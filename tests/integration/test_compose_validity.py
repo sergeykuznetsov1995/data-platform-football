@@ -33,6 +33,9 @@ SOFASCORE_GATEWAY_COMPOSE = (
 SOFASCORE_AIRFLOW_COMPOSE = (
     PROJECT_ROOT / "deploy" / "sofascore" / "airflow.compose.yaml"
 )
+FOTMOB_ISOLATED_COMPOSE = (
+    PROJECT_ROOT / "deploy" / "fotmob" / "isolated.compose.yaml"
+)
 SUPERVISED_OVERLAY = PROJECT_ROOT / "compose.seaweedfs-supervised.yaml"
 SUPERSET_DIR = PROJECT_ROOT / "configs" / "superset"
 OPENMETADATA_DIR = PROJECT_ROOT / "configs" / "openmetadata"
@@ -65,6 +68,14 @@ COMPOSE_TEST_ENV = {
     "SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR": "/tmp/compose-test-sofascore-legacy-venv",
     "SOFASCORE_AIRFLOW_DB_PASSWORD": "ci-not-a-secret",
     "SOFASCORE_POSTGRES_IMAGE": "postgres:16-alpine",
+    # The isolated FotMob contour (deploy/fotmob/isolated.compose.yaml) takes
+    # every host path, image and its metadata-DB password from the contour env
+    # file; dummy values keep the render independent of a production host.
+    "FOTMOB_RELEASE_ROOT": "/tmp/compose-test-fotmob-release",
+    "FOTMOB_DAGBAG_IGNORE_FILE": "/tmp/compose-test-fotmob-airflowignore",
+    "FOTMOB_AIRFLOW_IMAGE": "data-platform-airflow-scheduler:compose-test",
+    "FOTMOB_POSTGRES_IMAGE": "postgres:16-alpine",
+    "FOTMOB_AIRFLOW_DB_PASSWORD": "ci-not-a-secret",
 }
 
 
@@ -181,6 +192,44 @@ def _sofascore_airflow_config_json() -> dict:
     if proc.returncode != 0:
         pytest.fail(
             "SofaScore airflow compose config failed "
+            f"(rc={proc.returncode}):\nSTDOUT: {proc.stdout[:1000]}\n"
+            f"STDERR: {proc.stderr[:1000]}"
+        )
+    return json.loads(proc.stdout)
+
+
+def _fotmob_isolated_config_json() -> dict:
+    """Render the isolated FotMob contour (all profiles, so the UI service shows)."""
+    if not _docker_available():
+        pytest.skip("docker CLI not available on this host")
+
+    proc = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--project-name",
+            "fotmob-airflow-config-test",
+            "--file",
+            str(FOTMOB_ISOLATED_COMPOSE),
+            "--project-directory",
+            str(PROJECT_ROOT),
+            "--env-file",
+            str(PROJECT_ROOT / ".env.example"),
+            "--profile",
+            "*",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=str(PROJECT_ROOT),
+        env=COMPOSE_TEST_ENV,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            "FotMob isolated compose config failed "
             f"(rc={proc.returncode}):\nSTDOUT: {proc.stdout[:1000]}\n"
             f"STDERR: {proc.stderr[:1000]}"
         )
@@ -353,6 +402,53 @@ class TestComposeFile:
         # Compose renders memory sizes as byte-count strings.
         assert int(resources["limits"]["memory"]) >= 1 << 30
         assert int(resources["reservations"]["memory"]) >= 256 << 20
+
+    def test_fotmob_isolated_renders_from_one_release_root(self):
+        """Every code bind of the contour comes from FOTMOB_RELEASE_ROOT, the DAG
+        block-list from its own host file (a file-bind out of a tree that
+        ``git checkout`` rewrites would go stale by inode), and the contour keeps
+        the container names, the metadata-DB volume and the networks the live
+        automaton and runbook depend on."""
+        cfg = _fotmob_isolated_config_json()
+        services = cfg["services"]
+        assert set(services) == {
+            "airflow-metadb", "airflow-init", "airflow-scheduler", "airflow-webserver",
+        }
+        release_root = COMPOSE_TEST_ENV["FOTMOB_RELEASE_ROOT"]
+        scheduler = services["airflow-scheduler"]
+        volumes = {volume["target"]: volume for volume in scheduler["volumes"]}
+        assert len(volumes) == len(scheduler["volumes"])
+        expected = {
+            "/opt/airflow/dags": f"{release_root}/dags",
+            "/opt/airflow/dags/.airflowignore": COMPOSE_TEST_ENV["FOTMOB_DAGBAG_IGNORE_FILE"],
+            "/opt/airflow/logs": f"{release_root}/logs",
+            "/opt/airflow/scrapers": f"{release_root}/scrapers",
+            "/opt/airflow/scripts": f"{release_root}/scripts",
+            "/opt/airflow/configs/medallion": f"{release_root}/configs/medallion",
+            "/opt/airflow/configs/fotmob": f"{release_root}/configs/fotmob",
+        }
+        assert {target: volume["source"] for target, volume in volumes.items()} == expected
+        for target, volume in volumes.items():
+            assert volume["type"] == "bind", target
+            assert volume["bind"].get("create_host_path", False) is False, target
+            assert volume.get("read_only", False) is (target != "/opt/airflow/logs"), target
+        init_volumes = {volume["target"]: volume["source"] for volume in services["airflow-init"]["volumes"]}
+        assert init_volumes == expected, "init must not resurrect the v1 block-list or a mini-DAG file bind"
+        assert scheduler["container_name"] == "fotmob-airflow-scheduler"
+        assert services["airflow-metadb"]["container_name"] == "fotmob-airflow-metadb"
+        assert scheduler["image"] == COMPOSE_TEST_ENV["FOTMOB_AIRFLOW_IMAGE"]
+        assert services["airflow-metadb"]["image"] == COMPOSE_TEST_ENV["FOTMOB_POSTGRES_IMAGE"]
+        env = scheduler["environment"]
+        assert env["FOTMOB_ISOLATED_STACK"] == "1"
+        assert env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] == (
+            "postgresql+psycopg2://airflow:ci-not-a-secret@fotmob-airflow-metadb:5432/airflow"
+        )
+        assert services["airflow-metadb"]["environment"]["POSTGRES_PASSWORD"] == "ci-not-a-secret"
+        assert set(scheduler["networks"]) == {"default", "dp-storage"}
+        assert "dp-backend" not in cfg["networks"]
+        assert cfg["volumes"]["fm_airflow_pgdata"]["name"] == "fotmob_airflow_pgdata"
+        assert int(scheduler["deploy"]["resources"]["limits"]["memory"]) == 10 << 30
+        assert services["airflow-webserver"]["profiles"] == ["ui"]
 
     def test_scheduler_renders_with_exact_sofascore_artifact_bind(self):
         cfg = _compose_config_json()

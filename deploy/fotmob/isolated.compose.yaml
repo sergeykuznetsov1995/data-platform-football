@@ -1,0 +1,250 @@
+# Изолированный FotMob-Airflow (#930) — рецепт живого контура из одного источника
+# (#1155, этап 3). Проект fotmob-airflow, своя metadata-DB, scheduler на пинованном
+# образе, код — bind-mount дерева ${FOTMOB_RELEASE_ROOT} (git-worktree, которое
+# переставляет автомат доставки deploy/fotmob/auto_deliver.sh). Общий проект
+# data-platform НЕ трогает.
+#
+# Это тот же рецепт, из которого контур поднят на VM (fotmob-airflow.compose.v2.yaml
+# вне git), только без зашитых путей: каждый путь хоста и образ — переменная без
+# дефолта, без значения `docker compose config` падает, а не подставляет чужое
+# дерево. Переменные — deploy/fotmob/fotmob.env.example; эксплуатация —
+# docs/operations/fotmob-isolated-ceremony-free.md. Секреты приходят только через
+# --env-file (общий .env платформы + env-файл контура).
+#
+# НЕ путать с deploy/fotmob/airflow.compose.yaml: тот файл — церемониальный путь
+# (deploy.py: проекция DagBag, deployment report, evidence), который в живом контуре
+# выключен с 2026-08-11 и на этот контур не накладывается.
+#
+# Сети: default (metadb <-> scheduler, своя сеть проекта) + dp-storage (чужая,
+# только ради алиасов trino/seaweedfs). Своей внешней сети типа sofascore-net
+# НЕТ — у FotMob нет прокси-шлюза (direct-only HTTP). dp-backend сознательно
+# НЕ подключаем (флапает + alias postgres общей Airflow-БД — риск двойного
+# scheduler'а).
+#
+# Запуск (после заполнения env-файла контура):
+#   docker compose -p fotmob-airflow -f deploy/fotmob/isolated.compose.yaml \
+#     --env-file "$FOTMOB_PLATFORM_ENV_FILE" --env-file <fotmob.env> up -d --no-deps airflow-scheduler
+#   ВСЕГДА --no-deps (и при первом запуске: metadb --wait → init → scheduler по одному,
+#   см. рунбук): без него depends_on пересоздаст airflow-init
+#   (см. SHARED-STACK-PROTOCOL.md). Доставка кода контейнеры НЕ пересоздаёт —
+#   она подменяет дерево под bind-mount'ом (auto_deliver.sh / b6_deliver.sh).
+name: fotmob-airflow
+
+x-fm-airflow-common: &fm-airflow-common
+  image: ${FOTMOB_AIRFLOW_IMAGE:?set the pinned FotMob Airflow image}
+  shm_size: '512m'
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  cap_add: [CHOWN, SETGID, SETUID, SYS_PTRACE]
+  environment: &fm-airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?set the Airflow fernet key}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # СВОЯ metadata-DB: сервис airflow-metadb этого проекта (DNS-алиас по
+    # container_name в default-сети). Ни при каких обстоятельствах не менять
+    # на общий postgres — двойной scheduler на одной БД.
+    # Пароль контура — своя переменная: база инициализирована 2026-07-17 значением
+    # общего AIRFLOW_DB_PASSWORD того дня; ротация общего .env не должна ломать
+    # метабазу контура.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${FOTMOB_AIRFLOW_DB_PASSWORD:?set the FotMob metadata-DB password}@fotmob-airflow-metadb:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?set the Airflow webserver secret key}
+    PYTHONPATH: /opt/airflow
+    # Trino/S3 — по алиасам через внешнюю dp-storage.
+    TRINO_HOST: trino
+    TRINO_PORT: ${TRINO_PORT:?set Trino port}
+    TRINO_PASSWORD: ${TRINO_PASSWORD:?set Trino password}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3 access key}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3 secret key}
+    # Source-native FotMob raw-first storage (сверено с fotmob-блоком
+    # общего compose.yaml). Транспорт direct-only — прокси-переменных нет.
+    FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE:?set warehouse bucket}/raw/fotmob
+    FOTMOB_RAW_S3_ENDPOINT: seaweedfs:8333
+    FOTMOB_RAW_S3_SCHEME: http
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ALERT_ENV: fotmob-isolated
+    # Гейт изолята. На master он обязателен — без него dag_trigger_fotmob_daily и
+    # dag_orchestrate_fotmob не создаются, а ceremony-free writer-путь (PR #1034)
+    # именно им и удерживает изоляцию от общего стека.
+    FOTMOB_ISOLATED_STACK: "1"
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+  volumes:
+    # Везде длинный синтаксис + create_host_path: false: отсутствующий источник —
+    # ошибка запуска, а не молча созданный Docker'ом пустой каталог.
+    # DagBag = весь dags/ дерева; чужие даги прячет блок-лист ниже.
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set the absolute FotMob release tree}/dags
+      target: /opt/airflow/dags
+      read_only: true
+      bind:
+        create_host_path: false
+    # Блок-лист чужих DAG — file-bind ХОСТОВОГО файла вне дерева (канонический текст
+    # — deploy/fotmob/isolated.airflowignore того же дерева). Из дерева его монтировать
+    # нельзя: доставка переставляет дерево `git checkout` без пересоздания контейнера,
+    # а file-bind держит инод — изменённый файл в контейнер не попал бы (так протух
+    # file-bind dag_trigger_fotmob_daily.py 27.07). Хостовую копию править только
+    # append'ом (`>>`) или `cp` поверх — sed -i / mv меняют инод.
+    - type: bind
+      source: ${FOTMOB_DAGBAG_IGNORE_FILE:?set the host copy of deploy/fotmob/isolated.airflowignore}
+      target: /opt/airflow/dags/.airflowignore
+      read_only: true
+      bind:
+        create_host_path: false
+    # logs/ не в git и compose'ом не создаётся (create_host_path: false): каталог с
+    # uid 50000 создаёт установка контура (рунбук), в живом дереве он уже есть.
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set the absolute FotMob release tree}/logs
+      target: /opt/airflow/logs
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set the absolute FotMob release tree}/scrapers
+      target: /opt/airflow/scrapers
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set the absolute FotMob release tree}/scripts
+      target: /opt/airflow/scripts
+      read_only: true
+      bind:
+        create_host_path: false
+    # E1 medallion config для silver-тасок (utils/medallion_config.py).
+    # configs/soccerdata и прокси-конфиги НЕ нужны: fotmob — source-native,
+    # без soccerdata и без прокси.
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set the absolute FotMob release tree}/configs/medallion
+      target: /opt/airflow/configs/medallion
+      read_only: true
+      bind:
+        create_host_path: false
+    # Дневная волна пиннута к configs/fotmob/issue-930-scopes.txt
+    # (FOTMOB_DAILY_SCOPE_FILE + sha256-контракт). Без этого маунта каталога
+    # в контейнере нет вовсе и ран падает на проверке скоуп-файла.
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set the absolute FotMob release tree}/configs/fotmob
+      target: /opt/airflow/configs/fotmob
+      read_only: true
+      bind:
+        create_host_path: false
+  networks:
+    - default
+    - dp-storage
+
+services:
+  airflow-metadb:
+    # Живое значение postgres:16-alpine; лучше запинить digest.
+    image: ${FOTMOB_POSTGRES_IMAGE:?set the pinned FotMob metadata-DB image}
+    container_name: fotmob-airflow-metadb
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, FOWNER, DAC_READ_SEARCH]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${FOTMOB_AIRFLOW_DB_PASSWORD:?set the FotMob metadata-DB password}
+      POSTGRES_DB: airflow
+    volumes:
+      - fm_airflow_pgdata:/var/lib/postgresql/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  airflow-init:
+    <<: *fm-airflow-common
+    container_name: fotmob-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        airflow db migrate
+        airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME} \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD} \
+          --firstname Admin --lastname User --role Admin \
+          --email admin@example.com || true
+        airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
+        airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
+        echo "fotmob-airflow init complete"
+    environment:
+      <<: *fm-airflow-env
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:?set the Airflow admin user name}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:?set the Airflow admin password}
+    restart: "no"
+    depends_on:
+      airflow-metadb:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *fm-airflow-common
+    container_name: fotmob-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+        reservations:
+          memory: 1G
+
+  # Опциональный UI для приёмки: ... --profile ui up -d --no-deps airflow-webserver ; http://127.0.0.1:8084
+  airflow-webserver:
+    <<: *fm-airflow-common
+    container_name: fotmob-airflow-webserver
+    command: webserver
+    profiles: ["ui"]
+    ports:
+      - "127.0.0.1:8084:8080"
+    environment:
+      <<: *fm-airflow-env
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  fm_airflow_pgdata:
+    # Стабильное имя: том живой метабазы. Другое имя = пустая метабаза (потеря
+    # истории ранов, пулов и пауз).
+    name: fotmob_airflow_pgdata
+
+networks:
+  default: {}
+  dp-storage:
+    external: true
+    name: dp-storage
