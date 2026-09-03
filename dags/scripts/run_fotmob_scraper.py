@@ -136,6 +136,13 @@ MATCH_SETTLE_MARGIN = timedelta(hours=3)
 # чужой flush (десятки секунд), а красным становится лишь тогда, когда держатель
 # явно зависает.
 WRITER_LOCK_ENV = "FOTMOB_WRITER_LOCK"
+# Общий потолок запросов к источнику. Локальный token bucket остаётся у каждого
+# процесса своим (--requests-per-minute), но суммарно к FotMob уходит не больше
+# этого числа — сегодня 60/мин, ровно та нагрузка, которую источник видит от
+# одной волны. Раньше суммарный потолок держался лишь тем, что замок писателя
+# исключал одновременную работу волны и кампании.
+FOTMOB_SHARED_RPM_CEILING = 60.0
+FOTMOB_SHARED_RPM_ENV = "FOTMOB_SHARED_RPM"
 # Маркер узкого замка: по нему драйвер кампании отличает дерево, в котором волна
 # и юнит могут писать одновременно, от прежнего с замком на весь ран.
 WRITER_LOCK_SCOPE = "flush"
@@ -849,6 +856,46 @@ def _salvage_flush() -> None:
         logger.exception("salvage flush after runner failure also failed")
 
 
+def _shared_rpm_ceiling(environ: Mapping[str, str] | None = None) -> float:
+    """Потолок общего лимитера; ``0`` выключает его (офлайн-реплей и тесты)."""
+
+    env = os.environ if environ is None else environ
+    raw = str(env.get(FOTMOB_SHARED_RPM_ENV, "")).strip()
+    if not raw:
+        return FOTMOB_SHARED_RPM_CEILING
+    return float(raw)
+
+
+def _with_shared_rpm_ceiling(limiter, *, workers: int):
+    """Надеть на локальный лимитер общий потолок источника.
+
+    Локальный кап процесса не меняется и остаётся первым барьером: он режет
+    почти все попытки, не обращаясь к базе.
+    """
+
+    rpm = _shared_rpm_ceiling()
+    if rpm <= 0:
+        logger.warning(
+            "FotMob shared rpm ceiling disabled via %s — суммарная нагрузка "
+            "на источник не ограничена",
+            FOTMOB_SHARED_RPM_ENV,
+        )
+        return limiter
+
+    from scrapers.fbref.control.store import resolve_control_db_uri
+    from scrapers.fotmob.shared_rate_limiter import (
+        CompositeRateLimiter,
+        PgSharedRateLimiter,
+    )
+
+    shared = PgSharedRateLimiter(
+        resolve_control_db_uri(os.environ),
+        rpm=rpm,
+        burst=float(max(1, workers)),
+    )
+    return CompositeRateLimiter(limiter, shared)
+
+
 def _build_native_service(args, run_id: str):
     """Construct production dependencies lazily for fast CLI/unit imports."""
 
@@ -870,6 +917,7 @@ def _build_native_service(args, run_id: str):
         # Avoid an initial 30-request burst when several workers start.
         burst_size=max(1, args.workers),
     )
+    limiter = _with_shared_rpm_ceiling(limiter, workers=args.workers)
     transport = FotMobTransport(
         raw_store=raw_store,
         max_attempts=args.max_attempts,

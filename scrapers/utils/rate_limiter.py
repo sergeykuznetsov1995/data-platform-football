@@ -127,6 +127,18 @@ class RateLimiter:
 
             return False
 
+    def refund(self) -> None:
+        """Вернуть в ведро токен, взятый попыткой, которая не состоялась.
+
+        Нужно, когда за локальным капом стоит второй барьер (общий потолок
+        источника): без возврата токен, взятый локально и не пропущенный
+        общим, сгорал бы, и локальный кап медленно душил бы процесс.
+        """
+
+        with self._lock:
+            self._refill()
+            self._tokens = min(self.config.burst_size, self._tokens + 1)
+
     @property
     def available_tokens(self) -> float:
         """Get current number of available tokens."""
