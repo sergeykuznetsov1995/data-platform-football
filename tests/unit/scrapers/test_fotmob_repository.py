@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -305,6 +307,12 @@ class ScopeAttemptTrino:
 
     def __init__(self):
         self.sql = []
+
+    def table_exists(self, _schema, _table):
+        # Единый путь записи сверяет пачку с хранилищем перед записью и при
+        # batch_size=1 тоже — заглушка обязана отвечать на тот же вопрос, что и
+        # настоящий Trino.
+        return False
 
     def execute_query(self, sql):
         self.sql.append(sql)
@@ -2275,3 +2283,277 @@ def test_seasons_parse_identity_gives_the_reparse_its_own_batch():
     for row in writer.rows["fotmob_competition_seasons"]:
         counts[row["_target_batch_id"]] = counts.get(row["_target_batch_id"], 0) + 1
     assert counts == {old.batch_id: 46, new.batch_id: 34}
+
+
+# --- В1 (#1242): замок писателя вокруг записи, а не вокруг рана -------------
+
+
+class _CountingGuard:
+    """Общий межпроцессный замок писателя, каким его видит репозиторий."""
+
+    def __init__(self, *, delay_table=None, writer=None):
+        self._lock = threading.Lock()
+        self.entries = 0
+        self.max_concurrent = 0
+        self._live = 0
+        self._live_lock = threading.Lock()
+        self._delay_table = delay_table
+        self._writer = writer
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        self._lock.acquire()
+        with self._live_lock:
+            self.entries += 1
+            self._live += 1
+            self.max_concurrent = max(self.max_concurrent, self._live)
+        return True
+
+    def __exit__(self, *exc_info):
+        with self._live_lock:
+            self._live -= 1
+        self._lock.release()
+        return False
+
+
+class _SlowReconcileWriter(ReconcileWriter):
+    """Писатель, чья запись первой таблицы длится заметное время.
+
+    Без замка это окно и есть дефект: второй писатель успевает сверить пачку с
+    хранилищем, пока первая запись ещё не видна.
+    """
+
+    def __init__(self, slow_table, delay=0.05):
+        super().__init__()
+        self.slow_table = slow_table
+        self.delay = delay
+
+    def write_dataframe(self, df, **kwargs):
+        if kwargs["table"] == self.slow_table:
+            time.sleep(self.delay)
+        return super().write_dataframe(df, **kwargs)
+
+
+def _match_dataset(match_id):
+    return TableRows(
+        "fotmob_matches",
+        [
+            {
+                "competition_id": "289",
+                "source_season_key": "2017/2019",
+                "match_id": str(match_id),
+            }
+        ],
+        "matches",
+        ("competition_id", "source_season_key"),
+    )
+
+
+def _writer_pair(writer, guard):
+    # 50 целей в пачке: обе стороны держат буфер, пока flush не позовут явно.
+    wave = FotMobRepository(writer=writer, batch_size=50, write_guard=guard)
+    campaign = FotMobRepository(writer=writer, batch_size=50, write_guard=guard)
+    return wave, campaign
+
+
+def _shared_and_unique_commits():
+    """Одна общая цель (тот же batch_id у обоих) плюс по одной своей."""
+
+    shared = _commit(target_key="shared-target", content_hash="c" * 64)
+    wave_only = _commit(target_key="wave-target", content_hash="d" * 64)
+    campaign_only = _commit(target_key="campaign-target", content_hash="e" * 64)
+    return shared, wave_only, campaign_only
+
+
+def _batch_counts(writer, table):
+    column = "_target_batch_id" if table != "fotmob_ingest_manifest" else "batch_id"
+    counts = {}
+    for row in writer.rows.get(table, []):
+        counts[row[column]] = counts.get(row[column], 0) + 1
+    return counts
+
+
+def test_two_writers_interleaved_keep_exactly_once_under_one_guard():
+    writer = ReconcileWriter()
+    guard = _CountingGuard()
+    wave, campaign = _writer_pair(writer, guard)
+    shared, wave_only, campaign_only = _shared_and_unique_commits()
+
+    wave.commit(shared, [_match_dataset(1)])
+    wave.commit(wave_only, [_match_dataset(2)])
+    campaign.commit(shared, [_match_dataset(1)])
+    campaign.commit(campaign_only, [_match_dataset(3)])
+
+    campaign.flush()
+    wave.flush()
+
+    assert _batch_counts(writer, "fotmob_matches") == {
+        shared.batch_id: 1,
+        wave_only.batch_id: 1,
+        campaign_only.batch_id: 1,
+    }
+    # Ничего не потеряно: три уникальные пачки по одной строке.
+    assert len(writer.rows["fotmob_matches"]) == 3
+    manifest = _batch_counts(writer, "fotmob_ingest_manifest")
+    assert set(manifest) == {
+        shared.batch_id,
+        wave_only.batch_id,
+        campaign_only.batch_id,
+    }
+    # Замок входился на каждую физическую запись, а не один раз на процесс.
+    assert guard.entries >= 2
+    assert guard.max_concurrent == 1
+
+
+def test_two_writers_flushing_in_parallel_keep_exactly_once():
+    writer = _SlowReconcileWriter("fotmob_matches")
+    guard = _CountingGuard()
+    wave, campaign = _writer_pair(writer, guard)
+    shared, wave_only, campaign_only = _shared_and_unique_commits()
+
+    wave.commit(shared, [_match_dataset(1)])
+    wave.commit(wave_only, [_match_dataset(2)])
+    campaign.commit(shared, [_match_dataset(1)])
+    campaign.commit(campaign_only, [_match_dataset(3)])
+
+    errors: list[BaseException] = []
+
+    def flush(repository):
+        try:
+            repository.flush()
+        except BaseException as exc:  # noqa: BLE001 - тест обязан увидеть отказ
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=flush, args=(wave,)),
+        threading.Thread(target=flush, args=(campaign,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    assert _batch_counts(writer, "fotmob_matches") == {
+        shared.batch_id: 1,
+        wave_only.batch_id: 1,
+        campaign_only.batch_id: 1,
+    }
+    assert len(writer.rows["fotmob_matches"]) == 3
+    assert guard.max_concurrent == 1
+
+
+def test_parallel_flush_without_guard_breaks_exactly_once():
+    """Контроль: тест выше ловит дефект, а не проходит сам собой."""
+
+    writer = _SlowReconcileWriter("fotmob_matches")
+    shared, wave_only, campaign_only = _shared_and_unique_commits()
+    wave = FotMobRepository(writer=writer, batch_size=50)
+    campaign = FotMobRepository(writer=writer, batch_size=50)
+
+    wave.commit(shared, [_match_dataset(1)])
+    wave.commit(wave_only, [_match_dataset(2)])
+    campaign.commit(shared, [_match_dataset(1)])
+    campaign.commit(campaign_only, [_match_dataset(3)])
+
+    errors: list[BaseException] = []
+
+    def flush(repository):
+        try:
+            repository.flush()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=flush, args=(wave,)),
+        threading.Thread(target=flush, args=(campaign,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    duplicated = _batch_counts(writer, "fotmob_matches").get(shared.batch_id, 0) > 1
+    assert duplicated or errors, (
+        "без общего замка одновременный flush обязан задвоить пачку или упасть"
+    )
+
+
+def test_write_guard_is_not_held_between_writes():
+    writer = ReconcileWriter()
+    guard = _CountingGuard()
+    repository = FotMobRepository(writer=writer, batch_size=2, write_guard=guard)
+
+    repository.ensure_schema()
+    after_schema = guard.entries
+    assert after_schema == 1
+
+    repository.commit(_commit(target_key="one", content_hash="1" * 64))
+    assert guard.entries == after_schema, "буферизованный commit не пишет и не ждёт"
+
+    repository.commit(_commit(target_key="two", content_hash="2" * 64))
+    repository.flush()
+    assert guard.entries == after_schema + 1
+    assert guard.max_concurrent == 1
+
+    # Пустой буфер не берёт замок вовсе.
+    assert repository.flush() == []
+    assert guard.entries == after_schema + 1
+
+
+def test_lost_write_guard_fails_every_later_write_immediately():
+    class _Refusing:
+        def __init__(self):
+            self.attempts = 0
+
+        def __call__(self):
+            self.attempts += 1
+            raise RuntimeError("WriterLockBusy: another FotMob writer holds the lock")
+
+    guard = _Refusing()
+    writer = ReconcileWriter()
+    repository = FotMobRepository(writer=writer, batch_size=50, write_guard=guard)
+    repository.commit(_commit(target_key="one", content_hash="1" * 64))
+    repository.commit(_commit(target_key="two", content_hash="2" * 64))
+
+    with pytest.raises(RuntimeError, match="WriterLockBusy"):
+        repository.flush()
+    assert guard.attempts == 1
+
+    with pytest.raises(RuntimeError, match="WriterLockBusy"):
+        repository.flush()
+    with pytest.raises(RuntimeError, match="WriterLockBusy"):
+        repository.ensure_current_views()
+    # Повторного ожидания замка нет: отказ поднимается из памяти процесса.
+    assert guard.attempts == 1
+    assert writer.rows == {}
+
+
+def test_unbuffered_writers_keep_exactly_once_under_one_guard():
+    """batch_size=1 сверяет пачку с хранилищем так же, как буферизованный путь.
+
+    Прямая запись обходила сверку `_reconcile_pending_table`, и два писателя под
+    одним замком клали одну и ту же пачку дважды — каждый в свой заход.
+    """
+
+    writer = ReconcileWriter()
+    guard = _CountingGuard()
+    shared = _commit(target_key="shared-target", content_hash="c" * 64)
+    wave = FotMobRepository(writer=writer, batch_size=1, write_guard=guard)
+    campaign = FotMobRepository(writer=writer, batch_size=1, write_guard=guard)
+
+    wave.commit(shared, [_match_dataset(1)])
+    campaign.commit(shared, [_match_dataset(1)])
+
+    assert _batch_counts(writer, "fotmob_matches") == {shared.batch_id: 1}
+    assert len(writer.rows["fotmob_matches"]) == 1
+    manifest = [
+        row for row in writer.rows["fotmob_ingest_manifest"]
+        if row["batch_id"] == shared.batch_id
+    ]
+    assert len(manifest) == 1
+    assert manifest[0]["status"] == "success"
+    assert manifest[0]["run_id"] == shared.run_id
+    assert guard.max_concurrent == 1

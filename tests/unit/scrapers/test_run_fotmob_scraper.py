@@ -3868,8 +3868,8 @@ class TestFotmobNativeRunner:
 
 
 class _FakeCursor:
-    def __init__(self, acquired, executed):
-        self._acquired = acquired
+    def __init__(self, answers, executed):
+        self._answers = answers
         self._executed = executed
 
     def __enter__(self):
@@ -3882,27 +3882,52 @@ class _FakeCursor:
         self._executed.append((sql, params))
 
     def fetchone(self):
-        return (self._acquired,)
+        return (self._answers(),)
 
 
 class _FakeConnection:
-    def __init__(self, acquired, executed):
+    def __init__(self, answers, executed):
         self.autocommit = False
         self.closed = False
-        self._acquired = acquired
+        self._answers = answers
         self._executed = executed
 
     def cursor(self):
-        return _FakeCursor(self._acquired, self._executed)
+        return _FakeCursor(self._answers, self._executed)
 
     def close(self):
         self.closed = True
 
 
-def _fake_psycopg2(monkeypatch, mod, *, acquired, executed, connections):
+def _fake_psycopg2(
+    monkeypatch, mod, *, acquired, executed, connections, opened=None
+):
+    """Подменить psycopg2 замка писателя.
+
+    ``acquired`` — либо один ответ на все опросы, либо их последовательность
+    (последний ответ повторяется, если опросов больше): узкий замок опрашивает
+    ``pg_try_advisory_lock`` до успеха или до исчерпания ожидания.
+    ``opened`` собирает сами соединения — по ним видно, что между записями
+    открытого соединения к метабазе нет.
+    """
+
+    if isinstance(acquired, (list, tuple)):
+        pending = list(acquired)
+
+        def answers():
+            return pending.pop(0) if len(pending) > 1 else pending[0]
+
+    else:
+
+        def answers():
+            return acquired
+
     def connect(dsn):
         connections.append(dsn)
-        return _FakeConnection(acquired, executed)
+        connection = _FakeConnection(answers, executed)
+        if opened is not None:
+            opened.append(connection)
+        return connection
 
     monkeypatch.setitem(
         sys.modules, "psycopg2", SimpleNamespace(connect=connect)
@@ -3914,12 +3939,59 @@ def _fake_psycopg2(monkeypatch, mod, *, acquired, executed, connections):
     return mod
 
 
-class TestFotmobWriterLock:
-    """B7: право записи в bronze захватывается атомарно и без ожидания.
+class _LockScopeTrino:
+    def __init__(self):
+        self.sql = []
 
-    max_active_runs=1 сериализует только DagRun'ы одного дага; ручной добор и
-    осиротевший скрапер писали в те же таблицы мимо неё, а ретрая на конфликт
-    коммита у FotMob нет.
+    def table_exists(self, _schema, _table):
+        return False
+
+    def get_table_columns(self, _schema, _table):
+        return []
+
+    def _execute(self, sql):
+        self.sql.append(sql)
+
+
+class _LockScopeWriter:
+    """Писатель, у которого есть Trino-менеджер, но нет никакой физики."""
+
+    def __init__(self):
+        self.calls = []
+        self.trino = _LockScopeTrino()
+
+    def _get_trino_manager(self):
+        return self.trino
+
+    def write_dataframe(self, df, **kwargs):
+        self.calls.append((df.copy(), dict(kwargs)))
+        return f"iceberg.{kwargs['database']}.{kwargs['table']}"
+
+
+def _lock_scope_commit(key):
+    from scrapers.fotmob.repository import ManifestStatus, TargetCommit
+
+    return TargetCommit(
+        run_id="run-lock",
+        target_type="season",
+        target_key=key,
+        competition_id="289",
+        source_season_key="2017/2019",
+        status=ManifestStatus.SUCCESS,
+        content_hash=key.ljust(64, "0"),
+        raw_uri=f"file:///raw/{key}.json.gz",
+        fetched_at=datetime(2026, 9, 3, 12, 0),
+    )
+
+
+class TestFotmobWriterLock:
+    """B7: право записи в bronze захватывается атомарно и на время записи.
+
+    max_active_runs=1 сериализует только DagRun'ы одного дага; ручной добор,
+    осиротевший скрапер и юнит кампании истории пишут в те же таблицы мимо неё,
+    а ретрая на конфликт коммита у FotMob нет. Замок держится ровно на время
+    физической записи: замок на весь ран отдавал кампании только промежутки
+    между волнами (волны занимают 66-88 % суток).
     """
 
     @staticmethod
@@ -3928,49 +4000,184 @@ class TestFotmobWriterLock:
         return importlib.import_module("dags.scripts.run_fotmob_scraper")
 
     @pytest.mark.unit
-    def test_lock_is_taken_without_waiting_and_released_by_closing(
+    def test_free_lock_is_taken_by_one_probe_and_released_by_closing(
         self, monkeypatch
     ):
         mod = self._module()
         monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
         executed: list[tuple[str, Any]] = []
         connections: list[str] = []
+        opened: list[Any] = []
         _fake_psycopg2(
-            monkeypatch, mod, acquired=True, executed=executed, connections=connections
+            monkeypatch,
+            mod,
+            acquired=True,
+            executed=executed,
+            connections=connections,
+            opened=opened,
         )
         held = None
 
         with mod._writer_lock() as acquired:
             held = acquired
             statements = list(executed)
+            assert opened[0].closed is False
 
         assert held is True
-        # Именно НЕблокирующий вариант: pg_advisory_lock ждал бы второго
-        # писателя вместо мгновенного отказа.
+        # Захват остаётся НЕблокирующим на уровне SQL: pg_advisory_lock ждал бы
+        # в базе без предела и без следа в логе.
         assert statements == [
             ("SELECT pg_try_advisory_lock(%s)", (mod._WRITER_LOCK_KEY,))
         ]
         assert connections == ["postgresql://airflow@metadb:5432/airflow"]
+        assert opened[0].closed is True
 
     @pytest.mark.unit
-    def test_second_writer_is_refused_immediately(self, monkeypatch):
+    def test_busy_lock_is_waited_out_by_polling(self, monkeypatch):
+        """Чужая запись — секунды: второй писатель ждёт её, а не падает."""
+
         mod = self._module()
         monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        executed: list[tuple[str, Any]] = []
+        opened: list[Any] = []
         _fake_psycopg2(
-            monkeypatch, mod, acquired=False, executed=[], connections=[]
+            monkeypatch,
+            mod,
+            acquired=[False, False, True],
+            executed=executed,
+            connections=[],
+            opened=opened,
         )
+        slept: list[float] = []
+        monkeypatch.setattr(mod.time, "sleep", slept.append)
+
+        with mod._writer_lock() as acquired:
+            assert acquired is True
+
+        assert len(executed) == 3
+        assert {sql for sql, _params in executed} == {
+            "SELECT pg_try_advisory_lock(%s)"
+        }
+        assert slept == [mod.WRITER_LOCK_POLL_SECONDS] * 2
+        assert opened[0].closed is True
+
+    @pytest.mark.unit
+    def test_exhausted_wait_refuses_to_write_in_parallel(self, monkeypatch):
+        """Ожидание не бесконечно: зависший держатель красит ран."""
+
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        monkeypatch.setattr(mod, "WRITER_LOCK_WAIT_SECONDS", 4.0)
+        monkeypatch.setattr(mod, "WRITER_LOCK_POLL_SECONDS", 2.0)
+        executed: list[tuple[str, Any]] = []
+        opened: list[Any] = []
+        _fake_psycopg2(
+            monkeypatch,
+            mod,
+            acquired=False,
+            executed=executed,
+            connections=[],
+            opened=opened,
+        )
+        clock = iter([0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0])
+        monkeypatch.setattr(mod.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(mod.time, "sleep", lambda _delay: None)
 
         with pytest.raises(mod.WriterLockBusy) as excinfo:
             with mod._writer_lock():
                 raise AssertionError("тело не должно выполняться")
 
         assert "bronze writer lock" in str(excinfo.value)
+        assert "after waiting" in str(excinfo.value)
+        assert len(executed) >= 2
+        assert opened[0].closed is True
 
     @pytest.mark.unit
-    def test_busy_lock_fails_the_run_without_touching_the_scraper(
+    def test_lock_is_held_only_around_physical_writes(self, monkeypatch):
+        """Между записями соединения к метабазе нет вовсе."""
+
+        from scrapers.fotmob.repository import FotMobRepository
+
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        executed: list[tuple[str, Any]] = []
+        connections: list[str] = []
+        opened: list[Any] = []
+        _fake_psycopg2(
+            monkeypatch,
+            mod,
+            acquired=True,
+            executed=executed,
+            connections=connections,
+            opened=opened,
+        )
+        writer = _LockScopeWriter()
+        repository = FotMobRepository(
+            writer=writer, batch_size=2, write_guard=mod._writer_lock
+        )
+
+        repository.ensure_schema()
+        assert len(opened) == 1, "DDL схемы пишет — значит берёт замок"
+        assert all(connection.closed for connection in opened)
+
+        repository.commit(_lock_scope_commit("one"))
+        assert len(opened) == 1, "буферизованный commit не пишет и замка не берёт"
+
+        repository.commit(_lock_scope_commit("two"))
+        assert len(opened) == 2, "порог пачки пишет — ровно один захват"
+        assert all(connection.closed for connection in opened)
+
+        repository.ensure_current_views()
+        assert len(opened) == 3
+        assert all(connection.closed for connection in opened)
+        assert {sql for sql, _params in executed} == {
+            "SELECT pg_try_advisory_lock(%s)"
+        }
+        assert connections == ["postgresql://airflow@metadb:5432/airflow"] * 3
+
+    @pytest.mark.unit
+    def test_run_body_holds_no_metadb_connection(self, monkeypatch, tmp_path):
+        """Пока идут sync_*, замок писателя не держит никто."""
+
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        opened: list[Any] = []
+        _fake_psycopg2(
+            monkeypatch,
+            mod,
+            acquired=True,
+            executed=[],
+            connections=[],
+            opened=opened,
+        )
+        live: list[int] = []
+
+        def run_native(_args):
+            live.append(len([item for item in opened if not item.closed]))
+            return 0, {"status": "success", "complete": True, "errors": []}
+
+        monkeypatch.setattr(mod, "_run_native", run_native)
+        out = tmp_path / "report.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["run_fotmob_scraper.py", "--mode", "discover", "--output", str(out)],
+        )
+
+        assert mod.main() == 0
+        assert live == [0]
+        assert opened == []
+
+    @pytest.mark.unit
+    def test_exhausted_guard_fails_the_run_without_salvage(
         self, monkeypatch, tmp_path
     ):
-        """Отказ обязан быть виден отчётом, а не тихим пропуском работы."""
+        """Отказ обязан быть виден отчётом, а не тихим пропуском работы.
+
+        Драйвер кампании ищет ``WriterLockBusy`` в ВЕРХНЕУРОВНЕВОМ ``.errors``
+        отчёта, поэтому класс отказа обязан доехать именно туда, а
+        salvage-flush в этом случае только повторил бы ожидание замка.
+        """
 
         from utils import fotmob_publication as publication
 
@@ -3982,11 +4189,17 @@ class TestFotmobWriterLock:
         monkeypatch.delenv(
             publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
         )
-        _fake_psycopg2(
-            monkeypatch, mod, acquired=False, executed=[], connections=[]
+        busy = mod.WriterLockBusy(
+            "another FotMob writer holds the bronze writer lock (key 1) "
+            "after waiting 600s; refusing to write in parallel"
         )
-        started = MagicMock()
-        monkeypatch.setattr(mod, "_run_native", started)
+
+        def refuse(_args):
+            raise busy
+
+        salvage = MagicMock()
+        monkeypatch.setattr(mod, "_run_native", refuse)
+        monkeypatch.setattr(mod, "_salvage_flush", salvage)
         out = tmp_path / "report.json"
         monkeypatch.setattr(
             sys,
@@ -3996,11 +4209,55 @@ class TestFotmobWriterLock:
 
         assert mod.main() == 1
 
-        started.assert_not_called()
+        salvage.assert_not_called()
         report = json.loads(out.read_text(encoding="utf-8"))
         assert report["status"] == "incomplete"
         assert report["complete"] is False
-        assert any("writer lock" in str(error) for error in report["errors"])
+        assert any("WriterLockBusy" in str(error) for error in report["errors"])
+
+    @pytest.mark.unit
+    def test_lost_guard_raises_immediately_on_every_later_write(self, monkeypatch):
+        """Второе ожидание не начинается: отказ поднимается из памяти процесса."""
+
+        from scrapers.fotmob.repository import FotMobRepository
+
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        monkeypatch.setattr(mod, "WRITER_LOCK_WAIT_SECONDS", 0.0)
+        connections: list[str] = []
+        _fake_psycopg2(
+            monkeypatch,
+            mod,
+            acquired=False,
+            executed=[],
+            connections=connections,
+            opened=[],
+        )
+        monkeypatch.setattr(mod.time, "sleep", lambda _delay: None)
+        writer = _LockScopeWriter()
+        repository = FotMobRepository(
+            writer=writer, batch_size=50, write_guard=mod._writer_lock
+        )
+        repository.commit(_lock_scope_commit("one"))
+
+        with pytest.raises(mod.WriterLockBusy):
+            repository.flush()
+        assert len(connections) == 1
+
+        with pytest.raises(mod.WriterLockBusy):
+            repository.flush()
+        with pytest.raises(mod.WriterLockBusy):
+            repository.ensure_current_views()
+        assert len(connections) == 1, "повторного ожидания замка быть не должно"
+        assert writer.calls == []
+
+    @pytest.mark.unit
+    def test_narrow_scope_marker_is_published_for_the_campaign_driver(self):
+        """Драйвер кампании отличает узкий замок от замка на ран по маркеру."""
+
+        mod = self._module()
+
+        assert mod.WRITER_LOCK_SCOPE == "flush"
 
     @pytest.mark.unit
     def test_lock_can_be_disabled_only_explicitly(self, monkeypatch):

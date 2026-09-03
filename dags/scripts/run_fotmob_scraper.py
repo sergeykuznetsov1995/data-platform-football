@@ -19,6 +19,7 @@ import re
 import signal
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -124,12 +125,32 @@ MATCH_SETTLE_MARGIN = timedelta(hours=3)
 
 # Единственность писателя bronze (B7). max_active_runs=1 сериализует только
 # DagRun'ы одного дага, а ручной добор и осиротевший скрапер (PPid=1) пишут в те
-# же таблицы мимо неё; ретрая на конфликт коммита у FotMob нет. Захват обязан
-# быть НЕблокирующим: второй писатель должен падать сразу с внятной ошибкой, а
-# не ждать и не писать параллельно. Advisory-замок сессии освобождается сам,
-# когда соединение умирает, — поэтому убитый SIGKILL ран не оставляет висящего
-# замка, в отличие от записи-владельца в таблице.
+# же таблицы мимо неё; ретрая на конфликт коммита у FotMob нет. Advisory-замок
+# сессии освобождается сам, когда соединение умирает, — поэтому убитый SIGKILL
+# ран не оставляет висящего замка, в отличие от записи-владельца в таблице.
+#
+# Замок держится ровно на время ФИЗИЧЕСКОЙ записи (`WRITER_LOCK_SCOPE`), а не на
+# весь ран: запись занимает 0,33 % длительности волны, и замок на ран отдавал
+# кампании истории только промежутки между волнами (волны занимают 66-88 %
+# суток). Отсюда и ожидание вместо мгновенного отказа: второй писатель ждёт
+# чужой flush (десятки секунд), а красным становится лишь тогда, когда держатель
+# явно зависает.
 WRITER_LOCK_ENV = "FOTMOB_WRITER_LOCK"
+# Общий потолок запросов к источнику. Локальный token bucket остаётся у каждого
+# процесса своим (--requests-per-minute), но суммарно к FotMob уходит не больше
+# этого числа — сегодня 60/мин, ровно та нагрузка, которую источник видит от
+# одной волны. Раньше суммарный потолок держался лишь тем, что замок писателя
+# исключал одновременную работу волны и кампании.
+FOTMOB_SHARED_RPM_CEILING = 60.0
+FOTMOB_SHARED_RPM_ENV = "FOTMOB_SHARED_RPM"
+# Маркер узкого замка: по нему драйвер кампании отличает дерево, в котором волна
+# и юнит могут писать одновременно, от прежнего с замком на весь ран.
+WRITER_LOCK_SCOPE = "flush"
+# Чужой flush по замеру 30-60 с, перестройка 18 вью — порядка минуты. Десять
+# минут покрывают самый долгий flush с запасом; всё, что дольше, — зависший
+# держатель, и о нём лучше узнать красным раном, чем ждать час.
+WRITER_LOCK_WAIT_SECONDS = 600.0
+WRITER_LOCK_POLL_SECONDS = 2.0
 _WRITER_LOCK_KEY = int.from_bytes(
     hashlib.blake2b(b"fotmob-bronze-writer", digest_size=8).digest(),
     "big",
@@ -235,12 +256,17 @@ class WriterLockBusy(RuntimeError):
 
 @contextmanager
 def _writer_lock(environ: Mapping[str, str] | None = None) -> Iterator[bool]:
-    """Взять НЕблокирующий advisory-замок писателя на всё время рана.
+    """Взять advisory-замок писателя на время ОДНОЙ физической записи.
 
-    Замок общий для всех входов: и полоса из DAG, и ручной добор берут один и
-    тот же ключ, поэтому второй писатель падает сразу, а не пишет параллельно.
-    Отключается только явно (``FOTMOB_WRITER_LOCK=0``) — для офлайн-реплея и
-    тестов; молчаливого обхода нет, иначе защита превращается в декорацию.
+    Замок общий для всех входов: и полоса из DAG, и ручной добор, и юнит
+    кампании берут один и тот же ключ, поэтому одновременной записи в bronze
+    не бывает. Захват остаётся НЕблокирующим на уровне SQL
+    (``pg_try_advisory_lock``), а ожидание делается опросом: блокирующий
+    ``pg_advisory_lock`` ждал бы в базе без предела и без следа в логе.
+    Исчерпанное ожидание — ``WriterLockBusy``: держатель завис, и ран обязан
+    покраснеть. Отключается только явно (``FOTMOB_WRITER_LOCK=0``) — для
+    офлайн-реплея и тестов; молчаливого обхода нет, иначе защита превращается
+    в декорацию.
     """
 
     env = os.environ if environ is None else environ
@@ -259,14 +285,30 @@ def _writer_lock(environ: Mapping[str, str] | None = None) -> Iterator[bool]:
     connection = psycopg2.connect(resolve_control_db_uri(env))
     try:
         connection.autocommit = True
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_try_advisory_lock(%s)", (_WRITER_LOCK_KEY,))
-            acquired = bool(cursor.fetchone()[0])
-        if not acquired:
-            raise WriterLockBusy(
-                "another FotMob writer holds the bronze writer lock "
-                f"(key {_WRITER_LOCK_KEY}); refusing to write in parallel"
-            )
+        deadline = time.monotonic() + WRITER_LOCK_WAIT_SECONDS
+        waited = 0.0
+        while True:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", (_WRITER_LOCK_KEY,))
+                acquired = bool(cursor.fetchone()[0])
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise WriterLockBusy(
+                    "another FotMob writer holds the bronze writer lock "
+                    f"(key {_WRITER_LOCK_KEY}) after waiting "
+                    f"{WRITER_LOCK_WAIT_SECONDS:.0f}s; refusing to write in parallel"
+                )
+            if waited == 0.0:
+                logger.info(
+                    "bronze writer lock is busy, waiting up to %.0fs for the "
+                    "current write to finish",
+                    WRITER_LOCK_WAIT_SECONDS,
+                )
+            time.sleep(WRITER_LOCK_POLL_SECONDS)
+            waited += WRITER_LOCK_POLL_SECONDS
+        if waited:
+            logger.info("bronze writer lock acquired after %.0fs", waited)
         yield True
     finally:
         # Закрытие соединения снимает замок сессии — отдельный UNLOCK не нужен
@@ -814,6 +856,47 @@ def _salvage_flush() -> None:
         logger.exception("salvage flush after runner failure also failed")
 
 
+def _shared_rpm_ceiling(environ: Mapping[str, str] | None = None) -> float:
+    """Потолок общего лимитера; ``0`` выключает его (офлайн-реплей и тесты)."""
+
+    env = os.environ if environ is None else environ
+    raw = str(env.get(FOTMOB_SHARED_RPM_ENV, "")).strip()
+    if not raw:
+        return FOTMOB_SHARED_RPM_CEILING
+    return float(raw)
+
+
+def _with_shared_rpm_ceiling(limiter, *, workers: int):
+    """Надеть на локальный лимитер общий потолок источника.
+
+    Локальный кап процесса не меняется и остаётся первым барьером: он режет
+    почти все попытки, не обращаясь к базе.
+    """
+
+    rpm = _shared_rpm_ceiling()
+    if rpm <= 0:
+        logger.warning(
+            "FotMob shared rpm ceiling disabled via %s — суммарная нагрузка "
+            "на источник не ограничена",
+            FOTMOB_SHARED_RPM_ENV,
+        )
+        return limiter
+
+    from scrapers.fbref.control.store import resolve_control_db_uri
+    from scrapers.fotmob.shared_rate_limiter import (
+        CompositeRateLimiter,
+        PgSharedRateLimiter,
+    )
+
+
+    shared = PgSharedRateLimiter(
+        resolve_control_db_uri(os.environ),
+        rpm=rpm,
+        burst=float(max(1, workers)),
+    )
+    return CompositeRateLimiter(limiter, shared)
+
+
 def _build_native_service(args, run_id: str):
     """Construct production dependencies lazily for fast CLI/unit imports."""
 
@@ -822,19 +905,22 @@ def _build_native_service(args, run_id: str):
     from scrapers.fotmob.repository import FotMobRepository
     from scrapers.fotmob.service import FotMobIngestService
     from scrapers.fotmob.transport import FotMobTransport
-    from scrapers.utils.rate_limiter import RateLimiter
+    from scrapers.fotmob.shared_rate_limiter import RefundableRateLimiter
 
     raw_store = (
         FotMobRawStore.from_uri(args.raw_store_uri)
         if args.raw_store_uri
         else FotMobRawStore.from_env(optional=False)
     )
-    limiter = RateLimiter(
+    # RefundableRateLimiter — тот же token bucket, что и раньше, плюс возврат
+    # токена, не пропущенного общим потолком (см. shared_rate_limiter).
+    limiter = RefundableRateLimiter(
         max_requests=args.requests_per_minute,
         window_seconds=60,
         # Avoid an initial 30-request burst when several workers start.
         burst_size=max(1, args.workers),
     )
+    limiter = _with_shared_rpm_ceiling(limiter, workers=args.workers)
     transport = FotMobTransport(
         raw_store=raw_store,
         max_attempts=args.max_attempts,
@@ -846,6 +932,7 @@ def _build_native_service(args, run_id: str):
     repository = FotMobRepository(
         batch_size=args.commit_batch_size,
         max_buffered_rows=args.max_buffered_rows,
+        write_guard=_writer_lock,
     )
     budget = TransportBudget(
         max_requests=args.max_requests,
@@ -2789,6 +2876,12 @@ def _run_native_unfenced(args) -> tuple[int, dict[str, Any]]:
 
     try:
         return _run_native(args)
+    except WriterLockBusy as exc:
+        # Спасать нечем: права записи нет, и salvage-flush только повторил бы
+        # ожидание замка. Класс отказа обязан доехать до верхнеуровневых
+        # `errors[]` — по нему драйвер кампании отличает уступку от неудачи.
+        logger.error("FotMob bronze writer lock unavailable: %s", exc)
+        return 1, _failure_payload(args, exc)
     except (ValueError, RuntimeError) as exc:
         logger.error("FotMob runner configuration/runtime failure: %s", exc)
         _salvage_flush()
@@ -2850,16 +2943,16 @@ def main():
     except ValueError:
         pass  # not in the main thread (unit-test harness) — keep default
     try:
-        # Замок писателя охватывает ОБА входа: ceremony-free ран не берёт
-        # ControlStore-guard вовсе, и без этого захвата ручной добор пишет в
-        # bronze параллельно полосе (B7).
-        with _writer_lock():
-            if publication is None:
-                # Ceremony-free run: no ControlStore guard and no attestation,
-                # exactly the pre-#995 runner semantics.
-                rc, payload = _run_native_unfenced(args)
-            else:
-                rc, payload = _run_native_under_fence(args, publication)
+        # Замок писателя больше не охватывает ран: его берёт репозиторий на
+        # время каждой физической записи (см. `_writer_lock` и `write_guard` в
+        # `_build_native_service`). Захват на весь ран отдавал кампании истории
+        # только промежутки между волнами.
+        if publication is None:
+            # Ceremony-free run: no ControlStore guard and no attestation,
+            # exactly the pre-#995 runner semantics.
+            rc, payload = _run_native_unfenced(args)
+        else:
+            rc, payload = _run_native_under_fence(args, publication)
     except Exception as exc:
         # Guard acquisition/validation failed before the service was built.
         # Do not salvage-flush here: there is no publication authority.

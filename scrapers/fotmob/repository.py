@@ -21,10 +21,21 @@ import json
 import logging
 import random
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Iterable,
+    Iterator,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 import pandas as pd
 
@@ -844,8 +855,22 @@ class FotMobRepository:
         schema: str = "bronze",
         batch_size: int = 1,
         max_buffered_rows: int = 20_000,
+        write_guard: Optional[Callable[[], ContextManager[Any]]] = None,
     ) -> None:
         self.writer = writer or IcebergWriter(catalog=catalog)
+        # Межпроцессная единственность писателя bronze держится ровно на время
+        # физической записи, а не на весь ран: между записями замка нет, поэтому
+        # волна контура и юнит кампании работают одновременно. Корректность
+        # exactly-once уже построена на сверке пачек ПЕРЕД записью внутри
+        # `_flush_once`, а это check-then-write — она верна только при
+        # сериализованных flush, что и обеспечивает guard.
+        self._write_guard: Callable[[], ContextManager[Any]] = (
+            write_guard or nullcontext
+        )
+        # Один раз потерянное право записи не возвращается в этом процессе:
+        # повторное ожидание замка на каждом следующем commit/flush превратило
+        # бы отказ в многочасовое зависание вместо красного рана.
+        self._write_guard_failure: Optional[BaseException] = None
         self.catalog = catalog
         self.schema = schema
         # One Iceberg commit per target makes the manifest table grow one
@@ -899,6 +924,28 @@ class FotMobRepository:
         ] = {}
         self._scope_attempt_loaded: set[tuple[str, str]] = set()
         self._preloaded = False
+
+    @contextmanager
+    def _guarded_write(self) -> Iterator[None]:
+        """Держать право записи ровно на время физического обращения к Trino."""
+
+        if self._write_guard_failure is not None:
+            raise self._write_guard_failure
+        try:
+            guard = self._write_guard()
+            guard.__enter__()
+        except BaseException as exc:
+            # Отказ ЗАХВАТА — не отказ записи: он запоминается, чтобы каждый
+            # следующий commit/flush поднял его немедленно и ран покраснел.
+            self._write_guard_failure = exc
+            raise
+        try:
+            yield
+        except BaseException as exc:
+            if not guard.__exit__(type(exc), exc, exc.__traceback__):
+                raise
+        else:
+            guard.__exit__(None, None, None)
 
     def _write(
         self,
@@ -1005,25 +1052,14 @@ class FotMobRepository:
             )
         manifest_row = commit.manifest_row()
 
-        if self.batch_size <= 1:
-            table_paths: list[str] = []
-            for table, entity_type, partition_cols, rows in prepared:
-                path = self._write(
-                    table,
-                    rows,
-                    entity_type=entity_type,
-                    partition_cols=partition_cols,
-                )
-                if path:
-                    table_paths.append(path)
-            manifest_path = self._write(
-                MANIFEST_TABLE, [manifest_row], entity_type="ingest_manifest"
-            )
-            if manifest_path:
-                table_paths.append(manifest_path)
-            self._index_committed(manifest_row)
-            return table_paths
-
+        # Небуферизованного пути записи больше нет. Прямая запись обходила
+        # сверку пачки с хранилищем (`_flush_once` → `_reconcile_pending_table`),
+        # а это единственная защита от повторной записи уже лежащей пачки:
+        # при batch_size<=1 два писателя под общим замком писали одну и ту же
+        # пачку дважды, каждый в свой заход. Теперь любой batch_size кладёт
+        # цель в буфер, а порог `batch_size` тут же вызывает flush() — сверка,
+        # ретрай конфликта коммита и замок писателя переиспользуются как есть.
+        #
         # Inventory deduplication may need authoritative Trino reads. Do all
         # of those reads before mutating the write buffer so a metadata/query
         # failure cannot leave half a target queued. New keys live in a small
@@ -1621,28 +1657,38 @@ class FotMobRepository:
 
         from scrapers.base.trino_manager import _is_iceberg_commit_conflict
 
+        # Право записи потеряно раньше — писать нечего и ждать нечего: отказ
+        # обязан подняться наверх, а не превратиться в тихий пропуск целей.
+        if self._write_guard_failure is not None:
+            raise self._write_guard_failure
+        if not self._pending and not self._pending_manifest:
+            return []
         paths: list[str] = []
-        for attempt in range(_COMMIT_CONFLICT_RETRIES):
-            try:
-                self._flush_once(paths)
-                return list(dict.fromkeys(paths))
-            except Exception as error:
-                if attempt >= _COMMIT_CONFLICT_RETRIES - 1 or not (
-                    _is_iceberg_commit_conflict(error)
-                ):
-                    raise
-                delay = min(
-                    _COMMIT_CONFLICT_MAX_DELAY,
-                    _COMMIT_CONFLICT_BASE_DELAY * (2**attempt),
-                ) + random.uniform(0, _COMMIT_CONFLICT_BASE_DELAY)
-                logger.warning(
-                    "Iceberg commit conflict on flush (attempt %d/%d), "
-                    "reconciling and retrying in %.1fs",
-                    attempt + 1,
-                    _COMMIT_CONFLICT_RETRIES,
-                    delay,
-                )
-                time.sleep(delay)
+        # Замок берётся на всю петлю ретраев: сверка пачек перед записью должна
+        # видеть согласованное хранилище, иначе чужой flush между сверкой и
+        # записью задвоил бы пачку.
+        with self._guarded_write():
+            for attempt in range(_COMMIT_CONFLICT_RETRIES):
+                try:
+                    self._flush_once(paths)
+                    return list(dict.fromkeys(paths))
+                except Exception as error:
+                    if attempt >= _COMMIT_CONFLICT_RETRIES - 1 or not (
+                        _is_iceberg_commit_conflict(error)
+                    ):
+                        raise
+                    delay = min(
+                        _COMMIT_CONFLICT_MAX_DELAY,
+                        _COMMIT_CONFLICT_BASE_DELAY * (2**attempt),
+                    ) + random.uniform(0, _COMMIT_CONFLICT_BASE_DELAY)
+                    logger.warning(
+                        "Iceberg commit conflict on flush (attempt %d/%d), "
+                        "reconciling and retrying in %.1fs",
+                        attempt + 1,
+                        _COMMIT_CONFLICT_RETRIES,
+                        delay,
+                    )
+                    time.sleep(delay)
 
     def _flush_once(self, paths: list[str]) -> None:
         """Write every buffered target as one Iceberg commit per table.
@@ -1738,87 +1784,88 @@ class FotMobRepository:
         if manager_getter is None:
             return
         trino = manager_getter()
-        trino._execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.catalog}.{self.schema}.{MANIFEST_TABLE} (
-                run_id VARCHAR,
-                target_type VARCHAR,
-                target_key VARCHAR,
-                competition_id VARCHAR,
-                source_season_key VARCHAR,
-                stage_id VARCHAR,
-                entity_id VARCHAR,
-                batch_id VARCHAR,
-                content_hash VARCHAR,
-                observation_id VARCHAR,
-                raw_uri VARCHAR,
-                parser_version VARCHAR,
-                status VARCHAR,
-                fetch_outcome VARCHAR,
-                http_status INTEGER,
-                attempts INTEGER,
-                retries INTEGER,
-                cache_hit BOOLEAN,
-                stale BOOLEAN,
-                fetched_at TIMESTAMP(6),
-                completed_at TIMESTAMP(6),
-                retry_after TIMESTAMP(6),
-                direct_bytes BIGINT,
-                proxy_bytes BIGINT,
-                encoded_bytes BIGINT,
-                decoded_bytes BIGINT,
-                expected_counts_json VARCHAR,
-                actual_counts_json VARCHAR,
-                capabilities_json VARCHAR,
-                exclusions_json VARCHAR,
-                unknown_paths_json VARCHAR,
-                error_code VARCHAR,
-                error VARCHAR,
-                _source VARCHAR,
-                _entity_type VARCHAR,
-                _ingested_at TIMESTAMP(6)
-            ) WITH (partitioning = ARRAY['target_type'])
-            """
-        )
-        trino._execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE} (
-                competition_id VARCHAR,
-                catalog_name VARCHAR,
-                profile_name VARCHAR,
-                source_gender VARCHAR,
-                source_age_group VARCHAR,
-                source_type VARCHAR,
-                probe_status VARCHAR,
-                decision VARCHAR,
-                reason VARCHAR,
-                policy_rule VARCHAR,
-                classifier_version VARCHAR,
-                profile_target_key VARCHAR,
-                profile_content_hash VARCHAR,
-                catalog_fingerprint VARCHAR,
-                authoritative_miss_count INTEGER,
-                probe_attempt_count INTEGER,
-                next_probe_at TIMESTAMP(6),
-                observed_at TIMESTAMP(6),
-                discovery_run_id VARCHAR,
-                _target_batch_id VARCHAR,
-                _payload_sha256 VARCHAR,
-                _parser_version VARCHAR,
-                _raw_uri VARCHAR,
-                _observed_at TIMESTAMP(6),
-                _source VARCHAR,
-                _entity_type VARCHAR,
-                _ingested_at TIMESTAMP(6)
-            ) WITH (partitioning = ARRAY['competition_id'])
-            """
-        )
-        trino._execute(
-            f"""
-            ALTER TABLE {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE}
-            ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER
-            """
-        )
+        with self._guarded_write():
+            trino._execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.catalog}.{self.schema}.{MANIFEST_TABLE} (
+                    run_id VARCHAR,
+                    target_type VARCHAR,
+                    target_key VARCHAR,
+                    competition_id VARCHAR,
+                    source_season_key VARCHAR,
+                    stage_id VARCHAR,
+                    entity_id VARCHAR,
+                    batch_id VARCHAR,
+                    content_hash VARCHAR,
+                    observation_id VARCHAR,
+                    raw_uri VARCHAR,
+                    parser_version VARCHAR,
+                    status VARCHAR,
+                    fetch_outcome VARCHAR,
+                    http_status INTEGER,
+                    attempts INTEGER,
+                    retries INTEGER,
+                    cache_hit BOOLEAN,
+                    stale BOOLEAN,
+                    fetched_at TIMESTAMP(6),
+                    completed_at TIMESTAMP(6),
+                    retry_after TIMESTAMP(6),
+                    direct_bytes BIGINT,
+                    proxy_bytes BIGINT,
+                    encoded_bytes BIGINT,
+                    decoded_bytes BIGINT,
+                    expected_counts_json VARCHAR,
+                    actual_counts_json VARCHAR,
+                    capabilities_json VARCHAR,
+                    exclusions_json VARCHAR,
+                    unknown_paths_json VARCHAR,
+                    error_code VARCHAR,
+                    error VARCHAR,
+                    _source VARCHAR,
+                    _entity_type VARCHAR,
+                    _ingested_at TIMESTAMP(6)
+                ) WITH (partitioning = ARRAY['target_type'])
+                """
+            )
+            trino._execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE} (
+                    competition_id VARCHAR,
+                    catalog_name VARCHAR,
+                    profile_name VARCHAR,
+                    source_gender VARCHAR,
+                    source_age_group VARCHAR,
+                    source_type VARCHAR,
+                    probe_status VARCHAR,
+                    decision VARCHAR,
+                    reason VARCHAR,
+                    policy_rule VARCHAR,
+                    classifier_version VARCHAR,
+                    profile_target_key VARCHAR,
+                    profile_content_hash VARCHAR,
+                    catalog_fingerprint VARCHAR,
+                    authoritative_miss_count INTEGER,
+                    probe_attempt_count INTEGER,
+                    next_probe_at TIMESTAMP(6),
+                    observed_at TIMESTAMP(6),
+                    discovery_run_id VARCHAR,
+                    _target_batch_id VARCHAR,
+                    _payload_sha256 VARCHAR,
+                    _parser_version VARCHAR,
+                    _raw_uri VARCHAR,
+                    _observed_at TIMESTAMP(6),
+                    _source VARCHAR,
+                    _entity_type VARCHAR,
+                    _ingested_at TIMESTAMP(6)
+                ) WITH (partitioning = ARRAY['competition_id'])
+                """
+            )
+            trino._execute(
+                f"""
+                ALTER TABLE {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE}
+                ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER
+                """
+            )
 
     def ensure_current_views(self) -> list[str]:
         """Create manifest-filtered, deduplicated ``*_current`` views.
@@ -1834,114 +1881,115 @@ class FotMobRepository:
         if manager_getter is None:
             return []
         trino = manager_getter()
-        created: list[str] = []
-        safe_parser_version = PARSER_VERSION.replace("'", "''")
-        safe_legacy_parser_version = LEGACY_PARSER_VERSION.replace("'", "''")
-        for table, (target_types, natural_key) in CURRENT_VIEW_SPECS.items():
-            if not trino.table_exists(self.schema, table):
-                continue
-            columns = trino.get_table_columns(self.schema, table)
-            available = {str(item).lower() for item in columns}
-            required_metadata = {
-                "_target_batch_id",
-                "_observed_at",
-                "_ingested_at",
-            }
-            missing_metadata = sorted(required_metadata - available)
-            if missing_metadata:
-                raise ValueError(
-                    f"{table}: current view commit columns are missing: "
-                    f"{missing_metadata}"
-                )
-            missing_keys = [key for key in natural_key if key.lower() not in available]
-            if missing_keys:
-                raise ValueError(
-                    f"{table}: current view natural-key columns are missing: "
-                    f"{missing_keys}"
-                )
-            keys = list(natural_key)
-            quoted_columns = ", ".join(f'"{column}"' for column in columns)
-            partition = ", ".join(f'r."{key}"' for key in keys)
-            types = ", ".join(
-                "'" + item.strip().replace("'", "''") + "'"
-                for item in target_types.split(",")
-            )
-            view = f"{table}_current"
-            if table in REPLACE_TARGET_CURRENT_TABLES:
-                manifest_identity = REPLACE_TARGET_MANIFEST_IDENTITIES.get(table)
-                if not manifest_identity:
+        with self._guarded_write():
+            created: list[str] = []
+            safe_parser_version = PARSER_VERSION.replace("'", "''")
+            safe_legacy_parser_version = LEGACY_PARSER_VERSION.replace("'", "''")
+            for table, (target_types, natural_key) in CURRENT_VIEW_SPECS.items():
+                if not trino.table_exists(self.schema, table):
+                    continue
+                columns = trino.get_table_columns(self.schema, table)
+                available = {str(item).lower() for item in columns}
+                required_metadata = {
+                    "_target_batch_id",
+                    "_observed_at",
+                    "_ingested_at",
+                }
+                missing_metadata = sorted(required_metadata - available)
+                if missing_metadata:
                     raise ValueError(
-                        f"{table}: replacement target has no manifest identity"
+                        f"{table}: current view commit columns are missing: "
+                        f"{missing_metadata}"
                     )
-                manifest_partition = ", ".join(manifest_identity)
-                committed_cte = f"""
-                observed_targets AS (
-                    SELECT batch_id, target_key, parser_version, status,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY {manifest_partition}
-                               ORDER BY
-                                   CASE WHEN parser_version =
-                                             '{safe_parser_version}'
-                                        THEN 1 ELSE 0 END DESC,
-                                   completed_at DESC, batch_id DESC
-                           ) AS target_rn
-                    FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
-                    WHERE target_type IN ({types})
-                      AND (
-                          (
-                              parser_version = '{safe_parser_version}'
-                              AND status IN (
-                                  'success', 'not_modified', 'not_available'
+                missing_keys = [key for key in natural_key if key.lower() not in available]
+                if missing_keys:
+                    raise ValueError(
+                        f"{table}: current view natural-key columns are missing: "
+                        f"{missing_keys}"
+                    )
+                keys = list(natural_key)
+                quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                partition = ", ".join(f'r."{key}"' for key in keys)
+                types = ", ".join(
+                    "'" + item.strip().replace("'", "''") + "'"
+                    for item in target_types.split(",")
+                )
+                view = f"{table}_current"
+                if table in REPLACE_TARGET_CURRENT_TABLES:
+                    manifest_identity = REPLACE_TARGET_MANIFEST_IDENTITIES.get(table)
+                    if not manifest_identity:
+                        raise ValueError(
+                            f"{table}: replacement target has no manifest identity"
+                        )
+                    manifest_partition = ", ".join(manifest_identity)
+                    committed_cte = f"""
+                    observed_targets AS (
+                        SELECT batch_id, target_key, parser_version, status,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY {manifest_partition}
+                                   ORDER BY
+                                       CASE WHEN parser_version =
+                                                 '{safe_parser_version}'
+                                            THEN 1 ELSE 0 END DESC,
+                                       completed_at DESC, batch_id DESC
+                               ) AS target_rn
+                        FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                        WHERE target_type IN ({types})
+                          AND (
+                              (
+                                  parser_version = '{safe_parser_version}'
+                                  AND status IN (
+                                      'success', 'not_modified', 'not_available'
+                                  )
+                              ) OR (
+                                  parser_version = '{safe_legacy_parser_version}'
+                                  AND status IN ('success', 'not_modified')
                               )
-                          ) OR (
-                              parser_version = '{safe_legacy_parser_version}'
-                              AND status IN ('success', 'not_modified')
                           )
-                      )
-                ), committed AS (
-                    SELECT DISTINCT batch_id, parser_version
-                    FROM observed_targets
-                    WHERE target_rn = 1
-                      AND status IN ('success', 'not_modified')
+                    ), committed AS (
+                        SELECT DISTINCT batch_id, parser_version
+                        FROM observed_targets
+                        WHERE target_rn = 1
+                          AND status IN ('success', 'not_modified')
+                    )
+                    """
+                else:
+                    committed_cte = f"""
+                    committed AS (
+                        SELECT DISTINCT batch_id, parser_version
+                        FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                        WHERE target_type IN ({types})
+                          AND parser_version IN (
+                              '{safe_parser_version}',
+                              '{safe_legacy_parser_version}'
+                          )
+                          AND status IN ('success', 'not_modified')
+                    )
+                    """
+                trino._execute(
+                    f"""
+                    CREATE OR REPLACE VIEW {self.catalog}.{self.schema}.{view} AS
+                    WITH {committed_cte}, ranked AS (
+                        SELECT r.*,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY {partition}
+                                   ORDER BY
+                                            CASE WHEN c.parser_version =
+                                                      '{safe_parser_version}'
+                                                 THEN 1 ELSE 0 END DESC,
+                                            r._observed_at DESC, r._ingested_at DESC,
+                                            r._target_batch_id DESC
+                               ) AS _current_rn
+                        FROM {self.catalog}.{self.schema}.{table} r
+                        INNER JOIN committed c
+                            ON c.batch_id = r._target_batch_id
+                    )
+                    SELECT {quoted_columns}
+                    FROM ranked
+                    WHERE _current_rn = 1
+                    """
                 )
-                """
-            else:
-                committed_cte = f"""
-                committed AS (
-                    SELECT DISTINCT batch_id, parser_version
-                    FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
-                    WHERE target_type IN ({types})
-                      AND parser_version IN (
-                          '{safe_parser_version}',
-                          '{safe_legacy_parser_version}'
-                      )
-                      AND status IN ('success', 'not_modified')
-                )
-                """
-            trino._execute(
-                f"""
-                CREATE OR REPLACE VIEW {self.catalog}.{self.schema}.{view} AS
-                WITH {committed_cte}, ranked AS (
-                    SELECT r.*,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY {partition}
-                               ORDER BY
-                                        CASE WHEN c.parser_version =
-                                                  '{safe_parser_version}'
-                                             THEN 1 ELSE 0 END DESC,
-                                        r._observed_at DESC, r._ingested_at DESC,
-                                        r._target_batch_id DESC
-                           ) AS _current_rn
-                    FROM {self.catalog}.{self.schema}.{table} r
-                    INNER JOIN committed c
-                        ON c.batch_id = r._target_batch_id
-                )
-                SELECT {quoted_columns}
-                FROM ranked
-                WHERE _current_rn = 1
-                """
-            )
-            created.append(f"{self.catalog}.{self.schema}.{view}")
+                created.append(f"{self.catalog}.{self.schema}.{view}")
         return created
 
     def latest_scope_evidence(
