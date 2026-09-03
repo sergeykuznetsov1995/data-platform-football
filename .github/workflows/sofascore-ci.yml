@@ -14,7 +14,6 @@ on:
       - "dags/dag_sofascore_manifest_maintenance.py"
       - "dags/.airflowignore"
       - "dags/utils/sofascore_all_mens_state.py"
-      - "dags/dag_canary_sofascore_proxy.py"
       - "dags/dag_iceberg_maintenance.py"
       - "dags/dag_sofascore_pipeline.py"
       - "dags/dag_transform_e3.py"
@@ -81,7 +80,6 @@ jobs:
             dags/dag_refresh_sofascore_all_mens.py \
             dags/dag_trigger_sofascore_daily.py \
             dags/dag_sofascore_manifest_maintenance.py \
-            dags/dag_canary_sofascore_proxy.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_sofascore_pipeline.py \
             dags/scripts/run_sofascore_scraper.py \
@@ -97,15 +95,13 @@ jobs:
             scripts/purge_sofascore_manifest_observations.py \
             scripts/sofascore_capture_manifest_guard_v1.py \
             scripts/sofascore_runtime_preflight.py \
-            scripts/proxy_filter \
-            scripts/research/bench_sofascore_paid_canary.py
+            scripts/proxy_filter
           python -m compileall -q \
             scrapers/sofascore dags/scripts dags/utils scripts/proxy_filter \
-            dags/dag_ingest_sofascore.py dags/dag_canary_sofascore_proxy.py \
+            dags/dag_ingest_sofascore.py \
             dags/dag_sofascore_pipeline.py \
             dags/dag_trigger_sofascore_daily.py dags/dag_sofascore_manifest_maintenance.py \
-            scripts/migrate_sofascore_production.py \
-            scripts/research/bench_sofascore_paid_canary.py
+            scripts/migrate_sofascore_production.py
           python -m py_compile \
             dags/dag_iceberg_maintenance.py \
             dags/utils/maintenance_tasks.py \
@@ -119,11 +115,9 @@ jobs:
         run: |
           pytest -q \
             tests/unit/configs/test_sofascore_endpoint_coverage.py \
-            tests/unit/configs/test_sofascore_proxy_canary_cohort.py \
             tests/unit/dags/test_dag_backfill_sofascore_all_mens.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
             tests/unit/dags/test_dag_refresh_sofascore_all_mens.py \
-            tests/unit/dags/test_dag_canary_sofascore_proxy.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_sofascore_pipeline.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
@@ -147,7 +141,6 @@ jobs:
             tests/unit/scrapers/test_sofascore_live_capture.py \
             tests/unit/scrapers/test_sofascore_manifest_batching.py \
             tests/unit/scrapers/test_sofascore_pipeline.py \
-            tests/unit/scrapers/test_sofascore_runtime_fingerprint.py \
             tests/unit/scrapers/test_sofascore_workload_plan.py \
             tests/unit/scrapers/test_sofascore_workload_runtime.py \
             tests/unit/scrapers/test_sofascore_raw_store.py \
@@ -156,7 +149,6 @@ jobs:
             tests/unit/scrapers/test_sofascore_scraper.py \
             tests/unit/scrapers/test_sofascore_season_pipeline.py \
             tests/unit/scripts/test_backfill_sofascore.py \
-            tests/unit/scripts/test_bench_sofascore_paid_canary.py \
             tests/unit/scripts/test_bench_sofascore_offline_replay.py \
             tests/unit/scripts/test_build_sofascore_all_mens_snapshot.py \
             tests/unit/scripts/test_enrich_sofascore_all_mens_snapshot.py \
@@ -169,7 +161,6 @@ jobs:
             tests/unit/scripts/test_run_sofascore_scope_cycle.py \
             tests/unit/scripts/test_run_sofascore_workload.py \
             tests/unit/scripts/test_sofascore_capture_manifest_guard_v1.py \
-            tests/unit/scripts/test_sofascore_proxy_budget.py \
             tests/unit/scripts/test_sofascore_runtime_preflight.py \
             tests/unit/sql/test_sofascore_league_table_silver.py \
             tests/unit/sql/test_sofascore_post_shot_xg.py \
