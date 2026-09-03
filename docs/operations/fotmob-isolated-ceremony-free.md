@@ -12,11 +12,12 @@
 
 | Что | Значение |
 |---|---|
-| Compose-проект | `fotmob-airflow`, файл `/root/fotmob-runtime/fotmob-airflow.compose.v2.yaml` |
+| Compose-проект | `fotmob-airflow`, рецепт — `deploy/fotmob/isolated.compose.yaml` (#1155; живой контур на 03.09.2026 ещё поднят из `/root/fotmob-runtime/fotmob-airflow.compose.v2.yaml` — тот же рецепт с зашитыми путями, переезд — этап 4 ниже) |
 | Контейнеры | `fotmob-airflow-scheduler` (LocalExecutor, воркеры — форки), `fotmob-airflow-metadb` |
 | Метабаза | своя, том `fotmob_airflow_pgdata`. **Никогда не переключать на общий postgres** |
-| Код | бинд-маунты `ro` из `/root/dpf-fotmob-930-runtime`: `dags`, `scrapers`, `scripts`, `configs/medallion`, `configs/fotmob`; `logs` — `rw` |
-| Блок-лист чужих DAG | file-bind `/root/fotmob-runtime/airflowignore-fotmob.v2` → `/opt/airflow/dags/.airflowignore` |
+| Код | бинд-маунты `ro` из `${FOTMOB_RELEASE_ROOT}` (сейчас `/root/dpf-fotmob-930-runtime`): `dags`, `scrapers`, `scripts`, `configs/medallion`, `configs/fotmob`; `logs` — `rw` |
+| Блок-лист чужих DAG | канонический текст — `deploy/fotmob/isolated.airflowignore`; хостовая копия `${FOTMOB_DAGBAG_IGNORE_FILE}` (сейчас `/root/fotmob-runtime/airflowignore-fotmob.v2`) file-bind'ом → `/opt/airflow/dags/.airflowignore` |
+| Автомат доставки | `deploy/fotmob/{auto_deliver,b6_deliver,window_alert}.sh` + `env.sh`, cron `*/5`; пути и пины — `/etc/data-platform/fotmob.env` (`deploy/fotmob/fotmob.env.example`) |
 | Порты наружу | нет. Общая с платформой только сеть `dp-storage` (Trino, SeaweedFS) |
 | Маркеры | `FOTMOB_ISOLATED_STACK=1`, `ALERT_ENV=fotmob-isolated` |
 
@@ -36,9 +37,124 @@ git -C /root/dpf-fotmob-930-runtime checkout --detach <sha>
 меняют инод каталога, а бинд-маунт привязан к иноду на момент старта контейнера — контейнер
 продолжит видеть старое дерево, и никакой интервал этого не исправит.
 
-Ветка, на которую указывает дерево, **не подлежит удалению**: сейчас это
-`deploy/fotmob-1149-isolated` (`94d0132a`). Точка отката — тег `fotmob-runtime-pre-1149`
-(`5852151f`, ветка `wip/fotmob-930-runtime-tree`).
+Руками так делать больше не нужно: подмену делает автомат `auto_deliver.sh` (cron `*/5`,
+описан в разделе «Рецепт контура из одного источника») — в ночное окно он зовёт
+`b6_deliver.sh apply`, который переставляет ветку `deploy/fotmob-b6-master` на
+`FOTMOB_TARGET`, принимает результат метабазой и md5 целевого модуля, а при провале
+откатывает на `FOTMOB_ROLLBACK_REF` и докладывает в Telegram. Ветки `deploy/*`, на которых
+стояло дерево, **не подлежат удалению**. Точка отката до #1149 — тег
+`fotmob-runtime-pre-1149` (`5852151f`, ветка `wip/fotmob-930-runtime-tree`).
+
+## Рецепт контура из одного источника (#1155, этап 3)
+
+До этапа 3 рецепт жил вне git: два compose-файла в `/root/fotmob-runtime` (v1 для metadb и
+init, v2 для scheduler'а), блок-лист, мёртвая копия мини-DAG и три скрипта в корне `/root`
+(автомат доставки, b6, сторож окна) с зашитыми путями и пинами. Теперь всё, что нужно, чтобы
+поднять контур с нуля, лежит в `deploy/fotmob/`:
+
+| Часть | Файл в репозитории | На хосте |
+|---|---|---|
+| Compose-проект `fotmob-airflow` (metadb, init, scheduler, webserver по профилю `ui`) | `deploy/fotmob/isolated.compose.yaml` | `docker compose -p fotmob-airflow -f … --env-file <общий .env> --env-file /etc/data-platform/fotmob.env up -d --no-deps <сервис>` |
+| Блок-лист чужих DAG | `deploy/fotmob/isolated.airflowignore` | копия `${FOTMOB_DAGBAG_IGNORE_FILE}` вне дерева, file-bind в `/opt/airflow/dags/.airflowignore`; менять только `>>` или `cp` поверх |
+| Переменные: пути машины, образы, пароль метабазы, пины выката | `deploy/fotmob/fotmob.env.example` → `/etc/data-platform/fotmob.env` (root, 0600) | второй `--env-file` для compose и единственный файл, который читают скрипты |
+| Автомат доставки, b6, сторож окна | `deploy/fotmob/{auto_deliver,b6_deliver,window_alert}.sh` + `env.sh` | один каталог (например `/usr/local/libexec/fotmob/`), две строки cron |
+
+Не путать с `deploy/fotmob/airflow.compose.yaml` + `deploy.py`: это церемониальный путь
+(проекция DagBag, deployment report, evidence, сеть `dp-backend`, другой том метабазы). В
+живом контуре он выключен с 11.08 и на этот рецепт не накладывается; его судьба — отдельное
+решение.
+
+### Единый источник истины
+
+- **Дерево** — `${FOTMOB_RELEASE_ROOT}`: git-worktree, которое автомат переставляет
+  `git checkout -B deploy/fotmob-b6-master <FOTMOB_TARGET>` под живыми bind-mount'ами.
+  Контейнеры при доставке не пересоздаются.
+- **Пины выката** — пять строк `FOTMOB_TARGET`, `FOTMOB_ROLLBACK_REF`, `FOTMOB_ROLLBACK_SHA`,
+  `FOTMOB_NEW_CODE_FILE`, `FOTMOB_NEW_CODE_MD5` в `/etc/data-platform/fotmob.env`.
+  «Поднять пин» = переписать их атомарно (write + `mv`) вне окна 19:45–23:20 UTC и не в
+  момент тика cron; скрипты не правятся и не расходятся с репозиторием. md5 цели —
+  `git show <TARGET>:scrapers/fotmob/<модуль>.py | md5sum`.
+- **Блок-лист** — `deploy/fotmob/isolated.airflowignore`. Тест
+  `tests/unit/deploy/test_fotmob_contour_recipe.py` требует, чтобы в нём был КАЖДЫЙ чужой
+  `dags/dag_*.py` и ни один из семи своих: новый чужой DAG на master без строки здесь — красный
+  CI (до этого блок-лист сопровождался руками и был fail-open). Хостовая копия монтируется
+  файлом ВНЕ дерева: file-bind из дерева протух бы по иноду при первом `checkout`, который
+  меняет этот файл (та же мина, что file-bind `dag_trigger_fotmob_daily.py` 27.07). Когда
+  репозиторный файл получил новые строки — дописать их в хостовую копию `>>`, затем сверить:
+  `sha256sum "$FOTMOB_DAGBAG_IGNORE_FILE" "$FOTMOB_RELEASE_ROOT/deploy/fotmob/isolated.airflowignore"`.
+- **Пути хоста и образы** — только `${VAR:?…}`, каждый bind длинным синтаксисом с
+  `create_host_path: false`. Проверки: `tests/unit/deploy/test_fotmob_contour_recipe.py`
+  (статика), `tests/integration/test_compose_validity.py -k fotmob` (рендер),
+  `tests/unit/deploy/test_fotmob_delivery_scripts.py` (скрипты против заглушек).
+- **Env-файл читается как compose**: `deploy/fotmob/env.sh` (`fotmob_load_env`) принимает
+  только ключи `FOTMOB_*`, ничего не подставляет и не экспортирует. Секреты платформы
+  (fernet, S3, Trino, Telegram) — по-прежнему в общем `.env`; в `fotmob.env` — только пароль
+  метабазы контура (`FOTMOB_AIRFLOW_DB_PASSWORD`: база инициализирована 17.07 значением общего
+  `AIRFLOW_DB_PASSWORD` того дня, ротация общего `.env` не должна её ломать).
+
+### Установка (один раз на хост)
+
+```bash
+install -d -m 0755 /etc/data-platform /usr/local/libexec/fotmob
+install -m 0600 deploy/fotmob/fotmob.env.example /etc/data-platform/fotmob.env   # заполнить
+install -m 0755 deploy/fotmob/auto_deliver.sh deploy/fotmob/b6_deliver.sh \
+  deploy/fotmob/window_alert.sh /usr/local/libexec/fotmob/
+install -m 0644 deploy/fotmob/env.sh /usr/local/libexec/fotmob/
+install -m 0644 deploy/fotmob/isolated.airflowignore "$FOTMOB_DAGBAG_IGNORE_FILE"  # дальше только >>
+install -d -m 0755 "$FOTMOB_STATE_DIR"   # автомат каталог состояния не создаёт
+```
+
+Cron (`crontab -e`, обе строки раз в 5 минут; окно и одноразовость — внутри скриптов):
+
+```
+*/5 * * * * /usr/local/libexec/fotmob/window_alert.sh >> /var/log/fotmob-window-alert.log 2>&1
+*/5 * * * * /usr/local/libexec/fotmob/auto_deliver.sh  >> /var/log/fotmob-auto-deliver-cron.log 2>&1
+```
+
+Метабаза и init поднимаются один раз из того же файла; дальше `up` нужен только при смене
+образа или лимитов — всегда `--no-deps`, иначе `depends_on` пересоздаст `airflow-init`:
+
+```bash
+docker compose -p fotmob-airflow -f deploy/fotmob/isolated.compose.yaml \
+  --env-file "$FOTMOB_PLATFORM_ENV_FILE" --env-file /etc/data-platform/fotmob.env \
+  up -d airflow-metadb airflow-init
+```
+
+### Переезд живого контура на этот рецепт (этап 4 #1155)
+
+Предусловия нет: боевое дерево `2c7e469f` (ветка `deploy/fotmob-b6-master`) — предок master,
+кода вне master в бою нет. Живой контур на 03.09.2026 поднят из
+`/root/fotmob-runtime/fotmob-airflow.compose.v2.yaml` (scheduler) и `…compose.yaml` (metadb и
+init — v1, с 17.07 не пересоздавались); рендер `isolated.compose.yaml` с боевыми значениями даёт
+те же монты, env, command, healthcheck и лимиты, что у работающих контейнеров. Задуманные
+отличия: `${VAR:?}` и `create_host_path: false`; init на v2-якоре (без v1-блок-листа и мёртвого
+file-bind мини-DAG); пароль метабазы — своя переменная. Шаги — руками владельца, в ночное окно
+(19:45–23:20 UTC), при остановленной кампании (`state/STOP` + выключатель автомата):
+
+1. Заполнить `/etc/data-platform/fotmob.env` живыми значениями: `FOTMOB_RELEASE_ROOT=/root/dpf-fotmob-930-runtime`,
+   образ `data-platform-airflow-scheduler:fbref-590579ef…`, `FOTMOB_POSTGRES_IMAGE=postgres:16-alpine`,
+   `FOTMOB_AIRFLOW_DB_PASSWORD` = текущий `AIRFLOW_DB_PASSWORD` общего `.env`,
+   `FOTMOB_DAGBAG_IGNORE_FILE=/root/fotmob-runtime/airflowignore-fotmob.v2`, пути автомата
+   (`/root/fotmob_history_backfill`, `/root/watchdog/state`, `/root/watchdog/fotmob_auto_deliver.log`,
+   файл `telegram.env`, хук `tg-send.sh`, `pytest` из `/root/.venvs/dpf-test`), пины — из
+   строк `TARGET=`/`ROLLBACK_*`/`NEW_CODE_*` живого `/root/fotmob-auto-deliver.sh`.
+2. Установить скрипты и cron по разделу «Установка»; старые строки cron
+   (`/root/fotmob-auto-deliver.sh`, `/root/watchdog/fotmob_window_alert.sh`) снять тем же
+   `crontab -e`. Замок, маркеры и защёлки в `/root/watchdog/state` — те же файлы, автомат
+   продолжит с текущего состояния (`fotmob-b6-accepted` = принятый SHA).
+3. Пересоздать scheduler из рецепта (`up -d --no-deps --force-recreate airflow-scheduler`) —
+   только при нуле активных ранов ингеста и пустом `pgrep run_fotmob_scraper`; metadb не
+   трогать (том `fotmob_airflow_pgdata` тот же). Init пересоздавать не обязательно; если
+   пересоздаётся — только из этого файла (v1-блок-лист больше не вернётся).
+4. Приёмка: `docker inspect fotmob-airflow-scheduler` — ровно семь bind'ов: шесть на
+   `${FOTMOB_RELEASE_ROOT}/…` и один на `${FOTMOB_DAGBAG_IGNORE_FILE}`; `import_error=0`, семь
+   активных DAG контура, `sha256sum` хостовой копии блок-листа = репозиторной.
+5. После приёмки из `/root/fotmob-runtime` нужна только хостовая копия блок-листа;
+   `fotmob-airflow.compose*.yaml`, `airflowignore-fotmob` (v1), `airflowignore-fotmob.v2.pre1149`,
+   `dag_trigger_fotmob_daily.py` (мёртвая копия — в дереве лежит другой файл),
+   `fotmob-production.env` (копия всех секретов платформы, контур её не читает),
+   `fotmob-host-trino.env`, `delta-20260717/`, `fbref-geoip/` больше не нужны — это этап 5,
+   решение владельца.
 
 ### Приёмка деплоя — только по метабазе
 
@@ -135,7 +251,12 @@ docker exec fotmob-airflow-scheduler bash -lc \
    `--deployment-report` (`required=True`), `fotmob_observe.py` его перехеширует — на
    ceremony-free контуре оба не запускаются. Разбор только через psql изолята и Trino.
 7. **`docker compose up` без `--no-deps`** потянет `fotmob-airflow-init`, который вернёт
-   протухший v1-блок-лист. Регламент — `/root/SHARED-STACK-PROTOCOL.md`.
+   протухший v1-блок-лист (пока контур поднят из старых файлов; из
+   `isolated.compose.yaml` init берёт тот же якорь, что scheduler). Регламент —
+   `/root/SHARED-STACK-PROTOCOL.md`.
+8. **File-bind файла из дерева, которое переставляет `git checkout`,** протухает по иноду:
+   git пишет изменённый файл заново, контейнер держит старый. Поэтому блок-лист монтируется
+   из хостовой копии вне дерева и правится только `>>`; в дерево его файл-бинд не переносить.
 
 ## Известные дефекты кода (issue #1159)
 
