@@ -201,8 +201,13 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 3. Заморозить дерево с коммитом, содержащим этот рецепт, выкатить `deploy.sh` —
    первое дерево в `/opt/sofascore/releases/`. Канарейка не нужна, если
    `runtime_fingerprint` дерева не изменился: verified-артефакт того же digest
-   действителен (правки только в `deploy/`, `dags/`, `tests/`, `docs/` в digest
-   не входят).
+   действителен. **`dags/` в пломбу входит частично** — четыре DAG
+   (`dag_ingest_sofascore`, оба all-mens, `dag_canary_sofascore_proxy`) и часть
+   `dags/scripts`, `dags/utils` перечислены в `RUNTIME_FILE_ENTRIES`
+   (`scrapers/sofascore/runtime_fingerprint.py`); вне пломбы целиком только
+   `deploy/`, `tests/` и `docs/`. Перед выкатом сверять digest, а не догадываться:
+   `PYTHONPATH=<дерево> python -c "from scrapers.sofascore.runtime_fingerprint import
+   runtime_fingerprint; print(runtime_fingerprint()['digest'])"`.
 4. После приёмки убрать из `/root/sofascore-runtime` старые compose/override, мини-DAG и
    `airflowignore-sofascore` (они больше не монтируются), а `pkg2/*.sh` заменить ссылкой
    на `deploy/sofascore/`.

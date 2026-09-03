@@ -19,6 +19,20 @@ sofascore_load_env "$ENV_FILE" || exit 2
   "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?}" "${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?}" \
   "${SOFASCORE_PLATFORM_ENV_FILE:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
+# Каждый шлюз — ЕДИНСТВЕННЫЙ писатель своего WAL/ledger. Два одинаковых пути свели бы
+# полосы в один каталог, и приёмка бы это пропустила: ожидаемые пути она берёт из того
+# же env-файла. Проверяем здесь, до паузы кампаний, repin и пересоздания scheduler'а —
+# на gateway-up отказ стоил бы уже пересозданных сервисов.
+LANE_STATE_DIRS="$SOFASCORE_GATEWAY_STATE_HOST_DIR
+$SOFASCORE_HISTORY_GW_STATE_HOST_DIR
+$SOFASCORE_PLAYERS_GW_STATE_HOST_DIR"
+[ "$(printf '%s\n' "$LANE_STATE_DIRS" | sort -u | wc -l)" = "3" ] \
+  || { echo "каталоги состояния полос должны быть разными: $(echo $LANE_STATE_DIRS)" >&2; exit 2; }
+while IFS= read -r lane_dir; do
+  [ -d "$lane_dir" ] && [ -w "$lane_dir" ] \
+    || { echo "каталог состояния полосы недоступен на запись: $lane_dir" >&2; exit 2; }
+done <<< "$LANE_STATE_DIRS"
+
 # Имя дерева: release-<digest8>[-<gitsha8>]; digest — идентичность runtime-контракта
 # (канарейка и артефакт), sha различает деревья с одинаковым контрактом (правка только
 # рецепта/мини-DAG). Рабочий каталог канарейки — по digest: тот же контракт = та же VERIFIED.

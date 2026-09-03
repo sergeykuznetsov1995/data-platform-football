@@ -99,6 +99,8 @@ def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, P
     state_dir = tmp_path / "stub-state"
     bin_dir = tmp_path / "bin"
     state_dir.mkdir()
+    for lane in ("gateway-state", "gateway-state-history", "gateway-state-players"):
+        (runtime / lane).mkdir(parents=True)
     _stubs(bin_dir, state_dir)
     (state_dir / f"paused_{HIST}").write_text("f\n")
     (state_dir / f"paused_{REFRESH}").write_text(f"{refresh_paused}\n")
@@ -233,6 +235,44 @@ def test_deploy_refuses_before_touching_anything_when_a_lane_state_dir_is_unset(
     )
     assert proc.returncode != 0, proc.stdout
     assert missing in proc.stderr, proc.stderr
+    assert not (state_dir / "calls.log").exists(), "ни одного вызова docker до отказа"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("break_env", "reason"),
+    [
+        (
+            lambda text, runtime: text.replace(
+                f"SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state-history",
+                f"SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state",
+            ),
+            "должны быть разными",
+        ),
+        (
+            lambda text, runtime: text.replace(
+                f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players",
+                f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/nowhere",
+            ),
+            "недоступен на запись",
+        ),
+    ],
+    ids=["two-lanes-share-one-state-dir", "lane-state-dir-does-not-exist"],
+)
+def test_deploy_refuses_a_state_layout_that_would_give_a_wal_two_writers(
+    tmp_path: Path, break_env, reason: str
+) -> None:
+    # Каталог состояния — не просто строка в env: два одинаковых пути дали бы двух
+    # писателей на один WAL, а приёмка бы это пропустила (ожидания она берёт из того
+    # же файла). Отказ обязан случиться до паузы кампаний и любого вызова docker.
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    env_file.write_text(break_env(env_file.read_text(encoding="utf-8"), runtime), encoding="utf-8")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert reason in proc.stderr, proc.stderr
     assert not (state_dir / "calls.log").exists(), "ни одного вызова docker до отказа"
 
 
