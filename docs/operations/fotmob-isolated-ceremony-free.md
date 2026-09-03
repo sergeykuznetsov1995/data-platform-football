@@ -50,7 +50,12 @@ git -C /root/dpf-fotmob-930-runtime checkout --detach <sha>
 До этапа 3 рецепт жил вне git: два compose-файла в `/root/fotmob-runtime` (v1 для metadb и
 init, v2 для scheduler'а), блок-лист, мёртвая копия мини-DAG и три скрипта в корне `/root`
 (автомат доставки, b6, сторож окна) с зашитыми путями и пинами. Теперь всё, что нужно, чтобы
-поднять контур с нуля, лежит в `deploy/fotmob/`:
+поднять контур с нуля — compose, блок-лист, переменные, автомат доставки, сторож окна, —
+лежит в `deploy/fotmob/`. Вне репозитория остаётся одно: раннер кампании истории
+(`$FOTMOB_CAMPAIGN_DIR` — `driver.sh`, `state/`, `logs/`; сейчас `/root/fotmob_history_backfill`),
+которым автомат управляет после доставки. Это временная кампания, не часть контура; без её
+каталога автомат глушит себя (лог «КАТАЛОГ КАМПАНИИ … НЕ НА МЕСТЕ»), а не доставляет
+вслепую — забрать раннер в репозиторий или отвязать от него автомат решает владелец.
 
 | Часть | Файл в репозитории | На хосте |
 |---|---|---|
@@ -131,7 +136,9 @@ install -d -m 0755 /etc/data-platform /usr/local/libexec/fotmob
 install -m 0755 deploy/fotmob/auto_deliver.sh deploy/fotmob/b6_deliver.sh \
   deploy/fotmob/window_alert.sh /usr/local/libexec/fotmob/
 install -m 0644 deploy/fotmob/env.sh /usr/local/libexec/fotmob/
-test -x "$FOTMOB_TG_HOOK"                                  # хук алерта — внешний, ставится отдельно
+test -f "$FOTMOB_TG_ENV"                                   # токен Telegram (0600) — общий с автоматом
+test -x "$FOTMOB_CAMPAIGN_DIR/driver.sh" && test -d "$FOTMOB_CAMPAIGN_DIR/state" \
+  && test -d "$FOTMOB_CAMPAIGN_DIR/logs"                    # раннер кампании — вне репозитория
 [ -e "$FOTMOB_DAGBAG_IGNORE_FILE" ] || \
   install -D -m 0644 deploy/fotmob/isolated.airflowignore "$FOTMOB_DAGBAG_IGNORE_FILE"   # -D создаёт каталог; дальше только >>
 install -d -m 0755 "$FOTMOB_STATE_DIR"                     # автомат каталог состояния не создаёт
@@ -176,7 +183,7 @@ file-bind мини-DAG); пароль метабазы — своя переме
    `FOTMOB_AIRFLOW_DB_PASSWORD` = текущий `AIRFLOW_DB_PASSWORD` общего `.env`,
    `FOTMOB_DAGBAG_IGNORE_FILE=/root/fotmob-runtime/airflowignore-fotmob.v2`, пути автомата
    (`/root/fotmob_history_backfill`, `/root/watchdog/state`, `/root/watchdog/fotmob_auto_deliver.log`,
-   файл `telegram.env`, хук `tg-send.sh`, `pytest` из `/root/.venvs/dpf-test`), пины — из
+   файл `telegram.env`, `pytest` из `/root/.venvs/dpf-test`), пины — из
    строк `TARGET=`/`ROLLBACK_*`/`NEW_CODE_*` живого `/root/fotmob-auto-deliver.sh` (там они
    уже короткие SHA — переносить как есть).
 2. Установить скрипты и cron по разделу «Установка» (env-файл уже заполнен — шаг с example
@@ -203,7 +210,7 @@ file-bind мини-DAG); пароль метабазы — своя переме
 ### Приёмка деплоя — только по метабазе
 
 `airflow dags list` и `airflow dags list-import-errors` в Airflow 2.11.2 **строят свой
-DagBag с диска** (`dag_command.py:448`, `:498`) и покажут «ровно 6 дагов, среди них
+DagBag с диска** (`dag_command.py:448`, `:498`) и покажут «ровно 7 дагов, среди них
 оркестратор» уже через секунду после `checkout`, когда планировщик ещё ничего не видел.
 `airflow dags unpause` при отсутствующей строке печатает «No paused DAGs were found»
 и выходит с **кодом 0** — неотличимо от успеха. Обе пробы как гейт не годятся.

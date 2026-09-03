@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 
@@ -37,7 +38,6 @@ REQUIRED = {
     "FOTMOB_METADB_CONTAINER",
     "FOTMOB_SCHEDULER_CONTAINER",
     "FOTMOB_TG_ENV",
-    "FOTMOB_TG_HOOK",
     "FOTMOB_HOST_PYTEST",
     "FOTMOB_TARGET",
     "FOTMOB_ROLLBACK_REF",
@@ -74,7 +74,6 @@ def _layout(tmp_path: Path) -> dict[str, str]:
         "FOTMOB_METADB_CONTAINER": "stub-metadb",
         "FOTMOB_SCHEDULER_CONTAINER": "stub-scheduler",
         "FOTMOB_TG_ENV": str(tmp_path / "telegram.env"),
-        "FOTMOB_TG_HOOK": str(tmp_path / "bin" / "tg-send"),
         "FOTMOB_HOST_PYTEST": "/bin/true",
         # Короткие SHA, как `git rev-parse --short`: автомат сравнивает пины с ним по префиксу.
         "FOTMOB_TARGET": "11111111",
@@ -126,11 +125,11 @@ def test_env_loader_reads_the_file_like_compose_and_never_exports(tmp_path: Path
         b"# comment\r\n"
         b"FOTMOB_TARGET=abc123\r\n"
         b"FOTMOB_LOG='/x/with space/log'\n"
-        b"FOTMOB_TG_HOOK=\"/x/q\\\"uote\\\\y\"\n"
+        b"FOTMOB_HOST_PYTEST=\"/x/q\\\"uote\\\\y\"\n"
     )
     probe = (
         f'. "{ENV_SH}"; fotmob_load_env "{env_file}" || exit 9; '
-        'printf "%s|%s|%s|%s|" "$FOTMOB_TARGET" "$FOTMOB_LOG" "$FOTMOB_TG_HOOK" "${FOTMOB_ROLLBACK_SHA-unset}"; '
+        'printf "%s|%s|%s|%s|" "$FOTMOB_TARGET" "$FOTMOB_LOG" "$FOTMOB_HOST_PYTEST" "${FOTMOB_ROLLBACK_SHA-unset}"; '
         'env | grep -c "^FOTMOB_TARGET=" || true'
     )
     # Экспортированный FOTMOB_ROLLBACK_SHA ключа в файле не имеет — после загрузки его
@@ -366,15 +365,24 @@ def _date_stub(stubs: Path, hhmm: str) -> None:
     )
 
 
+def _tg_env(values: dict[str, str]) -> None:
+    Path(values["FOTMOB_TG_ENV"]).write_text("TELEGRAM_BOT_TOKEN=t0k\nTELEGRAM_CHAT_ID=42\n", encoding="utf-8")
+
+
+def _curl_stub(stubs: Path, sent: Path, reply: str) -> None:
+    _stub(stubs, "curl", f'printf "%s\\n" "$*" >> "{sent}"; printf "%s" \'{reply}\'\n')
+
+
 @pytest.mark.unit
 def test_window_alert_outside_the_window_touches_nothing(tmp_path: Path) -> None:
     values = _layout(tmp_path)
+    _tg_env(values)
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     stubs = tmp_path / "bin"
     stubs.mkdir()
     _date_stub(stubs, "1200")
     _stub(stubs, "docker", 'echo "docker must not be called" >&2; exit 99\n')
-    _stub(stubs, "tg-send", 'echo "hook must not be called" >&2; exit 99\n')
+    _stub(stubs, "curl", 'echo "curl must not be called" >&2; exit 99\n')
     proc = _run(ALERT, env_file=env_file, stubs=stubs)
     assert proc.returncode == 0, proc.stderr
     assert proc.stderr == ""
@@ -382,7 +390,7 @@ def test_window_alert_outside_the_window_touches_nothing(tmp_path: Path) -> None
 
 
 @pytest.mark.unit
-def test_window_alert_without_the_hook_is_loud_and_sets_no_latch(tmp_path: Path) -> None:
+def test_window_alert_without_the_telegram_env_is_loud_and_sets_no_latch(tmp_path: Path) -> None:
     values = _layout(tmp_path)
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     stubs = tmp_path / "bin"
@@ -390,13 +398,32 @@ def test_window_alert_without_the_hook_is_loud_and_sets_no_latch(tmp_path: Path)
     _date_stub(stubs, "2000")
     proc = _run(ALERT, env_file=env_file, stubs=stubs)
     assert proc.returncode == 2
-    assert values["FOTMOB_TG_HOOK"] in proc.stderr
-    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir()), "без хука защёлка не ставится"
+    assert values["FOTMOB_TG_ENV"] in proc.stderr
+    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir()), "без токена защёлка не ставится"
 
 
 @pytest.mark.unit
-def test_window_alert_inside_an_open_window_uses_container_and_hook_from_the_env_file(tmp_path: Path) -> None:
+def test_window_alert_never_creates_the_state_dir(tmp_path: Path) -> None:
+    """Пустой каталог состояния, созданный сторожем перед тиком автомата, снял бы его
+    fail-closed проверку (нет выключателя, маркеров и суточной защёлки)."""
     values = _layout(tmp_path)
+    _tg_env(values)
+    values["FOTMOB_STATE_DIR"] = str(tmp_path / "watchdog" / "gone")
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "2000")
+    _stub(stubs, "curl", 'echo "curl must not be called" >&2; exit 99\n')
+    proc = _run(ALERT, env_file=env_file, stubs=stubs)
+    assert proc.returncode == 2
+    assert values["FOTMOB_STATE_DIR"] in proc.stderr
+    assert not Path(values["FOTMOB_STATE_DIR"]).exists()
+
+
+@pytest.mark.unit
+def test_window_alert_inside_an_open_window_sends_via_the_env_token_and_latches_once(tmp_path: Path) -> None:
+    values = _layout(tmp_path)
+    _tg_env(values)
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     stubs = tmp_path / "bin"
     stubs.mkdir()
@@ -405,51 +432,55 @@ def test_window_alert_inside_an_open_window_uses_container_and_hook_from_the_env
     calls = tmp_path / "docker.calls"
     _stub(stubs, "docker", f'echo "$*" >> "{calls}"; echo 0\n')
     sent = tmp_path / "tg.sent"
-    _stub(stubs, "tg-send", f'printf "%s\\n" "$1" >> "{sent}"\n')
+    _curl_stub(stubs, sent, '{"ok":true,"result":{}}')
     proc = _run(ALERT, env_file=env_file, stubs=stubs)
     assert proc.returncode == 0, proc.stderr
     assert calls.read_text(encoding="utf-8").startswith("exec stub-metadb psql")
-    message = sent.read_text(encoding="utf-8")
-    assert "окно доставки ОТКРЫТО" in message and values["FOTMOB_LOG"] in message
+    request = sent.read_text(encoding="utf-8")
+    assert "api.telegram.org/bott0k/sendMessage" in request and "chat_id=42" in request
+    assert "окно доставки ОТКРЫТО" in request and values["FOTMOB_LOG"] in request
     assert (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-window-alert-2026-01-01").exists()
     # Второй тик того же дня молчит.
     proc = _run(ALERT, env_file=env_file, stubs=stubs)
     assert proc.returncode == 0
-    assert sent.read_text(encoding="utf-8") == message
+    assert sent.read_text(encoding="utf-8") == request
 
 
 @pytest.mark.unit
-def test_window_alert_never_creates_the_state_dir(tmp_path: Path) -> None:
-    """Пустой каталог состояния, созданный сторожем перед тиком автомата, снял бы его
-    fail-closed проверку (нет выключателя, маркеров и суточной защёлки)."""
+@pytest.mark.parametrize("reply", ['{"ok":false,"error_code":429}', ""], ids=["api-refused", "curl-failed"])
+def test_window_alert_sets_no_latch_when_telegram_did_not_accept(tmp_path: Path, reply: str) -> None:
+    """Живой внешний хук возвращал 0 и без конфигурации, и при упавшем curl — поэтому
+    сторож судит по ответу API сам, а защёлку ставит только на "ok":true."""
     values = _layout(tmp_path)
-    values["FOTMOB_STATE_DIR"] = str(tmp_path / "watchdog" / "gone")
-    env_file = _write_env(tmp_path / "fotmob.env", **values)
-    stubs = tmp_path / "bin"
-    stubs.mkdir()
-    _date_stub(stubs, "2000")
-    _stub(stubs, "tg-send", 'echo "hook must not be called" >&2; exit 99\n')
-    proc = _run(ALERT, env_file=env_file, stubs=stubs)
-    assert proc.returncode == 2
-    assert values["FOTMOB_STATE_DIR"] in proc.stderr
-    assert not Path(values["FOTMOB_STATE_DIR"]).exists()
-
-
-@pytest.mark.unit
-def test_window_alert_sets_no_latch_when_the_hook_fails(tmp_path: Path) -> None:
-    values = _layout(tmp_path)
+    _tg_env(values)
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     stubs = tmp_path / "bin"
     stubs.mkdir()
     _date_stub(stubs, "2000")
     _stub(stubs, "pgrep", "exit 1\n")
     _stub(stubs, "docker", "echo 0\n")
-    attempts = tmp_path / "tg.attempts"
-    _stub(stubs, "tg-send", f'echo "$1" >> "{attempts}"; exit 1\n')
+    sent = tmp_path / "tg.sent"
+    _curl_stub(stubs, sent, reply)
     proc = _run(ALERT, env_file=env_file, stubs=stubs)
     assert proc.returncode == 3
-    assert "вернул ошибку" in proc.stderr
-    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir()), "неудачная отправка защёлку не ставит"
+    assert "не доставлен" in proc.stderr
+    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir()), "недоставленный алерт защёлку не ставит"
     # Следующий тик пробует снова, а не молчит до завтра.
     _run(ALERT, env_file=env_file, stubs=stubs)
-    assert attempts.read_text(encoding="utf-8").count("\n") == 2
+    assert sent.read_text(encoding="utf-8").count("\n") == 2
+
+
+@pytest.mark.unit
+def test_auto_deliver_shuts_itself_off_without_the_campaign_runner_dir(tmp_path: Path) -> None:
+    """Раннер кампании истории живёт вне репозитория; без его каталога (из env-файла)
+    автомат не доставляет вслепую, а глушит себя и говорит об этом в лог."""
+    values = _layout(tmp_path)
+    shutil.rmtree(values["FOTMOB_CAMPAIGN_DIR"])
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    proc = _run(AUTO, env_file=env_file)
+    assert proc.returncode == 1, proc.stderr
+    log = Path(values["FOTMOB_LOG"]).read_text(encoding="utf-8")
+    assert "КАТАЛОГ КАМПАНИИ" in log and values["FOTMOB_CAMPAIGN_DIR"] in log
+    state = Path(values["FOTMOB_STATE_DIR"])
+    assert (state / "fotmob-auto-deliver.off").exists(), "автомат глушит себя"
+    assert "каталог кампании" in (state / "fotmob-pending-alert").read_text(encoding="utf-8")
