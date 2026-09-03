@@ -12,10 +12,10 @@
 | Часть | Файл в репозитории | Compose-проект / unit | Что монтирует |
 | --- | --- | --- | --- |
 | Планировщик + своя metadata-DB | `deploy/sofascore/airflow.compose.yaml` | `sofascore-airflow` (`sofascore-airflow-scheduler`, `sofascore-airflow-metadb`, `airflow-init`, `airflow-webserver` по профилю `ui`) | код — из `${SOFASCORE_RELEASE_ROOT}`; состояние кампании, verified-артефакт, пул прокси, venv-шим — из runtime-каталога |
-| Платный шлюз | `deploy/sofascore/gateway.compose.yaml` | `sofascore-gw` (`sofascore_gw_951`, алиас сервиса `sofascore_proxy_filter` в сети `sofascore-net`) | всё дерево релиза в `/opt/sofascore-repo:ro`; артефакт, WAL/ledger, fallback-файл — из runtime-каталога |
+| Платные шлюзы полос (3 шт.) | `deploy/sofascore/gateway.compose.yaml` | `sofascore-gw` (`sofascore_gw_951` с алиасом сервиса `sofascore_proxy_filter`, `sofascore_gw_history`, `sofascore_gw_players` в сети `sofascore-net`) | всё дерево релиза в `/opt/sofascore-repo:ro`; артефакт и fallback-файл общие, WAL/ledger — свой каталог у каждого |
 | Блок-лист DagBag | `deploy/sofascore/.airflowignore` | накрывает `dags/.airflowignore` внутри scheduler'а | — |
 | Мини-DAG контура | `dags/dag_trigger_sofascore_daily.py`, `dags/dag_sofascore_manifest_maintenance.py` | обычные файлы `dags/`; на общем scheduler'е спрятаны через `dags/.airflowignore` | — |
-| Сторож аренд | `deploy/sofascore/gateway_lease_watchdog.py` + `systemd/sofascore-gw-lease-watchdog.service` | `sofascore-gw-lease-watchdog.service`, читает `/etc/data-platform/sofascore.env` | — |
+| Сторожа аренд (3 шт.) | `deploy/sofascore/gateway_lease_watchdog.py` + `systemd/sofascore-gw-lease-watchdog{,-history,-players}.service` | одноимённые unit'ы, все читают `/etc/data-platform/sofascore.env` | — |
 | Ротация | `freeze_release.sh` → `run_canary.sh` → `deploy.sh` → `postdeploy_checks.sh` | — | — |
 | Переменные | `deploy/sofascore/sofascore.env.example` → `/etc/data-platform/sofascore.env` | второй `--env-file` после общего `.env` платформы | — |
 
@@ -24,6 +24,29 @@
 ежедневника), `dag_sofascore_manifest_maintenance` (воскресенье 05:00 UTC). Остальные
 файлы `dags/` блок-лист не пускает в DagBag (движок RE2, lookahead не работает —
 поэтому блок-лист, а не allow-list).
+
+## Три полосы источника (#1244)
+
+С 03.09.2026 кампания истории, актуалка и дейли не делят один слот аренды: до развода
+`--max-active-leases 1` на общем шлюзе давал `HTTP 429: paid-proxy concurrency limit
+reached` почти на каждом запуске истории (03.09 за сутки — 105 упавших запусков
+`run_historical_scope` против 3 успешных).
+
+| Полоса | Шлюз (сервис / контейнер) | Пул Airflow | Дневной потолок |
+| --- | --- | --- | --- |
+| Актуалка + дейли | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ |
+| Кампания истории | `sofascore_gw_history` / `sofascore_gw_history` | `sofascore_history_pool` | 2000 МБ |
+| Профили игроков | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
+
+Сумма дневных потолков — труба источника, 3 ГБ/сутки. Потолок и число активных аренд у
+каждой полосы — переменные окружения (`SOFASCORE_{PROXY,HISTORY_GW,PLAYERS_GW}_{DAILY_BUDGET_MB,
+MAX_ACTIVE_LEASES}`), слоты пулов — `SOFASCORE_{HISTORY,PLAYERS}_POOL_SLOTS`: расширение
+полосы правит `/etc/data-platform/sofascore.env`, а не рецепт. Пулы ставит `airflow-init`
+при первом подъёме и шаг `pools` в `deploy.sh` на каждой ротации (init на ротации не
+пересоздаётся). У каждого шлюза СВОЙ каталог состояния (`gateway-state`,
+`gateway-state-history`, `gateway-state-players`): WAL и ledger рассчитаны на
+единственного писателя. Артефакт бюджета, пул прокси и токен контрольной плоскости —
+общие: runtime-контракт у трёх шлюзов один.
 
 ## Единый источник истины
 
@@ -151,6 +174,10 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 отличия: `.airflowignore` берётся из дерева, file-bind'ов мини-DAG нет,
 `create_host_path: false`). Шаги переезда, все — руками владельца в тихое окно:
 
+0. Создать каталоги состояния новых шлюзов рядом с существующим:
+   `<runtime-dir>/gateway-state-history` и `<runtime-dir>/gateway-state-players`
+   (владелец и права — как у `<runtime-dir>/gateway-state`). Свой каталог у каждого
+   шлюза обязателен: WAL и ledger рассчитаны на единственного писателя.
 1. Заполнить `/etc/data-platform/sofascore.env` из живых значений
    (`SOFASCORE_RELEASE_ROOT=/root/dpf-release-6e91eb05`, артефакт `6e91eb05…`, каталоги
    `/root/sofascore-runtime/{all-men,gateway-state,legacy-scraper-venv}`,
@@ -161,8 +188,11 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    как у живой метабазы).
 2. Заморозить дерево с коммитом, содержащим этот рецепт, прогнать канарейку, выкатить
    `deploy.sh` — первое дерево в `/opt/sofascore/releases/`.
-3. Установить unit и бинарь сторожа из репозитория, снять drop-in
-   `/etc/systemd/system/sofascore-gw-lease-watchdog.service.d/override.conf`.
+3. Установить бинарь сторожа и ТРИ unit'а из репозитория (по одному на полосу:
+   `sofascore-gw-lease-watchdog{,-history,-players}.service`), снять drop-in
+   `/etc/systemd/system/sofascore-gw-lease-watchdog.service.d/override.conf`,
+   `daemon-reload`, `enable` все три. Рестартовать их не нужно — это последний
+   шаг `deploy.sh`.
 4. После приёмки убрать из `/root/sofascore-runtime` старые compose/override, мини-DAG и
    `airflowignore-sofascore` (они больше не монтируются), а `pkg2/*.sh` заменить ссылкой
    на `deploy/sofascore/`.

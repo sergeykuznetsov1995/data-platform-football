@@ -25,6 +25,12 @@ CONTOUR_AIRFLOWIGNORE = DEPLOY / ".airflowignore"
 SHARED_AIRFLOWIGNORE = ROOT / "dags" / ".airflowignore"
 ENV_EXAMPLE = DEPLOY / "sofascore.env.example"
 UNIT = DEPLOY / "systemd" / "sofascore-gw-lease-watchdog.service"
+# По сторожу на полосу: сторож смотрит один контейнер и один каталог состояния.
+LANE_UNITS = {
+    "sofascore_proxy_filter": UNIT,
+    "sofascore_gw_history": DEPLOY / "systemd" / "sofascore-gw-lease-watchdog-history.service",
+    "sofascore_gw_players": DEPLOY / "systemd" / "sofascore-gw-lease-watchdog-players.service",
+}
 SCRIPTS = (
     DEPLOY / "freeze_release.sh",
     DEPLOY / "run_canary.sh",
@@ -323,3 +329,27 @@ def test_watchdog_unit_reads_the_contour_env_file_instead_of_pinning_a_tree() ->
     assert "--state-dir ${SOFASCORE_GATEWAY_STATE_HOST_DIR}" in unit
     assert not HOST_PATH_LITERAL.search(unit)
     assert "dpf-release" not in unit
+
+
+@pytest.mark.unit
+def test_every_lane_has_a_watchdog_bound_to_its_own_gateway_and_state_dir() -> None:
+    cfg = _load(GATEWAY_COMPOSE)
+    assert set(LANE_UNITS) == set(cfg["services"])
+    seen = set()
+    for service, unit_path in LANE_UNITS.items():
+        unit = _code_lines(unit_path)
+        gateway = cfg["services"][service]
+        state = next(
+            v["source"] for v in gateway["volumes"]
+            if v["target"] == "/opt/airflow/logs/sofascore_proxy_filter"
+        )
+        # Сторож освобождает залипший слот аренды: перепутанная пара «контейнер /
+        # каталог состояния» рестартовала бы чужой шлюз по чужому WAL.
+        assert f"--container {gateway['container_name']} " in unit + " ", unit_path.name
+        assert f"--state-dir {state.split(':?')[0]}" + "}" in unit, unit_path.name
+        assert "EnvironmentFile=/etc/data-platform/sofascore.env" in unit, unit_path.name
+        assert "--expected-mount ${SOFASCORE_RELEASE_ROOT}" in unit, unit_path.name
+        assert not HOST_PATH_LITERAL.search(unit), unit_path.name
+        assert "dpf-release" not in unit, unit_path.name
+        seen.add((gateway["container_name"], state))
+    assert len(seen) == 3, seen

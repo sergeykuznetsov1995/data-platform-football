@@ -1,0 +1,51 @@
+[Unit]
+Description=Free the SofaScore history gateway's single lease slot when a lease latches stuck
+Documentation=https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/deploy/sofascore/gateway_lease_watchdog.py
+Requires=docker.service
+After=docker.service
+
+[Service]
+# Свой unit на каждую полосу (#1244): сторож смотрит ОДИН контейнер и ОДИН
+# каталог состояния, а у трёх шлюзов каталоги разные (единственный писатель
+# WAL/ledger). Всё остальное — как у sofascore-gw-lease-watchdog.service.
+Type=simple
+User=root
+Group=root
+UMask=0077
+# Install with:
+#   install -m 0755 deploy/sofascore/gateway_lease_watchdog.py \
+#       /usr/local/libexec/sofascore-gw-lease-watchdog
+#   install -m 0644 deploy/sofascore/systemd/sofascore-gw-lease-watchdog-history.service \
+#       /etc/systemd/system/ && systemctl daemon-reload
+# The unit deliberately does not run the file straight out of a git checkout:
+# a mid-flight pull would swap the code of a process that restarts containers.
+#
+# The expected release mount, the state directory and the alert command come
+# from the contour env file (deploy/sofascore/sofascore.env.example), the same
+# file deploy.sh repins on every rotation — no drop-in edits, just a restart.
+EnvironmentFile=/etc/data-platform/sofascore.env
+ExecStart=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog \
+    --container sofascore_gw_history \
+    --state-dir ${SOFASCORE_HISTORY_GW_STATE_HOST_DIR} \
+    --expected-mount ${SOFASCORE_RELEASE_ROOT} \
+    --alert-command ${SOFASCORE_WATCHDOG_ALERT_COMMAND}
+Restart=always
+RestartSec=30
+# It reads gateway state and shells out to docker; nothing here should ever
+# need more than that.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/run/docker.sock
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
