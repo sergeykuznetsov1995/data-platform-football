@@ -14,6 +14,10 @@
 set -euo pipefail
 
 ENV_FILE="${FOTMOB_ENV_FILE:-/etc/data-platform/fotmob.env}"
+# Эстафета автомата (одноразовый пропуск) приходит окружением, а не env-файлом;
+# загрузчик ниже сбрасывает ВСЕ FOTMOB_*, поэтому её значения снимаются до него.
+DELIVER_NONCE=${FOTMOB_DELIVER_NONCE:-}
+DELIVER_NONCE_FILE=${FOTMOB_DELIVER_NONCE_FILE:-}
 # shellcheck source=deploy/fotmob/env.sh
 . "$(dirname "$(readlink -f "$0")")/env.sh"
 fotmob_load_env "$ENV_FILE" || exit 2
@@ -92,11 +96,11 @@ if [ "$MODE" = apply ] && [ "$DRY" = 0 ]; then
   # сознательно повторяющего весь протокол, это не защита и быть ею не может;
   # цель — чтобы ручной запуск не прошёл мимо маркера, отката и алертов.
   nonce_ok=0
-  if [ -n "${FOTMOB_DELIVER_NONCE:-}" ] && [ -n "${FOTMOB_DELIVER_NONCE_FILE:-}" ] \
-     && [ -f "$FOTMOB_DELIVER_NONCE_FILE" ] && [ ! -L "$FOTMOB_DELIVER_NONCE_FILE" ] \
-     && [ "$(cat "$FOTMOB_DELIVER_NONCE_FILE" 2>/dev/null)" = "$FOTMOB_DELIVER_NONCE" ]; then
+  if [ -n "$DELIVER_NONCE" ] && [ -n "$DELIVER_NONCE_FILE" ] \
+     && [ -f "$DELIVER_NONCE_FILE" ] && [ ! -L "$DELIVER_NONCE_FILE" ] \
+     && [ "$(cat "$DELIVER_NONCE_FILE" 2>/dev/null)" = "$DELIVER_NONCE" ]; then
     nonce_ok=1
-    rm -f "$FOTMOB_DELIVER_NONCE_FILE"
+    rm -f "$DELIVER_NONCE_FILE"
   fi
   if [ "$(readlink /proc/self/fd/9 2>/dev/null)" != "$LOCK_REAL" ] \
      || flock -n "$LOCKFILE" true 2>/dev/null \

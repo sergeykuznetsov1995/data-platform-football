@@ -54,7 +54,7 @@ init, v2 для scheduler'а), блок-лист, мёртвая копия ми
 
 | Часть | Файл в репозитории | На хосте |
 |---|---|---|
-| Compose-проект `fotmob-airflow` (metadb, init, scheduler, webserver по профилю `ui`) | `deploy/fotmob/isolated.compose.yaml` | `docker compose -p fotmob-airflow -f … --env-file <общий .env> --env-file /etc/data-platform/fotmob.env up -d --no-deps <сервис>` |
+| Compose-проект `fotmob-airflow` (metadb, init, scheduler, webserver по профилю `ui`) | `deploy/fotmob/isolated.compose.yaml` | `docker compose -p fotmob-airflow -f … --env-file "$FOTMOB_PLATFORM_ENV_FILE" --env-file /etc/data-platform/fotmob.env up -d --no-deps <сервис>` (после `fotmob_load_env`) |
 | Блок-лист чужих DAG | `deploy/fotmob/isolated.airflowignore` | копия `${FOTMOB_DAGBAG_IGNORE_FILE}` вне дерева, file-bind в `/opt/airflow/dags/.airflowignore`; менять только `>>` или `cp` поверх |
 | Переменные: пути машины, образы, пароль метабазы, пины выката | `deploy/fotmob/fotmob.env.example` → `/etc/data-platform/fotmob.env` (root, 0600) | второй `--env-file` для compose и единственный файл, который читают скрипты |
 | Автомат доставки, b6, сторож окна | `deploy/fotmob/{auto_deliver,b6_deliver,window_alert}.sh` + `env.sh` | один каталог (например `/usr/local/libexec/fotmob/`), две строки cron |
@@ -105,10 +105,13 @@ init, v2 для scheduler'а), блок-лист, мёртвая копия ми
 - **Env-файл читается как compose**: `deploy/fotmob/env.sh` (`fotmob_load_env`) принимает
   только ключи `FOTMOB_*`, ничего не подставляет и не экспортирует; чтобы compose и скрипты
   не прочли один файл по-разному, значения с `$` и inline-комментарии ` #` загрузчик
-  отвергает, пути пишутся без хвостового `/`. В shell оператора не должно быть
-  экспортированных `FOTMOB_*`: окружение процесса у compose старше `--env-file` и молча
-  перекрыло бы файл — перед `docker compose` снимайте их (`unset $(compgen -v FOTMOB_)`,
-  как в командах ниже). Секреты платформы
+  отвергает, пути пишутся без хвостового `/`. Файл — единственный источник: загрузчик
+  сначала снимает ВСЕ `FOTMOB_*` из окружения (и экспортированные тоже), потом читает файл,
+  поэтому унаследованное значение не переживёт файл без этого ключа. У compose окружение
+  процесса старше `--env-file`, и экспортированный `FOTMOB_*` молча перекрыл бы файл — все
+  команды compose ниже идут после `fotmob_load_env`, который такие переменные уже снял.
+  Общий `.env` платформы compose получает первым `--env-file` из
+  `FOTMOB_PLATFORM_ENV_FILE` (скрипты этот ключ не читают). Секреты платформы
   (fernet, S3, Trino, Telegram) — по-прежнему в общем `.env`; в `fotmob.env` — только пароль
   метабазы контура (`FOTMOB_AIRFLOW_DB_PASSWORD`: база инициализирована 17.07 значением общего
   `AIRFLOW_DB_PASSWORD` того дня, ротация общего `.env` не должна её ломать).
@@ -130,7 +133,7 @@ install -m 0755 deploy/fotmob/auto_deliver.sh deploy/fotmob/b6_deliver.sh \
 install -m 0644 deploy/fotmob/env.sh /usr/local/libexec/fotmob/
 test -x "$FOTMOB_TG_HOOK"                                  # хук алерта — внешний, ставится отдельно
 [ -e "$FOTMOB_DAGBAG_IGNORE_FILE" ] || \
-  install -m 0644 deploy/fotmob/isolated.airflowignore "$FOTMOB_DAGBAG_IGNORE_FILE"   # дальше только >>
+  install -D -m 0644 deploy/fotmob/isolated.airflowignore "$FOTMOB_DAGBAG_IGNORE_FILE"   # -D создаёт каталог; дальше только >>
 install -d -m 0755 "$FOTMOB_STATE_DIR"                     # автомат каталог состояния не создаёт
 install -d -o 50000 -g 0 -m 0775 "$FOTMOB_RELEASE_ROOT/logs"   # logs/ не в git; compose источники bind'ов не создаёт
 ```
@@ -143,14 +146,18 @@ Cron root'а (`crontab -e` под root; обе строки раз в 5 мину
 */5 * * * * /usr/local/libexec/fotmob/auto_deliver.sh  >> /var/log/fotmob-auto-deliver-cron.log 2>&1
 ```
 
-Метабаза и init поднимаются один раз из того же файла; дальше `up` нужен только при смене
-образа или лимитов — всегда `--no-deps`, иначе `depends_on` пересоздаст `airflow-init`:
+Первый запуск контура — три шага по одному сервису из того же файла, в том же shell (после
+`fotmob_load_env`); дальше `up` нужен только при смене образа или лимитов. Всегда
+`--no-deps`: без него `depends_on` пересоздаёт `airflow-init` (у metadb → init →
+scheduler порядок обеспечивают `--wait` и явная последовательность команд):
 
 ```bash
-unset $(compgen -v FOTMOB_)   # экспортированные FOTMOB_* перекрыли бы --env-file
-docker compose -p fotmob-airflow -f deploy/fotmob/isolated.compose.yaml \
-  --env-file <общий .env платформы> --env-file /etc/data-platform/fotmob.env \
-  up -d airflow-metadb airflow-init
+fmc(){ docker compose -p fotmob-airflow -f deploy/fotmob/isolated.compose.yaml \
+  --env-file "$FOTMOB_PLATFORM_ENV_FILE" --env-file /etc/data-platform/fotmob.env "$@"; }
+fmc up -d --no-deps --wait airflow-metadb                       # ждёт healthy
+fmc up --no-deps --exit-code-from airflow-init airflow-init     # разово, до «init complete»
+fmc up -d --no-deps airflow-scheduler
+# UI для приёмки (опционально): fmc --profile ui up -d --no-deps airflow-webserver → http://127.0.0.1:8084
 ```
 
 ### Переезд живого контура на этот рецепт (этап 4 #1155)
@@ -178,8 +185,8 @@ file-bind мини-DAG); пароль метабазы — своя переме
    `/root/watchdog/fotmob_window_alert.sh`) снять тем же root-`crontab -e`. Замок, маркеры и
    защёлки в `/root/watchdog/state` — те же файлы, автомат продолжит с текущего состояния
    (`fotmob-b6-accepted` = принятый SHA).
-3. Пересоздать scheduler из рецепта (`up -d --no-deps --force-recreate airflow-scheduler`, из
-   shell без экспортированных `FOTMOB_*`) — только при нуле активных ранов ингеста и пустом
+3. Пересоздать scheduler из рецепта (`fmc up -d --no-deps --force-recreate airflow-scheduler`
+   из раздела «Установка», после `fotmob_load_env`) — только при нуле активных ранов ингеста и пустом
    `pgrep run_fotmob_scraper`; metadb не трогать (том `fotmob_airflow_pgdata` тот же). Init
    пересоздавать не обязательно; если пересоздаётся — только из этого файла (v1-блок-лист
    больше не вернётся).

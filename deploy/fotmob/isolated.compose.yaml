@@ -23,8 +23,9 @@
 #
 # Запуск (после заполнения env-файла контура):
 #   docker compose -p fotmob-airflow -f deploy/fotmob/isolated.compose.yaml \
-#     --env-file <общий .env> --env-file <fotmob.env> up -d --no-deps airflow-scheduler
-#   ВСЕГДА --no-deps: без него depends_on пересоздаст airflow-init
+#     --env-file "$FOTMOB_PLATFORM_ENV_FILE" --env-file <fotmob.env> up -d --no-deps airflow-scheduler
+#   ВСЕГДА --no-deps (и при первом запуске: metadb --wait → init → scheduler по одному,
+#   см. рунбук): без него depends_on пересоздаст airflow-init
 #   (см. SHARED-STACK-PROTOCOL.md). Доставка кода контейнеры НЕ пересоздаёт —
 #   она подменяет дерево под bind-mount'ом (auto_deliver.sh / b6_deliver.sh).
 name: fotmob-airflow
@@ -210,7 +211,7 @@ services:
         reservations:
           memory: 1G
 
-  # Опциональный UI для приёмки: ... --profile ui up -d ; http://127.0.0.1:8084
+  # Опциональный UI для приёмки: ... --profile ui up -d --no-deps airflow-webserver ; http://127.0.0.1:8084
   airflow-webserver:
     <<: *fm-airflow-common
     container_name: fotmob-airflow-webserver

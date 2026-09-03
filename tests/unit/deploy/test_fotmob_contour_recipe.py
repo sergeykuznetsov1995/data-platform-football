@@ -26,6 +26,10 @@ COMPOSE = DEPLOY / "isolated.compose.yaml"
 BLOCKLIST = DEPLOY / "isolated.airflowignore"
 ENV_EXAMPLE = DEPLOY / "fotmob.env.example"
 ENV_SH = DEPLOY / "env.sh"
+RUNBOOK = ROOT / "docs" / "operations" / "fotmob-isolated-ceremony-free.md"
+# Имена, которые скрипты законно берут из окружения ДО загрузчика (он сбрасывает все
+# FOTMOB_*): путь к самому env-файлу и эстафета автомата b6.
+PROCESS_PROTOCOL = {"FOTMOB_ENV_FILE", "FOTMOB_DELIVER_NONCE", "FOTMOB_DELIVER_NONCE_FILE"}
 SCRIPTS = (
     DEPLOY / "auto_deliver.sh",
     DEPLOY / "b6_deliver.sh",
@@ -222,6 +226,12 @@ def test_delivery_scripts_take_every_host_path_and_pin_from_the_env_file() -> No
         assert "FOTMOB_ENV_FILE" in text, f"{script.name}: must read the contour env file"
         assert 'fotmob_load_env "$ENV_FILE"' in text, f"{script.name}: must use the shared loader"
         assert "set -a" not in text, f"{script.name}: exporting the env file lets stale values leak"
+        # Загрузчик сбрасывает все FOTMOB_* окружения, поэтому всё, что скрипт берёт из
+        # окружения под этим именем, снимается ДО него — и только имена протокола процесса.
+        before, after = text.split('fotmob_load_env "$ENV_FILE"', 1)
+        early = set(re.findall(r"\$\{(FOTMOB_[A-Z0-9_]+)", before))
+        assert early <= PROCESS_PROTOCOL, f"{script.name}: {sorted(early - PROCESS_PROTOCOL)} read before the loader"
+        assert "${FOTMOB_DELIVER_NONCE" not in after, f"{script.name}: handshake read after the loader wiped it"
         subprocess.run(["bash", "-n", str(script)], check=True)
         for key in re.findall(r"\$\{(FOTMOB_[A-Z0-9_]+):\?", text):
             assert key in example_keys, f"{script.name}: {key} missing from fotmob.env.example"
@@ -246,3 +256,19 @@ def test_env_example_covers_every_fail_closed_compose_variable() -> None:
     assert all(key.startswith("FOTMOB_") for key in example_keys), "env.sh accepts only FOTMOB_* keys"
     assert not HOST_PATH_LITERAL.search(ENV_EXAMPLE.read_text(encoding="utf-8"))
     assert "FOTMOB_DAGBAG_IGNORE_FILE" in example_keys
+    # Ключ без потребителя — второй источник хостового пути: его правят, а читает никто.
+    referenced: set[str] = set()
+    for path in (COMPOSE, *SCRIPTS, RUNBOOK):
+        referenced |= set(re.findall(r"FOTMOB_[A-Z0-9_]+", path.read_text(encoding="utf-8")))
+    unused = example_keys - referenced
+    assert not unused, f"{ENV_EXAMPLE.name}: {sorted(unused)} read by nothing (compose, scripts, runbook)"
+
+
+@pytest.mark.unit
+def test_runbook_never_runs_compose_up_without_no_deps() -> None:
+    """`up` без `--no-deps` тянет depends_on и пересоздаёт airflow-init (общий стек —
+    SHARED-STACK-PROTOCOL.md); первый запуск тоже идёт по одному сервису."""
+    for path in (RUNBOOK, COMPOSE):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if re.search(r"\bup( -d)?\b", line) and ("compose" in line or line.lstrip().startswith("fmc ")):
+                assert "--no-deps" in line, f"{path.name}: {line.strip()}"

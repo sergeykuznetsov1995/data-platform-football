@@ -25,6 +25,9 @@ ENV_SH = DEPLOY / "env.sh"
 AUTO = DEPLOY / "auto_deliver.sh"
 B6 = DEPLOY / "b6_deliver.sh"
 ALERT = DEPLOY / "window_alert.sh"
+# Фиксированный PATH автомата (cron-гигиена): заглушки из PATH окружения он не видит,
+# поэтому прогон идёт на установленной копии с этой единственной правкой.
+PATH_LINE = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
 
 REQUIRED = {
     "FOTMOB_RELEASE_ROOT",
@@ -82,6 +85,22 @@ def _layout(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _install(tmp_path: Path, stubs: Path) -> Path:
+    """Копия deploy/fotmob как после `install` рунбука (скрипты рядом, автомат зовёт
+    b6_deliver.sh по соседству) с ровно одной правкой: фиксированный PATH автомата
+    получает впереди каталог заглушек. Возвращает путь установленного автомата."""
+    libexec = tmp_path / "libexec"
+    libexec.mkdir()
+    for src in (AUTO, B6, ALERT, ENV_SH):
+        text = src.read_text(encoding="utf-8")
+        if src == AUTO:
+            assert text.count(PATH_LINE) == 1, "автомат перестал фиксировать PATH — правь тест"
+            text = text.replace(PATH_LINE, PATH_LINE.replace("export PATH=", f"export PATH={stubs}:"))
+        (libexec / src.name).write_text(text, encoding="utf-8")
+        (libexec / src.name).chmod(0o755)
+    return libexec / AUTO.name
+
+
 def _run(script: Path, *args: str, env_file: Path, stubs: Path | None = None, extra_env: dict | None = None,
          cwd: Path | None = None) -> subprocess.CompletedProcess:
     env = {
@@ -111,15 +130,18 @@ def test_env_loader_reads_the_file_like_compose_and_never_exports(tmp_path: Path
     )
     probe = (
         f'. "{ENV_SH}"; fotmob_load_env "{env_file}" || exit 9; '
-        'printf "%s|%s|%s|" "$FOTMOB_TARGET" "$FOTMOB_LOG" "$FOTMOB_TG_HOOK"; '
+        'printf "%s|%s|%s|%s|" "$FOTMOB_TARGET" "$FOTMOB_LOG" "$FOTMOB_TG_HOOK" "${FOTMOB_ROLLBACK_SHA-unset}"; '
         'env | grep -c "^FOTMOB_TARGET=" || true'
     )
+    # Экспортированный FOTMOB_ROLLBACK_SHA ключа в файле не имеет — после загрузки его
+    # не должно быть вовсе: файл — единственный источник, не «файл поверх окружения».
     proc = subprocess.run(
-        ["bash", "-c", probe], env={**os.environ, "FOTMOB_TARGET": "stale-exported"},
+        ["bash", "-c", probe],
+        env={**os.environ, "FOTMOB_TARGET": "stale-exported", "FOTMOB_ROLLBACK_SHA": "deadbeef"},
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == 'abc123|/x/with space/log|/x/q"uote\\y|0\n'
+    assert proc.stdout == 'abc123|/x/with space/log|/x/q"uote\\y|unset|0\n'
 
     for name, values, message in (
         ("foreign", {"FOTMOB_TARGET": "a", "PATH": "/evil"}, "недопустимый ключ"),
@@ -177,20 +199,31 @@ def test_auto_deliver_fails_closed_on_a_missing_pin(tmp_path: Path) -> None:
     assert proc.returncode != 0
     assert "FOTMOB_TARGET" in proc.stderr
     assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-auto-deliver.lock").exists()
+    # Значение из окружения (cron-строка, забытый export) файл без ключа не заменяет.
+    proc = _run(AUTO, env_file=env_file, extra_env={"FOTMOB_TARGET": "deadbee"})
+    assert proc.returncode != 0
+    assert "FOTMOB_TARGET" in proc.stderr
+    assert not Path(values["FOTMOB_LOG"]).exists(), "автомат не сделал ни шага"
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("script", [AUTO, B6], ids=["auto", "b6"])
-def test_scripts_refuse_a_full_length_sha_pin(tmp_path: Path, script: Path) -> None:
-    """Пины сравниваются с `git rev-parse --short HEAD` по префиксу: полный SHA никогда не
-    совпал бы, и исправное дерево считалось бы незаконным — лучше не стартовать."""
+@pytest.mark.parametrize("key", ["FOTMOB_TARGET", "FOTMOB_ROLLBACK_SHA"])
+@pytest.mark.parametrize(
+    "bad", ["1" * 40, "abc12", "deadbeef1", "DEADBEE", "deploy/fotmob-b6-master"],
+    ids=["full-sha", "too-short", "nine-hex", "upper", "ref-name"],
+)
+def test_scripts_refuse_a_pin_that_is_not_a_short_sha(tmp_path: Path, key: str, bad: str) -> None:
+    """Пины сравниваются с `git rev-parse --short HEAD` по префиксу: полный SHA (или имя
+    ветки) никогда не совпал бы, и исправное дерево считалось бы незаконным — лучше не
+    стартовать. Оба скрипта, оба сверяемых пина."""
     values = _layout(tmp_path)
-    values["FOTMOB_TARGET"] = "1" * 40
+    values[key] = bad
     env_file = _write_env(tmp_path / "fotmob.env", **values)
-    proc = _run(script, "check", env_file=env_file)
-    assert proc.returncode == 2, proc.stderr
-    assert "FOTMOB_TARGET" in proc.stderr and "короткий SHA" in proc.stderr
-    assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-auto-deliver.lock").exists()
+    for script in (AUTO, B6):
+        proc = _run(script, "check", env_file=env_file)
+        assert proc.returncode == 2, (script.name, proc.stderr)
+        assert key in proc.stderr and "короткий SHA" in proc.stderr, (script.name, proc.stderr)
+        assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-auto-deliver.lock").exists()
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -200,11 +233,9 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-@pytest.mark.unit
-def test_b6_check_dry_run_validates_the_tree_against_pins_from_the_env_file(tmp_path: Path) -> None:
-    values = _layout(tmp_path)
-    repo = tmp_path / "copy"
-    repo.mkdir()
+def _two_commits(repo: Path) -> tuple[str, str]:
+    """Репозиторий с коммитами one → two, HEAD отцеплен на one (откат), two — цель."""
+    repo.mkdir(exist_ok=True)
     _git(repo, "init", "-q")
     (repo / "a.txt").write_text("a", encoding="utf-8")
     _git(repo, "add", "a.txt")
@@ -214,6 +245,14 @@ def test_b6_check_dry_run_validates_the_tree_against_pins_from_the_env_file(tmp_
     _git(repo, "commit", "-q", "-am", "two")
     two = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", "-q", "--detach", one)
+    return one, two
+
+
+@pytest.mark.unit
+def test_b6_check_dry_run_validates_the_tree_against_pins_from_the_env_file(tmp_path: Path) -> None:
+    values = _layout(tmp_path)
+    repo = tmp_path / "copy"
+    one, two = _two_commits(repo)
 
     values.update(FOTMOB_TARGET=two[:8], FOTMOB_ROLLBACK_REF=one[:8], FOTMOB_ROLLBACK_SHA=one[:8])
     env_file = _write_env(tmp_path / "fotmob.env", **values)
@@ -243,61 +282,77 @@ def test_b6_refuses_a_production_apply_outside_the_automaton(tmp_path: Path) -> 
 
 
 @pytest.mark.unit
-def test_b6_apply_under_the_automaton_lock_switches_the_tree_and_accepts(tmp_path: Path) -> None:
-    """Эстафета замка автомат → b6 с путями из env-файла: fd 9 на замке, который автомат
-    открыл по СЫРОМУ пути (с хвостовым `/` в FOTMOB_STATE_DIR), одноразовый пропуск,
-    окно, checkout цели и приёмка против заглушек docker/pgrep/date/sleep."""
+def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_path: Path) -> None:
+    """Настоящий автомат против заглушек: окно — из date, живые раннеры — из pgrep, метабаза
+    и контейнер — из docker. Автомат берёт замок в каталоге состояния из env-файла (по
+    СЫРОМУ пути, с хвостовым `/`), выписывает одноразовый пропуск и зовёт СОСЕДНИЙ
+    b6_deliver.sh; тот принимает эстафету по унаследованному fd 9 и пропуску, переключает
+    дерево на цель; автомат видит приёмку (md5 цели в контейнере, перечитанные даги, ноль
+    ошибок импорта), записывает принятый SHA и поднимает драйвер кампании из каталога,
+    указанного в env-файле. Ни один путь и ни один пин не приходят иначе как из файла."""
     values = _layout(tmp_path)
     repo = Path(values["FOTMOB_RELEASE_ROOT"])
-    _git(repo, "init", "-q")
-    (repo / "a.txt").write_text("a", encoding="utf-8")
-    _git(repo, "add", "a.txt")
-    _git(repo, "commit", "-q", "-m", "one")
-    one = _git(repo, "rev-parse", "HEAD")
-    (repo / "a.txt").write_text("b", encoding="utf-8")
-    _git(repo, "commit", "-q", "-am", "two")
-    two = _git(repo, "rev-parse", "HEAD")
-    _git(repo, "checkout", "-q", "--detach", one)
+    one, two = _two_commits(repo)
+    # Пины — ровно то, что печатает `git rev-parse --short` в ЭТОМ дереве: автомат
+    # сравнивает их с коротким HEAD по префиксу, пин длиннее не совпал бы никогда.
+    one_short = _git(repo, "rev-parse", "--short", one)
+    two_short = _git(repo, "rev-parse", "--short", two)
     state = Path(values["FOTMOB_STATE_DIR"])
+    campaign = Path(values["FOTMOB_CAMPAIGN_DIR"])
     md5 = "d41d8cd98f00b204e9800998ecf8427e"
     values.update(
         FOTMOB_STATE_DIR=str(state) + "/",
-        FOTMOB_TARGET=two[:8], FOTMOB_ROLLBACK_REF=one[:8], FOTMOB_ROLLBACK_SHA=one[:8],
+        FOTMOB_TARGET=two_short, FOTMOB_ROLLBACK_REF=one_short, FOTMOB_ROLLBACK_SHA=one_short,
         FOTMOB_NEW_CODE_MD5=md5,
     )
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     stubs = tmp_path / "bin"
     stubs.mkdir()
     _date_stub(stubs, "2000")
-    _stub(stubs, "sleep", "exit 0\n")
-    _stub(stubs, "pgrep", "exit 1\n")
+    # `sleep 5` — ожидание старта драйвера кампании: заглушке драйвера нужно мгновение,
+    # чтобы оставить след; остальные ожидания (приёмка, 90 с) — мгновенны.
+    _stub(stubs, "sleep", '[ "$1" = 5 ] && exec /bin/sleep 1\nexit 0\n')
+    driver_started = campaign / "state" / "driver-started"
+    _stub(campaign, "driver.sh", f'touch "{driver_started}"\nexit 0\n')
+    _stub(
+        stubs, "pgrep",
+        f'case "$*" in *driver.sh*) [ -e "{driver_started}" ] && exit 0; exit 1 ;; *) exit 1 ;; esac\n',
+    )
     calls = tmp_path / "docker.calls"
     _stub(
         stubs, "docker",
         f'echo "$*" >> "{calls}"\n'
-        f'case "$*" in *md5sum*) echo "{md5}  file" ;; *"count(*)"*) echo 0 ;; *) echo "dag_x | f" ;; esac\n',
+        'case "$*" in\n'
+        '  *pgrep*) exit 1 ;;\n'                    # юнит кампании в контейнере не жив
+        f'  *md5sum*) echo "{md5}  file" ;;\n'      # целевой модуль виден из контейнера
+        '  *"FROM dag WHERE"*) echo 1 ;;\n'         # fotmob-даг перечитан планировщиком
+        '  *"count(*)"*) echo 0 ;;\n'               # ни активных ранов, ни ошибок импорта
+        '  *) echo "dag_x | f" ;;\n'
+        'esac\n',
     )
-    nonce_file = state / "fotmob-deliver-nonce"
-    raw_lock = f"{state}//fotmob-auto-deliver.lock"   # ровно так его открывает автомат
-    automaton = tmp_path / "automaton.sh"
-    automaton.write_text(
-        "#!/bin/bash\n"
-        f'exec 9>"{raw_lock}"\n'
-        "flock -n 9 || exit 99\n"
-        f'printf "%s\\n" nonce-1 > "{nonce_file}"\n'
-        f'FOTMOB_DELIVERY_LOCK=held FOTMOB_DELIVER_NONCE=nonce-1 FOTMOB_DELIVER_NONCE_FILE="{nonce_file}" '
-        f'bash "{B6}" apply\n',
-        encoding="utf-8",
-    )
-    proc = _run(automaton, env_file=env_file, stubs=stubs)
+    auto = _install(tmp_path, stubs)
+    proc = _run(auto, env_file=env_file, stubs=stubs)
     assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "окно открыто" in proc.stdout and "B6 ДОСТАВЛЕН" in proc.stdout
+    log = Path(values["FOTMOB_LOG"]).read_text(encoding="utf-8")
+    assert "ОКНО ОТКРЫТО" in log and f"{auto.parent}/b6_deliver.sh apply" in log, "b6 — сосед автомата"
+    assert "окно открыто" in log and "B6 ДОСТАВЛЕН" in log, "вывод b6 уходит в лог автомата"
+    assert "приёмка подтверждена" in log and f"ДОСТАВЛЕНО: HEAD={two_short}" in log
+    assert "кампания истории запущена" in log
     assert _git(repo, "rev-parse", "HEAD") == two
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "deploy/fotmob-b6-master"
-    assert not nonce_file.exists(), "пропуск одноразовый"
-    log = calls.read_text(encoding="utf-8")
-    assert "exec stub-metadb psql" in log and "exec stub-scheduler md5sum /opt/airflow/scrapers/fotmob/service.py" in log
-
+    assert (state / "fotmob-b6-accepted").read_text(encoding="utf-8").strip() == two_short
+    assert not (state / "fotmob-deliver-nonce").exists(), "пропуск одноразовый"
+    assert not (state / "fotmob-b6-inflight").exists()
+    assert (state / "fotmob-auto-deliver-attempted-2026-01-01").exists()
+    assert (state / "fotmob-campaign-started").exists()
+    assert (campaign / "state" / "campaign_enabled").exists()
+    docker_log = calls.read_text(encoding="utf-8")
+    assert "exec stub-metadb psql" in docker_log
+    assert "exec stub-scheduler md5sum /opt/airflow/scrapers/fotmob/service.py" in docker_log
+    # Telegram недоступен (нет TG-env) — исход не потерян, а отложен в очередь каталога
+    # состояния из env-файла.
+    assert "FotMob B6 доставлен" in (state / "fotmob-pending-alert").read_text(encoding="utf-8")
+    assert not (state / "fotmob-auto-deliver.off").exists()
 
 def _date_stub(stubs: Path, hhmm: str) -> None:
     _stub(
@@ -361,3 +416,40 @@ def test_window_alert_inside_an_open_window_uses_container_and_hook_from_the_env
     proc = _run(ALERT, env_file=env_file, stubs=stubs)
     assert proc.returncode == 0
     assert sent.read_text(encoding="utf-8") == message
+
+
+@pytest.mark.unit
+def test_window_alert_never_creates_the_state_dir(tmp_path: Path) -> None:
+    """Пустой каталог состояния, созданный сторожем перед тиком автомата, снял бы его
+    fail-closed проверку (нет выключателя, маркеров и суточной защёлки)."""
+    values = _layout(tmp_path)
+    values["FOTMOB_STATE_DIR"] = str(tmp_path / "watchdog" / "gone")
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "2000")
+    _stub(stubs, "tg-send", 'echo "hook must not be called" >&2; exit 99\n')
+    proc = _run(ALERT, env_file=env_file, stubs=stubs)
+    assert proc.returncode == 2
+    assert values["FOTMOB_STATE_DIR"] in proc.stderr
+    assert not Path(values["FOTMOB_STATE_DIR"]).exists()
+
+
+@pytest.mark.unit
+def test_window_alert_sets_no_latch_when_the_hook_fails(tmp_path: Path) -> None:
+    values = _layout(tmp_path)
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "2000")
+    _stub(stubs, "pgrep", "exit 1\n")
+    _stub(stubs, "docker", "echo 0\n")
+    attempts = tmp_path / "tg.attempts"
+    _stub(stubs, "tg-send", f'echo "$1" >> "{attempts}"; exit 1\n')
+    proc = _run(ALERT, env_file=env_file, stubs=stubs)
+    assert proc.returncode == 3
+    assert "вернул ошибку" in proc.stderr
+    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir()), "неудачная отправка защёлку не ставит"
+    # Следующий тик пробует снова, а не молчит до завтра.
+    _run(ALERT, env_file=env_file, stubs=stubs)
+    assert attempts.read_text(encoding="utf-8").count("\n") == 2
