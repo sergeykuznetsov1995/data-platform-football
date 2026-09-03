@@ -44,7 +44,7 @@ WORLD_CUP_SEASON_SHAPE = production_season_shape(
 )
 
 
-def _policy(*, season_measured: tuple[str, ...] = ("16", "17")) -> WorkloadBudgetPolicy:
+def _policy() -> WorkloadBudgetPolicy:
     classes = {
         match_workload_class(): WorkloadClassBudget(
             match_workload_class(),
@@ -52,10 +52,7 @@ def _policy(*, season_measured: tuple[str, ...] = ("16", "17")) -> WorkloadBudge
             MATCH_BATCH_SIZE,
             1_000,
             ("event",),
-            20,
-            5,
             workload_shape_digest(production_match_shape()),
-            ("16", "17"),
         ),
         player_workload_class(): WorkloadClassBudget(
             player_workload_class(),
@@ -63,16 +60,10 @@ def _policy(*, season_measured: tuple[str, ...] = ("16", "17")) -> WorkloadBudge
             PLAYER_BATCH_SIZE,
             2_000,
             ("player_profile",),
-            20,
-            5,
             workload_shape_digest(production_player_shape()),
-            ("16", "17"),
         ),
     }
-    for shape, measured in (
-        (EPL_SEASON_SHAPE, season_measured),
-        (WORLD_CUP_SEASON_SHAPE, ("16",)),
-    ):
+    for shape in (EPL_SEASON_SHAPE, WORLD_CUP_SEASON_SHAPE):
         name = season_workload_class(shape)
         classes[name] = WorkloadClassBudget(
             name,
@@ -80,10 +71,7 @@ def _policy(*, season_measured: tuple[str, ...] = ("16", "17")) -> WorkloadBudge
             1,
             3_000,
             ("schedule_last",),
-            20,
-            5,
             workload_shape_digest(shape),
-            measured,
         )
     return WorkloadBudgetPolicy("a" * 64, classes)
 
@@ -158,7 +146,9 @@ def test_partitioned_plan_never_mixes_competitions_and_keeps_full_universe():
     }
 
 
-def test_season_class_measured_on_one_tournament_blocks_a_new_league():
+def test_static_season_class_authorizes_any_league_of_its_shape():
+    """#1245: the class is evidence of a shape, not of a measured league."""
+
     la_liga = PartitionWorkload(
         "ESP-La Liga",
         "2526",
@@ -177,12 +167,26 @@ def test_season_class_measured_on_one_tournament_blocks_a_new_league():
         season_workload_class(EPL_SEASON_SHAPE)
     ]
 
-    with pytest.raises(WorkloadPolicyUnavailable, match="measured only for tournament"):
+    unknown_shape = PartitionWorkload(
+        "ESP-La Liga",
+        "2526",
+        8,
+        season_workload=SeasonWorkload(
+            8,
+            61643,
+            production_season_shape(
+                season_format="split_year",
+                team_count_band="8_15",
+                max_pages_per_direction=50,
+            ),
+        ),
+    )
+    with pytest.raises(WorkloadPolicyUnavailable, match="has no class"):
         build_partitioned_plan(
-            _policy(season_measured=("17",)),
+            _policy(),
             dag_id="dag_ingest_sofascore",
             run_id="run-1",
-            partitions=(la_liga,),
+            partitions=(unknown_shape,),
             control_token=TOKEN,
         )
 

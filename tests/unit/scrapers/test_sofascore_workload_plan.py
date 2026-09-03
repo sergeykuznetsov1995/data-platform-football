@@ -430,33 +430,49 @@ def test_class_measured_on_two_tournaments_authorizes_a_new_one(tmp_path):
     assert {item.workload_class for item in player} == {PLAYER_CLASS}
 
 
-def test_class_measured_on_one_tournament_does_not_generalize(tmp_path):
+def test_a_class_authorizes_every_tournament_of_its_shape(tmp_path):
+    """#1245: the paid canary is gone, so a class no longer transfers by
+    tournament — it transfers by measured *shape*, and one shape covers every
+    league that has it."""
+
     single = _artifact_payload(match_tournaments=(17,), player_tournaments=(17,))
     policy = _policy(tmp_path, single, name="single.json")
 
-    with pytest.raises(WorkloadPolicyUnavailable, match="measured only for tournament"):
-        build_signed_dagrun_plan(
+    for tournament in (8, 17):
+        plan = build_signed_dagrun_plan(
             policy,
-            **_plan_kwargs(source_tournament_id=8, season_workloads=[]),
+            **_plan_kwargs(source_tournament_id=tournament, season_workloads=[]),
         )
+        assert {item.workload_class for item in plan.allocations} == {
+            MATCH_CLASS,
+            PLAYER_CLASS,
+        }
 
-    plan = build_signed_dagrun_plan(
-        policy, **_plan_kwargs(source_tournament_id=17, season_workloads=[])
+    season_plan = _plan(
+        tmp_path,
+        source_tournament_id=8,
+        pending_match_ids=[],
+        player_universe_ids=[],
+        pending_player_ids=[],
+        season_workloads=[SeasonWorkload(8, 12345, SEASON_SHAPE)],
     )
-    assert {item.workload_class for item in plan.allocations} == {
-        MATCH_CLASS,
-        PLAYER_CLASS,
-    }
+    assert [item.workload_class for item in season_plan.allocations] == [SEASON_CLASS]
 
-    # The season class of the shipped artifact is measured on tournament 17 only.
-    with pytest.raises(WorkloadPolicyUnavailable, match="measured only for tournament"):
+    # An undeclared shape is still refused: the shape, not the league, is the
+    # unit of authorization.
+    unknown_shape = production_season_shape(
+        season_format="split_year",
+        team_count_band="33_48",
+        max_pages_per_direction=50,
+    )
+    with pytest.raises(WorkloadPolicyUnavailable, match="has no class"):
         _plan(
             tmp_path,
             source_tournament_id=8,
             pending_match_ids=[],
             player_universe_ids=[],
             pending_player_ids=[],
-            season_workloads=[SeasonWorkload(8, 12345, SEASON_SHAPE)],
+            season_workloads=[SeasonWorkload(8, 12345, unknown_shape)],
         )
 
 
