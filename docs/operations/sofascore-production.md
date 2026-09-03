@@ -199,9 +199,16 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    (#1245): бюджет берётся из статической политики `configs/sofascore/workload_policy.json`,
    лежащей в git, и любая правка кода едет в бой без повторного замера.
    `runtime_fingerprint` дерева больше не участвует в выкате и в допуске аренды —
-   сверять digest перед выкатом не нужно. Расход держат статические потолки шлюза
-   (`--daily-budget-mb`, `--max-lease-mb`, `--dagrun-budget-bytes`,
-   `--url-budget-bytes`, `--max-active-leases`) из `deploy/sofascore/gateway.compose.yaml`.
+   сверять digest перед выкатом не нужно. Расход SofaScore держат три статических
+   потолка шлюза из `deploy/sofascore/gateway.compose.yaml` — `--daily-budget-mb`
+   (суточный трафик), `--max-lease-mb` (одна аренда) и `--max-active-leases`
+   (одновременные аренды), плюс `hard_task_bytes` классов самой политики.
+   **`--dagrun-budget-bytes` и `--url-budget-bytes` на платные аренды SofaScore не
+   действуют** (так было и до #1245): `_lease_dagrun_budget_bytes` меряет подписанный
+   прогон по `workload_plan.run_cap_bytes` — сумме аллокейшенов плана, — а
+   `_lease_url_budget_bytes` подставляет то же число вместо `--url-budget-bytes`,
+   чтобы прогретая сессия браузера не обрезалась на одном URL. Настоящий потолок
+   целого DagRun'а — открытый follow-up #1245.
 4. После приёмки убрать из `/root/sofascore-runtime` старые compose/override, мини-DAG и
    `airflowignore-sofascore` (они больше не монтируются), а `pkg2/*.sh` заменить ссылкой
    на `deploy/sofascore/`.

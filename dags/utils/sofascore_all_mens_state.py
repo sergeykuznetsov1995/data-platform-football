@@ -312,6 +312,15 @@ def plan_historical_batch(
     completed_keys = {str(value) for value in completed}
     authorized: frozenset[str] | None = None
     if authorized_season_classes is not None:
+        if isinstance(authorized_season_classes, Mapping):
+            # #1245: this used to be a mapping of class -> measured tournament
+            # ids, and a static policy carries none, so every ready scope was
+            # deferred and the lane planned nothing.  A mapping still iterates
+            # as its keys, which would make that regression silent; refuse it.
+            raise CampaignPlanningError(
+                "authorized_season_classes must be workload class names, "
+                "not a mapping of measurement evidence"
+            )
         authorized = frozenset(str(name) for name in authorized_season_classes)
     # (rank, kind, tournament, season); kind in ready/completed/pending/deferred
     ranked: list[tuple[tuple[int, int, int], str, Mapping[str, Any], Mapping[str, Any]]] = []

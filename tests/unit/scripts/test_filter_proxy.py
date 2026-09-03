@@ -3980,6 +3980,102 @@ def test_static_policy_authorizes_production_and_its_absence_fails_closed(shared
     assert production.report()["budget_artifact_id"] == policy.artifact_id
 
 
+def test_gateway_main_boots_the_static_policy_and_then_issues_a_paid_lease(
+    shared_mod, monkeypatch, tmp_path, caplog
+):
+    """#1245 criterion: no measured artifact anywhere on the boot path.
+
+    Everything below runs the real ``main()`` of ``scripts/proxy_filter``:
+    the CLI pin, the policy load and the listener bootstrap.  Only the
+    socket, the proxy pool and the signal loop are stubbed.
+    """
+
+    policy_id = hashlib.sha256(SHIPPED_WORKLOAD_POLICY.read_bytes()).hexdigest()
+    args = SimpleNamespace(
+        source_mode="shared-no-whoscored",
+        listen="127.0.0.1:0",
+        proxy_file=str(tmp_path / "unused-proxies.txt"),
+        blocklist=None,
+        out=str(tmp_path / "meter.json"),
+        pidfile=str(tmp_path / "filter.pid"),
+        sofascore_budget_artifact=str(SHIPPED_WORKLOAD_POLICY),
+        dagrun_budget_bytes=8_000_000,
+    )
+    monkeypatch.setattr(
+        shared_mod.argparse.ArgumentParser, "parse_args", lambda self: args
+    )
+    monkeypatch.setattr(
+        shared_mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "c" * 64},
+    )
+    monkeypatch.setattr(
+        shared_mod,
+        "_residential_manager",
+        lambda **kwargs: (SimpleNamespace(total_count=1), "test pool"),
+    )
+
+    class Server:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class StopEvent:
+        def set(self):
+            return None
+
+        async def wait(self):
+            return None
+
+    async def start_server(*_args, **_kwargs):
+        return Server()
+
+    monkeypatch.setattr(shared_mod.asyncio, "start_server", start_server)
+    monkeypatch.setattr(shared_mod.asyncio, "Event", StopEvent)
+    monkeypatch.setattr(
+        shared_mod.asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(add_signal_handler=lambda *a: None),
+    )
+    monkeypatch.setattr(
+        shared_mod.asyncio, "ensure_future", lambda coro: coro.close()
+    )
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", shared_mod.CONTROL_TOKEN)
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", policy_id)
+
+    asyncio.run(shared_mod.main())
+
+    # The gateway is up on a policy that carries no measurement evidence.
+    assert shared_mod.SOFASCORE_BUDGET_ARTIFACT_ID == policy_id
+    assert shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES >= 8_000_000
+    health = shared_mod._service_health_report(SimpleNamespace(total_count=1))
+    assert health["sofascore_paid_enabled"] is True
+    assert health["sofascore_budget_artifact_id"] == policy_id
+    assert not [key for key in health if key.startswith("sofascore_canary")]
+
+    # ...and it hands out a real paid lease for the production lane.
+    policy = shared_mod.load_static_workload_policy(SHIPPED_WORKLOAD_POLICY)
+    match_policy = policy.classes[MATCH_WORKLOAD_CLASS]
+    lease = shared_mod._create_lease(
+        _FakeManager(
+            [
+                "http://u:p@pool.invalid:10000",
+                "http://u:p@pool.invalid:10001",
+            ]
+        ),
+        max_bytes=match_policy.hard_task_bytes,
+        ttl_seconds=30,
+        metadata=_sofascore_context(
+            budget=match_policy.hard_task_bytes, artifact_id=policy_id
+        ),
+        require_context=True,
+    )
+    assert lease.source == "sofascore"
+    assert lease.report()["budget_artifact_id"] == policy_id
+
+
 def test_players_lane_dag_is_inside_the_paid_sofascore_allowlist(shared_mod):
     """#1245 unblocks #1244: the players lane must be able to take a lease."""
 

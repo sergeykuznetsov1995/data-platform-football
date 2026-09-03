@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import pathlib
 import sys
 from datetime import timedelta
 from types import SimpleNamespace
@@ -295,3 +296,43 @@ def test_validated_scope_clears_its_failure_memory(monkeypatch, tmp_path):
     )
 
     assert calls == [("completed", "c:8:825"), ("cleared", "c:8:825")]
+
+
+@pytest.mark.unit
+def test_shipped_static_policy_authorizes_the_ready_history_scopes(monkeypatch):
+    """#1245 regression: the static policy carries no measured tournaments.
+
+    ``_plan_historical_batch`` derives ``authorized_season_classes`` from the
+    shipped policy itself.  While that derivation handed the planner each
+    class's (now always empty) measured tournaments, every ready historical
+    scope was filtered out as ``deferred`` and the lane planned NOTHING.
+
+    Nothing here is stubbed except the campaign files on disk: the real
+    policy loader, the real derivation and the real planner all run, and
+    ``plan_historical_batch`` refuses a mapping of measurement evidence, so
+    restoring the original derivation turns this test red instead of green.
+    """
+
+    from tests.unit.utils.test_sofascore_all_mens_state import _snapshot
+
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    shipped_policy = repo_root / "configs" / "sofascore" / "workload_policy.json"
+    snapshot = _snapshot()
+
+    module = _load_dag_module()
+    monkeypatch.setattr(module, "WORKLOAD_ARTIFACT", str(shipped_policy))
+    monkeypatch.setattr(module, "_production_dag_active", lambda: False)
+    monkeypatch.setattr(module.state, "read_snapshot", lambda *a, **k: snapshot)
+    monkeypatch.setattr(module.state, "read_completed", lambda *a, **k: set())
+    monkeypatch.setattr(module.state, "read_failures", lambda *a, **k: {})
+    monkeypatch.setattr(module, "HISTORY_BATCH_SIZE", 10)
+
+    planned = module._plan_historical_batch(run_id="manual__1")
+
+    unfiltered = module.state.plan_historical_batch(
+        snapshot, completed=set(), batch_size=10
+    )
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        item["SOFASCORE_SCOPE_KEY"] for item in unfiltered
+    ]
+    assert planned

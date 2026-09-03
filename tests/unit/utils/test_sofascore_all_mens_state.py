@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import pathlib
 
 import pytest
 
@@ -19,14 +18,8 @@ from dags.utils.sofascore_all_mens_state import (
     read_failures,
 )
 from scrapers.sofascore.workload_plan import (
-    load_static_workload_policy,
     production_season_shape,
     season_workload_class,
-)
-
-SHIPPED_WORKLOAD_POLICY = (
-    pathlib.Path(__file__).resolve().parents[3]
-    / "configs" / "sofascore" / "workload_policy.json"
 )
 
 
@@ -195,36 +188,6 @@ def test_planner_defers_shapes_the_static_policy_does_not_declare():
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
         "campaign-test:8:825", "campaign-test:8:824"
     ]
-
-
-def test_shipped_static_policy_authorizes_the_ready_history_scopes():
-    """#1245 regression: the static policy carries no measured tournaments.
-
-    The backfill DAG derives ``authorized_season_classes`` from the shipped
-    policy.  While that derivation passed each class's (now always empty)
-    measured tournaments, every ready historical scope was filtered out as
-    ``deferred`` and the lane planned nothing at all.
-    """
-
-    policy = load_static_workload_policy(SHIPPED_WORKLOAD_POLICY)
-    declared = [
-        name for name, budget in policy.classes.items() if budget.scope == "season"
-    ]
-    assert declared, "the shipped policy must declare season classes"
-
-    snapshot = _snapshot()
-    planned = plan_historical_batch(
-        snapshot,
-        completed=set(),
-        batch_size=10,
-        authorized_season_classes=declared,
-    )
-
-    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
-        item["SOFASCORE_SCOPE_KEY"]
-        for item in plan_historical_batch(snapshot, completed=set(), batch_size=10)
-    ]
-    assert planned
 
 
 def test_planner_does_not_advance_wave_when_only_deferred_shapes_remain():
