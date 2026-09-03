@@ -116,6 +116,8 @@ def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, P
         SOFASCORE_RUNTIME_DIR={runtime}
         SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR={runtime}/all-men
         SOFASCORE_GATEWAY_STATE_HOST_DIR={runtime}/gateway-state
+        SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state-history
+        SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players
         SOFASCORE_PLATFORM_ENV_FILE={platform_env}
         SOFASCORE_HOST_PYTHON={bin_dir}/host-python
         SOFASCORE_RELEASE_ROOT=/old/release-deadbeef
@@ -203,6 +205,35 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
         "sofascore-gw-lease-watchdog-history.service",
         "sofascore-gw-lease-watchdog-players.service",
     ], restarts
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "missing",
+    ["SOFASCORE_HISTORY_GW_STATE_HOST_DIR", "SOFASCORE_PLAYERS_GW_STATE_HOST_DIR"],
+)
+def test_deploy_refuses_before_touching_anything_when_a_lane_state_dir_is_unset(
+    tmp_path: Path, missing: str
+) -> None:
+    # Каталог состояния полосы — fail-closed вход compose. Без проверки в начале
+    # скрипта пропущенная переменная валила бы выкат только на gateway-up: уже
+    # после паузы кампаний, перепиновки env-файла и пересоздания scheduler'а.
+    _runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    env_file.write_text(
+        "\n".join(
+            line for line in env_file.read_text(encoding="utf-8").splitlines()
+            if not line.startswith(f"{missing}=")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert missing in proc.stderr, proc.stderr
+    assert not (state_dir / "calls.log").exists(), "ни одного вызова docker до отказа"
 
 
 @pytest.mark.unit
@@ -334,9 +365,23 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         """,
         0o755,
     )
+    # У каждого unit'а свой ExecStart: приёмка обязана ловить сторожа, который
+    # active, но сторожит чужой шлюз по чужому каталогу состояния.
     _write(
         bin_dir / "systemctl",
-        '#!/usr/bin/env bash\ncase "$*" in *show*) echo "ExecStart={{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog --container sofascore_gw_951 --state-dir /s --expected-mount $EXPECTED_MOUNT --alert-command /a ; ignore_errors=no }}" ;; *) echo active ;; esac\n',
+        """\
+        #!/usr/bin/env bash
+        case "$*" in
+          *show*)
+            case "$*" in
+              *-history.service*) c=$WD_HISTORY_CONTAINER; s=$WD_HISTORY_STATE ;;
+              *-players.service*) c=$WD_PLAYERS_CONTAINER; s=$WD_PLAYERS_STATE ;;
+              *) c=$WD_MAIN_CONTAINER; s=$WD_MAIN_STATE ;;
+            esac
+            echo "ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog --container $c --state-dir $s --expected-mount $EXPECTED_MOUNT --alert-command /a ; ignore_errors=no }" ;;
+          *) echo active ;;
+        esac
+        """,
         0o755,
     )
 
@@ -348,6 +393,7 @@ def _run_postdeploy(
     tmp_path: Path,
     scheduler_mounts: dict[str, str],
     gateway_mounts: dict[str, dict[str, str]],
+    watchdogs: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     runtime = tmp_path / "runtime"
     release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
@@ -387,6 +433,13 @@ def _run_postdeploy(
         "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
         "SOFASCORE_ENV_FILE": str(env_file),
         "EXPECTED_MOUNT": str(release),
+        "WD_MAIN_CONTAINER": "sofascore_gw_951",
+        "WD_MAIN_STATE": f"{runtime}/gateway-state",
+        "WD_HISTORY_CONTAINER": "sofascore_gw_history",
+        "WD_HISTORY_STATE": f"{runtime}/gateway-state-history",
+        "WD_PLAYERS_CONTAINER": "sofascore_gw_players",
+        "WD_PLAYERS_STATE": f"{runtime}/gateway-state-players",
+        **(watchdogs or {}),
     }
     return subprocess.run(
         ["bash", str(DEPLOY / "postdeploy_checks.sh")], env=env, capture_output=True, text=True, timeout=60
@@ -446,12 +499,13 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
         assert f"✓ {container} лимит памяти 1 GiB" in proc.stdout, proc.stdout
     for service in ("sofascore_proxy_filter", "sofascore_gw_history", "sofascore_gw_players"):
         assert f"✓ {service} /health отвечает" in proc.stdout, proc.stdout
-    for unit in (
-        "sofascore-gw-lease-watchdog.service",
-        "sofascore-gw-lease-watchdog-history.service",
-        "sofascore-gw-lease-watchdog-players.service",
+    for unit, container in (
+        ("sofascore-gw-lease-watchdog.service", "sofascore_gw_951"),
+        ("sofascore-gw-lease-watchdog-history.service", "sofascore_gw_history"),
+        ("sofascore-gw-lease-watchdog-players.service", "sofascore_gw_players"),
     ):
         assert f"✓ {unit} active" in proc.stdout, proc.stdout
+        assert f"✓ {unit} --container {container}" in proc.stdout, proc.stdout
     for pool in ("ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"):
         assert f"✓ пул {pool} slots=1" in proc.stdout, proc.stdout
 
@@ -485,3 +539,24 @@ def test_postdeploy_fails_on_a_wrong_missing_or_extra_mount(tmp_path: Path, muta
     proc = _run_postdeploy(tmp_path, scheduler, gateways)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "ПРИЁМКА: " in proc.stdout and "ПРИЁМКА: ок" not in proc.stdout, proc.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "watchdogs",
+    [
+        {"WD_HISTORY_CONTAINER": "sofascore_gw_951"},
+        {"WD_PLAYERS_STATE": "/runtime/gateway-state"},
+        {"WD_MAIN_STATE": "/runtime/gateway-state-history"},
+    ],
+    ids=["history-watchdog-guards-the-refresh-gateway", "players-watchdog-on-shared-state", "main-watchdog-on-history-state"],
+)
+def test_postdeploy_fails_when_a_watchdog_guards_the_wrong_lane(
+    tmp_path: Path, watchdogs: dict[str, str]
+) -> None:
+    # Сторож может быть active и стоять на верном дереве, но освобождать аренду
+    # чужого шлюза по чужому WAL — приёмка обязана это ловить.
+    scheduler, gateways = _expected_mounts(tmp_path)
+    proc = _run_postdeploy(tmp_path, scheduler, gateways, watchdogs=watchdogs)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ПРИЁМКА: ок" not in proc.stdout, proc.stdout

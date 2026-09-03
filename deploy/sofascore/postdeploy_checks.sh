@@ -117,10 +117,19 @@ ls -1 "$CAMPAIGN/results" 2>/dev/null | wc -l | sed 's/^/results файлов: /
 
 echo
 echo "== 6. Вотчдоги аренд (по одному на шлюз) =="
-for unit in "${WATCHDOG_UNITS[@]}"; do
-  pin=$(systemctl show -p ExecStart "$unit" | grep -o -- "--expected-mount [^ ;]*" || true)
-  echo "$unit: ${pin:-(нет --expected-mount)}"
-  [ "$pin" = "--expected-mount $RELEASE" ] && ok "$unit на $RELEASE" || fail "$unit не на $RELEASE"
+# Сверяем не только дерево, но и пару «контейнер / каталог состояния»: сторож,
+# перепутавший полосу, был бы active и рестартовал бы чужой шлюз по чужому WAL.
+for i in "${!WATCHDOG_UNITS[@]}"; do
+  unit="${WATCHDOG_UNITS[$i]}"
+  exec_start=$(systemctl show -p ExecStart "$unit" 2>/dev/null || true)
+  echo "$unit: $(printf '%s' "$exec_start" | grep -o -- "--container [^ ;]* --state-dir [^ ;]* --expected-mount [^ ;]*" || echo "(ExecStart не разобран)")"
+  for expected in "--container ${GATEWAY_CONTAINERS[$i]}" \
+                  "--state-dir ${GATEWAY_STATE_DIRS[$i]}" \
+                  "--expected-mount $RELEASE"; do
+    flag=${expected%% *}
+    got=$(printf '%s' "$exec_start" | grep -o -- "$flag [^ ;]*" | head -1 || true)
+    [ "$got" = "$expected" ] && ok "$unit $expected" || fail "$unit: '${got:-<нет $flag>}' (ожидалось $expected)"
+  done
   [ "$(systemctl is-active "$unit")" = "active" ] && ok "$unit active" || fail "$unit не active"
 done
 

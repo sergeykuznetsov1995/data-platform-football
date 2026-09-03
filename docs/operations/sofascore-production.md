@@ -94,8 +94,12 @@ docker network create sofascore-net            # своя сеть контур�
 install -d -m 0755 /etc/data-platform /opt/sofascore/releases
 install -m 0600 deploy/sofascore/sofascore.env.example /etc/data-platform/sofascore.env   # заполнить
 install -m 0755 deploy/sofascore/gateway_lease_watchdog.py /usr/local/libexec/sofascore-gw-lease-watchdog
-install -m 0644 deploy/sofascore/systemd/sofascore-gw-lease-watchdog.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now sofascore-gw-lease-watchdog.service
+# По сторожу на полосу (#1244): свой контейнер и свой каталог состояния у каждого.
+install -m 0644 deploy/sofascore/systemd/sofascore-gw-lease-watchdog.service \
+    deploy/sofascore/systemd/sofascore-gw-lease-watchdog-history.service \
+    deploy/sofascore/systemd/sofascore-gw-lease-watchdog-players.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now \
+    sofascore-gw-lease-watchdog{,-history,-players}.service
 ```
 
 Метабаза и init поднимаются один раз из того же файла (дальше ротация трогает только
@@ -186,13 +190,19 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    `sofascore-airflow.compose.yaml`, `SOFASCORE_PROXY_POOL_JSON` — значение из
    `.env.proxy-pool.decodo`, в одинарных кавычках; `SOFASCORE_POSTGRES_IMAGE=postgres:16-alpine`
    как у живой метабазы).
-2. Заморозить дерево с коммитом, содержащим этот рецепт, прогнать канарейку, выкатить
-   `deploy.sh` — первое дерево в `/opt/sofascore/releases/`.
-3. Установить бинарь сторожа и ТРИ unit'а из репозитория (по одному на полосу:
+2. Установить бинарь сторожа и ТРИ unit'а из репозитория (по одному на полосу:
    `sofascore-gw-lease-watchdog{,-history,-players}.service`), снять drop-in
    `/etc/systemd/system/sofascore-gw-lease-watchdog.service.d/override.conf`,
-   `daemon-reload`, `enable` все три. Рестартовать их не нужно — это последний
-   шаг `deploy.sh`.
+   `daemon-reload`, `enable` все три. Рестартовать их не нужно — их рестартует
+   последний шаг `deploy.sh`. **Этот шаг обязателен ДО `deploy.sh`:** шаг `watchdog`
+   выката рестартует все три unit'а, и на отсутствующем выкат встанет уже после
+   пересоздания сервисов. Делать его в окне выката, непосредственно перед `deploy.sh`:
+   новый unit ждёт монтирования нового релиза, а живой шлюз до выката стоит на старом.
+3. Заморозить дерево с коммитом, содержащим этот рецепт, выкатить `deploy.sh` —
+   первое дерево в `/opt/sofascore/releases/`. Канарейка не нужна, если
+   `runtime_fingerprint` дерева не изменился: verified-артефакт того же digest
+   действителен (правки только в `deploy/`, `dags/`, `tests/`, `docs/` в digest
+   не входят).
 4. После приёмки убрать из `/root/sofascore-runtime` старые compose/override, мини-DAG и
    `airflowignore-sofascore` (они больше не монтируются), а `pkg2/*.sh` заменить ссылкой
    на `deploy/sofascore/`.

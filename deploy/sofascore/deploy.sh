@@ -16,6 +16,7 @@ ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
 . "$(dirname "$0")/env.sh"
 sofascore_load_env "$ENV_FILE" || exit 2
 : "${SOFASCORE_RUNTIME_DIR:?}" "${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?}" "${SOFASCORE_GATEWAY_STATE_HOST_DIR:?}" \
+  "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?}" "${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?}" \
   "${SOFASCORE_PLATFORM_ENV_FILE:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
 # Имя дерева: release-<digest8>[-<gitsha8>]; digest — идентичность runtime-контракта
