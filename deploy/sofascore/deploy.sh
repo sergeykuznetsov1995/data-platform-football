@@ -19,19 +19,23 @@ sofascore_load_env "$ENV_FILE" || exit 2
   "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?}" "${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?}" \
   "${SOFASCORE_PLATFORM_ENV_FILE:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
-# Каждый шлюз — ЕДИНСТВЕННЫЙ писатель своего WAL/ledger. Два одинаковых пути свели бы
-# полосы в один каталог, и приёмка бы это пропустила: ожидаемые пути она берёт из того
-# же env-файла. Проверяем здесь, до паузы кампаний, repin и пересоздания scheduler'а —
-# на gateway-up отказ стоил бы уже пересозданных сервисов.
+# Каждый шлюз — ЕДИНСТВЕННЫЙ писатель своего WAL/ledger. Два пути к ОДНОМУ каталогу
+# (в том числе через симлинк) свели бы полосы вместе, и приёмка бы это пропустила:
+# ожидаемые пути она берёт из того же env-файла. Дешёвая проверка — здесь, до паузы
+# кампаний и любого пересоздания; полную (каноничность, владелец, доступ UID 50000,
+# защищённая цепочка родителей, вне дерева релиза) делает preflight ниже — по каждому
+# из трёх каталогов, а не только по каталогу актуалки.
 LANE_STATE_DIRS="$SOFASCORE_GATEWAY_STATE_HOST_DIR
 $SOFASCORE_HISTORY_GW_STATE_HOST_DIR
 $SOFASCORE_PLAYERS_GW_STATE_HOST_DIR"
-[ "$(printf '%s\n' "$LANE_STATE_DIRS" | sort -u | wc -l)" = "3" ] \
-  || { echo "каталоги состояния полос должны быть разными: $(echo $LANE_STATE_DIRS)" >&2; exit 2; }
+lane_canonical=""
 while IFS= read -r lane_dir; do
-  [ -d "$lane_dir" ] && [ -w "$lane_dir" ] \
-    || { echo "каталог состояния полосы недоступен на запись: $lane_dir" >&2; exit 2; }
+  [ -d "$lane_dir" ] || { echo "каталог состояния полосы не существует: $lane_dir" >&2; exit 2; }
+  lane_canonical="$lane_canonical$(readlink -f "$lane_dir")
+"
 done <<< "$LANE_STATE_DIRS"
+[ "$(printf '%s' "$lane_canonical" | sort -u | wc -l)" = "3" ] \
+  || { echo "каталоги состояния полос указывают на один каталог: $(echo $lane_canonical)" >&2; exit 2; }
 
 # Имя дерева: release-<digest8>[-<gitsha8>]; digest — идентичность runtime-контракта
 # (канарейка и артефакт), sha различает деревья с одинаковым контрактом (правка только
@@ -43,7 +47,6 @@ LOG="$SOFASCORE_RUNTIME_DIR/all-men/deploy.log"
 SCHED_COMPOSE="$RELEASE/deploy/sofascore/airflow.compose.yaml"
 GW_COMPOSE="$RELEASE/deploy/sofascore/gateway.compose.yaml"
 CAMPAIGN="$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"
-STATE="$SOFASCORE_GATEWAY_STATE_HOST_DIR"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
@@ -146,12 +149,17 @@ chmod 0750 "$CAMPAIGN"
 chmod 0644 "$CAMPAIGN/snapshot.json"
 
 STEP="preflight"
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE" "$SOFASCORE_HOST_PYTHON" -B \
-  "$RELEASE/scripts/sofascore_runtime_preflight.py" preflight \
-    --release-root "$RELEASE" --artifact "$ARTIFACT_DEST" --state-dir "$STATE" \
-    --campaign-dir "$CAMPAIGN" --campaign-policy "$RELEASE/configs/sofascore/all_mens_campaign.json" \
-    --expected-artifact-id "$ARTIFACT_ID" >> "$LOG" 2>&1
-log "preflight ok"
+# По каталогу на полосу: preflight — единственная проверка, которая знает про UID 50000,
+# каноничность пути и запрет жить внутри дерева релиза. Прогон от root с `test -w`
+# её не заменяет: шлюз пишет не под root.
+while IFS= read -r lane_dir; do
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE" "$SOFASCORE_HOST_PYTHON" -B \
+    "$RELEASE/scripts/sofascore_runtime_preflight.py" preflight \
+      --release-root "$RELEASE" --artifact "$ARTIFACT_DEST" --state-dir "$lane_dir" \
+      --campaign-dir "$CAMPAIGN" --campaign-policy "$RELEASE/configs/sofascore/all_mens_campaign.json" \
+      --expected-artifact-id "$ARTIFACT_ID" >> "$LOG" 2>&1
+  log "preflight ok: $lane_dir"
+done <<< "$LANE_STATE_DIRS"
 
 # Единственный источник истины о бое — env-файл контура; compose и сторож читают его.
 # Значения этого выката передаются compose и явно (окружение процесса сильнее

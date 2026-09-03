@@ -88,7 +88,8 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
     )
     _write(
         bin_dir / "host-python",
-        f'#!/usr/bin/env bash\ncase "$*" in *runtime_fingerprint*) echo {DIGEST} ;; esac\nexit 0\n',
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{state_dir}/host-python.log"\n'
+        f'case "$*" in *runtime_fingerprint*) echo {DIGEST} ;; esac\nexit 0\n',
         0o755,
     )
 
@@ -197,6 +198,20 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
     # deploy.sh не пересоздаёт airflow-init, где пулы заводятся впервые: без этого
     # шага задачи полос повисли бы в несуществующем пуле.
     assert min(args.index(a) for a in pools) > max(i for i, a in enumerate(args) if a.startswith("compose "))
+    preflights = [
+        line for line in (state_dir / "host-python.log").read_text(encoding="utf-8").splitlines()
+        if " preflight " in line
+    ]
+    # Полный валидатор (каноничность, владелец, доступ UID 50000, вне дерева релиза)
+    # обязан пройти по КАЖДОЙ полосе, а не только по каталогу актуалки.
+    runtime = tmp_path / "runtime"
+    assert sorted(line.split("--state-dir ")[1].split(" ")[0] for line in preflights) == sorted(
+        [
+            f"{runtime}/gateway-state",
+            f"{runtime}/gateway-state-history",
+            f"{runtime}/gateway-state-players",
+        ]
+    ), preflights
     restarts = [
         line.split(" ", 1)[1]
         for line in (state_dir / "systemctl.log").read_text(encoding="utf-8").splitlines()
@@ -238,6 +253,17 @@ def test_deploy_refuses_before_touching_anything_when_a_lane_state_dir_is_unset(
     assert not (state_dir / "calls.log").exists(), "ни одного вызова docker до отказа"
 
 
+def _symlink_players_state_onto_history(text: str, runtime: Path) -> str:
+    """Разные строки — один каталог: сравнение строк такое не ловит."""
+    alias = runtime / "gateway-state-players-alias"
+    (runtime / "gateway-state-players").rmdir()
+    alias.symlink_to(runtime / "gateway-state-history")
+    return text.replace(
+        f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players",
+        f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={alias}",
+    )
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("break_env", "reason"),
@@ -247,17 +273,25 @@ def test_deploy_refuses_before_touching_anything_when_a_lane_state_dir_is_unset(
                 f"SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state-history",
                 f"SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state",
             ),
-            "должны быть разными",
+            "указывают на один каталог",
         ),
         (
             lambda text, runtime: text.replace(
                 f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players",
                 f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/nowhere",
             ),
-            "недоступен на запись",
+            "не существует",
+        ),
+        (
+            _symlink_players_state_onto_history,
+            "указывают на один каталог",
         ),
     ],
-    ids=["two-lanes-share-one-state-dir", "lane-state-dir-does-not-exist"],
+    ids=[
+        "two-lanes-share-one-state-dir",
+        "lane-state-dir-does-not-exist",
+        "lane-state-dir-is-a-symlink-to-another-lane",
+    ],
 )
 def test_deploy_refuses_a_state_layout_that_would_give_a_wal_two_writers(
     tmp_path: Path, break_env, reason: str
