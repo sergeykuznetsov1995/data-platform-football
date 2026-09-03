@@ -142,8 +142,13 @@ The budget classes ship in git as `configs/sofascore/workload_policy.json`
 of 50, one season per `season_format`/`team_count_band` pair) and nothing in it
 depends on the runtime fingerprint of the tree, so editing scraper code no
 longer invalidates the paid path. The spend stays bounded by three static
-gateway ceilings — `--daily-budget-mb`, `--max-lease-mb`, `--dagrun-budget-bytes`
-— and by the signed allocation of every task.
+gateway ceilings — `--daily-budget-mb`, `--max-lease-mb`, `--max-active-leases`
+— and by the signed allocation of every task. `--dagrun-budget-bytes` and
+`--url-budget-bytes` do NOT bound a paid SofaScore lease (they did not before
+#1245 either): `_lease_dagrun_budget_bytes` meters a signed run against
+`workload_plan.run_cap_bytes` — the signed sum of the plan's allocations — and
+`_lease_url_budget_bytes` substitutes the same number for the per-URL cap so a
+warmed browser session is not truncated on one URL.
 
 `deploy/sofascore/deploy.sh` copies the policy of the release tree to
 `<runtime>/artifacts/<release-tag>/workload_policy.json` and pins its SHA-256

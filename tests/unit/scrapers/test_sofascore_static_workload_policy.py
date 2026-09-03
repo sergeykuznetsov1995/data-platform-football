@@ -34,9 +34,11 @@ from scrapers.sofascore.workload_plan import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SHIPPED_POLICY = REPO_ROOT / "configs" / "sofascore" / "workload_policy.json"
-# The static DagRun ceiling the three gateway lanes are started with
-# (``--dagrun-budget-bytes`` in deploy/sofascore/gateway.compose.yaml).
-GATEWAY_DAGRUN_BUDGET_BYTES = 8_000_000
+# ``--max-lease-mb`` of the three gateway lanes (deploy/sofascore/
+# gateway.compose.yaml): the hard ceiling of ONE paid lease, and therefore of
+# one workload class.  ``--dagrun-budget-bytes`` is deliberately not used here:
+# it does not bound a signed SofaScore run (see ``_lease_dagrun_budget_bytes``).
+GATEWAY_MAX_LEASE_BYTES = 46 * 1024 * 1024
 
 
 def _payload() -> dict:
@@ -85,12 +87,12 @@ def test_editing_scraper_code_cannot_invalidate_the_budget(monkeypatch):
 
 
 @pytest.mark.unit
-def test_every_class_cap_fits_inside_the_static_gateway_dagrun_ceiling():
+def test_every_class_cap_fits_inside_one_paid_gateway_lease():
     policy = load_static_workload_policy(SHIPPED_POLICY)
 
     assert max(
         measured.hard_task_bytes for measured in policy.classes.values()
-    ) <= GATEWAY_DAGRUN_BUDGET_BYTES
+    ) <= GATEWAY_MAX_LEASE_BYTES
 
 
 @pytest.mark.unit

@@ -4068,11 +4068,17 @@ def test_gateway_main_boots_the_static_policy_and_then_issues_a_paid_lease(
         max_bytes=match_policy.hard_task_bytes,
         ttl_seconds=30,
         metadata=_sofascore_context(
-            budget=match_policy.hard_task_bytes, artifact_id=policy_id
+            # The ``::targets`` phase picks MATCH_WORKLOAD_CLASS, a class the
+            # shipped policy really declares — not the synthetic season shape
+            # the generic fixture would build by default.
+            run_id="scheduled__2026-09-03::targets",
+            budget=match_policy.hard_task_bytes,
+            artifact_id=policy_id,
         ),
         require_context=True,
     )
     assert lease.source == "sofascore"
+    assert lease.workload_plan.allocations[0].workload_class in policy.classes
     assert lease.report()["budget_artifact_id"] == policy_id
 
 
