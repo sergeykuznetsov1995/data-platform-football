@@ -169,6 +169,20 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
     assert env["SOFASCORE_PROXY_CONTROL_URL"] == "http://sofascore_proxy_filter:8899"
     assert env["SOFASCORE_ALL_MENS_STATE"] == "/opt/airflow/runtime/sofascore/all-men/state.json"
     assert env["SOFASCORE_REFRESH_BATCH_SIZE"] == "${SOFASCORE_REFRESH_BATCH_SIZE:-3}"
+    # Полосы (#1244): история и игроки ходят к своим шлюзам и держат свои пулы;
+    # актуалка и дейли остаются на дефолтах (sofascore_proxy_filter/ingest_scraper_pool),
+    # поэтому их ключей здесь сознательно нет.
+    assert env["SOFASCORE_HISTORY_POOL"] == "sofascore_history_pool"
+    assert env["SOFASCORE_HISTORY_PROXY_CONTROL_URL"] == "http://sofascore_gw_history:8899"
+    assert env["SOFASCORE_PLAYERS_POOL"] == "sofascore_players_pool"
+    assert env["SOFASCORE_PLAYERS_PROXY_CONTROL_URL"] == "http://sofascore_gw_players:8899"
+    assert "SOFASCORE_REFRESH_POOL" not in env and "SOFASCORE_REFRESH_PROXY_CONTROL_URL" not in env
+    # deploy.sh не пересоздаёт airflow-init, поэтому пулы ставятся и здесь (первый
+    # подъём контура), и шагом pools самого deploy.sh (ротация).
+    init = "\n".join(cfg["services"]["airflow-init"]["command"])
+    assert "airflow pools set 'ingest_scraper_pool' 1 " in init
+    assert 'airflow pools set \'sofascore_history_pool\' "${SOFASCORE_HISTORY_POOL_SLOTS:-1}" ' in init
+    assert 'airflow pools set \'sofascore_players_pool\' "${SOFASCORE_PLAYERS_POOL_SLOTS:-1}" ' in init
     assert "dp-backend" not in cfg["networks"]
     assert set(scheduler["networks"]) == {"sofascore-net", "dp-storage"}
     assert scheduler["deploy"]["resources"]["limits"]["memory"] == "10G"

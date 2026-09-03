@@ -58,6 +58,14 @@ x-ss-airflow-common: &ss-airflow-common
     # Хардкод (не из .env): в sofascore-net алиас sofascore_proxy_filter — наш шлюз
     # проекта sofascore-gw (container_name у него другой, alias — от имени сервиса).
     SOFASCORE_PROXY_CONTROL_URL: http://sofascore_proxy_filter:8899
+    # Полосы источника (#1244): три шлюза проекта sofascore-gw, три пула Airflow.
+    # Кампания истории и полоса игроков читают ЭТИ ключи (dag_backfill_…:53,72);
+    # актуалка и дейли остаются на дефолтах выше — их полоса это sofascore_gw_951
+    # и ingest_scraper_pool, который и сериализует их между собой.
+    SOFASCORE_HISTORY_POOL: sofascore_history_pool
+    SOFASCORE_HISTORY_PROXY_CONTROL_URL: http://sofascore_gw_history:8899
+    SOFASCORE_PLAYERS_POOL: sofascore_players_pool
+    SOFASCORE_PLAYERS_PROXY_CONTROL_URL: http://sofascore_gw_players:8899
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
     SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
     SOFASCORE_PLAYER_ROTATION_MODULUS: ${SOFASCORE_PLAYER_ROTATION_MODULUS:-4}
@@ -224,6 +232,8 @@ services:
           --firstname Admin --lastname User --role Admin \
           --email admin@example.com || true
         airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers (isolated sofascore stack #951)'
+        airflow pools set 'sofascore_history_pool' "${SOFASCORE_HISTORY_POOL_SLOTS:-1}" 'SofaScore history lane'
+        airflow pools set 'sofascore_players_pool' "${SOFASCORE_PLAYERS_POOL_SLOTS:-1}" 'SofaScore players lane'
         echo "sofascore-airflow init complete"
     environment:
       <<: *ss-airflow-env
