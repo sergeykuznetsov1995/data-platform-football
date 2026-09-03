@@ -888,6 +888,7 @@ def _with_shared_rpm_ceiling(limiter, *, workers: int):
         PgSharedRateLimiter,
     )
 
+
     shared = PgSharedRateLimiter(
         resolve_control_db_uri(os.environ),
         rpm=rpm,
@@ -904,14 +905,16 @@ def _build_native_service(args, run_id: str):
     from scrapers.fotmob.repository import FotMobRepository
     from scrapers.fotmob.service import FotMobIngestService
     from scrapers.fotmob.transport import FotMobTransport
-    from scrapers.utils.rate_limiter import RateLimiter
+    from scrapers.fotmob.shared_rate_limiter import RefundableRateLimiter
 
     raw_store = (
         FotMobRawStore.from_uri(args.raw_store_uri)
         if args.raw_store_uri
         else FotMobRawStore.from_env(optional=False)
     )
-    limiter = RateLimiter(
+    # RefundableRateLimiter — тот же token bucket, что и раньше, плюс возврат
+    # токена, не пропущенного общим потолком (см. shared_rate_limiter).
+    limiter = RefundableRateLimiter(
         max_requests=args.requests_per_minute,
         window_seconds=60,
         # Avoid an initial 30-request burst when several workers start.

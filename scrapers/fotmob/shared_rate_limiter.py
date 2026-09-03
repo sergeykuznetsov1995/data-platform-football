@@ -19,10 +19,32 @@ import threading
 import time
 from typing import Any, Optional
 
+from scrapers.utils.rate_limiter import RateLimiter
+
 
 logger = logging.getLogger(__name__)
 
 SHARED_RATE_LIMIT_TABLE = "fotmob_shared_rate_limit"
+
+
+class RefundableRateLimiter(RateLimiter):
+    """Локальный token bucket, умеющий вернуть невостребованный токен.
+
+    Возврат нужен, когда за локальным капом стоит второй барьер (общий потолок
+    источника): без него токен, взятый локально и не пропущенный общим, сгорал
+    бы, и локальный кап медленно душил бы процесс.
+
+    Метод живёт здесь, а не в самом ``RateLimiter``:
+    ``scrapers/utils/rate_limiter.py`` входит в пломбу
+    ``scrapers/whoscored/runtime_contract.lock``, и любая правка этого файла
+    требует перештамповки пломбы, то есть сдвигает согласованный
+    ``lock_sha256`` чужого источника.
+    """
+
+    def refund(self) -> None:
+        with self._lock:
+            self._refill()
+            self._tokens = min(self.config.burst_size, self._tokens + 1)
 
 
 class PgSharedRateLimiter:

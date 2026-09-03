@@ -13,8 +13,8 @@ from scrapers.fotmob.shared_rate_limiter import (
     SHARED_RATE_LIMIT_TABLE,
     CompositeRateLimiter,
     PgSharedRateLimiter,
+    RefundableRateLimiter,
 )
-from scrapers.utils.rate_limiter import RateLimiter
 
 
 class _FakeCursor:
@@ -109,7 +109,7 @@ class _StubShared:
 
 @pytest.mark.unit
 def test_local_refusal_never_asks_the_database():
-    local = RateLimiter(max_requests=1, window_seconds=600, burst_size=1)
+    local = RefundableRateLimiter(max_requests=1, window_seconds=600, burst_size=1)
     assert local.try_acquire() is True
     shared = _StubShared([True])
     slept = []
@@ -123,7 +123,7 @@ def test_local_refusal_never_asks_the_database():
 
 @pytest.mark.unit
 def test_shared_refusal_returns_the_local_token():
-    local = RateLimiter(max_requests=60, window_seconds=600, burst_size=4)
+    local = RefundableRateLimiter(max_requests=60, window_seconds=600, burst_size=4)
     shared = _StubShared([False])
     slept = []
     composite = CompositeRateLimiter(local, shared, sleep=slept.append)
@@ -145,7 +145,7 @@ def test_shared_refusal_returns_the_local_token():
 
 @pytest.mark.unit
 def test_both_barriers_pass_gives_a_token():
-    local = RateLimiter(max_requests=60, window_seconds=600, burst_size=4)
+    local = RefundableRateLimiter(max_requests=60, window_seconds=600, burst_size=4)
     shared = _StubShared([True])
     composite = CompositeRateLimiter(local, shared, sleep=lambda _delay: None)
     before = local.available_tokens
@@ -158,12 +158,27 @@ def test_both_barriers_pass_gives_a_token():
 
 @pytest.mark.unit
 def test_refund_never_exceeds_the_burst():
-    local = RateLimiter(max_requests=60, window_seconds=600, burst_size=2)
+    local = RefundableRateLimiter(max_requests=60, window_seconds=600, burst_size=2)
 
     local.refund()
     local.refund()
 
     assert local.available_tokens == pytest.approx(2.0, abs=1e-3)
+
+
+@pytest.mark.unit
+def test_sealed_base_limiter_is_untouched():
+    """scrapers/utils/rate_limiter.py входит в пломбу WhoScored.
+
+    Правка этого файла сдвигает согласованный lock_sha256 чужого источника и
+    валит его профильный CI на КАЖДОМ PR, поэтому возврат токена живёт в
+    подклассе, а не в самом RateLimiter.
+    """
+
+    from scrapers.utils.rate_limiter import RateLimiter
+
+    assert not hasattr(RateLimiter, "refund")
+    assert issubclass(RefundableRateLimiter, RateLimiter)
 
 
 @pytest.mark.unit
@@ -174,7 +189,7 @@ def test_disabled_ceiling_leaves_a_bare_local_limiter(monkeypatch):
     sys.modules.pop("dags.scripts.run_fotmob_scraper", None)
     mod = importlib.import_module("dags.scripts.run_fotmob_scraper")
     monkeypatch.setenv(mod.FOTMOB_SHARED_RPM_ENV, "0")
-    local = RateLimiter(max_requests=45, window_seconds=60, burst_size=4)
+    local = RefundableRateLimiter(max_requests=45, window_seconds=60, burst_size=4)
 
     assert mod._with_shared_rpm_ceiling(local, workers=4) is local
 
@@ -218,7 +233,7 @@ def test_ceiling_wraps_the_local_limiter_with_the_control_db(monkeypatch):
         sys.modules, "psycopg2", type(sys)("psycopg2")
     )
     sys.modules["psycopg2"].connect = connect
-    local = RateLimiter(max_requests=60, window_seconds=60, burst_size=4)
+    local = RefundableRateLimiter(max_requests=60, window_seconds=60, burst_size=4)
 
     composite = mod._with_shared_rpm_ceiling(local, workers=4)
 
