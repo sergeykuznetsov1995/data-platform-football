@@ -617,6 +617,38 @@ class TestNativeValidation:
             mod.validate_data(str(report))
 
     @pytest.mark.unit
+    def test_writer_lock_busy_report_stays_red(self, tmp_path):
+        """Барьер (б): отчёт-отказ замка писателя красит ран, как и раньше.
+
+        Замок писателя сузился до времени записи и научился ждать, но
+        исчерпанное ожидание по-прежнему обязано быть красным раном: тихо
+        пропущенная запись выглядела бы зелёным пустым раном (#1227).
+        """
+
+        import json
+
+        from airflow.exceptions import AirflowException
+
+        mod = _reload_dag_module()
+        payload = {
+            "run_id": "busy-run",
+            "mode": "daily",
+            "status": "incomplete",
+            "complete": False,
+            "tables": [],
+            "rows": {},
+            "errors": [
+                "WriterLockBusy: another FotMob writer holds the bronze writer "
+                "lock (key 1) after waiting 600s; refusing to write in parallel"
+            ],
+        }
+        report = tmp_path / "busy.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(AirflowException):
+            mod.validate_data(str(report))
+
+    @pytest.mark.unit
     def test_automatic_catalog_accepts_progress_with_scheduled_retry(self, tmp_path):
         """Ран непрерывной полосы с отложенным скоупом проходит validate_data.
 
