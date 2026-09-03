@@ -11,7 +11,7 @@
 
 | Часть | Файл в репозитории | Compose-проект / unit | Что монтирует |
 | --- | --- | --- | --- |
-| Планировщик + своя metadata-DB | `deploy/sofascore/airflow.compose.yaml` | `sofascore-airflow` (`sofascore-airflow-scheduler`, `sofascore-airflow-metadb`, `airflow-init`, `airflow-webserver` по профилю `ui`) | код — из `${SOFASCORE_RELEASE_ROOT}`; состояние кампании, verified-артефакт, пул прокси, venv-шим — из runtime-каталога |
+| Планировщик + своя metadata-DB | `deploy/sofascore/airflow.compose.yaml` | `sofascore-airflow` (`sofascore-airflow-scheduler`, `sofascore-airflow-metadb`, `airflow-init`, `airflow-webserver` по профилю `ui`) | код — из `${SOFASCORE_RELEASE_ROOT}`; состояние кампании, опубликованная статическая политика бюджета, пул прокси, venv-шим — из runtime-каталога |
 | Платные шлюзы полос (3 шт.) | `deploy/sofascore/gateway.compose.yaml` | `sofascore-gw` (`sofascore_gw_951` с алиасом сервиса `sofascore_proxy_filter`, `sofascore_gw_history`, `sofascore_gw_players` в сети `sofascore-net`) | всё дерево релиза в `/opt/sofascore-repo:ro`; артефакт и fallback-файл общие, WAL/ledger — свой каталог у каждого |
 | Блок-лист DagBag | `deploy/sofascore/.airflowignore` | накрывает `dags/.airflowignore` внутри scheduler'а | — |
 | Мини-DAG контура | `dags/dag_trigger_sofascore_daily.py`, `dags/dag_sofascore_manifest_maintenance.py` | обычные файлы `dags/`; на общем scheduler'е спрятаны через `dags/.airflowignore` | — |
@@ -195,15 +195,13 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    пересоздания сервисов. Делать его в окне выката, непосредственно перед `deploy.sh`:
    новый unit ждёт монтирования нового релиза, а живой шлюз до выката стоит на старом.
 3. Заморозить дерево с коммитом, содержащим этот рецепт, выкатить `deploy.sh` —
-   первое дерево в `/opt/sofascore/releases/`. Канарейка не нужна, если
-   `runtime_fingerprint` дерева не изменился: verified-артефакт того же digest
-   действителен. **`dags/` в пломбу входит частично** — четыре DAG
-   (`dag_ingest_sofascore`, оба all-mens, `dag_canary_sofascore_proxy`) и часть
-   `dags/scripts`, `dags/utils` перечислены в `RUNTIME_FILE_ENTRIES`
-   (`scrapers/sofascore/runtime_fingerprint.py`); вне пломбы целиком только
-   `deploy/`, `tests/` и `docs/`. Перед выкатом сверять digest, а не догадываться:
-   `PYTHONPATH=<дерево> python -c "from scrapers.sofascore.runtime_fingerprint import
-   runtime_fingerprint; print(runtime_fingerprint()['digest'])"`.
+   первое дерево в `/opt/sofascore/releases/`. Платный замер (канарейка) отменён
+   (#1245): бюджет берётся из статической политики `configs/sofascore/workload_policy.json`,
+   лежащей в git, и любая правка кода едет в бой без повторного замера.
+   `runtime_fingerprint` дерева больше не участвует в выкате и в допуске аренды —
+   сверять digest перед выкатом не нужно. Расход держат статические потолки шлюза
+   (`--daily-budget-mb`, `--max-lease-mb`, `--dagrun-budget-bytes`,
+   `--url-budget-bytes`, `--max-active-leases`) из `deploy/sofascore/gateway.compose.yaml`.
 4. После приёмки убрать из `/root/sofascore-runtime` старые compose/override, мини-DAG и
    `airflowignore-sofascore` (они больше не монтируются), а `pkg2/*.sh` заменить ссылкой
    на `deploy/sofascore/`.

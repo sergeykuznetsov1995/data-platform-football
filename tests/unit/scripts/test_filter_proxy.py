@@ -3986,8 +3986,34 @@ def test_players_lane_dag_is_inside_the_paid_sofascore_allowlist(shared_mod):
     assert shared_mod._source_for_dag("dag_players_sofascore_all_mens") == "sofascore"
     assert shared_mod._source_for_dag("dag_players_sofascore_unknown") == ""
 
-    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
-    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 4096
+    policy = shared_mod.load_static_workload_policy(SHIPPED_WORKLOAD_POLICY)
+    player_policy = policy.classes[PLAYER_WORKLOAD_CLASS]
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",
+            "http://u:p@pool.invalid:10001",
+        ]
+    )
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = player_policy.hard_task_bytes
+    shared_mod.SOFASCORE_BUDGET_ARTIFACT_ID = policy.artifact_id
+    # The lane does not merely resolve to a source: it takes a real paid lease.
+    lease = shared_mod._create_lease(
+        mgr,
+        max_bytes=player_policy.hard_task_bytes,
+        ttl_seconds=30,
+        metadata=_sofascore_context(
+            dag_id="dag_players_sofascore_all_mens",
+            run_id="scheduled__2026-09-03::players",
+            task_id="capture_player_batch_00000",
+            budget=player_policy.hard_task_bytes,
+            artifact_id=policy.artifact_id,
+        ),
+        require_context=True,
+    )
+    assert lease.source == "sofascore"
+    assert lease.dag_id == "dag_players_sofascore_all_mens"
+    assert lease.report()["budget_artifact_id"] == policy.artifact_id
+
     with pytest.raises(ValueError, match="closed source allowlist"):
         shared_mod._create_lease(
             mgr,

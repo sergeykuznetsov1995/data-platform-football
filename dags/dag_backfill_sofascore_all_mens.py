@@ -123,11 +123,11 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
         result_dir=RESULT_DIR,
         workload_artifact=WORKLOAD_ARTIFACT,
         dag_run_id=str(context.get("run_id") or "manual"),
-        authorized_season_classes={
-            name: budget.measured_tournament_ids
+        authorized_season_classes=[
+            name
             for name, budget in workload_policy.classes.items()
             if budget.scope == "season"
-        },
+        ],
         task_env=HISTORY_TASK_ENV,
     )
 

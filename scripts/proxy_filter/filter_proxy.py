@@ -7368,9 +7368,17 @@ async def main() -> None:
             # fail-closed until a readable static policy is mounted.
             log.warning("SofaScore paid leases disabled: %s", exc)
         else:
-            # The DagRun ceiling is the operator's static cap (``--dagrun-budget-
-            # bytes``) and never drops below the largest single workload class,
-            # so one signed allocation always fits inside it.
+            # Size of the largest paid SofaScore lease the gateway will hand
+            # out, and the "SofaScore paid leases are on" flag.  It is raised
+            # to the operator's ``--dagrun-budget-bytes`` so a cap set on the
+            # command line is never *lower* than what admission allows, but it
+            # is NOT the ceiling of a whole DagRun: a signed run is metered
+            # against ``workload_plan.run_cap_bytes`` (see
+            # ``_lease_dagrun_budget_bytes``), which is the signed sum of the
+            # plan's allocations and may exceed this number on a large batch.
+            # A DagRun-wide ceiling would need a separate decision (#1245
+            # follow-up); spend is bounded by ``--daily-budget-mb`` and
+            # ``--max-lease-mb`` meanwhile.
             SOFASCORE_DAGRUN_BUDGET_BYTES = max(
                 dagrun_budget_bytes,
                 max(item.hard_task_bytes for item in sofascore_policy.classes.values()),

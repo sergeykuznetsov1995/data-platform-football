@@ -257,7 +257,7 @@ def plan_historical_batch(
     ),
     metadata_budget_bytes: int = 64 * 1024 * 1024,
     dag_run_id: str = "manual",
-    authorized_season_classes: Mapping[str, Iterable[int | str]] | None = None,
+    authorized_season_classes: Iterable[str] | None = None,
     task_env: Mapping[str, str] | None = None,
     failures: Mapping[str, Mapping[str, Any]] | None = None,
     max_scope_attempts: int = DEFAULT_MAX_SCOPE_ATTEMPTS,
@@ -270,8 +270,9 @@ def plan_historical_batch(
     are ranked by ``(depth, -start_year, tournament_id)`` where ``depth`` is
     the season's position in the tournament's newest-first season list. A
     pending season yields one serialized metadata task for its wave; a
-    deferred (unmeasured) season is skipped and holds the deeper seasons of
-    its tournament until a later canary wave unlocks the shape.
+    season whose shape is not declared in the static workload policy is
+    deferred and holds the deeper seasons of its tournament until the policy
+    declares that shape.
 
     ``failures`` is the campaign's failure memory (see ``read_failures``): a
     scope with ``count >= max_scope_attempts`` is parked like a deferred one
@@ -309,12 +310,9 @@ def plan_historical_batch(
     if not isinstance(tournaments, list):
         raise CampaignPlanningError("campaign tournaments must be a list")
     completed_keys = {str(value) for value in completed}
-    authorized: dict[str, frozenset[str]] | None = None
+    authorized: frozenset[str] | None = None
     if authorized_season_classes is not None:
-        authorized = {
-            str(name): frozenset(str(value) for value in tournaments)
-            for name, tournaments in authorized_season_classes.items()
-        }
+        authorized = frozenset(str(name) for name in authorized_season_classes)
     # (rank, kind, tournament, season); kind in ready/completed/pending/deferred
     ranked: list[tuple[tuple[int, int, int], str, Mapping[str, Any], Mapping[str, Any]]] = []
     for tournament in tournaments:
@@ -378,13 +376,11 @@ def plan_historical_batch(
                             max_pages_per_direction=50,
                         )
                         class_name = season_workload_class(shape)
-                        measured = authorized.get(class_name)
                     except WorkloadPlanError:
-                        measured = None
-                    tournament_id = str(tournament.get("unique_tournament_id"))
-                    if measured is None or (
-                        tournament_id not in measured and len(measured) < 2
-                    ):
+                        class_name = ""
+                    # The static policy authorizes every tournament of a
+                    # declared shape; only an undeclared shape is deferred.
+                    if class_name not in authorized:
                         kind = "deferred"
             rank = (depth, -wave, int(tournament["unique_tournament_id"]))
             ranked.append((rank, kind, tournament, season))

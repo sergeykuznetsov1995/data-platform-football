@@ -148,6 +148,7 @@ jobs:
             tests/unit/scrapers/test_scrapers_lazy_import.py \
             tests/unit/scrapers/test_sofascore_scraper.py \
             tests/unit/scrapers/test_sofascore_season_pipeline.py \
+            tests/unit/scrapers/test_sofascore_static_workload_policy.py \
             tests/unit/scripts/test_backfill_sofascore.py \
             tests/unit/scripts/test_bench_sofascore_offline_replay.py \
             tests/unit/scripts/test_build_sofascore_all_mens_snapshot.py \

@@ -19,7 +19,7 @@ SHARED_FILTER_SHA256 = (
     # Bumped for the static workload policy that replaced the paid canary
     # (#1245).  FBref keeps its own filter and stays out of ``runtime_files`` —
     # both asserted below.
-    "91173093e57c11a44f71de3e11c460511a0aeae19f96273121278f802afd150d"
+    "9cfd47e56b87824c1f39f40982a53a44eeb50dcfb4f7e879929c73f5a9171634"
 )
 
 
