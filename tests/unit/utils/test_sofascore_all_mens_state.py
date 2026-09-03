@@ -7,8 +7,10 @@ import pytest
 
 from dags.utils.sofascore_all_mens_state import (
     CampaignPlanningError,
+    SeasonTarget,
     campaign_scope_key,
     clear_failed,
+    current_season_targets,
     env_int,
     mark_failed,
     plan_historical_batch,
@@ -352,13 +354,364 @@ def _refresh_snapshot():
     return snapshot
 
 
+def _refresh_pending(league, season, count, timestamp=1_787_788_800):
+    """One Bronze pending row under the timestamp-aware planner contract."""
+
+    return (league, season, count, timestamp)
+
+
+@pytest.mark.unit
+def test_refresh_planner_skips_tournament_with_null_seasons():
+    snapshot = _refresh_snapshot()
+    snapshot["tournaments"][0]["seasons"] = None
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+    planned = plan_refresh_batch(
+        snapshot,
+        [_refresh_pending("SS-17", "2627", 1), _refresh_pending("SS-8", "2526", 10)],
+        batch_size=2, queue_mode="fresh",
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825"
+    ]
+
+
+@pytest.mark.unit
+def test_current_season_targets_reject_a_boolean_start_year():
+    snapshot = _refresh_snapshot()
+    tournament = snapshot["tournaments"][0]
+    tournament["seasons"] = [
+        {
+            "source_season_id": 171,
+            "canonical_season": "invalid-boolean",
+            "start_year": True,
+            "metadata_status": "pending",
+        },
+        {
+            "source_season_id": 170,
+            "canonical_season": "valid-integer",
+            "start_year": 0,
+            "metadata_status": "pending",
+        },
+    ]
+
+    targets = current_season_targets(snapshot, frozenset())
+
+    assert next(target for target in targets if target.tournament_id == 17) == (
+        SeasonTarget(
+            tournament_id=17,
+            season_id=170,
+            league="SS-17",
+            canonical_season="valid-integer",
+        )
+    )
+
+
+@pytest.mark.unit
+def test_current_season_targets_keep_the_first_listed_newest_year_tie():
+    snapshot = _refresh_snapshot()
+    tournament = snapshot["tournaments"][0]
+    tournament["seasons"] = [
+        {
+            "source_season_id": 171,
+            "canonical_season": "first-2627",
+            "start_year": 2026,
+            "metadata_status": "pending",
+        },
+        {
+            "source_season_id": 172,
+            "canonical_season": "second-2026",
+            "start_year": 2026,
+            "metadata_status": "pending",
+        },
+    ]
+
+    targets = current_season_targets(snapshot, frozenset())
+
+    assert next(target for target in targets if target.tournament_id == 17) == (
+        SeasonTarget(
+            tournament_id=17,
+            season_id=171,
+            league="SS-17",
+            canonical_season="first-2627",
+        )
+    )
+
+
+@pytest.mark.unit
+def test_refresh_planner_skips_malformed_snapshot_records(caplog):
+    snapshot = _refresh_snapshot()
+    snapshot["tournaments"][0]["seasons"] = [
+        None,
+        "not-a-season",
+        {"source_season_id": "not-an-id", "canonical_season": "bad", "start_year": 2027},
+        {"source_season_id": 179, "start_year": 2027},
+        snapshot["tournaments"][0]["seasons"][0],
+    ]
+    snapshot["tournaments"].extend([
+        None,
+        "not-a-tournament",
+        {
+            "metadata_status": "ready",
+            "unique_tournament_id": "not-an-id",
+            "capture_key": "SS-bad",
+            "seasons": [],
+        },
+        {
+            "metadata_status": "ready",
+            "unique_tournament_id": 19,
+            "seasons": [],
+        },
+        {
+            "metadata_status": "ready",
+            "unique_tournament_id": 20,
+            "capture_key": "SS-20",
+            "seasons": {"not": "a list"},
+        },
+    ])
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+    planned = plan_refresh_batch(
+        snapshot,
+        [_refresh_pending("SS-17", "2627", 1), _refresh_pending("SS-8", "2627", 2)],
+        batch_size=2, queue_mode="fresh",
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:826", "campaign-test:17:1726"
+    ]
+    assert "invalid refresh snapshot" in caplog.text
+
+
+@pytest.mark.unit
+def test_refresh_planner_orders_fresh_rows_by_timestamp_with_deterministic_ties():
+    snapshot = _refresh_snapshot()
+    tournament = snapshot["tournaments"][0]
+    tournament["seasons"].append({
+        "source_season_id": 1724,
+        "canonical_season": "2425",
+        "start_year": 2024,
+        "metadata_status": "ready",
+    })
+    tournament["seasons"].append({
+        "source_season_id": 1723,
+        "canonical_season": "2324",
+        "start_year": 2023,
+        "metadata_status": "ready",
+    })
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+    planned = plan_refresh_batch(
+        snapshot,
+        [
+            _refresh_pending("SS-8", "2526", 5, 1_787_356_800),
+            _refresh_pending("SS-17", "2627", 7, 1_787_814_000),
+            _refresh_pending("SS-17", "2425", 5, 1_787_529_600),
+            _refresh_pending("SS-17", "2324", 5, 1_787_529_600),
+            _refresh_pending("SS-8", "2627", 10, 1_787_817_600),
+            _refresh_pending("SS-17", "2526", 9, 1_787_702_400),
+        ],
+        batch_size=8, queue_mode="fresh",
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:826",   # current, more pending matches
+        "campaign-test:17:1726",  # current, fewer pending matches
+        "campaign-test:17:1725",  # history, most pending matches
+        "campaign-test:17:1723",  # history equal-count ties: league then season
+        "campaign-test:17:1724",
+        "campaign-test:8:825",
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_fresh_prioritizes_a_newer_small_partition_over_old_backlog():
+    snapshot = _refresh_snapshot()
+    pending = [
+        _refresh_pending("SS-17", "2627", 1, 1_787_821_200),
+        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
+    ]
+
+    planned = plan_refresh_batch(
+        snapshot, pending, batch_size=2, queue_mode="fresh"
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726",  # current, even with fewer pending matches
+        "campaign-test:8:825",     # historical fallback
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_prioritizes_an_explicit_calendar_year_current_partition():
+    snapshot = _refresh_snapshot()
+    current = snapshot["tournaments"][0]["seasons"][0]
+    current.update({
+        "canonical_season": "2026",
+        "start_year": 2026,
+        "season_format": "single_year",
+        "source_season_id": 1726,
+    })
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    pending = [
+        _refresh_pending("SS-17", "2026", 1, 1_787_821_200),
+        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
+    ]
+
+    planned = plan_refresh_batch(
+        snapshot, pending, batch_size=2, queue_mode="fresh"
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726",  # current calendar year
+        "campaign-test:8:825",     # older split year fallback
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_backlog_preserves_largest_old_partition_first():
+    snapshot = _refresh_snapshot()
+    pending = [
+        _refresh_pending("SS-17", "2526", 3, 1_787_821_200),
+        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
+    ]
+
+    planned = plan_refresh_batch(
+        snapshot, pending, batch_size=2, queue_mode="backlog"
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825",  # historical backlog, most pending matches
+        "campaign-test:17:1725",
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_fresh_uses_null_last_newest_timestamp_and_stable_ties():
+    snapshot = _refresh_snapshot()
+    snapshot["tournaments"][0]["seasons"].extend([
+        {
+            "source_season_id": 1724,
+            "canonical_season": "2425",
+            "start_year": 2024,
+            "metadata_status": "ready",
+        },
+        {
+            "source_season_id": 1723,
+            "canonical_season": "2324",
+            "start_year": 2023,
+            "metadata_status": "ready",
+        },
+    ])
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+    planned = plan_refresh_batch(
+        snapshot,
+        [
+            _refresh_pending("SS-17", "2526", 99, None),
+            _refresh_pending("SS-17", "2324", 5, 1_787_738_400),
+            _refresh_pending("SS-17", "2425", 5, 1_787_738_400),
+            _refresh_pending("SS-17", "2627", 1, 1_787_824_800),
+            _refresh_pending("SS-8", "2526", 6, 1_787_738_400),
+            _refresh_pending("SS-8", "2627", 4, 1_787_738_400),
+        ],
+        batch_size=8,
+        queue_mode="fresh",
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726",  # newest timestamp
+        "campaign-test:8:825",   # same timestamp, larger pending count
+        "campaign-test:17:1723",  # same count: league then canonical season
+        "campaign-test:17:1724",
+        "campaign-test:8:826",
+        "campaign-test:17:1725",  # null timestamp is always last
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_filters_poisoned_rows_before_timestamp_normalization():
+    snapshot = _refresh_snapshot()
+    snapshot["tournaments"][0]["seasons"][1]["metadata_status"] = "excluded"
+    snapshot["tournaments"][0]["seasons"].append({
+        "source_season_id": 1724,
+        "canonical_season": "2425",
+        "start_year": 2024,
+        "metadata_status": "ready",
+    })
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+    planned = plan_refresh_batch(
+        snapshot,
+        [
+            _refresh_pending("SS-8", "2627", 50, object()),
+            _refresh_pending("SS-999", "2627", 40, object()),
+            _refresh_pending("SS-17", "2526", 30, object()),
+            _refresh_pending("SS-17", "2627", 1, 1_787_824_800),
+            _refresh_pending("SS-17", "2425", 99, "not-a-timestamp"),
+        ],
+        batch_size=8,
+        queue_mode="fresh",
+        exclude_tournament_ids={8},
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726",
+        "campaign-test:17:1724",
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_requires_an_explicit_queue_mode():
+    snapshot = _refresh_snapshot()
+
+    with pytest.raises(TypeError, match="queue_mode"):
+        plan_refresh_batch(snapshot, [_refresh_pending("SS-17", "2627", 1)])
+
+    with pytest.raises(CampaignPlanningError, match="queue_mode"):
+        plan_refresh_batch(
+            snapshot,
+            [_refresh_pending("SS-17", "2627", 1)],
+            queue_mode="current",
+        )
+
+
 @pytest.mark.unit
 def test_refresh_planner_ranks_partitions_by_pending_matches_and_bounds_batch():
     snapshot = _refresh_snapshot()
-    pending = [("SS-8", "2526", 3), ("SS-17", "2627", 10), ("SS-17", "2526", 1)]
+    pending = [
+        _refresh_pending("SS-8", "2526", 3),
+        _refresh_pending("SS-17", "2627", 10),
+        _refresh_pending("SS-17", "2526", 1),
+    ]
 
     planned = plan_refresh_batch(
-        snapshot, pending, batch_size=2, dag_run_id="scheduled__1",
+        snapshot, pending, batch_size=2, queue_mode="fresh", dag_run_id="scheduled__1",
         task_env={"SOFASCORE_PROXY_CONTROL_URL": "http://gw:8080"},
     )
 
@@ -394,16 +747,16 @@ def test_refresh_planner_skips_configured_unknown_and_excluded_partitions():
         unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()).hexdigest()
     pending = [
-        ("SS-8", "2627", 9),      # configured league: the daily ingest owns it
-        ("SS-999", "2627", 8),    # not in the snapshot
-        ("SS-17", "1999", 7),     # season the snapshot does not know
-        ("SS-17", "2526", 6),     # excluded season: the scope cycle refuses it
-        ("ENG-Premier League", "2627", 5),
-        ("SS-17", "2627", 1),
+        _refresh_pending("SS-8", "2627", 9),      # configured league: the daily ingest owns it
+        _refresh_pending("SS-999", "2627", 8),    # not in the snapshot
+        _refresh_pending("SS-17", "1999", 7),     # season the snapshot does not know
+        _refresh_pending("SS-17", "2526", 6),     # excluded season: the scope cycle refuses it
+        _refresh_pending("ENG-Premier League", "2627", 5),
+        _refresh_pending("SS-17", "2627", 1),
     ]
 
     planned = plan_refresh_batch(
-        snapshot, pending, batch_size=8, exclude_tournament_ids={8}
+        snapshot, pending, batch_size=8, queue_mode="fresh", exclude_tournament_ids={8}
     )
 
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
@@ -416,10 +769,12 @@ def test_refresh_planner_rejects_a_stale_snapshot_and_bad_batch_size():
     snapshot = _refresh_snapshot()
 
     with pytest.raises(CampaignPlanningError, match="batch_size"):
-        plan_refresh_batch(snapshot, [], batch_size=0)
+        plan_refresh_batch(snapshot, [], batch_size=0, queue_mode="fresh")
     snapshot["snapshot_id"] = "0" * 64
     with pytest.raises(CampaignPlanningError, match="digest"):
-        plan_refresh_batch(snapshot, [("SS-17", "2627", 1)])
+        plan_refresh_batch(
+            snapshot, [_refresh_pending("SS-17", "2627", 1)], queue_mode="fresh"
+        )
 
 
 @pytest.mark.unit

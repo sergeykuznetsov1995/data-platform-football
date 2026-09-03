@@ -30,3 +30,10 @@
 # v2.2 (01.09.2026, пин 2c7e469f): новые чужие даги на master после 10.08 —
 # кампания SofaScore all-mens (#1216). Дописано append-ом: file-bind живёт на иноде.
 ^(dag_backfill_sofascore_all_mens|dag_refresh_sofascore_all_mens)\.py$
+
+# v2.3 (03.09.2026, слияние master 5395f4f4 в #1241): новые чужие даги на master после
+# 01.09 — мини-DAG контура SofaScore (#1238). Общий dags/.airflowignore их тоже прячет, но
+# в изоляте FotMob его подменяет file-bind этого файла — строка нужна здесь. Приёмка
+# автомата считает только даги %fotmob% и чужих в DagBag не заметит, поэтому хостовую копию
+# дописать append-ом ДО первой доставки цели ≥ 5395f4f4.
+^(dag_sofascore_manifest_maintenance|dag_trigger_sofascore_daily)\.py$

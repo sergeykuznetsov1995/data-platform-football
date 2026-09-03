@@ -1843,10 +1843,13 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
         "\nnetworks:\n", 1
     )[0]
 
-    # Dedicated pool secret + file fallback until the purchased pool lands.
-    assert "PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:-}" in service
+    # Dedicated pool secret (fail-closed, never the platform-wide
+    # PROXY_POOL_JSON) + file fallback from a deployment-owned host file.
+    assert (
+        "PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:?set the SofaScore paid "
+        "proxy pool JSON}"
+    ) in service
     assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"' in service
-    assert "./proxys.txt:/opt/airflow/proxys.txt:ro" in service
     assert "http://sofascore_proxy_filter:8900" in service
     # hard-cap 0 => production signer (a >0 cap is the never-authorized canary).
     assert '\n      - --sofascore-canary-hard-cap-bytes\n      - "0"' in service
@@ -1855,12 +1858,19 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     # Ledger/WAL on the narrow persistent state root, isolated from the shared
     # gateway and from the release checkout.
     assert "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl" in service
-    # Isolation contract: joins the shared dp-backend network as EXTERNAL (own
-    # project) and is ABSENT from the shared compose.yaml, so foreign deploys
-    # can't sweep it.
-    assert "external: true" in gateway
-    assert "name: dp-backend" in gateway
+    # Isolation contract: its own compose project on the contour's own
+    # EXTERNAL network (the isolated scheduler reaches it by service alias;
+    # #1155 stage 3 dropped dp-backend) and ABSENT from the shared
+    # compose.yaml, so foreign deploys can't sweep it.
+    assert document["name"] == "sofascore-gw"
+    assert document["networks"] == {
+        "sofascore-net": {"external": True, "name": "sofascore-net"}
+    }
+    assert model["networks"] == ["sofascore-net"]
     assert "\n  sofascore_proxy_filter:\n" not in _COMPOSE_PATH.read_text()
+    # The whole frozen release tree is the code mount; nothing is built in place.
+    assert "build" not in model
+    assert model["environment"]["PYTHONPATH"] == "/opt/sofascore-repo"
     artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
     state_target = "/opt/airflow/logs/sofascore_proxy_filter"
     assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (artifact_target)
@@ -1897,6 +1907,16 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     assert state_mount.get("read_only", False) is False
     assert state_mount["bind"]["create_host_path"] is False
     assert "/opt/airflow/logs" not in targets
+    repo_mount = long_volumes["/opt/sofascore-repo"]
+    assert repo_mount["source"].startswith("${SOFASCORE_RELEASE_ROOT:?")
+    assert repo_mount["read_only"] is True
+    assert repo_mount["bind"]["create_host_path"] is False
+    fallback_mount = long_volumes["/opt/airflow/proxys.txt"]
+    assert fallback_mount["source"].startswith(
+        "${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?"
+    )
+    assert fallback_mount["read_only"] is True
+    assert fallback_mount["bind"]["create_host_path"] is False
     for flag in (
         "--out",
         "--ledger",
@@ -1909,7 +1929,7 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     assert model["healthcheck"]["test"] == [
         "CMD",
         "python",
-        "/opt/airflow/scripts/sofascore_runtime_preflight.py",
+        "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py",
         "gateway-health",
         "--artifact",
         artifact_target,

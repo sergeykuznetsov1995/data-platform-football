@@ -30,6 +30,9 @@ COMPOSE_FILE = PROJECT_ROOT / "compose.yaml"
 SOFASCORE_GATEWAY_COMPOSE = (
     PROJECT_ROOT / "deploy" / "sofascore" / "gateway.compose.yaml"
 )
+SOFASCORE_AIRFLOW_COMPOSE = (
+    PROJECT_ROOT / "deploy" / "sofascore" / "airflow.compose.yaml"
+)
 FOTMOB_ISOLATED_COMPOSE = (
     PROJECT_ROOT / "deploy" / "fotmob" / "isolated.compose.yaml"
 )
@@ -53,6 +56,18 @@ COMPOSE_TEST_ENV = {
     "SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST": "/tmp/compose-test-sofascore-budget.json",
     "SOFASCORE_GATEWAY_STATE_HOST_DIR": "/tmp/compose-test-sofascore-gateway-state",
     "SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR": "/tmp/compose-test-sofascore-all-men",
+    # The isolated SofaScore contour (deploy/sofascore/*.compose.yaml) is
+    # fail-closed on every host path and image; dummies keep the render
+    # independent of the production host (#1155).
+    "SOFASCORE_RELEASE_ROOT": "/tmp/compose-test-sofascore-release",
+    "SOFASCORE_AIRFLOW_IMAGE": "data-platform-airflow-scheduler:compose-test",
+    "SOFASCORE_GATEWAY_IMAGE": "data-platform-airflow-scheduler:compose-test",
+    "SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE": "/tmp/compose-test-sofascore-fallback.txt",
+    "SOFASCORE_PROXY_POOL_FILE": "/tmp/compose-test-sofascore-proxys.txt",
+    "SOFASCORE_PROXY_POOL_JSON": "[]",
+    "SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR": "/tmp/compose-test-sofascore-legacy-venv",
+    "SOFASCORE_AIRFLOW_DB_PASSWORD": "ci-not-a-secret",
+    "SOFASCORE_POSTGRES_IMAGE": "postgres:16-alpine",
     # The isolated FotMob contour (deploy/fotmob/isolated.compose.yaml) takes
     # every host path, image and its metadata-DB password from the contour env
     # file; dummy values keep the render independent of a production host.
@@ -141,6 +156,42 @@ def _sofascore_gateway_config_json() -> dict:
     if proc.returncode != 0:
         pytest.fail(
             "SofaScore gateway compose config failed "
+            f"(rc={proc.returncode}):\nSTDOUT: {proc.stdout[:1000]}\n"
+            f"STDERR: {proc.stderr[:1000]}"
+        )
+    return json.loads(proc.stdout)
+
+
+def _sofascore_airflow_config_json() -> dict:
+    """Render the isolated SofaScore scheduler compose project."""
+    if not _docker_available():
+        pytest.skip("docker CLI not available on this host")
+
+    proc = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--project-name",
+            "sofascore-airflow-config-test",
+            "--file",
+            str(SOFASCORE_AIRFLOW_COMPOSE),
+            "--env-file",
+            str(PROJECT_ROOT / ".env.example"),
+            "--profile",
+            "*",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=str(PROJECT_ROOT),
+        env=COMPOSE_TEST_ENV,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            "SofaScore airflow compose config failed "
             f"(rc={proc.returncode}):\nSTDOUT: {proc.stdout[:1000]}\n"
             f"STDERR: {proc.stderr[:1000]}"
         )
@@ -237,15 +288,109 @@ class TestComposeFile:
         assert volumes[state_target].get("read_only", False) is False
         assert volumes[state_target]["bind"].get("create_host_path", False) is False
         assert "/opt/airflow/logs" not in volumes
+        # The whole frozen release tree is the code mount (#999/#1000, #1155):
+        # filter_proxy.py needs the WhoScored anchor from the tree, not from
+        # /opt/airflow of the pinned image.
+        assert volumes["/opt/sofascore-repo"]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_RELEASE_ROOT"]
+        )
+        assert volumes["/opt/sofascore-repo"]["read_only"] is True
+        assert service["environment"]["PYTHONPATH"] == "/opt/sofascore-repo"
+        assert service["command"][:2] == [
+            "python",
+            "/opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py",
+        ]
         assert service["healthcheck"]["test"][0:4] == [
             "CMD",
             "python",
-            "/opt/airflow/scripts/sofascore_runtime_preflight.py",
+            "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py",
             "gateway-health",
         ]
         assert service["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
             "0" * 64
         )
+        assert service["environment"]["PROXY_POOL_JSON"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_PROXY_POOL_JSON"]
+        )
+        assert set(service["networks"]) == {"sofascore-net"}
+        assert cfg["networks"]["sofascore-net"]["external"] is True
+        assert "build" not in service
+        for volume in volumes.values():
+            assert volume["source"].startswith("/tmp/compose-test-sofascore-"), volume
+
+    def test_sofascore_airflow_renders_from_one_release_root(self):
+        """Every code bind of the isolated scheduler comes from one frozen
+        release root; state, artifact and secrets from explicit durable paths
+        (#1155 stage 3).  The mini-DAGs are repository files, so no file bind
+        may shadow them."""
+        cfg = _sofascore_airflow_config_json()
+        assert set(cfg["services"]) == {
+            "airflow-metadb",
+            "airflow-init",
+            "airflow-scheduler",
+            "airflow-webserver",
+        }
+        scheduler = cfg["services"]["airflow-scheduler"]
+        release_root = COMPOSE_TEST_ENV["SOFASCORE_RELEASE_ROOT"]
+        binds = {
+            volume["target"]: volume
+            for volume in scheduler["volumes"]
+            if volume["type"] == "bind"
+        }
+        code_targets = {
+            "/opt/airflow/dags",
+            "/opt/airflow/dags/.airflowignore",
+            "/opt/airflow/logs",
+            "/opt/airflow/scrapers",
+            "/opt/airflow/scripts",
+            "/opt/airflow/configs/medallion",
+            "/opt/airflow/configs/soccerdata",
+            "/opt/airflow/configs/sofascore",
+            "/opt/airflow/configs/proxy_filter",
+            "/opt/airflow/docker",
+        }
+        for target in code_targets:
+            assert binds[target]["source"].startswith(release_root + "/"), target
+        assert binds["/opt/airflow/dags/.airflowignore"]["source"] == (
+            f"{release_root}/deploy/sofascore/.airflowignore"
+        )
+        assert not any(
+            target.endswith(
+                ("dag_trigger_sofascore_daily.py", "dag_sofascore_manifest_maintenance.py")
+            )
+            for target in binds
+        )
+        artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+        assert binds[artifact_target]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST"]
+        )
+        assert binds[artifact_target]["read_only"] is True
+        assert binds[artifact_target]["bind"].get("create_host_path", False) is False
+        campaign_target = "/opt/airflow/runtime/sofascore/all-men"
+        assert binds[campaign_target]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"]
+        )
+        assert binds[campaign_target]["bind"].get("create_host_path", False) is False
+        assert binds["/opt/airflow/proxys.txt"]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_PROXY_POOL_FILE"]
+        )
+        for volume in binds.values():
+            assert volume["source"].startswith("/tmp/compose-test-sofascore-"), volume
+            # A missing source must fail the start, never become an empty dir.
+            assert volume["bind"].get("create_host_path", False) is False, volume
+        env = scheduler["environment"]
+        assert env["SOFASCORE_PROXY_CONTROL_URL"] == "http://sofascore_proxy_filter:8899"
+        assert env["SOFASCORE_ALL_MENS_STATE"] == (
+            "/opt/airflow/runtime/sofascore/all-men/state.json"
+        )
+        assert env["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == "0" * 64
+        assert env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] == (
+            "postgresql+psycopg2://airflow:ci-not-a-secret@airflow-metadb:5432/airflow"
+        )
+        assert set(scheduler["networks"]) == {"sofascore-net", "dp-storage"}
+        assert "dp-backend" not in cfg["networks"]
+        assert int(scheduler["deploy"]["resources"]["limits"]["memory"]) == 10 << 30
+        assert cfg["volumes"]["ss_airflow_pgdata"]["name"] == "sofascore_airflow_pgdata"
 
     def test_sofascore_gateway_memory_limit_survives_wal_replay(self):
         """The gateway replays its allocation WAL (~135 MiB) into memory on

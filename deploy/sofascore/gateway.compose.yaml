@@ -7,46 +7,50 @@
 # в собственный проект делает его невосприимчивым к чужим `up`: его жизненный
 # цикл управляется ТОЛЬКО этим файлом.
 #
-# Запуск (из корня стабильного чекаута, поднимает только этот шлюз):
-#   docker compose -p sofascore-gw \
-#     -f deploy/sofascore/gateway.compose.yaml \
-#     --project-directory . \
-#     --env-file /root/data-platform-football/.env \
-#     up -d
+# Файл описывает шлюз ровно так, как он работает с 2026-07-27 (#999/#1000): раньше
+# это была цепочка «база + override.v3 + all-men override» с тегами !override, где
+# два файла из трёх жили вне git (#1155, этап 3). Ключевые решения цепочки:
+# 1) дерево релиза смонтировано ЦЕЛИКОМ в /opt/sofascore-repo (ro), PYTHONPATH туда же:
+#    filter_proxy.py при запуске из /opt/airflow требует вшитый в образ WhoScored-якорь
+#    (в пинованном образе его нет); при другом корне якорь сам грузится из дерева.
+#    WhoScored-аттестация не входит в sofascore-контракт — боевой подписант здесь
+#    verified-артефакт SofaScore.
+# 2) сеть — только sofascore-net (своя, внешняя); scheduler проекта sofascore-airflow
+#    ходит по алиасу сервиса `sofascore_proxy_filter:8899`. dp-backend не подключаем.
+# 3) образ пинованный, без build: шлюз никогда не собирается на месте.
+# Каждый путь хоста — переменная без дефолта (см. sofascore.env.example).
 #
-# Прод-деплой: SOFASCORE_GATEWAY_IMAGE=<пинованный образ с /opt/airflow/runtime-contract>,
-# SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST=<immutable verified artifact на хосте>,
-# SOFASCORE_GATEWAY_STATE_HOST_DIR=<предварительно созданный durable state-каталог>.
-# Сеть dp-backend — ВНЕШНЯЯ (создаётся основным проектом); scheduler достаёт шлюз
-# по алиасу `sofascore_proxy_filter:8899` через неё. Routing у scheduler —
-# SOFASCORE_PROXY_CONTROL_URL в общем .env (переживает пересоздания).
+# Запуск — только через deploy/sofascore/deploy.sh. Вручную (после `set -a; . sofascore.env`):
+#   docker compose -p sofascore-gw -f deploy/sofascore/gateway.compose.yaml \
+#     --project-directory "$SOFASCORE_RELEASE_ROOT" \
+#     --env-file <общий .env> --env-file <sofascore.env> \
+#     up -d --no-deps --force-recreate sofascore_proxy_filter
+name: sofascore-gw
 
 services:
   sofascore_proxy_filter:
-    image: ${SOFASCORE_GATEWAY_IMAGE:-data-platform-airflow-scheduler:latest}
-    build:
-      context: ./docker/images/airflow
-      dockerfile: Dockerfile
-    container_name: sofascore_proxy_filter
+    image: ${SOFASCORE_GATEWAY_IMAGE:?set the pinned SofaScore gateway image}
+    container_name: sofascore_gw_951
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     environment:
-      PYTHONPATH: /opt/airflow
+      PYTHONPATH: /opt/sofascore-repo
       PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
       # Один и тот же неизменяемый container contract используют gateway и
       # scheduler; host location задаётся отдельно bind-переменной ниже.
       SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
       SOFASCORE_PROXY_BUDGET_ARTIFACT_ID: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified SofaScore artifact SHA-256}
-      # Купленный под SofaScore пул подставляется сюда; пусто => fail-closed на
-      # платный путь, разрешён только --proxy-file fallback ниже.
-      PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:-}
+      # Купленный под SofaScore пул. Своё имя переменной, а не общий PROXY_POOL_JSON
+      # из платформенного .env: иначе шлюз молча уедет на чужой пул. Без значения —
+      # fail-closed на платный путь.
+      PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:?set the SofaScore paid proxy pool JSON}
       PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
     command:
       - python
-      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - /opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py
       - --listen
       - 0.0.0.0:8899
       - --lease-listen
@@ -57,7 +61,7 @@ services:
       - /opt/airflow/proxys.txt
       - --allow-proxy-file-fallback
       - --blocklist
-      - /opt/airflow/configs/proxy_filter/blocklist.txt
+      - /opt/sofascore-repo/configs/proxy_filter/blocklist.txt
       - --out
       - /opt/airflow/logs/sofascore_proxy_filter/bytes.json
       - --daily-budget-mb
@@ -89,15 +93,21 @@ services:
       - --sofascore-parent-envelope
       - /opt/airflow/logs/sofascore_proxy_filter/sofascore_parent_envelopes.json
     volumes:
-      # Runtime-fingerprint входы: контрольная плоскость независимо
-      # пересчитывает тот же digest, что и продюсер в Airflow.
-      - ./dags:/opt/airflow/dags:ro
-      - ./scripts:/opt/airflow/scripts
-      - ./scrapers:/opt/airflow/scrapers
-      - ./configs/medallion:/opt/airflow/configs/medallion:ro
-      - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
-      - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
-      - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      # Дерево релиза целиком (см. решение 1 в шапке). Runtime-fingerprint входы —
+      # внутри него: контрольная плоскость пересчитывает тот же digest, что и Airflow.
+      - type: bind
+        source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}
+        target: /opt/sofascore-repo
+        read_only: true
+        bind:
+          create_host_path: false
+      # Файл-fallback прокси шлюза (секрет, вне git и вне дерева релиза).
+      - type: bind
+        source: ${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?set the gateway proxy fallback file}
+        target: /opt/airflow/proxys.txt
+        read_only: true
+        bind:
+          create_host_path: false
       # Artifact and mutable accounting state are deployment-owned and live
       # outside the release checkout.  Long bind syntax prevents Docker from
       # silently replacing a missing source with an empty file/directory.
@@ -116,7 +126,7 @@ services:
       test:
         - CMD
         - python
-        - /opt/airflow/scripts/sofascore_runtime_preflight.py
+        - /opt/sofascore-repo/scripts/sofascore_runtime_preflight.py
         - gateway-health
         - --artifact
         - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
@@ -140,11 +150,10 @@ services:
         reservations:
           memory: 256M
     networks:
-      - dp-backend
+      - sofascore-net
 
 networks:
-  # Общая backend-сеть основного проекта (создаётся им). Здесь — ВНЕШНЯЯ, чтобы
-  # шлюз жил в своём проекте, но был в одной сети со scheduler.
-  dp-backend:
+  # Своя сеть контура; создаётся один раз руками: `docker network create sofascore-net`.
+  sofascore-net:
     external: true
-    name: dp-backend
+    name: sofascore-net

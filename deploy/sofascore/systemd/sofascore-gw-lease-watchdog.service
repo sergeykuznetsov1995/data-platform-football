@@ -12,13 +12,20 @@ UMask=0077
 # Install with:
 #   install -m 0755 deploy/sofascore/gateway_lease_watchdog.py \
 #       /usr/local/libexec/sofascore-gw-lease-watchdog
+#   install -m 0644 deploy/sofascore/systemd/sofascore-gw-lease-watchdog.service \
+#       /etc/systemd/system/ && systemctl daemon-reload
 # The unit deliberately does not run the file straight out of a git checkout:
 # a mid-flight pull would swap the code of a process that restarts containers.
+#
+# The expected release mount, the state directory and the alert command come
+# from the contour env file (deploy/sofascore/sofascore.env.example), the same
+# file deploy.sh repins on every rotation — no drop-in edits, just a restart.
+EnvironmentFile=/etc/data-platform/sofascore.env
 ExecStart=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog \
     --container sofascore_gw_951 \
-    --state-dir /root/sofascore-runtime/gateway-state \
-    --expected-mount /root/dpf-release-aa2ce3ab \
-    --alert-command /root/.claude/hooks/tg-send.sh
+    --state-dir ${SOFASCORE_GATEWAY_STATE_HOST_DIR} \
+    --expected-mount ${SOFASCORE_RELEASE_ROOT} \
+    --alert-command ${SOFASCORE_WATCHDOG_ALERT_COMMAND}
 Restart=always
 RestartSec=30
 # It reads gateway state and shells out to docker; nothing here should ever
