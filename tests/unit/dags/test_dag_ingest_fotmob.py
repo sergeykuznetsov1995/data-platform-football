@@ -617,33 +617,86 @@ class TestNativeValidation:
             mod.validate_data(str(report))
 
     @pytest.mark.unit
-    def test_writer_lock_busy_report_stays_red(self, tmp_path):
-        """Барьер (б): отчёт-отказ замка писателя красит ран, как и раньше.
+    def test_writer_lock_busy_report_stays_red(self, monkeypatch, tmp_path):
+        """Барьер (б): отказ замка писателя красит ран НАСТОЯЩИМ отчётом.
 
         Замок писателя сузился до времени записи и научился ждать, но
         исчерпанное ожидание по-прежнему обязано быть красным раном: тихо
         пропущенная запись выглядела бы зелёным пустым раном (#1227).
+
+        Отчёт не собирается руками (урок 30: барьер проверяется настоящим
+        отчётом): ран идёт через настоящий ``main()``, у сервиса исчерпан
+        guard записи, раннер сам складывает отчёт и пишет его в файл — этот
+        файл и скармливается настоящему ``validate_data``.
         """
 
+        import importlib
         import json
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         from airflow.exceptions import AirflowException
 
+        from scrapers.fotmob.planner import RunMode
+        from scrapers.fotmob.service import OperationResult
+        from tests.unit.scrapers.test_fotmob_service import _service
+
         mod = _reload_dag_module()
-        payload = {
-            "run_id": "busy-run",
-            "mode": "daily",
-            "status": "incomplete",
-            "complete": False,
-            "tables": [],
-            "rows": {},
-            "errors": [
-                "WriterLockBusy: another FotMob writer holds the bronze writer "
-                "lock (key 1) after waiting 600s; refusing to write in parallel"
-            ],
-        }
+        sys.modules.pop("dags.scripts.run_fotmob_scraper", None)
+        runner = importlib.import_module("dags.scripts.run_fotmob_scraper")
+
+        service, _transport, repository = _service({}, mode=RunMode.DAILY)
+        busy = runner.WriterLockBusy(
+            "another FotMob writer holds the bronze writer lock (key 1) after "
+            "waiting 600s; refusing to write in parallel"
+        )
+
+        def refuse_write():
+            raise busy
+
+        # Ожидание замка исчерпано: guard потерян, и каждая физическая запись
+        # этого процесса поднимает отказ немедленно.
+        repository.flush = refuse_write
+        repository.ensure_current_views = refuse_write
+        service.discover_catalog = MagicMock(
+            return_value=SimpleNamespace(
+                operation=OperationResult("competition_catalog", attempted=1),
+                discovery=None,
+            )
+        )
+        monkeypatch.setattr(
+            runner,
+            "_build_native_service",
+            lambda args, run_id: (service, None),
+        )
         report = tmp_path / "busy.json"
-        report.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_fotmob_scraper.py",
+                "--mode",
+                "discover",
+                "--output",
+                str(report),
+            ],
+        )
+
+        assert runner.main() == 1
+
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        # Драйвер кампании ищет класс отказа в ВЕРХНЕУРОВНЕВОМ .errors, и он
+        # обязан приехать туда из настоящего flush(), а не из общей неудачи рана.
+        assert any(
+            "commit flush: WriterLockBusy" in str(error)
+            for error in payload["errors"]
+        ), payload["errors"]
+        assert any(
+            "current view refresh: WriterLockBusy" in str(error)
+            for error in payload["errors"]
+        ), payload["errors"]
+        assert payload["complete"] is False
 
         with pytest.raises(AirflowException):
             mod.validate_data(str(report))
