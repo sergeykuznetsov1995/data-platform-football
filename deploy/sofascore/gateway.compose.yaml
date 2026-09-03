@@ -1,4 +1,4 @@
-# SofaScore выделенный платный шлюз — ОТДЕЛЬНЫЙ compose-проект (#951).
+# SofaScore выделенные платные шлюзы — ОТДЕЛЬНЫЙ compose-проект (#951, полосы #1244).
 #
 # Почему отдельный файл/проект, а не сервис в общем compose.yaml:
 # все источники (fbref/whoscored/sofascore/…) делят ОДИН compose-проект
@@ -16,38 +16,87 @@
 #    WhoScored-аттестация не входит в sofascore-контракт — боевой подписант здесь
 #    verified-артефакт SofaScore.
 # 2) сеть — только sofascore-net (своя, внешняя); scheduler проекта sofascore-airflow
-#    ходит по алиасу сервиса `sofascore_proxy_filter:8899`. dp-backend не подключаем.
+#    ходит по алиасам сервисов `sofascore_proxy_filter:8899`, `sofascore_gw_history:8899`,
+#    `sofascore_gw_players:8899`. dp-backend не подключаем.
 # 3) образ пинованный, без build: шлюз никогда не собирается на месте.
 # Каждый путь хоста — переменная без дефолта (см. sofascore.env.example).
+#
+# ТРИ ШЛЮЗА, ТРИ ПОЛОСЫ (#1244). До 03.09.2026 история, актуалка и дейли делили один
+# слот аренды одного шлюза (`--max-active-leases 1`) → `HTTP 429: paid-proxy concurrency
+# limit reached` на ≥85 % запусков истории. Полосы разведены по своим шлюзам:
+#   sofascore_proxy_filter (sofascore_gw_951) — актуалка + дейли, 600 МБ/сутки;
+#   sofascore_gw_history                      — кампания истории,  2000 МБ/сутки;
+#   sofascore_gw_players                      — полоса профилей,    400 МБ/сутки.
+# Сумма дневных потолков = 3 ГБ (решение владельца 03.09). Потолки и число активных
+# аренд — переменными окружения: расширение полосы не должно править compose.
+# У КАЖДОГО шлюза свой каталог состояния: WAL/ledger рассчитаны на единственного
+# писателя, общий каталог на три процесса портит учёт байтов.
 #
 # Запуск — только через deploy/sofascore/deploy.sh. Вручную (после `set -a; . sofascore.env`):
 #   docker compose -p sofascore-gw -f deploy/sofascore/gateway.compose.yaml \
 #     --project-directory "$SOFASCORE_RELEASE_ROOT" \
 #     --env-file <общий .env> --env-file <sofascore.env> \
-#     up -d --no-deps --force-recreate sofascore_proxy_filter
+#     up -d --no-deps --force-recreate \
+#     sofascore_proxy_filter sofascore_gw_history sofascore_gw_players
 name: sofascore-gw
 
+# Общая часть трёх шлюзов. Только mapping-поля: `command` и `volumes` — списки, YAML
+# их не сливает, поэтому они выписаны у каждого сервиса явно.
+x-sofascore-gw-common: &sofascore-gw-common
+  image: ${SOFASCORE_GATEWAY_IMAGE:?set the pinned SofaScore gateway image}
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  environment:
+    PYTHONPATH: /opt/sofascore-repo
+    PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    # Один и тот же неизменяемый container contract используют gateway и
+    # scheduler; host location задаётся отдельно bind-переменной ниже.
+    SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+    SOFASCORE_PROXY_BUDGET_ARTIFACT_ID: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified SofaScore artifact SHA-256}
+    # Купленный под SofaScore пул. Своё имя переменной, а не общий PROXY_POOL_JSON
+    # из платформенного .env: иначе шлюз молча уедет на чужой пул. Без значения —
+    # fail-closed на платный путь. Один пул на три шлюза — делить его не нужно,
+    # раздельны только слоты аренды и дневные потолки.
+    PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:?set the SofaScore paid proxy pool JSON}
+    PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - /opt/sofascore-repo/scripts/sofascore_runtime_preflight.py
+      - gateway-health
+      - --artifact
+      - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+      - --state-dir
+      - /opt/airflow/logs/sofascore_proxy_filter
+      - --health-url
+      - http://localhost:8899/health
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 5s
+  deploy:
+    resources:
+      # Startup replays the allocation WAL (~135 MB by 2026-08-23) into
+      # memory at <2x its size; 256M OOM-crashlooped recovery on 2026-07-24
+      # and the `docker update --memory 1g` workaround was silently dropped
+      # by the 2026-08-23 recreate.  The limit must live here, not in
+      # `docker update`.
+      limits:
+        memory: 1G
+      reservations:
+        memory: 256M
+  networks:
+    - sofascore-net
+
 services:
+  # Полоса актуалки и дейли (пул Airflow ingest_scraper_pool).
   sofascore_proxy_filter:
-    image: ${SOFASCORE_GATEWAY_IMAGE:?set the pinned SofaScore gateway image}
+    <<: *sofascore-gw-common
     container_name: sofascore_gw_951
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    environment:
-      PYTHONPATH: /opt/sofascore-repo
-      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
-      # Один и тот же неизменяемый container contract используют gateway и
-      # scheduler; host location задаётся отдельно bind-переменной ниже.
-      SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
-      SOFASCORE_PROXY_BUDGET_ARTIFACT_ID: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified SofaScore artifact SHA-256}
-      # Купленный под SofaScore пул. Своё имя переменной, а не общий PROXY_POOL_JSON
-      # из платформенного .env: иначе шлюз молча уедет на чужой пул. Без значения —
-      # fail-closed на платный путь.
-      PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:?set the SofaScore paid proxy pool JSON}
-      PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
     command:
       - python
       - /opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py
@@ -65,7 +114,7 @@ services:
       - --out
       - /opt/airflow/logs/sofascore_proxy_filter/bytes.json
       - --daily-budget-mb
-      - ${SOFASCORE_PROXY_DAILY_BUDGET_MB:-300}
+      - ${SOFASCORE_PROXY_DAILY_BUDGET_MB:-600}
       - --max-lease-mb
       - ${SOFASCORE_PROXY_MAX_LEASE_MB:-46}
       - --max-lease-ttl-seconds
@@ -74,9 +123,10 @@ services:
       - ${SOFASCORE_PROXY_DAGRUN_BUDGET_BYTES:-8000000}
       - --url-budget-bytes
       - ${SOFASCORE_PROXY_URL_BUDGET_BYTES:-2000000}
-      # SofaScore = один активный лиз за раз (сериализация источника).
+      # Сериализация внутри полосы: сколько задач Airflow одновременно держат аренду.
+      # Переменной, а не литералом: расширение полосы (#1248) правит env, не рецепт.
       - --max-active-leases
-      - "1"
+      - ${SOFASCORE_PROXY_MAX_ACTIVE_LEASES:-1}
       - --sofascore-budget-artifact
       - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
       # 0 = боевой подписант (не эксперимент-канарейка).
@@ -122,35 +172,149 @@ services:
         target: /opt/airflow/logs/sofascore_proxy_filter
         bind:
           create_host_path: false
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - /opt/sofascore-repo/scripts/sofascore_runtime_preflight.py
-        - gateway-health
-        - --artifact
-        - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
-        - --state-dir
-        - /opt/airflow/logs/sofascore_proxy_filter
-        - --health-url
-        - http://localhost:8899/health
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 5s
-    deploy:
-      resources:
-        # Startup replays the allocation WAL (~135 MB by 2026-08-23) into
-        # memory at <2x its size; 256M OOM-crashlooped recovery on 2026-07-24
-        # and the `docker update --memory 1g` workaround was silently dropped
-        # by the 2026-08-23 recreate.  The limit must live here, not in
-        # `docker update`.
-        limits:
-          memory: 1G
-        reservations:
-          memory: 256M
-    networks:
-      - sofascore-net
+
+  # Полоса кампании истории (пул Airflow sofascore_history_pool).
+  sofascore_gw_history:
+    <<: *sofascore-gw-common
+    container_name: sofascore_gw_history
+    command:
+      - python
+      - /opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://sofascore_gw_history:8900
+      - --proxy-file
+      - /opt/airflow/proxys.txt
+      - --allow-proxy-file-fallback
+      - --blocklist
+      - /opt/sofascore-repo/configs/proxy_filter/blocklist.txt
+      - --out
+      - /opt/airflow/logs/sofascore_proxy_filter/bytes.json
+      - --daily-budget-mb
+      - ${SOFASCORE_HISTORY_GW_DAILY_BUDGET_MB:-2000}
+      - --max-lease-mb
+      - ${SOFASCORE_PROXY_MAX_LEASE_MB:-46}
+      - --max-lease-ttl-seconds
+      - ${SOFASCORE_PROXY_MAX_LEASE_TTL_SECONDS:-3600}
+      - --dagrun-budget-bytes
+      - ${SOFASCORE_PROXY_DAGRUN_BUDGET_BYTES:-8000000}
+      - --url-budget-bytes
+      - ${SOFASCORE_PROXY_URL_BUDGET_BYTES:-2000000}
+      - --max-active-leases
+      - ${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-1}
+      - --sofascore-budget-artifact
+      - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+      - --sofascore-canary-hard-cap-bytes
+      - "0"
+      - --sofascore-discovery-dagrun-budget-bytes
+      - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
+      - --ledger
+      - /opt/airflow/logs/sofascore_proxy_filter/paid_requests.jsonl
+      - --sofascore-allocation-ledger
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocations.json
+      - --sofascore-allocation-wal
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl
+      - --sofascore-parent-envelope
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_parent_envelopes.json
+    volumes:
+      - type: bind
+        source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}
+        target: /opt/sofascore-repo
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?set the gateway proxy fallback file}
+        target: /opt/airflow/proxys.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?set the immutable verified SofaScore budget artifact host file}
+        target: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+        read_only: true
+        bind:
+          create_host_path: false
+      # Своё состояние: WAL/ledger рассчитаны на единственного писателя.
+      - type: bind
+        source: ${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?set the durable SofaScore history gateway state host directory}
+        target: /opt/airflow/logs/sofascore_proxy_filter
+        bind:
+          create_host_path: false
+
+  # Полоса профилей игроков (пул Airflow sofascore_players_pool, DAG приходит в #1244 PR-2).
+  sofascore_gw_players:
+    <<: *sofascore-gw-common
+    container_name: sofascore_gw_players
+    command:
+      - python
+      - /opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://sofascore_gw_players:8900
+      - --proxy-file
+      - /opt/airflow/proxys.txt
+      - --allow-proxy-file-fallback
+      - --blocklist
+      - /opt/sofascore-repo/configs/proxy_filter/blocklist.txt
+      - --out
+      - /opt/airflow/logs/sofascore_proxy_filter/bytes.json
+      - --daily-budget-mb
+      - ${SOFASCORE_PLAYERS_GW_DAILY_BUDGET_MB:-400}
+      - --max-lease-mb
+      - ${SOFASCORE_PROXY_MAX_LEASE_MB:-46}
+      - --max-lease-ttl-seconds
+      - ${SOFASCORE_PROXY_MAX_LEASE_TTL_SECONDS:-3600}
+      - --dagrun-budget-bytes
+      - ${SOFASCORE_PROXY_DAGRUN_BUDGET_BYTES:-8000000}
+      - --url-budget-bytes
+      - ${SOFASCORE_PROXY_URL_BUDGET_BYTES:-2000000}
+      - --max-active-leases
+      - ${SOFASCORE_PLAYERS_GW_MAX_ACTIVE_LEASES:-1}
+      - --sofascore-budget-artifact
+      - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+      - --sofascore-canary-hard-cap-bytes
+      - "0"
+      - --sofascore-discovery-dagrun-budget-bytes
+      - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
+      - --ledger
+      - /opt/airflow/logs/sofascore_proxy_filter/paid_requests.jsonl
+      - --sofascore-allocation-ledger
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocations.json
+      - --sofascore-allocation-wal
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl
+      - --sofascore-parent-envelope
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_parent_envelopes.json
+    volumes:
+      - type: bind
+        source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}
+        target: /opt/sofascore-repo
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?set the gateway proxy fallback file}
+        target: /opt/airflow/proxys.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?set the immutable verified SofaScore budget artifact host file}
+        target: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?set the durable SofaScore players gateway state host directory}
+        target: /opt/airflow/logs/sofascore_proxy_filter
+        bind:
+          create_host_path: false
 
 networks:
   # Своя сеть контура; создаётся один раз руками: `docker network create sofascore-net`.

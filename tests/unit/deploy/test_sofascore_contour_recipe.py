@@ -33,6 +33,30 @@ SCRIPTS = (
 )
 MINI_DAGS = ("dag_trigger_sofascore_daily.py", "dag_sofascore_manifest_maintenance.py")
 
+# Три полосы источника (#1244): свой шлюз, свой дневной потолок, свой слот аренды,
+# свой каталог состояния. До развода все три ходили через sofascore_gw_951 и давали
+# `HTTP 429: paid-proxy concurrency limit reached` на ≥85 % запусков истории.
+GATEWAY_LANES = {
+    "sofascore_proxy_filter": {
+        "container": "sofascore_gw_951",
+        "budget": "${SOFASCORE_PROXY_DAILY_BUDGET_MB:-600}",
+        "leases": "${SOFASCORE_PROXY_MAX_ACTIVE_LEASES:-1}",
+        "state": "${SOFASCORE_GATEWAY_STATE_HOST_DIR:?",
+    },
+    "sofascore_gw_history": {
+        "container": "sofascore_gw_history",
+        "budget": "${SOFASCORE_HISTORY_GW_DAILY_BUDGET_MB:-2000}",
+        "leases": "${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-1}",
+        "state": "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?",
+    },
+    "sofascore_gw_players": {
+        "container": "sofascore_gw_players",
+        "budget": "${SOFASCORE_PLAYERS_GW_DAILY_BUDGET_MB:-400}",
+        "leases": "${SOFASCORE_PLAYERS_GW_MAX_ACTIVE_LEASES:-1}",
+        "state": "${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?",
+    },
+}
+
 # Host-side paths that must never be baked into the recipe; /home/airflow is the
 # container home and is allowed.
 HOST_PATH_LITERAL = re.compile(r"(?<![\w$])/(root/|tmp/|home/(?!airflow/))")
@@ -161,30 +185,48 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
 @pytest.mark.unit
 def test_gateway_compose_pins_the_live_gateway_shape() -> None:
     cfg = _load(GATEWAY_COMPOSE)
-    assert set(cfg["services"]) == {"sofascore_proxy_filter"}
-    gateway = cfg["services"]["sofascore_proxy_filter"]
-    assert gateway["container_name"] == "sofascore_gw_951"
-    assert gateway["environment"]["PYTHONPATH"] == "/opt/sofascore-repo"
-    assert gateway["environment"]["PROXY_POOL_JSON"].startswith("${SOFASCORE_PROXY_POOL_JSON:?")
-    binds = {v["target"]: v for v in gateway["volumes"]}
-    assert set(binds) == {
-        "/opt/sofascore-repo",
-        "/opt/airflow/proxys.txt",
-        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
-        "/opt/airflow/logs/sofascore_proxy_filter",
-    }
-    for target, bind in binds.items():
-        assert bind["bind"]["create_host_path"] is False, target
-        assert bind.get("read_only", False) is (target != "/opt/airflow/logs/sofascore_proxy_filter"), target
-    assert gateway["command"][:2] == ["python", "/opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py"]
-    assert "--max-active-leases" in gateway["command"]
-    assert gateway["command"][gateway["command"].index("--max-active-leases") + 1] == "1"
-    assert gateway["healthcheck"]["test"][:4] == [
-        "CMD", "python", "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py", "gateway-health",
-    ]
-    assert gateway["networks"] == ["sofascore-net"]
+    assert set(cfg["services"]) == set(GATEWAY_LANES)
+    state_sources, artifact_sources, tokens = [], set(), set()
+    for service, lane in GATEWAY_LANES.items():
+        gateway = cfg["services"][service]
+        assert gateway["container_name"] == lane["container"], service
+        assert gateway["environment"]["PYTHONPATH"] == "/opt/sofascore-repo", service
+        assert gateway["environment"]["PROXY_POOL_JSON"].startswith("${SOFASCORE_PROXY_POOL_JSON:?"), service
+        binds = {v["target"]: v for v in gateway["volumes"]}
+        assert set(binds) == {
+            "/opt/sofascore-repo",
+            "/opt/airflow/proxys.txt",
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+            "/opt/airflow/logs/sofascore_proxy_filter",
+        }, service
+        for target, bind in binds.items():
+            assert bind["bind"]["create_host_path"] is False, (service, target)
+            assert bind.get("read_only", False) is (target != "/opt/airflow/logs/sofascore_proxy_filter"), (
+                service, target
+            )
+        command = gateway["command"]
+        assert command[:2] == ["python", "/opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py"], service
+        # Каждый шлюз арендует прокси у СЕБЯ: общий lease-url свёл бы три полосы
+        # обратно в один слот аренды — ровно тот дефект, который чинит #1244.
+        assert command[command.index("--lease-proxy-url") + 1] == f"http://{service}:8900", service
+        assert command[command.index("--daily-budget-mb") + 1] == lane["budget"], service
+        assert command[command.index("--max-active-leases") + 1] == lane["leases"], service
+        assert gateway["healthcheck"]["test"][:4] == [
+            "CMD", "python", "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py", "gateway-health",
+        ], service
+        assert gateway["networks"] == ["sofascore-net"], service
+        assert gateway["deploy"]["resources"]["limits"]["memory"] == "1G", service
+        state = binds["/opt/airflow/logs/sofascore_proxy_filter"]["source"]
+        assert state.startswith(lane["state"]), service
+        state_sources.append(state)
+        artifact_sources.add(binds["/opt/airflow/runtime/sofascore/proxy_budget_canary.json"]["source"])
+        tokens.add(gateway["environment"]["PROXY_FILTER_CONTROL_TOKEN"])
+    # WAL/ledger рассчитаны на единственного писателя: общий каталог на три процесса
+    # портит учёт байтов и восстановление аренд.
+    assert len(set(state_sources)) == 3, state_sources
+    # Артефакт и токен — общие: тот же digest, та же контрольная плоскость.
+    assert len(artifact_sources) == 1 and len(tokens) == 1
     assert set(cfg["networks"]) == {"sofascore-net"}
-    assert gateway["deploy"]["resources"]["limits"]["memory"] == "1G"
 
 
 @pytest.mark.unit
