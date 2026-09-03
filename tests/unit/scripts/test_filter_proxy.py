@@ -70,6 +70,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "fbref_proxy" / "filter_proxy.py"
 _SHARED_SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
 _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
+# #1245: the paid canary artifact is gone; the budget classes ship in git.
+SHIPPED_WORKLOAD_POLICY = REPO_ROOT / "configs" / "sofascore" / "workload_policy.json"
 _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 # #951 (инцидент 2026-07-17): выделенный SofaScore-шлюз вынесен в СВОЙ
 # compose-проект, чтобы чужой `docker compose up` его не пересоздавал.
@@ -106,9 +108,7 @@ def _load_shared_module():
     return loaded
 
 
-@pytest.fixture()
-def mod(tmp_path):
-    loaded = _load_module()
+def _prepared_module(loaded, tmp_path):
     loaded.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
     loaded.CONTROL_TOKEN = "c" * 32
     loaded.TRANSFERMARKT_CONTROL_TOKEN = "t" * 32
@@ -140,6 +140,22 @@ def mod(tmp_path):
     loaded.WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE = True
     loaded.WHOSCORED_FULL_PAID_CRAWL_AVAILABLE = True
     return loaded
+
+
+@pytest.fixture()
+def mod(tmp_path):
+    return _prepared_module(_load_module(), tmp_path)
+
+
+@pytest.fixture()
+def shared_mod(tmp_path):
+    """#1245: the SofaScore paid path now lives only in the shared runtime.
+
+    ``mod`` is the frozen FBref copy; the static workload policy, the retired
+    canary and the players lane are contracts of ``scripts/proxy_filter``.
+    """
+
+    return _prepared_module(_load_shared_module(), tmp_path)
 
 
 # --- _is_blocked --------------------------------------------------------------
@@ -1829,7 +1845,7 @@ def test_proxy_filter_compose_is_env_only_by_default():
     assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"' in service
     assert "proxys.txt:/opt/airflow/proxys.txt" not in service
     # The lease concurrency limit is operator-tunable; the serial guarantees
-    # that matter are per source (SofaScore production/canary), not global.
+    # that matter are per source (SofaScore production), not global.
     assert "${PROXY_FILTER_MAX_ACTIVE_LEASES:-4}" in service
 
 
@@ -1862,8 +1878,6 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
         # Каждая полоса арендует прокси у СВОЕГО шлюза: общий lease-url свёл бы
         # три полосы обратно в один слот аренды — дефект, который чинит #1244.
         assert command[command.index("--lease-proxy-url") + 1] == f"http://{name}:8900", name
-        # hard-cap 0 => production signer (a >0 cap is the never-authorized canary).
-        assert command[command.index("--sofascore-canary-hard-cap-bytes") + 1] == "0", name
         # One active SofaScore lease at a time by default; the ceiling is an
         # operator knob (#1248 widens a lane without touching the recipe).
         assert command[command.index("--max-active-leases") + 1].endswith(":-1}"), name
@@ -2439,9 +2453,8 @@ def test_sofascore_policy_pin_rejection_stops_main_before_pool_or_listener(
 def _initialize_real_metered_guard(mod, monkeypatch, tmp_path):
     """Run only filter_proxy's budget initialization and return its real guard."""
     from scripts.proxy_filter.budget import SharedBudgetLedger
-    from tests.unit.scripts.test_sofascore_proxy_budget import _artifact
 
-    artifact = _artifact(tmp_path / "canary.json")
+    artifact = SHIPPED_WORKLOAD_POLICY
     policy = mod.load_verified_policy(artifact, workload_class=MATCH_WORKLOAD_CLASS)
     ledger_path = tmp_path / "ledger.json"
     ledger = SharedBudgetLedger(ledger_path, policy)
@@ -3927,11 +3940,8 @@ def test_all_mens_backfill_dag_uses_the_signed_sofascore_lane():
     assert mod._dagrun_budget_bytes("dag_backfill_sofascore_all_mens") == 1234
 
 
-def test_explicit_canary_bootstraps_artifact_but_never_authorizes_production(
-    mod,
-    tmp_path,
-):
-    from tests.unit.scripts.test_sofascore_proxy_budget import _artifact
+def test_static_policy_authorizes_production_and_its_absence_fails_closed(shared_mod):
+    """#1245: the paid canary is gone; the shipped policy is the signer."""
 
     mgr = _FakeManager(
         [
@@ -3939,26 +3949,11 @@ def test_explicit_canary_bootstraps_artifact_but_never_authorizes_production(
             "http://u:p@pool.invalid:10001",
         ]
     )
-    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 0
-    mod.SOFASCORE_BUDGET_ARTIFACT_ID = ""
-    mod.SOFASCORE_CANARY_HARD_CAP_BYTES = 4096
-    mod.SOFASCORE_CANARY_POLICY_ID = mod._canary_policy_id(4096)
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 0
+    shared_mod.SOFASCORE_BUDGET_ARTIFACT_ID = ""
 
-    canary = mod._create_lease(
-        mgr,
-        max_bytes=4096,
-        ttl_seconds=30,
-        metadata=_sofascore_canary_context(),
-        require_context=True,
-    )
-    assert canary.source == "sofascore_canary"
-    assert canary.report()["budget_artifact_id"] == mod.SOFASCORE_CANARY_POLICY_ID
-    assert len(mod.SOFASCORE_CANARY_POLICY_ID) == 64
-    assert mod.SOFASCORE_CANARY_POLICY_ID in Path(mod.LEDGER_PATH).read_text()
-    canary.closed = True
-
-    with pytest.raises(RuntimeError, match="verified canary required"):
-        mod._create_lease(
+    with pytest.raises(RuntimeError, match="static workload policy required"):
+        shared_mod._create_lease(
             mgr,
             max_bytes=4096,
             ttl_seconds=30,
@@ -3966,15 +3961,12 @@ def test_explicit_canary_bootstraps_artifact_but_never_authorizes_production(
             require_context=True,
         )
 
-    # Twenty complete cold observations produce the independent reviewed
-    # artifact which, and only which, unlocks the production DAG.
-    artifact_path = _artifact(tmp_path / "canary.json", runs=20)
-    policy = mod.load_verified_workload_policy(artifact_path)
+    policy = shared_mod.load_static_workload_policy(SHIPPED_WORKLOAD_POLICY)
     match_policy = policy.classes[MATCH_WORKLOAD_CLASS]
-    assert match_policy.sample_count == 20
-    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = match_policy.hard_task_bytes
-    mod.SOFASCORE_BUDGET_ARTIFACT_ID = policy.artifact_id
-    production = mod._create_lease(
+    assert match_policy.sample_count == 0
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = match_policy.hard_task_bytes
+    shared_mod.SOFASCORE_BUDGET_ARTIFACT_ID = policy.artifact_id
+    production = shared_mod._create_lease(
         mgr,
         max_bytes=match_policy.hard_task_bytes,
         ttl_seconds=30,
@@ -3986,7 +3978,29 @@ def test_explicit_canary_bootstraps_artifact_but_never_authorizes_production(
     )
     assert production.source == "sofascore"
     assert production.report()["budget_artifact_id"] == policy.artifact_id
-    assert policy.artifact_id != mod.SOFASCORE_CANARY_POLICY_ID
+
+
+def test_players_lane_dag_is_inside_the_paid_sofascore_allowlist(shared_mod):
+    """#1245 unblocks #1244: the players lane must be able to take a lease."""
+
+    assert shared_mod._source_for_dag("dag_players_sofascore_all_mens") == "sofascore"
+    assert shared_mod._source_for_dag("dag_players_sofascore_unknown") == ""
+
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 4096
+    with pytest.raises(ValueError, match="closed source allowlist"):
+        shared_mod._create_lease(
+            mgr,
+            max_bytes=4096,
+            ttl_seconds=30,
+            metadata={
+                "dag_id": "dag_players_sofascore_unknown",
+                "run_id": "run",
+                "task_id": "task",
+                "canonical_url": "https://www.sofascore.com/",
+            },
+            require_context=True,
+        )
 
 
 def test_sofascore_lease_pins_upstream_and_uses_basic_token_auth(mod, caplog):

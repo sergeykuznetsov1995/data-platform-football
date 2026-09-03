@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parents[3]
 SHARED_FILTER = ROOT / "scripts/proxy_filter/filter_proxy.py"
 FBREF_FILTER = ROOT / "scripts/fbref_proxy/filter_proxy.py"
 SHARED_FILTER_SHA256 = (
-    # Bumped for the discovery-lease budget fix in
-    # ``_lease_dagrun_budget_bytes`` (code review of PR #1216).  FBref keeps its
-    # own filter and stays out of ``runtime_files`` — both asserted below.
-    "cfbf98698c8d5e5540289c2f7894382c9a5fe4603ecdd175b1951b6271bd9cdd"
+    # Bumped for the static workload policy that replaced the paid canary
+    # (#1245).  FBref keeps its own filter and stays out of ``runtime_files`` —
+    # both asserted below.
+    "91173093e57c11a44f71de3e11c460511a0aeae19f96273121278f802afd150d"
 )
 
 

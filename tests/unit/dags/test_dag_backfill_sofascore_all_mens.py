@@ -88,7 +88,7 @@ def _planner_kwargs(module, monkeypatch):
     monkeypatch.setattr(module.state, "read_completed", lambda *a, **k: set())
     monkeypatch.setattr(module.state, "read_failures", lambda *a, **k: {})
     monkeypatch.setattr(
-        module, "load_verified_workload_policy",
+        module, "load_static_workload_policy",
         lambda *a, **k: SimpleNamespace(classes={}),
     )
     monkeypatch.setattr(module.state, "plan_historical_batch", _plan)

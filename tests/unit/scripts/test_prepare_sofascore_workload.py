@@ -51,7 +51,7 @@ def _pin_test_workload_policy(monkeypatch):
     monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", "b" * 64)
 
 
-def _policy(season_shape=EPL_SEASON_SHAPE, tournament="17"):
+def _policy(season_shape=EPL_SEASON_SHAPE):
     season_class = season_workload_class(season_shape)
     match_class = match_workload_class()
     player_class = player_workload_class()
@@ -64,10 +64,7 @@ def _policy(season_shape=EPL_SEASON_SHAPE, tournament="17"):
                 25,
                 100,
                 ("event",),
-                20,
-                5,
                 workload_shape_digest(production_match_shape()),
-                (tournament,),
             ),
             player_class: WorkloadClassBudget(
                 player_class,
@@ -75,10 +72,7 @@ def _policy(season_shape=EPL_SEASON_SHAPE, tournament="17"):
                 50,
                 200,
                 ("player_profile",),
-                20,
-                5,
                 workload_shape_digest(production_player_shape()),
-                (tournament,),
             ),
             season_class: WorkloadClassBudget(
                 season_class,
@@ -86,10 +80,7 @@ def _policy(season_shape=EPL_SEASON_SHAPE, tournament="17"):
                 1,
                 300,
                 ("schedule_last",),
-                20,
-                5,
                 workload_shape_digest(season_shape),
-                (tournament,),
             ),
         },
     )
@@ -162,7 +153,7 @@ def _common_patches(plan):
     runtime = SimpleNamespace(raw_store=MagicMock(), manifest_store=MagicMock())
     return (
         patch(
-            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
             return_value=_policy(),
         ),
         patch(
@@ -200,7 +191,7 @@ def test_prepare_rejects_missing_noncanonical_or_zero_pin_before_loading_policy(
     destination = tmp_path / "must-not-exist.json"
     with (
         patch(
-            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
             side_effect=load_policy,
         ),
         patch(
@@ -237,7 +228,7 @@ def test_prepare_rejects_verified_policy_that_does_not_match_artifact_pin(
 
     with (
         patch(
-            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
             return_value=_policy(),
         ) as load_policy,
         patch(
@@ -367,7 +358,7 @@ def test_force_repair_gets_a_measured_allocation_even_when_old_raw_is_complete(
     # A retry reuses exact signed bytes even if manifests changed meanwhile.
     with (
         patch(
-            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
             return_value=_policy(),
         ),
         patch(
@@ -407,7 +398,7 @@ def test_late_retry_reuses_original_signed_day_and_week_snapshot(tmp_path, monke
     monkeypatch.setenv("SOFASCORE_PLAYER_FRESHNESS_KEY", "week-after-boundary")
     with (
         patch(
-            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
             return_value=_policy(),
         ),
         patch(
@@ -1152,8 +1143,8 @@ def test_season_class_uses_the_configured_team_count_band(tmp_path, monkeypatch)
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     with (
         patch(
-            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
-            return_value=_policy(WORLD_CUP_SEASON_SHAPE, tournament="16"),
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
+            return_value=_policy(WORLD_CUP_SEASON_SHAPE),
         ),
         patch(
             "dags.scripts.prepare_sofascore_workload.build_capture_runtime",
@@ -1192,7 +1183,7 @@ def test_season_class_uses_the_configured_team_count_band(tmp_path, monkeypatch)
 def test_unmeasured_band_cannot_be_signed_against_another_leagues_class(
     tmp_path, monkeypatch
 ):
-    # Only the 16_20/split_year class is verified: a 48-team calendar-year
+    # Only the 16_20/split_year class is declared: a 48-team calendar-year
     # season must not borrow it. Fail-closed, no plan on disk.
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     from scrapers.sofascore.workload_plan import WorkloadPolicyUnavailable
@@ -1200,8 +1191,8 @@ def test_unmeasured_band_cannot_be_signed_against_another_leagues_class(
     destination = tmp_path / "wc-borrowed-plan.json"
     with (
         patch(
-            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
-            return_value=_policy(tournament="16"),
+            "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
+            return_value=_policy(),
         ),
         patch(
             "dags.scripts.prepare_sofascore_workload.build_capture_runtime",

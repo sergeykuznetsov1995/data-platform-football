@@ -4,8 +4,8 @@
 The host-side ``preflight`` validates deployment-owned bind sources for the
 fixed container identity (UID 50000/GID 0).  Container health modes additionally
 prove the effective identity, perform a real write/unlink probe in gateway
-state, load the verified workload policy against the current runtime
-fingerprint, and compare its artifact ID with the credential-free gateway
+state, load the static workload policy shipped with the
+release tree, and compare its artifact ID with the credential-free gateway
 health response.
 """
 
@@ -33,7 +33,7 @@ if str(ROOT) not in sys.path:
 
 from scrapers.sofascore.workload_plan import (  # noqa: E402
     WorkloadPolicyUnavailable,
-    load_verified_workload_policy,
+    load_static_workload_policy,
 )
 from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
     validate_campaign_snapshot,
@@ -217,10 +217,10 @@ def validate_artifact(
                 "SofaScore artifact effective-access check uses the wrong identity"
             )
         try:
-            policy = load_verified_workload_policy(Path(f"/proc/self/fd/{descriptor}"))
+            policy = load_static_workload_policy(Path(f"/proc/self/fd/{descriptor}"))
         except WorkloadPolicyUnavailable as exc:
             raise ReadinessError(
-                "SofaScore artifact is not verified for the current runtime"
+                "SofaScore workload policy is not loadable"
             ) from exc
         after = os.fstat(descriptor)
         try:
@@ -235,9 +235,9 @@ def validate_artifact(
             raise ReadinessError("SofaScore artifact changed during verification")
         artifact_id = str(policy.artifact_id)
         if ARTIFACT_ID_RE.fullmatch(artifact_id) is None:
-            raise ReadinessError("verified SofaScore artifact returned an invalid ID")
+            raise ReadinessError("SofaScore workload policy returned an invalid ID")
         if artifact_id != expected:
-            raise ReadinessError("verified SofaScore artifact ID differs from the pin")
+            raise ReadinessError("SofaScore workload policy ID differs from the pin")
         return artifact_id
     finally:
         os.close(descriptor)

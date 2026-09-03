@@ -14,7 +14,7 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.sensors.python import PythonSensor
 
-from scrapers.sofascore.workload_plan import load_verified_workload_policy
+from scrapers.sofascore.workload_plan import load_static_workload_policy
 
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils import sofascore_all_mens_state as state
@@ -110,7 +110,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     campaign_id = str(snapshot.get("campaign_id") or "")
     completed = state.read_completed(STATE_PATH, campaign_id=campaign_id)
     failures = state.read_failures(FAILURES_PATH, campaign_id=campaign_id)
-    workload_policy = load_verified_workload_policy(WORKLOAD_ARTIFACT)
+    workload_policy = load_static_workload_policy(WORKLOAD_ARTIFACT)
     return state.plan_historical_batch(
         snapshot,
         completed=completed,
