@@ -52,6 +52,10 @@ COMPOSE_TEST_ENV = {
     # production host layout while exercising fail-closed interpolation.
     "SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST": "/tmp/compose-test-sofascore-budget.json",
     "SOFASCORE_GATEWAY_STATE_HOST_DIR": "/tmp/compose-test-sofascore-gateway-state",
+    # Свой каталог состояния у каждой полосы (#1244): WAL/ledger шлюза
+    # рассчитаны на единственного писателя.
+    "SOFASCORE_HISTORY_GW_STATE_HOST_DIR": "/tmp/compose-test-sofascore-gateway-state-history",
+    "SOFASCORE_PLAYERS_GW_STATE_HOST_DIR": "/tmp/compose-test-sofascore-gateway-state-players",
     "SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR": "/tmp/compose-test-sofascore-all-men",
     # The isolated SofaScore contour (deploy/sofascore/*.compose.yaml) is
     # fail-closed on every host path and image; dummies keep the render
@@ -268,6 +272,29 @@ class TestComposeFile:
         assert "build" not in service
         for volume in volumes.values():
             assert volume["source"].startswith("/tmp/compose-test-sofascore-"), volume
+
+        # Три полосы (#1244): свой контейнер и свой каталог состояния у каждой.
+        lanes = {
+            "sofascore_proxy_filter": (
+                "sofascore_gw_951",
+                COMPOSE_TEST_ENV["SOFASCORE_GATEWAY_STATE_HOST_DIR"],
+            ),
+            "sofascore_gw_history": (
+                "sofascore_gw_history",
+                COMPOSE_TEST_ENV["SOFASCORE_HISTORY_GW_STATE_HOST_DIR"],
+            ),
+            "sofascore_gw_players": (
+                "sofascore_gw_players",
+                COMPOSE_TEST_ENV["SOFASCORE_PLAYERS_GW_STATE_HOST_DIR"],
+            ),
+        }
+        assert set(cfg["services"]) == set(lanes)
+        for name, (container, state_source) in lanes.items():
+            lane = cfg["services"][name]
+            assert lane["container_name"] == container, name
+            lane_volumes = {v["target"]: v for v in lane["volumes"]}
+            assert lane_volumes[state_target]["source"] == state_source, name
+            assert lane["deploy"]["resources"]["limits"]["memory"] == "1073741824", name
 
     def test_sofascore_airflow_renders_from_one_release_root(self):
         """Every code bind of the isolated scheduler comes from one frozen
