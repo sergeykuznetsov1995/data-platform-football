@@ -129,9 +129,6 @@ services:
       - ${SOFASCORE_PROXY_MAX_ACTIVE_LEASES:-1}
       - --sofascore-budget-artifact
       - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
-      # 0 = боевой подписант (не эксперимент-канарейка).
-      - --sofascore-canary-hard-cap-bytes
-      - "0"
       - --sofascore-discovery-dagrun-budget-bytes
       - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
       - --ledger
@@ -207,8 +204,6 @@ services:
       - ${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-1}
       - --sofascore-budget-artifact
       - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
-      - --sofascore-canary-hard-cap-bytes
-      - "0"
       - --sofascore-discovery-dagrun-budget-bytes
       - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
       - --ledger
@@ -279,8 +274,6 @@ services:
       - ${SOFASCORE_PLAYERS_GW_MAX_ACTIVE_LEASES:-1}
       - --sofascore-budget-artifact
       - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
-      - --sofascore-canary-hard-cap-bytes
-      - "0"
       - --sofascore-discovery-dagrun-budget-bytes
       - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
       - --ledger

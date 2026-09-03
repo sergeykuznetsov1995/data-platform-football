@@ -1654,9 +1654,7 @@ services:
       - --max-active-leases
       - ${PROXY_FILTER_MAX_ACTIVE_LEASES:-4}
       - --sofascore-budget-artifact
-      - /opt/airflow/configs/sofascore/proxy_budget_canary.json
-      - --sofascore-canary-hard-cap-bytes
-      - ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
+      - /opt/airflow/configs/sofascore/workload_policy.json
       - --sofascore-discovery-dagrun-budget-bytes
       - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
       - --ledger

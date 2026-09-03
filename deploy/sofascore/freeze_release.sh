@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Заморозка дерева контура SofaScore под ротацию (#1218, #1155 этап 3).
 # Использование: bash deploy/sofascore/freeze_release.sh <sha>
-#   digest считается по дереву (scrapers.sofascore.runtime_fingerprint) и сверяется
-#   с шаблоном configs/sofascore/proxy_budget_canary.json того же коммита.
 # Переменные — из $SOFASCORE_ENV_FILE (по умолчанию /etc/data-platform/sofascore.env):
-#   SOFASCORE_SOURCE_REPO, SOFASCORE_RELEASES_DIR, SOFASCORE_HOST_PYTHON.
-# Дальше: run_canary.sh <дерево> (tmux), затем deploy.sh <дерево> после VERIFIED.
+#   SOFASCORE_SOURCE_REPO, SOFASCORE_RELEASES_DIR.
+# Дальше: deploy.sh <дерево> (платного замера перед выкатом больше нет, #1245).
 set -euo pipefail
 
 # The frozen checkout is mounted read-only into containers running as uid
@@ -18,7 +16,7 @@ ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
 # shellcheck source=deploy/sofascore/env.sh
 . "$(dirname "$0")/env.sh"
 sofascore_load_env "$ENV_FILE" || exit 2
-: "${SOFASCORE_SOURCE_REPO:?}" "${SOFASCORE_RELEASES_DIR:?}" "${SOFASCORE_HOST_PYTHON:?}"
+: "${SOFASCORE_SOURCE_REPO:?}" "${SOFASCORE_RELEASES_DIR:?}"
 
 [ -d "$SOFASCORE_RELEASES_DIR" ] || { echo "нет каталога релизов $SOFASCORE_RELEASES_DIR" >&2; exit 1; }
 TMP_TREE=$(mktemp -d "$SOFASCORE_RELEASES_DIR/freeze.XXXXXX")
@@ -31,27 +29,17 @@ git -C "$TMP_TREE" checkout -q --detach "$SHA"
 # Рецепт контура (deploy/sofascore/*) и мини-DAG должны быть в самом дереве:
 # compose монтирует их из ${SOFASCORE_RELEASE_ROOT}, пустышек и симлинков больше нет.
 for f in deploy/sofascore/airflow.compose.yaml deploy/sofascore/gateway.compose.yaml \
-         deploy/sofascore/.airflowignore dags/dag_trigger_sofascore_daily.py \
+         deploy/sofascore/.airflowignore configs/sofascore/workload_policy.json \
+         dags/dag_trigger_sofascore_daily.py \
          dags/dag_sofascore_manifest_maintenance.py; do
   [ -s "$TMP_TREE/$f" ] || { echo "ОШИБКА: в $SHA нет $f — коммит старше рецепта #1155" >&2; exit 1; }
 done
 
-DIGEST=$(cd "$TMP_TREE" && PYTHONDONTWRITEBYTECODE=1 "$SOFASCORE_HOST_PYTHON" -B -c "
-import sys; sys.path.insert(0,'.')
-from scrapers.sofascore.runtime_fingerprint import runtime_fingerprint
-print(runtime_fingerprint('.')['digest'])
-")
-TPL_DIGEST=$(python3 -c "import json;print(json.load(open('$TMP_TREE/configs/sofascore/proxy_budget_canary.json'))['runtime_fingerprint']['digest'])")
-[ "$TPL_DIGEST" = "$DIGEST" ] || {
-  echo "ОШИБКА: digest шаблона $TPL_DIGEST != fingerprint дерева $DIGEST (перештамповать bootstrap)" >&2
-  exit 1; }
-
-# Имя: release-<digest8>-<gitsha8>. digest — идентичность runtime-контракта (по нему
-# ищутся канарейка и артефакт), sha различает деревья с одинаковым контрактом — правка
-# только рецепта deploy/sofascore/ или мини-DAG (они в fingerprint не входят) получает
-# новое дерево и не упирается в «уже существует».
+# Имя: release-<gitsha8>. Отпечаток дерева больше не участвует в идентичности:
+# бюджет задаёт статическая политика из того же коммита (#1245), а не платный замер,
+# привязанный к отпечатку.
 GIT_SHA=$(git -C "$TMP_TREE" rev-parse --short=8 HEAD)
-TREE="$SOFASCORE_RELEASES_DIR/release-${DIGEST:0:8}-${GIT_SHA}"
+TREE="$SOFASCORE_RELEASES_DIR/release-${GIT_SHA}"
 [ -e "$TREE" ] && { echo "ОШИБКА: $TREE уже существует" >&2; exit 1; }
 mv "$TMP_TREE" "$TREE"
 trap - EXIT
@@ -64,5 +52,5 @@ chmod 755 "$TREE"
 mkdir -p "$TREE/logs"
 chown -R 50000:root "$TREE/logs"
 
-echo "дерево заморожено: $TREE (sha $GIT_SHA, digest $DIGEST)"
-echo "дальше: bash deploy/sofascore/run_canary.sh $TREE  (tmux), затем deploy.sh после VERIFIED"
+echo "дерево заморожено: $TREE (sha $GIT_SHA)"
+echo "дальше: bash deploy/sofascore/deploy.sh $TREE"

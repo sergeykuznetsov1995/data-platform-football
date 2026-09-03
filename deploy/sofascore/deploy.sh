@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Выкат замороженного дерева на контур SofaScore (проекты sofascore-airflow / sofascore-gw).
 # Использование: bash deploy/sofascore/deploy.sh <release-root> [old-release-root]
-# Предпосылки: VERIFIED в <runtime>/canary-<digest8>; окно вне 13:55–15:35 UTC;
+# Предпосылки: окно вне 13:55–15:35 UTC;
 #   обе кампании (история и актуалка) ставятся на паузу и ждут idle здесь же,
 #   актуалка после выката возвращается в прежнее состояние.
 # Переменные — из $SOFASCORE_ENV_FILE (по умолчанию /etc/data-platform/sofascore.env);
@@ -37,12 +37,11 @@ done <<< "$LANE_STATE_DIRS"
 [ "$(printf '%s' "$lane_canonical" | sort -u | wc -l)" = "3" ] \
   || { echo "каталоги состояния полос указывают на один каталог: $(echo $lane_canonical)" >&2; exit 2; }
 
-# Имя дерева: release-<digest8>[-<gitsha8>]; digest — идентичность runtime-контракта
-# (канарейка и артефакт), sha различает деревья с одинаковым контрактом (правка только
-# рецепта/мини-DAG). Рабочий каталог канарейки — по digest: тот же контракт = та же VERIFIED.
+# Имя дерева: release-<sha8> (исторические деревья — release-<digest8>-<gitsha8>).
+# TAG — первый сегмент после release-; он именует каталог артефакта этого выката.
+# Политика бюджета едет в самом дереве: платного замера больше нет (#1245).
 TAG=$(basename "$RELEASE" | sed -e 's/^release-//' -e 's/-.*$//')
-WORKSPACE="$SOFASCORE_RUNTIME_DIR/canary-$TAG"
-ARTIFACT="$WORKSPACE/candidate.json"
+ARTIFACT="$RELEASE/configs/sofascore/workload_policy.json"
 LOG="$SOFASCORE_RUNTIME_DIR/all-men/deploy.log"
 SCHED_COMPOSE="$RELEASE/deploy/sofascore/airflow.compose.yaml"
 GW_COMPOSE="$RELEASE/deploy/sofascore/gateway.compose.yaml"
@@ -98,7 +97,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-[ -f "$WORKSPACE/VERIFIED" ] || { echo "нет VERIFIED в $WORKSPACE" >&2; exit 2; }
+[ -s "$ARTIFACT" ] || { echo "в $RELEASE нет configs/sofascore/workload_policy.json" >&2; exit 2; }
 [ -f "$SCHED_COMPOSE" ] && [ -f "$GW_COMPOSE" ] || { echo "в $RELEASE нет deploy/sofascore/*.compose.yaml" >&2; exit 2; }
 hour=$(date -u +%H%M)
 if [ "$hour" -ge 1355 ] && [ "$hour" -le 1535 ]; then echo "окно дейли 14:00–15:30 UTC — позже" >&2; exit 3; fi
@@ -119,20 +118,16 @@ while true; do
 done
 log "idle"
 
-STEP="digest"
-DIGEST=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE" "$SOFASCORE_HOST_PYTHON" -B -c \
-  'from scrapers.sofascore.runtime_fingerprint import runtime_fingerprint; print(runtime_fingerprint()["digest"])')
-CANDIDATE_DIGEST=$(python3 -c "import json; print(json.load(open('$ARTIFACT'))['runtime_fingerprint']['digest'])")
-[ "$DIGEST" = "$CANDIDATE_DIGEST" ] || { echo "digest дерева $DIGEST != кандидата $CANDIDATE_DIGEST" >&2; exit 4; }
-[ "${DIGEST:0:8}" = "$TAG" ] || { echo "имя дерева не совпадает с digest" >&2; exit 4; }
-
 STEP="artifact"
-ARTIFACT_DEST="$SOFASCORE_RUNTIME_DIR/artifacts/$DIGEST/proxy_budget_canary.json"
+# Артефакт бюджета = статическая политика из дерева (#1245). Копия неизменяема и
+# переживает ротацию дерева: её sha256 — тот самый artifact_id, которым шлюз и
+# клиент склеивают подписанные планы, WAL и ledger.
+ARTIFACT_DEST="$SOFASCORE_RUNTIME_DIR/artifacts/$TAG/workload_policy.json"
 mkdir -p "$(dirname "$ARTIFACT_DEST")"
 cp "$ARTIFACT" "$ARTIFACT_DEST"
 chmod 0644 "$ARTIFACT_DEST"
 ARTIFACT_ID=$(sha256sum "$ARTIFACT_DEST" | awk '{print $1}')
-log "artifact $ARTIFACT_DEST id=$ARTIFACT_ID (digest дерева $DIGEST — это разные сущности)"
+log "artifact $ARTIFACT_DEST id=$ARTIFACT_ID"
 
 # Перенос состояния кампании из старого дерева в runtime (переживает ротации).
 OLD_STATE_DIR="${OLD_RELEASE:+$OLD_RELEASE/logs/sofascore-all-men}"
@@ -255,4 +250,4 @@ while IFS= read -r unit; do
   systemctl restart "$unit"
   log "watchdog restarted on $RELEASE: $unit $(systemctl is-active "$unit")"
 done <<< "$WATCHDOG_UNITS"
-log "DONE artifact_id=$ARTIFACT_ID runtime=$DIGEST"
+log "DONE artifact_id=$ARTIFACT_ID release=$RELEASE"
