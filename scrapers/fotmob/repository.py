@@ -1052,26 +1052,14 @@ class FotMobRepository:
             )
         manifest_row = commit.manifest_row()
 
-        if self.batch_size <= 1:
-            table_paths: list[str] = []
-            with self._guarded_write():
-                for table, entity_type, partition_cols, rows in prepared:
-                    path = self._write(
-                        table,
-                        rows,
-                        entity_type=entity_type,
-                        partition_cols=partition_cols,
-                    )
-                    if path:
-                        table_paths.append(path)
-                manifest_path = self._write(
-                    MANIFEST_TABLE, [manifest_row], entity_type="ingest_manifest"
-                )
-                if manifest_path:
-                    table_paths.append(manifest_path)
-            self._index_committed(manifest_row)
-            return table_paths
-
+        # Небуферизованного пути записи больше нет. Прямая запись обходила
+        # сверку пачки с хранилищем (`_flush_once` → `_reconcile_pending_table`),
+        # а это единственная защита от повторной записи уже лежащей пачки:
+        # при batch_size<=1 два писателя под общим замком писали одну и ту же
+        # пачку дважды, каждый в свой заход. Теперь любой batch_size кладёт
+        # цель в буфер, а порог `batch_size` тут же вызывает flush() — сверка,
+        # ретрай конфликта коммита и замок писателя переиспользуются как есть.
+        #
         # Inventory deduplication may need authoritative Trino reads. Do all
         # of those reads before mutating the write buffer so a metadata/query
         # failure cannot leave half a target queued. New keys live in a small

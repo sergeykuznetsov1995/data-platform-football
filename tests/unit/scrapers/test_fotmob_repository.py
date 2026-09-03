@@ -308,6 +308,12 @@ class ScopeAttemptTrino:
     def __init__(self):
         self.sql = []
 
+    def table_exists(self, _schema, _table):
+        # Единый путь записи сверяет пачку с хранилищем перед записью и при
+        # batch_size=1 тоже — заглушка обязана отвечать на тот же вопрос, что и
+        # настоящий Trino.
+        return False
+
     def execute_query(self, sql):
         self.sql.append(sql)
         return [
@@ -2523,3 +2529,31 @@ def test_lost_write_guard_fails_every_later_write_immediately():
     # Повторного ожидания замка нет: отказ поднимается из памяти процесса.
     assert guard.attempts == 1
     assert writer.rows == {}
+
+
+def test_unbuffered_writers_keep_exactly_once_under_one_guard():
+    """batch_size=1 сверяет пачку с хранилищем так же, как буферизованный путь.
+
+    Прямая запись обходила сверку `_reconcile_pending_table`, и два писателя под
+    одним замком клали одну и ту же пачку дважды — каждый в свой заход.
+    """
+
+    writer = ReconcileWriter()
+    guard = _CountingGuard()
+    shared = _commit(target_key="shared-target", content_hash="c" * 64)
+    wave = FotMobRepository(writer=writer, batch_size=1, write_guard=guard)
+    campaign = FotMobRepository(writer=writer, batch_size=1, write_guard=guard)
+
+    wave.commit(shared, [_match_dataset(1)])
+    campaign.commit(shared, [_match_dataset(1)])
+
+    assert _batch_counts(writer, "fotmob_matches") == {shared.batch_id: 1}
+    assert len(writer.rows["fotmob_matches"]) == 1
+    manifest = [
+        row for row in writer.rows["fotmob_ingest_manifest"]
+        if row["batch_id"] == shared.batch_id
+    ]
+    assert len(manifest) == 1
+    assert manifest[0]["status"] == "success"
+    assert manifest[0]["run_id"] == shared.run_id
+    assert guard.max_concurrent == 1
