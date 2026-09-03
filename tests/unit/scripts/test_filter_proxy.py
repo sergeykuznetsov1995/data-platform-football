@@ -1834,110 +1834,127 @@ def test_proxy_filter_compose_is_env_only_by_default():
 
 
 def test_sofascore_has_a_dedicated_production_metered_proxy_service():
-    # The gateway lives in its OWN compose project (#951, инцидент 2026-07-17):
-    # a foreign `docker compose up` on the shared project must not recreate it.
-    gateway = _SOFASCORE_GATEWAY_COMPOSE_PATH.read_text()
-    document = yaml.safe_load(gateway)
-    model = document["services"]["sofascore_proxy_filter"]
-    service = gateway.split("  sofascore_proxy_filter:\n", 1)[1].split(
-        "\nnetworks:\n", 1
-    )[0]
+    # The gateways live in their OWN compose project (#951, инцидент 2026-07-17):
+    # a foreign `docker compose up` on the shared project must not recreate them.
+    document = yaml.safe_load(_SOFASCORE_GATEWAY_COMPOSE_PATH.read_text())
+    artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    state_target = "/opt/airflow/logs/sofascore_proxy_filter"
+    # Три полосы источника (#1244) — три сервиса одного проекта. Общая часть
+    # приезжает YAML-якорем, поэтому контракт читается из разобранной модели,
+    # а не из текстового среза файла. Свой каталог состояния у каждой полосы:
+    # WAL/ledger шлюза рассчитаны на единственного писателя.
+    lane_state_vars = {
+        "sofascore_proxy_filter": "${SOFASCORE_GATEWAY_STATE_HOST_DIR:?",
+        "sofascore_gw_history": "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?",
+        "sofascore_gw_players": "${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?",
+    }
+    assert set(document["services"]) == set(lane_state_vars)
 
-    # Dedicated pool secret (fail-closed, never the platform-wide
-    # PROXY_POOL_JSON) + file fallback from a deployment-owned host file.
-    assert (
-        "PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:?set the SofaScore paid "
-        "proxy pool JSON}"
-    ) in service
-    assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"' in service
-    assert "http://sofascore_proxy_filter:8900" in service
-    # hard-cap 0 => production signer (a >0 cap is the never-authorized canary).
-    assert '\n      - --sofascore-canary-hard-cap-bytes\n      - "0"' in service
-    # One active SofaScore lease at a time.
-    assert '\n      - --max-active-leases\n      - "1"' in service
-    # Ledger/WAL on the narrow persistent state root, isolated from the shared
-    # gateway and from the release checkout.
-    assert "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl" in service
-    # Isolation contract: its own compose project on the contour's own
-    # EXTERNAL network (the isolated scheduler reaches it by service alias;
-    # #1155 stage 3 dropped dp-backend) and ABSENT from the shared
-    # compose.yaml, so foreign deploys can't sweep it.
+    for name, state_var in lane_state_vars.items():
+        model = document["services"][name]
+        command, env = model["command"], model["environment"]
+        # Dedicated pool secret (fail-closed, never the platform-wide
+        # PROXY_POOL_JSON) + file fallback from a deployment-owned host file.
+        assert env["PROXY_POOL_JSON"] == (
+            "${SOFASCORE_PROXY_POOL_JSON:?set the SofaScore paid proxy pool JSON}"
+        ), name
+        assert env["PROXY_FILTER_ALLOW_FILE_FALLBACK"] == "true", name
+        # Каждая полоса арендует прокси у СВОЕГО шлюза: общий lease-url свёл бы
+        # три полосы обратно в один слот аренды — дефект, который чинит #1244.
+        assert command[command.index("--lease-proxy-url") + 1] == f"http://{name}:8900", name
+        # hard-cap 0 => production signer (a >0 cap is the never-authorized canary).
+        assert command[command.index("--sofascore-canary-hard-cap-bytes") + 1] == "0", name
+        # One active SofaScore lease at a time by default; the ceiling is an
+        # operator knob (#1248 widens a lane without touching the recipe).
+        assert command[command.index("--max-active-leases") + 1].endswith(":-1}"), name
+        # Isolation contract: the contour's own EXTERNAL network (the isolated
+        # scheduler reaches every gateway by service alias; #1155 stage 3 dropped
+        # dp-backend).
+        assert model["networks"] == ["sofascore-net"], name
+        # The whole frozen release tree is the code mount; nothing is built in place.
+        assert "build" not in model, name
+        assert env["PYTHONPATH"] == "/opt/sofascore-repo", name
+        assert env["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == artifact_target, name
+        assert env["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
+            "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified "
+            "SofaScore artifact SHA-256}"
+        ), name
+        assert command[command.index("--sofascore-budget-artifact") + 1] == artifact_target, name
+
+        volumes = model["volumes"]
+        long_volumes = {
+            volume["target"]: volume for volume in volumes if isinstance(volume, dict)
+        }
+        targets = [
+            volume["target"] if isinstance(volume, dict) else volume.split(":")[1]
+            for volume in volumes
+        ]
+        assert len(targets) == len(set(targets)), name
+        artifact_mount = long_volumes[artifact_target]
+        assert artifact_mount["source"].startswith(
+            "${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?"
+        ), name
+        assert artifact_mount["read_only"] is True, name
+        assert artifact_mount["bind"]["create_host_path"] is False, name
+        assert not artifact_target.startswith("/opt/airflow/configs/sofascore/")
+        assert not any(
+            target != artifact_target and artifact_target.startswith(f"{target}/")
+            for target in targets
+        ), name
+
+        state_mount = long_volumes[state_target]
+        assert state_mount["source"].startswith(state_var), name
+        assert state_mount.get("read_only", False) is False, name
+        assert state_mount["bind"]["create_host_path"] is False, name
+        assert "/opt/airflow/logs" not in targets, name
+        repo_mount = long_volumes["/opt/sofascore-repo"]
+        assert repo_mount["source"].startswith("${SOFASCORE_RELEASE_ROOT:?"), name
+        assert repo_mount["read_only"] is True, name
+        assert repo_mount["bind"]["create_host_path"] is False, name
+        fallback_mount = long_volumes["/opt/airflow/proxys.txt"]
+        assert fallback_mount["source"].startswith(
+            "${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?"
+        ), name
+        assert fallback_mount["read_only"] is True, name
+        assert fallback_mount["bind"]["create_host_path"] is False, name
+        # Ledger/WAL on the narrow persistent state root, isolated from the shared
+        # gateway, from the release checkout and from the other lanes.
+        for flag in (
+            "--out",
+            "--ledger",
+            "--sofascore-allocation-ledger",
+            "--sofascore-allocation-wal",
+            "--sofascore-parent-envelope",
+        ):
+            assert command[command.index(flag) + 1].startswith(f"{state_target}/"), (name, flag)
+        assert model["healthcheck"]["test"] == [
+            "CMD",
+            "python",
+            "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py",
+            "gateway-health",
+            "--artifact",
+            artifact_target,
+            "--state-dir",
+            state_target,
+            "--health-url",
+            "http://localhost:8899/health",
+        ], name
+
+    # Каталог состояния у каждой полосы свой — иначе три писателя на один WAL.
+    assert len({
+        next(
+            v["source"] for v in service["volumes"] if v["target"] == state_target
+        )
+        for service in document["services"].values()
+    }) == 3
     assert document["name"] == "sofascore-gw"
     assert document["networks"] == {
         "sofascore-net": {"external": True, "name": "sofascore-net"}
     }
-    assert model["networks"] == ["sofascore-net"]
-    assert "\n  sofascore_proxy_filter:\n" not in _COMPOSE_PATH.read_text()
-    # The whole frozen release tree is the code mount; nothing is built in place.
-    assert "build" not in model
-    assert model["environment"]["PYTHONPATH"] == "/opt/sofascore-repo"
-    artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
-    state_target = "/opt/airflow/logs/sofascore_proxy_filter"
-    assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (artifact_target)
-    assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
-        "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified "
-        "SofaScore artifact SHA-256}"
-    )
-    artifact_flag = model["command"].index("--sofascore-budget-artifact")
-    assert model["command"][artifact_flag + 1] == artifact_target
-
-    volumes = model["volumes"]
-    long_volumes = {
-        volume["target"]: volume for volume in volumes if isinstance(volume, dict)
-    }
-    targets = [
-        volume["target"] if isinstance(volume, dict) else volume.split(":")[1]
-        for volume in volumes
-    ]
-    assert len(targets) == len(set(targets))
-    artifact_mount = long_volumes[artifact_target]
-    assert artifact_mount["source"].startswith(
-        "${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?"
-    )
-    assert artifact_mount["read_only"] is True
-    assert artifact_mount["bind"]["create_host_path"] is False
-    assert not artifact_target.startswith("/opt/airflow/configs/sofascore/")
-    assert not any(
-        target != artifact_target and artifact_target.startswith(f"{target}/")
-        for target in targets
-    )
-
-    state_mount = long_volumes[state_target]
-    assert state_mount["source"].startswith("${SOFASCORE_GATEWAY_STATE_HOST_DIR:?")
-    assert state_mount.get("read_only", False) is False
-    assert state_mount["bind"]["create_host_path"] is False
-    assert "/opt/airflow/logs" not in targets
-    repo_mount = long_volumes["/opt/sofascore-repo"]
-    assert repo_mount["source"].startswith("${SOFASCORE_RELEASE_ROOT:?")
-    assert repo_mount["read_only"] is True
-    assert repo_mount["bind"]["create_host_path"] is False
-    fallback_mount = long_volumes["/opt/airflow/proxys.txt"]
-    assert fallback_mount["source"].startswith(
-        "${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?"
-    )
-    assert fallback_mount["read_only"] is True
-    assert fallback_mount["bind"]["create_host_path"] is False
-    for flag in (
-        "--out",
-        "--ledger",
-        "--sofascore-allocation-ledger",
-        "--sofascore-allocation-wal",
-        "--sofascore-parent-envelope",
-    ):
-        index = model["command"].index(flag)
-        assert model["command"][index + 1].startswith(f"{state_target}/")
-    assert model["healthcheck"]["test"] == [
-        "CMD",
-        "python",
-        "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py",
-        "gateway-health",
-        "--artifact",
-        artifact_target,
-        "--state-dir",
-        state_target,
-        "--health-url",
-        "http://localhost:8899/health",
-    ]
+    # ABSENT from the shared compose.yaml, so foreign deploys can't sweep them.
+    shared = _COMPOSE_PATH.read_text()
+    for name in document["services"]:
+        assert f"\n  {name}:\n" not in shared, name
 
 
 def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():

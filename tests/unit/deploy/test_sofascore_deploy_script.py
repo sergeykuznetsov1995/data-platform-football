@@ -73,7 +73,11 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
         ''',
         0o755,
     )
-    _write(bin_dir / "systemctl", "#!/usr/bin/env bash\necho active\n", 0o755)
+    _write(
+        bin_dir / "systemctl",
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{state_dir}/systemctl.log"\necho active\n',
+        0o755,
+    )
     _write(bin_dir / "chown", "#!/usr/bin/env bash\nexit 0\n", 0o755)
     # The script polls with sleep 10/60; the stub makes failure paths finish instantly.
     _write(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n", 0o755)
@@ -84,7 +88,8 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
     )
     _write(
         bin_dir / "host-python",
-        f'#!/usr/bin/env bash\ncase "$*" in *runtime_fingerprint*) echo {DIGEST} ;; esac\nexit 0\n',
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{state_dir}/host-python.log"\n'
+        f'case "$*" in *runtime_fingerprint*) echo {DIGEST} ;; esac\nexit 0\n',
         0o755,
     )
 
@@ -95,6 +100,8 @@ def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, P
     state_dir = tmp_path / "stub-state"
     bin_dir = tmp_path / "bin"
     state_dir.mkdir()
+    for lane in ("gateway-state", "gateway-state-history", "gateway-state-players"):
+        (runtime / lane).mkdir(parents=True)
     _stubs(bin_dir, state_dir)
     (state_dir / f"paused_{HIST}").write_text("f\n")
     (state_dir / f"paused_{REFRESH}").write_text(f"{refresh_paused}\n")
@@ -112,6 +119,8 @@ def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, P
         SOFASCORE_RUNTIME_DIR={runtime}
         SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR={runtime}/all-men
         SOFASCORE_GATEWAY_STATE_HOST_DIR={runtime}/gateway-state
+        SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state-history
+        SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players
         SOFASCORE_PLATFORM_ENV_FILE={platform_env}
         SOFASCORE_HOST_PYTHON={bin_dir}/host-python
         SOFASCORE_RELEASE_ROOT=/old/release-deadbeef
@@ -176,6 +185,129 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
         assert "--no-deps --force-recreate" in args
     assert f"-f {release}/deploy/sofascore/airflow.compose.yaml" in compose_calls[0][0]
     assert f"--project-directory {release}" in compose_calls[1][0]
+    # Три полосы (#1244): три шлюза одним вызовом, три пула, три сторожа.
+    assert compose_calls[1][0].endswith(
+        "sofascore_proxy_filter sofascore_gw_history sofascore_gw_players"
+    ), compose_calls[1][0]
+    args = [call[0] for call in _calls(state_dir)]
+    pools = [a for a in args if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")]
+    assert [a.split()[5] for a in pools] == [
+        "ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"
+    ], pools
+    assert all(a.split()[6] == "1" for a in pools), pools
+    # deploy.sh не пересоздаёт airflow-init, где пулы заводятся впервые: без этого
+    # шага задачи полос повисли бы в несуществующем пуле.
+    assert min(args.index(a) for a in pools) > max(i for i, a in enumerate(args) if a.startswith("compose "))
+    preflights = [
+        line for line in (state_dir / "host-python.log").read_text(encoding="utf-8").splitlines()
+        if " preflight " in line
+    ]
+    # Полный валидатор (каноничность, владелец, доступ UID 50000, вне дерева релиза)
+    # обязан пройти по КАЖДОЙ полосе, а не только по каталогу актуалки.
+    runtime = tmp_path / "runtime"
+    assert sorted(line.split("--state-dir ")[1].split(" ")[0] for line in preflights) == sorted(
+        [
+            f"{runtime}/gateway-state",
+            f"{runtime}/gateway-state-history",
+            f"{runtime}/gateway-state-players",
+        ]
+    ), preflights
+    restarts = [
+        line.split(" ", 1)[1]
+        for line in (state_dir / "systemctl.log").read_text(encoding="utf-8").splitlines()
+        if line.startswith("restart ")
+    ]
+    assert restarts == [
+        "sofascore-gw-lease-watchdog.service",
+        "sofascore-gw-lease-watchdog-history.service",
+        "sofascore-gw-lease-watchdog-players.service",
+    ], restarts
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "missing",
+    ["SOFASCORE_HISTORY_GW_STATE_HOST_DIR", "SOFASCORE_PLAYERS_GW_STATE_HOST_DIR"],
+)
+def test_deploy_refuses_before_touching_anything_when_a_lane_state_dir_is_unset(
+    tmp_path: Path, missing: str
+) -> None:
+    # Каталог состояния полосы — fail-closed вход compose. Без проверки в начале
+    # скрипта пропущенная переменная валила бы выкат только на gateway-up: уже
+    # после паузы кампаний, перепиновки env-файла и пересоздания scheduler'а.
+    _runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    env_file.write_text(
+        "\n".join(
+            line for line in env_file.read_text(encoding="utf-8").splitlines()
+            if not line.startswith(f"{missing}=")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert missing in proc.stderr, proc.stderr
+    assert not (state_dir / "calls.log").exists(), "ни одного вызова docker до отказа"
+
+
+def _symlink_players_state_onto_history(text: str, runtime: Path) -> str:
+    """Разные строки — один каталог: сравнение строк такое не ловит."""
+    alias = runtime / "gateway-state-players-alias"
+    (runtime / "gateway-state-players").rmdir()
+    alias.symlink_to(runtime / "gateway-state-history")
+    return text.replace(
+        f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players",
+        f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={alias}",
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("break_env", "reason"),
+    [
+        (
+            lambda text, runtime: text.replace(
+                f"SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state-history",
+                f"SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state",
+            ),
+            "указывают на один каталог",
+        ),
+        (
+            lambda text, runtime: text.replace(
+                f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players",
+                f"SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/nowhere",
+            ),
+            "не существует",
+        ),
+        (
+            _symlink_players_state_onto_history,
+            "указывают на один каталог",
+        ),
+    ],
+    ids=[
+        "two-lanes-share-one-state-dir",
+        "lane-state-dir-does-not-exist",
+        "lane-state-dir-is-a-symlink-to-another-lane",
+    ],
+)
+def test_deploy_refuses_a_state_layout_that_would_give_a_wal_two_writers(
+    tmp_path: Path, break_env, reason: str
+) -> None:
+    # Каталог состояния — не просто строка в env: два одинаковых пути дали бы двух
+    # писателей на один WAL, а приёмка бы это пропустила (ожидания она берёт из того
+    # же файла). Отказ обязан случиться до паузы кампаний и любого вызова docker.
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    env_file.write_text(break_env(env_file.read_text(encoding="utf-8"), runtime), encoding="utf-8")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert reason in proc.stderr, proc.stderr
+    assert not (state_dir / "calls.log").exists(), "ни одного вызова docker до отказа"
 
 
 @pytest.mark.unit
@@ -294,7 +426,12 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
           exit 0
         fi
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
-          case "${{@: -1}}" in *import_error*) echo 0 ;; *is_active=true*) echo 5 ;; *) echo "dag|f|t" ;; esac
+          case "${{@: -1}}" in
+            *import_error*) echo 0 ;;
+            *is_active=true*) echo 5 ;;
+            *slot_pool*) echo 1 ;;
+            *) echo "dag|f|t" ;;
+          esac
           exit 0
         fi
         if [ "$1" = exec ]; then echo '{{"status":"ok"}}'; exit 0; fi
@@ -302,14 +439,36 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         """,
         0o755,
     )
+    # У каждого unit'а свой ExecStart: приёмка обязана ловить сторожа, который
+    # active, но сторожит чужой шлюз по чужому каталогу состояния.
     _write(
         bin_dir / "systemctl",
-        '#!/usr/bin/env bash\ncase "$*" in *show*) echo "ExecStart={{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog --container sofascore_gw_951 --state-dir /s --expected-mount $EXPECTED_MOUNT --alert-command /a ; ignore_errors=no }}" ;; *) echo active ;; esac\n',
+        """\
+        #!/usr/bin/env bash
+        case "$*" in
+          *show*)
+            case "$*" in
+              *-history.service*) c=$WD_HISTORY_CONTAINER; s=$WD_HISTORY_STATE ;;
+              *-players.service*) c=$WD_PLAYERS_CONTAINER; s=$WD_PLAYERS_STATE ;;
+              *) c=$WD_MAIN_CONTAINER; s=$WD_MAIN_STATE ;;
+            esac
+            echo "ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog --container $c --state-dir $s --expected-mount $EXPECTED_MOUNT --alert-command /a ; ignore_errors=no }" ;;
+          *) echo active ;;
+        esac
+        """,
         0o755,
     )
 
 
-def _run_postdeploy(tmp_path: Path, scheduler_mounts: dict[str, str], gateway_mounts: dict[str, str]) -> subprocess.CompletedProcess:
+GATEWAY_CONTAINERS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
+
+
+def _run_postdeploy(
+    tmp_path: Path,
+    scheduler_mounts: dict[str, str],
+    gateway_mounts: dict[str, dict[str, str]],
+    watchdogs: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     runtime = tmp_path / "runtime"
     release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
     _write(runtime / "all-men" / "state.json", json.dumps({"completed": [1, 2]}))
@@ -320,6 +479,8 @@ def _run_postdeploy(tmp_path: Path, scheduler_mounts: dict[str, str], gateway_mo
         SOFASCORE_RELEASE_ROOT={release}
         SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR={runtime}/all-men
         SOFASCORE_GATEWAY_STATE_HOST_DIR={runtime}/gateway-state
+        SOFASCORE_HISTORY_GW_STATE_HOST_DIR={runtime}/gateway-state-history
+        SOFASCORE_PLAYERS_GW_STATE_HOST_DIR={runtime}/gateway-state-players
         SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST={runtime}/artifacts/{DIGEST}/proxy_budget_canary.json
         SOFASCORE_PROXY_POOL_FILE={runtime}/proxys.txt
         SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE={runtime}/fallback.txt
@@ -333,7 +494,11 @@ def _run_postdeploy(tmp_path: Path, scheduler_mounts: dict[str, str], gateway_mo
 
     mounts_file.write_text(
         "".join(f"sofascore-airflow-scheduler|{_typed(d, s)}\n" for d, s in scheduler_mounts.items())
-        + "".join(f"sofascore_gw_951|{_typed(d, s)}\n" for d, s in gateway_mounts.items()),
+        + "".join(
+            f"{container}|{_typed(d, s)}\n"
+            for container, mounts in gateway_mounts.items()
+            for d, s in mounts.items()
+        ),
         encoding="utf-8",
     )
     _postdeploy_stub(tmp_path / "bin", mounts_file)
@@ -342,13 +507,20 @@ def _run_postdeploy(tmp_path: Path, scheduler_mounts: dict[str, str], gateway_mo
         "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
         "SOFASCORE_ENV_FILE": str(env_file),
         "EXPECTED_MOUNT": str(release),
+        "WD_MAIN_CONTAINER": "sofascore_gw_951",
+        "WD_MAIN_STATE": f"{runtime}/gateway-state",
+        "WD_HISTORY_CONTAINER": "sofascore_gw_history",
+        "WD_HISTORY_STATE": f"{runtime}/gateway-state-history",
+        "WD_PLAYERS_CONTAINER": "sofascore_gw_players",
+        "WD_PLAYERS_STATE": f"{runtime}/gateway-state-players",
+        **(watchdogs or {}),
     }
     return subprocess.run(
         ["bash", str(DEPLOY / "postdeploy_checks.sh")], env=env, capture_output=True, text=True, timeout=60
     )
 
 
-def _expected_mounts(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
+def _expected_mounts(tmp_path: Path) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
     runtime = tmp_path / "runtime"
     release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
     artifact = f"{runtime}/artifacts/{DIGEST}/proxy_budget_canary.json"
@@ -369,21 +541,47 @@ def _expected_mounts(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
         "/opt/legacy-scraper-venv": f"{runtime}/legacy-scraper-venv",
         "/home/airflow/soccerdata": "/var/lib/docker/volumes/sofascore_soccerdata_cache/_data",
     }
-    gateway = {
-        "/opt/sofascore-repo": str(release),
-        "/opt/airflow/proxys.txt": f"{runtime}/fallback.txt",
-        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json": artifact,
-        "/opt/airflow/logs/sofascore_proxy_filter": f"{runtime}/gateway-state",
+    # Дерево, fallback-файл и артефакт общие у трёх полос; каталог состояния — свой:
+    # WAL/ledger шлюза рассчитаны на единственного писателя.
+    state_dirs = {
+        "sofascore_gw_951": f"{runtime}/gateway-state",
+        "sofascore_gw_history": f"{runtime}/gateway-state-history",
+        "sofascore_gw_players": f"{runtime}/gateway-state-players",
     }
-    return scheduler, gateway
+    gateways = {
+        container: {
+            "/opt/sofascore-repo": str(release),
+            "/opt/airflow/proxys.txt": f"{runtime}/fallback.txt",
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json": artifact,
+            "/opt/airflow/logs/sofascore_proxy_filter": state_dir,
+        }
+        for container, state_dir in state_dirs.items()
+    }
+    return scheduler, gateways
 
 
 @pytest.mark.unit
 def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) -> None:
-    scheduler, gateway = _expected_mounts(tmp_path)
-    proc = _run_postdeploy(tmp_path, scheduler, gateway)
+    scheduler, gateways = _expected_mounts(tmp_path)
+    assert tuple(gateways) == GATEWAY_CONTAINERS
+    proc = _run_postdeploy(tmp_path, scheduler, gateways)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ПРИЁМКА: ок" in proc.stdout
+    # Три полосы проверяются целиком: health, пулы, сторожа.
+    for container in GATEWAY_CONTAINERS:
+        assert f"✓ {container} healthy" in proc.stdout, proc.stdout
+        assert f"✓ {container} лимит памяти 1 GiB" in proc.stdout, proc.stdout
+    for service in ("sofascore_proxy_filter", "sofascore_gw_history", "sofascore_gw_players"):
+        assert f"✓ {service} /health отвечает" in proc.stdout, proc.stdout
+    for unit, container in (
+        ("sofascore-gw-lease-watchdog.service", "sofascore_gw_951"),
+        ("sofascore-gw-lease-watchdog-history.service", "sofascore_gw_history"),
+        ("sofascore-gw-lease-watchdog-players.service", "sofascore_gw_players"),
+    ):
+        assert f"✓ {unit} active" in proc.stdout, proc.stdout
+        assert f"✓ {unit} --container {container}" in proc.stdout, proc.stdout
+    for pool in ("ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"):
+        assert f"✓ пул {pool} slots=1" in proc.stdout, proc.stdout
 
 
 @pytest.mark.unit
@@ -393,18 +591,46 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
         lambda s, g: s.__setitem__("/opt/airflow/scripts", "/old/release-deadbeef/scripts"),
         lambda s, g: s.pop("/opt/airflow/docker"),
         lambda s, g: s.__setitem__("/opt/airflow/dags/dag_trigger_sofascore_daily.py", "/old/runtime/dag.py"),
-        lambda s, g: g.__setitem__("/opt/sofascore-repo", "/old/release-deadbeef"),
+        lambda s, g: g["sofascore_gw_951"].__setitem__("/opt/sofascore-repo", "/old/release-deadbeef"),
         lambda s, g: s.__setitem__("/opt/airflow/extra", "/old/release-deadbeef/scripts"),
-        lambda s, g: g.__setitem__("/opt/airflow/proxys-extra.txt", "/old/runtime/proxys.txt"),
+        lambda s, g: g["sofascore_gw_951"].__setitem__("/opt/airflow/proxys-extra.txt", "/old/runtime/proxys.txt"),
+        lambda s, g: g["sofascore_gw_history"].__setitem__("/opt/sofascore-repo", "/old/release-deadbeef"),
+        lambda s, g: g["sofascore_gw_players"].__setitem__(
+            "/opt/airflow/logs/sofascore_proxy_filter",
+            g["sofascore_gw_951"]["/opt/airflow/logs/sofascore_proxy_filter"],
+        ),
+        lambda s, g: g.pop("sofascore_gw_players"),
     ],
     ids=[
         "old-tree-mount", "missing-mount", "stale-mini-dag-file-bind", "gateway-old-tree",
         "scheduler-extra-bind-elsewhere", "gateway-extra-bind",
+        "history-gateway-old-tree", "players-gateway-shares-state-dir", "players-gateway-missing",
     ],
 )
 def test_postdeploy_fails_on_a_wrong_missing_or_extra_mount(tmp_path: Path, mutate) -> None:
-    scheduler, gateway = _expected_mounts(tmp_path)
-    mutate(scheduler, gateway)
-    proc = _run_postdeploy(tmp_path, scheduler, gateway)
+    scheduler, gateways = _expected_mounts(tmp_path)
+    mutate(scheduler, gateways)
+    proc = _run_postdeploy(tmp_path, scheduler, gateways)
     assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "ПРИЁМКА: 1 проблем" in proc.stdout, proc.stdout
+    assert "ПРИЁМКА: " in proc.stdout and "ПРИЁМКА: ок" not in proc.stdout, proc.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "watchdogs",
+    [
+        {"WD_HISTORY_CONTAINER": "sofascore_gw_951"},
+        {"WD_PLAYERS_STATE": "/runtime/gateway-state"},
+        {"WD_MAIN_STATE": "/runtime/gateway-state-history"},
+    ],
+    ids=["history-watchdog-guards-the-refresh-gateway", "players-watchdog-on-shared-state", "main-watchdog-on-history-state"],
+)
+def test_postdeploy_fails_when_a_watchdog_guards_the_wrong_lane(
+    tmp_path: Path, watchdogs: dict[str, str]
+) -> None:
+    # Сторож может быть active и стоять на верном дереве, но освобождать аренду
+    # чужого шлюза по чужому WAL — приёмка обязана это ловить.
+    scheduler, gateways = _expected_mounts(tmp_path)
+    proc = _run_postdeploy(tmp_path, scheduler, gateways, watchdogs=watchdogs)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ПРИЁМКА: ок" not in proc.stdout, proc.stdout
