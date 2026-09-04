@@ -130,6 +130,7 @@ if [ "$rc" = 0 ] || [ -e "$S/deploy_half" ]; then
   echo "created-new" > "$S/created"
   echo "2026-09-03T03:40:00.000000000Z" > "$S/started"
   cat "$S/wd_pid_new" > "$S/wd_pid"
+  [ -e "$S/deploy_eats_artifact_id" ] && sed -i '/^SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=/d' "$SOFASCORE_ENV_FILE"
   echo t > "$S/paused_dag_backfill_sofascore_all_mens"
   # Половинчатый выкат: scheduler уехал на новое дерево, шлюзы остались на старом.
   [ -e "$S/deploy_half" ] || printf '%s\\n' "$new" > "$S/mounts_root"
@@ -289,7 +290,7 @@ case "$1" in
       dags)
         case "$5" in
           pause) echo t > "$S/paused_$6" ;;
-          unpause) echo f > "$S/paused_$6" ;;
+          unpause) [ -e "$S/unpause_fails" ] || echo f > "$S/paused_$6" ;;
         esac ;;
     esac
     exit 0 ;;
@@ -746,6 +747,75 @@ def test_an_interrupted_delivery_that_moved_production_is_rolled_back(stand: Sta
     assert len(stand.calls("compose")) == 2, stand.calls("compose")
     assert not (stand.state / "sofascore-inflight").exists()
     assert "⛔" in stand.pending()
+
+
+@pytest.mark.unit
+def test_an_interrupted_delivery_before_the_containers_still_puts_the_env_file_back(stand: Stand) -> None:
+    """Ревью Sol, раунд 1. deploy.sh перепинивает env-файл ДО пересоздания контейнеров.
+    Обрыв ровно в этой щели оставляет env на новом дереве при контейнерах на старом, и
+    раньше автомат просто снимал маркер: следующий тик читал HEAD уже НОВОГО дерева, видел
+    совпадение с master, писал маркер приёмки без единой проверки и молча выходил нулём
+    каждые пять минут — контур навсегда оставался смешанным."""
+    (stand.state / "sofascore-inflight").touch()
+    (stand.state / "sofascore-rollback.env").write_text(
+        f"OLD_RELEASE_ROOT={stand.old_tree}\nNEW_RELEASE_ROOT={stand.new_tree}\n"
+        f"OLD_ARTIFACT_HOST={stand.runtime}/artifacts/old/workload_policy.json\n"
+        f"OLD_ARTIFACT_ID=cafebabe\nHIST_PAUSED=f\nREFRESH_PAUSED=f\n"
+        + "".join(f"POOL_{p}=1\n" for p in POOLS),
+        encoding="utf-8",
+    )
+    # Так выглядит контур после обрыва: env уже на новом дереве, контейнеры — ещё на старом.
+    stand.env_file.write_text(
+        stand.env_file.read_text(encoding="utf-8")
+        .replace(f"SOFASCORE_RELEASE_ROOT={stand.old_tree}", f"SOFASCORE_RELEASE_ROOT={stand.new_tree}")
+        .replace("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=cafebabe", "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=deadbeef"),
+        encoding="utf-8",
+    )
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert stand.env_value("SOFASCORE_RELEASE_ROOT") == str(stand.old_tree)
+    assert stand.env_value("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID") == "cafebabe"
+    assert not stand.calls("compose"), "контейнеры не трогали — их и не надо пересоздавать"
+    assert not (stand.state / "sofascore-inflight").exists()
+    assert "env-файл вернул к снимку" in stand.log_text()
+
+
+@pytest.mark.unit
+def test_a_delivery_that_leaves_the_campaign_paused_is_not_reported_as_success(stand: Stand) -> None:
+    """Ревью Sol, раунд 1. deploy.sh штатно оставляет историю на паузе; вернуть её —
+    единственное, ради чего автомат и заведён. Раньше неудача возврата писала
+    MANUAL ACTION REQUIRED в лог, а наружу всё равно уходило ✅ — прямое «зелёное, но
+    пустое»: код в бою, приёмка сошлась, кампания стоит до утра."""
+    stand.watchdog_pids()
+    stand.put("unpause_fails")
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "🆘" in stand.pending() and "✅" not in stand.pending()
+    assert "контур не вернулся в рабочее состояние" in stand.pending()
+    assert HIST in stand.pending()
+    # Доставка всё-таки состоялась и принята — маркер приёмки честный, INFLIGHT закрыт.
+    assert (stand.state / "sofascore-accepted").read_text(encoding="utf-8").strip() == stand.new_sha
+    assert not (stand.state / "sofascore-inflight").exists()
+
+
+@pytest.mark.unit
+def test_a_rollback_checks_all_three_env_lines_against_the_file(stand: Stand) -> None:
+    """Ревью Sol, раунд 1. Сверялась одна строка из трёх, и сверялась по переменной
+    оболочки: sofascore_load_env снимает только ключи, которые есть в файле, поэтому
+    исчезнувшая строка оставляла в памяти прежнее значение и проверка её не видела. Старые
+    контейнеры поднялись бы с чужим артефактом бюджета, а приёмка env-файл не читает."""
+    stand.watchdog_pids()
+    stand.put("deploy_rc", "5")
+    stand.put("deploy_half")
+    stand.put("deploy_eats_artifact_id")
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ENV-ФАЙЛ НЕ ВЕРНУЛСЯ К СНИМКУ" in stand.log_text()
+    assert not stand.calls("compose"), "без вернувшегося env пересоздавать контейнеры нельзя"
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
+    assert (stand.state / "sofascore-inflight").exists()
 
 
 @pytest.mark.unit

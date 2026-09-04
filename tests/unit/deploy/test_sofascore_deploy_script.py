@@ -91,9 +91,25 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
     _write(bin_dir / "chown", "#!/usr/bin/env bash\nexit 0\n", 0o755)
     # The script polls with sleep 10/60; the stub makes failure paths finish instantly.
     _write(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n", 0o755)
+    # Часы: `+%s` двигаются на 60 с за вызов, но только когда тест положил файл `clock` —
+    # так проверяется, что потолок ожидания считается по ЧАСАМ, а не по сумме sleep.
+    # Без этого файла время стоит, и остальные тесты остаются детерминированными.
     _write(
         bin_dir / "date",
-        '#!/usr/bin/env bash\ncase "$*" in *%H%M*) echo 0000 ;; *) echo 2026-01-01T00:00:00Z ;; esac\n',
+        f"""\
+        #!/usr/bin/env bash
+        STATE="{state_dir}"
+        case "$*" in
+          *%H%M*) echo 0000 ;;
+          *%s*)
+            if [ -e "$STATE/clock" ]; then
+              n=$(cat "$STATE/clock"); n=$(( n + 60 )); echo "$n" > "$STATE/clock"; echo "$n"
+            else
+              echo 1767225600
+            fi ;;
+          *) echo 2026-01-01T00:00:00Z ;;
+        esac
+        """,
         0o755,
     )
     _write(
@@ -515,6 +531,33 @@ def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Pat
     log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
     assert "FAILED at step 'drain'" in log
     assert "nothing deployed" in log
+
+
+@pytest.mark.unit
+def test_the_idle_ceiling_counts_wall_clock_not_the_sum_of_sleeps(tmp_path: Path) -> None:
+    """Ревью Sol, раунд 1. Каждый виток ожидания делает ДВА запроса к метабазе с таймаутом
+    до SOFASCORE_DEPLOY_METADB_TIMEOUT секунд каждый. Пока потолок уменьшался «на 30 за
+    виток», на недоступной метабазе 5400 с превращались почти в 4,5 часа — то есть выкат
+    всё равно съедал бы всё окно ночной доставки. Часы идут по 60 с за обращение: при
+    потолке 100 с честный счёт даёт не больше двух витков, счёт по sleep дал бы четыре."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    (state_dir / "busy").write_text("1\n")
+    (state_dir / "clock").write_text("1767225600\n")
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": "100",
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    waits = [a for a, *_ in _calls(state_dir) if "task_instance" in a]
+    assert 1 <= len(waits) <= 2, waits
+    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
+    assert "contour still busy after 100s" in log
 
 
 @pytest.mark.unit

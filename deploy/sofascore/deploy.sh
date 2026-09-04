@@ -71,14 +71,22 @@ set_pool() {  # set_pool <name> <slots> <description>
 HISTORY_SLOTS="${SOFASCORE_HISTORY_POOL_SLOTS:-1}"
 PLAYERS_SLOTS="${SOFASCORE_PLAYERS_POOL_SLOTS:-1}"
 wait_idle() {  # wait_idle <секунд>; 0 — контур свободен, 1 — потолок исчерпан
-  local left="$1" busy active
+  # Потолок держится по ЧАСАМ, а не по сумме sleep: каждая итерация делает два запроса к
+  # метабазе с таймаутом до SOFASCORE_DEPLOY_METADB_TIMEOUT секунд каждый, и на недоступной
+  # метабазе счётчик «минус 30 за виток» растянул бы 5400 с почти на 4,5 часа. Витки тоже
+  # ограничены: часы могут стоять (заглушка стенда, съехавший NTP), и тогда без этого
+  # предела цикл стал бы вечным.
+  local deadline tries busy active
+  deadline=$(( $(date -u +%s) + $1 ))
+  tries=$(( $1 / 30 + 1 ))
   while :; do
     # Пустой ответ (метабаза недоступна / timeout) — это «не знаю», а не «свободно».
     busy=$($PSQL "SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');" || true)
     active=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');" || true)
     [ "${busy:-x}" = "0" ] && [ "${active:-x}" = "0" ] && return 0
-    [ "$left" -le 0 ] && return 1
-    left=$(( left - 30 ))
+    tries=$(( tries - 1 ))
+    [ "$tries" -le 0 ] && return 1
+    [ "$(date -u +%s)" -ge "$deadline" ] && return 1
     sleep 30
   done
 }

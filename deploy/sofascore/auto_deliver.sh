@@ -213,12 +213,20 @@ inspect(){ timeout -k 5 30 docker inspect "$@" 2>/dev/null; }
 # --- снимок боя (цель отката) ---------------------------------------------------------
 snap_get(){ sed -n "s/^$1=//p" "$SNAPSHOT" 2>/dev/null | head -1; }
 RESTORE_PENDING=""
+RESTORE_NOTE=""
+ROLLBACK_NOTE=""
 # С момента снимка и до выхода: вернуть паузы и слоты пулов к тому, что было. Это
 # закрывает и штатный след deploy.sh (после выката история остаётся на паузе), и любой
 # аварийный обрыв автомата.
+#
+# Возвращает 1, если хоть что-то не вернулось, и складывает причины в RESTORE_NOTE.
+# Игнорировать это нельзя: доставка, после которой история осталась на паузе, — это
+# «зелёно, но пусто». Код в бою, приёмка сошлась, а кампания стоит до утра, ровно то,
+# ради чего автомат и заведён.
 restore_state(){
   [ -n "$RESTORE_PENDING" ] || return 0
   RESTORE_PENDING=""
+  RESTORE_NOTE=""
   local pool want desc
   for pool in $POOLS; do
     want=$(snap_get "POOL_$pool")
@@ -228,18 +236,23 @@ restore_state(){
       sofascore_history_pool) desc='SofaScore history lane' ;;
       *) desc='SofaScore players lane' ;;
     esac
-    sched airflow pools set "$pool" "$want" "$desc" \
-      || log "MANUAL ACTION REQUIRED: пул $pool не вернулся к $want слотам"
+    if ! sched airflow pools set "$pool" "$want" "$desc"; then
+      RESTORE_NOTE="$RESTORE_NOTE пул $pool не вернулся к $want слотам;"
+      log "MANUAL ACTION REQUIRED: пул $pool не вернулся к $want слотам"
+    fi
   done
   restore_pause "$HIST" "$(snap_get HIST_PAUSED)"
   restore_pause "$REFRESH" "$(snap_get REFRESH_PAUSED)"
+  [ -z "$RESTORE_NOTE" ]
 }
 restore_pause(){  # restore_pause <dag_id> <t|f>
   local dag="$1" want="$2" now
   case "$want" in t) sched airflow dags pause "$dag" ;; f) sched airflow dags unpause "$dag" ;; *) return 0 ;; esac
   now=$(metadb "SELECT is_paused FROM dag WHERE dag_id='$dag';")
   [ "$now" = "$want" ] && { log "$dag: пауза вернулась к '$want'"; return 0; }
+  RESTORE_NOTE="$RESTORE_NOTE $dag остался в состоянии paused='$now' вместо '$want';"
   log "MANUAL ACTION REQUIRED: $dag paused='$now', ожидалось '$want'"
+  return 1
 }
 trap restore_state EXIT
 
@@ -301,29 +314,58 @@ acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt sched
 }
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
 
+# Единственный источник истины о бое — env-файл контура; deploy.sh перепинывает его ДО
+# пересоздания контейнеров, поэтому обрыв между этими шагами оставляет env на новом дереве
+# при контейнерах на старом. Возврат трёх строк — первый шаг любого отката, и он всегда
+# сверяется перечитыванием: без сверки корня «откат» пересоздал бы контейнеры обратно на
+# НОВОЕ дерево, то есть доставил бы; без сверки артефакта старые контейнеры поднялись бы с
+# чужим или пустым бюджетом, а приёмка env-файл не читает и такого не заметила бы.
+env_file_value(){ sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -1; }
+repin_env_to_old(){  # repin_env_to_old <старое дерево>
+  local old="$1" root host id
+  sofascore_set_env_var "$ENV_FILE" SOFASCORE_RELEASE_ROOT "$old"
+  sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST "$(snap_get OLD_ARTIFACT_HOST)"
+  sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_ID "$(snap_get OLD_ARTIFACT_ID)"
+  sofascore_load_env "$ENV_FILE"
+  # Сверяемся с ФАЙЛОМ, а не с переменными оболочки: sofascore_load_env снимает только те
+  # ключи, что есть в файле, поэтому ИСЧЕЗНУВШАЯ строка оставила бы в памяти прежнее
+  # значение и проверка прошла бы на устаревших данных, ничего не заметив.
+  root=$(env_file_value SOFASCORE_RELEASE_ROOT)
+  host=$(env_file_value SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST)
+  id=$(env_file_value SOFASCORE_PROXY_BUDGET_ARTIFACT_ID)
+  if [ "$root" = "$old" ] \
+     && [ "$host" = "$(snap_get OLD_ARTIFACT_HOST)" ] \
+     && [ "$id" = "$(snap_get OLD_ARTIFACT_ID)" ]; then
+    return 0
+  fi
+  log "ENV-ФАЙЛ НЕ ВЕРНУЛСЯ К СНИМКУ (корень='$root', артефакт='$host', id='$id') — контейнеры не трогаю"
+  return 1
+}
+
 # --- откат комплектом -------------------------------------------------------------------
 # Best-effort: шаги выполняются, даже если предыдущий не удался. Исход решается ТОЛЬКО
 # подтверждением теми же шестью признаками против старого дерева, а не кодами возврата.
 rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt scheduler'а до отката>
-  local old="$1" started_before="$2" c left seen
+  local old="$1" started_before="$2" c left seen tries deadline busy_now
   set +e
   # Улики до отката: --force-recreate сносит контейнеры вместе с логами.
   for c in "$SCHED" $GATEWAY_CONTAINERS; do
     echo "--- docker logs $c --tail 200 ---" >> "$LOG"
     timeout -k 5 60 docker logs "$c" --tail 200 >> "$LOG" 2>&1
   done
-  sofascore_set_env_var "$ENV_FILE" SOFASCORE_RELEASE_ROOT "$old"
-  sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST "$(snap_get OLD_ARTIFACT_HOST)"
-  sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_ID "$(snap_get OLD_ARTIFACT_ID)"
-  sofascore_load_env "$ENV_FILE"
-  if [ "${SOFASCORE_RELEASE_ROOT:-}" != "$old" ]; then
-    log "ОТКАТ ОСТАНОВЛЕН: env-файл не вернулся на $old — контейнеры не трогаю"
-    return 1
-  fi
+  repin_env_to_old "$old" || return 1
   # Пересоздание scheduler'а обрывает любой идущий таск: второй раз за ночь этого делать
-  # нельзя без проверки, что контур снова свободен.
+  # нельзя не глядя. Ждём освобождения контура, но НЕ бесконечно: бой, оставшийся на
+  # непринятом дереве, хуже оборванного прогона. Если ждать не дождались — откатываем всё
+  # равно и говорим об этом в алерте, а не молчим.
+  ROLLBACK_NOTE=""
   left=$(( ${ROLLBACK_IDLE_WAIT:-300} ))
   while [ "$left" -gt 0 ] && [ "$(contour_busy)" != 0 ]; do sleep 30; left=$(( left - 30 )); done
+  busy_now=$(contour_busy)
+  if [ "$busy_now" != 0 ]; then
+    ROLLBACK_NOTE=" ВНИМАНИЕ: откат пересоздавал контейнеры при непустом контуре (dag_run в работе: '$busy_now') — идущий прогон дейли/актуалки/обслуживания оборван, его трафик оплачен впустую."
+    log "ОТКАТ ПРИ ЗАНЯТОМ КОНТУРЕ (dag_run: '$busy_now') — идущий прогон будет оборван"
+  fi
   SOFASCORE_RELEASE_ROOT="$old" \
   SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST="$(snap_get OLD_ARTIFACT_HOST)" \
   SOFASCORE_PROXY_BUDGET_ARTIFACT_ID="$(snap_get OLD_ARTIFACT_ID)" \
@@ -342,12 +384,15 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
     timeout -k 5 60 systemctl restart "$c" >> "$LOG" 2>&1
   done <<< "$WATCHDOG_UNITS"
   restore_state
-  left=$ACCEPT_WAIT
+  deadline=$(( $(date -u +%s) + ACCEPT_WAIT ))
+  tries=$(( ACCEPT_WAIT / ACCEPT_POLL + 1 ))
   while :; do
     seen=$(acceptance_rollback "$old" "$started_before")
     [ "$seen" = 1 ] && return 0
-    [ "$left" -le 0 ] && break
-    sleep "$ACCEPT_POLL"; left=$(( left - ACCEPT_POLL ))
+    tries=$(( tries - 1 ))
+    [ "$tries" -le 0 ] && break
+    [ "$(date -u +%s)" -ge "$deadline" ] && break
+    sleep "$ACCEPT_POLL"
   done
   return 1
 }
@@ -463,15 +508,25 @@ if is_plain "$INFLIGHT"; then
     [ "$(mounts_in "$c" "$OLD" "$want")" = 1 ] || on_old=0
   done
   if [ "$on_old" = 1 ]; then
-    log "НЕЗАКРЫТАЯ ДОСТАВКА, но бой целиком на $OLD — откат не нужен"
-    tg_durable "⚠️ SofaScore: прошлая доставка оборвалась на середине, но бой целиком остался на прежнем дереве ($OLD) — откатывать нечего. Следующая попытка — в ближайшее окно. Лог: $LOG"
+    # Контейнеры не пересоздавали — но deploy.sh перепинивает env ДО них, и обрыв ровно в
+    # этой щели оставляет env на новом дереве при контейнерах на старом. Не вернуть три
+    # строки — значит оставить контур смешанным навсегда: следующий тик увидел бы
+    # HEAD($SOFASCORE_RELEASE_ROOT) == master, записал бы маркер приёмки без единой
+    # проверки и молча выходил бы нулём каждые пять минут.
+    if ! repin_env_to_old "$OLD"; then
+      tg_durable "🆘 SofaScore: прошлая доставка оборвалась до пересоздания контейнеров (бой на $OLD), но вернуть env-файл к снимку не удалось — контур остался бы смешанным: файл говорит одно, контейнеры смонтированы с другого дерева. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+      set_off
+      exit 1
+    fi
+    log "НЕЗАКРЫТАЯ ДОСТАВКА, но бой целиком на $OLD — контейнеры не трогаю, env возвращён к снимку"
+    tg_durable "⚠️ SofaScore: прошлая доставка оборвалась на середине, но бой целиком остался на прежнем дереве ($OLD) — контейнеры не трогал, env-файл вернул к снимку. Следующая попытка — в ближайшее окно. Лог: $LOG"
     rm -f "$INFLIGHT"
     exit 1
   fi
   log "НЕЗАКРЫТАЯ ДОСТАВКА и бой не на $OLD — откатываю комплектом"
   started_before=$(inspect -f '{{.State.StartedAt}}' "$SCHED")
   if rollback_to_old "$OLD" "$started_before"; then
-    tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же). Следующая попытка — в ближайшее окно. Лог: $LOG"
+    tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}${RESTORE_NOTE:+ Не вернулось:$RESTORE_NOTE} Следующая попытка — в ближайшее окно. Лог: $LOG"
     rm -f "$INFLIGHT"
   else
     tg_durable "🆘 SofaScore: прошлая доставка оборвалась И откат на $OLD не подтверждён. НУЖНЫ РУКИ. Если шлюз не поднялся и после отката — смотреть формат $(dirname "$(snap_get OLD_ARTIFACT_HOST)")/../gateway-state*/sofascore_allocations.json: новый код мог переписать ledger так, что старый бинарь его не читает; процедурой это не лечится. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
@@ -664,7 +719,13 @@ fi
 
 # ---- 8. Приёмка ------------------------------------------------------------------------------
 # Привязка — к ФАКТУ пересоздания контейнера, а не к часам автомата.
-left=$ACCEPT_WAIT
+# Потолок ожидания держится по ЧАСАМ, а не по сумме sleep: один заход приёмки — это
+# десяток внешних вызовов с таймаутами 20–30 с каждый, и «минус ACCEPT_POLL за виток»
+# на деградировавшем docker/systemd вынес бы автомат далеко за конец окна, а в
+# воскресенье — за 05:00, прямо на обслуживание манифеста. Витки тоже ограничены:
+# остановившиеся часы иначе сделали бы цикл вечным.
+accept_deadline=$(( $(date -u +%s) + ACCEPT_WAIT ))
+accept_tries=$(( ACCEPT_WAIT / ACCEPT_POLL + 1 ))
 seen=0
 while [ "$rc" = 0 ]; do
   created=$(inspect -f '{{.Created}}' "$SCHED")
@@ -673,16 +734,28 @@ while [ "$rc" = 0 ]; do
     [ -n "$started" ] && seen=$(acceptance_seen "$NEW" "$started")
   fi
   [ "$seen" = 1 ] && break
-  [ "$left" -le 0 ] && break
-  log "приёмки пока нет (ответ '$seen'), жду ещё ${left}s"
-  sleep "$ACCEPT_POLL"; left=$(( left - ACCEPT_POLL ))
+  accept_tries=$(( accept_tries - 1 ))
+  [ "$accept_tries" -le 0 ] && break
+  [ "$(date -u +%s)" -ge "$accept_deadline" ] && break
+  log "приёмки пока нет (ответ '$seen'), жду ещё ${ACCEPT_POLL}s"
+  sleep "$ACCEPT_POLL"
 done
 
 if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   # ---- 9. Успех --------------------------------------------------------------------------
-  restore_state
+  restored=1
+  restore_state || restored=0
   printf '%s\n' "$WANT" > "$ACCEPTED" 2>/dev/null || log "маркер приёмки $ACCEPTED не записан"
   rm -f "$FAILNIGHTS"
+  # Код в бою и принят — но если контур не вернулся в рабочее состояние (история осталась
+  # на паузе, слот пула не восстановлен), это «зелёно, но пусто»: кампания простоит до
+  # утра, ровно то, ради чего автомат и заведён. Такой исход обязан звучать как авария.
+  if [ "$restored" != 1 ]; then
+    log "ДОСТАВЛЕНО, НО КОНТУР НЕ ВЕРНУЛСЯ В РАБОТУ:$RESTORE_NOTE"
+    tg_durable "🆘 SofaScore: код ${WANT:0:8} доставлен и приёмка сошлась, НО контур не вернулся в рабочее состояние —$RESTORE_NOTE Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Лог: $LOG"
+    rm -f "$INFLIGHT"
+    exit 1
+  fi
   extra=""
   n=$( { ls -d "$RELEASES_DIR"/release-* 2>/dev/null || true; } | grep -c . )
   orphans=$( { ls -d "$RELEASES_DIR"/freeze.* 2>/dev/null || true; } | grep -c . )
@@ -705,7 +778,7 @@ fails=$(( ${fails:-0} + 1 ))
 { printf '%s\n' "$fails" > "$FAILNIGHTS"; } 2>/dev/null || fails=$FAIL_NIGHTS_MAX
 if rollback_to_old "$OLD" "$started_before"; then
   log "ОТКАТ ПОДТВЕРЖДЁН: бой на $OLD"
-  msg="⛔ SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён теми же шестью признаками. Ночь $fails из $FAIL_NIGHTS_MAX подряд. Разбор: $LOG"
+  msg="⛔ SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён теми же шестью признаками.${ROLLBACK_NOTE}${RESTORE_NOTE:+ Не вернулось:$RESTORE_NOTE} Ночь $fails из $FAIL_NIGHTS_MAX подряд. Разбор: $LOG"
   if [ "$fails" -ge "$FAIL_NIGHTS_MAX" ]; then
     msg="$msg Больше не пробую — автомат заглушен, снять $OFF после разбора."
     set_off
@@ -714,7 +787,7 @@ if rollback_to_old "$OLD" "$started_before"; then
   rm -f "$INFLIGHT"
 else
   log "ОТКАТ НЕ ПОДТВЕРЖДЁН — глушу автомат, маркер доставки оставляю"
-  tg_durable "🆘 SofaScore: доставка ${WANT:0:8} провалилась (rc=$rc) И откат на $OLD не подтверждён. НУЖНЫ РУКИ. Если шлюз не поднялся и после отката — смотреть формат sofascore_allocations.json в каталогах состояния полос: новый код мог переписать ledger так, что старый бинарь его не читает, и процедурой отката это не лечится. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+  tg_durable "🆘 SofaScore: доставка ${WANT:0:8} провалилась (rc=$rc) И откат на $OLD не подтверждён.${ROLLBACK_NOTE}${RESTORE_NOTE:+ Не вернулось:$RESTORE_NOTE} НУЖНЫ РУКИ. Если шлюз не поднялся и после отката — смотреть формат sofascore_allocations.json в каталогах состояния полос: новый код мог переписать ledger так, что старый бинарь его не читает, и процедурой отката это не лечится. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
   set_off
 fi
 exit 1
