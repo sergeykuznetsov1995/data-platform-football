@@ -698,6 +698,9 @@ class SofascoreLeaseClient:
                 "dag_ingest_sofascore",
                 "dag_backfill_sofascore_all_mens",
                 "dag_refresh_sofascore_all_mens",
+                # The players lane (#1244) buys profiles on its own gateway
+                # under the same signed-plan contract as the other lanes.
+                "dag_players_sofascore_all_mens",
             )
             if source == "sofascore"
             else ("dag_canary_sofascore_proxy",)

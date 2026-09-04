@@ -15,12 +15,14 @@
 | Платные шлюзы полос (3 шт.) | `deploy/sofascore/gateway.compose.yaml` | `sofascore-gw` (`sofascore_gw_951` с алиасом сервиса `sofascore_proxy_filter`, `sofascore_gw_history`, `sofascore_gw_players` в сети `sofascore-net`) | всё дерево релиза в `/opt/sofascore-repo:ro`; артефакт и fallback-файл общие, WAL/ledger — свой каталог у каждого |
 | Блок-лист DagBag | `deploy/sofascore/.airflowignore` | накрывает `dags/.airflowignore` внутри scheduler'а | — |
 | Мини-DAG контура | `dags/dag_trigger_sofascore_daily.py`, `dags/dag_sofascore_manifest_maintenance.py` | обычные файлы `dags/`; на общем scheduler'е спрятаны через `dags/.airflowignore` | — |
+| Полоса профилей | `dags/dag_players_sofascore_all_mens.py` | там же; на общем scheduler'е и в изоляте FotMob спрятана блок-листами | — |
 | Сторожа аренд (3 шт.) | `deploy/sofascore/gateway_lease_watchdog.py` + `systemd/sofascore-gw-lease-watchdog{,-history,-players}.service` | одноимённые unit'ы, все читают `/etc/data-platform/sofascore.env` | — |
 | Ротация | `freeze_release.sh` → `deploy.sh` → `postdeploy_checks.sh` | — | — |
 | Переменные | `deploy/sofascore/sofascore.env.example` → `/etc/data-platform/sofascore.env` | второй `--env-file` после общего `.env` платформы | — |
 
-Активны в контуре ровно пять DAG: `dag_ingest_sofascore`, `dag_backfill_sofascore_all_mens`,
-`dag_refresh_sofascore_all_mens`, `dag_trigger_sofascore_daily` (14:00 UTC, триггер
+Активны в контуре ровно шесть DAG: `dag_ingest_sofascore`, `dag_backfill_sofascore_all_mens`,
+`dag_refresh_sofascore_all_mens`, `dag_players_sofascore_all_mens` (полоса профилей,
+07/12/17/22 UTC), `dag_trigger_sofascore_daily` (14:00 UTC, триггер
 ежедневника), `dag_sofascore_manifest_maintenance` (воскресенье 05:00 UTC). Остальные
 файлы `dags/` блок-лист не пускает в DagBag (движок RE2, lookahead не работает —
 поэтому блок-лист, а не allow-list).
@@ -36,7 +38,7 @@ reached` почти на каждом запуске истории (03.09 за 
 | --- | --- | --- | --- |
 | Актуалка + дейли | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ |
 | Кампания истории | `sofascore_gw_history` / `sofascore_gw_history` | `sofascore_history_pool` | 2000 МБ |
-| Профили игроков | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
+| Профили игроков (`dag_players_sofascore_all_mens`) | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
 
 Сумма дневных потолков — труба источника, 3 ГБ/сутки. Потолок и число активных аренд у
 каждой полосы — переменные окружения (`SOFASCORE_{PROXY,HISTORY_GW,PLAYERS_GW}_{DAILY_BUDGET_MB,
@@ -47,6 +49,87 @@ MAX_ACTIVE_LEASES}`), слоты пулов — `SOFASCORE_{HISTORY,PLAYERS}_POO
 `gateway-state-history`, `gateway-state-players`): WAL и ledger рассчитаны на
 единственного писателя. Артефакт бюджета, пул прокси и токен контрольной плоскости —
 общие: runtime-контракт у трёх шлюзов один.
+
+### Полоса профилей игроков (`dag_players_sofascore_all_mens`, #1244)
+
+**Расписание — `0 7,12,17,22 * * *` UTC при `dagrun_timeout` 4 ч 30 мин.** Прогоны
+занимают 07:00–11:30, 12:00–16:30, 17:00–21:30 и 22:00–02:30 UTC и **конструктивно** не
+пересекают окно ночной доставки 03:30–06:00 (вс. до 04:45): `deploy.sh` пересоздаёт
+scheduler под LocalExecutor и оборвал бы скоуп на середине, потеряв уже оплаченный
+трафик. Запас — час до окна и час после. Это проверяется тестом-арифметикой по
+константам модуля; `@continuous` отвергнут именно поэтому. Второй линией защиты
+`deploy.sh` осушает `sofascore_players_pool` в шаге `drain` и ждёт задачи полосы, а
+`contour_busy` автомата откладывает тик, если идёт ручной прогон.
+
+**Очередь.** Кандидаты — закрытые скоупы кампании истории (`state.json`: туда скоуп
+попадает, только когда все матчи турнира-сезона закоммичены в bronze — ровно то, чего
+требует фаза `players`), минус собственный `players-state.json`, минус 15 включённых лиг
+реестра (их профили собирает недельная ротация дейли; манифест профиля ключуется парой
+«турнир + сезон», поэтому полоса покупала бы их второй раз). Порядок — новейшие сезоны
+первыми. Пропускная способность — до 3 скоупов за прогон, до 12 в сутки; это ниже
+скорости пополнения очереди историей (15–18/сутки) и является сознательной платой за
+безопасное расписание. Разгон — только тройкой ручек вместе
+(`SOFASCORE_PLAYERS_POOL_SLOTS`, `SOFASCORE_PLAYERS_MAX_ACTIVE_TASKS`,
+`SOFASCORE_PLAYERS_GW_MAX_ACTIVE_LEASES`); поднять одну из трёх — вернуть 429-шторм.
+
+**Свои файлы состояния** (внутри уже смонтированного `all-men`, нового монта нет):
+`players-state.json` (засчитанные скоупы), `players-failures.json` (память отказов:
+3 попытки, остывание 24 ч), `players-results/` (результаты скоупов).
+
+**`deferred`** в результате скоупа — это «ещё рано», а не поломка: матчи сезона
+дособраны не полностью. Платного трафика не было, задача зелёная, скоуп уходит в память
+отказов и вернётся после остывания. «Потерянный универс игроков» (матчи финишировали, а
+игроков нет) остаётся жёстким провалом.
+
+**Аварийная остановка без выката:** пауза DAG полосы + осушение пула
+(`airflow pools set sofascore_players_pool 0 'stopped'`). Идущий скоуп доработает вместе
+со своим `validate` и будет зачтён; новые не стартуют.
+
+**Приёмка полосы (воспроизводимо).** База на 04.09.2026 до выката: `rows_campaign = 0`
+при 27 037 строках профилей по 8 лигам реестра.
+
+```bash
+# 0. ПЕРВЫЙ ВЫКАТ: полоса приезжает ЗАПАУЩЕННОЙ (is_paused_upon_creation=True) и сама
+#    никогда не стартует — ни deploy.sh, ни автомат её не распаузивают намеренно, чтобы
+#    платный трафик не пошёл без присмотра. Снять паузу руками, вне окна доставки:
+docker exec sofascore-airflow-scheduler airflow dags unpause dag_players_sofascore_all_mens
+# 1. Убедиться, что распаузилась (ждём f|t):
+docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT is_paused, is_active FROM dag WHERE dag_id='dag_players_sofascore_all_mens';"
+# 2. Функциональный критерий: строки по турнирам кампании появились (было 0):
+~/.claude/bin/trino-ro.sh "SELECT count(*) AS rows_campaign, count(DISTINCT player_id) AS players_campaign \
+  FROM iceberg.bronze.sofascore_player_profile WHERE league LIKE 'SS-%'"
+~/.claude/bin/trino-ro.sh "SELECT count(*) FROM iceberg.bronze.sofascore_player_season_stats WHERE league LIKE 'SS-%'"
+# 3. Ни одного 429 в результатах полосы и расход шлюза против потолка 400 МБ.
+#    ВАЖНО: ошибка захвата лежит НЕ в верхнеуровневом players-results/<safe_run>.json
+#    (там только status/exit_code цикла), а в players-results/<safe_run>/players.json.
+#    Сначала убедиться, что файлы вообще есть, иначе ноль совпадений — ложный:
+ls -1 "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/*/players.json | wc -l     # >0
+grep -rl 'concurrency limit reached' \
+  "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/ | wc -l                       # ждём 0
+python3 -c "import json;d=json.load(open('$SOFASCORE_PLAYERS_GW_STATE_HOST_DIR/bytes.json'));print(d)"
+# 4. История и актуалка не замедлились. Считать НЕ только состояния прогонов, но и
+#    длительность самих скоупов — до и после снятия паузы с полосы (подставить момент
+#    распаузивания вместо <CUTOVER>): доля зелёных, число скоупов в сутки и медиана
+#    длительности должны остаться прежними.
+docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT ti.dag_id, ti.task_id, ti.start_date < TIMESTAMPTZ '<CUTOVER>' AS before_lane, \
+          count(*) AS scopes, count(*) FILTER (WHERE ti.state='success') AS green, \
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (ti.end_date-ti.start_date))/60)::numeric, 1) AS median_min \
+     FROM task_instance ti \
+    WHERE ti.task_id IN ('run_historical_scope','run_refresh_scope') \
+      AND ti.start_date > TIMESTAMPTZ '<CUTOVER>' - interval '24 hours' \
+      AND ti.start_date < TIMESTAMPTZ '<CUTOVER>' + interval '24 hours' \
+      AND ti.end_date IS NOT NULL \
+    GROUP BY 1,2,3 ORDER BY 1,2,3;"
+# 4b. Полоса не пересекается с окном доставки: ни один прогон полосы не идёт в 03:30-06:00 UTC
+docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT run_id, start_date, end_date FROM dag_run WHERE dag_id='dag_players_sofascore_all_mens' \
+      AND (start_date, coalesce(end_date, now())) OVERLAPS \
+          (date_trunc('day', start_date) + interval '3 hours 30 minutes', date_trunc('day', start_date) + interval '6 hours');"
+# 5. Очередь полосы растёт:
+python3 -c "import json;print(len(json.load(open('$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR/players-state.json'))['completed']))"
+```
 
 ## Единый источник истины
 
@@ -139,7 +222,8 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    состояния кампании (только если `state.json` ещё нет); `sofascore_runtime_preflight.py
    preflight`; перепин трёх строк в `sofascore.env`; `up -d --no-deps --force-recreate`
    scheduler'а и шлюза; ожидание healthy (10 мин), `scheduler-health`, `import_error=0`,
-   ровно три активных core-DAG; история остаётся на паузе, актуалка возвращается в
+   все core-DAG активны (число считается из списка `CORE_DAGS` в самом скрипте);
+   история остаётся на паузе, актуалка возвращается в
    прежнее состояние; `systemctl restart` сторожа. Любой аварийный выход после паузы
    (preflight, compose, healthcheck, DAG-и) возвращает актуалку И слоты
    `sofascore_history_pool` (шаг `pools` стоит после health-проверок, до него выкат может
@@ -149,12 +233,18 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 3. `bash deploy/sofascore/postdeploy_checks.sh` — только чтение, код выхода 1 при любой
    несошедшейся проверке: healthy и память шлюза, env кампании, точные пары
    «destination → source» всех монтов scheduler'а и шлюза (и ни одного лишнего монта
-   поверх `dags/`), `import_error=0`, пять активных DAG контура, состояние кампании, пин
+   поверх `dags/`), `import_error=0`, шесть активных DAG контура, состояние кампании, пин
    и статус сторожа (`systemctl show -p ExecStart`), `/health` шлюза.
 
 Всегда `--no-deps`: без него `depends_on` пересоздаст `airflow-init` (см.
 `/root/SHARED-STACK-PROTOCOL.md`). Общий compose-проект `data-platform` эти команды не
 трогают — у контура свои проекты.
+
+**Новый DAG приезжает ЗАПАУЩЕННЫМ** (`is_paused_upon_creation=True`) и сам не стартует
+никогда: ни `deploy.sh`, ни автомат его не распаузивают — платный трафик не должен идти
+без присмотра. После первой доставки такого DAG снять паузу руками вне окна доставки и
+посмотреть первый прогон; для полосы профилей это шаг 0 её приёмки — раздел
+«Полоса профилей игроков» выше, подраздел «Приёмка полосы».
 
 ## Ночная доставка (автомат, #1245)
 
@@ -171,6 +261,12 @@ install -d -m 0755 "$SOFASCORE_AUTO_STATE_DIR"     # автомат его НЕ 
 : > "$SOFASCORE_AUTO_STATE_DIR/sofascore-auto-deliver.off"   # взвести выключатель на время проверки
 ( crontab -l 2>/dev/null; echo '*/5 * * * * /usr/local/libexec/sofascore/auto_deliver.sh' ) | crontab -
 ```
+
+> **Порядок при добавлении DAG в контур — строго такой: сначала доставка нового дерева,
+> потом переустановка `auto_deliver.sh`.** Приёмку делает УСТАНОВЛЕННАЯ копия автомата, а
+> `deploy.sh` едет вместе с деревом. Старая копия (знает N имён) примет дерево с N+1 DAG
+> штатно; новая копия (ждёт N+1) против старого дерева (N) не сойдётся ни разу и откатит
+> корректную доставку. Переустанавливать — вне окна, взведя `.off`, после успешной ночи.
 
 Пять новых ключей в `/etc/data-platform/sofascore.env` — `SOFASCORE_AUTO_STATE_DIR`,
 `SOFASCORE_AUTO_LOG`, `SOFASCORE_TG_ENV`, `SOFASCORE_METADB_CONTAINER`,
@@ -195,7 +291,7 @@ install -d -m 0755 "$SOFASCORE_AUTO_STATE_DIR"     # автомат его НЕ 
 дерева → снимок боя → `deploy.sh` под `setsid`+`timeout` → приёмка → успех либо откат.
 
 **Приёмка** — шесть признаков подряд, все привязаны к факту пересоздания контейнера
-(`.Created` изменился), а не к часам автомата: пять DAG контура активны, без ошибок
+(`.Created` изменился), а не к часам автомата: шесть DAG контура активны, без ошибок
 импорта и перечитаны после `.State.StartedAt` нового scheduler'а; `import_error = 0`;
 три шлюза `healthy`, `HostConfig.Memory = 1 GiB` и метка `com.docker.compose.project =
 sofascore-gw`; монты scheduler'а И трёх шлюзов ведут в новое дерево; слоты трёх пулов

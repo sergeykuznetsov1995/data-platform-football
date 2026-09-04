@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 
@@ -38,6 +39,13 @@ POOLS = ("ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_poo
 GATEWAYS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
 SCHEDULER = "sofascore-airflow-scheduler"
 METADB = "sofascore-airflow-metadb"
+# Список core-DAG читается из самого скрипта: стенд не должен уметь
+# рассинхронизироваться с ним — ровно та ошибка, которую ловит тест ниже.
+CORE_DAGS = tuple(
+    re.search(r'^CORE_DAGS="([^"]+)"', AUTO.read_text(encoding="utf-8"), re.M)
+    .group(1)
+    .split()
+)
 # Четверг 03:30 UTC — середина окна доставки; воскресенье того же формата — для сдвига.
 THU_0330 = "2026-09-03 03:30:00"
 SUN_0330 = "2026-09-06 03:30:00"
@@ -192,7 +200,7 @@ exit "$rc"
         self.put("started", "2026-09-03T00:00:00.000000000Z")
         self.put("mounts_root", str(self.old_tree))
         self.put("mounts_sched_root", str(self.old_tree))
-        self.put("dags", "5")
+        self.put("dags", str(len(CORE_DAGS)))
         self.put("import_error", "0")
         self.put("busy", "0")
         self.put("gw_health", "healthy")
@@ -1093,3 +1101,33 @@ def test_an_unreachable_master_still_announces_the_closing_window(stand: Stand) 
     first = stand.pending()
     stand.run()
     assert stand.pending() == first
+
+
+@pytest.mark.unit
+def test_the_acceptance_dag_count_is_derived_from_the_core_dag_list() -> None:
+    """Рассинхрон списка и числа — самая дорогая ошибка этого скрипта.
+
+    Литерал рядом со списком забывают обновить первым же новым DAG, и тогда
+    приёмка не сходится НИ ОДНОЙ ночи: зелёная доставка откатывается, а на
+    третью ночь автомат глушит себя маркером .off.
+    """
+
+    text = AUTO.read_text(encoding="utf-8")
+
+    assert "dag_players_sofascore_all_mens" in CORE_DAGS
+    assert re.search(r"^CORE_DAGS_N=", text, re.M), "число core-DAG не выводится"
+    # Ни одного сравнения счётчика DAG с числом-литералом.
+    assert not re.search(r'\[\s*"\$dags"\s*=\s*"?\d', text)
+
+
+@pytest.mark.unit
+def test_a_running_players_scope_postpones_the_delivery_tick() -> None:
+    """Расписание полосы окно не пересекает, но ручной прогон может: тик
+    доставки должен подождать, а не быть оборванным пересозданием scheduler'а."""
+
+    text = AUTO.read_text(encoding="utf-8")
+    busy = text.split("contour_busy(){", 1)[1].split("\n}\n", 1)[0]
+
+    assert "'$PLAYERS'" in busy
+    # Историю сюда по-прежнему НЕ включаем: ею занимается шаг drain в deploy.sh.
+    assert "'$HIST'" not in busy

@@ -8,6 +8,7 @@ import pytest
 
 from dags.scripts.prepare_sofascore_workload import (
     CompetitionSeason,
+    PlayerEvidenceNotReady,
     _observed_player_ids,
     _parse_rotation_boundary,
     main as prepare_main,
@@ -657,7 +658,7 @@ def test_players_phase_rereads_fresh_match_universe_then_signs_all_players(
     observed_probe.assert_called_once_with("ENG-Premier League", "2526")
 
 
-def _players_phase_without_a_universe(tmp_path, matches):
+def _players_phase_without_a_universe(tmp_path, matches, pending=()):
     """Plan the players phase for a league nobody can be captured for."""
     patches = _common_patches(_season_plan())
     with (
@@ -679,7 +680,7 @@ def _players_phase_without_a_universe(tmp_path, matches):
         ),
         patch(
             "dags.scripts.prepare_sofascore_workload._pending_targets",
-            return_value=(),
+            return_value=pending,
         ),
     ):
         return prepare_workload_plan(
@@ -1614,3 +1615,145 @@ def test_non_due_leagues_cost_no_trino_or_squad_read(
     assert {call.args[0] for call in observed_probe.call_args_list} == expected
     # Season raw is not even inspected for a league nobody will capture.
     assert season_probe.call_count == len(expected)
+
+
+@pytest.mark.unit
+def test_pending_matches_defer_the_players_phase_instead_of_breaking_it(
+    tmp_path, monkeypatch
+):
+    """A lane whose queue runs ahead of the match capture meets this daily."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(PlayerEvidenceNotReady, match="players cannot be planned"):
+        _players_phase_without_a_universe(tmp_path, matches={"7"}, pending=("7",))
+
+
+@pytest.mark.unit
+def test_a_lost_player_universe_is_never_deferred(tmp_path, monkeypatch):
+    """Finished matches with nobody in them is lost evidence, not a wait."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(RuntimeError) as caught:
+        _players_phase_without_a_universe(tmp_path, matches={"7"})
+
+    assert "player universe is empty" in str(caught.value)
+    assert not isinstance(caught.value, PlayerEvidenceNotReady)
+
+
+@pytest.mark.unit
+def test_dropping_every_partition_is_a_wait_for_players_and_a_failure_elsewhere(
+    tmp_path, monkeypatch, capsys
+):
+    """One tournament-season per plan makes ANY drop look like a total one."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(PlayerEvidenceNotReady, match="every SofaScore partition"):
+        _two_league_plan(
+            tmp_path,
+            "players",
+            [SeasonPlanningError("first"), SeasonPlanningError("second")],
+            capsys,
+        )
+
+    with pytest.raises(RuntimeError) as caught:
+        _two_league_plan(
+            tmp_path,
+            "targets",
+            [SeasonPlanningError("first"), SeasonPlanningError("second")],
+            capsys,
+        )
+    assert not isinstance(caught.value, PlayerEvidenceNotReady)
+
+
+@pytest.mark.unit
+def test_the_players_lane_plan_is_accepted_by_the_real_runner_loader(
+    tmp_path, monkeypatch
+):
+    """Урок №60: оба конца шва сходятся на НАСТОЯЩЕМ подписанном плане.
+
+    Позитивные тесты фазы игроков мокают и планировщик, и раннер, поэтому путь
+    «план фазы players → подпись → загрузка раннером под dag_id полосы →
+    непустые player-allocations» целиком не исполнялся ни разу. Здесь план
+    строится по-настоящему и предъявляется настоящему загрузчику раннера.
+    """
+
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_players_sofascore_all_mens")
+    monkeypatch.setenv("SOFASCORE_RUN_ID", "players-run-1")
+    from dags.scripts import run_sofascore_scope_cycle as cycle
+    from dags.scripts.run_sofascore_scraper import _load_runtime_workload_plan
+
+    patches = _common_patches(_season_plan())
+    registered = {str(value) for value in range(1, 54)}
+    seen = {}
+
+    def capture(argv):
+        """Настоящий загрузчик плана раннера на том argv, который собрал цикл."""
+
+        options = {
+            name: argv[index + 1]
+            for index, name in enumerate(argv)
+            if name.startswith("--")
+            and index + 1 < len(argv)
+            and not argv[index + 1].startswith("--")
+        }
+        assert options["--entity"] == "player_capture", options
+        seen["loaded"] = _load_runtime_workload_plan(
+            options["--workload-plan"],
+            entity=options["--entity"],
+            league=options["--league"],
+            season=options["--season"],
+            offline_replay=False,
+        )
+        return 0
+
+    def pending(_runtime, ids, builder):
+        specs = builder(next(iter(ids))) if ids else ()
+        if specs and specs[0].key.endpoint in {"event", "lineups"}:
+            return ()
+        return tuple(sorted(ids, key=int))
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch(
+            "dags.scripts.prepare_sofascore_workload.squad_player_ids",
+            return_value=tuple(registered),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._observed_player_ids",
+            return_value={"98", "99"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value={"7"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            side_effect=pending,
+        ),
+    ):
+        with patch(
+            "dags.scripts.run_sofascore_scraper.main", side_effect=capture
+        ):
+            outcome = cycle.run_phase(
+                "players",
+                {
+                    "capture_key": "ENG-Premier League",
+                    "canonical_season": "2526",
+                    "run_id": "players-run-1",
+                    "dag_id": "dag_players_sofascore_all_mens",
+                },
+                output_dir=tmp_path / "run",
+                workload_artifact=tmp_path / "artifact.json",
+            )
+
+    assert outcome["status"] == "success"
+    plan, allocations = seen["loaded"]
+    assert plan.dag_id == "dag_players_sofascore_all_mens"
+    assert plan.run_id == "players-run-1::players"
+    assert allocations, "полоса получила бы пустой план и купила бы ноль профилей"
+    assert {item.scope for item in allocations} == {"player"}
+    assert sum(len(target_ids(item)) for item in allocations) == 55

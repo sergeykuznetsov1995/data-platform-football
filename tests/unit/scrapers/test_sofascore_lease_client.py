@@ -590,3 +590,53 @@ def test_control_token_is_required_and_never_taken_from_proxy_environment(
     monkeypatch.delenv("SOFASCORE_PROXY_CONTROL_TOKEN", raising=False)
     with pytest.raises(ValueError, match="CONTROL_TOKEN"):
         SofascoreLeaseClient("http://proxy_filter:8899")
+
+
+def test_the_players_lane_is_a_signed_production_lane_and_strangers_are_not():
+    plan, allocation = _plan(
+        dag_id="dag_players_sofascore_all_mens",
+        run_id="manual__all-men-players--7-96518::players",
+        task_id="capture_player_batch_00000",
+    )
+    session = _Session(_Response(
+        201,
+        _lease_payload(plan=plan, allocation=allocation),
+    ))
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN
+    )
+
+    lease = client.acquire(
+        max_bytes=4096,
+        ttl_seconds=3600,
+        dag_id="dag_players_sofascore_all_mens",
+        run_id=plan.run_id,
+        task_id=allocation.task_id,
+        workload_plan=plan,
+        allocation_id=allocation.allocation_id,
+        attempt_id="attempt-1",
+    )
+
+    assert lease.source == "sofascore"
+    assert session.calls[0][2]["json"]["dag_id"] == (
+        "dag_players_sofascore_all_mens"
+    )
+
+    # The list stays closed: an unknown dag_id is refused before any HTTP call.
+    stranger = _Session()
+    with pytest.raises(ValueError):
+        SofascoreLeaseClient(
+            "http://proxy_filter:8899",
+            session=stranger,
+            control_token=CONTROL_TOKEN,
+        ).acquire(
+            max_bytes=4096,
+            ttl_seconds=3600,
+            dag_id="dag_players_sofascore_someone_else",
+            run_id=plan.run_id,
+            task_id=allocation.task_id,
+            workload_plan=plan,
+            allocation_id=allocation.allocation_id,
+            attempt_id="attempt-1",
+        )
+    assert stranger.calls == []

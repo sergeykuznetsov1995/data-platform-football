@@ -14,6 +14,7 @@ from dags.utils.sofascore_all_mens_state import (
     env_int,
     mark_failed,
     plan_historical_batch,
+    plan_players_batch,
     plan_refresh_batch,
     read_failures,
 )
@@ -794,3 +795,129 @@ def test_env_int_fails_closed_on_an_invalid_knob(monkeypatch, raw):
 
     with pytest.raises(ValueError, match="SOFASCORE_TEST_KNOB"):
         env_int("SOFASCORE_TEST_KNOB", 8, 1, 64)
+
+
+def _closed_history_keys():
+    """Every scope of the fixture snapshot, as the history lane records them."""
+
+    return {
+        campaign_scope_key("campaign-test", tournament_id, season_id)
+        for tournament_id, season_id in (
+            (17, 1725), (17, 1724), (8, 825), (8, 824)
+        )
+    }
+
+
+@pytest.mark.unit
+def test_players_planner_walks_closed_scopes_newest_season_first():
+    planned = plan_players_batch(
+        _snapshot(), completed=_closed_history_keys(), batch_size=10
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825",
+        "campaign-test:17:1725",
+        "campaign-test:8:824",
+        "campaign-test:17:1724",
+    ]
+    assert planned[0]["SOFASCORE_CAMPAIGN_ACTION"] == "players"
+    assert planned[0]["SOFASCORE_CANONICAL_SEASON"] == "2526"
+    # One immutable plan per run_id on the gateway ledger.
+    assert len({item["SOFASCORE_SCOPE_RUN_ID"] for item in planned}) == 4
+
+
+@pytest.mark.unit
+def test_players_planner_never_replans_a_scope_it_already_captured():
+    planned = plan_players_batch(
+        _snapshot(),
+        completed=_closed_history_keys(),
+        players_completed={"campaign-test:8:825", "campaign-test:17:1725"},
+        batch_size=10,
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:824",
+        "campaign-test:17:1724",
+    ]
+
+
+@pytest.mark.unit
+def test_players_planner_leaves_the_registry_leagues_to_the_daily_rotation():
+    """The profile manifest is keyed by (tournament, season), not capture_key:
+    without this the lane would buy the daily ingest's profiles a second time."""
+
+    planned = plan_players_batch(
+        _snapshot(),
+        completed=_closed_history_keys(),
+        exclude_tournament_ids=(17,),
+        batch_size=10,
+    )
+
+    assert [item["SOFASCORE_TOURNAMENT_ID"] for item in planned] == ["8", "8"]
+
+
+@pytest.mark.unit
+def test_players_planner_parks_a_repeatedly_failing_scope_until_it_cools():
+    from datetime import datetime, timedelta, timezone
+
+    moment = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+    failures = {
+        "campaign-test:8:825": {
+            "count": 3,
+            "last_run_id": "manual-1",
+            "last_at": (moment - timedelta(hours=2)).isoformat(),
+        }
+    }
+
+    parked = plan_players_batch(
+        _snapshot(),
+        completed=_closed_history_keys(),
+        failures=failures,
+        max_scope_attempts=3,
+        moment=moment,
+        batch_size=10,
+    )
+    assert "campaign-test:8:825" not in [
+        item["SOFASCORE_SCOPE_KEY"] for item in parked
+    ]
+
+    cooled = plan_players_batch(
+        _snapshot(),
+        completed=_closed_history_keys(),
+        failures=failures,
+        max_scope_attempts=3,
+        moment=moment + timedelta(hours=23),
+        batch_size=10,
+    )
+    assert cooled[0]["SOFASCORE_SCOPE_KEY"] == "campaign-test:8:825"
+
+
+@pytest.mark.unit
+def test_players_planner_skips_a_key_the_snapshot_no_longer_knows(caplog):
+    """A rotated-out tournament must not take the whole phase down with it."""
+
+    completed = _closed_history_keys() | {
+        "campaign-test:999:99925", "campaign-other:8:825", "nonsense"
+    }
+
+    with caplog.at_level("WARNING"):
+        planned = plan_players_batch(
+            _snapshot(), completed=completed, batch_size=10
+        )
+
+    assert len(planned) == 4
+    assert "campaign-test:999:99925" in caplog.text
+    assert "nonsense" in caplog.text
+
+
+@pytest.mark.unit
+def test_players_planner_bounds_the_batch_and_refuses_a_bad_one():
+    planned = plan_players_batch(
+        _snapshot(), completed=_closed_history_keys(), batch_size=2
+    )
+    assert len(planned) == 2
+
+    with pytest.raises(CampaignPlanningError):
+        plan_players_batch(
+            _snapshot(), completed=_closed_history_keys(), batch_size=0
+        )

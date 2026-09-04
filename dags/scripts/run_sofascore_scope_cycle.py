@@ -25,6 +25,16 @@ from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
 )
 
 
+# The two mappings ARE the list of runnable phases: a phase exists exactly when
+# it names both a signed plan phase and the capture entity that spends it.
+PLAN_PHASES = {"season": "season", "matches": "targets", "players": "players"}
+CAPTURE_ENTITIES = {
+    "season": "all",
+    "matches": "match_capture",
+    "players": "player_capture",
+}
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
@@ -58,15 +68,15 @@ def run_phase(
     )
     from dags.scripts.run_sofascore_scraper import main as run_capture
 
-    if phase not in {"season", "matches"}:
-        raise ValueError("phase must be season or matches")
+    if phase not in PLAN_PHASES:
+        raise ValueError(f"phase must be one of {sorted(PLAN_PHASES)}")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     capture_key = str(scope["capture_key"])
     canonical = str(scope["canonical_season"])
     base_run_id = str(scope["run_id"])
-    plan_phase = "season" if phase == "season" else "targets"
-    entity = "all" if phase == "season" else "match_capture"
+    plan_phase = PLAN_PHASES[phase]
+    entity = CAPTURE_ENTITIES[phase]
     dag_id = str(scope.get("dag_id") or "dag_backfill_sofascore_all_mens")
     plan = prepare_workload_plan(
         dag_id=dag_id,
@@ -79,6 +89,12 @@ def run_phase(
         manifest_backend=str(scope.get("manifest_backend") or "trino"),
         force_replace=bool(scope.get("force_replace")),
         allow_inactive_season=True,
+        # The players lane's queue IS its rotation: one tournament-season per
+        # signed plan, planned only after its matches closed.  Without the
+        # force flag the weekly cohort of the daily ingest would silently drop
+        # the scope from the plan and the capture would fail on the missing
+        # partition instead.
+        players_force=True,
         season_freshness_key="final",
         season_evidence=str(scope.get("season_evidence") or "pages"),
     )
@@ -112,7 +128,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-snapshot-id", required=True)
     parser.add_argument("--expected-campaign-id", required=True)
     parser.add_argument(
-        "--phase", choices=("metadata", "season", "matches", "all"), default="all"
+        "--phase",
+        choices=("metadata", "season", "matches", "players", "all"),
+        default="all",
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output", required=True)
@@ -140,10 +158,17 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    from dags.scripts.prepare_sofascore_workload import PlayerEvidenceNotReady
+
     parser = _parser()
     args = parser.parse_args(argv)
     if args.season_evidence == "bronze" and args.phase != "matches":
         parser.error("--season-evidence bronze requires --phase matches")
+    if args.phase == "players" and args.allow_pending_season:
+        # Profiles need every match of the season committed to Bronze, and a
+        # season whose metadata is still pending cannot have that.  Refuse here
+        # instead of paying for a Trino round trip to learn the same thing.
+        parser.error("--phase players cannot use --allow-pending-season")
     output_dir = Path(args.output_dir).resolve()
     output = Path(args.output).resolve()
     result: dict[str, Any] = {"status": "running", "phases": [], "errors": []}
@@ -196,6 +221,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "metadata": (),
             "season": ("season",),
             "matches": ("matches",),
+            "players": ("players",),
+            # "all" deliberately stops at matches: player evidence is only
+            # plannable once every match of the season has committed Bronze,
+            # which is exactly what the matches phase is still doing.
             "all": ("season", "matches"),
         }[args.phase]
         for phase in phases:
@@ -211,6 +240,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _atomic_json(output, result)
                 return 1
         result["status"] = "success"
+        _atomic_json(output, result)
+        return 0
+    except PlayerEvidenceNotReady as exc:
+        # "Too early", not "broken": no paid traffic happened, so the scope is
+        # deferred and the task stays green.  The lane parks it in its failure
+        # memory and comes back after the cooldown.
+        result["status"] = "deferred"
+        result["deferral_reason"] = f"{type(exc).__name__}: {exc}"
         _atomic_json(output, result)
         return 0
     except Exception as exc:

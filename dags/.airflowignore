@@ -5,3 +5,6 @@
 # Изолированный контур накрывает этот файл своим deploy/sofascore/.airflowignore.
 ^dag_trigger_sofascore_daily\.py$
 ^dag_sofascore_manifest_maintenance\.py$
+# Полоса профилей игроков (#1244) — платный DAG изолированного контура: свой
+# шлюз, свой пул, свой сторож. Общему scheduler'у платформы её разбирать нечем.
+^dag_players_sofascore_all_mens\.py$

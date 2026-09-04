@@ -74,10 +74,11 @@ WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
 POOLS="ingest_scraper_pool sofascore_history_pool sofascore_players_pool"
-CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance"
+CORE_DAGS="dag_ingest_sofascore dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
+PLAYERS=dag_players_sofascore_all_mens
 MAINT=dag_sofascore_manifest_maintenance
 
 # Окно и потолки. Переопределяются из окружения только для стенда.
@@ -297,7 +298,7 @@ acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt sched
   dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
   errs=$(metadb "SELECT count(*) FROM import_error;")
   case "$dags$errs" in *X*) echo X; return ;; esac
-  [ "$dags" = 5 ] || { echo 0; return; }
+  [ "$dags" = "$CORE_DAGS_N" ] || { echo 0; return; }
   [ "$errs" = 0 ] || { echo 0; return; }
   # Три шлюза ОДНИМ вызовом: `docker inspect a b c` при отсутствии имени печатает только
   # найденные и отдаёт rc=1 — «нет контейнера» иначе было бы неотличимо от «упал docker».
@@ -335,6 +336,10 @@ acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt sched
   echo 1
 }
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
+# Число выводится ИЗ СПИСКА и НИКОГДА не пишется литералом рядом с ним: список
+# растёт, литерал забывают, и тогда приёмка не сходится ни одной ночи — зелёная
+# доставка откатывается, а на третью ночь автомат глушит себя маркером .off.
+CORE_DAGS_N=$(for d in $CORE_DAGS; do echo "$d"; done | wc -l)
 
 # Единственный источник истины о бое — env-файл контура; deploy.sh перепинывает его ДО
 # пересоздания контейнеров, поэтому обрыв между этими шагами оставляет env на новом дереве
@@ -456,7 +461,10 @@ acceptance_rollback(){
 }
 contour_busy(){
   # Историю сюда НЕ включаем: ею занимается шаг drain внутри deploy.sh.
-  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT') AND state IN ('queued','running');"
+  # Полосу игроков включаем: её расписание окно доставки не пересекает, но ручной
+  # прогон может — пусть тик доставки подождёт, а не будет оборван пересозданием
+  # scheduler'а на середине оплаченного скоупа.
+  metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$PLAYERS','$MAINT') AND state IN ('queued','running');"
 }
 
 # --- окно доставки ----------------------------------------------------------------------
@@ -620,7 +628,7 @@ if is_plain "$INFLIGHT"; then
       tg_durable "🆘 SofaScore: прошлая доставка оборвалась, откат на $OLD подтверждён, НО контур не вернулся в рабочее состояние —$RESTORE_NOTE${ROLLBACK_NOTE} Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
       set_off
     else
-      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE} Следующая попытка — в ближайшее окно. Лог: $LOG"
+      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (шесть DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE} Следующая попытка — в ближайшее окно. Лог: $LOG"
     fi
   else
     tg_durable "🆘 SofaScore: прошлая доставка оборвалась И откат на $OLD не подтверждён. НУЖНЫ РУКИ. Если шлюз не поднялся и после отката — смотреть формат $(dirname "$(snap_get OLD_ARTIFACT_HOST)")/../gateway-state*/sofascore_allocations.json: новый код мог переписать ledger так, что старый бинарь его не читает; процедурой это не лечится. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
@@ -678,7 +686,7 @@ if [ "$LIVE" = "$WANT" ]; then
     if [ "$seen" != 1 ]; then
       log "БОЙ НА MASTER, НО КОНТРАКТ ПРИЁМКИ НЕ СОШЁЛСЯ — маркер приёмки не выдаю"
       if ! said_today "$STATE/sofascore-contract-failed-$TODAY"; then
-        tg_durable "⚠️ SofaScore: бой стоит на master ($LIVE_ROOT), но контур не проходит контракт приёмки из шести признаков (пять DAG перечитаны и без ошибок импорта, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов в этом дереве, слоты пулов как ожидается, три сторожа на нём же). Маркер приёмки не выдаю, доставлять нечего. Разбор: $LOG"
+        tg_durable "⚠️ SofaScore: бой стоит на master ($LIVE_ROOT), но контур не проходит контракт приёмки из шести признаков (шесть DAG перечитаны и без ошибок импорта, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов в этом дереве, слоты пулов как ожидается, три сторожа на нём же). Маркер приёмки не выдаю, доставлять нечего. Разбор: $LOG"
         mark_said "$STATE/sofascore-contract-failed-$TODAY"
       fi
       exit 0
@@ -917,7 +925,7 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   log "ДОСТАВЛЕНО: $NEW (sha ${WANT:0:8}), артефакт ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}"
   # Маркер снимаем ПОСЛЕ гарантированной отправки: смерть между снятием и сообщением
   # оставила бы исход немым, а суточная защёлка — следующие тики молчаливыми.
-  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (пять DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s.${extra}"
+  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (шесть DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s.${extra}"
   rm -f "$INFLIGHT"
   exit 0
 fi
