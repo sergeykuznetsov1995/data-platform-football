@@ -89,15 +89,24 @@ scheduler под LocalExecutor и оборвал бы скоуп на серед
 при 27 037 строках профилей по 8 лигам реестра.
 
 ```bash
-# 1. Полоса распаущена и её прогоны идут (после ручного снятия паузы на шаге 5 выката):
+# 0. ПЕРВЫЙ ВЫКАТ: полоса приезжает ЗАПАУЩЕННОЙ (is_paused_upon_creation=True) и сама
+#    никогда не стартует — ни deploy.sh, ни автомат её не распаузивают намеренно, чтобы
+#    платный трафик не пошёл без присмотра. Снять паузу руками, вне окна доставки:
+docker exec sofascore-airflow-scheduler airflow dags unpause dag_players_sofascore_all_mens
+# 1. Убедиться, что распаузилась (ждём f|t):
 docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
   "SELECT is_paused, is_active FROM dag WHERE dag_id='dag_players_sofascore_all_mens';"
 # 2. Функциональный критерий: строки по турнирам кампании появились (было 0):
 ~/.claude/bin/trino-ro.sh "SELECT count(*) AS rows_campaign, count(DISTINCT player_id) AS players_campaign \
   FROM iceberg.bronze.sofascore_player_profile WHERE league LIKE 'SS-%'"
 ~/.claude/bin/trino-ro.sh "SELECT count(*) FROM iceberg.bronze.sofascore_player_season_stats WHERE league LIKE 'SS-%'"
-# 3. Ни одного 429 в результатах полосы и расход шлюза против потолка 400 МБ:
-grep -l 'concurrency limit reached' "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/*.json | wc -l   # ждём 0
+# 3. Ни одного 429 в результатах полосы и расход шлюза против потолка 400 МБ.
+#    ВАЖНО: ошибка захвата лежит НЕ в верхнеуровневом players-results/<safe_run>.json
+#    (там только status/exit_code цикла), а в players-results/<safe_run>/players.json.
+#    Сначала убедиться, что файлы вообще есть, иначе ноль совпадений — ложный:
+ls -1 "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/*/players.json | wc -l     # >0
+grep -rl 'concurrency limit reached' \
+  "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/ | wc -l                       # ждём 0
 python3 -c "import json;d=json.load(open('$SOFASCORE_PLAYERS_GW_STATE_HOST_DIR/bytes.json'));print(d)"
 # 4. История и актуалка не замедлились: успешные прогоны за сутки до и после выката
 docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
@@ -215,6 +224,11 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 Всегда `--no-deps`: без него `depends_on` пересоздаст `airflow-init` (см.
 `/root/SHARED-STACK-PROTOCOL.md`). Общий compose-проект `data-platform` эти команды не
 трогают — у контура свои проекты.
+
+**Новый DAG приезжает ЗАПАУЩЕННЫМ** (`is_paused_upon_creation=True`) и сам не стартует
+никогда: ни `deploy.sh`, ни автомат его не распаузивают — платный трафик не должен идти
+без присмотра. После первой доставки такого DAG снять паузу руками вне окна доставки и
+посмотреть первый прогон; для полосы профилей это шаг 0 её приёмки (см. ниже).
 
 ## Ночная доставка (автомат, #1245)
 

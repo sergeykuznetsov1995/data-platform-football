@@ -87,6 +87,8 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
           [ "$5" = pause ] && [ -e "$STATE/stale_on_pause_$6" ] && echo 1 > "$STATE/active"
           # scheduler-down simulation: `airflow dags unpause` fails once the flag exists
           [ "$5" = unpause ] && [ -e "$STATE/scheduler_down" ] && exit 1
+          # `airflow pools set <name>` fails while the flag for that pool exists
+          [ "$4" = pools ] && [ -e "$STATE/pool_set_fails_$6" ] && exit 1
           case "$5" in pause) echo t > "$STATE/paused_$6" ;; unpause) echo f > "$STATE/paused_$6" ;; esac
           exit 0
         fi
@@ -179,8 +181,12 @@ def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, P
     return runtime, release, env_file, state_dir
 
 
-def _run_deploy(tmp_path: Path, *, refresh_paused: str) -> tuple[subprocess.CompletedProcess, Path, Path, Path]:
+def _run_deploy(
+    tmp_path: Path, *, refresh_paused: str, state: dict[str, str] | None = None
+) -> tuple[subprocess.CompletedProcess, Path, Path, Path]:
     runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused=refresh_paused)
+    for name, value in (state or {}).items():
+        _write(state_dir / name, f"{value}\n")
     env = {
         **os.environ,
         "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
@@ -1018,3 +1024,31 @@ def test_the_core_dag_count_is_derived_from_the_list_in_both_recipes() -> None:
     assert "dag_players_sofascore_all_mens" in postdeploy
     assert "CONTOUR_DAGS_N=" in postdeploy
     assert not re.search(r'\[\s*"\$active"\s*=\s*"?\d', postdeploy)
+
+
+@pytest.mark.unit
+def test_a_failed_second_drain_still_gives_the_history_pool_its_slots_back(
+    tmp_path: Path,
+) -> None:
+    """Осушение идёт по двум пулам, и отказ на втором выходит по `set -e`.
+
+    Если флаг «пул осушён» ставится ПОСЛЕ обоих вызовов, on_exit не знает про уже
+    осушённую историю, и она остаётся с нулём слотов без единого сообщения.
+    """
+
+    proc, _release, _env_file, state_dir = _run_deploy(
+        tmp_path,
+        refresh_paused="f",
+        state={"pool_set_fails_sofascore_players_pool": "1"},
+    )
+
+    assert proc.returncode != 0
+    args = [call[0] for call in _calls(state_dir)]
+    pools = [
+        a.split()[5:7] for a in args
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
+    ]
+    assert ["sofascore_history_pool", "1"] in pools, pools
+    log = (tmp_path / "runtime" / "all-men" / "deploy.log").read_text(encoding="utf-8")
+    assert "sofascore_history_pool restored to 1 slots" in log
+    assert "MANUAL ACTION REQUIRED: sofascore_players_pool left drained" in log

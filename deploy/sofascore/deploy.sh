@@ -219,12 +219,15 @@ STEP="drain"
 REFRESH_WAS_PAUSED=$(is_paused "$REFRESH")
 HIST_WAS_PAUSED=$(is_paused "$HIST")
 log "drain: sofascore_history_pool -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
+# Флаг ставится ДО первого осушения: отказ на втором пуле выходит по `set -e`, и
+# on_exit обязан знать, что первый уже осушён, — иначе история осталась бы с нулём
+# слотов молча. Возврат пула, который осушить не удалось, безвреден (set идемпотентен).
+POOL_DRAINED=1
 set_pool sofascore_history_pool 0 'SofaScore history lane (drained for deploy)'
 # Полосу игроков паузить нельзя по той же причине, что и историю: под паузой не
 # отработает validate_players_scope, и оплаченный скоуп не будет засчитан.
 # Дверь новым скоупам закрывает пул, а взятый доработает вместе со своим validate.
 set_pool sofascore_players_pool 0 'SofaScore players lane (drained for deploy)'
-POOL_DRAINED=1
 pause_dag "$REFRESH"
 # Ждём прогон, который ДЕРЖИТ слот пула, а не любой активный: прогон, чей скоуп ещё не успел
 # взять слот, после осушения не сдвинется никогда (scheduled без слота), а прогон с пустым
