@@ -8,6 +8,7 @@ import pytest
 
 from dags.scripts.prepare_sofascore_workload import (
     CompetitionSeason,
+    PlayerEvidenceNotReady,
     _observed_player_ids,
     _parse_rotation_boundary,
     main as prepare_main,
@@ -657,7 +658,7 @@ def test_players_phase_rereads_fresh_match_universe_then_signs_all_players(
     observed_probe.assert_called_once_with("ENG-Premier League", "2526")
 
 
-def _players_phase_without_a_universe(tmp_path, matches):
+def _players_phase_without_a_universe(tmp_path, matches, pending=()):
     """Plan the players phase for a league nobody can be captured for."""
     patches = _common_patches(_season_plan())
     with (
@@ -679,7 +680,7 @@ def _players_phase_without_a_universe(tmp_path, matches):
         ),
         patch(
             "dags.scripts.prepare_sofascore_workload._pending_targets",
-            return_value=(),
+            return_value=pending,
         ),
     ):
         return prepare_workload_plan(
@@ -1614,3 +1615,51 @@ def test_non_due_leagues_cost_no_trino_or_squad_read(
     assert {call.args[0] for call in observed_probe.call_args_list} == expected
     # Season raw is not even inspected for a league nobody will capture.
     assert season_probe.call_count == len(expected)
+
+
+@pytest.mark.unit
+def test_pending_matches_defer_the_players_phase_instead_of_breaking_it(
+    tmp_path, monkeypatch
+):
+    """A lane whose queue runs ahead of the match capture meets this daily."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(PlayerEvidenceNotReady, match="players cannot be planned"):
+        _players_phase_without_a_universe(tmp_path, matches={"7"}, pending=("7",))
+
+
+@pytest.mark.unit
+def test_a_lost_player_universe_is_never_deferred(tmp_path, monkeypatch):
+    """Finished matches with nobody in them is lost evidence, not a wait."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(RuntimeError) as caught:
+        _players_phase_without_a_universe(tmp_path, matches={"7"})
+
+    assert "player universe is empty" in str(caught.value)
+    assert not isinstance(caught.value, PlayerEvidenceNotReady)
+
+
+@pytest.mark.unit
+def test_dropping_every_partition_is_a_wait_for_players_and_a_failure_elsewhere(
+    tmp_path, monkeypatch, capsys
+):
+    """One tournament-season per plan makes ANY drop look like a total one."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(PlayerEvidenceNotReady, match="every SofaScore partition"):
+        _two_league_plan(
+            tmp_path,
+            "players",
+            [SeasonPlanningError("first"), SeasonPlanningError("second")],
+            capsys,
+        )
+
+    with pytest.raises(RuntimeError) as caught:
+        _two_league_plan(
+            tmp_path,
+            "targets",
+            [SeasonPlanningError("first"), SeasonPlanningError("second")],
+            capsys,
+        )
+    assert not isinstance(caught.value, PlayerEvidenceNotReady)

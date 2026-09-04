@@ -158,6 +158,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    from dags.scripts.prepare_sofascore_workload import PlayerEvidenceNotReady
+
     parser = _parser()
     args = parser.parse_args(argv)
     if args.season_evidence == "bronze" and args.phase != "matches":
@@ -238,6 +240,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _atomic_json(output, result)
                 return 1
         result["status"] = "success"
+        _atomic_json(output, result)
+        return 0
+    except PlayerEvidenceNotReady as exc:
+        # "Too early", not "broken": no paid traffic happened, so the scope is
+        # deferred and the task stays green.  The lane parks it in its failure
+        # memory and comes back after the cooldown.
+        result["status"] = "deferred"
+        result["deferral_reason"] = f"{type(exc).__name__}: {exc}"
         _atomic_json(output, result)
         return 0
     except Exception as exc:

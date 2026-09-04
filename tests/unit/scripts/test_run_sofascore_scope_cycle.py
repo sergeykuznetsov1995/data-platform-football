@@ -287,3 +287,51 @@ def test_the_players_phase_refuses_a_pending_season(tmp_path, monkeypatch, capsy
     # The refusal must be the combination check, not argparse not knowing the
     # phase at all — otherwise this test would stay green after a rename.
     assert "cannot use --allow-pending-season" in capsys.readouterr().err
+
+
+def _raiser(exc):
+    def run_phase(phase, *_args, **_kwargs):
+        raise exc
+
+    return run_phase
+
+
+@pytest.mark.unit
+def test_a_scope_that_is_only_too_early_defers_green(tmp_path, monkeypatch):
+    from dags.scripts.prepare_sofascore_workload import PlayerEvidenceNotReady
+
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setattr(
+        cycle,
+        "run_phase",
+        _raiser(PlayerEvidenceNotReady("SS-17 match raw/manifest is incomplete")),
+    )
+    # No paid traffic happened, so this is not an incident: exit 0.
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "players")) == 0
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "deferred"
+    assert "PlayerEvidenceNotReady" in result["deferral_reason"]
+
+
+@pytest.mark.unit
+def test_a_lost_player_universe_still_fails_the_scope(tmp_path, monkeypatch):
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setattr(
+        cycle,
+        "run_phase",
+        _raiser(RuntimeError("SS-17 player universe is empty")),
+    )
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "players")) == 1
+    assert json.loads(
+        (tmp_path / "result.json").read_text()
+    )["status"] == "failed"
