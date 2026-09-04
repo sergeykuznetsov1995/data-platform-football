@@ -51,6 +51,23 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
               dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
               cat "$STATE/paused_$dag" ;;
             *"is_active=true"*) cat "$STATE/active_count" 2>/dev/null || echo 3 ;;
+            # run_id прогона истории, который держит слот пула ('-' — такого нет)
+            *"coalesce((SELECT run_id"*) cat "$STATE/hist_run" 2>/dev/null || echo - ;;
+            # Четыре числа шага drain. Третье считается ЧЕСТНО: отслеживаемым признаётся
+            # только тот run_id, который скрипт спросил, — иначе тест не отличил бы возврат
+            # к старому «считаем все прогоны истории».
+            *"run_id="*)
+              want=${{sql#*run_id=\\'}}; want=${{want%%\\'*}}
+              hist=0
+              if [ -n "$want" ] && [ "$want" = "$(cat "$STATE/hist_run" 2>/dev/null)" ] \\
+                 && [ -e "$STATE/hist_run_active" ]; then hist=1; fi
+              printf '%s|%s|%s|%s\\n' "$(cat "$STATE/active_dr" 2>/dev/null || echo 0)" \\
+                "$(cat "$STATE/busy" 2>/dev/null || echo 0)" "$hist" \\
+                "$(cat "$STATE/hist_busy" 2>/dev/null || echo 0)" ;;
+            # Прогон актуалки, замёрзший под паузой: планировщик его не двигает, поэтому
+            # ожидание, которое считает ЕГО, не кончится никогда.
+            *dag_run*"'dag_refresh_sofascore_all_mens'"*)
+              cat "$STATE/active_refresh" 2>/dev/null || cat "$STATE/active" 2>/dev/null || echo 0 ;;
             *task_instance*"state IN ("*) cat "$STATE/busy" 2>/dev/null || echo 0 ;;
             *dag_run*"state IN ("*) cat "$STATE/active" 2>/dev/null || echo 0 ;;
             *"count(*)"*) echo 0 ;;
@@ -607,6 +624,88 @@ def test_deploy_drains_the_pool_before_pausing_history_and_never_unpauses_it(tmp
     assert drain < first_wait < pause_hist < first_compose, args
     assert pause_refresh < first_wait, args
     assert f"unpause {HIST}" not in "\n".join(args), args
+
+
+@pytest.mark.unit
+def test_drain_waits_for_the_tracked_history_run_not_for_an_empty_contour(tmp_path: Path) -> None:
+    """Ревью Sol, раунд 3, находка №1. История идёт @continuous: как только отслеживаемый
+    прогон кончается, планировщик почти мгновенно (замер 04.09: медиана 26 с) создаёт
+    следующий, и с осушённым пулом тот остаётся running навсегда — run_historical_scope
+    вечно scheduled. Условие «прогонов истории нет» достижимо ровно один раз, в промежутке
+    ~26 с при опросе раз в 30 с: монетка, промах — rc=4 и ночь без доставки. Ждать надо
+    завершения ИМЕННО того прогона, который работал на входе; новый пустой закрывает
+    close_stale_runs после паузы."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    tracked = "scheduled__2026-09-04T03:31:00+00:00"
+    (state_dir / "hist_run").write_text(f"{tracked}\n")   # прогон, который шёл на входе...
+    # ...он уже закончился (флага hist_run_active нет), а сменщик создан и висит running
+    (state_dir / "active").write_text("1\n")
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": "60",
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    waits = [a for a in args if "run_id=" in a]
+    assert waits, args
+    assert f"run_id='{tracked}'" in waits[0], waits[0]
+    assert [a for a in args if a.startswith("compose ")], "выкат обязан состояться, а не уйти в rc=4"
+    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
+    assert f"ждём прогон истории '{tracked}'" in log, log
+
+
+@pytest.mark.unit
+def test_drain_refuses_to_start_when_the_metadb_cannot_name_the_history_run(tmp_path: Path) -> None:
+    """Пустой ответ на «какой прогон истории сейчас работает» — это «не знаю», а не «его
+    нет»: выкатывать вслепую значит оборвать оплаченный скоуп. Код 4 — «контур занят, выкат
+    не начат», бой не тронут. `|| true` на этом чтении обязателен и по второй причине: без
+    него отказ метабазы под `set -e` вышел бы кодом timeout (124), а для автомата ночной
+    доставки 124 — это «таймаут доставки», то есть полный откат боя, которого не было."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    (state_dir / "hist_run").write_text("")   # метабаза не ответила
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    assert not [a for a in args if a.startswith("compose ")], args
+    assert f"SOFASCORE_RELEASE_ROOT={release}" not in env_file.read_text(encoding="utf-8")
+    assert (state_dir / f"paused_{HIST}").read_text().strip() == "f"
+    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
+    assert "метабаза не ответила про идущий прогон истории" in log, log
+
+
+@pytest.mark.unit
+def test_a_refresh_run_frozen_by_the_pause_does_not_block_the_deploy(tmp_path: Path) -> None:
+    """Тот же класс, что находка №1, только на соседнем DAG. Пауза не даёт планировщику
+    двигать прогон (03.09 так замёрз прогон истории, и его закрывали руками), поэтому ждать
+    ЗАКРЫТИЯ прогона актуалки, которую этот же шаг только что запаузил, значит ждать до
+    потолка и уйти в rc=4. Ждём её ЗАДАЧ — именно их обрывает пересоздание, — а сам прогон
+    доработает, когда шаг restore-pause вернёт актуалку в работу."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    (state_dir / "active_refresh").write_text("1\n")   # прогон актуалки идёт с 00:30 UTC
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": "60",
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    assert [a for a in args if a.startswith("compose ")], "замёрзший прогон актуалки не повод не выкатывать"
+    assert (state_dir / f"paused_{REFRESH}").read_text().strip() == "f", "актуалка возвращена в работу"
 
 
 @pytest.mark.unit

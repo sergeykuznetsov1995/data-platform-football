@@ -2,7 +2,9 @@
 # Выкат замороженного дерева на контур SofaScore (проекты sofascore-airflow / sofascore-gw).
 # Использование: bash deploy/sofascore/deploy.sh <release-root> [old-release-root]
 # Предпосылки: окно вне 13:55–15:35 UTC;
-#   обе кампании (история и актуалка) ставятся на паузу и ждут idle здесь же,
+#   шаг drain осушает пул истории, паузит актуалку и ждёт завершения того прогона истории,
+#   который работал на входе (история при этом остаётся распаущенной — иначе не отработает
+#   validate_historical_scope и оплаченный скоуп не будет засчитан);
 #   актуалка после выката возвращается в прежнее состояние.
 # Переменные — из $SOFASCORE_ENV_FILE (по умолчанию /etc/data-platform/sofascore.env);
 #   скрипт сам переписывает в нём SOFASCORE_RELEASE_ROOT / _PROXY_BUDGET_ARTIFACT_HOST / _ID —
@@ -76,13 +78,16 @@ wait_idle() {  # wait_idle <секунд>; 0 — контур свободен, 
   # метабазе счётчик «минус 30 за виток» растянул бы 5400 с почти на 4,5 часа. Витки тоже
   # ограничены: часы могут стоять (заглушка стенда, съехавший NTP), и тогда без этого
   # предела цикл стал бы вечным.
+  # Прогонов АКТУАЛКИ здесь нет намеренно: к этому моменту она на паузе, а прогон паузного
+  # DAG планировщик не двигает — терминального состояния он не получит, и ждать его значит
+  # ждать до потолка. Её задачи в счёте остаются: именно их обрывает пересоздание.
   local deadline tries busy active
   deadline=$(( $(date -u +%s) + $1 ))
   tries=$(( $1 / 30 + 1 ))
   while :; do
     # Пустой ответ (метабаза недоступна / timeout) — это «не знаю», а не «свободно».
     busy=$($PSQL "SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');" || true)
-    active=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');" || true)
+    active=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$HIST') AND state IN ('queued','running');" || true)
     [ "${busy:-x}" = "0" ] && [ "${active:-x}" = "0" ] && return 0
     tries=$(( tries - 1 ))
     [ "$tries" -le 0 ] && return 1
@@ -90,6 +95,36 @@ wait_idle() {  # wait_idle <секунд>; 0 — контур свободен, 
     sleep 30
     # Ещё раз ПОСЛЕ сна и ДО нового витка: иначе, перешагнув потолок во сне, цикл успел бы
     # начать новую пару запросов с таймаутами по 30 с каждый и выйти за него на целый виток.
+    [ "$(date -u +%s)" -ge "$deadline" ] && return 1
+  done
+}
+# Ожидание шага drain. Ждать «в контуре нет прогонов истории» нельзя: история идёт
+# @continuous, и как только отслеживаемый прогон кончается, планировщик почти мгновенно
+# (замер 04.09: медиана 26 с) создаёт следующий, а с осушённым пулом тот остаётся running
+# навсегда — его run_historical_scope вечно scheduled. Ждём завершения ИМЕННО того прогона,
+# который работал на входе.
+# Актуалка к этому моменту на паузе, а прогон запаущенного DAG планировщик не двигает
+# (DagModel.is_paused == false в next_dagruns_to_examine), терминального состояния он уже не
+# получит — поэтому по ней ждём отсутствия ЗАДАЧ, а не закрытия прогона. Задачи доработают,
+# сам прогон продолжится, когда шаг restore-pause вернёт актуалку в работу.
+DRAIN_ROW=""
+wait_drained() {  # wait_drained <секунд> <run_id прогона истории>; 0 — контур осушён, 1 — потолок
+  local deadline tries
+  deadline=$(( $(date -u +%s) + $1 ))
+  tries=$(( $1 / 30 + 1 ))
+  while :; do
+    # Одним запросом, четыре числа: прогоны дейли; задачи дейли и актуалки; отслеживаемый
+    # прогон истории; задачи истории — последнее закрывает окно, когда у нового прогона успел
+    # стартовать plan_historical_batch. Одним, а не четырьмя: рваное чтение показало бы контур
+    # свободным по числам из разных моментов. Пустой ответ (метабаза недоступна / timeout) —
+    # это «не знаю», а не «свободно».
+    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$2' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running'));" || true)
+    [ "${DRAIN_ROW:-x}" = "0|0|0|0" ] && return 0
+    tries=$(( tries - 1 ))
+    [ "$tries" -le 0 ] && return 1
+    [ "$(date -u +%s)" -ge "$deadline" ] && return 1
+    sleep 30
+    # Ещё раз ПОСЛЕ сна и ДО нового витка — по той же причине, что в wait_idle.
     [ "$(date -u +%s)" -ge "$deadline" ] && return 1
   done
 }
@@ -175,7 +210,17 @@ log "drain: sofascore_history_pool -> 0 slots, pause $REFRESH (was paused=$REFRE
 set_pool sofascore_history_pool 0 'SofaScore history lane (drained for deploy)'
 POOL_DRAINED=1
 pause_dag "$REFRESH"
-wait_idle "$IDLE_WAIT" || { log "contour still busy after ${IDLE_WAIT}s — nothing deployed"; exit 4; }
+# Ждём прогон, который ДЕРЖИТ слот пула, а не любой активный: прогон, чей скоуп ещё не успел
+# взять слот, после осушения не сдвинется никогда (scheduled без слота), а прогон с пустым
+# планом уходит в 30-минутное охлаждение, которого ждать нечего — платного трафика в нём нет.
+# `|| true` обязателен: без него отказ метабазы под `set -e` вышел бы кодом timeout (124), а
+# для автомата 124 — это «таймаут доставки», то есть полный откат боя, которого не было.
+HIST_RUN=$($PSQL "SELECT coalesce((SELECT run_id FROM task_instance WHERE dag_id='$HIST' AND task_id='run_historical_scope' AND state IN ('queued','running') ORDER BY start_date NULLS LAST LIMIT 1),'-');" || true)
+[ -n "$HIST_RUN" ] || { log "метабаза не ответила про идущий прогон истории — nothing deployed"; exit 4; }
+[ "$HIST_RUN" = "-" ] && HIST_RUN=""
+log "drain: ждём прогон истории '${HIST_RUN:-нет работающего скоупа}'"
+wait_drained "$IDLE_WAIT" "$HIST_RUN" \
+  || { log "contour still busy after ${IDLE_WAIT}s (последний ответ '${DRAIN_ROW:-пусто}') — nothing deployed"; exit 4; }
 
 STEP="pause"
 pause_dag "$HIST"
