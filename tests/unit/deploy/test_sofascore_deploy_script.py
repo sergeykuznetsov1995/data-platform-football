@@ -108,9 +108,12 @@ def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, P
     for name in ("airflow.compose.yaml", "gateway.compose.yaml"):
         _write(release / "deploy" / "sofascore" / name, "services: {}\n")
     _write(runtime / "all-men" / "snapshot.json", "{}\n")
-    workspace = runtime / f"canary-{TAG}"
-    _write(workspace / "VERIFIED", "")
-    _write(workspace / "candidate.json", json.dumps({"runtime_fingerprint": {"digest": DIGEST}}))
+    # #1245: the budget artifact is the static policy shipped in the release
+    # tree; there is no canary workspace and no VERIFIED gate any more.
+    _write(
+        release / "configs" / "sofascore" / "workload_policy.json",
+        json.dumps({"schema_version": 4, "source": "sofascore"}),
+    )
     platform_env = _write(tmp_path / "platform.env", "TRINO_PORT=8443\n")
     env_file = _write(
         tmp_path / "sofascore.env",
@@ -165,7 +168,7 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
     proc, release, env_file, state_dir = _run_deploy(tmp_path, refresh_paused="f")
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    artifact_host = tmp_path / "runtime" / "artifacts" / DIGEST / "proxy_budget_canary.json"
+    artifact_host = tmp_path / "runtime" / "artifacts" / TAG / "workload_policy.json"
     assert artifact_host.is_file()
     artifact_id = subprocess.run(
         ["sha256sum", str(artifact_host)], capture_output=True, text=True, check=True
@@ -308,6 +311,53 @@ def test_deploy_refuses_a_state_layout_that_would_give_a_wal_two_writers(
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert reason in proc.stderr, proc.stderr
     assert not (state_dir / "calls.log").exists(), "ни одного вызова docker до отказа"
+
+
+@pytest.mark.unit
+def test_deploy_no_longer_gates_on_a_paid_canary_or_a_tree_digest(tmp_path: Path) -> None:
+    """#1245: no VERIFIED file, no candidate.json, no runtime-fingerprint compare."""
+
+    proc, _release, _env_file, state_dir = _run_deploy(tmp_path, refresh_paused="f")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    host_python_log = state_dir.parent / "stub-state" / "host-python.log"
+    calls = (
+        host_python_log.read_text(encoding="utf-8")
+        if host_python_log.exists()
+        else ""
+    )
+    assert "runtime_fingerprint" not in calls
+    assert not (tmp_path / "runtime" / f"canary-{TAG}").exists()
+    script = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
+    assert "VERIFIED" not in script
+    assert "candidate.json" not in script
+
+
+@pytest.mark.unit
+def test_deploy_refuses_a_release_tree_without_the_static_workload_policy(
+    tmp_path: Path,
+) -> None:
+    runtime, release, env_file, _state_dir = _layout(tmp_path, refresh_paused="f")
+    (release / "configs" / "sofascore" / "workload_policy.json").unlink()
+
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+            "SOFASCORE_ENV_FILE": str(env_file),
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "workload_policy.json" in proc.stderr
+    assert f"SOFASCORE_RELEASE_ROOT={release}" not in env_file.read_text(
+        encoding="utf-8"
+    )
+    assert not (runtime / "artifacts").exists()
 
 
 @pytest.mark.unit

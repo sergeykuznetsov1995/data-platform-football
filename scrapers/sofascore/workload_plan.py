@@ -38,16 +38,19 @@ from scrapers.sofascore.runtime_fingerprint import (
 
 
 WORKLOAD_ARTIFACT_SCHEMA_VERSION = 3
+# v4 is the static workload policy checked into git (#1245).  It declares the
+# same class shapes as the retired measurement artifact but carries no samples,
+# no runtime fingerprint and no "verified" flag: the paid spend is bounded by
+# the gateway's static ceilings (daily budget, lease size, DagRun cap) instead
+# of a four-hour paid canary that had to be re-run after every code change.
+WORKLOAD_POLICY_SCHEMA_VERSION = 4
 WORKLOAD_PLAN_SCHEMA_VERSION = 2
 ALLOCATION_LEDGER_SCHEMA_VERSION = 1
 WORKLOAD_BUDGET_DERIVATION = "max_observed_task_bytes_per_workload_class_v2"
+WORKLOAD_STATIC_BUDGET_DERIVATION = "static_workload_class_cap_v1"
 WORKLOAD_METER = "proxy_filter_provider_path_v2"
 MIN_COLD_SAMPLES_PER_CLASS = 20
 MIN_DISTINCT_EXITS_PER_CLASS = 5
-# A class measured on a single tournament describes that tournament only; two
-# independent tournaments are the minimum evidence that the shape - and not the
-# league behind it - drives the measured bytes.
-MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER = 2
 MATCH_BATCH_SIZE = 25
 PLAYER_BATCH_SIZE = 50
 # Byte-driving endpoint sets of the production capture.  They mirror
@@ -462,10 +465,13 @@ class WorkloadClassBudget:
     max_units: int
     hard_task_bytes: int
     required_endpoints: tuple[str, ...]
-    sample_count: int
-    distinct_proxy_exits: int
     shape_digest: str
-    measured_tournament_ids: tuple[str, ...]
+    # Measurement provenance of the retired canary artifact.  A static policy
+    # carries none of it; the fields survive only for the v3 reader that the
+    # separate FBref proxy runtime still imports.
+    sample_count: int = 0
+    distinct_proxy_exits: int = 0
+    measured_tournament_ids: tuple[str, ...] = ()
 
 
 # ``hard_task_bytes`` is the exact maximum of the canary's cold samples and the
@@ -501,14 +507,13 @@ class WorkloadBudgetPolicy:
         *,
         scope: str,
         units: int,
-        source_tournament_id: int | str,
         shape_digest: str,
     ) -> WorkloadClassBudget:
         try:
             policy = self.classes[name]
         except KeyError as exc:
             raise WorkloadPolicyUnavailable(
-                f"verified workload artifact has no class {name!r}"
+                f"workload policy has no class {name!r}"
             ) from exc
         if policy.scope != scope:
             raise WorkloadPolicyUnavailable(
@@ -516,18 +521,7 @@ class WorkloadBudgetPolicy:
             )
         if policy.shape_digest != _shape_digest_token(shape_digest):
             raise WorkloadPolicyUnavailable(
-                f"workload class {name!r} shape is not measured"
-            )
-        tournament = source_tournament_token(source_tournament_id)
-        if (
-            tournament not in policy.measured_tournament_ids
-            and len(policy.measured_tournament_ids)
-            < MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER
-        ):
-            raise WorkloadPolicyUnavailable(
-                f"workload class {name!r} is measured only for tournament "
-                f"{policy.measured_tournament_ids[0]!r} and cannot authorize "
-                f"tournament {tournament!r}"
+                f"workload class {name!r} shape is not declared"
             )
         if isinstance(units, bool) or not isinstance(units, int) or units < 1:
             raise WorkloadPlanError("allocation units must be a positive integer")
@@ -669,6 +663,133 @@ def _measured_tournament_ids(name: str, raw_class: Mapping[str, object]) -> tupl
             )
         measured.append(token)
     return tuple(sorted(measured, key=int))
+
+
+_STATIC_POLICY_FORBIDDEN_KEYS = (
+    "budget_multiplier",
+    "runtime_fingerprint",
+    "verified",
+)
+_STATIC_CLASS_FORBIDDEN_KEYS = (
+    "budget_multiplier",
+    "measured_tournament_ids",
+    "samples",
+)
+
+
+def load_static_workload_policy(
+    path: os.PathLike[str] | str,
+) -> WorkloadBudgetPolicy:
+    """Load the v4 static class ceilings that are checked into git.
+
+    Same class shapes and the same per-class hard cap as the retired v3
+    measurement artifact, but no cold samples, no runtime fingerprint and no
+    "verified" flag.  Editing scraper code therefore no longer invalidates the
+    paid budget; the spend is bounded by the gateway's static ceilings and by
+    the signed allocation of every task.  The returned ``artifact_id`` is still
+    the SHA-256 of the exact file, so plans, WAL and the allocation ledger keep
+    binding the gateway and the client to one policy.
+    """
+
+    policy_path = Path(path)
+    try:
+        raw = policy_path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkloadPolicyUnavailable(
+            f"invalid workload policy: {policy_path}"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise WorkloadPolicyUnavailable("workload policy must be an object")
+    if payload.get("schema_version") != WORKLOAD_POLICY_SCHEMA_VERSION:
+        raise WorkloadPolicyUnavailable(
+            "workload policy schema_version must be "
+            f"{WORKLOAD_POLICY_SCHEMA_VERSION}"
+        )
+    if payload.get("source") != "sofascore":
+        raise WorkloadPolicyUnavailable("workload policy source must be sofascore")
+    if payload.get("meter") != WORKLOAD_METER:
+        raise WorkloadPolicyUnavailable("workload policy uses an untrusted meter")
+    if payload.get("budget_derivation") != WORKLOAD_STATIC_BUDGET_DERIVATION:
+        raise WorkloadPolicyUnavailable(
+            f"budget_derivation must be {WORKLOAD_STATIC_BUDGET_DERIVATION}"
+        )
+    # A measurement artifact must never be readable as a static policy: its
+    # numbers mean something else and its guards no longer run here.
+    for key in _STATIC_POLICY_FORBIDDEN_KEYS:
+        if key in payload:
+            raise WorkloadPolicyUnavailable(
+                f"static workload policy cannot carry {key!r}"
+            )
+    raw_classes = payload.get("workload_classes")
+    if not isinstance(raw_classes, Mapping) or not raw_classes:
+        raise WorkloadPolicyUnavailable("workload_classes must be a non-empty object")
+
+    classes: dict[str, WorkloadClassBudget] = {}
+    declared_shapes: dict[tuple[str, str], str] = {}
+    for raw_name, raw_class in sorted(raw_classes.items()):
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise WorkloadPolicyUnavailable("workload class names must be non-empty")
+        name = raw_name.strip()
+        if not isinstance(raw_class, Mapping):
+            raise WorkloadPolicyUnavailable(
+                f"workload class {name!r} must be an object"
+            )
+        for key in _STATIC_CLASS_FORBIDDEN_KEYS:
+            if key in raw_class:
+                raise WorkloadPolicyUnavailable(
+                    f"workload class {name!r} cannot carry {key!r}"
+                )
+        scope = raw_class.get("scope")
+        if scope not in _WORKLOAD_SCOPES:
+            raise WorkloadPolicyUnavailable(
+                f"workload class {name!r} has invalid scope"
+            )
+        shape_digest, shape_endpoints = _validated_shape(name, scope, raw_class)
+        duplicate = declared_shapes.get((scope, shape_digest))
+        if duplicate is not None:
+            raise WorkloadPolicyUnavailable(
+                f"scope {scope!r} has a duplicate shape_digest in classes "
+                f"{duplicate!r} and {name!r}"
+            )
+        declared_shapes[(scope, shape_digest)] = name
+        if name != workload_class_name(scope, shape_digest):
+            raise WorkloadPolicyUnavailable(
+                f"workload class {name!r} must be named after its scope and shape"
+            )
+        max_units = _positive_int(raw_class.get("max_units"), f"{name}.max_units")
+        expected_units = {
+            "match": MATCH_BATCH_SIZE,
+            "player": PLAYER_BATCH_SIZE,
+            "season": 1,
+        }[scope]
+        if max_units != expected_units:
+            raise WorkloadPolicyUnavailable(
+                f"{scope} workload class must declare exactly "
+                f"{expected_units} units"
+            )
+        required_endpoints = _endpoint_tuple(
+            raw_class.get("required_endpoints"), f"{name}.required_endpoints"
+        )
+        if required_endpoints != shape_endpoints:
+            raise WorkloadPolicyUnavailable(
+                f"{name}.required_endpoints must equal the endpoints of its shape"
+            )
+        hard_task_bytes = _positive_int(
+            raw_class.get("hard_task_bytes"), f"{name}.hard_task_bytes"
+        )
+        classes[name] = WorkloadClassBudget(
+            name=name,
+            scope=scope,
+            max_units=max_units,
+            hard_task_bytes=hard_task_bytes,
+            required_endpoints=required_endpoints,
+            shape_digest=shape_digest,
+        )
+    return WorkloadBudgetPolicy(
+        artifact_id=hashlib.sha256(raw).hexdigest(),
+        classes=classes,
+    )
 
 
 def load_verified_workload_policy(
@@ -1253,14 +1374,13 @@ def build_signed_allocation_plan(
         ):
             raise WorkloadPlanError("batch_index must be non-negative")
         units = _normalize_ids(request.units, f"{task_id}.units")
-        source_tournament_id = source_tournament_token(
-            request.source_tournament_id
-        )
+        # The class no longer transfers per tournament, but a malformed
+        # provenance field must still fail before the plan is signed.
+        source_tournament_token(request.source_tournament_id)
         measured = policy.class_for(
             workload_class,
             scope=scope,
             units=len(units),
-            source_tournament_id=source_tournament_id,
             shape_digest=request.shape_digest,
         )
         identity = {
@@ -1349,7 +1469,6 @@ def build_signed_dagrun_plan(
             workload_class,
             scope="match",
             units=len(units),
-            source_tournament_id=tournament,
             shape_digest=match_shape_digest,
         )
         allocation_inputs.append(
@@ -1372,7 +1491,6 @@ def build_signed_dagrun_plan(
             workload_class,
             scope="player",
             units=len(units),
-            source_tournament_id=tournament,
             shape_digest=player_shape_digest,
         )
         allocation_inputs.append(
@@ -1399,7 +1517,6 @@ def build_signed_dagrun_plan(
             workload.workload_class,
             scope="season",
             units=1,
-            source_tournament_id=workload.tournament_id,
             shape_digest=workload.shape_digest,
         )
         allocation_inputs.append(

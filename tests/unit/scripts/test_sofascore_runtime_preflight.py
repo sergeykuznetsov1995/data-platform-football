@@ -35,7 +35,7 @@ def _state(tmp_path: Path, *, mode: int = 0o770) -> Path:
 def _allow_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         preflight,
-        "load_verified_workload_policy",
+        "load_static_workload_policy",
         lambda _path: SimpleNamespace(artifact_id=ARTIFACT_ID),
     )
 
@@ -51,7 +51,7 @@ def _health(**overrides: object) -> dict[str, object]:
     return payload
 
 
-def test_filesystem_preflight_is_uid_aware_and_loads_verified_policy(
+def test_filesystem_preflight_is_uid_aware_and_loads_static_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _allow_policy(monkeypatch)
@@ -226,7 +226,7 @@ def test_host_preflight_rejects_unprotected_parent_chain(
         )
 
 
-def test_artifact_rejects_unverified_runtime_and_wrong_pin(
+def test_artifact_rejects_an_unloadable_policy_and_a_wrong_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     artifact = _artifact(tmp_path)
@@ -234,8 +234,8 @@ def test_artifact_rejects_unverified_runtime_and_wrong_pin(
     def unavailable(_path: Path) -> None:
         raise WorkloadPolicyUnavailable("test detail must remain hidden")
 
-    monkeypatch.setattr(preflight, "load_verified_workload_policy", unavailable)
-    with pytest.raises(preflight.ReadinessError, match="current runtime") as raised:
+    monkeypatch.setattr(preflight, "load_static_workload_policy", unavailable)
+    with pytest.raises(preflight.ReadinessError, match="not loadable") as raised:
         preflight.validate_artifact(
             artifact,
             runtime_uid=artifact.stat().st_uid,
@@ -319,7 +319,7 @@ def test_artifact_inode_replacement_during_fd_verification_is_rejected(
         return SimpleNamespace(artifact_id=ARTIFACT_ID)
 
     monkeypatch.setattr(
-        preflight, "load_verified_workload_policy", replace_while_loading
+        preflight, "load_static_workload_policy", replace_while_loading
     )
     with pytest.raises(preflight.ReadinessError, match="changed during verification"):
         preflight.validate_artifact(

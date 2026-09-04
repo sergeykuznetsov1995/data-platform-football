@@ -33,7 +33,6 @@ LANE_UNITS = {
 }
 SCRIPTS = (
     DEPLOY / "freeze_release.sh",
-    DEPLOY / "run_canary.sh",
     DEPLOY / "deploy.sh",
     DEPLOY / "postdeploy_checks.sh",
 )

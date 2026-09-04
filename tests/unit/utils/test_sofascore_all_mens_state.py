@@ -163,10 +163,10 @@ def test_unavailable_season_does_not_block_other_ready_scopes():
     ]
 
 
-def test_planner_defers_unmeasured_shapes_and_starts_measured_wave_scope():
+def test_planner_defers_shapes_the_static_policy_does_not_declare():
     snapshot = _snapshot()
     snapshot["tournaments"][0]["seasons"][0]["team_count"] = 24
-    measured_class = season_workload_class(production_season_shape(
+    declared_class = season_workload_class(production_season_shape(
         season_format="split_year",
         team_count_band="16_20",
         max_pages_per_direction=50,
@@ -181,10 +181,10 @@ def test_planner_defers_unmeasured_shapes_and_starts_measured_wave_scope():
         snapshot,
         completed=set(),
         batch_size=10,
-        authorized_season_classes={measured_class: (8, 17)},
+        authorized_season_classes=[declared_class],
     )
 
-    # The deferred 17-1725 also holds the deeper 17-1724 (canary unlocks it).
+    # 17-1725's shape is undeclared, so it also holds the deeper 17-1724.
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
         "campaign-test:8:825", "campaign-test:8:824"
     ]
@@ -199,7 +199,7 @@ def test_planner_does_not_advance_wave_when_only_deferred_shapes_remain():
     snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
         unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()).hexdigest()
-    measured_class = season_workload_class(production_season_shape(
+    declared_class = season_workload_class(production_season_shape(
         season_format="split_year",
         team_count_band="16_20",
         max_pages_per_direction=50,
@@ -213,7 +213,7 @@ def test_planner_does_not_advance_wave_when_only_deferred_shapes_remain():
         snapshot,
         completed=completed,
         batch_size=10,
-        authorized_season_classes={measured_class: (8, 17)},
+        authorized_season_classes=[declared_class],
     )
 
     assert planned == []

@@ -42,7 +42,7 @@ from scrapers.sofascore.season_pipeline import (
 from scrapers.sofascore.workload_plan import (
     SeasonWorkload,
     WorkloadPolicyUnavailable,
-    load_verified_workload_policy,
+    load_static_workload_policy,
     production_season_shape,
     team_count_band,
 )
@@ -82,11 +82,10 @@ def _load_pinned_workload_policy(artifact_path: os.PathLike[str] | str):
             f"{SOFASCORE_BUDGET_ARTIFACT_ID_ENV} cannot use the CI/render-only "
             "zero placeholder"
         )
-    policy = load_verified_workload_policy(artifact_path)
+    policy = load_static_workload_policy(artifact_path)
     if not hmac.compare_digest(policy.artifact_id, required_artifact_id):
         raise WorkloadPolicyUnavailable(
-            "verified SofaScore workload policy does not match the required "
-            "artifact pin"
+            "SofaScore workload policy does not match the required artifact pin"
         )
     return policy
 
@@ -649,6 +648,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--artifact",
         default=os.environ.get("SOFASCORE_PROXY_BUDGET_ARTIFACT", ""),
+        help="static SofaScore workload policy (schema v4) mounted for this run",
     )
     parser.add_argument("--output")
     parser.add_argument("--raw-store-uri")

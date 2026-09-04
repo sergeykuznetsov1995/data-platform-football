@@ -25,11 +25,14 @@ from scrapers.sofascore.workload_plan import (
     WORKLOAD_ARTIFACT_SCHEMA_VERSION,
     WORKLOAD_BUDGET_DERIVATION,
     WORKLOAD_METER,
+    WORKLOAD_POLICY_SCHEMA_VERSION,
     WorkloadPolicyUnavailable,
+    load_static_workload_policy,
     load_verified_workload_policy,
 )
 
 
+POLICY_SCHEMA_VERSION = WORKLOAD_POLICY_SCHEMA_VERSION
 CANARY_SCHEMA_VERSION = WORKLOAD_ARTIFACT_SCHEMA_VERSION
 LEGACY_CANARY_SCHEMA_VERSION = 1
 # v2 bound a class to one tournament instead of one measured shape.  Its samples
@@ -202,13 +205,62 @@ class BudgetPolicy:
             value = int(self.endpoint_reservation_bytes[endpoint])
         except KeyError as exc:
             raise ProductionBudgetUnavailable(
-                f"verified canary has no reservation for endpoint {endpoint!r}"
+                f"workload policy has no reservation for endpoint {endpoint!r}"
             ) from exc
         if value <= 0:
             raise ProductionBudgetUnavailable(
-                f"invalid canary reservation for endpoint {endpoint!r}"
+                f"invalid policy reservation for endpoint {endpoint!r}"
             )
         return value
+
+
+def _load_static_class_policy(
+    policy_path: Path,
+    workload_class: Optional[str],
+) -> BudgetPolicy:
+    """Adapt one static workload class to the capture-engine budget API.
+
+    The class is selected by name only; shape identity and unit count are
+    enforced by :func:`load_static_workload_policy` and by ``class_for`` at
+    plan time.
+    """
+
+    if not isinstance(workload_class, str) or not workload_class.strip():
+        raise ProductionBudgetUnavailable(
+            "static workload policy requires one explicit workload_class"
+        )
+    name = workload_class.strip()
+    try:
+        policy = load_static_workload_policy(policy_path)
+        measured = policy.classes[name]
+    except KeyError as exc:
+        raise ProductionBudgetUnavailable(
+            f"workload policy has no class {name!r}"
+        ) from exc
+    except WorkloadPolicyUnavailable as exc:
+        raise ProductionBudgetUnavailable(str(exc)) from exc
+
+    # Every endpoint of the class may reserve the whole class cap: a cold run
+    # attributes browser warm-up bytes to whichever endpoint runs first, so a
+    # per-endpoint split is not a safe upper bound.  SharedBudgetLedger and the
+    # filtering proxy still enforce the exact class total before any provider
+    # byte is forwarded.
+    endpoint_reservations = {
+        endpoint: measured.hard_task_bytes
+        for endpoint in measured.required_endpoints
+    }
+    class_artifact_id = hashlib.sha256(
+        f"{policy.artifact_id}\0{name}".encode("utf-8")
+    ).hexdigest()
+    return BudgetPolicy(
+        artifact_id=class_artifact_id,
+        hard_run_bytes=measured.hard_task_bytes,
+        endpoint_reservation_bytes=endpoint_reservations,
+        sample_count=0,
+        distinct_proxy_exits=0,
+        workload_class=name,
+        parent_artifact_id=policy.artifact_id,
+    )
 
 
 def _load_v3_class_policy(
@@ -478,9 +530,9 @@ def load_verified_policy(
     workload_class: Optional[str] = None,
     allow_legacy_v1: bool = False,
 ) -> BudgetPolicy:
-    """Load exactly one measured task budget; never aggregate v3 classes.
+    """Load exactly one task budget; never aggregate workload classes.
 
-    ``workload_class`` is mandatory for schema v3.  The returned artifact ID
+    ``workload_class`` is mandatory for the static v4 policy and for v3.  The returned artifact ID
     binds both the parent artifact SHA-256 and the selected class, so a lease
     cannot be replayed under another task shape.  Schema v2 is rejected outright
     (its classes are keyed by tournament, not by measured shape) and schema v1 is
@@ -497,6 +549,8 @@ def load_verified_policy(
     if not isinstance(payload, Mapping):
         raise ProductionBudgetUnavailable("canary artifact must be an object")
     schema_version = payload.get("schema_version")
+    if schema_version == POLICY_SCHEMA_VERSION:
+        return _load_static_class_policy(artifact_path, workload_class)
     if schema_version == CANARY_SCHEMA_VERSION:
         return _load_v3_class_policy(
             artifact_path,

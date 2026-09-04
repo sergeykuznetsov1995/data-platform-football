@@ -34,7 +34,6 @@ MATCH_WORKLOAD_CLASS = match_workload_class()
 PLAYER_WORKLOAD_CLASS = player_workload_class()
 MATCH_SHAPE_DIGEST = workload_shape_digest(production_match_shape())
 PLAYER_SHAPE_DIGEST = workload_shape_digest(production_player_shape())
-MEASURED_TOURNAMENTS = ("16", "17")
 
 
 def _match_budget() -> WorkloadClassBudget:
@@ -44,10 +43,7 @@ def _match_budget() -> WorkloadClassBudget:
         25,
         100,
         ("event",),
-        20,
-        5,
         MATCH_SHAPE_DIGEST,
-        MEASURED_TOURNAMENTS,
     )
 
 
@@ -58,10 +54,7 @@ def _player_budget() -> WorkloadClassBudget:
         50,
         200,
         ("player_profile",),
-        20,
-        5,
         PLAYER_SHAPE_DIGEST,
-        MEASURED_TOURNAMENTS,
     )
 
 

@@ -163,12 +163,12 @@ def _player_record(endpoint: str) -> dict:
     }
 
 
-def test_runtime_reads_verified_budget_configuration_without_blocking_replay(
+def test_runtime_reads_static_budget_configuration_without_blocking_replay(
     tmp_path,
     monkeypatch,
 ):
     artifact = Path(__file__).resolve().parents[3] / (
-        "configs/sofascore/proxy_budget_canary.json"
+        "configs/sofascore/workload_policy.json"
     )
     monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT", str(artifact))
     monkeypatch.setenv(
