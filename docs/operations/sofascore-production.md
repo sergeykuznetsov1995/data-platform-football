@@ -85,6 +85,28 @@ scheduler под LocalExecutor и оборвал бы скоуп на серед
 (`airflow pools set sofascore_players_pool 0 'stopped'`). Идущий скоуп доработает вместе
 со своим `validate` и будет зачтён; новые не стартуют.
 
+**Приёмка полосы (воспроизводимо).** База на 04.09.2026 до выката: `rows_campaign = 0`
+при 27 037 строках профилей по 8 лигам реестра.
+
+```bash
+# 1. Полоса распаущена и её прогоны идут (после ручного снятия паузы на шаге 5 выката):
+docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT is_paused, is_active FROM dag WHERE dag_id='dag_players_sofascore_all_mens';"
+# 2. Функциональный критерий: строки по турнирам кампании появились (было 0):
+~/.claude/bin/trino-ro.sh "SELECT count(*) AS rows_campaign, count(DISTINCT player_id) AS players_campaign \
+  FROM iceberg.bronze.sofascore_player_profile WHERE league LIKE 'SS-%'"
+~/.claude/bin/trino-ro.sh "SELECT count(*) FROM iceberg.bronze.sofascore_player_season_stats WHERE league LIKE 'SS-%'"
+# 3. Ни одного 429 в результатах полосы и расход шлюза против потолка 400 МБ:
+grep -l 'concurrency limit reached' "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/*.json | wc -l   # ждём 0
+python3 -c "import json;d=json.load(open('$SOFASCORE_PLAYERS_GW_STATE_HOST_DIR/bytes.json'));print(d)"
+# 4. История и актуалка не замедлились: успешные прогоны за сутки до и после выката
+docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT dag_id, state, count(*) FROM dag_run WHERE dag_id IN ('dag_backfill_sofascore_all_mens','dag_refresh_sofascore_all_mens') \
+   AND start_date > now() - interval '24 hours' GROUP BY 1,2 ORDER BY 1,2;"
+# 5. Очередь полосы растёт:
+python3 -c "import json;print(len(json.load(open('$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR/players-state.json'))['completed']))"
+```
+
 ## Единый источник истины
 
 - **Код** — одно замороженное дерево `${SOFASCORE_RELEASE_ROOT}`
