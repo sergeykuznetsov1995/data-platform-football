@@ -70,8 +70,12 @@ PLAYERS_DAGRUN_TIMEOUT = timedelta(hours=4, minutes=30)
 # (``retries=1``), so the window has to hold BOTH attempts (lesson of Sol round
 # 12 on the refresh lane: counting one attempt made the arithmetic decorative).
 # Live measurement 2026-09-04: the largest league took 34 min end to end;
-# campaign tournaments are smaller.
-PLAYERS_SCOPE_TIMEOUT = timedelta(minutes=45)
+# campaign tournaments are smaller.  40 min, not 45: at 45 the worst case
+# (3 scopes x 2 attempts) spends the whole 270-minute DagRun and ``validate``
+# and ``finalize`` never run, so a scope whose capture SUCCEEDED is not booked
+# and gets bought again next run.  40 leaves 30 min of slack and keeps
+# PLAYERS_BATCH_FITS at 3.
+PLAYERS_SCOPE_TIMEOUT = timedelta(minutes=40)
 PLAYERS_SCOPE_ATTEMPTS = 2
 PLAYERS_BATCH_FITS = int(
     PLAYERS_DAGRUN_TIMEOUT / (PLAYERS_SCOPE_TIMEOUT * PLAYERS_SCOPE_ATTEMPTS)

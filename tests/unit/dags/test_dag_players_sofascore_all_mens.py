@@ -81,8 +81,37 @@ def test_players_dag_runs_four_times_a_day_with_one_bounded_serial_batch(clean_e
     assert module.PLAYERS_BATCH_SIZE == 3
     assert operators["run_players_scope"]._init_kwargs["retries"] == 1
     assert operators["run_players_scope"]._init_kwargs["execution_timeout"] == timedelta(
-        minutes=45
+        minutes=40
     )
+
+
+@pytest.mark.unit
+def test_the_worst_case_batch_leaves_the_window_room_to_book_the_work(clean_env):
+    """Capture that succeeded must still be booked before the window closes.
+
+    The batch runs serially on one pool slot and every scope may be attempted
+    twice, so the worst case is ``batch x timeout x attempts``.  If that eats
+    the whole DagRun, ``validate_players_scope`` and ``finalize_players_run``
+    are killed by ``dagrun_timeout`` and a scope whose capture already went
+    through is never written to ``players-state.json`` — the lane pays the
+    source for it a second time next run (the class of lesson #1216, which is
+    why ``finalize`` looks at both mapped tasks).
+    """
+
+    module = _load_dag_module()
+    worst_case = (
+        module.PLAYERS_BATCH_SIZE
+        * module.PLAYERS_SCOPE_TIMEOUT
+        * module.PLAYERS_SCOPE_ATTEMPTS
+    )
+    slack = module.PLAYERS_DAGRUN_TIMEOUT - worst_case
+    assert slack >= timedelta(minutes=20), (
+        f"worst case {worst_case} leaves only {slack} of the "
+        f"{module.PLAYERS_DAGRUN_TIMEOUT} window for validate and finalize"
+    )
+    # The slack must not have been bought by shrinking the batch.
+    assert module.PLAYERS_BATCH_FITS == 3
+    assert module.PLAYERS_BATCH_SIZE == 3
 
 
 @pytest.mark.unit
