@@ -292,7 +292,9 @@ def test_rotation_scripts_take_every_host_path_from_the_env_file() -> None:
             assert key in example_keys, f"{script.name}: {key} missing from sofascore.env.example"
     deploy = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
     for key in ("SOFASCORE_RELEASE_ROOT", "SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST", "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"):
-        assert f"set_env_var {key} " in deploy, f"deploy.sh must repin {key} in the env file"
+        assert f'sofascore_set_env_var "$ENV_FILE" {key} ' in deploy, (
+            f"deploy.sh must repin {key} in the env file через общий загрузчик"
+        )
     assert "sed -i" not in deploy.replace('sed -i "s#^${key}=', ""), "no ad-hoc edits of system files"
     assert "--no-deps --force-recreate airflow-scheduler" in deploy
     # Все три шлюза поднимаются одним вызовом того же compose-проекта.

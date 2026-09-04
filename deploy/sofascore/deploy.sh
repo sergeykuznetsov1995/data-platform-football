@@ -58,11 +58,6 @@ sofascore-gw-lease-watchdog-players.service"
 PSQL="docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c"
 
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"; }
-set_env_var() {  # set_env_var KEY VALUE — переписать строку KEY= в env-файле контура
-  local key="$1" value="$2"
-  grep -qE "^${key}=" "$ENV_FILE" || { echo "в $ENV_FILE нет строки ${key}=" >&2; exit 2; }
-  sed -i "s#^${key}=.*#${key}=${value}#" "$ENV_FILE"
-}
 is_paused() { $PSQL "SELECT is_paused FROM dag WHERE dag_id='$1';"; }
 pause_dag() {
   docker exec sofascore-airflow-scheduler airflow dags pause "$1" >> "$LOG" 2>&1
@@ -160,9 +155,9 @@ done <<< "$LANE_STATE_DIRS"
 # Значения этого выката передаются compose и явно (окружение процесса сильнее
 # --env-file — так старое значение никогда не перекроет новое).
 STEP="repin-env"
-set_env_var SOFASCORE_RELEASE_ROOT "$RELEASE"
-set_env_var SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST "$ARTIFACT_DEST"
-set_env_var SOFASCORE_PROXY_BUDGET_ARTIFACT_ID "$ARTIFACT_ID"
+sofascore_set_env_var "$ENV_FILE" SOFASCORE_RELEASE_ROOT "$RELEASE"
+sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST "$ARTIFACT_DEST"
+sofascore_set_env_var "$ENV_FILE" SOFASCORE_PROXY_BUDGET_ARTIFACT_ID "$ARTIFACT_ID"
 sofascore_load_env "$ENV_FILE"
 [ "$SOFASCORE_RELEASE_ROOT" = "$RELEASE" ] || { log "env file did not take the new release root"; exit 2; }
 log "env file $ENV_FILE repinned to $RELEASE"

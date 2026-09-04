@@ -422,6 +422,39 @@ def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
 
 
 @pytest.mark.unit
+def test_set_env_var_rewrites_only_its_own_line_and_fails_on_a_missing_key(tmp_path: Path) -> None:
+    """Перепин живёт в общем загрузчике: тот же `sed` делает откат автомата (#1245).
+
+    Две копии одной правки рано или поздно разъехались бы, и откат перепинывал бы не
+    то, что перепинул выкат."""
+    env_file = _write(
+        tmp_path / "sofascore.env",
+        """\
+        # шапка
+        SOFASCORE_RELEASE_ROOT=/old/release-deadbeef
+        SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=old
+        SOFASCORE_PROXY_POOL_JSON='[{"host":"pool","port":1}]'
+        """,
+    )
+    script = f"""\
+        . {DEPLOY}/env.sh
+        sofascore_set_env_var {env_file} SOFASCORE_RELEASE_ROOT /new/release-cafebabe || exit 8
+        sofascore_set_env_var {env_file} SOFASCORE_MISSING x; echo "rc=$?"
+        """
+    proc = subprocess.run(
+        ["bash", "-c", textwrap.dedent(script)], capture_output=True, text=True, check=True
+    )
+    assert "rc=2" in proc.stdout, proc.stdout + proc.stderr
+    assert "нет строки SOFASCORE_MISSING=" in proc.stderr
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        "# шапка",
+        "SOFASCORE_RELEASE_ROOT=/new/release-cafebabe",
+        "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=old",
+        """SOFASCORE_PROXY_POOL_JSON='[{"host":"pool","port":1}]'""",
+    ]
+
+
+@pytest.mark.unit
 def test_env_loader_strips_quotes_and_never_expands_or_exports(tmp_path: Path) -> None:
     env_file = tmp_path / "x.env"
     env_file.write_bytes(
