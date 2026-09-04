@@ -201,3 +201,89 @@ def test_run_phase_plans_matches_from_the_scope_season_evidence(tmp_path):
     }
     assert planner.call_args.kwargs["phase"] == "targets"
     assert planner.call_args.kwargs["season_evidence"] == "bronze"
+
+
+@pytest.mark.unit
+def test_run_phase_signs_the_players_plan_and_captures_profiles(tmp_path):
+    scope = {**_scope(), "run_id": "players-1"}
+    plan = tmp_path / "players-plan.json"
+    captured = {}
+
+    def capture(argv):
+        captured["argv"] = list(argv)
+        return 0
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            return_value=plan,
+        ) as planner,
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=capture),
+    ):
+        result = cycle.run_phase(
+            "players",
+            scope,
+            output_dir=tmp_path / "run",
+            workload_artifact=tmp_path / "artifact.json",
+        )
+
+    assert result == {
+        "phase": "players",
+        "status": "success",
+        "exit_code": 0,
+        "plan": str(plan),
+    }
+    assert planner.call_args.kwargs["phase"] == "players"
+    # The lane's queue is its rotation, and the campaign's season manifests are
+    # written under the "final" key: the dated default would call every scope
+    # "season not ready".
+    assert planner.call_args.kwargs["players_force"] is True
+    assert planner.call_args.kwargs["season_freshness_key"] == "final"
+    argv = captured["argv"]
+    assert argv[argv.index("--entity") + 1] == "player_capture"
+    # No slicing: a partial universe would let endpoint-completeness DQ pass on
+    # a subset of the season's players.
+    assert "--limit" not in argv
+
+
+@pytest.mark.unit
+def test_the_players_phase_runs_alone_and_never_inside_all(tmp_path, monkeypatch):
+    calls = []
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setattr(
+        cycle,
+        "run_phase",
+        lambda phase, *a, **k: (
+            calls.append(phase) or {"phase": phase, "status": "success"}
+        ),
+    )
+
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "players")) == 0
+    assert calls == ["players"]
+
+    calls.clear()
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "all")) == 0
+    assert calls == ["season", "matches"]
+
+
+@pytest.mark.unit
+def test_the_players_phase_refuses_a_pending_season(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cycle,
+        "load_exact_scope",
+        lambda *a, **k: pytest.fail("argument validation must come first"),
+    )
+
+    with pytest.raises(SystemExit):
+        cycle.main(_cycle_argv(
+            tmp_path, "--phase", "players", "--allow-pending-season"
+        ))
+
+    # The refusal must be the combination check, not argparse not knowing the
+    # phase at all — otherwise this test would stay green after a rename.
+    assert "cannot use --allow-pending-season" in capsys.readouterr().err
