@@ -171,6 +171,9 @@ _PAID_ROUTES = frozenset(
         TransportRoute.PAID_LEASE,
     }
 )
+# Raised by the FlareSolverr WhoScored extension when the page's RequireJS
+# site-header token is absent; a bootstrap reload does not recover it (#1017).
+_SOURCE_STAGE_HEADER_UNAVAILABLE = "WhoScored page request header is unavailable."
 
 
 class FailureKind(str, Enum):
@@ -4369,12 +4372,24 @@ class WhoScoredTransport:
         except (FlareSolverrErrorPage, FlareSolverrError) as exc:
             self._drop_browser_session(client, route)
             record_error(FailureKind.BROWSER, exc)
+            # [1017] Stage-stat XHR fails synchronously in the extension when the
+            # page's RequireJS site-header token is absent ("WhoScored page
+            # request header is unavailable."). A full bootstrap reload does NOT
+            # recover it, so 4 retries only burn wall-clock (→ AirflowTaskTimeout)
+            # and re-download the bootstrap page (proxy bytes). service.py already
+            # degrades these stage-stat feeds to NOT_AVAILABLE on the first raise
+            # (_is_source_stage_statistics_unavailable) — schedule/matches/events
+            # still commit and the scope stays success. Mark it non-retryable so
+            # it fails fast into that graceful path. Any other browser error keeps
+            # retryable=True. Latent behind master's #1012 residential transport.
+            _exc_text = _safe_route_exception_text(exc, route=route)
+            _no_retry = _SOURCE_STAGE_HEADER_UNAVAILABLE in _exc_text
             raise WhoScoredTransportError(
-                _safe_route_exception_text(exc, route=route),
+                _exc_text,
                 kind=FailureKind.BROWSER,
                 url=items[0].url,
                 route=route,
-                retryable=True,
+                retryable=not _no_retry,
             ) from exc
 
         outcomes: list[_BrowserBatchOutcome] = []

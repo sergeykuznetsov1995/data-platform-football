@@ -3803,6 +3803,58 @@ def test_stale_flaresolverr_identity_is_config_failure_before_cache_or_paid():
     assert factory_calls == []
 
 
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("message", "expected_retryable", "expected_batch_calls"),
+    [
+        (
+            "FlareSolverr HTTP 502: WhoScored page request header is unavailable.",
+            False,
+            1,
+        ),
+        ("FlareSolverr HTTP 502: ordinary browser failure", True, 3),
+    ],
+)
+def test_missing_site_header_batch_failure_is_not_retried(
+    message, expected_retryable, expected_batch_calls
+):
+    """The stage-stat XHR fails synchronously in the extension when the page's
+    RequireJS site-header token is absent, and a bootstrap reload does not
+    recover it (#1017): every retry only burns wall-clock and proxy bytes, so
+    that failure must leave the browser loop on the first raise while ordinary
+    browser failures keep retrying.
+    """
+    bootstrap = {
+        "html": "<html><body>Team Statistics</body></html>",
+        "status": 200,
+        "cookies": [],
+        "userAgent": "browser",
+    }
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        *[item for _ in range(3) for item in (bootstrap, FlareSolverrError(message))]
+    )
+    transport, factory_calls = _transport(
+        direct, direct_fs=fs, raw_cache=KeyedMemoryRawCache(), attempts=3
+    )
+    request = FetchRequest(
+        url=TEAM_STATS_URL,
+        cache_key="feed-0",
+        validator=lambda response: json.loads(response.content) is not None,
+        scope="INT-World Cup=2026",
+        entity="team_stage_statistics",
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch_many([request])
+
+    assert raised.value.kind is FailureKind.BROWSER
+    assert raised.value.retryable is expected_retryable
+    assert len(fs.xhr_many_calls) == expected_batch_calls
+    assert factory_calls == []
+
 @pytest.mark.unit
 @pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), "2"])
 def test_invalid_browser_retry_jitter_fails_before_network(value):
