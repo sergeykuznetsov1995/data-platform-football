@@ -355,6 +355,24 @@ exit 0
         path = self.stub_state / f"{name}.calls"
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
+    def write_snapshot(self, **override: str) -> None:
+        """Снимок отката, каким его пишет сам автомат: пути обоих деревьев, пины артефакта,
+        паузы обеих кампаний, слоты трёх пулов. Неполный снимок автомат обязан отвергнуть."""
+        fields = {
+            "OLD_RELEASE_ROOT": str(self.old_tree),
+            "NEW_RELEASE_ROOT": str(self.new_tree),
+            "OLD_ARTIFACT_HOST": f"{self.runtime}/artifacts/old/workload_policy.json",
+            "OLD_ARTIFACT_ID": "cafebabe",
+            "HIST_PAUSED": "f",
+            "REFRESH_PAUSED": "f",
+            **{f"POOL_{p}": "1" for p in POOLS},
+            "SCHED_CREATED": "created-old",
+        }
+        fields.update(override)
+        (self.state / "sofascore-rollback.env").write_text(
+            "".join(f"{k}={v}\n" for k, v in fields.items() if v is not None), encoding="utf-8"
+        )
+
     def log_text(self) -> str:
         return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
 
@@ -438,15 +456,59 @@ def test_a_missing_key_fails_closed_before_the_lock(stand: Stand, key: str) -> N
     assert not stand.calls("deploy")
 
 
+def _production_on_master(stand: Stand) -> None:
+    """Бой после нормальной ротации: своё замороженное дерево на master, контейнеры на нём.
+    Именно так это выглядит в жизни — правка внутри замороженного дерева в бою запрещена."""
+    subprocess.run(["git", "clone", "-q", str(stand.source), str(stand.new_tree)], check=True)
+    _git(stand.new_tree, "checkout", "-q", "--detach", stand.new_sha)
+    stand.new_tree.chmod(0o755)
+    (stand.new_tree / "logs").mkdir()
+    stand._write_env(stand.new_tree)
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+
+
 @pytest.mark.unit
 def test_nothing_happens_when_production_already_runs_master(stand: Stand) -> None:
-    """Совпали — к бою больше не обращаемся: ни окна, ни docker, ни защёлки."""
-    _git(stand.old_tree, "checkout", "-q", "--detach", stand.new_sha)
+    """Совпали и контур целиком на одном дереве — к бою больше не обращаемся: ни окна, ни
+    выката, ни защёлки."""
+    _production_on_master(stand)
     proc = stand.run()
     assert proc.returncode == 0, proc.stderr
     assert not stand.calls("compose") and not stand.calls("deploy")
     assert not list(stand.state.glob("sofascore-auto-deliver-attempted-*"))
     assert (stand.state / "sofascore-accepted").read_text(encoding="utf-8").strip() == stand.new_sha
+
+
+@pytest.mark.unit
+def test_a_mixed_contour_is_never_silently_declared_accepted(stand: Stand) -> None:
+    """Ревью Sol, раунд 2. `deploy.sh` — в том числе ручной, по слову «выкатывай» —
+    перепинивает env-файл ДО пересоздания контейнеров. Обрыв ровно в этой щели даёт env на
+    новом дереве при контейнерах на старом: HEAD сходится с master, а контур смешанный.
+    Раньше автомат в этом состоянии молча писал маркер приёмки и выходил нулём каждые пять
+    минут — навсегда, без единого сообщения."""
+    _production_on_master(stand)
+    stand.put("mounts_root", str(stand.old_tree))       # шлюзы остались на прежнем дереве
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "КОНТУР СМЕШАННЫЙ" in stand.log_text()
+    assert not (stand.state / "sofascore-accepted").exists(), "маркер приёмки не выдаётся авансом"
+    assert "контур смешанный" in stand.pending() and "НУЖНЫ РУКИ" in stand.pending()
+    assert not stand.calls("deploy")
+    # Второй тик тех же суток повторяет отказ, но не повторяет сообщение.
+    first = stand.pending()
+    stand.run()
+    assert stand.pending() == first
+
+
+@pytest.mark.unit
+def test_a_matching_head_with_docker_down_leaves_the_acceptance_marker_alone(stand: Stand) -> None:
+    _production_on_master(stand)
+    stand.put("docker_down")
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not (stand.state / "sofascore-accepted").exists()
+    assert "проверить монты нечем" in stand.log_text()
 
 
 @pytest.mark.unit
@@ -712,12 +774,7 @@ def test_an_unconfirmed_rollback_shuts_the_automaton_off_and_keeps_the_marker(st
 def test_an_interrupted_delivery_that_never_moved_production_only_clears_the_marker(stand: Stand) -> None:
     stand.watchdog_pids()
     (stand.state / "sofascore-inflight").touch()
-    (stand.state / "sofascore-rollback.env").write_text(
-        f"OLD_RELEASE_ROOT={stand.old_tree}\nNEW_RELEASE_ROOT={stand.new_tree}\n"
-        f"HIST_PAUSED=f\nREFRESH_PAUSED=f\n"
-        + "".join(f"POOL_{p}=1\n" for p in POOLS),
-        encoding="utf-8",
-    )
+    stand.write_snapshot()
     proc = stand.run()
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "бой целиком на" in stand.log_text()
@@ -730,13 +787,7 @@ def test_an_interrupted_delivery_that_never_moved_production_only_clears_the_mar
 def test_an_interrupted_delivery_that_moved_production_is_rolled_back(stand: Stand) -> None:
     stand.watchdog_pids()
     (stand.state / "sofascore-inflight").touch()
-    (stand.state / "sofascore-rollback.env").write_text(
-        f"OLD_RELEASE_ROOT={stand.old_tree}\nNEW_RELEASE_ROOT={stand.new_tree}\n"
-        f"OLD_ARTIFACT_HOST={stand.runtime}/artifacts/old/workload_policy.json\n"
-        f"OLD_ARTIFACT_ID=cafebabe\nHIST_PAUSED=f\nREFRESH_PAUSED=f\n"
-        + "".join(f"POOL_{p}=1\n" for p in POOLS),
-        encoding="utf-8",
-    )
+    stand.write_snapshot()
     stand.put("mounts_root", str(stand.new_tree))
     stand.put("mounts_sched_root", str(stand.new_tree))
     stand.put("rollback_root", str(stand.old_tree))
@@ -757,13 +808,7 @@ def test_an_interrupted_delivery_before_the_containers_still_puts_the_env_file_b
     совпадение с master, писал маркер приёмки без единой проверки и молча выходил нулём
     каждые пять минут — контур навсегда оставался смешанным."""
     (stand.state / "sofascore-inflight").touch()
-    (stand.state / "sofascore-rollback.env").write_text(
-        f"OLD_RELEASE_ROOT={stand.old_tree}\nNEW_RELEASE_ROOT={stand.new_tree}\n"
-        f"OLD_ARTIFACT_HOST={stand.runtime}/artifacts/old/workload_policy.json\n"
-        f"OLD_ARTIFACT_ID=cafebabe\nHIST_PAUSED=f\nREFRESH_PAUSED=f\n"
-        + "".join(f"POOL_{p}=1\n" for p in POOLS),
-        encoding="utf-8",
-    )
+    stand.write_snapshot()
     # Так выглядит контур после обрыва: env уже на новом дереве, контейнеры — ещё на старом.
     stand.env_file.write_text(
         stand.env_file.read_text(encoding="utf-8")
@@ -777,7 +822,7 @@ def test_an_interrupted_delivery_before_the_containers_still_puts_the_env_file_b
     assert stand.env_value("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID") == "cafebabe"
     assert not stand.calls("compose"), "контейнеры не трогали — их и не надо пересоздавать"
     assert not (stand.state / "sofascore-inflight").exists()
-    assert "env-файл вернул к снимку" in stand.log_text()
+    assert "env-файл, паузы и пулы вернул к снимку" in stand.pending()
 
 
 @pytest.mark.unit
@@ -796,6 +841,9 @@ def test_a_delivery_that_leaves_the_campaign_paused_is_not_reported_as_success(s
     # Доставка всё-таки состоялась и принята — маркер приёмки честный, INFLIGHT закрыт.
     assert (stand.state / "sofascore-accepted").read_text(encoding="utf-8").strip() == stand.new_sha
     assert not (stand.state / "sofascore-inflight").exists()
+    # Выключатель обязателен: контур стоит, и следующий коммит начал бы новый выкат прямо
+    # на остановленной кампании.
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
 
 
 @pytest.mark.unit
@@ -816,6 +864,44 @@ def test_a_rollback_checks_all_three_env_lines_against_the_file(stand: Stand) ->
     assert not stand.calls("compose"), "без вернувшегося env пересоздавать контейнеры нельзя"
     assert (stand.state / "sofascore-auto-deliver.off").exists()
     assert (stand.state / "sofascore-inflight").exists()
+
+
+@pytest.mark.unit
+def test_an_interrupted_delivery_that_cannot_restart_the_campaign_is_not_a_warning(stand: Stand) -> None:
+    """Ревью Sol, раунд 2. Раньше ⚠️ уходило и маркер снимался ДО восстановления пауз и
+    пулов — оно шло EXIT-trap'ом. Осушённый пул или запаузенная история не попадали ни в
+    одно сообщение: автомат отчитывался «ничего страшного» о ночи, в которой кампания не
+    работает."""
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot()
+    stand.put("unpause_fails")
+    stand.put(f"paused_{HIST}", "t")     # deploy.sh успел запаузить историю до обрыва
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "🆘" in stand.pending() and "⚠️" not in stand.pending()
+    assert "контур не вернулся в рабочее состояние" in stand.pending()
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
+    assert not (stand.state / "sofascore-inflight").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "drop", ["OLD_ARTIFACT_HOST", "OLD_ARTIFACT_ID", "POOL_sofascore_history_pool", "HIST_PAUSED"]
+)
+def test_an_incomplete_snapshot_is_refused_like_a_missing_one(stand: Stand, drop: str) -> None:
+    """Ревью Sol, раунд 2. Неполный снимок опаснее отсутствующего: пустые пины артефакта
+    проходили сверку как «успешно восстановленные», и старые контейнеры поднялись бы с
+    пустым (fail-closed для compose) бюджетом, а маркер доставки при этом снимался."""
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(**{drop: None})
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "снимок отката неполон" in stand.log_text()
+    assert not stand.calls("compose")
+    assert (stand.state / "sofascore-inflight").exists()
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
 
 
 @pytest.mark.unit
