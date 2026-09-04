@@ -35,6 +35,7 @@ SCRIPTS = (
     DEPLOY / "freeze_release.sh",
     DEPLOY / "deploy.sh",
     DEPLOY / "postdeploy_checks.sh",
+    DEPLOY / "auto_deliver.sh",
 )
 MINI_DAGS = ("dag_trigger_sofascore_daily.py", "dag_sofascore_manifest_maintenance.py")
 
