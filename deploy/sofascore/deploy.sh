@@ -7,6 +7,8 @@
 # Переменные — из $SOFASCORE_ENV_FILE (по умолчанию /etc/data-platform/sofascore.env);
 #   скрипт сам переписывает в нём SOFASCORE_RELEASE_ROOT / _PROXY_BUDGET_ARTIFACT_HOST / _ID —
 #   этот файл и есть единственный источник «какое дерево в бою» (compose, сторож, приёмка).
+# Коды возврата: 2 — предпосылки; 3 — окно дейли; 4 — контур занят, выкат не начат; 5 — шлюзы;
+#   6 — импорт DAG; 7 — паузы.
 set -euo pipefail
 
 RELEASE="${1:?путь к замороженному дереву}"
@@ -55,17 +57,46 @@ GATEWAY_CONTAINERS="sofascore_gw_951 sofascore_gw_history sofascore_gw_players"
 WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
 sofascore-gw-lease-watchdog-history.service
 sofascore-gw-lease-watchdog-players.service"
-PSQL="docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c"
+# Таймаут обязателен: зависший `docker exec` в шаге ожидания держал бы выкат вечно,
+# а автомат ночной доставки (#1245) зовёт этот скрипт из cron.
+PSQL="timeout -k 5 ${SOFASCORE_DEPLOY_METADB_TIMEOUT:-30} docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c"
 
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"; }
 is_paused() { $PSQL "SELECT is_paused FROM dag WHERE dag_id='$1';"; }
+set_pool() {  # set_pool <name> <slots> <description>
+  docker exec sofascore-airflow-scheduler airflow pools set "$1" "$2" "$3" >> "$LOG" 2>&1
+}
+# Источник слотов — env-файл, а не таблица slot_pool: чтение живого значения дало бы
+# гонку с ручным выкатом (второй выкат прочитал бы осушённый 0 и «восстановил» пул в 0).
+HISTORY_SLOTS="${SOFASCORE_HISTORY_POOL_SLOTS:-1}"
+PLAYERS_SLOTS="${SOFASCORE_PLAYERS_POOL_SLOTS:-1}"
+wait_idle() {  # wait_idle <секунд>; 0 — контур свободен, 1 — потолок исчерпан
+  local left="$1" busy active
+  while :; do
+    # Пустой ответ (метабаза недоступна / timeout) — это «не знаю», а не «свободно».
+    busy=$($PSQL "SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');" || true)
+    active=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');" || true)
+    [ "${busy:-x}" = "0" ] && [ "${active:-x}" = "0" ] && return 0
+    [ "$left" -le 0 ] && return 1
+    left=$(( left - 30 ))
+    sleep 30
+  done
+}
+# Прогон истории, оставшийся без задач, планировщик не закроет: паузные прогоны не попадают
+# в next_dagruns_to_examine (DagModel.is_paused == false), а dagrun_timeout проверяется только
+# в _schedule_dag_run. ORM внутри планировщика, а не UPDATE в метабазе: set_state сам проставит
+# end_date и сохранит матрицу переходов. Строго одна физическая строка и ни одной одинарной
+# кавычки внутри: перевод строки порвал бы журнал вызовов в тестах, отступ дал бы IndentationError.
+close_stale_runs() {  # close_stale_runs <dag_id>
+  timeout -k 5 60 docker exec sofascore-airflow-scheduler python -c 'import sys; from airflow.models import DagRun; from airflow.utils.state import DagRunState; from airflow import settings; s = settings.Session(); print("closed stale dag_run", [(r.dag_id, r.run_id, r.set_state(DagRunState.FAILED))[:2] for r in s.query(DagRun).filter(DagRun.dag_id == sys.argv[1], DagRun.state.in_(["queued", "running"])).all()]); s.commit(); s.close()' "$1" >> "$LOG" 2>&1
+}
 pause_dag() {
   docker exec sofascore-airflow-scheduler airflow dags pause "$1" >> "$LOG" 2>&1
   [ "$(is_paused "$1")" = "t" ] || { log "$1 did not pause"; exit 7; }
 }
 # Любой аварийный выход после паузы: вернуть актуалку в прежнее состояние и сказать,
 # на каком шаге встали (история остаётся на паузе, как и при штатном выкате).
-REFRESH_WAS_PAUSED=""
+REFRESH_WAS_PAUSED=""; HIST_WAS_PAUSED=""; POOL_DRAINED=""
 STEP="start"
 on_exit() {
   local rc=$? state
@@ -73,6 +104,24 @@ on_exit() {
   # Внутри trap ничего не должно оборвать откат: set -e снимаем, каждый шаг — best effort.
   set +e
   log "FAILED at step '$STEP' (rc=$rc); env file: $ENV_FILE — проверь, какое дерево там записано"
+  # Осушённый пул возвращаем при ЛЮБОМ обрыве: штатный шаг pools стоит после gateway-health
+  # и scheduler-health, до него выкат может не дойти — и полоса истории осталась бы с нулём
+  # слотов без единого сообщения.
+  if [ -n "$POOL_DRAINED" ]; then
+    if set_pool sofascore_history_pool "$HISTORY_SLOTS" 'SofaScore history lane'; then
+      log "sofascore_history_pool restored to $HISTORY_SLOTS slots"
+    else
+      log "MANUAL ACTION REQUIRED: sofascore_history_pool left drained — airflow pools set sofascore_history_pool $HISTORY_SLOTS 'SofaScore history lane'"
+    fi
+  fi
+  # rc=4 — «контур занят, выкат не начат»: паузу истории тоже возвращаем как было.
+  # На прочих кодах история остаётся на паузе, как и при штатном выкате.
+  if [ "$rc" -eq 4 ] && [ "$HIST_WAS_PAUSED" = "f" ]; then
+    docker exec sofascore-airflow-scheduler airflow dags unpause "$HIST" >> "$LOG" 2>&1
+    [ "$(is_paused "$HIST")" = "f" ] \
+      && log "$HIST unpaused back (contour busy, nothing deployed)" \
+      || log "MANUAL ACTION REQUIRED: $HIST is still paused — unpause it by hand"
+  fi
   if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
     # Сначала штатно через scheduler; если он сам лежит (упал recreate/health) —
     # напрямую в метабазе контура одной строкой (то же, что делает `airflow dags unpause`).
@@ -97,20 +146,30 @@ trap on_exit EXIT
 hour=$(date -u +%H%M)
 if [ "$hour" -ge 1355 ] && [ "$hour" -le 1535 ]; then echo "окно дейли 14:00–15:30 UTC — позже" >&2; exit 3; fi
 
-# Пересоздание scheduler'а обрывает любой идущий таск, поэтому на паузу — обе кампании.
+# Пересоздание scheduler'а обрывает любой идущий таск, поэтому контур сначала осушается.
 # Актуалка после выката возвращается в то состояние, в каком была; история остаётся
 # на паузе до ручного решения (как и раньше).
-STEP="pause"
+IDLE_WAIT="${SOFASCORE_DEPLOY_IDLE_WAIT:-5400}"
+
+STEP="drain"
+# История идёт @continuous: в окне выката у неё ВСЕГДА есть прогон. Дверь новым скоупам
+# закрывает ПУЛ, а не пауза: в sofascore_history_pool сидит ровно одна задача —
+# run_historical_scope; задача без слота остаётся `scheduled` и не попадает ни в 'queued',
+# ни в 'running'. Паузу истории ставим ПОСЛЕ ожидания: под паузой не выполнится
+# validate_historical_scope, а он единственный засчитывает скоуп в state.json — новый прогон
+# получил бы новый run_id и купил те же 8–81 минуты платного трафика заново.
 REFRESH_WAS_PAUSED=$(is_paused "$REFRESH")
-log "pause $HIST and $REFRESH (refresh was paused=$REFRESH_WAS_PAUSED), wait for idle"
-pause_dag "$HIST"
+HIST_WAS_PAUSED=$(is_paused "$HIST")
+log "drain: sofascore_history_pool -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
+set_pool sofascore_history_pool 0 'SofaScore history lane (drained for deploy)'
+POOL_DRAINED=1
 pause_dag "$REFRESH"
-while true; do
-  busy=$($PSQL "SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');")
-  active=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');")
-  [ "$busy" = "0" ] && [ "$active" = "0" ] && break
-  sleep 60
-done
+wait_idle "$IDLE_WAIT" || { log "contour still busy after ${IDLE_WAIT}s — nothing deployed"; exit 4; }
+
+STEP="pause"
+pause_dag "$HIST"
+close_stale_runs "$HIST"
+wait_idle 120 || { log "history dag_run did not close"; exit 4; }
 log "idle"
 
 STEP="artifact"
@@ -134,7 +193,9 @@ if [ -n "$OLD_STATE_DIR" ] && [ -d "$OLD_STATE_DIR" ] && [ ! -e "$CAMPAIGN/state
   log "campaign state migrated from $OLD_STATE_DIR ($(python3 -c "import json;print(len(json.load(open('$CAMPAIGN/state.json'))['completed']))") completed)"
 fi
 mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results"
-chown -R 50000:0 "$CAMPAIGN"
+# Каталог кампании растёт вместе с ней (тысячи файлов): без потолка `chown` мог бы
+# оказаться самым долгим шагом выката, который никто не ограничивает.
+timeout -k 5 120 chown -R 50000:0 "$CAMPAIGN"
 chmod 0750 "$CAMPAIGN"
 chmod 0644 "$CAMPAIGN/snapshot.json"
 
@@ -218,15 +279,11 @@ STEP="pools"
 # Пулы полос заводит airflow-init, но deploy.sh пересоздаёт только scheduler и шлюзы —
 # на ротации init не запускается. Без этого шага задачи полосы повисли бы в
 # несуществующем пуле. `airflow pools set` идемпотентен: создаёт или переставляет слоты.
-set_pool() {  # set_pool <name> <slots> <description>
-  docker exec sofascore-airflow-scheduler airflow pools set "$1" "$2" "$3" >> "$LOG" 2>&1
-}
-HISTORY_SLOTS="${SOFASCORE_HISTORY_POOL_SLOTS:-1}"
-PLAYERS_SLOTS="${SOFASCORE_PLAYERS_POOL_SLOTS:-1}"
 set_pool ingest_scraper_pool 1 'Serialize heavy ingest scrapers (isolated sofascore stack #951)'
 set_pool sofascore_history_pool "$HISTORY_SLOTS" 'SofaScore history lane'
 set_pool sofascore_players_pool "$PLAYERS_SLOTS" 'SofaScore players lane'
 log "pools set: ingest_scraper_pool=1 sofascore_history_pool=$HISTORY_SLOTS sofascore_players_pool=$PLAYERS_SLOTS"
+POOL_DRAINED=""   # слоты вернулись штатно — позднему обрыву возвращать нечего
 
 STEP="restore-pause"
 pause_dag "$HIST"

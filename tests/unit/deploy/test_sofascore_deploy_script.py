@@ -51,12 +51,22 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
               dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
               cat "$STATE/paused_$dag" ;;
             *"is_active=true"*) cat "$STATE/active_count" 2>/dev/null || echo 3 ;;
+            *task_instance*"state IN ("*) cat "$STATE/busy" 2>/dev/null || echo 0 ;;
+            *dag_run*"state IN ("*) cat "$STATE/active" 2>/dev/null || echo 0 ;;
             *"count(*)"*) echo 0 ;;
             *) echo "unexpected sql: $sql" >&2; exit 9 ;;
           esac
           exit 0
         fi
+        if [ "$1" = exec ] && [ "$2" = sofascore-airflow-scheduler ] && [ "$3" = python ]; then
+          # close_stale_runs: висящий dag_run закрыт ORM-ом внутри планировщика
+          rm -f "$STATE/active"
+          exit 0
+        fi
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-scheduler ] && [ "$3" = airflow ]; then
+          # @continuous успевает создать новый dag_run между «контур свободен» и паузой;
+          # под паузой он замерзает и сам никогда не закроется.
+          [ "$5" = pause ] && [ -e "$STATE/stale_on_pause_$6" ] && echo 1 > "$STATE/active"
           # scheduler-down simulation: `airflow dags unpause` fails once the flag exists
           [ "$5" = unpause ] && [ -e "$STATE/scheduler_down" ] && exit 1
           case "$5" in pause) echo t > "$STATE/paused_$6" ;; unpause) echo f > "$STATE/paused_$6" ;; esac
@@ -194,13 +204,20 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
     ), compose_calls[1][0]
     args = [call[0] for call in _calls(state_dir)]
     pools = [a for a in args if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")]
-    assert [a.split()[5] for a in pools] == [
-        "ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"
-    ], pools
-    assert all(a.split()[6] == "1" for a in pools), pools
+    first_compose = min(i for i, a in enumerate(args) if a.startswith("compose "))
+    last_compose = max(i for i, a in enumerate(args) if a.startswith("compose "))
+    # Шаг drain закрывает полосу истории ДО пересоздания: пул, а не пауза, не даёт стартовать
+    # новому скоупу, пока хвост уже начатого досчитывается.
+    assert pools[0].split()[5:7] == ["sofascore_history_pool", "0"], pools
+    assert args.index(pools[0]) < first_compose, pools
+    restored = pools[1:]
     # deploy.sh не пересоздаёт airflow-init, где пулы заводятся впервые: без этого
     # шага задачи полос повисли бы в несуществующем пуле.
-    assert min(args.index(a) for a in pools) > max(i for i, a in enumerate(args) if a.startswith("compose "))
+    assert [a.split()[5] for a in restored] == [
+        "ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"
+    ], pools
+    assert all(a.split()[6] == "1" for a in restored), pools
+    assert min(args.index(a) for a in restored) > last_compose
     preflights = [
         line for line in (state_dir / "host-python.log").read_text(encoding="utf-8").splitlines()
         if " preflight " in line
@@ -419,6 +436,15 @@ def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
     via_metadb = any("UPDATE dag SET is_paused=false" in a for a in args)
     assert via_metadb == ("scheduler_down" in break_state)
     assert "MANUAL ACTION REQUIRED" not in log
+    # Шаг pools стоит ПОСЛЕ gateway-health и scheduler-health: до него выкат не дошёл,
+    # и полоса истории осталась бы с нулём слотов, если бы её не вернул on_exit.
+    pools = [
+        a.split()[5:7] for a in args
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
+    ]
+    assert pools[0] == ["sofascore_history_pool", "0"], pools
+    assert pools[-1] == ["sofascore_history_pool", "1"], pools
+    assert f"sofascore_history_pool restored to 1 slots" in log
 
 
 @pytest.mark.unit
@@ -452,6 +478,92 @@ def test_set_env_var_rewrites_only_its_own_line_and_fails_on_a_missing_key(tmp_p
         "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=old",
         """SOFASCORE_PROXY_POOL_JSON='[{"host":"pool","port":1}]'""",
     ]
+
+
+@pytest.mark.unit
+def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Path) -> None:
+    """Потолок ожидания. Раньше `while true` без таймаута висел ВЕЧНО: история идёт
+    @continuous, а под паузой её хвост не выполняется вовсе и dag_run не двигается.
+    Теперь исчерпанный потолок — код 4 «контур занят, выкат не начат», и он обязан быть
+    честным: ни одного compose, env не перепинован, артефакт не создан, а осушённый пул
+    и пауза истории возвращены как были."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    (state_dir / "busy").write_text("1\n")
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": "0",
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    assert not [a for a in args if a.startswith("compose ")], args
+    assert f"SOFASCORE_RELEASE_ROOT={release}" not in env_file.read_text(encoding="utf-8")
+    assert not (runtime / "artifacts").exists()
+    pools = [
+        a.split()[5:7] for a in args
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
+    ]
+    assert pools == [["sofascore_history_pool", "0"], ["sofascore_history_pool", "1"]], pools
+    # Контур занят — значит НИЧЕГО не изменилось: обе кампании работают дальше.
+    assert (state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
+    assert (state_dir / f"paused_{HIST}").read_text().strip() == "f"
+    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
+    assert "FAILED at step 'drain'" in log
+    assert "nothing deployed" in log
+
+
+@pytest.mark.unit
+def test_deploy_closes_the_history_run_that_froze_under_the_pause(tmp_path: Path) -> None:
+    """@continuous успевает создать новый dag_run между «контур свободен» и паузой.
+    Под паузой планировщик его не рассматривает вовсе (next_dagruns_to_examine требует
+    is_paused == false, а dagrun_timeout проверяется только в _schedule_dag_run), поэтому
+    он висит НАВСЕГДА. Закрывает его ORM внутри планировщика — и только у истории:
+    дейли выкатом не паузится, его прогон живой, закрывать чужой прогон — порча боя."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    (state_dir / f"stale_on_pause_{HIST}").write_text("1\n")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    closers = [a for a in args if a.startswith("exec sofascore-airflow-scheduler python -c ")]
+    assert len(closers) == 1, closers
+    assert "DagRunState.FAILED" in closers[0], closers
+    assert closers[0].endswith(f" {HIST}"), closers
+    assert REFRESH not in closers[0] and "dag_ingest_sofascore" not in closers[0], closers
+    # Закрытие идёт ПОСЛЕ паузы истории и ДО пересоздания контейнеров.
+    assert args.index(f"exec sofascore-airflow-scheduler airflow dags pause {HIST}") < args.index(closers[0])
+    assert args.index(closers[0]) < min(i for i, a in enumerate(args) if a.startswith("compose "))
+
+
+@pytest.mark.unit
+def test_deploy_drains_the_pool_before_pausing_history_and_never_unpauses_it(tmp_path: Path) -> None:
+    """Порядок — единственное, что бережёт оплаченный скоуп. Пауза истории ДО ожидания
+    не даёт выполниться validate_historical_scope, а он единственный засчитывает скоуп в
+    state.json: следующий прогон получил бы новый run_id и купил те же 8–81 минуты
+    платного трафика заново. Поэтому дверь новым скоупам закрывает ПУЛ, а пауза приходит
+    после ожидания; распаузивать историю штатный выкат по-прежнему не вправе."""
+    proc, _release, _env_file, state_dir = _run_deploy(tmp_path, refresh_paused="f")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    drain = next(
+        i for i, a in enumerate(args)
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set sofascore_history_pool 0")
+    )
+    first_wait = next(i for i, a in enumerate(args) if "task_instance" in a)
+    pause_hist = args.index(f"exec sofascore-airflow-scheduler airflow dags pause {HIST}")
+    pause_refresh = args.index(f"exec sofascore-airflow-scheduler airflow dags pause {REFRESH}")
+    first_compose = min(i for i, a in enumerate(args) if a.startswith("compose "))
+    assert drain < first_wait < pause_hist < first_compose, args
+    assert pause_refresh < first_wait, args
+    assert f"unpause {HIST}" not in "\n".join(args), args
 
 
 @pytest.mark.unit
