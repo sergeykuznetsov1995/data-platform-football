@@ -1786,3 +1786,42 @@ def test_wrapping_transport_without_lease_lost_flag_captures_normally(tmp_path):
     assert factory.calls == client.close_calls == 1
     assert traffic["paid_proxy_bytes"] == 250
     assert traffic["lease_relaunches"] == 0
+
+
+def test_players_dag_enters_the_production_transport_and_strangers_do_not(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_players_sofascore_all_mens")
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 10], final_total=10)
+    factory = _TransportFactory(client, _Capture([_record(b'{"items":[]}')]))
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="SS-7:2627",
+        entity="player_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert traffic["paid_proxy_bytes"] == 10
+    assert client.acquire_calls[0]["dag_id"] == "dag_players_sofascore_all_mens"
+
+    # The production list stays closed to everything else.
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_players_sofascore_someone_else")
+    stranger_client = _LeaseClient([0, 0, 10], final_total=10)
+    stranger_runtime, _ = _runtime(tmp_path / "stranger")
+    with pytest.raises(ValueError):
+        capture_live_specs(
+            stranger_runtime,
+            [_spec(2)],
+            canonical_url="https://www.sofascore.com/event/1",
+            scope="SS-7:2627",
+            entity="player_capture",
+            transport_factory=_TransportFactory(
+                stranger_client, _Capture([_record(b'{"items":[]}')])
+            ),
+        )
+    assert stranger_client.acquire_calls == []
