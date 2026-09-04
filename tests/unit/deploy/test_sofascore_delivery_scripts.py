@@ -107,6 +107,8 @@ env_file="${SOFASCORE_ENV_FILE:?}"
 rel=$(sed -n 's/^SOFASCORE_RELEASES_DIR=//p' "$env_file" | head -1)
 src=$(sed -n 's/^SOFASCORE_SOURCE_REPO=//p' "$env_file" | head -1)
 [ -e "$S/freeze_fails" ] && { echo "заморозка не удалась" >&2; exit 1; }
+# Заморозка идёт до 900 с (на стенде — столько, сколько попросил тест).
+[ -e "$S/freeze_slow" ] && echo $(( $(cat "$S/now_epoch") + $(cat "$S/freeze_slow") )) > "$S/now_epoch"
 tree="$rel/release-${sha:0:8}"
 git clone -q "$src" "$tree"
 git -C "$tree" checkout -q --detach "$sha"
@@ -122,6 +124,10 @@ echo "дальше: bash deploy/sofascore/deploy.sh $tree"
 printf '%s|%s\\n' "$*" "${SOFASCORE_DEPLOY_IDLE_WAIT-<unset>}" >> "$S/deploy.calls"
 rc=$(cat "$S/deploy_rc" 2>/dev/null || echo 0)
 new="$1"
+# rc=4 — «контур занят, выкат не начат»: пул и паузы возвращает on_exit самого deploy.sh,
+# но best effort — здесь эмулируется случай, когда вернуть их он не смог.
+[ "$rc" = 4 ] && [ -e "$S/deploy_leaves_history_paused" ] \
+  && echo t > "$S/paused_dag_backfill_sofascore_all_mens"
 if [ "$rc" = 0 ] || [ -e "$S/deploy_half" ]; then
   sed -i "s#^SOFASCORE_RELEASE_ROOT=.*#SOFASCORE_RELEASE_ROOT=$new#" "$SOFASCORE_ENV_FILE"
   sed -i "s#^SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST=.*#SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST=$new/artifact.json#" "$SOFASCORE_ENV_FILE"
@@ -458,7 +464,9 @@ def test_a_missing_key_fails_closed_before_the_lock(stand: Stand, key: str) -> N
 
 def _production_on_master(stand: Stand) -> None:
     """Бой после нормальной ротации: своё замороженное дерево на master, контейнеры на нём.
-    Именно так это выглядит в жизни — правка внутри замороженного дерева в бою запрещена."""
+    Именно так это выглядит в жизни — правка внутри замороженного дерева в бою запрещена.
+    Сторожа тоже на этом дереве: маркер приёмки выдаётся только по полному контракту из шести
+    признаков, и сторож с `--expected-mount` на прежнее дерево — законный повод его не выдать."""
     subprocess.run(["git", "clone", "-q", str(stand.source), str(stand.new_tree)], check=True)
     _git(stand.new_tree, "checkout", "-q", "--detach", stand.new_sha)
     stand.new_tree.chmod(0o755)
@@ -466,6 +474,8 @@ def _production_on_master(stand: Stand) -> None:
     stand._write_env(stand.new_tree)
     stand.put("mounts_root", str(stand.new_tree))
     stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.watchdog_pids()
+    stand.put("wd_pid", (stand.stub_state / "wd_pid_new").read_text().strip())
 
 
 @pytest.mark.unit
@@ -983,3 +993,103 @@ def test_a_dirty_production_tree_is_never_used_as_a_rollback_target(stand: Stand
     assert "НЕ В ЗАКОННОМ СОСТОЯНИИ" in stand.log_text()
     assert (stand.state / "sofascore-auto-deliver.off").exists()
     assert not stand.calls("deploy")
+
+
+@pytest.mark.unit
+def test_rc4_that_leaves_the_campaign_stopped_is_an_alarm_not_a_warning(stand: Stand) -> None:
+    """Ревью Sol, раунд 3, находка 2. Код 4 безопасен для БОЯ, но не для кампании: к этому
+    моменту deploy.sh уже осушил пул и запаузил актуалку, а его собственный возврат —
+    best effort. Раньше автомат выходил нулём, и неудача restore_state уходила в EXIT-trap:
+    наружу шло ⚠️ «ничего страшного» о ночи, в которую кампания стоит."""
+    stand.watchdog_pids()
+    stand.put("deploy_rc", "4")
+    stand.put("deploy_leaves_history_paused")
+    stand.put("unpause_fails")
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "🆘" in stand.pending() and "⚠️" not in stand.pending()
+    assert "контур не вернулся в рабочее состояние" in stand.pending()
+    assert HIST in stand.pending()
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
+    assert not stand.calls("compose"), "выкат не начинался — откатывать нечего"
+    assert not (stand.state / "sofascore-inflight").exists()
+
+
+@pytest.mark.unit
+def test_a_confirmed_rollback_with_a_stopped_campaign_is_an_alarm(stand: Stand) -> None:
+    """Ревью Sol, раунд 3, находка 3. Исход отката решался одной приёмкой, а код возврата
+    restore_state игнорировался: бой возвращался на старое дерево, кампания оставалась
+    стоять, и уходило ⛔ «попробуем завтра». Следующий коммит начал бы новую доставку прямо
+    на остановленном контуре."""
+    stand.watchdog_pids()
+    stand.put("deploy_rc", "5")
+    stand.put("deploy_half")
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    stand.put("unpause_fails")     # история осталась на паузе после выката
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert stand.calls("compose"), "откат комплектом всё равно состоялся"
+    assert "🆘" in stand.pending() and "⛔" not in stand.pending()
+    assert "контур не вернулся в рабочее состояние" in stand.pending()
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
+    assert not (stand.state / "sofascore-inflight").exists(), "откат подтверждён — маркер снят"
+
+
+@pytest.mark.unit
+def test_the_headroom_is_recounted_after_the_freeze_ate_the_window(stand: Stand) -> None:
+    """Ревью Sol, раунд 3, находка 4. Запас считался ДО заморозки, а она идёт до 900 с:
+    воскресный старт в 03:30 уезжал к 05:00 против объявленного дедлайна 04:45, прямо на
+    обслуживание манифеста. Пересчёт стоит до снимка отката: после него любой выход шёл бы
+    через EXIT-trap, и неудача возврата контура осталась бы немой."""
+    stand.put("freeze_slow", "7000")     # заморозка длилась почти два часа
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "после заморозки запаса нет" in stand.log_text()
+    assert not stand.calls("deploy"), "выкат не начинаем — он упёрся бы в дедлайн"
+    assert not list(stand.state.glob("sofascore-auto-deliver-attempted-*"))
+    assert not (stand.state / "sofascore-inflight").exists()
+
+
+@pytest.mark.unit
+def test_a_matching_head_without_the_full_contract_gets_no_acceptance_marker(stand: Stand) -> None:
+    """Ревью Sol, раунд 3, находка 5. Совпадение HEAD проверялось одними монтами, а маркер
+    приёмки выдавался и fail-ночи сбрасывались — то есть «принято» объявлялось по одному
+    признаку из шести. Сторож, оставшийся на прежнем дереве, — ровно тот случай: код в бою,
+    а следит за ним чужой процесс."""
+    _production_on_master(stand)
+    stand.put("wd_pid", (stand.stub_state / "wd_pid_old").read_text().strip())
+    (stand.state / "sofascore-fail-nights").write_text("2\n", encoding="utf-8")
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not (stand.state / "sofascore-accepted").exists(), "маркер приёмки не выдаётся авансом"
+    assert "КОНТРАКТ ПРИЁМКИ НЕ СОШЁЛСЯ" in stand.log_text()
+    assert "⚠️" in stand.pending() and "контракт приёмки" in stand.pending()
+    assert (stand.state / "sofascore-fail-nights").exists(), "счётчик провальных ночей не сбрасываем"
+    # Второй тик тех же суток повторяет отказ, но не повторяет сообщение.
+    first = stand.pending()
+    stand.run()
+    assert stand.pending() == first
+
+
+@pytest.mark.unit
+def test_an_unreachable_master_still_announces_the_closing_window(stand: Stand) -> None:
+    """Ревью Sol, раунд 3, находка 6. Недоступный master завершал тик ДО разговора об окне,
+    поэтому обещанный ежесуточный сигнал не звучал ни разу за такую ночь — а бой остаётся на
+    старом коде ровно так же, как при неудачной доставке."""
+    stand.env_file.write_text(
+        stand.env_file.read_text(encoding="utf-8").replace(
+            f"SOFASCORE_SOURCE_REPO={stand.source}", f"SOFASCORE_SOURCE_REPO={stand.tmp}/no-such-repo"
+        ),
+        encoding="utf-8",
+    )
+    stand.put("now_epoch", str(_epoch("2026-09-03 05:57:00")))
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stderr
+    assert "master недоступен" in stand.log_text()
+    assert "окно доставки закрывается" in stand.pending() and "master недоступен" in stand.pending()
+    assert not stand.calls("deploy")
+    # Один маркер на все причины: второй тик тех же суток молчит.
+    first = stand.pending()
+    stand.run()
+    assert stand.pending() == first

@@ -212,6 +212,20 @@ inspect(){ timeout -k 5 30 docker inspect "$@" 2>/dev/null; }
 
 # --- снимок боя (цель отката) ---------------------------------------------------------
 snap_get(){ sed -n "s/^$1=//p" "$SNAPSHOT" 2>/dev/null | head -1; }
+# Ожидаемые слоты пула: снимок, если он есть (сверка с литералом 1/1/1 дала бы ложный откат
+# после первого же расширения полосы), иначе — значения env-файла, те же, что ставит deploy.sh.
+# У ingest_scraper_pool ключа нет нигде: он всегда 1, и поднятый руками пул будет читаться как
+# «контракт не сошёлся» — это видно в алерте и уходит после первой же доставки со снимком.
+pool_want(){  # pool_want <pool>
+  local w
+  w=$(snap_get "POOL_$1")
+  case "$w" in ''|*[!0-9]*) ;; *) printf '%s' "$w"; return ;; esac
+  case "$1" in
+    sofascore_history_pool) printf '%s' "$HISTORY_SLOTS" ;;
+    sofascore_players_pool) printf '%s' "$PLAYERS_SLOTS" ;;
+    *) printf '1' ;;
+  esac
+}
 RESTORE_PENDING=""
 RESTORE_NOTE=""
 ROLLBACK_NOTE=""
@@ -308,7 +322,7 @@ acceptance_seen(){  # acceptance_seen <новое дерево> <StartedAt sched
   for c in $POOLS; do
     got=$(metadb "SELECT slots FROM slot_pool WHERE pool='$c';")
     [ "$got" = X ] && { echo X; return; }
-    [ "$got" = "$(snap_get "POOL_$c")" ] || { echo 0; return; }
+    [ "$got" = "$(pool_want "$c")" ] || { echo 0; return; }
   done
   # Сторожа: Type=simple + Restart=always означают, что `is-active` отвечает active сразу
   # после exec, а MainPID меняется — /proc читаем каждый раз заново, не по кэшу.
@@ -384,6 +398,9 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
     timeout -k 5 60 docker logs "$c" --tail 200 >> "$LOG" 2>&1
   done
   repin_env_to_old "$old" || return 1
+  # Возврат пауз и слотов (ниже, restore_state) — часть исхода отката, а не побочный шаг:
+  # бой на старом дереве при остановленной кампании — это «зелёно, но пусто». Ответ несёт
+  # RESTORE_NOTE, его читают обе ветки «откат подтверждён».
   # Пересоздание scheduler'а обрывает любой идущий таск: второй раз за ночь этого делать
   # нельзя не глядя. Ждём освобождения контура, но НЕ бесконечно: бой, оставшийся на
   # непринятом дереве, хуже оборванного прогона. Если ждать не дождались — откатываем всё
@@ -440,6 +457,28 @@ acceptance_rollback(){
 contour_busy(){
   # Историю сюда НЕ включаем: ею занимается шаг drain внутри deploy.sh.
   metadb "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT') AND state IN ('queued','running');"
+}
+
+# --- окно доставки ----------------------------------------------------------------------
+# Считается в одном месте, потому что спрашивают о нём двое: шаг «окно и запас» и ветка
+# «master недоступен» — она выходила из тика раньше всякого разговора об окне, и обещанный
+# ежесуточный сигнал не звучал ни разу за ночь, когда до master не дозвониться.
+set_window(){   # выставляет hm, end, now, deadline, in_window
+  now=$(date -u +%s)
+  hm=$((10#$(date -u +%H%M)))
+  end=$WINDOW_TO
+  [ "$(date -u +%u)" = 7 ] && end=$SUNDAY_TO   # вс. 05:00 UTC — обслуживание манифеста
+  deadline=$(date -u -d "$TODAY ${end:0:2}:${end:2:2}" +%s)
+  in_window=0
+  { [ "$hm" -ge "$((10#$WINDOW_FROM))" ] && [ "$hm" -le "$((10#$end))" ]; } && in_window=1
+}
+# Один суточный маркер на все причины: ночь без доставки — одна новость, а не три.
+announce_missed_window(){  # announce_missed_window <текст>
+  [ "$in_window" = 1 ] || return 0
+  [ "$(( deadline - $(date -u +%s) ))" -le 300 ] || return 0
+  said_today "$STATE/sofascore-window-missed-$TODAY" && return 0
+  tg_durable "$1"
+  mark_said "$STATE/sofascore-window-missed-$TODAY"
 }
 
 # ---- 0. Каталог состояния ---------------------------------------------------------------
@@ -573,8 +612,16 @@ if is_plain "$INFLIGHT"; then
   log "НЕЗАКРЫТАЯ ДОСТАВКА и бой не на $OLD — откатываю комплектом"
   started_before=$(inspect -f '{{.State.StartedAt}}' "$SCHED")
   if rollback_to_old "$OLD" "$started_before"; then
-    tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE}${RESTORE_NOTE:+ Не вернулось:$RESTORE_NOTE} Следующая попытка — в ближайшее окно. Лог: $LOG"
+    # Маркер снимаем в любом случае: откат подтверждён, бой на старом дереве, разбирать
+    # «прерванную доставку» следующему тику незачем.
     rm -f "$INFLIGHT"
+    if [ -n "$RESTORE_NOTE" ]; then
+      log "ОТКАТ ПОДТВЕРЖДЁН, НО КОНТУР НЕ ВЕРНУЛСЯ В РАБОТУ:$RESTORE_NOTE — глушу автомат"
+      tg_durable "🆘 SofaScore: прошлая доставка оборвалась, откат на $OLD подтверждён, НО контур не вернулся в рабочее состояние —$RESTORE_NOTE${ROLLBACK_NOTE} Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+      set_off
+    else
+      tg_durable "⛔ SofaScore: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён (пять DAG перечитаны, ошибок импорта нет, три шлюза healthy на старом дереве, сторожа на нём же).${ROLLBACK_NOTE} Следующая попытка — в ближайшее окно. Лог: $LOG"
+    fi
   else
     tg_durable "🆘 SofaScore: прошлая доставка оборвалась И откат на $OLD не подтверждён. НУЖНЫ РУКИ. Если шлюз не поднялся и после отката — смотреть формат $(dirname "$(snap_get OLD_ARTIFACT_HOST)")/../gateway-state*/sofascore_allocations.json: новый код мог переписать ledger так, что старый бинарь его не читает; процедурой это не лечится. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     set_off
@@ -590,6 +637,10 @@ WANT=$(timeout -k 5 60 git ls-remote "$SOURCE_REPO" refs/heads/master 2>/dev/nul
 is_sha40(){ case "$1" in *[!0-9a-f]*) return 1 ;; esac; [ "${#1}" = 40 ]; }
 if ! is_sha40 "$WANT"; then
   log "master недоступен (git ls-remote $SOURCE_REPO вернул '$WANT') — вслепую не переключаемся"
+  # Молчаливый выход съедал бы обещанный ежесуточный сигнал: недоступный master держит бой на
+  # старом коде ровно так же, как неудачная доставка, и узнать об этом надо той же ночью.
+  set_window
+  announce_missed_window "⚠️ SofaScore: окно доставки закрывается, а master недоступен (git ls-remote $SOURCE_REPO вернул '$WANT') — бой остаётся на ${LIVE:0:8}. Причина — в $LOG; следующая попытка завтра."
   exit 0
 fi
 if [ "$LIVE" = "$WANT" ]; then
@@ -611,10 +662,29 @@ if [ "$LIVE" = "$WANT" ]; then
     fi
     exit 1
   fi
-  # Бой на master и целиком на одном дереве — ровно то, чего мы хотим. Заодно поддерживаем
-  # маркер приёмки в актуальном виде: ручной выкат законен и маркера не ставит.
-  [ "$(head -c 64 "$ACCEPTED" 2>/dev/null | tr -d ' \n\r')" = "$WANT" ] \
-    || { printf '%s\n' "$WANT" > "$ACCEPTED" 2>/dev/null || log "маркер приёмки $ACCEPTED не записан"; }
+  # Бой на master и целиком на одном дереве. Маркер приёмки — утверждение «принято», и по
+  # одним монтам его выдавать нельзя: контракт из шести признаков ловит и сторожа на старом
+  # дереве, и осушённый пул, и ошибку импорта. Полную проверку делаем ровно там, где маркер
+  # ВЫДАЁТСЯ: в установившемся режиме (маркер уже равен master) она стоила бы полутора
+  # десятков внешних вызовов каждые пять минут круглосуточно, а автомат не сторож кампании.
+  if [ "$(head -c 64 "$ACCEPTED" 2>/dev/null | tr -d ' \n\r')" != "$WANT" ]; then
+    started=$(inspect -f '{{.State.StartedAt}}' "$SCHED")
+    seen=X
+    [ -n "$started" ] && seen=$(acceptance_seen "$LIVE_ROOT" "$started")
+    if [ "$seen" = X ]; then
+      log "бой на master, но контракт приёмки проверить нечем — маркер приёмки не трогаю"
+      exit 0
+    fi
+    if [ "$seen" != 1 ]; then
+      log "БОЙ НА MASTER, НО КОНТРАКТ ПРИЁМКИ НЕ СОШЁЛСЯ — маркер приёмки не выдаю"
+      if ! said_today "$STATE/sofascore-contract-failed-$TODAY"; then
+        tg_durable "⚠️ SofaScore: бой стоит на master ($LIVE_ROOT), но контур не проходит контракт приёмки из шести признаков (пять DAG перечитаны и без ошибок импорта, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов в этом дереве, слоты пулов как ожидается, три сторожа на нём же). Маркер приёмки не выдаю, доставлять нечего. Разбор: $LOG"
+        mark_said "$STATE/sofascore-contract-failed-$TODAY"
+      fi
+      exit 0
+    fi
+    printf '%s\n' "$WANT" > "$ACCEPTED" 2>/dev/null || log "маркер приёмки $ACCEPTED не записан"
+  fi
   rm -f "$FAILNIGHTS"
   exit 0
 fi
@@ -638,16 +708,10 @@ if [ -z "$LIVE" ] || [ -n "$DIRTY" ]; then
 fi
 
 # ---- 4. Окно и запас времени ------------------------------------------------------------------
-hm=$((10#$(date -u +%H%M)))
-end=$WINDOW_TO
-[ "$(date -u +%u)" = 7 ] && end=$SUNDAY_TO   # вс. 05:00 UTC — обслуживание манифеста
-{ [ "$hm" -ge "$((10#$WINDOW_FROM))" ] && [ "$hm" -le "$((10#$end))" ]; } || exit 0
-now=$(date -u +%s)
-deadline=$(date -u -d "$TODAY ${end:0:2}:${end:2:2}" +%s)
-if [ "$(( deadline - now ))" -le 300 ] && ! said_today "$STATE/sofascore-window-missed-$TODAY"; then
-  tg_durable "⚠️ SofaScore: окно доставки закрывается, а бой всё ещё на ${LIVE:0:8} (master ${WANT:0:8}). Причина — в $LOG; следующая попытка завтра."
-  mark_said "$STATE/sofascore-window-missed-$TODAY"
-fi
+set_window
+[ "$in_window" = 1 ] || exit 0
+announce_missed_window "⚠️ SofaScore: окно доставки закрывается, а бой всё ещё на ${LIVE:0:8} (master ${WANT:0:8}). Причина — в $LOG; следующая попытка завтра."
+
 IDLE_WAIT=$(( deadline - now - DEPLOY_CEILING - ACCEPT_WAIT ))
 if [ "$IDLE_WAIT" -lt "$MIN_DRAIN" ]; then
   log "запаса нет ($IDLE_WAIT с до дедлайна за вычетом потолков) — сегодня не доставляем"
@@ -698,6 +762,18 @@ else
     exit 1
   fi
 fi
+
+# Дедлайн держится по ЧАСАМ, а не по началу тика: заморозка дерева занимает до 900 с, и
+# воскресный старт в 03:30 уезжал бы к 05:00 против объявленного дедлайна 04:45 — прямо на
+# обслуживание манифеста. Пересчитываем ЗДЕСЬ, до снимка: дальше стоит RESTORE_PENDING=1, и
+# выход прошёл бы через trap restore_state, чья неудача осталась бы немой.
+IDLE_WAIT=$(( deadline - $(date -u +%s) - DEPLOY_CEILING - ACCEPT_WAIT ))
+if [ "$IDLE_WAIT" -lt "$MIN_DRAIN" ]; then
+  log "после заморозки запаса нет ($IDLE_WAIT с до дедлайна за вычетом потолков) — сегодня не доставляем"
+  announce_missed_window "⚠️ SofaScore: окно доставки закрывается, а бой всё ещё на ${LIVE:0:8} (master ${WANT:0:8}): заморозка дерева съела запас. Причина — в $LOG; следующая попытка завтра."
+  exit 0
+fi
+DELIVER_TIMEOUT=$(( IDLE_WAIT + DEPLOY_CEILING ))
 
 # ---- 6. Снимок боя ---------------------------------------------------------------------------
 OLD="$LIVE_ROOT"
@@ -772,7 +848,18 @@ log "deploy.sh вернул $rc"
 # следующий тик не пройдёт порог MIN_DRAIN. Цена — до 90 минут ночи без прогресса кампании.
 if [ "$rc" = 4 ]; then
   log "контур не освободился за ${IDLE_WAIT}s — выкат не начинался, откатывать нечего"
+  # Возврат контура проверяем ЗДЕСЬ, а не оставляем EXIT-trap'у: deploy.sh на этом коде уже
+  # вернул пул и паузы сам, но если не вернул — при `exit 0` неудача restore_state ушла бы в
+  # один лог, а наружу пошло бы ⚠️ «ничего страшного» о ночи, в которую кампания стоит.
+  restored=1
+  restore_state || restored=0
   rm -f "$ATTEMPTED" "$INFLIGHT"
+  if [ "$restored" != 1 ]; then
+    log "ВЫКАТ НЕ НАЧАЛСЯ, И КОНТУР НЕ ВЕРНУЛСЯ В РАБОТУ:$RESTORE_NOTE — глушу автомат"
+    tg_durable "🆘 SofaScore: доставка ${WANT:0:8} не состоялась (контур не освободился за ${IDLE_WAIT}s, бой не тронут), И контур не вернулся в рабочее состояние —$RESTORE_NOTE Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+    set_off
+    exit 1
+  fi
   tg_durable "⚠️ SofaScore: доставка ${WANT:0:8} не состоялась — контур не освободился за ${IDLE_WAIT}s (выкат не начинался, бой не тронут). Следующая попытка завтра. Лог: $LOG"
   exit 0
 fi
@@ -843,13 +930,21 @@ fails=$(( ${fails:-0} + 1 ))
 { printf '%s\n' "$fails" > "$FAILNIGHTS"; } 2>/dev/null || fails=$FAIL_NIGHTS_MAX
 if rollback_to_old "$OLD" "$started_before"; then
   log "ОТКАТ ПОДТВЕРЖДЁН: бой на $OLD"
-  msg="⛔ SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён теми же шестью признаками.${ROLLBACK_NOTE}${RESTORE_NOTE:+ Не вернулось:$RESTORE_NOTE} Ночь $fails из $FAIL_NIGHTS_MAX подряд. Разбор: $LOG"
-  if [ "$fails" -ge "$FAIL_NIGHTS_MAX" ]; then
-    msg="$msg Больше не пробую — автомат заглушен, снять $OFF после разбора."
-    set_off
-  fi
-  tg_durable "$msg"
   rm -f "$INFLIGHT"
+  if [ -n "$RESTORE_NOTE" ]; then
+    # Откат сошёлся, но кампания стоит — это не ⛔ «попробуем завтра», а авария: следующий
+    # коммит начал бы новую доставку на остановленном контуре.
+    log "ОТКАТ ПОДТВЕРЖДЁН, НО КОНТУР НЕ ВЕРНУЛСЯ В РАБОТУ:$RESTORE_NOTE — глушу автомат"
+    tg_durable "🆘 SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'), откат на $OLD подтверждён, НО контур не вернулся в рабочее состояние —$RESTORE_NOTE${ROLLBACK_NOTE} Кампания будет стоять, пока это не поправят. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+    set_off
+  else
+    msg="⛔ SofaScore: доставка ${WANT:0:8} НЕ состоялась (deploy.sh вернул $rc, приёмка '$seen'). Откат на $OLD подтверждён теми же шестью признаками.${ROLLBACK_NOTE} Ночь $fails из $FAIL_NIGHTS_MAX подряд. Разбор: $LOG"
+    if [ "$fails" -ge "$FAIL_NIGHTS_MAX" ]; then
+      msg="$msg Больше не пробую — автомат заглушен, снять $OFF после разбора."
+      set_off
+    fi
+    tg_durable "$msg"
+  fi
 else
   log "ОТКАТ НЕ ПОДТВЕРЖДЁН — глушу автомат, маркер доставки оставляю"
   tg_durable "🆘 SofaScore: доставка ${WANT:0:8} провалилась (rc=$rc) И откат на $OLD не подтверждён.${ROLLBACK_NOTE}${RESTORE_NOTE:+ Не вернулось:$RESTORE_NOTE} НУЖНЫ РУКИ. Если шлюз не поднялся и после отката — смотреть формат sofascore_allocations.json в каталогах состояния полос: новый код мог переписать ledger так, что старый бинарь его не читает, и процедурой отката это не лечится. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
