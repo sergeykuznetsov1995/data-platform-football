@@ -53,6 +53,13 @@ CAMPAIGN="$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
+PLAYERS=dag_players_sofascore_all_mens
+# Число core-DAG выводится ИЗ СПИСКА и нигде не пишется литералом: рассинхрон
+# списка и числа — самая дешёвая в исполнении и самая дорогая по последствиям
+# ошибка этого рецепта (приёмка не сходится ни разу, зелёная доставка откатывается).
+CORE_DAGS="$DAILY $HIST $REFRESH $PLAYERS"
+CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
+CORE_DAGS_N=$(set -- $CORE_DAGS; echo $#)
 # Три полосы источника (#1244): свой шлюз, свой пул, свой сторож аренд у каждой.
 GATEWAYS="sofascore_proxy_filter sofascore_gw_history sofascore_gw_players"
 GATEWAY_CONTAINERS="sofascore_gw_951 sofascore_gw_history sofascore_gw_players"
@@ -118,7 +125,7 @@ wait_drained() {  # wait_drained <секунд> <run_id прогона исто�
     # стартовать plan_historical_batch. Одним, а не четырьмя: рваное чтение показало бы контур
     # свободным по числам из разных моментов. Пустой ответ (метабаза недоступна / timeout) —
     # это «не знаю», а не «свободно».
-    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$2' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running'));" || true)
+    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH','$PLAYERS') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$2' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running'));" || true)
     [ "${DRAIN_ROW:-x}" = "0|0|0|0" ] && return 0
     tries=$(( tries - 1 ))
     [ "$tries" -le 0 ] && return 1
@@ -158,6 +165,11 @@ on_exit() {
       log "sofascore_history_pool restored to $HISTORY_SLOTS slots"
     else
       log "MANUAL ACTION REQUIRED: sofascore_history_pool left drained — airflow pools set sofascore_history_pool $HISTORY_SLOTS 'SofaScore history lane'"
+    fi
+    if set_pool sofascore_players_pool "$PLAYERS_SLOTS" 'SofaScore players lane'; then
+      log "sofascore_players_pool restored to $PLAYERS_SLOTS slots"
+    else
+      log "MANUAL ACTION REQUIRED: sofascore_players_pool left drained — airflow pools set sofascore_players_pool $PLAYERS_SLOTS 'SofaScore players lane'"
     fi
   fi
   # rc=4 — «контур занят, выкат не начат»: паузу истории тоже возвращаем как было.
@@ -208,6 +220,10 @@ REFRESH_WAS_PAUSED=$(is_paused "$REFRESH")
 HIST_WAS_PAUSED=$(is_paused "$HIST")
 log "drain: sofascore_history_pool -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
 set_pool sofascore_history_pool 0 'SofaScore history lane (drained for deploy)'
+# Полосу игроков паузить нельзя по той же причине, что и историю: под паузой не
+# отработает validate_players_scope, и оплаченный скоуп не будет засчитан.
+# Дверь новым скоупам закрывает пул, а взятый доработает вместе со своим validate.
+set_pool sofascore_players_pool 0 'SofaScore players lane (drained for deploy)'
 POOL_DRAINED=1
 pause_dag "$REFRESH"
 # Ждём прогон, который ДЕРЖИТ слот пула, а не любой активный: прогон, чей скоуп ещё не успел
@@ -244,11 +260,11 @@ OLD_STATE_DIR="${OLD_RELEASE:+$OLD_RELEASE/logs/sofascore-all-men}"
 if [ -n "$OLD_STATE_DIR" ] && [ -d "$OLD_STATE_DIR" ] && [ ! -e "$CAMPAIGN/state.json" ]; then
   cp -a "$OLD_STATE_DIR/state.json" "$CAMPAIGN/state.json"
   [ -e "$OLD_STATE_DIR/failures.json" ] && cp -a "$OLD_STATE_DIR/failures.json" "$CAMPAIGN/failures.json"
-  mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results"
+  mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results" "$CAMPAIGN/players-results"
   cp -a "$OLD_STATE_DIR/results/." "$CAMPAIGN/results/"
   log "campaign state migrated from $OLD_STATE_DIR ($(python3 -c "import json;print(len(json.load(open('$CAMPAIGN/state.json'))['completed']))") completed)"
 fi
-mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results"
+mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results" "$CAMPAIGN/players-results"
 # Каталог кампании растёт вместе с ней (тысячи файлов): без потолка `chown` мог бы
 # оказаться самым долгим шагом выката, который никто не ограничивает.
 timeout -k 5 120 chown -R 50000:0 "$CAMPAIGN"
@@ -323,13 +339,13 @@ docker exec sofascore-airflow-scheduler python /opt/airflow/scripts/sofascore_ru
   --campaign-policy /opt/airflow/configs/sofascore/all_mens_campaign.json >> "$LOG" 2>&1
 for _ in $(seq 1 30); do
   errs=$($PSQL "SELECT count(*) FROM import_error;")
-  present=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('$HIST','$REFRESH','$DAILY') AND is_active=true;")
-  [ "$present" = "3" ] && break
+  present=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active=true;")
+  [ "$present" = "$CORE_DAGS_N" ] && break
   sleep 10
 done
 log "dags active=$present import_errors=$errs"
 [ "$errs" = "0" ] || { log "import errors present — см. import_error"; exit 6; }
-[ "$present" = "3" ] || { log "expected 3 active core DAGs, got $present"; exit 6; }
+[ "$present" = "$CORE_DAGS_N" ] || { log "expected $CORE_DAGS_N active core DAGs, got $present"; exit 6; }
 
 STEP="pools"
 # Пулы полос заводит airflow-init, но deploy.sh пересоздаёт только scheduler и шлюзы —
