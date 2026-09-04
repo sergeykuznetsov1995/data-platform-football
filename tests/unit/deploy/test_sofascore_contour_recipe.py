@@ -38,6 +38,14 @@ SCRIPTS = (
     DEPLOY / "auto_deliver.sh",
 )
 MINI_DAGS = ("dag_trigger_sofascore_daily.py", "dag_sofascore_manifest_maintenance.py")
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "sofascore-ci.yml"
+# Ровно те DAG, что живут в изолированном контуре (deploy/sofascore/.airflowignore).
+CONTOUR_DAGS = (
+    "dag_ingest_sofascore.py",
+    "dag_backfill_sofascore_all_mens.py",
+    "dag_refresh_sofascore_all_mens.py",
+    "dag_players_sofascore_all_mens.py",
+) + MINI_DAGS
 
 # Три полосы источника (#1244): свой шлюз, свой дневной потолок, свой слот аренды,
 # свой каталог состояния. До развода все три ходили через sofascore_gw_951 и давали
@@ -355,3 +363,28 @@ def test_every_lane_has_a_watchdog_bound_to_its_own_gateway_and_state_dir() -> N
         assert "dpf-release" not in unit, unit_path.name
         seen.add((gateway["container_name"], state))
     assert len(seen) == 3, seen
+
+
+@pytest.mark.unit
+def test_every_contour_dag_is_present_in_all_three_ci_lists() -> None:
+    """Иначе следующий новый DAG контура снова окажется вне CI: у SofaScore
+    нет джобы реального импорта, и линт с компиляцией — единственный гейт."""
+
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    paths_block, jobs = text.split("jobs:", 1)
+    ruff_block = jobs.split("ruff check", 1)[1].split("python -m compileall", 1)[0]
+    compile_block = jobs.split("python -m compileall", 1)[1].split(
+        "python -m py_compile", 1
+    )[0]
+    pytest_block = jobs.split("pytest -q", 1)[1]
+
+    for name in CONTOUR_DAGS:
+        assert (ROOT / "dags" / name).exists(), name
+        assert f"dags/{name}" in paths_block, name
+        assert f"dags/{name}" in ruff_block, name
+        assert f"dags/{name}" in compile_block, name
+
+    for test_file in sorted(
+        (ROOT / "tests" / "unit" / "dags").glob("test_dag_*sofascore*.py")
+    ):
+        assert f"tests/unit/dags/{test_file.name}" in pytest_block, test_file.name

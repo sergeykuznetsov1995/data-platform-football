@@ -10,6 +10,7 @@ on:
       - "dags/dag_ingest_sofascore.py"
       - "dags/dag_backfill_sofascore_all_mens.py"
       - "dags/dag_refresh_sofascore_all_mens.py"
+      - "dags/dag_players_sofascore_all_mens.py"
       - "dags/dag_trigger_sofascore_daily.py"
       - "dags/dag_sofascore_manifest_maintenance.py"
       - "dags/.airflowignore"
@@ -78,6 +79,7 @@ jobs:
             dags/dag_ingest_sofascore.py \
             dags/dag_backfill_sofascore_all_mens.py \
             dags/dag_refresh_sofascore_all_mens.py \
+            dags/dag_players_sofascore_all_mens.py \
             dags/dag_trigger_sofascore_daily.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_iceberg_maintenance.py \
@@ -101,6 +103,8 @@ jobs:
             dags/dag_ingest_sofascore.py \
             dags/dag_sofascore_pipeline.py \
             dags/dag_trigger_sofascore_daily.py dags/dag_sofascore_manifest_maintenance.py \
+            dags/dag_backfill_sofascore_all_mens.py dags/dag_refresh_sofascore_all_mens.py \
+            dags/dag_players_sofascore_all_mens.py \
             scripts/migrate_sofascore_production.py
           python -m py_compile \
             dags/dag_iceberg_maintenance.py \
@@ -117,6 +121,7 @@ jobs:
             tests/unit/configs/test_sofascore_endpoint_coverage.py \
             tests/unit/dags/test_dag_backfill_sofascore_all_mens.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
+            tests/unit/dags/test_dag_players_sofascore_all_mens.py \
             tests/unit/dags/test_dag_refresh_sofascore_all_mens.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_sofascore_pipeline.py \
