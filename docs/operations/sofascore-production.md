@@ -108,10 +108,25 @@ ls -1 "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/*/players.json | wc
 grep -rl 'concurrency limit reached' \
   "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"/players-results/ | wc -l                       # ждём 0
 python3 -c "import json;d=json.load(open('$SOFASCORE_PLAYERS_GW_STATE_HOST_DIR/bytes.json'));print(d)"
-# 4. История и актуалка не замедлились: успешные прогоны за сутки до и после выката
+# 4. История и актуалка не замедлились. Считать НЕ только состояния прогонов, но и
+#    длительность самих скоупов — до и после снятия паузы с полосы (подставить момент
+#    распаузивания вместо <CUTOVER>): доля зелёных, число скоупов в сутки и медиана
+#    длительности должны остаться прежними.
 docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
-  "SELECT dag_id, state, count(*) FROM dag_run WHERE dag_id IN ('dag_backfill_sofascore_all_mens','dag_refresh_sofascore_all_mens') \
-   AND start_date > now() - interval '24 hours' GROUP BY 1,2 ORDER BY 1,2;"
+  "SELECT ti.dag_id, ti.task_id, ti.start_date < TIMESTAMPTZ '<CUTOVER>' AS before_lane, \
+          count(*) AS scopes, count(*) FILTER (WHERE ti.state='success') AS green, \
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (ti.end_date-ti.start_date))/60)::numeric, 1) AS median_min \
+     FROM task_instance ti \
+    WHERE ti.task_id IN ('run_historical_scope','run_refresh_scope') \
+      AND ti.start_date > TIMESTAMPTZ '<CUTOVER>' - interval '24 hours' \
+      AND ti.start_date < TIMESTAMPTZ '<CUTOVER>' + interval '24 hours' \
+      AND ti.end_date IS NOT NULL \
+    GROUP BY 1,2,3 ORDER BY 1,2,3;"
+# 4b. Полоса не пересекается с окном доставки: ни один прогон полосы не идёт в 03:30-06:00 UTC
+docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT run_id, start_date, end_date FROM dag_run WHERE dag_id='dag_players_sofascore_all_mens' \
+      AND (start_date, coalesce(end_date, now())) OVERLAPS \
+          (date_trunc('day', start_date) + interval '3 hours 30 minutes', date_trunc('day', start_date) + interval '6 hours');"
 # 5. Очередь полосы растёт:
 python3 -c "import json;print(len(json.load(open('$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR/players-state.json'))['completed']))"
 ```
@@ -228,7 +243,8 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 **Новый DAG приезжает ЗАПАУЩЕННЫМ** (`is_paused_upon_creation=True`) и сам не стартует
 никогда: ни `deploy.sh`, ни автомат его не распаузивают — платный трафик не должен идти
 без присмотра. После первой доставки такого DAG снять паузу руками вне окна доставки и
-посмотреть первый прогон; для полосы профилей это шаг 0 её приёмки (см. ниже).
+посмотреть первый прогон; для полосы профилей это шаг 0 её приёмки — раздел
+«Полоса профилей игроков» выше, подраздел «Приёмка полосы».
 
 ## Ночная доставка (автомат, #1245)
 
