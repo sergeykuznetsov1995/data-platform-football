@@ -107,6 +107,8 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
             fi
             # scheduler-down simulation: `airflow dags unpause` fails once the flag exists
             [ "$3" = unpause ] && [ -e "$STATE/scheduler_down" ] && exit 1
+            # обслуживание манифеста не распаузилось: команда прошла, состояние не сошлось
+            [ "$3" = unpause ] && [ -e "$STATE/maint_unpause_fails" ] && [ "$4" = "dag_sofascore_manifest_maintenance" ] && exit 0
             case "$3" in pause) echo t > "$STATE/paused_$4" ;; unpause) echo f > "$STATE/paused_$4" ;; esac
             exit 0
           fi
@@ -168,7 +170,7 @@ def _layout(
     state_dir = tmp_path / "stub-state"
     bin_dir = tmp_path / "bin"
     state_dir.mkdir()
-    for lane in ("gateway-state", "gateway-state-history", "gateway-state-players"):
+    for lane in ("gateway-state", "gateway-state-history", "gateway-state-players", "auto-deliver"):
         (runtime / lane).mkdir(parents=True)
     _stubs(bin_dir, state_dir)
     write_metadb_stub(state_dir)
@@ -1075,11 +1077,12 @@ def test_the_capture_scope_accounting_is_proven_from_the_metadb(
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "scope_state,expected",
-    # Упавшая волна метаданных учтённой НЕ считается: платный запрос уходит до записи
-    # чекпойнта (scripts/enrich_sofascore_all_mens_snapshot.py), состояние не двинулось —
-    # planner купит ту же волну заново. Третий случай: прогон закрыт (dagrun_timeout), а
+    # Упавшая волна метаданных — `unknown`: чекпойнт пишется в середине задачи
+    # (scripts/enrich_sofascore_all_mens_snapshot.py), поэтому `failed` бывает и до записи
+    # (волну купят заново), и после неё (волна учтена, упало закрытие клиента) — по цвету
+    # задачи эти случаи неразличимы. Третий случай: прогон закрыт (dagrun_timeout), а
     # задача метаданных так и не стала терминальной — результата нет, учёт не подтверждён.
-    [("success", "t"), ("failed", "f"), ("restarting", "f")],
+    [("success", "t"), ("failed", "unknown"), ("restarting", "f")],
 )
 def test_the_metadata_scope_accounting_uses_its_own_task_state(
     tmp_path: Path, scope_state: str, expected: str
@@ -1283,6 +1286,54 @@ def test_a_descriptor_that_is_not_the_lock_is_an_error_not_a_busy_contour(tmp_pa
 
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "ведёт не на замок выката" in proc.stderr
+
+
+@pytest.mark.unit
+def test_a_maintenance_that_did_not_come_back_is_not_a_finished_deploy(tmp_path: Path) -> None:
+    """Ревью Sol, круг 2. Несошедшееся постусловие возврата паузы обслуживания только
+    писалось в журнал, а функция возвращала ноль: выкат заканчивался DONE, обслуживание
+    оставалось под паузой навсегда, и воскресный прогон просто не запускался бы."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE, maint_paused="f",
+        pre=lambda rt: (rt.parent / "stub-state" / "maint_unpause_fails").touch(),
+    )
+
+    assert r.proc.returncode == 7, r.out
+    assert "MANUAL ACTION REQUIRED" in r.log
+    assert "DONE" not in r.log
+
+
+@pytest.mark.unit
+def test_the_proof_lands_in_the_state_directory_the_automat_reads(tmp_path: Path) -> None:
+    """Ревью Sol, круг 2. Писатель брал каталог из SOFASCORE_RUNTIME_DIR, а читатель —
+    из отдельно настраиваемого SOFASCORE_AUTO_STATE_DIR: разъехавшись, автомат читал бы
+    вечно чужой файл и молчал бы об этом."""
+    alien = tmp_path / "elsewhere"
+    alien.mkdir()
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        env_extra={"SOFASCORE_AUTO_STATE_DIR": str(alien)},
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert (alien / "last-drain.env").exists(), list(alien.iterdir())
+    assert not (r.runtime / "auto-deliver" / "last-drain.env").exists()
+
+
+@pytest.mark.unit
+def test_the_proof_is_not_written_into_a_state_directory_that_does_not_exist(tmp_path: Path) -> None:
+    """Ревью Sol, круг 2. `mkdir -p` под доказательство учёта воссоздавал бы каталог
+    состояния автомата — тот самый, где живут выключатель, маркер незакрытой доставки и
+    снимок отката. Потеряв каталог, автомат обязан остановиться fail-closed, а не найти
+    свежесозданный пустой и пойти доставлять."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        pre=lambda rt: (rt / "auto-deliver").rmdir(),
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert not (r.runtime / "auto-deliver").exists(), "каталог состояния автомата не создаём"
+    assert "каталога состояния автомата нет" in r.log
 
 
 @pytest.mark.unit

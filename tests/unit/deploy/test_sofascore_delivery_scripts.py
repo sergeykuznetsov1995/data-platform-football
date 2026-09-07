@@ -315,7 +315,8 @@ case "$1" in
     case "$4" in
       dags)
         case "$5" in
-          pause) echo t > "$S/paused_$6" ;;
+          pause)
+            [ -e "$S/pause_maint_fails" ] && [ "$6" = "dag_sofascore_manifest_maintenance" ] || echo t > "$S/paused_$6" ;;
           unpause)
             skip=0
             [ -e "$S/unpause_fails" ] && skip=1
@@ -1199,6 +1200,26 @@ def test_rc4_that_leaves_the_campaign_stopped_is_an_alarm_not_a_warning(stand: S
     assert (stand.state / "sofascore-auto-deliver.off").exists()
     assert not stand.calls("compose"), "выкат не начинался — откатывать нечего"
     assert not (stand.state / "sofascore-inflight").exists()
+
+
+@pytest.mark.unit
+def test_a_rollback_that_could_not_pause_the_maintenance_says_so(stand: Stand) -> None:
+    """Ревью Sol, круг 2. Пауза обслуживания перед откатом ставилась вслепую: команда могла
+    отказать, прогон обслуживания стартовал бы между проверкой «контур свободен» и
+    пересозданием контейнеров и был бы оборван молча, а откат доложили бы как штатный.
+    Откат из-за этого не отменяем — бой на непринятом дереве хуже."""
+    stand.watchdog_pids()
+    stand.put("deploy_rc", "5")
+    stand.put("deploy_half")
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    stand.put("pause_maint_fails")
+    stand.put(f"paused_{MAINT}", "f")   # до отката обслуживание не под паузой
+    proc = stand.run()
+
+    assert stand.calls("compose"), "откат всё равно состоялся"
+    assert "не встал на паузу перед откатом" in stand.pending(), stand.pending()
+    assert proc.returncode != 0
 
 
 @pytest.mark.unit

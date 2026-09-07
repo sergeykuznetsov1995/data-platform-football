@@ -62,7 +62,9 @@ MAINT=dag_sofascore_manifest_maintenance
 HIST_POOL=sofascore_history_pool
 # Доказательство учёта оплаченного скоупа за этот drain (#1245): автомат ночной доставки
 # переносит его в запись окна, утренняя приёмка сверяет DRAIN_RUN_ID с метабазой.
-LAST_DRAIN="$SOFASCORE_RUNTIME_DIR/auto-deliver/last-drain.env"
+# Каталог — тот же ключ, что читает автомат (SOFASCORE_AUTO_STATE_DIR): два независимо
+# настраиваемых пути разъехались бы молча, и автомат читал бы вечно чужой файл (Sol круг 2).
+LAST_DRAIN="${SOFASCORE_AUTO_STATE_DIR:-$SOFASCORE_RUNTIME_DIR/auto-deliver}/last-drain.env"
 # Три полосы источника (#1244): свой шлюз, свой пул, свой сторож аренд у каждой.
 GATEWAYS="sofascore_proxy_filter sofascore_gw_history sofascore_gw_players"
 GATEWAY_CONTAINERS="sofascore_gw_951 sofascore_gw_history sofascore_gw_players"
@@ -285,19 +287,26 @@ write_drain_proof() {
           fi ;;
         metadata)
           # У метаданных нет SOFASCORE_SCOPE_KEY: finalize их пропускает, результат несёт
-          # состояние самой задачи (sofascore_all_mens_state.py). Учтённой считается ТОЛЬКО
-          # успешная волна: платный запрос уходит до записи чекпойнта
-          # (scripts/enrich_sofascore_all_mens_snapshot.py), поэтому падение задачи означает
-          # потраченные байты без движения состояния — planner купит ту же волну заново
-          # (Sol круг 1; в плане §3.1 стояло `success|failed`).
+          # состояние самой задачи (sofascore_all_mens_state.py). Учтён — только успех.
+          # Падение — `unknown`, и это не осторожность, а факт: чекпойнт пишется в середине
+          # задачи (scripts/enrich_sofascore_all_mens_snapshot.py), поэтому `failed` бывает и
+          # до записи (волну купят заново), и после неё (волна учтена, упало закрытие
+          # клиента). По цвету задачи эти два случая неразличимы — врать в любую сторону
+          # хуже, чем сказать «не знаю» (Sol круги 1 и 2; в плане §3.1 стояло `success|failed`).
           key="$(json_field "$xcom" SOFASCORE_EXPECTED_CAMPAIGN_ID):metadata:$(json_field "$xcom" SOFASCORE_METADATA_WAVE)"
           accounted=f
-          case "$scope" in success) accounted=t ;; esac ;;
+          case "$scope" in success) accounted=t ;; failed) accounted=unknown ;; esac ;;
         *) kind="-"; accounted=f ;;
       esac
     fi
   fi
-  mkdir -p "$(dirname "$LAST_DRAIN")" 2>/dev/null || true
+  # Каталог НЕ создаём: в нём же живут выключатель, маркер незакрытой доставки и снимок
+  # отката, и молча созданный пустой каталог снял бы fail-closed проверки автомата
+  # (Sol круг 2; тот же запрет — в sofascore.env.example).
+  if [ ! -d "$(dirname "$LAST_DRAIN")" ]; then
+    log "каталога состояния автомата нет ($(dirname "$LAST_DRAIN")) — доказательство учёта не пишу"
+    return 0
+  fi
   tmp="$LAST_DRAIN.$$.tmp"
   {
     printf 'DRAIN_WINDOW_ID=%s\n' "${SOFASCORE_DEPLOY_WINDOW_ID:-manual-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -347,9 +356,15 @@ restore_maint_pause() {
   fi
   [ "$MAINT_WAS_PAUSED" = "f" ] || { log "$MAINT kept paused (as before)"; return 0; }
   docker exec sofascore-airflow-scheduler airflow dags unpause "$MAINT" >> "$LOG" 2>&1
-  [ "$(is_paused "$MAINT")" = "f" ] \
-    && log "$MAINT unpaused back" \
-    || log "MANUAL ACTION REQUIRED: $MAINT is still paused — unpause it by hand"
+  if [ "$(is_paused "$MAINT")" = "f" ]; then
+    log "$MAINT unpaused back"
+    return 0
+  fi
+  # Возврат не состоялся — это отказ, а не примечание: раньше функция возвращала ноль от
+  # log, выкат заканчивался DONE, и обслуживание манифеста молча оставалось под паузой
+  # навсегда (Sol круг 2). В EXIT-trap отказ остаётся best effort — там уже падают.
+  log "MANUAL ACTION REQUIRED: $MAINT is still paused — unpause it by hand"
+  return 1
 }
 STEP="start"
 on_exit() {
@@ -590,7 +605,7 @@ POOL_DRAINED=""   # слоты вернулись штатно — поздне�
 
 STEP="restore-pause"
 pause_dag "$HIST"
-restore_maint_pause
+restore_maint_pause || exit 7
 if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
   docker exec sofascore-airflow-scheduler airflow dags unpause "$REFRESH" >> "$LOG" 2>&1
   [ "$(is_paused "$REFRESH")" = "f" ] || { log "$REFRESH did not unpause"; exit 7; }
