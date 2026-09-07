@@ -12,12 +12,16 @@
   ],
   "tables": [
     {
-      "user": "airflow|superset|openmetadata",
+      "user": "airflow",
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
+    },
+    {
+      "user": "superset|openmetadata",
       "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
     },
     {
       "group": "platform-admins",
-      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
     },
     {
       "catalog": "iceberg",
