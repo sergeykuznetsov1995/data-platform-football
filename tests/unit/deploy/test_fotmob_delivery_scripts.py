@@ -798,3 +798,28 @@ def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_grepped(tmp_path:
         "сбой чтения не смеет выдавать себя за «ошибки раннера нет»"
     assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
     assert "task-лог не прочитан" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_does_not_close_an_unconfirmed_rollback(tmp_path: Path) -> None:
+    """Неподтверждённый откат (метабаза так и держит ошибки импорта) не записывает
+    вердикт и не снимает маркер незавершённого отката: иначе после снятия `.off`
+    руками фаза увидела бы готовое «rollback» и пропустила забракованный пин."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__lll|failed|2026-09-08T00:00:10|refresh",
+        runner_err="[ERROR] __main__: boom\n",
+    )
+    # Ссылка отката ведёт не туда, куда смотрит пин отката: checkout проходит, но
+    # confirm_rollback видит чужой HEAD и подтверждения не даёт.
+    env_file = _write_env(
+        tmp_path / "fotmob.env", **{**w["values"], "FOTMOB_ROLLBACK_REF": w["two_short"]}
+    )
+    proc = _run(w["auto"], env_file=env_file, stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert "дерево переключено на" in w["log"].read_text(encoding="utf-8"), "откат был начат"
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file()
+    assert (w["state"] / f"fotmob-wave-rollback-pending-{w['two_short']}-{WAVE_TC}").is_file(), \
+        "незавершённый откат обязан пережить тик"
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
+    assert "откат НЕ подтверждён" in w["sent"].read_text(encoding="utf-8")
