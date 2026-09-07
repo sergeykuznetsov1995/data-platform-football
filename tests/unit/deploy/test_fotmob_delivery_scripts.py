@@ -340,6 +340,9 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     assert _git(repo, "rev-parse", "HEAD") == two
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "deploy/fotmob-b6-master"
     assert (state / "fotmob-b6-accepted").read_text(encoding="utf-8").strip() == two_short
+    # Момент доставки закреплён отметкой — её читает вторая фаза приёмки (#1256).
+    delivered_at = (state / f"fotmob-delivered-at-{two_short}").read_text(encoding="utf-8").strip()
+    assert delivered_at.endswith("Z") and delivered_at[:4].isdigit() and "T" in delivered_at, delivered_at
     assert not (state / "fotmob-deliver-nonce").exists(), "пропуск одноразовый"
     assert not (state / "fotmob-b6-inflight").exists()
     assert (state / "fotmob-auto-deliver-attempted-2026-01-01").exists()
@@ -484,3 +487,339 @@ def test_auto_deliver_shuts_itself_off_without_the_campaign_runner_dir(tmp_path:
     state = Path(values["FOTMOB_STATE_DIR"])
     assert (state / "fotmob-auto-deliver.off").exists(), "автомат глушит себя"
     assert "каталог кампании" in (state / "fotmob-pending-alert").read_text(encoding="utf-8")
+
+
+# --- Вторая фаза приёмки: исход первой волны на новом коде (#1256) ------------
+# Дерево уже стоит на цели и приёмка первой фазы подтверждена заглушками (целевой
+# md5 в контейнере, даги перечитаны, ошибок импорта нет) — автомат доходит до фазы 2
+# и судит по волнам, которые отдаёт заглушка метабазы.
+
+WAVE_T = "2026-09-08T00:00:00Z"
+WAVE_TC = "20260908T000000Z"
+
+
+def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive: bool = False,
+                  log_mode: str = "ok", deliver_marker: bool = False) -> dict:
+    values = _layout(tmp_path)
+    repo = Path(values["FOTMOB_RELEASE_ROOT"])
+    one, two = _two_commits(repo)
+    one_short = _git(repo, "rev-parse", "--short", one)
+    two_short = _git(repo, "rev-parse", "--short", two)
+    # Дерево на ЦЕЛИ: доставка уже состоялась, автомат входит в фазу 2 с delivered=1.
+    _git(repo, "checkout", "-q", "--detach", two)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    values.update(
+        FOTMOB_TARGET=two_short, FOTMOB_ROLLBACK_REF=one_short, FOTMOB_ROLLBACK_SHA=one_short,
+        FOTMOB_NEW_CODE_MD5=md5,
+    )
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    state = Path(values["FOTMOB_STATE_DIR"])
+    # Момент доставки — из строки лога прошлой доставки (В1 доставлена автоматом,
+    # у которого отметки $STATE/fotmob-delivered-at-<sha> ещё не было).
+    log = Path(values["FOTMOB_LOG"])
+    log.parent.mkdir(parents=True, exist_ok=True)
+    if deliver_marker:
+        # Момент доставки закреплён отметкой — строки в логе нет вовсе (ротация).
+        log.write_text("", encoding="utf-8")
+        (state / f"fotmob-delivered-at-{two_short}").write_text(WAVE_T + "\n", encoding="utf-8")
+    else:
+        log.write_text(f"{WAVE_T} ДОСТАВЛЕНО: HEAD={two_short}\n", encoding="utf-8")
+    (state / "fotmob-b6-accepted").write_text(two_short + "\n", encoding="utf-8")
+
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _stub(stubs, "sleep", '[ "$1" = 5 ] && exec /bin/sleep 1\nexit 0\n')
+    driver_started = Path(values["FOTMOB_CAMPAIGN_DIR"]) / "state" / "driver-started"
+    _stub(Path(values["FOTMOB_CAMPAIGN_DIR"]), "driver.sh", f'touch "{driver_started}"\nexit 0\n')
+    _pgrep_stub(stubs, driver_started, writer_alive)
+    rows_file = tmp_path / "waves.txt"
+    rows_file.write_text(rows + ("\n" if rows else ""), encoding="utf-8")
+    # Task-логи волн лежат на диске так же, как в контейнере, а заглушка docker
+    # ИСПОЛНЯЕТ ту самую команду, которую автомат посылает внутрь, лишь подменив
+    # корень путей. Иначе тест проверял бы заглушку, а не разбор кодов возврата:
+    # различить «совпадений нет» и «лог не прочитан» можно только на настоящем
+    # конвейере `ls || exit 3; grep | cut`.
+    logs_root = tmp_path / "airflow-logs"
+    for line in [r for r in rows.split("\n") if r.strip()]:
+        run_id = line.split("|", 1)[0]
+        attempt = logs_root / f"dag_id=dag_ingest_fotmob/run_id={run_id}/task_id=scrape_fotmob_data"
+        if log_mode == "missing":
+            continue
+        attempt.mkdir(parents=True)
+        if log_mode == "unreadable":
+            # Каталог на месте файла: `ls` доволен, `grep` возвращает 2 — ровно тот
+            # сбой чтения, который без pipefail выглядел бы «ошибки раннера нет».
+            (attempt / "attempt=1.log").mkdir()
+        else:
+            (attempt / "attempt=1.log").write_text(
+                "2026-09-08 00:00:11 INFO wave started\n" + runner_err, encoding="utf-8"
+            )
+    calls = tmp_path / "docker.calls"
+    _stub(
+        stubs, "docker",
+        f'echo "$*" >> "{calls}"\n'
+        'case "$*" in\n'
+        '  *pgrep*) exit 1 ;;\n'
+        f'  *md5sum*) echo "{md5}  file" ;;\n'
+        # Команду чтения task-лога исполняем по-настоящему, подменив только корень путей.
+        '  *__main__*)\n'
+        '    payload=$(printf "%s" "${@: -1}" | '
+        f'sed "s|/opt/airflow/logs|{logs_root}|g")\n'
+        '    exec bash -c "$payload" ;;\n'
+        '  *"FROM dag WHERE"*) echo 1 ;;\n'             # даг перечитан планировщиком
+        '  *"count(*)"*) echo 0 ;;\n'                   # import_error и активные раны
+        # Список волн фазы 2 отдаём ТОЛЬКО на запрос нужной формы: иначе тест не
+        # заметил бы ни потерянного отсева ручных прогонов, ни отвязки от момента
+        # доставки, ни утраты разбора conf, ни сбитого порядка.
+        '  *"FROM dag_run WHERE"*)\n'
+        '    if [[ "$*" == *"run_id LIKE \'fotmob_orchestrated"* '
+        '&& "$*" == *"regexp_match"* '
+        f'&& "$*" == *"start_date > \'{WAVE_T}\'"* '
+        '&& "$*" == *"ORDER BY start_date;"* ]]; then\n'
+        f'      cat "{rows_file}"\n'
+        '    else\n'
+        '      echo "ЗАПРОС-ВОЛН-НЕ-ТОЙ-ФОРМЫ"\n'
+        '    fi ;;\n'
+        '  *"SELECT 1;"*) echo 1 ;;\n'                  # метабаза жива
+        '  *) echo "dag_x | f" ;;\n'
+        'esac\n',
+    )
+    sent = tmp_path / "tg.sent"
+    _tg_env(values)
+    _curl_stub(stubs, sent, '{"ok":true}')
+    return {
+        "auto": _install(tmp_path, stubs), "env_file": env_file, "values": values, "repo": repo,
+        "state": state, "stubs": stubs, "sent": sent, "one": one, "two": two,
+        "one_short": one_short, "two_short": two_short, "log": log,
+        "driver_started": driver_started,
+    }
+
+
+def _pgrep_stub(stubs: Path, driver_started: Path, writer_alive: bool) -> None:
+    _stub(
+        stubs, "pgrep",
+        f'case "$*" in\n'
+        f'  *driver.sh*) [ -e "{driver_started}" ] && exit 0; exit 1 ;;\n'
+        f'  *run_fotmob_scrape*) exit {0 if writer_alive else 1} ;;\n'
+        '  *) exit 1 ;;\n'
+        'esac\n',
+    )
+
+
+@pytest.mark.unit
+def test_phase2_accepts_the_first_green_refresh_wave(tmp_path: Path) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__aaa|success|2026-09-08T00:00:10|refresh")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert verdict.is_file(), sorted(p.name for p in w["state"].iterdir())
+    assert "accepted" in verdict.read_text(encoding="utf-8")
+    sent = w["sent"].read_text(encoding="utf-8")
+    assert "первая волна актуалки" in sent and "mode=refresh" in sent and "не легла" in sent
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"], "зелёная волна ничего не откатывает"
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+
+
+@pytest.mark.unit
+def test_phase2_rolls_back_on_a_runner_error_when_no_writer_is_alive(tmp_path: Path) -> None:
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__bbb|failed|2026-09-08T00:00:10|refresh",
+        runner_err="[ERROR] __main__: semantic batch has 1 stored rows; expected either 0 or 2\n",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"], "бой вернулся на откатный пин"
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file(), "защёлка живёт сутки — без .off тот же пин поехал бы снова"
+    assert not (w["state"] / f"fotmob-wave-rollback-pending-{w['two_short']}-{WAVE_TC}").exists()
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert "rollback" in verdict.read_text(encoding="utf-8")
+    sent = w["sent"].read_text(encoding="utf-8")
+    assert "красная первая волна" in sent and "semantic batch" in sent
+    assert "Откат подтверждён" in sent
+    # Выключатель ставится ДО дерева: смерть между checkout и set_off оставила бы
+    # автомат взведённым, а pending — недостижимым (delivered=0 в фазу не заходит).
+    log = w["log"].read_text(encoding="utf-8")
+    assert log.index("выключатель поставлен") < log.index("дерево переключено на")
+    assert not (w["state"] / "fotmob-b6-accepted").exists(), "принятым остаётся только подтверждённый SHA"
+
+
+@pytest.mark.unit
+def test_phase2_reports_a_red_history_wave_without_rolling_back(tmp_path: Path) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__ccc|failed|2026-09-08T00:00:10|backfill")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"], "краснота истории откат не запускает"
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists(), "вердикт выносит только актуалка"
+    assert (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__ccc").is_file()
+    sent = w["sent"].read_text(encoding="utf-8")
+    assert "красная волна истории" in sent and "не откат" in sent
+
+
+@pytest.mark.unit
+def test_phase2_rolls_back_a_red_refresh_wave_without_a_runner_error_and_names_the_source(tmp_path: Path) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__ddd|failed|2026-09-08T00:00:10|daily")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file()
+    sent = w["sent"].read_text(encoding="utf-8")
+    assert "ошибки раннера нет" in sent and "no_progress_failure" in sent
+    assert "повторить доставку в ближайшее окно" in sent
+
+
+@pytest.mark.unit
+def test_phase2_waits_for_the_gap_between_waves_and_rolls_back_on_the_next_tick(tmp_path: Path) -> None:
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__eee|failed|2026-09-08T00:00:10|refresh",
+        runner_err="[ERROR] __main__: boom\n",
+        writer_alive=True,
+    )
+    pending = w["state"] / f"fotmob-wave-rollback-pending-{w['two_short']}-{WAVE_TC}"
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"], extra_env={"WRITER_WAIT": "0"})
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"], "под живым писателем дерево не трогаем"
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists(), "занятое дерево — не авария, автомат не глушим"
+    assert pending.is_file() and "fotmob_orchestrated__eee" in pending.read_text(encoding="utf-8")
+    assert "жду паузы между волнами" in w["sent"].read_text(encoding="utf-8")
+
+    # Писатель ушёл — тот же маркер доводит откат до конца, метабазу больше не спрашиваем.
+    _pgrep_stub(w["stubs"], w["driver_started"], writer_alive=False)
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"], extra_env={"WRITER_WAIT": "0"})
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file()
+    assert not pending.exists()
+    assert (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").is_file()
+
+
+@pytest.mark.unit
+def test_phase2_rolls_back_a_history_wave_that_carries_a_runner_error(tmp_path: Path) -> None:
+    """Ошибка раннера — наш код в любой полосе: краснота истории освобождена от отката
+    только тогда, когда `[ERROR] __main__` в task-логе НЕТ."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__fff|failed|2026-09-08T00:00:10|backfill",
+        runner_err="[ERROR] __main__: RuntimeError: writer lock lost\n",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file()
+    assert not (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__fff").exists()
+    assert "writer lock lost" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_read(tmp_path: Path) -> None:
+    """«Лог не прочитан» ≠ «ошибки раннера нет»: иначе красная волна с нашей ошибкой
+    ушла бы в «краснота истории», а следующая зелёная актуалка приняла бы этот код."""
+    w = _phase2_world(
+        tmp_path, "fotmob_orchestrated__ggg|failed|2026-09-08T00:00:10|backfill", log_mode="missing",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"], "вслепую не откатываем"
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists(), "и не принимаем"
+    assert not (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__ggg").exists()
+    assert "task-лог не прочитан" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_skips_history_and_judges_by_the_first_current_wave(tmp_path: Path) -> None:
+    """Порядок волн не фиксирован: между доставкой и первой актуалкой может встать
+    красная историческая — она сообщает о себе и пропускается, вердикт даёт актуалка."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__h1|failed|2026-09-08T00:10:00|backfill\n"
+        "fotmob_orchestrated__h2|success|2026-09-08T04:00:00|refresh",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__h1").is_file()
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert "fotmob_orchestrated__h2" in verdict.read_text(encoding="utf-8")
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+    sent = w["sent"].read_text(encoding="utf-8")
+    assert "красная волна истории" in sent and "не легла" in sent
+
+
+@pytest.mark.unit
+def test_phase2_takes_the_delivery_moment_from_the_marker_when_the_log_rotated(tmp_path: Path) -> None:
+    """Момент доставки живёт в отметке $STATE/fotmob-delivered-at-<sha>: имена маркеров
+    фазы содержат его, и ротация лога иначе осиротила бы начатый откат."""
+    w = _phase2_world(
+        tmp_path, "fotmob_orchestrated__iii|success|2026-09-08T00:00:10|daily", deliver_marker=True,
+    )
+    assert w["log"].read_text(encoding="utf-8") == "", "строки ДОСТАВЛЕНО в логе нет"
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").is_file()
+    assert "mode=daily" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_waits_while_the_metadb_still_has_an_active_wave(tmp_path: Path) -> None:
+    """Живого процесса мало: оркестратор допускает волну каждые пять минут, и новый
+    DagRun существует раньше, чем его раннер виден pgrep."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__jjj|failed|2026-09-08T00:00:10|refresh",
+        runner_err="[ERROR] __main__: boom\n",
+    )
+    # Писателей нет, но метабаза говорит «одна волна queued» — дерево не трогаем.
+    stub = (w["stubs"] / "docker").read_text(encoding="utf-8")
+    stub = stub.replace('  *"count(*)"*) echo 0 ;;', '  *"running\',\'queued"*) echo 1 ;;\n  *"count(*)"*) echo 0 ;;')
+    (w["stubs"] / "docker").write_text(stub, encoding="utf-8")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"], extra_env={"WRITER_WAIT": "0"})
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert (w["state"] / f"fotmob-wave-rollback-pending-{w['two_short']}-{WAVE_TC}").is_file()
+    assert "жду паузы между волнами" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_grepped(tmp_path: Path) -> None:
+    """Лог на месте, но не читается (каталог вместо файла, нет прав, битый том): `grep`
+    возвращает 2. Без `pipefail` внутри контейнера этот код терялся бы за `cut`, и сбой
+    чтения выглядел бы как «ошибки раннера нет» — красная волна прошла бы мимо отката."""
+    w = _phase2_world(
+        tmp_path, "fotmob_orchestrated__kkk|failed|2026-09-08T00:00:10|backfill", log_mode="unreadable",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert not (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__kkk").exists(), \
+        "сбой чтения не смеет выдавать себя за «ошибки раннера нет»"
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
+    assert "task-лог не прочитан" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_does_not_close_an_unconfirmed_rollback(tmp_path: Path) -> None:
+    """Неподтверждённый откат (метабаза так и держит ошибки импорта) не записывает
+    вердикт и не снимает маркер незавершённого отката: иначе после снятия `.off`
+    руками фаза увидела бы готовое «rollback» и пропустила забракованный пин."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__lll|failed|2026-09-08T00:00:10|refresh",
+        runner_err="[ERROR] __main__: boom\n",
+    )
+    # Ссылка отката ведёт не туда, куда смотрит пин отката: checkout проходит, но
+    # confirm_rollback видит чужой HEAD и подтверждения не даёт.
+    env_file = _write_env(
+        tmp_path / "fotmob.env", **{**w["values"], "FOTMOB_ROLLBACK_REF": w["two_short"]}
+    )
+    proc = _run(w["auto"], env_file=env_file, stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert "дерево переключено на" in w["log"].read_text(encoding="utf-8"), "откат был начат"
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file()
+    assert (w["state"] / f"fotmob-wave-rollback-pending-{w['two_short']}-{WAVE_TC}").is_file(), \
+        "незавершённый откат обязан пережить тик"
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
+    assert "откат НЕ подтверждён" in w["sent"].read_text(encoding="utf-8")
