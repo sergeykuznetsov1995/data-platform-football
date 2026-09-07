@@ -340,6 +340,9 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     assert _git(repo, "rev-parse", "HEAD") == two
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "deploy/fotmob-b6-master"
     assert (state / "fotmob-b6-accepted").read_text(encoding="utf-8").strip() == two_short
+    # Момент доставки закреплён отметкой — её читает вторая фаза приёмки (#1256).
+    delivered_at = (state / f"fotmob-delivered-at-{two_short}").read_text(encoding="utf-8").strip()
+    assert delivered_at.endswith("Z") and delivered_at[:4].isdigit() and "T" in delivered_at, delivered_at
     assert not (state / "fotmob-deliver-nonce").exists(), "пропуск одноразовый"
     assert not (state / "fotmob-b6-inflight").exists()
     assert (state / "fotmob-auto-deliver-attempted-2026-01-01").exists()
@@ -495,7 +498,8 @@ WAVE_T = "2026-09-08T00:00:00Z"
 WAVE_TC = "20260908T000000Z"
 
 
-def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive: bool = False) -> dict:
+def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive: bool = False,
+                  log_rc: int = 0, deliver_marker: bool = False) -> dict:
     values = _layout(tmp_path)
     repo = Path(values["FOTMOB_RELEASE_ROOT"])
     one, two = _two_commits(repo)
@@ -514,7 +518,12 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
     # у которого отметки $STATE/fotmob-delivered-at-<sha> ещё не было).
     log = Path(values["FOTMOB_LOG"])
     log.parent.mkdir(parents=True, exist_ok=True)
-    log.write_text(f"{WAVE_T} ДОСТАВЛЕНО: HEAD={two_short}\n", encoding="utf-8")
+    if deliver_marker:
+        # Момент доставки закреплён отметкой — строки в логе нет вовсе (ротация).
+        log.write_text("", encoding="utf-8")
+        (state / f"fotmob-delivered-at-{two_short}").write_text(WAVE_T + "\n", encoding="utf-8")
+    else:
+        log.write_text(f"{WAVE_T} ДОСТАВЛЕНО: HEAD={two_short}\n", encoding="utf-8")
     (state / "fotmob-b6-accepted").write_text(two_short + "\n", encoding="utf-8")
 
     stubs = tmp_path / "bin"
@@ -525,8 +534,15 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
     _pgrep_stub(stubs, driver_started, writer_alive)
     rows_file = tmp_path / "waves.txt"
     rows_file.write_text(rows + ("\n" if rows else ""), encoding="utf-8")
+    # Чтение task-лога отдельным скриптом: контейнер отвечает ненулевым кодом, когда
+    # логов нет или он недоступен, и «не прочитал» обязано отличаться от «ошибки нет».
     err_file = tmp_path / "runner_err.txt"
     err_file.write_text(runner_err, encoding="utf-8")
+    log_reader = tmp_path / "read_task_log.sh"
+    log_reader.write_text(
+        "#!/bin/bash\n" + (f'exit {log_rc}\n' if log_rc else f'cat "{err_file}"\n'), encoding="utf-8"
+    )
+    log_reader.chmod(0o755)
     calls = tmp_path / "docker.calls"
     _stub(
         stubs, "docker",
@@ -534,11 +550,22 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
         'case "$*" in\n'
         '  *pgrep*) exit 1 ;;\n'
         f'  *md5sum*) echo "{md5}  file" ;;\n'
-        f'  *__main__*) cat "{err_file}" ;;\n'          # task-лог волны: строка ошибки раннера
-        f'  *"FROM dag_run WHERE"*) cat "{rows_file}" ;;\n'   # волны после доставки (фаза 2)
+        f'  *__main__*) exec {log_reader} ;;\n'         # task-лог волны: строка ошибки раннера
         '  *"FROM dag WHERE"*) echo 1 ;;\n'             # даг перечитан планировщиком
+        '  *"count(*)"*) echo 0 ;;\n'                   # import_error и активные раны
+        # Список волн фазы 2 отдаём ТОЛЬКО на запрос нужной формы: иначе тест не
+        # заметил бы ни потерянного отсева ручных прогонов, ни отвязки от момента
+        # доставки, ни утраты разбора conf, ни сбитого порядка.
+        '  *"FROM dag_run WHERE"*)\n'
+        '    if [[ "$*" == *"run_id LIKE \'fotmob_orchestrated"* '
+        '&& "$*" == *"regexp_match"* '
+        f'&& "$*" == *"start_date > \'{WAVE_T}\'"* '
+        '&& "$*" == *"ORDER BY start_date;"* ]]; then\n'
+        f'      cat "{rows_file}"\n'
+        '    else\n'
+        '      echo "ЗАПРОС-ВОЛН-НЕ-ТОЙ-ФОРМЫ"\n'
+        '    fi ;;\n'
         '  *"SELECT 1;"*) echo 1 ;;\n'                  # метабаза жива
-        '  *"count(*)"*) echo 0 ;;\n'                   # import_error
         '  *) echo "dag_x | f" ;;\n'
         'esac\n',
     )
@@ -595,6 +622,10 @@ def test_phase2_rolls_back_on_a_runner_error_when_no_writer_is_alive(tmp_path: P
     sent = w["sent"].read_text(encoding="utf-8")
     assert "красная первая волна" in sent and "semantic batch" in sent
     assert "Откат подтверждён" in sent
+    # Выключатель ставится ДО дерева: смерть между checkout и set_off оставила бы
+    # автомат взведённым, а pending — недостижимым (delivered=0 в фазу не заходит).
+    log = w["log"].read_text(encoding="utf-8")
+    assert log.index("выключатель поставлен") < log.index("дерево переключено на")
     assert not (w["state"] / "fotmob-b6-accepted").exists(), "принятым остаётся только подтверждённый SHA"
 
 
@@ -647,3 +678,90 @@ def test_phase2_waits_for_the_gap_between_waves_and_rolls_back_on_the_next_tick(
     assert (w["state"] / "fotmob-auto-deliver.off").is_file()
     assert not pending.exists()
     assert (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").is_file()
+
+
+@pytest.mark.unit
+def test_phase2_rolls_back_a_history_wave_that_carries_a_runner_error(tmp_path: Path) -> None:
+    """Ошибка раннера — наш код в любой полосе: краснота истории освобождена от отката
+    только тогда, когда `[ERROR] __main__` в task-логе НЕТ."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__fff|failed|2026-09-08T00:00:10|backfill",
+        runner_err="[ERROR] __main__: RuntimeError: writer lock lost\n",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file()
+    assert not (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__fff").exists()
+    assert "writer lock lost" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_read(tmp_path: Path) -> None:
+    """«Лог не прочитан» ≠ «ошибки раннера нет»: иначе красная волна с нашей ошибкой
+    ушла бы в «краснота истории», а следующая зелёная актуалка приняла бы этот код."""
+    w = _phase2_world(
+        tmp_path, "fotmob_orchestrated__ggg|failed|2026-09-08T00:00:10|backfill", log_rc=3,
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"], "вслепую не откатываем"
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists(), "и не принимаем"
+    assert not (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__ggg").exists()
+    assert "task-лог не прочитан" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_skips_history_and_judges_by_the_first_current_wave(tmp_path: Path) -> None:
+    """Порядок волн не фиксирован: между доставкой и первой актуалкой может встать
+    красная историческая — она сообщает о себе и пропускается, вердикт даёт актуалка."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__h1|failed|2026-09-08T00:10:00|backfill\n"
+        "fotmob_orchestrated__h2|success|2026-09-08T04:00:00|refresh",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__h1").is_file()
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert "fotmob_orchestrated__h2" in verdict.read_text(encoding="utf-8")
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+    sent = w["sent"].read_text(encoding="utf-8")
+    assert "красная волна истории" in sent and "принято" in sent
+
+
+@pytest.mark.unit
+def test_phase2_takes_the_delivery_moment_from_the_marker_when_the_log_rotated(tmp_path: Path) -> None:
+    """Момент доставки живёт в отметке $STATE/fotmob-delivered-at-<sha>: имена маркеров
+    фазы содержат его, и ротация лога иначе осиротила бы начатый откат."""
+    w = _phase2_world(
+        tmp_path, "fotmob_orchestrated__iii|success|2026-09-08T00:00:10|daily", deliver_marker=True,
+    )
+    assert w["log"].read_text(encoding="utf-8") == "", "строки ДОСТАВЛЕНО в логе нет"
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").is_file()
+    assert "mode=daily" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_waits_while_the_metadb_still_has_an_active_wave(tmp_path: Path) -> None:
+    """Живого процесса мало: оркестратор допускает волну каждые пять минут, и новый
+    DagRun существует раньше, чем его раннер виден pgrep."""
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__jjj|failed|2026-09-08T00:00:10|refresh",
+        runner_err="[ERROR] __main__: boom\n",
+    )
+    # Писателей нет, но метабаза говорит «одна волна queued» — дерево не трогаем.
+    stub = (w["stubs"] / "docker").read_text(encoding="utf-8")
+    stub = stub.replace('  *"count(*)"*) echo 0 ;;', '  *"running\',\'queued"*) echo 1 ;;\n  *"count(*)"*) echo 0 ;;')
+    (w["stubs"] / "docker").write_text(stub, encoding="utf-8")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"], extra_env={"WRITER_WAIT": "0"})
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert (w["state"] / f"fotmob-wave-rollback-pending-{w['two_short']}-{WAVE_TC}").is_file()
+    assert "жду паузы между волнами" in w["sent"].read_text(encoding="utf-8")
