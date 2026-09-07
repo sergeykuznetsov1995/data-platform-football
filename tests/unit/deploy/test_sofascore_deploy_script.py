@@ -55,12 +55,33 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
             *"coalesce((SELECT run_id"*) cat "$STATE/hist_run" 2>/dev/null || echo - ;;
             # Четыре числа шага drain. Третье считается ЧЕСТНО: отслеживаемым признаётся
             # только тот run_id, который скрипт спросил, — иначе тест не отличил бы возврат
-            # к старому «считаем все прогоны истории».
+            # к старому «считаем все прогоны истории». Заглушка держит МИР (состояния задач
+            # прогона), а не подстроки, и отвечает на тот вопрос, который задан: «прогон ещё
+            # открыт?» (dag_run) и «осталась ли у него движимая работа?» (task_instance ti).
+            # hist_scope — состояние run_historical_scope, hist_bank — состояние банковской
+            # пары validate/finalize ('none' = состояния ещё нет, как у Airflow сразу после
+            # успеха скоупа). По умолчанию обе задачи терминальны.
             *"run_id="*)
               want=${{sql#*run_id=\\'}}; want=${{want%%\\'*}}
               hist=0
-              if [ -n "$want" ] && [ "$want" = "$(cat "$STATE/hist_run" 2>/dev/null)" ] \\
-                 && [ -e "$STATE/hist_run_active" ]; then hist=1; fi
+              if [ -n "$want" ] && [ "$want" = "$(cat "$STATE/hist_run" 2>/dev/null)" ]; then
+                scope=$(cat "$STATE/hist_scope" 2>/dev/null || echo done)
+                bank=$(cat "$STATE/hist_bank" 2>/dev/null || echo done)
+                case "$sql" in
+                  *"task_instance ti"*)
+                    case "$scope" in queued|running) hist=1 ;; esac
+                    case "$bank" in scheduled|up_for_retry|queued|running) hist=1 ;; esac
+                    # Задачу БЕЗ состояния запрос видит, только если о ней спрашивает:
+                    # предикат без `state IS NULL` не узнает о ней ничего, и заглушка,
+                    # отвечающая за метабазу, обязана это повторить — иначе тест зелен
+                    # и на предикате, который этот промежуток не закрывает.
+                    case "$sql" in
+                      *"state IS NULL"*)
+                        [ "$scope" = success ] && [ "$bank" = none ] && hist=1 ;;
+                    esac ;;
+                  *) [ -e "$STATE/hist_run_active" ] && hist=1 ;;
+                esac
+              fi
               printf '%s|%s|%s|%s\\n' "$(cat "$STATE/active_dr" 2>/dev/null || echo 0)" \\
                 "$(cat "$STATE/busy" 2>/dev/null || echo 0)" "$hist" \\
                 "$(cat "$STATE/hist_busy" 2>/dev/null || echo 0)" ;;
@@ -681,6 +702,107 @@ def test_drain_refuses_to_start_when_the_metadb_cannot_name_the_history_run(tmp_
     assert (state_dir / f"paused_{HIST}").read_text().strip() == "f"
     log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
     assert "метабаза не ответила про идущий прогон истории" in log, log
+
+
+@pytest.mark.unit
+def test_drain_ignores_a_scope_retry_that_the_drain_itself_parked(tmp_path: Path) -> None:
+    """Ночь 05.09: доставки не было. run_historical_scope упал уже ПОСЛЕ осушения пула,
+    его повтор (retries=1, #1244) встал за слотом, который этот же шаг только что забрал,
+    и прогон истории остался running без единой движущейся задачи: ответ '0|0|1|0' все
+    5515 с, rc=4. Ждать закрытия такого прогона значит ждать самого себя — и так почти
+    каждую ночь, потому что больше половины прогонов истории падают. Ждём движимую работу:
+    повтор в осушённом пуле не движим по построению, оплаченного результата за ним нет
+    (первая попытка упала), а открытый прогон закроет close_stale_runs после паузы."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    tracked = "scheduled__2026-09-05T02:15:41.446584+00:00"
+    (state_dir / "hist_run").write_text(f"{tracked}\n")
+    (state_dir / "hist_run_active").write_text("1\n")   # прогон ещё открыт...
+    (state_dir / "active").write_text("1\n")
+    # ...но единственная его незавершённая задача — повтор скоупа, припаркованный
+    # осушённым пулом; банковская пара состояния ещё не получала и получить не может.
+    (state_dir / "hist_scope").write_text("up_for_retry\n")
+    (state_dir / "hist_bank").write_text("none\n")
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": "60",
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    assert [a for a in args if a.startswith("compose ")], "припаркованный повтор — не повод не выкатывать"
+    assert [a for a in args if a.startswith("exec sofascore-airflow-scheduler python -c ")], (
+        "открытый прогон закрывает close_stale_runs после паузы"
+    )
+
+
+@pytest.mark.unit
+def test_drain_waits_while_the_banking_task_has_no_state_yet(tmp_path: Path) -> None:
+    """Ревью Sol, круг 1. Сразу после успеха скоупа validate_historical_scope не имеет
+    состояния ВОВСЕ: `scheduled` планировщик проставит через виток. Опрос раз в 30 с
+    попадает в этот промежуток, и условие «нет движимой работы» оказалось бы выполнено —
+    выкат оборвал бы засчитывание уже оплаченного скоупа, ровно то, ради чего осушение и
+    придумано. Задачи без состояния считаются движимой работой, но только банковская пара
+    и только когда скоуп этого прогона уже success: иначе «состояния нет» было бы у них
+    с первой секунды прогона и ожидание снова стало бы вечным."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    tracked = "scheduled__2026-09-05T02:15:41.446584+00:00"
+    (state_dir / "hist_run").write_text(f"{tracked}\n")
+    (state_dir / "hist_run_active").write_text("1\n")
+    (state_dir / "active").write_text("1\n")
+    (state_dir / "hist_scope").write_text("success\n")   # скоуп оплачен и отработал...
+    (state_dir / "hist_bank").write_text("none\n")       # ...а validate ещё без состояния
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": "60",
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    assert not [a for a in args if a.startswith("compose ")], args
+    assert f"SOFASCORE_RELEASE_ROOT={release}" not in env_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_drain_still_waits_while_the_paid_scope_is_being_banked(tmp_path: Path) -> None:
+    """Обратная сторона той же починки. Между «скоуп отработал» и «validate_historical_scope
+    закончил» у прогона нет ни одной задачи в queued/running, но есть задача, стоящая за
+    слотом НЕ осушённого пула (default_pool). Оборвать выкатом именно этот промежуток —
+    потерять засчитывание оплаченного скоупа: следующий прогон купит те же 8–81 минуты
+    платного трафика заново. Такая работа движима, значит ждём её до потолка."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    tracked = "scheduled__2026-09-05T02:15:41.446584+00:00"
+    (state_dir / "hist_run").write_text(f"{tracked}\n")
+    (state_dir / "hist_run_active").write_text("1\n")
+    (state_dir / "active").write_text("1\n")
+    (state_dir / "hist_scope").write_text("success\n")   # скоуп оплачен и отработал...
+    (state_dir / "hist_bank").write_text("scheduled\n")  # ...validate ждёт слота default_pool
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": "60",
+    }
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    args = [call[0] for call in _calls(state_dir)]
+    assert not [a for a in args if a.startswith("compose ")], args
+    assert f"SOFASCORE_RELEASE_ROOT={release}" not in env_file.read_text(encoding="utf-8")
+    # Контур обязан вернуться в работу: слот пула на месте, актуалка распаущена.
+    assert [a for a in args if a.startswith("exec sofascore-airflow-scheduler airflow pools set sofascore_history_pool 1")], args
+    assert (state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
 
 
 @pytest.mark.unit

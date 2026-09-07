@@ -2,9 +2,10 @@
 # Выкат замороженного дерева на контур SofaScore (проекты sofascore-airflow / sofascore-gw).
 # Использование: bash deploy/sofascore/deploy.sh <release-root> [old-release-root]
 # Предпосылки: окно вне 13:55–15:35 UTC;
-#   шаг drain осушает пул истории, паузит актуалку и ждёт завершения того прогона истории,
-#   который работал на входе (история при этом остаётся распаущенной — иначе не отработает
-#   validate_historical_scope и оплаченный скоуп не будет засчитан);
+#   шаг drain осушает пул истории, паузит актуалку и ждёт, пока у того прогона истории,
+#   который работал на входе, не кончится ДВИЖИМАЯ работа (история при этом остаётся
+#   распаущенной — иначе не отработает validate_historical_scope и оплаченный скоуп
+#   не будет засчитан);
 #   актуалка после выката возвращается в прежнее состояние.
 # Переменные — из $SOFASCORE_ENV_FILE (по умолчанию /etc/data-platform/sofascore.env);
 #   скрипт сам переписывает в нём SOFASCORE_RELEASE_ROOT / _PROXY_BUDGET_ARTIFACT_HOST / _ID —
@@ -101,8 +102,29 @@ wait_idle() {  # wait_idle <секунд>; 0 — контур свободен, 
 # Ожидание шага drain. Ждать «в контуре нет прогонов истории» нельзя: история идёт
 # @continuous, и как только отслеживаемый прогон кончается, планировщик почти мгновенно
 # (замер 04.09: медиана 26 с) создаёт следующий, а с осушённым пулом тот остаётся running
-# навсегда — его run_historical_scope вечно scheduled. Ждём завершения ИМЕННО того прогона,
-# который работал на входе.
+# навсегда — его run_historical_scope вечно scheduled.
+# Но и ЗАВЕРШЕНИЯ отслеживаемого прогона ждать нельзя (ночь 05.09: ответ '0|0|1|0' все
+# 5515 с, rc=4, доставки не было). У run_historical_scope есть retries=1 (#1244): скоуп,
+# упавший уже ПОСЛЕ осушения, уходит в up_for_retry и встаёт за слотом, который этот же шаг
+# только что забрал. Прогон остаётся running без единой движущейся задачи — ждать его значит
+# ждать самого себя, и так каждую ночь, потому что больше половины прогонов истории падают.
+# Поэтому ждём не закрытия прогона, а того, чтобы у него кончилась ДВИЖИМАЯ работа: задачи
+# в queued/running и задачи, стоящие за слотом НЕ осушённого пула — validate_historical_scope
+# и finalize_historical_run в default_pool, те самые, что засчитывают оплаченный скоуп.
+# Повтор в осушённом пуле двинуться не может по построению, и оплаченного результата за ним
+# нет: его первая попытка упала. Прогон, оставшийся открытым, закрывает close_stale_runs
+# после паузы — шаг, который в скрипте и без того есть.
+# Третья ветка предиката — про состояние `none` (ревью Sol, круг 1). Сразу после успеха
+# скоупа validate_historical_scope ещё не имеет состояния вовсе: планировщик проставит ему
+# `scheduled` через виток. Поймать этот промежуток опросом раз в 30 с — значит оборвать
+# выкатом ЗАСЧИТЫВАНИЕ уже оплаченного скоупа, ровно то, ради чего осушение и придумано.
+# Поэтому задачи без состояния считаются движимой работой, но только банковская пара
+# (validate_historical_scope, finalize_historical_run) и только если скоуп этого прогона
+# уже success: иначе «нет состояния» было бы у них всегда, с первой секунды прогона, и
+# ожидание снова стало бы вечным.
+# Охлаждение (wait_before_next_continuous_run, PythonSensor mode=reschedule, до получаса в
+# up_for_reschedule) движимой работой не считается намеренно: платного трафика за ним нет,
+# а ждать его — дарить окну доставки эти полчаса.
 # Актуалка к этому моменту на паузе, а прогон запаущенного DAG планировщик не двигает
 # (DagModel.is_paused == false в next_dagruns_to_examine), терминального состояния он уже не
 # получит — поэтому по ней ждём отсутствия ЗАДАЧ, а не закрытия прогона. Задачи доработают,
@@ -113,12 +135,12 @@ wait_drained() {  # wait_drained <секунд> <run_id прогона исто�
   deadline=$(( $(date -u +%s) + $1 ))
   tries=$(( $1 / 30 + 1 ))
   while :; do
-    # Одним запросом, четыре числа: прогоны дейли; задачи дейли и актуалки; отслеживаемый
-    # прогон истории; задачи истории — последнее закрывает окно, когда у нового прогона успел
-    # стартовать plan_historical_batch. Одним, а не четырьмя: рваное чтение показало бы контур
-    # свободным по числам из разных моментов. Пустой ответ (метабаза недоступна / timeout) —
+    # Одним запросом, четыре числа: прогоны дейли; задачи дейли и актуалки; движимая работа
+    # отслеживаемого прогона истории; задачи истории — последнее закрывает окно, когда у
+    # нового прогона успел стартовать plan_historical_batch. Одним запросом, а не четырьмя:
+    # рваное чтение показало бы контур свободным по числам из разных моментов. Пустой ответ (метабаза недоступна / timeout) —
     # это «не знаю», а не «свободно».
-    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$2' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running'));" || true)
+    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH') AND state IN ('queued','running')), (SELECT count(*) FROM task_instance ti WHERE ti.dag_id='$HIST' AND ti.run_id='$2' AND (ti.state IN ('queued','running') OR (ti.state IN ('scheduled','up_for_retry') AND ti.pool <> 'sofascore_history_pool') OR (ti.state IS NULL AND ti.task_id IN ('validate_historical_scope','finalize_historical_run') AND EXISTS (SELECT 1 FROM task_instance s WHERE s.dag_id=ti.dag_id AND s.run_id=ti.run_id AND s.task_id='run_historical_scope' AND s.state='success')))), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running'));" || true)
     [ "${DRAIN_ROW:-x}" = "0|0|0|0" ] && return 0
     tries=$(( tries - 1 ))
     [ "$tries" -le 0 ] && return 1
