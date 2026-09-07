@@ -316,7 +316,11 @@ case "$1" in
       dags)
         case "$5" in
           pause) echo t > "$S/paused_$6" ;;
-          unpause) [ -e "$S/unpause_fails" ] || echo f > "$S/paused_$6" ;;
+          unpause)
+            skip=0
+            [ -e "$S/unpause_fails" ] && skip=1
+            [ -e "$S/unpause_maint_fails" ] && [ "$6" = "dag_sofascore_manifest_maintenance" ] && skip=1
+            [ "$skip" = 1 ] || echo f > "$S/paused_$6" ;;
         esac ;;
     esac
     exit 0 ;;
@@ -705,6 +709,34 @@ def test_a_broken_leftover_release_dir_is_never_reused(stand: Stand, break_it: s
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "content,expect",
+    [
+        ("DRAIN_WINDOW_ID={today}\nDRAIN_ACCOUNTED=t\n", "Учёт оплаченного скоупа истории: подтверждён"),
+        ("DRAIN_WINDOW_ID={today}\nDRAIN_ACCOUNTED=f\n", "НЕ подтверждён"),
+        ("DRAIN_WINDOW_ID={today}\nDRAIN_ACCOUNTED=n/a\n", "платной работы в это окно не было"),
+        # След прошлой ночи или ручного выката: выдать его за сегодняшний учёт нельзя.
+        ("DRAIN_WINDOW_ID=2026-08-01\nDRAIN_ACCOUNTED=t\n", "неизвестен (файл от окна 2026-08-01)"),
+        (None, "неизвестен (файла"),
+    ],
+)
+def test_the_report_of_the_night_carries_the_drain_accounting(
+    stand: Stand, content: str | None, expect: str
+) -> None:
+    """Ревью Sol, круг 1: доказательство учёта из шага drain было мёртвым контрактом —
+    deploy.sh его писал, а не читал никто. Теперь оно звучит в отчёте ночи; на исход
+    доставки (его решает приёмка) не влияет."""
+    stand.watchdog_pids()
+    if content is not None:
+        (stand.state / "last-drain.env").write_text(content.format(today=stand.today), encoding="utf-8")
+    proc = stand.run()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    assert "✅" in stand.pending()
+    assert expect in stand.pending(), stand.pending()
+
+
+@pytest.mark.unit
 def test_the_happy_path_delivers_accepts_and_restores_the_snapshot(stand: Stand) -> None:
     """Сквозной успех: заморозка → deploy.sh нового дерева → приёмка по шести признакам →
     маркер принятого sha, снятый INFLIGHT, паузы и пулы как до доставки, ✅ в очереди."""
@@ -926,6 +958,25 @@ def test_an_interrupted_delivery_that_never_moved_production_only_clears_the_mar
     assert not stand.calls("compose"), "откатывать нечего"
     assert not (stand.state / "sofascore-inflight").exists()
     assert "⚠️" in stand.pending()
+
+
+@pytest.mark.unit
+def test_a_teardown_that_cannot_unpause_the_maintenance_is_not_a_success(stand: Stand) -> None:
+    """Ревью Sol, круг 1. Разбор незакрытой доставки возвращал обслуживание, но код возврата
+    не смотрел: обслуживание оставалось под паузой навсегда, а автомат снимал маркер,
+    отчитывался ⚠️ «ничего страшного» и не глушил себя — воскресный прогон обслуживания
+    просто больше не запускался бы."""
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(MAINT_PAUSED="f")
+    stand.put(f"paused_{MAINT}", "t")
+    stand.put("unpause_maint_fails")
+    proc = stand.run()
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "🆘" in stand.pending() and "⚠️" not in stand.pending()
+    assert "контур не вернулся в рабочее состояние" in stand.pending()
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
 
 
 @pytest.mark.unit

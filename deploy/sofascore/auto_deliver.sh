@@ -63,8 +63,12 @@ INFLIGHT=$STATE/sofascore-inflight         # доставка начата и е
 ACCEPTED=$STATE/sofascore-accepted         # sha кода, приёмку которого подтвердили
 SNAPSHOT=$STATE/sofascore-rollback.env     # состояние боя до доставки: цель отката
 FAILNIGHTS=$STATE/sofascore-fail-nights    # подряд провальных ночей
+LASTDRAIN=$STATE/last-drain.env            # доказательство учёта шага drain (#1245)
 TODAY=$(date -u +%F)
 ATTEMPTED=$STATE/sofascore-auto-deliver-attempted-$TODAY
+# Идентификатор окна, который автомат передаёт deploy.sh и по которому потом узнаёт
+# СВОЁ доказательство учёта среди чужих (ручной выкат пишет туда же).
+SOFASCORE_DEPLOY_WINDOW_ID_TODAY=$TODAY
 
 # Имена контейнеров, сервисов compose и unit'ов сторожей — те же значения, что в
 # deploy.sh:53-57. Литералами: это состав контура, а не настройка машины.
@@ -116,6 +120,25 @@ mk_marker(){
   # Проверяем ДО записи: перенаправление идёт ПО ссылке и обнуляет её цель.
   if odd_path "$1"; then log "на месте $1 не обычный файл — не пишу туда ничего"; return 1; fi
   { : > "$1"; } 2>/dev/null && is_plain "$1"
+}
+# Доказательство учёта из шага drain: оплаченный скоуп кампании либо доехал до state.json
+# (`t`), либо нет (`f`), либо платной работы в ту ночь не было (`n/a`). Читаем построчно,
+# а не `source`: файл лежит в каталоге состояния и исполнять его содержимое нельзя.
+# Возвращаем текст для отчёта; на исход ночи это не влияет — исход решает приёмка.
+read_drain_accounted(){
+  local v w
+  is_plain "$LASTDRAIN" || { printf 'неизвестен (файла %s нет)' "$LASTDRAIN"; return 0; }
+  w=$(sed -n 's/^DRAIN_WINDOW_ID=//p' "$LASTDRAIN" 2>/dev/null | head -1)
+  v=$(sed -n 's/^DRAIN_ACCOUNTED=//p' "$LASTDRAIN" 2>/dev/null | head -1)
+  # Файл от чужого окна — след прошлой ночи или ручного выката: выдать его за сегодняшний
+  # учёт значило бы отчитаться чужим замером.
+  [ "$w" = "$SOFASCORE_DEPLOY_WINDOW_ID_TODAY" ] || { printf 'неизвестен (файл от окна %s)' "${w:--}"; return 0; }
+  case "$v" in
+    t) printf 'подтверждён' ;;
+    f) printf 'НЕ подтверждён (оплаченный скоуп не доехал до state.json)' ;;
+    n/a) printf 'платной работы в это окно не было' ;;
+    *) printf 'неизвестен (DRAIN_ACCOUNTED=%s)' "${v:--}" ;;
+  esac
 }
 said_today(){ is_plain "$1"; }
 mark_said(){ mk_marker "$1" || log "не смог поставить отметку $1 — сообщение повторится следующим заходом"; }
@@ -651,7 +674,10 @@ if is_plain "$INFLIGHT"; then
     restored_old=0
     restore_state && restored_old=1
     # Разбор завершён (контейнеры трогать не пришлось) — обслуживание возвращается.
-    restore_maint
+    # Отказ здесь — такой же «контур не вернулся», как незавершённый restore_state:
+    # обслуживание осталось бы под паузой навсегда, а автомат отчитался бы об успехе
+    # и снял INFLIGHT (Sol круг 1).
+    restore_maint || restored_old=0
     if [ "$restored_old" = 1 ]; then
       log "НЕЗАКРЫТАЯ ДОСТАВКА, но бой целиком на $OLD — контейнеры не трогаю, env возвращён к снимку"
       tg_durable "⚠️ SofaScore: прошлая доставка оборвалась на середине, но бой целиком остался на прежнем дереве ($OLD) — контейнеры не трогал, env-файл, паузы и пулы вернул к снимку. Следующая попытка — в ближайшее окно. Лог: $LOG"
@@ -971,6 +997,10 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
     set_off
     exit 1
   fi
+  # Доказательство учёта шага drain: оплаченный скоуп кампании либо доехал до state.json,
+  # либо нет. На исход ночи оно не влияет (код в бою и принят), но должно звучать в отчёте:
+  # без потребителя файл был бы мёртвым контрактом (Sol круг 1).
+  accounted=$(read_drain_accounted)
   extra=""
   n=$( { ls -d "$RELEASES_DIR"/release-* 2>/dev/null || true; } | grep -c . )
   orphans=$( { ls -d "$RELEASES_DIR"/freeze.* 2>/dev/null || true; } | grep -c . )
@@ -980,7 +1010,7 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   log "ДОСТАВЛЕНО: $NEW (sha ${WANT:0:8}), артефакт ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}"
   # Маркер снимаем ПОСЛЕ гарантированной отправки: смерть между снятием и сообщением
   # оставила бы исход немым, а суточная защёлка — следующие тики молчаливыми.
-  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (пять DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s.${extra}"
+  tg_durable "✅ SofaScore: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (пять DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, три шлюза healthy на 1 GiB в проекте sofascore-gw, монты scheduler'а и шлюзов ведут в новое дерево, пулы как были, три сторожа на новом дереве). artifact_id=${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:0:12}, деплой занял $(( $(date -u +%s) - now ))s. Учёт оплаченного скоупа истории: $accounted.${extra}"
   rm -f "$INFLIGHT"
   exit 0
 fi

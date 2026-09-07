@@ -285,10 +285,14 @@ write_drain_proof() {
           fi ;;
         metadata)
           # У метаданных нет SOFASCORE_SCOPE_KEY: finalize их пропускает, результат несёт
-          # состояние самой задачи (sofascore_all_mens_state.py).
+          # состояние самой задачи (sofascore_all_mens_state.py). Учтённой считается ТОЛЬКО
+          # успешная волна: платный запрос уходит до записи чекпойнта
+          # (scripts/enrich_sofascore_all_mens_snapshot.py), поэтому падение задачи означает
+          # потраченные байты без движения состояния — planner купит ту же волну заново
+          # (Sol круг 1; в плане §3.1 стояло `success|failed`).
           key="$(json_field "$xcom" SOFASCORE_EXPECTED_CAMPAIGN_ID):metadata:$(json_field "$xcom" SOFASCORE_METADATA_WAVE)"
           accounted=f
-          case "$scope" in success|failed) accounted=t ;; esac ;;
+          case "$scope" in success) accounted=t ;; esac ;;
         *) kind="-"; accounted=f ;;
       esac
     fi

@@ -69,7 +69,10 @@ sofascore_take_deploy_lock() {  # sofascore_take_deploy_lock <fd>
   if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
     echo "на месте замка выката не обычный файл: $path" >&2; return 2
   fi
-  eval "exec $fd>\"\$path\"" 2>/dev/null || { echo "не открывается замок выката: $path" >&2; return 2; }
+  # `>>`, а не `>`: путь настраиваемый, и опечатка в SOFASCORE_DEPLOY_LOCK обнулила бы
+  # обычный файл, на который она указала, ещё до flock (Sol круг 1). Дописывать в замок
+  # никто не собирается — нужен только дескриптор.
+  eval "exec $fd>>\"\$path\"" 2>/dev/null || { echo "не открывается замок выката: $path" >&2; return 2; }
   flock -n "$fd"; rc=$?
   [ "$rc" = 0 ] && return 0
   [ "$rc" = 1 ] && return 1

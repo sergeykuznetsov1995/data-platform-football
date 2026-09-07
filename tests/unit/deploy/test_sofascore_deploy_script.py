@@ -1075,9 +1075,11 @@ def test_the_capture_scope_accounting_is_proven_from_the_metadb(
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "scope_state,expected",
-    # Третий случай: прогон закрыт (dagrun_timeout), а задача метаданных так и не стала
-    # терминальной — результата нет, учёт не подтверждён.
-    [("success", "t"), ("failed", "t"), ("restarting", "f")],
+    # Упавшая волна метаданных учтённой НЕ считается: платный запрос уходит до записи
+    # чекпойнта (scripts/enrich_sofascore_all_mens_snapshot.py), состояние не двинулось —
+    # planner купит ту же волну заново. Третий случай: прогон закрыт (dagrun_timeout), а
+    # задача метаданных так и не стала терминальной — результата нет, учёт не подтверждён.
+    [("success", "t"), ("failed", "f"), ("restarting", "f")],
 )
 def test_the_metadata_scope_accounting_uses_its_own_task_state(
     tmp_path: Path, scope_state: str, expected: str
@@ -1281,6 +1283,19 @@ def test_a_descriptor_that_is_not_the_lock_is_an_error_not_a_busy_contour(tmp_pa
 
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "ведёт не на замок выката" in proc.stderr
+
+
+@pytest.mark.unit
+def test_taking_the_lock_never_truncates_the_file_it_points_at(tmp_path: Path) -> None:
+    """Путь замка настраиваемый (SOFASCORE_DEPLOY_LOCK), а открытие через `>` обнулило бы
+    файл, на который указала опечатка, ещё до flock — в том числе файл боевого дерева."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        pre=lambda rt: (rt / "deploy.lock").write_text("важные данные\n", encoding="utf-8"),
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert (r.runtime / "deploy.lock").read_text(encoding="utf-8") == "важные данные\n"
 @pytest.mark.unit
 def test_env_loader_strips_quotes_and_never_expands_or_exports(tmp_path: Path) -> None:
     env_file = tmp_path / "x.env"
