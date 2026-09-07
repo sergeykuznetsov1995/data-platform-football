@@ -499,7 +499,7 @@ WAVE_TC = "20260908T000000Z"
 
 
 def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive: bool = False,
-                  log_rc: int = 0, deliver_marker: bool = False) -> dict:
+                  log_mode: str = "ok", deliver_marker: bool = False) -> dict:
     values = _layout(tmp_path)
     repo = Path(values["FOTMOB_RELEASE_ROOT"])
     one, two = _two_commits(repo)
@@ -534,15 +534,26 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
     _pgrep_stub(stubs, driver_started, writer_alive)
     rows_file = tmp_path / "waves.txt"
     rows_file.write_text(rows + ("\n" if rows else ""), encoding="utf-8")
-    # Чтение task-лога отдельным скриптом: контейнер отвечает ненулевым кодом, когда
-    # логов нет или он недоступен, и «не прочитал» обязано отличаться от «ошибки нет».
-    err_file = tmp_path / "runner_err.txt"
-    err_file.write_text(runner_err, encoding="utf-8")
-    log_reader = tmp_path / "read_task_log.sh"
-    log_reader.write_text(
-        "#!/bin/bash\n" + (f'exit {log_rc}\n' if log_rc else f'cat "{err_file}"\n'), encoding="utf-8"
-    )
-    log_reader.chmod(0o755)
+    # Task-логи волн лежат на диске так же, как в контейнере, а заглушка docker
+    # ИСПОЛНЯЕТ ту самую команду, которую автомат посылает внутрь, лишь подменив
+    # корень путей. Иначе тест проверял бы заглушку, а не разбор кодов возврата:
+    # различить «совпадений нет» и «лог не прочитан» можно только на настоящем
+    # конвейере `ls || exit 3; grep | cut`.
+    logs_root = tmp_path / "airflow-logs"
+    for line in [r for r in rows.split("\n") if r.strip()]:
+        run_id = line.split("|", 1)[0]
+        attempt = logs_root / f"dag_id=dag_ingest_fotmob/run_id={run_id}/task_id=scrape_fotmob_data"
+        if log_mode == "missing":
+            continue
+        attempt.mkdir(parents=True)
+        if log_mode == "unreadable":
+            # Каталог на месте файла: `ls` доволен, `grep` возвращает 2 — ровно тот
+            # сбой чтения, который без pipefail выглядел бы «ошибки раннера нет».
+            (attempt / "attempt=1.log").mkdir()
+        else:
+            (attempt / "attempt=1.log").write_text(
+                "2026-09-08 00:00:11 INFO wave started\n" + runner_err, encoding="utf-8"
+            )
     calls = tmp_path / "docker.calls"
     _stub(
         stubs, "docker",
@@ -550,7 +561,11 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
         'case "$*" in\n'
         '  *pgrep*) exit 1 ;;\n'
         f'  *md5sum*) echo "{md5}  file" ;;\n'
-        f'  *__main__*) exec {log_reader} ;;\n'         # task-лог волны: строка ошибки раннера
+        # Команду чтения task-лога исполняем по-настоящему, подменив только корень путей.
+        '  *__main__*)\n'
+        '    payload=$(printf "%s" "${@: -1}" | '
+        f'sed "s|/opt/airflow/logs|{logs_root}|g")\n'
+        '    exec bash -c "$payload" ;;\n'
         '  *"FROM dag WHERE"*) echo 1 ;;\n'             # даг перечитан планировщиком
         '  *"count(*)"*) echo 0 ;;\n'                   # import_error и активные раны
         # Список волн фазы 2 отдаём ТОЛЬКО на запрос нужной формы: иначе тест не
@@ -600,7 +615,7 @@ def test_phase2_accepts_the_first_green_refresh_wave(tmp_path: Path) -> None:
     assert verdict.is_file(), sorted(p.name for p in w["state"].iterdir())
     assert "accepted" in verdict.read_text(encoding="utf-8")
     sent = w["sent"].read_text(encoding="utf-8")
-    assert "первая волна актуалки" in sent and "mode=refresh" in sent and "принято" in sent
+    assert "первая волна актуалки" in sent and "mode=refresh" in sent and "не легла" in sent
     assert _git(w["repo"], "rev-parse", "HEAD") == w["two"], "зелёная волна ничего не откатывает"
     assert not (w["state"] / "fotmob-auto-deliver.off").exists()
 
@@ -702,7 +717,7 @@ def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_read(tmp_path: Pa
     """«Лог не прочитан» ≠ «ошибки раннера нет»: иначе красная волна с нашей ошибкой
     ушла бы в «краснота истории», а следующая зелёная актуалка приняла бы этот код."""
     w = _phase2_world(
-        tmp_path, "fotmob_orchestrated__ggg|failed|2026-09-08T00:00:10|backfill", log_rc=3,
+        tmp_path, "fotmob_orchestrated__ggg|failed|2026-09-08T00:00:10|backfill", log_mode="missing",
     )
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
     assert proc.returncode == 0, proc.stderr + proc.stdout
@@ -729,7 +744,7 @@ def test_phase2_skips_history_and_judges_by_the_first_current_wave(tmp_path: Pat
     assert "fotmob_orchestrated__h2" in verdict.read_text(encoding="utf-8")
     assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
     sent = w["sent"].read_text(encoding="utf-8")
-    assert "красная волна истории" in sent and "принято" in sent
+    assert "красная волна истории" in sent and "не легла" in sent
 
 
 @pytest.mark.unit
@@ -765,3 +780,21 @@ def test_phase2_waits_while_the_metadb_still_has_an_active_wave(tmp_path: Path) 
     assert not (w["state"] / "fotmob-auto-deliver.off").exists()
     assert (w["state"] / f"fotmob-wave-rollback-pending-{w['two_short']}-{WAVE_TC}").is_file()
     assert "жду паузы между волнами" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_grepped(tmp_path: Path) -> None:
+    """Лог на месте, но не читается (каталог вместо файла, нет прав, битый том): `grep`
+    возвращает 2. Без `pipefail` внутри контейнера этот код терялся бы за `cut`, и сбой
+    чтения выглядел бы как «ошибки раннера нет» — красная волна прошла бы мимо отката."""
+    w = _phase2_world(
+        tmp_path, "fotmob_orchestrated__kkk|failed|2026-09-08T00:00:10|backfill", log_mode="unreadable",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert not (w["state"] / "fotmob-wave-history-red-fotmob_orchestrated__kkk").exists(), \
+        "сбой чтения не смеет выдавать себя за «ошибки раннера нет»"
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
+    assert "task-лог не прочитан" in w["sent"].read_text(encoding="utf-8")

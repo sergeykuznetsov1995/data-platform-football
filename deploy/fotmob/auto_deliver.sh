@@ -819,8 +819,12 @@ runner_error(){ # $1 = run_id
       echo X; return ;;
   esac
   logs="/opt/airflow/logs/dag_id=dag_ingest_fotmob/run_id=$1/task_id=scrape_fotmob_data/attempt=*.log"
+  # Внутри контейнера: pipefail обязателен — без него код `grep` теряется в конвейере,
+  # и сбой ЧТЕНИЯ существующего лога (grep=2: нет прав, каталог вместо файла, битый
+  # том) выглядел бы как «совпадений нет» (ревью Sol, раунд 2). Единица grep-а — это
+  # штатное «не нашёл», всё, что больше, — «не прочитал».
   if ! out=$(timeout -k 5 60 docker exec "$CAMPAIGN_CONTAINER" bash -lc \
-      "ls $logs >/dev/null 2>&1 || exit 3; grep -m1 -h -E '\[ERROR\] __main__:' $logs | cut -c1-300" 2>/dev/null); then
+      "set -o pipefail; ls $logs >/dev/null 2>&1 || exit 3; grep -m1 -h -E '\[ERROR\] __main__:' $logs | cut -c1-300; rc=\$?; [ \"\$rc\" -le 1 ] || exit 4" 2>/dev/null); then
     echo X; return
   fi
   printf '%s' "$out" | head -n 1 | cut -c1-300
@@ -1012,8 +1016,13 @@ wave_acceptance(){
         "красная первая волна актуалки, ошибки раннера нет — вероятен отказ источника (no_progress_failure), код мог быть ни при чём; после разбора снять $OFF и повторить доставку в ближайшее окно"
       return 0
     fi
-    log "ПЕРВАЯ ВОЛНА АКТУАЛКИ ПОСЛЕ ДОСТАВКИ: $run ($started) mode=$mode success — код принят"
-    tg_durable "✅ FotMob $head_now: первая волна актуалки \`$run\` mode=$mode success — принято."
+    # Что «принято» тут значит: первая волна актуалки на новом коде НЕ ЛЕГЛА. Это не
+    # утверждение, что код отработал полно: зелёный ран бывает и при отложенном
+    # дедлайном плане (partial_success выходит нулём). Полноту судят по данным —
+    # долг «сыграно без деталей» и счётчик здоровых суток в утренней сводке
+    # (решение владельца 07.09 п.2); фаза 2 отвечает только за «не легла».
+    log "ПЕРВАЯ ВОЛНА АКТУАЛКИ ПОСЛЕ ДОСТАВКИ: $run ($started) mode=$mode success — волна не легла"
+    tg_durable "✅ FotMob $head_now: первая волна актуалки \`$run\` mode=$mode success — не легла, откат не нужен. Полноту (долг и здоровые сутки) судит утренняя сводка."
     mk_marker "$verdict" && printf '%s\n' "$run accepted mode=$mode" >> "$verdict" 2>/dev/null \
       || log "маркер вердикта ($verdict) не записан — сообщение о приёмке повторится следующим заходом"
     return 0
