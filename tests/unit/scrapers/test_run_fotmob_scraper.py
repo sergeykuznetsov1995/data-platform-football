@@ -460,14 +460,14 @@ class TestFotmobNativeRunner:
             if operation["entity"] == "season_work_plan"
         )
 
-    @pytest.mark.unit
-    def test_automatic_backfill_empty_plan_with_pending_queue_turns_run_red(self):
-        """Пустой план истории при непустой очереди — КРАСНАЯ волна (#1227).
+    def _history_lane(self, mod):
+        """Полоса истории на одном турнире с тремя сезонами.
 
-        Сценарий ровно тот, что шесть дней притворялся здоровым: часть скоупов
-        обязательства закрыта, оставшийся стоит на остывании после повтора,
-        план пуст, попыток в ране нет — значит ни гейт исходов, ни приёмка
-        каталога такую волну не красят.
+        Общая фикстура барьера продвижения: первая волна закрывает
+        `47=2024/2025`, вторая ставит `47=2023/2024` на остывание после
+        повтора, третья планирует ноль скоупов при непустой очереди — ровно
+        состояние 06.09 (`1c53cb66`), которое старый барьер красил по размеру
+        плана.
         """
 
         from scrapers.fotmob.planner import RunMode, TransportBudget
@@ -479,7 +479,6 @@ class TestFotmobNativeRunner:
             _league_payload,
         )
 
-        mod = self._module()
         root = _league_payload()
         root["allAvailableSeasons"] = ["2025/2026", "2024/2025", "2023/2024"]
         responses = {
@@ -533,6 +532,61 @@ class TestFotmobNativeRunner:
             )
             return _run_native_admitted(mod, args, service=service)
 
+        return repository, run
+
+    def _age_lane_journal(
+        self,
+        repository,
+        report,
+        *,
+        hours_ago,
+        source_season_key="2024/2025",
+        outcome=None,
+        reason=None,
+    ):
+        """Состарить строку журнала полосы под журнальной подписью волны.
+
+        Карта состояний выбирает САМУЮ СВЕЖУЮ запись скоупа, поэтому «старую»
+        попытку нельзя дописать поверх новой — старится сама запись, ровно как
+        в манифесте живёт одна строка последнего исхода скоупа.
+        """
+
+        from datetime import timezone
+
+        journal = self._season_work_plan(report)["metadata"][
+            "journal_plan_signature"
+        ]
+        aged_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            hours=hours_ago
+        )
+        matched = 0
+        for commit in repository.commits:
+            if (
+                commit.target_type != "scope_attempt"
+                or commit.entity_id != journal
+                or commit.source_season_key != source_season_key
+            ):
+                continue
+            commit.capabilities["last_attempt_at"] = aged_at.isoformat()
+            if outcome is not None:
+                commit.capabilities["outcome"] = outcome
+            if reason is not None:
+                commit.capabilities["reason"] = reason
+            matched += 1
+        assert matched, f"журнал не содержит попытки {source_season_key}"
+
+    @pytest.mark.unit
+    def test_automatic_backfill_empty_plan_stays_green_while_the_lane_progresses(self):
+        """Пустой план истории при живой полосе — ЗЕЛЁНАЯ волна (#1255).
+
+        Старый барьер красил по размеру плана и потому красил штатное
+        остывание: единственный кандидат новейшего цикла ждёт повтора, план
+        пуст, а полоса закрыла скоуп три часа назад. Волна 1c53cb66 06.09.
+        """
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+
         first_rc, first_report = run("stalled-cycle-1")
         assert first_rc == 0, first_report["errors"]
         assert first_report["selection"]["planned_scopes"] == ["47=2024/2025"]
@@ -540,22 +594,81 @@ class TestFotmobNativeRunner:
         second_rc, second_report = run("stalled-cycle-2", retryable=True)
         assert second_rc == 1
         assert second_report["selection"]["planned_scopes"] == ["47=2023/2024"]
-        assert second_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+        self._age_lane_journal(repository, second_report, hours_ago=3)
+        third_rc, third_report = run("stalled-cycle-3")
+
+        assert third_report["selection"]["planned_scopes"] == []
+        assert third_rc == 0, third_report["errors"]
+        assert third_report["status"] == "success"
+        work_plan = self._season_work_plan(third_report)
+        assert work_plan["metadata"]["pending_candidate_scopes"] == 1
+        assert work_plan["errors"] == []
+        assert "lane_idle_h=3" in mod._wave_metrics_line(third_report, third_rc)
+
+    @pytest.mark.unit
+    def test_automatic_backfill_turns_red_when_the_lane_closed_nothing_for_days(self):
+        """Полоса без единого закрытия дольше порога — КРАСНАЯ волна (#1227).
+
+        Именно это шесть суток 26.08–01.09 притворялось здоровым: план пуст,
+        попыток в ране нет, очередь обязательства не пуста, и никакой другой
+        барьер такую волну не красит.
+        """
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+
+        run("stalled-cycle-1")
+        _second_rc, second_report = run("stalled-cycle-2", retryable=True)
+        self._age_lane_journal(repository, second_report, hours_ago=40)
 
         third_rc, third_report = run("stalled-cycle-3")
 
         assert third_report["selection"]["planned_scopes"] == []
-        assert third_report["selection"]["scope_attempts"] == []
         assert third_rc == 1
         assert third_report["status"] != "success"
         assert third_report["complete"] is False
         work_plan = self._season_work_plan(third_report)
-        assert work_plan["metadata"]["obligation_scopes"] == 2
-        assert work_plan["metadata"]["already_complete_scopes"] == 1
         assert work_plan["metadata"]["pending_candidate_scopes"] == 1
-        assert any(
-            "history lane is stalled" in error for error in work_plan["errors"]
-        ), work_plan["errors"]
+        stall = [
+            error
+            for error in work_plan["errors"]
+            if error.startswith("no_progress:")
+        ]
+        assert stall, work_plan["errors"]
+        assert "40h" in stall[0]
+        assert "lane_idle_h=40" in mod._wave_metrics_line(third_report, third_rc)
+
+    @pytest.mark.unit
+    def test_source_gap_candidate_counts_as_lane_activity(self):
+        """Кандидат в дыру источника — это работа полосы, а не простой.
+
+        Источник ответил и сказал «матчей нет»; закрытия ещё нет (нужно второе
+        наблюдение), но полоса жива. Считать такие часы простоем — вернуть
+        ложную красноту с другой стороны.
+        """
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+
+        run("stalled-cycle-1")
+        _second_rc, second_report = run("stalled-cycle-2", retryable=True)
+        self._age_lane_journal(repository, second_report, hours_ago=40)
+        self._age_lane_journal(
+            repository,
+            second_report,
+            hours_ago=2,
+            source_season_key="2023/2024",
+            outcome="retryable",
+            reason="source-advertised finished match payloads absent",
+        )
+
+        third_rc, third_report = run("stalled-cycle-3")
+
+        assert third_report["selection"]["planned_scopes"] == []
+        assert third_rc == 0, third_report["errors"]
+        assert self._season_work_plan(third_report)["errors"] == []
+        assert "lane_idle_h=2" in mod._wave_metrics_line(third_report, third_rc)
 
     @pytest.mark.unit
     def test_automatic_backfill_empty_plan_with_empty_queue_stays_green(self):
@@ -695,7 +808,7 @@ class TestFotmobNativeRunner:
             "obligation=5066 already_complete=589 pending=4477 success=0 "
             "source_gap=0 retryable=0 terminal=0 deferred=0 rows_total=6075 "
             "requests=450 not_modified=367 encoded_bytes=3438525 "
-            "gap_candidate=n/a budget_requests_left=19550"
+            "gap_candidate=n/a lane_idle_h=n/a budget_requests_left=19550"
         )
 
     @pytest.mark.unit
@@ -726,6 +839,7 @@ class TestFotmobNativeRunner:
             "not_modified",
             "encoded_bytes",
             "gap_candidate",
+            "lane_idle_h",
             "budget_requests_left",
         ]
         assert "mode=refresh" in line
@@ -1168,6 +1282,9 @@ class TestFotmobNativeRunner:
         assert attempt["attempt_count"] == 2
         assert len(attempt["attempt_identities"]) == 2
         assert len(set(attempt["attempt_identities"])) == 2
+        # Живой 07.09 03:09 (c24436fc): planned=1, success=0, source_gap=1 —
+        # зелёная волна с названной причиной в строке метрик.
+        assert "source_gap=1" in mod._wave_metrics_line(second_report, second_rc)
 
     @pytest.mark.unit
     def test_automatic_run_with_progress_defers_retry_without_failing(self):

@@ -86,6 +86,15 @@ _SOURCE_GAP_RETRY_REASON = "source-advertised finished match payloads absent"
 _SOURCE_GAP_REASON = (
     "two successful fetches lacked source-advertised finished match payloads"
 )
+# Порог простоя полосы истории: сколько полоса может не закрывать НИ ОДНОГО
+# скоупа, прежде чем волна признаётся красной. 24 ч — максимальный штатный
+# бэкофф повтора (`_scope_retry_due`) и он же `planner.TERMINAL_RETRY_AFTER`,
+# плюс ~12 ч на самую длинную волну: раньше 36 ч «полоса стоит» недоказуемо.
+# Замер 08.09 по 27 backfill-волнам за 21 сутки: при 36 ч не краснеет ни одна
+# здоровая волна (самый длинный разрыв между закрытиями исправной полосы —
+# 44 ч, из них 16 ч фактического простоя: кандидат в дыру считается
+# активностью), а шесть суток слепоты 26.08–01.09 (#1227) краснеют.
+LANE_STALL_AFTER = timedelta(hours=36)
 
 PUBLICATION_BINDING_ARGUMENTS = {
     "schema": "publication_schema",
@@ -796,6 +805,7 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
         ("not_modified", transport.get("not_modified")),
         ("encoded_bytes", transport.get("encoded_bytes")),
         ("gap_candidate", _count(metadata.get("source_gap_candidate_scopes"))),
+        ("lane_idle_h", metadata.get("lane_idle_hours")),
         ("budget_requests_left", requests_left),
     )
     return " ".join(
@@ -1684,23 +1694,6 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         work_plan.errors.append(
             f"{mode.value} discovered no eligible exact season targets"
         )
-    # Четвёртый барьер цвета: автоматическая полоса истории, запланировавшая
-    # ноль скоупов при непустой очереди кандидатов, обязана быть КРАСНОЙ.
-    # Пустой план не даёт исходов попыток, поэтому ни гейт исходов рана, ни
-    # приёмка каталога такую волну не красят — она шесть дней притворялась
-    # здоровой (#1227). Пустая очередь (всё обязательство уже в журнале)
-    # остаётся законным зелёным завершением.
-    if (
-        not work
-        and automatic_catalog
-        and mode == RunMode.BACKFILL
-        and pending_candidate_scopes
-    ):
-        work_plan.errors.append(
-            f"backfill planned no scopes while {len(pending_candidate_scopes)} "
-            f"of {len(obligation_scopes)} obligation scopes remain outside the "
-            "completion journal: history lane is stalled"
-        )
     if mode == RunMode.DAILY and daily_competition_ids:
         planned_competition_ids = {item.competition_id for item in work}
         missing_current_ids = sorted(daily_competition_ids - planned_competition_ids)
@@ -2385,6 +2378,60 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             reason=state_reason,
         )
         deferred_scope_targets.add(token)
+    # Четвёртый барьер цвета судит полосу истории по ПРОДВИЖЕНИЮ, а не по
+    # размеру плана. Пустой план backfill сам по себе законен: единственный
+    # кандидат новейшего цикла может штатно остывать после повтора (барьер
+    # planner.py:319-333) — волна 1c53cb66 06.09 краснела именно на этом
+    # штатном остывании. Красным полосу делает другое: она давно не закрыла ни
+    # одного скоупа при непустой очереди обязательства (#1227, шесть суток
+    # слепоты 26.08–01.09). Активностью считаются закрытия (success/source_gap)
+    # и кандидаты в дыру источника — источник ответил, полоса работает.
+    #
+    # Барьер стоит ДО finish(): отчёт волны сериализуется там, а гейт исходов
+    # ниже читает те же живые операции — ошибка попадает и в отчёт, и в цвет.
+    if automatic_catalog and mode == RunMode.BACKFILL:
+        lane_closed_now = sum(
+            1
+            for entry in attempt_operation.metadata.get("outcomes", ())
+            if isinstance(entry, Mapping)
+            and str(entry.get("outcome")) in {"success", "source_gap"}
+        )
+        lane_last_activity = max(
+            (
+                state.last_attempt_at
+                for state in attempt_states.values()
+                if state.outcome in {"success", "source_gap"}
+                or (
+                    state.outcome == "retryable"
+                    and state.reason == _SOURCE_GAP_RETRY_REASON
+                )
+            ),
+            default=None,
+        )
+        lane_idle = (
+            None
+            if lane_last_activity is None
+            else datetime.now(timezone.utc).replace(tzinfo=None) - lane_last_activity
+        )
+        lane_idle_hours = (
+            None if lane_idle is None else int(lane_idle.total_seconds() // 3600)
+        )
+        work_plan.metadata["lane_idle_hours"] = lane_idle_hours
+        if (
+            pending_candidate_scopes
+            and lane_closed_now == 0
+            and not source_gap_candidates
+            # Пустой журнал (сутки после подъёма PARSER_VERSION) часов не даёт:
+            # неизвестность красноты не создаёт — осознанно.
+            and lane_idle is not None
+            and lane_idle > LANE_STALL_AFTER
+        ):
+            work_plan.errors.append(
+                f"no_progress: history lane closed no scope for "
+                f"{lane_idle_hours}h while {len(pending_candidate_scopes)} of "
+                f"{len(obligation_scopes)} obligation scopes remain outside the "
+                "completion journal"
+            )
     rc, payload = finish()
     replay_missing_inputs = (
         _replay_missing_raw_evidence(
