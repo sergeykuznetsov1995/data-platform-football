@@ -1343,7 +1343,16 @@ def test_the_acceptance_dag_count_is_derived_from_the_core_dag_list() -> None:
 
     text = AUTO.read_text(encoding="utf-8")
 
-    assert "dag_players_sofascore_all_mens" in CORE_DAGS
+    # Производность числа от списка мало стоит, если из списка молча выпадет имя:
+    # приёмка тогда сойдётся на неполном контуре. Состав пришпилен целиком (Sol круг 1).
+    assert set(CORE_DAGS) == {
+        "dag_ingest_sofascore",
+        "dag_backfill_sofascore_all_mens",
+        "dag_refresh_sofascore_all_mens",
+        "dag_players_sofascore_all_mens",
+        "dag_trigger_sofascore_daily",
+        "dag_sofascore_manifest_maintenance",
+    }, CORE_DAGS
     assert re.search(r"^CORE_DAGS_N=", text, re.M), "число core-DAG не выводится"
     # Ни одного сравнения счётчика DAG с числом-литералом.
     assert not re.search(r'\[\s*"\$dags"\s*=\s*"?\d', text)
@@ -1360,3 +1369,7 @@ def test_a_running_players_scope_postpones_the_delivery_tick() -> None:
     assert "'$PLAYERS'" in busy
     # Историю сюда по-прежнему НЕ включаем: ею занимается шаг drain в deploy.sh.
     assert "'$HIST'" not in busy
+    # Предупреждение об откате при занятом контуре обязано перечислять то же, что
+    # считает contour_busy: иначе оператор ищет оборванный прогон не там (Sol круг 1).
+    warn = next(l for l in text.splitlines() if "трафик оплачен впустую" in l)
+    assert "полосы игроков" in warn, warn

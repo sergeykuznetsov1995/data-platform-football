@@ -1760,8 +1760,20 @@ def test_the_core_dag_count_is_derived_from_the_list_in_both_recipes() -> None:
 
     assert re.search(r"^CORE_DAGS_N=", deploy, re.M)
     assert not re.search(r'\[\s*"\$present"\s*=\s*"?\d', deploy)
-    assert "dag_players_sofascore_all_mens" in postdeploy
     assert "CONTOUR_DAGS_N=" in postdeploy
+    # Числа выводятся из списков, но и СОСТАВ списков пришпилен: три разных счётчика
+    # (4 у рецепта выката, 6 у приёмки) молча разъехались бы выпадением имени (Sol круг 1).
+    core = re.search(r'^CORE_DAGS="([^"]+)"', deploy, re.M).group(1).split()
+    assert core == ["$DAILY", "$HIST", "$REFRESH", "$PLAYERS"], core
+    contour = re.search(r"^CONTOUR_DAGS=\(([^)]+)\)", postdeploy, re.M).group(1).split()
+    assert set(contour) == {
+        "dag_ingest_sofascore",
+        "dag_backfill_sofascore_all_mens",
+        "dag_refresh_sofascore_all_mens",
+        "dag_players_sofascore_all_mens",
+        "dag_trigger_sofascore_daily",
+        "dag_sofascore_manifest_maintenance",
+    }, contour
     assert not re.search(r'\[\s*"\$active"\s*=\s*"?\d', postdeploy)
 
 

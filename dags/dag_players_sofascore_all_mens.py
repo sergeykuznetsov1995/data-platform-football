@@ -60,7 +60,7 @@ WORKLOAD_ARTIFACT = os.environ.get(
 
 # The lane's own timings.  Runs start at 07:00, 12:00, 17:00 and 22:00 UTC and
 # may last 4.5 h, so the last one ends at 02:30 — an hour before the delivery
-# window opens (03:30 UTC, 04:45 on Sundays) and an hour after it closes.
+# window opens (03:30 UTC, one window on every day) and an hour after it closes.
 # @continuous was rejected for exactly this: it would meet the delivery every
 # single night.
 PLAYERS_SCHEDULE = "0 7,12,17,22 * * *"

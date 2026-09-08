@@ -475,7 +475,7 @@ rollback_to_old(){  # rollback_to_old <старое дерево> <StartedAt sch
   while [ "$left" -gt 0 ] && [ "$(contour_busy)" != 0 ]; do sleep 30; left=$(( left - 30 )); done
   busy_now=$(contour_busy)
   if [ "$busy_now" != 0 ]; then
-    ROLLBACK_NOTE="$ROLLBACK_NOTE ВНИМАНИЕ: откат пересоздавал контейнеры при непустом контуре (dag_run в работе: '$busy_now') — идущий прогон дейли/актуалки/обслуживания оборван, его трафик оплачен впустую."
+    ROLLBACK_NOTE="$ROLLBACK_NOTE ВНИМАНИЕ: откат пересоздавал контейнеры при непустом контуре (dag_run в работе: '$busy_now') — идущий прогон дейли/актуалки/полосы игроков/обслуживания оборван, его трафик оплачен впустую."
     log "ОТКАТ ПРИ ЗАНЯТОМ КОНТУРЕ (dag_run: '$busy_now') — идущий прогон будет оборван"
   fi
   SOFASCORE_RELEASE_ROOT="$old" \
