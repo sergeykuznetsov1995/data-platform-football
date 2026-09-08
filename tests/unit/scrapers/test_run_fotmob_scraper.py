@@ -595,6 +595,7 @@ class TestFotmobNativeRunner:
         assert second_rc == 1
         assert second_report["selection"]["planned_scopes"] == ["47=2023/2024"]
 
+        assert timedelta(hours=3) < mod.LANE_STALL_AFTER
         self._age_lane_journal(repository, second_report, hours_ago=3)
         third_rc, third_report = run("stalled-cycle-3")
 
@@ -620,7 +621,10 @@ class TestFotmobNativeRunner:
 
         run("stalled-cycle-1")
         _second_rc, second_report = run("stalled-cycle-2", retryable=True)
-        self._age_lane_journal(repository, second_report, hours_ago=40)
+        # Возраст считается ОТ порога, а не числом: смена LANE_STALL_AFTER не
+        # должна оставлять тест зелёным на старой константе (урок 100).
+        stalled_hours = int(mod.LANE_STALL_AFTER.total_seconds() // 3600) + 4
+        self._age_lane_journal(repository, second_report, hours_ago=stalled_hours)
 
         third_rc, third_report = run("stalled-cycle-3")
 
@@ -636,8 +640,40 @@ class TestFotmobNativeRunner:
             if error.startswith("no_progress:")
         ]
         assert stall, work_plan["errors"]
-        assert "40h" in stall[0]
-        assert "lane_idle_h=40" in mod._wave_metrics_line(third_report, third_rc)
+        assert f"{stalled_hours}h" in stall[0]
+        assert f"lane_idle_h={stalled_hours}" in mod._wave_metrics_line(
+            third_report, third_rc
+        )
+
+    @pytest.mark.unit
+    def test_lane_stall_threshold_is_pinned_at_thirty_six_hours(self):
+        """Само значение порога — замер, а не вкус, и оно закреплено тестом.
+
+        Замер 08.09 по 27 backfill-волнам за 21 сутки: 24 ч максимального
+        бэкоффа (`_scope_retry_due`, `planner.TERMINAL_RETRY_AFTER`) плюс ~12 ч
+        самой длинной волны. При 24 ч ложно покраснела бы здоровая волна
+        37cb5061 (27.08, простой 35,9 ч). Час ДО порога обязан быть зелёным.
+        """
+
+        mod = self._module()
+        assert mod.LANE_STALL_AFTER == timedelta(hours=36)
+
+        repository, run = self._history_lane(mod)
+        run("stalled-cycle-1")
+        _second_rc, second_report = run("stalled-cycle-2", retryable=True)
+        below_threshold = int(mod.LANE_STALL_AFTER.total_seconds() // 3600) - 1
+        self._age_lane_journal(
+            repository, second_report, hours_ago=below_threshold
+        )
+
+        third_rc, third_report = run("stalled-cycle-3")
+
+        assert third_report["selection"]["planned_scopes"] == []
+        assert third_rc == 0, third_report["errors"]
+        assert self._season_work_plan(third_report)["errors"] == []
+        assert f"lane_idle_h={below_threshold}" in mod._wave_metrics_line(
+            third_report, third_rc
+        )
 
     @pytest.mark.unit
     def test_source_gap_candidate_counts_as_lane_activity(self):
@@ -653,7 +689,11 @@ class TestFotmobNativeRunner:
 
         run("stalled-cycle-1")
         _second_rc, second_report = run("stalled-cycle-2", retryable=True)
-        self._age_lane_journal(repository, second_report, hours_ago=40)
+        self._age_lane_journal(
+            repository,
+            second_report,
+            hours_ago=int(mod.LANE_STALL_AFTER.total_seconds() // 3600) + 4,
+        )
         self._age_lane_journal(
             repository,
             second_report,
