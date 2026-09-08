@@ -981,6 +981,25 @@ def test_a_teardown_that_cannot_unpause_the_maintenance_is_not_a_success(stand: 
 
 
 @pytest.mark.unit
+def test_an_unconfirmed_rollback_still_says_the_maintenance_was_not_paused(stand: Stand) -> None:
+    """Ревью Sol, круг 3. В ветке «откат не подтверждён» аварийный алерт терял ROLLBACK_NOTE
+    вместе с предупреждением о незапаузившемся обслуживании — самое время о нём молчать
+    было бы худшим: контейнеры пересоздавали при живом прогоне обслуживания."""
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(MAINT_PAUSED="f")
+    stand.put(f"paused_{MAINT}", "f")
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.put("pause_maint_fails")
+    proc = stand.run()                     # rollback_works не выставлен: откат не подтверждён
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "🆘" in stand.pending()
+    assert "не встал на паузу перед откатом" in stand.pending(), stand.pending()
+
+
+@pytest.mark.unit
 def test_an_interrupted_delivery_that_moved_production_is_rolled_back(stand: Stand) -> None:
     stand.watchdog_pids()
     (stand.state / "sofascore-inflight").touch()
@@ -1115,7 +1134,10 @@ def test_an_interrupted_delivery_without_a_snapshot_touches_nothing(stand: Stand
 @pytest.mark.parametrize(
     "marker",
     ["sofascore-inflight", "sofascore-accepted", "sofascore-rollback.env",
-     "sofascore-pending-alert", "sofascore-auto-deliver.off", "sofascore-fail-nights"],
+     "sofascore-pending-alert", "sofascore-auto-deliver.off", "sofascore-fail-nights",
+     # Ревью Sol, круг 3: доказательство учёта тоже своё состояние. Каталог на его месте
+     # уронил бы `rm -f` в deploy.sh кодом 1 — и автомат откатил бы НЕТРОНУТЫЙ бой.
+     "last-drain.env"],
 )
 def test_a_substituted_marker_stops_everything(stand: Stand, marker: str) -> None:
     """Symlink принимает запись с нулевым кодом и читается пустым, каталог рвёт

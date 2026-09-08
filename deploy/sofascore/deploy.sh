@@ -138,7 +138,11 @@ HIST_RUN=""
 HIST_DIAG=""
 BREAKER_CALLS=0
 BREAKER_RESULT="-"
-BREAKER_MAX="${SOFASCORE_DEPLOY_BREAKER_MAX:-5}"
+# Один вызов на шаг, а не пять (Sol круг 3): внешний `timeout` убивает КЛИЕНТА docker exec,
+# а процесс в контейнере переживает его (moby#9098). Пять зависших ломателей могли бы
+# тронуть задачу уже после того, как drain вернул код 4 и вернул слоты пула. Один вызов
+# ограничивает и это окно, и цену ошибки; зависшего добиваем явно (см. break_deadlock).
+BREAKER_MAX="${SOFASCORE_DEPLOY_BREAKER_MAX:-1}"
 # hist_scope_row [run_id] -> "<run_id>|<pool>|<state>|<try_number>"; "-" — такого прогона
 # нет; пустая строка — метабаза не ответила («не знаю», а не «нет»).
 # Без аргумента выбирает прогон с начатой платной работой, с аргументом — рассказывает про
@@ -195,12 +199,26 @@ break_deadlock() {
   log "drain: припаркованный скоуп прогона '$HIST_RUN' — ломаю тупик (вызов $BREAKER_CALLS из $BREAKER_MAX)"
   # Текст ломателя идёт по stdin: однострочником без кавычек он уже не выражается.
   # 8>&- : дескриптор замка выката потомкам не наследуется.
-  if timeout -k 5 60 docker exec -i sofascore-airflow-scheduler python - \
-       "$HIST" "$HIST_RUN" "$HIST_POOL" < "$RELEASE/deploy/sofascore/drain_breaker.py" >> "$LOG" 2>&1 8>&-; then
+  # Метка в argv — единственный способ найти ломателя внутри контейнера: код пришёл по
+  # stdin, имени файла у него нет.
+  local marker="drain-breaker-$$-$BREAKER_CALLS" brc=0
+  timeout -k 5 60 docker exec -i sofascore-airflow-scheduler python - \
+       "$HIST" "$HIST_RUN" "$HIST_POOL" "$marker" < "$RELEASE/deploy/sofascore/drain_breaker.py" >> "$LOG" 2>&1 8>&- || brc=$?
+  if [ "$brc" = 0 ]; then
     BREAKER_RESULT=ok
   else
     BREAKER_RESULT=сбой
-    log "drain: ломатель не отработал (вызов $BREAKER_CALLS) — повторю на следующем витке"
+    log "drain: ломатель не отработал (код $brc)"
+    # 124/137 — сработал timeout: клиент убит, а python в контейнере жив и держит открытую
+    # транзакцию на строке dag_run. Добиваем по метке, иначе он проснётся после выката и
+    # переведёт задачу уже в чужом мире (Sol круг 3).
+    if [ "$brc" = 124 ] || [ "$brc" = 137 ]; then
+      if timeout -k 5 30 docker exec sofascore-airflow-scheduler pkill -f "$marker" >> "$LOG" 2>&1 8>&-; then
+        log "drain: зависший ломатель $marker добит в контейнере"
+      else
+        log "MANUAL ACTION REQUIRED: ломатель $marker мог остаться жить в планировщике — проверить руками"
+      fi
+    fi
   fi
   return 0
 }
@@ -264,7 +282,10 @@ write_drain_proof() {
   if [ -n "$HIST_RUN" ]; then
     row=$($PSQL "SELECT coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='run_historical_scope' AND map_index=0),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='validate_historical_scope' AND map_index=0),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='validate_historical_scope' AND map_index=-1),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='finalize_historical_run'),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='propagate_historical_status'),'-'), coalesce((SELECT state FROM dag_run WHERE dag_id='$HIST' AND run_id='$HIST_RUN'),'-'), coalesce((SELECT convert_from(value,'UTF8') FROM xcom WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='plan_historical_batch' AND key='return_value' LIMIT 1),'-');" || true)
     if [ -z "$row" ]; then
-      scope="?"; validate="?"; finalize="?"; propagate="?"; dagrun="?"; accounted=f
+      # Метабаза не ответила — это «не знаю», а не доказанный незачёт: пустой ответ в роли
+      # `f` заставил бы утреннюю приёмку искать потерянные деньги там, где их не теряли
+      # (Sol круг 3).
+      scope="?"; validate="?"; finalize="?"; propagate="?"; dagrun="?"; accounted=unknown
     else
       scope=$(printf '%s' "$row" | cut -d'|' -f1)
       validate0=$(printf '%s' "$row" | cut -d'|' -f2)
@@ -323,10 +344,17 @@ write_drain_proof() {
     printf 'DRAIN_AT=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'DRAIN_ACCOUNTED=%s\n' "$accounted"
   } > "$tmp" && mv -f "$tmp" "$LAST_DRAIN" || log "доказательство учёта $LAST_DRAIN не записано"
+  local accounted_ru
+  case "$accounted" in
+    t) accounted_ru="подтверждён" ;;
+    f) accounted_ru="НЕ подтверждён" ;;
+    unknown) accounted_ru="неизвестен" ;;
+    *) accounted_ru="$accounted" ;;
+  esac
   if [ -z "$HIST_RUN" ]; then
     log "drain: прогона истории с начатой платной работой не было — учитывать нечего (ACCOUNTED=$accounted)"
   else
-    log "drain: прогон $HIST_RUN закрыт: kind=$kind, run=$scope, validate=$validate, finalize=$finalize, propagate=$propagate, dag_run=$dagrun; учёт: $([ "$accounted" = t ] && echo подтверждён || echo "НЕ подтверждён")"
+    log "drain: прогон $HIST_RUN закрыт: kind=$kind, run=$scope, validate=$validate, finalize=$finalize, propagate=$propagate, dag_run=$dagrun; учёт: $accounted_ru"
   fi
 }
 # Прогон истории, оставшийся без задач, планировщик не закроет: паузные прогоны не попадают

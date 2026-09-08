@@ -65,6 +65,10 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
               *)
                 # «Метабаза не отвечает»: пустой вывод и ненулевой код — то же, что таймаут.
                 [ -e "$STATE/metadb_down" ] && exit 1
+                # Метабаза отвалилась ровно на запросе доказательства учёта.
+                case "$sql" in
+                  *plan_historical_batch*) [ -e "$STATE/proof_query_fails" ] && exit 1 ;;
+                esac
                 case "$sql" in
                   *"state IN ('scheduled','up_for_retry')"*)
                     # Строка опроса: перед N-м витком применяем мир turn_N.sql, если он есть.
@@ -82,6 +86,8 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
               # Ломатель тупика: текст идёт по stdin и исполняется НАСТОЯЩИЙ, поверх той же
               # sqlite-базы. Последствия для планировщика — отдельным файлом.
               if [ -e "$STATE/breaker_fails" ]; then cat > /dev/null; echo "breaker stub failure" >&2; exit 1; fi
+              # timeout убил клиента: код 124, процесс в контейнере «остался жить».
+              if [ -e "$STATE/breaker_hangs" ]; then cat > /dev/null; exit 124; fi
               shift 2
               "$PY" "$STATE/breaker_host.py" "$STATE/metadb.sqlite" "$@" || exit $?
               if [ -f "$STATE/after_breaker.sql" ]; then
@@ -627,6 +633,7 @@ def _deploy(
     turns: dict[int, str] | None = None,
     after_breaker: str | None = None,
     breaker_fails: bool = False,
+    breaker_hangs: bool = False,
     metadb_down: bool = False,
     clock: bool = False,
     health: str | None = None,
@@ -649,6 +656,8 @@ def _deploy(
         (state_dir / "after_breaker.sql").write_text(after_breaker, encoding="utf-8")
     if breaker_fails:
         (state_dir / "breaker_fails").touch()
+    if breaker_hangs:
+        (state_dir / "breaker_hangs").touch()
     if metadb_down:
         (state_dir / "metadb_down").touch()
     if clock:
@@ -804,7 +813,7 @@ def test_the_breaker_is_called_with_the_tracked_run_and_the_drained_pool(tmp_pat
 
     assert len(r.breaker_calls) == 1, r.breaker_calls
     call = r.breaker_calls[0]
-    assert call.endswith(f"python - {HIST} {_RUN_ID} sofascore_history_pool"), call
+    assert f"python - {HIST} {_RUN_ID} sofascore_history_pool drain-breaker-" in call, call
 
 
 @pytest.mark.unit
@@ -1017,16 +1026,30 @@ def test_a_successful_breaker_is_called_exactly_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_a_technically_failed_breaker_is_retried_up_to_the_cap(tmp_path: Path) -> None:
-    """Сбой `docker exec` до commit — не «состояние вне протокола», а «не дозвонились»:
-    повторяем, но не бесконечно. Потолок — пять вызовов за drain, дальше честное ожидание
-    до потолка и rc=4; на код возврата выката сбой ломателя не влияет (иначе автомат
-    ночной доставки откатил бы НЕТРОНУТЫЙ бой)."""
+def test_a_technically_failed_breaker_is_not_retried_this_step(tmp_path: Path) -> None:
+    """Ревью Sol, круг 3. Сбой `docker exec` до commit — «не дозвонились», но повторять его
+    внутри одного шага нельзя: внешний `timeout` убивает клиента, а python в контейнере
+    переживает его (moby#9098), и пять зависших ломателей тронули бы задачу уже после
+    возврата слотов пула. Один вызов за drain, дальше честное ожидание и rc=4; на код
+    возврата выката сбой ломателя не влияет (иначе автомат откатил бы НЕТРОНУТЫЙ бой)."""
     r = _deploy(tmp_path, idle_wait="600", breaker_fails=True)
 
     assert r.proc.returncode == 4, r.out
-    assert len(r.breaker_calls) == 5, r.breaker_calls
+    assert len(r.breaker_calls) == 1, r.breaker_calls
     assert "тупик не ломается" in r.log
+
+
+@pytest.mark.unit
+def test_a_hung_breaker_is_killed_inside_the_container(tmp_path: Path) -> None:
+    """Ревью Sol, круг 3. `timeout` убивает КЛИЕНТА docker exec, а процесс в контейнере
+    живёт дальше и держит открытую транзакцию на строке dag_run: проснувшись после выката,
+    он перевёл бы задачу уже в чужом мире. Зависшего добиваем по метке из argv."""
+    r = _deploy(tmp_path, idle_wait="600", breaker_hangs=True)
+
+    assert r.proc.returncode == 4, r.out
+    kills = [a for a in r.args if "pkill -f drain-breaker-" in a]
+    assert len(kills) == 1, r.args
+    assert "добит в контейнере" in r.log
 
 
 # --- Доказательство учёта -----------------------------------------------------------------
@@ -1104,6 +1127,23 @@ def test_the_metadata_scope_accounting_uses_its_own_task_state(
     assert env["DRAIN_SCOPE_KIND"] == "metadata"
     assert env["DRAIN_SCOPE_KEY"] == "camp1:metadata:2024"
     assert env["DRAIN_ACCOUNTED"] == expected, env
+
+
+@pytest.mark.unit
+def test_a_metadb_that_did_not_answer_leaves_the_accounting_unknown(tmp_path: Path) -> None:
+    """Ревью Sol, круг 3. Отказ запроса подавлялся `|| true`, и пустой ответ записывался как
+    `ACCOUNTED=f` — «деньги потеряны». Недоступная метабаза означает «не знаю»: утренняя
+    приёмка иначе искала бы потерянный скоуп там, где ничего не терялось."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        pre=lambda rt: (rt.parent / "stub-state" / "proof_query_fails").touch(),
+    )
+
+    assert r.proc.returncode == 0, r.out
+    env = r.drain_env()
+    assert env["DRAIN_ACCOUNTED"] == "unknown", env
+    assert env["DRAIN_SCOPE_STATE"] == "?"
+    assert "учёт: неизвестен" in r.log
 
 
 @pytest.mark.unit

@@ -151,7 +151,9 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    `upstream_failed`, `finalize_historical_run` записывает отказ, `propagate` закрывает
    прогон. Ломатель отказывается работать (и пишет причину в лог), если прогона нет,
    mapped-скоупов больше одного (batch > 1), скоуп лежит в другом пуле или его состояние
-   вне протокола; не больше 5 вызовов за шаг.
+   вне протокола. **Один вызов за шаг**: внешний `timeout` убивает клиента `docker exec`, а
+   python в контейнере переживает его (moby#9098) — зависшего ломателя drain добивает по
+   метке из argv (`pkill -f drain-breaker-…`), а повторов внутри шага не делает.
 
    Строка опроса — **пять чисел** `дейли-прогоны|задачи|отслеживаемый прогон|задачи истории|
    припаркованные скоупы`; выход — только `0|0|0|0|0`. Пятое число видно и когда ломатель
@@ -166,7 +168,8 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 
    Шаг пишет `${SOFASCORE_RUNTIME_DIR}/auto-deliver/last-drain.env` — **доказательство
    учёта** отслеживаемого прогона (`DRAIN_RUN_ID`, состояния `run/validate/finalize/
-   propagate`, `DRAIN_WINDOW_ID`, `ACCOUNTED=t|f|n/a`). `ACCOUNTED=t` означает, что
+   propagate`, `DRAIN_WINDOW_ID`, `ACCOUNTED=t|f|n/a|unknown`; `unknown` — метабаза не ответила или исход задачи по её цвету
+   неразличим). `ACCOUNTED=t` означает, что
    оплаченный скоуп доехал до `state.json`: у capture — `finalize` успешен и `validate`
    терминален; у волны метаданных — задача успешна (её падение даёт `unknown`: чекпойнт
    пишется в середине задачи, и по цвету не отличить «упало до записи» от «упало после»). Файл ни на что не влияет и код возврата не
