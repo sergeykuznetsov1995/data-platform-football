@@ -1774,6 +1774,7 @@ def test_the_core_dag_count_is_derived_from_the_list_in_both_recipes() -> None:
         "dag_trigger_sofascore_daily",
         "dag_sofascore_manifest_maintenance",
     }, contour
+    assert len(contour) == 6, contour
     assert not re.search(r'\[\s*"\$active"\s*=\s*"?\d', postdeploy)
 
 

@@ -1353,6 +1353,9 @@ def test_the_acceptance_dag_count_is_derived_from_the_core_dag_list() -> None:
         "dag_trigger_sofascore_daily",
         "dag_sofascore_manifest_maintenance",
     }, CORE_DAGS
+    # Множество не ловит дубликат имени, а число выводится из списка: «ровно шесть»
+    # держится только парой «состав + длина» (Sol круг 2).
+    assert len(CORE_DAGS) == 6, CORE_DAGS
     assert re.search(r"^CORE_DAGS_N=", text, re.M), "число core-DAG не выводится"
     # Ни одного сравнения счётчика DAG с числом-литералом.
     assert not re.search(r'\[\s*"\$dags"\s*=\s*"?\d', text)
