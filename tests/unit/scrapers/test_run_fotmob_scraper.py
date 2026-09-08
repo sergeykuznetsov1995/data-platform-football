@@ -495,7 +495,7 @@ class TestFotmobNativeRunner:
         }
         repository = MemoryFotMobRepository()
 
-        def run(run_id, *, retryable=False):
+        def run(run_id, *, retryable=False, deadline_at=None):
             service = FotMobIngestService(
                 transport=StubTransport(dict(responses)),
                 repository=repository,
@@ -530,6 +530,7 @@ class TestFotmobNativeRunner:
                     run_id,
                 ]
             )
+            args.deadline_at = deadline_at
             return _run_native_admitted(mod, args, service=service)
 
         return repository, run
@@ -649,6 +650,47 @@ class TestFotmobNativeRunner:
         assert f"lane_idle_h={stalled_hours}" in mod._wave_metrics_line(
             third_report, third_rc
         )
+
+    @pytest.mark.unit
+    def test_planned_scope_without_a_closure_stays_red_on_a_stalled_lane(self):
+        """Красное решает продвижение полосы, а не пустота плана.
+
+        Волна ЗАПЛАНИРОВАЛА скоуп, отдала его штатной дедлайн-отсрочке и не
+        закрыла ничего, пока полоса стоит дольше порога. Старый барьер
+        требовал `planned=0` и такую волну пропускал зелёной; тест закрепляет,
+        что возврат этого ограничения красноту не выключит.
+        """
+
+        from datetime import timezone
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+
+        first_rc, first_report = run("planned-stall-1")
+        assert first_rc == 0, first_report["errors"]
+        stalled_hours = int(mod.LANE_STALL_AFTER.total_seconds() // 3600) + 4
+        self._age_lane_journal(repository, first_report, hours_ago=stalled_hours)
+
+        second_rc, second_report = run(
+            "planned-stall-2",
+            deadline_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=1),
+        )
+
+        assert second_report["selection"]["planned_scope_count"] == 1
+        assert second_report["selection"]["scope_outcome_counts"] == {"deferred": 1}
+        assert second_rc == 1
+        assert second_report["status"] == "incomplete"
+        stall = [
+            error
+            for error in self._season_work_plan(second_report)["errors"]
+            if error.startswith("no_progress:")
+        ]
+        assert stall, self._season_work_plan(second_report)["errors"]
+        metrics = mod._wave_metrics_line(second_report, second_rc)
+        assert "planned=1" in metrics and "success=0" in metrics
+        assert "deferred=1" in metrics
+        assert f"lane_idle_h={stalled_hours}" in metrics
 
     @pytest.mark.unit
     def test_lane_stall_threshold_is_pinned_at_thirty_six_hours(self):
