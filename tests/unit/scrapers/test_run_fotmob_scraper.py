@@ -590,6 +590,11 @@ class TestFotmobNativeRunner:
         first_rc, first_report = run("stalled-cycle-1")
         assert first_rc == 0, first_report["errors"]
         assert first_report["selection"]["planned_scopes"] == ["47=2024/2025"]
+        # Волна, закрывшая скоуп прямо сейчас, рапортует нулевой простой, а не
+        # часы «до себя»; доказанный ноль кандидатов печатается как 0, не n/a.
+        first_metrics = mod._wave_metrics_line(first_report, first_rc)
+        assert "lane_idle_h=0" in first_metrics
+        assert "gap_candidate=0" in first_metrics
 
         second_rc, second_report = run("stalled-cycle-2", retryable=True)
         assert second_rc == 1

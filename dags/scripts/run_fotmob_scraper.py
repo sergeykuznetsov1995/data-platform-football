@@ -2389,6 +2389,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     #
     # Барьер стоит ДО finish(): отчёт волны сериализуется там, а гейт исходов
     # ниже читает те же живые операции — ошибка попадает и в отчёт, и в цвет.
+    if automatic_catalog:
+        # Пустой список кандидатов — доказанный ноль, а не «неизвестно»: у
+        # полной автоматической волны метрика обязана печатать 0, а n/a
+        # остаётся усечённому отчёту.
+        work_plan.metadata["source_gap_candidate_scopes"] = list(
+            source_gap_candidates
+        )
     if automatic_catalog and mode == RunMode.BACKFILL:
         lane_closed_now = sum(
             1
@@ -2416,7 +2423,12 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         lane_idle_hours = (
             None if lane_idle is None else int(lane_idle.total_seconds() // 3600)
         )
-        work_plan.metadata["lane_idle_hours"] = lane_idle_hours
+        # Работа ЭТОГО рана обнуляет простой: волна, закрывшая скоуп прямо
+        # сейчас, не может рапортовать вчерашние часы простоя, а первая волна
+        # на пустом журнале — «неизвестно».
+        work_plan.metadata["lane_idle_hours"] = (
+            0 if (lane_closed_now or source_gap_candidates) else lane_idle_hours
+        )
         if (
             pending_candidate_scopes
             and lane_closed_now == 0
