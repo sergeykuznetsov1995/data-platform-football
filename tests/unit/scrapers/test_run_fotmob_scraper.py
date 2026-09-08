@@ -695,7 +695,7 @@ class TestFotmobNativeRunner:
             "obligation=5066 already_complete=589 pending=4477 success=0 "
             "source_gap=0 retryable=0 terminal=0 deferred=0 rows_total=6075 "
             "requests=450 not_modified=367 encoded_bytes=3438525 "
-            "budget_requests_left=19550"
+            "gap_candidate=n/a budget_requests_left=19550"
         )
 
     @pytest.mark.unit
@@ -725,6 +725,7 @@ class TestFotmobNativeRunner:
             "requests",
             "not_modified",
             "encoded_bytes",
+            "gap_candidate",
             "budget_requests_left",
         ]
         assert "mode=refresh" in line
@@ -1123,9 +1124,28 @@ class TestFotmobNativeRunner:
             mod, args, service=make_service("missing-match-1")
         )
 
-        assert first_rc == 1
-        assert first_report["status"] == "incomplete"
-        assert first_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+        # Первое наблюдение дыры источника — кандидат, а не отказ волны (#1255):
+        # источник ответил и сказал «матчей нет», ран красить нечем. Но и
+        # зелёной волна быть не может — ни одного скоупа она не закрыла.
+        assert first_rc == 0, first_report["errors"]
+        assert first_report["status"] == "partial_success"
+        assert first_report["complete"] is False
+        first_attempt = first_report["selection"]["scope_attempts"][0]
+        assert first_attempt["outcome"] == "retryable"
+        assert (
+            first_attempt["reason"]
+            == "source-advertised finished match payloads absent"
+        )
+        assert first_report["selection"]["source_gap_candidate_scopes"] == [
+            "47=2025/2026"
+        ]
+        assert not first_report["errors"]
+        assert "gap_candidate=1" in mod._wave_metrics_line(first_report, first_rc)
+
+        from scripts.fotmob_catalog_acceptance import validate_report
+
+        first_continuous = validate_report(first_report, require_full_completion=False)
+        assert first_continuous.ok is True, first_continuous.errors
 
         real_datetime = datetime
 
@@ -1248,6 +1268,96 @@ class TestFotmobNativeRunner:
         assert validate_report(report, require_full_completion=True).ok is False
         continuous = validate_report(report, require_full_completion=False)
         assert continuous.ok is True, continuous.errors
+
+    @pytest.mark.unit
+    def test_source_gap_candidate_does_not_shield_a_dead_source_in_the_same_wave(self):
+        """Послабление для кандидата в дыру не прикрывает мёртвый источник.
+
+        Кандидат (источник ответил «матчей нет») перестал красить волну, но
+        рядом с ним живёт скоуп с настоящим сетевым отказом и ни одного
+        закрытия. Такая волна обязана остаться красной — иначе послабление
+        воспроизводит ровно ту слепоту «зелёное при нулевом сборе» (#1227),
+        ради которой гейт исходов и вводился.
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService, OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 48, "name": "Second League"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _competition_payload(47, "Premier League")
+            ),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: (
+                _competition_payload(48, "Second League")
+            ),
+            canonicalize_target(
+                "matchDetails", {"matchId": "100"}
+            ).canonical_url: {
+                "error": True,
+                "message": "Data not found",
+                "matchId": "100",
+            },
+        }
+        service = FotMobIngestService(
+            transport=StubTransport(dict(responses)),
+            repository=MemoryFotMobRepository(),
+            mode=RunMode.DAILY,
+            budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+            run_id="gap-and-dead-1",
+            max_workers=2,
+        )
+        real_sync_season = service.sync_season
+
+        def sync_season(competition_id, source_season_key, **kwargs):
+            if int(competition_id) == 48:
+                return (
+                    OperationResult(
+                        "season_bundle",
+                        attempted=1,
+                        retryable=["HTTP 503 from FotMob"],
+                    ),
+                    None,
+                )
+            return real_sync_season(competition_id, source_season_key, **kwargs)
+
+        service.sync_season = sync_season
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "gap-and-dead-1",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert report["selection"]["source_gap_candidate_scopes"] == ["47=2025/2026"]
+        assert report["selection"]["scope_outcome_counts"].get("success", 0) == 0
+        assert rc == 1
+        assert report["status"] == "incomplete"
+        assert report["complete"] is False
 
     @pytest.mark.unit
     def test_schedule_cooldown_returns_after_the_next_kickoff_not_in_two_days(self):
@@ -1756,7 +1866,7 @@ class TestFotmobNativeRunner:
 
         first_rc, first_report = run(first_catalog, "composition-1")
 
-        assert first_rc == 1
+        assert first_rc == 0, first_report["errors"]
         assert first_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
 
         real_datetime = datetime

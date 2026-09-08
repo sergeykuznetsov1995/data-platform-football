@@ -739,6 +739,10 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
     def _mapping(value: Any) -> Mapping[str, Any]:
         return value if isinstance(value, Mapping) else {}
 
+    def _count(value: Any) -> Any:
+        # Отсутствующий список — «неизвестно», а не «ноль» (см. _outcome ниже).
+        return len(value) if isinstance(value, list) else None
+
     def _total(value: Any) -> Any:
         mapping = _mapping(value)
         if not mapping:
@@ -791,6 +795,7 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
         ("requests", transport.get("attempts")),
         ("not_modified", transport.get("not_modified")),
         ("encoded_bytes", transport.get("encoded_bytes")),
+        ("gap_candidate", _count(metadata.get("source_gap_candidate_scopes"))),
         ("budget_requests_left", requests_left),
     )
     return " ".join(
@@ -1771,6 +1776,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     if automatic_catalog:
         operations.append(attempt_operation)
     completed_scopes: list[str] = []
+    # Скоупы, у которых доказательства дыры источника уже собраны, но второго
+    # наблюдения ещё нет. До #1255 такой скоуп шёл в work_plan.retryable и красил
+    # первую попытку, хотя источник честно ответил «матчей нет».
+    source_gap_candidates: list[str] = []
     replay_gap_entries: list[dict[str, Any]] = []
 
     # Complete one exact scope end-to-end before starting the next.  This is
@@ -1988,12 +1997,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 if previous_attempt is not None
                 else ()
             )
-            source_gap = (
+            # Доказательства дыры источника (первое наблюдение) и её признание
+            # (второе наблюдение) разделены: промоушен в source_gap по-прежнему
+            # требует двух независимых наблюдений, а вот КРАСИТЬ волну первое
+            # наблюдение больше не обязано.
+            source_gap_evidence = (
                 automatic_catalog
                 and source_missing_matches > 0
                 and bool(bundle is not None)
                 and all(operation.ok for operation in scope_operations)
                 and not outstanding
+            )
+            source_gap = (
+                source_gap_evidence
                 and previous_attempt is not None
                 and previous_attempt.outcome in {"retryable", "source_gap"}
                 and previous_attempt.reason
@@ -2030,7 +2046,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 )
                 work_plan.succeeded += 1
             else:
-                if not hard_failure or not automatic_catalog:
+                source_gap_candidate = source_gap_evidence and not hard_failure
+                if source_gap_candidate:
+                    # Признак класса сохраняется в отчёте (метаданные плана и
+                    # selection), но не как строка ошибки: иначе кандидат
+                    # красит волну ещё до того, как дыра признана.
+                    source_gap_candidates.append(scope_key)
+                    work_plan.metadata.setdefault(
+                        "source_gap_candidate_scopes", []
+                    ).append(scope_key)
+                elif not hard_failure or not automatic_catalog:
                     work_plan.retryable.append(work_plan_retryable)
                 next_due = _scope_retry_due(
                     (previous_attempt.attempt_count + 1 if previous_attempt else 1),
@@ -2412,12 +2437,28 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         # Гейт судит ран по тому, что сделал он сам. Карта состояний под
         # стабильной подписью — это история всей полосы, включая скоупы, до
         # которых это окно не дошло.
-        run_outcomes = tuple(
-            str(entry.get("outcome"))
+        run_outcome_entries = tuple(
+            entry
             for entry in attempt_operation.metadata.get("outcomes", ())
             if isinstance(entry, Mapping)
         )
-        retryable_attempts = "retryable" in run_outcomes
+        run_outcomes = tuple(
+            str(entry.get("outcome")) for entry in run_outcome_entries
+        )
+        # Кандидат в дыру источника записан в журнал как retryable — это верно
+        # для планировщика (признание дыры требует второго наблюдения), но для
+        # цвета волны это не отказ: источник ответил, и ответил «матчей нет».
+        # Красить первую попытку было ложной краснотой (#1255, волна 51dc3d2a
+        # 06.09: planned=1, retryable=1, rc=1 при исправном источнике).
+        gap_candidate_scopes = set(source_gap_candidates)
+        retryable_attempts = any(
+            str(entry.get("outcome")) == "retryable"
+            and format_scope_token(
+                entry.get("competition_id"), entry.get("source_season_key")
+            )
+            not in gap_candidate_scopes
+            for entry in run_outcome_entries
+        )
         terminal_attempts = "terminal" in run_outcomes
         # Закрытый скоуп — единственное доказательство, что ран вообще работал.
         # source_gap закрывает скоуп с признанной дырой источника, это тоже
@@ -2434,6 +2475,9 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             for outcome in sorted(set(run_outcomes))
         }
         payload["selection"]["planned_scope_count"] = len(planned_scopes)
+        payload["selection"]["source_gap_candidate_scopes"] = list(
+            source_gap_candidates
+        )
         unauthorized_operation_retries = any(
             not _is_budget_deferral_error(reason)
             for operation in operations
@@ -2475,6 +2519,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             retryable_attempts
             or unauthorized_operation_retries
             or automatic_deferrals
+            or source_gap_candidates
         ):
             payload["status"] = "partial_success"
             payload["complete"] = False
