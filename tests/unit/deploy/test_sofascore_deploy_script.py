@@ -29,6 +29,7 @@ TAG = DIGEST[:8]
 HIST = "dag_backfill_sofascore_all_mens"
 REFRESH = "dag_refresh_sofascore_all_mens"
 MAINT = "dag_sofascore_manifest_maintenance"
+PLAYERS = "dag_players_sofascore_all_mens"
 
 
 def _write(path: Path, text: str, mode: int | None = None) -> Path:
@@ -576,6 +577,11 @@ _DEFAULT = object()
 _DAILY_BUSY = (
     "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
     " VALUES ('dag_ingest_sofascore','daily-1','ingest',-1,'running','default_pool',1);"
+)
+# Занятая полоса игроков: её оплаченный скоуп идёт — второе число строки опроса не ноль.
+_PLAYERS_BUSY = (
+    "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
+    f" VALUES ('{PLAYERS}','players-1','run_players_scope',0,'running','sofascore_players_pool',1);"
 )
 # Что делает ПЛАНИРОВЩИК после того, как ломатель поставил скоупу failed: validate-плейсхолдер
 # получает upstream_failed, finalize пишет отказ в failures.json, propagate закрывает прогон.
@@ -1680,10 +1686,23 @@ def test_the_recipe_waits_for_the_players_lane_but_never_pauses_it() -> None:
     text = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
 
     assert "PLAYERS=dag_players_sofascore_all_mens" in text
+    # Имя пула — одной константой на осушение, возврат и сообщения (принцип $HIST_POOL
+    # из #1245): разъехавшись, они осушали бы один пул, а возвращали другой.
+    assert "PLAYERS_POOL=sofascore_players_pool" in text
     # wait_drained ждёт ЗАДАЧИ полосы: невзятый скоуп при осушённом пуле висит
     # `scheduled` и не блокирует, а взятый доработает вместе со своим validate.
-    assert "'$DAILY','$REFRESH','$PLAYERS'" in text
-    assert "set_pool sofascore_players_pool 0" in text
+    # Проверяем СОСТАВ второго числа, а не подстроку: после сведения с #1264 в том же
+    # списке стоит и обслуживание манифеста, и подстрочный ассерт молча пережил бы
+    # выпадение любого имени из середины.
+    drain_row = next(l for l in text.splitlines() if l.lstrip().startswith("DRAIN_ROW=$("))
+    counted = re.search(
+        r"count\(\*\) FROM task_instance WHERE dag_id IN \(([^)]+)\)"
+        r" AND state IN \('queued','running'\)",
+        drain_row,
+    )
+    assert counted, "второе число строки опроса не найдено"
+    assert set(counted.group(1).split(",")) == {"'$DAILY'", "'$REFRESH'", "'$PLAYERS'", "'$MAINT'"}
+    assert 'set_pool "$PLAYERS_POOL" 0' in text
     assert '"$CAMPAIGN/players-results"' in text
 
     # restore-pause полосы не касается: мы её не паузили.
@@ -1692,6 +1711,46 @@ def test_the_recipe_waits_for_the_players_lane_but_never_pauses_it() -> None:
     # wait_idle тоже не трогаем: паузный DAG в гейте «контур свободен» подвешивает выкат.
     wait_idle = text.split("wait_idle() {", 1)[1].split("\n}\n", 1)[0]
     assert "$PLAYERS" not in wait_idle
+
+
+@pytest.mark.unit
+def test_a_running_players_scope_holds_the_deploy_and_needs_no_breaker(tmp_path: Path) -> None:
+    """Тот же инвариант в живой метабазе, а не в тексте рецепта. Пока задача полосы идёт,
+    второе число строки опроса не ноль — выкат не начинается и оплаченный скоуп профилей
+    не рвётся пересозданием scheduler'а. Ломатель тупика (#1245) к полосе не зовут: он
+    умеет только run_historical_scope, а полоса в пятое число не попадает вовсе."""
+    r = _deploy(tmp_path, idle_wait="0", seed_sql=_PLAYERS_BUSY, world=None)
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.compose_calls, r.args
+    assert not r.breaker_calls, r.breaker_calls
+    assert "FAILED at step 'drain'" in r.log
+    assert "nothing deployed" in r.log
+    # Ждали её задачи — но саму полосу при этом не паузили.
+    assert not (r.state_dir / f"paused_{PLAYERS}").exists()
+
+
+@pytest.mark.unit
+def test_a_green_deploy_drains_the_players_pool_and_never_touches_its_pause(tmp_path: Path) -> None:
+    """Штатный выкат: пул полосы осушён до пересоздания и возвращён после, а паузу её
+    никто не трогает ни в drain, ни в restore-pause."""
+    r = _deploy(tmp_path, idle_wait="600", world=None)
+
+    assert r.proc.returncode == 0, r.out
+    assert not [a for a in r.args if f"dags pause {PLAYERS}" in a or f"dags unpause {PLAYERS}" in a], r.args
+    assert not (r.state_dir / f"paused_{PLAYERS}").exists()
+    pools = [
+        a.split()[5:7] for a in r.args
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
+    ]
+    assert ["sofascore_players_pool", "0"] in pools, pools
+    assert ["sofascore_players_pool", "1"] in pools, pools
+    first_compose = min(i for i, a in enumerate(r.args) if a.startswith("compose "))
+    drained = next(
+        i for i, a in enumerate(r.args)
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set sofascore_players_pool 0")
+    )
+    assert drained < first_compose, r.args
 
 
 @pytest.mark.unit
