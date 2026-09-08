@@ -39,6 +39,7 @@ POOLS = ("ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_poo
 GATEWAYS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
 SCHEDULER = "sofascore-airflow-scheduler"
 METADB = "sofascore-airflow-metadb"
+MAINT = "dag_sofascore_manifest_maintenance"
 # Список core-DAG читается из самого скрипта: стенд не должен уметь
 # рассинхронизироваться с ним — ровно та ошибка, которую ловит тест ниже.
 CORE_DAGS = tuple(
@@ -129,7 +130,11 @@ echo "дальше: bash deploy/sofascore/deploy.sh $tree"
         _script(
             self.source / "deploy" / "sofascore", "deploy.sh",
             '''S="${STUB_STATE:?}"
-printf '%s|%s\\n' "$*" "${SOFASCORE_DEPLOY_IDLE_WAIT-<unset>}" >> "$S/deploy.calls"
+printf '%s|%s|%s|%s\\n' "$*" "${SOFASCORE_DEPLOY_IDLE_WAIT-<unset>}" \\
+  "${SOFASCORE_DEPLOY_WINDOW_ID-<unset>}" "${SOFASCORE_DEPLOY_LOCK_FD-<unset>}" >> "$S/deploy.calls"
+# Замок выката держит автомат весь тик: снаружи он не берётся, пока идёт доставка.
+flock -n "${SOFASCORE_DEPLOY_LOCK:?}" true 2>/dev/null \\
+  && echo free >> "$S/lock.probe" || echo held >> "$S/lock.probe"
 rc=$(cat "$S/deploy_rc" 2>/dev/null || echo 0)
 new="$1"
 # rc=4 — «контур занят, выкат не начат»: пул и паузы возвращает on_exit самого deploy.sh,
@@ -179,6 +184,8 @@ exit "$rc"
                     f"SOFASCORE_PLATFORM_ENV_FILE={self.platform_env}",
                     f"SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST={self.runtime}/artifacts/old/workload_policy.json",
                     "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID=cafebabe",
+                    # Замок выката (#1245): один протокол на автомат и ручной deploy.sh.
+                    f"SOFASCORE_DEPLOY_LOCK={self.runtime}/deploy.lock",
                     "",
                 ]
             ),
@@ -190,6 +197,22 @@ exit "$rc"
             if line.startswith(f"{key}="):
                 return line.split("=", 1)[1]
         return ""
+
+    def _flock_stub(self) -> None:
+        _script(
+            self.stubs, "flock",
+            '''S="${STUB_STATE:?}"
+# Чужой ручной выкат «заканчивается» ровно между первым чтением env-файла и замком:
+# автомат обязан перечитать env под замком, иначе снимок отката укажет на дерево,
+# которого в бою уже нет.
+if [ -e "$S/env_swap_root" ] && [ ! -e "$S/env_swapped" ]; then
+  : > "$S/env_swapped"
+  sed -i "s#^SOFASCORE_RELEASE_ROOT=.*#SOFASCORE_RELEASE_ROOT=$(cat "$S/env_swap_root")#" \
+    "${SOFASCORE_ENV_FILE:?}"
+fi
+exec /usr/bin/flock "$@"
+''',
+        )
 
     # -- состояние заглушек -----------------------------------------------------
     def put(self, name: str, value: str = "1") -> None:
@@ -203,14 +226,19 @@ exit "$rc"
         self.put("dags", str(len(CORE_DAGS)))
         self.put("import_error", "0")
         self.put("busy", "0")
+        self._flock_stub()
         self.put("gw_health", "healthy")
         self.put("gw_memory", "1073741824")
         self.put("gw_project", "sofascore-gw")
         self.put("now_epoch", str(_epoch(THU_0330)))
+        self.today = THU_0330.split(" ")[0]
         for pool in POOLS:
             self.put(f"pool_{pool}", "1")
         for dag in (HIST, REFRESH):
             self.put(f"paused_{dag}", "f")
+        # Обслуживание манифеста живёт на паузе и распаущивается только своим прогоном:
+        # deploy.sh паузит его на выкат, автомат возвращает после приёмки или отката.
+        self.put(f"paused_{MAINT}", "t")
 
     # -- сторожа: настоящие процессы с настоящим /proc/<pid>/cmdline ------------
     def watchdog_pids(self) -> None:
@@ -244,14 +272,6 @@ exec /bin/date -u -d "@$FAKE" "$fmt"
 ''',
         )
         _script(self.stubs, "sleep", "exit 0\n")
-        _script(
-            self.stubs, "pgrep",
-            f'''case "$*" in
-  *deploy*) [ -e "{s}/manual_deploy" ] && exit 0; exit 1 ;;
-esac
-exit 1
-''',
-        )
         _script(
             self.stubs, "systemctl",
             f'''S="{s}"
@@ -303,12 +323,19 @@ case "$1" in
     case "$4" in
       dags)
         case "$5" in
-          pause) echo t > "$S/paused_$6" ;;
-          unpause) [ -e "$S/unpause_fails" ] || echo f > "$S/paused_$6" ;;
+          pause)
+            [ -e "$S/pause_maint_fails" ] && [ "$6" = "dag_sofascore_manifest_maintenance" ] || echo t > "$S/paused_$6" ;;
+          unpause)
+            skip=0
+            [ -e "$S/unpause_fails" ] && skip=1
+            [ -e "$S/unpause_maint_fails" ] && [ "$6" = "dag_sofascore_manifest_maintenance" ] && skip=1
+            [ "$skip" = 1 ] || echo f > "$S/paused_$6" ;;
         esac ;;
     esac
     exit 0 ;;
   inspect)
+    # «docker не отвечает»: код 1 и пустой вывод — так автомат отличает «не знаю» от «нет».
+    [ -e "$S/inspect_fails" ] && exit 1
     fmt="$3"
     shift 3
     for c in "$@"; do
@@ -377,8 +404,11 @@ exit 0
             "NEW_RELEASE_ROOT": str(self.new_tree),
             "OLD_ARTIFACT_HOST": f"{self.runtime}/artifacts/old/workload_policy.json",
             "OLD_ARTIFACT_ID": "cafebabe",
+            "SNAPSHOT_VERSION": "2",
+            "WINDOW_ID": "2026-09-03",
             "HIST_PAUSED": "f",
             "REFRESH_PAUSED": "f",
+            "MAINT_PAUSED": "t",
             **{f"POOL_{p}": "1" for p in POOLS},
             "SCHED_CREATED": "created-old",
         }
@@ -545,13 +575,55 @@ def test_an_unreachable_source_repo_stops_the_tick_without_touching_anything(sta
 
 
 @pytest.mark.unit
-def test_a_manual_deploy_in_progress_skips_the_tick(stand: Stand) -> None:
+def test_a_busy_deploy_lock_skips_the_tick(stand: Stand) -> None:
     """deploy.sh — инструмент владельца по слову «выкатывай»: запрещать его автомат не
-    вправе, но и лезть под него не должен."""
-    stand.put("manual_deploy")
-    proc = stand.run()
+    вправе, но и лезть под него не должен. Раньше это решал `pgrep deploy.sh` — между
+    «процесса нет» и первым изменением контура помещался целый чужой выкат. Теперь обе
+    стороны берут один замок."""
+    lock = stand.runtime / "deploy.lock"
+    lock.touch()
+    holder = subprocess.Popen(["flock", "-n", str(lock), "sleep", "60"])
+    try:
+        proc = stand.run()
+    finally:
+        holder.kill()
+        holder.wait()
+
     assert proc.returncode == 0, proc.stderr
-    assert "идёт ручной выкат" in stand.log_text()
+    assert "идёт другой выкат" in stand.log_text()
+    assert not stand.calls("deploy")
+
+
+@pytest.mark.unit
+def test_the_automaton_holds_the_deploy_lock_for_the_whole_tick(stand: Stand) -> None:
+    """Замок держится весь тик — снимок, выкат, приёмка, восстановление. Дескриптор и
+    окно уезжают в deploy.sh: свидетельство учёта привязано к этой ночи, а сам выкат идёт
+    под уже взятым замком, а не спотыкается о него."""
+    stand.watchdog_pids()
+    proc = stand.run()
+
+    assert proc.returncode == 0, proc.stderr
+    calls = stand.calls("deploy")
+    assert calls, stand.log_text()
+    window, fd = calls[0].split("|")[2], calls[0].split("|")[3]
+    assert window == stand.today, calls[0]
+    assert fd == "8", calls[0]
+    assert (stand.stub_state / "lock.probe").read_text().strip() == "held"
+
+
+@pytest.mark.unit
+def test_the_env_file_is_reread_under_the_lock(stand: Stand) -> None:
+    """Ручной выкат мог закончиться между первым чтением env-файла и захватом замка: без
+    перечитывания снимок отката указывал бы на дерево, которого в бою уже нет."""
+    other = stand.releases / "release-99999999"
+    (other / "logs").mkdir(parents=True)
+    stand.put("env_swap_root", str(other))
+    proc = stand.run()
+
+    # Перечитанный env указывает на дерево, которое законным клоном не является: автомат
+    # об этом и говорит. Без перечитывания он спокойно доставил бы на прежнее дерево.
+    assert proc.returncode == 1, proc.stderr + stand.log_text()
+    assert "НЕ В ЗАКОННОМ СОСТОЯНИИ" in stand.log_text()
     assert not stand.calls("deploy")
 
 
@@ -570,18 +642,17 @@ def test_outside_the_window_the_automaton_is_silent(stand: Stand, when: str, hhm
 
 
 @pytest.mark.unit
-def test_sunday_closes_the_window_before_the_manifest_maintenance(stand: Stand) -> None:
-    """Воскресный dag_sofascore_manifest_maintenance стартует в 05:00 UTC, а гейт «контур
-    свободен» проверяется ОДИН раз — до осушения, которое длится десятки минут."""
-    stand.put("now_epoch", str(_epoch("2026-09-06 04:50:00")))   # воскресенье, после 04:45
+def test_sunday_is_an_ordinary_night_now(stand: Stand) -> None:
+    """Решение владельца 07.09: воскресного дедлайна 04:45 больше нет. Он оставлял на
+    осушение 1020 с и съел ночь 06.09 при честно работавшем 62-минутном скоупе. Прогон
+    обслуживания манифеста в 05:00 не мешает: deploy.sh паузит его на весь выкат, автомат
+    возвращает паузу после приёмки или отката."""
+    stand.put("now_epoch", str(_epoch("2026-09-06 04:50:00")))   # воскресенье
+    stand.watchdog_pids()
     proc = stand.run()
-    assert proc.returncode == 0, proc.stderr
-    assert not stand.calls("deploy")
-    # В четверг тот же час — рабочий: запаса ещё хватает.
-    stand.put("now_epoch", str(_epoch("2026-09-03 04:50:00")))
-    stand.run()
-    assert stand.calls("deploy"), "в будни 04:50 — ещё окно"
 
+    assert proc.returncode == 0, proc.stderr
+    assert stand.calls("deploy"), "в воскресенье 04:50 окно открыто, как в четверг"
 
 @pytest.mark.unit
 def test_no_headroom_left_means_no_delivery_and_no_latch(stand: Stand) -> None:
@@ -647,6 +718,34 @@ def test_a_broken_leftover_release_dir_is_never_reused(stand: Stand, break_it: s
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "content,expect",
+    [
+        ("DRAIN_WINDOW_ID={today}\nDRAIN_ACCOUNTED=t\n", "Учёт оплаченного скоупа истории: подтверждён"),
+        ("DRAIN_WINDOW_ID={today}\nDRAIN_ACCOUNTED=f\n", "НЕ подтверждён"),
+        ("DRAIN_WINDOW_ID={today}\nDRAIN_ACCOUNTED=n/a\n", "платной работы в это окно не было"),
+        # След прошлой ночи или ручного выката: выдать его за сегодняшний учёт нельзя.
+        ("DRAIN_WINDOW_ID=2026-08-01\nDRAIN_ACCOUNTED=t\n", "неизвестен (файл от окна 2026-08-01)"),
+        (None, "неизвестен (файла"),
+    ],
+)
+def test_the_report_of_the_night_carries_the_drain_accounting(
+    stand: Stand, content: str | None, expect: str
+) -> None:
+    """Ревью Sol, круг 1: доказательство учёта из шага drain было мёртвым контрактом —
+    deploy.sh его писал, а не читал никто. Теперь оно звучит в отчёте ночи; на исход
+    доставки (его решает приёмка) не влияет."""
+    stand.watchdog_pids()
+    if content is not None:
+        (stand.state / "last-drain.env").write_text(content.format(today=stand.today), encoding="utf-8")
+    proc = stand.run()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    assert "✅" in stand.pending()
+    assert expect in stand.pending(), stand.pending()
+
+
+@pytest.mark.unit
 def test_the_happy_path_delivers_accepts_and_restores_the_snapshot(stand: Stand) -> None:
     """Сквозной успех: заморозка → deploy.sh нового дерева → приёмка по шести признакам →
     маркер принятого sha, снятый INFLIGHT, паузы и пулы как до доставки, ✅ в очереди."""
@@ -656,7 +755,7 @@ def test_the_happy_path_delivers_accepts_and_restores_the_snapshot(stand: Stand)
 
     deploy = stand.calls("deploy")
     assert len(deploy) == 1, deploy
-    args, idle = deploy[0].split("|")
+    args, idle = deploy[0].split("|")[:2]
     assert args.split() == [str(stand.new_tree), str(stand.old_tree)], args
     # Запас на осушение доезжает окружением процесса, а не через env-файл контура:
     # любой ключ вне SOFASCORE_*/PROXY_FILTER_SOFASCORE_* уронил бы все три скрипта ротации.
@@ -789,6 +888,75 @@ def test_an_unconfirmed_rollback_shuts_the_automaton_off_and_keeps_the_marker(st
 
 
 @pytest.mark.unit
+def test_the_snapshot_remembers_the_maintenance_pause_and_the_window(stand: Stand) -> None:
+    """Снимок версии 2: паузу обслуживания манифеста снимает deploy.sh, а возвращает
+    автомат — значит, помнить её обязан снимок. WINDOW_ID привязывает разбор незакрытой
+    доставки к ТОЙ ночи, в которую она началась, даже если разбор пришёлся на следующие сутки."""
+    stand.watchdog_pids()
+    proc = stand.run()
+
+    assert proc.returncode == 0, proc.stderr + stand.log_text()
+    snapshot = (stand.state / "sofascore-rollback.env").read_text(encoding="utf-8")
+    assert "SNAPSHOT_VERSION=2\n" in snapshot, snapshot
+    assert "MAINT_PAUSED=t\n" in snapshot, snapshot
+    assert f"WINDOW_ID={stand.today}\n" in snapshot, snapshot
+    # Пауза обслуживания вернулась туда же, где была до доставки.
+    assert (stand.stub_state / f"paused_{MAINT}").read_text().strip() == "t"
+
+
+@pytest.mark.unit
+def test_an_unreadable_maintenance_pause_makes_the_snapshot_unusable(stand: Stand) -> None:
+    """Ответ X (метабаза молчала) о паузе обслуживания — такой же негодный снимок, как
+    непрочитанные паузы кампаний: вернуть её после отката было бы не из чего."""
+    stand.watchdog_pids()
+    stand.put(f"paused_{MAINT}", "X")
+    proc = stand.run()
+
+    assert proc.returncode == 1, proc.stderr
+    assert not stand.calls("deploy"), "доставки быть не должно"
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
+
+
+@pytest.mark.unit
+def test_an_unfinished_teardown_leaves_the_maintenance_paused(stand: Stand) -> None:
+    """Инвариант: на разрушительном пути обслуживание манифеста под паузой. Разбор
+    незакрытой доставки не состоялся (docker молчит про монты) — EXIT-trap возвращает пулы
+    и паузы кампаний, но паузу обслуживания НЕ трогает: следующий тик будет откатывать бой
+    пересозданием контейнеров, и живой прогон обслуживания он бы оборвал."""
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(MAINT_PAUSED="f")
+    stand.put(f"paused_{MAINT}", "t")     # deploy.sh запаузил обслуживание до обрыва
+    stand.put("inspect_fails")            # docker не отвечает про монты
+    proc = stand.run()
+
+    assert proc.returncode == 1, proc.stderr
+    assert "docker не отвечает" in stand.log_text()
+    assert (stand.stub_state / f"paused_{MAINT}").read_text().strip() == "t", stand.log_text()
+    assert (stand.state / "sofascore-inflight").exists(), "разбор не завершён — маркер остаётся"
+
+
+@pytest.mark.unit
+def test_a_confirmed_rollback_puts_the_maintenance_pause_back(stand: Stand) -> None:
+    """Откат завершён — обслуживание возвращается в то состояние, в каком было до доставки.
+    Сам откат пересоздаёт контейнеры, поэтому паузу он ставит себе сам, независимо от того,
+    кто её снял."""
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(MAINT_PAUSED="f")
+    stand.put(f"paused_{MAINT}", "t")
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    proc = stand.run()
+
+    assert proc.returncode == 1, proc.stderr
+    assert "откатываю комплектом" in stand.log_text()
+    assert (stand.stub_state / f"paused_{MAINT}").read_text().strip() == "f"
+
+
+@pytest.mark.unit
 def test_an_interrupted_delivery_that_never_moved_production_only_clears_the_marker(stand: Stand) -> None:
     stand.watchdog_pids()
     (stand.state / "sofascore-inflight").touch()
@@ -799,6 +967,44 @@ def test_an_interrupted_delivery_that_never_moved_production_only_clears_the_mar
     assert not stand.calls("compose"), "откатывать нечего"
     assert not (stand.state / "sofascore-inflight").exists()
     assert "⚠️" in stand.pending()
+
+
+@pytest.mark.unit
+def test_a_teardown_that_cannot_unpause_the_maintenance_is_not_a_success(stand: Stand) -> None:
+    """Ревью Sol, круг 1. Разбор незакрытой доставки возвращал обслуживание, но код возврата
+    не смотрел: обслуживание оставалось под паузой навсегда, а автомат снимал маркер,
+    отчитывался ⚠️ «ничего страшного» и не глушил себя — воскресный прогон обслуживания
+    просто больше не запускался бы."""
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(MAINT_PAUSED="f")
+    stand.put(f"paused_{MAINT}", "t")
+    stand.put("unpause_maint_fails")
+    proc = stand.run()
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "🆘" in stand.pending() and "⚠️" not in stand.pending()
+    assert "контур не вернулся в рабочее состояние" in stand.pending()
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
+
+
+@pytest.mark.unit
+def test_an_unconfirmed_rollback_still_says_the_maintenance_was_not_paused(stand: Stand) -> None:
+    """Ревью Sol, круг 3. В ветке «откат не подтверждён» аварийный алерт терял ROLLBACK_NOTE
+    вместе с предупреждением о незапаузившемся обслуживании — самое время о нём молчать
+    было бы худшим: контейнеры пересоздавали при живом прогоне обслуживания."""
+    stand.watchdog_pids()
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(MAINT_PAUSED="f")
+    stand.put(f"paused_{MAINT}", "f")
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.put("pause_maint_fails")
+    proc = stand.run()                     # rollback_works не выставлен: откат не подтверждён
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "🆘" in stand.pending()
+    assert "не встал на паузу перед откатом" in stand.pending(), stand.pending()
 
 
 @pytest.mark.unit
@@ -936,7 +1142,10 @@ def test_an_interrupted_delivery_without_a_snapshot_touches_nothing(stand: Stand
 @pytest.mark.parametrize(
     "marker",
     ["sofascore-inflight", "sofascore-accepted", "sofascore-rollback.env",
-     "sofascore-pending-alert", "sofascore-auto-deliver.off", "sofascore-fail-nights"],
+     "sofascore-pending-alert", "sofascore-auto-deliver.off", "sofascore-fail-nights",
+     # Ревью Sol, круг 3: доказательство учёта тоже своё состояние. Каталог на его месте
+     # уронил бы `rm -f` в deploy.sh кодом 1 — и автомат откатил бы НЕТРОНУТЫЙ бой.
+     "last-drain.env"],
 )
 def test_a_substituted_marker_stops_everything(stand: Stand, marker: str) -> None:
     """Symlink принимает запись с нулевым кодом и читается пустым, каталог рвёт
@@ -1021,6 +1230,26 @@ def test_rc4_that_leaves_the_campaign_stopped_is_an_alarm_not_a_warning(stand: S
     assert (stand.state / "sofascore-auto-deliver.off").exists()
     assert not stand.calls("compose"), "выкат не начинался — откатывать нечего"
     assert not (stand.state / "sofascore-inflight").exists()
+
+
+@pytest.mark.unit
+def test_a_rollback_that_could_not_pause_the_maintenance_says_so(stand: Stand) -> None:
+    """Ревью Sol, круг 2. Пауза обслуживания перед откатом ставилась вслепую: команда могла
+    отказать, прогон обслуживания стартовал бы между проверкой «контур свободен» и
+    пересозданием контейнеров и был бы оборван молча, а откат доложили бы как штатный.
+    Откат из-за этого не отменяем — бой на непринятом дереве хуже."""
+    stand.watchdog_pids()
+    stand.put("deploy_rc", "5")
+    stand.put("deploy_half")
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    stand.put("pause_maint_fails")
+    stand.put(f"paused_{MAINT}", "f")   # до отката обслуживание не под паузой
+    proc = stand.run()
+
+    assert stand.calls("compose"), "откат всё равно состоялся"
+    assert "не встал на паузу перед откатом" in stand.pending(), stand.pending()
+    assert proc.returncode != 0
 
 
 @pytest.mark.unit

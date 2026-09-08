@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 import re
 import subprocess
 import textwrap
 
 import pytest
+
+from tests.unit.deploy.conftest import rows, seed, write_metadb_stub
+from tests.unit.deploy.conftest import world as world_helper
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -24,6 +28,7 @@ DIGEST = "0123456789abcdef" * 4
 TAG = DIGEST[:8]
 HIST = "dag_backfill_sofascore_all_mens"
 REFRESH = "dag_refresh_sofascore_all_mens"
+MAINT = "dag_sofascore_manifest_maintenance"
 
 
 def _write(path: Path, text: str, mode: int | None = None) -> Path:
@@ -40,56 +45,83 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
         f'''\
         #!/usr/bin/env bash
         STATE="{state_dir}"
+        PY="{sys.executable}"
         printf '%s\\t%s\\t%s\\n' "$*" "${{SOFASCORE_RELEASE_ROOT-<unset>}}" \\
           "${{SOFASCORE_PROXY_BUDGET_ARTIFACT_ID-<unset>}}" >> "$STATE/calls.log"
-        if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
+        if [ "$1" = exec ]; then
           sql="${{@: -1}}"
-          case "$sql" in
-            *"UPDATE dag SET is_paused=false"*)
-              dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
-              echo f > "$STATE/paused_$dag"; echo "UPDATE 1" ;;
-            *"SELECT is_paused"*)
-              dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
-              cat "$STATE/paused_$dag" ;;
-            *"is_active=true"*) cat "$STATE/active_count" 2>/dev/null || echo 4 ;;
-            # run_id прогона истории, который держит слот пула ('-' — такого нет)
-            *"coalesce((SELECT run_id"*) cat "$STATE/hist_run" 2>/dev/null || echo - ;;
-            # Четыре числа шага drain. Третье считается ЧЕСТНО: отслеживаемым признаётся
-            # только тот run_id, который скрипт спросил, — иначе тест не отличил бы возврат
-            # к старому «считаем все прогоны истории».
-            *"run_id="*)
-              want=${{sql#*run_id=\\'}}; want=${{want%%\\'*}}
-              hist=0
-              if [ -n "$want" ] && [ "$want" = "$(cat "$STATE/hist_run" 2>/dev/null)" ] \\
-                 && [ -e "$STATE/hist_run_active" ]; then hist=1; fi
-              printf '%s|%s|%s|%s\\n' "$(cat "$STATE/active_dr" 2>/dev/null || echo 0)" \\
-                "$(cat "$STATE/busy" 2>/dev/null || echo 0)" "$hist" \\
-                "$(cat "$STATE/hist_busy" 2>/dev/null || echo 0)" ;;
-            # Прогон актуалки, замёрзший под паузой: планировщик его не двигает, поэтому
-            # ожидание, которое считает ЕГО, не кончится никогда.
-            *dag_run*"'dag_refresh_sofascore_all_mens'"*)
-              cat "$STATE/active_refresh" 2>/dev/null || cat "$STATE/active" 2>/dev/null || echo 0 ;;
-            *task_instance*"state IN ("*) cat "$STATE/busy" 2>/dev/null || echo 0 ;;
-            *dag_run*"state IN ("*) cat "$STATE/active" 2>/dev/null || echo 0 ;;
-            *"count(*)"*) echo 0 ;;
-            *) echo "unexpected sql: $sql" >&2; exit 9 ;;
-          esac
-          exit 0
-        fi
-        if [ "$1" = exec ] && [ "$2" = sofascore-airflow-scheduler ] && [ "$3" = python ]; then
-          # close_stale_runs: висящий dag_run закрыт ORM-ом внутри планировщика
-          rm -f "$STATE/active"
-          exit 0
-        fi
-        if [ "$1" = exec ] && [ "$2" = sofascore-airflow-scheduler ] && [ "$3" = airflow ]; then
-          # @continuous успевает создать новый dag_run между «контур свободен» и паузой;
-          # под паузой он замерзает и сам никогда не закроется.
-          [ "$5" = pause ] && [ -e "$STATE/stale_on_pause_$6" ] && echo 1 > "$STATE/active"
-          # scheduler-down simulation: `airflow dags unpause` fails once the flag exists
-          [ "$5" = unpause ] && [ -e "$STATE/scheduler_down" ] && exit 1
-          # `airflow pools set <name>` fails while the flag for that pool exists
-          [ "$4" = pools ] && [ -e "$STATE/pool_set_fails_$6" ] && exit 1
-          case "$5" in pause) echo t > "$STATE/paused_$6" ;; unpause) echo f > "$STATE/paused_$6" ;; esac
+          shift
+          [ "$1" = "-i" ] && shift
+          container="$1"; shift
+          if [ "$container" = sofascore-airflow-metadb ]; then
+            case "$sql" in
+              *"UPDATE dag SET is_paused=false"*)
+                dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
+                echo f > "$STATE/paused_$dag"; echo "UPDATE 1"; exit 0 ;;
+              *"SELECT is_paused"*)
+                dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
+                cat "$STATE/paused_$dag"; exit 0 ;;
+              *"is_active=true"*) cat "$STATE/active_count" 2>/dev/null || echo 4; exit 0 ;;
+              # Всё остальное исполняется по-настоящему против sqlite-метабазы.
+              *)
+                # «Метабаза не отвечает»: пустой вывод и ненулевой код — то же, что таймаут.
+                [ -e "$STATE/metadb_down" ] && exit 1
+                # Метабаза отвалилась ровно на запросе доказательства учёта.
+                case "$sql" in
+                  *plan_historical_batch*) [ -e "$STATE/proof_query_fails" ] && exit 1 ;;
+                esac
+                case "$sql" in
+                  *"state IN ('scheduled','up_for_retry')"*)
+                    # Строка опроса: перед N-м витком применяем мир turn_N.sql, если он есть.
+                    n=$(( $(cat "$STATE/turn" 2>/dev/null || echo 0) + 1 ))
+                    echo "$n" > "$STATE/turn"
+                    if [ -f "$STATE/turn_$n.sql" ]; then
+                      "$PY" "$STATE/sqlrun.py" "$STATE/metadb.sqlite" "$(cat "$STATE/turn_$n.sql")" script
+                    fi ;;
+                esac
+                exec "$PY" "$STATE/sqlrun.py" "$STATE/metadb.sqlite" "$sql" ;;
+            esac
+          fi
+          if [ "$container" = sofascore-airflow-scheduler ] && [ "$1" = python ]; then
+            if [ "$2" = - ]; then
+              # Ломатель тупика: текст идёт по stdin и исполняется НАСТОЯЩИЙ, поверх той же
+              # sqlite-базы. Последствия для планировщика — отдельным файлом.
+              if [ -e "$STATE/breaker_fails" ]; then cat > /dev/null; echo "breaker stub failure" >&2; exit 1; fi
+              # timeout убил клиента: код 124, процесс в контейнере «остался жить».
+              if [ -e "$STATE/breaker_hangs" ]; then cat > /dev/null; exit 124; fi
+              shift 2
+              "$PY" "$STATE/breaker_host.py" "$STATE/metadb.sqlite" "$@" || exit $?
+              if [ -f "$STATE/after_breaker.sql" ]; then
+                "$PY" "$STATE/sqlrun.py" "$STATE/metadb.sqlite" "$(cat "$STATE/after_breaker.sql")" script
+              else
+                echo "NO-EFFECT" >> "$STATE/breaker.log"
+              fi
+              exit 0
+            fi
+            if [ "$2" = -c ]; then
+              # close_stale_runs: ORM внутри планировщика закрывает висящие прогоны.
+              exec "$PY" "$STATE/sqlrun.py" "$STATE/metadb.sqlite" \\
+                "UPDATE dag_run SET state='failed' WHERE dag_id='$4' AND state IN ('queued','running')"
+            fi
+            exit 0
+          fi
+          if [ "$container" = sofascore-airflow-scheduler ] && [ "$1" = airflow ]; then
+            # @continuous успевает создать новый dag_run между «контур свободен» и паузой;
+            # под паузой он замерзает и сам никогда не закроется.
+            if [ "$3" = pause ] && [ -e "$STATE/stale_on_pause_$4" ]; then
+              "$PY" "$STATE/sqlrun.py" "$STATE/metadb.sqlite" \\
+                "INSERT INTO dag_run (dag_id, run_id, state, start_date) VALUES ('$4','stale-on-pause','running','2026-09-05T04:00:00')"
+            fi
+            # scheduler-down simulation: `airflow dags unpause` fails once the flag exists
+            [ "$3" = unpause ] && [ -e "$STATE/scheduler_down" ] && exit 1
+            # обслуживание манифеста не распаузилось: команда прошла, состояние не сошлось
+            [ "$3" = unpause ] && [ -e "$STATE/maint_unpause_fails" ] && [ "$4" = "dag_sofascore_manifest_maintenance" ] && exit 0
+            # `airflow pools set <name>` падает, пока для этого пула стоит флаг.
+            # Индексы после сдвига аргументов стаба: $2=pools, $4=<name>.
+            [ "$2" = pools ] && [ -e "$STATE/pool_set_fails_$4" ] && exit 1
+            case "$3" in pause) echo t > "$STATE/paused_$4" ;; unpause) echo f > "$STATE/paused_$4" ;; esac
+            exit 0
+          fi
           exit 0
         fi
         if [ "$1" = inspect ]; then
@@ -140,19 +172,28 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
     )
 
 
-def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, Path]:
+def _layout(
+    tmp_path: Path, *, refresh_paused: str, maint_paused: str = "t"
+) -> tuple[Path, Path, Path, Path]:
     runtime = tmp_path / "runtime"
     release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
     state_dir = tmp_path / "stub-state"
     bin_dir = tmp_path / "bin"
     state_dir.mkdir()
-    for lane in ("gateway-state", "gateway-state-history", "gateway-state-players"):
+    for lane in ("gateway-state", "gateway-state-history", "gateway-state-players", "auto-deliver"):
         (runtime / lane).mkdir(parents=True)
     _stubs(bin_dir, state_dir)
+    write_metadb_stub(state_dir)
     (state_dir / f"paused_{HIST}").write_text("f\n")
     (state_dir / f"paused_{REFRESH}").write_text(f"{refresh_paused}\n")
+    (state_dir / f"paused_{MAINT}").write_text(f"{maint_paused}\n")
     for name in ("airflow.compose.yaml", "gateway.compose.yaml"):
         _write(release / "deploy" / "sofascore" / name, "services: {}\n")
+    # Ломатель тупика едет в дереве релиза: deploy.sh кормит его текстом stdin `docker exec`.
+    _write(
+        release / "deploy" / "sofascore" / "drain_breaker.py",
+        (DEPLOY / "drain_breaker.py").read_text(encoding="utf-8"),
+    )
     _write(runtime / "all-men" / "snapshot.json", "{}\n")
     # #1245: the budget artifact is the static policy shipped in the release
     # tree; there is no canary workspace and no VERIFIED gate any more.
@@ -207,10 +248,12 @@ def _run_deploy(
 
 
 def _calls(state_dir: Path) -> list[tuple[str, str, str]]:
-    return [
-        tuple(line.split("\t"))
-        for line in (state_dir / "calls.log").read_text(encoding="utf-8").splitlines()
-    ]
+    # Файла может не быть вовсе: занятый замок выката останавливает скрипт до первого
+    # обращения к docker, и это само по себе доказательство «бой не тронут».
+    log = state_dir / "calls.log"
+    if not log.exists():
+        return []
+    return [tuple(line.split("\t")) for line in log.read_text(encoding="utf-8").splitlines()]
 
 
 @pytest.mark.unit
@@ -527,6 +570,131 @@ def test_set_env_var_rewrites_only_its_own_line_and_fails_on_a_missing_key(tmp_p
     ]
 
 
+_RUN_ID = "scheduled__2026-09-05T02:15:41.446584+00:00"
+_DEFAULT = object()
+# Занятый контур: у дейли идёт задача — второе число строки опроса никогда не станет нулём.
+_DAILY_BUSY = (
+    "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
+    " VALUES ('dag_ingest_sofascore','daily-1','ingest',-1,'running','default_pool',1);"
+)
+# Что делает ПЛАНИРОВЩИК после того, как ломатель поставил скоупу failed: validate-плейсхолдер
+# получает upstream_failed, finalize пишет отказ в failures.json, propagate закрывает прогон.
+_CLOSE_RUN = "UPDATE dag_run SET state='{state}' WHERE run_id='" + _RUN_ID + "';"
+_TAIL_AFTER_FAILURE = (
+    "UPDATE task_instance SET state='upstream_failed' WHERE task_id='validate_historical_scope';"
+    "UPDATE task_instance SET state='success'"
+    " WHERE task_id IN ('finalize_historical_run','propagate_historical_status');"
+    f"UPDATE dag_run SET state='failed' WHERE run_id='{_RUN_ID}';"
+)
+
+
+def _env(tmp_path: Path, env_file: Path, *, idle_wait: str, extra: dict | None = None) -> dict:
+    return {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "SOFASCORE_DEPLOY_IDLE_WAIT": idle_wait,
+        **(extra or {}),
+    }
+
+
+class _Run:
+    """Результат прогона deploy.sh против sqlite-метабазы стенда."""
+
+    def __init__(self, proc, runtime: Path, release: Path, env_file: Path, state_dir: Path) -> None:
+        self.proc, self.runtime, self.release = proc, runtime, release
+        self.env_file, self.state_dir = env_file, state_dir
+
+    @property
+    def out(self) -> str:
+        return self.proc.stdout + self.proc.stderr
+
+    @property
+    def args(self) -> list[str]:
+        return [call[0] for call in _calls(self.state_dir)]
+
+    @property
+    def compose_calls(self) -> list[str]:
+        return [a for a in self.args if a.startswith("compose ")]
+
+    @property
+    def breaker_calls(self) -> list[str]:
+        return [a for a in self.args if " python - " in a]
+
+    @property
+    def log(self) -> str:
+        return (self.runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
+
+    def scope_state(self) -> str | None:
+        return rows(
+            self.state_dir,
+            "SELECT state FROM task_instance WHERE task_id='run_historical_scope' AND map_index=0",
+        )[0][0]
+
+    def dag_run_state(self) -> str:
+        return rows(self.state_dir, "SELECT state FROM dag_run LIMIT 1")[0][0]
+
+    def drain_env(self) -> dict[str, str]:
+        text = (self.runtime / "auto-deliver" / "last-drain.env").read_text(encoding="utf-8")
+        return dict(line.split("=", 1) for line in text.splitlines() if line)
+
+
+def _deploy(
+    tmp_path: Path,
+    *,
+    idle_wait: str = "600",
+    world: dict | None | object = _DEFAULT,
+    seed_sql: str = "",
+    turns: dict[int, str] | None = None,
+    after_breaker: str | None = None,
+    breaker_fails: bool = False,
+    breaker_hangs: bool = False,
+    metadb_down: bool = False,
+    clock: bool = False,
+    health: str | None = None,
+    refresh_paused: str = "f",
+    maint_paused: str = "t",
+    under_lock_fd: bool = False,
+    env_extra: dict | None = None,
+    pre=None,
+) -> _Run:
+    runtime, release, env_file, state_dir = _layout(
+        tmp_path, refresh_paused=refresh_paused, maint_paused=maint_paused
+    )
+    if world is not None:
+        world_helper(state_dir, run_id=_RUN_ID, **({} if world is _DEFAULT else world))
+    if seed_sql:
+        seed(state_dir, seed_sql)
+    for turn, sql in (turns or {}).items():
+        (state_dir / f"turn_{turn}.sql").write_text(sql, encoding="utf-8")
+    if after_breaker is not None:
+        (state_dir / "after_breaker.sql").write_text(after_breaker, encoding="utf-8")
+    if breaker_fails:
+        (state_dir / "breaker_fails").touch()
+    if breaker_hangs:
+        (state_dir / "breaker_hangs").touch()
+    if metadb_down:
+        (state_dir / "metadb_down").touch()
+    if clock:
+        (state_dir / "clock").write_text("1767225600\n")
+    if health:
+        (state_dir / "health").write_text(f"{health}\n")
+    if pre is not None:
+        pre(runtime)
+    env = _env(tmp_path, env_file, idle_wait=idle_wait, extra=env_extra)
+    if under_lock_fd:
+        env["SOFASCORE_DEPLOY_LOCK_FD"] = "8"
+        cmd = [
+            "bash", "-c",
+            f'exec 8>"{runtime}/deploy.lock"; flock -n 8 || exit 9;'
+            f' exec bash "{DEPLOY}/deploy.sh" "{release}"',
+        ]
+    else:
+        cmd = ["bash", str(DEPLOY / "deploy.sh"), str(release)]
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180)
+    return _Run(proc, runtime, release, env_file, state_dir)
+
+
 @pytest.mark.unit
 def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Path) -> None:
     """Потолок ожидания. Раньше `while true` без таймаута висел ВЕЧНО: история идёт
@@ -534,25 +702,14 @@ def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Pat
     Теперь исчерпанный потолок — код 4 «контур занят, выкат не начат», и он обязан быть
     честным: ни одного compose, env не перепинован, артефакт не создан, а осушённый пул
     и пауза истории возвращены как были."""
-    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
-    (state_dir / "busy").write_text("1\n")
-    env = {
-        **os.environ,
-        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
-        "SOFASCORE_ENV_FILE": str(env_file),
-        "SOFASCORE_DEPLOY_IDLE_WAIT": "0",
-    }
-    proc = subprocess.run(
-        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
-    )
+    r = _deploy(tmp_path, idle_wait="0", seed_sql=_DAILY_BUSY, world=None)
 
-    assert proc.returncode == 4, proc.stdout + proc.stderr
-    args = [call[0] for call in _calls(state_dir)]
-    assert not [a for a in args if a.startswith("compose ")], args
-    assert f"SOFASCORE_RELEASE_ROOT={release}" not in env_file.read_text(encoding="utf-8")
-    assert not (runtime / "artifacts").exists()
+    assert r.proc.returncode == 4, r.out
+    assert not r.compose_calls, r.args
+    assert f"SOFASCORE_RELEASE_ROOT={r.release}" not in r.env_file.read_text(encoding="utf-8")
+    assert not (r.runtime / "artifacts").exists()
     pools = [
-        a.split()[5:7] for a in args
+        a.split()[5:7] for a in r.args
         if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
     ]
     assert pools == [
@@ -562,171 +719,694 @@ def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Pat
         ["sofascore_players_pool", "1"],
     ], pools
     # Контур занят — значит НИЧЕГО не изменилось: обе кампании работают дальше.
-    assert (state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
-    assert (state_dir / f"paused_{HIST}").read_text().strip() == "f"
-    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
-    assert "FAILED at step 'drain'" in log
-    assert "nothing deployed" in log
+    assert (r.state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
+    assert (r.state_dir / f"paused_{HIST}").read_text().strip() == "f"
+    assert "FAILED at step 'drain'" in r.log
+    assert "nothing deployed" in r.log
 
 
 @pytest.mark.unit
 def test_the_idle_ceiling_counts_wall_clock_not_the_sum_of_sleeps(tmp_path: Path) -> None:
-    """Ревью Sol, раунд 1. Каждый виток ожидания делает ДВА запроса к метабазе с таймаутом
-    до SOFASCORE_DEPLOY_METADB_TIMEOUT секунд каждый. Пока потолок уменьшался «на 30 за
+    """Ревью Sol, раунд 1. Каждый виток ожидания делает запросы к метабазе с таймаутом до
+    SOFASCORE_DEPLOY_METADB_TIMEOUT секунд каждый. Пока потолок уменьшался «на 30 за
     виток», на недоступной метабазе 5400 с превращались почти в 4,5 часа — то есть выкат
     всё равно съедал бы всё окно ночной доставки. Часы идут по 60 с за обращение: при
     потолке 100 с честный счёт даёт не больше двух витков, счёт по sleep дал бы четыре."""
-    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
-    (state_dir / "busy").write_text("1\n")
-    (state_dir / "clock").write_text("1767225600\n")
-    env = {
-        **os.environ,
-        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
-        "SOFASCORE_ENV_FILE": str(env_file),
-        "SOFASCORE_DEPLOY_IDLE_WAIT": "100",
-    }
-    proc = subprocess.run(
-        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
-    )
+    r = _deploy(tmp_path, idle_wait="100", seed_sql=_DAILY_BUSY, clock=True, world=None)
 
-    assert proc.returncode == 4, proc.stdout + proc.stderr
-    waits = [a for a, *_ in _calls(state_dir) if "task_instance" in a]
-    assert 1 <= len(waits) <= 2, waits
-    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
-    assert "contour still busy after 100s" in log
-
-
-@pytest.mark.unit
-def test_deploy_closes_the_history_run_that_froze_under_the_pause(tmp_path: Path) -> None:
-    """@continuous успевает создать новый dag_run между «контур свободен» и паузой.
-    Под паузой планировщик его не рассматривает вовсе (next_dagruns_to_examine требует
-    is_paused == false, а dagrun_timeout проверяется только в _schedule_dag_run), поэтому
-    он висит НАВСЕГДА. Закрывает его ORM внутри планировщика — и только у истории:
-    дейли выкатом не паузится, его прогон живой, закрывать чужой прогон — порча боя."""
-    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
-    (state_dir / f"stale_on_pause_{HIST}").write_text("1\n")
-    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
-    proc = subprocess.run(
-        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
-    )
-
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    args = [call[0] for call in _calls(state_dir)]
-    closers = [a for a in args if a.startswith("exec sofascore-airflow-scheduler python -c ")]
-    assert len(closers) == 1, closers
-    assert "DagRunState.FAILED" in closers[0], closers
-    assert closers[0].endswith(f" {HIST}"), closers
-    assert REFRESH not in closers[0] and "dag_ingest_sofascore" not in closers[0], closers
-    # Закрытие идёт ПОСЛЕ паузы истории и ДО пересоздания контейнеров.
-    assert args.index(f"exec sofascore-airflow-scheduler airflow dags pause {HIST}") < args.index(closers[0])
-    assert args.index(closers[0]) < min(i for i, a in enumerate(args) if a.startswith("compose "))
-
-
-@pytest.mark.unit
-def test_deploy_drains_the_pool_before_pausing_history_and_never_unpauses_it(tmp_path: Path) -> None:
-    """Порядок — единственное, что бережёт оплаченный скоуп. Пауза истории ДО ожидания
-    не даёт выполниться validate_historical_scope, а он единственный засчитывает скоуп в
-    state.json: следующий прогон получил бы новый run_id и купил те же 8–81 минуты
-    платного трафика заново. Поэтому дверь новым скоупам закрывает ПУЛ, а пауза приходит
-    после ожидания; распаузивать историю штатный выкат по-прежнему не вправе."""
-    proc, _release, _env_file, state_dir = _run_deploy(tmp_path, refresh_paused="f")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    args = [call[0] for call in _calls(state_dir)]
-    drain = next(
-        i for i, a in enumerate(args)
-        if a.startswith("exec sofascore-airflow-scheduler airflow pools set sofascore_history_pool 0")
-    )
-    first_wait = next(i for i, a in enumerate(args) if "task_instance" in a)
-    pause_hist = args.index(f"exec sofascore-airflow-scheduler airflow dags pause {HIST}")
-    pause_refresh = args.index(f"exec sofascore-airflow-scheduler airflow dags pause {REFRESH}")
-    first_compose = min(i for i, a in enumerate(args) if a.startswith("compose "))
-    assert drain < first_wait < pause_hist < first_compose, args
-    assert pause_refresh < first_wait, args
-    assert f"unpause {HIST}" not in "\n".join(args), args
-
-
-@pytest.mark.unit
-def test_drain_waits_for_the_tracked_history_run_not_for_an_empty_contour(tmp_path: Path) -> None:
-    """Ревью Sol, раунд 3, находка №1. История идёт @continuous: как только отслеживаемый
-    прогон кончается, планировщик почти мгновенно (замер 04.09: медиана 26 с) создаёт
-    следующий, и с осушённым пулом тот остаётся running навсегда — run_historical_scope
-    вечно scheduled. Условие «прогонов истории нет» достижимо ровно один раз, в промежутке
-    ~26 с при опросе раз в 30 с: монетка, промах — rc=4 и ночь без доставки. Ждать надо
-    завершения ИМЕННО того прогона, который работал на входе; новый пустой закрывает
-    close_stale_runs после паузы."""
-    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
-    tracked = "scheduled__2026-09-04T03:31:00+00:00"
-    (state_dir / "hist_run").write_text(f"{tracked}\n")   # прогон, который шёл на входе...
-    # ...он уже закончился (флага hist_run_active нет), а сменщик создан и висит running
-    (state_dir / "active").write_text("1\n")
-    env = {
-        **os.environ,
-        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
-        "SOFASCORE_ENV_FILE": str(env_file),
-        "SOFASCORE_DEPLOY_IDLE_WAIT": "60",
-    }
-    proc = subprocess.run(
-        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
-    )
-
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    args = [call[0] for call in _calls(state_dir)]
-    waits = [a for a in args if "run_id=" in a]
-    assert waits, args
-    assert f"run_id='{tracked}'" in waits[0], waits[0]
-    assert [a for a in args if a.startswith("compose ")], "выкат обязан состояться, а не уйти в rc=4"
-    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
-    assert f"ждём прогон истории '{tracked}'" in log, log
+    assert r.proc.returncode == 4, r.out
+    polls = [a for a in r.args if "state IN ('scheduled','up_for_retry')" in a]
+    assert 1 <= len(polls) <= 2, polls
+    assert "contour still busy after 100s" in r.log
 
 
 @pytest.mark.unit
 def test_drain_refuses_to_start_when_the_metadb_cannot_name_the_history_run(tmp_path: Path) -> None:
-    """Пустой ответ на «какой прогон истории сейчас работает» — это «не знаю», а не «его
-    нет»: выкатывать вслепую значит оборвать оплаченный скоуп. Код 4 — «контур занят, выкат
-    не начат», бой не тронут. `|| true` на этом чтении обязателен и по второй причине: без
-    него отказ метабазы под `set -e` вышел бы кодом timeout (124), а для автомата ночной
+    """Пустой ответ на «какой прогон истории начал платную работу» — это «не знаю», а не
+    «его нет»: выкатывать вслепую значит оборвать оплаченный скоуп. Код 4 — «контур занят,
+    выкат не начат», бой не тронут. `|| true` на этом чтении обязателен и по второй причине:
+    без него отказ метабазы под `set -e` вышел бы кодом timeout (124), а для автомата ночной
     доставки 124 — это «таймаут доставки», то есть полный откат боя, которого не было."""
-    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
-    (state_dir / "hist_run").write_text("")   # метабаза не ответила
-    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
-    proc = subprocess.run(
-        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
-    )
+    r = _deploy(tmp_path, metadb_down=True)
 
-    assert proc.returncode == 4, proc.stdout + proc.stderr
-    args = [call[0] for call in _calls(state_dir)]
-    assert not [a for a in args if a.startswith("compose ")], args
-    assert f"SOFASCORE_RELEASE_ROOT={release}" not in env_file.read_text(encoding="utf-8")
-    assert (state_dir / f"paused_{HIST}").read_text().strip() == "f"
-    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
-    assert "метабаза не ответила про идущий прогон истории" in log, log
+    assert r.proc.returncode == 4, r.out
+    assert not r.compose_calls, r.args
+    assert f"SOFASCORE_RELEASE_ROOT={r.release}" not in r.env_file.read_text(encoding="utf-8")
+    assert (r.state_dir / f"paused_{HIST}").read_text().strip() == "f"
+    assert "метабаза не ответила про идущий прогон истории" in r.log
 
 
 @pytest.mark.unit
 def test_a_refresh_run_frozen_by_the_pause_does_not_block_the_deploy(tmp_path: Path) -> None:
-    """Тот же класс, что находка №1, только на соседнем DAG. Пауза не даёт планировщику
-    двигать прогон (03.09 так замёрз прогон истории, и его закрывали руками), поэтому ждать
-    ЗАКРЫТИЯ прогона актуалки, которую этот же шаг только что запаузил, значит ждать до
-    потолка и уйти в rc=4. Ждём её ЗАДАЧ — именно их обрывает пересоздание, — а сам прогон
-    доработает, когда шаг restore-pause вернёт актуалку в работу."""
-    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
-    (state_dir / "active_refresh").write_text("1\n")   # прогон актуалки идёт с 00:30 UTC
-    env = {
-        **os.environ,
-        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
-        "SOFASCORE_ENV_FILE": str(env_file),
-        "SOFASCORE_DEPLOY_IDLE_WAIT": "60",
-    }
-    proc = subprocess.run(
-        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    """Пауза не даёт планировщику двигать прогон (03.09 так замёрз прогон истории, и его
+    закрывали руками), поэтому ждать ЗАКРЫТИЯ прогона актуалки, которую этот же шаг только
+    что запаузил, значит ждать до потолка и уйти в rc=4. Ждём её ЗАДАЧ — именно их обрывает
+    пересоздание, — а сам прогон доработает, когда шаг restore-pause вернёт актуалку."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=None,
+        seed_sql=(
+            "INSERT INTO dag_run (dag_id, run_id, state, start_date)"
+            f" VALUES ('{REFRESH}','refresh-00:30','running','2026-09-05T00:30:00');"
+        ),
     )
 
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert r.proc.returncode == 0, r.out
+    assert r.compose_calls, "замёрзший прогон актуалки не повод не выкатывать"
+    assert (r.state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
+
+
+# --- §2, группа (а): выбор отслеживаемого прогона на входе в drain ------------------------
+# Отслеживается прогон, который НАЧАЛ платную работу. Всё остальное — не ждём и не трогаем.
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("state", ["running", "queued", "restarting"])
+def test_a_working_scope_is_tracked_and_waited_for_without_the_breaker(
+    tmp_path: Path, state: str
+) -> None:
+    """Ночь 06.09: скоуп честно работал 62 минуты. Такой прогон ждут, ломателя не зовут —
+    задача не припаркована, она делает оплаченную работу. `restarting` ставит `clear`
+    работающей задачи: это работа, а не её отсутствие."""
+    r = _deploy(tmp_path, idle_wait="60", world=dict(scope_state=state, scope_try=1))
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.breaker_calls, r.breaker_calls
+    assert not r.compose_calls, r.args
+    assert "отслеживаю прогон истории" in r.log
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "scope_state,scope_try",
+    [("up_for_retry", 1), ("scheduled", 2)],
+)
+def test_a_parked_retry_is_broken_and_the_deploy_goes_on(
+    tmp_path: Path, scope_state: str, scope_try: int
+) -> None:
+    """Ночь 05.09 обеими сторонами щели: скоуп упал (`up_for_retry`), через retry_delay
+    повтор встал `scheduled` (try 2) в осушённый пул. Слота до конца выката не будет, а
+    прогон висит running — старый выбор видел `0|0|1|0` с первого же опроса и ждал 92
+    минуты до rc=4. Ломатель переводит скоуп в failed, планировщик доигрывает хвост
+    (это делает after_breaker.sql), и выкат состоится."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_state=scope_state, scope_try=scope_try),
+        after_breaker=_TAIL_AFTER_FAILURE,
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert len(r.breaker_calls) == 1, r.breaker_calls
+    assert r.compose_calls, r.args
+    # Ломатель поставил ровно failed — и ровно скоупу, а не прогону.
+    assert r.scope_state() == "failed"
+    assert "-> failed" in r.log
+
+
+@pytest.mark.unit
+def test_the_breaker_is_called_with_the_tracked_run_and_the_drained_pool(tmp_path: Path) -> None:
+    """Аргументы ломателя — не украшение: чужой прогон он ронять не вправе, а пул выката и
+    пул задачи обязаны быть одним значением (HIST_POOL)."""
+    r = _deploy(tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE)
+
+    assert len(r.breaker_calls) == 1, r.breaker_calls
+    call = r.breaker_calls[0]
+    assert f"python - {HIST} {_RUN_ID} sofascore_history_pool drain-breaker-" in call, call
+
+
+@pytest.mark.unit
+def test_a_scope_scheduled_on_its_first_try_is_not_tracked_at_all(tmp_path: Path) -> None:
+    """Сменщик, созданный @continuous после конца отслеживаемого прогона: его скоуп
+    `scheduled` try 1 в осушённом пуле, платного трафика он не купил. Такой прогон не
+    ждут и не трогают — после паузы его закрывает close_stale_runs (так было 07.09)."""
+    r = _deploy(tmp_path, idle_wait="600", world=dict(scope_state="scheduled", scope_try=1))
+
+    assert r.proc.returncode == 0, r.out
+    assert not r.breaker_calls, r.breaker_calls
+    assert "прогона истории с начатой платной работой нет" in r.log
+    # Закрыл его close_stale_runs (ORM внутри планировщика), а не ломатель.
+    assert r.dag_run_state() == "failed"
+    closers = [a for a in r.args if a.startswith("exec sofascore-airflow-scheduler python -c ")]
+    assert len(closers) == 1, closers
+
+
+@pytest.mark.unit
+def test_a_scope_without_a_state_is_not_tracked(tmp_path: Path) -> None:
+    """NULL у скоупа — ручной `clear` или сброс orphan TI планировщиком. Платной работы за
+    ним не видно, стартовать в осушённом пуле он не может: не ждём и не трогаем."""
+    r = _deploy(tmp_path, idle_wait="600", world=dict(scope_state=None, scope_try=0))
+
+    assert r.proc.returncode == 0, r.out
+    assert not r.breaker_calls, r.breaker_calls
+    assert "прогона истории с начатой платной работой нет" in r.log
+
+
+@pytest.mark.unit
+def test_a_successful_scope_with_a_pending_validate_is_still_tracked(tmp_path: Path) -> None:
+    """Дыра старого предиката «queued/running»: скоуп уже success, а validate (тот, что
+    засчитывает оплаченный скоуп в state.json) ещё не начался. Прогон обязан ждаться до
+    закрытия — иначе пересоздание scheduler'а обрывает учёт оплаченной работы."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="success", scope_try=1, validate_state=None),
+    )
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.breaker_calls, r.breaker_calls
+    assert not r.compose_calls, r.args
+    assert f"отслеживаю прогон истории '{_RUN_ID}'" in r.log
+
+
+@pytest.mark.unit
+def test_a_failed_scope_in_an_open_run_is_waited_for_not_broken(tmp_path: Path) -> None:
+    """Скоуп терминален, но прогон ещё открыт: учёт держат validate и finalize. Ломателю
+    здесь делать нечего — ждём закрытия прогона."""
+    r = _deploy(tmp_path, idle_wait="60", world=dict(scope_state="failed", scope_try=2))
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.breaker_calls, r.breaker_calls
+
+
+@pytest.mark.unit
+def test_a_parked_scope_in_another_pool_is_waited_for_with_a_diagnosis(tmp_path: Path) -> None:
+    """Рассинхрон SOFASCORE_HISTORY_POOL: скоуп припаркован в ЧУЖОМ пуле. Пятое число его
+    не считает (drain осушил не тот пул), ломателя не зовём — менять чужое состояние вслепую
+    нельзя. Ждём до потолка и говорим, почему."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="up_for_retry", scope_pool="default_pool", scope_try=1),
+    )
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.breaker_calls, r.breaker_calls
+    assert "скоуп в пуле 'default_pool', drain осушил 'sofascore_history_pool'" in r.log
+
+
+@pytest.mark.unit
+def test_the_breaker_refuses_a_batch_bigger_than_one(tmp_path: Path) -> None:
+    """Боевой SOFASCORE_HISTORY_BATCH_SIZE не задан (batch=1), и версия поддерживает только
+    его: при двух mapped-скоупах «сломать тупик» значило бы погасить учёт соседнего,
+    возможно успешного, скоупа. Ломатель зовётся, но не меняет НИЧЕГО."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="running", scope_try=1, extra_scope=(1, "scheduled", 1)),
+    )
+
+    assert r.proc.returncode == 4, r.out
+    assert r.breaker_calls, "пятое число > 0 — ломателя обязаны позвать"
+    assert "batch>1 не поддержан" in r.log
+    assert sorted(s for (s,) in rows(
+        r.state_dir, "SELECT state FROM task_instance WHERE task_id='run_historical_scope'"
+    )) == ["running", "scheduled"]
+
+
+@pytest.mark.unit
+def test_a_parked_scope_of_another_run_is_not_touched(tmp_path: Path) -> None:
+    """Пятое число считает задачи ТОЛЬКО отслеживаемого прогона: припаркованный скоуп
+    закрытого соседа (его закроет close_stale_runs) ломателя не будит."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="success", scope_try=1, validate_state=None),
+        seed_sql=(
+            "INSERT INTO dag_run (dag_id, run_id, state, start_date)"
+            f" VALUES ('{HIST}','other-run','failed','2026-09-05T02:00:00');"
+            "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
+            f" VALUES ('{HIST}','other-run','run_historical_scope',0,'up_for_retry','sofascore_history_pool',1);"
+        ),
+    )
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.breaker_calls, r.breaker_calls
+
+
+# --- §2, группа (б): переходы уже выбранного прогона --------------------------------------
+# Мир меняется между витками опроса (файлы turn_<N>.sql применяются перед N-м опросом).
+
+
+@pytest.mark.unit
+def test_a_running_scope_that_falls_into_a_parked_retry_is_broken_later(tmp_path: Path) -> None:
+    """Ровно ночь 05.09: на входе в drain скоуп ещё работал, упал через 2,5 минуты, ушёл в
+    up_for_retry — и повтор встал в очередь за слотом, которого нет. Прогон выбран на первом
+    витке и удерживается: ломатель приходит к нему, а не ждёт нового выбора."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_state="running", scope_try=1),
+        turns={
+            2: "UPDATE task_instance SET state='failed' WHERE task_id='run_historical_scope';",
+            3: "UPDATE task_instance SET state='up_for_retry' WHERE task_id='run_historical_scope';",
+        },
+        after_breaker=_TAIL_AFTER_FAILURE,
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert len(r.breaker_calls) == 1, r.breaker_calls
+    assert r.scope_state() == "failed"
+
+
+@pytest.mark.unit
+def test_a_scope_that_finishes_on_its_own_closes_the_run_without_the_breaker(tmp_path: Path) -> None:
+    """Ночь 06.09 и 07.09: скоуп доработал сам, дальше validate → finalize → cooldown →
+    propagate → прогон закрыт. Ломателя не зовут ни разу."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_state="running", scope_try=1),
+        turns={
+            2: (
+                "UPDATE task_instance SET state='success' WHERE task_id='run_historical_scope';"
+                "UPDATE task_instance SET state='success', map_index=0"
+                " WHERE task_id='validate_historical_scope';"
+            ),
+            3: (
+                "UPDATE task_instance SET state='success'"
+                " WHERE task_id IN ('finalize_historical_run','propagate_historical_status');"
+                f"UPDATE dag_run SET state='success' WHERE run_id='{_RUN_ID}';"
+            ),
+        },
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert not r.breaker_calls, r.breaker_calls
+    assert r.drain_env()["DRAIN_ACCOUNTED"] == "t", r.drain_env()
+
+
+@pytest.mark.unit
+def test_a_cleared_scope_of_the_tracked_run_is_waited_for_with_a_diagnosis(tmp_path: Path) -> None:
+    """Ручной `clear` в окне выката — вне протокола (рунбук это запрещает). Состояние стало
+    NULL: стартовать в осушённом пуле задача не может, а менять его — гадать. Ждём до
+    потолка и называем причину."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="running", scope_try=1),
+        turns={2: "UPDATE task_instance SET state=NULL WHERE task_id='run_historical_scope';"},
+    )
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.breaker_calls, r.breaker_calls
+    assert "состояние вне протокола" in r.log
+
+
+@pytest.mark.unit
+def test_the_deploy_waits_for_the_run_to_close_after_the_breaker(tmp_path: Path) -> None:
+    """После ломателя ждём не «скоуп терминален», а закрытия прогона: finalize уже success,
+    но dag_run ещё running — учёт дописывается, пересоздавать scheduler рано."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        after_breaker=(
+            "UPDATE task_instance SET state='upstream_failed'"
+            " WHERE task_id='validate_historical_scope';"
+            "UPDATE task_instance SET state='success' WHERE task_id='finalize_historical_run';"
+        ),
+    )
+
+    assert r.proc.returncode == 4, r.out
+    assert len(r.breaker_calls) == 1, r.breaker_calls
+    assert not r.compose_calls, r.args
+
+
+@pytest.mark.unit
+def test_a_successful_breaker_is_called_exactly_once(tmp_path: Path) -> None:
+    """Ломатель ставит failed один раз: после него пятое число — ноль, и звать его снова
+    незачем. Без последствий планировщика (файла after_breaker.sql нет) выкат честно уходит
+    в rc=4, но вызов остаётся РОВНО один."""
+    r = _deploy(tmp_path, idle_wait="60")
+
+    assert r.proc.returncode == 4, r.out
+    assert len(r.breaker_calls) == 1, r.breaker_calls
+    assert (r.state_dir / "breaker.log").read_text().count("NO-EFFECT") == 1
+
+
+@pytest.mark.unit
+def test_a_technically_failed_breaker_is_not_retried_this_step(tmp_path: Path) -> None:
+    """Ревью Sol, круг 3. Сбой `docker exec` до commit — «не дозвонились», но повторять его
+    внутри одного шага нельзя: внешний `timeout` убивает клиента, а python в контейнере
+    переживает его (moby#9098), и пять зависших ломателей тронули бы задачу уже после
+    возврата слотов пула. Один вызов за drain, дальше честное ожидание и rc=4; на код
+    возврата выката сбой ломателя не влияет (иначе автомат откатил бы НЕТРОНУТЫЙ бой)."""
+    r = _deploy(tmp_path, idle_wait="600", breaker_fails=True)
+
+    assert r.proc.returncode == 4, r.out
+    assert len(r.breaker_calls) == 1, r.breaker_calls
+    assert "тупик не ломается" in r.log
+
+
+@pytest.mark.unit
+def test_a_hung_breaker_is_killed_inside_the_container(tmp_path: Path) -> None:
+    """Ревью Sol, круг 3. `timeout` убивает КЛИЕНТА docker exec, а процесс в контейнере
+    живёт дальше и держит открытую транзакцию на строке dag_run: проснувшись после выката,
+    он перевёл бы задачу уже в чужом мире. Зависшего добиваем по метке из argv."""
+    r = _deploy(tmp_path, idle_wait="600", breaker_hangs=True)
+
+    assert r.proc.returncode == 4, r.out
+    kills = [a for a in r.args if "pkill -f drain-breaker-" in a]
+    assert len(kills) == 1, r.args
+    assert "добит в контейнере" in r.log
+
+
+# --- Доказательство учёта -----------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "world_kw,expected",
+    [
+        # 05.09: скоуп упал, validate не раскрылся (учёт несёт NULL-плейсхолдер map -1),
+        # finalize записал отказ в failures.json.
+        (dict(scope_state="failed", validate_state="upstream_failed", finalize_state="success"), "t"),
+        # штатный зачёт через mark_completed
+        (dict(scope_state="success", validate_state="success", validate_map=0,
+              finalize_state="success"), "t"),
+        # успешный скоуп с провалившейся валидацией: отказ пишет finalize
+        (dict(scope_state="success", validate_state="failed", validate_map=0,
+              finalize_state="success"), "t"),
+        # finalize не отработал — учёт НЕ подтверждён, хотя прогон терминален
+        (dict(scope_state="failed", validate_state="upstream_failed", finalize_state="failed"), "f"),
+        (dict(scope_state="failed", validate_state="upstream_failed", finalize_state=None), "f"),
+        # dagrun_timeout закрыл прогон вовсе без хвоста
+        (dict(scope_state="failed", validate_state=None, finalize_state=None), "f"),
+    ],
+)
+def test_the_capture_scope_accounting_is_proven_from_the_metadb(
+    tmp_path: Path, world_kw: dict, expected: str
+) -> None:
+    """Терминальный прогон — ещё не учтённый скоуп. Доказательство пишется в момент drain:
+    failures.json к утру перезаписывается следующим отказом, а в state.json у `completed`
+    идентификатора прогона нет вовсе."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_try=1, **world_kw),
+        turns={2: _CLOSE_RUN.format(state="failed")},
+    )
+
+    assert r.proc.returncode == 0, r.out
+    env = r.drain_env()
+    assert env["DRAIN_ACCOUNTED"] == expected, env
+    assert env["DRAIN_RUN_ID"] == _RUN_ID
+    assert env["DRAIN_SCOPE_KIND"] == "capture"
+    assert env["DRAIN_SCOPE_KEY"] == "camp1:937:78750"
+    assert ("учёт: подтверждён" if expected == "t" else "учёт: НЕ подтверждён") in r.log
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "scope_state,expected",
+    # Упавшая волна метаданных — `unknown`: чекпойнт пишется в середине задачи
+    # (scripts/enrich_sofascore_all_mens_snapshot.py), поэтому `failed` бывает и до записи
+    # (волну купят заново), и после неё (волна учтена, упало закрытие клиента) — по цвету
+    # задачи эти случаи неразличимы. Третий случай: прогон закрыт (dagrun_timeout), а
+    # задача метаданных так и не стала терминальной — результата нет, учёт не подтверждён.
+    [("success", "t"), ("failed", "unknown"), ("restarting", "f")],
+)
+def test_the_metadata_scope_accounting_uses_its_own_task_state(
+    tmp_path: Path, scope_state: str, expected: str
+) -> None:
+    """У метаданных нет SOFASCORE_SCOPE_KEY: finalize их пропускает, и результат несёт
+    состояние самой задачи. Ключ собирается из плана — <campaign_id>:metadata:<wave>."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(
+            scope_state=scope_state, scope_try=1,
+            plan_kind="metadata", finalize_state="success",
+        ),
+        turns={2: _CLOSE_RUN.format(state="success")},
+    )
+
+    assert r.proc.returncode == 0, r.out
+    env = r.drain_env()
+    assert env["DRAIN_SCOPE_KIND"] == "metadata"
+    assert env["DRAIN_SCOPE_KEY"] == "camp1:metadata:2024"
+    assert env["DRAIN_ACCOUNTED"] == expected, env
+
+
+@pytest.mark.unit
+def test_a_metadb_that_did_not_answer_leaves_the_accounting_unknown(tmp_path: Path) -> None:
+    """Ревью Sol, круг 3. Отказ запроса подавлялся `|| true`, и пустой ответ записывался как
+    `ACCOUNTED=f` — «деньги потеряны». Недоступная метабаза означает «не знаю»: утренняя
+    приёмка иначе искала бы потерянный скоуп там, где ничего не терялось."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        pre=lambda rt: (rt.parent / "stub-state" / "proof_query_fails").touch(),
+    )
+
+    assert r.proc.returncode == 0, r.out
+    env = r.drain_env()
+    assert env["DRAIN_ACCOUNTED"] == "unknown", env
+    assert env["DRAIN_SCOPE_STATE"] == "?"
+    assert "учёт: неизвестен" in r.log
+
+
+@pytest.mark.unit
+def test_a_night_without_a_paid_run_is_accounted_as_not_applicable(tmp_path: Path) -> None:
+    """Прогона с начатой платной работой не было — учитывать нечего. Это не провал: `n/a`
+    идёт в зачёт приёмки наравне с `t`."""
+    r = _deploy(tmp_path, idle_wait="600", world=dict(scope_state="scheduled", scope_try=1))
+
+    assert r.proc.returncode == 0, r.out
+    env = r.drain_env()
+    assert env["DRAIN_ACCOUNTED"] == "n/a"
+    assert env["DRAIN_RUN_ID"] == "-"
+
+
+@pytest.mark.unit
+def test_the_drain_proof_carries_the_window_and_replaces_the_previous_one(tmp_path: Path) -> None:
+    """Свидетельство привязано к окну автомата: файл прошлой ночи не должен подтверждать
+    сегодняшнюю. Старый удаляется в начале drain, новый пишется атомарно (tmp + mv), и
+    временного файла после выката не остаётся."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_state="success", validate_state="success",
+                   validate_map=0, finalize_state="success", scope_try=1),
+        turns={2: _CLOSE_RUN.format(state="success")},
+        env_extra={"SOFASCORE_DEPLOY_WINDOW_ID": "2026-09-08"},
+        pre=lambda runtime: _write(runtime / "auto-deliver" / "last-drain.env", "DRAIN_WINDOW_ID=2026-01-01\n"),
+    )
+
+    assert r.proc.returncode == 0, r.out
+    env = r.drain_env()
+    assert env["DRAIN_WINDOW_ID"] == "2026-09-08"
+    assert env["DRAIN_BREAKER_CALLS"] == "0"
+    assert not list((r.runtime / "auto-deliver").glob("*.tmp"))
+
+
+@pytest.mark.unit
+def test_a_manual_deploy_stamps_its_own_window_id(tmp_path: Path) -> None:
+    """Ручной выкат окна автомата не знает: свидетельство помечается `manual-<время>`,
+    и автомат его не примет за свою ночь."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_state="success", validate_state="success",
+                   validate_map=0, finalize_state="success", scope_try=1),
+        turns={2: _CLOSE_RUN.format(state="success")},
+    )
+
+    assert r.drain_env()["DRAIN_WINDOW_ID"].startswith("manual-"), r.drain_env()
+
+
+# --- Обслуживание манифеста ---------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_manifest_maintenance_is_paused_before_the_first_wait(tmp_path: Path) -> None:
+    """Воскресный дедлайн 04:45 срезал окно доставки, потому что в 05:00 стартует
+    обслуживание манифеста. Решение владельца 07.09: окно до 06:00 каждый день, а
+    обслуживание — под паузой на весь выкат. Пауза обязана лечь ДО первого ожидания:
+    иначе прогон обслуживания успел бы стартовать в осушаемом контуре."""
+    r = _deploy(tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE)
+
+    assert r.proc.returncode == 0, r.out
+    pause_maint = r.args.index(f"exec sofascore-airflow-scheduler airflow dags pause {MAINT}")
+    first_poll = next(i for i, a in enumerate(r.args) if "state IN ('scheduled','up_for_retry')" in a)
+    assert pause_maint < first_poll, r.args
+
+
+@pytest.mark.unit
+def test_a_running_maintenance_task_is_waited_for(tmp_path: Path) -> None:
+    """Задачи обслуживания попали во второе число строки опроса: пересоздание scheduler'а
+    оборвало бы их так же, как задачи дейли."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="scheduled", scope_try=1),
+        seed_sql=(
+            "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
+            f" VALUES ('{MAINT}','maint-1','compact_manifest',-1,'running','default_pool',1);"
+        ),
+    )
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.compose_calls, r.args
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("health,rc", [("healthy", 0), ("unhealthy", 5)])
+def test_a_manual_deploy_restores_the_maintenance_pause_on_every_outcome(
+    tmp_path: Path, health: str, rc: int
+) -> None:
+    """Ручной запуск — владелец снимка пауз: он же обязан вернуть обслуживание, и на
+    успехе, и на аварии."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        maint_paused="f",
+        after_breaker=_TAIL_AFTER_FAILURE,
+        health=health,
+    )
+
+    assert r.proc.returncode == rc, r.out
+    assert (r.state_dir / f"paused_{MAINT}").read_text().strip() == "f"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("health,rc", [("healthy", 0), ("unhealthy", 5)])
+def test_a_deploy_from_the_automat_leaves_the_maintenance_paused(
+    tmp_path: Path, health: str, rc: int
+) -> None:
+    """Запуск из автомата ночной доставки (задан SOFASCORE_DEPLOY_LOCK_FD): паузу держит
+    автомат до конца приёмки или отката. Снять её здесь значило бы отдать обслуживанию
+    контур посреди разрушительного пути — прогон встретил бы пересоздание контейнеров."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        maint_paused="f",
+        after_breaker=_TAIL_AFTER_FAILURE,
+        health=health,
+        under_lock_fd=True,
+    )
+
+    assert r.proc.returncode == rc, r.out
+    assert (r.state_dir / f"paused_{MAINT}").read_text().strip() == "t"
+    assert "её вернёт автомат ночной доставки" in r.log
+
+
+# --- Замок выката --------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_a_busy_deploy_lock_stops_the_deploy_before_it_touches_anything(tmp_path: Path) -> None:
+    """Раньше автомат отличал ручной выкат по `pgrep deploy.sh`, а сам deploy.sh не
+    проверял ничего: между «процесса нет» и первым изменением контура помещался целый чужой
+    выкат. Теперь обе стороны берут один замок ДО первого изменения. Занят — rc=4 «выкат не
+    начат»: ни осушения пула, ни пауз."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    lock = runtime / "deploy.lock"
+    lock.touch()
+    holder = subprocess.Popen(["flock", "-n", str(lock), "sleep", "60"])
+    try:
+        proc = subprocess.run(
+            ["bash", str(DEPLOY / "deploy.sh"), str(release)],
+            env=_env(tmp_path, env_file, idle_wait="600"),
+            capture_output=True, text=True, timeout=120,
+        )
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert proc.returncode == 4, proc.stdout + proc.stderr
     args = [call[0] for call in _calls(state_dir)]
-    assert [a for a in args if a.startswith("compose ")], "замёрзший прогон актуалки не повод не выкатывать"
-    assert (state_dir / f"paused_{REFRESH}").read_text().strip() == "f", "актуалка возвращена в работу"
+    assert not [a for a in args if "pools set" in a], args
+    assert not [a for a in args if "dags pause" in a], args
+    assert "замок выката занят" in (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
 
 
+@pytest.mark.unit
+def test_an_inherited_lock_descriptor_lets_the_deploy_run(tmp_path: Path) -> None:
+    """Автомат держит замок весь тик и передаёт дескриптор: на том же open file description
+    flock отдаёт замок сразу, иначе доставка спотыкалась бы о собственный замок."""
+    r = _deploy(tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE, under_lock_fd=True)
+
+    assert r.proc.returncode == 0, r.out
+    assert r.compose_calls, r.args
+
+
+@pytest.mark.unit
+def test_a_descriptor_that_is_not_the_lock_is_an_error_not_a_busy_contour(tmp_path: Path) -> None:
+    """«Выкат под замком» обязан быть фактом, а не словом: чужой дескриптор — поломка (rc=2),
+    а не «контур занят» (rc=4), иначе автомат счёл бы ночь мирно пропущенной."""
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    (runtime / "not-the-lock").touch()
+    proc = subprocess.run(
+        ["bash", "-c",
+         f'exec 8>"{runtime}/not-the-lock"; exec bash "{DEPLOY}/deploy.sh" "{release}"'],
+        env={**_env(tmp_path, env_file, idle_wait="600"), "SOFASCORE_DEPLOY_LOCK_FD": "8"},
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "ведёт не на замок выката" in proc.stderr
+
+
+@pytest.mark.unit
+def test_a_maintenance_that_did_not_come_back_is_not_a_finished_deploy(tmp_path: Path) -> None:
+    """Ревью Sol, круг 2. Несошедшееся постусловие возврата паузы обслуживания только
+    писалось в журнал, а функция возвращала ноль: выкат заканчивался DONE, обслуживание
+    оставалось под паузой навсегда, и воскресный прогон просто не запускался бы."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE, maint_paused="f",
+        pre=lambda rt: (rt.parent / "stub-state" / "maint_unpause_fails").touch(),
+    )
+
+    assert r.proc.returncode == 7, r.out
+    assert "MANUAL ACTION REQUIRED" in r.log
+    assert "DONE" not in r.log
+
+
+@pytest.mark.unit
+def test_the_proof_lands_in_the_state_directory_the_automat_reads(tmp_path: Path) -> None:
+    """Ревью Sol, круг 2. Писатель брал каталог из SOFASCORE_RUNTIME_DIR, а читатель —
+    из отдельно настраиваемого SOFASCORE_AUTO_STATE_DIR: разъехавшись, автомат читал бы
+    вечно чужой файл и молчал бы об этом."""
+    alien = tmp_path / "elsewhere"
+    alien.mkdir()
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        env_extra={"SOFASCORE_AUTO_STATE_DIR": str(alien)},
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert (alien / "last-drain.env").exists(), list(alien.iterdir())
+    assert not (r.runtime / "auto-deliver" / "last-drain.env").exists()
+
+
+@pytest.mark.unit
+def test_the_proof_is_not_written_into_a_state_directory_that_does_not_exist(tmp_path: Path) -> None:
+    """Ревью Sol, круг 2. `mkdir -p` под доказательство учёта воссоздавал бы каталог
+    состояния автомата — тот самый, где живут выключатель, маркер незакрытой доставки и
+    снимок отката. Потеряв каталог, автомат обязан остановиться fail-closed, а не найти
+    свежесозданный пустой и пойти доставлять."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        pre=lambda rt: (rt / "auto-deliver").rmdir(),
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert not (r.runtime / "auto-deliver").exists(), "каталог состояния автомата не создаём"
+    assert "каталога состояния автомата нет" in r.log
+
+
+@pytest.mark.unit
+def test_taking_the_lock_never_truncates_the_file_it_points_at(tmp_path: Path) -> None:
+    """Путь замка настраиваемый (SOFASCORE_DEPLOY_LOCK), а открытие через `>` обнулило бы
+    файл, на который указала опечатка, ещё до flock — в том числе файл боевого дерева."""
+    r = _deploy(
+        tmp_path, idle_wait="600", after_breaker=_TAIL_AFTER_FAILURE,
+        pre=lambda rt: (rt / "deploy.lock").write_text("важные данные\n", encoding="utf-8"),
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert (r.runtime / "deploy.lock").read_text(encoding="utf-8") == "важные данные\n"
 @pytest.mark.unit
 def test_env_loader_strips_quotes_and_never_expands_or_exports(tmp_path: Path) -> None:
     env_file = tmp_path / "x.env"

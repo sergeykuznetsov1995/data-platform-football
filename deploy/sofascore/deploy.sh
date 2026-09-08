@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Выкат замороженного дерева на контур SofaScore (проекты sofascore-airflow / sofascore-gw).
 # Использование: bash deploy/sofascore/deploy.sh <release-root> [old-release-root]
-# Предпосылки: окно вне 13:55–15:35 UTC;
-#   шаг drain осушает пул истории, паузит актуалку и ждёт завершения того прогона истории,
-#   который работал на входе (история при этом остаётся распаущенной — иначе не отработает
-#   validate_historical_scope и оплаченный скоуп не будет засчитан);
-#   актуалка после выката возвращается в прежнее состояние.
+# Предпосылки: окно вне 13:55–15:35 UTC; свободный замок выката (SOFASCORE_DEPLOY_LOCK);
+#   шаг drain осушает пул истории, паузит актуалку и обслуживание манифеста и ждёт завершения
+#   того прогона истории, который НАЧАЛ платную работу (история при этом остаётся
+#   распаущенной — иначе не отработает validate_historical_scope и оплаченный скоуп не будет
+#   засчитан); припарковавшийся в осушённом пуле повтор скоупа шаг переводит в failed сам
+#   (drain_breaker.py) — иначе прогон висит вечно и выкат ждёт сам себя;
+#   актуалка после выката возвращается в прежнее состояние, обслуживание манифеста —
+#   при ручном запуске (из автомата ночной доставки паузу снимает сам автомат).
 # Переменные — из $SOFASCORE_ENV_FILE (по умолчанию /etc/data-platform/sofascore.env);
 #   скрипт сам переписывает в нём SOFASCORE_RELEASE_ROOT / _PROXY_BUDGET_ARTIFACT_HOST / _ID —
 #   этот файл и есть единственный источник «какое дерево в бою» (compose, сторож, приёмка).
-# Коды возврата: 2 — предпосылки; 3 — окно дейли; 4 — контур занят, выкат не начат; 5 — шлюзы;
-#   6 — импорт DAG; 7 — паузы.
+# Коды возврата: 2 — предпосылки; 3 — окно дейли; 4 — контур занят или замок выката занят,
+#   выкат не начат; 5 — шлюзы; 6 — импорт DAG; 7 — паузы.
 set -euo pipefail
 
 RELEASE="${1:?путь к замороженному дереву}"
@@ -54,12 +57,22 @@ HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
 PLAYERS=dag_players_sofascore_all_mens
+MAINT=dag_sofascore_manifest_maintenance
 # Число core-DAG выводится ИЗ СПИСКА и нигде не пишется литералом: рассинхрон
 # списка и числа — самая дешёвая в исполнении и самая дорогая по последствиям
 # ошибка этого рецепта (приёмка не сходится ни разу, зелёная доставка откатывается).
 CORE_DAGS="$DAILY $HIST $REFRESH $PLAYERS"
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
 CORE_DAGS_N=$(set -- $CORE_DAGS; echo $#)
+# Один источник имени пула на set_pool, предикат ожидания и ломатель: разъехавшись, они
+# осушали бы один пул, а ждали задачи в другом.
+HIST_POOL=sofascore_history_pool
+PLAYERS_POOL=sofascore_players_pool
+# Доказательство учёта оплаченного скоупа за этот drain (#1245): автомат ночной доставки
+# переносит его в запись окна, утренняя приёмка сверяет DRAIN_RUN_ID с метабазой.
+# Каталог — тот же ключ, что читает автомат (SOFASCORE_AUTO_STATE_DIR): два независимо
+# настраиваемых пути разъехались бы молча, и автомат читал бы вечно чужой файл (Sol круг 2).
+LAST_DRAIN="${SOFASCORE_AUTO_STATE_DIR:-$SOFASCORE_RUNTIME_DIR/auto-deliver}/last-drain.env"
 # Три полосы источника (#1244): свой шлюз, свой пул, свой сторож аренд у каждой.
 GATEWAYS="sofascore_proxy_filter sofascore_gw_history sofascore_gw_players"
 GATEWAY_CONTAINERS="sofascore_gw_951 sofascore_gw_history sofascore_gw_players"
@@ -108,25 +121,144 @@ wait_idle() {  # wait_idle <секунд>; 0 — контур свободен, 
 # Ожидание шага drain. Ждать «в контуре нет прогонов истории» нельзя: история идёт
 # @continuous, и как только отслеживаемый прогон кончается, планировщик почти мгновенно
 # (замер 04.09: медиана 26 с) создаёт следующий, а с осушённым пулом тот остаётся running
-# навсегда — его run_historical_scope вечно scheduled. Ждём завершения ИМЕННО того прогона,
-# который работал на входе.
-# Актуалка к этому моменту на паузе, а прогон запаущенного DAG планировщик не двигает
-# (DagModel.is_paused == false в next_dagruns_to_examine), терминального состояния он уже не
-# получит — поэтому по ней ждём отсутствия ЗАДАЧ, а не закрытия прогона. Задачи доработают,
-# сам прогон продолжится, когда шаг restore-pause вернёт актуалку в работу.
+# навсегда — его run_historical_scope вечно scheduled.
+#
+# Ждём прогон, который НАЧАЛ платную работу: у него есть run_historical_scope с
+# map_index >= 0 в queued/running/restarting/up_for_retry/success/failed/upstream_failed
+# либо scheduled с try_number > 1 (припарковавшийся повтор — ночь 05.09). Прогон без
+# такого скоупа платного трафика не купил: его не ждём и не трогаем, после паузы его
+# закроет close_stale_runs. Выбранный run_id удерживается до записи доказательства учёта:
+# запрос по running-прогонам терминальный прогон уже не вернёт.
+#
+# Пятое число строки опроса — «припарковано»: скоуп выбранного прогона в осушённом пуле
+# в scheduled/up_for_retry. Он не сдвинется до конца выката, а прогон из-за него висит
+# running вечно (deadlock-детектор Airflow для этого DAG отключён: max_active_tis_per_dag=1
+# у run_historical_scope). Такой скоуп переводит в failed ломатель (drain_breaker.py), и
+# дальше планировщик доигрывает хвост сам: validate -> upstream_failed, finalize пишет
+# отказ в failures.json, cooldown, propagate, прогон закрыт.
+#
+# Актуалка и обслуживание манифеста к этому моменту на паузе, а прогон запаущенного DAG
+# планировщик не двигает (DagModel.is_paused == false в next_dagruns_to_examine),
+# терминального состояния он уже не получит — поэтому по ним ждём отсутствия ЗАДАЧ, а не
+# закрытия прогона. Задачи доработают, сам прогон продолжится после снятия паузы.
 DRAIN_ROW=""
-wait_drained() {  # wait_drained <секунд> <run_id прогона истории>; 0 — контур осушён, 1 — потолок
-  local deadline tries
+HIST_RUN=""
+HIST_DIAG=""
+BREAKER_CALLS=0
+BREAKER_RESULT="-"
+# Один вызов на шаг, а не пять (Sol круг 3): внешний `timeout` убивает КЛИЕНТА docker exec,
+# а процесс в контейнере переживает его (moby#9098). Пять зависших ломателей могли бы
+# тронуть задачу уже после того, как drain вернул код 4 и вернул слоты пула. Один вызов
+# ограничивает и это окно, и цену ошибки; зависшего добиваем явно (см. break_deadlock).
+BREAKER_MAX="${SOFASCORE_DEPLOY_BREAKER_MAX:-1}"
+# hist_scope_row [run_id] -> "<run_id>|<pool>|<state>|<try_number>"; "-" — такого прогона
+# нет; пустая строка — метабаза не ответила («не знаю», а не «нет»).
+# Без аргумента выбирает прогон с начатой платной работой, с аргументом — рассказывает про
+# уже выбранный (в том числе терминальный: его состояние и есть диагностика).
+hist_scope_row() {
+  local where
+  if [ -n "${1:-}" ]; then
+    where="dr.run_id='$1'"
+  else
+    where="dr.state IN ('queued','running') AND (ti.state IN ('queued','running','restarting','up_for_retry','success','failed','upstream_failed') OR (ti.state='scheduled' AND ti.try_number>1))"
+  fi
+  $PSQL "SELECT coalesce((SELECT dr.run_id || '|' || coalesce(ti.pool,'-') || '|' || coalesce(ti.state,'none') || '|' || coalesce(ti.try_number,0) FROM dag_run dr JOIN task_instance ti ON ti.dag_id=dr.dag_id AND ti.run_id=dr.run_id WHERE dr.dag_id='$HIST' AND ti.task_id='run_historical_scope' AND ti.map_index>=0 AND $where ORDER BY dr.start_date NULLS LAST LIMIT 1),'-');" || true
+}
+# Диагностика ожидания: почему ждём, если ломателю звать некого. Пишется один раз на
+# ИЗМЕНЕНИЕ, иначе каждые 30 с в лог шла бы одна и та же строка.
+hist_diag() {
+  local row pool state try note
+  [ -n "$HIST_RUN" ] || return 0
+  row=$(hist_scope_row "$HIST_RUN")
+  [ -n "$row" ] && [ "$row" != "-" ] || return 0
+  pool=$(printf '%s' "$row" | cut -d'|' -f2)
+  state=$(printf '%s' "$row" | cut -d'|' -f3)
+  try=$(printf '%s' "$row" | cut -d'|' -f4)
+  note=""
+  if [ "$pool" != "$HIST_POOL" ]; then
+    case "$state" in
+      scheduled|up_for_retry) note="скоуп в пуле '$pool', drain осушил '$HIST_POOL' — ломателя не зову, жду до потолка" ;;
+    esac
+  else
+    case "$state" in
+      queued|running|restarting|up_for_retry|success|failed|upstream_failed|skipped|removed) ;;
+      scheduled) [ "${try:-0}" -gt 1 ] || note="скоуп scheduled с try_number=$try — состояние вне протокола, жду до потолка" ;;
+      *) note="скоуп в состоянии '$state' — состояние вне протокола, жду до потолка" ;;
+    esac
+  fi
+  [ -n "$note" ] || return 0
+  [ "$note" = "$HIST_DIAG" ] && return 0
+  HIST_DIAG="$note"
+  log "drain: $note"
+}
+# 0 — ломатель вызван (следующий виток сразу), 1 — звать некого или потолок вызовов исчерпан.
+# Best-effort: код возврата на rc выката не влияет. Иначе сбой `docker exec` дал бы код,
+# отличный от 4, и автомат ночной доставки откатил бы НЕТРОНУТЫЙ бой.
+break_deadlock() {
+  [ -n "$HIST_RUN" ] || return 1
+  if [ "$BREAKER_CALLS" -ge "$BREAKER_MAX" ]; then
+    if [ "$BREAKER_RESULT" != "не-ломается" ]; then
+      BREAKER_RESULT="не-ломается"
+      log "drain: тупик не ломается ($BREAKER_CALLS вызовов ломателя) — жду до потолка"
+    fi
+    return 1
+  fi
+  BREAKER_CALLS=$(( BREAKER_CALLS + 1 ))
+  log "drain: припаркованный скоуп прогона '$HIST_RUN' — ломаю тупик (вызов $BREAKER_CALLS из $BREAKER_MAX)"
+  # Текст ломателя идёт по stdin: однострочником без кавычек он уже не выражается.
+  # 8>&- : дескриптор замка выката потомкам не наследуется.
+  # Метка в argv — единственный способ найти ломателя внутри контейнера: код пришёл по
+  # stdin, имени файла у него нет.
+  local marker="drain-breaker-$$-$BREAKER_CALLS" brc=0
+  timeout -k 5 60 docker exec -i sofascore-airflow-scheduler python - \
+       "$HIST" "$HIST_RUN" "$HIST_POOL" "$marker" < "$RELEASE/deploy/sofascore/drain_breaker.py" >> "$LOG" 2>&1 8>&- || brc=$?
+  if [ "$brc" = 0 ]; then
+    BREAKER_RESULT=ok
+  else
+    BREAKER_RESULT=сбой
+    log "drain: ломатель не отработал (код $brc)"
+    # 124/137 — сработал timeout: клиент убит, а python в контейнере жив и держит открытую
+    # транзакцию на строке dag_run. Добиваем по метке, иначе он проснётся после выката и
+    # переведёт задачу уже в чужом мире (Sol круг 3).
+    if [ "$brc" = 124 ] || [ "$brc" = 137 ]; then
+      if timeout -k 5 30 docker exec sofascore-airflow-scheduler pkill -f "$marker" >> "$LOG" 2>&1 8>&-; then
+        log "drain: зависший ломатель $marker добит в контейнере"
+      else
+        log "MANUAL ACTION REQUIRED: ломатель $marker мог остаться жить в планировщике — проверить руками"
+      fi
+    fi
+  fi
+  return 0
+}
+wait_drained() {  # wait_drained <секунд>; 0 — контур осушён, 1 — потолок исчерпан
+  local deadline tries parked
   deadline=$(( $(date -u +%s) + $1 ))
   tries=$(( $1 / 30 + 1 ))
   while :; do
-    # Одним запросом, четыре числа: прогоны дейли; задачи дейли и актуалки; отслеживаемый
-    # прогон истории; задачи истории — последнее закрывает окно, когда у нового прогона успел
-    # стартовать plan_historical_batch. Одним, а не четырьмя: рваное чтение показало бы контур
-    # свободным по числам из разных моментов. Пустой ответ (метабаза недоступна / timeout) —
-    # это «не знаю», а не «свободно».
-    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH','$PLAYERS') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$2' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running'));" || true)
-    [ "${DRAIN_ROW:-x}" = "0|0|0|0" ] && return 0
+    # Выбор повторяется, пока прогон не выбран: платная работа могла начаться до осушения
+    # пула, но ещё не быть видимой первым запросом.
+    [ -n "$HIST_RUN" ] || pick_hist_run
+    # Одним запросом, пять чисел: прогоны дейли; задачи дейли, актуалки, полосы игроков и
+    # обслуживания — полоса игроков в этом же числе, потому что её оплаченный скоуп нельзя
+    # оборвать пересозданием scheduler'а (паузить её при этом нельзя: под паузой не
+    # отработает validate_players_scope);
+    # отслеживаемый прогон истории; задачи истории — они закрывают окно, когда у нового
+    # прогона успел стартовать plan_historical_batch; припаркованный скоуп отслеживаемого
+    # прогона. Одним, а не пятью: рваное чтение показало бы контур свободным по числам из
+    # разных моментов. Пустой ответ (метабаза недоступна / timeout) — это «не знаю», а не
+    # «свободно».
+    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH','$PLAYERS','$MAINT') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='run_historical_scope' AND map_index>=0 AND pool='$HIST_POOL' AND state IN ('scheduled','up_for_retry'));" || true)
+    [ "${DRAIN_ROW:-x}" = "0|0|0|0|0" ] && return 0
+    parked=${DRAIN_ROW##*|}
+    case "$parked" in ''|*[!0-9]*) parked=0 ;; esac
+    if [ "$parked" -gt 0 ] && break_deadlock; then
+      # Ломатель отработал — следующий виток без сна: хвост прогона пойдёт сразу.
+      tries=$(( tries - 1 ))
+      [ "$tries" -le 0 ] && return 1
+      [ "$(date -u +%s)" -ge "$deadline" ] && return 1
+      continue
+    fi
+    hist_diag
     tries=$(( tries - 1 ))
     [ "$tries" -le 0 ] && return 1
     [ "$(date -u +%s)" -ge "$deadline" ] && return 1
@@ -134,6 +266,107 @@ wait_drained() {  # wait_drained <секунд> <run_id прогона исто�
     # Ещё раз ПОСЛЕ сна и ДО нового витка — по той же причине, что в wait_idle.
     [ "$(date -u +%s)" -ge "$deadline" ] && return 1
   done
+}
+# Выбор отслеживаемого прогона. Пустой ответ метабазы на ПЕРВОМ обращении — rc=4:
+# выкатывать, не зная, идёт ли оплаченный скоуп, значит оборвать его.
+pick_hist_run() {
+  local row
+  row=$(hist_scope_row)
+  [ -n "$row" ] || return 0
+  [ "$row" = "-" ] && return 0
+  HIST_RUN=${row%%|*}
+  log "drain: отслеживаю прогон истории '$HIST_RUN' (скоуп: пул $(printf '%s' "$row" | cut -d'|' -f2), состояние $(printf '%s' "$row" | cut -d'|' -f3), try $(printf '%s' "$row" | cut -d'|' -f4))"
+}
+# Поле JSON-объекта плана: значений с кавычками внутри у него не бывает (пути, id, числа).
+json_field() {  # json_field <json> <ключ>
+  printf '%s' "$1" | sed -n "s/.*\"$2\": *\"\([^\"]*\)\".*/\1/p" | head -1
+}
+# Доказательство учёта (#1245). Терминальный прогон — ещё не учтённый скоуп: finalize мог
+# упасть, а dagrun_timeout 6 ч закрывает прогон вовсе без финализации. Пишем то, что видно
+# в метабазе, атомарно (tmp + mv): автомат ночной доставки переносит это в запись окна, а
+# утренняя приёмка сверяет DRAIN_RUN_ID со строками task_instance — они долговечны, в
+# отличие от failures.json, где следующий отказ перезаписывает last_run_id.
+write_drain_proof() {
+  local row scope validate0 validate_ph validate finalize propagate dagrun xcom kind key accounted tmp
+  kind="-"; key="-"; accounted="n/a"
+  scope="-"; validate="-"; finalize="-"; propagate="-"; dagrun="-"
+  if [ -n "$HIST_RUN" ]; then
+    row=$($PSQL "SELECT coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='run_historical_scope' AND map_index=0),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='validate_historical_scope' AND map_index=0),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='validate_historical_scope' AND map_index=-1),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='finalize_historical_run'),'-'), coalesce((SELECT coalesce(state,'none') FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='propagate_historical_status'),'-'), coalesce((SELECT state FROM dag_run WHERE dag_id='$HIST' AND run_id='$HIST_RUN'),'-'), coalesce((SELECT convert_from(value,'UTF8') FROM xcom WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='plan_historical_batch' AND key='return_value' LIMIT 1),'-');" || true)
+    if [ -z "$row" ]; then
+      # Метабаза не ответила — это «не знаю», а не доказанный незачёт: пустой ответ в роли
+      # `f` заставил бы утреннюю приёмку искать потерянные деньги там, где их не теряли
+      # (Sol круг 3).
+      scope="?"; validate="?"; finalize="?"; propagate="?"; dagrun="?"; accounted=unknown
+    else
+      scope=$(printf '%s' "$row" | cut -d'|' -f1)
+      validate0=$(printf '%s' "$row" | cut -d'|' -f2)
+      validate_ph=$(printf '%s' "$row" | cut -d'|' -f3)
+      finalize=$(printf '%s' "$row" | cut -d'|' -f4)
+      propagate=$(printf '%s' "$row" | cut -d'|' -f5)
+      dagrun=$(printf '%s' "$row" | cut -d'|' -f6)
+      xcom=$(printf '%s' "$row" | cut -d'|' -f7-)
+      # Скоуп упал до раскрытия validate: у карты нет map 0, состояние учёта несёт
+      # NULL-плейсхолдер map -1 (при провале апстрима планировщик ставит ему upstream_failed).
+      validate="$validate0"
+      [ "$validate" = "-" ] && validate="$validate_ph"
+      kind=$(json_field "$xcom" SOFASCORE_CAMPAIGN_ACTION)
+      case "$kind" in
+        capture)
+          key=$(json_field "$xcom" SOFASCORE_SCOPE_KEY)
+          accounted=f
+          if [ "$finalize" = success ]; then
+            case "$validate" in success|failed|upstream_failed) accounted=t ;; esac
+          fi ;;
+        metadata)
+          # У метаданных нет SOFASCORE_SCOPE_KEY: finalize их пропускает, результат несёт
+          # состояние самой задачи (sofascore_all_mens_state.py). Учтён — только успех.
+          # Падение — `unknown`, и это не осторожность, а факт: чекпойнт пишется в середине
+          # задачи (scripts/enrich_sofascore_all_mens_snapshot.py), поэтому `failed` бывает и
+          # до записи (волну купят заново), и после неё (волна учтена, упало закрытие
+          # клиента). По цвету задачи эти два случая неразличимы — врать в любую сторону
+          # хуже, чем сказать «не знаю» (Sol круги 1 и 2; в плане §3.1 стояло `success|failed`).
+          key="$(json_field "$xcom" SOFASCORE_EXPECTED_CAMPAIGN_ID):metadata:$(json_field "$xcom" SOFASCORE_METADATA_WAVE)"
+          accounted=f
+          case "$scope" in success) accounted=t ;; failed) accounted=unknown ;; esac ;;
+        *) kind="-"; accounted=f ;;
+      esac
+    fi
+  fi
+  # Каталог НЕ создаём: в нём же живут выключатель, маркер незакрытой доставки и снимок
+  # отката, и молча созданный пустой каталог снял бы fail-closed проверки автомата
+  # (Sol круг 2; тот же запрет — в sofascore.env.example).
+  if [ ! -d "$(dirname "$LAST_DRAIN")" ]; then
+    log "каталога состояния автомата нет ($(dirname "$LAST_DRAIN")) — доказательство учёта не пишу"
+    return 0
+  fi
+  tmp="$LAST_DRAIN.$$.tmp"
+  {
+    printf 'DRAIN_WINDOW_ID=%s\n' "${SOFASCORE_DEPLOY_WINDOW_ID:-manual-$(date -u +%Y%m%dT%H%M%SZ)}"
+    printf 'DRAIN_RUN_ID=%s\n' "${HIST_RUN:--}"
+    printf 'DRAIN_SCOPE_KIND=%s\n' "${kind:--}"
+    printf 'DRAIN_SCOPE_KEY=%s\n' "${key:--}"
+    printf 'DRAIN_SCOPE_STATE=%s\n' "$scope"
+    printf 'DRAIN_VALIDATE_STATE=%s\n' "$validate"
+    printf 'DRAIN_FINALIZE_STATE=%s\n' "$finalize"
+    printf 'DRAIN_PROPAGATE_STATE=%s\n' "$propagate"
+    printf 'DRAIN_DAGRUN_STATE=%s\n' "$dagrun"
+    printf 'DRAIN_BREAKER_CALLS=%s\n' "$BREAKER_CALLS"
+    printf 'DRAIN_BREAKER_RESULT=%s\n' "$BREAKER_RESULT"
+    printf 'DRAIN_AT=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'DRAIN_ACCOUNTED=%s\n' "$accounted"
+  } > "$tmp" && mv -f "$tmp" "$LAST_DRAIN" || log "доказательство учёта $LAST_DRAIN не записано"
+  local accounted_ru
+  case "$accounted" in
+    t) accounted_ru="подтверждён" ;;
+    f) accounted_ru="НЕ подтверждён" ;;
+    unknown) accounted_ru="неизвестен" ;;
+    *) accounted_ru="$accounted" ;;
+  esac
+  if [ -z "$HIST_RUN" ]; then
+    log "drain: прогона истории с начатой платной работой не было — учитывать нечего (ACCOUNTED=$accounted)"
+  else
+    log "drain: прогон $HIST_RUN закрыт: kind=$kind, run=$scope, validate=$validate, finalize=$finalize, propagate=$propagate, dag_run=$dagrun; учёт: $accounted_ru"
+  fi
 }
 # Прогон истории, оставшийся без задач, планировщик не закроет: паузные прогоны не попадают
 # в next_dagruns_to_examine (DagModel.is_paused == false), а dagrun_timeout проверяется только
@@ -149,7 +382,29 @@ pause_dag() {
 }
 # Любой аварийный выход после паузы: вернуть актуалку в прежнее состояние и сказать,
 # на каком шаге встали (история остаётся на паузе, как и при штатном выкате).
-REFRESH_WAS_PAUSED=""; HIST_WAS_PAUSED=""; POOL_DRAINED=""
+REFRESH_WAS_PAUSED=""; HIST_WAS_PAUSED=""; MAINT_WAS_PAUSED=""; POOL_DRAINED=""
+# Паузу обслуживания манифеста возвращает тот, кто снял снимок: ручной запуск — здесь,
+# запуск из автомата (задан SOFASCORE_DEPLOY_LOCK_FD) — сам автомат, после приёмки или
+# отката. Иначе на разрушительном пути (откат вторым тиком) обслуживание оказалось бы
+# распаущенным и его прогон встретил бы пересоздание контейнеров.
+restore_maint_pause() {
+  [ -n "$MAINT_WAS_PAUSED" ] || return 0
+  if [ -n "${SOFASCORE_DEPLOY_LOCK_FD:-}" ]; then
+    log "$MAINT остаётся на паузе — её вернёт автомат ночной доставки (was paused=$MAINT_WAS_PAUSED)"
+    return 0
+  fi
+  [ "$MAINT_WAS_PAUSED" = "f" ] || { log "$MAINT kept paused (as before)"; return 0; }
+  docker exec sofascore-airflow-scheduler airflow dags unpause "$MAINT" >> "$LOG" 2>&1
+  if [ "$(is_paused "$MAINT")" = "f" ]; then
+    log "$MAINT unpaused back"
+    return 0
+  fi
+  # Возврат не состоялся — это отказ, а не примечание: раньше функция возвращала ноль от
+  # log, выкат заканчивался DONE, и обслуживание манифеста молча оставалось под паузой
+  # навсегда (Sol круг 2). В EXIT-trap отказ остаётся best effort — там уже падают.
+  log "MANUAL ACTION REQUIRED: $MAINT is still paused — unpause it by hand"
+  return 1
+}
 STEP="start"
 on_exit() {
   local rc=$? state
@@ -161,15 +416,15 @@ on_exit() {
   # и scheduler-health, до него выкат может не дойти — и полоса истории осталась бы с нулём
   # слотов без единого сообщения.
   if [ -n "$POOL_DRAINED" ]; then
-    if set_pool sofascore_history_pool "$HISTORY_SLOTS" 'SofaScore history lane'; then
-      log "sofascore_history_pool restored to $HISTORY_SLOTS slots"
+    if set_pool "$HIST_POOL" "$HISTORY_SLOTS" 'SofaScore history lane'; then
+      log "$HIST_POOL restored to $HISTORY_SLOTS slots"
     else
-      log "MANUAL ACTION REQUIRED: sofascore_history_pool left drained — airflow pools set sofascore_history_pool $HISTORY_SLOTS 'SofaScore history lane'"
+      log "MANUAL ACTION REQUIRED: $HIST_POOL left drained — airflow pools set $HIST_POOL $HISTORY_SLOTS 'SofaScore history lane'"
     fi
-    if set_pool sofascore_players_pool "$PLAYERS_SLOTS" 'SofaScore players lane'; then
-      log "sofascore_players_pool restored to $PLAYERS_SLOTS slots"
+    if set_pool "$PLAYERS_POOL" "$PLAYERS_SLOTS" 'SofaScore players lane'; then
+      log "$PLAYERS_POOL restored to $PLAYERS_SLOTS slots"
     else
-      log "MANUAL ACTION REQUIRED: sofascore_players_pool left drained — airflow pools set sofascore_players_pool $PLAYERS_SLOTS 'SofaScore players lane'"
+      log "MANUAL ACTION REQUIRED: $PLAYERS_POOL left drained — airflow pools set $PLAYERS_POOL $PLAYERS_SLOTS 'SofaScore players lane'"
     fi
   fi
   # rc=4 — «контур занят, выкат не начат»: паузу истории тоже возвращаем как было.
@@ -180,6 +435,7 @@ on_exit() {
       && log "$HIST unpaused back (contour busy, nothing deployed)" \
       || log "MANUAL ACTION REQUIRED: $HIST is still paused — unpause it by hand"
   fi
+  restore_maint_pause
   if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
     # Сначала штатно через scheduler; если он сам лежит (упал recreate/health) —
     # напрямую в метабазе контура одной строкой (то же, что делает `airflow dags unpause`).
@@ -204,6 +460,31 @@ trap on_exit EXIT
 hour=$(date -u +%H%M)
 if [ "$hour" -ge 1355 ] && [ "$hour" -le 1535 ]; then echo "окно дейли 14:00–15:30 UTC — позже" >&2; exit 3; fi
 
+STEP="lock"
+# Замок выката (#1245): один протокол на автомат ночной доставки и ручной запуск. Раньше
+# автомат отличал ручной выкат по `pgrep deploy.sh`, а deploy.sh не проверял ничего — между
+# «процесса нет» и первым изменением контура помещался целый чужой выкат. Берём ПОСЛЕ
+# дешёвых предпосылок и ДО снимка пауз: занятый замок обязан кончаться нетронутым боем.
+sofascore_deploy_lock_init || exit 2
+if [ -n "${SOFASCORE_DEPLOY_LOCK_FD:-}" ]; then
+  # Запуск из автомата: замок взят родителем, дескриптор унаследован. Проверяем, что он
+  # ведёт именно на файл замка, иначе «выкат под замком» был бы словом, а не фактом.
+  # На том же open file description flock отдаёт замок сразу — конкуренции здесь быть не может.
+  [ "/proc/self/fd/$SOFASCORE_DEPLOY_LOCK_FD" -ef "$SOFASCORE_DEPLOY_LOCK" ] \
+    || { echo "SOFASCORE_DEPLOY_LOCK_FD=$SOFASCORE_DEPLOY_LOCK_FD ведёт не на замок выката $SOFASCORE_DEPLOY_LOCK" >&2; exit 2; }
+  flock -n "$SOFASCORE_DEPLOY_LOCK_FD" || { echo "унаследованный замок выката не берётся" >&2; exit 2; }
+else
+  # `|| lock_rc=$?`, а не `; lock_rc=$?`: под `set -e` занятый замок оборвал бы скрипт
+  # кодом 1, и автомат ночной доставки принял бы это за поломку выката, а не за «не начат».
+  lock_rc=0
+  sofascore_take_deploy_lock 8 || lock_rc=$?
+  [ "$lock_rc" = 2 ] && exit 2
+  if [ "$lock_rc" = 1 ]; then
+    log "замок выката занят ($SOFASCORE_DEPLOY_LOCK) — выкат не начат, бой не тронут"
+    exit 4
+  fi
+fi
+
 # Пересоздание scheduler'а обрывает любой идущий таск, поэтому контур сначала осушается.
 # Актуалка после выката возвращается в то состояние, в каком была; история остаётся
 # на паузе до ручного решения (как и раньше).
@@ -216,30 +497,43 @@ STEP="drain"
 # ни в 'running'. Паузу истории ставим ПОСЛЕ ожидания: под паузой не выполнится
 # validate_historical_scope, а он единственный засчитывает скоуп в state.json — новый прогон
 # получил бы новый run_id и купил те же 8–81 минуты платного трафика заново.
+# Старое доказательство учёта убираем ДО первого действия: файл прошлой ночи, доживший до
+# утра, автомат принял бы за свидетельство сегодняшней (окно сверяется, но пустая строка
+# честнее чужой).
+rm -f "$LAST_DRAIN"
 REFRESH_WAS_PAUSED=$(is_paused "$REFRESH")
 HIST_WAS_PAUSED=$(is_paused "$HIST")
-log "drain: sofascore_history_pool -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
+# Обслуживание манифеста паузится вместе с актуалкой: его прогон в 05:00 UTC воскресенья
+# раньше резал окно доставки (SUNDAY_TO), теперь окно одно на все дни, а пересечения не
+# случается, потому что DAG на паузе. Паузу снимает тот, кто снял снимок: при ручном
+# запуске — этот скрипт, из автомата ночной доставки — сам автомат после приёмки или отката.
+MAINT_WAS_PAUSED=$(is_paused "$MAINT")
+log "drain: $HIST_POOL и $PLAYERS_POOL -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED) и $MAINT (was paused=$MAINT_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
 # Флаг ставится ДО первого осушения: отказ на втором пуле выходит по `set -e`, и
 # on_exit обязан знать, что первый уже осушён, — иначе история осталась бы с нулём
 # слотов молча. Возврат пула, который осушить не удалось, безвреден (set идемпотентен).
 POOL_DRAINED=1
-set_pool sofascore_history_pool 0 'SofaScore history lane (drained for deploy)'
+set_pool "$HIST_POOL" 0 'SofaScore history lane (drained for deploy)'
 # Полосу игроков паузить нельзя по той же причине, что и историю: под паузой не
 # отработает validate_players_scope, и оплаченный скоуп не будет засчитан.
 # Дверь новым скоупам закрывает пул, а взятый доработает вместе со своим validate.
-set_pool sofascore_players_pool 0 'SofaScore players lane (drained for deploy)'
+set_pool "$PLAYERS_POOL" 0 'SofaScore players lane (drained for deploy)'
 pause_dag "$REFRESH"
-# Ждём прогон, который ДЕРЖИТ слот пула, а не любой активный: прогон, чей скоуп ещё не успел
-# взять слот, после осушения не сдвинется никогда (scheduled без слота), а прогон с пустым
-# планом уходит в 30-минутное охлаждение, которого ждать нечего — платного трафика в нём нет.
-# `|| true` обязателен: без него отказ метабазы под `set -e` вышел бы кодом timeout (124), а
-# для автомата 124 — это «таймаут доставки», то есть полный откат боя, которого не было.
-HIST_RUN=$($PSQL "SELECT coalesce((SELECT run_id FROM task_instance WHERE dag_id='$HIST' AND task_id='run_historical_scope' AND state IN ('queued','running') ORDER BY start_date NULLS LAST LIMIT 1),'-');" || true)
-[ -n "$HIST_RUN" ] || { log "метабаза не ответила про идущий прогон истории — nothing deployed"; exit 4; }
-[ "$HIST_RUN" = "-" ] && HIST_RUN=""
-log "drain: ждём прогон истории '${HIST_RUN:-нет работающего скоупа}'"
-wait_drained "$IDLE_WAIT" "$HIST_RUN" \
+pause_dag "$MAINT"
+# `|| true` внутри hist_scope_row обязателен: без него отказ метабазы под `set -e` вышел бы
+# кодом timeout (124), а для автомата 124 — это «таймаут доставки», то есть полный откат
+# боя, которого не было.
+HIST_ROW=$(hist_scope_row)
+[ -n "$HIST_ROW" ] || { log "метабаза не ответила про идущий прогон истории — nothing deployed"; exit 4; }
+if [ "$HIST_ROW" = "-" ]; then
+  log "drain: прогона истории с начатой платной работой нет — жду только контур"
+else
+  HIST_RUN=${HIST_ROW%%|*}
+  log "drain: отслеживаю прогон истории '$HIST_RUN' (скоуп: пул $(printf '%s' "$HIST_ROW" | cut -d'|' -f2), состояние $(printf '%s' "$HIST_ROW" | cut -d'|' -f3), try $(printf '%s' "$HIST_ROW" | cut -d'|' -f4))"
+fi
+wait_drained "$IDLE_WAIT" \
   || { log "contour still busy after ${IDLE_WAIT}s (последний ответ '${DRAIN_ROW:-пусто}') — nothing deployed"; exit 4; }
+write_drain_proof
 
 STEP="pause"
 pause_dag "$HIST"
@@ -304,7 +598,7 @@ SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST="$ARTIFACT_DEST" \
 SOFASCORE_PROXY_BUDGET_ARTIFACT_ID="$ARTIFACT_ID" \
 docker compose -p sofascore-airflow -f "$SCHED_COMPOSE" \
   --env-file "$SOFASCORE_PLATFORM_ENV_FILE" --env-file "$ENV_FILE" \
-  up -d --no-deps --force-recreate airflow-scheduler >> "$LOG" 2>&1
+  up -d --no-deps --force-recreate airflow-scheduler >> "$LOG" 2>&1 8>&-
 log "scheduler up"
 
 STEP="gateway-up"
@@ -314,7 +608,7 @@ SOFASCORE_PROXY_BUDGET_ARTIFACT_ID="$ARTIFACT_ID" \
 docker compose -p sofascore-gw -f "$GW_COMPOSE" \
   --project-directory "$RELEASE" \
   --env-file "$SOFASCORE_PLATFORM_ENV_FILE" --env-file "$ENV_FILE" \
-  up -d --no-deps --force-recreate $GATEWAYS >> "$LOG" 2>&1
+  up -d --no-deps --force-recreate $GATEWAYS >> "$LOG" 2>&1 8>&-
 log "gateways up: $GATEWAYS"
 
 STEP="gateway-health"
@@ -355,13 +649,14 @@ STEP="pools"
 # на ротации init не запускается. Без этого шага задачи полосы повисли бы в
 # несуществующем пуле. `airflow pools set` идемпотентен: создаёт или переставляет слоты.
 set_pool ingest_scraper_pool 1 'Serialize heavy ingest scrapers (isolated sofascore stack #951)'
-set_pool sofascore_history_pool "$HISTORY_SLOTS" 'SofaScore history lane'
-set_pool sofascore_players_pool "$PLAYERS_SLOTS" 'SofaScore players lane'
-log "pools set: ingest_scraper_pool=1 sofascore_history_pool=$HISTORY_SLOTS sofascore_players_pool=$PLAYERS_SLOTS"
+set_pool "$HIST_POOL" "$HISTORY_SLOTS" 'SofaScore history lane'
+set_pool "$PLAYERS_POOL" "$PLAYERS_SLOTS" 'SofaScore players lane'
+log "pools set: ingest_scraper_pool=1 $HIST_POOL=$HISTORY_SLOTS $PLAYERS_POOL=$PLAYERS_SLOTS"
 POOL_DRAINED=""   # слоты вернулись штатно — позднему обрыву возвращать нечего
 
 STEP="restore-pause"
 pause_dag "$HIST"
+restore_maint_pause || exit 7
 if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
   docker exec sofascore-airflow-scheduler airflow dags unpause "$REFRESH" >> "$LOG" 2>&1
   [ "$(is_paused "$REFRESH")" = "f" ] || { log "$REFRESH did not unpause"; exit 7; }
