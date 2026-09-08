@@ -1264,16 +1264,17 @@ class ReconcileTrino:
         self.queries.append(sql)
         marker = "FROM iceberg.bronze."
         table = sql.split(marker, 1)[1].split()[0]
-        if "SELECT run_id, batch_id, target_key, content_hash" in sql:
+        if table == "fotmob_ingest_manifest" and "SELECT run_id, batch_id" in sql:
+            # Ветка отпечатков манифеста опознаётся по таблице и форме SELECT, а
+            # список колонок читается из самого запроса: раньше ключом ветки был
+            # точный префикс колонок, и любое его расширение молча уводило
+            # тесты в ветку счётчиков (#1255).
+            columns = [
+                column.strip()
+                for column in sql.split("SELECT", 1)[1].split("FROM", 1)[0].split(",")
+            ]
             return [
-                (
-                    row.get("run_id"),
-                    row.get("batch_id"),
-                    row.get("target_key"),
-                    row.get("content_hash"),
-                    row.get("parser_version"),
-                    row.get("status"),
-                )
+                tuple(row.get(column) for column in columns)
                 for row in self.writer.rows.get(table, [])
             ]
         batch_column = "_target_batch_id" if "_target_batch_id" in sql else "batch_id"
@@ -1449,8 +1450,75 @@ def test_restart_fails_closed_on_duplicate_exact_manifest_semantics():
     repository = FotMobRepository(writer=writer, batch_size=50)
     repository.commit(commit)
 
-    with pytest.raises(RuntimeError, match="has 2 stored rows; expected either 0 or 1"):
+    with pytest.raises(RuntimeError, match="has 2 stored rows; expected either 0 or 1") as excinfo:
         repository.flush()
+
+    # Настоящая половинная пачка обязана нести путь ремонта: кто писал, какую
+    # цель, в каком скоупе и каким запросом это посмотреть (#1255).
+    message = str(excinfo.value)
+    assert f"run_id={commit.run_id}" in message
+    assert commit.batch_id in message
+    assert f"target_key={commit.target_key}" in message
+    assert "competition_id=289" in message
+    assert "source_season_key=2017/2019" in message
+    assert "has 2 stored rows" in message
+    assert (
+        "SELECT run_id, target_type, entity_id, competition_id, "
+        "source_season_key, status FROM iceberg.bronze.fotmob_ingest_manifest "
+        f"WHERE batch_id='{commit.batch_id}'"
+    ) in message
+
+
+def _global_team_commit(**overrides):
+    # Глобальная цель: скоуп в target_key не входит, observation_id пуст —
+    # значит batch_id у наблюдений разных скоупов один и тот же.
+    values = {
+        "target_type": "team",
+        "target_key": "https://www.fotmob.com/api/data/teams?id=1",
+        "entity_id": "1",
+        "status": ManifestStatus.EXCLUDED,
+        "source_season_key": "2026",
+    }
+    values.update(overrides)
+    return _commit(**values)
+
+
+def test_same_global_target_observed_in_two_scopes_does_not_redden_the_wave():
+    # Боевая волна 7ab3af4c (04.09): та же команда, недоступная в трёх скоупах
+    # одного рана, давала один отпечаток — сверка падала «1 stored rows;
+    # expected either 0 or 2» при целой таблице, а 663 строки остались сиротами.
+    writer = ReconcileWriter()
+    early = _global_team_commit(competition_id="9067")
+    writer.rows["fotmob_ingest_manifest"] = [early.manifest_row()]
+
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    first = _global_team_commit(competition_id="8983")
+    second = _global_team_commit(competition_id="8984")
+    assert first.batch_id == second.batch_id == early.batch_id
+    repository.commit(first)
+    repository.commit(second)
+
+    repository.flush()
+
+    rows = writer.rows["fotmob_ingest_manifest"]
+    assert len(rows) == 3
+    assert [row["competition_id"] for row in rows] == ["9067", "8983", "8984"]
+
+
+def test_exact_duplicate_manifest_row_in_buffer_self_heals():
+    # Тот же скоуп, наблюдённый дважды за ран, — повтор, а не половинная пачка:
+    # буфер схлопывается, лежащая строка подтверждает наблюдение, волна жива.
+    writer = ReconcileWriter()
+    commit = _global_team_commit(competition_id="8983")
+    writer.rows["fotmob_ingest_manifest"] = [commit.manifest_row()]
+
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit)
+    repository.commit(commit)
+
+    repository.flush()
+
+    assert len(writer.rows["fotmob_ingest_manifest"]) == 1
 
 
 def test_buffered_manifest_answers_this_runs_incremental_reads():
