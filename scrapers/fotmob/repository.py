@@ -80,6 +80,9 @@ SCOPE_ATTEMPT_OUTCOMES = frozenset(
 # `_target_batch_id` и снимает подтверждённые пакеты с буфера (а при частичном
 # совпадении падает закрыто). Повторяя именно flush(), мы переиспользуем этот
 # готовый механизм exactly-once вместо того, чтобы предполагать недоказуемое.
+# Отпечаток строки манифеста включает скоуп наблюдения, а точный дубль в буфере
+# схлопывается вместо отказа: сверка обязана ронять волну только на настоящей
+# половинной пачке, а не на двух скоупах одной глобальной цели (#1255).
 #
 # Неблокированный путь `commit()` при batch_size<=1 пишет без буфера и сверки —
 # он ретраем НЕ прикрыт сознательно. Боевые раны идут с `--commit-batch-size 50`,
@@ -1485,10 +1488,22 @@ class FotMobRepository:
         bytes still appends a fresh manifest/freshness observation.
         Failure/tombstone states remain distinct so an older failure with the
         same target bytes can never be mistaken for a later success.
+
+        Скоуп наблюдения (``competition_id``/``source_season_key``/``stage_id``/
+        ``entity_id``) входит в отпечаток обязательно: у глобальной цели
+        (``/teams?id=N``) ``target_key`` скоупа не содержит, поэтому без этих
+        колонок наблюдения одной команды в двух турнирах сливались в один
+        отпечаток — и волна либо падала «расхождением» при целой таблице, либо
+        молча выбрасывала наблюдение второго скоупа (#1255).
         """
 
         status = str(row.get("status"))
         semantic_status = "published" if status in SUCCESS_STATES else status
+
+        def _scope(column: str) -> Optional[str]:
+            value = row.get(column)
+            return None if value is None else str(value)
+
         return (
             str(row.get("batch_id")),
             str(row.get("target_key")),
@@ -1496,6 +1511,10 @@ class FotMobRepository:
             str(row.get("parser_version")),
             str(row.get("run_id")),
             semantic_status,
+            _scope("competition_id"),
+            _scope("source_season_key"),
+            _scope("stage_id"),
+            _scope("entity_id"),
         )
 
     def _stored_manifest_fingerprints(
@@ -1518,7 +1537,8 @@ class FotMobRepository:
             rows = trino.execute_query(
                 f"""
                 SELECT run_id, batch_id, target_key, content_hash,
-                       parser_version, status
+                       parser_version, status, competition_id,
+                       source_season_key, stage_id, entity_id
                 FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
                 WHERE batch_id IN ({values})
                 """
@@ -1530,6 +1550,10 @@ class FotMobRepository:
                 content_hash,
                 parser_version,
                 status,
+                competition_id,
+                source_season_key,
+                stage_id,
+                entity_id,
             ) in rows:
                 fingerprint = self._manifest_fingerprint(
                     {
@@ -1539,6 +1563,10 @@ class FotMobRepository:
                         "content_hash": content_hash,
                         "parser_version": parser_version,
                         "status": status,
+                        "competition_id": competition_id,
+                        "source_season_key": source_season_key,
+                        "stage_id": stage_id,
+                        "entity_id": entity_id,
                     }
                 )
                 fingerprints[fingerprint] = fingerprints.get(fingerprint, 0) + 1
@@ -1579,7 +1607,9 @@ class FotMobRepository:
             elif actual_count != 0:
                 raise RuntimeError(
                     f"{table}: batch {batch_id} has {actual_count} stored rows; "
-                    f"expected either 0 or {expected_count}"
+                    f"expected either 0 or {expected_count}; inspect: "
+                    f"SELECT * FROM {self.catalog}.{self.schema}.{table} "
+                    f"WHERE _target_batch_id='{batch_id}'"
                 )
         if confirmed:
             remaining = [
@@ -1596,26 +1626,31 @@ class FotMobRepository:
 
         if not self._pending_manifest:
             return
+        # Точный дубль в буфере лечится схлопыванием, а не отказом: две
+        # неразличимые строки одного наблюдения — это повтор внутри рана, а не
+        # доказательство половинной пачки. Наблюдения одной глобальной цели в
+        # разных скоупах отпечатками теперь различаются и НЕ схлопываются
+        # (#1255).
+        collapsed: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for row in self._pending_manifest:
+            collapsed.setdefault(self._manifest_fingerprint(row), row)
+        if len(collapsed) != len(self._pending_manifest):
+            self._pending_manifest = list(collapsed.values())
+            self._rebuild_pending_indexes()
         stored = self._stored_manifest_fingerprints(
             str(row.get("batch_id")) for row in self._pending_manifest
         )
         if stored is None:
             return
-        expected: dict[tuple[Any, ...], int] = {}
-        for row in self._pending_manifest:
-            fingerprint = self._manifest_fingerprint(row)
-            expected[fingerprint] = expected.get(fingerprint, 0) + 1
         confirmed_fingerprints: set[tuple[Any, ...]] = set()
-        for fingerprint, expected_count in expected.items():
+        # После схлопывания на каждый отпечаток приходится ровно одна
+        # буферизованная строка, поэтому ожидание — 0 или 1.
+        for fingerprint, row in collapsed.items():
             actual_count = int(stored.get(fingerprint, 0))
-            if actual_count == expected_count:
+            if actual_count == 1:
                 confirmed_fingerprints.add(fingerprint)
             elif actual_count != 0:
-                raise RuntimeError(
-                    f"{MANIFEST_TABLE}: semantic batch {fingerprint[0]} has "
-                    f"{actual_count} stored rows; expected either 0 or "
-                    f"{expected_count}"
-                )
+                raise RuntimeError(self._manifest_mismatch_message(row, actual_count))
         if not confirmed_fingerprints:
             return
         for row in self._pending_manifest:
@@ -1627,6 +1662,26 @@ class FotMobRepository:
             if self._manifest_fingerprint(row) not in confirmed_fingerprints
         ]
         self._rebuild_pending_indexes()
+
+    def _manifest_mismatch_message(
+        self,
+        row: Mapping[str, Any],
+        actual_count: int,
+    ) -> str:
+        """Закрытый отказ с готовым путём диагностики (#1255)."""
+
+        batch_id = str(row.get("batch_id"))
+        return (
+            f"{MANIFEST_TABLE}: semantic batch {batch_id} "
+            f"(run_id={row.get('run_id')} target_key={row.get('target_key')} "
+            f"competition_id={row.get('competition_id')} "
+            f"source_season_key={row.get('source_season_key')} "
+            f"stage_id={row.get('stage_id')} entity_id={row.get('entity_id')}) "
+            f"has {actual_count} stored rows; expected either 0 or 1; inspect: "
+            "SELECT run_id, target_type, entity_id, competition_id, "
+            f"source_season_key, status FROM {self.catalog}.{self.schema}."
+            f"{MANIFEST_TABLE} WHERE batch_id='{batch_id}'"
+        )
 
     def _rebuild_pending_indexes(self) -> None:
         self._pending_targets = {}

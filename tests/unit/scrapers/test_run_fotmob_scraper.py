@@ -460,14 +460,14 @@ class TestFotmobNativeRunner:
             if operation["entity"] == "season_work_plan"
         )
 
-    @pytest.mark.unit
-    def test_automatic_backfill_empty_plan_with_pending_queue_turns_run_red(self):
-        """Пустой план истории при непустой очереди — КРАСНАЯ волна (#1227).
+    def _history_lane(self, mod):
+        """Полоса истории на одном турнире с тремя сезонами.
 
-        Сценарий ровно тот, что шесть дней притворялся здоровым: часть скоупов
-        обязательства закрыта, оставшийся стоит на остывании после повтора,
-        план пуст, попыток в ране нет — значит ни гейт исходов, ни приёмка
-        каталога такую волну не красят.
+        Общая фикстура барьера продвижения: первая волна закрывает
+        `47=2024/2025`, вторая ставит `47=2023/2024` на остывание после
+        повтора, третья планирует ноль скоупов при непустой очереди — ровно
+        состояние 06.09 (`1c53cb66`), которое старый барьер красил по размеру
+        плана.
         """
 
         from scrapers.fotmob.planner import RunMode, TransportBudget
@@ -479,7 +479,6 @@ class TestFotmobNativeRunner:
             _league_payload,
         )
 
-        mod = self._module()
         root = _league_payload()
         root["allAvailableSeasons"] = ["2025/2026", "2024/2025", "2023/2024"]
         responses = {
@@ -496,7 +495,7 @@ class TestFotmobNativeRunner:
         }
         repository = MemoryFotMobRepository()
 
-        def run(run_id, *, retryable=False):
+        def run(run_id, *, retryable=False, deadline_at=None):
             service = FotMobIngestService(
                 transport=StubTransport(dict(responses)),
                 repository=repository,
@@ -531,31 +530,232 @@ class TestFotmobNativeRunner:
                     run_id,
                 ]
             )
+            args.deadline_at = deadline_at
             return _run_native_admitted(mod, args, service=service)
+
+        return repository, run
+
+    def _age_lane_journal(
+        self,
+        repository,
+        report,
+        *,
+        hours_ago,
+        source_season_key="2024/2025",
+        outcome=None,
+        reason=None,
+    ):
+        """Состарить строку журнала полосы под журнальной подписью волны.
+
+        Карта состояний выбирает САМУЮ СВЕЖУЮ запись скоупа, поэтому «старую»
+        попытку нельзя дописать поверх новой — старится сама запись, ровно как
+        в манифесте живёт одна строка последнего исхода скоупа.
+        """
+
+        from datetime import timezone
+
+        journal = self._season_work_plan(report)["metadata"][
+            "journal_plan_signature"
+        ]
+        aged_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            hours=hours_ago
+        )
+        matched = 0
+        for commit in repository.commits:
+            if (
+                commit.target_type != "scope_attempt"
+                or commit.entity_id != journal
+                or commit.source_season_key != source_season_key
+            ):
+                continue
+            commit.capabilities["last_attempt_at"] = aged_at.isoformat()
+            if outcome is not None:
+                commit.capabilities["outcome"] = outcome
+            if reason is not None:
+                commit.capabilities["reason"] = reason
+            matched += 1
+        assert matched, f"журнал не содержит попытки {source_season_key}"
+
+    @pytest.mark.unit
+    def test_automatic_backfill_empty_plan_stays_green_while_the_lane_progresses(self):
+        """Пустой план истории при живой полосе — ЗЕЛЁНАЯ волна (#1255).
+
+        Старый барьер красил по размеру плана и потому красил штатное
+        остывание: единственный кандидат новейшего цикла ждёт повтора, план
+        пуст, а полоса закрыла скоуп три часа назад. Волна 1c53cb66 06.09.
+        """
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
 
         first_rc, first_report = run("stalled-cycle-1")
         assert first_rc == 0, first_report["errors"]
         assert first_report["selection"]["planned_scopes"] == ["47=2024/2025"]
+        # Волна, закрывшая скоуп прямо сейчас, рапортует нулевой простой, а не
+        # часы «до себя»; доказанный ноль кандидатов печатается как 0, не n/a.
+        first_metrics = mod._wave_metrics_line(first_report, first_rc)
+        assert "lane_idle_h=0" in first_metrics
+        assert "gap_candidate=0" in first_metrics
 
         second_rc, second_report = run("stalled-cycle-2", retryable=True)
         assert second_rc == 1
         assert second_report["selection"]["planned_scopes"] == ["47=2023/2024"]
-        assert second_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+        assert timedelta(hours=3) < mod.LANE_STALL_AFTER
+        self._age_lane_journal(repository, second_report, hours_ago=3)
+        third_rc, third_report = run("stalled-cycle-3")
+
+        assert third_report["selection"]["planned_scopes"] == []
+        assert third_rc == 0, third_report["errors"]
+        assert third_report["status"] == "success"
+        work_plan = self._season_work_plan(third_report)
+        assert work_plan["metadata"]["pending_candidate_scopes"] == 1
+        assert work_plan["errors"] == []
+        assert "lane_idle_h=3" in mod._wave_metrics_line(third_report, third_rc)
+
+    @pytest.mark.unit
+    def test_automatic_backfill_turns_red_when_the_lane_closed_nothing_for_days(self):
+        """Полоса без единого закрытия дольше порога — КРАСНАЯ волна (#1227).
+
+        Именно это шесть суток 26.08–01.09 притворялось здоровым: план пуст,
+        попыток в ране нет, очередь обязательства не пуста, и никакой другой
+        барьер такую волну не красит.
+        """
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+
+        run("stalled-cycle-1")
+        _second_rc, second_report = run("stalled-cycle-2", retryable=True)
+        # Возраст считается ОТ порога, а не числом: смена LANE_STALL_AFTER не
+        # должна оставлять тест зелёным на старой константе (урок 100).
+        stalled_hours = int(mod.LANE_STALL_AFTER.total_seconds() // 3600) + 4
+        self._age_lane_journal(repository, second_report, hours_ago=stalled_hours)
 
         third_rc, third_report = run("stalled-cycle-3")
 
         assert third_report["selection"]["planned_scopes"] == []
-        assert third_report["selection"]["scope_attempts"] == []
         assert third_rc == 1
         assert third_report["status"] != "success"
         assert third_report["complete"] is False
         work_plan = self._season_work_plan(third_report)
-        assert work_plan["metadata"]["obligation_scopes"] == 2
-        assert work_plan["metadata"]["already_complete_scopes"] == 1
         assert work_plan["metadata"]["pending_candidate_scopes"] == 1
-        assert any(
-            "history lane is stalled" in error for error in work_plan["errors"]
-        ), work_plan["errors"]
+        stall = [
+            error
+            for error in work_plan["errors"]
+            if error.startswith("no_progress:")
+        ]
+        assert stall, work_plan["errors"]
+        assert f"{stalled_hours}h" in stall[0]
+        assert f"lane_idle_h={stalled_hours}" in mod._wave_metrics_line(
+            third_report, third_rc
+        )
+
+    @pytest.mark.unit
+    def test_planned_scope_without_a_closure_stays_red_on_a_stalled_lane(self):
+        """Красное решает продвижение полосы, а не пустота плана.
+
+        Волна ЗАПЛАНИРОВАЛА скоуп, отдала его штатной дедлайн-отсрочке и не
+        закрыла ничего, пока полоса стоит дольше порога. Старый барьер
+        требовал `planned=0` и такую волну пропускал зелёной; тест закрепляет,
+        что возврат этого ограничения красноту не выключит.
+        """
+
+        from datetime import timezone
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+
+        first_rc, first_report = run("planned-stall-1")
+        assert first_rc == 0, first_report["errors"]
+        stalled_hours = int(mod.LANE_STALL_AFTER.total_seconds() // 3600) + 4
+        self._age_lane_journal(repository, first_report, hours_ago=stalled_hours)
+
+        second_rc, second_report = run(
+            "planned-stall-2",
+            deadline_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=1),
+        )
+
+        assert second_report["selection"]["planned_scope_count"] == 1
+        assert second_report["selection"]["scope_outcome_counts"] == {"deferred": 1}
+        assert second_rc == 1
+        assert second_report["status"] == "incomplete"
+        stall = [
+            error
+            for error in self._season_work_plan(second_report)["errors"]
+            if error.startswith("no_progress:")
+        ]
+        assert stall, self._season_work_plan(second_report)["errors"]
+        metrics = mod._wave_metrics_line(second_report, second_rc)
+        assert "planned=1" in metrics and "success=0" in metrics
+        assert "deferred=1" in metrics
+        assert f"lane_idle_h={stalled_hours}" in metrics
+
+    @pytest.mark.unit
+    def test_lane_stall_threshold_is_pinned_at_thirty_six_hours(self):
+        """Само значение порога — замер, а не вкус, и оно закреплено тестом.
+
+        Замер 08.09 по 27 backfill-волнам за 21 сутки: 24 ч максимального
+        бэкоффа (`_scope_retry_due`, `planner.TERMINAL_RETRY_AFTER`) плюс ~12 ч
+        самой длинной волны. При 24 ч ложно покраснела бы здоровая волна
+        37cb5061 (27.08, простой 35,9 ч). Час ДО порога обязан быть зелёным.
+        """
+
+        mod = self._module()
+        assert mod.LANE_STALL_AFTER == timedelta(hours=36)
+
+        repository, run = self._history_lane(mod)
+        run("stalled-cycle-1")
+        _second_rc, second_report = run("stalled-cycle-2", retryable=True)
+        below_threshold = int(mod.LANE_STALL_AFTER.total_seconds() // 3600) - 1
+        self._age_lane_journal(
+            repository, second_report, hours_ago=below_threshold
+        )
+
+        third_rc, third_report = run("stalled-cycle-3")
+
+        assert third_report["selection"]["planned_scopes"] == []
+        assert third_rc == 0, third_report["errors"]
+        assert self._season_work_plan(third_report)["errors"] == []
+        assert f"lane_idle_h={below_threshold}" in mod._wave_metrics_line(
+            third_report, third_rc
+        )
+
+    @pytest.mark.unit
+    def test_source_gap_candidate_counts_as_lane_activity(self):
+        """Кандидат в дыру источника — это работа полосы, а не простой.
+
+        Источник ответил и сказал «матчей нет»; закрытия ещё нет (нужно второе
+        наблюдение), но полоса жива. Считать такие часы простоем — вернуть
+        ложную красноту с другой стороны.
+        """
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+
+        run("stalled-cycle-1")
+        _second_rc, second_report = run("stalled-cycle-2", retryable=True)
+        self._age_lane_journal(
+            repository,
+            second_report,
+            hours_ago=int(mod.LANE_STALL_AFTER.total_seconds() // 3600) + 4,
+        )
+        self._age_lane_journal(
+            repository,
+            second_report,
+            hours_ago=2,
+            source_season_key="2023/2024",
+            outcome="retryable",
+            reason="source-advertised finished match payloads absent",
+        )
+
+        third_rc, third_report = run("stalled-cycle-3")
+
+        assert third_report["selection"]["planned_scopes"] == []
+        assert third_rc == 0, third_report["errors"]
+        assert self._season_work_plan(third_report)["errors"] == []
+        assert "lane_idle_h=2" in mod._wave_metrics_line(third_report, third_rc)
 
     @pytest.mark.unit
     def test_automatic_backfill_empty_plan_with_empty_queue_stays_green(self):
@@ -695,7 +895,7 @@ class TestFotmobNativeRunner:
             "obligation=5066 already_complete=589 pending=4477 success=0 "
             "source_gap=0 retryable=0 terminal=0 deferred=0 rows_total=6075 "
             "requests=450 not_modified=367 encoded_bytes=3438525 "
-            "budget_requests_left=19550"
+            "gap_candidate=n/a lane_idle_h=n/a budget_requests_left=19550"
         )
 
     @pytest.mark.unit
@@ -725,6 +925,8 @@ class TestFotmobNativeRunner:
             "requests",
             "not_modified",
             "encoded_bytes",
+            "gap_candidate",
+            "lane_idle_h",
             "budget_requests_left",
         ]
         assert "mode=refresh" in line
@@ -1123,9 +1325,28 @@ class TestFotmobNativeRunner:
             mod, args, service=make_service("missing-match-1")
         )
 
-        assert first_rc == 1
-        assert first_report["status"] == "incomplete"
-        assert first_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+        # Первое наблюдение дыры источника — кандидат, а не отказ волны (#1255):
+        # источник ответил и сказал «матчей нет», ран красить нечем. Но и
+        # зелёной волна быть не может — ни одного скоупа она не закрыла.
+        assert first_rc == 0, first_report["errors"]
+        assert first_report["status"] == "partial_success"
+        assert first_report["complete"] is False
+        first_attempt = first_report["selection"]["scope_attempts"][0]
+        assert first_attempt["outcome"] == "retryable"
+        assert (
+            first_attempt["reason"]
+            == "source-advertised finished match payloads absent"
+        )
+        assert first_report["selection"]["source_gap_candidate_scopes"] == [
+            "47=2025/2026"
+        ]
+        assert not first_report["errors"]
+        assert "gap_candidate=1" in mod._wave_metrics_line(first_report, first_rc)
+
+        from scripts.fotmob_catalog_acceptance import validate_report
+
+        first_continuous = validate_report(first_report, require_full_completion=False)
+        assert first_continuous.ok is True, first_continuous.errors
 
         real_datetime = datetime
 
@@ -1148,6 +1369,9 @@ class TestFotmobNativeRunner:
         assert attempt["attempt_count"] == 2
         assert len(attempt["attempt_identities"]) == 2
         assert len(set(attempt["attempt_identities"])) == 2
+        # Живой 07.09 03:09 (c24436fc): planned=1, success=0, source_gap=1 —
+        # зелёная волна с названной причиной в строке метрик.
+        assert "source_gap=1" in mod._wave_metrics_line(second_report, second_rc)
 
     @pytest.mark.unit
     def test_automatic_run_with_progress_defers_retry_without_failing(self):
@@ -1248,6 +1472,96 @@ class TestFotmobNativeRunner:
         assert validate_report(report, require_full_completion=True).ok is False
         continuous = validate_report(report, require_full_completion=False)
         assert continuous.ok is True, continuous.errors
+
+    @pytest.mark.unit
+    def test_source_gap_candidate_does_not_shield_a_dead_source_in_the_same_wave(self):
+        """Послабление для кандидата в дыру не прикрывает мёртвый источник.
+
+        Кандидат (источник ответил «матчей нет») перестал красить волну, но
+        рядом с ним живёт скоуп с настоящим сетевым отказом и ни одного
+        закрытия. Такая волна обязана остаться красной — иначе послабление
+        воспроизводит ровно ту слепоту «зелёное при нулевом сборе» (#1227),
+        ради которой гейт исходов и вводился.
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService, OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 48, "name": "Second League"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _competition_payload(47, "Premier League")
+            ),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: (
+                _competition_payload(48, "Second League")
+            ),
+            canonicalize_target(
+                "matchDetails", {"matchId": "100"}
+            ).canonical_url: {
+                "error": True,
+                "message": "Data not found",
+                "matchId": "100",
+            },
+        }
+        service = FotMobIngestService(
+            transport=StubTransport(dict(responses)),
+            repository=MemoryFotMobRepository(),
+            mode=RunMode.DAILY,
+            budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+            run_id="gap-and-dead-1",
+            max_workers=2,
+        )
+        real_sync_season = service.sync_season
+
+        def sync_season(competition_id, source_season_key, **kwargs):
+            if int(competition_id) == 48:
+                return (
+                    OperationResult(
+                        "season_bundle",
+                        attempted=1,
+                        retryable=["HTTP 503 from FotMob"],
+                    ),
+                    None,
+                )
+            return real_sync_season(competition_id, source_season_key, **kwargs)
+
+        service.sync_season = sync_season
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "gap-and-dead-1",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert report["selection"]["source_gap_candidate_scopes"] == ["47=2025/2026"]
+        assert report["selection"]["scope_outcome_counts"].get("success", 0) == 0
+        assert rc == 1
+        assert report["status"] == "incomplete"
+        assert report["complete"] is False
 
     @pytest.mark.unit
     def test_schedule_cooldown_returns_after_the_next_kickoff_not_in_two_days(self):
@@ -1756,7 +2070,7 @@ class TestFotmobNativeRunner:
 
         first_rc, first_report = run(first_catalog, "composition-1")
 
-        assert first_rc == 1
+        assert first_rc == 0, first_report["errors"]
         assert first_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
 
         real_datetime = datetime

@@ -86,6 +86,15 @@ _SOURCE_GAP_RETRY_REASON = "source-advertised finished match payloads absent"
 _SOURCE_GAP_REASON = (
     "two successful fetches lacked source-advertised finished match payloads"
 )
+# Порог простоя полосы истории: сколько полоса может не закрывать НИ ОДНОГО
+# скоупа, прежде чем волна признаётся красной. 24 ч — максимальный штатный
+# бэкофф повтора (`_scope_retry_due`) и он же `planner.TERMINAL_RETRY_AFTER`,
+# плюс ~12 ч на самую длинную волну: раньше 36 ч «полоса стоит» недоказуемо.
+# Замер 08.09 по 27 backfill-волнам за 21 сутки: при 36 ч не краснеет ни одна
+# здоровая волна (самый длинный разрыв между закрытиями исправной полосы —
+# 44 ч, из них 16 ч фактического простоя: кандидат в дыру считается
+# активностью), а шесть суток слепоты 26.08–01.09 (#1227) краснеют.
+LANE_STALL_AFTER = timedelta(hours=36)
 
 PUBLICATION_BINDING_ARGUMENTS = {
     "schema": "publication_schema",
@@ -739,6 +748,10 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
     def _mapping(value: Any) -> Mapping[str, Any]:
         return value if isinstance(value, Mapping) else {}
 
+    def _count(value: Any) -> Any:
+        # Отсутствующий список — «неизвестно», а не «ноль» (см. _outcome ниже).
+        return len(value) if isinstance(value, list) else None
+
     def _total(value: Any) -> Any:
         mapping = _mapping(value)
         if not mapping:
@@ -791,6 +804,8 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
         ("requests", transport.get("attempts")),
         ("not_modified", transport.get("not_modified")),
         ("encoded_bytes", transport.get("encoded_bytes")),
+        ("gap_candidate", _count(metadata.get("source_gap_candidate_scopes"))),
+        ("lane_idle_h", metadata.get("lane_idle_hours")),
         ("budget_requests_left", requests_left),
     )
     return " ".join(
@@ -1679,23 +1694,6 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         work_plan.errors.append(
             f"{mode.value} discovered no eligible exact season targets"
         )
-    # Четвёртый барьер цвета: автоматическая полоса истории, запланировавшая
-    # ноль скоупов при непустой очереди кандидатов, обязана быть КРАСНОЙ.
-    # Пустой план не даёт исходов попыток, поэтому ни гейт исходов рана, ни
-    # приёмка каталога такую волну не красят — она шесть дней притворялась
-    # здоровой (#1227). Пустая очередь (всё обязательство уже в журнале)
-    # остаётся законным зелёным завершением.
-    if (
-        not work
-        and automatic_catalog
-        and mode == RunMode.BACKFILL
-        and pending_candidate_scopes
-    ):
-        work_plan.errors.append(
-            f"backfill planned no scopes while {len(pending_candidate_scopes)} "
-            f"of {len(obligation_scopes)} obligation scopes remain outside the "
-            "completion journal: history lane is stalled"
-        )
     if mode == RunMode.DAILY and daily_competition_ids:
         planned_competition_ids = {item.competition_id for item in work}
         missing_current_ids = sorted(daily_competition_ids - planned_competition_ids)
@@ -1771,6 +1769,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     if automatic_catalog:
         operations.append(attempt_operation)
     completed_scopes: list[str] = []
+    # Скоупы, у которых доказательства дыры источника уже собраны, но второго
+    # наблюдения ещё нет. До #1255 такой скоуп шёл в work_plan.retryable и красил
+    # первую попытку, хотя источник честно ответил «матчей нет».
+    source_gap_candidates: list[str] = []
     replay_gap_entries: list[dict[str, Any]] = []
 
     # Complete one exact scope end-to-end before starting the next.  This is
@@ -1988,12 +1990,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 if previous_attempt is not None
                 else ()
             )
-            source_gap = (
+            # Доказательства дыры источника (первое наблюдение) и её признание
+            # (второе наблюдение) разделены: промоушен в source_gap по-прежнему
+            # требует двух независимых наблюдений, а вот КРАСИТЬ волну первое
+            # наблюдение больше не обязано.
+            source_gap_evidence = (
                 automatic_catalog
                 and source_missing_matches > 0
                 and bool(bundle is not None)
                 and all(operation.ok for operation in scope_operations)
                 and not outstanding
+            )
+            source_gap = (
+                source_gap_evidence
                 and previous_attempt is not None
                 and previous_attempt.outcome in {"retryable", "source_gap"}
                 and previous_attempt.reason
@@ -2030,7 +2039,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 )
                 work_plan.succeeded += 1
             else:
-                if not hard_failure or not automatic_catalog:
+                source_gap_candidate = source_gap_evidence and not hard_failure
+                if source_gap_candidate:
+                    # Признак класса сохраняется в отчёте (метаданные плана и
+                    # selection), но не как строка ошибки: иначе кандидат
+                    # красит волну ещё до того, как дыра признана.
+                    source_gap_candidates.append(scope_key)
+                    work_plan.metadata.setdefault(
+                        "source_gap_candidate_scopes", []
+                    ).append(scope_key)
+                elif not hard_failure or not automatic_catalog:
                     work_plan.retryable.append(work_plan_retryable)
                 next_due = _scope_retry_due(
                     (previous_attempt.attempt_count + 1 if previous_attempt else 1),
@@ -2360,6 +2378,72 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             reason=state_reason,
         )
         deferred_scope_targets.add(token)
+    # Четвёртый барьер цвета судит полосу истории по ПРОДВИЖЕНИЮ, а не по
+    # размеру плана. Пустой план backfill сам по себе законен: единственный
+    # кандидат новейшего цикла может штатно остывать после повтора (барьер
+    # planner.py:319-333) — волна 1c53cb66 06.09 краснела именно на этом
+    # штатном остывании. Красным полосу делает другое: она давно не закрыла ни
+    # одного скоупа при непустой очереди обязательства (#1227, шесть суток
+    # слепоты 26.08–01.09). Активностью считаются закрытия (success/source_gap)
+    # и кандидаты в дыру источника — источник ответил, полоса работает.
+    #
+    # Барьер стоит ДО finish(): отчёт волны сериализуется там, а гейт исходов
+    # ниже читает те же живые операции — ошибка попадает и в отчёт, и в цвет.
+    if automatic_catalog:
+        # Пустой список кандидатов — доказанный ноль, а не «неизвестно»: у
+        # полной автоматической волны метрика обязана печатать 0, а n/a
+        # остаётся усечённому отчёту.
+        work_plan.metadata["source_gap_candidate_scopes"] = list(
+            source_gap_candidates
+        )
+    if automatic_catalog and mode == RunMode.BACKFILL:
+        lane_closed_now = sum(
+            1
+            for entry in attempt_operation.metadata.get("outcomes", ())
+            if isinstance(entry, Mapping)
+            and str(entry.get("outcome")) in {"success", "source_gap"}
+        )
+        lane_last_activity = max(
+            (
+                state.last_attempt_at
+                for state in attempt_states.values()
+                if state.outcome in {"success", "source_gap"}
+                or (
+                    state.outcome == "retryable"
+                    and state.reason == _SOURCE_GAP_RETRY_REASON
+                )
+            ),
+            default=None,
+        )
+        lane_idle = (
+            None
+            if lane_last_activity is None
+            else datetime.now(timezone.utc).replace(tzinfo=None) - lane_last_activity
+        )
+        lane_idle_hours = (
+            None if lane_idle is None else int(lane_idle.total_seconds() // 3600)
+        )
+        # Работа ЭТОГО рана обнуляет простой: волна, закрывшая скоуп прямо
+        # сейчас, не может рапортовать вчерашние часы простоя, а первая волна
+        # на пустом журнале — «неизвестно».
+        work_plan.metadata["lane_idle_hours"] = (
+            0 if (lane_closed_now or source_gap_candidates) else lane_idle_hours
+        )
+        if (
+            pending_candidate_scopes
+            and lane_closed_now == 0
+            and not source_gap_candidates
+            # Пустой журнал (сутки после подъёма PARSER_VERSION) часов не даёт:
+            # неизвестность красноты не создаёт — осознанно.
+            and lane_idle is not None
+            and lane_idle > LANE_STALL_AFTER
+        ):
+            work_plan.errors.append(
+                f"no_progress: history lane closed no scope for "
+                f"{lane_idle_hours}h while {len(pending_candidate_scopes)} of "
+                f"{len(obligation_scopes)} obligation scopes remain outside the "
+                "completion journal"
+            )
     rc, payload = finish()
     replay_missing_inputs = (
         _replay_missing_raw_evidence(
@@ -2412,12 +2496,28 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         # Гейт судит ран по тому, что сделал он сам. Карта состояний под
         # стабильной подписью — это история всей полосы, включая скоупы, до
         # которых это окно не дошло.
-        run_outcomes = tuple(
-            str(entry.get("outcome"))
+        run_outcome_entries = tuple(
+            entry
             for entry in attempt_operation.metadata.get("outcomes", ())
             if isinstance(entry, Mapping)
         )
-        retryable_attempts = "retryable" in run_outcomes
+        run_outcomes = tuple(
+            str(entry.get("outcome")) for entry in run_outcome_entries
+        )
+        # Кандидат в дыру источника записан в журнал как retryable — это верно
+        # для планировщика (признание дыры требует второго наблюдения), но для
+        # цвета волны это не отказ: источник ответил, и ответил «матчей нет».
+        # Красить первую попытку было ложной краснотой (#1255, волна 51dc3d2a
+        # 06.09: planned=1, retryable=1, rc=1 при исправном источнике).
+        gap_candidate_scopes = set(source_gap_candidates)
+        retryable_attempts = any(
+            str(entry.get("outcome")) == "retryable"
+            and format_scope_token(
+                entry.get("competition_id"), entry.get("source_season_key")
+            )
+            not in gap_candidate_scopes
+            for entry in run_outcome_entries
+        )
         terminal_attempts = "terminal" in run_outcomes
         # Закрытый скоуп — единственное доказательство, что ран вообще работал.
         # source_gap закрывает скоуп с признанной дырой источника, это тоже
@@ -2434,6 +2534,9 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             for outcome in sorted(set(run_outcomes))
         }
         payload["selection"]["planned_scope_count"] = len(planned_scopes)
+        payload["selection"]["source_gap_candidate_scopes"] = list(
+            source_gap_candidates
+        )
         unauthorized_operation_retries = any(
             not _is_budget_deferral_error(reason)
             for operation in operations
@@ -2475,6 +2578,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             retryable_attempts
             or unauthorized_operation_retries
             or automatic_deferrals
+            or source_gap_candidates
         ):
             payload["status"] = "partial_success"
             payload["complete"] = False
