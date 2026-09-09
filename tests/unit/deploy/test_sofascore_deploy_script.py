@@ -888,22 +888,29 @@ def test_a_parked_scope_in_another_pool_is_waited_for_with_a_diagnosis(tmp_path:
 
 
 @pytest.mark.unit
-def test_the_breaker_refuses_a_batch_bigger_than_one(tmp_path: Path) -> None:
-    """Боевой SOFASCORE_HISTORY_BATCH_SIZE не задан (batch=1), и версия поддерживает только
-    его: при двух mapped-скоупах «сломать тупик» значило бы погасить учёт соседнего,
-    возможно успешного, скоупа. Ломатель зовётся, но не меняет НИЧЕГО."""
+def test_the_breaker_fails_only_the_parked_scopes_of_a_batch(tmp_path: Path) -> None:
+    """Батч из трёх скоупов (#1248 ступень 1): один ещё работает, два припаркованы в
+    осушённом пуле. Пятое число deploy.sh считает ЛЮБОЙ scheduled/up_for_retry, поэтому
+    ломатель обязан погасить ровно то же множество — иначе прогон не закроется и ночь
+    уйдёт без доставки. Работающий скоуп не трогаем: его учёт закроют validate и finalize."""
     r = _deploy(
         tmp_path,
         idle_wait="60",
         world=dict(scope_state="running", scope_try=1, extra_scope=(1, "scheduled", 1)),
+        seed_sql=(
+            "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
+            f" VALUES ('{HIST}','{_RUN_ID}','run_historical_scope',2,'up_for_retry',"
+            "'sofascore_history_pool',1);"
+        ),
     )
 
     assert r.proc.returncode == 4, r.out
     assert r.breaker_calls, "пятое число > 0 — ломателя обязаны позвать"
-    assert "batch>1 не поддержан" in r.log
-    assert sorted(s for (s,) in rows(
-        r.state_dir, "SELECT state FROM task_instance WHERE task_id='run_historical_scope'"
-    )) == ["running", "scheduled"]
+    assert "batch>1 не поддержан" not in r.log
+    assert dict(rows(
+        r.state_dir,
+        "SELECT map_index, state FROM task_instance WHERE task_id='run_historical_scope'",
+    )) == {0: "running", 1: "failed", 2: "failed"}
 
 
 @pytest.mark.unit

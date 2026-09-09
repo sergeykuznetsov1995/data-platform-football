@@ -39,8 +39,11 @@ POOL = "sofascore_history_pool"
 BREAKER = ROOT / "deploy" / "sofascore" / "drain_breaker.py"
 
 
-def _campaign_files(root: Path) -> tuple[Path, Path]:
-    """Снимок кампании и политика, связанные так же, как в бою (одна пара digest-ов)."""
+def _campaign_files(root: Path, seasons: int = 1) -> tuple[Path, Path]:
+    """Снимок кампании и политика, связанные так же, как в бою (одна пара digest-ов).
+
+    ``seasons`` > 1 даёт снимок, из которого планировщик набирает батч (#1248 ступень 1).
+    """
 
     sys.path[:0] = [str(ROOT), str(ROOT / "dags")]
     from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
@@ -54,14 +57,14 @@ def _campaign_files(root: Path) -> tuple[Path, Path]:
         "capture_key": "SS-17",
         "metadata_status": "ready",
         "seasons": [{
-            "source_season_id": 1725,
-            "canonical_season": "2526",
-            "start_year": 2025,
+            "source_season_id": 1725 - offset,
+            "canonical_season": "%d%d" % (25 - offset, 26 - offset),
+            "start_year": 2025 - offset,
             "season_format": "split_year",
             "team_count": 20,
             "metadata_status": "ready",
             "team_count_evidence": {"count": 20, "endpoint": "/teams"},
-        }],
+        } for offset in range(seasons)],
     }]
     policy = {
         "schema_version": 1,
@@ -84,6 +87,24 @@ def _campaign_files(root: Path) -> tuple[Path, Path]:
     snapshot_path.write_text(json.dumps(document), encoding="utf-8")
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
     return snapshot_path, policy_path
+
+
+def _bind_orm(sql_alchemy_conn: str) -> None:
+    """Привязать ORM Airflow к нужной базе.
+
+    Настройки Airflow процессные: соседний модуль airflow_real (batch isolation) поднимает
+    свою базу и свой ORM, и без явной привязки `create_session` пришёл бы в чужой — а после
+    его tearDownClass и вовсе в удалённый — файл.
+    """
+
+    from airflow import settings
+    from airflow.configuration import conf
+
+    if not conf.has_section("database"):
+        conf.add_section("database")
+    conf.set("database", "sql_alchemy_conn", sql_alchemy_conn)
+    settings.SQL_ALCHEMY_CONN = sql_alchemy_conn
+    settings.configure_orm()
 
 
 class DrainBreakerOnRealAirflow(unittest.TestCase):
@@ -116,6 +137,7 @@ class DrainBreakerOnRealAirflow(unittest.TestCase):
         }
         os.environ.update(cls.env)
         (cls.tmp / "airflow").mkdir()
+        _bind_orm(cls.env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"])
         subprocess.run(
             [str(Path(sys.executable).with_name("airflow")), "db", "migrate"],
             env=cls.env, check=True, capture_output=True,
@@ -233,10 +255,17 @@ class DrainBreakerOnRealAirflow(unittest.TestCase):
         dag_run.refresh_from_db()
         self.assertEqual(self._state(dag_run, "run_historical_scope", 0), "failed")
 
-        # Дальше — настоящий планировщик: validate-плейсхолдер получает upstream_failed,
-        # finalize стартует по all_done и пишет отказ в failures.json.
+        # Дальше — настоящий планировщик. С all_done (#1248 ступень 1) validate своего
+        # скоупа больше не гасится соседями по батчу: он доходит до собственной проверки,
+        # не находит результата и падает сам; finalize стартует по all_done и пишет отказ
+        # в failures.json.
         self._advance(dag_run)
-        self.assertEqual(self._state(dag_run, "validate_historical_scope", -1), "upstream_failed")
+        self.assertEqual(self._state(dag_run, "validate_historical_scope", 0), "scheduled")
+        with self.assertRaises(Exception):
+            self._run_task(dag_run, "validate_historical_scope", map_index=0)
+        dag_run.refresh_from_db()
+        self.assertEqual(self._state(dag_run, "validate_historical_scope", 0), "failed")
+        self._advance(dag_run)
         self._run_task(dag_run, "finalize_historical_run")
         failures = json.loads(self.failures_path.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -351,32 +380,43 @@ class DrainBreakerOnRealAirflow(unittest.TestCase):
         self.assertEqual(missing.returncode, 0, missing.stderr)
         self.assertIn("отказ — прогона", missing.stdout)
 
-    def test_the_breaker_refuses_a_batch_bigger_than_one(self) -> None:
+    def test_the_breaker_fails_only_the_parked_scopes_of_a_batch(self) -> None:
+        """Батч (#1248 ступень 1): припаркованные скоупы гасим, работающий — нет.
+
+        Пятое число deploy.sh считает любой scheduled/up_for_retry в осушённом пуле,
+        поэтому ломатель обязан погасить ровно это множество — иначе прогон не закроется
+        и ночь уйдёт без доставки."""
         from airflow.models import TaskInstance
         from airflow.utils.session import create_session
 
         dag_run = self._plan_and_expand("real-batch")
-        self._park_retry(dag_run)
         with create_session() as session:
-            source = dag_run.get_task_instance("run_historical_scope", map_index=0, session=session)
-            twin = TaskInstance(
-                self.dag.get_task("run_historical_scope"),
-                run_id=dag_run.run_id,
-                map_index=1,
+            running = dag_run.get_task_instance(
+                "run_historical_scope", map_index=0, session=session
             )
-            twin.state = "scheduled"
-            twin.pool = POOL
-            twin.try_number = 1
-            session.merge(twin)
+            running.state = "running"
+            running.try_number = 1
+            running.pool = POOL
+            session.merge(running)
+            for map_index, state in ((1, "scheduled"), (2, "up_for_retry")):
+                twin = TaskInstance(
+                    self.dag.get_task("run_historical_scope"),
+                    run_id=dag_run.run_id,
+                    map_index=map_index,
+                )
+                twin.state = state
+                twin.pool = POOL
+                twin.try_number = 1
+                session.merge(twin)
             session.commit()
-            self.assertEqual(source.map_index, 0)
 
         proc = self._break(dag_run.run_id)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("batch>1 не поддержан", proc.stdout)
+        self.assertNotIn("batch>1 не поддержан", proc.stdout)
         dag_run.refresh_from_db()
-        self.assertEqual(self._state(dag_run, "run_historical_scope", 0), "up_for_retry")
-        self.assertEqual(self._state(dag_run, "run_historical_scope", 1), "scheduled")
+        self.assertEqual(self._state(dag_run, "run_historical_scope", 0), "running")
+        self.assertEqual(self._state(dag_run, "run_historical_scope", 1), "failed")
+        self.assertEqual(self._state(dag_run, "run_historical_scope", 2), "failed")
 
     def test_the_placeholder_row_is_never_touched(self) -> None:
         """map_index = -1 — не скоуп, а NULL-плейсхолдер нераскрытой карты."""
