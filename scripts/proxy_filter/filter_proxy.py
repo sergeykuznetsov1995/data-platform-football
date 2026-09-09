@@ -318,10 +318,16 @@ _TLS_ECH_EXTENSION_TYPES = frozenset({0xFE0D, 0xFFCE})
 # these bounds the lease's only tunnel hangs forever (byte-metered head read),
 # never drains ``active_tunnels`` and latches the single serial SofaScore slot
 # (#946).  The connect/head reads are bounded, and a re-pin to a fresh exit is
-# allowed only before the first provider byte has been billed.
+# allowed only while every provider byte billed on the lease is provably
+# complete — none at all, or a rejected CONNECT response this call metered whole
+# (#1247 A2).
 LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = 5.0
 LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS = 4.0
 LEASE_UPSTREAM_FAILOVER_ATTEMPTS = 2
+# A dead Decodo exit answers the first CONNECT with a small non-TLS error
+# page and closes (#1247 A2).  Draining that bounded body proves the whole
+# response, so the lease may re-pin instead of retaining its escrow.
+DEAD_EXIT_RESPONSE_MAX_BYTES = 1024
 SOFASCORE_EXIT_PROBE_HOST = "api.ipify.org"
 CONTROL_TOKEN = ""
 TRANSFERMARKT_CONTROL_TOKEN = ""
@@ -406,6 +412,15 @@ class UpstreamHeadTimeout(RuntimeError):
 
 class UpstreamHeadIncomplete(RuntimeError):
     """The residential upstream closed before a complete response head arrived."""
+
+
+class _DeadExitResponse(RuntimeError):
+    """The provider rejected the first tunnel's CONNECT and its whole response
+    was observed (EOF or an exact Content-Length).
+
+    Nothing is left in transport read-ahead, so the lease may fail over to a
+    fresh exit instead of latching accounting uncertainty.
+    """
 
 
 class _LeaseBudgetRefused(Exception):
@@ -989,6 +1004,9 @@ class Lease:
     close_recorded: bool = False
     budget_exceeded: bool = False
     accounting_uncertain: bool = False
+    # Why the escrow was retained. Written once by the latch (first cause
+    # wins) so the gateway log and the lease report can attribute it.
+    accounting_uncertain_reason: str = ""
     # An append error is ambiguous: the event may have reached the filesystem
     # before fsync failed. Never retry or release that reservation in-process,
     # because doing so could durably charge the same provider bytes twice.
@@ -1048,6 +1066,7 @@ class Lease:
             "expired": self.expired,
             "budget_exceeded": self.budget_exceeded,
             "accounting_uncertain": self.accounting_uncertain,
+            "accounting_uncertain_reason": self.accounting_uncertain_reason,
             "paid_ledger_uncertain": self.paid_ledger_uncertain,
             "pending_provider_bytes": pending_provider_bytes,
             "durably_settled_provider_bytes": settled_provider_bytes,
@@ -3824,7 +3843,7 @@ def _flush_whoscored_metering(lease: Lease) -> int:
     return amount
 
 
-def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
+def _latch_lease_accounting_uncertainty(lease: Lease, *, reason: str) -> None:
     """Revoke uncertain provider accounting without returning any escrow."""
 
     if lease.accounting_uncertain:
@@ -3841,6 +3860,9 @@ def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
                 lease.lease_id,
             )
     lease.accounting_uncertain = True
+    # First cause wins: the idempotence guard above already returned for a
+    # lease that was latched earlier, so this never overwrites the origin.
+    lease.accounting_uncertain_reason = reason
     lease.latched_at = _wall_time()
     lease.closed = True
     lease.budget_exceeded = True
@@ -3865,8 +3887,10 @@ def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
                 lease.lease_id,
             )
     log.critical(
-        "provider byte accounting is uncertain; lease %s escrow is retained",
+        "provider byte accounting is uncertain; lease %s escrow is retained; "
+        "reason=%s",
         lease.lease_id,
+        reason,
     )
 
 
@@ -3877,13 +3901,13 @@ def _settle_observed_lease_bytes(
     host: str,
     direction: str,
     count: int,
-    force_uncertain: bool = False,
+    uncertain_reason: str | None = None,
 ) -> None:
     """Convert a local I/O reservation to durable spend, or retain it forever."""
 
     if count <= 0:
-        if force_uncertain:
-            _latch_lease_accounting_uncertainty(lease)
+        if uncertain_reason:
+            _latch_lease_accounting_uncertainty(lease, reason=uncertain_reason)
         else:
             _release_lease_reservation(lease, reservation)
         return
@@ -3893,16 +3917,16 @@ def _settle_observed_lease_bytes(
         # Bytes were already queued to or read from the provider. Never release
         # either the local reservation or the lease-wide durable escrow when
         # exact accounting cannot be proven.
-        _latch_lease_accounting_uncertainty(lease)
+        _latch_lease_accounting_uncertainty(lease, reason="ledger_charge_failed")
         raise
-    if force_uncertain:
+    if uncertain_reason:
         # The observed prefix is exact, but cancellation/read failure can leave
         # additional provider bytes inside transport read-ahead. Convert the
         # exact prefix from reserved allowance to durable spend, then retain
         # only the unconsumed reservation as unknown.  Otherwise the reaper
         # would conservatively charge the already-accounted prefix twice.
         _release_lease_reservation(lease, min(reservation, count))
-        _latch_lease_accounting_uncertainty(lease)
+        _latch_lease_accounting_uncertainty(lease, reason=uncertain_reason)
         return
     _release_lease_reservation(lease, reservation)
 
@@ -3955,7 +3979,7 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
             # Any background/browser byte without an active gateway-installed
             # owner is unattributable. Retain the full escrow and durably revoke
             # the campaign before refusing the chunk.
-            _latch_lease_accounting_uncertainty(lease)
+            _latch_lease_accounting_uncertainty(lease, reason="whoscored_unowned_bytes")
             raise RuntimeError("WhoScored provider bytes have no active endpoint owner")
         if WHOSCORED_METER_BATCH_BYTES <= 0:
             raise RuntimeError("WhoScored metering batch must be positive")
@@ -4279,6 +4303,9 @@ async def _pump(
     if lease is not None and budget_guard is not None:
         raise ValueError("lease and legacy budget guard are mutually exclusive")
     provider_eof_observed = False
+    # Name of the exception swallowed by the proxy boundary below, so a latch
+    # in ``finally`` can attribute why the provider EOF was never observed.
+    swallowed = "none"
     # Set when the client leg failed mid-response: the provider is then drained
     # to EOF (still metered per chunk) without forwarding anything further.
     client_gone = False
@@ -4343,7 +4370,7 @@ async def _pump(
                         try:
                             await _wait_for_reservation_turnover(lease)
                         except (asyncio.TimeoutError, TimeoutError):
-                            _latch_lease_accounting_uncertainty(lease)
+                            _latch_lease_accounting_uncertainty(lease, reason="down_reservation_wait_timeout")
                             raise
                     if reservation <= 0:
                         break
@@ -4380,14 +4407,14 @@ async def _pump(
                     # already contain billed read-ahead, even when this is the
                     # client->provider pump. Revoke the lease, close both ends,
                     # and retain every unproven escrow byte.
-                    _latch_lease_accounting_uncertainty(lease)
+                    _latch_lease_accounting_uncertainty(lease, reason="client_hangup_drain_timeout" if client_gone else "tunnel_read_timeout")
                 raise
             except BaseException:
                 if lease is not None:
                     if direction == "down":
                         # A cancelled provider read can leave unobservable
                         # transport-buffered bytes. Retain the reservation.
-                        _latch_lease_accounting_uncertainty(lease)
+                        _latch_lease_accounting_uncertainty(lease, reason="provider_read_error")
                     else:
                         _release_lease_reservation(lease, reservation)
                 raise
@@ -4395,7 +4422,7 @@ async def _pump(
                 # A cancellation-resistant reader or an event-loop stall can
                 # return after wait_for's deadline. Never turn those bytes into
                 # ordinary post-expiry settlement or forward them downstream.
-                _latch_lease_accounting_uncertainty(lease)
+                _latch_lease_accounting_uncertainty(lease, reason="lease_expired_during_read")
                 raise asyncio.TimeoutError("paid lease expired during read")
             if lease is not None and direction == "down" and not chunk:
                 # StreamReader returns EOF only after its internal buffer has
@@ -4437,7 +4464,7 @@ async def _pump(
                         try:
                             await _wait_for_reservation_turnover(lease)
                         except (asyncio.TimeoutError, TimeoutError):
-                            _latch_lease_accounting_uncertainty(lease)
+                            _latch_lease_accounting_uncertainty(lease, reason="up_reservation_wait_timeout")
                             raise
                         continue
                     prefix_size = min(len(pending), available)
@@ -4477,18 +4504,23 @@ async def _pump(
             except BaseException:
                 if lease is not None and direction == "down":
                     # Cancellation leaves the provider read-ahead unobservable.
-                    _latch_lease_accounting_uncertainty(lease)
+                    _latch_lease_accounting_uncertainty(lease, reason="client_write_cancelled")
                 raise
             if lease is None:
                 counter[host] += len(chunk)
-    except Exception:  # noqa: BLE001 — proxy must never crash a flow
-        pass
+    except Exception as exc:  # noqa: BLE001 — proxy must never crash a flow
+        swallowed = type(exc).__name__
+    except BaseException as exc:
+        # Cancellation still propagates; only the diagnostic name is recorded,
+        # because ``finally`` latches before the caller can attribute it.
+        swallowed = type(exc).__name__
+        raise
     finally:
         if lease is not None and direction == "down" and not provider_eof_observed:
             # Includes TTL/closed/budget refusal before a read, reservation
             # errors swallowed by the proxy boundary, and cancellation between
             # chunks. Only an observed provider EOF may release the lifecycle.
-            _latch_lease_accounting_uncertainty(lease)
+            _latch_lease_accounting_uncertainty(lease, reason=f"pump_exit_without_provider_eof:{swallowed}")
         if provider_reader_registered:
             lease.active_provider_readers = max(0, lease.active_provider_readers - 1)
             _ACTIVE_PROVIDER_READERS = max(0, _ACTIVE_PROVIDER_READERS - 1)
@@ -4543,7 +4575,7 @@ async def _run_tunnel_pumps(
             # Cancellation can reach gather before the down coroutine executes
             # its first provider read, while the transport already owns billed
             # response bytes. Retain all remaining escrow in that handoff gap.
-            _latch_lease_accounting_uncertainty(lease)
+            _latch_lease_accounting_uncertainty(lease, reason="tunnel_pumps_cancelled")
         raise
     finally:
         # The up pump only half-closes the provider leg (see _pump).
@@ -4638,13 +4670,118 @@ async def _reject_client_head(
     writer.close()
 
 
+def _dead_exit_body_length(lines: list[bytes]) -> int | None:
+    """Return a provably exact response body length, or ``None``.
+
+    ``_header_map`` silently keeps the last of repeated headers, which is not a
+    proof: a duplicated or non-numeric ``Content-Length``, or any
+    ``Transfer-Encoding``, leaves the body length ambiguous.  The drain then
+    accepts only a real provider EOF as evidence that nothing is left billed
+    inside transport read-ahead.
+    """
+
+    length: int | None = None
+    for line in lines:
+        try:
+            name, value = line.decode("latin1").split(":", 1)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        lowered = name.strip().lower()
+        rendered = value.strip()
+        if lowered == "transfer-encoding":
+            return None
+        if lowered != "content-length":
+            continue
+        if (
+            length is not None
+            # int() raises ValueError past CPython's digit limit, and any body
+            # that long is over the cap anyway: refuse instead of parsing.
+            or len(rendered) > 19
+            or not (rendered.isascii() and rendered.isdigit())
+        ):
+            return None
+        length = int(rendered)
+    return length
+
+
+async def _drain_dead_exit_response(
+    reader: asyncio.StreamReader,
+    lease: Lease,
+    host: str,
+    *,
+    already: int,
+    content_length: int | None,
+) -> int | None:
+    """Settle the body of a rejected first-tunnel CONNECT, or refuse to guess.
+
+    Returns the number of body bytes metered when the response is provably
+    complete — the provider closed (EOF) or its ``Content-Length`` was matched
+    exactly — which means no billed byte can still hide in transport
+    read-ahead.  Returns ``None`` when the tail stays unproven (over
+    ``DEAD_EXIT_RESPONSE_MAX_BYTES``, or silent past
+    ``LEASE_CLIENT_HANGUP_DRAIN_SECONDS``); the outstanding reservation is then
+    deliberately *not* released, so the caller's latch retains it.
+    """
+
+    if already >= DEAD_EXIT_RESPONSE_MAX_BYTES:
+        # The head alone already spent this attempt's dead-exit budget; even a
+        # provably empty body must not buy a re-pin past the declared ceiling.
+        return None
+    body = 0
+    deadline = time.monotonic() + LEASE_CLIENT_HANGUP_DRAIN_SECONDS
+    while True:
+        if content_length is not None and body >= content_length:
+            return body
+        wanted = DEAD_EXIT_RESPONSE_MAX_BYTES - (already + body)
+        if content_length is not None:
+            wanted = min(wanted, content_length - body)
+        if wanted <= 0:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        reservation = _reserve_lease_bytes(lease, wanted)
+        if reservation <= 0:
+            lease.budget_exceeded = True
+            return None
+        try:
+            chunk = await asyncio.wait_for(reader.read(reservation), remaining)
+        except (asyncio.TimeoutError, TimeoutError):
+            return None
+        except BaseException:
+            _settle_observed_lease_bytes(
+                lease,
+                reservation=reservation,
+                host=host,
+                direction="down",
+                count=0,
+                uncertain_reason="dead_exit_drain_cancelled",
+            )
+            raise
+        if not chunk:
+            _release_lease_reservation(lease, reservation)
+            return body
+        _settle_observed_lease_bytes(
+            lease,
+            reservation=reservation,
+            host=host,
+            direction="down",
+            count=len(chunk),
+        )
+        body += len(chunk)
+
+
 async def _read_metered_provider_head(
     reader: asyncio.StreamReader,
     lease: Lease,
     host: str,
     timeout_seconds: float | None = None,
-) -> tuple[bytes, list[bytes]]:
+) -> tuple[bytes, list[bytes], int]:
     """Read an upstream HTTP response head without crossing a paid budget.
+
+    Returns the status line, the header lines and the exact number of provider
+    bytes this call settled — the caller cannot recover that count from the
+    shared lease counter, which any concurrent tunnel may also advance.
 
     ``StreamReader.readline`` has no per-call byte limit. Reading the provider
     response one byte at a time under one pre-reserved window is deliberate:
@@ -4670,14 +4807,14 @@ async def _read_metered_provider_head(
     timed_out = False
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
 
-    def settle_payload(*, force_uncertain: bool = False) -> None:
+    def settle_payload(*, uncertain_reason: str | None = None) -> None:
         _settle_observed_lease_bytes(
             lease,
             reservation=reservation,
             host=host,
             direction="down",
             count=len(payload),
-            force_uncertain=force_uncertain,
+            uncertain_reason=uncertain_reason,
         )
 
     try:
@@ -4701,14 +4838,20 @@ async def _read_metered_provider_head(
                 complete = True
                 break
     except BaseException:
-        settle_payload(force_uncertain=True)
+        settle_payload(uncertain_reason="provider_head_read_cancelled")
         raise
     # A timeout (including one before the first visible byte) or exhausting the
     # bounded head window can leave provider bytes in StreamReader/transport
     # read-ahead.  Charge the exact visible prefix, revoke the lease and retain
     # every remaining escrow byte instead of treating the exit as retryable.
     settle_payload(
-        force_uncertain=timed_out or (not complete and len(payload) >= reservation)
+        uncertain_reason=(
+            "provider_head_timeout"
+            if timed_out
+            else "provider_head_over_budget"
+            if not complete and len(payload) >= reservation
+            else None
+        )
     )
     if timed_out:
         raise UpstreamHeadTimeout("provider response head timed out")
@@ -4720,7 +4863,7 @@ async def _read_metered_provider_head(
     lines = bytes(payload).splitlines(keepends=True)
     if not lines:
         raise RuntimeError("empty provider response head")
-    return lines[0], lines[1:-1]
+    return lines[0], lines[1:-1], len(payload)
 
 
 def _provider_connect_status_code(status: bytes) -> int | None:
@@ -5037,7 +5180,7 @@ def _reap_expired_leases() -> int:
             # A provider StreamReader can contain unobservable read-ahead, so
             # production leases retain all remaining escrow and claims.
             if lease.source in {"sofascore", "whoscored"}:
-                _latch_lease_accounting_uncertainty(lease)
+                _latch_lease_accounting_uncertainty(lease, reason="ttl_expired_with_open_tunnels")
             else:
                 lease.closed = True
                 for tunnel_writer in tuple(lease.tunnel_writers):
@@ -5095,13 +5238,13 @@ def _reap_expired_leases() -> int:
             try:
                 _flush_whoscored_metering(lease)
             except Exception:  # noqa: BLE001 - retain escrow and revoke
-                _latch_lease_accounting_uncertainty(lease)
+                _latch_lease_accounting_uncertainty(lease, reason="whoscored_expiry_flush_failed")
                 continue
             if (
                 _pending_whoscored_provider_bytes(lease)
                 or lease.settled_whoscored_bytes != lease.total_bytes
             ):
-                _latch_lease_accounting_uncertainty(lease)
+                _latch_lease_accounting_uncertainty(lease, reason="whoscored_expiry_meter_mismatch")
                 continue
             released = _whoscored_campaign_ledger().release_provider_reservation(
                 lease.proxy_campaign_approval,
@@ -5195,13 +5338,13 @@ async def _close_lease(
         try:
             _flush_whoscored_metering(lease)
         except Exception:  # noqa: BLE001 - terminal response must stay red
-            _latch_lease_accounting_uncertainty(lease)
+            _latch_lease_accounting_uncertainty(lease, reason="whoscored_close_flush_failed")
             drained = False
         if drained and (
             _pending_whoscored_provider_bytes(lease)
             or lease.settled_whoscored_bytes != lease.total_bytes
         ):
-            _latch_lease_accounting_uncertainty(lease)
+            _latch_lease_accounting_uncertainty(lease, reason="whoscored_close_meter_mismatch")
             drained = False
     if drained and lease.current_request_id:
         _finish_endpoint_request(lease, lease.current_request_id)
@@ -6055,7 +6198,7 @@ async def _write_upstream(
         if lease is not None:
             # A transport may have accepted a prefix before surfacing an error.
             # Treat the complete pre-I/O reservation as unknown provider spend.
-            _latch_lease_accounting_uncertainty(lease)
+            _latch_lease_accounting_uncertainty(lease, reason="provider_write_error")
         raise
     if lease is not None:
         _settle_observed_lease_bytes(
@@ -6079,7 +6222,7 @@ async def _write_upstream(
             # be buffered on the paired reader even though drain reports failure.
             # Outbound bytes are exact above; inbound read-ahead is not, so the
             # lease cannot safely fail over or return its remaining escrow.
-            _latch_lease_accounting_uncertainty(lease)
+            _latch_lease_accounting_uncertainty(lease, reason="provider_drain_error")
         raise
     return True
 
@@ -6106,7 +6249,7 @@ async def _open_lease_upstream_tunnel(
     target: str,
     host: str,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes, list[bytes]]:
-    """Open a lease CONNECT tunnel, failing over only a proven empty EOF/reset.
+    """Open a lease CONNECT tunnel, failing over only on a proven-complete exit.
 
     A dead exit accepts the TCP connection and then never answers the CONNECT.
     Each attempt dials the lease's currently-pinned exit, sends the CONNECT head
@@ -6116,11 +6259,25 @@ async def _open_lease_upstream_tunnel(
     one-attempt contract never re-pins even after a zero-byte TCP failure.  A
     head timeout is never retryable for any source: transport read-ahead makes
     its provider-byte total unknowable, so the reader latches accounting
-    uncertainty and makes the lease unusable.  Every failed attempt closes its
+    uncertainty and makes the lease unusable.  A non-200 CONNECT on the first
+    SofaScore tunnel is retryable only after this call meters the whole
+    rejection itself (EOF or an unambiguous Content-Length); the failover gate
+    compares the lease counter against that self-measured total, so bytes billed
+    by a concurrent tunnel refuse the re-pin instead of certifying it.  Every failed attempt closes its
     socket and unregisters it from ``tunnel_writers``. Credentials and
     ``host:port`` are never logged — only non-reversible fingerprint hashes.
     """
     last_error: BaseException | None = None
+    # Only a lease that has not billed a single response byte can still be on a
+    # dead exit.  The flag is computed once: after the first drained rejection
+    # the lease already owns that exit's response bytes (down 251 in the field),
+    # yet the next attempt is still part of the same dead-exit failover.
+    first_tunnel = lease.source == "sofascore" and lease.down_bytes == 0
+    # Response bytes billed by this call that are provably complete.  Only a
+    # fully drained dead-exit rejection adds to it, so the failover gate below
+    # stays "no unproven provider byte has been billed" rather than degrading
+    # to "no byte at all" after the first drained exit.
+    observed_down_bytes = 0
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
         up_host, up_port, up_user, up_pass = lease.upstream
         srv_w = None
@@ -6147,7 +6304,7 @@ async def _open_lease_upstream_tunnel(
                 srv_w, connect_request, lease=lease, host=host, direction="up"
             ):
                 raise _LeaseBudgetRefused()
-            status, response_headers = await _read_metered_provider_head(
+            status, response_headers, head_bytes = await _read_metered_provider_head(
                 srv_r,
                 lease,
                 host,
@@ -6156,6 +6313,34 @@ async def _open_lease_upstream_tunnel(
                     ceiling_seconds=LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS,
                 ),
             )
+            code = _provider_connect_status_code(status)
+            if first_tunnel and code != 200:
+                drained = await _drain_dead_exit_response(
+                    srv_r,
+                    lease,
+                    host,
+                    already=head_bytes,
+                    content_length=_dead_exit_body_length(response_headers),
+                )
+                if drained is None:
+                    log.warning(
+                        "lease %s dead exit response did not end within "
+                        "%d bytes/%.1fs; latching",
+                        lease.lease_id,
+                        DEAD_EXIT_RESPONSE_MAX_BYTES,
+                        LEASE_CLIENT_HANGUP_DRAIN_SECONDS,
+                    )
+                    return srv_r, srv_w, status, response_headers
+                log.warning(
+                    "lease %s dead exit on first tunnel: CONNECT %s rejected "
+                    "with status %s, whole %d-byte response metered",
+                    lease.lease_id,
+                    _upstream_fingerprint(lease.upstream),
+                    code,
+                    head_bytes + drained,
+                )
+                observed_down_bytes += head_bytes + drained
+                raise _DeadExitResponse()
             return srv_r, srv_w, status, response_headers
         except BaseException as exc:
             # No failed attempt may leak its socket or its tunnel_writers entry.
@@ -6173,6 +6358,7 @@ async def _open_lease_upstream_tunnel(
                     OSError,
                     UpstreamHeadTimeout,
                     UpstreamHeadIncomplete,
+                    _DeadExitResponse,
                 ),
             ):
                 # Budget refusals (429), over-budget heads and cancellation are
@@ -6181,7 +6367,11 @@ async def _open_lease_upstream_tunnel(
             last_error = exc
         # FBref must never spend a second paid CONNECT attempt. SofaScore's
         # separately bounded dead-exit policy remains response-byte based.
-        failover_allowed = False if lease.source == "fbref" else lease.down_bytes == 0
+        failover_allowed = (
+            False
+            if lease.source == "fbref"
+            else lease.down_bytes == observed_down_bytes
+        )
         if (
             failover_allowed
             and lease.usable
@@ -6475,6 +6665,7 @@ async def handle(
                         OSError,
                         UpstreamHeadTimeout,
                         UpstreamHeadIncomplete,
+                        _DeadExitResponse,
                     ):
                         # Timeout/accounting-uncertainty paths already revoke;
                         # a proven empty EOF/reset remains a normal 502 after
@@ -6512,7 +6703,7 @@ async def handle(
                             # response body in StreamReader read-ahead.  Retain
                             # the whole remaining escrow rather than discarding
                             # those unobservable provider bytes on close.
-                            _latch_lease_accounting_uncertainty(lease)
+                            _latch_lease_accounting_uncertainty(lease, reason=f"provider_connect_rejected_{_provider_connect_status_code(status)}")
                         return
                     client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     await client_w.drain()
@@ -6533,7 +6724,7 @@ async def handle(
                         if lease is not None:
                             # The provider reader may hold tunnel bytes beyond its
                             # accounted response head, but no down-pump owns it yet.
-                            _latch_lease_accounting_uncertainty(lease)
+                            _latch_lease_accounting_uncertainty(lease, reason="client_connect_ack_failed")
                         raise
                 if buffered_client_hello and not await _write_upstream(
                     srv_w,
@@ -6544,7 +6735,7 @@ async def handle(
                 ):
                     # Provider CONNECT already succeeded. Retain the remaining
                     # escrow because its reader has no pump owning read-ahead.
-                    _latch_lease_accounting_uncertainty(lease)
+                    _latch_lease_accounting_uncertainty(lease, reason="client_hello_forward_refused")
                     client_w.close()
                     return
                 await _run_tunnel_pumps(

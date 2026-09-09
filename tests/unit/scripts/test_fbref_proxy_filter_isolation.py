@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parents[3]
 SHARED_FILTER = ROOT / "scripts/proxy_filter/filter_proxy.py"
 FBREF_FILTER = ROOT / "scripts/fbref_proxy/filter_proxy.py"
 SHARED_FILTER_SHA256 = (
-    # Bumped for the static workload policy that replaced the paid canary
-    # (#1245).  FBref keeps its own filter and stays out of ``runtime_files`` —
-    # both asserted below.
-    "9cfd47e56b87824c1f39f40982a53a44eeb50dcfb4f7e879929c73f5a9171634"
+    # Bumped for the latch reason and the first-tunnel dead-exit failover
+    # (#1247 A2).  FBref keeps its own filter and stays out of
+    # ``runtime_files`` — both asserted below.
+    "05cefa7e43c947afe9f010a9a1a4ff075e9bdd3940773d0dfe385b706277c3bd"
 )
 
 

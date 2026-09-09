@@ -501,10 +501,12 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             and reported_repins <= self._observed_upstream_repins
         ):
             # A fingerprint drift is legal only as the proxy's dead-exit
-            # failover (#946), whose proof is a strictly increased
-            # ``upstream_repins`` counter: the filter re-pins exclusively before
-            # the first provider down-byte, so a repins increment certifies a
-            # pre-data failover even when the client first observes the drift
+            # failover (#946, #1247 A2), whose proof is a strictly increased
+            # ``upstream_repins`` counter: the filter re-pins only while every
+            # provider down-byte it billed is provably complete — none at all,
+            # or a rejected CONNECT response metered to EOF/Content-Length — so
+            # a repins increment still certifies that no capture payload was
+            # split across exits, even when the client first observes the drift
             # after the successful attempt billed bytes (mid-request transparent
             # failover).  A drift without that increment — including against an
             # old proxy that does not report the field — stays fail-closed.
