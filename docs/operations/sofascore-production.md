@@ -48,6 +48,19 @@ MAX_ACTIVE_LEASES}`), слоты пулов — `SOFASCORE_{HISTORY,PLAYERS}_POO
 единственного писателя. Артефакт бюджета, пул прокси и токен контрольной плоскости —
 общие: runtime-контракт у трёх шлюзов один.
 
+Фраза «правит env, а не рецепт» верна для аренд и слотов, но не для темпа кампании.
+Ручки самой кампании истории — `SOFASCORE_HISTORY_BATCH_SIZE` (сколько скоупов
+планируется в прогоне), `SOFASCORE_HISTORY_MAX_ACTIVE_TASKS` (сколько их бежит разом) и
+`SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE` — DAG читает только из окружения планировщика,
+поэтому они перечислены в `environment:` рецепта в форме `${X:-дефолт}`. Хостовый
+`/etc/data-platform/sofascore.env` их переопределяет, но применяются они не рестартом, а
+пересозданием планировщика, то есть ротацией релиза. Отдельная ручка — per-source предел
+шлюза истории: флаг `--sofascore-max-active-leases`, значение берётся из того же
+`SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES`, что и общий `--max-active-leases`. Без него
+общий лимит аренд ничего не даёт: сериализатор источника отдал бы соседям батча
+`429 SofaScore paid-proxy concurrency limit reached`. Текущее значение видно в `/health`
+шлюза полем `sofascore_max_active_leases`.
+
 ## Единый источник истины
 
 - **Код** — одно замороженное дерево `${SOFASCORE_RELEASE_ROOT}`
