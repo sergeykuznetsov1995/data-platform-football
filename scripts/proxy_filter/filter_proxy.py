@@ -322,6 +322,10 @@ _TLS_ECH_EXTENSION_TYPES = frozenset({0xFE0D, 0xFFCE})
 LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = 5.0
 LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS = 4.0
 LEASE_UPSTREAM_FAILOVER_ATTEMPTS = 2
+# A dead Decodo exit answers the first CONNECT with a small non-TLS error
+# page and closes (#1247 A2).  Draining that bounded body proves the whole
+# response, so the lease may re-pin instead of retaining its escrow.
+DEAD_EXIT_RESPONSE_MAX_BYTES = 1024
 SOFASCORE_EXIT_PROBE_HOST = "api.ipify.org"
 CONTROL_TOKEN = ""
 TRANSFERMARKT_CONTROL_TOKEN = ""
@@ -406,6 +410,15 @@ class UpstreamHeadTimeout(RuntimeError):
 
 class UpstreamHeadIncomplete(RuntimeError):
     """The residential upstream closed before a complete response head arrived."""
+
+
+class _DeadExitResponse(RuntimeError):
+    """The provider rejected the first tunnel's CONNECT and its whole response
+    was observed (EOF or an exact Content-Length).
+
+    Nothing is left in transport read-ahead, so the lease may fail over to a
+    fresh exit instead of latching accounting uncertainty.
+    """
 
 
 class _LeaseBudgetRefused(Exception):
@@ -4650,6 +4663,69 @@ async def _reject_client_head(
     writer.close()
 
 
+async def _drain_dead_exit_response(
+    reader: asyncio.StreamReader,
+    lease: Lease,
+    host: str,
+    *,
+    already: int,
+    content_length: int | None,
+) -> int | None:
+    """Settle the body of a rejected first-tunnel CONNECT, or refuse to guess.
+
+    Returns the number of body bytes metered when the response is provably
+    complete — the provider closed (EOF) or its ``Content-Length`` was matched
+    exactly — which means no billed byte can still hide in transport
+    read-ahead.  Returns ``None`` when the tail stays unproven (over
+    ``DEAD_EXIT_RESPONSE_MAX_BYTES``, or silent past
+    ``LEASE_CLIENT_HANGUP_DRAIN_SECONDS``); the outstanding reservation is then
+    deliberately *not* released, so the caller's latch retains it.
+    """
+
+    body = 0
+    deadline = time.monotonic() + LEASE_CLIENT_HANGUP_DRAIN_SECONDS
+    while True:
+        if content_length is not None and body >= content_length:
+            return body
+        wanted = DEAD_EXIT_RESPONSE_MAX_BYTES - (already + body)
+        if content_length is not None:
+            wanted = min(wanted, content_length - body)
+        if wanted <= 0:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        reservation = _reserve_lease_bytes(lease, wanted)
+        if reservation <= 0:
+            lease.budget_exceeded = True
+            return None
+        try:
+            chunk = await asyncio.wait_for(reader.read(reservation), remaining)
+        except (asyncio.TimeoutError, TimeoutError):
+            return None
+        except BaseException:
+            _settle_observed_lease_bytes(
+                lease,
+                reservation=reservation,
+                host=host,
+                direction="down",
+                count=0,
+                uncertain_reason="dead_exit_drain_cancelled",
+            )
+            raise
+        if not chunk:
+            _release_lease_reservation(lease, reservation)
+            return body
+        _settle_observed_lease_bytes(
+            lease,
+            reservation=reservation,
+            host=host,
+            direction="down",
+            count=len(chunk),
+        )
+        body += len(chunk)
+
+
 async def _read_metered_provider_head(
     reader: asyncio.StreamReader,
     lease: Lease,
@@ -6139,6 +6215,12 @@ async def _open_lease_upstream_tunnel(
     ``host:port`` are never logged — only non-reversible fingerprint hashes.
     """
     last_error: BaseException | None = None
+    # Only a lease that has not billed a single response byte can still be on a
+    # dead exit.  The flag is computed once: after the first drained rejection
+    # the lease already owns that exit's response bytes (down 251 in the field),
+    # yet the next attempt is still part of the same dead-exit failover.
+    first_tunnel = lease.source == "sofascore" and lease.down_bytes == 0
+    down_before = lease.down_bytes
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
         up_host, up_port, up_user, up_pass = lease.upstream
         srv_w = None
@@ -6174,6 +6256,40 @@ async def _open_lease_upstream_tunnel(
                     ceiling_seconds=LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS,
                 ),
             )
+            code = _provider_connect_status_code(status)
+            if first_tunnel and code != 200:
+                raw_length = _header_map(response_headers).get("content-length")
+                try:
+                    content_length = None if raw_length is None else int(raw_length)
+                except ValueError:
+                    content_length = None
+                if content_length is not None and content_length < 0:
+                    content_length = None
+                drained = await _drain_dead_exit_response(
+                    srv_r,
+                    lease,
+                    host,
+                    already=lease.down_bytes - down_before,
+                    content_length=content_length,
+                )
+                if drained is None:
+                    log.warning(
+                        "lease %s dead exit response did not end within "
+                        "%d bytes/%.1fs; latching",
+                        lease.lease_id,
+                        DEAD_EXIT_RESPONSE_MAX_BYTES,
+                        LEASE_CLIENT_HANGUP_DRAIN_SECONDS,
+                    )
+                    return srv_r, srv_w, status, response_headers
+                log.warning(
+                    "lease %s dead exit on first tunnel: CONNECT %s rejected "
+                    "with status %s, %d response bytes settled to EOF",
+                    lease.lease_id,
+                    _upstream_fingerprint(lease.upstream),
+                    code,
+                    lease.down_bytes - down_before,
+                )
+                raise _DeadExitResponse()
             return srv_r, srv_w, status, response_headers
         except BaseException as exc:
             # No failed attempt may leak its socket or its tunnel_writers entry.
@@ -6191,6 +6307,7 @@ async def _open_lease_upstream_tunnel(
                     OSError,
                     UpstreamHeadTimeout,
                     UpstreamHeadIncomplete,
+                    _DeadExitResponse,
                 ),
             ):
                 # Budget refusals (429), over-budget heads and cancellation are
@@ -6199,7 +6316,14 @@ async def _open_lease_upstream_tunnel(
             last_error = exc
         # FBref must never spend a second paid CONNECT attempt. SofaScore's
         # separately bounded dead-exit policy remains response-byte based.
-        failover_allowed = False if lease.source == "fbref" else lease.down_bytes == 0
+        failover_allowed = (
+            False
+            if lease.source == "fbref"
+            else (
+                lease.down_bytes == 0
+                or isinstance(last_error, _DeadExitResponse)
+            )
+        )
         if (
             failover_allowed
             and lease.usable
@@ -6493,6 +6617,7 @@ async def handle(
                         OSError,
                         UpstreamHeadTimeout,
                         UpstreamHeadIncomplete,
+                        _DeadExitResponse,
                     ):
                         # Timeout/accounting-uncertainty paths already revoke;
                         # a proven empty EOF/reset remains a normal 502 after

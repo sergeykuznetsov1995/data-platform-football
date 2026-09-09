@@ -9082,6 +9082,13 @@ def test_shared_wal_compaction_keeps_only_open_attempts(tmp_path):
 # is the frozen FBref copy and must not carry these contracts.
 
 
+_DEAD_EXIT_HEAD = (
+    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\nConnection: close\r\n\r\n"
+)
+_DEAD_EXIT_RESPONSE = _DEAD_EXIT_HEAD + b"dead-exit!!"
+_LIVE_CONNECT_HEAD = b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+
 def test_latch_records_reason_in_lease_report_and_log(shared_mod, caplog):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_sofascore_lease(shared_mod, mgr)
@@ -9113,3 +9120,211 @@ def test_latch_reason_first_writer_wins(shared_mod, caplog):
     ]
     assert len(latched) == 1
 
+
+def test_first_tunnel_dead_exit_connect_rejection_fails_over_without_latch(
+    shared_mod, monkeypatch, caplog
+):
+    # Decodo's dead exit answers the very first CONNECT with a small non-TLS
+    # error page and closes (up 164 -> down 251 -> CRITICAL in ~30 ms). The
+    # whole response is observable, so the lease re-pins instead of latching.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _FakeUpstreamReader(_DEAD_EXIT_RESPONSE), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(_LIVE_CONNECT_HEAD), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            asyncio.wait_for(
+                shared_mod.handle(
+                    _ClientConnectReader(_connect_header_lines(lease)),
+                    client_writer,
+                    mgr,
+                    require_lease=True,
+                ),
+                2.0,
+            )
+        )
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is False
+    assert lease.usable is True
+    assert lease.upstream_repins == 1
+    assert lease.upstream == ("pool.invalid", 10001, "u", "p")
+    assert lease.down_bytes == len(_DEAD_EXIT_RESPONSE) + len(_LIVE_CONNECT_HEAD)
+    assert lease.reserved_bytes == 0
+    assert "dead exit on first tunnel" in caplog.text
+
+
+def test_dead_exit_body_by_content_length_without_eof_fails_over(
+    shared_mod, monkeypatch, caplog
+):
+    # The exit does not close the socket, but its Content-Length proves the
+    # tail: the response is fully observed and the lease may still re-pin.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return (
+                _FakeUpstreamReader(_DEAD_EXIT_RESPONSE, block_when_empty=True),
+                _FakeUpstreamWriter(),
+            )
+        return _FakeUpstreamReader(_LIVE_CONNECT_HEAD), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            asyncio.wait_for(
+                shared_mod.handle(
+                    _ClientConnectReader(_connect_header_lines(lease)),
+                    client_writer,
+                    mgr,
+                    require_lease=True,
+                ),
+                2.0,
+            )
+        )
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is False
+    assert lease.usable is True
+    assert lease.upstream_repins == 1
+    assert lease.down_bytes == len(_DEAD_EXIT_RESPONSE) + len(_LIVE_CONNECT_HEAD)
+    assert "dead exit on first tunnel" in caplog.text
+
+
+def test_dead_exit_failover_is_refused_after_first_provider_payload_byte(
+    shared_mod, monkeypatch
+):
+    # Not the first tunnel any more: the dead-exit policy is byte-based, so a
+    # rejected CONNECT still latches — now with an attributable reason.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 1)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(_DEAD_EXIT_RESPONSE), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            shared_mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"502 Bad Gateway" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
+    assert lease.upstream_repins == 0
+    assert lease.upstream == ("pool.invalid", 10000, "u", "p")
+
+
+def test_dead_exit_response_over_cap_keeps_latch(shared_mod, monkeypatch, caplog):
+    # An unbounded error page is not a dead-exit signature: stop reading at the
+    # cap and retain every unproven escrow byte.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    head = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(head + b"x" * 2000), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            asyncio.wait_for(
+                shared_mod.handle(
+                    _ClientConnectReader(_connect_header_lines(lease)),
+                    client_writer,
+                    mgr,
+                    require_lease=True,
+                ),
+                2.0,
+            )
+        )
+
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
+    assert lease.upstream_repins == 0
+    assert (
+        lease.down_bytes
+        <= len(head) + shared_mod.DEAD_EXIT_RESPONSE_MAX_BYTES
+    )
+    assert "did not end within" in caplog.text
+
+
+def test_dead_exit_response_without_eof_keeps_latch(shared_mod, monkeypatch):
+    # No Content-Length and no close: the tail stays unprovable, so the lease
+    # must latch instead of re-pinning onto an unknown provider bill.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+    monkeypatch.setattr(
+        shared_mod, "LEASE_CLIENT_HANGUP_DRAIN_SECONDS", 0.02, raising=False
+    )
+
+    head = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+
+    async def fake_open(host, port):
+        return (
+            _FakeUpstreamReader(head + b"partial", block_when_empty=True),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            shared_mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
+    assert lease.upstream_repins == 0
