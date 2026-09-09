@@ -82,7 +82,7 @@ set_pool() {  # set_pool <name> <slots> <description>
 }
 # Источник слотов — env-файл, а не таблица slot_pool: чтение живого значения дало бы
 # гонку с ручным выкатом (второй выкат прочитал бы осушённый 0 и «восстановил» пул в 0).
-HISTORY_SLOTS="${SOFASCORE_HISTORY_POOL_SLOTS:-1}"
+HISTORY_SLOTS="${SOFASCORE_HISTORY_POOL_SLOTS:-3}"
 PLAYERS_SLOTS="${SOFASCORE_PLAYERS_POOL_SLOTS:-1}"
 wait_idle() {  # wait_idle <секунд>; 0 — контур свободен, 1 — потолок исчерпан
   # Потолок держится по ЧАСАМ, а не по сумме sleep: каждая итерация делает два запроса к

@@ -97,7 +97,7 @@ ACCEPT_POLL=${ACCEPT_POLL:-20}
 MIN_DRAIN=${MIN_DRAIN:-900}        # меньше 15 мин на осушение — не начинаем вовсе
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
 FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}
-HISTORY_SLOTS=${SOFASCORE_HISTORY_POOL_SLOTS:-1}
+HISTORY_SLOTS=${SOFASCORE_HISTORY_POOL_SLOTS:-3}
 PLAYERS_SLOTS=${SOFASCORE_PLAYERS_POOL_SLOTS:-1}
 
 # --- сообщения и маркеры -------------------------------------------------------------

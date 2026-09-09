@@ -291,7 +291,8 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
     assert [a.split()[5] for a in restored] == [
         "ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"
     ], pools
-    assert all(a.split()[6] == "1" for a in restored), pools
+    # Полоса истории возвращается на свой дефолт (#1248 ступень 1), остальные — на 1.
+    assert [a.split()[6] for a in restored] == ["1", "3", "1"], pools
     assert min(args.index(a) for a in restored) > last_compose
     preflights = [
         line for line in (state_dir / "host-python.log").read_text(encoding="utf-8").splitlines()
@@ -518,8 +519,8 @@ def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
         if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
     ]
     assert pools[0] == ["sofascore_history_pool", "0"], pools
-    assert pools[-1] == ["sofascore_history_pool", "1"], pools
-    assert f"sofascore_history_pool restored to 1 slots" in log
+    assert pools[-1] == ["sofascore_history_pool", "3"], pools
+    assert f"sofascore_history_pool restored to 3 slots" in log
 
 
 @pytest.mark.unit
@@ -697,7 +698,7 @@ def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Pat
         a.split()[5:7] for a in r.args
         if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
     ]
-    assert pools == [["sofascore_history_pool", "0"], ["sofascore_history_pool", "1"]], pools
+    assert pools == [["sofascore_history_pool", "0"], ["sofascore_history_pool", "3"]], pools
     # Контур занят — значит НИЧЕГО не изменилось: обе кампании работают дальше.
     assert (r.state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
     assert (r.state_dir / f"paused_{HIST}").read_text().strip() == "f"
@@ -1445,6 +1446,7 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
           case "${{@: -1}}" in
             *import_error*) echo 0 ;;
             *is_active=true*) echo 5 ;;
+            *"pool='sofascore_history_pool'"*) echo 3 ;;
             *slot_pool*) echo 1 ;;
             *) echo "dag|f|t" ;;
           esac
@@ -1596,8 +1598,10 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
     ):
         assert f"✓ {unit} active" in proc.stdout, proc.stdout
         assert f"✓ {unit} --container {container}" in proc.stdout, proc.stdout
-    for pool in ("ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"):
-        assert f"✓ пул {pool} slots=1" in proc.stdout, proc.stdout
+    for pool, slots in (
+        ("ingest_scraper_pool", 1), ("sofascore_history_pool", 3), ("sofascore_players_pool", 1)
+    ):
+        assert f"✓ пул {pool} slots={slots}" in proc.stdout, proc.stdout
 
 
 @pytest.mark.unit

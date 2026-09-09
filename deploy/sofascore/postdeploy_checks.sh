@@ -146,7 +146,7 @@ echo
 echo "== 8. Пулы полос =="
 $PSQL "SELECT pool, slots FROM slot_pool WHERE pool IN ('ingest_scraper_pool','sofascore_history_pool','sofascore_players_pool') ORDER BY 1;"
 for spec in "ingest_scraper_pool=1" \
-            "sofascore_history_pool=${SOFASCORE_HISTORY_POOL_SLOTS:-1}" \
+            "sofascore_history_pool=${SOFASCORE_HISTORY_POOL_SLOTS:-3}" \
             "sofascore_players_pool=${SOFASCORE_PLAYERS_POOL_SLOTS:-1}"; do
   pool=${spec%%=*}; want=${spec#*=}
   got=$($PSQL "SELECT slots FROM slot_pool WHERE pool='$pool';")
