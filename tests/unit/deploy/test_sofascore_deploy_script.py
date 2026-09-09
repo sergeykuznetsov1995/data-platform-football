@@ -987,6 +987,24 @@ def test_the_breaker_gets_one_call_per_scope_of_the_batch(tmp_path: Path) -> Non
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("batch,want", [("4", "из 4"), ("", "из 3"), ("два", "из 3")])
+def test_the_breaker_budget_follows_the_batch_size(tmp_path: Path, batch: str, want: str) -> None:
+    """Ревью Sol, круг 2, п.4. Батч допускает 1..64 скоупов, а бюджет вызовов был литералом:
+    при batch=4 четвёртой волне вызова бы не хватило. Бюджет считается от той же ручки, что
+    читает DAG; мусор в env-файле читается как дефолт, а не роняет шаг арифметикой."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="up_for_retry", scope_try=1),
+        env_extra=({"SOFASCORE_HISTORY_BATCH_SIZE": batch} if batch else None),
+        after_breaker=_TAIL_AFTER_FAILURE,
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert f"вызов 1 {want}" in r.log, r.log
+
+
+@pytest.mark.unit
 def test_a_scope_that_finishes_on_its_own_closes_the_run_without_the_breaker(tmp_path: Path) -> None:
     """Ночь 06.09 и 07.09: скоуп доработал сам, дальше validate → finalize → cooldown →
     propagate → прогон закрыт. Ломателя не зовут ни разу."""
