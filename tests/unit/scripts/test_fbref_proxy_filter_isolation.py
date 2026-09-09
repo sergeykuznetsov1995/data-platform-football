@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parents[3]
 SHARED_FILTER = ROOT / "scripts/proxy_filter/filter_proxy.py"
 FBREF_FILTER = ROOT / "scripts/fbref_proxy/filter_proxy.py"
 SHARED_FILTER_SHA256 = (
-    # Bumped for the latch reason and the first-tunnel dead-exit failover
-    # (#1247 A2).  FBref keeps its own filter and stays out of
+    # Bumped for the per-source SofaScore lease ceiling of the history lane
+    # (#1248 stage 1).  FBref keeps its own filter and stays out of
     # ``runtime_files`` — both asserted below.
-    "05cefa7e43c947afe9f010a9a1a4ff075e9bdd3940773d0dfe385b706277c3bd"
+    "e9b91d23a461b9d77b889ae630df83f3f9e3c0b1713e1b2c9ff1c339267123d3"
 )
 
 

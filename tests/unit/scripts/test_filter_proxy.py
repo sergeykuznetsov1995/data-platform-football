@@ -1878,9 +1878,11 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
         # Каждая полоса арендует прокси у СВОЕГО шлюза: общий lease-url свёл бы
         # три полосы обратно в один слот аренды — дефект, который чинит #1244.
         assert command[command.index("--lease-proxy-url") + 1] == f"http://{name}:8900", name
-        # One active SofaScore lease at a time by default; the ceiling is an
-        # operator knob (#1248 widens a lane without touching the recipe).
-        assert command[command.index("--max-active-leases") + 1].endswith(":-1}"), name
+        # One active SofaScore lease at a time, except on the history lane which
+        # #1248 stage 1 widened to three so a batch of scopes runs side by side;
+        # the ceiling stays an operator knob on every lane.
+        expected_leases = ":-3}" if name == "sofascore_gw_history" else ":-1}"
+        assert command[command.index("--max-active-leases") + 1].endswith(expected_leases), name
         # Isolation contract: the contour's own EXTERNAL network (the isolated
         # scheduler reaches every gateway by service alias; #1155 stage 3 dropped
         # dp-backend).
@@ -4988,6 +4990,42 @@ def test_non_sofascore_leases_can_run_concurrently_up_to_configured_limit(mod):
                 "task_id": "task-c",
                 "canonical_url": "https://www.transfermarkt.com/c",
             },
+            require_context=True,
+        )
+
+
+def test_sofascore_lane_admits_up_to_its_own_ceiling(shared_mod):
+    """Полоса истории (#1248): три скоупа батча держат аренды разом, четвёртый — 429.
+
+    До ступени 1 per-source guard был безусловным (одна живая аренда `sofascore` на шлюз),
+    поэтому два из трёх mapped-скоупов всегда получали «SofaScore paid-proxy concurrency
+    limit reached» и клетка «3 скоупа × 20 req/мин» была недостижима.
+
+    Фикстура `shared_mod` — боевой `scripts/proxy_filter`, который и запускают три
+    шлюза SofaScore; замороженная копия FBref (`mod`) остаётся сериальной."""
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",
+            "http://u:p@pool.invalid:10001",
+        ]
+    )
+    shared_mod.MAX_ACTIVE_LEASES = 4
+    shared_mod.SOFASCORE_MAX_ACTIVE_LEASES = 3
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 4096
+    for index in range(3):
+        shared_mod._create_lease(
+            mgr,
+            max_bytes=4096,
+            ttl_seconds=30,
+            metadata=_sofascore_context(run_id=f"run-{index}::season"),
+            require_context=True,
+        )
+    with pytest.raises(RuntimeError, match="SofaScore paid-proxy concurrency"):
+        shared_mod._create_lease(
+            mgr,
+            max_bytes=4096,
+            ttl_seconds=30,
+            metadata=_sofascore_context(run_id="run-3::season"),
             require_context=True,
         )
 

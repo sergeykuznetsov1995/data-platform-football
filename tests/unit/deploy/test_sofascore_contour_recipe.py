@@ -52,7 +52,7 @@ GATEWAY_LANES = {
     "sofascore_gw_history": {
         "container": "sofascore_gw_history",
         "budget": "${SOFASCORE_HISTORY_GW_DAILY_BUDGET_MB:-2000}",
-        "leases": "${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-1}",
+        "leases": "${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-3}",
         "state": "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?",
     },
     "sofascore_gw_players": {
@@ -231,6 +231,12 @@ def test_gateway_compose_pins_the_live_gateway_shape() -> None:
         assert command[command.index("--lease-proxy-url") + 1] == f"http://{service}:8900", service
         assert command[command.index("--daily-budget-mb") + 1] == lane["budget"], service
         assert command[command.index("--max-active-leases") + 1] == lane["leases"], service
+        # Общий лимит аренд поднимает per-source потолок ТОЛЬКО на полосе истории (#1248):
+        # у двух других шлюзов флага нет, и `sofascore` там остаётся сериализован дефолтом 1.
+        if service == "sofascore_gw_history":
+            assert command[command.index("--sofascore-max-active-leases") + 1] == lane["leases"], service
+        else:
+            assert "--sofascore-max-active-leases" not in command, service
         assert gateway["healthcheck"]["test"][:4] == [
             "CMD", "python", "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py", "gateway-health",
         ], service

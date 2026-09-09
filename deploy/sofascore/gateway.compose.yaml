@@ -201,7 +201,11 @@ services:
       - --url-budget-bytes
       - ${SOFASCORE_PROXY_URL_BUDGET_BYTES:-2000000}
       - --max-active-leases
-      - ${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-1}
+      - ${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-3}
+      # Тот же ключ поднимает и per-source потолок: без него общий лимит аренд
+      # ничего не даёт — второй и третий скоуп батча ловят 429 сериализатора.
+      - --sofascore-max-active-leases
+      - ${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-3}
       - --sofascore-budget-artifact
       - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
       - --sofascore-discovery-dagrun-budget-bytes
