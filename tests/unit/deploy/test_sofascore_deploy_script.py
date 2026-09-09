@@ -987,7 +987,14 @@ def test_the_breaker_gets_one_call_per_scope_of_the_batch(tmp_path: Path) -> Non
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("batch,want", [("4", "из 4"), ("", "из 3"), ("два", "из 3")])
+@pytest.mark.parametrize(
+    "batch,want",
+    [
+        ("4", "из 4"), ("64", "из 64"), ("", "из 3"), ("два", "из 3"),
+        # "00" — цифры, но нулевой бюджет: ломателя не позвали бы ни разу.
+        ("00", "из 3"), ("0", "из 3"), ("65", "из 3"), ("999999999999", "из 3"),
+    ],
+)
 def test_the_breaker_budget_follows_the_batch_size(tmp_path: Path, batch: str, want: str) -> None:
     """Ревью Sol, круг 2, п.4. Батч допускает 1..64 скоупов, а бюджет вызовов был литералом:
     при batch=4 четвёртой волне вызова бы не хватило. Бюджет считается от той же ручки, что
