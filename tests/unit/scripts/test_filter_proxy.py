@@ -6145,6 +6145,21 @@ def _shrink_failover_timeouts(mod, monkeypatch):
     )
 
 
+def _relax_provider_head_timeout(mod, monkeypatch, seconds=1.5):
+    """Undo the 20 ms head deadline of ``_shrink_failover_timeouts``.
+
+    The dead-exit fakes hand back their whole response at once, so only the
+    dial needs to be short there.  A loaded CI runner can spend longer than
+    20 ms inside the byte-metered head read and latch ``provider_head_timeout``
+    instead of the behaviour under test (#1247 A2).  Scenarios where the head
+    deadline *is* the subject keep the shrunk value.
+    """
+
+    monkeypatch.setattr(
+        mod, "LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS", seconds, raising=False
+    )
+
+
 def _patch_upstream_opener(mod, monkeypatch, fake_open):
     # ``_open_upstream_connection`` is the #946 test seam; also patch the raw
     # asyncio symbol so the pre-#946 code (which lacks the seam) still exercises
@@ -9132,6 +9147,7 @@ def test_first_tunnel_dead_exit_connect_rejection_fails_over_without_latch(
     )
     lease = _make_sofascore_lease(shared_mod, mgr)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     opens = []
 
@@ -9177,6 +9193,7 @@ def test_dead_exit_body_by_content_length_without_eof_fails_over(
     )
     lease = _make_sofascore_lease(shared_mod, mgr)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     opens = []
 
@@ -9224,6 +9241,7 @@ def test_dead_exit_failover_is_refused_after_first_provider_payload_byte(
     lease = _make_sofascore_lease(shared_mod, mgr)
     shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 1)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     async def fake_open(host, port):
         return _FakeUpstreamReader(_DEAD_EXIT_RESPONSE), _FakeUpstreamWriter()
@@ -9258,6 +9276,7 @@ def test_dead_exit_response_over_cap_keeps_latch(shared_mod, monkeypatch, caplog
     )
     lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     head = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
 
@@ -9298,6 +9317,7 @@ def test_dead_exit_response_without_eof_keeps_latch(shared_mod, monkeypatch):
     )
     lease = _make_sofascore_lease(shared_mod, mgr)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
     monkeypatch.setattr(
         shared_mod, "LEASE_CLIENT_HANGUP_DRAIN_SECONDS", 0.02, raising=False
     )
@@ -9366,6 +9386,7 @@ def test_dead_exit_ambiguous_body_framing_keeps_latch(
     )
     lease = _make_sofascore_lease(shared_mod, mgr)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
     monkeypatch.setattr(
         shared_mod, "LEASE_CLIENT_HANGUP_DRAIN_SECONDS", 0.02, raising=False
     )
@@ -9405,6 +9426,7 @@ def test_two_drained_dead_exits_in_a_row_each_get_the_full_byte_cap(
     )
     lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     dead = (
         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 600\r\n"
@@ -9453,6 +9475,7 @@ def test_dead_exit_head_over_cap_keeps_latch_even_with_empty_body(
     )
     lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     padding = b"X-Pad: " + b"p" * 1200 + b"\r\n"
     response = (
@@ -9489,6 +9512,7 @@ def test_drained_dead_exit_does_not_block_a_later_empty_eof_failover(
     )
     lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     opens = []
 
@@ -9557,6 +9581,7 @@ def test_dead_exit_failover_refuses_when_another_tunnel_billed_bytes(
     )
     lease = _make_sofascore_lease(shared_mod, mgr)
     _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
 
     class _ForeignBillingReader(_FakeUpstreamReader):
         """Another tunnel on the same lease bills 37 bytes mid-drain."""
