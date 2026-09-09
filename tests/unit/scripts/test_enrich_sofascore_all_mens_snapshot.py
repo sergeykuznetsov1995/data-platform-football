@@ -228,3 +228,122 @@ def test_expected_revision_mismatch_fails_before_browser_creation(
     assert result == 1
     assert browser_created is False
     assert "changed after planning" in report.read_text()
+
+
+def _sign(document):
+    document["snapshot_id"] = hashlib.sha256(json.dumps(
+        {key: value for key, value in document.items() if key != "snapshot_id"},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    return document
+
+
+def _after_wave_snapshot():
+    """Snapshot as the 2025 metadata wave left it: 76986 excluded by schema_error."""
+
+    document = _snapshot()
+    tournament = document["tournaments"][0]
+    tournament["classification"]["gender"] = "male"
+    tournament["metadata_status"] = "ready"
+    season = tournament["seasons"][0]
+    season["metadata_status"] = "excluded"
+    season["team_count"] = None
+    season["team_count_evidence"] = {
+        "type": "source_team_ids_unavailable",
+        "endpoint": "/unique-tournament/17/season/76986/teams",
+        "reason": "schema_error",
+    }
+    return _sign(document)
+
+
+def test_next_wave_retries_schema_error_season():
+    client = Client()
+
+    enriched, report = enrich_snapshot(
+        _after_wave_snapshot(), client, wave_start_year=2024
+    )
+
+    tournament = enriched["tournaments"][0]
+    retried = tournament["seasons"][0]
+    assert retried["metadata_status"] == "ready"
+    assert retried["team_count"] == 20
+    assert retried["team_count_evidence"]["type"] == "source_team_ids"
+    assert "/unique-tournament/17/season/76986/teams" in client.calls
+    assert report["retried_schema_error_scopes"] == 1
+    assert report["recovered_schema_error_scopes"] == 1
+    assert tournament["seasons"][1]["metadata_status"] == "ready"
+
+
+def test_repeated_schema_error_keeps_evidence_and_stays_excluded():
+    client = UnavailableTeamClient()
+    before = _after_wave_snapshot()["tournaments"][0]["seasons"][0]
+
+    enriched, report = enrich_snapshot(
+        _after_wave_snapshot(), client, wave_start_year=2024
+    )
+
+    season = enriched["tournaments"][0]["seasons"][0]
+    assert "/unique-tournament/17/season/76986/teams" in client.calls
+    assert season["metadata_status"] == "excluded"
+    assert season["team_count"] is None
+    assert season["team_count_evidence"] == before["team_count_evidence"]
+    assert report["retried_schema_error_scopes"] == 1
+    assert report["recovered_schema_error_scopes"] == 0
+
+
+def test_wave_does_not_retry_the_season_it_excluded():
+    client = Client()
+
+    enriched, report = enrich_snapshot(
+        _after_wave_snapshot(), client, wave_start_year=2025
+    )
+
+    assert enriched["tournaments"][0]["seasons"][0]["metadata_status"] == "excluded"
+    assert client.calls == []
+    assert report["source_requests"] == 0
+
+
+def test_tournament_excluded_seasons_are_never_retried():
+    document = _after_wave_snapshot()
+    tournament = document["tournaments"][0]
+    tournament["metadata_status"] = "excluded"
+    for season in tournament["seasons"]:
+        season["metadata_status"] = "excluded"
+    tournament["seasons"][1]["team_count_evidence"] = {
+        "type": "source_team_ids_unavailable",
+        "endpoint": "/unique-tournament/17/season/61627/teams",
+        "reason": "schema_error",
+    }
+    client = Client()
+
+    _, report = enrich_snapshot(_sign(document), client, wave_start_year=2024)
+
+    assert client.calls == []
+    assert report["source_requests"] == 0
+    assert report.get("retried_schema_error_scopes", 0) == 0
+
+
+def test_retry_lifts_a_tournament_with_no_pending_season_in_the_wave():
+    """The live shape: the wave year is already done, only the schema_error stays."""
+
+    document = _after_wave_snapshot()
+    done = document["tournaments"][0]["seasons"][1]
+    done["metadata_status"] = "ready"
+    done["team_count"] = 20
+    done["team_count_evidence"] = {
+        "type": "source_team_ids",
+        "endpoint": "/unique-tournament/17/season/61627/teams",
+        "count": 20,
+        "team_ids_sha256": "0" * 64,
+    }
+    client = Client()
+
+    enriched, report = enrich_snapshot(_sign(document), client, wave_start_year=2024)
+
+    retried = enriched["tournaments"][0]["seasons"][0]
+    assert retried["metadata_status"] == "ready"
+    assert client.calls == ["/unique-tournament/17/season/76986/teams"]
+    assert report["retried_schema_error_scopes"] == 1
+    assert report["recovered_schema_error_scopes"] == 1
