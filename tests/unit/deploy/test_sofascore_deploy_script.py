@@ -959,6 +959,34 @@ def test_a_running_scope_that_falls_into_a_parked_retry_is_broken_later(tmp_path
 
 
 @pytest.mark.unit
+def test_the_breaker_gets_one_call_per_scope_of_the_batch(tmp_path: Path) -> None:
+    """Ревью Sol, круг 1, п.2. Скоупы батча паркуются РАЗНЫМИ волнами: один вызов ломателя
+    гасил бы только первую, а упавший позже сосед снова вешал бы шаг drain до потолка —
+    ночь без доставки. Бюджет вызовов равен размеру батча."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_state="running", scope_try=1, extra_scope=(1, "up_for_retry", 1)),
+        turns={
+            3: (
+                "UPDATE task_instance SET state='up_for_retry'"
+                " WHERE task_id='run_historical_scope' AND map_index=0;"
+            ),
+        },
+        after_breaker=_TAIL_AFTER_FAILURE,
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert len(r.breaker_calls) == 2, r.breaker_calls
+    assert "вызов 2 из 3" in r.log
+    assert "тупик не ломается" not in r.log
+    assert dict(rows(
+        r.state_dir,
+        "SELECT map_index, state FROM task_instance WHERE task_id='run_historical_scope'",
+    )) == {0: "failed", 1: "failed"}
+
+
+@pytest.mark.unit
 def test_a_scope_that_finishes_on_its_own_closes_the_run_without_the_breaker(tmp_path: Path) -> None:
     """Ночь 06.09 и 07.09: скоуп доработал сам, дальше validate → finalize → cooldown →
     propagate → прогон закрыт. Ломателя не зовут ни разу."""
