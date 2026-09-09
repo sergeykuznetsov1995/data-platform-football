@@ -9074,3 +9074,42 @@ def test_shared_wal_compaction_keeps_only_open_attempts(tmp_path):
     assert wal_path.read_bytes().splitlines() == kept_lines
     assert backup.read_bytes().splitlines() == original_lines
     assert mod._read_allocation_wal() == {"lease-open": before["lease-open"]}
+
+
+# --- #1247 A2: latch reason + dead-exit failover on the first tunnel ---------
+#
+# The shared runtime (``shared_mod``) is the SofaScore production path; ``mod``
+# is the frozen FBref copy and must not carry these contracts.
+
+
+def test_latch_records_reason_in_lease_report_and_log(shared_mod, caplog):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_sofascore_lease(shared_mod, mgr)
+
+    with caplog.at_level("CRITICAL"):
+        shared_mod._latch_lease_accounting_uncertainty(lease, reason="unit_probe")
+
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "unit_probe"
+    assert lease.report()["accounting_uncertain_reason"] == "unit_probe"
+    assert "escrow is retained; reason=unit_probe" in caplog.text
+
+
+def test_latch_reason_first_writer_wins(shared_mod, caplog):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_sofascore_lease(shared_mod, mgr)
+
+    with caplog.at_level("CRITICAL"):
+        shared_mod._latch_lease_accounting_uncertainty(lease, reason="first_cause")
+        shared_mod._latch_lease_accounting_uncertainty(lease, reason="second_cause")
+
+    assert lease.accounting_uncertain_reason == "first_cause"
+    assert "second_cause" not in caplog.text
+    latched = [
+        record
+        for record in caplog.records
+        if record.levelname == "CRITICAL"
+        and "escrow is retained" in record.getMessage()
+    ]
+    assert len(latched) == 1
+
