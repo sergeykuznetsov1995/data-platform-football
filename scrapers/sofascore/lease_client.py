@@ -122,9 +122,11 @@ class SofascoreLeaseStats:
     phase_plan_digest: str
     parent_run_cap_bytes: int
     parent_run_spent_provider_bytes: int
-    # Times the filter re-pinned the lease's residential exit before its first
-    # provider byte (#946 dead-exit failover).  Defaults to 0 when the proxy
-    # predates the field, which keeps any fingerprint drift fail-closed.
+    # Times the filter re-pinned the lease's residential exit while no unproven
+    # provider byte had been billed (#946 dead-exit failover; #1247 A2 also
+    # re-pins after a rejected CONNECT whose whole response was metered to EOF).
+    # Defaults to 0 when the proxy predates the field, which keeps any
+    # fingerprint drift fail-closed.
     upstream_repins: int = 0
 
     @classmethod

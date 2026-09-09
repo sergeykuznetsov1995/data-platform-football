@@ -4508,6 +4508,11 @@ async def _pump(
                 counter[host] += len(chunk)
     except Exception as exc:  # noqa: BLE001 — proxy must never crash a flow
         swallowed = type(exc).__name__
+    except BaseException as exc:
+        # Cancellation still propagates; only the diagnostic name is recorded,
+        # because ``finally`` latches before the caller can attribute it.
+        swallowed = type(exc).__name__
+        raise
     finally:
         if lease is not None and direction == "down" and not provider_eof_observed:
             # Includes TTL/closed/budget refusal before a read, reservation
@@ -4685,7 +4690,13 @@ def _dead_exit_body_length(lines: list[bytes]) -> int | None:
             return None
         if lowered != "content-length":
             continue
-        if length is not None or not (rendered.isascii() and rendered.isdigit()):
+        if (
+            length is not None
+            # int() raises ValueError past CPython's digit limit, and any body
+            # that long is over the cap anyway: refuse instead of parsing.
+            or len(rendered) > 19
+            or not (rendered.isascii() and rendered.isdigit())
+        ):
             return None
         length = int(rendered)
     return length
@@ -4710,6 +4721,10 @@ async def _drain_dead_exit_response(
     deliberately *not* released, so the caller's latch retains it.
     """
 
+    if already >= DEAD_EXIT_RESPONSE_MAX_BYTES:
+        # The head alone already spent this attempt's dead-exit budget; even a
+        # provably empty body must not buy a re-pin past the declared ceiling.
+        return None
     body = 0
     deadline = time.monotonic() + LEASE_CLIENT_HANGUP_DRAIN_SECONDS
     while True:
@@ -6248,6 +6263,11 @@ async def _open_lease_upstream_tunnel(
     # the lease already owns that exit's response bytes (down 251 in the field),
     # yet the next attempt is still part of the same dead-exit failover.
     first_tunnel = lease.source == "sofascore" and lease.down_bytes == 0
+    # Response bytes billed by this call that are provably complete.  Only a
+    # fully drained dead-exit rejection adds to it, so the failover gate below
+    # stays "no unproven provider byte has been billed" rather than degrading
+    # to "no byte at all" after the first drained exit.
+    observed_down_bytes = 0
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
         up_host, up_port, up_user, up_pass = lease.upstream
         # Each attempt owns its own dead-exit byte budget: a fully drained
@@ -6312,6 +6332,7 @@ async def _open_lease_upstream_tunnel(
                     code,
                     lease.down_bytes - attempt_down_before,
                 )
+                observed_down_bytes += lease.down_bytes - attempt_down_before
                 raise _DeadExitResponse()
             return srv_r, srv_w, status, response_headers
         except BaseException as exc:
@@ -6342,10 +6363,7 @@ async def _open_lease_upstream_tunnel(
         failover_allowed = (
             False
             if lease.source == "fbref"
-            else (
-                lease.down_bytes == 0
-                or isinstance(last_error, _DeadExitResponse)
-            )
+            else lease.down_bytes == observed_down_bytes
         )
         if (
             failover_allowed

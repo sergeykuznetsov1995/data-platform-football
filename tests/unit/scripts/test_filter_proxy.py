@@ -9431,3 +9431,116 @@ def test_two_drained_dead_exits_in_a_row_each_get_the_full_byte_cap(
     assert lease.upstream == ("pool.invalid", 10002, "u", "p")
     assert lease.down_bytes == 2 * len(dead) + len(_LIVE_CONNECT_HEAD)
     assert "did not end within" not in caplog.text
+
+
+def test_dead_exit_body_length_refuses_a_length_int_cannot_parse(shared_mod):
+    # ``isdigit()`` accepts a digit run past CPython's int() limit, where int()
+    # raises ValueError out of the tunnel opener without latching anything.
+    huge = str(10**9) + "0" * 5000
+    assert huge.isdigit()
+    lines = [b"Content-Length: " + huge.encode()]
+    assert shared_mod._dead_exit_body_length(lines) is None
+    assert shared_mod._dead_exit_body_length([b"Content-Length: 600"]) == 600
+
+
+def test_dead_exit_head_over_cap_keeps_latch_even_with_empty_body(
+    shared_mod, monkeypatch
+):
+    # A head larger than the per-attempt ceiling must not buy a re-pin just
+    # because Content-Length proves the body is empty.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    padding = b"X-Pad: " + b"p" * 1200 + b"\r\n"
+    response = (
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+        + padding
+        + b"Connection: close\r\n\r\n"
+    )
+    assert len(response) > shared_mod.DEAD_EXIT_RESPONSE_MAX_BYTES
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(response), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _dead_exit_handle(shared_mod, lease, mgr)
+
+    assert b"502 Bad Gateway" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
+    assert lease.upstream_repins == 0
+
+
+def test_drained_dead_exit_does_not_block_a_later_empty_eof_failover(
+    shared_mod, monkeypatch
+):
+    # After a fully metered rejection the lease owns no unproven byte, so the
+    # next exit's empty EOF must still be allowed to re-pin.
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",
+            "http://u:p@pool.invalid:10001",
+            "http://u:p@pool.invalid:10002",
+        ]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _FakeUpstreamReader(_DEAD_EXIT_RESPONSE), _FakeUpstreamWriter()
+        if len(opens) == 2:
+            # A closed/reset exit: EOF before any head byte.
+            return _FakeUpstreamReader(b""), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(_LIVE_CONNECT_HEAD), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    client_writer = _dead_exit_handle(shared_mod, lease, mgr)
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is False
+    assert lease.usable is True
+    assert lease.upstream_repins == 2
+    assert lease.upstream == ("pool.invalid", 10002, "u", "p")
+
+
+def test_pump_cancellation_is_named_in_the_latch_reason(shared_mod):
+    # The pump's ``finally`` latches before the caller can attribute a
+    # cancellation, and first-cause-wins then freezes that reason: it must name
+    # the real cause instead of claiming nothing was swallowed.
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    # Every remaining byte is reserved elsewhere, so the down pump parks in
+    # _wait_for_reservation_turnover with the lease still usable.
+    shared_mod._reserve_lease_bytes(lease, shared_mod._lease_remaining(lease))
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            shared_mod._pump(
+                _FakeUpstreamReader(b"", block_when_empty=True),
+                _ClientWriter(),
+                "www.sofascore.com",
+                {},
+                lease=lease,
+                direction="down",
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 2.0))
+
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == (
+        "pump_exit_without_provider_eof:CancelledError"
+    )
