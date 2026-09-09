@@ -318,7 +318,9 @@ _TLS_ECH_EXTENSION_TYPES = frozenset({0xFE0D, 0xFFCE})
 # these bounds the lease's only tunnel hangs forever (byte-metered head read),
 # never drains ``active_tunnels`` and latches the single serial SofaScore slot
 # (#946).  The connect/head reads are bounded, and a re-pin to a fresh exit is
-# allowed only before the first provider byte has been billed.
+# allowed only while every provider byte billed on the lease is provably
+# complete — none at all, or a rejected CONNECT response this call metered whole
+# (#1247 A2).
 LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = 5.0
 LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS = 4.0
 LEASE_UPSTREAM_FAILOVER_ATTEMPTS = 2
@@ -4774,8 +4776,12 @@ async def _read_metered_provider_head(
     lease: Lease,
     host: str,
     timeout_seconds: float | None = None,
-) -> tuple[bytes, list[bytes]]:
+) -> tuple[bytes, list[bytes], int]:
     """Read an upstream HTTP response head without crossing a paid budget.
+
+    Returns the status line, the header lines and the exact number of provider
+    bytes this call settled — the caller cannot recover that count from the
+    shared lease counter, which any concurrent tunnel may also advance.
 
     ``StreamReader.readline`` has no per-call byte limit. Reading the provider
     response one byte at a time under one pre-reserved window is deliberate:
@@ -4857,7 +4863,7 @@ async def _read_metered_provider_head(
     lines = bytes(payload).splitlines(keepends=True)
     if not lines:
         raise RuntimeError("empty provider response head")
-    return lines[0], lines[1:-1]
+    return lines[0], lines[1:-1], len(payload)
 
 
 def _provider_connect_status_code(status: bytes) -> int | None:
@@ -6243,7 +6249,7 @@ async def _open_lease_upstream_tunnel(
     target: str,
     host: str,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes, list[bytes]]:
-    """Open a lease CONNECT tunnel, failing over only a proven empty EOF/reset.
+    """Open a lease CONNECT tunnel, failing over only on a proven-complete exit.
 
     A dead exit accepts the TCP connection and then never answers the CONNECT.
     Each attempt dials the lease's currently-pinned exit, sends the CONNECT head
@@ -6253,7 +6259,11 @@ async def _open_lease_upstream_tunnel(
     one-attempt contract never re-pins even after a zero-byte TCP failure.  A
     head timeout is never retryable for any source: transport read-ahead makes
     its provider-byte total unknowable, so the reader latches accounting
-    uncertainty and makes the lease unusable.  Every failed attempt closes its
+    uncertainty and makes the lease unusable.  A non-200 CONNECT on the first
+    SofaScore tunnel is retryable only after this call meters the whole
+    rejection itself (EOF or an unambiguous Content-Length); the failover gate
+    compares the lease counter against that self-measured total, so bytes billed
+    by a concurrent tunnel refuse the re-pin instead of certifying it.  Every failed attempt closes its
     socket and unregisters it from ``tunnel_writers``. Credentials and
     ``host:port`` are never logged — only non-reversible fingerprint hashes.
     """
@@ -6270,9 +6280,6 @@ async def _open_lease_upstream_tunnel(
     observed_down_bytes = 0
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
         up_host, up_port, up_user, up_pass = lease.upstream
-        # Each attempt owns its own dead-exit byte budget: a fully drained
-        # rejection must not shrink the ceiling of the next exit's response.
-        attempt_down_before = lease.down_bytes
         srv_w = None
         try:
             # A failover is another provider-bound session, not a free retry.
@@ -6297,7 +6304,7 @@ async def _open_lease_upstream_tunnel(
                 srv_w, connect_request, lease=lease, host=host, direction="up"
             ):
                 raise _LeaseBudgetRefused()
-            status, response_headers = await _read_metered_provider_head(
+            status, response_headers, head_bytes = await _read_metered_provider_head(
                 srv_r,
                 lease,
                 host,
@@ -6312,7 +6319,7 @@ async def _open_lease_upstream_tunnel(
                     srv_r,
                     lease,
                     host,
-                    already=lease.down_bytes - attempt_down_before,
+                    already=head_bytes,
                     content_length=_dead_exit_body_length(response_headers),
                 )
                 if drained is None:
@@ -6326,13 +6333,13 @@ async def _open_lease_upstream_tunnel(
                     return srv_r, srv_w, status, response_headers
                 log.warning(
                     "lease %s dead exit on first tunnel: CONNECT %s rejected "
-                    "with status %s, %d response bytes settled to EOF",
+                    "with status %s, whole %d-byte response metered",
                     lease.lease_id,
                     _upstream_fingerprint(lease.upstream),
                     code,
-                    lease.down_bytes - attempt_down_before,
+                    head_bytes + drained,
                 )
-                observed_down_bytes += lease.down_bytes - attempt_down_before
+                observed_down_bytes += head_bytes + drained
                 raise _DeadExitResponse()
             return srv_r, srv_w, status, response_headers
         except BaseException as exc:

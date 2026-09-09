@@ -9544,3 +9544,49 @@ def test_pump_cancellation_is_named_in_the_latch_reason(shared_mod):
     assert lease.accounting_uncertain_reason == (
         "pump_exit_without_provider_eof:CancelledError"
     )
+
+
+def test_dead_exit_failover_refuses_when_another_tunnel_billed_bytes(
+    shared_mod, monkeypatch
+):
+    # The proof is "this call metered every byte the lease was charged". Bytes
+    # billed by a concurrent tunnel while the rejection is drained were never
+    # proven here, so they must refuse the re-pin instead of certifying it.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    class _ForeignBillingReader(_FakeUpstreamReader):
+        """Another tunnel on the same lease bills 37 bytes mid-drain."""
+
+        def __init__(self, data):
+            super().__init__(data)
+            self.charged = False
+
+        async def read(self, size):
+            chunk = await super().read(size)
+            if chunk and not self.charged and not self.buf:
+                self.charged = True
+                shared_mod._account_lease_bytes(
+                    lease, "www.sofascore.com", "down", 37
+                )
+            return chunk
+
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _ForeignBillingReader(_DEAD_EXIT_RESPONSE), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(_LIVE_CONNECT_HEAD), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _dead_exit_handle(shared_mod, lease, mgr)
+
+    assert b"502 Bad Gateway" in bytes(client_writer.payload)
+    assert lease.upstream_repins == 0
+    assert lease.upstream == ("pool.invalid", 10000, "u", "p")
+    assert opens == [("pool.invalid", 10000)]
