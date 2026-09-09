@@ -9328,3 +9328,106 @@ def test_dead_exit_response_without_eof_keeps_latch(shared_mod, monkeypatch):
     assert lease.accounting_uncertain is True
     assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
     assert lease.upstream_repins == 0
+
+
+def _dead_exit_handle(shared_mod, lease, mgr):
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            shared_mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+    return client_writer
+
+
+@pytest.mark.parametrize(
+    "framing",
+    [
+        b"Content-Length: 11\r\nContent-Length: 11\r\n",
+        b"Content-Length: 11\r\nTransfer-Encoding: chunked\r\n",
+        b"Content-Length: 0\r\nTransfer-Encoding: chunked\r\n",
+        b"Content-Length: +11\r\n",
+    ],
+    ids=("duplicate", "chunked-with-length", "chunked-zero-length", "non-numeric"),
+)
+def test_dead_exit_ambiguous_body_framing_keeps_latch(
+    shared_mod, monkeypatch, framing
+):
+    # A repeated/non-numeric Content-Length or any Transfer-Encoding is not a
+    # proof of the tail: without a provider EOF the escrow must stay retained.
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+    monkeypatch.setattr(
+        shared_mod, "LEASE_CLIENT_HANGUP_DRAIN_SECONDS", 0.02, raising=False
+    )
+
+    response = (
+        b"HTTP/1.1 502 Bad Gateway\r\n" + framing + b"Connection: close\r\n\r\n"
+        b"dead-exit!!"
+    )
+
+    async def fake_open(host, port):
+        return (
+            _FakeUpstreamReader(response, block_when_empty=True),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    client_writer = _dead_exit_handle(shared_mod, lease, mgr)
+
+    assert b"502 Bad Gateway" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
+    assert lease.upstream_repins == 0
+
+
+def test_two_drained_dead_exits_in_a_row_each_get_the_full_byte_cap(
+    shared_mod, monkeypatch, caplog
+):
+    # The response cap is per attempt. Two 600-byte rejections must both be
+    # drained and re-pinned; a per-call cap would latch on the second one.
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",
+            "http://u:p@pool.invalid:10001",
+            "http://u:p@pool.invalid:10002",
+        ]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr, budget=65536)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    dead = (
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 600\r\n"
+        b"Connection: close\r\n\r\n" + b"d" * 600
+    )
+    assert len(dead) > shared_mod.DEAD_EXIT_RESPONSE_MAX_BYTES // 2
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) <= 2:
+            return _FakeUpstreamReader(dead, block_when_empty=True), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(_LIVE_CONNECT_HEAD), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+
+    with caplog.at_level("WARNING"):
+        client_writer = _dead_exit_handle(shared_mod, lease, mgr)
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is False
+    assert lease.usable is True
+    assert lease.upstream_repins == 2
+    assert lease.upstream == ("pool.invalid", 10002, "u", "p")
+    assert lease.down_bytes == 2 * len(dead) + len(_LIVE_CONNECT_HEAD)
+    assert "did not end within" not in caplog.text

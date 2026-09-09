@@ -19,7 +19,7 @@ SHARED_FILTER_SHA256 = (
     # Bumped for the latch reason and the first-tunnel dead-exit failover
     # (#1247 A2).  FBref keeps its own filter and stays out of
     # ``runtime_files`` — both asserted below.
-    "4b5cc09f526dc97644c46e3c1d19f25268a1f41c3af7b555ffe00f48dd377e4a"
+    "3cbe2bc9af48c5b378b82e4bcccd4d55c82b1ed0d408dbec99e89a7c606435cc"
 )
 
 

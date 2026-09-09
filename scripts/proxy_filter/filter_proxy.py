@@ -4663,6 +4663,34 @@ async def _reject_client_head(
     writer.close()
 
 
+def _dead_exit_body_length(lines: list[bytes]) -> int | None:
+    """Return a provably exact response body length, or ``None``.
+
+    ``_header_map`` silently keeps the last of repeated headers, which is not a
+    proof: a duplicated or non-numeric ``Content-Length``, or any
+    ``Transfer-Encoding``, leaves the body length ambiguous.  The drain then
+    accepts only a real provider EOF as evidence that nothing is left billed
+    inside transport read-ahead.
+    """
+
+    length: int | None = None
+    for line in lines:
+        try:
+            name, value = line.decode("latin1").split(":", 1)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        lowered = name.strip().lower()
+        rendered = value.strip()
+        if lowered == "transfer-encoding":
+            return None
+        if lowered != "content-length":
+            continue
+        if length is not None or not (rendered.isascii() and rendered.isdigit()):
+            return None
+        length = int(rendered)
+    return length
+
+
 async def _drain_dead_exit_response(
     reader: asyncio.StreamReader,
     lease: Lease,
@@ -6220,9 +6248,11 @@ async def _open_lease_upstream_tunnel(
     # the lease already owns that exit's response bytes (down 251 in the field),
     # yet the next attempt is still part of the same dead-exit failover.
     first_tunnel = lease.source == "sofascore" and lease.down_bytes == 0
-    down_before = lease.down_bytes
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
         up_host, up_port, up_user, up_pass = lease.upstream
+        # Each attempt owns its own dead-exit byte budget: a fully drained
+        # rejection must not shrink the ceiling of the next exit's response.
+        attempt_down_before = lease.down_bytes
         srv_w = None
         try:
             # A failover is another provider-bound session, not a free retry.
@@ -6258,19 +6288,12 @@ async def _open_lease_upstream_tunnel(
             )
             code = _provider_connect_status_code(status)
             if first_tunnel and code != 200:
-                raw_length = _header_map(response_headers).get("content-length")
-                try:
-                    content_length = None if raw_length is None else int(raw_length)
-                except ValueError:
-                    content_length = None
-                if content_length is not None and content_length < 0:
-                    content_length = None
                 drained = await _drain_dead_exit_response(
                     srv_r,
                     lease,
                     host,
-                    already=lease.down_bytes - down_before,
-                    content_length=content_length,
+                    already=lease.down_bytes - attempt_down_before,
+                    content_length=_dead_exit_body_length(response_headers),
                 )
                 if drained is None:
                     log.warning(
@@ -6287,7 +6310,7 @@ async def _open_lease_upstream_tunnel(
                     lease.lease_id,
                     _upstream_fingerprint(lease.upstream),
                     code,
-                    lease.down_bytes - down_before,
+                    lease.down_bytes - attempt_down_before,
                 )
                 raise _DeadExitResponse()
             return srv_r, srv_w, status, response_headers
