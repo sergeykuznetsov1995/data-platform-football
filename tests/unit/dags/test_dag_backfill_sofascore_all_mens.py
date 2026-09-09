@@ -124,6 +124,26 @@ def test_history_lane_defaults_match_the_single_slot_campaign(monkeypatch):
 
 
 @pytest.mark.unit
+def test_validate_is_isolated_from_sibling_scopes():
+    """#1248 ступень 1: батч из трёх скоупов — падение одного не гасит учёт двух других.
+
+    `validate_historical_scope` разложен по тому же плану, но не внутри mapped-группы:
+    с дефолтным `all_success` упавший `run[1]` делал `upstream_failed` ВСЕ три validate,
+    и finalize помечал failed два оплаченных и успешных скоупа. `all_done` даёт каждому
+    validate дойти до своей проверки — «упал ли мой скоуп» он выясняет сам, по своему
+    результату."""
+    from airflow.operators.python import PythonOperator
+
+    _load_dag_module()
+    validate = next(
+        item for item in PythonOperator._instances
+        if item.task_id == "validate_historical_scope"
+    )
+
+    assert validate._init_kwargs.get("trigger_rule") == "all_done"
+
+
+@pytest.mark.unit
 def test_history_lane_knobs_come_from_env(monkeypatch):
     monkeypatch.setenv("SOFASCORE_HISTORY_BATCH_SIZE", "3")
     monkeypatch.setenv("SOFASCORE_HISTORY_POOL", "sofascore_history_pool")
