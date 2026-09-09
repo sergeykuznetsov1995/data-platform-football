@@ -53,6 +53,18 @@ def _validate_snapshot(snapshot: Mapping[str, Any]) -> None:
         raise SnapshotEnrichmentError("snapshot candidate_count mismatch")
 
 
+def _schema_error_retry(season: Mapping[str, Any]) -> bool:
+    """True when a season was excluded only by a source team-index schema error."""
+
+    if season.get("metadata_status") != "excluded":
+        return False
+    evidence = season.get("team_count_evidence")
+    return (
+        isinstance(evidence, Mapping)
+        and evidence.get("reason") == "schema_error"
+    )
+
+
 def enrich_snapshot(
     snapshot: Mapping[str, Any],
     client: Any,
@@ -73,6 +85,8 @@ def enrich_snapshot(
     document = deepcopy(dict(snapshot))
     processed = 0
     source_requests = 0
+    retried_scopes = 0
+    recovered_scopes = 0
     for tournament in document["tournaments"]:
         changed = False
         if max_tournaments is not None and processed >= max_tournaments:
@@ -85,8 +99,15 @@ def enrich_snapshot(
             if isinstance(season, dict)
             and int(season.get("start_year", -1)) == int(wave_start_year)
         ]
+        retry_seasons = [
+            season for season in tournament.get("seasons") or []
+            if status != "excluded"
+            and isinstance(season, dict)
+            and int(season.get("start_year", -1)) != int(wave_start_year)
+            and _schema_error_retry(season)
+        ]
         needs_identity = status == "pending"
-        needs_teams = any(
+        needs_teams = bool(retry_seasons) or any(
             season.get("metadata_status") == "pending" for season in wave_seasons
         )
         if not needs_identity and not needs_teams:
@@ -123,9 +144,13 @@ def enrich_snapshot(
             tournament["metadata_status"] = "ready"
             changed = True
 
-        for season in wave_seasons:
-            if season.get("metadata_status") != "pending":
-                continue
+        due_seasons = [
+            season for season in wave_seasons
+            if season.get("metadata_status") == "pending"
+        ] + retry_seasons
+        for season in due_seasons:
+            retrying = season.get("metadata_status") == "excluded"
+            retried_scopes += int(retrying)
             season_id = int(season["source_season_id"])
             endpoint = SEASON_TEAMS_PATH.format(
                 unique_tournament_id=source_id,
@@ -142,7 +167,8 @@ def enrich_snapshot(
             except DiscoverySchemaError:
                 # Some source-listed cup seasons legitimately expose no team
                 # index. Keep the exact season fail-closed without aborting
-                # metadata validation for every other tournament.
+                # metadata validation for every other tournament. A later wave
+                # looks at this season once more (C1, #1247).
                 season["team_count"] = None
                 season["team_count_evidence"] = {
                     "type": "source_team_ids_unavailable",
@@ -155,6 +181,7 @@ def enrich_snapshot(
             season["team_count"] = team_count
             season["team_count_evidence"] = evidence
             season["metadata_status"] = "ready"
+            recovered_scopes += int(retrying)
             changed = True
         if changed:
             document["snapshot_id"] = _snapshot_digest(document)
@@ -190,6 +217,8 @@ def enrich_snapshot(
         "excluded_tournaments": excluded_tournaments,
         "ready_wave_scopes": ready_wave_scopes,
         "excluded_wave_scopes": excluded_wave_scopes,
+        "retried_schema_error_scopes": retried_scopes,
+        "recovered_schema_error_scopes": recovered_scopes,
         "source_requests": source_requests,
     }
 
