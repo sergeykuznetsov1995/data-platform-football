@@ -62,7 +62,13 @@ def _phase_report(path: Path) -> dict[str, Any]:
     }
     traffic = payload.get("traffic")
     if isinstance(traffic, dict):
-        for field in ("status_counts", "endpoints", "request_count", "replay_hits"):
+        for field in (
+            "status_counts",
+            "status_counts_stage",
+            "endpoints",
+            "request_count",
+            "replay_hits",
+        ):
             if field in traffic:
                 report[field] = traffic[field]
     return report
@@ -120,13 +126,18 @@ def run_phase(
         argv.extend(["--raw-store-uri", str(scope["raw_store_uri"])])
     if scope.get("force_replace"):
         argv.append("--force-replace")
+    report_path = destination / f"{phase}.json"
+    # An Airflow retry reuses this directory (sofascore_all_mens_state.py
+    # hashes the DagRun id, not the try number), so a report left by the
+    # previous try must not be read as this one's.
+    report_path.unlink(missing_ok=True)
     exit_code = int(run_capture(argv))
     return {
         "phase": phase,
         "status": "success" if exit_code == 0 else "failed",
         "exit_code": exit_code,
         "plan": str(plan),
-        **_phase_report(destination / f"{phase}.json"),
+        **_phase_report(report_path),
     }
 
 
@@ -236,6 +247,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result["errors"].extend(f"{phase}: {message}" for message in phase_errors)
             if phase_result.get("status_counts") is not None:
                 result["status_counts"] = phase_result["status_counts"]
+                result.pop("status_counts_stage", None)
+                if phase_result.get("status_counts_stage") is not None:
+                    result["status_counts_stage"] = phase_result[
+                        "status_counts_stage"
+                    ]
             if phase_result.get("status") != "success":
                 if not phase_errors:
                     result["errors"].append(
