@@ -143,12 +143,14 @@ jobs:
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
+            ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_ver="$("$buildx_bin" version)"
           case "$buildx_ver" in
             "github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782") ;;
             "github.com/docker/buildx v0.36.1 1d8dde89b8aba914e05e45366770736fea1fd690") ;;
+            "github.com/docker/buildx v0.37.0 ac30b249211430b85fb8f37b6e7154b5c47ba0b6") ;;
             *) echo "unpinned system buildx version: $buildx_ver" >&2; exit 1 ;;
           esac
           test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
@@ -172,12 +174,14 @@ jobs:
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
+            ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_ver="$("$buildx_exec" version)"
           case "$buildx_ver" in
             "github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782") ;;
             "github.com/docker/buildx v0.36.1 1d8dde89b8aba914e05e45366770736fea1fd690") ;;
+            "github.com/docker/buildx v0.37.0 ac30b249211430b85fb8f37b6e7154b5c47ba0b6") ;;
             *) echo "unpinned system buildx version: $buildx_ver" >&2; exit 1 ;;
           esac
           test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
@@ -232,6 +236,7 @@ jobs:
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
+            ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -262,6 +267,7 @@ jobs:
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
+            ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -427,6 +433,7 @@ jobs:
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
+            ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -592,6 +599,7 @@ jobs:
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
+            ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
