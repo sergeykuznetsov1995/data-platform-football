@@ -43,6 +43,31 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         raise
 
 
+def _phase_report(path: Path) -> dict[str, Any]:
+    """Read what the capture runner wrote for this phase, if anything.
+
+    The runner already records its failure messages and endpoint counters in
+    ``<output-dir>/<phase>.json``; without this the cycle result kept only an
+    exit code and every red attempt looked reasonless (#1260).
+    """
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"errors": []}
+    if not isinstance(payload, dict):
+        return {"errors": []}
+    report: dict[str, Any] = {
+        "errors": [str(message) for message in payload.get("errors") or []]
+    }
+    traffic = payload.get("traffic")
+    if isinstance(traffic, dict):
+        for field in ("status_counts", "endpoints", "request_count", "replay_hits"):
+            if field in traffic:
+                report[field] = traffic[field]
+    return report
+
+
 def run_phase(
     phase: str,
     scope: Mapping[str, Any],
@@ -101,6 +126,7 @@ def run_phase(
         "status": "success" if exit_code == 0 else "failed",
         "exit_code": exit_code,
         "plan": str(plan),
+        **_phase_report(destination / f"{phase}.json"),
     }
 
 
@@ -206,7 +232,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 workload_artifact=args.workload_artifact,
             )
             result["phases"].append(phase_result)
+            phase_errors = phase_result.get("errors") or []
+            result["errors"].extend(f"{phase}: {message}" for message in phase_errors)
+            if phase_result.get("status_counts") is not None:
+                result["status_counts"] = phase_result["status_counts"]
             if phase_result.get("status") != "success":
+                if not phase_errors:
+                    result["errors"].append(
+                        f"{phase}: exit_code={phase_result.get('exit_code')}, "
+                        "phase report missing"
+                    )
                 result["status"] = "failed"
                 _atomic_json(output, result)
                 return 1

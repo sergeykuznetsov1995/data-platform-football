@@ -198,6 +198,7 @@ def test_run_phase_plans_matches_from_the_scope_season_evidence(tmp_path):
         "status": "success",
         "exit_code": 0,
         "plan": str(plan),
+        "errors": [],
     }
     assert planner.call_args.kwargs["phase"] == "targets"
     assert planner.call_args.kwargs["season_evidence"] == "bronze"
