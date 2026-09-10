@@ -1,6 +1,7 @@
 # Изолированный sofascore-стек (#951/#999): монтируется поверх dags/.airflowignore
-# дерева релиза (deploy/sofascore/airflow.compose.yaml). Активны в контуре ровно пять
-# DAG: dag_ingest_sofascore, dag_backfill_sofascore_all_mens, dag_refresh_sofascore_all_mens
+# дерева релиза (deploy/sofascore/airflow.compose.yaml). Активны в контуре ровно шесть
+# DAG: dag_ingest_sofascore, dag_backfill_sofascore_all_mens, dag_refresh_sofascore_all_mens,
+# dag_players_sofascore_all_mens (#1244)
 # и два мини-DAG контура — dag_trigger_sofascore_daily, dag_sofascore_manifest_maintenance
 # (лежат в dags/ репозитория; на общем scheduler'е их прячет dags/.airflowignore).
 # ВНИМАНИЕ: движок regexp здесь RE2 (не Python re) — negative lookahead (?!...)

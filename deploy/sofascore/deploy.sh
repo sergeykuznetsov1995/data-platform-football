@@ -56,10 +56,18 @@ CAMPAIGN="$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
+PLAYERS=dag_players_sofascore_all_mens
 MAINT=dag_sofascore_manifest_maintenance
+# Число core-DAG выводится ИЗ СПИСКА и нигде не пишется литералом: рассинхрон
+# списка и числа — самая дешёвая в исполнении и самая дорогая по последствиям
+# ошибка этого рецепта (приёмка не сходится ни разу, зелёная доставка откатывается).
+CORE_DAGS="$DAILY $HIST $REFRESH $PLAYERS"
+CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
+CORE_DAGS_N=$(set -- $CORE_DAGS; echo $#)
 # Один источник имени пула на set_pool, предикат ожидания и ломатель: разъехавшись, они
 # осушали бы один пул, а ждали задачи в другом.
 HIST_POOL=sofascore_history_pool
+PLAYERS_POOL=sofascore_players_pool
 # Доказательство учёта оплаченного скоупа за этот drain (#1245): автомат ночной доставки
 # переносит его в запись окна, утренняя приёмка сверяет DRAIN_RUN_ID с метабазой.
 # Каталог — тот же ключ, что читает автомат (SOFASCORE_AUTO_STATE_DIR): два независимо
@@ -230,13 +238,16 @@ wait_drained() {  # wait_drained <секунд>; 0 — контур осушён
     # Выбор повторяется, пока прогон не выбран: платная работа могла начаться до осушения
     # пула, но ещё не быть видимой первым запросом.
     [ -n "$HIST_RUN" ] || pick_hist_run
-    # Одним запросом, пять чисел: прогоны дейли; задачи дейли, актуалки и обслуживания;
+    # Одним запросом, пять чисел: прогоны дейли; задачи дейли, актуалки, полосы игроков и
+    # обслуживания — полоса игроков в этом же числе, потому что её оплаченный скоуп нельзя
+    # оборвать пересозданием scheduler'а (паузить её при этом нельзя: под паузой не
+    # отработает validate_players_scope);
     # отслеживаемый прогон истории; задачи истории — они закрывают окно, когда у нового
     # прогона успел стартовать plan_historical_batch; припаркованный скоуп отслеживаемого
     # прогона. Одним, а не пятью: рваное чтение показало бы контур свободным по числам из
     # разных моментов. Пустой ответ (метабаза недоступна / timeout) — это «не знаю», а не
     # «свободно».
-    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH','$MAINT') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='run_historical_scope' AND map_index>=0 AND pool='$HIST_POOL' AND state IN ('scheduled','up_for_retry'));" || true)
+    DRAIN_ROW=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id='$DAILY' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$REFRESH','$PLAYERS','$MAINT') AND state IN ('queued','running')), (SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND state IN ('queued','running')), (SELECT count(*) FROM task_instance WHERE dag_id='$HIST' AND run_id='$HIST_RUN' AND task_id='run_historical_scope' AND map_index>=0 AND pool='$HIST_POOL' AND state IN ('scheduled','up_for_retry'));" || true)
     [ "${DRAIN_ROW:-x}" = "0|0|0|0|0" ] && return 0
     parked=${DRAIN_ROW##*|}
     case "$parked" in ''|*[!0-9]*) parked=0 ;; esac
@@ -410,6 +421,11 @@ on_exit() {
     else
       log "MANUAL ACTION REQUIRED: $HIST_POOL left drained — airflow pools set $HIST_POOL $HISTORY_SLOTS 'SofaScore history lane'"
     fi
+    if set_pool "$PLAYERS_POOL" "$PLAYERS_SLOTS" 'SofaScore players lane'; then
+      log "$PLAYERS_POOL restored to $PLAYERS_SLOTS slots"
+    else
+      log "MANUAL ACTION REQUIRED: $PLAYERS_POOL left drained — airflow pools set $PLAYERS_POOL $PLAYERS_SLOTS 'SofaScore players lane'"
+    fi
   fi
   # rc=4 — «контур занят, выкат не начат»: паузу истории тоже возвращаем как было.
   # На прочих кодах история остаётся на паузе, как и при штатном выкате.
@@ -492,9 +508,16 @@ HIST_WAS_PAUSED=$(is_paused "$HIST")
 # случается, потому что DAG на паузе. Паузу снимает тот, кто снял снимок: при ручном
 # запуске — этот скрипт, из автомата ночной доставки — сам автомат после приёмки или отката.
 MAINT_WAS_PAUSED=$(is_paused "$MAINT")
-log "drain: $HIST_POOL -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED) и $MAINT (was paused=$MAINT_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
-set_pool "$HIST_POOL" 0 'SofaScore history lane (drained for deploy)'
+log "drain: $HIST_POOL и $PLAYERS_POOL -> 0 slots, pause $REFRESH (was paused=$REFRESH_WAS_PAUSED) и $MAINT (was paused=$MAINT_WAS_PAUSED), wait up to ${IDLE_WAIT}s"
+# Флаг ставится ДО первого осушения: отказ на втором пуле выходит по `set -e`, и
+# on_exit обязан знать, что первый уже осушён, — иначе история осталась бы с нулём
+# слотов молча. Возврат пула, который осушить не удалось, безвреден (set идемпотентен).
 POOL_DRAINED=1
+set_pool "$HIST_POOL" 0 'SofaScore history lane (drained for deploy)'
+# Полосу игроков паузить нельзя по той же причине, что и историю: под паузой не
+# отработает validate_players_scope, и оплаченный скоуп не будет засчитан.
+# Дверь новым скоупам закрывает пул, а взятый доработает вместе со своим validate.
+set_pool "$PLAYERS_POOL" 0 'SofaScore players lane (drained for deploy)'
 pause_dag "$REFRESH"
 pause_dag "$MAINT"
 # `|| true` внутри hist_scope_row обязателен: без него отказ метабазы под `set -e` вышел бы
@@ -534,11 +557,11 @@ OLD_STATE_DIR="${OLD_RELEASE:+$OLD_RELEASE/logs/sofascore-all-men}"
 if [ -n "$OLD_STATE_DIR" ] && [ -d "$OLD_STATE_DIR" ] && [ ! -e "$CAMPAIGN/state.json" ]; then
   cp -a "$OLD_STATE_DIR/state.json" "$CAMPAIGN/state.json"
   [ -e "$OLD_STATE_DIR/failures.json" ] && cp -a "$OLD_STATE_DIR/failures.json" "$CAMPAIGN/failures.json"
-  mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results"
+  mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results" "$CAMPAIGN/players-results"
   cp -a "$OLD_STATE_DIR/results/." "$CAMPAIGN/results/"
   log "campaign state migrated from $OLD_STATE_DIR ($(python3 -c "import json;print(len(json.load(open('$CAMPAIGN/state.json'))['completed']))") completed)"
 fi
-mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results"
+mkdir -p "$CAMPAIGN/results" "$CAMPAIGN/refresh-results" "$CAMPAIGN/players-results"
 # Каталог кампании растёт вместе с ней (тысячи файлов): без потолка `chown` мог бы
 # оказаться самым долгим шагом выката, который никто не ограничивает.
 timeout -k 5 120 chown -R 50000:0 "$CAMPAIGN"
@@ -613,13 +636,13 @@ docker exec sofascore-airflow-scheduler python /opt/airflow/scripts/sofascore_ru
   --campaign-policy /opt/airflow/configs/sofascore/all_mens_campaign.json >> "$LOG" 2>&1
 for _ in $(seq 1 30); do
   errs=$($PSQL "SELECT count(*) FROM import_error;")
-  present=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('$HIST','$REFRESH','$DAILY') AND is_active=true;")
-  [ "$present" = "3" ] && break
+  present=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active=true;")
+  [ "$present" = "$CORE_DAGS_N" ] && break
   sleep 10
 done
 log "dags active=$present import_errors=$errs"
 [ "$errs" = "0" ] || { log "import errors present — см. import_error"; exit 6; }
-[ "$present" = "3" ] || { log "expected 3 active core DAGs, got $present"; exit 6; }
+[ "$present" = "$CORE_DAGS_N" ] || { log "expected $CORE_DAGS_N active core DAGs, got $present"; exit 6; }
 
 STEP="pools"
 # Пулы полос заводит airflow-init, но deploy.sh пересоздаёт только scheduler и шлюзы —
@@ -627,8 +650,8 @@ STEP="pools"
 # несуществующем пуле. `airflow pools set` идемпотентен: создаёт или переставляет слоты.
 set_pool ingest_scraper_pool 1 'Serialize heavy ingest scrapers (isolated sofascore stack #951)'
 set_pool "$HIST_POOL" "$HISTORY_SLOTS" 'SofaScore history lane'
-set_pool sofascore_players_pool "$PLAYERS_SLOTS" 'SofaScore players lane'
-log "pools set: ingest_scraper_pool=1 $HIST_POOL=$HISTORY_SLOTS sofascore_players_pool=$PLAYERS_SLOTS"
+set_pool "$PLAYERS_POOL" "$PLAYERS_SLOTS" 'SofaScore players lane'
+log "pools set: ingest_scraper_pool=1 $HIST_POOL=$HISTORY_SLOTS $PLAYERS_POOL=$PLAYERS_SLOTS"
 POOL_DRAINED=""   # слоты вернулись штатно — позднему обрыву возвращать нечего
 
 STEP="restore-pause"

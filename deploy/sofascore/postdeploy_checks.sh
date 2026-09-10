@@ -18,6 +18,11 @@ GATEWAY_CONTAINERS=(sofascore_gw_951 sofascore_gw_history sofascore_gw_players)
 GATEWAY_STATE_DIRS=("${SOFASCORE_GATEWAY_STATE_HOST_DIR:?}" "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?}" "${SOFASCORE_PLAYERS_GW_STATE_HOST_DIR:?}")
 GATEWAY_SERVICES=(sofascore_proxy_filter sofascore_gw_history sofascore_gw_players)
 WATCHDOG_UNITS=(sofascore-gw-lease-watchdog.service sofascore-gw-lease-watchdog-history.service sofascore-gw-lease-watchdog-players.service)
+# Все DAG контура. Число ниже считается ИЗ этого списка — литерал рядом со
+# списком рассинхронизируется первым же новым DAG.
+CONTOUR_DAGS=(dag_backfill_sofascore_all_mens dag_refresh_sofascore_all_mens dag_players_sofascore_all_mens dag_ingest_sofascore dag_trigger_sofascore_daily dag_sofascore_manifest_maintenance)
+CONTOUR_DAGS_SQL=$(printf "'%s'," "${CONTOUR_DAGS[@]}"); CONTOUR_DAGS_SQL=${CONTOUR_DAGS_SQL%,}
+CONTOUR_DAGS_N=${#CONTOUR_DAGS[@]}
 FAILS=0
 fail() { echo "  ✗ $*"; FAILS=$((FAILS + 1)); }
 ok() { echo "  ✓ $*"; }
@@ -99,8 +104,8 @@ errs=$($PSQL "SELECT count(*) FROM import_error;")
 echo "import_error=$errs"
 [ "$errs" = "0" ] && ok "import_error=0" || fail "import_error=$errs"
 $PSQL "SELECT dag_id, is_paused, is_active FROM dag WHERE dag_id LIKE '%sofascore%' ORDER BY 1;"
-active=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('dag_backfill_sofascore_all_mens','dag_refresh_sofascore_all_mens','dag_ingest_sofascore','dag_trigger_sofascore_daily','dag_sofascore_manifest_maintenance') AND is_active=true;")
-[ "$active" = "5" ] && ok "5 DAG контура активны" || fail "активных DAG контура: $active из 5"
+active=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ($CONTOUR_DAGS_SQL) AND is_active=true;")
+[ "$active" = "$CONTOUR_DAGS_N" ] && ok "$CONTOUR_DAGS_N DAG контура активны" || fail "активных DAG контура: $active из $CONTOUR_DAGS_N"
 
 echo
 echo "== 5. Состояние кампании =="

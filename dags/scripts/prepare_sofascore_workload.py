@@ -90,6 +90,18 @@ def _load_pinned_workload_policy(artifact_path: os.PathLike[str] | str):
     return policy
 
 
+class PlayerEvidenceNotReady(RuntimeError):
+    """The players phase has to WAIT, it is not broken.
+
+    Profiles can only be planned once every match of the season has committed
+    Bronze, so a lane whose queue runs ahead of the match capture meets this
+    routinely.  Telling it apart from a real failure by the text of a
+    ``RuntimeError`` would be brittle, and a lane with exactly one
+    tournament-season in its plan sees every drop as "all partitions dropped".
+    A subclass keeps every existing caller and test unchanged.
+    """
+
+
 @dataclass(frozen=True)
 class CompetitionSeason:
     league: str
@@ -576,7 +588,7 @@ def prepare_workload_plan(
             continue
 
         if pending_matches:
-            raise RuntimeError(
+            raise PlayerEvidenceNotReady(
                 f"{item.league} match raw/manifest is incomplete; "
                 "players cannot be planned"
             )
@@ -619,7 +631,12 @@ def prepare_workload_plan(
     # Isolating one stuck league must not turn into a silent empty run: if
     # NOTHING could be planned, that is a systemic outage, not pagination noise.
     if incomplete_partitions and len(incomplete_partitions) == considered_partitions:
-        raise RuntimeError(
+        # For the players phase this is "not yet", not "broken": its plan holds
+        # exactly one tournament-season, so ANY drop looks like a total one.
+        dropped = (
+            PlayerEvidenceNotReady if phase == "players" else RuntimeError
+        )
+        raise dropped(
             f"every SofaScore partition was dropped from the {phase} plan — "
             "season raw is incomplete for "
             + ", ".join(incomplete_partitions)

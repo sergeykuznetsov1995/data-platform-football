@@ -45,6 +45,8 @@ DEFAULT_MAX_SCOPE_ATTEMPTS = 3
 DEFAULT_PARK_COOLDOWN_HOURS = 24
 DEFAULT_REFRESH_BATCH_SIZE = 8
 DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
+DEFAULT_PLAYERS_BATCH_SIZE = 3
+DEFAULT_PLAYERS_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/players-results"
 
 
 @dataclass(frozen=True)
@@ -613,6 +615,134 @@ def plan_refresh_batch(
     return planned
 
 
+def plan_players_batch(
+    snapshot: Mapping[str, Any],
+    *,
+    completed: Iterable[str],
+    players_completed: Iterable[str] = (),
+    batch_size: int = DEFAULT_PLAYERS_BATCH_SIZE,
+    exclude_tournament_ids: Iterable[int | str] = (),
+    failures: Mapping[str, Mapping[str, Any]] | None = None,
+    max_scope_attempts: int = DEFAULT_MAX_SCOPE_ATTEMPTS,
+    park_cooldown_hours: int = DEFAULT_PARK_COOLDOWN_HOURS,
+    moment: datetime | None = None,
+    snapshot_path: str = "/opt/airflow/runtime/sofascore/all-men/snapshot.json",
+    policy_path: str = "/opt/airflow/configs/sofascore/all_mens_campaign.json",
+    result_dir: str = DEFAULT_PLAYERS_RESULT_DIR,
+    workload_artifact: str = (
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    ),
+    dag_run_id: str = "manual",
+    task_env: Mapping[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Select a bounded batch of CLOSED history scopes that still lack profiles.
+
+    ``completed`` is the history lane's own memory (``state.json``): a scope is
+    there only when every match of that tournament-season committed Bronze,
+    which is exactly the precondition the players phase needs.  Scopes this
+    lane already captured (``players_completed``, its own state file) drop out,
+    so the queue is finite and a finished scope never comes back.
+
+    ``exclude_tournament_ids`` are the registry's enabled leagues.  This is not
+    politeness about duplicate work: the profile manifest is keyed by
+    (tournament, season) and not by capture_key, so the lane would outrun the
+    daily ingest's weekly rotation and buy its profiles a second time.
+
+    Ordering is newest season first, then (tournament, season) — deterministic
+    and terminating.  A scope that failed ``max_scope_attempts`` times is
+    parked like in the history lane, and the park expires after
+    ``park_cooldown_hours``.  A key the snapshot no longer knows is skipped
+    with a warning instead of failing the whole phase.
+    """
+
+    moment = moment or datetime.now(timezone.utc)
+    lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise CampaignPlanningError("batch_size must be a positive integer")
+    if (
+        isinstance(max_scope_attempts, bool)
+        or not isinstance(max_scope_attempts, int)
+        or max_scope_attempts < 1
+    ):
+        raise CampaignPlanningError("max_scope_attempts must be a positive integer")
+    snapshot_id = str(snapshot.get("snapshot_id") or "")
+    if not snapshot_id or snapshot_id != _snapshot_digest(snapshot):
+        raise CampaignPlanningError("campaign snapshot digest mismatch")
+    campaign_id = str(snapshot.get("campaign_id") or "")
+    if not campaign_id:
+        raise CampaignPlanningError("campaign_id is missing")
+    # ``_scope_task_env`` needs the raw season mapping, which ``SeasonTarget``
+    # does not carry — so the index keeps the mapping itself.
+    index: dict[tuple[int, int], tuple[Mapping[str, Any], int | None]] = {}
+    for tournament_id, _capture_key, seasons in _refresh_snapshot_tournaments(snapshot):
+        for season, season_id, start_year, _canonical in _refresh_snapshot_seasons(
+            tournament_id, seasons, require_start_year=False
+        ):
+            index[(tournament_id, season_id)] = (season, start_year)
+    excluded_tournament_ids = frozenset(int(value) for value in exclude_tournament_ids)
+    already = {str(value) for value in players_completed}
+    candidates: list[tuple[bool, int, int, int, Mapping[str, Any]]] = []
+    for scope_key in sorted({str(value) for value in completed}):
+        if scope_key in already:
+            continue
+        parts = scope_key.split(":")
+        if len(parts) != 3 or parts[0] != campaign_id:
+            logger.warning(
+                "players candidate %s is not a scope key of this campaign; skipped",
+                scope_key,
+            )
+            continue
+        try:
+            tournament_id = int(parts[1])
+            season_id = int(parts[2])
+        except ValueError:
+            logger.warning("players candidate %s is malformed; skipped", scope_key)
+            continue
+        if tournament_id in excluded_tournament_ids:
+            continue
+        entry = index.get((tournament_id, season_id))
+        if entry is None:
+            logger.warning(
+                "players candidate %s is not a ready snapshot season; skipped",
+                scope_key,
+            )
+            continue
+        attempts = (failures or {}).get(scope_key) or {}
+        if int(attempts.get("count", 0)) >= max_scope_attempts and not park_has_cooled(
+            attempts, moment, park_cooldown_hours
+        ):
+            logger.warning(
+                "players scope %s parked after %s failed attempts (last run %s)",
+                scope_key, attempts.get("count"), attempts.get("last_run_id"),
+            )
+            continue
+        season, start_year = entry
+        candidates.append(
+            (start_year is None, -(start_year or 0), tournament_id, season_id, season)
+        )
+    candidates.sort(key=lambda item: item[:4])
+    planned: list[dict[str, str]] = []
+    for _undated, _wave, tournament_id, _season_id, season in candidates:
+        planned.append(
+            _scope_task_env(
+                "players",
+                snapshot_id=snapshot_id,
+                campaign_id=campaign_id,
+                tournament_id=tournament_id,
+                season=season,
+                lane_env=lane_env,
+                snapshot_path=snapshot_path,
+                policy_path=policy_path,
+                result_dir=result_dir,
+                workload_artifact=workload_artifact,
+                dag_run_id=dag_run_id,
+            )
+        )
+        if len(planned) == batch_size:
+            break
+    return planned
+
+
 def read_snapshot(
     path: str | Path, *, policy_path: str | Path | None = None
 ) -> Mapping[str, Any]:
@@ -769,6 +899,7 @@ __all__ = [
     "mark_completed",
     "mark_failed",
     "plan_historical_batch",
+    "plan_players_batch",
     "plan_refresh_batch",
     "read_completed",
     "read_failures",

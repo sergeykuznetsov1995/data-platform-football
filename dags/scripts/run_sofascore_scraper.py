@@ -2131,6 +2131,10 @@ def _load_runtime_workload_plan(
         # so a broken plan hand-off would have fallen back to an unplanned
         # capture instead of failing closed (Sol round 12, finding 3).
         "dag_refresh_sofascore_all_mens",
+        # The players lane runs the paid player phase on its own gateway; an
+        # absent plan there must fail closed, not fall back to an unplanned
+        # capture (#1244).
+        "dag_players_sofascore_all_mens",
     }
     if not path:
         if production:

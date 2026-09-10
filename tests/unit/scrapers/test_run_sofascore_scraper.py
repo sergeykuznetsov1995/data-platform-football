@@ -219,3 +219,39 @@ class TestBronzeMatchResolver:
                 "2526",
                 None,
             )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "dag_id, is_production",
+    [
+        ("dag_players_sofascore_all_mens", True),
+        ("dag_players_sofascore_someone_else", False),
+    ],
+)
+def test_the_players_lane_fails_closed_without_a_signed_plan(
+    monkeypatch, dag_id, is_production
+):
+    """A production lane without a plan must stop, not capture unplanned."""
+
+    runner = _runner_module()
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", dag_id)
+
+    if is_production:
+        with pytest.raises(RuntimeError, match="requires --workload-plan"):
+            runner._load_runtime_workload_plan(
+                None,
+                entity="player_capture",
+                league="SS-7",
+                season="2627",
+                offline_replay=False,
+            )
+        return
+
+    assert runner._load_runtime_workload_plan(
+        None,
+        entity="player_capture",
+        league="SS-7",
+        season="2627",
+        offline_replay=False,
+    ) == (None, ())

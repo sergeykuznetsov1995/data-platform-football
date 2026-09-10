@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from pathlib import Path
+import re
 import subprocess
 import textwrap
 
@@ -28,6 +29,7 @@ TAG = DIGEST[:8]
 HIST = "dag_backfill_sofascore_all_mens"
 REFRESH = "dag_refresh_sofascore_all_mens"
 MAINT = "dag_sofascore_manifest_maintenance"
+PLAYERS = "dag_players_sofascore_all_mens"
 
 
 def _write(path: Path, text: str, mode: int | None = None) -> Path:
@@ -60,7 +62,7 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
               *"SELECT is_paused"*)
                 dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
                 cat "$STATE/paused_$dag"; exit 0 ;;
-              *"is_active=true"*) cat "$STATE/active_count" 2>/dev/null || echo 3; exit 0 ;;
+              *"is_active=true"*) cat "$STATE/active_count" 2>/dev/null || echo 4; exit 0 ;;
               # Всё остальное исполняется по-настоящему против sqlite-метабазы.
               *)
                 # «Метабаза не отвечает»: пустой вывод и ненулевой код — то же, что таймаут.
@@ -115,6 +117,9 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
             [ "$3" = unpause ] && [ -e "$STATE/scheduler_down" ] && exit 1
             # обслуживание манифеста не распаузилось: команда прошла, состояние не сошлось
             [ "$3" = unpause ] && [ -e "$STATE/maint_unpause_fails" ] && [ "$4" = "dag_sofascore_manifest_maintenance" ] && exit 0
+            # `airflow pools set <name>` падает, пока для этого пула стоит флаг.
+            # Индексы после сдвига аргументов стаба: $2=pools, $4=<name>.
+            [ "$2" = pools ] && [ -e "$STATE/pool_set_fails_$4" ] && exit 1
             case "$3" in pause) echo t > "$STATE/paused_$4" ;; unpause) echo f > "$STATE/paused_$4" ;; esac
             exit 0
           fi
@@ -218,8 +223,12 @@ def _layout(
     return runtime, release, env_file, state_dir
 
 
-def _run_deploy(tmp_path: Path, *, refresh_paused: str) -> tuple[subprocess.CompletedProcess, Path, Path, Path]:
+def _run_deploy(
+    tmp_path: Path, *, refresh_paused: str, state: dict[str, str] | None = None
+) -> tuple[subprocess.CompletedProcess, Path, Path, Path]:
     runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused=refresh_paused)
+    for name, value in (state or {}).items():
+        _write(state_dir / name, f"{value}\n")
     env = {
         **os.environ,
         "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
@@ -283,9 +292,11 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
     last_compose = max(i for i, a in enumerate(args) if a.startswith("compose "))
     # Шаг drain закрывает полосу истории ДО пересоздания: пул, а не пауза, не даёт стартовать
     # новому скоупу, пока хвост уже начатого досчитывается.
-    assert pools[0].split()[5:7] == ["sofascore_history_pool", "0"], pools
-    assert args.index(pools[0]) < first_compose, pools
-    restored = pools[1:]
+    assert [a.split()[5:7] for a in pools[:2]] == [
+        ["sofascore_history_pool", "0"], ["sofascore_players_pool", "0"]
+    ], pools
+    assert args.index(pools[1]) < first_compose, pools
+    restored = pools[2:]
     # deploy.sh не пересоздаёт airflow-init, где пулы заводятся впервые: без этого
     # шага задачи полос повисли бы в несуществующем пуле.
     assert [a.split()[5] for a in restored] == [
@@ -517,9 +528,14 @@ def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
         a.split()[5:7] for a in args
         if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
     ]
-    assert pools[0] == ["sofascore_history_pool", "0"], pools
-    assert pools[-1] == ["sofascore_history_pool", "1"], pools
-    assert f"sofascore_history_pool restored to 1 slots" in log
+    assert pools[:2] == [
+        ["sofascore_history_pool", "0"], ["sofascore_players_pool", "0"]
+    ], pools
+    assert pools[-2:] == [
+        ["sofascore_history_pool", "1"], ["sofascore_players_pool", "1"]
+    ], pools
+    assert "sofascore_history_pool restored to 1 slots" in log
+    assert "sofascore_players_pool restored to 1 slots" in log
 
 
 @pytest.mark.unit
@@ -561,6 +577,11 @@ _DEFAULT = object()
 _DAILY_BUSY = (
     "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
     " VALUES ('dag_ingest_sofascore','daily-1','ingest',-1,'running','default_pool',1);"
+)
+# Занятая полоса игроков: её оплаченный скоуп идёт — второе число строки опроса не ноль.
+_PLAYERS_BUSY = (
+    "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
+    f" VALUES ('{PLAYERS}','players-1','run_players_scope',0,'running','sofascore_players_pool',1);"
 )
 # Что делает ПЛАНИРОВЩИК после того, как ломатель поставил скоупу failed: validate-плейсхолдер
 # получает upstream_failed, finalize пишет отказ в failures.json, propagate закрывает прогон.
@@ -697,7 +718,12 @@ def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Pat
         a.split()[5:7] for a in r.args
         if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
     ]
-    assert pools == [["sofascore_history_pool", "0"], ["sofascore_history_pool", "1"]], pools
+    assert pools == [
+        ["sofascore_history_pool", "0"],
+        ["sofascore_players_pool", "0"],
+        ["sofascore_history_pool", "1"],
+        ["sofascore_players_pool", "1"],
+    ], pools
     # Контур занят — значит НИЧЕГО не изменилось: обе кампании работают дальше.
     assert (r.state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
     assert (r.state_dir / f"paused_{HIST}").read_text().strip() == "f"
@@ -1444,7 +1470,7 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
           case "${{@: -1}}" in
             *import_error*) echo 0 ;;
-            *is_active=true*) echo 5 ;;
+            *is_active=true*) echo 6 ;;
             *slot_pool*) echo 1 ;;
             *) echo "dag|f|t" ;;
           esac
@@ -1650,3 +1676,131 @@ def test_postdeploy_fails_when_a_watchdog_guards_the_wrong_lane(
     proc = _run_postdeploy(tmp_path, scheduler, gateways, watchdogs=watchdogs)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "ПРИЁМКА: ок" not in proc.stdout, proc.stdout
+
+
+@pytest.mark.unit
+def test_the_recipe_waits_for_the_players_lane_but_never_pauses_it() -> None:
+    """Полосу игроков закрывает ПУЛ, а не пауза: под паузой не отработает
+    validate_players_scope, и оплаченный скоуп не будет засчитан."""
+
+    text = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
+
+    assert "PLAYERS=dag_players_sofascore_all_mens" in text
+    # Имя пула — одной константой на осушение, возврат и сообщения (принцип $HIST_POOL
+    # из #1245): разъехавшись, они осушали бы один пул, а возвращали другой.
+    assert "PLAYERS_POOL=sofascore_players_pool" in text
+    # wait_drained ждёт ЗАДАЧИ полосы: невзятый скоуп при осушённом пуле висит
+    # `scheduled` и не блокирует, а взятый доработает вместе со своим validate.
+    # Проверяем СОСТАВ второго числа, а не подстроку: после сведения с #1264 в том же
+    # списке стоит и обслуживание манифеста, и подстрочный ассерт молча пережил бы
+    # выпадение любого имени из середины.
+    drain_row = next(l for l in text.splitlines() if l.lstrip().startswith("DRAIN_ROW=$("))
+    counted = re.search(
+        r"count\(\*\) FROM task_instance WHERE dag_id IN \(([^)]+)\)"
+        r" AND state IN \('queued','running'\)",
+        drain_row,
+    )
+    assert counted, "второе число строки опроса не найдено"
+    assert set(counted.group(1).split(",")) == {"'$DAILY'", "'$REFRESH'", "'$PLAYERS'", "'$MAINT'"}
+    assert 'set_pool "$PLAYERS_POOL" 0' in text
+    assert '"$CAMPAIGN/players-results"' in text
+
+    # restore-pause полосы не касается: мы её не паузили.
+    restore = text.split('STEP="restore-pause"', 1)[1]
+    assert "$PLAYERS" not in restore
+    # wait_idle тоже не трогаем: паузный DAG в гейте «контур свободен» подвешивает выкат.
+    wait_idle = text.split("wait_idle() {", 1)[1].split("\n}\n", 1)[0]
+    assert "$PLAYERS" not in wait_idle
+
+
+@pytest.mark.unit
+def test_a_running_players_scope_holds_the_deploy_and_needs_no_breaker(tmp_path: Path) -> None:
+    """Тот же инвариант в живой метабазе, а не в тексте рецепта. Пока задача полосы идёт,
+    второе число строки опроса не ноль — выкат не начинается и оплаченный скоуп профилей
+    не рвётся пересозданием scheduler'а. Ломатель тупика (#1245) к полосе не зовут: он
+    умеет только run_historical_scope, а полоса в пятое число не попадает вовсе."""
+    r = _deploy(tmp_path, idle_wait="0", seed_sql=_PLAYERS_BUSY, world=None)
+
+    assert r.proc.returncode == 4, r.out
+    assert not r.compose_calls, r.args
+    assert not r.breaker_calls, r.breaker_calls
+    assert "FAILED at step 'drain'" in r.log
+    assert "nothing deployed" in r.log
+    # Ждали её задачи — но саму полосу при этом не паузили.
+    assert not (r.state_dir / f"paused_{PLAYERS}").exists()
+
+
+@pytest.mark.unit
+def test_a_green_deploy_drains_the_players_pool_and_never_touches_its_pause(tmp_path: Path) -> None:
+    """Штатный выкат: пул полосы осушён до пересоздания и возвращён после, а паузу её
+    никто не трогает ни в drain, ни в restore-pause."""
+    r = _deploy(tmp_path, idle_wait="600", world=None)
+
+    assert r.proc.returncode == 0, r.out
+    assert not [a for a in r.args if f"dags pause {PLAYERS}" in a or f"dags unpause {PLAYERS}" in a], r.args
+    assert not (r.state_dir / f"paused_{PLAYERS}").exists()
+    pools = [
+        a.split()[5:7] for a in r.args
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
+    ]
+    assert ["sofascore_players_pool", "0"] in pools, pools
+    assert ["sofascore_players_pool", "1"] in pools, pools
+    first_compose = min(i for i, a in enumerate(r.args) if a.startswith("compose "))
+    drained = next(
+        i for i, a in enumerate(r.args)
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set sofascore_players_pool 0")
+    )
+    assert drained < first_compose, r.args
+
+
+@pytest.mark.unit
+def test_the_core_dag_count_is_derived_from_the_list_in_both_recipes() -> None:
+    deploy = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
+    postdeploy = (DEPLOY / "postdeploy_checks.sh").read_text(encoding="utf-8")
+
+    assert re.search(r"^CORE_DAGS_N=", deploy, re.M)
+    assert not re.search(r'\[\s*"\$present"\s*=\s*"?\d', deploy)
+    assert "CONTOUR_DAGS_N=" in postdeploy
+    # Числа выводятся из списков, но и СОСТАВ списков пришпилен: три разных счётчика
+    # (4 у рецепта выката, 6 у приёмки) молча разъехались бы выпадением имени (Sol круг 1).
+    core = re.search(r'^CORE_DAGS="([^"]+)"', deploy, re.M).group(1).split()
+    assert core == ["$DAILY", "$HIST", "$REFRESH", "$PLAYERS"], core
+    contour = re.search(r"^CONTOUR_DAGS=\(([^)]+)\)", postdeploy, re.M).group(1).split()
+    assert set(contour) == {
+        "dag_ingest_sofascore",
+        "dag_backfill_sofascore_all_mens",
+        "dag_refresh_sofascore_all_mens",
+        "dag_players_sofascore_all_mens",
+        "dag_trigger_sofascore_daily",
+        "dag_sofascore_manifest_maintenance",
+    }, contour
+    assert len(contour) == 6, contour
+    assert not re.search(r'\[\s*"\$active"\s*=\s*"?\d', postdeploy)
+
+
+@pytest.mark.unit
+def test_a_failed_second_drain_still_gives_the_history_pool_its_slots_back(
+    tmp_path: Path,
+) -> None:
+    """Осушение идёт по двум пулам, и отказ на втором выходит по `set -e`.
+
+    Если флаг «пул осушён» ставится ПОСЛЕ обоих вызовов, on_exit не знает про уже
+    осушённую историю, и она остаётся с нулём слотов без единого сообщения.
+    """
+
+    proc, _release, _env_file, state_dir = _run_deploy(
+        tmp_path,
+        refresh_paused="f",
+        state={"pool_set_fails_sofascore_players_pool": "1"},
+    )
+
+    assert proc.returncode != 0
+    args = [call[0] for call in _calls(state_dir)]
+    pools = [
+        a.split()[5:7] for a in args
+        if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
+    ]
+    assert ["sofascore_history_pool", "1"] in pools, pools
+    log = (tmp_path / "runtime" / "all-men" / "deploy.log").read_text(encoding="utf-8")
+    assert "sofascore_history_pool restored to 1 slots" in log
+    assert "MANUAL ACTION REQUIRED: sofascore_players_pool left drained" in log

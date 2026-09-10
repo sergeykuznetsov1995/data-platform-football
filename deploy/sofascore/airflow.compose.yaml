@@ -61,10 +61,9 @@ x-ss-airflow-common: &ss-airflow-common
     # Полосы источника (#1244): три шлюза проекта sofascore-gw, три пула Airflow.
     # Кампанию истории эти ключи включают сразу: dag_backfill_sofascore_all_mens:53,72
     # уже читает SOFASCORE_HISTORY_POOL и SOFASCORE_HISTORY_PROXY_CONTROL_URL.
-    # Пару PLAYERS пока НЕ читает никто — её потребитель, отдельный DAG полосы
-    # игроков, приходит вторым PR той же задачи #1244; до него шлюз
-    # sofascore_gw_players стоит без нагрузки (профили собирает ротация дейли
-    # в полосе актуалки). Актуалка и дейли остаются на дефолтах выше — их полоса
+    # Ключи PLAYERS читает dag_players_sofascore_all_mens — полоса профилей
+    # игроков (#1244, PR-2): свой шлюз sofascore_gw_players и свой пул.
+    # Актуалка и дейли остаются на дефолтах выше — их полоса
     # это sofascore_gw_951 и ingest_scraper_pool, который сериализует их между собой.
     SOFASCORE_HISTORY_POOL: sofascore_history_pool
     SOFASCORE_HISTORY_PROXY_CONTROL_URL: http://sofascore_gw_history:8899
@@ -82,6 +81,13 @@ x-ss-airflow-common: &ss-airflow-common
     SOFASCORE_ALL_MENS_STATE: /opt/airflow/runtime/sofascore/all-men/state.json
     SOFASCORE_ALL_MENS_RESULT_DIR: /opt/airflow/runtime/sofascore/all-men/results
     SOFASCORE_REFRESH_RESULT_DIR: /opt/airflow/runtime/sofascore/all-men/refresh-results
+    # Состояние полосы игроков — внутри уже смонтированного rw-каталога all-men,
+    # нового монта не нужно. SOFASCORE_PLAYER_FRESHNESS_KEY здесь НЕТ намеренно:
+    # в окружении scheduler'а он заморозил бы недельную ротацию профилей у дейли,
+    # поэтому его кладёт себе в env задачи сама полоса.
+    SOFASCORE_PLAYERS_STATE: /opt/airflow/runtime/sofascore/all-men/players-state.json
+    SOFASCORE_PLAYERS_RESULT_DIR: /opt/airflow/runtime/sofascore/all-men/players-results
+    SOFASCORE_PLAYERS_BATCH_SIZE: ${SOFASCORE_PLAYERS_BATCH_SIZE:-3}
     # Батч полосы актуалки урезан с дефолтных 8 до 3: при max_active_tasks=1 и
     # execution_timeout=2h на скоуп восемь скоупов не влезают в dagrun_timeout=5h
     # (находка code-review 25.08). Вернуть к 8 после замера реальной длительности скоупа.
