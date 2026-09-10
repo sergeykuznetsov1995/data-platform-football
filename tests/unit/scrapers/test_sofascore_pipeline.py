@@ -1590,6 +1590,7 @@ def test_match_runner_closes_lineup_less_scope_from_replayed_raw(
 
     runtime, transport = _runtime(tmp_path)
     records = _load_lineup_less_scope(tmp_path, runtime, monkeypatch, runner)
+    deferred = [record for record in records if not record.is_terminal]
 
     rc, result = _run_match_capture_under_plan(
         tmp_path, runtime, _unallocated_plan(runtime)
@@ -1606,6 +1607,14 @@ def test_match_runner_closes_lineup_less_scope_from_replayed_raw(
     assert all(
         runtime.manifest_store.get(record.key).is_terminal for record in records
     )
+    assert result["traffic"]["status_counts"] == {
+        "success": len(deferred),
+        "legitimate_empty": 0,
+        "not_supported": 0,
+        "retryable_failure": 0,
+        "schema_error": 0,
+    }
+    assert "status_counts_stage" not in result["traffic"]
 
 
 def test_match_runner_lineup_less_scope_does_not_loop(tmp_path, monkeypatch):
@@ -1690,6 +1699,7 @@ def test_match_runner_still_refuses_a_genuinely_nonterminal_endpoint(
     [error] = result["errors"]
     assert error.startswith("match capture has nonterminal endpoint states")
     assert "statistics=rate_limited" in error
+    assert result["traffic"]["status_counts_stage"] == "pre_finalize"
 
 def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(
     tmp_path,

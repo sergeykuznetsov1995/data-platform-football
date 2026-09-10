@@ -1343,6 +1343,7 @@ def _run_match_capture(
                     CaptureExpectation,
                     validate_manifest_completeness,
                 )
+                from scrapers.sofascore.manifest import ManifestStatus
                 from scrapers.sofascore.pipeline import (
                     finalize_materialized_results,
                     promote_repaired_results,
@@ -1355,6 +1356,7 @@ def _run_match_capture(
                 _flush_manifest_store(capture_runtime.manifest_store)
                 observations = []
                 expectations = []
+                final_counts = {status.value: 0 for status in ManifestStatus}
                 for result in pipeline_results:
                     key = result.manifest.key
                     committed = capture_runtime.manifest_store.get(key)
@@ -1362,6 +1364,7 @@ def _run_match_capture(
                         raise RuntimeError(
                             f"manifest commit missing for {key.stable_id()}"
                         )
+                    final_counts[committed.status.value] += 1
                     observations.append(
                         {
                             **committed.key.__dict__,
@@ -1381,12 +1384,18 @@ def _run_match_capture(
                         )
                     )
                 validate_manifest_completeness(expectations, observations).require()
+                # The engine snapshot counts states as they were recorded
+                # mid-pass, where every materialized endpoint is still a
+                # deferred retryable_failure — a green run and a red one looked
+                # alike (#1260). Report the committed states instead.
+                results["traffic"]["status_counts"] = final_counts
                 results["endpoint_completeness"] = 1.0
                 results["traffic"]["endpoint_completeness"] = 1.0
                 results["replay_cache"] = capture_runtime.engine.metrics.snapshot()
 
     except ReplaceGuardError as e:
         results["traffic"] = capture_runtime.engine.metrics.snapshot()
+        results["traffic"]["status_counts_stage"] = "pre_finalize"
         msg = f"{REPLACE_GUARD_MARKER}: {e}"
         logger.error(msg)
         results["errors"].append(msg)
@@ -1394,6 +1403,7 @@ def _run_match_capture(
         return 3
     except Exception as e:
         results["traffic"] = capture_runtime.engine.metrics.snapshot()
+        results["traffic"]["status_counts_stage"] = "pre_finalize"
         logger.error("match_capture scrape failed hard: %s", e, exc_info=True)
         results["errors"].append(str(e))
         _write_results(output_path, results)
