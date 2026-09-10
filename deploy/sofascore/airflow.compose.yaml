@@ -74,6 +74,10 @@ x-ss-airflow-common: &ss-airflow-common
     # хостовым /etc/data-platform/sofascore.env без правки рецепта.
     SOFASCORE_HISTORY_BATCH_SIZE: ${SOFASCORE_HISTORY_BATCH_SIZE:-3}
     SOFASCORE_HISTORY_MAX_ACTIVE_TASKS: ${SOFASCORE_HISTORY_MAX_ACTIVE_TASKS:-3}
+    # Темп кампании (#1248 ступень 2, решение владельца 24.08): 60 req/мин на
+    # задачу, потолок кода — 60 (scrapers/sofascore/rate_control.py:26), 61 роняет
+    # DAG на импорте. Первый 429 ОТ САЙТА откатывает задачу к 20/60 до конца фазы.
+    SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE: ${SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE:-60}
     SOFASCORE_PLAYERS_POOL: sofascore_players_pool
     SOFASCORE_PLAYERS_PROXY_CONTROL_URL: http://sofascore_gw_players:8899
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}

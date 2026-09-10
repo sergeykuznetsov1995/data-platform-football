@@ -184,6 +184,10 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
     # поэтому размер батча и потолок параллельных задач живут в рецепте, а не в коде DAG.
     assert env["SOFASCORE_HISTORY_BATCH_SIZE"] == "${SOFASCORE_HISTORY_BATCH_SIZE:-3}"
     assert env["SOFASCORE_HISTORY_MAX_ACTIVE_TASKS"] == "${SOFASCORE_HISTORY_MAX_ACTIVE_TASKS:-3}"
+    assert (
+        env["SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE"]
+        == "${SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE:-60}"
+    )
     assert env["SOFASCORE_PLAYERS_POOL"] == "sofascore_players_pool"
     assert env["SOFASCORE_PLAYERS_PROXY_CONTROL_URL"] == "http://sofascore_gw_players:8899"
     assert "SOFASCORE_REFRESH_POOL" not in env and "SOFASCORE_REFRESH_PROXY_CONTROL_URL" not in env

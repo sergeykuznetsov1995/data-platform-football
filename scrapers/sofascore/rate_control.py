@@ -85,4 +85,14 @@ def production_rate_limiter(environ: Mapping[str, str] = os.environ) -> RateLimi
         raise ValueError(
             f"{RATE_LIMIT_ENV} must be an integer in 1..{_MAX_PER_MINUTE}, got {raw!r}"
         )
-    return AdaptiveRateLimiter(max_requests=per_minute, window_seconds=60.0)
+    # The bucket starts full and Camoufox spends a token per real request, so an
+    # unclamped burst would let every history task open with `per_minute`
+    # back-to-back requests before the refill rate is felt, and three tasks share
+    # one site.  Deny the opening volley entirely (same reasoning as the
+    # ``sofascore_discovery`` preset): the steady pace stays `per_minute`,
+    # spread evenly, because refill is unchanged.
+    return AdaptiveRateLimiter(
+        max_requests=per_minute,
+        window_seconds=60.0,
+        burst_size=1,
+    )

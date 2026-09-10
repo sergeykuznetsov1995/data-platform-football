@@ -40,9 +40,44 @@ def test_env_sets_the_history_lane_pace(clock):
     assert isinstance(limiter, AdaptiveRateLimiter)
     assert limiter.config.max_requests == 60
     assert limiter.config.window_seconds == 60
-    assert limiter.config.burst_size == 60
-    assert limiter.available_tokens == 60
+    assert limiter.config.burst_size == 1
+    assert limiter.available_tokens == 1
     assert limiter.fell_back is False
+
+
+def test_env_pace_opens_without_a_burst(clock):
+    """A fresh limiter must not hand out an opening volley of any size.
+
+    The bucket starts full, and Camoufox spends one token per real request, so
+    a `per_minute`-sized burst would let each of the three history tasks fire
+    that many requests back to back before the refill rate is felt.  The first
+    source 429 on that volley drops the whole phase to 20/60 for good.
+    """
+
+    limiter = production_rate_limiter({"SOFASCORE_RATE_LIMIT_PER_MINUTE": "60"})
+
+    fired = 0
+    while limiter.try_acquire():
+        fired += 1
+    assert fired == 1
+
+    # Idling does not bank credit for a later volley either.
+    clock["now"] += 600.0
+    fired = 0
+    while limiter.try_acquire():
+        fired += 1
+    assert fired == 1
+
+    # The steady pace is still the requested one: 60/60s == one token a second.
+    for _ in range(60):
+        clock["now"] += 1.0
+        assert limiter.try_acquire()
+    assert limiter.try_acquire() is False
+
+    # A slower pace is paced the same way, one request at a time.
+    assert production_rate_limiter(
+        {"SOFASCORE_RATE_LIMIT_PER_MINUTE": "5"}
+    ).config.burst_size == 1
 
 
 def test_empty_env_keeps_the_production_limiter():
@@ -64,8 +99,7 @@ def test_invalid_env_fails_closed(value):
 
 def test_fallback_drops_to_the_production_rate(clock):
     limiter = production_rate_limiter({"SOFASCORE_RATE_LIMIT_PER_MINUTE": "60"})
-    for _ in range(60):
-        assert limiter.try_acquire()
+    assert limiter.try_acquire()
     assert limiter.wait_time_seconds() == pytest.approx(1.0)
 
     assert limiter.fallback() is True
@@ -82,7 +116,7 @@ def test_fallback_drops_to_the_production_rate(clock):
 
 
 def test_fallback_clamps_the_burst_to_the_production_bucket(clock):
-    limiter = production_rate_limiter({"SOFASCORE_RATE_LIMIT_PER_MINUTE": "60"})
+    limiter = AdaptiveRateLimiter(max_requests=60, window_seconds=60.0)
     assert limiter.available_tokens == 60
 
     limiter.fallback()
