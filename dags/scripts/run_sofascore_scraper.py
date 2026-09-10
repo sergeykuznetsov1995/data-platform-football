@@ -32,6 +32,7 @@ import logging
 import os
 import sys
 import warnings
+from collections import Counter
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -396,6 +397,26 @@ def _complete_manifest_records_for_projection(
             "compatibility projection lacks canonical endpoint states: " + repr(missing)
         )
     return records
+
+
+def _incomplete_endpoint_summary(status_rows, *, limit: int = 20) -> str:
+    """Name why a capture is nonterminal: how many matches and which states."""
+    incomplete = [row for row in status_rows if not bool(row.get("capture_complete"))]
+    states = Counter()
+    for row in incomplete:
+        for column, value in row.items():
+            if not column.endswith("_status"):
+                continue
+            if value in {"success", "not_available"}:
+                continue
+            states[f"{column[: -len('_status')]}={value}"] += 1
+    named = ", ".join(
+        f"{state} x{count}" for state, count in states.most_common(limit)
+    )
+    return (
+        f"{len(incomplete)} of {len(status_rows)} matches incomplete; "
+        + (named or "no endpoint state named")
+    )
 
 
 def _merge_live_traffic(parts):
@@ -833,6 +854,13 @@ def _run_match_capture(
         ]
         results["matches_total"] = total
         results["matches_skipped_existing"] = total - len(match_ids)
+        logger.info(
+            "Endpoint resume plan: %d endpoints over %d matches, %d matches "
+            "skipped as terminal",
+            sum(len(endpoints) for endpoints in endpoint_plan.values()),
+            len(match_ids),
+            total - len(match_ids),
+        )
         if limit:
             match_ids = match_ids[: int(limit)]
         if not match_ids:
@@ -1049,14 +1077,48 @@ def _run_match_capture(
                     "common capture produced no endpoint-status projection"
                 )
             status_empty = False
-            all_status_terminal = bool(
-                status_df["capture_complete"].fillna(False).astype(bool).all()
-            )
+            complete_status_rows = None
+            if pipeline_results:
+                # Endpoint resume hands this pass only the nonterminal
+                # endpoints, so ``status_df`` reports every endpoint closed in
+                # an earlier pass as ``missing``. Judge terminality by the same
+                # full long-manifest projection the compatibility status commit
+                # uses below (#1260), and reuse the rows there.
+                from scrapers.sofascore.adapters import project_legacy_match_status
+
+                complete_status_rows = project_legacy_match_status(
+                    _complete_manifest_records_for_projection(
+                        capture_runtime.manifest_store,
+                        endpoint_specs,
+                        pipeline_results,
+                    ),
+                    league=league,
+                    season=season_short,
+                    endpoints=(
+                        "event",
+                        "lineups",
+                        "statistics",
+                        "shotmap",
+                        "incidents",
+                    ),
+                )
+                all_status_terminal = bool(complete_status_rows) and all(
+                    bool(row["capture_complete"]) for row in complete_status_rows
+                )
+            else:
+                all_status_terminal = bool(
+                    status_df["capture_complete"].fillna(False).astype(bool).all()
+                )
 
             if ratings_empty and eps_empty and not all_status_terminal:
                 raise RuntimeError(
                     "match capture has nonterminal endpoint states; refusing "
-                    "to publish incomplete normalized data"
+                    "to publish incomplete normalized data: "
+                    + _incomplete_endpoint_summary(
+                        complete_status_rows
+                        if complete_status_rows is not None
+                        else status_df.to_dict("records")
+                    )
                 )
             elif ratings_empty and eps_empty:
                 logger.warning(
@@ -1249,26 +1311,7 @@ def _run_match_capture(
                     )
 
                 if pipeline_results:
-                    from scrapers.sofascore.adapters import (
-                        project_legacy_match_status,
-                    )
-
-                    compatibility_rows = project_legacy_match_status(
-                        _complete_manifest_records_for_projection(
-                            capture_runtime.manifest_store,
-                            endpoint_specs,
-                            pipeline_results,
-                        ),
-                        league=league,
-                        season=season_short,
-                        endpoints=(
-                            "event",
-                            "lineups",
-                            "statistics",
-                            "shotmap",
-                            "incidents",
-                        ),
-                    )
+                    compatibility_rows = complete_status_rows
                     if not compatibility_rows:
                         raise RuntimeError(
                             "long manifest cannot finalize without compatibility status"
