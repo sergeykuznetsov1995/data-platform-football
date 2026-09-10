@@ -9,12 +9,19 @@
 92 минуты и rc=4). Deadlock-детектор Airflow для этого DAG отключён (max_active_tis_per_dag=1
 у run_historical_scope), сам он такой прогон не закроет.
 
-Только `failed`, только один mapped-скоуп (боевой batch=1), только пул выката. Сначала
-блокировка строки прогона — ту же берут планировщик (dagrun.py) и мини-планировщик
+Только `failed`, только припаркованные скоупы, только пул выката. Батч (#1248 ступень 1)
+разбирается поскоупно: гасим ровно то множество, которое считает пятое число deploy.sh —
+`scheduled` или `up_for_retry` при ЛЮБОМ try_number. Меньшее множество означало бы, что
+прогон не закроется и выкат всё равно упрётся в потолок ожидания; большее — что мы гасим
+работающий или уже терминальный скоуп. Работающие, поставленные в очередь исполнителю и
+терминальные скоупы не трогаем: их учёт закроют validate и finalize.
+
+Сначала блокировка строки прогона — ту же берут планировщик (dagrun.py) и мини-планировщик
 (taskinstance.py), поэтому после нашего commit протокол «DagRun-lock → свежий список
 готовых TI → schedule_tis» увидит failed и не вернёт задачу в scheduled. `failed` даёт
-планировщику доработать хвост: validate → upstream_failed, finalize запишет отказ в
-failures.json (count+1 — то же, что сделал бы упавший повтор, на 90 минут раньше).
+планировщику доработать хвост: validate своего скоупа не найдёт результата и упадёт,
+finalize запишет отказ в failures.json (count+1 — то же, что сделал бы упавший повтор, на
+90 минут раньше) и оставит соседние скоупы батча в покое.
 """
 
 import sys
@@ -47,15 +54,16 @@ try:
             )
             .all()
         )
-        if len(scopes) != 1:
-            print("drain_breaker: отказ — batch>1 не поддержан (mapped-скоупов %d)" % len(scopes))
-        else:
-            ti = scopes[0]
+        if not scopes:
+            # Карта ещё не раскрыта: есть только NULL-плейсхолдер map_index=-1,
+            # и он не скоуп — трогать его нельзя.
+            print("drain_breaker: отказ — раскрытых скоупов нет (mapped-скоупов 0)")
+        for ti in scopes:
             # Колонка state — String, из базы приходит обычной строкой (не enum).
             state = ti.state
             if ti.pool != POOL:
                 print("drain_breaker: отказ — скоуп в пуле %r, drain осушил %r" % (ti.pool, POOL))
-            elif state == "up_for_retry" or (state == "scheduled" and (ti.try_number or 0) > 1):
+            elif state in ("up_for_retry", "scheduled"):
                 ti.set_state("failed", session=session)
                 print("drain_breaker: map_index=%d %s -> failed" % (ti.map_index, state))
             else:

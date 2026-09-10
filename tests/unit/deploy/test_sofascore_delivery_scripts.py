@@ -35,6 +35,12 @@ PATH_LINE = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 HIST = "dag_backfill_sofascore_all_mens"
 REFRESH = "dag_refresh_sofascore_all_mens"
 POOLS = ("ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool")
+# Слоты полос: история идёт батчем из трёх скоупов (#1248 ступень 1), остальные серийны.
+POOL_SLOTS = {
+    "ingest_scraper_pool": "1",
+    "sofascore_history_pool": "3",
+    "sofascore_players_pool": "1",
+}
 GATEWAYS = ("sofascore_gw_951", "sofascore_gw_history", "sofascore_gw_players")
 SCHEDULER = "sofascore-airflow-scheduler"
 METADB = "sofascore-airflow-metadb"
@@ -225,7 +231,7 @@ exec /usr/bin/flock "$@"
         self.put("now_epoch", str(_epoch(THU_0330)))
         self.today = THU_0330.split(" ")[0]
         for pool in POOLS:
-            self.put(f"pool_{pool}", "1")
+            self.put(f"pool_{pool}", POOL_SLOTS[pool])
         for dag in (HIST, REFRESH):
             self.put(f"paused_{dag}", "f")
         # Обслуживание манифеста живёт на паузе и распаущивается только своим прогоном:
@@ -401,7 +407,7 @@ exit 0
             "HIST_PAUSED": "f",
             "REFRESH_PAUSED": "f",
             "MAINT_PAUSED": "t",
-            **{f"POOL_{p}": "1" for p in POOLS},
+            **{f"POOL_{p}": POOL_SLOTS[p] for p in POOLS},
             "SCHED_CREATED": "created-old",
         }
         fields.update(override)
@@ -781,7 +787,7 @@ def test_rc4_means_the_contour_was_busy_and_nothing_was_touched(stand: Stand) ->
     assert "контур не освободился" in stand.log_text()
     assert (stand.stub_state / f"paused_{HIST}").read_text().strip() == "f"
     for pool in POOLS:
-        assert (stand.stub_state / f"pool_{pool}").read_text().strip() == "1"
+        assert (stand.stub_state / f"pool_{pool}").read_text().strip() == POOL_SLOTS[pool]
 
 
 @pytest.mark.unit

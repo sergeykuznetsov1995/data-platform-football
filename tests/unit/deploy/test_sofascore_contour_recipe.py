@@ -52,7 +52,7 @@ GATEWAY_LANES = {
     "sofascore_gw_history": {
         "container": "sofascore_gw_history",
         "budget": "${SOFASCORE_HISTORY_GW_DAILY_BUDGET_MB:-2000}",
-        "leases": "${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-1}",
+        "leases": "${SOFASCORE_HISTORY_GW_MAX_ACTIVE_LEASES:-3}",
         "state": "${SOFASCORE_HISTORY_GW_STATE_HOST_DIR:?",
     },
     "sofascore_gw_players": {
@@ -180,6 +180,10 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
     # поэтому их ключей здесь сознательно нет.
     assert env["SOFASCORE_HISTORY_POOL"] == "sofascore_history_pool"
     assert env["SOFASCORE_HISTORY_PROXY_CONTROL_URL"] == "http://sofascore_gw_history:8899"
+    # Ручки кампании (#1248 ступень 1): DAG читает их ТОЛЬКО из окружения планировщика,
+    # поэтому размер батча и потолок параллельных задач живут в рецепте, а не в коде DAG.
+    assert env["SOFASCORE_HISTORY_BATCH_SIZE"] == "${SOFASCORE_HISTORY_BATCH_SIZE:-3}"
+    assert env["SOFASCORE_HISTORY_MAX_ACTIVE_TASKS"] == "${SOFASCORE_HISTORY_MAX_ACTIVE_TASKS:-3}"
     assert env["SOFASCORE_PLAYERS_POOL"] == "sofascore_players_pool"
     assert env["SOFASCORE_PLAYERS_PROXY_CONTROL_URL"] == "http://sofascore_gw_players:8899"
     assert "SOFASCORE_REFRESH_POOL" not in env and "SOFASCORE_REFRESH_PROXY_CONTROL_URL" not in env
@@ -187,7 +191,7 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
     # подъём контура), и шагом pools самого deploy.sh (ротация).
     init = "\n".join(cfg["services"]["airflow-init"]["command"])
     assert "airflow pools set 'ingest_scraper_pool' 1 " in init
-    assert 'airflow pools set \'sofascore_history_pool\' "${SOFASCORE_HISTORY_POOL_SLOTS:-1}" ' in init
+    assert 'airflow pools set \'sofascore_history_pool\' "${SOFASCORE_HISTORY_POOL_SLOTS:-3}" ' in init
     assert 'airflow pools set \'sofascore_players_pool\' "${SOFASCORE_PLAYERS_POOL_SLOTS:-1}" ' in init
     assert "dp-backend" not in cfg["networks"]
     assert set(scheduler["networks"]) == {"sofascore-net", "dp-storage"}
@@ -231,6 +235,12 @@ def test_gateway_compose_pins_the_live_gateway_shape() -> None:
         assert command[command.index("--lease-proxy-url") + 1] == f"http://{service}:8900", service
         assert command[command.index("--daily-budget-mb") + 1] == lane["budget"], service
         assert command[command.index("--max-active-leases") + 1] == lane["leases"], service
+        # Общий лимит аренд поднимает per-source потолок ТОЛЬКО на полосе истории (#1248):
+        # у двух других шлюзов флага нет, и `sofascore` там остаётся сериализован дефолтом 1.
+        if service == "sofascore_gw_history":
+            assert command[command.index("--sofascore-max-active-leases") + 1] == lane["leases"], service
+        else:
+            assert "--sofascore-max-active-leases" not in command, service
         assert gateway["healthcheck"]["test"][:4] == [
             "CMD", "python", "/opt/sofascore-repo/scripts/sofascore_runtime_preflight.py", "gateway-health",
         ], service

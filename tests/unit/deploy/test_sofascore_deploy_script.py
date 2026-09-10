@@ -291,7 +291,8 @@ def test_deploy_passes_the_new_release_to_compose_even_with_a_stale_shell_enviro
     assert [a.split()[5] for a in restored] == [
         "ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"
     ], pools
-    assert all(a.split()[6] == "1" for a in restored), pools
+    # Полоса истории возвращается на свой дефолт (#1248 ступень 1), остальные — на 1.
+    assert [a.split()[6] for a in restored] == ["1", "3", "1"], pools
     assert min(args.index(a) for a in restored) > last_compose
     preflights = [
         line for line in (state_dir / "host-python.log").read_text(encoding="utf-8").splitlines()
@@ -518,8 +519,8 @@ def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
         if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
     ]
     assert pools[0] == ["sofascore_history_pool", "0"], pools
-    assert pools[-1] == ["sofascore_history_pool", "1"], pools
-    assert f"sofascore_history_pool restored to 1 slots" in log
+    assert pools[-1] == ["sofascore_history_pool", "3"], pools
+    assert f"sofascore_history_pool restored to 3 slots" in log
 
 
 @pytest.mark.unit
@@ -697,7 +698,7 @@ def test_deploy_gives_up_honestly_when_the_contour_never_goes_idle(tmp_path: Pat
         a.split()[5:7] for a in r.args
         if a.startswith("exec sofascore-airflow-scheduler airflow pools set ")
     ]
-    assert pools == [["sofascore_history_pool", "0"], ["sofascore_history_pool", "1"]], pools
+    assert pools == [["sofascore_history_pool", "0"], ["sofascore_history_pool", "3"]], pools
     # Контур занят — значит НИЧЕГО не изменилось: обе кампании работают дальше.
     assert (r.state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
     assert (r.state_dir / f"paused_{HIST}").read_text().strip() == "f"
@@ -887,22 +888,29 @@ def test_a_parked_scope_in_another_pool_is_waited_for_with_a_diagnosis(tmp_path:
 
 
 @pytest.mark.unit
-def test_the_breaker_refuses_a_batch_bigger_than_one(tmp_path: Path) -> None:
-    """Боевой SOFASCORE_HISTORY_BATCH_SIZE не задан (batch=1), и версия поддерживает только
-    его: при двух mapped-скоупах «сломать тупик» значило бы погасить учёт соседнего,
-    возможно успешного, скоупа. Ломатель зовётся, но не меняет НИЧЕГО."""
+def test_the_breaker_fails_only_the_parked_scopes_of_a_batch(tmp_path: Path) -> None:
+    """Батч из трёх скоупов (#1248 ступень 1): один ещё работает, два припаркованы в
+    осушённом пуле. Пятое число deploy.sh считает ЛЮБОЙ scheduled/up_for_retry, поэтому
+    ломатель обязан погасить ровно то же множество — иначе прогон не закроется и ночь
+    уйдёт без доставки. Работающий скоуп не трогаем: его учёт закроют validate и finalize."""
     r = _deploy(
         tmp_path,
         idle_wait="60",
         world=dict(scope_state="running", scope_try=1, extra_scope=(1, "scheduled", 1)),
+        seed_sql=(
+            "INSERT INTO task_instance (dag_id, run_id, task_id, map_index, state, pool, try_number)"
+            f" VALUES ('{HIST}','{_RUN_ID}','run_historical_scope',2,'up_for_retry',"
+            "'sofascore_history_pool',1);"
+        ),
     )
 
     assert r.proc.returncode == 4, r.out
     assert r.breaker_calls, "пятое число > 0 — ломателя обязаны позвать"
-    assert "batch>1 не поддержан" in r.log
-    assert sorted(s for (s,) in rows(
-        r.state_dir, "SELECT state FROM task_instance WHERE task_id='run_historical_scope'"
-    )) == ["running", "scheduled"]
+    assert "batch>1 не поддержан" not in r.log
+    assert dict(rows(
+        r.state_dir,
+        "SELECT map_index, state FROM task_instance WHERE task_id='run_historical_scope'",
+    )) == {0: "running", 1: "failed", 2: "failed"}
 
 
 @pytest.mark.unit
@@ -948,6 +956,59 @@ def test_a_running_scope_that_falls_into_a_parked_retry_is_broken_later(tmp_path
     assert r.proc.returncode == 0, r.out
     assert len(r.breaker_calls) == 1, r.breaker_calls
     assert r.scope_state() == "failed"
+
+
+@pytest.mark.unit
+def test_the_breaker_gets_one_call_per_scope_of_the_batch(tmp_path: Path) -> None:
+    """Ревью Sol, круг 1, п.2. Скоупы батча паркуются РАЗНЫМИ волнами: один вызов ломателя
+    гасил бы только первую, а упавший позже сосед снова вешал бы шаг drain до потолка —
+    ночь без доставки. Бюджет вызовов равен размеру батча."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="600",
+        world=dict(scope_state="running", scope_try=1, extra_scope=(1, "up_for_retry", 1)),
+        turns={
+            3: (
+                "UPDATE task_instance SET state='up_for_retry'"
+                " WHERE task_id='run_historical_scope' AND map_index=0;"
+            ),
+        },
+        after_breaker=_TAIL_AFTER_FAILURE,
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert len(r.breaker_calls) == 2, r.breaker_calls
+    assert "вызов 2 из 3" in r.log
+    assert "тупик не ломается" not in r.log
+    assert dict(rows(
+        r.state_dir,
+        "SELECT map_index, state FROM task_instance WHERE task_id='run_historical_scope'",
+    )) == {0: "failed", 1: "failed"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "batch,want",
+    [
+        ("4", "из 4"), ("64", "из 64"), ("", "из 3"), ("два", "из 3"),
+        # "00" — цифры, но нулевой бюджет: ломателя не позвали бы ни разу.
+        ("00", "из 3"), ("0", "из 3"), ("65", "из 3"), ("999999999999", "из 3"),
+    ],
+)
+def test_the_breaker_budget_follows_the_batch_size(tmp_path: Path, batch: str, want: str) -> None:
+    """Ревью Sol, круг 2, п.4. Батч допускает 1..64 скоупов, а бюджет вызовов был литералом:
+    при batch=4 четвёртой волне вызова бы не хватило. Бюджет считается от той же ручки, что
+    читает DAG; мусор в env-файле читается как дефолт, а не роняет шаг арифметикой."""
+    r = _deploy(
+        tmp_path,
+        idle_wait="60",
+        world=dict(scope_state="up_for_retry", scope_try=1),
+        env_extra=({"SOFASCORE_HISTORY_BATCH_SIZE": batch} if batch else None),
+        after_breaker=_TAIL_AFTER_FAILURE,
+    )
+
+    assert r.proc.returncode == 0, r.out
+    assert f"вызов 1 {want}" in r.log, r.log
 
 
 @pytest.mark.unit
@@ -1445,6 +1506,7 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
           case "${{@: -1}}" in
             *import_error*) echo 0 ;;
             *is_active=true*) echo 5 ;;
+            *"pool='sofascore_history_pool'"*) echo 3 ;;
             *slot_pool*) echo 1 ;;
             *) echo "dag|f|t" ;;
           esac
@@ -1596,8 +1658,10 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
     ):
         assert f"✓ {unit} active" in proc.stdout, proc.stdout
         assert f"✓ {unit} --container {container}" in proc.stdout, proc.stdout
-    for pool in ("ingest_scraper_pool", "sofascore_history_pool", "sofascore_players_pool"):
-        assert f"✓ пул {pool} slots=1" in proc.stdout, proc.stdout
+    for pool, slots in (
+        ("ingest_scraper_pool", 1), ("sofascore_history_pool", 3), ("sofascore_players_pool", 1)
+    ):
+        assert f"✓ пул {pool} slots={slots}" in proc.stdout, proc.stdout
 
 
 @pytest.mark.unit

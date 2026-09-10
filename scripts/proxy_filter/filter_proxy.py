@@ -236,6 +236,12 @@ _ZERO_SHA256 = "0" * 64
 WHOSCORED_DAGRUN_BUDGET_BYTES = DEFAULT_WHOSCORED_PAID_CAP_BYTES
 URL_BUDGET_BYTES = 2_000_000
 MAX_ACTIVE_LEASES = 4
+# Per-source ceiling of the SofaScore lane (#1248).  The default keeps the
+# historical behaviour — one live SofaScore lease per gateway — so the daily
+# and the players gateways stay serial; only the history gateway raises it via
+# --sofascore-max-active-leases to run a batch of scopes side by side.  A zero
+# or negative value refuses every SofaScore lease, i.e. it fails closed.
+SOFASCORE_MAX_ACTIVE_LEASES = 1
 # How long a latched (accounting-uncertain) SofaScore lease keeps its
 # concurrency slot before the reaper performs the restart-equivalent claim
 # finish (#1060). Mirrors the external watchdog's LATCH_GRACE_SECONDS so an
@@ -3203,8 +3209,10 @@ def _create_lease(
         # A backfill lease uses a different provider pool and cannot consume a
         # production concurrency slot.
         raise RuntimeError("paid-proxy concurrency limit reached")
-    if source == "sofascore" and any(
-        item.source == "sofascore" for item in active_leases
+    if (
+        source == "sofascore"
+        and len([item for item in active_leases if item.source == "sofascore"])
+        >= SOFASCORE_MAX_ACTIVE_LEASES
     ):
         raise RuntimeError("SofaScore paid-proxy concurrency limit reached")
     # The catalog scan is a single serial walker: it rotates exhausted leases
@@ -5500,6 +5508,7 @@ def _service_health_report(mgr) -> dict[str, Any]:
         "max_lease_bytes": MAX_LEASE_BYTES,
         "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
         "max_active_leases": MAX_ACTIVE_LEASES,
+        "sofascore_max_active_leases": SOFASCORE_MAX_ACTIVE_LEASES,
         "dagrun_budget_bytes": DAGRUN_BUDGET_BYTES,
         "url_budget_bytes": URL_BUDGET_BYTES,
         "lease_proxy_url": LEASE_PROXY_URL,
@@ -6955,6 +6964,7 @@ async def main() -> None:
     global SOFASCORE_DAGRUN_BUDGET_BYTES, SOFASCORE_BUDGET_ARTIFACT_ID
     global SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     global URL_BUDGET_BYTES, MAX_ACTIVE_LEASES, LEDGER_PATH, CONTROL_TOKEN
+    global SOFASCORE_MAX_ACTIVE_LEASES
     global TRANSFERMARKT_CONTROL_TOKEN
     global TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
     global TRANSFERMARKT_BACKFILL_PROXY_MANAGER
@@ -7081,6 +7091,11 @@ async def main() -> None:
     )
     ap.add_argument("--url-budget-bytes", type=int, default=2_000_000)
     ap.add_argument("--max-active-leases", type=int, default=MAX_ACTIVE_LEASES)
+    ap.add_argument(
+        "--sofascore-max-active-leases",
+        type=int,
+        default=SOFASCORE_MAX_ACTIVE_LEASES,
+    )
     ap.add_argument(
         "--lease-upstream-connect-timeout-seconds",
         type=float,
@@ -7327,6 +7342,9 @@ async def main() -> None:
     ).strip()
     url_budget_bytes = int(getattr(args, "url_budget_bytes", URL_BUDGET_BYTES))
     max_active_leases = int(getattr(args, "max_active_leases", MAX_ACTIVE_LEASES))
+    sofascore_max_active_leases = int(
+        getattr(args, "sofascore_max_active_leases", SOFASCORE_MAX_ACTIVE_LEASES)
+    )
     lease_connect_timeout_seconds = float(
         getattr(
             args,
@@ -7487,6 +7505,7 @@ async def main() -> None:
         raise SystemExit(str(exc)) from None
     URL_BUDGET_BYTES = url_budget_bytes
     MAX_ACTIVE_LEASES = max_active_leases
+    SOFASCORE_MAX_ACTIVE_LEASES = sofascore_max_active_leases
     LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = lease_connect_timeout_seconds
     LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS = lease_head_timeout_seconds
     LEASE_UPSTREAM_FAILOVER_ATTEMPTS = lease_failover_attempts

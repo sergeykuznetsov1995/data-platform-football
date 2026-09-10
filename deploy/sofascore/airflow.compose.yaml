@@ -68,6 +68,12 @@ x-ss-airflow-common: &ss-airflow-common
     # это sofascore_gw_951 и ingest_scraper_pool, который сериализует их между собой.
     SOFASCORE_HISTORY_POOL: sofascore_history_pool
     SOFASCORE_HISTORY_PROXY_CONTROL_URL: http://sofascore_gw_history:8899
+    # Ручки кампании истории (#1248 ступень 1): DAG читает их только отсюда —
+    # batch задаёт число mapped-задач в прогоне, max_active_tasks — сколько их
+    # бежит разом (LocalExecutor живёт в этом же контейнере). Переопределяются
+    # хостовым /etc/data-platform/sofascore.env без правки рецепта.
+    SOFASCORE_HISTORY_BATCH_SIZE: ${SOFASCORE_HISTORY_BATCH_SIZE:-3}
+    SOFASCORE_HISTORY_MAX_ACTIVE_TASKS: ${SOFASCORE_HISTORY_MAX_ACTIVE_TASKS:-3}
     SOFASCORE_PLAYERS_POOL: sofascore_players_pool
     SOFASCORE_PLAYERS_PROXY_CONTROL_URL: http://sofascore_gw_players:8899
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
@@ -236,7 +242,7 @@ services:
           --firstname Admin --lastname User --role Admin \
           --email admin@example.com || true
         airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers (isolated sofascore stack #951)'
-        airflow pools set 'sofascore_history_pool' "${SOFASCORE_HISTORY_POOL_SLOTS:-1}" 'SofaScore history lane'
+        airflow pools set 'sofascore_history_pool' "${SOFASCORE_HISTORY_POOL_SLOTS:-3}" 'SofaScore history lane'
         airflow pools set 'sofascore_players_pool' "${SOFASCORE_PLAYERS_POOL_SLOTS:-1}" 'SofaScore players lane'
         echo "sofascore-airflow init complete"
     environment:

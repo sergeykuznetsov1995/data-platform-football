@@ -328,6 +328,13 @@ with DAG(
     validate = PythonOperator.partial(
         task_id="validate_historical_scope",
         python_callable=_validate_historical_scope,
+        # A batch is a batch of independent scopes: ``validate`` expands over the
+        # same plan but lives outside the mapped group, so the default
+        # ``all_success`` made one failed ``run[i]`` mark EVERY ``validate`` as
+        # upstream_failed — and ``finalize`` then booked two paid, healthy scopes
+        # as failures.  ``all_done`` lets each validation reach its own check: it
+        # decides on its own result whether its scope succeeded.
+        trigger_rule="all_done",
         retries=0,
     ).expand(op_kwargs=plan.output)
     finalize = PythonOperator(
