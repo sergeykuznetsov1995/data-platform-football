@@ -1,0 +1,24 @@
+{
+  "blob_key": "blobs/sha256/6c/6c69843d4f73f1bde96d61253b4a07b31d878046f5f1c08360276985d4794cd8.json.gz",
+  "compression": "gzip",
+  "content_hash": "6c69843d4f73f1bde96d61253b4a07b31d878046f5f1c08360276985d4794cd8",
+  "content_type": "application/json",
+  "decoded_bytes": 2176,
+  "encoded_bytes": 625,
+  "endpoint": "incidents",
+  "fetched_at": "2026-09-05T09:48:13.227629+00:00",
+  "fetcher_version": "sofascore-capture-engine-v1",
+  "freshness_key": "final",
+  "hash_algorithm": "sha256",
+  "http_status": 200,
+  "manifest_version": "sofascore-raw-v1",
+  "request_url": "https://www.sofascore.com/api/v1/event/13198315/incidents",
+  "response_headers": {
+    "content-type": "application/json"
+  },
+  "source": "sofascore",
+  "source_season_id": "69577",
+  "source_tournament_id": "767",
+  "target_id": "13198315",
+  "target_type": "event"
+}
