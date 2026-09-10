@@ -1540,6 +1540,157 @@ def test_match_runner_still_replays_unallocated_targets_from_raw(
     )
 
 
+SCOPE_FIXTURE_ROOT = FIXTURE_ROOT / "sofascore_scope_767_69577"
+SCOPE_TOURNAMENT_ID = 767
+SCOPE_SEASON_ID = 69577
+SCOPE_MATCH_IDS = ("13198314", "13198315", "13443984")
+
+
+def _load_lineup_less_scope(tmp_path, runtime, monkeypatch, runner):
+    """Real raw + long manifest of tournament 767 / season 69577 (#1260).
+
+    Production state of a lower-league scope: event/incidents answered 200 and
+    wait deferred for the Bronze MERGE, lineups/shotmap (and statistics on two
+    of three matches) are terminally 404. Endpoint resume hands a repeat pass
+    only the deferred endpoints.
+    """
+    import shutil
+
+    raw_root = tmp_path / "raw"
+    for name in ("targets", "blobs"):
+        shutil.copytree(
+            SCOPE_FIXTURE_ROOT / name, raw_root / name, dirs_exist_ok=True
+        )
+    records = [
+        EndpointManifest.from_dict(payload)
+        for payload in json.loads(
+            (SCOPE_FIXTURE_ROOT / "manifest.json").read_text(encoding="utf-8")
+        )
+    ]
+    for record in records:
+        runtime.manifest_store.upsert(record)
+    _patch_match_runner_environment(monkeypatch, runner, list(SCOPE_MATCH_IDS))
+    monkeypatch.setattr(
+        runner,
+        "_source_context",
+        lambda *args: (SCOPE_TOURNAMENT_ID, SCOPE_SEASON_ID),
+    )
+    return records
+
+
+def test_match_runner_closes_lineup_less_scope_from_replayed_raw(
+    tmp_path, monkeypatch
+):
+    """#1260: a scope whose lineups are 404 must close from replayed raw.
+
+    The resume plan carries only the deferred endpoints, so the terminality
+    guard may not judge the match by this pass alone — the endpoints closed in
+    an earlier pass are still terminal in the long manifest."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, transport = _runtime(tmp_path)
+    records = _load_lineup_less_scope(tmp_path, runtime, monkeypatch, runner)
+
+    rc, result = _run_match_capture_under_plan(
+        tmp_path, runtime, _unallocated_plan(runtime)
+    )
+
+    assert rc == 0
+    assert result["errors"] == []
+    assert transport.calls == 0
+    assert result["traffic"]["request_count"] == 0
+    assert result["capture_status_rows"] == 3
+    assert result["matches_complete"] == 3
+    assert "iceberg.bronze.sofascore_events" in result["tables"]
+    assert "iceberg.bronze.sofascore_incidents" in result["tables"]
+    assert all(
+        runtime.manifest_store.get(record.key).is_terminal for record in records
+    )
+
+
+def test_match_runner_lineup_less_scope_does_not_loop(tmp_path, monkeypatch):
+    """#1260: once the scope is closed the next pass has nothing to resume."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, transport = _runtime(tmp_path)
+    _load_lineup_less_scope(tmp_path, runtime, monkeypatch, runner)
+
+    rc, _ = _run_match_capture_under_plan(
+        tmp_path, runtime, _unallocated_plan(runtime)
+    )
+    assert rc == 0
+
+    rc, second = _run_match_capture_under_plan(
+        tmp_path, runtime, _unallocated_plan(runtime)
+    )
+
+    assert rc == 0
+    assert transport.calls == 0
+    assert second["matches_total"] == 3
+    assert second["matches_skipped_existing"] == 3
+    assert second["traffic"]["request_count"] == 0
+    assert second["traffic"].get("endpoints", 0) == 0
+
+
+def test_match_runner_still_refuses_a_genuinely_nonterminal_endpoint(
+    tmp_path, monkeypatch
+):
+    """#1260 must not weaken the guard: a live 429 keeps the match nonterminal
+    and the refusal now names the endpoint states that caused it."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import live_capture
+    from scrapers.sofascore.live_capture import _zero_traffic
+
+    match_ids = [*PROBE_MATCH_IDS, *SECOND_MATCH_IDS]
+    runtime, transport = _runtime(tmp_path)
+    plan, allocations = _two_allocation_plan(runtime)
+    _patch_match_runner_environment(monkeypatch, runner, match_ids)
+
+    def source_rate_limited_on_statistics(runtime, specs, **kwargs):
+        results = []
+        for spec in specs:
+            if spec.key.endpoint == "statistics":
+                manifest = EndpointManifest(
+                    key=spec.key,
+                    status=ManifestStatus.RETRYABLE_FAILURE,
+                    run_id="run",
+                    task_id="capture",
+                    attempts=1,
+                    row_count=0,
+                    http_status=429,
+                )
+            else:
+                manifest = _successful_manifest(spec)
+            runtime.manifest_store.upsert(manifest)
+            results.append(CaptureResult(manifest=manifest, network_used=True))
+        return results, _zero_traffic()
+
+    monkeypatch.setattr(
+        live_capture, "capture_live_specs", source_rate_limited_on_statistics
+    )
+    output = tmp_path / "match-429.json"
+
+    with patch(
+        "scrapers.sofascore.SofaScoreScraper", return_value=_runner_player_scraper()
+    ):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=plan,
+            workload_allocations=allocations,
+            offline_replay=False,
+        )
+
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 1
+    assert transport.calls == 0
+    [error] = result["errors"]
+    assert error.startswith("match capture has nonterminal endpoint states")
+    assert "statistics=rate_limited" in error
+
 def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(
     tmp_path,
     monkeypatch,
