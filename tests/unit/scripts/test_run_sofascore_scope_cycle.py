@@ -198,6 +198,156 @@ def test_run_phase_plans_matches_from_the_scope_season_evidence(tmp_path):
         "status": "success",
         "exit_code": 0,
         "plan": str(plan),
+        "errors": [],
     }
     assert planner.call_args.kwargs["phase"] == "targets"
     assert planner.call_args.kwargs["season_evidence"] == "bronze"
+
+
+def _plan_double(**kwargs):
+    return kwargs["output_path"]
+
+
+@pytest.mark.unit
+def test_cycle_reports_why_a_phase_failed(tmp_path, monkeypatch):
+    """#1260: every red attempt must say in results/<hash>.json why it is red.
+
+    The message the capture runner already wrote to the phase report was
+    dropped on the boundary between the phase and the cycle result."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    message = (
+        "match capture has nonterminal endpoint states; refusing to publish "
+        "incomplete normalized data: 3 of 3 matches incomplete; "
+        "statistics=rate_limited x3"
+    )
+    status_counts = {"success": 12, "retryable_failure": 3}
+
+    def run_capture(argv):
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.name == "season.json":
+            output.write_text(json.dumps({"errors": [], "traffic": {}}))
+            return 0
+        output.write_text(json.dumps({
+            "errors": [message],
+            "traffic": {
+                "status_counts": status_counts,
+                "endpoints": 15,
+                "request_count": 0,
+                "replay_hits": 15,
+            },
+        }))
+        return 1
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "all")) == 1
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "failed"
+    assert result["errors"] == [f"matches: {message}"]
+    assert result["phases"][1]["status_counts"] == status_counts
+    assert result["phases"][1]["request_count"] == 0
+    assert result["phases"][1]["replay_hits"] == 15
+    assert result["status_counts"] == status_counts
+
+
+@pytest.mark.unit
+def test_cycle_names_a_phase_that_left_no_report(tmp_path, monkeypatch):
+    """#1260: a phase killed before it wrote its report still owes a reason."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", return_value=1),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches")) == 1
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["errors"] == ["matches: exit_code=1, phase report missing"]
+
+
+@pytest.mark.unit
+def test_cycle_ignores_a_report_left_by_the_previous_try(tmp_path, monkeypatch):
+    """#1260: an Airflow retry reuses the scope directory, so a report from the
+    previous try must not be served as this try's reason."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    stale = tmp_path / "run" / "matches.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({
+        "errors": ["stale reason from the previous try"],
+        "traffic": {"status_counts": {"success": 99}},
+    }))
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", return_value=1),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches")) == 1
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["errors"] == ["matches: exit_code=1, phase report missing"]
+    assert "status_counts" not in result
+
+
+@pytest.mark.unit
+def test_cycle_keeps_the_stage_of_a_prefinalize_snapshot(tmp_path, monkeypatch):
+    """#1260: counters taken before finalize must stay labelled as such."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+
+    def run_capture(argv):
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            "errors": ["match capture scrape failed hard: boom"],
+            "traffic": {
+                "status_counts": {"retryable_failure": 7},
+                "status_counts_stage": "pre_finalize",
+            },
+        }))
+        return 1
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches")) == 1
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["phases"][0]["status_counts_stage"] == "pre_finalize"
+    assert result["status_counts_stage"] == "pre_finalize"
+    assert result["status_counts"] == {"retryable_failure": 7}
