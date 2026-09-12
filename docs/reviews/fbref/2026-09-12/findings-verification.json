@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "selected_public_findings_and_verification_summary",
+  "audit_date": "2026-09-12",
+  "provenance": {
+    "method": "Distilled from locally retained audit summaries; no new production audit performed for this bundle.",
+    "original_reports": [
+      "FBREF-REVIEW-2026-09-12.md",
+      "FBREF-BOARD-AUDIT-2026-09-12.md",
+      "FBREF-CODE-REVIEW-2026-09-12.md",
+      "FBREF-RUNTIME-AUDIT-2026-09-12.md"
+    ],
+    "public_reports": [
+      "review.md",
+      "board-audit.md",
+      "code-review.md",
+      "runtime-audit.md"
+    ],
+    "full_internal_evidence_published": false,
+    "production_backup_published": false,
+    "code_patch_published": false
+  },
+  "verification": {
+    "source": "review.md",
+    "base_sha": "cff8d50c7d7859c009d00118816dbbc14d5fafa2",
+    "prepared_code_fixes": 3,
+    "prepared_test_fixes": 1,
+    "passed": 1770,
+    "skipped": 1,
+    "seconds": 51.95,
+    "test_files": 60,
+    "skipped_reason": "Real Airflow import: Airflow not installed in the test environment.",
+    "log": "unit-verified.log",
+    "ruff": "passed",
+    "diff_whitespace": "passed",
+    "generated_runtime_evidence_consistency": "passed",
+    "scope_limit": "Result predates later audit utility preparation; it does not verify that utility.",
+    "code_deployed": false,
+    "source_observations_repaired": false,
+    "retained_stages_recovered": false
+  },
+  "board_snapshot": {
+    "source": "board-audit.md",
+    "captured_at": "2026-09-12T10:10:15Z",
+    "project_items_read": 601,
+    "pages": 7,
+    "direct_open_issues": 23,
+    "status_counts": {
+      "Todo": 15,
+      "In Progress": 5,
+      "Blocked": 2,
+      "In Review": 1
+    },
+    "issue_numbers": [
+      870,
+      901,
+      903,
+      916,
+      923,
+      945,
+      949,
+      1023,
+      1062,
+      1111,
+      1115,
+      1129,
+      1130,
+      1131,
+      1133,
+      1141,
+      1145,
+      1167,
+      1186,
+      1188,
+      1192,
+      1206,
+      1207
+    ],
+    "merged_prs": [
+      1220,
+      1221,
+      1222,
+      1224,
+      1226
+    ],
+    "workflow_runs": {
+      "total": 30,
+      "success": 18,
+      "failure": 6,
+      "cancelled": 6
+    },
+    "historical_ci_failures_already_corrected": 6,
+    "limit": "Historical snapshot before board reset; not a live board-state claim."
+  },
+  "runtime_snapshot": {
+    "source": "runtime-audit.md",
+    "window_actual_start_from": "2026-08-24T00:00:00Z",
+    "captured_approximately_utc": "2026-09-12 10:11-10:14",
+    "scheduled_current": {
+      "success": 0,
+      "failed": 19,
+      "running": 1
+    },
+    "manual_current": {
+      "nonpublishing_success": 1,
+      "failed": 2
+    },
+    "history": {
+      "success": 40,
+      "failed": 15,
+      "stopped_at": "2026-09-06T01:21:47Z"
+    },
+    "bootstrap": {
+      "success": 3,
+      "failed": 1
+    },
+    "current_scope": {
+      "targets": 226012,
+      "never_fetched": 210622,
+      "outside_sla": 75197
+    },
+    "publication_scope": {
+      "targets": 12069,
+      "never_fetched": 82,
+      "outside_sla": 501
+    },
+    "publication_stale_by_page_kind": {
+      "season_stats": 463,
+      "schedule": 34,
+      "season": 3,
+      "competition_index": 1
+    },
+    "current_completed_match_backlog": 11,
+    "male_registry": {
+      "competitions": 117,
+      "seasons": 1975
+    },
+    "historical_frontier": {
+      "targets": 185184,
+      "fetched": 14476,
+      "pending_retry": 170385,
+      "quarantined": 323,
+      "denominator_stabilized": false
+    },
+    "fbref_generic_stage_janitor": {
+      "reviewed_days": 20,
+      "failed_days": 20,
+      "failed_attempts": 60,
+      "retained_attention_stages": 10
+    },
+    "other_reviewed_maintenance_successful_days": 20,
+    "limit": "Multiple SELECTs during live ingest; pre-fixture-archival counts, not one immutable snapshot. Fetched is not typed completeness."
+  },
+  "fixture_archival": {
+    "source": "runtime-audit.md",
+    "committed_at_utc": "2026-09-12T10:29:25Z",
+    "rows_changed": 1,
+    "target_id": "fbref:test:concurrent-index:26816b472c144534a6e4348964e56687",
+    "fetch_attempts": 0,
+    "new_source": "fbref-test-fixture",
+    "new_state": "quarantined",
+    "new_error_class": "TestFixtureArchived",
+    "immutable_failed_cohort_preserved": true,
+    "real_index_unchanged": true,
+    "backup_retained_locally": true,
+    "limit": "One proven test fixture; other production stale data not repaired."
+  },
+  "confirmed_raw_reproduction": {
+    "source": "code-review.md",
+    "source_squad_id": "7c76bc53",
+    "source_season": "2009-2010",
+    "raw_sha256": "7a79556910ea5f403efb7850d0754e60d18e270ddcb7109a5f2a32e0a6d21167",
+    "table_id": "results2009-20103111_overall",
+    "location": "dom",
+    "source_ordinals": [
+      5,
+      6
+    ],
+    "row_counts": [
+      5,
+      6
+    ],
+    "raw_published": false
+  },
+  "current_status": {
+    "source": "agreed-scope.md",
+    "implementation_preparation_stopped_by_user": true,
+    "prior_plan_is_execution_authorization": false,
+    "next_step": "Further reviews, then new child issues under the consolidated epic.",
+    "production_layer": "Bronze",
+    "current_max_delay_hours_after_source_publication": 24,
+    "stable_simultaneous_history_required": true,
+    "all_history_completion_required_before_first_go": false,
+    "soak_days_approved": 7,
+    "soak_started": false,
+    "proxy_budget_is_task_or_go_criterion": false
+  },
+  "not_established": [
+    "Full production row audit",
+    "All source datasets or historical coverage complete",
+    "Production typed-row contamination",
+    "Production historical row loss from cross-century display-season collision",
+    "Safe live writer concurrency",
+    "Production GO"
+  ]
+}
