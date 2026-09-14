@@ -1,23 +1,21 @@
 # =============================================================================
 # OpenMetadata 1.5.x — Trino Lineage Workflow
 # =============================================================================
-# Reads recent Trino query history (system.runtime.queries on the coordinator)
-# and parses CTAS / INSERT statements to auto-build Bronze → Silver → Gold lineage.
+# Extracts lineage from catalogued Trino view definitions.
 #
 # Prerequisite: `trino_ingestion.yaml` must be run first so OpenMetadata has the
-# table catalog populated — query parser matches table names against existing
-# entities to draw edges.
+# table catalog populated — view references are matched against existing entities
+# to draw edges.
 #
 # Run:
 #   docker compose exec openmetadata-ingestion \
 #     metadata ingest -c /opt/configs/trino_lineage.yaml
 #
-# IMPORTANT: Trino's `system.runtime.queries` is in-memory and bounded by
-# `query.max-history` (default 100) and `query.min-expire-age` (default 10m).
-# At our cluster size (1 coordinator) and DAG cadence (Silver+Gold ~17 CTAS daily),
-# the default 100-query window is ENOUGH only if lineage runs at least every few
-# hours. If you increase ingestion volume, raise `query.max-history` in
-# configs/trino/config.properties (see README).
+# IMPORTANT: query lineage is intentionally disabled. Production traffic is
+# over 100 queries/minute, so `system.runtime.queries` must stay short-lived to
+# protect the coordinator heap and cannot provide a truthful daily lookback.
+# Restore CTAS/INSERT lineage only after query events are persisted externally;
+# do not lengthen Trino's in-memory history.
 # =============================================================================
 
 source:
@@ -42,11 +40,8 @@ source:
   sourceConfig:
     config:
       type: DatabaseLineage
-      # Lookback window in days. With sequential daily DAG runs, 1 day is enough.
-      queryLogDuration: 1
-      # Hard cap on the number of queries fetched from system.runtime.queries.
-      resultLimit: 1000
-      # Process CTAS/INSERT lineage between bronze/silver/gold; skip system schemas.
+      # Preserve lineage through canonical serving views without reading the
+      # coordinator's intentionally short-lived query history.
       schemaFilterPattern:
         includes:
           - "^bronze$"
@@ -55,12 +50,9 @@ source:
       # Canonical WhoScored manifest-backed readers and Transfermarkt A/B
       # readers are views. Preserve lineage through their serving boundaries.
       processViewLineage: true
-      processQueryLineage: true
+      processQueryLineage: false
       processStoredProcedureLineage: false
-      # SqlGlot handles Trino dialect well (CTAS, WITH, window functions used in Gold).
       parsingTimeoutLimit: 300
-      # Filter out OpenMetadata's own probe queries from lineage analysis.
-      filterCondition: "query NOT LIKE '%information_schema%' AND query NOT LIKE '%system.runtime%'"
 
 sink:
   type: metadata-rest
