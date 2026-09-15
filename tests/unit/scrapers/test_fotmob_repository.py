@@ -2659,10 +2659,28 @@ def test_season_match_window_reads_the_partitioned_base_table_once():
 
     writer = MatchWindowWriter(
         rows=[
-            ("9123", "2026", "4001", "2026-09-10T18:00:00.000Z", True, None, None),
+            (
+                "9123",
+                "2026",
+                "4001",
+                "2026-09-10T18:00:00.000Z",
+                True,
+                None,
+                None,
+                "2026-09-11T02:00:00",
+            ),
             # Декартово произведение двух IN-списков: ключ «2026» есть и у
             # турнира, которого в запросе не было.
-            ("47", "2026", "4002", "2026-09-11T18:00:00.000Z", True, None, None),
+            (
+                "47",
+                "2026",
+                "4002",
+                "2026-09-11T18:00:00.000Z",
+                True,
+                None,
+                None,
+                "2026-09-12T02:00:00",
+            ),
         ]
     )
     repository = FotMobRepository(writer=writer)
@@ -2687,6 +2705,10 @@ def test_season_match_window_reads_the_partitioned_base_table_once():
     assert rows[0]["match_id"] == "4001"
     assert rows[0]["utc_time"] == "2026-09-10T18:00:00.000Z"
     assert rows[0]["finished"] is True
+    # Версия строки нужна вызывающему: в таблице живёт несколько записей одного
+    # матча, и решать обязана самая свежая.
+    assert "_ingested_at" in sql
+    assert rows[0]["_ingested_at"] == "2026-09-11T02:00:00"
 
 
 def test_season_match_window_without_scopes_never_queries():
@@ -2706,6 +2728,32 @@ def test_memory_repository_answers_the_new_planning_inputs():
     repository = MemoryFotMobRepository()
 
     assert repository.manifest_index_loaded is True
+    assert (
+        repository.season_matches_in_window(
+            [(47, "2025/2026")],
+            start_iso="2026-09-09T00:00:00.000Z",
+            end_iso="2026-10-31T00:00:00.000Z",
+        )
+        == []
+    )
+
+
+class _BrokenMatchWindowTrino(MatchWindowTrino):
+    def table_exists(self, _schema, _table):
+        raise RuntimeError("Trino is unavailable")
+
+
+def test_season_match_window_survives_a_broken_metadata_query():
+    """Подсказка порядка не имеет права гасить волну.
+
+    `table_exists` — это тоже запрос (`SHOW TABLES`), и его отказ ничем не
+    отличается от отказа самого чтения окна.
+    """
+
+    writer = MatchWindowWriter()
+    writer.trino = _BrokenMatchWindowTrino()
+    repository = FotMobRepository(writer=writer)
+
     assert (
         repository.season_matches_in_window(
             [(47, "2025/2026")],

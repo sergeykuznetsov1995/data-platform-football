@@ -795,15 +795,17 @@ def _window_active_scopes(
     единственный признак «сезон живой», который не зависит от флагов источника.
 
     Строки таблицы — версии: одна и та же пара приходит несколькими записями,
-    поэтому матчи схлопываются по `match_id`, а отмена/перенос в любой версии
-    считается отменой.
+    поэтому матчи схлопываются по `match_id` и решает САМАЯ СВЕЖАЯ версия
+    (`_ingested_at`). Брать «отменён или перенесён хоть в одной версии» нельзя:
+    перенесённый и затем сыгранный матч навсегда выпал бы из долга, а одна
+    старая отмена выкинула бы из актуалки весь сезон.
     """
 
     if not getattr(repository, "manifest_index_loaded", False):
         return set(), {}
     from scrapers.fotmob.transport import canonicalize_target
 
-    by_scope: dict[tuple[int, str], dict[str, dict[str, Any]]] = {}
+    by_scope: dict[tuple[int, str], dict[str, tuple[str, Mapping[str, Any]]]] = {}
     for row in rows:
         try:
             identity = (int(row["competition_id"]), str(row["source_season_key"]))
@@ -812,23 +814,23 @@ def _window_active_scopes(
         match_id = row.get("match_id")
         if match_id is None:
             continue
-        merged = by_scope.setdefault(identity, {}).setdefault(str(match_id), {})
-        merged.setdefault("match_id", match_id)
-        merged.setdefault("utc_time", row.get("utc_time"))
-        for flag in ("finished", "cancelled", "postponed"):
-            if row.get(flag):
-                merged[flag] = True
+        stamp = str(row.get("_ingested_at") or "")
+        versions = by_scope.setdefault(identity, {})
+        previous = versions.get(str(match_id))
+        if previous is None or stamp >= previous[0]:
+            versions[str(match_id)] = (stamp, row)
 
     active: set[tuple[int, str]] = set()
     debt: dict[tuple[int, str], int] = {}
-    for identity, matches in by_scope.items():
+    for identity, versions in by_scope.items():
+        matches = [row for _, row in versions.values()]
         # NULL — не отмена: у части строк флаг просто не заполнен.
-        if not any(not match.get("cancelled") for match in matches.values()):
+        if not any(not match.get("cancelled") for match in matches):
             continue
         active.add(identity)
         debt[identity] = sum(
             1
-            for match in matches.values()
+            for match in matches
             if _match_debt_is_open(
                 match, repository, now, canonicalize_target, require_finished=False
             )

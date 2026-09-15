@@ -2406,8 +2406,6 @@ class FotMobRepository:
         if manager_getter is None:
             return []
         trino = manager_getter()
-        if not trino.table_exists(self.schema, MATCHES_TABLE):
-            return []
         competitions = ", ".join(sorted({f"'{comp}'" for comp, _ in requested}))
         seasons = ", ".join(
             sorted({"'" + season.replace("'", "''") + "'" for _, season in requested})
@@ -2415,10 +2413,14 @@ class FotMobRepository:
         safe_start = str(start_iso).replace("'", "''")
         safe_end = str(end_iso).replace("'", "''")
         try:
+            # `table_exists` — тоже запрос (`SHOW TABLES`), поэтому он внутри
+            # защиты: его отказ обязан гасить подсказку порядка, а не волну.
+            if not trino.table_exists(self.schema, MATCHES_TABLE):
+                return []
             rows = trino.execute_query(
                 f"""
                 SELECT competition_id, source_season_key, match_id, utc_time,
-                       finished, cancelled, postponed
+                       finished, cancelled, postponed, _ingested_at
                 FROM {self.catalog}.{self.schema}.{MATCHES_TABLE}
                 WHERE competition_id IN ({competitions})
                   AND source_season_key IN ({seasons})
@@ -2446,6 +2448,9 @@ class FotMobRepository:
                     "finished": row[4],
                     "cancelled": row[5],
                     "postponed": row[6],
+                    # Версия строки: одна и та же пара живёт в таблице
+                    # несколькими записями, и решает самая свежая.
+                    "_ingested_at": row[7],
                 }
             )
         return output

@@ -559,6 +559,10 @@ def test_season_without_source_flags_joins_the_current_lane_when_it_is_active():
     }
     assert all(item.is_latest for item in current)
     assert history == []
+    # Так полоса истории ведёт себя в бою: раннер считает окно только в волне
+    # актуалки (гейт `automatic_catalog and mode == DAILY`), поэтому в BACKFILL
+    # `active_scopes` пуст и параллельный сезон остаётся и в истории тоже.
+    # Дизъюнктность полос достигается только когда обе получают одно множество.
     assert [item.identity for item in history_without_active] == [(9123, "2026")]
 
 

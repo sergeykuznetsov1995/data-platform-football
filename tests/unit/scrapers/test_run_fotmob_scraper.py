@@ -4750,13 +4750,19 @@ class TestFotmobDebtQueue:
         assert "manifest index is not preloaded" in caplog.text
 
     @pytest.mark.unit
-    def test_window_rows_are_folded_by_match_and_ignore_a_null_cancelled_flag(self):
-        """Строки таблицы — версии одного матча, NULL в cancelled не отмена."""
+    def test_window_rows_are_folded_to_the_freshest_version_of_each_match(self):
+        """Строки таблицы — версии одного матча; решает самая свежая.
+
+        Перенесённый и затем сыгранный матч обязан снова стать долгом, а одна
+        старая отмена не имеет права выкинуть из актуалки весь сезон. NULL в
+        `cancelled` — не отмена, а незаполненный флаг.
+        """
 
         mod = self._module()
         now = datetime(2026, 9, 16, 1, 0)
         repository = _IndexedRepository()
         rows = [
+            # 300: перенесён в старой версии, сыгран в свежей — это долг.
             {
                 "competition_id": 9123,
                 "source_season_key": "2026",
@@ -4764,17 +4770,20 @@ class TestFotmobDebtQueue:
                 "utc_time": "2026-09-14T18:00:00.000Z",
                 "finished": None,
                 "cancelled": None,
-                "postponed": None,
+                "postponed": True,
+                "_ingested_at": "2026-09-01T02:00:00",
             },
             {
                 "competition_id": 9123,
                 "source_season_key": "2026",
                 "match_id": "300",
                 "utc_time": "2026-09-14T18:00:00.000Z",
-                "finished": False,
-                "cancelled": False,
+                "finished": True,
+                "cancelled": None,
                 "postponed": False,
+                "_ingested_at": "2026-09-15T02:00:00",
             },
+            # 301 ещё впереди: не долг, но сезон живой.
             {
                 "competition_id": 9123,
                 "source_season_key": "2026",
@@ -4783,7 +4792,9 @@ class TestFotmobDebtQueue:
                 "finished": None,
                 "cancelled": None,
                 "postponed": None,
+                "_ingested_at": "2026-09-15T02:00:00",
             },
+            # 400: отменён в СВЕЖЕЙ версии — сезон 555 из окна выпадает.
             {
                 "competition_id": 555,
                 "source_season_key": "2026",
@@ -4792,6 +4803,7 @@ class TestFotmobDebtQueue:
                 "finished": None,
                 "cancelled": None,
                 "postponed": None,
+                "_ingested_at": "2026-09-01T02:00:00",
             },
             {
                 "competition_id": 555,
@@ -4801,17 +4813,37 @@ class TestFotmobDebtQueue:
                 "finished": None,
                 "cancelled": True,
                 "postponed": None,
+                "_ingested_at": "2026-09-15T02:00:00",
+            },
+            # 500: отменён в СТАРОЙ версии, в свежей отмены нет — сезон живой.
+            {
+                "competition_id": 777,
+                "source_season_key": "2026",
+                "match_id": "500",
+                "utc_time": "2026-09-14T18:00:00.000Z",
+                "finished": None,
+                "cancelled": True,
+                "postponed": None,
+                "_ingested_at": "2026-09-01T02:00:00",
+            },
+            {
+                "competition_id": 777,
+                "source_season_key": "2026",
+                "match_id": "500",
+                "utc_time": "2026-09-14T18:00:00.000Z",
+                "finished": None,
+                "cancelled": None,
+                "postponed": None,
+                "_ingested_at": "2026-09-15T02:00:00",
             },
         ]
 
         active, debt = mod._window_active_scopes(rows, repository, now)
 
-        # 555 отменён в одной из версий и других матчей в окне не имеет.
-        assert active == {(9123, "2026")}
+        assert active == {(9123, "2026"), (777, "2026")}
         # Долг у не обходимого сезона считается без требования finished: флаг в
-        # bronze устарел ровно потому, что сезон давно не обходили. Матч 301 в
-        # будущем — не долг.
-        assert debt == {(9123, "2026"): 1}
+        # bronze устарел ровно потому, что сезон давно не обходили.
+        assert debt == {(9123, "2026"): 1, (777, "2026"): 1}
 
     @pytest.mark.unit
     def test_history_lane_and_the_campaign_never_pay_for_the_debt_queue(
