@@ -15,6 +15,8 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fotmob_orchestration import (
+    CHILD_TIMEOUT_MINUTES,
+    FAILURE_BACKOFF,
     FotMobLane,
     FotMobSchedulerState,
     advance_after_success,
@@ -47,6 +49,10 @@ LEGACY_PAUSED_DAGS = frozenset(
     }
 )
 ORCHESTRATED_RUN_ID_PREFIX = "fotmob_orchestrated__"
+# Пауза за красной волной обязана пережить полночь: волна, упавшая в 23:55, держит
+# паузу до 00:25, а волна, начатая вчера, может упасть уже сегодня. Поэтому нижняя
+# граница выборки шире текущих суток на самую длинную возможную волну плюс саму паузу.
+FAILURE_LOOKBACK = timedelta(minutes=CHILD_TIMEOUT_MINUTES) + FAILURE_BACKOFF
 DECISION_TASK_ID = "choose_fotmob_lane"
 INITIALIZER_TASK_ID = "initialize_fotmob_publication"
 TRIGGER_TASK_ID = "trigger_fotmob_ingest"
@@ -153,7 +159,8 @@ def _ingest_child_observations(
     from airflow.models import DagRun
     from airflow.settings import Session
 
-    day_start = datetime.combine(_utc_now(now).date(), time(0, 0), tzinfo=UTC)
+    observed_at = _utc_now(now)
+    day_start = datetime.combine(observed_at.date(), time(0, 0), tzinfo=UTC)
     session = Session()
     try:
         runs = (
@@ -161,7 +168,7 @@ def _ingest_child_observations(
             .filter(
                 DagRun.dag_id == INGEST_DAG_ID,
                 DagRun.run_id.like(f"{ORCHESTRATED_RUN_ID_PREFIX}%"),
-                DagRun.start_date >= day_start,
+                DagRun.start_date >= min(day_start, observed_at - FAILURE_LOOKBACK),
             )
             .order_by(DagRun.start_date.asc())
             .all()
@@ -184,6 +191,10 @@ def _ingest_child_observations(
         # Пауза держится только за ПОСЛЕДНЕЙ завершённой волной: зелёная волна
         # после красной снимает её.
         last_failure_ended_at = None
+        started_at = getattr(run, "start_date", None)
+        if started_at is not None and _utc_now(started_at) < day_start:
+            # Вчерашняя волна попала в выборку ради паузы и суточный долг не закрывает.
+            continue
         conf = getattr(run, "conf", None)
         mode = conf.get("mode") if isinstance(conf, Mapping) else None
         if str(mode or "").casefold() == FotMobLane.REFRESH.value:

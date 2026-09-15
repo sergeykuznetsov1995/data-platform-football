@@ -891,11 +891,12 @@ def _fake_metadb(monkeypatch, rows, *, session_factory=None):
     return log
 
 
-def _run(state, mode, *, end_date=None):
+def _run(state, mode, *, end_date=None, start_date=None):
     return SimpleNamespace(
         state=state,
         conf={"mode": mode},
         end_date=end_date,
+        start_date=start_date or datetime(2026, 8, 8, 6, tzinfo=timezone.utc),
     )
 
 
@@ -920,7 +921,13 @@ def test_observations_read_todays_orchestrated_children_in_one_query(monkeypatch
     assert filters[0][1] == (
         ("eq", "dag_id", module.INGEST_DAG_ID),
         ("like", "run_id", f"{module.ORCHESTRATED_RUN_ID_PREFIX}%"),
-        ("ge", "start_date", datetime(2026, 8, 8, tzinfo=timezone.utc)),
+        # Нижняя граница — не полночь, а самая ранняя из полуночи и окна паузы:
+        # красная волна, кончившаяся до полуночи, обязана удержать паузу.
+        (
+            "ge",
+            "start_date",
+            datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc) - module.FAILURE_LOOKBACK,
+        ),
     )
     assert ("close",) in log
 
@@ -970,3 +977,61 @@ def test_child_run_id_prefix_matches_the_observation_filter(monkeypatch):
     assert module.trigger_ingest._init_kwargs["trigger_run_id"].startswith(
         module.ORCHESTRATED_RUN_ID_PREFIX
     )
+
+
+def test_failure_backoff_survives_midnight(monkeypatch):
+    """Волна, упавшая в 23:55, обязана держать паузу и после полуночи.
+
+    Выборка «за текущие сутки» теряла такой отказ: в 00:00 запрос его уже не видел,
+    и красная полоса стартовала повторно через пять минут вместо паузы.
+    """
+
+    module = _reload_owner(monkeypatch, isolated=False)
+    yesterday_failed_at = datetime(2026, 8, 7, 23, 55, tzinfo=timezone.utc)
+    rows = [
+        _run(
+            "failed",
+            "daily",
+            start_date=datetime(2026, 8, 7, 23, 50, tzinfo=timezone.utc),
+            end_date=yesterday_failed_at,
+        )
+    ]
+    log = _fake_metadb(monkeypatch, rows)
+    now = datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc)
+
+    refresh_done_today, last_failure_ended_at = module._ingest_child_observations(now)
+
+    assert last_failure_ended_at == yesterday_failed_at
+    assert refresh_done_today is False
+    lower_bound = [entry for entry in log if entry[0] == "filter"][0][1][2]
+    assert lower_bound == ("ge", "start_date", now - module.FAILURE_LOOKBACK)
+    assert lower_bound[2] < datetime(2026, 8, 8, tzinfo=timezone.utc)
+
+
+def test_yesterdays_green_refresh_does_not_settle_todays_guarantee(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    rows = [
+        _run(
+            "success",
+            "refresh",
+            start_date=datetime(2026, 8, 7, 22, tzinfo=timezone.utc),
+        )
+    ]
+    _fake_metadb(monkeypatch, rows)
+
+    assert module._ingest_child_observations(
+        datetime(2026, 8, 8, 0, 30, tzinfo=timezone.utc)
+    ) == (False, None)
+
+
+def test_todays_lower_bound_is_midnight_once_the_day_is_older_than_the_lookback(
+    monkeypatch,
+):
+    module = _reload_owner(monkeypatch, isolated=False)
+    log = _fake_metadb(monkeypatch, [])
+    now = datetime(2026, 8, 8, 20, tzinfo=timezone.utc)
+
+    module._ingest_child_observations(now)
+
+    lower_bound = [entry for entry in log if entry[0] == "filter"][0][1][2]
+    assert lower_bound == ("ge", "start_date", datetime(2026, 8, 8, tzinfo=timezone.utc))
