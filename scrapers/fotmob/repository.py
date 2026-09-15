@@ -2393,10 +2393,22 @@ class FotMobRepository:
         scope keys, so the requested scopes prune. The ``_current`` view is
         deliberately not used — it joins the manifest and ranks the whole
         table, which is exactly the class of heavy reads a wave cannot afford.
+
+        ``fotmob_matches`` is a replace-target table (a season bundle is a
+        complete snapshot, ``REPLACE_TARGET_CURRENT_TABLES``), so the newest
+        batch of a scope is chosen FIRST and the window is applied to it after.
+        Both halves matter: a fixture dropped from the newest snapshot must not
+        survive in an older row, and a match whose newest version moved out of
+        the window must not be answered from its older version.
+
         Two independent ``IN`` lists describe a cartesian product (one season
         key belongs to many competitions), so the requested pairs are
         intersected in Python. A failed query answers an empty window: a wave
         must not go red because an ordering hint could not be computed.
+
+        Known limit: batches are not verified against the manifest (that is the
+        join the wave cannot afford). A batch written to the table whose
+        manifest row never landed is therefore visible here for one wave.
         """
 
         requested = {(int(comp), str(season)) for comp, season in identities}
@@ -2421,9 +2433,17 @@ class FotMobRepository:
                 f"""
                 SELECT competition_id, source_season_key, match_id, utc_time,
                        finished, cancelled, postponed, _ingested_at
-                FROM {self.catalog}.{self.schema}.{MATCHES_TABLE}
-                WHERE competition_id IN ({competitions})
-                  AND source_season_key IN ({seasons})
+                FROM (
+                    SELECT competition_id, source_season_key, match_id, utc_time,
+                           finished, cancelled, postponed, _ingested_at,
+                           max(_ingested_at) OVER (
+                               PARTITION BY competition_id, source_season_key
+                           ) AS _newest_ingested_at
+                    FROM {self.catalog}.{self.schema}.{MATCHES_TABLE}
+                    WHERE competition_id IN ({competitions})
+                      AND source_season_key IN ({seasons})
+                )
+                WHERE _ingested_at = _newest_ingested_at
                   AND utc_time > '{safe_start}'
                   AND utc_time <= '{safe_end}'
                 """

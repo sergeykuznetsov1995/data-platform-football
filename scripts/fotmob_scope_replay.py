@@ -924,6 +924,15 @@ def build_replay_report(raw_root: Path) -> dict[str, Any]:
             "scope_count": len(scopes),
             "review_count": len(review_inventory),
             "pending_count": len(pending_inventory),
+            # Машинно проверяемый признак неполноты: полоса CURRENT собрана без
+            # активных сезонов (#1285), поэтому набор скоупов и подпись
+            # контракта могут отличаться от боевых. Читателю отчёта нельзя
+            # молча сравнивать этот scope_sha256 с боевым.
+            "current_lane_complete": False,
+            "current_lane_incomplete_reason": (
+                "offline replay has no bronze match window, so seasons the "
+                "source stopped flagging are missing from the CURRENT lane"
+            ),
         },
         "decisions": decisions,
         "review_inventory": review_inventory,

@@ -2698,7 +2698,15 @@ def test_season_match_window_reads_the_partitioned_base_table_once():
     assert "JOIN" not in sql.upper()
     assert "competition_id IN ('47', '9123')" in sql
     assert "source_season_key IN ('2025/2026', '2026')" in sql
-    assert "utc_time > '2026-09-09T00:00:00.000Z'" in sql
+    # Сезон — снимок целиком (replace-target), поэтому сначала выбирается
+    # свежий батч скоупа и только потом применяется окно: иначе матч, у
+    # которого свежая версия уехала за окно, отвечался бы старой версией, а
+    # выброшенный из нового снимка матч жил бы вечно.
+    snapshot = sql.index("max(_ingested_at) OVER")
+    partition = sql.index("PARTITION BY competition_id, source_season_key")
+    window = sql.index("utc_time > '2026-09-09T00:00:00.000Z'")
+    assert snapshot < partition < window
+    assert "_ingested_at = _newest_ingested_at" in sql
     assert "utc_time <= '2026-10-31T00:00:00.000Z'" in sql
 
     assert [row["competition_id"] for row in rows] == [9123]
