@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   unit:
+    name: unit-suite
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
