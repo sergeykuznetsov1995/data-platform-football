@@ -8,7 +8,7 @@ that keeps the daily reservation and fair background alternation testable.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from typing import Any, Mapping
 
@@ -19,15 +19,48 @@ from utils.fotmob_publication import (
 
 
 UTC = timezone.utc
-BACKGROUND_HOLD_START = time(13, 30)
-BACKGROUND_DEADLINE = time(13, 45)
+
+
+def _earlier(moment: time, delta: timedelta) -> time:
+    """Сдвинуть настенное время назад внутри одних суток."""
+
+    return (datetime.combine(date(1970, 1, 1), moment, tzinfo=UTC) - delta).time()
+
+
 DAILY_WINDOW_START = time(14, 0)
-DAILY_WINDOW_END = time(15, 0)
+# #1282: окно старта дневной полосы было ровно час (14:00–15:00), и затянувшийся фон
+# съедал его целиком. Замер 08–15.09: фоновая волна кончалась в 14:03–14:23 (хвост
+# доскрапа и Silver ~16 мин), дневной полосы не было в 3 сутках из 8. Окно старта тянем
+# до 19:00, но не дальше: волна, рождённая в 19:45+, держала бы контур занятым в окне
+# ночной доставки (19:45–23:20 UTC) — ночь без доставки и без возможности отката.
+DAILY_WINDOW_END = time(19, 0)
 # Дневная полоса была прибита к когорте из 21 турнира и укладывалась в минуты, поэтому
 # кооперативного дедлайна не имела. Под автоматическим каталогом она обходит весь каталог,
 # и единственным ограничителем оставался жёсткий execution_timeout ребёнка — то есть
 # SIGTERM и красный ран вместо мягкой отсрочки (deferred → partial_success).
 DAILY_DEADLINE = time(21, 0)
+# Самый поздний допустимый старт дневной полосы обязан сохранять запас до её дедлайна,
+# иначе позднее окно старта рождает волну-огрызок. Инвариант закреплён тестом
+# test_late_daily_still_has_runway_before_its_deadline.
+MIN_DAILY_RUNWAY = timedelta(minutes=120)
+
+# Жёсткий стоп фона — это дедлайн и разбег, а не убийство живой волны: убитая волна
+# красит ран, автомат доставки трактует красноту как повод откатить пин, а буфер пачки
+# может разойтись с таблицей. Поэтому фон обязан САМ успеть закончиться до начала
+# дневного окна: его кооперативный дедлайн отстоит от 14:00 на наблюдаемый хвост
+# (доскрап + Silver, замер 08–15.09: 18–38 мин) с запасом.
+BACKGROUND_TAIL_ALLOWANCE = timedelta(minutes=45)
+BACKGROUND_DEADLINE = _earlier(DAILY_WINDOW_START, BACKGROUND_TAIL_ALLOWANCE)
+# Фоновая волна без минимального разбега — огрызок: она не успевает закрыть ни одного
+# скоупа и при lane_idle > 36 ч краснеет с ошибкой раннера no_progress (E4), а красная
+# волна сразу после ночной доставки означает автооткат пина.
+MIN_BACKGROUND_RUNWAY = timedelta(minutes=90)
+BACKGROUND_HOLD_START = _earlier(BACKGROUND_DEADLINE, MIN_BACKGROUND_RUNWAY)
+
+# До #1282 следующая волна стартовала через 17–70 с после красной и повторяла тот же
+# отказ. Пауза одинакова для всех полос: 15 мин почти не отличались бы от нынешней
+# минуты при серии красных, 60 мин съедали бы окно.
+FAILURE_BACKOFF = timedelta(minutes=30)
 
 # execution_timeout задачи scrape_fotmob_data в dag_ingest_fotmob. Продублирован здесь
 # намеренно: от него считается достижимость потолков запросов, а тест
@@ -138,12 +171,31 @@ def choose_lane(
     now_utc: datetime,
     state: FotMobSchedulerState,
     child_running: bool,
+    *,
+    refresh_done_today: bool = False,
+    last_failure_ended_at: datetime | None = None,
 ) -> LaneDecision:
-    """Choose one workload without mutating the durable cursor."""
+    """Choose one workload without mutating the durable cursor.
+
+    ``refresh_done_today`` и ``last_failure_ended_at`` — наблюдения из метабазы, а не
+    поля состояния: форма Variable ``fotmob.scheduler.state.v1`` (четыре ключа) —
+    контракт отката пином, и пятый ключ сделал бы откат невозможным.
+
+    Оговорка: дневная полоса теперь может быть выбрана повторно в те же сутки (после
+    паузы за красной волной). При включённой церемонии публикации это дало бы тот же
+    ``generation_id`` — идентичность считается от суточной границы 14:00. В боевом
+    изолированном контуре церемония выключена, и идентификатор поколения включает
+    ``run_id`` пятиминутного тика владельца, поэтому повтор уникален.
+    """
 
     now = _as_utc(now_utc)
     if child_running:
         return LaneDecision(None, "ingest_child_running")
+    if (
+        last_failure_ended_at is not None
+        and now < _as_utc(last_failure_ended_at) + FAILURE_BACKOFF
+    ):
+        return LaneDecision(None, "failure_backoff")
 
     wall_time = now.time().replace(tzinfo=None)
     if BACKGROUND_HOLD_START <= wall_time < DAILY_WINDOW_START:
@@ -154,6 +206,11 @@ def choose_lane(
         return LaneDecision(FotMobLane.DAILY, "daily_window")
     if wall_time >= DAILY_WINDOW_END:
         return LaneDecision(None, "background_window_closed")
+    if not refresh_done_today:
+        # Курсор полос честен только в среднем: замер 08–15.09 показал refresh в 5
+        # сутках из 8. Суточная гарантия заводит его независимо от курсора, а после
+        # успеха advance_after_success отдаёт остаток дня истории.
+        return LaneDecision(FotMobLane.REFRESH, "refresh_daily_guarantee")
     return LaneDecision(state.next_background_lane, "background_fair_turn")
 
 
@@ -207,6 +264,10 @@ def advance_after_success(
 # замеренных ~12 КиБ на запрос (дневной ран 09.08: 913 запросов / 10,7 МиБ) он держит
 # примерно четырёхкратный запас и в норме не срабатывает. Это осознанно.
 #
+# Окно полосы считается от самого раннего допустимого старта: у дневной полосы,
+# стартовавшей поздно (#1282 растянул окно старта до 19:00), потолок запросов
+# декоративен — останов ей даёт кооперативный дедлайн DAILY_DEADLINE.
+#
 # rpm НЕ поднимаем — темп обращений к источнику прежний.
 _LANE_CAPS = {
     FotMobLane.DAILY: (24_000, 1_536, 60),
@@ -233,7 +294,8 @@ def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
         and now.time().replace(tzinfo=None) >= BACKGROUND_HOLD_START
     ):
         raise ValueError(
-            "FotMob background child cannot start at or after the 13:30 UTC cutoff"
+            "FotMob background child cannot start at or after the "
+            f"{BACKGROUND_HOLD_START.strftime('%H:%M')} UTC cutoff"
         )
     max_requests, max_direct_mib, rpm = _LANE_CAPS[normalized_lane]
     deadline = (
