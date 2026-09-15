@@ -22,6 +22,19 @@ from tests.unit.scripts.test_fotmob_deploy import (
 NOW = datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)
 
 
+class _FrozenDateTimeMeta(type):
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, datetime)
+
+
+class _FrozenDateTime(datetime, metaclass=_FrozenDateTimeMeta):
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return NOW.replace(tzinfo=None)
+        return NOW.astimezone(tz)
+
+
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -1341,6 +1354,14 @@ def test_plan_refuses_active_publication_lease_and_nonstructural_evidence():
     with pytest.raises(mod.PurgeRefused, match="structural-female"):
         _plan(backend)
 
+    backend = FakeBackend()
+    backend.evidence[10557] = replace(
+        backend.evidence[10557],
+        observed_at=NOW - mod.MAX_EVIDENCE_AGE - timedelta(seconds=1),
+    )
+    with pytest.raises(mod.PurgeRefused, match="structural-female evidence is stale"):
+        _plan(backend)
+
 
 def test_plan_refuses_a_missing_protected_profile_blob():
     backend = FakeBackend()
@@ -2008,10 +2029,11 @@ def test_journal_cannot_skip_live_reconstruction_with_an_extraneous_receipt(
     assert not any(event[0] == "delete-table" for event in backend.events)
 
 
-def test_cli_dry_run_writes_plan_without_mutation(tmp_path):
+def test_cli_dry_run_writes_plan_without_mutation(tmp_path, monkeypatch):
     backend = FakeBackend()
     output = tmp_path / "plan.json"
     deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    monkeypatch.setattr(mod, "datetime", _FrozenDateTime)
     code = mod.main(
         [
             "--env-file",
@@ -2037,7 +2059,7 @@ def test_cli_dry_run_writes_plan_without_mutation(tmp_path):
     mod._validate_plan(
         payload,
         supplied_sha256=payload["plan_sha256"],
-        now=datetime.now(timezone.utc),
+        now=NOW,
     )
     assert not any(event[0].startswith("delete") for event in backend.events)
 
@@ -2098,10 +2120,12 @@ def test_cli_rejects_invalid_plan_before_constructing_writer_backend(
     assert called is False
 
 
-def test_cli_expired_empty_journal_recovers_and_releases_journaled_fence(tmp_path):
+def test_cli_expired_empty_journal_recovers_and_releases_journaled_fence(
+    tmp_path, monkeypatch
+):
     backend = FakeBackend()
     plan = _plan(backend)
-    clock = datetime.now(timezone.utc)
+    clock = NOW
     plan["created_at"] = (clock - timedelta(hours=2)).isoformat()
     plan["expires_at"] = (clock - timedelta(hours=1)).isoformat()
     plan = mod.with_plan_hash(plan)
@@ -2121,6 +2145,7 @@ def test_cli_expired_empty_journal_recovers_and_releases_journaled_fence(tmp_pat
         called = True
         return backend
 
+    monkeypatch.setattr(mod, "datetime", _FrozenDateTime)
     code = mod.main(
         [
             "--env-file",
