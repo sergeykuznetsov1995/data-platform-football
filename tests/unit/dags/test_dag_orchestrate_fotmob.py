@@ -3,10 +3,28 @@ from __future__ import annotations
 import importlib
 import json
 import sys
-from datetime import datetime, timezone
-from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
+from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from utils.fotmob_orchestration import BACKGROUND_HOLD_START
+
+
+def _hold(shift: timedelta = timedelta(0)) -> datetime:
+    """Границу фонового старта берём из константы, а не из литерала."""
+
+    return (
+        datetime(
+            2026,
+            8,
+            8,
+            BACKGROUND_HOLD_START.hour,
+            BACKGROUND_HOLD_START.minute,
+            tzinfo=timezone.utc,
+        )
+        + shift
+    )
 
 
 def _reload_owner(monkeypatch, *, isolated: bool):
@@ -213,7 +231,7 @@ def test_successful_child_advances_durable_lane_once_across_task_retry(monkeypat
 def test_background_launch_rechecks_1330_before_initializing(monkeypatch):
     module = _reload_owner(monkeypatch, isolated=False)
     state = module.FotMobSchedulerState.initial()
-    selected_at = datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc)
+    selected_at = _hold(-timedelta(minutes=1))
     decision = {
         "lane": "refresh",
         "state": state.to_dict(),
@@ -231,8 +249,10 @@ def test_background_launch_rechecks_1330_before_initializing(monkeypatch):
     assert (
         module.initialize_admitted_publication(
             ti=ti,
-            now_utc=datetime(2026, 8, 8, 13, 30, tzinfo=timezone.utc),
+            now_utc=_hold(),
             child_running=False,
+            refresh_done_today=False,
+            last_failure_ended_at=None,
         )
         is False
     )
@@ -240,8 +260,10 @@ def test_background_launch_rechecks_1330_before_initializing(monkeypatch):
 
     assert module.initialize_admitted_publication(
         ti=ti,
-        now_utc=datetime(2026, 8, 8, 13, 29, 30, tzinfo=timezone.utc),
+        now_utc=_hold(-timedelta(seconds=30)),
         child_running=False,
+        refresh_done_today=False,
+        last_failure_ended_at=None,
     ) == {"generation_id": "one"}
     assert len(initialized) == 1
 
@@ -399,7 +421,7 @@ def test_pretrigger_cutoff_safely_releases_without_child_or_state_advance(
 
     module = _reload_owner(monkeypatch, isolated=True)
     state = module.FotMobSchedulerState.initial()
-    selected_at = datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc)
+    selected_at = _hold(-timedelta(minutes=1))
     decision = {
         "lane": "refresh",
         "state": state.to_dict(),
@@ -445,8 +467,10 @@ def test_pretrigger_cutoff_safely_releases_without_child_or_state_advance(
 
     context = {
         "ti": ti,
-        "now_utc": datetime(2026, 8, 8, 13, 30, tzinfo=timezone.utc),
+        "now_utc": _hold(),
         "child_running": False,
+        "refresh_done_today": False,
+        "last_failure_ended_at": None,
     }
     with pytest.raises(AirflowSkipException, match="window closed"):
         module.trigger_ingest.execute(context)
@@ -467,7 +491,7 @@ def test_pretrigger_boundary_allows_background_before_cutoff(monkeypatch):
 
     module = _reload_owner(monkeypatch, isolated=True)
     state = module.FotMobSchedulerState.initial()
-    selected_at = datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc)
+    selected_at = _hold(-timedelta(minutes=1))
     decision = {
         "lane": "refresh",
         "state": state.to_dict(),
@@ -489,8 +513,10 @@ def test_pretrigger_boundary_allows_background_before_cutoff(monkeypatch):
     )
     context = {
         "ti": ti,
-        "now_utc": datetime(2026, 8, 8, 13, 29, 30, tzinfo=timezone.utc),
+        "now_utc": _hold(-timedelta(seconds=30)),
         "child_running": False,
+        "refresh_done_today": False,
+        "last_failure_ended_at": None,
     }
 
     assert module.trigger_ingest.execute(context) == "triggered"
@@ -572,7 +598,7 @@ def test_pretrigger_final_check_orders_active_query_then_clock_then_trigger(
 
     module = _reload_owner(monkeypatch, isolated=True)
     state = module.FotMobSchedulerState.initial()
-    selected_at = datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc)
+    selected_at = _hold(-timedelta(minutes=1))
     decision = {
         "lane": "refresh",
         "state": state.to_dict(),
@@ -581,6 +607,11 @@ def test_pretrigger_final_check_orders_active_query_then_clock_then_trigger(
     ti = SimpleNamespace(xcom_pull=lambda **kwargs: decision)
     events = []
     monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(
+        module,
+        "_ingest_child_observations",
+        lambda *args, **kwargs: events.append("observations_query") or (False, None),
+    )
     monkeypatch.setattr(
         module,
         "_ingest_child_active",
@@ -595,11 +626,18 @@ def test_pretrigger_final_check_orders_active_query_then_clock_then_trigger(
     context = {
         "ti": ti,
         "utcnow": lambda: events.append("actual_clock")
-        or datetime(2026, 8, 8, 13, 29, 59, tzinfo=timezone.utc),
+        or _hold(-timedelta(seconds=1)),
     }
 
     assert module.trigger_ingest.execute(context) == "triggered"
-    assert events == ["active_child_query", "actual_clock", "trigger_child"]
+    # Наблюдения метабазы обязаны лечь ДО последнего чтения часов: после него
+    # остаются только чистые сравнения перед вставкой ребёнка.
+    assert events == [
+        "observations_query",
+        "active_child_query",
+        "actual_clock",
+        "trigger_child",
+    ]
 
 
 def test_queued_child_appearing_between_init_and_trigger_is_rejected(monkeypatch):
@@ -607,7 +645,7 @@ def test_queued_child_appearing_between_init_and_trigger_is_rejected(monkeypatch
 
     module = _reload_owner(monkeypatch, isolated=True)
     state = module.FotMobSchedulerState.initial()
-    selected_at = datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc)
+    selected_at = _hold(-timedelta(minutes=1))
     decision = {
         "lane": "refresh",
         "state": state.to_dict(),
@@ -630,17 +668,15 @@ def test_queued_child_appearing_between_init_and_trigger_is_rejected(monkeypatch
 
     ti = _TI()
     active = iter([False, True])
-    clock = iter(
-        [
-            datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc),
-            datetime(2026, 8, 8, 13, 29, 30, tzinfo=timezone.utc),
-        ]
-    )
+    clock = iter([_hold(-timedelta(minutes=1)), _hold(-timedelta(seconds=30))])
     initialized = []
     released = []
     child_triggers = []
     monkeypatch.setattr(module, "_load_state", lambda: state)
     monkeypatch.setattr(module, "_ingest_child_active", lambda: next(active))
+    monkeypatch.setattr(
+        module, "_ingest_child_observations", lambda *args, **kwargs: (False, None)
+    )
     monkeypatch.setattr(
         module,
         "initialize_fotmob_publication",
@@ -754,3 +790,183 @@ def test_non_exact_isolated_value_does_not_materialize_owner(monkeypatch):
     module = importlib.import_module("dag_orchestrate_fotmob")
     assert module.dag is None
     assert PythonOperator._instances == []
+
+
+def _state_with(module, lane, **kwargs):
+    return module.FotMobSchedulerState(
+        next_background_lane=lane,
+        daily_date=kwargs.get("daily_date"),
+        generation=3,
+        updated_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+    )
+
+
+def test_lane_selection_feeds_both_metadb_observations_into_the_policy(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    state = _state_with(module, module.FotMobLane.BACKFILL)
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(
+        module,
+        "_ingest_child_observations",
+        lambda *args, **kwargs: pytest.fail("test hook must replace the query"),
+    )
+    midnight = datetime(2026, 8, 8, 0, 5, tzinfo=timezone.utc)
+
+    owed = module.select_fotmob_lane(
+        now_utc=midnight,
+        child_running=False,
+        refresh_done_today=False,
+        last_failure_ended_at=None,
+    )
+    assert owed["lane"] == "refresh"
+    assert owed["reason"] == "refresh_daily_guarantee"
+
+    settled = module.select_fotmob_lane(
+        now_utc=midnight,
+        child_running=False,
+        refresh_done_today=True,
+        last_failure_ended_at=None,
+    )
+    assert settled["lane"] == "backfill"
+
+    paused = module.select_fotmob_lane(
+        now_utc=midnight,
+        child_running=False,
+        refresh_done_today=True,
+        last_failure_ended_at=datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc),
+    )
+    assert paused is False
+
+
+def _fake_metadb(monkeypatch, rows, *, session_factory=None):
+    class _Column:
+        def __init__(self, name):
+            self.name = name
+
+        def __eq__(self, other):
+            return ("eq", self.name, other)
+
+        def like(self, pattern):
+            return ("like", self.name, pattern)
+
+        def __ge__(self, other):
+            return ("ge", self.name, other)
+
+        def asc(self):
+            return ("asc", self.name)
+
+    class _DagRun:
+        dag_id = _Column("dag_id")
+        run_id = _Column("run_id")
+        start_date = _Column("start_date")
+
+    log = []
+
+    class _Query:
+        def filter(self, *clauses):
+            log.append(("filter", clauses))
+            return self
+
+        def order_by(self, *clauses):
+            log.append(("order_by", clauses))
+            return self
+
+        def all(self):
+            return rows
+
+    class _Session:
+        def query(self, model):
+            log.append(("query", model))
+            return _Query()
+
+        def close(self):
+            log.append(("close",))
+
+    airflow_models = ModuleType("airflow.models")
+    airflow_models.DagRun = _DagRun
+    airflow_settings = ModuleType("airflow.settings")
+    airflow_settings.Session = session_factory or _Session
+    monkeypatch.setitem(sys.modules, "airflow.models", airflow_models)
+    monkeypatch.setitem(sys.modules, "airflow.settings", airflow_settings)
+    return log
+
+
+def _run(state, mode, *, end_date=None):
+    return SimpleNamespace(
+        state=state,
+        conf={"mode": mode},
+        end_date=end_date,
+    )
+
+
+def test_observations_read_todays_orchestrated_children_in_one_query(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    failed_at = datetime(2026, 8, 8, 9, 30, tzinfo=timezone.utc)
+    rows = [
+        _run("success", "refresh"),
+        _run("running", "daily"),
+        _run("failed", "backfill", end_date=failed_at),
+    ]
+    log = _fake_metadb(monkeypatch, rows)
+
+    refresh_done_today, last_failure_ended_at = module._ingest_child_observations(
+        datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    )
+
+    assert refresh_done_today is True
+    assert last_failure_ended_at == failed_at
+    filters = [entry for entry in log if entry[0] == "filter"]
+    assert len(filters) == 1, "наблюдения обязаны стоить один запрос на тик"
+    assert filters[0][1] == (
+        ("eq", "dag_id", module.INGEST_DAG_ID),
+        ("like", "run_id", f"{module.ORCHESTRATED_RUN_ID_PREFIX}%"),
+        ("ge", "start_date", datetime(2026, 8, 8, tzinfo=timezone.utc)),
+    )
+    assert ("close",) in log
+
+
+def test_observations_forget_a_failure_once_a_later_wave_is_green(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    rows = [
+        _run("failed", "refresh", end_date=datetime(2026, 8, 8, 1, tzinfo=timezone.utc)),
+        _run("success", "refresh"),
+    ]
+    _fake_metadb(monkeypatch, rows)
+
+    assert module._ingest_child_observations(
+        datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    ) == (True, None)
+
+
+def test_empty_metadb_day_owes_a_refresh_and_holds_no_pause(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    _fake_metadb(monkeypatch, [])
+
+    assert module._ingest_child_observations(
+        datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    ) == (False, None)
+
+
+def test_unavailable_metadb_raises_instead_of_reporting_a_quiet_day(monkeypatch):
+    """Молчаливый None перезапускал бы красную полосу вслепую каждые пять минут."""
+
+    module = _reload_owner(monkeypatch, isolated=False)
+
+    def _broken():
+        raise RuntimeError("metadb is unavailable")
+
+    _fake_metadb(monkeypatch, [], session_factory=_broken)
+
+    with pytest.raises(RuntimeError, match="metadb is unavailable"):
+        module._ingest_child_observations(
+            datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+        )
+
+
+def test_child_run_id_prefix_matches_the_observation_filter(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=True)
+
+    assert module.ORCHESTRATED_RUN_ID_PREFIX == "fotmob_orchestrated__"
+    assert module.trigger_ingest._init_kwargs["trigger_run_id"].startswith(
+        module.ORCHESTRATED_RUN_ID_PREFIX
+    )
