@@ -8,7 +8,12 @@ import pytest
 from scripts import fotmob_recover as mod
 from scrapers.fbref.control import StateConflict
 from tests.unit.scrapers.test_publication_generation_store import make_store
-from utils.fotmob_orchestration import FotMobSchedulerState, choose_lane
+from utils.fotmob_orchestration import (
+    DAILY_WINDOW_END,
+    FotMobLane,
+    FotMobSchedulerState,
+    choose_lane,
+)
 
 
 GENERATION_ID = "28c9c8a2-16d1-50a4-bf8d-c8a5ca4ed50b"
@@ -476,8 +481,18 @@ def test_writing_daily_failure_waits_for_next_calendar_boundary_with_new_ids(
     )
 
     selected_state = snapshots[0]["owner_matches"][0]["decision"]["state"]
+    # #1282: окно СТАРТА дневной полосы идёт до DAILY_WINDOW_END, поэтому после
+    # паузы за красной волной планировщик заводит daily повторно в те же сутки.
     same_day = choose_lane(
         datetime(2026, 8, 8, 18, 5, tzinfo=timezone.utc),
+        FotMobSchedulerState.from_dict(selected_state),
+        False,
+    )
+    closed = choose_lane(
+        datetime(
+            2026, 8, 8, DAILY_WINDOW_END.hour, DAILY_WINDOW_END.minute,
+            tzinfo=timezone.utc,
+        ),
         FotMobSchedulerState.from_dict(selected_state),
         False,
     )
@@ -487,7 +502,8 @@ def test_writing_daily_failure_waits_for_next_calendar_boundary_with_new_ids(
         False,
     )
     assert events == ["release"]
-    assert same_day.lane is None
+    assert same_day.lane is FotMobLane.DAILY
+    assert closed.lane is None
     assert next_tick.lane is not None
     assert next_tick.lane.value == lane
     assert report["passed"] is True
@@ -499,9 +515,11 @@ def test_writing_daily_failure_waits_for_next_calendar_boundary_with_new_ids(
     retry = report["roll_forward"]["next_eligible_boundary"]
     assert retry["policy"] == "next_eligible_boundary"
     assert retry["lane"] == lane
-    assert retry["timing"] == "next_calendar_daily_1400_utc"
-    assert retry["same_day_retry_allowed"] is False
-    assert retry["earliest_at"] == "2026-08-09T14:00:00.000000+00:00"
+    # Планировщик допустит полосу уже сегодня — через паузу после красной волны;
+    # СВЕЖАЯ идентичность появляется только на следующей календарной границе.
+    assert retry["timing"] == "same_day_after_failure_backoff"
+    assert retry["same_day_retry_allowed"] is True
+    assert retry["earliest_at"] == "2026-08-08T18:30:00.000000+00:00"
     assert retry["next_data_interval_start"] == ("2026-08-08T14:00:00.000000+00:00")
     assert retry["next_data_interval_end"] == "2026-08-09T14:00:00.000000+00:00"
     assert retry["identity_source"] == (
@@ -525,7 +543,9 @@ def test_writing_daily_failure_waits_for_next_calendar_boundary_with_new_ids(
     assert json.loads(_arguments(tmp_path).output.read_text())["passed"] is True
 
 
-def test_terminal_daily_never_reuses_the_remaining_same_day_window():
+def test_terminal_daily_never_reuses_its_generation_even_when_retried_today():
+    """Повтор в те же сутки допустим, а повтор ТЕРМИНАЛЬНОГО поколения — нет."""
+
     retry = mod._next_eligible_boundary(
         _owner()["decision"],
         _binding(),
@@ -533,8 +553,79 @@ def test_terminal_daily_never_reuses_the_remaining_same_day_window():
         observed_at="2026-08-08T14:10:00+00:00",
     )
 
+    assert retry["same_day_retry_allowed"] is True
+    assert retry["earliest_at"] == "2026-08-08T14:40:00.000000+00:00"
+    assert retry["requires_new_generation_id"] is True
+    assert retry["requires_new_child_run_ids"] is True
+    assert retry["next_data_interval_end"] == "2026-08-09T14:00:00.000000+00:00"
+
+
+def test_terminal_daily_failing_late_waits_for_the_next_calendar_boundary():
+    retry = mod._next_eligible_boundary(
+        _owner()["decision"],
+        _binding(),
+        generation_id=GENERATION_ID,
+        observed_at="2026-08-08T18:45:00+00:00",
+    )
+
+    assert retry["same_day_retry_allowed"] is False
+    assert retry["timing"] == "next_calendar_daily_1400_utc"
+    assert retry["earliest_at"] == "2026-08-09T14:00:00.000000+00:00"
+
+
+def test_recovering_yesterdays_daily_never_promises_a_pre_window_retry():
+    """Пауза не открывает дневную полосу раньше начала её окна.
+
+    Восстановление вчерашнего daily сегодня утром обещало бы повтор «через 30 минут»,
+    хотя раньше 14:00 планировщик дневную полосу не заводит.
+    """
+
+    retry = mod._next_eligible_boundary(
+        _owner()["decision"],
+        _binding(),
+        generation_id=GENERATION_ID,
+        observed_at="2026-08-09T06:00:00+00:00",
+    )
+
     assert retry["same_day_retry_allowed"] is False
     assert retry["earliest_at"] == "2026-08-09T14:00:00.000000+00:00"
+
+
+def test_recover_daily_policy_copy_matches_the_scheduler():
+    """Копия окон в recover обязана совпадать с политикой планировщика.
+
+    Скрипт запускается самостоятельно, dags/ на PYTHONPATH не гарантирован, поэтому
+    константы скопированы. Расхождение копии молча вернуло бы старый контракт.
+    """
+    from utils import fotmob_orchestration as policy
+
+    assert mod.DAILY_WINDOW_START == policy.DAILY_WINDOW_START
+    assert mod.DAILY_WINDOW_END == policy.DAILY_WINDOW_END
+    assert mod.FAILURE_BACKOFF == policy.FAILURE_BACKOFF
+
+
+def test_recover_accepts_refresh_taken_off_cursor_by_the_daily_guarantee():
+    """#1282: суточная гарантия заводит refresh и при курсоре backfill."""
+
+    decision = _owner(lane="refresh")["decision"]
+    decision["state"]["next_background_lane"] = "backfill"
+
+    advanced = mod.expected_advanced_state(
+        decision, recovered_at="2026-08-08T18:00:00+00:00"
+    )
+
+    assert advanced["next_background_lane"] == "backfill"
+    assert advanced["generation"] == decision["state"]["generation"] + 1
+
+
+def test_recover_still_rejects_backfill_that_differs_from_the_cursor():
+    decision = _owner(lane="backfill")["decision"]
+    decision["state"]["next_background_lane"] = "refresh"
+
+    with pytest.raises(mod.RecoveryError, match="backfill differs"):
+        mod.expected_advanced_state(
+            decision, recovered_at="2026-08-08T18:00:00+00:00"
+        )
 
 
 @pytest.mark.parametrize("lane", ("refresh", "backfill"))
@@ -576,14 +667,24 @@ def test_writing_background_failure_keeps_lane_for_next_owner_interval(
     )
 
     selected_state = snapshots[0]["owner_matches"][0]["decision"]["state"]
+    # 09:10 — раньше BACKGROUND_HOLD_START; полосу возвращает курсор, но только
+    # когда суточная гарантия refresh уже закрыта.
     next_tick = choose_lane(
-        datetime(2026, 8, 9, 12, 10, tzinfo=timezone.utc),
+        datetime(2026, 8, 9, 9, 10, tzinfo=timezone.utc),
         FotMobSchedulerState.from_dict(selected_state),
         False,
+        refresh_done_today=True,
+    )
+    owed_refresh = choose_lane(
+        datetime(2026, 8, 9, 9, 10, tzinfo=timezone.utc),
+        FotMobSchedulerState.from_dict(selected_state),
+        False,
+        refresh_done_today=False,
     )
     assert events == ["release"]
     assert next_tick.lane is not None
     assert next_tick.lane.value == lane
+    assert owed_refresh.lane is FotMobLane.REFRESH
     retry = report["roll_forward"]["next_eligible_boundary"]
     assert retry == {
         "policy": "next_eligible_boundary",

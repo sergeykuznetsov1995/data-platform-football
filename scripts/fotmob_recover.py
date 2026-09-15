@@ -11,10 +11,14 @@ Two recoveries are intentionally narrow:
 
 * a terminal isolated producer in ``writing``/retained ``failed`` is marked
   failed with ``safe_to_release=True`` while its scheduler cursor remains
-  unchanged.  A terminal generation is never reopened: daily becomes eligible
-  at the next calendar 14:00 UTC boundary, while refresh/backfill keeps the
-  same lane for the next eligible five-minute owner interval.  Both use fresh
-  generation and child-run identities;
+  unchanged.  A terminal generation is never reopened.  Since #1282 the daily
+  start window runs until ``DAILY_WINDOW_END``, so the scheduler admits daily
+  again on the same day once ``FAILURE_BACKOFF`` has passed -- that is a
+  different fact from identity: a same-day daily binding repeats the terminal
+  generation, so the report keeps a fresh identity at the next calendar
+  boundary.  Refresh/backfill keeps its lane for the next eligible five-minute
+  owner interval, and refresh may also be taken off-cursor by the per-day
+  refresh guarantee.  Both use fresh generation and child-run identities;
 * an exact terminal SofaScore wait against ``ready`` and unclaimed evidence is
   abandoned.
 
@@ -60,6 +64,14 @@ SILVER_DAG_ID = "dag_transform_fotmob_silver"
 SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
 PUBLICATION_CONF_KEY = "fotmob_publication"
 SCHEDULER_STATE_VARIABLE = "fotmob.scheduler.state.v1"
+
+# Копия политики окон планировщика (dags/utils/fotmob_orchestration.py).
+# Импортировать оттуда нельзя: скрипт запускается самостоятельно и dags/ на
+# PYTHONPATH не гарантирован. Расхождение копии ловит тест
+# test_recover_daily_policy_copy_matches_the_scheduler.
+DAILY_WINDOW_START = time(14, 0)
+DAILY_WINDOW_END = time(19, 0)
+FAILURE_BACKOFF = timedelta(minutes=30)
 
 ISOLATED_DAGS = (
     OWNER_DAG_ID,
@@ -228,13 +240,13 @@ def _next_eligible_boundary(
     if (
         old_end - old_start != timedelta(days=1)
         or old_end.date() != failed_date
-        or old_end.time() != time(14, 0)
+        or old_end.time() != DAILY_WINDOW_START
     ):
         raise RecoveryError("terminal daily binding differs from selected boundary")
 
     observed = _instant(observed_at, label="retry boundary observation")
     next_date = failed_date + timedelta(days=1)
-    boundary = datetime.combine(next_date, time(14, 0), tzinfo=timezone.utc)
+    boundary = datetime.combine(next_date, DAILY_WINDOW_START, tzinfo=timezone.utc)
     while boundary <= observed:
         boundary += timedelta(days=1)
     next_binding = {
@@ -247,11 +259,37 @@ def _next_eligible_boundary(
     next_generation_id = make_generation_id(next_binding)
     if next_generation_id == generation_id:  # pragma: no cover - UUID input differs
         raise RecoveryError("next daily boundary reused terminal generation")
+    # #1282: окно СТАРТА дневной полосы идёт до DAILY_WINDOW_END, поэтому после паузы
+    # FAILURE_BACKOFF планировщик заводит daily повторно в те же сутки. Это два разных
+    # факта: когда полоса снова допускается (earliest_at) и когда у неё появляется
+    # СВЕЖАЯ идентичность. В те же сутки binding тот же, то есть поколение повторило бы
+    # терминальное, а терминальное не переоткрывается — идентичность отчёта остаётся у
+    # следующей календарной границы.
+    # earliest_at — ВЕРХНЯЯ оценка: снимок восстановления не несёт времени конца
+    # упавшего рана, известно лишь, что на observed_at он уже был терминальным;
+    # планировщик может допустить полосу раньше, если отказ кончился раньше.
+    # Раньше начала дневного окна допуска нет в любом случае.
+    same_day_retry_at = max(
+        observed + FAILURE_BACKOFF,
+        datetime.combine(observed.date(), DAILY_WINDOW_START, tzinfo=timezone.utc),
+    )
+    same_day_window_end = datetime.combine(
+        observed.date(), DAILY_WINDOW_END, tzinfo=timezone.utc
+    )
+    same_day_retry_allowed = (
+        observed.date() == failed_date and same_day_retry_at < same_day_window_end
+    )
     return {
         **common,
-        "timing": "next_calendar_daily_1400_utc",
-        "same_day_retry_allowed": False,
-        "earliest_at": boundary.isoformat(timespec="microseconds"),
+        "timing": (
+            "same_day_after_failure_backoff"
+            if same_day_retry_allowed
+            else "next_calendar_daily_1400_utc"
+        ),
+        "same_day_retry_allowed": same_day_retry_allowed,
+        "earliest_at": (
+            same_day_retry_at if same_day_retry_allowed else boundary
+        ).isoformat(timespec="microseconds"),
         "next_data_interval_start": next_binding["data_interval_start"],
         "next_data_interval_end": next_binding["data_interval_end"],
         "identity_source": "next_daily_binding_and_rollout_runtime_fingerprint",
@@ -306,8 +344,9 @@ def expected_advanced_state(
     if lane == "daily":
         daily_date = selected_date
     elif lane == "refresh":
-        if next_lane != "refresh":
-            raise RecoveryError("automatic refresh differs from scheduler cursor")
+        # #1282: суточная гарантия заводит refresh независимо от курсора, поэтому
+        # refresh при курсоре backfill законен. После успеха курсор всё равно уходит
+        # на backfill — остаток суток достаётся истории.
         next_lane = "backfill"
     else:
         if next_lane != "backfill":

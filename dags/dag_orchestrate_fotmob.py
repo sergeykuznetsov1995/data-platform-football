@@ -15,6 +15,7 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fotmob_orchestration import (
+    FAILURE_BACKOFF,
     FotMobLane,
     FotMobSchedulerState,
     advance_after_success,
@@ -46,6 +47,7 @@ LEGACY_PAUSED_DAGS = frozenset(
         "dag_collect_fotmob_players",
     }
 )
+ORCHESTRATED_RUN_ID_PREFIX = "fotmob_orchestrated__"
 DECISION_TASK_ID = "choose_fotmob_lane"
 INITIALIZER_TASK_ID = "initialize_fotmob_publication"
 TRIGGER_TASK_ID = "trigger_fotmob_ingest"
@@ -135,6 +137,91 @@ def _ingest_child_active() -> bool:
     return bool(DagRun.find(dag_id=INGEST_DAG_ID, state="running"))
 
 
+def _ingest_child_observations(
+    now: datetime | None = None,
+) -> tuple[bool, datetime | None]:
+    """Read today's refresh success and the last finished child failure.
+
+    Оба факта — наблюдения метабазы, а не поля состояния планировщика: форма
+    Variable ``fotmob.scheduler.state.v1`` (четыре ключа) сверяется на равенство
+    четырьмя внешними валидаторами и является контрактом отката пином.
+
+    Одна выборка на тик. Недоступная база обязана бросить исключение: молчаливый
+    ``None`` означал бы перезапуск красной полосы вслепую каждые пять минут.
+    """
+
+    # Lazy import keeps host DAG unit tests independent of a full Airflow DB.
+    from airflow.models import DagRun
+    from airflow.settings import Session
+    from sqlalchemy import or_
+
+    observed_at = _utc_now(now)
+    day_start = datetime.combine(observed_at.date(), time(0, 0), tzinfo=UTC)
+    session = Session()
+    try:
+        runs = (
+            session.query(DagRun)
+            .filter(
+                DagRun.dag_id == INGEST_DAG_ID,
+                DagRun.run_id.like(f"{ORCHESTRATED_RUN_ID_PREFIX}%"),
+                # Два факта живут на разных осях времени. Суточный долг refresh — по
+                # НАЧАЛУ волны (сегодняшние сутки). Пауза — по КОНЦУ волны: волна,
+                # упавшая в 23:55, держит паузу и после полуночи, а волна, начатая
+                # вчера, может кончиться сегодня. Ограничивать паузу возрастом старта
+                # нечем: жёсткий таймаут 15 ч накрывает только scrape_fotmob_data, а
+                # дальше ран ждёт Silver — общего потолка длительности у DagRun нет.
+                or_(
+                    DagRun.start_date >= day_start,
+                    DagRun.end_date >= observed_at - FAILURE_BACKOFF,
+                ),
+            )
+            .order_by(DagRun.start_date.asc())
+            .all()
+        )
+    finally:
+        session.close()
+
+    refresh_done_today = False
+    last_failure_ended_at: Any = None
+    for run in runs:
+        raw_state = getattr(run, "state", None)
+        run_state = str(
+            getattr(raw_state, "value", raw_state) or ""
+        ).casefold()
+        if run_state == "failed":
+            last_failure_ended_at = getattr(run, "end_date", None)
+            continue
+        if run_state != "success":
+            continue
+        # Пауза держится только за ПОСЛЕДНЕЙ завершённой волной: зелёная волна
+        # после красной снимает её.
+        last_failure_ended_at = None
+        started_at = getattr(run, "start_date", None)
+        if started_at is not None and _utc_now(started_at) < day_start:
+            # Вчерашняя волна попала в выборку ради паузы и суточный долг не закрывает.
+            continue
+        conf = getattr(run, "conf", None)
+        mode = conf.get("mode") if isinstance(conf, Mapping) else None
+        if str(mode or "").casefold() == FotMobLane.REFRESH.value:
+            refresh_done_today = True
+    if last_failure_ended_at is not None:
+        last_failure_ended_at = _utc_now(last_failure_ended_at)
+    return refresh_done_today, last_failure_ended_at
+
+
+def _context_child_observations(
+    context: Mapping[str, Any],
+) -> tuple[bool, datetime | None]:
+    """Read the metadb observations, with deterministic test hooks."""
+
+    if "refresh_done_today" in context or "last_failure_ended_at" in context:
+        return (
+            bool(context.get("refresh_done_today")),
+            context.get("last_failure_ended_at"),
+        )
+    return _ingest_child_observations()
+
+
 def _context_utc_now(context: Mapping[str, Any]) -> datetime:
     """Read the real clock at the call site, with deterministic test hooks."""
 
@@ -192,6 +279,7 @@ def _attest_owner_runtime(**context: Any) -> dict[str, Any]:
 def select_fotmob_lane(**context: Any) -> dict[str, Any] | bool:
     """Short-circuit an idle tick, otherwise publish one immutable decision."""
 
+    refresh_done_today, last_failure_ended_at = _context_child_observations(context)
     now = _context_utc_now(context)
     state = _load_state()
     child_running = bool(
@@ -199,7 +287,13 @@ def select_fotmob_lane(**context: Any) -> dict[str, Any] | bool:
         if "child_running" in context
         else _ingest_child_active()
     )
-    decision = choose_lane(now, state, child_running)
+    decision = choose_lane(
+        now,
+        state,
+        child_running,
+        refresh_done_today=refresh_done_today,
+        last_failure_ended_at=last_failure_ended_at,
+    )
     if decision.lane is None:
         return False
     return {
@@ -247,6 +341,7 @@ def _launch_still_admitted(context: Mapping[str, Any]) -> bool:
             raise AirflowException("FotMob background deadline is invalid")
         deadline = deadline.astimezone(UTC)
 
+    refresh_done_today, last_failure_ended_at = _context_child_observations(context)
     child_active = bool(
         context.get("child_running")
         if "child_running" in context
@@ -256,7 +351,16 @@ def _launch_still_admitted(context: Mapping[str, Any]) -> bool:
     # and DagRun queries above may be slow; after this clock read only pure
     # comparisons remain before TriggerDagRunOperator performs its insert.
     now = _context_utc_now(context)
-    if choose_lane(now, current, child_active).lane is not selected_lane:
+    if (
+        choose_lane(
+            now,
+            current,
+            child_active,
+            refresh_done_today=refresh_done_today,
+            last_failure_ended_at=last_failure_ended_at,
+        ).lane
+        is not selected_lane
+    ):
         return False
     if deadline is not None and now >= deadline:
         return False
@@ -522,7 +626,7 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
         trigger_ingest = BoundaryCheckedTriggerDagRunOperator(
             task_id=TRIGGER_TASK_ID,
             trigger_dag_id=INGEST_DAG_ID,
-            trigger_run_id="fotmob_orchestrated__" + GENERATION_TEMPLATE,
+            trigger_run_id=ORCHESTRATED_RUN_ID_PREFIX + GENERATION_TEMPLATE,
             logical_date="{{ logical_date.isoformat() }}",
             conf={
                 **CHILD_CONF_TEMPLATE,
