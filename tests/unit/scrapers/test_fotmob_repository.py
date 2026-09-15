@@ -2625,3 +2625,92 @@ def test_unbuffered_writers_keep_exactly_once_under_one_guard():
     assert manifest[0]["status"] == "success"
     assert manifest[0]["run_id"] == shared.run_id
     assert guard.max_concurrent == 1
+
+
+class MatchWindowTrino:
+    def __init__(self, rows=()):
+        self.sql = []
+        self.rows = list(rows)
+
+    def table_exists(self, _schema, table):
+        return table == "fotmob_matches"
+
+    def execute_query(self, sql):
+        self.sql.append(sql)
+        return list(self.rows)
+
+
+class MatchWindowWriter(RecordingWriter):
+    def __init__(self, rows=()):
+        super().__init__()
+        self.trino = MatchWindowTrino(rows)
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
+def test_season_match_window_reads_the_partitioned_base_table_once():
+    """Порядок очереди не имеет права стоить волне тяжёлого чтения.
+
+    Вью `_current` соединяет таблицу с манифестом на 1,2 млн строк и ранжирует
+    весь объём; базовая таблица партиционирована по обоим ключам скоупа, и
+    окно прунится до запрошенных партиций.
+    """
+
+    writer = MatchWindowWriter(
+        rows=[
+            ("9123", "2026", "4001", "2026-09-10T18:00:00.000Z", True, None, None),
+            # Декартово произведение двух IN-списков: ключ «2026» есть и у
+            # турнира, которого в запросе не было.
+            ("47", "2026", "4002", "2026-09-11T18:00:00.000Z", True, None, None),
+        ]
+    )
+    repository = FotMobRepository(writer=writer)
+
+    rows = repository.season_matches_in_window(
+        [(9123, "2026"), (47, "2025/2026")],
+        start_iso="2026-09-09T00:00:00.000Z",
+        end_iso="2026-10-31T00:00:00.000Z",
+    )
+
+    assert len(writer.trino.sql) == 1
+    sql = writer.trino.sql[0]
+    assert "fotmob_matches" in sql
+    assert "fotmob_matches_current" not in sql
+    assert "JOIN" not in sql.upper()
+    assert "competition_id IN ('47', '9123')" in sql
+    assert "source_season_key IN ('2025/2026', '2026')" in sql
+    assert "utc_time > '2026-09-09T00:00:00.000Z'" in sql
+    assert "utc_time <= '2026-10-31T00:00:00.000Z'" in sql
+
+    assert [row["competition_id"] for row in rows] == [9123]
+    assert rows[0]["match_id"] == "4001"
+    assert rows[0]["utc_time"] == "2026-09-10T18:00:00.000Z"
+    assert rows[0]["finished"] is True
+
+
+def test_season_match_window_without_scopes_never_queries():
+    writer = MatchWindowWriter()
+    repository = FotMobRepository(writer=writer)
+
+    assert (
+        repository.season_matches_in_window(
+            [], start_iso="2026-09-09T00:00:00.000Z", end_iso="2026-10-31T00:00:00.000Z"
+        )
+        == []
+    )
+    assert writer.trino.sql == []
+
+
+def test_memory_repository_answers_the_new_planning_inputs():
+    repository = MemoryFotMobRepository()
+
+    assert repository.manifest_index_loaded is True
+    assert (
+        repository.season_matches_in_window(
+            [(47, "2025/2026")],
+            start_iso="2026-09-09T00:00:00.000Z",
+            end_iso="2026-10-31T00:00:00.000Z",
+        )
+        == []
+    )

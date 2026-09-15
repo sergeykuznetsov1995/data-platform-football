@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Collection, Iterable, Mapping, Optional
 
 from .domain import ScopeClassification, ScopeDecision, SeasonRef
 
@@ -240,6 +240,19 @@ def _season_recency_key(season: SeasonRef) -> int:
     return 0
 
 
+def _is_current_season(
+    season: SeasonRef, active: Collection[tuple[int, str]] = ()
+) -> bool:
+    """Is this scope part of the source-current lane?
+
+    Source flags are the primary signal, but a competition can run two parallel
+    seasons and the source keeps the flags on only one of them (9123/2026).  A
+    season with matches in the observed window is current regardless of flags.
+    """
+
+    return bool(season.is_selected or season.is_latest or season.identity in active)
+
+
 def _history_season_cycle_key(source_season_key: str) -> tuple[int, str]:
     label = str(source_season_key).strip()
     years = [int(value) for value in re.findall(r"(?<!\d)[12]\d{3}(?!\d)", label)]
@@ -258,6 +271,8 @@ def _plan_seasons(
     lane: Optional[ScopeLane] = None,
     attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
     now: Optional[datetime] = None,
+    scope_debt: Mapping[tuple[int, str], int] | None = None,
+    active_scopes: Optional[Collection[tuple[int, str]]] = None,
     enforce_history_cycle_barrier: bool,
 ) -> list[SeasonWorkItem]:
     """Build shared catalog-obligation or runnable-plan work items."""
@@ -274,6 +289,8 @@ def _plan_seasons(
         else None
     )
     attempts = dict(attempt_states or {})
+    debt = dict(scope_debt or {})
+    active = {(int(comp), str(season)) for comp, season in (active_scopes or ())}
     observed_now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     if observed_now.tzinfo is not None:
         observed_now = observed_now.astimezone(timezone.utc).replace(tzinfo=None)
@@ -289,12 +306,12 @@ def _plan_seasons(
             continue
         if requested is not None and identity not in requested:
             continue
-        is_current = bool(season.is_selected or season.is_latest)
+        is_current = _is_current_season(season, active)
         if lane == ScopeLane.CURRENT and not is_current:
             continue
         if lane == ScopeLane.HISTORY and is_current:
             continue
-        if mode == RunMode.DAILY and not (season.is_selected or season.is_latest):
+        if mode == RunMode.DAILY and not is_current:
             continue
         if mode == RunMode.BACKFILL and identity in success:
             continue
@@ -349,23 +366,33 @@ def _plan_seasons(
                 if retry_at > observed_now:
                     continue
 
-        active_rank = 0 if (season.is_selected or season.is_latest) else 1
+        is_current = _is_current_season(season, active)
+        active_rank = 0 if is_current else 1
         recency = _season_recency_key(season)
         reason = "active_or_latest" if active_rank == 0 else "historical_backfill"
-        last_attempt = attempt.last_attempt_at if attempt is not None else datetime.min
-        if last_attempt.tzinfo is not None:
-            last_attempt = last_attempt.astimezone(timezone.utc).replace(tzinfo=None)
+        # Долг — первый ключ после полосы: волна не успевает обойти весь план,
+        # и обходить надо сначала скоупы с сыгранными матчами без деталей.
+        # attempt is None = в этой полосе скоуп ещё не обходили, долг неизвестен
+        # (новый сезон, сезон из active_scopes) — считаем, что он есть.
+        debt_rank = 0 if (debt.get(season.identity, 0) > 0 or attempt is None) else 1
+        if attempt is None or attempt.outcome == "deferred":
+            # Отложенному дедлайном/бюджетом хвосту журнал ставит свежий штамп
+            # «тронут»; для очереди он не тронут, иначе хвост остаётся хвостом.
+            last_attempt = datetime.min
+        else:
+            last_attempt = _naive_utc(attempt.last_attempt_at)
         output.append(
             SeasonWorkItem(
                 competition_id=season.competition_id,
                 source_season_key=season.source_season_key,
                 priority=(
                     active_rank,
+                    debt_rank,
                     last_attempt,
                     recency,
                     season.source_season_key,
                 ),
-                is_latest=bool(season.is_selected or season.is_latest),
+                is_latest=is_current,
                 reason=reason,
             )
         )
@@ -385,6 +412,8 @@ def plan_seasons(
     lane: Optional[ScopeLane] = None,
     attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
     now: Optional[datetime] = None,
+    scope_debt: Mapping[tuple[int, str], int] | None = None,
+    active_scopes: Optional[Collection[tuple[int, str]]] = None,
 ) -> list[SeasonWorkItem]:
     """Build a stable runnable daily/backfill/replay plan.
 
@@ -396,6 +425,10 @@ def plan_seasons(
     before cooldown filtering, so a cooling retry or fresh terminal outcome in
     that cycle blocks all older cycles. Exact season strings pass through
     unchanged and no hardcoded competition cohort affects order.
+
+    ``scope_debt`` (played matches without details per scope) is the first
+    order key after the lane rank, and ``active_scopes`` adds source-current
+    seasons the source flags miss. Without both the order is the previous one.
     """
 
     return _plan_seasons(
@@ -407,6 +440,8 @@ def plan_seasons(
         lane=lane,
         attempt_states=attempt_states,
         now=now,
+        scope_debt=scope_debt,
+        active_scopes=active_scopes,
         enforce_history_cycle_barrier=True,
     )
 
@@ -417,12 +452,14 @@ def catalog_scope_obligation(
     *,
     mode: RunMode,
     lane: Optional[ScopeLane] = None,
+    active_scopes: Optional[Collection[tuple[int, str]]] = None,
 ) -> tuple[tuple[int, str], ...]:
     """Enumerate the immutable full eligible scope obligation.
 
     Catalog contracts describe every eligible exact source scope and therefore
     deliberately ignore durable completion/attempt state and the runnable
-    automatic-history cycle barrier.
+    automatic-history cycle barrier. ``active_scopes`` must be the same set the
+    plan gets, so obligation and plan split the lanes identically.
     """
 
     return tuple(
@@ -432,6 +469,7 @@ def catalog_scope_obligation(
             seasons,
             mode=mode,
             lane=lane,
+            active_scopes=active_scopes,
             enforce_history_cycle_barrier=False,
         )
     )

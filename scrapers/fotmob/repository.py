@@ -57,6 +57,7 @@ PARSER_VERSION = "fotmob-native-v2"
 LEGACY_PARSER_VERSION = "fotmob-native-v1"
 MANIFEST_TABLE = "fotmob_ingest_manifest"
 SCOPE_OBSERVATIONS_TABLE = "fotmob_competition_scope_observations"
+MATCHES_TABLE = "fotmob_matches"
 
 SCOPE_ATTEMPT_OUTCOMES = frozenset(
     {"success", "retryable", "terminal", "source_gap", "deferred"}
@@ -2373,6 +2374,82 @@ class FotMobRepository:
         )
         return _raw_entity_result(normalized_type, normalized_id, selected)
 
+    @property
+    def manifest_index_loaded(self) -> bool:
+        """Is the manifest index in memory, so a lookup costs no query?"""
+
+        return bool(self._preloaded)
+
+    def season_matches_in_window(
+        self,
+        identities: Iterable[tuple[int, str]],
+        *,
+        start_iso: str,
+        end_iso: str,
+    ) -> list[dict[str, Any]]:
+        """Read scheduled matches of exact scopes inside one time window.
+
+        One query against the base table: it is physically partitioned by both
+        scope keys, so the requested scopes prune. The ``_current`` view is
+        deliberately not used — it joins the manifest and ranks the whole
+        table, which is exactly the class of heavy reads a wave cannot afford.
+        Two independent ``IN`` lists describe a cartesian product (one season
+        key belongs to many competitions), so the requested pairs are
+        intersected in Python. A failed query answers an empty window: a wave
+        must not go red because an ordering hint could not be computed.
+        """
+
+        requested = {(int(comp), str(season)) for comp, season in identities}
+        if not requested:
+            return []
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return []
+        trino = manager_getter()
+        if not trino.table_exists(self.schema, MATCHES_TABLE):
+            return []
+        competitions = ", ".join(sorted({f"'{comp}'" for comp, _ in requested}))
+        seasons = ", ".join(
+            sorted({"'" + season.replace("'", "''") + "'" for _, season in requested})
+        )
+        safe_start = str(start_iso).replace("'", "''")
+        safe_end = str(end_iso).replace("'", "''")
+        try:
+            rows = trino.execute_query(
+                f"""
+                SELECT competition_id, source_season_key, match_id, utc_time,
+                       finished, cancelled, postponed
+                FROM {self.catalog}.{self.schema}.{MATCHES_TABLE}
+                WHERE competition_id IN ({competitions})
+                  AND source_season_key IN ({seasons})
+                  AND utc_time > '{safe_start}'
+                  AND utc_time <= '{safe_end}'
+                """
+            )
+        except Exception as exc:  # pragma: no cover - transport/Trino failure
+            logger.warning("FotMob season match window query failed: %s", exc)
+            return []
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                identity = (int(row[0]), str(row[1]))
+            except (TypeError, ValueError):
+                continue
+            if identity not in requested:
+                continue
+            output.append(
+                {
+                    "competition_id": identity[0],
+                    "source_season_key": identity[1],
+                    "match_id": row[2],
+                    "utc_time": row[3],
+                    "finished": row[4],
+                    "cancelled": row[5],
+                    "postponed": row[6],
+                }
+            )
+        return output
+
     def completed_scope_keys(
         self,
         plan_signature: str,
@@ -2849,6 +2926,21 @@ class MemoryFotMobRepository:
         return None
 
     def ensure_current_views(self) -> list[str]:
+        return []
+
+    @property
+    def manifest_index_loaded(self) -> bool:
+        """In-memory commits are the index: a lookup never queries anything."""
+
+        return True
+
+    def season_matches_in_window(
+        self,
+        identities: Iterable[tuple[int, str]],
+        *,
+        start_iso: str,
+        end_iso: str,
+    ) -> list[dict[str, Any]]:
         return []
 
     def latest_scope_evidence(

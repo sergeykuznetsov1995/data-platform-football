@@ -131,6 +131,11 @@ CURRENT_SCOPE_OBLIGATION_COOLDOWN = timedelta(hours=2)
 # Сколько ждать ПОСЛЕ начала матча, прежде чем идти за его флагом: полтора часа
 # игры плюс запас на то, что источник проставляет терминальный статус не мгновенно.
 MATCH_SETTLE_MARGIN = timedelta(hours=3)
+# Окно, по которому сезон признаётся идущим независимо от флагов источника:
+# неделя назад закрывает уже сыгранный долг, полтора месяца вперёд — сезон,
+# который стартует или доигрывается (9123/2026 идёт до 01.11.2026).
+ACTIVE_WINDOW_LOOKBACK = timedelta(days=7)
+ACTIVE_WINDOW_LOOKAHEAD = timedelta(days=45)
 
 # Единственность писателя bronze (B7). max_active_runs=1 сериализует только
 # DagRun'ы одного дага, а ручной добор и осиротевший скрапер (PPid=1) пишут в те
@@ -703,6 +708,140 @@ def _schedule_cooldown(matches: Iterable[Mapping[str, Any]], now: datetime) -> t
     return min(CURRENT_SCOPE_COOLDOWN, earliest_future + MATCH_SETTLE_MARGIN - now)
 
 
+def _match_debt_is_open(
+    match: Mapping[str, Any],
+    repository: Any,
+    now: datetime,
+    canonicalize: Any,
+    *,
+    require_finished: bool,
+) -> bool:
+    """Придёт ли раннер за карточкой этого матча, если обойдёт скоуп сейчас.
+
+    Дословно фильтр `FotMobIngestService.sync_match_payloads`
+    (`scrapers/fotmob/service.py:2466-2493`): долг — ровно то, что раннер сам
+    запросил бы после обхода, ни больше. Матч, который начался, но не помечен
+    `finished`, долгом НЕ считается: его карточку раннер не качает
+    (`include_unfinished=False`), и такой матч дал бы вечный долг.
+
+    `require_finished=False` — для сезонов, которые источник в этой волне не
+    отдаёт (флагов нет, бандла нет): их флаг `finished` в bronze заведомо
+    устарел, раз сезон давно не обходили.
+    """
+
+    if require_finished and not match.get("finished"):
+        return False
+    if match.get("cancelled") or match.get("postponed"):
+        return False
+    kickoff = _match_kickoff(match.get("utc_time"))
+    if kickoff is None or kickoff > now - MATCH_SETTLE_MARGIN:
+        return False
+    match_id = match.get("match_id")
+    if match_id is None:
+        return False
+    target = canonicalize("matchDetails", {"matchId": str(match_id)})
+    previous = repository.latest_success(target.target_key)
+    return previous is None or bool(previous.get("stale"))
+
+
+def _scope_debt_counts(
+    discovery_results: Iterable[Any],
+    repository: Any,
+    now: datetime,
+) -> dict[tuple[int, str], int]:
+    """Сколько у каждого скоупа сыгранных матчей без собранной карточки.
+
+    Считается бесплатно: расписание выбранного сезона discovery уже скачала, а
+    индекс манифеста сервис предзагрузил одним запросом в конструкторе
+    (`scrapers/fotmob/service.py:583-587`), поэтому `latest_success` — это
+    словарный lookup. Без предзагруженного индекса 135 тыс. lookup'ов
+    превратились бы в 135 тыс. запросов к Trino, поэтому гейт обязателен.
+    """
+
+    if not getattr(repository, "manifest_index_loaded", False):
+        logger.warning(
+            "FotMob debt queue: manifest index is not preloaded, "
+            "scope debt is skipped"
+        )
+        return {}
+    from scrapers.fotmob.transport import canonicalize_target
+
+    counts: dict[tuple[int, str], int] = {}
+    for discovered in discovery_results:
+        bundle = getattr(discovered, "selected_bundle", None)
+        if bundle is None:
+            continue
+        identity = tuple(bundle.scope.identity[:2])
+        counts[identity] = sum(
+            1
+            for match in bundle.matches
+            if _match_debt_is_open(
+                match, repository, now, canonicalize_target, require_finished=True
+            )
+        )
+    return counts
+
+
+def _window_active_scopes(
+    rows: Iterable[Mapping[str, Any]],
+    repository: Any,
+    now: datetime,
+) -> tuple[set[tuple[int, str]], dict[tuple[int, str], int]]:
+    """Сезоны, у которых есть матчи в окне, и их долг.
+
+    Источник держит флаги `selected`/`latest` на одном сезоне турнира, а сезонов
+    бывает два параллельных (9123: `2026/2027` выбран, `2026` идёт до ноября).
+    Второй выпадал из полосы актуалки и не планировался вовсе. Матчи в окне —
+    единственный признак «сезон живой», который не зависит от флагов источника.
+
+    Строки таблицы — версии: одна и та же пара приходит несколькими записями,
+    поэтому матчи схлопываются по `match_id`, а отмена/перенос в любой версии
+    считается отменой.
+    """
+
+    if not getattr(repository, "manifest_index_loaded", False):
+        return set(), {}
+    from scrapers.fotmob.transport import canonicalize_target
+
+    by_scope: dict[tuple[int, str], dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            identity = (int(row["competition_id"]), str(row["source_season_key"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        match_id = row.get("match_id")
+        if match_id is None:
+            continue
+        merged = by_scope.setdefault(identity, {}).setdefault(str(match_id), {})
+        merged.setdefault("match_id", match_id)
+        merged.setdefault("utc_time", row.get("utc_time"))
+        for flag in ("finished", "cancelled", "postponed"):
+            if row.get(flag):
+                merged[flag] = True
+
+    active: set[tuple[int, str]] = set()
+    debt: dict[tuple[int, str], int] = {}
+    for identity, matches in by_scope.items():
+        # NULL — не отмена: у части строк флаг просто не заполнен.
+        if not any(not match.get("cancelled") for match in matches.values()):
+            continue
+        active.add(identity)
+        debt[identity] = sum(
+            1
+            for match in matches.values()
+            if _match_debt_is_open(
+                match, repository, now, canonicalize_target, require_finished=False
+            )
+        )
+    return active, debt
+
+
+def _window_bound(moment: datetime) -> str:
+    """Границы окна — в том же виде, в каком источник пишет `utc_time`."""
+
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
 def _scope_attempt_payload(state, *, plan_signature: str | None = None) -> dict[str, Any]:
     # Отчёт — доказательство о КОНТРАКТЕ, поэтому наружу идёт контрактная
     # подпись рана; журнальная подпись, под которой состояние лежит в манифесте,
@@ -990,6 +1129,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         MANDATORY_COMPETITION_IDS,
         RunMode,
         ScopeLane,
+        _history_season_cycle_key,
         catalog_scope_obligation,
         deterministic_plan_signature,
         plan_seasons,
@@ -1516,6 +1656,45 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if mode == RunMode.BACKFILL
         else ScopeLane.CURRENT
     )
+    # Очередь актуалки идёт по долгу, а не по давности: волна планирует 300-360
+    # скоупов, а успевает 6-160, поэтому порядок решает, что вообще соберётся.
+    # Считается только в автоматической полосе актуалки: у кампании истории
+    # контракта нет (`lane=None`), у backfill/discover/replay и явных скоупов
+    # долг не спрашивают — ни запроса, ни подсчёта.
+    scope_debt: dict[tuple[int, str], int] = {}
+    active_scopes: set[tuple[int, str]] = set()
+    if automatic_catalog and mode == RunMode.DAILY:
+        observed_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        scope_debt = _scope_debt_counts(
+            discovery_results, service.repository, observed_now
+        )
+        window_reader = getattr(
+            service.repository, "season_matches_in_window", None
+        )
+        if window_reader is not None:
+            included_ids = {
+                item.competition.competition_id
+                for item in classifications
+                if item.decision.value == "included"
+            }
+            window_scopes = [
+                season.identity
+                for season in seasons
+                if season.competition_id in included_ids
+                and not (season.is_selected or season.is_latest)
+                and _history_season_cycle_key(season.source_season_key)[0]
+                >= observed_now.year - 1
+            ]
+            window_rows = window_reader(
+                window_scopes,
+                start_iso=_window_bound(observed_now - ACTIVE_WINDOW_LOOKBACK),
+                end_iso=_window_bound(observed_now + ACTIVE_WINDOW_LOOKAHEAD),
+            )
+            active_scopes, window_debt = _window_active_scopes(
+                window_rows, service.repository, observed_now
+            )
+            scope_debt.update(window_debt)
+
     contract_scopes: tuple[tuple[int, str], ...] = ()
     if automatic_catalog:
         contract_scopes = (
@@ -1526,6 +1705,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 seasons,
                 mode=mode,
                 lane=automatic_lane,
+                active_scopes=active_scopes,
             )
         )
         if (
@@ -1651,6 +1831,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         explicit_scopes=(explicit_scopes or None),
         lane=(automatic_lane if automatic_catalog else None),
         attempt_states=attempt_states,
+        scope_debt=scope_debt,
+        active_scopes=active_scopes,
     )
     daily_scope_times = {}
     if mode == RunMode.DAILY and not automatic_catalog:
@@ -1684,8 +1866,26 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             "pending_candidate_scopes": len(pending_candidate_scopes),
             "attempt_states": len(attempt_states),
             "daily_completion_timestamps": len(daily_scope_times),
+            "debt_scopes": sum(
+                1 for item in work if item.priority[1] == 0
+            ),
+            "active_extra_scopes": sorted(
+                format_scope_token(comp, season) for comp, season in active_scopes
+            ),
         },
     )
+    if automatic_catalog and mode == RunMode.DAILY:
+        # Единственная наблюдаемая точка сигнала: N=0 при ненулевом долге в
+        # утренней сводке означает, что признак сломан, и правку надо откатить.
+        logger.info(
+            "FotMob debt queue: debt_scopes=%s active_extra=%s first=%s",
+            work_plan.metadata["debt_scopes"],
+            len(active_scopes),
+            [
+                format_scope_token(item.competition_id, item.source_season_key)
+                for item in work[:5]
+            ],
+        )
     if (
         not work
         and mode in {RunMode.DAILY, RunMode.REPLAY}
