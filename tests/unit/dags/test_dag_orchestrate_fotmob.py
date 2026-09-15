@@ -839,18 +839,54 @@ def test_lane_selection_feeds_both_metadb_observations_into_the_policy(monkeypat
 
 
 def _fake_metadb(monkeypatch, rows, *, session_factory=None):
+    """Фейковая метабаза, которая РЕАЛЬНО применяет собранный фильтр к строкам.
+
+    Мок, который фильтры только записывает, пропустил бы ровно тот дефект, ради
+    которого этот запрос существует (пауза, потерянная у длинной волны).
+    """
+
+    class _Clause:
+        def __init__(self, op, name, value):
+            self.op, self.name, self.value = op, name, value
+
+        def matches(self, row):
+            actual = getattr(row, self.name, None)
+            if self.op == "eq":
+                return actual == self.value
+            if self.op == "like":
+                return isinstance(actual, str) and actual.startswith(
+                    self.value.rstrip("%")
+                )
+            if self.op == "ge":
+                # SQL-семантика: сравнение с NULL — не истина.
+                return actual is not None and actual >= self.value
+            raise AssertionError(f"неизвестный оператор {self.op}")
+
+        def __repr__(self):
+            return f"({self.op}, {self.name}, {self.value})"
+
+        def __eq__(self, other):
+            return (self.op, self.name, self.value) == other
+
+    class _Or:
+        def __init__(self, clauses):
+            self.clauses = clauses
+
+        def matches(self, row):
+            return any(clause.matches(row) for clause in self.clauses)
+
     class _Column:
         def __init__(self, name):
             self.name = name
 
         def __eq__(self, other):
-            return ("eq", self.name, other)
+            return _Clause("eq", self.name, other)
 
         def like(self, pattern):
-            return ("like", self.name, pattern)
+            return _Clause("like", self.name, pattern)
 
         def __ge__(self, other):
-            return ("ge", self.name, other)
+            return _Clause("ge", self.name, other)
 
         def asc(self):
             return ("asc", self.name)
@@ -859,12 +895,17 @@ def _fake_metadb(monkeypatch, rows, *, session_factory=None):
         dag_id = _Column("dag_id")
         run_id = _Column("run_id")
         start_date = _Column("start_date")
+        end_date = _Column("end_date")
 
     log = []
 
     class _Query:
+        def __init__(self):
+            self.clauses = []
+
         def filter(self, *clauses):
             log.append(("filter", clauses))
+            self.clauses.extend(clauses)
             return self
 
         def order_by(self, *clauses):
@@ -872,7 +913,11 @@ def _fake_metadb(monkeypatch, rows, *, session_factory=None):
             return self
 
         def all(self):
-            return rows
+            return [
+                row
+                for row in rows
+                if all(clause.matches(row) for clause in self.clauses)
+            ]
 
     class _Session:
         def query(self, model):
@@ -886,13 +931,18 @@ def _fake_metadb(monkeypatch, rows, *, session_factory=None):
     airflow_models.DagRun = _DagRun
     airflow_settings = ModuleType("airflow.settings")
     airflow_settings.Session = session_factory or _Session
+    sqlalchemy_module = ModuleType("sqlalchemy")
+    sqlalchemy_module.or_ = lambda *clauses: _Or(clauses)
     monkeypatch.setitem(sys.modules, "airflow.models", airflow_models)
     monkeypatch.setitem(sys.modules, "airflow.settings", airflow_settings)
+    monkeypatch.setitem(sys.modules, "sqlalchemy", sqlalchemy_module)
     return log
 
 
 def _run(state, mode, *, end_date=None, start_date=None):
     return SimpleNamespace(
+        dag_id="dag_ingest_fotmob",
+        run_id="fotmob_orchestrated__generation",
         state=state,
         conf={"mode": mode},
         end_date=end_date,
@@ -918,17 +968,20 @@ def test_observations_read_todays_orchestrated_children_in_one_query(monkeypatch
     assert last_failure_ended_at == failed_at
     filters = [entry for entry in log if entry[0] == "filter"]
     assert len(filters) == 1, "наблюдения обязаны стоить один запрос на тик"
-    assert filters[0][1] == (
-        ("eq", "dag_id", module.INGEST_DAG_ID),
-        ("like", "run_id", f"{module.ORCHESTRATED_RUN_ID_PREFIX}%"),
-        # Нижняя граница — не полночь, а самая ранняя из полуночи и окна паузы:
-        # красная волна, кончившаяся до полуночи, обязана удержать паузу.
+    scalar, like, disjunction = filters[0][1][0], filters[0][1][1], filters[0][1][2]
+    assert scalar == ("eq", "dag_id", module.INGEST_DAG_ID)
+    assert like == ("like", "run_id", f"{module.ORCHESTRATED_RUN_ID_PREFIX}%")
+    # Суточный долг — по началу волны, пауза — по её концу: две разные оси времени.
+    assert [
+        (clause.op, clause.name, clause.value) for clause in disjunction.clauses
+    ] == [
+        ("ge", "start_date", datetime(2026, 8, 8, tzinfo=timezone.utc)),
         (
             "ge",
-            "start_date",
-            datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc) - module.FAILURE_LOOKBACK,
+            "end_date",
+            datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc) - module.FAILURE_BACKOFF,
         ),
-    )
+    ]
     assert ("close",) in log
 
 
@@ -996,16 +1049,13 @@ def test_failure_backoff_survives_midnight(monkeypatch):
             end_date=yesterday_failed_at,
         )
     ]
-    log = _fake_metadb(monkeypatch, rows)
+    _fake_metadb(monkeypatch, rows)
     now = datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc)
 
     refresh_done_today, last_failure_ended_at = module._ingest_child_observations(now)
 
     assert last_failure_ended_at == yesterday_failed_at
     assert refresh_done_today is False
-    lower_bound = [entry for entry in log if entry[0] == "filter"][0][1][2]
-    assert lower_bound == ("ge", "start_date", now - module.FAILURE_LOOKBACK)
-    assert lower_bound[2] < datetime(2026, 8, 8, tzinfo=timezone.utc)
 
 
 def test_yesterdays_green_refresh_does_not_settle_todays_guarantee(monkeypatch):
@@ -1024,14 +1074,45 @@ def test_yesterdays_green_refresh_does_not_settle_todays_guarantee(monkeypatch):
     ) == (False, None)
 
 
-def test_todays_lower_bound_is_midnight_once_the_day_is_older_than_the_lookback(
-    monkeypatch,
-):
+def test_long_running_wave_keeps_its_pause_whatever_its_age(monkeypatch):
+    """Жёсткий таймаут накрывает только scrape_fotmob_data — дальше ран ждёт Silver.
+
+    Возрастом старта паузу ограничивать нечем: волна, начатая вчера в 14:00 и
+    упавшая сегодня в 06:00, обязана держать паузу до 06:30.
+    """
+
     module = _reload_owner(monkeypatch, isolated=False)
-    log = _fake_metadb(monkeypatch, [])
-    now = datetime(2026, 8, 8, 20, tzinfo=timezone.utc)
+    failed_at = datetime(2026, 8, 8, 6, 0, tzinfo=timezone.utc)
+    rows = [
+        _run(
+            "failed",
+            "backfill",
+            start_date=datetime(2026, 8, 7, 14, tzinfo=timezone.utc),
+            end_date=failed_at,
+        )
+    ]
+    _fake_metadb(monkeypatch, rows)
 
-    module._ingest_child_observations(now)
+    refresh_done_today, last_failure_ended_at = module._ingest_child_observations(
+        datetime(2026, 8, 8, 6, 5, tzinfo=timezone.utc)
+    )
 
-    lower_bound = [entry for entry in log if entry[0] == "filter"][0][1][2]
-    assert lower_bound == ("ge", "start_date", datetime(2026, 8, 8, tzinfo=timezone.utc))
+    assert last_failure_ended_at == failed_at
+    assert refresh_done_today is False
+
+
+def test_an_old_failure_outside_the_backoff_does_not_reach_the_policy(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    rows = [
+        _run(
+            "failed",
+            "backfill",
+            start_date=datetime(2026, 8, 7, 14, tzinfo=timezone.utc),
+            end_date=datetime(2026, 8, 7, 20, tzinfo=timezone.utc),
+        )
+    ]
+    _fake_metadb(monkeypatch, rows)
+
+    assert module._ingest_child_observations(
+        datetime(2026, 8, 8, 6, 5, tzinfo=timezone.utc)
+    ) == (False, None)

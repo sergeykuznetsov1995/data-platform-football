@@ -573,6 +573,24 @@ def test_terminal_daily_failing_late_waits_for_the_next_calendar_boundary():
     assert retry["earliest_at"] == "2026-08-09T14:00:00.000000+00:00"
 
 
+def test_recovering_yesterdays_daily_never_promises_a_pre_window_retry():
+    """Пауза не открывает дневную полосу раньше начала её окна.
+
+    Восстановление вчерашнего daily сегодня утром обещало бы повтор «через 30 минут»,
+    хотя раньше 14:00 планировщик дневную полосу не заводит.
+    """
+
+    retry = mod._next_eligible_boundary(
+        _owner()["decision"],
+        _binding(),
+        generation_id=GENERATION_ID,
+        observed_at="2026-08-09T06:00:00+00:00",
+    )
+
+    assert retry["same_day_retry_allowed"] is False
+    assert retry["earliest_at"] == "2026-08-09T14:00:00.000000+00:00"
+
+
 def test_recover_daily_policy_copy_matches_the_scheduler():
     """Копия окон в recover обязана совпадать с политикой планировщика.
 

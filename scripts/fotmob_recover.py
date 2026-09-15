@@ -265,11 +265,20 @@ def _next_eligible_boundary(
     # СВЕЖАЯ идентичность. В те же сутки binding тот же, то есть поколение повторило бы
     # терминальное, а терминальное не переоткрывается — идентичность отчёта остаётся у
     # следующей календарной границы.
-    same_day_retry_at = observed + FAILURE_BACKOFF
+    # earliest_at — ВЕРХНЯЯ оценка: снимок восстановления не несёт времени конца
+    # упавшего рана, известно лишь, что на observed_at он уже был терминальным;
+    # планировщик может допустить полосу раньше, если отказ кончился раньше.
+    # Раньше начала дневного окна допуска нет в любом случае.
+    same_day_retry_at = max(
+        observed + FAILURE_BACKOFF,
+        datetime.combine(observed.date(), DAILY_WINDOW_START, tzinfo=timezone.utc),
+    )
     same_day_window_end = datetime.combine(
         observed.date(), DAILY_WINDOW_END, tzinfo=timezone.utc
     )
-    same_day_retry_allowed = same_day_retry_at < same_day_window_end
+    same_day_retry_allowed = (
+        observed.date() == failed_date and same_day_retry_at < same_day_window_end
+    )
     return {
         **common,
         "timing": (

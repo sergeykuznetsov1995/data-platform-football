@@ -15,7 +15,6 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fotmob_orchestration import (
-    CHILD_TIMEOUT_MINUTES,
     FAILURE_BACKOFF,
     FotMobLane,
     FotMobSchedulerState,
@@ -49,10 +48,6 @@ LEGACY_PAUSED_DAGS = frozenset(
     }
 )
 ORCHESTRATED_RUN_ID_PREFIX = "fotmob_orchestrated__"
-# Пауза за красной волной обязана пережить полночь: волна, упавшая в 23:55, держит
-# паузу до 00:25, а волна, начатая вчера, может упасть уже сегодня. Поэтому нижняя
-# граница выборки шире текущих суток на самую длинную возможную волну плюс саму паузу.
-FAILURE_LOOKBACK = timedelta(minutes=CHILD_TIMEOUT_MINUTES) + FAILURE_BACKOFF
 DECISION_TASK_ID = "choose_fotmob_lane"
 INITIALIZER_TASK_ID = "initialize_fotmob_publication"
 TRIGGER_TASK_ID = "trigger_fotmob_ingest"
@@ -158,6 +153,7 @@ def _ingest_child_observations(
     # Lazy import keeps host DAG unit tests independent of a full Airflow DB.
     from airflow.models import DagRun
     from airflow.settings import Session
+    from sqlalchemy import or_
 
     observed_at = _utc_now(now)
     day_start = datetime.combine(observed_at.date(), time(0, 0), tzinfo=UTC)
@@ -168,7 +164,16 @@ def _ingest_child_observations(
             .filter(
                 DagRun.dag_id == INGEST_DAG_ID,
                 DagRun.run_id.like(f"{ORCHESTRATED_RUN_ID_PREFIX}%"),
-                DagRun.start_date >= min(day_start, observed_at - FAILURE_LOOKBACK),
+                # Два факта живут на разных осях времени. Суточный долг refresh — по
+                # НАЧАЛУ волны (сегодняшние сутки). Пауза — по КОНЦУ волны: волна,
+                # упавшая в 23:55, держит паузу и после полуночи, а волна, начатая
+                # вчера, может кончиться сегодня. Ограничивать паузу возрастом старта
+                # нечем: жёсткий таймаут 15 ч накрывает только scrape_fotmob_data, а
+                # дальше ран ждёт Silver — общего потолка длительности у DagRun нет.
+                or_(
+                    DagRun.start_date >= day_start,
+                    DagRun.end_date >= observed_at - FAILURE_BACKOFF,
+                ),
             )
             .order_by(DagRun.start_date.asc())
             .all()
