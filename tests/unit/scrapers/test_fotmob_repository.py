@@ -2625,3 +2625,13 @@ def test_unbuffered_writers_keep_exactly_once_under_one_guard():
     assert manifest[0]["status"] == "success"
     assert manifest[0]["run_id"] == shared.run_id
     assert guard.max_concurrent == 1
+
+
+def test_memory_repository_reports_its_manifest_index_as_loaded():
+    """Двойник памяти — сам себе индекс: lookup у него не стоит запроса.
+
+    Без этого признака подсчёт долга волны молча выключался бы на всех тестах
+    полного рана, и гейт индекса выглядел бы рабочим, ничего не проверяя.
+    """
+
+    assert MemoryFotMobRepository().manifest_index_loaded is True

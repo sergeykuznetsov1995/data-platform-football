@@ -2373,6 +2373,12 @@ class FotMobRepository:
         )
         return _raw_entity_result(normalized_type, normalized_id, selected)
 
+    @property
+    def manifest_index_loaded(self) -> bool:
+        """Is the manifest index in memory, so a lookup costs no query?"""
+
+        return bool(self._preloaded)
+
     def completed_scope_keys(
         self,
         plan_signature: str,
@@ -2850,6 +2856,12 @@ class MemoryFotMobRepository:
 
     def ensure_current_views(self) -> list[str]:
         return []
+
+    @property
+    def manifest_index_loaded(self) -> bool:
+        """In-memory commits are the index: a lookup never queries anything."""
+
+        return True
 
     def latest_scope_evidence(
         self, competition_ids: Iterable[int]

@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from scrapers.fotmob.repository import MemoryFotMobRepository
+
 
 PUBLICATION_SHA = "a" * 40
 
@@ -4585,3 +4587,250 @@ class TestFotmobWriterLock:
 
         with mod._writer_lock() as acquired:
             assert acquired is False
+
+
+def _debt_match(match_id, utc_time, **flags):
+    match = {"match_id": match_id, "utc_time": utc_time}
+    match.update(flags)
+    return match
+
+
+class _IndexedRepository:
+    """Двойник с предзагруженным индексом манифеста."""
+
+    manifest_index_loaded = True
+
+    def __init__(self, collected=()):
+        from scrapers.fotmob.transport import canonicalize_target
+
+        self.collected = {
+            canonicalize_target("matchDetails", {"matchId": str(value)}).target_key: str(
+                value
+            )
+            for value in collected
+        }
+        self.stale = set()
+        self.lookups = []
+
+    def latest_success(self, target_key):
+        self.lookups.append(target_key)
+        match_id = self.collected.get(target_key)
+        if match_id is None:
+            return None
+        return {"stale": match_id in self.stale}
+
+
+class _BareRepository:
+    """Двойник без предзагрузки: гейт обязан его распознать."""
+
+    def latest_success(self, target_key):  # pragma: no cover - не должен зваться
+        raise AssertionError("latest_success must not be called without the index")
+
+
+class _LegacyRepository(MemoryFotMobRepository):
+    """Репозиторий без признака предзагрузки: его не было до этой правки."""
+
+    @property
+    def manifest_index_loaded(self):
+        raise AttributeError("manifest_index_loaded")
+
+
+def _discovered(identity, matches):
+    return SimpleNamespace(
+        selected_bundle=SimpleNamespace(
+            scope=SimpleNamespace(identity=identity),
+            matches=list(matches),
+        )
+    )
+
+
+class TestFotmobDebtQueue:
+    """#1285: очередь актуалки идёт по долгу, а не по давности касания."""
+
+    @staticmethod
+    def _module():
+        sys.modules.pop("dags.scripts.run_fotmob_scraper", None)
+        return importlib.import_module("dags.scripts.run_fotmob_scraper")
+
+    @pytest.mark.unit
+    def test_scope_debt_counts_only_what_the_runner_would_fetch(self):
+        """Долг = ровно фильтр sync_match_payloads, ни больше.
+
+        Матч, который начался, но не помечен finished, карточку не получает
+        (include_unfinished=False) — засчитать его долгом значило бы завести
+        вечного должника, который навсегда занял бы голову очереди.
+        """
+
+        mod = self._module()
+        from scrapers.fotmob.transport import canonicalize_target
+
+        now = datetime(2026, 9, 16, 1, 0)
+        repository = _IndexedRepository(collected=("200", "201"))
+        repository.stale.add("201")
+        matches = [
+            _debt_match("100", "2026-09-15T18:00:00.000Z", finished=True),
+            _debt_match("201", "2026-09-15T18:00:00.000Z", finished=True),
+            _debt_match("200", "2026-09-15T18:00:00.000Z", finished=True),
+            _debt_match("101", "2026-09-16T00:30:00.000Z", finished=True),
+            _debt_match("102", "2026-09-15T18:00:00.000Z", finished=False),
+            _debt_match(
+                "103", "2026-09-15T18:00:00.000Z", finished=True, cancelled=True
+            ),
+            _debt_match(
+                "104", "2026-09-15T18:00:00.000Z", finished=True, postponed=True
+            ),
+            _debt_match("105", "not-a-time", finished=True),
+        ]
+
+        counts = mod._scope_debt_counts(
+            [
+                _discovered((47, "2025/2026", None), matches),
+                SimpleNamespace(selected_bundle=None),
+            ],
+            repository,
+            now,
+        )
+
+        assert counts == {(47, "2025/2026"): 2}
+        assert canonicalize_target(
+            "matchDetails", {"matchId": "100"}
+        ).target_key in repository.lookups
+
+    @pytest.mark.unit
+    def test_scope_debt_is_skipped_without_a_preloaded_manifest_index(self, caplog):
+        """Без индекса 135 тыс. lookup'ов стали бы 135 тыс. запросов к Trino."""
+
+        mod = self._module()
+        repository = _BareRepository()
+
+        with caplog.at_level("WARNING"):
+            counts = mod._scope_debt_counts(
+                [
+                    _discovered(
+                        (47, "2025/2026", None),
+                        [_debt_match("100", "2026-09-15T18:00:00.000Z", finished=True)],
+                    )
+                ],
+                repository,
+                datetime(2026, 9, 16, 1, 0),
+            )
+
+        assert counts == {}
+        assert "manifest index is not preloaded" in caplog.text
+
+    @pytest.mark.unit
+    def test_history_lane_and_the_campaign_never_pay_for_the_debt_queue(
+        self, monkeypatch
+    ):
+        """Гейт: долг считает только автоматическая полоса актуалки.
+
+        Две ноги гейта: полоса истории (`mode != DAILY`, сюда же replay) и
+        кампания истории, которая идёт без `--catalog-contract`
+        (`automatic_catalog=False`, `lane=None`).
+        """
+
+        mod = self._module()
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+        }
+        debt_calls = []
+        monkeypatch.setattr(
+            mod,
+            "_scope_debt_counts",
+            lambda *args, **kwargs: debt_calls.append(args) or {},
+        )
+
+        for arguments in (
+            ["--mode", "backfill", "--catalog-contract", "fotmob-catalog-v1"],
+            ["--mode", "backfill", "--scope", "47=2024/2025"],
+        ):
+            service, _, _ = _service(responses)
+            args = mod._argument_parser().parse_args(
+                [*arguments, "--entities", "season"]
+            )
+
+            rc, report = _run_native_admitted(mod, args, service=service)
+
+            assert rc == 0, report["errors"]
+            assert debt_calls == []
+
+    @pytest.mark.unit
+    def test_refresh_counts_the_debt_and_logs_the_queue(self, caplog):
+        """Единственная наблюдаемая точка сигнала — строка лога волны.
+
+        N = 0 при ненулевом долге в утренней сводке означает, что признак
+        сломан и правку надо откатывать пином; без строки это неотличимо.
+        """
+
+        mod = self._module()
+
+        with caplog.at_level("INFO"):
+            rc, report = self._refresh_run(mod)
+
+        assert rc == 0, report["errors"]
+        work_plan = next(
+            operation
+            for operation in report["operations"]
+            if operation["entity"] == "season_work_plan"
+        )
+        assert work_plan["metadata"]["debt_scopes"] >= 1
+        assert "FotMob debt queue: debt_scopes=" in caplog.text
+
+    @pytest.mark.unit
+    def test_repository_without_the_index_flag_keeps_the_wave_running(self, caplog):
+        """Старый репозиторий (откат, чужой двойник) не роняет ран."""
+
+        mod = self._module()
+
+        with caplog.at_level("WARNING"):
+            rc, report = self._refresh_run(mod, repository_factory=_LegacyRepository)
+
+        assert rc == 0, report["errors"]
+        assert "manifest index is not preloaded" in caplog.text
+
+    @staticmethod
+    def _refresh_run(mod, repository_factory=None):
+        """Волна актуалки на одном included-турнире."""
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _league_payload,
+        )
+
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service = FotMobIngestService(
+            transport=StubTransport(responses),
+            repository=(repository_factory or MemoryFotMobRepository)(),
+            mode=RunMode.DAILY,
+            budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+            run_id="debt-queue-run",
+            max_workers=2,
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+        return _run_native_admitted(mod, args, service=service)

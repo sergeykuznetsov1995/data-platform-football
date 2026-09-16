@@ -240,6 +240,19 @@ def _season_recency_key(season: SeasonRef) -> int:
     return 0
 
 
+def _is_current_season(season: SeasonRef) -> bool:
+    """Is this scope part of the source-current lane?
+
+    One definition for the lane filters, the order rank and the work item, so
+    they cannot drift apart.  A competition running two parallel seasons keeps
+    the source flags on only one of them, so the other silently leaves the
+    current lane — that is a separate defect with its own issue, not a
+    predicate this planner can decide on its own.
+    """
+
+    return bool(season.is_selected or season.is_latest)
+
+
 def _history_season_cycle_key(source_season_key: str) -> tuple[int, str]:
     label = str(source_season_key).strip()
     years = [int(value) for value in re.findall(r"(?<!\d)[12]\d{3}(?!\d)", label)]
@@ -258,6 +271,7 @@ def _plan_seasons(
     lane: Optional[ScopeLane] = None,
     attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
     now: Optional[datetime] = None,
+    scope_debt: Mapping[tuple[int, str], int] | None = None,
     enforce_history_cycle_barrier: bool,
 ) -> list[SeasonWorkItem]:
     """Build shared catalog-obligation or runnable-plan work items."""
@@ -274,6 +288,7 @@ def _plan_seasons(
         else None
     )
     attempts = dict(attempt_states or {})
+    debt = dict(scope_debt or {})
     observed_now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     if observed_now.tzinfo is not None:
         observed_now = observed_now.astimezone(timezone.utc).replace(tzinfo=None)
@@ -289,12 +304,12 @@ def _plan_seasons(
             continue
         if requested is not None and identity not in requested:
             continue
-        is_current = bool(season.is_selected or season.is_latest)
+        is_current = _is_current_season(season)
         if lane == ScopeLane.CURRENT and not is_current:
             continue
         if lane == ScopeLane.HISTORY and is_current:
             continue
-        if mode == RunMode.DAILY and not (season.is_selected or season.is_latest):
+        if mode == RunMode.DAILY and not is_current:
             continue
         if mode == RunMode.BACKFILL and identity in success:
             continue
@@ -349,23 +364,33 @@ def _plan_seasons(
                 if retry_at > observed_now:
                     continue
 
-        active_rank = 0 if (season.is_selected or season.is_latest) else 1
+        is_current = _is_current_season(season)
+        active_rank = 0 if is_current else 1
         recency = _season_recency_key(season)
         reason = "active_or_latest" if active_rank == 0 else "historical_backfill"
-        last_attempt = attempt.last_attempt_at if attempt is not None else datetime.min
-        if last_attempt.tzinfo is not None:
-            last_attempt = last_attempt.astimezone(timezone.utc).replace(tzinfo=None)
+        # Долг — первый ключ после полосы: волна не успевает обойти весь план,
+        # и обходить надо сначала скоупы с сыгранными матчами без деталей.
+        # attempt is None = в этой полосе скоуп ещё не обходили, долг
+        # неизвестен (новый сезон) — считаем, что он есть.
+        debt_rank = 0 if (debt.get(season.identity, 0) > 0 or attempt is None) else 1
+        if attempt is None or attempt.outcome == "deferred":
+            # Отложенному дедлайном/бюджетом хвосту журнал ставит свежий штамп
+            # «тронут»; для очереди он не тронут, иначе хвост остаётся хвостом.
+            last_attempt = datetime.min
+        else:
+            last_attempt = _naive_utc(attempt.last_attempt_at)
         output.append(
             SeasonWorkItem(
                 competition_id=season.competition_id,
                 source_season_key=season.source_season_key,
                 priority=(
                     active_rank,
+                    debt_rank,
                     last_attempt,
                     recency,
                     season.source_season_key,
                 ),
-                is_latest=bool(season.is_selected or season.is_latest),
+                is_latest=is_current,
                 reason=reason,
             )
         )
@@ -385,6 +410,7 @@ def plan_seasons(
     lane: Optional[ScopeLane] = None,
     attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
     now: Optional[datetime] = None,
+    scope_debt: Mapping[tuple[int, str], int] | None = None,
 ) -> list[SeasonWorkItem]:
     """Build a stable runnable daily/backfill/replay plan.
 
@@ -396,6 +422,9 @@ def plan_seasons(
     before cooldown filtering, so a cooling retry or fresh terminal outcome in
     that cycle blocks all older cycles. Exact season strings pass through
     unchanged and no hardcoded competition cohort affects order.
+
+    ``scope_debt`` (played matches without details per scope) is the first
+    order key after the lane rank. Without it the order is the previous one.
     """
 
     return _plan_seasons(
@@ -407,6 +436,7 @@ def plan_seasons(
         lane=lane,
         attempt_states=attempt_states,
         now=now,
+        scope_debt=scope_debt,
         enforce_history_cycle_barrier=True,
     )
 

@@ -703,6 +703,72 @@ def _schedule_cooldown(matches: Iterable[Mapping[str, Any]], now: datetime) -> t
     return min(CURRENT_SCOPE_COOLDOWN, earliest_future + MATCH_SETTLE_MARGIN - now)
 
 
+def _match_debt_is_open(
+    match: Mapping[str, Any],
+    repository: Any,
+    now: datetime,
+    canonicalize: Any,
+) -> bool:
+    """Придёт ли раннер за карточкой этого матча, если обойдёт скоуп сейчас.
+
+    Дословно фильтр `FotMobIngestService.sync_match_payloads`
+    (`scrapers/fotmob/service.py:2466-2493`): долг — ровно то, что раннер сам
+    запросил бы после обхода, ни больше. Матч, который начался, но не помечен
+    `finished`, долгом НЕ считается: его карточку раннер не качает
+    (`include_unfinished=False`), и такой матч дал бы вечный долг.
+    """
+
+    if not match.get("finished"):
+        return False
+    if match.get("cancelled") or match.get("postponed"):
+        return False
+    kickoff = _match_kickoff(match.get("utc_time"))
+    if kickoff is None or kickoff > now - MATCH_SETTLE_MARGIN:
+        return False
+    match_id = match.get("match_id")
+    if match_id is None:
+        return False
+    target = canonicalize("matchDetails", {"matchId": str(match_id)})
+    previous = repository.latest_success(target.target_key)
+    return previous is None or bool(previous.get("stale"))
+
+
+def _scope_debt_counts(
+    discovery_results: Iterable[Any],
+    repository: Any,
+    now: datetime,
+) -> dict[tuple[int, str], int]:
+    """Сколько у каждого скоупа сыгранных матчей без собранной карточки.
+
+    Считается бесплатно: расписание выбранного сезона discovery уже скачала, а
+    индекс манифеста сервис предзагрузил одним запросом в конструкторе
+    (`scrapers/fotmob/service.py:583-587`), поэтому `latest_success` — это
+    словарный lookup. Без предзагруженного индекса 135 тыс. lookup'ов
+    превратились бы в 135 тыс. запросов к Trino, поэтому гейт обязателен.
+    """
+
+    if not getattr(repository, "manifest_index_loaded", False):
+        logger.warning(
+            "FotMob debt queue: manifest index is not preloaded, "
+            "scope debt is skipped"
+        )
+        return {}
+    from scrapers.fotmob.transport import canonicalize_target
+
+    counts: dict[tuple[int, str], int] = {}
+    for discovered in discovery_results:
+        bundle = getattr(discovered, "selected_bundle", None)
+        if bundle is None:
+            continue
+        identity = tuple(bundle.scope.identity[:2])
+        counts[identity] = sum(
+            1
+            for match in bundle.matches
+            if _match_debt_is_open(match, repository, now, canonicalize_target)
+        )
+    return counts
+
+
 def _scope_attempt_payload(state, *, plan_signature: str | None = None) -> dict[str, Any]:
     # Отчёт — доказательство о КОНТРАКТЕ, поэтому наружу идёт контрактная
     # подпись рана; журнальная подпись, под которой состояние лежит в манифесте,
@@ -1516,6 +1582,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if mode == RunMode.BACKFILL
         else ScopeLane.CURRENT
     )
+    # Очередь актуалки идёт по долгу, а не по давности: волна планирует 300-360
+    # скоупов, а успевает 6-160, поэтому порядок решает, что вообще соберётся.
+    # Считается только в автоматической полосе актуалки: у кампании истории
+    # контракта нет (`lane=None`), у backfill/discover/replay и явных скоупов
+    # долг не спрашивают — ни чтения индекса, ни подсчёта.
+    scope_debt: dict[tuple[int, str], int] = {}
+    if automatic_catalog and mode == RunMode.DAILY:
+        scope_debt = _scope_debt_counts(
+            discovery_results,
+            service.repository,
+            datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+
     contract_scopes: tuple[tuple[int, str], ...] = ()
     if automatic_catalog:
         contract_scopes = (
@@ -1651,6 +1730,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         explicit_scopes=(explicit_scopes or None),
         lane=(automatic_lane if automatic_catalog else None),
         attempt_states=attempt_states,
+        scope_debt=scope_debt,
     )
     daily_scope_times = {}
     if mode == RunMode.DAILY and not automatic_catalog:
@@ -1684,8 +1764,22 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             "pending_candidate_scopes": len(pending_candidate_scopes),
             "attempt_states": len(attempt_states),
             "daily_completion_timestamps": len(daily_scope_times),
+            "debt_scopes": sum(
+                1 for item in work if item.priority[1] == 0
+            ),
         },
     )
+    if automatic_catalog and mode == RunMode.DAILY:
+        # Единственная наблюдаемая точка сигнала: N=0 при ненулевом долге в
+        # утренней сводке означает, что признак сломан, и правку надо откатить.
+        logger.info(
+            "FotMob debt queue: debt_scopes=%s first=%s",
+            work_plan.metadata["debt_scopes"],
+            [
+                format_scope_token(item.competition_id, item.source_season_key)
+                for item in work[:5]
+            ],
+        )
     if (
         not work
         and mode in {RunMode.DAILY, RunMode.REPLAY}

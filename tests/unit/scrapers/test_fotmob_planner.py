@@ -415,3 +415,141 @@ def test_plan_signature_is_order_independent_and_policy_sensitive():
     )
     with pytest.raises(ValueError, match="at least one"):
         deterministic_plan_signature([])
+
+
+def _current_attempt(
+    competition_id,
+    source_season_key,
+    now,
+    age,
+    outcome="success",
+    next_retry_at=None,
+):
+    return ScopeAttemptState(
+        competition_id=competition_id,
+        source_season_key=source_season_key,
+        plan_signature="fmplan1-test",
+        attempt_count=1,
+        last_attempt_at=now - age,
+        next_retry_at=next_retry_at,
+        outcome=outcome,
+        reason="test",
+    )
+
+
+def _current_plan(now, attempts, *, scope_debt=None, seasons=None, competitions=None):
+    return plan_seasons(
+        [_classified(value) for value in (competitions or (47, 48, 49, 50))],
+        seasons
+        or [
+            SeasonRef(47, "2025/2026", is_selected=True),
+            SeasonRef(48, "2025/2026", is_selected=True),
+            SeasonRef(49, "2025/2026", is_selected=True),
+            SeasonRef(50, "2025/2026", is_selected=True),
+        ],
+        mode=RunMode.DAILY,
+        lane=ScopeLane.CURRENT,
+        attempt_states=attempts,
+        scope_debt=scope_debt,
+        now=now,
+    )
+
+
+def test_scope_with_debt_is_planned_before_a_longer_untouched_scope():
+    """Долг обходится раньше давности: волна не успевает обойти весь план."""
+
+    now = datetime(2026, 9, 16, 1)
+    plan = _current_plan(
+        now,
+        {
+            (47, "2025/2026"): _current_attempt(47, "2025/2026", now, timedelta(hours=1)),
+            (48, "2025/2026"): _current_attempt(48, "2025/2026", now, timedelta(hours=10)),
+        },
+        scope_debt={(47, "2025/2026"): 3},
+        competitions=(47, 48),
+        seasons=[
+            SeasonRef(47, "2025/2026", is_selected=True),
+            SeasonRef(48, "2025/2026", is_selected=True),
+        ],
+    )
+
+    assert [item.competition_id for item in plan] == [47, 48]
+
+
+def test_two_debtors_are_ordered_by_how_long_they_were_not_touched():
+    now = datetime(2026, 9, 16, 1)
+    plan = _current_plan(
+        now,
+        {
+            (47, "2025/2026"): _current_attempt(47, "2025/2026", now, timedelta(hours=1)),
+            (48, "2025/2026"): _current_attempt(48, "2025/2026", now, timedelta(hours=10)),
+        },
+        scope_debt={(47, "2025/2026"): 3, (48, "2025/2026"): 1},
+        competitions=(47, 48),
+        seasons=[
+            SeasonRef(47, "2025/2026", is_selected=True),
+            SeasonRef(48, "2025/2026", is_selected=True),
+        ],
+    )
+
+    assert [item.competition_id for item in plan] == [48, 47]
+
+
+def test_deferred_scope_is_ranked_as_untouched_but_behind_a_never_tried_scope():
+    """Отложенный хвост получает штамп «тронут» — очередь обязана его игнорировать.
+
+    Иначе весь хвост, срезанный дедлайном или бюджетом, на следующей волне
+    снова оказывается позади уже обойдённых и не собирается никогда.
+    """
+
+    now = datetime(2026, 9, 16, 1)
+    plan = _current_plan(
+        now,
+        {
+            (47, "2025/2026"): _current_attempt(
+                47, "2025/2026", now, timedelta(minutes=1), outcome="deferred"
+            ),
+            (48, "2025/2026"): _current_attempt(48, "2025/2026", now, timedelta(hours=24)),
+        },
+        competitions=(47, 48, 49),
+        seasons=[
+            SeasonRef(47, "2025/2026", is_selected=True),
+            SeasonRef(48, "2025/2026", is_selected=True),
+            SeasonRef(49, "2025/2026", is_selected=True),
+        ],
+    )
+
+    assert [item.competition_id for item in plan] == [49, 47, 48]
+
+
+def test_plan_without_debt_inputs_keeps_composition_and_pins_the_priority_form():
+    """Без новых входов меняется только положение отложенного скоупа."""
+
+    now = datetime(2026, 9, 16, 1)
+    plan = _current_plan(
+        now,
+        {
+            (48, "2025/2026"): _current_attempt(48, "2025/2026", now, timedelta(hours=24)),
+            (49, "2025/2026"): _current_attempt(
+                49, "2025/2026", now, timedelta(minutes=1), outcome="deferred"
+            ),
+            (50, "2025/2026"): _current_attempt(
+                50,
+                "2025/2026",
+                now,
+                timedelta(minutes=5),
+                next_retry_at=now + timedelta(hours=2),
+            ),
+        },
+    )
+
+    assert [
+        (item.competition_id, item.source_season_key, item.is_latest, item.reason)
+        for item in plan
+    ] == [
+        (47, "2025/2026", True, "active_or_latest"),
+        (49, "2025/2026", True, "active_or_latest"),
+        (48, "2025/2026", True, "active_or_latest"),
+    ]
+    assert plan[0].priority == (0, 0, datetime.min, 0, "2025/2026")
+    assert plan[2].priority == (0, 1, now - timedelta(hours=24), 0, "2025/2026")
