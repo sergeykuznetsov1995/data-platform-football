@@ -986,6 +986,7 @@ def _build_native_service(args, run_id: str):
     from scrapers.fotmob.repository import FotMobRepository
     from scrapers.fotmob.service import FotMobIngestService
     from scrapers.fotmob.transport import FotMobTransport
+    from scrapers.fotmob.trino_instrumentation import FotMobIcebergWriter
     from scrapers.fotmob.shared_rate_limiter import RefundableRateLimiter
 
     raw_store = (
@@ -1011,6 +1012,9 @@ def _build_native_service(args, run_id: str):
         rate_limiter=limiter,
     )
     repository = FotMobRepository(
+        # Тот же IcebergWriter, но соединение подписано полосой и раном:
+        # без этого запросы обеих полос неотличимы в очереди Trino (#1284).
+        writer=FotMobIcebergWriter(run_id=run_id),
         batch_size=args.commit_batch_size,
         max_buffered_rows=args.max_buffered_rows,
         write_guard=_writer_lock,
