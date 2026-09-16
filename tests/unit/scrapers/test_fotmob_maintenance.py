@@ -7,6 +7,7 @@ contextmanager'ом: здесь ни одного живого соединен�
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import subprocess
@@ -54,8 +55,30 @@ class _FakeManager:
         # table -> list of (partition, path, size)
         self.files = {table: list(rows) for table, rows in files.items()}
         self.queries: list[str] = []
+        self.events: list[str] = []
         self.fail_on_alter = False
         self.merged = 0
+        self._last = None
+
+    @property
+    def connection(self):
+        """Соединение компакции: курсор ходит в ту же фейковую таблицу."""
+
+        self.events.append("connection")
+        manager = self
+
+        class _Cursor:
+            def execute(self, sql: str) -> None:
+                manager.events.append("execute")
+                manager._last = manager.execute_query(sql)
+
+            def fetchall(self):
+                return manager._last
+
+            def close(self) -> None:
+                manager.events.append("cursor_closed")
+
+        return SimpleNamespace(cursor=_Cursor)
 
     def _table_of(self, sql: str) -> str:
         for table in self.files:
@@ -107,6 +130,8 @@ def _run(manager, *, now, tables=(MANIFEST,), **kwargs):
     @contextmanager
     def _lock():
         lock_entries.append(1)
+        if hasattr(manager, "events"):
+            manager.events.append("lock")
         yield True
 
     defaults = dict(
@@ -317,6 +342,16 @@ class TestWriterLock:
         assert len(entries) == result["chunks"]
         assert pauses == [maintenance.CHUNK_PAUSE_SECONDS] * result["chunks"]
 
+    def test_connection_is_opened_before_the_lock_and_one_query_runs_under_it(self):
+        """Под замком — ровно один запрос: переподключения базового клиента вне замка."""
+
+        manager = _FakeManager({MANIFEST: _files("match", 10)})
+
+        result = _run(manager, now=_Clock(_at(23, 31)))
+
+        assert result["chunks"] == 1
+        assert manager.events == ["connection", "lock", "execute", "cursor_closed"]
+
     def test_busy_lock_stops_the_run_green(self, caplog):
         from dags.scripts.run_fotmob_scraper import WriterLockBusy
 
@@ -392,23 +427,30 @@ class TestFailure:
         assert result["stopped"] == "error"
         assert maintenance.exit_code(result) == 1
 
-    def test_alert_reaches_the_dags_utils_package(self, monkeypatch):
-        """CLI стартует с PYTHONPATH=<корень>, а utils.alerts лежит в dags/."""
+    def test_alert_works_on_the_bare_cli_sys_path(self, monkeypatch):
+        """CLI стартует с PYTHONPATH=<корень>, а utils.alerts лежит в dags/utils."""
 
-        sent: list[tuple[str, str]] = []
-        monkeypatch.syspath_prepend(str(REPO_ROOT))
-        from utils import alerts
-
+        dags_dir = str(REPO_ROOT / "dags")
         monkeypatch.setattr(
-            alerts,
-            "send_telegram_message",
-            lambda message, level="info": sent.append((message, level)),
+            sys, "path", [entry for entry in sys.path if entry != dags_dir]
         )
+        for name in [
+            name
+            for name in list(sys.modules)
+            if name == "utils" or name.startswith("utils.")
+        ]:
+            monkeypatch.delitem(sys.modules, name)
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+        # Без правки пути CLI получил бы здесь ModuleNotFoundError.
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("utils.alerts")
 
         maintenance.notify("compaction failed")
 
-        assert sent == [("compaction failed", "error")]
-        assert str(REPO_ROOT / "dags") in sys.path
+        assert dags_dir in sys.path
+        assert "utils.alerts" in sys.modules
 
 
 @pytest.mark.unit
