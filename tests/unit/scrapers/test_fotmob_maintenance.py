@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -270,11 +271,32 @@ class TestDeadline:
     def test_no_chunk_starts_after_the_cutoff(self):
         manager = _FakeManager({MANIFEST: _files("match", 2_500, size=1024)})
 
-        result = _run(manager, now=_Clock(_at(23, 44), timedelta(minutes=2)))
+        result = _run(manager, now=_Clock(_at(23, 41), timedelta(minutes=1)))
 
         assert result["stopped"] == "deadline"
         assert result["chunks"] == 1
         assert manager.merged == 1
+
+    def test_lock_taken_after_the_cutoff_starts_no_chunk(self):
+        """Замок ждётся до 600 с — время проверяется ещё раз уже под замком."""
+
+        manager = _FakeManager({MANIFEST: _files("match", 10)})
+        clock = _Clock(_at(23, 43))
+
+        @contextmanager
+        def _slow_lock():
+            # Ожидание замка съело остаток окна.
+            clock.value = _at(23, 46)
+            yield True
+
+        result = _run(manager, now=clock, writer_lock=_slow_lock)
+
+        assert result["stopped"] == "deadline"
+        assert result["chunks"] == 0
+        assert manager.merged == 0
+        assert not any(
+            query.lstrip().upper().startswith("ALTER") for query in manager.queries
+        )
 
 
 @pytest.mark.unit
@@ -351,6 +373,43 @@ class TestFailure:
         assert len(notifications) == 1
         assert MANIFEST in notifications[0]
 
+    def test_broken_alert_does_not_swallow_the_failed_run(self):
+        manager = _FakeManager({MANIFEST: _files("match", 10)})
+
+        def _boom_alert(_message):
+            raise ModuleNotFoundError("utils.alerts")
+
+        def _failing_query(sql: str):
+            if sql.lstrip().upper().startswith("ALTER"):
+                raise RuntimeError("Trino query exceeded maximum execution time")
+            return original(sql)
+
+        original = manager.execute_query
+        manager.execute_query = _failing_query
+
+        result = _run(manager, now=_Clock(_at(23, 31)), notify=_boom_alert)
+
+        assert result["stopped"] == "error"
+        assert maintenance.exit_code(result) == 1
+
+    def test_alert_reaches_the_dags_utils_package(self, monkeypatch):
+        """CLI стартует с PYTHONPATH=<корень>, а utils.alerts лежит в dags/."""
+
+        sent: list[tuple[str, str]] = []
+        monkeypatch.syspath_prepend(str(REPO_ROOT))
+        from utils import alerts
+
+        monkeypatch.setattr(
+            alerts,
+            "send_telegram_message",
+            lambda message, level="info": sent.append((message, level)),
+        )
+
+        maintenance.notify("compaction failed")
+
+        assert sent == [("compaction failed", "error")]
+        assert str(REPO_ROOT / "dags") in sys.path
+
 
 @pytest.mark.unit
 class TestMetricsAndOutput:
@@ -380,6 +439,27 @@ class TestMetricsAndOutput:
             record.getMessage().startswith("FotMob compaction: table=")
             for record in caplog.records
         )
+
+    def test_unmeasured_table_is_not_reported_as_complete(self):
+        manager = _FakeManager({MANIFEST: _files("match", 10)})
+        original = manager.execute_query
+        state = {"metrics": 0}
+
+        def _execute(sql: str):
+            if "count(*)" in sql:
+                state["metrics"] += 1
+                if state["metrics"] == 2:
+                    raise RuntimeError("Trino is gone")
+            return original(sql)
+
+        manager.execute_query = _execute
+
+        result = _run(manager, now=_Clock(_at(23, 31)))
+
+        assert result["stopped"] == "metrics_unavailable"
+        assert maintenance.exit_code(result) == 0
+        assert result["metrics_incomplete"] == [MANIFEST]
+        assert result["files_before"] == result["files_after"] == 0
 
     def test_complete_when_nothing_is_small_enough(self):
         manager = _FakeManager(
@@ -417,7 +497,8 @@ class TestCompactionConnection:
         assert isinstance(manager, FotMobTrinoTableManager)
         assert calls[-1]["source"] == "fotmob:maintenance"
         assert calls[-1]["session_properties"] == {
-            "query_max_execution_time": maintenance.QUERY_MAX_EXECUTION_TIME
+            "query_max_run_time": maintenance.QUERY_MAX_RUN_TIME,
+            "query_max_execution_time": maintenance.QUERY_MAX_EXECUTION_TIME,
         }
 
 

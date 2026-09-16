@@ -24,8 +24,15 @@
 
 * окно 23:30-23:50 UTC — новых волн нет с 19:00, фоновая полоса стартует 00:00;
 * идёт волна или она кончилась меньше 30 минут назад — прогон не начинается;
-* каждая порция берёт замок писателя B7 и ограничена сервером 180 секундами,
-  новых порций после 23:47 нет — к 23:50 замок свободен при любой цене порции;
+* каждая порция берёт замок писателя B7 и ограничена сервером 180 секундами
+  полного времени запроса (``query_max_run_time`` считает и очередь, и разбор,
+  и планирование, которых ``query_max_execution_time`` не покрывает);
+* новых порций после 23:44 нет, и время проверяется ЕЩЁ РАЗ уже под замком:
+  ожидание замка у раннера — до 600 секунд, за них окно успевает закрыться.
+  Худший случай удержания замка — 2 x 180 с (базовый клиент повторяет запрос
+  один раз при обрыве соединения), то есть замок свободен к 23:50; если при
+  этом ещё и переподключение к Trino съест свои 113 с, то к 23:52 — всё равно
+  задолго до волны 00:00 с её ожиданием замка 600 с;
 * занятый замок (юнит кампании истории) — не ошибка: прогон уходит зелёным.
 """
 
@@ -33,7 +40,9 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 import re
+import sys
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
@@ -68,12 +77,18 @@ MAX_SQL_BYTES = 250_000
 
 WINDOW_START = dtime(23, 30)
 WINDOW_END = dtime(23, 50)
-CHUNK_CUTOFF = dtime(23, 47)
+# 23:44 + 2 x 180 с (порция и один повтор базового клиента) = 23:50: позже этого
+# момента порция не стартует ни до захвата замка, ни после него.
+CHUNK_CUTOFF = dtime(23, 44)
 WAVE_POLL_SECONDS = 60.0
 CHUNK_PAUSE_SECONDS = 3.0
 DELIVERY_TAIL = timedelta(minutes=30)
 
 # Серверный потолок одной порции: дольше — ошибка Trino, а не удержанный замок.
+# ``query_max_run_time`` — полное время жизни запроса (очередь, разбор,
+# планирование, исполнение); ``query_max_execution_time`` оставлен как второй
+# рубеж по самому исполнению.
+QUERY_MAX_RUN_TIME = "180s"
 QUERY_MAX_EXECUTION_TIME = "180s"
 COMPACTION_SOURCE = "fotmob:maintenance"
 
@@ -206,7 +221,10 @@ def build_compaction_manager():
 
     return FotMobTrinoTableManager(
         source=COMPACTION_SOURCE,
-        session_properties={"query_max_execution_time": QUERY_MAX_EXECUTION_TIME},
+        session_properties={
+            "query_max_run_time": QUERY_MAX_RUN_TIME,
+            "query_max_execution_time": QUERY_MAX_EXECUTION_TIME,
+        },
     )
 
 
@@ -250,7 +268,16 @@ def _writer_lock_busy_class():
 
 
 def notify(message: str) -> None:
-    """Телеграм той же функцией, что и алерты DAG-ов контура."""
+    """Телеграм той же функцией, что и алерты DAG-ов контура.
+
+    ``utils.alerts`` лежит в ``<корень>/dags/utils``, а CLI запускается с
+    ``PYTHONPATH=<корень>`` (в контейнере — ``/opt/airflow``): sys.path сюда
+    кладёт планировщик, а не мы, поэтому каталог DAG-ов добавляем сами.
+    """
+
+    dags_dir = str(pathlib.Path(__file__).resolve().parents[2] / "dags")
+    if dags_dir not in sys.path:
+        sys.path.append(dags_dir)
 
     from utils.alerts import send_telegram_message
 
@@ -321,10 +348,9 @@ def run(
                 stopped = "deadline"
                 break
             try:
-                with writer_lock():
-                    started = time.perf_counter()
-                    manager.execute_query(chunk_sql(table, chunk["paths"]))
-                elapsed = time.perf_counter() - started
+                elapsed = _compact_chunk(
+                    manager, writer_lock, table, chunk, now=now, cutoff=cutoff
+                )
             except busy_class:
                 logger.warning(
                     "FotMob compaction stopped: bronze writer lock is busy"
@@ -339,11 +365,18 @@ def run(
                     chunk["files"],
                     error,
                 )
-                notify(
-                    f"FotMob compaction failed on {table} "
-                    f"(partition={chunk['partition']}, files={chunk['files']}): {error}"
-                )
+                try:
+                    notify(
+                        f"FotMob compaction failed on {table} (partition="
+                        f"{chunk['partition']}, files={chunk['files']}): {error}"
+                    )
+                except Exception:  # noqa: BLE001 — молчащий алерт не должен съесть отчёт
+                    logger.exception("FotMob compaction: алерт не доставлен")
                 stopped = "error"
+                break
+            if elapsed is None:
+                # Замок достался уже после cutoff — порцию не начинаем.
+                stopped = "deadline"
                 break
             entry["chunks"] += 1
             result["chunks"] += 1
@@ -370,7 +403,28 @@ def run(
     for field in ("files", "bytes"):
         result[f"{field}_before"] = sum(entry[f"{field}_before"] for entry in measured)
         result[f"{field}_after"] = sum(entry[f"{field}_after"] for entry in measured)
+    # Итоговые числа считаются только по таблицам с обоими замерами; если
+    # завершающий замер где-то не удался, прогон не имеет права называться
+    # `complete` — по нему владелец решает, что компакция сошлась.
+    result["metrics_incomplete"] = [
+        entry["table"] for entry in result["tables"] if entry.get("files_after") is None
+    ]
+    if result["metrics_incomplete"] and stopped == "complete":
+        stopped = "metrics_unavailable"
     return _finish(result, stopped, now)
+
+
+def _compact_chunk(manager, writer_lock, table: str, chunk, *, now, cutoff):
+    """Склеить одну порцию под замком; ``None`` — замок достался после cutoff."""
+
+    with writer_lock():
+        # Ожидание замка у раннера — до 600 с: пока мы стояли в очереди за ним,
+        # окно могло закрыться, и начинать порцию уже нельзя.
+        if now() >= cutoff:
+            return None
+        started = time.perf_counter()
+        manager.execute_query(chunk_sql(table, chunk["paths"]))
+        return time.perf_counter() - started
 
 
 def _metrics(manager, table: str, *, optional: bool = False):
