@@ -4627,6 +4627,14 @@ class _BareRepository:
         raise AssertionError("latest_success must not be called without the index")
 
 
+class _LegacyRepository(MemoryFotMobRepository):
+    """Репозиторий без признака предзагрузки: его не было до этой правки."""
+
+    @property
+    def manifest_index_loaded(self):
+        raise AttributeError("manifest_index_loaded")
+
+
 def _discovered(identity, matches):
     return SimpleNamespace(
         selected_bundle=SimpleNamespace(
@@ -4636,47 +4644,8 @@ def _discovered(identity, matches):
     )
 
 
-class _WindowRepository(MemoryFotMobRepository):
-    """Двойник, у которого в окне есть матчи параллельного сезона 47=2026."""
-
-    def __init__(self):
-        super().__init__()
-        self.window_calls = []
-
-    def season_matches_in_window(self, identities, *, start_iso, end_iso):
-        from datetime import timezone
-
-        self.window_calls.append((list(identities), start_iso, end_iso))
-        played = (
-            datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)
-        ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        return [
-            {
-                "competition_id": 47,
-                "source_season_key": "2026",
-                "match_id": "300",
-                "utc_time": played,
-                "finished": None,
-                "cancelled": None,
-                "postponed": None,
-            }
-        ]
-
-
-class _LegacyRepository(MemoryFotMobRepository):
-    """Репозиторий без входов #1285: их не было до этой правки."""
-
-    @property
-    def manifest_index_loaded(self):
-        raise AttributeError("manifest_index_loaded")
-
-    @property
-    def season_matches_in_window(self):
-        raise AttributeError("season_matches_in_window")
-
-
 class TestFotmobDebtQueue:
-    """#1285: очередь актуалки по долгу и активные сезоны без флагов источника."""
+    """#1285: очередь актуалки идёт по долгу, а не по давности касания."""
 
     @staticmethod
     def _module():
@@ -4750,106 +4719,10 @@ class TestFotmobDebtQueue:
         assert "manifest index is not preloaded" in caplog.text
 
     @pytest.mark.unit
-    def test_window_rows_are_folded_to_the_freshest_version_of_each_match(self):
-        """Строки таблицы — версии одного матча; решает самая свежая.
-
-        Перенесённый и затем сыгранный матч обязан снова стать долгом, а одна
-        старая отмена не имеет права выкинуть из актуалки весь сезон. NULL в
-        `cancelled` — не отмена, а незаполненный флаг.
-        """
-
-        mod = self._module()
-        now = datetime(2026, 9, 16, 1, 0)
-        repository = _IndexedRepository()
-        rows = [
-            # 300: перенесён в старой версии, сыгран в свежей — это долг.
-            {
-                "competition_id": 9123,
-                "source_season_key": "2026",
-                "match_id": "300",
-                "utc_time": "2026-09-14T18:00:00.000Z",
-                "finished": None,
-                "cancelled": None,
-                "postponed": True,
-                "_ingested_at": "2026-09-01T02:00:00",
-            },
-            {
-                "competition_id": 9123,
-                "source_season_key": "2026",
-                "match_id": "300",
-                "utc_time": "2026-09-14T18:00:00.000Z",
-                "finished": True,
-                "cancelled": None,
-                "postponed": False,
-                "_ingested_at": "2026-09-15T02:00:00",
-            },
-            # 301 ещё впереди: не долг, но сезон живой.
-            {
-                "competition_id": 9123,
-                "source_season_key": "2026",
-                "match_id": "301",
-                "utc_time": "2026-10-01T18:00:00.000Z",
-                "finished": None,
-                "cancelled": None,
-                "postponed": None,
-                "_ingested_at": "2026-09-15T02:00:00",
-            },
-            # 400: отменён в СВЕЖЕЙ версии — сезон 555 из окна выпадает.
-            {
-                "competition_id": 555,
-                "source_season_key": "2026",
-                "match_id": "400",
-                "utc_time": "2026-09-14T18:00:00.000Z",
-                "finished": None,
-                "cancelled": None,
-                "postponed": None,
-                "_ingested_at": "2026-09-01T02:00:00",
-            },
-            {
-                "competition_id": 555,
-                "source_season_key": "2026",
-                "match_id": "400",
-                "utc_time": "2026-09-14T18:00:00.000Z",
-                "finished": None,
-                "cancelled": True,
-                "postponed": None,
-                "_ingested_at": "2026-09-15T02:00:00",
-            },
-            # 500: отменён в СТАРОЙ версии, в свежей отмены нет — сезон живой.
-            {
-                "competition_id": 777,
-                "source_season_key": "2026",
-                "match_id": "500",
-                "utc_time": "2026-09-14T18:00:00.000Z",
-                "finished": None,
-                "cancelled": True,
-                "postponed": None,
-                "_ingested_at": "2026-09-01T02:00:00",
-            },
-            {
-                "competition_id": 777,
-                "source_season_key": "2026",
-                "match_id": "500",
-                "utc_time": "2026-09-14T18:00:00.000Z",
-                "finished": None,
-                "cancelled": None,
-                "postponed": None,
-                "_ingested_at": "2026-09-15T02:00:00",
-            },
-        ]
-
-        active, debt = mod._window_active_scopes(rows, repository, now)
-
-        assert active == {(9123, "2026"), (777, "2026")}
-        # Долг у не обходимого сезона считается без требования finished: флаг в
-        # bronze устарел ровно потому, что сезон давно не обходили.
-        assert debt == {(9123, "2026"): 1, (777, "2026"): 1}
-
-    @pytest.mark.unit
     def test_history_lane_and_the_campaign_never_pay_for_the_debt_queue(
         self, monkeypatch
     ):
-        """Гейт: запрос окна и подсчёт долга живут только в автоматической актуалке.
+        """Гейт: долг считает только автоматическая полоса актуалки.
 
         Две ноги гейта: полоса истории (`mode != DAILY`, сюда же replay) и
         кампания истории, которая идёт без `--catalog-contract`
@@ -4880,14 +4753,7 @@ class TestFotmobDebtQueue:
             ["--mode", "backfill", "--catalog-contract", "fotmob-catalog-v1"],
             ["--mode", "backfill", "--scope", "47=2024/2025"],
         ):
-            service, _, repository = _service(responses)
-            window_calls = []
-            monkeypatch.setattr(
-                repository,
-                "season_matches_in_window",
-                lambda *args, **kwargs: window_calls.append(kwargs) or [],
-                raising=False,
-            )
+            service, _, _ = _service(responses)
             args = mod._argument_parser().parse_args(
                 [*arguments, "--entities", "season"]
             )
@@ -4895,48 +4761,15 @@ class TestFotmobDebtQueue:
             rc, report = _run_native_admitted(mod, args, service=service)
 
             assert rc == 0, report["errors"]
-            assert window_calls == []
             assert debt_calls == []
 
     @pytest.mark.unit
-    def test_refresh_gives_obligation_and_plan_the_same_active_scopes(
-        self, monkeypatch
-    ):
-        """Обязательство и план обязаны делить полосы одинаково.
+    def test_refresh_counts_the_debt_and_logs_the_queue(self, caplog):
+        """Единственная наблюдаемая точка сигнала — строка лога волны.
 
-        Разойдись они — сезон, попавший в план, не вошёл бы в обязательство
-        волны, и приёмка «должники ⊆ план» считалась бы по разным множествам.
+        N = 0 при ненулевом долге в утренней сводке означает, что признак
+        сломан и правку надо откатывать пином; без строки это неотличимо.
         """
-
-        mod = self._module()
-        from scrapers.fotmob import planner as planner_module
-
-        seen = {}
-        original_obligation = planner_module.catalog_scope_obligation
-        original_plan = planner_module.plan_seasons
-
-        def obligation(*args, **kwargs):
-            seen["obligation"] = kwargs.get("active_scopes")
-            return original_obligation(*args, **kwargs)
-
-        def plan(*args, **kwargs):
-            seen["plan"] = kwargs.get("active_scopes")
-            seen["scope_debt"] = kwargs.get("scope_debt")
-            return original_plan(*args, **kwargs)
-
-        monkeypatch.setattr(planner_module, "catalog_scope_obligation", obligation)
-        monkeypatch.setattr(planner_module, "plan_seasons", plan)
-
-        rc, report = self._refresh_run(mod)
-
-        assert rc == 0, report["errors"]
-        assert seen["obligation"] == {(47, "2026")}
-        assert seen["plan"] == {(47, "2026")}
-        assert seen["scope_debt"][(47, "2026")] == 1
-
-    @pytest.mark.unit
-    def test_refresh_plans_the_active_season_and_logs_the_debt_queue(self, caplog):
-        """9123/2026: сезон без флагов источника обязан попасть в план актуалки."""
 
         mod = self._module()
 
@@ -4944,39 +4777,29 @@ class TestFotmobDebtQueue:
             rc, report = self._refresh_run(mod)
 
         assert rc == 0, report["errors"]
-        assert "47=2026" in report["selection"]["planned_scopes"]
         work_plan = next(
             operation
             for operation in report["operations"]
             if operation["entity"] == "season_work_plan"
         )
-        assert work_plan["metadata"]["active_extra_scopes"] == ["47=2026"]
         assert work_plan["metadata"]["debt_scopes"] >= 1
         assert "FotMob debt queue: debt_scopes=" in caplog.text
-        assert "active_extra=1" in caplog.text
 
     @pytest.mark.unit
-    def test_repository_without_the_new_inputs_keeps_the_wave_running(self):
-        """Старый репозиторий (откат, реплей, чужой двойник) не роняет ран."""
+    def test_repository_without_the_index_flag_keeps_the_wave_running(self, caplog):
+        """Старый репозиторий (откат, чужой двойник) не роняет ран."""
 
         mod = self._module()
 
-        rc, report = self._refresh_run(mod, repository_factory=_LegacyRepository)
+        with caplog.at_level("WARNING"):
+            rc, report = self._refresh_run(mod, repository_factory=_LegacyRepository)
 
         assert rc == 0, report["errors"]
-        work_plan = next(
-            operation
-            for operation in report["operations"]
-            if operation["entity"] == "season_work_plan"
-        )
-        assert work_plan["metadata"]["active_extra_scopes"] == []
-        assert "47=2026" not in report["selection"]["planned_scopes"]
+        assert "manifest index is not preloaded" in caplog.text
 
     @staticmethod
     def _refresh_run(mod, repository_factory=None):
-        """Волна актуалки на турнире с двумя параллельными сезонами."""
-
-        import copy
+        """Волна актуалки на одном included-турнире."""
 
         from scrapers.fotmob.planner import RunMode, TransportBudget
         from scrapers.fotmob.service import FotMobIngestService
@@ -4986,25 +4809,15 @@ class TestFotmobDebtQueue:
             _league_payload,
         )
 
-        root = copy.deepcopy(_league_payload("2026/2027"))
-        root["details"]["latestSeason"] = "2026/2027"
-        root["allAvailableSeasons"] = ["2026/2027", "2026"]
-        parallel = copy.deepcopy(_league_payload("2026"))
-        parallel["details"]["latestSeason"] = "2026/2027"
-        parallel["allAvailableSeasons"] = ["2026/2027", "2026"]
         responses = {
             canonicalize_target("allLeagues").canonical_url: {
                 "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
             },
-            canonicalize_target("leagues", {"id": 47}).canonical_url: root,
-            canonicalize_target(
-                "leagues", {"id": 47, "season": "2026"}
-            ).canonical_url: parallel,
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
         }
-        repository = (repository_factory or _WindowRepository)()
         service = FotMobIngestService(
             transport=StubTransport(responses),
-            repository=repository,
+            repository=(repository_factory or MemoryFotMobRepository)(),
             mode=RunMode.DAILY,
             budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
             run_id="debt-queue-run",

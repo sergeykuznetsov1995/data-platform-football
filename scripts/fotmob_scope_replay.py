@@ -11,7 +11,6 @@ import os
 import sys
 import tempfile
 import zlib
-import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -839,18 +838,6 @@ def build_replay_report(raw_root: Path) -> dict[str, Any]:
         for item in decisions
         if item["decision"] == ScopeDecision.INCLUDED.value
     ]
-    # Полоса CURRENT боевой волны шире этой: раннер добавляет в неё сезоны,
-    # у которых источник снял флаги, но матчи в окне есть (#1285,
-    # `run_fotmob_scraper.py` → `active_scopes`). Офлайн из raw это не
-    # восстанавливается — окно живёт в bronze, — поэтому набор реплея может
-    # быть беднее боевого, и контракт получится другой. Молчать об этом нельзя:
-    # расхождение читалось бы как расхождение данных.
-    warnings.warn(
-        "offline replay rebuilds the CURRENT lane without active_scopes: "
-        "seasons the source stopped flagging are missing and the contract "
-        "may differ from the live one",
-        stacklevel=2,
-    )
     scopes = [
         item.identity
         for item in plan_seasons(
@@ -924,15 +911,6 @@ def build_replay_report(raw_root: Path) -> dict[str, Any]:
             "scope_count": len(scopes),
             "review_count": len(review_inventory),
             "pending_count": len(pending_inventory),
-            # Машинно проверяемый признак неполноты: полоса CURRENT собрана без
-            # активных сезонов (#1285), поэтому набор скоупов и подпись
-            # контракта могут отличаться от боевых. Читателю отчёта нельзя
-            # молча сравнивать этот scope_sha256 с боевым.
-            "current_lane_complete": False,
-            "current_lane_incomplete_reason": (
-                "offline replay has no bronze match window, so seasons the "
-                "source stopped flagging are missing from the CURRENT lane"
-            ),
         },
         "decisions": decisions,
         "review_inventory": review_inventory,

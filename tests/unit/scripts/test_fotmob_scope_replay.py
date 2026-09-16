@@ -640,23 +640,3 @@ def test_newer_304_validation_of_old_profile_wins_over_earlier_failure(tmp_path)
     assert report["decisions"][0]["observed_at"] == (
         "2026-08-08T12:00:00+00:00"
     )
-
-
-def test_replay_marks_its_current_lane_as_incomplete(tmp_path, recwarn):
-    """Контракт реплея беднее боевого — и это видно машине, а не только глазу.
-
-    Боевая волна добавляет в полосу CURRENT сезоны, у которых источник снял
-    флаги, но матчи в окне есть (#1285). Офлайн из raw это окно недоступно,
-    поэтому набор скоупов и `scope_sha256` расходятся с боевыми; без явного
-    признака расхождение читалось бы как расхождение данных.
-    """
-
-    raw_root = _fixture_root(tmp_path)
-
-    report = mod.build_replay_report(raw_root)
-
-    assert report["summary"]["current_lane_complete"] is False
-    assert "CURRENT lane" in report["summary"]["current_lane_incomplete_reason"]
-    assert any(
-        "active_scopes" in str(warning.message) for warning in recwarn.list
-    )

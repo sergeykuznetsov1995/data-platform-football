@@ -15,7 +15,6 @@ from scrapers.fotmob.planner import (
     ScopeAttemptState,
     ScopeLane,
     TransportBudget,
-    catalog_scope_obligation,
     deterministic_plan_signature,
     _history_season_cycle_key,
     plan_seasons,
@@ -521,106 +520,6 @@ def test_deferred_scope_is_ranked_as_untouched_but_behind_a_never_tried_scope():
     )
 
     assert [item.competition_id for item in plan] == [49, 47, 48]
-
-
-def test_season_without_source_flags_joins_the_current_lane_when_it_is_active():
-    """9123/2026: у турнира два параллельных сезона, флаги источника на одном."""
-
-    seasons = [
-        SeasonRef(9123, "2026/2027", is_selected=True, source_order=0),
-        SeasonRef(9123, "2026", source_order=1),
-    ]
-    active = {(9123, "2026")}
-
-    current = plan_seasons(
-        [_classified(9123)],
-        seasons,
-        mode=RunMode.DAILY,
-        lane=ScopeLane.CURRENT,
-        active_scopes=active,
-    )
-    history = plan_seasons(
-        [_classified(9123)],
-        seasons,
-        mode=RunMode.BACKFILL,
-        lane=ScopeLane.HISTORY,
-        active_scopes=active,
-    )
-    history_without_active = plan_seasons(
-        [_classified(9123)],
-        seasons,
-        mode=RunMode.BACKFILL,
-        lane=ScopeLane.HISTORY,
-    )
-
-    assert {item.identity for item in current} == {
-        (9123, "2026/2027"),
-        (9123, "2026"),
-    }
-    assert all(item.is_latest for item in current)
-    assert history == []
-    # Так полоса истории ведёт себя в бою: раннер считает окно только в волне
-    # актуалки (гейт `automatic_catalog and mode == DAILY`), поэтому в BACKFILL
-    # `active_scopes` пуст и параллельный сезон остаётся и в истории тоже.
-    # Дизъюнктность полос достигается только когда обе получают одно множество.
-    assert [item.identity for item in history_without_active] == [(9123, "2026")]
-
-
-def test_active_season_without_a_current_attempt_leads_the_queue():
-    """У 9123/2026 успех лежит под журнальной подписью полосы истории.
-
-    В журнале CURRENT попытки нет — долг неизвестен, и скоуп обязан попасть в
-    голову очереди, иначе он снова достанется отрезанному хвосту плана.
-    """
-
-    now = datetime(2026, 9, 16, 1)
-    plan = plan_seasons(
-        [_classified(47), _classified(9123)],
-        [
-            SeasonRef(47, "2025/2026", is_selected=True, source_order=0),
-            SeasonRef(9123, "2026", source_order=1),
-        ],
-        mode=RunMode.DAILY,
-        lane=ScopeLane.CURRENT,
-        attempt_states={
-            (47, "2025/2026"): _current_attempt(
-                47, "2025/2026", now, timedelta(hours=10)
-            )
-        },
-        active_scopes={(9123, "2026")},
-        now=now,
-    )
-
-    assert [item.identity for item in plan] == [(9123, "2026"), (47, "2025/2026")]
-    assert plan[0].priority[:2] == (0, 0)
-    assert plan[0].is_latest is True
-    assert plan[0].reason == "active_or_latest"
-
-
-def test_catalog_obligation_moves_an_active_season_from_history_to_current():
-    seasons = [
-        SeasonRef(9123, "2026/2027", is_selected=True, source_order=0),
-        SeasonRef(9123, "2026", source_order=1),
-    ]
-    active = {(9123, "2026")}
-
-    current = catalog_scope_obligation(
-        [_classified(9123)],
-        seasons,
-        mode=RunMode.DAILY,
-        lane=ScopeLane.CURRENT,
-        active_scopes=active,
-    )
-    history = catalog_scope_obligation(
-        [_classified(9123)],
-        seasons,
-        mode=RunMode.BACKFILL,
-        lane=ScopeLane.HISTORY,
-        active_scopes=active,
-    )
-
-    assert set(current) == {(9123, "2026/2027"), (9123, "2026")}
-    assert history == ()
 
 
 def test_plan_without_debt_inputs_keeps_composition_and_pins_the_priority_form():
