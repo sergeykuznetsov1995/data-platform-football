@@ -12,6 +12,8 @@ import json
 import logging
 import subprocess
 import sys
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +60,8 @@ class _FakeManager:
         self.events: list[str] = []
         self.fail_on_alter = False
         self.merged = 0
+        self.cancelled = False
+        self.block = None
         self._last = None
 
     @property
@@ -78,6 +82,10 @@ class _FakeManager:
             def close(self) -> None:
                 manager.events.append("cursor_closed")
 
+            def cancel(self) -> None:
+                manager.events.append("cancel")
+                manager.cancelled = True
+
         return SimpleNamespace(cursor=_Cursor)
 
     def _table_of(self, sql: str) -> str:
@@ -90,6 +98,9 @@ class _FakeManager:
         self.queries.append(sql)
         table = self._table_of(sql)
         if sql.lstrip().upper().startswith("ALTER"):
+            if self.block is not None:
+                # Клиент Trino спит по Retry-After — участок под замком висит.
+                self.block.wait(timeout=30)
             if self.fail_on_alter:
                 raise RuntimeError("Trino query exceeded maximum execution time")
             paths = {
@@ -351,6 +362,35 @@ class TestWriterLock:
 
         assert result["chunks"] == 1
         assert manager.events == ["connection", "lock", "execute", "cursor_closed"]
+
+    def test_stuck_chunk_releases_the_lock_and_reddens_the_run(self, monkeypatch):
+        """Клиентский сон под замком ограничен: запрос снимается, замок отдаётся."""
+
+        manager = _FakeManager({MANIFEST: _files("match", 10)})
+        manager.block = threading.Event()
+        monkeypatch.setattr(maintenance, "MAX_LOCK_HOLD_SECONDS", 0.05)
+        notifications: list[str] = []
+        entries: list[int] = []
+
+        started = time.monotonic()
+        try:
+            result = _run(
+                manager,
+                now=_Clock(_at(23, 31)),
+                notifications=notifications,
+                lock_entries=entries,
+            )
+        finally:
+            manager.block.set()
+        held = time.monotonic() - started
+
+        assert result["stopped"] == "error"
+        assert maintenance.exit_code(result) == 1
+        assert manager.cancelled is True
+        assert "cancel" in manager.events
+        assert len(entries) == 1
+        assert held < 5, "замок не должен держаться дольше своего потолка"
+        assert len(notifications) == 1
 
     def test_busy_lock_stops_the_run_green(self, caplog):
         from dags.scripts.run_fotmob_scraper import WriterLockBusy

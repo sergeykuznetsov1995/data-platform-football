@@ -25,16 +25,20 @@
 * окно 23:30-23:50 UTC — новых волн нет с 19:00, фоновая полоса стартует 00:00;
 * идёт волна или она кончилась меньше 30 минут назад — прогон не начинается;
 * под замком выполняется РОВНО ОДИН запрос на своём курсоре: соединение
-  поднимается до захвата замка, клиентских повторов и переподключений внутри
-  участка нет (базовый ``_execute`` при обрыве соединения переподключался бы
-  семью попытками с ``SELECT 1`` каждая — это и есть неограниченное удержание
-  замка). Потолок запроса держит сервер: ``query_max_run_time`` = 180 с (полное
-  время жизни запроса — очередь, разбор, планирование, исполнение), вторым
-  рубежом ``query_max_execution_time``;
+  поднимается до захвата замка, переподключений базового клиента (семь попыток
+  с ``SELECT 1`` каждая) внутри участка нет. Потолок запроса держит сервер:
+  ``query_max_run_time`` = 180 с (полное время жизни запроса — очередь, разбор,
+  планирование, исполнение), вторым рубежом ``query_max_execution_time``;
+* у участка под замком есть СОБСТВЕННЫЙ потолок
+  :data:`MAX_LOCK_HOLD_SECONDS`: запрос идёт в отдельном потоке, и если он не
+  уложился, запрос снимается на сервере (``cursor.cancel()``), а замок
+  отпускается, не дожидаясь потока. Серверный потолок один этого не даёт: HTTP-
+  клиент Trino повторяет запросы и спит по ``Retry-After`` сколько скажет
+  сервер (429 с ``Retry-After: 900`` продержал бы замок 15 минут);
 * новых порций после 23:44 нет, и время проверяется ЕЩЁ РАЗ уже под замком:
   ожидание замка у раннера — до 600 секунд, за них окно успевает закрыться.
-  Отсюда потолок удержания замка: 23:44 + 180 с = 23:47, то есть замок свободен
-  задолго до волны 00:00 с её ожиданием замка 600 с;
+  Отсюда потолок удержания замка: 23:44 + 240 с = 23:48, то есть замок свободен
+  до волны 00:00 с её ожиданием замка 600 с;
 * занятый замок (юнит кампании истории) — не ошибка: прогон уходит зелёным.
 """
 
@@ -45,6 +49,7 @@ import logging
 import pathlib
 import re
 import sys
+import threading
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
@@ -92,6 +97,9 @@ DELIVERY_TAIL = timedelta(minutes=30)
 # рубеж по самому исполнению.
 QUERY_MAX_RUN_TIME = "180s"
 QUERY_MAX_EXECUTION_TIME = "180s"
+# Собственный потолок участка под замком: серверные 180 с плюс запас на выдачу
+# результата. Превышение — снятый запрос, отпущенный замок и красный прогон.
+MAX_LOCK_HOLD_SECONDS = 240.0
 COMPACTION_SOURCE = "fotmob:maintenance"
 
 WAVE_DAG_ID = "dag_ingest_fotmob"
@@ -416,31 +424,60 @@ def run(
     return _finish(result, stopped, now)
 
 
+class CompactionOverrun(RuntimeError):
+    """Порция не уложилась в потолок удержания замка; запрос снят на сервере."""
+
+
 def _compact_chunk(manager, writer_lock, table: str, chunk, *, now, cutoff):
     """Склеить одну порцию под замком; ``None`` — замок достался после cutoff.
 
     Соединение берётся ДО замка, а сам запрос идёт на своём курсоре мимо
     ``execute_query``: базовый клиент при обрыве соединения переподключается
     (до семи попыток с ``SELECT 1``) и повторяет запрос — под замком это
-    неограниченное удержание. Здесь под замком ровно один запрос с серверным
-    потолком; оборвалось соединение — порция падает, а хвост берёт следующая
-    ночь. Процесс компакции однопоточный, поэтому курсор безопасен.
+    неограниченное удержание. Оставшееся клиентское время (HTTP-повторы и сон
+    по ``Retry-After``) ограничивает поток-исполнитель: не уложился в
+    :data:`MAX_LOCK_HOLD_SECONDS` — запрос снимается на сервере, замок
+    отпускается, прогон краснеет, а хвост берёт следующая ночь.
     """
 
     connection = manager.connection
+    sql = chunk_sql(table, chunk["paths"])
+    cursor = connection.cursor()
+    outcome: dict[str, BaseException] = {}
+
+    def _execute_chunk() -> None:
+        try:
+            cursor.execute(sql)
+            cursor.fetchall()
+        except BaseException as error:  # noqa: BLE001 — ошибку отдаём главному потоку
+            outcome["error"] = error
+
+    worker = threading.Thread(
+        target=_execute_chunk, name="fotmob-compaction-chunk", daemon=True
+    )
     with writer_lock():
         # Ожидание замка у раннера — до 600 с: пока мы стояли в очереди за ним,
         # окно могло закрыться, и начинать порцию уже нельзя.
         if now() >= cutoff:
+            cursor.close()
             return None
         started = time.perf_counter()
-        cursor = connection.cursor()
-        try:
-            cursor.execute(chunk_sql(table, chunk["paths"]))
-            cursor.fetchall()
-        finally:
+        worker.start()
+        worker.join(MAX_LOCK_HOLD_SECONDS)
+        overrun = worker.is_alive()
+        if overrun:
+            cursor.cancel()
+        else:
+            elapsed = time.perf_counter() - started
             cursor.close()
-        return time.perf_counter() - started
+    if overrun:
+        raise CompactionOverrun(
+            f"порция {table}/{chunk['partition']} держала замок дольше "
+            f"{MAX_LOCK_HOLD_SECONDS:.0f} с — запрос снят на сервере"
+        )
+    if "error" in outcome:
+        raise outcome["error"]
+    return elapsed
 
 
 def _metrics(manager, table: str, *, optional: bool = False):
