@@ -90,6 +90,9 @@ class TestFBrefCurrentFailureEdges:
     def test_one_live_runner_owns_fetch_parse_batches(self, fbref_dags):
         dag = fbref_dags["dag_ingest_fbref"]
         assert dag.task_dict["seed_competition_index"].downstream_task_ids == {
+            "capture_raw_baseline"
+        }
+        assert dag.task_dict["capture_raw_baseline"].downstream_task_ids == {
             "recover_raw_before_fetch"
         }
         assert dag.task_dict["recover_raw_before_fetch"].downstream_task_ids == {
@@ -98,7 +101,10 @@ class TestFBrefCurrentFailureEdges:
         live = dag.task_dict["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
         assert live.op_kwargs["max_batches"] == 14
-        assert live.downstream_task_ids == {"choose_publication_path"}
+        assert live.downstream_task_ids == {"audit_raw_integrity"}
+        assert dag.task_dict["audit_raw_integrity"].downstream_task_ids == {
+            "choose_publication_path"
+        }
 
     def test_validation_is_the_only_silver_parent(self, fbref_dags):
         dag = fbref_dags["dag_ingest_fbref"]
