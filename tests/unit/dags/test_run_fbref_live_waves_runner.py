@@ -175,10 +175,34 @@ def test_runner_prints_a_progress_document_after_each_batch(
     assert f"{runner.RESULT_PREFIX}" in out
 
 
+def test_progress_documents_also_reach_the_run_log_file(monkeypatch, tmp_path):
+    """The pipe dies with a SIGKILLed parent; the log file does not."""
+
+    monkeypatch.setattr(runner, "LOG_DIRECTORY", str(tmp_path / "live"))
+    root = logging.getLogger()
+    before = list(root.handlers)
+    before_level = root.level
+    try:
+        runner._attach_run_log_file("control-run")
+        runner._print_progress({"batches": 2, "deadline_reached": False})
+        for handler in root.handlers:
+            handler.flush()
+        written = (tmp_path / "live" / "control-run.log").read_text()
+    finally:
+        root.setLevel(before_level)
+        for handler in list(root.handlers):
+            if handler not in before:
+                handler.close()
+                root.removeHandler(handler)
+    assert runner.PROGRESS_PREFIX in written
+    assert '"batches": 2' in written
+
+
 def test_runner_log_file_receives_the_run_log(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "LOG_DIRECTORY", str(tmp_path / "live"))
     root = logging.getLogger()
     before = list(root.handlers)
+    before_level = root.level
     try:
         runner._attach_run_log_file("control-run")
         logging.getLogger("fbref.test").warning("hello from the runner")
@@ -186,6 +210,7 @@ def test_runner_log_file_receives_the_run_log(monkeypatch, tmp_path):
             handler.flush()
         written = (tmp_path / "live" / "control-run.log").read_text()
     finally:
+        root.setLevel(before_level)
         for handler in list(root.handlers):
             if handler not in before:
                 handler.close()

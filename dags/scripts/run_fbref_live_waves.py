@@ -37,6 +37,7 @@ RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 # Emitted after every batch, so a runner killed mid-flight still leaves its
 # last complete aggregate in the pipe the parent already reads.
 PROGRESS_PREFIX = "FBREF_LIVE_WAVES_PROGRESS:"
+logger = logging.getLogger(__name__)
 LOG_DIRECTORY = "/opt/airflow/logs/fbref_live_waves"
 # Slice of the meter's allowance this run never claims, so the warm-HTTP lease
 # extension still fits after the meter booked spend the fetcher cannot see
@@ -288,7 +289,12 @@ def _attach_run_log_file(control_run_id: str) -> None:
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
-    logging.getLogger().addHandler(handler)
+    root = logging.getLogger()
+    # The file must hold the progress documents whatever the caller configured,
+    # otherwise the one artefact that survives a SIGKILLed parent is empty.
+    if root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    root.addHandler(handler)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -314,10 +320,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_progress(document: Mapping) -> None:
-    print(
-        f"{PROGRESS_PREFIX}{json.dumps(document, sort_keys=True)}",
-        flush=True,
-    )
+    payload = json.dumps(document, sort_keys=True)
+    # Two independent places on purpose: the pipe is what the parent parses,
+    # and the log file is what survives when the parent itself is SIGKILLed
+    # and its pipe dies with it.
+    print(f"{PROGRESS_PREFIX}{payload}", flush=True)
+    logger.info("%s%s", PROGRESS_PREFIX, payload)
 
 
 def _run(args: argparse.Namespace) -> int:

@@ -2207,6 +2207,9 @@ def run_fbref_live_waves(
             "FBref live runner failed with exit code "
             f"{process.returncode}"
         )
+        # A runner killed outright (SIGKILL from outside, OOM) leaves a
+        # non-zero code and its accumulated stdout, with no exception here.
+        _log_partial_live_result(stdout)
         _abort_failed_live_subprocess(
             airflow_run_id=airflow_run_id,
             dag_id=dag_id,
@@ -2217,6 +2220,7 @@ def run_fbref_live_waves(
     try:
         result = _parse_prefixed_result(stdout, LIVE_WAVES_RESULT_PREFIX)
     except Exception as exc:
+        _log_partial_live_result(stdout)
         _abort_failed_live_subprocess(
             airflow_run_id=airflow_run_id,
             dag_id=dag_id,
