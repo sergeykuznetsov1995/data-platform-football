@@ -30,9 +30,12 @@ from scrapers.fbref.control import (
     BudgetExceeded,
     CompetitionRegistryEntry,
     ControlStore,
+    ControlStoreConfigError,
     CurrentSeasonRemediationEvidence,
     FrontierProvenance,
     FrontierTarget,
+    LeaseLost,
+    MigrationError,
     SeasonAlias,
     SeasonRegistryEntry,
     StateConflict,
@@ -715,6 +718,7 @@ class WaveResult:
     requeued_session_exhaustion: int = 0
     deferred_dead_clearance: int = 0
     contract_quarantined: int = 0
+    dead_lettered: int = 0
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
@@ -734,6 +738,7 @@ class _ProcessedObservation:
     seeded: int = 0
     skipped_ineligible: int = 0
     contract_quarantined: int = 0
+    dead_lettered: int = 0
     failures: tuple[str, ...] = ()
 
 
@@ -1950,10 +1955,47 @@ def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
     )
 
 
+# A record that fails after its lease is taken is dead-lettered so the rest of
+# the wave survives -- but only when the failure is a property of the page.
+# These are properties of the world around it: retiring the target would bury a
+# live page because a gateway blinked, and the very next run would find nothing
+# to retry.  Driver classes are matched through their root module because
+# psycopg2/pyarrow/trino are never imported here (both stores take injected
+# connections), and classification goes by exception type, never by message
+# text (#1122/#1124).
+_INFRASTRUCTURE_EXCEPTION_ROOTS = frozenset({"psycopg2", "pyarrow", "trino"})
+_INFRASTRUCTURE_EXCEPTIONS: tuple[type, ...] = (
+    TypedPromotionDeferred,
+    LeaseLost,
+    BudgetExceeded,
+    MigrationError,
+    ControlStoreConfigError,
+    OSError,
+)
+# The reason string carries the review date because page_frontier has no
+# review_at column; a real column comes with the next control migration.
+DEAD_LETTER_REVIEW_DAYS = 7
+DEAD_LETTER_REASON_PREFIX = "dead_letter:"
+
+
+def _is_infrastructure_failure(exc: BaseException) -> bool:
+    """Tell "the world broke" from "this page cannot be used"."""
+
+    if isinstance(exc, _INFRASTRUCTURE_EXCEPTIONS):
+        return True
+    return any(
+        cls.__module__.split(".", 1)[0] in _INFRASTRUCTURE_EXCEPTION_ROOTS
+        for cls in type(exc).__mro__
+    )
+
+
 def _is_mass_contract_rejection(result: "WaveResult") -> bool:
     """Tell a few unusable archived pages from the source changing shape."""
 
-    retired = result.contract_quarantined
+    # Both verdicts shrink the crawl scope the same way, so the guard has to
+    # weigh their sum: five contract quarantines plus five dead letters is the
+    # source moving under the parser just as much as ten of either.
+    retired = result.contract_quarantined + result.dead_lettered
     return (
         retired > MAX_ROUTINE_CONTRACT_QUARANTINES
         and retired * 2 > result.cohort_size
@@ -2294,6 +2336,7 @@ class FBrefPipeline:
         # policy directly inspectable and overridable in deterministic tests.
         self._scope_reconcile_deferred = False
         self._scope_reconcile_pending = False
+        self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
@@ -5600,6 +5643,54 @@ class FBrefPipeline:
                     contract_quarantined=1,
                     failures=tuple(failures),
                 )
+        elif (
+            self._dead_letter_budget > 0
+            and not _is_infrastructure_failure(exc)
+        ):
+            # Everything else that dies on one record after its lease was taken
+            # -- a persistence error, a typed-parser refusal, a StateConflict on
+            # the success marker of an already-finished page -- used to raise
+            # ParseWaveError and end the wave, so one page held the whole lane
+            # hostage run after run (#1317).  Retire that one target instead and
+            # keep going; the verdict is reversible (state='quarantined', see
+            # docs/operations/fbref_dead_letter_return.md) and it is fenced to
+            # the exact bytes that failed, so a newer fetch is never retired on
+            # a stale reading.
+            review_after = (
+                self.clock() + timedelta(days=DEAD_LETTER_REVIEW_DAYS)
+            ).date().isoformat()
+            reason = (
+                f"{DEAD_LETTER_REASON_PREFIX}{type(exc).__name__}"
+                f":review_after={review_after}:{str(exc)[:200]}"
+            )
+            dead_lettered = False
+            try:
+                dead_lettered = self.control.quarantine_contract_rejected_target(
+                    record.target_id,
+                    content_hash=record.content_hash,
+                    reason=reason,
+                )
+            except Exception as dead_letter_exc:
+                failures.append(
+                    f"{record.target_id}:dead_letter:"
+                    f"{type(dead_letter_exc).__name__}:{dead_letter_exc}"
+                )
+            if dead_lettered:
+                self._dead_letter_budget -= 1
+                logger.warning(
+                    "Dead-lettered %s after %s: %s",
+                    record.target_id,
+                    type(exc).__name__,
+                    reason,
+                )
+                return _ProcessedObservation(
+                    typed_promoted=typed_promoted,
+                    stale_typed_observations_skipped=(
+                        stale_typed_observations_skipped
+                    ),
+                    dead_lettered=1,
+                    failures=tuple(failures),
+                )
         failures.append(f"{record.target_id}:{type(exc).__name__}:{exc}")
         return _ProcessedObservation(
             typed_promoted=typed_promoted,
@@ -6228,6 +6319,7 @@ class FBrefPipeline:
         result.seeded += outcome.seeded
         result.skipped_ineligible += outcome.skipped_ineligible
         result.contract_quarantined += outcome.contract_quarantined
+        result.dead_lettered += outcome.dead_lettered
         result.failures.extend(outcome.failures)
 
     def _prepare_acceptance_replay_match(
@@ -6625,6 +6717,10 @@ class FBrefPipeline:
         """Parse and persist a bounded handoff using raw storage only."""
 
         result = WaveResult()
+        # One wave, one budget: the wave body is single-threaded, so a plain
+        # instance counter bounds how much scope a single wave may retire
+        # before the run stops instead of silently shrinking further.
+        self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
         stateful_run_id = run_id
         stateful_run_type = settings.run_type
         if acceptance_replay and settings.run_type != "replay":
@@ -6855,8 +6951,9 @@ class FBrefPipeline:
             # shrinking the crawl scope is the one outcome worse than stopping.
             raise ParseWaveError(
                 "Mass source contract rejection: "
-                f"{result.contract_quarantined} of {result.cohort_size} "
-                "targets retired in one wave"
+                f"{result.contract_quarantined} contract-quarantined and "
+                f"{result.dead_lettered} dead-lettered of "
+                f"{result.cohort_size} targets retired in one wave"
             )
         return result
 
@@ -7512,6 +7609,7 @@ def _validate_oversize_evidence_wave_result(
             "requeued_session_exhaustion",
             "deferred_dead_clearance",
             "contract_quarantined",
+            "dead_lettered",
             "moved_pages_skipped",
             "deferred_match_not_found",
             "terminal_oversized_pages",

@@ -21,7 +21,12 @@ from scrapers.fbref.bronze import (
     TABLE_CELLS_TABLE,
     TABLE_INVENTORY_TABLE,
 )
-from scrapers.fbref.control import StateConflict
+from scrapers.fbref.control import (
+    ControlStoreConfigError,
+    LeaseLost,
+    MigrationError,
+    StateConflict,
+)
 from scrapers.fbref.control.models import (
     BudgetReservation,
     CohortTarget,
@@ -2630,10 +2635,14 @@ def test_match_page_parser_error_keeps_legacy_sequential_error_evidence(
 
     pipeline._parse_generic = page_with_error
 
-    with pytest.raises(ParseWaveError, match="generic contract failed"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    # The wave now retires the one page it cannot use and carries on (#1317);
+    # the legacy error evidence it writes on the way out is unchanged.
+    assert result.failures == []
+    assert result.dead_lettered == 1
 
     page_evidence = [
         item for item in control.manifests
@@ -2674,10 +2683,11 @@ def test_batch_per_item_manifest_fault_never_completes_early_and_continues(
 
     control.record_dataset_manifest = fail_one_manifest
 
-    with pytest.raises(ParseWaveError, match="fault after"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+    assert result.failures == []
+    assert result.dead_lettered == 1
 
     first_key = next(
         key for key, row in control.observations.items()
@@ -2723,10 +2733,11 @@ def test_batch_observation_completion_fault_fails_only_that_lease(tmp_path):
 
     control.complete_observation_processing = fail_before_complete
 
-    with pytest.raises(ParseWaveError, match="observation commit fault"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+    assert result.failures == []
+    assert result.dead_lettered == 1
 
     statuses = {
         row["target_id"]: row["status"] for row in control.observations.values()
@@ -2793,10 +2804,11 @@ def test_second_batch_guard_enter_fault_closes_first_then_fails_all_leases(
 
     control.guard_latest_content = guard_with_second_enter_fault
 
-    with pytest.raises(ParseWaveError, match="second guard enter fault"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+    assert result.failures == []
+    assert result.dead_lettered == 2
 
     first_exit = control.events.index(f"content_guard_exit:{ordered[0]}")
     rollback = control.events.index(
@@ -3138,15 +3150,23 @@ def test_completed_manifest_conflict_does_not_mask_processing_failure(
     control.record_dataset_manifest = immutable_manifest
     pipeline = FBrefPipeline(control, raw, generic_writer=FailingWriter())
 
-    with pytest.raises(ParseWaveError) as captured:
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["player"],
-            settings=_settings(),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["player"],
+        settings=_settings(),
+    )
 
-    assert "generic write failed" in str(captured.value)
-    assert "completed manifest is immutable" not in str(captured.value)
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[record.target_id]
+    assert quarantined["state"] == "quarantined"
+    assert "generic write failed" in quarantined["last_error_message"]
+    # The StateConflict on the immutable completion marker must not overwrite
+    # the real cause in the dead-letter reason.
+    assert (
+        "completed manifest is immutable"
+        not in quarantined["last_error_message"]
+    )
 
 
 def test_cross_run_recovery_processes_raw_from_failed_source_run_offline(
@@ -4746,17 +4766,17 @@ def test_scope_is_reconciled_once_per_wave_not_once_per_page(tmp_path):
     assert control.events.count("scope_reconcile") == 1
 
 
-def test_a_failed_wave_still_reconciles_the_scope_it_changed(tmp_path):
+def test_a_dead_lettering_wave_still_reconciles_the_scope_it_changed(tmp_path):
     pipeline, control, _generic = _pipeline_with_saved_generic_pages(
         tmp_path, ["9", "12", "13"], broken=("12",)
     )
 
-    with pytest.raises(ParseWaveError):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["competition"],
-            settings=_settings("current"),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+    assert result.dead_lettered == 1
 
     # Page 9 seeded before the wave failed; leaving its scope unreconciled
     # would park the target it created until some later run swept the frontier.
@@ -4817,14 +4837,14 @@ def test_page_with_parser_errors_never_joins_a_cohort(tmp_path):
         tmp_path, ["9", "12", "13"], broken=("12",)
     )
 
-    # The broken page fails discovery, which fails the wave -- as it did
-    # before cohorting. What matters here is that it was written on its own.
-    with pytest.raises(ParseWaveError, match="Season discovery failed"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["competition"],
-            settings=_settings("current"),
-        )
+    # The broken page fails discovery, which now retires that one target --
+    # as before cohorting, what matters here is that it was written on its own.
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+    assert result.dead_lettered == 1
 
     # 9 flushes when the broken page arrives, 12 goes through the single-page
     # path (so it never appears as a cohort), 13 follows on its own.
@@ -5178,7 +5198,9 @@ def test_same_history_with_new_index_gets_new_snapshot_and_reverts_old_current(
     ]) == 2
 
 
-def test_advertised_current_mismatch_without_href_fails_closed(tmp_path):
+def test_advertised_current_mismatch_without_href_dead_letters_the_target(
+    tmp_path,
+):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     control.registry["6"] = {
@@ -5213,17 +5235,25 @@ def test_advertised_current_mismatch_without_href_fails_closed(tmp_path):
         "logical_refresh_id": refresh,
     }]
 
-    with pytest.raises(
-        ParseWaveError,
-        match="advertised current season evidence is incomplete",
-    ):
-        FBrefPipeline(
-            control, raw, generic_writer=FakeWriter()
-        ).parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["competition"],
-            settings=_settings("current"),
-        )
+    # Fail-closed is still fail-closed for the target: incomplete evidence
+    # never seeds a season.  Only the blast radius changed -- the target is
+    # retired and the wave carries on (#1317).
+    result = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter()
+    ).parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    assert control.frontier[record.target_id]["state"] == "quarantined"
+    assert (
+        "advertised current season evidence is incomplete"
+        in control.frontier[record.target_id]["last_error_message"]
+    )
+    assert control.seasons == []
 
 
 def test_advertised_current_href_without_label_fails_closed():
@@ -5836,7 +5866,9 @@ def test_season_stats_zero_table_page_with_proven_identity_parses_empty(
     assert control.frontier[record.target_id]["state"] == "fetched"
 
 
-def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
+def test_zero_table_source_shell_is_dead_lettered_before_typed_promotion(
+    tmp_path,
+):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     target = page_target_from_link(
@@ -5874,19 +5906,22 @@ def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
         typed_adapter=FakeTypedAdapter(typed_writer),
     )
 
-    with pytest.raises(ParseWaveError, match="Season source contract failed"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["season"],
-            settings=_settings("current"),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
 
     assert generic_writer.pages[0][0].tables == ()
     assert typed_writer.calls == []
-    # A shell that cannot prove its own identity may be a challenge page or a
-    # truncated capture: fresher bytes can still parse, so it must never be
-    # retired on this evidence.
-    assert control.frontier[record.target_id]["state"] == "fetched"
+    # A shell that cannot prove its own identity is still refused typed
+    # promotion.  What changed (#1317) is who pays: the target is dead-lettered
+    # and the wave finishes, instead of the whole lane dying on this one page.
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[record.target_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
 def _redirected_season_wave(
@@ -6014,7 +6049,7 @@ def test_historical_bare_season_redirected_to_current_is_retired(tmp_path):
     assert rejected["last_error_message"] == "schedule_season_mismatch"
 
 
-def test_current_season_mismatch_stays_loud(tmp_path):
+def test_current_season_mismatch_dead_letters_the_target(tmp_path):
     control, pipeline, record = _redirected_season_wave(
         tmp_path,
         canonical_url="https://fbref.com/en/comps/11/Serie-A-M-Stats",
@@ -6025,14 +6060,15 @@ def test_current_season_mismatch_stays_loud(tmp_path):
         historical=False,
     )
 
-    with pytest.raises(ParseWaveError, match="Season source contract failed"):
-        pipeline.recover_unprocessed_wave(
-            str(uuid.uuid4()),
-            page_kinds=["season"],
-            settings=_settings("current"),
-        )
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
 
-    assert control.frontier[record.target_id]["state"] == "fetched"
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    assert control.frontier[record.target_id]["state"] == "quarantined"
 
 
 def _schedule_less_season_wave(tmp_path):
@@ -6188,7 +6224,7 @@ def test_unretired_contract_rejection_still_fails_the_wave(tmp_path):
     # A target that raced into a lease cannot be retired, and claiming progress
     # that did not shrink the cohort would spin the recovery drain forever.
     control.quarantine_contract_rejected_target = (
-        lambda target_id, *, reason: False
+        lambda target_id, *, content_hash, reason: False
     )
 
     with pytest.raises(ParseWaveError, match="Season source contract failed"):
@@ -6201,7 +6237,9 @@ def test_unretired_contract_rejection_still_fails_the_wave(tmp_path):
     assert control.frontier[rejected_id]["state"] == "fetched"
 
 
-def test_schedule_less_page_without_source_identity_is_never_retired(tmp_path):
+def test_schedule_less_page_without_source_identity_is_dead_lettered(
+    tmp_path,
+):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     target = page_target_from_link(DiscoveredPageLink(
@@ -6239,14 +6277,17 @@ def test_schedule_less_page_without_source_identity_is_never_retired(tmp_path):
         typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
     )
 
-    with pytest.raises(ParseWaveError, match="Season source contract failed"):
-        pipeline.recover_unprocessed_wave(
-            str(uuid.uuid4()),
-            page_kinds=["season"],
-            settings=_settings("current"),
-        )
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
 
-    assert control.frontier[record.target_id]["state"] == "fetched"
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[record.target_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
 def test_superseded_raw_of_a_rejecting_page_is_skipped_not_retired(tmp_path):
@@ -6287,12 +6328,21 @@ def test_mass_contract_rejection_fails_the_wave_instead_of_shrinking_scope():
     assert not _is_mass_contract_rejection(
         WaveResult(cohort_size=25, contract_quarantined=10)
     )
+    # Both verdicts shrink the scope, so the guard weighs their sum: neither
+    # counter alone crosses the threshold here, together they do.
+    assert _is_mass_contract_rejection(
+        WaveResult(cohort_size=10, contract_quarantined=3, dead_lettered=4)
+    )
+    assert not _is_mass_contract_rejection(
+        WaveResult(cohort_size=25, contract_quarantined=3, dead_lettered=2)
+    )
 
 
 def test_wave_result_publishes_the_counter_the_recovery_drain_reads(tmp_path):
     # The drain reads this key off as_dict(); the DAG-side test mocks the dict,
     # so bind the name here.
     assert "contract_quarantined" in WaveResult().as_dict()
+    assert "dead_lettered" in WaveResult().as_dict()
 
 
 def test_non_contract_parse_failure_still_fails_the_whole_wave(tmp_path):
@@ -6510,20 +6560,27 @@ def test_malformed_archived_matchlog_is_retired_during_recovery(tmp_path):
     assert rejected["last_error_message"] == "invalid_matchlog_route"
 
 
-def test_exact_malformed_matchlog_stays_loud_outside_recovery(tmp_path):
+def test_exact_malformed_matchlog_is_dead_lettered_outside_recovery(tmp_path):
     control, pipeline, record = _malformed_archived_matchlog_wave(tmp_path)
 
-    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["matchlog"],
-            settings=_settings("backfill"),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["matchlog"],
+        settings=_settings("backfill"),
+    )
 
-    assert control.frontier[record.target_id]["state"] == "fetched"
+    # Outside recovery the invalid-route exemption does not apply, so this is
+    # not a contract quarantine -- it is the generic dead letter, which keeps
+    # the reason and the review date in last_error_message.
+    assert result.contract_quarantined == 0
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[record.target_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
-def test_other_malformed_matchlog_stays_loud_during_recovery(tmp_path):
+def test_other_malformed_matchlog_is_dead_lettered_during_recovery(tmp_path):
     control, pipeline, record = _malformed_archived_matchlog_wave(
         tmp_path,
         canonical_url=(
@@ -6533,31 +6590,40 @@ def test_other_malformed_matchlog_stays_loud_during_recovery(tmp_path):
         season_id="2015-2016",
     )
 
-    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
-        pipeline.recover_unprocessed_wave(
-            str(uuid.uuid4()),
-            page_kinds=["matchlog"],
-            settings=_settings("backfill"),
-        )
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["matchlog"],
+        settings=_settings("backfill"),
+    )
 
-    assert control.frontier[record.target_id]["state"] == "fetched"
+    assert result.contract_quarantined == 0
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[record.target_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
-def test_tableless_live_squad_page_still_fails_the_wave(tmp_path):
+def test_tableless_live_squad_page_is_dead_lettered(tmp_path):
     control, pipeline, rejected_id, _ = _tableless_squad_wave(
         tmp_path, historical=False
     )
 
     # On a recurring target a table-free page is how source drift announces
-    # itself, so it stays a loud failure instead of a silent retirement.
-    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["squad"],
-            settings=_settings("current"),
-        )
+    # itself: it still never passes as a valid page.  It is now dead-lettered
+    # (reversible, budgeted, counted) instead of ending the wave (#1317).
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["squad"],
+        settings=_settings("current"),
+    )
 
-    assert control.frontier[rejected_id]["state"] == "fetched"
+    assert result.contract_quarantined == 0
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[rejected_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
 def test_parser_crash_on_an_archived_page_is_never_isolated(tmp_path):
@@ -6585,26 +6651,36 @@ def test_parser_crash_on_an_archived_page_is_never_isolated(tmp_path):
     ) is None
 
 
-def test_tableless_shell_without_page_identity_is_never_retired(tmp_path):
+def test_tableless_shell_without_page_identity_is_dead_lettered(tmp_path):
     control, pipeline, rejected_id, _ = _tableless_squad_wave(
         tmp_path, historical=True, identity=False
     )
 
-    # Retirement is terminal, so absence of tables is not evidence on its own:
-    # a foreign 200 shell has the same shape as a real archived page, and a
-    # retry of fresher bytes can still succeed.
-    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["squad"],
-            settings=_settings("backfill"),
-        )
+    # Absence of tables is still not evidence of an archived page, so this is
+    # never the terminal contract quarantine.  The dead letter is reversible
+    # and carries the reason, so fresher bytes can still be retried by hand.
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["squad"],
+        settings=_settings("backfill"),
+    )
 
-    assert control.frontier[rejected_id]["state"] == "fetched"
+    assert result.contract_quarantined == 0
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[rejected_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
-def test_tableless_archived_schedule_page_still_fails_the_wave(tmp_path):
-    """A spine page is the only source of its subtree, so it is never retired."""
+def test_tableless_archived_schedule_page_is_dead_lettered(tmp_path):
+    """A spine page is retired too, and the run reports what it cost.
+
+    A schedule page is the only source of its season's match targets, so this
+    verdict costs the subtree until the target is returned by hand.  The price
+    is bounded by the per-wave dead-letter budget and visible in the counter
+    (решение 5 плана 21.09).
+    """
 
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -6634,16 +6710,18 @@ def test_tableless_archived_schedule_page_still_fails_the_wave(tmp_path):
         typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
     )
 
-    # Match targets exist only because a schedule page was parsed, so retiring
-    # this one would amputate the season's matches with a green run.
-    with pytest.raises(ParseWaveError, match="page_contract"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["schedule"],
-            settings=_settings("backfill"),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["schedule"],
+        settings=_settings("backfill"),
+    )
 
-    assert control.frontier[record.target_id]["state"] == "fetched"
+    assert result.contract_quarantined == 0
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[record.target_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
 def _tableless_single_target_wave(tmp_path, *, page_kind, canonical_url,
@@ -6676,8 +6754,12 @@ def _tableless_single_target_wave(tmp_path, *, page_kind, canonical_url,
     return control, pipeline, record.target_id
 
 
-def test_seasonless_squad_url_is_the_live_row_and_is_never_retired(tmp_path):
-    """A club's undated page is the row the current-season lane refreshes."""
+def test_seasonless_squad_url_is_the_live_row_and_is_dead_lettered(tmp_path):
+    """A club's undated page is the row the current-season lane refreshes.
+
+    It is never the terminal contract quarantine, but it is dead-lettered like
+    any other record that cannot be used, and returned by hand from there.
+    """
 
     control, pipeline, target_id = _tableless_single_target_wave(
         tmp_path,
@@ -6686,18 +6768,26 @@ def test_seasonless_squad_url_is_the_live_row_and_is_never_retired(tmp_path):
         source_ids={"squad_id": "d5121f10"},
     )
 
-    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["squad"],
-            settings=_settings("backfill"),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["squad"],
+        settings=_settings("backfill"),
+    )
 
-    assert control.frontier[target_id]["state"] == "fetched"
+    assert result.contract_quarantined == 0
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[target_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
-def test_player_target_is_never_retired_by_the_archive(tmp_path):
-    """One player row serves every season and both lanes, so it is never buried."""
+def test_player_target_is_dead_lettered_by_the_archive(tmp_path):
+    """One player row serves every season and both lanes.
+
+    The archive never grants it the terminal contract quarantine; a dead
+    letter is reversible, so the shared row can be brought back.
+    """
 
     control, pipeline, target_id = _tableless_single_target_wave(
         tmp_path,
@@ -6709,14 +6799,18 @@ def test_player_target_is_never_retired_by_the_archive(tmp_path):
         source_ids={"player_id": "406c5597"},
     )
 
-    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["player"],
-            settings=_settings("backfill"),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["player"],
+        settings=_settings("backfill"),
+    )
 
-    assert control.frontier[target_id]["state"] == "fetched"
+    assert result.contract_quarantined == 0
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    quarantined = control.frontier[target_id]
+    assert quarantined["state"] == "quarantined"
+    assert quarantined["last_error_message"].startswith("dead_letter:")
 
 
 def test_retired_target_leaves_the_cohort_of_its_own_run(tmp_path):
@@ -8996,12 +9090,12 @@ def test_typed_page_without_source_context_fails_observation(tmp_path):
         typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
     )
 
-    with pytest.raises(ParseWaveError, match="source competition_id and season_id"):
-        pipeline.parse_wave(
-            str(uuid.uuid4()),
-            page_kinds=["match"],
-            settings=_settings("current"),
-        )
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["match"],
+        settings=_settings("current"),
+    )
+    assert result.dead_lettered == 1
 
     key = (
         refresh,
@@ -9156,12 +9250,12 @@ def test_page_completion_marker_is_after_typed_schedule_persistence(
     )
 
     if typed_fails:
-        with pytest.raises(ParseWaveError, match="typed persistence failed"):
-            pipeline.parse_wave(
-                str(uuid.uuid4()),
-                page_kinds=["schedule"],
-                settings=_settings(),
-            )
+        failed = pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["schedule"],
+            settings=_settings(),
+        )
+        assert failed.dead_lettered == 1
         page_marker = [
             item for item in control.manifests if item["dataset"] == "__page__"
         ][-1]
@@ -9237,12 +9331,12 @@ def test_empty_typed_schedule_is_persisted_as_zero_row_replacement(
     )
 
     if typed_fails:
-        with pytest.raises(ParseWaveError, match="typed persistence failed"):
-            pipeline.parse_wave(
-                str(uuid.uuid4()),
-                page_kinds=["schedule"],
-                settings=_settings(),
-            )
+        failed = pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["schedule"],
+            settings=_settings(),
+        )
+        assert failed.dead_lettered == 1
     else:
         pipeline.parse_wave(
             str(uuid.uuid4()),
@@ -12663,3 +12757,436 @@ def test_moved_page_is_spared_on_the_paid_persistent_path(tmp_path):
     assert "failed" in control.session_close_statuses
     assert "reset_clearance" in control.events
     assert fetcher.reset_calls == 1
+
+
+# --- dead letter (#1317) -----------------------------------------------------
+
+
+def _dead_letter_cohort(tmp_path, *, count):
+    """``count`` targets whose generic write the page contract refuses.
+
+    A bare table-free shell with no identity is the one shape that is never
+    granted the terminal contract quarantine, so whatever these targets get is
+    the dead letter and nothing else.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target_ids = []
+    for index in range(count):
+        url = f"https://fbref.com/en/squads/d512{index:04d}/1938/Austria-Stats"
+        target = PageTarget(
+            source="fbref",
+            page_kind="squad",
+            target_id=f"fbref:squad:d512{index:04d}",
+            canonical_url=url,
+            source_ids={"squad_id": f"d512{index:04d}"},
+        )
+        refresh, record = _commit_for_parse(
+            raw, target, _archive_shell(url, identity=False)
+        )
+        control.frontier[record.target_id] = {
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "source_ids": dict(record.source_ids),
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+        }
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+        target_ids.append(record.target_id)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    return control, pipeline, target_ids
+
+
+def test_dead_letter_reason_carries_type_and_review_date(tmp_path):
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=1)
+    pipeline.clock = lambda: datetime(2026, 9, 21, 6, 18, tzinfo=timezone.utc)
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["squad"],
+        settings=_settings("backfill"),
+    )
+
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    row = control.frontier[target_ids[0]]
+    assert row["state"] == "quarantined"
+    assert row["last_error_class"] == "ParseContractQuarantined"
+    # page_frontier has no review_at column, so the date rides in the reason
+    # (плана 21.09, решение 3); a real column comes with the next migration.
+    assert row["last_error_message"].startswith(
+        "dead_letter:GenericPersistenceError:review_after=2026-09-28:"
+    )
+    assert "page_contract:no_tables" in row["last_error_message"]
+    assert row["next_fetch_at"] is None
+
+
+def test_dead_letter_budget_stops_after_five_targets_in_one_wave(tmp_path):
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=10)
+
+    # Retiring a handful of pages is routine; retiring a whole cohort silently
+    # is the one outcome worse than stopping, so the budget hands the rest back
+    # to the loud path.
+    with pytest.raises(ParseWaveError):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=replace(_settings("backfill"), shard_size=25),
+        )
+
+    states = [control.frontier[item]["state"] for item in target_ids]
+    assert states.count("quarantined") == 5
+    assert states.count("fetched") == 5
+
+
+def test_dead_letter_budget_is_reset_for_every_wave(tmp_path):
+    # Five per wave, not five per run: a second wave of the same size must be
+    # able to retire its own five, or the drain would stall after one batch.
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=10)
+    settings = replace(_settings("backfill"), shard_size=5)
+
+    first = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["squad"], settings=settings
+    )
+    second = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["squad"], settings=settings
+    )
+
+    assert first.dead_lettered == second.dead_lettered == 5
+    assert first.failures == second.failures == []
+    assert all(
+        control.frontier[item]["state"] == "quarantined"
+        for item in target_ids
+    )
+
+
+class _FakePostgresError(Exception):
+    """A driver class pipeline never imports, matched by its root module."""
+
+    __module__ = "psycopg2.errors"
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        LeaseLost("frontier lease expired under the writer"),
+        BudgetExceeded("no funded reservation left"),
+        MigrationError("control schema is ahead of this code"),
+        ControlStoreConfigError("FBREF_CONTROL_DB_URI is missing"),
+        OSError("seaweedfs refused the connection"),
+        _FakePostgresError("server closed the connection unexpectedly"),
+    ],
+    ids=[
+        "LeaseLost",
+        "BudgetExceeded",
+        "MigrationError",
+        "ControlStoreConfigError",
+        "OSError",
+        "psycopg2",
+    ],
+)
+def test_infrastructure_exception_is_never_dead_lettered(tmp_path, exception):
+    # The world breaking is not a property of the page: retiring the target
+    # here would bury a live page because a gateway blinked.
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=1)
+
+    class InfrastructureWriter(FakeWriter):
+        def persist_page(self, page, **kwargs):
+            raise exception
+
+    pipeline.generic_writer = InfrastructureWriter()
+
+    with pytest.raises(ParseWaveError, match=type(exception).__name__):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[target_ids[0]]["state"] == "fetched"
+
+
+def test_leased_target_is_not_dead_lettered(tmp_path):
+    # The quarantine fence refuses a leased target, and a lost race must be
+    # reported rather than counted as progress.
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=1)
+    control.frontier[target_ids[0]]["state"] = "leased"
+
+    with pytest.raises(ParseWaveError):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[target_ids[0]]["state"] == "leased"
+
+
+def test_dead_letter_is_fenced_to_the_bytes_that_failed(tmp_path):
+    # A newer fetch landed while the verdict was being formed: the stale
+    # reading must not retire the target.
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=1)
+    control.frontier[target_ids[0]]["last_content_hash"] = "b" * 64
+
+    with pytest.raises(ParseWaveError):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[target_ids[0]]["state"] == "fetched"
+
+
+def test_state_conflict_on_the_success_marker_dead_letters_the_target(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = PageTarget(
+        source="fbref",
+        page_kind="player",
+        target_id="fbref:player:1234abcd",
+        canonical_url="https://fbref.com/en/players/1234abcd/Player",
+        source_ids={"player_id": "1234abcd"},
+    )
+    refresh, record = _commit_for_parse(
+        raw,
+        target,
+        """
+        <table id="stats_standard"><tr>
+          <th data-stat="player">Player</th></tr>
+          <tr><td data-stat="player">Player</td></tr></table>
+        """,
+    )
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    original = control.record_dataset_manifest
+
+    def conflicting_page_marker(**kwargs):
+        if kwargs["dataset"] == "__page__":
+            raise StateConflict("completed page manifest is immutable")
+        return original(**kwargs)
+
+    control.record_dataset_manifest = conflicting_page_marker
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["player"],
+        settings=_settings(),
+    )
+
+    # The page is already parsed, so retiring it loses nothing, and the
+    # duplicate success marker is exactly the shape that stalled the history
+    # lane on 2026-09-06.
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    assert control.frontier[record.target_id]["state"] == "quarantined"
+    assert control.frontier[record.target_id][
+        "last_error_message"
+    ].startswith("dead_letter:StateConflict:")
+
+
+SEASON_STATS_KEEPERS_BLOB = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures/fbref/season_stats/acnq-2027-keepers-e9cfdc24.html.gz"
+)
+ATLAS_SQUAD_BLOB = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures/fbref/squads/atlas-2009-2010-7a795569.html.gz"
+)
+
+
+def test_season_stats_zero_table_shell_without_identity_is_dead_lettered(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = _keepers_season_stats_target()
+    refresh, record = _commit_for_parse(
+        raw, target, "<html><body><p>temporary source shell</p></body></html>"
+    )
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season_stats"],
+        settings=_settings("current"),
+    )
+
+    assert result.failures == []
+    assert result.parsed == 0
+    assert result.dead_lettered == 1
+    assert control.frontier[record.target_id]["state"] == "quarantined"
+
+
+def test_recovery_cohort_of_the_three_pages_that_killed_the_lane_survives(
+    tmp_path,
+):
+    """The exact cohort `recover_raw_before_fetch` died on, offline.
+
+    Real bytes for both known killers: the tableless 657:2027:keepers capture
+    (2026-09-16..21) and the Atlas 2009-2010 squad page whose two DOM tables
+    share one table id (2026-09-06).  The third member fails with a plain
+    persistence error to prove the generic path is covered too.
+    """
+
+    keepers_html = gzip.decompress(
+        SEASON_STATS_KEEPERS_BLOB.read_bytes()
+    ).decode("utf-8")
+    assert hashlib.sha256(keepers_html.encode()).hexdigest() == (
+        "e9cfdc24966cf53ac0cada496b383bf150d9db3a49b18f315bcdf4aff8767e10"
+    )
+    atlas_html = gzip.decompress(ATLAS_SQUAD_BLOB.read_bytes()).decode("utf-8")
+    assert hashlib.sha256(atlas_html.encode()).hexdigest() == (
+        "7a79556910ea5f403efb7850d0754e60d18e270ddcb7109a5f2a32e0a6d21167"
+    )
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    members = [
+        (
+            _keepers_season_stats_target(),
+            keepers_html,
+            "daily",
+        ),
+        (
+            PageTarget(
+                source="fbref",
+                page_kind="squad",
+                target_id="fbref:squad:7c76bc53:a667b6f50d092c9f077c",
+                canonical_url=(
+                    "https://fbref.com/en/squads/7c76bc53/2009-2010/c31/"
+                    "Atlas-Stats-Liga-MX"
+                ),
+                source_ids={"squad_id": "7c76bc53"},
+            ),
+            atlas_html,
+            "historical_once",
+        ),
+        (
+            PageTarget(
+                source="fbref",
+                page_kind="player",
+                target_id="fbref:player:0abcdef1",
+                canonical_url="https://fbref.com/en/players/0abcdef1/Player",
+                source_ids={"player_id": "0abcdef1"},
+            ),
+            """
+            <table id="stats_standard"><tr>
+              <th data-stat="player">Player</th></tr>
+              <tr><td data-stat="player">Player</td></tr></table>
+            """,
+            "monthly",
+        ),
+    ]
+    records = {}
+    for target, html, policy in members:
+        refresh, record = _commit_for_parse(raw, target, html)
+        records[target.target_id] = record
+        control.frontier[record.target_id] = {
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "source_ids": dict(record.source_ids),
+            "refresh_policy": policy,
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+        }
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+
+    original_manifest = control.record_dataset_manifest
+    atlas_id = members[1][0].target_id
+    player_id = members[2][0].target_id
+    seen_atlas_datasets = set()
+
+    def failing_manifest(**kwargs):
+        if kwargs["target_id"] == player_id and kwargs["dataset"].startswith(
+            "table:"
+        ):
+            raise GenericPersistenceError("stage table write failed")
+        if kwargs["target_id"] == atlas_id:
+            # Pre-#1316 the manifest key is (table id, source location), so the
+            # second of the two `results2009-20103111_overall` tables collides
+            # with the first and the store refuses the write.  With #1316 the
+            # key carries the table instance and no conflict ever forms -- both
+            # worlds must leave the wave standing.
+            if kwargs["dataset"] in seen_atlas_datasets:
+                raise StateConflict(
+                    "completed dataset manifest is immutable: "
+                    f"{kwargs['dataset']}"
+                )
+            seen_atlas_datasets.add(kwargs["dataset"])
+        return original_manifest(**kwargs)
+
+    control.record_dataset_manifest = failing_manifest
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season_stats", "squad", "player"],
+        settings=replace(_settings("current"), shard_size=25),
+    )
+
+    # The whole point: recover_raw_before_fetch finishes, so the run reaches
+    # its first paid request instead of dying before it (#1317).
+    assert result.failures == []
+    assert result.cohort_size == 3
+    # The tableless keepers page is now an ordinary empty parse.
+    keepers_id = members[0][0].target_id
+    assert control.frontier[keepers_id]["state"] == "fetched"
+    assert result.parsed >= 1
+    # The plain persistence error retires its own target and nothing else.
+    assert control.frontier[player_id]["state"] == "quarantined"
+    assert f"contract_quarantine:{player_id}" in control.events
+    assert result.dead_lettered >= 1
+    # Atlas: dead-lettered while the duplicate table id still collides, parsed
+    # once #1316 gives the manifest key its table instance.  Either way the
+    # cohort survives.
+    assert control.frontier[atlas_id]["state"] in {"fetched", "quarantined"}
