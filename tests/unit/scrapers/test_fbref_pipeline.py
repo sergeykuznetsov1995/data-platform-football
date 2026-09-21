@@ -13231,12 +13231,108 @@ def test_recovery_cohort_of_the_three_pages_that_killed_the_lane_survives(
     assert (
         control.frontier[player_id]["last_error_message"]
     ).startswith("dead_letter:GenericPersistenceError:review_after=")
+    # Every member reached a verdict: two parsed or retired, one retired.
+    assert result.parsed + result.dead_lettered == 3
     # Atlas: dead-lettered while the duplicate table id still collides, parsed
-    # once #1316 gives the manifest key its table instance.  Either way the
-    # cohort survives, and either way the verdict names its own cause.
+    # once #1316 gives the manifest key its table instance.  Either way it is
+    # processed -- never silently skipped -- and either way the cohort survives.
+    atlas_observations = [
+        row for row in control.observations.values()
+        if row["target_id"] == atlas_id
+    ]
+    assert len(atlas_observations) == 1
     atlas_state = control.frontier[atlas_id]["state"]
-    assert atlas_state in {"fetched", "quarantined"}
     if atlas_state == "quarantined":
+        assert atlas_observations[0]["status"] == "failed"
         assert control.frontier[atlas_id][
             "last_error_message"
         ].startswith("dead_letter:StateConflict:review_after=")
+        assert seen_atlas_datasets  # the collision really was exercised
+    else:
+        assert atlas_state == "fetched"
+        assert atlas_observations[0]["status"] == "succeeded"
+
+
+def test_infrastructure_cause_survives_a_masking_state_conflict(tmp_path):
+    # A Trino outage inside a writer sends the error path to record a failure
+    # manifest, which the store refuses on an already completed dataset.  The
+    # caller then sees a StateConflict with the real cause on __context__:
+    # classifying only the outer class would retire a live page for an outage.
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=1)
+
+    class MaskingWriter(FakeWriter):
+        def persist_page(self, page, **kwargs):
+            try:
+                raise TrinoError("SQL execution failed: coordinator gone")
+            except TrinoError:
+                raise StateConflict(
+                    "A completed dataset manifest is immutable"
+                )
+
+    pipeline.generic_writer = MaskingWriter()
+
+    with pytest.raises(ParseWaveError, match="StateConflict"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[target_ids[0]]["state"] == "fetched"
+
+
+def test_infrastructure_cause_is_read_through_explicit_chaining(tmp_path):
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=1)
+
+    class ChainingWriter(FakeWriter):
+        def persist_page(self, page, **kwargs):
+            raise GenericPersistenceError("stage write failed") from OSError(
+                "seaweedfs refused the connection"
+            )
+
+    pipeline.generic_writer = ChainingWriter()
+
+    with pytest.raises(ParseWaveError, match="GenericPersistenceError"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[target_ids[0]]["state"] == "fetched"
+
+
+def test_guard_exit_fault_still_fails_a_wave_that_dead_lettered_every_item(
+    tmp_path,
+):
+    # Every item already scheduled as a failure leaves no finished outcome to
+    # hang the guard error on.  Before #1317 the item failures themselves
+    # killed the wave; now they are dead-lettered, so the frontier-fence error
+    # has to be carried past the fencing loop or the wave goes green with the
+    # guard never closed.
+    pipeline, control, records, _generic, _typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    original_guard = control.guard_latest_content
+
+    @contextmanager
+    def guard_with_exit_fault(target_id, content_hash, logical_refresh_id):
+        with original_guard(
+            target_id, content_hash, logical_refresh_id
+        ) as verdict:
+            yield verdict
+        raise RuntimeError("could not release the content guard")
+
+    control.guard_latest_content = guard_with_exit_fault
+
+    def fail_every_completion(lease, **kwargs):
+        raise RuntimeError("observation commit fault")
+
+    control.complete_observation_processing = fail_every_completion
+
+    with pytest.raises(ParseWaveError, match="content_guard"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
+
+    assert len(records) == 2

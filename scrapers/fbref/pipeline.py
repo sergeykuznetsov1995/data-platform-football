@@ -1984,14 +1984,31 @@ DEAD_LETTER_REASON_PREFIX = "dead_letter:"
 
 
 def _is_infrastructure_failure(exc: BaseException) -> bool:
-    """Tell "the world broke" from "this page cannot be used"."""
+    """Tell "the world broke" from "this page cannot be used".
 
-    if isinstance(exc, _INFRASTRUCTURE_EXCEPTIONS):
-        return True
-    return any(
-        cls.__module__.split(".", 1)[0] in _INFRASTRUCTURE_EXCEPTION_ROOTS
-        for cls in type(exc).__mro__
-    )
+    The whole cause chain is read, not just the outermost class: an
+    infrastructure failure routinely arrives wrapped.  A Trino outage inside
+    the typed writer, for instance, sends the error path to record a failure
+    manifest, which the store refuses on an already completed dataset -- the
+    caller then sees a ``StateConflict`` with the real cause hanging off
+    ``__context__``.  Retiring the target on that reading would bury a live
+    page for an outage, so any infrastructure link anywhere in the chain keeps
+    the failure loud.
+    """
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _INFRASTRUCTURE_EXCEPTIONS):
+            return True
+        if any(
+            cls.__module__.split(".", 1)[0] in _INFRASTRUCTURE_EXCEPTION_ROOTS
+            for cls in type(current).__mro__
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _is_mass_contract_rejection(result: "WaveResult") -> bool:
@@ -6249,6 +6266,7 @@ class FBrefPipeline:
                 except Exception as exc:
                     finish_failures.append((item, exc, progress))
 
+        pending_lock_failure: Optional[BaseException] = None
         if lock_errors:
             scheduled = {
                 item.record.logical_refresh_id
@@ -6262,21 +6280,30 @@ class FBrefPipeline:
             ]
             for item in unfinished:
                 finish_failures.append((item, lock_errors[0], {}))
-            if not unfinished and outcomes:
-                # An exit failure after durable completion cannot safely turn
-                # a succeeded lease back into failed. Keep its state, but make
-                # the wave report the frontier-fence failure loudly.
-                first_key = next(iter(outcomes))
-                first = outcomes[first_key]
-                lock_error = lock_errors[0]
-                outcomes[first_key] = replace(
-                    first,
-                    failures=first.failures
-                    + (
-                        f"{items[0].record.target_id}:content_guard:"
-                        f"{type(lock_error).__name__}:{lock_error}",
-                    ),
-                )
+            if not unfinished:
+                if outcomes:
+                    # An exit failure after durable completion cannot safely
+                    # turn a succeeded lease back into failed. Keep its state,
+                    # but make the wave report the frontier-fence failure
+                    # loudly.
+                    first_key = next(iter(outcomes))
+                    first = outcomes[first_key]
+                    lock_error = lock_errors[0]
+                    outcomes[first_key] = replace(
+                        first,
+                        failures=first.failures
+                        + (
+                            f"{items[0].record.target_id}:content_guard:"
+                            f"{type(lock_error).__name__}:{lock_error}",
+                        ),
+                    )
+                else:
+                    # Every item is already scheduled as a failure, so there is
+                    # no finished outcome to hang the guard error on yet. Those
+                    # failures may each be dead-lettered (#1317), and then the
+                    # wave would finish green while the frontier fence never
+                    # closed. Carry the error past the fencing loop below.
+                    pending_lock_failure = lock_errors[0]
 
         # Failure fencing uses its own control transaction, so it must happen
         # only after every frontier lock is gone. This includes ordinary
@@ -6293,6 +6320,18 @@ class FBrefPipeline:
                         "stale_typed_observations_skipped", 0
                     ),
                 )
+            )
+        if pending_lock_failure is not None and outcomes:
+            first_key = next(iter(outcomes))
+            first = outcomes[first_key]
+            outcomes[first_key] = replace(
+                first,
+                failures=first.failures
+                + (
+                    f"{items[0].record.target_id}:content_guard:"
+                    f"{type(pending_lock_failure).__name__}:"
+                    f"{pending_lock_failure}",
+                ),
             )
         return [outcomes[item.record.logical_refresh_id] for item in items]
 
