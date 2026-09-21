@@ -34,6 +34,10 @@ from scrapers.fbref.settings import (
 
 
 RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
+# Emitted after every batch, so a runner killed mid-flight still leaves its
+# last complete aggregate in the pipe the parent already reads.
+PROGRESS_PREFIX = "FBREF_LIVE_WAVES_PROGRESS:"
+LOG_DIRECTORY = "/opt/airflow/logs/fbref_live_waves"
 # Slice of the meter's allowance this run never claims, so the warm-HTTP lease
 # extension still fits after the meter booked spend the fetcher cannot see
 # (64 KiB per collapsed lease, see the note at its use site) (#1188).
@@ -257,7 +261,34 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, 81),
         default=80,
     )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=0,
+        help="Absolute wall-clock budget for the batch loop; 0 disables it",
+    )
     return parser
+
+
+def _attach_run_log_file(control_run_id: str) -> None:
+    """Keep this run's log next to the task's, not only in the parent's pipe."""
+
+    try:
+        os.makedirs(LOG_DIRECTORY, exist_ok=True)
+        handler = logging.FileHandler(
+            os.path.join(LOG_DIRECTORY, f"{control_run_id}.log")
+        )
+    except OSError as exc:
+        print(
+            f"could not open the runner log file: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(handler)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -267,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = build_parser().parse_args(argv)
+    _attach_run_log_file(args.control_run_id)
     _sigterm_state, previous_sigterm = _install_sigterm_unwind_handler()
     watchdog = None
     try:
@@ -281,7 +313,17 @@ def main(argv: list[str] | None = None) -> int:
             signal.signal(signal.SIGTERM, previous_sigterm)
 
 
+def _print_progress(document: Mapping) -> None:
+    print(
+        f"{PROGRESS_PREFIX}{json.dumps(document, sort_keys=True)}",
+        flush=True,
+    )
+
+
 def _run(args: argparse.Namespace) -> int:
+    # The budget is counted from the runner's own start, so the meter check and
+    # fetcher construction below are spent out of it rather than added to it.
+    started = time.monotonic()
     page_kinds = [kind for kind in args.page_kinds.split(",") if kind]
     if not page_kinds:
         raise SystemExit("at least one page kind is required")
@@ -423,6 +465,10 @@ def _run(args: argparse.Namespace) -> int:
         page_kinds=page_kinds,
         settings=settings,
         max_batches=args.max_batches,
+        deadline_monotonic=(
+            started + args.deadline_seconds if args.deadline_seconds else None
+        ),
+        on_batch=_print_progress,
     ).as_dict()
     print(f"{RESULT_PREFIX}{json.dumps(result, sort_keys=True)}", flush=True)
     return 0

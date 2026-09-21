@@ -9859,6 +9859,149 @@ def test_hard_transport_policy_is_never_a_refreshable_session_failure():
     assert _session_failure(error) is False
 
 
+def test_live_run_result_publishes_deadline_reached():
+    result = LiveRunResult()
+
+    assert result.deadline_reached is False
+    assert result.as_dict()["deadline_reached"] is False
+
+    result.deadline_reached = True
+
+    assert result.as_dict()["deadline_reached"] is True
+
+
+def test_live_waves_stop_at_the_deadline_with_a_partial_aggregate(tmp_path):
+    """The budget is wall-clock, so a slow batch cannot outrun the task timeout."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    # The clock jumps past the deadline while the first batch is running, so
+    # the second batch is never claimed and no paid lease is spent on it.
+    ticks = iter((1000.0, 1000.0 + 19801.0))
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        monotonic=lambda: next(ticks),
+    )
+    fetch_calls = 0
+
+    def fetch_wave(*_args, **_kwargs):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return WaveResult(claimed=1, fetched=1)
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = lambda *_args, **_kwargs: WaveResult(
+        cohort_size=1, parsed=1
+    )
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["match"],
+        settings=_settings(),
+        max_batches=14,
+        deadline_monotonic=1000.0 + 19800.0,
+    )
+
+    assert fetch_calls == 1
+    assert result.batches == 1
+    assert result.deadline_reached is True
+    # A budget stop is not an empty frontier: the remaining targets are still
+    # due, and the freshness gate must not be told the lane is closed.
+    assert result.frontier_closed is False
+
+
+def test_live_waves_without_a_deadline_are_unchanged(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    monotonic_calls = 0
+
+    def monotonic():
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        return 0.0
+
+    pipeline = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter(), monotonic=monotonic
+    )
+    fetch_results = iter((WaveResult(claimed=1, fetched=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+    pipeline.fetch_wave = lambda *_args, **_kwargs: next(fetch_results)
+    pipeline.parse_wave = lambda *_args, **_kwargs: next(parse_results)
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["match"],
+        settings=_settings(),
+        max_batches=14,
+    )
+
+    assert result.batches == 2
+    assert result.frontier_closed is True
+    assert result.deadline_reached is False
+    # The clock is never consulted when no budget was given.
+    assert monotonic_calls == 0
+
+
+def test_live_waves_report_every_finished_batch_to_the_callback(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    fetch_results = iter((WaveResult(claimed=1, fetched=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+    pipeline.fetch_wave = lambda *_args, **_kwargs: next(fetch_results)
+    pipeline.parse_wave = lambda *_args, **_kwargs: next(parse_results)
+    documents = []
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["match"],
+        settings=_settings(),
+        max_batches=14,
+        on_batch=documents.append,
+    )
+
+    assert [document["batches"] for document in documents] == [1, 2]
+    assert documents[0]["fetch"]["fetched"] == 1
+    # The callback fires as soon as a batch is merged, before the loop decides
+    # the frontier is closed, so the last progress document is the aggregate
+    # minus that final verdict.  That is the point: a killed runner leaves the
+    # work it finished, not a claim about how the run ended.
+    assert result.frontier_closed is True
+    assert documents[-1]["frontier_closed"] is False
+    assert documents[-1]["fetch"] == result.as_dict()["fetch"]
+    assert documents[-1]["parse"] == result.as_dict()["parse"]
+
+
+def test_a_failing_batch_callback_never_kills_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    fetch_results = iter((WaveResult(claimed=1, fetched=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+    pipeline.fetch_wave = lambda *_args, **_kwargs: next(fetch_results)
+    pipeline.parse_wave = lambda *_args, **_kwargs: next(parse_results)
+
+    def on_batch(_document):
+        raise RuntimeError("the pipe is closed")
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["match"],
+        settings=_settings(),
+        max_batches=14,
+        on_batch=on_batch,
+    )
+
+    assert result.batches == 2
+    assert result.frontier_closed is True
+
+
 def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
     tmp_path,
 ):

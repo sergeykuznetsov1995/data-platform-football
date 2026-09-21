@@ -3,6 +3,7 @@ from __future__ import annotations
 import dis
 import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -218,6 +219,58 @@ def test_live_wave_wrapper_accepts_int_and_templated_int_string(
     assert captured["command"][
         captured["command"].index("--max-batches") + 1
     ] == str(int(max_batches))
+    # The deadline always travels with the cap, so a run cannot be bounded by
+    # batch count alone by accident.
+    assert "--deadline-seconds" in captured["command"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("deadline_seconds", "expected"),
+    [(0, "0.0"), (19800, "19800.0"), ("19800", "19800.0")],
+)
+def test_live_wave_wrapper_forwards_the_templated_wave_deadline(
+    monkeypatch, deadline_seconds, expected
+):
+    captured = {}
+
+    class Process:
+        pid = 1234
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            return (
+                'FBREF_LIVE_WAVES_RESULT:{"batches": 1, "frontier_closed": true}\n',
+                "",
+            )
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda command, **_kwargs: captured.update(command=command) or Process(),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_process_group_exists",
+        lambda _process_group_id: False,
+    )
+
+    fbref_pipeline_tasks.run_fbref_live_waves(
+        airflow_run_id="manual__deadline",
+        dag_id="dag_ingest_fbref",
+        worker_id="current-live",
+        page_kinds=["match"],
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+        max_batches=14,
+        deadline_seconds=deadline_seconds,
+    )
+
+    assert captured["command"][
+        captured["command"].index("--deadline-seconds") + 1
+    ] == expected
 
 
 @pytest.mark.unit
@@ -2342,6 +2395,116 @@ def test_live_waves_reject_success_with_a_surviving_descendant(monkeypatch):
 
     assert calls == 2
     assert killed == [(3210, fbref_pipeline_tasks.signal.SIGTERM)]
+
+
+@pytest.mark.unit
+def test_timeout_logs_the_last_progress_document_and_still_fails(
+    monkeypatch, caplog
+):
+    """A killed runner loses its final result line; the progress lines survive."""
+
+    calls = 0
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
+                    cmd=["runner"], timeout=timeout
+                )
+            # Exactly what the pipe holds when the six-hour wait expires: the
+            # batches that finished, and no FBREF_LIVE_WAVES_RESULT: line.
+            return (
+                'FBREF_LIVE_WAVES_PROGRESS:{"batches": 1}\n'
+                'FBREF_LIVE_WAVES_PROGRESS:{"batches": 2}\n',
+                "",
+            )
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os, "killpg", lambda _pid, _sig: None
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", MagicMock())
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="process group was killed"):
+            fbref_pipeline_tasks.run_fbref_live_waves(
+                airflow_run_id="scheduled__2026-09-22T06:00:00+00:00",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["match"],
+                run_type="current",
+                request_limit=4096,
+                byte_limit_mb=2048,
+                shard_size=25,
+                max_batches=14,
+                deadline_seconds=19800,
+            )
+
+    assert 'partial result: {"batches": 2}' in caplog.text
+
+
+@pytest.mark.unit
+def test_a_runner_without_progress_lines_says_so_and_still_fails(
+    monkeypatch, caplog
+):
+    calls = 0
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
+                    cmd=["runner"], timeout=timeout
+                )
+            return "InsecureRequestWarning: noise\n", ""
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os, "killpg", lambda _pid, _sig: None
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", MagicMock())
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="process group was killed"):
+            fbref_pipeline_tasks.run_fbref_live_waves(
+                airflow_run_id="scheduled__2026-09-22T06:00:00+00:00",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["match"],
+                run_type="current",
+                request_limit=4096,
+                byte_limit_mb=2048,
+                shard_size=25,
+            )
+
+    assert "left no partial result document" in caplog.text
 
 
 @pytest.mark.unit

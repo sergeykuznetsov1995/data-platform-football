@@ -52,6 +52,7 @@ class TestFBrefCurrentTopology:
             "request_limit",
             "byte_limit_mb",
             "shard_size",
+            "wave_deadline_seconds",
         }
         source = Path(module.__file__).read_text(encoding="utf-8")
         assert "LEAGUES" not in source
@@ -67,6 +68,11 @@ class TestFBrefCurrentTopology:
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["minimum"] == 1
         assert params["shard_size"]._kw["maximum"] == 25
+        # Five and a half hours: the six-hour subprocess wait minus half an hour
+        # for the batch that is running when the budget expires.
+        assert params["wave_deadline_seconds"].default == 19800
+        assert params["wave_deadline_seconds"]._kw["minimum"] == 0
+        assert params["wave_deadline_seconds"]._kw["maximum"] == 6 * 60 * 60
 
         initialize = tasks["initialize_run"]
         assert initialize.python_callable.__name__ == "initialize_fbref_run"
@@ -119,6 +125,11 @@ class TestFBrefCurrentTopology:
         assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
         assert live.op_kwargs["page_kinds"] == module.PAGE_KINDS
         assert live.op_kwargs["max_batches"] == factory.CURRENT_MAX_BATCHES
+        assert factory.CURRENT_WAVE_DEADLINE_SECONDS == 19800
+        assert live.op_kwargs["deadline_seconds"] == (
+            "{{ dag_run.conf.get('wave_deadline_seconds', "
+            "params.wave_deadline_seconds) }}"
+        )
         expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
         assert expected_reservation_mb == 9
         assert tasks["initialize_run"].op_kwargs["reservation_mb"] == (
