@@ -53,6 +53,7 @@ from scrapers.fbref.bronze import GenericPersistenceError
 from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION, PageDocument
 from scrapers.fbref import pipeline as pipeline_module
 from scrapers.fbref.pipeline import (
+    ContentGuardFailure,
     FBrefPipeline,
     FETCH_LEASE_SECONDS,
     _FrontierSeedCandidate,
@@ -13388,3 +13389,76 @@ def test_two_observations_of_one_target_retire_it_once_and_keep_the_wave(
     assert result.dead_lettered == 1
     assert control.events.count(f"contract_quarantine:{target.target_id}") == 1
     assert control.frontier[target.target_id]["state"] == "quarantined"
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        TrinoError("SQL execution failed: coordinator unavailable"),
+        ContentGuardFailure("content guard did not hold for the cohort"),
+    ],
+    ids=["TrinoError", "ContentGuardFailure"],
+)
+def test_infrastructure_failure_on_a_repeat_observation_fails_the_wave(
+    tmp_path, exception
+):
+    # Same two observations of one target, but the world breaks on the second.
+    # The target is already retired, so every suppressing branch would happily
+    # swallow this one -- which is exactly how a wave could finish green after
+    # the control store or the coordinator died (#1317, раунд 4).  Classifying
+    # the exception before any suppression is what keeps it loud.
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    url = "https://fbref.com/en/squads/d5120000/1938/Austria-Stats"
+    target = PageTarget(
+        source="fbref",
+        page_kind="squad",
+        target_id="fbref:squad:d5120000",
+        canonical_url=url,
+        source_ids={"squad_id": "d5120000"},
+    )
+    html = _archive_shell(url, identity=False)
+    for _ in range(2):
+        refresh, record = _commit_for_parse(raw, target, html)
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    class BreaksOnceTheTargetIsRetired(BronzePageContractWriter):
+        def persist_page(self, page, **kwargs):
+            if pipeline._dead_lettered_targets:
+                raise exception
+            return super().persist_page(page, **kwargs)
+
+    pipeline.generic_writer = BreaksOnceTheTargetIsRetired()
+
+    with pytest.raises(ParseWaveError, match=type(exception).__name__):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=replace(_settings("backfill"), shard_size=25),
+        )
+
+    # The first observation still retired the page exactly once...
+    assert control.events.count(f"contract_quarantine:{target.target_id}") == 1
+    assert control.frontier[target.target_id]["state"] == "quarantined"
+    # ...and the outage on the second was not folded into that verdict: the
+    # reason still names the page contract, never the broken dependency.
+    reason = str(control.frontier[target.target_id]["last_error_message"])
+    assert reason.startswith("dead_letter:GenericPersistenceError:")
+    assert type(exception).__name__ not in reason

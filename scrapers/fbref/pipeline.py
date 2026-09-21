@@ -5691,72 +5691,83 @@ class FBrefPipeline:
                     contract_quarantined=1,
                     failures=tuple(failures),
                 )
-        elif record.target_id in self._dead_lettered_targets:
-            # One cohort can hold several observations of the same target, so
-            # a target this wave has already retired shows up again.  Retiring
-            # it twice would double-count progress; failing would bring back
-            # the very wave death this fix removes.
-            logger.info(
-                "Target %s was already dead-lettered by this wave",
-                record.target_id,
-            )
-            return _ProcessedObservation(
-                typed_promoted=typed_promoted,
-                stale_typed_observations_skipped=(
-                    stale_typed_observations_skipped
-                ),
-                failures=tuple(failures),
-            )
-        elif (
-            self._dead_letter_budget > 0
-            and not _is_infrastructure_failure(exc)
-            and not self._target_is_already_retired(record.target_id)
-        ):
-            # Everything else that dies on one record after its lease was taken
-            # -- a persistence error, a typed-parser refusal, a StateConflict on
-            # the success marker of an already-finished page -- used to raise
-            # ParseWaveError and end the wave, so one page held the whole lane
-            # hostage run after run (#1317).  Retire that one target instead and
-            # keep going; the verdict is reversible (state='quarantined', see
-            # docs/operations/fbref_dead_letter_return.md) and it is fenced to
-            # the exact bytes that failed, so a newer fetch is never retired on
-            # a stale reading.
-            review_after = (
-                self.clock() + timedelta(days=DEAD_LETTER_REVIEW_DAYS)
-            ).date().isoformat()
-            reason = (
-                f"{DEAD_LETTER_REASON_PREFIX}{type(exc).__name__}"
-                f":review_after={review_after}:{str(exc)[:200]}"
-            )
-            dead_lettered = False
-            try:
-                dead_lettered = self.control.quarantine_contract_rejected_target(
+        elif not _is_infrastructure_failure(exc):
+            # Classification comes first, and every way of not reporting a
+            # failure lives under it.  A failure of the world around the page
+            # -- a dead gateway, a lost lease, a frontier fence that did not
+            # hold -- must reach `failures` whichever branch below would
+            # otherwise apply, or a wave finishes green after the control store
+            # broke.  Ordering this the other way round is what made the same
+            # defect appear three times (#1317 review rounds 1, 3 and 4).
+            if record.target_id in self._dead_lettered_targets:
+                # One cohort can hold several observations of the same target,
+                # so a target this wave has already retired shows up again.
+                # Retiring it twice would double-count progress; failing would
+                # bring back the very wave death this fix removes.
+                logger.info(
+                    "Target %s was already dead-lettered by this wave",
                     record.target_id,
-                    content_hash=record.content_hash,
-                    reason=reason,
-                )
-            except Exception as dead_letter_exc:
-                failures.append(
-                    f"{record.target_id}:dead_letter:"
-                    f"{type(dead_letter_exc).__name__}:{dead_letter_exc}"
-                )
-            if dead_lettered:
-                self._dead_letter_budget -= 1
-                self._dead_lettered_targets.add(record.target_id)
-                logger.warning(
-                    "Dead-lettered %s after %s: %s",
-                    record.target_id,
-                    type(exc).__name__,
-                    reason,
                 )
                 return _ProcessedObservation(
                     typed_promoted=typed_promoted,
                     stale_typed_observations_skipped=(
                         stale_typed_observations_skipped
                     ),
-                    dead_lettered=1,
                     failures=tuple(failures),
                 )
+            if (
+                self._dead_letter_budget > 0
+                and not self._target_is_already_retired(record.target_id)
+            ):
+                # Everything else that dies on one record after its
+                # lease was taken -- a persistence error, a typed-parser
+                # refusal, a StateConflict on the success marker of an
+                # already-finished page -- used to raise ParseWaveError
+                # and end the wave, so one page held the whole lane
+                # hostage run after run (#1317).  Retire that one target
+                # instead and keep going; the verdict is reversible
+                # (state='quarantined', see
+                # docs/operations/fbref_dead_letter_return.md) and it is
+                # fenced to the exact bytes that failed, so a newer fetch
+                # is never retired on a stale reading.
+                review_after = (
+                    self.clock() + timedelta(days=DEAD_LETTER_REVIEW_DAYS)
+                ).date().isoformat()
+                reason = (
+                    f"{DEAD_LETTER_REASON_PREFIX}{type(exc).__name__}"
+                    f":review_after={review_after}:{str(exc)[:200]}"
+                )
+                dead_lettered = False
+                try:
+                    dead_lettered = (
+                        self.control.quarantine_contract_rejected_target(
+                            record.target_id,
+                            content_hash=record.content_hash,
+                            reason=reason,
+                        )
+                    )
+                except Exception as dead_letter_exc:
+                    failures.append(
+                        f"{record.target_id}:dead_letter:"
+                        f"{type(dead_letter_exc).__name__}:{dead_letter_exc}"
+                    )
+                if dead_lettered:
+                    self._dead_letter_budget -= 1
+                    self._dead_lettered_targets.add(record.target_id)
+                    logger.warning(
+                        "Dead-lettered %s after %s: %s",
+                        record.target_id,
+                        type(exc).__name__,
+                        reason,
+                    )
+                    return _ProcessedObservation(
+                        typed_promoted=typed_promoted,
+                        stale_typed_observations_skipped=(
+                            stale_typed_observations_skipped
+                        ),
+                        dead_lettered=1,
+                        failures=tuple(failures),
+                    )
         failures.append(f"{record.target_id}:{type(exc).__name__}:{exc}")
         return _ProcessedObservation(
             typed_promoted=typed_promoted,
