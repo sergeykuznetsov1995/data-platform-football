@@ -1929,9 +1929,20 @@ def test_silver_dq_errors_do_not_block_the_candidate_while_silver_is_frozen(monk
         **context,
     )
 
-    assert candidate["quality_gate_status"] == "non-blocking"
-    assert candidate["quality_gate_errors"] == ["no_duplicates[silver.fotmob_lineup]"]
+    # След ошибки живёт внутри quality_gate; состав полей кандидата не меняется —
+    # его сверяет точным множеством scripts/fotmob_acceptance.py.
     assert candidate["quality_gate"] == quality_gate
+    assert candidate["quality_gate"]["errors"] == ["no_duplicates[silver.fotmob_lineup]"]
+    assert candidate["quality_gate"]["blocking"] is False
+    assert set(candidate) == {
+        "schema",
+        "generation_id",
+        "digest",
+        "transform_task_ids",
+        "transform_results",
+        "row_count_gate",
+        "quality_gate",
+    }
     assert len(candidate["digest"]) == 64
     assert record.call_args.args[1] == candidate
 

@@ -840,6 +840,64 @@ def test_live_candidate_rejects_extra_missing_tamper_and_bad_semantics():
         mod._validate_live_candidate(bad_semantics, bad_lineage)
 
 
+def _resigned(candidate, lineage):
+    unsigned = {key: value for key, value in candidate.items() if key != "digest"}
+    candidate["digest"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return candidate, replace(lineage, candidate_digest=candidate["digest"])
+
+
+def test_live_candidate_accepts_non_blocking_quality_gate_while_silver_is_frozen():
+    # #1312: пока silver заморожен, DQ пишет ошибки как предупреждения и метит
+    # гейт ``blocking: False``. Приёмка обязана принять такого кандидата —
+    # иначе автомат доставки откатит ночной выкат.
+    lineage = fake_lineage()
+    candidate = full_live_candidate(lineage.generation_id)
+    candidate["quality_gate"] = {
+        "passed": 3,
+        "total": 5,
+        "errors": ["no_duplicates[silver.fotmob_lineup]"],
+        "warnings": ["freshness_warning"],
+        "blocking": False,
+    }
+    candidate, lineage = _resigned(candidate, lineage)
+
+    summary = mod._validate_live_candidate(candidate, lineage)
+
+    assert summary["quality_passed"] == 3
+    assert summary["quality_total"] == 5
+
+
+def test_live_candidate_still_rejects_errors_when_gate_declares_itself_blocking():
+    lineage = fake_lineage()
+    candidate = full_live_candidate(lineage.generation_id)
+    candidate["quality_gate"] = {
+        "passed": 3,
+        "total": 5,
+        "errors": ["no_duplicates[silver.fotmob_lineup]"],
+        "warnings": ["freshness_warning"],
+        "blocking": True,
+    }
+    candidate, lineage = _resigned(candidate, lineage)
+
+    with pytest.raises(ValueError, match="quality gate is not clean"):
+        mod._validate_live_candidate(candidate, lineage)
+
+
+def test_live_candidate_fields_match_the_evidence_the_silver_dag_records():
+    # Контракт между писателем кандидата и приёмкой: состав полей сверяется
+    # точным множеством, поэтому новый ключ в evidence ломает доставку (#1312).
+    from utils import fotmob_publication
+
+    source = Path(fotmob_publication.__file__).read_text(encoding="utf-8")
+    body = source.split("def record_fotmob_silver_candidate(", 1)[1]
+    body = body.split("\n    evidence = {", 1)[1].split("}", 1)[0]
+    written = {line.split('"')[1] for line in body.splitlines() if '":' in line}
+
+    assert written | {"digest"} == set(mod.LIVE_CANDIDATE_FIELDS)
+
+
 def test_live_publication_reader_uses_admitted_scheduler(tmp_path):
     options = runtime_options(tmp_path)
     lifecycle_path, report = write_lifecycle_report(tmp_path, options)

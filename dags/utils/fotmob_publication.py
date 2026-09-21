@@ -2397,8 +2397,11 @@ def record_fotmob_silver_candidate(
         raise _airflow_exception("FotMob Silver row-count evidence is not clean")
     if not isinstance(quality_gate, Mapping):
         raise _airflow_exception("FotMob Silver quality evidence is not clean")
-    quality_errors = list(quality_gate.get("errors") or [])
-    if quality_errors and SILVER_DQ_BLOCKING:
+    # #1312: пока silver заморожен, ошибки DQ не блокируют кандидата. След
+    # остаётся внутри ``quality_gate`` (ключи ``errors`` и ``blocking``); новых
+    # полей в evidence не добавляем — состав полей кандидата сверяется точным
+    # множеством в scripts/fotmob_acceptance.py (LIVE_CANDIDATE_FIELDS).
+    if quality_gate.get("errors") and SILVER_DQ_BLOCKING:
         raise _airflow_exception("FotMob Silver quality evidence is not clean")
     evidence = {
         "schema": FOTMOB_PUBLICATION_SCHEMA,
@@ -2408,11 +2411,6 @@ def record_fotmob_silver_candidate(
         "row_count_gate": _normalize_candidate_value(dict(row_gate)),
         "quality_gate": _normalize_candidate_value(dict(quality_gate)),
     }
-    if quality_errors:
-        # #1312: silver заморожен — ошибки DQ не блокируют кандидата, но след
-        # обязан остаться в evidence.
-        evidence["quality_gate_status"] = "non-blocking"
-        evidence["quality_gate_errors"] = _normalize_candidate_value(quality_errors)
     evidence["digest"] = hashlib.sha256(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
