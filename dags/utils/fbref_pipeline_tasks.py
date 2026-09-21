@@ -45,6 +45,7 @@ DEFAULT_LEGACY_SCRAPER_PYTHON = "/opt/legacy-scraper-venv/bin/python"
 LIVE_WAVES_RUNNER = "/opt/airflow/dags/scripts/run_fbref_live_waves.py"
 LIVE_WAVES_PYTHONPATH = "/opt/airflow"
 LIVE_WAVES_RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
+LIVE_WAVES_PROGRESS_PREFIX = "FBREF_LIVE_WAVES_PROGRESS:"
 LIVE_WAVES_TIMEOUT_SECONDS = 6 * 60 * 60
 LIVE_WAVES_TERMINATION_GRACE_SECONDS = 30
 LIVE_WAVES_KILL_GRACE_SECONDS = 10
@@ -2055,6 +2056,7 @@ def run_fbref_live_waves(
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
     domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
     max_batches: int = FBREF_MAX_LIVE_BATCHES,
+    deadline_seconds: float = 0,
 ) -> dict:
     """Run all bounded live batches in one warm, unforked subprocess."""
 
@@ -2090,6 +2092,8 @@ def run_fbref_live_waves(
         str(domain_interval_seconds),
         "--max-batches",
         str(normalized_batches),
+        "--deadline-seconds",
+        str(float(deadline_seconds)),
     ]
     lifecycle = _LiveRunnerLifecycle()
     stdout = ""
@@ -2135,6 +2139,7 @@ def run_fbref_live_waves(
                 _decoded_stream(stdout),
                 _decoded_stream(stderr),
             )
+            _log_partial_live_result(stdout)
             message = (
                 "FBref live runner exceeded "
                 f"{LIVE_WAVES_TIMEOUT_SECONDS}s"
@@ -2167,6 +2172,7 @@ def run_fbref_live_waves(
                 _decoded_stream(stdout),
                 _decoded_stream(stderr),
             )
+            _log_partial_live_result(stdout)
         if not synchronous_abort_attempted:
             _abort_failed_live_subprocess(
                 airflow_run_id=airflow_run_id,
@@ -2201,6 +2207,9 @@ def run_fbref_live_waves(
             "FBref live runner failed with exit code "
             f"{process.returncode}"
         )
+        # A runner killed outright (SIGKILL from outside, OOM) leaves a
+        # non-zero code and its accumulated stdout, with no exception here.
+        _log_partial_live_result(stdout)
         _abort_failed_live_subprocess(
             airflow_run_id=airflow_run_id,
             dag_id=dag_id,
@@ -2211,6 +2220,7 @@ def run_fbref_live_waves(
     try:
         result = _parse_prefixed_result(stdout, LIVE_WAVES_RESULT_PREFIX)
     except Exception as exc:
+        _log_partial_live_result(stdout)
         _abort_failed_live_subprocess(
             airflow_run_id=airflow_run_id,
             dag_id=dag_id,
@@ -2220,6 +2230,28 @@ def run_fbref_live_waves(
         raise
     logger.info("FBref live waves: %s", json.dumps(result, sort_keys=True))
     return result
+
+
+def _log_partial_live_result(stdout) -> None:
+    """Name what a killed runner had already finished; never raise."""
+
+    try:
+        # Not _decoded_stream: that one truncates to the last 8000 characters
+        # for the diagnostic dump, which can cut a progress document in half or
+        # drop it behind later library noise.  The protocol is parsed from the
+        # whole stream.
+        if isinstance(stdout, bytes):
+            text = stdout.decode("utf-8", "replace")
+        else:
+            text = "" if stdout is None else str(stdout)
+        partial = _parse_prefixed_result(text, LIVE_WAVES_PROGRESS_PREFIX)
+    except Exception:  # noqa: BLE001 - the task fails on its own cause
+        logger.warning("FBref live waves left no partial result document")
+        return
+    logger.warning(
+        "FBref live waves partial result: %s",
+        json.dumps(partial, sort_keys=True),
+    )
 
 
 def _abort_failed_live_subprocess(

@@ -76,6 +76,12 @@ CURRENT_MAX_BATCHES = 14
 # this factory as an explicit first-parent modification instead of silently
 # leaving production on the old cap-80 bytes.
 CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-14-v1"
+# Absolute wall-clock budget for the batch loop: six hours minus half an
+# hour, so the batch that is running when the budget expires still has room
+# to finish, close its lease and reconcile the meter before the six-hour
+# subprocess wait.  The cap above bounds the batch count; this bounds time,
+# which is what actually runs out when a batch is slower than its estimate.
+CURRENT_WAVE_DEADLINE_SECONDS = 19800
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -91,6 +97,10 @@ BYTE_LIMIT_MB = (
     "{{ dag_run.conf.get('byte_limit_mb', params.byte_limit_mb) }}"
 )
 SHARD_SIZE = "{{ dag_run.conf.get('shard_size', params.shard_size) }}"
+WAVE_DEADLINE_SECONDS = (
+    "{{ dag_run.conf.get('wave_deadline_seconds', "
+    "params.wave_deadline_seconds) }}"
+)
 
 
 def _scheduled_params() -> dict:
@@ -114,6 +124,15 @@ def _scheduled_params() -> dict:
             maximum=MAX_SHARD_SIZE,
             description="Maximum frontier targets claimed by one task",
         ),
+        "wave_deadline_seconds": Param(
+            CURRENT_WAVE_DEADLINE_SECONDS,
+            type="integer",
+            minimum=0,
+            maximum=6 * 60 * 60,
+            description=(
+                "Wall-clock budget for the batch loop in seconds; 0 disables it"
+            ),
+        ),
     }
 
 
@@ -127,6 +146,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         request_limit = FBREF_PRODUCTION_REQUEST_LIMIT
         byte_limit_mb = FBREF_PRODUCTION_BYTE_LIMIT_MB
         shard_size = FBREF_MAX_WARM_SESSION_TARGETS
+        # Bootstrap is driven by hand and has no schedule to protect, so it
+        # keeps the old behaviour: the batch cap is its only bound.
+        wave_deadline_seconds = 0
         description = "Manual non-publishing FBref current bootstrap"
         tags = ["fbref", "bronze", "raw-first", "bootstrap", "manual"]
         doc_md = """
@@ -145,6 +167,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         request_limit = REQUEST_LIMIT
         byte_limit_mb = BYTE_LIMIT_MB
         shard_size = SHARD_SIZE
+        wave_deadline_seconds = WAVE_DEADLINE_SECONDS
         description = "Durable raw-first FBref current refresh"
         tags = ["fbref", "bronze", "raw-first", "discovery"]
         doc_md = """
@@ -278,6 +301,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
                 "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
                 "max_batches": CURRENT_MAX_BATCHES,
+                "deadline_seconds": wave_deadline_seconds,
             },
             pool=FBREF_SCRAPER_POOL,
             execution_timeout=timedelta(hours=6, minutes=5),
@@ -431,6 +455,7 @@ __all__ = [
     "BOOTSTRAP_DAG_ID",
     "CURRENT_MAX_BATCHES",
     "CURRENT_MAX_BATCHES_POLICY",
+    "CURRENT_WAVE_DEADLINE_SECONDS",
     "INGEST_DAG_ID",
     "PAGE_KINDS",
     "build_fbref_current_dag",

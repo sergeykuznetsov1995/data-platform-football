@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import signal
 import subprocess
@@ -62,6 +64,175 @@ def test_parser_defaults_to_eighty_live_batches():
     assert tuple(action.choices) == tuple(range(1, 81))
 
 
+def test_parser_accepts_a_wave_deadline():
+    action = next(
+        item
+        for item in runner.build_parser()._actions
+        if item.dest == "deadline_seconds"
+    )
+    assert action.default == 0
+    assert action.type is float
+
+
+def _live_run_environment(monkeypatch, *, run_live_waves):
+    """One accepted live run, with everything paid stubbed out."""
+
+    control = SimpleNamespace(
+        get_run=lambda _run_id: {
+            "run_type": "current",
+            "request_limit": 4096,
+            "byte_limit": 2048 * 1024 * 1024,
+            "metadata": {"dag_id": "dag_ingest_fbref"},
+        }
+    )
+    pipeline = SimpleNamespace(
+        control=control,
+        fetcher_factory=None,
+        run_live_waves=run_live_waves,
+    )
+    monkeypatch.setenv(
+        "FBREF_PROXY_CONTROL_URL",
+        "http://fbref_proxy_filter:8899",
+    )
+    monkeypatch.setattr(runner.ControlStore, "from_env", lambda: control)
+    monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
+    monkeypatch.setattr(runner, "FBrefFetcher", lambda **_kwargs: object())
+    return Namespace(
+        control_run_id="control-run",
+        worker_id="live",
+        page_kinds="match",
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+        reservation_mb=3,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        max_batches=14,
+        deadline_seconds=0,
+    )
+
+
+def test_runner_converts_deadline_seconds_into_a_monotonic_deadline(
+    monkeypatch, capsys
+):
+    seen = {}
+
+    def run_live_waves(*_args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(as_dict=lambda: {"batches": 1})
+
+    args = _live_run_environment(monkeypatch, run_live_waves=run_live_waves)
+    args.deadline_seconds = 19800.0
+    monkeypatch.setattr(runner.time, "monotonic", lambda: 1000.0)
+
+    assert runner._run(args) == 0
+    capsys.readouterr()
+
+    # Counted from the runner's own start, so the meter check and fetcher
+    # construction are spent out of the budget rather than added to it.
+    assert seen["deadline_monotonic"] == 1000.0 + 19800.0
+
+
+def test_runner_without_a_deadline_passes_none(monkeypatch, capsys):
+    seen = {}
+
+    def run_live_waves(*_args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(as_dict=lambda: {"batches": 1})
+
+    args = _live_run_environment(monkeypatch, run_live_waves=run_live_waves)
+
+    assert runner._run(args) == 0
+    capsys.readouterr()
+
+    assert seen["deadline_monotonic"] is None
+
+
+def test_runner_prints_a_progress_document_after_each_batch(
+    monkeypatch, capsys
+):
+    def run_live_waves(*_args, **kwargs):
+        on_batch = kwargs["on_batch"]
+        on_batch({"batches": 1, "deadline_reached": False})
+        on_batch({"batches": 2, "deadline_reached": False})
+        return SimpleNamespace(
+            as_dict=lambda: {"batches": 2, "deadline_reached": False}
+        )
+
+    args = _live_run_environment(monkeypatch, run_live_waves=run_live_waves)
+
+    assert runner._run(args) == 0
+
+    out = capsys.readouterr().out
+    progress = [
+        json.loads(line[len(runner.PROGRESS_PREFIX):])
+        for line in out.splitlines()
+        if line.startswith(runner.PROGRESS_PREFIX)
+    ]
+    assert [document["batches"] for document in progress] == [1, 2]
+    # The final result keeps its own prefix, so the parent can tell a complete
+    # run from the last thing a killed one managed to say.
+    assert f"{runner.RESULT_PREFIX}" in out
+
+
+def test_progress_documents_also_reach_the_run_log_file(monkeypatch, tmp_path):
+    """The pipe dies with a SIGKILLed parent; the log file does not."""
+
+    monkeypatch.setattr(runner, "LOG_DIRECTORY", str(tmp_path / "live"))
+    root = logging.getLogger()
+    before = list(root.handlers)
+    before_level = root.level
+    try:
+        runner._attach_run_log_file("control-run")
+        runner._print_progress({"batches": 2, "deadline_reached": False})
+        for handler in root.handlers:
+            handler.flush()
+        written = (tmp_path / "live" / "control-run.log").read_text()
+    finally:
+        root.setLevel(before_level)
+        for handler in list(root.handlers):
+            if handler not in before:
+                handler.close()
+                root.removeHandler(handler)
+    assert runner.PROGRESS_PREFIX in written
+    assert '"batches": 2' in written
+
+
+def test_runner_log_file_receives_the_run_log(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "LOG_DIRECTORY", str(tmp_path / "live"))
+    root = logging.getLogger()
+    before = list(root.handlers)
+    before_level = root.level
+    try:
+        runner._attach_run_log_file("control-run")
+        logging.getLogger("fbref.test").warning("hello from the runner")
+        for handler in root.handlers:
+            handler.flush()
+        written = (tmp_path / "live" / "control-run.log").read_text()
+    finally:
+        root.setLevel(before_level)
+        for handler in list(root.handlers):
+            if handler not in before:
+                handler.close()
+                root.removeHandler(handler)
+    assert "hello from the runner" in written
+
+
+def test_unwritable_log_directory_does_not_stop_the_runner(
+    monkeypatch, tmp_path, capsys
+):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    monkeypatch.setattr(runner, "LOG_DIRECTORY", str(blocked / "live"))
+    root = logging.getLogger()
+    before = list(root.handlers)
+
+    runner._attach_run_log_file("control-run")
+
+    assert list(root.handlers) == before
+    assert "could not open the runner log file" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("request_limit", "byte_limit_mb"),
     [
@@ -93,6 +264,7 @@ def test_runner_rejects_non_profile_pair_before_pipeline_construction(
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=80,
+        deadline_seconds=0,
     )
 
     with pytest.raises(ValueError, match="Unsupported FBref live"):
@@ -143,6 +315,7 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=16,
+        deadline_seconds=0,
     )
 
     assert runner._run(args) == 0
@@ -226,6 +399,7 @@ def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=16,
+        deadline_seconds=0,
     )
 
     assert runner._run(args) == 0
@@ -284,6 +458,7 @@ def test_runner_caps_new_run_to_daily_bytes_left_after_another_run(
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=80,
+        deadline_seconds=0,
     )
 
     assert runner._run(args) == 0
@@ -370,6 +545,7 @@ def test_runner_never_claims_the_whole_daily_remainder(
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=80,
+        deadline_seconds=0,
     )
 
     assert runner._run(args) == 0
@@ -413,6 +589,7 @@ def test_runner_rejects_stored_profile_mismatch_before_fetcher_construction(
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=80,
+        deadline_seconds=0,
     )
 
     with pytest.raises(RuntimeError, match="profile differs"):
@@ -462,6 +639,7 @@ def test_runner_rejects_persistent_marker_mismatch_before_pipeline_or_meter(
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=80,
+        deadline_seconds=0,
     )
 
     with pytest.raises(RuntimeError, match="persistent HTTP profile differs"):

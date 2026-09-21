@@ -834,6 +834,10 @@ class _AcceptanceReplayMatch:
 class LiveRunResult:
     batches: int = 0
     frontier_closed: bool = False
+    # True when the run stopped because its absolute wall-clock budget ran out
+    # before the batch cap did.  Distinguishes a deliberate, complete stop from
+    # a SIGKILL mid-batch, which publishes no result at all.
+    deadline_reached: bool = False
     fetch: WaveResult = field(default_factory=WaveResult)
     parse: WaveResult = field(default_factory=WaveResult)
 
@@ -841,6 +845,7 @@ class LiveRunResult:
         return {
             "batches": self.batches,
             "frontier_closed": self.frontier_closed,
+            "deadline_reached": self.deadline_reached,
             "fetch": self.fetch.as_dict(),
             "parse": self.parse.as_dict(),
         }
@@ -2348,6 +2353,7 @@ class FBrefPipeline:
         fetcher_factory: Optional[Callable[..., object]] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = _utcnow,
+        monotonic: Callable[[], float] = time.monotonic,
         finalization_guard: Callable[[], object] = nullcontext,
     ) -> None:
         self.control = control
@@ -2363,6 +2369,7 @@ class FBrefPipeline:
         )
         self.sleep = sleep
         self.clock = clock
+        self.monotonic = monotonic
         self.finalization_guard = finalization_guard
         # Instance fields make the default-off rollout and bounded cohort
         # policy directly inspectable and overridable in deterministic tests.
@@ -4068,6 +4075,8 @@ class FBrefPipeline:
         page_kinds: Sequence[str],
         settings: PipelineSettings,
         max_batches: int = 80,
+        deadline_monotonic: Optional[float] = None,
+        on_batch: Optional[Callable[[dict], None]] = None,
     ) -> LiveRunResult:
         """Fetch raw and parse offline in one warm, bounded process.
 
@@ -4113,6 +4122,16 @@ class FBrefPipeline:
             )
             with reconcile_context as reconciliation:
                 for batch in range(1, normalized_batches + 1):
+                    if (
+                        deadline_monotonic is not None
+                        and self.monotonic() >= deadline_monotonic
+                    ):
+                        # Stop between batches, before spending a paid lease on
+                        # work the task timeout would kill mid-flight.  The run
+                        # still unwinds through the finally below and publishes
+                        # its aggregate.
+                        aggregate.deadline_reached = True
+                        break
                     fetched = self.fetch_wave(
                         run_id,
                         worker_id=f"{worker_id}:batch-{batch:02d}",
@@ -4132,6 +4151,14 @@ class FBrefPipeline:
                     aggregate.batches = batch
                     self._merge_wave_result(aggregate.fetch, fetched)
                     self._merge_wave_result(aggregate.parse, parsed)
+                    if on_batch is not None:
+                        try:
+                            on_batch(aggregate.as_dict())
+                        except Exception:  # noqa: BLE001 - telemetry only
+                            logger.warning(
+                                "FBref live waves batch callback failed",
+                                exc_info=True,
+                            )
 
                     if _is_run_mass_redirect(aggregate.fetch):
                         raise FetchWaveError(

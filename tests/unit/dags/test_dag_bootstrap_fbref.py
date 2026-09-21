@@ -71,6 +71,9 @@ class TestFBrefBootstrapTopology:
         # six-hour-five-minute task timeout, so it shares the production-safe
         # 14-wave cap rather than reviving the stale 80-wave contract.
         assert live.op_kwargs["max_batches"] == 14
+        # Bootstrap is manual and has no schedule to protect, so the wall-clock
+        # budget stays off there and the cap remains its only bound.
+        assert live.op_kwargs["deadline_seconds"] == 0
 
     def test_dedicated_pool_is_created_idempotently(self):
         compose = (
