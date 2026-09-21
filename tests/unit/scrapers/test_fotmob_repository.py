@@ -1442,6 +1442,60 @@ def test_confirmed_batch_with_mismatched_count_still_fails_closed():
     assert len(writer.rows["fotmob_field_inventory"]) == 3
 
 
+def test_orphan_mark_does_not_outlive_a_failed_flush_attempt():
+    # Разрешение стереть обломок живёт одну попытку: между упавшим flush и
+    # следующим чужой писатель (юнит кампании истории) дописывает ту самую
+    # пачку до конца и заводит ей строку манифеста. Устаревшая метка стёрла бы
+    # уже подтверждённые строки при следующей записи этой таблицы (#1311).
+    writer = ReconcileWriter(fail_after_commit="fotmob_matches")
+    orphan = _commit(target_key="https://example/m/orphan")
+    later = _commit(target_key="https://example/m/later")
+    writer.rows["fotmob_field_inventory"] = [
+        {"_target_batch_id": orphan.batch_id, "json_path": f"content.f{index}"}
+        for index in range(3)
+    ]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(
+        orphan,
+        [
+            TableRows(
+                "fotmob_matches",
+                [
+                    {
+                        "competition_id": "289",
+                        "source_season_key": "2017/2019",
+                        "match_id": "1",
+                    }
+                ],
+                "matches",
+                ("competition_id", "source_season_key"),
+            ),
+            _inventory_dataset([f"content.f{index}" for index in range(5)]),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="lost writer response"):
+        repository.flush()
+
+    # Чужой писатель довёл пачку до конца: 5 строк и строка манифеста.
+    writer.rows["fotmob_field_inventory"] = [
+        {"_target_batch_id": orphan.batch_id, "json_path": f"content.f{index}"}
+        for index in range(5)
+    ]
+    writer.rows.setdefault("fotmob_ingest_manifest", []).append(orphan.manifest_row())
+
+    repository.commit(
+        later,
+        [_inventory_dataset([f"content.g{index}" for index in range(2)])],
+    )
+    repository.flush()
+
+    counts = {}
+    for row in writer.rows["fotmob_field_inventory"]:
+        batch_id = str(row["_target_batch_id"])
+        counts[batch_id] = counts.get(batch_id, 0) + 1
+    assert counts == {orphan.batch_id: 5, later.batch_id: 2}
+
+
 def test_prior_failure_manifest_cannot_swallow_later_success_with_same_batch_id():
     writer = ReconcileWriter()
     failure = _commit(status=ManifestStatus.SCHEMA_DRIFT)

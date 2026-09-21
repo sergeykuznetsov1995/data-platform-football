@@ -1812,6 +1812,12 @@ class FotMobRepository:
         # A prior process (or a writer that lost its response after commit) may
         # already have landed any prefix of the table writes. Reconcile every
         # deterministic target batch before appending again.
+        #
+        # Разрешение на удаление обломка живёт ровно одну попытку: между
+        # упавшей попыткой и следующей чужой писатель мог дописать ту самую
+        # пачку, и тогда она уже подтверждена — стереть её было бы потерей
+        # данных. Список собирается сверкой заново на каждой попытке (#1311).
+        self._overwrite_batches = {}
         for key in list(self._pending):
             buffered_before = len(self._pending.get(key, ()))
             self._reconcile_pending_table(key)
@@ -1853,7 +1859,6 @@ class FotMobRepository:
             self._index_committed(manifest_row)
         self._pending = {}
         self._pending_manifest = []
-        self._overwrite_batches = {}
         self._pending_targets = {}
         self._pending_entities = {}
         self._pending_raw_entities = {}
