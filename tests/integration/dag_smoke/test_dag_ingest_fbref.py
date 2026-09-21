@@ -76,13 +76,12 @@ class TestFBrefDagBag:
             task_id.startswith(("fetch_wave_", "parse_wave_"))
             for task_id in backfill.task_dict
         )
-        replay_waves = [
-            task_id
+        assert not any(
+            task_id.startswith(("fetch_wave_", "parse_wave_"))
             for task_id in replay.task_dict
-            if task_id.startswith("parse_wave_")
-        ]
-        assert len(replay_waves) == 8
-        assert len(replay.task_dict) == len(replay_waves) + 3
+        )
+        assert "drain_replay" in replay.task_dict
+        assert len(replay.task_dict) == 10
 
 
 @pytest.mark.integration
@@ -127,12 +126,15 @@ class TestFBrefBoundedModes:
         initialize = dag.task_dict["initialize_run"]
         assert initialize.op_kwargs["run_type"] == "backfill"
         assert initialize.op_kwargs["request_limit"] == (
-            "{{ params.request_limit }}"
+            "{{ dag_run.conf.get('request_limit', params.request_limit) }}"
         )
-        assert dag.task_dict["seed_historical_seasons"].downstream_task_ids == {
+        assert dag.task_dict["capture_raw_baseline"].downstream_task_ids == {
             "recover_raw_before_fetch"
         }
         assert dag.task_dict["recover_raw_before_fetch"].downstream_task_ids == {
+            "seed_historical_seasons"
+        }
+        assert dag.task_dict["seed_historical_seasons"].downstream_task_ids == {
             "run_live_waves"
         }
 
@@ -144,18 +146,26 @@ class TestFBrefBoundedModes:
         assert initialize.op_kwargs["run_type"] == "replay"
         assert initialize.op_kwargs["request_limit"] == 0
         assert initialize.op_kwargs["byte_limit_mb"] == 0
-        for task_id, task in dag.task_dict.items():
-            if task_id.startswith("parse_wave_"):
-                assert task.op_kwargs["source_control_run_id"] == (
-                    "{{ params.source_control_run_id }}"
-                )
+        assert dag.task_dict["drain_replay"].op_kwargs[
+            "source_control_run_id"
+        ] == "{{ params.source_control_run_id }}"
 
-    def test_all_three_modes_validate_before_silver(self, fbref_dags):
-        for dag in fbref_dags.values():
+    def test_publishing_modes_validate_before_silver(self, fbref_dags):
+        # Bootstrap has no publication tasks at all (see
+        # test_backfill_and_replay_are_manual), so only the three publishing
+        # DAGs carry this invariant.  Backfill routes validate_run through
+        # choose_publication_path before the export.
+        expected_export_parent = {
+            "dag_ingest_fbref": "validate_run",
+            "dag_backfill_fbref": "choose_publication_path",
+            "dag_replay_fbref": "validate_run",
+        }
+        for dag_id, parent in expected_export_parent.items():
+            dag = fbref_dags[dag_id]
             validate = dag.task_dict["validate_run"]
             export = dag.task_dict["export_publication_scope"]
             trigger = dag.task_dict["trigger_silver_transform"]
-            assert export.upstream_task_ids == {validate.task_id}
+            assert export.upstream_task_ids == {parent}
             assert trigger.upstream_task_ids == {export.task_id}
             assert validate.trigger_rule == "all_success"
             assert trigger.trigger_rule == "all_success"
