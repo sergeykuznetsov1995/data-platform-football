@@ -15,6 +15,7 @@ from typing import get_args, get_type_hints
 import pytest
 
 from scrapers.fbref.camoufox_fetch import GEOIP_BYTE_RESERVATION_BYTES
+from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
     GenericPagePersistItem,
     PAGE_MANIFEST_TABLE,
@@ -12885,6 +12886,7 @@ class _FakePostgresError(Exception):
         ControlStoreConfigError("FBREF_CONTROL_DB_URI is missing"),
         OSError("seaweedfs refused the connection"),
         _FakePostgresError("server closed the connection unexpectedly"),
+        TrinoError("SQL execution failed: coordinator unavailable"),
     ],
     ids=[
         "LeaseLost",
@@ -12893,6 +12895,7 @@ class _FakePostgresError(Exception):
         "ControlStoreConfigError",
         "OSError",
         "psycopg2",
+        "TrinoError",
     ],
 )
 def test_infrastructure_exception_is_never_dead_lettered(tmp_path, exception):
@@ -12946,6 +12949,42 @@ def test_dead_letter_is_fenced_to_the_bytes_that_failed(tmp_path):
         )
 
     assert control.frontier[target_ids[0]]["state"] == "fetched"
+
+
+def test_an_already_retired_target_is_not_dead_lettered_again(tmp_path):
+    # A replay cohort deliberately includes retired targets, and the quarantine
+    # UPDATE succeeds again on an already quarantined row.  Counting that as a
+    # fresh retirement would let one unusable record report progress on every
+    # replay wave until the drain runs out of waves.
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=1)
+    control.frontier[target_ids[0]].update(
+        state="quarantined",
+        last_error_class="ParseContractQuarantined",
+        last_error_message="dead_letter:GenericPersistenceError:review_after=2026-09-28:x",
+    )
+    # Ordinary parsing and raw recovery drop retired targets before the cohort
+    # is formed; the replay cohort keeps them on purpose, so this stands in for
+    # `list_replay_fetches`.
+    control.list_unprocessed_fetches = lambda **kwargs: [
+        {
+            **item,
+            "run_id": str(uuid.UUID(int=1)),
+            "source_run_type": "backfill",
+        }
+        for item in control.fetches
+    ]
+
+    with pytest.raises(ParseWaveError, match=target_ids[0]):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=replace(_settings("backfill"), shard_size=25),
+        )
+
+    # No second retirement event, so the drain sees no progress and stops
+    # instead of looping the same record wave after wave.
+    assert control.events.count(f"contract_quarantine:{target_ids[0]}") == 0
+    assert control.frontier[target_ids[0]]["state"] == "quarantined"
 
 
 def test_state_conflict_on_the_success_marker_dead_letters_the_target(
@@ -13189,4 +13228,15 @@ def test_recovery_cohort_of_the_three_pages_that_killed_the_lane_survives(
     # Atlas: dead-lettered while the duplicate table id still collides, parsed
     # once #1316 gives the manifest key its table instance.  Either way the
     # cohort survives.
-    assert control.frontier[atlas_id]["state"] in {"fetched", "quarantined"}
+    assert (
+        control.frontier[player_id]["last_error_message"]
+    ).startswith("dead_letter:GenericPersistenceError:review_after=")
+    # Atlas: dead-lettered while the duplicate table id still collides, parsed
+    # once #1316 gives the manifest key its table instance.  Either way the
+    # cohort survives, and either way the verdict names its own cause.
+    atlas_state = control.frontier[atlas_id]["state"]
+    assert atlas_state in {"fetched", "quarantined"}
+    if atlas_state == "quarantined":
+        assert control.frontier[atlas_id][
+            "last_error_message"
+        ].startswith("dead_letter:StateConflict:review_after=")

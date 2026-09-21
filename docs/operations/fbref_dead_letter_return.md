@@ -42,14 +42,35 @@ WHERE state = 'quarantined'
 ORDER BY review_after NULLS LAST, target_id;
 ```
 
-Счётчик попыток по цели (колонки нет, считается по журналу обработки):
+### Счётчика попыток разбора НЕТ
+
+`observation_processing` хранит **текущее состояние** наблюдения, а не журнал:
+повторный клейм и повторный отказ обновляют ту же строку
+(`control/store.py`, ветка `UPDATE … SET status='processing' …`). Поэтому
+`count(*) … status='failed'` — это «упало ли сейчас», а не «сколько раз падало»:
+после успешного повтора оно станет нулём. Настоящий счётчик попыток требует
+колонки в `page_frontier` и приедет вместе с ближайшей миграцией control-схемы.
+
+Что есть сейчас:
 
 ```sql
-SELECT count(*) AS failed_attempts
+-- последнее состояние разбора этой цели (одна строка на наблюдение)
+SELECT logical_refresh_id, status, error_class, left(error_message, 120),
+       started_at, updated_at
 FROM fbref_control.observation_processing
 WHERE target_id = :target_id
-  AND status = 'failed';
+ORDER BY updated_at DESC;
+
+-- сколько РАЗ страницу забирали (журнал заборов, append-only)
+SELECT count(*) AS fetch_attempts, max(finished_at) AS last_attempt
+FROM fbref_control.fetch_attempt
+WHERE target_id = :target_id;
 ```
+
+`fetch_attempt` — журнал, но он считает **заборы**, а не разборы; у цели в
+dead-letter забор как раз успешный, а упал разбор. Так что «сколько раз эта
+запись убивала волну» сейчас достоверно не считается нигде — это названо
+недоделанным в #1317.
 
 ## Вернуть цель в очередь
 

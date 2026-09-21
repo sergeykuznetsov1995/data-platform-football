@@ -2361,6 +2361,7 @@ def drain_fbref_replay(
         "seeded": 0,
         "skipped_ineligible": 0,
         "contract_quarantined": 0,
+        "dead_lettered": 0,
     }
     completed_waves = 0
     for _wave_number in range(1, wave_limit + 1):

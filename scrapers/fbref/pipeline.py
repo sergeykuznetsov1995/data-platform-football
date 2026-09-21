@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
+from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
     GenericPagePersistItem,
@@ -1971,6 +1972,10 @@ _INFRASTRUCTURE_EXCEPTIONS: tuple[type, ...] = (
     MigrationError,
     ControlStoreConfigError,
     OSError,
+    # The Bronze writers reach Trino through TrinoTableManager, which wraps
+    # every driver failure in its own class -- it lives outside the `trino`
+    # package, so the module-root rule below never sees it.
+    TrinoError,
 )
 # The reason string carries the review date because page_frontier has no
 # review_at column; a real column comes with the next control migration.
@@ -5574,6 +5579,21 @@ class FBrefPipeline:
             )
         return kept
 
+    def _target_is_already_retired(self, target_id: str) -> bool:
+        """Retiring a retired target is a no-op that would look like progress.
+
+        Ordinary parsing and raw recovery exclude quarantined targets before
+        the cohort is formed, but ``list_replay_fetches`` deliberately does not
+        -- a replay is how a fixed parser is proven against frozen raw, retired
+        targets included.  The quarantine UPDATE succeeds again on a target
+        that is already quarantined, so counting that as a fresh retirement
+        would let one unusable record report progress on every replay wave
+        until the drain runs out of waves.
+        """
+
+        frontier = self.control.get_frontier_target(target_id) or {}
+        return str(frontier.get("state") or "") == "quarantined"
+
     def _failed_claimed_observation(
         self,
         *,
@@ -5646,6 +5666,7 @@ class FBrefPipeline:
         elif (
             self._dead_letter_budget > 0
             and not _is_infrastructure_failure(exc)
+            and not self._target_is_already_retired(record.target_id)
         ):
             # Everything else that dies on one record after its lease was taken
             # -- a persistence error, a typed-parser refusal, a StateConflict on
