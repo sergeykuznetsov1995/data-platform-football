@@ -949,8 +949,16 @@ def _validate_live_candidate(
     passed = quality_gate.get("passed")
     total = quality_gate.get("total")
     warnings = quality_gate.get("warnings")
+    errors = quality_gate.get("errors")
+    # #1312: пока silver заморожен (``SILVER_DQ_BLOCKING = False`` в
+    # dags/utils/fotmob_publication.py), гейт помечает себя ``blocking: False``
+    # и ошибки DQ допустимы — они обязаны быть перечислены в ``errors``.
+    # Без явного ``blocking: False`` действует прежнее правило «ошибок нет».
+    non_blocking = quality_gate.get("blocking") is False
     if (
-        quality_gate.get("errors") != []
+        (errors != [] and not non_blocking)
+        or not isinstance(errors, list)
+        or any(not isinstance(item, str) or not item for item in errors)
         or not isinstance(warnings, list)
         or any(not isinstance(item, str) or not item for item in warnings)
         or type(passed) is not int
@@ -958,7 +966,7 @@ def _validate_live_candidate(
         or passed < 0
         or total <= 0
         or passed > total
-        or total != passed + len(warnings)
+        or total != passed + len(warnings) + len(errors)
     ):
         raise ValueError("live publication candidate quality gate is not clean")
 

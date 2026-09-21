@@ -46,6 +46,7 @@ from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
 from utils.fotmob_publication import (
+    SILVER_DQ_BLOCKING,
     fotmob_publication_writer,
     record_fotmob_silver_candidate,
 )
@@ -718,11 +719,24 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
 
     telegram_dq_summary(report, header="FotMob Silver DQ")
 
-    if report.errors:
+    if report.errors and SILVER_DQ_BLOCKING:
         from airflow.exceptions import AirflowException
         raise AirflowException(
             f"FotMob Silver DQ failed: {len(report.errors)} error(s). "
             + "; ".join(f"{r.name}: {r.details or r.error}" for r in report.errors[:5])
+        )
+    elif report.errors:
+        # #1312: silver заморожен — ошибки DQ пишем как предупреждения, волну
+        # сбора не красим.
+        for r in report.errors:
+            logger.error(
+                "FotMob Silver DQ (non-blocking): %s: %s",
+                r.name, r.details or r.error,
+            )
+        logger.warning(
+            "FotMob Silver DQ: %d error(s) recorded as warnings — silver is "
+            "frozen (#1312), the ingest wave is not reddened",
+            len(report.errors),
         )
 
     return {
@@ -730,6 +744,7 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
         'total': len(report.results),
         'errors': [r.name for r in report.errors],
         'warnings': [r.name for r in report.warnings],
+        'blocking': SILVER_DQ_BLOCKING,
     }
 
 

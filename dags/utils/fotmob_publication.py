@@ -45,6 +45,10 @@ from scrapers.fotmob.source_refresh import (
 
 logger = logging.getLogger(__name__)
 
+# Решение владельца 21.09.2026 (#1312): витрины заморожены 12.09, ошибки DQ silver
+# только предупреждают и не красят волну сбора. Вернуть True при разморозке silver.
+SILVER_DQ_BLOCKING: bool = False
+
 FOTMOB_PUBLICATION_SOURCE = "fotmob"
 FOTMOB_PUBLICATION_SCHEMA = "fotmob-publication-v1"
 FOTMOB_PUBLICATION_DISABLED_SCHEMA = "fotmob-publication-disabled-v1"
@@ -2391,7 +2395,13 @@ def record_fotmob_silver_candidate(
     quality_gate = task_instance.xcom_pull(task_ids="validate_silver_quality")
     if not isinstance(row_gate, Mapping) or row_gate.get("warnings"):
         raise _airflow_exception("FotMob Silver row-count evidence is not clean")
-    if not isinstance(quality_gate, Mapping) or quality_gate.get("errors"):
+    if not isinstance(quality_gate, Mapping):
+        raise _airflow_exception("FotMob Silver quality evidence is not clean")
+    # #1312: пока silver заморожен, ошибки DQ не блокируют кандидата. След
+    # остаётся внутри ``quality_gate`` (ключи ``errors`` и ``blocking``); новых
+    # полей в evidence не добавляем — состав полей кандидата сверяется точным
+    # множеством в scripts/fotmob_acceptance.py (LIVE_CANDIDATE_FIELDS).
+    if quality_gate.get("errors") and SILVER_DQ_BLOCKING:
         raise _airflow_exception("FotMob Silver quality evidence is not clean")
     evidence = {
         "schema": FOTMOB_PUBLICATION_SCHEMA,
