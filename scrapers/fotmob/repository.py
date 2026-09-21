@@ -904,6 +904,10 @@ class FotMobRepository:
         # resurrected after a proven source absence.
         self._pending_raw_entities: dict[tuple[str, str], dict[str, Any]] = {}
         self._pending_rows = 0
+        # Батчи, чьи строки лежат в таблице без строки в манифесте: обломки
+        # прерванной записи. Их физическая запись идёт с DELETE перед INSERT,
+        # чтобы обломок не смешался с полной пачкой (#1311).
+        self._overwrite_batches: dict[str, set[str]] = {}
         # Incremental planning asks "did we already ingest this target?" once
         # per target. As a Trino round-trip that was the single most expensive
         # thing the backfill did (678 of ~1900 queries per 40 min, ~7 queries
@@ -957,6 +961,7 @@ class FotMobRepository:
         *,
         entity_type: str,
         partition_cols: Optional[Sequence[str]] = None,
+        delete_filter: Optional[str] = None,
     ) -> Optional[str]:
         normalized = normalize_rows(rows)
         if not normalized:
@@ -984,6 +989,7 @@ class FotMobRepository:
             partition_spec=[(column, "identity") for column in partitions] or None,
             add_metadata=False,
             source="fotmob",
+            delete_filter=delete_filter,
         )
 
     def commit(
@@ -1600,17 +1606,42 @@ class FotMobRepository:
         if stored is None:
             return
         confirmed: set[str] = set()
+        disputed: dict[str, int] = {}
         for batch_id, expected_count in expected.items():
             actual_count = int(stored.get(batch_id, 0))
             if actual_count == expected_count:
                 confirmed.add(batch_id)
             elif actual_count != 0:
-                raise RuntimeError(
-                    f"{table}: batch {batch_id} has {actual_count} stored rows; "
-                    f"expected either 0 or {expected_count}; inspect: "
-                    f"SELECT * FROM {self.catalog}.{self.schema}.{table} "
-                    f"WHERE _target_batch_id='{batch_id}'"
+                disputed[batch_id] = actual_count
+        if disputed:
+            # Манифест — единственный журнал завершённой пачки. Нет строки в нём
+            # — лежащие строки никогда не были подтверждены, это обломок
+            # прерванной записи, а не порча: его переписывают, а не роняют
+            # волну. Есть строка — расхождение счёта настоящее, отказ закрытый.
+            manifest_counts = self._stored_batch_counts(
+                MANIFEST_TABLE,
+                disputed,
+                batch_column="batch_id",
+            )
+            for batch_id, actual_count in disputed.items():
+                expected_count = expected[batch_id]
+                if manifest_counts is None or int(manifest_counts.get(batch_id, 0)):
+                    raise RuntimeError(
+                        f"{table}: batch {batch_id} has {actual_count} stored "
+                        f"rows; expected either 0 or {expected_count}; inspect: "
+                        f"SELECT * FROM {self.catalog}.{self.schema}.{table} "
+                        f"WHERE _target_batch_id='{batch_id}'"
+                    )
+                logger.warning(
+                    "%s: batch %s has %d stored rows without a manifest row; "
+                    "treating as an orphan of an interrupted write and "
+                    "overwriting with %d rows",
+                    table,
+                    batch_id,
+                    actual_count,
+                    expected_count,
                 )
+                self._overwrite_batches.setdefault(table, set()).add(batch_id)
         if confirmed:
             remaining = [
                 row for row in rows if str(row.get("_target_batch_id")) not in confirmed
@@ -1620,6 +1651,21 @@ class FotMobRepository:
             else:
                 self._pending.pop(key, None)
             self._pending_rows = sum(len(value) for value in self._pending.values())
+
+    def _orphan_delete_filter(self, table: str) -> Optional[str]:
+        """DELETE-условие для обломков прерванной записи этой таблицы (#1311).
+
+        Условие снимается сразу: повторная запись той же таблицы в этом flush
+        не должна стирать только что вставленные строки.
+        """
+
+        batch_ids = self._overwrite_batches.pop(table, None)
+        if not batch_ids:
+            return None
+        values = ", ".join(
+            "'" + batch_id.replace("'", "''") + "'" for batch_id in sorted(batch_ids)
+        )
+        return f"_target_batch_id IN ({values})"
 
     def _reconcile_pending_manifest(self) -> None:
         """Drop manifest rows already committed before an ambiguous failure."""
@@ -1779,6 +1825,7 @@ class FotMobRepository:
                 rows,
                 entity_type=entity_type,
                 partition_cols=partition_cols,
+                delete_filter=self._orphan_delete_filter(table),
             )
             if path:
                 paths.append(path)
@@ -1806,6 +1853,7 @@ class FotMobRepository:
             self._index_committed(manifest_row)
         self._pending = {}
         self._pending_manifest = []
+        self._overwrite_batches = {}
         self._pending_targets = {}
         self._pending_entities = {}
         self._pending_raw_entities = {}

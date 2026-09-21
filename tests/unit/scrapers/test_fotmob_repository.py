@@ -1298,6 +1298,19 @@ class ReconcileWriter(RecordingWriter):
     def write_dataframe(self, df, **kwargs):
         table = kwargs["table"]
         self.calls.append((df.copy(), dict(kwargs)))
+        delete_filter = kwargs.get("delete_filter")
+        if delete_filter:
+            # Тот же DELETE перед INSERT, что делает Trino-писатель (#1311).
+            prefix, _, values = delete_filter.partition(" IN (")
+            assert prefix == "_target_batch_id", delete_filter
+            deleted = {
+                value.strip().strip("'") for value in values.rstrip(")").split(",")
+            }
+            self.rows[table] = [
+                row
+                for row in self.rows.get(table, [])
+                if str(row.get("_target_batch_id")) not in deleted
+            ]
         self.rows.setdefault(table, []).extend(df.to_dict("records"))
         if self.fail_after_commit == table:
             self.fail_after_commit = None
@@ -1341,6 +1354,9 @@ def test_restart_fails_closed_on_partial_or_duplicate_target_batch_count():
         {"_target_batch_id": commit.batch_id},
         {"_target_batch_id": commit.batch_id},
     ]
+    # Пачка подтверждена журналом: расхождение счёта — настоящая порча, а не
+    # обломок прерванной записи (#1311).
+    writer.rows["fotmob_ingest_manifest"] = [commit.manifest_row()]
     repository = FotMobRepository(writer=writer, batch_size=50)
     repository.commit(
         commit,
@@ -1362,6 +1378,68 @@ def test_restart_fails_closed_on_partial_or_duplicate_target_batch_count():
 
     with pytest.raises(RuntimeError, match="expected either 0 or 1"):
         repository.flush()
+
+
+def _inventory_dataset(json_paths):
+    return TableRows(
+        "fotmob_field_inventory",
+        [_inventory_row(json_path) for json_path in json_paths],
+        "field_inventory",
+        ("target_type",),
+    )
+
+
+def test_orphan_batch_without_manifest_row_is_overwritten():
+    # Боевая волна 20.09 (#1311): в fotmob_field_inventory с 16.09 лежали 172
+    # строки одного матча без строки в манифесте, и сверка роняла всю волну.
+    # Незавершённая пачка — обломок прерванной записи: её переписывают.
+    writer = ReconcileWriter()
+    commit = _commit(target_key="https://example/m/orphan")
+    writer.rows["fotmob_field_inventory"] = [
+        {"_target_batch_id": commit.batch_id, "json_path": f"content.f{index}"}
+        for index in range(3)
+    ]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(
+        commit,
+        [_inventory_dataset([f"content.f{index}" for index in range(5)])],
+    )
+
+    repository.flush()
+
+    stored = writer.rows["fotmob_field_inventory"]
+    assert len(stored) == 5, "обломок обязан быть стёрт, а не смешан с пачкой"
+    assert {row["json_path"] for row in stored} == {
+        f"content.f{index}" for index in range(5)
+    }
+    assert all(str(row["_target_batch_id"]) == commit.batch_id for row in stored)
+    assert [row["batch_id"] for row in writer.rows["fotmob_ingest_manifest"]] == [
+        commit.batch_id
+    ]
+
+
+def test_confirmed_batch_with_mismatched_count_still_fails_closed():
+    # Зеркало предыдущего теста: строка в манифесте есть, значит пачка была
+    # завершена, и другое число строк — настоящая порча, а не обломок.
+    writer = ReconcileWriter()
+    commit = _commit(target_key="https://example/m/confirmed")
+    writer.rows["fotmob_field_inventory"] = [
+        {"_target_batch_id": commit.batch_id, "json_path": f"content.f{index}"}
+        for index in range(3)
+    ]
+    writer.rows["fotmob_ingest_manifest"] = [commit.manifest_row()]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(
+        commit,
+        [_inventory_dataset([f"content.f{index}" for index in range(5)])],
+    )
+
+    with pytest.raises(
+        RuntimeError, match="has 3 stored rows; expected either 0 or 5"
+    ):
+        repository.flush()
+
+    assert len(writer.rows["fotmob_field_inventory"]) == 3
 
 
 def test_prior_failure_manifest_cannot_swallow_later_success_with_same_batch_id():
@@ -2291,6 +2369,9 @@ def test_reparsed_seasons_collide_under_one_batch_and_fail_the_reconcile():
         for index in range(46)
     ]
     writer.rows["fotmob_competition_seasons"] = stored
+    # Пачка завершена (строка в журнале есть) — значит 46 строк не обломок
+    # прерванной записи, и сверка обязана падать закрыто (#1311).
+    writer.rows["fotmob_ingest_manifest"] = [commit.manifest_row()]
     repository = FotMobRepository(writer=writer, batch_size=500)
     repository.commit(
         commit,
