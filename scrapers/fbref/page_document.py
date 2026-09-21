@@ -220,6 +220,28 @@ def response_owns_target_page(html: str, *, canonical_url: str) -> bool:
     )
 
 
+def _has_verified_zero_table_season_stats_page(
+    html: str,
+    *,
+    canonical_url: Optional[str],
+) -> bool:
+    """Accept a real tableless season-stats page without accepting a shell.
+
+    FBref publishes a season stat route (keepers, misc, playingtime, ...) for a
+    competition edition that has no rows yet: a full 200 response whose body is
+    the page header and nothing else.  The generic contract cannot tell that
+    from a proxy/error shell by shape alone, so the page has to prove it is this
+    target's own address -- the same positive evidence the archive branch of
+    ``_historical_contract_rejection`` demands.
+
+    The typed season gate (``typed_bronze.parse_season_stats_html``) accepts the
+    very same proof, so a page that clears this gate cannot fall over on
+    ``TypedBronzeError`` one step later.
+    """
+
+    return response_owns_target_page(html, canonical_url=canonical_url or "")
+
+
 def _entity_ids(tag: Tag) -> Dict[str, str]:
     """Extract stable source IDs without interpreting display text."""
 
@@ -557,6 +579,7 @@ def parse_page_document(
     page_kind: str,
     source_ids: Optional[Mapping[str, object]] = None,
     content_hash: Optional[str] = None,
+    canonical_url: Optional[str] = None,
     parser_version: str = PAGE_DOCUMENT_VERSION,
 ) -> PageDocument:
     """Inventory every source table without transport or persistence access."""
@@ -591,9 +614,10 @@ def parse_page_document(
             ordinal += 1
 
     # Generic Bronze inventories source structure; page-kind parsers own its
-    # meaning. Competition card grids and single-match season pages are valid
-    # zero-table shapes, while an empty semantic table is still evidence that
-    # must be persisted with Availability.EMPTY (not rejected pre-semantics).
+    # meaning. Competition card grids, single-match season pages and a stat
+    # route of an edition with no rows yet are valid zero-table shapes, while
+    # an empty semantic table is still evidence that must be persisted with
+    # Availability.EMPTY (not rejected pre-semantics).
     if not tables:
         valid_zero_table_page = (
             page_kind in _ZERO_TABLE_SEMANTIC_PAGE_KINDS
@@ -602,6 +626,11 @@ def parse_page_document(
                 html,
                 target_id=target_id,
                 source_ids=source_ids,
+            )
+            or page_kind == "season_stats"
+            and _has_verified_zero_table_season_stats_page(
+                html,
+                canonical_url=canonical_url,
             )
         )
         if not valid_zero_table_page:

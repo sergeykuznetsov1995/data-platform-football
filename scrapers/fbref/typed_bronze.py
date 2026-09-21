@@ -47,6 +47,7 @@ from scrapers.fbref.match_parser import (
     MatchParseResult,
     parse_match_html as parse_existing_match_html,
 )
+from scrapers.fbref.page_document import response_owns_target_page
 
 
 # v4 (#949): paired with PAGE_DOCUMENT_VERSION v4.  c75879b started propagating
@@ -555,6 +556,7 @@ def parse_season_stats_html(
     *,
     context: TypedSourceContext,
     stat_route: str,
+    canonical_url: Optional[str] = None,
 ) -> Dict[str, DatasetParseResult]:
     """Parse stable typed datasets from one already-discovered season page."""
 
@@ -571,13 +573,23 @@ def parse_season_stats_html(
     try:
         comment_tables = extract_tables_from_comments(soup)
         has_any_table = soup.find("table") is not None or bool(comment_tables)
-        valid_zero_table_page = (
-            not has_any_table
-            and has_valid_zero_table_season_signature(
+        # Two proofs, one verdict: the season signature (heading/canonical plus
+        # a competition-history backlink) and the target's own canonical
+        # address.  The generic gate in ``page_document`` accepts a tableless
+        # season-stats page on the second one, so accepting it here too keeps a
+        # page that cleared generic from dying on TypedBronzeError.
+        valid_zero_table_page = not has_any_table and (
+            has_valid_zero_table_season_signature(
                 html_text,
                 competition_id=context.source_competition_id,
                 season_id=context.source_season_id,
                 season_label=context.season_label,
+            )
+            or (
+                bool(canonical_url)
+                and response_owns_target_page(
+                    html_text, canonical_url=str(canonical_url)
+                )
             )
         )
         for category, stat_type in extracts:

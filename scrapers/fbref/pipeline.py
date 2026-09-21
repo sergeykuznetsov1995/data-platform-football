@@ -4934,6 +4934,7 @@ class FBrefPipeline:
             page_kind=record.page_kind,
             source_ids=record.source_ids,
             content_hash=record.content_hash,
+            canonical_url=record.canonical_url,
         )
         if (
             page.target_id != record.target_id
@@ -5178,7 +5179,10 @@ class FBrefPipeline:
                     else str(record.source_ids.get("stat_route") or "")
                 )
                 parsed = parse_typed_season_stats_html(
-                    html, context=context, stat_route=stat_route
+                    html,
+                    context=context,
+                    stat_route=stat_route,
+                    canonical_url=record.canonical_url,
                 )
                 if any(item.status.value == "error" for item in parsed.values()):
                     raise TypedBronzeError("Typed season parser failed")

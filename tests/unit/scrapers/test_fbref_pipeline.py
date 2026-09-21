@@ -5758,6 +5758,84 @@ def test_single_match_season_zero_table_shape_reaches_not_applicable_semantics(
     assert len(typed_writer.calls) == 1
 
 
+SEASON_STATS_KEEPERS_URL = (
+    "https://fbref.com/en/comps/657/keepers/"
+    "Africa-Cup-of-Nations-qualification-Stats"
+)
+# Byte-shape of the real capture that has been killing recover_raw_before_fetch
+# since 16.09 (fbref:season_stats:657:2027:keepers, content_hash e9cfdc24…):
+# a full 200 response for a stat route the edition has not populated yet.
+TABLELESS_SEASON_STATS_HTML = """
+<html><head>
+  <link rel="canonical" href="{url}" />
+  <meta property="og:url" content="{url}">
+</head><body>
+  <div id="meta"><h1>2027 Africa Cup of Nations qualification Goalkeeper Stats</h1></div>
+</body></html>
+""".format(url=SEASON_STATS_KEEPERS_URL)
+
+
+def _keepers_season_stats_target():
+    return page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season_stats",
+            canonical_url=SEASON_STATS_KEEPERS_URL,
+            source_ids={
+                "competition_id": "657",
+                "season_id": "2027",
+                "stat_route": "keepers",
+            },
+        )
+    )
+
+
+def test_season_stats_zero_table_page_with_proven_identity_parses_empty(
+    tmp_path,
+):
+    # Mirror of the season-page case above for the stat routes: both the
+    # generic and the typed gate accept the page on the same evidence, so it
+    # must not fall over on TypedBronzeError one step after clearing generic.
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = _keepers_season_stats_target()
+    refresh, record = _commit_for_parse(
+        raw, target, TABLELESS_SEASON_STATS_HTML
+    )
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    writer = ContractWriter()
+    typed_writer = FakeTypedWriter()
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=writer,
+        typed_adapter=FakeTypedAdapter(typed_writer),
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season_stats"],
+        settings=_settings("current"),
+    )
+
+    assert result.parsed == 1
+    assert result.failures == []
+    assert writer.pages[0][0].errors == ()
+    assert writer.pages[0][0].tables == ()
+    assert len(typed_writer.calls) == 1
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
 def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)

@@ -392,3 +392,80 @@ def test_target_without_a_canonical_url_can_never_prove_ownership():
     assert not response_owns_target_page(
         TABLELESS_SQUAD_ARCHIVE, canonical_url=""
     )
+
+
+SEASON_STATS_URL = (
+    "https://fbref.com/en/comps/657/keepers/"
+    "Africa-Cup-of-Nations-qualification-Stats"
+)
+# Shape of the real 657:2027:keepers capture (content_hash e9cfdc24…): a full
+# 200 response for an edition whose stat route has no rows yet.
+TABLELESS_SEASON_STATS = """
+<html><head>
+  <link rel="canonical"
+    href="https://fbref.com/en/comps/657/keepers/Africa-Cup-of-Nations-qualification-Stats" />
+  <meta property="og:url"
+    content="https://fbref.com/en/comps/657/keepers/Africa-Cup-of-Nations-qualification-Stats">
+</head><body>
+  <div id="meta"><h1>2027 Africa Cup of Nations qualification Goalkeeper Stats</h1></div>
+</body></html>
+"""
+
+
+def test_tableless_season_stats_page_with_proven_identity_is_valid():
+    page = parse_page_document(
+        TABLELESS_SEASON_STATS,
+        target_id="fbref:season_stats:657:2027:keepers",
+        page_kind="season_stats",
+        source_ids={
+            "competition_id": "657",
+            "season_id": "2027",
+            "stat_route": "keepers",
+        },
+        canonical_url=SEASON_STATS_URL,
+    )
+
+    assert page.errors == ()
+    assert page.tables == ()
+
+
+def test_tableless_season_stats_shell_without_identity_is_rejected():
+    shell = "<html><body><p>temporary source shell</p></body></html>"
+
+    page = parse_page_document(
+        shell,
+        target_id="fbref:season_stats:657:2027:keepers",
+        page_kind="season_stats",
+        source_ids={"competition_id": "657", "season_id": "2027"},
+        canonical_url=SEASON_STATS_URL,
+    )
+
+    assert page.errors == ("page_contract:no_tables",)
+
+
+def test_tableless_season_stats_without_a_canonical_url_is_rejected():
+    # A caller that cannot name the target's own address has no evidence to
+    # tell this page from a 200 shell.
+    page = parse_page_document(
+        TABLELESS_SEASON_STATS,
+        target_id="fbref:season_stats:657:2027:keepers",
+        page_kind="season_stats",
+        source_ids={"competition_id": "657", "season_id": "2027"},
+    )
+
+    assert page.errors == ("page_contract:no_tables",)
+
+
+def test_tableless_season_stats_of_another_target_is_rejected():
+    page = parse_page_document(
+        TABLELESS_SEASON_STATS,
+        target_id="fbref:season_stats:657:2027:misc",
+        page_kind="season_stats",
+        source_ids={"competition_id": "657", "season_id": "2027"},
+        canonical_url=(
+            "https://fbref.com/en/comps/657/misc/"
+            "Africa-Cup-of-Nations-qualification-Stats"
+        ),
+    )
+
+    assert page.errors == ("page_contract:no_tables",)
