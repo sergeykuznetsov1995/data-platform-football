@@ -2805,11 +2805,13 @@ def test_second_batch_guard_enter_fault_closes_first_then_fails_all_leases(
 
     control.guard_latest_content = guard_with_second_enter_fault
 
-    result = pipeline.parse_wave(
-        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
-    )
-    assert result.failures == []
-    assert result.dead_lettered == 2
+    # A fence failure is the control store breaking, not a property of these
+    # pages, so it stays loud: dead-lettering them would shrink the crawl scope
+    # because one database call failed.
+    with pytest.raises(ParseWaveError, match="content guard did not hold"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
 
     first_exit = control.events.index(f"content_guard_exit:{ordered[0]}")
     rollback = control.events.index(
@@ -13336,3 +13338,53 @@ def test_guard_exit_fault_still_fails_a_wave_that_dead_lettered_every_item(
         )
 
     assert len(records) == 2
+
+
+def test_two_observations_of_one_target_retire_it_once_and_keep_the_wave(
+    tmp_path,
+):
+    # One recovery cohort can hold several logical_refresh_ids of the same
+    # target.  The first retires it; the second must neither count again nor
+    # fail the wave, or the cohort dies on the very record this fix isolates.
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    url = "https://fbref.com/en/squads/d5120000/1938/Austria-Stats"
+    target = PageTarget(
+        source="fbref",
+        page_kind="squad",
+        target_id="fbref:squad:d5120000",
+        canonical_url=url,
+        source_ids={"squad_id": "d5120000"},
+    )
+    html = _archive_shell(url, identity=False)
+    for _ in range(2):
+        refresh, record = _commit_for_parse(raw, target, html)
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["squad"],
+        settings=replace(_settings("backfill"), shard_size=25),
+    )
+
+    assert result.failures == []
+    assert result.dead_lettered == 1
+    assert control.events.count(f"contract_quarantine:{target.target_id}") == 1
+    assert control.frontier[target.target_id]["state"] == "quarantined"

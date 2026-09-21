@@ -354,6 +354,15 @@ class TypedPromotionDeferred(PipelineError):
     """An active target refresh prevents an atomic typed promotion."""
 
 
+class ContentGuardFailure(PipelineError):
+    """The frontier fence around a cohort did not open or close cleanly.
+
+    This is a control-store failure, never a property of the page it was
+    guarding, so it must stay loud: retiring the targets it was holding would
+    shrink the crawl scope because a database call failed.
+    """
+
+
 class SourceContractRejected(ParseWaveError):
     """One page's own published shape can never satisfy its parser contract.
 
@@ -1967,6 +1976,7 @@ def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
 _INFRASTRUCTURE_EXCEPTION_ROOTS = frozenset({"psycopg2", "pyarrow", "trino"})
 _INFRASTRUCTURE_EXCEPTIONS: tuple[type, ...] = (
     TypedPromotionDeferred,
+    ContentGuardFailure,
     LeaseLost,
     BudgetExceeded,
     MigrationError,
@@ -2359,6 +2369,7 @@ class FBrefPipeline:
         self._scope_reconcile_deferred = False
         self._scope_reconcile_pending = False
         self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
+        self._dead_lettered_targets: set[str] = set()
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
@@ -5680,6 +5691,22 @@ class FBrefPipeline:
                     contract_quarantined=1,
                     failures=tuple(failures),
                 )
+        elif record.target_id in self._dead_lettered_targets:
+            # One cohort can hold several observations of the same target, so
+            # a target this wave has already retired shows up again.  Retiring
+            # it twice would double-count progress; failing would bring back
+            # the very wave death this fix removes.
+            logger.info(
+                "Target %s was already dead-lettered by this wave",
+                record.target_id,
+            )
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=(
+                    stale_typed_observations_skipped
+                ),
+                failures=tuple(failures),
+            )
         elif (
             self._dead_letter_budget > 0
             and not _is_infrastructure_failure(exc)
@@ -5715,6 +5742,7 @@ class FBrefPipeline:
                 )
             if dead_lettered:
                 self._dead_letter_budget -= 1
+                self._dead_lettered_targets.add(record.target_id)
                 logger.warning(
                     "Dead-lettered %s after %s: %s",
                     record.target_id,
@@ -6279,7 +6307,17 @@ class FBrefPipeline:
                 and item.record.logical_refresh_id not in scheduled
             ]
             for item in unfinished:
-                finish_failures.append((item, lock_errors[0], {}))
+                # The fence failure belongs to the guard, not to these pages:
+                # naming it keeps them out of the dead-letter path, which would
+                # otherwise retire a whole batch because one database call
+                # failed.
+                guard_failure = ContentGuardFailure(
+                    "content guard did not hold for "
+                    f"{item.record.target_id}: "
+                    f"{type(lock_errors[0]).__name__}: {lock_errors[0]}"
+                )
+                guard_failure.__cause__ = lock_errors[0]
+                finish_failures.append((item, guard_failure, {}))
             if not unfinished:
                 if outcomes:
                     # An exit failure after durable completion cannot safely
@@ -6781,6 +6819,7 @@ class FBrefPipeline:
         # instance counter bounds how much scope a single wave may retire
         # before the run stops instead of silently shrinking further.
         self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
+        self._dead_lettered_targets = set()
         stateful_run_id = run_id
         stateful_run_type = settings.run_type
         if acceptance_replay and settings.run_type != "replay":
