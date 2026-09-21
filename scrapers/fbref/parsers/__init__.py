@@ -33,6 +33,7 @@ from scrapers.fbref.parsers.id_extractors import (
 from scrapers.fbref.parsers.finders import (
     find_schedule_table,
     find_team_stats_table,
+    team_stats_table_ids,
     find_player_stats_table,
     parse_shots_table,
     parse_lineup_table,
@@ -65,6 +66,7 @@ __all__ = [
     # finders
     'find_schedule_table',
     'find_team_stats_table',
+    'team_stats_table_ids',
     'find_player_stats_table',
     'parse_shots_table',
     'parse_lineup_table',

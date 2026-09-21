@@ -2941,6 +2941,163 @@ def test_guard_exit_fault_after_completion_is_loud_and_replay_claims_nothing(
     assert after_replay == before_replay
 
 
+@pytest.mark.parametrize("in_comment", [False, True])
+@pytest.mark.parametrize("identical", [False, True])
+@pytest.mark.parametrize("alternate_control", [False, True])
+def test_repeated_table_ids_keep_distinct_immutable_manifests_on_replay(
+    tmp_path, in_comment, identical, alternate_control
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    destination = FakeControl(raw) if alternate_control else control
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="squad",
+        canonical_url="https://fbref.com/en/squads/7c76bc53/2009-2010/Squad-Stats",
+        source_ids={"squad_id": "7c76bc53"},
+    ))
+
+    def table(size):
+        rows = "".join(
+            f'<tr><td data-stat="squad">Team {index}</td></tr>'
+            for index in range(size)
+        )
+        return (
+            '<table id="results2009-20103111_overall">'
+            '<thead><tr><th data-stat="squad">Squad</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    html = table(5) + table(5 if identical else 6)
+    if in_comment:
+        html = f"<!-- {html} -->"
+    _, record = _commit_for_parse(raw, target, html)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    page = pipeline._parse_generic(html, record)
+    manifests = {}
+
+    def immutable_manifest(**values):
+        key = tuple(values[name] for name in (
+            "target_id", "content_hash", "parser_version", "dataset"
+        ))
+        previous = manifests.setdefault(key, values)
+        if previous != values:
+            raise StateConflict("A completed dataset manifest is immutable")
+
+    destination.record_dataset_manifest = immutable_manifest
+    # A failed historical attempt already committed the first table's legacy
+    # manifest. Recovery must retain it and finish every other table offline.
+    first = replace(page, tables=page.tables[:1])
+    kwargs = {"control": destination} if alternate_control else {}
+    pipeline._record_generic_table_results(record, first, **kwargs)
+    previous = dict(manifests)
+    pipeline._record_generic_table_results(record, page, **kwargs)
+    pipeline._record_generic_table_results(record, page, **kwargs)
+
+    assert len(manifests) == 2
+    assert all(manifests[key] == value for key, value in previous.items())
+    assert sorted(value["row_count"] for value in manifests.values()) == (
+        [5, 5] if identical else [5, 6]
+    )
+    assert {value["availability"] for value in manifests.values()} == (
+        {"unknown", "duplicate"} if identical else {"unknown"}
+    )
+    assert next(iter(previous))[-1] == (
+        f"table:{page.tables[0].table_id}:{page.tables[0].source_location}"
+    )
+    if alternate_control:
+        assert control.manifests == []
+
+
+def test_history_recovery_replays_real_atlas_raw_with_repeated_table_ids(tmp_path):
+    fixture = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures/fbref/squads/atlas-2009-2010-7a795569.html.gz"
+    )
+    html_bytes = gzip.decompress(fixture.read_bytes())
+    assert hashlib.sha256(html_bytes).hexdigest() == (
+        "7a79556910ea5f403efb7850d0754e60d18e270ddcb7109a5f2a32e0a6d21167"
+    )
+    html = html_bytes.decode("utf-8")
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = PageTarget(
+        source="fbref",
+        target_id="fbref:squad:7c76bc53:a667b6f50d092c9f077c",
+        canonical_url=(
+            "https://fbref.com/en/squads/7c76bc53/2009-2010/c31/Atlas-Stats-Liga-MX"
+        ),
+        page_kind="squad",
+        source_ids={"squad_id": "7c76bc53"},
+    )
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[target.target_id] = {
+        "target_id": target.target_id,
+        "state": "fetched",
+        "refresh_policy": "historical_once",
+        "last_content_hash": record.content_hash,
+        "last_logical_refresh_id": refresh,
+    }
+    control.fetches = [{
+        "run_id": str(uuid.uuid4()),
+        "source_run_type": "backfill",
+        "target_id": target.target_id,
+        "page_kind": "squad",
+        "logical_refresh_id": refresh,
+        "content_hash": record.content_hash,
+    }]
+    manifests = {}
+
+    def immutable_manifest(**values):
+        key = tuple(values[name] for name in (
+            "target_id", "content_hash", "parser_version", "dataset"
+        ))
+        previous = manifests.setdefault(key, values)
+        if previous != values:
+            raise StateConflict("A completed dataset manifest is immutable")
+
+    def forbidden_transport(*_args):
+        raise AssertionError("history raw recovery must not use the network")
+
+    control.record_dataset_manifest = immutable_manifest
+    writer = FakeWriter()
+    pipeline = FBrefPipeline(
+        control, raw, generic_writer=writer, fetcher_factory=forbidden_transport
+    )
+    page = pipeline._parse_generic(html, record)
+    repeated = [
+        table for table in page.tables
+        if table.table_id == "results2009-20103111_overall"
+        and table.source_location == "dom"
+    ]
+    assert [table.row_count for table in repeated] == [5, 6]
+    # The failed production attempt already persisted this exact prefix.
+    pipeline._record_generic_table_results(
+        record, replace(page, tables=page.tables[:6])
+    )
+    previous = dict(manifests)
+    run_id = str(uuid.uuid4())
+    result = pipeline.recover_unprocessed_wave(
+        run_id, page_kinds=["squad"], settings=_settings("backfill")
+    )
+    replay = pipeline.recover_unprocessed_wave(
+        run_id, page_kinds=["squad"], settings=_settings("backfill")
+    )
+
+    assert result.parsed == 1
+    assert result.failures == []
+    assert replay.cohort_size == replay.parsed == 0
+    table_manifests = [
+        value for value in manifests.values()
+        if value["dataset"].startswith("table:")
+    ]
+    assert len(table_manifests) == len(page.tables)
+    assert all(manifests[key] == value for key, value in previous.items())
+    assert len(writer.pages) == 1
+    assert {value["status"] for value in control.observations.values()} == {
+        "succeeded"
+    }
+
+
 def test_completed_manifest_conflict_does_not_mask_processing_failure(
     tmp_path,
 ):

@@ -527,8 +527,10 @@ def run(_args):
         state="active",
         tail_reserved=True,
     )
-    print("READY", flush=True)
     try:
+        # The parent may signal immediately after READY. Announce readiness
+        # only once the session's finally handler is installed.
+        print("READY", flush=True)
         while True:
             time.sleep(1)
     finally:

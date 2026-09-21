@@ -7475,6 +7475,12 @@ class ControlStore:
                        ) AS never_fetched_targets,
                        count(*) FILTER (WHERE NOT within_sla)
                            AS stale_targets,
+                       count(*) FILTER (
+                           WHERE NOT within_sla AND last_fetched_at IS NULL
+                       ) AS stale_never_fetched_targets,
+                       count(*) FILTER (
+                           WHERE NOT within_sla AND last_fetched_at IS NOT NULL
+                       ) AS aged_targets,
                        count(*) FILTER (WHERE within_sla)
                            AS fresh_targets,
                        min(last_fetched_at) AS oldest_last_fetched_at
@@ -7492,6 +7498,10 @@ class ControlStore:
                     "never_fetched_targets": int(
                         row["never_fetched_targets"] or 0
                     ),
+                    "stale_never_fetched_targets": int(
+                        row["stale_never_fetched_targets"] or 0
+                    ),
+                    "aged_targets": int(row["aged_targets"] or 0),
                     "oldest_last_fetched_at": row.get(
                         "oldest_last_fetched_at"
                     ),
@@ -7516,6 +7526,13 @@ class ControlStore:
                     row["never_fetched_targets"]
                     for row in freshness_by_kind.values()
                 ),
+                "stale_never_fetched_targets": sum(
+                    row["stale_never_fetched_targets"]
+                    for row in freshness_by_kind.values()
+                ),
+                "aged_targets": sum(
+                    row["aged_targets"] for row in freshness_by_kind.values()
+                ),
             }
             freshness_totals["all_within_sla"] = (
                 freshness_totals["stale_targets"] == 0
@@ -7538,6 +7555,13 @@ class ControlStore:
                 ),
                 "never_fetched_targets": sum(
                     row["never_fetched_targets"] for row in publication_rows
+                ),
+                "stale_never_fetched_targets": sum(
+                    row["stale_never_fetched_targets"]
+                    for row in publication_rows
+                ),
+                "aged_targets": sum(
+                    row["aged_targets"] for row in publication_rows
                 ),
             }
             publication_freshness["all_within_sla"] = (

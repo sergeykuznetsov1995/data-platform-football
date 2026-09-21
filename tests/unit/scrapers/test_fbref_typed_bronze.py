@@ -1721,3 +1721,51 @@ def test_module_has_no_transport_or_url_construction_dependency() -> None:
     assert "requests" not in source
     assert "FBrefFetcher" not in source
     assert "_fetch_page" not in source
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("stat_route", "foreign_table_id"),
+    [
+        ("shooting", "stats_squads_shooting_against"),
+        ("passing", "stats_squads_passing_types_for"),
+    ],
+)
+def test_foreign_team_table_is_not_published_rather_than_schema_drift(
+    stat_route, foreign_table_id
+) -> None:
+    """The finder and the source-table probe must share one table identity.
+
+    ``find_team_stats_table`` refuses the opponent's ``*_against`` table and
+    the neighbouring ``passing_types`` route.  If ``_season_source_tables``
+    still claimed those as "the source table for this dataset", the page would
+    be reported as ``SeasonPageSchemaDriftError`` and
+    ``FBrefPipeline._parse_typed`` would raise ``TypedBronzeError`` for the
+    whole page — turning a silently wrong value into a dead wave.
+    """
+
+    html = f"""
+    <html><body>
+    <table id="{foreign_table_id}">
+      <thead><tr><th>Squad</th><th>Gls</th></tr></thead>
+      <tbody><tr>
+        <th data-stat="team"><a href="/en/squads/18bb7c10/Arsenal">Arsenal</a></th>
+        <td data-stat="goals">99</td>
+      </tr></tbody>
+    </table>
+    </body></html>
+    """
+
+    parsed = typed.parse_season_stats_html(
+        html,
+        context=typed.TypedSourceContext("9", "2025-2026"),
+        stat_route=stat_route,
+    )
+
+    team = parsed[f"team_{stat_route}"]
+    assert team.status == DatasetStatus.NOT_APPLICABLE
+    assert team.reason == "typed_source_table_not_published"
+    assert team.error_type is None
+    assert not any(
+        result.status == DatasetStatus.ERROR for result in parsed.values()
+    )

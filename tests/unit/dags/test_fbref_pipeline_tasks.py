@@ -1685,6 +1685,87 @@ def test_current_scope_freshness_fails_closed_for_stale_or_missing_evidence(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("aggregate_only", [False, True])
+@pytest.mark.parametrize("exact_split", [False, True])
+def test_fresh_never_fetched_target_cannot_hide_aged_fetched_target(
+    monkeypatch, aggregate_only, exact_split
+):
+    from airflow.exceptions import AirflowFailException
+
+    summary = _freshness_summary(stale_kind="schedule")
+    metrics = summary["freshness_by_page_kind"]["schedule"]
+    metrics.update(total_targets=2, fresh_targets=1, never_fetched_targets=1)
+    aggregate = summary["current_scope_freshness"]
+    aggregate["total_targets"] += 1
+    aggregate["fresh_targets"] += 1
+    aggregate["never_fetched_targets"] = 1
+    if exact_split:
+        for value in (metrics, aggregate):
+            value.update(aged_targets=1, stale_never_fetched_targets=0)
+    if aggregate_only:
+        summary.pop("freshness_by_page_kind")
+        summary["publication_scope_freshness"] = aggregate
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store",
+        lambda: SimpleNamespace(get_run_summary=lambda _run: summary),
+    )
+
+    with pytest.raises(AirflowFailException, match="aged=1"):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__mixed_freshness",
+            dag_id="dag_ingest_fbref", run_type="current",
+        )
+
+
+@pytest.mark.unit
+def test_legacy_freshness_split_stays_advisory_for_nonpublishing_history(
+    monkeypatch,
+):
+    summary = _nonpublishing_summary(stale_kind="schedule")
+    summary["freshness_by_page_kind"]["schedule"]["never_fetched_targets"] = 1
+    summary["current_scope_freshness"]["never_fetched_targets"] = 1
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store",
+        lambda: SimpleNamespace(get_run_summary=lambda _run: summary),
+    )
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="manual__legacy_history",
+        dag_id="dag_backfill_fbref", run_type="backfill", enforce=False,
+    )
+    assert result["status"] == "advisory"
+    assert "current_scope:legacy_freshness_split=conservative" in result["warnings"]
+    assert result["publication_scope_freshness"]["aged_targets"] == 1
+    assert result["publication_scope_freshness"]["aged_targets_exact"] is False
+    assert result["publication_scope_freshness"]["stale_never_fetched_targets"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("split", [
+    {"aged_targets": 0},
+    {"stale_never_fetched_targets": 1},
+    {"aged_targets": None, "stale_never_fetched_targets": 1},
+    {"aged_targets": 0, "stale_never_fetched_targets": 0},
+    {"aged_targets": 0, "stale_never_fetched_targets": 1},
+])
+def test_freshness_gate_rejects_incomplete_or_inconsistent_exact_split(
+    monkeypatch, split
+):
+    summary = _freshness_summary(stale_kind="schedule")
+    summary.pop("freshness_by_page_kind")
+    # stale=1, never=0 means only aged=1 + stale_never=0 is possible.
+    summary["current_scope_freshness"].update(split)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store",
+        lambda: SimpleNamespace(get_run_summary=lambda _run: summary),
+    )
+    with pytest.raises(ValueError, match="FBref freshness stale split"):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__invalid_split",
+            dag_id="dag_ingest_fbref", run_type="current",
+        )
+
+
+@pytest.mark.unit
 def test_current_scope_freshness_treats_never_fetched_backlog_as_warning(
     monkeypatch,
 ):
@@ -1695,6 +1776,12 @@ def test_current_scope_freshness_treats_never_fetched_backlog_as_warning(
     summary["freshness_by_page_kind"]["schedule"]["never_fetched_targets"] = 7
     summary["current_scope_freshness"]["stale_targets"] = 7
     summary["current_scope_freshness"]["never_fetched_targets"] = 7
+    for value in (
+        summary["freshness_by_page_kind"]["schedule"],
+        summary["current_scope_freshness"],
+    ):
+        value.update(aged_targets=0, stale_never_fetched_targets=7)
+        value["total_targets"] += 6
     control = MagicMock()
     control.get_run_summary.return_value = summary
     monkeypatch.setattr(
@@ -1711,6 +1798,8 @@ def test_current_scope_freshness_treats_never_fetched_backlog_as_warning(
     assert any("expansion_backlog=7" in w for w in result["warnings"])
     assert result["freshness_by_page_kind"]["schedule"]["aged_targets"] == 0
     assert result["publication_scope_freshness"]["aged_targets"] == 0
+    assert result["publication_scope_freshness"]["aged_targets_exact"] is True
+    assert result["publication_scope_freshness"]["stale_never_fetched_targets"] == 7
 
 
 @pytest.mark.unit
@@ -1726,6 +1815,12 @@ def test_current_scope_freshness_still_fails_on_genuinely_aged_pages(
     summary["freshness_by_page_kind"]["schedule"]["never_fetched_targets"] = 4
     summary["current_scope_freshness"]["stale_targets"] = 9
     summary["current_scope_freshness"]["never_fetched_targets"] = 4
+    for value in (
+        summary["freshness_by_page_kind"]["schedule"],
+        summary["current_scope_freshness"],
+    ):
+        value.update(aged_targets=5, stale_never_fetched_targets=4)
+        value["total_targets"] += 8
     control = MagicMock()
     control.get_run_summary.return_value = summary
     monkeypatch.setattr(

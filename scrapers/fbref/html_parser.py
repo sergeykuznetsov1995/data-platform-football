@@ -27,6 +27,7 @@ from scrapers.fbref.parsers import (  # noqa: F401,F811 — compatibility re-exp
     extract_match_urls_from_schedule,
     find_schedule_table,
     find_team_stats_table,
+    team_stats_table_ids,
     find_player_stats_table,
     parse_shots_table,
     parse_lineup_table,

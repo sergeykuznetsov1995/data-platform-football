@@ -13,6 +13,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 
 from scrapers.fbref.parsers.finders import (
+    find_team_stats_table,
     parse_events_from_scorebox,
     parse_lineup_table,
     parse_shots_table,
@@ -25,6 +26,69 @@ from scrapers.fbref.parsers.finders import (
     _parse_pct,
     _parse_of_stat,
 )
+from scrapers.fbref.html_parser import extract_tables_from_comments
+
+
+@pytest.mark.parametrize(
+    ("requested_stat", "table_id"),
+    [
+        ("shooting", "stats_squads_shooting_against"),
+        ("passing", "stats_squads_passing_types_for"),
+    ],
+)
+@pytest.mark.parametrize("commented", [False, True])
+def test_team_stats_rejects_another_perspective_or_stat_route(
+    requested_stat, table_id, commented
+):
+    table = f"""
+    <table id="{table_id}">
+      <thead><tr><th>Squad</th><th>Gls</th></tr></thead>
+      <tbody><tr>
+        <th data-stat="team"><a href="/en/squads/18bb7c10/Arsenal">Arsenal</a></th>
+        <td data-stat="goals">99</td>
+      </tr></tbody>
+    </table>
+    """
+    soup = BeautifulSoup(
+        f"<!-- {table} -->" if commented else table, "html.parser"
+    )
+    assert find_team_stats_table(
+        soup, extract_tables_from_comments(soup), requested_stat
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("requested_stat", "table_id"),
+    [
+        ("stats", "stats_squads_standard_for"),
+        ("shooting", "stats_squads_shooting_for"),
+        ("shooting", "stats_squads_shooting"),
+        ("playingtime", "stats_squads_playing_time_for"),
+        ("playingtime", "stats_squads_playingtime_for"),
+    ],
+)
+@pytest.mark.parametrize("commented", [False, True])
+def test_team_stats_preserves_supported_source_table_ids(
+    requested_stat, table_id, commented
+):
+    table = f"""
+    <table id="{table_id}">
+      <thead><tr><th>Squad</th><th>Gls</th></tr></thead>
+      <tbody><tr>
+        <th data-stat="team"><a href="/en/squads/18bb7c10/Arsenal">Arsenal</a></th>
+        <td data-stat="goals">42</td>
+      </tr></tbody>
+    </table>
+    """
+    soup = BeautifulSoup(
+        f"<!-- {table} -->" if commented else table, "html.parser"
+    )
+    frame = find_team_stats_table(
+        soup, extract_tables_from_comments(soup), requested_stat
+    )
+    assert frame is not None
+    assert frame.iloc[0]["Gls"] == 42
+    assert frame.iloc[0]["team_id"] == "18bb7c10"
 
 
 # ---------------------------------------------------------------------------
