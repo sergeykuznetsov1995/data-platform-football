@@ -1578,6 +1578,42 @@ def test_recovery_drain_counts_a_retired_target_as_progress(monkeypatch):
 
 
 @pytest.mark.unit
+def test_recovery_drain_counts_dead_lettered_as_progress(monkeypatch):
+    dead_lettered = MagicMock()
+    dead_lettered.as_dict.return_value = {
+        "cohort_size": 3,
+        "claimed": 3,
+        "parsed": 0,
+        "contract_quarantined": 0,
+        "dead_lettered": 3,
+    }
+    drained = MagicMock()
+    drained.as_dict.return_value = {"cohort_size": 0, "parsed": 0}
+    pipeline = MagicMock()
+    pipeline.recover_unprocessed_wave.side_effect = [dead_lettered, drained]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    # A dead letter retires the target exactly like a contract quarantine, so
+    # a cohort that only dead-letters must not look stalled (#1317).
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__dead-letter-recovery",
+        dag_id="dag_ingest_fbref",
+        page_kinds=["season_stats"],
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+    )
+
+    assert recovered["dead_lettered"] == 3
+    assert recovered["recovery_stalled"] is False
+    assert pipeline.recover_unprocessed_wave.call_count == 2
+    pipeline.fetch_wave.assert_not_called()
+
+
+@pytest.mark.unit
 def test_current_scope_freshness_accepts_complete_per_kind_evidence(monkeypatch):
     control = MagicMock()
     control.get_run_summary.return_value = _freshness_summary()

@@ -1862,8 +1862,12 @@ def run_recovery_wave(
             break
         parsed = int(result.get("parsed") or 0)
         # Retiring a target the parser can never accept shrinks the cohort for
-        # good, so it is progress even though nothing was parsed.
-        retired = int(result.get("contract_quarantined") or 0)
+        # good, so it is progress even though nothing was parsed.  A
+        # dead-lettered record retires the same way (#1317), so the drain must
+        # count it too or a cohort that only dead-letters looks stalled.
+        retired = int(result.get("contract_quarantined") or 0) + int(
+            result.get("dead_lettered") or 0
+        )
         aggregate["batches"] = int(aggregate["batches"]) + 1
         for key, value in result.items():
             if key == "failures":
@@ -2357,6 +2361,7 @@ def drain_fbref_replay(
         "seeded": 0,
         "skipped_ineligible": 0,
         "contract_quarantined": 0,
+        "dead_lettered": 0,
     }
     completed_waves = 0
     for _wave_number in range(1, wave_limit + 1):

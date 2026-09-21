@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
+from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
     GenericPagePersistItem,
@@ -30,9 +31,12 @@ from scrapers.fbref.control import (
     BudgetExceeded,
     CompetitionRegistryEntry,
     ControlStore,
+    ControlStoreConfigError,
     CurrentSeasonRemediationEvidence,
     FrontierProvenance,
     FrontierTarget,
+    LeaseLost,
+    MigrationError,
     SeasonAlias,
     SeasonRegistryEntry,
     StateConflict,
@@ -348,6 +352,15 @@ class RunValidationError(PipelineError):
 
 class TypedPromotionDeferred(PipelineError):
     """An active target refresh prevents an atomic typed promotion."""
+
+
+class ContentGuardFailure(PipelineError):
+    """The frontier fence around a cohort did not open or close cleanly.
+
+    This is a control-store failure, never a property of the page it was
+    guarding, so it must stay loud: retiring the targets it was holding would
+    shrink the crawl scope because a database call failed.
+    """
 
 
 class SourceContractRejected(ParseWaveError):
@@ -715,6 +728,7 @@ class WaveResult:
     requeued_session_exhaustion: int = 0
     deferred_dead_clearance: int = 0
     contract_quarantined: int = 0
+    dead_lettered: int = 0
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
@@ -734,6 +748,7 @@ class _ProcessedObservation:
     seeded: int = 0
     skipped_ineligible: int = 0
     contract_quarantined: int = 0
+    dead_lettered: int = 0
     failures: tuple[str, ...] = ()
 
 
@@ -1950,10 +1965,69 @@ def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
     )
 
 
+# A record that fails after its lease is taken is dead-lettered so the rest of
+# the wave survives -- but only when the failure is a property of the page.
+# These are properties of the world around it: retiring the target would bury a
+# live page because a gateway blinked, and the very next run would find nothing
+# to retry.  Driver classes are matched through their root module because
+# psycopg2/pyarrow/trino are never imported here (both stores take injected
+# connections), and classification goes by exception type, never by message
+# text (#1122/#1124).
+_INFRASTRUCTURE_EXCEPTION_ROOTS = frozenset({"psycopg2", "pyarrow", "trino"})
+_INFRASTRUCTURE_EXCEPTIONS: tuple[type, ...] = (
+    TypedPromotionDeferred,
+    ContentGuardFailure,
+    LeaseLost,
+    BudgetExceeded,
+    MigrationError,
+    ControlStoreConfigError,
+    OSError,
+    # The Bronze writers reach Trino through TrinoTableManager, which wraps
+    # every driver failure in its own class -- it lives outside the `trino`
+    # package, so the module-root rule below never sees it.
+    TrinoError,
+)
+# The reason string carries the review date because page_frontier has no
+# review_at column; a real column comes with the next control migration.
+DEAD_LETTER_REVIEW_DAYS = 7
+DEAD_LETTER_REASON_PREFIX = "dead_letter:"
+
+
+def _is_infrastructure_failure(exc: BaseException) -> bool:
+    """Tell "the world broke" from "this page cannot be used".
+
+    The whole cause chain is read, not just the outermost class: an
+    infrastructure failure routinely arrives wrapped.  A Trino outage inside
+    the typed writer, for instance, sends the error path to record a failure
+    manifest, which the store refuses on an already completed dataset -- the
+    caller then sees a ``StateConflict`` with the real cause hanging off
+    ``__context__``.  Retiring the target on that reading would bury a live
+    page for an outage, so any infrastructure link anywhere in the chain keeps
+    the failure loud.
+    """
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _INFRASTRUCTURE_EXCEPTIONS):
+            return True
+        if any(
+            cls.__module__.split(".", 1)[0] in _INFRASTRUCTURE_EXCEPTION_ROOTS
+            for cls in type(current).__mro__
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _is_mass_contract_rejection(result: "WaveResult") -> bool:
     """Tell a few unusable archived pages from the source changing shape."""
 
-    retired = result.contract_quarantined
+    # Both verdicts shrink the crawl scope the same way, so the guard has to
+    # weigh their sum: five contract quarantines plus five dead letters is the
+    # source moving under the parser just as much as ten of either.
+    retired = result.contract_quarantined + result.dead_lettered
     return (
         retired > MAX_ROUTINE_CONTRACT_QUARANTINES
         and retired * 2 > result.cohort_size
@@ -2294,6 +2368,8 @@ class FBrefPipeline:
         # policy directly inspectable and overridable in deterministic tests.
         self._scope_reconcile_deferred = False
         self._scope_reconcile_pending = False
+        self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
+        self._dead_lettered_targets: set[str] = set()
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
@@ -4934,6 +5010,7 @@ class FBrefPipeline:
             page_kind=record.page_kind,
             source_ids=record.source_ids,
             content_hash=record.content_hash,
+            canonical_url=record.canonical_url,
         )
         if (
             page.target_id != record.target_id
@@ -5178,7 +5255,10 @@ class FBrefPipeline:
                     else str(record.source_ids.get("stat_route") or "")
                 )
                 parsed = parse_typed_season_stats_html(
-                    html, context=context, stat_route=stat_route
+                    html,
+                    context=context,
+                    stat_route=stat_route,
+                    canonical_url=record.canonical_url,
                 )
                 if any(item.status.value == "error" for item in parsed.values()):
                     raise TypedBronzeError("Typed season parser failed")
@@ -5527,6 +5607,21 @@ class FBrefPipeline:
             )
         return kept
 
+    def _target_is_already_retired(self, target_id: str) -> bool:
+        """Retiring a retired target is a no-op that would look like progress.
+
+        Ordinary parsing and raw recovery exclude quarantined targets before
+        the cohort is formed, but ``list_replay_fetches`` deliberately does not
+        -- a replay is how a fixed parser is proven against frozen raw, retired
+        targets included.  The quarantine UPDATE succeeds again on a target
+        that is already quarantined, so counting that as a fresh retirement
+        would let one unusable record report progress on every replay wave
+        until the drain runs out of waves.
+        """
+
+        frontier = self.control.get_frontier_target(target_id) or {}
+        return str(frontier.get("state") or "") == "quarantined"
+
     def _failed_claimed_observation(
         self,
         *,
@@ -5596,6 +5691,83 @@ class FBrefPipeline:
                     contract_quarantined=1,
                     failures=tuple(failures),
                 )
+        elif not _is_infrastructure_failure(exc):
+            # Classification comes first, and every way of not reporting a
+            # failure lives under it.  A failure of the world around the page
+            # -- a dead gateway, a lost lease, a frontier fence that did not
+            # hold -- must reach `failures` whichever branch below would
+            # otherwise apply, or a wave finishes green after the control store
+            # broke.  Ordering this the other way round is what made the same
+            # defect appear three times (#1317 review rounds 1, 3 and 4).
+            if record.target_id in self._dead_lettered_targets:
+                # One cohort can hold several observations of the same target,
+                # so a target this wave has already retired shows up again.
+                # Retiring it twice would double-count progress; failing would
+                # bring back the very wave death this fix removes.
+                logger.info(
+                    "Target %s was already dead-lettered by this wave",
+                    record.target_id,
+                )
+                return _ProcessedObservation(
+                    typed_promoted=typed_promoted,
+                    stale_typed_observations_skipped=(
+                        stale_typed_observations_skipped
+                    ),
+                    failures=tuple(failures),
+                )
+            if (
+                self._dead_letter_budget > 0
+                and not self._target_is_already_retired(record.target_id)
+            ):
+                # Everything else that dies on one record after its
+                # lease was taken -- a persistence error, a typed-parser
+                # refusal, a StateConflict on the success marker of an
+                # already-finished page -- used to raise ParseWaveError
+                # and end the wave, so one page held the whole lane
+                # hostage run after run (#1317).  Retire that one target
+                # instead and keep going; the verdict is reversible
+                # (state='quarantined', see
+                # docs/operations/fbref_dead_letter_return.md) and it is
+                # fenced to the exact bytes that failed, so a newer fetch
+                # is never retired on a stale reading.
+                review_after = (
+                    self.clock() + timedelta(days=DEAD_LETTER_REVIEW_DAYS)
+                ).date().isoformat()
+                reason = (
+                    f"{DEAD_LETTER_REASON_PREFIX}{type(exc).__name__}"
+                    f":review_after={review_after}:{str(exc)[:200]}"
+                )
+                dead_lettered = False
+                try:
+                    dead_lettered = (
+                        self.control.quarantine_contract_rejected_target(
+                            record.target_id,
+                            content_hash=record.content_hash,
+                            reason=reason,
+                        )
+                    )
+                except Exception as dead_letter_exc:
+                    failures.append(
+                        f"{record.target_id}:dead_letter:"
+                        f"{type(dead_letter_exc).__name__}:{dead_letter_exc}"
+                    )
+                if dead_lettered:
+                    self._dead_letter_budget -= 1
+                    self._dead_lettered_targets.add(record.target_id)
+                    logger.warning(
+                        "Dead-lettered %s after %s: %s",
+                        record.target_id,
+                        type(exc).__name__,
+                        reason,
+                    )
+                    return _ProcessedObservation(
+                        typed_promoted=typed_promoted,
+                        stale_typed_observations_skipped=(
+                            stale_typed_observations_skipped
+                        ),
+                        dead_lettered=1,
+                        failures=tuple(failures),
+                    )
         failures.append(f"{record.target_id}:{type(exc).__name__}:{exc}")
         return _ProcessedObservation(
             typed_promoted=typed_promoted,
@@ -6133,6 +6305,7 @@ class FBrefPipeline:
                 except Exception as exc:
                     finish_failures.append((item, exc, progress))
 
+        pending_lock_failure: Optional[BaseException] = None
         if lock_errors:
             scheduled = {
                 item.record.logical_refresh_id
@@ -6145,22 +6318,41 @@ class FBrefPipeline:
                 and item.record.logical_refresh_id not in scheduled
             ]
             for item in unfinished:
-                finish_failures.append((item, lock_errors[0], {}))
-            if not unfinished and outcomes:
-                # An exit failure after durable completion cannot safely turn
-                # a succeeded lease back into failed. Keep its state, but make
-                # the wave report the frontier-fence failure loudly.
-                first_key = next(iter(outcomes))
-                first = outcomes[first_key]
-                lock_error = lock_errors[0]
-                outcomes[first_key] = replace(
-                    first,
-                    failures=first.failures
-                    + (
-                        f"{items[0].record.target_id}:content_guard:"
-                        f"{type(lock_error).__name__}:{lock_error}",
-                    ),
+                # The fence failure belongs to the guard, not to these pages:
+                # naming it keeps them out of the dead-letter path, which would
+                # otherwise retire a whole batch because one database call
+                # failed.
+                guard_failure = ContentGuardFailure(
+                    "content guard did not hold for "
+                    f"{item.record.target_id}: "
+                    f"{type(lock_errors[0]).__name__}: {lock_errors[0]}"
                 )
+                guard_failure.__cause__ = lock_errors[0]
+                finish_failures.append((item, guard_failure, {}))
+            if not unfinished:
+                if outcomes:
+                    # An exit failure after durable completion cannot safely
+                    # turn a succeeded lease back into failed. Keep its state,
+                    # but make the wave report the frontier-fence failure
+                    # loudly.
+                    first_key = next(iter(outcomes))
+                    first = outcomes[first_key]
+                    lock_error = lock_errors[0]
+                    outcomes[first_key] = replace(
+                        first,
+                        failures=first.failures
+                        + (
+                            f"{items[0].record.target_id}:content_guard:"
+                            f"{type(lock_error).__name__}:{lock_error}",
+                        ),
+                    )
+                else:
+                    # Every item is already scheduled as a failure, so there is
+                    # no finished outcome to hang the guard error on yet. Those
+                    # failures may each be dead-lettered (#1317), and then the
+                    # wave would finish green while the frontier fence never
+                    # closed. Carry the error past the fencing loop below.
+                    pending_lock_failure = lock_errors[0]
 
         # Failure fencing uses its own control transaction, so it must happen
         # only after every frontier lock is gone. This includes ordinary
@@ -6177,6 +6369,18 @@ class FBrefPipeline:
                         "stale_typed_observations_skipped", 0
                     ),
                 )
+            )
+        if pending_lock_failure is not None and outcomes:
+            first_key = next(iter(outcomes))
+            first = outcomes[first_key]
+            outcomes[first_key] = replace(
+                first,
+                failures=first.failures
+                + (
+                    f"{items[0].record.target_id}:content_guard:"
+                    f"{type(pending_lock_failure).__name__}:"
+                    f"{pending_lock_failure}",
+                ),
             )
         return [outcomes[item.record.logical_refresh_id] for item in items]
 
@@ -6224,6 +6428,7 @@ class FBrefPipeline:
         result.seeded += outcome.seeded
         result.skipped_ineligible += outcome.skipped_ineligible
         result.contract_quarantined += outcome.contract_quarantined
+        result.dead_lettered += outcome.dead_lettered
         result.failures.extend(outcome.failures)
 
     def _prepare_acceptance_replay_match(
@@ -6621,6 +6826,11 @@ class FBrefPipeline:
         """Parse and persist a bounded handoff using raw storage only."""
 
         result = WaveResult()
+        # One wave, one budget: the wave body is single-threaded, so a plain
+        # instance counter bounds how much scope a single wave may retire
+        # before the run stops instead of silently shrinking further.
+        self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
+        self._dead_lettered_targets = set()
         stateful_run_id = run_id
         stateful_run_type = settings.run_type
         if acceptance_replay and settings.run_type != "replay":
@@ -6851,8 +7061,9 @@ class FBrefPipeline:
             # shrinking the crawl scope is the one outcome worse than stopping.
             raise ParseWaveError(
                 "Mass source contract rejection: "
-                f"{result.contract_quarantined} of {result.cohort_size} "
-                "targets retired in one wave"
+                f"{result.contract_quarantined} contract-quarantined and "
+                f"{result.dead_lettered} dead-lettered of "
+                f"{result.cohort_size} targets retired in one wave"
             )
         return result
 
@@ -7508,6 +7719,7 @@ def _validate_oversize_evidence_wave_result(
             "requeued_session_exhaustion",
             "deferred_dead_clearance",
             "contract_quarantined",
+            "dead_lettered",
             "moved_pages_skipped",
             "deferred_match_not_found",
             "terminal_oversized_pages",
