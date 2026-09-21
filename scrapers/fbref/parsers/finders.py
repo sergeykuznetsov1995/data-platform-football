@@ -96,6 +96,35 @@ def find_schedule_table(
     return combined.reset_index(drop=True)
 
 
+def team_stats_table_ids(stat_type: str) -> list:
+    """Exact FBref table IDs that hold this team's own requested statistics.
+
+    Single source of truth for table identity: both the parser
+    (:func:`find_team_stats_table`) and the typed-bronze source-table probe
+    must agree, otherwise a page whose only match is the opponent's
+    ``*_against`` table looks "present but unparsed" to one side and absent to
+    the other.
+    """
+
+    # FBref uses 'playing_time' with underscore, we use 'playingtime'
+    stat_type_mapping = {
+        'playingtime': 'playing_time',
+    }
+    fbref_stat_type = stat_type_mapping.get(stat_type, stat_type)
+
+    table_ids = [
+        f'stats_squads_{fbref_stat_type}_for',
+        f'stats_squads_{stat_type}_for',  # fallback to original
+        f'stats_squads_{fbref_stat_type}',
+        f'stats_squads_{stat_type}',
+    ]
+    # Only add standard fallback for standard stats — otherwise it returns
+    # the wrong table (Standard Stats instead of the target stat type)
+    if stat_type in ('stats', 'standard'):
+        table_ids.insert(2, 'stats_squads_standard_for')
+    return table_ids
+
+
 def find_team_stats_table(
     soup: BeautifulSoup,
     comment_tables: Dict[str, BeautifulSoup],
@@ -112,27 +141,8 @@ def find_team_stats_table(
     Returns:
         DataFrame or None
     """
-    # Map stat_type to FBref table naming convention
-    # FBref uses 'playing_time' with underscore, we use 'playingtime'
-    stat_type_mapping = {
-        'playingtime': 'playing_time',
-    }
-    fbref_stat_type = stat_type_mapping.get(stat_type, stat_type)
-
-    # Possible table IDs for squad stats
-    table_ids = [
-        f'stats_squads_{fbref_stat_type}_for',
-        f'stats_squads_{stat_type}_for',  # fallback to original
-        f'stats_squads_{fbref_stat_type}',
-        f'stats_squads_{stat_type}',
-    ]
-    # Only add standard fallback for standard stats — otherwise it returns
-    # the wrong table (Standard Stats instead of the target stat type)
-    if stat_type in ('stats', 'standard'):
-        table_ids.insert(2, 'stats_squads_standard_for')
-
     df = None
-    for table_id in table_ids:
+    for table_id in team_stats_table_ids(stat_type):
         df = parse_table(soup, table_id, comment_tables, extract_team_ids=True)
         if df is not None and not df.empty:
             return df

@@ -38,6 +38,7 @@ from scrapers.fbref.html_parser import (
     find_player_stats_table,
     find_schedule_table,
     find_team_stats_table,
+    team_stats_table_ids,
 )
 from scrapers.fbref.match_parser import (
     DatasetParseResult,
@@ -408,22 +409,18 @@ def _season_source_tables(
 ):
     source_type = "playing_time" if stat_type == "playingtime" else stat_type
     if category == "team":
-        exact = {
-            f"stats_squads_{source_type}_for",
-            f"stats_squads_{stat_type}_for",
-            f"stats_squads_{source_type}",
-            f"stats_squads_{stat_type}",
-        }
-        if stat_type in {"stats", "standard"}:
-            exact.add("stats_squads_standard_for")
+        # Same identity the parser uses (finders.team_stats_table_ids): a
+        # substring probe here would call the opponent's ``*_against`` table
+        # or another route such as ``passing_types`` "the source table for
+        # this dataset".  Since the parser can no longer read those, the page
+        # would be reported as SeasonPageSchemaDriftError and
+        # pipeline._parse_typed would abort the whole page instead of marking
+        # one dataset as not published.
+        exact = set(team_stats_table_ids(stat_type))
         return _matching_tables(
             soup,
             comment_tables,
-            lambda table_id: table_id in exact
-            or (
-                "squads" in table_id
-                and (stat_type in table_id or source_type in table_id)
-            ),
+            lambda table_id: table_id in exact,
         )
     exact = {
         f"stats_{source_type}",
