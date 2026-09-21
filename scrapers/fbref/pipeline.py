@@ -4990,12 +4990,22 @@ class FBrefPipeline:
         control=None,
     ) -> None:
         control_store = self.control if control is None else control
+        seen_tables: set[tuple[str, str]] = set()
         for table in page.tables:
+            identity = (table.table_id, table.source_location)
+            dataset = f"table:{table.table_id}:{table.source_location}"
+            if identity in seen_tables:
+                # FBref may repeat a source ID within the same DOM/comment.
+                # Preserve the first table's already-committed legacy key;
+                # later instances have independent rows/availability and must
+                # not overwrite that immutable verdict during raw recovery.
+                dataset += f":instance:{table.table_instance_id}"
+            seen_tables.add(identity)
             control_store.record_dataset_manifest(
                 target_id=record.target_id,
                 content_hash=record.content_hash,
                 parser_version=page.parser_version,
-                dataset=f"table:{table.table_id}:{table.source_location}",
+                dataset=dataset,
                 availability=table.availability.value,
                 parse_status="succeeded",
                 persistence_status="succeeded",

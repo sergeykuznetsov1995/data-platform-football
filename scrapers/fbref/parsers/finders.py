@@ -137,13 +137,10 @@ def find_team_stats_table(
         if df is not None and not df.empty:
             return df
 
-    # Try finding table with 'squads' in ID
-    for key in comment_tables.keys():
-        if 'squads' in key.lower() and stat_type in key.lower():
-            df = parse_table(soup, key, comment_tables, extract_team_ids=True)
-            if df is not None and not df.empty:
-                return df
-
+    # Exact IDs above cover the supported source and legacy spellings.  A
+    # substring fallback also matches the opponent's ``*_against`` table or
+    # another route such as ``passing_types`` when ``passing`` is requested,
+    # silently writing those values as this team's requested statistics.
     return None
 
 

@@ -941,6 +941,29 @@ def _non_negative_metric(payload: Mapping[str, object], key: str) -> int:
     return value
 
 
+def _freshness_stale_split(
+    metrics: Mapping[str, object],
+) -> tuple[int, int | None, bool]:
+    """Separate aged copies from expansion only with measured intersections."""
+
+    stale = _non_negative_metric(metrics, "stale_targets")
+    never = _non_negative_metric(metrics, "never_fetched_targets")
+    keys = {"aged_targets", "stale_never_fetched_targets"}
+    present = keys.intersection(metrics)
+    if not present:
+        # Older producers count ALL never-fetched targets, including fresh
+        # additions inside SLA. Subtracting that population hides aged copies.
+        # Preserve rolling-upgrade support with a conservative upper bound.
+        return stale, None, False
+    if present != keys or any(metrics[key] is None for key in keys):
+        raise ValueError("Incomplete FBref freshness stale split")
+    aged = _non_negative_metric(metrics, "aged_targets")
+    stale_never = _non_negative_metric(metrics, "stale_never_fetched_targets")
+    if aged + stale_never != stale or stale_never > never:
+        raise ValueError("Inconsistent FBref freshness stale split")
+    return aged, stale_never, True
+
+
 def validate_fbref_current_scope_freshness(
     *,
     airflow_run_id: str,
@@ -1038,13 +1061,9 @@ def validate_fbref_current_scope_freshness(
                 )
             if total == 0:
                 violations.append(f"{kind}:total_targets=0")
-            # The gate exists to catch data we already hold going stale, not
-            # to punish the scope for growing.  A target that was never
-            # fetched is expansion backlog: it has no aged copy to protect,
-            # and while the registry widens (#1145 Э5) it dominates ``stale``
-            # and turns every daily run red without a single rotten page.
-            # Fallback split until Э7 lands exact counters.
-            aged = max(0, stale - never)
+            aged, stale_never, exact_split = _freshness_stale_split(raw_metrics)
+            if stale and not exact_split:
+                warnings.append(f"{kind}:legacy_freshness_split=conservative")
             if aged:
                 violations.append(
                     f"{kind}:stale={stale},never_fetched={never},aged={aged}"
@@ -1059,7 +1078,9 @@ def validate_fbref_current_scope_freshness(
                 "total_targets": total,
                 "stale_targets": stale,
                 "never_fetched_targets": never,
+                "stale_never_fetched_targets": stale_never,
                 "aged_targets": aged,
+                "aged_targets_exact": exact_split,
             }
 
     normalized_aggregate = {}
@@ -1068,7 +1089,9 @@ def validate_fbref_current_scope_freshness(
         stale = _non_negative_metric(aggregate, "stale_targets")
         never = _non_negative_metric(aggregate, "never_fetched_targets")
         within_sla = aggregate.get("all_within_sla") is True
-        aged = max(0, stale - never)
+        aged, stale_never, exact_split = _freshness_stale_split(aggregate)
+        if stale and not exact_split:
+            warnings.append("current_scope:legacy_freshness_split=conservative")
         if total == 0:
             violations.append("current_scope:total_targets=0")
         if aged:
@@ -1090,7 +1113,9 @@ def validate_fbref_current_scope_freshness(
             "total_targets": total,
             "stale_targets": stale,
             "never_fetched_targets": never,
+            "stale_never_fetched_targets": stale_never,
             "aged_targets": aged,
+            "aged_targets_exact": exact_split,
             "all_within_sla": within_sla,
         }
 

@@ -1,5 +1,6 @@
 import inspect
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 
@@ -1334,6 +1335,59 @@ def test_scope_reconciliation_reopens_only_its_own_quarantine_and_keeps_evidence
     assert factory.connections[0].committed is True
 
 
+def test_freshness_sql_and_summary_preserve_exact_stale_intersections():
+    run_id = str(uuid.uuid4())
+    database = sqlite3.connect(":memory:")
+    database.row_factory = sqlite3.Row
+    database.execute(
+        "CREATE TABLE evaluated_scope (page_kind TEXT, sla_seconds INTEGER, "
+        "last_fetched_at TEXT, within_sla INTEGER)"
+    )
+    # A fresh new target must not cancel an old fetched copy. The old never
+    # fetched row is expansion debt; player enrichment stays outside publication.
+    database.executemany("INSERT INTO evaluated_scope VALUES (?, ?, ?, ?)", [
+        ("schedule", 86400, "2026-08-01", 0),
+        ("schedule", 86400, None, 1),
+        ("schedule", 86400, None, 0),
+        ("player", 2592000, "2026-07-01", 0),
+    ])
+
+    def handler(sql, _params):
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if ") AS missing" in sql:
+            return [{"count": 0}], 1
+        if "FROM evaluated_scope" in sql:
+            # Execute the production aggregate SQL over the four evaluated
+            # source states, without PostgreSQL/network or mocked counters.
+            select = "SELECT page_kind, max(sla_seconds)" + sql.split(
+                "SELECT page_kind, max(sla_seconds)", 1
+            )[1]
+            rows = [dict(row) for row in database.execute(select)]
+            return rows, len(rows)
+        return [], 0
+
+    try:
+        store, _ = make_store(handler)
+        summary = store.get_run_summary(run_id)
+    finally:
+        database.close()
+
+    schedule = summary["freshness_by_page_kind"]["schedule"]
+    assert schedule["stale_targets"] == 2
+    assert schedule["never_fetched_targets"] == 2
+    assert schedule["stale_never_fetched_targets"] == 1
+    assert schedule["aged_targets"] == 1
+    assert summary["current_scope_freshness"]["aged_targets"] == 2
+    assert summary["publication_scope_freshness"]["aged_targets"] == 1
+    for scope in ("current_scope_freshness", "publication_scope_freshness"):
+        assert summary[scope]["stale_never_fetched_targets"] == 1
+        assert summary[scope]["stale_targets"] == (
+            summary[scope]["aged_targets"]
+            + summary[scope]["stale_never_fetched_targets"]
+        )
+
+
 def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
     run_id = str(uuid.uuid4())
     executions = []
@@ -1382,6 +1436,8 @@ def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
                 "fresh_targets": 1,
                 "stale_targets": 0,
                 "never_fetched_targets": 0,
+                "stale_never_fetched_targets": 0,
+                "aged_targets": 0,
                 "oldest_last_fetched_at": None,
             }], 1
         if "AS crawlable" in sql:
