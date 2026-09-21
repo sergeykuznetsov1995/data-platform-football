@@ -45,6 +45,10 @@ from scrapers.fotmob.source_refresh import (
 
 logger = logging.getLogger(__name__)
 
+# Решение владельца 21.09.2026 (#1312): витрины заморожены 12.09, ошибки DQ silver
+# только предупреждают и не красят волну сбора. Вернуть True при разморозке silver.
+SILVER_DQ_BLOCKING: bool = False
+
 FOTMOB_PUBLICATION_SOURCE = "fotmob"
 FOTMOB_PUBLICATION_SCHEMA = "fotmob-publication-v1"
 FOTMOB_PUBLICATION_DISABLED_SCHEMA = "fotmob-publication-disabled-v1"
@@ -2391,7 +2395,10 @@ def record_fotmob_silver_candidate(
     quality_gate = task_instance.xcom_pull(task_ids="validate_silver_quality")
     if not isinstance(row_gate, Mapping) or row_gate.get("warnings"):
         raise _airflow_exception("FotMob Silver row-count evidence is not clean")
-    if not isinstance(quality_gate, Mapping) or quality_gate.get("errors"):
+    if not isinstance(quality_gate, Mapping):
+        raise _airflow_exception("FotMob Silver quality evidence is not clean")
+    quality_errors = list(quality_gate.get("errors") or [])
+    if quality_errors and SILVER_DQ_BLOCKING:
         raise _airflow_exception("FotMob Silver quality evidence is not clean")
     evidence = {
         "schema": FOTMOB_PUBLICATION_SCHEMA,
@@ -2401,6 +2408,11 @@ def record_fotmob_silver_candidate(
         "row_count_gate": _normalize_candidate_value(dict(row_gate)),
         "quality_gate": _normalize_candidate_value(dict(quality_gate)),
     }
+    if quality_errors:
+        # #1312: silver заморожен — ошибки DQ не блокируют кандидата, но след
+        # обязан остаться в evidence.
+        evidence["quality_gate_status"] = "non-blocking"
+        evidence["quality_gate_errors"] = _normalize_candidate_value(quality_errors)
     evidence["digest"] = hashlib.sha256(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

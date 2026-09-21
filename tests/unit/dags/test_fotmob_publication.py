@@ -1889,6 +1889,72 @@ def test_candidate_is_exact_digested_and_seal_renews_full_lease(monkeypatch):
     assert seal.call_args.kwargs["ttl_seconds"] == 14 * 24 * 60 * 60
 
 
+def _silver_candidate_context(monkeypatch, quality_gate):
+    _ceremony_env(monkeypatch)
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    record = MagicMock(return_value={"phase": "writing"})
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(record_publication_candidate=record),
+    )
+    values = {
+        "silver_transforms.a": {
+            "status": "success",
+            "table": "iceberg.silver.a",
+            "rows": 10,
+        },
+        "validate_silver": {"status": "success", "warnings": []},
+        "validate_silver_quality": quality_gate,
+    }
+    context = _context()
+    context["ti"].xcom_pull.side_effect = lambda task_ids: values[task_ids]
+    return context, record
+
+
+def test_silver_dq_errors_do_not_block_the_candidate_while_silver_is_frozen(monkeypatch):
+    # #1312: витрины заморожены, ошибка DQ обязана остаться следом в evidence,
+    # но не ронять волну сбора.
+    monkeypatch.setattr(publication, "SILVER_DQ_BLOCKING", False)
+    quality_gate = {
+        "passed": 1,
+        "errors": ["no_duplicates[silver.fotmob_lineup]"],
+        "warnings": [],
+        "blocking": False,
+    }
+    context, record = _silver_candidate_context(monkeypatch, quality_gate)
+
+    candidate = publication.record_fotmob_silver_candidate(
+        transform_task_ids=["silver_transforms.a"],
+        **context,
+    )
+
+    assert candidate["quality_gate_status"] == "non-blocking"
+    assert candidate["quality_gate_errors"] == ["no_duplicates[silver.fotmob_lineup]"]
+    assert candidate["quality_gate"] == quality_gate
+    assert len(candidate["digest"]) == 64
+    assert record.call_args.args[1] == candidate
+
+
+def test_silver_dq_errors_block_the_candidate_when_blocking_is_restored(monkeypatch):
+    monkeypatch.setattr(publication, "SILVER_DQ_BLOCKING", True)
+    quality_gate = {
+        "passed": 1,
+        "errors": ["no_duplicates[silver.fotmob_lineup]"],
+        "warnings": [],
+        "blocking": True,
+    }
+    context, record = _silver_candidate_context(monkeypatch, quality_gate)
+
+    with pytest.raises(Exception, match="quality evidence is not clean"):
+        publication.record_fotmob_silver_candidate(
+            transform_task_ids=["silver_transforms.a"],
+            **context,
+        )
+
+    record.assert_not_called()
+
+
 def test_bronze_only_candidate_is_deterministic_from_validated_evidence(monkeypatch):
     _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
