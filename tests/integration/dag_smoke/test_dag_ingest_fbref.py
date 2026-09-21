@@ -97,7 +97,7 @@ class TestFBrefCurrentFailureEdges:
         }
         live = dag.task_dict["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
-        assert live.op_kwargs["max_batches"] == 16
+        assert live.op_kwargs["max_batches"] == 14
         assert live.downstream_task_ids == {"choose_publication_path"}
 
     def test_validation_is_the_only_silver_parent(self, fbref_dags):

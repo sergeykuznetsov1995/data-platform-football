@@ -85,10 +85,10 @@ class TestFBrefCurrentTopology:
         factory = sys.modules["utils.fbref_current_dag_factory"]
         assert (
             factory.CURRENT_MAX_BATCHES_POLICY
-            == "fbref-current-max-batches-16-v1"
+            == "fbref-current-max-batches-14-v1"
         )
-        assert factory.CURRENT_MAX_BATCHES == 16
-        assert module.CURRENT_MAX_BATCHES == 16
+        assert factory.CURRENT_MAX_BATCHES == 14
+        assert module.CURRENT_MAX_BATCHES == 14
         assert len(tasks) == 16
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"

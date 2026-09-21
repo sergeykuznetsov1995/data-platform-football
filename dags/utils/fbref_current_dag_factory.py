@@ -61,15 +61,21 @@ PAGE_KINDS = (
 
 # One unforked process advances bounded raw-first batches while retaining the
 # same clearance and proxy quarantine for the run.  The observed full 25-page
-# cadence is about 20m21s; 16 waves leave about 39 minutes before the
-# six-hour-five-minute task timeout.  The current-only deferred reconciliation
-# can improve throughput, but its exact speedup requires a live canary.
-CURRENT_MAX_BATCHES = 16
-# Deployment marker for the reviewed cap-16 policy.  The speed release was
+# cadence is about 20m21s, so at a rounded 21 minutes per wave 14 waves cost
+# about 4h54m and 16 waves about 5h36m.  The runner also pays warm-up and
+# finalisation outside the batch loop, which the cap-16 arithmetic ignored:
+# the subprocess wait is six hours (LIVE_WAVES_TIMEOUT_SECONDS) and the task
+# timeout is six hours five minutes, so a cap-16 run has no room left for the
+# tail and is killed mid-batch.  Cap 14 keeps about an hour of headroom for
+# warm-up, the last batch and finalisation.  The current-only deferred
+# reconciliation can improve throughput, but its exact speedup requires a
+# live canary.
+CURRENT_MAX_BATCHES = 14
+# Deployment marker for the reviewed cap-14 policy.  The speed release was
 # merged before it was installed, so the combined Bronze delivery must carry
 # this factory as an explicit first-parent modification instead of silently
 # leaving production on the old cap-80 bytes.
-CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-16-v1"
+CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-14-v1"
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
