@@ -148,7 +148,10 @@ class TestFBrefBoundedModes:
         assert initialize.op_kwargs["byte_limit_mb"] == 0
         assert dag.task_dict["drain_replay"].op_kwargs[
             "source_control_run_id"
-        ] == "{{ params.source_control_run_id }}"
+        ] == (
+            "{{ dag_run.conf.get('source_control_run_id', "
+            "params.source_control_run_id) }}"
+        )
 
     def test_publishing_modes_validate_before_silver(self, fbref_dags):
         # Bootstrap has no publication tasks at all (see
