@@ -2398,6 +2398,54 @@ def test_live_waves_reject_success_with_a_surviving_descendant(monkeypatch):
 
 
 @pytest.mark.unit
+def test_progress_survives_more_than_eight_thousand_characters_of_noise(
+    monkeypatch, caplog
+):
+    """The diagnostic dump truncates; the protocol must not be read from it."""
+
+    class Process:
+        pid = 4321
+        returncode = -9
+
+        def communicate(self, *, timeout=None):
+            noise = "InsecureRequestWarning: unverified HTTPS request\n" * 400
+            assert len(noise) > 8000
+            return (
+                'FBREF_LIVE_WAVES_PROGRESS:{"batches": 7}\n' + noise,
+                "",
+            )
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_process_group_exists",
+        lambda _process_group_id: False,
+    )
+    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", MagicMock())
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="exit code -9"):
+            fbref_pipeline_tasks.run_fbref_live_waves(
+                airflow_run_id="scheduled__2026-09-22T06:00:00+00:00",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["match"],
+                run_type="current",
+                request_limit=4096,
+                byte_limit_mb=2048,
+                shard_size=25,
+                max_batches=14,
+                deadline_seconds=19800,
+            )
+
+    assert 'partial result: {"batches": 7}' in caplog.text
+
+
+@pytest.mark.unit
 def test_an_outright_killed_runner_still_reports_its_progress(
     monkeypatch, caplog
 ):

@@ -2236,9 +2236,15 @@ def _log_partial_live_result(stdout) -> None:
     """Name what a killed runner had already finished; never raise."""
 
     try:
-        partial = _parse_prefixed_result(
-            _decoded_stream(stdout), LIVE_WAVES_PROGRESS_PREFIX
-        )
+        # Not _decoded_stream: that one truncates to the last 8000 characters
+        # for the diagnostic dump, which can cut a progress document in half or
+        # drop it behind later library noise.  The protocol is parsed from the
+        # whole stream.
+        if isinstance(stdout, bytes):
+            text = stdout.decode("utf-8", "replace")
+        else:
+            text = "" if stdout is None else str(stdout)
+        partial = _parse_prefixed_result(text, LIVE_WAVES_PROGRESS_PREFIX)
     except Exception:  # noqa: BLE001 - the task fails on its own cause
         logger.warning("FBref live waves left no partial result document")
         return

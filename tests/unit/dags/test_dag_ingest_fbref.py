@@ -73,6 +73,21 @@ class TestFBrefCurrentTopology:
         assert params["wave_deadline_seconds"].default == 19800
         assert params["wave_deadline_seconds"]._kw["minimum"] == 0
         assert params["wave_deadline_seconds"]._kw["maximum"] == 6 * 60 * 60
+        # The deadline bounds when a batch may START, so the reserve it leaves
+        # has to cover the batch that is already running plus finalisation.
+        # Observed full 25-page cadence: 20m21s.  Anything less than that and
+        # the budget would hand the task timeout a batch it cannot finish.
+        observed_batch_seconds = 20 * 60 + 21
+        live_waves_timeout_seconds = sys.modules[
+            "utils.fbref_pipeline_tasks"
+        ].LIVE_WAVES_TIMEOUT_SECONDS
+        assert live_waves_timeout_seconds == 6 * 60 * 60
+        reserve = (
+            live_waves_timeout_seconds
+            - params["wave_deadline_seconds"].default
+        )
+        assert reserve == 1800
+        assert reserve >= observed_batch_seconds * 1.4
 
         initialize = tasks["initialize_run"]
         assert initialize.python_callable.__name__ == "initialize_fbref_run"
