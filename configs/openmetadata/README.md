@@ -11,14 +11,20 @@ build ER diagrams).
 0) bootstrap       (this dir, one-time per OM instance) — creates Tier/Domain/PII/UseCase classifications + tags
 1) ingest          (schema discovery from Trino)        — creates table entities in OM
 2) apply           (this dir)                           — patches descriptions/tags/relationships
-3) lineage         (Trino query history → edges)        — wires fct→dim → mart→fct
+3) lineage         (Trino view definitions → edges)     — preserves serving-view lineage
 ```
 
 Cadence:
 - `om-bootstrap`: one-time per OM instance (and after an approved metadata-database reinitialisation); idempotent, safe to re-run. Never use raw `docker compose down -v` on this platform.
 - `om-ingest-trino`: ad-hoc after a schema change in Gold.
 - `om-apply-descriptions`: after editing any YAML here (idempotent, safe to re-run).
-- `om-lineage-trino`: nightly (Trino query history rolls up the latest day).
+- `om-lineage-trino`: after adding or changing Trino views.
+
+Query lineage from CTAS/INSERT is disabled: production Trino handles more than
+100 queries per minute, so its in-memory history is deliberately short to keep
+the coordinator alive. Durable query lineage requires an external Trino event
+store; do not increase `query.max-history` or `query.min-expire-age` as a
+substitute. Declarative `relationships:` and view lineage remain available.
 
 > Without `om-bootstrap`, `om-apply-descriptions` returns `PATCH HTTP 404: tag instance for Tier.Gold not found` on every YAML — the tag FQNs referenced in `tags:` must exist as real OM tags first.
 
@@ -221,8 +227,9 @@ read the totals correctly. FotMob / WhoScored columns are unaffected.
 
 Lineage edges (`relationships`) are best-effort: the `apply` script logs WARN
 on 4xx and continues, since edge creation depends on entity IDs that may not
-yet exist when the catalog is freshly bootstrapped — `om-lineage-trino` will
-backfill from query history on the next nightly run.
+yet exist when the catalog is freshly bootstrapped. Re-run
+`om-apply-descriptions` after schema ingestion; `om-lineage-trino` separately
+refreshes lineage available from view definitions.
 
 ## Removing dropped tables (stale lineage cleanup)
 
