@@ -769,10 +769,19 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             # The fetch succeeded, so provider bytes moved, but the endpoint
             # meter did not answer and the boundary may still be open on the
             # gateway.  The lease is done: read its final meter independently
-            # (close, then stats) and charge exactly that.  Only when even the
-            # final meter is unreadable is a lower bound (known meter delta +
-            # body bytes) charged — and then the batch is NOT re-leased: a
-            # relaunch never proceeds on an understated charge (#1218).
+            # (close, then stats) and charge exactly that — but only a meter
+            # the gateway proves final (closed, no tunnel, no byte reservation
+            # left) is exact.  Otherwise a lower bound is charged (the larger
+            # of the non-final meter and the known delta + body bytes) and the
+            # batch is NOT re-leased: a relaunch never proceeds on an
+            # understated charge (#1218).
+            # Count the source request now: closing the lease tears the browser
+            # down (``self._capture = None``), which would zero it.
+            source_requests = max(
+                0,
+                int(getattr(self._capture, "_source_request_count", source_before) or 0)
+                - source_before,
+            )
             try:
                 final = self.close_lost_lease()
             except BudgetAccountingError:
@@ -786,14 +795,25 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                     raise BudgetAccountingError(
                         "SofaScore lease provider counter moved backwards"
                     ) from None
+            lower_bound = max(
+                0, before_total - self._accounted_provider_bytes
+            ) + _record_body_size(record)
+            if (
+                final is not None
+                and bool(getattr(final, "closed", False))
+                and int(getattr(final, "active_tunnels", 1)) == 0
+                and int(getattr(final, "reserved_bytes", 1)) == 0
+            ):
                 provider_bytes = final_total - self._accounted_provider_bytes
                 self._last_stats = final
                 self.lease_lost = self._safe_error(exc)
                 accounting = "exact"
             else:
-                provider_bytes = max(
-                    0, before_total - self._accounted_provider_bytes
-                ) + _record_body_size(record)
+                provider_bytes = lower_bound
+                if final is not None:
+                    provider_bytes = max(
+                        lower_bound, final_total - self._accounted_provider_bytes
+                    )
                 self._last_stats = before
                 accounting = "estimated"
             self._accounted_provider_bytes += provider_bytes
@@ -807,14 +827,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                 retryable=False,
                 browser_sessions=sessions,
                 navigations=navigations,
-                source_requests=max(
-                    0,
-                    int(
-                        getattr(self._capture, "_source_request_count", source_before)
-                        or 0
-                    )
-                    - source_before,
-                ),
+                source_requests=source_requests,
                 accounting_uncertain=accounting == "estimated",
                 control_channel_failure=isinstance(
                     exc, SofascoreLeaseControlUnavailable

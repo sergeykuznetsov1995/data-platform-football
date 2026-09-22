@@ -88,6 +88,8 @@ def _stats(
     base_run_id="run-1",
     workload_phase="targets",
     upstream_repins=0,
+    active_tunnels=0,
+    reserved_bytes=0,
 ):
     allocation = allocation or WorkloadAllocation(
         allocation_id="alloc-" + "1" * 32,
@@ -108,7 +110,8 @@ def _stats(
         dagrun_budget_bytes=dagrun_budget_bytes,
         daily_total_bytes=total,
         daily_budget_bytes=1_000_000,
-        active_tunnels=0,
+        active_tunnels=active_tunnels,
+        reserved_bytes=reserved_bytes,
         closed=closed,
         expired=False,
         budget_exceeded=False,
@@ -1894,16 +1897,46 @@ class _FinishChannelDownClient(_RecordingCloseClient):
         )
 
 
+class _ClosedOutClient(_FinishChannelDownClient):
+    """After the refused close the gateway reports the lease's last meter."""
+
+    def __init__(self, totals, *, final_total, final_meter, **final_state):
+        super().__init__(totals, final_total=final_total)
+        self.final_meter = final_meter
+        self.final_state = final_state
+
+    def stats(self, lease):
+        if self.close_calls:
+            self.stats_calls += 1
+            return self._stats(self.final_meter, **self.final_state)
+        return super().stats(lease)
+
+
+def _record_transport_errors(runtime):
+    seen = []
+    original = runtime.engine.metrics.transport_error
+
+    def spy(endpoint, error):
+        seen.append(error)
+        return original(endpoint, error)
+
+    runtime.engine.metrics.transport_error = spy
+    return seen
+
+
 def test_control_channel_failure_after_fetch_charges_the_final_meter_and_releases(
     tmp_path, monkeypatch
 ):
     # #1349, 15 of 43 leaks: the fetch succeeded but the endpoint meter close
-    # died on the control channel.  The lease is finished: its FINAL meter is
-    # read independently (close refused as pending, then stats) and charged
-    # exactly — here body plus a 40-byte tail the gateway saw — and the spec
-    # is re-fetched on a fresh lease.
+    # died on the control channel.  The lease is finished: its meter is read
+    # independently (close refused as pending, then stats) and charged exactly
+    # ONLY once the gateway proves it final (closed, no tunnel, no byte
+    # reservation) — here body plus a 40-byte tail — and the spec is re-fetched
+    # on a fresh lease.  The source requests of the failed attempt survive the
+    # browser teardown of the close (Astra round 3, P1 #2).
     runtime, _ = _runtime(tmp_path)
     plan, allocation = _relaunch_plan(runtime)
+    errors = _record_transport_errors(runtime)
     sleeps = []
     monkeypatch.setattr(
         "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
@@ -1911,8 +1944,10 @@ def test_control_channel_failure_after_fetch_charges_the_final_meter_and_release
     body = b'{"items":[{"id":1}]}'
     final_meter = len(body) + 40
 
-    # enter, spec1 before, final meter after the refused close
-    lost_client = _FinishChannelDownClient([0, 0, final_meter], final_total=0)
+    # enter, spec1 before; the final meter after the refused close
+    lost_client = _ClosedOutClient(
+        [0, 0], final_total=0, final_meter=final_meter, closed=True
+    )
     lost_capture = _Capture([_record(body)])
     fresh_client = _RecordingCloseClient([0, 0, 150], final_total=150)
     fresh_capture = _Capture([_record(body)])
@@ -1931,6 +1966,10 @@ def test_control_channel_failure_after_fetch_charges_the_final_meter_and_release
     assert lost_client.close_completed == [False]
     assert lost_capture.fetch_paths == ["/api/v1/event/1/event"]
     assert fresh_capture.fetch_paths == ["/api/v1/event/1/event"]
+    [failure] = errors
+    assert "accounting=exact" in str(failure)
+    # warm + fetch on the lost lease, counted before its browser was closed
+    assert failure.source_requests == lost_capture._source_request_count == 2
     budget = runtime.engine.budget
     assert budget.reservations == {}
     assert budget.spent == final_meter + 150
@@ -1941,6 +1980,55 @@ def test_control_channel_failure_after_fetch_charges_the_final_meter_and_release
     assert traffic["endpoint_provider_bytes"] == {"event": final_meter + 150}
     assert traffic["accounting_uncertain"] == 0
     assert traffic["control_channel_failures"] == 1
+
+
+@pytest.mark.parametrize(
+    "final_state",
+    [
+        {"closed": False},
+        {"closed": True, "active_tunnels": 1},
+        {"closed": True, "reserved_bytes": 512},
+    ],
+    ids=["not-closed", "tunnel-still-draining", "bytes-still-reserved"],
+)
+def test_readable_but_nonfinal_meter_after_fetch_is_an_estimate_without_relaunch(
+    final_state, tmp_path, monkeypatch
+):
+    # Astra round 3, P1 #1: a readable meter is not a final one.  While the
+    # gateway still drains a tunnel or holds a byte reservation, more bytes
+    # can land after the snapshot, so the charge is only a lower bound and
+    # the batch must not re-lease on it (#1218).
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    errors = _record_transport_errors(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+    body = b'{"items":[{"id":1}]}'
+    snapshot = len(body) + 40  # non-final, but larger than the body
+
+    client = _ClosedOutClient(
+        [0, 0], final_total=0, final_meter=snapshot, **final_state
+    )
+    capture = _Capture([_record(body)])
+    factory = _LeaseSequenceFactory(_TransportFactory(client, capture))
+
+    with pytest.raises(RuntimeError, match="accounting=estimated"):
+        _capture_batch(runtime, [_spec(1, "event")], plan, allocation, factory)
+
+    assert factory.attempt_ids == ["1"]
+    assert sleeps == []
+    [failure] = errors
+    assert failure.retryable is False
+    assert failure.accounting_uncertain is True
+    assert failure.source_requests == 2  # warm + fetch, not zeroed by close
+    budget = runtime.engine.budget
+    assert budget.reservations == {}
+    assert budget.spent == snapshot
+    metrics = runtime.engine.metrics.snapshot()
+    assert metrics["accounting_uncertain"] == 1
+    assert metrics["source_request_count"] == 2
 
 
 def test_unreadable_final_meter_after_fetch_charges_a_lower_bound_and_never_releases(
@@ -1967,10 +2055,14 @@ def test_unreadable_final_meter_after_fetch_charges_a_lower_bound_and_never_rele
     capture = _Capture([_record(body)])
     factory = _LeaseSequenceFactory(_TransportFactory(client, capture))
 
+    errors = _record_transport_errors(runtime)
+
     with pytest.raises(RuntimeError, match="accounting=estimated") as captured:
         _capture_batch(runtime, [_spec(1, "event")], plan, allocation, factory)
 
     assert "control channel failure" in str(captured.value)
+    [failure] = errors
+    assert failure.source_requests == 2  # warm + fetch, not zeroed by close
     assert factory.attempt_ids == ["1"]
     budget = runtime.engine.budget
     assert budget.reservations == {}
