@@ -1097,6 +1097,9 @@ class FakeControl:
     def get_acceptance_run_evidence(self, run_id):
         return getattr(self, "acceptance_evidence", None)
 
+    def get_run_target_counts(self, run_id):
+        return dict(self.get_run_summary(run_id)["target_counts"])
+
     def get_run_summary(self, run_id, **_versions):
         return {
             **self.run,
@@ -11364,6 +11367,44 @@ def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
     assert control.reservations[0][1]["bytes_"] == 23 * 1024 * 1024
 
 
+def test_empty_wave_reads_target_counts_without_the_full_run_summary(tmp_path):
+    """An empty claim must not drag the full-frontier scope rollup into the
+    hot path of every batch: ``get_run_summary`` recomputes it, the narrow
+    accessor does not (#1319)."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.claim_targets = lambda *args, **kwargs: []
+    control.create_due_run_cohort = lambda *args, **kwargs: []
+    control.get_run_target_counts = lambda *args, **kwargs: {"succeeded": 7}
+
+    def forbidden_summary(*_args, **_kwargs):
+        raise AssertionError("fetch_wave must not call get_run_summary")
+
+    control.get_run_summary = forbidden_summary
+
+    def forbidden_fetcher(*_):
+        raise AssertionError("no fetcher for an empty wave")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=forbidden_fetcher,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=_settings(),
+    )
+
+    assert result.claimed == 0
+    assert result.failures == []
+
+
 def test_a_wave_after_the_budget_stop_no_ops_instead_of_raising(tmp_path):
     """The wave that follows a budget stop claims nothing, because the run handed
     its targets back to the queue. Counting those 'skipped' targets as unfinished
@@ -11372,8 +11413,9 @@ def test_a_wave_after_the_budget_stop_no_ops_instead_of_raising(tmp_path):
     control = FakeControl(raw)
     control.claim_targets = lambda *args, **kwargs: []
     control.create_due_run_cohort = lambda *args, **kwargs: []
-    control.get_run_summary = lambda *args, **kwargs: {
-        "target_counts": {"succeeded": 11, "skipped": 14},
+    control.get_run_target_counts = lambda *args, **kwargs: {
+        "succeeded": 11,
+        "skipped": 14,
     }
 
     def forbidden(*_):
@@ -11410,8 +11452,10 @@ def test_a_resumed_run_with_terminally_failed_targets_no_ops_instead_of_deadlock
     control = FakeControl(raw)
     control.claim_targets = lambda *args, **kwargs: []
     control.create_due_run_cohort = lambda *args, **kwargs: []
-    control.get_run_summary = lambda *args, **kwargs: {
-        "target_counts": {"succeeded": 29, "skipped": 20, "failed": 1},
+    control.get_run_target_counts = lambda *args, **kwargs: {
+        "succeeded": 29,
+        "skipped": 20,
+        "failed": 1,
     }
 
     def forbidden(*_):
@@ -11444,8 +11488,10 @@ def test_a_wave_with_claimable_backlog_still_raises_the_unfinished_gate(
     control = FakeControl(raw)
     control.claim_targets = lambda *args, **kwargs: []
     control.create_due_run_cohort = lambda *args, **kwargs: []
-    control.get_run_summary = lambda *args, **kwargs: {
-        "target_counts": {"succeeded": 1, "pending": 2, "leased": 1},
+    control.get_run_target_counts = lambda *args, **kwargs: {
+        "succeeded": 1,
+        "pending": 2,
+        "leased": 1,
     }
     pipeline = FBrefPipeline(
         control,

@@ -4,11 +4,16 @@
 -- in scrapers/fbref/pipeline.py must be deployed first; otherwise the next
 -- competition discovery reconciliation writes both old source slugs back.
 --
+-- SINCE #1319: the prospective-cohort probe below evaluates the scope rollup
+-- over the WHOLE frontier (an upper bound), while the production
+-- create_due_run_cohort evaluates the same rollup over its due candidates
+-- only.  The admitted set is the same; the probe is simply the slower form.
+--
 -- EXECUTION ORDER (the FBref DAG stays paused throughout):
 --   1. Deploy the code.
 --   2. Run this read-only probe in the deployed scheduler; it must print the
 --      mapping version and cohort-policy SHA256 shown here:
---      docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import SEASON_INSTALL_REDIRECT_VERSION as v, _canonical_season_install_url as f; h=hashlib.sha256(inspect.getsource(ControlStore.create_due_run_cohort).encode()).hexdigest(); assert v == 'fbref-season-install-redirects-20260825-v1'; assert h == '891f08fbf7ac22ca1d9c4e5ad27f3ec45b76bfe938266f5eea2a319158396c15'; assert f('33','2026-2027','https://fbref.com/en/comps/33/2-Bundesliga-Stats') == 'https://fbref.com/en/comps/33/2'; assert f('59','2026-2027','https://fbref.com/en/comps/59/3-Liga-Stats') == 'https://fbref.com/en/comps/59/3'; print(v,h)"
+--      docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import SEASON_INSTALL_REDIRECT_VERSION as v, _canonical_season_install_url as f; h=hashlib.sha256(inspect.getsource(ControlStore.create_due_run_cohort).encode()).hexdigest(); assert v == 'fbref-season-install-redirects-20260825-v1'; assert h == 'a96c7142b5e614efa9edbee722eb1b20c538e89901fedd11ac3b7c496088f2fd'; assert f('33','2026-2027','https://fbref.com/en/comps/33/2-Bundesliga-Stats') == 'https://fbref.com/en/comps/33/2'; assert f('59','2026-2027','https://fbref.com/en/comps/59/3-Liga-Stats') == 'https://fbref.com/en/comps/59/3'; print(v,h)"
 --   3. Apply this SQL while the active-run guard is clear. Its executable
 --      preflight must prove that the production cohort policy would choose
 --      comp59 then comp33 as prospective ordinals 0 and 1.

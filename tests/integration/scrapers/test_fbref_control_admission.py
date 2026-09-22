@@ -16,6 +16,10 @@ from scrapers.fbref.control import ControlStore, StateConflict
 from scrapers.fbref.control.replay_effects import (
     normalize_replay_control_effects,
 )
+from scrapers.fbref.control.store import (
+    _FRONTIER_SCOPE_CTE,
+    _frontier_scope_cte_for_candidates,
+)
 
 
 pytestmark = pytest.mark.integration
@@ -782,3 +786,260 @@ def test_raw_baseline_and_attempt_set_are_durably_anchored(
         assert store.claim_targets(run_id, "late-worker") == []
     finally:
         setup.close()
+
+
+def test_candidate_scope_matches_the_full_frontier_rollup_and_ordering():
+    """#1319: narrowing the scope CTE to batch candidates must change nothing.
+
+    The rollup rows of every admitted target must be byte-identical to the
+    unchanged full-frontier ``_FRONTIER_SCOPE_CTE``, and the admitted ordered
+    list must still follow the admission tiers - including targets whose scope
+    exists only through provenance edges.
+    """
+    psycopg2 = pytest.importorskip("psycopg2")
+    dsn = _postgres_uri()
+    connection = psycopg2.connect(
+        dsn,
+        application_name="fbref-candidate-scope-test",
+        options="-c statement_timeout=30000",
+    )
+    suffix = uuid.uuid4().hex
+    run_id = str(uuid.uuid4())
+    snapshot_id = str(uuid.uuid4())
+    male = f"cand-male-{suffix}"
+    female = f"cand-female-{suffix}"
+    dormant = f"cand-dormant-{suffix}"
+    current_season = f"2026-{suffix}"
+    past_season = f"2019-{suffix}"
+    policy = f"cand-current-{suffix}"
+
+    index_target = f"fbref:cand:index:{suffix}"
+    season_target = f"fbref:cand:season:{suffix}"
+    match_target = f"fbref:cand:match:{suffix}"
+    carried_target = f"fbref:cand:carried:{suffix}"
+    both_target = f"fbref:cand:both:{suffix}"
+    orphan_target = f"fbref:cand:orphan:{suffix}"
+    female_target = f"fbref:cand:female:{suffix}"
+    dormant_target = f"fbref:cand:dormant:{suffix}"
+    past_target = f"fbref:cand:past:{suffix}"
+    all_targets = [
+        index_target,
+        season_target,
+        match_target,
+        carried_target,
+        both_target,
+        orphan_target,
+        female_target,
+        dormant_target,
+        past_target,
+    ]
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.crawl_run (
+                    run_id, run_type, status, request_limit, byte_limit
+                ) VALUES (%s, 'current-semantic-test', 'running', 100, 52428800)
+                """,
+                (run_id,),
+            )
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.registry_snapshot (
+                    snapshot_id, run_id, successful, fetched_at
+                ) VALUES (%s, %s, true, clock_timestamp())
+                """,
+                (snapshot_id, run_id),
+            )
+            for competition_id, gender, crawl_state in (
+                (male, "male", "active"),
+                (female, "female", "active"),
+                (dormant, "male", "quarantined"),
+            ):
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.competition_registry (
+                        competition_id, canonical_url, name, gender,
+                        classification, crawl_state, first_seen_at,
+                        last_seen_at, first_snapshot_id, last_snapshot_id
+                    ) VALUES (
+                        %s, %s, %s, %s, 'test', %s,
+                        clock_timestamp(), clock_timestamp(), %s, %s
+                    )
+                    """,
+                    (
+                        competition_id,
+                        f"https://example.invalid/{competition_id}",
+                        competition_id,
+                        gender,
+                        crawl_state,
+                        snapshot_id,
+                        snapshot_id,
+                    ),
+                )
+            for competition_id, season_id, is_current in (
+                (male, current_season, True),
+                (male, past_season, False),
+                (female, current_season, True),
+                (dormant, current_season, True),
+            ):
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.season_registry (
+                        competition_id, season_id, canonical_url, label,
+                        is_current, first_seen_at, last_seen_at,
+                        first_snapshot_id, last_snapshot_id
+                    ) VALUES (
+                        %s, %s, %s, 'test', %s,
+                        clock_timestamp(), clock_timestamp(), %s, %s
+                    )
+                    """,
+                    (
+                        competition_id,
+                        season_id,
+                        f"https://example.invalid/{competition_id}/{season_id}",
+                        is_current,
+                        snapshot_id,
+                        snapshot_id,
+                    ),
+                )
+
+            def insert_target(
+                target_id, page_kind, source_ids, created_at, priority=0
+            ):
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.page_frontier (
+                        target_id, page_kind, canonical_url, source_ids,
+                        refresh_policy, priority, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+                    """,
+                    (
+                        target_id,
+                        page_kind,
+                        f"https://example.invalid/{target_id}",
+                        json.dumps(source_ids),
+                        policy,
+                        priority,
+                        created_at,
+                        created_at,
+                    ),
+                )
+
+            def insert_edge(child, competition_id, season_id):
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.frontier_provenance (
+                        provenance_id, parent_target_id, child_target_id,
+                        relation, carried_competition_id, carried_season_id,
+                        parent_content_hash, parser_version
+                    ) VALUES (%s, %s, %s, 'discovered', %s, %s, %s, %s)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        index_target,
+                        child,
+                        competition_id,
+                        season_id,
+                        f"hash-{suffix}",
+                        f"parser-{suffix}",
+                    ),
+                )
+
+            male_current = {
+                "competition_id": male,
+                "season_id": current_season,
+            }
+            insert_target(
+                index_target, "competition_index", {}, "1950-01-01T00:00:00Z"
+            )
+            insert_target(
+                season_target, "season", male_current, "1940-01-01T00:00:00Z"
+            )
+            insert_target(
+                match_target, "match", male_current, "1960-01-01T00:00:00Z", 65
+            )
+            # Scope carried only by a provenance edge - no source_ids at all.
+            insert_target(
+                carried_target, "squad", {}, "1961-01-01T00:00:00Z", 10
+            )
+            insert_edge(carried_target, male, current_season)
+            # Scope declared twice: source_ids and a matching edge.
+            insert_target(
+                both_target, "squad", male_current, "1962-01-01T00:00:00Z", 9
+            )
+            insert_edge(both_target, male, current_season)
+            # No scope anywhere.
+            insert_target(
+                orphan_target, "squad", {}, "1963-01-01T00:00:00Z", 8
+            )
+            insert_target(
+                female_target,
+                "match",
+                {"competition_id": female, "season_id": current_season},
+                "1880-01-01T00:00:00Z",
+                2000,
+            )
+            insert_target(
+                dormant_target,
+                "match",
+                {"competition_id": dormant, "season_id": current_season},
+                "1881-01-01T00:00:00Z",
+                2000,
+            )
+            insert_target(
+                past_target,
+                "match",
+                {"competition_id": male, "season_id": past_season},
+                "1882-01-01T00:00:00Z",
+                2000,
+            )
+
+            candidate_sql = (
+                "        SELECT probe.target_id\n"
+                "        FROM unnest(%s::text[]) AS probe(target_id)"
+            )
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + """
+                SELECT * FROM scope_rollup
+                WHERE target_id = ANY(%s::text[]) ORDER BY target_id
+                """,
+                (all_targets,),
+            )
+            full_rollup = cursor.fetchall()
+            cursor.execute(
+                _frontier_scope_cte_for_candidates(candidate_sql)
+                + """
+                SELECT * FROM scope_rollup ORDER BY target_id
+                """,
+                (all_targets,),
+            )
+            narrow_rollup = cursor.fetchall()
+
+        assert full_rollup == narrow_rollup
+        assert len(full_rollup) >= 6
+
+        wrapped = _RollbackOnlyConnection(connection)
+        store = ControlStore(dsn, connection_factory=lambda _dsn: wrapped)
+        cohort = store.create_due_run_cohort(
+            run_id, refresh_policies=[policy], limit=6
+        )
+        assert [item.target_id for item in cohort] == [
+            index_target,
+            season_target,
+            match_target,
+            carried_target,
+            both_target,
+        ]
+
+        leases = store.claim_targets(
+            run_id, "worker-1", limit=6, refresh_policies=[policy]
+        )
+        assert sorted(lease.target_id for lease in leases) == sorted(
+            item.target_id for item in cohort
+        )
+    finally:
+        connection.rollback()
+        connection.close()

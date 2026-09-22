@@ -20,6 +20,10 @@ from scrapers.fbref.control import (
     resolve_control_db_uri,
 )
 from scrapers.fbref.control.migrations import MIGRATIONS
+from scrapers.fbref.control.store import (
+    _FRONTIER_SCOPE_CTE,
+    _frontier_scope_cte_for_candidates,
+)
 from scrapers.fbref.policy import (
     DISCOVERY_SPINE_PAGE_KINDS,
     OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
@@ -810,7 +814,8 @@ def test_due_cohort_uses_explicit_publication_admission_tiers():
         connection_factory=FakeFactory(handler),
     )
 
-    assert store.create_due_run_cohort(str(uuid.uuid4()), limit=5) == []
+    run_id = str(uuid.uuid4())
+    assert store.create_due_run_cohort(run_id, limit=5) == []
     assert "FOR UPDATE" in selected["run_sql"]
     sql = selected["sql"]
     ordering = sql[sql.rindex("ORDER BY eligible.admission_tier") :]
@@ -824,11 +829,15 @@ def test_due_cohort_uses_explicit_publication_admission_tiers():
     assert "frontier.page_kind = 'match'" in sql
     assert "COALESCE(scope.has_current_season, false) THEN 2" in sql
     assert "frontier.refresh_policy <> 'historical_once'" in sql
-    assert selected["params"][:3] == (
+    # The candidate CTE owns the first four parameters (#1319); the
+    # admission-tier arrays moved behind them.
+    assert selected["params"][:4] == (None, None, None, None)
+    assert selected["params"][4:7] == (
         list(DISCOVERY_SPINE_PAGE_KINDS),
         list(DISCOVERY_SPINE_PAGE_KINDS),
         list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
     )
+    assert selected["params"][-2:] == (run_id, 5)
     assert "fbref_control.frontier_provenance" in sql
     assert "scope.scope_count > 0" in sql
     assert "scope.has_female" in sql
@@ -927,7 +936,7 @@ def test_due_cohort_rechecks_cross_run_membership_after_frontier_lock():
 def test_claim_rechecks_registry_scope_before_any_network_lease():
     source = inspect.getsource(ControlStore.claim_targets)
 
-    assert "_FRONTIER_SCOPE_CTE" in source
+    assert "_frontier_scope_cte_for_candidates(" in source
     assert "scope.scope_count > 0" in source
     assert "scope.competition_missing" in source
     assert "scope.has_female" in source
@@ -950,6 +959,229 @@ def test_claim_scope_cte_filters_a_new_queued_target_without_valid_scope():
     assert "NOT COALESCE(scope.has_female, false)" in source
     assert "NOT COALESCE(scope.inactive_competition, true)" in source
     assert "NOT COALESCE(scope.invalid_season, true)" in source
+
+
+def test_candidate_scope_cte_is_the_shared_rollup_plus_candidate_joins():
+    """The narrowed CTE is the shared rollup plus exactly three insertions."""
+
+    candidate_sql = "        SELECT probe.target_id FROM probe AS probe"
+    narrowed = _frontier_scope_cte_for_candidates(candidate_sql)
+
+    stripped = narrowed.replace(
+        "WITH scope_candidates AS MATERIALIZED (\n"
+        f"{candidate_sql}\n"
+        "    ),\n    ",
+        "WITH ",
+        1,
+    )
+    for join in (
+        "\n        JOIN scope_candidates AS candidate"
+        "\n          ON candidate.target_id = frontier.target_id",
+        "\n        JOIN scope_candidates AS candidate"
+        "\n          ON candidate.target_id = edge.child_target_id",
+    ):
+        assert stripped.count(join) == 1
+        stripped = stripped.replace(join, "", 1)
+
+    assert stripped == _FRONTIER_SCOPE_CTE
+    with pytest.raises(ValueError, match="format placeholders"):
+        _frontier_scope_cte_for_candidates("SELECT {oops}")
+
+
+def _claim_sql_probe(run_id, seen):
+    def handler(sql, _params):
+        if "SELECT status, metadata FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running", "metadata": {}}], 1
+        if "SELECT DISTINCT lease_run_id AS run_id" in sql:
+            return [], 0
+        if "SELECT target_id, claim_token, lease_epoch" in sql:
+            return [], 0
+        if "SELECT reservation.*" in sql:
+            return [], 0
+        if "UPDATE fbref_control.fetch_attempt AS attempt" in sql:
+            return [], 0
+        if "UPDATE fbref_control.run_target AS target" in sql:
+            return [], 0
+        if (
+            "UPDATE fbref_control.page_frontier" in sql
+            and "lease_expires_at <=" in sql
+        ):
+            return [], 0
+        if "SELECT target.target_id" in sql:
+            seen["sql"] = sql
+            seen["params"] = _params
+            return [], 0
+        raise AssertionError(sql)
+
+    return handler
+
+
+def test_claim_scope_is_narrowed_to_this_runs_targets():
+    run_id = str(uuid.uuid4())
+    seen = {}
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(_claim_sql_probe(run_id, seen)),
+    )
+
+    assert (
+        store.claim_targets(
+            run_id,
+            "worker-1",
+            limit=5,
+            page_kinds=("match",),
+            refresh_policies=("daily",),
+        )
+        == []
+    )
+
+    sql = seen["sql"]
+    assert sql.lstrip().startswith("WITH scope_candidates AS MATERIALIZED")
+    assert "FROM fbref_control.run_target AS candidate_target" in sql
+    assert "JOIN scope_candidates AS claim_candidate" in sql
+    assert "ON candidate.target_id = edge.child_target_id" in sql
+    # The candidate predicate is the outer predicate, verbatim.
+    assert sql.count("status IN ('pending', 'retry')") == 2
+    assert seen["params"] == (
+        run_id,
+        run_id,
+        ["match"],
+        ["match"],
+        ["daily"],
+        ["daily"],
+        5,
+    )
+
+
+def test_due_cohort_scope_is_narrowed_to_due_candidates():
+    run_id = str(uuid.uuid4())
+    seen = {}
+
+    def handler(sql, params):
+        if "SELECT status FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running"}], 1
+        if "SELECT frontier.target_id" in sql:
+            seen["sql"] = sql
+            seen["params"] = params
+            return [], 0
+        if "SELECT COALESCE(max(ordinal)" in sql:
+            return [{"next_ordinal": 0}], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    assert (
+        store.create_due_run_cohort(
+            run_id,
+            page_kinds=("match",),
+            refresh_policies=("daily",),
+            limit=5,
+        )
+        == []
+    )
+
+    sql = seen["sql"]
+    assert sql.lstrip().startswith("WITH scope_candidates AS MATERIALIZED")
+    assert "FROM fbref_control.page_frontier AS candidate_frontier" in sql
+    assert "JOIN scope_candidates AS cohort_candidate" in sql
+    # Every non-scope predicate of ``eligible`` is repeated verbatim in the
+    # candidate CTE, so the candidate set stays a superset of ``eligible``.
+    for predicate in (
+        "state IN ('queued', 'retry')",
+        "state = 'fetched'",
+        "next_fetch_at IS NOT NULL",
+        "retry_after IS NULL",
+        "refresh_policy = ANY(%s::text[])",
+    ):
+        assert sql.count(predicate) == 2, predicate
+    assert sql.count("%s::text[] IS NULL") == 4
+    assert seen["params"] == (
+        ["match"],
+        ["match"],
+        ["daily"],
+        ["daily"],
+        list(DISCOVERY_SPINE_PAGE_KINDS),
+        list(DISCOVERY_SPINE_PAGE_KINDS),
+        list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
+        ["match"],
+        ["match"],
+        ["daily"],
+        ["daily"],
+        run_id,
+        5,
+    )
+
+
+def test_no_frontier_scope_cte_scans_the_whole_provenance_on_the_claim_path():
+    """Neither batch operator may walk provenance without a candidate fence."""
+
+    claim_seen = {}
+    ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(_claim_sql_probe("", claim_seen)),
+    ).claim_targets(str(uuid.uuid4()), "worker-1", limit=5)
+
+    cohort_seen = {}
+
+    def cohort_handler(sql, params):
+        if "SELECT status FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running"}], 1
+        if "SELECT frontier.target_id" in sql:
+            cohort_seen["sql"] = sql
+            return [], 0
+        if "SELECT COALESCE(max(ordinal)" in sql:
+            return [{"next_ordinal": 0}], 1
+        raise AssertionError(sql)
+
+    ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(cohort_handler),
+    ).create_due_run_cohort(str(uuid.uuid4()), limit=5)
+
+    for sql in (claim_seen["sql"], cohort_seen["sql"]):
+        assert sql.count("FROM fbref_control.frontier_provenance AS edge") == 1
+        branch = sql[
+            sql.index("FROM fbref_control.frontier_provenance AS edge") : sql.index(
+                "WHERE edge.carried_competition_id IS NOT NULL"
+            )
+        ]
+        assert "JOIN scope_candidates AS candidate" in branch
+        assert "ON candidate.target_id = edge.child_target_id" in branch
+
+
+def test_run_target_counts_uses_one_grouped_statement():
+    statements = []
+
+    def handler(sql, params):
+        statements.append((sql, params))
+        return (
+            [
+                {"status": "pending", "count": 4},
+                {"status": "succeeded", "count": 21},
+            ],
+            2,
+        )
+
+    run_id = str(uuid.uuid4())
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    assert store.get_run_target_counts(run_id) == {
+        "pending": 4,
+        "succeeded": 21,
+    }
+    assert len(statements) == 1
+    sql, params = statements[0]
+    assert "FROM fbref_control.run_target" in sql
+    assert "GROUP BY status" in sql
+    assert "scope_rollup" not in sql
+    assert "frontier_provenance" not in sql
+    assert params == (run_id,)
 
 
 def test_explicit_cohort_cannot_steal_target_from_active_run_or_canary():

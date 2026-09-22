@@ -32,6 +32,24 @@ quarantined target whose registry scope became eligible can wait until the
 final repair (and, if needed, the next scheduled current run).  Historical
 runs retain their existing per-wave reconciliation cadence.
 
+## Update 2026-09-22 (#1319)
+
+The statements named above as "unchanged full `_FRONTIER_SCOPE_CTE`
+evaluations" no longer scan the whole frontier on the batch path.
+`claim_targets()` and `create_due_run_cohort()` now evaluate the same rollup
+over a `scope_candidates` CTE -- this run's `pending`/`retry` targets for the
+claim, the due non-scope-filtered frontier rows for the cohort -- so the
+provenance UNION sorts the candidates' edges instead of all 19.0 M.  The empty
+claim no longer calls `get_run_summary()` at all: `fetch_wave()` reads
+`get_run_target_counts()`, one grouped statement over `run_target`.
+
+The safety argument above is unchanged in substance: `claim_targets()` still
+evaluates the same scope formula under the same frontier lock before every
+network lease.  Only its input is narrowed, and to a strict superset of the
+targets whose scope the outer query reads, so a newly seeded ineligible target
+still cannot be fetched while repair is deferred.  `reconcile_frontier_scope()`
+and `get_run_summary()` keep the full-frontier form.
+
 If the final repair reopens a previously quarantined target after the last
 zero-claim wave, the runner clears `frontier_closed`.  This prevents the
 downstream validator from treating that reopened work as a false terminal

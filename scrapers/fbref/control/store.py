@@ -132,12 +132,12 @@ _PUBLICATION_PHASES = {
     "abandoned",
     "failed",
 }
-_FRONTIER_SCOPE_CTE = """
-    WITH declared_scope AS (
+_FRONTIER_SCOPE_CTE_TEMPLATE = """
+    {with_clause}declared_scope AS (
         SELECT frontier.target_id, frontier.source,
                frontier.source_ids ->> 'competition_id' AS competition_id,
                frontier.source_ids ->> 'season_id' AS season_id
-        FROM fbref_control.page_frontier AS frontier
+        FROM fbref_control.page_frontier AS frontier{declared_candidate_join}
         WHERE frontier.source_ids ? 'competition_id'
         UNION
         SELECT edge.child_target_id AS target_id, child.source,
@@ -145,7 +145,7 @@ _FRONTIER_SCOPE_CTE = """
                edge.carried_season_id AS season_id
         FROM fbref_control.frontier_provenance AS edge
         JOIN fbref_control.page_frontier AS child
-          ON child.target_id = edge.child_target_id
+          ON child.target_id = edge.child_target_id{edge_candidate_join}
         WHERE edge.carried_competition_id IS NOT NULL
     ),
     canonical_scope AS (
@@ -205,6 +205,41 @@ _FRONTIER_SCOPE_CTE = """
         GROUP BY scoped.target_id
     )
 """
+
+
+_FRONTIER_SCOPE_CTE = _FRONTIER_SCOPE_CTE_TEMPLATE.format(
+    with_clause="WITH ",
+    declared_candidate_join="",
+    edge_candidate_join="",
+)
+
+
+def _frontier_scope_cte_for_candidates(candidate_sql: str) -> str:
+    """Return the shared scope rollup restricted to ``candidate_sql`` targets.
+
+    The rollup itself is unchanged: both UNION branches only gain a join onto
+    the candidate set, so the ``scope_rollup`` row of a candidate target is
+    identical to the row the full-frontier form produces.  ``MATERIALIZED`` is
+    mandatory - an inlined candidate body would evaluate ``clock_timestamp()``
+    once per reference and let the two branches disagree about the set.
+    """
+    if "{" in candidate_sql or "}" in candidate_sql:
+        raise ValueError("candidate_sql must not contain format placeholders")
+    return _FRONTIER_SCOPE_CTE_TEMPLATE.format(
+        with_clause=(
+            "WITH scope_candidates AS MATERIALIZED (\n"
+            f"{candidate_sql}\n"
+            "    ),\n    "
+        ),
+        declared_candidate_join=(
+            "\n        JOIN scope_candidates AS candidate"
+            "\n          ON candidate.target_id = frontier.target_id"
+        ),
+        edge_candidate_join=(
+            "\n        JOIN scope_candidates AS candidate"
+            "\n          ON candidate.target_id = edge.child_target_id"
+        ),
+    )
 
 
 def _postgres_dsn(uri: str) -> str:
@@ -6516,7 +6551,26 @@ class ControlStore:
             if crawl_run is None or crawl_run["status"] not in {"pending", "running"}:
                 raise StateConflict(f"Run {run} cannot accept a due cohort")
             cursor.execute(
-                _FRONTIER_SCOPE_CTE
+                _frontier_scope_cte_for_candidates(
+                    """        SELECT candidate_frontier.target_id
+        FROM fbref_control.page_frontier AS candidate_frontier
+        WHERE (
+                candidate_frontier.state IN ('queued', 'retry')
+                OR (
+                    candidate_frontier.state = 'fetched'
+                    AND candidate_frontier.next_fetch_at IS NOT NULL
+                    AND candidate_frontier.next_fetch_at <= clock_timestamp()
+                )
+            )
+          AND (candidate_frontier.next_fetch_at IS NULL
+               OR candidate_frontier.next_fetch_at <= clock_timestamp())
+          AND (candidate_frontier.retry_after IS NULL
+               OR candidate_frontier.retry_after <= clock_timestamp())
+          AND (%s::text[] IS NULL
+               OR candidate_frontier.page_kind = ANY(%s::text[]))
+          AND (%s::text[] IS NULL
+               OR candidate_frontier.refresh_policy = ANY(%s::text[]))"""
+                )
                 + f"""
                 , sla(page_kind, sla_seconds) AS (
                     VALUES {_PAGE_KIND_SLA_VALUES}
@@ -6557,6 +6611,8 @@ class ControlStore:
                            ELSE 5
                          END AS admission_tier
                   FROM fbref_control.page_frontier AS frontier
+                  JOIN scope_candidates AS cohort_candidate
+                    ON cohort_candidate.target_id = frontier.target_id
                   LEFT JOIN scope_rollup AS scope
                     ON scope.target_id = frontier.target_id
                   LEFT JOIN sla
@@ -6623,6 +6679,10 @@ class ControlStore:
                 FOR UPDATE OF frontier SKIP LOCKED
                 """,
                 (
+                    kinds,
+                    kinds,
+                    policies,
+                    policies,
                     list(DISCOVERY_SPINE_PAGE_KINDS),
                     list(DISCOVERY_SPINE_PAGE_KINDS),
                     list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
@@ -6697,6 +6757,32 @@ class ControlStore:
                 accepted_offset += 1
         return cohort
 
+    @staticmethod
+    def _target_counts(cursor, run: str) -> dict[str, int]:
+        """Count this run's targets by status - one grouped statement."""
+        cursor.execute(
+            """
+            SELECT status, count(*) AS count
+            FROM fbref_control.run_target
+            WHERE run_id = %s GROUP BY status ORDER BY status
+            """,
+            (run,),
+        )
+        return {
+            str(row["status"]): int(row["count"]) for row in _fetchall(cursor)
+        }
+
+    def get_run_target_counts(self, run_id: object) -> dict[str, int]:
+        """Return the run's target counts by status without the full summary.
+
+        ``fetch_wave`` needs nothing else from ``get_run_summary`` when a claim
+        comes back empty, and the summary drags the full-frontier scope rollup
+        through the hot path of every batch (#1319).
+        """
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            return self._target_counts(cursor, run)
+
     def get_run_summary(
         self,
         run_id: object,
@@ -6761,18 +6847,7 @@ class ControlStore:
                     "crawl run_type must be current, backfill, replay, or "
                     "publication"
                 )
-            cursor.execute(
-                """
-                SELECT status, count(*) AS count
-                FROM fbref_control.run_target
-                WHERE run_id = %s GROUP BY status ORDER BY status
-                """,
-                (run,),
-            )
-            summary["target_counts"] = {
-                str(row["status"]): int(row["count"])
-                for row in _fetchall(cursor)
-            }
+            summary["target_counts"] = self._target_counts(cursor, run)
             cursor.execute(
                 """
                 SELECT frontier.page_kind, count(*) AS count
@@ -9438,7 +9513,12 @@ class ControlStore:
                 run_rows_locked=True,
             )
             cursor.execute(
-                _FRONTIER_SCOPE_CTE
+                _frontier_scope_cte_for_candidates(
+                    """        SELECT candidate_target.target_id
+        FROM fbref_control.run_target AS candidate_target
+        WHERE candidate_target.run_id = %s
+          AND candidate_target.status IN ('pending', 'retry')"""
+                )
                 + """
                 SELECT target.target_id, target.logical_refresh_id,
                        frontier.canonical_url, frontier.page_kind,
@@ -9448,6 +9528,8 @@ class ControlStore:
                   ON run.run_id = target.run_id
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = target.target_id
+                JOIN scope_candidates AS claim_candidate
+                  ON claim_candidate.target_id = target.target_id
                 LEFT JOIN scope_rollup AS scope
                   ON scope.target_id = frontier.target_id
                 WHERE target.run_id = %s AND run.status = 'running'
@@ -9481,7 +9563,15 @@ class ControlStore:
                 LIMIT %s
                 FOR UPDATE OF frontier SKIP LOCKED
                 """,
-                (run, kinds, kinds, policies, policies, normalized_limit),
+                (
+                    run,
+                    run,
+                    kinds,
+                    kinds,
+                    policies,
+                    policies,
+                    normalized_limit,
+                ),
             )
             candidates = _fetchall(cursor)
             for candidate in candidates:
