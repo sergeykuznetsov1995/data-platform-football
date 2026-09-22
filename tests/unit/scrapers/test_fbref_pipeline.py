@@ -11806,10 +11806,13 @@ def _historical_competition_seed(tmp_path, *, existing=None, page_kind="competit
         )
     else:
         link = DiscoveredPageLink(
-            page_kind="player",
-            canonical_url="https://fbref.com/en/players/0000000a/Player",
+            page_kind="squad",
+            canonical_url=(
+                "https://fbref.com/en/squads/0000000a/1930-1931/Team-Stats"
+            ),
             source_ids={
-                "player_id": "0000000a",
+                "squad_id": "0000000a",
+                "squad_discriminator": "0000000a",
                 "competition_id": "9",
                 "season_id": "1930-1931",
             },
@@ -11871,13 +11874,13 @@ def test_historical_seed_leaves_one_shot_competition_alone(tmp_path):
     assert target.refresh_policy == "historical_once"
 
 
-def test_historical_seed_still_downgrades_unguarded_player(tmp_path):
+def test_historical_seed_still_downgrades_unguarded_squad(tmp_path):
     target = _historical_competition_seed(
         tmp_path,
-        page_kind="player",
+        page_kind="squad",
         existing={
-            "target_id": "fbref:player:0000000a",
-            "page_kind": "player",
+            "target_id": "fbref:squad:0000000a",
+            "page_kind": "squad",
             "refresh_policy": "monthly",
             "priority": 40,
             "next_fetch_at": NOW,
@@ -11910,11 +11913,14 @@ def test_oversized_discovery_batch_is_split_targets_before_edges(tmp_path):
     candidates = [
         _FrontierSeedCandidate(
             link=DiscoveredPageLink(
-                page_kind="player",
+                page_kind="squad",
                 canonical_url=(
-                    f"https://fbref.com/en/players/{index:05d}/Player-{index}"
+                    f"https://fbref.com/en/squads/{index:05d}/Team-{index}"
                 ),
-                source_ids={"player_id": f"{index:05d}"},
+                source_ids={
+                    "squad_id": f"{index:05d}",
+                    "squad_discriminator": f"{index:05d}",
+                },
             ),
             historical=False,
         )
@@ -11944,11 +11950,14 @@ def test_discovery_batch_within_the_ceiling_stays_one_atomic_write(tmp_path):
     candidates = [
         _FrontierSeedCandidate(
             link=DiscoveredPageLink(
-                page_kind="player",
+                page_kind="squad",
                 canonical_url=(
-                    f"https://fbref.com/en/players/{index:05d}/Player-{index}"
+                    f"https://fbref.com/en/squads/{index:05d}/Team-{index}"
                 ),
-                source_ids={"player_id": f"{index:05d}"},
+                source_ids={
+                    "squad_id": f"{index:05d}",
+                    "squad_discriminator": f"{index:05d}",
+                },
             ),
             historical=False,
         )
