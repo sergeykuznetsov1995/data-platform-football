@@ -3091,8 +3091,7 @@ class FBrefPipeline:
             refresh_policies=policies,
         )
         if not leases:
-            summary = self.control.get_run_summary(run_id) or {}
-            target_counts = summary.get("target_counts") or {}
+            target_counts = self.control.get_run_target_counts(run_id) or {}
             # 'skipped' is a target this run handed back to the queue when it
             # stopped at its budget. Counting it as unfinished made the wave
             # after the budget stop raise instead of no-opping, so a run that
