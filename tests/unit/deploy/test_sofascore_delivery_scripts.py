@@ -50,6 +50,18 @@ THU_0330 = "2026-09-03 03:30:00"
 SUN_0330 = "2026-09-06 03:30:00"
 
 
+def _installed_text(src: Path, stubs: Path) -> str:
+    """Текст копии, какой её кладёт стенд: автомат — с каталогом заглушек впереди PATH.
+    Та же копия лежит в тестовом репозитории (#1362): автомат сверяет себя с релизом по md5,
+    и релиз стенда обязан нести ровно установленный текст — иначе самоустановка поставила бы
+    копию с настоящим PATH, и следующий тик стенда пошёл бы в живой docker."""
+    text = src.read_text(encoding="utf-8")
+    if src == AUTO:
+        assert text.count(PATH_LINE) == 1, "автомат перестал фиксировать PATH — правь тест"
+        text = text.replace(PATH_LINE, PATH_LINE.replace("export PATH=", f"export PATH={stubs}:"))
+    return text
+
+
 def _script(directory: Path, name: str, body: str) -> Path:
     path = directory / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +80,23 @@ def _git(repo: Path, *args: str) -> str:
 def _epoch(when: str) -> int:
     return int(
         subprocess.run(["date", "-u", "-d", when, "+%s"], capture_output=True, text=True, check=True).stdout
+    )
+
+
+def _window(stand: "Stand", day: str) -> dict[str, str]:
+    """Запись окна `sofascore-window-<day>.env` как словарь (пустой — записи нет)."""
+    path = stand.state / f"sofascore-window-{day}.env"
+    if not path.exists():
+        return {}
+    return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
+
+
+def _put_window(stand: "Stand", day: str, **fields: str) -> None:
+    """Запись окна, какой её оставил прошлый тик (открытая — без OUTCOME)."""
+    base = {"WINDOW_ID": day, "LIVE": stand.old_sha, "TARGET": stand.new_sha, "LAST_REASON": ""}
+    base.update(fields)
+    (stand.state / f"sofascore-window-{day}.env").write_text(
+        "".join(f"{k}={v}\n" for k, v in base.items()), encoding="utf-8"
     )
 
 
@@ -157,6 +186,10 @@ exit "$rc"
         )
         for name in ("airflow.compose.yaml", "gateway.compose.yaml"):
             (self.source / "deploy" / "sofascore" / name).write_text("services: {}\n", encoding="utf-8")
+        for src in (AUTO, ENV_SH):
+            copy = self.source / "deploy" / "sofascore" / src.name
+            copy.write_text(_installed_text(src, self.stubs), encoding="utf-8")
+            copy.chmod(0o755)
         (self.source / "marker.txt").write_text("one\n", encoding="utf-8")
         _git(self.source, "add", "-A")
         _git(self.source, "commit", "-q", "-m", "one")
@@ -365,15 +398,14 @@ exit 0
         libexec = self.tmp / "libexec"
         libexec.mkdir(exist_ok=True)
         for src in (AUTO, ENV_SH):
-            text = src.read_text(encoding="utf-8")
-            if src == AUTO:
-                assert text.count(PATH_LINE) == 1, "автомат перестал фиксировать PATH — правь тест"
-                text = text.replace(PATH_LINE, PATH_LINE.replace("export PATH=", f"export PATH={self.stubs}:"))
-            (libexec / src.name).write_text(text, encoding="utf-8")
+            (libexec / src.name).write_text(_installed_text(src, self.stubs), encoding="utf-8")
             (libexec / src.name).chmod(0o755)
         return libexec / AUTO.name
 
-    def run(self, **extra: str) -> subprocess.CompletedProcess:
+    def run(self, *, keep_copy: bool = False, **extra: str) -> subprocess.CompletedProcess:
+        """Один тик cron. keep_copy — не переустанавливать копию: тик идёт тем, что в
+        libexec сейчас (в том числе копией, которую автомат поставил себе сам)."""
+        script = self.tmp / "libexec" / AUTO.name if keep_copy else self.install()
         env = {
             "PATH": os.environ["PATH"],
             "HOME": os.environ.get("HOME", "/nonexistent"),
@@ -386,7 +418,7 @@ exit 0
             **extra,
         }
         return subprocess.run(
-            ["bash", str(self.install())], env=env, capture_output=True, text=True, timeout=120
+            ["bash", str(script)], env=env, capture_output=True, text=True, timeout=120
         )
 
     # -- чтение результатов ------------------------------------------------------
@@ -524,6 +556,9 @@ def test_nothing_happens_when_production_already_runs_master(stand: Stand) -> No
     assert not stand.calls("compose") and not stand.calls("deploy")
     assert not list(stand.state.glob("sofascore-auto-deliver-attempted-*"))
     assert (stand.state / "sofascore-accepted").read_text(encoding="utf-8").strip() == stand.new_sha
+    # #1362: «бой = master» внутри окна больше не молчит — запись окна открыта с TARGET=-.
+    rec = _window(stand, stand.today)
+    assert rec["TARGET"] == "-" and "OUTCOME" not in rec, rec
 
 
 @pytest.mark.unit
@@ -662,6 +697,9 @@ def test_no_headroom_left_means_no_delivery_and_no_latch(stand: Stand) -> None:
     assert "запаса нет" in stand.log_text()
     assert not stand.calls("deploy")
     assert not list(stand.state.glob("sofascore-auto-deliver-attempted-*"))
+    # #1362: попыток в этом окне больше не будет — запись закрыта failed.
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and "запаса нет" in rec["REASON"], rec
 
 
 @pytest.mark.unit
@@ -741,6 +779,12 @@ def test_the_report_of_the_night_carries_the_drain_accounting(
     assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
     assert "✅" in stand.pending()
     assert expect in stand.pending(), stand.pending()
+    # #1362: ACCOUNTED переезжает в запись окна только из своего окна; f — всё равно delivered.
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "delivered", rec
+    own = content is not None and content.startswith("DRAIN_WINDOW_ID={today}")
+    want = content.split("DRAIN_ACCOUNTED=")[1].strip() if own else "unknown"
+    assert rec["ACCOUNTED"] == want, rec
 
 
 @pytest.mark.unit
@@ -774,15 +818,18 @@ def test_the_happy_path_delivers_accepts_and_restores_the_snapshot(stand: Stand)
 
 @pytest.mark.unit
 def test_rc4_means_the_contour_was_busy_and_nothing_was_touched(stand: Stand) -> None:
-    """Код 4 deploy.sh — «контур занят, выкат не начат»: откатывать нечего, защёлку сутки
-    держать не за что. Второй попытки за ночь всё равно не будет: IDLE_WAIT — это запас до
-    дедлайна, и следующий тик не пройдёт порог MIN_DRAIN."""
+    """Код 4 deploy.sh — «контур занят, выкат не начат»: откатывать нечего. #1362: это
+    провальная ночь — запись окна failed, защёлка остаётся (второй попытки за ночь нет:
+    IDLE_WAIT — весь запас до дедлайна)."""
     stand.watchdog_pids()
     stand.put("deploy_rc", "4")
     proc = stand.run()
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert not (stand.state / "sofascore-auto-deliver-attempted-2026-09-03").exists()
+    assert (stand.state / "sofascore-auto-deliver-attempted-2026-09-03").exists()
     assert not (stand.state / "sofascore-inflight").exists()
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and "rc=4" in rec["REASON"] and rec["RESTORED"] == "t", rec
+    assert "Ночь 1 из 3 подряд" in stand.pending(), stand.pending()
     assert not stand.calls("compose"), "отката не было"
     assert "контур не освободился" in stand.log_text()
     assert (stand.stub_state / f"paused_{HIST}").read_text().strip() == "f"
@@ -801,6 +848,10 @@ def test_a_delivery_timeout_is_named_and_rolled_back(stand: Stand) -> None:
     assert "ТАЙМАУТ доставки" in stand.log_text()
     assert stand.calls("compose"), "откат комплектом"
     assert "⛔" in stand.pending()
+    assert [p.name for p in stand.state.glob("sofascore-window-*")] == ["sofascore-window-2026-09-03.env"]
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and "124" in rec["REASON"], rec
+    assert stand.log_text().count("ИТОГ ОКНА") == 1
 
 
 @pytest.mark.unit
@@ -1066,6 +1117,8 @@ def test_a_delivery_that_leaves_the_campaign_paused_is_not_reported_as_success(s
     # Выключатель обязателен: контур стоит, и следующий коммит начал бы новый выкат прямо
     # на остановленной кампании.
     assert (stand.state / "sofascore-auto-deliver.off").exists()
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and rec["RESTORED"] == "f", rec
 
 
 @pytest.mark.unit
@@ -1140,7 +1193,7 @@ def test_an_interrupted_delivery_without_a_snapshot_touches_nothing(stand: Stand
 @pytest.mark.parametrize(
     "marker",
     ["sofascore-inflight", "sofascore-accepted", "sofascore-rollback.env",
-     "sofascore-pending-alert", "sofascore-auto-deliver.off", "sofascore-fail-nights",
+     "sofascore-pending-alert", "sofascore-auto-deliver.off", "sofascore-window-2026-09-03.env",
      # Ревью Sol, круг 3: доказательство учёта тоже своё состояние. Каталог на его месте
      # уронил бы `rm -f` в deploy.sh кодом 1 — и автомат откатил бы НЕТРОНУТЫЙ бой.
      "last-drain.env"],
@@ -1173,18 +1226,39 @@ def test_a_busy_lock_exits_quietly(stand: Stand) -> None:
 
 
 @pytest.mark.unit
-def test_three_failed_nights_in_a_row_shut_the_automaton_off(stand: Stand) -> None:
+@pytest.mark.parametrize(
+    ("history", "off"),
+    [
+        # Две провальные ночи до сегодняшней — третья глушит автомат.
+        ({"2026-09-01": "failed", "2026-09-02": "failed"}, True),
+        # unknown между failed серию не рвёт (не считает и не сбрасывает).
+        ({"2026-08-31": "failed", "2026-09-01": "unknown", "2026-09-02": "failed"}, True),
+        # delivered обрывает счёт.
+        ({"2026-08-31": "failed", "2026-09-01": "delivered", "2026-09-02": "failed"}, False),
+        # no-target и needs-hands пропускаются.
+        ({"2026-08-30": "failed", "2026-08-31": "no-target", "2026-09-01": "needs-hands",
+          "2026-09-02": "failed"}, True),
+    ],
+)
+def test_three_failed_nights_in_a_row_shut_the_automaton_off(
+    stand: Stand, history: dict[str, str], off: bool
+) -> None:
+    """Серия провалов выводится из записей окон (#1362); файла-счётчика больше нет."""
     stand.watchdog_pids()
-    (stand.state / "sofascore-fail-nights").write_text("2\n", encoding="utf-8")
+    for day, outcome in history.items():
+        _put_window(stand, day, OUTCOME=outcome, REASON="прошлая ночь", RESTORED="t")
     stand.put("deploy_rc", "5")
     stand.put("deploy_half")
     stand.put("rollback_root", str(stand.old_tree))
     stand.put("rollback_works")
     proc = stand.run()
     assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert (stand.state / "sofascore-fail-nights").read_text(encoding="utf-8").strip() == "3"
-    assert (stand.state / "sofascore-auto-deliver.off").exists()
-    assert "Больше не пробую" in stand.pending()
+    assert not (stand.state / "sofascore-fail-nights").exists()
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and rec["RESTORED"] == "t", rec
+    assert (stand.state / "sofascore-auto-deliver.off").exists() is off
+    assert ("Больше не пробую" in stand.pending()) is off
+    assert "ИТОГ ОКНА 2026-09-03" in stand.log_text()
 
 
 @pytest.mark.unit
@@ -1228,6 +1302,8 @@ def test_rc4_that_leaves_the_campaign_stopped_is_an_alarm_not_a_warning(stand: S
     assert (stand.state / "sofascore-auto-deliver.off").exists()
     assert not stand.calls("compose"), "выкат не начинался — откатывать нечего"
     assert not (stand.state / "sofascore-inflight").exists()
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and rec["RESTORED"] == "f", rec
 
 
 @pytest.mark.unit
@@ -1328,3 +1404,285 @@ def test_an_unreachable_master_still_announces_the_closing_window(stand: Stand) 
     first = stand.pending()
     stand.run()
     assert stand.pending() == first
+
+
+# ---- #1362: автомат = артефакт релиза -------------------------------------------------------
+
+def _advance_master(stand: Stand, automat_tail: str | None = None) -> None:
+    """Новый коммит в master стенда (к автомату в нём, если попросили, добавлен хвост);
+    цель доставки — он. Вызывать ДО watchdog_pids: сторож нового дерева смотрит на new_tree."""
+    if automat_tail is not None:
+        path = stand.source / "deploy" / "sofascore" / AUTO.name
+        path.write_text(path.read_text(encoding="utf-8") + automat_tail, encoding="utf-8")
+    (stand.source / "marker.txt").write_text("three\n", encoding="utf-8")
+    _git(stand.source, "commit", "-q", "-am", "three")
+    stand.new_sha = _git(stand.source, "rev-parse", "HEAD")
+    stand.new_tree = stand.releases / f"release-{stand.new_sha[:8]}"
+
+
+def _md5(path: Path) -> str:
+    import hashlib
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.unit
+def test_a_matching_automat_is_verified_before_the_delivery(stand: Stand) -> None:
+    """Копия = релиз → строка «сверен» с md5 обеих половин, доставка идёт, AUTOMAT=ok."""
+    stand.watchdog_pids()
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    copy = stand.tmp / "libexec" / AUTO.name
+    assert f"автомат сверен с релизом {stand.new_sha[:8]}: auto_deliver.sh {_md5(copy)}" in stand.log_text()
+    assert len(stand.calls("deploy")) == 1
+    rec = _window(stand, stand.today)
+    assert rec["AUTOMAT"] == "ok" and rec["OUTCOME"] == "delivered", rec
+
+
+@pytest.mark.unit
+def test_a_stale_automat_installs_itself_from_the_release_and_delivers_next_tick(stand: Stand) -> None:
+    """Копия ≠ релиз впервые → установлена из релиза атомарно, md5 совпал, тик вышел без
+    выката и без защёлки; следующий тик (уже новой копией) доставил."""
+    _advance_master(stand, "# новая версия автомата\n")
+    stand.watchdog_pids()
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    copy = stand.tmp / "libexec" / AUTO.name
+    assert _md5(copy) == _md5(stand.new_tree / "deploy" / "sofascore" / AUTO.name)
+    assert copy.stat().st_mode & 0o777 == 0o755
+    assert "автомат обновлён из релиза" in stand.log_text()
+    assert (stand.state / f"sofascore-automat-installed-{stand.new_sha[:8]}").exists()
+    assert not stand.calls("deploy")
+    assert not list(stand.state.glob("sofascore-auto-deliver-attempted-*"))
+    assert not list((stand.tmp / "libexec").glob(".*install-tmp"))
+    rec = _window(stand, stand.today)
+    assert rec["AUTOMAT"] == "installed" and "OUTCOME" not in rec, rec
+
+    stand.put("now_epoch", str(_epoch("2026-09-03 03:35:00")))
+    proc = stand.run(keep_copy=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    assert "автомат сверен с релизом" in stand.log_text()
+    assert len(stand.calls("deploy")) == 1
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "delivered" and rec["AUTOMAT"] == "ok", rec
+
+
+def _assert_mismatch(stand: Stand, proc: subprocess.CompletedProcess, copy_md5: str) -> None:
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    assert (stand.state / "sofascore-automat-mismatch-2026-09-03").exists()
+    assert (stand.state / "sofascore-auto-deliver-attempted-2026-09-03").exists()
+    assert not stand.calls("deploy") and not stand.calls("compose")
+    assert _md5(stand.tmp / "libexec" / AUTO.name) == copy_md5, "копия не подменена наполовину"
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and rec["AUTOMAT"] == "mismatch", rec
+    assert "автомат ≠ релиз" in rec["REASON"], rec
+    assert "⛔" in stand.pending() and "не совпадает с релизом" in stand.pending()
+
+
+@pytest.mark.unit
+def test_a_stale_automat_after_an_install_is_a_red_night(stand: Stand) -> None:
+    """Копия ≠ релиз, а отметка об установке из этого релиза уже стоит → красный маркер,
+    запись failed, доставки нет, тревога."""
+    _advance_master(stand, "# новая версия автомата\n")
+    stand.watchdog_pids()
+    (stand.state / f"sofascore-automat-installed-{stand.new_sha[:8]}").touch()
+    copy_md5 = _md5(stand.install())
+    _assert_mismatch(stand, stand.run(keep_copy=True), copy_md5)
+
+
+@pytest.mark.unit
+def test_an_automat_that_cannot_install_itself_is_a_red_night(stand: Stand) -> None:
+    """Каталог копии недоступен на запись (стенд идёт от root, поэтому невозможность записи
+    изображается каталогом на месте временного файла установки) → то же, что выше."""
+    _advance_master(stand, "# новая версия автомата\n")
+    stand.watchdog_pids()
+    copy_md5 = _md5(stand.install())
+    blocker = stand.tmp / "libexec" / f".{AUTO.name}.install-tmp"
+    blocker.mkdir()
+    (blocker / "keep").touch()
+    _assert_mismatch(stand, stand.run(keep_copy=True), copy_md5)
+    assert "установка копии из релиза не удалась" in _window(stand, stand.today)["REASON"]
+
+
+# ---- #1265 / #1362: запись окна ------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_quiet_night_is_one_record_closed_as_no_target_at_the_deadline(stand: Stand) -> None:
+    _production_on_master(stand)
+    for when in ("2026-09-03 03:30:00", "2026-09-03 04:10:00"):
+        stand.put("now_epoch", str(_epoch(when)))
+        assert stand.run().returncode == 0
+    assert [p.name for p in stand.state.glob("sofascore-window-*")] == ["sofascore-window-2026-09-03.env"]
+    rec = _window(stand, stand.today)
+    assert rec["TARGET"] == "-" and "OUTCOME" not in rec and len(rec["SCRIPT_SHA"]) == 64, rec
+    stand.put("now_epoch", str(_epoch("2026-09-03 06:05:00")))
+    assert stand.run().returncode == 0
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "no-target", rec
+    assert "ИТОГ ОКНА 2026-09-03: цель -, исход no-target" in stand.log_text()
+
+
+@pytest.mark.unit
+def test_a_commit_that_appears_inside_the_window_is_delivered_not_no_target(stand: Stand) -> None:
+    stand.watchdog_pids()
+    _git(stand.source, "update-ref", "refs/heads/master", stand.old_sha)   # master = бой
+    assert stand.run().returncode == 0
+    assert _window(stand, stand.today)["TARGET"] == "-"
+    _git(stand.source, "update-ref", "refs/heads/master", stand.new_sha)   # коммит появился
+    stand.put("now_epoch", str(_epoch("2026-09-03 03:35:00")))
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    rec = _window(stand, stand.today)
+    assert rec["TARGET"] == stand.new_sha and rec["OUTCOME"] == "delivered", rec
+
+
+@pytest.mark.unit
+def test_a_failed_freeze_keeps_the_record_open_and_the_next_tick_delivers(stand: Stand) -> None:
+    stand.watchdog_pids()
+    stand.put("freeze_fails")
+    assert stand.run().returncode == 1
+    rec = _window(stand, stand.today)
+    assert "OUTCOME" not in rec and "заморозка" in rec["LAST_REASON"], rec
+    (stand.stub_state / "freeze_fails").unlink()
+    stand.put("now_epoch", str(_epoch("2026-09-03 03:35:00")))
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "delivered" and "заморозка" in rec["LAST_REASON"], rec
+
+
+@pytest.mark.unit
+def test_a_contour_busy_until_the_deadline_is_a_failed_night(stand: Stand) -> None:
+    stand.put("busy", "1")
+    assert stand.run().returncode == 0
+    assert "контур занят" in _window(stand, stand.today)["LAST_REASON"]
+    stand.put("now_epoch", str(_epoch("2026-09-03 06:05:00")))
+    assert stand.run().returncode == 0
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "failed" and rec["REASON"].startswith("окно истекло: контур занят"), rec
+    assert not stand.calls("deploy")
+
+
+@pytest.mark.unit
+def test_an_unreachable_master_all_window_long_is_unknown(stand: Stand) -> None:
+    stand.env_file.write_text(
+        stand.env_file.read_text(encoding="utf-8").replace(
+            f"SOFASCORE_SOURCE_REPO={stand.source}", f"SOFASCORE_SOURCE_REPO={stand.tmp}/no-such-repo"
+        ),
+        encoding="utf-8",
+    )
+    assert stand.run().returncode == 0
+    assert _window(stand, stand.today)["TARGET"] == "?"
+    stand.put("now_epoch", str(_epoch("2026-09-03 06:05:00")))
+    assert stand.run().returncode == 0
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "unknown" and "master недоступен" in rec["REASON"], rec
+
+
+@pytest.mark.unit
+def test_a_missing_record_for_yesterday_is_closed_as_unknown_on_the_first_tick(stand: Stand) -> None:
+    _put_window(stand, "2026-09-01", OUTCOME="delivered", REASON="приёмка подтверждена", RESTORED="t")
+    stand.put("now_epoch", str(_epoch("2026-09-03 01:00:00")))
+    assert stand.run().returncode == 0
+    rec = _window(stand, "2026-09-02")
+    assert rec["OUTCOME"] == "unknown" and "не работал" in rec["REASON"], rec
+    assert _window(stand, stand.today) == {}, "сегодняшнее окно ещё не началось"
+
+
+@pytest.mark.unit
+def test_the_very_first_recording_tick_does_not_invent_past_windows(stand: Stand) -> None:
+    """Копия, впервые пишущая записи, окон до себя не видела — «unknown» за вчера был бы
+    ложной тревогой в первое же утро после установки."""
+    stand.put("now_epoch", str(_epoch("2026-09-03 01:00:00")))
+    assert stand.run().returncode == 0
+    assert not list(stand.state.glob("sofascore-window-*"))
+
+
+@pytest.mark.unit
+def test_the_switch_still_closes_overdue_windows_but_touches_nothing(stand: Stand) -> None:
+    """.off + INFLIGHT + смешанные монты: записи исходов — да, изменения контура — нет."""
+    stand.watchdog_pids()
+    (stand.state / "sofascore-auto-deliver.off").touch()
+    _put_window(stand, "2026-09-02", LAST_REASON="контур занят")
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(WINDOW_ID="2026-09-03")
+    stand.put("mounts_root", str(stand.new_tree))
+    env_before = stand.env_file.read_text(encoding="utf-8")
+    stand.put("now_epoch", str(_epoch("2026-09-03 07:00:00")))
+    assert stand.run().returncode == 0
+    assert _window(stand, "2026-09-02")["OUTCOME"] == "failed"
+    assert _window(stand, stand.today) == {}, "окно разбираемой доставки оставлено разбору"
+    assert not stand.calls("deploy") and not stand.calls("compose")
+    assert stand.env_file.read_text(encoding="utf-8") == env_before
+    assert not [c for c in stand.calls("docker") if " dags " in c or " pools " in c]
+
+
+@pytest.mark.unit
+def test_an_interrupted_delivery_is_accounted_to_its_own_window_next_day(stand: Stand) -> None:
+    stand.watchdog_pids()
+    _put_window(stand, "2026-09-03", ATTEMPT_AT="2026-09-03T03:31:00Z")
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot(WINDOW_ID="2026-09-03")
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    stand.put("now_epoch", str(_epoch("2026-09-04 02:00:00")))
+    proc = stand.run()
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    rec = _window(stand, "2026-09-03")
+    assert rec["OUTCOME"] == "failed" and "откат после обрыва" in rec["REASON"], rec
+    assert _window(stand, "2026-09-04") == {}
+
+
+@pytest.mark.unit
+def test_a_break_between_acceptance_and_clearing_the_marker_is_rolled_back_as_failed(stand: Stand) -> None:
+    stand.watchdog_pids()
+    _put_window(stand, "2026-09-03", DELIVERY_PHASE="finishing")
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot()
+    stand.put("mounts_root", str(stand.new_tree))
+    stand.put("mounts_sched_root", str(stand.new_tree))
+    stand.put("rollback_root", str(stand.old_tree))
+    stand.put("rollback_works")
+    stand.put("now_epoch", str(_epoch("2026-09-03 04:00:00")))
+    assert stand.run().returncode == 1
+    assert _window(stand, stand.today)["OUTCOME"] == "failed"
+    assert len(stand.calls("compose")) == 2
+
+
+@pytest.mark.unit
+def test_a_break_between_clearing_the_marker_and_the_record_is_unknown(stand: Stand) -> None:
+    _put_window(stand, "2026-09-03", DELIVERY_PHASE="finishing")
+    stand.put("now_epoch", str(_epoch("2026-09-03 06:05:00")))
+    stand.run()
+    rec = _window(stand, stand.today)
+    assert rec["OUTCOME"] == "unknown" and "обрыв между снятием" in rec["REASON"], rec
+
+
+@pytest.mark.unit
+def test_an_inflight_marker_next_to_a_delivered_record_breaks_the_invariant(stand: Stand) -> None:
+    _put_window(stand, "2026-09-03", OUTCOME="delivered", REASON="приёмка подтверждена", RESTORED="t")
+    (stand.state / "sofascore-inflight").touch()
+    stand.write_snapshot()
+    assert stand.run().returncode == 1
+    assert _window(stand, stand.today)["OUTCOME"] == "unknown"
+    assert (stand.state / "sofascore-auto-deliver.off").exists()
+    assert "🆘" in stand.pending()
+    assert not stand.calls("compose")
+
+
+@pytest.mark.unit
+def test_a_success_is_written_last_with_the_night_summary(stand: Stand) -> None:
+    stand.watchdog_pids()
+    proc = stand.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    rec = _window(stand, stand.today)
+    for key in ("WINDOW_ID", "LIVE", "TARGET", "SCRIPT_SHA", "OPENED_AT", "OUTCOME", "REASON",
+                "ACCOUNTED", "RESTORED", "CLOSED_AT", "AUTOMAT"):
+        assert key in rec, (key, rec)
+    assert rec["OUTCOME"] == "delivered" and rec["DELIVERY_PHASE"] == "finishing", rec
+    assert rec["TARGET"] == stand.new_sha and rec["LIVE"] == stand.old_sha, rec
+    log = stand.log_text()
+    assert log.index("ДОСТАВЛЕНО") < log.index("ИТОГ ОКНА 2026-09-03")
+    assert f"ИТОГ ОКНА 2026-09-03: цель {stand.new_sha[:8]}, исход delivered" in log
+    assert not list(stand.state.glob("*.tmp"))
