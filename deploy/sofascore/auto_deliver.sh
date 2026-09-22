@@ -43,9 +43,26 @@ HERE=$(dirname "$(readlink -f "$0")")
 # при расхождении она ставит себя из релиза сама. Путь — только отсюда, без зашитого
 # /usr/local/libexec: копия живёт там, куда её поставили.
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
+md5_of(){ md5sum "$1" 2>/dev/null | cut -c1-32; }
+# Сверяется то, что этот процесс РЕАЛЬНО исполняет, а не файл по пути (Astra, круг 1): экземпляр
+# cron, загрузившийся до самоустановки и получивший замок после неё, иначе сверил бы уже новый
+# файл и пошёл доставлять старым кодом. bash держит скрипт открытым на fd 255, и после `mv -f`
+# этот дескриптор ведёт на прежний инод («… (deleted)»). env.sh читается через свой дескриптор,
+# и md5 берётся с него же — ровно тот текст, что загружен в процесс.
+case "$(readlink "/proc/$$/fd/255" 2>/dev/null)" in
+  "$SELF"|"$SELF (deleted)") RUN_MD5=$(md5_of "/proc/$$/fd/255") ;;
+  *) RUN_MD5=$(md5_of "$SELF") ;;
+esac
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
-# shellcheck source=deploy/sofascore/env.sh
-. "$HERE/env.sh"
+RUN_ENV_MD5=""
+if { exec {ENV_SH_FD}<"$HERE/env.sh"; } 2>/dev/null; then
+  RUN_ENV_MD5=$(md5_of "/proc/$$/fd/$ENV_SH_FD")
+  # shellcheck source=deploy/sofascore/env.sh
+  . "/proc/$$/fd/$ENV_SH_FD"
+  exec {ENV_SH_FD}<&-
+else
+  . "$HERE/env.sh"
+fi
 sofascore_load_env "$ENV_FILE" || exit 2
 export SOFASCORE_ENV_FILE="$ENV_FILE"   # тот же файл читают freeze_release.sh и deploy.sh
 
@@ -718,7 +735,6 @@ close_overdue_windows(){
 }
 
 # --- автомат = артефакт релиза (#1362) -----------------------------------------------------
-md5_of(){ md5sum "$1" 2>/dev/null | cut -c1-32; }
 # Атомарно рядом с целью: tmp + chmod + mv -f. Работающий bash держит старый инод и
 # дочитывает старую копию; следующий тик cron идёт уже новой. 0 — только при совпавшем md5.
 install_copy(){  # install_copy <источник> <цель>
@@ -739,18 +755,27 @@ install_copy(){  # install_copy <источник> <цель>
 # установки или установить не удалось — красный маркер и ночь без доставки: смешанные
 # версии автомата и рецепта небезопасны (план 1245 §3.4).
 ensure_automat_matches_release(){  # ensure_automat_matches_release <дерево релиза>
-  local new="$1" sha8=${WANT:0:8} m_run m_env r_run r_env marker ok=1 why
-  m_run=$(md5_of "$SELF"); m_env=$(md5_of "$HERE/env.sh")
+  local new="$1" sha8=${WANT:0:8} m_run m_env d_run d_env r_run r_env marker ok=1 why
+  # m_* — что исполняет этот процесс (снято при старте), d_* — что лежит на диске сейчас.
+  m_run=$RUN_MD5; m_env=$RUN_ENV_MD5
+  d_run=$(md5_of "$SELF"); d_env=$(md5_of "$HERE/env.sh")
   r_run=$(md5_of "$new/deploy/sofascore/auto_deliver.sh"); r_env=$(md5_of "$new/deploy/sofascore/env.sh")
   if [ -n "$r_run" ] && [ -n "$r_env" ] && [ "$m_run" = "$r_run" ] && [ "$m_env" = "$r_env" ]; then
     log "автомат сверен с релизом $sha8: auto_deliver.sh $m_run, env.sh $m_env"
     win_write "$TODAY" "AUTOMAT=ok" || true
     return 0
   fi
+  # На диске уже релиз, а этот экземпляр загружен раньше замены: доставлять им нельзя, ставить
+  # нечего. Выходим без защёлки и без отметок — следующий тик cron пойдёт копией с диска.
+  if [ -n "$r_run" ] && [ -n "$r_env" ] && [ "$d_run" = "$r_run" ] && [ "$d_env" = "$r_env" ]; then
+    log "работающий экземпляр автомата старше копии на диске (исполняется ${m_run:-?}/${m_env:-?}, на диске релиз $sha8) — тик без доставки, следующий пойдёт новой копией"
+    win_write "$TODAY" "LAST_REASON=экземпляр автомата старше копии на диске — доставка следующим тиком" || true
+    exit 0
+  fi
   marker=$STATE/sofascore-automat-installed-$sha8
   if [ -n "$r_run" ] && [ -n "$r_env" ] && ! is_plain "$marker" && ! odd_path "$marker"; then
-    [ "$m_env" = "$r_env" ] || install_copy "$new/deploy/sofascore/env.sh" "$HERE/env.sh" || ok=0
-    [ "$ok" = 1 ] && { [ "$m_run" = "$r_run" ] || install_copy "$new/deploy/sofascore/auto_deliver.sh" "$SELF" || ok=0; }
+    [ "$d_env" = "$r_env" ] || install_copy "$new/deploy/sofascore/env.sh" "$HERE/env.sh" || ok=0
+    [ "$ok" = 1 ] && { [ "$d_run" = "$r_run" ] || install_copy "$new/deploy/sofascore/auto_deliver.sh" "$SELF" || ok=0; }
     if [ "$ok" = 1 ]; then
       mk_marker "$marker" || log "не смог поставить отметку $marker"
       log "автомат обновлён из релиза $sha8: auto_deliver.sh ${m_run:-?}→$r_run, env.sh ${m_env:-?}→$r_env"

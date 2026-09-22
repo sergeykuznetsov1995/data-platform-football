@@ -241,6 +241,13 @@ if [ -e "$S/env_swap_root" ] && [ ! -e "$S/env_swapped" ]; then
   sed -i "s#^SOFASCORE_RELEASE_ROOT=.*#SOFASCORE_RELEASE_ROOT=$(cat "$S/env_swap_root")#" \
     "${SOFASCORE_ENV_FILE:?}"
 fi
+# Самоустановка другим экземпляром (#1362, Astra круг 1): пока этот экземпляр ждал замок,
+# копию на диске уже заменили (новый инод), а исполняется он прежним текстом.
+if [ -e "$S/swap_copy_from" ] && [ ! -e "$S/swap_copy_done" ]; then
+  : > "$S/swap_copy_done"
+  to=$(cat "$S/swap_copy_to")
+  cp "$(cat "$S/swap_copy_from")" "$to.swap" && chmod 0755 "$to.swap" && mv -f "$to.swap" "$to"
+fi
 exec /usr/bin/flock "$@"
 ''',
         )
@@ -1690,3 +1697,31 @@ def test_a_success_is_written_last_with_the_night_summary(stand: Stand) -> None:
     assert log.index("ДОСТАВЛЕНО") < log.index("ИТОГ ОКНА 2026-09-03")
     assert f"ИТОГ ОКНА 2026-09-03: цель {stand.new_sha[:8]}, исход delivered" in log
     assert not list(stand.state.glob("*.tmp"))
+
+
+@pytest.mark.unit
+def test_an_instance_loaded_before_the_self_install_does_not_deliver(stand: Stand) -> None:
+    """Astra, круг 1, P1: экземпляр cron загрузился старой копией, ждал замок, а копию на диске
+    тем временем заменили релизом. Сверка по файлу сказала бы «сверен», и доставку повёл бы
+    старый код. Сверяется то, что исполняется: тик без доставки, без защёлки и без отметок."""
+    _advance_master(stand, "# новая версия автомата\n")
+    stand.watchdog_pids()
+    copy = stand.install()
+    old_md5 = _md5(copy)
+    stand.put("swap_copy_from", str(stand.source / "deploy" / "sofascore" / AUTO.name))
+    stand.put("swap_copy_to", str(copy))
+    proc = stand.run(keep_copy=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    assert _md5(copy) != old_md5, "копию на диске заменили во время тика"
+    assert "работающий экземпляр автомата старше копии на диске" in stand.log_text()
+    assert "автомат сверен" not in stand.log_text()
+    assert not stand.calls("deploy") and not stand.calls("compose")
+    assert not list(stand.state.glob("sofascore-auto-deliver-attempted-*"))
+    assert not list(stand.state.glob("sofascore-automat-*"))
+    rec = _window(stand, stand.today)
+    assert "OUTCOME" not in rec and rec.get("AUTOMAT", "") != "ok", rec
+    # Следующий тик идёт копией с диска — уже релизной — и доставляет.
+    stand.put("now_epoch", str(_epoch("2026-09-03 03:35:00")))
+    proc = stand.run(keep_copy=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr + stand.log_text()
+    assert _window(stand, stand.today)["OUTCOME"] == "delivered"

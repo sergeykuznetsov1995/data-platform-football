@@ -247,8 +247,10 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 ```bash
 install -d -m 0755 /usr/local/libexec/sofascore
 cp -p /usr/local/libexec/sofascore/auto_deliver.sh "$SOFASCORE_AUTO_STATE_DIR/auto_deliver.sh.prev-$(date -u +%Y%m%d)"
+pgrep -af '[a]uto_deliver.sh'    # пусто: тик старой копии не идёт (и после установки — тоже пусто)
 flock -w 120 "$SOFASCORE_AUTO_STATE_DIR/sofascore-auto-deliver.lock" \
   install -m 0755 deploy/sofascore/auto_deliver.sh deploy/sofascore/env.sh /usr/local/libexec/sofascore/
+pgrep -af '[a]uto_deliver.sh'
 md5sum /usr/local/libexec/sofascore/{auto_deliver.sh,env.sh} deploy/sofascore/{auto_deliver.sh,env.sh}   # пары равны
 install -d -m 0755 "$SOFASCORE_AUTO_STATE_DIR"     # автомат его НЕ создаёт: см. ниже
 : > "$SOFASCORE_AUTO_STATE_DIR/sofascore-auto-deliver.off"   # (первый раз на хосте) выключатель на время проверки
@@ -294,6 +296,10 @@ install -d -m 0755 "$SOFASCORE_AUTO_STATE_DIR"     # автомат его НЕ 
   отметка, строка `автомат обновлён из релиза <sha8>: <old>→<new>`, `AUTOMAT=installed`, тик
   выходит **без защёлки**: следующий тик (≤ 5 мин) доставляет уже новой копией, замороженное
   дерево переиспользуется;
+- сверяется то, что процесс **исполняет** (md5 снимается при старте с дескриптора скрипта и
+  с того дескриптора, через который загружен `env.sh`), а не файл по пути: экземпляр,
+  загруженный до замены и получивший замок после неё, видит «на диске уже релиз» и выходит без
+  доставки, без защёлки и без отметок — следующий тик идёт копией с диска;
 - не совпало после установки из этого же релиза, установка не удалась или в релизе нет
   файлов — красный маркер `sofascore-automat-mismatch-<дата>`, ⛔ в Telegram, запись окна
   `failed` (`AUTOMAT=mismatch`), защёлка — доставки в это окно нет. Лечение — установка
