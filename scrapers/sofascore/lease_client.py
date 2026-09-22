@@ -1,10 +1,11 @@
 """Small fail-closed client for proxy-filter's SofaScore session leases.
 
 Control-channel retries are explicit, typed and per-method (#1349): a network
-failure of the gateway's own control plane is retried for the idempotent reads
-and closes (``stats``, ``finish_endpoint``, ``close``) and, for the stateful
-POSTs (``acquire``, ``begin_endpoint``), only when the request provably never
-reached the gateway.  An exhausted retry budget raises
+failure of the gateway's own control plane is retried for the idempotent
+``stats`` and ``close`` and, for the state-changing ``acquire``,
+``begin_endpoint`` and ``finish_endpoint`` (a repeated endpoint DELETE is
+refused as stale once the first one landed), only when the request provably
+never reached the gateway.  An exhausted retry budget raises
 :class:`SofascoreLeaseControlUnavailable`.  One lease is owned by one logical
 Airflow task and one warmed browser session; endpoint payloads share its exact
 provider-path byte counter.
@@ -73,19 +74,13 @@ class SofascoreLeaseControlUnavailable(SofascoreLeaseProtocolError):
         self.elapsed_seconds = elapsed_seconds
 
 
-# Methods that create gateway state: a request that may have reached the
-# gateway is never repeated (a doubled lease/boundary is worse than one lost
-# attempt).  Everything else on this channel is an idempotent read or close.
-_STATEFUL_CONTROL_METHODS = frozenset({"POST"})
-
-
 def _control_network_failure(exc: BaseException) -> Optional[bool]:
     """Classify a control-channel ``requests`` failure.
 
     Returns ``None`` for anything that is not a network failure, ``True`` when
     the request provably never left this process (connect refused/timed out),
     ``False`` when it may have reached the gateway (read timeout, connection
-    dropped after sending).
+    dropped after sending, response body cut mid-stream).
     """
     try:
         from requests import exceptions as requests_exceptions
@@ -99,7 +94,9 @@ def _control_network_failure(exc: BaseException) -> Optional[bool]:
         if isinstance(reason, MaxRetryError):
             reason = reason.reason
         return isinstance(reason, NewConnectionError)
-    if isinstance(exc, requests_exceptions.Timeout):
+    if isinstance(
+        exc, (requests_exceptions.Timeout, requests_exceptions.ChunkedEncodingError)
+    ):
         return False
     return None
 
@@ -694,8 +691,14 @@ class SofascoreLeaseClient:
         token: str,
         payload: Optional[Mapping[str, Any]],
         headers: Mapping[str, str],
+        idempotent: bool,
     ) -> Any:
-        """One control request under the typed per-method retry policy."""
+        """One control request under the typed per-method retry policy.
+
+        A request that may have reached the gateway is repeated only when it is
+        ``idempotent``; a state-changing one (lease, endpoint boundary) is
+        repeated only after a failure that proves it was never sent.
+        """
         started = self._clock()
         attempt = 0
         while True:
@@ -717,9 +720,7 @@ class SofascoreLeaseClient:
                     ) from exc
                 elapsed = self._clock() - started
                 delay = self._retry_delay(attempt)
-                retry_allowed = (
-                    not_sent or method not in _STATEFUL_CONTROL_METHODS
-                )
+                retry_allowed = not_sent or idempotent
                 if (
                     not retry_allowed
                     or attempt >= self.control_retry_attempts
@@ -740,12 +741,18 @@ class SofascoreLeaseClient:
         *,
         token: str = "",
         payload: Optional[Mapping[str, Any]] = None,
+        idempotent: bool = False,
     ) -> Mapping[str, Any]:
         headers = {"X-Proxy-Control-Token": self._control_token}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         response = self._send(
-            method, path, token=token, payload=payload, headers=headers
+            method,
+            path,
+            token=token,
+            payload=payload,
+            headers=headers,
+            idempotent=idempotent,
         )
         status = int(getattr(response, "status_code", 0) or 0)
         try:
@@ -938,6 +945,7 @@ class SofascoreLeaseClient:
             "GET",
             f"/v1/leases/{quote(lease.lease_id, safe='')}/stats",
             token=lease.token,
+            idempotent=True,
         )
         stats = SofascoreLeaseStats.from_mapping(body)
         self._validate_stats_provenance(lease, stats)
@@ -1030,6 +1038,7 @@ class SofascoreLeaseClient:
             f"/v1/leases/{quote(lease.lease_id, safe='')}/close",
             token=lease.token,
             payload=payload,
+            idempotent=True,
         )
         stats = SofascoreLeaseStats.from_mapping(body)
         self._validate_stats_provenance(lease, stats)

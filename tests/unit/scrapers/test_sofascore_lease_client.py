@@ -620,21 +620,55 @@ def test_stats_read_timeout_is_retried_and_the_third_attempt_answers():
     assert sleeps == [1.0, 2.0]
 
 
-def test_finish_endpoint_and_close_retry_a_dropped_connection():
-    lease = _production_lease(token="token")
-    session = _Session(
-        _read_timeout(),
-        _Response(200, _stats_payload()),
-        _refused(),
-        _Response(200, _stats_payload(closed=True)),
-    )
+def test_finish_endpoint_read_timeout_is_not_repeated():
+    # The gateway clears the endpoint boundary on the first DELETE; a repeat
+    # after a lost response is refused as stale (filter_proxy
+    # _finish_endpoint_request), turning a landed close into a failure.
+    session = _Session(_read_timeout(), _Response(200, _stats_payload()))
     client, sleeps = _retrying_client(session)
 
-    client.finish_endpoint(lease, "endpoint-1")
-    client.close(lease)
+    with pytest.raises(SofascoreLeaseControlUnavailable) as captured:
+        client.finish_endpoint(_production_lease(token="token"), "endpoint-1")
 
-    assert [call[0] for call in session.calls] == ["DELETE"] * 4
-    assert sleeps == [1.0, 1.0]
+    assert len(session.calls) == 1
+    assert sleeps == []
+    assert captured.value.attempts == 1
+    assert "Read timed out" in str(captured.value)
+
+
+def test_finish_endpoint_is_repeated_only_when_never_sent():
+    session = _Session(_refused(), _Response(200, _stats_payload()))
+    client, sleeps = _retrying_client(session)
+
+    client.finish_endpoint(_production_lease(token="token"), "endpoint-1")
+
+    assert [call[0] for call in session.calls] == ["DELETE", "DELETE"]
+    assert sleeps == [1.0]
+
+
+def test_close_retries_a_read_timeout():
+    session = _Session(_read_timeout(), _Response(200, _stats_payload(closed=True)))
+    client, sleeps = _retrying_client(session)
+
+    client.close(_production_lease(token="token"))
+
+    assert len(session.calls) == 2
+    assert sleeps == [1.0]
+
+
+def test_stats_body_cut_mid_stream_is_a_retried_channel_failure():
+    cut_body = requests.exceptions.ChunkedEncodingError(
+        "Connection broken: IncompleteRead(12 bytes read, 88 more expected)"
+    )
+    session = _Session(cut_body, cut_body, cut_body, cut_body)
+    client, sleeps = _retrying_client(session)
+
+    with pytest.raises(SofascoreLeaseControlUnavailable) as captured:
+        client.stats(_production_lease(token="token"))
+
+    assert len(session.calls) == 4
+    assert sleeps == [1.0, 2.0, 4.0]
+    assert "control channel failure" in str(captured.value)
 
 
 def test_control_retry_time_budget_stops_before_the_attempt_cap():
