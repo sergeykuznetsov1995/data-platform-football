@@ -341,8 +341,10 @@ def test_cycle_result_names_a_control_channel_failure(tmp_path, monkeypatch):
                 "status_counts": {"retryable_failure": 1},
                 "endpoints": 1,
                 "request_count": 2,
+                "source_request_count": 0,
                 "paid_proxy_bytes": 0,
                 "control_channel_failures": 1,
+                "accounting_uncertain": 0,
             },
         }))
         return 1
@@ -363,6 +365,10 @@ def test_cycle_result_names_a_control_channel_failure(tmp_path, monkeypatch):
     assert "control channel failure (GET /v1/leases/lease-1/stats, 4 attempts" in error
     assert "attempts: [attempt 1: TransportError: SofaScore control channel" in error
     assert "budget exhausted" not in error
+    season = result["phases"][0]
+    assert season["control_channel_failures"] == 1
+    assert season["accounting_uncertain"] == 0
+    assert season["source_request_count"] == 0
 
 
 @pytest.mark.unit
