@@ -46,6 +46,11 @@ from utils.fbref_pipeline_tasks import (
 INGEST_DAG_ID = "dag_ingest_fbref"
 BOOTSTRAP_DAG_ID = FBREF_BOOTSTRAP_DAG_ID
 
+# Decision 3 of the 21.09 grill keeps player pages and their match logs out of
+# both lanes: they are 77.8% of the frontier and 67% of the paid history bytes
+# and no Bronze product reads them.  The seed filter in the pipeline stops new
+# ones from being born; this list stops the 261,932 queued ones from being
+# claimed or fetched.  Their frontier state is untouched (#1321).
 PAGE_KINDS = (
     "competition_index",
     "competition",
@@ -54,8 +59,6 @@ PAGE_KINDS = (
     "schedule",
     "standings",
     "squad",
-    "player",
-    "matchlog",
     "match",
 )
 
@@ -76,6 +79,10 @@ CURRENT_MAX_BATCHES = 14
 # this factory as an explicit first-parent modification instead of silently
 # leaving production on the old cap-80 bytes.
 CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-14-v1"
+# Deployment marker for the reviewed no-players page-kind policy, carried the
+# same way as the cap above so a delivery cannot silently leave production on
+# the old list that still claims player and matchlog pages.
+CURRENT_PAGE_KINDS_POLICY = "fbref-current-page-kinds-no-players-v1"
 # Absolute wall-clock budget for the batch loop: six hours minus half an
 # hour, so the batch that is running when the budget expires still has room
 # to finish, close its lease and reconcile the meter before the six-hour
@@ -455,6 +462,7 @@ __all__ = [
     "BOOTSTRAP_DAG_ID",
     "CURRENT_MAX_BATCHES",
     "CURRENT_MAX_BATCHES_POLICY",
+    "CURRENT_PAGE_KINDS_POLICY",
     "CURRENT_WAVE_DEADLINE_SECONDS",
     "INGEST_DAG_ID",
     "PAGE_KINDS",

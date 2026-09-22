@@ -108,6 +108,10 @@ class TestFBrefCurrentTopology:
             factory.CURRENT_MAX_BATCHES_POLICY
             == "fbref-current-max-batches-14-v1"
         )
+        assert (
+            factory.CURRENT_PAGE_KINDS_POLICY
+            == "fbref-current-page-kinds-no-players-v1"
+        )
         assert factory.CURRENT_MAX_BATCHES == 14
         assert module.CURRENT_MAX_BATCHES == 14
         assert len(tasks) == 16
@@ -139,6 +143,18 @@ class TestFBrefCurrentTopology:
         )
         assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
         assert live.op_kwargs["page_kinds"] == module.PAGE_KINDS
+        assert "player" not in live.op_kwargs["page_kinds"]
+        assert "matchlog" not in live.op_kwargs["page_kinds"]
+        assert module.PAGE_KINDS == (
+            "competition_index",
+            "competition",
+            "season",
+            "season_stats",
+            "schedule",
+            "standings",
+            "squad",
+            "match",
+        )
         assert live.op_kwargs["max_batches"] == factory.CURRENT_MAX_BATCHES
         assert factory.CURRENT_WAVE_DEADLINE_SECONDS == 19800
         assert live.op_kwargs["deadline_seconds"] == (

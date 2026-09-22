@@ -51,14 +51,15 @@ from utils.fbref_pipeline_tasks import (
 )
 
 
+# History follows the same decision 3 as the daily lane: player pages and their
+# match logs are out of scope, so the backfill must not claim or fetch them
+# either (#1321).
 BACKFILL_PAGE_KINDS = (
     "season",
     "season_stats",
     "schedule",
     "standings",
     "squad",
-    "player",
-    "matchlog",
     "match",
 )
 BACKFILL_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT

@@ -66,6 +66,7 @@ from scrapers.fbref.pipeline import (
     SENTINEL_COMPETITIONS,
     WaveResult,
     _is_mass_redirect,
+    _is_squad_non_roster_url,
     _is_run_mass_redirect,
     _season_with_registry_redirect,
     affordable_clearance_reservation,
@@ -3531,12 +3532,13 @@ def test_seed_links_persists_one_ordered_batch_per_observation(tmp_path):
     _, parent_record = _commit_for_parse(raw, parent, "<html></html>")
     links = [
         DiscoveredPageLink(
-            page_kind="player",
+            page_kind="squad",
             canonical_url=(
-                f"https://fbref.com/en/players/{index:08x}/Player"
+                f"https://fbref.com/en/squads/{index:08x}/Squad-Stats"
             ),
             source_ids={
-                "player_id": f"{index:08x}",
+                "squad_id": f"{index:08x}",
+                "squad_discriminator": f"{index:08x}",
                 "competition_id": "9",
                 "season_id": "2025-2026",
             },
@@ -3565,6 +3567,169 @@ def test_seed_links_persists_one_ordered_batch_per_observation(tmp_path):
     )
     assert control.events.index("frontier_batch:end") < control.events.index(
         "scope_reconcile"
+    )
+
+
+def _seed_parent(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    parent = page_target_from_link(DiscoveredPageLink(
+        page_kind="schedule",
+        canonical_url="https://fbref.com/en/comps/9/2025-2026/schedule/x",
+        source_ids={"competition_id": "9", "season_id": "2025-2026"},
+    ))
+    _, parent_record = _commit_for_parse(raw, parent, "<html></html>")
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    return control, pipeline, parent_record
+
+
+def _squad_link(canonical_url, squad_id="abcd1234"):
+    return DiscoveredPageLink(
+        page_kind="squad",
+        canonical_url=canonical_url,
+        source_ids={
+            "squad_id": squad_id,
+            "squad_discriminator": hashlib.sha256(
+                canonical_url.encode("utf-8")
+            ).hexdigest()[:20],
+            "competition_id": "9",
+            "season_id": "2025-2026",
+        },
+    )
+
+
+def test_seed_drops_player_and_matchlog_links_without_targets_or_edges(
+    tmp_path,
+):
+    control, pipeline, parent_record = _seed_parent(tmp_path)
+    links = [
+        DiscoveredPageLink(
+            page_kind="player",
+            canonical_url="https://fbref.com/en/players/1234abcd/Player",
+            source_ids={
+                "player_id": "1234abcd",
+                "competition_id": "9",
+                "season_id": "2025-2026",
+            },
+        ),
+        DiscoveredPageLink(
+            page_kind="matchlog",
+            canonical_url=(
+                "https://fbref.com/en/players/1234abcd/matchlogs/2025/"
+                "summary/Slug"
+            ),
+            source_ids={
+                "player_id": "1234abcd",
+                "matchlog_season_id": "2025",
+                "matchlog_discriminator": "2025/summary",
+                "competition_id": "9",
+                "season_id": "2025-2026",
+            },
+        ),
+        _squad_link(
+            "https://fbref.com/en/squads/abcd1234/2025-2026/Arsenal-Stats"
+        ),
+    ]
+
+    seeded, skipped = pipeline._seed_links(
+        links, historical=False, parent_record=parent_record
+    )
+
+    assert (seeded, skipped) == (1, 0)
+    assert [item["page_kind"] for item in control.frontier.values()] == [
+        "squad"
+    ]
+    assert [edge["metadata"]["child_page_kind"]
+            for edge in control.provenance] == ["squad"]
+
+
+@pytest.mark.parametrize(
+    "canonical_url, seeded_count",
+    [
+        (
+            "https://fbref.com/en/squads/33c6b26e/2008-2009/matchlogs/"
+            "all_comps/misc/Standard-Liege-Match-Logs-All-Competitions",
+            0,
+        ),
+        (
+            "https://fbref.com/en/squads/f0ac8ee6/2019-2020/goallogs/"
+            "all_comps/Eintracht-Frankfurt-Goal-Logs-All-Competitions",
+            0,
+        ),
+        (
+            "https://fbref.com/en/squads/33c6b26e/history/"
+            "Standard-Liege-Stats-and-History",
+            0,
+        ),
+        (
+            "https://fbref.com/en/squads/206d90db/2025-2026/wages/"
+            "Barcelona-Wage-Details",
+            0,
+        ),
+        (
+            "https://fbref.com/en/squads/db3b9613/2019-2020/all_comps/"
+            "Atletico-Madrid-Stats-All-Competitions",
+            1,
+        ),
+        (
+            "https://fbref.com/en/squads/db3b9613/2019-2020/c569/"
+            "Atletico-Madrid-Stats-Copa-del-Rey",
+            1,
+        ),
+        (
+            "https://fbref.com/en/squads/33c6b26e/"
+            "Standard-Liege-Stats-and-History",
+            1,
+        ),
+    ],
+)
+def test_seed_drops_squad_subkinds_but_keeps_roster_pages(
+    tmp_path, canonical_url, seeded_count
+):
+    control, pipeline, parent_record = _seed_parent(tmp_path)
+
+    seeded, skipped = pipeline._seed_links(
+        [_squad_link(canonical_url)],
+        historical=False,
+        parent_record=parent_record,
+    )
+
+    assert (seeded, skipped) == (seeded_count, 0)
+    assert len(control.frontier) == seeded_count
+    assert len(control.provenance) == seeded_count
+
+
+def test_is_squad_non_roster_url_matches_path_segments_not_slugs():
+    assert _is_squad_non_roster_url(
+        "https://fbref.com/en/squads/33c6b26e/2008-2009/matchlogs/all_comps/"
+        "misc/Standard-Liege-Match-Logs-All-Competitions"
+    )
+    assert _is_squad_non_roster_url(
+        "https://fbref.com/en/squads/206d90db/2025-2026/wages/"
+        "Barcelona-Wage-Details"
+    )
+    # The display slug carries the same words and must not be read as the
+    # structural route component.
+    assert not _is_squad_non_roster_url(
+        "https://fbref.com/en/squads/33c6b26e/Standard-Liege-Stats-and-History"
+    )
+    assert not _is_squad_non_roster_url(
+        "https://fbref.com/en/squads/206d90db/2025-2026/Barcelona-Wages-Stats"
+    )
+    # A squad id shaped like a sub-kind segment is still a roster page.
+    assert not _is_squad_non_roster_url(
+        "https://fbref.com/en/squads/history/Team-Stats"
+    )
+    assert not _is_squad_non_roster_url(
+        "https://fbref.com/en/comps/9/2025-2026/wages/Anything"
     )
 
 
@@ -5556,6 +5721,80 @@ def test_single_match_competition_inventories_current_and_backfill_targets(
     assert all(
         entry.metadata.get("direct_match_only") is True
         for entry in control.seasons
+    )
+
+
+def test_seed_filter_applies_from_competition_and_discovery_paths(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=(
+            "https://fbref.com/en/comps/9/2025-2026/"
+            "2025-2026-Premier-League-Stats"
+        ),
+        source_ids={"competition_id": "9", "season_id": "2025-2026"},
+    ))
+    html = """
+    <main id="content">
+      <table id="results2025-20269_overall"><tr><td>x</td></tr></table>
+      <a href="/en/comps/9/2025-2026/schedule/PL-Scores-and-Fixtures"
+        >Scores &amp; Fixtures</a>
+      <a href="/en/players/1234abcd/Player">Top scorer</a>
+      <a href="/en/players/1234abcd/matchlogs/2025/summary/Slug">Logs</a>
+      <a href="/en/squads/abcd1234/2025-2026/matchlogs/all_comps/misc/Logs"
+        >Team logs</a>
+      <a href="/en/squads/abcd1234/2025-2026/Team-Stats">Squad</a>
+    </main>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.upsert_frontier_target(frontier_target(target, historical=False))
+    control.frontier[record.target_id].update({
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    })
+    control.fetches.append({
+        "source_run_type": "current",
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=ContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+
+    children = {
+        key: item for key, item in control.frontier.items()
+        if key != record.target_id
+    }
+    assert sorted(item["page_kind"] for item in children.values()) == [
+        "schedule",
+        "squad",
+    ]
+    seeded_squad = next(
+        item for item in children.values() if item["page_kind"] == "squad"
+    )
+    assert seeded_squad["canonical_url"].endswith("/2025-2026/Team-Stats")
+    assert all(
+        edge["metadata"]["child_page_kind"] in {"schedule", "squad"}
+        for edge in control.provenance
     )
 
 
@@ -9117,7 +9356,7 @@ def test_typed_page_without_source_context_fails_observation(tmp_path):
     )
 
 
-def test_player_navigation_cannot_seed_match_and_deduplicates_matchlogs(
+def test_player_navigation_seeds_neither_match_nor_matchlog(
     tmp_path,
 ):
     raw = _raw_store(tmp_path)
@@ -9190,19 +9429,12 @@ def test_player_navigation_cannot_seed_match_and_deduplicates_matchlogs(
         item for key, item in control.frontier.items()
         if key != target.target_id
     ]
-    assert result.seeded == 1
-    assert [item["page_kind"] for item in children] == ["matchlog"]
-    assert children[0]["source_ids"] == {
-        "player_id": "1234abcd",
-        "matchlog_season_id": "2025",
-        "matchlog_discriminator": "2025/summary",
-    }
-    matchlog_edge = next(
+    assert result.seeded == 0
+    assert [item["page_kind"] for item in children] == []
+    assert [
         edge for edge in control.provenance
-        if edge["child_target_id"] == children[0]["target_id"]
-    )
-    assert matchlog_edge["carried_competition_id"] == "9"
-    assert matchlog_edge["carried_season_id"] == "2025-2026"
+        if edge["parent_target_id"] == target.target_id
+    ] == []
 
 
 @pytest.mark.parametrize("typed_fails", [False, True])
@@ -11574,10 +11806,13 @@ def _historical_competition_seed(tmp_path, *, existing=None, page_kind="competit
         )
     else:
         link = DiscoveredPageLink(
-            page_kind="player",
-            canonical_url="https://fbref.com/en/players/0000000a/Player",
+            page_kind="squad",
+            canonical_url=(
+                "https://fbref.com/en/squads/0000000a/1930-1931/Team-Stats"
+            ),
             source_ids={
-                "player_id": "0000000a",
+                "squad_id": "0000000a",
+                "squad_discriminator": "0000000a",
                 "competition_id": "9",
                 "season_id": "1930-1931",
             },
@@ -11639,13 +11874,13 @@ def test_historical_seed_leaves_one_shot_competition_alone(tmp_path):
     assert target.refresh_policy == "historical_once"
 
 
-def test_historical_seed_still_downgrades_unguarded_player(tmp_path):
+def test_historical_seed_still_downgrades_unguarded_squad(tmp_path):
     target = _historical_competition_seed(
         tmp_path,
-        page_kind="player",
+        page_kind="squad",
         existing={
-            "target_id": "fbref:player:0000000a",
-            "page_kind": "player",
+            "target_id": "fbref:squad:0000000a",
+            "page_kind": "squad",
             "refresh_policy": "monthly",
             "priority": 40,
             "next_fetch_at": NOW,
@@ -11678,11 +11913,14 @@ def test_oversized_discovery_batch_is_split_targets_before_edges(tmp_path):
     candidates = [
         _FrontierSeedCandidate(
             link=DiscoveredPageLink(
-                page_kind="player",
+                page_kind="squad",
                 canonical_url=(
-                    f"https://fbref.com/en/players/{index:05d}/Player-{index}"
+                    f"https://fbref.com/en/squads/{index:05d}/Team-{index}"
                 ),
-                source_ids={"player_id": f"{index:05d}"},
+                source_ids={
+                    "squad_id": f"{index:05d}",
+                    "squad_discriminator": f"{index:05d}",
+                },
             ),
             historical=False,
         )
@@ -11712,11 +11950,14 @@ def test_discovery_batch_within_the_ceiling_stays_one_atomic_write(tmp_path):
     candidates = [
         _FrontierSeedCandidate(
             link=DiscoveredPageLink(
-                page_kind="player",
+                page_kind="squad",
                 canonical_url=(
-                    f"https://fbref.com/en/players/{index:05d}/Player-{index}"
+                    f"https://fbref.com/en/squads/{index:05d}/Team-{index}"
                 ),
-                source_ids={"player_id": f"{index:05d}"},
+                source_ids={
+                    "squad_id": f"{index:05d}",
+                    "squad_discriminator": f"{index:05d}",
+                },
             ),
             historical=False,
         )
