@@ -21,6 +21,7 @@ from scrapers.sofascore.live_capture import (
     hash_proxy_exit,
 )
 from scrapers.sofascore.lease_client import (
+    SofascoreLeaseControlUnavailable,
     SofascoreLeaseProtocolError,
     SofascoreLeaseRejected,
 )
@@ -503,9 +504,9 @@ def test_sticky_upstream_fingerprint_cannot_change_mid_lease(tmp_path):
     capture = _Capture([_record(b'{"items":[]}')])
     factory = _TransportFactory(client, capture)
 
-    # capture_engine masks the transport's typed error as "untyped paid transport
-    # failure"; the invariant under test is simply that the drift fails closed.
-    with pytest.raises(BudgetAccountingError):
+    # The transport's own accounting verdict reaches the caller unchanged
+    # (#1349: no more "untyped ... reservation retained" mask) and fails closed.
+    with pytest.raises(BudgetAccountingError, match="changed residential upstream"):
         capture_live_specs(
             runtime,
             [_spec(1)],
@@ -1786,3 +1787,140 @@ def test_wrapping_transport_without_lease_lost_flag_captures_normally(tmp_path):
     assert factory.calls == client.close_calls == 1
     assert traffic["paid_proxy_bytes"] == 250
     assert traffic["lease_relaunches"] == 0
+
+
+def _channel_down(path="/v1/leases/lease-1/stats", method="GET"):
+    return SofascoreLeaseControlUnavailable(
+        f"proxy control channel failure ({method} {path}, 4 attempts in 7.0s): "
+        "Read timed out. token=lease-secret",
+        attempts=4,
+        elapsed_seconds=7.0,
+    )
+
+
+def test_control_channel_failure_before_fetch_closes_the_reservation_at_zero(
+    tmp_path,
+):
+    # #1349, 28 of 43 leaks 19–21.09: the pre-fetch meter read died on the
+    # gateway's own control channel outside the typed try, the engine saw an
+    # "untyped" failure and kept the whole class ceiling reserved.
+    runtime, _ = _runtime(tmp_path)
+
+    class _ChannelDownClient(_LeaseClient):
+        def stats(self, lease):
+            if self.stats_calls >= 1:  # every read after the lease was opened
+                self.stats_calls += 1
+                raise _channel_down()
+            return super().stats(lease)
+
+    client = _ChannelDownClient([0], final_total=0)
+    capture = _Capture([_record(b'{"items":[]}')])
+    factory = _TransportFactory(client, capture)
+
+    with pytest.raises(RuntimeError, match="control channel failure") as captured:
+        capture_live_specs(
+            runtime,
+            [_spec(1)],
+            canonical_url="https://www.sofascore.com/event/1",
+            scope="ENG-Premier League:2526",
+            entity="match_capture",
+            transport_factory=factory,
+        )
+
+    budget = runtime.engine.budget
+    assert budget.reservations == {}  # outstanding = 0: nothing left reserved
+    assert budget.spent == 0
+    metrics = runtime.engine.metrics.snapshot()
+    assert metrics["control_channel_failures"] == 3  # retried, then failed
+    assert metrics["paid_proxy_bytes"] == 0
+    assert capture.fetch_paths == []
+    assert "lease-secret" not in str(captured.value)
+    manifest = runtime.engine.manifest_store.get(_spec(1).key)
+    assert manifest.error_type == "TransportError"
+    assert "SofaScore control channel failed before fetch" in manifest.error_message
+
+
+def test_one_control_channel_blip_before_fetch_is_retried_on_the_same_lease(
+    tmp_path,
+):
+    runtime, _ = _runtime(tmp_path)
+
+    class _BlipClient(_LeaseClient):
+        def stats(self, lease):
+            if self.stats_calls == 1:
+                self.stats_calls += 1
+                raise _channel_down()
+            return super().stats(lease)
+
+    # enter, (blip), spec1 before, spec1 finish
+    client = _BlipClient([0, 0, 80], final_total=80)
+    capture = _Capture([_record(b'{"items":[{"id":1}]}')])
+    factory = _TransportFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert [r.manifest.error_type for r in results] == ["DeferredMaterialization"]
+    assert runtime.engine.budget.reservations == {}
+    assert runtime.engine.budget.spent == 80
+    assert traffic["paid_proxy_bytes"] == traffic["provider_total_bytes"] == 80
+    assert traffic["control_channel_failures"] == 1
+    assert factory.calls == 1
+
+
+def test_control_channel_failure_after_fetch_charges_a_lower_bound_and_releases(
+    tmp_path, monkeypatch
+):
+    # #1349, 15 of 43 leaks: the fetch succeeded but the endpoint meter close
+    # died on the control channel.  Bytes moved, so the charge is the known
+    # lower bound (the body), the lease is treated as lost (its boundary is
+    # still open on the gateway) and the spec is re-fetched on a fresh lease.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+    body = b'{"items":[{"id":1}]}'
+
+    class _FinishChannelDownClient(_RecordingCloseClient):
+        def finish_endpoint(self, lease, request_id):
+            raise _channel_down(
+                "/v1/leases/lease-1/endpoints/endpoint-1", method="DELETE"
+            )
+
+    # enter, spec1 before
+    lost_client = _FinishChannelDownClient([0, 0], final_total=0)
+    lost_capture = _Capture([_record(body)])
+    fresh_client = _RecordingCloseClient([0, 0, 150], final_total=150)
+    fresh_capture = _Capture([_record(body)])
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(lost_client, lost_capture),
+        _TransportFactory(fresh_client, fresh_capture),
+    )
+
+    results, traffic = _capture_batch(
+        runtime, [_spec(1, "event")], plan, allocation, factory
+    )
+
+    assert [r.manifest.error_type for r in results] == ["DeferredMaterialization"]
+    assert factory.attempt_ids == ["1", "1:relaunch1"]
+    assert sleeps == [35]
+    assert lost_capture.fetch_paths == ["/api/v1/event/1/event"]
+    assert fresh_capture.fetch_paths == ["/api/v1/event/1/event"]
+    budget = runtime.engine.budget
+    assert budget.reservations == {}
+    assert budget.spent == len(body) + 150
+    assert traffic["lease_relaunches"] == 1
+    assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == (
+        len(body) + 150
+    )
+    assert traffic["endpoint_provider_bytes"] == {"event": len(body) + 150}
+    assert traffic["accounting_uncertain"] == 1
+    assert traffic["control_channel_failures"] == 1
