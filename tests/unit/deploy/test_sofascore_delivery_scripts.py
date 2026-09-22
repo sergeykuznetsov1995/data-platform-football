@@ -1370,13 +1370,17 @@ def test_a_matching_head_without_the_full_contract_gets_no_acceptance_marker(sta
     а следит за ним чужой процесс."""
     _production_on_master(stand)
     stand.put("wd_pid", (stand.stub_state / "wd_pid_old").read_text().strip())
-    (stand.state / "sofascore-fail-nights").write_text("2\n", encoding="utf-8")
+    for day in ("2026-09-01", "2026-09-02"):
+        _put_window(stand, day, OUTCOME="failed", REASON="прошлая ночь", RESTORED="t")
     proc = stand.run()
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not (stand.state / "sofascore-accepted").exists(), "маркер приёмки не выдаётся авансом"
     assert "КОНТРАКТ ПРИЁМКИ НЕ СОШЁЛСЯ" in stand.log_text()
     assert "⚠️" in stand.pending() and "контракт приёмки" in stand.pending()
-    assert (stand.state / "sofascore-fail-nights").exists(), "счётчик провальных ночей не сбрасываем"
+    # Серию провальных ночей не сбрасываем: бой на master не проверен — цель «?», не «-».
+    assert _window(stand, "2026-09-02")["OUTCOME"] == "failed"
+    rec = _window(stand, stand.today)
+    assert rec["TARGET"] == "?" and "контракт приёмки" in rec["LAST_REASON"], rec
     # Второй тик тех же суток повторяет отказ, но не повторяет сообщение.
     first = stand.pending()
     stand.run()
