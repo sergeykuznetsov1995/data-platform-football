@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import pytest
+import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from scrapers.sofascore.lease_client import (
     SofascoreLeaseClient,
+    SofascoreLeaseControlUnavailable,
     SofascoreLeaseProtocolError,
     SofascoreLeaseRejected,
     SofascoreProxyLease,
@@ -508,27 +511,150 @@ def test_rejection_redacts_credentials_and_token_values():
     assert "[REDACTED]" in message
 
 
-def test_transport_failure_is_not_retried_and_is_redacted():
-    plan, allocation = _plan(run_id="run::targets", task_id="task", budget=10)
-    session = _Session(RuntimeError("http://u:p@proxy.invalid token=secret"))
-    client = SofascoreLeaseClient(
-        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN
+def _refused():
+    """What requests raises when nothing listens on the gateway port."""
+    reason = NewConnectionError(
+        None, "Failed to establish a new connection: [Errno 111] Connection refused"
+    )
+    return requests.exceptions.ConnectionError(
+        MaxRetryError(None, "http://u:p@proxy_filter:8899/v1/leases", reason)
     )
 
+
+def _read_timeout():
+    return requests.exceptions.ReadTimeout(
+        "HTTPConnectionPool(host='proxy_filter', port=8899): Read timed out. "
+        "(read timeout=5.0) token=secret"
+    )
+
+
+def _retrying_client(session, *, clock=None, **kwargs):
+    sleeps = []
+    ticks = iter(range(0, 10_000))
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899",
+        session=session,
+        control_token=CONTROL_TOKEN,
+        sleep=sleeps.append,
+        clock=clock or (lambda: float(next(ticks))),
+        **kwargs,
+    )
+    return client, sleeps
+
+
+def _acquire(client, plan, allocation):
+    return client.acquire(
+        max_bytes=10,
+        ttl_seconds=10,
+        dag_id="dag_ingest_sofascore",
+        run_id="run::targets",
+        task_id="task",
+        workload_plan=plan,
+        allocation_id=allocation.allocation_id,
+        attempt_id="1",
+    )
+
+
+def test_non_network_transport_failure_is_not_retried_and_is_redacted():
+    plan, allocation = _plan(run_id="run::targets", task_id="task", budget=10)
+    session = _Session(RuntimeError("http://u:p@proxy.invalid token=secret"))
+    client, sleeps = _retrying_client(session)
+
     with pytest.raises(SofascoreLeaseProtocolError) as captured:
-        client.acquire(
-            max_bytes=10,
-            ttl_seconds=10,
-            dag_id="dag_ingest_sofascore",
-            run_id="run::targets",
-            task_id="task",
-            workload_plan=plan,
-            allocation_id=allocation.allocation_id,
-            attempt_id="1",
-        )
+        _acquire(client, plan, allocation)
+
+    assert not isinstance(captured.value, SofascoreLeaseControlUnavailable)
+    assert len(session.calls) == 1
+    assert sleeps == []
+    assert "u:p" not in str(captured.value)
+    assert "secret" not in str(captured.value)
+
+
+def test_acquire_read_timeout_is_not_repeated():
+    # #1349: a POST that may have reached the gateway creates state there; a
+    # doubled lease is worse than one lost attempt.
+    plan, allocation = _plan(run_id="run::targets", task_id="task", budget=10)
+    session = _Session(_read_timeout())
+    client, sleeps = _retrying_client(session)
+
+    with pytest.raises(SofascoreLeaseControlUnavailable) as captured:
+        _acquire(client, plan, allocation)
 
     assert len(session.calls) == 1
-    assert "u:p" not in str(captured.value)
+    assert sleeps == []
+    assert captured.value.attempts == 1
+    assert captured.value.retryable is True
+    assert "control channel failure" in str(captured.value)
+    assert "secret" not in str(captured.value)
+
+
+def test_acquire_connection_refused_is_retried_up_to_the_attempt_cap():
+    plan, allocation = _plan(run_id="run::targets", task_id="task", budget=10)
+    session = _Session(*(_refused() for _ in range(4)))
+    client, sleeps = _retrying_client(session)
+
+    with pytest.raises(SofascoreLeaseControlUnavailable) as captured:
+        _acquire(client, plan, allocation)
+
+    assert len(session.calls) == 4
+    assert sleeps == [1.0, 2.0, 4.0]
+    assert captured.value.attempts == 4
+    message = str(captured.value)
+    assert message.startswith(
+        "proxy control channel failure (POST /v1/leases, 4 attempts in "
+    )
+    assert "u:p" not in message
+    assert "****:****@" in message
+
+
+def test_stats_read_timeout_is_retried_and_the_third_attempt_answers():
+    session = _Session(
+        _read_timeout(), _read_timeout(), _Response(200, _stats_payload())
+    )
+    client, sleeps = _retrying_client(session)
+
+    stats = client.stats(_production_lease(token="token"))
+
+    assert stats.total_bytes == 1000
+    assert len(session.calls) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_finish_endpoint_and_close_retry_a_dropped_connection():
+    lease = _production_lease(token="token")
+    session = _Session(
+        _read_timeout(),
+        _Response(200, _stats_payload()),
+        _refused(),
+        _Response(200, _stats_payload(closed=True)),
+    )
+    client, sleeps = _retrying_client(session)
+
+    client.finish_endpoint(lease, "endpoint-1")
+    client.close(lease)
+
+    assert [call[0] for call in session.calls] == ["DELETE"] * 4
+    assert sleeps == [1.0, 1.0]
+
+
+def test_control_retry_time_budget_stops_before_the_attempt_cap():
+    # Each failed attempt burns a 5 s read timeout: 0 → 5 (+1) → 11 (+2) →
+    # 18; the next 4 s back-off would cross the 20 s budget.
+    session = _Session(*(_read_timeout() for _ in range(10)))
+    clock_values = iter([0.0, 5.0, 11.0, 18.0, 25.0])
+    client, sleeps = _retrying_client(
+        session,
+        clock=lambda: next(clock_values),
+        control_retry_attempts=10,
+    )
+
+    with pytest.raises(SofascoreLeaseControlUnavailable) as captured:
+        client.stats(_production_lease(token="token"))
+
+    assert len(session.calls) == 3
+    assert sleeps == [1.0, 2.0]
+    assert captured.value.attempts == 3
+    assert "3 attempts in 18.0s" in str(captured.value)
     assert "secret" not in str(captured.value)
 
 

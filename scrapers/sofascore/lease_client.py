@@ -1,16 +1,22 @@
 """Small fail-closed client for proxy-filter's SofaScore session leases.
 
-Lease creation is stateful and intentionally has no hidden retry.  One lease is
-owned by one logical Airflow task and one warmed browser session; endpoint
-payloads share its exact provider-path byte counter.
+Control-channel retries are explicit, typed and per-method (#1349): a network
+failure of the gateway's own control plane is retried for the idempotent reads
+and closes (``stats``, ``finish_endpoint``, ``close``) and, for the stateful
+POSTs (``acquire``, ``begin_endpoint``), only when the request provably never
+reached the gateway.  An exhausted retry budget raises
+:class:`SofascoreLeaseControlUnavailable`.  One lease is owned by one logical
+Airflow task and one warmed browser session; endpoint payloads share its exact
+provider-path byte counter.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from scrapers.sofascore.workload_plan import SignedDagRunPlan, WorkloadAllocation
@@ -50,6 +56,52 @@ class SofascoreLeaseRejected(SofascoreLeaseError):
 
 class SofascoreLeaseProtocolError(SofascoreLeaseError):
     """The lease service returned an unusable or inconsistent response."""
+
+
+class SofascoreLeaseControlUnavailable(SofascoreLeaseProtocolError):
+    """The gateway's control channel stayed unreachable after typed retries.
+
+    The message always carries the ``control channel failure`` marker that the
+    red-run classifier keys on (#1349).
+    """
+
+    retryable = True
+
+    def __init__(self, message: str, *, attempts: int, elapsed_seconds: float) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.elapsed_seconds = elapsed_seconds
+
+
+# Methods that create gateway state: a request that may have reached the
+# gateway is never repeated (a doubled lease/boundary is worse than one lost
+# attempt).  Everything else on this channel is an idempotent read or close.
+_STATEFUL_CONTROL_METHODS = frozenset({"POST"})
+
+
+def _control_network_failure(exc: BaseException) -> Optional[bool]:
+    """Classify a control-channel ``requests`` failure.
+
+    Returns ``None`` for anything that is not a network failure, ``True`` when
+    the request provably never left this process (connect refused/timed out),
+    ``False`` when it may have reached the gateway (read timeout, connection
+    dropped after sending).
+    """
+    try:
+        from requests import exceptions as requests_exceptions
+        from urllib3.exceptions import MaxRetryError, NewConnectionError
+    except ImportError:  # pragma: no cover - requests is a runtime dependency
+        return None
+    if isinstance(exc, requests_exceptions.ConnectTimeout):
+        return True
+    if isinstance(exc, requests_exceptions.ConnectionError):
+        reason = exc.args[0] if exc.args else None
+        if isinstance(reason, MaxRetryError):
+            reason = reason.reason
+        return isinstance(reason, NewConnectionError)
+    if isinstance(exc, requests_exceptions.Timeout):
+        return False
+    return None
 
 
 def _phase_run_id(run_id: str) -> tuple[str, str]:
@@ -580,6 +632,11 @@ class SofascoreLeaseClient:
         timeout_seconds: float = 5.0,
         session: Optional[Any] = None,
         control_token: Optional[str] = None,
+        control_retry_attempts: int = 4,
+        control_retry_budget_seconds: float = 20.0,
+        control_retry_delays: tuple[float, ...] = (1.0, 2.0, 4.0),
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         base = str(control_url).rstrip("/")
         parsed = urlsplit(base)
@@ -607,6 +664,13 @@ class SofascoreLeaseClient:
         self._session = session
         if self._session is not None:
             self._session.trust_env = False
+        if control_retry_attempts < 1 or control_retry_budget_seconds <= 0:
+            raise ValueError("proxy lease control retry policy must be positive")
+        self.control_retry_attempts = int(control_retry_attempts)
+        self.control_retry_budget_seconds = float(control_retry_budget_seconds)
+        self.control_retry_delays = tuple(float(d) for d in control_retry_delays)
+        self._sleep = sleep
+        self._clock = clock
 
     def _http(self):
         if self._session is None:
@@ -615,6 +679,59 @@ class SofascoreLeaseClient:
             self._session = requests.Session()
             self._session.trust_env = False
         return self._session
+
+    def _retry_delay(self, attempt: int) -> float:
+        if not self.control_retry_delays:
+            return 0.0
+        index = min(attempt - 1, len(self.control_retry_delays) - 1)
+        return self.control_retry_delays[index]
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        token: str,
+        payload: Optional[Mapping[str, Any]],
+        headers: Mapping[str, str],
+    ) -> Any:
+        """One control request under the typed per-method retry policy."""
+        started = self._clock()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._http().request(
+                    method,
+                    f"{self.control_url}{path}",
+                    json=dict(payload) if payload is not None else None,
+                    headers=dict(headers),
+                    timeout=self.timeout_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 - requests is an adapter boundary
+                message = redact_sensitive(exc, secrets=(token,))
+                not_sent = _control_network_failure(exc)
+                if not_sent is None:
+                    raise SofascoreLeaseProtocolError(
+                        f"proxy lease control request failed: {message}"
+                    ) from exc
+                elapsed = self._clock() - started
+                delay = self._retry_delay(attempt)
+                retry_allowed = (
+                    not_sent or method not in _STATEFUL_CONTROL_METHODS
+                )
+                if (
+                    not retry_allowed
+                    or attempt >= self.control_retry_attempts
+                    or elapsed + delay >= self.control_retry_budget_seconds
+                ):
+                    raise SofascoreLeaseControlUnavailable(
+                        f"proxy control channel failure ({method} {path}, "
+                        f"{attempt} attempts in {elapsed:.1f}s): {message}",
+                        attempts=attempt,
+                        elapsed_seconds=elapsed,
+                    ) from exc
+                self._sleep(delay)
 
     def _request(
         self,
@@ -627,19 +744,9 @@ class SofascoreLeaseClient:
         headers = {"X-Proxy-Control-Token": self._control_token}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        try:
-            response = self._http().request(
-                method,
-                f"{self.control_url}{path}",
-                json=dict(payload) if payload is not None else None,
-                headers=headers,
-                timeout=self.timeout_seconds,
-            )
-        except Exception as exc:  # noqa: BLE001 - requests is an adapter boundary
-            message = redact_sensitive(exc, secrets=(token,))
-            raise SofascoreLeaseProtocolError(
-                f"proxy lease control request failed: {message}"
-            ) from exc
+        response = self._send(
+            method, path, token=token, payload=payload, headers=headers
+        )
         status = int(getattr(response, "status_code", 0) or 0)
         try:
             body = response.json()
