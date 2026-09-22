@@ -89,6 +89,16 @@ class TestFBrefBackfillTopology:
         assert seed.op_kwargs["reservation_mb"] == expected_reservation_mb
         assert "competition_index" not in module.BACKFILL_PAGE_KINDS
         assert "competition" not in module.BACKFILL_PAGE_KINDS
+        assert "player" not in module.BACKFILL_PAGE_KINDS
+        assert "matchlog" not in module.BACKFILL_PAGE_KINDS
+        assert module.BACKFILL_PAGE_KINDS == (
+            "season",
+            "season_stats",
+            "schedule",
+            "standings",
+            "squad",
+            "match",
+        )
 
     def test_one_warm_live_runner_is_bounded(self, loaded_dag):
         module, tasks = loaded_dag

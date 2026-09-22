@@ -19,7 +19,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
@@ -275,6 +275,55 @@ CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS = 0
 PERSISTENT_PARSE_GUARD_SECONDS = 10 * 60
 
 logger = logging.getLogger(__name__)
+
+# Decision 3 of the 21.09 grill keeps player pages and player match logs out of
+# both lanes, so they must not be born either: a target seeded here is fetched
+# by any later run whose page kinds include it, and it carries provenance edges
+# that cost the scope rollup 19M rows.  The daily and backfill DAG page-kind
+# lists are the fetch filter; this set is the seed filter (#1321).
+SEED_EXCLUDED_PAGE_KINDS = frozenset({"player", "matchlog"})
+# ``discover_page_links`` labels every ``/en/squads/<id>/...`` page ``squad``
+# (discovery.py routes on ``route[0] == "squads"`` alone), so the sub-kind is
+# visible only in the URL path.  Team match logs, goal logs, club history and
+# wage tables are not squads in the sense decision 3 keeps -- only the roster
+# is.  ``roster``/``roster_details``/``all_comps`` stay in scope.
+SQUAD_NON_ROSTER_URL_SEGMENTS = ("matchlogs", "goallogs", "history", "wages")
+
+
+def _is_squad_non_roster_url(canonical_url: str) -> bool:
+    """Tell a squad sub-kind page from its roster by the URL path segments.
+
+    Matching whole path segments and not a substring keeps display slugs such
+    as ``Arsenal-Wages-Stats`` or ``...-Scores-and-Fixtures`` out of the
+    filter: only the structural ``/wages/`` or ``/matchlogs/`` component of the
+    route below ``/en/squads/<squad_id>/`` marks a non-roster page.
+    """
+
+    segments = [
+        segment
+        for segment in urlsplit(canonical_url).path.split("/")
+        if segment
+    ]
+    if "squads" not in segments:
+        return False
+    # Skip the squad id itself: a squad whose id happened to read ``history``
+    # would still be a roster page.
+    tail = segments[segments.index("squads") + 2:]
+    return any(
+        segment in SQUAD_NON_ROSTER_URL_SEGMENTS for segment in tail
+    )
+
+
+def _out_of_scope_seed_reason(link: DiscoveredPageLink) -> Optional[str]:
+    """Name why a discovered link must not become a frontier target."""
+
+    if link.page_kind in SEED_EXCLUDED_PAGE_KINDS:
+        return link.page_kind
+    if link.page_kind == "squad" and _is_squad_non_roster_url(
+        link.canonical_url
+    ):
+        return "squad_subkind"
+    return None
 
 
 def _bounded_int(
@@ -4317,8 +4366,15 @@ class FBrefPipeline:
                             else str(competition_id),
                             None if season_id is None else str(season_id),
                         ))
+        dropped_out_of_scope: dict[str, int] = {}
         for candidate in candidates:
             link = candidate.link
+            dropped_reason = _out_of_scope_seed_reason(link)
+            if dropped_reason is not None:
+                dropped_out_of_scope[dropped_reason] = (
+                    dropped_out_of_scope.get(dropped_reason, 0) + 1
+                )
+                continue
             source_ids = dict(link.source_ids)
             target = page_target_from_link(link)
             prepared = frontier_target(
@@ -4399,6 +4455,12 @@ class FBrefPipeline:
                             **dict(provenance_metadata or {}),
                         },
                     ))
+        if dropped_out_of_scope:
+            logger.info(
+                "FBref seed dropped_out_of_scope_links=%s parent=%s",
+                dict(sorted(dropped_out_of_scope.items())),
+                None if parent_record is None else parent_record.target_id,
+            )
         if prepared_targets or provenance_edges:
             ordered_targets = [
                 prepared_targets[target_id]

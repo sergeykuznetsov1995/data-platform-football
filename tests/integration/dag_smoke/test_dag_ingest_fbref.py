@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,13 @@ class TestFBrefCurrentFailureEdges:
         live = dag.task_dict["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
         assert live.op_kwargs["max_batches"] == 14
+        assert "player" not in live.op_kwargs["page_kinds"]
+        assert "matchlog" not in live.op_kwargs["page_kinds"]
+        factory = sys.modules["utils.fbref_current_dag_factory"]
+        assert (
+            factory.CURRENT_PAGE_KINDS_POLICY
+            == "fbref-current-page-kinds-no-players-v1"
+        )
         assert live.downstream_task_ids == {"audit_raw_integrity"}
         assert dag.task_dict["audit_raw_integrity"].downstream_task_ids == {
             "choose_publication_path"
