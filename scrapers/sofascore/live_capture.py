@@ -281,9 +281,6 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._broken = False
         self._needs_rewarm = False
         self._accounted_provider_bytes = 0
-        # Lower-bound bytes charged without a readable meter (#1349); the
-        # lease snapshot reports them so engine and lease totals still agree.
-        self._estimated_provider_bytes = 0
         self._last_stats = None
         self._proxy_exit_hash: Optional[str] = None
         self._browser_started = False
@@ -769,25 +766,43 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                 self._lease, request_boundary
             )
         except SofascoreLeaseError as exc:
-            # The fetch succeeded, so provider bytes moved, but the meter is
-            # unreadable.  Charge a lower bound (the known meter delta plus the
-            # body bytes), and treat the lease as lost: its endpoint boundary
-            # is still open on the gateway, so the next begin_endpoint would be
-            # refused (409).  ``capture_live_specs`` re-leases and re-fetches.
-            estimate = _record_body_size(record)
-            provider_bytes = (
-                max(0, before_total - self._accounted_provider_bytes) + estimate
-            )
-            self._last_stats = before
-            self._estimated_provider_bytes += estimate
+            # The fetch succeeded, so provider bytes moved, but the endpoint
+            # meter did not answer and the boundary may still be open on the
+            # gateway.  The lease is done: read its final meter independently
+            # (close, then stats) and charge exactly that.  Only when even the
+            # final meter is unreadable is a lower bound (known meter delta +
+            # body bytes) charged — and then the batch is NOT re-leased: a
+            # relaunch never proceeds on an understated charge (#1218).
+            try:
+                final = self.close_lost_lease()
+            except BudgetAccountingError:
+                final = None
+            if final is not None:
+                final_total = int(final.total_bytes)
+                if (
+                    final_total < before_total
+                    or final_total < self._accounted_provider_bytes
+                ):
+                    raise BudgetAccountingError(
+                        "SofaScore lease provider counter moved backwards"
+                    ) from None
+                provider_bytes = final_total - self._accounted_provider_bytes
+                self._last_stats = final
+                self.lease_lost = self._safe_error(exc)
+                accounting = "exact"
+            else:
+                provider_bytes = max(
+                    0, before_total - self._accounted_provider_bytes
+                ) + _record_body_size(record)
+                self._last_stats = before
+                accounting = "estimated"
             self._accounted_provider_bytes += provider_bytes
             self._endpoint_request_provider_bytes.setdefault(
                 provider_budget.endpoint, []
             ).append(provider_bytes)
-            self.lease_lost = self._safe_error(exc)
             raise TransportError(
                 f"SofaScore control channel failed after fetch for {path} "
-                f"(accounting=estimated): {self._safe_error(exc)}",
+                f"(accounting={accounting}): {self._safe_error(exc)}",
                 provider_bytes=provider_bytes,
                 retryable=False,
                 browser_sessions=sessions,
@@ -800,7 +815,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                     )
                     - source_before,
                 ),
-                accounting_uncertain=True,
+                accounting_uncertain=accounting == "estimated",
                 control_channel_failure=isinstance(
                     exc, SofascoreLeaseControlUnavailable
                 ),
@@ -985,8 +1000,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         return {
             "provider_up_bytes": int(stats.up_bytes),
             "provider_down_bytes": int(stats.down_bytes),
-            "provider_total_bytes": int(stats.total_bytes)
-            + self._estimated_provider_bytes,
+            "provider_total_bytes": int(stats.total_bytes),
             "provider_budget_bytes": (
                 self.allocation.budget_bytes
                 if self.allocation is not None

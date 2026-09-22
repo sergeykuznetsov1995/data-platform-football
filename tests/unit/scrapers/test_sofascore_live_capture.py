@@ -1874,13 +1874,34 @@ def test_one_control_channel_blip_before_fetch_is_retried_on_the_same_lease(
     assert factory.calls == 1
 
 
-def test_control_channel_failure_after_fetch_charges_a_lower_bound_and_releases(
+class _FinishChannelDownClient(_RecordingCloseClient):
+    """The fetch landed, then the endpoint-meter DELETE died on the channel."""
+
+    def finish_endpoint(self, lease, request_id):
+        raise _channel_down(
+            "/v1/leases/lease-1/endpoints/endpoint-1", method="DELETE"
+        )
+
+    def close(self, lease, **kwargs):
+        # The boundary is still open, so the gateway's counters are not final.
+        self.close_completed.append(kwargs.get("completed"))
+        self.close_calls += 1
+        raise SofascoreLeaseRejected(
+            "proxy lease API rejected DELETE /v1/leases/lease-1/close "
+            "(HTTP 409): lease provider counters are not final",
+            status_code=409,
+            code="lease_close_pending",
+        )
+
+
+def test_control_channel_failure_after_fetch_charges_the_final_meter_and_releases(
     tmp_path, monkeypatch
 ):
     # #1349, 15 of 43 leaks: the fetch succeeded but the endpoint meter close
-    # died on the control channel.  Bytes moved, so the charge is the known
-    # lower bound (the body), the lease is treated as lost (its boundary is
-    # still open on the gateway) and the spec is re-fetched on a fresh lease.
+    # died on the control channel.  The lease is finished: its FINAL meter is
+    # read independently (close refused as pending, then stats) and charged
+    # exactly — here body plus a 40-byte tail the gateway saw — and the spec
+    # is re-fetched on a fresh lease.
     runtime, _ = _runtime(tmp_path)
     plan, allocation = _relaunch_plan(runtime)
     sleeps = []
@@ -1888,15 +1909,10 @@ def test_control_channel_failure_after_fetch_charges_a_lower_bound_and_releases(
         "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
     )
     body = b'{"items":[{"id":1}]}'
+    final_meter = len(body) + 40
 
-    class _FinishChannelDownClient(_RecordingCloseClient):
-        def finish_endpoint(self, lease, request_id):
-            raise _channel_down(
-                "/v1/leases/lease-1/endpoints/endpoint-1", method="DELETE"
-            )
-
-    # enter, spec1 before
-    lost_client = _FinishChannelDownClient([0, 0], final_total=0)
+    # enter, spec1 before, final meter after the refused close
+    lost_client = _FinishChannelDownClient([0, 0, final_meter], final_total=0)
     lost_capture = _Capture([_record(body)])
     fresh_client = _RecordingCloseClient([0, 0, 150], final_total=150)
     fresh_capture = _Capture([_record(body)])
@@ -1912,15 +1928,53 @@ def test_control_channel_failure_after_fetch_charges_a_lower_bound_and_releases(
     assert [r.manifest.error_type for r in results] == ["DeferredMaterialization"]
     assert factory.attempt_ids == ["1", "1:relaunch1"]
     assert sleeps == [35]
+    assert lost_client.close_completed == [False]
     assert lost_capture.fetch_paths == ["/api/v1/event/1/event"]
     assert fresh_capture.fetch_paths == ["/api/v1/event/1/event"]
     budget = runtime.engine.budget
     assert budget.reservations == {}
-    assert budget.spent == len(body) + 150
+    assert budget.spent == final_meter + 150
     assert traffic["lease_relaunches"] == 1
     assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == (
-        len(body) + 150
+        final_meter + 150
     )
-    assert traffic["endpoint_provider_bytes"] == {"event": len(body) + 150}
-    assert traffic["accounting_uncertain"] == 1
+    assert traffic["endpoint_provider_bytes"] == {"event": final_meter + 150}
+    assert traffic["accounting_uncertain"] == 0
     assert traffic["control_channel_failures"] == 1
+
+
+def test_unreadable_final_meter_after_fetch_charges_a_lower_bound_and_never_releases(
+    tmp_path, monkeypatch
+):
+    # Channel down for the whole close-out: the charge is only a lower bound
+    # (the body), so the batch must fail instead of re-leasing on it (#1218
+    # invariant) — with the reservation closed, not leaked.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", lambda _s: None
+    )
+    body = b'{"items":[{"id":1}]}'
+
+    class _DeadChannelClient(_FinishChannelDownClient):
+        def stats(self, lease):
+            if self.stats_calls >= 2:  # after enter + the pre-fetch read
+                self.stats_calls += 1
+                raise _channel_down()
+            return super().stats(lease)
+
+    client = _DeadChannelClient([0, 0], final_total=0)
+    capture = _Capture([_record(body)])
+    factory = _LeaseSequenceFactory(_TransportFactory(client, capture))
+
+    with pytest.raises(RuntimeError, match="accounting=estimated") as captured:
+        _capture_batch(runtime, [_spec(1, "event")], plan, allocation, factory)
+
+    assert "control channel failure" in str(captured.value)
+    assert factory.attempt_ids == ["1"]
+    budget = runtime.engine.budget
+    assert budget.reservations == {}
+    assert budget.spent == len(body)
+    metrics = runtime.engine.metrics.snapshot()
+    assert metrics["accounting_uncertain"] == 1
+    assert metrics["control_channel_failures"] == 1
