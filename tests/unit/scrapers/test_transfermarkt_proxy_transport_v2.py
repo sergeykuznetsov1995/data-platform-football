@@ -1431,3 +1431,97 @@ def test_lease_close_gives_up_when_the_drain_never_settles():
 
     assert naps == [0.2, 0.5, 1.0, 2.0]
     assert len(control.calls) == 5
+
+
+@pytest.mark.unit
+def test_pseudo_status_logs_the_proxy_status_line(monkeypatch, caplog):
+    """#1389: a dead exit must say what the gateway answered, not just http=0."""
+
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(8 * 1024 * 1024))
+    monkeypatch.delenv("TRANSFERMARKT_RAW_STORE_URI", raising=False)
+    provider = _FakeLeaseProvider([])
+    dead = _Response(b"", status=0)
+    classified = _Response(b"", status=0)
+    classified.headers = {"x-proxy-upstream-status": "407"}
+    factory = _TlsFactory([dead, classified, _Response(b"ok")])
+    client = TransfermarktHttpClient(
+        lease_provider=provider,
+        lease_metadata=_metadata(),
+        client_factory=factory,
+        sleep_fn=lambda _: None,
+    )
+
+    with caplog.at_level("WARNING", logger="scrapers.transfermarkt.client"):
+        outcome = client.fetch(
+            "https://www.transfermarkt.us/a", as_json=False, max_attempts=3,
+        )
+
+    assert outcome.status is FetchStatus.OK
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "attempt" in record.getMessage()
+    ]
+    assert len(lines) == 2
+    assert "transport:connection:TransportStatusError" in lines[0]
+    assert "proxy_status=0 upstream_class=нет класса от шлюза" in lines[0]
+    assert "proxy_status=0 upstream_class=407" in lines[1]
+
+
+@pytest.mark.unit
+def test_single_attempt_transport_failure_still_logs_the_proxy_status(
+    monkeypatch, caplog,
+):
+    """#1389 (Astra r1 #4): max_attempts=1 — the probe's shape — must log too."""
+
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(8 * 1024 * 1024))
+    monkeypatch.delenv("TRANSFERMARKT_RAW_STORE_URI", raising=False)
+    dead = _Response(b"", status=0)
+    dead.headers = {"X-Proxy-Upstream-Status": "dead_exit"}
+    client = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([dead]),
+        sleep_fn=lambda _: None,
+    )
+
+    with caplog.at_level("WARNING", logger="scrapers.transfermarkt.client"):
+        outcome = client.fetch(
+            "https://www.transfermarkt.us/a", as_json=False, max_attempts=1,
+        )
+
+    assert outcome.error == "transport:connection:TransportStatusError"
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "attempt 1/1 failed" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "proxy_status=0 upstream_class=dead_exit" in lines[0]
+
+
+@pytest.mark.unit
+def test_gateway_502_with_upstream_header_logs_the_class(monkeypatch, caplog):
+    """#1389 (code-review): a real gateway 502 carries the class on HTTP."""
+
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(8 * 1024 * 1024))
+    monkeypatch.delenv("TRANSFERMARKT_RAW_STORE_URI", raising=False)
+    bad = _Response(b"upstream refused", status=502)
+    bad.headers = {"X-Proxy-Upstream-Status": "407"}
+    client = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([bad]),
+        sleep_fn=lambda _: None,
+    )
+
+    with caplog.at_level("WARNING", logger="scrapers.transfermarkt.client"):
+        outcome = client.fetch(
+            "https://www.transfermarkt.us/a", as_json=False, max_attempts=1,
+        )
+
+    assert outcome.status_code == 502
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "attempt 1/1 failed" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "HTTP 502 proxy_status=502 upstream_class=407" in lines[0]

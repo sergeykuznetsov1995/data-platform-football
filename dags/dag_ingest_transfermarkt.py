@@ -11,16 +11,18 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
+from utils.alerts import telegram_on_failure
 from utils.config import CURRENT_SEASON, DAG_TAGS, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
 
@@ -41,6 +43,8 @@ from scrapers.transfermarkt.models import (
     SCOPE_WALL_CLOCK_TIMEOUT_SECONDS,
 )
 
+
+logger = logging.getLogger(__name__)
 
 MV_HISTORY_DAILY_LIMIT = MAX_ROSTER_WINDOW
 COACH_HISTORY_TTL_DAYS = 28
@@ -68,6 +72,17 @@ STANDING_POLICY_PATH = (
     '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json'
 )
 STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
+# #1389: one paid request through the same gateway lease path as the children
+# before any scope is planned.  A dead pool answers the CONNECT with a pseudo
+# status or a short error page; a real competition start page is well over
+# 60 KiB, so a 200 with a small body is an error page, not the source.
+GATEWAY_PROBE_URL = (
+    'https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1'
+)
+GATEWAY_PROBE_MIN_BODY_BYTES = 60 * 1024
+GATEWAY_PROBE_HARD_BYTES = 2 * 1024 * 1024
+GATEWAY_PROBE_SOFT_BYTES = 1024 * 1024
+GATEWAY_PROBE_LEASE_TTL_SECONDS = 120
 
 _APPROVAL_FIELDS = (
     'paid_proxy_packet_id',
@@ -80,6 +95,97 @@ _APPROVAL_FIELDS = (
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, '').strip().lower() in {
         '1', 'true', 'yes', 'on',
+    }
+
+
+def _probe_gateway_exit(
+    *,
+    dag_id: str,
+    run_id: str,
+    lease_provider: Any = None,
+    client_factory: Any = None,
+) -> dict[str, Any]:
+    """Fetch one real page through a gateway lease; fail the run if it is dead.
+
+    Uses the children's own lease/client path, so a probe that passes means a
+    child can reach the source.  The lease is always closed.
+    """
+
+    from scrapers.transfermarkt.client import (
+        ProxyFilterLeaseProvider,
+        TransfermarktHttpClient,
+        redact_sensitive,
+    )
+    from scrapers.transfermarkt.models import (
+        ProxyRequiredError,
+        SharedTrafficLedger,
+    )
+
+    try:
+        if lease_provider is None:
+            control_url = os.environ.get('TM_PROXY_CONTROL_URL', '').strip()
+            if not control_url:
+                raise AirflowException(
+                    'TM_PROXY_CONTROL_URL is required; direct fallback is '
+                    'forbidden'
+                )
+            lease_provider = ProxyFilterLeaseProvider(control_url)
+        client = TransfermarktHttpClient(
+            lease_provider=lease_provider,
+            traffic_ledger=SharedTrafficLedger(
+                hard_provider_bytes=GATEWAY_PROBE_HARD_BYTES,
+                soft_provider_bytes=GATEWAY_PROBE_SOFT_BYTES,
+                retry_limit=0,
+            ),
+            lease_metadata={
+                'dag_id': dag_id,
+                'run_id': run_id,
+                'task_id': 'plan_exact_scopes',
+                'scope': 'gateway_probe',
+            },
+            lease_ttl_seconds=GATEWAY_PROBE_LEASE_TTL_SECONDS,
+            timeout_seconds=30,
+            client_factory=client_factory,
+        )
+        try:
+            outcome = client.fetch(
+                GATEWAY_PROBE_URL,
+                as_json=False,
+                max_attempts=1,
+                label='gateway_probe',
+            )
+        finally:
+            client.close()
+    except AirflowException:
+        raise
+    except (ProxyRequiredError, ConnectionError, TimeoutError) as exc:
+        # The gateway refused the lease or the exit/transport failed: a
+        # gateway/pool verdict the stall watch classifies as transport.
+        raise AirflowException(
+            f'шлюз/пул: {type(exc).__name__}: {redact_sensitive(exc)}'
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - storage/meter/permit are not the pool
+        raise AirflowException(
+            f'проба: {type(exc).__name__}: {redact_sensitive(exc)}'
+        ) from exc
+
+    status_code = int(outcome.status_code or 0)
+    body_bytes = int(outcome.decoded_body_bytes or 0)
+    if str(outcome.error or '').startswith('transport:'):
+        failure = str(outcome.error)
+    elif status_code != 200:
+        failure = f'http={status_code}'
+    elif body_bytes <= GATEWAY_PROBE_MIN_BODY_BYTES:
+        failure = f'body {body_bytes} байт'
+    else:
+        failure = None
+    if failure is not None:
+        raise AirflowException(f'шлюз/пул: {failure}')
+    return {
+        'url': GATEWAY_PROBE_URL,
+        'status_code': status_code,
+        'body_bytes': body_bytes,
+        'provider_metered_bytes': outcome.provider_metered_bytes,
     }
 
 
@@ -418,6 +524,17 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
                 ],
             })
         mapped_envs.append(environment)
+    # #1389: the gateway probe is the one paid request before the children.  It
+    # runs only in the scheduled standing-policy run, after the policy above was
+    # fully validated; a manual one-shot run skips it, so a packet the child
+    # would refuse never costs a probe.  A dead pool fails the run here, one
+    # task, before any mapped child starts.
+    if approval_mode == 'standing_policy':
+        _probe_gateway_exit(
+            dag_id=str(context['dag'].dag_id), run_id=str(context['run_id']),
+        )
+    else:
+        logger.info('проба сети пропущена: ручной ран с пакетом одобрений')
     return mapped_envs
 
 
@@ -817,7 +934,86 @@ def _build_scope_set(
     }
 
 
+class _UpstreamFailureAlreadyReported(AirflowFailException):
+    """Preflight/planning failed and already sent its own alert."""
+
+
+def _failure_class(scope_status: Mapping[str, Any] | None) -> str:
+    if not scope_status:
+        return 'unknown'  # no status written during this run
+    error = str(scope_status.get('error') or '')
+    if 'transport:' in error:
+        return 'transport'
+    return str(scope_status.get('error_type') or 'unknown')
+
+
+def _read_child_scope_status(
+    env: Mapping[str, Any], *, not_before: datetime | None = None,
+) -> dict[str, Any] | None:
+    """The child's scope-status.json, only if written during this dag run.
+
+    A child killed by its execution_timeout writes nothing; a file left by an
+    earlier run/try must not lend it a stale class.
+    """
+
+    try:
+        payload = json.loads(str(env['TM_SCOPE_PAYLOAD_JSON']))
+        base_dir = Path(str(payload['result_paths']['base_dir']))
+        path = base_dir / 'scope-status.json'
+        if not_before is not None and path.stat().st_mtime < not_before.timestamp():
+            return None
+        status = json.loads(path.read_text())
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    return status if isinstance(status, dict) else None
+
+
+def _raise_on_failed_children(context: Mapping[str, Any]) -> None:
+    """Turn red mapped children into one aggregate failure (one TG per run).
+
+    The children carry no failure callback; this task runs ``all_done`` and is
+    the single alert point.  If planning never produced children, the failed
+    upstream task has already alerted — fail without a second message.
+    """
+
+    dag_run = context['dag_run']
+    children = [
+        item for item in dag_run.get_task_instances()
+        if item.task_id == 'run_exact_child_cycle'
+    ]
+    states = [str(getattr(item.state, 'value', item.state)) for item in children]
+    if not children or 'upstream_failed' in states:
+        raise _UpstreamFailureAlreadyReported(
+            'preflight/planning failed before any scope ran; alerted upstream'
+        )
+    failed = [item for item in children if str(
+        getattr(item.state, 'value', item.state)
+    ) == 'failed']
+    if not failed:
+        return
+    planned_envs = context['ti'].xcom_pull(task_ids='plan_exact_scopes') or []
+    classes: dict[str, int] = {}
+    for item in failed:
+        index = int(getattr(item, 'map_index', -1))
+        env = planned_envs[index] if 0 <= index < len(planned_envs) else {}
+        failure = _failure_class(_read_child_scope_status(
+            env, not_before=getattr(dag_run, 'start_date', None),
+        ))
+        classes[failure] = classes.get(failure, 0) + 1
+    rendered = ', '.join(f'{name}: {count}' for name, count in sorted(classes.items()))
+    raise AirflowFailException(
+        f'{len(failed)} из {len(children)} кусков красные, классы: {{{rendered}}}'
+    )
+
+
+def _scope_set_failure_callback(context: Mapping[str, Any]) -> None:
+    if isinstance(context.get('exception'), _UpstreamFailureAlreadyReported):
+        return
+    telegram_on_failure(context)
+
+
 def _validate_scope_set(**context: Any) -> dict[str, Any]:
+    _raise_on_failed_children(context)
     ti = context['ti']
     planned_envs = ti.xcom_pull(task_ids='plan_exact_scopes') or []
     preflight = (
@@ -991,6 +1187,9 @@ with DAG(
     plan_exact_scopes_task = PythonOperator(
         task_id='plan_exact_scopes',
         python_callable=_plan_exact_scopes,
+        # #1389: the plan ends with the paid gateway probe — one probe per run,
+        # not one per retry.
+        retries=0,
     )
 
     run_exact_child_cycle_task = BashOperator.partial(
@@ -1056,11 +1255,15 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
         # long worst-case DagRun only delays the next scheduled one.
         execution_timeout=timedelta(seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS),
         do_xcom_push=False,
+        # #1389: one TG per run — validate_scope_set reports the aggregate.
+        on_failure_callback=None,
     ).expand(env=plan_exact_scopes_task.output)
 
     validate_scope_set_task = PythonOperator(
         task_id='validate_scope_set',
         python_callable=_validate_scope_set,
+        trigger_rule='all_done',
+        on_failure_callback=_scope_set_failure_callback,
     )
 
     (

@@ -29,6 +29,18 @@ def _reload_dag_module():
 
 @pytest.fixture
 def dag_module():
+    # #1389: plan_exact_scopes ends with a paid gateway probe.  Unit tests of
+    # the DAG never touch the network: record the calls instead.
+    module = _reload_dag_module()
+    module.probe_calls = []
+    module._probe_gateway_exit = (
+        lambda **kw: module.probe_calls.append(kw) or {'status_code': 200}
+    )
+    return module
+
+
+@pytest.fixture
+def real_probe_module():
     return _reload_dag_module()
 
 
@@ -965,6 +977,7 @@ class TestScopeSetGate:
         )
         result = dag_module._validate_scope_set(
             ti=ti, params={'scopes': ['GB1:2025'], 'leagues': []},
+            dag_run=_dag_run(_child(0, 'success')),
         )
         assert result['transform_conf'] == {
             'transfermarkt_parent_cycle_id': 'parent-cycle',
@@ -1394,7 +1407,374 @@ class TestReaderPreflight:
             tm_v2, 'verify_reader_views', lambda *a, **kw: {'passed': True},
         )
         result = dag_module._preflight_reader_route_for_paid_cycle()
+        assert dag_module.probe_calls == []
         assert result['revision'] == 9
         assert result['candidate_slot'] == 'b'
         assert result['write_mode'] == 'dual'
         assert result['paid_io_allowed'] is True
+
+
+class _ProbeResponse:
+    def __init__(self, body: bytes, *, status: int = 200, headers=None):
+        self.content = body
+        self.status_code = status
+        self.headers = dict(headers or {'Content-Length': str(len(body))})
+
+
+class _ProbeTlsClient:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+        self.closed = False
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def close(self):
+        self.closed = True
+
+
+class _ProbeTlsFactory:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.clients = []
+
+    def __call__(self, **kwargs):
+        client = _ProbeTlsClient(self.responses)
+        self.clients.append(client)
+        return client
+
+
+class _ProbeLeaseProvider:
+    def __init__(self):
+        self.acquired = []
+        self.closed = []
+        self.permits = []
+
+    def acquire(self, *, max_bytes, ttl_seconds, metadata):
+        from scrapers.transfermarkt.models import ProxyLease
+
+        lease = ProxyLease(
+            lease_id=f'lease-{len(self.acquired) + 1}',
+            token='token',
+            proxy_url='http://proxy_filter:8900',
+            max_bytes=max_bytes,
+            expires_at=9_999_999_999,
+        )
+        self.acquired.append((lease, dict(metadata)))
+        return lease
+
+    def stats(self, lease):
+        from scrapers.transfermarkt.models import LeaseTrafficSnapshot
+
+        return LeaseTrafficSnapshot()
+
+    def close(self, lease):
+        from scrapers.transfermarkt.models import LeaseTrafficSnapshot
+
+        self.closed.append(lease.lease_id)
+        return LeaseTrafficSnapshot(closed=True)
+
+    def acquire_request_permit(self, *, metadata, request_id):
+        self.permits.append(request_id)
+        return f'permit-{len(self.permits)}'
+
+    @staticmethod
+    def authenticated_proxy_url(lease):
+        return 'http://lease:token@proxy_filter:8900'
+
+
+class TestGatewayProbe:
+    """#1389: one paid request before planning; a dead gateway fails early."""
+
+    def _probe(self, real_probe_module, monkeypatch, responses):
+        monkeypatch.delenv('TRANSFERMARKT_RAW_STORE_URI', raising=False)
+        monkeypatch.delenv('TRANSFERMARKT_REQUIRE_RAW_STORE', raising=False)
+        provider = _ProbeLeaseProvider()
+        factory = _ProbeTlsFactory(responses)
+        call = lambda: real_probe_module._probe_gateway_exit(  # noqa: E731
+            dag_id='dag_ingest_transfermarkt',
+            run_id='scheduled__2026-09-25T04:00:00+00:00',
+            lease_provider=provider,
+            client_factory=factory,
+        )
+        return call, provider, factory
+
+    def test_real_page_passes_and_closes_the_lease(self, real_probe_module, monkeypatch):
+        call, provider, factory = self._probe(
+            real_probe_module, monkeypatch, [_ProbeResponse(b'x' * 70 * 1024)],
+        )
+        result = call()
+        assert result['status_code'] == 200
+        assert result['body_bytes'] == 70 * 1024
+        assert len(provider.acquired) == 1
+        assert provider.closed == ['lease-1']
+        assert factory.clients[0].calls == [real_probe_module.GATEWAY_PROBE_URL]
+        metadata = provider.acquired[0][1]
+        assert metadata['dag_id'] == 'dag_ingest_transfermarkt'
+        assert metadata['canonical_url'] == real_probe_module.GATEWAY_PROBE_URL
+
+    def test_gateway_502_fails_with_gateway_class(self, real_probe_module, monkeypatch):
+        call, provider, _ = self._probe(
+            real_probe_module, monkeypatch, [_ProbeResponse(b'bad gateway', status=502)],
+        )
+        with pytest.raises(Exception, match=r'шлюз/пул: http=502'):
+            call()
+        assert provider.closed == ['lease-1']
+
+    def test_pseudo_status_fails_with_transport_class(
+        self, real_probe_module, monkeypatch,
+    ):
+        call, provider, _ = self._probe(
+            real_probe_module, monkeypatch, [_ProbeResponse(b'', status=0)],
+        )
+        with pytest.raises(Exception, match=r'шлюз/пул: transport:'):
+            call()
+        assert provider.closed == ['lease-1']
+
+    def test_small_200_body_is_not_the_source(self, real_probe_module, monkeypatch):
+        call, provider, _ = self._probe(
+            real_probe_module, monkeypatch, [_ProbeResponse(b'x' * 10 * 1024)],
+        )
+        with pytest.raises(Exception, match=r'шлюз/пул: body 10240 байт'):
+            call()
+        assert provider.closed == ['lease-1']
+
+    def test_lease_refusal_is_a_gateway_verdict(self, real_probe_module, monkeypatch):
+        from scrapers.transfermarkt.models import ProxyRequiredError
+
+        call, provider, _ = self._probe(real_probe_module, monkeypatch, [])
+
+        def refuse(**kwargs):
+            raise ProxyRequiredError('proxy lease API rejected POST /v1/leases')
+
+        provider.acquire = refuse
+        with pytest.raises(Exception, match=r'шлюз/пул: ProxyRequiredError'):
+            call()
+
+    def test_storage_failure_is_not_a_gateway_verdict(
+        self, real_probe_module, monkeypatch,
+    ):
+        from scrapers.transfermarkt.models import TrafficMeterError
+
+        call, provider, _ = self._probe(real_probe_module, monkeypatch, [])
+
+        def meter_down(**kwargs):
+            raise TrafficMeterError('request permit wait exceeded its bound')
+
+        provider.acquire = meter_down
+        with pytest.raises(Exception) as caught:
+            call()
+        assert str(caught.value).startswith('проба: TrafficMeterError')
+        assert 'шлюз/пул' not in str(caught.value)
+
+    def test_probe_lease_is_signed_by_the_plan_task(
+        self, real_probe_module, monkeypatch,
+    ):
+        call, provider, _ = self._probe(
+            real_probe_module, monkeypatch, [_ProbeResponse(b'x' * 70 * 1024)],
+        )
+        call()
+        assert provider.acquired[0][1]['task_id'] == 'plan_exact_scopes'
+
+    def test_plan_task_never_retries_the_paid_probe(self, real_probe_module):
+        from airflow.operators.python import PythonOperator
+
+        task = next(
+            item for item in PythonOperator._instances
+            if item.task_id == 'plan_exact_scopes'
+        )
+        assert task._init_kwargs['retries'] == 0
+
+    def test_probe_runs_after_approvals_and_fails_the_plan(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        gate = TestStandingPolicyGate()
+        gate._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        context = gate._context(dag_module, gate._standing_params(dag_module))
+
+        assert len(dag_module._plan_exact_scopes(**context)) == 1
+        assert dag_module.probe_calls == [{
+            'dag_id': 'dag_ingest_transfermarkt',
+            'run_id': 'scheduled__2026-07-13',
+        }]
+
+        def dead(**kwargs):
+            raise dag_module.AirflowException('шлюз/пул: http=502')
+
+        monkeypatch.setattr(dag_module, '_probe_gateway_exit', dead)
+        with pytest.raises(Exception, match='шлюз/пул'):
+            dag_module._plan_exact_scopes(**context)
+
+    def test_refused_run_never_spends_the_probe(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        gate = TestStandingPolicyGate()
+        gate._arm(dag_module, monkeypatch, tmp_path)
+        monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(
+                **gate._context(dag_module, gate._standing_params(dag_module)),
+            )
+        assert dag_module.probe_calls == []
+
+
+def _child(map_index, state):
+    return SimpleNamespace(
+        task_id='run_exact_child_cycle', map_index=map_index, state=state,
+    )
+
+
+def _dag_run(*children):
+    return SimpleNamespace(get_task_instances=lambda: list(children))
+
+
+def _env_with_status(tmp_path, name, status):
+    base = tmp_path / name
+    base.mkdir()
+    if status is not None:
+        (base / 'scope-status.json').write_text(json.dumps(status))
+    return {
+        'TM_SCOPE_PAYLOAD_JSON': json.dumps(
+            {'result_paths': {'base_dir': str(base)}},
+        ),
+    }
+
+
+class TestOneAlertPerRun:
+    """#1389: eight mapped failures used to send eight TG messages."""
+
+    def test_mapped_children_carry_no_failure_callback(self, dag_module):
+        task = _bash_task('run_exact_child_cycle')
+        assert 'on_failure_callback' in task._init_kwargs
+        assert task._init_kwargs['on_failure_callback'] is None
+
+    def test_scope_set_task_is_the_single_alert_point(self, dag_module):
+        from airflow.operators.python import PythonOperator
+
+        task = next(
+            item for item in PythonOperator._instances
+            if item.task_id == 'validate_scope_set'
+        )
+        assert task._init_kwargs['trigger_rule'] == 'all_done'
+        assert (
+            task._init_kwargs['on_failure_callback']
+            is dag_module._scope_set_failure_callback
+        )
+
+    def test_failed_children_become_one_aggregate(self, dag_module, tmp_path):
+        envs = [
+            _env_with_status(tmp_path, 'a', {
+                'status': 'failed', 'error_type': 'ScopeCycleError',
+                'error': 'players runner failed: transport:connection:'
+                         'TransportStatusError',
+            }),
+            _env_with_status(tmp_path, 'b', {
+                'status': 'failed', 'error_type': 'ScopeManifestError',
+                'error': 'manifest digest drift',
+            }),
+            _env_with_status(tmp_path, 'c', {'status': 'complete'}),
+        ]
+        ti = MagicMock()
+        ti.xcom_pull.side_effect = lambda task_ids: envs
+        with pytest.raises(Exception) as caught:
+            dag_module._raise_on_failed_children({
+                'ti': ti,
+                'dag_run': _dag_run(
+                    _child(0, 'failed'), _child(1, 'failed'),
+                    _child(2, 'success'),
+                ),
+            })
+        assert isinstance(caught.value, dag_module.AirflowFailException)
+        assert str(caught.value) == (
+            '2 из 3 кусков красные, классы: '
+            '{ScopeManifestError: 1, transport: 1}'
+        )
+
+    def test_status_file_older_than_the_run_is_not_trusted(
+        self, dag_module, tmp_path,
+    ):
+        import os
+        from datetime import datetime, timezone
+
+        env = _env_with_status(tmp_path, 'old', {
+            'status': 'failed', 'error_type': 'ScopeCycleError',
+            'error': 'transport:connection:TransportStatusError',
+        })
+        status_path = tmp_path / 'old' / 'scope-status.json'
+        os.utime(status_path, (1_000_000_000, 1_000_000_000))
+        ti = MagicMock()
+        ti.xcom_pull.side_effect = lambda task_ids: [env]
+        dag_run = SimpleNamespace(
+            get_task_instances=lambda: [_child(0, 'failed')],
+            start_date=datetime(2026, 9, 25, 4, 0, tzinfo=timezone.utc),
+        )
+        with pytest.raises(Exception, match=r'классы: \{unknown: 1\}'):
+            dag_module._raise_on_failed_children({'ti': ti, 'dag_run': dag_run})
+
+    def test_green_children_pass_through(self, dag_module):
+        dag_module._raise_on_failed_children({
+            'ti': MagicMock(),
+            'dag_run': _dag_run(_child(0, 'success'), _child(1, 'success')),
+        })
+
+    def test_upstream_failure_is_not_reported_twice(self, dag_module, monkeypatch):
+        sent = []
+        monkeypatch.setattr(dag_module, 'telegram_on_failure', sent.append)
+        with pytest.raises(dag_module._UpstreamFailureAlreadyReported) as caught:
+            dag_module._raise_on_failed_children({
+                'ti': MagicMock(),
+                'dag_run': _dag_run(_child(-1, 'upstream_failed')),
+            })
+        dag_module._scope_set_failure_callback({'exception': caught.value})
+        assert sent == []
+        aggregate = {'exception': dag_module.AirflowFailException('2 из 8')}
+        dag_module._scope_set_failure_callback(aggregate)
+        assert sent == [aggregate]
+
+
+
+class TestProbeOnlyInScheduledRun:
+    """#1389 (after Astra r3): the probe runs only in the standing-policy run."""
+
+    def test_standing_policy_run_probes(self, dag_module, monkeypatch, tmp_path):
+        gate = TestStandingPolicyGate()
+        gate._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        dag_module._plan_exact_scopes(
+            **gate._context(dag_module, gate._standing_params(dag_module)),
+        )
+        assert len(dag_module.probe_calls) == 1
+
+    def test_one_shot_run_skips_the_probe(
+        self, dag_module, monkeypatch, tmp_path, caplog,
+    ):
+        gate = TestStandingPolicyGate()
+        payload = gate._arm(dag_module, monkeypatch, tmp_path)
+        params = gate._standing_params(
+            dag_module,
+            approval_bundles={
+                payload['scope_id']: {
+                    'paid_proxy_packet_id': 'paid-1',
+                    'paid_proxy_packet_hash': 'a' * 64,
+                    'production_write_packet_id': 'write-1',
+                    'production_write_packet_hash': 'b' * 64,
+                },
+            },
+        )
+        with caplog.at_level('INFO'):
+            envs = dag_module._plan_exact_scopes(
+                **gate._context(dag_module, params, run_type='manual'),
+            )
+        assert envs[0]['TM_APPROVAL_MODE'] == 'one_shot'
+        assert dag_module.probe_calls == []
+        assert 'проба сети пропущена: ручной ран с пакетом одобрений' in caplog.text

@@ -89,8 +89,34 @@ _MAX_BLOCKED_ATTEMPTS = 4
 TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS = 65.0
 
 
+# #1389: the gateway names the upstream CONNECT outcome (``<code|timeout|
+# dead_exit>``) in this header; an older gateway sends none.
+PROXY_UPSTREAM_STATUS_HEADER = "X-Proxy-Upstream-Status"
+
+
 class TransportStatusError(ConnectionError):
     """A pseudo-response carried no real HTTP status (tls-client quirk)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        upstream_status: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.upstream_status = upstream_status
+
+
+def _header_value(headers: Any, name: str) -> Optional[str]:
+    if not isinstance(headers, Mapping):
+        return None
+    wanted = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == wanted:
+            return str(value).strip() or None
+    return None
 
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
@@ -1662,6 +1688,7 @@ class TransfermarktHttpClient:
         attempt_envelopes: list[RawAttemptEnvelopeRecord] = []
 
         for attempt in range(1, attempts_cap + 1):
+            proxy_status = ""
             self._check_request_budget()
             self._check_decoded_budget(before_request=True)
             self._check_provider_budget(retry=attempt > 1)
@@ -1695,7 +1722,12 @@ class TransfermarktHttpClient:
                     # which retries on a fresh exit like any other
                     # connection failure.
                     raise TransportStatusError(
-                        f"transport failure: pseudo HTTP status {status_code}"
+                        f"transport failure: pseudo HTTP status {status_code}",
+                        status_code=status_code,
+                        upstream_status=_header_value(
+                            getattr(resp, "headers", None),
+                            PROXY_UPSTREAM_STATUS_HEADER,
+                        ),
                     )
                 body = self._response_bytes(resp)
                 body_n = len(body)
@@ -1978,6 +2010,13 @@ class TransfermarktHttpClient:
                     last_error = f"HTTP {status_code}"
                     error_type = ErrorType.UNKNOWN.value
                     retry_allowed = False
+                if status_code >= 500 or status_code == 407:
+                    # #1389: a gateway-generated 502/407 carries its upstream
+                    # class on the real HTTP response, not on a pseudo status.
+                    proxy_status = (
+                        f" proxy_status={status_code} upstream_class="
+                        f"{_header_value(response_headers, PROXY_UPSTREAM_STATUS_HEADER) or 'нет класса от шлюза'}"
+                    )
 
                 proxy_success = terminal_status == FetchStatus.SCHEMA_ERROR
                 self._record_proxy(
@@ -2002,6 +2041,16 @@ class TransfermarktHttpClient:
                     self._avoid_on_next_client(proxy_obj)
                     self._discard_failed_transport(label=label)
                 if not retry_allowed:
+                    if proxy_status:
+                        logger.warning(
+                            "%s attempt %d/%d failed (%s): %s%s",
+                            label,
+                            attempt,
+                            attempts_cap,
+                            context or url,
+                            last_error,
+                            proxy_status,
+                        )
                     break
             except TrafficBudgetExceeded:
                 self._budget_exhausted = True
@@ -2046,6 +2095,11 @@ class TransfermarktHttpClient:
                 last_status = 0
                 safe_kind = self._transport_error_kind(exc)
                 last_error = f"transport:{safe_kind}:{type(exc).__name__}"
+                proxy_status = (
+                    f" proxy_status={getattr(exc, 'status_code', None)}"
+                    " upstream_class="
+                    f"{getattr(exc, 'upstream_status', None) or 'нет класса от шлюза'}"
+                )
                 terminal_status = FetchStatus.RETRY_EXHAUSTED
                 error_name = type(exc).__name__.lower()
                 error_type = (
@@ -2088,15 +2142,28 @@ class TransfermarktHttpClient:
                 self._avoid_on_next_client(proxy_obj)
                 self._discard_failed_transport(label=label)
                 if attempt >= attempts_cap:
+                    # #1389: the last (or only) attempt still names the
+                    # gateway's answer — the loop exits before the shared
+                    # warning below.
+                    logger.warning(
+                        "%s attempt %d/%d failed (%s): %s%s",
+                        label,
+                        attempt,
+                        attempts_cap,
+                        context or url,
+                        last_error,
+                        proxy_status,
+                    )
                     break
 
             logger.warning(
-                "%s attempt %d/%d failed (%s): %s",
+                "%s attempt %d/%d failed (%s): %s%s",
                 label,
                 attempt,
                 attempts_cap,
                 context or url,
                 last_error,
+                proxy_status,
             )
             self._backoff(attempt)
 
