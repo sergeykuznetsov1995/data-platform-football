@@ -1034,14 +1034,30 @@ def test_extract_tournament_standings_same_name_blocks_differ_by_id():
     rows = extract_tournament_standings(_same_name_blocks_buffer(), 291, 84027)
     assert [r["group_id"] for r in rows] == [1001, 1001, 1002, 1002]
     groups = [normalize_standing(r)["group"] for r in rows]
+    # The first block keeps its published name; only a later block whose team
+    # would collide gets the id, so no already-published key changes.
     assert groups == [
-        "Lebanese Second Division 25/26 #1001",
-        "Lebanese Second Division 25/26 #1001",
+        "Lebanese Second Division 25/26",
+        "Lebanese Second Division 25/26",
         "Lebanese Second Division 25/26 #1002",
         "Lebanese Second Division 25/26 #1002",
     ]
     # group_id is a key helper only, never a Bronze column.
     assert "group_id" not in normalize_standing(rows[0])
+
+
+def test_same_name_blocks_without_shared_team_keep_the_published_group():
+    """#1351 (Astra r1): such a season already published under the plain name
+    (no duplicate, no schema_error); renaming it would leave the old Bronze
+    rows beside new ones under MERGE by (league, season, group, team)."""
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"][1]["rows"][0]["team"]["id"] = 4
+    rows = extract_tournament_standings(buffer, 291, 84027)
+    assert {normalize_standing(r)["group"] for r in rows} == {
+        "Lebanese Second Division 25/26"}
 
 
 def test_extract_tournament_standings_distinct_names_keep_plain_group():
