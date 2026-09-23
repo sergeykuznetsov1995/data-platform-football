@@ -330,15 +330,14 @@ def build_schedule_page_spec(
             )
         },
         paid_proxy=paid_proxy,
-        # The seed page has no predecessor. SofaScore returns 404 when that
-        # direction has no events (for example ``next/0`` after a season has
-        # ended), which is a legitimate empty direction. Later pages are only
-        # planned after a preceding ``hasNextPage=true`` and therefore keep a
-        # 404 resumable/failing.
-        legitimate_empty_http_statuses=(204, 404) if page == 0 else (204,),
-        # A page explicitly promised by the preceding ``hasNextPage`` is
-        # required. A transient 404 must remain resumable, not become a cached
-        # ``not_supported`` hole in the schedule chain.
+        # SofaScore returns 404 when a direction has no (more) events: on the
+        # seed page (``next/0`` after a season has ended) and further down the
+        # chain alike. A 404 on a page promised by the preceding
+        # ``hasNextPage=true`` means the chain ended, exactly as in
+        # ``schedule_refresh`` (#1351): keeping it retryable replayed the
+        # stored 404 at zero traffic into a red league every day.
+        legitimate_empty_http_statuses=(204, 404),
+        # Never a cached ``not_supported`` hole in the schedule chain.
         not_supported_http_statuses=(),
     )
 
@@ -866,9 +865,9 @@ def plan_season_partition(
         )
         if required_schedule_page:
             # Schedule pages, including a page promised by its predecessor,
-            # are never optional. A seed page may nevertheless be a body-less
-            # terminal empty (204/404) when that whole direction has no events.
-            # Promised later pages do not accept 404 in their endpoint policy.
+            # are never optional. Any page may nevertheless be a body-less
+            # terminal empty (204/404): the direction has no (more) events and
+            # the chain ends there (#1351).
             accepted_schedule_empty = bool(
                 manifest
                 and manifest.status == ManifestStatus.LEGITIMATE_EMPTY

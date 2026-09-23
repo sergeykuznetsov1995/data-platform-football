@@ -546,21 +546,32 @@ def test_network_free_planner_follows_every_stored_schedule_page(tmp_path):
 
 
 @pytest.mark.unit
-def test_seed_schedule_404_is_legitimate_empty_but_promised_page_is_not():
+def test_schedule_404_is_legitimate_empty_on_seed_and_promised_pages():
+    """#1351: a 404 further down the chain means the chain ended (as in
+    ``schedule_refresh``); it used to be a retryable failure that reddened the
+    league every day."""
     seed = build_schedule_page_spec(direction="next", page=0, **_common())
     promised = build_schedule_page_spec(direction="next", page=1, **_common())
 
     assert 404 in seed.legitimate_empty_http_statuses
-    assert 404 not in promised.legitimate_empty_http_statuses
+    assert 404 in promised.legitimate_empty_http_statuses
     assert seed.not_supported_http_statuses == ()
     assert promised.not_supported_http_statuses == ()
 
 
 @pytest.mark.unit
-def test_seed_schedule_terminal_404_closes_direction_without_json(tmp_path):
+@pytest.mark.parametrize("page", [0, 1])
+def test_schedule_terminal_404_closes_direction_without_json(tmp_path, page):
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
-    seed = build_schedule_page_spec(direction="next", page=0, **_common())
+    if page:
+        # The promised page exists in the plan only after ``hasNextPage``.
+        _seed_json(
+            raw_store,
+            build_schedule_page_spec(direction="next", page=0, **_common()),
+            _schedule_payload([14000001], has_next=True),
+        )
+    seed = build_schedule_page_spec(direction="next", page=page, **_common())
     raw = raw_store.store_bytes(
         seed.raw_target,
         b'{"error":"not found"}',
@@ -590,7 +601,7 @@ def test_seed_schedule_terminal_404_closes_direction_without_json(tmp_path):
     assert all(
         not (
             spec.key.endpoint == "schedule_next"
-            and spec.key.target_id != "next:0"
+            and spec.key.target_id not in {"next:0", f"next:{page}"}
         )
         for spec in plan.specs
     )
@@ -628,6 +639,63 @@ def test_missing_promised_schedule_page_stays_planned_and_nonterminal(tmp_path):
             max_pages=1,
             **_common(),
         )
+
+
+@pytest.mark.unit
+def test_promised_schedule_page_404_replays_to_legitimate_empty_and_closes(
+    tmp_path,
+):
+    """#1351: the promised page answered 404 once and its raw is stored; every
+    later attempt replayed it at 0 traffic into ``retryable_failure``. Now the
+    free replay ends the chain: the page is ``legitimate_empty``, the direction
+    is closed and the season is publishable."""
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    last_zero = build_schedule_page_spec(direction="last", page=0, **_common())
+    last_one = build_schedule_page_spec(direction="last", page=1, **_common())
+    _seed_json(raw_store, last_zero, _schedule_payload([14000001], has_next=True))
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    raw = raw_store.store_bytes(
+        last_one.raw_target,
+        b'{"error":{"code":404,"message":"Not Found"}}',
+        request_url=last_one.url,
+        http_status=404,
+        response_headers={"content-type": "application/json"},
+    )
+    manifest.upsert(
+        EndpointManifest(
+            key=last_one.key,
+            status=ManifestStatus.RETRYABLE_FAILURE,
+            run_id="earlier-attempt",
+            task_id="season",
+            attempts=1,
+            row_count=0,
+            http_status=404,
+            raw_content_hash=raw.content_hash,
+            raw_blob_key=raw.blob_key,
+            request_url=last_one.url,
+            error_type="TransportError",
+            error_message="unexpected SofaScore HTTP status 404",
+        )
+    )
+    engine, transport = _engine(
+        tmp_path, raw_store=raw_store, manifest_store=manifest
+    )
+
+    before = plan_season_partition(raw_store, manifest, **_common())
+    assert last_one.key in before.pending_keys
+    replay_season_specs(engine, [last_one])
+    after = plan_season_partition(raw_store, manifest, **_common())
+
+    assert transport.calls == 0
+    assert manifest.get(last_one.key).status == ManifestStatus.LEGITIMATE_EMPTY
+    assert last_one.key not in after.pending_keys
+    assert last_one.key not in after.missing_raw_keys
+    assert all(spec.key.target_id != "last:2" for spec in after.specs)
 
 
 @pytest.mark.unit
