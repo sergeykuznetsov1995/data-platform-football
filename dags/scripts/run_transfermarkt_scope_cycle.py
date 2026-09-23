@@ -1182,6 +1182,12 @@ def _build_scope_manifest(
             'requests', 'retries', 'cache_hits', 'duration_ms',
         )
     }
+    # #1388: keep-alive evidence — how many requests each TLS session
+    # carried; informational, absent in results of older runners.
+    session_totals = {
+        'sessions': 0, 'requests': 0,
+        'multi_request_sessions': 0, 'max_requests_per_session': 0,
+    }
     empty_hash = stable_hash([])
     for run in runs:
         _validate_result_identity(run.result, identity, run.parser_entity)
@@ -1191,6 +1197,14 @@ def _build_scope_manifest(
         )
         for field, value in metrics.items():
             total_metrics[field] += int(value)
+        per_session = run.result.get('requests_per_session')
+        if isinstance(per_session, Mapping):
+            for field in ('sessions', 'requests', 'multi_request_sessions'):
+                session_totals[field] += int(per_session.get(field) or 0)
+            session_totals['max_requests_per_session'] = max(
+                session_totals['max_requests_per_session'],
+                int(per_session.get('max_requests_per_session') or 0),
+            )
         manifest_rows = _manifest_rows(run.result, args.write_mode)
         outputs = run.result.get('outputs') or {}
         if not isinstance(outputs, Mapping):
@@ -1398,6 +1412,7 @@ def _build_scope_manifest(
             'decoded_mib': total_metrics['decoded_bytes'] / MIB,
             'wire_mib': total_metrics['wire_bytes'] / MIB,
             'provider_mib': total_metrics['provider_metered_bytes'] / MIB,
+            'requests_per_session': session_totals,
             'cache_hit_rate': (
                 total_metrics['cache_hits']
                 / (total_metrics['requests'] + total_metrics['cache_hits'])

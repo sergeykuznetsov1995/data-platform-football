@@ -193,6 +193,37 @@ class TestRecordTrafficRun:
         assert "10485761" in inserts[0]
 
     @pytest.mark.unit
+    def test_persists_provider_metered_bytes_when_present(self, fake_silver):
+        pt = importlib.import_module("utils.proxy_traffic")
+        metered = pt.summarize_result_traffic("transfermarkt", {
+            "telemetry_available": True,
+            "decoded_response_body_bytes": 1000,
+            "provider_metered_bytes": 7777,
+        })
+        unmetered = pt.summarize_result_traffic("fbref", {
+            "telemetry_available": True,
+            "decoded_response_body_bytes": 1000,
+        })
+
+        assert metered["provider_metered_bytes"] == 7777
+        assert unmetered["provider_metered_bytes"] is None
+        assert pt.record_traffic_run(metered, conn=object()) is True
+        assert pt.record_traffic_run(unmetered, conn=object()) is True
+
+        executed = fake_silver["executed"]
+        assert any(
+            "ADD COLUMN IF NOT EXISTS provider_metered_bytes bigint" in sql
+            for sql in executed
+        )
+        inserts = [sql for sql in executed if sql.startswith("INSERT INTO")]
+        assert all(
+            "estimated_wire_response_mb, provider_metered_bytes) VALUES" in sql
+            for sql in inserts
+        )
+        assert inserts[0].endswith(", 7777)")
+        assert inserts[1].endswith(", NULL)")
+
+    @pytest.mark.unit
     def test_replace_existing_is_retry_idempotent(self, fake_silver):
         pt = importlib.import_module("utils.proxy_traffic")
 
@@ -228,7 +259,9 @@ class TestRecordTrafficRun:
 class TestDailyRollup:
     @pytest.mark.unit
     def test_rolls_up_per_source_and_formats_report(self, fake_silver):
-        fake_silver["rows"] = [("fbref", 900.0, 3), ("transfermarkt", 300.0, 4)]
+        fake_silver["rows"] = [
+            ("fbref", 900.0, 3, None), ("transfermarkt", 300.0, 4, 1200.5),
+        ]
         pt = importlib.import_module("utils.proxy_traffic")
 
         out = pt.daily_rollup(object())
@@ -236,8 +269,18 @@ class TestDailyRollup:
         assert out["total_mb"] == pytest.approx(1200.0)
         assert out["by_source"][0] == {
             "source": "fbref", "mb": 900.0, "gb": round(900.0 / 1024, 3), "runs": 3,
+            "paid_mb": None,
         }
+        assert out["by_source"][1]["paid_mb"] == 1200.5
         assert "fbref" in out["report"] and "GB" in out["report"]
+        # #1388: provider-billed bytes next to decoded ones, only when metered.
+        assert "transfermarkt 0.293 GB (оплачено 1200.5 МиБ)" in out["report"]
+        assert "fbref 0.879 GB," in out["report"]
+        assert any(
+            "sum(CAST(provider_metered_bytes AS double)" in s
+            for s in fake_silver["executed"]
+            if s.startswith("SELECT source")
+        )
         assert any("GROUP BY source" in s for s in fake_silver["executed"])
         assert any(
             "decoded_response_body_bytes" in s

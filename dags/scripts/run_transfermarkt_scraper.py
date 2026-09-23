@@ -3310,6 +3310,7 @@ def _base_result(
         'provider_down_bytes': None,
         'provider_metered_bytes': None,
         'provider_metering_available': False,
+        'requests_per_session': None,
         'failed_attempts': 0,
         'budget_status': {},
         'checkpoint_status': 'not_applicable',
@@ -4108,6 +4109,7 @@ def _run_entity(
         results['provider_metering_available'] = bool(
             traffic.get('provider_metering_available', False)
         )
+        results['requests_per_session'] = traffic.get('requests_per_session')
         results['estimated_wire_response_mb'] = traffic.get(
             'estimated_wire_response_mb', results['wire_mb'],
         )

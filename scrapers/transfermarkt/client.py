@@ -15,6 +15,7 @@ import random
 import re
 import socket
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import asdict, replace
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional
@@ -92,6 +93,22 @@ TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS = 65.0
 # #1389: the gateway names the upstream CONNECT outcome (``<code|timeout|
 # dead_exit>``) in this header; an older gateway sends none.
 PROXY_UPSTREAM_STATUS_HEADER = "X-Proxy-Upstream-Status"
+
+# #1388: a lease with less than this left is closed and replaced before the
+# next request, so the gateway never expires it under an open tunnel.
+_LEASE_RENEW_BEFORE_SECONDS = 60.0
+
+
+def _requests_per_session(counts: Any) -> Dict[str, Any]:
+    """Summarise how many requests each keep-alive TLS session carried."""
+
+    values = [int(value) for value in counts]
+    return {
+        "sessions": len(values),
+        "requests": sum(values),
+        "multi_request_sessions": sum(1 for value in values if value > 1),
+        "max_requests_per_session": max(values, default=0),
+    }
 
 
 class TransportStatusError(ConnectionError):
@@ -609,6 +626,8 @@ class TransfermarktHttpClient:
         self._monotonic = monotonic_fn
 
         self._client = None
+        self._session_id: Optional[str] = None
+        self._requests_by_session: Dict[str, int] = {}
         self._proxy_obj = None
         self._avoid_proxy_key: Optional[str] = None
         self._avoid_explicit_proxy = False
@@ -767,11 +786,18 @@ class TransfermarktHttpClient:
     # ------------------------------------------------------------------
 
     def _new_tls_client(self, proxy_url: str):
+        # wrapper-tls-requests 1.2.5 overwrites its per-client uuid with
+        # ``session_id=None`` unless one is passed, so every request opened
+        # a fresh TLS tunnel (#1388).  One explicit id per client keeps the
+        # connection alive for the life of the lease; a new client (new
+        # exit/lease) gets a new id and ``close()`` destroys exactly it.
+        self._session_id = uuid.uuid4().hex
         if self._client_factory is not None:
             return self._client_factory(
                 proxy=proxy_url,
                 headers=dict(DEFAULT_HEADERS),
                 client_identifier="chrome_133",
+                session_id=self._session_id,
             )
         import tls_requests
 
@@ -779,6 +805,7 @@ class TransfermarktHttpClient:
             proxy=_tls_requests_compatible_proxy_url(proxy_url),
             headers=dict(DEFAULT_HEADERS),
             client_identifier="chrome_133",
+            session_id=self._session_id,
         )
 
     def _ensure_client(
@@ -789,6 +816,11 @@ class TransfermarktHttpClient:
         context: Mapping[str, Any],
         retry: bool,
     ):
+        if self._client is not None and self._lease_expiring():
+            # Planned rotation, not a transport failure: close the session
+            # and the lease before the gateway expires it mid-request.
+            self._discard_client()
+            self._close_lease(label=label)
         if self._client is not None:
             return self._client, self._proxy_obj
 
@@ -873,6 +905,12 @@ class TransfermarktHttpClient:
         self._client = self._new_tls_client(proxy_url)
         return self._client, self._proxy_obj
 
+    def _lease_expiring(self) -> bool:
+        return (
+            self._lease is not None
+            and self._lease.expires_at - self._time() < _LEASE_RENEW_BEFORE_SECONDS
+        )
+
     def _has_alternate_proxy(self, proxy_obj) -> bool:
         if self._lease_provider is not None:
             return self._traffic_ledger.remaining_hard_bytes > 0
@@ -896,6 +934,7 @@ class TransfermarktHttpClient:
     def _discard_client(self) -> None:
         client = self._client
         self._client = None
+        self._session_id = None
         self._proxy_obj = None
         if client is not None:
             try:
@@ -1381,6 +1420,9 @@ class TransfermarktHttpClient:
                 provider_total if self._provider_metering_available else None
             ),
             "provider_metering_available": self._provider_metering_available,
+            "requests_per_session": _requests_per_session(
+                self._requests_by_session.values()
+            ),
             "network_fetches": self._attempts,
             "request_attempts": self._attempts,
             "requests": self._attempts,
@@ -1705,6 +1747,10 @@ class TransfermarktHttpClient:
                     label=label,
                     context=context,
                 )
+                if self._session_id is not None:
+                    self._requests_by_session[self._session_id] = (
+                        self._requests_by_session.get(self._session_id, 0) + 1
+                    )
                 resp = client.get(
                     url,
                     timeout=self.timeout_seconds,
