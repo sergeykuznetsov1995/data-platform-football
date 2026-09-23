@@ -674,12 +674,16 @@ def replay_player_specs(
     return runtime.engine.capture_many(specs, offline=True, force_replay=True)
 
 
+_NO_MISMATCH = object()
+
+
 def materialize_player_datasets(
     scraper,
     results: Iterable[CaptureResult],
     *,
     league: str,
     season: str,
+    rejected: Optional[list] = None,
 ):
     """Build player Bronze frames with canonical source/raw lineage.
 
@@ -687,6 +691,10 @@ def materialize_player_datasets(
     atomically MERGE both returned frames and only then call
     :func:`finalize_materialized_results`. This preserves raw-first replay when
     either Iceberg write fails.
+
+    With ``rejected`` (#1352) a record whose rows name another player is
+    appended there as ``(result, message)`` and skipped instead of failing the
+    whole league.
     """
     import pandas as pd
 
@@ -702,6 +710,24 @@ def materialize_player_datasets(
                 f'unexpected player capture datasets: {sorted(unknown)!r}'
             )
         key = result.manifest.key
+        if rejected is not None:
+            mismatch = next(
+                (
+                    row.get('player_id')
+                    for dataset in result.datasets.values()
+                    for row in dataset.rows
+                    if row.get('player_id') is None
+                    or str(row.get('player_id')) != key.target_id
+                ),
+                _NO_MISMATCH,
+            )
+            if mismatch is not _NO_MISMATCH:
+                rejected.append((
+                    result,
+                    f'player row target mismatch: {mismatch!r} != '
+                    f'{key.target_id!r}',
+                ))
+                continue
         for name, dataset in result.datasets.items():
             raw_hash = (
                 result.raw.content_hash

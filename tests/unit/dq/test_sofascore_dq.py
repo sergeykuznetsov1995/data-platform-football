@@ -208,7 +208,7 @@ def test_table_contract_rejects_duplicates_missing_fields_and_bad_enum():
     assert {"required_field_loss", "null_natural_key"} <= codes
 
 
-def test_participant_gender_enum_stops_non_male_rows_before_the_write():
+def test_participant_gender_enum_rejects_the_row_and_keeps_the_rest():
     base = {
         "match_id": "1",
         "team_id": "t1",
@@ -236,12 +236,71 @@ def test_participant_gender_enum_stops_non_male_rows_before_the_write():
         if finding.code == "invalid_enum_value"
     ]
     assert invalid and invalid[0].examples[0][1] == "gender"
-    with pytest.raises(SofaScoreDQViolation):
-        report.require()
+
+    # #1352: one non-male participant is refused as a row; the other 24 rows
+    # of the batch are accepted instead of the whole batch being dropped.
+    men = [{**base, "match_id": str(n)} for n in range(1, 25)]
+    rows = [*men[:12], {**women, "match_id": "99"}, *men[12:]]
+    accepted, rejected = validate_table_rows(table, rows).partition(rows)
+    assert accepted == men
+    assert len(rejected) == 1
+    assert rejected[0].code == "invalid_enum_value"
+    assert rejected[0].table == table
+    assert rejected[0].row["gender"] == "F"
+    assert rejected[0].natural_key == "ENG-Premier League|2526|99|t2"
+    assert "gender='F'" in rejected[0].message
 
     # A missing source marker is absence of evidence, not a contradiction.
     unknown = {**base, "team_id": "t3", "team_side": "away", "gender": None}
     assert validate_table_rows(table, [base, unknown]).passed
+
+
+def _participant(match_id, team_id, **extra):
+    return {
+        "match_id": match_id,
+        "team_id": team_id,
+        "team_side": "home",
+        "name": "Arsenal",
+        "gender": "M",
+        "team_type": 0,
+        "source_tournament_id": 17,
+        "source_season_id": 76986,
+        "league": "ENG-Premier League",
+        "season": "2526",
+        "raw_content_hash": "a" * 64,
+        "raw_blob_key": "sofascore/17/76986/event/1.json.gz",
+        "_ingested_at": "2026-07-11T00:00:00Z",
+        **extra,
+    }
+
+
+def test_duplicate_natural_key_keeps_the_first_row_and_rejects_the_rest():
+    table = "bronze.sofascore_event_participants"
+    first = _participant("1", "t1")
+    again = _participant("1", "t1", name="Arsenal FC")
+    other = _participant("1", "t2", team_side="away")
+    rows = [first, again, other]
+
+    accepted, rejected = validate_table_rows(table, rows).partition(rows)
+
+    assert accepted == [first, other]
+    assert [row.code for row in rejected] == ["duplicate_natural_key"]
+    assert rejected[0].row is again
+
+
+def test_all_rows_rejected_still_fails_the_batch():
+    table = "bronze.sofascore_event_participants"
+    rows = [
+        _participant("1", "t1", gender="F"),
+        _participant("2", "t2", gender="F"),
+    ]
+
+    with pytest.raises(
+        SofaScoreDQViolation,
+        match=r"all 2 rows of bronze\.sofascore_event_participants rejected: "
+        r"invalid_enum_value",
+    ):
+        validate_table_rows(table, rows).partition(rows)
 
 
 def test_adult_men_gender_tripwire_guards_the_committed_partition():

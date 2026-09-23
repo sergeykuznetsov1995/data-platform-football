@@ -630,3 +630,41 @@ def test_failed_plan_preparation_is_a_zero_request_phase_that_quarantines(
     record = state.read_failures(failures, campaign_id="c")["c:17:76986"]
     assert record["streak_no_traffic"] == 3
     assert state.is_quarantined_record(record, 3)
+
+
+@pytest.mark.unit
+def test_cycle_result_carries_rejected_rows_of_a_green_phase(tmp_path, monkeypatch):
+    """#1352: a phase that refused single rows stays green and says so."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    rejected_rows = {
+        "bronze.sofascore_event_participants": {"invalid_enum_value": 1}
+    }
+
+    def run_capture(argv):
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            "errors": [],
+            "rejected_rows": rejected_rows,
+            "traffic": {"request_count": 0},
+        }))
+        return 0
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches")) == 0
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "success"
+    assert result["phases"][0]["rejected_rows"] == rejected_rows
+    assert "rejected_players" not in result["phases"][0]

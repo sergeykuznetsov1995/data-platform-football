@@ -178,7 +178,14 @@ def test_bootstrap_inventory_matches_new_normalized_bronze_contracts():
         "bronze.sofascore_lineups",
         "bronze.sofascore_incidents",
         "bronze.sofascore_player_universe",
+        "bronze.sofascore_rejected_rows",
     }
+    # #1352: the rejects journal is not a normalized endpoint table; the
+    # endpoint coverage contract stays unchanged.
+    rejected = by_name.pop("bronze.sofascore_rejected_rows")
+    assert "bronze.sofascore_rejected_rows" not in contract["tables"]
+    assert rejected.natural_key == ("table_name", "natural_key", "run_id")
+    assert rejected.partition_columns == ("league", "season")
     for name, table in by_name.items():
         declared = contract["tables"][name]
         assert table.natural_key == tuple(declared["natural_key"])

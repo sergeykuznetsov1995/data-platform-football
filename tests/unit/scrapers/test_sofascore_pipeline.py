@@ -761,6 +761,37 @@ def test_player_materialization_rejects_target_mismatch(tmp_path):
         )
 
 
+def test_player_materialization_journals_target_mismatch_when_asked(tmp_path):
+    """#1352: with a rejects list, one mismatched record no longer fails the league."""
+    runtime, _ = _runtime(tmp_path)
+    spec = _player_spec("player_profile")
+    result = ingest_prefetched_records(
+        runtime,
+        specs={(PLAYER_ID, "player_profile"): spec},
+        records={"profile": _player_record("player_profile")},
+    )[0]
+    row = dict(result.datasets["player_profile"].rows[0])
+    row["player_id"] = "99999"
+    from scrapers.sofascore.capture_engine import ParsedDataset
+
+    poisoned = CaptureResult(
+        manifest=result.manifest,
+        datasets={"player_profile": ParsedDataset("player_profile", [row])},
+        raw=result.raw,
+    )
+    rejected: list = []
+    frames = materialize_player_datasets(
+        MetadataScraper(),
+        [poisoned, result],
+        league="ENG-Premier League",
+        season="2526",
+        rejected=rejected,
+    )
+    assert [item[0] for item in rejected] == [poisoned]
+    assert "player row target mismatch" in rejected[0][1]
+    assert list(frames["player_profile"]["player_id"]) == [PLAYER_ID]
+
+
 def _runner_player_scraper():
     scraper = MagicMock()
     scraper.__enter__.return_value = scraper
@@ -855,6 +886,184 @@ def test_player_runner_offline_replay_writes_both_tables_without_network(
     assert result["traffic"]["request_count"] == 0
     assert result["profile_players"] == 1
     assert result["season_stats_players"] == 1
+
+
+def _player_records_for(player_id: str, *, broken: bool = False) -> dict:
+    records = {}
+    for endpoint in PLAYER_PATHS:
+        payload = json.loads(PLAYER_FIXTURES[endpoint].read_bytes())
+        if endpoint == "player_profile" and not broken:
+            payload["player"]["id"] = int(player_id)
+        records[f"{player_id}:{endpoint}"] = {
+            "player_id": player_id,
+            "endpoint": endpoint,
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            # A broken profile names another player: the schema validator
+            # records it as schema_error (the POR 504-profile case).
+            "body": json.dumps(payload).encode("utf-8"),
+        }
+    return records
+
+
+def _player_batch_runtime(tmp_path, player_ids, broken_id):
+    runtime, transport = _runtime(tmp_path)
+    specs = {
+        (player_id, endpoint): build_player_spec(
+            source_tournament_id=17,
+            source_season_id=76986,
+            target_id=player_id,
+            endpoint=endpoint,
+            freshness_key="fixture-week",
+            paid_proxy=False,
+        )
+        for player_id in player_ids
+        for endpoint in PLAYER_PATHS
+    }
+    records = {}
+    for player_id in player_ids:
+        records.update(
+            _player_records_for(player_id, broken=player_id == broken_id)
+        )
+    ingest_prefetched_records(runtime, specs=specs, records=records)
+    return runtime, transport, specs
+
+
+def test_player_runner_journals_one_schema_error_and_publishes_the_league(
+    tmp_path,
+    monkeypatch,
+):
+    """#1352: one schema_error player no longer drops the league (POR, 504)."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    monkeypatch.setenv("SOFASCORE_PLAYER_FRESHNESS_KEY", "fixture-week")
+    _patch_complete_season_player_universe(monkeypatch)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    player_ids = [str(30_000 + n) for n in range(25)]
+    broken_id = player_ids[3]
+    runtime, transport, specs = _player_batch_runtime(
+        tmp_path, player_ids, broken_id
+    )
+    assert (
+        runtime.manifest_store.get(specs[(broken_id, "player_profile")].key).status
+        == ManifestStatus.SCHEMA_ERROR
+    )
+    scraper = _runner_player_scraper()
+    scraper._resolve_player_ids_from_bronze.return_value = list(player_ids)
+    saved = {}
+
+    def save(**kwargs):
+        saved[kwargs["table_name"]] = kwargs
+        return "iceberg.bronze." + kwargs["table_name"]
+
+    scraper.save_to_iceberg.side_effect = save
+    output = tmp_path / "player-reject.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, result["errors"]
+    assert transport.calls == 0
+    profiles = saved["sofascore_player_profile"]["df"]
+    assert sorted(profiles["player_id"].astype(str)) == sorted(
+        set(player_ids) - {broken_id}
+    )
+    journal = saved["sofascore_rejected_rows"]["df"]
+    assert list(journal["reason_code"]) == ["schema_error"]
+    assert list(journal["table_name"]) == ["bronze.sofascore_player_profile"]
+    assert list(journal["natural_key"]) == [f"ENG-Premier League|2526|{broken_id}"]
+    assert list(journal["phase"]) == ["players"]
+    assert result["rejected_players"] == 1
+    assert result["rejected_rows"] == {
+        "bronze.sofascore_player_profile": {"schema_error": 1}
+    }
+    # The broken record stays schema_error (a parser fix replays it from raw);
+    # every other endpoint is finalized.
+    for (player_id, endpoint), spec in specs.items():
+        committed = runtime.manifest_store.get(spec.key)
+        if (player_id, endpoint) == (broken_id, "player_profile"):
+            assert committed.status == ManifestStatus.SCHEMA_ERROR
+        else:
+            assert committed.is_terminal
+
+
+def test_player_runner_journals_a_target_mismatch_and_publishes_the_league(
+    tmp_path,
+    monkeypatch,
+):
+    """#1352: ``player row target mismatch`` is a record reject, not a league failure."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import pipeline
+
+    monkeypatch.setenv("SOFASCORE_PLAYER_FRESHNESS_KEY", "fixture-week")
+    _patch_complete_season_player_universe(monkeypatch)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    player_ids = [str(30_000 + n) for n in range(25)]
+    poisoned_id = player_ids[5]
+    runtime, transport, specs = _player_batch_runtime(tmp_path, player_ids, None)
+    real_replay = pipeline.replay_player_specs
+
+    def poisoned_replay(capture_runtime, replay_specs):
+        from scrapers.sofascore.capture_engine import ParsedDataset
+
+        replayed = []
+        for result in real_replay(capture_runtime, replay_specs):
+            key = result.manifest.key
+            if (key.target_id, key.endpoint) == (poisoned_id, "player_profile"):
+                row = dict(result.datasets["player_profile"].rows[0])
+                row["player_id"] = "99999"
+                result = CaptureResult(
+                    manifest=result.manifest,
+                    datasets={"player_profile": ParsedDataset("player_profile", [row])},
+                    raw=result.raw,
+                )
+            replayed.append(result)
+        return replayed
+
+    monkeypatch.setattr(pipeline, "replay_player_specs", poisoned_replay)
+    scraper = _runner_player_scraper()
+    scraper._resolve_player_ids_from_bronze.return_value = list(player_ids)
+    saved = {}
+
+    def save(**kwargs):
+        saved[kwargs["table_name"]] = kwargs
+        return "iceberg.bronze." + kwargs["table_name"]
+
+    scraper.save_to_iceberg.side_effect = save
+    output = tmp_path / "player-mismatch.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, result["errors"]
+    profiles = saved["sofascore_player_profile"]["df"]
+    assert poisoned_id not in set(profiles["player_id"].astype(str))
+    assert len(profiles) == 24
+    journal = saved["sofascore_rejected_rows"]["df"]
+    assert list(journal["reason_code"]) == ["schema_error"]
+    assert "player row target mismatch" in journal.iloc[0]["reason"]
+    assert result["rejected_players"] == 1
+    held = runtime.manifest_store.get(specs[(poisoned_id, "player_profile")].key)
+    assert held.status == ManifestStatus.SCHEMA_ERROR
+    assert held.error_type == "RowRejected"
 
 
 def _recording_writer_lock(monkeypatch, events, on_exit=lambda: None):
@@ -967,7 +1176,11 @@ def test_match_runner_merges_bronze_inside_the_writer_lock_and_finalizes_after(
     )
     from dags.utils import sofascore_dq
 
-    passed = SimpleNamespace(require=lambda: None)
+    passed = SimpleNamespace(
+        require=lambda: None,
+        partition=lambda rows: (list(rows), []),
+        rejected_indices={},
+    )
     for validator in (
         "validate_table_rows",
         "validate_lineup_semantics",
@@ -1010,6 +1223,135 @@ def test_match_runner_merges_bronze_inside_the_writer_lock_and_finalizes_after(
     assert all(
         runtime.manifest_store.get(spec.key).is_terminal for spec in specs.values()
     )
+
+
+def _event_records_for(match_id: str, *, away_gender: str = "M") -> dict:
+    records = {}
+    for endpoint in EVENT_PATHS:
+        body = FIXTURES[endpoint].read_bytes()
+        if endpoint == "event":
+            payload = json.loads(body)
+            payload["event"]["id"] = int(match_id)
+            payload["event"]["awayTeam"]["gender"] = away_gender
+            body = json.dumps(payload).encode("utf-8")
+        records[f"{match_id}:{endpoint}"] = {
+            "match_id": match_id,
+            "endpoint": endpoint,
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "body": body,
+        }
+    return records
+
+
+def test_match_runner_rejects_one_bad_row_and_publishes_the_other_24_matches(
+    tmp_path,
+    monkeypatch,
+):
+    """#1352: one non-male participant no longer drops a 25-match batch.
+
+    The bad row goes to the rejects journal, the other 24 matches reach
+    Bronze and finalize, and the bad match stays nonterminal (schema_error)
+    so the next pass replays it from raw with zero traffic.
+    """
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, transport = _runtime(tmp_path)
+    match_ids = [str(20_000_000 + n) for n in range(25)]
+    bad_match = match_ids[7]
+    specs = {
+        (match_id, endpoint): _event_spec(match_id, endpoint)
+        for match_id in match_ids
+        for endpoint in EVENT_PATHS
+    }
+    records = {}
+    for match_id in match_ids:
+        records.update(
+            _event_records_for(
+                match_id, away_gender="F" if match_id == bad_match else "M"
+            )
+        )
+    ingest_prefetched_records(runtime, specs=specs, records=records)
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: list(match_ids),
+    )
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    events: list[str] = []
+    _recording_writer_lock(monkeypatch, events)
+    saved = {}
+    scraper = _runner_player_scraper()
+
+    def add_metadata(frame, entity_type):
+        frame = MetadataScraper._add_metadata(frame, entity_type)
+        frame["_ingested_at"] = "2026-09-23T00:00:00Z"
+        return frame
+
+    scraper._add_metadata.side_effect = add_metadata
+
+    def save(**kwargs):
+        events.append("save:" + kwargs["table_name"])
+        saved[kwargs["table_name"]] = kwargs
+        return "iceberg.bronze." + kwargs["table_name"]
+
+    scraper.save_to_iceberg.side_effect = save
+    output = tmp_path / "match-reject.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, result["errors"]
+    assert transport.calls == 0
+    assert result["errors"] == []
+    events_df = saved["sofascore_events"]["df"]
+    assert sorted(events_df["match_id"].astype(str)) == sorted(
+        set(match_ids) - {bad_match}
+    )
+    participants = saved["sofascore_event_participants"]["df"]
+    assert bad_match not in set(participants["match_id"].astype(str))
+    assert len(participants) == 48
+    rejected = saved["sofascore_rejected_rows"]
+    assert rejected["natural_keys"] == ["table_name", "natural_key", "run_id"]
+    assert rejected["partition_cols"] == ["league", "season"]
+    journal = rejected["df"]
+    assert len(journal) == 1
+    row = journal.iloc[0]
+    assert row["table_name"] == "bronze.sofascore_event_participants"
+    assert row["reason_code"] == "invalid_enum_value"
+    assert row["run_id"] == "fixture-run"
+    assert row["phase"] == "matches"
+    assert json.loads(row["row_json"])["gender"] == "F"
+    assert events[-2:] == ["save:sofascore_rejected_rows", "lock:exit"]
+    assert result["rejected_rows"] == {
+        "bronze.sofascore_event_participants": {"invalid_enum_value": 1}
+    }
+    for (match_id, _endpoint), spec in specs.items():
+        committed = runtime.manifest_store.get(spec.key)
+        if match_id == bad_match:
+            assert committed.status == ManifestStatus.SCHEMA_ERROR
+            assert committed.error_type == "RowRejected"
+        else:
+            assert committed.is_terminal
+    assert result["matches_complete"] == 24
+    # The held match is nonterminal, so the next pass replays only it.
+    assert set(endpoint_resume_plan(runtime.manifest_store, specs.values())) == {
+        bad_match
+    }
 
 
 def _event_spec(match_id: str, endpoint: str):
@@ -1244,7 +1586,11 @@ def _patch_match_runner_environment(monkeypatch, runner, match_ids):
     )
     from dags.utils import sofascore_dq
 
-    passed = SimpleNamespace(require=lambda: None)
+    passed = SimpleNamespace(
+        require=lambda: None,
+        partition=lambda rows: (list(rows), []),
+        rejected_indices={},
+    )
     for validator in (
         "validate_table_rows",
         "validate_lineup_semantics",
@@ -2170,7 +2516,11 @@ def test_compatibility_status_failure_keeps_long_manifest_replayable_without_net
     )
     from dags.utils import sofascore_dq
 
-    passed = SimpleNamespace(require=lambda: None)
+    passed = SimpleNamespace(
+        require=lambda: None,
+        partition=lambda rows: (list(rows), []),
+        rejected_indices={},
+    )
     for validator in (
         "validate_table_rows",
         "validate_lineup_semantics",

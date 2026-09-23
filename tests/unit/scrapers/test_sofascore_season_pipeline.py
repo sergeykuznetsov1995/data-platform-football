@@ -2001,7 +2001,7 @@ def test_runner_live_player_reports_committed_not_deferred_completeness(
     )
     output = tmp_path / "player-live.json"
 
-    def materialize(_scraper, _results, *, league, season):
+    def materialize(_scraper, _results, *, league, season, rejected=None):
         return {
             "player_profile": pd.DataFrame(
                 [
@@ -2046,7 +2046,7 @@ def test_runner_live_player_reports_committed_not_deferred_completeness(
         ),
         patch(
             "scrapers.sofascore.pipeline.replay_player_specs",
-            return_value=[SimpleNamespace()],
+            return_value=[SimpleNamespace(manifest=SimpleNamespace(status="success"))],
         ),
             patch(
                 "scrapers.sofascore.pipeline.materialize_player_datasets",
