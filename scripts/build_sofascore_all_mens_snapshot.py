@@ -96,6 +96,8 @@ _NEGATIVE_MARKERS = (
      "amateur marker in source identity"),
     (re.compile(r"(?:^|[-_ /])(?:futsal|beach-soccer|esports|e-sports)(?:$|[-_ /])", re.I),
      "non-field-football marker in source identity"),
+    (re.compile(r"esoccer|e-soccer|fifa ?\d\d|eliga|efootball", re.I),
+     "esoccer marker in source identity"),
 )
 
 
