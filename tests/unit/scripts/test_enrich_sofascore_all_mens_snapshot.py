@@ -624,4 +624,44 @@ def test_missing_tournament_identity_is_skipped_not_fatal():
 
     assert client.calls == ["/unique-tournament/17"]
     assert report["unavailable_tournaments"] == 1
-    assert enriched["tournaments"] == snapshot["tournaments"]
+    tournament = enriched["tournaments"][0]
+    assert tournament["metadata_status"] == "pending"
+    assert tournament["identity_unavailable"]["status_code"] == 404
+    assert tournament["seasons"] == snapshot["tournaments"][0]["seasons"]
+
+
+def test_unavailable_identity_cannot_hold_the_head_of_the_queue():
+    # Astra r3: with max_seasons=1 a gone tournament ahead of a healthy one
+    # must not stall every following run.
+    from scrapers.sofascore.discovery import DiscoveryHTTPError
+
+    gone = deepcopy(_snapshot()["tournaments"][0])
+    gone["unique_tournament_id"] = 5
+    for season in gone["seasons"]:
+        season["source_season_id"] += 1
+    document = _snapshot()
+    document["tournaments"].insert(0, gone)
+    document["candidate_count"] = 2
+
+    class GoneFirstClient(Client):
+        def get_json(self, path):
+            if path == "/unique-tournament/5":
+                self.calls.append(path)
+                raise DiscoveryHTTPError("HTTP 404", status_code=404)
+            return super().get_json(path)
+
+    denominator = _priority_denominator({5: "core", 17: "core"})
+    state = _sign(document)
+    ready = []
+    for _run in range(3):
+        state, report = enrich_snapshot(
+            state, GoneFirstClient(), wave_start_year=1999,
+            denominator=denominator, select="priority", max_seasons=1,
+        )
+        ready.append(sum(
+            season["metadata_status"] == "ready"
+            for item in state["tournaments"] for season in item["seasons"]
+        ))
+
+    # Run 1 meets the gone tournament first; runs 2 and 3 move past it.
+    assert ready == [0, 1, 2]

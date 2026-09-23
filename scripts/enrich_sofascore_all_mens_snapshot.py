@@ -91,8 +91,11 @@ def select_priority_seasons(
     ``queue_priority > 0``.  Order: ``(queue_priority, 0 if the season is the
     tournament's newest by start_year else 1, -start_year, tournament_id,
     source_season_id)`` -- every running core season first, then core seasons
-    deeper year by year, then disputed ones.  Returns
-    ``(tournament_id, source_season_id, start_year)`` tuples.
+    deeper year by year, then disputed ones.  A tournament whose identity
+    page the source did not serve (``identity_unavailable``, set by
+    ``enrich_snapshot``) goes behind every other candidate, so it cannot hold
+    the head of the queue; it is retried once the rest has been served.
+    Returns ``(tournament_id, source_season_id, start_year)`` tuples.
     """
 
     if (
@@ -101,7 +104,9 @@ def select_priority_seasons(
         or max_seasons < 1
     ):
         raise SnapshotEnrichmentError("max_seasons must be positive")
-    ranked: list[tuple[tuple[int, int, int, int, int], tuple[int, int, int]]] = []
+    ranked: list[
+        tuple[tuple[int, int, int, int, int, int], tuple[int, int, int]]
+    ] = []
     for tournament in snapshot.get("tournaments") or []:
         if not isinstance(tournament, Mapping):
             raise SnapshotEnrichmentError("snapshot tournament must be an object")
@@ -121,12 +126,14 @@ def select_priority_seasons(
             if season.get("metadata_status") != "excluded"
         ]
         newest = max(live_years) if live_years else None
+        deferred = 1 if tournament.get("identity_unavailable") else 0
         for season in seasons:
             if season.get("metadata_status") != "pending":
                 continue
             start_year = int(season["start_year"])
             season_id = int(season["source_season_id"])
             rank = (
+                deferred,
                 priority,
                 0 if start_year == newest else 1,
                 -start_year,
@@ -240,9 +247,18 @@ def enrich_snapshot(
                 if not _entity_missing(exc):
                     raise
                 # Identity unknown: leave the tournament pending (no guess on
-                # gender) and go on with the rest of the selection.
+                # gender), send it behind the rest of the priority queue and
+                # go on with the rest of the selection.
                 unavailable_tournaments += 1
+                tournament["identity_unavailable"] = {
+                    "endpoint": endpoint,
+                    "status_code": exc.status_code,
+                }
+                document["snapshot_id"] = _snapshot_digest(document)
+                if checkpoint is not None:
+                    checkpoint(document)
                 continue
+            tournament.pop("identity_unavailable", None)
             parsed = parse_catalog_payload(payload, endpoint=endpoint)
             if len(parsed) != 1 or parsed[0]["unique_tournament_id"] != source_id:
                 raise SnapshotEnrichmentError(
