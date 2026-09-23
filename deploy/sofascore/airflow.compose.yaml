@@ -92,6 +92,9 @@ x-ss-airflow-common: &ss-airflow-common
     SOFASCORE_ALL_MENS_STATE: /opt/airflow/runtime/sofascore/all-men/state.json
     SOFASCORE_ALL_MENS_RESULT_DIR: /opt/airflow/runtime/sofascore/all-men/results
     SOFASCORE_REFRESH_RESULT_DIR: /opt/airflow/runtime/sofascore/all-men/refresh-results
+    # Какой релиз в бою (#1351): карантин скоупа кампании привязан к sha8
+    # релиза и сам снимается на следующем (одна попытка).
+    SOFASCORE_RELEASE_ROOT: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}
     # Батч полосы актуалки урезан с дефолтных 8 до 3: при max_active_tasks=1 и
     # execution_timeout=2h на скоуп восемь скоупов не влезают в dagrun_timeout=5h
     # (находка code-review 25.08). Вернуть к 8 после замера реальной длительности скоупа.

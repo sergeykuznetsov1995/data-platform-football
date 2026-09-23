@@ -239,10 +239,18 @@ def test_finalize_remembers_failed_scopes_by_map_index(monkeypatch):
         "run_id": "manual__2",
     }
 
+    monkeypatch.delenv("SOFASCORE_RELEASE_ROOT", raising=False)
     assert module._finalize_historical_run(**context)["did_work"] is True
     assert marked == [(
         module.FAILURES_PATH,
-        {"campaign_id": "c", "scope_key": "c:8:825", "run_id": "manual__2"},
+        {
+            "campaign_id": "c", "scope_key": "c:8:825", "run_id": "manual__2",
+            # No result path in this plan: the attempt's outcome is unknown,
+            # which never extends a no-traffic streak (#1351).
+            "reason": "scope result is unreadable",
+            "source_requests": None,
+            "release": "unknown",
+        },
     )]
     # The memory lives next to the completed-state file.
     assert module.FAILURES_PATH == str(
@@ -284,10 +292,104 @@ def test_finalize_remembers_a_scope_whose_validation_failed(monkeypatch):
         "run_id": "manual__3",
     }
 
+    monkeypatch.delenv("SOFASCORE_RELEASE_ROOT", raising=False)
     module._finalize_historical_run(**context)
-    assert marked == [
-        {"campaign_id": "c", "scope_key": "c:8:825", "run_id": "manual__3"}
-    ]
+    assert marked == [{
+        "campaign_id": "c", "scope_key": "c:8:825", "run_id": "manual__3",
+        "reason": "scope result is unreadable",
+        "source_requests": None,
+        "release": "unknown",
+    }]
+
+
+@pytest.mark.unit
+def test_finalize_passes_the_scope_result_reason_traffic_and_release(
+    monkeypatch, tmp_path
+):
+    """#1351: quarantine needs the class of the failure, whether the attempt
+    reached the source at all, and which release ran it."""
+    module = _load_dag_module()
+    result = tmp_path / "result.json"
+    long_tail = "x" * 400
+    result.write_text(module.json.dumps({
+        "status": "failed",
+        "errors": [
+            "season: capture_engine: endpoint standings_total is nonterminal: "
+            "schema_error; attempts: [attempt 1: " + long_tail + "]\nsecond line",
+            "matches: other",
+        ],
+        "phases": [
+            {"phase": "season", "request_count": 0, "replay_hits": 9},
+            {"phase": "matches", "source_request_count": 0, "request_count": 3},
+        ],
+    }))
+    planned = [{**_capture_env("c:8:825"),
+                "SOFASCORE_SCOPE_RESULT_PATH": str(result)}]
+    marked = []
+    monkeypatch.setattr(
+        module.state, "mark_failed", lambda path, **kw: marked.append(kw)
+    )
+    monkeypatch.setenv(
+        "SOFASCORE_RELEASE_ROOT", "/opt/sofascore/releases/release-1a3d9890"
+    )
+    context = {
+        "ti": SimpleNamespace(
+            xcom_pull=lambda **kw: planned, xcom_push=lambda **kw: None
+        ),
+        "dag_run": SimpleNamespace(
+            get_task_instance=lambda task_id, map_index=-1: SimpleNamespace(
+                state="failed" if task_id == "run_historical_scope"
+                else "upstream_failed"
+            )
+        ),
+        "run_id": "manual__4",
+    }
+
+    module._finalize_historical_run(**context)
+
+    assert marked == [{
+        "campaign_id": "c", "scope_key": "c:8:825", "run_id": "manual__4",
+        "reason": (
+            "season: capture_engine: endpoint standings_total is nonterminal: "
+            "schema_error"
+        ),
+        # source_request_count where the phase has it, request_count otherwise.
+        "source_requests": 0,
+        "release": "1a3d9890",
+    }]
+
+
+@pytest.mark.unit
+def test_finalize_counts_paid_phases_as_traffic(monkeypatch, tmp_path):
+    module = _load_dag_module()
+    result = tmp_path / "result.json"
+    result.write_text(module.json.dumps({
+        "status": "failed",
+        "errors": ["season: capture_engine: boom"],
+        "phases": [{"phase": "season", "source_request_count": 5}],
+    }))
+    planned = [{**_capture_env("c:8:825"),
+                "SOFASCORE_SCOPE_RESULT_PATH": str(result)}]
+    marked = []
+    monkeypatch.setattr(
+        module.state, "mark_failed", lambda path, **kw: marked.append(kw)
+    )
+    context = {
+        "ti": SimpleNamespace(
+            xcom_pull=lambda **kw: planned, xcom_push=lambda **kw: None
+        ),
+        "dag_run": SimpleNamespace(
+            get_task_instance=lambda task_id, map_index=-1: SimpleNamespace(
+                state="failed"
+            )
+        ),
+        "run_id": "manual__5",
+    }
+
+    module._finalize_historical_run(**context)
+
+    assert marked[0]["source_requests"] == 5
+    assert marked[0]["reason"] == "season: capture_engine: boom"
 
 
 @pytest.mark.unit
