@@ -135,6 +135,39 @@ def test_exact_scope_fails_closed_before_paid_capture(tmp_path, change, expected
 
 
 @pytest.mark.unit
+def test_snapshot_revised_after_planning_still_loads_the_same_campaign_scope(
+    tmp_path, caplog
+):
+    # #1354: metadata enrichment advances the snapshot between plan and run.
+    snapshot = tmp_path / "snapshot.json"
+    document = _snapshot()
+    snapshot.write_text(json.dumps(document), encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        scope = load_exact_scope(
+            snapshot, tournament_id=17, source_season_id=76986,
+            expected_snapshot_id="f" * 64,
+            expected_campaign_id=document["campaign_id"],
+        )
+
+    assert scope["snapshot_id"] == document["snapshot_id"]
+    assert "snapshot revised after planning (ffffffff->" in caplog.text
+
+
+@pytest.mark.unit
+def test_other_campaign_identity_is_still_refused(tmp_path):
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps(_snapshot()), encoding="utf-8")
+
+    with pytest.raises(CampaignScopeError, match="campaign identity changed"):
+        load_exact_scope(
+            snapshot, tournament_id=17, source_season_id=76986,
+            expected_snapshot_id="f" * 64,
+            expected_campaign_id="other-campaign",
+        )
+
+
+@pytest.mark.unit
 def test_scope_overlays_are_single_tournament_and_catalog_valid(tmp_path):
     snapshot = tmp_path / "snapshot.json"
     snapshot.write_text(json.dumps(_snapshot()), encoding="utf-8")

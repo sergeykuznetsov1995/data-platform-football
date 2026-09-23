@@ -160,9 +160,11 @@ def _validate_historical_scope(**environment: str) -> dict[str, Any]:
     campaign_id, tournament_id, season_id = environment[
         "SOFASCORE_SCOPE_KEY"
     ].split(":")
+    # The result's snapshot_id is the revision the scope actually ran on; the
+    # refresh lane's metadata enrichment may have advanced it after planning
+    # (#1354), which leaves the campaign identity and this exact scope intact.
     if (
-        result.get("snapshot_id") != environment["SOFASCORE_EXPECTED_SNAPSHOT_ID"]
-        or result.get("campaign_id") != campaign_id
+        result.get("campaign_id") != campaign_id
         or int(result.get("tournament_id", 0)) != int(tournament_id)
         or int(result.get("source_season_id", 0)) != int(season_id)
     ):

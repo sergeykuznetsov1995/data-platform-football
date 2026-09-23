@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from scrapers.sofascore.discovery import (
     DISCOVERY_LEASE_MAX_BYTES,
     DISCOVERY_LEASE_TTL_SECONDS,
+    DiscoveryHTTPError,
     DiscoverySchemaError,
     LeaseBrowserSofaScoreClient,
     SEASON_TEAMS_PATH,
@@ -54,6 +55,16 @@ def _validate_snapshot(snapshot: Mapping[str, Any]) -> None:
         raise SnapshotEnrichmentError("snapshot candidate_count mismatch")
 
 
+def _entity_missing(exc: DiscoveryHTTPError) -> bool:
+    """A 4xx about this exact URL (not 403 block / 429 throttle): retrying the
+    same entity cannot help, so it must not abort the whole pass -- otherwise
+    the priority queue picks it first again every run and never moves (#1354).
+    """
+
+    code = exc.status_code
+    return code is not None and 400 <= code < 500 and code not in (403, 429)
+
+
 def _schema_error_retry(season: Mapping[str, Any]) -> bool:
     """True when a season was excluded only by a source team-index schema error."""
 
@@ -66,6 +77,74 @@ def _schema_error_retry(season: Mapping[str, Any]) -> bool:
     )
 
 
+SELECT_MODES = ("wave", "priority")
+
+
+def select_priority_seasons(
+    snapshot: Mapping[str, Any],
+    denominator: Denominator,
+    max_seasons: int,
+) -> list[tuple[int, int, int]]:
+    """Pick the next ``max_seasons`` pending seasons by queue priority (#1354).
+
+    Candidates are pending seasons (``start_year >= 0``) of tournaments with
+    ``queue_priority > 0``.  Order: ``(queue_priority, 0 if the season is the
+    tournament's newest by start_year else 1, -start_year, tournament_id,
+    source_season_id)`` -- every running core season first, then core seasons
+    deeper year by year, then disputed ones.  A tournament whose identity
+    page the source did not serve (``identity_unavailable``, set by
+    ``enrich_snapshot``) goes behind every other candidate, so it cannot hold
+    the head of the queue; it is retried once the rest has been served.
+    Returns ``(tournament_id, source_season_id, start_year)`` tuples.
+    """
+
+    if (
+        isinstance(max_seasons, bool)
+        or not isinstance(max_seasons, int)
+        or max_seasons < 1
+    ):
+        raise SnapshotEnrichmentError("max_seasons must be positive")
+    ranked: list[
+        tuple[tuple[int, int, int, int, int, int], tuple[int, int, int]]
+    ] = []
+    for tournament in snapshot.get("tournaments") or []:
+        if not isinstance(tournament, Mapping):
+            raise SnapshotEnrichmentError("snapshot tournament must be an object")
+        if str(tournament.get("metadata_status") or "pending") == "excluded":
+            continue
+        tournament_id = int(tournament["unique_tournament_id"])
+        priority = denominator.queue_priority(tournament_id)
+        if priority <= 0:
+            continue
+        seasons = [
+            season for season in tournament.get("seasons") or []
+            if isinstance(season, Mapping)
+            and int(season.get("start_year", -1)) >= 0
+        ]
+        live_years = [
+            int(season["start_year"]) for season in seasons
+            if season.get("metadata_status") != "excluded"
+        ]
+        newest = max(live_years) if live_years else None
+        deferred = 1 if tournament.get("identity_unavailable") else 0
+        for season in seasons:
+            if season.get("metadata_status") != "pending":
+                continue
+            start_year = int(season["start_year"])
+            season_id = int(season["source_season_id"])
+            rank = (
+                deferred,
+                priority,
+                0 if start_year == newest else 1,
+                -start_year,
+                tournament_id,
+                season_id,
+            )
+            ranked.append((rank, (tournament_id, season_id, start_year)))
+    ranked.sort(key=lambda item: item[0])
+    return [item for _rank, item in ranked[:max_seasons]]
+
+
 def enrich_snapshot(
     snapshot: Mapping[str, Any],
     client: Any,
@@ -74,14 +153,24 @@ def enrich_snapshot(
     max_tournaments: Optional[int] = None,
     checkpoint: Optional[Callable[[Mapping[str, Any]], None]] = None,
     denominator: Optional[Denominator] = None,
+    select: str = "wave",
+    max_seasons: Optional[int] = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     """Confirm source gender and team counts for one breadth-first wave.
 
     A tournament outside the denominator queues (``queue_priority 0``:
     esoccer, student; #1353) is never fetched.
+
+    ``select="priority"`` (#1354) ignores ``wave_start_year`` and validates
+    the ``max_seasons`` seasons chosen by ``select_priority_seasons``,
+    tournament by tournament in that order; schema-error seasons are not
+    retried in this mode.  ``ready_wave_scopes`` / ``excluded_wave_scopes``
+    then count the selected seasons.
     """
 
     _validate_snapshot(snapshot)
+    if select not in SELECT_MODES:
+        raise SnapshotEnrichmentError(f"unknown select mode {select!r}")
     if max_tournaments is not None and (
         isinstance(max_tournaments, bool)
         or not isinstance(max_tournaments, int)
@@ -90,11 +179,28 @@ def enrich_snapshot(
         raise SnapshotEnrichmentError("max_tournaments must be positive")
     denominator = load_denominator() if denominator is None else denominator
     document = deepcopy(dict(snapshot))
+    tournaments = document["tournaments"]
+    selected: dict[int, set[int]] | None = None
+    if select == "priority":
+        if max_seasons is None:
+            raise SnapshotEnrichmentError("priority select needs max_seasons")
+        selected = {}
+        for tournament_id, season_id, _year in select_priority_seasons(
+            document, denominator, max_seasons
+        ):
+            selected.setdefault(tournament_id, set()).add(season_id)
+        by_id = {
+            int(item["unique_tournament_id"]): item
+            for item in tournaments if isinstance(item, dict)
+        }
+        # dicts keep insertion order: tournaments in selection order.
+        tournaments = [by_id[tournament_id] for tournament_id in selected]
     processed = 0
     source_requests = 0
     retried_scopes = 0
     recovered_scopes = 0
-    for tournament in document["tournaments"]:
+    unavailable_tournaments = 0
+    for tournament in tournaments:
         changed = False
         if max_tournaments is not None and processed >= max_tournaments:
             break
@@ -103,18 +209,27 @@ def enrich_snapshot(
         if denominator.queue_priority(int(tournament["unique_tournament_id"])) == 0:
             continue
         status = str(tournament.get("metadata_status") or "pending")
-        wave_seasons = [
-            season for season in tournament.get("seasons") or []
-            if isinstance(season, dict)
-            and int(season.get("start_year", -1)) == int(wave_start_year)
-        ]
-        retry_seasons = [
-            season for season in tournament.get("seasons") or []
-            if status != "excluded"
-            and isinstance(season, dict)
-            and int(season.get("start_year", -1)) != int(wave_start_year)
-            and _schema_error_retry(season)
-        ]
+        if selected is not None:
+            chosen = selected[int(tournament["unique_tournament_id"])]
+            wave_seasons = [
+                season for season in tournament.get("seasons") or []
+                if isinstance(season, dict)
+                and int(season["source_season_id"]) in chosen
+            ]
+            retry_seasons = []
+        else:
+            wave_seasons = [
+                season for season in tournament.get("seasons") or []
+                if isinstance(season, dict)
+                and int(season.get("start_year", -1)) == int(wave_start_year)
+            ]
+            retry_seasons = [
+                season for season in tournament.get("seasons") or []
+                if status != "excluded"
+                and isinstance(season, dict)
+                and int(season.get("start_year", -1)) != int(wave_start_year)
+                and _schema_error_retry(season)
+            ]
         needs_identity = status == "pending"
         needs_teams = bool(retry_seasons) or any(
             season.get("metadata_status") == "pending" for season in wave_seasons
@@ -125,8 +240,25 @@ def enrich_snapshot(
         source_id = int(tournament["unique_tournament_id"])
         if needs_identity:
             endpoint = TOURNAMENT_PATH.format(unique_tournament_id=source_id)
-            payload = client.get_json(endpoint)
             source_requests += 1
+            try:
+                payload = client.get_json(endpoint)
+            except DiscoveryHTTPError as exc:
+                if not _entity_missing(exc):
+                    raise
+                # Identity unknown: leave the tournament pending (no guess on
+                # gender), send it behind the rest of the priority queue and
+                # go on with the rest of the selection.
+                unavailable_tournaments += 1
+                tournament["identity_unavailable"] = {
+                    "endpoint": endpoint,
+                    "status_code": exc.status_code,
+                }
+                document["snapshot_id"] = _snapshot_digest(document)
+                if checkpoint is not None:
+                    checkpoint(document)
+                continue
+            tournament.pop("identity_unavailable", None)
             parsed = parse_catalog_payload(payload, endpoint=endpoint)
             if len(parsed) != 1 or parsed[0]["unique_tournament_id"] != source_id:
                 raise SnapshotEnrichmentError(
@@ -165,15 +297,17 @@ def enrich_snapshot(
                 unique_tournament_id=source_id,
                 season_id=season_id,
             )
-            payload = client.get_json(endpoint)
             source_requests += 1
             try:
+                payload = client.get_json(endpoint)
                 team_count, evidence = parse_team_count_payload(
                     payload,
                     unique_tournament_id=source_id,
                     season_id=season_id,
                 )
-            except DiscoverySchemaError:
+            except (DiscoverySchemaError, DiscoveryHTTPError) as exc:
+                if isinstance(exc, DiscoveryHTTPError) and not _entity_missing(exc):
+                    raise
                 # Some source-listed cup seasons legitimately expose no team
                 # index. Keep the exact season fail-closed without aborting
                 # metadata validation for every other tournament. A later wave
@@ -206,21 +340,26 @@ def enrich_snapshot(
         item.get("metadata_status") == "excluded"
         for item in document["tournaments"]
     )
+    def _in_wave(item: Mapping[str, Any], season: Mapping[str, Any]) -> bool:
+        if selected is not None:
+            return int(season.get("source_season_id", -1)) in selected.get(
+                int(item["unique_tournament_id"]), ()
+            )
+        return int(season.get("start_year", -1)) == int(wave_start_year)
+
     ready_wave_scopes = sum(
-        season.get("metadata_status") == "ready"
-        and int(season.get("start_year", -1)) == int(wave_start_year)
+        season.get("metadata_status") == "ready" and _in_wave(item, season)
         for item in document["tournaments"]
         for season in item.get("seasons") or []
         if isinstance(season, Mapping)
     )
     excluded_wave_scopes = sum(
-        season.get("metadata_status") == "excluded"
-        and int(season.get("start_year", -1)) == int(wave_start_year)
+        season.get("metadata_status") == "excluded" and _in_wave(item, season)
         for item in document["tournaments"]
         for season in item.get("seasons") or []
         if isinstance(season, Mapping)
     )
-    return document, {
+    counts = {
         "processed_tournaments": processed,
         "ready_tournaments": ready_tournaments,
         "excluded_tournaments": excluded_tournaments,
@@ -229,7 +368,11 @@ def enrich_snapshot(
         "retried_schema_error_scopes": retried_scopes,
         "recovered_schema_error_scopes": recovered_scopes,
         "source_requests": source_requests,
+        "unavailable_tournaments": unavailable_tournaments,
     }
+    if selected is not None:
+        counts["selected_seasons"] = sum(len(item) for item in selected.values())
+    return document, counts
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -316,6 +459,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--wave-start-year", type=int, default=2025)
     parser.add_argument("--max-tournaments", type=int)
+    parser.add_argument("--select", choices=SELECT_MODES, default="wave")
+    parser.add_argument("--max-seasons", type=int)
     parser.add_argument("--budget-cap-bytes", type=int, required=True)
     parser.add_argument(
         "--per-lease-max-bytes", type=int, default=DISCOVERY_LEASE_MAX_BYTES
@@ -337,11 +482,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_path = Path(args.report)
     report: dict[str, Any] = {
         "status": "running",
-        "wave_start_year": args.wave_start_year,
+        "select": args.select,
+        "wave_start_year": (
+            args.wave_start_year if args.select == "wave" else None
+        ),
+        "max_seasons": args.max_seasons,
         "errors": [],
     }
     client: Optional[LeaseBrowserSofaScoreClient] = None
     try:
+        if args.select == "priority" and not args.max_seasons:
+            raise SnapshotEnrichmentError("--select priority needs --max-seasons")
         snapshot = _read_json(source_path)
         if snapshot.get("snapshot_id") != args.expected_snapshot_id:
             raise SnapshotEnrichmentError(
@@ -372,6 +523,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             wave_start_year=args.wave_start_year,
             max_tournaments=args.max_tournaments,
             checkpoint=checkpoint.write,
+            select=args.select,
+            max_seasons=args.max_seasons,
         )
         checkpoint.write(enriched)
         report.update(counts)
@@ -409,5 +562,6 @@ __all__ = [
     "SnapshotEnrichmentError",
     "_SnapshotCheckpoint",
     "enrich_snapshot",
+    "select_priority_seasons",
     "main",
 ]

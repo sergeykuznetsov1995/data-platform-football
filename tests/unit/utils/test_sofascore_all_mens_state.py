@@ -126,7 +126,9 @@ def test_completed_newest_wave_advances_to_previous_season():
 
 
 @pytest.mark.unit
-def test_pending_metadata_plans_a_serialized_wave_before_capture():
+def test_pending_seasons_never_yield_a_metadata_task():
+    # #1354: metadata is enriched by the refresh lane, so a pending season
+    # is skipped; the plan holds only ready capture scopes.
     snapshot = _snapshot(second_status="pending")
     completed = {
         campaign_scope_key(snapshot["campaign_id"], 17, 1725),
@@ -134,9 +136,24 @@ def test_pending_metadata_plans_a_serialized_wave_before_capture():
 
     planned = plan_historical_batch(snapshot, completed=completed, batch_size=10)
 
-    assert len(planned) == 1
-    assert planned[0]["SOFASCORE_CAMPAIGN_ACTION"] == "metadata"
-    assert planned[0]["SOFASCORE_METADATA_WAVE"] == "2025"
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1724"
+    ]
+    assert all(item["SOFASCORE_CAMPAIGN_ACTION"] == "capture" for item in planned)
+    assert not any("SOFASCORE_METADATA_WAVE" in item for item in planned)
+
+
+@pytest.mark.unit
+def test_plan_is_empty_when_only_pending_seasons_remain():
+    snapshot = _snapshot(second_status="pending")
+    completed = {
+        campaign_scope_key(snapshot["campaign_id"], 17, 1725),
+        campaign_scope_key(snapshot["campaign_id"], 17, 1724),
+    }
+
+    planned = plan_historical_batch(snapshot, completed=completed, batch_size=10)
+
+    assert planned == []
 
 
 def test_unavailable_season_does_not_block_other_ready_scopes():

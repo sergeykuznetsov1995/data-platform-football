@@ -99,6 +99,9 @@ x-ss-airflow-common: &ss-airflow-common
     # execution_timeout=2h на скоуп восемь скоупов не влезают в dagrun_timeout=5h
     # (находка code-review 25.08). Вернуть к 8 после замера реальной длительности скоупа.
     SOFASCORE_REFRESH_BATCH_SIZE: ${SOFASCORE_REFRESH_BATCH_SIZE:-3}
+    # Метаданные сезонов (#1354): задача enrich_season_metadata актуалки
+    # проверяет столько pending-сезонов снапшота за прогон (0 — выключить).
+    SOFASCORE_METADATA_SEASONS_PER_RUN: ${SOFASCORE_METADATA_SEASONS_PER_RUN:-170}
     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     ALERT_ENV: sofascore-isolated

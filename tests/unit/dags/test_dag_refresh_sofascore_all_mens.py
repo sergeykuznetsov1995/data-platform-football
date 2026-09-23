@@ -24,6 +24,7 @@ REFRESH_KNOBS = (
     "SOFASCORE_REFRESH_WINDOW_HOURS",
     "SOFASCORE_REFRESH_RESULT_DIR",
     "SOFASCORE_REFRESH_PROXY_CONTROL_URL",
+    "SOFASCORE_METADATA_SEASONS_PER_RUN",
 )
 
 
@@ -81,6 +82,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         "plan_refresh_batch",
         "run_refresh_scope",
         "validate_refresh_scope",
+        "enrich_season_metadata",
         "propagate_refresh_status",
     }
 
@@ -187,7 +189,10 @@ def test_refresh_dag_has_one_all_done_leaf(clean_env, monkeypatch):
     assert operators["validate_refresh_scope"].upstream_task_ids == {
         "run_refresh_scope"
     }
-    assert propagate.upstream_task_ids == {"validate_refresh_scope"}
+    assert operators["enrich_season_metadata"].upstream_task_ids == {
+        "validate_refresh_scope"
+    }
+    assert propagate.upstream_task_ids == {"enrich_season_metadata"}
 
 
 @pytest.mark.unit
@@ -524,8 +529,13 @@ def test_validate_refresh_scope_checks_provenance_without_marking_completed(
     [
         ('{"status": "failed"}', "did not finish successfully"),
         (
-            '{"status": "success", "snapshot_id": "other", "campaign_id": "c",'
+            '{"status": "success", "snapshot_id": "s", "campaign_id": "other",'
             ' "tournament_id": 8, "source_season_id": 825}',
+            "provenance mismatch",
+        ),
+        (
+            '{"status": "success", "snapshot_id": "s", "campaign_id": "c",'
+            ' "tournament_id": 8, "source_season_id": 824}',
             "provenance mismatch",
         ),
         (
@@ -546,6 +556,24 @@ def test_validate_refresh_scope_fails_closed(
 
     with pytest.raises(AirflowException, match=message):
         module._validate_refresh_scope(**_refresh_env(result))
+
+
+@pytest.mark.unit
+def test_validate_refresh_scope_accepts_a_snapshot_revised_after_planning(
+    clean_env, monkeypatch, tmp_path
+):
+    # #1354: enrichment advances the snapshot between plan and run; the same
+    # campaign, tournament and season still validate.
+    module = _load_dag_module(monkeypatch)
+    result = tmp_path / "result.json"
+    result.write_text(
+        '{"status": "success", "snapshot_id": "revised", "campaign_id": "c",'
+        ' "tournament_id": 8, "source_season_id": 825}'
+    )
+
+    assert module._validate_refresh_scope(**_refresh_env(result)) == {
+        "status": "refreshed", "scope_key": "c:8:825"
+    }
 
 
 @pytest.mark.unit
@@ -594,3 +622,120 @@ def test_propagate_refresh_status_is_the_single_honest_leaf(
             module._propagate_status(dag_run=dag_run)
     else:
         assert module._propagate_status(dag_run=dag_run) == {"status": "success"}
+
+
+@pytest.mark.unit
+def test_enrich_season_metadata_task_shape(clean_env, monkeypatch):
+    module = _load_dag_module(monkeypatch)
+    enrich = _operators()["enrich_season_metadata"]
+
+    assert enrich._init_kwargs["trigger_rule"] == "all_done"
+    assert enrich._init_kwargs["retries"] == 0
+    assert enrich._init_kwargs["execution_timeout"] == module.METADATA_TIMEOUT
+    # Astra r1 #2: the enrichment runs inside the same DagRun window as the
+    # sweep and both attempts of every scope (with their retry delay).
+    run = _operators()["run_refresh_scope"]
+    assert (
+        module.REFRESH_FETCH_TIMEOUT
+        + module.REFRESH_BATCH_FITS
+        * (
+            module.REFRESH_SCOPE_TIMEOUT * module.REFRESH_SCOPE_ATTEMPTS
+            + run._init_kwargs["retry_delay"]
+        )
+        + module.METADATA_TIMEOUT
+        <= module.REFRESH_DAGRUN_TIMEOUT
+    )
+    assert module.REFRESH_BATCH_FITS >= 1
+    assert enrich._init_kwargs["pool"] == "ingest_scraper_pool"
+    assert enrich._init_kwargs["priority_weight"] < 5
+    # A failed enrichment is a red task, never a red DagRun.
+    assert "enrich_season_metadata" not in module.REFRESH_TASK_IDS
+    assert module.METADATA_SEASONS_PER_RUN == 170
+
+
+def _fake_enrichment(module, monkeypatch, tmp_path, *, returncode=0):
+    calls = []
+    monkeypatch.setattr(module, "METADATA_RESULT_DIR", str(tmp_path / "metadata-results"))
+    monkeypatch.setattr(
+        module.state, "read_snapshot",
+        lambda *_a, **_k: {"snapshot_id": "snap-1", "campaign_id": "camp-1"},
+    )
+
+    def run(command, *, env, cwd, check):
+        calls.append({"command": command, "env": env, "cwd": cwd})
+        report = command[command.index("--report") + 1]
+        with open(report, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"status": "success", "ready_wave_scopes": 7,'
+                ' "source_requests": 9, "traffic": {"paid_proxy_bytes": 123}}'
+            )
+        return SimpleNamespace(returncode=returncode)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    return calls
+
+
+@pytest.mark.unit
+def test_enrich_season_metadata_builds_the_priority_command(
+    clean_env, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SOFASCORE_REFRESH_PROXY_CONTROL_URL", "http://gw:8899")
+    module = _load_dag_module(monkeypatch)
+    calls = _fake_enrichment(module, monkeypatch, tmp_path)
+
+    summary = module._enrich_season_metadata(run_id="scheduled__2026-09-24T00:30:00+00:00")
+
+    assert summary == {
+        "campaign_id": "camp-1",
+        "ready_wave_scopes": 7,
+        "source_requests": 9,
+        "paid_proxy_bytes": 123,
+    }
+    command = calls[0]["command"]
+    assert command[1] == module.ENRICH_SCRIPT
+
+    def flag(name):
+        return command[command.index(name) + 1]
+
+    assert flag("--snapshot") == module.SNAPSHOT_PATH
+    assert flag("--output") == module.SNAPSHOT_PATH
+    assert flag("--policy") == module.POLICY_PATH
+    assert flag("--select") == "priority"
+    assert flag("--max-seasons") == "170"
+    assert flag("--expected-snapshot-id") == "snap-1"
+    assert flag("--dag-id") == "dag_refresh_sofascore_all_mens"
+    # Astra r1 #1: its own gateway run key, so the sweep cannot starve it.
+    assert flag("--run-id") == "scheduled__2026-09-24T00:30:00+00:00:metadata"
+    assert flag("--task-id") == "enrich_season_metadata"
+    assert flag("--budget-cap-bytes") == str(16 * 1024 * 1024)
+    report = flag("--report")
+    assert report.startswith(str(tmp_path / "metadata-results") + "/")
+    assert report.endswith(".json") and ":" not in report.rsplit("/", 1)[1]
+    assert calls[0]["env"]["SOFASCORE_PROXY_CONTROL_URL"] == "http://gw:8899"
+    assert calls[0]["env"]["PYTHONPATH"] == "/opt/airflow:/opt/airflow/dags"
+
+
+@pytest.mark.unit
+def test_enrich_season_metadata_fails_on_nonzero_exit(
+    clean_env, monkeypatch, tmp_path
+):
+    from airflow.exceptions import AirflowException
+
+    module = _load_dag_module(monkeypatch)
+    _fake_enrichment(module, monkeypatch, tmp_path, returncode=1)
+
+    with pytest.raises(AirflowException, match="enrichment failed"):
+        module._enrich_season_metadata(run_id="manual__x")
+
+
+@pytest.mark.unit
+def test_enrich_season_metadata_zero_seasons_skips(clean_env, monkeypatch, tmp_path):
+    from airflow.exceptions import AirflowSkipException
+
+    monkeypatch.setenv("SOFASCORE_METADATA_SEASONS_PER_RUN", "0")
+    module = _load_dag_module(monkeypatch)
+    calls = _fake_enrichment(module, monkeypatch, tmp_path)
+
+    with pytest.raises(AirflowSkipException):
+        module._enrich_season_metadata(run_id="manual__x")
+    assert calls == []

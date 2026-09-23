@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ import yaml
 
 from scrapers.sofascore.catalog import SofaScoreCatalog
 from scrapers.sofascore.denominator import Denominator, load_denominator
+
+logger = logging.getLogger(__name__)
 
 
 class CampaignScopeError(ValueError):
@@ -132,6 +135,12 @@ def load_exact_scope(
     lane plans its matches from Bronze schedule evidence instead of season
     pages.  Tournament classification and eligibility checks stay as strict as
     for the history campaign; an ``excluded`` season is never admitted.
+
+    ``expected_snapshot_id`` differing from the current revision is only
+    logged: the refresh lane's metadata enrichment advances the snapshot
+    between planning and run (#1354).  The campaign identity
+    (``expected_campaign_id``), the digest and every row check below stay
+    strict, so a revision can never swap the scope that was planned.
     """
 
     path = Path(snapshot_path)
@@ -145,7 +154,10 @@ def load_exact_scope(
     if snapshot_id != _snapshot_digest(document):
         raise CampaignScopeError("campaign snapshot digest mismatch")
     if expected_snapshot_id and snapshot_id != expected_snapshot_id:
-        raise CampaignScopeError("campaign snapshot changed after planning")
+        logger.warning(
+            "snapshot revised after planning (%s->%s), campaign identity intact",
+            str(expected_snapshot_id)[:8], snapshot_id[:8],
+        )
     campaign_id = str(document.get("campaign_id") or "")
     if not campaign_id:
         raise CampaignScopeError("campaign_id is missing")

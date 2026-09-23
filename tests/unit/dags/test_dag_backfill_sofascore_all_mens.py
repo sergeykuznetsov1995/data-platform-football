@@ -421,6 +421,65 @@ def test_validated_scope_clears_its_failure_memory(monkeypatch, tmp_path):
     assert calls == [("completed", "c:8:825"), ("cleared", "c:8:825")]
 
 
+def _validate_capture(module, monkeypatch, tmp_path, document):
+    result = tmp_path / "result.json"
+    result.write_text(document)
+    calls = []
+    monkeypatch.setattr(
+        module.state, "mark_completed",
+        lambda path, **kw: calls.append(("completed", kw["scope_key"])),
+    )
+    monkeypatch.setattr(
+        module.state, "clear_failed",
+        lambda path, **kw: calls.append(("cleared", kw["scope_key"])),
+    )
+    module._validate_historical_scope(
+        SOFASCORE_CAMPAIGN_ACTION="capture",
+        SOFASCORE_SCOPE_RESULT_PATH=str(result),
+        SOFASCORE_EXPECTED_SNAPSHOT_ID="s",
+        SOFASCORE_SCOPE_KEY="c:8:825",
+    )
+    return calls
+
+
+@pytest.mark.unit
+def test_scope_on_a_snapshot_revised_after_planning_is_completed(
+    monkeypatch, tmp_path
+):
+    # #1354: the refresh lane's enrichment advances the snapshot between plan
+    # and run; the paid scope of the same campaign/tournament/season counts.
+    module = _load_dag_module()
+
+    calls = _validate_capture(
+        module, monkeypatch, tmp_path,
+        '{"status": "success", "snapshot_id": "revised", "campaign_id": "c",'
+        ' "tournament_id": 8, "source_season_id": 825}',
+    )
+
+    assert calls == [("completed", "c:8:825"), ("cleared", "c:8:825")]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "document",
+    [
+        '{"status": "success", "snapshot_id": "s", "campaign_id": "other",'
+        ' "tournament_id": 8, "source_season_id": 825}',
+        '{"status": "success", "snapshot_id": "s", "campaign_id": "c",'
+        ' "tournament_id": 8, "source_season_id": 824}',
+    ],
+)
+def test_scope_of_another_campaign_or_season_is_refused(
+    monkeypatch, tmp_path, document
+):
+    from airflow.exceptions import AirflowException
+
+    module = _load_dag_module()
+
+    with pytest.raises(AirflowException, match="provenance mismatch"):
+        _validate_capture(module, monkeypatch, tmp_path, document)
+
+
 @pytest.mark.unit
 def test_shipped_static_policy_authorizes_the_ready_history_scopes(monkeypatch):
     """#1245 regression: the static policy carries no measured tournaments.
