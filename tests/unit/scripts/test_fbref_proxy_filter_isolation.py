@@ -18,8 +18,9 @@ FBREF_FILTER = ROOT / "scripts/fbref_proxy/filter_proxy.py"
 SHARED_FILTER_SHA256 = (
     # Bumped for the per-source SofaScore lease ceiling of the history lane
     # (#1248 stage 1).  FBref keeps its own filter and stays out of
-    # ``runtime_files`` — both asserted below.
-    "e9b91d23a461b9d77b889ae630df83f3f9e3c0b1713e1b2c9ff1c339267123d3"
+    # ``runtime_files`` — both asserted below.  #1350: ledgers flushed off
+    # the per-chunk path.
+    "8a67fc35ac8a05c2610bf04151712b81259c16679147d373bd128f237c2a6f8c"
 )
 
 

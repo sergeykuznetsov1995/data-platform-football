@@ -760,6 +760,8 @@ def test_proxy_wal_can_resume_exact_active_claim_after_process_restart(tmp_path)
         claim_token=durable_claim_token,
     )
     first_ledger.consume(plan, first, 40)
+    # #1350: consume lives in memory until the periodic flush.
+    assert first_ledger.flush() is True
 
     restarted = AllocationLedger(path, control_token=CONTROL_TOKEN)
     resumed = restarted.resume_claim(
@@ -776,6 +778,169 @@ def test_proxy_wal_can_resume_exact_active_claim_after_process_restart(tmp_path)
             allocation.allocation_id,
             claim_token="not-the-durable-wal-token",
         )
+
+
+def _stored(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _spent_on_disk(path: Path, plan, allocation_id: str) -> int:
+    runs = _stored(path)["runs"]
+    (run,) = [item for item in runs.values() if item["run_id"] == plan.run_id]
+    return int(run["allocations"][allocation_id]["spent_provider_bytes"])
+
+
+def test_consume_stays_in_memory_until_flush(tmp_path):
+    """#1350: per-chunk consume must not rewrite the ledger file."""
+
+    plan = _plan(tmp_path)
+    allocation = plan.allocations[0]
+    path = tmp_path / "allocations.json"
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    claim = ledger.claim(plan, allocation.allocation_id, attempt_id="try-1")
+    # claim is a lease boundary: the watchdog needs active_claim on disk.
+    assert _stored(path)["runs"]
+    before = path.stat().st_mtime_ns, path.read_bytes()
+    for _ in range(5):
+        ledger.consume(plan, claim, 10)
+    assert (path.stat().st_mtime_ns, path.read_bytes()) == before
+    assert ledger.dirty is True
+    assert ledger.snapshot(plan)["spent_provider_bytes"] == 50
+    assert path.read_bytes() == before[1], "snapshot must not write"
+
+    assert ledger.flush() is True
+    assert ledger.dirty is False
+    assert _spent_on_disk(path, plan, allocation.allocation_id) == 50
+    flushed = path.stat().st_mtime_ns
+    assert ledger.flush() is False, "clean ledger must not be rewritten"
+    assert path.stat().st_mtime_ns == flushed
+
+
+def test_finish_persists_immediately_including_unflushed_consume(tmp_path):
+    plan = _plan(tmp_path)
+    allocation = plan.allocations[0]
+    path = tmp_path / "allocations.json"
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    claim = ledger.claim(plan, allocation.allocation_id, attempt_id="try-1")
+    ledger.consume(plan, claim, 30)
+    ledger.finish(
+        plan,
+        claim,
+        lease_id="lease-1",
+        endpoint_request_provider_bytes={"event": [30]},
+        completed=True,
+    )
+    assert ledger.dirty is False
+    stored = _stored(path)
+    (run,) = stored["runs"].values()
+    persisted = run["allocations"][allocation.allocation_id]
+    assert persisted["active_claim"] is None
+    assert persisted["completed"] is True
+    assert persisted["spent_provider_bytes"] == 30
+    assert len(persisted["lease_stats"]) == 1
+
+
+def test_compact_file_is_schema_v1_and_readable_by_a_fresh_reader(tmp_path):
+    """Rollback contract: same schema/structure, only the whitespace changed."""
+
+    plan = _plan(tmp_path)
+    allocation = plan.allocations[0]
+    path = tmp_path / "allocations.json"
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    claim = ledger.claim(plan, allocation.allocation_id, attempt_id="try-1")
+    text = path.read_text(encoding="utf-8")
+    assert "\n " not in text, "ledger is written as compact JSON"
+    stored = json.loads(text)
+    assert stored["schema_version"] == 1
+    (run,) = stored["runs"].values()
+    active = run["allocations"][allocation.allocation_id]["active_claim"]
+    assert set(active) >= {"started_at", "start_spent_provider_bytes"}
+    fresh = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    assert fresh._read() == stored
+    resumed = fresh.resume_claim(
+        plan, allocation.allocation_id, claim_token=claim.claim_token
+    )
+    assert resumed.spent_provider_bytes == 0
+
+
+def _stored_run(run_id: str, updated_at: str, *, active: bool) -> dict:
+    return {
+        "run_id": run_id,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+        "allocations": {
+            "a": {"active_claim": {"started_at": updated_at} if active else None}
+        },
+    }
+
+
+def test_flush_compacts_old_inactive_runs_and_keeps_active_and_fresh(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(days=4)).isoformat()
+    fresh = (now - timedelta(hours=1)).isoformat()
+    path = tmp_path / "allocations.json"
+    runs = {
+        "old-done": _stored_run("old-done", old, active=False),
+        "old-active": _stored_run("old-active", old, active=True),
+        "fresh-done": _stored_run("fresh-done", fresh, active=False),
+    }
+    path.write_text(json.dumps({"schema_version": 1, "runs": runs}))
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    assert ledger.flush(force=True) is True
+    assert set(_stored(path)["runs"]) == {"old-active", "fresh-done"}
+
+
+def test_run_cap_drops_oldest_inactive_but_never_an_active_run(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    path = tmp_path / "allocations.json"
+    runs = {
+        f"run-{index}": _stored_run(
+            f"run-{index}",
+            (now - timedelta(minutes=10 - index)).isoformat(),
+            active=index == 0,
+        )
+        for index in range(6)
+    }
+    path.write_text(json.dumps({"schema_version": 1, "runs": runs}))
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN, run_cap=3)
+    ledger.flush(force=True)
+    # run-0 is the oldest but active; run-1/run-2 are the oldest inactive.
+    assert set(_stored(path)["runs"]) == {"run-0", "run-4", "run-5"}
+
+
+def test_restart_before_flush_loses_consume_until_wal_replays_it(tmp_path):
+    """The proxy WAL is primary: an unflushed consume is replayed on restart."""
+
+    plan = _plan(tmp_path)
+    allocation = plan.allocations[0]
+    path = tmp_path / "allocations.json"
+    token = "proxy-wal-claim-token-that-is-at-least-32-bytes"
+    crashed = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    claim = crashed.claim(
+        plan, allocation.allocation_id, attempt_id="try-1", claim_token=token
+    )
+    crashed.consume(plan, claim, 40)
+    del crashed  # no flush: the process died
+
+    restarted = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    resumed = restarted.resume_claim(
+        plan, allocation.allocation_id, claim_token=token
+    )
+    assert resumed.spent_provider_bytes == 0
+    restarted.consume(plan, resumed, 40)  # replay of the journal difference
+    stats = restarted.finish(
+        plan,
+        resumed,
+        lease_id="lease-1",
+        endpoint_request_provider_bytes={"event": [40]},
+        completed=False,
+    )
+    assert stats["attempt_provider_bytes"] == 40
+    assert _spent_on_disk(path, plan, allocation.allocation_id) == 40
 
 
 def test_same_run_cannot_replace_plan_to_mint_another_allocation(tmp_path):

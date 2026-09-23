@@ -127,6 +127,7 @@ jobs:
             tests/unit/deploy/test_sofascore_delivery_scripts.py \
             tests/unit/deploy/test_sofascore_deploy_script.py \
             tests/unit/deploy/test_sofascore_gateway_lease_watchdog.py \
+            tests/unit/deploy/test_sofascore_gateway_probe_load.py \
             tests/unit/dq/test_sofascore_dq.py \
             tests/unit/scrapers/test_run_sofascore_discovery.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
