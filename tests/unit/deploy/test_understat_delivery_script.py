@@ -39,6 +39,7 @@ BASE_FILES = {
     "dags/utils/default_args.py": "DEFAULT_ARGS = {}\n",
     "dags/utils/alerts.py": "def telegram_on_failure(ctx): pass\n",
     "dags/utils/medallion_config.py": "FLOOR = 1\n",
+    "scrapers/utils/retry_policy.py": "RETRY = 1\n",
     "scrapers/understat/__init__.py": "",
     "scrapers/understat/client.py": "VERSION = 1\n",
     "dags/utils/understat_tasks.py": "TASKS = 1\n",
@@ -190,6 +191,26 @@ def test_shared_module_drift_cancels(stand: Stand, shared: str) -> None:
     assert f"общий модуль {shared}" in stand.tg()
     assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 1\n"
     assert stand.accepted() == stand.base
+
+
+@pytest.mark.parametrize("kind", ["extra_in_tree", "deleted_in_master"])
+def test_shared_module_composition_drift_cancels(stand: Stand, kind: str) -> None:
+    if kind == "extra_in_tree":
+        stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
+        (stand.tree / "scrapers/utils/stray.py").write_text("X = 1\n", encoding="utf-8")
+        name = "scrapers/utils/stray.py"
+    else:
+        stand.master({"scrapers/understat/client.py": "VERSION = 2\n", "scrapers/utils/retry_policy.py": None})
+        name = "scrapers/utils/retry_policy.py"
+    (stand.tree / "scrapers/utils/__pycache__").mkdir()
+    (stand.tree / "scrapers/utils/__pycache__/x.cpython-311.pyc").write_bytes(b"\0")
+    res = stand.run("--check")
+    assert res.returncode == 1
+    assert f"ОТМЕНА: общий модуль {name} в бою ≠ master" in res.stdout
+    res = stand.run()
+    assert res.returncode == 1
+    assert f"общий модуль {name}" in stand.tg()
+    assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 1\n"
 
 
 def test_delivers_in_place_creates_new_module_and_rolls_back_by_hand(stand: Stand) -> None:

@@ -164,6 +164,10 @@ ACC=$(cat "$ACCEPTED_F" 2>/dev/null)
 for f in $(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS); do
   g show "$SHA:$f" | cmp -s - "$TREE/$f" || stop "ОТМЕНА: общий модуль $f в бою ≠ master ${SHA:0:7}"
 done
+# Состав тоже: удалённый в master или лишний в бою общий модуль (без __pycache__/.pyc) — та же отмена.
+EXTRA=$(comm -13 <(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS | LC_ALL=C sort -u) \
+  <(cd "$TREE" && for p in $SHARED_PATHS; do [ -e "$p" ] && find "$p" -type f ! -path '*/__pycache__/*' ! -name '*.pyc'; done | LC_ALL=C sort -u))
+[ -z "$EXTRA" ] || stop "ОТМЕНА: общий модуль $(echo $EXTRA) в бою ≠ master ${SHA:0:7} (в master его нет)"
 log "база ${ACC:0:7} → master ${SHA:0:7}; общие модули в бою = master"
 
 # --- бой = принятая база по всем файлам Understat (иначе — чужая живая правка)
