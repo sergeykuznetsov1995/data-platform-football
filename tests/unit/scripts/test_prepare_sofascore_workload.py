@@ -1032,11 +1032,12 @@ def test_season_phase_still_fails_when_planning_fails_for_every_league(
         )
 
 
-def test_dropped_league_diagnostics_name_the_real_cause(
+def test_player_universe_gap_does_not_drop_a_league_from_the_match_phase(
     tmp_path, monkeypatch, capsys
 ):
-    """№9: the drop message was hard-wired to 'season raw is incomplete (N
-    missing keys…)' even when the cause was a player-universe evidence gap."""
+    """#1351 (решение 8): a player-universe evidence gap gates only the player
+    phase. It used to drop the league from the match phase too — the history
+    scope then captured no matches and the season looked done."""
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     gap = "scheduled/participating team 42 has no usable squad evidence"
 
@@ -1047,10 +1048,8 @@ def test_dropped_league_diagnostics_name_the_real_cause(
         capsys,
     )
 
-    assert len([item for item in signed.allocations if item.scope == "match"]) == 1
-    assert (
-        f"drops ENG-Premier League 2526: player universe evidence gaps: {gap}"
-    ) in stderr
+    assert len([item for item in signed.allocations if item.scope == "match"]) == 2
+    assert "drops ENG-Premier League" not in stderr
 
 
 def test_target_phase_still_fails_when_every_league_is_incomplete(

@@ -518,7 +518,9 @@ def prepare_workload_plan(
             )
             if blocking_missing:
                 drop_reason = f"{len(blocking_missing)} missing raw keys"
-            elif season_plan.player_universe_evidence_gaps:
+            elif phase == "players" and season_plan.player_universe_evidence_gaps:
+                # #1351 (решение 8): a gap in the player universe gates only
+                # the player phase; the match phase of the league still runs.
                 drop_reason = "player universe evidence gaps: " + "; ".join(
                     season_plan.player_universe_evidence_gaps
                 )

@@ -460,3 +460,40 @@ def test_cycle_keeps_the_stage_of_a_prefinalize_snapshot(tmp_path, monkeypatch):
     assert result["phases"][0]["status_counts_stage"] == "pre_finalize"
     assert result["status_counts_stage"] == "pre_finalize"
     assert result["status_counts"] == {"retryable_failure": 7}
+
+
+@pytest.mark.unit
+def test_cycle_result_carries_player_universe_gaps(tmp_path, monkeypatch):
+    """#1351: a season published with player-universe gaps is green; the gap
+    count must still reach results/<hash>.json for the watchdog."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+
+    def run_capture(argv):
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            "errors": [],
+            "player_universe_gaps": [
+                "participants omitted scheduled team ids: 44"
+            ],
+            "traffic": {"request_count": 0, "player_universe_gaps": 1},
+        }))
+        return 0
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "season")) == 0
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "success"
+    assert result["phases"][0]["player_universe_gaps"] == 1

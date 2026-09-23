@@ -71,6 +71,7 @@ def _phase_report(path: Path) -> dict[str, Any]:
             "replay_hits",
             "control_channel_failures",
             "accounting_uncertain",
+            "player_universe_gaps",
         ):
             if field in traffic:
                 report[field] = traffic[field]

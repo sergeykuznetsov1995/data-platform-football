@@ -101,7 +101,11 @@ class SeasonPartitionPlan:
 
     @property
     def complete(self) -> bool:
-        return not self.pending_keys and not self.player_universe_evidence_gaps
+        # #1351 (решение 8): player-universe gaps are NOT season incompleteness.
+        # They are kept on the plan and gate only the player phase
+        # (``player_universe_ready``); a season whose participants omit a club
+        # used to fail every attempt at zero traffic, forever.
+        return not self.pending_keys
 
     @property
     def match_phase_ready(self) -> bool:
@@ -120,17 +124,18 @@ class SeasonPartitionPlan:
         profiles are still planned and captured — just on the next run.
         """
 
-        if self.player_universe_evidence_gaps:
-            return False
         return not any(
             key.endpoint != REFEREE_PROFILE_ENDPOINT for key in self.pending_keys
         )
 
     @property
     def player_universe_ready(self) -> bool:
-        """``complete`` for the player phase: the same referee-tolerant view."""
+        """The player phase: the referee-tolerant view plus a proven universe.
 
-        return self.match_phase_ready
+        The only place ``player_universe_evidence_gaps`` block anything (#1351).
+        """
+
+        return self.match_phase_ready and not self.player_universe_evidence_gaps
 
 
 @dataclass(frozen=True)
@@ -990,13 +995,11 @@ def plan_season_partition(
             player_universe_evidence_gaps.append(
                 "participants returned no teams; squad universe is unproven"
             )
-            append_key_once(pending, participants.key)
         elif missing_participants:
             missing_tokens = ",".join(sorted(missing_participants, key=int))
             player_universe_evidence_gaps.append(
                 "participants omitted scheduled team ids: " + missing_tokens
             )
-            append_key_once(pending, participants.key)
 
     # Schedule evidence is authoritative for teams that actually played, while
     # participants can add registered teams that do not appear in the captured
@@ -1019,7 +1022,6 @@ def plan_season_partition(
             player_universe_evidence_gaps.append(
                 f"scheduled/participating team {team_id} has an empty squad"
             )
-            append_key_once(pending, spec.key)
         elif (
             not stored.has_valid_json
             and squad_manifest is not None
@@ -1029,7 +1031,6 @@ def plan_season_partition(
             player_universe_evidence_gaps.append(
                 f"scheduled/participating team {team_id} has no usable squad evidence"
             )
-            append_key_once(pending, spec.key)
 
     referee_ids = set(embedded_referee_ids)
     for event_id in event_ids:
@@ -1302,11 +1303,9 @@ def materialize_season_partition(
 
     league = _canonical_token(canonical_league, "canonical_league")
     season = _canonical_token(canonical_season, "canonical_season")
-    if plan.player_universe_evidence_gaps:
-        raise SeasonMaterializationError(
-            "player universe evidence is incomplete: "
-            + "; ".join(plan.player_universe_evidence_gaps)
-        )
+    # Player-universe gaps do not stop the season (#1351): the schedule and
+    # table are complete evidence on their own; the gaps stay on the plan and
+    # only the player phase refuses a partial universe.
     expected_keys = [spec.key for spec in plan.specs]
     result_keys = [result.manifest.key for result in results]
     if len(result_keys) != len(set(result_keys)):
