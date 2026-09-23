@@ -24,6 +24,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ from scrapers.sofascore.runtime_fingerprint import (
     validate_runtime_fingerprint,
 )
 
+log = logging.getLogger(__name__)
+
 
 WORKLOAD_ARTIFACT_SCHEMA_VERSION = 3
 # v4 is the static workload policy checked into git (#1245).  It declares the
@@ -46,6 +49,18 @@ WORKLOAD_ARTIFACT_SCHEMA_VERSION = 3
 WORKLOAD_POLICY_SCHEMA_VERSION = 4
 WORKLOAD_PLAN_SCHEMA_VERSION = 2
 ALLOCATION_LEDGER_SCHEMA_VERSION = 1
+# #1350: the file grew forever (30 MB) and was rewritten on every chunk.  Runs
+# without an active claim that are older than the retention, or beyond the cap
+# of full runs (oldest first), are slimmed: ``units`` and ``lease_stats`` go,
+# budget/spend/completed stay, so the pre-#1350 binary still refuses to re-mint
+# them after a rollback.  A slimmed run is dropped (and remembered in
+# ``retired_runs``) only when the retire horizon has passed since it was
+# slimmed (``compacted_at``), so no run is dropped during the first 30 days
+# after this code ships.  An active claim is never touched.
+ALLOCATION_RUN_RETENTION_SECONDS = 3 * 24 * 3600
+ALLOCATION_RUN_CAP = 300
+ALLOCATION_RUN_RETIRE_SECONDS = 30 * 24 * 3600
+_SLIMMED_ALLOCATION_FIELDS = ("units", "lease_stats")
 WORKLOAD_BUDGET_DERIVATION = "max_observed_task_bytes_per_workload_class_v2"
 WORKLOAD_STATIC_BUDGET_DERIVATION = "static_workload_class_cap_v1"
 WORKLOAD_METER = "proxy_filter_provider_path_v2"
@@ -1597,17 +1612,130 @@ class AllocationClaim:
 
 
 class AllocationLedger:
-    """Atomic allocation ownership and provider accounting across retries."""
+    """Atomic allocation ownership and provider accounting across retries.
+
+    #1350: the instance is the only writer of its file.  The document is read
+    from disk once and then lives in memory.  ``claim`` and ``finish`` (lease
+    boundaries: the lease watchdog reads ``active_claim`` from disk, restart
+    recovery needs ``start_spent_provider_bytes``/``lease_stats``) persist
+    immediately; ``consume`` only updates memory and marks the ledger dirty;
+    ``flush`` persists a dirty ledger (the gateway calls it on a timer and on
+    SIGTERM).  Bytes consumed after the last flush are replayed from the
+    append-only allocation WAL after a crash.
+    """
 
     def __init__(
         self,
         path: os.PathLike[str] | str,
         *,
         control_token: Optional[str | bytes] = None,
+        run_retention_seconds: int = ALLOCATION_RUN_RETENTION_SECONDS,
+        run_cap: int = ALLOCATION_RUN_CAP,
+        run_retire_seconds: int = ALLOCATION_RUN_RETIRE_SECONDS,
     ) -> None:
         self.path = Path(path)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._secret = _control_secret(control_token)
+        self.run_retention_seconds = int(run_retention_seconds)
+        self.run_cap = int(run_cap)
+        self.run_retire_seconds = int(run_retire_seconds)
+        self._payload: Optional[dict[str, Any]] = None
+        self._dirty = False
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def _load(self) -> dict[str, Any]:
+        """Read the document once; afterwards memory is the source of truth."""
+
+        if self._payload is None:
+            self._payload = self._read()
+        return self._payload
+
+    def _compact(self, payload: dict[str, Any]) -> int:
+        """Slim old inactive runs, retire long-slim ones; never an active one."""
+
+        runs = payload["runs"]
+
+        def active(run: Mapping[str, Any]) -> bool:
+            allocations = run.get("allocations")
+            if not isinstance(allocations, Mapping):
+                return False
+            return any(
+                isinstance(item, Mapping) and item.get("active_claim") is not None
+                for item in allocations.values()
+            )
+
+        def age(run: Mapping[str, Any]) -> float:
+            updated = datetime.fromisoformat(
+                str(run.get("updated_at") or run.get("created_at"))
+            )
+            return (now - updated).total_seconds()
+
+        now = datetime.now(timezone.utc)
+        inactive = sorted(
+            ((age(run), key) for key, run in runs.items() if not active(run)),
+            reverse=True,
+        )
+        retire = [
+            key
+            for _, key in inactive
+            if runs[key].get("compacted") is True
+            and (
+                now - datetime.fromisoformat(str(runs[key]["compacted_at"]))
+            ).total_seconds()
+            > self.run_retire_seconds
+        ]
+        full = [
+            (seconds, key)
+            for seconds, key in inactive
+            if runs[key].get("compacted") is not True
+        ]
+        slim = [key for seconds, key in full if seconds > self.run_retention_seconds]
+        full_runs = sum(1 for run in runs.values() if run.get("compacted") is not True)
+        overflow = full_runs - len(slim) - self.run_cap
+        if overflow > 0:
+            chosen = set(slim)
+            slim.extend([key for _, key in full if key not in chosen][:overflow])
+        for key in slim:
+            run = runs[key]
+            for allocation in run.get("allocations", {}).values():
+                for field in _SLIMMED_ALLOCATION_FIELDS:
+                    allocation.pop(field, None)
+            run["compacted"] = True
+            run["compacted_at"] = now.isoformat()
+        retired = payload.setdefault("retired_runs", {})
+        for key in retire:
+            del runs[key]
+            # A signed plan has no expiry: remember the key so a late retry
+            # is refused instead of resurrecting the run with spent=0.
+            retired[key] = _utc_now()
+        if slim or retire:
+            log.info(
+                "allocation ledger compacted: %d runs slimmed, %d retired, "
+                "%d kept",
+                len(slim),
+                len(retire),
+                len(runs),
+            )
+        return len(slim) + len(retire)
+
+    def flush(self, *, force: bool = False) -> bool:
+        """Compact and persist a dirty ledger; ``False`` when nothing to do."""
+
+        if not (self._dirty or force):
+            return False
+        handle = self._locked()
+        try:
+            payload = self._load()
+            self._compact(payload)
+            self._write(payload)
+            self._dirty = False
+            return True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     def _locked(self):
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1640,7 +1768,7 @@ class AllocationLedger:
             descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             try:
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+                    stream.write(json.dumps(value, separators=(",", ":")) + "\n")
                     stream.flush()
                     os.fsync(stream.fileno())
             except BaseException:
@@ -1677,6 +1805,10 @@ class AllocationLedger:
     def _run(self, payload: dict[str, Any], plan: SignedDagRunPlan) -> dict[str, Any]:
         key = self._run_key(plan)
         existing = payload["runs"].get(key)
+        if existing is None and key in payload.get("retired_runs", {}):
+            raise AllocationAccountingError(
+                "DagRun plan was retired from the allocation ledger"
+            )
         if existing is None:
             allocations = {
                 item.allocation_id: {
@@ -1752,7 +1884,7 @@ class AllocationLedger:
             )
         handle = self._locked()
         try:
-            payload = self._read()
+            payload = self._load()
             run = self._run(payload, plan)
             allocation = run["allocations"][allocation_id]
             if allocation.get("active_claim") is not None:
@@ -1778,7 +1910,14 @@ class AllocationLedger:
             }
             allocation["attempts"] = int(allocation.get("attempts", 0)) + 1
             run["updated_at"] = _utc_now()
-            self._write(payload)
+            try:
+                self._write(payload)
+            except BaseException:
+                allocation["active_claim"] = None
+                allocation["attempts"] = int(allocation["attempts"]) - 1
+                raise
+            # The write carried every earlier in-memory consume as well.
+            self._dirty = False
             return AllocationClaim(
                 artifact_id=plan.artifact_id,
                 dag_id=plan.dag_id,
@@ -1822,7 +1961,7 @@ class AllocationLedger:
             )
         handle = self._locked()
         try:
-            payload = self._read()
+            payload = self._load()
             run = self._run(payload, plan)
             allocation = run["allocations"][allocation_id]
             active = allocation.get("active_claim")
@@ -1885,7 +2024,7 @@ class AllocationLedger:
             raise AllocationAccountingError("claim belongs to another DagRun plan")
         handle = self._locked()
         try:
-            payload = self._read()
+            payload = self._load()
             run = self._run(payload, plan)
             allocation = self._active(run, claim)
             allocation_spent = int(allocation["spent_provider_bytes"])
@@ -1902,7 +2041,8 @@ class AllocationLedger:
             allocation["spent_provider_bytes"] = allocation_spent + provider_bytes
             run["spent_provider_bytes"] = run_spent + provider_bytes
             run["updated_at"] = _utc_now()
-            self._write(payload)
+            # #1350: memory only; ``flush`` persists it off the per-chunk path.
+            self._dirty = True
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
@@ -1951,7 +2091,7 @@ class AllocationLedger:
             raise AllocationAccountingError("proxy exit must be an anonymized hash")
         handle = self._locked()
         try:
-            payload = self._read()
+            payload = self._load()
             run = self._run(payload, plan)
             allocation = self._active(run, claim)
             active = allocation["active_claim"]
@@ -1995,12 +2135,21 @@ class AllocationLedger:
                 "finished_at": _utc_now(),
                 "completed": completed,
             }
+            previous_completed = allocation.get("completed")
             allocation.setdefault("lease_stats", []).append(stats)
             allocation["active_claim"] = None
             if completed:
                 allocation["completed"] = True
             run["updated_at"] = _utc_now()
-            self._write(payload)
+            self._compact(payload)
+            try:
+                self._write(payload)
+            except BaseException:
+                allocation["lease_stats"].pop()
+                allocation["active_claim"] = active
+                allocation["completed"] = previous_completed
+                raise
+            self._dirty = False
             return stats
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -2010,12 +2159,11 @@ class AllocationLedger:
         self._verify(plan)
         handle = self._locked()
         try:
-            payload = self._read()
+            payload = self._load()
             run = self._run(payload, plan)
             # Round-trip detaches callers from mutable in-memory state.
-            snapshot = json.loads(json.dumps(run, sort_keys=True))
-            self._write(payload)
-            return snapshot
+            # #1350: a read, not a write.
+            return json.loads(json.dumps(run, sort_keys=True))
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()

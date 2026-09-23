@@ -263,6 +263,9 @@ SOFASCORE_ALLOCATION_WAL_PATH = (
 SOFASCORE_PARENT_ENVELOPE_PATH = (
     "/opt/airflow/logs/proxy_filter/sofascore_parent_envelopes.json"
 )
+# #1350: dirty SofaScore allocation/envelope ledgers are persisted from the
+# 2-second report tick at most this often (and on SIGTERM), never per chunk.
+LEDGER_FLUSH_INTERVAL_SECONDS = 10.0
 WHOSCORED_CAMPAIGN_LEDGER_PATH = (
     "/opt/airflow/logs/proxy_filter/whoscored_campaigns.json"
 )
@@ -1194,6 +1197,12 @@ _daily_day = ""
 _daily_up_bytes = 0
 _daily_down_bytes = 0
 _daily_reserved_bytes = 0
+# #1350: SofaScore allocation/envelope ledgers are flushed on a timer, while
+# ``paid_requests.jsonl`` is appended with fsync for every chunk.  The boot-time
+# restore keeps what that journal proves per lease and per parent phase so the
+# crash recovery can replay bytes the unflushed ledgers lost.
+_RESTORED_ALLOCATION_LEASE_BYTES: dict[str, int] = {}
+_RESTORED_PARENT_PHASE_BYTES: dict[tuple[str, str], dict[str, int]] = {}
 _run_up_bytes: dict[str, int] = defaultdict(int)
 _run_down_bytes: dict[str, int] = defaultdict(int)
 _run_reserved_bytes: dict[str, int] = defaultdict(int)
@@ -2372,6 +2381,8 @@ def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
     """Restore run/URL/daily counters from durable byte-delta events."""
     global _daily_day, _daily_up_bytes, _daily_down_bytes
     restored = 0
+    _RESTORED_ALLOCATION_LEASE_BYTES.clear()
+    _RESTORED_PARENT_PHASE_BYTES.clear()
     try:
         stream = open(path, "rb")
     except (FileNotFoundError, OSError):
@@ -2405,6 +2416,17 @@ def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
                     else f"standalone/{lease_id}"
                 )
                 canonical = _canonical_url(event.get("canonical_url"))
+                if event.get("allocation_id"):
+                    _RESTORED_ALLOCATION_LEASE_BYTES[lease_id] = (
+                        _RESTORED_ALLOCATION_LEASE_BYTES.get(lease_id, 0) + count
+                    )
+                    base_run_id = str(event.get("base_run_id") or "")
+                    phase = str(event.get("workload_phase") or "")
+                    if base_run_id and phase:
+                        phases = _RESTORED_PARENT_PHASE_BYTES.setdefault(
+                            (dag_id, base_run_id), {}
+                        )
+                        phases[phase] = phases.get(phase, 0) + count
                 if direction == "up":
                     _run_up_bytes[run_key] += count
                     _url_up_bytes[(run_key, canonical)] += count
@@ -2497,7 +2519,14 @@ def _split_phase_run_id(run_id: str) -> tuple[str, str]:
 
 
 class ParentRunEnvelopeLedger:
-    """Atomic parent cap shared by immutable season/targets/players plans."""
+    """Atomic parent cap shared by immutable season/targets/players plans.
+
+    #1350: single writer, document kept in memory.  ``register`` (envelope
+    opening) persists immediately; per-chunk ``consume`` only marks the
+    ledger dirty and ``flush`` persists it on the gateway timer/SIGTERM.  A
+    hard crash may lose at most one flush interval of parent spend (soft
+    phase envelope; exact bytes stay in the paid WAL and allocation ledger).
+    """
 
     SCHEMA_VERSION = 1
     PHASE_ORDER = {"season": 0, "targets": 1, "players": 2}
@@ -2505,6 +2534,29 @@ class ParentRunEnvelopeLedger:
     def __init__(self, path: str) -> None:
         self.path = path
         self.lock_path = path + ".lock"
+        self._payload: dict[str, Any] | None = None
+        self._dirty = False
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def _load(self) -> dict[str, Any]:
+        if self._payload is None:
+            self._payload = self._read()
+        return self._payload
+
+    def flush(self, *, force: bool = False) -> bool:
+        if not (self._dirty or force):
+            return False
+        handle = self._locked()
+        try:
+            self._write(self._load())
+            self._dirty = False
+            return True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     def _locked(self):
         os.makedirs(os.path.dirname(self.lock_path) or ".", exist_ok=True)
@@ -2556,6 +2608,41 @@ class ParentRunEnvelopeLedger:
             except FileNotFoundError:
                 pass
 
+    def replay(self, phase_bytes: Mapping[tuple[str, str], Mapping[str, int]]) -> int:
+        """Raise phase spend to what the paid journal proves (#1350 recovery)."""
+
+        replayed = 0
+        handle = self._locked()
+        try:
+            payload = self._load()
+            for (dag_id, base_run_id), phases in phase_bytes.items():
+                run = payload["runs"].get(self._key(dag_id, base_run_id))
+                if not isinstance(run, dict) or not isinstance(
+                    run.get("phases"), dict
+                ):
+                    continue
+                for phase, journal_bytes in phases.items():
+                    state = run["phases"].get(phase)
+                    if not isinstance(state, dict):
+                        continue
+                    missing = int(journal_bytes) - int(
+                        state.get("spent_provider_bytes", 0)
+                    )
+                    if missing > 0:
+                        state["spent_provider_bytes"] = (
+                            int(state.get("spent_provider_bytes", 0)) + missing
+                        )
+                        run["spent_provider_bytes"] = (
+                            int(run.get("spent_provider_bytes", 0)) + missing
+                        )
+                        replayed += missing
+            if replayed:
+                self._dirty = True
+            return replayed
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
     @staticmethod
     def _key(dag_id: str, base_run_id: str) -> str:
         return hashlib.sha256(f"{dag_id}\0{base_run_id}".encode("utf-8")).hexdigest()
@@ -2597,7 +2684,7 @@ class ParentRunEnvelopeLedger:
         key = self._key(plan.dag_id, base_run_id)
         handle = self._locked()
         try:
-            payload = self._read()
+            payload = self._load()
             run = payload["runs"].get(key)
             if run is None:
                 run = {
@@ -2657,6 +2744,7 @@ class ParentRunEnvelopeLedger:
                 raise ParentEnvelopeError("parent DagRun spend exceeds its signed cap")
             run["updated_at"] = datetime.now(timezone.utc).isoformat()
             self._write(payload)
+            self._dirty = False
             return self._snapshot(run, phase=phase)
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -2675,7 +2763,7 @@ class ParentRunEnvelopeLedger:
             raise ParentEnvelopeError("parent provider bytes must be non-negative")
         handle = self._locked()
         try:
-            payload = self._read()
+            payload = self._load()
             run = payload["runs"].get(self._key(dag_id, base_run_id))
             if not isinstance(run, dict):
                 raise ParentEnvelopeError("parent DagRun envelope is unknown")
@@ -2697,7 +2785,8 @@ class ParentRunEnvelopeLedger:
                 int(phase_state.get("spent_provider_bytes", 0)) + provider_bytes
             )
             run["updated_at"] = datetime.now(timezone.utc).isoformat()
-            self._write(payload)
+            # #1350: memory only; the gateway timer persists it.
+            self._dirty = True
             return self._snapshot(run, phase=phase)
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -2935,9 +3024,21 @@ def _recover_allocation_wal() -> int:
             active.get("start_spent_provider_bytes", 0)
         )
         reported = sum(sum(values) for values in observations.values())
+        # #1350: the ledger is flushed on a timer; the allocation WAL (closed
+        # endpoints) and the paid journal (every chunk) are appended with
+        # fsync.  After a crash the journals are primary: replay what the
+        # unflushed ledger lost.
+        journal = max(reported, _RESTORED_ALLOCATION_LEASE_BYTES.get(lease_id, 0))
+        if journal > attempt_spent:
+            ledger.consume(plan, claim, journal - attempt_spent)
+            log.warning(
+                "SofaScore allocation journal ahead of ledger by %d bytes, "
+                "replayed (lease %s)",
+                journal - attempt_spent,
+                lease_id,
+            )
+            attempt_spent = journal
         remainder = attempt_spent - reported
-        if remainder < 0:
-            raise RuntimeError("allocation WAL reports more bytes than its ledger")
         active_endpoint = str(state.get("active_endpoint") or "")
         if remainder or active_endpoint:
             if not active_endpoint:
@@ -2956,6 +3057,16 @@ def _recover_allocation_wal() -> int:
             "allocation_finished", lease_id, recovered_after_restart=True
         )
         recovered += 1
+    ledger.flush(force=True)
+    envelopes = _parent_envelope_ledger()
+    replayed = envelopes.replay(_RESTORED_PARENT_PHASE_BYTES)
+    if replayed:
+        log.warning(
+            "SofaScore parent envelope journal ahead of ledger by %d bytes, "
+            "replayed",
+            replayed,
+        )
+    envelopes.flush()
     return recovered
 
 
@@ -6901,7 +7012,16 @@ def _dump(out_path: str, quiet: bool = False) -> None:
         log.info("wrote %s", out_path)
 
 
+def _flush_ledgers() -> None:
+    """Persist dirty SofaScore ledgers (#1350); synchronous, no threads."""
+
+    for ledger in (SOFASCORE_ALLOCATION_LEDGER, SOFASCORE_PARENT_ENVELOPE_LEDGER):
+        if ledger is not None:
+            ledger.flush()
+
+
 async def _periodic_dump(out_path: str, interval: float = 2.0) -> None:
+    last_flush = time.monotonic()
     while True:
         await asyncio.sleep(interval)
         try:
@@ -6909,6 +7029,12 @@ async def _periodic_dump(out_path: str, interval: float = 2.0) -> None:
             _dump(out_path, quiet=True)
         except Exception:  # noqa: BLE001
             log.exception("periodic proxy lease cleanup/report failed")
+        if time.monotonic() - last_flush >= LEDGER_FLUSH_INTERVAL_SECONDS:
+            last_flush = time.monotonic()
+            try:
+                _flush_ledgers()
+            except Exception:  # noqa: BLE001
+                log.exception("periodic SofaScore ledger flush failed")
 
 
 class _SharedBudgetGuard:
@@ -7813,6 +7939,10 @@ async def main() -> None:
     else:
         async with server, lease_server:
             await stop.wait()
+    try:
+        _flush_ledgers()
+    except Exception:  # noqa: BLE001
+        log.exception("SofaScore ledger flush on shutdown failed")
     _dump(out_path)
 
 

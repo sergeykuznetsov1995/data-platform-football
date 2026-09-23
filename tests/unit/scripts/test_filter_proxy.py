@@ -3696,6 +3696,9 @@ def test_restart_recovers_endpoint_provenance_without_minting_bytes(mod):
     )
     mod._begin_endpoint_request(lease, "lineups")
     mod._account_lease_bytes(lease, "www.sofascore.com", "down", 100)
+    # #1350: per-chunk bytes live in memory until the gateway's timed flush;
+    # this scenario starts from a ledger that the timer already persisted.
+    mod._allocation_ledger().flush()
 
     # Provider sockets vanish on process restart.  The private WAL retains the
     # claim token and active endpoint, while the allocation ledger retains bytes.
@@ -3723,6 +3726,206 @@ def test_restart_recovers_endpoint_provenance_without_minting_bytes(mod):
         require_context=True,
     )
     assert retry.max_bytes == 900
+
+
+def _dirty_sofascore_lease(module, *, endpoint_finished: bool):
+    module.SOFASCORE_DAGRUN_BUDGET_BYTES = 1000
+    context = _sofascore_context(budget=1000)
+    lease = module._create_lease(
+        _FakeManager(["http://u:p@pool.invalid:10000"]),
+        max_bytes=1000,
+        ttl_seconds=30,
+        metadata=context,
+        require_context=True,
+    )
+    request_id = module._begin_endpoint_request(lease, "lineups")
+    module._account_lease_bytes(lease, "www.sofascore.com", "down", 100)
+    if endpoint_finished:
+        module._finish_endpoint_request(lease, request_id)
+    return context
+
+
+def _allocation_on_disk(module, context) -> dict:
+    stored = json.loads(Path(module.SOFASCORE_ALLOCATION_LEDGER_PATH).read_text())
+    (run,) = [
+        run for run in stored["runs"].values() if run["run_id"] == context["run_id"]
+    ]
+    return run["allocations"][context["allocation_id"]]
+
+
+def _parent_spent_on_disk(module) -> int:
+    stored = json.loads(Path(module.SOFASCORE_PARENT_ENVELOPE_PATH).read_text())
+    (run,) = stored["runs"].values()
+    return int(run["spent_provider_bytes"])
+
+
+def _hard_crash_and_boot(module) -> int:
+    """Drop every in-memory ledger/lease, then run the boot restore path."""
+
+    module.LEASES.clear()
+    module.LEASE_TOKENS.clear()
+    module.SOFASCORE_ALLOCATION_LEDGER = None
+    module._SOFASCORE_ALLOCATION_LEDGER_KEY = None
+    module.SOFASCORE_PARENT_ENVELOPE_LEDGER = None
+    module._SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH = ""
+    for counters in (
+        module._run_up_bytes,
+        module._run_down_bytes,
+        module._url_up_bytes,
+        module._url_down_bytes,
+    ):
+        counters.clear()
+    module._restore_budget_ledger(module.LEDGER_PATH, restore_daily=False)
+    return module._recover_allocation_wal()
+
+
+@pytest.mark.parametrize("endpoint_finished", [True, False])
+def test_restart_replays_journal_ahead_of_unflushed_ledgers(
+    shared_mod, caplog, endpoint_finished
+):
+    """#1350: journals are primary; an unflushed ledger no longer blocks boot
+    and a crash does not hand the lost bytes back to the allocation/parent."""
+
+    context = _dirty_sofascore_lease(shared_mod, endpoint_finished=endpoint_finished)
+    assert shared_mod._allocation_ledger().dirty is True
+    assert shared_mod._parent_envelope_ledger().dirty is True
+    assert _allocation_on_disk(shared_mod, context)["spent_provider_bytes"] == 0
+    assert _parent_spent_on_disk(shared_mod) == 0
+
+    with caplog.at_level("WARNING", logger="filter_proxy"):
+        assert _hard_crash_and_boot(shared_mod) == 1
+
+    assert "allocation journal ahead of ledger by 100 bytes, replayed" in caplog.text
+    assert "parent envelope journal ahead of ledger by 100 bytes" in caplog.text
+    allocation = _allocation_on_disk(shared_mod, context)
+    assert allocation["active_claim"] is None
+    assert allocation["spent_provider_bytes"] == 100
+    assert allocation["lease_stats"][-1]["endpoint_request_provider_bytes"] == {
+        "lineups": [100]
+    }
+    assert _parent_spent_on_disk(shared_mod) == 100
+    # A second boot is idempotent: nothing left to replay.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="filter_proxy"):
+        assert _hard_crash_and_boot(shared_mod) == 0
+    assert "ahead of ledger" not in caplog.text
+    assert _allocation_on_disk(shared_mod, context)["spent_provider_bytes"] == 100
+    assert _parent_spent_on_disk(shared_mod) == 100
+
+
+def test_report_tick_flushes_dirty_ledgers_after_the_interval(
+    shared_mod, monkeypatch
+):
+    context = _dirty_sofascore_lease(shared_mod, endpoint_finished=False)
+    allocations = shared_mod._allocation_ledger()
+    envelopes = shared_mod._parent_envelope_ledger()
+    assert allocations.dirty and envelopes.dirty
+    assert _allocation_on_disk(shared_mod, context)["spent_provider_bytes"] == 0
+    assert _parent_spent_on_disk(shared_mod) == 0
+    monkeypatch.setattr(shared_mod, "_reap_expired_leases", lambda: None)
+    monkeypatch.setattr(shared_mod, "_dump", lambda *a, **k: None)
+
+    async def tick_for(seconds: float) -> None:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                shared_mod._periodic_dump("unused", interval=0.01), seconds
+            )
+
+    monkeypatch.setattr(shared_mod, "LEDGER_FLUSH_INTERVAL_SECONDS", 3600.0)
+    asyncio.run(tick_for(0.05))
+    assert allocations.dirty and envelopes.dirty, "flushed before the interval"
+
+    monkeypatch.setattr(shared_mod, "LEDGER_FLUSH_INTERVAL_SECONDS", 0.0)
+    asyncio.run(tick_for(0.05))
+    assert not allocations.dirty and not envelopes.dirty
+    assert _allocation_on_disk(shared_mod, context)["spent_provider_bytes"] == 100
+    assert _parent_spent_on_disk(shared_mod) == 100
+
+
+def test_gateway_shutdown_flushes_dirty_ledgers(shared_mod, monkeypatch, tmp_path):
+    """#1350: SIGTERM leaves the ledgers on disk as current as memory."""
+
+    args = SimpleNamespace(
+        source_mode="shared-no-whoscored",
+        listen="127.0.0.1:0",
+        proxy_file=str(tmp_path / "unused-proxies.txt"),
+        blocklist=None,
+        out=str(tmp_path / "meter.json"),
+        pidfile=str(tmp_path / "filter.pid"),
+        sofascore_budget_artifact=str(SHIPPED_WORKLOAD_POLICY),
+        dagrun_budget_bytes=8_000_000,
+    )
+    monkeypatch.setattr(
+        shared_mod.argparse.ArgumentParser, "parse_args", lambda self: args
+    )
+    monkeypatch.setattr(
+        shared_mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "c" * 64},
+    )
+    monkeypatch.setattr(
+        shared_mod,
+        "_residential_manager",
+        lambda **kwargs: (SimpleNamespace(total_count=1), "test pool"),
+    )
+    policy_id = hashlib.sha256(SHIPPED_WORKLOAD_POLICY.read_bytes()).hexdigest()
+    served: dict = {}
+
+    class Server:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class StopEvent:
+        def set(self):
+            return None
+
+        async def wait(self):
+            # Traffic while the gateway runs; SIGTERM arrives before a tick.
+            policy = shared_mod.load_static_workload_policy(SHIPPED_WORKLOAD_POLICY)
+            budget = policy.classes[MATCH_WORKLOAD_CLASS].hard_task_bytes
+            context = _sofascore_context(
+                run_id="scheduled__2026-09-23::targets",
+                budget=budget,
+                artifact_id=policy_id,
+            )
+            lease = shared_mod._create_lease(
+                _FakeManager(["http://u:p@pool.invalid:10000"]),
+                max_bytes=budget,
+                ttl_seconds=30,
+                metadata=context,
+                require_context=True,
+            )
+            shared_mod._begin_endpoint_request(lease, "lineups")
+            shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 100)
+            assert shared_mod._allocation_ledger().dirty
+            served["context"] = context
+
+    async def start_server(*_args, **_kwargs):
+        return Server()
+
+    monkeypatch.setattr(shared_mod.asyncio, "start_server", start_server)
+    monkeypatch.setattr(shared_mod.asyncio, "Event", StopEvent)
+    monkeypatch.setattr(
+        shared_mod.asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(add_signal_handler=lambda *a: None),
+    )
+    monkeypatch.setattr(
+        shared_mod.asyncio, "ensure_future", lambda coro: coro.close()
+    )
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", shared_mod.CONTROL_TOKEN)
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", policy_id)
+
+    asyncio.run(shared_mod.main())
+
+    assert not shared_mod._allocation_ledger().dirty
+    assert not shared_mod._parent_envelope_ledger().dirty
+    allocation = _allocation_on_disk(shared_mod, served["context"])
+    assert allocation["spent_provider_bytes"] == 100
+    assert _parent_spent_on_disk(shared_mod) == 100
 
 
 def test_parent_envelope_sums_three_phases_and_stops_before_crossing(mod):
