@@ -75,6 +75,10 @@ def _phase_report(path: Path) -> dict[str, Any]:
         ):
             if field in traffic:
                 report[field] = traffic[field]
+    # #1352: rows refused one by one instead of failing the phase.
+    for field in ("rejected_rows", "rejected_players", "rejected_endpoints"):
+        if field in payload:
+            report[field] = payload[field]
     return report
 
 

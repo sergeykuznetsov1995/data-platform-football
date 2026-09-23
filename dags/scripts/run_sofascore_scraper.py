@@ -608,10 +608,49 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
         "lineups": "bronze.sofascore_lineups",
         "incidents": "bronze.sofascore_incidents",
     }
+    # #1352: a row-level violation refuses that row, not the whole batch.
+    rejected_rows = []
+    # Every row of a table refused on its own merits (not emptied by dropping
+    # a rejected match): the caller decides whether that is a parser/contract
+    # defect (fresh data -> red) or a quarantine replay (journal).
+    all_rejected = None
     for dataset, table in dq_tables.items():
         frame = frames[dataset]
         if not frame.empty:
-            validate_table_rows(table, frame.to_dict("records")).require()
+            records = frame.to_dict("records")
+            report = validate_table_rows(table, records)
+            _, rejected = report.partition(records, allow_all_rejected=True)
+            if rejected and len(rejected) == len(records) and all_rejected is None:
+                all_rejected = (
+                    f"all {len(records)} rows of {table} rejected: "
+                    f"{rejected[0].code}"
+                )
+            if rejected:
+                rejected_rows.extend(rejected)
+                keep = [
+                    position
+                    for position in range(len(frame))
+                    if position not in report.rejected_indices
+                ]
+                frames[dataset] = frame.iloc[keep]
+    # A match that lost a row (other than a later duplicate) is incomplete:
+    # drop it from every frame so no half-written match reaches Bronze. Its
+    # manifest stays nonterminal and replays from raw with zero traffic.
+    rejected_match_ids = frozenset(
+        str(rejected.row.get("match_id"))
+        for rejected in rejected_rows
+        if rejected.code != "duplicate_natural_key"
+        and rejected.row.get("match_id") not in (None, "")
+    )
+    if rejected_match_ids:
+        for name, frame in frames.items():
+            if name == "capture_status" or frame.empty:
+                continue
+            column = "match_id" if "match_id" in frame.columns else "game_id"
+            if column in frame.columns:
+                frames[name] = frame[
+                    ~frame[column].astype(str).isin(rejected_match_ids)
+                ]
     if not frames["lineups"].empty:
         validate_lineup_semantics(frames["lineups"].to_dict("records")).require()
     if not frames["event_participants"].empty:
@@ -635,7 +674,187 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
             expected_source_season_id=expected_source_season_id,
             expected_canonical_season=season,
         ).require()
+    frames["rejected_rows"] = rejected_rows
+    frames["rejected_match_ids"] = rejected_match_ids
+    frames["all_rejected"] = all_rejected
     return frames
+
+
+_ROW_REJECTED_ERROR = "RowRejected"
+
+
+def _hold_rejected_matches(pipeline_results, rejected_match_ids, rejected_rows):
+    """Keep a match with a rejected row out of the success finalize (#1352).
+
+    Its deferred endpoint records become ``schema_error``: nonterminal, so the
+    next pass replays them from raw with zero source traffic, and never
+    ``success`` for rows that were not written.
+    """
+    from dataclasses import replace
+
+    from scrapers.sofascore.manifest import ManifestStatus, utc_now_iso
+    from scrapers.sofascore.pipeline import materialized_terminal_manifest
+
+    reasons = {}
+    for rejected in rejected_rows:
+        match_id = str(rejected.row.get("match_id"))
+        reasons.setdefault(match_id, f"{rejected.table}: {rejected.code}")
+    held = []
+    kept = []
+    for result in pipeline_results:
+        manifest = result.manifest
+        if (
+            manifest.key.target_id in rejected_match_ids
+            and materialized_terminal_manifest(manifest) is not manifest
+        ):
+            manifest = replace(
+                manifest,
+                status=ManifestStatus.SCHEMA_ERROR,
+                error_type=_ROW_REJECTED_ERROR,
+                error_message="row rejected before Bronze MERGE: "
+                + reasons.get(manifest.key.target_id, "unknown"),
+                updated_at=utc_now_iso(),
+            )
+            held.append(manifest)
+            result = replace(result, manifest=manifest)
+        kept.append(result)
+    return kept, held
+
+
+def _hold_rejected_players(replayed, mismatched, *, league: str, season: str):
+    """Journal schema_error / mismatched player records (#1352).
+
+    Returns the results to finalize (mismatched ones turned ``schema_error`` so
+    they never finalize as ``success``), the records to upsert, and the
+    rejected rows for ``bronze.sofascore_rejected_rows``.
+    """
+    from dataclasses import replace
+
+    from dags.utils.sofascore_dq import RejectedRow
+    from scrapers.sofascore.manifest import ManifestStatus, utc_now_iso
+
+    tables = {
+        "player_profile": "bronze.sofascore_player_profile",
+        "player_season_statistics": "bronze.sofascore_player_season_stats",
+    }
+    messages = {id(result): message for result, message in mismatched}
+    kept = []
+    held = []
+    rejected_rows = []
+    for result in replayed:
+        manifest = result.manifest
+        message = messages.get(id(result))
+        if message is not None:
+            manifest = replace(
+                manifest,
+                status=ManifestStatus.SCHEMA_ERROR,
+                error_type=_ROW_REJECTED_ERROR,
+                error_message=message,
+                updated_at=utc_now_iso(),
+            )
+            held.append(manifest)
+            result = replace(result, manifest=manifest)
+        if manifest.status == ManifestStatus.SCHEMA_ERROR:
+            key = manifest.key
+            rejected_rows.append(
+                RejectedRow(
+                    row={
+                        "player_id": key.target_id,
+                        "endpoint": key.endpoint,
+                        "source_tournament_id": key.source_tournament_id,
+                        "source_season_id": key.source_season_id,
+                        "freshness_key": key.freshness_key,
+                        "error_type": manifest.error_type,
+                        "raw_blob_key": manifest.raw_blob_key,
+                    },
+                    table=tables.get(key.endpoint, f"bronze.sofascore_{key.endpoint}"),
+                    code="schema_error",
+                    message=str(manifest.error_message or manifest.error_type or ""),
+                    natural_key=f"{league}|{season}|{key.target_id}",
+                )
+            )
+        kept.append(result)
+    return kept, held, rejected_rows
+
+
+def _player_retryable_remaining(manifest_store, specs, nonterminal):
+    """Drop journaled ``schema_error`` endpoints from a nonterminal plan."""
+    from scrapers.sofascore.manifest import ManifestStatus
+
+    by_key = {(spec.key.target_id, spec.key.endpoint): spec for spec in specs}
+    remaining = {}
+    for target, endpoints in nonterminal.items():
+        for endpoint in endpoints:
+            spec = by_key.get((target, endpoint))
+            record = manifest_store.get(spec.key) if spec is not None else None
+            if record is not None and record.status == ManifestStatus.SCHEMA_ERROR:
+                continue
+            remaining.setdefault(target, []).append(endpoint)
+    return {target: tuple(names) for target, names in remaining.items()}
+
+
+def _endpoint_closure(planned: int, rejected: int) -> dict:
+    """Honest completeness (#1352): journaled rejects are not terminal.
+
+    ``endpoint_completeness`` = terminal / planned; a consumer that accepts a
+    phase with rejects checks ``terminal + rejected == planned`` instead.
+    """
+    terminal = planned - rejected
+    return {
+        "planned_endpoints": planned,
+        "terminal_endpoints": terminal,
+        "rejected_endpoints": rejected,
+        "endpoint_completeness": terminal / planned if planned > 0 else 1.0,
+    }
+
+
+_REJECTED_ROWS_TABLE = "sofascore_rejected_rows"
+_REJECTED_ROWS_NATURAL_KEY = ["table_name", "natural_key", "run_id"]
+
+
+def _rejected_rows_frame(
+    rejected_rows,
+    *,
+    league: str,
+    season: str,
+    run_id: str,
+    phase: str,
+    parser_stage: str,
+):
+    """Build the ``bronze.sofascore_rejected_rows`` journal frame (#1352)."""
+    import pandas as pd
+
+    rejected_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    frame = pd.DataFrame(
+        [
+            {
+                "table_name": str(rejected.table),
+                "natural_key": str(rejected.natural_key),
+                "reason_code": str(rejected.code),
+                "reason": str(rejected.message)[:2000],
+                "row_json": json.dumps(
+                    dict(rejected.row), default=str, sort_keys=True
+                ),
+                "league": str(league),
+                "season": str(season),
+                "run_id": str(run_id),
+                "phase": str(phase),
+                "parser_stage": str(parser_stage),
+                "rejected_at": rejected_at,
+            }
+            for rejected in rejected_rows
+        ]
+    )
+    # One journal row per key and run: MERGE refuses duplicate source keys.
+    return frame.drop_duplicates(subset=_REJECTED_ROWS_NATURAL_KEY)
+
+
+def _rejected_rows_summary(rejected_rows) -> dict:
+    summary: dict = {}
+    for rejected in rejected_rows:
+        by_code = summary.setdefault(str(rejected.table), {})
+        by_code[str(rejected.code)] = by_code.get(str(rejected.code), 0) + 1
+    return summary
 
 
 def _flush_manifest_store(manifest_store) -> None:
@@ -851,6 +1070,17 @@ def _run_match_capture(
             if force_replace or offline_replay
             else endpoint_resume_plan(capture_runtime.manifest_store, specs)
         )
+        # Matches already held by a rejected row (#1352): replaying them is a
+        # quarantine repeat, not fresh data.
+        quarantined_before = frozenset(
+            target
+            for (target, _endpoint), spec in endpoint_specs.items()
+            if target in endpoint_plan
+            and getattr(
+                capture_runtime.manifest_store.get(spec.key), "error_type", None
+            )
+            == _ROW_REJECTED_ERROR
+        )
         total = len(match_ids)
         match_ids = [
             match_id for match_id in match_ids if str(match_id) in endpoint_plan
@@ -1052,6 +1282,24 @@ def _run_match_capture(
                     league=league,
                     season=season_short,
                 )
+            rejected_rows = frames.pop("rejected_rows", [])
+            rejected_match_ids = frames.pop("rejected_match_ids", frozenset())
+            all_rejected = frames.pop("all_rejected", None)
+            held_records = []
+            if rejected_match_ids:
+                pipeline_results, held_records = _hold_rejected_matches(
+                    pipeline_results, rejected_match_ids, rejected_rows
+                )
+            if all_rejected and (
+                not rejected_match_ids or rejected_match_ids - quarantined_before
+            ):
+                # Fresh data refused wholesale: parser/contract defect, red.
+                # The matches are held first, so the next pass is a quarantine
+                # replay (journal, green) instead of a free red loop.
+                for record in held_records:
+                    capture_runtime.manifest_store.upsert(record)
+                _flush_manifest_store(capture_runtime.manifest_store)
+                raise RuntimeError(all_rejected)
             results["traffic"] = _logical_capture_traffic(
                 capture_runtime.engine,
                 live_traffic,
@@ -1105,8 +1353,12 @@ def _run_match_capture(
                         "incidents",
                     ),
                 )
+                # A match held back by a rejected row (#1352) is reported in
+                # rejected_rows, not as a nonterminal capture.
                 all_status_terminal = bool(complete_status_rows) and all(
-                    bool(row["capture_complete"]) for row in complete_status_rows
+                    bool(row["capture_complete"])
+                    for row in complete_status_rows
+                    if str(row["match_id"]) not in rejected_match_ids
                 )
             else:
                 all_status_terminal = bool(
@@ -1341,6 +1593,24 @@ def _run_match_capture(
                             ].nunique()
                         )
 
+                if rejected_rows:
+                    rjpath = scraper.save_to_iceberg(
+                        df=_rejected_rows_frame(
+                            rejected_rows,
+                            league=league,
+                            season=season_short,
+                            run_id=capture_runtime.engine.run_id,
+                            phase="matches",
+                            parser_stage="pre_merge_dq",
+                        ),
+                        table_name=_REJECTED_ROWS_TABLE,
+                        partition_cols=["league", "season"],
+                        natural_keys=_REJECTED_ROWS_NATURAL_KEY,
+                    )
+                    results["tables"].append(rjpath)
+            if rejected_rows:
+                results["rejected_rows"] = _rejected_rows_summary(rejected_rows)
+
             if pipeline_results:
                 from dags.utils.sofascore_dq import (
                     CaptureExpectation,
@@ -1353,7 +1623,16 @@ def _run_match_capture(
                 )
 
                 finalize_materialized_results(capture_runtime, pipeline_results)
-                promote_repaired_results(capture_runtime, pipeline_results)
+                for record in held_records:
+                    capture_runtime.manifest_store.upsert(record)
+                promote_repaired_results(
+                    capture_runtime,
+                    [
+                        result
+                        for result in pipeline_results
+                        if result.manifest.error_type != _ROW_REJECTED_ERROR
+                    ],
+                )
                 # The commit-verification below must read durable state, not
                 # the write-behind buffer.
                 _flush_manifest_store(capture_runtime.manifest_store)
@@ -1368,6 +1647,9 @@ def _run_match_capture(
                             f"manifest commit missing for {key.stable_id()}"
                         )
                     final_counts[committed.status.value] += 1
+                    if result.manifest.error_type == _ROW_REJECTED_ERROR:
+                        # Held back by a rejected row: journaled, not missing.
+                        continue
                     observations.append(
                         {
                             **committed.key.__dict__,
@@ -1392,8 +1674,13 @@ def _run_match_capture(
                 # deferred retryable_failure — a green run and a red one looked
                 # alike (#1260). Report the committed states instead.
                 results["traffic"]["status_counts"] = final_counts
-                results["endpoint_completeness"] = 1.0
-                results["traffic"]["endpoint_completeness"] = 1.0
+                # Journaled instead of published (#1352): not terminal, so
+                # endpoint_completeness stays honest (120/125 -> 0.96).
+                results.update(
+                    _endpoint_closure(len(pipeline_results), len(held_records))
+                )
+                completeness = results["endpoint_completeness"]
+                results["traffic"]["endpoint_completeness"] = completeness
                 results["replay_cache"] = capture_runtime.engine.metrics.snapshot()
 
     except ReplaceGuardError as e:
@@ -1470,6 +1757,7 @@ def _run_player_capture(
             validate_minimum_coverage,
             validate_season_alignment,
         )
+        from scrapers.sofascore.manifest import ManifestStatus
         from scrapers.sofascore.pipeline import (
             PLAYER_PATHS,
             build_player_spec,
@@ -1710,6 +1998,7 @@ def _run_player_capture(
                         canonical_url=canonical_url,
                         scope=f"{league}:{season_short}",
                         entity=ENTITY_PLAYER_CAPTURE,
+                        tolerate_schema_error=True,
                     )
                 else:
                     from scrapers.sofascore.workload_runtime import target_ids
@@ -1730,6 +2019,7 @@ def _run_player_capture(
                             canonical_url=canonical_url,
                             scope=f"{league}:{season_short}",
                             entity=ENTITY_PLAYER_CAPTURE,
+                            tolerate_schema_error=True,
                             workload_plan=workload_plan,
                             allocation_id=allocation.allocation_id,
                             attempt_id=(
@@ -1750,11 +2040,18 @@ def _run_player_capture(
             # was already terminal; replaying all specs keeps the 95% profile
             # gate and both Bronze MERGEs partition-complete with zero network.
             replayed = replay_player_specs(capture_runtime, specs)
+            # #1352: one broken player record is journaled and skipped, not a
+            # league-wide failure; the 95% coverage gate below still applies.
+            mismatched = []
             frames = materialize_player_datasets(
                 scraper,
                 replayed,
                 league=league,
                 season=season_short,
+                rejected=mismatched,
+            )
+            replayed, held_records, rejected_rows = _hold_rejected_players(
+                replayed, mismatched, league=league, season=season_short
             )
             profile_df = frames["player_profile"]
             season_df = frames["player_season_stats"]
@@ -1803,9 +2100,37 @@ def _run_player_capture(
                     results["tables"].append(spath)
                     results["season_stats_rows"] = len(season_df)
                     results["season_stats_players"] = season_df["player_id"].nunique()
+                if rejected_rows:
+                    rjpath = scraper.save_to_iceberg(
+                        df=_rejected_rows_frame(
+                            rejected_rows,
+                            league=league,
+                            season=season_short,
+                            run_id=capture_runtime.engine.run_id,
+                            phase="players",
+                            parser_stage="player_materialize",
+                        ),
+                        table_name=_REJECTED_ROWS_TABLE,
+                        partition_cols=["league", "season"],
+                        natural_keys=_REJECTED_ROWS_NATURAL_KEY,
+                    )
+                    results["tables"].append(rjpath)
+            if rejected_rows:
+                results["rejected_rows"] = _rejected_rows_summary(rejected_rows)
+                results["rejected_players"] = len(
+                    {rejected.natural_key for rejected in rejected_rows}
+                )
 
             finalize_materialized_results(capture_runtime, replayed)
-            remaining = endpoint_resume_plan(capture_runtime.manifest_store, specs)
+            for record in held_records:
+                capture_runtime.manifest_store.upsert(record)
+            # A schema_error record is journaled above and replays from raw
+            # after a parser fix; only retryable records mean lost work.
+            remaining = _player_retryable_remaining(
+                capture_runtime.manifest_store,
+                specs,
+                endpoint_resume_plan(capture_runtime.manifest_store, specs),
+            )
             if remaining:
                 raise RuntimeError(
                     "player manifest stayed nonterminal after successful "
@@ -1813,7 +2138,11 @@ def _run_player_capture(
                 )
             promote_repaired_results(
                 capture_runtime,
-                replayed,
+                [
+                    result
+                    for result in replayed
+                    if result.manifest.status != ManifestStatus.SCHEMA_ERROR
+                ],
                 canonical_freshness_key=canonical_player_freshness,
             )
             _flush_manifest_store(capture_runtime.manifest_store)
@@ -1821,8 +2150,9 @@ def _run_player_capture(
                 capture_runtime.engine,
                 live_traffic,
             )
-            results["traffic"]["endpoint_completeness"] = 1.0
-            results["endpoint_completeness"] = 1.0
+            results.update(_endpoint_closure(len(specs), len(rejected_rows)))
+            completeness = results["endpoint_completeness"]
+            results["traffic"]["endpoint_completeness"] = completeness
             _write_results(output_path, results)
             return 0
     except ReplaceGuardError as exc:

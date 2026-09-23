@@ -286,12 +286,38 @@ SOFASCORE_PLAYER_UNIVERSE = BootstrapTable(
 )
 
 
+# #1352: a row refused by a row-level DQ check (or a broken player record) is
+# journaled here instead of failing its whole batch. The runner writes it with
+# the same ``save_to_iceberg`` MERGE, which creates the table on first write.
+SOFASCORE_REJECTED_ROWS = BootstrapTable(
+    schema="bronze",
+    name="sofascore_rejected_rows",
+    columns=_columns(
+        ("table_name", "varchar"),
+        ("natural_key", "varchar"),
+        ("reason_code", "varchar"),
+        ("reason", "varchar"),
+        ("row_json", "varchar"),
+        ("league", "varchar"),
+        ("season", "varchar"),
+        ("run_id", "varchar"),
+        ("phase", "varchar"),
+        ("parser_stage", "varchar"),
+        ("rejected_at", "timestamp(6)"),
+    ),
+    partition_columns=("league", "season"),
+    grain="one rejected source row of one Bronze table in one capture run",
+    natural_key=("table_name", "natural_key", "run_id"),
+)
+
+
 NEW_BRONZE_BOOTSTRAP_TABLES = (
     SOFASCORE_EVENTS,
     SOFASCORE_EVENT_PARTICIPANTS,
     SOFASCORE_LINEUPS,
     SOFASCORE_INCIDENTS,
     SOFASCORE_PLAYER_UNIVERSE,
+    SOFASCORE_REJECTED_ROWS,
 )
 BOOTSTRAP_TABLES = (OPS_MANIFEST, *NEW_BRONZE_BOOTSTRAP_TABLES)
 

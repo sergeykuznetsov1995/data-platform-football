@@ -703,6 +703,7 @@ def run_sofascore_dq(**context) -> Dict[str, Any]:
     logger = logging.getLogger(__name__)
     _require_successful_producers(context, ["validate_data"])
     checked: List[str] = []
+    rejected: Dict[str, int] = {}
     for league in SOFASCORE_LEAGUES:
         slug = _league_slug(league)
         schedule_legacy = (
@@ -751,13 +752,39 @@ def run_sofascore_dq(**context) -> Dict[str, Any]:
             if (
                 result.get("fallback")
                 or result.get("errors")
-                or result.get("endpoint_completeness") != 1.0
+                or not _endpoints_closed(result)
             ):
                 raise AirflowException(
                     f"{league} {phase} canonical endpoint completeness failed"
                 )
             checked.append(f"{league}:{phase}")
-    return {"status": "success", "checked": checked, "count": len(checked)}
+            if result.get("rejected_endpoints"):
+                rejected[f"{league}:{phase}"] = int(result["rejected_endpoints"])
+    return {
+        "status": "success",
+        "checked": checked,
+        "count": len(checked),
+        "rejected_endpoints": rejected,
+    }
+
+
+def _endpoints_closed(result: Dict[str, Any]) -> bool:
+    """#1352: every planned endpoint is terminal or journaled as a reject.
+
+    ``endpoint_completeness`` is terminal / planned; a record refused into
+    ``bronze.sofascore_rejected_rows`` is not terminal but is not lost either.
+    """
+    if result.get("endpoint_completeness") == 1.0:
+        return True
+    planned = result.get("planned_endpoints")
+    terminal = result.get("terminal_endpoints")
+    rejected = result.get("rejected_endpoints")
+    return (
+        all(isinstance(value, int) for value in (planned, terminal, rejected))
+        and planned > 0
+        and rejected > 0
+        and terminal + rejected == planned
+    )
 
 
 def validate_bronze_freshness(**context) -> None:

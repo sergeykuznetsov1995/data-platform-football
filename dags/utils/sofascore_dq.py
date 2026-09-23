@@ -71,12 +71,28 @@ class DQFinding:
     examples: tuple[Any, ...] = ()
 
 
+@dataclass(frozen=True)
+class RejectedRow:
+    """One row refused by a row-level check; the rest of its batch is kept (#1352)."""
+
+    row: Mapping[str, Any]
+    table: str
+    code: str
+    message: str
+    natural_key: str
+
+
 @dataclass
 class DQReport:
     """A composable result for pre-commit and post-transform checks."""
 
     findings: list[DQFinding] = field(default_factory=list)
     metrics: dict[str, float | int] = field(default_factory=dict)
+    # Row-level violations by row index (#1352): these rows can be refused
+    # one by one instead of stopping the whole batch.
+    rejected_indices: dict[int, list[DQFinding]] = field(default_factory=dict)
+    table_name: str | None = None
+    natural_key_fields: tuple[str, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -102,6 +118,48 @@ class DQReport:
             detail = "; ".join(f"{f.code}: {f.message}" for f in self.findings[:10])
             raise SofaScoreDQViolation(detail)
         return self
+
+    def reject_row(self, index: int, code: str, message: str) -> None:
+        self.rejected_indices.setdefault(index, []).append(DQFinding(code, message))
+
+    def partition(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        allow_all_rejected: bool = False,
+    ) -> tuple[list[Mapping[str, Any]], list[RejectedRow]]:
+        """Split ``rows`` into accepted rows and row-level rejects (#1352).
+
+        When every row is refused the batch still fails: that is a parser or
+        contract defect, not one bad record. ``allow_all_rejected`` leaves that
+        verdict to a caller that can tell a quarantine replay from fresh data.
+        """
+
+        accepted: list[Mapping[str, Any]] = []
+        rejected: list[RejectedRow] = []
+        for index, row in enumerate(rows):
+            reasons = self.rejected_indices.get(index)
+            if not reasons:
+                accepted.append(row)
+                continue
+            rejected.append(
+                RejectedRow(
+                    row=row,
+                    table=str(self.table_name),
+                    code=reasons[0].code,
+                    message="; ".join(reason.message for reason in reasons),
+                    natural_key="|".join(
+                        str(value)
+                        for value in _key_tuple(row, self.natural_key_fields)
+                    ),
+                )
+            )
+        if rows and not accepted and not allow_all_rejected:
+            raise SofaScoreDQViolation(
+                f"all {len(rows)} rows of {self.table_name} rejected: "
+                f"{rejected[0].code}"
+            )
+        return accepted, rejected
 
 
 @dataclass(frozen=True)
@@ -537,7 +595,7 @@ def validate_table_rows(
     materialized = list(rows)
     required_columns = list(table["required_columns"])
     key_fields = list(table["natural_key"])
-    report = DQReport()
+    report = DQReport(table_name=table_name, natural_key_fields=tuple(key_fields))
 
     missing_rows: list[tuple[int, tuple[str, ...]]] = []
     null_keys: list[tuple[int, tuple[Any, ...]]] = []
@@ -552,17 +610,32 @@ def validate_table_rows(
         missing = tuple(col for col in required_columns if col not in row)
         if missing:
             missing_rows.append((index, missing))
+            report.reject_row(
+                index, "required_field_loss", f"missing columns {list(missing)}"
+            )
         key = _key_tuple(row, key_fields)
         if any(value is None or value == "" for value in key):
             null_keys.append((index, key))
+            report.reject_row(index, "null_natural_key", f"empty natural key {key!r}")
         elif key in seen:
+            # The first row of a duplicated key is kept; later ones are refused.
             duplicates.append(key)
+            report.reject_row(
+                index,
+                "duplicate_natural_key",
+                f"duplicate natural key {key!r} (first kept at row {seen[key]})",
+            )
         else:
             seen[key] = index
         for column, allowed in allowed_values.items():
             value = row.get(column)
             if value is not None and value not in allowed:
                 invalid_enums.append((index, column, value))
+                report.reject_row(
+                    index,
+                    "invalid_enum_value",
+                    f"{column}={value!r} not in {sorted(allowed)!r}",
+                )
 
     if missing_rows:
         report.add(

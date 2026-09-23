@@ -238,6 +238,44 @@ def read_scope_outcome(result_path: str | Path | None) -> tuple[str, int | None]
     return reason, (sum(counts) if counts else None)
 
 
+def read_scope_rejects(result_path: str | Path | None) -> int:
+    """Endpoints a green scope journaled as rejects instead of publishing (#1352).
+
+    Sum of the phases' ``rejected_endpoints`` in the scope-cycle result; an
+    unreadable result counts as 0 (nothing to replay is known).
+    """
+
+    try:
+        result = json.loads(Path(str(result_path)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(result, Mapping):
+        return 0
+    total = 0
+    for phase in result.get("phases") or []:
+        if isinstance(phase, Mapping):
+            try:
+                total += int(phase.get("rejected_endpoints") or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def rejects_await_release(attempts: Mapping[str, Any], release: str) -> bool:
+    """A completed scope with journaled rejects gets ONE free replay per release.
+
+    ``completed_rejected_endpoints`` > 0 and the last attempt was on another
+    release: the new release may carry the parser/contract fix, and the
+    replay reads raw only. Same release -> wait (no replay every cycle).
+    """
+
+    try:
+        rejected = int(attempts.get("completed_rejected_endpoints") or 0)
+    except (TypeError, ValueError):
+        return False
+    return rejected > 0 and attempts.get("last_release") != release
+
+
 def is_quarantined_record(attempts: Mapping[str, Any], max_scope_attempts: int) -> bool:
     """Failure record whose no-traffic streak reached the attempt ceiling."""
 
@@ -429,7 +467,10 @@ def plan_historical_batch(
                 quarantine_record = is_quarantined_record(
                     attempts, max_scope_attempts
                 )
-                if key in completed_keys:
+                replay_rejects = key in completed_keys and rejects_await_release(
+                    attempts, release
+                )
+                if key in completed_keys and not replay_rejects:
                     kind = "completed"
                 elif quarantine_record and attempts.get("last_release") == release:
                     kind = "quarantined"
@@ -474,6 +515,18 @@ def plan_historical_batch(
                     # declared shape; only an undeclared shape is deferred.
                     if class_name not in authorized:
                         kind = "deferred"
+                if replay_rejects:
+                    if kind == "ready":
+                        logger.warning(
+                            "campaign scope %s replays %s journaled rejected "
+                            "endpoints from raw on release %s (last %s)",
+                            key, attempts.get("completed_rejected_endpoints"),
+                            release, attempts.get("last_release"),
+                        )
+                    else:
+                        # Already published: a replay that cannot run now
+                        # never blocks the tournament's deeper seasons.
+                        kind = "completed"
             rank = (depth, -wave, int(tournament["unique_tournament_id"]))
             ranked.append((rank, kind, tournament, season))
             if kind not in ("ready", "completed", "quarantined"):
@@ -860,6 +913,45 @@ def mark_failed(
             "last_reason": reason_text,
             "last_release": str(release),
         }
+        if previous.get("completed_rejected_endpoints"):
+            # A failed replay of a completed scope keeps waiting for the next
+            # release instead of losing its journaled rejects (#1352).
+            attempts[str(scope_key)]["completed_rejected_endpoints"] = int(
+                previous["completed_rejected_endpoints"]
+            )
+        _write_failures(destination, campaign_id=campaign_id, attempts=attempts)
+
+
+def mark_completed_rejects(
+    path: str | Path,
+    *,
+    campaign_id: str,
+    scope_key: str,
+    rejected_endpoints: int,
+    run_id: str,
+    release: str = UNKNOWN_RELEASE,
+) -> None:
+    """Remember that a completed scope journaled rejects on ``release`` (#1352).
+
+    Kept in ``failures.json`` (schema v1, optional field) because the planner
+    already reads it: ``rejects_await_release`` replans the scope once per new
+    release.  0 rejects leaves the memory as the completion left it (cleared).
+    """
+
+    if int(rejected_endpoints) <= 0:
+        return
+    destination = Path(path)
+    with _state_lock(destination):
+        attempts = read_failures(destination, campaign_id=campaign_id)
+        attempts[str(scope_key)] = {
+            "count": 0,
+            "last_run_id": str(run_id),
+            "last_at": datetime.now(timezone.utc).isoformat(),
+            "streak_no_traffic": 0,
+            "last_reason": "",
+            "last_release": str(release),
+            "completed_rejected_endpoints": int(rejected_endpoints),
+        }
         _write_failures(destination, campaign_id=campaign_id, attempts=attempts)
 
 
@@ -882,11 +974,14 @@ __all__ = [
     "env_int",
     "is_quarantined_record",
     "mark_completed",
+    "mark_completed_rejects",
     "mark_failed",
     "plan_historical_batch",
     "plan_refresh_batch",
     "read_completed",
     "read_failures",
     "read_scope_outcome",
+    "read_scope_rejects",
+    "rejects_await_release",
     "read_snapshot",
 ]

@@ -279,6 +279,46 @@ class TestBronzeFreshnessGate:
         with pytest.raises(Exception, match="canonical endpoint completeness failed"):
             dag_module.run_sofascore_dq()
 
+    def test_manifest_dq_accepts_terminal_plus_rejected_equal_to_planned(
+        self, dag_module, monkeypatch
+    ):
+        """#1352: a batch with one journaled reject (120 terminal + 5 rejected
+        of 125 planned) is closed; the rejects surface in the DQ output."""
+
+        def load(path, logger):
+            if "int_world_cup" in path and "match_capture" in path:
+                return {
+                    "endpoint_completeness": 0.96,
+                    "planned_endpoints": 125,
+                    "terminal_endpoints": 120,
+                    "rejected_endpoints": 5,
+                    "errors": [],
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        result = dag_module.run_sofascore_dq()
+        assert result["status"] == "success"
+        assert result["rejected_endpoints"] == {"INT-World Cup:match": 5}
+
+    def test_manifest_dq_still_fails_when_rejects_do_not_close_the_plan(
+        self, dag_module, monkeypatch
+    ):
+        def load(path, logger):
+            if "int_world_cup" in path and "match_capture" in path:
+                return {
+                    "endpoint_completeness": 0.92,
+                    "planned_endpoints": 125,
+                    "terminal_endpoints": 115,
+                    "rejected_endpoints": 5,
+                    "errors": [],
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        with pytest.raises(Exception, match="canonical endpoint completeness failed"):
+            dag_module.run_sofascore_dq()
+
     def test_manifest_dq_accepts_clean_match_noop(self, dag_module, monkeypatch):
         """#842/#951: a clean incremental no-op (every resolved match already
         terminal in bronze) never runs the capture engine and cannot stamp
