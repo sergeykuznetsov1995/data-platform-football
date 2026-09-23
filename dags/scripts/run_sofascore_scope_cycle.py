@@ -67,7 +67,10 @@ def _phase_report(path: Path) -> dict[str, Any]:
             "status_counts_stage",
             "endpoints",
             "request_count",
+            "source_request_count",
             "replay_hits",
+            "control_channel_failures",
+            "accounting_uncertain",
         ):
             if field in traffic:
                 report[field] = traffic[field]

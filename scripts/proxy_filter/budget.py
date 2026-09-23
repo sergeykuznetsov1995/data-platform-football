@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -39,6 +40,11 @@ LEGACY_CANARY_SCHEMA_VERSION = 1
 # cannot be re-interpreted as shape evidence, so it is rejected explicitly.
 SUPERSEDED_CANARY_SCHEMA_VERSION = 2
 LEDGER_SCHEMA_VERSION = 1
+# A reservation that never saw a provider byte and outlived this is a leak of
+# a killed/failed attempt (#1349, memory 26.08); the next reserve reaps it.
+RESERVATION_TTL_SECONDS = 900
+
+log = logging.getLogger(__name__)
 BUDGET_DERIVATION = WORKLOAD_BUDGET_DERIVATION
 LEGACY_BUDGET_DERIVATION = "max_measured_total_and_per_run_endpoint_max_v1"
 MIN_CANARY_RUNS = MIN_COLD_SAMPLES_PER_CLASS
@@ -676,12 +682,55 @@ class SharedBudgetLedger:
             return token, run["reservations"][token]
         raise BudgetAccountingError("unknown proxy budget reservation")
 
+    @staticmethod
+    def _reap_stale_reservations(run: dict, run_id: str) -> None:
+        """Drop zero-consumption reservations older than the TTL.
+
+        Reservations that already carried provider bytes are never touched:
+        that traffic was paid.  A reservation without a readable ``created_at``
+        predates the timestamp and counts as expired.
+        """
+        now = datetime.now(timezone.utc)
+        reaped = []
+        for key, item in list(run["reservations"].items()):
+            if item.get("consumed_bytes"):
+                continue
+            try:
+                created = datetime.fromisoformat(str(item["created_at"]))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age = (now - created).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                age = None
+            if age is not None and age <= RESERVATION_TTL_SECONDS:
+                continue
+            del run["reservations"][key]
+            reaped.append(
+                {
+                    "endpoint": item.get("endpoint"),
+                    "reserved_bytes": item.get("reserved_bytes"),
+                    "created_at": item.get("created_at"),
+                    "reaped_at": now.isoformat(),
+                }
+            )
+        if reaped:
+            run.setdefault("reaped", []).extend(reaped)
+            log.warning(
+                "reaped %d stale zero-byte budget reservation(s) of run %s "
+                "(%d bytes, ttl %ds)",
+                len(reaped),
+                run_id,
+                sum(int(item["reserved_bytes"] or 0) for item in reaped),
+                RESERVATION_TTL_SECONDS,
+            )
+
     def reserve(self, run_id: str, endpoint: str) -> tuple[str, int]:
         measured_max = self.policy.reservation_for(endpoint)
         handle = self._locked()
         try:
             payload = self._read()
             run = self._run(payload, run_id)
+            self._reap_stale_reservations(run, run_id)
             outstanding = sum(
                 item["reserved_bytes"] - item["consumed_bytes"]
                 for item in run["reservations"].values()
@@ -887,7 +936,9 @@ class SharedBudgetLedger:
         try:
             payload = self._read()
             run = self._run(payload, run_id)
-            return json.loads(json.dumps(run))
+            snapshot = json.loads(json.dumps(run))
+            snapshot.setdefault("reaped", [])
+            return snapshot
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()

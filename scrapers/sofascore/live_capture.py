@@ -31,7 +31,11 @@ from scripts.proxy_filter.budget import (
     ProxyBudgetExceeded,
 )
 from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
-from scrapers.sofascore.lease_client import SofascoreLeaseRejected
+from scrapers.sofascore.lease_client import (
+    SofascoreLeaseControlUnavailable,
+    SofascoreLeaseError,
+    SofascoreLeaseRejected,
+)
 from scrapers.sofascore.manifest import ManifestStatus
 from scrapers.sofascore.workload_plan import SignedDagRunPlan, WorkloadAllocation
 
@@ -67,6 +71,16 @@ _relaunch_sleep = time.sleep
 _VIABLE_LEASE_FLOOR_BYTES = 4096
 
 
+def _record_body_size(record: Any) -> int:
+    """Byte size of a fetched record's body (a lower bound of its traffic)."""
+    body = record.get("body") if isinstance(record, dict) else None
+    if isinstance(body, str):
+        return len(body.encode("utf-8"))
+    if isinstance(body, bytes):
+        return len(body)
+    return 0
+
+
 def _zero_traffic() -> dict[str, Any]:
     return {
         "paid_proxy_bytes": 0,
@@ -78,6 +92,8 @@ def _zero_traffic() -> dict[str, Any]:
         "endpoint_request_count": 0,
         "source_request_count": 0,
         "http_429": 0,
+        "control_channel_failures": 0,
+        "accounting_uncertain": 0,
         "cache_hit_rate": 1.0,
         "replay_hit_rate": 1.0,
         "endpoint_completeness": 1.0,
@@ -608,7 +624,22 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         if provider_budget.run_id != self.engine.run_id:
             raise BudgetAccountingError("SofaScore provider token run mismatch")
         path = self._source_path(url)
-        before = self._validate_stats(self._client.stats(self._lease))
+        try:
+            before_stats = self._client.stats(self._lease)
+        except SofascoreLeaseError as exc:
+            # Nothing was fetched: no provider byte moved for this endpoint,
+            # so the reservation closes at zero and the attempt is retried.
+            raise TransportError(
+                f"SofaScore control channel failed before fetch for {path}: "
+                f"{self._safe_error(exc)}",
+                provider_bytes=0,
+                retryable=True,
+                source_requests=0,
+                control_channel_failure=isinstance(
+                    exc, SofascoreLeaseControlUnavailable
+                ),
+            ) from None
+        before = self._validate_stats(before_stats)
         before_total = int(before.total_bytes)
         if before_total < self._accounted_provider_bytes:
             raise BudgetAccountingError(
@@ -691,14 +722,31 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                     provider_budget.endpoint, []
                 ).append(provider_bytes)
             except BudgetAccountingError:
-                if lease_lost:
-                    # The revoked lease's final meter is unreadable or
-                    # inconsistent: fail closed here, never relaunch on an
-                    # understated charge.
-                    raise
-                provider_bytes = None
-            except Exception:
-                provider_bytes = None
+                # An inconsistent meter (or the revoked lease's unreadable
+                # final meter) fails closed; the engine releases the
+                # reservation for an untyped error and never retries it.
+                raise
+            except Exception as meter_exc:  # noqa: BLE001 — typed below
+                # The meter stayed unreadable after the control channel's own
+                # retries: charge the last exactly known delta (0 without a
+                # read) and flag the charge as uncertain.  The counter is
+                # never moved backwards; the next readable meter reconciles
+                # every byte into the next endpoint's charge.
+                provider_bytes = max(
+                    0, before_total - self._accounted_provider_bytes
+                )
+                self._last_stats = before
+                self._accounted_provider_bytes += provider_bytes
+                self._endpoint_request_provider_bytes.setdefault(
+                    provider_budget.endpoint, []
+                ).append(provider_bytes)
+                accounting_uncertain = True
+                meter_channel_failure = isinstance(
+                    meter_exc, SofascoreLeaseControlUnavailable
+                )
+            else:
+                accounting_uncertain = False
+                meter_channel_failure = False
             raise TransportError(
                 f"warmed SofaScore request failed for {path}: {self._safe_error(exc)}",
                 provider_bytes=provider_bytes,
@@ -706,11 +754,86 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                 browser_sessions=sessions,
                 navigations=navigations,
                 source_requests=max(0, source_after - source_before),
+                accounting_uncertain=accounting_uncertain,
+                control_channel_failure=(
+                    meter_channel_failure
+                    or isinstance(exc, SofascoreLeaseControlUnavailable)
+                ),
             ) from None
 
-        after = self._validate_stats(
-            self._client.finish_endpoint(self._lease, request_boundary)
-        )
+        try:
+            finished_stats = self._client.finish_endpoint(
+                self._lease, request_boundary
+            )
+        except SofascoreLeaseError as exc:
+            # The fetch succeeded, so provider bytes moved, but the endpoint
+            # meter did not answer and the boundary may still be open on the
+            # gateway.  The lease is done: read its final meter independently
+            # (close, then stats) and charge exactly that — but only a meter
+            # the gateway proves final (closed, no tunnel, no byte reservation
+            # left) is exact.  Otherwise a lower bound is charged (the larger
+            # of the non-final meter and the known delta + body bytes) and the
+            # batch is NOT re-leased: a relaunch never proceeds on an
+            # understated charge (#1218).
+            # Count the source request now: closing the lease tears the browser
+            # down (``self._capture = None``), which would zero it.
+            source_requests = max(
+                0,
+                int(getattr(self._capture, "_source_request_count", source_before) or 0)
+                - source_before,
+            )
+            try:
+                final = self.close_lost_lease()
+            except BudgetAccountingError:
+                final = None
+            if final is not None:
+                final_total = int(final.total_bytes)
+                if (
+                    final_total < before_total
+                    or final_total < self._accounted_provider_bytes
+                ):
+                    raise BudgetAccountingError(
+                        "SofaScore lease provider counter moved backwards"
+                    ) from None
+            lower_bound = max(
+                0, before_total - self._accounted_provider_bytes
+            ) + _record_body_size(record)
+            if (
+                final is not None
+                and bool(getattr(final, "closed", False))
+                and int(getattr(final, "active_tunnels", 1)) == 0
+                and int(getattr(final, "reserved_bytes", 1)) == 0
+            ):
+                provider_bytes = final_total - self._accounted_provider_bytes
+                self._last_stats = final
+                self.lease_lost = self._safe_error(exc)
+                accounting = "exact"
+            else:
+                provider_bytes = lower_bound
+                if final is not None:
+                    provider_bytes = max(
+                        lower_bound, final_total - self._accounted_provider_bytes
+                    )
+                self._last_stats = before
+                accounting = "estimated"
+            self._accounted_provider_bytes += provider_bytes
+            self._endpoint_request_provider_bytes.setdefault(
+                provider_budget.endpoint, []
+            ).append(provider_bytes)
+            raise TransportError(
+                f"SofaScore control channel failed after fetch for {path} "
+                f"(accounting={accounting}): {self._safe_error(exc)}",
+                provider_bytes=provider_bytes,
+                retryable=False,
+                browser_sessions=sessions,
+                navigations=navigations,
+                source_requests=source_requests,
+                accounting_uncertain=accounting == "estimated",
+                control_channel_failure=isinstance(
+                    exc, SofascoreLeaseControlUnavailable
+                ),
+            ) from None
+        after = self._validate_stats(finished_stats)
         request_boundary = None
         source_requests = max(
             0,
@@ -1227,6 +1350,8 @@ def _live_traffic(
         "cache_hits",
         "replay_hits",
         "http_429",
+        "control_channel_failures",
+        "accounting_uncertain",
         "row_count",
         "completed_matches",
         "completed_players",

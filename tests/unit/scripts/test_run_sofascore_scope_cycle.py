@@ -262,6 +262,115 @@ def test_cycle_reports_why_a_phase_failed(tmp_path, monkeypatch):
     assert result["status_counts"] == status_counts
 
 
+def _control_channel_failure_text():
+    """The exact error a season phase leaves after the gateway control channel
+    stayed down (#1349): the real client's typed failure, wrapped by the live
+    transport and carried through the engine's attempt log."""
+    import requests
+    from types import SimpleNamespace
+    from urllib3.exceptions import MaxRetryError, NewConnectionError
+
+    from scrapers.sofascore.capture_engine import (
+        TransportError,
+        _append_attempt_log,
+        _attempt_entry,
+    )
+    from scrapers.sofascore.lease_client import (
+        SofascoreLeaseClient,
+        SofascoreLeaseControlUnavailable,
+    )
+
+    class _RefusingSession:
+        trust_env = False
+
+        def request(self, *args, **kwargs):
+            raise requests.exceptions.ConnectionError(
+                MaxRetryError(
+                    None,
+                    "/v1/leases/lease-1/stats",
+                    NewConnectionError(None, "[Errno 111] Connection refused"),
+                )
+            )
+
+    client = SofascoreLeaseClient(
+        "http://sofascore_gw_history:8899",
+        session=_RefusingSession(),
+        control_token="c" * 32,
+        sleep=lambda _s: None,
+    )
+    try:
+        client.stats(SimpleNamespace(lease_id="lease-1", token="t" * 16))
+    except SofascoreLeaseControlUnavailable as channel:
+        first = TransportError(
+            "SofaScore control channel failed before fetch for "
+            f"/api/v1/unique-tournament/17/season/76986/events/last/0: {channel}",
+            provider_bytes=0,
+            source_requests=0,
+            control_channel_failure=True,
+        )
+    last = TransportError("warmed SofaScore request failed", provider_bytes=0)
+    log = [_attempt_entry(1, first), _attempt_entry(2, last)]
+    _append_attempt_log(last, log)
+    return (
+        "capture_engine: SofaScore endpoint did not reach a publishable state: "
+        "17:76986:season:76986:events_last_0:final status=retryable_failure "
+        f"error=TransportError: {last}"
+    )
+
+
+@pytest.mark.unit
+def test_cycle_result_names_a_control_channel_failure(tmp_path, monkeypatch):
+    """#1349: the red-run classifier must see the control channel, not
+    "budget exhausted", in results/<hash>.json errors[]."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    message = _control_channel_failure_text()
+
+    def run_capture(argv):
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # Contract of the runner's hard failure: the reason, zero paid
+        # traffic, no completed rows.
+        output.write_text(json.dumps({
+            "errors": [message],
+            "traffic": {
+                "status_counts": {"retryable_failure": 1},
+                "endpoints": 1,
+                "request_count": 2,
+                "source_request_count": 0,
+                "paid_proxy_bytes": 0,
+                "control_channel_failures": 1,
+                "accounting_uncertain": 0,
+            },
+        }))
+        return 1
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "all")) == 1
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "failed"
+    [error] = result["errors"]
+    assert error.startswith("season: capture_engine: ")
+    assert "control channel failure (GET /v1/leases/lease-1/stats, 4 attempts" in error
+    assert "attempts: [attempt 1: TransportError: SofaScore control channel" in error
+    assert "budget exhausted" not in error
+    season = result["phases"][0]
+    assert season["control_channel_failures"] == 1
+    assert season["accounting_uncertain"] == 0
+    assert season["source_request_count"] == 0
+
+
 @pytest.mark.unit
 def test_cycle_names_a_phase_that_left_no_report(tmp_path, monkeypatch):
     """#1260: a phase killed before it wrote its report still owes a reason."""

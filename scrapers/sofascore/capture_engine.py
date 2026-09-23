@@ -53,6 +53,10 @@ class TransportError(RuntimeError):
 
     Paid transports must always provide ``provider_bytes`` (including zero), so
     the run ledger remains correct even when navigation/fetch raises.
+    ``accounting_uncertain`` marks a charge that is a lower-bound estimate
+    because the gateway meter could not be read (#1349);
+    ``control_channel_failure`` marks a failure of the gateway's own control
+    channel rather than of the paid source request.
     """
 
     def __init__(
@@ -64,10 +68,14 @@ class TransportError(RuntimeError):
         browser_sessions: int = 0,
         navigations: int = 0,
         source_requests: int = 1,
+        accounting_uncertain: bool = False,
+        control_channel_failure: bool = False,
     ) -> None:
         super().__init__(message)
         self.provider_bytes = provider_bytes
         self.retryable = retryable
+        self.accounting_uncertain = accounting_uncertain
+        self.control_channel_failure = control_channel_failure
         self.browser_sessions = browser_sessions
         self.navigations = navigations
         self.source_requests = source_requests
@@ -249,6 +257,15 @@ class CaptureResult:
     network_used: bool = False
 
 
+def _attempt_entry(attempt: int, exc: BaseException) -> str:
+    return f"attempt {attempt}: {type(exc).__name__}: {exc}"
+
+
+def _append_attempt_log(exc: BaseException, attempt_log: list[str]) -> None:
+    """Make the final error carry every attempt's cause (``errors[]`` shows it)."""
+    exc.args = (f"{exc}; attempts: [{' | '.join(attempt_log)}]",)
+
+
 class CaptureMetrics:
     """Thread-safe run metrics; no-op values are exact integer zeroes."""
 
@@ -267,6 +284,8 @@ class CaptureMetrics:
         self.replay_hits = 0
         self.completed_rows = 0
         self.http_429 = 0
+        self.control_channel_failures = 0
+        self.accounting_uncertain_count = 0
         self.status_counts = {status.value: 0 for status in ManifestStatus}
         self._completed_matches: set[str] = set()
         self._completed_players: set[str] = set()
@@ -307,6 +326,12 @@ class CaptureMetrics:
             self._provider_observation(endpoint, error.provider_bytes)
             self.browser_sessions += error.browser_sessions
             self.navigations += error.navigations
+            self.control_channel_failures += int(error.control_channel_failure)
+
+    def accounting_uncertain(self, endpoint: str) -> None:
+        """Count one paid attempt closed without an exact provider meter."""
+        with self._lock:
+            self.accounting_uncertain_count += 1
 
     def source_rate_limited(self) -> None:
         """Count one HTTP 429 answered by the source itself (not the gateway)."""
@@ -354,6 +379,8 @@ class CaptureMetrics:
                 "cache_hits": self.cache_hits,
                 "replay_hits": self.replay_hits,
                 "http_429": self.http_429,
+                "control_channel_failures": self.control_channel_failures,
+                "accounting_uncertain": self.accounting_uncertain_count,
                 "cache_hit_rate": (self.cache_hits + self.replay_hits) / completed,
                 "replay_hit_rate": self.replay_hits / completed,
                 "row_count": self.completed_rows,
@@ -563,6 +590,12 @@ class SofaScoreCaptureEngine:
             )
         return 0
 
+    def _release_reservation(self, authorization: ProviderBudgetToken) -> None:
+        try:
+            self.budget.cancel(self.run_id, authorization.reservation_token)
+        except BudgetAccountingError:
+            self.budget.finish(self.run_id, authorization.reservation_token)
+
     def _request(self, spec: EndpointSpec) -> HttpPayload:
         transport_budget = self.authorize_request(spec)
         try:
@@ -570,23 +603,23 @@ class SofaScoreCaptureEngine:
         except TransportError as exc:
             self.metrics.transport_error(spec.key.endpoint, exc)
             if spec.paid_proxy:
-                if exc.provider_bytes is None:
-                    # Unknown paid traffic cannot be retried safely: the shared
-                    # budget might already have been spent outside the ledger.
-                    raise BudgetAccountingError(
-                        "paid transport failure omitted provider-byte accounting"
-                    ) from exc
+                # The reservation is always closed by fact (#1349): an unread
+                # meter charges nothing here — the lease meter still reconciles
+                # every byte at close — and the error keeps its own retry verdict.
+                if exc.provider_bytes is None or exc.accounting_uncertain:
+                    self.metrics.accounting_uncertain(spec.key.endpoint)
                 self._finish_authorized_response(
-                    spec, transport_budget, exc.provider_bytes
+                    spec,
+                    transport_budget,
+                    0 if exc.provider_bytes is None else exc.provider_bytes,
                 )
             raise
         except Exception:
             if spec.paid_proxy and transport_budget is not None:
-                # Only a transport-level typed error can prove whether paid
-                # bytes moved. Leave the reservation outstanding, fail closed.
-                raise BudgetAccountingError(
-                    "untyped paid transport failure; reservation retained for audit"
-                )
+                # An untyped failure never leaves the reservation outstanding:
+                # release it (cancel when nothing was consumed, otherwise close
+                # it at the consumed bytes) and surface the original error.
+                self._release_reservation(transport_budget)
             raise
         self._finish_authorized_response(
             spec, transport_budget, response.provider_bytes
@@ -863,6 +896,9 @@ class SofaScoreCaptureEngine:
         last_response: Optional[HttpPayload] = None
         last_raw: Optional[RawPayloadRecord] = None
         last_error: Optional[BaseException] = None
+        # Every failed attempt, so the cause of attempt 1 (e.g. a control
+        # channel failure) survives into the final error text (#1349).
+        attempt_log: list[str] = []
         for local_attempt in range(1, self.retry_policy.max_attempts + 1):
             attempts = attempts_before + local_attempt
             try:
@@ -877,10 +913,18 @@ class SofaScoreCaptureEngine:
                     response_headers=response.headers,
                 )
                 last_raw = raw
-            except (ProductionBudgetUnavailable, ProxyBudgetExceeded, BudgetAccountingError):
+            except (
+                ProductionBudgetUnavailable,
+                ProxyBudgetExceeded,
+                BudgetAccountingError,
+            ) as exc:
+                if attempt_log:
+                    attempt_log.append(_attempt_entry(local_attempt, exc))
+                    _append_attempt_log(exc, attempt_log)
                 raise
             except TransportError as exc:
                 last_error = exc
+                attempt_log.append(_attempt_entry(local_attempt, exc))
                 provider_total += int(exc.provider_bytes or 0)
                 if not exc.retryable or local_attempt == self.retry_policy.max_attempts:
                     break
@@ -897,6 +941,7 @@ class SofaScoreCaptureEngine:
                     f"retryable SofaScore HTTP status {status}",
                     provider_bytes=response.provider_bytes,
                 )
+                attempt_log.append(_attempt_entry(local_attempt, last_error))
                 if local_attempt < self.retry_policy.max_attempts:
                     self.sleep(
                         self.retry_policy.delay(
@@ -939,6 +984,7 @@ class SofaScoreCaptureEngine:
                     provider_bytes=response.provider_bytes,
                     retryable=False,
                 )
+                attempt_log.append(_attempt_entry(local_attempt, last_error))
                 break
 
             result = self._materialize(
@@ -961,6 +1007,8 @@ class SofaScoreCaptureEngine:
         # when retries occurred; derive it from the number of requests observed in
         # this endpoint loop by tracking the previous count.
         attempts = attempts_before + local_attempt
+        if last_error is not None and attempt_log:
+            _append_attempt_log(last_error, attempt_log)
         manifest = self._record(
             spec,
             status=ManifestStatus.RETRYABLE_FAILURE,

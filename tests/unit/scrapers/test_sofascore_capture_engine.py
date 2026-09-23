@@ -14,6 +14,7 @@ from scrapers.sofascore.capture_engine import (
     OfflineReplayMiss,
     RetryPolicy,
     SofaScoreCaptureEngine,
+    TransportError,
 )
 from scrapers.sofascore.manifest import (
     InMemoryManifestStore,
@@ -23,6 +24,7 @@ from scrapers.sofascore.manifest import (
 from scrapers.sofascore.raw_store import RawPayloadStore
 from scripts.proxy_filter.budget import (
     ProductionBudgetUnavailable,
+    ProxyBudgetExceeded,
     SharedBudgetLedger,
     load_verified_policy,
 )
@@ -667,3 +669,96 @@ def test_bounded_concurrency_never_exceeds_configured_workers(tmp_path):
     results = engine.capture_many([_spec(str(index)) for index in range(8)])
     assert len(results) == 8
     assert 1 < transport.maximum <= 2
+
+
+def _outstanding(budget, run_id="dag-run"):
+    snapshot = budget.snapshot(run_id)
+    return sum(
+        item["reserved_bytes"] - item["consumed_bytes"]
+        for item in snapshot["reservations"].values()
+    )
+
+
+def test_unmetered_transport_failure_closes_the_reservation_at_zero(tmp_path):
+    # #1349: a failure without a provider meter used to raise
+    # BudgetAccountingError and leave the whole class ceiling reserved, so the
+    # next attempt of the run died "budget exhausted" with zero paid requests.
+    budget = _verified_budget(tmp_path)
+    transport = FakeTransport(
+        [
+            TransportError("meter unreadable", provider_bytes=None)
+            for _ in range(3)
+        ]
+    )
+    engine = _engine(tmp_path, transport, budget=budget)
+
+    result = engine.capture(_spec(paid=True))
+
+    assert len(transport.calls) == 3
+    assert result.manifest.status == ManifestStatus.RETRYABLE_FAILURE
+    assert result.manifest.error_type == "TransportError"
+    assert _outstanding(budget) == 0
+    assert budget.snapshot("dag-run")["spent_provider_bytes"] == 0
+    assert engine.metrics.snapshot()["accounting_uncertain"] == 3
+
+
+def test_untyped_transport_failure_releases_the_reservation(tmp_path):
+    budget = _verified_budget(tmp_path)
+    failure = RuntimeError("lease control plane exploded")
+    transport = FakeTransport([failure])
+    engine = _engine(tmp_path, transport, budget=budget)
+
+    with pytest.raises(RuntimeError) as captured:
+        engine.capture(_spec(paid=True))
+
+    assert captured.value is failure
+    assert _outstanding(budget) == 0
+    assert budget.snapshot("dag-run")["reservations"] == {}
+
+
+def test_final_failure_text_carries_every_attempt_cause(tmp_path):
+    budget = _verified_budget(tmp_path)
+    transport = FakeTransport(
+        [
+            TransportError(
+                "SofaScore control channel failed before fetch: proxy control "
+                "channel failure (GET /v1/leases/l/stats, 4 attempts in 7.0s)",
+                provider_bytes=0,
+                source_requests=0,
+                control_channel_failure=True,
+            ),
+            TransportError("warmed request failed: net::ERR_TIMED_OUT", provider_bytes=5),
+            TransportError("warmed request failed: net::ERR_TIMED_OUT", provider_bytes=5),
+        ]
+    )
+    engine = _engine(tmp_path, transport, budget=budget)
+
+    result = engine.capture(_spec(paid=True))
+
+    message = result.manifest.error_message
+    assert message.startswith("warmed request failed: net::ERR_TIMED_OUT; attempts: [")
+    assert "attempt 1: TransportError: SofaScore control channel failed" in message
+    assert "control channel failure" in message
+    assert "attempt 3: TransportError: warmed request failed" in message
+    assert _outstanding(budget) == 0
+    assert engine.metrics.snapshot()["control_channel_failures"] == 1
+
+
+def test_budget_verdict_after_a_failed_attempt_names_the_first_cause(tmp_path):
+    budget = _verified_budget(tmp_path)
+    transport = FakeTransport(
+        [
+            TransportError(
+                "proxy control channel failure (GET /stats)", provider_bytes=0
+            ),
+            ProxyBudgetExceeded("budget exhausted before endpoint 'event'"),
+        ]
+    )
+    engine = _engine(tmp_path, transport, budget=budget)
+
+    with pytest.raises(ProxyBudgetExceeded) as captured:
+        engine.capture(_spec(paid=True))
+
+    assert "attempt 1: TransportError: proxy control channel failure" in str(
+        captured.value
+    )
