@@ -250,6 +250,92 @@ class TestIngestStatusLeaf:
             dag_module._propagate_ingest_status(**self._context(states))
 
 
+class TestWeekdayRunCarriesValidationColor:
+    """#1356: a weekday run (player gate short-circuited) must still turn red
+    when match validation failed, and the player validators must skip instead
+    of running (and failing) on a branch that never ran."""
+
+    WEEKDAY_SKIP = {"prepare_sofascore_player_plan": "skipped"}
+
+    @staticmethod
+    def _context(states):
+        def get_task_instance(task_id):
+            if task_id not in states:
+                return None
+            return SimpleNamespace(state=states[task_id])
+
+        return {
+            "params": {},
+            "dag_run": SimpleNamespace(get_task_instance=get_task_instance),
+        }
+
+    def test_weekday_failed_validation_reaches_and_fails_the_leaf(self, dag_module):
+        # Only the gate's direct child is skipped, so the all_done leaf runs.
+        gate = _python_task("gate_player_capture")
+        assert gate._init_kwargs["ignore_downstream_trigger_rules"] is False
+        assert "propagate_ingest_status" not in gate.downstream_task_ids
+        states = {
+            "validate_data": "failed",
+            "run_sofascore_dq": "upstream_failed",
+            "validate_bronze_freshness": "success",
+            "gate_player_capture": "success",
+            "prepare_sofascore_player_plan": "skipped",
+            "validate_player_data": "skipped",
+            "validate_player_freshness": "skipped",
+        }
+        with pytest.raises(Exception, match="validate_data=failed"):
+            dag_module._propagate_ingest_status(**self._context(states))
+
+    def test_weekday_player_data_validation_skips(self, dag_module, monkeypatch):
+        from airflow.exceptions import AirflowSkipException
+
+        monkeypatch.setattr(
+            dag_module,
+            "_due_player_leagues",
+            lambda context: pytest.fail("weekday validation must not run"),
+        )
+        with pytest.raises(AirflowSkipException):
+            dag_module.validate_player_data(**self._context(self.WEEKDAY_SKIP))
+
+    def test_weekday_player_freshness_skips(self, dag_module, monkeypatch):
+        from airflow.exceptions import AirflowSkipException
+
+        import utils.data_quality as dq
+
+        monkeypatch.setattr(
+            dq,
+            "run_checks",
+            lambda *a, **k: pytest.fail("weekday freshness must not run"),
+        )
+        with pytest.raises(AirflowSkipException):
+            dag_module.validate_player_freshness(**self._context(self.WEEKDAY_SKIP))
+
+    def test_weekend_player_validators_run_as_before(self, dag_module, monkeypatch):
+        import utils.alerts as al
+        import utils.data_quality as dq
+
+        calls = []
+        monkeypatch.setattr(
+            dq,
+            "run_checks",
+            lambda checks, raise_on_error: calls.append("checks")
+            or MagicMock(errors=[]),
+        )
+        monkeypatch.setattr(al, "telegram_dq_summary", lambda *a, **k: None)
+        monkeypatch.setattr(dag_module, "_due_player_leagues", lambda context: set())
+        states = {"prepare_sofascore_player_plan": "success"}
+        states.update(
+            {
+                dag_module._player_capture_task_id(league): "skipped"
+                for league in dag_module.SOFASCORE_LEAGUES
+            }
+        )
+        dag_module.validate_player_freshness(**self._context(states))
+        assert calls == ["checks"]
+        out = dag_module.validate_player_data(**self._context(states))
+        assert out["status"] == "success"
+
+
 class TestBronzeFreshnessGate:
     """#751: a ``validate_bronze_freshness`` task must exist, wired after
     canonical manifest DQ, alerting on stale ``bronze.sofascore_*`` ingestion."""
@@ -812,6 +898,11 @@ class TestPlayerCaptureGate:
         gate = _python_task("gate_player_capture")
         assert gate is not None
         assert gate.python_callable is dag_module._gate_player_capture
+        # #1356: the default (True) skips every descendant down to the
+        # propagate_ingest_status leaf, so a weekday run with a failed
+        # validate_data finished green.
+        assert gate._init_kwargs["ignore_downstream_trigger_rules"] is False
+        assert gate.downstream_task_ids == {"prepare_sofascore_player_plan"}
 
     def test_run_players_param_forces_capture(self, dag_module):
         assert dag_module._gate_player_capture(params={"run_players": True}) is True

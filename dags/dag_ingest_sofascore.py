@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
@@ -1041,6 +1041,25 @@ def _propagate_ingest_status(**context) -> Dict[str, Any]:
     return {"status": "success"}
 
 
+def _skip_if_player_branch_skipped(context: Dict[str, Any]) -> None:
+    """Weekday runs: ``gate_player_capture`` short-circuits, which leaves the
+    gate itself ``success`` and marks only its direct child
+    (``prepare_sofascore_player_plan``) ``skipped`` (#1356). The ``all_done``
+    player validators still get scheduled then and must skip, not validate a
+    branch that never ran."""
+
+    dag_run = context.get("dag_run")
+    if dag_run is None:
+        return
+    task_instance = dag_run.get_task_instance(PLAYER_PLAN_TASK_ID)
+    state = getattr(task_instance, "state", None)
+    value = getattr(state, "value", state)
+    if str(value or "").casefold().split(".")[-1] == "skipped":
+        raise AirflowSkipException(
+            "player capture gate short-circuited this run; nothing to validate"
+        )
+
+
 def _player_plan_path(context: Dict[str, Any]) -> str | None:
     """The signed player plan every ``scrape_player_capture_*`` task reads
     (the XCom of ``prepare_sofascore_player_plan``, same as
@@ -1128,6 +1147,7 @@ def validate_player_data(**context) -> Dict[str, Any]:
     """
     import logging
 
+    _skip_if_player_branch_skipped(context)
     logger = logging.getLogger(__name__)
     due = _due_player_leagues(context)
     # C5: a due league the planner dropped never ran (its rotation gate
@@ -1294,6 +1314,8 @@ def validate_player_freshness(**context) -> None:
     its slot for weeks) — a per-partition freshness check is the follow-up.
     """
     import logging
+
+    _skip_if_player_branch_skipped(context)
 
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import CHECK, run_checks
@@ -1646,6 +1668,11 @@ rm -f "$SOFASCORE_RESULT_DIR/{_mc_output}" && \\
         # all_done lets the hook inspect every match producer state and fail
         # explicitly instead of spending proxy bytes on a stale player universe.
         trigger_rule="all_done",
+        # #1356: the default (True) cascades the weekday skip down to the
+        # propagate_ingest_status leaf, so a run with a failed validate_data
+        # finished green. Only the direct child is skipped now; the all_done
+        # player validators skip themselves (_skip_if_player_branch_skipped).
+        ignore_downstream_trigger_rules=False,
     )
 
     scrape_player_capture_task = BashOperator(
