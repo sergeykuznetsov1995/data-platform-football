@@ -113,6 +113,15 @@ def summarize_result_traffic(
             "real_proxy_mb",
         ],
     )
+    # #1388: bytes the proxy provider actually billed (lease counters), when
+    # the scraper is metered; decoded body bytes understate them several-fold.
+    provider_bytes: Optional[int] = None
+    try:
+        raw_provider = traffic.get("provider_metered_bytes")
+        if raw_provider is not None and int(raw_provider) >= 0:
+            provider_bytes = int(raw_provider)
+    except (TypeError, ValueError, OverflowError):
+        provider_bytes = None
     domain_mb: Dict[str, float] = defaultdict(float)
     for row in traffic.get("top_traffic_urls") or []:
         if not isinstance(row, dict):
@@ -136,6 +145,7 @@ def summarize_result_traffic(
         "estimated_wire_response_mb": (
             round(float(wire_raw), 4) if wire_raw is not None else None
         ),
+        "provider_metered_bytes": provider_bytes,
         "requests": int(
             _first_present(traffic, ["network_fetches", "requests"]) or 0
         ),
@@ -376,7 +386,8 @@ def ensure_ops_table(conn) -> None:
         "decoded_response_body_bytes bigint, "
         "decoded_response_body_mb double, "
         "wire_mb double, "
-        "estimated_wire_response_mb double"
+        "estimated_wire_response_mb double, "
+        "provider_metered_bytes bigint"
         ") WITH (partitioning = ARRAY['run_date'])",
     )
     # Existing deployments predate the detailed counters. Iceberg/Trino DDL is
@@ -393,6 +404,7 @@ def ensure_ops_table(conn) -> None:
         ("decoded_response_body_mb", "double"),
         ("wire_mb", "double"),
         ("estimated_wire_response_mb", "double"),
+        ("provider_metered_bytes", "bigint"),
     ):
         _execute(
             conn,
@@ -441,6 +453,7 @@ def record_traffic_run(
         decoded_mb = summary.get("decoded_response_body_mb")
         wire_mb = summary.get("wire_mb")
         estimated_wire_mb = summary.get("estimated_wire_response_mb")
+        provider_bytes = summary.get("provider_metered_bytes")
         entity = str(summary.get("entity") or "")
         run_key = str(summary.get("run_key") or "")
         requests = int(summary.get("requests") or 0)
@@ -473,7 +486,7 @@ def record_traffic_run(
             "entity, run_key, request_count, retry_count, failure_count, "
             "failed_attempt_count, decoded_response_body_bytes, "
             "decoded_response_body_mb, wire_mb, "
-            "estimated_wire_response_mb) VALUES ("
+            "estimated_wire_response_mb, provider_metered_bytes) VALUES ("
             f"TIMESTAMP '{run_ts}', DATE '{run_date}', "
             f"{_sql_str(source)}, {_sql_str(dag_run_id)}, "
             f"{total_mb}, {_sql_str(top_str)}, {_sql_str(entity)}, "
@@ -482,7 +495,8 @@ def record_traffic_run(
             f"{int(decoded_bytes) if decoded_bytes is not None else 'NULL'}, "
             f"{float(decoded_mb) if decoded_mb is not None else 'NULL'}, "
             f"{float(wire_mb) if wire_mb is not None else 'NULL'}, "
-            f"{float(estimated_wire_mb) if estimated_wire_mb is not None else 'NULL'})",
+            f"{float(estimated_wire_mb) if estimated_wire_mb is not None else 'NULL'}, "
+            f"{int(provider_bytes) if provider_bytes is not None else 'NULL'})",
         )
         logger.info(
             "PROXY_TRAFFIC persisted source=%s total=%.2f MB run=%s",
@@ -508,8 +522,10 @@ def daily_rollup(conn) -> Dict[str, Any]:
     """Per-source residential-traffic totals for *yesterday* (#789 Phase 2).
 
     Reuses ``_execute`` (fetch=True). Returns
-    ``{total_mb, total_gb, by_source: [{source, mb, gb, runs}], report}`` where
-    ``report`` is the human line the daily DAG logs.
+    ``{total_mb, total_gb, total_paid_mb, paid_complete, unbilled_sources,
+    by_source: [{source, mb, gb, runs, paid_mb, unbilled_runs}], report}`` where ``report`` is
+    the human line the daily DAG logs.  ``total_mb`` is decoded body traffic;
+    ``total_paid_mb`` is provider-billed traffic of metered sources only.
     """
     _execute = _silver_tasks_module()._execute
 
@@ -519,7 +535,9 @@ def daily_rollup(conn) -> Dict[str, Any]:
             conn,
             "SELECT source, sum(COALESCE("
             f"CAST(decoded_response_body_bytes AS double) / {MIB}.0, "
-            "total_mb)) AS mb, count(*) AS runs "
+            "total_mb)) AS mb, count(*) AS runs, "
+            f"sum(CAST(provider_metered_bytes AS double) / {MIB}.0) AS paid_mb, "
+            "count_if(provider_metered_bytes IS NULL) AS unbilled_runs "
             f"FROM {OPS_TABLE} "
             "WHERE run_date = current_date - INTERVAL '1' DAY "
             "GROUP BY source ORDER BY mb DESC",
@@ -533,15 +551,65 @@ def daily_rollup(conn) -> Dict[str, Any]:
             "mb": round(float(r[1] or 0.0), 4),
             "gb": round(float(r[1] or 0.0) / 1024, 3),
             "runs": int(r[2] or 0),
+            # NULL when the source has no provider-metered rows yesterday.
+            "paid_mb": round(float(r[3]), 4) if r[3] is not None else None,
+            # sum() skips NULL rows: a partly billed source is marked, not
+            # silently shown as a full paid total.
+            "unbilled_runs": int(r[4] or 0),
         }
         for r in rows
     ]
     total_mb = round(sum(float(r[1] or 0.0) for r in rows), 4)
-    parts = ", ".join(f"{s['source']} {s['gb']} GB" for s in by_source) or "—"
-    report = f"вчера прокси съели {round(total_mb / 1024, 3)} GB ({total_mb} MB): {parts}"
+    # #1388: decoded body bytes are not what the provider bills.  Billed bytes
+    # exist only for metered sources; the rest are named as having no billing
+    # data instead of being silently mixed into a "spend" total.
+    paid = [s for s in by_source if s["paid_mb"] is not None]
+    # Only partly billed sources (some runs metered, some not) are named:
+    # never-metered sources (fbref, sofascore, …) would be daily noise that
+    # hides a real metering loss of a paid source.
+    partial = [s for s in paid if s["unbilled_runs"]]
+    unbilled = [s["source"] for s in partial]
+    total_paid_mb = (
+        round(sum(s["paid_mb"] for s in paid), 4) if paid else None
+    )
+    paid_complete = bool(paid) and not partial
+
+    def _paid_note(s):
+        if s["paid_mb"] is None:
+            return ""
+        if s["unbilled_runs"]:
+            return (
+                f" (оплачено {s['paid_mb']} МиБ, неполно: {s['unbilled_runs']} "
+                f"из {s['runs']} прогонов без биллинга)"
+            )
+        return f" (оплачено {s['paid_mb']} МиБ)"
+
+    parts = ", ".join(
+        f"{s['source']} {s['gb']} GB{_paid_note(s)}" for s in by_source
+    ) or "—"
+    if paid:
+        incomplete = "" if paid_complete else " (итог неполный)"
+        paid_txt = (
+            f"оплачено провайдеру {total_paid_mb} МиБ{incomplete} "
+            f"({', '.join(s['source'] for s in paid)})"
+        )
+    else:
+        paid_txt = "оплаченных байт нет"
+    if partial:
+        paid_txt += "; без данных биллинга: " + ", ".join(
+            f"{s['source']} ({s['unbilled_runs']} из {s['runs']} прогонов)"
+            for s in partial
+        )
+    report = (
+        f"вчера прокси: распаковано {round(total_mb / 1024, 3)} GB "
+        f"({total_mb} MB); {paid_txt}: {parts}"
+    )
     return {
         "total_mb": total_mb,
         "total_gb": round(total_mb / 1024, 3),
+        "total_paid_mb": total_paid_mb,
+        "paid_complete": paid_complete,
+        "unbilled_sources": unbilled,
         "by_source": by_source,
         "report": report,
     }

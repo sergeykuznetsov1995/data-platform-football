@@ -6,8 +6,13 @@ Reads ``iceberg.ops.proxy_traffic_runs`` for *yesterday* and logs one
 per-source rollup line so the residential-proxy spend (``pool.proxys.io``,
 ~$4/GB) is visible day-by-day:
 
-    PROXY_TRAFFIC_DAILY вчера прокси съели 1.234 GB (1263.6 MB):
-        fbref 0.900 GB, transfermarkt 0.300 GB, capology 0.034 GB
+    PROXY_TRAFFIC_DAILY вчера прокси: распаковано 1.234 GB (1263.6 MB);
+        оплачено провайдеру 1200.5 МиБ (transfermarkt): fbref 0.900 GB,
+        transfermarkt 0.300 GB (оплачено 1200.5 МиБ), capology 0.034 GB
+
+"распаковано" is decoded body traffic; "оплачено" is provider-billed bytes of
+metered sources only (#1388).  A metered source with some runs lacking billed
+bytes is marked "(итог неполный)" and listed under "без данных биллинга".
 
 The per-run rows are written passively by each ingest run (FBref after durable
 control validation in ``utils.fbref_pipeline_tasks``; Transfermarkt / Capology

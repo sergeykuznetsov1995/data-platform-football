@@ -826,6 +826,10 @@ class TestFallbackPath:
             'decoded_response_body_mb': 0.25,
             'network_fetches': 3,
             'failed_attempts': 1,
+            'requests_per_session': {
+                'sessions': 1, 'requests': 3,
+                'multi_request_sessions': 1, 'max_requests_per_session': 3,
+            },
         }
         scraper.get_stats.return_value = {'requests': 3, 'failures': 1}
 
@@ -838,6 +842,7 @@ class TestFallbackPath:
         assert results['decoded_response_body_mb'] == pytest.approx(0.25)
         assert results['network_fetches'] == 3
         assert results['failed_attempts'] == 1
+        assert results['requests_per_session']['multi_request_sessions'] == 1
         assert 'parser exploded' in results['errors']
 
 

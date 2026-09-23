@@ -231,6 +231,10 @@ def _fake_result(command: tuple[str, ...], *, retries: int = 0) -> dict:
         'wire_response_bytes': 120,
         'provider_metered_bytes': 125,
         'provider_metering_available': True,
+        'requests_per_session': {
+            'sessions': 1, 'requests': 2,
+            'multi_request_sessions': 1, 'max_requests_per_session': 2,
+        },
         'provider_byte_grant': cycle.HARD_BYTE_CAP,
         'network_fetches': 2,
         'retries': retries,
@@ -371,6 +375,11 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
         cycle.EXPECTED_ENTITIES
     )
     assert manifest['traffic']['totals']['provider_metered_bytes'] == 500
+    # #1388: keep-alive evidence summed over the four parser runs.
+    assert manifest['traffic']['requests_per_session'] == {
+        'sessions': 4, 'requests': 8,
+        'multi_request_sessions': 4, 'max_requests_per_session': 2,
+    }
     assert persisted == [manifest]
     assert len(persisted_ledgers) == 1
     assert set(persisted_ledgers[0]['by_entity']) == set(cycle.EXPECTED_ENTITIES)
