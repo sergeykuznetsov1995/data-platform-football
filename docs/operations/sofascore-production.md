@@ -489,8 +489,10 @@ s.clear_failed(p, campaign_id=cid, scope_key=f'{cid}:<tournament_id>:<source_sea
   «таблица опустела, потому что сняли отказанный матч») — это дефект парсера/контракта: ошибка `all N rows of <table> rejected: <code>` в `errors[]`. Красный
   ровно один раз: матчи до ошибки переводятся в `RowRejected`, и следующий проход — уже повтор
   карантина (журнал, зелёный), а не бесплатная красная петля (урок 101).
-- **Полнота.** `endpoint_completeness=1.0` значит «каждый плановый эндпоинт терминален или записан
-  в журнал отказов»; сколько эндпоинтов ушло в журнал вместо публикации — `rejected_endpoints`.
+- **Полнота.** `endpoint_completeness` = терминальные / плановые; отказы в журнале терминальными не
+  считаются (пачка 24 + 1 → 120/125 = 0.96). В отчёте рядом `planned_endpoints`, `terminal_endpoints`,
+  `rejected_endpoints`. Барьер дейли `run_sofascore_dq` считает лигу закрытой при
+  `terminal + rejected == planned` и выводит `rejected_endpoints` по лигам.
 - **Схема.** `table_name, natural_key, reason_code, reason, row_json, league, season, run_id, phase,
   parser_stage, rejected_at`; партиции `(league, season)`; ключ MERGE `(table_name, natural_key,
   run_id)`. Таблицу создаёт первая запись (`save_to_iceberg` → `IcebergWriter` создаёт таблицу, если
@@ -502,9 +504,13 @@ s.clear_failed(p, campaign_id=cid, scope_key=f'{cid}:<tournament_id>:<source_sea
   bronze.sofascore_rejected_rows GROUP BY 1 UNION ALL SELECT '__sentinel__','0'"`.
 - **Как перезаписать после починки.** Починка парсера/контракта едет обычной ночной доставкой;
   после неё первый же проход полосы по этому сезону переигрывает отказанные записи из raw
-  (0 трафика) и публикует их. Скоуп истории, закрытый зелёным проходом с отказами (`mark_completed`),
-  кампания больше не планирует — такой сезон перезаписывается ручным прогоном фазы матчей/игроков
-  раннера с `--offline-replay` (только raw, запросов к источнику нет) по слову владельца.
+  (0 трафика) и публикует их. Скоуп истории, закрытый зелёным проходом с отказами, остаётся в
+  `state.json.completed`, а в `failures.json` получает запись `completed_rejected_endpoints` +
+  `last_release` (`_finalize_historical_run` → `mark_completed_rejects`). Планировщик берёт такой скоуп
+  ещё раз **один раз на новый релиз** (`rejects_await_release`: релиз в бою ≠ `last_release`) — реплей
+  из raw; тот же релиз — ждёт, не каждый цикл. Отказов не осталось — запись снимается; красный
+  повтор — запись обновляется релизом и ждёт следующего. Без нового релиза — ручной прогон фазы
+  раннера с `--offline-replay` (только raw) по слову владельца.
   Строки журнала не удаляются — это история отказов.
 
 ## Мины, которые уже стреляли

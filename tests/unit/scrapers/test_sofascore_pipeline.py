@@ -986,6 +986,9 @@ def test_player_runner_journals_one_schema_error_and_publishes_the_league(
     assert result["rejected_rows"] == {
         "bronze.sofascore_player_profile": {"schema_error": 1}
     }
+    assert result["planned_endpoints"] == 50
+    assert result["rejected_endpoints"] == 1
+    assert result["endpoint_completeness"] == pytest.approx(0.98)
     # The broken record stays schema_error (a parser fix replays it from raw);
     # every other endpoint is finalized.
     for (player_id, endpoint), spec in specs.items():
@@ -1517,6 +1520,11 @@ def test_match_runner_rejects_one_bad_row_and_publishes_the_other_24_matches(
         "bronze.sofascore_event_participants": {"invalid_enum_value": 1}
     }
     assert result["rejected_endpoints"] == len(EVENT_PATHS)
+    # Astra r3: honest completeness — rejects are journaled, not terminal.
+    assert result["planned_endpoints"] == 125
+    assert result["terminal_endpoints"] == 120
+    assert result["endpoint_completeness"] == pytest.approx(0.96)
+    assert result["traffic"]["endpoint_completeness"] == pytest.approx(0.96)
     for (match_id, _endpoint), spec in specs.items():
         committed = runtime.manifest_store.get(spec.key)
         if match_id == bad_match:
@@ -1540,6 +1548,8 @@ def test_match_runner_rejects_one_bad_row_and_publishes_the_other_24_matches(
     assert "sofascore_events" not in saved
     assert len(saved["sofascore_rejected_rows"]["df"]) == 1
     assert again["rejected_endpoints"] == len(EVENT_PATHS)
+    assert again["terminal_endpoints"] == 0
+    assert again["endpoint_completeness"] == 0.0
     for endpoint in EVENT_PATHS:
         held = runtime.manifest_store.get(specs[(bad_match, endpoint)].key)
         assert held.status == ManifestStatus.SCHEMA_ERROR

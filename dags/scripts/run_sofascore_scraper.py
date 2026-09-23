@@ -793,6 +793,21 @@ def _player_retryable_remaining(manifest_store, specs, nonterminal):
     return {target: tuple(names) for target, names in remaining.items()}
 
 
+def _endpoint_closure(planned: int, rejected: int) -> dict:
+    """Honest completeness (#1352): journaled rejects are not terminal.
+
+    ``endpoint_completeness`` = terminal / planned; a consumer that accepts a
+    phase with rejects checks ``terminal + rejected == planned`` instead.
+    """
+    terminal = planned - rejected
+    return {
+        "planned_endpoints": planned,
+        "terminal_endpoints": terminal,
+        "rejected_endpoints": rejected,
+        "endpoint_completeness": terminal / planned if planned > 0 else 1.0,
+    }
+
+
 _REJECTED_ROWS_TABLE = "sofascore_rejected_rows"
 _REJECTED_ROWS_NATURAL_KEY = ["table_name", "natural_key", "run_id"]
 
@@ -1654,18 +1669,18 @@ def _run_match_capture(
                         )
                     )
                 validate_manifest_completeness(expectations, observations).require()
-                if held_records:
-                    # endpoint_completeness below keeps its contract: every
-                    # planned endpoint is terminal or journaled. What was
-                    # journaled instead of published is counted separately.
-                    results["rejected_endpoints"] = len(held_records)
                 # The engine snapshot counts states as they were recorded
                 # mid-pass, where every materialized endpoint is still a
                 # deferred retryable_failure — a green run and a red one looked
                 # alike (#1260). Report the committed states instead.
                 results["traffic"]["status_counts"] = final_counts
-                results["endpoint_completeness"] = 1.0
-                results["traffic"]["endpoint_completeness"] = 1.0
+                # Journaled instead of published (#1352): not terminal, so
+                # endpoint_completeness stays honest (120/125 -> 0.96).
+                results.update(
+                    _endpoint_closure(len(pipeline_results), len(held_records))
+                )
+                completeness = results["endpoint_completeness"]
+                results["traffic"]["endpoint_completeness"] = completeness
                 results["replay_cache"] = capture_runtime.engine.metrics.snapshot()
 
     except ReplaceGuardError as e:
@@ -2105,7 +2120,6 @@ def _run_player_capture(
                 results["rejected_players"] = len(
                     {rejected.natural_key for rejected in rejected_rows}
                 )
-                results["rejected_endpoints"] = len(rejected_rows)
 
             finalize_materialized_results(capture_runtime, replayed)
             for record in held_records:
@@ -2136,8 +2150,9 @@ def _run_player_capture(
                 capture_runtime.engine,
                 live_traffic,
             )
-            results["traffic"]["endpoint_completeness"] = 1.0
-            results["endpoint_completeness"] = 1.0
+            results.update(_endpoint_closure(len(specs), len(rejected_rows)))
+            completeness = results["endpoint_completeness"]
+            results["traffic"]["endpoint_completeness"] = completeness
             _write_results(output_path, results)
             return 0
     except ReplaceGuardError as exc:

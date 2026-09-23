@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import pathlib
 import sys
 from datetime import timedelta
@@ -458,3 +459,58 @@ def test_shipped_static_policy_authorizes_the_ready_history_scopes(monkeypatch):
         item["SOFASCORE_SCOPE_KEY"] for item in unfiltered
     ]
     assert planned
+
+
+@pytest.mark.unit
+def test_finalize_remembers_journaled_rejects_of_a_green_scope(
+    monkeypatch, tmp_path
+):
+    """#1352 (Astra r3): a green scope that journaled rejects passes their
+    count and the running release on, so a new release replays it once."""
+
+    module = _load_dag_module()
+    result_path = tmp_path / "scope.json"
+    result_path.write_text(json.dumps({
+        "status": "success",
+        "phases": [
+            {"phase": "season", "rejected_endpoints": 0},
+            {"phase": "matches", "rejected_endpoints": 5},
+        ],
+    }))
+    planned = [{
+        **_capture_env("c:8:825"),
+        "SOFASCORE_SCOPE_RESULT_PATH": str(result_path),
+    }]
+    remembered = []
+    monkeypatch.setattr(
+        module.state, "mark_completed_rejects",
+        lambda path, **kw: remembered.append((path, kw)),
+    )
+    monkeypatch.setattr(
+        module.state, "mark_failed",
+        lambda path, **kw: pytest.fail("a green scope is not a failure"),
+    )
+    context = {
+        "ti": SimpleNamespace(
+            xcom_pull=lambda **kw: planned, xcom_push=lambda **kw: None
+        ),
+        "dag_run": SimpleNamespace(
+            get_task_instance=lambda task_id, map_index=-1: SimpleNamespace(
+                state="success"
+            )
+        ),
+        "run_id": "manual__4",
+    }
+
+    monkeypatch.setenv(
+        "SOFASCORE_RELEASE_ROOT", "/opt/sofascore/releases/release-abcd1234"
+    )
+    module._finalize_historical_run(**context)
+    assert remembered == [(
+        module.FAILURES_PATH,
+        {
+            "campaign_id": "c", "scope_key": "c:8:825",
+            "rejected_endpoints": 5, "run_id": "manual__4",
+            "release": "abcd1234",
+        },
+    )]

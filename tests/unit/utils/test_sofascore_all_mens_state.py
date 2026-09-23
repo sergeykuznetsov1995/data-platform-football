@@ -971,3 +971,91 @@ def test_current_release_is_the_sha8_of_the_release_root(monkeypatch, root, expe
     else:
         monkeypatch.setenv("SOFASCORE_RELEASE_ROOT", root)
     assert current_release() == expected
+
+
+def _completed_plan(snapshot, failures_path, completed, *, release):
+    return [item["SOFASCORE_SCOPE_KEY"] for item in plan_historical_batch(
+        snapshot,
+        completed=completed,
+        batch_size=10,
+        failures=read_failures(failures_path, campaign_id=snapshot["campaign_id"]),
+        max_scope_attempts=3,
+        release=release,
+    )]
+
+
+@pytest.mark.unit
+def test_completed_scope_with_rejects_replays_once_per_new_release(tmp_path):
+    """#1352 (Astra r3): a green scope that journaled rejects is completed,
+    not lost: a NEW release replays it once (raw only, the fix may be in it);
+    the same release never replans it — not every cycle."""
+    from dags.utils.sofascore_all_mens_state import (
+        mark_completed_rejects,
+        read_scope_rejects,
+    )
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+    completed = {head}
+    result = tmp_path / "scope.json"
+    result.write_text(json.dumps({"phases": [
+        {"phase": "season"}, {"phase": "matches", "rejected_endpoints": 5},
+    ]}))
+    assert read_scope_rejects(result) == 5
+    assert read_scope_rejects(tmp_path / "missing.json") == 0
+
+    mark_completed_rejects(
+        failures_path, campaign_id=campaign_id, scope_key=head,
+        rejected_endpoints=5, run_id="run-1", release="aaaaaaaa",
+    )
+    record = read_failures(failures_path, campaign_id=campaign_id)[head]
+    assert record["completed_rejected_endpoints"] == 5
+    assert record["streak_no_traffic"] == 0
+
+    # Same release: completed, and its tournament advances past it.
+    same = _completed_plan(snapshot, failures_path, completed, release="aaaaaaaa")
+    assert head not in same
+    assert campaign_scope_key(campaign_id, 8, 824) in same
+    # New release: one replay.
+    assert head in _completed_plan(
+        snapshot, failures_path, completed, release="bbbbbbbb"
+    )
+
+    # The replay fails on the new release: the marker survives, the scope
+    # waits for the next release instead of retrying every cycle.
+    _fail(failures_path, campaign_id, head, "run-2",
+          reason="matches: boom", source_requests=0, release="bbbbbbbb")
+    assert read_failures(
+        failures_path, campaign_id=campaign_id
+    )[head]["completed_rejected_endpoints"] == 5
+    assert head not in _completed_plan(
+        snapshot, failures_path, completed, release="bbbbbbbb"
+    )
+    assert head in _completed_plan(
+        snapshot, failures_path, completed, release="cccccccc"
+    )
+
+    # A green replay without rejects clears the memory (validation clears,
+    # 0 rejects writes nothing): completed for good.
+    clear_failed(failures_path, campaign_id=campaign_id, scope_key=head)
+    mark_completed_rejects(
+        failures_path, campaign_id=campaign_id, scope_key=head,
+        rejected_endpoints=0, run_id="run-3", release="cccccccc",
+    )
+    assert head not in read_failures(failures_path, campaign_id=campaign_id)
+    assert head not in _completed_plan(
+        snapshot, failures_path, completed, release="dddddddd"
+    )
+
+
+@pytest.mark.unit
+def test_completed_scope_without_rejects_is_never_replanned(tmp_path):
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    assert head not in _completed_plan(
+        snapshot, tmp_path / "failures.json", {head}, release="bbbbbbbb"
+    )

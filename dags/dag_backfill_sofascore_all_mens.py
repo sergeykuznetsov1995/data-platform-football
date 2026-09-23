@@ -207,6 +207,19 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
             if task_instance is not None:
                 states.add(_task_state(task_instance))
         if not states & {"failed", "upstream_failed"}:
+            if states == {"success"}:
+                # #1352: a green scope that journaled rejects is replayed
+                # from raw once per new release (rejects_await_release).
+                state.mark_completed_rejects(
+                    FAILURES_PATH,
+                    campaign_id=environment["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
+                    scope_key=scope_key,
+                    rejected_endpoints=state.read_scope_rejects(
+                        environment.get("SOFASCORE_SCOPE_RESULT_PATH")
+                    ),
+                    run_id=str(context.get("run_id") or "manual"),
+                    release=release,
+                )
             continue
         reason, source_requests = state.read_scope_outcome(
             environment.get("SOFASCORE_SCOPE_RESULT_PATH")
