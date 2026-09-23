@@ -736,6 +736,9 @@ def _run_match_capture(
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -2397,6 +2400,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -2419,6 +2425,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -2510,6 +2519,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -2542,6 +2554,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )

@@ -185,39 +185,6 @@ def _task_state(task_instance: Any) -> str:
     return str(value or "none").casefold().split(".")[-1]
 
 
-def _scope_outcome(environment: dict[str, str]) -> tuple[str, int | None]:
-    """Reason class and source requests of one failed attempt (#1351).
-
-    Read from the scope-cycle result the task wrote: the first ``errors[]``
-    line up to its ``; attempts: [`` tail (the final cause, as the watchdog
-    classifier reads it) and the sum of the phases' ``source_request_count``
-    (``request_count`` where a failure report has only that).  An unreadable
-    result is an unknown outcome: ``None`` never extends a no-traffic streak.
-    """
-
-    try:
-        result = json.loads(
-            Path(environment["SOFASCORE_SCOPE_RESULT_PATH"]).read_text(
-                encoding="utf-8"
-            )
-        )
-    except (KeyError, OSError, ValueError):
-        return "scope result is unreadable", None
-    if not isinstance(result, dict):
-        return "scope result is unreadable", None
-    errors = result.get("errors") or []
-    reason = str(errors[0]) if errors else "scope result has no errors[]"
-    reason = (reason.splitlines() or [""])[0]
-    reason = reason.split("; attempts: [", 1)[0]
-    counts = [
-        phase.get("source_request_count", phase.get("request_count"))
-        for phase in result.get("phases") or []
-        if isinstance(phase, dict)
-    ]
-    counts = [int(value) for value in counts if value is not None]
-    return reason, (sum(counts) if counts else None)
-
-
 def _finalize_historical_run(**context: Any) -> dict[str, Any]:
     planned = context["ti"].xcom_pull(task_ids="plan_historical_batch") or []
     dag_run = context.get("dag_run")
@@ -241,7 +208,9 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
                 states.add(_task_state(task_instance))
         if not states & {"failed", "upstream_failed"}:
             continue
-        reason, source_requests = _scope_outcome(environment)
+        reason, source_requests = state.read_scope_outcome(
+            environment.get("SOFASCORE_SCOPE_RESULT_PATH")
+        )
         state.mark_failed(
             FAILURES_PATH,
             campaign_id=environment["SOFASCORE_EXPECTED_CAMPAIGN_ID"],

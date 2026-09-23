@@ -209,6 +209,35 @@ def current_release(environ: Mapping[str, str] | None = None) -> str:
     return name or UNKNOWN_RELEASE
 
 
+def read_scope_outcome(result_path: str | Path | None) -> tuple[str, int | None]:
+    """Reason class and source requests of one failed attempt (#1351).
+
+    Read from the scope-cycle result the task wrote: the first ``errors[]``
+    line up to its ``; attempts: [`` tail (the final cause, as the watchdog
+    classifier reads it) and the sum of the phases' ``source_request_count``
+    (``request_count`` where a failure report has only that).  An unreadable
+    result is an unknown outcome: ``None`` never extends a no-traffic streak.
+    """
+
+    try:
+        result = json.loads(Path(str(result_path)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "scope result is unreadable", None
+    if not isinstance(result, Mapping):
+        return "scope result is unreadable", None
+    errors = result.get("errors") or []
+    reason = str(errors[0]) if errors else "scope result has no errors[]"
+    reason = (reason.splitlines() or [""])[0]
+    reason = reason.split("; attempts: [", 1)[0]
+    counts = [
+        phase.get("source_request_count", phase.get("request_count"))
+        for phase in result.get("phases") or []
+        if isinstance(phase, Mapping)
+    ]
+    counts = [int(value) for value in counts if value is not None]
+    return reason, (sum(counts) if counts else None)
+
+
 def is_quarantined_record(attempts: Mapping[str, Any], max_scope_attempts: int) -> bool:
     """Failure record whose no-traffic streak reached the attempt ceiling."""
 
@@ -858,5 +887,6 @@ __all__ = [
     "plan_refresh_batch",
     "read_completed",
     "read_failures",
+    "read_scope_outcome",
     "read_snapshot",
 ]

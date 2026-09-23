@@ -497,3 +497,44 @@ def test_cycle_result_carries_player_universe_gaps(tmp_path, monkeypatch):
     result = json.loads((tmp_path / "result.json").read_text())
     assert result["status"] == "success"
     assert result["phases"][0]["player_universe_gaps"] == 1
+
+
+@pytest.mark.unit
+def test_runner_fail_closed_before_capture_reaches_quarantine_as_zero_requests(
+    tmp_path, monkeypatch
+):
+    """#1351 (Astra r2): the chain «runner fails closed before any capture →
+    cycle result → finalize → quarantine». The runner's fail-closed reports
+    said ``requests: 0`` only, the cycle result carried no request counter,
+    and the scope's identical free failures never built a streak."""
+    from dags.utils import sofascore_all_mens_state as state
+
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    # The real runner entrypoint; no registry overlay / signed plan exists,
+    # so it fails closed (activation guard) before any capture runtime.
+    with patch(
+        "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+        side_effect=_plan_double,
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "season")) == 1
+
+    result_path = tmp_path / "result.json"
+    result = json.loads(result_path.read_text())
+    assert result["errors"][0].startswith("season: activation_guard: ")
+    assert result["phases"][0]["source_request_count"] == 0
+
+    reason, source_requests = state.read_scope_outcome(result_path)
+    assert source_requests == 0
+    failures = tmp_path / "failures.json"
+    for run_id in ("r1", "r2", "r3"):
+        state.mark_failed(
+            failures, campaign_id="c", scope_key="c:17:76986", run_id=run_id,
+            reason=reason, source_requests=source_requests, release="aaaaaaaa",
+        )
+    record = state.read_failures(failures, campaign_id="c")["c:17:76986"]
+    assert state.is_quarantined_record(record, 3)
