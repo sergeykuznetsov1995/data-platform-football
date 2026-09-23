@@ -526,7 +526,6 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
     import pandas as pd
 
     from dags.utils.sofascore_dq import (
-        SofaScoreDQViolation,
         validate_event_participants,
         validate_lineup_semantics,
         validate_season_alignment,
@@ -618,7 +617,7 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
         if not frame.empty:
             records = frame.to_dict("records")
             report = validate_table_rows(table, records)
-            _, rejected = report.partition(records)
+            _, rejected = report.partition(records, allow_all_rejected=True)
             if rejected:
                 rejected_rows.extend(rejected)
                 keep = [
@@ -645,12 +644,16 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
                 frames[name] = frame[
                     ~frame[column].astype(str).isin(rejected_match_ids)
                 ]
-        for dataset, table in dq_tables.items():
-            if rows_before[dataset] and frames[dataset].empty:
-                raise SofaScoreDQViolation(
-                    f"all {rows_before[dataset]} rows of {table} rejected: "
-                    f"{rejected_rows[0].code}"
-                )
+    # Nothing of a table survived: the caller decides whether that is a parser
+    # or contract defect (fresh data -> red) or a quarantine replay (journal).
+    all_rejected = None
+    for dataset, table in dq_tables.items():
+        if rejected_rows and rows_before[dataset] and frames[dataset].empty:
+            all_rejected = (
+                f"all {rows_before[dataset]} rows of {table} rejected: "
+                f"{rejected_rows[0].code}"
+            )
+            break
     if not frames["lineups"].empty:
         validate_lineup_semantics(frames["lineups"].to_dict("records")).require()
     if not frames["event_participants"].empty:
@@ -676,6 +679,7 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
         ).require()
     frames["rejected_rows"] = rejected_rows
     frames["rejected_match_ids"] = rejected_match_ids
+    frames["all_rejected"] = all_rejected
     return frames
 
 
@@ -1054,6 +1058,17 @@ def _run_match_capture(
             if force_replace or offline_replay
             else endpoint_resume_plan(capture_runtime.manifest_store, specs)
         )
+        # Matches already held by a rejected row (#1352): replaying them is a
+        # quarantine repeat, not fresh data.
+        quarantined_before = frozenset(
+            target
+            for (target, _endpoint), spec in endpoint_specs.items()
+            if target in endpoint_plan
+            and getattr(
+                capture_runtime.manifest_store.get(spec.key), "error_type", None
+            )
+            == _ROW_REJECTED_ERROR
+        )
         total = len(match_ids)
         match_ids = [
             match_id for match_id in match_ids if str(match_id) in endpoint_plan
@@ -1257,11 +1272,22 @@ def _run_match_capture(
                 )
             rejected_rows = frames.pop("rejected_rows", [])
             rejected_match_ids = frames.pop("rejected_match_ids", frozenset())
+            all_rejected = frames.pop("all_rejected", None)
             held_records = []
             if rejected_match_ids:
                 pipeline_results, held_records = _hold_rejected_matches(
                     pipeline_results, rejected_match_ids, rejected_rows
                 )
+            if all_rejected and (
+                not rejected_match_ids or rejected_match_ids - quarantined_before
+            ):
+                # Fresh data refused wholesale: parser/contract defect, red.
+                # The matches are held first, so the next pass is a quarantine
+                # replay (journal, green) instead of a free red loop.
+                for record in held_records:
+                    capture_runtime.manifest_store.upsert(record)
+                _flush_manifest_store(capture_runtime.manifest_store)
+                raise RuntimeError(all_rejected)
             results["traffic"] = _logical_capture_traffic(
                 capture_runtime.engine,
                 live_traffic,
@@ -1631,6 +1657,11 @@ def _run_match_capture(
                         )
                     )
                 validate_manifest_completeness(expectations, observations).require()
+                if held_records:
+                    # endpoint_completeness below keeps its contract: every
+                    # planned endpoint is terminal or journaled. What was
+                    # journaled instead of published is counted separately.
+                    results["rejected_endpoints"] = len(held_records)
                 # The engine snapshot counts states as they were recorded
                 # mid-pass, where every materialized endpoint is still a
                 # deferred retryable_failure — a green run and a red one looked
@@ -1955,6 +1986,7 @@ def _run_player_capture(
                         canonical_url=canonical_url,
                         scope=f"{league}:{season_short}",
                         entity=ENTITY_PLAYER_CAPTURE,
+                        tolerate_schema_error=True,
                     )
                 else:
                     from scrapers.sofascore.workload_runtime import target_ids
@@ -1975,6 +2007,7 @@ def _run_player_capture(
                             canonical_url=canonical_url,
                             scope=f"{league}:{season_short}",
                             entity=ENTITY_PLAYER_CAPTURE,
+                            tolerate_schema_error=True,
                             workload_plan=workload_plan,
                             allocation_id=allocation.allocation_id,
                             attempt_id=(
@@ -2075,6 +2108,7 @@ def _run_player_capture(
                 results["rejected_players"] = len(
                     {rejected.natural_key for rejected in rejected_rows}
                 )
+                results["rejected_endpoints"] = len(rejected_rows)
 
             finalize_materialized_results(capture_runtime, replayed)
             for record in held_records:

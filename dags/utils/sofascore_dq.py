@@ -123,12 +123,16 @@ class DQReport:
         self.rejected_indices.setdefault(index, []).append(DQFinding(code, message))
 
     def partition(
-        self, rows: Sequence[Mapping[str, Any]]
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        allow_all_rejected: bool = False,
     ) -> tuple[list[Mapping[str, Any]], list[RejectedRow]]:
         """Split ``rows`` into accepted rows and row-level rejects (#1352).
 
         When every row is refused the batch still fails: that is a parser or
-        contract defect, not one bad record.
+        contract defect, not one bad record. ``allow_all_rejected`` leaves that
+        verdict to a caller that can tell a quarantine replay from fresh data.
         """
 
         accepted: list[Mapping[str, Any]] = []
@@ -150,7 +154,7 @@ class DQReport:
                     ),
                 )
             )
-        if rows and not accepted:
+        if rows and not accepted and not allow_all_rejected:
             raise SofaScoreDQViolation(
                 f"all {len(rows)} rows of {self.table_name} rejected: "
                 f"{rejected[0].code}"

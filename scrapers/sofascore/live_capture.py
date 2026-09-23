@@ -1123,6 +1123,7 @@ def capture_live_specs(
     transport_factory: Callable[..., LeaseBackedCamoufoxTransport] = (
         LeaseBackedCamoufoxTransport
     ),
+    tolerate_schema_error: bool = False,
 ) -> tuple[list[Any], dict[str, Any]]:
     """Capture a deterministic spec sequence through one lease/browser.
 
@@ -1130,6 +1131,8 @@ def capture_live_specs(
     touched.  A successful normalized payload is intentionally nonterminal until
     its Bronze MERGE (``DeferredMaterialization``); every other nonterminal result
     aborts the task before another paid endpoint is attempted.
+    ``tolerate_schema_error`` (#1352, player phase) keeps a ``schema_error``
+    record as a per-record reject and moves on to the next spec.
     """
 
     if not specs:
@@ -1160,7 +1163,7 @@ def capture_live_specs(
             replayable = bool(raw and 200 <= raw.http_status < 300 and raw.http_status != 204)
         if replayable:
             result = engine.capture(spec)
-            _require_publishable(result)
+            _require_publishable(result, tolerate_schema_error=tolerate_schema_error)
             captured_by_key[spec.key] = result
         else:
             network_specs.append(spec)
@@ -1220,7 +1223,9 @@ def capture_live_specs(
                     raise _LeaseLost(
                         transport.lease_lost, transport.provider_snapshot()
                     )
-                _require_publishable(result)
+                _require_publishable(
+                    result, tolerate_schema_error=tolerate_schema_error
+                )
                 captured_by_key[pending[0].key] = result
                 del pending[0]
 
@@ -1309,13 +1314,14 @@ def _lease_lost(exc: BaseException) -> bool:
     return isinstance(exc, SofascoreLeaseRejected) and exc.code in _LEASE_LOST_CODES
 
 
-def _require_publishable(result: Any) -> None:
+def _require_publishable(result: Any, *, tolerate_schema_error: bool = False) -> None:
     manifest = result.manifest
     deferred = (
         manifest.status.value == "retryable_failure"
         and manifest.error_type == "DeferredMaterialization"
     )
-    if not manifest.is_terminal and not deferred:
+    rejected = tolerate_schema_error and manifest.status.value == "schema_error"
+    if not manifest.is_terminal and not deferred and not rejected:
         raise RuntimeError(
             "SofaScore endpoint did not reach a publishable state: "
             f"{manifest.key.stable_id()} status={manifest.status.value} "

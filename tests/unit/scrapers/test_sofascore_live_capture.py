@@ -2070,3 +2070,92 @@ def test_unreadable_final_meter_after_fetch_charges_a_lower_bound_and_never_rele
     metrics = runtime.engine.metrics.snapshot()
     assert metrics["accounting_uncertain"] == 1
     assert metrics["control_channel_failures"] == 1
+
+
+def _signed_player_batch(runtime):
+    runtime.engine.run_id = "scheduled__signed-run::players"
+    allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "7" * 32,
+        task_id="capture",
+        scope="player",
+        workload_class="player_batch_50",
+        batch_index=0,
+        units=("1", "2"),
+        budget_bytes=10_000,
+    )
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_ingest_sofascore",
+        run_id=runtime.engine.run_id,
+        player_universe_ids=("1", "2"),
+        allocations=(allocation,),
+        control_token="c" * 32,
+    )
+    return plan, allocation
+
+
+def _capture_player_batch(runtime, plan, allocation, **kwargs):
+    client = _LeaseClient([0, 0, 100, 100, 250], final_total=250)
+    factory = _TransportFactory(
+        client,
+        _Capture(
+            [
+                # The first player's payload breaks the schema (#1352: POR).
+                _record(b'{"unexpected":{"id":1}}'),
+                _record(b'{"items":[{"id":2}]}'),
+            ]
+        ),
+    )
+    return capture_live_specs(
+        runtime,
+        [_spec(1), _spec(2)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="player_capture",
+        workload_plan=plan,
+        allocation_id=allocation.allocation_id,
+        attempt_id="1",
+        transport_factory=factory,
+        **kwargs,
+    )
+
+
+def test_signed_player_batch_keeps_going_past_a_schema_error_record(tmp_path):
+    """#1352 (Astra r1 #1): one schema_error player no longer aborts the paid batch."""
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _signed_player_batch(runtime)
+
+    results, _ = _capture_player_batch(
+        runtime, plan, allocation, tolerate_schema_error=True
+    )
+
+    assert [result.manifest.status.value for result in results] == [
+        "schema_error",
+        "retryable_failure",
+    ]
+    assert results[1].manifest.error_type == "DeferredMaterialization"
+
+    # A later pass replays the retained raw of the broken record without a
+    # lease and still tolerates it.
+    def forbidden(*args, **kwargs):
+        raise AssertionError("raw replay opened a paid transport")
+
+    replayed, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="player_capture",
+        transport_factory=forbidden,
+        tolerate_schema_error=True,
+    )
+    assert replayed[0].manifest.status.value == "schema_error"
+    assert traffic["paid_proxy_bytes"] == 0
+
+
+def test_signed_batch_without_tolerance_still_aborts_on_schema_error(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _signed_player_batch(runtime)
+
+    with pytest.raises(RuntimeError, match="did not reach a publishable state"):
+        _capture_player_batch(runtime, plan, allocation)
