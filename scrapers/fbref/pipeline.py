@@ -223,8 +223,9 @@ MAX_ROUTINE_MOVED_PAGES = 5
 # far beyond the handful of retired aliases this exists for.
 MAX_RUN_MOVED_PAGES = 25
 # A single match endpoint can briefly answer 404 and then publish the same
-# match on a later run.  That verdict is reversible only for match pages: a
-# 404 on a spine page can amputate discovery scope and must stay loud.  Above
+# match on a later run.  This counter is for match pages only: a 404 on a
+# spine page is a generic deferred target failure (#1324, see
+# MAX_DEFERRED_TARGET_FAILURES_PER_RUN) with its own ceilings.  Above
 # this count, and only when the deferred matches dominate their wave, the
 # response stops looking target-local and starts looking like a bad exit or a
 # source-wide outage.
@@ -237,6 +238,14 @@ MAX_RUN_DEFERRED_MATCH_NOT_FOUND = 25
 # target-local while refusing to normalize a cohort- or run-wide markup jump.
 MAX_ROUTINE_TERMINAL_OVERSIZED_PAGES = 5
 MAX_RUN_TERMINAL_OVERSIZED_PAGES = 25
+# #1324: any other target-local FetchError (5xx, a non-match 4xx outside the
+# clearance statuses, empty body, non-HTML answer...) defers that one target
+# to the next run instead of failing the wave.  A 3xx that is not a usable
+# "moved" statement is NOT deferred: it is a transport signal (challenge,
+# captive portal, hijacked exit) and still fails the wave.  The per-wave floor is
+# MAX_ROUTINE_CONTRACT_QUARANTINES; the run gets the same hard ceiling as
+# permanent redirects, so a thin but steady stream of failures still ends red.
+MAX_DEFERRED_TARGET_FAILURES_PER_RUN = 25
 # A moved-page verdict shrinks the crawl scope quietly, so it may only be
 # reached for an address that still belongs to the source.  A captive portal
 # or a hijacked residential exit answering 301 with its own login page must
@@ -781,6 +790,9 @@ class WaveResult:
     moved_pages_skipped: int = 0
     deferred_match_not_found: int = 0
     terminal_oversized_pages: int = 0
+    # "{target_id}:{error_class}" of target-local fetch failures handed back
+    # to the next run instead of failing the wave (#1324).
+    deferred_target_failures: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -1296,6 +1308,25 @@ def _is_run_mass_terminal_oversized_pages(fetch: "WaveResult") -> bool:
     """Catch oversized responses spread thinly across many waves."""
 
     return fetch.terminal_oversized_pages > MAX_RUN_TERMINAL_OVERSIZED_PAGES
+
+
+def _is_mass_deferred_target_failures(result: "WaveResult") -> bool:
+    """Tell a few failing pages from a cohort-wide outage (#1324)."""
+
+    deferred = len(result.deferred_target_failures)
+    return (
+        deferred > MAX_ROUTINE_CONTRACT_QUARANTINES
+        and deferred * 2 > result.cohort_size
+    )
+
+
+def _is_run_mass_deferred_target_failures(fetch: "WaveResult") -> bool:
+    """Catch deferred target failures spread thinly across many waves."""
+
+    return (
+        len(fetch.deferred_target_failures)
+        > MAX_DEFERRED_TARGET_FAILURES_PER_RUN
+    )
 
 
 def _sentinel_gate_errors(coverage: object) -> list[str]:
@@ -3827,7 +3858,26 @@ class FBrefPipeline:
                             exc,
                         )
                         terminal_oversized = exc.error_class == "response_too_large"
-                        reversible_target_failure = moved or match_not_found
+                        # A redirect that is not a usable "moved" statement is
+                        # a transport signal (challenge, captive portal,
+                        # hijacked exit), not one page's fault: it stays loud.
+                        redirect_refusal = (
+                            exc.error_class == "http_status"
+                            and exc.http_status is not None
+                            and 300 <= int(exc.http_status) < 400
+                            and not moved
+                        )
+                        # #1324: every other target-local failure is deferred
+                        # the same reversible way instead of failing the wave.
+                        deferred_target_failure = not (
+                            moved
+                            or match_not_found
+                            or terminal_oversized
+                            or redirect_refusal
+                        )
+                        reversible_target_failure = (
+                            moved or match_not_found or deferred_target_failure
+                        )
                         self.control.fail_fetch(
                             lease,
                             error_class=exc.error_class,
@@ -3959,10 +4009,41 @@ class FBrefPipeline:
                                     returned,
                                 )
                                 break
-                        else:
+                        elif redirect_refusal:
                             result.failures.append(
                                 f"{lease.target_id}:{exc.error_class}"
                             )
+                        else:
+                            # #1324: one failing page is not a verdict on the
+                            # wave.  The attempt stays durable evidence above;
+                            # the page is retried by the next run, and a
+                            # dominant or run-wide stream still fails closed.
+                            result.deferred_target_failures.append(
+                                f"{lease.target_id}:{exc.error_class}"
+                            )
+                            logger.warning(
+                                "Run %s target %s failed with %s; deferred to "
+                                "the next run (frontier queued, run target "
+                                "skipped): %s",
+                                run_id,
+                                lease.target_id,
+                                exc.error_class,
+                                str(exc),
+                            )
+                            if _is_mass_deferred_target_failures(result):
+                                untouched = leases[lease_index + 1 :]
+                                returned = self.control.requeue_unfetched_targets(
+                                    untouched
+                                )
+                                logger.error(
+                                    "Run %s stops after %d/%d deferred target "
+                                    "failures; %d untouched target(s) returned",
+                                    run_id,
+                                    len(result.deferred_target_failures),
+                                    result.cohort_size,
+                                    returned,
+                                )
+                                break
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
                         if (
@@ -4092,6 +4173,14 @@ class FBrefPipeline:
                     f"{result.terminal_oversized_pages}"
                     f"/{result.cohort_size}"
                 )
+            if _is_mass_deferred_target_failures(result):
+                # A cohort dominated by failing pages is evidence about the
+                # source or the exit, not about the pages (#1324).
+                result.failures.append(
+                    "mass_target_failures="
+                    f"{len(result.deferred_target_failures)}"
+                    f" of {result.cohort_size}"
+                )
         finally:
             if owns_session:
                 live_session.close(
@@ -4108,8 +4197,8 @@ class FBrefPipeline:
     def _merge_wave_result(target: WaveResult, source: WaveResult) -> None:
         for name in WaveResult.__dataclass_fields__:
             value = getattr(source, name)
-            if name == "failures":
-                target.failures.extend(value)
+            if name in {"failures", "deferred_target_failures"}:
+                getattr(target, name).extend(value)
             elif isinstance(value, bool):
                 setattr(target, name, bool(getattr(target, name)) or value)
             else:
@@ -4222,6 +4311,11 @@ class FBrefPipeline:
                             "mass_response_too_large_run="
                             f"{aggregate.fetch.terminal_oversized_pages}"
                         )
+                    if _is_run_mass_deferred_target_failures(aggregate.fetch):
+                        raise FetchWaveError(
+                            "mass_target_failures_run="
+                            f"{len(aggregate.fetch.deferred_target_failures)}"
+                        )
 
                     if fetched.budget_exhausted:
                         break
@@ -4242,6 +4336,16 @@ class FBrefPipeline:
                 # its eventual repair has not run yet.  Do not report a false
                 # closure to the downstream validator.
                 aggregate.frontier_closed = False
+            deferred = len(aggregate.fetch.deferred_target_failures)
+            if deferred:
+                counts = self.control.get_run_target_counts(run_id)
+                if int(counts.get("succeeded") or 0) == 0:
+                    # Deferring pages is only honest while the run still does
+                    # work.  A run that fetched nothing at all is red (#1324).
+                    raise FetchWaveError(
+                        f"no page fetched; {deferred} target failure(s) "
+                        "deferred"
+                    )
             failed = False
             return aggregate
         finally:
@@ -7546,9 +7650,18 @@ class FBrefPipeline:
                 if int(freshness.get("total_targets") or 0) <= 0:
                     errors.append("publication_scope_freshness_empty")
                 if not bool(freshness.get("all_within_sla")):
-                    errors.append(
-                        f"{freshness_label}_stale_targets="
-                        f"{int(freshness.get('stale_targets') or 0)}"
+                    # #1324: staleness of the whole scope is the frontier's
+                    # debt, not this run's result.  It is reported, not
+                    # enforced; the run's own work is gated above.
+                    stale_targets = int(freshness.get("stale_targets") or 0)
+                    warnings[
+                        f"scope_debt:{freshness_label}_stale_targets"
+                    ] = stale_targets
+                    logger.warning(
+                        "Run %s finishes with scope debt: %s_stale_targets=%d",
+                        run_id,
+                        freshness_label,
+                        stale_targets,
                     )
         if (
             not isolated_acceptance
