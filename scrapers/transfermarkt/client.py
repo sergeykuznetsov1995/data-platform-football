@@ -2010,6 +2010,13 @@ class TransfermarktHttpClient:
                     last_error = f"HTTP {status_code}"
                     error_type = ErrorType.UNKNOWN.value
                     retry_allowed = False
+                if status_code >= 500 or status_code == 407:
+                    # #1389: a gateway-generated 502/407 carries its upstream
+                    # class on the real HTTP response, not on a pseudo status.
+                    proxy_status = (
+                        f" proxy_status={status_code} upstream_class="
+                        f"{_header_value(response_headers, PROXY_UPSTREAM_STATUS_HEADER) or 'нет класса от шлюза'}"
+                    )
 
                 proxy_success = terminal_status == FetchStatus.SCHEMA_ERROR
                 self._record_proxy(
@@ -2034,6 +2041,16 @@ class TransfermarktHttpClient:
                     self._avoid_on_next_client(proxy_obj)
                     self._discard_failed_transport(label=label)
                 if not retry_allowed:
+                    if proxy_status:
+                        logger.warning(
+                            "%s attempt %d/%d failed (%s): %s%s",
+                            label,
+                            attempt,
+                            attempts_cap,
+                            context or url,
+                            last_error,
+                            proxy_status,
+                        )
                     break
             except TrafficBudgetExceeded:
                 self._budget_exhausted = True

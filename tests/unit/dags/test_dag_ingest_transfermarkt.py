@@ -1556,6 +1556,40 @@ class TestGatewayProbe:
         with pytest.raises(Exception, match=r'шлюз/пул: ProxyRequiredError'):
             call()
 
+    def test_storage_failure_is_not_a_gateway_verdict(
+        self, real_probe_module, monkeypatch,
+    ):
+        from scrapers.transfermarkt.models import TrafficMeterError
+
+        call, provider, _ = self._probe(real_probe_module, monkeypatch, [])
+
+        def meter_down(**kwargs):
+            raise TrafficMeterError('request permit wait exceeded its bound')
+
+        provider.acquire = meter_down
+        with pytest.raises(Exception) as caught:
+            call()
+        assert str(caught.value).startswith('проба: TrafficMeterError')
+        assert 'шлюз/пул' not in str(caught.value)
+
+    def test_probe_lease_is_signed_by_the_plan_task(
+        self, real_probe_module, monkeypatch,
+    ):
+        call, provider, _ = self._probe(
+            real_probe_module, monkeypatch, [_ProbeResponse(b'x' * 70 * 1024)],
+        )
+        call()
+        assert provider.acquired[0][1]['task_id'] == 'plan_exact_scopes'
+
+    def test_plan_task_never_retries_the_paid_probe(self, real_probe_module):
+        from airflow.operators.python import PythonOperator
+
+        task = next(
+            item for item in PythonOperator._instances
+            if item.task_id == 'plan_exact_scopes'
+        )
+        assert task._init_kwargs['retries'] == 0
+
     def test_probe_runs_after_approvals_and_fails_the_plan(
         self, dag_module, monkeypatch, tmp_path,
     ):
@@ -1664,6 +1698,27 @@ class TestOneAlertPerRun:
             '2 из 3 кусков красные, классы: '
             '{ScopeManifestError: 1, transport: 1}'
         )
+
+    def test_status_file_older_than_the_run_is_not_trusted(
+        self, dag_module, tmp_path,
+    ):
+        import os
+        from datetime import datetime, timezone
+
+        env = _env_with_status(tmp_path, 'old', {
+            'status': 'failed', 'error_type': 'ScopeCycleError',
+            'error': 'transport:connection:TransportStatusError',
+        })
+        status_path = tmp_path / 'old' / 'scope-status.json'
+        os.utime(status_path, (1_000_000_000, 1_000_000_000))
+        ti = MagicMock()
+        ti.xcom_pull.side_effect = lambda task_ids: [env]
+        dag_run = SimpleNamespace(
+            get_task_instances=lambda: [_child(0, 'failed')],
+            start_date=datetime(2026, 9, 25, 4, 0, tzinfo=timezone.utc),
+        )
+        with pytest.raises(Exception, match=r'классы: \{unknown: 1\}'):
+            dag_module._raise_on_failed_children({'ti': ti, 'dag_run': dag_run})
 
     def test_green_children_pass_through(self, dag_module):
         dag_module._raise_on_failed_children({

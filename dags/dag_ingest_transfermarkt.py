@@ -116,7 +116,10 @@ def _probe_gateway_exit(
         TransfermarktHttpClient,
         redact_sensitive,
     )
-    from scrapers.transfermarkt.models import SharedTrafficLedger
+    from scrapers.transfermarkt.models import (
+        ProxyRequiredError,
+        SharedTrafficLedger,
+    )
 
     try:
         if lease_provider is None:
@@ -137,7 +140,7 @@ def _probe_gateway_exit(
             lease_metadata={
                 'dag_id': dag_id,
                 'run_id': run_id,
-                'task_id': 'preflight_reader_route_for_paid_cycle',
+                'task_id': 'plan_exact_scopes',
                 'scope': 'gateway_probe',
             },
             lease_ttl_seconds=GATEWAY_PROBE_LEASE_TTL_SECONDS,
@@ -155,9 +158,15 @@ def _probe_gateway_exit(
             client.close()
     except AirflowException:
         raise
-    except Exception as exc:  # noqa: BLE001 - every probe failure is a gateway verdict
+    except (ProxyRequiredError, ConnectionError, TimeoutError) as exc:
+        # The gateway refused the lease or the exit/transport failed: a
+        # gateway/pool verdict the stall watch classifies as transport.
         raise AirflowException(
             f'шлюз/пул: {type(exc).__name__}: {redact_sensitive(exc)}'
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - storage/meter/permit are not the pool
+        raise AirflowException(
+            f'проба: {type(exc).__name__}: {redact_sensitive(exc)}'
         ) from exc
 
     status_code = int(outcome.status_code or 0)
@@ -931,18 +940,29 @@ class _UpstreamFailureAlreadyReported(AirflowFailException):
 
 def _failure_class(scope_status: Mapping[str, Any] | None) -> str:
     if not scope_status:
-        return 'no_scope_status'
+        return 'unknown'  # no status written during this run
     error = str(scope_status.get('error') or '')
     if 'transport:' in error:
         return 'transport'
     return str(scope_status.get('error_type') or 'unknown')
 
 
-def _read_child_scope_status(env: Mapping[str, Any]) -> dict[str, Any] | None:
+def _read_child_scope_status(
+    env: Mapping[str, Any], *, not_before: datetime | None = None,
+) -> dict[str, Any] | None:
+    """The child's scope-status.json, only if written during this dag run.
+
+    A child killed by its execution_timeout writes nothing; a file left by an
+    earlier run/try must not lend it a stale class.
+    """
+
     try:
         payload = json.loads(str(env['TM_SCOPE_PAYLOAD_JSON']))
         base_dir = Path(str(payload['result_paths']['base_dir']))
-        status = json.loads((base_dir / 'scope-status.json').read_text())
+        path = base_dir / 'scope-status.json'
+        if not_before is not None and path.stat().st_mtime < not_before.timestamp():
+            return None
+        status = json.loads(path.read_text())
     except (KeyError, TypeError, ValueError, OSError):
         return None
     return status if isinstance(status, dict) else None
@@ -976,7 +996,9 @@ def _raise_on_failed_children(context: Mapping[str, Any]) -> None:
     for item in failed:
         index = int(getattr(item, 'map_index', -1))
         env = planned_envs[index] if 0 <= index < len(planned_envs) else {}
-        failure = _failure_class(_read_child_scope_status(env))
+        failure = _failure_class(_read_child_scope_status(
+            env, not_before=getattr(dag_run, 'start_date', None),
+        ))
         classes[failure] = classes.get(failure, 0) + 1
     rendered = ', '.join(f'{name}: {count}' for name, count in sorted(classes.items()))
     raise AirflowFailException(
@@ -1165,6 +1187,9 @@ with DAG(
     plan_exact_scopes_task = PythonOperator(
         task_id='plan_exact_scopes',
         python_callable=_plan_exact_scopes,
+        # #1389: the plan ends with the paid gateway probe — one probe per run,
+        # not one per retry.
+        retries=0,
     )
 
     run_exact_child_cycle_task = BashOperator.partial(
