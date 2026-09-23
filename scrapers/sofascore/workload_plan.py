@@ -49,11 +49,16 @@ WORKLOAD_ARTIFACT_SCHEMA_VERSION = 3
 WORKLOAD_POLICY_SCHEMA_VERSION = 4
 WORKLOAD_PLAN_SCHEMA_VERSION = 2
 ALLOCATION_LEDGER_SCHEMA_VERSION = 1
-# #1350: the in-memory ledger drops finished DagRuns older than this, and keeps
-# at most this many runs (oldest inactive first); an active claim is never
-# dropped.  The old file grew forever (30 MB) and was rewritten on every chunk.
+# #1350: the file grew forever (30 MB) and was rewritten on every chunk.  Runs
+# without an active claim that are older than the retention, or beyond the cap
+# of full runs (oldest first), are slimmed: ``units`` and ``lease_stats`` go,
+# budget/spend/completed stay, so the pre-#1350 binary still refuses to re-mint
+# them after a rollback.  Slimmed runs untouched for the retire horizon are
+# dropped and remembered in ``retired_runs``.  An active claim is never touched.
 ALLOCATION_RUN_RETENTION_SECONDS = 3 * 24 * 3600
 ALLOCATION_RUN_CAP = 300
+ALLOCATION_RUN_RETIRE_SECONDS = 30 * 24 * 3600
+_SLIMMED_ALLOCATION_FIELDS = ("units", "lease_stats")
 WORKLOAD_BUDGET_DERIVATION = "max_observed_task_bytes_per_workload_class_v2"
 WORKLOAD_STATIC_BUDGET_DERIVATION = "static_workload_class_cap_v1"
 WORKLOAD_METER = "proxy_filter_provider_path_v2"
@@ -1624,12 +1629,14 @@ class AllocationLedger:
         control_token: Optional[str | bytes] = None,
         run_retention_seconds: int = ALLOCATION_RUN_RETENTION_SECONDS,
         run_cap: int = ALLOCATION_RUN_CAP,
+        run_retire_seconds: int = ALLOCATION_RUN_RETIRE_SECONDS,
     ) -> None:
         self.path = Path(path)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._secret = _control_secret(control_token)
         self.run_retention_seconds = int(run_retention_seconds)
         self.run_cap = int(run_cap)
+        self.run_retire_seconds = int(run_retire_seconds)
         self._payload: Optional[dict[str, Any]] = None
         self._dirty = False
 
@@ -1645,7 +1652,7 @@ class AllocationLedger:
         return self._payload
 
     def _compact(self, payload: dict[str, Any]) -> int:
-        """Drop old finished runs; never a run with an active claim."""
+        """Slim old inactive runs, retire long-slim ones; never an active one."""
 
         runs = payload["runs"]
 
@@ -1658,39 +1665,55 @@ class AllocationLedger:
                 for item in allocations.values()
             )
 
-        def stamp(run: Mapping[str, Any]) -> datetime:
-            return datetime.fromisoformat(
+        def age(run: Mapping[str, Any]) -> float:
+            updated = datetime.fromisoformat(
                 str(run.get("updated_at") or run.get("created_at"))
             )
+            return (now - updated).total_seconds()
 
         now = datetime.now(timezone.utc)
         inactive = sorted(
-            (stamp(run), key) for key, run in runs.items() if not active(run)
+            ((age(run), key) for key, run in runs.items() if not active(run)),
+            reverse=True,
         )
-        evict = [
+        retire = [
             key
-            for updated, key in inactive
-            if (now - updated).total_seconds() > self.run_retention_seconds
+            for seconds, key in inactive
+            if runs[key].get("compacted") is True
+            and seconds > self.run_retire_seconds
         ]
-        overflow = len(runs) - len(evict) - self.run_cap
+        full = [
+            (seconds, key)
+            for seconds, key in inactive
+            if runs[key].get("compacted") is not True
+        ]
+        slim = [key for seconds, key in full if seconds > self.run_retention_seconds]
+        full_runs = sum(1 for run in runs.values() if run.get("compacted") is not True)
+        overflow = full_runs - len(slim) - self.run_cap
         if overflow > 0:
-            chosen = set(evict)
-            evict.extend(
-                [key for _, key in inactive if key not in chosen][:overflow]
-            )
+            chosen = set(slim)
+            slim.extend([key for _, key in full if key not in chosen][:overflow])
+        for key in slim:
+            run = runs[key]
+            for allocation in run.get("allocations", {}).values():
+                for field in _SLIMMED_ALLOCATION_FIELDS:
+                    allocation.pop(field, None)
+            run["compacted"] = True
         retired = payload.setdefault("retired_runs", {})
-        for key in evict:
+        for key in retire:
             del runs[key]
             # A signed plan has no expiry: remember the key so a late retry
             # is refused instead of resurrecting the run with spent=0.
             retired[key] = _utc_now()
-        if evict:
+        if slim or retire:
             log.info(
-                "allocation ledger compacted: %d runs dropped, %d kept",
-                len(evict),
+                "allocation ledger compacted: %d runs slimmed, %d retired, "
+                "%d kept",
+                len(slim),
+                len(retire),
                 len(runs),
             )
-        return len(evict)
+        return len(slim) + len(retire)
 
     def flush(self, *, force: bool = False) -> bool:
         """Compact and persist a dirty ledger; ``False`` when nothing to do."""

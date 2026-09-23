@@ -868,13 +868,34 @@ def _stored_run(run_id: str, updated_at: str, *, active: bool) -> dict:
         "run_id": run_id,
         "created_at": updated_at,
         "updated_at": updated_at,
+        "spent_provider_bytes": 7,
         "allocations": {
-            "a": {"active_claim": {"started_at": updated_at} if active else None}
+            "a": {
+                "active_claim": {"started_at": updated_at} if active else None,
+                "budget_bytes": 10,
+                "spent_provider_bytes": 7,
+                "completed": True,
+                "units": ["u"] * 3,
+                "lease_stats": [{"attempt_provider_bytes": 7}],
+            }
         },
     }
 
 
-def test_flush_compacts_old_inactive_runs_and_keeps_active_and_fresh(tmp_path):
+def _is_slim(run: dict) -> bool:
+    allocation = run["allocations"]["a"]
+    return (
+        run.get("compacted") is True
+        and "units" not in allocation
+        and "lease_stats" not in allocation
+        # What the pre-#1350 binary needs to refuse re-minting it.
+        and allocation["spent_provider_bytes"] == 7
+        and allocation["completed"] is True
+        and allocation["budget_bytes"] == 10
+    )
+
+
+def test_flush_slims_old_inactive_runs_and_keeps_active_and_fresh(tmp_path):
     from datetime import datetime, timedelta, timezone
 
     now = datetime.now(timezone.utc)
@@ -889,35 +910,14 @@ def test_flush_compacts_old_inactive_runs_and_keeps_active_and_fresh(tmp_path):
     path.write_text(json.dumps({"schema_version": 1, "runs": runs}))
     ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
     assert ledger.flush(force=True) is True
-    assert set(_stored(path)["runs"]) == {"old-active", "fresh-done"}
-    assert set(_stored(path)["retired_runs"]) == {"old-done"}
+    stored = _stored(path)["runs"]
+    assert set(stored) == {"old-done", "old-active", "fresh-done"}
+    assert _is_slim(stored["old-done"])
+    assert stored["old-active"] == runs["old-active"]
+    assert stored["fresh-done"] == runs["fresh-done"]
 
 
-def test_retired_run_cannot_be_resurrected_by_a_late_claim(tmp_path):
-    """Compaction must not mint a fresh allowance for a still-signed plan."""
-
-    plan = _plan(tmp_path)
-    allocation = plan.allocations[0]
-    path = tmp_path / "allocations.json"
-    ledger = AllocationLedger(
-        path, control_token=CONTROL_TOKEN, run_retention_seconds=0
-    )
-    claim = ledger.claim(plan, allocation.allocation_id, attempt_id="try-1")
-    ledger.consume(plan, claim, 10)
-    ledger.finish(
-        plan,
-        claim,
-        lease_id="lease-1",
-        endpoint_request_provider_bytes={"event": [10]},
-        completed=False,
-    )
-    assert _stored(path)["runs"] == {}, "retention 0 retires the finished run"
-    for reader in (ledger, AllocationLedger(path, control_token=CONTROL_TOKEN)):
-        with pytest.raises(AllocationAccountingError, match="retired"):
-            reader.claim(plan, allocation.allocation_id, attempt_id="try-2")
-
-
-def test_run_cap_drops_oldest_inactive_but_never_an_active_run(tmp_path):
+def test_run_cap_slims_oldest_inactive_but_never_an_active_run(tmp_path):
     from datetime import datetime, timedelta, timezone
 
     now = datetime.now(timezone.utc)
@@ -933,8 +933,83 @@ def test_run_cap_drops_oldest_inactive_but_never_an_active_run(tmp_path):
     path.write_text(json.dumps({"schema_version": 1, "runs": runs}))
     ledger = AllocationLedger(path, control_token=CONTROL_TOKEN, run_cap=3)
     ledger.flush(force=True)
-    # run-0 is the oldest but active; run-1/run-2 are the oldest inactive.
-    assert set(_stored(path)["runs"]) == {"run-0", "run-4", "run-5"}
+    stored = _stored(path)["runs"]
+    # run-0 is the oldest but active; run-1..run-3 are the oldest inactive.
+    assert sorted(key for key, run in stored.items() if _is_slim(run)) == [
+        "run-1",
+        "run-2",
+        "run-3",
+    ]
+    assert stored["run-0"] == runs["run-0"]
+
+
+def test_long_slim_runs_are_retired_and_remembered(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    path = tmp_path / "allocations.json"
+    ancient = _stored_run("ancient", (now - timedelta(days=31)).isoformat(), active=False)
+    ancient_active = _stored_run(
+        "ancient-active", (now - timedelta(days=31)).isoformat(), active=True
+    )
+    path.write_text(
+        json.dumps(
+            {"schema_version": 1, "runs": {"ancient": ancient, "ancient-active": ancient_active}}
+        )
+    )
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    ledger.flush(force=True)
+    assert _is_slim(_stored(path)["runs"]["ancient"]), "slimmed first"
+    ledger._dirty = True
+    ledger.flush()
+    stored = _stored(path)
+    assert set(stored["runs"]) == {"ancient-active"}
+    assert set(stored["retired_runs"]) == {"ancient"}
+
+
+def _finished_once(tmp_path, **ledger_options):
+    plan = _plan(tmp_path)
+    allocation = plan.allocations[0]
+    path = tmp_path / "allocations.json"
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN, **ledger_options)
+    claim = ledger.claim(plan, allocation.allocation_id, attempt_id="try-1")
+    ledger.consume(plan, claim, 10)
+    ledger.finish(
+        plan,
+        claim,
+        lease_id="lease-1",
+        endpoint_request_provider_bytes={"event": [10]},
+        completed=True,
+    )
+    return plan, allocation, path, ledger
+
+
+def test_slimmed_run_keeps_refusing_a_late_claim_even_without_tombstones(tmp_path):
+    """Rollback: the pre-#1350 binary ignores ``retired_runs`` — a slimmed run
+    must still carry enough to refuse re-minting the allocation."""
+
+    plan, allocation, path, ledger = _finished_once(tmp_path, run_retention_seconds=0)
+    (run,) = _stored(path)["runs"].values()
+    assert run["compacted"] is True
+    assert run["allocations"][allocation.allocation_id]["spent_provider_bytes"] == 10
+    stored = _stored(path)
+    stored.pop("retired_runs", None)
+    path.write_text(json.dumps(stored))
+    for reader in (ledger, AllocationLedger(path, control_token=CONTROL_TOKEN)):
+        with pytest.raises(DuplicateAllocation):
+            reader.claim(plan, allocation.allocation_id, attempt_id="try-2")
+
+
+def test_retired_run_cannot_be_resurrected_by_a_late_claim(tmp_path):
+    plan, allocation, path, ledger = _finished_once(
+        tmp_path, run_retention_seconds=0, run_retire_seconds=0
+    )
+    ledger._dirty = True
+    ledger.flush()  # slimmed by finish, retired by this flush
+    assert _stored(path)["runs"] == {}
+    for reader in (ledger, AllocationLedger(path, control_token=CONTROL_TOKEN)):
+        with pytest.raises(AllocationAccountingError, match="retired"):
+            reader.claim(plan, allocation.allocation_id, attempt_id="try-2")
 
 
 def test_restart_before_flush_loses_consume_until_wal_replays_it(tmp_path):
