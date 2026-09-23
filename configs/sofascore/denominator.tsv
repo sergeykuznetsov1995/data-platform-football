@@ -142,7 +142,7 @@ tournament_id	capture_key	name	class	queue_priority	basis
 340	SS-340	Johan Cruijff Schaal	core	1	G1:CORE взрослые мужские
 341	SS-341	Supercoppa Italiana	core	1	G1:CORE взрослые мужские
 345	SS-345	Supertaça	core	1	G1:CORE взрослые мужские
-346	SS-346	Community Shield	amateur	9	G1:2 региональные/любительские
+346	SS-346	Community Shield	core	1	G1:2 → core (суперкубок, не любители)
 347	SS-347	Scottish Cup	core	1	G1:CORE взрослые мужские
 348	SS-348	North Macedonia Cup	core	1	G1:CORE взрослые мужские
 355	SS-355	Cupa României Betano	core	1	G1:CORE взрослые мужские
@@ -647,7 +647,7 @@ tournament_id	capture_key	name	class	queue_priority	basis
 18477	SS-18477	Ligue 1	core	1	G1:CORE взрослые мужские
 18491	SS-18491	Egyptian League Cup	core	1	G1:CORE взрослые мужские
 18526	SS-18526	Iranian Super Cup	core	1	G1:CORE взрослые мужские
-18531	SS-18531	Singapore Community Shield	amateur	9	G1:2 региональные/любительские
+18531	SS-18531	Singapore Community Shield	core	1	G1:2 → core (суперкубок, не любители)
 18537	SS-18537	Libyan Cup	core	1	G1:CORE взрослые мужские
 18539	SS-18539	Hun Sen Cup	core	1	G1:CORE взрослые мужские
 18559	SS-18559	Uzbekistan Pro League	core	1	G1:CORE взрослые мужские
