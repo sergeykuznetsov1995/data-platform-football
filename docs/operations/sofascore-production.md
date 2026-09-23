@@ -468,6 +468,38 @@ s.clear_failed(p, campaign_id=cid, scope_key=f'{cid}:<tournament_id>:<source_sea
 Ручное снятие не считается вмешательством вехи 2. Схема `failures.json` осталась
 `schema_version: 1`: старые записи без новых полей читаются как `streak_no_traffic = 0`.
 
+## Таблица отказов (#1352)
+
+Одна плохая строка больше не валит пачку: она уходит в `bronze.sofascore_rejected_rows`, остальное
+пишется, фаза зелёная.
+
+- **Что попадает.** Матчи — построчные нарушения DQ до MERGE (`dags/utils/sofascore_dq.py`,
+  `validate_table_rows` → `DQReport.partition`) по events / event_participants / lineups / incidents:
+  `invalid_enum_value` (например, `gender` не `M`), `required_field_loss`, `null_natural_key`,
+  `duplicate_natural_key` (первая строка ключа остаётся, остальные — отказ). Игроки — запись с
+  `schema_error` и `player row target mismatch` (`reason_code=schema_error`).
+- **Что происходит с матчем.** Матч, у которого отказана строка (кроме повторов ключа), не
+  пишется ни в одну таблицу целиком — полуматчей в bronze нет. Его эндпоинты в манифесте получают
+  `schema_error` с `error_type=RowRejected`: нетерминально, поэтому следующий проход полосы
+  переигрывает их из raw с нулём запросов к источнику; если строка всё ещё плохая — новая строка
+  журнала с новым `run_id`. Игрок со `schema_error` не мешает лиге; порог покрытия профилей
+  95 % остаётся (больше 5 % битых — красный честный).
+- **Когда всё-таки красный.** Отказаны все строки таблицы (или все матчи пачки) — это дефект
+  парсера/контракта: ошибка `all N rows of <table> rejected: <code>` в `errors[]`.
+- **Схема.** `table_name, natural_key, reason_code, reason, row_json, league, season, run_id, phase,
+  parser_stage, rejected_at`; партиции `(league, season)`; ключ MERGE `(table_name, natural_key,
+  run_id)`. Таблицу создаёт первая запись (`save_to_iceberg` → `IcebergWriter` создаёт таблицу, если
+  её нет); она же объявлена в `scripts/migrate_sofascore_production.py` (`SOFASCORE_REJECTED_ROWS`).
+- **Где смотреть.** Счётчики прогона — `rejected_rows: {таблица: {код: n}}` и `rejected_players` в
+  отчёте фазы раннера и в `phases[]` файла `all-men/results/<hash>.json`. Журнал:
+  `bash ~/.claude/bin/trino-ro.sh "SELECT reason_code, cast(count(*) AS varchar) FROM
+  bronze.sofascore_rejected_rows GROUP BY 1 UNION ALL SELECT '__sentinel__','0'"`.
+- **Как перезаписать после починки.** Починка парсера/контракта едет обычной ночной доставкой;
+  после неё первый же проход полосы по этому сезону переигрывает отказанные записи из raw
+  (0 трафика) и публикует их. Сезон, по которому полоса больше не ходит (закрытый скоуп истории), —
+  ручной прогон фазы матчей/игроков раннера с `--offline-replay` (только raw, запросов к источнику нет)
+  по слову владельца. Строки журнала не удаляются — это история отказов.
+
 ## Мины, которые уже стреляли
 
 - Дерево 0700 от `mktemp` → шлюз в цикле `Permission denied` (25.08); `freeze_release.sh`
