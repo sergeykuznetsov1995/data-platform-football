@@ -103,20 +103,36 @@ def run_phase(
     plan_phase = "season" if phase == "season" else "targets"
     entity = "all" if phase == "season" else "match_capture"
     dag_id = str(scope.get("dag_id") or "dag_backfill_sofascore_all_mens")
-    plan = prepare_workload_plan(
-        dag_id=dag_id,
-        base_run_id=base_run_id,
-        phase=plan_phase,
-        competition_seasons=[CompetitionSeason(capture_key, canonical)],
-        artifact_path=workload_artifact,
-        output_path=destination / f"{plan_phase}-plan.json",
-        raw_store_uri=scope.get("raw_store_uri"),
-        manifest_backend=str(scope.get("manifest_backend") or "trino"),
-        force_replace=bool(scope.get("force_replace")),
-        allow_inactive_season=True,
-        season_freshness_key="final",
-        season_evidence=str(scope.get("season_evidence") or "pages"),
-    )
+    try:
+        plan = prepare_workload_plan(
+            dag_id=dag_id,
+            base_run_id=base_run_id,
+            phase=plan_phase,
+            competition_seasons=[CompetitionSeason(capture_key, canonical)],
+            artifact_path=workload_artifact,
+            output_path=destination / f"{plan_phase}-plan.json",
+            raw_store_uri=scope.get("raw_store_uri"),
+            manifest_backend=str(scope.get("manifest_backend") or "trino"),
+            force_replace=bool(scope.get("force_replace")),
+            allow_inactive_season=True,
+            season_freshness_key="final",
+            season_evidence=str(scope.get("season_evidence") or "pages"),
+        )
+    except Exception as exc:
+        # #1351: a plan that cannot be prepared from the scope's stored state
+        # (schema-rejected raw, max_pages) is a failed phase with its reason,
+        # not a cycle result with ``phases=[]`` that reads as unknown traffic
+        # and never builds a quarantine streak (урок 101).  Preparation reads
+        # only local raw, the manifest and config — it sends no request to the
+        # source, so 0 is the measured count, not a guess.
+        return {
+            "phase": phase,
+            "status": "failed",
+            "exit_code": None,
+            "plan": None,
+            "errors": [f"workload_plan_prepare: {type(exc).__name__}: {exc}"],
+            "source_request_count": 0,
+        }
     argv = [
         "--entity", entity,
         "--league", capture_key,

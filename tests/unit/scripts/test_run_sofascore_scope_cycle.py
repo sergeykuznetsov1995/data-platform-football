@@ -538,3 +538,95 @@ def test_runner_fail_closed_before_capture_reaches_quarantine_as_zero_requests(
         )
     record = state.read_failures(failures, campaign_id="c")["c:17:76986"]
     assert state.is_quarantined_record(record, 3)
+
+
+@pytest.mark.unit
+def test_failed_plan_preparation_is_a_zero_request_phase_that_quarantines(
+    tmp_path, monkeypatch
+):
+    """#1351 (Astra r3): ``prepare_workload_plan`` failing on the scope's
+    stored state (schema-rejected raw, ``max_pages``) before the runner left
+    the cycle result with ``phases=[]``: the attempt read as «unknown
+    traffic», never built a quarantine streak and came back from the park
+    forever. The failure is a phase with its reason and 0 source requests
+    (preparation never talks to the source), so three identical ones
+    quarantine the scope — through the real preparation code."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from dags.utils import sofascore_all_mens_state as state
+    from scrapers.sofascore.season_pipeline import SeasonPlanningError
+    from scrapers.sofascore.workload_plan import WorkloadBudgetPolicy
+
+    # The checked-in medallion config stands in for the rendered overlay.
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        Path(__file__).resolve().parents[3]
+        / "configs" / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(
+        cycle,
+        "load_exact_scope",
+        lambda *a, **k: {**_scope(), "capture_key": "ENG-Premier League"},
+    )
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", "b" * 64)
+    catalog = MagicMock()
+    catalog.competition.return_value = SimpleNamespace(
+        capture_allowed=True, unique_tournament_id=17
+    )
+    catalog.resolve_source_season.return_value = SimpleNamespace(
+        season_id=76986, format="split_year"
+    )
+    runner = MagicMock(side_effect=AssertionError("runner must not start"))
+    broken = SeasonPlanningError(
+        "stored schedule_last raw failed schema validation"
+    )
+    result_path = tmp_path / "result.json"
+    failures = tmp_path / "failures.json"
+
+    for run_id in ("r1", "r2", "r3"):
+        with (
+            patch(
+                "dags.scripts.prepare_sofascore_workload.load_static_workload_policy",
+                return_value=WorkloadBudgetPolicy("b" * 64, {}),
+            ),
+            patch(
+                "dags.scripts.prepare_sofascore_workload.build_capture_runtime",
+                return_value=SimpleNamespace(
+                    raw_store=MagicMock(), manifest_store=MagicMock()
+                ),
+            ),
+            patch(
+                "dags.scripts.prepare_sofascore_workload.SofaScoreCatalog.load",
+                return_value=catalog,
+            ),
+            patch(
+                "dags.scripts.prepare_sofascore_workload.plan_season_partition",
+                side_effect=broken,
+            ),
+            patch("dags.scripts.run_sofascore_scraper.main", runner),
+        ):
+            assert cycle.main(_cycle_argv(tmp_path, "--phase", "season")) == 1
+
+        result = json.loads(result_path.read_text())
+        assert result["status"] == "failed"
+        [phase] = result["phases"]
+        assert phase["phase"] == "season"
+        assert phase["status"] == "failed"
+        assert phase["source_request_count"] == 0
+        assert result["errors"][0].startswith(
+            "season: workload_plan_prepare: RuntimeError: every SofaScore "
+            "partition was dropped from the season plan"
+        )
+        reason, source_requests = state.read_scope_outcome(result_path)
+        assert source_requests == 0
+        state.mark_failed(
+            failures, campaign_id="c", scope_key="c:17:76986", run_id=run_id,
+            reason=reason, source_requests=source_requests, release="aaaaaaaa",
+        )
+
+    runner.assert_not_called()
+    record = state.read_failures(failures, campaign_id="c")["c:17:76986"]
+    assert record["streak_no_traffic"] == 3
+    assert state.is_quarantined_record(record, 3)
