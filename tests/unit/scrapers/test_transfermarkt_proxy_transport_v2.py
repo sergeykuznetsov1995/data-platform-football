@@ -1431,3 +1431,37 @@ def test_lease_close_gives_up_when_the_drain_never_settles():
 
     assert naps == [0.2, 0.5, 1.0, 2.0]
     assert len(control.calls) == 5
+
+
+@pytest.mark.unit
+def test_pseudo_status_logs_the_proxy_status_line(monkeypatch, caplog):
+    """#1389: a dead exit must say what the gateway answered, not just http=0."""
+
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(8 * 1024 * 1024))
+    monkeypatch.delenv("TRANSFERMARKT_RAW_STORE_URI", raising=False)
+    provider = _FakeLeaseProvider([])
+    dead = _Response(b"", status=0)
+    classified = _Response(b"", status=0)
+    classified.headers = {"x-proxy-upstream-status": "407"}
+    factory = _TlsFactory([dead, classified, _Response(b"ok")])
+    client = TransfermarktHttpClient(
+        lease_provider=provider,
+        lease_metadata=_metadata(),
+        client_factory=factory,
+        sleep_fn=lambda _: None,
+    )
+
+    with caplog.at_level("WARNING", logger="scrapers.transfermarkt.client"):
+        outcome = client.fetch(
+            "https://www.transfermarkt.us/a", as_json=False, max_attempts=3,
+        )
+
+    assert outcome.status is FetchStatus.OK
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "attempt" in record.getMessage()
+    ]
+    assert len(lines) == 2
+    assert "transport:connection:TransportStatusError" in lines[0]
+    assert "proxy_status=0 upstream_class=нет класса от шлюза" in lines[0]
+    assert "proxy_status=0 upstream_class=407" in lines[1]
