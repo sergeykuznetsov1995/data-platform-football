@@ -2125,6 +2125,18 @@ class TransfermarktHttpClient:
                 self._avoid_on_next_client(proxy_obj)
                 self._discard_failed_transport(label=label)
                 if attempt >= attempts_cap:
+                    # #1389: the last (or only) attempt still names the
+                    # gateway's answer — the loop exits before the shared
+                    # warning below.
+                    logger.warning(
+                        "%s attempt %d/%d failed (%s): %s%s",
+                        label,
+                        attempt,
+                        attempts_cap,
+                        context or url,
+                        last_error,
+                        proxy_status,
+                    )
                     break
 
             logger.warning(

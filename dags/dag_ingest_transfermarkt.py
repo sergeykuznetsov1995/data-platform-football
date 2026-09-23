@@ -177,12 +177,8 @@ def _probe_gateway_exit(
     }
 
 
-def _preflight_reader_route_for_paid_cycle(**context: Any) -> dict[str, Any]:
-    """Pin the live reader revision and inactive slot, then probe the gateway.
-
-    The gateway probe is the only paid request before planning: a dead pool
-    turns the run red here, before any mapped child spends its budget.
-    """
+def _preflight_reader_route_for_paid_cycle() -> dict[str, Any]:
+    """Pin the live reader revision and inactive slot before any proxy I/O."""
 
     if not _truthy_env('TM_NATIVE_V2_ENABLED'):
         raise AirflowException(
@@ -265,14 +261,6 @@ def _preflight_reader_route_for_paid_cycle(**context: Any) -> dict[str, Any]:
         cur.close()
         conn.close()
 
-    dag = context.get('dag')
-    gateway_probe = _probe_gateway_exit(
-        dag_id=str(getattr(dag, 'dag_id', '') or 'dag_ingest_transfermarkt'),
-        run_id=str(
-            context.get('run_id')
-            or os.environ.get('AIRFLOW_CTX_DAG_RUN_ID', '')
-        ),
-    )
     return {
         'active_version': state.active_version,
         'active_slot': state.active_slot,
@@ -283,7 +271,6 @@ def _preflight_reader_route_for_paid_cycle(**context: Any) -> dict[str, Any]:
             'native-only'
             if state.legacy_writers_disabled_at is not None else 'dual'
         ),
-        'gateway_probe': gateway_probe,
         'paid_io_allowed': True,
     }
 
@@ -525,6 +512,13 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
                 ],
             })
         mapped_envs.append(environment)
+    # #1389: the gateway probe is the one paid request before the children, and
+    # it runs only after every approval above has passed — a run that is
+    # refused never spends it.  A dead pool fails the run here, one task, before
+    # any mapped child starts.
+    _probe_gateway_exit(
+        dag_id=str(context['dag'].dag_id), run_id=str(context['run_id']),
+    )
     return mapped_envs
 
 

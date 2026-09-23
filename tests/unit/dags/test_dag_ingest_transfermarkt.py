@@ -29,6 +29,18 @@ def _reload_dag_module():
 
 @pytest.fixture
 def dag_module():
+    # #1389: plan_exact_scopes ends with a paid gateway probe.  Unit tests of
+    # the DAG never touch the network: record the calls instead.
+    module = _reload_dag_module()
+    module.probe_calls = []
+    module._probe_gateway_exit = (
+        lambda **kw: module.probe_calls.append(kw) or {'status_code': 200}
+    )
+    return module
+
+
+@pytest.fixture
+def real_probe_module():
     return _reload_dag_module()
 
 
@@ -1394,14 +1406,8 @@ class TestReaderPreflight:
         monkeypatch.setattr(
             tm_v2, 'verify_reader_views', lambda *a, **kw: {'passed': True},
         )
-        probes = []
-        monkeypatch.setattr(
-            dag_module, '_probe_gateway_exit',
-            lambda **kw: probes.append(kw) or {'status_code': 200},
-        )
-        result = dag_module._preflight_reader_route_for_paid_cycle(run_id='r-1')
-        assert probes == [{'dag_id': 'dag_ingest_transfermarkt', 'run_id': 'r-1'}]
-        assert result['gateway_probe'] == {'status_code': 200}
+        result = dag_module._preflight_reader_route_for_paid_cycle()
+        assert dag_module.probe_calls == []
         assert result['revision'] == 9
         assert result['candidate_slot'] == 'b'
         assert result['write_mode'] == 'dual'
@@ -1485,12 +1491,12 @@ class _ProbeLeaseProvider:
 class TestGatewayProbe:
     """#1389: one paid request before planning; a dead gateway fails early."""
 
-    def _probe(self, dag_module, monkeypatch, responses):
+    def _probe(self, real_probe_module, monkeypatch, responses):
         monkeypatch.delenv('TRANSFERMARKT_RAW_STORE_URI', raising=False)
         monkeypatch.delenv('TRANSFERMARKT_REQUIRE_RAW_STORE', raising=False)
         provider = _ProbeLeaseProvider()
         factory = _ProbeTlsFactory(responses)
-        call = lambda: dag_module._probe_gateway_exit(  # noqa: E731
+        call = lambda: real_probe_module._probe_gateway_exit(  # noqa: E731
             dag_id='dag_ingest_transfermarkt',
             run_id='scheduled__2026-09-25T04:00:00+00:00',
             lease_provider=provider,
@@ -1498,50 +1504,50 @@ class TestGatewayProbe:
         )
         return call, provider, factory
 
-    def test_real_page_passes_and_closes_the_lease(self, dag_module, monkeypatch):
+    def test_real_page_passes_and_closes_the_lease(self, real_probe_module, monkeypatch):
         call, provider, factory = self._probe(
-            dag_module, monkeypatch, [_ProbeResponse(b'x' * 70 * 1024)],
+            real_probe_module, monkeypatch, [_ProbeResponse(b'x' * 70 * 1024)],
         )
         result = call()
         assert result['status_code'] == 200
         assert result['body_bytes'] == 70 * 1024
         assert len(provider.acquired) == 1
         assert provider.closed == ['lease-1']
-        assert factory.clients[0].calls == [dag_module.GATEWAY_PROBE_URL]
+        assert factory.clients[0].calls == [real_probe_module.GATEWAY_PROBE_URL]
         metadata = provider.acquired[0][1]
         assert metadata['dag_id'] == 'dag_ingest_transfermarkt'
-        assert metadata['canonical_url'] == dag_module.GATEWAY_PROBE_URL
+        assert metadata['canonical_url'] == real_probe_module.GATEWAY_PROBE_URL
 
-    def test_gateway_502_fails_with_gateway_class(self, dag_module, monkeypatch):
+    def test_gateway_502_fails_with_gateway_class(self, real_probe_module, monkeypatch):
         call, provider, _ = self._probe(
-            dag_module, monkeypatch, [_ProbeResponse(b'bad gateway', status=502)],
+            real_probe_module, monkeypatch, [_ProbeResponse(b'bad gateway', status=502)],
         )
         with pytest.raises(Exception, match=r'шлюз/пул: http=502'):
             call()
         assert provider.closed == ['lease-1']
 
     def test_pseudo_status_fails_with_transport_class(
-        self, dag_module, monkeypatch,
+        self, real_probe_module, monkeypatch,
     ):
         call, provider, _ = self._probe(
-            dag_module, monkeypatch, [_ProbeResponse(b'', status=0)],
+            real_probe_module, monkeypatch, [_ProbeResponse(b'', status=0)],
         )
         with pytest.raises(Exception, match=r'шлюз/пул: transport:'):
             call()
         assert provider.closed == ['lease-1']
 
-    def test_small_200_body_is_not_the_source(self, dag_module, monkeypatch):
+    def test_small_200_body_is_not_the_source(self, real_probe_module, monkeypatch):
         call, provider, _ = self._probe(
-            dag_module, monkeypatch, [_ProbeResponse(b'x' * 10 * 1024)],
+            real_probe_module, monkeypatch, [_ProbeResponse(b'x' * 10 * 1024)],
         )
         with pytest.raises(Exception, match=r'шлюз/пул: body 10240 байт'):
             call()
         assert provider.closed == ['lease-1']
 
-    def test_lease_refusal_is_a_gateway_verdict(self, dag_module, monkeypatch):
+    def test_lease_refusal_is_a_gateway_verdict(self, real_probe_module, monkeypatch):
         from scrapers.transfermarkt.models import ProxyRequiredError
 
-        call, provider, _ = self._probe(dag_module, monkeypatch, [])
+        call, provider, _ = self._probe(real_probe_module, monkeypatch, [])
 
         def refuse(**kwargs):
             raise ProxyRequiredError('proxy lease API rejected POST /v1/leases')
@@ -1550,27 +1556,41 @@ class TestGatewayProbe:
         with pytest.raises(Exception, match=r'шлюз/пул: ProxyRequiredError'):
             call()
 
-    def test_failed_probe_stops_the_run_before_planning(
-        self, dag_module, monkeypatch,
+    def test_probe_runs_after_approvals_and_fails_the_plan(
+        self, dag_module, monkeypatch, tmp_path,
     ):
-        from utils import transfermarkt_native_v2 as tm_v2
+        gate = TestStandingPolicyGate()
+        gate._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        context = gate._context(dag_module, gate._standing_params(dag_module))
 
-        monkeypatch.setenv('TM_NATIVE_V2_ENABLED', 'true')
-        state = tm_v2.ReaderState(
-            exists=True, active_version='v2', active_slot='a', revision=9,
-        )
-        monkeypatch.setattr(tm_v2, 'connect', lambda: MagicMock())
-        monkeypatch.setattr(tm_v2, 'read_reader_state', lambda *a, **kw: state)
-        monkeypatch.setattr(
-            tm_v2, 'verify_reader_views', lambda *a, **kw: {'passed': True},
-        )
+        assert len(dag_module._plan_exact_scopes(**context)) == 1
+        assert dag_module.probe_calls == [{
+            'dag_id': 'dag_ingest_transfermarkt',
+            'run_id': 'scheduled__2026-07-13',
+        }]
 
         def dead(**kwargs):
             raise dag_module.AirflowException('шлюз/пул: http=502')
 
         monkeypatch.setattr(dag_module, '_probe_gateway_exit', dead)
         with pytest.raises(Exception, match='шлюз/пул'):
-            dag_module._preflight_reader_route_for_paid_cycle(run_id='r-1')
+            dag_module._plan_exact_scopes(**context)
+
+    def test_refused_run_never_spends_the_probe(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        gate = TestStandingPolicyGate()
+        gate._arm(dag_module, monkeypatch, tmp_path)
+        monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(
+                **gate._context(dag_module, gate._standing_params(dag_module)),
+            )
+        assert dag_module.probe_calls == []
 
 
 def _child(map_index, state):

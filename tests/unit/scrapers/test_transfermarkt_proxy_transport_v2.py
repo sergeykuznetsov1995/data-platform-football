@@ -1465,3 +1465,34 @@ def test_pseudo_status_logs_the_proxy_status_line(monkeypatch, caplog):
     assert "transport:connection:TransportStatusError" in lines[0]
     assert "proxy_status=0 upstream_class=нет класса от шлюза" in lines[0]
     assert "proxy_status=0 upstream_class=407" in lines[1]
+
+
+@pytest.mark.unit
+def test_single_attempt_transport_failure_still_logs_the_proxy_status(
+    monkeypatch, caplog,
+):
+    """#1389 (Astra r1 #4): max_attempts=1 — the probe's shape — must log too."""
+
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(8 * 1024 * 1024))
+    monkeypatch.delenv("TRANSFERMARKT_RAW_STORE_URI", raising=False)
+    dead = _Response(b"", status=0)
+    dead.headers = {"X-Proxy-Upstream-Status": "dead_exit"}
+    client = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([dead]),
+        sleep_fn=lambda _: None,
+    )
+
+    with caplog.at_level("WARNING", logger="scrapers.transfermarkt.client"):
+        outcome = client.fetch(
+            "https://www.transfermarkt.us/a", as_json=False, max_attempts=1,
+        )
+
+    assert outcome.error == "transport:connection:TransportStatusError"
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "attempt 1/1 failed" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "proxy_status=0 upstream_class=dead_exit" in lines[0]
