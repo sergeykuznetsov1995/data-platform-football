@@ -113,6 +113,29 @@ between read and write aborts with a concurrent-update error; rerun. `enable`
 takes the whole wave in one write and re-checks eligibility per row — enable a
 wave only after its capture budget classes are verified.
 
+## Denominator registry (`denominator.tsv`, #1353)
+
+`denominator.tsv` is the one file that says which tournaments count as ours.
+Columns: `tournament_id capture_key name class queue_priority basis`.
+It covers the 1 504 ids of the frozen campaign snapshot (their sorted-id
+sha256 must equal `candidate_ids_sha256` in `all_mens_campaign.json`) plus the
+daily registry's tournaments that the snapshot lacks, keyed by their
+`canonical_id`. The file never changes the snapshot's id set; it only filters
+and orders on top of it (`scrapers/sofascore/denominator.py`).
+
+`class` decides `queue_priority` (the loader refuses any other pairing):
+
+- `core` → `1`: planned in each lane's usual order;
+- `youth`, `reserve`, `amateur`, `show`, `women`, `unknown` → `9`: planned only
+  after every core scope of every depth;
+- `esoccer`, `student` → `0`: outside the history queue, the refresh queue and
+  the schedule sweep.
+
+A tournament missing from the file is queued with `9` and a warning. To move a
+tournament to another class, edit its one row (`class`, the matching
+`queue_priority`, and `basis` saying why) and ship it; planners reread the file
+on their next plan without a DAG restart.
+
 ## Production table bootstrap
 
 Before the first raw-first deployment, render and inspect the idempotent Iceberg
