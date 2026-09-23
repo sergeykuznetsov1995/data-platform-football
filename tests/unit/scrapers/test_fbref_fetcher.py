@@ -1349,3 +1349,27 @@ def test_failure_without_a_location_header_carries_no_redirect_location():
         )
 
     assert caught.value.redirect_location is None
+
+
+def test_exhausted_byte_budget_is_still_hard_transport_policy():
+    """#1385 absorbs a single response's overrun, but an exhausted session
+    total stays a hard transport policy stop, whatever its label."""
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 7,
+        "real_bytes_downloaded": 800_000,
+        "byte_budget_exhausted": True,
+        "byte_budget_failure": "session_byte_cap_exceeded:4194400>4194304",
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "session_byte_cap_exceeded:4194400>4194304" in str(raised.value)

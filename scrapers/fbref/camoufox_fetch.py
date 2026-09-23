@@ -110,8 +110,10 @@ BROWSER_REQUEST_FIXED_OVERHEAD_BYTES = 64 * 1024
 # Content-Length at all, so an undeclared body is the norm on the clearance
 # path rather than an attack. A declared smaller body shrinks the reservation
 # after response headers; an undeclared body keeps the ceiling. A body that
-# outgrows it aborts the session, and a ceiling that does not fit the remaining
-# budget aborts in route() before any socket is opened.
+# outgrows its reservation is an overrun charged to the session budget (#1385):
+# the session aborts only when the overrun no longer fits max_network_bytes,
+# and a ceiling that does not fit the remaining budget aborts in route() before
+# any socket is opened.
 BROWSER_UNDECLARED_BODY_RESERVATION_BYTES = 512 * 1024
 UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES = (
     BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
@@ -572,6 +574,10 @@ class CamoufoxFbrefTransport:
         self._browser_watchdog_kills = 0
         self._navigation_attempts = 0
         self._budget_blocked_count = 0
+        # #1385: responses that outgrew their per-request reservation and were
+        # absorbed by the session byte budget instead of aborting the session.
+        self._reservation_overruns = 0
+        self._reservation_overrun_bytes = 0
         self._inflight_byte_reservations: Dict[int, int] = {}
         # Playwright/Firefox may hand a *different* Request wrapper to later
         # callbacks. Stable Playwright GUID is the primary identity; URL is a
@@ -1618,6 +1624,58 @@ class CamoufoxFbrefTransport:
         # forever holding its leases.  `route()` refuses every further request
         # while the flag is set, and `fetch()` closes the session on its way out.
 
+    def _absorb_reservation_overrun(
+        self,
+        req,
+        *,
+        needed: int,
+        reserved: int,
+        reason: str,
+        reservation_key: Optional[int] = None,
+    ) -> bool:
+        """Charge a response that outgrew its reservation to the session cap.
+
+        The per-request reservation is an admission estimate, not a cap: one
+        bootstrap XHR of 592 492 bytes against a 589 824-byte reservation killed
+        the whole 23.09 run while the 16 MiB session budget was 5 % spent
+        (#1385). The overrun is kept only while the session total still fits
+        ``max_network_bytes``; otherwise the session aborts as before.
+
+        With ``reservation_key`` the request is still in flight: its reservation
+        grows to ``needed`` and the fit check adds the growth. Without it the
+        caller has already booked the bytes, so the current total is checked.
+        """
+
+        extra = needed - reserved
+        if extra <= 0:
+            return True
+        unbooked = extra if reservation_key is not None else 0
+        if (
+            self._bytes_total
+            + self._unobserved_reserved_bytes
+            + self._inflight_reserved_bytes
+            + unbooked
+            > self._max_network_bytes
+        ):
+            self._abort_session_for_byte_budget(f"{reason}:{needed}>{reserved}")
+            return False
+        if reservation_key is not None:
+            self._inflight_byte_reservations[reservation_key] = needed
+            self._inflight_reserved_bytes += extra
+        self._reservation_overruns += 1
+        self._reservation_overrun_bytes += extra
+        logger.warning(
+            "Camoufox response outgrew its reservation and was absorbed: "
+            "%s>%s (session total %d/%d)",
+            needed,
+            reserved,
+            self._bytes_total
+            + self._unobserved_reserved_bytes
+            + self._inflight_reserved_bytes,
+            self._max_network_bytes,
+        )
+        return True
+
     def _on_unexpected_websocket(self, websocket) -> None:
         """Fail closed if content requests a WebSocket connection.
 
@@ -1907,10 +1965,17 @@ class CamoufoxFbrefTransport:
                 # ``sizes()`` may have charged an observed value smaller than
                 # the reservation, while an unknown request charged it all.
                 self._unobserved_reserved_bytes += max(0, desired - charged)
-                self._abort_session_for_byte_budget(
-                    "late_declared_body_exceeds_settled_reservation:"
-                    f"{desired}>{reserved}"
-                )
+                if self._absorb_reservation_overrun(
+                    req,
+                    needed=desired,
+                    reserved=reserved,
+                    reason="late_declared_body_exceeds_settled_reservation",
+                ):
+                    # The proven size is now booked: a duplicate of this
+                    # response must neither charge nor count it again.
+                    reserved = desired
+                    charged = max(charged, desired)
+                    validated = True
         guid = self._request_guid(req)
         if validated and guid in self._late_response_accounting_by_guid:
             self._late_response_accounting_by_guid[guid] = (
@@ -2045,9 +2110,14 @@ class CamoufoxFbrefTransport:
 
         desired = self._desired_response_reservation(headers)
         if desired > admitted:
-            self._abort_session_for_byte_budget(
-                "declared_body_exceeds_admission_reservation:"
-                f"{desired - BROWSER_REQUEST_FIXED_OVERHEAD_BYTES}"
+            # Grows the reservation to the declared size, or aborts when the
+            # session budget cannot fit the growth.
+            self._absorb_reservation_overrun(
+                req,
+                needed=desired,
+                reserved=admitted,
+                reason="declared_body_exceeds_admission_reservation",
+                reservation_key=reservation_key,
             )
             return
         self._inflight_byte_reservations[reservation_key] = desired
@@ -2081,26 +2151,35 @@ class CamoufoxFbrefTransport:
                 self._unobserved_reserved_bytes += max(0, int(reserved))
             else:
                 charged = n
+                # Order (#1385): the reservation is already released and the
+                # exact size is booked, so the session total below includes the
+                # overrun exactly once; only a total over the cap aborts.
                 self._record_observed_request_bytes(req, n)
-                if (
-                    self._max_network_bytes is not None
-                    and (
-                        n > reserved
-                        or self._bytes_total
+                if self._max_network_bytes is not None:
+                    self._absorb_reservation_overrun(
+                        req,
+                        needed=n,
+                        reserved=reserved,
+                        reason="completed_size_exceeded_reservation",
+                    )
+                    total = (
+                        self._bytes_total
                         + self._unobserved_reserved_bytes
                         + self._inflight_reserved_bytes
-                        > self._max_network_bytes
                     )
-                ):
-                    self._abort_session_for_byte_budget(
-                        f"completed_size_exceeded_reservation:{n}>{reserved}"
-                    )
+                    if total > self._max_network_bytes:
+                        self._abort_session_for_byte_budget(
+                            "session_byte_cap_exceeded:"
+                            f"{total}>{self._max_network_bytes}"
+                        )
         except Exception:  # noqa: BLE001 — sizes() can race on teardown
             self._unobserved_reserved_bytes += max(0, int(reserved))
         finally:
             self._remember_settled_finished_request(
                 req,
-                reserved=reserved,
+                # An absorbed overrun grew the reservation to the observed
+                # size; a late duplicate response must not count it again.
+                reserved=max(reserved, charged),
                 charged=charged,
                 response_seen=response_seen,
             )
@@ -2527,6 +2606,8 @@ class CamoufoxFbrefTransport:
             "browser_watchdog_kills": self._browser_watchdog_kills,
             "browser_navigation_attempts": self._navigation_attempts,
             "budget_blocked_count": self._budget_blocked_count,
+            "reservation_overruns": self._reservation_overruns,
+            "reservation_overrun_bytes": self._reservation_overrun_bytes,
             "inflight_reserved_bytes": self._inflight_reserved_bytes,
             "unobserved_reserved_bytes": self._unobserved_reserved_bytes,
             "budget_unobserved_bytes": (
