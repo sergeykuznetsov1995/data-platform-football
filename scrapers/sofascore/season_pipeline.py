@@ -211,10 +211,16 @@ def _is_placeholder_team(team: object) -> bool:
     """
     if not isinstance(team, Mapping):
         return False
-    if team.get("disabled") is True:
+    return _is_placeholder_side(team.get("disabled"), team.get("name"), team.get("slug"))
+
+
+def _is_placeholder_side(disabled: object, name: object, slug: object) -> bool:
+    """The stub predicate on a team's flag/name/slug (event object or the
+    flattened ``<side>_team_*`` schedule columns alike)."""
+    if disabled is True:
         return True
-    name = str(team.get("name") or "").strip()
-    slug = str(team.get("slug") or "").strip().casefold()
+    name = str(name or "").strip()
+    slug = str(slug or "").strip().casefold()
     return bool(
         _PLACEHOLDER_TEAM_NAME.fullmatch(name)
         or slug.startswith(("winner-of-", "loser-of-"))
@@ -1140,8 +1146,8 @@ def _is_schedule_identity_conflict(
 
     ``previous`` is the older observation, ``current`` the fresher one. A
     column missing on either copy is not a conflict. A knockout-bracket stub
-    ("Winner of match N", ``<side>_team_disabled`` is True on the older copy;
-    see ``_is_placeholder_team``) resolving into a real team is the source
+    ("Winner of match N", ``<side>_team_disabled`` is True or the name/slug is
+    a stub on the older copy; see ``_is_placeholder_team``) resolving into a real team is the source
     filling in a slot, not a different match.
     """
 
@@ -1153,7 +1159,13 @@ def _is_schedule_identity_conflict(
         return False
     if column in ("home_team_id", "away_team_id"):
         side = column[: -len("_id")]
-        if previous.get(f"{side}_disabled") is True:
+        # Same stub predicate as the team universe (#1351): a named ``W101``
+        # slot without ``disabled`` resolves into the real team too.
+        if _is_placeholder_side(
+            previous.get(f"{side}_disabled"),
+            previous.get(f"{side}_name"),
+            previous.get(f"{side}_slug"),
+        ):
             return False
     return True
 

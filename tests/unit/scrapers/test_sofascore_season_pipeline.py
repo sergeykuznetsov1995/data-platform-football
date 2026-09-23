@@ -1494,6 +1494,80 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
 
 
 @pytest.mark.unit
+def test_runner_signed_season_with_player_universe_gap_publishes_at_zero_traffic(
+    tmp_path,
+    monkeypatch,
+):
+    """#1351 (Astra r1, урок 60): the production shape — a SIGNED plan, real
+    planner/replay/materialize/finalize, every raw already stored — for a
+    season whose participants omit real scheduled clubs (291:84027). It used
+    to fail at 0 traffic every attempt; now it publishes both tables, the
+    manifest commits, and the gap travels in the report."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_complete_partition_roots(
+        raw_store, participants_payload=evidence["partial_participants"]
+    )
+    initial = plan_season_partition(raw_store, manifest, **_common())
+    for spec in initial.specs:
+        if spec.key.endpoint == "squads":
+            _seed_json(raw_store, spec, evidence["nonempty_squad"])
+        elif spec.key.endpoint == "referee_profile":
+            _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
+    engine, transport = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+        sink=DeferredCaptureSink(),
+    )
+    runtime = CaptureRuntime(engine, manifest, raw_store)
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID)
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame.assign(
+        _entity_type=entity,
+        _ingested_at="fixture",
+    )
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: (
+        "iceberg.bronze." + kwargs["table_name"]
+    )
+    output = tmp_path / "season-signed-gap.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=_signed_plan_without_players(),
+            offline_replay=False,
+        )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, payload["errors"]
+    assert payload["errors"] == []
+    assert transport.calls == 0
+    assert [
+        call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
+    ] == ["sofascore_schedule", "sofascore_league_table"]
+    assert payload["schedule_rows"] == 2
+    assert payload["league_table_rows"] == 4
+    assert payload["player_universe_gaps"] == [
+        "participants omitted scheduled team ids: 17,33,44"
+    ]
+    assert payload["traffic"]["player_universe_gaps"] == 1
+    committed = plan_season_partition(raw_store, manifest, **_common())
+    assert committed.match_phase_ready is True
+    assert committed.player_universe_ready is False
+
+
+@pytest.mark.unit
 def test_runner_season_merges_bronze_inside_the_writer_lock(tmp_path, monkeypatch):
     """D5: both season MERGEs run under one writer-lock span; the manifest is
     finalized only after the lock is released."""
@@ -2149,7 +2223,12 @@ def _replayed_partition_with_cross_page_repeat(
             seeded["tournament"] = {"isLive": True}
         event["awayTeam"]["shortName"] = "Zwolle"
         event["tournament"] = {"isLive": False}
-    if placeholder_home:
+    if placeholder_home == "named":
+        # #1351: a stub recognised only by its name, without ``disabled``.
+        schedule_last_payload["events"][0]["homeTeam"] = {
+            "id": 999903, "name": "W101", "slug": "w101", "gender": "M",
+        }
+    elif placeholder_home:
         schedule_last_payload["events"][0]["homeTeam"] = _placeholder_team(999901)
     if mutate:
         # Reproduce the 2026-08-20 production repeat exactly: the source moved
@@ -2298,6 +2377,32 @@ def test_partition_materializer_collapses_placeholder_resolved_on_later_page(
     assert repeats[0]["source_page_direction"] == "next"
     assert str(repeats[0]["home_team_id"]) == "42"
     assert repeats[0].get("home_team_disabled") is not True
+
+
+@pytest.mark.unit
+def test_partition_materializer_collapses_named_placeholder_resolved_later(
+    tmp_path,
+):
+    """#1351 (Astra r1): the cross-page dedup must use the same stub predicate
+    as the team universe — a ``W101`` slot without ``disabled`` resolving into
+    the real team is not a different match."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        placeholder_home="named",
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    assert str(repeats[0]["home_team_id"]) == "42"
 
 
 def _plan_with_missing(*endpoints, pending=None):
