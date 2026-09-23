@@ -307,15 +307,25 @@ def extract_tournament_standings(buffer: Dict[str, dict], ut_id, season_id) -> l
     if not blocks and isinstance(standings[0], dict):
         blocks = [standings[0]]
     multi_group = len(blocks) > 1
+    # #1351: two blocks may share one ``name`` (Lebanese Second Division 25/26)
+    # with a team in both; the block ``id`` is the real identity. ``group_id``
+    # only keys the parser's duplicate check (never a Bronze column); a name
+    # shared by several blocks gets the id appended so Bronze rows differ too.
+    name_counts: dict = {}
+    for block in blocks:
+        name_counts[block.get("name")] = name_counts.get(block.get("name"), 0) + 1
     rows: list = []
     for block in blocks:
         block_rows = block.get("rows")
         if not isinstance(block_rows, list):
             continue
         group_name = block.get("name") if multi_group else None
+        group_id = block.get("id") if multi_group else None
+        if multi_group and name_counts[group_name] > 1 and group_id is not None:
+            group_name = f"{group_name} #{group_id}"
         for row in block_rows:
             if multi_group and isinstance(row, dict) and not row.get("group"):
-                row = {**row, "group": group_name}
+                row = {**row, "group": group_name, "group_id": group_id}
             rows.append(row)
     return rows
 

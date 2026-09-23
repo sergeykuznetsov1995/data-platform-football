@@ -2415,3 +2415,38 @@ def test_partition_materializer_rejects_normalized_season_mismatch(
             canonical_league="ENG-Premier League",
             canonical_season="2025/26",
         )
+
+
+def _two_blocks_payload(first_id, second_id, *, name="Lebanese Second Division 25/26"):
+    def row(team_id, pts):
+        return {"team": {"id": team_id, "name": f"Club {team_id}"},
+                "matches": 3, "wins": pts // 3, "draws": pts % 3,
+                "losses": 3 - pts // 3 - pts % 3, "scoresFor": 5,
+                "scoresAgainst": 2, "points": pts}
+    return {"standings": [
+        {"type": "total", "id": first_id, "name": name,
+         "rows": [row(187262, 9), row(2, 4)]},
+        {"type": "total", "id": second_id, "name": name,
+         "rows": [row(187262, 7), row(3, 1)]},
+    ]}
+
+
+@pytest.mark.unit
+def test_standings_same_block_name_different_id_is_not_a_schema_error():
+    """#1351: 10 history scopes looped on ``duplicate standings row`` because
+    two blocks shared a name; the block id is the real identity."""
+    standings = build_standings_total_spec(**_common())
+    table = standings.parsers["league_table"](_two_blocks_payload(1001, 1002))
+
+    assert len(table) == 4
+    assert len({(row["group"], row["team_id"]) for row in table}) == 4
+    assert "group_id" not in table[0]
+
+
+@pytest.mark.unit
+def test_standings_true_duplicate_inside_one_block_still_fails():
+    from scrapers.sofascore.capture_engine import SchemaValidationError
+
+    standings = build_standings_total_spec(**_common())
+    with pytest.raises(SchemaValidationError, match="duplicate standings row"):
+        standings.parsers["league_table"](_two_blocks_payload(1001, 1001))

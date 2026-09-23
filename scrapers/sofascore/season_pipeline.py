@@ -394,7 +394,10 @@ def _standings_parser(
             team_id = str(source["team"]["id"])
             row = normalize_standing(source)
             group = str(row.get("group") or "")
-            key = (group, team_id)
+            # #1351: the block id, when the source sent one, is the identity of
+            # the table; a shared block name is not a duplicate.
+            group_id = source.get("group_id")
+            key = (str(group_id) if group_id is not None else group, team_id)
             if key in seen:
                 raise SchemaValidationError(
                     f"duplicate standings row group={group!r} team={team_id}"
