@@ -1020,7 +1020,9 @@ def test_publication_lock_task_uses_exact_control_generation(monkeypatch):
 
 
 @pytest.mark.unit
-def test_publication_lock_finalizer_releases_after_silver_success(monkeypatch):
+def test_publication_lock_finalizer_releases_after_publication_export(
+    monkeypatch,
+):
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(
         fbref_pipeline_tasks, "release_fbref_publication_lock", release
@@ -1031,7 +1033,11 @@ def test_publication_lock_finalizer_releases_after_silver_success(monkeypatch):
                 task_id="acquire_publication_lock", state="success"
             ),
             SimpleNamespace(
-                task_id="trigger_silver_transform", state="success"
+                task_id="export_publication_scope", state="success"
+            ),
+            # #1324: Silver runs after the lock and never colours Bronze.
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state="failed"
             ),
         ]
     )
@@ -1040,12 +1046,15 @@ def test_publication_lock_finalizer_releases_after_silver_success(monkeypatch):
         dag_id="dag_backfill_fbref",
         dag_run=success_run,
     )
-    assert result == {"released": True}
+    assert result == {
+        "released": True,
+        "status": "released_after_publication_export",
+    }
     release.assert_called_once()
 
 
 @pytest.mark.unit
-def test_publication_lock_finalizer_retains_failed_production_silver(
+def test_publication_lock_finalizer_releases_and_fails_after_export_failure(
     monkeypatch,
 ):
     release = MagicMock(return_value={"released": True})
@@ -1062,24 +1071,28 @@ def test_publication_lock_finalizer_retains_failed_production_silver(
                 task_id="release_canary_publication_lock", state="skipped"
             ),
             SimpleNamespace(
-                task_id="trigger_silver_transform", state="failed"
+                task_id="export_publication_scope", state="failed"
             ),
         ]
     )
     from airflow.exceptions import AirflowException
 
-    with pytest.raises(AirflowException, match="lock retained"):
+    with pytest.raises(
+        AirflowException,
+        match="export failed; lock released, Silver not triggered",
+    ):
         fbref_pipeline_tasks.finalize_fbref_publication_lock(
             airflow_run_id="manual__backfill",
             dag_id="dag_backfill_fbref",
             dag_run=failed_run,
         )
-    release.assert_not_called()
+    release.assert_called_once()
 
 
 @pytest.mark.unit
-def test_publication_lock_finalizer_releases_when_silver_never_started(
-    monkeypatch,
+@pytest.mark.parametrize("export_state", ["upstream_failed", "skipped"])
+def test_publication_lock_finalizer_releases_when_export_never_started(
+    monkeypatch, export_state,
 ):
     from airflow.exceptions import AirflowException
 
@@ -1092,13 +1105,17 @@ def test_publication_lock_finalizer_releases_when_silver_never_started(
             SimpleNamespace(
                 task_id="acquire_publication_lock", state="success"
             ),
+            SimpleNamespace(task_id="validate_run", state="failed"),
             SimpleNamespace(
-                task_id="trigger_silver_transform",
-                state="upstream_failed",
+                task_id="export_publication_scope",
+                state=export_state,
             ),
         ]
     )
-    with pytest.raises(AirflowException, match="released because"):
+    with pytest.raises(
+        AirflowException,
+        match="released because publication never started",
+    ):
         fbref_pipeline_tasks.finalize_fbref_publication_lock(
             airflow_run_id="manual__backfill",
             dag_id="dag_backfill_fbref",
@@ -1776,8 +1793,12 @@ def test_current_scope_freshness_fails_closed_for_stale_or_missing_evidence(
 @pytest.mark.unit
 @pytest.mark.parametrize("aggregate_only", [False, True])
 @pytest.mark.parametrize("exact_split", [False, True])
+@pytest.mark.parametrize(
+    ("run_type", "dag_id"),
+    [("current", "dag_ingest_fbref"), ("backfill", "dag_backfill_fbref")],
+)
 def test_fresh_never_fetched_target_cannot_hide_aged_fetched_target(
-    monkeypatch, aggregate_only, exact_split
+    monkeypatch, aggregate_only, exact_split, run_type, dag_id
 ):
     from airflow.exceptions import AirflowFailException
 
@@ -1799,11 +1820,28 @@ def test_fresh_never_fetched_target_cannot_hide_aged_fetched_target(
         lambda: SimpleNamespace(get_run_summary=lambda _run: summary),
     )
 
-    with pytest.raises(AirflowFailException, match="aged=1"):
-        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
-            airflow_run_id="manual__mixed_freshness",
-            dag_id="dag_ingest_fbref", run_type="current",
-        )
+    if run_type == "backfill":
+        with pytest.raises(AirflowFailException, match="aged=1"):
+            fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+                airflow_run_id="manual__mixed_freshness",
+                dag_id=dag_id, run_type=run_type,
+            )
+        return
+
+    # #1324: on the current run the aged copy is scope debt -- still
+    # visible, never hidden by the fresh never-fetched sibling.
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="manual__mixed_freshness",
+        dag_id=dag_id, run_type=run_type,
+    )
+    assert result["status"] == "passed_with_debt"
+    assert result["scope_debt"]["current_scope"]["aged"] == 1
+    assert any(
+        w.startswith("scope_debt:current_scope:") and "aged=1" in w
+        for w in result["warnings"]
+    )
+    if not aggregate_only:
+        assert result["scope_debt"]["schedule"]["aged"] == 1
 
 
 @pytest.mark.unit
@@ -1883,8 +1921,17 @@ def test_current_scope_freshness_treats_never_fetched_backlog_as_warning(
         run_type="current",
     )
 
-    assert result["status"] == "passed"
-    assert any("expansion_backlog=7" in w for w in result["warnings"])
+    # #1324: backlog of the growing registry is reported as scope debt.
+    assert result["status"] == "passed_with_debt"
+    assert result["scope_debt"]["schedule"] == {
+        "stale": 7,
+        "never_fetched": 7,
+        "aged": 0,
+    }
+    assert (
+        "scope_debt:schedule:stale=7,never_fetched=7,aged=0"
+        in result["warnings"]
+    )
     assert result["freshness_by_page_kind"]["schedule"]["aged_targets"] == 0
     assert result["publication_scope_freshness"]["aged_targets"] == 0
     assert result["publication_scope_freshness"]["aged_targets_exact"] is True
@@ -1922,6 +1969,103 @@ def test_current_scope_freshness_still_fails_on_genuinely_aged_pages(
             dag_id="dag_backfill_fbref",
             run_type="backfill",
         )
+
+
+def _aged_current_summary(aged: int) -> dict:
+    summary = _freshness_summary(stale_kind="match")
+    for value in (
+        summary["freshness_by_page_kind"]["match"],
+        summary["current_scope_freshness"],
+    ):
+        value.update(
+            stale_targets=aged,
+            never_fetched_targets=0,
+            aged_targets=aged,
+            stale_never_fetched_targets=0,
+        )
+        value["total_targets"] += aged - 1
+    return summary
+
+
+@pytest.mark.unit
+def test_current_scope_freshness_reports_aged_pages_as_scope_debt(
+    monkeypatch,
+):
+    """#1324: протухшее в скоупе — долг скоупа, не провал рана."""
+
+    summary = _aged_current_summary(5)
+    summary["target_counts"] = {"succeeded": 300, "skipped": 1}
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store",
+        lambda: SimpleNamespace(get_run_summary=lambda _run: summary),
+    )
+
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        run_type="current",
+    )
+
+    assert result["status"] == "passed_with_debt"
+    assert result["scope_debt"]["match"] == {
+        "stale": 5,
+        "never_fetched": 0,
+        "aged": 5,
+    }
+    assert "scope_debt:match:stale=5,never_fetched=0,aged=5" in result["warnings"]
+
+
+@pytest.mark.unit
+def test_freshness_gate_fails_only_when_the_run_did_no_work(monkeypatch):
+    from airflow.exceptions import AirflowFailException
+
+    summary = _aged_current_summary(5)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store",
+        lambda: SimpleNamespace(get_run_summary=lambda _run: summary),
+    )
+
+    summary["target_counts"] = {"failed": 3}
+    with pytest.raises(
+        AirflowFailException,
+        match="fbref current run did no work: succeeded=0 claimed=3",
+    ):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__no_work",
+            dag_id="dag_ingest_fbref",
+            run_type="current",
+        )
+
+    summary["target_counts"] = {"succeeded": 1, "failed": 3}
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="manual__some_work",
+        dag_id="dag_ingest_fbref",
+        run_type="current",
+    )
+    assert result["status"] == "passed_with_debt"
+
+
+@pytest.mark.unit
+def test_current_freshness_gate_still_fails_on_broken_evidence(monkeypatch):
+    from airflow.exceptions import AirflowFailException
+
+    summary = _aged_current_summary(5)
+    summary["target_counts"] = {"succeeded": 10}
+    summary["freshness_by_page_kind"].pop("schedule")
+    summary["freshness_by_page_kind"]["match"]["sla_seconds"] = 10**9
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store",
+        lambda: SimpleNamespace(get_run_summary=lambda _run: summary),
+    )
+
+    with pytest.raises(AirflowFailException) as failure:
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__broken",
+            dag_id="dag_ingest_fbref",
+            run_type="current",
+        )
+    assert "missing_page_kinds=schedule" in str(failure.value)
+    assert "match:sla_seconds=" in str(failure.value)
 
 
 @pytest.mark.unit

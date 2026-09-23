@@ -112,6 +112,10 @@ class TestFBrefCurrentTopology:
             factory.CURRENT_PAGE_KINDS_POLICY
             == "fbref-current-page-kinds-no-players-v1"
         )
+        assert (
+            factory.CURRENT_PUBLICATION_ORDER_POLICY
+            == "fbref-current-silver-after-lock-v1"
+        )
         assert factory.CURRENT_MAX_BATCHES == 14
         assert module.CURRENT_MAX_BATCHES == 14
         assert len(tasks) == 16
@@ -218,31 +222,36 @@ class TestFBrefCurrentTopology:
         assert tasks["validate_run"].downstream_task_ids == {
             "export_publication_scope"
         }
+        # #1324: the lock is released right after the publication export;
+        # Silver is triggered after the lock and is a leaf.
         assert tasks["export_publication_scope"].downstream_task_ids == {
-            "trigger_silver_transform"
+            "release_publication_lock",
+            "trigger_silver_transform",
         }
         assert tasks["trigger_silver_transform"].upstream_task_ids == {
-            "export_publication_scope"
+            "export_publication_scope",
+            "release_publication_lock",
         }
-        assert tasks["trigger_silver_transform"].downstream_task_ids == {
-            "release_publication_lock"
-        }
+        assert tasks["trigger_silver_transform"].downstream_task_ids == set()
         assert tasks["release_canary_publication_lock"].downstream_task_ids == {
             "release_publication_lock"
         }
         assert release.upstream_task_ids == {
-            "trigger_silver_transform",
+            "export_publication_scope",
             "release_canary_publication_lock",
         }
+        assert release.downstream_task_ids == {"trigger_silver_transform"}
 
-    def test_silver_waits_and_propagates_child_failure(self, loaded_dag):
+    def test_silver_is_triggered_after_the_lock_without_waiting(
+        self, loaded_dag
+    ):
         _, tasks = loaded_dag
         kwargs = tasks["trigger_silver_transform"]._captured_kwargs
         assert kwargs["trigger_dag_id"] == "dag_transform_fbref_silver"
-        assert kwargs["wait_for_completion"] is True
-        assert kwargs["allowed_states"] == ["success"]
-        assert kwargs["failed_states"] == ["failed"]
-        assert kwargs["execution_timeout"].total_seconds() == 12 * 60 * 60
+        # #1324: the Bronze verdict does not wait for Silver.
+        assert kwargs["wait_for_completion"] is False
+        assert kwargs["execution_timeout"].total_seconds() == 10 * 60
+        assert kwargs["trigger_rule"] == "all_success"
         assert kwargs["retries"] == 0
         assert kwargs["reset_dag_run"] is False
         assert kwargs["trigger_run_id"] == (

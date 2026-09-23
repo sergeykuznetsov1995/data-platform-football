@@ -973,7 +973,12 @@ def validate_fbref_current_scope_freshness(
     fail_fast: bool = True,
     enforce=None,
 ) -> dict:
-    """Fail closed when any active male/current target exceeds its source SLA.
+    """Gate a run on current-scope freshness evidence.
+
+    On the publishing current run (#1324) the verdict is the run's own
+    result: it fails on broken evidence or when the run did no work, and
+    reports aged/backlog targets of the whole scope as ``scope_debt``.  The
+    backfill lanes keep failing closed when any target exceeds its SLA.
 
     ``ControlStore.get_run_summary`` selects the authoritative current scope.
     This callable intentionally uses only that public API, and accepts either
@@ -1018,6 +1023,22 @@ def validate_fbref_current_scope_freshness(
 
     violations = []
     warnings = []
+    # #1324: on the publishing current run the gate measures the run's own
+    # result.  Aged copies and expansion backlog of the whole frontier are
+    # the scope's debt: reported (warning + XCom ``scope_debt``), not enforced.
+    debt_mode = enforcing and normalized_run_type == "current"
+    scope_debt = {}
+    if debt_mode:
+        target_counts = summary.get("target_counts")
+        if not isinstance(target_counts, Mapping):
+            target_counts = {}
+        claimed = sum(int(count or 0) for count in target_counts.values())
+        succeeded = int(target_counts.get("succeeded") or 0)
+        if claimed > 0 and succeeded == 0:
+            violations.append(
+                "run_work_zero: fbref current run did no work: "
+                f"succeeded=0 claimed={claimed}"
+            )
     if normalized_run_type == "backfill":
         pending = _non_negative_metric(summary, "promotion_pending_match_count")
         if pending:
@@ -1065,7 +1086,17 @@ def validate_fbref_current_scope_freshness(
             aged, stale_never, exact_split = _freshness_stale_split(raw_metrics)
             if stale and not exact_split:
                 warnings.append(f"{kind}:legacy_freshness_split=conservative")
-            if aged:
+            if debt_mode and stale:
+                scope_debt[kind] = {
+                    "stale": stale,
+                    "never_fetched": never,
+                    "aged": aged,
+                }
+                warnings.append(
+                    f"scope_debt:{kind}:stale={stale},never_fetched={never},"
+                    f"aged={aged}"
+                )
+            elif aged:
                 violations.append(
                     f"{kind}:stale={stale},never_fetched={never},aged={aged}"
                 )
@@ -1095,7 +1126,17 @@ def validate_fbref_current_scope_freshness(
             warnings.append("current_scope:legacy_freshness_split=conservative")
         if total == 0:
             violations.append("current_scope:total_targets=0")
-        if aged:
+        if debt_mode and (stale or not within_sla):
+            scope_debt["current_scope"] = {
+                "stale": stale,
+                "never_fetched": never,
+                "aged": aged,
+            }
+            warnings.append(
+                f"scope_debt:current_scope:stale={stale},never_fetched={never},"
+                f"aged={aged},all_within_sla={within_sla}"
+            )
+        elif aged:
             violations.append(
                 "current_scope:"
                 f"stale={stale},never_fetched={never},aged={aged},"
@@ -1138,16 +1179,25 @@ def validate_fbref_current_scope_freshness(
         )
     if warnings:
         logger.warning(
-            "FBref current-scope freshness passed with expansion backlog: %s",
+            "FBref current-scope freshness passed with warnings: %s",
             "; ".join(warnings),
         )
-    return {
-        "status": "passed" if enforcing else "advisory",
+    if not enforcing:
+        status = "advisory"
+    elif scope_debt:
+        status = "passed_with_debt"
+    else:
+        status = "passed"
+    result = {
+        "status": status,
         "run_type": normalized_run_type,
         "publication_scope_freshness": normalized_aggregate,
         "freshness_by_page_kind": normalized_kinds,
         "warnings": warnings,
     }
+    if debt_mode:
+        result["scope_debt"] = scope_debt
+    return result
 
 
 def _control_run_id(*, airflow_run_id: str, dag_id: str) -> str:
@@ -1770,23 +1820,25 @@ def finalize_fbref_publication_lock(
             "publishing": False,
             "status": "released_after_nonpublishing_run",
         }
-    silver_state = states.get("trigger_silver_transform", "missing")
-    if silver_state != "success":
-        if silver_state in {"skipped", "upstream_failed"}:
-            release_fbref_publication_lock(
-                airflow_run_id=airflow_run_id, dag_id=dag_id
-            )
-        raise AirflowException(
-            "FBref Silver publication did not succeed; publication lock "
-            + (
-                "released because the child never started "
-                if silver_state in {"skipped", "upstream_failed"}
-                else "retained because child state is ambiguous "
-            )
-            + f"(state={silver_state})"
-        )
-    return release_fbref_publication_lock(
+    # #1324: the Bronze verdict ends at the publication export.  Silver is
+    # triggered only after this lock is released and is never waited on, so
+    # its state cannot hold the lock or colour the Bronze run.
+    released = release_fbref_publication_lock(
         airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    if export_state == "success":
+        return {
+            **released,
+            "status": "released_after_publication_export",
+        }
+    if export_state in {"skipped", "upstream_failed"}:
+        raise AirflowException(
+            "FBref publication lock released because publication never "
+            f"started (state={export_state})"
+        )
+    raise AirflowException(
+        "FBref publication export failed; lock released, Silver not "
+        f"triggered (state={export_state})"
     )
 
 

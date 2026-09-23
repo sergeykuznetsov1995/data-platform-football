@@ -83,6 +83,10 @@ CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-14-v1"
 # same way as the cap above so a delivery cannot silently leave production on
 # the old list that still claims player and matchlog pages.
 CURRENT_PAGE_KINDS_POLICY = "fbref-current-page-kinds-no-players-v1"
+# Deployment marker for #1324: Silver is triggered only after the publication
+# lock is released and is never waited on, so the Bronze verdict and the lock
+# no longer depend on Silver.
+CURRENT_PUBLICATION_ORDER_POLICY = "fbref-current-silver-after-lock-v1"
 # Absolute wall-clock budget for the batch loop: six hours minus half an
 # hour, so the batch that is running when the budget expires still has room
 # to finish, close its lease and reconcile the meter before the six-hour
@@ -161,11 +165,14 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         doc_md = """
         ## FBref manual bootstrap
 
-        This DAG has no schedule and is safe to leave unpaused. It always uses
+        This DAG is paused by default; unpause it only for a manual bootstrap
+        and pause it again afterwards. Every run is a paid path. It always uses
         the exact production `4096 requests / 2048 MiB / shard 25` safety profile. It
         performs raw recovery, live fetch, parse, and integrity validation,
-        then releases the publication lock. Freshness, scope export, canary,
-        and Silver tasks do not exist in this DAG.
+        then releases the publication lock. It runs the same run gates as
+        ingest (`validate_bootstrap_run`) except freshness and Silver:
+        freshness, scope export, canary, and Silver tasks do not exist in
+        this DAG.
         """
     else:
         dag_id = INGEST_DAG_ID
@@ -184,8 +191,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         competitions are recorded but never added to the crawl frontier;
         unknown gender is quarantined. Every network task is bounded by the
         shared PostgreSQL request/byte budget and commits raw bytes before
-        parsing. Silver starts only after final completeness/traffic
-        validation passes. DagRun conf may select only the measured `100/50`
+        parsing. Silver is triggered only after final completeness/traffic
+        validation passes and the publication lock is released; it is not
+        awaited and does not colour the Bronze run. DagRun conf may select only the measured `100/50`
         canary profile or the default `4096/2048` production safety profile; every warm
         session claims at most 25 targets. A content-hashed raw inventory is
         captured before recovery/fetch, and publication is gated by a
@@ -209,8 +217,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         "doc_md": doc_md,
     }
     if bootstrap_only:
-        # schedule=None makes unpausing safe: no automatic DagRun can appear.
-        dag_kwargs["is_paused_upon_creation"] = False
+        # #1324: a manual bootstrap is a paid path without freshness, scope or
+        # Silver gates, so it is created paused and unpaused only by hand.
+        dag_kwargs["is_paused_upon_creation"] = True
     else:
         dag_kwargs["params"] = _scheduled_params()
 
@@ -438,12 +447,12 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                     "publication_scope": "fbref_silver_only",
                     "trigger_xref": False,
                 },
-                wait_for_completion=True,
+                # #1324 (CURRENT_PUBLICATION_ORDER_POLICY): fire and forget
+                # after the lock is released; Silver never holds the lock or
+                # colours the Bronze run.
+                wait_for_completion=False,
                 reset_dag_run=False,
-                poke_interval=30,
-                allowed_states=["success"],
-                failed_states=["failed"],
-                execution_timeout=timedelta(hours=12),
+                execution_timeout=timedelta(minutes=10),
                 retries=0,
                 trigger_rule="all_success",
             )
@@ -451,9 +460,10 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
             audit_raw_integrity >> choose_path
             choose_path >> validate_canary >> release_canary_lock
             choose_path >> validate_freshness >> validate_run
-            validate_run >> export_publication_scope >> trigger_silver
-            trigger_silver >> release_publication_lock
+            validate_run >> export_publication_scope >> release_publication_lock
             release_canary_lock >> release_publication_lock
+            # On the canary path export is skipped, so Silver is skipped too.
+            [export_publication_scope, release_publication_lock] >> trigger_silver
 
     return dag
 
@@ -463,6 +473,7 @@ __all__ = [
     "CURRENT_MAX_BATCHES",
     "CURRENT_MAX_BATCHES_POLICY",
     "CURRENT_PAGE_KINDS_POLICY",
+    "CURRENT_PUBLICATION_ORDER_POLICY",
     "CURRENT_WAVE_DEADLINE_SECONDS",
     "INGEST_DAG_ID",
     "PAGE_KINDS",

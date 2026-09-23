@@ -384,12 +384,11 @@ with DAG(
             "publication_scope": "fbref_silver_only",
             "trigger_xref": False,
         },
-        wait_for_completion=True,
+        # #1324: fire and forget after the lock is released; Silver never
+        # holds the lock or colours the Bronze run.
+        wait_for_completion=False,
         reset_dag_run=False,
-        poke_interval=30,
-        allowed_states=["success"],
-        failed_states=["failed"],
-        execution_timeout=timedelta(hours=12),
+        execution_timeout=timedelta(minutes=10),
         retries=0,
         trigger_rule="all_success",
     )
@@ -403,8 +402,9 @@ with DAG(
     )
 
     previous >> validate_freshness >> validate_run >> choose_publication_path
-    choose_publication_path >> export_publication_scope >> trigger_silver
-    trigger_silver >> release_publication_lock
+    choose_publication_path >> export_publication_scope >> release_publication_lock
+    # On the non-publishing path export is skipped, so Silver is skipped too.
+    [export_publication_scope, release_publication_lock] >> trigger_silver
     # A non-publishing historical run holds the lock for its own batches only,
     # instead of the six-to-eighteen hours a Silver transform costs.
     choose_publication_path >> release_publication_lock

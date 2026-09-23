@@ -182,19 +182,30 @@ class TestFBrefBackfillTopology:
             "export_publication_scope",
             "release_publication_lock",
         }
+        # #1324: lock released after export; Silver after the lock, unawaited.
+        assert tasks["export_publication_scope"].downstream_task_ids == {
+            "release_publication_lock",
+            "trigger_silver_transform",
+        }
+        assert tasks["release_publication_lock"].upstream_task_ids == {
+            "choose_publication_path",
+            "export_publication_scope",
+        }
         trigger = tasks["trigger_silver_transform"]
-        assert trigger.upstream_task_ids == {"export_publication_scope"}
-        assert trigger._captured_kwargs["wait_for_completion"] is True
-        assert trigger._captured_kwargs["failed_states"] == ["failed"]
+        assert trigger.upstream_task_ids == {
+            "export_publication_scope",
+            "release_publication_lock",
+        }
+        assert trigger._captured_kwargs["wait_for_completion"] is False
         assert (
             trigger._captured_kwargs["execution_timeout"].total_seconds()
-            == 12 * 60 * 60
+            == 10 * 60
         )
         assert trigger._captured_kwargs["retries"] == 0
         assert trigger._captured_kwargs["reset_dag_run"] is False
         assert trigger._captured_kwargs["execution_date"] == "{{ ti.start_date }}"
         assert trigger._captured_kwargs["conf"]["trigger_xref"] is False
-        assert trigger.downstream_task_ids == {"release_publication_lock"}
+        assert trigger.downstream_task_ids == set()
 
     def test_raw_recovery_drains_before_the_historical_seed(self, loaded_dag):
         """A seeded season must never be judged on raw the seed itself unhid.
