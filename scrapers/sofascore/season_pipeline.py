@@ -9,6 +9,7 @@ fixtures/direct canaries opt out explicitly.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
@@ -197,8 +198,25 @@ def _is_placeholder_team(team: object) -> bool:
     and have no squads, so counting them keeps the season plan permanently
     incomplete (#946). ``type`` does not discriminate and the registry
     ``enabled`` flag is unrelated.
+
+    Some brackets send the stub WITHOUT the flag, recognisable only by its
+    name ("W101"/"L101" = winner/loser of match 101, "TBD"/"TBA") or slug
+    ("winner-of-…"/"loser-of-…"); those failed the season as
+    ``participants omitted scheduled team ids`` every day (#1351).
     """
-    return isinstance(team, Mapping) and team.get("disabled") is True
+    if not isinstance(team, Mapping):
+        return False
+    if team.get("disabled") is True:
+        return True
+    name = str(team.get("name") or "").strip()
+    slug = str(team.get("slug") or "").strip().casefold()
+    return bool(
+        _PLACEHOLDER_TEAM_NAME.fullmatch(name)
+        or slug.startswith(("winner-of-", "loser-of-"))
+    )
+
+
+_PLACEHOLDER_TEAM_NAME = re.compile(r"[WL]\d{1,3}|TBD|TBA", re.IGNORECASE)
 
 
 def _schedule_schema(source_season_id: str):

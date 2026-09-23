@@ -2450,3 +2450,77 @@ def test_standings_true_duplicate_inside_one_block_still_fails():
     standings = build_standings_total_spec(**_common())
     with pytest.raises(SchemaValidationError, match="duplicate standings row"):
         standings.parsers["league_table"](_two_blocks_payload(1001, 1001))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "team",
+    [
+        {"id": 999903, "name": "W101", "slug": "w101"},
+        {"id": 999904, "name": "l7", "slug": "l7"},
+        {"id": 999905, "name": "TBD", "slug": "tbd"},
+        {"id": 999906, "name": "tba", "slug": "tba"},
+        {"id": 999907, "name": "Winner QF1", "slug": "winner-of-match-12"},
+        {"id": 999908, "name": "Loser SF2", "slug": "Loser-of-match-14"},
+    ],
+)
+def test_named_bracket_stubs_are_placeholders_without_disabled_flag(team):
+    """#1351: bracket stubs named W101/L101/TBD (or slugged winner-of-/loser-of-)
+    arrive without ``disabled: true`` and failed the season as
+    ``participants omitted scheduled team ids``."""
+    from scrapers.sofascore.season_pipeline import _is_placeholder_team
+
+    assert _is_placeholder_team(team) is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "team",
+    [
+        {"id": 42, "name": "Arsenal", "slug": "arsenal"},
+        {"id": 43, "name": "W1000", "slug": "w1000"},
+        {"id": 44, "name": "Wolves", "slug": "wolverhampton"},
+        {"id": 45, "name": "TBD United", "slug": "tbd-united"},
+        {"id": 46, "name": "Arsenal", "slug": "arsenal", "disabled": False},
+    ],
+)
+def test_real_teams_are_not_named_placeholders(team):
+    from scrapers.sofascore.season_pipeline import _is_placeholder_team
+
+    assert _is_placeholder_team(team) is False
+
+
+@pytest.mark.unit
+def test_named_placeholder_stays_out_of_team_universe(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    event = {
+        "id": 14000301,
+        "season": {"id": SEASON_ID, "name": "Premier League 25/26", "year": "25/26"},
+        "status": {"type": "notstarted"},
+        "startTimestamp": 1782000000,
+        "homeTeam": {"id": 42, "name": "Arsenal", "gender": "M"},
+        "awayTeam": {"id": 999903, "name": "W101", "slug": "w101", "gender": "M"},
+        "roundInfo": {"round": 30},
+    }
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        {"events": [event], "hasNextPage": False},
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_participants_spec(**_common()),
+        {"teams": [{"id": 42, "name": "Arsenal", "gender": "M"}]},
+    )
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert plan.team_ids == ("42",)
+    assert plan.placeholder_team_ids == ("999903",)
+    assert plan.player_universe_evidence_gaps == ()
