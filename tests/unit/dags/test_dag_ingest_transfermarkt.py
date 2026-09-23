@@ -36,12 +36,6 @@ def dag_module():
     module._probe_gateway_exit = (
         lambda **kw: module.probe_calls.append(kw) or {'status_code': 200}
     )
-    # The read-only one-shot journal check has its own tests below; here the
-    # planning tests use synthetic packet identities with no journal on disk.
-    module.journal_checks = []
-    module._assert_one_shot_packets_live = (
-        lambda journal, envs: module.journal_checks.append((journal, len(envs)))
-    )
     return module
 
 
@@ -1692,85 +1686,25 @@ class TestOneAlertPerRun:
         assert sent == [aggregate]
 
 
-def _journal_record(packet_id, action, *, status='approved', hours=1):
-    from datetime import datetime, timezone
 
-    expires = datetime.now(timezone.utc) + timedelta(hours=hours)
-    return {
-        'packet_hash': '',
-        'packet_id': packet_id,
-        'action': action,
-        'status': status,
-        'canonical_json': '{}',
-        'issued_at': '2026-09-23T00:00:00.000000Z',
-        'expires_at': expires.isoformat(timespec='microseconds').replace(
-            '+00:00', 'Z',
-        ),
-        'approved_at': '2026-09-23T00:00:01.000000Z',
-    }
+class TestProbeOnlyInScheduledRun:
+    """#1389 (after Astra r3): the probe runs only in the standing-policy run."""
 
-
-class TestOneShotPacketsBeforeProbe:
-    """#1389 (Astra r2 #1): a one-shot run spends the probe only on live packets."""
-
-    def _env(self):
-        return {
-            'TM_SCOPE_ID': 'GB1__2025',
-            'TM_PAID_APPROVAL_PACKET_ID': 'paid-1',
-            'TM_PAID_APPROVAL_PACKET_HASH': 'a' * 64,
-            'TM_WRITE_APPROVAL_PACKET_ID': 'write-1',
-            'TM_WRITE_APPROVAL_PACKET_HASH': 'b' * 64,
-        }
-
-    def _journal(self, tmp_path, **paid_overrides):
-        paid = _journal_record('paid-1', 'paid_proxy', **paid_overrides)
-        write = _journal_record('write-1', 'production_write')
-        path = tmp_path / 'journal.json'
-        path.write_text(json.dumps({'a' * 64: paid, 'b' * 64: write}))
-        return path
-
-    def test_live_packets_pass(self, real_probe_module, tmp_path):
-        real_probe_module._assert_one_shot_packets_live(
-            self._journal(tmp_path), [self._env()],
+    def test_standing_policy_run_probes(self, dag_module, monkeypatch, tmp_path):
+        gate = TestStandingPolicyGate()
+        gate._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        dag_module._plan_exact_scopes(
+            **gate._context(dag_module, gate._standing_params(dag_module)),
         )
+        assert len(dag_module.probe_calls) == 1
 
-    @pytest.mark.parametrize('overrides, match', [
-        ({'status': 'consumed'}, 'status=consumed'),
-        ({'status': 'issued'}, 'status=issued'),
-        ({'hours': -1}, 'not live'),
-    ])
-    def test_dead_packets_stop_before_the_probe(
-        self, real_probe_module, tmp_path, overrides, match,
-    ):
-        with pytest.raises(Exception, match=match):
-            real_probe_module._assert_one_shot_packets_live(
-                self._journal(tmp_path, **overrides), [self._env()],
-            )
-
-    def test_unknown_packet_stops_before_the_probe(
-        self, real_probe_module, tmp_path,
-    ):
-        env = dict(self._env(), TM_PAID_APPROVAL_PACKET_HASH='c' * 64)
-        with pytest.raises(Exception, match='was not issued'):
-            real_probe_module._assert_one_shot_packets_live(
-                self._journal(tmp_path), [env],
-            )
-
-    def test_one_shot_plan_checks_the_journal_before_the_probe(
-        self, dag_module, monkeypatch, tmp_path,
+    def test_one_shot_run_skips_the_probe(
+        self, dag_module, monkeypatch, tmp_path, caplog,
     ):
         gate = TestStandingPolicyGate()
         payload = gate._arm(dag_module, monkeypatch, tmp_path)
-        monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
-        order = []
-        monkeypatch.setattr(
-            dag_module, '_assert_one_shot_packets_live',
-            lambda journal, envs: order.append('journal'),
-        )
-        monkeypatch.setattr(
-            dag_module, '_probe_gateway_exit',
-            lambda **kw: order.append('probe'),
-        )
         params = gate._standing_params(
             dag_module,
             approval_bundles={
@@ -1782,18 +1716,10 @@ class TestOneShotPacketsBeforeProbe:
                 },
             },
         )
-        dag_module._plan_exact_scopes(**gate._context(dag_module, params))
-        assert order == ['journal', 'probe']
-
-    def test_standing_policy_plan_skips_the_journal(
-        self, dag_module, monkeypatch, tmp_path,
-    ):
-        gate = TestStandingPolicyGate()
-        gate._arm(dag_module, monkeypatch, tmp_path)
-        policy_path, _ = _write_standing_policy(tmp_path)
-        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
-        dag_module._plan_exact_scopes(
-            **gate._context(dag_module, gate._standing_params(dag_module)),
-        )
-        assert dag_module.journal_checks == []
-        assert len(dag_module.probe_calls) == 1
+        with caplog.at_level('INFO'):
+            envs = dag_module._plan_exact_scopes(
+                **gate._context(dag_module, params, run_type='manual'),
+            )
+        assert envs[0]['TM_APPROVAL_MODE'] == 'one_shot'
+        assert dag_module.probe_calls == []
+        assert 'проба сети пропущена: ручной ран с пакетом одобрений' in caplog.text
