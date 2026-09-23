@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from scrapers.sofascore.denominator import Denominator, load_denominator
 from scrapers.sofascore.workload_plan import (
     WorkloadPlanError,
     production_season_shape,
@@ -158,18 +159,25 @@ def _refresh_snapshot_seasons(
 
 
 def current_season_targets(
-    snapshot: Mapping[str, Any], exclude_tournament_ids: frozenset[int]
+    snapshot: Mapping[str, Any],
+    exclude_tournament_ids: frozenset[int],
+    denominator: Denominator | None = None,
 ) -> list[SeasonTarget]:
     """Newest non-excluded season of every ready tournament, by tournament id.
 
     The order is stable so callers walk a fixed sequence.  An ``excluded``
     season is never a target; a tournament whose seasons are all excluded is
-    skipped.  Ties retain the first matching season in snapshot order.
+    skipped.  Ties retain the first matching season in snapshot order.  A
+    tournament with denominator ``queue_priority 0`` (esoccer, student;
+    #1353) is never a target.
     """
 
+    denominator = load_denominator() if denominator is None else denominator
     targets: list[SeasonTarget] = []
     for tournament_id, capture_key, seasons in _refresh_snapshot_tournaments(snapshot):
         if tournament_id in exclude_tournament_ids:
+            continue
+        if denominator.queue_priority(tournament_id) == 0:
             continue
         newest: tuple[int, SeasonTarget] | None = None
         for _season, season_id, start_year, canonical in _refresh_snapshot_seasons(
@@ -362,11 +370,18 @@ def plan_historical_batch(
     park_cooldown_hours: int = DEFAULT_PARK_COOLDOWN_HOURS,
     moment: datetime | None = None,
     release: str | None = None,
+    denominator: Denominator | None = None,
 ) -> list[dict[str, str]]:
     """Select a bounded batch: every tournament's newest season, then deeper.
 
+    ``denominator`` (default: ``load_denominator()``, #1353) filters and
+    orders the snapshot: a tournament with ``queue_priority 0`` (esoccer,
+    student) is never planned, and every core (``1``) scope of every depth
+    ranks before any disputed (``9``) one.
+
     Candidates inside the allowed waves (``start_year <= first_start_year``)
-    are ranked by ``(depth, -start_year, tournament_id)`` where ``depth`` is
+    are ranked by ``(queue_priority, depth, -start_year, tournament_id)``
+    where ``depth`` is
     the season's position in the tournament's newest-first season list. A
     pending season yields one serialized metadata task for its wave; a
     season whose shape is not declared in the static workload policy is
@@ -415,6 +430,7 @@ def plan_historical_batch(
     if not isinstance(tournaments, list):
         raise CampaignPlanningError("campaign tournaments must be a list")
     completed_keys = {str(value) for value in completed}
+    denominator = load_denominator() if denominator is None else denominator
     authorized: frozenset[str] | None = None
     if authorized_season_classes is not None:
         if isinstance(authorized_season_classes, Mapping):
@@ -428,12 +444,17 @@ def plan_historical_batch(
             )
         authorized = frozenset(str(name) for name in authorized_season_classes)
     # (rank, kind, tournament, season); kind in ready/completed/pending/deferred
-    ranked: list[tuple[tuple[int, int, int], str, Mapping[str, Any], Mapping[str, Any]]] = []
+    ranked: list[
+        tuple[tuple[int, int, int, int], str, Mapping[str, Any], Mapping[str, Any]]
+    ] = []
     for tournament in tournaments:
         if not isinstance(tournament, Mapping):
             raise CampaignPlanningError("campaign tournament must be an object")
         tournament_status = str(tournament.get("metadata_status") or "pending")
         if tournament_status == "excluded":
+            continue
+        priority = denominator.queue_priority(int(tournament["unique_tournament_id"]))
+        if priority == 0:
             continue
         seasons = tournament.get("seasons")
         if not isinstance(seasons, list):
@@ -527,7 +548,7 @@ def plan_historical_batch(
                         # Already published: a replay that cannot run now
                         # never blocks the tournament's deeper seasons.
                         kind = "completed"
-            rank = (depth, -wave, int(tournament["unique_tournament_id"]))
+            rank = (priority, depth, -wave, int(tournament["unique_tournament_id"]))
             ranked.append((rank, kind, tournament, season))
             if kind not in ("ready", "completed", "quarantined"):
                 # Deeper seasons of this tournament wait behind the blocker.
@@ -639,6 +660,7 @@ def plan_refresh_batch(
     ),
     dag_run_id: str = "manual",
     task_env: Mapping[str, str] | None = None,
+    denominator: Denominator | None = None,
 ) -> list[dict[str, str]]:
     """Select a timestamp-aware fresh or largest-backlog refresh batch.
 
@@ -652,7 +674,9 @@ def plan_refresh_batch(
     line (the scope cycle would refuse it anyway).  A pending season is
     accepted: the refresh lane runs the matches phase from Bronze evidence
     without season pages.  ``fresh`` ranks the newest timestamp first, while
-    ``backlog`` ranks the largest unfinished partition first.
+    ``backlog`` ranks the largest unfinished partition first.  Both rank
+    behind the denominator's ``queue_priority`` (#1353): core before disputed
+    buckets, and a ``0`` tournament (esoccer, student) is never planned.
     """
 
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
@@ -673,6 +697,7 @@ def plan_refresh_batch(
     tournaments = snapshot.get("tournaments")
     if not isinstance(tournaments, list):
         raise CampaignPlanningError("campaign tournaments must be a list")
+    denominator = load_denominator() if denominator is None else denominator
     # Campaign partitions are keyed ``SS-<unique_tournament_id>``.
     excluded_tournament_ids = frozenset(int(value) for value in exclude_tournament_ids)
     configured_keys = {f"SS-{value}" for value in excluded_tournament_ids}
@@ -682,7 +707,9 @@ def plan_refresh_batch(
             tournament_id, seasons, require_start_year=False
         ):
             index[(capture_key, canonical)] = (tournament_id, season)
-    candidates: list[tuple[str, str, int, int | None, int, Mapping[str, Any]]] = []
+    candidates: list[
+        tuple[str, str, int, int | None, int, Mapping[str, Any], int]
+    ] = []
     for league, canonical, count, timestamp in pending_partitions:
         league = str(league)
         canonical = str(canonical)
@@ -707,6 +734,9 @@ def plan_refresh_batch(
             else None
         )
         tournament_id, season = entry
+        priority = denominator.queue_priority(tournament_id)
+        if priority == 0:
+            continue
         candidates.append(
             (
                 league,
@@ -715,11 +745,13 @@ def plan_refresh_batch(
                 normalized_timestamp,
                 tournament_id,
                 season,
+                priority,
             )
         )
     if queue_mode == "fresh":
         candidates.sort(
             key=lambda item: (
+                item[6],
                 item[3] is None,
                 -(item[3] or 0),
                 -item[2],
@@ -728,9 +760,9 @@ def plan_refresh_batch(
             )
         )
     else:
-        candidates.sort(key=lambda item: (-item[2], item[0], item[1]))
+        candidates.sort(key=lambda item: (item[6], -item[2], item[0], item[1]))
     planned: list[dict[str, str]] = []
-    for _league, _canonical, _count, _timestamp, tournament_id, season in candidates:
+    for _league, _canonical, _count, _timestamp, tournament_id, season, _p in candidates:
         planned.append(
             _scope_task_env(
                 "refresh",

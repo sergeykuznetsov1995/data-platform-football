@@ -235,3 +235,34 @@ def test_pending_season_overlays_carry_no_team_count_and_fail_closed_on_pages(
     assert season_config["season_format"] == "split_year"
     with pytest.raises(WorkloadPlanError, match="outside the measured"):
         team_count_band(season_config["team_count"])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tournament_class", ["esoccer", "student"])
+def test_scope_outside_the_denominator_queues_is_refused(tmp_path, tournament_class):
+    from scrapers.sofascore.denominator import (
+        CLASS_PRIORITY,
+        Denominator,
+        DenominatorRow,
+    )
+
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps(_snapshot()), encoding="utf-8")
+    denominator = Denominator(rows={17: DenominatorRow(
+        tournament_id=17, capture_key="SS-17", name="x",
+        tournament_class=tournament_class,
+        queue_priority=CLASS_PRIORITY[tournament_class], basis="test",
+    )})
+
+    with pytest.raises(
+        CampaignScopeError,
+        match=rf"tournament 17 is outside the denominator queues \({tournament_class}\)",
+    ):
+        load_exact_scope(
+            snapshot, tournament_id=17, source_season_id=76986,
+            denominator=denominator,
+        )
+    # The committed file keeps the same scope admitted (17 is core there).
+    assert load_exact_scope(
+        snapshot, tournament_id=17, source_season_id=76986
+    )["capture_key"] == "SS-17"
