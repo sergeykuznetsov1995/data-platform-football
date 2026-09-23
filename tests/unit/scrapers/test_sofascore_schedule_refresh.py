@@ -1001,6 +1001,31 @@ def test_a_resolved_bracket_stub_is_not_an_identity_conflict(tmp_path):
     assert [row["home_team_id"] for row in rows] == [12345]
 
 
+@pytest.mark.unit
+def test_a_resolved_named_bracket_stub_is_not_an_identity_conflict(tmp_path):
+    """#1351 (Astra r2): the same stub predicate as the season lane — a ``W101``
+    slot WITHOUT ``disabled`` resolving into the real team is not a conflict,
+    and the resolved copy reaches Bronze."""
+
+    first, _ = _fixture_events()
+    stub = _event(first, event_id=42, tournament_id=READY_TOURNAMENT,
+                  season_id=READY_PREVIOUS_SEASON)
+    stub["homeTeam"] = {"id": 900002, "name": "W101", "slug": "w101"}
+    resolved = _event(first, event_id=42, tournament_id=READY_TOURNAMENT,
+                      season_id=READY_PREVIOUS_SEASON)
+    resolved["homeTeam"] = {"id": 12345, "name": "Real Team", "slug": "real-team"}
+    client = _Client({
+        schedule_page_path(*PREVIOUS_TARGET): _page(stub, resolved)
+    })
+    fetched, _, _ = fetch_season_schedules(client, [PREVIOUS_TARGET], _store(tmp_path))
+
+    rows, counters = schedule_rows_from_events(
+        fetched, SNAPSHOT, exclude_leagues=()
+    )
+    assert counters["identity_conflict"] == 0
+    assert [row["home_team_id"] for row in rows] == [12345]
+
+
 def test_rows_reject_a_page_made_only_of_junk(tmp_path):
     # ``{"events": [null, null]}``: nothing can be placed, over enough events
     # to be a pattern — fully malformed.

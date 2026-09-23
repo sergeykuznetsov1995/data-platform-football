@@ -1568,6 +1568,138 @@ def test_runner_signed_season_with_player_universe_gap_publishes_at_zero_traffic
 
 
 @pytest.mark.unit
+def test_runner_main_with_a_real_signed_season_plan_publishes_despite_universe_gap(
+    tmp_path,
+    monkeypatch,
+):
+    """#1351 (Astra r2, урок 60): the production entrypoint end to end — a REAL
+    HMAC-signed season plan written to disk, loaded and verified by
+    ``_load_runtime_workload_plan`` inside ``main()`` under the history DAG's
+    context, then the real planner/replay/materialize/finalize. The season's
+    participants omit real scheduled clubs (291:84027); it publishes at zero
+    traffic and reports the gap."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore.workload_plan import (
+        SeasonWorkload,
+        WorkloadBudgetPolicy,
+        WorkloadClassBudget,
+        production_season_shape,
+        season_workload_class,
+        workload_shape_digest,
+    )
+    from scrapers.sofascore.workload_runtime import (
+        PartitionWorkload,
+        build_partitioned_plan,
+        write_plan,
+    )
+
+    token = "season-gap-control-token-with-at-least-32-bytes"
+    shape = production_season_shape(
+        season_format="split_year",
+        team_count_band="16_20",
+        max_pages_per_direction=50,
+    )
+    season_class = season_workload_class(shape)
+    policy = WorkloadBudgetPolicy("a" * 64, {
+        season_class: WorkloadClassBudget(
+            season_class, "season", 1, 3_000, ("schedule_last",),
+            workload_shape_digest(shape),
+        ),
+    })
+    plan_path = write_plan(
+        tmp_path / "season-plan.json",
+        build_partitioned_plan(
+            policy,
+            dag_id="dag_backfill_sofascore_all_mens",
+            run_id="scope-run-1::season",
+            freshness_keys={
+                "season": FRESHNESS, "match": "final", "player": "fixture-week",
+            },
+            partitions=[
+                PartitionWorkload(
+                    "ENG-Premier League",
+                    "2526",
+                    17,
+                    season_workload=SeasonWorkload(17, 76986, shape, pending=False),
+                )
+            ],
+            control_token=token,
+        ),
+    )
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", token)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens")
+    monkeypatch.setenv("SOFASCORE_RUN_ID", "scope-run-1")
+
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_complete_partition_roots(
+        raw_store, participants_payload=evidence["partial_participants"]
+    )
+    initial = plan_season_partition(raw_store, manifest, **_common())
+    for spec in initial.specs:
+        if spec.key.endpoint == "squads":
+            _seed_json(raw_store, spec, evidence["nonempty_squad"])
+        elif spec.key.endpoint == "referee_profile":
+            _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
+    engine, transport = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+        sink=DeferredCaptureSink(),
+    )
+    runtime = CaptureRuntime(engine, manifest, raw_store)
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID)
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame.assign(
+        _entity_type=entity,
+        _ingested_at="fixture",
+    )
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: (
+        "iceberg.bronze." + kwargs["table_name"]
+    )
+    output = tmp_path / "season.json"
+
+    with (
+        patch(
+            "scrapers.sofascore.pipeline.build_capture_runtime",
+            return_value=runtime,
+        ),
+        patch(
+            "scrapers.sofascore.SofaScoreScraper", return_value=scraper, create=True
+        ),
+    ):
+        rc = runner.main([
+            "--entity", "all",
+            "--league", "ENG-Premier League",
+            "--season", "2526",
+            "--allow-inactive-season",
+            "--manifest-backend", "trino",
+            "--workload-plan", str(plan_path),
+            "--output", str(output),
+        ])
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, payload["errors"]
+    assert payload["errors"] == []
+    assert payload["freshness_key"] == FRESHNESS
+    assert transport.calls == 0
+    assert [
+        call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
+    ] == ["sofascore_schedule", "sofascore_league_table"]
+    assert payload["schedule_rows"] == 2
+    assert payload["league_table_rows"] == 4
+    assert payload["player_universe_gaps"] == [
+        "participants omitted scheduled team ids: 17,33,44"
+    ]
+    assert payload["traffic"]["player_universe_gaps"] == 1
+
+
+@pytest.mark.unit
 def test_runner_season_merges_bronze_inside_the_writer_lock(tmp_path, monkeypatch):
     """D5: both season MERGEs run under one writer-lock span; the manifest is
     finalized only after the lock is released."""
