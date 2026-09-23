@@ -43,6 +43,15 @@ DEFAULT_MAX_SCOPE_ATTEMPTS = 3
 # a scope that fails again is parked again for another window, so a genuinely
 # broken season still cannot loop on paid traffic.
 DEFAULT_PARK_COOLDOWN_HOURS = 24
+# A scope that failed ``max_scope_attempts`` times IN A ROW at zero source
+# requests with the same reason is not unlucky, it is deterministic: the same
+# stored raw replays into the same error for free, and a park only thinned
+# that to once a day (291:84027 — 25 attempts, #1351, урок 101).  Such a scope
+# is quarantined: never planned again on the same release, and the deeper
+# seasons of its tournament do not wait behind it.  A new release lifts it for
+# one attempt; a manual lift removes its entry from failures.json.
+QUARANTINE_REASON_CHARS = 200
+UNKNOWN_RELEASE = "unknown"
 DEFAULT_REFRESH_BATCH_SIZE = 8
 DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
 
@@ -184,6 +193,57 @@ def current_season_targets(
     return targets
 
 
+def current_release(environ: Mapping[str, str] | None = None) -> str:
+    """The running release: sha8 of ``SOFASCORE_RELEASE_ROOT`` or ``unknown``.
+
+    Delivery pins ``/opt/sofascore/releases/release-<sha8>``; its basename is
+    what a quarantine is bound to.
+    """
+
+    root = str((os.environ if environ is None else environ).get(
+        "SOFASCORE_RELEASE_ROOT"
+    ) or "").strip().rstrip("/")
+    name = os.path.basename(root)
+    if name.startswith("release-"):
+        name = name[len("release-"):]
+    return name or UNKNOWN_RELEASE
+
+
+def read_scope_outcome(result_path: str | Path | None) -> tuple[str, int | None]:
+    """Reason class and source requests of one failed attempt (#1351).
+
+    Read from the scope-cycle result the task wrote: the first ``errors[]``
+    line up to its ``; attempts: [`` tail (the final cause, as the watchdog
+    classifier reads it) and the sum of the phases' ``source_request_count``
+    (``request_count`` where a failure report has only that).  An unreadable
+    result is an unknown outcome: ``None`` never extends a no-traffic streak.
+    """
+
+    try:
+        result = json.loads(Path(str(result_path)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "scope result is unreadable", None
+    if not isinstance(result, Mapping):
+        return "scope result is unreadable", None
+    errors = result.get("errors") or []
+    reason = str(errors[0]) if errors else "scope result has no errors[]"
+    reason = (reason.splitlines() or [""])[0]
+    reason = reason.split("; attempts: [", 1)[0]
+    counts = [
+        phase.get("source_request_count", phase.get("request_count"))
+        for phase in result.get("phases") or []
+        if isinstance(phase, Mapping)
+    ]
+    counts = [int(value) for value in counts if value is not None]
+    return reason, (sum(counts) if counts else None)
+
+
+def is_quarantined_record(attempts: Mapping[str, Any], max_scope_attempts: int) -> bool:
+    """Failure record whose no-traffic streak reached the attempt ceiling."""
+
+    return int(attempts.get("streak_no_traffic", 0) or 0) >= max_scope_attempts
+
+
 def park_has_cooled(
     attempts: Mapping[str, Any],
     moment: datetime,
@@ -263,6 +323,7 @@ def plan_historical_batch(
     max_scope_attempts: int = DEFAULT_MAX_SCOPE_ATTEMPTS,
     park_cooldown_hours: int = DEFAULT_PARK_COOLDOWN_HOURS,
     moment: datetime | None = None,
+    release: str | None = None,
 ) -> list[dict[str, str]]:
     """Select a bounded batch: every tournament's newest season, then deeper.
 
@@ -280,11 +341,17 @@ def plan_historical_batch(
     after ``park_cooldown_hours`` and the scope gets ONE more attempt — see
     ``DEFAULT_PARK_COOLDOWN_HOURS`` for why a park may not be permanent.
 
+    A scope whose ``streak_no_traffic`` reached ``max_scope_attempts`` is
+    quarantined instead (see ``QUARANTINE_REASON_CHARS``): not planned while
+    its ``last_release`` is the running ``release`` (default: from the
+    environment), and its tournament's deeper seasons are planned past it.
+
     ``task_env`` is the lane's own environment (gateway URL, rate limit) and
     is forwarded verbatim to every planned task; campaign keys win over it.
     """
 
     moment = moment or datetime.now(timezone.utc)
+    release = current_release() if release is None else str(release)
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise CampaignPlanningError("batch_size must be a positive integer")
@@ -359,10 +426,26 @@ def plan_historical_batch(
                     int(season["source_season_id"]),
                 )
                 attempts = (failures or {}).get(key) or {}
+                quarantine_record = is_quarantined_record(
+                    attempts, max_scope_attempts
+                )
                 if key in completed_keys:
                     kind = "completed"
-                elif int(attempts.get("count", 0)) >= max_scope_attempts and not (
-                    park_has_cooled(attempts, moment, park_cooldown_hours)
+                elif quarantine_record and attempts.get("last_release") == release:
+                    kind = "quarantined"
+                    logger.warning(
+                        "campaign scope %s quarantined after %s free identical "
+                        "failures on release %s: %s",
+                        key, attempts.get("streak_no_traffic"), release,
+                        attempts.get("last_reason"),
+                    )
+                elif (
+                    # A quarantine from an older release is lifted: the new
+                    # release may carry the fix, so ONE attempt past the park;
+                    # the same free outcome quarantines it again.
+                    not quarantine_record
+                    and int(attempts.get("count", 0)) >= max_scope_attempts
+                    and not park_has_cooled(attempts, moment, park_cooldown_hours)
                 ):
                     kind = "parked"
                     logger.warning(
@@ -393,13 +476,15 @@ def plan_historical_batch(
                         kind = "deferred"
             rank = (depth, -wave, int(tournament["unique_tournament_id"]))
             ranked.append((rank, kind, tournament, season))
-            if kind not in ("ready", "completed"):
+            if kind not in ("ready", "completed", "quarantined"):
                 # Deeper seasons of this tournament wait behind the blocker.
+                # A quarantined season is terminal and blocks nothing: one
+                # dead season must not freeze a tournament's history (#1351).
                 break
     ranked.sort(key=lambda item: item[0])
     planned: list[dict[str, str]] = []
     for _rank, kind, tournament, season in ranked:
-        if kind in ("completed", "deferred", "parked"):
+        if kind in ("completed", "deferred", "parked", "quarantined"):
             continue
         if kind == "pending":
             if planned:
@@ -702,10 +787,12 @@ def mark_completed(path: str | Path, *, campaign_id: str, scope_key: str) -> Non
 
 
 def read_failures(path: str | Path, *, campaign_id: str) -> dict[str, dict[str, Any]]:
-    """Failure memory: ``{scope_key: {"count", "last_run_id", "last_at"}}``.
+    """Failure memory: ``{scope_key: {"count", "last_run_id", "last_at", ...}}``.
 
     Lives in ``failures.json`` next to ``state.json`` (which stays at schema
-    v1 untouched); a missing file means no failures.
+    v1 untouched); a missing file means no failures.  #1351 added optional
+    ``streak_no_traffic``, ``last_reason`` and ``last_release`` (still schema
+    v1): a record without them reads as a streak of 0.
     """
 
     source = Path(path)
@@ -736,16 +823,42 @@ def _write_failures(
 
 
 def mark_failed(
-    path: str | Path, *, campaign_id: str, scope_key: str, run_id: str
+    path: str | Path,
+    *,
+    campaign_id: str,
+    scope_key: str,
+    run_id: str,
+    reason: str | None = None,
+    source_requests: int | None = None,
+    release: str = UNKNOWN_RELEASE,
 ) -> None:
+    """Count one failed attempt and its no-progress streak.
+
+    ``reason`` is the class text of the attempt (first ``errors[]`` line of
+    the scope result, cut to ``QUARANTINE_REASON_CHARS``); ``source_requests``
+    is how many requests reached the source (``None`` = unknown, which never
+    extends the streak).  ``streak_no_traffic`` grows only while attempts stay
+    at 0 source requests with the same reason; anything else restarts it.
+    """
+
+    reason_text = str(reason or "")[:QUARANTINE_REASON_CHARS]
+    free = source_requests is not None and int(source_requests) == 0
     destination = Path(path)
     with _state_lock(destination):
         attempts = read_failures(destination, campaign_id=campaign_id)
         previous = attempts.get(str(scope_key)) or {}
+        streak = 0
+        if free:
+            streak = 1
+            if previous.get("last_reason") == reason_text:
+                streak += int(previous.get("streak_no_traffic", 0) or 0)
         attempts[str(scope_key)] = {
             "count": int(previous.get("count", 0)) + 1,
             "last_run_id": str(run_id),
             "last_at": datetime.now(timezone.utc).isoformat(),
+            "streak_no_traffic": streak,
+            "last_reason": reason_text,
+            "last_release": str(release),
         }
         _write_failures(destination, campaign_id=campaign_id, attempts=attempts)
 
@@ -764,13 +877,16 @@ __all__ = [
     "SeasonTarget",
     "campaign_scope_key",
     "clear_failed",
+    "current_release",
     "current_season_targets",
     "env_int",
+    "is_quarantined_record",
     "mark_completed",
     "mark_failed",
     "plan_historical_batch",
     "plan_refresh_batch",
     "read_completed",
     "read_failures",
+    "read_scope_outcome",
     "read_snapshot",
 ]

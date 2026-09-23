@@ -794,3 +794,180 @@ def test_env_int_fails_closed_on_an_invalid_knob(monkeypatch, raw):
 
     with pytest.raises(ValueError, match="SOFASCORE_TEST_KNOB"):
         env_int("SOFASCORE_TEST_KNOB", 8, 1, 64)
+
+
+def _quarantine_plan(snapshot, failures_path, *, release="aaaaaaaa", moment=None):
+    return [item["SOFASCORE_SCOPE_KEY"] for item in plan_historical_batch(
+        snapshot,
+        completed=set(),
+        batch_size=10,
+        failures=read_failures(failures_path, campaign_id=snapshot["campaign_id"]),
+        max_scope_attempts=3,
+        park_cooldown_hours=24,
+        moment=moment,
+        release=release,
+    )]
+
+
+def _fail(failures_path, campaign_id, scope_key, run_id, *, reason, source_requests,
+          release="aaaaaaaa"):
+    mark_failed(
+        failures_path,
+        campaign_id=campaign_id,
+        scope_key=scope_key,
+        run_id=run_id,
+        reason=reason,
+        source_requests=source_requests,
+        release=release,
+    )
+
+
+SCHEMA_REASON = (
+    "season: capture_engine: endpoint standings_total is nonterminal: schema_error"
+)
+
+
+@pytest.mark.unit
+def test_three_free_identical_failures_quarantine_the_scope_not_its_tournament(
+    tmp_path,
+):
+    """#1351: 3 red attempts in a row at 0 source requests with the same reason
+    are a deterministic dead end (291:84027 — 25 attempts). The scope is
+    quarantined: never planned again on this release, no cooldown, and the
+    deeper seasons of its tournament do NOT wait behind it."""
+    from datetime import datetime, timedelta, timezone
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+    deeper = campaign_scope_key(campaign_id, 8, 824)
+
+    for run_id in ("run-1", "run-2", "run-3"):
+        _fail(failures_path, campaign_id, head, run_id,
+              reason=SCHEMA_REASON, source_requests=0)
+
+    record = read_failures(failures_path, campaign_id=campaign_id)[head]
+    assert record["count"] == 3
+    assert record["streak_no_traffic"] == 3
+    assert record["last_reason"] == SCHEMA_REASON
+    assert record["last_release"] == "aaaaaaaa"
+    planned = _quarantine_plan(snapshot, failures_path)
+    assert head not in planned
+    assert deeper in planned
+    # Terminal, unlike a park: a cooldown does not bring it back.
+    later = datetime.now(timezone.utc) + timedelta(hours=72)
+    assert head not in _quarantine_plan(snapshot, failures_path, moment=later)
+
+
+@pytest.mark.unit
+def test_three_paid_failures_still_park_as_before(tmp_path):
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    for run_id in ("run-1", "run-2", "run-3"):
+        _fail(failures_path, campaign_id, head, run_id,
+              reason=SCHEMA_REASON, source_requests=4)
+
+    assert read_failures(
+        failures_path, campaign_id=campaign_id
+    )[head]["streak_no_traffic"] == 0
+    planned = _quarantine_plan(snapshot, failures_path)
+    # Parked: the scope and, on purpose, its tournament's deeper season wait.
+    assert head not in planned
+    assert campaign_scope_key(campaign_id, 8, 824) not in planned
+
+
+@pytest.mark.unit
+def test_a_changed_reason_restarts_the_no_traffic_streak(tmp_path):
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    _fail(failures_path, campaign_id, head, "run-1",
+          reason=SCHEMA_REASON, source_requests=0)
+    _fail(failures_path, campaign_id, head, "run-2",
+          reason=SCHEMA_REASON, source_requests=0)
+    _fail(failures_path, campaign_id, head, "run-3",
+          reason="season: capture_engine: something else", source_requests=0)
+
+    record = read_failures(failures_path, campaign_id=campaign_id)[head]
+    assert record["streak_no_traffic"] == 1
+    # count 3 -> parked (tournament waits), not quarantined.
+    assert campaign_scope_key(campaign_id, 8, 824) not in _quarantine_plan(
+        snapshot, failures_path
+    )
+
+
+@pytest.mark.unit
+def test_a_new_release_lifts_the_quarantine_for_one_attempt(tmp_path):
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+    for run_id in ("run-1", "run-2", "run-3"):
+        _fail(failures_path, campaign_id, head, run_id,
+              reason=SCHEMA_REASON, source_requests=0)
+    assert head not in _quarantine_plan(snapshot, failures_path)
+
+    # A new release may carry the parser fix: one free attempt, even though
+    # count >= max_scope_attempts would otherwise park it.
+    assert head in _quarantine_plan(snapshot, failures_path, release="bbbbbbbb")
+
+    # The same outcome at 0 traffic on the new release -> quarantined again.
+    _fail(failures_path, campaign_id, head, "run-4",
+          reason=SCHEMA_REASON, source_requests=0, release="bbbbbbbb")
+    assert head not in _quarantine_plan(
+        snapshot, failures_path, release="bbbbbbbb"
+    )
+    # A manual lift is `clear_failed` (runbook: remove the entry).
+    clear_failed(failures_path, campaign_id=campaign_id, scope_key=head)
+    assert _quarantine_plan(snapshot, failures_path, release="bbbbbbbb")[0] == head
+
+
+@pytest.mark.unit
+def test_old_failure_records_without_quarantine_fields_still_read(tmp_path):
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+    failures_path.write_text(json.dumps({
+        "schema_version": 1,
+        "campaign_id": campaign_id,
+        "attempts": {head: {
+            "count": 3, "last_run_id": "old", "last_at": "2099-01-01T00:00:00+00:00",
+        }},
+    }))
+
+    # Parked (count 3, not cooled), not quarantined: the tournament waits.
+    planned = _quarantine_plan(snapshot, failures_path)
+    assert head not in planned
+    assert campaign_scope_key(campaign_id, 8, 824) not in planned
+    _fail(failures_path, campaign_id, head, "run-4",
+          reason=SCHEMA_REASON, source_requests=0)
+    record = read_failures(failures_path, campaign_id=campaign_id)[head]
+    assert record["count"] == 4
+    assert record["streak_no_traffic"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("root", "expected"),
+    [
+        ("/opt/sofascore/releases/release-1a3d9890", "1a3d9890"),
+        ("/opt/sofascore/releases/release-1a3d9890/", "1a3d9890"),
+        ("", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_current_release_is_the_sha8_of_the_release_root(monkeypatch, root, expected):
+    from dags.utils.sofascore_all_mens_state import current_release
+
+    if root is None:
+        monkeypatch.delenv("SOFASCORE_RELEASE_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("SOFASCORE_RELEASE_ROOT", root)
+    assert current_release() == expected

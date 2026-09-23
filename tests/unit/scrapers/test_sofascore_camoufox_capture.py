@@ -1007,3 +1007,61 @@ def test_proxy_connectivity_classifier_matches_connectivity_shapes():
         )
         is None
     )
+
+
+def _same_name_blocks_buffer(ut=291, sid=84027):
+    """#1351: two 'total' blocks share one ``name`` (Lebanese Second Division
+    25/26) and a team plays in both; only the block ``id`` tells them apart."""
+    def row(team_id, name, pts):
+        return {"team": {"id": team_id, "name": name}, "matches": 3,
+                "wins": pts // 3, "draws": pts % 3,
+                "losses": 3 - pts // 3 - pts % 3,
+                "scoresFor": 5, "scoresAgainst": 2, "points": pts}
+    return {
+        f"/api/v1/unique-tournament/{ut}/season/{sid}/standings/total": {
+            "status": 200, "challenge": False, "json": {"standings": [
+                {"type": "total", "id": 1001, "name": "Lebanese Second Division 25/26",
+                 "rows": [row(187262, "Club A", 9), row(2, "Club B", 4)]},
+                {"type": "total", "id": 1002, "name": "Lebanese Second Division 25/26",
+                 "rows": [row(187262, "Club A", 7), row(3, "Club C", 1)]},
+            ]}},
+    }
+
+
+def test_extract_tournament_standings_same_name_blocks_differ_by_id():
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    rows = extract_tournament_standings(_same_name_blocks_buffer(), 291, 84027)
+    assert [r["group_id"] for r in rows] == [1001, 1001, 1002, 1002]
+    groups = [normalize_standing(r)["group"] for r in rows]
+    # The first block keeps its published name; only a later block whose team
+    # would collide gets the id, so no already-published key changes.
+    assert groups == [
+        "Lebanese Second Division 25/26",
+        "Lebanese Second Division 25/26",
+        "Lebanese Second Division 25/26 #1002",
+        "Lebanese Second Division 25/26 #1002",
+    ]
+    # group_id is a key helper only, never a Bronze column.
+    assert "group_id" not in normalize_standing(rows[0])
+
+
+def test_same_name_blocks_without_shared_team_keep_the_published_group():
+    """#1351 (Astra r1): such a season already published under the plain name
+    (no duplicate, no schema_error); renaming it would leave the old Bronze
+    rows beside new ones under MERGE by (league, season, group, team)."""
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    buffer = _same_name_blocks_buffer()
+    path = next(iter(buffer))
+    buffer[path]["json"]["standings"][1]["rows"][0]["team"]["id"] = 4
+    rows = extract_tournament_standings(buffer, 291, 84027)
+    assert {normalize_standing(r)["group"] for r in rows} == {
+        "Lebanese Second Division 25/26"}
+
+
+def test_extract_tournament_standings_distinct_names_keep_plain_group():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_standings
+    rows = extract_tournament_standings(_wc_group_standings_buffer(), 16, 58210)
+    assert [r["group"] for r in rows] == [
+        "Group A", "Group A", "Group B", "Group B"]

@@ -9,6 +9,7 @@ fixtures/direct canaries opt out explicitly.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
@@ -100,7 +101,11 @@ class SeasonPartitionPlan:
 
     @property
     def complete(self) -> bool:
-        return not self.pending_keys and not self.player_universe_evidence_gaps
+        # #1351 (решение 8): player-universe gaps are NOT season incompleteness.
+        # They are kept on the plan and gate only the player phase
+        # (``player_universe_ready``); a season whose participants omit a club
+        # used to fail every attempt at zero traffic, forever.
+        return not self.pending_keys
 
     @property
     def match_phase_ready(self) -> bool:
@@ -119,17 +124,18 @@ class SeasonPartitionPlan:
         profiles are still planned and captured — just on the next run.
         """
 
-        if self.player_universe_evidence_gaps:
-            return False
         return not any(
             key.endpoint != REFEREE_PROFILE_ENDPOINT for key in self.pending_keys
         )
 
     @property
     def player_universe_ready(self) -> bool:
-        """``complete`` for the player phase: the same referee-tolerant view."""
+        """The player phase: the referee-tolerant view plus a proven universe.
 
-        return self.match_phase_ready
+        The only place ``player_universe_evidence_gaps`` block anything (#1351).
+        """
+
+        return self.match_phase_ready and not self.player_universe_evidence_gaps
 
 
 @dataclass(frozen=True)
@@ -197,8 +203,31 @@ def _is_placeholder_team(team: object) -> bool:
     and have no squads, so counting them keeps the season plan permanently
     incomplete (#946). ``type`` does not discriminate and the registry
     ``enabled`` flag is unrelated.
+
+    Some brackets send the stub WITHOUT the flag, recognisable only by its
+    name ("W101"/"L101" = winner/loser of match 101, "TBD"/"TBA") or slug
+    ("winner-of-…"/"loser-of-…"); those failed the season as
+    ``participants omitted scheduled team ids`` every day (#1351).
     """
-    return isinstance(team, Mapping) and team.get("disabled") is True
+    if not isinstance(team, Mapping):
+        return False
+    return _is_placeholder_side(team.get("disabled"), team.get("name"), team.get("slug"))
+
+
+def _is_placeholder_side(disabled: object, name: object, slug: object) -> bool:
+    """The stub predicate on a team's flag/name/slug (event object or the
+    flattened ``<side>_team_*`` schedule columns alike)."""
+    if disabled is True:
+        return True
+    name = str(name or "").strip()
+    slug = str(slug or "").strip().casefold()
+    return bool(
+        _PLACEHOLDER_TEAM_NAME.fullmatch(name)
+        or slug.startswith(("winner-of-", "loser-of-"))
+    )
+
+
+_PLACEHOLDER_TEAM_NAME = re.compile(r"[WL]\d{1,3}|TBD|TBA", re.IGNORECASE)
 
 
 def _schedule_schema(source_season_id: str):
@@ -312,15 +341,14 @@ def build_schedule_page_spec(
             )
         },
         paid_proxy=paid_proxy,
-        # The seed page has no predecessor. SofaScore returns 404 when that
-        # direction has no events (for example ``next/0`` after a season has
-        # ended), which is a legitimate empty direction. Later pages are only
-        # planned after a preceding ``hasNextPage=true`` and therefore keep a
-        # 404 resumable/failing.
-        legitimate_empty_http_statuses=(204, 404) if page == 0 else (204,),
-        # A page explicitly promised by the preceding ``hasNextPage`` is
-        # required. A transient 404 must remain resumable, not become a cached
-        # ``not_supported`` hole in the schedule chain.
+        # SofaScore returns 404 when a direction has no (more) events: on the
+        # seed page (``next/0`` after a season has ended) and further down the
+        # chain alike. A 404 on a page promised by the preceding
+        # ``hasNextPage=true`` means the chain ended, exactly as in
+        # ``schedule_refresh`` (#1351): keeping it retryable replayed the
+        # stored 404 at zero traffic into a red league every day.
+        legitimate_empty_http_statuses=(204, 404),
+        # Never a cached ``not_supported`` hole in the schedule chain.
         not_supported_http_statuses=(),
     )
 
@@ -394,7 +422,10 @@ def _standings_parser(
             team_id = str(source["team"]["id"])
             row = normalize_standing(source)
             group = str(row.get("group") or "")
-            key = (group, team_id)
+            # #1351: the block id, when the source sent one, is the identity of
+            # the table; a shared block name is not a duplicate.
+            group_id = source.get("group_id")
+            key = (str(group_id) if group_id is not None else group, team_id)
             if key in seen:
                 raise SchemaValidationError(
                     f"duplicate standings row group={group!r} team={team_id}"
@@ -845,9 +876,9 @@ def plan_season_partition(
         )
         if required_schedule_page:
             # Schedule pages, including a page promised by its predecessor,
-            # are never optional. A seed page may nevertheless be a body-less
-            # terminal empty (204/404) when that whole direction has no events.
-            # Promised later pages do not accept 404 in their endpoint policy.
+            # are never optional. Any page may nevertheless be a body-less
+            # terminal empty (204/404): the direction has no (more) events and
+            # the chain ends there (#1351).
             accepted_schedule_empty = bool(
                 manifest
                 and manifest.status == ManifestStatus.LEGITIMATE_EMPTY
@@ -970,13 +1001,11 @@ def plan_season_partition(
             player_universe_evidence_gaps.append(
                 "participants returned no teams; squad universe is unproven"
             )
-            append_key_once(pending, participants.key)
         elif missing_participants:
             missing_tokens = ",".join(sorted(missing_participants, key=int))
             player_universe_evidence_gaps.append(
                 "participants omitted scheduled team ids: " + missing_tokens
             )
-            append_key_once(pending, participants.key)
 
     # Schedule evidence is authoritative for teams that actually played, while
     # participants can add registered teams that do not appear in the captured
@@ -999,7 +1028,6 @@ def plan_season_partition(
             player_universe_evidence_gaps.append(
                 f"scheduled/participating team {team_id} has an empty squad"
             )
-            append_key_once(pending, spec.key)
         elif (
             not stored.has_valid_json
             and squad_manifest is not None
@@ -1009,7 +1037,6 @@ def plan_season_partition(
             player_universe_evidence_gaps.append(
                 f"scheduled/participating team {team_id} has no usable squad evidence"
             )
-            append_key_once(pending, spec.key)
 
     referee_ids = set(embedded_referee_ids)
     for event_id in event_ids:
@@ -1119,8 +1146,8 @@ def _is_schedule_identity_conflict(
 
     ``previous`` is the older observation, ``current`` the fresher one. A
     column missing on either copy is not a conflict. A knockout-bracket stub
-    ("Winner of match N", ``<side>_team_disabled`` is True on the older copy;
-    see ``_is_placeholder_team``) resolving into a real team is the source
+    ("Winner of match N", ``<side>_team_disabled`` is True or the name/slug is
+    a stub on the older copy; see ``_is_placeholder_team``) resolving into a real team is the source
     filling in a slot, not a different match.
     """
 
@@ -1132,7 +1159,13 @@ def _is_schedule_identity_conflict(
         return False
     if column in ("home_team_id", "away_team_id"):
         side = column[: -len("_id")]
-        if previous.get(f"{side}_disabled") is True:
+        # Same stub predicate as the team universe (#1351): a named ``W101``
+        # slot without ``disabled`` resolves into the real team too.
+        if _is_placeholder_side(
+            previous.get(f"{side}_disabled"),
+            previous.get(f"{side}_name"),
+            previous.get(f"{side}_slug"),
+        ):
             return False
     return True
 
@@ -1282,11 +1315,9 @@ def materialize_season_partition(
 
     league = _canonical_token(canonical_league, "canonical_league")
     season = _canonical_token(canonical_season, "canonical_season")
-    if plan.player_universe_evidence_gaps:
-        raise SeasonMaterializationError(
-            "player universe evidence is incomplete: "
-            + "; ".join(plan.player_universe_evidence_gaps)
-        )
+    # Player-universe gaps do not stop the season (#1351): the schedule and
+    # table are complete evidence on their own; the gaps stay on the plan and
+    # only the player phase refuses a partial universe.
     expected_keys = [spec.key for spec in plan.specs]
     result_keys = [result.manifest.key for result in results]
     if len(result_keys) != len(set(result_keys)):

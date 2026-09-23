@@ -188,6 +188,7 @@ def _task_state(task_instance: Any) -> str:
 def _finalize_historical_run(**context: Any) -> dict[str, Any]:
     planned = context["ti"].xcom_pull(task_ids="plan_historical_batch") or []
     dag_run = context.get("dag_run")
+    release = state.current_release()
     for index, environment in enumerate(planned):
         scope_key = environment.get("SOFASCORE_SCOPE_KEY")
         if not scope_key or dag_run is None:
@@ -207,11 +208,17 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
                 states.add(_task_state(task_instance))
         if not states & {"failed", "upstream_failed"}:
             continue
+        reason, source_requests = state.read_scope_outcome(
+            environment.get("SOFASCORE_SCOPE_RESULT_PATH")
+        )
         state.mark_failed(
             FAILURES_PATH,
             campaign_id=environment["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
             scope_key=scope_key,
             run_id=str(context.get("run_id") or "manual"),
+            reason=reason,
+            source_requests=source_requests,
+            release=release,
         )
     did_work = bool(planned)
     target = datetime.now(timezone.utc) + (

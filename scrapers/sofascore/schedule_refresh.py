@@ -35,6 +35,7 @@ from scrapers.sofascore.raw_store import (
     RawPayloadRecord,
     RawPayloadStore,
 )
+from scrapers.sofascore.season_pipeline import _is_placeholder_side
 
 
 log = logging.getLogger(__name__)
@@ -618,7 +619,7 @@ def _is_identity_conflict(
     """True when two copies of one ``game_id`` are DIFFERENT matches.
 
     A knockout-bracket stub ("Winner of match N", ``<side>_team_disabled`` True
-    on the OLDER copy) resolving into a real team is the source filling in a
+    or a stub name/slug such as ``W101`` on the OLDER copy) resolving into a real team is the source filling in a
     slot, not a contradiction.  ``season_pipeline._is_schedule_identity_conflict``
     has exempted exactly that since Sol round 21; this lane compared the raw
     team ids instead, so a resolved cup tie was counted as a conflict, the
@@ -640,7 +641,13 @@ def _is_identity_conflict(
             continue
         if previous[column] == current[column]:
             continue
-        if previous.get(f"{side}_disabled") is True:
+        # Same stub predicate as the season lane (#1351): a named ``W101``
+        # slot without ``disabled`` resolves into the real team too.
+        if _is_placeholder_side(
+            previous.get(f"{side}_disabled"),
+            previous.get(f"{side}_name"),
+            previous.get(f"{side}_slug"),
+        ):
             continue
         return True
     return False

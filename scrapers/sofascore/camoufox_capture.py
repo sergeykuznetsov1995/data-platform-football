@@ -307,15 +307,33 @@ def extract_tournament_standings(buffer: Dict[str, dict], ut_id, season_id) -> l
     if not blocks and isinstance(standings[0], dict):
         blocks = [standings[0]]
     multi_group = len(blocks) > 1
+    # #1351: two blocks may share one ``name`` (Lebanese Second Division 25/26)
+    # with a team in both; the block ``id`` is the real identity. ``group_id``
+    # only keys the parser's duplicate check (never a Bronze column). Only a
+    # LATER same-name block that repeats a team already seen under that name
+    # gets `` #<id>`` appended, so Bronze rows differ — every season that could
+    # publish before (no repeated team) keeps its group key unchanged.
+    teams_by_name: dict = {}
     rows: list = []
     for block in blocks:
         block_rows = block.get("rows")
         if not isinstance(block_rows, list):
             continue
         group_name = block.get("name") if multi_group else None
+        group_id = block.get("id") if multi_group else None
+        if multi_group:
+            block_teams = {
+                str((row.get("team") or {}).get("id"))
+                for row in block_rows
+                if isinstance(row, dict) and isinstance(row.get("team"), dict)
+            }
+            seen = teams_by_name.setdefault(group_name, set())
+            if group_id is not None and block_teams & seen:
+                group_name = f"{group_name} #{group_id}"
+            seen |= block_teams
         for row in block_rows:
             if multi_group and isinstance(row, dict) and not row.get("group"):
-                row = {**row, "group": group_name}
+                row = {**row, "group": group_name, "group_id": group_id}
             rows.append(row)
     return rows
 

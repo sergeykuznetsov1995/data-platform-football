@@ -736,6 +736,9 @@ def _run_match_capture(
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -1870,6 +1873,19 @@ def _write_results(path: str, payload: dict) -> None:
             logger.warning("proxy-traffic log failed: %s", e)
 
 
+def _record_player_universe_gaps(results: dict, plan) -> None:
+    """Keep the player-universe gaps of a published season visible (#1351).
+
+    They no longer fail the season phase; only the player phase refuses a
+    partial universe. The list goes to the phase report, the count to
+    ``traffic`` so the scope-cycle result carries it.
+    """
+
+    gaps = list(plan.player_universe_evidence_gaps)
+    results["player_universe_gaps"] = gaps
+    results["traffic"]["player_universe_gaps"] = len(gaps)
+
+
 def _run_season_capture_engine(
     leagues: List[str],
     season: int,
@@ -1965,6 +1981,7 @@ def _run_season_capture_engine(
                 "cache_hit_rate": 1.0,
                 "endpoint_completeness": 1.0,
             }
+            _record_player_universe_gaps(results, plan)
             _write_results(output_path, results)
             return 0
         live_traffic = None
@@ -2123,6 +2140,7 @@ def _run_season_capture_engine(
             live_traffic,
         )
         results["traffic"]["endpoint_completeness"] = 1.0
+        _record_player_universe_gaps(results, committed)
         _write_results(output_path, results)
         return 0
     except ReplaceGuardError as exc:
@@ -2382,6 +2400,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -2404,6 +2425,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -2495,6 +2519,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
@@ -2527,6 +2554,9 @@ def main(argv=None):
                     "browser_sessions": 0,
                     "browser_navigations": 0,
                     "requests": 0,
+                    # Failed closed before any capture: provably no source
+                    # request (#1351 — the quarantine streak reads this).
+                    "source_request_count": 0,
                 },
             },
         )
