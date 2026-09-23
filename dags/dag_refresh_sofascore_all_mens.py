@@ -9,18 +9,23 @@ seasons playing now, the known ones and the never-seeded, each walking its own
 cursor; ``run_sofascore_schedule_refresh.py`` carries the details.  The 14
 configured leagues stay with ``dag_ingest_sofascore``; the frozen campaign
 state (state.json, failures.json) is never touched by this lane.
+After that, ``enrich_season_metadata`` validates the next pending seasons of
+the campaign snapshot by queue priority (#1354), so the history lane keeps
+getting ready seasons without a serialized metadata wave of its own.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
@@ -124,6 +129,23 @@ REFRESH_TASK_ENV: dict[str, str] = {}
 _control_url = os.environ.get("SOFASCORE_REFRESH_PROXY_CONTROL_URL", "").strip()
 if _control_url:
     REFRESH_TASK_ENV["SOFASCORE_PROXY_CONTROL_URL"] = _control_url
+# Season metadata enrichment (#1354): after the refresh work, the lane
+# validates the next N pending seasons of the snapshot by queue priority, so
+# the history lane always has ready seasons to plan.  0 switches it off.  The
+# task is NOT in REFRESH_TASK_IDS: a failed enrichment is a red task, never a
+# red DagRun.
+METADATA_SEASONS_PER_RUN = state.env_int(
+    "SOFASCORE_METADATA_SEASONS_PER_RUN", 170, 0, 10000
+)
+METADATA_BUDGET_BYTES = 16 * 1024 * 1024
+METADATA_TIMEOUT = timedelta(minutes=40)
+METADATA_RESULT_DIR = str(Path(
+    os.environ.get(
+        "SOFASCORE_ALL_MENS_RESULT_DIR",
+        "/opt/airflow/runtime/sofascore/all-men/results",
+    )
+).parent / "metadata-results")
+ENRICH_SCRIPT = "/opt/airflow/scripts/enrich_sofascore_all_mens_snapshot.py"
 REFRESH_TASK_IDS = frozenset({
     "refresh_season_schedules",
     "plan_refresh_batch",
@@ -254,9 +276,11 @@ def _validate_refresh_scope(**environment: str) -> dict[str, Any]:
     campaign_id, tournament_id, season_id = environment[
         "SOFASCORE_SCOPE_KEY"
     ].split(":")
+    # The result's snapshot_id is the revision the scope actually ran on; the
+    # metadata enrichment may have advanced it after planning (#1354), which
+    # leaves the campaign identity and this exact scope intact.
     if (
-        result.get("snapshot_id") != environment["SOFASCORE_EXPECTED_SNAPSHOT_ID"]
-        or result.get("campaign_id") != campaign_id
+        result.get("campaign_id") != campaign_id
         or int(result.get("tournament_id", 0)) != int(tournament_id)
         or int(result.get("source_season_id", 0)) != int(season_id)
     ):
@@ -264,6 +288,55 @@ def _validate_refresh_scope(**environment: str) -> dict[str, Any]:
     # A refreshed scope is never "completed": the next DagRun re-plans it
     # from Bronze evidence as new games finish.
     return {"status": "refreshed", "scope_key": environment["SOFASCORE_SCOPE_KEY"]}
+
+
+def _enrich_season_metadata(**context: Any) -> dict[str, Any]:
+    if not METADATA_SEASONS_PER_RUN:
+        raise AirflowSkipException("SOFASCORE_METADATA_SEASONS_PER_RUN is 0")
+    snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+    run_id = str(context.get("run_id") or "manual")
+    result_dir = Path(METADATA_RESULT_DIR)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    report_path = result_dir / (
+        "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id)
+        + ".json"
+    )
+    command = [
+        sys.executable, ENRICH_SCRIPT,
+        "--snapshot", SNAPSHOT_PATH,
+        "--policy", POLICY_PATH,
+        "--output", SNAPSHOT_PATH,
+        "--select", "priority",
+        "--max-seasons", str(METADATA_SEASONS_PER_RUN),
+        "--expected-snapshot-id", str(snapshot["snapshot_id"]),
+        "--dag-id", DAG_ID,
+        "--run-id", run_id,
+        "--task-id", "enrich_season_metadata",
+        "--budget-cap-bytes", str(METADATA_BUDGET_BYTES),
+        "--report", str(report_path),
+    ]
+    env = {
+        **os.environ,
+        **REFRESH_TASK_ENV,
+        "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+    }
+    completed = subprocess.run(command, env=env, cwd="/opt/airflow", check=False)
+    if completed.returncode != 0:
+        raise AirflowException(
+            f"season metadata enrichment failed (exit {completed.returncode}); "
+            f"report: {report_path}"
+        )
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AirflowException(f"metadata report is unreadable: {exc}") from exc
+    traffic = report.get("traffic") or {}
+    return {
+        "campaign_id": snapshot.get("campaign_id"),
+        "ready_wave_scopes": report.get("ready_wave_scopes"),
+        "source_requests": report.get("source_requests"),
+        "paid_proxy_bytes": traffic.get("paid_proxy_bytes"),
+    }
 
 
 def _task_state(task_instance: Any) -> str:
@@ -413,6 +486,20 @@ with DAG(
         python_callable=_validate_refresh_scope,
         retries=0,
     ).expand(op_kwargs=plan.output)
+    enrich = PythonOperator(
+        task_id="enrich_season_metadata",
+        python_callable=_enrich_season_metadata,
+        # Runs whatever the refresh work did: metadata is independent of it.
+        trigger_rule="all_done",
+        pool=REFRESH_POOL,
+        # Below the refresh scopes (5) in the shared pool.
+        priority_weight=1,
+        # NO retry, like the schedule sweep above: a second attempt of the same
+        # DagRun would walk the same paid selection again on what is left of
+        # the run budget; the next scheduled run continues from the snapshot.
+        retries=0,
+        execution_timeout=METADATA_TIMEOUT,
+    )
     propagate = PythonOperator(
         task_id="propagate_refresh_status",
         python_callable=_propagate_status,
@@ -420,7 +507,7 @@ with DAG(
         retries=0,
     )
 
-    fetch >> plan >> run >> validate >> propagate
+    fetch >> plan >> run >> validate >> enrich >> propagate
 
 
 __all__ = ["DAG_ID", "dag"]
