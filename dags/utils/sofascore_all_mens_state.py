@@ -361,7 +361,6 @@ def plan_historical_batch(
     workload_artifact: str = (
         "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
     ),
-    metadata_budget_bytes: int = 64 * 1024 * 1024,
     dag_run_id: str = "manual",
     authorized_season_classes: Iterable[str] | None = None,
     task_env: Mapping[str, str] | None = None,
@@ -383,7 +382,9 @@ def plan_historical_batch(
     are ranked by ``(queue_priority, depth, -start_year, tournament_id)``
     where ``depth`` is
     the season's position in the tournament's newest-first season list. A
-    pending season yields one serialized metadata task for its wave; a
+    pending season is skipped (it still blocks the deeper seasons of its
+    tournament); its metadata is enriched by the refresh DAG's
+    ``enrich_season_metadata`` task (#1354), never by this plan. A
     season whose shape is not declared in the static workload policy is
     deferred and holds the deeper seasons of its tournament until the policy
     declares that shape.
@@ -414,12 +415,6 @@ def plan_historical_batch(
         or max_scope_attempts < 1
     ):
         raise CampaignPlanningError("max_scope_attempts must be a positive integer")
-    if (
-        isinstance(metadata_budget_bytes, bool)
-        or not isinstance(metadata_budget_bytes, int)
-        or metadata_budget_bytes < 1
-    ):
-        raise CampaignPlanningError("metadata_budget_bytes must be positive")
     snapshot_id = str(snapshot.get("snapshot_id") or "")
     if not snapshot_id or snapshot_id != _snapshot_digest(snapshot):
         raise CampaignPlanningError("campaign snapshot digest mismatch")
@@ -558,32 +553,10 @@ def plan_historical_batch(
     ranked.sort(key=lambda item: item[0])
     planned: list[dict[str, str]] = []
     for _rank, kind, tournament, season in ranked:
-        if kind in ("completed", "deferred", "parked", "quarantined"):
+        if kind in ("completed", "deferred", "parked", "quarantined", "pending"):
+            # A pending season waits for the refresh lane's metadata
+            # enrichment (#1354); it never serializes the history lane.
             continue
-        if kind == "pending":
-            if planned:
-                break
-            wave = int(season["start_year"])
-            safe_run = hashlib.sha256(
-                f"{dag_run_id}:metadata:{campaign_id}:{wave}".encode("utf-8")
-            ).hexdigest()[:20]
-            return [{
-                **lane_env,
-                "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
-                "SOFASCORE_CAMPAIGN_ACTION": "metadata",
-                "SOFASCORE_CAMPAIGN_SNAPSHOT": snapshot_path,
-                "SOFASCORE_ALL_MENS_POLICY": policy_path,
-                "SOFASCORE_EXPECTED_SNAPSHOT_ID": snapshot_id,
-                "SOFASCORE_EXPECTED_CAMPAIGN_ID": campaign_id,
-                "SOFASCORE_METADATA_WAVE": str(wave),
-                "SOFASCORE_METADATA_BUDGET_BYTES": str(metadata_budget_bytes),
-                "SOFASCORE_SCOPE_RESULT_PATH": str(
-                    Path(result_dir) / f"{safe_run}.json"
-                ),
-                "SOFASCORE_SCOPE_OUTPUT_DIR": str(
-                    Path(result_dir) / safe_run
-                ),
-            }]
         planned.append(_scope_task_env(
             "capture",
             snapshot_id=snapshot_id,
