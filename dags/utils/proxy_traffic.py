@@ -522,8 +522,10 @@ def daily_rollup(conn) -> Dict[str, Any]:
     """Per-source residential-traffic totals for *yesterday* (#789 Phase 2).
 
     Reuses ``_execute`` (fetch=True). Returns
-    ``{total_mb, total_gb, by_source: [{source, mb, gb, runs, paid_mb}], report}`` where
-    ``report`` is the human line the daily DAG logs.
+    ``{total_mb, total_gb, total_paid_mb, unbilled_sources,
+    by_source: [{source, mb, gb, runs, paid_mb}], report}`` where ``report`` is
+    the human line the daily DAG logs.  ``total_mb`` is decoded body traffic;
+    ``total_paid_mb`` is provider-billed traffic of metered sources only.
     """
     _execute = _silver_tasks_module()._execute
 
@@ -554,15 +556,35 @@ def daily_rollup(conn) -> Dict[str, Any]:
         for r in rows
     ]
     total_mb = round(sum(float(r[1] or 0.0) for r in rows), 4)
+    # #1388: decoded body bytes are not what the provider bills.  Billed bytes
+    # exist only for metered sources; the rest are named as having no billing
+    # data instead of being silently mixed into a "spend" total.
+    paid = [s for s in by_source if s["paid_mb"] is not None]
+    unbilled = [s["source"] for s in by_source if s["paid_mb"] is None]
+    total_paid_mb = (
+        round(sum(s["paid_mb"] for s in paid), 4) if paid else None
+    )
     parts = ", ".join(
         f"{s['source']} {s['gb']} GB"
         + (f" (оплачено {s['paid_mb']} МиБ)" if s["paid_mb"] is not None else "")
         for s in by_source
     ) or "—"
-    report = f"вчера прокси съели {round(total_mb / 1024, 3)} GB ({total_mb} MB): {parts}"
+    paid_txt = (
+        f"оплачено провайдеру {total_paid_mb} МиБ "
+        f"({', '.join(s['source'] for s in paid)})"
+        if paid else "оплаченных байт нет"
+    )
+    if unbilled:
+        paid_txt += f"; без данных биллинга: {', '.join(unbilled)}"
+    report = (
+        f"вчера прокси: распаковано {round(total_mb / 1024, 3)} GB "
+        f"({total_mb} MB); {paid_txt}: {parts}"
+    )
     return {
         "total_mb": total_mb,
         "total_gb": round(total_mb / 1024, 3),
+        "total_paid_mb": total_paid_mb,
+        "unbilled_sources": unbilled,
         "by_source": by_source,
         "report": report,
     }

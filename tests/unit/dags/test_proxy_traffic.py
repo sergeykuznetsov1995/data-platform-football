@@ -276,6 +276,13 @@ class TestDailyRollup:
         # #1388: provider-billed bytes next to decoded ones, only when metered.
         assert "transfermarkt 0.293 GB (оплачено 1200.5 МиБ)" in out["report"]
         assert "fbref 0.879 GB," in out["report"]
+        assert out["total_paid_mb"] == 1200.5
+        assert out["unbilled_sources"] == ["fbref"]
+        assert out["report"].startswith(
+            "вчера прокси: распаковано 1.172 GB (1200.0 MB); "
+            "оплачено провайдеру 1200.5 МиБ (transfermarkt); "
+            "без данных биллинга: fbref: "
+        )
         assert any(
             "sum(CAST(provider_metered_bytes AS double)" in s
             for s in fake_silver["executed"]
@@ -296,5 +303,7 @@ class TestDailyRollup:
         out = pt.daily_rollup(object())
 
         assert out["total_mb"] == 0.0
+        assert out["total_paid_mb"] is None
+        assert "оплаченных байт нет" in out["report"]
         assert out["by_source"] == []
         assert "—" in out["report"]

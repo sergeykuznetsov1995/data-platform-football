@@ -58,9 +58,10 @@ class _TlsFactory:
 class _LeaseProvider:
     """Leases that expire ``ttl`` seconds after the injected clock."""
 
-    def __init__(self, clock, ttl):
+    def __init__(self, clock, ttl, permit_wait=None):
         self.clock = clock
         self.ttl = ttl
+        self.permit_wait = permit_wait
         self.acquired = []
         self.closed = []
 
@@ -83,6 +84,8 @@ class _LeaseProvider:
         return replace(LeaseTrafficSnapshot(up_bytes=10, down_bytes=90), closed=True)
 
     def acquire_request_permit(self, *, metadata, request_id):
+        if self.permit_wait is not None:
+            self.permit_wait()
         return "permit"
 
     @staticmethod
@@ -90,8 +93,8 @@ class _LeaseProvider:
         return f"http://lease:{lease.token}@proxy_filter:8900"
 
 
-def _metered_client(clock, ttl):
-    provider = _LeaseProvider(clock, ttl)
+def _metered_client(clock, ttl, permit_wait=None):
+    provider = _LeaseProvider(clock, ttl, permit_wait)
     factory = _TlsFactory()
     client = TransfermarktHttpClient(
         lease_provider=provider,
@@ -157,6 +160,31 @@ def test_expiring_lease_is_rotated_before_the_request_with_a_new_session():
         "multi_request_sessions": 1,
         "max_requests_per_session": 2,
     }
+
+
+@pytest.mark.unit
+def test_lease_expiry_is_checked_after_the_permit_wait():
+    now = [1_000.0]
+
+    def permit_wait():
+        now[0] += 65  # the longest bounded permit poll
+
+    client, provider, factory = _metered_client(
+        lambda: now[0], ttl=200, permit_wait=permit_wait,
+    )
+
+    # 200 s lease: after the first wait 135 s are left -> same session.
+    client.fetch("https://www.transfermarkt.us/a", as_json=False, label="mv")
+    # Before the second wait 135 s are left (would pass a pre-wait check),
+    # after it only 70 s; after the third wait 5 s -> rotate before I/O.
+    client.fetch("https://www.transfermarkt.us/b", as_json=False, label="mv")
+    client.fetch("https://www.transfermarkt.us/c", as_json=False, label="mv")
+
+    assert provider.closed == ["lease-1"]
+    assert len(provider.acquired) == 2
+    assert provider.acquired[1].expires_at - now[0] == 200
+    assert client.get_traffic_stats()["requests_per_session"]["sessions"] == 2
+    assert len({call["session_id"] for call in factory.calls}) == 2
 
 
 # --- real sockets: local CONNECT proxy counting accepted connections -------
@@ -257,7 +285,7 @@ def _count_connections(base_url, proxy, *, keep_session_id):
 
     def factory(**kwargs):
         if not keep_session_id:
-            kwargs.pop("session_id")
+            kwargs.pop("session_id", None)
         # Test-only: the local page has a self-signed certificate.
         return tls_requests.Client(verify=False, **kwargs)
 

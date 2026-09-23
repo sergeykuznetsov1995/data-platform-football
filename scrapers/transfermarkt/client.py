@@ -816,11 +816,6 @@ class TransfermarktHttpClient:
         context: Mapping[str, Any],
         retry: bool,
     ):
-        if self._client is not None and self._lease_expiring():
-            # Planned rotation, not a transport failure: close the session
-            # and the lease before the gateway expires it mid-request.
-            self._discard_client()
-            self._close_lease(label=label)
         if self._client is not None:
             return self._client, self._proxy_obj
 
@@ -1747,6 +1742,17 @@ class TransfermarktHttpClient:
                     label=label,
                     context=context,
                 )
+                if self._lease_expiring():
+                    # Planned rotation right before I/O, not a transport
+                    # failure: rate-limit and permit waits (up to 65 s) can
+                    # outlast the lease remainder.  Permits are bound to the
+                    # run and request, not to the lease.
+                    self._discard_client()
+                    self._close_lease(label=label)
+                    client, proxy_obj = self._ensure_client(
+                        url=url, label=label, context=context,
+                        retry=attempt > 1,
+                    )
                 if self._session_id is not None:
                     self._requests_by_session[self._session_id] = (
                         self._requests_by_session.get(self._session_id, 0) + 1
