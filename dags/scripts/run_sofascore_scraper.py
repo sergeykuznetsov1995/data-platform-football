@@ -610,14 +610,21 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
     }
     # #1352: a row-level violation refuses that row, not the whole batch.
     rejected_rows = []
-    rows_before = {}
+    # Every row of a table refused on its own merits (not emptied by dropping
+    # a rejected match): the caller decides whether that is a parser/contract
+    # defect (fresh data -> red) or a quarantine replay (journal).
+    all_rejected = None
     for dataset, table in dq_tables.items():
         frame = frames[dataset]
-        rows_before[dataset] = len(frame)
         if not frame.empty:
             records = frame.to_dict("records")
             report = validate_table_rows(table, records)
             _, rejected = report.partition(records, allow_all_rejected=True)
+            if rejected and len(rejected) == len(records) and all_rejected is None:
+                all_rejected = (
+                    f"all {len(records)} rows of {table} rejected: "
+                    f"{rejected[0].code}"
+                )
             if rejected:
                 rejected_rows.extend(rejected)
                 keep = [
@@ -644,16 +651,6 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
                 frames[name] = frame[
                     ~frame[column].astype(str).isin(rejected_match_ids)
                 ]
-    # Nothing of a table survived: the caller decides whether that is a parser
-    # or contract defect (fresh data -> red) or a quarantine replay (journal).
-    all_rejected = None
-    for dataset, table in dq_tables.items():
-        if rejected_rows and rows_before[dataset] and frames[dataset].empty:
-            all_rejected = (
-                f"all {rows_before[dataset]} rows of {table} rejected: "
-                f"{rejected_rows[0].code}"
-            )
-            break
     if not frames["lineups"].empty:
         validate_lineup_semantics(frames["lineups"].to_dict("records")).require()
     if not frames["event_participants"].empty:
