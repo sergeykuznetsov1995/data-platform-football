@@ -564,11 +564,15 @@ def daily_rollup(conn) -> Dict[str, Any]:
     # exist only for metered sources; the rest are named as having no billing
     # data instead of being silently mixed into a "spend" total.
     paid = [s for s in by_source if s["paid_mb"] is not None]
-    unbilled = [s["source"] for s in by_source if s["unbilled_runs"]]
+    # Only partly billed sources (some runs metered, some not) are named:
+    # never-metered sources (fbref, sofascore, …) would be daily noise that
+    # hides a real metering loss of a paid source.
+    partial = [s for s in paid if s["unbilled_runs"]]
+    unbilled = [s["source"] for s in partial]
     total_paid_mb = (
         round(sum(s["paid_mb"] for s in paid), 4) if paid else None
     )
-    paid_complete = bool(paid) and not any(s["unbilled_runs"] for s in paid)
+    paid_complete = bool(paid) and not partial
 
     def _paid_note(s):
         if s["paid_mb"] is None:
@@ -583,17 +587,18 @@ def daily_rollup(conn) -> Dict[str, Any]:
     parts = ", ".join(
         f"{s['source']} {s['gb']} GB{_paid_note(s)}" for s in by_source
     ) or "—"
-    paid_txt = (
-        f"оплачено провайдеру {total_paid_mb} МиБ"
-        + ("" if paid_complete else " (итог неполный)")
-        + f" ({', '.join(s['source'] for s in paid)})"
-        if paid else "оплаченных байт нет"
-    )
-    if unbilled:
+    if paid:
+        incomplete = "" if paid_complete else " (итог неполный)"
+        paid_txt = (
+            f"оплачено провайдеру {total_paid_mb} МиБ{incomplete} "
+            f"({', '.join(s['source'] for s in paid)})"
+        )
+    else:
+        paid_txt = "оплаченных байт нет"
+    if partial:
         paid_txt += "; без данных биллинга: " + ", ".join(
-            s["source"] if s["paid_mb"] is None
-            else f"{s['source']} ({s['unbilled_runs']} из {s['runs']} прогонов)"
-            for s in by_source if s["unbilled_runs"]
+            f"{s['source']} ({s['unbilled_runs']} из {s['runs']} прогонов)"
+            for s in partial
         )
     report = (
         f"вчера прокси: распаковано {round(total_mb / 1024, 3)} GB "

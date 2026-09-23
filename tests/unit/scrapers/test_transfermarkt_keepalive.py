@@ -18,6 +18,7 @@ from scrapers.transfermarkt.models import (
     FetchStatus,
     LeaseTrafficSnapshot,
     ProxyLease,
+    ProxyRequiredError,
     SharedTrafficLedger,
 )
 
@@ -34,10 +35,13 @@ class _Response:
 
 
 class _TlsClient:
-    def __init__(self):
+    def __init__(self, fail=False):
         self.closed = False
+        self.fail = fail
 
     def get(self, url, **kwargs):
+        if self.fail:
+            raise ConnectionError("connection reset by exit")
         return _Response(b"page")
 
     def close(self):
@@ -45,23 +49,27 @@ class _TlsClient:
 
 
 class _TlsFactory:
-    def __init__(self):
+    def __init__(self, failing_clients=0):
         self.calls = []
         self.clients = []
+        self.failing_clients = failing_clients
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
-        self.clients.append(_TlsClient())
+        self.clients.append(
+            _TlsClient(fail=len(self.clients) < self.failing_clients)
+        )
         return self.clients[-1]
 
 
 class _LeaseProvider:
     """Leases that expire ``ttl`` seconds after the injected clock."""
 
-    def __init__(self, clock, ttl, permit_wait=None):
+    def __init__(self, clock, ttl, permit_wait=None, close_failures=0):
         self.clock = clock
         self.ttl = ttl
         self.permit_wait = permit_wait
+        self.close_failures = close_failures
         self.acquired = []
         self.closed = []
 
@@ -80,6 +88,9 @@ class _LeaseProvider:
         return LeaseTrafficSnapshot(up_bytes=10, down_bytes=90)
 
     def close(self, lease):
+        if self.close_failures:
+            self.close_failures -= 1
+            raise ProxyRequiredError("proxy lease API rejected DELETE (HTTP 500)")
         self.closed.append(lease.lease_id)
         return replace(LeaseTrafficSnapshot(up_bytes=10, down_bytes=90), closed=True)
 
@@ -93,9 +104,11 @@ class _LeaseProvider:
         return f"http://lease:{lease.token}@proxy_filter:8900"
 
 
-def _metered_client(clock, ttl, permit_wait=None):
-    provider = _LeaseProvider(clock, ttl, permit_wait)
-    factory = _TlsFactory()
+def _metered_client(
+    clock, ttl, permit_wait=None, close_failures=0, failing_clients=0,
+):
+    provider = _LeaseProvider(clock, ttl, permit_wait, close_failures)
+    factory = _TlsFactory(failing_clients)
     client = TransfermarktHttpClient(
         lease_provider=provider,
         traffic_ledger=SharedTrafficLedger(),
@@ -107,6 +120,7 @@ def _metered_client(clock, ttl, permit_wait=None):
         },
         client_factory=factory,
         time_fn=clock,
+        sleep_fn=lambda _seconds: None,
     )
     return client, provider, factory
 
@@ -138,10 +152,10 @@ def test_one_session_id_per_lease_counts_requests_per_session():
 @pytest.mark.unit
 def test_expiring_lease_is_rotated_before_the_request_with_a_new_session():
     now = [1_000.0]
-    client, provider, factory = _metered_client(lambda: now[0], ttl=100)
+    client, provider, factory = _metered_client(lambda: now[0], ttl=150)
 
     client.fetch("https://www.transfermarkt.us/a", as_json=False, label="mv")
-    now[0] += 30  # 70 s left: keep the session
+    now[0] += 80  # 70 s left: keep the session
     client.fetch("https://www.transfermarkt.us/b", as_json=False, label="mv")
     now[0] += 20  # 50 s left (< 60): planned close, new lease and session
     outcome = client.fetch(
@@ -185,6 +199,67 @@ def test_lease_expiry_is_checked_after_the_permit_wait():
     assert provider.acquired[1].expires_at - now[0] == 200
     assert client.get_traffic_stats()["requests_per_session"]["sessions"] == 2
     assert len({call["session_id"] for call in factory.calls}) == 2
+
+
+@pytest.mark.unit
+def test_short_granted_lease_is_not_rotated_early():
+    # The gateway may clamp a lease to the approval window (or the DAG asks
+    # for 60..119 s): a replacement would be no longer, so no rotation.
+    now = [1_000.0]
+    client, provider, factory = _metered_client(lambda: now[0], ttl=90)
+
+    for path in ("a", "b", "c"):
+        now[0] += 20  # 70, 50, 30 s left of a 90 s grant
+        assert client.fetch(
+            f"https://www.transfermarkt.us/{path}", as_json=False, label="mv",
+        ).status is FetchStatus.OK
+
+    assert len(provider.acquired) == 1
+    assert provider.closed == []
+    assert len(factory.calls) == 1
+
+
+@pytest.mark.unit
+def test_failed_rotation_is_retried_like_a_transport_failure():
+    now = [1_000.0]
+    client, provider, factory = _metered_client(
+        lambda: now[0], ttl=150, close_failures=1,
+    )
+    client.fetch("https://www.transfermarkt.us/a", as_json=False, label="mv")
+    now[0] += 100  # 50 s left: rotation starts, its lease close fails
+
+    outcome = client.fetch(
+        "https://www.transfermarkt.us/b", as_json=False, label="mv",
+    )
+
+    assert outcome.status is FetchStatus.OK
+    assert outcome.attempts == 2
+    assert len(provider.acquired) == 2
+    assert factory.clients[0].closed is True
+
+
+@pytest.mark.unit
+def test_transport_failures_are_not_counted_as_session_requests():
+    now = [1_000.0]
+    client, _provider, _factory = _metered_client(
+        lambda: now[0], ttl=3_600, failing_clients=3,
+    )
+
+    failed = client.fetch(
+        "https://www.transfermarkt.us/a", as_json=False, label="mv",
+        max_attempts=3,
+    )
+    assert failed.status is not FetchStatus.OK
+    assert client.get_traffic_stats()["requests_per_session"]["sessions"] == 0
+
+    ok = client.fetch("https://www.transfermarkt.us/b", as_json=False, label="mv")
+    assert ok.status is FetchStatus.OK
+    assert client.get_traffic_stats()["requests_per_session"] == {
+        "sessions": 1,
+        "requests": 1,
+        "multi_request_sessions": 0,
+        "max_requests_per_session": 1,
+    }
 
 
 # --- real sockets: local CONNECT proxy counting accepted connections -------

@@ -111,6 +111,10 @@ def _requests_per_session(counts: Any) -> Dict[str, Any]:
     }
 
 
+class LeaseRotationError(ConnectionError):
+    """A planned pre-expiry lease rotation failed; retried like transport (#1388)."""
+
+
 class TransportStatusError(ConnectionError):
     """A pseudo-response carried no real HTTP status (tls-client quirk)."""
 
@@ -602,6 +606,7 @@ class TransfermarktHttpClient:
         self._lease_metadata = dict(lease_metadata or {})
         self._lease_ttl_seconds = max(1, int(lease_ttl_seconds))
         self._lease: Optional[ProxyLease] = None
+        self._lease_acquired_at: Optional[float] = None
         self._cache = cache
         if require_raw_store is None:
             require_raw_store = os.environ.get(
@@ -836,6 +841,7 @@ class TransfermarktHttpClient:
                 raise TrafficBudgetExceeded(
                     "Transfermarkt provider hard byte budget exhausted"
                 )
+            self._lease_acquired_at = self._time()
             self._lease = self._lease_provider.acquire(
                 max_bytes=remaining,
                 ttl_seconds=self._lease_ttl_seconds,
@@ -901,9 +907,17 @@ class TransfermarktHttpClient:
         return self._client, self._proxy_obj
 
     def _lease_expiring(self) -> bool:
+        # A lease granted shorter than twice the margin (the gateway clamps
+        # expiry to the approval window; the DAG allows 60..119 s TTLs) is
+        # never rotated early: its replacement would be no longer, so every
+        # request would cost an extra acquire + close for nothing.
+        if self._lease is None or self._lease_acquired_at is None:
+            return False
+        granted = self._lease.expires_at - self._lease_acquired_at
+        remaining = self._lease.expires_at - self._time()
         return (
-            self._lease is not None
-            and self._lease.expires_at - self._time() < _LEASE_RENEW_BEFORE_SECONDS
+            granted >= 2 * _LEASE_RENEW_BEFORE_SECONDS
+            and remaining < _LEASE_RENEW_BEFORE_SECONDS
         )
 
     def _has_alternate_proxy(self, proxy_obj) -> bool:
@@ -1743,20 +1757,25 @@ class TransfermarktHttpClient:
                     context=context,
                 )
                 if self._lease_expiring():
-                    # Planned rotation right before I/O, not a transport
-                    # failure: rate-limit and permit waits (up to 65 s) can
-                    # outlast the lease remainder.  Permits are bound to the
-                    # run and request, not to the lease.
-                    self._discard_client()
-                    self._close_lease(label=label)
-                    client, proxy_obj = self._ensure_client(
-                        url=url, label=label, context=context,
-                        retry=attempt > 1,
-                    )
-                if self._session_id is not None:
-                    self._requests_by_session[self._session_id] = (
-                        self._requests_by_session.get(self._session_id, 0) + 1
-                    )
+                    # Planned rotation right before I/O: rate-limit and
+                    # permit waits (up to 65 s) can outlast the lease
+                    # remainder.  Permits are bound to the run and request,
+                    # not to the lease.  A failed close/acquire here is
+                    # retried like a transport failure, not a hard abort.
+                    try:
+                        self._discard_client()
+                        self._close_lease(label=label)
+                        client, proxy_obj = self._ensure_client(
+                            url=url, label=label, context=context,
+                            retry=attempt > 1,
+                        )
+                    except (TrafficBudgetExceeded, TrafficMeterError):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - adapter errors vary
+                        raise LeaseRotationError(
+                            "planned lease rotation failed: "
+                            f"{redact_sensitive(exc)}"
+                        ) from exc
                 resp = client.get(
                     url,
                     timeout=self.timeout_seconds,
@@ -1780,6 +1799,13 @@ class TransfermarktHttpClient:
                             getattr(resp, "headers", None),
                             PROXY_UPSTREAM_STATUS_HEADER,
                         ),
+                    )
+                # Keep-alive evidence counts only requests that came back
+                # with a real HTTP status, so failed fresh clients do not
+                # read as "one request per session".
+                if self._session_id is not None:
+                    self._requests_by_session[self._session_id] = (
+                        self._requests_by_session.get(self._session_id, 0) + 1
                     )
                 body = self._response_bytes(resp)
                 body_n = len(body)

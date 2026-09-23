@@ -278,11 +278,12 @@ class TestDailyRollup:
         assert "fbref 0.879 GB," in out["report"]
         assert out["total_paid_mb"] == 1200.5
         assert out["paid_complete"] is True
-        assert out["unbilled_sources"] == ["fbref"]
+        # Never-metered fbref is not "missing billing" noise (#1388 review).
+        assert out["unbilled_sources"] == []
+        assert "без данных биллинга" not in out["report"]
         assert out["report"].startswith(
             "вчера прокси: распаковано 1.172 GB (1200.0 MB); "
-            "оплачено провайдеру 1200.5 МиБ (transfermarkt); "
-            "без данных биллинга: fbref: "
+            "оплачено провайдеру 1200.5 МиБ (transfermarkt): "
         )
         assert any(
             "sum(CAST(provider_metered_bytes AS double)" in s
