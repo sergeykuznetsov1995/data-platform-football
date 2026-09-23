@@ -836,23 +836,44 @@ class TestPartialScrapeRatio:
         '<div>No data available</div></html>'
     )
 
+    @staticmethod
+    def _populated_squad_html(club_id: str) -> str:
+        return (
+            '<html><h1 class="data-header__headline-wrapper">C</h1>'
+            '<table class="items"><tbody><tr><td>1</td>'
+            f'<td class="hauptlink"><a href="/p-{club_id}/profil/spieler/'
+            f'{club_id}">P{club_id}</a></td></tr></tbody></table></html>'
+        )
+
+    def _patch_real_parser_pipeline(
+        self, monkeypatch, scraper, squad_pages, bronze_club_ids=(),
+    ):
+        # Listing and transport are faked; the squad parser, the empty-roster
+        # detector and the fetch validator run for real (#1397).
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
+            {'club_id': str(i), 'club_slug': f'club-{i}', 'club_name': f'C{i}'}
+            for i in range(len(squad_pages))
+        ])
+        pages = iter(squad_pages)
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda url, label='html', context=None:
+                next(pages) if label == 'squad' else '<html/>',
+        )
+        monkeypatch.setattr(
+            scraper, '_bronze_club_has_roster',
+            lambda league, season, club_id: str(club_id) in bronze_club_ids,
+        )
+
     def test_empty_roster_clubs_count_as_success(self, scraper, monkeypatch):
         # Dissolved amateur clubs (FC Lienden 2011/12): a valid club page with
         # no squad table is data truth, not a failed fetch — 2 of 10 empty
         # must not trip the 0.9 ratio (#936 daily-red on TM-511).
-        import scrapers.transfermarkt.scraper as tm
-        self._patch_players_pipeline(
+        self._patch_real_parser_pipeline(
             monkeypatch, scraper,
-            [self._EMPTY_ROSTER_HTML] * 2 + ['<html/>'] * 8,
-        )
-        monkeypatch.setattr(
-            tm, '_parse_squad_page',
-            lambda html, club_id: []
-            if html == self._EMPTY_ROSTER_HTML
-            else [{'player_id': f'p{club_id}',
-                   'player_slug': f'player-{club_id}',
-                   'name': f'P{club_id}', 'club_id': club_id,
-                   'market_value_eur': None}],
+            [self._EMPTY_ROSTER_HTML] * 2
+            + [self._populated_squad_html(str(i)) for i in range(2, 10)],
         )
         df = scraper.read_players(league='ENG-Premier League', season=2025)
         assert df['player_id'].nunique() == 8
@@ -861,22 +882,113 @@ class TestPartialScrapeRatio:
         assert 'empty_squad_club_ids' not in capture
         statuses = capture.get('endpoint_status_by_team') or {}
         assert statuses.get('0') == 'ok' and statuses.get('1') == 'ok'
+        assert {'0', '1'} <= set(capture.get('observed_team_ids') or [])
+        # the empty roster is recorded as a valid empty fetch, not OK/0 rows
+        assert scraper._fetch_records['squad']['0'].status == (
+            FetchStatus.VALID_EMPTY
+        )
         # the fetch validator must accept the same page instead of burning
         # six attempts on 'missing table.items'
         validator = scraper._endpoint_validator('squad', False)
         assert validator(self._EMPTY_ROSTER_HTML) is None
 
+    def test_empty_roster_page_is_parsed_empty_and_detected(self):
+        from bs4 import BeautifulSoup
+
+        from scrapers.transfermarkt.scraper import (
+            _parse_squad_page,
+            _squad_page_is_empty_roster,
+        )
+
+        assert _parse_squad_page(self._EMPTY_ROSTER_HTML, club_id='511') == []
+        assert _squad_page_is_empty_roster(
+            BeautifulSoup(self._EMPTY_ROSTER_HTML, 'html.parser'),
+        )
+        # a table.items whose body holds only the one-cell "no entries" row
+        empty_table = (
+            '<html><h1 class="data-header__headline-wrapper">X</h1>'
+            '<table class="items"><tbody><tr><td colspan="9">No entries'
+            '</td></tr></tbody></table></html>'
+        )
+        assert _parse_squad_page(empty_table, club_id='511') == []
+        assert _squad_page_is_empty_roster(
+            BeautifulSoup(empty_table, 'html.parser'),
+        )
+
     def test_empty_roster_detector_requires_club_header(self):
+        from bs4 import BeautifulSoup
+
         from scrapers.transfermarkt.scraper import _squad_page_is_empty_roster
 
-        assert _squad_page_is_empty_roster(self._EMPTY_ROSTER_HTML)
-        # a page that still carries player links stays a schema error
-        assert not _squad_page_is_empty_roster(
-            '<html><h1 class="data-header__headline-wrapper">X</h1>'
-            '<a href="/a/profil/spieler/1">A</a></html>'
-        )
         # an interstitial/error page without the club header is not "empty"
-        assert not _squad_page_is_empty_roster('<html>blocked</html>')
+        assert not _squad_page_is_empty_roster(
+            BeautifulSoup('<html>blocked</html>', 'html.parser'),
+        )
+
+    def test_squad_rows_without_parsable_links_stay_schema_error(
+        self, scraper, monkeypatch,
+    ):
+        # Link-format drift: the table still has data rows, the parser
+        # returns [] — that must not be mistaken for an empty roster.
+        from bs4 import BeautifulSoup
+
+        from scrapers.transfermarkt.scraper import _squad_page_is_empty_roster
+
+        drifted = (
+            '<html><h1 class="data-header__headline-wrapper">X</h1>'
+            '<table class="items"><tbody><tr><td>1</td>'
+            '<td class="hauptlink"><a href="/x/profile/player/1">A</a></td>'
+            '</tr></tbody></table></html>'
+        )
+        assert not _squad_page_is_empty_roster(
+            BeautifulSoup(drifted, 'html.parser'),
+        )
+        assert scraper._endpoint_validator('squad', False)(drifted) == (
+            'squad has no player links'
+        )
+        self._patch_real_parser_pipeline(
+            monkeypatch, scraper,
+            [drifted] + [self._populated_squad_html(str(i)) for i in range(1, 10)],
+        )
+        scraper.read_players(league='ENG-Premier League', season=2025)
+        capture = scraper.get_scope_capture() or {}
+        assert capture['endpoint_status_by_team']['0'] == 'schema_error'
+        assert scraper._fetch_records['squad']['0'].status == (
+            FetchStatus.SCHEMA_ERROR
+        )
+
+    def test_sidebar_player_links_do_not_block_empty_roster(self, scraper):
+        # Sidebar widgets on an empty club page may link players; the verdict
+        # is bound to the squad container, not to the whole page.
+        from bs4 import BeautifulSoup
+
+        from scrapers.transfermarkt.scraper import _squad_page_is_empty_roster
+
+        page = (
+            '<html><h1 class="data-header__headline-wrapper">FC Lienden</h1>'
+            '<div class="box"><a href="/a/profil/spieler/1">A</a></div></html>'
+        )
+        assert _squad_page_is_empty_roster(BeautifulSoup(page, 'html.parser'))
+        assert scraper._endpoint_validator('squad', False)(page) is None
+
+    def test_club_with_bronze_roster_cannot_turn_empty(
+        self, scraper, monkeypatch,
+    ):
+        # A club that already has squad rows in Bronze must not silently
+        # become empty: replace_partitions would drop its committed rows.
+        self._patch_real_parser_pipeline(
+            monkeypatch, scraper,
+            [self._EMPTY_ROSTER_HTML]
+            + [self._populated_squad_html(str(i)) for i in range(1, 10)],
+            bronze_club_ids={'0'},
+        )
+        scraper.read_players(league='ENG-Premier League', season=2025)
+        capture = scraper.get_scope_capture() or {}
+        assert capture['endpoint_status_by_team']['0'] == 'schema_error'
+        assert '0' not in capture['observed_team_ids']
+        assert scraper._fetch_records['squad']['0'].status == (
+            FetchStatus.SCHEMA_ERROR
+        )
 
     def test_read_mv_history_raises_on_low_success_ratio(
         self, scraper, monkeypatch,
