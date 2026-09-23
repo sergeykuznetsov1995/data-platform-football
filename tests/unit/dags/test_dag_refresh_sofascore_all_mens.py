@@ -631,7 +631,21 @@ def test_enrich_season_metadata_task_shape(clean_env, monkeypatch):
 
     assert enrich._init_kwargs["trigger_rule"] == "all_done"
     assert enrich._init_kwargs["retries"] == 0
-    assert enrich._init_kwargs["execution_timeout"] == timedelta(minutes=40)
+    assert enrich._init_kwargs["execution_timeout"] == module.METADATA_TIMEOUT
+    # Astra r1 #2: the enrichment runs inside the same DagRun window as the
+    # sweep and both attempts of every scope (with their retry delay).
+    run = _operators()["run_refresh_scope"]
+    assert (
+        module.REFRESH_FETCH_TIMEOUT
+        + module.REFRESH_BATCH_FITS
+        * (
+            module.REFRESH_SCOPE_TIMEOUT * module.REFRESH_SCOPE_ATTEMPTS
+            + run._init_kwargs["retry_delay"]
+        )
+        + module.METADATA_TIMEOUT
+        <= module.REFRESH_DAGRUN_TIMEOUT
+    )
+    assert module.REFRESH_BATCH_FITS >= 1
     assert enrich._init_kwargs["pool"] == "ingest_scraper_pool"
     assert enrich._init_kwargs["priority_weight"] < 5
     # A failed enrichment is a red task, never a red DagRun.
@@ -690,7 +704,8 @@ def test_enrich_season_metadata_builds_the_priority_command(
     assert flag("--max-seasons") == "170"
     assert flag("--expected-snapshot-id") == "snap-1"
     assert flag("--dag-id") == "dag_refresh_sofascore_all_mens"
-    assert flag("--run-id") == "scheduled__2026-09-24T00:30:00+00:00"
+    # Astra r1 #1: its own gateway run key, so the sweep cannot starve it.
+    assert flag("--run-id") == "scheduled__2026-09-24T00:30:00+00:00:metadata"
     assert flag("--task-id") == "enrich_season_metadata"
     assert flag("--budget-cap-bytes") == str(16 * 1024 * 1024)
     report = flag("--report")

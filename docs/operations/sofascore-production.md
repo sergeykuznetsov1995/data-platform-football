@@ -594,9 +594,13 @@ planning»). Теперь план истории pending-сезоны проп�
 
 **Где задача.** `dag_refresh_sofascore_all_mens`, задача `enrich_season_metadata`:
 `validate_refresh_scope >> enrich_season_metadata >> propagate_refresh_status`, `trigger_rule=all_done`,
-`retries=0`, таймаут 40 мин, пул `ingest_scraper_pool` (шлюз `sofascore_gw_951`), вес ниже скоупов.
+`retries=0`, таймаут 25 мин (входит в расчёт окна DagRun 7 ч вместе с обходом афиши и двумя
+попытками скоупа), пул `ingest_scraper_pool` (шлюз `sofascore_gw_951`), вес ниже скоупов.
 Она запускает `scripts/enrich_sofascore_all_mens_snapshot.py --select priority --max-seasons N`
-с потолком 16 МиБ на прогон и пишет снапшот через тот же чекпойнт под замком. N —
+с потолком 16 МиБ на прогон и пишет снапшот через тот же чекпойнт под замком. Аренды она берёт под
+своим логическим прогоном `<run_id>:metadata`: шлюз считает discovery-байты на пару
+`(dag_id, run_id)`, и обход афиши того же DagRun не может выесть её бюджет; дневной потолок полосы
+общий. N —
 `SOFASCORE_METADATA_SEASONS_PER_RUN` (рецепт, дефолт 170; `0` — задача пропускается, skipped). Ручка
 живёт в `environment:` рецепта, поэтому меняется через `/etc/data-platform/sofascore.env` и ротацию.
 

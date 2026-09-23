@@ -57,6 +57,10 @@ RESULT_DIR = (
 REFRESH_DAGRUN_TIMEOUT = timedelta(hours=7)
 REFRESH_FETCH_TIMEOUT = timedelta(minutes=150)
 REFRESH_SCOPE_TIMEOUT = timedelta(hours=2)
+# Season metadata enrichment (#1354) runs after the scopes inside the same
+# window: 170 seasons plus their tournaments' identity checks are <= 340
+# requests, ~17 min at the lane's 20/min.
+METADATA_TIMEOUT = timedelta(minutes=25)
 # Whatever the campaign-wide default (8) or an operator's override says, the
 # batch is capped by what actually fits: sweep + batch * scope * attempts <=
 # DagRun.  A batch of 8 would need 18 h in a 7 h window and the run would be
@@ -74,7 +78,7 @@ REFRESH_SCOPE_TIMEOUT = timedelta(hours=2)
 # (Sol round 12, finding 2).
 REFRESH_SCOPE_ATTEMPTS = 2
 REFRESH_BATCH_FITS = int(
-    (REFRESH_DAGRUN_TIMEOUT - REFRESH_FETCH_TIMEOUT)
+    (REFRESH_DAGRUN_TIMEOUT - REFRESH_FETCH_TIMEOUT - METADATA_TIMEOUT)
     / (REFRESH_SCOPE_TIMEOUT * REFRESH_SCOPE_ATTEMPTS)
 )
 REFRESH_BATCH_SIZE = min(
@@ -138,7 +142,6 @@ METADATA_SEASONS_PER_RUN = state.env_int(
     "SOFASCORE_METADATA_SEASONS_PER_RUN", 170, 0, 10000
 )
 METADATA_BUDGET_BYTES = 16 * 1024 * 1024
-METADATA_TIMEOUT = timedelta(minutes=40)
 METADATA_RESULT_DIR = str(Path(
     os.environ.get(
         "SOFASCORE_ALL_MENS_RESULT_DIR",
@@ -310,7 +313,10 @@ def _enrich_season_metadata(**context: Any) -> dict[str, Any]:
         "--max-seasons", str(METADATA_SEASONS_PER_RUN),
         "--expected-snapshot-id", str(snapshot["snapshot_id"]),
         "--dag-id", DAG_ID,
-        "--run-id", run_id,
+        # A logical run of its own: the gateway meters discovery bytes per
+        # (dag_id, run_id), and the schedule sweep of this DagRun may already
+        # have spent that cap.  The UTC-day cap of the lane stays shared.
+        "--run-id", f"{run_id}:metadata",
         "--task-id", "enrich_season_metadata",
         "--budget-cap-bytes", str(METADATA_BUDGET_BYTES),
         "--report", str(report_path),
