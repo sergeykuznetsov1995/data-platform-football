@@ -20,7 +20,7 @@ SHARED_FILTER_SHA256 = (
     # (#1248 stage 1).  FBref keeps its own filter and stays out of
     # ``runtime_files`` — both asserted below.  #1350: ledgers flushed off
     # the per-chunk path.
-    "8a67fc35ac8a05c2610bf04151712b81259c16679147d373bd128f237c2a6f8c"
+    "1d574f25969b9173a68c4af5e4c13de8b6f8e017ea1ba7d5ff59a4cb5716c1e3"
 )
 
 

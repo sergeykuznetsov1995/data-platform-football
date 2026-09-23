@@ -3759,28 +3759,58 @@ def _parent_spent_on_disk(module) -> int:
     return int(run["spent_provider_bytes"])
 
 
-def test_restart_replays_journal_ahead_of_unflushed_ledger(shared_mod, caplog):
-    """#1350: the WAL is primary; an unflushed ledger no longer blocks boot."""
+def _hard_crash_and_boot(module) -> int:
+    """Drop every in-memory ledger/lease, then run the boot restore path."""
 
-    context = _dirty_sofascore_lease(shared_mod, endpoint_finished=True)
+    module.LEASES.clear()
+    module.LEASE_TOKENS.clear()
+    module.SOFASCORE_ALLOCATION_LEDGER = None
+    module._SOFASCORE_ALLOCATION_LEDGER_KEY = None
+    module.SOFASCORE_PARENT_ENVELOPE_LEDGER = None
+    module._SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH = ""
+    for counters in (
+        module._run_up_bytes,
+        module._run_down_bytes,
+        module._url_up_bytes,
+        module._url_down_bytes,
+    ):
+        counters.clear()
+    module._restore_budget_ledger(module.LEDGER_PATH, restore_daily=False)
+    return module._recover_allocation_wal()
+
+
+@pytest.mark.parametrize("endpoint_finished", [True, False])
+def test_restart_replays_journal_ahead_of_unflushed_ledgers(
+    shared_mod, caplog, endpoint_finished
+):
+    """#1350: journals are primary; an unflushed ledger no longer blocks boot
+    and a crash does not hand the lost bytes back to the allocation/parent."""
+
+    context = _dirty_sofascore_lease(shared_mod, endpoint_finished=endpoint_finished)
     assert shared_mod._allocation_ledger().dirty is True
+    assert shared_mod._parent_envelope_ledger().dirty is True
     assert _allocation_on_disk(shared_mod, context)["spent_provider_bytes"] == 0
+    assert _parent_spent_on_disk(shared_mod) == 0
 
-    # Hard crash: memory (and the unflushed 100 bytes) is gone.
-    shared_mod.LEASES.clear()
-    shared_mod.LEASE_TOKENS.clear()
-    shared_mod.SOFASCORE_ALLOCATION_LEDGER = None
-    shared_mod._SOFASCORE_ALLOCATION_LEDGER_KEY = None
     with caplog.at_level("WARNING", logger="filter_proxy"):
-        assert shared_mod._recover_allocation_wal() == 1
+        assert _hard_crash_and_boot(shared_mod) == 1
 
-    assert "journal ahead of ledger by 100 bytes, replayed" in caplog.text
+    assert "allocation journal ahead of ledger by 100 bytes, replayed" in caplog.text
+    assert "parent envelope journal ahead of ledger by 100 bytes" in caplog.text
     allocation = _allocation_on_disk(shared_mod, context)
     assert allocation["active_claim"] is None
     assert allocation["spent_provider_bytes"] == 100
     assert allocation["lease_stats"][-1]["endpoint_request_provider_bytes"] == {
         "lineups": [100]
     }
+    assert _parent_spent_on_disk(shared_mod) == 100
+    # A second boot is idempotent: nothing left to replay.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="filter_proxy"):
+        assert _hard_crash_and_boot(shared_mod) == 0
+    assert "ahead of ledger" not in caplog.text
+    assert _allocation_on_disk(shared_mod, context)["spent_provider_bytes"] == 100
+    assert _parent_spent_on_disk(shared_mod) == 100
 
 
 def test_report_tick_flushes_dirty_ledgers_after_the_interval(

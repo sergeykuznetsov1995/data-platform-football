@@ -1678,8 +1678,12 @@ class AllocationLedger:
             evict.extend(
                 [key for _, key in inactive if key not in chosen][:overflow]
             )
+        retired = payload.setdefault("retired_runs", {})
         for key in evict:
             del runs[key]
+            # A signed plan has no expiry: remember the key so a late retry
+            # is refused instead of resurrecting the run with spent=0.
+            retired[key] = _utc_now()
         if evict:
             log.info(
                 "allocation ledger compacted: %d runs dropped, %d kept",
@@ -1772,6 +1776,10 @@ class AllocationLedger:
     def _run(self, payload: dict[str, Any], plan: SignedDagRunPlan) -> dict[str, Any]:
         key = self._run_key(plan)
         existing = payload["runs"].get(key)
+        if existing is None and key in payload.get("retired_runs", {}):
+            raise AllocationAccountingError(
+                "DagRun plan was retired from the allocation ledger"
+            )
         if existing is None:
             allocations = {
                 item.allocation_id: {

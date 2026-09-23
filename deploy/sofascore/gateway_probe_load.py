@@ -8,14 +8,19 @@ Runs inside a gateway container (stdlib only) while a real batch is leasing:
         [--stats-lease-id <lease id>] < deploy/sofascore/gateway_probe_load.py
 
 It sends ``GET /health`` and, when a lease id is given,
-``GET /v1/leases/<id>/stats`` at ``--rate`` requests per second each, and
-prints one JSON document with ``count, p50_ms, p95_ms, max_ms, errors,
-timeouts`` per endpoint.  The control token is taken from the environment
+``GET /v1/leases/<id>/stats`` at ``--rate`` requests per second each — every
+endpoint from its own thread on its own schedule, so a stalled answer on one
+route does not hide the stall from the other — and prints one JSON document
+with ``count, p50_ms, p95_ms, max_ms, errors, timeouts`` per endpoint.  No
+request starts after ``--seconds``; the run ends at most one request timeout
+(5 s) later.  The control token is taken from the environment
 (``PROXY_FILTER_CONTROL_TOKEN``, the gateway's own variable) and is never
-printed.  Without a lease bearer token (``SOFASCORE_PROBE_LEASE_TOKEN``) the
-stats route answers 401 from the same event loop, which is what the latency
-measurement needs; status codes are reported in ``status_counts``.
-Nothing is mutated: both routes are GET and idempotent.
+printed.  The lease bearer token is private to the task holding the lease, so
+without ``SOFASCORE_PROBE_LEASE_TOKEN`` the stats route answers 401 after the
+control-token check, from the same event loop — the loop stall this probe
+measures; the authorized handler is covered by the clients' ``ReadTimeout``
+count.  Status codes are reported in ``status_counts``.  Nothing is mutated:
+both routes are GET and idempotent.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import math
 import os
 import socket
 import sys
+import threading
 import time
 from typing import Iterable, Mapping, Optional, Sequence
 from urllib.parse import quote, urlsplit
@@ -143,16 +149,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
         )
     interval = 1.0 / args.rate
-    started = time.monotonic()
-    deadline = started + args.seconds
-    tick = started
-    while tick < deadline:
-        for endpoint in endpoints:
+    deadline = time.monotonic() + args.seconds
+
+    def drive(endpoint: _Endpoint) -> None:
+        next_at = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                return
+            if next_at > now:
+                time.sleep(min(next_at, deadline) - now)
+                continue
             endpoint.hit(host, port)
-        tick += interval
-        pause = tick - time.monotonic()
-        if pause > 0:
-            time.sleep(pause)
+            # A slow answer skips the missed slots instead of bursting.
+            next_at = max(next_at + interval, time.monotonic())
+
+    threads = [
+        threading.Thread(target=drive, args=(endpoint,), daemon=True)
+        for endpoint in endpoints
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
     return {
         "base_url": args.base_url,
         "seconds": args.seconds,

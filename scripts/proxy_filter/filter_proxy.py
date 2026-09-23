@@ -1197,6 +1197,12 @@ _daily_day = ""
 _daily_up_bytes = 0
 _daily_down_bytes = 0
 _daily_reserved_bytes = 0
+# #1350: SofaScore allocation/envelope ledgers are flushed on a timer, while
+# ``paid_requests.jsonl`` is appended with fsync for every chunk.  The boot-time
+# restore keeps what that journal proves per lease and per parent phase so the
+# crash recovery can replay bytes the unflushed ledgers lost.
+_RESTORED_ALLOCATION_LEASE_BYTES: dict[str, int] = {}
+_RESTORED_PARENT_PHASE_BYTES: dict[tuple[str, str], dict[str, int]] = {}
 _run_up_bytes: dict[str, int] = defaultdict(int)
 _run_down_bytes: dict[str, int] = defaultdict(int)
 _run_reserved_bytes: dict[str, int] = defaultdict(int)
@@ -2375,6 +2381,8 @@ def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
     """Restore run/URL/daily counters from durable byte-delta events."""
     global _daily_day, _daily_up_bytes, _daily_down_bytes
     restored = 0
+    _RESTORED_ALLOCATION_LEASE_BYTES.clear()
+    _RESTORED_PARENT_PHASE_BYTES.clear()
     try:
         stream = open(path, "rb")
     except (FileNotFoundError, OSError):
@@ -2408,6 +2416,17 @@ def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
                     else f"standalone/{lease_id}"
                 )
                 canonical = _canonical_url(event.get("canonical_url"))
+                if event.get("allocation_id"):
+                    _RESTORED_ALLOCATION_LEASE_BYTES[lease_id] = (
+                        _RESTORED_ALLOCATION_LEASE_BYTES.get(lease_id, 0) + count
+                    )
+                    base_run_id = str(event.get("base_run_id") or "")
+                    phase = str(event.get("workload_phase") or "")
+                    if base_run_id and phase:
+                        phases = _RESTORED_PARENT_PHASE_BYTES.setdefault(
+                            (dag_id, base_run_id), {}
+                        )
+                        phases[phase] = phases.get(phase, 0) + count
                 if direction == "up":
                     _run_up_bytes[run_key] += count
                     _url_up_bytes[(run_key, canonical)] += count
@@ -2588,6 +2607,41 @@ class ParentRunEnvelopeLedger:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+
+    def replay(self, phase_bytes: Mapping[tuple[str, str], Mapping[str, int]]) -> int:
+        """Raise phase spend to what the paid journal proves (#1350 recovery)."""
+
+        replayed = 0
+        handle = self._locked()
+        try:
+            payload = self._load()
+            for (dag_id, base_run_id), phases in phase_bytes.items():
+                run = payload["runs"].get(self._key(dag_id, base_run_id))
+                if not isinstance(run, dict) or not isinstance(
+                    run.get("phases"), dict
+                ):
+                    continue
+                for phase, journal_bytes in phases.items():
+                    state = run["phases"].get(phase)
+                    if not isinstance(state, dict):
+                        continue
+                    missing = int(journal_bytes) - int(
+                        state.get("spent_provider_bytes", 0)
+                    )
+                    if missing > 0:
+                        state["spent_provider_bytes"] = (
+                            int(state.get("spent_provider_bytes", 0)) + missing
+                        )
+                        run["spent_provider_bytes"] = (
+                            int(run.get("spent_provider_bytes", 0)) + missing
+                        )
+                        replayed += missing
+            if replayed:
+                self._dirty = True
+            return replayed
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     @staticmethod
     def _key(dag_id: str, base_run_id: str) -> str:
@@ -2970,19 +3024,21 @@ def _recover_allocation_wal() -> int:
             active.get("start_spent_provider_bytes", 0)
         )
         reported = sum(sum(values) for values in observations.values())
-        remainder = attempt_spent - reported
-        if remainder < 0:
-            # #1350: the ledger is flushed on a timer, the WAL is appended
-            # with fsync.  After a crash the journal is primary: replay the
-            # bytes the unflushed ledger lost.
-            ledger.consume(plan, claim, -remainder)
+        # #1350: the ledger is flushed on a timer; the allocation WAL (closed
+        # endpoints) and the paid journal (every chunk) are appended with
+        # fsync.  After a crash the journals are primary: replay what the
+        # unflushed ledger lost.
+        journal = max(reported, _RESTORED_ALLOCATION_LEASE_BYTES.get(lease_id, 0))
+        if journal > attempt_spent:
+            ledger.consume(plan, claim, journal - attempt_spent)
             log.warning(
                 "SofaScore allocation journal ahead of ledger by %d bytes, "
                 "replayed (lease %s)",
-                -remainder,
+                journal - attempt_spent,
                 lease_id,
             )
-            remainder = 0
+            attempt_spent = journal
+        remainder = attempt_spent - reported
         active_endpoint = str(state.get("active_endpoint") or "")
         if remainder or active_endpoint:
             if not active_endpoint:
@@ -3002,6 +3058,15 @@ def _recover_allocation_wal() -> int:
         )
         recovered += 1
     ledger.flush(force=True)
+    envelopes = _parent_envelope_ledger()
+    replayed = envelopes.replay(_RESTORED_PARENT_PHASE_BYTES)
+    if replayed:
+        log.warning(
+            "SofaScore parent envelope journal ahead of ledger by %d bytes, "
+            "replayed",
+            replayed,
+        )
+    envelopes.flush()
     return recovered
 
 

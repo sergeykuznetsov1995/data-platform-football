@@ -890,6 +890,31 @@ def test_flush_compacts_old_inactive_runs_and_keeps_active_and_fresh(tmp_path):
     ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
     assert ledger.flush(force=True) is True
     assert set(_stored(path)["runs"]) == {"old-active", "fresh-done"}
+    assert set(_stored(path)["retired_runs"]) == {"old-done"}
+
+
+def test_retired_run_cannot_be_resurrected_by_a_late_claim(tmp_path):
+    """Compaction must not mint a fresh allowance for a still-signed plan."""
+
+    plan = _plan(tmp_path)
+    allocation = plan.allocations[0]
+    path = tmp_path / "allocations.json"
+    ledger = AllocationLedger(
+        path, control_token=CONTROL_TOKEN, run_retention_seconds=0
+    )
+    claim = ledger.claim(plan, allocation.allocation_id, attempt_id="try-1")
+    ledger.consume(plan, claim, 10)
+    ledger.finish(
+        plan,
+        claim,
+        lease_id="lease-1",
+        endpoint_request_provider_bytes={"event": [10]},
+        completed=False,
+    )
+    assert _stored(path)["runs"] == {}, "retention 0 retires the finished run"
+    for reader in (ledger, AllocationLedger(path, control_token=CONTROL_TOKEN)):
+        with pytest.raises(AllocationAccountingError, match="retired"):
+            reader.claim(plan, allocation.allocation_id, attempt_id="try-2")
 
 
 def test_run_cap_drops_oldest_inactive_but_never_an_active_run(tmp_path):

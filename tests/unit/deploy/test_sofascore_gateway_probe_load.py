@@ -138,3 +138,48 @@ def test_main_prints_one_json_report_per_endpoint(monkeypatch, capsys):
         assert set(endpoint["status_counts"]) == {code}
     assert ("/v1/leases/lease%2F1/stats", "t" * 32) in seen
     assert "t" * 32 not in json.dumps(report), "token must never be printed"
+
+
+def test_a_stalled_route_neither_delays_the_other_nor_overruns_the_deadline(
+    monkeypatch, capsys
+):
+    import time
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path == "/health":
+                time.sleep(0.3)
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    started = time.monotonic()
+    try:
+        probe.main(
+            [
+                "--base-url",
+                f"http://127.0.0.1:{server.server_address[1]}",
+                "--seconds",
+                "0.5",
+                "--rate",
+                "20",
+                "--stats-lease-id",
+                "x",
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    elapsed = time.monotonic() - started
+    report = json.loads(capsys.readouterr().out)["endpoints"]
+    assert report["health"]["count"] <= 3, "slow route keeps its own pace"
+    assert report["stats"]["count"] >= 6, "stats is not held behind /health"
+    assert report["stats"]["p95_ms"] < 250
+    assert elapsed < 0.5 + 0.3 + 0.5, "no request starts after --seconds"
