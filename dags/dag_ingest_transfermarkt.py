@@ -342,6 +342,47 @@ def _approval_bundle(
     return result
 
 
+def _assert_one_shot_packets_live(
+    journal: Path, mapped_envs: Sequence[Mapping[str, str]],
+) -> None:
+    """Read-only: every one-shot packet is issued, approved, unconsumed, live.
+
+    The child consumes (and fully validates) the packets; this only keeps the
+    paid gateway probe from being spent on a run whose packets the child would
+    refuse anyway — unknown, already consumed, failed, or expired.
+    """
+
+    from utils.transfermarkt_approval import ApprovalError, ApprovalJournal
+
+    records = ApprovalJournal(journal)
+    now = datetime.now().astimezone()
+    for env in mapped_envs:
+        for action, id_key, hash_key in (
+            ('paid_proxy', 'TM_PAID_APPROVAL_PACKET_ID',
+             'TM_PAID_APPROVAL_PACKET_HASH'),
+            ('production_write', 'TM_WRITE_APPROVAL_PACKET_ID',
+             'TM_WRITE_APPROVAL_PACKET_HASH'),
+        ):
+            scope_id = env['TM_SCOPE_ID']
+            try:
+                record = records.get(env[hash_key])
+            except ApprovalError as exc:
+                raise AirflowException(f'{scope_id}: {action} {exc}') from exc
+            expires_at = datetime.fromisoformat(
+                str(record.expires_at).replace('Z', '+00:00'),
+            )
+            if (
+                record.packet_id != env[id_key]
+                or record.action != action
+                or record.status != 'approved'
+                or now >= expires_at
+            ):
+                raise AirflowException(
+                    f'{scope_id}: {action} approval packet is not live '
+                    f'(status={record.status}, expires_at={record.expires_at})'
+                )
+
+
 def _is_scheduled_run(context: Mapping[str, Any]) -> bool:
     dag_run = context.get('dag_run')
     if dag_run is not None:
@@ -516,6 +557,8 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
     # it runs only after every approval above has passed — a run that is
     # refused never spends it.  A dead pool fails the run here, one task, before
     # any mapped child starts.
+    if approval_mode == 'one_shot':
+        _assert_one_shot_packets_live(journal, mapped_envs)
     _probe_gateway_exit(
         dag_id=str(context['dag'].dag_id), run_id=str(context['run_id']),
     )
