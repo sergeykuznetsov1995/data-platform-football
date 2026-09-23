@@ -50,13 +50,15 @@ q() { docker exec "$METADB" psql -U airflow -d airflow -At -c "$1" 2>/dev/null; 
 g() { git -C "$REPO" "$@"; }
 
 # Приёмка: оба DAG перечитаны после CUT без ошибок, своих import_error нет, файлы Understat = BASE.
+# CUT берётся ПОСЛЕ всех записей; +60 с — больше таймаута разбора файла (dag_file_processor_timeout
+# 50 с по умолчанию): разбор, начатый до окончания записи, приёмку не засчитает.
 accept() {
   local cut="$1" base="$2" i d r ok f
-  REASON="DAG не перечитаны за 6 мин"
-  for i in $(seq 1 18); do
+  REASON="DAG не перечитаны за 7 мин"
+  for i in $(seq 1 21); do
     ok=1
     for d in $DAGS; do
-      r=$(q "select has_import_errors, last_parsed_time > timestamptz '$cut' from dag where dag_id='$d'")
+      r=$(q "select has_import_errors, last_parsed_time > timestamptz '$cut' + interval '60 seconds' from dag where dag_id='$d'")
       [ "$r" = "f|t" ] || { ok=0; REASON="$d has_import_errors|перечитан = '${r:-нет ответа}'"; }
     done
     r=$(q "select count(*) from import_error where filename like '%understat%'")
@@ -71,7 +73,8 @@ accept() {
   log "приёмка пройдена (DAG перечитаны после $cut, бой = ${base:0:7})"
 }
 
-# Возврат доставки из каталога $1 (файл files: «статус путь» в порядке записи).
+# Возврат доставки из каталога $1 (файл files: «статус путь» в порядке записи; M попадает туда
+# только после проверенной полной .prev-копии, A — до создания файла).
 restore() {
   local bk="$1" day="$2" st f rc=0
   while read -r st f; do
@@ -85,6 +88,18 @@ restore() {
   return $rc
 }
 
+# Причина не трогать бой сейчас (пусто — можно): окно 11:00–08:30 UTC и занятость Understat.
+busy_reason() {
+  local hhmm n
+  hhmm=$(date -u +%H%M)
+  if (( 10#$hhmm >= 830 && 10#$hhmm < 1100 )); then echo "вне окна ($hhmm UTC; окно 11:00–08:30)"; return; fi
+  n=$(q "select count(*) from task_instance where dag_id in ('dag_ingest_understat','dag_backfill_understat') and state in ('running','queued')")
+  if [ "$n" != "0" ]; then echo "Understat занят: task_instance running/queued = '${n:-метабаза не ответила}'"
+  elif pgrep -f 'run_understat_scrape[r]' >/dev/null; then echo "Understat занят: живой процесс run_understat_scraper"
+  fi
+}
+set_accepted() { echo "$1" > "$ACCEPTED_F.tmp" && mv "$ACCEPTED_F.tmp" "$ACCEPTED_F"; }
+
 exec 9>"$STATE/understat-auto-deliver.lock"
 flock -n 9 || { log "другой запуск держит замок — выход"; exit 0; }
 
@@ -92,10 +107,12 @@ if [ "$MODE" = "--rollback" ]; then
   RB="${2:-}"; BK="$OUT/$RB"
   [ -n "$RB" ] && [ -f "$BK/files" ] && [ -f "$BK/accepted-before" ] || stop "--rollback: нет $BK/files или accepted-before"
   BASE=$(cat "$BK/accepted-before"); SHA=$BASE; FILES_N=$(wc -l < "$BK/files")
-  CUT=$(q "select now()"); [ -n "$CUT" ] || stop "--rollback: метабаза не отвечает"
+  BUSY=$(busy_reason); [ -z "$BUSY" ] || stop "--rollback $RB не выполнен: $BUSY"
   restore "$BK" "$RB" || stop "--rollback $RB: возврат файлов не удался — НУЖНЫ РУКИ"
+  CUT=$(q "select now()"); [ -n "$CUT" ] || stop "--rollback: метабаза не отвечает — НУЖНЫ РУКИ"
   if accept "$CUT" "$BASE"; then
-    echo "$BASE" > "$ACCEPTED_F.tmp" && mv "$ACCEPTED_F.tmp" "$ACCEPTED_F"; rm -f "$INFLIGHT"
+    set_accepted "$BASE" || stop "--rollback $RB принят, но $ACCEPTED_F не записан — НУЖНЫ РУКИ"
+    rm -f "$INFLIGHT"
     journal "ручной откат $RB принят"; tg "↩️ Understat: ручной откат доставки $RB принят, бой = ${BASE:0:7}"; exit 0
   fi
   stop "--rollback $RB: приёмка не пройдена ($REASON) — НУЖНЫ РУКИ"
@@ -119,15 +136,7 @@ LATCH="$STATE/understat-auto-deliver-attempted-$DAY"
 if [ "$MODE" = night ] && [ -f "$LATCH" ]; then log "сегодня ($DAY) попытка уже была — выход"; exit 0; fi
 
 # --- окно и занятость Understat
-HHMM=$(date -u +%H%M)
-BUSY=""
-if (( 10#$HHMM >= 830 && 10#$HHMM < 1100 )); then BUSY="вне окна ($HHMM UTC; окно 11:00–08:30)"
-else
-  N=$(q "select count(*) from task_instance where dag_id in ('dag_ingest_understat','dag_backfill_understat') and state in ('running','queued')")
-  if [ "$N" != "0" ]; then BUSY="Understat занят: task_instance running/queued = '${N:-метабаза не ответила}'"
-  elif pgrep -f 'run_understat_scrape[r]' >/dev/null; then BUSY="Understat занят: живой процесс run_understat_scraper"
-  fi
-fi
+BUSY=$(busy_reason)
 if [ -n "$BUSY" ]; then
   [ "$MODE" = --check ] && log "заметка: $BUSY" || { log "$BUSY — выход"; exit 0; }
 fi
@@ -165,7 +174,7 @@ while IFS=$'\t' read -r st p1 p2; do
 done < <(g diff --name-status "$ACC" "$SHA" -- $UNDERSTAT_PATHS ':(glob)dags/**/*understat*.py')
 if [ "${#ST[@]}" = 0 ]; then
   log "нечего доставлять: файлы Understat ${ACC:0:7} = ${SHA:0:7}"
-  [ "$MODE" = night ] && { echo "$SHA" > "$ACCEPTED_F.tmp" && mv "$ACCEPTED_F.tmp" "$ACCEPTED_F"; journal "нечего доставлять, база сдвинута"; }
+  [ "$MODE" = night ] && { set_accepted "$SHA" || stop "не записан $ACCEPTED_F"; journal "нечего доставлять, база сдвинута"; }
   exit 0
 fi
 ORDERED=$(
@@ -191,21 +200,30 @@ log "к доставке ($FILES_N): $(for f in $ORDERED; do printf '%s %s; ' "$
 if [ "$MODE" = --check ]; then log "проверки пройдены (--check, ничего не записано)"; journal "check: проверки пройдены"; exit 0; fi
 
 # --- запись
-CUT=$(q "select now()"); [ -n "$CUT" ] || stop "метабаза не отвечает (now())"
-echo "$SHA $DAY" > "$INFLIGHT"
-echo "$ACC" > "$BK/accepted-before"; : > "$BK/files"
+# Состояние для отката пишется ДО первой записи в бой; не записалось — в бой не идём.
+{ echo "$SHA $DAY" > "$INFLIGHT" && echo "$ACC" > "$BK/accepted-before" && : > "$BK/files"; } \
+  || { rm -f "$INFLIGHT"; stop "не записано состояние доставки (inflight/accepted-before/files) — бой не тронут"; }
 WRITE_OK=1
 for f in $ORDERED; do
-  echo "${ST[$f]} $f" >> "$BK/files"
-  if [ "${ST[$f]}" = A ]; then : > "$BK/$f.absent-$DAY"; mkdir -p "$TREE/$(dirname "$f")"
-  else cp -p "$TREE/$f" "$BK/$f.prev-$DAY" || { WRITE_OK=0; REASON="копия .prev $f"; break; }
+  if [ "${ST[$f]}" = A ]; then
+    { : > "$BK/$f.absent-$DAY" && echo "A $f" >> "$BK/files" && mkdir -p "$TREE/$(dirname "$f")"; } \
+      || { WRITE_OK=0; REASON="подготовка нового $f"; break; }
+  else
+    { cp -p "$TREE/$f" "$BK/$f.prev-$DAY" && cmp -s "$TREE/$f" "$BK/$f.prev-$DAY" && echo "M $f" >> "$BK/files"; } \
+      || { WRITE_OK=0; REASON="копия .prev $f"; break; }
   fi
   cat "$BK/$f.new" > "$TREE/$f" && cmp -s "$BK/$f.new" "$TREE/$f" || { WRITE_OK=0; REASON="запись $f"; break; }
   log "  записан ${ST[$f]} $f"
 done
 
+if [ "$WRITE_OK" = 1 ]; then CUT=$(q "select now()"); [ -n "$CUT" ] || { WRITE_OK=0; REASON="метабаза не отвечает (now())"; }; fi
 if [ "$WRITE_OK" = 1 ] && accept "$CUT" "$SHA"; then
-  echo "$SHA" > "$ACCEPTED_F.tmp" && mv "$ACCEPTED_F.tmp" "$ACCEPTED_F"; rm -f "$INFLIGHT"
+  if ! set_accepted "$SHA"; then
+    touch "$OFF"; journal "доставлено, но $ACCEPTED_F не записан"
+    tg "🆘 Understat: доставка ${SHA:0:7} принята, но база $ACCEPTED_F не записана — НУЖНЫ РУКИ; автомат выключен"
+    exit 2
+  fi
+  rm -f "$INFLIGHT"
   journal "доставлено: $(echo $ORDERED)"
   tg "✅ Understat: доставлено $FILES_N файлов из ${SHA:0:7}, DAG перечитаны без ошибок"
   exit 0
@@ -214,8 +232,12 @@ fi
 # --- откат
 log "приёмка/запись провалена: $REASON — откат"
 WHY="$REASON"
-CUT=$(q "select now()")
-if restore "$BK" "$DAY" && [ -n "$CUT" ] && accept "$CUT" "$ACC"; then
+ROK=0
+if restore "$BK" "$DAY"; then
+  CUT=$(q "select now()")
+  if [ -z "$CUT" ]; then REASON="метабаза не отвечает"; elif accept "$CUT" "$ACC"; then ROK=1; fi
+else REASON="возврат файлов не удался"; fi
+if [ "$ROK" = 1 ]; then
   rm -f "$INFLIGHT"; journal "отклонено ($WHY), откачено"
   tg "🔴 Understat: доставка ${SHA:0:7} отклонена ($WHY), откачено, DAG перечитаны"
   exit 1

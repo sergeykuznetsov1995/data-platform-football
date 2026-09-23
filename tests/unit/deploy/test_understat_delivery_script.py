@@ -7,8 +7,11 @@
 
 Git — настоящий: репозиторий создаётся `git init -b master`, коммит 1 — «бой», коммит 2 —
 master с правками сценария; боевое дерево — клон на коммите 1, канонический клон — клон с
-origin. Заглушка метабазы отвечает по подстрокам SQL; флаги разбора DAG она выводит из
-содержимого боевого дерева: файл с маркером BROKEN «не импортируется» (`t|f`), как в бою.
+origin. Заглушка метабазы отвечает по подстрокам SQL, но ответы выводит из содержимого
+боевого дерева, как в бою: маркер BROKEN — DAG «не импортируется» (`t|f`), маркер IMPORTERR —
+своя строка `import_error` Understat; запрос `import_error` без фильтра Understat получает 6
+(чужие строки WhoScored), файл `stale` — планировщик не перечитывает DAG (`f|f`). На каждый
+`now()` заглушка снимает содержимое client.py — так видно, что метка взята после записи.
 Ни боевое дерево, ни docker, ни сеть тесты не трогают.
 """
 
@@ -113,10 +116,14 @@ class Stand:
         _script(self.stubs / "docker", f'''sql="${{@: -1}}"
 echo "$sql" >> {ss}/docker.log
 case "$sql" in
-  *has_import_errors*) if grep -rqs BROKEN {tree}/scrapers/understat {tree}/dags; then echo "t|f"; else echo "f|t"; fi ;;
-  *import_error*) echo 0 ;;
+  *has_import_errors*)
+    echo "$sql" | grep -o "dag_id='[a-z_]*'" >> {ss}/dags_queried
+    if [ -f {ss}/stale ]; then echo "f|f"
+    elif grep -rqs BROKEN {tree}/scrapers/understat {tree}/dags; then echo "t|f"; else echo "f|t"; fi ;;
+  *import_error*"like '%understat%'"*) grep -rqs IMPORTERR {tree}/scrapers/understat {tree}/dags && echo 1 || echo 0 ;;
+  *import_error*) echo 6 ;;
   *task_instance*) cat {ss}/busy 2>/dev/null || echo 0 ;;
-  *"now()"*) echo "2026-09-24 01:10:05+00" ;;
+  *"now()"*) cat {tree}/scrapers/understat/client.py >> {ss}/now_snapshots; echo "2026-09-24 01:10:05+00" ;;
   *) echo "неизвестный SQL: $sql" >&2; exit 1 ;;
 esac
 ''')
@@ -170,6 +177,10 @@ def test_nothing_to_deliver_moves_base_without_writes(stand: Stand) -> None:
 def test_shared_module_drift_cancels(stand: Stand) -> None:
     stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
     (stand.tree / "dags/utils/config.py").write_text("SCHEDULES = {'x': 1}\n", encoding="utf-8")
+    res = stand.run("--check")
+    assert res.returncode == 1
+    assert "ОТМЕНА: общий модуль dags/utils/config.py в бою ≠ master" in res.stdout
+    assert stand.tg() == ""
     res = stand.run()
     assert res.returncode == 1
     assert "ОТМЕНА: общий модуль dags/utils/config.py в бою ≠ master" in stand.log()
@@ -201,7 +212,18 @@ def test_delivers_in_place_creates_new_module_and_rolls_back_by_hand(stand: Stan
     assert not (stand.state / "understat-inflight").exists()
     assert "доставлено" in (stand.out / "journal.log").read_text(encoding="utf-8")
     assert f"доставлено 3 файлов из {sha[:7]}" in stand.tg()
+    # Метка приёмки взята после записи; приёмка смотрит оба DAG с запасом на идущий разбор.
+    assert (stand.ss / "now_snapshots").read_text(encoding="utf-8").splitlines()[0] == "VERSION = 2"
+    assert set((stand.ss / "dags_queried").read_text(encoding="utf-8").split()) == {
+        "dag_id='dag_ingest_understat'", "dag_id='dag_backfill_understat'"}
+    assert "interval '60 seconds'" in (stand.ss / "docker.log").read_text(encoding="utf-8")
 
+    (stand.ss / "now").write_text("2026-09-24 09:30:00", encoding="utf-8")
+    res = stand.run("--rollback", DAY)
+    assert res.returncode == 1 and "вне окна" in res.stdout
+    assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 2\n"
+
+    (stand.ss / "now").write_text(NIGHT, encoding="utf-8")
     res = stand.run("--rollback", DAY)
     assert res.returncode == 0, res.stdout + res.stderr
     assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 1\n"
@@ -237,9 +259,10 @@ def test_foreign_live_edit_stops(stand: Stand) -> None:
     assert stand.accepted() == stand.base
 
 
-def test_failed_acceptance_rolls_back(stand: Stand) -> None:
+@pytest.mark.parametrize("cause", ["BROKEN", "IMPORTERR"])
+def test_failed_acceptance_rolls_back(stand: Stand, cause: str) -> None:
     stand.master({
-        "scrapers/understat/client.py": "VERSION = 2  # BROKEN\n",
+        "scrapers/understat/client.py": f"VERSION = 2  # {cause}\n",
         "scrapers/understat/extra.py": "EXTRA = 1\n",
     })
     res = stand.run()
@@ -253,12 +276,31 @@ def test_failed_acceptance_rolls_back(stand: Stand) -> None:
     assert (stand.state / f"understat-auto-deliver-attempted-{DAY}").exists()
 
 
-def test_outside_window_does_nothing(stand: Stand) -> None:
+def test_unconfirmed_rollback_switches_off(stand: Stand) -> None:
     stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
-    (stand.ss / "now").write_text("2026-09-24 09:30:00", encoding="utf-8")
+    (stand.ss / "stale").write_text("", encoding="utf-8")
+    res = stand.run()
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 1\n"
+    assert "🆘" in stand.tg() and "НУЖНЫ РУКИ" in stand.tg()
+    assert (stand.state / "understat-auto-deliver.off").exists()
+    assert (stand.state / "understat-inflight").exists()
+    assert stand.accepted() == stand.base
+    (stand.state / f"understat-auto-deliver-attempted-{DAY}").unlink()
+    res = stand.run()
+    assert res.returncode == 0 and "выключатель" in res.stdout
+
+
+@pytest.mark.parametrize("why", ["window", "busy"])
+def test_outside_window_or_busy_does_nothing(stand: Stand, why: str) -> None:
+    stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
+    if why == "window":
+        (stand.ss / "now").write_text("2026-09-24 09:30:00", encoding="utf-8")
+    else:
+        (stand.ss / "busy").write_text("1\n", encoding="utf-8")
     res = stand.run()
     assert res.returncode == 0
-    assert "вне окна" in stand.log()
+    assert ("вне окна" if why == "window" else "Understat занят") in stand.log()
     assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 1\n"
     assert not (stand.state / f"understat-auto-deliver-attempted-{DAY}").exists()
     assert stand.tg() == ""
