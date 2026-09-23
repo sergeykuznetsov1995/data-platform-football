@@ -199,7 +199,9 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    неразличим). `ACCOUNTED=t` означает, что
    оплаченный скоуп доехал до `state.json`: у capture — `finalize` успешен и `validate`
    терминален; у волны метаданных — задача успешна (её падение даёт `unknown`: чекпойнт
-   пишется в середине задачи, и по цвету не отличить «упало до записи» от «упало после»). Файл ни на что не влияет и код возврата не
+   пишется в середине задачи, и по цвету не отличить «упало до записи» от «упало после»). С #1354
+   план истории метадату не выдаёт (раздел «Метаданные сезонов»), так что эта ветка учёта
+   остаётся только для старых прогонов. Файл ни на что не влияет и код возврата не
    меняет — его читает автомат ночной доставки и вставляет строкой в ✅ об исходе ночи
    (файл от чужого `WINDOW_ID` или отсутствующий — «учёт неизвестен», а не молчание).
    Старый файл удаляется в начале шага, новый пишется атомарно.
@@ -581,6 +583,50 @@ id обязан совпасть с `candidate_ids_sha256` политики `all
 (`@continuous` история, актуалка, афиша) перезапускать не нужно — новый порядок действует со
 следующего плана после доставки. 59 из 87 турниров `gender=unknown` размечены `core`, но в
 очередь пока не попадают: снапшот держит их и все их сезоны `excluded` (возврат — отдельный PR).
+
+## Метаданные сезонов (#1354)
+
+**Что изменилось.** До #1354 план истории на первом сезоне без метаданных (`metadata_status=pending`)
+при пустом батче выдавал одну задачу метаданных на целый календарный год, а готовые сезоны за ней
+ждали; каждый чекпойнт этой задачи к тому же ронял поздние старты скоупов («snapshot changed after
+planning»). Теперь план истории pending-сезоны пропускает (более глубокие сезоны того же турнира
+по-прежнему ждут за ними) и метадату не выдаёт никогда. Метаданные дописывает актуалка.
+
+**Где задача.** `dag_refresh_sofascore_all_mens`, задача `enrich_season_metadata`:
+`validate_refresh_scope >> enrich_season_metadata >> propagate_refresh_status`, `trigger_rule=all_done`,
+`retries=0`, таймаут 40 мин, пул `ingest_scraper_pool` (шлюз `sofascore_gw_951`), вес ниже скоупов.
+Она запускает `scripts/enrich_sofascore_all_mens_snapshot.py --select priority --max-seasons N`
+с потолком 16 МиБ на прогон и пишет снапшот через тот же чекпойнт под замком. N —
+`SOFASCORE_METADATA_SEASONS_PER_RUN` (рецепт, дефолт 170; `0` — задача пропускается, skipped). Ручка
+живёт в `environment:` рецепта, поэтому меняется через `/etc/data-platform/sofascore.env` и ротацию.
+
+**Порядок.** Кандидаты — pending-сезоны турниров с `queue_priority > 0` (реестр знаменателя) и
+`start_year >= 0`; сортировка `(queue_priority, 0 если сезон самый новый у турнира иначе 1,
+-start_year, tournament_id, source_season_id)`: сначала идущие сезоны ядра, затем ядро вглубь год
+за годом, затем спорные. N режет по сезонам, не по турнирам. Турнир с непроверенной идентичностью
+(`pending`) сначала получает один запрос идентичности; исключение по полу — как в волновом режиме.
+Повтор сезонов `schema_error` в этом режиме не делается (он остался у ручного `--select wave`).
+
+**Снапшот меняется под ногами.** Скоуп, запланированный на прежней ревизии снапшота, не падает:
+`load_exact_scope` пишет warning «snapshot revised after planning (<old8>→<new8>), campaign identity
+intact», а validate обеих DAG сверяет `campaign_id`, турнир и сезон, но не `snapshot_id` результата
+(в результате лежит фактическая ревизия — для разбора). Сам обогатитель свою проверку
+`--expected-snapshot-id` сохраняет: он пишет снапшот и чужую ревизию не перезатрёт.
+
+**Отчёты.** `<all-men>/metadata-results/<run_id>.json` (на хосте
+`/root/sofascore-runtime/all-men/metadata-results/`): `select`, `max_seasons`, `selected_seasons`,
+`ready_wave_scopes` (сколько выбранных сезонов стали ready), `source_requests`, `traffic.paid_proxy_bytes`,
+`errors[]`. Те же три числа — в XCom задачи. Утренняя сводка печатает строку
+`метаданные сезонов: ready <n> (<±Δ за сутки>), pending <m>; enrich за сутки: <k> прогонов, <s> сезонов,
+ошибок <e>` (журнал для Δ — `/root/watchdog/state/sofascore_metadata_ready.jsonl`).
+
+**Рост ready одной командой.**
+```bash
+python3 -c "import json,collections as c;d=json.load(open('/root/sofascore-runtime/all-men/snapshot.json'));print(c.Counter(s['metadata_status'] for t in d['tournaments'] for s in t['seasons']))"
+```
+
+**Цвет.** Задачи нет в `REFRESH_TASK_IDS`: её провал — красная TI, но не красный DagRun
+(`propagate_refresh_status` смотрит только на задачи актуалки). Причина провала — в `errors[]` отчёта.
 
 ## Измеритель вехи 1 (#1355)
 
