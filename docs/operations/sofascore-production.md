@@ -513,6 +513,40 @@ s.clear_failed(p, campaign_id=cid, scope_key=f'{cid}:<tournament_id>:<source_sea
   раннера с `--offline-replay` (только raw) по слову владельца.
   Строки журнала не удаляются — это история отказов.
 
+## Порог красноты (#1356)
+
+Порог один на весь контур: **красных `run_*_scope` task instance < 20 % за сутки UTC** (решение
+гриля 22.09). Считается по `task_instance`, а не по цвету `dag_run`: цвет DagRun лжёт (урок 84), а
+один красный скоуп даёт до трёх красных TI (`run_*_scope`, `validate_*_scope`, лист статуса).
+
+- **Где живёт.** `dags/utils/sofascore_red_share.py` — порог `RED_SHARE_THRESHOLD_PCT`, SQL
+  `red_share_sql(t0, t1)`, строка `format_line(day, per_dag)`. Модуль без Airflow и едет релизом;
+  хостовые утренняя сводка (`/root/watchdog/morning_report.py`, строка «кампания SofaScore») и сторож
+  (`/root/watchdog/sofascore_stall_watch.py`, правило R4) импортируют его из боевого релиза
+  (`SOFASCORE_RELEASE_ROOT=` в `/etc/data-platform/sofascore.env`) и печатают одну и ту же строку.
+  Своих порогов у них нет. Модуля в релизе нет — строка `⛔ порог красноты: модуля
+  sofascore_red_share нет в релизе <sha8>`; подмена для стенда — `SOFASCORE_RED_SHARE_MODULE=<путь>`.
+- **Что считается.** `dag_backfill_sofascore_all_mens` и `dag_refresh_sofascore_all_mens`,
+  `task_id LIKE 'run\_%\_scope'` (`run_historical_scope`, `run_refresh_scope`; `run_sofascore_dq` не
+  скоуп), `map_index >= 0`, `state IN ('success','failed')`, окно `[вчера 00:00Z, сегодня 00:00Z)` по
+  `start_date`. Строка TI хранит последнюю попытку: повтор переносит её в сутки, когда он стартовал;
+  `up_for_retry`/`running` не считаются. При таймауте скоупа 4 ч и повторе через 2 мин число за вчера
+  устойчиво с ~04:05 UTC — сводка (05:00 UTC) и R4 (с 05:00 UTC) читают его после этого.
+- **Цвет.** «✅» — только при доле < 20 % и хотя бы одном терминальном TI; ≥ 20 % — «⛔», сводка
+  заводит разбор `/root/SOFASCORE-STALL-<день>.md`, R4 шлёт ту же строку в Telegram (раз в сутки,
+  state-ключ `red_share_day`); ноль терминальных TI — «⚠️ нет терминальных TI», без «✅».
+- **Проверить руками одним SQL** (ответ `dag_id|красных|всего`):
+  ```bash
+  R=$(grep -m1 '^SOFASCORE_RELEASE_ROOT=' /etc/data-platform/sofascore.env | cut -d= -f2)
+  docker exec sofascore-airflow-metadb psql -U airflow -d airflow -Atc "$(python3 -c "import importlib.util as u,datetime as d
+  s=u.spec_from_file_location('m','$R/dags/utils/sofascore_red_share.py');m=u.module_from_spec(s);s.loader.exec_module(m)
+  t=d.datetime.now(d.timezone.utc).date();print(m.red_share_sql(f'{t-d.timedelta(1)}T00:00:00Z',f'{t}T00:00:00Z'))")"
+  ```
+- **Дейли.** `dag_ingest_sofascore` в скоуп-порог не входит, но его цвет теперь честный: гейт
+  `gate_player_capture` по будням скипает только прямого потомка (`ignore_downstream_trigger_rules=False`),
+  лист `propagate_ingest_status` исполняется и краснит DagRun при `validate_data=failed`; валидаторы
+  игроков в такие дни сами выходят `AirflowSkipException`.
+
 ## Мины, которые уже стреляли
 
 - Дерево 0700 от `mktemp` → шлюз в цикле `Permission denied` (25.08); `freeze_release.sh`
