@@ -25,6 +25,7 @@ from scrapers.sofascore.discovery import (
     parse_team_count_payload,
 )
 from scrapers.sofascore.all_mens_campaign import validate_campaign_snapshot
+from scrapers.sofascore.denominator import Denominator, load_denominator
 
 
 class SnapshotEnrichmentError(ValueError):
@@ -72,8 +73,13 @@ def enrich_snapshot(
     wave_start_year: int,
     max_tournaments: Optional[int] = None,
     checkpoint: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    denominator: Optional[Denominator] = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
-    """Confirm source gender and team counts for one breadth-first wave."""
+    """Confirm source gender and team counts for one breadth-first wave.
+
+    A tournament outside the denominator queues (``queue_priority 0``:
+    esoccer, student; #1353) is never fetched.
+    """
 
     _validate_snapshot(snapshot)
     if max_tournaments is not None and (
@@ -82,6 +88,7 @@ def enrich_snapshot(
         or max_tournaments < 1
     ):
         raise SnapshotEnrichmentError("max_tournaments must be positive")
+    denominator = load_denominator() if denominator is None else denominator
     document = deepcopy(dict(snapshot))
     processed = 0
     source_requests = 0
@@ -93,6 +100,8 @@ def enrich_snapshot(
             break
         if not isinstance(tournament, dict):
             raise SnapshotEnrichmentError("snapshot tournament must be an object")
+        if denominator.queue_priority(int(tournament["unique_tournament_id"])) == 0:
+            continue
         status = str(tournament.get("metadata_status") or "pending")
         wave_seasons = [
             season for season in tournament.get("seasons") or []

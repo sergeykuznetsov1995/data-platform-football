@@ -347,3 +347,27 @@ def test_retry_lifts_a_tournament_with_no_pending_season_in_the_wave():
     assert client.calls == ["/unique-tournament/17/season/76986/teams"]
     assert report["retried_schema_error_scopes"] == 1
     assert report["recovered_schema_error_scopes"] == 1
+
+
+@pytest.mark.parametrize("tournament_class", ["esoccer", "student"])
+def test_tournament_outside_the_denominator_queues_is_never_fetched(tournament_class):
+    from scrapers.sofascore.denominator import (
+        CLASS_PRIORITY,
+        Denominator,
+        DenominatorRow,
+    )
+
+    denominator = Denominator(rows={17: DenominatorRow(
+        tournament_id=17, capture_key="SS-17", name="x",
+        tournament_class=tournament_class,
+        queue_priority=CLASS_PRIORITY[tournament_class], basis="test",
+    )})
+    client = Client()
+    snapshot = _snapshot()
+
+    enriched, _ = enrich_snapshot(
+        snapshot, client, wave_start_year=2025, denominator=denominator
+    )
+
+    assert client.calls == []
+    assert enriched["tournaments"] == snapshot["tournaments"]
