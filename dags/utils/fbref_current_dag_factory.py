@@ -31,6 +31,7 @@ from utils.fbref_pipeline_tasks import (
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
     finalize_fbref_publication_lock,
+    finalize_fbref_publication_lock_and_route_silver,
     initialize_fbref_run,
     release_fbref_publication_lock,
     run_fbref_live_waves,
@@ -341,9 +342,18 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         seed_competition_index >> capture_raw_baseline >> recover_raw
         recover_raw >> live_waves >> audit_raw_integrity
 
-        release_publication_lock = PythonOperator(
+        # #1324: on ingest the finalizer also routes Silver (after the lock),
+        # so it stays the terminal Bronze verdict; bootstrap has no Silver.
+        release_operator = (
+            PythonOperator if bootstrap_only else BranchPythonOperator
+        )
+        release_publication_lock = release_operator(
             task_id="release_publication_lock",
-            python_callable=finalize_fbref_publication_lock,
+            python_callable=(
+                finalize_fbref_publication_lock
+                if bootstrap_only
+                else finalize_fbref_publication_lock_and_route_silver
+            ),
             op_kwargs={
                 "airflow_run_id": AIRFLOW_RUN_ID,
                 "dag_id": DAG_ID,
@@ -462,8 +472,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
             choose_path >> validate_freshness >> validate_run
             validate_run >> export_publication_scope >> release_publication_lock
             release_canary_lock >> release_publication_lock
-            # On the canary path export is skipped, so Silver is skipped too.
-            [export_publication_scope, release_publication_lock] >> trigger_silver
+            # The finalizer branches into Silver only after a successful
+            # publication export; its failure leaves Silver upstream_failed.
+            release_publication_lock >> trigger_silver
 
     return dag
 

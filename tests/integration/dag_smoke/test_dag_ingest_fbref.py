@@ -130,10 +130,8 @@ class TestFBrefCurrentFailureEdges:
         )
         assert export.upstream_task_ids == {"validate_run"}
         # #1324: Silver after the lock, unawaited; the lock never waits.
-        assert trigger.upstream_task_ids == {
-            "export_publication_scope",
-            "release_publication_lock",
-        }
+        assert trigger.upstream_task_ids == {"release_publication_lock"}
+        assert release.task_type == "BranchPythonOperator"
         assert release.upstream_task_ids == {
             "export_publication_scope",
             "release_canary_publication_lock",
@@ -203,8 +201,7 @@ class TestFBrefBoundedModes:
                 ].upstream_task_ids == {"trigger_silver_transform"}
             else:
                 assert trigger.upstream_task_ids == {
-                    export.task_id,
-                    "release_publication_lock",
+                    "release_publication_lock"
                 }
             assert validate.trigger_rule == "all_success"
             assert trigger.trigger_rule == "all_success"

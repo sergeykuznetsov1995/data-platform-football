@@ -1867,6 +1867,30 @@ def finalize_fbref_publication_lock(
     )
 
 
+def finalize_fbref_publication_lock_and_route_silver(
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    **context,
+):
+    """Branching finalizer of the lanes that trigger Silver after the lock.
+
+    #1324: the lock finalizer stays the DAG's terminal Bronze verdict.  Silver
+    is followed only after the finalizer released the lock for a successful
+    publication export; every other successful outcome (canary, dry run,
+    non-publishing backfill) skips Silver only after the verdict is known, and
+    a raising finalizer fails this task, so Silver ends upstream_failed and
+    the DagRun stays red.
+    """
+
+    result = finalize_fbref_publication_lock(
+        airflow_run_id=airflow_run_id, dag_id=dag_id, **context
+    )
+    if result.get("status") == "released_after_publication_export":
+        return "trigger_silver_transform"
+    return None
+
+
 def seed_fbref_competition_index(
     *, airflow_run_id: str, dag_id: str
 ) -> str:
@@ -2748,6 +2772,7 @@ __all__ = [
     "choose_fbref_publication_path",
     "export_fbref_publication_scope",
     "finalize_fbref_publication_lock",
+    "finalize_fbref_publication_lock_and_route_silver",
     "fbref_dag_failure_callback",
     "initialize_fbref_run",
     "drain_fbref_replay",

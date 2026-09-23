@@ -38,7 +38,7 @@ from utils.fbref_pipeline_tasks import (
     choose_fbref_backfill_publication_path,
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
-    finalize_fbref_publication_lock,
+    finalize_fbref_publication_lock_and_route_silver,
     guard_fbref_history_window,
     initialize_fbref_run,
     plan_fbref_backfill,
@@ -393,9 +393,11 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    release_publication_lock = PythonOperator(
+    # #1324: the finalizer stays the terminal Bronze verdict and branches into
+    # Silver only after a successful publication export.
+    release_publication_lock = BranchPythonOperator(
         task_id="release_publication_lock",
-        python_callable=finalize_fbref_publication_lock,
+        python_callable=finalize_fbref_publication_lock_and_route_silver,
         op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
         retries=0,
         trigger_rule="all_done",
@@ -403,8 +405,7 @@ with DAG(
 
     previous >> validate_freshness >> validate_run >> choose_publication_path
     choose_publication_path >> export_publication_scope >> release_publication_lock
-    # On the non-publishing path export is skipped, so Silver is skipped too.
-    [export_publication_scope, release_publication_lock] >> trigger_silver
+    release_publication_lock >> trigger_silver
     # A non-publishing historical run holds the lock for its own batches only,
     # instead of the six-to-eighteen hours a Silver transform costs.
     choose_publication_path >> release_publication_lock

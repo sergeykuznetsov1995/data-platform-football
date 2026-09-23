@@ -185,17 +185,18 @@ class TestFBrefBackfillTopology:
         # #1324: lock released after export; Silver after the lock, unawaited.
         assert tasks["export_publication_scope"].downstream_task_ids == {
             "release_publication_lock",
-            "trigger_silver_transform",
         }
-        assert tasks["release_publication_lock"].upstream_task_ids == {
+        release = tasks["release_publication_lock"]
+        assert release.upstream_task_ids == {
             "choose_publication_path",
             "export_publication_scope",
         }
+        assert type(release) is type(tasks["choose_publication_path"])
+        assert release.python_callable.__name__ == (
+            "finalize_fbref_publication_lock_and_route_silver"
+        )
         trigger = tasks["trigger_silver_transform"]
-        assert trigger.upstream_task_ids == {
-            "export_publication_scope",
-            "release_publication_lock",
-        }
+        assert trigger.upstream_task_ids == {"release_publication_lock"}
         assert trigger._captured_kwargs["wait_for_completion"] is False
         assert (
             trigger._captured_kwargs["execution_timeout"].total_seconds()

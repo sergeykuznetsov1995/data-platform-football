@@ -1089,6 +1089,53 @@ def test_publication_lock_finalizer_releases_and_fails_after_export_failure(
     release.assert_called_once()
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("status", "branch"),
+    [
+        ("released_after_publication_export", "trigger_silver_transform"),
+        ("released_by_canary_path", None),
+        ("released_after_nonpublishing_run", None),
+        ("not_acquired", None),
+    ],
+)
+def test_route_silver_follows_silver_only_after_publication_export(
+    monkeypatch, status, branch,
+):
+    finalizer = MagicMock(return_value={"released": True, "status": status})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "finalize_fbref_publication_lock", finalizer
+    )
+
+    assert fbref_pipeline_tasks.finalize_fbref_publication_lock_and_route_silver(
+        airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        dag_run="run",
+    ) == branch
+    finalizer.assert_called_once_with(
+        airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        dag_run="run",
+    )
+
+
+@pytest.mark.unit
+def test_route_silver_propagates_a_red_verdict(monkeypatch):
+    from airflow.exceptions import AirflowException
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "finalize_fbref_publication_lock",
+        MagicMock(side_effect=AirflowException("canary verdict is red")),
+    )
+
+    with pytest.raises(AirflowException, match="canary verdict is red"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock_and_route_silver(
+            airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+        )
+
+
 def _replay_shaped_task():
     # dag_replay_fbref keeps export -> Silver (wait) -> lock (#1324 scope).
     return SimpleNamespace(upstream_task_ids={"trigger_silver_transform"})

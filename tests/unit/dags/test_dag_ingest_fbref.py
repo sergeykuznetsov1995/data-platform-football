@@ -193,8 +193,11 @@ class TestFBrefCurrentTopology:
         release = tasks["release_publication_lock"]
         assert release._captured_kwargs["trigger_rule"] == "all_done"
         assert release._captured_kwargs["retries"] == 0
+        # #1324: the finalizer is a branch -- the terminal Bronze verdict that
+        # follows Silver only after a successful publication export.
+        assert type(release) is type(tasks["choose_publication_path"])
         assert release.python_callable.__name__ == (
-            "finalize_fbref_publication_lock"
+            "finalize_fbref_publication_lock_and_route_silver"
         )
         freshness = tasks["validate_current_scope_freshness"]
         assert freshness.python_callable.__name__ == (
@@ -226,10 +229,8 @@ class TestFBrefCurrentTopology:
         # Silver is triggered after the lock and is a leaf.
         assert tasks["export_publication_scope"].downstream_task_ids == {
             "release_publication_lock",
-            "trigger_silver_transform",
         }
         assert tasks["trigger_silver_transform"].upstream_task_ids == {
-            "export_publication_scope",
             "release_publication_lock",
         }
         assert tasks["trigger_silver_transform"].downstream_task_ids == set()
