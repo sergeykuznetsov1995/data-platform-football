@@ -260,7 +260,7 @@ class TestDailyRollup:
     @pytest.mark.unit
     def test_rolls_up_per_source_and_formats_report(self, fake_silver):
         fake_silver["rows"] = [
-            ("fbref", 900.0, 3, None), ("transfermarkt", 300.0, 4, 1200.5),
+            ("fbref", 900.0, 3, None, 3), ("transfermarkt", 300.0, 4, 1200.5, 0),
         ]
         pt = importlib.import_module("utils.proxy_traffic")
 
@@ -269,7 +269,7 @@ class TestDailyRollup:
         assert out["total_mb"] == pytest.approx(1200.0)
         assert out["by_source"][0] == {
             "source": "fbref", "mb": 900.0, "gb": round(900.0 / 1024, 3), "runs": 3,
-            "paid_mb": None,
+            "paid_mb": None, "unbilled_runs": 3,
         }
         assert out["by_source"][1]["paid_mb"] == 1200.5
         assert "fbref" in out["report"] and "GB" in out["report"]
@@ -277,6 +277,7 @@ class TestDailyRollup:
         assert "transfermarkt 0.293 GB (оплачено 1200.5 МиБ)" in out["report"]
         assert "fbref 0.879 GB," in out["report"]
         assert out["total_paid_mb"] == 1200.5
+        assert out["paid_complete"] is True
         assert out["unbilled_sources"] == ["fbref"]
         assert out["report"].startswith(
             "вчера прокси: распаковано 1.172 GB (1200.0 MB); "
@@ -291,6 +292,27 @@ class TestDailyRollup:
         assert any("GROUP BY source" in s for s in fake_silver["executed"])
         assert any(
             "decoded_response_body_bytes" in s
+            for s in fake_silver["executed"]
+            if s.startswith("SELECT source")
+        )
+
+    @pytest.mark.unit
+    def test_partly_billed_source_is_marked_incomplete(self, fake_silver):
+        # Two TM runs yesterday, only one of them metered: sum() skips the
+        # NULL row, so the paid total must be flagged as incomplete.
+        fake_silver["rows"] = [("transfermarkt", 300.0, 2, 150.0, 1)]
+        pt = importlib.import_module("utils.proxy_traffic")
+
+        out = pt.daily_rollup(object())
+
+        assert out["total_paid_mb"] == 150.0
+        assert out["paid_complete"] is False
+        assert out["unbilled_sources"] == ["transfermarkt"]
+        assert "оплачено провайдеру 150.0 МиБ (итог неполный)" in out["report"]
+        assert "без данных биллинга: transfermarkt (1 из 2 прогонов)" in out["report"]
+        assert "неполно: 1 из 2 прогонов без биллинга" in out["report"]
+        assert any(
+            "count_if(provider_metered_bytes IS NULL)" in s
             for s in fake_silver["executed"]
             if s.startswith("SELECT source")
         )

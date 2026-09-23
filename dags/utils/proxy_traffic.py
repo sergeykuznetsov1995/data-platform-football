@@ -522,8 +522,8 @@ def daily_rollup(conn) -> Dict[str, Any]:
     """Per-source residential-traffic totals for *yesterday* (#789 Phase 2).
 
     Reuses ``_execute`` (fetch=True). Returns
-    ``{total_mb, total_gb, total_paid_mb, unbilled_sources,
-    by_source: [{source, mb, gb, runs, paid_mb}], report}`` where ``report`` is
+    ``{total_mb, total_gb, total_paid_mb, paid_complete, unbilled_sources,
+    by_source: [{source, mb, gb, runs, paid_mb, unbilled_runs}], report}`` where ``report`` is
     the human line the daily DAG logs.  ``total_mb`` is decoded body traffic;
     ``total_paid_mb`` is provider-billed traffic of metered sources only.
     """
@@ -536,7 +536,8 @@ def daily_rollup(conn) -> Dict[str, Any]:
             "SELECT source, sum(COALESCE("
             f"CAST(decoded_response_body_bytes AS double) / {MIB}.0, "
             "total_mb)) AS mb, count(*) AS runs, "
-            f"sum(CAST(provider_metered_bytes AS double) / {MIB}.0) AS paid_mb "
+            f"sum(CAST(provider_metered_bytes AS double) / {MIB}.0) AS paid_mb, "
+            "count_if(provider_metered_bytes IS NULL) AS unbilled_runs "
             f"FROM {OPS_TABLE} "
             "WHERE run_date = current_date - INTERVAL '1' DAY "
             "GROUP BY source ORDER BY mb DESC",
@@ -552,6 +553,9 @@ def daily_rollup(conn) -> Dict[str, Any]:
             "runs": int(r[2] or 0),
             # NULL when the source has no provider-metered rows yesterday.
             "paid_mb": round(float(r[3]), 4) if r[3] is not None else None,
+            # sum() skips NULL rows: a partly billed source is marked, not
+            # silently shown as a full paid total.
+            "unbilled_runs": int(r[4] or 0),
         }
         for r in rows
     ]
@@ -560,22 +564,37 @@ def daily_rollup(conn) -> Dict[str, Any]:
     # exist only for metered sources; the rest are named as having no billing
     # data instead of being silently mixed into a "spend" total.
     paid = [s for s in by_source if s["paid_mb"] is not None]
-    unbilled = [s["source"] for s in by_source if s["paid_mb"] is None]
+    unbilled = [s["source"] for s in by_source if s["unbilled_runs"]]
     total_paid_mb = (
         round(sum(s["paid_mb"] for s in paid), 4) if paid else None
     )
+    paid_complete = bool(paid) and not any(s["unbilled_runs"] for s in paid)
+
+    def _paid_note(s):
+        if s["paid_mb"] is None:
+            return ""
+        if s["unbilled_runs"]:
+            return (
+                f" (оплачено {s['paid_mb']} МиБ, неполно: {s['unbilled_runs']} "
+                f"из {s['runs']} прогонов без биллинга)"
+            )
+        return f" (оплачено {s['paid_mb']} МиБ)"
+
     parts = ", ".join(
-        f"{s['source']} {s['gb']} GB"
-        + (f" (оплачено {s['paid_mb']} МиБ)" if s["paid_mb"] is not None else "")
-        for s in by_source
+        f"{s['source']} {s['gb']} GB{_paid_note(s)}" for s in by_source
     ) or "—"
     paid_txt = (
-        f"оплачено провайдеру {total_paid_mb} МиБ "
-        f"({', '.join(s['source'] for s in paid)})"
+        f"оплачено провайдеру {total_paid_mb} МиБ"
+        + ("" if paid_complete else " (итог неполный)")
+        + f" ({', '.join(s['source'] for s in paid)})"
         if paid else "оплаченных байт нет"
     )
     if unbilled:
-        paid_txt += f"; без данных биллинга: {', '.join(unbilled)}"
+        paid_txt += "; без данных биллинга: " + ", ".join(
+            s["source"] if s["paid_mb"] is None
+            else f"{s['source']} ({s['unbilled_runs']} из {s['runs']} прогонов)"
+            for s in by_source if s["unbilled_runs"]
+        )
     report = (
         f"вчера прокси: распаковано {round(total_mb / 1024, 3)} GB "
         f"({total_mb} MB); {paid_txt}: {parts}"
@@ -584,6 +603,7 @@ def daily_rollup(conn) -> Dict[str, Any]:
         "total_mb": total_mb,
         "total_gb": round(total_mb / 1024, 3),
         "total_paid_mb": total_paid_mb,
+        "paid_complete": paid_complete,
         "unbilled_sources": unbilled,
         "by_source": by_source,
         "report": report,
