@@ -5,6 +5,7 @@ import gzip
 import gc
 import json
 import logging
+import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -12281,6 +12282,11 @@ def test_match_404_is_deferred_while_sibling_and_next_run_succeed(tmp_path):
     ("error_class", "http_status", "permanent"),
     [
         ("http_status", 500, False),
+        ("http_status", 410, False),
+        ("http_exception", None, False),
+        ("empty_body", 200, False),
+        ("invalid_encoding", 200, False),
+        ("invalid_content_type", 200, False),
     ],
 )
 def test_other_match_target_failure_is_deferred(
@@ -12467,6 +12473,80 @@ def test_live_run_serialization_exposes_deferred_match_not_found():
     ).as_dict()
 
     assert payload["fetch"]["deferred_match_not_found"] == 1
+
+
+@pytest.mark.parametrize(
+    ("error_class", "http_status"),
+    [
+        ("transport_internal_error", None),
+        ("raw_contract_not_html_document", 200),
+        ("some_future_class", None),
+    ],
+)
+def test_unclassified_target_failure_still_fails_the_wave(
+    tmp_path, error_class, http_status,
+):
+    # #1324 round 2: a class the control store does not classify would come
+    # back as unclassified_failures in validate_and_finish, so it is not
+    # deferred -- it keeps failing the wave closed.
+    run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"unclassified:{error_class}"))
+    lease = _match_fetch_lease(run_id, 1)
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, [[lease]])
+
+    class UnclassifiedFailureFetcher(FakeFetcher):
+        def fetch(self, url, **_kwargs):
+            raise FetchError(
+                f"target failure for {url}",
+                error_class=error_class,
+                http_status=http_status,
+                wire_bytes=303,
+                browser_document_bytes=0,
+                browser_asset_bytes=0,
+                browser_requests=0,
+                browser_bootstrap_attempts=0,
+                browser_unobserved_bytes=0,
+                target_requests=1,
+                http_status_history=(
+                    () if http_status is None else (http_status,)
+                ),
+                latency_ms=321,
+            )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: UnclassifiedFailureFetcher(
+            control.events, b"unused"
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match=error_class):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=replace(_settings(), shard_size=1),
+        )
+
+    assert control.failed[0][1]["requeue"] is False
+
+
+def test_deferrable_classes_are_classified_by_the_control_store():
+    # The deferral set must stay inside the store's classified traffic
+    # errors, or a deferred page resurfaces as unclassified_failures and
+    # fails validate_and_finish (#1324 round 2).
+    store_source = (
+        Path(__file__).resolve().parents[3]
+        / "scrapers" / "fbref" / "control" / "store.py"
+    ).read_text(encoding="utf-8")
+    block = store_source.split("classified_errors = [", 1)[1].split("]", 1)[0]
+    classified = set(re.findall(r'"([A-Za-z_]+)"', block))
+
+    assert pipeline_module.DEFERRABLE_TARGET_FAILURE_CLASSES <= classified
 
 
 class FakeSelectiveServerErrorFetcher(FakeFetcher):

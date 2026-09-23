@@ -238,14 +238,27 @@ MAX_RUN_DEFERRED_MATCH_NOT_FOUND = 25
 # target-local while refusing to normalize a cohort- or run-wide markup jump.
 MAX_ROUTINE_TERMINAL_OVERSIZED_PAGES = 5
 MAX_RUN_TERMINAL_OVERSIZED_PAGES = 25
-# #1324: any other target-local FetchError (5xx, a non-match 4xx outside the
-# clearance statuses, empty body, non-HTML answer...) defers that one target
+# #1324: any other target-local FetchError of a classified class (5xx, a
+# non-match 4xx outside the clearance statuses, empty body, wrong encoding or
+# content type, see DEFERRABLE_TARGET_FAILURE_CLASSES) defers that one target
 # to the next run instead of failing the wave.  A 3xx that is not a usable
 # "moved" statement is NOT deferred: it is a transport signal (challenge,
 # captive portal, hijacked exit) and still fails the wave.  The per-wave floor is
 # MAX_ROUTINE_CONTRACT_QUARANTINES; the run gets the same hard ceiling as
 # permanent redirects, so a thin but steady stream of failures still ends red.
 MAX_DEFERRED_TARGET_FAILURES_PER_RUN = 25
+# Only classes the control store's traffic summary already counts as
+# classified target failures may be deferred: any other class (an internal
+# transport bug, a raw-contract rejection, anything new) would reappear as
+# unclassified_failures and fail validate_and_finish anyway, so it keeps
+# failing the wave closed where it happens.
+DEFERRABLE_TARGET_FAILURE_CLASSES = frozenset({
+    "http_status",
+    "http_exception",
+    "empty_body",
+    "invalid_encoding",
+    "invalid_content_type",
+})
 # A moved-page verdict shrinks the crawl scope quietly, so it may only be
 # reached for an address that still belongs to the source.  A captive portal
 # or a hijacked residential exit answering 301 with its own login page must
@@ -3869,11 +3882,14 @@ class FBrefPipeline:
                         )
                         # #1324: every other target-local failure is deferred
                         # the same reversible way instead of failing the wave.
-                        deferred_target_failure = not (
-                            moved
-                            or match_not_found
-                            or terminal_oversized
-                            or redirect_refusal
+                        deferred_target_failure = (
+                            exc.error_class in DEFERRABLE_TARGET_FAILURE_CLASSES
+                            and not (
+                                moved
+                                or match_not_found
+                                or terminal_oversized
+                                or redirect_refusal
+                            )
                         )
                         reversible_target_failure = (
                             moved or match_not_found or deferred_target_failure
@@ -4009,7 +4025,7 @@ class FBrefPipeline:
                                     returned,
                                 )
                                 break
-                        elif redirect_refusal:
+                        elif not deferred_target_failure:
                             result.failures.append(
                                 f"{lease.target_id}:{exc.error_class}"
                             )
