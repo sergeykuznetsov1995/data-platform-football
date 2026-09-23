@@ -328,15 +328,14 @@ def test_duplicate_response_after_normal_finish_is_accepted_once():
     assert transport._settled_finished_request_urls == {}
 
 
-@pytest.mark.unit
-def test_late_oversized_response_trips_byte_cap_after_unknown_finish():
+def _late_oversized_response_after_unknown_finish(cap):
     admission = (
         BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
         + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
     )
     transport = CamoufoxFbrefTransport(
         max_network_requests=5,
-        max_network_bytes=3 * admission,
+        max_network_bytes=cap,
     )
     route = _Route(url="https://fbref.com/en/")
     route.request._impl_obj._guid = "request@bootstrap"
@@ -357,27 +356,73 @@ def test_late_oversized_response_trips_byte_cap_after_unknown_finish():
             status=200,
         )
     )
-
-    stats = transport.traffic_stats()
-    assert stats["byte_budget_exhausted"] is True
-    assert stats["byte_budget_failure"] == (
-        "late_declared_body_exceeds_settled_reservation:"
-        f"{BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + declared_body}>{admission}"
-    )
-    assert stats["unobserved_reserved_bytes"] == (
+    return transport, late, admission, (
         BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + declared_body
     )
 
 
 @pytest.mark.unit
-def test_late_oversized_response_tops_up_successful_size_accounting():
+def test_late_oversized_response_is_absorbed_after_unknown_finish_while_the_cap_fits():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport, late, admission, desired = (
+        _late_oversized_response_after_unknown_finish(3 * admission)
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["byte_budget_failure"] is None
+    assert stats["unobserved_reserved_bytes"] == desired
+    assert stats["reservation_overruns"] == 1
+    assert stats["reservation_overrun_bytes"] == desired - admission
+
+    # A duplicate of the same late response must not charge the overrun twice.
+    transport._on_response(
+        _Response(
+            late,
+            {"content-length": str(desired - BROWSER_REQUEST_FIXED_OVERHEAD_BYTES)},
+            status=200,
+        )
+    )
+    stats = transport.traffic_stats()
+    assert stats["unobserved_reserved_bytes"] == desired
+    assert stats["reservation_overruns"] == 1
+
+
+@pytest.mark.unit
+def test_late_oversized_response_trips_byte_cap_after_unknown_finish_when_the_cap_cannot_fit_it():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport, _late, admission, desired = (
+        _late_oversized_response_after_unknown_finish(admission)
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == (
+        "late_declared_body_exceeds_settled_reservation:"
+        f"{desired}>{admission}"
+    )
+    assert stats["unobserved_reserved_bytes"] == desired
+    assert stats["reservation_overruns"] == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cap_admissions, exhausted", [(3, False), (1, True)])
+def test_late_oversized_response_tops_up_successful_size_accounting(
+    cap_admissions, exhausted
+):
     admission = (
         BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
         + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
     )
     transport = CamoufoxFbrefTransport(
         max_network_requests=5,
-        max_network_bytes=3 * admission,
+        max_network_bytes=cap_admissions * admission,
     )
     route = _Route(url="https://fbref.com/en/")
     route.request._impl_obj._guid = "request@bootstrap"
@@ -403,7 +448,13 @@ def test_late_oversized_response_tops_up_successful_size_accounting():
     )
 
     stats = transport.traffic_stats()
-    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_exhausted"] is exhausted
+    assert stats["reservation_overruns"] == (0 if exhausted else 1)
+    if exhausted:
+        assert stats["byte_budget_failure"] == (
+            "late_declared_body_exceeds_settled_reservation:"
+            f"{desired}>{admission}"
+        )
     assert stats["real_bytes_downloaded"] == 130
     assert stats["unobserved_reserved_bytes"] == desired - 130
     assert stats["budget_bytes_consumed"] == desired
@@ -745,8 +796,22 @@ def test_undeclared_body_reserves_the_ceiling_and_settles_to_observed(headers):
     assert stats["real_bytes_downloaded"] == 41_500
 
 
+def _finish_with_size(transport, route, size, *, resource_type=None):
+    if resource_type is not None:
+        route.request.resource_type = resource_type
+    route.request.sizes.return_value = {
+        "responseBodySize": size,
+        "responseHeadersSize": 0,
+        "requestBodySize": 0,
+        "requestHeadersSize": 0,
+    }
+    transport._on_request_finished(route.request)
+
+
 @pytest.mark.unit
-def test_undeclared_body_that_outgrows_its_reservation_aborts_at_completion():
+def test_undeclared_body_that_outgrows_its_reservation_is_absorbed_while_the_cap_fits():
+    """#1385: a response bigger than its per-request reservation is an overrun
+    charged to the session budget, not a reason to kill the session."""
     overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     ceiling = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
     transport = CamoufoxFbrefTransport(
@@ -757,19 +822,241 @@ def test_undeclared_body_that_outgrows_its_reservation_aborts_at_completion():
     transport._on_response(_Response(route.request, {}))
 
     oversized = overhead + ceiling + 1
-    route.request.sizes.return_value = {
-        "responseBodySize": oversized,
-        "responseHeadersSize": 0,
-        "requestBodySize": 0,
-        "requestHeadersSize": 0,
-    }
-    transport._on_request_finished(route.request)
+    _finish_with_size(transport, route, oversized)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["byte_budget_failure"] is None
+    assert stats["reservation_overruns"] == 1
+    assert stats["reservation_overrun_bytes"] == 1
+    assert stats["inflight_reserved_bytes"] == 0
+    assert transport._bytes_total == oversized
+
+
+@pytest.mark.unit
+def test_late_response_after_an_absorbed_completion_overrun_is_not_counted_twice():
+    """Firefox may report requestfinished before the response callback. Once
+    the completed size was absorbed, a late response declaring that size is
+    already paid for."""
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    ceiling = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    transport = CamoufoxFbrefTransport(max_network_bytes=4 * 1024 * 1024)
+    route = _Route()
+    route.request._impl_obj._guid = "request@bootstrap-xhr"
+    transport._maybe_block(route)
+    oversized = overhead + ceiling + 1
+    _finish_with_size(transport, route, oversized)
+
+    transport._on_response(
+        _Response(route.request, {"content-length": str(oversized - overhead)})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is False
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["reservation_overruns"] == 1
+    assert stats["budget_bytes_consumed"] == oversized
+
+
+@pytest.mark.unit
+def test_one_600kb_undeclared_response_keeps_a_4mib_session_alive():
+    cap = 4 * 1024 * 1024
+    transport = CamoufoxFbrefTransport(max_network_bytes=cap)
+    big = _Route(resource_type="xhr", url="https://fbref.com/cdn-cgi/big")
+    transport._maybe_block(big)
+    transport._on_response(_Response(big.request, {}))
+    _finish_with_size(transport, big, 614_400)
+
+    followers = [
+        _Route(resource_type="xhr", url=f"https://fbref.com/cdn-cgi/{index}")
+        for index in range(5)
+    ]
+    for route in followers:
+        transport._maybe_block(route)
+    for route in followers:
+        _finish_with_size(transport, route, 80_000)
+
+    stats = transport.traffic_stats()
+    assert all(route.continued == 1 for route in followers)
+    assert all(route.aborted == 0 for route in followers)
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["reservation_overruns"] == 1
+    assert stats["reservation_overrun_bytes"] == (
+        614_400
+        - BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        - BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    assert stats["real_bytes_downloaded"] == 614_400 + 5 * 80_000
+    assert stats["budget_bytes_consumed"] == 614_400 + 5 * 80_000
+
+
+@pytest.mark.unit
+def test_replay_of_20260923_xhr_592492_does_not_abort():
+    """Replay of the 23.09 bootstrap: seven browser requests, one XHR of
+    592 492 bytes against a 589 824-byte reservation, 16 MiB transport cap.
+    Before #1385 this aborted with
+    ``completed_size_exceeded_reservation:592492>589824`` and killed the run."""
+    cap = 16 * 1024 * 1024
+    transport = CamoufoxFbrefTransport(max_network_bytes=cap)
+    sizes = [
+        ("document", 30_000),
+        ("script", 45_000),
+        ("xhr", 20_000),
+        ("xhr", 592_492),
+        ("xhr", 30_000),
+        ("xhr", 25_000),
+        ("document", 30_000),
+    ]
+    routes = []
+    for index, (resource_type, _size) in enumerate(sizes):
+        route = _Route(
+            resource_type=resource_type,
+            url=f"https://fbref.com/en/bootstrap/{index}",
+        )
+        transport._maybe_block(route)
+        transport._on_response(_Response(route.request, {}))
+        routes.append(route)
+    for route, (_resource_type, size) in zip(routes, sizes):
+        _finish_with_size(transport, route, size)
+
+    stats = transport.traffic_stats()
+    assert all(route.continued == 1 for route in routes)
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["byte_budget_failure"] is None
+    assert transport._byte_budget_exhausted is False
+    assert stats["reservation_overruns"] == 1
+    assert stats["reservation_overrun_bytes"] == 592_492 - 589_824
+    assert stats["real_bytes_downloaded"] == sum(size for _t, size in sizes)
+    assert stats["inflight_reserved_bytes"] == 0
+
+    after = _Route(url="https://fbref.com/en/comps/")
+    transport._maybe_block(after)
+    assert after.continued == 1
+
+
+@pytest.mark.unit
+def test_declared_body_over_admission_is_absorbed_while_the_cap_fits():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    admission = overhead + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    transport = CamoufoxFbrefTransport(max_network_bytes=4 * 1024 * 1024)
+    route = _Route(resource_type="xhr")
+    transport._maybe_block(route)
+    declared = 600 * 1024
+    transport._on_response(
+        _Response(route.request, {"content-length": str(declared)})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == overhead + declared
+    assert stats["reservation_overruns"] == 1
+    assert stats["reservation_overrun_bytes"] == overhead + declared - admission
+
+    _finish_with_size(transport, route, declared + 1_000)
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["real_bytes_downloaded"] == declared + 1_000
+    assert stats["reservation_overruns"] == 1
+
+
+@pytest.mark.unit
+def test_declared_body_over_admission_aborts_when_the_cap_cannot_fit_it():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    admission = overhead + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    transport = CamoufoxFbrefTransport(max_network_bytes=640 * 1024)
+    route = _Route(resource_type="xhr")
+    transport._maybe_block(route)
+    declared = 600 * 1024
+    transport._on_response(
+        _Response(route.request, {"content-length": str(declared)})
+    )
 
     stats = transport.traffic_stats()
     assert stats["byte_budget_exhausted"] is True
-    assert stats["byte_budget_failure"].startswith(
-        "completed_size_exceeded_reservation:"
+    assert stats["byte_budget_failure"] == (
+        "declared_body_exceeds_admission_reservation:"
+        f"{overhead + declared}>{admission}"
     )
+    assert stats["reservation_overruns"] == 0
+    # The admitted reservation is charged in full, as before #1385.
+    assert stats["unobserved_reserved_bytes"] == admission
+    assert stats["inflight_reserved_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_session_that_sums_past_the_cap_still_exhausts_the_budget():
+    """Criterion 2 of #1385: the session total stays a hard cap. With a 1 MiB
+    cap the first 600 KB response is absorbed; the second request cannot
+    even be admitted — its reservation no longer fits next to the first
+    response — so the exhaustion comes from the admission branch."""
+    cap = 1024 * 1024
+    transport = CamoufoxFbrefTransport(max_network_bytes=cap)
+    first = _Route(resource_type="xhr", url="https://fbref.com/one")
+    transport._maybe_block(first)
+    _finish_with_size(transport, first, 600_000)
+    assert transport.traffic_stats()["byte_budget_exhausted"] is False
+
+    second = _Route(resource_type="xhr", url="https://fbref.com/two")
+    transport._maybe_block(second)
+
+    stats = transport.traffic_stats()
+    assert second.continued == 0
+    assert second.aborted == 1
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == "request_admission_exceeds_byte_cap"
+    assert stats["real_bytes_downloaded"] == 600_000
+
+
+@pytest.mark.unit
+def test_completed_response_within_its_reservation_names_the_session_cap():
+    """A total over the cap with ``n <= reserved`` is not an overrun: it gets
+    its own label instead of ``completed_size_exceeded_reservation``."""
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    admission = overhead + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    cap = admission + 1_000
+    transport = CamoufoxFbrefTransport(max_network_bytes=cap)
+    route = _Route()
+    transport._maybe_block(route)
+    # Accounting drift outside this request (e.g. an unobserved charge).
+    transport._unobserved_reserved_bytes = cap
+    _finish_with_size(transport, route, 100)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == (
+        f"session_byte_cap_exceeded:{cap + 100}>{cap}"
+    )
+    assert stats["reservation_overruns"] == 0
+
+
+@pytest.mark.unit
+def test_parallel_overruns_cannot_overbook_the_cap():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    admission = overhead + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    cap = 2 * admission + 50_000
+    transport = CamoufoxFbrefTransport(max_network_bytes=cap)
+    first = _Route(resource_type="xhr", url="https://fbref.com/one")
+    second = _Route(resource_type="xhr", url="https://fbref.com/two")
+    transport._maybe_block(first)
+    transport._maybe_block(second)
+    transport._on_response(_Response(first.request, {}))
+    transport._on_response(_Response(second.request, {}))
+
+    _finish_with_size(transport, first, admission + 40_000)
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["reservation_overruns"] == 1
+
+    _finish_with_size(transport, second, admission + 40_000)
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == (
+        "completed_size_exceeded_reservation:"
+        f"{admission + 40_000}>{admission}"
+    )
+    assert stats["reservation_overruns"] == 1
+    assert stats["real_bytes_downloaded"] == 2 * (admission + 40_000)
 
 
 @pytest.mark.unit
