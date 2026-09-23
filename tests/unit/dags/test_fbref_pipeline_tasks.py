@@ -1089,6 +1089,114 @@ def test_publication_lock_finalizer_releases_and_fails_after_export_failure(
     release.assert_called_once()
 
 
+def _replay_shaped_task():
+    # dag_replay_fbref keeps export -> Silver (wait) -> lock (#1324 scope).
+    return SimpleNamespace(upstream_task_ids={"trigger_silver_transform"})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("silver_state", "released", "message"),
+    [
+        ("failed", False, "retained because child state is ambiguous"),
+        ("running", False, "retained because child state is ambiguous"),
+        ("upstream_failed", True, "released because the child never started"),
+    ],
+)
+def test_replay_shaped_finalizer_keeps_the_silver_verdict(
+    monkeypatch, silver_state, released, message,
+):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(
+                task_id="export_publication_scope", state="success"
+            ),
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state=silver_state
+            ),
+        ]
+    )
+    with pytest.raises(AirflowException, match=message):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__replay",
+            dag_id="dag_replay_fbref",
+            dag_run=run,
+            task=_replay_shaped_task(),
+        )
+    assert release.called is released
+
+
+@pytest.mark.unit
+def test_replay_shaped_finalizer_releases_after_silver_success(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(
+                task_id="export_publication_scope", state="success"
+            ),
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state="success"
+            ),
+        ]
+    )
+    result = fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="manual__replay",
+        dag_id="dag_replay_fbref",
+        dag_run=run,
+        ti=SimpleNamespace(task=_replay_shaped_task()),
+    )
+    assert result == {"released": True}
+    release.assert_called_once()
+
+
+@pytest.mark.unit
+def test_ingest_shaped_finalizer_ignores_silver_and_releases_on_export(
+    monkeypatch,
+):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(
+                task_id="export_publication_scope", state="success"
+            ),
+        ]
+    )
+    result = fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        dag_run=run,
+        task=SimpleNamespace(
+            upstream_task_ids={
+                "export_publication_scope",
+                "release_canary_publication_lock",
+            }
+        ),
+    )
+    assert result["status"] == "released_after_publication_export"
+    release.assert_called_once()
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("export_state", ["upstream_failed", "skipped"])
 def test_publication_lock_finalizer_releases_when_export_never_started(

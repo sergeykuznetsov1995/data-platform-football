@@ -1820,6 +1820,31 @@ def finalize_fbref_publication_lock(
             "publishing": False,
             "status": "released_after_nonpublishing_run",
         }
+    task = context.get("task") or getattr(context.get("ti"), "task", None)
+    if "trigger_silver_transform" in set(
+        getattr(task, "upstream_task_ids", ()) or ()
+    ):
+        # A graph that still waits for Silver before this lock (today only
+        # dag_replay_fbref) keeps the pre-#1324 verdict: the lock is held
+        # while the child's state is ambiguous.
+        silver_state = states.get("trigger_silver_transform", "missing")
+        if silver_state != "success":
+            if silver_state in {"skipped", "upstream_failed"}:
+                release_fbref_publication_lock(
+                    airflow_run_id=airflow_run_id, dag_id=dag_id
+                )
+            raise AirflowException(
+                "FBref Silver publication did not succeed; publication lock "
+                + (
+                    "released because the child never started "
+                    if silver_state in {"skipped", "upstream_failed"}
+                    else "retained because child state is ambiguous "
+                )
+                + f"(state={silver_state})"
+            )
+        return release_fbref_publication_lock(
+            airflow_run_id=airflow_run_id, dag_id=dag_id
+        )
     # #1324: the Bronze verdict ends at the publication export.  Silver is
     # triggered only after this lock is released and is never waited on, so
     # its state cannot hold the lock or colour the Bronze run.

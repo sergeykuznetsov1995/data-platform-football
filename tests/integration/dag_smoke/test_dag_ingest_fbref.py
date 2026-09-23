@@ -195,7 +195,12 @@ class TestFBrefBoundedModes:
             trigger = dag.task_dict["trigger_silver_transform"]
             assert export.upstream_task_ids == {parent}
             if dag_id == "dag_replay_fbref":
+                # Replay keeps export -> Silver (wait) -> lock; the shared
+                # finalizer picks its verdict from this topology.
                 assert trigger.upstream_task_ids == {export.task_id}
+                assert dag.task_dict[
+                    "release_publication_lock"
+                ].upstream_task_ids == {"trigger_silver_transform"}
             else:
                 assert trigger.upstream_task_ids == {
                     export.task_id,
