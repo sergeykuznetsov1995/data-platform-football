@@ -636,6 +636,87 @@ def test_normalize_rows_serializes_mixed_nested_values_without_arrow_coercion():
     ]
 
 
+def test_normalize_rows_turns_non_finite_values_into_null():
+    # #1384: FotMob leaderboards sent StatValue "Infinity"; DOUBLE guard rejects it.
+    rows = normalize_rows(
+        [
+            {
+                "a": "Infinity",
+                "b": "-Infinity",
+                "c": "NaN",
+                "d": float("inf"),
+                "e": float("-inf"),
+                "f": float("nan"),
+                "g": 1.5,
+                "h": "1.5",
+                "i": "Infinity Ltd",
+                "j": 0,
+            }
+        ]
+    )
+    assert rows == [
+        {
+            "a": None,
+            "b": None,
+            "c": None,
+            "d": None,
+            "e": None,
+            "f": None,
+            "g": 1.5,
+            "h": "1.5",
+            "i": "Infinity Ltd",
+            "j": 0,
+        }
+    ]
+
+
+def test_commit_hands_non_finite_leaderboard_values_to_double_guard_as_null():
+    # #1384: the live wave died in TrinoTableManager._format_sql_value on
+    # stat_value 'Infinity'; the committed frame must render as SQL NULL.
+    from unittest.mock import MagicMock, patch
+
+    with patch.dict("sys.modules", {"trino": MagicMock(), "trino.dbapi": MagicMock()}):
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+    scope = {"competition_id": "289", "source_season_key": "2017/2019"}
+    writer = RecordingWriter()
+    repository = FotMobRepository(writer=writer)
+    repository.commit(
+        _commit(),
+        [
+            TableRows(
+                table="fotmob_leaderboards",
+                entity_type="leaderboards",
+                rows=[
+                    {
+                        **scope,
+                        "player_id": "1",
+                        "stat_value": "Infinity",
+                        "sub_stat_value": float("inf"),
+                    },
+                    {
+                        **scope,
+                        "player_id": "2",
+                        "stat_value": 2.5,
+                        "sub_stat_value": "-Infinity",
+                    },
+                ],
+            )
+        ],
+    )
+
+    assert writer.calls[0][1]["table"] == "fotmob_leaderboards"
+    frame = writer.calls[0][0]
+    rendered = [
+        [manager._format_sql_value(value, "DOUBLE") for value in frame[column]]
+        for column in ("stat_value", "sub_stat_value")
+    ]
+    assert rendered == [["NULL", "CAST(2.5 AS DOUBLE)"], ["NULL", "NULL"]]
+    with pytest.raises(ValueError, match="incompatible with DOUBLE"):
+        manager._format_sql_value("Infinity", "DOUBLE")
+
+
 def test_exact_source_season_keys_do_not_collide():
     repository = MemoryFotMobRepository()
     repository.record(_commit(source_season_key="2017/2019", target_key="a"))

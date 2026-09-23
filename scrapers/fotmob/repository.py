@@ -19,11 +19,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import random
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import (
     Any,
@@ -37,6 +39,7 @@ from typing import (
     Sequence,
 )
 
+import numpy as np
 import pandas as pd
 
 from scrapers.base.iceberg_writer import IcebergWriter
@@ -418,6 +421,9 @@ def deterministic_target_batch_id(
     return "fm1-" + hashlib.sha256(material).hexdigest()
 
 
+_NON_FINITE_STRINGS = frozenset({"Infinity", "-Infinity", "NaN"})
+
+
 def _scalar(value: Any) -> Any:
     """Make arbitrary parser values safe for an Arrow dataframe column.
 
@@ -435,6 +441,15 @@ def _scalar(value: Any) -> Any:
         return stable_json(value)
     if isinstance(value, datetime) and value.tzinfo is not None:
         return value.astimezone(timezone.utc).replace(tzinfo=None)
+    # #1384: the source sends .NET/JSON-extension non-finite tokens ("Infinity"
+    # in leaderboard StatValue); the strict bronze DOUBLE guard rejects them.
+    # The raw payload keeps the original value, so the typed row stores NULL.
+    if isinstance(value, (float, np.floating)) and not math.isfinite(value):
+        return None
+    if isinstance(value, Decimal) and not value.is_finite():
+        return None
+    if isinstance(value, str) and value.strip() in _NON_FINITE_STRINGS:
+        return None
     return value
 
 
