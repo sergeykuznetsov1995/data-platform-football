@@ -371,3 +371,175 @@ def test_tournament_outside_the_denominator_queues_is_never_fetched(tournament_c
 
     assert client.calls == []
     assert enriched["tournaments"] == snapshot["tournaments"]
+
+
+def _priority_denominator(classes):
+    from scrapers.sofascore.denominator import (
+        CLASS_PRIORITY,
+        Denominator,
+        DenominatorRow,
+    )
+
+    return Denominator(rows={
+        tournament_id: DenominatorRow(
+            tournament_id=tournament_id, capture_key=f"SS-{tournament_id}",
+            name="x", tournament_class=tournament_class,
+            queue_priority=CLASS_PRIORITY[tournament_class], basis="test",
+        )
+        for tournament_id, tournament_class in classes.items()
+    })
+
+
+def _priority_snapshot():
+    def season(tournament_id, year, status="pending"):
+        return {
+            "source_season_id": tournament_id * 10000 + year,
+            "start_year": year,
+            "metadata_status": status,
+            "team_count": None,
+            "team_count_evidence": None,
+        }
+
+    def tournament(tournament_id, seasons, status="ready"):
+        return {
+            "unique_tournament_id": tournament_id,
+            "metadata_status": status,
+            "seasons": seasons,
+        }
+
+    document = {
+        "schema_version": 1,
+        "candidate_count": 4,
+        "policy_id": "test",
+        "campaign_id": "campaign-test",
+        "tournaments": [
+            # disputed (priority 9): its running season still ranks last.
+            tournament(9, [season(9, 2026)]),
+            # core: newest 2025 ready, deeper seasons pending.
+            tournament(1, [
+                season(1, 2025, "ready"), season(1, 2024), season(1, 2023),
+                season(1, -1),
+            ]),
+            # core: running 2026 season pending.
+            tournament(2, [season(2, 2026), season(2, 2024)], status="pending"),
+            # esoccer (priority 0): never selected.
+            tournament(5, [season(5, 2026)]),
+        ],
+    }
+    return _sign(document)
+
+
+def test_priority_selection_orders_running_core_then_deeper_core_then_disputed():
+    denominator = _priority_denominator(
+        {1: "core", 2: "core", 9: "youth", 5: "esoccer"}
+    )
+
+    picked = enrichment.select_priority_seasons(
+        _priority_snapshot(), denominator, 10
+    )
+
+    assert picked == [
+        (2, 22026, 2026),   # core, running season
+        (1, 12024, 2024),   # core, deeper 2024 (tid 1 before tid 2)
+        (2, 22024, 2024),
+        (1, 12023, 2023),   # core, deeper 2023
+        (9, 92026, 2026),   # disputed last
+    ]
+
+
+def test_priority_selection_cuts_by_seasons_not_tournaments():
+    denominator = _priority_denominator(
+        {1: "core", 2: "core", 9: "youth", 5: "esoccer"}
+    )
+
+    picked = enrichment.select_priority_seasons(
+        _priority_snapshot(), denominator, 2
+    )
+
+    assert picked == [(2, 22026, 2026), (1, 12024, 2024)]
+
+
+def test_priority_enrichment_fetches_only_selected_seasons():
+    denominator = _priority_denominator({17: "core"})
+
+    class SeasonClient(Client):
+        pass
+
+    client = SeasonClient()
+    snapshot = _snapshot()
+
+    enriched, report = enrich_snapshot(
+        snapshot, client, wave_start_year=1999, denominator=denominator,
+        select="priority", max_seasons=1,
+    )
+
+    assert client.calls == [
+        "/unique-tournament/17",
+        "/unique-tournament/17/season/76986/teams",
+    ]
+    seasons = enriched["tournaments"][0]["seasons"]
+    assert [item["metadata_status"] for item in seasons] == ["ready", "pending"]
+    assert report["selected_seasons"] == 1
+    assert report["ready_wave_scopes"] == 1
+    assert report["source_requests"] == 2
+
+
+def test_priority_enrichment_does_not_retry_schema_error_seasons():
+    denominator = _priority_denominator({17: "core"})
+    document = _after_wave_snapshot()
+    client = Client()
+
+    enriched, report = enrich_snapshot(
+        _sign(document), client, wave_start_year=2024, denominator=denominator,
+        select="priority", max_seasons=5,
+    )
+
+    assert "/unique-tournament/17/season/76986/teams" not in client.calls
+    assert report["retried_schema_error_scopes"] == 0
+
+
+def test_priority_main_writes_selection_into_the_report(tmp_path, monkeypatch):
+    snapshot = tmp_path / "snapshot.json"
+    policy = tmp_path / "policy.json"
+    report = tmp_path / "report.json"
+    snapshot.write_text(json.dumps(_snapshot()))
+    policy.write_text("{}")
+
+    class FakeBrowser(Client):
+        stats = {"paid_proxy_bytes": 0}
+
+        def __init__(self, **_kwargs):
+            super().__init__()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(enrichment, "LeaseBrowserSofaScoreClient", FakeBrowser)
+    monkeypatch.setattr(enrichment, "validate_campaign_snapshot", lambda *_: None)
+    monkeypatch.setattr(
+        enrichment, "load_denominator",
+        lambda *_: _priority_denominator({17: "core"}),
+    )
+
+    result = enrichment.main([
+        "--snapshot", str(snapshot),
+        "--policy", str(policy),
+        "--output", str(snapshot),
+        "--report", str(report),
+        "--expected-snapshot-id", _snapshot()["snapshot_id"],
+        "--dag-id", "dag_refresh_sofascore_all_mens",
+        "--run-id", "scheduled__test",
+        "--task-id", "enrich_season_metadata",
+        "--budget-cap-bytes", "1000",
+        "--control-url", "http://proxy-filter:8899",
+        "--select", "priority",
+        "--max-seasons", "2",
+    ])
+
+    written = json.loads(report.read_text())
+    assert result == 0
+    assert written["select"] == "priority"
+    assert written["max_seasons"] == 2
+    assert written["selected_seasons"] == 2
+    assert written["ready_wave_scopes"] == 2
+    assert written["wave_start_year"] is None
