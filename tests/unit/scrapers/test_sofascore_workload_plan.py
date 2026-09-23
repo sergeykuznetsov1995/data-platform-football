@@ -943,7 +943,10 @@ def test_run_cap_slims_oldest_inactive_but_never_an_active_run(tmp_path):
     assert stored["run-0"] == runs["run-0"]
 
 
-def test_long_slim_runs_are_retired_and_remembered(tmp_path):
+def test_retire_horizon_counts_from_slimming_not_from_run_age(tmp_path):
+    """#1350 round 4: a run older than 30 days is slimmed, but dropped only
+    30 days after ``compacted_at`` — never within the rollback window."""
+
     from datetime import datetime, timedelta, timezone
 
     now = datetime.now(timezone.utc)
@@ -958,13 +961,45 @@ def test_long_slim_runs_are_retired_and_remembered(tmp_path):
         )
     )
     ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
+    for _ in range(3):  # repeated flushes right after rollout drop nothing
+        ledger.flush(force=True)
+    stored = _stored(path)
+    assert _is_slim(stored["runs"]["ancient"])
+    assert "compacted_at" in stored["runs"]["ancient"]
+    assert stored.get("retired_runs", {}) == {}
+
+    # 30 days after slimming (not after the run's own timestamps) it retires.
+    stored["runs"]["ancient"]["compacted_at"] = (now - timedelta(days=31)).isoformat()
+    path.write_text(json.dumps(stored))
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN)
     ledger.flush(force=True)
-    assert _is_slim(_stored(path)["runs"]["ancient"]), "slimmed first"
-    ledger._dirty = True
-    ledger.flush()
     stored = _stored(path)
     assert set(stored["runs"]) == {"ancient-active"}
     assert set(stored["retired_runs"]) == {"ancient"}
+
+
+def test_first_flushes_on_a_live_shaped_ledger_drop_no_runs(tmp_path):
+    """First night of the new code: old, capped and fresh runs — no deletions."""
+
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    ages = [timedelta(days=days) for days in (0, 1, 2, 5, 29, 31, 60, 200)]
+    runs = {
+        f"run-{index}": _stored_run(
+            f"run-{index}", (now - age).isoformat(), active=index == 7
+        )
+        for index, age in enumerate(ages)
+    }
+    path = tmp_path / "allocations.json"
+    path.write_text(json.dumps({"schema_version": 1, "runs": runs}))
+    ledger = AllocationLedger(path, control_token=CONTROL_TOKEN, run_cap=2)
+    for _ in range(3):
+        ledger.flush(force=True)
+    stored = _stored(path)
+    assert set(stored["runs"]) == set(runs)
+    assert stored.get("retired_runs", {}) == {}
+    assert stored["runs"]["run-7"] == runs["run-7"], "active run untouched"
 
 
 def _finished_once(tmp_path, **ledger_options):
@@ -1005,7 +1040,7 @@ def test_retired_run_cannot_be_resurrected_by_a_late_claim(tmp_path):
         tmp_path, run_retention_seconds=0, run_retire_seconds=0
     )
     ledger._dirty = True
-    ledger.flush()  # slimmed by finish, retired by this flush
+    ledger.flush()  # slimmed by finish, retired by this flush (horizon 0)
     assert _stored(path)["runs"] == {}
     for reader in (ledger, AllocationLedger(path, control_token=CONTROL_TOKEN)):
         with pytest.raises(AllocationAccountingError, match="retired"):

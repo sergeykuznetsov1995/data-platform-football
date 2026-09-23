@@ -53,8 +53,10 @@ ALLOCATION_LEDGER_SCHEMA_VERSION = 1
 # without an active claim that are older than the retention, or beyond the cap
 # of full runs (oldest first), are slimmed: ``units`` and ``lease_stats`` go,
 # budget/spend/completed stay, so the pre-#1350 binary still refuses to re-mint
-# them after a rollback.  Slimmed runs untouched for the retire horizon are
-# dropped and remembered in ``retired_runs``.  An active claim is never touched.
+# them after a rollback.  A slimmed run is dropped (and remembered in
+# ``retired_runs``) only when the retire horizon has passed since it was
+# slimmed (``compacted_at``), so no run is dropped during the first 30 days
+# after this code ships.  An active claim is never touched.
 ALLOCATION_RUN_RETENTION_SECONDS = 3 * 24 * 3600
 ALLOCATION_RUN_CAP = 300
 ALLOCATION_RUN_RETIRE_SECONDS = 30 * 24 * 3600
@@ -1678,9 +1680,12 @@ class AllocationLedger:
         )
         retire = [
             key
-            for seconds, key in inactive
+            for _, key in inactive
             if runs[key].get("compacted") is True
-            and seconds > self.run_retire_seconds
+            and (
+                now - datetime.fromisoformat(str(runs[key]["compacted_at"]))
+            ).total_seconds()
+            > self.run_retire_seconds
         ]
         full = [
             (seconds, key)
@@ -1699,6 +1704,7 @@ class AllocationLedger:
                 for field in _SLIMMED_ALLOCATION_FIELDS:
                     allocation.pop(field, None)
             run["compacted"] = True
+            run["compacted_at"] = now.isoformat()
         retired = payload.setdefault("retired_runs", {})
         for key in retire:
             del runs[key]
