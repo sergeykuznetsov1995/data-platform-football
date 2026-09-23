@@ -48,12 +48,18 @@ EXPECTED_TASK_IDS = {
 
 @pytest.mark.unit
 class TestFBrefBootstrapTopology:
-    def test_manual_unpaused_bounded_dag(self, loaded_dag):
+    def test_manual_paused_bounded_dag(self, loaded_dag):
         module, tasks = loaded_dag
 
         assert module.dag.dag_id == "dag_bootstrap_fbref"
         assert module.dag.schedule is None
-        assert module.dag._dag_kwargs["is_paused_upon_creation"] is False
+        # #1324: a paid path without freshness/Silver gates is paused by
+        # default and unpaused only for a manual bootstrap.
+        assert module.dag._dag_kwargs["is_paused_upon_creation"] is True
+        doc_md = module.dag._dag_kwargs["doc_md"]
+        assert "paused by default" in doc_md
+        assert "paid path" in doc_md
+        assert "safe to leave unpaused" not in doc_md
         assert module.dag._dag_kwargs["max_active_runs"] == 1
         assert module.dag._dag_kwargs["max_active_tasks"] == 1
         assert module.dag._dag_kwargs["dagrun_timeout"].total_seconds() == (

@@ -73,8 +73,6 @@ def test_silver_is_fbref_only_and_never_launches_xref_or_gold():
 @pytest.mark.parametrize(
     ("filename", "child_dag_id", "timeout_hours"),
     [
-        ("dag_ingest_fbref.py", "dag_transform_fbref_silver", 12),
-        ("dag_backfill_fbref.py", "dag_transform_fbref_silver", 12),
         ("dag_replay_fbref.py", "dag_transform_fbref_silver", 12),
         ("dag_master_pipeline.py", "dag_transform_xref", 5),
         ("dag_master_pipeline.py", "dag_transform_fbref_gold", 12),
@@ -92,6 +90,23 @@ def test_blocking_fbref_handoffs_do_not_retry_reset_child_dags(
     assert _literal(trigger["reset_dag_run"]) is expected_reset
     assert _literal(trigger["retries"]) == 0
     assert _timedelta_hours(trigger["execution_timeout"]) == timeout_hours
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("filename", ["dag_ingest_fbref.py", "dag_backfill_fbref.py"])
+def test_bronze_silver_handoff_fires_after_the_lock_without_waiting(filename):
+    """#1324: the Bronze verdict and lock never wait for Silver."""
+
+    trigger = _literal_trigger(filename, "dag_transform_fbref_silver")
+
+    assert _literal(trigger["wait_for_completion"]) is False
+    assert _literal(trigger["reset_dag_run"]) is False
+    assert _literal(trigger["retries"]) == 0
+    timeout = trigger["execution_timeout"]
+    assert isinstance(timeout, ast.Call) and timeout.func.id == "timedelta"
+    assert {kw.arg: _literal(kw.value) for kw in timeout.keywords} == {
+        "minutes": 10
+    }
 
 
 @pytest.mark.unit

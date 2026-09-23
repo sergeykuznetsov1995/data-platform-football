@@ -5,6 +5,7 @@ import gzip
 import gc
 import json
 import logging
+import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -4084,14 +4085,18 @@ def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
         clock=lambda: NOW,
     )
 
-    with pytest.raises(FetchWaveError, match="http_status"):
-        pipeline.fetch_wave(
-            str(uuid.UUID(int=1)),
-            worker_id="worker-1",
-            page_kinds=["competition_index"],
-            settings=_settings(),
-        )
+    # #1324: a target-local 5xx defers that target; the wave does not raise.
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
 
+    assert result.failures == []
+    assert result.deferred_target_failures == [
+        "fbref:competition_index:all:http_status"
+    ]
     assert control.reservations[0][1]["requests"] == 22
     assert control.settlements[0][1]["requests_used"] == 5
     assert control.events.count("throttle") == 4
@@ -4109,7 +4114,9 @@ def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
         "error_message": "redacted status_history=500,500 body_sha256=abc",
         "retry_delay_seconds": 60,
         "permanent": False,
-        "requeue": False,
+        # requeue=True is the store's queued/skipped shape (retry_after
+        # NULL): reversible, and not "unfinished" for the run gates.
+        "requeue": True,
         "http_status": 500,
         "http_request_count": 2,
         "http_status_history": (500, 500),
@@ -7999,17 +8006,6 @@ def test_canary_validation_does_not_require_global_publication_freshness(tmp_pat
             },
             "crawlable_out_of_scope_targets",
         ),
-        (
-            {
-                "current_scope_freshness": {
-                    "total_targets": 4,
-                    "fresh_targets": 3,
-                    "stale_targets": 1,
-                    "all_within_sla": False,
-                }
-            },
-            "current_scope_stale_targets=1",
-        ),
     ],
 )
 def test_validation_enforces_production_scope_and_recovery_gates(
@@ -8026,6 +8022,55 @@ def test_validation_enforces_production_scope_and_recovery_gates(
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
     assert "finish:False" not in control.events
+
+
+@pytest.mark.parametrize(
+    ("freshness_key", "label"),
+    [
+        ("current_scope_freshness", "current_scope"),
+        ("publication_scope_freshness", "publication_scope"),
+    ],
+)
+def test_validate_and_finish_reports_stale_scope_as_debt_not_error(
+    tmp_path, freshness_key, label,
+):
+    # #1324: a stale frontier is scope debt, not this run's failure.
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary[freshness_key] = {
+        "total_targets": 4,
+        "fresh_targets": 3,
+        "stale_targets": 1,
+        "all_within_sla": False,
+    }
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert result["warnings"] == {f"scope_debt:{label}_stale_targets": 1}
+    assert "finish:True" in control.events
+
+
+def test_validate_and_finish_still_fails_an_empty_publication_scope(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["publication_scope_freshness"] = {
+        "total_targets": 0,
+        "stale_targets": 0,
+        "all_within_sla": True,
+    }
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(
+        RunValidationError, match="publication_scope_freshness_empty"
+    ):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" not in control.events
 
 
 def test_validation_reports_but_does_not_gate_other_lane_overdue_raw(tmp_path):
@@ -8414,12 +8459,14 @@ def test_nonpublishing_run_is_not_gated_by_a_stale_publication_scope(tmp_path):
 
     assert "finish:True" in control.events
 
-    with pytest.raises(
-        RunValidationError, match="publication_scope_stale_targets=482"
-    ):
-        pipeline.validate_and_finish(
-            str(uuid.uuid4()), publication_eligible=True
-        )
+    # #1324: on a publishing run the same staleness is reported as scope
+    # debt, not enforced.
+    result = pipeline.validate_and_finish(
+        str(uuid.uuid4()), publication_eligible=True
+    )
+    assert result["warnings"] == {
+        "scope_debt:publication_scope_stale_targets": 482
+    }
 
 
 def test_validation_rejects_missing_sentinel_coverage(tmp_path):
@@ -12044,7 +12091,7 @@ def test_moved_page_is_skipped_without_failing_the_wave(tmp_path):
 
 
 class FakeNotFoundFetcher(FakeMovedFetcher):
-    """A genuinely broken target: not a redirect, so the wave must still die."""
+    """A genuinely broken target: not a redirect, and not a match 404."""
 
     def fetch(self, url, **kwargs):
         self.events.append("http")
@@ -12064,7 +12111,7 @@ class FakeNotFoundFetcher(FakeMovedFetcher):
         )
 
 
-def test_non_redirect_page_failure_still_fails_the_wave(tmp_path):
+def test_non_redirect_page_failure_is_deferred_and_the_wave_continues(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     pipeline = FBrefPipeline(
@@ -12076,15 +12123,21 @@ def test_non_redirect_page_failure_still_fails_the_wave(tmp_path):
         clock=lambda: NOW,
     )
 
-    with pytest.raises(FetchWaveError, match="http_status"):
-        pipeline.fetch_wave(
-            str(uuid.UUID(int=1)),
-            worker_id="worker-1",
-            page_kinds=["competition_index"],
-            settings=_settings(),
-        )
+    # #1324: one failing page is handed back to the next run; the wave ends
+    # normally so its healthy siblings reach parsing and the run gates.
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
 
-    assert control.failed[0][1]["requeue"] is False
+    assert result.failures == []
+    assert result.deferred_target_failures == [
+        "fbref:competition_index:all:http_status"
+    ]
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["permanent"] is False
 
 
 def _match_fetch_lease(run_id, number, *, attempt_number=1):
@@ -12229,9 +12282,14 @@ def test_match_404_is_deferred_while_sibling_and_next_run_succeed(tmp_path):
     ("error_class", "http_status", "permanent"),
     [
         ("http_status", 500, False),
+        ("http_status", 410, False),
+        ("http_exception", None, False),
+        ("empty_body", 200, False),
+        ("invalid_encoding", 200, False),
+        ("invalid_content_type", 200, False),
     ],
 )
-def test_other_match_target_failure_remains_fail_closed(
+def test_other_match_target_failure_is_deferred(
     tmp_path,
     error_class,
     http_status,
@@ -12274,15 +12332,19 @@ def test_other_match_target_failure_remains_fail_closed(
         clock=lambda: NOW,
     )
 
-    with pytest.raises(FetchWaveError, match=error_class):
-        pipeline.fetch_wave(
-            run_id,
-            worker_id="match-worker",
-            page_kinds=["match"],
-            settings=replace(_settings(), shard_size=1),
-        )
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="match-worker",
+        page_kinds=["match"],
+        settings=replace(_settings(), shard_size=1),
+    )
 
-    assert control.failed[0][1]["requeue"] is False
+    assert result.failures == []
+    assert result.deferred_target_failures == [
+        f"{lease.target_id}:{error_class}"
+    ]
+    assert result.deferred_match_not_found == 0
+    assert control.failed[0][1]["requeue"] is True
     assert control.failed[0][1]["permanent"] is permanent
 
 
@@ -12411,6 +12473,293 @@ def test_live_run_serialization_exposes_deferred_match_not_found():
     ).as_dict()
 
     assert payload["fetch"]["deferred_match_not_found"] == 1
+
+
+@pytest.mark.parametrize(
+    ("error_class", "http_status"),
+    [
+        ("transport_internal_error", None),
+        ("raw_contract_not_html_document", 200),
+        ("some_future_class", None),
+    ],
+)
+def test_unclassified_target_failure_still_fails_the_wave(
+    tmp_path, error_class, http_status,
+):
+    # #1324 round 2: a class the control store does not classify would come
+    # back as unclassified_failures in validate_and_finish, so it is not
+    # deferred -- it keeps failing the wave closed.
+    run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"unclassified:{error_class}"))
+    lease = _match_fetch_lease(run_id, 1)
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, [[lease]])
+
+    class UnclassifiedFailureFetcher(FakeFetcher):
+        def fetch(self, url, **_kwargs):
+            raise FetchError(
+                f"target failure for {url}",
+                error_class=error_class,
+                http_status=http_status,
+                wire_bytes=303,
+                browser_document_bytes=0,
+                browser_asset_bytes=0,
+                browser_requests=0,
+                browser_bootstrap_attempts=0,
+                browser_unobserved_bytes=0,
+                target_requests=1,
+                http_status_history=(
+                    () if http_status is None else (http_status,)
+                ),
+                latency_ms=321,
+            )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: UnclassifiedFailureFetcher(
+            control.events, b"unused"
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match=error_class):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=replace(_settings(), shard_size=1),
+        )
+
+    assert control.failed[0][1]["requeue"] is False
+
+
+def test_deferrable_classes_are_classified_by_the_control_store():
+    # The deferral set must stay inside the store's classified traffic
+    # errors, or a deferred page resurfaces as unclassified_failures and
+    # fails validate_and_finish (#1324 round 2).
+    store_source = (
+        Path(__file__).resolve().parents[3]
+        / "scrapers" / "fbref" / "control" / "store.py"
+    ).read_text(encoding="utf-8")
+    block = store_source.split("classified_errors = [", 1)[1].split("]", 1)[0]
+    classified = set(re.findall(r'"([A-Za-z_]+)"', block))
+
+    assert pipeline_module.DEFERRABLE_TARGET_FAILURE_CLASSES <= classified
+
+
+class FakeSelectiveServerErrorFetcher(FakeFetcher):
+    """Answer HTTP 500 for the configured matches and 200 for the rest."""
+
+    def __init__(self, events, failing_match_ids):
+        super().__init__(events, b"<html>healthy-match</html>")
+        self.failing_match_ids = set(failing_match_ids)
+
+    def fetch(self, url, **kwargs):
+        match_id = url.rstrip("/").rsplit("/", 1)[-1]
+        if match_id not in self.failing_match_ids:
+            return super().fetch(url, **kwargs)
+        self.events.append("http_500")
+        raise FetchError(
+            f"FBref returned HTTP 500 for {url}; attempts=1; status_history=500",
+            error_class="http_status",
+            http_status=500,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(500,),
+            latency_ms=321,
+        )
+
+
+def _server_error_wave(tmp_path, run_number, cohort_size, failing_count):
+    run_id = str(uuid.UUID(int=run_number))
+    leases = [
+        _match_fetch_lease(run_id, number)
+        for number in range(1, cohort_size + 1)
+    ]
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, [leases])
+    failing = [lease.source_ids["match_id"] for lease in leases[:failing_count]]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeSelectiveServerErrorFetcher(
+            control.events, failing
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    def execute():
+        return pipeline.fetch_wave(
+            run_id,
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=replace(
+                _settings(),
+                shard_size=cohort_size,
+                request_limit=100,
+            ),
+        )
+
+    return execute, control, leases
+
+
+def test_one_failed_target_among_many_does_not_raise_and_finishes_the_wave(
+    tmp_path,
+):
+    execute, control, leases = _server_error_wave(tmp_path, 7401, 8, 1)
+
+    result = execute()
+
+    assert result.failures == []
+    assert result.deferred_target_failures == [
+        f"{leases[0].target_id}:http_status"
+    ]
+    assert result.fetched == 7
+    assert [lease.target_id for lease, _ in control.completed] == [
+        lease.target_id for lease in leases[1:]
+    ]
+    assert control.failed[0][0].target_id == leases[0].target_id
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["permanent"] is False
+
+
+def test_mass_target_failures_still_raise(tmp_path):
+    execute, control, leases = _server_error_wave(tmp_path, 7402, 8, 6)
+
+    with pytest.raises(FetchWaveError, match="mass_target_failures=6 of 8"):
+        execute()
+
+    assert len(control.failed) == 6
+    assert all(item[1]["requeue"] is True for item in control.failed)
+    assert control.completed == []
+    assert [
+        event for event in control.events if event.startswith("requeue:")
+    ] == [f"requeue:{lease.target_id}" for lease in leases[6:]]
+
+
+def test_target_failures_at_the_floor_stay_target_local(tmp_path):
+    execute, control, _leases = _server_error_wave(tmp_path, 7403, 10, 5)
+
+    result = execute()
+
+    assert result.failures == []
+    assert len(result.deferred_target_failures) == 5
+    assert result.fetched == 5
+
+
+@pytest.mark.parametrize(
+    ("batches", "raises"),
+    [(5, False), (6, True)],
+)
+def test_run_level_deferred_target_failure_ceiling_is_above_twenty_five(
+    tmp_path,
+    batches,
+    raises,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    def fake_fetch(*_args, **_kwargs):
+        return WaveResult(
+            claimed=25,
+            cohort_size=25,
+            fetched=20,
+            deferred_target_failures=[
+                f"fbref:match:{n:08x}:http_status" for n in range(5)
+            ],
+        )
+
+    pipeline.fetch_wave = fake_fetch
+    pipeline.parse_wave = lambda *_args, **_kwargs: WaveResult(
+        cohort_size=25,
+        parsed=20,
+    )
+
+    def execute():
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=7410 + batches)),
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=batches,
+        )
+
+    if raises:
+        with pytest.raises(
+            FetchWaveError,
+            match="mass_target_failures_run=30",
+        ):
+            execute()
+    else:
+        result = execute()
+        assert len(result.fetch.deferred_target_failures) == 25
+
+
+def _deferred_only_run(tmp_path, target_counts):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.get_run_target_counts = lambda _run_id: dict(target_counts)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    waves = [
+        WaveResult(
+            claimed=1,
+            cohort_size=1,
+            deferred_target_failures=["fbref:match:00000001:http_status"],
+        ),
+        WaveResult(),
+    ]
+    pipeline.fetch_wave = lambda *_a, **_k: waves.pop(0)
+    pipeline.parse_wave = lambda *_a, **_k: WaveResult()
+
+    def execute():
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=7420)),
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=2,
+        )
+
+    return execute
+
+
+def test_run_with_zero_fetched_pages_and_deferred_failures_is_red(tmp_path):
+    execute = _deferred_only_run(tmp_path, {"skipped": 1})
+
+    with pytest.raises(
+        FetchWaveError,
+        match=r"no page fetched; 1 target failure\(s\) deferred",
+    ):
+        execute()
+
+
+def test_run_with_fetched_pages_and_deferred_failures_is_green(tmp_path):
+    execute = _deferred_only_run(tmp_path, {"succeeded": 3, "skipped": 1})
+
+    result = execute()
+
+    assert result.fetch.deferred_target_failures == [
+        "fbref:match:00000001:http_status"
+    ]
+    assert result.frontier_closed is True
+
+
+def test_live_run_serialization_exposes_deferred_target_failures():
+    payload = LiveRunResult(
+        fetch=WaveResult(deferred_target_failures=["t:http_status"])
+    ).as_dict()
+
+    assert payload["fetch"]["deferred_target_failures"] == ["t:http_status"]
 
 
 def _season_stats_fetch_lease(run_id, number):

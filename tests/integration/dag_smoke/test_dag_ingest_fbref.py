@@ -64,7 +64,9 @@ class TestFBrefDagBag:
         replay = fbref_dags["dag_replay_fbref"]
         assert backfill.schedule_interval is None
         assert bootstrap.schedule_interval is None
-        assert bootstrap.is_paused_upon_creation is False
+        # #1324: a paid path without freshness/Silver gates is paused.
+        assert bootstrap.is_paused_upon_creation is True
+        assert "paused by default" in bootstrap.doc_md
         assert len(bootstrap.task_dict) == 11
         assert {
             "validate_current_scope_freshness",
@@ -120,11 +122,23 @@ class TestFBrefCurrentFailureEdges:
         trigger = dag.task_dict["trigger_silver_transform"]
         assert validate.trigger_rule == "all_success"
         assert trigger.trigger_rule == "all_success"
+        release = dag.task_dict["release_publication_lock"]
+        factory = sys.modules["utils.fbref_current_dag_factory"]
+        assert (
+            factory.CURRENT_PUBLICATION_ORDER_POLICY
+            == "fbref-current-silver-after-lock-v1"
+        )
         assert export.upstream_task_ids == {"validate_run"}
-        assert trigger.upstream_task_ids == {"export_publication_scope"}
-        assert trigger.wait_for_completion is True
-        assert _states(trigger.allowed_states) == ["success"]
-        assert _states(trigger.failed_states) == ["failed"]
+        # #1324: Silver after the lock, unawaited; the lock never waits.
+        assert trigger.upstream_task_ids == {"release_publication_lock"}
+        assert release.task_type == "BranchPythonOperator"
+        assert release.upstream_task_ids == {
+            "export_publication_scope",
+            "release_canary_publication_lock",
+        }
+        assert trigger.downstream_task_ids == set()
+        assert trigger.wait_for_completion is False
+        assert trigger.execution_timeout.total_seconds() == 10 * 60
 
 
 @pytest.mark.integration
@@ -165,7 +179,8 @@ class TestFBrefBoundedModes:
         # Bootstrap has no publication tasks at all (see
         # test_backfill_and_replay_are_manual), so only the three publishing
         # DAGs carry this invariant.  Backfill routes validate_run through
-        # choose_publication_path before the export.
+        # choose_publication_path before the export.  Ingest and backfill
+        # trigger Silver after the publication lock is released (#1324).
         expected_export_parent = {
             "dag_ingest_fbref": "validate_run",
             "dag_backfill_fbref": "choose_publication_path",
@@ -177,6 +192,16 @@ class TestFBrefBoundedModes:
             export = dag.task_dict["export_publication_scope"]
             trigger = dag.task_dict["trigger_silver_transform"]
             assert export.upstream_task_ids == {parent}
-            assert trigger.upstream_task_ids == {export.task_id}
+            if dag_id == "dag_replay_fbref":
+                # Replay keeps export -> Silver (wait) -> lock; the shared
+                # finalizer picks its verdict from this topology.
+                assert trigger.upstream_task_ids == {export.task_id}
+                assert dag.task_dict[
+                    "release_publication_lock"
+                ].upstream_task_ids == {"trigger_silver_transform"}
+            else:
+                assert trigger.upstream_task_ids == {
+                    "release_publication_lock"
+                }
             assert validate.trigger_rule == "all_success"
             assert trigger.trigger_rule == "all_success"

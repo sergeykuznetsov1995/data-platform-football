@@ -242,10 +242,15 @@ freshness gate, export a publication scope, or trigger Silver.
 ```bash
 airflow dags unpause dag_bootstrap_fbref
 airflow dags trigger dag_bootstrap_fbref
+# after the run finishes:
+airflow dags pause dag_bootstrap_fbref
 ```
 
-`dag_bootstrap_fbref` has `schedule=None`, so it is safe to leave unpaused: it
-can create only an explicitly triggered manual DagRun. Its tasks contain
+`dag_bootstrap_fbref` is paused by default (#1324): every run is a paid path
+that runs the same run gates as ingest (`validate_bootstrap_run`) but has no
+freshness, publication-scope or Silver gates. Unpause it only for a manual
+bootstrap and pause it again afterwards; `schedule=None` means it can create
+only an explicitly triggered manual DagRun. Its tasks contain
 literal `4096 requests / 2048 MiB / shard 25` safety limits and literal
 `bootstrap_only=true`; DagRun conf cannot change them. The scheduled
 `dag_ingest_fbref` keeps its original daily schedule, parameters, and
