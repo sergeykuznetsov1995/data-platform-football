@@ -37,6 +37,8 @@ BASE_FILES = {
     "dags/utils/__init__.py": "",
     "dags/utils/config.py": "SCHEDULES = {}\n",
     "dags/utils/default_args.py": "DEFAULT_ARGS = {}\n",
+    "dags/utils/alerts.py": "def telegram_on_failure(ctx): pass\n",
+    "dags/utils/medallion_config.py": "FLOOR = 1\n",
     "scrapers/understat/__init__.py": "",
     "scrapers/understat/client.py": "VERSION = 1\n",
     "dags/utils/understat_tasks.py": "TASKS = 1\n",
@@ -174,17 +176,18 @@ def test_nothing_to_deliver_moves_base_without_writes(stand: Stand) -> None:
     assert (stand.state / f"understat-auto-deliver-attempted-{DAY}").exists()
 
 
-def test_shared_module_drift_cancels(stand: Stand) -> None:
+@pytest.mark.parametrize("shared", ["dags/utils/config.py", "dags/utils/alerts.py", "scrapers/base/base_scraper.py"])
+def test_shared_module_drift_cancels(stand: Stand, shared: str) -> None:
     stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
-    (stand.tree / "dags/utils/config.py").write_text("SCHEDULES = {'x': 1}\n", encoding="utf-8")
+    (stand.tree / shared).write_text("# живая правка общего модуля\n", encoding="utf-8")
     res = stand.run("--check")
     assert res.returncode == 1
-    assert "ОТМЕНА: общий модуль dags/utils/config.py в бою ≠ master" in res.stdout
+    assert f"ОТМЕНА: общий модуль {shared} в бою ≠ master" in res.stdout
     assert stand.tg() == ""
     res = stand.run()
     assert res.returncode == 1
-    assert "ОТМЕНА: общий модуль dags/utils/config.py в бою ≠ master" in stand.log()
-    assert "общий модуль dags/utils/config.py" in stand.tg()
+    assert f"ОТМЕНА: общий модуль {shared} в бою ≠ master" in stand.log()
+    assert f"общий модуль {shared}" in stand.tg()
     assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 1\n"
     assert stand.accepted() == stand.base
 
@@ -249,13 +252,21 @@ def test_structural_change_needs_hands(stand: Stand, kind: str) -> None:
     assert stand.accepted() == stand.base
 
 
-def test_foreign_live_edit_stops(stand: Stand) -> None:
+@pytest.mark.parametrize("stray", [None, "scrapers/understat/stray.py", "dags/utils/understat_stray.py"])
+def test_foreign_live_edit_stops(stand: Stand, stray: str | None) -> None:
     stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
-    (stand.tree / "scrapers/understat/client.py").write_text("VERSION = 'живая правка'\n", encoding="utf-8")
+    if stray is None:
+        (stand.tree / "scrapers/understat/client.py").write_text("VERSION = 'живая правка'\n", encoding="utf-8")
+        expected = "чужая живая правка: scrapers/understat/client.py"
+    else:
+        (stand.tree / stray).write_text("X = 1\n", encoding="utf-8")
+        expected = f"лишние файлы Understat в бою: {stray}"
+    (stand.tree / "scrapers/understat/__pycache__").mkdir()
+    (stand.tree / "scrapers/understat/__pycache__/client.cpython-311.pyc").write_bytes(b"\0")
     res = stand.run()
     assert res.returncode == 1
-    assert "чужая живая правка: scrapers/understat/client.py" in stand.log()
-    assert stand.tree_text("scrapers/understat/client.py") == "VERSION = 'живая правка'\n"
+    assert expected in stand.log()
+    assert stand.tree_text("scrapers/understat/client.py") != "VERSION = 2\n"
     assert stand.accepted() == stand.base
 
 
@@ -289,6 +300,17 @@ def test_unconfirmed_rollback_switches_off(stand: Stand) -> None:
     (stand.state / f"understat-auto-deliver-attempted-{DAY}").unlink()
     res = stand.run()
     assert res.returncode == 0 and "выключатель" in res.stdout
+
+
+def test_unconfirmed_manual_rollback_switches_off(stand: Stand) -> None:
+    stand.master({"scrapers/understat/client.py": "VERSION = 2\n"})
+    assert stand.run().returncode == 0
+    (stand.ss / "stale").write_text("", encoding="utf-8")
+    res = stand.run("--rollback", DAY)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "🆘 Understat: ручной откат" in stand.tg()
+    assert (stand.state / "understat-auto-deliver.off").exists()
+    assert (stand.state / "understat-inflight").read_text(encoding="utf-8").strip() == f"rollback {DAY}"
 
 
 @pytest.mark.parametrize("why", ["window", "busy"])

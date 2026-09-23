@@ -17,7 +17,8 @@ MODE="${1:-night}"
 SELF="${BASH_SOURCE[0]}"
 
 UNDERSTAT_PATHS="scrapers/understat dags/dag_ingest_understat.py dags/dag_backfill_understat.py dags/utils/understat_tasks.py dags/scripts/run_understat_scraper.py"
-SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__init__.py dags/utils/config.py dags/utils/default_args.py"
+# Общие модули, которые импортируют файлы Understat (с транзитивными: default_args → alerts, config → medallion_config).
+SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__init__.py dags/utils/config.py dags/utils/default_args.py dags/utils/alerts.py dags/utils/medallion_config.py"
 # Порядок записи файлов вне scrapers/understat/ — импортируемые раньше импортирующих.
 DAG_ORDER="dags/utils/understat_tasks.py dags/scripts/run_understat_scraper.py dags/dag_backfill_understat.py dags/dag_ingest_understat.py"
 DAGS="dag_ingest_understat dag_backfill_understat"
@@ -49,6 +50,13 @@ stop() { log "СТОП: $1"; tg "⛔ Understat: $1"; journal "стоп: $1"; exi
 q() { docker exec "$METADB" psql -U airflow -d airflow -At -c "$1" 2>/dev/null; }
 g() { git -C "$REPO" "$@"; }
 
+# Лишние исходные файлы Understat в бою против коммита $1 (без __pycache__/.pyc).
+extra_files() {
+  comm -13 <(g ls-tree -r --name-only "$1" | grep -E '^scrapers/understat/|^dags/(.*/)?[^/]*understat[^/]*\.py$' | LC_ALL=C sort -u) \
+    <( { (cd "$TREE" && find scrapers/understat -type f ! -path '*/__pycache__/*' ! -name '*.pyc'
+         cd "$TREE" && find dags -name '*understat*.py' ! -path '*/__pycache__/*'); } | LC_ALL=C sort -u)
+}
+
 # Приёмка: оба DAG перечитаны после CUT без ошибок, своих import_error нет, файлы Understat = BASE.
 # CUT берётся ПОСЛЕ всех записей; +60 с — больше таймаута разбора файла (dag_file_processor_timeout
 # 50 с по умолчанию): разбор, начатый до окончания записи, приёмку не засчитает.
@@ -70,6 +78,7 @@ accept() {
   for f in $(g ls-tree -r --name-only "$base" -- $UNDERSTAT_PATHS); do
     g show "$base:$f" | cmp -s - "$TREE/$f" || { REASON="после записи $f в бою ≠ ${base:0:7}"; return 1; }
   done
+  f=$(extra_files "$base"); [ -z "$f" ] || { REASON="лишние файлы Understat в бою: $(echo $f)"; return 1; }
   log "приёмка пройдена (DAG перечитаны после $cut, бой = ${base:0:7})"
 }
 
@@ -108,14 +117,16 @@ if [ "$MODE" = "--rollback" ]; then
   [ -n "$RB" ] && [ -f "$BK/files" ] && [ -f "$BK/accepted-before" ] || stop "--rollback: нет $BK/files или accepted-before"
   BASE=$(cat "$BK/accepted-before"); SHA=$BASE; FILES_N=$(wc -l < "$BK/files")
   BUSY=$(busy_reason); [ -z "$BUSY" ] || stop "--rollback $RB не выполнен: $BUSY"
-  restore "$BK" "$RB" || stop "--rollback $RB: возврат файлов не удался — НУЖНЫ РУКИ"
-  CUT=$(q "select now()"); [ -n "$CUT" ] || stop "--rollback: метабаза не отвечает — НУЖНЫ РУКИ"
-  if accept "$CUT" "$BASE"; then
-    set_accepted "$BASE" || stop "--rollback $RB принят, но $ACCEPTED_F не записан — НУЖНЫ РУКИ"
+  echo "rollback $RB" > "$INFLIGHT" || stop "--rollback $RB: не записан $INFLIGHT — бой не тронут"
+  REASON="возврат файлов не удался"
+  if restore "$BK" "$RB" && { REASON="метабаза не отвечает"; CUT=$(q "select now()"); [ -n "$CUT" ]; } \
+     && accept "$CUT" "$BASE" && { REASON="не записан $ACCEPTED_F"; set_accepted "$BASE"; }; then
     rm -f "$INFLIGHT"
     journal "ручной откат $RB принят"; tg "↩️ Understat: ручной откат доставки $RB принят, бой = ${BASE:0:7}"; exit 0
   fi
-  stop "--rollback $RB: приёмка не пройдена ($REASON) — НУЖНЫ РУКИ"
+  touch "$OFF"; journal "ручной откат $RB НЕ подтверждён ($REASON), выключатель поставлен"
+  tg "🆘 Understat: ручной откат $RB НЕ подтверждён ($REASON) — НУЖНЫ РУКИ; автомат выключен ($OFF)"
+  exit 2
 fi
 [ "$MODE" = night ] || [ "$MODE" = --check ] || { echo "режимы: (без аргумента) | --check | --rollback <YYYYMMDD>"; exit 2; }
 
@@ -159,6 +170,7 @@ log "база ${ACC:0:7} → master ${SHA:0:7}; общие модули в бо�
 for f in $(g ls-tree -r --name-only "$ACC" -- $UNDERSTAT_PATHS); do
   g show "$ACC:$f" | cmp -s - "$TREE/$f" || stop "чужая живая правка: $f в бою ≠ принятой базе ${ACC:0:7}"
 done
+EXTRA=$(extra_files "$ACC"); [ -z "$EXTRA" ] || stop "чужая живая правка: лишние файлы Understat в бою: $(echo $EXTRA)"
 
 # --- список изменений: M — доставить, A в scrapers/understat/ — создать, прочее — руками
 # (glob ловит новые *understat*.py в dags/ — их создание тронуло бы сторожевой каталог)
