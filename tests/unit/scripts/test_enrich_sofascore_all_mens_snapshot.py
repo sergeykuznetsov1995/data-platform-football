@@ -543,3 +543,85 @@ def test_priority_main_writes_selection_into_the_report(tmp_path, monkeypatch):
     assert written["selected_seasons"] == 2
     assert written["ready_wave_scopes"] == 2
     assert written["wave_start_year"] is None
+
+
+class MissingSeasonClient(Client):
+    """HTTP 404 on the running season's team index, like the real client."""
+
+    def get_json(self, path):
+        if path == "/unique-tournament/17/season/76986/teams":
+            from scrapers.sofascore.discovery import DiscoveryHTTPError
+
+            self.calls.append(path)
+            raise DiscoveryHTTPError(
+                f"metered browser request failed: HTTP 404 {path}", status_code=404
+            )
+        return super().get_json(path)
+
+
+def test_priority_queue_moves_past_a_season_the_source_does_not_have():
+    # Astra r2: an entity-level 4xx must not abort the pass, or the priority
+    # queue would select the same season first on every run forever.
+    denominator = _priority_denominator({17: "core"})
+
+    first, report = enrich_snapshot(
+        _snapshot(), MissingSeasonClient(), wave_start_year=1999,
+        denominator=denominator, select="priority", max_seasons=5,
+    )
+
+    seasons = first["tournaments"][0]["seasons"]
+    assert seasons[0]["metadata_status"] == "excluded"
+    assert seasons[0]["team_count_evidence"]["reason"] == "schema_error"
+    assert seasons[1]["metadata_status"] == "ready"
+    assert report["ready_wave_scopes"] == 1
+
+    client = MissingSeasonClient()
+    _second, again = enrich_snapshot(
+        first, client, wave_start_year=1999,
+        denominator=denominator, select="priority", max_seasons=5,
+    )
+
+    assert client.calls == []
+    assert again["selected_seasons"] == 0
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, None])
+def test_blocking_or_transient_errors_still_abort_the_pass(status):
+    from scrapers.sofascore.discovery import DiscoveryHTTPError
+
+    class BlockedClient(Client):
+        def get_json(self, path):
+            if "/season/" in path:
+                raise DiscoveryHTTPError("blocked", status_code=status)
+            return super().get_json(path)
+
+    with pytest.raises(DiscoveryHTTPError):
+        enrich_snapshot(
+            _snapshot(), BlockedClient(), wave_start_year=1999,
+            denominator=_priority_denominator({17: "core"}),
+            select="priority", max_seasons=5,
+        )
+
+
+def test_missing_tournament_identity_is_skipped_not_fatal():
+    from scrapers.sofascore.discovery import DiscoveryHTTPError
+
+    class GoneClient(Client):
+        def get_json(self, path):
+            if path == "/unique-tournament/17":
+                self.calls.append(path)
+                raise DiscoveryHTTPError("HTTP 404", status_code=404)
+            return super().get_json(path)
+
+    snapshot = _snapshot()
+    client = GoneClient()
+
+    enriched, report = enrich_snapshot(
+        snapshot, client, wave_start_year=1999,
+        denominator=_priority_denominator({17: "core"}),
+        select="priority", max_seasons=5,
+    )
+
+    assert client.calls == ["/unique-tournament/17"]
+    assert report["unavailable_tournaments"] == 1
+    assert enriched["tournaments"] == snapshot["tournaments"]

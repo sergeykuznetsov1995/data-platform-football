@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from scrapers.sofascore.discovery import (
     DISCOVERY_LEASE_MAX_BYTES,
     DISCOVERY_LEASE_TTL_SECONDS,
+    DiscoveryHTTPError,
     DiscoverySchemaError,
     LeaseBrowserSofaScoreClient,
     SEASON_TEAMS_PATH,
@@ -52,6 +53,16 @@ def _validate_snapshot(snapshot: Mapping[str, Any]) -> None:
         raise SnapshotEnrichmentError("snapshot tournaments must be a list")
     if snapshot.get("candidate_count") != len(tournaments):
         raise SnapshotEnrichmentError("snapshot candidate_count mismatch")
+
+
+def _entity_missing(exc: DiscoveryHTTPError) -> bool:
+    """A 4xx about this exact URL (not 403 block / 429 throttle): retrying the
+    same entity cannot help, so it must not abort the whole pass -- otherwise
+    the priority queue picks it first again every run and never moves (#1354).
+    """
+
+    code = exc.status_code
+    return code is not None and 400 <= code < 500 and code not in (403, 429)
 
 
 def _schema_error_retry(season: Mapping[str, Any]) -> bool:
@@ -181,6 +192,7 @@ def enrich_snapshot(
     source_requests = 0
     retried_scopes = 0
     recovered_scopes = 0
+    unavailable_tournaments = 0
     for tournament in tournaments:
         changed = False
         if max_tournaments is not None and processed >= max_tournaments:
@@ -221,8 +233,16 @@ def enrich_snapshot(
         source_id = int(tournament["unique_tournament_id"])
         if needs_identity:
             endpoint = TOURNAMENT_PATH.format(unique_tournament_id=source_id)
-            payload = client.get_json(endpoint)
             source_requests += 1
+            try:
+                payload = client.get_json(endpoint)
+            except DiscoveryHTTPError as exc:
+                if not _entity_missing(exc):
+                    raise
+                # Identity unknown: leave the tournament pending (no guess on
+                # gender) and go on with the rest of the selection.
+                unavailable_tournaments += 1
+                continue
             parsed = parse_catalog_payload(payload, endpoint=endpoint)
             if len(parsed) != 1 or parsed[0]["unique_tournament_id"] != source_id:
                 raise SnapshotEnrichmentError(
@@ -261,15 +281,17 @@ def enrich_snapshot(
                 unique_tournament_id=source_id,
                 season_id=season_id,
             )
-            payload = client.get_json(endpoint)
             source_requests += 1
             try:
+                payload = client.get_json(endpoint)
                 team_count, evidence = parse_team_count_payload(
                     payload,
                     unique_tournament_id=source_id,
                     season_id=season_id,
                 )
-            except DiscoverySchemaError:
+            except (DiscoverySchemaError, DiscoveryHTTPError) as exc:
+                if isinstance(exc, DiscoveryHTTPError) and not _entity_missing(exc):
+                    raise
                 # Some source-listed cup seasons legitimately expose no team
                 # index. Keep the exact season fail-closed without aborting
                 # metadata validation for every other tournament. A later wave
@@ -330,6 +352,7 @@ def enrich_snapshot(
         "retried_schema_error_scopes": retried_scopes,
         "recovered_schema_error_scopes": recovered_scopes,
         "source_requests": source_requests,
+        "unavailable_tournaments": unavailable_tournaments,
     }
     if selected is not None:
         counts["selected_seasons"] = sum(len(item) for item in selected.values())
