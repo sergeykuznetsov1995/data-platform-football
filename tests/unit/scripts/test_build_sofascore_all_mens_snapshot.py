@@ -179,6 +179,29 @@ def test_amateur_candidate_is_excluded_even_when_classification_is_unknown():
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "Liga Pro FIFA20 - 12 mins play",
+        "Battle Champions League FIFA 21",
+        "Hrvatski Telekom eLiga",
+        "eSoccer Battle",
+        "E-Soccer Cup",
+        "eFootball League",
+    ],
+)
+def test_esoccer_candidate_is_excluded(name: str):
+    recount = _recount_doc()
+    recount["tournaments"][0]["name"] = name
+
+    snapshot = build_snapshot(_candidate_doc(), recount, _estimates(), POLICY)
+    row = snapshot["tournaments"][0]
+    assert row["metadata_status"] == "excluded"
+    assert "esoccer marker in source identity" in row["classification"][
+        "exclusion_reasons"
+    ]
+
+
+@pytest.mark.parametrize(
     ("canonical", "expected"),
     [("9900", 1999), ("0001", 2000), ("2526", 2025)],
 )

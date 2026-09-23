@@ -1,0 +1,1512 @@
+tournament_id	capture_key	name	class	queue_priority	basis
+1	SS-1	EURO	core	1	G1:CORE взрослые мужские
+7	SS-7	UEFA Champions League	core	1	G1:CORE взрослые мужские
+8	ESP-La Liga	LaLiga	core	1	registry:tournaments.json (дейли до #1370)
+9	SS-9	Challenger Pro League	core	1	G1:CORE взрослые мужские
+11	SS-11	World Cup Qual. UEFA	core	1	G1:CORE взрослые мужские
+13	SS-13	World Cup Qual. CAF	core	1	G1:CORE взрослые мужские
+14	SS-14	World Cup Qual. CONCACAF	core	1	G1:CORE взрослые мужские
+16	INT-World Cup	FIFA World Cup	core	1	registry:tournaments.json (дейли до #1370)
+17	ENG-Premier League	Premier League	core	1	registry:tournaments.json (дейли до #1370)
+18	SS-18	Championship	core	1	G1:CORE взрослые мужские
+19	SS-19	FA Cup	core	1	G1:CORE взрослые мужские
+20	SS-20	Eliteserien	core	1	G1:CORE взрослые мужские
+21	SS-21	EFL Cup	core	1	G1:CORE взрослые мужские
+22	SS-22	Norwegian 1st Division	core	1	G1:CORE взрослые мужские
+23	ITA-Serie A	Serie A	core	1	registry:tournaments.json (дейли до #1370)
+24	SS-24	League One	core	1	G1:CORE взрослые мужские
+25	SS-25	League Two	core	1	G1:CORE взрослые мужские
+27	SS-27	EURO, Qualification	core	1	G1:CORE взрослые мужские
+28	SS-28	AFC Asian Cup Qual.	core	1	G1:CORE взрослые мужские
+29	SS-29	NM Cup	core	1	G1:CORE взрослые мужские
+34	FRA-Ligue 1	Ligue 1	core	1	registry:tournaments.json (дейли до #1370)
+35	GER-Bundesliga	Bundesliga	core	1	registry:tournaments.json (дейли до #1370)
+36	SS-36	Scottish Premiership	core	1	G1:CORE взрослые мужские
+37	SS-37	VriendenLoterij Eredivisie	core	1	G1:CORE взрослые мужские
+38	SS-38	Pro League	core	1	G1:CORE взрослые мужские
+39	SS-39	Danish Superliga	core	1	G1:CORE взрослые мужские
+40	SS-40	Allsvenskan	core	1	G1:CORE взрослые мужские
+41	SS-41	Veikkausliiga	core	1	G1:CORE взрослые мужские
+44	SS-44	2. Bundesliga	core	1	G1:CORE взрослые мужские
+45	SS-45	Austrian Bundesliga	core	1	G1:CORE взрослые мужские
+46	SS-46	Superettan	core	1	G1:CORE взрослые мужские
+47	SS-47	Betinia Liga	core	1	G1:CORE взрослые мужские
+52	SS-52	Trendyol Süper Lig	core	1	G1:CORE взрослые мужские
+53	SS-53	Serie B	core	1	G1:CORE взрослые мужские
+54	SS-54	LaLiga 2	core	1	G1:CORE взрослые мужские
+55	SS-55	Ykkösliiga	core	1	G1:CORE взрослые мужские
+65	SS-65	CampoBet 2 Division	core	1	G1:CORE взрослые мужские
+67	SS-67	Ettan, Norra	core	1	G1:CORE взрослые мужские
+68	SS-68	Ettan, Södra	core	1	G1:CORE взрослые мужские
+70	SS-70	Division 2, Norra Svealand	core	1	G1:CORE взрослые мужские
+71	SS-71	Division 2, Norrland	core	1	G1:CORE взрослые мужские
+72	SS-72	Division 2, Södra Götaland	core	1	G1:CORE взрослые мужские
+73	SS-73	Division 2, Västra Götaland	core	1	G1:CORE взрослые мужские
+74	SS-74	Division 2, Södra Svealand	core	1	G1:CORE взрослые мужские
+76	SS-76	Oddset Pokalen	core	1	G1:CORE взрослые мужские
+80	SS-80	Svenska Cupen	core	1	G1:CORE взрослые мужские
+83	SS-83	Liigacup	core	1	G1:CORE взрослые мужские
+91	SS-91	Russian Cup	core	1	G1:CORE взрослые мужские
+92	SS-92	Carioca	core	1	G1:CORE взрослые мужские
+96	SS-96	Türkiye Kupası	core	1	G1:CORE взрослые мужские
+97	SS-97	Nesine 2. Lig	core	1	G1:CORE взрослые мужские
+98	SS-98	Trendyol 1.Lig	core	1	G1:CORE взрослые мужские
+101	SS-101	J. League Cup	core	1	G1:CORE взрослые мужские
+131	SS-131	Eerste Divisie	core	1	G1:CORE взрослые мужские
+133	SS-133	Copa América	core	1	G1:CORE взрослые мужские
+135	SS-135	2. Liga	core	1	G1:CORE взрослые мужские
+136	SS-136	A-League Men	core	1	G1:CORE взрослые мужские
+140	SS-140	CONCACAF Gold Cup	core	1	G1:CORE взрослые мужские
+152	SS-152	SuperLiga României	core	1	G1:CORE взрослые мужские
+154	SS-154	Montenegrin First League	core	1	G1:CORE взрослые мужские
+155	SS-155	Liga Profesional de Fútbol	core	1	G1:CORE взрослые мужские
+169	SS-169	Vysshaya Liga	core	1	G1:CORE взрослые мужские
+170	SS-170	HNL	core	1	G1:CORE взрослые мужские
+171	SS-171	Cyprus League by Stoiximan	core	1	G1:CORE взрослые мужские
+172	SS-172	Czech First League	core	1	G1:CORE взрослые мужские
+173	SS-173	National League	core	1	G1:CORE взрослые мужские
+178	SS-178	Premium Liiga	core	1	G1:CORE взрослые мужские
+179	SS-179	Kakkonen, Group A	core	1	G1:CORE взрослые мужские
+180	SS-180	Kakkonen, Group B	core	1	G1:CORE взрослые мужские
+181	SS-181	Kakkonen, Group C	core	1	G1:CORE взрослые мужские
+182	SS-182	Ligue 2	core	1	G1:CORE взрослые мужские
+183	SS-183	Ligue 3	core	1	G1:CORE взрослые мужские
+185	SS-185	Stoiximan Super League	core	1	G1:CORE взрослые мужские
+186	SS-186	Super League 2	core	1	G1:CORE взрослые мужские
+187	SS-187	OTP Bank Liga	core	1	G1:CORE взрослые мужские
+188	SS-188	Besta deild karla	core	1	G1:CORE взрослые мужские
+192	SS-192	Premier Division	core	1	G1:CORE взрослые мужские
+193	SS-193	First Division	core	1	G1:CORE взрослые мужские
+195	SS-195	FAI Cup	core	1	G1:CORE взрослые мужские
+196	SS-196	J1 League	core	1	G1:CORE взрослые мужские
+197	SS-197	Virsliga	core	1	G1:CORE взрослые мужские
+198	SS-198	TOPLYGA	core	1	G1:CORE взрослые мужские
+199	SS-199	1. MFL	core	1	G1:CORE взрослые мужские
+200	SS-200	NIFL Premiership	core	1	G1:CORE взрослые мужские
+202	SS-202	Ekstraklasa	core	1	G1:CORE взрослые мужские
+203	RUS-Premier League	Russian Premier League	core	1	registry:tournaments.json (дейли до #1370)
+204	SS-204	First League	core	1	G1:CORE взрослые мужские
+205	SS-205	FNL	core	1	G1:CORE взрослые мужские
+206	SS-206	Scottish Championship	core	1	G1:CORE взрослые мужские
+207	SS-207	Scottish League One	core	1	G1:CORE взрослые мужские
+209	SS-209	Scottish League Two	core	1	G1:CORE взрослые мужские
+210	SS-210	Mozzart Bet Superliga	core	1	G1:CORE взрослые мужские
+211	SS-211	Niké Liga	core	1	G1:CORE взрослые мужские
+212	SS-212	PrvaLiga	core	1	G1:CORE взрослые мужские
+213	SS-213	Supercopa de España	core	1	G1:CORE взрослые мужские
+215	SS-215	Swiss Super League	core	1	G1:CORE взрослые мужские
+216	SS-216	Challenge League	core	1	G1:CORE взрослые мужские
+217	SS-217	DFB Pokal	core	1	G1:CORE взрослые мужские
+218	SS-218	Ukrainian Premier League	core	1	G1:CORE взрослые мужские
+220	SS-220	Suomen Cup	core	1	G1:CORE взрослые мужские
+222	SS-222	WWIN Liga BiH	core	1	G1:CORE взрослые мужские
+224	SS-224	Slovakia League Two	core	1	G1:CORE взрослые мужские
+229	SS-229	Betclic 1. Liga	core	1	G1:CORE взрослые мужские
+231	SS-231	Liga FUTVE	core	1	G1:CORE взрослые мужские
+238	SS-238	Liga Portugal Betclic	core	1	G1:CORE взрослые мужские
+239	SS-239	Liga Portugal 2	core	1	G1:CORE взрослые мужские
+240	SS-240	LigaPro Serie A	core	1	G1:CORE взрослые мужские
+242	SS-242	MLS	core	1	G1:CORE взрослые мужские
+246	SS-246	AFC Asian Cup	core	1	G1:CORE взрослые мужские
+247	SS-247	Parva Liga	core	1	G1:CORE взрослые мужские
+254	SS-254	Cymru Premier	core	1	G1:CORE взрослые мужские
+266	SS-266	Israeli Premier League	core	1	G1:CORE взрослые мужские
+270	SS-270	Africa Cup of Nations	core	1	G1:CORE взрослые мужские
+278	SS-278	Liga AUF Uruguaya	core	1	G1:CORE взрослые мужские
+281	SS-281	Puchar Polski	core	1	G1:CORE взрослые мужские
+282	SS-282	MOL Cup	core	1	G1:CORE взрослые мужские
+291	SS-291	Slovenia Cup	core	1	G1:CORE взрослые мужские
+295	SS-295	World Cup Qual. CONMEBOL	core	1	G1:CORE взрослые мужские
+303	SS-303	Slovnaft Cup	core	1	G1:CORE взрослые мужские
+305	SS-305	MOL Magyar Kupa	core	1	G1:CORE взрослые мужские
+307	SS-307	Hrvatski nogometni kup	core	1	G1:CORE взрослые мужские
+308	SS-308	World Cup Qual. AFC	core	1	G1:CORE взрослые мужские
+309	SS-309	World Cup Qual. OFC	core	1	G1:CORE взрослые мужские
+312	SS-312	Ukraine Cup	core	1	G1:CORE взрослые мужские
+314	SS-314	Mozzart Kup Srbije	core	1	G1:CORE взрослые мужские
+315	SS-315	Cyprus Cup	core	1	G1:CORE взрослые мужские
+323	SS-323	Emperor Cup	core	1	G1:CORE взрослые мужские
+325	SS-325	Brasileirão Betano	core	1	G1:CORE взрослые мужские
+326	SS-326	Belgian Cup	core	1	G1:CORE взрослые мужские
+327	SS-327	Taça da Liga	core	1	G1:CORE взрослые мужские
+328	SS-328	Coppa Italia	core	1	G1:CORE взрослые мужские
+329	SS-329	Copa del Rey	core	1	G1:CORE взрослые мужские
+330	SS-330	Eurojackpot KNVB Beker	core	1	G1:CORE взрослые мужские
+331	SS-331	Scottish Challenge Cup	core	1	G1:CORE взрослые мужские
+332	SS-332	Scottish League Cup	core	1	G1:CORE взрослые мужские
+334	SS-334	Football League Trophy	core	1	G1:CORE взрослые мужские
+335	SS-335	Coupe de France	core	1	G1:CORE взрослые мужские
+336	SS-336	Taça de Portugal	core	1	G1:CORE взрослые мужские
+338	SS-338	Belgian Super Cup	core	1	G1:CORE взрослые мужские
+339	SS-339	Trophée des Champions	core	1	G1:CORE взрослые мужские
+340	SS-340	Johan Cruijff Schaal	core	1	G1:CORE взрослые мужские
+341	SS-341	Supercoppa Italiana	core	1	G1:CORE взрослые мужские
+345	SS-345	Supertaça	core	1	G1:CORE взрослые мужские
+346	SS-346	Community Shield	core	1	G1:2 → core (суперкубок, не любители)
+347	SS-347	Scottish Cup	core	1	G1:CORE взрослые мужские
+348	SS-348	North Macedonia Cup	core	1	G1:CORE взрослые мужские
+355	SS-355	Cupa României Betano	core	1	G1:CORE взрослые мужские
+356	SS-356	Eesti Superkarikas	core	1	G1:CORE взрослые мужские
+357	SS-357	FIFA Club World Cup	core	1	G1:CORE взрослые мужские
+358	SS-358	South African Premier Division	core	1	G1:CORE взрослые мужские
+365	SS-365	Bulgarian Cup	core	1	G1:CORE взрослые мужские
+367	SS-367	Welsh League Cup	core	1	G1:CORE взрослые мужские
+370	SS-370	State Cup	core	1	G1:CORE взрослые мужские
+372	SS-372	Paulista Série A1	core	1	G1:CORE взрослые мужские
+373	SS-373	Copa Betano do Brasil	core	1	G1:CORE взрослые мужские
+374	SS-374	Baianão Mansão Green 2026	core	1	G1:CORE взрослые мужские
+375	SS-375	Greek Football Cup	core	1	G1:CORE взрослые мужские
+376	SS-376	Catarinense	core	1	G1:CORE взрослые мужские
+377	SS-377	Gaúcho	core	1	G1:CORE взрослые мужские
+378	SS-378	Cearense	core	1	G1:CORE взрослые мужские
+379	SS-379	Mineiro, Módulo I	core	1	G1:CORE взрослые мужские
+380	SS-380	Pernambucano	core	1	G1:CORE взрослые мужские
+381	SS-381	Goiano	core	1	G1:CORE взрослые мужские
+382	SS-382	Paranaense	core	1	G1:CORE взрослые мужские
+384	SS-384	CONMEBOL Libertadores	core	1	G1:CORE взрослые мужские
+388	SS-388	FAW Welsh Cup	core	1	G1:CORE взрослые мужские
+390	SS-390	Brasileirão Série B	core	1	G1:CORE взрослые мужские
+392	SS-392	East Asian Championship	core	1	G1:CORE взрослые мужские
+393	SS-393	Japanese Super Cup	core	1	G1:CORE взрослые мужские
+395	SS-395	Division 2, Ostra Götaland	core	1	G1:CORE взрослые мужские
+397	SS-397	Russian Supercup	core	1	G1:CORE взрослые мужские
+399	SS-399	Schweizer Cup	core	1	G1:CORE взрослые мужские
+402	SS-402	J2 League	core	1	G1:CORE взрослые мужские
+406	SS-406	Liga 1 Te Apuesto	core	1	G1:CORE взрослые мужские
+410	SS-410	K League 1	core	1	G1:CORE взрослые мужские
+436	SS-436	Olympic Games	core	1	G1:CORE взрослые мужские
+445	SS-445	ÖFB Cup	core	1	G1:CORE взрослые мужские
+463	SS-463	AFC Champions League Elite	core	1	G1:CORE взрослые мужские
+465	SS-465	UEFA Super Cup	core	1	G1:CORE взрослые мужские
+480	SS-480	CONMEBOL Sudamericana	core	1	G1:CORE взрослые мужские
+482	SS-482	Canadian Soccer League	core	1	G1:CORE взрослые мужские
+490	SS-490	CONMEBOL Recopa	core	1	G1:CORE взрослые мужские
+491	SS-491	3. Liga	core	1	G1:CORE взрослые мужские
+495	SS-495	US Open Cup	core	1	G1:CORE взрослые мужские
+498	SS-498	CONCACAF Champions Cup	core	1	G1:CORE взрослые мужские
+504	SS-504	Icelandic Men's Football Cup	core	1	G1:CORE взрослые мужские
+505	SS-505	TFF Süper Kupa	core	1	G1:CORE взрослые мужские
+510	SS-510	Bulgarian Supercup	core	1	G1:CORE взрослые мужские
+511	SS-511	Superpuchar Polski	core	1	G1:CORE взрослые мужские
+515	SS-515	Betclic 2. Liga	core	1	G1:CORE взрослые мужские
+532	SS-532	2. SNL	core	1	G1:CORE взрослые мужские
+544	SS-544	Segunda Federación	core	1	G1:CORE взрослые мужские
+550	SS-550	Cypriot Super Cup	core	1	G1:CORE взрослые мужские
+562	SS-562	Liga 2 Casa Pariurilor	core	1	G1:CORE взрослые мужские
+578	SS-578	Belarus Cup	core	1	G1:CORE взрослые мужские
+583	SS-583	Bosnia & Herzegovina Cup	core	1	G1:CORE взрослые мужские
+594	SS-594	New Zealand National League	core	1	G1:CORE взрослые мужские
+602	SS-602	ASEAN Championship	core	1	G1:CORE взрослые мужские
+611	SS-611	Northern Ireland Football League Cup	core	1	G1:CORE взрослые мужские
+615	SS-615	Korean Cup	core	1	G1:CORE взрослые мужские
+622	SS-622	Gulf Cup	core	1	G1:CORE взрослые мужские
+626	SS-626	V-League 1	core	1	G1:CORE взрослые мужские
+629	SS-629	VBET Malta Premier	core	1	G1:CORE взрослые мужские
+630	SS-630	Challenge League	core	1	G1:CORE взрослые мужские
+633	SS-633	Maltese FA Trophy	core	1	G1:CORE взрослые мужские
+634	SS-634	Singapore Premier League	core	1	G1:CORE взрослые мужские
+637	SS-637	African Nations Championship	core	1	G1:CORE взрослые мужские
+649	SS-649	Chinese Super League	core	1	G1:CORE взрослые мужские
+655	SS-655	Singapore Cup	core	1	G1:CORE взрослые мужские
+668	SS-668	AFC Champions League Two	core	1	G1:CORE взрослые мужские
+671	SS-671	Armenian Premier League	core	1	G1:CORE взрослые мужские
+672	SS-672	Armenian 1st League	core	1	G1:CORE взрослые мужские
+673	SS-673	Faroe Islands Premier League	core	1	G1:CORE взрослые мужские
+674	SS-674	Faroe Islands 1. Deild	core	1	G1:CORE взрослые мужские
+675	SS-675	Iceland 1. deild	core	1	G1:CORE взрослые мужские
+676	SS-676	Pirma Lyga	core	1	G1:CORE взрослые мужские
+677	SS-677	1.Liga	core	1	G1:CORE взрослые мужские
+678	SS-678	Esiliiga	core	1	G1:CORE взрослые мужские
+679	SS-679	UEFA Europa League	core	1	G1:CORE взрослые мужские
+682	SS-682	Kazakhstan Premier League	core	1	G1:CORE взрослые мужские
+685	SS-685	Moldovan Super Liga	core	1	G1:CORE взрослые мужские
+690	SS-690	Division Nationale	core	1	G1:CORE взрослые мужские
+691	SS-691	Persha Liha	core	1	G1:CORE взрослые мужские
+692	SS-692	Cypriot 2nd Division	core	1	G1:CORE взрослые мужские
+698	SS-698	Supercupa României	core	1	G1:CORE взрослые мужские
+701	SS-701	NIFL Championship	core	1	G1:CORE взрослые мужские
+703	SS-703	Primera Nacional	core	1	G1:CORE взрослые мужские
+704	SS-704	Erovnuli Liga	core	1	G1:CORE взрослые мужские
+709	SS-709	Misli Premier League	core	1	G1:CORE взрослые мужские
+710	SS-710	Moldovan Liga 1	core	1	G1:CORE взрослые мужские
+715	SS-715	M:tel Prva liga Republike Srpske	core	1	G1:CORE взрослые мужские
+716	SS-716	Prva Liga, Federacije BiH	core	1	G1:CORE взрослые мужские
+717	SS-717	Meridianbet 2. CFL	core	1	G1:CORE взрослые мужские
+718	SS-718	2. MFL	core	1	G1:CORE взрослые мужские
+720	SS-720	Abissnet Superiore	core	1	G1:CORE взрослые мужские
+721	SS-721	Mozzart Bet Prva Liga	core	1	G1:CORE взрослые мужские
+722	SS-722	Kategoria e Pare	core	1	G1:CORE взрослые мужские
+723	SS-723	Promotion d'Honneur	core	1	G1:CORE взрослые мужские
+724	SS-724	1. NL	core	1	G1:CORE взрослые мужские
+725	SS-725	Maltese Super Cup	core	1	G1:CORE взрослые мужские
+726	SS-726	Erovnuli Liga 2	core	1	G1:CORE взрослые мужские
+727	SS-727	Israel National League	core	1	G1:CORE взрослые мужские
+729	SS-729	Georgian Cup	core	1	G1:CORE взрослые мужские
+731	SS-731	Eesti Karikas	core	1	G1:CORE взрослые мужские
+736	SS-736	Birinci Liqa	core	1	G1:CORE взрослые мужские
+737	SS-737	Coppa Titano	core	1	G1:CORE взрослые мужские
+738	SS-738	Campionato Sammarinese	core	1	G1:CORE взрослые мужские
+739	SS-739	Montenegrin Cup	core	1	G1:CORE взрослые мужские
+740	SS-740	Azerbaijan Cup	core	1	G1:CORE взрослые мужские
+741	SS-741	Cupa Moldova	core	1	G1:CORE взрослые мужские
+742	SS-742	Primera Divisió	core	1	G1:CORE взрослые мужские
+743	SS-743	Segona Divisió	core	1	G1:CORE взрослые мужские
+749	SS-749	Kazakhstan Cup	core	1	G1:CORE взрослые мужские
+756	SS-756	Kupa e Shqiperise	core	1	G1:CORE взрослые мужские
+757	SS-757	FL1 Aktiv - Cup	core	1	G1:CORE взрослые мужские
+761	SS-761	Latvijas Kauss	core	1	G1:CORE взрослые мужские
+765	SS-765	Coupe de Luxembourg	core	1	G1:CORE взрослые мужские
+766	SS-766	Georgian Super Cup	core	1	G1:CORE взрослые мужские
+767	SS-767	Irish Cup	core	1	G1:CORE взрослые мужские
+771	SS-771	V-League 2	core	1	G1:CORE взрослые мужские
+772	SS-772	Uzbekistan Super League	core	1	G1:CORE взрослые мужские
+773	SS-773	Kazakhstan Super Cup	core	1	G1:CORE взрослые мужские
+775	SS-775	Belarusian Super Cup	core	1	G1:CORE взрослые мужские
+776	SS-776	Pershaya Liga	core	1	G1:CORE взрослые мужские
+777	SS-777	K League 2	core	1	G1:CORE взрослые мужские
+778	SS-778	Armenian Cup	core	1	G1:CORE взрослые мужские
+779	SS-779	Faroe Islands Cup	core	1	G1:CORE взрослые мужские
+782	SS-782	Chinese League 1	core	1	G1:CORE взрослые мужские
+785	SS-785	Kazakhstan 1st League	core	1	G1:CORE взрослые мужские
+786	SS-786	Icelandic Super Cup	core	1	G1:CORE взрослые мужские
+798	SS-798	Super Cup	core	1	G1:CORE взрослые мужские
+799	SS-799	Franz Beckenbauer Supercup	core	1	G1:CORE взрослые мужские
+800	SS-800	Croatian Super Cup	core	1	G1:CORE взрослые мужские
+808	SS-808	Egyptian Premier League	core	1	G1:CORE взрослые мужские
+812	SS-812	LFF Cup	core	1	G1:CORE взрослые мужские
+824	SS-824	Coppa Italia Serie C	core	1	G1:CORE взрослые мужские
+825	SS-825	Stars League	core	1	G1:CORE взрослые мужские
+841	SS-841	Algerian Ligue 1	core	1	G1:CORE взрослые мужские
+842	SS-842	WAFF Championship	core	1	G1:CORE взрослые мужские
+846	SS-846	Bahraini Premier League	core	1	G1:CORE взрослые мужские
+848	SS-848	I-League	core	1	G1:CORE взрослые мужские
+868	SS-868	Division 2, Norra Götaland	core	1	G1:CORE взрослые мужские
+881	SS-881	Copa Constitució	core	1	G1:CORE взрослые мужские
+882	SS-882	CFA Cup	core	1	G1:CORE взрослые мужские
+884	SS-884	Supercoppa Serie C	core	1	G1:CORE взрослые мужские
+890	SS-890	Supercupa Moldovei	core	1	G1:CORE взрослые мужские
+915	SS-915	Persian Gulf Pro League	core	1	G1:CORE взрослые мужские
+929	SS-929	Jordan Pro League	core	1	G1:CORE взрослые мужские
+937	SS-937	Botola Pro	core	1	G1:CORE взрослые мужские
+939	SS-939	Crown Prince Cup	core	1	G1:CORE взрослые мужские
+947	SS-947	Hong Kong Premier League	core	1	G1:CORE взрослые мужские
+953	SS-953	Federation Cup	core	1	G1:CORE взрослые мужские
+955	SS-955	Saudi Pro League	core	1	G1:CORE взрослые мужские
+965	SS-965	Omani League	core	1	G1:CORE взрослые мужские
+971	SS-971	UAE Pro League	core	1	G1:CORE взрослые мужские
+984	SS-984	Tunisian Ligue Professionnelle 1	core	1	G1:CORE взрослые мужские
+1000	SS-1000	Malaysia Super League	core	1	G1:CORE взрослые мужские
+1002	SS-1002	Zain Premier League	core	1	G1:CORE взрослые мужские
+1006	SS-1006	Elite One	core	1	G1:CORE взрослые мужские
+1015	SS-1015	Indonesia Super League	core	1	G1:CORE взрослые мужские
+1020	SS-1020	Nedbank Cup	core	1	G1:CORE взрослые мужские
+1024	SS-1024	Copa Argentina	core	1	G1:CORE взрослые мужские
+1032	SS-1032	Thai League 1	core	1	G1:CORE взрослые мужские
+1054	SS-1054	CAF Champions League	core	1	G1:CORE взрослые мужские
+1060	SS-1060	Baltic Cup	core	1	G1:CORE взрослые мужские
+1093	SS-1093	Second League, Division B, Group 1	core	1	G1:CORE взрослые мужские
+1095	SS-1095	Second League, Division B, Group 3	core	1	G1:CORE взрослые мужские
+1097	SS-1097	Second League, Division B, Group 4	core	1	G1:CORE взрослые мужские
+1099	SS-1099	Second League, Division B, Group 2	core	1	G1:CORE взрослые мужские
+1101	SS-1101	Promotion League	core	1	G1:CORE взрослые мужские
+1107	SS-1107	Albanian Supercup	core	1	G1:CORE взрослые мужские
+1115	SS-1115	CAF Confederations Cup	core	1	G1:CORE взрослые мужские
+1125	SS-1125	MTN 8	core	1	G1:CORE взрослые мужские
+1127	SS-1127	Liga F Moeve	women	9	G1:W женские/смешанные
+1135	SS-1135	Vtora Liga	core	1	G1:CORE взрослые мужские
+1137	SS-1137	Premier League	core	1	G1:CORE взрослые мужские
+1139	SS-1139	Première Ligue, Féminine	women	9	C6:gender-unknown/women
+1191	SS-1191	Ghana Premier League	core	1	G1:CORE взрослые мужские
+1205	SS-1205	South African League Cup	core	1	G1:CORE взрослые мужские
+1211	SS-1211	Ivory Coast Ligue 1	core	1	G1:CORE взрослые мужские
+1221	SS-1221	Copa Chile	core	1	G1:CORE взрослые мужские
+1222	SS-1222	OFC Champions League	core	1	G1:CORE взрослые мужские
+1226	SS-1226	Senegal Ligue 1	core	1	G1:CORE взрослые мужские
+1234	SS-1234	Paulista, Série A2	core	1	G1:CORE взрослые мужские
+1236	SS-1236	Vietnamese Super Cup	core	1	G1:CORE взрослые мужские
+1238	SS-1238	Categoría Primera B	core	1	G1:CORE взрослые мужские
+1240	SS-1240	Liga de Ascenso	core	1	G1:CORE взрослые мужские
+1246	SS-1246	Viareggio Cup	core	1	G1:CORE взрослые мужские
+1250	SS-1250	CAF Super Cup	core	1	G1:CORE взрослые мужские
+1254	SS-1254	División Intermedia	core	1	G1:CORE взрослые мужские
+1258	SS-1258	NPL South Australia	core	1	G1:CORE взрослые мужские
+1260	SS-1260	NPL Capital Football	core	1	G1:CORE взрослые мужские
+1262	SS-1262	LFF Super Cup	core	1	G1:CORE взрослые мужские
+1268	SS-1268	NPL Queensland	core	1	G1:CORE взрослые мужские
+1270	SS-1270	NPL Western Australia	core	1	G1:CORE взрослые мужские
+1274	SS-1274	NPL New South Wales	core	1	G1:CORE взрослые мужские
+1275	SS-1275	NPL Victoria Men	core	1	G1:CORE взрослые мужские
+1281	SS-1281	Brasileirão Série C	core	1	G1:CORE взрослые мужские
+1295	SS-1295	Emirates Cup	core	1	G1:CORE взрослые мужские
+1309	SS-1309	Supercopa de Chile	core	1	G1:CORE взрослые мужские
+1325	SS-1325	Premier League Asia Trophy	core	1	G1:CORE взрослые мужские
+1335	SS-1335	Copa Colombia	core	1	G1:CORE взрослые мужские
+1343	SS-1343	Supercoppa Sammarinese	core	1	G1:CORE взрослые мужские
+1347	SS-1347	Primera B Metropolitana	core	1	G1:CORE взрослые мужские
+1369	SS-1369	UAE League Cup	core	1	G1:CORE взрослые мужские
+1374	SS-1374	Serie D, Girone A	core	1	G1:CORE взрослые мужские
+1376	SS-1376	Serie D, Girone B	core	1	G1:CORE взрослые мужские
+1378	SS-1378	Serie D, Girone C	core	1	G1:CORE взрослые мужские
+1380	SS-1380	Serie D, Girone D	core	1	G1:CORE взрослые мужские
+1382	SS-1382	Serie D, Girone E	core	1	G1:CORE взрослые мужские
+1384	SS-1384	Serie D, Girone F	core	1	G1:CORE взрослые мужские
+1386	SS-1386	Serie D, Girone G	core	1	G1:CORE взрослые мужские
+1388	SS-1388	Serie D, Girone H	core	1	G1:CORE взрослые мужские
+1390	SS-1390	Serie D, Girone I	core	1	G1:CORE взрослые мужские
+1434	SS-1434	Coupe du Trône	core	1	G1:CORE взрослые мужские
+1460	SS-1460	Cypriot Third Division	core	1	G1:CORE взрослые мужские
+1518	SS-1518	Stars Cup	core	1	G1:CORE взрослые мужские
+1542	SS-1542	Gibraltar Football League	core	1	G1:CORE взрослые мужские
+1588	SS-1588	Algerian Cup	core	1	G1:CORE взрослые мужские
+1596	SS-1596	Copa do Nordeste	core	1	G1:CORE взрослые мужские
+1598	SS-1598	Copa MX	core	1	G1:CORE взрослые мужские
+1614	SS-1614	Paulista, Série A3	core	1	G1:CORE взрослые мужские
+1618	SS-1618	Supercopa Argentina	core	1	G1:CORE взрослые мужские
+1626	SS-1626	NPL Tasmania	core	1	G1:CORE взрослые мужские
+1632	SS-1632	Men's President's Cup	core	1	G1:CORE взрослые мужские
+1634	SS-1634	Crown Prince Cup	core	1	G1:CORE взрослые мужские
+1638	SS-1638	NPL Northern New South Wales	core	1	G1:CORE взрослые мужские
+1644	SS-1644	FKF Kenyan Premier League	core	1	G1:CORE взрослые мужские
+1654	SS-1654	Philippines Football League	core	1	G1:CORE взрослые мужские
+1662	SS-1662	Kansallinen Liiga	women	9	G1:W женские/смешанные
+1682	SS-1682	Coupe de Tunisie	core	1	G1:CORE взрослые мужские
+1696	SS-1696	FA Cup, Qualification	core	1	G1:CORE взрослые мужские
+1710	SS-1710	Serie D, Poule Scudetto	core	1	G1:CORE взрослые мужские
+1754	SS-1754	Supercopa MX	core	1	G1:CORE взрослые мужские
+1778	SS-1778	Cupa Ligii	core	1	G1:CORE взрослые мужские
+1786	SS-1786	Australia Cup	core	1	G1:CORE взрослые мужские
+1794	SS-1794	MLS All Star Game	show	9	G1:3 шоу/киберфутбол
+1822	SS-1822	Jordan Cup	core	1	G1:CORE взрослые мужские
+1848	SS-1848	Africa Cup of Nations Qual.	core	1	G1:CORE взрослые мужские
+1892	SS-1892	Jamaica Premier League	core	1	G1:CORE взрослые мужские
+1900	SS-1900	Indian Super League	core	1	G1:CORE взрослые мужские
+1906	SS-1906	Motsepe Foundation Championship	core	1	G1:CORE взрослые мужские
+1908	SS-1908	Uruguayan Segunda División	core	1	G1:CORE взрослые мужские
+1924	SS-1924	Armenian Supercup	core	1	G1:CORE взрослые мужские
+1954	SS-1954	CONCACAF W Championship	women	9	G1:W женские/смешанные
+2056	SS-2056	Icelandic Men's Football League Cup A	core	1	G1:CORE взрослые мужские
+2058	SS-2058	King's Cup	core	1	G1:CORE взрослые мужские
+2060	SS-2060	Nigeria Premier Football League	core	1	G1:CORE взрослые мужские
+2065	SS-2065	Zambia Super League	core	1	G1:CORE взрослые мужские
+2076	SS-2076	COSAFA Cup	core	1	G1:CORE взрослые мужские
+2103	SS-2103	Trofeo de Campeon de Campeones	core	1	G1:CORE взрослые мужские
+2104	SS-2104	Israel Super Cup	core	1	G1:CORE взрослые мужские
+2107	SS-2107	AME Cup	core	1	G1:CORE взрослые мужские
+2119	SS-2119	Saudi Super Cup	core	1	G1:CORE взрослые мужские
+2120	SS-2120	Saudi 1st Division	core	1	G1:CORE взрослые мужские
+2123	SS-2123	Eurojackpot Vrouwen Eredivisie	women	9	G1:W женские/смешанные
+2142	SS-2142	Gaza Strip Premier League	core	1	G1:CORE взрослые мужские
+2159	SS-2159	Lebanese Super Cup	core	1	G1:CORE взрослые мужские
+2284	SS-2284	WK League	women	9	G1:W женские/смешанные
+2289	SS-2289	Calcutta Premier Division	core	1	G1:CORE взрослые мужские
+2293	SS-2293	J3 League	core	1	G1:CORE взрослые мужские
+2294	SS-2294	Japan Football League	core	1	G1:CORE взрослые мужские
+2295	SS-2295	Lebanese Premier League	core	1	G1:CORE взрослые мужские
+2296	SS-2296	West Bank League	core	1	G1:CORE взрослые мужские
+2303	SS-2303	Ghana FA Cup	core	1	G1:CORE взрослые мужские
+2304	SS-2304	UAE Super Cup	core	1	G1:CORE взрослые мужские
+2305	SS-2305	Egypt Cup	core	1	G1:CORE взрослые мужские
+2306	SS-2306	Sultan Cup	core	1	G1:CORE взрослые мужские
+2307	SS-2307	Lebanon Cup	core	1	G1:CORE взрослые мужские
+2308	SS-2308	Girabola	core	1	G1:CORE взрослые мужские
+2353	SS-2353	Tanzanian Premier League	core	1	G1:CORE взрослые мужские
+2354	SS-2354	SAFF Championship	core	1	G1:CORE взрослые мужские
+2736	SS-2736	King's Cup	core	1	G1:CORE взрослые мужские
+3076	SS-3076	SheBelieves Cup	women	9	G1:W женские/смешанные
+3079	SS-3079	CFA Super Cup	core	1	G1:CORE взрослые мужские
+3080	SS-3080	Presidents Cup	core	1	G1:CORE взрослые мужские
+3087	SS-3087	Vietnam Cup	core	1	G1:CORE взрослые мужские
+9230	SS-9230	Canadian Championship	core	1	G1:CORE взрослые мужские
+9355	SS-9355	Toto Cup Al	core	1	G1:CORE взрослые мужские
+9356	SS-9356	Toto Cup Leumit	core	1	G1:CORE взрослые мужские
+9386	SS-9386	MSFL	core	1	G1:CORE взрослые мужские
+9387	SS-9387	CFL	core	1	G1:CORE взрослые мужские
+9413	SS-9413	AlbiMall Superliga	core	1	G1:CORE взрослые мужские
+9426	SS-9426	First League	core	1	G1:CORE взрослые мужские
+9459	SS-9459	Algerian Ligue 2	core	1	G1:CORE взрослые мужские
+10069	SS-10069	Kupa e Kosovës	core	1	G1:CORE взрослые мужские
+10093	SS-10093	Campeonato de Portugal	core	1	G1:CORE взрослые мужские
+10158	SS-10158	Copa Verde	core	1	G1:CORE взрослые мужские
+10166	SS-10166	Uganda Premier League	core	1	G1:CORE взрослые мужские
+10240	SS-10240	LigaPro Serie B	core	1	G1:CORE взрослые мужские
+10268	SS-10268	K3 League	core	1	G1:CORE взрослые мужские
+10291	SS-10291	Hong Kong FA Cup	core	1	G1:CORE взрослые мужские
+10294	SS-10294	Alagoano	core	1	G1:CORE взрослые мужские
+10295	SS-10295	Paraibano	core	1	G1:CORE взрослые мужские
+10297	SS-10297	Liga 2	core	1	G1:CORE взрослые мужские
+10309	SS-10309	Iceland 2. deild	core	1	G1:CORE взрослые мужские
+10326	SS-10326	Brasileirão Série D	core	1	G1:CORE взрослые мужские
+10381	SS-10381	Chinese League 2	core	1	G1:CORE взрослые мужские
+10383	SS-10383	Copa Paulista	core	1	G1:CORE взрослые мужские
+10416	SS-10416	King's Cup	core	1	G1:CORE взрослые мужские
+10511	SS-10511	Thai League 2	core	1	G1:CORE взрослые мужские
+10526	SS-10526	Hong Kong 1st Division	core	1	G1:CORE взрослые мужские
+10528	SS-10528	Copa Venezuela	core	1	G1:CORE взрослые мужские
+10533	SS-10533	Liga Primera de Nicaragua	core	1	G1:CORE взрослые мужские
+10535	SS-10535	Myanmar National League	core	1	G1:CORE взрослые мужские
+10536	SS-10536	Egyptian Second Division A	core	1	G1:CORE взрослые мужские
+10554	SS-10554	Botola Pro 2	core	1	G1:CORE взрослые мужские
+10608	SS-10608	Rwanda Premier League	core	1	G1:CORE взрослые мужские
+10618	SS-10618	World Championship Qual., Inter-Confederation	core	1	G1:CORE взрослые мужские
+10619	SS-10619	First Division League	core	1	G1:CORE взрослые мужские
+10633	SS-10633	Tunisian Ligue Professionnelle 2	core	1	G1:CORE взрослые мужские
+10636	SS-10636	Premier Football League	core	1	G1:CORE взрослые мужские
+10639	SS-10639	Algerian Super Cup	core	1	G1:CORE взрослые мужские
+10641	SS-10641	Division 2, Promotion Round	core	1	G1:CORE взрослые мужские
+10665	SS-10665	UAE 1st Division	core	1	G1:CORE взрослые мужские
+10741	SS-10741	Cambodian Premier League	core	1	G1:CORE взрослые мужские
+10756	SS-10756	Superliga de Colombia	core	1	G1:CORE взрослые мужские
+10772	SS-10772	Copinha	core	1	G1:CORE взрослые мужские
+10783	SS-10783	UEFA Nations League	core	1	G1:CORE взрослые мужские
+10784	SS-10784	Congo Ligue 1	core	1	G1:CORE взрослые мужские
+11033	SS-11033	Zimbabwe Premier Soccer League	core	1	G1:CORE взрослые мужские
+11058	SS-11058	Super Cup India	core	1	G1:CORE взрослые мужские
+11082	SS-11082	3rd Division, Group 6	core	1	G1:CORE взрослые мужские
+11083	SS-11083	3rd Division, Group 3	core	1	G1:CORE взрослые мужские
+11084	SS-11084	3rd Division, Group 1	core	1	G1:CORE взрослые мужские
+11085	SS-11085	2nd Division, Group 1	core	1	G1:CORE взрослые мужские
+11086	SS-11086	3rd Division, Group 2	core	1	G1:CORE взрослые мужские
+11087	SS-11087	3rd Division, Group 4	core	1	G1:CORE взрослые мужские
+11088	SS-11088	3rd Division, Group 5	core	1	G1:CORE взрослые мужские
+11089	SS-11089	2nd Division Playoffs	core	1	G1:CORE взрослые мужские
+11090	SS-11090	2nd Division, Group 2	core	1	G1:CORE взрослые мужские
+11126	SS-11126	Copa de SM La Reina	women	9	G1:W женские/смешанные
+11315	SS-11315	Betclic 3. Liga, Group 3	core	1	G1:CORE взрослые мужские
+11316	SS-11316	Betclic 3. Liga, Group 1	core	1	G1:CORE взрослые мужские
+11317	SS-11317	Betclic 3. Liga, Group 2	core	1	G1:CORE взрослые мужские
+11318	SS-11318	Betclic 3. Liga, Group 4	core	1	G1:CORE взрослые мужские
+11338	SS-11338	Azadegan League	core	1	G1:CORE взрослые мужские
+11386	SS-11386	Primera C Metropolitana	core	1	G1:CORE взрослые мужские
+11402	SS-11402	Tweede Divisie	core	1	G1:CORE взрослые мужские
+11415	SS-11415	Nesine 3. Lig, Grup 3	core	1	G1:CORE взрослые мужские
+11416	SS-11416	Nesine 3. Lig, Grup 2	core	1	G1:CORE взрослые мужские
+11417	SS-11417	Nesine 3. Lig, Grup 1	core	1	G1:CORE взрослые мужские
+11420	SS-11420	Botswana Premier League	core	1	G1:CORE взрослые мужские
+11445	SS-11445	Serie C, Girone A	core	1	G1:CORE взрослые мужские
+11446	SS-11446	Serie C, Girone C	core	1	G1:CORE взрослые мужские
+11447	SS-11447	Serie C, Girone B	core	1	G1:CORE взрослые мужские
+11452	SS-11452	Serie C, Playoffs	core	1	G1:CORE взрослые мужские
+11454	SS-11454	Campeones Cup	core	1	G1:CORE взрослые мужские
+11497	SS-11497	Hazfi Cup	core	1	G1:CORE взрослые мужские
+11509	SS-11509	Kakkonen Playoffs	core	1	G1:CORE взрослые мужские
+11532	SS-11532	Primera División, Clausura	core	1	G1:CORE взрослые мужские
+11533	SS-11533	Liga Panameña de Fútbol, Clausura	core	1	G1:CORE взрослые мужские
+11534	SS-11534	Liga Panameña de Fútbol, Apertura	core	1	G1:CORE взрослые мужские
+11535	SS-11535	Primera División, Apertura	core	1	G1:CORE взрослые мужские
+11536	SS-11536	Primera A, Finalización	core	1	G1:CORE взрослые мужские
+11537	SS-11537	Primera División, Apertura	core	1	G1:CORE взрослые мужские
+11539	SS-11539	Primera A	core	1	G1:CORE взрослые мужские
+11540	SS-11540	Primera División, Apertura	core	1	G1:CORE взрослые мужские
+11541	SS-11541	Primera División	core	1	G1:CORE взрослые мужские
+11542	SS-11542	Primera División, Clausura	core	1	G1:CORE взрослые мужские
+11611	SS-11611	Liga de Expansión MX, Apertura	core	1	G1:CORE взрослые мужские
+11612	SS-11612	Liga de Expansión MX, Clausura	core	1	G1:CORE взрослые мужские
+11613	SS-11613	Liga Hondubet, Apertura	core	1	G1:CORE взрослые мужские
+11614	SS-11614	Liga Hondubet, Clausura	core	1	G1:CORE взрослые мужские
+11615	SS-11615	Liga Nacional de Fútbol de Guatemala, Clausura	core	1	G1:CORE взрослые мужские
+11617	SS-11617	Ettan, Relegation/Promotion	core	1	G1:CORE взрослые мужские
+11618	SS-11618	Copa Federación	core	1	G1:CORE взрослые мужские
+11619	SS-11619	Liga Nacional de Fútbol de Guatemala, Apertura	core	1	G1:CORE взрослые мужские
+11620	SS-11620	Liga MX, Clausura	core	1	G1:CORE взрослые мужские
+11621	SS-11621	Liga MX, Apertura	core	1	G1:CORE взрослые мужские
+11653	SS-11653	Liga de Primera	core	1	G1:CORE взрослые мужские
+11663	SS-11663	Potiguar, 1ª Divisão	core	1	G1:CORE взрослые мужские
+11664	SS-11664	Maranhense	core	1	G1:CORE взрослые мужские
+11665	SS-11665	Sergipano	core	1	G1:CORE взрослые мужские
+11669	SS-11669	Paraense	core	1	G1:CORE взрослые мужские
+11670	SS-11670	Mato-Grossense	core	1	G1:CORE взрослые мужские
+11671	SS-11671	Liga de Ascenso, Apertura	core	1	G1:CORE взрослые мужские
+11672	SS-11672	Liga de Ascenso, Clausura	core	1	G1:CORE взрослые мужские
+11679	SS-11679	Sul-Mato-Grossense	core	1	G1:CORE взрослые мужские
+11682	SS-11682	Brasiliense	core	1	G1:CORE взрослые мужские
+11702	SS-11702	Amazonense	core	1	G1:CORE взрослые мужские
+11705	SS-11705	Supercopa Uruguaya	core	1	G1:CORE взрослые мужские
+13331	SS-13331	Bangladesh Football League	core	1	G1:CORE взрослые мужские
+13353	SS-13353	Piauiense	core	1	G1:CORE взрослые мужские
+13361	SS-13361	Jordan 1st Division	core	1	G1:CORE взрослые мужские
+13362	SS-13362	USL League One	core	1	G1:CORE взрослые мужские
+13363	SS-13363	USL Championship	core	1	G1:CORE взрослые мужские
+13383	SS-13383	West Bank Cup	core	1	G1:CORE взрослые мужские
+13450	SS-13450	NPSL	core	1	G1:CORE взрослые мужские
+13470	SS-13470	Canadian Premier League	core	1	G1:CORE взрослые мужские
+13471	SS-13471	Gaza Strip Cup	core	1	G1:CORE взрослые мужские
+13474	SS-13474	Malaysia FA Cup	core	1	G1:CORE взрослые мужские
+13475	SS-13475	Copa de la Liga Profesional	core	1	G1:CORE взрослые мужские
+13546	SS-13546	USL League Two	core	1	G1:CORE взрослые мужские
+13578	SS-13578	Iceland 3. deild	core	1	G1:CORE взрослые мужские
+13579	SS-13579	Serie C, Play-out	core	1	G1:CORE взрослые мужские
+13614	SS-13614	Copa Paraguay	core	1	G1:CORE взрослые мужские
+13668	SS-13668	Amapazão	core	1	G1:CORE взрослые мужские
+13684	SS-13684	Copa Ecuador	core	1	G1:CORE взрослые мужские
+13685	SS-13685	Copa Bicentenario	core	1	G1:CORE взрослые мужские
+13774	SS-13774	Black Label Cup	core	1	G1:CORE взрослые мужские
+13783	SS-13783	Leagues Cup	core	1	G1:CORE взрослые мужские
+13820	SS-13820	Cymru North	core	1	G1:CORE взрослые мужские
+13821	SS-13821	Cymru South	core	1	G1:CORE взрослые мужские
+13998	SS-13998	Arab Club Champions Cup	core	1	G1:CORE взрослые мужские
+14090	SS-14090	Torneo Federal A	core	1	G1:CORE взрослые мужские
+14100	SS-14100	CONCACAF Nations League	core	1	G1:CORE взрослые мужские
+14101	SS-14101	Primera D Metropolitana	core	1	G1:CORE взрослые мужские
+14126	SS-14126	Federation Cup	core	1	G1:CORE взрослые мужские
+14564	SS-14564	Kuwait Super Cup	core	1	G1:CORE взрослые мужские
+14602	SS-14602	Supercopa do Brasil	core	1	G1:CORE взрослые мужские
+14603	SS-14603	Supercopa Peruana	core	1	G1:CORE взрослые мужские
+14609	SS-14609	CONMEBOL Pre-Olympic	core	1	G1:CORE взрослые мужские
+14627	SS-14627	Qatar Cup	core	1	G1:CORE взрослые мужские
+14650	SS-14650	Capixaba	core	1	G1:CORE взрослые мужские
+14658	SS-14658	Rondoniense	core	1	G1:CORE взрослые мужские
+14659	SS-14659	Acreano	core	1	G1:CORE взрослые мужские
+14660	SS-14660	Supercopa Ecuador	core	1	G1:CORE взрослые мужские
+14686	SS-14686	Tocantinense	core	1	G1:CORE взрослые мужские
+14688	SS-14688	Egyptian Supercup	core	1	G1:CORE взрослые мужские
+14710	SS-14710	Emir Cup	core	1	G1:CORE взрослые мужские
+14713	SS-14713	Cupa Federației	core	1	G1:CORE взрослые мужские
+14733	SS-14733	Roraimense	core	1	G1:CORE взрослые мужские
+14734	SS-14734	Tunisian Super Cup	core	1	G1:CORE взрослые мужские
+14756	SS-14756	Liga Pro FIFA20 - 12 mins play	esoccer	0	G1:3 шоу/киберфутбол
+14762	SS-14762	Battle Champions League FIFA20 - 8 mins play	esoccer	0	G1:3 шоу/киберфутбол
+14763	SS-14763	Battle Champions League B FIFA20 - 8 mins play	esoccer	0	G1:3 шоу/киберфутбол
+14769	SS-14769	eLigaMX FIFA 2020 - 12  mins play	esoccer	0	G1:3 шоу/киберфутбол
+15938	SS-15938	Nesine 3. Lig, Grup 4	core	1	G1:CORE взрослые мужские
+15946	SS-15946	NCAA	student	0	G1:1 студенческие
+16353	SS-16353	Liga Pro FIFA21 - 12 mins play	esoccer	0	G1:3 шоу/киберфутбол
+16437	SS-16437	Digicel Premier League	core	1	G1:CORE взрослые мужские
+16439	SS-16439	Telekom S-League	core	1	G1:CORE взрослые мужские
+16462	SS-16462	Hrvatski Telekom eLiga Dinamo - Club Playoffs	esoccer	0	G1:3 шоу/киберфутбол
+16463	SS-16463	Hrvatski Telekom eLiga Hajduk - Club Playoffs	esoccer	0	G1:3 шоу/киберфутбол
+16464	SS-16464	Hrvatski Telekom eLiga Osijek - Club Playoffs	esoccer	0	G1:3 шоу/киберфутбол
+16465	SS-16465	Hrvatski Telekom eLiga Rijeka - Club Playoffs	esoccer	0	G1:3 шоу/киберфутбол
+16497	SS-16497	Hrvatski Telekom eLiga	esoccer	0	G1:3 шоу/киберфутбол
+16504	SS-16504	Gozo Football League First Division	core	1	G1:CORE взрослые мужские
+16508	SS-16508	Srpska Liga Beograd	core	1	G1:CORE взрослые мужские
+16509	SS-16509	Srpska Liga Istok	core	1	G1:CORE взрослые мужские
+16510	SS-16510	TAŠ BET Srpska Liga Vojvodina	core	1	G1:CORE взрослые мужские
+16511	SS-16511	Srpska Liga Zapad	core	1	G1:CORE взрослые мужские
+16514	SS-16514	Gozo Football League Second Division	core	1	G1:CORE взрослые мужские
+16527	SS-16527	National Super League	core	1	G1:CORE взрослые мужские
+16540	SS-16540	FKF National Super League	core	1	G1:CORE взрослые мужские
+16554	SS-16554	Dhivehi Premier League	core	1	G1:CORE взрослые мужские
+16589	SS-16589	Andorran Supercup	core	1	G1:CORE взрослые мужские
+16601	SS-16601	Ethiopian Premier League	core	1	G1:CORE взрослые мужские
+16610	SS-16610	GFF First Division	core	1	G1:CORE взрослые мужские
+16612	SS-16612	National Division One	core	1	C6:gender-unknown/no-marker
+16640	SS-16640	Championship League	core	1	G1:CORE взрослые мужские
+16641	SS-16641	Premier League	core	1	G1:CORE взрослые мужские
+16642	SS-16642	Moçambola	core	1	G1:CORE взрослые мужские
+16663	SS-16663	Primus League	core	1	G1:CORE взрослые мужские
+16672	SS-16672	Kategoria e Dytë	core	1	G1:CORE взрослые мужские
+16676	SS-16676	NB III Kelet	core	1	G1:CORE взрослые мужские
+16679	SS-16679	NB III Közép	core	1	G1:CORE взрослые мужские
+16682	SS-16682	NB III Nyugat	core	1	G1:CORE взрослые мужские
+16702	SS-16702	Liga e Dytë	core	1	G1:CORE взрослые мужские
+16704	SS-16704	Promé Divishon	core	1	G1:CORE взрослые мужские
+16721	SS-16721	AFA Senior Male League	core	1	G1:CORE взрослые мужские
+16732	SS-16732	SKNFA Premier League	core	1	G1:CORE взрослые мужские
+16733	SS-16733	Regional 1	amateur	9	G1:2 региональные/любительские
+16736	SS-16736	División Profesional	core	1	G1:CORE взрослые мужские
+16753	SS-16753	SKNFA Division 1	core	1	G1:CORE взрослые мужские
+16779	SS-16779	Superscore Liga 3 Seria 4	core	1	G1:CORE взрослые мужские
+16787	SS-16787	Superscore Liga 3 Seria 5	core	1	G1:CORE взрослые мужские
+16789	SS-16789	Georgia Liga 3	core	1	G1:CORE взрослые мужские
+16794	SS-16794	Kategoria e Tretë	core	1	G1:CORE взрослые мужские
+16796	SS-16796	Superscore Liga 3 Seria 8	core	1	G1:CORE взрослые мужские
+16797	SS-16797	Superscore Liga 3 Seria 1	core	1	G1:CORE взрослые мужские
+16804	SS-16804	Superscore Liga 3 Seria 2	core	1	G1:CORE взрослые мужские
+16809	SS-16809	Superscore Liga 3 Seria 6	core	1	G1:CORE взрослые мужские
+16810	SS-16810	LFA First Division	core	1	G1:CORE взрослые мужские
+16813	SS-16813	Lao League	core	1	G1:CORE взрослые мужские
+16816	SS-16816	Superscore Liga 3 Seria 9	core	1	G1:CORE взрослые мужские
+16817	SS-16817	Tajikistan Higher League	core	1	G1:CORE взрослые мужские
+16822	SS-16822	Superscore Liga 3 Seria 10	core	1	G1:CORE взрослые мужские
+16826	SS-16826	Superscore Liga 3 Seria 3	core	1	G1:CORE взрослые мужские
+16892	SS-16892	Superscore Liga 3 Seria 7	core	1	G1:CORE взрослые мужские
+16896	SS-16896	QFA Cup	core	1	G1:CORE взрослые мужские
+16911	SS-16911	Illicocash Ligue 1	core	1	G1:CORE взрослые мужские
+16914	SS-16914	NCAA Division I National Championship	student	0	G1:1 студенческие
+16948	SS-16948	Premier League	core	1	G1:CORE взрослые мужские
+16950	SS-16950	Sierra Leone National Premier League	core	1	G1:CORE взрослые мужские
+17015	SS-17015	UEFA Conference League	core	1	G1:CORE взрослые мужские
+17017	SS-17017	Super League	core	1	G1:CORE взрослые мужские
+17027	SS-17027	Liga 4	core	1	G1:CORE взрослые мужские
+17034	SS-17034	Arab Cup	core	1	G1:CORE взрослые мужские
+17072	SS-17072	CampoBet 3 Division	core	1	G1:CORE взрослые мужские
+17073	SS-17073	Primera Federación	core	1	G1:CORE взрослые мужские
+17101	SS-17101	Liga 3	core	1	G1:CORE взрослые мужские
+17123	SS-17123	Memorijalni turnir Mladen Ramljak	core	1	G1:CORE взрослые мужские
+17212	SS-17212	1. HNLŽ	women	9	G1:W женские/смешанные
+17243	SS-17243	Syrian Premier League	core	1	G1:CORE взрослые мужские
+17351	SS-17351	National Division Two	core	1	C6:gender-unknown/no-marker
+18213	SS-18213	LFA Segunda Divisão	core	1	G1:CORE взрослые мужские
+18229	SS-18229	Ýokary Liga	core	1	G1:CORE взрослые мужские
+18235	SS-18235	LFA Primeira Divisão	core	1	G1:CORE взрослые мужские
+18272	SS-18272	Campeonato Nacional	core	1	G1:CORE взрослые мужские
+18415	SS-18415	Supercopa Paraguay	core	1	G1:CORE взрослые мужские
+18429	SS-18429	First Division	core	1	G1:CORE взрослые мужские
+18436	SS-18436	Trofeo de Campeones de la Liga Profesional	core	1	G1:CORE взрослые мужские
+18452	SS-18452	MTN Premier League	core	1	G1:CORE взрослые мужские
+18477	SS-18477	Ligue 1	core	1	G1:CORE взрослые мужские
+18491	SS-18491	Egyptian League Cup	core	1	G1:CORE взрослые мужские
+18526	SS-18526	Iranian Super Cup	core	1	G1:CORE взрослые мужские
+18531	SS-18531	Singapore Community Shield	core	1	G1:2 → core (суперкубок, не любители)
+18537	SS-18537	Libyan Cup	core	1	G1:CORE взрослые мужские
+18539	SS-18539	Hun Sen Cup	core	1	G1:CORE взрослые мужские
+18559	SS-18559	Uzbekistan Pro League	core	1	G1:CORE взрослые мужские
+18576	SS-18576	SVB Eerste Divisie	core	1	G1:CORE взрослые мужские
+18593	SS-18593	Torneo Amistoso De Verano	core	1	friendly→core (карта)
+18641	SS-18641	MLS Next Pro	core	1	G1:CORE взрослые мужские
+18642	SS-18642	NISA	core	1	G1:CORE взрослые мужские
+18643	SS-18643	Gaúcho, Série A2	core	1	G1:CORE взрослые мужские
+18644	SS-18644	Carioca, Série A2	core	1	G1:CORE взрослые мужские
+18653	SS-18653	WE-League	women	9	G1:W женские/смешанные
+18654	SS-18654	Finalissima	core	1	G1:CORE взрослые мужские
+18668	SS-18668	Jordan Super Cup	core	1	G1:CORE взрослые мужские
+18725	SS-18725	Mongolian Premier League	core	1	G1:CORE взрослые мужские
+18728	SS-18728	Campeonato Nacional	core	1	G1:CORE взрослые мужские
+18834	SS-18834	Segunda División	core	1	G1:CORE взрослые мужские
+18846	SS-18846	Superscore Liga 3 Baraj Promovare	core	1	G1:CORE взрослые мужские
+18874	SS-18874	Championship	core	1	G1:CORE взрослые мужские
+18877	SS-18877	Copa Uruguay	core	1	G1:CORE взрослые мужские
+18878	SS-18878	National Foot 1	core	1	G1:CORE взрослые мужские
+18890	SS-18890	USL W League	women	9	G1:W женские/смешанные
+18894	SS-18894	First Division	core	1	G1:CORE взрослые мужские
+18940	SS-18940	Bahraini Super Cup	core	1	G1:CORE взрослые мужские
+19011	SS-19011	Copa Simón Bolívar	core	1	G1:CORE взрослые мужские
+19034	SS-19034	Upolu National League	core	1	G1:CORE взрослые мужские
+19051	SS-19051	3. NL - Sjever	core	1	G1:CORE взрослые мужские
+19114	SS-19114	3. NL - Istok	core	1	G1:CORE взрослые мужские
+19115	SS-19115	3. NL - Zapad	core	1	G1:CORE взрослые мужские
+19122	SS-19122	2. NL	core	1	G1:CORE взрослые мужские
+19124	SS-19124	3. NL - Jug	core	1	G1:CORE взрослые мужские
+19132	SS-19132	3. NL - Centar	core	1	G1:CORE взрослые мужские
+19141	SS-19141	ISA Malta	core	1	G1:CORE взрослые мужские
+19220	SS-19220	Goiano, Divisão de Acesso	core	1	G1:CORE взрослые мужские
+19345	SS-19345	Division di Honor	core	1	G1:CORE взрослые мужские
+19377	SS-19377	Ligue B Nationale	core	1	G1:CORE взрослые мужские
+19410	SS-19410	FUFA Big League	core	1	G1:CORE взрослые мужские
+19415	SS-19415	PBZ Premier League	core	1	G1:CORE взрослые мужские
+19511	SS-19511	BFA Senior League	core	1	C6:gender-unknown/no-marker
+19535	SS-19535	Gaza Strip Division 1	core	1	G1:CORE взрослые мужские
+19633	SS-19633	Tocantinense, 2ª Divisão	core	1	G1:CORE взрослые мужские
+19752	SS-19752	Ghana Division One	core	1	G1:CORE взрослые мужские
+19790	SS-19790	ABFA Premier League	core	1	C6:gender-unknown/no-marker
+19812	SS-19812	Recopa Catarinense	core	1	G1:CORE взрослые мужские
+19813	SS-19813	Copa Alagoas	core	1	G1:CORE взрослые мужские
+19814	SS-19814	Recopa Gaúcha	core	1	G1:CORE взрослые мужские
+19841	SS-19841	Supercopa Internacional	core	1	G1:CORE взрослые мужские
+19850	SS-19850	Recopa Mineira	core	1	G1:CORE взрослые мужские
+19855	SS-19855	Cearense, Série B	core	1	G1:CORE взрослые мужские
+19886	SS-19886	Esiliiga B	core	1	G1:CORE взрослые мужские
+19889	SS-19889	Vincy Premier League	core	1	G1:CORE взрослые мужские
+19891	SS-19891	Copa Division Profesional	core	1	G1:CORE взрослые мужские
+19931	SS-19931	Rock Cup	core	1	G1:CORE взрослые мужские
+19945	SS-19945	Régionale 1	amateur	9	G1:2 региональные/любительские
+19950	SS-19950	BVIFA National League	core	1	C6:gender-unknown/no-marker
+19969	SS-19969	Segunda División	core	1	G1:CORE взрослые мужские
+19980	SS-19980	Druha Liga	core	1	G1:CORE взрослые мужские
+20001	SS-20001	Coppa Italia Serie D	core	1	G1:CORE взрослые мужские
+20023	SS-20023	Primera Divisional C	amateur	9	C6:gender-unknown/amateur/regional/school
+20044	SS-20044	Zain First Division	core	1	G1:CORE взрослые мужские
+20047	SS-20047	Mozzart Bet Cup	core	1	G1:CORE взрослые мужские
+20052	SS-20052	Qatar League 2	core	1	G1:CORE взрослые мужские
+20058	SS-20058	Paulista, Série A4	core	1	G1:CORE взрослые мужские
+20070	SS-20070	Catarinense, Série B	core	1	G1:CORE взрослые мужские
+20077	SS-20077	Regional League	amateur	9	C6:gender-unknown/amateur/regional/school
+20096	SS-20096	Paranaense, 2ª Divisão	core	1	G1:CORE взрослые мужские
+20122	SS-20122	Pure Play Football League	core	1	G1:CORE взрослые мужские
+20161	SS-20161	VPL 1	core	1	G1:CORE взрослые мужские
+20208	SS-20208	BFA Premier League	core	1	G1:CORE взрослые мужские
+20209	SS-20209	Liga Dominicana de Fútbol	core	1	G1:CORE взрослые мужские
+20210	SS-20210	Budweiser G-League	core	1	G1:CORE взрослые мужские
+20220	SS-20220	FKF Division Two League	core	1	G1:CORE взрослые мужские
+20238	SS-20238	Elite League	core	1	G1:CORE взрослые мужские
+20239	SS-20239	Carioca, Série C	core	1	G1:CORE взрослые мужские
+20290	SS-20290	Inter Community Football League	amateur	9	C6:gender-unknown/amateur/regional/school
+20311	SS-20311	British Columbia Premier League	core	1	G1:CORE взрослые мужские
+20342	SS-20342	Ligue1 Québec	core	1	G1:CORE взрослые мужские
+20348	SS-20348	Paraense, Série A3	core	1	G1:CORE взрослые мужские
+20352	SS-20352	Baiano, Série B	core	1	G1:CORE взрослые мужские
+20367	SS-20367	Blue Stars	core	1	G1:CORE взрослые мужские
+20370	SS-20370	Ontario Premier League 1	core	1	G1:CORE взрослые мужские
+20434	SS-20434	UAE 2nd Division	core	1	G1:CORE взрослые мужские
+20439	SS-20439	UAE 3rd Division	core	1	G1:CORE взрослые мужские
+20464	SS-20464	Second Division	core	1	C6:gender-unknown/no-marker
+20472	SS-20472	Alagoano, Série B	core	1	G1:CORE взрослые мужские
+20481	SS-20481	Third Division - Tripoli	core	1	C6:gender-unknown/no-marker
+20482	SS-20482	Third Division - South	core	1	G1:CORE взрослые мужские
+20485	SS-20485	PVFA Super League	core	1	G1:CORE взрослые мужские
+20494	SS-20494	Third Division - West	core	1	C6:gender-unknown/no-marker
+20495	SS-20495	Third Division - Al Jabal Alakhdar	core	1	C6:gender-unknown/no-marker
+20513	SS-20513	Cearense, Série C	core	1	G1:CORE взрослые мужские
+20546	SS-20546	Taça Fares Lopes	core	1	G1:CORE взрослые мужские
+20547	SS-20547	Copa Rio	core	1	G1:CORE взрослые мужские
+20584	SS-20584	Paraense, Série A2	core	1	G1:CORE взрослые мужские
+20609	SS-20609	Third Division - Tobruk	core	1	C6:gender-unknown/no-marker
+20620	SS-20620	Copa FGF	core	1	C6:gender-unknown/no-marker
+20621	SS-20621	NIFL Charity Shield	show	9	G1:3 шоу/киберфутбол
+20695	SS-20695	CONCACAF Central American Cup	core	1	G1:CORE взрослые мужские
+20706	SS-20706	Second League, Division A	core	1	G1:CORE взрослые мужские
+20708	SS-20708	UEFA-CONMEBOL Club Challenge	core	1	G1:CORE взрослые мужские
+20718	SS-20718	National Soccer League	core	1	G1:CORE взрослые мужские
+20748	SS-20748	Federation Cup	core	1	G1:CORE взрослые мужские
+20750	SS-20750	Mineiro, Segunda Divisão	core	1	G1:CORE взрослые мужские
+20757	SS-20757	Third Division	core	1	C6:gender-unknown/no-marker
+20785	SS-20785	CFU Club Shield	core	1	G1:CORE взрослые мужские
+20806	SS-20806	Capixaba, Série B	core	1	G1:CORE взрослые мужские
+20809	SS-20809	Durand Cup	core	1	G1:CORE взрослые мужские
+20825	SS-20825	Sergipano, Série A2	core	1	G1:CORE взрослые мужские
+20827	SS-20827	Piala Malaysia	core	1	G1:CORE взрослые мужские
+20862	SS-20862	Gamma Ethniki	core	1	G1:CORE взрослые мужские
+20870	SS-20870	Liga Premier Serie A	core	1	G1:CORE взрослые мужские
+20871	SS-20871	Liga Premier Serie B	core	1	G1:CORE взрослые мужские
+20891	SS-20891	Maranhense, Série B	core	1	G1:CORE взрослые мужские
+20893	SS-20893	Paraibano, 2ª Divisão	core	1	G1:CORE взрослые мужские
+20898	SS-20898	Copa Santa Catarina	core	1	G1:CORE взрослые мужские
+20902	SS-20902	Carioca,  Série B1	core	1	G1:CORE взрослые мужские
+20931	SS-20931	CONCACAF Caribbean Cup	core	1	G1:CORE взрослые мужские
+20938	SS-20938	Divisional D AUF	core	1	G1:CORE взрослые мужские
+20945	SS-20945	Divize A	core	1	C6:gender-unknown/no-marker
+20946	SS-20946	Divize B	core	1	G1:CORE взрослые мужские
+20947	SS-20947	Divize C	core	1	G1:CORE взрослые мужские
+20948	SS-20948	Divize D	core	1	G1:CORE взрослые мужские
+20949	SS-20949	Divize F	core	1	G1:CORE взрослые мужские
+20950	SS-20950	Divize E	core	1	G1:CORE взрослые мужские
+21028	SS-21028	Copa FMF	core	1	G1:CORE взрослые мужские
+21048	SS-21048	African Football League	core	1	G1:CORE взрослые мужские
+21050	SS-21050	İkinci Liqa	core	1	G1:CORE взрослые мужские
+21065	SS-21065	Catarinense, Série C	core	1	G1:CORE взрослые мужские
+21093	SS-21093	Coupe de France - Martinique	core	1	G1:CORE взрослые мужские
+21115	SS-21115	Premier League of Belize	core	1	G1:CORE взрослые мужские
+21133	SS-21133	Gaúcho, Série B	core	1	G1:CORE взрослые мужские
+21134	SS-21134	FFAS Senior League	core	1	C6:gender-unknown/no-marker
+21150	SS-21150	Potiguar, 2ª Divisão	core	1	G1:CORE взрослые мужские
+21151	SS-21151	Piauiense, Série B	core	1	G1:CORE взрослые мужские
+21155	SS-21155	Paraibano, 3ª Divisão	core	1	G1:CORE взрослые мужские
+21156	SS-21156	Rondoniense, Série B	core	1	G1:CORE взрослые мужские
+21158	SS-21158	Sul-Mato-Grossense, Série B	core	1	G1:CORE взрослые мужские
+21161	SS-21161	Pernambucano, Série A2	core	1	C6:gender-unknown/no-marker
+21191	SS-21191	Copa Perú	core	1	G1:CORE взрослые мужские
+21251	SS-21251	Pernambucano, Série A3	core	1	G1:CORE взрослые мужские
+21261	SS-21261	III Liiga	core	1	G1:CORE взрослые мужские
+21305	SS-21305	Copa Costa Rica	core	1	G1:CORE взрослые мужские
+21358	SS-21358	Debmarine Namibia Premiership	core	1	G1:CORE взрослые мужские
+21408	SS-21408	Trophée Gérard Janvion - R1	core	1	G1:CORE взрослые мужские
+21434	SS-21434	Malian Première Division	core	1	G1:CORE взрослые мужские
+21436	SS-21436	Division 1	core	1	G1:CORE взрослые мужские
+21450	SS-21450	TCIFA Premier League	core	1	G1:CORE взрослые мужские
+21490	SS-21490	Régionale 2	amateur	9	G1:2 региональные/любительские
+21491	SS-21491	Coupe de France - Guadeloupe Zone	core	1	G1:CORE взрослые мужские
+21531	SS-21531	Trophée Daniel Charles-Alfred - R2	core	1	G1:CORE взрослые мужские
+21532	SS-21532	IV Liiga	core	1	G1:CORE взрослые мужские
+21537	SS-21537	Round Cup	core	1	G1:CORE взрослые мужские
+21571	SS-21571	WFF Championship	women	9	C6:gender-unknown/women
+21677	SS-21677	Champions Dream	show	9	C6:gender-unknown/esoccer/show
+21684	SS-21684	Liga Guantánamo	core	1	C6:gender-unknown/no-marker
+21686	SS-21686	Supercopa Grão-Pará	core	1	G1:CORE взрослые мужские
+21769	SS-21769	Riyadh Season Cup	core	1	G1:CORE взрослые мужские
+21773	SS-21773	Premier League	core	1	G1:CORE взрослые мужские
+21779	SS-21779	Thai FA Cup	core	1	G1:CORE взрослые мужские
+21782	SS-21782	CRFA Division Two	core	1	G1:CORE взрослые мужские
+21792	SS-21792	Ligue 1 Vini	core	1	G1:CORE взрослые мужские
+21797	SS-21797	Coupe de Martinique	core	1	G1:CORE взрослые мужские
+21798	SS-21798	ERFA Division Two	core	1	G1:CORE взрослые мужские
+21804	SS-21804	Régionale 3	amateur	9	C6:gender-unknown/amateur/regional/school
+21826	SS-21826	CIFA Premier League	core	1	G1:CORE взрослые мужские
+21840	SS-21840	Coupe de Guadeloupe	core	1	G1:CORE взрослые мужские
+21851	SS-21851	Torneio Paraná de Verão	core	1	G1:CORE взрослые мужские
+21852	SS-21852	GEDFA Division Three	core	1	G1:CORE взрослые мужские
+21854	SS-21854	Copa Betico Croes	core	1	G1:CORE взрослые мужские
+21882	SS-21882	I-League 2	core	1	G1:CORE взрослые мужские
+21887	SS-21887	Mfantseman Division Three	core	1	C6:gender-unknown/no-marker
+21889	SS-21889	Reykjavík Cup	core	1	G1:CORE взрослые мужские
+21918	SS-21918	President's Cup	core	1	G1:CORE взрослые мужские
+21920	SS-21920	Régional 1	amateur	9	G1:2 региональные/любительские
+21927	SS-21927	Ykkösliigacup	core	1	G1:CORE взрослые мужские
+21929	SS-21929	Champion vs Champion	core	1	G1:CORE взрослые мужские
+21970	SS-21970	Coupe Vyv	core	1	G1:CORE взрослые мужские
+21976	SS-21976	CONCACAF W Gold Cup	women	9	C6:gender-unknown/women
+21979	SS-21979	Comoros Premier League	core	1	G1:CORE взрослые мужские
+21996	SS-21996	Queensland Premier League 1	core	1	G1:CORE взрослые мужские
+22001	SS-22001	Ontario Premier League 2	core	1	G1:CORE взрослые мужские
+22002	SS-22002	Alberta Premier League	core	1	G1:CORE взрослые мужские
+22005	SS-22005	Kings League Mexico	show	9	G1:3 шоу/киберфутбол
+22020	SS-22020	Ykkönen	core	1	G1:CORE взрослые мужские
+22031	SS-22031	Second Division - Gulf of Sirte	core	1	C6:gender-unknown/no-marker
+22077	SS-22077	GAED Division Three	core	1	C6:gender-unknown/no-marker
+22096	SS-22096	Super Cup	core	1	G1:CORE взрослые мужские
+22106	SS-22106	Première Division de N’Djaména	core	1	C6:gender-unknown/no-marker
+22107	SS-22107	Deuxième Division de N’Djaména	core	1	G1:CORE взрослые мужские
+22114	SS-22114	USVI Federation Cup	core	1	G1:CORE взрослые мужские
+22115	SS-22115	NLO Division One League	core	1	G1:CORE взрослые мужские
+22136	SS-22136	Nigeria National League	core	1	G1:CORE взрослые мужские
+22139	SS-22139	Vtoraya Liga	core	1	G1:CORE взрослые мужские
+22161	SS-22161	LDF 2da División Expansión	core	1	C6:gender-unknown/no-marker
+22167	SS-22167	BARFA Division Two	core	1	G1:CORE взрослые мужские
+22195	SS-22195	Väikesed Karikavõistlused	core	1	G1:CORE взрослые мужские
+22197	SS-22197	GARFA Division Two	core	1	C6:gender-unknown/no-marker
+22198	SS-22198	Copa Grão Pará	core	1	G1:CORE взрослые мужские
+22244	SS-22244	Ethiopian Higher League	core	1	G1:CORE взрослые мужские
+22249	SS-22249	Ontario League Cup	core	1	G1:CORE взрослые мужские
+22252	SS-22252	Mulan Football League	women	9	G1:W женские/смешанные
+22256	SS-22256	Taiwan Football Premier League	core	1	G1:CORE взрослые мужские
+22307	SS-22307	5stars Premier League	core	1	G1:CORE взрослые мужские
+22327	SS-22327	Paulista, Segunda Divisão	core	1	G1:CORE взрослые мужские
+22364	SS-22364	ML Foundation Division Three	core	1	C6:gender-unknown/no-marker
+22368	SS-22368	BARFA Cup	core	1	G1:CORE взрослые мужские
+22372	SS-22372	STOK Elite Division	core	1	G1:CORE взрослые мужские
+22382	SS-22382	USL Prinx Tires Cup	core	1	G1:CORE взрослые мужские
+22397	SS-22397	Bhutan Premier League	core	1	G1:CORE взрослые мужские
+22403	SS-22403	Premier League	core	1	G1:CORE взрослые мужские
+22430	SS-22430	Campeonato Nacional Formativo - Proyección	reserve	9	C6:gender-unknown/youth
+22431	SS-22431	Campeonato Nacional Formativo - Sub 18	youth	9	C6:gender-unknown/youth
+22437	SS-22437	Kings World Cup Clubs	show	9	G1:3 шоу/киберфутбол
+22479	SS-22479	International Tournament "Vlatko Marković"	core	1	G1:CORE взрослые мужские
+22480	SS-22480	Eredivisie Cup	women	9	G1:W женские/смешанные
+22507	SS-22507	Yas Coupe de Madagascar	core	1	G1:CORE взрослые мужские
+22508	SS-22508	Cyprus Cup 3rd & 4th Division	core	1	G1:CORE взрослые мужские
+22512	SS-22512	BARFA Division Two Middle League	core	1	G1:CORE взрослые мужские
+22542	SS-22542	Celtiis Ligue Pro	core	1	C6:gender-unknown/no-marker
+22551	SS-22551	Kazakhstan League Cup	core	1	G1:CORE взрослые мужские
+22586	SS-22586	Georgia Regional League	amateur	9	G1:2 региональные/любительские
+22609	SS-22609	AMP vs Beta Squad Charity Match	show	9	G1:3 шоу/киберфутбол
+22632	SS-22632	GrønlandsBANKEN GM	core	1	C6:gender-unknown/no-marker
+22650	SS-22650	STOK Promotion Championship	core	1	G1:CORE взрослые мужские
+22711	SS-22711	Liga Nacional Sub-19	youth	9	G1:6 молодёжь/резерв
+22716	SS-22716	OFC Men's Nations Cup	core	1	G1:CORE взрослые мужские
+22733	SS-22733	Kyrgyzstan Top Liga	core	1	G1:CORE взрослые мужские
+22740	SS-22740	Liga A1	core	1	C6:gender-unknown/no-marker
+22758	SS-22758	Beamish Stout Munster Senior Premier Division	core	1	G1:CORE взрослые мужские
+22759	SS-22759	Primera División B	core	1	G1:CORE взрослые мужские
+22793	SS-22793	Mongolia Cup	core	1	G1:CORE взрослые мужские
+22795	SS-22795	AFC Challenge League	core	1	C6:gender-unknown/no-marker
+22799	SS-22799	Liga FUTVE 2	core	1	G1:CORE взрослые мужские
+22816	SS-22816	Amapazão, Série B	core	1	G1:CORE взрослые мужские
+22821	SS-22821	Malaysia MFL Cup	core	1	G1:CORE взрослые мужские
+22858	SS-22858	NLO Division Two League	core	1	G1:CORE взрослые мужские
+22948	SS-22948	COTIF Tournament	core	1	G1:CORE взрослые мужские
+22975	SS-22975	Costa Rican Supercup	core	1	G1:CORE взрослые мужские
+23013	SS-23013	Indonesia President's Cup	core	1	G1:CORE взрослые мужские
+23060	SS-23060	Myanmar League 2	core	1	G1:CORE взрослые мужские
+23098	SS-23098	TFA Major League	core	1	C6:gender-unknown/no-marker
+23229	SS-23229	Indonesia Championship	core	1	G1:CORE взрослые мужские
+23259	SS-23259	The Ondo Stars League	core	1	G1:CORE взрослые мужские
+23265	SS-23265	Liga Alef North	core	1	G1:CORE взрослые мужские
+23266	SS-23266	Liga Alef South	core	1	G1:CORE взрослые мужские
+23295	SS-23295	Trophée Yvon Lutbert	core	1	G1:CORE взрослые мужские
+23328	SS-23328	Prime League	women	9	C6:gender-unknown/women
+23341	SS-23341	CONCACAF W Champions Cup	women	9	C6:gender-unknown/women
+23458	SS-23458	Tournoi des Centres de Formation  Féminin	women	9	C6:gender-unknown/women
+23459	SS-23459	Tournoi des Centres de Formation	reserve	9	G1:6 молодёжь/резерв
+23461	SS-23461	3. MFL	core	1	C6:gender-unknown/no-marker
+23473	SS-23473	Second Division League	core	1	C6:gender-unknown/no-marker
+23504	SS-23504	Third Division League	core	1	G1:CORE взрослые мужские
+23521	SS-23521	I-League 3	core	1	G1:CORE взрослые мужские
+23538	SS-23538	Seychelles Premier League	core	1	G1:CORE взрослые мужские
+23603	SS-23603	IFC Adeyemi Football Championship	core	1	C6:gender-unknown/no-marker
+23607	SS-23607	Elford Alliyu Football League	core	1	G1:CORE взрослые мужские
+23619	SS-23619	Oluyole Local Football League	amateur	9	C6:gender-unknown/amateur/regional/school
+23663	SS-23663	Ibadan Football Council	core	1	G1:CORE взрослые мужские
+23674	SS-23674	FIFA Intercontinental Cup	core	1	G1:CORE взрослые мужские
+23694	SS-23694	MSL 1	core	1	G1:CORE взрослые мужские
+23696	SS-23696	South Africa Diski Challenge	core	1	G1:CORE взрослые мужские
+23701	SS-23701	WE League Cup	women	9	G1:W женские/смешанные
+23703	SS-23703	Super D1	core	1	G1:CORE взрослые мужские
+23798	SS-23798	Thailand League Cup	core	1	G1:CORE взрослые мужские
+23807	SS-23807	Premier Division	core	1	G1:CORE взрослые мужские
+23826	SS-23826	Tournoi Inter-Communes (Masculin)	amateur	9	G1:2 региональные/любительские
+23827	SS-23827	Tournoi Inter-Communes (Féminin)	women	9	C6:gender-unknown/women
+23848	SS-23848	Morocco Excellence Cup	core	1	G1:CORE взрослые мужские
+23986	SS-23986	Dynasty Scouting League	core	1	G1:CORE взрослые мужские
+23987	SS-23987	Gulf Club Champions League	core	1	G1:CORE взрослые мужские
+23998	SS-23998	Régional 2	amateur	9	G1:2 региональные/любительские
+24029	SS-24029	England National League Cup	core	1	G1:CORE взрослые мужские
+24040	SS-24040	Iraq Stars League	core	1	G1:CORE взрослые мужские
+24045	SS-24045	ASHDFA Division Three	core	1	G1:CORE взрослые мужские
+24111	SS-24111	Asaba Super Cup	core	1	G1:CORE взрослые мужские
+24172	SS-24172	Ardal Leagues	core	1	G1:CORE взрослые мужские
+24192	SS-24192	Santosh Trophy	core	1	G1:CORE взрослые мужские
+24194	SS-24194	Afghanistan Champions League	core	1	G1:CORE взрослые мужские
+24208	SS-24208	Liga de Tineret	youth	9	C6:gender-unknown/youth
+24213	SS-24213	Cupa de Tineret	reserve	9	G1:6 молодёжь/резерв
+24243	SS-24243	Afghanistan Premier League	core	1	G1:CORE взрослые мужские
+24249	SS-24249	Hong Kong 2nd Division	core	1	G1:CORE взрослые мужские
+24255	SS-24255	Republic Cup	core	1	G1:CORE взрослые мужские
+24278	SS-24278	Bangladesh Challenge Cup	core	1	G1:CORE взрослые мужские
+24285	SS-24285	Copa Paraná	youth	9	C6:gender-unknown/youth
+24295	SS-24295	Kadınlar 1.Ligi	women	9	C6:gender-unknown/women
+24333	SS-24333	Thai League 3 Cup	core	1	G1:CORE взрослые мужские
+24351	SS-24351	Bangladesh Federation Cup	core	1	G1:CORE взрослые мужские
+24374	SS-24374	CCMFA Division Three League	core	1	G1:CORE взрослые мужские
+24376	SS-24376	Kings World Cup Nations	show	9	G1:3 шоу/киберфутбол
+24377	SS-24377	Tano Annual Tournament	core	1	G1:CORE взрослые мужские
+24380	SS-24380	GA Division Three North	core	1	G1:CORE взрослые мужские
+24399	SS-24399	Hong Kong Sapling Cup	core	1	G1:CORE взрослые мужские
+24408	SS-24408	MFL Challenge Cup	core	1	G1:CORE взрослые мужские
+24423	SS-24423	Nationwide League One - Super 8	core	1	G1:CORE взрослые мужские
+24432	SS-24432	Indonesia Nusantara League	core	1	G1:CORE взрослые мужские
+24499	SS-24499	Copa de la LDF	core	1	G1:CORE взрослые мужские
+24544	SS-24544	Munster Senior Cup	core	1	G1:CORE взрослые мужские
+24561	SS-24561	Premier League	core	1	C6:gender-unknown/no-marker
+24631	SS-24631	Match for Hope	core	1	G1:CORE взрослые мужские
+24641	SS-24641	NSW League Two	core	1	G1:CORE взрослые мужские
+24666	SS-24666	Olumo Super Liga	core	1	G1:CORE взрослые мужские
+24715	SS-24715	Leinster Senior Cup	core	1	G1:CORE взрослые мужские
+24754	SS-24754	Nagaland Super League	core	1	C6:gender-unknown/no-marker
+24794	SS-24794	Liga de Ascenso	core	1	C6:gender-unknown/no-marker
+24883	SS-24883	Queensland Kappa Pro Series	core	1	G1:CORE взрослые мужские
+24914	SS-24914	Faroe Islands 2. Deild	core	1	G1:CORE взрослые мужские
+25030	SS-25030	Tajikistan Cup	core	1	G1:CORE взрослые мужские
+25033	SS-25033	Icelandic Men's Football League Cup B	core	1	G1:CORE взрослые мужские
+25049	SS-25049	Oman's 1st Division	core	1	G1:CORE взрослые мужские
+25050	SS-25050	Régional 1	amateur	9	G1:2 региональные/любительские
+25125	SS-25125	Icelandic Men's Football League Cup C	core	1	G1:CORE взрослые мужские
+25158	SS-25158	K4 League	core	1	G1:CORE взрослые мужские
+25186	SS-25186	Coupe de Polynesie	core	1	C6:gender-unknown/no-marker
+25187	SS-25187	Supercopa Venezuela	core	1	C6:gender-unknown/no-marker
+25247	SS-25247	Regional 2	amateur	9	G1:2 региональные/любительские
+25248	SS-25248	Regional 3	amateur	9	G1:2 региональные/любительские
+25273	SS-25273	Malta Challenge Cup	core	1	G1:CORE взрослые мужские
+25302	SS-25302	Faroe Islands Super Cup	core	1	G1:CORE взрослые мужские
+25312	SS-25312	Nepal Super League	core	1	G1:CORE взрослые мужские
+25376	SS-25376	FENIX Trophy	core	1	G1:CORE взрослые мужские
+25377	SS-25377	Iraqi FA Cup	core	1	G1:CORE взрослые мужские
+25382	SS-25382	AFFA Gənclər Liqası	reserve	9	G1:6 молодёжь/резерв
+25390	SS-25390	AEED Division Three	core	1	G1:CORE взрослые мужские
+25404	SS-25404	Rubaga Soccer League	core	1	G1:CORE взрослые мужские
+25478	SS-25478	Liga LFA Gane Betplay	core	1	G1:CORE взрослые мужские
+25479	SS-25479	Ascenso LFA Gane Betplay	core	1	G1:CORE взрослые мужские
+25480	SS-25480	Promoción LFA Gane Betplay	core	1	G1:CORE взрослые мужские
+25481	SS-25481	Liga Master LFA PRO	amateur	9	G1:2 региональные/любительские
+25485	SS-25485	The Lao Prime Minister Cup	core	1	G1:CORE взрослые мужские
+25489	SS-25489	Don Bosco Cup	core	1	G1:CORE взрослые мужские
+25492	SS-25492	Baller League UK	show	9	G1:3 шоу/киберфутбол
+25502	SS-25502	Nadeshiko League 2	women	9	G1:W женские/смешанные
+25509	SS-25509	NPL Northern Territory	core	1	G1:CORE взрослые мужские
+25519	SS-25519	Super Cup Mário Esteves Coluna	core	1	G1:CORE взрослые мужские
+25528	SS-25528	Tələbə Liqası	core	1	G1:CORE взрослые мужские
+25623	SS-25623	Türkiye Spor Yazarları Derneği Kupası	core	1	G1:CORE взрослые мужские
+25628	SS-25628	LMFPR Humberto Padrón, Primera División	core	1	G1:CORE взрослые мужские
+25629	SS-25629	LMFPR Humberto Padrón, Segunda División	core	1	G1:CORE взрослые мужские
+25630	SS-25630	Copa Corusso	core	1	G1:CORE взрослые мужские
+25633	SS-25633	Altero.lv LIIGA	core	1	G1:CORE взрослые мужские
+25635	SS-25635	Ligue2 Québec	core	1	G1:CORE взрослые мужские
+25649	SS-25649	Ingwenyama Cup	core	1	G1:CORE взрослые мужские
+25657	SS-25657	Legends Matches	show	9	C6:gender-unknown/esoccer/show
+25736	SS-25736	Ligue3 Québec	core	1	G1:CORE взрослые мужские
+25752	SS-25752	Maris Cup	core	1	G1:CORE взрослые мужские
+25788	SS-25788	DFA Premier League	core	1	G1:CORE взрослые мужские
+25846	SS-25846	ARFA Division 2 League	core	1	G1:CORE взрослые мужские
+25865	SS-25865	Nigeria Federation Cup	core	1	G1:CORE взрослые мужские
+25875	SS-25875	Samatta Cup	core	1	G1:CORE взрослые мужские
+25902	SS-25902	Malawi Super League	core	1	G1:CORE взрослые мужские
+25914	SS-25914	Kolmonen	core	1	C6:gender-unknown/no-marker
+25989	SS-25989	Football West State League 1	core	1	G1:CORE взрослые мужские
+25991	SS-25991	Kansallinen Ykkönen	women	9	G1:W женские/смешанные
+26015	SS-26015	NSW League One	core	1	G1:CORE взрослые мужские
+26016	SS-26016	South Australia State League 1	core	1	C6:gender-unknown/no-marker
+26017	SS-26017	Capital Premier League	core	1	C6:gender-unknown/no-marker
+26020	SS-26020	Western Australia State League 1	core	1	G1:CORE взрослые мужские
+26023	SS-26023	Dali Dali 3.Līga	core	1	G1:CORE взрослые мужские
+26051	SS-26051	Federation Cup	core	1	G1:CORE взрослые мужские
+26059	SS-26059	Orange Cup	core	1	G1:CORE взрослые мужские
+26119	SS-26119	Vietnam 2nd Division	core	1	G1:CORE взрослые мужские
+26124	SS-26124	Iceland 4. deild	core	1	C6:gender-unknown/no-marker
+26135	SS-26135	Northern Super League	women	9	G1:W женские/смешанные
+26176	SS-26176	Primera A Tarija	core	1	G1:CORE взрослые мужские
+26242	SS-26242	Primera A Beni	core	1	G1:CORE взрослые мужские
+26248	SS-26248	Kurdistan Premier League	core	1	G1:CORE взрослые мужские
+26249	SS-26249	Copa Espírito Santo	core	1	G1:CORE взрослые мужские
+26272	SS-26272	All-Island Cup	women	9	G1:W женские/смешанные
+26375	SS-26375	Championnat Scolaire	student	0	G1:1 студенческие
+26376	SS-26376	Championnat Scolaire Féminin	women	9	C6:gender-unknown/women
+26378	SS-26378	Interbarrios Chiquitos Pinar Apertura	amateur	9	G1:2 региональные/любительские
+26379	SS-26379	Interbarrios Chiquitos Pinar Clausura	amateur	9	G1:2 региональные/любительские
+26382	SS-26382	Queensland Premier League 2	core	1	C6:gender-unknown/no-marker
+26397	SS-26397	Super Ligue	core	1	G1:CORE взрослые мужские
+26405	SS-26405	Copa Master 30	amateur	9	G1:2 региональные/любительские
+26482	SS-26482	Super League 2 Super Cup	core	1	C6:gender-unknown/no-marker
+26498	SS-26498	Premijer Ženska Liga	women	9	G1:W женские/смешанные
+26509	SS-26509	Copa Futuro Sub-20	youth	9	G1:6 молодёжь/резерв
+26512	SS-26512	Myanmar National League Cup	core	1	G1:CORE взрослые мужские
+26521	SS-26521	Kup BiH Žene	women	9	G1:W женские/смешанные
+26624	SS-26624	Primera División de Santa Clara	core	1	G1:CORE взрослые мужские
+26676	SS-26676	Syrian First Division	core	1	G1:CORE взрослые мужские
+26680	SS-26680	1xCup	core	1	G1:CORE взрослые мужские
+26682	SS-26682	Primera A Cochabamba	core	1	G1:CORE взрослые мужские
+26693	SS-26693	Super Kup	core	1	C6:gender-unknown/no-marker
+26697	SS-26697	Lesotho Premier League	core	1	G1:CORE взрослые мужские
+26702	SS-26702	Oman FA Cup	core	1	G1:CORE взрослые мужские
+26764	SS-26764	Pacific Coast Soccer League	core	1	G1:CORE взрослые мужские
+26796	SS-26796	Coupe du Congo	core	1	G1:CORE взрослые мужские
+26797	SS-26797	Amazonense, Série B	core	1	G1:CORE взрослые мужские
+26798	SS-26798	Unity Cup	core	1	G1:CORE взрослые мужские
+26905	SS-26905	Abuja All Stars International	show	9	G1:3 шоу/киберфутбол
+26918	SS-26918	President Cup	core	1	G1:CORE взрослые мужские
+26927	SS-26927	Campeon de Campeones Liga Expansion MX	core	1	C6:gender-unknown/no-marker
+26929	SS-26929	Primera A Santa Cruz	core	1	G1:CORE взрослые мужские
+26947	SS-26947	Primera C	core	1	G1:CORE взрослые мужские
+26949	SS-26949	Micronesian Games	core	1	G1:CORE взрослые мужские
+26954	SS-26954	Primera A La Paz	core	1	G1:CORE взрослые мужские
+27031	SS-27031	CONIFA World Cup	core	1	G1:CORE взрослые мужские
+27033	SS-27033	Kurdistan First Division	core	1	G1:CORE взрослые мужские
+27042	SS-27042	NFCA Abeokuta South Coaches League	core	1	G1:CORE взрослые мужские
+27058	SS-27058	CONIFA European Football Cup	core	1	G1:CORE взрослые мужские
+27063	SS-27063	CONIFA Asia Cup	core	1	G1:CORE взрослые мужские
+27108	SS-27108	Supercopa de Lima	core	1	G1:CORE взрослые мужские
+27114	SS-27114	Primera A Chuquisaca	core	1	G1:CORE взрослые мужские
+27145	SS-27145	Supercupa de Tineret	reserve	9	G1:6 молодёжь/резерв
+27192	SS-27192	CONIFA Africa Cup	core	1	G1:CORE взрослые мужские
+27197	SS-27197	Primera A Potosí	core	1	G1:CORE взрослые мужские
+27206	SS-27206	Vitória CUP	core	1	G1:CORE взрослые мужские
+27207	SS-27207	Primera A Oruro	core	1	G1:CORE взрослые мужские
+27214	SS-27214	Primera A Pando	core	1	G1:CORE взрослые мужские
+27216	SS-27216	Primera B Chuquisaca	core	1	G1:CORE взрослые мужские
+27238	SS-27238	Uzbekistan Cup	core	1	G1:CORE взрослые мужские
+27318	SS-27318	Primera B Tarija	core	1	G1:CORE взрослые мужские
+27334	SS-27334	Primera B Santa Cruz	core	1	G1:CORE взрослые мужские
+27354	SS-27354	Interprovinciales Pre Copa Simón Bolívar	core	1	G1:CORE взрослые мужские
+27355	SS-27355	Viva World Cup	core	1	G1:CORE взрослые мужские
+27384	SS-27384	Primera B Cochabamba	core	1	G1:CORE взрослые мужские
+27398	SS-27398	Primera B Beni	core	1	G1:CORE взрослые мужские
+27406	SS-27406	Primera B Oruro	core	1	G1:CORE взрослые мужские
+27487	SS-27487	Primera B Potosí	core	1	G1:CORE взрослые мужские
+27493	SS-27493	Primera B La Paz	core	1	G1:CORE взрослые мужские
+27508	SS-27508	ERFA Division Three	core	1	G1:CORE взрослые мужские
+27528	SS-27528	Fotbolti.net Cup	core	1	G1:CORE взрослые мужские
+27536	SS-27536	NNL Super 8	core	1	G1:CORE взрослые мужские
+27548	SS-27548	Ligue Haïtienne de Football	core	1	G1:CORE взрослые мужские
+27549	SS-27549	Primera de Ascenso Cochabamba	core	1	G1:CORE взрослые мужские
+27564	SS-27564	Ligue Saint-Pierre-et-Miquelon	core	1	G1:CORE взрослые мужские
+27576	SS-27576	Intercolegios Lima Norte	student	0	G1:1 студенческие
+27653	SS-27653	Segunda de Ascenso Cochabamba	core	1	G1:CORE взрослые мужские
+27684	SS-27684	FIFI Wild Cup	core	1	G1:CORE взрослые мужские
+27691	SS-27691	Tercera de Ascenso Cochabamba	core	1	G1:CORE взрослые мужские
+27692	SS-27692	Primera de Ascenso Santa Cruz	core	1	G1:CORE взрослые мужские
+27742	SS-27742	Mato-Grossense, 2ª Divisão	core	1	G1:CORE взрослые мужские
+27787	SS-27787	Segunda División de Santa Clara	core	1	G1:CORE взрослые мужские
+27789	SS-27789	Chatham Cup	core	1	C6:gender-unknown/no-marker
+27792	SS-27792	Segunda de Ascenso Beni	core	1	G1:CORE взрослые мужские
+27800	SS-27800	Segunda de Ascenso Santa Cruz	core	1	G1:CORE взрослые мужские
+27802	SS-27802	Primera de Ascenso Tarija	core	1	G1:CORE взрослые мужские
+27805	SS-27805	Segunda de Ascenso Tarija	core	1	G1:CORE взрослые мужские
+27806	SS-27806	CONIFA Challenger Cup	core	1	G1:CORE взрослые мужские
+27807	SS-27807	Al Balda Al Sayahi Cup	core	1	G1:CORE взрослые мужские
+27810	SS-27810	Conifa Hungary Heritage Cup	core	1	G1:CORE взрослые мужские
+27818	SS-27818	Conifa World Unity Cup	core	1	G1:CORE взрослые мужские
+27819	SS-27819	Tercera de Ascenso Tarija	core	1	G1:CORE взрослые мужские
+27825	SS-27825	Benedikt Fontana Cup	core	1	G1:CORE взрослые мужские
+27836	SS-27836	Tercera de Ascenso Santa Cruz	core	1	G1:CORE взрослые мужские
+27922	SS-27922	CONIFA South America Football Cup	core	1	G1:CORE взрослые мужские
+27929	SS-27929	Copa de La Liga de Santa Clara	core	1	G1:CORE взрослые мужские
+27946	SS-27946	Conifa Euro No Limits	core	1	G1:CORE взрослые мужские
+27950	SS-27950	Trofeo Insubria	core	1	G1:CORE взрослые мужские
+27952	SS-27952	Givova Trophy	core	1	G1:CORE взрослые мужские
+27958	SS-27958	Copa Governo do Estado de Sergipe	core	1	G1:CORE взрослые мужские
+27964	SS-27964	Copa CSANF	core	1	G1:CORE взрослые мужские
+27970	SS-27970	Super Cup	core	1	C6:gender-unknown/no-marker
+27972	SS-27972	Future Stars Challenge Cup	core	1	G1:CORE взрослые мужские
+27976	SS-27976	Tynwald Hill Tournament	core	1	G1:CORE взрослые мужские
+28021	SS-28021	Recopa	core	1	C6:gender-unknown/no-marker
+28091	SS-28091	Super Ligue	core	1	G1:CORE взрослые мужские
+28107	SS-28107	Copa Interamericana Mayor	core	1	G1:CORE взрослые мужские
+28125	SS-28125	Wasimi Summer Soccer Championship	core	1	G1:CORE взрослые мужские
+28126	SS-28126	Abeokuta South Coaches FA Cup	core	1	G1:CORE взрослые мужские
+28133	SS-28133	Torneo Asociación	core	1	C6:gender-unknown/no-marker
+28144	SS-28144	Nacional B	core	1	G1:CORE взрослые мужские
+28153	SS-28153	National 1	core	1	C6:gender-unknown/no-marker
+28157	SS-28157	Unilus League	core	1	G1:CORE взрослые мужские
+28164	SS-28164	Primera de Ascenso La Paz	core	1	G1:CORE взрослые мужские
+28165	SS-28165	Primera División de Ascenso	core	1	C6:gender-unknown/no-marker
+28170	SS-28170	3. SNL	core	1	C6:gender-unknown/no-marker
+28208	SS-28208	Acreano, Série B	core	1	G1:CORE взрослые мужские
+28254	SS-28254	Ardal South League Cup	core	1	G1:CORE взрослые мужские
+28263	SS-28263	Ardal North League Cup	core	1	G1:CORE взрослые мужские
+28276	SS-28276	Division 1 Féminin	women	9	C6:gender-unknown/women
+28279	SS-28279	Niamh Challenge Cup	core	1	G1:CORE взрослые мужские
+28308	SS-28308	ASEAN Club Championship	core	1	G1:CORE взрослые мужские
+28320	SS-28320	1. ŽFL	women	9	G1:W женские/смешанные
+28350	SS-28350	Segunda de Ascenso La Paz	core	1	G1:CORE взрослые мужские
+28362	SS-28362	Primera de Ascenso Chuquisaca	core	1	G1:CORE взрослые мужские
+28367	SS-28367	Brasiliense, Série B	core	1	G1:CORE взрослые мужские
+28368	SS-28368	Oyebode Cup	core	1	G1:CORE взрослые мужские
+28375	SS-28375	Piala Sumbangsih	core	1	C6:gender-unknown/no-marker
+28380	SS-28380	Tercera de Ascenso La Paz	core	1	G1:CORE взрослые мужские
+28384	SS-28384	USL Super League	women	9	C6:gender-unknown/women
+28472	SS-28472	Pepe Reyes Cup	core	1	C6:gender-unknown/no-marker
+28476	SS-28476	D'Royal Off Season Football Tournament	core	1	G1:CORE взрослые мужские
+28477	SS-28477	Dumankaya Cup	core	1	G1:CORE взрослые мужские
+28479	SS-28479	Yemen First Division	core	1	G1:CORE взрослые мужские
+28480	SS-28480	Pro Route League	core	1	G1:CORE взрослые мужские
+28486	SS-28486	UNPO Cup	core	1	G1:CORE взрослые мужские
+28528	SS-28528	Pacific Games	core	1	G1:CORE взрослые мужские
+28530	SS-28530	U-Sports	student	0	G1:1 студенческие
+28533	SS-28533	Wimbum Sports Tournament Yaounde	core	1	G1:CORE взрослые мужские
+28549	SS-28549	Liga Luqueña	core	1	G1:CORE взрослые мужские
+28555	SS-28555	Liga de Ascenso	core	1	C6:gender-unknown/no-marker
+28564	SS-28564	WUFA World Series	core	1	G1:CORE взрослые мужские
+28568	SS-28568	IPCT Tournament	core	1	G1:CORE взрослые мужские
+28656	SS-28656	The Creative Championship League	core	1	G1:CORE взрослые мужские
+28657	SS-28657	The Creative Championship Cup	core	1	G1:CORE взрослые мужские
+28675	SS-28675	Atlantic Heritage Cup	core	1	G1:CORE взрослые мужские
+28676	SS-28676	Copa Don Elias Mansur	core	1	G1:CORE взрослые мужские
+28679	SS-28679	Primera C	core	1	G1:CORE взрослые мужские
+28705	SS-28705	Yorkshire Cup	core	1	G1:CORE взрослые мужские
+28716	SS-28716	Conifa World Cup, Qualification	core	1	G1:CORE взрослые мужские
+28732	SS-28732	Mineiro, Segunda Divisao	core	1	C6:gender-unknown/no-marker
+28736	SS-28736	Prost International Trophy	core	1	G1:CORE взрослые мужские
+28748	SS-28748	CONIFA Exhibition Games	show	9	G1:3 шоу/киберфутбол
+28750	SS-28750	Paranaense, 3ª Divisão	core	1	G1:CORE взрослые мужские
+28755	SS-28755	Goiano, 3ª Divisão	core	1	G1:CORE взрослые мужские
+28756	SS-28756	Taca FPF Paranaense	core	1	C6:gender-unknown/no-marker
+28757	SS-28757	Carioca, Série B2	core	1	G1:CORE взрослые мужские
+28832	SS-28832	N.F.-Board Exhibition Games	show	9	C6:gender-unknown/esoccer/show
+28834	SS-28834	Outrigger Challenge Cup	core	1	G1:CORE взрослые мужские
+28856	SS-28856	Segunda de Ascenso Chuquisaca	core	1	G1:CORE взрослые мужские
+28858	SS-28858	CAFA Nations Cup	core	1	G1:CORE взрослые мужские
+28867	SS-28867	Tercera de Ascenso Chuquisaca	core	1	C6:gender-unknown/no-marker
+28869	SS-28869	FSN Betwinner Mini League	core	1	G1:CORE взрослые мужские
+28877	SS-28877	Island Games	core	1	G1:CORE взрослые мужские
+28878	SS-28878	Liga Nacional Sub-16	youth	9	G1:6 молодёжь/резерв
+28890	SS-28890	Due Sicilies Cup	core	1	G1:CORE взрослые мужские
+28896	SS-28896	Hong Kong League Cup	core	1	G1:CORE взрослые мужские
+28908	SS-28908	Singapore Premier League 2	core	1	C6:gender-unknown/no-marker
+28911	SS-28911	Supercopa de El Salvador	core	1	G1:CORE взрослые мужские
+28913	SS-28913	Tajik Super Cup	core	1	G1:CORE взрослые мужские
+28919	SS-28919	Kyrgyzstan Super Cup	core	1	G1:CORE взрослые мужские
+28923	SS-28923	LPR Pro, Clausura	core	1	G1:CORE взрослые мужские
+28924	SS-28924	LPR Pro, Apertura	core	1	G1:CORE взрослые мужские
+28946	SS-28946	Primera B Pando	core	1	G1:CORE взрослые мужские
+29010	SS-29010	Australian Championship	core	1	G1:CORE взрослые мужские
+29018	SS-29018	Tournoi des 4	core	1	G1:CORE взрослые мужские
+29030	SS-29030	Liga 3	core	1	G1:CORE взрослые мужские
+29045	SS-29045	Division 2 Féminin	women	9	C6:gender-unknown/women
+29071	SS-29071	La Coupe de l'Outre-Mer	core	1	G1:CORE взрослые мужские
+29193	SS-29193	Ježek Cup	core	1	G1:CORE взрослые мужские
+29218	SS-29218	Hong Kong Senior Shield	core	1	G1:CORE взрослые мужские
+29224	SS-29224	Liga Limpeña	core	1	G1:CORE взрослые мужские
+29245	SS-29245	Alh Kanka Football Competition	core	1	G1:CORE взрослые мужские
+29326	SS-29326	Primera A Riberalta	core	1	G1:CORE взрослые мужские
+29334	SS-29334	ABC Unity Cup	core	1	G1:CORE взрослые мужские
+29340	SS-29340	Primera A Villa Montes	core	1	G1:CORE взрослые мужские
+29357	SS-29357	Primera A Villazon	core	1	G1:CORE взрослые мужские
+29369	SS-29369	FasoFoot Ligue 1	core	1	G1:CORE взрослые мужские
+29371	SS-29371	Primera A Yacuiba	core	1	G1:CORE взрослые мужские
+29380	SS-29380	Copa Paulino Alcantara	core	1	G1:CORE взрослые мужские
+29382	SS-29382	Europeada	core	1	G1:CORE взрослые мужские
+29400	SS-29400	National Foot 2	core	1	G1:CORE взрослые мужские
+29412	SS-29412	Sergipano, Série A3	core	1	G1:CORE взрослые мужские
+29414	SS-29414	Supertaca	core	1	G1:CORE взрослые мужские
+29526	SS-29526	South West InterDivisional Cup	core	1	G1:CORE взрослые мужские
+29536	SS-29536	Baller League US	show	9	G1:3 шоу/киберфутбол
+29620	SS-29620	Primera de Ascenso Oruro	core	1	G1:CORE взрослые мужские
+29859	SS-29859	Copa Maria Bonita	women	9	G1:W женские/смешанные
+29860	SS-29860	Taça Cidade do Paulista	women	9	G1:W женские/смешанные
+29892	SS-29892	FKF Kwale County League	amateur	9	G1:2 региональные/любительские
+29899	SS-29899	Torneo Desarrollo de Talento Sub-15 2.0	youth	9	G1:6 молодёжь/резерв
+29953	SS-29953	Lebanese Second Division	core	1	G1:CORE взрослые мужские
+29961	SS-29961	GFA Cup	core	1	G1:CORE взрослые мужские
+29963	SS-29963	GFA 1st Division KO	core	1	G1:CORE взрослые мужские
+30059	SS-30059	Moldovan Liga 2	core	1	G1:CORE взрослые мужские
+30081	SS-30081	Kadınlar 2. Ligi	women	9	G1:W женские/смешанные
+30082	SS-30082	Kadınlar 3. Ligi	women	9	G1:W женские/смешанные
+30084	SS-30084	Supercopa de Puerto Rico	core	1	G1:CORE взрослые мужские
+30097	SS-30097	Ligue de Bangui	core	1	G1:CORE взрослые мужские
+30119	SS-30119	Olubadan Cup	core	1	G1:CORE взрослые мужские
+30185	SS-30185	USVI Premier League	core	1	G1:CORE взрослые мужские
+30206	SS-30206	IFA Shield	core	1	G1:CORE взрослые мужские
+30222	SS-30222	Inter-Regions UGB (CROUS)	core	1	G1:CORE взрослые мужские
+30257	SS-30257	TFA 1st Division	core	1	G1:CORE взрослые мужские
+30258	SS-30258	Kup FS opštine Inđija	core	1	G1:CORE взрослые мужские
+30365	SS-30365	D1 Lonato	core	1	G1:CORE взрослые мужские
+30404	SS-30404	FKF Nairobi East Regional League	amateur	9	G1:2 региональные/любительские
+30412	SS-30412	Kings League MENA	show	9	G1:3 шоу/киберфутбол
+30532	SS-30532	Copa Governador do Estado da Bahia	core	1	G1:CORE взрослые мужские
+30559	SS-30559	Copa Caribe	core	1	G1:CORE взрослые мужские
+30572	SS-30572	Tournoi de Presaison Interclub	core	1	G1:CORE взрослые мужские
+30586	SS-30586	FKF Division One League	core	1	G1:CORE взрослые мужские
+30691	SS-30691	Liga Giron	core	1	G1:CORE взрослые мужские
+30843	SS-30843	-	esoccer	0	C6:gender-unknown/esoccer/show
+30857	SS-30857	Senegal Ligue 2	core	1	G1:CORE взрослые мужские
+30906	SS-30906	Isoko Super Cup	core	1	G1:CORE взрослые мужские
+30941	SS-30941	Segunda de Ascenso Oruro	core	1	G1:CORE взрослые мужские
+30965	SS-30965	Dames Ligue 1	women	9	G1:W женские/смешанные
+31005	SS-31005	Tercera de Ascenso Oruro	core	1	G1:CORE взрослые мужские
+31034	SS-31034	Jordan Shield Cup	core	1	G1:CORE взрослые мужские
+31121	SS-31121	Reģionu kauss	core	1	G1:CORE взрослые мужские
+31134	SS-31134	Kings Americas Cup	core	1	G1:CORE взрослые мужские
+31225	SS-31225	CONCACAF W Championship qualification	women	9	G1:W женские/смешанные
+31228	SS-31228	Aspidistra Radnorshire Cup	core	1	G1:CORE взрослые мужские
+31232	SS-31232	Dhaka Senior Division League	core	1	G1:CORE взрослые мужские
+31237	SS-31237	Super League	core	1	G1:CORE взрослые мужские
+31245	SS-31245	CWFA Senior Cup	core	1	G1:CORE взрослые мужские
+31300	SS-31300	NLO Cup	core	1	G1:CORE взрослые мужские
+31346	SS-31346	Super Cup	core	1	G1:CORE взрослые мужские
+31351	SS-31351	CUMSA Premier League	core	1	G1:CORE взрослые мужские
+31364	SS-31364	Judith Chime's Championship	women	9	G1:W женские/смешанные
+31370	SS-31370	D1 Djibouti	core	1	G1:CORE взрослые мужские
+31393	SS-31393	ADAKLU FA Division 3	core	1	G1:CORE взрослые мужские
+31439	SS-31439	Adepafa Futbol 11 Master 40	amateur	9	G1:2 региональные/любительские
+31445	SS-31445	Guwahati Premier League	core	1	G1:CORE взрослые мужские
+31453	SS-31453	WRFA Division Two	core	1	G1:CORE взрослые мужские
+31523	SS-31523	FKF Western Regional League Zone A	amateur	9	G1:2 региональные/любительские
+31524	SS-31524	FKF Western Regional League Zone B	amateur	9	G1:2 региональные/любительские
+31525	SS-31525	FKF Western Regional League Zone C	amateur	9	G1:2 региональные/любительские
+31534	SS-31534	BARFA Division Three League	core	1	G1:CORE взрослые мужские
+31606	SS-31606	Copa Santarém	core	1	G1:CORE взрослые мужские
+31624	SS-31624	World Sports Summit	show	9	G1:3 шоу/киберфутбол
+31637	SS-31637	K5 League	core	1	G1:CORE взрослые мужские
+31681	SS-31681	Naisten Kakkonen	women	9	G1:W женские/смешанные
+31693	SS-31693	Linafoot Ligue 1	core	1	G1:CORE взрослые мужские
+31709	SS-31709	Copa Amigos	core	1	G1:CORE взрослые мужские
+31712	SS-31712	General Da’ud Cup	core	1	G1:CORE взрослые мужские
+31754	SS-31754	Bengal Super League	core	1	G1:CORE взрослые мужские
+31773	SS-31773	Ligue Inter Régions	core	1	G1:CORE взрослые мужские
+31777	SS-31777	National Conference League	core	1	G1:CORE взрослые мужские
+31832	SS-31832	Copa de La Liga	core	1	G1:CORE взрослые мужские
+31838	SS-31838	Jiangsu Football City League	core	1	G1:CORE взрослые мужские
+31850	SS-31850	Winter Tournament	core	1	G1:CORE взрослые мужские
+31863	SS-31863	Copa Oeste	core	1	G1:CORE взрослые мужские
+31872	SS-31872	Ziemas Kauss	women	9	G1:W женские/смешанные
+31928	SS-31928	LIFGE	core	1	G1:CORE взрослые мужские
+31930	SS-31930	OFC Pro League	core	1	G1:CORE взрослые мужские
+32015	SS-32015	Yemen Second Division	core	1	G1:CORE взрослые мужские
+32027	SS-32027	Queensland Premier League 3 Metro	core	1	G1:CORE взрослые мужские
+32033	SS-32033	Zanzibar Cup	core	1	G1:CORE взрослые мужские
+32036	SS-32036	Unilorin League	core	1	G1:CORE взрослые мужские
+32049	SS-32049	Nepal National League	core	1	G1:CORE взрослые мужские
+32070	SS-32070	South Australia State League 2	core	1	G1:CORE взрослые мужские
+32078	SS-32078	Supercopa de Santa Clara	core	1	G1:CORE взрослые мужские
+32085	SS-32085	OBOS Supercup	core	1	G1:CORE взрослые мужские
+32089	SS-32089	FKF Western Regional League	amateur	9	G1:2 региональные/любительские
+32144	SS-32144	K-League Super Cup	core	1	G1:CORE взрослые мужские
+32152	SS-32152	Sieviešu Superkauss	women	9	G1:W женские/смешанные
+32171	SS-32171	Castel Challenge Cup	core	1	G1:CORE взрослые мужские
+32172	SS-32172	Rwanda Heroes' Cup	core	1	G1:CORE взрослые мужские
+32176	SS-32176	Khalid Bin Hamad Cup	core	1	G1:CORE взрослые мужские
+32193	SS-32193	1. Division	core	1	G1:CORE взрослые мужские
+32194	SS-32194	Celtiis Ligue 2	core	1	G1:CORE взрослые мужские
+32239	SS-32239	Liga Orange	core	1	G1:CORE взрослые мужские
+32245	SS-32245	Cuba Campeonato Nacional	core	1	G1:CORE взрослые мужские
+32263	SS-32263	National Challenge Cup	core	1	G1:CORE взрослые мужские
+32274	SS-32274	Sudanese Premier League	core	1	G1:CORE взрослые мужские
+32320	SS-32320	Coupe du Trône Féminine	women	9	C6:gender-unknown/women
+32350	SS-32350	Liga Puerto Rico Pro	core	1	G1:CORE взрослые мужские
+32354	SS-32354	SFA Super League	core	1	G1:CORE взрослые мужские
+32371	SS-32371	Waterfalls League	core	1	G1:CORE взрослые мужские
+32392	SS-32392	Coupe du Faso	core	1	G1:CORE взрослые мужские
+32400	SS-32400	Liga Nacional de Candelaria	core	1	G1:CORE взрослые мужские
+32435	SS-32435	Torneio Ribeiro Seguros	core	1	G1:CORE взрослые мужские
+32524	SS-32524	Tunisian Ligue Régionale	amateur	9	G1:2 региональные/любительские
+32529	SS-32529	Winter Cup	women	9	G1:W женские/смешанные
+32547	SS-32547	ARFA Division 2 Middle League	core	1	G1:CORE взрослые мужские
+32642	SS-32642	Copa Presidente	core	1	G1:CORE взрослые мужские
+32656	SS-32656	Champions Cup	core	1	G1:CORE взрослые мужские
+32659	SS-32659	Denso Challenge Cup Kariya	core	1	G1:CORE взрослые мужские
+32668	SS-32668	AIMC League	core	1	G1:CORE взрослые мужские
+32688	SS-32688	AIMC Cup	core	1	G1:CORE взрослые мужские
+32725	SS-32725	SIFL HEBI Cup	core	1	G1:CORE взрослые мужские
+32732	SS-32732	Ligue 2 Moorea	core	1	G1:CORE взрослые мужские
+32734	SS-32734	Copa de la Liga	core	1	G1:CORE взрослые мужские
+32770	SS-32770	Ligue Régionale de Football_Oran	amateur	9	G1:2 региональные/любительские
+32793	SS-32793	Turkmenistan Cup	core	1	G1:CORE взрослые мужские
+32800	SS-32800	Turkmenistan Super Cup	core	1	G1:CORE взрослые мужские
+32807	SS-32807	Rwanda Peace Cup	core	1	G1:CORE взрослые мужские
+32827	SS-32827	Hahn Australia Cup Western Australia Preliminary Rounds	core	1	G1:CORE взрослые мужские
+32832	SS-32832	FIFA Series	core	1	G1:CORE взрослые мужские
+33075	SS-33075	LaLiga Pinar Sub-20	youth	9	G1:6 молодёжь/резерв
+33307	SS-33307	Livonia Cup	core	1	G1:CORE взрослые мужские
+33487	SS-33487	Saint Lucía Premier League	core	1	G1:CORE взрослые мужские
+33495	SS-33495	Copa Sul-Sudeste	core	1	G1:CORE взрослые мужские
+33647	SS-33647	Segunda División Autónoma SCCR	core	1	G1:CORE взрослые мужские
+33656	SS-33656	JFL Cup	core	1	G1:CORE взрослые мужские
+33670	SS-33670	Championnat Raiatea-Tahaa	core	1	G1:CORE взрослые мужские
+33674	SS-33674	United Premier Soccer League	core	1	G1:CORE взрослые мужские
+33675	SS-33675	Federal Regional Championship	amateur	9	G1:2 региональные/любительские
+33694	SS-33694	Queens League México	women	9	G1:W женские/смешанные
+33698	SS-33698	Kategoria Superiore Femra	women	9	G1:W женские/смешанные
+33702	SS-33702	First Division	core	1	G1:CORE взрослые мужские
+33717	SS-33717	Oaustech Vice Chancellor Cup	core	1	G1:CORE взрослые мужские
+33754	SS-33754	NRF League One	core	1	G1:CORE взрослые мужские
+33813	SS-33813	Birim North Division 3 League	core	1	G1:CORE взрослые мужские
+33838	SS-33838	Trophée Claude Chadet R3	core	1	G1:CORE взрослые мужские
+33843	SS-33843	Segunda Liga	core	1	G1:CORE взрослые мужские
+33868	SS-33868	MFA Cup	core	1	G1:CORE взрослые мужские
+33893	SS-33893	South Sudan Cup	core	1	G1:CORE взрослые мужские
+33894	SS-33894	Bonaire Eredivisie	core	1	G1:CORE взрослые мужские
+33895	SS-33895	Kazakhstan 2nd Division	core	1	G1:CORE взрослые мужские
+33932	SS-33932	GFF Elite League	core	1	G1:CORE взрослые мужские
+33936	SS-33936	MFA Charity Shield	show	9	G1:3 шоу/киберфутбол
+33938	SS-33938	Ligue Régionale de Football - Constantine, Régionale 1	amateur	9	G1:2 региональные/любительские
+33939	SS-33939	Ligue Wilaya Football Skikda , Division Honneur	core	1	G1:CORE взрослые мужские
+33951	SS-33951	4.Līga	core	1	G1:CORE взрослые мужские
+33962	SS-33962	Federacion Regional 2012	amateur	9	G1:2 региональные/любительские
+33973	SS-33973	UPSL SoCal North Divison 1	core	1	G1:CORE взрослые мужские
+33974	SS-33974	Ivano-Frankivsk Region Championship	core	1	G1:CORE взрослые мужские
+34007	SS-34007	Ligue 2 Régionale Sikasso	amateur	9	G1:2 региональные/любительские
+34008	SS-34008	R1 Féminine	women	9	C6:gender-unknown/women
+34009	SS-34009	Coupe de Martinique féminine	women	9	C6:gender-unknown/women
+34068	SS-34068	Ligue Régionale de Football - Constantine, Régionale 2	amateur	9	G1:2 региональные/любительские
+34072	SS-34072	Northern Territory Division 3	core	1	G1:CORE взрослые мужские
+34081	SS-34081	Adun Soccer League	core	1	G1:CORE взрослые мужские
+34093	SS-34093	Saint Lucia Super League	core	1	G1:CORE взрослые мужские
+34096	SS-34096	Prairies Premier League	core	1	G1:CORE взрослые мужские
+34126	SS-34126	Segunda Divisão	core	1	G1:CORE взрослые мужские
+34133	SS-34133	India Delhi Premier League	core	1	G1:CORE взрослые мужские
+34136	SS-34136	SIFL Closing Tournament	core	1	G1:CORE взрослые мужские
+34146	SS-34146	Ligue 2 Mali District de Bamako	amateur	9	G1:2 региональные/любительские
+34147	SS-34147	Teal Rising Cup	women	9	G1:W женские/смешанные
+34184	SS-34184	Unimed Student Union Cup	student	0	G1:1 студенческие
+34227	SS-34227	Dali Dali 3.Līga	core	1	G1:CORE взрослые мужские
+34234	SS-34234	Thai League 3	core	1	G1:CORE взрослые мужские
+34241	SS-34241	Elege Ileya	core	1	G1:CORE взрослые мужские
+34280	SS-34280	Eksumsa League	core	1	G1:CORE взрослые мужские
+34290	SS-34290	BGML Football League	core	1	G1:CORE взрослые мужские
+34318	SS-34318	Ahmedabad District Football Association	amateur	9	G1:2 региональные/любительские
+34328	SS-34328	Régional 1 Réunion	amateur	9	G1:2 региональные/любительские
+34366	SS-34366	Muungano Cup	core	1	G1:CORE взрослые мужские
+34385	SS-34385	Liga Encarnacena de Futbol	core	1	G1:CORE взрослые мужские
+34391	SS-34391	Ethiopia Cup	core	1	G1:CORE взрослые мужские
+34409	SS-34409	Régional 2 Réunion	amateur	9	G1:2 региональные/любительские
+34415	SS-34415	Coupe du Québec	core	1	G1:CORE взрослые мужские
+34421	SS-34421	Liga Paranaense de Futbol	core	1	G1:CORE взрослые мужские
+34429	SS-34429	Republic of Yemen Cup	core	1	G1:CORE взрослые мужские
+34431	SS-34431	Taça Nacional	core	1	G1:CORE взрослые мужские
+34434	SS-34434	HILZ Cup	core	1	G1:CORE взрослые мужские
+34458	SS-34458	Supertaça Nacional	core	1	G1:CORE взрослые мужские
+34459	SS-34459	Taça 17 de Janeiro	core	1	G1:CORE взрослые мужские
+34473	SS-34473	Torneo de Ascenso Santa Clara	core	1	G1:CORE взрослые мужские
+34600	SS-34600	South Korea League Cup K3·K4	core	1	G1:CORE взрослые мужские
+34629	SS-34629	Campeonato Nacional da Divisão de Honra	core	1	G1:CORE взрослые мужские
+34649	SS-34649	TCIFA PPL Cup	core	1	G1:CORE взрослые мужские
+34680	SS-34680	All Star Xperience - Division A	show	9	G1:3 шоу/киберфутбол
+34681	SS-34681	All Star Xperience - Division B	show	9	G1:3 шоу/киберфутбол
+34682	SS-34682	All Star Xperience - Prem	show	9	G1:3 шоу/киберфутбол
+34692	SS-34692	State League 6 South-East	core	1	G1:CORE взрослые мужские
+34701	SS-34701	LVBET Latvijas Kauss	core	1	G1:CORE взрослые мужские
+34759	SS-34759	Liga 4 Piala Presiden	core	1	G1:CORE взрослые мужские
+34808	SS-34808	Adun VC Inter-level Cup	core	1	G1:CORE взрослые мужские
+34922	SS-34922	Atlantic League V	core	1	G1:CORE взрослые мужские
+34941	SS-34941	League Masterbol 1ra División	core	1	G1:CORE взрослые мужские
+34943	SS-34943	Copa Interbarrios Bayamo	amateur	9	G1:2 региональные/любительские
+34963	SS-34963	Coupe de Guyane	core	1	G1:CORE взрослые мужские
+34972	SS-34972	BRFA 3rd Division League	core	1	G1:CORE взрослые мужские
+35020	SS-35020	Copa Primera	core	1	G1:CORE взрослые мужские
+35036	SS-35036	League Masterbol 2da División	core	1	G1:CORE взрослые мужские
+35056	SS-35056	FV Greater Ballarat League 3	core	1	G1:CORE взрослые мужские
+35059	SS-35059	SGFA All Age E's	core	1	G1:CORE взрослые мужские
+35067	SS-35067	Peru Copa de la Liga	core	1	G1:CORE взрослые мужские
+35095	SS-35095	Challenge Prince Rainier III	core	1	G1:CORE взрослые мужские
+35099	SS-35099	Somali Super Cup	core	1	G1:CORE взрослые мужские
+35102	SS-35102	Liga del Alto Paraná	core	1	G1:CORE взрослые мужские
+35143	SS-35143	Liga Bellavisteña de Futbol	core	1	G1:CORE взрослые мужские
+35201	SS-35201	Ligue de football de l'équateur	core	1	G1:CORE взрослые мужские
+35206	SS-35206	FUNAABSU League	student	0	G1:1 студенческие
+35254	SS-35254	Iceland 5.deild	core	1	G1:CORE взрослые мужские
+35266	SS-35266	Jamaica Football Cup	core	1	G1:CORE взрослые мужские
+35273	SS-35273	COMPSSA Provost Cup	core	1	G1:CORE взрослые мужские
+35288	SS-35288	Unilag MSA Dean's Cup	core	1	G1:CORE взрослые мужские
+35313	SS-35313	Rahvaliiga	core	1	G1:CORE взрослые мужские
+35326	SS-35326	Siguria Superliga - Femrat	women	9	G1:W женские/смешанные
+35370	SS-35370	Al Wafaa Cup Aden	core	1	G1:CORE взрослые мужские
+35371	SS-35371	Liga Ganadera del Fútbol Ñeembucu	core	1	G1:CORE взрослые мужские
+35375	SS-35375	Liga Plaza Guantánamo	core	1	G1:CORE взрослые мужские
+35424	SS-35424	Unilorin VC Olympics	core	1	G1:CORE взрослые мужские
+35462	SS-35462	Sudan Cup	core	1	G1:CORE взрослые мужские
+35464	SS-35464	MNZ Ptuj - Člani 1. razred	core	1	G1:CORE взрослые мужские
+35473	SS-35473	Liga San Lorenzana de Futbol	core	1	G1:CORE взрослые мужские
+35515	SS-35515	Malaysia President Cup	core	1	G1:CORE взрослые мужские
+35541	SS-35541	South Sudan National League	core	1	G1:CORE взрослые мужские
+35568	SS-35568	Fiji FA Cup	core	1	G1:CORE взрослые мужские
+35580	SS-35580	OFS Prilep	core	1	G1:CORE взрослые мужские
+35611	SS-35611	Kyrgyzstan Cup	core	1	G1:CORE взрослые мужские
+35613	SS-35613	Guangdong City Football Super League	core	1	G1:CORE взрослые мужские
+35616	SS-35616	Chinese Champions League CMCL	core	1	G1:CORE взрослые мужские
+35632	SS-35632	Coupe Catherine Flon	core	1	G1:CORE взрослые мужские
+35639	SS-35639	Singapore Islandwide League	core	1	G1:CORE взрослые мужские
+35647	SS-35647	Liga Deportiva Campo Aceval	core	1	G1:CORE взрослые мужские
+35651	SS-35651	Luxembourg Super Cup	core	1	G1:CORE взрослые мужские
+35654	SS-35654	Rahvaliiga B	core	1	G1:CORE взрослые мужские
+35662	SS-35662	Singapore Football League 1	core	1	G1:CORE взрослые мужские
+35663	SS-35663	Singapore Football League 2	core	1	G1:CORE взрослые мужские
+35667	SS-35667	Inner Mongolia Football Super League	core	1	G1:CORE взрослые мужские
+35676	SS-35676	Liga Deportiva Lomagrandense de Futbol	core	1	G1:CORE взрослые мужские
+35679	SS-35679	Fujian Football City League	core	1	G1:CORE взрослые мужские
+35691	SS-35691	Singapore FA Cup	core	1	G1:CORE взрослые мужские
+35694	SS-35694	Liga Deportiva San José Obrero de Fútbol	core	1	G1:CORE взрослые мужские
+35695	SS-35695	Liga Deportiva San José Obrero de Fútbol	core	1	C6:gender-unknown/no-marker
+35696	SS-35696	Inter Zongo Community Tournament	amateur	9	G1:2 региональные/любительские
+35702	SS-35702	Unilag FSS Fresher’s Cup	core	1	G1:CORE взрослые мужские
+35703	SS-35703	Nkurunzuza Cup	women	9	G1:W женские/смешанные
+35711	SS-35711	N-Quad Inter Tribes Football Tournament	core	1	G1:CORE взрослые мужские
+35712	SS-35712	Kumasi Super League	core	1	G1:CORE взрослые мужские
+35741	SS-35741	Sichuan City Football League	core	1	G1:CORE взрослые мужские
+35746	SS-35746	MBL Copa de la Liga	core	1	G1:CORE взрослые мужские
+35754	SS-35754	CCAA Championship	student	0	G1:1 студенческие
+35765	SS-35765	Coupe La Presse De Limonade	core	1	G1:CORE взрослые мужские
+35769	SS-35769	Sierra Leone FA Cup	core	1	G1:CORE взрослые мужские
+35843	SS-35843	Pinnacle Football League, Unilorin	core	1	G1:CORE взрослые мужские
+35861	SS-35861	Swep League Funaab	core	1	G1:CORE взрослые мужские
+35864	SS-35864	Shandong Provincial Club Championship	core	1	G1:CORE взрослые мужские
+35879	SS-35879	Renato Miceli Memorial Tournament	core	1	G1:CORE взрослые мужские
+35880	SS-35880	Taça da Liga	core	1	G1:CORE взрослые мужские
+35884	SS-35884	The Arena	core	1	G1:CORE взрослые мужские
+35891	SS-35891	Futo Seset Dean's Cup	core	1	G1:CORE взрослые мужские
+35893	SS-35893	Cupa României	core	1	G1:CORE взрослые мужские
+35899	SS-35899	Dhaka Second Division Football League	core	1	G1:CORE взрослые мужские
+35912	SS-35912	Supertaça de Cabo Verde	core	1	G1:CORE взрослые мужские
+35944	SS-35944	Toyin Amuzu Football Competition	core	1	G1:CORE взрослые мужские
+35955	SS-35955	PFL	core	1	G1:CORE взрослые мужские
+35963	SS-35963	The Light Innovative Football League	core	1	G1:CORE взрослые мужские
+36010	SS-36010	Campos Blazers League	core	1	G1:CORE взрослые мужские
+36021	SS-36021	Champions FBC	core	1	G1:CORE взрослые мужские
+36031	SS-36031	NCAA III, Men	student	0	G1:1 студенческие
+36034	SS-36034	Ligue des Champions D2 Nationale	core	1	G1:CORE взрослые мужские
+36042	SS-36042	Coupe du Cameroun	core	1	G1:CORE взрослые мужские
+36051	SS-36051	BAREM	core	1	G1:CORE взрослые мужские
+36066	SS-36066	Supercopa de Honduras	core	1	G1:CORE взрослые мужские
+36090	SS-36090	FAI National League	core	1	G1:CORE взрослые мужские
+36100	SS-36100	CUMSA Games Football Cup	core	1	G1:CORE взрослые мужские
+36119	SS-36119	Northeast Region City Football League	core	1	G1:CORE взрослые мужские
+36120	SS-36120	Rahvaliiga C	core	1	G1:CORE взрослые мужские
+36168	SS-36168	Military and Para-Military Cup	student	0	G1:1 студенческие
+36176	SS-36176	AJSL	core	1	G1:CORE взрослые мужские
+36185	SS-36185	National 2	core	1	G1:CORE взрослые мужские
+36197	SS-36197	Kensington Pro League	core	1	G1:CORE взрослые мужские
+36198	SS-36198	Wertheimer Stadtmeisterschaft	core	1	G1:CORE взрослые мужские
+36201	SS-36201	Gemeinde Cup Ubstadt-Weiher	core	1	G1:CORE взрослые мужские
+36209	SS-36209	BVIFA President's Cup	core	1	G1:CORE взрослые мужские
+36226	SS-36226	FKF Nairobi East County League	amateur	9	G1:2 региональные/любительские
+36275	SS-36275	Campeonato Defeso de Bairro de São-Paulo Camada Jr	reserve	9	G1:6 молодёжь/резерв
+36290	SS-36290	MiraBèl	core	1	G1:CORE взрослые мужские
+36318	SS-36318	Mundialito Gonaives	core	1	G1:CORE взрослые мужские
+36323	SS-36323	Campeonato de Maio	core	1	G1:CORE взрослые мужские
+36335	SS-36335	Chanpyona ADF e HCDF	core	1	G1:CORE взрослые мужские
+36346	SS-36346	Coupe Sacré Cœur	core	1	G1:CORE взрослые мужские
+36383	SS-36383	Campeonato Regional da Brava	amateur	9	G1:2 региональные/любительские
+36430	SS-36430	Championnat Sherly Jeude	core	1	G1:CORE взрослые мужские
+36437	SS-36437	Interzone Du Nord Ouest	core	1	G1:CORE взрослые мужские
+36438	SS-36438	Somali  Second League	core	1	G1:CORE взрослые мужские
+36439	SS-36439	Liga A2	core	1	G1:CORE взрослые мужские
+36469	SS-36469	Dhaka Interschool Champions League	student	0	G1:1 студенческие
+36470	SS-36470	Como Cup	core	1	G1:CORE взрослые мужские
+36474	SS-36474	Inter-Bairros de Bissau	core	1	G1:CORE взрослые мужские
+36491	SS-36491	Bermuda First Division	core	1	G1:CORE взрослые мужские
+36495	SS-36495	Coupe Francisque	core	1	G1:CORE взрослые мужские
+36498	SS-36498	Sri Lanka Champions League	core	1	G1:CORE взрослые мужские
+36516	SS-36516	ESCFE 1st Division	core	1	G1:CORE взрослые мужские
+36543	SS-36543	Macao FA Cup	core	1	G1:CORE взрослые мужские
+36551	SS-36551	Elite League Cup	core	1	G1:CORE взрослые мужские
+36559	SS-36559	Playball Africa	core	1	G1:CORE взрослые мужские
+36566	SS-36566	Ligue Football De Port-De-Paix	core	1	G1:CORE взрослые мужские
+36573	SS-36573	Torneio de Verão Póvoa de Varzim	core	1	G1:CORE взрослые мужские
+36578	SS-36578	Liga Semi Veteren	core	1	G1:CORE взрослые мужские
+36580	SS-36580	Maracana AMS	core	1	G1:CORE взрослые мужские
+36581	SS-36581	Campo Armada	core	1	G1:CORE взрослые мужские
+36584	SS-36584	OPL Pro/Rel Playoffs (W) 2026	women	9	G1:W женские/смешанные
+36586	SS-36586	Ontario Premier League 3 (W) Playoffs 2026	women	9	G1:W женские/смешанные
+36588	SS-36588	Copa dos Campeões Superliga	core	1	G1:CORE взрослые мужские
+36589	SS-36589	Marihano Super Challenge Cup	core	1	G1:CORE взрослые мужские
+36590	SS-36590	Team Profiter	core	1	G1:CORE взрослые мужские
+36591	SS-36591	CTF	core	1	G1:CORE взрослые мужские
+36593	SS-36593	Coupe Sainte-Claire	core	1	G1:CORE взрослые мужские
+36594	SS-36594	Negeri Sembilan Premier League	core	1	G1:CORE взрослые мужские
+36597	SS-36597	Torneo San Antonio	core	1	G1:CORE взрослые мужские

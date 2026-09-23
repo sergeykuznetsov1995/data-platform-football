@@ -1059,3 +1059,118 @@ def test_completed_scope_without_rejects_is_never_replanned(tmp_path):
     assert head not in _completed_plan(
         snapshot, tmp_path / "failures.json", {head}, release="bbbbbbbb"
     )
+
+
+# --- #1353: the denominator file filters and orders both queues ----------
+
+
+def _denominator(**classes):
+    """A denominator with the given ``{"t<id>": class}`` rows."""
+
+    from scrapers.sofascore.denominator import (
+        CLASS_PRIORITY,
+        Denominator,
+        DenominatorRow,
+    )
+
+    rows = {}
+    for name, tournament_class in classes.items():
+        tournament_id = int(name[1:])
+        rows[tournament_id] = DenominatorRow(
+            tournament_id=tournament_id,
+            capture_key=f"SS-{tournament_id}",
+            name=name,
+            tournament_class=tournament_class,
+            queue_priority=CLASS_PRIORITY[tournament_class],
+            basis="test",
+        )
+    return Denominator(rows=rows)
+
+
+@pytest.mark.unit
+def test_esoccer_tournament_is_never_planned_even_with_an_empty_core_queue():
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    # All core work is done: only the esoccer tournament has open scopes.
+    completed = {
+        campaign_scope_key(campaign_id, 17, 1725),
+        campaign_scope_key(campaign_id, 17, 1724),
+    }
+
+    planned = plan_historical_batch(
+        snapshot, completed=completed, batch_size=10,
+        denominator=_denominator(t17="core", t8="esoccer"),
+    )
+
+    assert planned == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("disputed", ["amateur", "show", "youth", "unknown"])
+def test_disputed_bucket_is_planned_only_after_every_core_depth(disputed):
+    snapshot = _snapshot()
+
+    planned = plan_historical_batch(
+        snapshot, completed=set(), batch_size=10,
+        denominator=_denominator(t17="core", t8=disputed),
+    )
+
+    # Core 17 at depth 0 AND depth 1 precede the disputed 8 at depth 0.
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1725", "campaign-test:17:1724",
+        "campaign-test:8:825", "campaign-test:8:824",
+    ]
+
+
+@pytest.mark.unit
+def test_tournament_missing_from_the_file_is_queued_last_with_a_warning(caplog):
+    snapshot = _snapshot()
+
+    planned = plan_historical_batch(
+        snapshot, completed=set(), batch_size=10,
+        denominator=_denominator(t8="core"),
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825", "campaign-test:8:824",
+        "campaign-test:17:1725", "campaign-test:17:1724",
+    ]
+    assert "tournament 17 is not in the denominator file" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("queue_mode", ["fresh", "backlog"])
+def test_refresh_planner_skips_student_and_ranks_core_before_disputed(queue_mode):
+    snapshot = _refresh_snapshot()
+    # The disputed tournament has the newer AND the bigger partition.
+    pending = [
+        _refresh_pending("SS-17", "2627", 1, 1_787_000_000),
+        _refresh_pending("SS-8", "2627", 50, 1_787_900_000),
+    ]
+
+    planned = plan_refresh_batch(
+        snapshot, pending, batch_size=2, queue_mode=queue_mode,
+        denominator=_denominator(t17="core", t8="amateur"),
+    )
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726", "campaign-test:8:826",
+    ]
+
+    planned = plan_refresh_batch(
+        snapshot, pending, batch_size=2, queue_mode=queue_mode,
+        denominator=_denominator(t17="core", t8="student"),
+    )
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726",
+    ]
+
+
+@pytest.mark.unit
+def test_current_season_targets_skip_esoccer_tournaments():
+    snapshot = _refresh_snapshot()
+
+    targets = current_season_targets(
+        snapshot, frozenset(), denominator=_denominator(t17="esoccer", t8="core")
+    )
+
+    assert [target.tournament_id for target in targets] == [8]

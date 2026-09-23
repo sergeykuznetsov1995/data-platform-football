@@ -115,6 +115,7 @@ jobs:
         run: |
           pytest -q \
             tests/unit/configs/test_sofascore_endpoint_coverage.py \
+            tests/unit/configs/test_sofascore_denominator_file.py \
             tests/unit/dags/test_dag_backfill_sofascore_all_mens.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
             tests/unit/dags/test_dag_refresh_sofascore_all_mens.py \

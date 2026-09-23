@@ -30,7 +30,7 @@ git -C "$TMP_TREE" checkout -q --detach "$SHA"
 # compose монтирует их из ${SOFASCORE_RELEASE_ROOT}, пустышек и симлинков больше нет.
 for f in deploy/sofascore/airflow.compose.yaml deploy/sofascore/gateway.compose.yaml \
          deploy/sofascore/.airflowignore deploy/sofascore/drain_breaker.py \
-         configs/sofascore/workload_policy.json \
+         configs/sofascore/workload_policy.json configs/sofascore/denominator.tsv \
          dags/dag_trigger_sofascore_daily.py \
          dags/dag_sofascore_manifest_maintenance.py; do
   [ -s "$TMP_TREE/$f" ] || { echo "ОШИБКА: в $SHA нет $f — коммит старше рецепта #1155" >&2; exit 1; }

@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import yaml
 
 from scrapers.sofascore.catalog import SofaScoreCatalog
+from scrapers.sofascore.denominator import Denominator, load_denominator
 
 
 class CampaignScopeError(ValueError):
@@ -119,8 +120,12 @@ def load_exact_scope(
     expected_snapshot_id: str | None = None,
     expected_campaign_id: str | None = None,
     allow_pending_season: bool = False,
+    denominator: Denominator | None = None,
 ) -> dict[str, Any]:
     """Load one ready tournament-season and bind it to the snapshot digest.
+
+    A tournament outside the denominator queues (``queue_priority 0``:
+    esoccer, student; #1353) is refused before any other check.
 
     ``allow_pending_season`` admits a season whose metadata is still
     ``pending`` (no team pages, hence no ``team_count``/evidence): the refresh
@@ -160,6 +165,12 @@ def load_exact_scope(
             f"snapshot must contain exactly one tournament {wanted_tournament}"
         )
     tournament = matches[0]
+    denominator = load_denominator() if denominator is None else denominator
+    if denominator.queue_priority(wanted_tournament) == 0:
+        raise CampaignScopeError(
+            f"tournament {wanted_tournament} is outside the denominator queues "
+            f"({denominator.class_of(wanted_tournament)})"
+        )
     if tournament.get("metadata_status") != "ready":
         raise CampaignScopeError("tournament metadata_status must be ready")
     classification = tournament.get("classification")

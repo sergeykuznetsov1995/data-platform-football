@@ -547,6 +547,41 @@ s.clear_failed(p, campaign_id=cid, scope_key=f'{cid}:<tournament_id>:<source_sea
   лист `propagate_ingest_status` исполняется и краснит DagRun при `validate_data=failed`; валидаторы
   игроков в такие дни сами выходят `AirflowSkipException`.
 
+## Реестр знаменателя (#1353)
+
+**Что это.** `configs/sofascore/denominator.tsv` — один файл, который решает, какие турниры
+«наши» и в каком порядке их собирать. Колонки: `tournament_id capture_key name class
+queue_priority basis`. В файле все 1 504 турнира снапшота кампании (sha256 их отсортированных
+id обязан совпасть с `candidate_ids_sha256` политики `all_mens_campaign.json` — это проверяет
+тест-контракт) плюс 7 турниров реестра дейли, которых в снапшоте нет (8, 16, 17, 23, 34, 35,
+203; `capture_key` = их `canonical_id`, в очередь кампании не входят — их собирает дейли).
+Набор id снапшота файл не меняет: он фильтр и порядок поверх снапшота. Читает его
+`scrapers/sofascore/denominator.py` (`load_denominator`, путь — `SOFASCORE_DENOMINATOR_PATH`
+или `/opt/airflow/configs/sofascore/denominator.tsv` из релиза); ошибка формата —
+`DenominatorError`, план падает (fail-closed). `freeze_release.sh` не заморозит релиз без файла.
+
+**Классы и приоритеты** (пара `class → queue_priority` проверяется загрузчиком):
+
+| класс | приоритет | что значит |
+|---|---|---|
+| `core` | 1 | штатный порядок полос |
+| `youth`, `reserve`, `amateur`, `show`, `women`, `unknown` | 9 | только после всего ядра всех глубин |
+| `esoccer`, `student` | 0 | вне очереди истории, актуалки и обхода афиши |
+
+Кто читает: `plan_historical_batch` (турнир с `0` пропускается целиком; ранг
+`(queue_priority, depth, -start_year, tournament_id)`), `plan_refresh_batch` (пропуск `0`, ключ
+`(queue_priority, <ключ режима fresh/backlog>)`), `current_season_targets` афиши (пропуск `0`;
+порядок обхода — прежний, по паре id: курсор-якорь `_cursor_index` требует отсортированной
+по паре последовательности), `load_exact_scope` (скоуп турнира с `0` — отказ
+`tournament <id> is outside the denominator queues (<класс>)`). Турнир, которого в файле нет,
+идёт с приоритетом 9 и предупреждением в логе планировщика.
+
+**Как поменять класс.** Одна строка файла: `class`, соответствующий `queue_priority` и `basis`
+(почему), PR → ночная доставка. Планировщики перечитывают файл при каждом плане: DAG
+(`@continuous` история, актуалка, афиша) перезапускать не нужно — новый порядок действует со
+следующего плана после доставки. 59 из 87 турниров `gender=unknown` размечены `core`, но в
+очередь пока не попадают: снапшот держит их и все их сезоны `excluded` (возврат — отдельный PR).
+
 ## Мины, которые уже стреляли
 
 - Дерево 0700 от `mktemp` → шлюз в цикле `Permission denied` (25.08); `freeze_release.sh`
