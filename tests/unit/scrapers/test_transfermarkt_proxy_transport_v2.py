@@ -1498,6 +1498,46 @@ def test_single_attempt_transport_failure_still_logs_the_proxy_status(
     assert "proxy_status=0 upstream_class=dead_exit" in lines[0]
 
 
+def test_connect_reason_phrase_class_is_logged_without_header(monkeypatch, caplog):
+    """#1389-B: tls-client drops CONNECT headers; the class rides the status text.
+
+    A rejected CONNECT surfaces as a status-0 pseudo-response whose text is the
+    Go transport error (tls_requests ``Response.reason`` == ``text`` at 0), or
+    as an exception with the same text.
+    """
+
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(8 * 1024 * 1024))
+    monkeypatch.delenv("TRANSFERMARKT_RAW_STORE_URI", raising=False)
+    pseudo = _Response(b"proxyconnect tcp: Bad Gateway (upstream=407)", status=0)
+    factory = _TlsFactory(
+        [
+            pseudo,
+            RuntimeError("failed to do request: Bad Gateway (upstream=timeout)"),
+            _Response(b"ok"),
+        ]
+    )
+    client = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        lease_metadata=_metadata(),
+        client_factory=factory,
+        sleep_fn=lambda _: None,
+    )
+
+    with caplog.at_level("WARNING", logger="scrapers.transfermarkt.client"):
+        outcome = client.fetch(
+            "https://www.transfermarkt.us/a", as_json=False, max_attempts=3,
+        )
+
+    assert outcome.status is FetchStatus.OK
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "attempt" in record.getMessage()
+    ]
+    assert len(lines) == 2
+    assert "proxy_status=0 upstream_class=407" in lines[0]
+    assert "upstream_class=timeout" in lines[1]
+
+
 @pytest.mark.unit
 def test_gateway_502_with_upstream_header_logs_the_class(monkeypatch, caplog):
     """#1389 (code-review): a real gateway 502 carries the class on HTTP."""
