@@ -187,22 +187,46 @@ def test_daily_sql_grades_a_synthetic_manifest(synthetic):
     assert summarize_days([day_11, day_12, day_14]) == 0
 
 
+def _add_unplayed_game_7(con):
+    # The last complete attempt (b3, 13.10 14:00) ran before this kickoff,
+    # so its schedule still says is_result = false.
+    con.execute(
+        "INSERT INTO bronze.understat_schedule VALUES "
+        "('L', '2627', 7, '2026-10-13 18:00', false, 'b3')"
+    )
+
+
+def _journal(con, attempt_id, status, completed_at, game_ids, known=True):
+    con.execute(
+        "INSERT INTO ops.understat_ingest_failures_v1 VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "L", "2627", "understat-bronze-v2", f"batch-{attempt_id}",
+            attempt_id, status, completed_at,
+            json.dumps(
+                {"site_result_game_ids": game_ids, "site_result_known": known}
+            ),
+        ),
+    )
+
+
 def test_failed_latest_attempt_keeps_its_matches_due_as_our_delay(synthetic):
     """Plan decision 10: a failure after the write marker is the latest row;
     the schedule of the last complete attempt still defines the deadlines."""
+    _add_unplayed_game_7(synthetic.con)
     synthetic.con.execute(
         "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
         (
-            "L", "2627", "understat-bronze-v2", "b4", "a4",
+            "L", "2627", "understat-bronze-v2", "batch-a4", "a4",
             "contract_failure", "2026-10-14T09:30:00+00:00", "{}",
         ),
     )
-    synthetic.con.execute(
-        "INSERT INTO bronze.understat_schedule VALUES "
-        "('L', '2627', 7, '2026-10-13 18:00', true, 'b3')"
+    _journal(
+        synthetic.con, "a4", "contract_failure", "2026-10-14T09:30:00+00:00",
+        ["1", "2", "3", "4", "5", "6", "7"],
     )
 
-    # g7: deadline 14.10 20:00, the only attempt in the window failed.
+    # g7: deadline 14.10 20:00, the site result is known only from the
+    # failed attempt -> due and not on time (ours), not a site delay.
     assert synthetic("2026-10-14") == DayResult(
         "2026-10-14", due=1, ok=0, site_late=0
     )
@@ -210,6 +234,33 @@ def test_failed_latest_attempt_keeps_its_matches_due_as_our_delay(synthetic):
     assert synthetic("2026-10-12") == DayResult(
         "2026-10-12", due=2, ok=1, site_late=1
     )
+
+
+def test_game_seen_only_by_a_dq_failure_is_due_and_ours(synthetic):
+    """Astra round 3: old schedule with is_result = false, a DQ journal row
+    with the known result, no newer complete attempt."""
+    _add_unplayed_game_7(synthetic.con)
+    assert synthetic("2026-10-14").due == 0
+
+    _journal(
+        synthetic.con, "a7", "dq_failure", "2026-10-14T09:30:00+00:00", ["7"]
+    )
+    assert synthetic("2026-10-14") == DayResult(
+        "2026-10-14", due=1, ok=0, site_late=0
+    )
+
+
+def test_unknown_or_late_site_lists_do_not_add_due_games(synthetic):
+    _add_unplayed_game_7(synthetic.con)
+    _journal(
+        synthetic.con, "a8", "retryable_failure", "2026-10-14T09:30:00+00:00",
+        ["7"], known=False,
+    )
+    _journal(
+        synthetic.con, "a9", "dq_failure", "2026-10-14T21:00:00+00:00", ["7"]
+    )
+
+    assert synthetic("2026-10-14").due == 0
 
 
 def test_site_result_seen_by_a_journaled_failure_is_not_a_site_delay(synthetic):

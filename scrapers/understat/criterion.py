@@ -4,7 +4,10 @@ Definition (grill 23.09, roadmap assumptions; the morning report copies the
 SQL text below verbatim, so change it only together with that copy):
 
 * A match is *played* when the schedule of the latest ``complete`` attempt of
-  the scope (``_batch_id`` equals its ``batch_id``) has ``is_result = true``.
+  the scope (``_batch_id`` equals its ``batch_id``) has ``is_result = true``,
+  or when any attempt completed by its deadline listed it in
+  ``site_result_game_ids`` (a complete attempt or a failures-journal row with
+  ``site_result_known = true``) and that schedule has its row (kickoff).
   Not the consumers' fence (latest row must be ``complete``): the season
   schedule is known in advance, so a failed latest attempt must not drop its
   matches from ``due`` -- they stay due and count as our delay.
@@ -79,20 +82,20 @@ lc AS (
     )
     WHERE rn = 1
 ),
-played AS (
+sched AS (
     SELECT s.league, s.season, CAST(s.game_id AS varchar) AS game_id,
-           s.date AS kickoff,
-           count(*) OVER (
+           s.date AS kickoff, s.is_result,
+           CASE WHEN s.is_result THEN count_if(s.is_result) OVER (
                PARTITION BY s.league, s.season ORDER BY s.date
-           ) AS ordinal
+           ) END AS ordinal
     FROM iceberg.bronze.understat_schedule s
     JOIN lc ON lc.league = s.league AND lc.season = s.season
-    WHERE s._batch_id = lc.batch_id AND s.is_result
+    WHERE s._batch_id = lc.batch_id
 ),
-due AS (
-    SELECT league, season, game_id, kickoff, ordinal,
+cand AS (
+    SELECT league, season, game_id, kickoff, is_result, ordinal,
            kickoff + INTERVAL '26' HOUR AS deadline
-    FROM played
+    FROM sched
     WHERE kickoff + INTERVAL '26' HOUR >= TIMESTAMP '{day} 00:00:00'
       AND kickoff + INTERVAL '26' HOUR < TIMESTAMP '{day} 00:00:00' + INTERVAL '1' DAY
 ),
@@ -118,6 +121,25 @@ journal AS (
     FROM {failures} f
     WHERE f.contract_version = 'understat-bronze-v2'
       AND json_extract_scalar(f.quality_json, '$.site_result_known') = 'true'
+),
+seen AS (
+    SELECT league, season, done, site FROM att WHERE site IS NOT NULL
+    UNION ALL
+    SELECT league, season, done, site FROM journal
+),
+seen_by_deadline AS (
+    SELECT DISTINCT c.league, c.season, c.game_id
+    FROM cand c
+    JOIN seen v
+      ON v.league = c.league AND v.season = c.season
+     AND v.done <= c.deadline AND contains(v.site, c.game_id)
+),
+due AS (
+    SELECT c.league, c.season, c.game_id, c.kickoff, c.ordinal, c.deadline
+    FROM cand c
+    LEFT JOIN seen_by_deadline sd
+      ON sd.league = c.league AND sd.season = c.season AND sd.game_id = c.game_id
+    WHERE c.is_result OR sd.game_id IS NOT NULL
 ),
 journal_seen AS (
     SELECT d.league, d.game_id, count(*) AS hits
