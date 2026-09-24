@@ -1403,8 +1403,11 @@ class TestReaderPreflight:
         connection.cursor.return_value = cursor
         monkeypatch.setattr(tm_v2, 'connect', lambda: connection)
         monkeypatch.setattr(tm_v2, 'read_reader_state', lambda *a, **kw: state)
+        # #1387: the read-before-write gate is gone; views are never read.
         monkeypatch.setattr(
-            tm_v2, 'verify_reader_views', lambda *a, **kw: {'passed': True},
+            tm_v2,
+            'verify_reader_views',
+            lambda *a, **kw: pytest.fail('verify_reader_views must not run'),
         )
         result = dag_module._preflight_reader_route_for_paid_cycle()
         assert dag_module.probe_calls == []
@@ -1412,6 +1415,10 @@ class TestReaderPreflight:
         assert result['candidate_slot'] == 'b'
         assert result['write_mode'] == 'dual'
         assert result['paid_io_allowed'] is True
+        assert set(result) == {
+            'active_version', 'active_slot', 'candidate_slot', 'revision',
+            'reader_views', 'write_mode', 'paid_io_allowed',
+        }
 
 
 class _ProbeResponse:

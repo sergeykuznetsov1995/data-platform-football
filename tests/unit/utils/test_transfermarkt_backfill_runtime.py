@@ -455,10 +455,11 @@ def test_strict_preflight_requires_v2_legacy_shutdown_raw_and_durable_permits(
         cleanup_completed_at=None,
     )
     monkeypatch.setattr(tm_v2, "read_reader_state", lambda *_a, **_k: reader)
+    # #1387: the read-before-write gate is gone; views are never read.
     monkeypatch.setattr(
         tm_v2,
         "verify_reader_views",
-        lambda *_a, **_k: {"passed": True},
+        lambda *_a, **_k: pytest.fail("verify_reader_views must not run"),
     )
     monkeypatch.setattr(tm_v2, "inactive_slot", lambda _reader: "b")
 

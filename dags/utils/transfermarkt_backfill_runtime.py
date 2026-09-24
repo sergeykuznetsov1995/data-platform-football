@@ -935,20 +935,12 @@ def strict_cutover_preflight(
             raise BackfillRuntimeError(
                 "Transfermarkt v2 cutover and legacy-writer shutdown are required"
             )
-        cleanup = reader.cleanup_completed_at is not None
-        views = tm_v2.verify_reader_views(
-            cur,
-            expected_version="v2",
-            expected_revision=reader.revision,
-            expected_slot=reader.active_slot,
-            allow_static_slot=cleanup,
-            require_no_legacy=cleanup,
-        )
-        if not views.get("passed"):
-            raise BackfillRuntimeError("Transfermarkt v2 reader route preflight failed")
     finally:
         cur.close()
         conn.close()
+    # #1387: the read-before-write gate (``verify_reader_views``) is gone; the
+    # reader state above still pins the v2 slot and revision.
+    views = {"verified": False, "reason": "read-before-write gate removed (#1387)"}
 
     raw_factory = raw_store_factory or (lambda: RawResponseStore.from_env())
     raw_store = raw_factory()
