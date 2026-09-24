@@ -360,6 +360,10 @@ _PAID_LEDGER_CHAIN_COUNT = 0
 _PAID_LEDGER_CHAIN_OFFSET = 0
 _PAID_LEDGER_CHAIN_TAIL = ""
 SOURCE_MODE = "shared-no-whoscored"
+# Isolated Transfermarkt gateway (#1387): only the two Transfermarkt traffic
+# classes, bounded by the per-lease cap alone (no daily/DagRun/URL budget).
+TRANSFERMARKT_ONLY_SOURCE_MODE = "transfermarkt-only"
+TRANSFERMARKT_ONLY_SOURCES = frozenset({"transfermarkt", "transfermarkt_backfill"})
 SOFASCORE_CHALLENGE_HOSTS = frozenset(
     {"challenges.cloudflare.com", "turnstile.cloudflare.com"}
 )
@@ -491,7 +495,7 @@ async def _open_upstream_connection(
     )
 
 
-def _dagrun_budget_bytes(dag_id: str) -> int:
+def _dagrun_budget_bytes(dag_id: str) -> int | None:
     """Return the source-specific hard cap without weakening WhoScored."""
     if dag_id in SOFASCORE_DISCOVERY_DAG_IDS:
         return SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
@@ -534,9 +538,22 @@ def _source_for_lease_request(dag_id: str, requested_source: str) -> str:
     return _source_for_dag(dag_id)
 
 
+def _transfermarkt_only() -> bool:
+    """Return whether this gateway is the isolated Transfermarkt contour (#1387).
+
+    That contour has no daily, DagRun or per-URL byte ceiling: only the
+    per-lease cap (``--max-lease-mb``) and the Transfermarkt request pacing
+    bound its spend.
+    """
+
+    return SOURCE_MODE == TRANSFERMARKT_ONLY_SOURCE_MODE
+
+
 def _uses_shared_daily_budget(source: str) -> bool:
     """Return whether a traffic class belongs to the production UTC-day cap."""
 
+    if _transfermarkt_only():
+        return False
     return source != "transfermarkt_backfill"
 
 
@@ -1734,7 +1751,7 @@ def _url_total_bytes(run_key: str, canonical_url: str) -> int:
     return _url_up_bytes[key] + _url_down_bytes[key]
 
 
-def _lease_dagrun_budget_bytes(lease: Lease) -> int:
+def _lease_dagrun_budget_bytes(lease: Lease) -> int | None:
     """Use the signed sum of allocations for production SofaScore runs."""
 
     if lease.source == "sofascore":
@@ -1762,7 +1779,10 @@ def _lease_dagrun_budget_bytes(lease: Lease) -> int:
     return _dagrun_budget_bytes(lease.dag_id)
 
 
-def _lease_url_budget_bytes(lease: Lease) -> int:
+def _lease_url_budget_bytes(lease: Lease) -> int | None:
+    if _transfermarkt_only():
+        # The isolated Transfermarkt contour has no per-URL ceiling (#1387).
+        return None
     # A warmed SofaScore browser intentionally captures many API endpoints in
     # one lease.  The measured DagRun cap is its URL/session cap too, so the
     # legacy per-page WhoScored ceiling cannot truncate the warmed session.
@@ -3216,6 +3236,8 @@ def _create_lease(
     if requested_source and requested_source != inferred_source:
         raise ValueError("paid lease source does not match dag_id")
     source = inferred_source or requested_source
+    if _transfermarkt_only() and source not in TRANSFERMARKT_ONLY_SOURCES:
+        raise ValueError("dedicated Transfermarkt service rejects every other source")
     lease_manager = mgr
     if source == "transfermarkt_backfill":
         if TRANSFERMARKT_BACKFILL_PROXY_MANAGER is None:
@@ -3296,13 +3318,18 @@ def _create_lease(
         raise RuntimeError(
             "SofaScore discovery lease unavailable: explicit DagRun cap required"
         )
-    if source == "transfermarkt" and TRANSFERMARKT_DAGRUN_BUDGET_BYTES <= 0:
+    if (
+        source == "transfermarkt"
+        and not _transfermarkt_only()
+        and TRANSFERMARKT_DAGRUN_BUDGET_BYTES <= 0
+    ):
         raise RuntimeError(
             "Transfermarkt paid-proxy budget unavailable: explicit source-scoped "
             "authorization required"
         )
     if (
         source == "transfermarkt_backfill"
+        and not _transfermarkt_only()
         and TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES <= 0
     ):
         raise RuntimeError(
@@ -3414,10 +3441,14 @@ def _create_lease(
             whoscored_global_available,
         )
     else:
-        available_components = [
-            dagrun_budget - _run_total_bytes(run_key),
-            url_budget - _url_total_bytes(run_key, canonical_url),
-        ]
+        if _transfermarkt_only():
+            # #1387: the per-lease cap is the only byte bound of this contour.
+            available_components = [max_bytes]
+        else:
+            available_components = [
+                dagrun_budget - _run_total_bytes(run_key),
+                url_budget - _url_total_bytes(run_key, canonical_url),
+            ]
         if _uses_shared_daily_budget(source):
             available_components.append(DAILY_BUDGET_BYTES - _daily_total_bytes())
         if parent_envelope is not None:
@@ -3766,6 +3797,9 @@ def _lease_budget_capacity(lease: Lease, *, include_reservations: bool) -> int:
             max(0, lease.max_bytes - lease.total_bytes - lease_reserved),
             max(0, lease.global_budget_escrow_bytes - lease_reserved),
         )
+    if _transfermarkt_only():
+        # #1387: no daily/DagRun/URL ceiling; only the lease cap bounds spend.
+        return max(0, lease.max_bytes - lease.total_bytes - lease_reserved)
     daily_reserved = _daily_reserved_bytes if include_reservations else 0
     daily_remaining = (
         max(0, DAILY_BUDGET_BYTES - _daily_total_bytes() - daily_reserved)
@@ -4169,6 +4203,7 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
             raise RuntimeError("durable paid byte accounting failed")
     if lease.total_bytes >= lease.max_bytes or (
         lease.source != "whoscored"
+        and not _transfermarkt_only()
         and (
             (
                 _uses_shared_daily_budget(lease.source)
@@ -5614,15 +5649,14 @@ async def _close_lease(
 
 def _control_report(lease: Lease) -> dict[str, Any]:
     report = lease.report()
+    if _transfermarkt_only():
+        return report
     report["daily_total_bytes"] = _daily_total_bytes()
     report["daily_budget_bytes"] = DAILY_BUDGET_BYTES
     return report
 
 
-def _service_health_report(mgr) -> dict[str, Any]:
-    """Credential-free configuration and counters, never pool identities."""
-
-    remaining = max(0, DAILY_BUDGET_BYTES - _daily_total_bytes())
+def _exit_pool_health(mgr) -> dict[str, Any]:
     exit_total = int(getattr(mgr, "total_count", 0))
     dead_exits = min(_dead_exit_count(), exit_total)
     live_exits = exit_total - dead_exits
@@ -5637,6 +5671,59 @@ def _service_health_report(mgr) -> dict[str, Any]:
             if live_ratio is not None and live_ratio < EXIT_POOL_DEGRADED_RATIO
             else "ok"
         ),
+    }
+
+
+def _transfermarkt_permit_health() -> dict[str, Any]:
+    return {
+        "transfermarkt_requests_per_minute": TRANSFERMARKT_REQUESTS_PER_MINUTE,
+        "transfermarkt_request_permit_consume_required": True,
+        "transfermarkt_request_permit_pending_ttl_seconds": (
+            TransfermarktRequestPermitController.PENDING_TTL_SECONDS
+        ),
+        "transfermarkt_backfill_max_queue_seconds": (
+            TransfermarktRequestPermitController.BACKFILL_MAX_QUEUE_SECONDS
+        ),
+        "transfermarkt_request_permit_granted_ttl_seconds": (
+            TransfermarktRequestPermitController.GRANTED_TTL_SECONDS
+        ),
+        "transfermarkt_request_permit_state_durable": bool(
+            TRANSFERMARKT_REQUEST_PERMITS.state_path
+        ),
+    }
+
+
+def _transfermarkt_only_health_report(mgr) -> dict[str, Any]:
+    """Isolated Transfermarkt gateway: no daily/DagRun/URL budget keys (#1387)."""
+
+    return {
+        **_exit_pool_health(mgr),
+        "meter": PROVIDER_METER_ID,
+        "max_lease_bytes": MAX_LEASE_BYTES,
+        "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
+        "max_active_leases": MAX_ACTIVE_LEASES,
+        "lease_proxy_url": LEASE_PROXY_URL,
+        "configured_pool_count": int(mgr.total_count),
+        "transfermarkt_paid_enabled": bool(TRANSFERMARKT_CONTROL_TOKEN),
+        "transfermarkt_backfill_paid_enabled": (
+            bool(TRANSFERMARKT_BACKFILL_CONTROL_TOKEN)
+            and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+        ),
+        "transfermarkt_backfill_dag_ids": sorted(TRANSFERMARKT_BACKFILL_DAG_IDS),
+        "transfermarkt_backfill_uses_production_daily_budget": False,
+        **_transfermarkt_permit_health(),
+        "source_mode": SOURCE_MODE,
+    }
+
+
+def _service_health_report(mgr) -> dict[str, Any]:
+    """Credential-free configuration and counters, never pool identities."""
+
+    if _transfermarkt_only():
+        return _transfermarkt_only_health_report(mgr)
+    remaining = max(0, DAILY_BUDGET_BYTES - _daily_total_bytes())
+    return {
+        **_exit_pool_health(mgr),
         "meter": PROVIDER_METER_ID,
         "daily_total_bytes": _daily_total_bytes(),
         "daily_budget_bytes": DAILY_BUDGET_BYTES,
@@ -5679,20 +5766,7 @@ def _service_health_report(mgr) -> dict[str, Any]:
         ),
         "transfermarkt_backfill_budget_namespace": ("transfermarkt_backfill_dagrun"),
         "transfermarkt_backfill_uses_production_daily_budget": False,
-        "transfermarkt_requests_per_minute": TRANSFERMARKT_REQUESTS_PER_MINUTE,
-        "transfermarkt_request_permit_consume_required": True,
-        "transfermarkt_request_permit_pending_ttl_seconds": (
-            TransfermarktRequestPermitController.PENDING_TTL_SECONDS
-        ),
-        "transfermarkt_backfill_max_queue_seconds": (
-            TransfermarktRequestPermitController.BACKFILL_MAX_QUEUE_SECONDS
-        ),
-        "transfermarkt_request_permit_granted_ttl_seconds": (
-            TransfermarktRequestPermitController.GRANTED_TTL_SECONDS
-        ),
-        "transfermarkt_request_permit_state_durable": bool(
-            TRANSFERMARKT_REQUEST_PERMITS.state_path
-        ),
+        **_transfermarkt_permit_health(),
         "whoscored_default_paid_cap_bytes": DEFAULT_WHOSCORED_PAID_CAP_BYTES,
         "whoscored_signed_campaigns_required": True,
         "whoscored_provider_invoice_hard_cap_available": (
@@ -5778,14 +5852,25 @@ async def _handle_control(
             if not _control_token_valid(headers, source=traffic_class):
                 await _send_json(writer, 401, {"error": "invalid control token"})
                 return True
-            source_ready = (
-                TRANSFERMARKT_DAGRUN_BUDGET_BYTES > 0
-                if traffic_class == "transfermarkt"
-                else (
-                    TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES > 0
-                    and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+            if _transfermarkt_only():
+                # #1387: no budget flags; a configured class is a ready class.
+                source_ready = (
+                    bool(TRANSFERMARKT_CONTROL_TOKEN)
+                    if traffic_class == "transfermarkt"
+                    else (
+                        bool(TRANSFERMARKT_BACKFILL_CONTROL_TOKEN)
+                        and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+                    )
                 )
-            )
+            else:
+                source_ready = (
+                    TRANSFERMARKT_DAGRUN_BUDGET_BYTES > 0
+                    if traffic_class == "transfermarkt"
+                    else (
+                        TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES > 0
+                        and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+                    )
+                )
             if not source_ready:
                 raise RuntimeError(
                     "Transfermarkt request permits are unavailable for this source"
@@ -6039,6 +6124,22 @@ async def _handle_control(
                 str(request.get("dag_id") or "").strip(),
                 str(request.get("source") or "").strip(),
             )
+            if (
+                _transfermarkt_only()
+                and request_source not in TRANSFERMARKT_ONLY_SOURCES
+            ):
+                await _send_json(
+                    writer,
+                    403,
+                    {
+                        "code": "source_rejected",
+                        "error": (
+                            "dedicated Transfermarkt service rejects every "
+                            "other source"
+                        ),
+                    },
+                )
+                return True
             if not _control_token_valid(headers, source=request_source):
                 await _send_json(writer, 401, {"error": "invalid control token"})
                 return True
@@ -7283,7 +7384,7 @@ async def main() -> None:
     ap.add_argument("--listen", default="0.0.0.0:8899")
     ap.add_argument(
         "--source-mode",
-        choices=("shared-no-whoscored", "whoscored-only"),
+        choices=("shared-no-whoscored", "whoscored-only", "transfermarkt-only"),
         default="shared-no-whoscored",
     )
     ap.add_argument(
@@ -7542,6 +7643,33 @@ async def main() -> None:
     ap.add_argument("--budget-workload-class")
     args = ap.parse_args()
 
+    if str(args.source_mode) == TRANSFERMARKT_ONLY_SOURCE_MODE:
+        # #1387: the isolated Transfermarkt gateway has no byte budget other
+        # than the per-lease cap.  An explicit budget flag (also abbreviated)
+        # is an operator error, never silently ignored; env-derived budget
+        # defaults are not consulted in this mode.
+        budget_dests = (
+            "daily_budget_mb",
+            "daily_budget_bytes",
+            "dagrun_budget_bytes",
+            "transfermarkt_dagrun_budget_bytes",
+            "transfermarkt_backfill_dagrun_budget_bytes",
+            "url_budget_bytes",
+            "sofascore_discovery_dagrun_budget_bytes",
+            "sofascore_budget_artifact",
+        )
+        unset = object()
+        ap.set_defaults(**{dest: unset for dest in budget_dests})
+        probe = ap.parse_args()
+        supplied = sorted(
+            dest for dest in budget_dests if getattr(probe, dest, unset) is not unset
+        )
+        if supplied:
+            raise SystemExit(
+                "--source-mode=transfermarkt-only forbids byte budget flags: "
+                + ", ".join("--" + dest.replace("_", "-") for dest in supplied)
+            )
+
     if str(args.source_mode) == "whoscored-only" and bool(
         getattr(args, "allow_legacy_noauth", False)
     ):
@@ -7707,6 +7835,23 @@ async def main() -> None:
         raise SystemExit(
             "proxy byte budgets must be positive; disabled source caps may be zero"
         )
+    if SOURCE_MODE == TRANSFERMARKT_ONLY_SOURCE_MODE:
+        if len(TRANSFERMARKT_CONTROL_TOKEN) < 32:
+            raise SystemExit(
+                "TM_PROXY_CONTROL_TOKEN must contain at least 32 characters for "
+                "--source-mode=transfermarkt-only"
+            )
+        if not transfermarkt_permit_state_path:
+            raise SystemExit(
+                "--source-mode=transfermarkt-only requires "
+                "--transfermarkt-permit-state"
+            )
+        # Budget flags are forbidden here: an enabled class is a configured
+        # class.  Feed that to the shared admission checks below.
+        transfermarkt_budget_bytes = 1
+        transfermarkt_backfill_budget_bytes = (
+            1 if TRANSFERMARKT_BACKFILL_CONTROL_TOKEN else 0
+        )
     if transfermarkt_budget_bytes > 0 and len(TRANSFERMARKT_CONTROL_TOKEN) < 32:
         raise SystemExit(
             "TM_PROXY_CONTROL_TOKEN must contain at least 32 characters when "
@@ -7779,6 +7924,11 @@ async def main() -> None:
     TRANSFERMARKT_DAGRUN_BUDGET_BYTES = transfermarkt_budget_bytes
     TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = transfermarkt_backfill_budget_bytes
     TRANSFERMARKT_PERMIT_STATE_PATH = transfermarkt_permit_state_path
+    if SOURCE_MODE == TRANSFERMARKT_ONLY_SOURCE_MODE:
+        # #1387: no daily, DagRun or URL ceiling exists in this contour.
+        DAILY_BUDGET_BYTES = None
+        TRANSFERMARKT_DAGRUN_BUDGET_BYTES = None
+        TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = None
     try:
         TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController(
             requests_per_minute=TRANSFERMARKT_REQUESTS_PER_MINUTE,
@@ -7793,7 +7943,9 @@ async def main() -> None:
         )
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
-    URL_BUDGET_BYTES = url_budget_bytes
+    URL_BUDGET_BYTES = (
+        None if SOURCE_MODE == TRANSFERMARKT_ONLY_SOURCE_MODE else url_budget_bytes
+    )
     MAX_ACTIVE_LEASES = max_active_leases
     SOFASCORE_MAX_ACTIVE_LEASES = sofascore_max_active_leases
     LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = lease_connect_timeout_seconds
@@ -7922,11 +8074,14 @@ async def main() -> None:
             )
         except (OSError, RuntimeError, ProxyCampaignError) as exc:
             raise SystemExit(f"WhoScored protected state rejected: {exc}") from None
-    _restore_daily_counter(out_path)
+    tm_only = SOURCE_MODE == TRANSFERMARKT_ONLY_SOURCE_MODE
+    if not tm_only:
+        # #1387: the Transfermarkt-only contour has no UTC-day counter.
+        _restore_daily_counter(out_path)
     report_daily = (_daily_up_bytes, _daily_down_bytes)
     _daily_day = ""
     _daily_up_bytes = _daily_down_bytes = 0
-    restored_events = _restore_budget_ledger(LEDGER_PATH, restore_daily=True)
+    restored_events = _restore_budget_ledger(LEDGER_PATH, restore_daily=not tm_only)
     if sum(report_daily) > _daily_total_bytes():
         # Conservative compatibility for bytes recorded before the WAL was
         # deployed. Never add report+WAL, which would double count.
@@ -7982,7 +8137,11 @@ async def main() -> None:
         os.environ.get("TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON", "")
     ).strip()
     TRANSFERMARKT_BACKFILL_PROXY_MANAGER = None
-    if TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES > 0 and not backfill_pool_json:
+    if (
+        SOURCE_MODE != TRANSFERMARKT_ONLY_SOURCE_MODE
+        and TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES > 0
+        and not backfill_pool_json
+    ):
         raise SystemExit(
             "TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON is required when Transfermarkt "
             "backfill paid proxying is enabled"
