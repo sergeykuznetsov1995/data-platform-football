@@ -1,0 +1,40 @@
+{
+  "leagues": [
+    {
+      "id": "730",
+      "slug": "ita.1",
+      "calendar": ["2020-09-19T12:00Z"],
+      "sourceOptional": {"z": 2, "a": 1}
+    }
+  ],
+  "events": [
+    {
+      "id": "401000001",
+      "date": "2020-09-19T18:45Z",
+      "name": "Home FC at Away FC",
+      "shortName": "HOM @ AWY",
+      "season": {"year": 2020, "type": 1},
+      "status": {"type": {"name": "STATUS_FULL_TIME", "completed": true}},
+      "competitions": [
+        {
+          "attendance": 1000,
+          "venue": {"id": "99", "fullName": "Native Ground"},
+          "competitors": [
+            {
+              "homeAway": "home",
+              "score": "2",
+              "team": {"id": "10", "displayName": "Home FC", "abbreviation": "HOM"}
+            },
+            {
+              "homeAway": "away",
+              "score": "1",
+              "team": {"id": "20", "displayName": "Away FC", "abbreviation": "AWY"}
+            }
+          ],
+          "optionalCompetitionField": "kept"
+        }
+      ],
+      "optionalEventField": {"b": 2, "a": 1}
+    }
+  ]
+}
