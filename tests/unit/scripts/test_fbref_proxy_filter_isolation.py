@@ -20,7 +20,7 @@ SHARED_FILTER_SHA256 = (
     # (#1248 stage 1).  FBref keeps its own filter and stays out of
     # ``runtime_files`` — both asserted below.  #1350: ledgers flushed off
     # the per-chunk path.  #1389-B: upstream failure class, tunnels, /health.
-    "c0b99033fffeae14c7918f97d6e750d19e4617ed4ae514ded43048ba5a23c0e8"
+    "032b1f6a7c192f8a390be73e7ee8fa60db249f58df6873a9655c65a3b7848050"
 )
 
 

@@ -6506,7 +6506,7 @@ async def _open_lease_upstream_tunnel(
                 # not dead-exit signals: never failover, surface them as before.
                 raise
             last_error = exc
-            _mark_exit_dead(lease.upstream)
+            _mark_exit_dead(lease.upstream, lease)
         # FBref must never spend a second paid CONNECT attempt. SofaScore's
         # separately bounded dead-exit policy remains response-byte based.
         failover_allowed = (
@@ -6559,7 +6559,13 @@ EXIT_POOL_DEGRADED_RATIO = 0.5
 DEAD_EXITS: dict[str, float] = {}
 
 
-def _mark_exit_dead(upstream: tuple[str, int, str, str]) -> None:
+def _mark_exit_dead(
+    upstream: tuple[str, int, str, str], lease: "Lease | None" = None
+) -> None:
+    # /health divides by the production pool; the Transfermarkt backfill draws
+    # from its own dedicated pool, so its failures must not count here.
+    if lease is not None and lease.source == "transfermarkt_backfill":
+        return
     DEAD_EXITS[_upstream_fingerprint(upstream)] = (
         time.monotonic() + DEAD_EXIT_TTL_SECONDS
     )
@@ -6911,7 +6917,8 @@ async def handle(
                     _mark_exit_dead(
                         lease.upstream
                         if lease is not None
-                        else (up_host, up_port, up_user, up_pass)
+                        else (up_host, up_port, up_user, up_pass),
+                        lease,
                     )
                     if lease is not None:
                         try:
@@ -6995,7 +7002,7 @@ async def handle(
                     return
                 except (asyncio.TimeoutError, TimeoutError, OSError) as exc:
                     upstream_class = _upstream_failure_class(exc)
-                    _mark_exit_dead((up_host, up_port, up_user, up_pass))
+                    _mark_exit_dead((up_host, up_port, up_user, up_pass), lease)
                     _write_connect_rejection(client_w, upstream_class)
                     _record_connect_rejected(lease, upstream_class)
                     await client_w.drain()

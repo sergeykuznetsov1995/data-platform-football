@@ -9848,6 +9848,41 @@ def test_refused_dial_and_non_200_connect_mark_exits_dead(shared_mod, monkeypatc
     assert health["status"] == "ok"
 
 
+def test_backfill_pool_failures_do_not_count_against_production_pool(
+    shared_mod, monkeypatch
+):
+    production_mgr = _FakeManager(["http://u:p@production.invalid:10000"])
+    backfill_mgr = _FakeManager(["http://u:p@backfill.invalid:10000"])
+    shared_mod.DEAD_EXITS.clear()
+    shared_mod.URL_BUDGET_BYTES = 24 * 1024 * 1024
+    shared_mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 4096
+    shared_mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = backfill_mgr
+    lease = shared_mod._create_lease(
+        backfill_mgr,
+        max_bytes=4096,
+        ttl_seconds=30,
+        metadata={
+            "dag_id": "dag_backfill_transfermarkt",
+            "run_id": "scheduled__history",
+            "task_id": "capture_scope",
+            "canonical_url": "https://www.transfermarkt.com/history",
+        },
+    )
+    assert lease.source == "transfermarkt_backfill"
+
+    async def refused(host, port):
+        raise ConnectionRefusedError("refused")
+
+    _patch_upstream_opener(shared_mod, monkeypatch, refused)
+    payload = bytes(_tm_connect(shared_mod, lease, backfill_mgr).payload)
+
+    assert b"502 Bad Gateway (upstream=dial_error)" in payload
+    health = shared_mod._service_health_report(production_mgr)
+    assert health["dead_exit_count"] == 0
+    assert health["live_exit_ratio"] == 1.0
+    assert health["exit_pool_status"] == "ok"
+
+
 def test_dead_exit_memory_expires_after_ttl(shared_mod, monkeypatch):
     shared_mod.DEAD_EXITS.clear()
     shared_mod._mark_exit_dead(("pool.invalid", 10000, "u", "p"))
