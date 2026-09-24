@@ -252,9 +252,6 @@ class EspnHttpClient:
                 self.response_cap_bytes,
                 DEFAULT_RESPONSE_CAP_BYTES,
             ),
-            "rate_per_minute": (self.rate_per_minute, DEFAULT_RATE_PER_MINUTE),
-            "burst": (self.burst, DEFAULT_BURST),
-            "max_attempts": (self.max_attempts, DEFAULT_MAX_ATTEMPTS),
             "circuit_failure_threshold": (self.circuit_failure_threshold, 5),
         }
         for name, (value, hard_maximum) in hard_bounds.items():

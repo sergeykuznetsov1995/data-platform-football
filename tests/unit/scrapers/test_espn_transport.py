@@ -95,6 +95,21 @@ def _client(monkeypatch, tmp_path, responses, **kwargs):
     return client, session, sleeps, store
 
 
+
+@pytest.mark.unit
+def test_pace_above_defaults_is_accepted_and_non_positive_is_rejected(
+    monkeypatch, tmp_path
+):
+    # #1498: the contour sets the pace (S0 = 60/min); the transport keeps
+    # only the positivity guard, not a hard ceiling at the defaults.
+    client, _, _, _ = _client(
+        monkeypatch, tmp_path, [], rate_per_minute=60, burst=8, max_attempts=6
+    )
+    assert (client.rate_per_minute, client.burst, client.max_attempts) == (60, 8, 6)
+    for name in ("rate_per_minute", "burst", "max_attempts"):
+        with pytest.raises(ValueError, match="positive"):
+            _client(monkeypatch, tmp_path, [], **{name: 0})
+
 @pytest.mark.unit
 def test_success_is_raw_first_measured_and_cached(monkeypatch, tmp_path):
     body = b'{"events":[{"id":"1"}]}'

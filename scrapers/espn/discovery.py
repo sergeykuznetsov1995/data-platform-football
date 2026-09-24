@@ -676,25 +676,6 @@ def load_catalog_snapshot(path: str | Path) -> CatalogSnapshot:
     return CatalogSnapshot.from_dict(document)
 
 
-def quarantine_new_editions(snapshot: CatalogSnapshot, registry: Any) -> set[str]:
-    """Identify source rollovers that require explicit registry promotion."""
-
-    quarantined: set[str] = set()
-    by_id = registry.by_id
-    for candidate in _representatives(snapshot.candidates).values():
-        if candidate.espn_id is None:
-            continue
-        competition = by_id.get(candidate.espn_id)
-        if competition is None or candidate.source_season_year is None:
-            continue
-        if (
-            candidate.source_season_year
-            != competition.current_edition.source_season_year
-        ):
-            quarantined.add(f"{candidate.espn_id}:{candidate.source_season_year}")
-    return quarantined
-
-
 __all__ = [
     "CatalogCandidate",
     "CatalogDiff",
@@ -708,6 +689,5 @@ __all__ = [
     "load_catalog_snapshot",
     "parse_competition_detail",
     "parse_soccer_dropdown",
-    "quarantine_new_editions",
     "save_catalog_snapshot",
 ]

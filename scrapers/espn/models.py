@@ -12,7 +12,6 @@ from datetime import date, datetime, timezone
 from enum import Enum
 import hashlib
 import json
-import re
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
@@ -49,8 +48,6 @@ ADMITTED_AGE_CLASSES = frozenset(
 )
 
 MODEL_SCHEMA_VERSION = 1
-_SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
-_SCOPE_ID_RE = re.compile(r"([1-9][0-9]*):([1-9][0-9]*)")
 
 
 class CapabilityState(str, Enum):
@@ -60,23 +57,6 @@ class CapabilityState(str, Enum):
     PARTIAL = "partial"
     ABSENT = "absent"
     UNKNOWN = "unknown"
-    QUARANTINED = "quarantined"
-
-
-class ManifestState(str, Enum):
-    PLANNED = "planned"
-    INCOMPLETE = "incomplete"
-    COMPLETE = "complete"
-    FAILED = "failed"
-
-
-class DispositionState(str, Enum):
-    PLANNED = "planned"
-    CAPTURED = "captured"
-    VALID_EMPTY = "valid_empty"
-    NOT_APPLICABLE = "not_applicable"
-    FAILED = "failed"
-    SKIPPED = "skipped"
     QUARANTINED = "quarantined"
 
 
@@ -129,24 +109,6 @@ def _string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
     ):
         raise ValueError(f"{field_name} must contain non-empty strings")
     return tuple(value)
-
-
-def _signature(value: Any, field_name: str) -> str:
-    if not isinstance(value, str) or _SIGNATURE_RE.fullmatch(value) is None:
-        raise ValueError(f"{field_name} must be a lowercase SHA-256 signature")
-    return value
-
-
-def _scope_identity(value: Any) -> tuple[int, int]:
-    if not isinstance(value, str):
-        raise ValueError("scope_id must be '<espn_id>:<source_season_year>'")
-    match = _SCOPE_ID_RE.fullmatch(value)
-    if match is None:
-        raise ValueError("scope_id must be '<espn_id>:<source_season_year>'")
-    espn_id, source_year = (int(part) for part in match.groups())
-    _positive_int(espn_id, "scope_id espn_id")
-    _positive_int(source_year, "scope_id source_season_year", minimum=1800)
-    return espn_id, source_year
 
 
 def _freeze_json(value: Any, field_name: str) -> Any:
@@ -305,137 +267,15 @@ class Competition(CanonicalModel):
         return current[0]
 
 
-@dataclass(frozen=True, slots=True)
-class ScopePlan(CanonicalModel):
-    scope_id: str
-    espn_id: int
-    slug: str
-    source_season_year: int
-    start_date: date
-    end_date: date
-    capabilities: EntityCapabilities
-
-    def __post_init__(self) -> None:
-        _positive_int(self.espn_id, "espn_id")
-        _positive_int(self.source_season_year, "source_season_year", minimum=1800)
-        _required_string(self.slug, "scope slug")
-        expected = f"{self.espn_id}:{self.source_season_year}"
-        if self.scope_id != expected:
-            raise ValueError(f"scope_id must be {expected!r}")
-        if type(self.start_date) is not date or type(self.end_date) is not date:
-            raise TypeError("scope plan dates must be date values")
-        if self.start_date > self.end_date:
-            raise ValueError("scope plan has an invalid date window")
-        if not isinstance(self.capabilities, EntityCapabilities):
-            raise TypeError("scope plan capabilities must be EntityCapabilities")
-
-
-@dataclass(frozen=True, slots=True)
-class IngestPlan(CanonicalModel):
-    schema_version: int
-    run_id: str
-    as_of: date
-    registry_signature: str
-    scopes: tuple[ScopePlan, ...]
-    metadata: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != MODEL_SCHEMA_VERSION
-        ):
-            raise ValueError(f"schema_version must be {MODEL_SCHEMA_VERSION}")
-        _required_string(self.run_id, "run_id")
-        if type(self.as_of) is not date:
-            raise TypeError("as_of must be a date")
-        _signature(self.registry_signature, "registry_signature")
-        if not isinstance(self.scopes, (list, tuple)) or not all(
-            isinstance(scope, ScopePlan) for scope in self.scopes
-        ):
-            raise TypeError("scopes must contain ScopePlan values")
-        scopes = tuple(self.scopes)
-        if len({scope.scope_id for scope in scopes}) != len(scopes):
-            raise ValueError("scopes must have unique scope_id values")
-        if not isinstance(self.metadata, Mapping):
-            raise TypeError("metadata must be a mapping")
-        object.__setattr__(self, "scopes", scopes)
-        object.__setattr__(self, "metadata", _freeze_json(self.metadata, "metadata"))
-
-
-@dataclass(frozen=True, slots=True)
-class RequestDisposition(CanonicalModel):
-    endpoint: str
-    state: DispositionState
-    detail: str
-    event_id: Optional[int] = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.state, DispositionState):
-            object.__setattr__(self, "state", DispositionState(self.state))
-        _required_string(self.endpoint, "disposition endpoint")
-        _required_string(self.detail, "disposition detail")
-        if self.event_id is not None:
-            _positive_int(self.event_id, "disposition event_id")
-
-
-@dataclass(frozen=True, slots=True)
-class ScopeManifest(CanonicalModel):
-    schema_version: int
-    run_id: str
-    scope_id: str
-    registry_signature: str
-    plan_signature: str
-    state: ManifestState
-    generated_at: datetime
-    dispositions: tuple[RequestDisposition, ...]
-    row_counts: Mapping[str, int]
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != MODEL_SCHEMA_VERSION
-        ):
-            raise ValueError(f"schema_version must be {MODEL_SCHEMA_VERSION}")
-        _required_string(self.run_id, "run_id")
-        _scope_identity(self.scope_id)
-        _signature(self.registry_signature, "registry_signature")
-        _signature(self.plan_signature, "plan_signature")
-        if not isinstance(self.state, ManifestState):
-            object.__setattr__(self, "state", ManifestState(self.state))
-        _utc_string(self.generated_at)
-        if not isinstance(self.dispositions, (list, tuple)) or not all(
-            isinstance(item, RequestDisposition) for item in self.dispositions
-        ):
-            raise TypeError("dispositions must contain RequestDisposition values")
-        if not isinstance(self.row_counts, Mapping):
-            raise TypeError("manifest row_counts must be a mapping")
-        counts: dict[str, int] = {}
-        for entity, count in self.row_counts.items():
-            _required_string(entity, "manifest row_counts key")
-            if type(count) is not int:
-                raise TypeError("manifest row count must be an integer")
-            if count < 0:
-                raise ValueError("manifest row counts must be non-negative")
-            counts[entity] = count
-        object.__setattr__(self, "dispositions", tuple(self.dispositions))
-        object.__setattr__(self, "row_counts", MappingProxyType(counts))
-
-
 __all__ = [
     "ADMITTED_AGE_CLASSES",
     "AgeClass",
     "CanonicalModel",
     "CapabilityState",
     "Competition",
-    "DispositionState",
     "Edition",
     "EntityCapabilities",
     "Gender",
-    "IngestPlan",
     "LegacyAliases",
-    "ManifestState",
     "MODEL_SCHEMA_VERSION",
-    "RequestDisposition",
-    "ScopeManifest",
-    "ScopePlan",
 ]

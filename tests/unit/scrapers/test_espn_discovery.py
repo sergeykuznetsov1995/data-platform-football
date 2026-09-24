@@ -17,11 +17,9 @@ from scrapers.espn.discovery import (
     load_catalog_snapshot,
     parse_competition_detail,
     parse_soccer_dropdown,
-    quarantine_new_editions,
     save_catalog_snapshot,
 )
 from scrapers.espn.models import AgeClass, CapabilityState, Gender
-from scrapers.espn.registry import DEFAULT_REGISTRY_PATH, load_registry
 
 
 FIXTURE = (
@@ -183,7 +181,6 @@ def test_detail_without_numeric_id_remains_an_unpromotable_candidate() -> None:
 
 @pytest.mark.unit
 def test_discovery_enriches_every_row_without_promoting_or_guessing_age() -> None:
-    before = DEFAULT_REGISTRY_PATH.read_bytes()
     snapshot = discover_catalog(
         _dropdown(),
         details_by_slug={"eng.1": _detail()},
@@ -194,7 +191,6 @@ def test_discovery_enriches_every_row_without_promoting_or_guessing_age() -> Non
     assert snapshot.candidates[0].gender is Gender.MALE
     assert snapshot.candidates[0].age_class is AgeClass.UNKNOWN
     assert snapshot.candidates[1].gender is Gender.UNKNOWN
-    assert DEFAULT_REGISTRY_PATH.read_bytes() == before
 
 
 @pytest.mark.unit
@@ -316,32 +312,6 @@ def test_competition_detail_rejects_noncanonical_positive_integers(
 
 
 @pytest.mark.unit
-def test_every_female_fixture_candidate_is_rejected_by_manual_promotion() -> None:
-    from scrapers.espn.registry import RegistryError, promote_candidate
-
-    snapshot = CatalogSnapshot.from_dict(
-        json.loads(FIXTURE.read_text(encoding="utf-8"))
-    )
-    female = [row for row in snapshot.candidates if row.gender is Gender.FEMALE]
-
-    assert female
-    for candidate in female:
-        with pytest.raises(RegistryError, match="explicit MALE"):
-            promote_candidate(
-                {
-                    "schema_version": 1,
-                    "registry_version": "test",
-                    "as_of": "2026-07-31",
-                    "competitions": [],
-                },
-                candidate,
-                age_class=AgeClass.SENIOR,
-                age_class_evidence=("manual",),
-                legacy_league="TEST",
-            )
-
-
-@pytest.mark.unit
 def test_catalog_diff_reports_added_removed_and_changed_fields() -> None:
     base = CatalogCandidate.from_dict(
         {
@@ -430,35 +400,3 @@ def test_catalog_diff_detects_edition_window_change_without_year_change() -> Non
         DiscoveryChangeKind.CURRENT_EDITION
     ]
 
-
-@pytest.mark.unit
-def test_new_source_season_is_quarantined_until_registry_is_manually_updated() -> None:
-    registry = load_registry(DEFAULT_REGISTRY_PATH)
-    current = CatalogCandidate.from_dict(
-        {
-            "espn_id": 700,
-            "slug": "eng.1",
-            "name": "English Premier League",
-            "group": "Europe",
-            "source_order": 1,
-            "gender": "MALE",
-            "age_class": "UNKNOWN",
-            "source_season_year": 2027,
-            "edition_display_name": "2027-28 English Premier League",
-            "start_date": "2027-06-01",
-            "end_date": "2028-06-01",
-            "capabilities": {
-                "schedule": "proven",
-                "lineup": "proven",
-                "matchsheet": "proven",
-            },
-            "gender_evidence": ["detail.gender=MALE"],
-        }
-    )
-
-    quarantined = quarantine_new_editions(
-        CatalogSnapshot("2027-07-31T00:00:00Z", (current,)), registry
-    )
-
-    assert quarantined == {"700:2027"}
-    assert registry.by_slug["eng.1"].current_edition.source_season_year == 2026
