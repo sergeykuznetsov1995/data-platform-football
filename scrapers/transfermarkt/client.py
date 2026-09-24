@@ -139,6 +139,25 @@ def _header_value(headers: Any, name: str) -> Optional[str]:
             return str(value).strip() or None
     return None
 
+_GATEWAY_UPSTREAM_CLASS_RE = re.compile(r"upstream=([A-Za-z0-9_]+)")
+
+
+def _gateway_upstream_class(headers: Any, text: Any = None) -> Optional[str]:
+    """Upstream class from the gateway: header first, then its reason-phrase.
+
+    tls-client never exposes the CONNECT response headers: a rejected CONNECT
+    surfaces as a status-0 pseudo-response (or an exception) whose text is the
+    Go transport error carrying the gateway's status text, e.g.
+    ``Bad Gateway (upstream=407)`` (tls_requests/models/response.py:116-118).
+    """
+
+    header = _header_value(headers, PROXY_UPSTREAM_STATUS_HEADER)
+    if header:
+        return header
+    match = _GATEWAY_UPSTREAM_CLASS_RE.search(str(text or ""))
+    return match.group(1) if match else None
+
+
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
     re.IGNORECASE,
@@ -1795,9 +1814,9 @@ class TransfermarktHttpClient:
                     raise TransportStatusError(
                         f"transport failure: pseudo HTTP status {status_code}",
                         status_code=status_code,
-                        upstream_status=_header_value(
+                        upstream_status=_gateway_upstream_class(
                             getattr(resp, "headers", None),
-                            PROXY_UPSTREAM_STATUS_HEADER,
+                            getattr(resp, "text", None),
                         ),
                     )
                 # Keep-alive evidence counts only requests that came back
@@ -2176,7 +2195,7 @@ class TransfermarktHttpClient:
                 proxy_status = (
                     f" proxy_status={getattr(exc, 'status_code', None)}"
                     " upstream_class="
-                    f"{getattr(exc, 'upstream_status', None) or 'нет класса от шлюза'}"
+                    f"{getattr(exc, 'upstream_status', None) or _gateway_upstream_class(None, exc) or 'нет класса от шлюза'}"
                 )
                 terminal_status = FetchStatus.RETRY_EXHAUSTED
                 error_name = type(exc).__name__.lower()
