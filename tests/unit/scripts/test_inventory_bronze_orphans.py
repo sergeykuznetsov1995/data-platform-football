@@ -96,3 +96,34 @@ def test_classify_orphans_matchhistory_games_now_droppable():
     )
     assert droppable == ['fbref_player_passing', 'matchhistory_games', 'fbref_team_defense']
     assert blocked == []
+
+
+CLUBELO_ARCHIVE = [
+    'clubelo_ratings',
+    'clubelo_ratings_historical',
+    'clubelo_team_history',
+    'clubelo_ratings_archive_20260924',
+    'clubelo_ratings_historical_archive_20260924',
+    'clubelo_team_history_archive_20260924',
+    'clubelo_api_snapshot_archive',
+]
+
+
+def test_clubelo_archive_never_droppable():
+    # #1460: the ClubElo archive (source api.clubelo.com closed) must never be
+    # a --drop candidate, even when it falls out of the parser contract.
+    mod = _load_module()
+    live = CLUBELO_ARCHIVE + ['fbref_player_passing', 'fbref_team_defense']
+    orphans = mod.find_orphans(live, mod.build_keep_set())
+    droppable, blocked = mod.classify_orphans(orphans)
+
+    assert not [t for t in droppable if t.startswith('clubelo')]
+    assert droppable == ['fbref_player_passing', 'fbref_team_defense']
+    for t in orphans:
+        if t.startswith('clubelo'):
+            assert t in blocked
+            assert mod.BLOCKED_ORPHANS[t] == 'archive, source unrecoverable (#1460)'
+    # Protection must not depend on the contract: every archive name is blocked
+    # even if it is not an orphan today.
+    _, blocked_all = mod.classify_orphans(CLUBELO_ARCHIVE)
+    assert blocked_all == CLUBELO_ARCHIVE

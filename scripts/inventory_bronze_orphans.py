@@ -53,7 +53,22 @@ EXTRA_PRODUCED: set[str] = set()
 #   - (empty) matchhistory_games was migrated off by #307 — all four Silver
 #     consumers (xref_match / xref_team / xref_referee / matchhistory_match_odds)
 #     now read matchhistory_results, so games is a plain droppable orphan.
-BLOCKED_ORPHANS: dict[str, str] = {}
+#   - clubelo_* archive (#1460): api.clubelo.com is closed since 09.2026, these
+#     tables cannot be re-collected. Listed explicitly so the protection does
+#     not depend on the parser contract (old writers/contract entries go away).
+_CLUBELO_ARCHIVE_REASON = 'archive, source unrecoverable (#1460)'
+BLOCKED_ORPHANS: dict[str, str] = {
+    t: _CLUBELO_ARCHIVE_REASON
+    for t in (
+        'clubelo_ratings',
+        'clubelo_ratings_historical',
+        'clubelo_team_history',
+        'clubelo_ratings_archive_20260924',
+        'clubelo_ratings_historical_archive_20260924',
+        'clubelo_team_history_archive_20260924',
+        'clubelo_api_snapshot_archive',
+    )
+}
 
 
 def build_keep_set() -> set[str]:
