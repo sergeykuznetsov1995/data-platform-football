@@ -95,13 +95,28 @@ def test_copy_dry_run_prints_three_ctas_without_connecting(capsys, monkeypatch):
     ]
 
 
-def test_load_csv_dry_run_does_not_connect(csv_dir, capsys, monkeypatch):
+def _full_cache(tmp_path):
+    day = dt.date(2025, 7, 13)
+    for i in range(88):
+        d = day + dt.timedelta(days=i) if i < 87 else dt.date(2026, 8, 31)
+        (tmp_path / f'{d.isoformat()}.csv').write_text(CSV)
+    return tmp_path
+
+
+def test_load_csv_dry_run_does_not_connect(tmp_path, capsys, monkeypatch):
     mod = _load_module()
     monkeypatch.setattr(mod, '_connect', lambda: pytest.fail('dry-run must not connect'))
-    assert mod.main(['load-csv', '--dir', str(csv_dir), '--dry-run']) == 0
+    assert mod.main(['load-csv', '--dir', str(_full_cache(tmp_path)), '--dry-run']) == 0
     out = capsys.readouterr().out
-    assert 'files=2 rows=6' in out
+    assert 'files=88 rows=264' in out
     assert 'CREATE TABLE IF NOT EXISTS iceberg.bronze.clubelo_api_snapshot_archive' in out
+
+
+def test_load_csv_rejects_incomplete_cache_before_connecting(csv_dir, capsys, monkeypatch):
+    mod = _load_module()
+    monkeypatch.setattr(mod, '_connect', lambda: pytest.fail('must not connect'))
+    assert mod.main(['load-csv', '--dir', str(csv_dir)]) == 1
+    assert 'expected 88 files 2025-07-13..2026-08-31, got 2 files' in capsys.readouterr().err
 
 
 def test_source_has_no_destructive_sql_and_inserts_only_into_snapshot():
@@ -150,3 +165,36 @@ def test_load_inserts_into_empty_target(csv_dir):
     cur = _Cur(existing=0)
     assert mod.load_csv(cur, rows, len(files)) == 0
     assert len([s for s in cur.sql if s.startswith('INSERT')]) == 1
+
+
+class _VerifyCur:
+    def __init__(self, copy_count, snapshot):
+        self.copy_count, self.snapshot, self._last = copy_count, snapshot, None
+
+    def execute(self, sql):
+        self._last = sql
+
+    def fetchall(self):
+        if 'clubelo_api_snapshot_archive' in self._last:
+            return [self.snapshot]
+        is_copy = '_archive_20260924' in self._last
+        return [(self.copy_count if is_copy else 10, INGESTED)]
+
+
+GOOD_SNAPSHOT = (54010, 88, '2025-07-13', '2026-08-31', 694, 613.8)
+
+
+@pytest.mark.parametrize('copy_count, snapshot, rc', [
+    (10, GOOD_SNAPSHOT, 0),
+    (9, GOOD_SNAPSHOT, 1),                                              # copy differs
+    (10, (1000, 2, '2025-07-13', '2025-07-20', 600, 500.0), 1),         # incomplete
+])
+def test_verify_exit_code(monkeypatch, capsys, copy_count, snapshot, rc):
+    mod = _load_module()
+
+    class _Conn:
+        def cursor(self):
+            return _VerifyCur(copy_count, snapshot)
+
+    monkeypatch.setattr(mod, '_connect', lambda: _Conn())
+    assert mod.main(['verify']) == rc

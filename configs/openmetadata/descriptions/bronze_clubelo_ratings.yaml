@@ -26,7 +26,7 @@ columns:
   - name: team
     description: Название клуба в написании ClubElo (e.g. 'Man City').
   - name: rank
-    description: Место клуба по ELO (1 = сильнейший); double, ~47% NULL (rank проставлен не у всех клубов).
+    description: Место клуба по ELO (1 = сильнейший); double, NULL у 1 096 из 2 924 строк (34 level 1 + 1 062 level 2).
   - name: country
     description: ISO-код страны клуба (e.g. 'ENG','GER').
   - name: level

@@ -44,6 +44,10 @@ MODEL_VERSION = 'api-legacy'
 SOURCE = 'clubelo_api_cache'
 INSERT_CHUNK = 500
 CSV_COLUMNS = ['Rank', 'Club', 'Country', 'Level', 'Elo', 'From', 'To']
+# The frozen cache: exactly 88 weekly/daily files 2025-07-13 .. 2026-08-31 (#1460).
+EXPECTED_DATES = 88
+FIRST_DATE = '2025-07-13'
+LAST_DATE = '2026-08-31'
 NULL_MARKERS = ('', 'None')  # the API wrote the literal "None" for unranked clubs
 
 SNAPSHOT_DDL = f'''CREATE TABLE IF NOT EXISTS {SNAPSHOT_TABLE} (
@@ -157,6 +161,15 @@ def parse_csv_file(path, ingested_at):
     return rows
 
 
+def check_snapshot_files(files):
+    """Error text if the file set is not the frozen 88-date cache, else None."""
+    stems = sorted(f.stem for f in files)
+    if len(stems) != EXPECTED_DATES or stems[0] != FIRST_DATE or stems[-1] != LAST_DATE:
+        got = f'{len(stems)} files {stems[0]}..{stems[-1]}' if stems else '0 files'
+        return f'expected {EXPECTED_DATES} files {FIRST_DATE}..{LAST_DATE}, got {got}'
+    return None
+
+
 def parse_csv_dir(directory, ingested_at):
     files = sorted(Path(directory).glob('*.csv'))
     rows = []
@@ -197,9 +210,11 @@ def load_csv(cur, rows, n_files):
     _q(cur, SNAPSHOT_DDL)
     existing = _q(cur, f'SELECT count(*) FROM {SNAPSHOT_TABLE}')[0][0]
     if existing:
+        state = 'complete' if existing == len(rows) else 'PARTIAL (interrupted load?)'
         print(
-            f'ERROR: {SNAPSHOT_TABLE} already has {existing} rows; one-batch load '
-            'refused (a repeat load is an owner decision)', file=sys.stderr,
+            f'ERROR: {SNAPSHOT_TABLE} already has {existing} rows of {len(rows)} '
+            f'expected — {state}; one-batch load refused. This script never removes '
+            'rows: a repeat/cleanup is an owner decision.', file=sys.stderr,
         )
         return 1
     for s in insert_statements(rows):
@@ -215,8 +230,9 @@ def load_csv(cur, rows, n_files):
 def cmd_load_csv(args):
     ingested_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     files, rows = parse_csv_dir(args.dir, ingested_at)
-    if not files:
-        print(f'ERROR: no *.csv in {args.dir}', file=sys.stderr)
+    error = check_snapshot_files(files)
+    if error:
+        print(f'ERROR: {args.dir}: {error}', file=sys.stderr)
         return 1
     print(f'parsed: files={len(files)} rows={len(rows)} '
           f'dates={files[0].stem}..{files[-1].stem}')
@@ -233,15 +249,23 @@ def cmd_verify(args):
     cur = _connect().cursor()
     print('| table | source count | source max(_ingested_at) | copy count | copy max(_ingested_at) |')
     print('|---|---|---|---|---|')
+    problems = []
     for t, src, cp in compare_copies(cur):
         print(f'| {t} | {src[0]} | {src[1]} | {cp[0]} | {cp[1]} |')
+        if src != cp:
+            problems.append(f'{t}: copy differs from source')
     count, dates, dmin, dmax, clubs, avg_per_date = _q(cur, f'''
         SELECT count(*), count(DISTINCT rating_date), min(rating_date), max(rating_date),
                count(DISTINCT club), round(count(*) * 1.0 / count(DISTINCT rating_date), 1)
         FROM {SNAPSHOT_TABLE}''')[0]
     print(f'\n{SNAPSHOT_TABLE}: rows={count} dates={dates} ({dmin}..{dmax}) '
           f'distinct_clubs={clubs} avg_rows_per_date={avg_per_date}')
-    return 0
+    if (dates, dmin, dmax) != (EXPECTED_DATES, FIRST_DATE, LAST_DATE):
+        problems.append(f'snapshot archive: {dates} dates {dmin}..{dmax}, expected '
+                        f'{EXPECTED_DATES} {FIRST_DATE}..{LAST_DATE}')
+    for p in problems:
+        print(f'ERROR: {p}', file=sys.stderr)
+    return 1 if problems else 0
 
 
 def main(argv=None):
