@@ -15,9 +15,11 @@
 Эпизод (механика — /root/watchdog/transfermarkt_stall_watch.py, #1389): новое правило —
 тревога; то же — молчим, «⏳ продолжается N ч» не чаще раза в 24 ч от последнего сообщения;
 через ISSUE_AFTER_H от первой тревоги — issue (labels ISSUE_LABELS, заголовок с ключом
-правила; открытая issue с тем же заголовком не дублируется) + карточка на доску в Blocked,
-номер в state; условие снято — «✅ отбой» одной строкой и эпизод забыт. Telegram — напрямую
-через API бота с проверкой ответа, неподтверждённое ждёт в state.pending.
+правила; открытая issue с тем же заголовком не дублируется) + карточка на доску в Blocked
+(и для найденной открытой issue; не встала — повтор каждым тиком, без новой issue), номер и
+успех карточки в state (`issue`, `blocked`); условие снято — «✅ отбой» одной строкой и эпизод
+забыт. Telegram — напрямую через API бота с проверкой ответа, неподтверждённое ждёт в
+state.pending.
 
 Контракт на #1504 (новый контур): реакция на сбой — красный турнир + тревога этого сторожа;
 никаких `pause_all` / `on_failure → pause` — пауза контура и есть та тишина, которую сторож
@@ -215,31 +217,41 @@ def board_blocked(number):
 
 
 def escalate(rule, ep, text, now, dry_run):
-    """issue + карточка Blocked; строка второй тревоги или None (не вышло — повтор тиком позже)."""
+    """Одна issue на эпизод (номер в ep["issue"]) + карточка Blocked (успех — ep["blocked"]).
+    Строка второй тревоги — только когда issue впервые появилась в эпизоде; карточка не встала —
+    повтор следующим тиком без новой issue. None — issue завести не вышло (повтор тиком позже)."""
     title = issue_title(rule, ep)
     if dry_run:
         print(f"DRY: завёл бы issue «{title}» (labels {ISSUE_LABELS}) и карточку Blocked на доске")
         return None
-    number = find_open_issue(title)
-    reused = number is not None
-    if number is None:
-        body = (f"Сторож `/root/watchdog/espn_stall_watch.py` (#1496): правило `{rule}` держится "
-                f"с {ep['first']} ({(now - parse_ts(ep['first'])).total_seconds() / 3600:.0f} ч).\n\n"
-                f"Последний сигнал: {text}\n\n"
-                f"Что смотреть: `is_paused` DAG ESPN в metadb `{METADB}`, max(`{TS_COL}`) в "
-                f"`{'`, `'.join(BRONZE_TABLES)}`, строку ESPN в утренней сводке, лог "
-                "`/root/watchdog/espn_stall_watch.log`.")
-        url = gh(["issue", "create", "--repo", GH_REPO, "--title", title, "--body", body,
-                  "--label", ISSUE_LABELS])
-        m = re.search(r"/issues/(\d+)", url or "")
-        if not m:
-            return None
-        number = int(m.group(1))
-        if not board_blocked(number):
-            print(f"espn_stall_watch: issue #{number} заведена, карточку на доску поставить не вышло")
-    ep["issue"] = number
-    return (f"📌 ESPN: {RULE_TITLE[rule]} — держится ≥ {ISSUE_AFTER_H} ч, issue #{number} "
-            f"{'уже была открыта' if reused else 'заведена'}, карточка Blocked. #1496")
+    first = not ep.get("issue")
+    reused = False
+    if first:
+        number = find_open_issue(title)
+        reused = number is not None
+        if number is None:
+            body = (f"Сторож `/root/watchdog/espn_stall_watch.py` (#1496): правило `{rule}` держится "
+                    f"с {ep['first']} ({(now - parse_ts(ep['first'])).total_seconds() / 3600:.0f} ч).\n\n"
+                    f"Последний сигнал: {text}\n\n"
+                    f"Что смотреть: `is_paused` DAG ESPN в metadb `{METADB}`, max(`{TS_COL}`) в "
+                    f"`{'`, `'.join(BRONZE_TABLES)}`, строку ESPN в утренней сводке, лог "
+                    "`/root/watchdog/espn_stall_watch.log`.")
+            url = gh(["issue", "create", "--repo", GH_REPO, "--title", title, "--body", body,
+                      "--label", ISSUE_LABELS])
+            m = re.search(r"/issues/(\d+)", url or "")
+            if not m:
+                return None
+            number = int(m.group(1))
+        ep["issue"] = number
+    ep["blocked"] = board_blocked(ep["issue"])
+    if not ep["blocked"]:
+        print(f"espn_stall_watch: issue #{ep['issue']}: карточку Blocked поставить не вышло — "
+              "повтор следующим тиком")
+    if not first:
+        return None
+    board = "карточка Blocked" if ep["blocked"] else "карточку Blocked поставить не вышло — повторю"
+    return (f"📌 ESPN: {RULE_TITLE[rule]} — держится ≥ {ISSUE_AFTER_H} ч, issue #{ep['issue']} "
+            f"{'уже была открыта' if reused else 'заведена'}, {board}. #1496")
 
 
 def load_state(path):
@@ -285,17 +297,18 @@ def episode(state, rule, text, now, msgs, bits, dry_run):
         bits.append(f"{rule}=new")
         return
     hours = (now - parse_ts(ep["first"])).total_seconds() / 3600
-    if hours >= ISSUE_AFTER_H and not ep.get("issue"):
+    escalated = hours >= ISSUE_AFTER_H and not ep.get("blocked")
+    if escalated:   # issue ещё нет или карточка не встала — (повторная) эскалация
         second = escalate(rule, ep, text, now, dry_run)
         if second:
             msgs.append(second)
             ep["last_reminded_at"] = fmt_ts(now)   # вторая тревога заменяет «продолжается»
         bits.append(f"{rule}=escalate")
-    elif now - parse_ts(ep.get("last_reminded_at") or ep["first"]) >= timedelta(hours=24):
+    if now - parse_ts(ep.get("last_reminded_at") or ep["first"]) >= timedelta(hours=24):
         msgs.append(f"⏳ ESPN: продолжается ({hours:.0f} ч) — {text}")
         ep["last_reminded_at"] = fmt_ts(now)
         bits.append(f"{rule}=reminded")
-    else:
+    elif not escalated:
         bits.append(f"{rule}=silenced")
 
 

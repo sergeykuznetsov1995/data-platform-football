@@ -69,6 +69,7 @@ class World:
         self.sent: list[str] = []
         self.gh_calls: list[list[str]] = []
         self.open_issues: list[dict] = []
+        self.board_failures = 0   # сколько раз подряд смена Status на доске упадёт
 
     def set_dags(self, **paused):
         self.dags = [(d, paused.get(d, p)) for d, p in self.dags]
@@ -114,6 +115,9 @@ class World:
         if "addProjectV2ItemById" in query:
             return "PVTI_item9001"
         if "updateProjectV2ItemFieldValue" in query:
+            if self.board_failures:
+                self.board_failures -= 1
+                return None
             return '{"data":{}}'
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
@@ -263,6 +267,50 @@ def test_open_issue_with_same_title_is_reused(world, tmp_path):
     assert state["episodes"]["stall"]["issue"] == 1456
     assert state["episodes"]["paused"]["issue"] == 9001
     assert sum(c[:2] == ["issue", "create"] for c in world.gh_calls) == 1
+    # карточка Blocked ставится и найденной открытой issue (Astra р1 п.2)
+    assert ["n=1456"] == [a for c in world.gh_calls for a in c if a == "n=1456"]
+    assert state["episodes"]["stall"]["blocked"] is True
+    assert any("issue #1456 уже была открыта, карточка Blocked" in t for t in world.sent)
+
+
+def _updates(world):
+    return [c for c in world.gh_calls if any("updateProjectV2ItemFieldValue" in a for a in c)]
+
+
+def test_failed_board_card_is_retried_without_a_second_issue(world, tmp_path):
+    world.set_dags(**{d: "f" for d in EXPECTED})   # только stall — одна issue
+    _run(tmp_path, NOW)
+    world.board_failures = 2
+    state = _run(tmp_path, NOW + timedelta(hours=25))
+    ep = state["episodes"]["stall"]
+    assert ep["issue"] == 9001 and ep["blocked"] is False
+    assert any(t.startswith("📌 ESPN:") and "карточку Blocked поставить не вышло — повторю" in t
+               for t in world.sent)
+
+    world.sent.clear()
+    state = _run(tmp_path, NOW + timedelta(hours=25, minutes=15))   # вторая неудача
+    assert state["episodes"]["stall"]["blocked"] is False
+    state = _run(tmp_path, NOW + timedelta(hours=25, minutes=30))   # встала
+    assert state["episodes"]["stall"]["blocked"] is True
+    assert sum(c[:2] == ["issue", "create"] for c in world.gh_calls) == 1
+    assert len(_updates(world)) == 3
+    assert world.sent == []                                          # повторы карточки молча
+
+    _run(tmp_path, NOW + timedelta(hours=26))
+    assert len(_updates(world)) == 3                                 # после успеха доску не дёргаем
+
+
+def test_seeded_issue_with_blocked_true_is_not_touched(world, tmp_path):
+    """Шаг установки: эпизоды первого запуска помечаются issue #1456 + blocked — эпик на доске
+    не трогаем и новую issue не заводим."""
+    state = _run(tmp_path, NOW)
+    for ep in state["episodes"].values():
+        ep.update(issue=1456, blocked=True)
+    (tmp_path / "espn_stall_state.json").write_text(json.dumps(state))
+    world.sent.clear()
+    _run(tmp_path, NOW + timedelta(hours=25))
+    assert world.gh_calls == []
+    assert len(world.sent) == 2 and all(t.startswith("⏳ ESPN: продолжается (25 ч)") for t in world.sent)
 
 
 # 4. Trino недоступен — stall не трогаем

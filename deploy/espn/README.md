@@ -12,7 +12,9 @@ Telegram:
 
 Серия: первая тревога → тишина, «⏳ продолжается N ч» раз в 24 ч → через 24 ч issue
 (`source:espn,area:bronze,type:bug`, заголовок `ESPN: сторож [<правило>] — …`; открытая issue с
-тем же заголовком не дублируется) + карточка Blocked → «✅ отбой», когда условие снято.
+тем же заголовком не дублируется) + карточка Blocked (и для найденной открытой issue; не встала —
+повтор каждым тиком без новой issue; в state эпизода `issue` и `blocked`) → «✅ отбой», когда
+условие снято.
 State — `/root/watchdog/state/espn_stall_state.json` (+ `.lock`), неподтверждённые Telegram-сообщения
 ждут в `pending` и повторяются следующим тиком.
 
@@ -29,6 +31,23 @@ python3 /root/watchdog/espn_stall_watch.py --dry-run --state /tmp/espn-dry.json 
 crontab -l > /root/watchdog/crontab.prev-$(date +%Y%m%d)
 ( crontab -l; echo '*/15 * * * * /usr/bin/python3 /root/watchdog/espn_stall_watch.py >> /root/watchdog/espn_stall_watch.log 2>&1' ) | crontab -
 ```
+
+Первый боевой запуск даст две тревоги (stall и paused) — это правда про старый контур. Чтобы на
+вторые сутки сторож не завёл issue-дубль эпика #1456 и не перевёл карточку эпика в Blocked, после
+первого запуска пометить оба эпизода как уже эскалированные:
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("/root/watchdog/state/espn_stall_state.json")
+st = json.loads(p.read_text())
+for ep in st["episodes"].values():
+    ep.update(issue=1456, blocked=True)
+p.write_text(json.dumps(st, ensure_ascii=False, indent=0))
+PY
+```
+
+(`blocked: true` обязателен: без него сторож на вторые сутки поставил бы карточку #1456 в Blocked.)
 
 Откат: `crontab /root/watchdog/crontab.prev-<дата>`; state можно удалить.
 
