@@ -913,6 +913,33 @@ def test_direct_route_uses_residential_pool_when_proxy_file_set(monkeypatch, tmp
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("pool_file", ["", "missing", "empty"])
+def test_real_direct_transport_refuses_host_ip_without_pool(
+    monkeypatch, tmp_path, pool_file
+):
+    # #1471: a real direct_only transport (no injected session) must fail
+    # before any request instead of silently egressing from the host IP.
+    if pool_file == "":
+        monkeypatch.setenv("WHOSCORED_PROXY_FILE", "")
+    elif pool_file == "missing":
+        monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(tmp_path / "absent.txt"))
+    else:
+        empty = tmp_path / "empty.txt"
+        empty.write_text("")
+        monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(empty))
+    monkeypatch.setenv("WHOSCORED_TRANSPORT_POLICY", "direct_only")
+    fs = FakeFSClient()
+
+    with pytest.raises(ValueError, match="WHOSCORED_PROXY_FILE"):
+        WhoScoredTransport(
+            direct_fs_client=fs,
+            paid_fs_client=FakeFSClient(),
+            context=TransportContext(transport_policy="direct_only"),
+        )
+    assert fs.created == [] and fs.get_calls == []
+
+
+@pytest.mark.unit
 def test_direct_route_stays_host_ip_without_proxy_file(monkeypatch):
     monkeypatch.delenv("WHOSCORED_PROXY_FILE", raising=False)
     monkeypatch.setenv("WHOSCORED_TRANSPORT_POLICY", "direct_only")
@@ -3802,6 +3829,58 @@ def test_stale_flaresolverr_identity_is_config_failure_before_cache_or_paid():
     assert proxy.created == []
     assert factory_calls == []
 
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("message", "expected_retryable", "expected_batch_calls"),
+    [
+        (
+            "FlareSolverr HTTP 502: WhoScored page request header is unavailable.",
+            False,
+            1,
+        ),
+        ("FlareSolverr HTTP 502: ordinary browser failure", True, 3),
+    ],
+)
+def test_missing_site_header_batch_failure_is_not_retried(
+    message, expected_retryable, expected_batch_calls
+):
+    """The stage-stat XHR fails synchronously in the extension when the page's
+    RequireJS site-header token is absent, and a bootstrap reload does not
+    recover it (#1017): every retry only burns wall-clock and proxy bytes, so
+    that failure must leave the browser loop on the first raise while ordinary
+    browser failures keep retrying.
+    """
+    bootstrap = {
+        "html": "<html><body>Team Statistics</body></html>",
+        "status": 200,
+        "cookies": [],
+        "userAgent": "browser",
+    }
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        *[item for _ in range(3) for item in (bootstrap, FlareSolverrError(message))]
+    )
+    transport, factory_calls = _transport(
+        direct, direct_fs=fs, raw_cache=KeyedMemoryRawCache(), attempts=3
+    )
+    request = FetchRequest(
+        url=TEAM_STATS_URL,
+        cache_key="feed-0",
+        validator=lambda response: json.loads(response.content) is not None,
+        scope="INT-World Cup=2026",
+        entity="team_stage_statistics",
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch_many([request])
+
+    assert raised.value.kind is FailureKind.BROWSER
+    assert raised.value.retryable is expected_retryable
+    assert len(fs.xhr_many_calls) == expected_batch_calls
+    assert factory_calls == []
 
 @pytest.mark.unit
 @pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), "2"])

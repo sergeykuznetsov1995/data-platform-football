@@ -10,8 +10,8 @@ Traffic egresses through the residential proxy pool (``WHOSCORED_PROXY_FILE``);
 data lands on the VM only — Bronze Iceberg via Trino plus raw blobs in
 SeaweedFS.  No paid gateway, approval, pointer or off-host backup.
 
-Paused on creation: unpause to start draining, pause to stop.  Daily current
-data is a separate DAG (``dag_ingest_whoscored``).
+Manual trigger only until #1480 (``schedule=None``); paused on creation.  Daily
+current data is a separate DAG (``dag_ingest_whoscored``).
 """
 
 import json
@@ -37,6 +37,9 @@ DAG_ID = "dag_backfill_whoscored"
 RUNNER = "dags/scripts/run_whoscored_scraper.py"
 QUEUE_ID = "whoscored-history"
 RESULT_PATH = "/tmp/whoscored_backfill_{{ ts_nodash }}.json"
+# Tree the Bash task runs from; the isolated WhoScored stack mounts it outside
+# /opt/airflow and sets WHOSCORED_RUNTIME_ROOT.
+RUNTIME_ROOT = os.environ.get("WHOSCORED_RUNTIME_ROOT", "/opt/airflow")
 
 # Cooldown between continuous runs: short while draining, long once the plan is
 # empty so an idle DAG does not hot-spin the shared scheduler.
@@ -44,12 +47,13 @@ ACTIVE_COOLDOWN = timedelta(seconds=30)
 IDLE_COOLDOWN = timedelta(minutes=15)
 
 _TASK_ENV = {
-    "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+    # Order matters: runtime_contract requires PYTHONPATH to be an ordered
+    # subsequence of the anchored sys.path (root, root/dags).
+    "PYTHONPATH": f"{RUNTIME_ROOT}:{RUNTIME_ROOT}/dags",
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
     "HOME": "/home/airflow",
-    "WHOSCORED_PROXY_FILE": os.environ.get(
-        "WHOSCORED_PROXY_FILE", "/opt/airflow/proxys.txt"
-    ),
+    # No default: an unset pool fails the chunk instead of using the host IP.
+    "WHOSCORED_PROXY_FILE": os.environ.get("WHOSCORED_PROXY_FILE", ""),
 }
 
 
@@ -87,7 +91,8 @@ def _poll_ready(**context: Any) -> bool:
 with DAG(
     dag_id=DAG_ID,
     default_args=SCRAPER_ARGS,
-    schedule="@continuous",
+    # Manual only until the history campaign is re-planned (#1480).
+    schedule=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
@@ -100,7 +105,7 @@ with DAG(
     run_chunk = BashOperator(
         task_id="run_backfill_chunk",
         bash_command=(
-            "cd /opt/airflow && rm -f {result} && "
+            "cd {root} && rm -f {result} && "
             "python {runner} backfill "
             "--all-catalog "
             "--as-of-date {{{{ ds }}}} "
@@ -108,7 +113,9 @@ with DAG(
             "--max-work-items {{{{ params.max_work_items }}}} "
             "--transport-policy direct_only "
             "--output {result}"
-        ).format(runner=RUNNER, queue=QUEUE_ID, result=RESULT_PATH),
+        ).format(
+            root=RUNTIME_ROOT, runner=RUNNER, queue=QUEUE_ID, result=RESULT_PATH
+        ),
         env=_TASK_ENV,
         append_env=True,
     )

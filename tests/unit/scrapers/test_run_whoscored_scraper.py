@@ -701,6 +701,45 @@ def test_report_rejects_conflicting_or_tampered_attempt_sidecar(tmp_path):
 
 
 @pytest.mark.unit
+def test_non_mapped_airflow_task_reports_map_index_minus_one(monkeypatch, tmp_path):
+    # Airflow does not export AIRFLOW_CTX_MAP_INDEX for non-mapped tasks; the
+    # report must still carry a valid attempt identity (#1471).
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_whoscored")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "manual__1471")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_daily")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+    monkeypatch.delenv("AIRFLOW_CTX_MAP_INDEX", raising=False)
+
+    report = runner._new_report("daily", ())
+
+    assert report["airflow"]["map_index"] == "-1"
+    identity = runner._airflow_attempt_report_identity(
+        tmp_path / "result.json", report
+    )
+    assert identity is not None
+
+
+@pytest.mark.unit
+def test_report_outside_airflow_has_no_attempt_identity(monkeypatch, tmp_path):
+    for name in (
+        "AIRFLOW_CTX_DAG_ID",
+        "AIRFLOW_CTX_DAG_RUN_ID",
+        "AIRFLOW_CTX_TASK_ID",
+        "AIRFLOW_CTX_TRY_NUMBER",
+        "AIRFLOW_CTX_MAP_INDEX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    report = runner._new_report("daily", ())
+
+    assert report["airflow"]["map_index"] is None
+    assert (
+        runner._airflow_attempt_report_identity(tmp_path / "result.json", report)
+        is None
+    )
+
+
+@pytest.mark.unit
 def test_replay_uses_direct_service_and_emits_stable_v2_report(monkeypatch, tmp_path):
     rc, report, service_cls, _ = _run(
         monkeypatch,

@@ -171,6 +171,9 @@ _PAID_ROUTES = frozenset(
         TransportRoute.PAID_LEASE,
     }
 )
+# Raised by the FlareSolverr WhoScored extension when the page's RequireJS
+# site-header token is absent; a bootstrap reload does not recover it (#1017).
+_SOURCE_STAGE_HEADER_UNAVAILABLE = "WhoScored page request header is unavailable."
 
 
 class FailureKind(str, Enum):
@@ -2637,7 +2640,15 @@ class WhoScoredTransport:
         self._paid_batch_enabled = paid_batch_enabled
         self._source_circuit_permit: Optional[CircuitPermit] = None
         self._http_session_factory = http_session_factory
-        self._pool_proxy_url = self._resolve_pool_proxy_url()
+        # Only a real direct_only transport (no injected session) must refuse
+        # the silent host-IP fallback: WhoScored blocks that IP at Cloudflare.
+        self._pool_proxy_url = self._resolve_pool_proxy_url(
+            required=(
+                resolved_policy is TransportPolicy.DIRECT_ONLY
+                and direct_http_session is None
+                and http_session_factory is None
+            )
+        )
         self._direct_http = direct_http_session or self._new_http_session(
             self._pool_proxy_url
         )
@@ -2845,7 +2856,7 @@ class WhoScoredTransport:
         )
         time.sleep(delay)
 
-    def _resolve_pool_proxy_url(self) -> Optional[str]:
+    def _resolve_pool_proxy_url(self, *, required: bool = False) -> Optional[str]:
         """Residential-pool egress for the direct route.
 
         WhoScored blocks the datacentre host IP at Cloudflare while the same
@@ -2853,16 +2864,31 @@ class WhoScoredTransport:
         at a ``host:port:user:pass`` pool the direct curl and direct
         FlareSolverr routes egress through one pool member chosen once per
         process (sticky residential, matching the platform's per-task proxy
-        pattern).  Unset/empty keeps the legacy host-IP direct route.
+        pattern).  Unset/empty keeps the legacy host-IP direct route only for
+        injected test sessions; a ``required`` (real direct_only) transport
+        fails before any source request instead.
         """
         path = os.environ.get("WHOSCORED_PROXY_FILE", "").strip()
         if not path:
+            if required:
+                raise ValueError(
+                    "WHOSCORED_PROXY_FILE is not set: direct_only refuses to "
+                    "egress from the host IP"
+                )
             return None
         from scrapers.utils.proxy_manager import ProxyManager
 
         manager = ProxyManager(rotation_strategy="random")
-        manager.load_from_file_custom_format(path)
-        return manager.get_http_proxy_url()
+        try:
+            manager.load_from_file_custom_format(path)
+        except OSError as exc:
+            raise ValueError(
+                f"WHOSCORED_PROXY_FILE is not readable: {type(exc).__name__}"
+            ) from exc
+        proxy_url = manager.get_http_proxy_url()
+        if proxy_url is None and required:
+            raise ValueError("WHOSCORED_PROXY_FILE has no usable pool member")
+        return proxy_url
 
     def _new_http_session(self, proxy_url: Optional[str]) -> Any:
         if self._http_session_factory is not None:
@@ -4369,12 +4395,24 @@ class WhoScoredTransport:
         except (FlareSolverrErrorPage, FlareSolverrError) as exc:
             self._drop_browser_session(client, route)
             record_error(FailureKind.BROWSER, exc)
+            # [1017] Stage-stat XHR fails synchronously in the extension when the
+            # page's RequireJS site-header token is absent ("WhoScored page
+            # request header is unavailable."). A full bootstrap reload does NOT
+            # recover it, so 4 retries only burn wall-clock (→ AirflowTaskTimeout)
+            # and re-download the bootstrap page (proxy bytes). service.py already
+            # degrades these stage-stat feeds to NOT_AVAILABLE on the first raise
+            # (_is_source_stage_statistics_unavailable) — schedule/matches/events
+            # still commit and the scope stays success. Mark it non-retryable so
+            # it fails fast into that graceful path. Any other browser error keeps
+            # retryable=True. Latent behind master's #1012 residential transport.
+            _exc_text = _safe_route_exception_text(exc, route=route)
+            _no_retry = _SOURCE_STAGE_HEADER_UNAVAILABLE in _exc_text
             raise WhoScoredTransportError(
-                _safe_route_exception_text(exc, route=route),
+                _exc_text,
                 kind=FailureKind.BROWSER,
                 url=items[0].url,
                 route=route,
-                retryable=True,
+                retryable=not _no_retry,
             ) from exc
 
         outcomes: list[_BrowserBatchOutcome] = []
