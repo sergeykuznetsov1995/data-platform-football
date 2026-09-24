@@ -1376,8 +1376,13 @@ class TestFotmobNativeRunner:
         assert "source_gap=1" in mod._wave_metrics_line(second_report, second_rc)
 
     @staticmethod
-    def _source_gap_attempts(mod, monkeypatch, kickoff, runs):
-        """Прогоняет скоуп с матчем «данных нет» `runs` раз, сдвигая часы планера."""
+    def _source_gap_attempts(mod, monkeypatch, kickoff, runs, second_match=False,
+                             later_match_limit=None):
+        """Прогоняет скоуп с матчем «данных нет» `runs` раз, сдвигая часы планера.
+
+        `second_match` добавляет второй такой же матч 101 после 100;
+        `later_match_limit` — `--match-limit` со второго рана.
+        """
 
         from scrapers.fotmob import planner
         from scrapers.fotmob.planner import RunMode, TransportBudget
@@ -1387,6 +1392,11 @@ class TestFotmobNativeRunner:
 
         league = _league_payload()
         league["fixtures"]["allMatches"][0]["status"]["utcTime"] = kickoff
+        if second_match:
+            extra = json.loads(json.dumps(league["fixtures"]["allMatches"][0]))
+            extra["id"] = 101
+            extra["pageUrl"] = "/matches/alpha-vs-beta/y#101"
+            league["fixtures"]["allMatches"].append(extra)
         responses = {
             canonicalize_target("allLeagues").canonical_url: {
                 "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
@@ -1396,6 +1406,11 @@ class TestFotmobNativeRunner:
                 "error": True,
                 "message": "Data not found",
                 "matchId": "100",
+            },
+            canonicalize_target("matchDetails", {"matchId": "101"}).canonical_url: {
+                "error": True,
+                "message": "Data not found",
+                "matchId": "101",
             },
         }
         repository = MemoryFotMobRepository()
@@ -1422,6 +1437,8 @@ class TestFotmobNativeRunner:
 
             monkeypatch.setattr(planner, "datetime", ShiftedDatetime)
             args.run_id = f"gap-run-{index + 1}"
+            if index and later_match_limit is not None:
+                args.match_limit = later_match_limit
             service = FotMobIngestService(
                 transport=StubTransport(dict(responses)),
                 repository=repository,
@@ -1431,7 +1448,8 @@ class TestFotmobNativeRunner:
                 max_workers=2,
             )
             rc, report = _run_native_admitted(mod, args, service=service)
-            assert rc == 0, report["errors"]
+            # Отрезанный лимитом матч — честный retryable с rc=1; остальное зелёное.
+            assert rc == 0 or (index and later_match_limit), report["errors"]
             if not report["selection"]["scope_attempts"]:
                 # Скоуп не дошёл до срока — в этом ране его не планировали.
                 attempts.append(None)
@@ -1470,6 +1488,35 @@ class TestFotmobNativeRunner:
         # Третий ран — потолок попыток: дыра признана, обычные 48 ч.
         assert third["outcome"] == "source_gap"
         assert third["delay"] > timedelta(hours=47)
+
+    @pytest.mark.unit
+    def test_candidate_cut_by_the_limit_does_not_shorten_the_retry(self, monkeypatch):
+        """Astra р2: матч 101, не запрошенный из-за лимита, не держит скоуп на 2 ч.
+
+        Со второго рана лимит пускает только матч 100. К третьему рану 100
+        подтверждён (три рана), а 101 с одной старой попыткой новых попыток не
+        набирает — короткий возврат ради него шёл бы до истечения 72 ч.
+        """
+
+        from datetime import timezone
+
+        mod = self._module()
+        kickoff = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        first, second, third = self._source_gap_attempts(
+            mod,
+            monkeypatch,
+            kickoff,
+            runs=(0, 1, 3),
+            second_match=True,
+            later_match_limit=1,
+        )
+
+        assert first["outcome"] == "retryable"
+        assert second is not None and third is not None
+        # Обычная лестница повтора (третья попытка — 6 ч), не 2 ч ради 101.
+        assert third["delay"] > timedelta(hours=5)
 
     @pytest.mark.unit
     def test_source_gap_of_an_old_match_keeps_the_long_retry(self, monkeypatch):
@@ -1530,17 +1577,22 @@ class TestFotmobNativeRunner:
                 asked.append((target_type, set(entity_ids)))
                 return [row for row in rows if row["entity_id"] in set(entity_ids)]
 
-        assert mod._unconfirmed_gap_matches(matches, Repository(), now) == [
+        assert mod._unconfirmed_gap_matches(matches, Repository(), now, "r1") == [
             "close",
             "one",
         ]
-        # Старый и несыгранный матчи в запрос не попадают вовсе.
-        assert asked == [
-            ("match", {"one", "close", "spread", "three", "won", "other"})
+        # Кандидат, не спрошенный в текущем ране, короткого возврата не даёт.
+        assert mod._unconfirmed_gap_matches(matches, Repository(), now, "r2") == [
+            "close"
         ]
+        # Старый и несыгранный матчи в запрос не попадают вовсе.
+        assert asked[0] == (
+            "match",
+            {"one", "close", "spread", "three", "won", "other"},
+        )
         # Нечего проверять — Trino не спрашиваем.
-        assert mod._unconfirmed_gap_matches(matches[-2:], Repository(), now) == []
-        assert len(asked) == 1
+        assert mod._unconfirmed_gap_matches(matches[-2:], Repository(), now, "r1") == []
+        assert len(asked) == 2
 
     @pytest.mark.unit
     def test_automatic_run_with_progress_defers_retry_without_failing(self):

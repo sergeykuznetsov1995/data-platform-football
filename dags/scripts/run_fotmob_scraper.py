@@ -742,7 +742,10 @@ def _match_debt_is_open(
 
 
 def _unconfirmed_gap_matches(
-    matches: Iterable[Mapping[str, Any]], repository: Any, now: datetime
+    matches: Iterable[Mapping[str, Any]],
+    repository: Any,
+    now: datetime,
+    run_id: str,
 ) -> list[str]:
     """Матчи скоупа, чья дыра источника ещё не подтверждена (#1450).
 
@@ -759,6 +762,11 @@ def _unconfirmed_gap_matches(
     граница цены: не больше трёх лишних `matchDetails` на каждую подтверждённую
     дыру того же скоупа в расчёте на один матч-кандидат (за 72 ч от его начала);
     несколько кандидатов в одном скоупе эти возвраты складывают.
+
+    Кандидат назначает короткий возврат, только если сам получил «данных нет» в
+    ЭТОМ ране (`run_id`): иначе матч, отрезанный бюджетом или `--match-limit`,
+    возвращал бы скоуп каждые 2 ч, не набирая попыток, и потолок не держался бы.
+    Каждый короткий возврат тем самым оплачен новой попыткой кандидата.
     """
 
     candidates = set()
@@ -792,7 +800,7 @@ def _unconfirmed_gap_matches(
                 times.setdefault(entity_id, []).append(completed)
     unconfirmed = []
     for entity_id, run_ids in runs.items():
-        if entity_id in succeeded:
+        if entity_id in succeeded or str(run_id) not in run_ids:
             continue
         seen = times.get(entity_id) or [now]
         spread = max(seen) - min(seen)
@@ -2198,7 +2206,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 if source_missing_matches > 0
                 and bundle is not None
                 and _unconfirmed_gap_matches(
-                    bundle.matches, service.repository, observed_at
+                    bundle.matches, service.repository, observed_at, run_id
                 )
                 else None
             )
