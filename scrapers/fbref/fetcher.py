@@ -1139,20 +1139,10 @@ class FBrefFetcher:
                 and getattr(self, "_lease_client", None) is not None
             ):
                 provider_stats = None
+                drain_error = None
                 try:
                     provider_stats = self._wait_and_observe_provider()
                 except Exception as exc:
-                    # This verdict ends the wave and the exception is the only
-                    # evidence of why the paid lease would not drain.  Swallowed
-                    # silently it reads exactly like a policy breach: the geo-IP
-                    # path cost a day of blind red runs for the same reason,
-                    # until c343f5e2 put its type in the log (#1188).
-                    logger.warning(
-                        "FBref paid lease drain failed before the wave "
-                        "verdict: %s: %s",
-                        type(exc).__name__,
-                        exc,
-                    )
                     # An exit that never answered cannot have spent the ledger
                     # it refuses to close: measured spend is 352-415 bytes of a
                     # 16 MiB lease.  Owner's call 19.08 is to treat that narrow
@@ -1166,18 +1156,27 @@ class FBrefFetcher:
                     # not only for an unreachable meter, and the cap check below
                     # cannot re-impose the verdict once the drain failed (it has
                     # no fresh stats to read).  So the exemption also requires
-                    # that nothing is known to have been spent -- any observed
-                    # byte means the exit did answer somebody.
-                    unspent = not self._provider_lease_observed_bytes and not int(
-                        (bootstrap_stats or {}).get("real_bytes_downloaded", 0)
-                        or 0
-                    )
+                    # that nothing is known to have been spent by *this lease*
+                    # -- any byte the provider attributed to it means the exit
+                    # did answer somebody.
+                    #
+                    # Spend is judged per lease, not per transport (#1452).  The
+                    # transport's `real_bytes_downloaded` sums every rotation of
+                    # `transport.fetch` (up to four leases), and on
+                    # `GeoIPTransportError` the browser never started on this
+                    # lease at all: the probe runs after the lease is acquired
+                    # and before the launch.  The provider's per-lease counter is
+                    # the only honest witness.  On 24.09 the 3.1 MB of three
+                    # Cloudflare-rejected leases condemned a fourth whose exit
+                    # never answered, and the run died after 75 clean pages.
+                    unspent = not self._provider_lease_observed_bytes
                     if self._exit_never_answered(bootstrap_stats) and unspent:
                         drain_relief = f"{type(exc).__name__}: {exc}"
                     else:
                         hard_policy = (
                             hard_policy or "browser_provider_drain_failed"
                         )
+                    drain_error = exc
                 if (
                     (
                         self._provider_bootstrap_max_bytes > 0
@@ -1195,6 +1194,26 @@ class FBrefFetcher:
                     )
                 ):
                     hard_policy = hard_policy or "browser_provider_cap_exhausted"
+                if drain_error is not None:
+                    # This verdict ends the wave and the exception is the only
+                    # evidence of why the paid lease would not drain.  Swallowed
+                    # silently it reads exactly like a policy breach: the geo-IP
+                    # path cost a day of blind red runs for the same reason,
+                    # until c343f5e2 put its type in the log (#1188).
+                    # Logged after the cap check so the line names the verdict
+                    # the wave actually gets: the exemption above can still be
+                    # overruled by an exhausted provider cap (#1452; FetchError
+                    # text unchanged).
+                    logger.warning(
+                        "FBref paid lease drain failed before the wave "
+                        "verdict: %s: %s; %s",
+                        type(drain_error).__name__,
+                        drain_error,
+                        "exit never answered and its lease is unspent"
+                        " -- re-solving"
+                        if hard_policy is None
+                        else f"verdict {hard_policy}",
+                    )
             breakdown = (
                 self._full_browser_reservation_breakdown()
                 if finalize_error is not None
