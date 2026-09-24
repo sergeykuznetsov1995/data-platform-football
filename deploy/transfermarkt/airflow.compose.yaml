@@ -1,0 +1,233 @@
+# Изолированный Transfermarkt-Airflow (#1387): проект transfermarkt-airflow, своя
+# metadata-DB, scheduler на пинованном образе, код — bind-mount одного замороженного
+# дерева ${TRANSFERMARKT_RELEASE_ROOT}. Общий проект data-platform НЕ трогает.
+# Образец — deploy/sofascore/airflow.compose.yaml (без артефакта бюджета, кампании
+# all-men и полос). Каждый путь хоста — переменная без дефолта: без значения
+# `docker compose config` падает, а не молча подставляет чужое дерево.
+# Переменные — deploy/transfermarkt/transfermarkt.env.example. Секреты приходят только
+# через --env-file: первым общий .env платформы, вторым /etc/data-platform/transfermarkt.env.
+#
+# Сети: transfermarkt-net (своя, внешняя, создаётся руками один раз) + dp-storage (чужая,
+# только ради алиасов trino/seaweedfs). dp-backend сознательно НЕ подключаем: он несёт
+# alias postgres общей Airflow-БД — риск двойного scheduler'а на одной базе.
+#
+# Запуск — только через deploy/transfermarkt/deploy.sh (первый подъём metadb/init — по
+# README). ВСЕГДА `-p transfermarkt-airflow` и --no-deps для scheduler'а.
+name: transfermarkt-airflow
+
+x-tm-logging: &tm-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-tm-airflow-common: &tm-airflow-common
+  image: ${TRANSFERMARKT_AIRFLOW_IMAGE:?set the pinned Transfermarkt Airflow image}
+  shm_size: '512m'
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  cap_add: [CHOWN, SETGID, SETUID, SYS_PTRACE]
+  logging: *tm-logging
+  environment: &tm-airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?set the Airflow fernet key}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # СВОЯ metadata-DB: сервис airflow-metadb этого проекта. Ни при каких
+    # обстоятельствах не менять на общий postgres — двойной scheduler на одной БД.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${TRANSFERMARKT_AIRFLOW_DB_PASSWORD:?set the Transfermarkt metadata-DB password}@airflow-metadb:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?set the Airflow webserver secret key}
+    PYTHONPATH: /opt/airflow
+    # Trino/S3 — по алиасам через внешнюю dp-storage.
+    TRINO_HOST: trino
+    TRINO_PORT: ${TRINO_PORT:?set Trino port}
+    TRINO_PASSWORD: ${TRINO_PASSWORD:?set Trino password}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3 access key}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3 secret key}
+    # Те же имена, что у общего scheduler'а (compose.yaml, блок Transfermarkt).
+    TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-false}
+    TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
+    # Хардкод (не из .env): общий .env платформы несёт TM_PROXY_CONTROL_URL общего
+    # шлюза. В transfermarkt-net алиас transfermarkt_gw — шлюз проекта transfermarkt-gw.
+    TM_PROXY_CONTROL_URL: http://transfermarkt_gw:8899
+    # Свой токен контура, отличный от PROXY_FILTER_CONTROL_TOKEN: шлюз отказывает
+    # классу transfermarkt, если они равны. Фолбэка на общий токен нет.
+    TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:?set the Transfermarkt gateway control token}
+    TM_BACKFILL_PROXY_CONTROL_URL: http://transfermarkt_gw:8899
+    TM_BACKFILL_PROXY_CONTROL_TOKEN: ${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}
+    # Бакет — по премис-чеку #1387 (б): raw TM живёт в warehouse; общий .env держит
+    # ICEBERG_WAREHOUSE=football, поэтому значение не выводится из него.
+    TRANSFERMARKT_RAW_STORE_URI: s3://warehouse/raw/transfermarkt
+    # Обе полосы пишут сырой ответ до разбора: ingest/discover — через этот ключ,
+    # backfill ставит его сам в коде.
+    TRANSFERMARKT_REQUIRE_RAW_STORE: "true"
+    TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
+    TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ALERT_ENV: transfermarkt-isolated
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+  volumes:
+    # Везде длинный синтаксис + create_host_path: false: отсутствующий источник —
+    # ошибка запуска, а не молча созданный Docker'ом пустой каталог.
+    # DagBag = dags/ дерева релиза; поверх — блок-лист контура (ровно четыре TM-DAG).
+    - type: bind
+      source: ${TRANSFERMARKT_RELEASE_ROOT:?set the absolute frozen release root}/dags
+      target: /opt/airflow/dags
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${TRANSFERMARKT_RELEASE_ROOT:?set the absolute frozen release root}/deploy/transfermarkt/.airflowignore
+      target: /opt/airflow/dags/.airflowignore
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${TRANSFERMARKT_RELEASE_ROOT:?set the absolute frozen release root}/scrapers
+      target: /opt/airflow/scrapers
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${TRANSFERMARKT_RELEASE_ROOT:?set the absolute frozen release root}/scripts
+      target: /opt/airflow/scripts
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${TRANSFERMARKT_RELEASE_ROOT:?set the absolute frozen release root}/configs
+      target: /opt/airflow/configs
+      read_only: true
+      bind:
+        create_host_path: false
+    # Логи задач и всё состояние TM (transfermarkt-approvals, -registry, -native-v2,
+    # -checkpoints, -traffic, -backfill, dag_id=*) — вне дерева релиза, переживают ротацию.
+    - type: bind
+      source: ${TRANSFERMARKT_RUNTIME_DIR:?set the durable Transfermarkt runtime directory}/logs
+      target: /opt/airflow/logs
+      bind:
+        create_host_path: false
+  networks:
+    - transfermarkt-net
+    - dp-storage
+
+services:
+  airflow-metadb:
+    image: ${TRANSFERMARKT_POSTGRES_IMAGE:?set the pinned PostgreSQL image of the Transfermarkt metadata-DB}
+    container_name: transfermarkt-airflow-metadb
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, FOWNER, DAC_READ_SEARCH]
+    logging: *tm-logging
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${TRANSFERMARKT_AIRFLOW_DB_PASSWORD:?set the Transfermarkt metadata-DB password}
+      POSTGRES_DB: airflow
+    volumes:
+      - tm_airflow_pgdata:/var/lib/postgresql/data
+    networks:
+      - transfermarkt-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  airflow-init:
+    <<: *tm-airflow-common
+    container_name: transfermarkt-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        airflow db migrate
+        airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME} \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD} \
+          --firstname Admin --lastname User --role Admin \
+          --email admin@example.com || true
+        # Пулы — кодом (размеры как в общем compose.yaml); deploy.sh ставит их повторно.
+        airflow pools set 'transfermarkt_proxy' 1 'Transfermarkt production and registry proxy work'
+        airflow pools set 'transfermarkt_backfill_proxy' 1 'Transfermarkt historical backfill only; bounded dedicated proxy slot'
+        airflow pools set 'transfermarkt_backfill_control' 1 'Transfermarkt historical planning and DQ only; isolated from daily ingest'
+        echo "transfermarkt-airflow init complete"
+    environment:
+      <<: *tm-airflow-env
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:?set the Airflow admin user}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:?set the Airflow admin password}
+    restart: "no"
+    depends_on:
+      airflow-metadb:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *tm-airflow-common
+    container_name: transfermarkt-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+        reservations:
+          memory: 1G
+
+  # Опциональный UI для приёмки: ... --profile ui up -d --no-deps airflow-webserver;
+  # http://127.0.0.1:8084
+  airflow-webserver:
+    <<: *tm-airflow-common
+    container_name: transfermarkt-airflow-webserver
+    command: webserver
+    profiles: ["ui"]
+    ports:
+      - "127.0.0.1:8084:8080"
+    environment:
+      <<: *tm-airflow-env
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  tm_airflow_pgdata:
+    name: transfermarkt_airflow_pgdata
+
+networks:
+  transfermarkt-net:
+    external: true
+    name: transfermarkt-net
+  dp-storage:
+    external: true
+    name: dp-storage

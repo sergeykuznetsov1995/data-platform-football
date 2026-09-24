@@ -1,0 +1,16 @@
+# Изолированный контур Transfermarkt (#1387): монтируется поверх dags/.airflowignore
+# дерева релиза (deploy/transfermarkt/airflow.compose.yaml). Активны ровно четыре DAG:
+# dag_ingest_transfermarkt, dag_discover_transfermarkt_registry, dag_backfill_transfermarkt,
+# dag_transform_transfermarkt_silver. Пин — тест DagBag в tests/unit/dags/.
+# ВНИМАНИЕ: движок regexp здесь RE2 (не Python re) — negative lookahead (?!...)
+# НЕ поддерживается и молча игнорируется. Поэтому — явный блок-лист всего прочего.
+# Новый DAG в dags/ без строки здесь уронит тест «ровно четыре DAG».
+^configs/
+^plugins/
+^scripts/
+^sql/
+^utils/
+^dag_(accept|backup|bootstrap|canary|collect|e3|iceberg|master|orchestrate|proxy|refresh|replay|sofascore|superset|trigger)_
+^dag_backfill_(fbref|fotmob|sofascore_all_mens|understat|whoscored)\.py$
+^dag_ingest_(capology|clubelo|espn|fbref|fotmob|matchhistory|sofascore|sofifa|understat|whoscored)\.py$
+^dag_transform_(capology|e3|e4|espn|fbref|fotmob|sofifa|xref)[_.]

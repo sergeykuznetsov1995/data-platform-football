@@ -1,0 +1,102 @@
+# Выделенный платный шлюз Transfermarkt — ОТДЕЛЬНЫЙ compose-проект (#1387).
+# Все источники делят compose-проект `data-platform`, и любой `docker compose up` из
+# чужого чекаута пересоздаёт его сервисы; шлюз в своём проекте управляется только этим
+# файлом. Образец — deploy/sofascore/gateway.compose.yaml.
+#
+# 1) Дерево релиза смонтировано ЦЕЛИКОМ в /opt/transfermarkt-repo (ro), PYTHONPATH туда же:
+#    filter_proxy.py из /opt/airflow потребовал бы вшитый в образ WhoScored-якорь (в
+#    пинованном образе его нет); при другом корне якорь грузится из дерева.
+# 2) Режим --source-mode transfermarkt-only: аренды только transfermarkt /
+#    transfermarkt_backfill (прочие — 403 source_rejected), без суточного, dagrun- и
+#    URL-бюджетов (флаги бюджета режим отвергает на старте); предохранитель —
+#    потолок одной аренды 24 МиБ и слоты аренд.
+# 3) Сеть — только transfermarkt-net; scheduler проекта transfermarkt-airflow ходит по
+#    алиасу `transfermarkt_gw:8899`. Образ пинованный, без build.
+# 4) Пул Decodo — переменная TRANSFERMARKT_PROXY_POOL_JSON; deploy.sh подаёт её из
+#    файла пула в окружение процесса compose (не в лог и не в env-файл). Своё имя, а не
+#    PROXY_POOL_JSON: общий .env платформы несёт пул общего шлюза.
+#
+# Запуск — только через deploy/transfermarkt/deploy.sh.
+name: transfermarkt-gw
+
+services:
+  transfermarkt_gw:
+    image: ${TRANSFERMARKT_AIRFLOW_IMAGE:?set the pinned Transfermarkt image}
+    container_name: transfermarkt_gw
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    environment:
+      PYTHONPATH: /opt/transfermarkt-repo
+      # Стартовая проверка шлюза требует общий контрольный токен (≥ 32) в любом режиме;
+      # аренды TM он не открывает — для них свой TM_PROXY_CONTROL_TOKEN, обязан отличаться.
+      PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:?set the gateway shared control token}
+      TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:?set the Transfermarkt gateway control token}
+      TM_BACKFILL_PROXY_CONTROL_TOKEN: ${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}
+      PROXY_POOL_JSON: ${TRANSFERMARKT_PROXY_POOL_JSON:?deploy.sh feeds the Decodo pool from TRANSFERMARKT_PROXY_POOL_FILE}
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
+    command:
+      - python
+      - /opt/transfermarkt-repo/scripts/proxy_filter/filter_proxy.py
+      - --source-mode
+      - transfermarkt-only
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://transfermarkt_gw:8900
+      - --blocklist
+      - /opt/transfermarkt-repo/configs/proxy_filter/blocklist.txt
+      - --max-lease-mb
+      - "24"
+      - --max-lease-ttl-seconds
+      - "3600"
+      - --max-active-leases
+      - "4"
+      - --transfermarkt-permit-state
+      - /opt/airflow/logs/proxy_filter/transfermarkt_request_permits.json
+      - --ledger
+      - /opt/airflow/logs/proxy_filter/paid_requests.jsonl
+      - --out
+      - /opt/airflow/logs/proxy_filter/bytes.json
+    volumes:
+      # Дерево релиза целиком (см. п. 1). Входы runtime-fingerprint — внутри него.
+      - type: bind
+        source: ${TRANSFERMARKT_RELEASE_ROOT:?set the absolute frozen release root}
+        target: /opt/transfermarkt-repo
+        read_only: true
+        bind:
+          create_host_path: false
+      # Леджер, разрешения и счётчики шлюза — вне дерева релиза; единственный писатель.
+      - type: bind
+        source: ${TRANSFERMARKT_RUNTIME_DIR:?set the durable Transfermarkt runtime directory}/gateway-state
+        target: /opt/airflow/logs/proxy_filter
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8899/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+    networks:
+      - transfermarkt-net
+
+networks:
+  transfermarkt-net:
+    external: true
+    name: transfermarkt-net
