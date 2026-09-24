@@ -3,17 +3,22 @@
 Definition (grill 23.09, roadmap assumptions; the morning report copies the
 SQL text below verbatim, so change it only together with that copy):
 
-* A match is *played* when the published schedule (manifest fence: the latest
-  manifest row of the scope is ``complete`` and ``_batch_id`` equals its
-  ``batch_id``) has ``is_result = true``.  ``date`` is UTC for the current
-  seasons, so the deadline is ``date + 26 h`` (24 h after a ~2 h match).
+* A match is *played* when the schedule of the latest ``complete`` attempt of
+  the scope (``_batch_id`` equals its ``batch_id``) has ``is_result = true``.
+  Not the consumers' fence (latest row must be ``complete``): the season
+  schedule is known in advance, so a failed latest attempt must not drop its
+  matches from ``due`` -- they stay due and count as our delay.
+  ``date`` is UTC for the current seasons, so the deadline is
+  ``date + 26 h`` (24 h after a ~2 h match).
 * The day key D is the UTC day of the deadline.
 * *On time* (``ok``): a ``complete`` manifest attempt of the scope with
   ``kickoff < completed_at <= deadline`` covered the match
   (``quality_json.covered_game_ids`` = games with shots and player rows).
 * *Site delay* (``site_late``): the match is not on time, at least one
-  ``complete`` attempt ran between kickoff and deadline, and none of them saw
-  the match marked played by the site (``site_result_game_ids``).  Site delays
+  ``complete`` attempt ran between kickoff and deadline, and no attempt in
+  that window saw the match marked played by the site
+  (``site_result_game_ids`` of complete manifest attempts or of failures
+  journal rows with ``site_result_known = true``).  Site delays
   are subtracted from ``due`` and reported separately.  No complete attempt
   in that window at all means the delay is ours.
 * Transitional rule: attempts written before the lists existed have neither
@@ -29,8 +34,11 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Optional
 
+from scrapers.understat.manifest import FAILURES_TABLE, MANIFEST_SCHEMA
+
 
 TARGET_PCT = Decimal("99")
+FAILURES_RELATION = f"iceberg.{MANIFEST_SCHEMA}.{FAILURES_TABLE}"
 
 _FENCED_SCHEDULE = """
 m AS (
@@ -57,10 +65,30 @@ played AS (
     WHERE m.status = 'complete' AND s._batch_id = m.batch_id AND s.is_result
 )"""
 
-DAILY_CRITERION_SQL = (
-    "WITH"
-    + _FENCED_SCHEDULE
-    + """,
+DAILY_CRITERION_SQL = """WITH
+lc AS (
+    SELECT league, season, batch_id
+    FROM (
+        SELECT league, season, batch_id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY league, season
+                   ORDER BY completed_at DESC, attempt_id DESC
+               ) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2' AND status = 'complete'
+    )
+    WHERE rn = 1
+),
+played AS (
+    SELECT s.league, s.season, CAST(s.game_id AS varchar) AS game_id,
+           s.date AS kickoff,
+           count(*) OVER (
+               PARTITION BY s.league, s.season ORDER BY s.date
+           ) AS ordinal
+    FROM iceberg.bronze.understat_schedule s
+    JOIN lc ON lc.league = s.league AND lc.season = s.season
+    WHERE s._batch_id = lc.batch_id AND s.is_result
+),
 due AS (
     SELECT league, season, game_id, kickoff, ordinal,
            kickoff + INTERVAL '26' HOUR AS deadline
@@ -80,6 +108,25 @@ att AS (
                 AS array(varchar)) AS site
     FROM iceberg.ops.understat_ingest_manifest_v1
     WHERE contract_version = 'understat-bronze-v2' AND status = 'complete'
+),
+journal AS (
+    SELECT f.league, f.season,
+           CAST(from_iso8601_timestamp(f.completed_at) AT TIME ZONE 'UTC'
+                AS timestamp(6)) AS done,
+           CAST(json_extract(f.quality_json, '$.site_result_game_ids')
+                AS array(varchar)) AS site
+    FROM {failures} f
+    WHERE f.contract_version = 'understat-bronze-v2'
+      AND json_extract_scalar(f.quality_json, '$.site_result_known') = 'true'
+),
+journal_seen AS (
+    SELECT d.league, d.game_id, count(*) AS hits
+    FROM due d
+    JOIN journal j
+      ON j.league = d.league AND j.season = d.season
+     AND j.done > d.kickoff AND j.done <= d.deadline
+     AND contains(j.site, d.game_id)
+    GROUP BY d.league, d.game_id
 ),
 per_game AS (
     SELECT d.league, d.game_id,
@@ -103,10 +150,13 @@ per_game AS (
     GROUP BY d.league, d.game_id
 ),
 graded AS (
-    SELECT league,
-           covered_hits > 0 AS ok,
-           covered_hits = 0 AND attempts > 0 AND site_hits = 0 AS site_late
-    FROM per_game
+    SELECT p.league,
+           p.covered_hits > 0 AS ok,
+           p.covered_hits = 0 AND p.attempts > 0
+               AND p.site_hits = 0 AND coalesce(js.hits, 0) = 0 AS site_late
+    FROM per_game p
+    LEFT JOIN journal_seen js
+      ON js.league = p.league AND js.game_id = p.game_id
 )
 SELECT league,
        count_if(NOT site_late) AS due,
@@ -115,7 +165,6 @@ SELECT league,
 FROM graded
 GROUP BY league
 ORDER BY league"""
-)
 
 COMPLETENESS_SQL = (
     "WITH"
@@ -145,9 +194,13 @@ ORDER BY p.league"""
 )
 
 
-def render_daily_criterion_sql(day: str) -> str:
-    """SQL for deadline day ``day`` (ISO ``YYYY-MM-DD``, UTC)."""
-    return DAILY_CRITERION_SQL.format(day=_iso_day(day))
+def render_daily_criterion_sql(day: str, failures: str = FAILURES_RELATION) -> str:
+    """SQL for deadline day ``day`` (ISO ``YYYY-MM-DD``, UTC).
+
+    ``failures`` is the failures-journal relation; a caller may pass an empty
+    derived table with the manifest columns while the journal does not exist.
+    """
+    return DAILY_CRITERION_SQL.format(day=_iso_day(day), failures=failures)
 
 
 def render_completeness_sql(season: str) -> str:
@@ -206,6 +259,7 @@ def summarize_days(days: Iterable[DayResult]) -> int:
 __all__ = [
     "COMPLETENESS_SQL",
     "DAILY_CRITERION_SQL",
+    "FAILURES_RELATION",
     "TARGET_PCT",
     "DayResult",
     "pct",

@@ -48,7 +48,8 @@ def test_site_delay_is_subtracted_from_due_and_counted_separately():
     assert "count_if(NOT site_late) AS due" in sql
     assert "count_if(site_late) AS site_late" in sql
     assert (
-        "covered_hits = 0 AND attempts > 0 AND site_hits = 0 AS site_late" in sql
+        "p.covered_hits = 0 AND p.attempts > 0 AND p.site_hits = 0 "
+        "AND coalesce(js.hits, 0) = 0 AS site_late" in sql
     )
 
 
@@ -67,11 +68,17 @@ def test_streak_threshold_uses_the_exact_ratio_not_the_rounded_pct():
 
 def test_sql_reads_through_the_manifest_fence_with_a_26_hour_deadline():
     daily = render_daily_criterion_sql("2026-09-13")
-    for sql in (daily, COMPLETENESS_SQL):
-        assert "ORDER BY completed_at DESC, attempt_id DESC" in sql
-        assert "m.status = 'complete'" in sql
-        assert re.search(r"\w+\._batch_id = m\.batch_id", sql)
-        assert "contract_version = 'understat-bronze-v2'" in sql
+    # Completeness: the consumers' fence (latest row must be complete).
+    assert "ORDER BY completed_at DESC, attempt_id DESC" in COMPLETENESS_SQL
+    assert "m.status = 'complete'" in COMPLETENESS_SQL
+    assert re.search(r"\w+\._batch_id = m\.batch_id", COMPLETENESS_SQL)
+    # Daily: schedule of the latest COMPLETE attempt (plan decision 10).
+    assert re.search(
+        r"status = 'complete'\s*\)\s*WHERE rn = 1", daily
+    ), "the daily schedule must rank only complete attempts"
+    assert "s._batch_id = lc.batch_id" in daily
+    assert "iceberg.ops.understat_ingest_failures_v1 f" in daily
+    assert "contract_version = 'understat-bronze-v2'" in daily
     assert "kickoff + INTERVAL '26' HOUR" in daily
     assert "TIMESTAMP '2026-09-13 00:00:00'" in daily
     with pytest.raises(ValueError):
@@ -107,6 +114,7 @@ def synthetic():
     con.execute("CREATE SCHEMA ops")
     con.execute("CREATE SCHEMA bronze")
     con.execute(MANIFEST_DDL)
+    con.execute(MANIFEST_DDL.replace("manifest_v1", "failures_v1"))
     con.execute(SCHEDULE_DDL)
     con.executemany(
         "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
@@ -156,6 +164,7 @@ def synthetic():
         _, due, ok, site_late = rows[0]
         return DayResult(day, due=due, ok=ok, site_late=site_late)
 
+    run.con = con
     return run
 
 
@@ -176,3 +185,54 @@ def test_daily_sql_grades_a_synthetic_manifest(synthetic):
 
     assert summarize_days([day_11, day_14]) == 1
     assert summarize_days([day_11, day_12, day_14]) == 0
+
+
+def test_failed_latest_attempt_keeps_its_matches_due_as_our_delay(synthetic):
+    """Plan decision 10: a failure after the write marker is the latest row;
+    the schedule of the last complete attempt still defines the deadlines."""
+    synthetic.con.execute(
+        "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "L", "2627", "understat-bronze-v2", "b4", "a4",
+            "contract_failure", "2026-10-14T09:30:00+00:00", "{}",
+        ),
+    )
+    synthetic.con.execute(
+        "INSERT INTO bronze.understat_schedule VALUES "
+        "('L', '2627', 7, '2026-10-13 18:00', true, 'b3')"
+    )
+
+    # g7: deadline 14.10 20:00, the only attempt in the window failed.
+    assert synthetic("2026-10-14") == DayResult(
+        "2026-10-14", due=1, ok=0, site_late=0
+    )
+    # Earlier days keep their deadlines despite the failed latest row.
+    assert synthetic("2026-10-12") == DayResult(
+        "2026-10-12", due=2, ok=1, site_late=1
+    )
+
+
+def test_site_result_seen_by_a_journaled_failure_is_not_a_site_delay(synthetic):
+    """Plan decision 11: a failed attempt that parsed the league response
+    proves the site had the result, so the delay is ours."""
+    synthetic.con.execute(
+        "INSERT INTO ops.understat_ingest_failures_v1 VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "L", "2627", "understat-bronze-v2", "b5", "a5", "dq_failure",
+            "2026-10-12T12:00:00+00:00",
+            json.dumps({"site_result_game_ids": ["5"], "site_result_known": True}),
+        ),
+    )
+    synthetic.con.execute(
+        "INSERT INTO ops.understat_ingest_failures_v1 VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "L", "2627", "understat-bronze-v2", "b6", "a6",
+            "retryable_failure", "2026-10-12T12:30:00+00:00",
+            json.dumps({"site_result_game_ids": ["2"], "site_result_known": False}),
+        ),
+    )
+
+    # g5 moves from site delay to our delay; unknown lists are ignored.
+    assert synthetic("2026-10-12") == DayResult(
+        "2026-10-12", due=3, ok=1, site_late=0
+    )

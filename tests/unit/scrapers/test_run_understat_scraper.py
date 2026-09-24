@@ -154,11 +154,15 @@ class _Repository:
         self.previous = previous
         self.appended: list[ScopeAttempt] = []
         self.failures: list[ScopeAttempt] = []
+        self.failures_ensured = False
         self.ensured = False
         self.verified: list[ScopeAttempt] = []
 
     def ensure_table(self):
         self.ensured = True
+
+    def ensure_failures_table(self):
+        self.failures_ensured = True
 
     def latest_attempt(self, *_args, **_kwargs):
         return self.appended[-1] if self.appended else None
@@ -649,6 +653,7 @@ def test_dq_failure_is_journaled_with_game_lists_and_result_is_unchanged():
     assert journaled.error_message == payload["errors"][0]
     assert journaled.quality["site_result_game_ids"] == ["100"]
     assert journaled.quality["covered_game_ids"] == ["100"]
+    assert journaled.quality["site_result_known"] is True
     assert journaled.quality["issues"]
 
 
@@ -732,3 +737,27 @@ def test_early_failure_before_attempt_is_journaled_with_next_attempt_no(
     assert journaled.scope.source_league == "EPL"
     assert journaled.error_type == "ValueError"
     assert journaled.error_message == result["errors"][0]
+
+
+def test_every_run_ensures_the_failures_journal_before_any_failure():
+    factory, _ = _scraper_factory(_complete_frames())
+    repository = _Repository()
+
+    _, exit_code = runner.run_scope(
+        _args(), scraper_factory=factory, repository=repository
+    )
+
+    assert exit_code == 0
+    assert repository.ensured and repository.failures_ensured
+    assert repository.failures == []
+
+    broken = _Repository()
+
+    def journal_outage():
+        raise ConnectionError("trino unavailable")
+
+    broken.ensure_failures_table = journal_outage
+    _, broken_exit = runner.run_scope(
+        _args(), scraper_factory=factory, repository=broken
+    )
+    assert broken_exit == 0

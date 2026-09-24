@@ -348,6 +348,12 @@ def run_scope(
 
     try:
         repository.ensure_table()
+        # #1429: the failures journal exists before the first failure, so the
+        # daily meter can always read it; its outage never fails the scope.
+        try:
+            repository.ensure_failures_table()
+        except Exception:
+            logger.exception("Unable to ensure the Understat failures journal")
         latest = repository.latest_attempt(scope, contract_version=CONTRACT_VERSION)
         attempt_no = (latest.attempt_no + 1) if latest else 1
         if (
@@ -490,6 +496,10 @@ def run_scope(
                         proposed_attempt,
                         status=ManifestStatus.DQ_FAILURE,
                         completed_at=utc_now_iso(),
+                        quality={
+                            **proposed_attempt.quality,
+                            "site_result_known": True,
+                        },
                     ),
                 )
                 return _result_payload(proposed_attempt, errors=[message]), 1
