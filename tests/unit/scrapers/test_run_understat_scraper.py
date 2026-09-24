@@ -594,6 +594,10 @@ def test_backfill_verification_outage_does_not_hide_existing_complete_batch():
     assert second["errors"]
     assert repository.appended == appended_before
     stale_history_factory.assert_not_called()
+    [journaled] = repository.failures
+    assert journaled.status is ManifestStatus.RETRYABLE_FAILURE
+    assert journaled.error_message == "catalog unavailable"
+    assert journaled.mode == "backfill"
 
 
 def test_cli_requires_explicit_exact_scope_and_rejects_legacy_multi_scope_flags():

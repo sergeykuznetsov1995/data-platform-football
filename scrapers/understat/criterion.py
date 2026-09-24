@@ -84,16 +84,18 @@ att AS (
 per_game AS (
     SELECT d.league, d.game_id,
            count_if(a.done IS NOT NULL) AS attempts,
-           count_if(
+           count_if(coalesce(
                CASE WHEN a.covered IS NOT NULL
                     THEN contains(a.covered, d.game_id)
-                    ELSE a.cg >= d.ordinal END
-           ) AS covered_hits,
-           count_if(
+                    ELSE a.cg >= d.ordinal END,
+               false
+           )) AS covered_hits,
+           count_if(coalesce(
                CASE WHEN a.site IS NOT NULL
                     THEN contains(a.site, d.game_id)
-                    ELSE a.cg >= d.ordinal END
-           ) AS site_hits
+                    ELSE a.cg >= d.ordinal END,
+               false
+           )) AS site_hits
     FROM due d
     LEFT JOIN att a
       ON a.league = d.league AND a.season = d.season
@@ -187,14 +189,15 @@ def summarize_days(days: Iterable[DayResult]) -> int:
     """Streak of consecutive days with deadlines meeting the target.
 
     Walks back from the newest day; days with ``due = 0`` are neutral (skipped),
-    the first day with deadlines below ``TARGET_PCT`` ends the streak.
+    the first day with deadlines below ``TARGET_PCT`` ends the streak.  The
+    threshold is checked on the exact ratio, not on the rounded display value
+    (95/96 = 98.96 % rounds to 99.0 but misses the target).
     """
     streak = 0
     for result in sorted(days, key=lambda item: item.day, reverse=True):
-        value = result.pct
-        if value is None:
+        if result.due <= 0:
             continue
-        if value < TARGET_PCT:
+        if Decimal(100) * result.ok < TARGET_PCT * result.due:
             break
         streak += 1
     return streak

@@ -366,6 +366,22 @@ def run_scope(
                 logger.exception(
                     "Unable to verify already-complete Understat history scope"
                 )
+                verify_status, _, verify_message = _classify_exception(exc)
+                _journal_failure_best_effort(
+                    repository,
+                    build_failure_attempt(
+                        scope=scope,
+                        status=verify_status,
+                        batch_id=batch_id,
+                        run_id=run_id,
+                        mode=args.mode,
+                        parser_version=PARSER_VERSION,
+                        error_type=type(exc).__name__,
+                        error_message=verify_message,
+                        attempt_no=attempt_no,
+                        started_at=started_at,
+                    ),
+                )
                 return _result_payload(
                     latest,
                     errors=[
