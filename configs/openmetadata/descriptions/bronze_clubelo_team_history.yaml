@@ -1,0 +1,42 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_team_history
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_team_history
+  description: |
+    АРХИВ, замороженная таблица — не перезаписывать, optimize не запускать (#1460).
+    Источник (api.clubelo.com) закрыт с 09.2026, заново собрать нельзя; версия
+    модели Elo — `api-legacy` (новый сайт clubelo.com пересчитал историю).
+    Страховая копия: clubelo_team_history_archive_20260924.
+    Полная история Elo 44 английских клубов точными отрезками: 219 861 строка,
+    from 1946-07-07 … 2026-06-08; последний реальный конец отрезка 2026-06-07,
+    у последнего отрезка каждого клуба to = 2026-12-31 (заглушка открытого конца).
+    Сбор остановлен в #604 (закрыт 2026-06-16), последняя загрузка
+    _ingested_at 2026-06-06. Отрезки режутся и при смене места, не только Elo.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: team
+    description: Название клуба в написании ClubElo.
+  - name: rank
+    description: Место клуба по ELO на отрезке (double, может быть NULL).
+  - name: country
+    description: ISO-код страны клуба (в таблице только 'ENG').
+  - name: level
+    description: Дивизион (1 = высший; 0 — периоды вне английской лиги); bigint.
+  - name: elo
+    description: Рейтинг ELO клуба на отрезке (double; база ≈1500).
+  - name: from
+    description: Начало интервала действия значения Elo (timestamp).
+  - name: to
+    description: Конец интервала действия значения Elo (timestamp); 2026-12-31 — заглушка открытого конца.
+  - name: _source
+    description: Источник данных; метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

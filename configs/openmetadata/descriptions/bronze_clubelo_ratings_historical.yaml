@@ -4,14 +4,23 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_ratings_historical
   description: |
-    Еженедельные снимки клубных ELO-рейтингов с clubelo.com (метод soccerdata
-    read_by_date в цикле +7 дней, через scrapers/clubelo). Скрейпится gated-веткой
-    dag_ingest_clubelo (воскресенье / ручной триггер run_full=True, #716);
-    еженедельный refresh покрывает последние ~365 дней, разовый бэкфилл #716 —
-    ~10 сезонов АПЛ. Grain — один row на клуб за дату снимка.
-    Партиционирование ['rating_date']. Отличие от clubelo_ratings: rating_date —
-    varchar 'YYYY-MM-DD' (строка нужна, чтобы replace_partitions строил корректный
-    DELETE-фильтр).
+    АРХИВ, замороженная таблица — не перезаписывать, optimize не запускать (#1460).
+    Источник (api.clubelo.com) закрыт с 09.2026, заново собрать нельзя; версия
+    модели Elo — `api-legacy`. Страховая копия:
+    clubelo_ratings_historical_archive_20260924.
+    Бывшие еженедельные снимки клубных ELO-рейтингов (soccerdata read_by_date,
+    gated-ветка dag_ingest_clubelo, #716); 72 578 строк, 1 609 дат
+    2016-06-24 … 2026-08-30. Grain — один row на клуб за дату снимка.
+    Партиционирование ['rating_date'] (varchar 'YYYY-MM-DD').
+    Сетка дат лоскутная: несколько недельных сеток выборки с разным охватом лиг,
+    не сплошной ряд. Срез GER 2026-07-06 неполный (16 клубов против 18 в соседних
+    датах).
+    Воскресные прогоны 07.09, 14.09 и 21.09.2026 писали из кэша soccerdata:
+    значения не изменились, но даты 2026-09-06/13/20 потеряны (API отдавал 502, задача
+    была зелёной), а _ingested_at = 2026-09-21 у 50 дат 2025-09-21 … 2026-08-30 не
+    означает свежесть данных.
+    Семантика from/to — как в clubelo_ratings: интервал действия значения Elo,
+    2026-12-31 — заглушка «до следующего матча», дрожание Elo в 4-м знаке.
   tags:
     - Tier.Bronze
     - Domain.Football
@@ -28,11 +37,11 @@ columns:
   - name: elo
     description: Рейтинг ELO клуба на дату снимка (double; база ≈1500).
   - name: from
-    description: Начало периода действия этого рейтинга (timestamp).
+    description: Начало интервала действия значения Elo (timestamp).
   - name: to
-    description: Конец периода действия этого рейтинга (timestamp).
+    description: Конец интервала действия значения Elo (timestamp); 2026-12-31 — заглушка открытого конца.
   - name: league
-    description: Лига клуба; varchar, часто NULL (заполнено лишь для 'ENG-Premier League').
+    description: Лига клуба; varchar, часто NULL.
   - name: rating_date
     description: Дата снимка рейтинга (varchar 'YYYY-MM-DD'); partition key.
   - name: _source

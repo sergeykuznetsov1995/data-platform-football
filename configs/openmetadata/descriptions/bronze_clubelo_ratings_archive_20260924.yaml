@@ -1,0 +1,14 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_ratings_archive_20260924
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_ratings_archive_20260924
+  description: |
+    Страховая копия iceberg.bronze.clubelo_ratings от 2026-09-24 (#1460), сделана
+    CTAS скриптом scripts/clubelo_freeze_archive.py; count и max(_ingested_at)
+    сверены с источником. Не перезаписывать, optimize не запускать. Семантику
+    колонок см. в описании clubelo_ratings.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
