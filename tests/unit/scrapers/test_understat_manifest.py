@@ -9,12 +9,15 @@ import pytest
 
 from scrapers.understat.manifest import (
     CONTRACT_VERSION,
+    FAILURES_TABLE,
     MANIFEST_COLUMNS,
+    MANIFEST_TABLE,
     UNDERSTAT_ENTITIES,
     ManifestStatus,
     ScopeAttempt,
     ScopeKey,
     UnderstatManifestRepository,
+    render_manifest_ddl,
     validate_scope_attempt_result,
 )
 from scrapers.understat.quality import (
@@ -912,3 +915,59 @@ def test_runner_result_validation_is_serialization_friendly(tmp_path):
     wrong_scope = ScopeKey("ESP-La Liga", "2526")
     with pytest.raises(ValueError, match="does not match"):
         validate_scope_attempt_result(result, expected_scope=wrong_scope)
+
+
+def test_quality_report_lists_covered_and_site_result_games():
+    """#1429: every attempt carries the game lists the 24 h meter reads."""
+    report = _complete_report(_two_game_frames())
+
+    assert report.status is ManifestStatus.COMPLETE
+    quality = _complete_attempt(report=report).quality
+    assert quality["covered_game_ids"] == ["100", "101"]
+    assert quality["site_result_game_ids"] == ["100", "101"]
+    assert quality["completed_game_count"] == 2
+
+
+def test_game_with_shots_but_no_rosters_is_not_covered():
+    frames = _two_game_frames()
+    frames["understat_player_match_stats"] = frames[
+        "understat_player_match_stats"
+    ].query("game_id == 100")
+
+    report = _complete_report(frames)
+
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert report.to_dict()["covered_game_ids"] == ["100"]
+    assert report.to_dict()["site_result_game_ids"] == ["100", "101"]
+
+
+def test_failures_journal_is_a_separate_table_with_the_manifest_schema():
+    writer = _FakeWriter()
+    query = _FakeQuery()
+    repository = UnderstatManifestRepository(writer=writer, query=query)
+    failure = build_failure_attempt(
+        scope=SCOPE,
+        status=ManifestStatus.SCHEMA_DRIFT,
+        batch_id="failed-batch",
+        run_id="failed-run",
+        mode="current",
+        parser_version="native-v1",
+        error_message="getTeamData.statistics: expected an object",
+    )
+
+    repository.append_failure(failure)
+
+    ddl = query.calls[1][0]
+    assert "CREATE TABLE IF NOT EXISTS iceberg.ops.understat_ingest_failures_v1" in ddl
+    assert ddl.replace(
+        "understat_ingest_failures_v1", "understat_ingest_manifest_v1"
+    ) == render_manifest_ddl()
+    frame, kwargs = writer.calls[0]
+    assert kwargs["table"] == FAILURES_TABLE != MANIFEST_TABLE
+    assert tuple(frame.columns) == MANIFEST_COLUMNS
+    assert frame.loc[0, "error_message"] == (
+        "getTeamData.statistics: expected an object"
+    )
+    assert failure.quality["site_result_known"] is False
+    with pytest.raises(ValueError):
+        repository.append_failure(_complete_attempt())

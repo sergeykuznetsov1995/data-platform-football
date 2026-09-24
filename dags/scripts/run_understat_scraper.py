@@ -213,6 +213,69 @@ def _append_failure_best_effort(repository: Any, attempt: Any) -> Optional[str]:
     return None
 
 
+def _journal_failure_best_effort(repository: Any, attempt: Any) -> None:
+    """Append a failed attempt to the failures journal (#1429).
+
+    The journal is observability only: its outage must never change the
+    runner verdict, exit code or JSON result, so errors are only logged.
+    """
+    if repository is None:
+        return
+    try:
+        repository.append_failure(attempt)
+    except Exception:
+        logger.exception("Unable to journal the Understat failed attempt")
+
+
+def _journal_early_failure(
+    args: argparse.Namespace,
+    exc: BaseException,
+    *,
+    repository: Any = None,
+) -> None:
+    """Journal a failure raised before ``run_scope`` built its attempt."""
+    try:
+        from scrapers.understat.catalog import LEAGUE_BY_CANONICAL
+        from scrapers.understat.manifest import (
+            CONTRACT_VERSION,
+            ManifestStatus,
+            ScopeKey,
+            UnderstatManifestRepository,
+        )
+        from scrapers.understat.quality import build_failure_attempt
+
+        definition = LEAGUE_BY_CANONICAL.get(args.league)
+        scope = ScopeKey(
+            league=args.league,
+            season=args.season_slug,
+            source_league=definition.source_league if definition else None,
+            source_season_id=str(args.source_season_id),
+        )
+        if repository is None:
+            repository = UnderstatManifestRepository.from_env()
+        latest = repository.latest_attempt(scope, contract_version=CONTRACT_VERSION)
+        batch_id = str(uuid.uuid4())
+        attempt = build_failure_attempt(
+            scope=scope,
+            status=ManifestStatus.CONTRACT_FAILURE,
+            batch_id=batch_id,
+            run_id=str(
+                args.run_id
+                or os.getenv("AIRFLOW_CTX_DAG_RUN_ID")
+                or f"manual__{batch_id}"
+            ),
+            mode=args.mode,
+            parser_version=PARSER_VERSION,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            attempt_no=(latest.attempt_no + 1) if latest else 1,
+        )
+    except Exception:
+        logger.exception("Unable to build the Understat early failure journal row")
+        return
+    _journal_failure_best_effort(repository, attempt)
+
+
 def run_scope(
     args: argparse.Namespace,
     *,
@@ -285,6 +348,12 @@ def run_scope(
 
     try:
         repository.ensure_table()
+        # #1429: the failures journal exists before the first failure, so the
+        # daily meter can always read it; its outage never fails the scope.
+        try:
+            repository.ensure_failures_table()
+        except Exception:
+            logger.exception("Unable to ensure the Understat failures journal")
         latest = repository.latest_attempt(scope, contract_version=CONTRACT_VERSION)
         attempt_no = (latest.attempt_no + 1) if latest else 1
         if (
@@ -302,6 +371,22 @@ def run_scope(
             except Exception as exc:
                 logger.exception(
                     "Unable to verify already-complete Understat history scope"
+                )
+                verify_status, _, verify_message = _classify_exception(exc)
+                _journal_failure_best_effort(
+                    repository,
+                    build_failure_attempt(
+                        scope=scope,
+                        status=verify_status,
+                        batch_id=batch_id,
+                        run_id=run_id,
+                        mode=args.mode,
+                        parser_version=PARSER_VERSION,
+                        error_type=type(exc).__name__,
+                        error_message=verify_message,
+                        attempt_no=attempt_no,
+                        started_at=started_at,
+                    ),
                 )
                 return _result_payload(
                     latest,
@@ -401,9 +486,22 @@ def run_scope(
             if not report.passed:
                 # No physical partition was touched. Persisting this DQ
                 # failure in the publication manifest would hide either
-                # pre-v2 legacy rows or the last COMPLETE batch. The task
-                # result/log remains the audit record.
+                # pre-v2 legacy rows or the last COMPLETE batch, so it goes
+                # to the separate failures journal (#1429); the task
+                # result/log stays unchanged.
                 message = proposed_attempt.error_message or report.status.value
+                _journal_failure_best_effort(
+                    repository,
+                    replace(
+                        proposed_attempt,
+                        status=ManifestStatus.DQ_FAILURE,
+                        completed_at=utc_now_iso(),
+                        quality={
+                            **proposed_attempt.quality,
+                            "site_result_known": True,
+                        },
+                    ),
+                )
                 return _result_payload(proposed_attempt, errors=[message]), 1
 
             if report.status is ManifestStatus.COMPLETE:
@@ -505,6 +603,7 @@ def run_scope(
                 row_counts=report.row_counts,
                 natural_key_counts=report.natural_key_counts,
                 payload_hashes=report.payload_hashes,
+                site_result_game_ids=report.site_result_game_ids,
             )
         failure = build_failure_attempt(
             scope=scope,
@@ -527,6 +626,8 @@ def run_scope(
         append_error = None
         if publication_started:
             append_error = _append_failure_best_effort(repository, failure)
+        # Every failure, before or after the fence, is journaled (#1429).
+        _journal_failure_best_effort(repository, failure)
         errors = [message]
         if append_error:
             errors.append(append_error)
@@ -552,6 +653,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         }
         exit_code = 1
         logger.exception("Understat runner could not initialize the requested scope")
+        _journal_early_failure(args, exc)
     _atomic_write_json(args.output, result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
     return exit_code

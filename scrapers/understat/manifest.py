@@ -29,6 +29,11 @@ MANIFEST_VERSION = "understat-ingest-manifest-v1"
 CONTRACT_VERSION = "understat-bronze-v2"
 MANIFEST_SCHEMA = "ops"
 MANIFEST_TABLE = "understat_ingest_manifest_v1"
+# #1429: failed attempts are journaled in a sibling table with the manifest
+# schema.  A failure row inside the manifest itself would become the latest
+# attempt of the scope and hide its last COMPLETE batch from every fenced
+# consumer (silver/gold readers, ``is_scope_complete``, the backfill skip).
+FAILURES_TABLE = "understat_ingest_failures_v1"
 
 UNDERSTAT_ENTITIES = (
     "understat_schedule",
@@ -105,6 +110,9 @@ class ManifestStatus(str, Enum):
     RETRYABLE_FAILURE = "retryable_failure"
     CONTRACT_FAILURE = "contract_failure"
     SCHEMA_DRIFT = "schema_drift"
+    # Journal-only (FAILURES_TABLE): the in-memory quality gate rejected the
+    # scope before any Bronze write.
+    DQ_FAILURE = "dq_failure"
 
     @property
     def published(self) -> bool:
@@ -302,6 +310,18 @@ class ScopeAttempt:
                 )
             return
 
+        if self.status is ManifestStatus.DQ_FAILURE:
+            # Entity statuses keep the gate's per-entity verdicts.
+            if not set(statuses.values()) & {
+                ManifestStatus.CONTRACT_FAILURE,
+                ManifestStatus.SCHEMA_DRIFT,
+                ManifestStatus.RETRYABLE_FAILURE,
+            }:
+                raise ValueError(
+                    "dq_failure scope requires at least one failed entity"
+                )
+            return
+
         if self.status not in set(statuses.values()):
             raise ValueError(
                 f"{self.status.value} scope requires at least one entity with "
@@ -484,6 +504,8 @@ class UnderstatManifestRepository:
         self._query = query
         self.ensure_table_on_write = bool(ensure_table_on_write)
         self._table_ensured = False
+        self.failures_qualified = f"{self.catalog}.{self.schema}.{FAILURES_TABLE}"
+        self._failures_table_ensured = False
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> "UnderstatManifestRepository":
@@ -557,6 +579,49 @@ class UnderstatManifestRepository:
             frame,
             database=self.schema,
             table=self.table,
+            partition_spec=[("league", "identity"), ("season", "identity")],
+            mode="append",
+            add_metadata=False,
+            source="understat",
+        )
+
+    def ensure_failures_table(self) -> None:
+        if self._failures_table_ensured:
+            return
+        self._execute(
+            f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}",
+            fetch=False,
+        )
+        self._execute(
+            render_manifest_ddl(
+                catalog=self.catalog,
+                schema=self.schema,
+                table=FAILURES_TABLE,
+            ),
+            fetch=False,
+        )
+        self._failures_table_ensured = True
+
+    def append_failure(self, attempt: ScopeAttempt) -> str:
+        """Journal a failed attempt without touching the publication fence."""
+        if not isinstance(attempt, ScopeAttempt):
+            raise TypeError("attempt must be a ScopeAttempt")
+        if attempt.status in {
+            ManifestStatus.COMPLETE,
+            ManifestStatus.IN_PROGRESS,
+            ManifestStatus.UPSTREAM_PENDING,
+            ManifestStatus.NOT_PUBLISHED,
+        }:
+            raise ValueError(
+                f"{attempt.status.value} is not a failure and belongs in the manifest"
+            )
+        if self.ensure_table_on_write:
+            self.ensure_failures_table()
+        frame = pd.DataFrame([attempt.to_row()], columns=MANIFEST_COLUMNS)
+        return self._get_writer().write_dataframe(
+            frame,
+            database=self.schema,
+            table=FAILURES_TABLE,
             partition_spec=[("league", "identity"), ("season", "identity")],
             mode="append",
             add_metadata=False,
@@ -825,6 +890,7 @@ def validate_scope_attempt_result(
 
 __all__ = [
     "CONTRACT_VERSION",
+    "FAILURES_TABLE",
     "MANIFEST_COLUMNS",
     "MANIFEST_SCHEMA",
     "MANIFEST_TABLE",

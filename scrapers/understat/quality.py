@@ -104,6 +104,11 @@ class QualityReport:
     completed_game_count: int
     issues: Sequence[QualityIssue] = ()
     batch_id: Optional[str] = None
+    # #1429: per-attempt game lists for the "played -> Bronze <= 24 h" meter.
+    # covered = games with rows in both shots and player_match_stats;
+    # site_result = games the league response marked isResult.
+    covered_game_ids: Sequence[str] = ()
+    site_result_game_ids: Sequence[str] = ()
 
     @property
     def publishable(self) -> bool:
@@ -138,6 +143,8 @@ class QualityReport:
             "natural_key_counts": dict(self.natural_key_counts),
             "payload_hashes": dict(self.payload_hashes),
             "completed_game_count": self.completed_game_count,
+            "covered_game_ids": sorted(self.covered_game_ids),
+            "site_result_game_ids": sorted(self.site_result_game_ids),
             "batch_id": self.batch_id,
             "issues": [issue.to_dict() for issue in self.issues],
         }
@@ -985,6 +992,16 @@ def validate_understat_scope(
             else:
                 entity_statuses[entity] = status
 
+    def game_ids_of(entity: str) -> set[str]:
+        frame = normalized_frames[entity]
+        if frame.empty or "game_id" not in frame.columns:
+            return set()
+        return _normalized_ids(frame["game_id"])
+
+    covered_game_ids = game_ids_of("understat_shots") & game_ids_of(
+        "understat_player_match_stats"
+    )
+
     return QualityReport(
         scope=scope,
         active=bool(active),
@@ -996,6 +1013,8 @@ def validate_understat_scope(
         completed_game_count=len(completed_ids),
         issues=tuple(issues),
         batch_id=batch_id,
+        covered_game_ids=tuple(sorted(covered_game_ids)),
+        site_result_game_ids=tuple(sorted(completed_ids)),
     )
 
 
@@ -1060,6 +1079,7 @@ def build_failure_attempt(
     payload_hashes: Optional[Mapping[str, str]] = None,
     started_at: Optional[str] = None,
     completed_at: Optional[str] = None,
+    site_result_game_ids: Optional[Iterable[str]] = None,
 ) -> ScopeAttempt:
     """Build an auditable terminal attempt when extraction/DQ cannot report.
 
@@ -1072,6 +1092,7 @@ def build_failure_attempt(
         ManifestStatus.RETRYABLE_FAILURE,
         ManifestStatus.CONTRACT_FAILURE,
         ManifestStatus.SCHEMA_DRIFT,
+        ManifestStatus.DQ_FAILURE,
     }:
         raise ValueError("build_failure_attempt requires a failure status")
 
@@ -1107,6 +1128,12 @@ def build_failure_attempt(
             "status": status.value,
             "error_type": error_type or status.value,
             "error_message": str(error_message),
+            # #1429: known only when the league response was parsed before
+            # the failure; an exception inside the service leaves it unknown.
+            "site_result_game_ids": sorted(
+                str(game_id) for game_id in (site_result_game_ids or ())
+            ),
+            "site_result_known": site_result_game_ids is not None,
         },
         started_at=started_at or utc_now_iso(),
         completed_at=completed_at or utc_now_iso(),
