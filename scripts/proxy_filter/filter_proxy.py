@@ -6506,16 +6506,7 @@ async def _open_lease_upstream_tunnel(
                 # not dead-exit signals: never failover, surface them as before.
                 raise
             last_error = exc
-            if isinstance(
-                exc,
-                (
-                    _DeadExitResponse,
-                    asyncio.TimeoutError,
-                    TimeoutError,
-                    UpstreamHeadTimeout,
-                ),
-            ):
-                _mark_exit_dead(lease.upstream)
+            _mark_exit_dead(lease.upstream)
         # FBref must never spend a second paid CONNECT attempt. SofaScore's
         # separately bounded dead-exit policy remains response-byte based.
         failover_allowed = (
@@ -6562,8 +6553,8 @@ async def _open_lease_upstream_tunnel(
 PROXY_UPSTREAM_STATUS_HEADER = "X-Proxy-Upstream-Status"
 DEAD_EXIT_TTL_SECONDS = 600.0
 EXIT_POOL_DEGRADED_RATIO = 0.5
-# Gateway-local memory of exits that recently failed (fingerprint -> monotonic
-# deadline).  It only feeds /health: ProxyManager rotation is left untouched so
+# Gateway-local memory of exits that recently failed a dial, a CONNECT head or
+# answered CONNECT with non-200 (fingerprint -> monotonic deadline).  It only feeds /health: ProxyManager rotation is left untouched so
 # WhoScored/SofaScore exit selection and a non-empty pick pool are unchanged.
 DEAD_EXITS: dict[str, float] = {}
 
@@ -6847,6 +6838,11 @@ async def handle(
                         if hello_slot_acquired:
                             _WHOSCORED_CLIENT_HELLO_SLOTS.release()
                 if lease is not None:
+                    # Until the provider answers, the client leg only waits for
+                    # our CONNECT reply: keep it out of the latch's close set so
+                    # a head timeout can still deliver its classed 502 (#1389-B).
+                    if not local_connect_established:
+                        lease.tunnel_writers.discard(client_w)
                     # Bounded dial + metered head, failing a silent exit over to
                     # a fresh pool entry so one dead exit cannot latch the slot.
                     try:
@@ -6893,6 +6889,7 @@ async def handle(
                             await client_w.drain()
                         client_w.close()
                         return
+                    lease.tunnel_writers.add(client_w)
                 else:
                     srv_r, srv_w = await _open_upstream_connection(up_host, up_port)
                     connect_request = (
@@ -6910,6 +6907,11 @@ async def handle(
                 if _provider_connect_status_code(status) != 200:
                     upstream_class = _connect_code_class(
                         _provider_connect_status_code(status)
+                    )
+                    _mark_exit_dead(
+                        lease.upstream
+                        if lease is not None
+                        else (up_host, up_port, up_user, up_pass)
                     )
                     if lease is not None:
                         try:
@@ -6993,8 +6995,7 @@ async def handle(
                     return
                 except (asyncio.TimeoutError, TimeoutError, OSError) as exc:
                     upstream_class = _upstream_failure_class(exc)
-                    if upstream_class == "timeout":
-                        _mark_exit_dead((up_host, up_port, up_user, up_pass))
+                    _mark_exit_dead((up_host, up_port, up_user, up_pass))
                     _write_connect_rejection(client_w, upstream_class)
                     _record_connect_rejected(lease, upstream_class)
                     await client_w.drain()

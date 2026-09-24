@@ -9651,6 +9651,31 @@ def _tm_connect(mod, lease, mgr, host="www.transfermarkt.com"):
     return client_writer
 
 
+def _socket_connect(mod, lease, mgr, host="www.transfermarkt.com"):
+    """Drive one CONNECT through a real local socket and read until EOF.
+
+    A real transport drops bytes written after ``close()``, so this proves the
+    classed 502 is queued before any latch closes the client leg.
+    """
+
+    async def scenario():
+        server = await asyncio.start_server(
+            lambda r, w: mod.handle(r, w, mgr, require_lease=True),
+            "127.0.0.1",
+            0,
+        )
+        port = server.sockets[0].getsockname()[1]
+        async with server:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"".join(_connect_header_lines(lease, host=host)))
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(), 2.0)
+            writer.close()
+            return data
+
+    return asyncio.run(scenario())
+
+
 def test_upstream_407_is_classified_to_client_and_ledger(shared_mod, monkeypatch):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_transfermarkt_lease(shared_mod, mgr)
@@ -9664,8 +9689,9 @@ def test_upstream_407_is_classified_to_client_and_ledger(shared_mod, monkeypatch
             _FakeUpstreamWriter(),
         )
 
-    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
-    payload = bytes(_tm_connect(shared_mod, lease, mgr).payload)
+    # Only the gateway seam: the test itself dials the local server for real.
+    monkeypatch.setattr(shared_mod, "_open_upstream_connection", fake_open)
+    payload = _socket_connect(shared_mod, lease, mgr)
 
     assert payload.startswith(b"HTTP/1.1 502 Bad Gateway (upstream=407)\r\n")
     assert b"X-Proxy-Upstream-Status: 407\r\n" in payload
@@ -9689,10 +9715,11 @@ def test_upstream_head_timeout_is_classified_as_timeout(shared_mod, monkeypatch)
             _FakeUpstreamWriter(),
         )
 
-    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
-    payload = bytes(_tm_connect(shared_mod, lease, mgr).payload)
+    monkeypatch.setattr(shared_mod, "_open_upstream_connection", fake_open)
+    payload = _socket_connect(shared_mod, lease, mgr)
 
-    assert b"502 Bad Gateway (upstream=timeout)" in payload
+    assert lease.accounting_uncertain_reason == "provider_head_timeout"
+    assert payload.startswith(b"HTTP/1.1 502 Bad Gateway (upstream=timeout)\r\n")
     assert b"X-Proxy-Upstream-Status: timeout\r\n" in payload
     assert [
         e["reason"]
@@ -9784,6 +9811,41 @@ def test_health_reports_live_exit_share(shared_mod, pool, dead, ratio, pool_stat
     assert health["dead_exit_count"] == dead
     assert health["live_exit_ratio"] == ratio
     assert health["exit_pool_status"] == pool_status
+
+
+def test_refused_dial_and_non_200_connect_mark_exits_dead(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    shared_mod.DEAD_EXITS.clear()
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+
+    async def refused(host, port):
+        raise ConnectionRefusedError("refused")
+
+    _patch_upstream_opener(shared_mod, monkeypatch, refused)
+    payload = bytes(_tm_connect(shared_mod, lease, mgr).payload)
+
+    assert b"502 Bad Gateway (upstream=dial_error)" in payload
+    health = shared_mod._service_health_report(mgr)
+    assert (health["dead_exit_count"], health["live_exit_ratio"]) == (1, 0.0)
+    assert health["exit_pool_status"] == "degraded"
+
+    shared_mod.DEAD_EXITS.clear()
+    mgr2 = _FakeManager(["http://u:p@pool.invalid:10001", "http://u:p@pool.invalid:10002"])
+    lease2 = _make_transfermarkt_lease(shared_mod, mgr2)
+
+    async def rejecting(host, port):
+        return (
+            _FakeUpstreamReader(b"HTTP/1.1 502 Bad Gateway\r\n\r\n"),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, rejecting)
+    _tm_connect(shared_mod, lease2, mgr2)
+
+    health = shared_mod._service_health_report(mgr2)
+    assert (health["dead_exit_count"], health["live_exit_ratio"]) == (1, 0.5)
+    assert health["status"] == "ok"
 
 
 def test_dead_exit_memory_expires_after_ttl(shared_mod, monkeypatch):
