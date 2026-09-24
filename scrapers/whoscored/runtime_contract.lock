@@ -79,7 +79,7 @@
     "scrapers/whoscored/repository.py": "4ec8d41c607642e9dec301b39deea6b25569eb9a1a52b038a3fdf81acedf4686",
     "scrapers/whoscored/runtime_contract.py": "42407580ea2b84b8e3ff41840d5664cb14364d5a9e7b4eae9f9bd19da6946ab2",
     "scrapers/whoscored/runtime_limits.py": "896ec16834d6c9ca9924ed9feeab77ca5ebf1f8975f81e9f4fe3a21af717005d",
-    "scrapers/whoscored/service.py": "005f0551ced3b9fe334f9c2eb2005b3890e4c955ca7c0a95491e6de2b282c4c0",
+    "scrapers/whoscored/service.py": "f4624743e9a0c6226f76ffee88b2ff9a22d127e6d172d68a3d77c2ef03d18497",
     "scrapers/whoscored/source_circuit.py": "a5151da85688c9514d4d7eac55d4ca7200e62fdcabc6fcb10431406e6c37fe24",
     "scrapers/whoscored/stage_feeds.py": "9099865f34517c4e2e626083954f508eafb948768492c206153c1f11f5d0cd66",
     "scrapers/whoscored/transport.py": "c086667b5a3c8892d509827046b8d5ac7afb12f6ff37be8574d2d67a39bc9783",
