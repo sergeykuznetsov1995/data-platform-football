@@ -66,8 +66,6 @@ from run_transfermarkt_scope_cycle import (  # noqa: E402
 )
 from scrapers.transfermarkt.models import (  # noqa: E402
     MAX_ROSTER_WINDOW,
-    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
-    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
     PARENT_REQUEST_LIMIT,
     PARENT_RETRY_LIMIT,
     SCOPE_HARD_PROVIDER_BYTE_CAP,
@@ -143,10 +141,6 @@ def _child_argv(
             str(PROXY_REQUEST_LIMIT),
             "--retry-limit",
             str(PROXY_RETRY_LIMIT),
-            "--parent-byte-budget",
-            str(PARENT_DAILY_HARD_PROVIDER_BYTE_CAP),
-            "--parent-soft-byte-stop",
-            str(PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP),
             "--parent-request-limit",
             str(PARENT_REQUEST_LIMIT),
             "--parent-retry-limit",

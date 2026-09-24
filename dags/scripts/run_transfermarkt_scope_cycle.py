@@ -60,6 +60,7 @@ from scrapers.transfermarkt.models import (
     SCOPE_REQUEST_LIMIT,
     SCOPE_RETRY_LIMIT,
     SCOPE_SOFT_PROVIDER_BYTE_STOP,
+    parent_byte_caps_valid,
 )
 from scrapers.transfermarkt.registry import (
     CompetitionRecord,
@@ -79,7 +80,9 @@ RESPONSE_CACHE_TTL_SECONDS = 24 * 60 * 60
 # separate ledger; both pairs come from the budget canon in models.py.
 HARD_BYTE_CAP = SCOPE_HARD_PROVIDER_BYTE_CAP
 SOFT_BYTE_STOP = SCOPE_SOFT_PROVIDER_BYTE_STOP
-# Parent (daily) aggregate caps across every scope cycle of one parent run.
+# Parent (daily) aggregate byte caps across every scope cycle of one parent
+# run.  ``None`` since #1387: production has no parent byte cap; the parent
+# ledger still accumulates the bytes.  Backfill passes its batch-local pair.
 PARENT_BYTE_BUDGET = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
 PARENT_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 ENTITY_ORDER = (
@@ -1527,17 +1530,33 @@ def persist_scope_manifest(
     return sql
 
 
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _parent_byte_caps(hard: Any, soft: Any) -> tuple[int | None, int | None]:
+    """Validate the parent byte-cap pair: both ``None`` (#1387) or both set."""
+
+    hard_cap, soft_stop = _optional_int(hard), _optional_int(soft)
+    if not parent_byte_caps_valid(hard_cap, soft_stop):
+        raise ScopeCycleError(
+            'parent byte caps must be both unset or 0 < soft <= hard '
+            'with hard >= the scope hard cap'
+        )
+    return hard_cap, soft_stop
+
+
+def _bigint_sql(value: int | None) -> str:
+    return 'CAST(NULL AS bigint)' if value is None else str(int(value))
+
+
 def proxy_ledger_merge_sql(parent_ledger: Mapping[str, Any]) -> str:
     """Build one cumulative seven-row parent-cycle proxy ledger MERGE."""
 
-    if int(
-        parent_ledger.get('hard_provider_byte_budget', -1)
-    ) != PARENT_BYTE_BUDGET:
-        raise ScopeCycleError('parent proxy ledger hard cap is not production cap')
-    if int(
-        parent_ledger.get('soft_provider_byte_stop', -1)
-    ) != PARENT_SOFT_BYTE_STOP:
-        raise ScopeCycleError('parent proxy ledger soft stop is not production stop')
+    hard_limit, soft_limit = _parent_byte_caps(
+        parent_ledger.get('hard_provider_byte_budget', -1),
+        parent_ledger.get('soft_provider_byte_stop', -1),
+    )
     parent_cycle_id = _required(
         parent_ledger.get('parent_cycle_id'), 'parent ledger cycle id',
     )
@@ -1574,8 +1593,8 @@ def proxy_ledger_merge_sql(parent_ledger: Mapping[str, Any]) -> str:
             quoted(parent_cycle_id),
             quoted(entity),
             *(str(value) for value in values),
-            str(PARENT_BYTE_BUDGET),
-            str(PARENT_SOFT_BYTE_STOP),
+            _bigint_sql(hard_limit),
+            _bigint_sql(soft_limit),
         ])
         + ')'
         for entity, values in rows
@@ -1655,11 +1674,12 @@ def _update_parent_ledger(
     identity: ScopeIdentity,
     manifest: Mapping[str, Any],
     *,
-    hard_cap: int,
-    soft_stop: int,
+    hard_cap: int | None,
+    soft_stop: int | None,
     request_limit: int,
     retry_limit: int,
 ) -> Mapping[str, Any]:
+    hard_cap, soft_stop = _parent_byte_caps(hard_cap, soft_stop)
     path = Path(identity.parent_ledger_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f'.{path.name}.lock')
@@ -1671,16 +1691,18 @@ def _update_parent_ledger(
             else:
                 current = {
                     'parent_cycle_id': identity.parent_cycle_id,
-                    'hard_provider_byte_budget': int(hard_cap),
-                    'soft_provider_byte_stop': int(soft_stop),
+                    'hard_provider_byte_budget': hard_cap,
+                    'soft_provider_byte_stop': soft_stop,
                     'request_limit': int(request_limit),
                     'retry_limit': int(retry_limit),
                     'scopes': {},
                 }
             if (
                 current.get('parent_cycle_id') != identity.parent_cycle_id
-                or int(current.get('hard_provider_byte_budget', -1)) != hard_cap
-                or int(current.get('soft_provider_byte_stop', -1)) != soft_stop
+                or _optional_int(current.get('hard_provider_byte_budget', -1))
+                != hard_cap
+                or _optional_int(current.get('soft_provider_byte_stop', -1))
+                != soft_stop
                 or int(current.get('request_limit', -1)) != request_limit
                 or int(current.get('retry_limit', -1)) != retry_limit
             ):
@@ -1729,7 +1751,7 @@ def _update_parent_ledger(
                     raise ScopeCycleError(
                         f'parent entity ledger does not reconcile for {field}'
                     )
-            if totals['provider_metered_bytes'] > hard_cap:
+            if hard_cap is not None and totals['provider_metered_bytes'] > hard_cap:
                 raise ScopeCycleError('parent provider byte budget exceeded')
             if totals['requests'] > request_limit:
                 raise ScopeCycleError('parent request limit exceeded')
@@ -1755,12 +1777,14 @@ def _update_parent_ledger(
 def _parent_committed_totals(
     identity: ScopeIdentity,
     *,
-    hard_cap: int,
-    soft_stop: int,
+    hard_cap: int | None,
+    soft_stop: int | None,
     request_limit: int,
     retry_limit: int,
 ) -> Mapping[str, int]:
     """Read the committed parent totals under the same ledger lock."""
+
+    hard_cap, soft_stop = _parent_byte_caps(hard_cap, soft_stop)
 
     path = Path(identity.parent_ledger_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1775,8 +1799,10 @@ def _parent_committed_totals(
             current = _load_json_file(path)
             if (
                 current.get('parent_cycle_id') != identity.parent_cycle_id
-                or int(current.get('hard_provider_byte_budget', -1)) != hard_cap
-                or int(current.get('soft_provider_byte_stop', -1)) != soft_stop
+                or _optional_int(current.get('hard_provider_byte_budget', -1))
+                != hard_cap
+                or _optional_int(current.get('soft_provider_byte_stop', -1))
+                != soft_stop
                 or int(current.get('request_limit', -1)) != request_limit
                 or int(current.get('retry_limit', -1)) != retry_limit
             ):
@@ -1929,6 +1955,17 @@ def _checkpoint_identity(
         # checkpoints.  All source/schema/budget fields remain pinned below.
         identity_fields.pop('parent_cycle_id', None)
         identity_fields.pop('parent_ledger_path', None)
+    # #1387: parent byte caps join the identity ONLY when they are set.  A
+    # capped run (historical backfill, batch-local caps) hashes exactly as
+    # before, so its paid-for checkpoints still resume; an uncapped run
+    # (production ingest, caps None) deliberately gets a new identity — its
+    # old checkpoints were taken under the removed daily caps.
+    parent_byte_caps: dict[str, int] = {}
+    if args.parent_byte_budget is not None:
+        parent_byte_caps = {
+            'parent_byte_budget': int(args.parent_byte_budget),
+            'parent_soft_byte_stop': int(args.parent_soft_byte_stop),
+        }
     return stable_hash({
         **identity_fields,
         'reader_revision': int(args.reader_revision),
@@ -1938,10 +1975,7 @@ def _checkpoint_identity(
         'soft_byte_stop_bytes': int(args.soft_byte_stop_bytes),
         'request_limit': int(args.request_limit),
         'retry_limit': int(args.retry_limit),
-        # Parent caps join the identity: a checkpoint taken under different
-        # daily budgets must not resume silently under the new ones.
-        'parent_byte_budget': int(args.parent_byte_budget),
-        'parent_soft_byte_stop': int(args.parent_soft_byte_stop),
+        **parent_byte_caps,
         'parent_request_limit': int(args.parent_request_limit),
         'parent_retry_limit': int(args.parent_retry_limit),
         'career_window_limit': int(args.career_window_limit),
@@ -2146,8 +2180,8 @@ def run_scope_cycle(
         parent_ledger = _update_parent_ledger(
             identity,
             manifest,
-            hard_cap=int(args.parent_byte_budget),
-            soft_stop=int(args.parent_soft_byte_stop),
+            hard_cap=args.parent_byte_budget,
+            soft_stop=args.parent_soft_byte_stop,
             request_limit=int(args.parent_request_limit),
             retry_limit=int(args.parent_retry_limit),
         )
@@ -2210,8 +2244,8 @@ def run_scope_cycle(
     if len(runs) < len(ENTITY_ORDER):
         committed_preflight = _parent_committed_totals(
             identity,
-            hard_cap=int(args.parent_byte_budget),
-            soft_stop=int(args.parent_soft_byte_stop),
+            hard_cap=args.parent_byte_budget,
+            soft_stop=args.parent_soft_byte_stop,
             request_limit=int(args.parent_request_limit),
             retry_limit=int(args.parent_retry_limit),
         )
@@ -2235,19 +2269,23 @@ def run_scope_cycle(
         # is larger (the latter also carries failed scopes) — still leave one
         # whole scope cap inside the parent daily budget.  This bounds the
         # daily aggregate mathematically instead of post factum.
-        committed_bytes = max(
-            int(committed_preflight['provider_metered_bytes']),
-            _sibling_scope_ledger_bytes(identity),
-        )
-        if (
-            committed_bytes + int(args.cycle_budget_bytes)
-            > int(args.parent_byte_budget)
-        ):
-            raise ScopeCycleError(
-                'parent daily byte budget cannot admit another scope '
-                f'({committed_bytes} committed + {int(args.cycle_budget_bytes)} '
-                f'scope cap > {int(args.parent_byte_budget)})'
+        # #1387: without a parent byte budget (production) there is nothing
+        # to admit against; only backfill batches still carry one.
+        if args.parent_byte_budget is not None:
+            committed_bytes = max(
+                int(committed_preflight['provider_metered_bytes']),
+                _sibling_scope_ledger_bytes(identity),
             )
+            if (
+                committed_bytes + int(args.cycle_budget_bytes)
+                > int(args.parent_byte_budget)
+            ):
+                raise ScopeCycleError(
+                    'parent daily byte budget cannot admit another scope '
+                    f'({committed_bytes} committed + '
+                    f'{int(args.cycle_budget_bytes)} '
+                    f'scope cap > {int(args.parent_byte_budget)})'
+                )
     # Even a fully resumed capture still has one production ops MERGE ahead.
     packets = _consume_approvals(
         args, operation_argv=operation_argv, entity_limits=limits,
@@ -2255,8 +2293,8 @@ def run_scope_cycle(
     entity_checkpoint = dict(checkpoint.get('entities') or {})
     parent_totals = _parent_committed_totals(
         identity,
-        hard_cap=int(args.parent_byte_budget),
-        soft_stop=int(args.parent_soft_byte_stop),
+        hard_cap=args.parent_byte_budget,
+        soft_stop=args.parent_soft_byte_stop,
         request_limit=int(args.parent_request_limit),
         retry_limit=int(args.parent_retry_limit),
     )
@@ -2610,8 +2648,8 @@ def run_scope_cycle(
     parent_ledger = _update_parent_ledger(
         identity,
         manifest,
-        hard_cap=int(args.parent_byte_budget),
-        soft_stop=int(args.parent_soft_byte_stop),
+        hard_cap=args.parent_byte_budget,
+        soft_stop=args.parent_soft_byte_stop,
         request_limit=int(args.parent_request_limit),
         retry_limit=int(args.parent_retry_limit),
     )
@@ -2713,14 +2751,9 @@ def _validate_args(args: argparse.Namespace) -> None:
             'scope request/retry limits must equal '
             f'{SCOPE_REQUEST_LIMIT}/{SCOPE_RETRY_LIMIT}'
         )
-    if args.parent_byte_budget != PARENT_BYTE_BUDGET:
-        raise ScopeCycleError(
-            f'parent byte budget must equal {PARENT_BYTE_BUDGET}'
-        )
-    if args.parent_soft_byte_stop != PARENT_SOFT_BYTE_STOP:
-        raise ScopeCycleError(
-            f'parent soft byte stop must equal {PARENT_SOFT_BYTE_STOP}'
-        )
+    # #1387: parent byte caps are optional (None = uncapped); only a coherent
+    # pair is required.  Request/retry parent limits stay pinned below.
+    _parent_byte_caps(args.parent_byte_budget, args.parent_soft_byte_stop)
     if (
         args.parent_request_limit != PARENT_REQUEST_LIMIT
         or args.parent_retry_limit != PARENT_RETRY_LIMIT

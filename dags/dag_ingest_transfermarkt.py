@@ -32,8 +32,6 @@ from scrapers.transfermarkt.models import (
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     MAX_ROSTER_WINDOW,
     MAX_SCOPE_BATCH,
-    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
-    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
     PARENT_REQUEST_LIMIT,
     PARENT_RETRY_LIMIT,
     SCOPE_HARD_PROVIDER_BYTE_CAP,
@@ -56,9 +54,6 @@ PROVIDER_HARD_CAP_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
 PROVIDER_SOFT_STOP_BYTES = SCOPE_SOFT_PROVIDER_BYTE_STOP
 PROXY_REQUEST_LIMIT = SCOPE_REQUEST_LIMIT
 PROXY_RETRY_LIMIT = SCOPE_RETRY_LIMIT
-# Parent (daily) aggregate caps across all mapped scopes of one run.
-PARENT_BYTE_BUDGET = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
-PARENT_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 PROXY_CONCURRENCY = 1
 # Only an edition the promoted registry still marks current has to have been
 # captured recently; a finished edition's manifest never expires, or a slot that
@@ -208,70 +203,14 @@ def _preflight_reader_route_for_paid_cycle() -> dict[str, Any]:
                 'any paid cycle'
             )
         candidate_slot = tm_v2.inactive_slot(state)
-        try:
-            views = tm_v2.verify_reader_views(
-                cur,
-                expected_version=state.active_version,
-                expected_revision=state.revision,
-                expected_slot=(
-                    state.active_slot if state.active_version == 'v2' else None
-                ),
-                allow_static_slot=state.cleanup_completed_at is not None,
-            )
-        except Exception as exc:  # fresh bootstrap still has physical bases
-            views = {'passed': False, 'error': str(exc)}
-
-        if not views['passed']:
-            fresh_legacy_bootstrap = bool(
-                state.active_version == 'legacy'
-                and state.active_slot is None
-                and state.revision == 0
-            )
-            canonical_bases: dict[str, str | None] = {}
-            bootstrap_upstreams: dict[str, str | None] = {}
-            if fresh_legacy_bootstrap:
-                inventory = tm_v2._relation_inventory(cur)
-                canonical_bases = {
-                    relation.canonical: inventory.get(relation.canonical)
-                    for relation in tm_v2.CANONICAL_READER_RELATIONS
-                }
-                derived_team_value = (
-                    'iceberg.gold.transfermarkt_team_season_market_value'
-                )
-                physical_bases = {
-                    name: kind for name, kind in canonical_bases.items()
-                    if name != derived_team_value
-                }
-                bootstrap_upstreams = {
-                    'iceberg.silver.xref_team': inventory.get(
-                        'iceberg.silver.xref_team'
-                    ),
-                }
-                fresh_legacy_bootstrap = bool(
-                    all(
-                        kind in {'BASE TABLE', 'TABLE'}
-                        for kind in physical_bases.values()
-                    )
-                    and canonical_bases[derived_team_value]
-                    in {None, 'BASE TABLE', 'TABLE'}
-                    and all(
-                        kind in {'BASE TABLE', 'TABLE', 'VIEW'}
-                        for kind in bootstrap_upstreams.values()
-                    )
-                )
-            if not fresh_legacy_bootstrap:
-                raise AirflowException(
-                    f'Transfermarkt reader preflight failed: {views}'
-                )
-            views = {
-                'passed': True,
-                'mode': 'fresh_legacy_base_bootstrap',
-                'canonical_bases': canonical_bases,
-                'bootstrap_upstreams': bootstrap_upstreams,
-            }
     finally:
         cur.close()
         conn.close()
+
+    # #1387: the read-before-write gate (``verify_reader_views``) is gone —
+    # a paid cycle no longer depends on the reader views' shape.  The reader
+    # state still pins revision/slot/write mode for the children.
+    views = {'verified': False, 'reason': 'read-before-write gate removed (#1387)'}
 
     return {
         'active_version': state.active_version,
@@ -498,8 +437,6 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
             'TM_PROVIDER_SOFT_STOP_BYTES': str(PROVIDER_SOFT_STOP_BYTES),
             'TM_PROXY_REQUEST_LIMIT': str(int(params['proxy_request_limit'])),
             'TM_PROXY_RETRY_LIMIT': str(int(params['proxy_retry_limit'])),
-            'TM_PARENT_BYTE_BUDGET': str(PARENT_BYTE_BUDGET),
-            'TM_PARENT_SOFT_BYTE_STOP': str(PARENT_SOFT_BYTE_STOP),
             'TM_PARENT_REQUEST_LIMIT': str(PARENT_REQUEST_LIMIT),
             'TM_PARENT_RETRY_LIMIT': str(PARENT_RETRY_LIMIT),
             'TM_PENDING_CHECKPOINT_DIR': PENDING_CHECKPOINT_DIR,
@@ -767,21 +704,18 @@ def _build_scope_set(
 
     if len(ledger_paths) != 1:
         raise AirflowException('mapped scopes do not share one parent proxy ledger')
+    # #1387: the ingest parent cycle has no byte cap, so only the traffic
+    # totals are reconciled against the parent ledger.
     traffic = aggregate_traffic(manifests)
-    if traffic['provider_metered_bytes'] > PARENT_BYTE_BUDGET:
-        raise AirflowException(
-            'parent daily provider byte budget exceeded: '
-            f"{traffic['provider_metered_bytes']}/{PARENT_BYTE_BUDGET}"
-        )
     ledger = _load_json_object(next(iter(ledger_paths)), label='parent proxy ledger')
     required_ledger = {
         'provider_metered_bytes': traffic['provider_metered_bytes'],
         'requests': traffic['requests'],
         'retries': traffic['retries'],
-        'hard_provider_byte_budget': PARENT_BYTE_BUDGET,
-        'soft_provider_byte_stop': PARENT_SOFT_BYTE_STOP,
     }
-    if any(int(ledger.get(key, -1)) != value for key, value in required_ledger.items()):
+    if any(
+        int(ledger.get(key, -1)) != value for key, value in required_ledger.items()
+    ):
         raise AirflowException('parent proxy ledger disagrees with scope manifests')
 
     current_manifests = tuple(manifests)
@@ -1233,8 +1167,6 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
   --soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES" \
   --request-limit "$TM_PROXY_REQUEST_LIMIT" \
   --retry-limit "$TM_PROXY_RETRY_LIMIT" \
-  --parent-byte-budget "$TM_PARENT_BYTE_BUDGET" \
-  --parent-soft-byte-stop "$TM_PARENT_SOFT_BYTE_STOP" \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
   --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"''',
         append_env=True,

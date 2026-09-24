@@ -10241,3 +10241,341 @@ def test_dead_exit_failover_refuses_when_another_tunnel_billed_bytes(
     assert lease.upstream_repins == 0
     assert lease.upstream == ("pool.invalid", 10000, "u", "p")
     assert opens == [("pool.invalid", 10000)]
+
+
+# --- #1387: isolated Transfermarkt gateway (--source-mode transfermarkt-only) --
+
+_TM_ONLY_ARGV = [
+    "filter_proxy.py",
+    "--source-mode",
+    "transfermarkt-only",
+    "--listen",
+    "127.0.0.1:0",
+    "--lease-listen",
+    "",
+    "--max-lease-mb",
+    "24",
+    "--max-lease-ttl-seconds",
+    "3600",
+    "--max-active-leases",
+    "4",
+]
+
+
+def _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path, extra_argv=(), env=None):
+    """Run the real ``main()`` with real argparse; stub only sockets and pool."""
+
+    argv = [
+        *_TM_ONLY_ARGV,
+        "--out",
+        str(tmp_path / "bytes.json"),
+        "--pidfile",
+        str(tmp_path / "filter.pid"),
+        "--ledger",
+        str(tmp_path / "paid_requests.jsonl"),
+        "--transfermarkt-permit-state",
+        str(tmp_path / "transfermarkt_request_permits.json"),
+        *extra_argv,
+    ]
+    monkeypatch.setattr(shared_mod.sys, "argv", argv)
+    monkeypatch.setattr(
+        shared_mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "c" * 64},
+    )
+    monkeypatch.setattr(
+        shared_mod,
+        "_residential_manager",
+        lambda **kwargs: (SimpleNamespace(total_count=2), "test pool"),
+    )
+
+    class Server:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class StopEvent:
+        def set(self):
+            return None
+
+        async def wait(self):
+            return None
+
+    async def start_server(*_args, **_kwargs):
+        return Server()
+
+    monkeypatch.setattr(shared_mod.asyncio, "start_server", start_server)
+    monkeypatch.setattr(shared_mod.asyncio, "Event", StopEvent)
+    monkeypatch.setattr(
+        shared_mod.asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(add_signal_handler=lambda *a: None),
+    )
+    monkeypatch.setattr(
+        shared_mod.asyncio, "ensure_future", lambda coro: coro.close()
+    )
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "c" * 32)
+    monkeypatch.setenv("TM_PROXY_CONTROL_TOKEN", "t" * 32)
+    monkeypatch.delenv("TM_BACKFILL_PROXY_CONTROL_TOKEN", raising=False)
+    monkeypatch.delenv("TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON", raising=False)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
+    asyncio.run(shared_mod.main())
+
+
+def _tm_metadata(dag_id="dag_ingest_transfermarkt"):
+    return {
+        "dag_id": dag_id,
+        "run_id": "scheduled__2026-09-25T04:00:00+00:00",
+        "task_id": "run_scope",
+        "canonical_url": "https://www.transfermarkt.com/x",
+    }
+
+
+def test_transfermarkt_only_boots_without_budget_flags(
+    shared_mod, monkeypatch, tmp_path
+):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+
+    assert shared_mod.SOURCE_MODE == "transfermarkt-only"
+    assert shared_mod.DAILY_BUDGET_BYTES is None
+    assert shared_mod.TRANSFERMARKT_DAGRUN_BUDGET_BYTES is None
+    assert shared_mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES is None
+    assert shared_mod.URL_BUDGET_BYTES is None
+    assert shared_mod.MAX_LEASE_BYTES == 24 * 1024 * 1024
+    assert shared_mod.TRANSFERMARKT_REQUEST_PERMITS.state_path == str(
+        tmp_path / "transfermarkt_request_permits.json"
+    )
+
+
+def test_transfermarkt_only_lease_is_bounded_by_the_lease_cap_alone(
+    shared_mod, monkeypatch, tmp_path
+):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    # A shared-mode gateway would refuse or shrink this lease: yesterday's
+    # daily/DagRun/URL counters are far beyond the old 8 MB/2 MB ceilings.
+    run_key = f"dag_ingest_transfermarkt/{_tm_metadata()['run_id']}"
+    shared_mod._daily_day = shared_mod._utc_day()
+    shared_mod._daily_down_bytes = 10 * 1024**3
+    shared_mod._run_down_bytes[run_key] = 5 * 1024**3
+    shared_mod._url_down_bytes[(run_key, "https://www.transfermarkt.com/x")] = (
+        5 * 1024**3
+    )
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+
+    lease = shared_mod._create_lease(
+        mgr,
+        max_bytes=24 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_tm_metadata(),
+        require_context=True,
+    )
+
+    assert lease.max_bytes == 24 * 1024 * 1024
+    assert shared_mod._lease_remaining(lease) == 24 * 1024 * 1024
+    assert lease.report()["dagrun_budget_bytes"] is None
+    assert lease.report()["url_budget_bytes"] is None
+    control = shared_mod._control_report(lease)
+    assert "daily_budget_bytes" not in control
+    assert "daily_total_bytes" not in control
+    with pytest.raises(ValueError, match="max_bytes must be in"):
+        shared_mod._create_lease(
+            mgr,
+            max_bytes=24 * 1024 * 1024 + 1,
+            ttl_seconds=3600,
+            metadata=_tm_metadata(),
+            require_context=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "dag_id", ["dag_ingest_sofascore", "dag_ingest_fbref", "dag_ingest_whoscored"]
+)
+def test_transfermarkt_only_rejects_foreign_lease_with_403(
+    shared_mod, monkeypatch, tmp_path, dag_id
+):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    request = json.dumps(
+        {**_tm_metadata(dag_id), "max_bytes": 1_000, "ttl_seconds": 30}
+    ).encode()
+
+    class Reader:
+        async def readexactly(self, length):
+            return request
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    asyncio.run(
+        shared_mod._handle_control(
+            "POST",
+            "/v1/leases",
+            {
+                "content-length": str(len(request)),
+                "x-proxy-control-token": "c" * 32,
+            },
+            Reader(),
+            writer,
+            mgr,
+        )
+    )
+    head, body = bytes(writer.payload).split(b"\r\n\r\n", 1)
+
+    assert b"403" in head.split(b"\r\n", 1)[0]
+    assert json.loads(body)["code"] == "source_rejected"
+    assert shared_mod.LEASES == {}
+    assert mgr.calls == 0
+    with pytest.raises(ValueError, match="rejects every other source"):
+        shared_mod._create_lease(
+            mgr,
+            max_bytes=1_000,
+            ttl_seconds=30,
+            metadata=_tm_metadata(dag_id),
+        )
+
+
+def test_transfermarkt_only_health_has_no_budget_keys(
+    shared_mod, monkeypatch, tmp_path
+):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+
+    health = shared_mod._service_health_report(SimpleNamespace(total_count=2))
+
+    assert health["source_mode"] == "transfermarkt-only"
+    assert health["status"] == "ok"
+    assert health["transfermarkt_paid_enabled"] is True
+    assert health["transfermarkt_backfill_paid_enabled"] is False
+    assert health["max_lease_bytes"] == 24 * 1024 * 1024
+    assert health["live_exit_count"] == 2
+    assert not [key for key in health if "budget_bytes" in key]
+    assert not [key for key in health if key.startswith("daily_")]
+    assert json.loads(json.dumps(health)) == health
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--daily-budget-mb", "400"],
+        ["--dagrun-budget-bytes", "8000000"],
+        ["--transfermarkt-dagrun-budget-bytes", "352321536"],
+        ["--transfermarkt-backfill-dagrun-budget-bytes", "1"],
+        ["--url-budget-bytes", "2000000"],
+        ["--url-budget", "2000000"],
+    ],
+)
+def test_transfermarkt_only_forbids_budget_flags(
+    shared_mod, monkeypatch, tmp_path, flag
+):
+    with pytest.raises(SystemExit, match="forbids byte budget flags"):
+        _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path, flag)
+
+
+def test_transfermarkt_only_requires_lease_cap_token_and_permit_state(
+    shared_mod, monkeypatch, tmp_path
+):
+    with pytest.raises(SystemExit, match="budgets must be positive"):
+        _boot_transfermarkt_only(
+            shared_mod, monkeypatch, tmp_path, ["--max-lease-mb", "0"]
+        )
+    with pytest.raises(SystemExit, match="requires --transfermarkt-permit-state"):
+        _boot_transfermarkt_only(
+            shared_mod, monkeypatch, tmp_path, ["--transfermarkt-permit-state", ""]
+        )
+    monkeypatch.setattr(shared_mod.sys, "argv", [*_TM_ONLY_ARGV])
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "c" * 32)
+    monkeypatch.setenv("TM_PROXY_CONTROL_TOKEN", "")
+    monkeypatch.setattr(
+        shared_mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "c" * 64},
+    )
+    with pytest.raises(SystemExit, match="TM_PROXY_CONTROL_TOKEN"):
+        asyncio.run(shared_mod.main())
+
+
+@pytest.mark.parametrize("flag", ["--daily-budget-mb", "--max-lease-mb"])
+def test_shared_mode_still_requires_positive_budgets(
+    shared_mod, monkeypatch, flag
+):
+    monkeypatch.setattr(
+        shared_mod.sys,
+        "argv",
+        ["filter_proxy.py", "--source-mode", "shared-no-whoscored", flag, "0"],
+    )
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "c" * 32)
+    monkeypatch.setattr(
+        shared_mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "c" * 64},
+    )
+    with pytest.raises(SystemExit, match="budgets must be positive"):
+        asyncio.run(shared_mod.main())
+
+
+def test_transfermarkt_only_authenticates_before_rejecting_a_foreign_source(
+    shared_mod, monkeypatch, tmp_path
+):
+    """#1387 /code-review: an unauthenticated caller gets 401, never 403."""
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    request = json.dumps(
+        {**_tm_metadata("dag_ingest_sofascore"), "source": "sofascore",
+         "max_bytes": 1_000, "ttl_seconds": 30}
+    ).encode()
+
+    class Reader:
+        async def readexactly(self, length):
+            return request
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    asyncio.run(
+        shared_mod._handle_control(
+            "POST",
+            "/v1/leases",
+            {"content-length": str(len(request)), "x-proxy-control-token": "t" * 32},
+            Reader(),
+            writer,
+            mgr,
+        )
+    )
+    head, body = bytes(writer.payload).split(b"\r\n\r\n", 1)
+    assert b"401" in head.split(b"\r\n", 1)[0]
+    assert "source_rejected" not in body.decode()
+    assert mgr.calls == 0
+
+
+def test_transfermarkt_only_backfill_token_requires_backfill_pool(
+    shared_mod, monkeypatch, tmp_path
+):
+    with pytest.raises(SystemExit, match="TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON is empty"):
+        _boot_transfermarkt_only(
+            shared_mod, monkeypatch, tmp_path,
+            env={"TM_BACKFILL_PROXY_CONTROL_TOKEN": "b" * 32},
+        )

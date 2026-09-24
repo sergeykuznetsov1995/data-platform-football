@@ -24,8 +24,7 @@ from typing import Any, Iterable, Mapping, Sequence
 # The paid-traffic budget canon is stdlib-only, so readiness can pin the same
 # numbers the crawl actually ran under without importing any scraper runtime.
 from scrapers.transfermarkt.models import (
-    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
-    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
+    PARENT_DAILY_PLANNING_BYTES,
     PARENT_REQUEST_LIMIT,
     PARENT_RETRY_LIMIT,
     SCOPE_HARD_PROVIDER_BYTE_CAP,
@@ -68,8 +67,9 @@ SLOTS = ('a', 'b')
 # evidence already accumulated under the previous one.  Requests/retries have
 # no per-row limit column and keep today's ceiling, which can only be looser
 # than any earlier epoch's limit.
-SCOPE_SET_HARD_BYTE_CAP = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
-SCOPE_SET_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
+# #1387: no parent byte cap exists any more, so readiness keeps no byte
+# ceiling constant.  A ledger row with NULL parent caps belongs to that
+# uncapped epoch and is valid.
 SCOPE_SET_REQUEST_LIMIT = PARENT_REQUEST_LIMIT
 SCOPE_SET_RETRY_LIMIT = PARENT_RETRY_LIMIT
 
@@ -95,7 +95,7 @@ CUTOVER_MAX_CAREER_DEBT_RATIO = 0.10
 
 # The cutover freshness gate.  A current edition must have been re-captured
 # recently — but "recently" cannot mean READINESS_MAX_AGE_DAYS here: the paid
-# budget buys PARENT_DAILY_HARD_PROVIDER_BYTE_CAP / SCOPE_HARD_PROVIDER_BYTE_CAP
+# budget buys PARENT_DAILY_PLANNING_BYTES / SCOPE_HARD_PROVIDER_BYTE_CAP
 # scopes a day, so one refresh pass over the current editions of the promoted
 # registry (684 today) already takes months.  A flat 7-day rule would be
 # unsatisfiable by construction and would simply block every cutover forever.
@@ -3034,7 +3034,6 @@ ORDER BY scope_id, committed_at
         raise ReadinessError('scope-set traffic JSON is incomplete') from exc
     if persisted_traffic != expected_traffic:
         raise ReadinessError('scope-set traffic differs from child manifests')
-    hard_cap, soft_cap = SCOPE_SET_HARD_BYTE_CAP, SCOPE_SET_SOFT_BYTE_STOP
     manifests_by_parent = {
         parent: tuple(
             item for item in manifests if item.parent_cycle_id == parent
@@ -3106,7 +3105,7 @@ ORDER BY parent_cycle_id, entity
     if len(ledger_rows) != len(by_parent_entity):
         raise ReadinessError('per-parent proxy ledger entity set is incomplete')
     seen_ledger = set()
-    parent_row_caps: dict[str, set[tuple[int, int]]] = {}
+    parent_row_caps: dict[str, set[tuple[int | None, int | None]]] = {}
     ledger_traffic: dict[str, dict[str, int]] = {
         parent: dict.fromkeys(traffic_fields_tuple, 0)
         for parent in audited_parents
@@ -3146,22 +3145,26 @@ ORDER BY parent_cycle_id, entity
             exact_ledger[key[0]] = False
         for field in traffic_fields_tuple:
             ledger_traffic[key[0]][field] += actual[field]
-        # A row states the caps ITS crawl ran under.  Equality with today's
-        # canon would turn every earlier epoch's evidence red the moment the
-        # canon moves (and it already would have: production rows carry the
-        # retired 15/14 MiB pair).  The reader therefore accepts any coherent
-        # historical cap that is not above today's ceiling, and charges the
-        # cycle's actual bytes against the cap it was actually approved with.
-        row_hard = int(row_hard_cap)
-        row_soft = int(row_soft_cap)
-        if not (
-            0 < row_soft <= row_hard <= hard_cap
-            and row_soft <= soft_cap
-        ):
+        # A row states the caps ITS crawl ran under, and the cycle's actual
+        # bytes are charged against exactly that cap.  Since #1387 there is no
+        # "today's ceiling" to compare with: a row with NULL parent caps is the
+        # uncapped epoch and is valid as such; a numeric row (earlier epochs)
+        # only has to be coherent in itself.
+        if row_hard_cap is None and row_soft_cap is None:
+            row_caps: tuple[int | None, int | None] = (None, None)
+        elif row_hard_cap is None or row_soft_cap is None:
             raise ReadinessError(
                 f'{key[0]}: parent proxy ledger budget drifted'
             )
-        parent_row_caps.setdefault(key[0], set()).add((row_hard, row_soft))
+        else:
+            row_hard = int(row_hard_cap)
+            row_soft = int(row_soft_cap)
+            if not 0 < row_soft <= row_hard:
+                raise ReadinessError(
+                    f'{key[0]}: parent proxy ledger budget drifted'
+                )
+            row_caps = (row_hard, row_soft)
+        parent_row_caps.setdefault(key[0], set()).add(row_caps)
 
     for parent, caps in parent_row_caps.items():
         if len(caps) != 1:
@@ -3169,7 +3172,10 @@ ORDER BY parent_cycle_id, entity
                 f'{parent}: parent proxy ledger rows disagree on the budget'
             )
         parent_hard, _parent_soft = next(iter(caps))
-        if ledger_traffic[parent]['provider_metered_bytes'] > parent_hard:
+        if (
+            parent_hard is not None
+            and ledger_traffic[parent]['provider_metered_bytes'] > parent_hard
+        ):
             raise ReadinessError(
                 f'{parent}: parent cycle exceeds the provider hard byte cap'
             )
@@ -3623,7 +3629,7 @@ def achievable_scopes_per_day() -> int:
 
     return max(
         1,
-        int(PARENT_DAILY_HARD_PROVIDER_BYTE_CAP // SCOPE_HARD_PROVIDER_BYTE_CAP),
+        int(PARENT_DAILY_PLANNING_BYTES // SCOPE_HARD_PROVIDER_BYTE_CAP),
     )
 
 

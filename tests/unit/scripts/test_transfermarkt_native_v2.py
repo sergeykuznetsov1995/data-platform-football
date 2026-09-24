@@ -603,8 +603,8 @@ class _ScopeEvidenceCursor:
                         'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
                         'requests', 'retries', 'cache_hits', 'duration_ms',
                     )),
-                    control.SCOPE_SET_HARD_BYTE_CAP,
-                    control.SCOPE_SET_SOFT_BYTE_STOP,
+                    None,
+                    None,
                 ))
         self.rows = []
         self.sql = []
@@ -763,14 +763,21 @@ def test_scope_set_evidence_enforces_caps_per_parent_not_on_aggregate():
     )
 
 
+# A numeric row cap of an earlier epoch (#1387: today there is none).
+EPOCH_HARD = 352_321_536
+EPOCH_SOFT = 335_544_320
+
+
 def test_scope_set_evidence_rejects_one_parent_over_hard_byte_cap():
     mod = _load()
     control = mod.control
     excessive = _scope_manifest_fixture(
         control,
-        provider_bytes=control.SCOPE_SET_HARD_BYTE_CAP + 1,
+        provider_bytes=EPOCH_HARD + 1,
     )
-    cursor = _ScopeEvidenceCursor(control, [excessive])
+    cursor = _with_ledger_caps(
+        _ScopeEvidenceCursor(control, [excessive]), EPOCH_HARD, EPOCH_SOFT,
+    )
 
     with pytest.raises(control.ReadinessError, match='parent-1.*hard byte cap'):
         control._scope_set_evidence(
@@ -799,8 +806,9 @@ def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
     mod = _load()
     control = mod.control
 
-    assert control.SCOPE_SET_HARD_BYTE_CAP == 352_321_536
-    assert control.SCOPE_SET_SOFT_BYTE_STOP == 335_544_320
+    # #1387: no parent byte cap; request/retry ceilings are unchanged.
+    assert not hasattr(control, 'SCOPE_SET_HARD_BYTE_CAP')
+    assert not hasattr(control, 'SCOPE_SET_SOFT_BYTE_STOP')
     assert control.SCOPE_SET_REQUEST_LIMIT == 12_880
     assert control.SCOPE_SET_RETRY_LIMIT == 6_400
 
@@ -809,9 +817,23 @@ def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
 
     assert report['passed'] is True
     parent_report = report['parent_cycles']['parent-1']
-    assert parent_report['hard_provider_byte_cap'] == 352_321_536
-    assert parent_report['soft_provider_byte_stop'] == 335_544_320
+    assert parent_report['hard_provider_byte_cap'] is None
+    assert parent_report['soft_provider_byte_stop'] is None
     assert parent_report['proxy_ledger_exact'] is True
+
+
+def test_uncapped_epoch_row_is_valid_and_not_charged_against_a_cap():
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(control, provider_bytes=EPOCH_HARD * 3)
+    cursor = _with_ledger_caps(
+        _ScopeEvidenceCursor(control, [manifest]), None, None,
+    )
+
+    report, _ = _readiness(control, cursor)
+
+    assert report['passed'] is True
+    assert report['parent_cycles']['parent-1']['hard_provider_byte_cap'] is None
 
 
 def test_evidence_crawled_under_the_previous_epoch_stays_readable():
@@ -852,9 +874,9 @@ def test_a_cycle_over_its_own_epoch_cap_is_still_rejected():
 @pytest.mark.parametrize(
     ('hard', 'soft'),
     [
-        (500 * 1024 * 1024, 14_680_064),  # above today's ceiling
+        (None, 14_680_064),               # half-NULL pair
+        (15_728_640, None),               # half-NULL pair
         (15_728_640, 16_000_000),         # soft above hard
-        (352_321_536, 340_000_000),       # soft above today's soft ceiling
         (0, 0),                           # meaningless caps
     ],
 )
@@ -949,23 +971,23 @@ def test_a_fully_superseded_cycle_still_has_its_budget_audited():
     mod = _load()
     control = mod.control
     manifest = _scope_manifest_fixture(control, parent_cycle_id='parent-1')
-    cursor = _ScopeEvidenceCursor(
+    cursor = _with_ledger_caps(_ScopeEvidenceCursor(
         control, [manifest], superseded_parents=['parent-0'],
-    )
+    ), EPOCH_HARD, EPOCH_SOFT)
     assert 'parent-0' in {row[0] for row in cursor.ledger_rows}
 
     report, _ = _readiness(control, cursor)
     assert report['audited_parent_cycle_ids'] == ['parent-0', 'parent-1']
     assert report['parent_cycles']['parent-0']['in_scope_set'] is False
 
-    cursor = _ScopeEvidenceCursor(
+    cursor = _with_ledger_caps(_ScopeEvidenceCursor(
         control, [manifest], superseded_parents=['parent-0'],
-    )
+    ), EPOCH_HARD, EPOCH_SOFT)
     cursor.ledger_rows = [
         (
             row[0], row[1], row[2], row[3],
             row[4] + (
-                control.SCOPE_SET_HARD_BYTE_CAP + 1
+                EPOCH_HARD + 1
                 if row[0] == 'parent-0' and row[1] == 'squad_memberships'
                 else 0
             ),
@@ -985,12 +1007,14 @@ def test_the_full_cycle_spend_not_the_slot_subset_is_charged_to_the_cap():
     mod = _load()
     control = mod.control
     manifest = _scope_manifest_fixture(control, provider_bytes=1024)
-    cursor = _ScopeEvidenceCursor(control, [manifest])
+    cursor = _with_ledger_caps(
+        _ScopeEvidenceCursor(control, [manifest]), EPOCH_HARD, EPOCH_SOFT,
+    )
     cursor.ledger_rows = [
         (
             row[0], row[1], row[2], row[3],
             row[4] + (
-                control.SCOPE_SET_HARD_BYTE_CAP
+                EPOCH_HARD
                 if row[1] == 'squad_memberships' else 0
             ),
             *row[5:],
@@ -1126,10 +1150,11 @@ def test_the_freshness_horizon_is_what_the_paid_budget_can_deliver():
     control = mod.control
 
     per_day = control.achievable_scopes_per_day()
+    # #1387: a planning estimate, not a cap — still fourteen scopes a day.
     assert per_day == (
-        control.PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+        control.PARENT_DAILY_PLANNING_BYTES
         // control.SCOPE_HARD_PROVIDER_BYTE_CAP
-    )
+    ) == 14
     assert control.current_edition_refresh_horizon_days(0) == (
         control.READINESS_MAX_AGE_DAYS
     )
