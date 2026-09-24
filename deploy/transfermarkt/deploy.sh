@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Выкат замороженного дерева на контур Transfermarkt (проекты transfermarkt-airflow /
 # transfermarkt-gw, #1387). Образец — deploy/sofascore/deploy.sh, без drain: доставка идёт
-# только когда в своей метабазе нет running-прогона TM-DAG (иначе код 4, бой не тронут).
+# только когда в своей метабазе нет running-прогона TM-DAG (иначе код 4, бой не тронут);
+# перед остановкой шлюза все четыре DAG встают на паузу и простой подтверждается ещё раз.
 # Использование: bash deploy/transfermarkt/deploy.sh <release-root> [old-release-root]
 #   Тот же скрипт из СТАРОГО дерева — это и есть откат (auto_deliver.sh).
 # Переменные — из $TRANSFERMARKT_ENV_FILE (по умолчанию /etc/data-platform/transfermarkt.env);
@@ -51,11 +52,21 @@ set_pause() {  # set_pause <dag_id> <t|f>
 }
 
 STEP="start"
+# Паузы до выката: при коде 4 (бой не тронут) возвращаются как были.
+declare -A WAS_PAUSED=()
 on_exit() {
-  local rc=$?
+  local rc=$? d
   [ "$rc" -eq 0 ] && return 0
   set +e
   log "FAILED at step '$STEP' (rc=$rc); env file: $ENV_FILE — проверь, какое дерево там записано"
+  if [ "$rc" -eq 4 ]; then
+    for d in "${!WAS_PAUSED[@]}"; do
+      [ "${WAS_PAUSED[$d]}" = f ] || continue
+      timeout -k 5 60 docker exec "$SCHED" airflow dags unpause "$d" >> "$LOG" 2>&1 8>&-
+      [ "$(is_paused "$d")" = f ] && log "$d unpaused back (nothing deployed)" \
+        || log "MANUAL ACTION REQUIRED: $d is still paused — unpause it by hand"
+    done
+  fi
   exit "$rc"
 }
 trap on_exit EXIT
@@ -98,7 +109,19 @@ STEP="idle"
 running=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ($TM_DAGS_SQL) AND state='running';" || true)
 [ -n "$running" ] || { log "метабаза $METADB не ответила про идущие прогоны — nothing deployed"; exit 4; }
 [ "$running" = 0 ] || { log "идёт прогон TM ($running running) — nothing deployed"; exit 4; }
-log "idle: running-прогонов TM нет; deploy $RELEASE (old: ${OLD_RELEASE:--})"
+# Закрыть новые запуски: все четыре DAG на паузу (прогон паузного DAG планировщик не
+# двигает), затем подтвердить простой ещё раз — ран мог стартовать между проверкой и паузой.
+for d in "$INGEST" "$DISCOVER" "$BACKFILL" "$SILVER"; do
+  WAS_PAUSED[$d]=$(is_paused "$d" || true)
+  case "${WAS_PAUSED[$d]}" in t|f) ;; *) log "метабаза не ответила про паузу $d — nothing deployed"; unset 'WAS_PAUSED[$d]'; exit 4 ;; esac
+done
+for d in "$INGEST" "$DISCOVER" "$BACKFILL" "$SILVER"; do
+  timeout -k 5 60 docker exec "$SCHED" airflow dags pause "$d" >> "$LOG" 2>&1 8>&- || true
+  [ "$(is_paused "$d")" = t ] || { log "$d не встал на паузу — nothing deployed"; exit 4; }
+done
+busy=$($PSQL "SELECT (SELECT count(*) FROM dag_run WHERE dag_id IN ($TM_DAGS_SQL) AND state='running') + (SELECT count(*) FROM task_instance WHERE dag_id IN ($TM_DAGS_SQL) AND state IN ('queued','running','restarting'));" || true)
+[ "$busy" = 0 ] || { log "после паузы контур не пуст ('${busy:-нет ответа}') — nothing deployed"; exit 4; }
+log "idle: running-прогонов TM нет, четыре DAG на паузе; deploy $RELEASE (old: ${OLD_RELEASE:--})"
 
 STEP="repin-env"
 transfermarkt_set_env_var "$ENV_FILE" TRANSFERMARKT_RELEASE_ROOT "$RELEASE"

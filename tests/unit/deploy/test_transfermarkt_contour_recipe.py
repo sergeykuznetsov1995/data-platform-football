@@ -190,6 +190,8 @@ def test_deploy_script_order_and_pool_handling() -> None:
     text = _code_lines(DEPLOY / "deploy.sh")
     order = [
         "state='running'",
+        'airflow dags pause "$d"',
+        "state IN ('queued','running','restarting')",
         'transfermarkt_set_env_var "$ENV_FILE" TRANSFERMARKT_RELEASE_ROOT "$RELEASE"',
         'TRANSFERMARKT_PROXY_POOL_JSON="$(cat "$TRANSFERMARKT_PROXY_POOL_FILE")"',
         'up -d --no-deps --force-recreate "$GW"',
@@ -215,6 +217,11 @@ def test_auto_deliver_window_and_contract() -> None:
     assert "--drill-rollback" in text
     assert '"$old/deploy/transfermarkt/deploy.sh" "$old"' in text
     assert 'healthy 1073741824 transfermarkt-gw' in text
+    # Слоты пулов возвращаются к снимку ДО приёмки, которая их сверяет.
+    tail = text[text.index('log "deploy.sh вернул $rc"'):]
+    assert tail.index("restore_state || restored=0") < tail.index('seen=$(acceptance_seen "$NEW"')
+    # Обрыв после остановки шлюза: монты на OLD не доказывают живой бой.
+    assert "[ \"$gw_health\" != healthy ]" in text
 
 
 @pytest.mark.unit

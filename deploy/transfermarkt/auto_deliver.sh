@@ -632,8 +632,15 @@ if is_plain "$INFLIGHT"; then
     RESTORE_PENDING=""
     exit 1
   fi
+  gw_health=$(inspect -f '{{.State.Health.Status}}' "$GW")
+  if [ "$on_old" = 1 ] && [ "$gw_health" != healthy ]; then
+    # Обрыв между остановкой шлюза и его пересозданием: монты ещё на OLD, но шлюз стоит.
+    log "НЕЗАКРЫТАЯ ДОСТАВКА: монты на $OLD, а шлюз '$gw_health' — поднимаю бой откатом"
+    on_old=0
+  fi
   if [ "$on_old" = 1 ]; then
-    # Контейнеры не пересоздавались: вернуть только строку env-файла, паузы и пулы.
+    # Контейнеры не пересоздавались: вернуть строку env-файла, паузы и пулы, затем
+    # подтвердить тот же контракт приёмки по OLD, и только потом снять маркер.
     if ! transfermarkt_set_env_var "$ENV_FILE" TRANSFERMARKT_RELEASE_ROOT "$OLD" \
        || [ "$(env_file_value TRANSFERMARKT_RELEASE_ROOT)" != "$OLD" ]; then
       infl_close needs-hands "обрыв до пересоздания контейнеров, env не вернулся к снимку" f
@@ -641,7 +648,19 @@ if is_plain "$INFLIGHT"; then
       tg_durable "Transfermarkt: прошлая доставка оборвалась до пересоздания контейнеров (бой на $OLD), но вернуть env-файл к снимку не удалось. НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
       exit 1
     fi
-    if restore_state; then
+    restored_old=0
+    restore_state && restored_old=1
+    seen=X
+    started=$(inspect -f '{{.State.StartedAt}}' "$SCHED")
+    [ -n "$started" ] && seen=$(acceptance_seen "$OLD" "$started")
+    if [ "$restored_old" = 1 ] && [ "$seen" != 1 ]; then
+      log "НЕЗАКРЫТАЯ ДОСТАВКА: бой на $OLD, но приёмка по нему '$seen' — поднимаю бой откатом"
+      RESTORE_PENDING=1
+      restored_old=rollback
+    fi
+  fi
+  if [ "$on_old" = 1 ] && [ "$restored_old" != rollback ]; then
+    if [ "$restored_old" = 1 ]; then
       infl_close failed "доставка оборвалась до пересоздания контейнеров, бой остался на $OLD" t
       why=$(streak_tail)
       tg_durable "Transfermarkt: прошлая доставка оборвалась на середине, но бой целиком остался на прежнем дереве ($OLD) — env-файл, паузы и пулы вернул к снимку.$why Лог: $LOG"
@@ -901,6 +920,12 @@ if [ "$rc" = 4 ]; then
   tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась — контур занят (deploy.sh rc=4, бой не тронут).$why Лог: $LOG"
   exit 0
 fi
+# deploy.sh ставит пулы и паузы по умолчанию; снимок возвращаем ДО приёмки — приёмка
+# сверяет слоты пулов со снимком.
+restored=1
+if [ "$rc" = 0 ]; then
+  restore_state || restored=0
+fi
 accept_deadline=$(( $(date -u +%s) + ACCEPT_WAIT ))
 accept_tries=$(( ACCEPT_WAIT / ACCEPT_POLL + 1 ))
 seen=0
@@ -927,8 +952,6 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
     tg_durable "Transfermarkt: УЧЕНИЯ ОТКАТА ПРОВАЛЕНЫ — дерево с намеренной ошибкой импорта прошло приёмку. Бой возвращён на $OLD (если откат подтвердился — маркер доставки снят). НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
     exit 1
   fi
-  restored=1
-  restore_state || restored=0
   printf '%s\n' "$WANT" > "$ACCEPTED" 2>/dev/null || log "маркер приёмки $ACCEPTED не записан"
   if [ "$restored" != 1 ]; then
     tg_durable "Transfermarkt: код ${WANT:0:8} доставлен и приёмка сошлась, НО паузы/пулы не вернулись к снимку —$RESTORE_NOTE НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
