@@ -109,6 +109,10 @@ class QualityReport:
     # site_result = games the league response marked isResult.
     covered_game_ids: Sequence[str] = ()
     site_result_game_ids: Sequence[str] = ()
+    # #1431: league-response fingerprints (weekly closed-scope baseline) and
+    # the number of source HTTP requests the attempt made.
+    league_payload_hashes: Mapping[str, str] = field(default_factory=dict)
+    request_count: Optional[int] = None
 
     @property
     def publishable(self) -> bool:
@@ -147,6 +151,8 @@ class QualityReport:
             "site_result_game_ids": sorted(self.site_result_game_ids),
             "batch_id": self.batch_id,
             "issues": [issue.to_dict() for issue in self.issues],
+            "league_payload_hashes": dict(self.league_payload_hashes),
+            "request_count": self.request_count,
         }
 
 
@@ -305,6 +311,8 @@ def validate_understat_scope(
     payload_hashes: Optional[Mapping[str, str]] = None,
     batch_id: Optional[str] = None,
     coverage_exceptions: Optional[Mapping[str, object]] = None,
+    league_payload_hashes: Optional[Mapping[str, str]] = None,
+    request_count: Optional[int] = None,
 ) -> QualityReport:
     """Validate all seven entity frames for exactly one league-season scope.
 
@@ -1015,6 +1023,8 @@ def validate_understat_scope(
         batch_id=batch_id,
         covered_game_ids=tuple(sorted(covered_game_ids)),
         site_result_game_ids=tuple(sorted(completed_ids)),
+        league_payload_hashes=dict(league_payload_hashes or {}),
+        request_count=request_count,
     )
 
 
@@ -1080,6 +1090,8 @@ def build_failure_attempt(
     started_at: Optional[str] = None,
     completed_at: Optional[str] = None,
     site_result_game_ids: Optional[Iterable[str]] = None,
+    league_payload_hashes: Optional[Mapping[str, str]] = None,
+    request_count: Optional[int] = None,
 ) -> ScopeAttempt:
     """Build an auditable terminal attempt when extraction/DQ cannot report.
 
@@ -1109,6 +1121,12 @@ def build_failure_attempt(
     rows = full_map(row_counts, 0)
     keys = full_map(natural_key_counts, 0)
     hashes = full_map(payload_hashes, "")
+    # #1431: carried only when known before the failure.
+    known: dict[str, Any] = {}
+    if league_payload_hashes:
+        known["league_payload_hashes"] = dict(league_payload_hashes)
+    if request_count is not None:
+        known["request_count"] = request_count
     return ScopeAttempt(
         scope=scope,
         status=status,
@@ -1134,6 +1152,7 @@ def build_failure_attempt(
                 str(game_id) for game_id in (site_result_game_ids or ())
             ),
             "site_result_known": site_result_game_ids is not None,
+            **known,
         },
         started_at=started_at or utc_now_iso(),
         completed_at=completed_at or utc_now_iso(),

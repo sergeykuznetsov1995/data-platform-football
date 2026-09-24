@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import importlib
 import json
 from pathlib import Path
@@ -140,19 +141,89 @@ def test_current_planner_uses_runtime_rolling_catalog_and_config_scope(
         def rolling_scopes(self, **kwargs):
             calls.append(kwargs)
             return [
-                _scope(),
-                _scope(league="UNKNOWN-League"),
+                _scope(season="2627", source_id=2026),
+                _scope(league="UNKNOWN-League", season="2627", source_id=2026),
             ]
 
     monkeypatch.setattr(understat, "UnderstatClient", Client)
     monkeypatch.setattr(understat, "UnderstatCatalog", Catalog)
 
-    plan = dag_module.plan_current_scopes(run_id="scheduled__one")
+    plan = dag_module.plan_current_scopes(
+        run_id="scheduled__one", data_interval_end=_TUESDAY
+    )
 
     assert calls == [{"window": 2, "probe_next": True}]
     assert len(plan) == 1
     assert plan[0]["UNDERSTAT_LEAGUE"] == "ENG-Premier League"
     assert "UNDERSTAT_REPARSE" not in plan[0]
+
+
+# #1431: 2026-09-28 is a Monday; the 2025/26 season is closed from 2026-07-01.
+_MONDAY = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+_TUESDAY = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)
+
+
+def _window_catalog(monkeypatch):
+    import scrapers.understat as understat
+
+    class Client:
+        pass
+
+    class Catalog:
+        def __init__(self, client):
+            pass
+
+        def rolling_scopes(self, **kwargs):
+            return [
+                _scope(league=league, season=season, source_id=source_id)
+                for league in ("ENG-Premier League", "ESP-La Liga")
+                for season, source_id in (("2526", 2025), ("2627", 2026))
+            ]
+
+    monkeypatch.setattr(understat, "UnderstatClient", Client)
+    monkeypatch.setattr(understat, "UnderstatCatalog", Catalog)
+
+
+def _plan_view(plan):
+    return [
+        (
+            item["UNDERSTAT_LEAGUE"],
+            item["UNDERSTAT_SEASON_SLUG"],
+            item["UNDERSTAT_MODE"],
+        )
+        for item in plan
+    ]
+
+
+def test_weekday_plan_holds_only_current_season_scopes(dag_module, monkeypatch):
+    _window_catalog(monkeypatch)
+
+    plan = dag_module.plan_current_scopes(
+        run_id="scheduled__tue", data_interval_end=_TUESDAY
+    )
+
+    assert _plan_view(plan) == [
+        ("ENG-Premier League", "2627", "current"),
+        ("ESP-La Liga", "2627", "current"),
+    ]
+
+
+def test_monday_plan_queues_closed_checks_after_all_current_scopes(
+    dag_module, monkeypatch
+):
+    _window_catalog(monkeypatch)
+
+    plan = dag_module.plan_current_scopes(
+        run_id="scheduled__mon", data_interval_end=_MONDAY
+    )
+
+    assert _plan_view(plan) == [
+        ("ENG-Premier League", "2627", "current"),
+        ("ESP-La Liga", "2627", "current"),
+        ("ENG-Premier League", "2526", "closed_check"),
+        ("ESP-La Liga", "2526", "closed_check"),
+    ]
+    assert plan[2]["UNDERSTAT_RESULT_PATH"].startswith("/tmp/understat_closed_check_")
 
 
 def _result(
@@ -264,3 +335,23 @@ def test_complete_scope_requires_publication_evidence(dag_module, tmp_path):
     _result(path, attempt_overrides={"batch_id": ""})
     with pytest.raises(AirflowException, match="publication evidence"):
         dag_module.validate_scope_result(**_validation_context(path))
+
+
+def test_closed_check_validation_accepts_only_complete(dag_module, tmp_path):
+    """#1431: an unchanged skip returns the last complete attempt as-is."""
+    from airflow.exceptions import AirflowException
+
+    path = tmp_path / "result.json"
+    expected = _result(
+        path,
+        top_overrides={"closed_check": {"unchanged": True, "hashes": {}}},
+    )
+    assert dag_module.validate_scope_result(
+        **_validation_context(path, mode="closed_check")
+    ) == expected
+
+    _result(path, status="not_published")
+    with pytest.raises(AirflowException, match="terminal state"):
+        dag_module.validate_scope_result(
+            **_validation_context(path, mode="closed_check")
+        )

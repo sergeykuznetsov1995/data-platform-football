@@ -55,9 +55,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("current", "backfill"),
+        choices=("current", "backfill", "closed_check"),
         required=True,
-        help="Current rolling ingestion or manifest-resumable closed history",
+        help=(
+            "Current rolling ingestion, manifest-resumable closed history, or "
+            "the weekly closed-season league-hash check (#1431)"
+        ),
     )
     parser.add_argument("--league", required=True, help="Canonical platform league")
     parser.add_argument(
@@ -170,6 +173,27 @@ def _decorate_frames(
         frame["_batch_id"] = batch_id
         decorated[entity] = frame
     return decorated
+
+
+def _scraper_league_hashes(scraper: Any) -> dict[str, str]:
+    """#1431: league fingerprints of the scope the scraper just parsed."""
+
+    hashes = getattr(scraper, "last_league_hashes", None)
+    return dict(hashes) if isinstance(hashes, dict) else {}
+
+
+def _scraper_request_count(scraper: Any) -> Optional[int]:
+    """#1431: source HTTP requests made by the scraper's client."""
+
+    count = getattr(getattr(scraper, "client", None), "request_count", None)
+    if isinstance(count, bool) or not isinstance(count, int):
+        return None
+    return count
+
+
+def _add_counts(*counts: Optional[int]) -> Optional[int]:
+    known = [count for count in counts if count is not None]
+    return sum(known) if known else None
 
 
 def _classify_exception(exc: BaseException) -> tuple[Any, int, str]:
@@ -340,6 +364,9 @@ def run_scope(
     proposed_attempt = None
     publication_started = False
     written_tables: dict[str, str] = {}
+    # #1431: request accounting across the closed-check probe and full path.
+    probe_request_count: Optional[int] = None
+    active_scraper: Any = None
 
     if repository is None:
         repository = UnderstatManifestRepository.from_env()
@@ -402,6 +429,112 @@ def run_scope(
                     scope.season,
                 )
                 return _result_payload(latest), 0
+        if args.mode == "closed_check":
+            from scrapers.understat.closed_check import LEAGUE_HASH_ENTITIES
+
+            baseline = repository.latest_complete(
+                scope, contract_version=CONTRACT_VERSION
+            )
+            baseline_hashes = (
+                dict((baseline.quality or {}).get("league_payload_hashes") or {})
+                if baseline is not None
+                else {}
+            )
+            if not baseline_hashes:
+                logger.info(
+                    "closed scope has no baseline: league=%s season=%s; "
+                    "full re-ingest",
+                    scope.league,
+                    scope.season,
+                )
+            else:
+                with scraper_factory(
+                    leagues=[args.league],
+                    seasons=[args.season_slug],
+                ) as probe:
+                    active_scraper = probe
+                    snapshot = probe.league_snapshot(
+                        args.league,
+                        args.season_slug,
+                        args.source_season_id,
+                    )
+                    probe_request_count = _scraper_request_count(probe)
+                    active_scraper = None
+                changed = [
+                    entity
+                    for entity in LEAGUE_HASH_ENTITIES
+                    if snapshot.get(entity) != baseline_hashes.get(entity)
+                ]
+                # The skip returns the last complete attempt only while it is
+                # still the latest manifest row: any newer marker/failure must
+                # be superseded by a fresh publication, not reported as fine.
+                baseline_is_latest = (
+                    latest is not None
+                    and latest.status is ManifestStatus.COMPLETE
+                    and latest.attempt_id == baseline.attempt_id
+                )
+                if not changed and baseline_is_latest:
+                    try:
+                        unchanged_verified = repository.verify_physical_batch(
+                            baseline
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "Unable to verify unchanged closed Understat scope"
+                        )
+                        verify_status, _, verify_message = _classify_exception(exc)
+                        _journal_failure_best_effort(
+                            repository,
+                            build_failure_attempt(
+                                scope=scope,
+                                status=verify_status,
+                                batch_id=batch_id,
+                                run_id=run_id,
+                                mode=args.mode,
+                                parser_version=PARSER_VERSION,
+                                error_type=type(exc).__name__,
+                                error_message=verify_message,
+                                attempt_no=attempt_no,
+                                started_at=started_at,
+                                league_payload_hashes=snapshot,
+                                request_count=probe_request_count,
+                            ),
+                        )
+                        return _result_payload(
+                            baseline,
+                            errors=[
+                                "physical verification of the unchanged closed "
+                                f"scope failed: {type(exc).__name__}: {exc}"
+                            ],
+                        ), 1
+                    if unchanged_verified:
+                        logger.info(
+                            "closed scope unchanged: league=%s season=%s hashes=%s",
+                            scope.league,
+                            scope.season,
+                            snapshot,
+                        )
+                        payload = _result_payload(baseline)
+                        payload["closed_check"] = {
+                            "unchanged": True,
+                            "hashes": snapshot,
+                            "request_count": probe_request_count,
+                        }
+                        return payload, 0
+                    logger.info(
+                        "closed scope unchanged but its physical batch does not "
+                        "verify: league=%s season=%s; full re-ingest",
+                        scope.league,
+                        scope.season,
+                    )
+                else:
+                    logger.info(
+                        "closed scope changed (%s): league=%s season=%s; "
+                        "full re-ingest",
+                        ", ".join(changed) or "latest attempt is not complete",
+                        scope.league,
+                        scope.season,
+                    )
         previous = repository.latest_data_attempt(
             scope,
             contract_version=CONTRACT_VERSION,
@@ -414,11 +547,14 @@ def run_scope(
         # manifest, so manifest state cannot safely be used as a retry marker.
         # Refreshing each selected history scope also prevents a cached partial
         # HTTP-200 payload from trapping the self-draining DAG forever.
-        retry_refresh = args.mode == "backfill"
+        # #1431: a changed closed scope is re-ingested on the current path.
+        retry_refresh = args.mode in {"backfill", "closed_check"}
+        current_path = args.mode in {"current", "closed_check"}
         with scraper_factory(
             leagues=[args.league],
             seasons=[args.season_slug],
         ) as scraper:
+            active_scraper = scraper
             raw_frames = scraper.scrape_scope(
                 args.league,
                 args.season_slug,
@@ -428,7 +564,7 @@ def run_scope(
             )
             frames = _decorate_frames(raw_frames, batch_id=batch_id)
             if (
-                args.mode == "current"
+                current_path
                 and frames["understat_schedule"].empty
                 and previous is None
             ):
@@ -454,7 +590,7 @@ def run_scope(
                         "refusing to create a v2 manifest attempt"
                     )
             if (
-                args.mode == "current"
+                current_path
                 and args.source_discovered == "true"
                 and frames["understat_schedule"].empty
             ):
@@ -472,6 +608,10 @@ def run_scope(
                 previous_row_counts=previous_counts,
                 batch_id=batch_id,
                 coverage_exceptions=coverage_exceptions_for_scope(scope),
+                league_payload_hashes=_scraper_league_hashes(scraper),
+                request_count=_add_counts(
+                    probe_request_count, _scraper_request_count(scraper)
+                ),
             )
             proposed_attempt = build_scope_attempt(
                 report,
@@ -605,6 +745,12 @@ def run_scope(
                 payload_hashes=report.payload_hashes,
                 site_result_game_ids=report.site_result_game_ids,
             )
+        failure_kwargs.update(
+            league_payload_hashes=_scraper_league_hashes(active_scraper),
+            request_count=_add_counts(
+                probe_request_count, _scraper_request_count(active_scraper)
+            ),
+        )
         failure = build_failure_attempt(
             scope=scope,
             status=status,

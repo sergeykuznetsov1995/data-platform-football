@@ -928,6 +928,25 @@ def test_quality_report_lists_covered_and_site_result_games():
     assert quality["completed_game_count"] == 2
 
 
+def test_quality_report_carries_league_hashes_and_request_count():
+    """#1431: weekly closed-check baseline and daily request accounting."""
+    hashes = {"schedule": "a" * 64, "players": "b" * 64, "team_match_stats": "c" * 64}
+    report = validate_understat_scope(
+        _frames(),
+        scope=SCOPE,
+        active=False,
+        batch_id=BATCH,
+        league_payload_hashes=hashes,
+        request_count=412,
+    )
+
+    quality = report.to_dict()
+    assert quality["league_payload_hashes"] == hashes
+    assert quality["request_count"] == 412
+    assert _complete_report().to_dict()["league_payload_hashes"] == {}
+    assert _complete_report().to_dict()["request_count"] is None
+
+
 def test_game_with_shots_but_no_rosters_is_not_covered():
     frames = _two_game_frames()
     frames["understat_player_match_stats"] = frames[

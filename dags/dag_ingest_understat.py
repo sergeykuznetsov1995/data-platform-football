@@ -45,6 +45,7 @@ def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
     # Lazy import is intentional: DAG parsing must not open a source session or
     # require the scraper-only dependency set in the scheduler process.
     from scrapers.understat import UnderstatCatalog, UnderstatClient
+    from scrapers.understat.closed_check import split_daily_plan
 
     client = UnderstatClient()
     try:
@@ -63,6 +64,15 @@ def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
     if not scopes:
         raise AirflowException("Understat current discovery returned no scopes")
 
+    # #1431: closed seasons leave the daily window; on Mondays they get one
+    # league-hash check each, queued after every current scope.
+    run_boundary = (
+        context.get("data_interval_end")
+        or context.get("logical_date")
+        or datetime.now(timezone.utc)
+    )
+    current_scopes, closed_scopes = split_daily_plan(scopes, run_boundary)
+
     run_id = str(context.get("run_id") or "manual")
     plan = [
         scope_environment(
@@ -70,13 +80,24 @@ def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
             mode="current",
             run_id=run_id,
         )
-        for scope in scopes
+        for scope in current_scopes
+    ] + [
+        scope_environment(
+            scope,
+            mode="closed_check",
+            run_id=run_id,
+        )
+        for scope in closed_scopes
     ]
     logger.info(
         "Understat current plan contains %d scope(s): %s",
         len(plan),
         [
-            (item["UNDERSTAT_LEAGUE"], item["UNDERSTAT_SEASON_SLUG"])
+            (
+                item["UNDERSTAT_LEAGUE"],
+                item["UNDERSTAT_SEASON_SLUG"],
+                item["UNDERSTAT_MODE"],
+            )
             for item in plan
         ],
     )
