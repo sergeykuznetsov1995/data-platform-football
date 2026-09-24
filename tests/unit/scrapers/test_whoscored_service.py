@@ -1319,7 +1319,10 @@ def test_discover_catalog_rejects_loss_of_previously_published_tournament(
     assert repository.persisted == []
 
 
-def _menu_absent_previous_catalog():
+def _menu_absent_previous_catalog(
+    old_eligibility="included",
+    old_reason="parent:source_sex_male_no_youth_marker",
+):
     competition = _discovery_competition_row()
     competition.update(
         {
@@ -1332,8 +1335,10 @@ def _menu_absent_previous_catalog():
     old_season.update(
         {
             "source_selected": False,
-            "eligibility": "included",
-            "classification_reason": "parent:source_sex_male_no_youth_marker",
+            "start": "2022-11-20",
+            "end": "2022-12-18",
+            "eligibility": old_eligibility,
+            "classification_reason": old_reason,
             "is_active": False,
         }
     )
@@ -1364,8 +1369,14 @@ def _menu_absent_previous_catalog():
     )
 
 
-def _discover_with_menu_absent_season(monkeypatch, *, full_history=False):
-    previous = _menu_absent_previous_catalog()
+def _discover_with_menu_absent_season(
+    monkeypatch, *, full_history=False, old_eligibility=None, old_reason=None
+):
+    previous = (
+        _menu_absent_previous_catalog()
+        if old_eligibility is None
+        else _menu_absent_previous_catalog(old_eligibility, old_reason)
+    )
     repository = _CatalogRepository(previous=previous)
     schedule = {
         "date": datetime(2026, 7, 11, 19),
@@ -1391,11 +1402,24 @@ def _discover_with_menu_absent_season(monkeypatch, *, full_history=False):
 
 
 @pytest.mark.parametrize("full_history", [False, True])
+@pytest.mark.parametrize(
+    ("old_eligibility", "old_reason"),
+    [
+        ("included", "parent:source_sex_male_no_youth_marker"),
+        # Explicit source_unavailable evidence must survive menu absence.
+        ("source_unavailable", "season_has_no_accessible_fixture_date_evidence"),
+        # Parent inheritance would rewrite this to the parent's ``included``.
+        ("excluded_technical", "season_technical_exclusion"),
+    ],
+)
 def test_discover_catalog_retains_season_absent_from_source_menu(
-    monkeypatch, caplog, full_history
+    monkeypatch, caplog, full_history, old_eligibility, old_reason
 ):
     previous, repository, result = _discover_with_menu_absent_season(
-        monkeypatch, full_history=full_history
+        monkeypatch,
+        full_history=full_history,
+        old_eligibility=old_eligibility,
+        old_reason=old_reason,
     )
 
     assert result.status == "success", result.errors
@@ -1412,9 +1436,10 @@ def test_discover_catalog_retains_season_absent_from_source_menu(
     retained = seasons[8000]
     assert retained["is_active"] is False
     assert retained["classification_reason"] == "source_menu_absent"
-    assert retained["eligibility"] == previous_row["eligibility"]
-    assert retained.get("start") == previous_row.get("start")
-    assert retained.get("end") == previous_row.get("end")
+    assert previous_row["eligibility"] == old_eligibility
+    assert retained["eligibility"] == old_eligibility
+    assert str(retained["start"])[:10] == "2022-11-20"
+    assert str(retained["end"])[:10] == "2022-12-18"
     assert (8000, 600) in {
         (int(row["source_season_id"]), int(row["stage_id"]))
         for row in repository.persisted[0][0].to_rows()["stages"]
