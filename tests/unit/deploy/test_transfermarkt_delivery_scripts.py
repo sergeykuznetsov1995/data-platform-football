@@ -151,6 +151,7 @@ class Stand:
         self.put(f"created_{SCHED}", "2026-09-24T01:00:00Z")
         self.mounts_on(self.new)
         self.put(f"health_{GW}", "healthy")
+        self.put(f"health_{SCHED}", "healthy")
 
     def put(self, name: str, value: str) -> None:
         (self.state / name).write_text(value + "\n", encoding="utf-8")
@@ -163,7 +164,8 @@ class Stand:
     def run(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(self.automat)],
-            env={"PATH": os.environ["PATH"], "TRANSFERMARKT_ENV_FILE": str(self.env_file)},
+            env={"PATH": os.environ["PATH"], "TRANSFERMARKT_ENV_FILE": str(self.env_file),
+                 "ACCEPT_WAIT": "2", "ACCEPT_POLL": "1"},
             capture_output=True, text=True, timeout=120,
         )
 
@@ -257,6 +259,7 @@ case "$cmd" in
         r=$TRANSFERMARKT_RELEASE_ROOT
         printf '%s/dags\n%s/deploy/transfermarkt/.airflowignore\n%s/scrapers\n%s/scripts\n%s/configs\n' \
           "$r" "$r" "$r" "$r" "$r" > "$S/mounts_transfermarkt-airflow-scheduler"
+        echo healthy > "$S/health_transfermarkt-airflow-scheduler"
         echo 4 > "$S/registered" ;;
     esac ;;
   inspect)
@@ -345,3 +348,15 @@ def test_first_deploy_on_a_fresh_metabase_registers_and_sets_pauses(tmp_path: Pa
         assert (state / f"paused_{dag}").read_text().strip() == paused, dag
     for p in POOLS:
         assert (state / f"pool_{p}").read_text().strip() == "1", p
+
+
+@pytest.mark.unit
+def test_a_hung_scheduler_does_not_confirm_the_rollback(stand: Stand) -> None:
+    stand.put(f"health_{SCHED}", "unhealthy")
+    result = stand.run()
+    assert result.returncode == 1, result.stderr
+    assert (stand.state / "old_deploy_called").exists()
+    window = stand.window()
+    assert "OUTCOME=needs-hands" in window and "RESTORED=t" not in window
+    assert (stand.auto / "transfermarkt-inflight").exists()
+    assert (stand.auto / "transfermarkt-auto-deliver.off").exists()

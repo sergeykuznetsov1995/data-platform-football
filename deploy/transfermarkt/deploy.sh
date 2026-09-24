@@ -204,6 +204,12 @@ done
 log "dags parsed after start=$present import_errors=$errs"
 [ "$errs" = "0" ] || { log "import errors present — см. import_error"; exit 6; }
 [ "$present" = "4" ] || { log "expected 4 parsed TM DAGs, got '$present'"; exit 6; }
+# Живой SchedulerJob: healthcheck контейнера — `airflow jobs check` по heartbeat.
+for _ in $(seq 1 30); do
+  [ "$(docker inspect -f '{{.State.Health.Status}}' "$SCHED" 2>/dev/null)" = "healthy" ] && break
+  sleep 10
+done
+[ "$(docker inspect -f '{{.State.Health.Status}}' "$SCHED")" = "healthy" ] || { log "$SCHED unhealthy"; exit 6; }
 # /health шлюза изнутри планировщика: режим transfermarkt-only, суточного бюджета нет.
 health=$(timeout -k 5 60 docker exec "$SCHED" python -c '
 import json, urllib.request

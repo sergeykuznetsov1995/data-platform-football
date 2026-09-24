@@ -68,12 +68,14 @@ POOLS="transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_c
 CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
 WINDOW_FROM=${WINDOW_FROM:-0100}   # TM-DAG идут в 04:00 UTC; окно 01:00–03:00 (решение 9 #1387)
 WINDOW_TO=${WINDOW_TO:-0300}
-DEPLOY_CEILING=${DEPLOY_CEILING:-1500}  # потолок deploy.sh: шлюз 300 с + пулы 150 + приёмка 600 + запас
+DEPLOY_CEILING=${DEPLOY_CEILING:-1800}  # потолок deploy.sh: шлюз 300 + пулы 150 + DAG 600 + scheduler 300 + запас
 ACCEPT_WAIT=${ACCEPT_WAIT:-480}
 ACCEPT_POLL=${ACCEPT_POLL:-20}
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
 FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
+# Запас до конца окна: доставка + приёмка и столько же на откат с его приёмкой.
+NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + ACCEPT_WAIT) ))
 
 log(){
   if [ -L "$LOG" ] || { [ -e "$LOG" ] && [ ! -f "$LOG" ]; }; then
@@ -242,8 +244,8 @@ print("ok" if h.get("source_mode") == "transfermarkt-only" and not any(k.startsw
 ' 2>/dev/null 8>&- 9>&-) || { echo X; return; }
   [ "$out" = ok ] && echo 1 || echo 0
 }
-# Приёмка — пять признаков: 4 DAG перечитаны ПОСЛЕ старта этого scheduler'а и без ошибок
-# импорта; шлюз healthy на 1 GiB в проекте transfermarkt-gw; монты scheduler'а и шлюза в
+# Приёмка — шесть признаков: 4 DAG перечитаны ПОСЛЕ старта этого scheduler'а и без ошибок
+# импорта; scheduler healthy (heartbeat SchedulerJob); шлюз healthy на 1 GiB в проекте transfermarkt-gw; монты scheduler'а и шлюза в
 # этом дереве; /health шлюза в режиме transfermarkt-only; слоты пулов как в снимке.
 acceptance_seen(){  # acceptance_seen <дерево> <StartedAt scheduler'а>
   local new="$1" started="$2" dags errs gw got c
@@ -252,6 +254,9 @@ acceptance_seen(){  # acceptance_seen <дерево> <StartedAt scheduler'а>
   case "$dags$errs" in *X*) echo X; return ;; esac
   [ "$dags" = 4 ] || { echo 0; return; }
   [ "$errs" = 0 ] || { echo 0; return; }
+  # Живой SchedulerJob: healthcheck контейнера — `airflow jobs check` по heartbeat.
+  got=$(inspect -f '{{.State.Health.Status}}' "$SCHED") || { echo X; return; }
+  [ "$got" = healthy ] || { echo 0; return; }
   gw=$(inspect -f '{{.State.Health.Status}} {{.HostConfig.Memory}} {{index .Config.Labels "com.docker.compose.project"}}' "$GW") || { echo X; return; }
   [ "$gw" = "healthy 1073741824 transfermarkt-gw" ] || { echo 0; return; }
   got=$(mounts_all_in "$new")
@@ -780,7 +785,7 @@ else
   [ "$in_window" = 1 ] || exit 0
   WINDOW_ID=$TODAY
   announce_missed_window "Transfermarkt: окно доставки закрывается, а бой всё ещё на ${LIVE:0:8} (master ${WANT:0:8}). Лог: $LOG"
-  if [ $(( deadline - now )) -lt $(( DEPLOY_CEILING + ACCEPT_WAIT )) ]; then
+  if [ $(( deadline - now )) -lt "$NEED_BUDGET" ]; then
     log "запаса нет ($(( deadline - now )) с до конца окна) — сегодня не доставляем"
     if window_close "$TODAY" failed "запаса нет: $(( deadline - now )) с до конца окна" t; then
       why=$(streak_tail)
@@ -841,6 +846,17 @@ else
     fi
   fi
   ensure_automat_matches_release "$NEW"
+fi
+
+# Заморозка могла съесть до 900 с: запас пересчитывается непосредственно перед доставкой.
+if [ "$DRILL" != 1 ] && [ $(( deadline - $(date -u +%s) )) -lt "$NEED_BUDGET" ]; then
+  left=$(( deadline - $(date -u +%s) ))
+  log "после заморозки запаса нет ($left с до конца окна, нужно $NEED_BUDGET) — сегодня не доставляем"
+  if window_close "$TODAY" failed "после заморозки запаса нет: $left с" t; then
+    why=$(streak_tail)
+    is_plain "$OFF" && tg_durable "Transfermarkt: доставка ${WANT:0:8} сегодня не состоялась — заморозка дерева съела запас окна.$why Лог: $LOG"
+  fi
+  exit 0
 fi
 
 # ============================ Шаг 8: снимок отката, защёлки ============================

@@ -220,6 +220,11 @@ def test_auto_deliver_window_and_contract() -> None:
     # Слоты пулов возвращаются к снимку ДО приёмки, которая их сверяет.
     tail = text[text.index('log "deploy.sh вернул $rc"'):]
     assert tail.index("restore_state || restored=0") < tail.index('seen=$(acceptance_seen "$NEW"')
+    # Запас окна (доставка + откат) пересчитывается после заморозки, перед снимком.
+    assert "NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + ACCEPT_WAIT) ))" in text
+    assert text.index('freeze_release.sh" "$WANT"') < text.rindex('-lt "$NEED_BUDGET"') < text.index("Шаг 8")
+    # Приёмка требует живого SchedulerJob.
+    assert "[ \"$got\" = healthy ] || { echo 0; return; }" in text
     # Обрыв после остановки шлюза: монты на OLD не доказывают живой бой.
     assert "[ \"$gw_health\" != healthy ]" in text
 
