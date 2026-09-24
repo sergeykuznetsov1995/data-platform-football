@@ -1319,33 +1319,63 @@ def test_discover_catalog_rejects_loss_of_previously_published_tournament(
     assert repository.persisted == []
 
 
-def test_discover_catalog_rejects_loss_of_previously_published_season(
-    tmp_path, monkeypatch
+def _menu_absent_previous_catalog(
+    old_eligibility="included",
+    old_reason="parent:source_sex_male_no_youth_marker",
 ):
-    previous = WhoScoredCatalog.from_mapping(
+    competition = _discovery_competition_row()
+    competition.update(
         {
-            "competitions": [
-                {
-                    "id": "INT-World Cup",
-                    "seasons": [
-                        {
-                            "id": 2022,
-                            "season_format": "single_year",
-                            "source_season_id": 8000,
-                        },
-                        {
-                            "id": 2026,
-                            "season_format": "single_year",
-                            "source_season_id": 9001,
-                        },
-                    ],
-                    "sources": {
-                        "primary": ["whoscored"],
-                        "whoscored": {"region_id": 247, "tournament_id": 36},
-                    },
-                }
-            ]
+            "source_sex": 1,
+            "eligibility": "included",
+            "classification_reason": "source_sex_male_no_youth_marker",
         }
+    )
+    old_season = _discovery_season_row(source_season_id=8000, season_id="2022")
+    old_season.update(
+        {
+            "source_selected": False,
+            "start": "2022-11-20",
+            "end": "2022-12-18",
+            "eligibility": old_eligibility,
+            "classification_reason": old_reason,
+            "is_active": False,
+        }
+    )
+    current_season = _discovery_season_row()
+    current_season.update(
+        {
+            "eligibility": "included",
+            "classification_reason": "parent:source_sex_male_no_youth_marker",
+            "is_active": True,
+        }
+    )
+    old_stage = _discovery_stage_row(source_season_id=8000, stage_id=600)
+    old_stage.update({"season": "2022", "season_id": "2022"})
+    stages = (old_stage, _discovery_stage_row())
+    for stage in stages:
+        stage.update(
+            {
+                "eligibility": "included",
+                "classification_reason": "parent:source_sex_male_no_youth_marker",
+            }
+        )
+    return WhoScoredCatalog.from_rows(
+        {
+            "competitions": (competition,),
+            "seasons": (old_season, current_season),
+            "stages": stages,
+        }
+    )
+
+
+def _discover_with_menu_absent_season(
+    monkeypatch, *, full_history=False, old_eligibility=None, old_reason=None
+):
+    previous = (
+        _menu_absent_previous_catalog()
+        if old_eligibility is None
+        else _menu_absent_previous_catalog(old_eligibility, old_reason)
     )
     repository = _CatalogRepository(previous=previous)
     schedule = {
@@ -1361,21 +1391,84 @@ def test_discover_catalog_rejects_loss_of_previously_published_season(
         stage_rows=(_discovery_stage_row(),),
         schedule_rows=(schedule,),
     )
-
     result = WhoScoredIngestService.discover_catalog(
         as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
+        full_history=full_history,
+    )
+    return previous, repository, result
+
+
+@pytest.mark.parametrize("full_history", [False, True])
+@pytest.mark.parametrize(
+    ("old_eligibility", "old_reason"),
+    [
+        ("included", "parent:source_sex_male_no_youth_marker"),
+        # Explicit source_unavailable evidence must survive menu absence.
+        ("source_unavailable", "season_has_no_accessible_fixture_date_evidence"),
+        # Parent inheritance would rewrite this to the parent's ``included``.
+        ("excluded_technical", "season_technical_exclusion"),
+    ],
+)
+def test_discover_catalog_retains_season_absent_from_source_menu(
+    monkeypatch, caplog, full_history, old_eligibility, old_reason
+):
+    previous, repository, result = _discover_with_menu_absent_season(
+        monkeypatch,
+        full_history=full_history,
+        old_eligibility=old_eligibility,
+        old_reason=old_reason,
     )
 
-    assert result.status == "failed"
-    assert any(
-        "season menus lost previously published seasons" in error
-        and "INT-World Cup/8000" in error
-        for error in result.errors
+    assert result.status == "success", result.errors
+    assert len(repository.persisted) == 1
+    seasons = {
+        int(row["source_season_id"]): row
+        for row in repository.persisted[0][0].to_rows()["seasons"]
+    }
+    previous_row = next(
+        row
+        for row in previous.to_rows()["seasons"]
+        if int(row["source_season_id"]) == 8000
     )
-    assert repository.persisted == []
+    retained = seasons[8000]
+    assert retained["is_active"] is False
+    assert retained["classification_reason"] == "source_menu_absent"
+    assert previous_row["eligibility"] == old_eligibility
+    assert retained["eligibility"] == old_eligibility
+    assert str(retained["start"])[:10] == "2022-11-20"
+    assert str(retained["end"])[:10] == "2022-12-18"
+    assert (8000, 600) in {
+        (int(row["source_season_id"]), int(row["stage_id"]))
+        for row in repository.persisted[0][0].to_rows()["stages"]
+    }
+    assert any(
+        record.levelname == "WARNING"
+        and "source_menu_absent" in record.getMessage()
+        and "INT-World Cup/8000" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_discover_catalog_menu_absence_leaves_current_season_untouched(
+    monkeypatch, caplog
+):
+    _, repository, result = _discover_with_menu_absent_season(monkeypatch)
+
+    assert result.status == "success", result.errors
+    seasons = {
+        int(row["source_season_id"]): row
+        for row in repository.persisted[0][0].to_rows()["seasons"]
+    }
+    current = seasons[9001]
+    assert current["is_active"] is True
+    assert current["classification_reason"] != "source_menu_absent"
+    assert current["classification_reason"].startswith("parent:")
+    assert not any(
+        "INT-World Cup/9001" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_full_history_discovery_rejects_loss_of_previously_published_stage(

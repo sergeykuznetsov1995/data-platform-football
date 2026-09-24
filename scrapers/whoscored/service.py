@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -103,6 +104,8 @@ from .transport import (
     WhoScoredTransport,
     WhoScoredTransportError,
 )
+
+logger = logging.getLogger(__name__)
 
 _SOURCE_STAGE_HEADER_UNAVAILABLE = "WhoScored page request header is unavailable."
 
@@ -1176,6 +1179,7 @@ class WhoScoredIngestService:
             historical_stage_expected: set[tuple[str, int]] = set()
             historical_stage_evidence: set[tuple[str, int]] = set()
             visited_season_keys: set[tuple[str, int]] = set()
+            menu_absent_seasons: dict[tuple[str, int], dict[str, Any]] = {}
 
             for competition in competition_rows:
                 competition_id = str(competition["competition_id"])
@@ -1574,17 +1578,46 @@ class WhoScoredIngestService:
                     and row.get("source_season_id") is not None
                 }
                 missing_seasons = sorted(previous_season_keys - current_season_keys)
-                if missing_seasons:
-                    raise WhoScoredParseError(
-                        "tournament season menus lost previously published seasons: "
-                        + ", ".join(
-                            f"{competition_id}/{source_season_id}"
-                            for competition_id, source_season_id in missing_seasons[:20]
+                for key in missing_seasons:
+                    previous = previous_season_rows.get(key)
+                    if previous is None:
+                        raise WhoScoredParseError(
+                            "tournament season menus lost previously published "
+                            f"seasons: {key[0]}/{key[1]}"
                         )
+                    # WhoScored silently drops junk menu entries (e.g. World
+                    # Cup "2000/2001"). Keep the published evidence instead of
+                    # failing discovery; the row becomes inactive and says why.
+                    retained = dict(previous)
+                    retained["is_active"] = False
+                    retained["classification_reason"] = "source_menu_absent"
+                    season_rows.append(retained)
+                    menu_absent_seasons[key] = retained
+                if menu_absent_seasons:
+                    logger.warning(
+                        "tournament season menus no longer list previously "
+                        "published seasons; retained as source_menu_absent: %s",
+                        ", ".join(
+                            f"{competition_id}/{source_season_id}"
+                            for competition_id, source_season_id in menu_absent_seasons
+                        ),
                     )
 
-            if previous_catalog is not None and not full_history:
-                existing_stage_rows = previous_catalog.to_rows().get("stages", ())
+            if previous_catalog is not None and (
+                not full_history or menu_absent_seasons
+            ):
+                existing_stage_rows = [
+                    row
+                    for row in previous_catalog.to_rows().get("stages", ())
+                    if not full_history
+                    or (
+                        str(row.get("competition_id") or ""),
+                        int(row["source_season_id"])
+                        if row.get("source_season_id") is not None
+                        else -1,
+                    )
+                    in menu_absent_seasons
+                ]
                 stage_keys = {
                     (
                         row.get("competition_id"),
@@ -1646,6 +1679,31 @@ class WhoScoredIngestService:
                 },
                 classification_schedule_rows,
             )
+            if menu_absent_seasons:
+                # Parent inheritance rewrites ordinary reasons to
+                # ``parent:*``; restore the published eligibility and the
+                # explicit menu-absence reason for retained seasons.
+                retained_seasons: list[dict[str, Any]] = []
+                for source in resolved_rows["seasons"]:
+                    row = dict(source)
+                    retained = menu_absent_seasons.get(
+                        (
+                            str(row.get("competition_id") or ""),
+                            int(row["source_season_id"])
+                            if row.get("source_season_id") is not None
+                            else -1,
+                        )
+                    )
+                    if retained is not None:
+                        row.update(
+                            {
+                                "is_active": False,
+                                "eligibility": retained.get("eligibility"),
+                                "classification_reason": "source_menu_absent",
+                            }
+                        )
+                    retained_seasons.append(row)
+                resolved_rows = {**resolved_rows, "seasons": tuple(retained_seasons)}
             missing_activity_evidence = activity_expected - activity_evidence
             missing_stage_evidence = (
                 historical_stage_expected - historical_stage_evidence
