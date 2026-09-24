@@ -56,7 +56,18 @@
       "headers_file": null,
       "notes": "club page; match table has rows with 6 cells (no-result rows)",
       "sha256": "89d9cd7d44e346a28a54399f1a92c89eaa86ce4fae7f9bb7fab21103c19c35ba",
-      "file_bytes": 48980
+      "file_bytes": 48980,
+      "recapture": {
+        "url": "https://clubelo.com/riverplate",
+        "http_status": 200,
+        "captured_at": "2026-09-24T19:18:44Z",
+        "content_encoding_on_wire": "gzip",
+        "wire_bytes": 48980,
+        "wire_sha256": "89d9cd7d44e346a28a54399f1a92c89eaa86ce4fae7f9bb7fab21103c19c35ba",
+        "identity_bytes": 562174,
+        "headers_file": "club_riverplate.headers.txt",
+        "body_matches_fixture": true
+      }
     },
     "club_santos-fc_2.html.gz": {
       "url": "https://clubelo.com/santos-fc_2",
@@ -70,7 +81,19 @@
       "headers_file": null,
       "notes": "club page; duplicate match on 2026-09-02 in the match table",
       "sha256": "d5787745440f6e26ee6cec0b371f8caa5e71cf16d413d9a520b06535b6a5e8d4",
-      "file_bytes": 48937
+      "file_bytes": 48937,
+      "recapture": {
+        "url": "https://clubelo.com/santos-fc_2",
+        "http_status": 200,
+        "captured_at": "2026-09-24T19:18:48Z",
+        "content_encoding_on_wire": "gzip",
+        "wire_bytes": 49008,
+        "wire_sha256": "ba8ba5f1a221c733a07f955fb5d8310bc0b99a2830c341e4824809342a37b859",
+        "identity_bytes": 563626,
+        "headers_file": "club_santos-fc_2.headers.txt",
+        "body_matches_fixture": true,
+        "notes": "same decoded body, different gzip stream on the wire (49008 vs 48937 B)"
+      }
     },
     "club_lsapi-4199.html.gz": {
       "url": "https://clubelo.com/lsapi-4199",
@@ -84,7 +107,18 @@
       "headers_file": null,
       "notes": "club page; new club, 30 points in vegaJson (2026-01-21..2026-09-13)",
       "sha256": "41144144f2725c91d14150b0b2c440bc009658d0036b9510b64b89a379a9a4e1",
-      "file_bytes": 44442
+      "file_bytes": 44442,
+      "recapture": {
+        "url": "https://clubelo.com/lsapi-4199",
+        "http_status": 200,
+        "captured_at": "2026-09-24T19:18:53Z",
+        "content_encoding_on_wire": "gzip",
+        "wire_bytes": 44442,
+        "wire_sha256": "41144144f2725c91d14150b0b2c440bc009658d0036b9510b64b89a379a9a4e1",
+        "identity_bytes": 531934,
+        "headers_file": "club_lsapi-4199.headers.txt",
+        "body_matches_fixture": true
+      }
     },
     "club_Arsenal.html.gz": {
       "url": "http://clubelo.com/Arsenal/",
@@ -102,7 +136,18 @@
       "headers_file": "club_Arsenal.headers.txt",
       "notes": "saved decoded (identity 560222 B); wire br bytes were not measured; gzip -9 -n by us",
       "sha256": "1974d163f13ef97a89699d5811765a4642e99a86c29a9cb94b82cf23878f07fa",
-      "file_bytes": 48194
+      "file_bytes": 48194,
+      "recapture": {
+        "url": "https://clubelo.com/Arsenal",
+        "http_status": 200,
+        "captured_at": "2026-09-24T19:19:01Z",
+        "content_encoding_on_wire": "br",
+        "wire_bytes": 48579,
+        "wire_sha256": "5c971da6bcdf225085f568f7aee7d7f35fd93b5b090acdefc38197bc11b3a52a",
+        "identity_bytes": 560222,
+        "headers_file": "club_Arsenal.br.headers.txt",
+        "body_matches_fixture": true
+      }
     },
     "login.html.gz": {
       "url": "https://clubelo.com/login/",
@@ -116,7 +161,20 @@
       "headers_file": null,
       "notes": "contains 'registration is not available yet.'; gzip -9 -n by us",
       "sha256": "e5c05978bfaee4ed47494f383da233dfbecc0cb8532edb52bf00bbe38e18140e",
-      "file_bytes": 1463
+      "file_bytes": 1463,
+      "recapture": {
+        "url": "https://clubelo.com/login/",
+        "http_status": 200,
+        "captured_at": "2026-09-24T19:18:57Z",
+        "content_encoding_on_wire": "gzip",
+        "wire_bytes": 1458,
+        "wire_sha256": "1c7b9d52c8dee6660f0c8d64f0fe94172a2f9a7462046f9f672faeef5c9601df",
+        "identity_bytes": 4230,
+        "headers_file": "login.headers.txt",
+        "body_matches_fixture": false,
+        "identity_sha256": "89e534b4ffd45aeaa98ce51e26b4eac34c74f524dcfebd33d6f54a3c97701cf7",
+        "notes": "body differs from the fixture only by the csrfmiddlewaretoken value (line 58); fixture kept"
+      }
     },
     "Arsenal_Results.500.html": {
       "url": "https://clubelo.com/Arsenal/Results",
@@ -215,6 +273,76 @@
       "notes": "response headers as saved by curl -D; set-cookie lines (__cf_bm tokens) removed",
       "sha256": "2dfe61eb12af9e6d9557914207e2bd6e17c8852a0984a0fdcbe70943e53d99ce",
       "file_bytes": 794
+    },
+    "club_riverplate.headers.txt": {
+      "url": "https://clubelo.com/riverplate",
+      "http_status": 200,
+      "captured_at": "2026-09-24T19:18:44Z",
+      "captured_at_from": "date header",
+      "content_encoding_on_wire": "gzip",
+      "wire_bytes": null,
+      "identity_bytes": null,
+      "gzip_by": null,
+      "headers_file": "club_riverplate.headers.txt",
+      "notes": "headers of the live re-capture of club_riverplate (#1461, round 2); set-cookie lines removed",
+      "sha256": "eb2544c85a9158d00455d7cb498db07926617e35b74582a2217f9571de7f984b",
+      "file_bytes": 524
+    },
+    "club_santos-fc_2.headers.txt": {
+      "url": "https://clubelo.com/santos-fc_2",
+      "http_status": 200,
+      "captured_at": "2026-09-24T19:18:48Z",
+      "captured_at_from": "date header",
+      "content_encoding_on_wire": "gzip",
+      "wire_bytes": null,
+      "identity_bytes": null,
+      "gzip_by": null,
+      "headers_file": "club_santos-fc_2.headers.txt",
+      "notes": "headers of the live re-capture of club_santos-fc_2 (#1461, round 2); set-cookie lines removed",
+      "sha256": "9671d0ce5792de5d5605779939d59eefcabef8e06704281ae437f52b428abf72",
+      "file_bytes": 524
+    },
+    "club_lsapi-4199.headers.txt": {
+      "url": "https://clubelo.com/lsapi-4199",
+      "http_status": 200,
+      "captured_at": "2026-09-24T19:18:53Z",
+      "captured_at_from": "date header",
+      "content_encoding_on_wire": "gzip",
+      "wire_bytes": null,
+      "identity_bytes": null,
+      "gzip_by": null,
+      "headers_file": "club_lsapi-4199.headers.txt",
+      "notes": "headers of the live re-capture of club_lsapi-4199 (#1461, round 2); set-cookie lines removed",
+      "sha256": "a6fcda1fc0695300cfcc71ead89448a7c6c9b041c87ad2c798f18c472a20bf68",
+      "file_bytes": 524
+    },
+    "login.headers.txt": {
+      "url": "https://clubelo.com/login/",
+      "http_status": 200,
+      "captured_at": "2026-09-24T19:18:57Z",
+      "captured_at_from": "date header",
+      "content_encoding_on_wire": "gzip",
+      "wire_bytes": null,
+      "identity_bytes": null,
+      "gzip_by": null,
+      "headers_file": "login.headers.txt",
+      "notes": "headers of the live re-capture of login (#1461, round 2); set-cookie lines removed",
+      "sha256": "d5e53ce8fdf3f370d818d4b94b4ed25fe54c98176918e20e2fdaa2c682d528be",
+      "file_bytes": 537
+    },
+    "club_Arsenal.br.headers.txt": {
+      "url": "https://clubelo.com/Arsenal",
+      "http_status": 200,
+      "captured_at": "2026-09-24T19:19:01Z",
+      "captured_at_from": "date header",
+      "content_encoding_on_wire": "br",
+      "wire_bytes": null,
+      "identity_bytes": null,
+      "gzip_by": null,
+      "headers_file": "club_Arsenal.br.headers.txt",
+      "notes": "headers of the live re-capture of club_Arsenal (#1461, round 2); set-cookie lines removed",
+      "sha256": "b07b13a360831094139396cc92604ba97ce08e207e952cab587ec02ec9f5eb50",
+      "file_bytes": 522
     }
   }
 }

@@ -93,3 +93,24 @@ def test_header_only_responses_match_manifest(name):
 def test_headers_have_no_cookies():
     for path in FIXTURE_DIR.glob("*.headers.txt"):
         assert "set-cookie" not in path.read_text().lower(), path.name
+
+
+PAGE_FILES = [n for n in MANIFEST if n.endswith(".html.gz")]
+
+
+@pytest.mark.parametrize("name", PAGE_FILES)
+def test_every_page_has_headers_and_wire_bytes(name):
+    meta = MANIFEST[name]
+    recapture = meta.get("recapture") or {}
+    assert meta["headers_file"] or recapture.get("headers_file"), name
+    assert meta["wire_bytes"] or recapture.get("wire_bytes"), name
+
+
+@pytest.mark.parametrize("name", [n for n in PAGE_FILES if "recapture" in MANIFEST[n]])
+def test_recapture_headers_match_manifest(name):
+    recapture = MANIFEST[name]["recapture"]
+    lines = _text(recapture["headers_file"]).splitlines()
+    assert int(lines[0].split()[1]) == recapture["http_status"]
+    assert isinstance(recapture["body_matches_fixture"], bool)
+    if not recapture["body_matches_fixture"]:
+        assert len(recapture["identity_sha256"]) == 64
