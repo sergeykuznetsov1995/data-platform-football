@@ -74,8 +74,11 @@ ACCEPT_POLL=${ACCEPT_POLL:-20}
 METADB_TIMEOUT=${METADB_TIMEOUT:-30}
 FAIL_NIGHTS_MAX=${FAIL_NIGHTS_MAX:-3}
 CORE_DAGS_SQL=$(for d in $CORE_DAGS; do printf "'%s'," "$d"; done); CORE_DAGS_SQL=${CORE_DAGS_SQL%,}
-# Запас до конца окна: доставка + приёмка и столько же на откат с его приёмкой.
-NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + ACCEPT_WAIT) ))
+# Запас до конца окна: доставка и откат — каждый с потолком deploy.sh, его `timeout -k 30`
+# и приёмкой (плюс один опрос сверх её дедлайна), и общий резерв на снимок, возврат
+# пауз/пулов, сбор логов и запросы к метабазе с их таймаутами.
+BUDGET_RESERVE=${BUDGET_RESERVE:-600}
+NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + 30 + ACCEPT_WAIT + ACCEPT_POLL) + BUDGET_RESERVE ))
 
 log(){
   if [ -L "$LOG" ] || { [ -e "$LOG" ] && [ ! -f "$LOG" ]; }; then

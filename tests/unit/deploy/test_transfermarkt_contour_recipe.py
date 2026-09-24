@@ -221,7 +221,10 @@ def test_auto_deliver_window_and_contract() -> None:
     tail = text[text.index('log "deploy.sh вернул $rc"'):]
     assert tail.index("restore_state || restored=0") < tail.index('seen=$(acceptance_seen "$NEW"')
     # Запас окна (доставка + откат) пересчитывается после заморозки, перед снимком.
-    assert "NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + ACCEPT_WAIT) ))" in text
+    assert "NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + 30 + ACCEPT_WAIT + ACCEPT_POLL) + BUDGET_RESERVE ))" in text
+    # Бюджет по умолчанию (доставка + откат + резерв) влезает в окно 01:00–03:00.
+    need = 2 * (1800 + 30 + 480 + 20) + 600
+    assert need < 7200 - 300, need
     assert text.index('freeze_release.sh" "$WANT"') < text.rindex('-lt "$NEED_BUDGET"') < text.index("Шаг 8")
     # Приёмка требует живого SchedulerJob.
     assert "[ \"$got\" = healthy ] || { echo 0; return; }" in text
