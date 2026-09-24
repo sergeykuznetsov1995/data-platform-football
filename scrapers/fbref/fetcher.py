@@ -1139,6 +1139,7 @@ class FBrefFetcher:
                 and getattr(self, "_lease_client", None) is not None
             ):
                 provider_stats = None
+                drain_error = None
                 try:
                     provider_stats = self._wait_and_observe_provider()
                 except Exception as exc:
@@ -1175,23 +1176,7 @@ class FBrefFetcher:
                         hard_policy = (
                             hard_policy or "browser_provider_drain_failed"
                         )
-                    # This verdict ends the wave and the exception is the only
-                    # evidence of why the paid lease would not drain.  Swallowed
-                    # silently it reads exactly like a policy breach: the geo-IP
-                    # path cost a day of blind red runs for the same reason,
-                    # until c343f5e2 put its type in the log (#1188).
-                    # The branch taken above decides whether the wave lives, so
-                    # the line names it too (#1452; FetchError text unchanged).
-                    logger.warning(
-                        "FBref paid lease drain failed before the wave "
-                        "verdict: %s: %s; %s",
-                        type(exc).__name__,
-                        exc,
-                        "exit never answered and its lease is unspent"
-                        " -- re-solving"
-                        if drain_relief is not None
-                        else f"verdict {hard_policy}",
-                    )
+                    drain_error = exc
                 if (
                     (
                         self._provider_bootstrap_max_bytes > 0
@@ -1209,6 +1194,26 @@ class FBrefFetcher:
                     )
                 ):
                     hard_policy = hard_policy or "browser_provider_cap_exhausted"
+                if drain_error is not None:
+                    # This verdict ends the wave and the exception is the only
+                    # evidence of why the paid lease would not drain.  Swallowed
+                    # silently it reads exactly like a policy breach: the geo-IP
+                    # path cost a day of blind red runs for the same reason,
+                    # until c343f5e2 put its type in the log (#1188).
+                    # Logged after the cap check so the line names the verdict
+                    # the wave actually gets: the exemption above can still be
+                    # overruled by an exhausted provider cap (#1452; FetchError
+                    # text unchanged).
+                    logger.warning(
+                        "FBref paid lease drain failed before the wave "
+                        "verdict: %s: %s; %s",
+                        type(drain_error).__name__,
+                        drain_error,
+                        "exit never answered and its lease is unspent"
+                        " -- re-solving"
+                        if hard_policy is None
+                        else f"verdict {hard_policy}",
+                    )
             breakdown = (
                 self._full_browser_reservation_breakdown()
                 if finalize_error is not None

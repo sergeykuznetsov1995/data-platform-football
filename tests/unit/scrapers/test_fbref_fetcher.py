@@ -940,6 +940,31 @@ def test_traffic_of_earlier_exits_in_the_same_transport_does_not_block_the_exemp
     assert "its lease is unspent -- re-solving" in caplog.text
 
 
+def test_drain_log_names_the_cap_verdict_that_overrules_the_exemption(caplog):
+    """The drain line is logged after the cap check, so it names the real verdict.
+
+    The unreachable-exit exemption can still be overruled below it: when the
+    earlier Cloudflare-rejected leases have eaten the browser-phase cap, the
+    wave ends with ``browser_provider_cap_exhausted``.  A line that had already
+    promised "re-solving" would send the operator looking for a re-solve that
+    never happened (#1452, code review of PR #1454).
+    """
+
+    fetcher = _fetcher_with_dead_exit_and_failing_drain(
+        real_bytes_downloaded=3_100_000,
+    )
+    fetcher._provider_bootstrap_max_bytes = 4096
+    fetcher._provider_bootstrap_spent_bytes = 4096
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "browser_provider_cap_exhausted" in str(raised.value)
+    assert "verdict browser_provider_cap_exhausted" in caplog.text
+    assert "re-solving" not in caplog.text
+
+
 def test_an_observed_lease_balance_also_blocks_the_exemption(caplog):
     """Bytes the provider attributed to *this lease* are spend: still hard.
 
