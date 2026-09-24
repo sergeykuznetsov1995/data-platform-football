@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import hashlib
 import importlib.util
 import re
 import sys
@@ -100,7 +101,30 @@ def _full_cache(tmp_path):
     for i in range(88):
         d = day + dt.timedelta(days=i) if i < 87 else dt.date(2026, 8, 31)
         (tmp_path / f'{d.isoformat()}.csv').write_text(CSV)
+    sums = [
+        f'{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.name}'
+        for f in sorted(tmp_path.glob('*.csv'))
+    ]
+    (tmp_path / 'SHA256SUMS').write_text('\n'.join(sums) + '\n')
     return tmp_path
+
+
+def test_check_snapshot_files_pins_every_file_by_sha256(tmp_path):
+    mod = _load_module()
+    cache = _full_cache(tmp_path)
+    files = sorted(cache.glob('*.csv'))
+    assert mod.check_snapshot_files(files, cache) is None
+    # An inner date swapped for another name, same count and range -> rejected.
+    victim = files[40]
+    victim.rename(cache / '2025-12-31.csv')
+    err = mod.check_snapshot_files(sorted(cache.glob('*.csv')), cache)
+    assert err and err.startswith('SHA256SUMS mismatch')
+    (cache / '2025-12-31.csv').rename(victim)
+    # Same name, altered bytes -> rejected.
+    victim.write_text(CSV + '2,X,ENG,1,1500.0,2025-01-01,2025-01-02\n')
+    assert mod.check_snapshot_files(files, cache).startswith('SHA256SUMS mismatch')
+    (cache / 'SHA256SUMS').unlink()
+    assert mod.check_snapshot_files(files, cache) == 'SHA256SUMS missing'
 
 
 def test_load_csv_dry_run_does_not_connect(tmp_path, capsys, monkeypatch):
@@ -181,13 +205,14 @@ class _VerifyCur:
         return [(self.copy_count if is_copy else 10, INGESTED)]
 
 
-GOOD_SNAPSHOT = (54010, 88, '2025-07-13', '2026-08-31', 694, 613.8)
+GOOD_SNAPSHOT = (54010, 88, '2025-07-13', '2026-08-31', 694, 583, 613.8)
 
 
 @pytest.mark.parametrize('copy_count, snapshot, rc', [
     (10, GOOD_SNAPSHOT, 0),
     (9, GOOD_SNAPSHOT, 1),                                              # copy differs
-    (10, (1000, 2, '2025-07-13', '2025-07-20', 600, 500.0), 1),         # incomplete
+    (10, (1000, 2, '2025-07-13', '2025-07-20', 600, 500, 500.0), 1),    # incomplete
+    (10, (88, 88, '2025-07-13', '2026-08-31', 1, 1, 1.0), 1),           # 1 club per date
 ])
 def test_verify_exit_code(monkeypatch, capsys, copy_count, snapshot, rc):
     mod = _load_module()

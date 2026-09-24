@@ -18,13 +18,17 @@ statements are CTAS into the *_archive_20260924 copies and row inserts into
 clubelo_api_snapshot_archive.
 
 Usage (from the host, Trino published on 127.0.0.1:8082):
-    TRINO_HOST=127.0.0.1 TRINO_PORT=8082 TRINO_USER=airflow TRINO_PASSWORD=... \\
-        python scripts/clubelo_freeze_archive.py copy --dry-run
-    ... copy | load-csv --dir /root/clubelo-archive/soccerdata-cache-20260924 | verify
+    export TRINO_HOST=127.0.0.1 TRINO_PORT=8082 TRINO_USER=airflow TRINO_PASSWORD=...
+    python scripts/clubelo_freeze_archive.py copy --dry-run
+    python scripts/clubelo_freeze_archive.py copy
+    python scripts/clubelo_freeze_archive.py load-csv \\
+        --dir /root/clubelo-archive/soccerdata-cache-20260924
+    python scripts/clubelo_freeze_archive.py verify
 """
 
 import argparse
 import datetime as dt
+import hashlib
 import os
 import sys
 import warnings
@@ -48,6 +52,8 @@ CSV_COLUMNS = ['Rank', 'Club', 'Country', 'Level', 'Elo', 'From', 'To']
 EXPECTED_DATES = 88
 FIRST_DATE = '2025-07-13'
 LAST_DATE = '2026-08-31'
+EXPECTED_ROWS = 54010         # sum of the 88 CSVs, pinned by SHA256SUMS
+MIN_ROWS_PER_DATE = 500       # measured 583..630 clubs per date
 NULL_MARKERS = ('', 'None')  # the API wrote the literal "None" for unranked clubs
 
 SNAPSHOT_DDL = f'''CREATE TABLE IF NOT EXISTS {SNAPSHOT_TABLE} (
@@ -161,12 +167,28 @@ def parse_csv_file(path, ingested_at):
     return rows
 
 
-def check_snapshot_files(files):
-    """Error text if the file set is not the frozen 88-date cache, else None."""
+def check_snapshot_files(files, directory):
+    """Error text if the file set is not the frozen 88-date cache, else None.
+
+    Besides count and range, every file must match the ``SHA256SUMS`` written
+    when the cache was copied off the container (same name set, same bytes).
+    """
     stems = sorted(f.stem for f in files)
     if len(stems) != EXPECTED_DATES or stems[0] != FIRST_DATE or stems[-1] != LAST_DATE:
         got = f'{len(stems)} files {stems[0]}..{stems[-1]}' if stems else '0 files'
         return f'expected {EXPECTED_DATES} files {FIRST_DATE}..{LAST_DATE}, got {got}'
+    sums_path = Path(directory) / 'SHA256SUMS'
+    if not sums_path.is_file():
+        return 'SHA256SUMS missing'
+    expected = {}
+    for line in sums_path.read_text().splitlines():
+        digest, name = line.split(maxsplit=1)
+        expected[name.lstrip('*')] = digest
+    actual = {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in files}
+    if actual != expected:
+        bad = sorted(set(actual) ^ set(expected)) + sorted(
+            n for n in set(actual) & set(expected) if actual[n] != expected[n])
+        return f'SHA256SUMS mismatch: {bad[:5]}'
     return None
 
 
@@ -230,7 +252,7 @@ def load_csv(cur, rows, n_files):
 def cmd_load_csv(args):
     ingested_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     files, rows = parse_csv_dir(args.dir, ingested_at)
-    error = check_snapshot_files(files)
+    error = check_snapshot_files(files, args.dir)
     if error:
         print(f'ERROR: {args.dir}: {error}', file=sys.stderr)
         return 1
@@ -254,15 +276,20 @@ def cmd_verify(args):
         print(f'| {t} | {src[0]} | {src[1]} | {cp[0]} | {cp[1]} |')
         if src != cp:
             problems.append(f'{t}: copy differs from source')
-    count, dates, dmin, dmax, clubs, avg_per_date = _q(cur, f'''
-        SELECT count(*), count(DISTINCT rating_date), min(rating_date), max(rating_date),
-               count(DISTINCT club), round(count(*) * 1.0 / count(DISTINCT rating_date), 1)
-        FROM {SNAPSHOT_TABLE}''')[0]
+    count, dates, dmin, dmax, clubs, min_per_date, avg_per_date = _q(cur, f'''
+        SELECT sum(n), count(*), min(rating_date), max(rating_date),
+               (SELECT count(DISTINCT club) FROM {SNAPSHOT_TABLE}),
+               min(n), round(avg(n), 1)
+        FROM (SELECT rating_date, count(*) AS n FROM {SNAPSHOT_TABLE} GROUP BY rating_date)''')[0]
     print(f'\n{SNAPSHOT_TABLE}: rows={count} dates={dates} ({dmin}..{dmax}) '
-          f'distinct_clubs={clubs} avg_rows_per_date={avg_per_date}')
+          f'distinct_clubs={clubs} min_rows_per_date={min_per_date} '
+          f'avg_rows_per_date={avg_per_date}')
     if (dates, dmin, dmax) != (EXPECTED_DATES, FIRST_DATE, LAST_DATE):
         problems.append(f'snapshot archive: {dates} dates {dmin}..{dmax}, expected '
                         f'{EXPECTED_DATES} {FIRST_DATE}..{LAST_DATE}')
+    if count != EXPECTED_ROWS or (min_per_date or 0) < MIN_ROWS_PER_DATE:
+        problems.append(f'snapshot archive: {count} rows (expected {EXPECTED_ROWS}), '
+                        f'min {min_per_date} rows per date (expected >= {MIN_ROWS_PER_DATE})')
     for p in problems:
         print(f'ERROR: {p}', file=sys.stderr)
     return 1 if problems else 0
