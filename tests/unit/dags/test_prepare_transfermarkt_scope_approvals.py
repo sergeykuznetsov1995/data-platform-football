@@ -153,6 +153,10 @@ def test_paid_and_write_packets_share_the_childs_own_argv(tmp_path):
     assert paid.argv[1] == module.CHILD_SCRIPT
     # The approval flags must never appear: they reference the packets themselves.
     assert not [item for item in paid.argv if "approval-packet" in item]
+    # #1387: no parent byte budget; request/retry parent limits stay.
+    assert "--parent-byte-budget" not in paid.argv
+    assert "--parent-soft-byte-stop" not in paid.argv
+    assert "--parent-request-limit" in paid.argv
     assert paid.packet_hash != write.packet_hash
 
 

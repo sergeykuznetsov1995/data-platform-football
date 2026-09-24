@@ -17,8 +17,8 @@ from scrapers.transfermarkt.models import (
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     MAX_ROSTER_WINDOW,
     MAX_SCOPE_BATCH,
-    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
-    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
+    BACKFILL_BATCH_SOFT_BYTE_STOP,
+    PARENT_DAILY_PLANNING_BYTES,
     PARENT_REQUEST_LIMIT,
     PARENT_RETRY_LIMIT,
     SCOPE_HARD_PROVIDER_BYTE_CAP,
@@ -198,8 +198,8 @@ def _environment_for_scope(
         "TM_PROXY_RETRY_LIMIT": str(SCOPE_RETRY_LIMIT),
         # These are batch-local in this DAG. There is intentionally no UTC-day
         # or campaign application cap on historical work.
-        "TM_PARENT_BYTE_BUDGET": str(PARENT_DAILY_HARD_PROVIDER_BYTE_CAP),
-        "TM_PARENT_SOFT_BYTE_STOP": str(PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP),
+        "TM_PARENT_BYTE_BUDGET": str(PARENT_DAILY_PLANNING_BYTES),
+        "TM_PARENT_SOFT_BYTE_STOP": str(BACKFILL_BATCH_SOFT_BYTE_STOP),
         "TM_PARENT_REQUEST_LIMIT": str(PARENT_REQUEST_LIMIT),
         "TM_PARENT_RETRY_LIMIT": str(PARENT_RETRY_LIMIT),
         "TM_BACKFILL_CAMPAIGN_ID": str(payload["resume_cycle_id"]),

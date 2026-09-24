@@ -113,6 +113,9 @@ def test_mapped_environment_carries_frozen_campaign_not_proxy_secrets(module):
     assert json.loads(environment["TM_SCOPE_PAYLOAD_JSON"]) == payload
     assert "TM_PROXY_CONTROL_TOKEN" not in environment
     assert "TM_BACKFILL_PROXY_CONTROL_TOKEN" not in environment
+    # #1387: history keeps its batch-local byte envelope byte for byte.
+    assert environment["TM_PARENT_BYTE_BUDGET"] == "352321536"
+    assert environment["TM_PARENT_SOFT_BYTE_STOP"] == "335544320"
 
 
 def test_daily_task_has_strictly_higher_airflow_priority(module):

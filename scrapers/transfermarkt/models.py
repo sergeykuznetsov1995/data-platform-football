@@ -51,23 +51,27 @@ Sized at 1.2x the measured upper estimate of a cold big-league scope
 SCOPE_SOFT_PROVIDER_BYTE_STOP = 23_068_672
 """Graceful per-scope stop (22 MiB): no new paid request starts past it."""
 
-PARENT_DAILY_HARD_PROVIDER_BYTE_CAP = 352_321_536
-"""Hard provider-metered cap for one parent (daily) cycle (336 MiB).
+PARENT_DAILY_HARD_PROVIDER_BYTE_CAP: Optional[int] = None
+"""Parent (daily) hard provider-byte cap: none since #1387.
 
-The external proxy-filter allowance is 400 MB/day (~381.5 MiB); this keeps a
-~12% reserve under it.  Raising the external allowance further means editing
-this pair AND ``EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT`` (the import-time canon
-assert bounds the pair by it), plus the proxy-filter's own per-DagRun cap in
-the deployment.  Evidence already committed under an older, smaller pair
-stays valid: readiness reads the persisted ledger caps as a ceiling, not as
-an equality.
+The owner removed every daily traffic ceiling (grill 23.09).  ``None`` means
+the parent cycle is not byte-bounded; the per-scope cap below still is.
+Ledger rows written before #1387 keep their numeric parent caps.
 """
 
-PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP = 335_544_320
-"""Graceful parent-cycle stop (320 MiB) before the daily hard cap."""
+PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP: Optional[int] = None
+"""Parent (daily) graceful stop: none since #1387 (see above)."""
 
-EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT = 400_000_000
-"""Documented external proxy-filter allowance (400 MB/day)."""
+PARENT_DAILY_PLANNING_BYTES = 352_321_536
+"""Planning estimate of one day's paid traffic (336 MiB) for the freshness
+horizon.  NOT a cap and enforced nowhere since #1387."""
+
+BACKFILL_BATCH_SOFT_BYTE_STOP = 335_544_320
+"""Batch-local graceful stop of one historical backfill batch (320 MiB).
+
+History keeps its former batch envelope byte for byte: hard is
+``PARENT_DAILY_PLANNING_BYTES``, soft is this value.  Not a UTC-day cap.
+"""
 
 SCOPE_REQUEST_LIMIT = 1_610
 """Attempt ceiling for one scope cycle (150 + 650 + 650 + 160)."""
@@ -186,14 +190,34 @@ def _assert_budget_canon() -> None:
         0
         < SCOPE_SOFT_PROVIDER_BYTE_STOP
         < SCOPE_HARD_PROVIDER_BYTE_CAP
-        <= PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
-        < PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
-        <= EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT
+        <= PARENT_DAILY_PLANNING_BYTES
     ):
         raise AssertionError(
             'Transfermarkt provider byte budgets must satisfy '
-            'scope soft < scope hard <= parent soft < parent hard '
-            '<= external daily limit'
+            'scope soft < scope hard <= daily planning estimate'
+        )
+    if (PARENT_DAILY_HARD_PROVIDER_BYTE_CAP is None) != (
+        PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP is None
+    ) or (
+        PARENT_DAILY_HARD_PROVIDER_BYTE_CAP is not None
+        and not (
+            SCOPE_HARD_PROVIDER_BYTE_CAP
+            <= PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
+            < PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+        )
+    ):
+        raise AssertionError(
+            'a parent byte cap, when set, needs both values and must satisfy '
+            'scope hard <= parent soft < parent hard'
+        )
+    if not (
+        SCOPE_HARD_PROVIDER_BYTE_CAP
+        <= BACKFILL_BATCH_SOFT_BYTE_STOP
+        < PARENT_DAILY_PLANNING_BYTES
+    ):
+        raise AssertionError(
+            'backfill batch soft stop must fit between scope hard and the '
+            'batch hard cap'
         )
     for entity, budget in PRODUCTION_ENTITY_BUDGETS.items():
         if not 0 < int(budget['provider_reserve_bytes']) < SCOPE_HARD_PROVIDER_BYTE_CAP:

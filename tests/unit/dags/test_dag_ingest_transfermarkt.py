@@ -142,8 +142,9 @@ class TestDagShape:
         assert '--career-window-limit "$TM_MV_TRANSFERS_LIMIT"' in command
         assert '--cycle-budget-bytes "$TM_PROVIDER_HARD_CAP_BYTES"' in command
         assert '--soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES"' in command
-        assert '--parent-byte-budget "$TM_PARENT_BYTE_BUDGET"' in command
-        assert '--parent-soft-byte-stop "$TM_PARENT_SOFT_BYTE_STOP"' in command
+        # #1387: no parent byte budget reaches the children.
+        assert '--parent-byte-budget' not in command
+        assert '--parent-soft-byte-stop' not in command
         assert '--parent-request-limit "$TM_PARENT_REQUEST_LIMIT"' in command
         assert '--parent-retry-limit "$TM_PARENT_RETRY_LIMIT"' in command
         assert '--checkpoint-ttl-days "$TM_CHECKPOINT_TTL_DAYS"' in command
@@ -187,8 +188,8 @@ class TestDagShape:
         assert params['proxy_lease_ttl_seconds']._kw['maximum'] == 3600
         assert dag_module.PROVIDER_HARD_CAP_BYTES == 24 * 1024 * 1024
         assert dag_module.PROVIDER_SOFT_STOP_BYTES == 22 * 1024 * 1024
-        assert dag_module.PARENT_BYTE_BUDGET == 336 * 1024 * 1024
-        assert dag_module.PARENT_SOFT_BYTE_STOP == 320 * 1024 * 1024
+        assert dag_module.PARENT_BYTE_BUDGET is None
+        assert dag_module.PARENT_SOFT_BYTE_STOP is None
         assert dag_module.PARENT_REQUEST_LIMIT == 8 * 1610
         assert dag_module.PARENT_RETRY_LIMIT == 8 * 800
         assert dag_module.PROXY_CONCURRENCY == 1
@@ -297,8 +298,8 @@ class TestPlanningGate:
         assert json.loads(env['TM_SCOPE_PAYLOAD_JSON'])['scope_id'] == 'GB1__2025'
         assert env['TM_READER_REVISION'] == '7'
         assert env['TM_PROVIDER_HARD_CAP_BYTES'] == str(24 * 1024 * 1024)
-        assert env['TM_PARENT_BYTE_BUDGET'] == str(336 * 1024 * 1024)
-        assert env['TM_PARENT_SOFT_BYTE_STOP'] == str(320 * 1024 * 1024)
+        # #1387: the children get no parent byte budget.
+        assert not [key for key in env if key.startswith('TM_PARENT_') and 'BYTE' in key]
         assert env['TM_PARENT_REQUEST_LIMIT'] == str(8 * 1610)
         assert env['TM_PARENT_RETRY_LIMIT'] == str(8 * 800)
         assert env['TM_REFRESH_MODE'] == 'current'

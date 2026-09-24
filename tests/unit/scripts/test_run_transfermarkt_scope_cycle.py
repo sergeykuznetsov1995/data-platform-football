@@ -715,8 +715,27 @@ def test_scope_manifest_sql_is_exact_idempotent_complete_merge(tmp_path):
     assert 't.parent_cycle_id = s.parent_cycle_id' in proxy_sql
     assert 't.entity = s.entity' in proxy_sql
     assert proxy_sql.count("'scheduled__2026-07-11'") == 7
-    assert str(cycle.PARENT_BYTE_BUDGET) in proxy_sql
-    assert str(cycle.PARENT_SOFT_BYTE_STOP) in proxy_sql
+    # #1387: production has no parent byte cap; the row states NULL caps.
+    assert cycle.PARENT_BYTE_BUDGET is None
+    assert ledger['hard_provider_byte_budget'] is None
+    assert ledger['soft_provider_byte_stop'] is None
+    assert proxy_sql.count('CAST(NULL AS bigint)') == 14
+
+    # A batch-local pair (backfill) is written as numbers, unchanged.
+    capped = dict(
+        ledger,
+        hard_provider_byte_budget=352_321_536,
+        soft_provider_byte_stop=335_544_320,
+    )
+    capped_sql = cycle.proxy_ledger_merge_sql(capped)
+    assert 'CAST(NULL AS bigint)' not in capped_sql
+    assert capped_sql.count('352321536, 335544320)') == 7
+    for broken in (
+        {'hard_provider_byte_budget': 352_321_536, 'soft_provider_byte_stop': None},
+        {'hard_provider_byte_budget': 100, 'soft_provider_byte_stop': 200},
+    ):
+        with pytest.raises(cycle.ScopeCycleError, match='both unset'):
+            cycle.proxy_ledger_merge_sql(dict(ledger, **broken))
 
 
 def test_a_calendar_league_edition_is_read_as_the_season_it_is_labelled(tmp_path):
@@ -1413,10 +1432,11 @@ def test_standing_cycle_retry_limit_still_stops_before_paid_io(
          'scope request/retry limits must equal'),
         ('--retry-limit', cycle.SCOPE_RETRY_LIMIT + 1,
          'scope request/retry limits must equal'),
-        ('--parent-byte-budget', cycle.PARENT_BYTE_BUDGET - 1,
-         'parent byte budget must equal'),
-        ('--parent-soft-byte-stop', cycle.PARENT_SOFT_BYTE_STOP + 1,
-         'parent soft byte stop must equal'),
+        # #1387: parent byte caps are optional, but only as a coherent pair.
+        ('--parent-byte-budget', 352_321_536,
+         'parent byte caps must be both unset'),
+        ('--parent-soft-byte-stop', 335_544_320,
+         'parent byte caps must be both unset'),
         ('--parent-request-limit', cycle.PARENT_REQUEST_LIMIT + 1,
          'parent request/retry limits must equal'),
         ('--parent-retry-limit', cycle.PARENT_RETRY_LIMIT - 1,
@@ -1470,33 +1490,89 @@ def _daily_scope_fixture(tmp_path: Path, index: int, provider_bytes: int):
     return identity, manifest
 
 
-def _update_daily_ledger(identity, manifest):
+# #1387: production has no parent byte cap; the backfill batch keeps its
+# batch-local pair, which these admission tests exercise.
+BATCH_HARD = 352_321_536
+BATCH_SOFT = 335_544_320
+
+
+def _update_daily_ledger(identity, manifest, *, hard=BATCH_HARD, soft=BATCH_SOFT):
     return cycle._update_parent_ledger(
         identity,
         manifest,
-        hard_cap=cycle.PARENT_BYTE_BUDGET,
-        soft_stop=cycle.PARENT_SOFT_BYTE_STOP,
+        hard_cap=hard,
+        soft_stop=soft,
         request_limit=cycle.PARENT_REQUEST_LIMIT,
         retry_limit=cycle.PARENT_RETRY_LIMIT,
     )
+
+
+def _batch_capped(args):
+    args.parent_byte_budget = BATCH_HARD
+    args.parent_soft_byte_stop = BATCH_SOFT
+    return args
+
+
+def test_uncapped_parent_ledger_accumulates_past_the_old_daily_cap(tmp_path):
+    per_scope = 21 * cycle.MIB
+    payload = None
+    for index in range(20):
+        identity, manifest = _daily_scope_fixture(tmp_path, index, per_scope)
+        payload = _update_daily_ledger(identity, manifest, hard=None, soft=None)
+
+    assert payload['manifest_count'] == 20
+    assert payload['provider_metered_bytes'] == 20 * per_scope > BATCH_HARD
+    assert payload['hard_provider_byte_budget'] is None
+    assert payload['soft_provider_byte_stop'] is None
+    # A capped reader of the same file sees a budget mismatch, never a pass.
+    with pytest.raises(cycle.ScopeCycleError, match='identity/budget mismatch'):
+        cycle._parent_committed_totals(
+            identity,
+            hard_cap=BATCH_HARD,
+            soft_stop=BATCH_SOFT,
+            request_limit=cycle.PARENT_REQUEST_LIMIT,
+            retry_limit=cycle.PARENT_RETRY_LIMIT,
+        )
+
+
+def test_production_admission_has_no_daily_byte_gate(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    assert args.parent_byte_budget is None
+    _write_sibling_scope_ledger(
+        payload, 'e' * 24, run_key='other-child-e',
+        consumed=10 * 1024 * cycle.MIB,
+    )
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=itertools.count(start=0, step=1_000_000).__next__,
+    )
+
+    assert manifest['status'] == 'complete'
 
 
 def test_parent_daily_ledger_admits_sixteen_full_scopes_and_stops_the_next_byte(
     tmp_path,
 ):
     # A cold big-league scope costs ~18-21 MiB; sixteen of them at 21 MiB land
-    # exactly on the 336 MiB daily budget and every one must be admitted.
+    # exactly on the 336 MiB batch budget and every one must be admitted.
     per_scope = 21 * cycle.MIB
-    assert 16 * per_scope == cycle.PARENT_BYTE_BUDGET
+    assert 16 * per_scope == BATCH_HARD
     payload = None
     for index in range(16):
         identity, manifest = _daily_scope_fixture(tmp_path, index, per_scope)
         payload = _update_daily_ledger(identity, manifest)
 
     assert payload['manifest_count'] == 16
-    assert payload['provider_metered_bytes'] == cycle.PARENT_BYTE_BUDGET
-    assert payload['hard_provider_byte_budget'] == cycle.PARENT_BYTE_BUDGET
-    assert payload['soft_provider_byte_stop'] == cycle.PARENT_SOFT_BYTE_STOP
+    assert payload['provider_metered_bytes'] == BATCH_HARD
+    assert payload['hard_provider_byte_budget'] == BATCH_HARD
+    assert payload['soft_provider_byte_stop'] == BATCH_SOFT
 
     # One more byte anywhere in the day pierces the parent budget.
     identity, manifest = _daily_scope_fixture(tmp_path, 16, 1)
@@ -1565,7 +1641,7 @@ def _write_sibling_scope_ledger(
 def test_daily_admission_accepts_the_last_scope_the_day_can_hold(tmp_path):
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
-    args = _parse_args(argv)
+    args = _batch_capped(_parse_args(argv))
     for index in range(13):
         _write_sibling_scope_ledger(
             payload, f'{index:024x}', run_key=f'other-child-{index}',
@@ -1588,7 +1664,7 @@ def test_daily_admission_accepts_the_last_scope_the_day_can_hold(tmp_path):
 def test_daily_admission_refuses_one_byte_past_the_last_full_slot(tmp_path):
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
-    args = _parse_args(argv)
+    args = _batch_capped(_parse_args(argv))
     _write_sibling_scope_ledger(
         payload, 'a' * 24, run_key='other-child-a',
         consumed=312 * cycle.MIB + 1,
@@ -1611,7 +1687,7 @@ def test_daily_admission_counts_a_failed_scope_without_a_manifest(tmp_path):
     # parent-ledger entry) — its bytes still count against the day.
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
-    args = _parse_args(argv)
+    args = _batch_capped(_parse_args(argv))
     _write_sibling_scope_ledger(
         payload, 'b' * 24, run_key='crashed-child',
         consumed=280 * cycle.MIB, reserved=32 * cycle.MIB + 1,
@@ -1634,7 +1710,7 @@ def test_daily_admission_ignores_this_scopes_own_resumed_ledger(tmp_path):
     # ledger; the gate adds a full scope cap for it instead of double-counting.
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
-    args = _parse_args(argv)
+    args = _batch_capped(_parse_args(argv))
     _write_sibling_scope_ledger(
         payload, 'c' * 24, run_key=payload['child_cycle_id'],
         consumed=61 * cycle.MIB,
@@ -1809,7 +1885,7 @@ def test_sibling_scope_ledger_contract_is_pinned(tmp_path):
 def test_unreadable_sibling_scope_ledger_refuses_paid_io(tmp_path, body):
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
-    args = _parse_args(argv)
+    args = _batch_capped(_parse_args(argv))
     ledger_dir = Path(payload['parent_ledger']['path']).parent
     ledger_dir.mkdir(parents=True, exist_ok=True)
     (ledger_dir / 'transfermarkt_cycle_broken.json').write_text(

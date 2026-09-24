@@ -56,7 +56,8 @@ PROVIDER_HARD_CAP_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
 PROVIDER_SOFT_STOP_BYTES = SCOPE_SOFT_PROVIDER_BYTE_STOP
 PROXY_REQUEST_LIMIT = SCOPE_REQUEST_LIMIT
 PROXY_RETRY_LIMIT = SCOPE_RETRY_LIMIT
-# Parent (daily) aggregate caps across all mapped scopes of one run.
+# Parent (daily) aggregate byte caps across all mapped scopes of one run:
+# ``None`` since #1387 (no daily byte ceiling); the children get no flag.
 PARENT_BYTE_BUDGET = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
 PARENT_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 PROXY_CONCURRENCY = 1
@@ -442,8 +443,6 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
             'TM_PROVIDER_SOFT_STOP_BYTES': str(PROVIDER_SOFT_STOP_BYTES),
             'TM_PROXY_REQUEST_LIMIT': str(int(params['proxy_request_limit'])),
             'TM_PROXY_RETRY_LIMIT': str(int(params['proxy_retry_limit'])),
-            'TM_PARENT_BYTE_BUDGET': str(PARENT_BYTE_BUDGET),
-            'TM_PARENT_SOFT_BYTE_STOP': str(PARENT_SOFT_BYTE_STOP),
             'TM_PARENT_REQUEST_LIMIT': str(PARENT_REQUEST_LIMIT),
             'TM_PARENT_RETRY_LIMIT': str(PARENT_RETRY_LIMIT),
             'TM_PENDING_CHECKPOINT_DIR': PENDING_CHECKPOINT_DIR,
@@ -712,7 +711,10 @@ def _build_scope_set(
     if len(ledger_paths) != 1:
         raise AirflowException('mapped scopes do not share one parent proxy ledger')
     traffic = aggregate_traffic(manifests)
-    if traffic['provider_metered_bytes'] > PARENT_BYTE_BUDGET:
+    if (
+        PARENT_BYTE_BUDGET is not None
+        and traffic['provider_metered_bytes'] > PARENT_BYTE_BUDGET
+    ):
         raise AirflowException(
             'parent daily provider byte budget exceeded: '
             f"{traffic['provider_metered_bytes']}/{PARENT_BYTE_BUDGET}"
@@ -722,10 +724,18 @@ def _build_scope_set(
         'provider_metered_bytes': traffic['provider_metered_bytes'],
         'requests': traffic['requests'],
         'retries': traffic['retries'],
+    }
+    required_caps = {
         'hard_provider_byte_budget': PARENT_BYTE_BUDGET,
         'soft_provider_byte_stop': PARENT_SOFT_BYTE_STOP,
     }
-    if any(int(ledger.get(key, -1)) != value for key, value in required_ledger.items()):
+    if any(
+        int(ledger.get(key, -1)) != value for key, value in required_ledger.items()
+    ) or any(
+        key not in ledger
+        or (None if ledger[key] is None else int(ledger[key])) != value
+        for key, value in required_caps.items()
+    ):
         raise AirflowException('parent proxy ledger disagrees with scope manifests')
 
     current_manifests = tuple(manifests)
@@ -1177,8 +1187,6 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
   --soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES" \
   --request-limit "$TM_PROXY_REQUEST_LIMIT" \
   --retry-limit "$TM_PROXY_RETRY_LIMIT" \
-  --parent-byte-budget "$TM_PARENT_BYTE_BUDGET" \
-  --parent-soft-byte-stop "$TM_PARENT_SOFT_BYTE_STOP" \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
   --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"''',
         append_env=True,
