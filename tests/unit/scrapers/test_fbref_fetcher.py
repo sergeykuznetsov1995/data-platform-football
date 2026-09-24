@@ -1430,3 +1430,27 @@ def test_hard_transport_policy_branches_are_unchanged(stats, expected):
     """
 
     assert FBrefFetcher._hard_transport_policy_reason(stats) == expected
+
+
+def test_retained_clearance_without_lease_extension_stays_hard():
+    """Restoring a kept clearance on an unextended paid lease is a hard stop.
+
+    This is the accounting branch at the top of ``_ensure_clearance``: warm
+    HTTP must never run on a paid lease that was not extended for it.  #1452
+    only moved the drain-site spend test; this verdict must stay terminal and
+    must not build an HTTP session.
+    """
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher._http_session = None
+    fetcher._clearance = {"cf_clearance": "kept"}
+    fetcher._lease_client = MagicMock()
+    fetcher._provider_http_ready = False
+    fetcher._create_http_session = MagicMock()
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "not extended for warm HTTP" in str(raised.value)
+    fetcher._create_http_session.assert_not_called()
