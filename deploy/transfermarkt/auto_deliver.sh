@@ -676,6 +676,13 @@ if is_plain "$INFLIGHT"; then
   started_before=$(inspect -f '{{.State.StartedAt}}' "$SCHED")
   if rollback_to_old "$OLD" "$started_before"; then
     rm -f "$INFLIGHT"
+    if [ -n "$RESTORE_NOTE" ]; then
+      # Приёмка паузы не сверяет: несошедшийся возврат пауз/пулов запрещает «успех».
+      infl_close needs-hands "откат после обрыва подтверждён, контур не вернулся:$RESTORE_NOTE" f
+      tg_durable "Transfermarkt: прошлая доставка оборвалась, откат на $OLD подтверждён, НО паузы/пулы не вернулись к снимку —$RESTORE_NOTE${ROLLBACK_NOTE} НУЖНЫ РУКИ. Автомат глушу: снять $OFF после разбора. Лог: $LOG"
+      set_off
+      exit 1
+    fi
     infl_close failed "откат после обрыва доставки подтверждён, бой на $OLD" t
     why=$(streak_tail)
     tg_durable "Transfermarkt: прошлая доставка оборвалась на середине. Откат на $OLD подтверждён.${ROLLBACK_NOTE}$why Лог: $LOG"

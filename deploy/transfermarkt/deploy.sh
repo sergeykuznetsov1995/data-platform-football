@@ -39,7 +39,9 @@ PSQL="timeout -k 5 ${TRANSFERMARKT_DEPLOY_METADB_TIMEOUT:-30} docker exec $METAD
 LEDGER_MAX_AGE_DAYS="${TRANSFERMARKT_LEDGER_MAX_AGE_DAYS:-30}"
 
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"; }
-is_paused() { $PSQL "SELECT is_paused FROM dag WHERE dag_id='$1';"; }
+# t / f; «-» — DAG ещё не зарегистрирован (первый подъём: scheduler'а в этой метабазе не
+# было); пусто — метабаза не ответила.
+is_paused() { $PSQL "SELECT coalesce((SELECT CASE WHEN is_paused THEN 't' ELSE 'f' END FROM dag WHERE dag_id='$1'),'-');"; }
 set_pool() {  # set_pool <name> <slots> <description>
   timeout -k 5 60 docker exec "$SCHED" airflow pools set "$1" "$2" "$3" >> "$LOG" 2>&1 8>&-
 }
@@ -113,9 +115,13 @@ running=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ($TM_DAGS_SQL) AND
 # двигает), затем подтвердить простой ещё раз — ран мог стартовать между проверкой и паузой.
 for d in "$INGEST" "$DISCOVER" "$BACKFILL" "$SILVER"; do
   WAS_PAUSED[$d]=$(is_paused "$d" || true)
-  case "${WAS_PAUSED[$d]}" in t|f) ;; *) log "метабаза не ответила про паузу $d — nothing deployed"; unset 'WAS_PAUSED[$d]'; exit 4 ;; esac
+  case "${WAS_PAUSED[$d]}" in
+    t|f) ;;
+    -) unset 'WAS_PAUSED[$d]'; log "$d ещё не зарегистрирован (первый подъём) — паузить нечего" ;;
+    *) log "метабаза не ответила про паузу $d — nothing deployed"; unset 'WAS_PAUSED[$d]'; exit 4 ;;
+  esac
 done
-for d in "$INGEST" "$DISCOVER" "$BACKFILL" "$SILVER"; do
+for d in "${!WAS_PAUSED[@]}"; do
   timeout -k 5 60 docker exec "$SCHED" airflow dags pause "$d" >> "$LOG" 2>&1 8>&- || true
   [ "$(is_paused "$d")" = t ] || { log "$d не встал на паузу — nothing deployed"; exit 4; }
 done
