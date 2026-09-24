@@ -912,28 +912,44 @@ def test_unreachable_exit_re_solves_even_when_its_lease_will_not_drain():
     assert "FBrefProxyLeaseError" in str(raised.value)
 
 
-def test_an_exit_that_spent_bytes_is_not_exempted_from_the_drain_verdict():
-    """`wait_drained` also raises on budget and lifecycle states.
+def test_traffic_of_earlier_exits_in_the_same_transport_does_not_block_the_exemption(caplog):
+    """Replay of 24.09: earlier leases' bytes must not condemn a dead fourth one.
 
-    The cap check below the drain site cannot re-impose the verdict once the
-    drain itself failed -- it has no fresh stats to read -- so a lease that is
-    known to have spent anything must not ride the unreachable-exit exemption,
-    however the geo-IP flags happen to be set.
+    After a 403 the session was re-solved; three fresh leases in a row did not
+    satisfy Cloudflare (attempt 1-3/4), and the fourth lease's exit never
+    answered (geo-IP probe: 502 Bad Gateway, ``GeoIPTransportError``).  The
+    transport counter ``real_bytes_downloaded`` sums every rotation, so it
+    carried 3.1 MB of the three earlier leases; the old guard read that as
+    spend of the dead lease and returned ``browser_provider_drain_failed``,
+    killing the run after 75 clean pages (#1452).  The browser never started
+    on the dead lease, and the provider saw nothing on it: the wave re-solves.
     """
 
     fetcher = _fetcher_with_dead_exit_and_failing_drain(
-        real_bytes_downloaded=2048,
+        real_bytes_downloaded=3_100_000,
+        real_requests_count=40,
     )
 
     with pytest.raises(FetchError) as raised:
         fetcher._ensure_clearance()
 
-    assert raised.value.error_class == "hard_transport_policy"
-    assert "browser_provider_drain_failed" in str(raised.value)
+    assert raised.value.error_class == "clearance_failed"
+    assert "abandoned an unreachable exit's lease" in str(raised.value)
+    assert "browser_provider_drain_failed" not in str(raised.value)
+    # The runner log names the branch the drain verdict took.
+    assert "its lease is unspent -- re-solving" in caplog.text
 
 
-def test_an_observed_lease_balance_also_blocks_the_exemption():
-    """Bytes already attributed to this lease are spend just the same."""
+def test_an_observed_lease_balance_also_blocks_the_exemption(caplog):
+    """Bytes the provider attributed to *this lease* are spend: still hard.
+
+    Since #1452 this is the only spend that blocks the unreachable-exit
+    exemption -- the transport's cumulative counter no longer does.
+    ``wait_drained`` also raises on budget and lifecycle states, and the cap
+    check below the drain site cannot re-impose the verdict once the drain
+    failed, so a lease with provider-observed spend must not ride the
+    exemption, however the geo-IP flags happen to be set.
+    """
 
     fetcher = _fetcher_with_dead_exit_and_failing_drain()
     fetcher._provider_lease_observed_bytes = 4096
@@ -942,6 +958,7 @@ def test_an_observed_lease_balance_also_blocks_the_exemption():
         fetcher._ensure_clearance()
 
     assert raised.value.error_class == "hard_transport_policy"
+    assert "verdict browser_provider_drain_failed" in caplog.text
 
 
 def test_reset_keeps_the_wave_recoverable_when_the_lease_will_not_close():
@@ -1373,3 +1390,43 @@ def test_exhausted_byte_budget_is_still_hard_transport_policy():
 
     assert raised.value.error_class == "hard_transport_policy"
     assert "session_byte_cap_exceeded:4194400>4194304" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        ({"geoip_lookup_failed": True}, "geoip_lookup_failed"),
+        (
+            {"geoip_lookup_failed": True, "geoip_transport_failure": True},
+            None,
+        ),
+        ({"redirect_blocked": True}, "redirect_blocked"),
+        (
+            {
+                "network_policy_failed": True,
+                "network_policy_failure": "invalid_proxy_credential",
+            },
+            "invalid_proxy_credential",
+        ),
+        ({"network_policy_failed": True}, "unexpected_network"),
+        ({"request_budget_exhausted": True}, "request_budget_exhausted"),
+        (
+            {
+                "byte_budget_exhausted": True,
+                "byte_budget_failure": "geoip_admission_exceeds_byte_cap",
+            },
+            "geoip_admission_exceeds_byte_cap",
+        ),
+        ({"byte_budget_exhausted": True}, "byte_budget_exhausted"),
+        ({}, None),
+    ],
+)
+def test_hard_transport_policy_branches_are_unchanged(stats, expected):
+    """Policy and budget verdicts stay hard; only a dead exit is a lease miss.
+
+    #1452 moved the lease-spend test at the drain site and deliberately left
+    this classifier alone: an exit that answered against policy, a hijacked
+    redirect, traffic off the route and exhausted budgets still end the wave.
+    """
+
+    assert FBrefFetcher._hard_transport_policy_reason(stats) == expected
