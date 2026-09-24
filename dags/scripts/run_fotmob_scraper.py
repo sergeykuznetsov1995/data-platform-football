@@ -131,6 +131,12 @@ CURRENT_SCOPE_OBLIGATION_COOLDOWN = timedelta(hours=2)
 # Сколько ждать ПОСЛЕ начала матча, прежде чем идти за его флагом: полтора часа
 # игры плюс запас на то, что источник проставляет терминальный статус не мгновенно.
 MATCH_SETTLE_MARGIN = timedelta(hours=3)
+# Повтор матча, по которому источник ответил «данных нет» (#1450): дыра считается
+# подтверждённой после двух наблюдений с промежутком не меньше двух часов (или
+# после трёх любых); спустя трое суток от начала матча не переспрашиваем.
+SOURCE_GAP_CONFIRM_SPREAD = timedelta(hours=2)
+SOURCE_GAP_MAX_ATTEMPTS = 3
+SOURCE_GAP_RETRY_WINDOW = timedelta(hours=72)
 
 # Единственность писателя bronze (B7). max_active_runs=1 сериализует только
 # DagRun'ы одного дага, а ручной добор и осиротевший скрапер (PPid=1) пишут в те
@@ -731,6 +737,61 @@ def _match_debt_is_open(
     target = canonicalize("matchDetails", {"matchId": str(match_id)})
     previous = repository.latest_success(target.target_key)
     return previous is None or bool(previous.get("stale"))
+
+
+def _unconfirmed_gap_matches(
+    matches: Iterable[Mapping[str, Any]], repository: Any, now: datetime
+) -> list[str]:
+    """Матчи скоупа, чья дыра источника ещё не подтверждена (#1450).
+
+    Дыра — «данных нет» (`not_available`/`source_data_not_found`) без единого
+    успеха. Подтверждена — два разных рана с разбросом `completed_at` не меньше
+    двух часов или три разных рана. Пока не подтверждена и с начала матча не
+    прошло трое суток, скоуп возвращается на коротком сроке, а не через 48 ч.
+    Считаем по `run_id`/`completed_at`: `fetched_at` при 304 наследуется из кэша.
+    """
+
+    candidates = set()
+    for match in matches:
+        kickoff = _match_kickoff(match.get("utc_time"))
+        if (
+            match.get("finished")
+            and match.get("match_id") is not None
+            and kickoff is not None
+            and kickoff + SOURCE_GAP_RETRY_WINDOW > now
+        ):
+            candidates.add(str(match.get("match_id")))
+    if not candidates:
+        return []
+    runs: dict[str, set[str]] = {}
+    times: dict[str, list[datetime]] = {}
+    succeeded: set[str] = set()
+    for row in repository.entity_attempt_rows("match", candidates):
+        entity_id = str(row.get("entity_id"))
+        status = str(row.get("status"))
+        if status in {"success", "not_modified"}:
+            succeeded.add(entity_id)
+        elif status == "not_available" and row.get("error_code") == "source_data_not_found":
+            runs.setdefault(entity_id, set()).add(str(row.get("run_id")))
+            completed = row.get("completed_at")
+            if isinstance(completed, str):
+                completed = datetime.fromisoformat(completed)
+            if isinstance(completed, datetime):
+                if completed.tzinfo is not None:
+                    completed = completed.astimezone(timezone.utc).replace(tzinfo=None)
+                times.setdefault(entity_id, []).append(completed)
+    unconfirmed = []
+    for entity_id, run_ids in runs.items():
+        if entity_id in succeeded:
+            continue
+        seen = times.get(entity_id) or [now]
+        spread = max(seen) - min(seen)
+        if len(run_ids) < 2 or (
+            len(run_ids) < SOURCE_GAP_MAX_ATTEMPTS
+            and spread < SOURCE_GAP_CONFIRM_SPREAD
+        ):
+            unconfirmed.append(entity_id)
+    return sorted(unconfirmed)
 
 
 def _scope_debt_counts(
@@ -2120,6 +2181,17 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             work_plan_retryable = (
                 f"scope {scope_key} incomplete; outstanding={outstanding}"
             )
+            # Неподтверждённая дыра источника (#1450) возвращает скоуп через 2 ч:
+            # матч с «данных нет» переспрашивается, пока не подтверждён.
+            gap_retry_due = (
+                observed_at + CURRENT_SCOPE_OBLIGATION_COOLDOWN
+                if source_missing_matches > 0
+                and bundle is not None
+                and _unconfirmed_gap_matches(
+                    bundle.matches, service.repository, observed_at
+                )
+                else None
+            )
             if source_gap:
                 gap_identities = tuple(
                     dict.fromkeys((*prior_identities, attempt_identity))
@@ -2129,7 +2201,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     outcome="source_gap",
                     reason=_SOURCE_GAP_REASON,
                     next_retry_at=(
-                        observed_at + timedelta(hours=48)
+                        min(
+                            observed_at + timedelta(hours=48),
+                            gap_retry_due or datetime.max,
+                        )
                         if automatic_lane == ScopeLane.CURRENT
                         else None
                     ),
@@ -2152,6 +2227,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     (previous_attempt.attempt_count + 1 if previous_attempt else 1),
                     observed_at,
                 )
+                if gap_retry_due is not None:
+                    next_due = min(next_due, gap_retry_due)
                 record_automatic_attempt(
                     item,
                     outcome="terminal" if hard_failure else "retryable",

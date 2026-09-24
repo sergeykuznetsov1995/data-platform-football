@@ -2383,6 +2383,45 @@ class FotMobRepository:
             ),
         )
 
+    def entity_attempt_rows(
+        self, target_type: str, entity_ids: Iterable[str | int]
+    ) -> list[dict[str, Any]]:
+        """Every manifest attempt of these entities, buffered ones included.
+
+        История попыток, а не последняя строка: по ней раннер отличает дыру
+        источника, подтверждённую двумя наблюдениями, от однократного «данных
+        нет» (#1450). Версия парсера не фильтруется — ответ источника от неё
+        не зависит.
+        """
+
+        normalized_type = str(target_type)
+        ids = sorted({str(entity_id) for entity_id in entity_ids})
+        if not ids:
+            return []
+        columns = ("entity_id", "run_id", "status", "error_code", "completed_at")
+        rows = [
+            {column: row.get(column) for column in columns}
+            for row in self._pending_manifest
+            if str(row.get("target_type")) == normalized_type
+            and str(row.get("entity_id")) in ids
+        ]
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return rows
+        trino = manager_getter()
+        safe_type = normalized_type.replace("'", "''")
+        safe_ids = ", ".join("'" + entity_id.replace("'", "''") + "'" for entity_id in ids)
+        durable = trino.execute_query(
+            f"""
+            SELECT {", ".join(columns)}
+            FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+            WHERE target_type = '{safe_type}'
+              AND entity_id IN ({safe_ids})
+            """
+        )
+        rows.extend(dict(zip(columns, row)) for row in durable)
+        return rows
+
     def latest_entity_raw_target(
         self, target_type: str, entity_id: str | int
     ) -> Optional[dict[str, Any]]:
@@ -3088,6 +3127,22 @@ class MemoryFotMobRepository:
                 microseconds=latest_index + 1
             )
         return view
+
+    def entity_attempt_rows(
+        self, target_type: str, entity_ids: Iterable[str | int]
+    ) -> list[dict[str, Any]]:
+        ids = {str(entity_id) for entity_id in entity_ids}
+        return [
+            {
+                "entity_id": commit.entity_id,
+                "run_id": commit.run_id,
+                "status": commit.status.value,
+                "error_code": commit.error_code,
+                "completed_at": commit.completed_at or commit.fetched_at,
+            }
+            for commit in self.commits
+            if commit.target_type == str(target_type) and commit.entity_id in ids
+        ]
 
     def latest_entity_raw_target(
         self, target_type: str, entity_id: str | int

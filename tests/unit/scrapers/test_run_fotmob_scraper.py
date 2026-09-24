@@ -1375,6 +1375,173 @@ class TestFotmobNativeRunner:
         # зелёная волна с названной причиной в строке метрик.
         assert "source_gap=1" in mod._wave_metrics_line(second_report, second_rc)
 
+    @staticmethod
+    def _source_gap_attempts(mod, monkeypatch, kickoff, runs):
+        """Прогоняет скоуп с матчем «данных нет» `runs` раз, сдвигая часы планера."""
+
+        from scrapers.fotmob import planner
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload
+
+        league = _league_payload()
+        league["fixtures"]["allMatches"][0]["status"]["utcTime"] = kickoff
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: league,
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {
+                "error": True,
+                "message": "Data not found",
+                "matchId": "100",
+            },
+        }
+        repository = MemoryFotMobRepository()
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "gap-run-1",
+            ]
+        )
+        real_datetime = datetime
+        attempts = []
+        for index, shift_hours in enumerate(runs):
+
+            class ShiftedDatetime(datetime):
+                @classmethod
+                def now(cls, tz=None, _shift=shift_hours):
+                    return real_datetime.now(tz) + timedelta(hours=_shift)
+
+            monkeypatch.setattr(planner, "datetime", ShiftedDatetime)
+            args.run_id = f"gap-run-{index + 1}"
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+                run_id=args.run_id,
+                max_workers=2,
+            )
+            rc, report = _run_native_admitted(mod, args, service=service)
+            assert rc == 0, report["errors"]
+            if not report["selection"]["scope_attempts"]:
+                # Скоуп не дошёл до срока — в этом ране его не планировали.
+                attempts.append(None)
+                continue
+            attempt = report["selection"]["scope_attempts"][0]
+            attempt["delay"] = datetime.fromisoformat(
+                attempt["next_retry_at"]
+            ) - datetime.fromisoformat(attempt["last_attempt_at"])
+            attempts.append(attempt)
+        return attempts
+
+    @pytest.mark.unit
+    def test_unconfirmed_source_gap_match_is_retried_in_two_hours(self, monkeypatch):
+        """#1450: «данных нет» по свежему матчу — повтор через 2 ч, а не через 48.
+
+        23.09 13 переигровок Кубка Англии ушли на +48 ч после первого же ответа
+        «данных нет», потому что признак source_gap уже висел на скоупе. Пока дыра
+        не подтверждена (два рана с разбросом ≥ 2 ч или три рана), срок — 2 ч.
+        """
+
+        from datetime import timezone
+
+        mod = self._module()
+        kickoff = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        first, second, third = self._source_gap_attempts(
+            mod, monkeypatch, kickoff, runs=(0, 1, 3)
+        )
+
+        assert first["outcome"] == "retryable"
+        assert first["delay"] <= timedelta(hours=2)
+        # Два рана, но за минуты друг от друга: дыра не подтверждена.
+        assert second["outcome"] == "source_gap"
+        assert timedelta(hours=1) < second["delay"] <= timedelta(hours=2)
+        # Третий ран — потолок попыток: дыра признана, обычные 48 ч.
+        assert third["outcome"] == "source_gap"
+        assert third["delay"] > timedelta(hours=47)
+
+    @pytest.mark.unit
+    def test_source_gap_of_an_old_match_keeps_the_long_retry(self, monkeypatch):
+        """Трое суток от начала матча прошли — переспрашивать нечего, +48 ч как было."""
+
+        mod = self._module()
+        _first, second = self._source_gap_attempts(
+            mod, monkeypatch, "2026-01-01T12:00:00.000Z", runs=(0, 1)
+        )
+
+        assert second["outcome"] == "source_gap"
+        assert second["delay"] > timedelta(hours=47)
+
+    @pytest.mark.unit
+    def test_unconfirmed_gap_matches_counts_runs_spread_and_success(self):
+        mod = self._module()
+        now = datetime(2026, 9, 24, 12, 0)
+        recent = "2026-09-23T18:00:00Z"
+        matches = [
+            {"match_id": match_id, "finished": True, "utc_time": recent}
+            for match_id in ("one", "close", "spread", "three", "won", "other")
+        ] + [
+            {"match_id": "old", "finished": True, "utc_time": "2026-09-20T18:00:00Z"},
+            {"match_id": "live", "finished": False, "utc_time": recent},
+        ]
+
+        def gap(entity_id, run_id, hour, **extra):
+            row = {
+                "entity_id": entity_id,
+                "run_id": run_id,
+                "status": "not_available",
+                "error_code": "source_data_not_found",
+                "completed_at": datetime(2026, 9, 24, hour, 0),
+            }
+            row.update(extra)
+            return row
+
+        rows = [
+            gap("one", "r1", 10),
+            gap("one", "r1", 11),
+            gap("close", "r1", 10),
+            gap("close", "r2", 11),
+            gap("spread", "r1", 8),
+            gap("spread", "r2", 10),
+            gap("three", "r1", 10),
+            gap("three", "r2", 10),
+            gap("three", "r3", 11),
+            gap("won", "r1", 10),
+            {"entity_id": "won", "run_id": "r2", "status": "success"},
+            gap("other", "r1", 10, error_code="http_404"),
+            gap("old", "r1", 10),
+            gap("live", "r1", 10),
+        ]
+        asked = []
+
+        class Repository:
+            def entity_attempt_rows(self, target_type, entity_ids):
+                asked.append((target_type, set(entity_ids)))
+                return [row for row in rows if row["entity_id"] in set(entity_ids)]
+
+        assert mod._unconfirmed_gap_matches(matches, Repository(), now) == [
+            "close",
+            "one",
+        ]
+        # Старый и несыгранный матчи в запрос не попадают вовсе.
+        assert asked == [
+            ("match", {"one", "close", "spread", "three", "won", "other"})
+        ]
+        # Нечего проверять — Trino не спрашиваем.
+        assert mod._unconfirmed_gap_matches(matches[-2:], Repository(), now) == []
+        assert len(asked) == 1
+
     @pytest.mark.unit
     def test_automatic_run_with_progress_defers_retry_without_failing(self):
         """Отложенный повтор рядом с закрытым скоупом — жёлтый ран, не красный.
