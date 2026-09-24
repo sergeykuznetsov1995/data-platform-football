@@ -72,13 +72,11 @@ docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SCHED" \
 env_line() { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SCHED" | grep -E "^$1=" | head -1; }
 [ "$(env_line TM_PROXY_CONTROL_URL)" = "TM_PROXY_CONTROL_URL=http://transfermarkt_gw:8899" ] && ok "TM_PROXY_CONTROL_URL → свой шлюз" || fail "TM_PROXY_CONTROL_URL не на transfermarkt_gw"
 [ "$(env_line TRANSFERMARKT_REQUIRE_RAW_STORE)" = "TRANSFERMARKT_REQUIRE_RAW_STORE=true" ] && ok "raw-store обязателен" || fail "TRANSFERMARKT_REQUIRE_RAW_STORE не true"
-health=$(timeout -k 5 60 docker exec "$SCHED" python -c '
-import json, urllib.request
-h = json.load(urllib.request.urlopen("http://transfermarkt_gw:8899/health", timeout=10))
-print("source_mode=%s daily_keys=%d paid_enabled=%s live_exit_ratio=%s" % (h.get("source_mode"), sum(k.startswith("daily_") for k in h), h.get("transfermarkt_paid_enabled"), h.get("live_exit_ratio")))
-' 2>&1)
-echo "  /health: $health"
-case "$health" in "source_mode=transfermarkt-only daily_keys=0 "*) ok "/health: transfermarkt-only без daily_*" ;; *) fail "/health не в ожидаемом виде" ;; esac
+if health=$(transfermarkt_gateway_health_ok "$SCHED"); then
+  echo "  /health: $health"; ok "/health: transfermarkt-only без daily_*"
+else
+  echo "  /health: $health"; fail "/health не в ожидаемом виде"
+fi
 
 echo "== 3. Метабаза: import_error, 4 DAG, паузы =="
 errs=$($PSQL "SELECT count(*) FROM import_error;")

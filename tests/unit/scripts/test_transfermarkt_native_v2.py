@@ -603,8 +603,8 @@ class _ScopeEvidenceCursor:
                         'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
                         'requests', 'retries', 'cache_hits', 'duration_ms',
                     )),
-                    control.SCOPE_SET_HARD_BYTE_CAP,
-                    control.SCOPE_SET_SOFT_BYTE_STOP,
+                    None,
+                    None,
                 ))
         self.rows = []
         self.sql = []
@@ -807,8 +807,8 @@ def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
     control = mod.control
 
     # #1387: no parent byte cap; request/retry ceilings are unchanged.
-    assert control.SCOPE_SET_HARD_BYTE_CAP is None
-    assert control.SCOPE_SET_SOFT_BYTE_STOP is None
+    assert not hasattr(control, 'SCOPE_SET_HARD_BYTE_CAP')
+    assert not hasattr(control, 'SCOPE_SET_SOFT_BYTE_STOP')
     assert control.SCOPE_SET_REQUEST_LIMIT == 12_880
     assert control.SCOPE_SET_RETRY_LIMIT == 6_400
 

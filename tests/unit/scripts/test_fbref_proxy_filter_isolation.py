@@ -21,7 +21,7 @@ SHARED_FILTER_SHA256 = (
     # ``runtime_files`` — both asserted below.  #1350: ledgers flushed off
     # the per-chunk path.  #1389-B: upstream failure class, tunnels, /health.
     # #1387: transfermarkt-only source mode.
-    "f04c36d89fcaa62b67194409f878d9d23b190350b264b55eb4e9768107a50277"
+    "13d7d8b7f834ce67392bed532fd4959fb0f4dbd4a86a29feb0cbc3c68c066f36"
 )
 
 

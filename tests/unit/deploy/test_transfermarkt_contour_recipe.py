@@ -198,8 +198,8 @@ def test_deploy_script_order_and_pool_handling() -> None:
         "up -d --no-deps --force-recreate airflow-scheduler",
         "set_pool transfermarkt_proxy 1",
         "last_parsed_time > TIMESTAMPTZ '$STARTED'",
-        'set_pause "$INGEST" f',
-        'set_pause "$BACKFILL" t',
+        '["$INGEST"]=f ["$DISCOVER"]=f ["$BACKFILL"]=t ["$SILVER"]=t',
+        'set_pause "$d" "$want"',
     ]
     positions = [text.index(marker) for marker in order]
     assert positions == sorted(positions)

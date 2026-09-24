@@ -89,3 +89,32 @@ transfermarkt_set_env_var() {  # transfermarkt_set_env_var <file> <key> <value>
   grep -q "^$2=" "$1" || { echo "в $1 нет строки $2=" >&2; return 2; }
   sed -i "s#^$2=.*#$2=$3#" "$1"
 }
+
+# /health шлюза изнутри планировщика: режим transfermarkt-only и ни одного ключа daily_*
+# (суточного бюджета нет, #1387). Одна проба на выкат, автомат и приёмку — три копии
+# рано или поздно разошлись бы в том, что считать «здоровым».
+# Печатает одну строку «ok|bad source_mode=… daily_keys=… paid_enabled=… live_exit_ratio=…»;
+# код 0 — ok, 1 — шлюз ответил не так, 2 — проба не выполнилась (строка — её вывод).
+transfermarkt_gateway_health_ok() {  # transfermarkt_gateway_health_ok <контейнер планировщика>
+  local out
+  out=$(timeout -k 5 60 docker exec "$1" python -c '
+import json, urllib.request
+h = json.load(urllib.request.urlopen("http://transfermarkt_gw:8899/health", timeout=10))
+daily = sum(k.startswith("daily_") for k in h)
+ok = h.get("source_mode") == "transfermarkt-only" and daily == 0
+print(("ok" if ok else "bad") + " source_mode=%s daily_keys=%d paid_enabled=%s live_exit_ratio=%s" % (h.get("source_mode"), daily, h.get("transfermarkt_paid_enabled"), h.get("live_exit_ratio")))
+' 2>&1) || { echo "probe failed: $out"; return 2; }
+  echo "$out"
+  case "$out" in ok|ok\ *) return 0 ;; *) return 1 ;; esac
+}
+
+# Все bind-монты контейнера из каталога релизов ведут в дерево <дерево>, и их не меньше
+# <минимум>. Печатает 1 / 0; X — docker inspect не ответил.
+transfermarkt_mounts_in() {  # transfermarkt_mounts_in <контейнер> <каталог релизов> <дерево> <минимум>
+  local out
+  out=$(timeout -k 5 30 docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$1" 2>/dev/null) \
+    || { echo X; return 0; }
+  printf '%s\n' "$out" | awk -v root="$2/" -v new="$3" -v min="$4" '
+    index($0,root)==1 { t++; if ($0!=new && index($0,new"/")!=1) b++ }
+    END { print (t>=min && b==0) ? 1 : 0 }'
+}

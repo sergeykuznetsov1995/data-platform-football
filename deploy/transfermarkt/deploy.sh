@@ -150,7 +150,14 @@ if [ -f "$LEDGER" ] && [ -s "$LEDGER" ]; then
   first_s=$(date -u -d "$first_at" +%s 2>/dev/null || echo "")
   if [ -n "$first_s" ] && [ $(( $(date -u +%s) - first_s )) -gt $(( LEDGER_MAX_AGE_DAYS * 86400 )) ]; then
     archive="$GW_STATE/paid_requests.$(date -u +%Y%m%dT%H%M%SZ).jsonl.gz"
-    gzip -c "$LEDGER" > "$archive.tmp" && chmod 0600 "$archive.tmp" && mv -f "$archive.tmp" "$archive" && rm -f "$LEDGER"
+    # Цепочка `&&` под `set -e` не роняет скрипт: сбой gzip молча оставил бы .tmp и
+    # выкат шёл бы дальше. Сбой — код 5 (шлюз уже остановлен), леджер не тронут.
+    if ! ( gzip -c "$LEDGER" > "$archive.tmp" && chmod 0600 "$archive.tmp" \
+           && mv -f "$archive.tmp" "$archive" && rm -f "$LEDGER" ); then
+      rm -f "$archive.tmp"
+      log "ledger archive failed: $LEDGER не тронут, выкат остановлен"
+      exit 5
+    fi
     log "ledger archived: $archive (первая запись $first_at)"
   fi
 fi
@@ -211,31 +218,29 @@ for _ in $(seq 1 30); do
 done
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$SCHED")" = "healthy" ] || { log "$SCHED unhealthy"; exit 6; }
 # /health шлюза изнутри планировщика: режим transfermarkt-only, суточного бюджета нет.
-health=$(timeout -k 5 60 docker exec "$SCHED" python -c '
-import json, urllib.request
-h = json.load(urllib.request.urlopen("http://transfermarkt_gw:8899/health", timeout=10))
-ok = h.get("source_mode") == "transfermarkt-only" and not any(k.startswith("daily_") for k in h)
-print(("ok" if ok else "bad") + " source_mode=%s paid_enabled=%s" % (h.get("source_mode"), h.get("transfermarkt_paid_enabled")))
-' 2>&1 8>&- || true)
+health_rc=0
+health=$(transfermarkt_gateway_health_ok "$SCHED" 8>&-) || health_rc=$?
 log "gateway /health from scheduler: $health"
-case "$health" in ok\ *) ;; *) log "gateway /health не прошёл приёмку"; exit 6 ;; esac
+[ "$health_rc" = 0 ] || { log "gateway /health не прошёл приёмку"; exit 6; }
 # Все монты из каталога релизов ведут в НОВОЕ дерево (scheduler ≥ 5, шлюз ≥ 1).
 for pair in "$SCHED:5" "$GW:1"; do
   c=${pair%%:*}; want=${pair##*:}
-  got=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$c" \
-    | awk -v root="$TRANSFERMARKT_RELEASES_DIR/" -v new="$RELEASE" -v min="$want" '
-        index($0,root)==1 { t++; if ($0!=new && index($0,new"/")!=1) b++ }
-        END { print (t>=min && b==0) ? 1 : 0 }')
+  got=$(transfermarkt_mounts_in "$c" "$TRANSFERMARKT_RELEASES_DIR" "$RELEASE" "$want" 8>&-)
   [ "$got" = 1 ] || { log "монты $c ведут не в $RELEASE"; exit 6; }
 done
 log "mounts of $SCHED and $GW lead into $RELEASE"
 
 STEP="pauses"
-# ingest/discover работают, backfill/silver — на паузе (решение 10 #1387). Откат
-# возвращает паузы из снимка — это делает автомат после этого скрипта.
-set_pause "$INGEST" f
-set_pause "$DISCOVER" f
-set_pause "$BACKFILL" t
-set_pause "$SILVER" t
-log "pauses: $INGEST=f $DISCOVER=f $BACKFILL=t $SILVER=t"
+# Паузы — как были до выката: ручная пауза оператора выкат не снимает. DAG, которого до
+# выката в метабазе не было (первый подъём), получает дефолт решения 10 #1387:
+# ingest/discover работают, backfill/silver — на паузе. Откат возвращает паузы из
+# снимка — это делает автомат после этого скрипта.
+declare -A DEFAULT_PAUSED=(["$INGEST"]=f ["$DISCOVER"]=f ["$BACKFILL"]=t ["$SILVER"]=t)
+summary=""
+for d in "$INGEST" "$DISCOVER" "$BACKFILL" "$SILVER"; do
+  want="${WAS_PAUSED[$d]:-${DEFAULT_PAUSED[$d]}}"
+  set_pause "$d" "$want"
+  summary="$summary $d=$want"
+done
+log "pauses:$summary"
 log "DONE release=$RELEASE"

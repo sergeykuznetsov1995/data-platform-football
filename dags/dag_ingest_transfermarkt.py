@@ -32,8 +32,6 @@ from scrapers.transfermarkt.models import (
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     MAX_ROSTER_WINDOW,
     MAX_SCOPE_BATCH,
-    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
-    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
     PARENT_REQUEST_LIMIT,
     PARENT_RETRY_LIMIT,
     SCOPE_HARD_PROVIDER_BYTE_CAP,
@@ -56,10 +54,6 @@ PROVIDER_HARD_CAP_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
 PROVIDER_SOFT_STOP_BYTES = SCOPE_SOFT_PROVIDER_BYTE_STOP
 PROXY_REQUEST_LIMIT = SCOPE_REQUEST_LIMIT
 PROXY_RETRY_LIMIT = SCOPE_RETRY_LIMIT
-# Parent (daily) aggregate byte caps across all mapped scopes of one run:
-# ``None`` since #1387 (no daily byte ceiling); the children get no flag.
-PARENT_BYTE_BUDGET = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
-PARENT_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 PROXY_CONCURRENCY = 1
 # Only an edition the promoted registry still marks current has to have been
 # captured recently; a finished edition's manifest never expires, or a slot that
@@ -710,31 +704,17 @@ def _build_scope_set(
 
     if len(ledger_paths) != 1:
         raise AirflowException('mapped scopes do not share one parent proxy ledger')
+    # #1387: the ingest parent cycle has no byte cap, so only the traffic
+    # totals are reconciled against the parent ledger.
     traffic = aggregate_traffic(manifests)
-    if (
-        PARENT_BYTE_BUDGET is not None
-        and traffic['provider_metered_bytes'] > PARENT_BYTE_BUDGET
-    ):
-        raise AirflowException(
-            'parent daily provider byte budget exceeded: '
-            f"{traffic['provider_metered_bytes']}/{PARENT_BYTE_BUDGET}"
-        )
     ledger = _load_json_object(next(iter(ledger_paths)), label='parent proxy ledger')
     required_ledger = {
         'provider_metered_bytes': traffic['provider_metered_bytes'],
         'requests': traffic['requests'],
         'retries': traffic['retries'],
     }
-    required_caps = {
-        'hard_provider_byte_budget': PARENT_BYTE_BUDGET,
-        'soft_provider_byte_stop': PARENT_SOFT_BYTE_STOP,
-    }
     if any(
         int(ledger.get(key, -1)) != value for key, value in required_ledger.items()
-    ) or any(
-        key not in ledger
-        or (None if ledger[key] is None else int(ledger[key])) != value
-        for key, value in required_caps.items()
     ):
         raise AirflowException('parent proxy ledger disagrees with scope manifests')
 

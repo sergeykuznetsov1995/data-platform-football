@@ -60,6 +60,7 @@ from scrapers.transfermarkt.models import (
     SCOPE_REQUEST_LIMIT,
     SCOPE_RETRY_LIMIT,
     SCOPE_SOFT_PROVIDER_BYTE_STOP,
+    parent_byte_caps_valid,
 )
 from scrapers.transfermarkt.registry import (
     CompetitionRecord,
@@ -1537,11 +1538,10 @@ def _parent_byte_caps(hard: Any, soft: Any) -> tuple[int | None, int | None]:
     """Validate the parent byte-cap pair: both ``None`` (#1387) or both set."""
 
     hard_cap, soft_stop = _optional_int(hard), _optional_int(soft)
-    if (hard_cap is None) != (soft_stop is None) or (
-        hard_cap is not None and not 0 < soft_stop <= hard_cap
-    ):
+    if not parent_byte_caps_valid(hard_cap, soft_stop):
         raise ScopeCycleError(
-            'parent byte caps must be both unset or 0 < soft <= hard'
+            'parent byte caps must be both unset or 0 < soft <= hard '
+            'with hard >= the scope hard cap'
         )
     return hard_cap, soft_stop
 
@@ -1955,6 +1955,17 @@ def _checkpoint_identity(
         # checkpoints.  All source/schema/budget fields remain pinned below.
         identity_fields.pop('parent_cycle_id', None)
         identity_fields.pop('parent_ledger_path', None)
+    # #1387: parent byte caps join the identity ONLY when they are set.  A
+    # capped run (historical backfill, batch-local caps) hashes exactly as
+    # before, so its paid-for checkpoints still resume; an uncapped run
+    # (production ingest, caps None) deliberately gets a new identity — its
+    # old checkpoints were taken under the removed daily caps.
+    parent_byte_caps: dict[str, int] = {}
+    if args.parent_byte_budget is not None:
+        parent_byte_caps = {
+            'parent_byte_budget': int(args.parent_byte_budget),
+            'parent_soft_byte_stop': int(args.parent_soft_byte_stop),
+        }
     return stable_hash({
         **identity_fields,
         'reader_revision': int(args.reader_revision),
@@ -1964,8 +1975,7 @@ def _checkpoint_identity(
         'soft_byte_stop_bytes': int(args.soft_byte_stop_bytes),
         'request_limit': int(args.request_limit),
         'retry_limit': int(args.retry_limit),
-        # #1387: parent byte caps left the identity (production has none);
-        # the request/retry parent limits still pin it.
+        **parent_byte_caps,
         'parent_request_limit': int(args.parent_request_limit),
         'parent_retry_limit': int(args.parent_retry_limit),
         'career_window_limit': int(args.career_window_limit),

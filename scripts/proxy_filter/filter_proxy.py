@@ -6124,6 +6124,11 @@ async def _handle_control(
                 str(request.get("dag_id") or "").strip(),
                 str(request.get("source") or "").strip(),
             )
+            if not _control_token_valid(headers, source=request_source):
+                await _send_json(writer, 401, {"error": "invalid control token"})
+                return True
+            # Authenticate first: an unauthenticated caller learns nothing
+            # about which sources this dedicated gateway serves.
             if (
                 _transfermarkt_only()
                 and request_source not in TRANSFERMARKT_ONLY_SOURCES
@@ -6139,9 +6144,6 @@ async def _handle_control(
                         ),
                     },
                 )
-                return True
-            if not _control_token_valid(headers, source=request_source):
-                await _send_json(writer, 401, {"error": "invalid control token"})
                 return True
             lease = _create_lease(
                 mgr,
@@ -8145,6 +8147,18 @@ async def main() -> None:
         raise SystemExit(
             "TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON is required when Transfermarkt "
             "backfill paid proxying is enabled"
+        )
+    if (
+        SOURCE_MODE == TRANSFERMARKT_ONLY_SOURCE_MODE
+        and TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
+        and not backfill_pool_json
+    ):
+        # A backfill credential without its separately bounded pool would
+        # advertise a paid class that can never lease: fail closed at start.
+        raise SystemExit(
+            "transfermarkt-only: TM_BACKFILL_PROXY_CONTROL_TOKEN is set but "
+            "TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON is empty; set the backfill "
+            "pool or unset the backfill token"
         )
     if backfill_pool_json:
         try:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import dataclasses
+
 import hashlib
 import itertools
 import json
@@ -2058,3 +2061,53 @@ def test_runner_environment_never_inherits_listing_empty_flag(tmp_path):
         )
     assert 'TM_LISTING_AUTHORITATIVE_EMPTY' not in clean
     assert flagged['TM_LISTING_AUTHORITATIVE_EMPTY'] == 'true'
+
+
+PINNED_CAPPED_IDENTITY = 'b466939c88509c11337f9e232620a83e0319b1cd6ca8741b3c1ac668b2249b6e'
+
+
+def _fixed_identity_input(parent_byte_budget, parent_soft_byte_stop):
+    identity = cycle.ScopeIdentity(
+        parent_cycle_id='parent', resume_cycle_id='parent', child_cycle_id='child',
+        competition_id='GB1', edition_id='GB1-2025', canonical_competition_id='GB1',
+        canonical_season='2025', registry_snapshot_id='snap', capture_revision='rev',
+        scope_id='scope', result_base_dir='/r', entity_dir='/e',
+        scope_manifest_path='/m.json', parent_ledger_path='/l.json',
+        competition_record={'id': 'GB1'}, edition_current=True,
+        edition_participant_count=20,
+    )
+    args = argparse.Namespace(
+        reader_revision=7, candidate_slot='a', write_mode='candidate',
+        cycle_budget_bytes=25165824, soft_byte_stop_bytes=20971520,
+        request_limit=400, retry_limit=40,
+        parent_byte_budget=parent_byte_budget, parent_soft_byte_stop=parent_soft_byte_stop,
+        parent_request_limit=5000, parent_retry_limit=500, career_window_limit=3,
+        coach_history_ttl_days=30, lease_ttl_seconds=3600,
+    )
+    return identity, args, {'players': {'requests': 10}}
+
+
+def test_checkpoint_identity_with_set_parent_caps_is_unchanged_by_1387():
+    """Capped (backfill) checkpoints keep their pre-#1387 identity and resume."""
+    identity, args, limits = _fixed_identity_input(352321536, 335544320)
+    # The pre-#1387 formula (origin/master before #1387), spelled out.
+    before = cycle.stable_hash({
+        **dataclasses.asdict(identity),
+        'reader_revision': 7, 'candidate_slot': 'a', 'write_mode': 'candidate',
+        'cycle_budget_bytes': 25165824, 'soft_byte_stop_bytes': 20971520,
+        'request_limit': 400, 'retry_limit': 40,
+        'parent_byte_budget': 352321536, 'parent_soft_byte_stop': 335544320,
+        'parent_request_limit': 5000, 'parent_retry_limit': 500,
+        'career_window_limit': 3, 'coach_history_ttl_days': 30,
+        'lease_ttl_seconds': 3600, 'entity_limits': limits,
+    })
+    assert cycle._checkpoint_identity(identity, args, limits) == before
+    assert before == PINNED_CAPPED_IDENTITY
+
+
+def test_checkpoint_identity_without_parent_caps_differs_and_is_stable():
+    identity, capped, limits = _fixed_identity_input(352321536, 335544320)
+    _, uncapped, _ = _fixed_identity_input(None, None)
+    first = cycle._checkpoint_identity(identity, uncapped, limits)
+    assert first == cycle._checkpoint_identity(identity, uncapped, limits)
+    assert first != cycle._checkpoint_identity(identity, capped, limits)

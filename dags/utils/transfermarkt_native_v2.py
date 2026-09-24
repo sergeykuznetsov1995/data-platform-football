@@ -24,9 +24,7 @@ from typing import Any, Iterable, Mapping, Sequence
 # The paid-traffic budget canon is stdlib-only, so readiness can pin the same
 # numbers the crawl actually ran under without importing any scraper runtime.
 from scrapers.transfermarkt.models import (
-    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
     PARENT_DAILY_PLANNING_BYTES,
-    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
     PARENT_REQUEST_LIMIT,
     PARENT_RETRY_LIMIT,
     SCOPE_HARD_PROVIDER_BYTE_CAP,
@@ -69,10 +67,9 @@ SLOTS = ('a', 'b')
 # evidence already accumulated under the previous one.  Requests/retries have
 # no per-row limit column and keep today's ceiling, which can only be looser
 # than any earlier epoch's limit.
-# #1387: no parent byte cap exists any more (both are ``None``).  A ledger
-# row with NULL parent caps belongs to that uncapped epoch and is valid.
-SCOPE_SET_HARD_BYTE_CAP = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
-SCOPE_SET_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
+# #1387: no parent byte cap exists any more, so readiness keeps no byte
+# ceiling constant.  A ledger row with NULL parent caps belongs to that
+# uncapped epoch and is valid.
 SCOPE_SET_REQUEST_LIMIT = PARENT_REQUEST_LIMIT
 SCOPE_SET_RETRY_LIMIT = PARENT_RETRY_LIMIT
 

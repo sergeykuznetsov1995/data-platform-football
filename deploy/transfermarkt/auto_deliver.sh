@@ -226,26 +226,16 @@ restore_state(){
 }
 trap restore_state EXIT
 
-mounts_in(){  # mounts_in <контейнер> <дерево> <сколько монтов минимум>
-  local out
-  out=$(inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$1") || { echo X; return; }
-  printf '%s\n' "$out" | awk -v root="$RELEASES_DIR/" -v new="$2" -v min="$3" '
-    index($0,root)==1 { t++; if ($0!=new && index($0,new"/")!=1) b++ }
-    END { print (t>=min && b==0) ? 1 : 0 }'
-}
 mounts_all_in(){  # mounts_all_in <дерево>: scheduler ≥ 5 монтов из дерева, шлюз ≥ 1
   local a b
-  a=$(mounts_in "$SCHED" "$1" 5); b=$(mounts_in "$GW" "$1" 1)
+  a=$(transfermarkt_mounts_in "$SCHED" "$RELEASES_DIR" "$1" 5)
+  b=$(transfermarkt_mounts_in "$GW" "$RELEASES_DIR" "$1" 1)
   case "$a$b" in *X*) echo X ;; 11) echo 1 ;; *) echo 0 ;; esac
 }
-gateway_health_ok(){  # /health шлюза изнутри планировщика: transfermarkt-only, без daily_*
-  local out
-  out=$(timeout -k 5 60 docker exec "$SCHED" python -c '
-import json, urllib.request
-h = json.load(urllib.request.urlopen("http://transfermarkt_gw:8899/health", timeout=10))
-print("ok" if h.get("source_mode") == "transfermarkt-only" and not any(k.startswith("daily_") for k in h) else "bad")
-' 2>/dev/null 8>&- 9>&-) || { echo X; return; }
-  [ "$out" = ok ] && echo 1 || echo 0
+gateway_health_ok(){  # 1 / 0 / X по пробе transfermarkt_gateway_health_ok из env.sh
+  local rc=0
+  transfermarkt_gateway_health_ok "$SCHED" >/dev/null 2>&1 8>&- 9>&- || rc=$?
+  case "$rc" in 0) echo 1 ;; 1) echo 0 ;; *) echo X ;; esac
 }
 # Приёмка — шесть признаков: 4 DAG перечитаны ПОСЛЕ старта этого scheduler'а и без ошибок
 # импорта; scheduler healthy (heartbeat SchedulerJob); шлюз healthy на 1 GiB в проекте transfermarkt-gw; монты scheduler'а и шлюза в

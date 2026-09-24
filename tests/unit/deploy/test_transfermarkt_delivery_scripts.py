@@ -298,9 +298,8 @@ esac
 """
 
 
-@pytest.mark.unit
-def test_first_deploy_on_a_fresh_metabase_registers_and_sets_pauses(tmp_path: Path) -> None:
-    """README: metadb + init, затем deploy.sh — в метабазе ещё нет ни одного DAG."""
+def _deploy_stand(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    """Каталоги и заглушки для прямого запуска deploy.sh: state, runtime, release, stubs, env."""
     state = tmp_path / "stand"
     state.mkdir()
     runtime = tmp_path / "runtime"
@@ -332,11 +331,22 @@ def test_first_deploy_on_a_fresh_metabase_registers_and_sets_pauses(tmp_path: Pa
         f"TRANSFERMARKT_PLATFORM_ENV_FILE={platform}\nTRANSFERMARKT_PROXY_POOL_FILE={pool}\n",
         encoding="utf-8",
     )
-    result = subprocess.run(
+    return state, runtime, release, stubs, env_file
+
+
+def _run_deploy(release: Path, stubs: Path, env_file: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
         ["bash", str(release / "deploy" / "transfermarkt" / "deploy.sh"), str(release)],
         env={"PATH": f"{stubs}:{os.environ['PATH']}", "TRANSFERMARKT_ENV_FILE": str(env_file)},
         capture_output=True, text=True, timeout=120,
     )
+
+
+@pytest.mark.unit
+def test_first_deploy_on_a_fresh_metabase_registers_and_sets_pauses(tmp_path: Path) -> None:
+    """README: metadb + init, затем deploy.sh — в метабазе ещё нет ни одного DAG."""
+    state, runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    result = _run_deploy(release, stubs, env_file)
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"TRANSFERMARKT_RELEASE_ROOT={release}\n" in env_file.read_text(encoding="utf-8")
     assert (state / "pool_fed").exists()
@@ -348,6 +358,38 @@ def test_first_deploy_on_a_fresh_metabase_registers_and_sets_pauses(tmp_path: Pa
         assert (state / f"paused_{dag}").read_text().strip() == paused, dag
     for p in POOLS:
         assert (state / f"pool_{p}").read_text().strip() == "1", p
+
+
+@pytest.mark.unit
+def test_a_manual_pause_survives_deploy(tmp_path: Path) -> None:
+    """Выкат возвращает паузы, снятые до него, а не дефолт: ручная пауза ingest остаётся."""
+    state, _runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    (state / "registered").write_text("4\n", encoding="utf-8")
+    before = {"dag_ingest_transfermarkt": "t", "dag_discover_transfermarkt_registry": "f",
+              "dag_backfill_transfermarkt": "t", "dag_transform_transfermarkt_silver": "t"}
+    for dag, paused in before.items():
+        (state / f"paused_{dag}").write_text(paused + "\n", encoding="utf-8")
+    result = _run_deploy(release, stubs, env_file)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for dag, paused in before.items():
+        assert (state / f"paused_{dag}").read_text().strip() == paused, dag
+
+
+@pytest.mark.unit
+def test_a_failed_ledger_archive_stops_deploy_and_keeps_the_ledger(tmp_path: Path) -> None:
+    state, runtime, release, stubs, env_file = _deploy_stand(tmp_path)
+    ledger = runtime / "gateway-state" / "paid_requests.jsonl"
+    body = '{"occurred_at":"2020-01-01T00:00:00Z","bytes":1}\n'
+    ledger.write_text(body, encoding="utf-8")
+    gzip = stubs / "gzip"
+    gzip.write_text("#!/bin/bash\necho 'gzip: no space left' >&2\nexit 1\n", encoding="utf-8")
+    gzip.chmod(0o755)
+    result = _run_deploy(release, stubs, env_file)
+    assert result.returncode == 5, result.stdout + result.stderr
+    assert ledger.read_text(encoding="utf-8") == body
+    assert list((runtime / "gateway-state").glob("paid_requests.*.gz*")) == []
+    assert "ledger archive failed" in (runtime / "deploy.log").read_text(encoding="utf-8")
+    assert not (state / "pool_fed").exists()
 
 
 @pytest.mark.unit

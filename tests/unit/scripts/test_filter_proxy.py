@@ -10262,7 +10262,7 @@ _TM_ONLY_ARGV = [
 ]
 
 
-def _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path, extra_argv=()):
+def _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path, extra_argv=(), env=None):
     """Run the real ``main()`` with real argparse; stub only sockets and pool."""
 
     argv = [
@@ -10320,6 +10320,8 @@ def _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path, extra_argv=()):
     monkeypatch.setenv("TM_PROXY_CONTROL_TOKEN", "t" * 32)
     monkeypatch.delenv("TM_BACKFILL_PROXY_CONTROL_TOKEN", raising=False)
     monkeypatch.delenv("TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON", raising=False)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
     asyncio.run(shared_mod.main())
 
 
@@ -10522,3 +10524,58 @@ def test_shared_mode_still_requires_positive_budgets(
     )
     with pytest.raises(SystemExit, match="budgets must be positive"):
         asyncio.run(shared_mod.main())
+
+
+def test_transfermarkt_only_authenticates_before_rejecting_a_foreign_source(
+    shared_mod, monkeypatch, tmp_path
+):
+    """#1387 /code-review: an unauthenticated caller gets 401, never 403."""
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    request = json.dumps(
+        {**_tm_metadata("dag_ingest_sofascore"), "source": "sofascore",
+         "max_bytes": 1_000, "ttl_seconds": 30}
+    ).encode()
+
+    class Reader:
+        async def readexactly(self, length):
+            return request
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    asyncio.run(
+        shared_mod._handle_control(
+            "POST",
+            "/v1/leases",
+            {"content-length": str(len(request)), "x-proxy-control-token": "t" * 32},
+            Reader(),
+            writer,
+            mgr,
+        )
+    )
+    head, body = bytes(writer.payload).split(b"\r\n\r\n", 1)
+    assert b"401" in head.split(b"\r\n", 1)[0]
+    assert "source_rejected" not in body.decode()
+    assert mgr.calls == 0
+
+
+def test_transfermarkt_only_backfill_token_requires_backfill_pool(
+    shared_mod, monkeypatch, tmp_path
+):
+    with pytest.raises(SystemExit, match="TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON is empty"):
+        _boot_transfermarkt_only(
+            shared_mod, monkeypatch, tmp_path,
+            env={"TM_BACKFILL_PROXY_CONTROL_TOKEN": "b" * 32},
+        )

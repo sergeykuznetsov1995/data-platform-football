@@ -20,3 +20,33 @@ def test_canon_rejects_a_half_set_parent_pair(monkeypatch):
     monkeypatch.setattr(models, 'PARENT_DAILY_HARD_PROVIDER_BYTE_CAP', 400_000_000)
     with pytest.raises(AssertionError, match='parent byte cap'):
         models._assert_budget_canon()
+
+
+def test_canon_and_scope_cycle_accept_the_same_parent_pairs():
+    import pytest
+
+    from dags.scripts.run_transfermarkt_scope_cycle import (
+        ScopeCycleError,
+        _parent_byte_caps,
+    )
+
+    scope_hard = models.SCOPE_HARD_PROVIDER_BYTE_CAP
+    cases = [
+        ((None, None), True),
+        ((scope_hard, scope_hard), True),
+        ((models.PARENT_DAILY_PLANNING_BYTES,
+          models.BACKFILL_BATCH_SOFT_BYTE_STOP), True),
+        ((scope_hard, 1), True),
+        ((scope_hard - 1, 1), False),
+        ((scope_hard, scope_hard + 1), False),
+        ((scope_hard, 0), False),
+        ((scope_hard, None), False),
+        ((None, 1), False),
+    ]
+    for (hard, soft), ok in cases:
+        assert models.parent_byte_caps_valid(hard, soft) is ok, (hard, soft)
+        if ok:
+            assert _parent_byte_caps(hard, soft) == (hard, soft)
+        else:
+            with pytest.raises(ScopeCycleError):
+                _parent_byte_caps(hard, soft)

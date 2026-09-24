@@ -64,7 +64,9 @@ PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP: Optional[int] = None
 
 PARENT_DAILY_PLANNING_BYTES = 352_321_536
 """Planning estimate of one day's paid traffic (336 MiB) for the freshness
-horizon.  NOT a cap and enforced nowhere since #1387."""
+horizon.  Not enforced in the current-season (ingest) contour since #1387.
+History uses it as the batch-local hard cap of one backfill batch (see
+``dag_backfill_transfermarkt``); it is never a UTC-day cap."""
 
 BACKFILL_BATCH_SOFT_BYTE_STOP = 335_544_320
 """Batch-local graceful stop of one historical backfill batch (320 MiB).
@@ -183,6 +185,20 @@ PRODUCTION_ENTITY_BUDGETS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def parent_byte_caps_valid(hard: Optional[int], soft: Optional[int]) -> bool:
+    """The one rule for a parent (hard, soft) provider-byte pair.
+
+    Both unset (``None``), or both set with ``0 < soft <= hard`` and
+    ``hard >= SCOPE_HARD_PROVIDER_BYTE_CAP``.  The import-time canon check and
+    the scope-cycle runner both use this predicate, so they accept exactly the
+    same pairs.
+    """
+
+    if hard is None or soft is None:
+        return hard is None and soft is None
+    return 0 < soft <= hard and hard >= SCOPE_HARD_PROVIDER_BYTE_CAP
+
+
 def _assert_budget_canon() -> None:
     """Fail the import when the budget canon is internally inconsistent."""
 
@@ -196,19 +212,12 @@ def _assert_budget_canon() -> None:
             'Transfermarkt provider byte budgets must satisfy '
             'scope soft < scope hard <= daily planning estimate'
         )
-    if (PARENT_DAILY_HARD_PROVIDER_BYTE_CAP is None) != (
-        PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP is None
-    ) or (
-        PARENT_DAILY_HARD_PROVIDER_BYTE_CAP is not None
-        and not (
-            SCOPE_HARD_PROVIDER_BYTE_CAP
-            <= PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
-            < PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
-        )
+    if not parent_byte_caps_valid(
+        PARENT_DAILY_HARD_PROVIDER_BYTE_CAP, PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
     ):
         raise AssertionError(
             'a parent byte cap, when set, needs both values and must satisfy '
-            'scope hard <= parent soft < parent hard'
+            '0 < parent soft <= parent hard and parent hard >= scope hard'
         )
     if not (
         SCOPE_HARD_PROVIDER_BYTE_CAP
