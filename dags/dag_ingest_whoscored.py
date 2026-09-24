@@ -18,7 +18,7 @@ keeps the current window fresh.
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,17 +36,20 @@ DAG_ID = "dag_ingest_whoscored"
 RUNNER = "dags/scripts/run_whoscored_scraper.py"
 DISCOVERY_PATH = "/tmp/whoscored_discovery_{{ ts_nodash }}.json"
 RESULT_PATH = "/tmp/whoscored_result_{{ ts_nodash }}.json"
+# Tree the Bash tasks run from; the isolated WhoScored stack mounts it outside
+# /opt/airflow and sets WHOSCORED_RUNTIME_ROOT.
+RUNTIME_ROOT = os.environ.get("WHOSCORED_RUNTIME_ROOT", "/opt/airflow")
 
 # The scraper subprocess reads the residential pool from WHOSCORED_PROXY_FILE
-# (host:port:user:pass, one sticky member per task).  Deploy points this at the
-# mounted WhoScored pool; the default matches the standard proxy mount.
+# (host:port:user:pass, one sticky member per task).  No default: an unset pool
+# fails discover instead of egressing from the host IP.
 _TASK_ENV = {
-    "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+    # Order matters: runtime_contract requires PYTHONPATH to be an ordered
+    # subsequence of the anchored sys.path (root, root/dags).
+    "PYTHONPATH": f"{RUNTIME_ROOT}:{RUNTIME_ROOT}/dags",
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
     "HOME": "/home/airflow",
-    "WHOSCORED_PROXY_FILE": os.environ.get(
-        "WHOSCORED_PROXY_FILE", "/opt/airflow/proxys.txt"
-    ),
+    "WHOSCORED_PROXY_FILE": os.environ.get("WHOSCORED_PROXY_FILE", ""),
 }
 
 # Global-grain Bronze tables that must keep refreshing on every daily run.
@@ -180,12 +183,12 @@ with DAG(
     discover_catalog = BashOperator(
         task_id="discover_catalog",
         bash_command=(
-            "cd /opt/airflow && rm -f {discovery} && "
+            "cd {root} && rm -f {discovery} && "
             "python {runner} discover "
             "--as-of-date {{{{ ds }}}} "
             "--transport-policy direct_only "
             "--output {discovery}"
-        ).format(runner=RUNNER, discovery=DISCOVERY_PATH),
+        ).format(root=RUNTIME_ROOT, runner=RUNNER, discovery=DISCOVERY_PATH),
         env=_TASK_ENV,
         append_env=True,
     )
@@ -197,15 +200,17 @@ with DAG(
         # the error-budget gate downstream is the judge; the task itself only
         # fails when the runner died without a report.
         bash_command=(
-            "cd /opt/airflow && rm -f {result} && "
+            "cd {root} && rm -f {result} && "
             "python {runner} daily "
             "--skip-profiles "
             "--transport-policy direct_only "
             "--output {result} "
             "|| [ -s {result} ]"
-        ).format(runner=RUNNER, result=RESULT_PATH),
+        ).format(root=RUNTIME_ROOT, runner=RUNNER, result=RESULT_PATH),
         env=_TASK_ENV,
         append_env=True,
+        # SCRAPER_ARGS gives 2h; one daily over ~141 active scopes needs more.
+        execution_timeout=timedelta(hours=8),
     )
 
     validate = PythonOperator(

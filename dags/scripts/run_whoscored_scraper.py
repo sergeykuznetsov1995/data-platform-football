@@ -1094,7 +1094,12 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict[str, Any]:
             "dag_run_id": os.environ.get("AIRFLOW_CTX_DAG_RUN_ID"),
             "task_id": os.environ.get("AIRFLOW_CTX_TASK_ID"),
             "try_number": os.environ.get("AIRFLOW_CTX_TRY_NUMBER"),
-            "map_index": os.environ.get("AIRFLOW_CTX_MAP_INDEX"),
+            # Airflow leaves this unset for non-mapped tasks; -1 is its
+            # convention.  Outside Airflow the identity stays fully empty.
+            "map_index": os.environ.get(
+                "AIRFLOW_CTX_MAP_INDEX",
+                "-1" if os.environ.get("AIRFLOW_CTX_TASK_ID") else None,
+            ),
         },
         "status": "running",
         "command": command,

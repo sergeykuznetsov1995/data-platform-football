@@ -69,6 +69,54 @@ def test_ingest_tasks_are_direct_pool_native(ingest):
     assert daily._init_kwargs["append_env"] is True
 
 
+def test_ingest_daily_has_eight_hour_timeout(ingest):
+    from datetime import timedelta
+
+    daily = _bash("ingest_daily")
+    assert daily._init_kwargs["execution_timeout"] == timedelta(hours=8)
+
+
+@pytest.mark.parametrize("module_name", ["dag_ingest_whoscored", "dag_backfill_whoscored"])
+def test_proxy_file_has_no_default(monkeypatch, module_name):
+    # #1471: no silent default pool — an unset pool must reach the runner empty.
+    monkeypatch.delenv("WHOSCORED_PROXY_FILE", raising=False)
+    module = _reload(module_name)
+    assert module._TASK_ENV["WHOSCORED_PROXY_FILE"] == ""
+
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", "/opt/airflow/proxys.txt")
+    module = _reload(module_name)
+    assert module._TASK_ENV["WHOSCORED_PROXY_FILE"] == "/opt/airflow/proxys.txt"
+
+
+@pytest.mark.parametrize(
+    ("module_name", "task_ids"),
+    [
+        ("dag_ingest_whoscored", ("discover_catalog", "ingest_daily")),
+        ("dag_backfill_whoscored", ("run_backfill_chunk",)),
+    ],
+)
+def test_runtime_root_drives_cd_and_pythonpath(monkeypatch, module_name, task_ids):
+    monkeypatch.delenv("WHOSCORED_RUNTIME_ROOT", raising=False)
+    module = _reload(module_name)
+    assert module._TASK_ENV["PYTHONPATH"] == "/opt/airflow:/opt/airflow/dags"
+    for task_id in task_ids:
+        assert _bash(task_id)._init_kwargs["bash_command"].startswith(
+            "cd /opt/airflow && "
+        )
+
+    monkeypatch.setenv("WHOSCORED_RUNTIME_ROOT", "/opt/whoscored-src")
+    module = _reload(module_name)
+    # Order is load-bearing: runtime_contract wants (root, root/dags).
+    assert (
+        module._TASK_ENV["PYTHONPATH"]
+        == "/opt/whoscored-src:/opt/whoscored-src/dags"
+    )
+    for task_id in task_ids:
+        assert _bash(task_id)._init_kwargs["bash_command"].startswith(
+            "cd /opt/whoscored-src && "
+        )
+
+
 def test_ingest_has_validation_and_freshness(ingest):
     _python("validate_data")
     freshness = _python("validate_bronze_freshness")
@@ -77,11 +125,12 @@ def test_ingest_has_validation_and_freshness(ingest):
 
 # ----------------------------- backfill ----------------------------------
 
-def test_backfill_dag_is_continuous_and_paused(backfill):
+def test_backfill_dag_is_manual_and_paused(backfill):
     from utils.default_args import SCRAPER_ARGS
 
     assert backfill.dag.dag_id == "dag_backfill_whoscored"
-    assert backfill.dag.schedule == "@continuous"
+    # History stays manual until #1480.
+    assert backfill.dag.schedule is None
     assert backfill.dag._dag_kwargs["max_active_runs"] == 1
     assert backfill.dag._dag_kwargs["is_paused_upon_creation"] is True
     assert backfill.dag._dag_kwargs["default_args"] is SCRAPER_ARGS
