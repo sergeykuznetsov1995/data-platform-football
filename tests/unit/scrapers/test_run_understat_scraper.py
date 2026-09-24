@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from unittest.mock import MagicMock
 
@@ -152,6 +153,7 @@ class _Repository:
         self.legacy_schedule_rows = legacy_schedule_rows
         self.previous = previous
         self.appended: list[ScopeAttempt] = []
+        self.failures: list[ScopeAttempt] = []
         self.ensured = False
         self.verified: list[ScopeAttempt] = []
 
@@ -186,6 +188,10 @@ class _Repository:
     def append_attempt(self, attempt):
         self.appended.append(attempt)
         return "iceberg.ops.understat_ingest_manifest_v1"
+
+    def append_failure(self, attempt):
+        self.failures.append(attempt)
+        return "iceberg.ops.understat_ingest_failures_v1"
 
 
 def _scraper_factory(frames, *, save_error=None):
@@ -614,3 +620,111 @@ def test_cli_requires_explicit_exact_scope_and_rejects_legacy_multi_scope_flags(
     )
     assert parsed.league == LEAGUE and parsed.source_season_id == 2025
     assert parsed.source_discovered == "true"
+
+
+def test_dq_failure_is_journaled_with_game_lists_and_result_is_unchanged():
+    """#1429: DQ failures go to the failures journal, never to the manifest."""
+    invalid_frames = _complete_frames()
+    invalid_frames["understat_shots"] = invalid_frames["understat_shots"].drop(
+        columns=["xg"]
+    )
+    factory, _ = _scraper_factory(invalid_frames)
+    repository = _Repository()
+
+    payload, exit_code = runner.run_scope(
+        _args(), scraper_factory=factory, repository=repository
+    )
+
+    assert exit_code == 1
+    assert payload["status"] == "schema_drift"
+    assert repository.appended == []
+    [journaled] = repository.failures
+    assert journaled.status is ManifestStatus.DQ_FAILURE
+    assert journaled.batch_id == payload["batch_id"]
+    assert journaled.error_type == "schema_drift"
+    assert journaled.error_message == payload["errors"][0]
+    assert journaled.quality["site_result_game_ids"] == ["100"]
+    assert journaled.quality["covered_game_ids"] == ["100"]
+    assert journaled.quality["issues"]
+
+
+def test_exception_before_write_marker_is_journaled_but_manifest_untouched():
+    factory, scraper = _scraper_factory(_complete_frames())
+    scraper.scrape_scope.side_effect = TimeoutError("source timed out")
+    repository = _Repository()
+
+    payload, exit_code = runner.run_scope(
+        _args(), scraper_factory=factory, repository=repository
+    )
+
+    assert exit_code == 1
+    assert payload["status"] == "retryable_failure"
+    assert repository.appended == []
+    [journaled] = repository.failures
+    assert journaled.status is ManifestStatus.RETRYABLE_FAILURE
+    assert journaled.error_message == "source timed out"
+    assert journaled.quality["site_result_known"] is False
+    assert journaled.quality["site_result_game_ids"] == []
+
+
+def test_exception_after_write_marker_goes_to_manifest_and_journal():
+    factory, _ = _scraper_factory(
+        _complete_frames(), save_error=ReplaceGuardError("shrink")
+    )
+    repository = _Repository()
+
+    payload, exit_code = runner.run_scope(
+        _args(), scraper_factory=factory, repository=repository
+    )
+
+    assert exit_code == 3
+    assert [attempt.status for attempt in repository.appended] == [
+        ManifestStatus.IN_PROGRESS,
+        ManifestStatus.CONTRACT_FAILURE,
+    ]
+    [journaled] = repository.failures
+    assert journaled == repository.appended[-1]
+    assert journaled.quality["site_result_known"] is True
+    assert journaled.quality["site_result_game_ids"] == ["100"]
+    assert payload["scope_attempt"] == journaled.to_dict()
+
+
+def test_early_failure_before_attempt_is_journaled_with_next_attempt_no(
+    tmp_path, monkeypatch
+):
+    from scrapers.understat.manifest import UnderstatManifestRepository
+
+    repository = _Repository()
+    complete_factory, _ = _scraper_factory(_complete_frames())
+    runner.run_scope(
+        _args(), scraper_factory=complete_factory, repository=repository
+    )
+    monkeypatch.setattr(
+        UnderstatManifestRepository, "from_env", classmethod(lambda cls: repository)
+    )
+    output = tmp_path / "result.json"
+
+    exit_code = runner.main(
+        [
+            "--mode", "backfill",
+            "--league", LEAGUE,
+            "--season-slug", "2526",
+            "--source-season-id", "2025",
+            "--source-discovered", "false",
+            "--output", str(output),
+            "--run-id", "test-run",
+        ]
+    )
+
+    assert exit_code == 1
+    result = json.loads(output.read_text())
+    assert set(result) == {
+        "status", "league", "season", "source_season_id", "errors"
+    }
+    assert result["status"] == "contract_failure"
+    [journaled] = repository.failures
+    assert journaled.status is ManifestStatus.CONTRACT_FAILURE
+    assert journaled.attempt_no == repository.appended[-1].attempt_no + 1
+    assert journaled.scope.source_league == "EPL"
+    assert journaled.error_type == "ValueError"
+    assert journaled.error_message == result["errors"][0]
