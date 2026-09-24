@@ -436,6 +436,10 @@ class _DeadExitResponse(RuntimeError):
         self.code = code
 
 
+class _LeaseTtlTimeout(asyncio.TimeoutError):
+    """A provider wait ran out on the lease's own TTL, not on the exit."""
+
+
 class _LeaseBudgetRefused(Exception):
     """Internal marker: a lease write was refused by its own byte budget.
 
@@ -6422,10 +6426,14 @@ async def _open_lease_upstream_tunnel(
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
         up_host, up_port, up_user, up_pass = lease.upstream
         srv_w = None
+        ttl_bound = False
         try:
             # A failover is another provider-bound session, not a free retry.
             # Charge its signed request slot before the TCP dial performs I/O.
             _record_whoscored_provider_dial(lease)
+            ttl_bound = _lease_ttl_bounds_window(
+                lease, LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS
+            )
             srv_r, srv_w = await asyncio.wait_for(
                 _open_upstream_connection(up_host, up_port),
                 _lease_operation_timeout(
@@ -6445,6 +6453,9 @@ async def _open_lease_upstream_tunnel(
                 srv_w, connect_request, lease=lease, host=host, direction="up"
             ):
                 raise _LeaseBudgetRefused()
+            ttl_bound = _lease_ttl_bounds_window(
+                lease, LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS
+            )
             status, response_headers, head_bytes = await _read_metered_provider_head(
                 srv_r,
                 lease,
@@ -6505,8 +6516,14 @@ async def _open_lease_upstream_tunnel(
                 # Budget refusals (429), over-budget heads and cancellation are
                 # not dead-exit signals: never failover, surface them as before.
                 raise
-            last_error = exc
-            _mark_exit_dead(lease.upstream, lease)
+            if ttl_bound and isinstance(
+                exc, (asyncio.TimeoutError, TimeoutError, UpstreamHeadTimeout)
+            ):
+                # The lease ran out, not the exit: never blame the exit.
+                last_error = _LeaseTtlTimeout(str(exc))
+            else:
+                last_error = exc
+                _mark_exit_dead(lease.upstream, lease)
         # FBref must never spend a second paid CONNECT attempt. SofaScore's
         # separately bounded dead-exit policy remains response-byte based.
         failover_allowed = (
@@ -6579,13 +6596,22 @@ def _dead_exit_count() -> int:
     return len(DEAD_EXITS)
 
 
+def _lease_ttl_bounds_window(lease: "Lease", ceiling_seconds: float) -> bool:
+    """True when the lease TTL, not the exit ceiling, sets the next deadline."""
+
+    return lease.expires_at - _wall_time() <= float(ceiling_seconds)
+
+
 def _connect_code_class(code: int | None) -> str:
     return str(code) if code is not None else "invalid"
 
 
 def _upstream_failure_class(exc: BaseException) -> str:
     if isinstance(exc, _DeadExitResponse):
-        return f"dead_exit_{_connect_code_class(exc.code)}"
+        # Same provider rejection as the ordinary non-200 path: name its code.
+        return str(exc.code) if exc.code is not None else "dead_exit"
+    if isinstance(exc, _LeaseTtlTimeout):
+        return "lease_expired"
     if isinstance(exc, UpstreamHeadIncomplete):
         return "incomplete"
     # TimeoutError is an OSError subclass: classify it before dial errors.
@@ -6895,6 +6921,13 @@ async def handle(
                             await client_w.drain()
                         client_w.close()
                         return
+                    if lease.closed:
+                        # Closed while dialing (close/reaper/latch): the leg was
+                        # outside tunnel_writers, so close it here and never
+                        # acknowledge or pump on a closed lease.
+                        srv_w.close()
+                        client_w.close()
+                        return
                     lease.tunnel_writers.add(client_w)
                 else:
                     srv_r, srv_w = await _open_upstream_connection(up_host, up_port)
@@ -6910,10 +6943,9 @@ async def handle(
                         return
                     status = await srv_r.readline()
                     await _read_headers(srv_r)
-                if _provider_connect_status_code(status) != 200:
-                    upstream_class = _connect_code_class(
-                        _provider_connect_status_code(status)
-                    )
+                connect_code = _provider_connect_status_code(status)
+                if connect_code != 200:
+                    upstream_class = _connect_code_class(connect_code)
                     _mark_exit_dead(
                         lease.upstream
                         if lease is not None
@@ -6934,13 +6966,21 @@ async def handle(
                             # response body in StreamReader read-ahead.  Retain
                             # the whole remaining escrow rather than discarding
                             # those unobservable provider bytes on close.
-                            _latch_lease_accounting_uncertainty(lease, reason=f"provider_connect_rejected_{_provider_connect_status_code(status)}")
+                            _latch_lease_accounting_uncertainty(lease, reason=f"provider_connect_rejected_{connect_code}")
                         return
                     _write_connect_rejection(client_w, upstream_class)
                     await client_w.drain()
                     client_w.close()
                     srv_w.close()
                     return
+                DEAD_EXITS.pop(
+                    _upstream_fingerprint(
+                        lease.upstream
+                        if lease is not None
+                        else (up_host, up_port, up_user, up_pass)
+                    ),
+                    None,
+                )
                 if lease is not None:
                     lease.tunnels_total += 1
                 if not local_connect_established:
@@ -6981,9 +7021,13 @@ async def handle(
                 )
             else:
                 conn_count[host] += 1
+                ttl_bound = False
                 try:
                     if lease is not None:
                         _record_whoscored_provider_dial(lease)
+                        ttl_bound = _lease_ttl_bounds_window(
+                            lease, LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS
+                        )
                     srv_r, srv_w = await asyncio.wait_for(
                         _open_upstream_connection(up_host, up_port),
                         (
@@ -7001,8 +7045,12 @@ async def handle(
                     client_w.close()
                     return
                 except (asyncio.TimeoutError, TimeoutError, OSError) as exc:
-                    upstream_class = _upstream_failure_class(exc)
-                    _mark_exit_dead((up_host, up_port, up_user, up_pass), lease)
+                    if ttl_bound and isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                        # The lease ran out, not the exit: never blame the exit.
+                        upstream_class = "lease_expired"
+                    else:
+                        upstream_class = _upstream_failure_class(exc)
+                        _mark_exit_dead((up_host, up_port, up_user, up_pass), lease)
                     _write_connect_rejection(client_w, upstream_class)
                     _record_connect_rejected(lease, upstream_class)
                     await client_w.drain()

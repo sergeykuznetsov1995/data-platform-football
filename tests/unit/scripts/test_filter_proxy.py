@@ -9883,6 +9883,99 @@ def test_backfill_pool_failures_do_not_count_against_production_pool(
     assert health["exit_pool_status"] == "ok"
 
 
+def test_lease_ttl_timeout_is_not_blamed_on_the_exit(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    shared_mod.DEAD_EXITS.clear()
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+    lease.expires_at = shared_mod._wall_time() + 0.05
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(block_when_empty=True), _FakeUpstreamWriter()
+
+    monkeypatch.setattr(shared_mod, "_open_upstream_connection", fake_open)
+    payload = _socket_connect(shared_mod, lease, mgr)
+
+    assert payload.startswith(
+        b"HTTP/1.1 502 Bad Gateway (upstream=lease_expired)\r\n"
+    )
+    assert shared_mod.DEAD_EXITS == {}
+
+
+def test_successful_connect_clears_the_dead_mark(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    shared_mod.DEAD_EXITS.clear()
+    shared_mod._mark_exit_dead(("pool.invalid", 10000, "u", "p"))
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(_LIVE_CONNECT_HEAD), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    payload = bytes(_tm_connect(shared_mod, lease, mgr).payload)
+
+    assert payload.startswith(b"HTTP/1.1 200 Connection established")
+    assert shared_mod.DEAD_EXITS == {}
+
+
+def test_lease_closed_during_dial_gets_no_200_and_no_pumps(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+    upstream_writer = _FakeUpstreamWriter()
+
+    class ClosingReader(_FakeUpstreamReader):
+        async def read(self, size):
+            # _close_lease/reaper lands while the provider head is in flight.
+            lease.closed = True
+            return await super().read(size)
+
+    async def fake_open(host, port):
+        return ClosingReader(_LIVE_CONNECT_HEAD), upstream_writer
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            shared_mod.handle(
+                _ClientConnectReader(
+                    _connect_header_lines(lease, host="www.transfermarkt.com"),
+                    tunnel_payload=b"client-bytes",
+                ),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"200 Connection established" not in bytes(client_writer.payload)
+    assert client_writer.closed is True
+    assert upstream_writer.closed is True
+    assert b"client-bytes" not in bytes(upstream_writer.data)
+    assert lease.tunnels_total == 0
+
+
+def test_first_tunnel_dead_exit_class_is_the_provider_code(shared_mod, monkeypatch):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(shared_mod, mgr)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(_DEAD_EXIT_RESPONSE), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    payload = bytes(_dead_exit_handle(shared_mod, lease, mgr).payload)
+
+    assert b"502 Bad Gateway (upstream=502)\r\n" in payload
+    assert b"dead_exit" not in payload
+
+
 def test_dead_exit_memory_expires_after_ttl(shared_mod, monkeypatch):
     shared_mod.DEAD_EXITS.clear()
     shared_mod._mark_exit_dead(("pool.invalid", 10000, "u", "p"))
