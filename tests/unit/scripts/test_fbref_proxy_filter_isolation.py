@@ -19,8 +19,8 @@ SHARED_FILTER_SHA256 = (
     # Bumped for the per-source SofaScore lease ceiling of the history lane
     # (#1248 stage 1).  FBref keeps its own filter and stays out of
     # ``runtime_files`` — both asserted below.  #1350: ledgers flushed off
-    # the per-chunk path.
-    "1d574f25969b9173a68c4af5e4c13de8b6f8e017ea1ba7d5ff59a4cb5716c1e3"
+    # the per-chunk path.  #1389-B: upstream failure class, tunnels, /health.
+    "27b6a73464c062109e6323b211f65cba1630d9cadf148fcbdad54087d175770b"
 )
 
 

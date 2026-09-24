@@ -9607,6 +9607,201 @@ def _dead_exit_handle(shared_mod, lease, mgr):
     return client_writer
 
 
+# --- #1389-B: upstream failure class, connect_rejected, tunnels, /health ----
+
+
+def _make_transfermarkt_lease(mod, mgr, *, budget=4096):
+    mod.LEASES.clear()
+    mod.LEASE_TOKENS.clear()
+    mod.TRANSFERMARKT_DAGRUN_BUDGET_BYTES = budget
+    return mod._create_lease(
+        mgr,
+        max_bytes=budget,
+        ttl_seconds=30,
+        metadata={
+            "dag_id": "dag_ingest_transfermarkt",
+            "run_id": "run-1389b",
+            "task_id": "capture",
+            "canonical_url": "https://www.transfermarkt.com/x",
+        },
+        require_context=True,
+    )
+
+
+def _ledger_events(mod):
+    path = Path(mod.LEDGER_PATH)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def _tm_connect(mod, lease, mgr, host="www.transfermarkt.com"):
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease, host=host)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+    return client_writer
+
+
+def test_upstream_407_is_classified_to_client_and_ledger(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return (
+            _FakeUpstreamReader(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"
+            ),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    payload = bytes(_tm_connect(shared_mod, lease, mgr).payload)
+
+    assert payload.startswith(b"HTTP/1.1 502 Bad Gateway (upstream=407)\r\n")
+    assert b"X-Proxy-Upstream-Status: 407\r\n" in payload
+    assert payload.endswith(b"\r\n\r\n407")
+    rejected = [
+        e for e in _ledger_events(shared_mod) if e["event_type"] == "connect_rejected"
+    ]
+    assert [e["reason"] for e in rejected] == ["407"]
+    assert rejected[0]["lease_id"] == lease.lease_id
+    assert lease.tunnels_total == 0
+
+
+def test_upstream_head_timeout_is_classified_as_timeout(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _shrink_failover_timeouts(shared_mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return (
+            _FakeUpstreamReader(block_when_empty=True),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    payload = bytes(_tm_connect(shared_mod, lease, mgr).payload)
+
+    assert b"502 Bad Gateway (upstream=timeout)" in payload
+    assert b"X-Proxy-Upstream-Status: timeout\r\n" in payload
+    assert [
+        e["reason"]
+        for e in _ledger_events(shared_mod)
+        if e["event_type"] == "connect_rejected"
+    ] == ["timeout"]
+    assert shared_mod._dead_exit_count() == 1
+
+
+def test_whoscored_rejection_after_local_200_stays_silent(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = shared_mod._create_lease(
+        mgr,
+        max_bytes=1_000,
+        ttl_seconds=30,
+        metadata=_whoscored_campaign_context(shared_mod, cap=1_000),
+        require_context=True,
+    )
+
+    async def fake_open(host, port):
+        return (
+            _FakeUpstreamReader(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"
+            ),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    client_writer = _ClientWriter()
+    asyncio.run(
+        shared_mod.handle(
+            _ClientConnectReader(
+                _connect_header_lines(lease, host="www.whoscored.com"),
+                tunnel_payload=_tls_client_hello(),
+            ),
+            client_writer,
+            mgr,
+            require_lease=True,
+        )
+    )
+
+    assert bytes(client_writer.payload) == (
+        b"HTTP/1.1 200 Connection established\r\n\r\n"
+    )
+    assert client_writer.closed is True
+    assert not [
+        e
+        for e in _ledger_events(shared_mod)
+        if e["event_type"] not in {"lease_created", "bytes", "lease_closed"}
+    ]
+
+
+def test_lease_closed_counts_successful_tunnels(shared_mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(_LIVE_CONNECT_HEAD), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    for _ in range(3):
+        payload = bytes(_tm_connect(shared_mod, lease, mgr).payload)
+        assert payload.startswith(b"HTTP/1.1 200 Connection established")
+    assert lease.report()["tunnels_total"] == 3
+
+    asyncio.run(shared_mod._close_lease(lease, completed=True))
+
+    closed = [
+        e for e in _ledger_events(shared_mod) if e["event_type"] == "lease_closed"
+    ]
+    assert [e["tunnels_total"] for e in closed] == [3]
+
+
+@pytest.mark.parametrize(
+    ("pool", "dead", "ratio", "pool_status"),
+    [(2, 1, 0.5, "ok"), (3, 2, 1 / 3, "degraded"), (0, 0, None, "ok")],
+)
+def test_health_reports_live_exit_share(shared_mod, pool, dead, ratio, pool_status):
+    shared_mod.DEAD_EXITS.clear()
+    for index in range(dead):
+        shared_mod._mark_exit_dead(("pool.invalid", 10000 + index, "u", "p"))
+
+    health = shared_mod._service_health_report(SimpleNamespace(total_count=pool))
+
+    assert health["status"] == "ok"
+    assert health["configured_pool_count"] == pool
+    assert health["live_exit_count"] == pool - dead
+    assert health["dead_exit_count"] == dead
+    assert health["live_exit_ratio"] == ratio
+    assert health["exit_pool_status"] == pool_status
+
+
+def test_dead_exit_memory_expires_after_ttl(shared_mod, monkeypatch):
+    shared_mod.DEAD_EXITS.clear()
+    shared_mod._mark_exit_dead(("pool.invalid", 10000, "u", "p"))
+    now = shared_mod.time.monotonic()
+    monkeypatch.setattr(
+        shared_mod.time,
+        "monotonic",
+        lambda: now + shared_mod.DEAD_EXIT_TTL_SECONDS + 1,
+    )
+
+    health = shared_mod._service_health_report(SimpleNamespace(total_count=1))
+
+    assert health["dead_exit_count"] == 0
+    assert health["live_exit_ratio"] == 1.0
+
+
 @pytest.mark.parametrize(
     "framing",
     [

@@ -431,6 +431,10 @@ class _DeadExitResponse(RuntimeError):
     fresh exit instead of latching accounting uncertainty.
     """
 
+    def __init__(self, code: int | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+
 
 class _LeaseBudgetRefused(Exception):
     """Internal marker: a lease write was refused by its own byte budget.
@@ -1002,6 +1006,8 @@ class Lease:
     # reduced only by observed provider bytes or a clean durable release.
     global_budget_escrow_bytes: int = 0
     active_tunnels: int = 0
+    # Upstream CONNECT tunnels this lease opened successfully (provider 200).
+    tunnels_total: int = 0
     # Provider reads must own billed-byte allowance before touching the socket.
     # Track them separately from tunnels so a silent client->provider leg cannot
     # monopolise the shared lease reservation and starve the provider reader.
@@ -1068,6 +1074,7 @@ class Lease:
             "down_bytes": self.down_bytes,
             "total_bytes": self.total_bytes,
             "active_tunnels": self.active_tunnels,
+            "tunnels_total": self.tunnels_total,
             "reserved_bytes": self.reserved_bytes,
             "global_budget_escrow_bytes": self.global_budget_escrow_bytes,
             "upstream_repins": self.upstream_repins,
@@ -5394,6 +5401,7 @@ def _reap_expired_leases() -> int:
                         if lease.source == "whoscored"
                         else {}
                     ),
+                    tunnels_total=lease.tunnels_total,
                     expired=True,
                 )
                 lease.close_recorded = True
@@ -5562,6 +5570,7 @@ async def _close_lease(
                     if lease.source == "whoscored"
                     else {}
                 ),
+                tunnels_total=lease.tunnels_total,
             )
             lease.close_recorded = True
         except Exception:
@@ -5610,8 +5619,20 @@ def _service_health_report(mgr) -> dict[str, Any]:
     """Credential-free configuration and counters, never pool identities."""
 
     remaining = max(0, DAILY_BUDGET_BYTES - _daily_total_bytes())
+    exit_total = int(getattr(mgr, "total_count", 0))
+    dead_exits = min(_dead_exit_count(), exit_total)
+    live_exits = exit_total - dead_exits
+    live_ratio = live_exits / exit_total if exit_total else None
     return {
         "status": "ok",
+        "live_exit_count": live_exits,
+        "dead_exit_count": dead_exits,
+        "live_exit_ratio": live_ratio,
+        "exit_pool_status": (
+            "degraded"
+            if live_ratio is not None and live_ratio < EXIT_POOL_DEGRADED_RATIO
+            else "ok"
+        ),
         "meter": PROVIDER_METER_ID,
         "daily_total_bytes": _daily_total_bytes(),
         "daily_budget_bytes": DAILY_BUDGET_BYTES,
@@ -6460,7 +6481,7 @@ async def _open_lease_upstream_tunnel(
                     head_bytes + drained,
                 )
                 observed_down_bytes += head_bytes + drained
-                raise _DeadExitResponse()
+                raise _DeadExitResponse(code)
             return srv_r, srv_w, status, response_headers
         except BaseException as exc:
             # No failed attempt may leak its socket or its tunnel_writers entry.
@@ -6485,6 +6506,16 @@ async def _open_lease_upstream_tunnel(
                 # not dead-exit signals: never failover, surface them as before.
                 raise
             last_error = exc
+            if isinstance(
+                exc,
+                (
+                    _DeadExitResponse,
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    UpstreamHeadTimeout,
+                ),
+            ):
+                _mark_exit_dead(lease.upstream)
         # FBref must never spend a second paid CONNECT attempt. SofaScore's
         # separately bounded dead-exit policy remains response-byte based.
         failover_allowed = (
@@ -6526,6 +6557,71 @@ async def _open_lease_upstream_tunnel(
             )
             continue
         raise last_error
+
+
+PROXY_UPSTREAM_STATUS_HEADER = "X-Proxy-Upstream-Status"
+DEAD_EXIT_TTL_SECONDS = 600.0
+EXIT_POOL_DEGRADED_RATIO = 0.5
+# Gateway-local memory of exits that recently failed (fingerprint -> monotonic
+# deadline).  It only feeds /health: ProxyManager rotation is left untouched so
+# WhoScored/SofaScore exit selection and a non-empty pick pool are unchanged.
+DEAD_EXITS: dict[str, float] = {}
+
+
+def _mark_exit_dead(upstream: tuple[str, int, str, str]) -> None:
+    DEAD_EXITS[_upstream_fingerprint(upstream)] = (
+        time.monotonic() + DEAD_EXIT_TTL_SECONDS
+    )
+
+
+def _dead_exit_count() -> int:
+    now = time.monotonic()
+    for key, deadline in list(DEAD_EXITS.items()):
+        if deadline <= now:
+            del DEAD_EXITS[key]
+    return len(DEAD_EXITS)
+
+
+def _connect_code_class(code: int | None) -> str:
+    return str(code) if code is not None else "invalid"
+
+
+def _upstream_failure_class(exc: BaseException) -> str:
+    if isinstance(exc, _DeadExitResponse):
+        return f"dead_exit_{_connect_code_class(exc.code)}"
+    if isinstance(exc, UpstreamHeadIncomplete):
+        return "incomplete"
+    # TimeoutError is an OSError subclass: classify it before dial errors.
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, UpstreamHeadTimeout)):
+        return "timeout"
+    return "dial_error"
+
+
+def _write_connect_rejection(client_w, upstream_class: str) -> None:
+    """Queue a 502 that names the upstream failure class.
+
+    The class is repeated in the reason-phrase because some proxy clients
+    surface only the status line of a failed CONNECT, never its headers.
+    """
+
+    body = upstream_class.encode("ascii")
+    client_w.write(
+        b"HTTP/1.1 502 Bad Gateway (upstream=" + body + b")\r\n"
+        + PROXY_UPSTREAM_STATUS_HEADER.encode("ascii") + b": " + body + b"\r\n"
+        + b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+        + b"Connection: close\r\n\r\n"
+        + body
+    )
+
+
+def _record_connect_rejected(lease: "Lease | None", upstream_class: str) -> None:
+    # The WhoScored canary ledger validator rejects unknown event types.
+    if lease is None or lease.source == "whoscored":
+        return
+    try:
+        _append_budget_event("connect_rejected", lease, reason=upstream_class)
+    except Exception:  # noqa: BLE001 - diagnostic event, no billed bytes
+        log.exception("could not persist connect rejection for lease %s", lease.lease_id)
 
 
 async def handle(
@@ -6786,12 +6882,14 @@ async def handle(
                         UpstreamHeadTimeout,
                         UpstreamHeadIncomplete,
                         _DeadExitResponse,
-                    ):
+                    ) as exc:
                         # Timeout/accounting-uncertainty paths already revoke;
                         # a proven empty EOF/reset remains a normal 502 after
                         # bounded failover attempts. The finally drains the slot.
                         if not local_connect_established:
-                            client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            upstream_class = _upstream_failure_class(exc)
+                            _write_connect_rejection(client_w, upstream_class)
+                            _record_connect_rejected(lease, upstream_class)
                             await client_w.drain()
                         client_w.close()
                         return
@@ -6810,6 +6908,9 @@ async def handle(
                     status = await srv_r.readline()
                     await _read_headers(srv_r)
                 if _provider_connect_status_code(status) != 200:
+                    upstream_class = _connect_code_class(
+                        _provider_connect_status_code(status)
+                    )
                     if lease is not None:
                         try:
                             # For other leases the HTTP tunnel is not established
@@ -6817,7 +6918,8 @@ async def handle(
                             # latch closes every writer. WhoScored already sent
                             # its local 200 to obtain SNI and can only close.
                             if not local_connect_established:
-                                client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                                _write_connect_rejection(client_w, upstream_class)
+                                _record_connect_rejected(lease, upstream_class)
                         finally:
                             # A complete non-200/invalid head can already have a
                             # response body in StreamReader read-ahead.  Retain
@@ -6825,11 +6927,13 @@ async def handle(
                             # those unobservable provider bytes on close.
                             _latch_lease_accounting_uncertainty(lease, reason=f"provider_connect_rejected_{_provider_connect_status_code(status)}")
                         return
-                    client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    _write_connect_rejection(client_w, upstream_class)
                     await client_w.drain()
                     client_w.close()
                     srv_w.close()
                     return
+                if lease is not None:
+                    lease.tunnels_total += 1
                 if not local_connect_established:
                     try:
                         client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -6887,8 +6991,12 @@ async def handle(
                     await client_w.drain()
                     client_w.close()
                     return
-                except (asyncio.TimeoutError, TimeoutError, OSError):
-                    client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                except (asyncio.TimeoutError, TimeoutError, OSError) as exc:
+                    upstream_class = _upstream_failure_class(exc)
+                    if upstream_class == "timeout":
+                        _mark_exit_dead((up_host, up_port, up_user, up_pass))
+                    _write_connect_rejection(client_w, upstream_class)
+                    _record_connect_rejected(lease, upstream_class)
                     await client_w.drain()
                     client_w.close()
                     return
