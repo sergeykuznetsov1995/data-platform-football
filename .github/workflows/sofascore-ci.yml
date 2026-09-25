@@ -21,6 +21,8 @@ on:
       - "dags/sql/**/*sofascore*"
       - "dags/utils/maintenance_tasks.py"
       - "dags/utils/sofascore_dq.py"
+      - "dags/utils/sofascore_pool_wait.py"
+      - "dags/utils/sofascore_red_share.py"
       - "deploy/sofascore/**"
       - "scrapers/base/**"
       - "scrapers/sofascore/**"
@@ -170,4 +172,6 @@ jobs:
             tests/unit/sql/test_sofascore_league_table_silver.py \
             tests/unit/sql/test_sofascore_post_shot_xg.py \
             tests/unit/utils/test_sofascore_all_mens_state.py \
+            tests/unit/utils/test_sofascore_pool_wait.py \
+            tests/unit/utils/test_sofascore_red_share.py \
             tests/integration/test_compose_validity.py
