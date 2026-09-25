@@ -175,9 +175,8 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
     assert env["SOFASCORE_PROXY_CONTROL_URL"] == "http://sofascore_proxy_filter:8899"
     assert env["SOFASCORE_ALL_MENS_STATE"] == "/opt/airflow/runtime/sofascore/all-men/state.json"
     assert env["SOFASCORE_REFRESH_BATCH_SIZE"] == "${SOFASCORE_REFRESH_BATCH_SIZE:-3}"
-    # Полосы (#1244): история и игроки ходят к своим шлюзам и держат свои пулы;
-    # актуалка и дейли остаются на дефолтах (sofascore_proxy_filter/ingest_scraper_pool),
-    # поэтому их ключей здесь сознательно нет.
+    # Полосы (#1244, #1360): история и актуалка ходят к своим шлюзам и держат свои
+    # пулы; дейли остаётся на дефолтах (sofascore_proxy_filter/ingest_scraper_pool).
     assert env["SOFASCORE_HISTORY_POOL"] == "sofascore_history_pool"
     assert env["SOFASCORE_HISTORY_PROXY_CONTROL_URL"] == "http://sofascore_gw_history:8899"
     # Ручки кампании (#1248 ступень 1): DAG читает их ТОЛЬКО из окружения планировщика,
@@ -188,9 +187,12 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
         env["SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE"]
         == "${SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE:-60}"
     )
-    assert env["SOFASCORE_PLAYERS_POOL"] == "sofascore_players_pool"
-    assert env["SOFASCORE_PLAYERS_PROXY_CONTROL_URL"] == "http://sofascore_gw_players:8899"
-    assert "SOFASCORE_REFRESH_POOL" not in env and "SOFASCORE_REFRESH_PROXY_CONTROL_URL" not in env
+    # #1360: актуалке отдан третий шлюз и пул (бывшая полоса игроков #1244, имена
+    # сохранены); ключей PLAYERS никто не читает — в рецепте их нет.
+    assert env["SOFASCORE_REFRESH_POOL"] == "sofascore_players_pool"
+    assert env["SOFASCORE_REFRESH_PROXY_CONTROL_URL"] == "http://sofascore_gw_players:8899"
+    assert "SOFASCORE_PLAYERS_POOL" not in env
+    assert "SOFASCORE_PLAYERS_PROXY_CONTROL_URL" not in env
     # deploy.sh не пересоздаёт airflow-init, поэтому пулы ставятся и здесь (первый
     # подъём контура), и шагом pools самого deploy.sh (ротация).
     init = "\n".join(cfg["services"]["airflow-init"]["command"])

@@ -58,14 +58,15 @@ x-ss-airflow-common: &ss-airflow-common
     # Хардкод (не из .env): в sofascore-net алиас sofascore_proxy_filter — наш шлюз
     # проекта sofascore-gw (container_name у него другой, alias — от имени сервиса).
     SOFASCORE_PROXY_CONTROL_URL: http://sofascore_proxy_filter:8899
-    # Полосы источника (#1244): три шлюза проекта sofascore-gw, три пула Airflow.
-    # Кампанию истории эти ключи включают сразу: dag_backfill_sofascore_all_mens:53,72
-    # уже читает SOFASCORE_HISTORY_POOL и SOFASCORE_HISTORY_PROXY_CONTROL_URL.
-    # Пару PLAYERS пока НЕ читает никто — её потребитель, отдельный DAG полосы
-    # игроков, приходит вторым PR той же задачи #1244; до него шлюз
-    # sofascore_gw_players стоит без нагрузки (профили собирает ротация дейли
-    # в полосе актуалки). Актуалка и дейли остаются на дефолтах выше — их полоса
-    # это sofascore_gw_951 и ingest_scraper_pool, который сериализует их между собой.
+    # Полосы источника (#1244, #1360): три шлюза проекта sofascore-gw, три пула Airflow.
+    # Дейли — на дефолтах выше (sofascore_gw_951 + ingest_scraper_pool); история —
+    # sofascore_gw_history + sofascore_history_pool (dag_backfill_sofascore_all_mens).
+    # Актуалка (#1360): полоса игроков #1244 поглощена #1360 — третий шлюз и пул
+    # отданы актуалке, чтобы она не ждала дейли в общем слоте ingest_scraper_pool.
+    # Имена контейнера sofascore_gw_players, пула sofascore_players_pool и каталога
+    # состояния gateway-state-players сохранены, чтобы не трогать хост;
+    # переименование — вместе с выводом дейли (задача 20). Ключи читает
+    # dag_refresh_sofascore_all_mens (REFRESH_POOL, REFRESH_TASK_ENV).
     SOFASCORE_HISTORY_POOL: sofascore_history_pool
     SOFASCORE_HISTORY_PROXY_CONTROL_URL: http://sofascore_gw_history:8899
     # Ручки кампании истории (#1248 ступень 1): DAG читает их только отсюда —
@@ -78,8 +79,8 @@ x-ss-airflow-common: &ss-airflow-common
     # задачу, потолок кода — 60 (scrapers/sofascore/rate_control.py:26), 61 роняет
     # DAG на импорте. Первый 429 ОТ САЙТА откатывает задачу к 20/60 до конца фазы.
     SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE: ${SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE:-60}
-    SOFASCORE_PLAYERS_POOL: sofascore_players_pool
-    SOFASCORE_PLAYERS_PROXY_CONTROL_URL: http://sofascore_gw_players:8899
+    SOFASCORE_REFRESH_POOL: sofascore_players_pool
+    SOFASCORE_REFRESH_PROXY_CONTROL_URL: http://sofascore_gw_players:8899
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
     SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
     SOFASCORE_PLAYER_ROTATION_MODULUS: ${SOFASCORE_PLAYER_ROTATION_MODULUS:-4}
