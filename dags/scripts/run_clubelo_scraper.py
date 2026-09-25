@@ -28,6 +28,29 @@ logger = logging.getLogger(__name__)
 REPLACE_GUARD_MARKER = 'CLUBELO_REPLACE_GUARD'
 
 
+def run_history_mode(args) -> int:
+    """--mode history (#1462): red (non-zero) on ANY incompleteness.
+
+    Failed pages, redirects, a block by the site, pending clubs left or an
+    error all give exit 1 — a partial history must never look green (R-01).
+    """
+    try:
+        from scrapers.clubelo.history import exit_code, run_default
+
+        results = run_default(batch_size=args.batch_size)
+        code = exit_code(results)
+    except Exception as e:
+        logger.error(f"ClubElo history failed: {e}", exc_info=True)
+        results = {'error': f'{type(e).__name__}: {e}'}
+        code = 1
+
+    with open(args.output, 'w') as f:
+        json.dump(results, f)
+    print(json.dumps(results))  # Also print for Airflow logs
+    logger.info(f"ClubElo history complete, exit {code}")
+    return code
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run ClubElo scraper')
     parser.add_argument(
@@ -44,11 +67,19 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['daily', 'full'],
+        choices=['daily', 'full', 'history'],
         default='daily',
         help="daily = current ratings only (fast, 1 HTTP call); "
              "full = historical ratings ONLY (heavy, weekly cadence; the "
-             "daily task in the DAG chain already covers current ratings)"
+             "daily task in the DAG chain already covers current ratings); "
+             "history = club pages /{slug} of clubelo.com into the four "
+             "append-only history tables (#1462), resumable batches"
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=200,
+        help='--mode history: clubs per committed batch (default 200)'
     )
     parser.add_argument(
         '--force-replace',
@@ -67,6 +98,9 @@ def main():
              '(issue #716). Ignored in --mode daily.'
     )
     args = parser.parse_args()
+
+    if args.mode == 'history':
+        return run_history_mode(args)
 
     leagues = [l.strip() for l in args.leagues.split(',')]
     logger.info(f"Starting ClubElo scraper (mode={args.mode}) with leagues: {leagues}")
