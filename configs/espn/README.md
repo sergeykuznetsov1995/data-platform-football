@@ -75,3 +75,29 @@ Check:
 pytest tests/unit/configs/test_espn_denominator_file.py \
   tests/unit/scrapers/test_espn_classify.py tests/unit/scrapers/test_espn_catalog_core.py -q
 ```
+
+## Transport policy (`transport_policy.json`, #1500)
+
+One gate per VM (`scrapers/espn/gate.py`, `TransportGate`) decides where and
+when every ESPN request goes. Its state is one JSON file under `flock`
+(`ESPN_GATE_STATE_PATH`, default `${AIRFLOW_HOME:-/opt/airflow}/state/espn/gate.json`),
+so all processes share pace, origin blocks and counters. Loader:
+`load_transport_policy()`; an unknown key, non-increasing steps, a share
+outside (0, 1) or missing lanes fail closed.
+
+| Key | Meaning |
+|---|---|
+| `clusters` | `site`: primary `site.web.api.espn.com`, reserve `site.api.espn.com` (closed by Akamai for our User-Agent since 04.08); `core`: `sports.core.api.espn.com`, no reserve |
+| `origin_block_seconds`, `origin_probe_seconds` | a 403 closes an origin for 30 min; then exactly one request probes it every 30 min |
+| `reserve_probe_seconds` | the reserve starts closed and is probed at most once a day |
+| `all_blocked_pause_seconds`, `all_blocked_probe_seconds` | no open origin in a cluster: 30 min pause, then one probe every 5 min; `history` freezes first and reopens last |
+| `steps` | pace ladder S0…S3, requests per minute; the ceiling is `ESPN_GATE_STEP_CEILING` (default 0 = S0; raising it is #1510) |
+| `live_share` | share of each minute reserved for `live`: `history` is admitted only while its permits of the last minute stay below `1 - live_share` of the step |
+| `lanes` | per-lane daily request fuse (`daily_requests`), set above the S3 maximum; UTC date. Bytes are counted per lane (state `daily`) but never capped: no daily MB ceilings (roadmap assumption 4) |
+| `reset` | auto-reset: a 429, ≥ 3 × 403 in 60 s, or 5xx+timeouts > 2 % of ≥ 50 requests in 5 min → one step down, 15 min cooldown with `history` frozen, then back to the ceiling; two resets within an hour → S0 for 6 h and an `alert` in the state file |
+| `uncompressed_warn_bytes` | an `identity` response larger than this is logged as a warning |
+
+A 403 is never retried on another origin inside the same request: the request
+fails with `OriginBlocked` (`AllOriginsBlocked` when the cluster has no open
+origin), is journaled as `blocked_deferred`, and the caller retries it in a
+later wave.

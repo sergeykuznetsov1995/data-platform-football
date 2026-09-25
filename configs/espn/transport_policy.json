@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "clusters": {
+    "site": {
+      "primary": "https://site.web.api.espn.com",
+      "reserve": "https://site.api.espn.com"
+    },
+    "core": {
+      "primary": "https://sports.core.api.espn.com"
+    }
+  },
+  "origin_block_seconds": 1800,
+  "origin_probe_seconds": 1800,
+  "reserve_probe_seconds": 86400,
+  "all_blocked_pause_seconds": 1800,
+  "all_blocked_probe_seconds": 300,
+  "steps": [60, 120, 240, 360],
+  "live_share": 0.5,
+  "lanes": {
+    "live": {"daily_requests": 259200},
+    "history": {"daily_requests": 518400}
+  },
+  "reset": {
+    "http403_count": 3,
+    "http403_window_seconds": 60,
+    "error_share": 0.02,
+    "error_window_seconds": 300,
+    "error_min_requests": 50,
+    "cooldown_seconds": 900,
+    "double_reset_window_seconds": 3600,
+    "double_reset_hold_seconds": 21600
+  },
+  "uncompressed_warn_bytes": 102400
+}

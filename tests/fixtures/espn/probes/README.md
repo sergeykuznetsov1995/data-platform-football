@@ -22,5 +22,11 @@
 | `league_detail_fifa.world.u20.json` | c7 p03 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/fifa.world.u20?lang=en&region=us |
 | `league_detail_concacaf.champions_cup.json` | c7 p04 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/concacaf.champions_cup?lang=en&region=us |
 | `league_detail_sui.1.json` | c7 p07 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/sui.1?lang=en&region=us |
+| `site_api_403_akamai.{hdr,body}` | c5 p01 | https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event=740900 |
+
+`site_api_403_akamai.*` — заголовки и HTML-тело отказа Akamai (HTTP/2 403, `server: AkamaiGHost`,
+446 байт) на `site.api.espn.com` с User-Agent парсера `data-platform-football/espn-native-v2`,
+снято 24.09.2026 16:19 UTC. Используется `test_espn_transport.py` (#1500): 403 → запрос
+отложен, адрес закрыт. Записанного 429 нет — в тестах он синтетический.
 
 Тела со страницей > 1 (`pageCount > 1`) среди проб нет — появится в #1501.

@@ -1,9 +1,8 @@
-"""Public value types, URL identity and task budgets for ESPN transport."""
+"""Public value types, origins and URL identity for ESPN transport."""
 
 from __future__ import annotations
 
 import hashlib
-import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence, Union
@@ -13,18 +12,16 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 DEFAULT_CONNECT_TIMEOUT = 5.0
 DEFAULT_READ_TIMEOUT = 20.0
 DEFAULT_RESPONSE_CAP_BYTES = 16 * 1024 * 1024
-DEFAULT_RATE_PER_MINUTE = 30
-DEFAULT_BURST = 4
 DEFAULT_MAX_ATTEMPTS = 4
-DEFAULT_MAX_COMPETITIONS = 20
-DEFAULT_MAX_SUMMARY_EVENTS = 100
-DEFAULT_MAX_REQUESTS = 600
-DEFAULT_MAX_TASK_BYTES = 64 * 1024 * 1024
-ESPN_SITE_API_PRIMARY_ORIGIN = "https://site.api.espn.com"
-ESPN_SITE_API_FAILOVER_ORIGIN = "https://site.web.api.espn.com"
-ESPN_SITE_API_CAPTURE_ORIGINS = frozenset(
-    {ESPN_SITE_API_PRIMARY_ORIGIN, ESPN_SITE_API_FAILOVER_ORIGIN}
-)
+# #1500: site.api is closed by Akamai for the parser User-Agent since 04.08,
+# while site.web.api and core answer the same signature.  web.api is the
+# primary site origin, site.api only a reserve probed once a day.  Discovery
+# and lists use core only; core has no reserve.
+ESPN_SITE_WEB_API_ORIGIN = "https://site.web.api.espn.com"
+ESPN_SITE_API_ORIGIN = "https://site.api.espn.com"
+ESPN_CORE_API_ORIGIN = "https://sports.core.api.espn.com"
+ESPN_SITE_CLUSTER = ("site", ESPN_SITE_WEB_API_ORIGIN, ESPN_SITE_API_ORIGIN)
+ESPN_CORE_CLUSTER = ("core", ESPN_CORE_API_ORIGIN, None)
 
 ParamValue = Union[str, int, float, bool, None, Sequence[object]]
 Params = Union[Mapping[str, ParamValue], Sequence[tuple[str, ParamValue]]]
@@ -110,6 +107,12 @@ class RequestLedgerEntry:
     disposition: str
     error: Optional[str] = None
     transport_origin: Optional[str] = None
+    requested_at: Optional[str] = None
+    host: Optional[str] = None
+    lane: Optional[str] = None
+    step: Optional[int] = None
+    content_encoding: Optional[str] = None
+    origin_attempts: tuple[tuple[str, Optional[int]], ...] = ()
 
     def __post_init__(self) -> None:
         if self.transport_origin is not None:
@@ -179,12 +182,20 @@ class AmbientProxyError(EspnTransportError):
     pass
 
 
-class BudgetExceeded(EspnTransportError):
-    pass
+class OriginBlocked(EspnTransportError):
+    """403 on the chosen origin: it is closed, the request is deferred."""
 
 
-class CircuitOpen(EspnTransportError):
-    pass
+class AllOriginsBlocked(OriginBlocked):
+    """No origin of the cluster is open; the caller retries in a later wave."""
+
+
+class LaneClosed(EspnTransportError):
+    """The lane is frozen (auto-reset cooldown or all origins blocked)."""
+
+
+class DailyCapExceeded(EspnTransportError):
+    """The lane spent its daily request or byte cap."""
 
 
 class ResponseTooLarge(EspnTransportError):
@@ -213,129 +224,6 @@ def _nonnegative_int(value: object, field_name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer")
     return value
-
-
-@dataclass(slots=True)
-class TaskBudget:
-    """Per-task hard limits and consumption shared by all logical fetches."""
-
-    max_competitions: int = DEFAULT_MAX_COMPETITIONS
-    max_summary_events: int = DEFAULT_MAX_SUMMARY_EVENTS
-    max_requests: int = DEFAULT_MAX_REQUESTS
-    max_bytes: int = DEFAULT_MAX_TASK_BYTES
-    requests_used: int = field(default=0, init=False)
-    bytes_used: int = field(default=0, init=False)
-    bytes_reserved: int = field(default=0, init=False)
-    _competition_ids: set[object] = field(default_factory=set, init=False, repr=False)
-    _summary_event_ids: set[object] = field(default_factory=set, init=False, repr=False)
-    _lock: threading.RLock = field(
-        default_factory=threading.RLock, init=False, repr=False
-    )
-
-    def __post_init__(self) -> None:
-        hard_maxima = {
-            "max_competitions": DEFAULT_MAX_COMPETITIONS,
-            "max_summary_events": DEFAULT_MAX_SUMMARY_EVENTS,
-            "max_requests": DEFAULT_MAX_REQUESTS,
-            "max_bytes": DEFAULT_MAX_TASK_BYTES,
-        }
-        for name, hard_maximum in hard_maxima.items():
-            value = _nonnegative_int(getattr(self, name), name)
-            if value > hard_maximum:
-                raise ValueError(f"{name} cannot exceed {hard_maximum}")
-
-    @property
-    def competitions_used(self) -> int:
-        return len(self._competition_ids)
-
-    @property
-    def summary_events_used(self) -> int:
-        return len(self._summary_event_ids)
-
-    @property
-    def bytes_remaining(self) -> int:
-        with self._lock:
-            return self.max_bytes - self.bytes_used - self.bytes_reserved
-
-    def admit(
-        self,
-        endpoint: EndpointType,
-        *,
-        competition_id: object = None,
-        event_id: object = None,
-    ) -> None:
-        with self._lock:
-            competitions = set(self._competition_ids)
-            events = set(self._summary_event_ids)
-            if competition_id is not None:
-                competitions.add(competition_id)
-            elif endpoint is EndpointType.SCOREBOARD:
-                raise BudgetExceeded("scoreboard requests require competition_id")
-            if endpoint is EndpointType.SUMMARY and event_id is not None:
-                events.add(event_id)
-            elif endpoint is EndpointType.SUMMARY:
-                raise BudgetExceeded("Summary requests require event_id")
-            if len(competitions) > self.max_competitions:
-                raise BudgetExceeded(
-                    f"ESPN competition budget exceeded ({self.max_competitions})"
-                )
-            if len(events) > self.max_summary_events:
-                raise BudgetExceeded(
-                    f"ESPN Summary event budget exceeded ({self.max_summary_events})"
-                )
-            self._competition_ids = competitions
-            self._summary_event_ids = events
-
-    def admit_request(
-        self, response_cap_bytes: int = DEFAULT_RESPONSE_CAP_BYTES
-    ) -> "ByteReservation":
-        _nonnegative_int(response_cap_bytes, "response_cap_bytes")
-        with self._lock:
-            if self.requests_used >= self.max_requests:
-                raise BudgetExceeded(
-                    f"ESPN request budget exhausted ({self.max_requests})"
-                )
-            remaining = self.max_bytes - self.bytes_used - self.bytes_reserved
-            if remaining <= 0:
-                raise BudgetExceeded(f"ESPN byte budget exhausted ({self.max_bytes})")
-            self.requests_used += 1
-            reserved = min(response_cap_bytes, remaining)
-            self.bytes_reserved += reserved
-            return ByteReservation(self, reserved)
-
-    def consume_bytes(self, count: int) -> None:
-        """Compatibility API for non-reserved accounting; never overcommits."""
-        _nonnegative_int(count, "response bytes")
-        with self._lock:
-            if self.bytes_used + self.bytes_reserved + count > self.max_bytes:
-                raise BudgetExceeded(f"ESPN byte budget exceeded ({self.max_bytes})")
-            self.bytes_used += count
-
-
-class ByteReservation:
-    """One response's exclusive byte allowance; unused bytes are releasable."""
-
-    def __init__(self, budget: TaskBudget, limit: int) -> None:
-        self.budget = budget
-        self.limit = limit
-        self.remaining = limit
-        self._released = False
-
-    def charge(self, count: int) -> None:
-        _nonnegative_int(count, "response bytes")
-        with self.budget._lock:
-            if self._released or count > self.remaining:
-                raise BudgetExceeded("ESPN response exceeded its reserved byte budget")
-            self.remaining -= count
-            self.budget.bytes_reserved -= count
-            self.budget.bytes_used += count
-
-    def release(self) -> None:
-        with self.budget._lock:
-            if not self._released:
-                self.budget.bytes_reserved -= self.remaining
-                self.remaining = 0
-                self._released = True
 
 
 def _iter_params(params: Optional[Params]) -> list[tuple[str, str]]:
@@ -396,35 +284,31 @@ def canonicalize_target(url: str, params: Optional[Params] = None) -> CanonicalT
 
 
 __all__ = [
+    "AllOriginsBlocked",
     "AmbientProxyError",
-    "ByteReservation",
-    "BudgetExceeded",
     "CanonicalTarget",
-    "CircuitOpen",
-    "DEFAULT_BURST",
     "DEFAULT_CONNECT_TIMEOUT",
     "DEFAULT_MAX_ATTEMPTS",
-    "DEFAULT_MAX_COMPETITIONS",
-    "DEFAULT_MAX_REQUESTS",
-    "DEFAULT_MAX_SUMMARY_EVENTS",
-    "DEFAULT_MAX_TASK_BYTES",
-    "DEFAULT_RATE_PER_MINUTE",
     "DEFAULT_READ_TIMEOUT",
     "DEFAULT_RESPONSE_CAP_BYTES",
+    "DailyCapExceeded",
     "DirectTransportError",
     "EndpointType",
-    "ESPN_SITE_API_CAPTURE_ORIGINS",
-    "ESPN_SITE_API_FAILOVER_ORIGIN",
-    "ESPN_SITE_API_PRIMARY_ORIGIN",
+    "ESPN_CORE_API_ORIGIN",
+    "ESPN_CORE_CLUSTER",
+    "ESPN_SITE_API_ORIGIN",
+    "ESPN_SITE_CLUSTER",
+    "ESPN_SITE_WEB_API_ORIGIN",
     "EspnTransportError",
     "FetchResult",
     "HttpStatusError",
     "InvalidJsonError",
+    "LaneClosed",
+    "OriginBlocked",
     "Params",
     "RequestLedgerEntry",
     "ResponseTooLarge",
     "RetryExhausted",
-    "TaskBudget",
     "_nonnegative_int",
     "canonicalize_target",
     "normalize_transport_origin",
