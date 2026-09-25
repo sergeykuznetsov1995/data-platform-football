@@ -139,6 +139,17 @@ class UnderstatScraper(BaseScraper):
             force_refresh=force_refresh,
         )
 
+    def league_snapshot(
+        self, league: str, season_slug: str, source_season_id: int
+    ) -> dict[str, str]:
+        """#1431: one-request league fingerprints for the weekly closed check."""
+
+        return self.source.league_snapshot(league, season_slug, source_season_id)
+
+    @property
+    def last_league_hashes(self) -> dict[str, str]:
+        return dict(self.source.last_league_hashes)
+
     def save_to_iceberg(
         self,
         df: pd.DataFrame,

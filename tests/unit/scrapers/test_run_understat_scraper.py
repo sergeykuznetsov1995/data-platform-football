@@ -628,6 +628,13 @@ def test_cli_requires_explicit_exact_scope_and_rejects_legacy_multi_scope_flags(
     )
     assert parsed.league == LEAGUE and parsed.source_season_id == 2025
     assert parsed.source_discovered == "true"
+    # #1431: the weekly closed-season check is an accepted runner mode.
+    argv = [
+        "--mode", "closed_check", "--league", LEAGUE, "--season-slug", "2526",
+        "--source-season-id", "2025", "--source-discovered", "true",
+        "--output", "/tmp/result.json",
+    ]
+    assert parser.parse_args(argv).mode == "closed_check"
 
 
 def test_dq_failure_is_journaled_with_game_lists_and_result_is_unchanged():
@@ -761,3 +768,129 @@ def test_every_run_ensures_the_failures_journal_before_any_failure():
         _args(), scraper_factory=factory, repository=broken
     )
     assert broken_exit == 0
+
+
+# --- #1431: weekly closed-season league-hash check -------------------------
+
+_LEAGUE_HASHES = {
+    "schedule": "a" * 64,
+    "players": "b" * 64,
+    "team_match_stats": "c" * 64,
+}
+
+
+def _hash_scraper(frames, *, hashes, request_count):
+    scraper = MagicMock()
+    scraper.scrape_scope.return_value = frames
+    scraper.save_to_iceberg.side_effect = (
+        lambda **kwargs: f"iceberg.bronze.{kwargs['table_name']}"
+    )
+    scraper.league_snapshot.return_value = dict(hashes)
+    scraper.last_league_hashes = dict(hashes)
+    scraper.client.request_count = request_count
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    return scraper
+
+
+def _published_baseline(repository):
+    """Publish one complete closed-season attempt through the current path."""
+    scraper = _hash_scraper(
+        _complete_frames(), hashes=_LEAGUE_HASHES, request_count=412
+    )
+    payload, exit_code = runner.run_scope(
+        _args(), scraper_factory=MagicMock(return_value=scraper), repository=repository
+    )
+    assert exit_code == 0
+    baseline = repository.appended[-1]
+    assert baseline.status is ManifestStatus.COMPLETE
+    assert baseline.quality["league_payload_hashes"] == _LEAGUE_HASHES
+    assert baseline.quality["request_count"] == 412
+    repository.previous = baseline
+    return baseline
+
+
+def test_closed_check_unchanged_leaves_manifest_untouched_and_reports_latest():
+    repository = _Repository()
+    baseline = _published_baseline(repository)
+    rows_before = list(repository.appended)
+    probe = _hash_scraper(_complete_frames(), hashes=_LEAGUE_HASHES, request_count=2)
+
+    payload, exit_code = runner.run_scope(
+        _args(mode="closed_check"),
+        scraper_factory=MagicMock(return_value=probe),
+        repository=repository,
+    )
+
+    assert exit_code == 0
+    assert repository.appended == rows_before
+    assert repository.failures == []
+    probe.league_snapshot.assert_called_once_with(LEAGUE, "2526", 2025)
+    probe.scrape_scope.assert_not_called()
+    probe.save_to_iceberg.assert_not_called()
+    assert repository.verified[-1] is baseline
+    assert payload == {
+        **runner._result_payload(baseline),
+        "closed_check": {
+            "unchanged": True,
+            "hashes": _LEAGUE_HASHES,
+            "request_count": 2,
+        },
+    }
+
+
+def test_closed_check_changed_hash_reingests_scope_in_full():
+    repository = _Repository()
+    _published_baseline(repository)
+    new_hashes = {**_LEAGUE_HASHES, "schedule": "d" * 64}
+    probe = _hash_scraper(_complete_frames(), hashes=new_hashes, request_count=2)
+    full = _hash_scraper(_complete_frames(), hashes=new_hashes, request_count=380)
+
+    payload, exit_code = runner.run_scope(
+        _args(mode="closed_check"),
+        scraper_factory=MagicMock(side_effect=[probe, full]),
+        repository=repository,
+    )
+
+    assert exit_code == 0
+    assert payload["status"] == "complete"
+    full.scrape_scope.assert_called_once_with(
+        LEAGUE, "2526", 2025, mode="current", force_refresh=True
+    )
+    assert full.save_to_iceberg.call_count == 7
+    latest = repository.appended[-1]
+    assert latest.status is ManifestStatus.COMPLETE
+    assert latest.mode == "closed_check"
+    assert latest.quality["active"] is False
+    assert latest.quality["league_payload_hashes"] == new_hashes
+    assert latest.quality["request_count"] == 382
+    assert "closed_check" not in payload
+
+
+def test_closed_check_without_baseline_hashes_reingests_without_probe():
+    repository = _Repository()
+    _published_baseline(repository)
+    legacy = repository.appended[-1]
+    # Attempts published before #1431 carry no league fingerprints.
+    legacy_quality = {
+        key: value
+        for key, value in legacy.quality.items()
+        if key != "league_payload_hashes"
+    }
+    from dataclasses import replace as dc_replace
+
+    repository.appended[-1] = dc_replace(legacy, quality=legacy_quality)
+    repository.previous = repository.appended[-1]
+    full = _hash_scraper(_complete_frames(), hashes=_LEAGUE_HASHES, request_count=380)
+
+    payload, exit_code = runner.run_scope(
+        _args(mode="closed_check"),
+        scraper_factory=MagicMock(return_value=full),
+        repository=repository,
+    )
+
+    assert exit_code == 0
+    full.league_snapshot.assert_not_called()
+    full.scrape_scope.assert_called_once()
+    assert repository.appended[-1].quality["league_payload_hashes"] == _LEAGUE_HASHES
+    assert repository.appended[-1].quality["request_count"] == 380

@@ -17,6 +17,7 @@ from .catalog import (
 )
 from .client import UnderstatClient
 from .client import UnderstatHTTPError
+from .closed_check import league_payload_hashes
 from .parsers import (
     parse_match_payload,
     parse_player_season_stats,
@@ -62,6 +63,69 @@ class UnderstatSource:
         self.client = client
         self.today = today or date.today()
         self.catalog = UnderstatCatalog(client, today=self.today)
+        # #1431: fingerprints of the last parsed league response.
+        self.last_league_hashes: dict[str, str] = {}
+
+    def _scope(self, league: str, season_slug: str, source_season_id: int):
+        definition = LEAGUE_BY_CANONICAL.get(league)
+        if definition is None:
+            raise ValueError(f"Unsupported Understat league: {league!r}")
+        expected_slug = make_season_slug(source_season_id)
+        if season_slug != expected_slug:
+            raise ValueError(
+                f"season/source mismatch: {season_slug!r} != {expected_slug!r} "
+                f"for {source_season_id}"
+            )
+        return definition, UnderstatScope(
+            league=league,
+            source_league=definition.source_league,
+            source_league_id=definition.source_league_id,
+            season=season_slug,
+            source_season_id=source_season_id,
+            is_closed=source_season_id < current_source_season_id(self.today),
+            discovered=True,
+        )
+
+    def league_snapshot(
+        self,
+        league: str,
+        season_slug: str,
+        source_season_id: int,
+    ) -> dict[str, str]:
+        """Fingerprint one fresh league response exactly as ``scrape_scope`` does.
+
+        One ``getLeagueData`` request. A 404 returns ``{}`` (not published):
+        for a closed scope that never matches a baseline, so the caller falls
+        back to the full path, which fails as an unpublished closed scope.
+        """
+
+        definition, scope = self._scope(league, season_slug, source_season_id)
+        try:
+            league_payload = self.client.get_league_data(
+                definition.source_league,
+                source_season_id,
+                force_refresh=True,
+            )
+        except UnderstatHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            logger.warning(
+                "Understat closed scope league response is not published: "
+                "league=%s source_season_id=%s",
+                league,
+                source_season_id,
+            )
+            return {}
+        if not isinstance(league_payload, Mapping):
+            raise TypeError("getLeagueData payload must be an object")
+        validate_league_payload(league_payload)
+        return league_payload_hashes(
+            {
+                "schedule": parse_schedule(league_payload, scope),
+                "players": parse_player_season_stats(league_payload, scope),
+                "team_match_stats": parse_team_match_stats(league_payload, scope),
+            }
+        )
 
     def scrape_scope(
         self,
@@ -74,25 +138,7 @@ class UnderstatSource:
     ) -> dict[str, pd.DataFrame]:
         if mode not in {"current", "history", "reparse"}:
             raise ValueError("mode must be current, history, or reparse")
-        definition = LEAGUE_BY_CANONICAL.get(league)
-        if definition is None:
-            raise ValueError(f"Unsupported Understat league: {league!r}")
-        expected_slug = make_season_slug(source_season_id)
-        if season_slug != expected_slug:
-            raise ValueError(
-                f"season/source mismatch: {season_slug!r} != {expected_slug!r} "
-                f"for {source_season_id}"
-            )
-
-        scope = UnderstatScope(
-            league=league,
-            source_league=definition.source_league,
-            source_league_id=definition.source_league_id,
-            season=season_slug,
-            source_season_id=source_season_id,
-            is_closed=source_season_id < current_source_season_id(self.today),
-            discovered=True,
-        )
+        definition, scope = self._scope(league, season_slug, source_season_id)
         refresh_scope = force_refresh or mode in {"current", "reparse"}
         try:
             league_payload = self.client.get_league_data(
@@ -116,6 +162,10 @@ class UnderstatSource:
         schedule = parse_schedule(league_payload, scope)
         players = parse_player_season_stats(league_payload, scope)
         team_match = parse_team_match_stats(league_payload, scope)
+        # #1431: fingerprint before has_data is rewritten from match responses.
+        self.last_league_hashes = league_payload_hashes(
+            {"schedule": schedule, "players": players, "team_match_stats": team_match}
+        )
 
         empty_shots, empty_player_match = parse_match_payload({}, scope, {})
         shots: list[pd.DataFrame] = []
