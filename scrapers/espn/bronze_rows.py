@@ -270,8 +270,20 @@ def lineup_rows(
     ]
 
 
-def _number(value: str | None) -> float | None:
-    return None if value is None else float(value)
+# Recorded bodies give these as fractions ("0.8") and possession in percent
+# ("36.2"); a "%" display the parser also accepts is brought to those units.
+_FRACTION_COLUMNS = frozenset(
+    {"cross_pct", "longball_pct", "pass_pct", "shot_pct", "tackle_pct"}
+)
+
+
+def _number(column: str, value: str | None) -> float | None:
+    if value is None:
+        return None
+    if value.endswith("%"):
+        number = float(value[:-1])
+        return number / 100 if column in _FRACTION_COLUMNS else number
+    return float(value)
 
 
 def team_stats_rows(
@@ -291,7 +303,7 @@ def team_stats_rows(
             "team": row.team,
             "home_away": row.home_away,
             "formation": row.formation,
-            **{name: _number(getattr(row, name)) for name in TEAM_STAT_COLUMNS},
+            **{name: _number(name, getattr(row, name)) for name in TEAM_STAT_COLUMNS},
             "team_stats_state": _state(summary.matchsheet_state),
             "deep_stats_json": None,
             **lineage,

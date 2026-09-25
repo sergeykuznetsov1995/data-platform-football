@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime
+import json
 import re
 import uuid
 from unittest.mock import MagicMock, patch
@@ -25,7 +26,8 @@ from scrapers.espn.bronze_writer import (
     delete_filter,
     write_tournament_batch,
 )
-from tests.unit.scrapers.test_espn_probes import _parse
+from scrapers.espn.parsers import SummaryDisposition, parse_summary
+from tests.unit.scrapers.test_espn_probes import _bytes, _parse, _summary_context
 
 _SCOPE = re.compile(
     r"^competition_slug = '(?P<slug>[^']*)' AND season_year = (?P<year>\d+) "
@@ -248,3 +250,40 @@ def test_rows_that_do_not_fit_the_ddl_stop_before_the_first_commit() -> None:
     with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
         write_tournament_batch(_batch(bad), trino=trino)
     assert trino.calls == []
+
+
+def _reparsed(mutate) -> MatchPayload:
+    """eng.1 2020 Summary changed by ``mutate`` and parsed by the real parser."""
+    raw = _bytes("summary_eng1_2020.json")
+    competition, edition, event = _summary_context(json.loads(raw))
+    payload = json.loads(raw)
+    mutate(payload)
+    summary = parse_summary(
+        json.dumps(payload).encode(),
+        competition=competition,
+        edition=edition,
+        event=event,
+    )
+    return MatchPayload(
+        event, summary, RawRef("s3://raw/x", "cc" * 32, datetime(2026, 9, 25))
+    )
+
+
+@pytest.mark.unit
+def test_percent_display_values_reach_the_table_in_recorded_units() -> None:
+    def percent(payload: dict) -> None:
+        for stat in payload["boxscore"]["teams"][0]["statistics"]:
+            if stat["name"] == "possessionPct":
+                stat["displayValue"] = "55.5%"
+            if stat["name"] == "passPct":
+                stat["displayValue"] = "80%"
+
+    match = _reparsed(percent)
+    assert match.summary.disposition is SummaryDisposition.CAPTURED
+    trino = FakeTrino()
+
+    write_tournament_batch(_batch(match), trino=trino)
+
+    stats = trino.tables["espn_team_stats"]
+    assert len(stats) == 2
+    assert (55.5, 0.8) in {(row["possession_pct"], row["pass_pct"]) for row in stats}
