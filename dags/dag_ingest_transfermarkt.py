@@ -67,10 +67,12 @@ STANDING_POLICY_PATH = (
     '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json'
 )
 STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
-# #1389: one paid request through the same gateway lease path as the children
+# #1389: one paid page through the same gateway lease path as the children
 # before any scope is planned.  A dead pool answers the CONNECT with a pseudo
 # status or a short error page; a real competition start page is well over
-# 60 KiB, so a 200 with a small body is an error page, not the source.
+# 60 KiB, so a 200 with a small body is an error page, not the source.  One
+# blocked exit (403/405/429) is not a dead pool: the client closes the lease
+# and asks the gateway for another exit, at most three leases per probe.
 GATEWAY_PROBE_URL = (
     'https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1'
 )
@@ -78,6 +80,7 @@ GATEWAY_PROBE_MIN_BODY_BYTES = 60 * 1024
 GATEWAY_PROBE_HARD_BYTES = 2 * 1024 * 1024
 GATEWAY_PROBE_SOFT_BYTES = 1024 * 1024
 GATEWAY_PROBE_LEASE_TTL_SECONDS = 120
+GATEWAY_PROBE_MAX_ATTEMPTS = 3
 
 _APPROVAL_FIELDS = (
     'paid_proxy_packet_id',
@@ -100,7 +103,7 @@ def _probe_gateway_exit(
     lease_provider: Any = None,
     client_factory: Any = None,
 ) -> dict[str, Any]:
-    """Fetch one real page through a gateway lease; fail the run if it is dead.
+    """Fetch one real page through gateway leases; fail the run if the pool is dead.
 
     Uses the children's own lease/client path, so a probe that passes means a
     child can reach the source.  The lease is always closed.
@@ -130,7 +133,7 @@ def _probe_gateway_exit(
             traffic_ledger=SharedTrafficLedger(
                 hard_provider_bytes=GATEWAY_PROBE_HARD_BYTES,
                 soft_provider_bytes=GATEWAY_PROBE_SOFT_BYTES,
-                retry_limit=0,
+                retry_limit=GATEWAY_PROBE_MAX_ATTEMPTS - 1,
             ),
             lease_metadata={
                 'dag_id': dag_id,
@@ -146,7 +149,7 @@ def _probe_gateway_exit(
             outcome = client.fetch(
                 GATEWAY_PROBE_URL,
                 as_json=False,
-                max_attempts=1,
+                max_attempts=GATEWAY_PROBE_MAX_ATTEMPTS,
                 label='gateway_probe',
             )
         finally:

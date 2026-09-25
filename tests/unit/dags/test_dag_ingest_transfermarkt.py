@@ -1494,6 +1494,10 @@ class TestGatewayProbe:
     """#1389: one paid request before planning; a dead gateway fails early."""
 
     def _probe(self, real_probe_module, monkeypatch, responses):
+        from scrapers.transfermarkt import client as client_module
+
+        # Retries between leases back off for real seconds; not here.
+        monkeypatch.setattr(client_module.TransfermarktHttpClient, '_backoff', lambda self, attempt: None)
         monkeypatch.delenv('TRANSFERMARKT_RAW_STORE_URI', raising=False)
         monkeypatch.delenv('TRANSFERMARKT_REQUIRE_RAW_STORE', raising=False)
         provider = _ProbeLeaseProvider()
@@ -1520,23 +1524,41 @@ class TestGatewayProbe:
         assert metadata['dag_id'] == 'dag_ingest_transfermarkt'
         assert metadata['canonical_url'] == real_probe_module.GATEWAY_PROBE_URL
 
+    def test_blocked_exit_rotates_to_a_fresh_lease(self, real_probe_module, monkeypatch):
+        call, provider, factory = self._probe(
+            real_probe_module, monkeypatch,
+            [_ProbeResponse(b'blocked', status=405), _ProbeResponse(b'x' * 70 * 1024)],
+        )
+        result = call()
+        assert result['status_code'] == 200
+        assert provider.closed == ['lease-1', 'lease-2']
+        assert len(factory.clients) == 2
+
+    def test_every_exit_blocked_fails_after_three_leases(self, real_probe_module, monkeypatch):
+        call, provider, _ = self._probe(
+            real_probe_module, monkeypatch, [_ProbeResponse(b'blocked', status=405)] * 3,
+        )
+        with pytest.raises(Exception, match=r'шлюз/пул: http=405'):
+            call()
+        assert provider.closed == ['lease-1', 'lease-2', 'lease-3']
+
     def test_gateway_502_fails_with_gateway_class(self, real_probe_module, monkeypatch):
         call, provider, _ = self._probe(
-            real_probe_module, monkeypatch, [_ProbeResponse(b'bad gateway', status=502)],
+            real_probe_module, monkeypatch, [_ProbeResponse(b'bad gateway', status=502)] * 3,
         )
         with pytest.raises(Exception, match=r'шлюз/пул: http=502'):
             call()
-        assert provider.closed == ['lease-1']
+        assert provider.closed == ['lease-1', 'lease-2', 'lease-3']
 
     def test_pseudo_status_fails_with_transport_class(
         self, real_probe_module, monkeypatch,
     ):
         call, provider, _ = self._probe(
-            real_probe_module, monkeypatch, [_ProbeResponse(b'', status=0)],
+            real_probe_module, monkeypatch, [_ProbeResponse(b'', status=0)] * 3,
         )
         with pytest.raises(Exception, match=r'шлюз/пул: transport:'):
             call()
-        assert provider.closed == ['lease-1']
+        assert provider.closed == ['lease-1', 'lease-2', 'lease-3']
 
     def test_small_200_body_is_not_the_source(self, real_probe_module, monkeypatch):
         call, provider, _ = self._probe(
