@@ -159,6 +159,7 @@ services:
           --firstname Admin --lastname User --role Admin \
           --email admin@example.com || true
         # Пулы — кодом (размеры как в общем compose.yaml); deploy.sh ставит их повторно.
+        airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
         airflow pools set 'transfermarkt_proxy' 1 'Transfermarkt production and registry proxy work'
         airflow pools set 'transfermarkt_backfill_proxy' 1 'Transfermarkt historical backfill only; bounded dedicated proxy slot'
         airflow pools set 'transfermarkt_backfill_control' 1 'Transfermarkt historical planning and DQ only; isolated from daily ingest'

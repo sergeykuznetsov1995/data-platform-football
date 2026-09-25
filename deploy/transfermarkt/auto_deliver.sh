@@ -64,7 +64,7 @@ SNAPSHOT=$STATE/transfermarkt-rollback.env     # состояние боя до 
 TODAY=$(date -u +%F)
 ATTEMPTED=$STATE/transfermarkt-auto-deliver-attempted-$TODAY
 YESTERDAY=$(date -u -d "$TODAY -1 day" +%F)
-POOLS="transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control"
+POOLS="ingest_scraper_pool transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control"
 CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
 WINDOW_FROM=${WINDOW_FROM:-0100}   # TM-DAG идут в 04:00 UTC; окно 01:00–03:00 (решение 9 #1387)
 WINDOW_TO=${WINDOW_TO:-0300}
@@ -186,6 +186,7 @@ pool_want(){  # pool_want <pool>: слоты из снимка, иначе 1 (в
 }
 pool_desc(){
   case "$1" in
+    ingest_scraper_pool) printf '%s' 'Serialize heavy ingest scrapers to avoid VM swap (#671)' ;;
     transfermarkt_proxy) printf '%s' 'Transfermarkt production and registry proxy work' ;;
     transfermarkt_backfill_proxy) printf '%s' 'Transfermarkt historical backfill only; bounded dedicated proxy slot' ;;
     *) printf '%s' 'Transfermarkt historical planning and DQ only; isolated from daily ingest' ;;

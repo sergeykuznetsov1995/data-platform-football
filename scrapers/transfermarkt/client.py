@@ -79,7 +79,7 @@ _CHALLENGE_MARKERS = (
 # to a fresh exit, so a required page needs more than a couple of exits before a
 # whole cycle is abandoned.  The run-wide retry ledger is the real bound.
 _MAX_FETCH_ATTEMPTS = 8
-# A 403/429 is worth another exit, but not the full ladder: a source that means
+# A 403/405/429 is worth another exit, but not the full ladder: a source that means
 # it will say so from every exit, and each try burns one.
 _MAX_BLOCKED_ATTEMPTS = 4
 
@@ -2082,12 +2082,15 @@ class TransfermarktHttpClient:
                         duration_seconds=elapsed,
                     )
                     break
-                elif status_code in (403, 429):
+                elif status_code in (403, 405, 429):
+                    # 405 is Transfermarkt's block of one exit, not a
+                    # method error: the same page answered 405 from one
+                    # residential exit and 200 from the next (25.09).
                     terminal_status = FetchStatus.BLOCKED
                     last_error = f"HTTP {status_code}"
                     error_type = (
-                        ErrorType.FORBIDDEN.value
-                        if status_code == 403 else ErrorType.RATE_LIMIT.value
+                        ErrorType.RATE_LIMIT.value
+                        if status_code == 429 else ErrorType.FORBIDDEN.value
                     )
                     # A block is a statement about the exit, not the page.  Two
                     # attempts meant one alternate exit, and a third of the

@@ -67,10 +67,14 @@ STANDING_POLICY_PATH = (
     '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json'
 )
 STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
-# #1389: one paid request through the same gateway lease path as the children
+# #1389: one paid page through the same gateway lease path as the children
 # before any scope is planned.  A dead pool answers the CONNECT with a pseudo
 # status or a short error page; a real competition start page is well over
-# 60 KiB, so a 200 with a small body is an error page, not the source.
+# 60 KiB, so a 200 with a small body is an error page, not the source.  One
+# blocked exit (403/405/429), one gateway 5xx or one transport failure is
+# not a dead pool: the client closes the lease and asks the gateway for
+# another exit, at most three leases per probe (a 200 challenge page: two,
+# the client's own cap).  A dead pool therefore costs three short leases.
 GATEWAY_PROBE_URL = (
     'https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1'
 )
@@ -78,6 +82,7 @@ GATEWAY_PROBE_MIN_BODY_BYTES = 60 * 1024
 GATEWAY_PROBE_HARD_BYTES = 2 * 1024 * 1024
 GATEWAY_PROBE_SOFT_BYTES = 1024 * 1024
 GATEWAY_PROBE_LEASE_TTL_SECONDS = 120
+GATEWAY_PROBE_MAX_ATTEMPTS = 3
 
 _APPROVAL_FIELDS = (
     'paid_proxy_packet_id',
@@ -100,7 +105,7 @@ def _probe_gateway_exit(
     lease_provider: Any = None,
     client_factory: Any = None,
 ) -> dict[str, Any]:
-    """Fetch one real page through a gateway lease; fail the run if it is dead.
+    """Fetch one real page through gateway leases; fail the run if the pool is dead.
 
     Uses the children's own lease/client path, so a probe that passes means a
     child can reach the source.  The lease is always closed.
@@ -130,7 +135,7 @@ def _probe_gateway_exit(
             traffic_ledger=SharedTrafficLedger(
                 hard_provider_bytes=GATEWAY_PROBE_HARD_BYTES,
                 soft_provider_bytes=GATEWAY_PROBE_SOFT_BYTES,
-                retry_limit=0,
+                retry_limit=GATEWAY_PROBE_MAX_ATTEMPTS - 1,
             ),
             lease_metadata={
                 'dag_id': dag_id,
@@ -146,7 +151,7 @@ def _probe_gateway_exit(
             outcome = client.fetch(
                 GATEWAY_PROBE_URL,
                 as_json=False,
-                max_attempts=1,
+                max_attempts=GATEWAY_PROBE_MAX_ATTEMPTS,
                 label='gateway_probe',
             )
         finally:
@@ -165,7 +170,15 @@ def _probe_gateway_exit(
         ) from exc
 
     status_code = int(outcome.status_code or 0)
-    body_bytes = int(outcome.decoded_body_bytes or 0)
+    # decoded_body_bytes sums every attempt, blocked ones included; the gate
+    # is about the page the last (successful) exit returned.
+    value = outcome.value
+    if isinstance(value, bytes):
+        body_bytes = len(value)
+    elif isinstance(value, str):
+        body_bytes = len(value.encode('utf-8'))
+    else:
+        body_bytes = 0
     if str(outcome.error or '').startswith('transport:'):
         failure = str(outcome.error)
     elif status_code != 200:
@@ -180,6 +193,7 @@ def _probe_gateway_exit(
         'url': GATEWAY_PROBE_URL,
         'status_code': status_code,
         'body_bytes': body_bytes,
+        'decoded_body_bytes_all_attempts': int(outcome.decoded_body_bytes or 0),
         'provider_metered_bytes': outcome.provider_metered_bytes,
     }
 

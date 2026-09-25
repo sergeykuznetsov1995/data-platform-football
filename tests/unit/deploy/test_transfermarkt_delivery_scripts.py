@@ -24,7 +24,7 @@ DAGS = (
     "dag_backfill_transfermarkt",
     "dag_transform_transfermarkt_silver",
 )
-POOLS = ("transfermarkt_proxy", "transfermarkt_backfill_proxy", "transfermarkt_backfill_control")
+POOLS = ("ingest_scraper_pool", "transfermarkt_proxy", "transfermarkt_backfill_proxy", "transfermarkt_backfill_control")
 SCHED = "transfermarkt-airflow-scheduler"
 GW = "transfermarkt_gw"
 

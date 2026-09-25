@@ -158,10 +158,11 @@ def test_sticky_client_full_chrome133_headers_and_scalar_timeout():
 
 
 @pytest.mark.unit
-def test_403_rotates_proxy_once_and_records_retry():
+@pytest.mark.parametrize('status', [403, 405, 429])
+def test_blocked_status_rotates_proxy_once_and_records_retry(status):
     manager = _manager(2)
     factory = _ClientFactory([
-        _FakeResp(b'blocked', status=403),
+        _FakeResp(b'blocked', status=status),
         _FakeResp(b'ok', status=200),
     ])
     client = TransfermarktHttpClient(
@@ -181,7 +182,7 @@ def test_403_rotates_proxy_once_and_records_retry():
     stats = client.get_traffic_stats()
     assert stats['request_attempts'] == 2
     assert stats['retries'] == 1
-    assert stats['status_counts'] == {'200': 1, '403': 1}
+    assert stats['status_counts'] == {'200': 1, str(status): 1}
     proxies = manager._proxies
     assert sum(proxy.success_count for proxy in proxies) == 1
     assert sum(proxy.failure_count for proxy in proxies) == 1
