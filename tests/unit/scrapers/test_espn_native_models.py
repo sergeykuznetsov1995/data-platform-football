@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 
 import pytest
 
 from scrapers.espn.models import (
-    ADMITTED_AGE_CLASSES,
     AgeClass,
     CapabilityState,
     Competition,
     Edition,
     EntityCapabilities,
     Gender,
+    SeasonType,
 )
 
 
@@ -51,20 +52,39 @@ def test_scope_identity_is_native_numeric_id_and_source_year() -> None:
 
 
 @pytest.mark.unit
-def test_age_classes_enumerate_every_admitted_source_classification() -> None:
-    assert ADMITTED_AGE_CLASSES == frozenset(
-        {
-            AgeClass.SENIOR,
-            AgeClass.U17,
-            AgeClass.U19,
-            AgeClass.U20,
-            AgeClass.U21,
-            AgeClass.U23,
-            AgeClass.COLLEGE,
-        }
+def test_open_editions_allows_the_new_season_before_the_old_one_closes() -> None:
+    # #1501: a new core season opens while the previous one still has open
+    # matches; "exactly one current edition" is gone.
+    old = replace(_edition(), source_season_year=2025, display_name="2025-26 EPL")
+    new = _edition()
+    closed = replace(_edition(), source_season_year=2024, display_name="2024-25 EPL",
+                     current=False)
+    competition = Competition(
+        espn_id=700,
+        slug="eng.1",
+        name="English Premier League",
+        gender=Gender.MALE,
+        age_class=AgeClass.SENIOR,
+        enabled=True,
+        editions=(closed, old, new),
     )
-    assert AgeClass.YOUTH not in ADMITTED_AGE_CLASSES
-    assert AgeClass.UNKNOWN not in ADMITTED_AGE_CLASSES
+
+    assert competition.open_editions() == (old, new)
+    with pytest.raises(ValueError, match="at least one open edition"):
+        replace(competition, editions=(closed,)).open_editions()
+
+
+@pytest.mark.unit
+def test_edition_carries_its_season_types() -> None:
+    types = (SeasonType(1, "League Phase"), SeasonType(2, "Knockout Round Playoffs"))
+    edition = replace(_edition(), types=types)
+
+    assert edition.types == types
+    assert edition.to_dict()["types"][0] == {
+        "id": 1, "name": "League Phase", "start_date": None, "end_date": None,
+    }
+    with pytest.raises(ValueError, match="repeat a type id"):
+        replace(_edition(), types=(SeasonType(1), SeasonType(1)))
 
 
 @pytest.mark.unit
