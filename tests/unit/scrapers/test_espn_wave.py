@@ -719,3 +719,20 @@ def test_failed_status_check_reds_the_tournament_after_its_matches_publish(tmp_p
     rows = _matches(trino)
     assert rows[900003]["kickoff"] == datetime(2026, 9, 24, 22)
     assert rows[900002]["disposition"] is None  # left unmarked, checked again next wave
+
+
+@pytest.mark.unit
+def test_single_403_is_the_tournament_error_and_all_blocked_stops_the_wave(tmp_path) -> None:
+    from scrapers.espn.transport_contracts import AllOriginsBlocked, OriginBlocked
+
+    client, trino, _, _ = _wave1(tmp_path)
+    client.responses[_req_key(urls.all_scoreboard_day(TODAY))] = _day()  # 900001 gone
+    status_key = _req_key(urls.event_status("eng.1", 900001))
+    client.responses[status_key] = OriginBlocked("403 core")
+
+    (work,) = _plan(client, trino, tmp_path).works
+    assert (work.slug, work.error) == ("eng.1", "status of 900001: OriginBlocked: 403 core")
+
+    client.responses[status_key] = AllOriginsBlocked("every origin 403")
+    with pytest.raises(AllOriginsBlocked):
+        _plan(client, trino, tmp_path)

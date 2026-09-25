@@ -28,7 +28,9 @@ from .denominator import DenominatorRow
 from .editions import EditionState, plan_editions
 from .parser_common import EspnParseError
 from .transport_contracts import (
+    AllOriginsBlocked,
     DirectTransportError,
+    OriginBlocked,
     HttpStatusError,
     InvalidJsonError,
     ResponseTooLarge,
@@ -40,10 +42,12 @@ logger = logging.getLogger(__name__)
 EDITIONS_STATE_ENV = "ESPN_EDITIONS_STATE_PATH"
 MAX_AGE = timedelta(hours=24)
 STATE_VERSION = 1
-# One league failing is not a wave failure: its known editions stay.  Gate
-# closures (AllOriginsBlocked, LaneClosed, DailyCapExceeded) propagate.
+# One league failing is not a wave failure: its known editions stay; a single
+# 403 (OriginBlocked) is one of them.  Gate closures (AllOriginsBlocked — a
+# subclass, re-raised first —, LaneClosed, DailyCapExceeded) propagate.
 _LEAGUE_ERRORS = (
     DirectTransportError,
+    OriginBlocked,
     EspnParseError,
     HttpStatusError,
     InvalidJsonError,
@@ -187,6 +191,8 @@ def refresh(
                 schedule_terminal.get(row.slug, {}),
                 competition_slug=row.slug,
             )
+        except AllOriginsBlocked:
+            raise
         except _LEAGUE_ERRORS as exc:
             logger.warning(
                 "ESPN editions of %s not refreshed, %d known kept: %s: %s",

@@ -115,3 +115,20 @@ def test_default_path_sits_next_to_the_gate_state(monkeypatch) -> None:
     assert str(editions_store.default_state_path()) == "/opt/airflow/state/espn/editions.json"
     monkeypatch.setenv(editions_store.EDITIONS_STATE_ENV, "/tmp/x.json")
     assert str(editions_store.default_state_path()) == "/tmp/x.json"
+
+
+@pytest.mark.unit
+def test_single_403_keeps_known_editions_all_blocked_propagates(tmp_path) -> None:
+    from scrapers.espn.transport_contracts import AllOriginsBlocked, OriginBlocked
+
+    path = tmp_path / "editions.json"
+    editions_store.save(path, editions_store.EditionsSnapshot(NOW - timedelta(days=2), (_old(2025),)))
+    key = _req_key(urls.league_detail(UCL))
+
+    snapshot = _load(path, _client(**{key: OriginBlocked("403 core")}))
+    assert snapshot.failed == {UCL: "OriginBlocked: 403 core"}
+    assert snapshot.open_of(UCL) == (_old(2025),)
+
+    editions_store.save(path, editions_store.EditionsSnapshot(NOW - timedelta(days=2), (_old(2025),)))
+    with pytest.raises(AllOriginsBlocked):
+        _load(path, _client(**{key: AllOriginsBlocked("every origin 403")}))

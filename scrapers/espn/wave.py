@@ -57,7 +57,9 @@ from .schedule_parser import (
 )
 from .summary_parser import parse_summary
 from .transport_contracts import (
+    AllOriginsBlocked,
     DirectTransportError,
+    OriginBlocked,
     HttpStatusError,
     InvalidJsonError,
     ResponseTooLarge,
@@ -76,10 +78,13 @@ STALE_AFTER = timedelta(days=3)
 GREEN = "green"
 RED = "red"
 _MATCH = f"iceberg.{BRONZE_DATABASE}.{MATCH_TABLE}"
-# A status check that fails for one match leaves it unmarked; gate closures
-# (AllOriginsBlocked, LaneClosed, DailyCapExceeded) propagate.
+# A request that fails for one match or league is that tournament's error; a
+# single 403 (OriginBlocked) is one of them.  Gate closures (AllOriginsBlocked
+# — a subclass of OriginBlocked, re-raised first —, LaneClosed,
+# DailyCapExceeded) propagate and turn the wave red.
 _STATUS_ERRORS = (
     DirectTransportError,
+    OriginBlocked,
     EspnParseError,
     HttpStatusError,
     InvalidJsonError,
@@ -560,6 +565,8 @@ def _day_rows(
             rows.update(
                 (row.event_id, row) for row in _league_day_rows(league.body, competition, day)
             )
+        except AllOriginsBlocked:
+            raise
         except _STATUS_ERRORS as exc:
             errors[competition.slug] = f"{type(exc).__name__}: {exc}"
     return rows, True, errors
@@ -598,6 +605,8 @@ def check_presence(
         if exc.status == 404:
             return WITHDRAWN, None, None
         return None, None, f"status of {stored.event_id}: HttpStatusError: {exc}"
+    except AllOriginsBlocked:
+        raise
     except _STATUS_ERRORS as exc:
         return None, None, f"status of {stored.event_id}: {type(exc).__name__}: {exc}"
     if status == stored.status or status not in STATUS_MAP:
