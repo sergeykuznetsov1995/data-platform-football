@@ -131,6 +131,18 @@ def all_scoreboard_day(day: date) -> EspnRequest:
     return league_scoreboard_day("all", day)
 
 
+def summary(slug: str, event_id: int) -> EspnRequest:
+    """Match Summary on site.web.api, as in the recorded probes (#1504)."""
+
+    if type(event_id) is not int or event_id < 1:
+        raise ValueError("ESPN event id must be a positive integer")
+    return EspnRequest(
+        f"{SITE_SOCCER}/{slug}/summary",
+        MappingProxyType({"event": str(event_id)}),
+        EndpointType.SUMMARY,
+    )
+
+
 __all__ = [
     "EspnRequest",
     "MAX_WINDOW_DAYS",
@@ -142,5 +154,6 @@ __all__ = [
     "league_seasons",
     "season",
     "season_types",
+    "summary",
     "type_events",
 ]

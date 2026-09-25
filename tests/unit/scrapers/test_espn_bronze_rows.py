@@ -232,3 +232,19 @@ def test_summary_of_another_match_is_refused() -> None:
 
     with pytest.raises(ValueError, match="paired with"):
         batch_rows([MatchPayload(other, summary, RAW)], stamp=STAMP)
+
+
+@pytest.mark.unit
+def test_presence_of_a_match_that_left_its_day_goes_to_disposition() -> None:
+    # #1504: withdrawn/moved are presence values of a match without Summary.
+    event, parsed = _parse("summary_eng1_2020.json")
+    payload = MatchPayload(event, None, RAW, "withdrawn")
+
+    rows = batch_rows([payload], stamp=STAMP)
+
+    (match,) = rows["espn_match"]
+    assert (match["disposition"], match["lineup_state"]) == ("withdrawn", "pending")
+    with pytest.raises(ValueError, match="unknown presence"):
+        MatchPayload(event, None, RAW, "vanished")
+    with pytest.raises(ValueError, match="without Summary"):
+        MatchPayload(event, parsed, RAW, "moved")

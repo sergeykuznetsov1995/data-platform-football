@@ -7,6 +7,8 @@ row of the match, so a match already fetched must come with its Summary.
 
 - no Summary yet: match row with ``pending`` states, no children;
 - ``SOURCE_MALFORMED``: match row with disposition and reason, no children;
+- a match gone from its day (#1504): no Summary, ``disposition`` is the
+  presence value ``withdrawn`` (core answers 404) or ``moved``;
 - lineup rows only when ``lineup_state`` is captured, team statistics only
   when ``matchsheet_state`` is captured (match facts of the matchsheet rows
   live on the match row), events whenever the Summary has them.
@@ -38,6 +40,11 @@ from .parser_contracts import (
 
 SOURCE = "espn"
 PENDING = "pending"
+# Presence of a known match that left its day (#1504); written to
+# ``disposition`` of a match without Summary, never a parser outcome.
+WITHDRAWN = "withdrawn"
+MOVED = "moved"
+PRESENCE_VALUES = frozenset({WITHDRAWN, MOVED})
 
 # Anomaly classes that name no single team: every team of the match is flagged.
 _TEAM_ATTRIBUTED = frozenset(
@@ -69,6 +76,15 @@ class MatchPayload:
     summary: SummaryParseResult | None
     # Summary body when ``summary`` is set, else the scoreboard body.
     raw: RawRef
+    # WITHDRAWN / MOVED for a match without Summary that left its day.
+    presence: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.presence is not None:
+            if self.presence not in PRESENCE_VALUES:
+                raise ValueError(f"unknown presence {self.presence!r}")
+            if self.summary is not None:
+                raise ValueError("presence is only for a match without Summary")
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -111,6 +127,7 @@ def match_row(
     *,
     raw: RawRef,
     stamp: BatchStamp,
+    presence: str | None = None,
 ) -> dict[str, Any]:
     played = schedule.played_final
     sides = _sides(summary) if summary is not None else {}
@@ -130,7 +147,8 @@ def match_row(
         referee = leg = None
 
     if summary is None:
-        disposition = reason = anomalies = None
+        disposition = presence
+        reason = anomalies = None
         lineup_state = team_stats_state = events_state = PENDING
         first_fetched_at = None
         parser_version = schedule.parser_version
@@ -382,7 +400,9 @@ def batch_rows(
             )
         args = (payload.schedule, payload.summary)
         kwargs = {"raw": payload.raw, "stamp": stamp}
-        tables[MATCH_TABLE].append(match_row(*args, **kwargs))
+        tables[MATCH_TABLE].append(
+            match_row(*args, **kwargs, presence=payload.presence)
+        )
         tables[LINEUP_TABLE].extend(lineup_rows(*args, **kwargs))
         tables[TEAM_STATS_TABLE].extend(team_stats_rows(*args, **kwargs))
         tables[EVENTS_TABLE].extend(event_rows(*args, **kwargs))
@@ -391,8 +411,11 @@ def batch_rows(
 
 __all__ = (
     "BatchStamp",
+    "MOVED",
     "MatchPayload",
+    "PRESENCE_VALUES",
     "RawRef",
+    "WITHDRAWN",
     "batch_rows",
     "event_rows",
     "lineup_rows",

@@ -212,7 +212,7 @@ EVENTS_SCHEMA = _schema(
     pa.field("away_score", pa.int32()),
 )
 
-# Write order of a batch: match -> lineup -> team_stats -> events.
+# Table set; the batch write order is ``bronze_writer.WRITE_ORDER``.
 TABLES: dict[str, pa.Schema] = {
     MATCH_TABLE: MATCH_SCHEMA,
     LINEUP_TABLE: LINEUP_SCHEMA,
