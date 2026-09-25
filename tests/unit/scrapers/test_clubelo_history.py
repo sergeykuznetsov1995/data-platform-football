@@ -237,3 +237,38 @@ def test_iceberg_store_is_append_only_arrow_with_run_metadata():
     assert kwargs == {"mode": "append", "add_metadata": False, "bulk_arrow": True}
     assert list(frame.columns) == history.SCHEMAS[history.POINT_TABLE].names
     assert set(frame["_batch_id"]) == {"test-batch"} and set(frame["_source"]) == {"clubelo_html"}
+
+
+def _through_real_writer_conversion(frame, table):
+    """What IcebergWriter does with the frame in bulk_arrow append mode."""
+    from pyiceberg.catalog import Catalog
+
+    from scrapers.base.iceberg_writer import IcebergWriter
+
+    target_schema = Catalog._convert_schema_if_needed(history.SCHEMAS[table])
+
+    class _Target:
+        def schema(self):
+            return target_schema
+
+    arrow = IcebergWriter()._pandas_to_arrow(frame)
+    return IcebergWriter._align_pyiceberg_arrow_table(arrow, target=_Target())
+
+
+@pytest.mark.parametrize("extra", [
+    {},  # all four tables of a complete batch
+    {"/Arsenal": redirect_response(), "/santos-fc_2": redirect_response(),
+     "/riverplate": redirect_response(), "/lsapi-4199": [network_error()] * 3},  # manifest-only batch
+])
+def test_store_frames_survive_the_real_arrow_conversion(extra):
+    _, mem, _, _ = _run(_answers(**extra), CLUBS)
+    writer = _Writer()
+    store = history.IcebergHistoryStore(writer)
+    for table in history.WRITE_ORDER:
+        store.append(table, [r for r in mem.rows(table) if r.get("_batch_id") == "test-batch"])
+    assert writer.written
+    for _, table, frame, _ in writer.written:
+        aligned = _through_real_writer_conversion(frame, table)
+        assert aligned.num_rows == len(frame)
+        if table == history.MANIFEST_TABLE:
+            assert aligned.column("first_point").type == pa.date32()

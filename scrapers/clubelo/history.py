@@ -172,9 +172,10 @@ class IcebergHistoryStore:
     def append(self, table: str, rows: List[Dict[str, Any]]) -> None:
         if not rows:
             return
-        import pandas as pd
-
-        frame = pd.DataFrame(rows, columns=SCHEMAS[table].names)
+        # Type the rows by the table schema first: a plain DataFrame turns a
+        # column that is empty in this batch (dates of no_page/failed rows)
+        # into float NaN, which Arrow cannot cast to date32 (Sol r1 #1).
+        frame = pa.Table.from_pylist(rows, schema=SCHEMAS[table]).to_pandas(date_as_object=True)
         self.writer.write_dataframe(
             frame, self.database, table, mode="append", add_metadata=False, bulk_arrow=True
         )
