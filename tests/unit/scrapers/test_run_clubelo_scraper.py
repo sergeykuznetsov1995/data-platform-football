@@ -91,7 +91,7 @@ class TestDailyMode:
         ["--leagues", "ENG-Premier League"], ["--mode", "full"], ["--days-back", "30"],
         ["--force-replace"],
     ])
-    def test_soccerdata_flags_are_gone(self, temp_output, old_flag):
+    def test_old_api_flags_are_gone(self, temp_output, old_flag):
         with pytest.raises(SystemExit) as exc:
             self._run_daily(["--output", temp_output] + old_flag, self._result())
         assert exc.value.code == 2

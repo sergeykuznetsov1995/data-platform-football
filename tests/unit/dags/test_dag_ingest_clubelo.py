@@ -65,7 +65,7 @@ class TestDailyChain:
     def test_schedule_literal_twice_a_day(self, dag_module):
         assert dag_module.dag._dag_kwargs['schedule'] == '30 9,21 * * *'
 
-    def test_old_soccerdata_tasks_and_params_are_gone(self, dag_module):
+    def test_old_api_tasks_and_params_are_gone(self, dag_module):
         assert _bash_task('scrape_current_ratings') is None
         assert _python_task('gate_full_ratings') is None
         assert _bash_task('scrape_full_ratings') is None

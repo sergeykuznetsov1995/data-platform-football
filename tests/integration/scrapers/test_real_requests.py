@@ -16,7 +16,6 @@ With retries for flaky tests:
     pytest tests/integration/scrapers/test_real_requests.py -v -m integration --reruns 2
 """
 
-from datetime import date
 
 import pandas as pd
 import pytest
@@ -92,39 +91,6 @@ class TestMatchHistoryIntegration:
         expected_cols = ['home_team', 'away_team', 'home_goals', 'away_goals']
         for col in expected_cols:
             assert col in df.columns, f"Should have '{col}' column"
-
-
-# =============================================================================
-# ClubElo Tests (No Tor Required, May Have Server Issues)
-# =============================================================================
-
-@pytest.mark.integration
-@pytest.mark.flaky
-class TestClubEloIntegration:
-    """Integration tests for ClubElo scraper.
-
-    Note: ClubElo can have server issues (502 errors).
-    These tests are marked as flaky.
-    """
-
-    def test_read_by_date(self, clubelo_scraper, skip_if_no_network, integration_delay):
-        """Test reading ELO ratings by date."""
-        df = clubelo_scraper.read_by_date()
-
-        assert df is not None, "DataFrame should not be None"
-        assert isinstance(df, pd.DataFrame), "Result should be a DataFrame"
-        assert len(df) > 0, "DataFrame should not be empty"
-        assert '_source' in df.columns, "Should have metadata column"
-        assert df['_source'].iloc[0] == 'clubelo', "Source should be 'clubelo'"
-
-    def test_read_by_date_historical(self, clubelo_scraper, skip_if_no_network, integration_delay):
-        """Test reading historical ELO ratings."""
-        historical_date = date(2024, 1, 1)
-        df = clubelo_scraper.read_by_date(historical_date)
-
-        assert df is not None, "DataFrame should not be None"
-        assert isinstance(df, pd.DataFrame), "Result should be a DataFrame"
-        assert len(df) > 0, "DataFrame should not be empty"
 
 
 # =============================================================================

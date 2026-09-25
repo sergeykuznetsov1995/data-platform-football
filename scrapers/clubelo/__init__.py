@@ -1,3 +1,1 @@
-from scrapers.clubelo.scraper import ClubEloScraper
-
-__all__ = ['ClubEloScraper']
+"""ClubElo collection from the HTML pages of clubelo.com (#1459): transport, parse, history, daily."""
