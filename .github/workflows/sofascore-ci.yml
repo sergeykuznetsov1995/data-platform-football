@@ -21,6 +21,8 @@ on:
       - "dags/sql/**/*sofascore*"
       - "dags/utils/maintenance_tasks.py"
       - "dags/utils/sofascore_dq.py"
+      - "dags/utils/sofascore_pool_wait.py"
+      - "dags/utils/sofascore_red_share.py"
       - "deploy/sofascore/**"
       - "scrapers/base/**"
       - "scrapers/sofascore/**"
@@ -69,7 +71,7 @@ jobs:
           python -m pip install --disable-pip-version-check \
             pytest "ruff==0.15.20" pandas numpy pyarrow trino requests PyYAML jinja2 \
             jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
-            rapidfuzz Unidecode nicknames "sqlglot==30.12.0"
+            rapidfuzz Unidecode nicknames "sqlglot==30.12.0" "duckdb==1.5.4"
 
       - name: Static checks
         run: |
@@ -171,4 +173,6 @@ jobs:
             tests/unit/sql/test_sofascore_league_table_silver.py \
             tests/unit/sql/test_sofascore_post_shot_xg.py \
             tests/unit/utils/test_sofascore_all_mens_state.py \
+            tests/unit/utils/test_sofascore_pool_wait.py \
+            tests/unit/utils/test_sofascore_red_share.py \
             tests/integration/test_compose_validity.py

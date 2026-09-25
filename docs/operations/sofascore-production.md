@@ -34,9 +34,40 @@ reached` почти на каждом запуске истории (03.09 за 
 
 | Полоса | Шлюз (сервис / контейнер) | Пул Airflow | Дневной потолок |
 | --- | --- | --- | --- |
-| Актуалка + дейли | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ |
+| Дейли | `sofascore_proxy_filter` / `sofascore_gw_951` | `ingest_scraper_pool` | 600 МБ |
 | Кампания истории | `sofascore_gw_history` / `sofascore_gw_history` | `sofascore_history_pool` | 2000 МБ |
-| Профили игроков | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
+| Актуалка (#1360; бывшая полоса игроков) | `sofascore_gw_players` / `sofascore_gw_players` | `sofascore_players_pool` | 400 МБ |
+
+**Актуалка на своей полосе (#1360).** До #1360 актуалка и дейли делили шлюз `sofascore_gw_951`
+и единственный слот `ingest_scraper_pool`: прогон актуалки 15:30 UTC ждал идущий с 14:00 дейли
+(21–24.09 — 22,3 / 17,3 / 23,2 / 9,3 мин). Полоса игроков #1244 поглощена #1360: её простаивавший
+шлюз и пул отданы актуалке ключами рецепта `SOFASCORE_REFRESH_POOL=sofascore_players_pool` и
+`SOFASCORE_REFRESH_PROXY_CONTROL_URL=http://sofascore_gw_players:8899`
+(`deploy/sofascore/airflow.compose.yaml`; DAG читает их в `REFRESH_POOL` и `REFRESH_TASK_ENV`).
+Имена контейнера, пула, каталога состояния `gateway-state-players` и сторожа
+`sofascore-gw-lease-watchdog-players` сохранены, чтобы не трогать хост; переименование — вместе
+с выводом дейли. Ключей `SOFASCORE_PLAYERS_*` в рецепте больше нет (их никто не читал).
+`deploy.sh`, `postdeploy_checks.sh` и `auto_deliver.sh` не менялись: пул и шлюз там уже были.
+
+**История не ждёт дейли (#1360).** Правило «пока у `dag_ingest_sofascore` есть DagRun
+`queued`/`running`, план истории пуст» (`_history_start_allowed`) жило с общего шлюза и снято:
+у истории свой шлюз и пул с 03.09, Iceberg-коммиты полос сериализованы writer-lock'ом.
+`IDLE_COOLDOWN` (30 мин) остаётся только для честно пустого плана.
+
+**Метрика ожидания пула в утренней сводке (#1360).** Модуль `dags/utils/sofascore_pool_wait.py`
+(только stdlib, сводка грузит его из релиза по `SOFASCORE_RELEASE_ROOT`, как модуль порога
+красноты) печатает строку `• ожидание пула актуалкой: N мин (k/n прогонов ждали, макс M мин) ✅|⛔ ·
+история во время дейли: X скоупов · дейли в пулах актуалки/истории: Y/Z (за дд.мм UTC)`. Ожидание — не
+`queued_dttm → start_date` (в Airflow 2.11 ждущая слот задача стоит в `scheduled`, `queued_dttm`
+ставится вместе со слотом — всегда ≈ 0), а зазор первой попытки каждой задачи актуалки от более
+позднего из старта DagRun и конца предыдущих попыток прогона; зазоры ≤ 60 с — переходы планировщика,
+не ожидание. Прогон относится к суткам своего старта; меряется каждая попытка (прошлые попытки — из
+`task_instance_history`), ретрай — от конца своей прошлой попытки плюс задержка ретрая (2 мин у
+`run_refresh_scope`, `RETRY_DELAY_S`); задача, всё ещё ждущая слот (`scheduled`/`queued`, в прогоне ничего не
+бежит), считается ожидающей до момента сводки. ✅ — ни один прогон не ждал и ни одна задача дейли не
+держала пул актуалки или истории в эти сутки. Пока модуль
+не доставлен, строка — `⛔ … модуля sofascore_pool_wait нет в релизе <sha8>`; подмена для стенда —
+`SOFASCORE_POOL_WAIT_MODULE=<путь>`.
 
 Сумма дневных потолков — труба источника, 3 ГБ/сутки. Потолок и число активных аренд у
 каждой полосы — переменные окружения (`SOFASCORE_{PROXY,HISTORY_GW,PLAYERS_GW}_{DAILY_BUDGET_MB,
