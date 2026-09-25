@@ -8,7 +8,7 @@ import math
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
-from .client import UnderstatPayloadError
+from .client import UnderstatPayloadError, save_schema_drift_payload
 
 
 @dataclass(frozen=True)
@@ -136,6 +136,16 @@ class UnderstatCatalog:
 
     def discover_scopes(self, *, force_refresh: bool = True) -> tuple[UnderstatScope, ...]:
         payload = self.client.get_stat_data(force_refresh=force_refresh)
+        try:
+            return self._scopes_from(payload)
+        except UnderstatPayloadError:
+            # #1428 (R-02): keep the rejected discovery response.
+            save_schema_drift_payload(
+                getattr(self.client, "cache_dir", None), "stat.json", payload
+            )
+            raise
+
+    def _scopes_from(self, payload: Any) -> tuple[UnderstatScope, ...]:
         if not isinstance(payload, Mapping):
             raise _payload_error("root", "payload must be an object")
         if set(payload) != {"stat"}:

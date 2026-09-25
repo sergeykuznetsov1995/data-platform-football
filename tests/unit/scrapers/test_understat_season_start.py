@@ -18,7 +18,13 @@ import pandas as pd
 import pytest
 
 from dags.scripts import run_understat_scraper as runner
-from scrapers.understat import UnderstatCatalog, UnderstatSchemaDrift, UnderstatSource
+from scrapers.understat import (
+    UnderstatCatalog,
+    UnderstatClient,
+    UnderstatPayloadError,
+    UnderstatSchemaDrift,
+    UnderstatSource,
+)
 from scrapers.understat.catalog import UnderstatScope
 from scrapers.understat.coverage import coverage_exceptions_for_scope
 from scrapers.understat.manifest import ManifestStatus, ScopeKey
@@ -610,3 +616,110 @@ def test_control_all_teams_played_keeps_calls_and_result():
     assert len(client.team_calls) == 16
     assert report.to_dict()["teams_pending_first_match"] == []
     assert len(report.to_dict()["covered_game_ids"]) == 40
+
+
+# --------------------------------------------------------------------------
+# The same rule for drift found by the real client, parse_* and discovery.
+# --------------------------------------------------------------------------
+
+class _HTTPResponse:
+    def __init__(self, text: str):
+        self.status_code = 200
+        self.headers = {}
+        self.text = text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class _HTTPSession:
+    def __init__(self, body: str):
+        self.body = body
+        self.headers = {}
+
+    def get(self, url, **kwargs):
+        return _HTTPResponse(self.body)
+
+
+def _real_client(body: str, cache_dir: Path) -> UnderstatClient:
+    return UnderstatClient(
+        session=_HTTPSession(body),
+        cache_dir=cache_dir,
+        sleep=lambda _seconds: None,
+        jitter=lambda _start, _end: 0,
+    )
+
+
+@pytest.mark.parametrize("body", ["[]", "null", "not json"], ids=["list", "null", "invalid"])
+def test_real_client_saves_a_non_object_response(tmp_path, body):
+    client = _real_client(body, tmp_path)
+
+    with pytest.raises(UnderstatPayloadError) as caught:
+        UnderstatSource(client, today=date(2026, 7, 26)).scrape_scope(
+            LEAGUE, "2627", 2026
+        )
+
+    _assert_drift_status(caught.value)
+    [saved] = _drift_files(tmp_path)
+    assert saved.name.endswith("_league_RFPL_2026.json")
+    assert saved.read_text(encoding="utf-8") == body
+    assert not (tmp_path / "league_RFPL_2026.json").exists()
+
+
+def test_real_client_saves_a_non_object_team_response(tmp_path):
+    client = _real_client("[]", tmp_path)
+
+    with pytest.raises(UnderstatPayloadError):
+        client.get_team_data("CSKA Moscow", 2026, force_refresh=True)
+
+    [saved] = _drift_files(tmp_path)
+    assert saved.name.endswith("_team_CSKA_Moscow_2026.json")
+
+
+def test_league_parse_drift_payload_is_saved(tmp_path):
+    first = _results(_base_league())[0]
+    league = _league({first["id"]})
+    played = next(m for m in league["dates"] if m["id"] == first["id"])
+    played["goals"]["h"] = "not-a-number"  # structurally valid, parse fails
+    validate_league_payload(league)
+    client = _Client(league, cache_dir=tmp_path)
+
+    with pytest.raises(UnderstatSchemaDrift, match="invalid integer") as caught:
+        UnderstatSource(client, today=date(2026, 7, 26)).scrape_scope(LEAGUE, "2627", 2026)
+
+    _assert_drift_status(caught.value)
+    [saved] = _drift_files(tmp_path)
+    assert saved.name.endswith("_league_RFPL_2026.json")
+    assert json.loads(saved.read_text(encoding="utf-8")) == league
+
+
+def test_match_parse_drift_payload_is_saved(tmp_path):
+    first = _results(_base_league())[0]
+    league = _league({first["id"]})
+    client = _Client(league, cache_dir=tmp_path)
+    broken = _match_payload(first)
+    broken["shots"]["h"][0]["minute"] = "not-a-number"
+    client.match_overrides[first["id"]] = broken
+
+    with pytest.raises(UnderstatSchemaDrift):
+        UnderstatSource(client, today=date(2026, 7, 26)).scrape_scope(LEAGUE, "2627", 2026)
+
+    [saved] = _drift_files(tmp_path)
+    assert saved.name.endswith(f"_match_{first['id']}.json")
+    assert json.loads(saved.read_text(encoding="utf-8")) == broken
+
+
+def test_discovery_drift_payload_is_saved(tmp_path):
+    class _BrokenStat(_StatClient):
+        cache_dir = tmp_path
+
+        def get_stat_data(self, *, force_refresh=True):
+            payload = super().get_stat_data(force_refresh=force_refresh)
+            payload["stat"][0]["surprise"] = "1"
+            return payload
+
+    with pytest.raises(UnderstatPayloadError, match="field contract mismatch"):
+        UnderstatCatalog(_BrokenStat(), today=date(2026, 9, 25)).discover_scopes()
+
+    [saved] = _drift_files(tmp_path)
+    assert saved.name.endswith("_stat.json")

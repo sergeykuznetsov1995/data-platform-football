@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-import json
+from contextlib import contextmanager
+from datetime import date
 import logging
-from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
-from urllib.parse import quote
+from typing import Any, Iterator, Mapping, Optional
 
 import pandas as pd
 
@@ -20,6 +18,13 @@ from .catalog import (
 )
 from .client import UnderstatClient
 from .client import UnderstatHTTPError
+from .client import (
+    UnderstatPayloadError,
+    league_cache_name,
+    match_cache_name,
+    save_schema_drift_payload,
+    team_cache_name,
+)
 from .closed_check import league_payload_hashes
 from .parsers import (
     UnderstatSchemaDrift,
@@ -70,47 +75,22 @@ class UnderstatSource:
         # #1431: fingerprints of the last parsed league response.
         self.last_league_hashes: dict[str, str] = {}
 
-    def _validate(
-        self,
-        validator: Callable[..., None],
-        payload: Mapping[str, Any],
-        cache_name: str,
-        **kwargs: Any,
-    ) -> None:
-        """Run a payload validator; on drift keep the response, then re-raise.
+    @contextmanager
+    def _keep_on_drift(self, payload: Any, cache_name: str) -> Iterator[None]:
+        """Keep a response whose validation or parsing drifts, then re-raise.
 
-        #1428 (R-02): the regular cache file is overwritten by the next run,
-        so a drifted response is copied to ``<cache_dir>/schema_drift/``.
-        Saving is best-effort and never replaces the drift exception.
+        #1428 (R-02): one guard around everything that reads a league, match
+        or team response (``validate_*`` and ``parse_*``); the exception and
+        the runner's SCHEMA_DRIFT status stay unchanged.
         """
 
         try:
-            validator(payload, **kwargs)
-        except UnderstatSchemaDrift:
-            self._save_drift_payload(payload, cache_name)
+            yield
+        except (UnderstatSchemaDrift, UnderstatPayloadError):
+            save_schema_drift_payload(
+                getattr(self.client, "cache_dir", None), cache_name, payload
+            )
             raise
-
-    def _save_drift_payload(self, payload: Any, cache_name: str) -> None:
-        cache_dir = getattr(self.client, "cache_dir", None)
-        if cache_dir is None:
-            return
-        try:
-            folder = Path(cache_dir) / "schema_drift"
-            folder.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            target = folder / f"{stamp}_{cache_name}"
-            target.write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-        except Exception:  # the drift itself stays the verdict
-            logger.warning(
-                "Unable to save Understat schema-drift payload %s",
-                cache_name,
-                exc_info=True,
-            )
-            return
-        logger.warning("Understat schema-drift payload saved to %s", target)
 
     def _scope(self, league: str, season_slug: str, source_season_id: int):
         definition = LEAGUE_BY_CANONICAL.get(league)
@@ -164,18 +144,20 @@ class UnderstatSource:
             return {}
         if not isinstance(league_payload, Mapping):
             raise TypeError("getLeagueData payload must be an object")
-        self._validate(
-            validate_league_payload,
+        with self._keep_on_drift(
             league_payload,
-            _league_cache_name(definition.source_league, source_season_id),
-        )
-        return league_payload_hashes(
-            {
-                "schedule": parse_schedule(league_payload, scope),
-                "players": parse_player_season_stats(league_payload, scope),
-                "team_match_stats": parse_team_match_stats(league_payload, scope),
-            }
-        )
+            league_cache_name(definition.source_league, source_season_id),
+        ):
+            validate_league_payload(league_payload)
+            return league_payload_hashes(
+                {
+                    "schedule": parse_schedule(league_payload, scope),
+                    "players": parse_player_season_stats(league_payload, scope),
+                    "team_match_stats": parse_team_match_stats(
+                        league_payload, scope
+                    ),
+                }
+            )
 
     def scrape_scope(
         self,
@@ -207,15 +189,14 @@ class UnderstatSource:
             league_payload = {"dates": [], "players": [], "teams": {}}
         if not isinstance(league_payload, Mapping):
             raise TypeError("getLeagueData payload must be an object")
-        self._validate(
-            validate_league_payload,
+        with self._keep_on_drift(
             league_payload,
-            _league_cache_name(definition.source_league, source_season_id),
-        )
-
-        schedule = parse_schedule(league_payload, scope)
-        players = parse_player_season_stats(league_payload, scope)
-        team_match = parse_team_match_stats(league_payload, scope)
+            league_cache_name(definition.source_league, source_season_id),
+        ):
+            validate_league_payload(league_payload)
+            schedule = parse_schedule(league_payload, scope)
+            players = parse_player_season_stats(league_payload, scope)
+            team_match = parse_team_match_stats(league_payload, scope)
         # #1431: fingerprint before has_data is rewritten from match responses.
         self.last_league_hashes = league_payload_hashes(
             {"schedule": schedule, "players": players, "team_match_stats": team_match}
@@ -242,16 +223,18 @@ class UnderstatSource:
                 raise
             if not match_payload:
                 continue
-            self._validate(
-                validate_match_payload,
+            with self._keep_on_drift(
                 match_payload,
-                f"match_{quote(str(row['game_id']), safe='')}.json",
-            )
+                match_cache_name(int(row["game_id"])),
+            ):
+                validate_match_payload(match_payload)
+                shot_frame, player_frame = parse_match_payload(
+                    match_payload, scope, row
+                )
             schedule.loc[
                 schedule["game_id"] == row["game_id"], "has_data"
             ] = _match_payload_has_rows(match_payload)
             played_rows.append(row)
-            shot_frame, player_frame = parse_match_payload(match_payload, scope, row)
             shots.append(shot_frame)
             player_matches.append(player_frame)
 
@@ -278,18 +261,18 @@ class UnderstatSource:
                     source_season_id,
                     force_refresh=refresh_scope or mode == "reparse",
                 )
-                self._validate(
-                    validate_team_payload,
-                    team_payload,
-                    _team_cache_name(team_name, source_season_id),
-                    source_season_id=source_season_id,
-                )
-                player_team, breakdowns = parse_team_payload(
-                    team_payload,
-                    scope,
-                    team_id=team_id,
-                    team_name=team_name,
-                )
+                with self._keep_on_drift(
+                    team_payload, team_cache_name(team_name, source_season_id)
+                ):
+                    validate_team_payload(
+                        team_payload, source_season_id=source_season_id
+                    )
+                    player_team, breakdowns = parse_team_payload(
+                        team_payload,
+                        scope,
+                        team_id=team_id,
+                        team_name=team_name,
+                    )
                 player_team_frames.append(player_team)
                 breakdown_frames.append(breakdowns)
 
@@ -308,19 +291,6 @@ class UnderstatSource:
                 breakdown_frames, empty_breakdowns
             ),
         }
-
-
-def _league_cache_name(source_league: str, source_season_id: int) -> str:
-    """Same file name as ``UnderstatClient.get_league_data`` caches."""
-
-    return f"league_{quote(source_league, safe='_-')}_{source_season_id}.json"
-
-
-def _team_cache_name(team_name: str, source_season_id: int) -> str:
-    """Same file name as ``UnderstatClient.get_team_data`` caches."""
-
-    slug = quote(team_name.replace(" ", "_"), safe="_-")
-    return f"team_{slug}_{source_season_id}.json"
 
 
 def _team_records(value: Any) -> list[Mapping[str, Any]]:
