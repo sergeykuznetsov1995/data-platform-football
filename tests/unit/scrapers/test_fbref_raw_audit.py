@@ -8,7 +8,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from threading import Barrier
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -792,10 +792,9 @@ def test_s3_inventory_uses_bounded_pages_and_persists_etag_tokens(monkeypatch):
             ]
         },
     ]
-    paginator = MagicMock()
-    paginator.paginate.return_value = iter(pages)
+    pages[0].update(IsTruncated=True, NextContinuationToken="token-1")
     client = MagicMock()
-    client.get_paginator.return_value = paginator
+    client.list_objects_v2.side_effect = pages
     monkeypatch.setattr(
         raw_audit_module, "_s3_list_client", lambda: client
     )
@@ -803,12 +802,15 @@ def test_s3_inventory_uses_bounded_pages_and_persists_etag_tokens(monkeypatch):
 
     objects = list(raw_audit_module._walk_s3_raw_files(store))
 
-    client.get_paginator.assert_called_once_with("list_objects_v2")
-    paginator.paginate.assert_called_once_with(
-        Bucket="bucket",
-        Prefix="raw/",
-        PaginationConfig={"PageSize": 1_000},
-    )
+    assert client.list_objects_v2.call_args_list == [
+        call(Bucket="bucket", Prefix="raw/", MaxKeys=1_000),
+        call(
+            Bucket="bucket",
+            Prefix="raw/",
+            MaxKeys=1_000,
+            ContinuationToken="token-1",
+        ),
+    ]
     assert [item.path for item in objects] == [
         "bucket/raw/immutable/a.bin",
         "bucket/raw/immutable/b.bin",
@@ -818,6 +820,65 @@ def test_s3_inventory_uses_bounded_pages_and_persists_etag_tokens(monkeypatch):
         "s3-etag:etag-b",
     ]
 
+
+
+def test_s3_inventory_resumes_full_page_that_claims_not_truncated(
+    monkeypatch,
+):
+    """SeaweedFS ends a full page on a directory marker with
+    IsTruncated=False (#1535); the subtree after it must still be listed."""
+
+    modified = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    full_page = [
+        {"Key": f"raw/targets/{n:04d}.json", "Size": 1,
+         "LastModified": modified, "ETag": f'"e{n}"'}
+        for n in range(999)
+    ] + [{"Key": "raw/targets-v2/", "Size": 0, "LastModified": modified}]
+    tail = [
+        {"Key": "raw/targets-v2/competition/1.json", "Size": 2,
+         "LastModified": modified, "ETag": '"c1"'}
+    ]
+    client = MagicMock()
+    client.list_objects_v2.side_effect = [
+        {"Contents": full_page, "IsTruncated": False},
+        {"Contents": tail, "IsTruncated": False},
+    ]
+    monkeypatch.setattr(
+        raw_audit_module, "_s3_list_client", lambda: client
+    )
+
+    objects = list(
+        raw_audit_module._walk_s3_raw_files(MagicMock(root="bucket/raw"))
+    )
+
+    assert len(objects) == 1_000
+    assert objects[-1].path == "bucket/raw/targets-v2/competition/1.json"
+    assert client.list_objects_v2.call_args_list[1] == call(
+        Bucket="bucket",
+        Prefix="raw/",
+        MaxKeys=1_000,
+        StartAfter="raw/targets-v2/",
+    )
+
+
+def test_s3_inventory_fails_when_listing_stops_advancing(monkeypatch):
+    modified = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    full_page = {
+        "Contents": [
+            {"Key": f"raw/a/{n:04d}.json", "Size": 1,
+             "LastModified": modified}
+            for n in range(1_000)
+        ],
+        "IsTruncated": False,
+    }
+    client = MagicMock()
+    client.list_objects_v2.return_value = full_page
+    monkeypatch.setattr(
+        raw_audit_module, "_s3_list_client", lambda: client
+    )
+
+    with pytest.raises(RawAuditError, match="stopped advancing"):
+        list(raw_audit_module._walk_s3_raw_files(MagicMock(root="bucket/raw")))
 
 def test_audit_reuses_baseline_hashes_then_uses_metadata_guard(
     tmp_path, monkeypatch
