@@ -633,21 +633,30 @@ def test_primary_403_moves_next_requests_to_open_reserve_one_permit_each(
     client, session, _, _ = _client(
         monkeypatch,
         tmp_path,
-        [_akamai_403()] + [FakeResponse(200, b"{}") for _ in range(4)],
+        [FakeResponse(200, b"{}"), _akamai_403()]
+        + [FakeResponse(200, b"{}") for _ in range(3)],
         gate=gate,
     )
+    probe = client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 0})
+    assert probe.transport_origin == SITE  # the reserve's probe answered 200
+
     with pytest.raises(OriginBlocked) as exc_info:
         client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 1})
     assert not isinstance(exc_info.value, AllOriginsBlocked)
-    assert len(session.calls) == 1
+    assert exc_info.value.ledger_entry.attempts == 1
 
     before = gate.snapshot()["daily"]["live"]["requests"]
-    for event in (2, 3, 4, 5):
+    for event in (2, 3, 4):
         result = client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": event})
         assert result.attempts == 1 and result.transport_origin == SITE
-    assert gate.snapshot()["daily"]["live"]["requests"] - before == 4
-    assert [call[0].split("/apis")[0] for call in session.calls] == [WEB] + [SITE] * 4
-
+    assert gate.snapshot()["daily"]["live"]["requests"] - before == 3
+    assert [call[0].split("/apis")[0] for call in session.calls] == [
+        SITE,
+        WEB,
+        SITE,
+        SITE,
+        SITE,
+    ]
 
 @pytest.mark.unit
 def test_retryable_failure_retries_same_origin_with_new_permit(

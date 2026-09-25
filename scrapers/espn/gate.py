@@ -302,14 +302,13 @@ class TransportGate:
     def acquire(self, cluster: str) -> Permit:
         """Take one permit; waits for pace, raises when the lane or cluster is shut."""
 
+        # A permit is granted only for "now", after every check under the
+        # lock; waiting never holds a permit, so a 403 or an auto-reset seen
+        # by another process during the wait applies to this request too.
         while True:
             with self._state() as state:
-                now = self._now()
-                result = self._try_acquire(state, cluster, now)
+                result = self._try_acquire(state, cluster, self._now())
             if isinstance(result, Permit):
-                delay = result.granted_at - now
-                if delay > 0:
-                    self.sleep_fn(delay)
                 return result
             self.sleep_fn(result)
 
@@ -380,10 +379,13 @@ class TransportGate:
             for origin, is_reserve in ((primary, False), (reserve, True))
             if origin is not None
         ]
-        for origin, entry, is_reserve in candidates:
+        # A due reserve probe goes first, so the reserve is re-checked once a
+        # day even while the primary is healthy.
+        due_reserve = [c for c in candidates if c[2] and self._probe_due(c[1], now)]
+        for origin, entry, is_reserve in due_reserve + candidates:
             if not entry["closed"]:
                 return origin, False
-            if now >= entry["blocked_until"]:
+            if self._probe_due(entry, now):
                 if claim:
                     # One probe: keep it closed for everyone else meanwhile.
                     entry["blocked_until"] = now + self._probe_interval(
@@ -391,6 +393,10 @@ class TransportGate:
                     )
                 return origin, True
         raise AllOriginsBlocked(f"all ESPN origins of cluster {cluster!r} are blocked")
+
+    @staticmethod
+    def _probe_due(entry: dict, now: float) -> bool:
+        return entry["closed"] and now >= entry["blocked_until"]
 
     def _probe_interval(self, state, cluster: str, is_reserve: bool) -> int:
         if is_reserve:
@@ -429,6 +435,8 @@ class TransportGate:
         ):
             raise DailyCapExceeded(f"ESPN {self.lane} lane daily cap reached")
         self._pick_origin(state, cluster, now, claim=False)
+        if state["next_permit_at"] > now:
+            return state["next_permit_at"] - now
 
         step = self._effective_step(state, now)
         rate = self.policy.steps[step]
@@ -438,12 +446,11 @@ class TransportGate:
             history = [p[0] for p in state["permits"] if p[1] == "history"]
             if len(history) >= quota:
                 return max(0.05, history[0] + 60.0 - now)
-        granted = max(now, state["next_permit_at"])
         origin, probe = self._pick_origin(state, cluster, now, claim=True)
-        state["next_permit_at"] = granted + 60.0 / rate
-        state["permits"].append([granted, self.lane])
+        state["next_permit_at"] = now + 60.0 / rate
+        state["permits"].append([now, self.lane])
         daily["requests"] += 1
-        return Permit(cluster, origin, self.lane, step, probe, granted)
+        return Permit(cluster, origin, self.lane, step, probe, now)
 
     def _report(self, state, permit, status, timeout, direct_bytes, now):
         policy = self.policy
@@ -472,22 +479,25 @@ class TransportGate:
             entry["closed"] = True
             entry["last_status"] = 403
             if is_reserve:
-                entry["blocked_until"] = now + policy.reserve_probe_seconds
+                block = policy.reserve_probe_seconds
             elif state["all_blocked"].get(permit.cluster):
-                entry["blocked_until"] = now + policy.all_blocked_probe_seconds
+                block = policy.all_blocked_probe_seconds
             else:
-                entry["blocked_until"] = now + policy.origin_block_seconds
+                block = policy.origin_block_seconds
+            # A late 403 of a request admitted earlier never shortens a block.
+            entry["blocked_until"] = max(entry["blocked_until"], now + block)
             window403 = now - reset_policy["http403_window_seconds"]
             state["http403"] = [t for t in state["http403"] if t > window403] + [now]
             if len(state["http403"]) >= reset_policy["http403_count"]:
                 reset_reason = "http403"
                 state["http403"] = []
-        elif status is not None:
+        elif status is not None and (permit.probe or not entry["closed"]):
+            # Only the probe reopens a closed origin: a late answer of a
+            # request admitted before the block proves nothing.
             entry["last_status"] = status
-            if entry["closed"]:
-                entry["closed"] = False
-                entry["blocked_until"] = 0.0
-            if state["all_blocked"].pop(permit.cluster, None):
+            entry["closed"] = False
+            entry["blocked_until"] = 0.0
+            if permit.probe and state["all_blocked"].pop(permit.cluster, None):
                 # Live resumes now; history reopens last, after a cooldown.
                 state["history_frozen_until"] = max(
                     state["history_frozen_until"],

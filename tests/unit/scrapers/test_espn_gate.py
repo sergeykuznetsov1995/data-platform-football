@@ -55,17 +55,17 @@ def test_403_on_primary_moves_next_requests_to_reserve_one_permit_each(tmp_path)
     """Criterion 1: a 403 is never retried; next requests use the reserve."""
     clock = Clock()
     gate = _gate(tmp_path, clock)
-    # The reserve starts closed; a day later its probe is due.
+    # The reserve starts closed; a day later its probe is due and goes first.
     assert gate.choose_origin("site") == WEB
     clock.advance(86400)
+    probe = gate.acquire("site")
+    assert (probe.origin, probe.probe) == (SITE, True)
+    gate.report(probe, status=200)  # the reserve is open again
+
     first = gate.acquire("site")
     assert first.origin == WEB and not first.probe
     outcome = gate.report(first, status=403)
     assert outcome.origin_closed and not outcome.all_blocked
-
-    probe = gate.acquire("site")  # reserve block expired: this is its probe
-    assert (probe.origin, probe.probe) == (SITE, True)
-    gate.report(probe, status=200)
 
     before = gate.snapshot()
     permits = [gate.acquire("site") for _ in range(3)]
@@ -271,3 +271,82 @@ def test_origin_constants_keep_discovery_on_core_and_web_api():
     assert policy.cluster_of("https://site.api.espn.com") == "site"
     with pytest.raises(ValueError):
         policy.cluster_of("https://www.espn.com")
+
+
+@pytest.mark.unit
+def test_reserve_is_probed_daily_even_while_primary_is_healthy(tmp_path):
+    clock = Clock()
+    gate = _gate(tmp_path, clock)
+    for _ in range(3):
+        permit = gate.acquire("site")
+        assert permit.origin == WEB
+        gate.report(permit, status=200)
+    clock.advance(86400)
+    probe = gate.acquire("site")
+    assert (probe.origin, probe.probe) == (SITE, True)
+    assert gate.acquire("site").origin == WEB  # one probe only
+    outcome = gate.report(probe, status=403)
+    assert outcome.origin_closed and not outcome.all_blocked
+    assert gate.acquire("site").origin == WEB
+    clock.advance(86000)  # the next reserve probe is a day after the 403
+    assert gate.acquire("site").origin == WEB
+    clock.advance(400)
+    assert gate.acquire("site").probe
+
+
+@pytest.mark.unit
+def test_late_answer_of_a_request_admitted_before_the_block_does_not_reopen(tmp_path):
+    clock = Clock()
+    gate = _gate(tmp_path, clock)
+    early = gate.acquire("site")
+    blocked = gate.acquire("site")
+    assert gate.report(blocked, status=403).all_blocked
+    gate.report(early, status=200)  # in flight before the 403
+    with pytest.raises(AllOriginsBlocked):
+        gate.acquire("site")
+    assert gate.snapshot()["all_blocked"]
+    gate.report(early, status=403)  # a late 403 never shortens the pause
+    clock.advance(1799)
+    with pytest.raises(AllOriginsBlocked):
+        gate.acquire("site")
+
+
+@pytest.mark.unit
+def test_a_waiting_request_rechecks_blocks_and_resets_after_its_wait(tmp_path):
+    clock = Clock()
+    other = _gate(tmp_path, clock, ceiling=1)
+    in_flight = other.acquire("site")
+
+    def block_during_wait(seconds):
+        clock.sleep(seconds)
+        other.report(in_flight, status=403)
+
+    waiting = TransportGate(
+        load_transport_policy(),
+        tmp_path / "gate.json",
+        "live",
+        step_ceiling=1,
+        utcnow_fn=clock,
+        sleep_fn=block_during_wait,
+    )
+    with pytest.raises(AllOriginsBlocked):  # not sent to the closed origin
+        waiting.acquire("site")
+
+    clock2 = Clock()
+    live = _gate(tmp_path / "reset", clock2, ceiling=1)
+    first = live.acquire("site")
+
+    def reset_during_wait(seconds):
+        clock2.sleep(seconds)
+        live.report(first, status=429)
+
+    history = TransportGate(
+        load_transport_policy(),
+        tmp_path / "reset" / "gate.json",
+        "history",
+        step_ceiling=1,
+        utcnow_fn=clock2,
+        sleep_fn=reset_during_wait,
+    )
+    with pytest.raises(LaneClosed):  # history froze while it waited
+        history.acquire("site")
