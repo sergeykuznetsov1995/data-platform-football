@@ -1,0 +1,224 @@
+slug	espn_id	name	espn_gender	class	class_reason	in_target	hidden	live	current_season_year	deep_level	fotmob_id	sofascore_id	note
+afc.asian.cup	20219	AFC Asian Cup	MALE	senior_official	rule:default	1	0	1	2027				
+afc.champions	3902	AFC Champions League Elite	MALE	senior_official	rule:default	1	0	1	2025				
+afc.champions_qual	24452	AFC Champions League Elite Qualifying	MALE	senior_official	rule:default	1	0	1	2026				есть в core 24.09, нет в фикстуре 31.07 (новый турнир - обнаружение не работает с 15.08)
+afc.cup	2466	AFC Champions League Two	MALE	senior_official	rule:default	1	0	1	2025				
+afc.cup_qual	24455	AFC Champions League Two Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
+afc.cupq	5662	AFC Asian Cup Qualifiers	MALE	senior_official	rule:default	1	0	1	2024				
+afc.saff.championship	18914	SAFF Championship	MALE	senior_official	rule:default	1	0	1	2023				
+afc.w.asian.cup	23537	AFC Women's Asian Cup	FEMALE	women	rule:women_gender	0	0	1	2026				
+aff.championship	5672	ASEAN Championship	MALE	senior_official	rule:default	1	0	1	2026				
+arg.1	745	Argentine Liga Profesional de Fútbol	MALE	senior_official	rule:default	1	0	1	2026				
+arg.2	3903	Argentine Nacional B	MALE	senior_official	rule:default	1	0	1	2026				
+arg.3	3904	Argentine Primera B	MALE	senior_official	rule:default	1	0	1	2026				
+arg.copa	8107	Copa Argentina	MALE	senior_official	rule:default	1	0	1	2026				
+arg.copa_de_la_superliga	19264	Argentine Copa de la Superliga	MALE	senior_official	rule:default	1	0	1	2020				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+arg.supercopa	8346	Argentine Supercopa	MALE	senior_official	rule:default	1	0	1	2026				
+arg.supercopa.internacional	23348	Argentine Supercopa Internacional	MALE	senior_official	rule:default	1	0	1	2024				
+arg.trofeo_de_la_campeones	19705	Argentine Trofeo de Campeones	MALE	senior_official	rule:default	1	0	1	2025				
+aus.1	3906	Australian A-League Men	MALE	senior_official	rule:default	1	0	1	2026				
+aus.w.1	18992	Australian A-League Women	FEMALE	women	rule:women_gender	0	0	1	2025				
+aut.1	3907	Austrian Bundesliga	MALE	senior_official	rule:default	1	0	1	2026				
+bangabandhu.cup	18954	Bangabandhu Cup	MALE	friendly	manual:Bangabandhu Cup - пригласительный турнир сборных (Бангладеш)	0	0	0	2020				издание <=2022: турнир неактивен/упразднён у ESPN - только история; исчез из core leagues?limit=500 к 24.09
+bel.1	3901	Belgian Pro League	MALE	senior_official	rule:default	1	0	1	2026				
+bel.promotion.relegation	20116	Belgian Pro League Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+bol.1	620	Bolivian Liga Profesional	MALE	senior_official	rule:default	1	0	1	2026				
+bol.copa	23284	Copa Bolivia	MALE	senior_official	rule:default	1	0	1	2026				
+bol.ply.rel	20525	Bolivian Liga Profesional Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+bra.1	630	Brazilian Serie A	MALE	senior_official	rule:default	1	0	1	2026				
+bra.2	4007	Brazilian Serie B	MALE	senior_official	rule:default	1	0	1	2026				
+bra.camp.carioca	2265	Brazilian Campeonato Carioca	MALE	senior_official	rule:default	1	0	1	2026				
+bra.camp.gaucho	2272	Brazilian Campeonato Gaucho	MALE	senior_official	rule:default	1	0	1	2026				
+bra.camp.mineiro	10872	Brazilian Campeonato Mineiro	MALE	senior_official	rule:default	1	0	1	2026				
+bra.camp.paulista	8207	Brazilian Campeonato Paulista	MALE	senior_official	rule:default	1	0	1	2026				
+bra.copa_do_brazil	8306	Copa do Brasil	MALE	senior_official	rule:default	1	0	1	2026				
+bra.supercopa_do_brazil	19721	Brazilian Supercopa Rei	MALE	senior_official	rule:default	1	0	1	2026				
+caf.champions	2391	CAF Champions League	MALE	senior_official	rule:default	1	0	1	2025				
+caf.championship	8365	African Nations Championship	MALE	senior_official	rule:default	1	0	1	2024				
+caf.championship_qual	20866	African Nations Championship Qualifying	MALE	senior_official	rule:default	1	0	0	2024				исчез из core leagues?limit=500 к 24.09
+caf.confed	18000	CAF Confederation Cup	MALE	senior_official	rule:default	1	0	1	2025				
+caf.cosafa	20220	COSAFA Cup	MALE	senior_official	rule:default	1	0	1	2025				
+caf.nations	3908	Africa Cup of Nations	MALE	senior_official	rule:default	1	0	1	2025				
+caf.nations_qual	8315	Africa Cup of Nations Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
+caf.w.nations	23523	Women's Africa Cup of Nations	FEMALE	women	rule:women_gender	0	0	1	2026				
+campeones.cup	18771	Campeones Cup	MALE	senior_official	rule:default	1	0	1	2026				
+can.w.nsl	23286	Northern Super League	FEMALE	women	rule:women_gender	0	0	1	2026				
+chi.1	640	Chilean Primera División	MALE	senior_official	rule:default	1	0	1	2026				
+chi.1.promotion.relegation	20524	Chilean Primera División Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2021				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+chi.copa_chi	8312	Copa Chile	MALE	senior_official	rule:default	1	0	1	2026				
+chi.super_cup	8364	Chilean Supercopa	MALE	senior_official	rule:default	1	0	1	2026				
+chn.1	8376	Chinese Super League	MALE	senior_official	rule:default	1	0	1	2026				
+chn.1.promotion.relegation	19948	Chinese Super League Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2021				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+club.friendly	19834	Club Friendly	MALE	friendly	rule:friendly	0	0	1	2026				
+col.1	650	Colombian Primera A	MALE	senior_official	rule:default	1	0	1	2026				
+col.copa	8313	Copa Colombia	MALE	senior_official	rule:default	1	0	1	2026				
+col.superliga	19112	Colombian Superliga	MALE	senior_official	rule:default	1	0	1	2026				
+concacaf.central.american.cup	22947	Concacaf Central American Cup	MALE	senior_official	rule:default	1	0	1	2026				
+concacaf.champions	5699	Concacaf Champions Cup	MALE	senior_official	rule:default	1	0	1	2026				
+concacaf.champions_cup	5692	CONCACAF Champions Cup	FEMALE	senior_official	manual:ESPN core gender=FEMALE ошибочно: это мужской Кубок чемпионов КОНКАКАФ 1962-2008 (женский - concacaf.w.champions_cup)	1	0	1	2008				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+concacaf.confederations_playoff	8360	Concacaf Cup	MALE	senior_official	rule:default	1	0	1	2015				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+concacaf.gold	4004	Concacaf Gold Cup	MALE	senior_official	rule:default	1	0	1	2025				
+concacaf.gold_qual	19778	Concacaf Gold Cup Qualifying	MALE	senior_official	rule:default	1	0	1	2025				
+concacaf.leagues.cup	19425	Leagues Cup	MALE	senior_official	rule:default	1	0	1	2026				
+concacaf.nations.league	19267	Concacaf Nations League	MALE	senior_official	rule:default	1	0	1	2026				
+concacaf.u23	3911	CONCACAF U23 Tournament	MALE	youth	rule:youth	0	0	1	2012				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+concacaf.w.champions_cup	22946	Concacaf W Champions Cup	FEMALE	women	rule:women_gender	0	0	1	2025				
+concacaf.w.gold	22060	Concacaf W Gold Cup	FEMALE	women	rule:women_gender	0	0	1	2024				
+concacaf.womens.championship	18969	Concacaf W Championship	FEMALE	women	rule:women_gender	0	0	1	2026				
+conmebol.america	780	Copa América	MALE	senior_official	rule:default	1	0	1	2024				
+conmebol.america.femenina	20703	Copa América Femenina	FEMALE	women	rule:women_gender	0	0	1	2025				
+conmebol.libertadores	783	CONMEBOL Libertadores	MALE	senior_official	rule:default	1	0	1	2026				
+conmebol.recopa	8333	CONMEBOL Recopa	MALE	senior_official	rule:default	1	0	1	2026				
+conmebol.sudamericana	5454	CONMEBOL Sudamericana	MALE	senior_official	rule:default	1	0	1	2026				
+crc.1	4005	Costa Rican Primera Division	MALE	senior_official	rule:default	1	0	1	2026				
+den.1	3913	Danish Superliga	MALE	senior_official	rule:default	1	0	1	2026				
+ecu.1	660	LigaPro Ecuador	MALE	senior_official	rule:default	1	0	1	2026				
+eng.1	700	English Premier League	MALE	senior_official	rule:default	1	0	1	2026				
+eng.2	3914	English League Championship	MALE	senior_official	rule:default	1	0	1	2026				
+eng.3	3915	English League One	MALE	senior_official	rule:default	1	0	1	2026				
+eng.4	3916	English League Two	MALE	senior_official	rule:default	1	0	1	2026				
+eng.5	3917	English National League	MALE	senior_official	rule:default	1	0	1	2026				
+eng.charity	5329	English FA Community Shield	MALE	senior_official	rule:default	1	0	1	2026				
+eng.fa	3918	English FA Cup	MALE	senior_official	rule:default	1	0	1	2025				
+eng.fa_qual	23480	English FA Cup Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
+eng.league_cup	3920	English Carabao Cup	MALE	senior_official	rule:default	1	0	1	2026				
+eng.trophy	18481	English EFL Trophy	MALE	senior_official	rule:default	1	0	1	2025				взрослый официальный, но играют и U21-команды академий АПЛ
+eng.w.1	8097	English Women's Super League	FEMALE	women	rule:women_gender	0	0	1	2026				
+eng.w.fa	20226	English Women's FA Cup	FEMALE	women	rule:women_gender	0	0	1	2025				
+eng.w.league_cup	23390	English Women's League Cup	FEMALE	women	rule:women_gender	0	0	1	2025				
+eng.w.promotion.relegation	24405	English Women's Super League Promotion/Relegation Playoff	FEMALE	women	rule:women_gender	0	0	1	2025				
+esp.1	740	Spanish LALIGA	MALE	senior_official	rule:default	1	0	1	2026				
+esp.2	3921	Spanish LALIGA 2	MALE	senior_official	rule:default	1	0	1	2026				
+esp.copa_de_la_reina	20381	Spanish Copa de la Reina	FEMALE	women	rule:women_gender	0	0	1	2025				
+esp.copa_del_rey	3951	Spanish Copa del Rey	MALE	senior_official	rule:default	1	0	1	2025				
+esp.joan_gamper	17929	Trofeo Joan Gamper	MALE	friendly	manual:Trofeo Joan Gamper - предсезонный матч Барселоны	0	0	1	2026				
+esp.super_cup	8102	Spanish Supercopa	MALE	senior_official	rule:default	1	0	1	2026				
+esp.w.1	20956	Spanish Liga F	FEMALE	women	rule:women_gender	0	0	1	2026				
+fifa.concacaf.olympicsq	19831	Men's Olympic Qualifying Playoff	MALE	olympic	rule:olympic	0	0	1	2020				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+fifa.conmebol.olympicsq	19727	CONMEBOL Pre-Olympic Tournament	MALE	olympic	rule:olympic	0	0	1	2024				
+fifa.cwc	5501	FIFA Club World Cup	MALE	senior_official	rule:default	1	0	1	2025				
+fifa.friendly	3922	International Friendly	MALE	friendly	rule:friendly	0	0	1	2026				
+fifa.friendly.w	3923	Women's International Friendly	FEMALE	women	rule:women_gender	0	0	1	2026				
+fifa.friendly_u21	20132	Under-21 International Friendly	MALE	youth	rule:youth	0	0	1	2026				
+fifa.intercontinental.cup	782	Intercontinental Cup (India)	MALE	friendly	manual:Intercontinental Cup (India) - пригласительный турнир сборных AIFF (спорно: матчи категории A)	0	0	1	2024				
+fifa.intercontinental_cup	22902	FIFA Intercontinental Cup	MALE	senior_official	rule:default	1	0	1	2025				
+fifa.olympics	3924	Men's Olympic Soccer Tournament	MALE	olympic	rule:olympic	0	0	1	2024				
+fifa.shebelieves	19728	SheBelieves Cup	FEMALE	women	rule:women_gender	0	0	1	2026				
+fifa.w.champions_cup	24081	FIFA Women's Champions Cup	FEMALE	women	rule:women_gender	0	0	1	2026				
+fifa.w.concacaf.olympicsq	5342	Concacaf Women's Olympic Qualifying	FEMALE	women	rule:women_gender	0	0	1	2020				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+fifa.w.olympics	3925	Women's Olympic Soccer Tournament	FEMALE	women	rule:women_gender	0	0	1	2024				
+fifa.wcq.ply	23449	FIFA World Cup Qualifying - Playoff Tournament	MALE	senior_official	rule:default	1	0	1	2026				
+fifa.world	606	FIFA World Cup	MALE	senior_official	rule:default	1	0	1	2026				
+fifa.world.u17	5697	FIFA Under-17 World Cup	MALE	youth	rule:youth	0	0	1	2026				
+fifa.world.u20	5694	FIFA Under-20 World Cup	MALE	youth	rule:youth	0	0	1	2025				
+fifa.worldq.afc	789	FIFA World Cup Qualifying - AFC	MALE	senior_official	rule:default	1	0	1	2023				
+fifa.worldq.caf	790	FIFA World Cup Qualifying - CAF	MALE	senior_official	rule:default	1	0	1	2023				
+fifa.worldq.concacaf	788	FIFA World Cup Qualifying - Concacaf	MALE	senior_official	rule:default	1	0	1	2024				
+fifa.worldq.conmebol	787	FIFA World Cup Qualifying - CONMEBOL	MALE	senior_official	rule:default	1	0	1	2023				
+fifa.worldq.ofc	792	FIFA World Cup Qualifying - OFC	MALE	senior_official	rule:default	1	0	1	2024				
+fifa.worldq.uefa	786	FIFA World Cup Qualifying - UEFA	MALE	senior_official	rule:default	1	0	1	2025				
+fifa.wwc	795	FIFA Women's World Cup	FEMALE	women	rule:women_gender	0	0	1	2023				
+fifa.wwcq.ply		FIFA Women's World Cup Qualifying - Playoff Tournament	UNKNOWN	women	rule:women_slug	0	0	1	2023				
+fifa.wworld.u17	20865	FIFA Under-17 Women's World Cup	FEMALE	women	rule:women_gender	0	0	1	2026				
+fifa.wworldq.uefa	20649	FIFA Women's World Cup Qualifying - UEFA	FEMALE	women	rule:women_gender	0	0	1	2026				
+fra.1	710	French Ligue 1	MALE	senior_official	rule:default	1	0	1	2026				
+fra.1.promotion.relegation	20159	French Ligue 1 Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+fra.2	3926	French Ligue 2	MALE	senior_official	rule:default	1	0	1	2026				
+fra.coupe_de_france	3952	Coupe de France	MALE	senior_official	rule:default	1	0	1	2025				
+fra.super_cup	8357	French Trophee des Champions	MALE	senior_official	rule:default	1	0	1	2026				
+fra.w.1	20955	French Première Ligue	FEMALE	women	rule:women_gender	0	0	1	2026				
+friendly.emirates_cup	11108	Emirates Cup	MALE	friendly	rule:friendly	0	0	1	2026				
+ger.1	720	German Bundesliga	MALE	senior_official	rule:default	1	0	1	2026				
+ger.2	3927	German 2. Bundesliga	MALE	senior_official	rule:default	1	0	1	2026				
+ger.2.promotion.relegation	19871	German Bundesliga 2. Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+ger.dfb_pokal	3954	German Cup	MALE	senior_official	rule:default	1	0	1	2026				
+ger.playoff.relegation	8304	German Bundesliga Promotion/Relegation Playoff	MALE	senior_official	rule:default	1	0	1	2025				
+ger.super_cup	8101	German Supercup	MALE	senior_official	rule:default	1	0	1	2026				
+global.arnold.clark_cup	20566	Arnold Clark Cup	FEMALE	women	rule:women_gender	0	0	1	2023				
+global.club_challenge	21597	CONMEBOL-UEFA Club Challenge	MALE	senior_official	rule:default	1	0	1	2023				
+global.finalissima	20704	CONMEBOL-UEFA Cup of Champions	MALE	senior_official	rule:default	1	0	1	2026				
+global.gulf_cup	23107	Arabian Gulf Cup	MALE	senior_official	rule:default	1	0	1	2024				
+global.pinatar_cup	20571	Pinatar Cup	FEMALE	women	rule:women_gender	0	0	1	2025				
+global.u20.intercontinental_cup	22781	CONMEBOL-UEFA U20 Intercontinental Cup	MALE	youth	rule:youth	0	0	1	2026				
+global.w.finalissima	21191	CONMEBOL-UEFA Women's Cup of Champions	FEMALE	women	rule:women_gender	0	0	1	2023				
+gre.1	3955	Greek Super League	MALE	senior_official	rule:default	1	0	1	2026				
+gua.1	3928	Guatemalan Liga Nacional	MALE	senior_official	rule:default	1	0	1	2026				
+hon.1	3929	Honduran Liga Nacional	MALE	senior_official	rule:default	1	0	1	2026				
+ind.1	8316	Indian Super League	MALE	senior_official	rule:default	1	0	1	2025				
+ind.2	18505	Indian I-League	MALE	senior_official	rule:default	1	0	0	2025				исчез из core leagues?limit=500 к 24.09
+ita.1	730	Italian Serie A	MALE	senior_official	rule:default	1	0	1	2026				
+ita.2	3931	Italian Serie B	MALE	senior_official	rule:default	1	0	1	2026				
+ita.coppa_italia	3956	Coppa Italia	MALE	senior_official	rule:default	1	0	1	2026				
+ita.super_cup	8103	Italian Supercoppa	MALE	senior_official	rule:default	1	0	1	2025				
+jpn.1	750	Japanese J.League	MALE	senior_official	rule:default	1	0	1	2026				
+jpn.world_challenge	17931	Japanese J.League World Challenge	MALE	friendly	manual:J.League World Challenge - предсезонные матчи с европейскими клубами	0	0	1	2025				
+ksa.1	21231	Saudi Pro League	MALE	senior_official	rule:default	1	0	1	2026				
+ksa.kings.cup	22057	Saudi King's Cup	MALE	senior_official	rule:default	1	0	1	2026				
+mex.1	760	Mexican Liga BBVA MX	MALE	senior_official	rule:default	1	0	1	2026				
+mex.2	3932	Mexican Liga de Expansión MX	MALE	senior_official	rule:default	1	0	1	2026				
+mex.campeon	17893	Mexican Campeon de Campeones	MALE	senior_official	rule:default	1	0	1	2026				
+mex.w.1		Liga MX Femenil (по slug; деталь не запрашивалась)	FEMALE?	women	rule:women_slug	0	0	1					есть в core 24.09, нет в фикстуре 31.07 (новый турнир - обнаружение не работает с 15.08)
+ned.1	725	Dutch Eredivisie	MALE	senior_official	rule:default	1	0	1	2026				
+ned.2	3933	Dutch Keuken Kampioen Divisie	MALE	senior_official	rule:default	1	0	1	2026				
+ned.3.promotion.relegation	20798	Dutch Tweede Divisie Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+ned.cup	3957	Dutch KNVB Beker	MALE	senior_official	rule:default	1	0	1	2025				
+ned.playoff.relegation	8305	Dutch Eredivisie Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+ned.supercup	10749	Dutch Johan Cruyff Shield	MALE	senior_official	rule:default	1	0	1	2026				
+ned.w.1	19945	Dutch Vrouwen Eredivisie	FEMALE	women	rule:women_gender	0	0	1	2026				
+ned.w.knvb_cup	20115	Dutch KNVB Beker Vrouwen	FEMALE	women	rule:women_gender	0	0	1	2025				
+nonfifa	19725	Non-FIFA Friendly	MALE	friendly	rule:friendly	0	0	1	2022				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+nor.1	3960	Norwegian Eliteserien	MALE	senior_official	rule:default	1	0	1	2026				
+nor.1.promotion.relegation	19989	Norwegian Eliteserien Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+par.1	3934	Paraguayan Primera División	MALE	senior_official	rule:default	1	0	1	2026				
+par.1.supercopa	20526	Paraguayan Supercopa	MALE	senior_official	rule:default	1	0	1	2025				
+per.1	670	Peruvian Liga 1	MALE	senior_official	rule:default	1	0	1	2026				
+por.1	715	Portuguese Primeira Liga	MALE	senior_official	rule:default	1	0	1	2026				
+por.1.promotion.relegation	20186	Portuguese Primeira Liga Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+por.taca.portugal	20922	Taca de Portugal	MALE	senior_official	rule:default	1	0	1	2025				
+rsa.1	3937	South African Premiership	MALE	senior_official	rule:default	1	0	1	2026				
+rus.1	3939	Russian Premier League	MALE	senior_official	rule:default	1	0	1	2026				
+rus.1.promotion.relegation	20731	Russian Premier League Relegation/Promotion Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+sco.1	735	Scottish Premiership	MALE	senior_official	rule:default	1	0	1	2026				
+sco.1.promotion.relegation	20133	Scottish Premiership Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+sco.2	3940	Scottish Championship	MALE	senior_official	rule:default	1	0	1	2026				
+sco.2.promotion.relegation	20134	Scottish Championship Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+sco.challenge	5331	Scottish League Challenge Cup	MALE	senior_official	rule:default	1	0	1	2026				
+sco.cis	5330	Scottish League Cup	MALE	senior_official	rule:default	1	0	1	2026				
+sco.tennents	3959	Scottish Cup	MALE	senior_official	rule:default	1	0	1	2025				
+sco.tennents_qual	24457	Scottish Cup Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
+slv.1	3943	Salvadoran Primera Division	MALE	senior_official	rule:default	1	0	1	2026				
+sui.1	3944	Swiss Super League	MALE	senior_official	rule:default	0	1	0	2025				кандидат ручного списка скрытых slug; в процент не входит, пока ESPN не ведёт сезон
+swe.1	3945	Swedish Allsvenskan	MALE	senior_official	rule:default	1	0	1	2026				
+swe.1.promotion.relegation	19968	Swedish Allsvenskan Promotion/Relegation Playoffs	MALE	senior_official	rule:default	1	0	1	2025				
+tur.1	3946	Turkish Super Lig	MALE	senior_official	rule:default	1	0	1	2026				
+uefa.champions	775	UEFA Champions League	MALE	senior_official	rule:default	1	0	1	2025				
+uefa.champions_qual	19874	UEFA Champions League Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
+uefa.euro	781	UEFA European Championship	MALE	senior_official	rule:default	1	0	1	2024				
+uefa.euro.u19	5698	UEFA European Under-19 Championship	MALE	youth	rule:youth	0	0	1	2026				
+uefa.euro_u21	5693	UEFA European Under-21 Championship	MALE	youth	rule:youth	0	0	1	2025				
+uefa.euro_u21_qual	20114	UEFA European Under-21 Championship Qualifying	MALE	youth	rule:youth	0	0	1	2025				
+uefa.europa	776	UEFA Europa League	MALE	senior_official	rule:default	1	0	1	2025				
+uefa.europa.conf	20296	UEFA Conference League	MALE	senior_official	rule:default	1	0	1	2025				
+uefa.europa.conf_qual	20221	UEFA Conference League Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
+uefa.europa_qual	19887	UEFA Europa League Qualifying	MALE	senior_official	rule:default	1	0	1	2026				
+uefa.euroq	3947	UEFA European Championship Qualifying	MALE	senior_official	rule:default	1	0	1	2023				
+uefa.nations	2395	UEFA Nations League	MALE	senior_official	rule:default	1	0	1	2026				
+uefa.super_cup	5462	UEFA Super Cup	MALE	senior_official	rule:default	1	0	1	2026				
+uefa.w.europa	24079	UEFA Women's Europa Cup	FEMALE	women	rule:women_gender	0	0	1	2025				
+uefa.w.nations	23088	UEFA Women's Nations League	FEMALE	women	rule:women_gender	0	0	1	2025				
+uefa.wchampions	19483	UEFA Women's Champions League	FEMALE	women	rule:women_gender	0	0	1	2025				
+uefa.wchampions_qual	24458	UEFA Women's Champions League Qualifying	FEMALE	women	rule:women_gender	0	0	1	2026				
+uefa.weuro	17915	UEFA Women's European Championship	FEMALE	women	rule:women_gender	0	0	1	2025				
+uru.1	680	Liga AUF Uruguaya	MALE	senior_official	rule:default	1	0	1	2026				
+uru.2	3948	Segunda División de Uruguay	MALE	senior_official	rule:default	1	0	1	2011				издание <=2022: турнир неактивен/упразднён у ESPN - только история
+usa.1	770	MLS	MALE	senior_official	rule:default	1	0	1	2026				
+usa.ncaa.m.1	5487	NCAA Men's Soccer	MALE	college	rule:college	0	0	1	2026				
+usa.ncaa.w.1	5499	NCAA Women's Soccer	FEMALE	women	rule:women_gender	0	0	1	2026				
+usa.nwsl	8301	NWSL	FEMALE	women	rule:women_gender	0	0	1	2026				
+usa.nwsl.cup	19868	NWSL Challenge Cup	FEMALE	women	rule:women_gender	0	0	1	2026				
+usa.open	5337	U.S. Open Cup	MALE	senior_official	rule:default	1	0	1	2026				взрослый официальный, в ранних раундах любители
+usa.usl.1	4002	USL Championship	MALE	senior_official	rule:default	1	0	1	2026				
+usa.usl.l1	19915	USL League One	MALE	senior_official	rule:default	1	0	1	2026				
+usa.usl.l1.cup	22059	USL Cup	MALE	senior_official	rule:default	1	0	1	2026				
+usa.w.usl.1	23633	USL Super League	FEMALE	women	rule:women_gender	0	0	1	2026				
+ven.1	3949	Venezuelan Primera División	MALE	senior_official	rule:default	1	0	1	2026				
