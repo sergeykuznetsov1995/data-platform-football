@@ -174,3 +174,16 @@ def test_bad_vega_values_fail_closed(riverplate_html, old, new, what):
     assert old in riverplate_html
     with pytest.raises(LayoutChanged, match=what):
         parse_club_page(riverplate_html.replace(old, new, 1), "riverplate")
+
+
+def test_long_opponent_names_are_joined_from_both_spans():
+    page = parse_club_page(fixture_html("club_riverplate.html.gz"), "riverplate")
+    names = {m["opp_name"] for m in page.matches}
+    assert "Argentinos Juniors" in names and "Argentinos Junio" not in names
+
+
+@pytest.mark.parametrize("datasets", ['"datasets": [], "x": {', '"datasets": null, "x": {',
+                                      '"datasets": {"a": 5}, "x": {'])
+def test_bad_vega_datasets_shape_fails_closed(riverplate_html, datasets):
+    with pytest.raises(LayoutChanged, match="vegaJson"):
+        parse_club_page(riverplate_html.replace('"datasets": {', datasets, 1), "riverplate")

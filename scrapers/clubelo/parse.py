@@ -113,6 +113,8 @@ def _vega_points(html: str) -> List[Dict[str, Any]]:
         datasets = vega["datasets"]
     except (ValueError, KeyError, TypeError) as exc:
         raise LayoutChanged(f"vegaJson unreadable: {exc}") from None
+    if not isinstance(datasets, dict) or not all(isinstance(v, list) for v in datasets.values()):
+        raise LayoutChanged("vegaJson datasets is not a mapping of lists")
     # The dataset key is a content hash (data-<hash>): take the only non-empty one.
     filled = [rows for rows in datasets.values() if rows]
     if len(filled) != 1:
@@ -212,7 +214,11 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
                 "venue": cells[1],
                 "opp_slug": opp_href.lstrip("/") if opp_href else None,
                 "opp_tlc": "".join(opp.xpath('.//span[@class="max640"]/text()')) or None,
-                "opp_name": "".join(opp.xpath('.//span[@class="min641"]/text()')) or None,
+                # Long names are split: first 16 chars in span.min641, the rest
+                # in span.min1081 ("Argentinos Junio" + "rs").
+                "opp_name": "".join(opp.xpath(
+                    './/span[@class="min641"]/text() | .//span[@class="min1081"]/text()'
+                )) or None,
                 "opp_country": _first(opp.xpath(".//img/@alt")),
                 "opp_rank": _integer(opp_rank.strip(), "opponent rank") if opp_rank else None,
                 "prior_delta": prior,

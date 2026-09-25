@@ -331,7 +331,7 @@ class _Run:
         self.buffers[RAW_TABLE].append(raw)
         try:
             club = parse_club_page(gzip.decompress(raw["body"]).decode("utf-8"), slug)
-        except (LayoutChanged, UnicodeDecodeError) as exc:
+        except Exception as exc:  # any parse crash fails this page, not the queue
             self._fail(
                 slug,
                 f"{type(exc).__name__}: {exc}",

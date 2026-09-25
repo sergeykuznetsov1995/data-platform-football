@@ -301,3 +301,19 @@ def test_truncated_ranking_does_not_close_the_history():
     assert "expected >= 400" in result["error"]
     assert [c["path"] for c in session.calls] == ["/Ranking"]
     assert _manifest_new(store) == [] and history.exit_code(result) == 1
+
+
+def test_unexpected_parse_crash_fails_the_page_not_the_queue(monkeypatch):
+    real = history.parse_club_page
+
+    def crash_on_santos(html, slug):
+        if slug == "santos-fc_2":
+            raise AttributeError("boom")
+        return real(html, slug)
+
+    monkeypatch.setattr(history, "parse_club_page", crash_on_santos)
+    result, store, session, _ = _run(_answers(), CLUBS)
+    assert (result["pages_ok"], result["pages_failed"]) == (3, 1)
+    assert "AttributeError" in result["failed_slugs"][0]
+    assert [c["path"] for c in session.calls][-1] == "/lsapi-4199"
+    assert result["error"] is None and history.exit_code(result) == 1
