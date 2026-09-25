@@ -282,6 +282,13 @@ def _install_airflow_stubs() -> None:
             operator.is_mapped = True
             return operator
 
+        def expand_kwargs(self, kwargs, *, strict=True):
+            operator = self.operator_class(**self.kwargs)
+            operator._expand_kwargs_arg = kwargs
+            operator._expand_kwargs_strict = strict
+            operator.is_mapped = True
+            return operator
+
     class _BashOperator:
         # Class-level registry — every instance appends itself so DAG-load
         # tests can inspect the operators that were created.

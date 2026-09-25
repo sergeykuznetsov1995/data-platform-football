@@ -53,8 +53,29 @@ DEFAULT_PARK_COOLDOWN_HOURS = 24
 # one attempt; a manual lift removes its entry from failures.json.
 QUARANTINE_REASON_CHARS = 200
 UNKNOWN_RELEASE = "unknown"
-DEFAULT_REFRESH_BATCH_SIZE = 8
+# #1358: only an upper bound on the number of scopes; the 2 h window decides
+# how many actually go (a small-scope queue must be able to fill it).
+DEFAULT_REFRESH_BATCH_SIZE = 64
 DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
+# #1358: a refresh scope is sized by its own volume, not by the worst case of
+# the slowest one.  Measured match phase 20-25.09: 12-13 requests a minute,
+# five endpoints a match -> ~24 s a match; 25 s leaves a little room.
+DEFAULT_REFRESH_SECONDS_PER_MATCH = 25
+# Browser warm-up, Trino plan probes and the final MERGE of one scope.
+REFRESH_SCOPE_OVERHEAD_SECONDS = 180
+# A scope that does not fit the rest of the window whole is sliced; a slice
+# thinner than this is not worth its warm-up and closes the batch.
+REFRESH_MIN_SLICE_MATCHES = 20
+# One task never runs longer than this, whatever its estimate says.
+REFRESH_MAX_SCOPE_TIMEOUT_SECONDS = 2 * 3600
+# The runner stops taking allocations this long before its timeout, so the
+# timeout has to leave at least this much (plus a margin) over the estimate.
+REFRESH_RUNNER_STOP_MARGIN_SECONDS = 300
+REFRESH_MIN_TIMEOUT_HEADROOM_SECONDS = 600
+# Per-match byte ceiling of the SIGNED workload policy (``match_batch_25_*``:
+# ``hard_task_bytes`` 1 233 561 for 25 matches).  The policy file is signed and
+# is not edited here; the ceiling is derived from its own number.
+REFRESH_BYTES_PER_MATCH = 1_233_561 // 25
 
 
 @dataclass(frozen=True)
@@ -634,6 +655,8 @@ def plan_refresh_batch(
     dag_run_id: str = "manual",
     task_env: Mapping[str, str] | None = None,
     denominator: Denominator | None = None,
+    scope_budget_s: int | None = None,
+    seconds_per_match: int = DEFAULT_REFRESH_SECONDS_PER_MATCH,
 ) -> list[dict[str, str]]:
     """Select a timestamp-aware fresh or largest-backlog refresh batch.
 
@@ -650,9 +673,31 @@ def plan_refresh_batch(
     ``backlog`` ranks the largest unfinished partition first.  Both rank
     behind the denominator's ``queue_priority`` (#1353): core before disputed
     buckets, and a ``0`` tournament (esoccer, student) is never planned.
+
+    #1358: the batch holds as many scopes as their estimates fit into
+    ``scope_budget_s`` (``None`` = no window, ``batch_size`` only).  A scope's
+    estimate is its pending matches x ``seconds_per_match`` plus a fixed
+    warm-up; the first scope that does not fit whole is sliced to what is
+    left of the window, and a slice under ``REFRESH_MIN_SLICE_MATCHES``
+    closes the batch.  Every scope carries its own ceilings in its env:
+    ``SOFASCORE_SCOPE_MAX_MATCHES``, ``SOFASCORE_SCOPE_BYTE_CAP``,
+    ``SOFASCORE_SCOPE_TIMEOUT_S`` (the task's execution timeout) and
+    ``SOFASCORE_SCOPE_ESTIMATE_S``.
     """
 
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
+    if (
+        isinstance(seconds_per_match, bool)
+        or not isinstance(seconds_per_match, int)
+        or seconds_per_match < 1
+    ):
+        raise CampaignPlanningError("seconds_per_match must be a positive integer")
+    if scope_budget_s is not None and (
+        isinstance(scope_budget_s, bool)
+        or not isinstance(scope_budget_s, int)
+        or scope_budget_s < 1
+    ):
+        raise CampaignPlanningError("scope_budget_s must be a positive integer")
     if (
         isinstance(batch_size, bool)
         or not isinstance(batch_size, int)
@@ -735,24 +780,66 @@ def plan_refresh_batch(
     else:
         candidates.sort(key=lambda item: (item[6], -item[2], item[0], item[1]))
     planned: list[dict[str, str]] = []
-    for _league, _canonical, _count, _timestamp, tournament_id, season, _p in candidates:
-        planned.append(
-            _scope_task_env(
-                "refresh",
-                snapshot_id=snapshot_id,
-                campaign_id=campaign_id,
-                tournament_id=tournament_id,
-                season=season,
-                lane_env=lane_env,
-                snapshot_path=snapshot_path,
-                policy_path=policy_path,
-                result_dir=result_dir,
-                workload_artifact=workload_artifact,
-                dag_run_id=dag_run_id,
-            )
-        )
+    left = scope_budget_s
+    for position, (
+        league, canonical, count, _timestamp, tournament_id, season, _p
+    ) in enumerate(candidates):
         if len(planned) == batch_size:
+            logger.warning(
+                "refresh batch cut at SOFASCORE_REFRESH_BATCH_SIZE=%s scopes; "
+                "%s more candidates wait for the next run (window left: %s s)",
+                batch_size,
+                len(candidates) - position,
+                left,
+            )
             break
+        matches = max(1, int(count))
+        estimate = matches * seconds_per_match + REFRESH_SCOPE_OVERHEAD_SECONDS
+        if left is not None and estimate > left:
+            matches = (left - REFRESH_SCOPE_OVERHEAD_SECONDS) // seconds_per_match
+            if matches < REFRESH_MIN_SLICE_MATCHES:
+                logger.info(
+                    "refresh window closed at %s/%s: %s s left hold %s of its "
+                    "%s pending matches (< %s)",
+                    league, canonical, left, max(matches, 0), count,
+                    REFRESH_MIN_SLICE_MATCHES,
+                )
+                break
+            estimate = matches * seconds_per_match + REFRESH_SCOPE_OVERHEAD_SECONDS
+            logger.info(
+                "refresh scope %s/%s sliced to %s of %s pending matches",
+                league, canonical, matches, count,
+            )
+        if left is not None:
+            left -= estimate
+        timeout = min(
+            REFRESH_MAX_SCOPE_TIMEOUT_SECONDS,
+            max(
+                (estimate * 3 + 1) // 2,
+                estimate + REFRESH_MIN_TIMEOUT_HEADROOM_SECONDS,
+            ),
+        )
+        env = _scope_task_env(
+            "refresh",
+            snapshot_id=snapshot_id,
+            campaign_id=campaign_id,
+            tournament_id=tournament_id,
+            season=season,
+            lane_env=lane_env,
+            snapshot_path=snapshot_path,
+            policy_path=policy_path,
+            result_dir=result_dir,
+            workload_artifact=workload_artifact,
+            dag_run_id=dag_run_id,
+        )
+        env.update({
+            "SOFASCORE_SCOPE_MAX_MATCHES": str(matches),
+            "SOFASCORE_SCOPE_BYTE_CAP": str(matches * REFRESH_BYTES_PER_MATCH),
+            "SOFASCORE_SCOPE_ESTIMATE_S": str(estimate),
+            "SOFASCORE_SCOPE_TIMEOUT_S": str(timeout),
+            "SOFASCORE_REFRESH_SECONDS_PER_MATCH": str(seconds_per_match),
+        })
+        planned.append(env)
     return planned
 
 

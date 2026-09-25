@@ -1948,6 +1948,234 @@ def test_match_runner_probes_the_first_allocation_and_excludes_missing_endpoints
             assert "scope probe" in record.error_message
 
 
+def _event_only_source(seen, clock=None, step=0, paid_bytes=0):
+    """A stand-in source: ``event`` answers, every other endpoint is 404."""
+
+    from scrapers.sofascore.live_capture import _zero_traffic
+
+    def source(runtime, specs, **kwargs):
+        seen.append(sorted({spec.key.target_id for spec in specs}))
+        results = []
+        for spec in specs:
+            if not spec.supported:
+                results.append(runtime.engine.capture(spec))
+                continue
+            if spec.key.endpoint == "event":
+                manifest = _successful_manifest(spec)
+            else:
+                manifest = _not_supported_manifest(spec)
+            runtime.manifest_store.upsert(manifest)
+            results.append(CaptureResult(manifest=manifest, network_used=True))
+        if clock is not None:
+            clock["now"] += step
+        traffic = _zero_traffic()
+        traffic["paid_proxy_bytes"] = paid_bytes
+        return results, traffic
+
+    return source
+
+
+def _run_two_allocation_scope(tmp_path, monkeypatch, *, allocations=None, env=None,
+                              clock=None, step=0, paid_bytes=0, before=None):
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import live_capture
+
+    for name in (
+        "SOFASCORE_SCOPE_DEADLINE_EPOCH", "SOFASCORE_SCOPE_BYTE_CAP",
+        "SOFASCORE_SCOPE_MAX_MATCHES", "SOFASCORE_REFRESH_SECONDS_PER_MATCH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
+    if clock is not None:
+        import time as real_time
+
+        monkeypatch.setattr(
+            runner,
+            "time",
+            SimpleNamespace(time=lambda: clock["now"], monotonic=real_time.monotonic),
+        )
+    match_ids = [*PROBE_MATCH_IDS, *SECOND_MATCH_IDS]
+    runtime, transport = _runtime(tmp_path)
+    if before is not None:
+        before(runtime)
+    plan, planned = _two_allocation_plan(runtime)
+    _patch_match_runner_environment(monkeypatch, runner, match_ids)
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        live_capture,
+        "capture_live_specs",
+        _event_only_source(seen, clock, step, paid_bytes),
+    )
+    output = tmp_path / "match-partial.json"
+    with patch(
+        "scrapers.sofascore.SofaScoreScraper", return_value=_runner_player_scraper()
+    ):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=plan,
+            workload_allocations=planned if allocations is None else allocations(planned),
+            offline_replay=False,
+        )
+    return rc, json.loads(output.read_text(encoding="utf-8")), runtime, seen
+
+
+def test_match_runner_stops_before_its_deadline_and_reports_partial(
+    tmp_path, monkeypatch
+):
+    """#1358: the next allocation would not end 5 min before the task's
+    timeout, so it is left for the next run; what was captured is committed
+    and the manifest flushed, and the result says ``partial``."""
+    clock = {"now": 1_000.0}
+    # The probe allocation (3 matches x 25 s) fits; the source then takes
+    # 400 s, and the second allocation would end past deadline - 300 s.
+    rc, result, runtime, seen = _run_two_allocation_scope(
+        tmp_path, monkeypatch,
+        env={"SOFASCORE_SCOPE_DEADLINE_EPOCH": str(1_000 + 300 + 400)},
+        clock=clock, step=400,
+    )
+
+    assert rc == 0
+    assert result["errors"] == []
+    assert seen == [sorted(PROBE_MATCH_IDS)]
+    assert result["partial"]["remaining_matches"] == 1
+    assert result["partial"]["stop_reason"] == "time_budget"
+    assert result["partial"]["bytes"] == 0
+    assert "elapsed_s" in result["partial"]
+    # The captured matches are closed in the durable manifest ...
+    for match_id in PROBE_MATCH_IDS:
+        assert runtime.manifest_store.get(
+            _event_spec(match_id, "event").key
+        ).is_terminal
+    # ... and the deferred one was not touched at all.
+    assert runtime.manifest_store.get(
+        _event_spec(SECOND_MATCH_IDS[0], "event").key
+    ) is None
+    assert result["capture_status_rows"] == len(PROBE_MATCH_IDS)
+
+
+def test_capture_stop_reason_reads_the_byte_cap_and_the_deadline():
+    from dags.scripts import run_sofascore_scraper as runner
+
+    bytes_only = runner._scope_capture_limits({
+        "SOFASCORE_SCOPE_BYTE_CAP": "1000",
+        "SOFASCORE_SCOPE_MAX_MATCHES": "10",
+    })
+    # The next allocation is charged at 100 B per match before it starts.
+    assert runner._capture_stop_reason(bytes_only, 0, 10, now=0) is None
+    assert runner._capture_stop_reason(bytes_only, 900, 1, now=0) is None
+    assert runner._capture_stop_reason(bytes_only, 901, 1, now=0) == "byte_cap"
+    assert runner._capture_stop_reason(bytes_only, 999, 25, now=0) == "byte_cap"
+    # The byte ceiling is spent: no further allocation.
+    assert runner._capture_stop_reason(bytes_only, 1_000, 1, now=0) == "byte_cap"
+
+    limits = runner._scope_capture_limits({
+        "SOFASCORE_SCOPE_DEADLINE_EPOCH": "5000",
+        "SOFASCORE_REFRESH_SECONDS_PER_MATCH": "25",
+    })
+    # 25 matches x 25 s, at twice their estimate, must end 300 s before the
+    # deadline: an allocation is not interrupted once it runs.
+    assert runner._capture_stop_reason(limits, 0, 25, now=5000 - 300 - 1250) is None
+    assert runner._capture_stop_reason(limits, 0, 25, now=5000 - 300 - 1249) == (
+        "time_budget"
+    )
+    # Outside the refresh lane there is no ceiling at all.
+    assert runner._capture_stop_reason(
+        runner._scope_capture_limits({}), 10**12, 10**6, now=10**12
+    ) is None
+
+
+def test_match_runner_with_no_room_left_captures_nothing_and_stays_green(
+    tmp_path, monkeypatch
+):
+    clock = {"now": 1_000.0}
+    rc, result, _runtime_, seen = _run_two_allocation_scope(
+        tmp_path, monkeypatch,
+        env={"SOFASCORE_SCOPE_DEADLINE_EPOCH": "1100"},
+        clock=clock,
+    )
+
+    assert rc == 0
+    assert seen == []
+    assert result["partial"]["remaining_matches"] == 4
+    assert result["partial"]["stop_reason"] == "time_budget"
+    assert result["errors"] == []
+
+
+def test_match_runner_leaves_targets_cut_by_the_match_cap_for_the_next_run(
+    tmp_path, monkeypatch
+):
+    """The signed plan was cut to SOFASCORE_SCOPE_MAX_MATCHES: the unallocated
+    match with no raw is the next run's, not a planner-dropped partition."""
+    rc, result, _runtime_, seen = _run_two_allocation_scope(
+        tmp_path, monkeypatch,
+        env={"SOFASCORE_SCOPE_MAX_MATCHES": "3"},
+        allocations=lambda planned: planned[:1],
+    )
+
+    assert rc == 0
+    assert seen == [sorted(PROBE_MATCH_IDS)]
+    assert result["partial"]["stop_reason"] == "match_cap"
+    assert result["partial"]["remaining_matches"] == 1
+
+
+def test_match_runner_defers_a_cut_target_whose_raw_cannot_be_replayed(
+    tmp_path, monkeypatch
+):
+    """Astra #1358 finding 1: the match outside the slice has a saved 429 —
+    an offline replay would raise before the MERGE of what was captured, so
+    it is deferred like a match without raw."""
+
+    def _save_429(runtime):
+        for endpoint in ("event", "lineups", "statistics", "shotmap", "incidents"):
+            spec = _event_spec(SECOND_MATCH_IDS[0], endpoint)
+            runtime.raw_store.store_bytes(
+                spec.raw_target, b'{"error": "rate"}', request_url=spec.url,
+                http_status=429,
+            )
+
+    rc, result, runtime, seen = _run_two_allocation_scope(
+        tmp_path, monkeypatch,
+        env={"SOFASCORE_SCOPE_MAX_MATCHES": "3"},
+        allocations=lambda planned: planned[:1],
+        before=_save_429,
+    )
+
+    assert rc == 0
+    assert result["errors"] == []
+    assert seen == [sorted(PROBE_MATCH_IDS)]
+    assert result["partial"]["stop_reason"] == "match_cap"
+    assert result["partial"]["remaining_matches"] == 1
+    assert result["capture_status_rows"] == len(PROBE_MATCH_IDS)
+
+
+def test_replay_would_hit_only_on_answers_the_engine_replays(tmp_path):
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, _transport = _runtime(tmp_path)
+    for status, hit in ((200, True), (404, True), (429, False), (503, False)):
+        spec = _event_spec(f"9{status}", "event")
+        runtime.raw_store.store_bytes(
+            spec.raw_target, b"{}", request_url=spec.url, http_status=status
+        )
+        assert runner._replay_would_hit(runtime, spec) is hit, status
+    assert runner._replay_would_hit(runtime, _event_spec("9999", "event")) is False
+
+
+def test_match_runner_without_the_refresh_ceilings_is_unchanged(
+    tmp_path, monkeypatch
+):
+    rc, result, _runtime_, seen = _run_two_allocation_scope(tmp_path, monkeypatch)
+
+    assert rc == 0
+    assert "partial" not in result
+    assert len(seen) == 2
+
+
 def test_match_runner_probe_reads_the_manifest_of_a_terminal_first_allocation(
     tmp_path, monkeypatch
 ):

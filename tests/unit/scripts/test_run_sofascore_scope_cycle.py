@@ -670,3 +670,135 @@ def test_cycle_result_carries_rejected_rows_of_a_green_phase(tmp_path, monkeypat
     assert result["status"] == "success"
     assert result["phases"][0]["rejected_rows"] == rejected_rows
     assert "rejected_players" not in result["phases"][0]
+
+
+@pytest.mark.unit
+def test_cycle_reports_a_partial_scope_as_a_finished_task(tmp_path, monkeypatch):
+    """#1358: a capture that stopped at its own ceiling ends ``partial`` with
+    what is left, why, how long it ran and what it spent — exit 0."""
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setenv("SOFASCORE_SCOPE_TIMEOUT_S", "1800")
+    monkeypatch.delenv(cycle.SCOPE_DEADLINE_ENV, raising=False)
+    deadlines = []
+
+    def run_capture(argv):
+        import os
+
+        deadlines.append(os.environ.get(cycle.SCOPE_DEADLINE_ENV))
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            "errors": [],
+            "traffic": {"paid_proxy_bytes": 4_321},
+            "partial": {
+                "remaining_matches": 40,
+                "stop_reason": "time_budget",
+                "elapsed_s": 1_500.0,
+                "bytes": 4_321,
+            },
+        }))
+        return 0
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches")) == 0
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "partial"
+    assert result["remaining_matches"] == 40
+    assert result["stop_reason"] == "time_budget"
+    assert result["bytes"] == 4_321
+    assert isinstance(result["elapsed_s"], float)
+    assert result["phases"][0]["status"] == "partial"
+    # The runner saw the task's deadline; the cycle restores the environment.
+    import os
+    import time
+
+    assert deadlines[0] is not None
+    assert float(deadlines[0]) <= time.time() + 1800
+    assert cycle.SCOPE_DEADLINE_ENV not in os.environ
+
+
+@pytest.mark.unit
+def test_cycle_result_carries_elapsed_time_of_a_green_scope(tmp_path, monkeypatch):
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+
+    def run_capture(argv):
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({"errors": [], "traffic": {}}))
+        return 0
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches")) == 0
+
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "success"
+    assert "elapsed_s" in result
+    assert "stop_reason" not in result
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("window_in", [60.0, 10_000.0])
+def test_cycle_deadline_is_capped_by_the_refresh_window(
+    tmp_path, monkeypatch, window_in
+):
+    """Astra #1358 finding 3: a retry's timeout starts afresh, the batch's
+    window deadline does not — the runner gets whichever comes first."""
+    import os
+    import time
+
+    paths = cycle.ScopeOverlayPaths(
+        tmp_path / "tournaments.json",
+        tmp_path / "medallion" / "competitions.yaml",
+    )
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    monkeypatch.setenv("SOFASCORE_SCOPE_TIMEOUT_S", "1800")
+    window = time.time() + window_in
+    monkeypatch.setenv(cycle.WINDOW_DEADLINE_ENV, str(window))
+    monkeypatch.delenv(cycle.SCOPE_DEADLINE_ENV, raising=False)
+    deadlines = []
+
+    def run_capture(argv):
+        deadlines.append(float(os.environ[cycle.SCOPE_DEADLINE_ENV]))
+        output = Path(argv[argv.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({"errors": [], "traffic": {}}))
+        return 0
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+            side_effect=_plan_double,
+        ),
+        patch("dags.scripts.run_sofascore_scraper.main", side_effect=run_capture),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches")) == 0
+
+    if window_in < 1800:
+        assert deadlines == [window]
+    else:
+        assert deadlines[0] < window
+        assert deadlines[0] <= time.time() + 1800

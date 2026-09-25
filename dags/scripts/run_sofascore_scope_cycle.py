@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -24,6 +25,12 @@ from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
     load_exact_scope,
     render_scope_overlays,
 )
+
+
+# #1358: wall-clock epoch by which the capture runner must have stopped taking
+# allocations (it keeps a margin for the final MERGE and the manifest flush).
+SCOPE_DEADLINE_ENV = "SOFASCORE_SCOPE_DEADLINE_EPOCH"
+WINDOW_DEADLINE_ENV = "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -77,8 +84,13 @@ def _phase_report(path: Path) -> dict[str, Any]:
         ):
             if field in traffic:
                 report[field] = traffic[field]
-    # #1352: rows refused one by one instead of failing the phase.
-    for field in ("rejected_rows", "rejected_players", "rejected_endpoints"):
+    if isinstance(traffic, dict) and "paid_proxy_bytes" in traffic:
+        report["paid_proxy_bytes"] = traffic["paid_proxy_bytes"]
+    # #1352: rows refused one by one instead of failing the phase.  #1358:
+    # ``partial`` is a capture that stopped at its own ceiling.
+    for field in (
+        "rejected_rows", "rejected_players", "rejected_endpoints", "partial",
+    ):
         if field in payload:
             report[field] = payload[field]
     return report
@@ -164,9 +176,12 @@ def run_phase(
     report = _phase_report(report_path)
     # A runner report without ``traffic`` still gets the phase's count.
     report.setdefault("trino_queries", trino_accounting.snapshot())
+    status = "success" if exit_code == 0 else "failed"
+    if exit_code == 0 and isinstance(report.get("partial"), dict):
+        status = "partial"
     return {
         "phase": phase,
-        "status": "success" if exit_code == 0 else "failed",
+        "status": status,
         "exit_code": exit_code,
         "plan": str(plan),
         **report,
@@ -215,10 +230,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--season-evidence bronze requires --phase matches")
     output_dir = Path(args.output_dir).resolve()
     output = Path(args.output).resolve()
+    started = time.monotonic()
     result: dict[str, Any] = {"status": "running", "phases": [], "errors": []}
     previous_registry = os.environ.get("SOFASCORE_REGISTRY_PATH")
     previous_medallion = os.environ.get("MEDALLION_CONFIG_DIR")
     previous_run_id = os.environ.get("SOFASCORE_RUN_ID")
+    previous_deadline = os.environ.get(SCOPE_DEADLINE_ENV)
+    # #1358: the task's own timeout, counted from the start of this process
+    # (the task), so the capture runner stops taking allocations in time.
+    timeout_s = os.environ.get("SOFASCORE_SCOPE_TIMEOUT_S", "").strip()
+    if timeout_s:
+        deadline = time.time() + float(timeout_s)
+        # The refresh batch's own deadline (window + retry reserve) caps every
+        # task and every retry, whose timeout would otherwise start afresh.
+        window = os.environ.get(WINDOW_DEADLINE_ENV, "").strip()
+        if window:
+            deadline = min(deadline, float(window))
+        os.environ[SCOPE_DEADLINE_ENV] = str(deadline)
+
+    def _finish(status: str) -> None:
+        result["status"] = status
+        result["elapsed_s"] = round(time.monotonic() - started, 1)
+        result["bytes"] = sum(
+            int(phase.get("paid_proxy_bytes") or 0) for phase in result["phases"]
+        )
+        _atomic_json(output, result)
+
     try:
         scope = load_exact_scope(
             args.snapshot,
@@ -284,28 +321,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     result["status_counts_stage"] = phase_result[
                         "status_counts_stage"
                     ]
+            if phase_result.get("status") == "partial":
+                partial = phase_result["partial"]
+                for field in ("remaining_matches", "stop_reason"):
+                    result[field] = partial.get(field)
+                result["capture_elapsed_s"] = partial.get("elapsed_s")
+                _finish("partial")
+                return 0
             if phase_result.get("status") != "success":
                 if not phase_errors:
                     result["errors"].append(
                         f"{phase}: exit_code={phase_result.get('exit_code')}, "
                         "phase report missing"
                     )
-                result["status"] = "failed"
-                _atomic_json(output, result)
+                _finish("failed")
                 return 1
-        result["status"] = "success"
-        _atomic_json(output, result)
+        _finish("success")
         return 0
     except Exception as exc:
-        result["status"] = "failed"
         result["errors"].append(f"{type(exc).__name__}: {exc}")
-        _atomic_json(output, result)
+        _finish("failed")
         return 1
     finally:
         for key, previous in (
             ("SOFASCORE_REGISTRY_PATH", previous_registry),
             ("MEDALLION_CONFIG_DIR", previous_medallion),
             ("SOFASCORE_RUN_ID", previous_run_id),
+            (SCOPE_DEADLINE_ENV, previous_deadline),
         ):
             if previous is None:
                 os.environ.pop(key, None)

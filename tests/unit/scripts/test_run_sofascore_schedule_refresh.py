@@ -325,8 +325,10 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
         # Every class was WALKED, so none of them is holding its anchor after a
         # cut-short walk (audit after Sol r28).
         "interrupted_runs": {"due": 0, "stale": 0, "seed": 0},
-        # Both classes have a single member, so each anchor stays where it is.
-        "index": {"due": [7, 96518], "stale": [7, 96518], "seed": [7, 96518]},
+        # #1358: the due slice is exactly its members, so the slice is FULL and
+        # its anchor moves past the one taken (the whole class is still taken
+        # on every run); the other classes are wider than their one member.
+        "index": {"due": [23, 88001], "stale": [7, 96518], "seed": [7, 96518]},
     }
     # An anchor that stayed put means the class was walked whole — which is
     # only readable next to the size of the class itself.
@@ -1090,29 +1092,85 @@ def test_worst_case_pays_a_warm_up_for_every_lease():
 
 
 @pytest.mark.unit
-def test_the_default_plan_fits_the_byte_cap():
-    # Sol r6 #5: the old estimate forgot the fixture page of every stale and
-    # seeded season and the step-back allowance of a resumed chain.
-    pages = refresh.worst_case_pages(
-        refresh.DEFAULT_MAX_DUE, refresh.DEFAULT_MAX_STALE,
-        refresh.DEFAULT_MAX_SEED, refresh.DEFAULT_CHASE_PAGES,
-        refresh.DEFAULT_SEED_PAGES,
+def test_the_default_plan_fits_the_page_budget_and_its_derived_cap():
+    # Sol r6 #5: the estimate counts the fixture page of every stale and
+    # seeded season and the step-back allowance of a resumed chain.  #1358:
+    # whatever the classes hold, their slices are cut to the page budget, and
+    # the byte cap is derived from exactly those pages.
+    limits = refresh.budget_class_limits(
+        {"due": 5000, "stale": 5000, "seed": 5000},
+        page_budget=refresh.DEFAULT_PAGE_BUDGET,
+        chase_pages=refresh.DEFAULT_CHASE_PAGES,
+        seed_pages=refresh.DEFAULT_SEED_PAGES,
+        max_due=refresh.DEFAULT_MAX_DUE,
+        max_stale=refresh.DEFAULT_MAX_STALE,
+        max_seed=refresh.DEFAULT_MAX_SEED,
+    )
+    knobs = (
+        limits["due"], limits["stale"], limits["seed"],
+        refresh.DEFAULT_CHASE_PAGES, refresh.DEFAULT_SEED_PAGES,
     )
 
-    assert pages == 150 * 3 + 200 * 4 + 40 * 17
-    assert refresh.worst_case_bytes(
-        refresh.DEFAULT_MAX_DUE, refresh.DEFAULT_MAX_STALE,
-        refresh.DEFAULT_MAX_SEED, refresh.DEFAULT_CHASE_PAGES,
-        refresh.DEFAULT_SEED_PAGES,
-    ) <= refresh.DEFAULT_BUDGET_CAP_BYTES
+    # 2 400 pages hold 800 due seasons at 3 pages each; nothing is left.
+    assert limits == {"due": 800, "seed": 0, "stale": 0}
+    assert refresh.worst_case_pages(*knobs) <= refresh.DEFAULT_PAGE_BUDGET
+    cap = refresh.derive_budget_cap(*knobs)
+    assert refresh.worst_case_bytes(*knobs, refresh.DISCOVERY_LEASE_MAX_BYTES, cap) < cap
 
 
 @pytest.mark.unit
-def test_a_plan_too_big_for_the_cap_never_reaches_the_gateway(offline):
-    # The knobs come from the environment: an override that cannot fit has to
-    # fail before the first paid request, not halfway through the sweep.
+def test_budget_limits_take_due_first_then_seed_then_shrink_stale():
+    costs = refresh.class_page_costs(3, 12)
+    assert costs == {"due": 3, "stale": 4, "seed": 17}
+
+    limits = refresh.budget_class_limits(
+        {"due": 205, "stale": 1200, "seed": 60},
+        page_budget=2400, chase_pages=3, seed_pages=12,
+        max_due=4096, max_stale=200, max_seed=40,
+    )
+
+    # due = the number of due seasons, seed its whole share, stale what fits.
+    assert limits["due"] == 205
+    assert limits["seed"] == 40
+    assert limits["stale"] == min(200, (2400 - 205 * 3 - 40 * 17) // 4)
+    # A heavy due day squeezes stale instead of refusing the run.
+    heavy = refresh.budget_class_limits(
+        {"due": 700, "stale": 1200, "seed": 60},
+        page_budget=2400, chase_pages=3, seed_pages=12,
+        max_due=4096, max_stale=200, max_seed=40,
+    )
+    assert heavy == {"due": 700, "seed": 17, "stale": 2}
+    # The emergency bound still bounds due.
+    capped = refresh.budget_class_limits(
+        {"due": 700, "stale": 0, "seed": 0},
+        page_budget=2400, chase_pages=3, seed_pages=12,
+        max_due=100, max_stale=200, max_seed=40,
+    )
+    assert capped["due"] == 100
+
+
+@pytest.mark.unit
+def test_an_oversized_stale_override_shrinks_instead_of_refusing(offline):
+    # #1358: an override that asks for more stale seasons than the budget holds
+    # no longer blocks the run — the slice is cut to the pages left.
     assert refresh.main(_argv(
         offline, "--control-url", "http://gw", "--max-stale", "4000",
+        "--page-budget", "60",
+    )) == 0
+
+    report = json.loads(offline["output"].read_text())
+    assert report["planned_pages"] <= 60
+    assert report["class_limits"]["stale"] < 4000
+    client = _FakeClient.created[0]
+    assert client["budget_cap_bytes"] == report["budget_cap_bytes"]
+
+
+@pytest.mark.unit
+def test_a_plan_too_big_for_an_explicit_cap_never_reaches_the_gateway(offline):
+    # An operator's explicit byte cap is still honoured: a plan that cannot
+    # fit it fails before the first paid request, not halfway through.
+    assert refresh.main(_argv(
+        offline, "--control-url", "http://gw", "--budget-cap-bytes", "100000",
     )) == 1
 
     report = json.loads(offline["output"].read_text())
@@ -2111,11 +2169,14 @@ def test_the_report_says_which_limit_each_class_was_sliced_with(
     assert queue_limit == 2
     assert dict(zip(refresh.SWEEP_CLASSES, class_limits)) == report["class_limits"]
     assert report["class_limits"]["seed"] == 1 == 2 - report["retry_targets"]
-    assert report["class_limits"]["due"] == 150  # the configured default
+    # #1358: the due slice is exactly the due seasons of the run.
+    assert report["class_limits"]["due"] == report["class_members"]["due"]
 
 
 @pytest.mark.unit
-def test_the_estimate_counts_the_leases_that_shrink_with_the_budget(tmp_path):
+def test_the_estimate_counts_the_leases_that_shrink_with_the_budget(
+    offline, tmp_path, monkeypatch
+):
     # Sol r14 #1: the client asks for min(per-lease ceiling, what is LEFT of
     # the budget), so the last leases of a run are smaller and serve fewer
     # pages each.  Dividing the payload by one fixed lease size undercounted
@@ -2139,18 +2200,20 @@ def test_the_estimate_counts_the_leases_that_shrink_with_the_budget(tmp_path):
     # NEVER /dev/null for these: the report, the cursor and the retry queue are
     # written with ``os.replace``, which would swap the device node for a plain
     # file and break every ``2>/dev/null`` on the machine (Sol r15 #1 — it did).
-    output = tmp_path / "report.json"
-    argv = [
-        "--snapshot", str(tmp_path / "nonexistent.json"),
-        "--output", str(output),
-        "--cursor", str(tmp_path / "cursor.json"),
-        "--incomplete", str(tmp_path / "incomplete.json"),
+    # #1358: the plan ``main`` checks is its BUDGETED slices; pin them to the
+    # knobs measured above.
+    monkeypatch.setattr(
+        refresh, "budget_class_limits",
+        lambda members, **_: {"due": max_due, "stale": max_stale, "seed": max_seed},
+    )
+    output = offline["output"]
+    argv = _argv(
+        offline,
         "--control-url", "http://gw",
-        "--max-due", str(max_due), "--max-stale", str(max_stale),
-        "--max-seed", str(max_seed), "--chase-pages", str(chase_pages),
+        "--chase-pages", str(chase_pages),
         "--seed-pages", str(seed_pages),
         "--per-lease-max-bytes", str(lease), "--budget-cap-bytes", str(flat),
-    ]
+    )
 
     assert refresh.main(argv) == 1
 
@@ -2161,16 +2224,9 @@ def test_the_estimate_counts_the_leases_that_shrink_with_the_budget(tmp_path):
     report = json.loads(output.read_text())
     assert f"{refresh.worst_case_pages(*knobs)} pages" in report["errors"][0]
     assert "over the" in report["errors"][0]
-    # And a plan that fits is unaffected: the default sweep costs the same as
-    # it did before the leases were walked one by one.
-    defaults = (
-        refresh.DEFAULT_MAX_DUE, refresh.DEFAULT_MAX_STALE,
-        refresh.DEFAULT_MAX_SEED, refresh.DEFAULT_CHASE_PAGES,
-        refresh.DEFAULT_SEED_PAGES,
-    )
-    assert refresh.worst_case_bytes(*defaults, lease, refresh.DEFAULT_BUDGET_CAP_BYTES) == (
-        refresh.worst_case_bytes(*defaults, lease)
-    )
+    # And the derived cap (#1358) is one the same plan DOES fit under.
+    derived = refresh.derive_budget_cap(*knobs, lease)
+    assert refresh.worst_case_bytes(*knobs, lease, derived) < derived
 
 
 @pytest.mark.unit
@@ -2222,7 +2278,9 @@ def test_a_lease_carries_the_page_that_crosses_the_remint_mark_but_not_one_that_
 
 
 @pytest.mark.unit
-def test_a_lease_that_would_end_exactly_on_its_ceiling_is_refused(offline, tmp_path):
+def test_a_lease_that_would_end_exactly_on_its_ceiling_is_refused(
+    offline, tmp_path, monkeypatch
+):
     # Sol r19/r20: a lease drained to its final byte never lets the gateway read
     # the provider EOF — the down pump takes the allowance check at the top of
     # its loop, finds nothing left and breaks before the zero-length read, so
@@ -2239,22 +2297,23 @@ def test_a_lease_that_would_end_exactly_on_its_ceiling_is_refused(offline, tmp_p
     with pytest.raises(ValueError, match="exactly on its ceiling"):
         refresh.worst_case_bytes(1, 1, 1, 1, 1, 275_456, 412_673)
 
-    output = tmp_path / "report.json"
-    argv = [
-        "--snapshot", str(tmp_path / "nonexistent.json"),
-        "--output", str(output),
-        "--cursor", str(tmp_path / "cursor.json"),
-        "--incomplete", str(tmp_path / "incomplete.json"),
+    # #1358: the preflight checks the plan's BUDGETED slices, so it runs once
+    # they are cut — still before a single paid request.
+    monkeypatch.setattr(
+        refresh, "budget_class_limits",
+        lambda members, **_: {"due": 1, "stale": 1, "seed": 1},
+    )
+    argv = _argv(
+        offline,
         "--control-url", "http://gw",
-        "--max-due", "1", "--max-stale", "1", "--max-seed", "1",
         "--chase-pages", "1", "--seed-pages", "1",
         "--per-lease-max-bytes", str(lease), "--budget-cap-bytes", "412672",
-    ]
+    )
 
     assert refresh.main(argv) == 1
 
     # And the run says so before a single paid request, not halfway through.
-    report = json.loads(output.read_text())
+    report = json.loads(offline["output"].read_text())
     assert "exactly on its ceiling" in report["errors"][0]
     # Refused before a single paid request: no client was ever built.
     assert _FakeClient.created == []

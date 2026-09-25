@@ -74,7 +74,11 @@ TASK_ID = "refresh_season_schedules"
 # case of a plan is computed, not guessed — see ``worst_case_pages`` — and the
 # run refuses to start when it does not fit the cap, because a sweep that dies
 # fail-closed on bytes halfway is a run that paid for pages and kept nothing.
-DEFAULT_BUDGET_CAP_BYTES = 64 * 1024 * 1024
+# #1358: the run's page budget — what the 150 min fetch window holds at the
+# lane's 20 requests a minute with a 20 % margin.  The class slices are cut to
+# it (``budget_class_limits``) and the byte cap is derived from the pages they
+# may cost (``derive_budget_cap``); a fixed 64 MiB cap no longer applies.
+DEFAULT_PAGE_BUDGET = 2400
 _PAGE_BYTES = 27 * 1024
 _LEASE_WARMUP_BYTES = 80 * 1024
 # The client re-mints its lease at 90 % of the lease ceiling
@@ -82,10 +86,10 @@ _LEASE_WARMUP_BYTES = 80 * 1024
 # that many bytes — not a handful of times as the first estimate assumed (Sol
 # round 7, finding 5).
 _LEASE_BYTE_HEADROOM = 0.9
-# Seasons whose results move today: their tail pages, on every run — up to
-# this many of them.  A slice larger than the cap rotates on the cursor like
-# the other classes; the cap is what the byte budget is sized on.
-DEFAULT_MAX_DUE = 150
+# Seasons whose results move today: their tail pages, on every run — all of
+# them within the page budget (#1358).  This is only an emergency upper bound;
+# a slice larger than it rotates on the cursor like the other classes.
+DEFAULT_MAX_DUE = 4096
 # Seasons already in Bronze but not playing in the window: their tail page too,
 # but a slice per run.  This is what bounds the lag — a league that plays once a
 # week leaves the ``due`` window long before its next match, and without a round
@@ -673,11 +677,21 @@ def _parser() -> argparse.ArgumentParser:
         "--control-url", default=os.environ.get("SOFASCORE_PROXY_CONTROL_URL", "")
     )
     parser.add_argument(
+        # 0 (the default) derives the cap from the planned pages (#1358); a
+        # positive value is an operator override the plan must fit under.
         "--budget-cap-bytes", type=int,
         default=int(
             os.environ.get("SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", "").strip()
-            or DEFAULT_BUDGET_CAP_BYTES
+            or 0
         ),
+    )
+    parser.add_argument(
+        "--page-budget", type=int,
+        default=int(
+            os.environ.get("SOFASCORE_REFRESH_PAGE_BUDGET", "").strip()
+            or DEFAULT_PAGE_BUDGET
+        ),
+        help="Worst-case pages one run may plan; the class slices are cut to it.",
     )
     parser.add_argument(
         # The gateway may hand out a smaller lease than the client's default,
@@ -896,6 +910,80 @@ def worst_case_bytes(
     return spent
 
 
+def class_page_costs(chase_pages: int, seed_pages: int) -> dict[str, int]:
+    """Worst-case pages ONE target of each class costs (see ``worst_case_pages``)."""
+
+    return {
+        "due": chase_pages,
+        "stale": chase_pages + 1,
+        "seed": seed_pages + MAX_BACKTRACK_PAGES + 2,
+    }
+
+
+def budget_class_limits(
+    members: Mapping[str, int],
+    *,
+    page_budget: int,
+    chase_pages: int,
+    seed_pages: int,
+    max_due: int,
+    max_stale: int,
+    max_seed: int,
+) -> dict[str, int]:
+    """#1358: slice limits of the classes cut to the run's page budget.
+
+    ``due`` takes its share first — every due season, bounded only by the
+    emergency ``max_due`` and the budget; then ``seed`` (the resumed chains
+    are part of its share, see ``main``); then ``stale`` from what is left.
+    ``stale`` shrinks instead of blocking the start: the old fixed caps made
+    an override that did not fit refuse the whole run.
+    """
+
+    costs = class_page_costs(chase_pages, seed_pages)
+    left = int(page_budget)
+    limits: dict[str, int] = {}
+    for name, cap in (("due", max_due), ("seed", max_seed), ("stale", max_stale)):
+        # ``due`` is exactly the due seasons of the run.  ``seed`` carries the
+        # resume queue, which ``members`` does not count, so its share is
+        # reserved whole up to ``max_seed``; ``stale`` keeps its rotation cap
+        # and gets what is left.
+        wanted = min(int(cap), int(members.get(name, 0))) if name == "due" else int(cap)
+        limits[name] = max(0, min(wanted, left // costs[name]))
+        left -= limits[name] * costs[name]
+    return limits
+
+
+def derive_budget_cap(
+    max_due: int,
+    max_stale: int,
+    max_seed: int,
+    chase_pages: int,
+    seed_pages: int,
+    per_lease_max_bytes: int = DISCOVERY_LEASE_MAX_BYTES,
+) -> int:
+    """The smallest byte cap the planned pages fit under (#1358).
+
+    ``worst_case_bytes`` depends on the cap itself (the last leases shrink to
+    what is left of it), so the cap is searched upwards from the flat estimate
+    until the estimate under it stays strictly below it — the ``>=`` rule of
+    the preflight (Sol round 19).  A layout that would end a lease exactly on
+    its ceiling is moved on by a page's worth of bytes.
+    """
+
+    knobs = (max_due, max_stale, max_seed, chase_pages, seed_pages)
+    cap = worst_case_bytes(*knobs, per_lease_max_bytes) + 1
+    for _ in range(64):
+        try:
+            needed = worst_case_bytes(*knobs, per_lease_max_bytes, cap)
+        except ValueError:
+            cap += _PAGE_BYTES
+            continue
+        if needed < cap:
+            return cap
+        cap = needed + 1
+    raise ValueError(f"no byte cap found for the plan {knobs}")
+
+
 def sweep_predicates(
     known: set[tuple[str, str]],
     due: set[tuple[str, str]],
@@ -1006,27 +1094,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # sweep had been walked (Sol round 13, finding 4).
         if args.max_idle_runs < 0:
             raise ValueError("--max-idle-runs cannot be negative")
-        # The knobs are read from the environment, so an override can ask for
-        # more pages than the byte cap admits.  Refuse before a single paid
-        # request instead of dying fail-closed with the sweep half done.
-        knobs = (
-            args.max_due, args.max_stale, args.max_seed, args.chase_pages,
-            args.seed_pages,
-        )
-        needed = worst_case_bytes(
-            *knobs, args.per_lease_max_bytes, args.budget_cap_bytes
-        )
-        # ``>=``, not ``>``: a plan that lands EXACTLY on the cap leaves its
-        # last lease drained to its final byte, and a lease that ends on its
-        # ceiling never lets the gateway see EOF — it is closed
-        # ``accounting_uncertain`` and the close answers 409 (``filter_proxy``;
-        # lesson #7 on lost leases).  The cap has to keep a byte of slack
-        # (Sol round 19).
-        if needed >= args.budget_cap_bytes:
-            raise ValueError(
-                f"worst case of this plan is {worst_case_pages(*knobs)} pages "
-                f"~ {needed} bytes, over the {args.budget_cap_bytes} byte cap"
-            )
+        if args.page_budget <= 0:
+            raise ValueError("--page-budget must be positive")
+        if args.budget_cap_bytes < 0:
+            raise ValueError("--budget-cap-bytes cannot be negative")
         snapshot = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
         snapshot_id = str(snapshot.get("snapshot_id") or "")
         raw_store = (
@@ -1050,14 +1121,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # failing must not hide the rest of the queue behind it.
         unfinished, retry_cursor = read_incomplete(Path(args.incomplete))
         queued = [target for target in all_targets if target.pair in unfinished]
+        # #1358: the slices are cut to the page budget — due first, then the
+        # seed share (resume queue included), then stale from what is left.
+        wanted_now = sweep_predicates(set(known), due, set(unfinished))
+        limits = budget_class_limits(
+            {
+                name: sum(1 for target in all_targets if wanted_now[name](target))
+                for name in SWEEP_CLASSES
+            },
+            page_budget=args.page_budget,
+            chase_pages=args.chase_pages,
+            seed_pages=args.seed_pages,
+            max_due=args.max_due,
+            max_stale=args.max_stale,
+            max_seed=args.max_seed,
+        )
         retry_targets, next_retry_cursor = take_slice(
-            queued, retry_cursor, args.max_seed, lambda target: True,
+            queued, retry_cursor, limits["seed"], lambda target: True,
         )
         plan, next_cursors, members = plan_sweep(
-            all_targets, set(known), due, cursors, args.max_due, args.max_stale,
-            args.max_seed - len(retry_targets),
+            all_targets, set(known), due, cursors, limits["due"],
+            limits["stale"], limits["seed"] - len(retry_targets),
             pinned=set(unfinished),
         )
+        # The knobs are read from the environment, so an override can ask for
+        # more pages than the byte cap admits.  Refuse before a single paid
+        # request instead of dying fail-closed with the sweep half done.
+        knobs = (
+            limits["due"], limits["stale"], limits["seed"], args.chase_pages,
+            args.seed_pages,
+        )
+        budget_cap_bytes = args.budget_cap_bytes or derive_budget_cap(
+            *knobs, args.per_lease_max_bytes
+        )
+        needed = worst_case_bytes(
+            *knobs, args.per_lease_max_bytes, budget_cap_bytes
+        )
+        # ``>=``, not ``>``: a plan that lands EXACTLY on the cap leaves its
+        # last lease drained to its final byte, and a lease that ends on its
+        # ceiling never lets the gateway see EOF — it is closed
+        # ``accounting_uncertain`` and the close answers 409 (``filter_proxy``;
+        # lesson #7 on lost leases).  The cap has to keep a byte of slack
+        # (Sol round 19).
+        if needed >= budget_cap_bytes:
+            raise ValueError(
+                f"worst case of this plan is {worst_case_pages(*knobs)} pages "
+                f"~ {needed} bytes, over the {budget_cap_bytes} byte cap"
+            )
         retried = {target.pair for target in retry_targets}
         plan["seed"] = retry_targets + [
             target for target in plan["seed"] if target.pair not in retried
@@ -1108,10 +1218,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # round 13, finding 3).
                 "class_members": members,
                 "class_limits": {
-                    "due": args.max_due,
-                    "stale": args.max_stale,
-                    "seed": args.max_seed - len(retry_targets),
+                    "due": limits["due"],
+                    "stale": limits["stale"],
+                    "seed": limits["seed"] - len(retry_targets),
                 },
+                "page_budget": args.page_budget,
+                "planned_pages": worst_case_pages(*knobs),
+                "budget_cap_bytes": budget_cap_bytes,
                 # Resumed chains ride ahead of the seed slice, so they are in
                 # ``seed_targets`` without being in ``class_members["seed"]``.
                 "retry_targets": len(retry_targets),
@@ -1142,7 +1255,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         client = LeaseBrowserSofaScoreClient(
             control_url=str(args.control_url).strip(),
-            budget_cap_bytes=args.budget_cap_bytes,
+            budget_cap_bytes=budget_cap_bytes,
             per_lease_max_bytes=args.per_lease_max_bytes,
             lease_ttl_seconds=args.lease_ttl_seconds,
             max_attempts=args.max_attempts,
@@ -1559,6 +1672,9 @@ __all__ = [
     "take_slice",
     "worst_case_pages",
     "worst_case_bytes",
+    "budget_class_limits",
+    "class_page_costs",
+    "derive_budget_cap",
     "SWEEP_CLASSES",
     "read_cursor",
     "read_idle_runs",

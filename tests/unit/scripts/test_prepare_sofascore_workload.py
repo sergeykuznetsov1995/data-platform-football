@@ -564,6 +564,58 @@ def test_target_phase_from_bronze_evidence_never_reads_the_season_pages(
     shape_probe.assert_not_called()
 
 
+def test_target_phase_cuts_the_plan_to_the_scope_match_ceiling(
+    tmp_path, monkeypatch
+):
+    # #1358: the refresh lane sizes a scope to its window; the signed plan
+    # holds the first SOFASCORE_SCOPE_MAX_MATCHES pending matches only.
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("SOFASCORE_SCOPE_MAX_MATCHES", "30")
+    patches = _common_patches(_season_plan())
+    matches = {str(value) for value in range(1, 101)}
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value=matches,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            side_effect=lambda _runtime, ids, _builder: tuple(sorted(ids, key=int)),
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_refresh_sofascore_all_mens",
+            base_run_id="refresh-cap",
+            phase="targets",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "target-plan.json",
+            allow_inactive_season=True,
+            season_freshness_key="final",
+            season_evidence="bronze",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    planned = [match for item in signed.allocations for match in target_ids(item)]
+    assert len(planned) == 30
+    assert sorted(planned, key=int) == [str(value) for value in range(1, 31)]
+
+
+def test_scope_match_ceiling_is_absent_outside_the_refresh_lane(monkeypatch):
+    from dags.scripts import prepare_sofascore_workload as workload
+
+    monkeypatch.delenv("SOFASCORE_SCOPE_MAX_MATCHES", raising=False)
+    assert workload._scope_max_matches() is None
+    assert workload._cap_pending_matches(("1", "2"), None) == ("1", "2")
+    monkeypatch.setenv("SOFASCORE_SCOPE_MAX_MATCHES", "0")
+    with pytest.raises(ValueError, match="SOFASCORE_SCOPE_MAX_MATCHES"):
+        workload._scope_max_matches()
+
+
 @pytest.mark.parametrize(
     "phase, evidence",
     [("season", "bronze"), ("players", "bronze"), ("targets", "trino")],

@@ -1191,3 +1191,87 @@ def test_current_season_targets_skip_esoccer_tournaments():
     )
 
     assert [target.tournament_id for target in targets] == [8]
+
+
+def _window_plan(pending, **kwargs):
+    kwargs.setdefault("queue_mode", "fresh")
+    return plan_refresh_batch(
+        _refresh_snapshot(), pending, batch_size=kwargs.pop("batch_size", 8),
+        scope_budget_s=kwargs.pop("scope_budget_s", 7200), **kwargs,
+    )
+
+
+@pytest.mark.unit
+def test_refresh_window_takes_every_small_scope_that_fits():
+    # #1358: four scopes of 10 matches are 4 x (250 + 180) s of a 2 h window.
+    planned = _window_plan([
+        _refresh_pending("SS-17", "2627", 10, 1_787_900_004),
+        _refresh_pending("SS-8", "2627", 10, 1_787_900_003),
+        _refresh_pending("SS-17", "2526", 10, 1_787_900_002),
+        _refresh_pending("SS-8", "2526", 10, 1_787_900_001),
+    ])
+
+    assert len(planned) == 4
+    for env in planned:
+        assert env["SOFASCORE_SCOPE_MAX_MATCHES"] == "10"
+        assert env["SOFASCORE_SCOPE_BYTE_CAP"] == str(10 * 49_342)
+        assert env["SOFASCORE_SCOPE_ESTIMATE_S"] == str(10 * 25 + 180)
+        # estimate x 1.5 would leave the runner's 5 min stop margin no room on
+        # a small scope, so the timeout keeps 10 min over the estimate.
+        assert env["SOFASCORE_SCOPE_TIMEOUT_S"] == str(430 + 600)
+        assert env["SOFASCORE_REFRESH_SECONDS_PER_MATCH"] == "25"
+
+
+@pytest.mark.unit
+def test_refresh_window_slices_the_scope_that_does_not_fit_whole():
+    planned = _window_plan([
+        _refresh_pending("SS-17", "2627", 100, 1_787_900_004),
+        _refresh_pending("SS-8", "2627", 5_920, 1_787_900_003),
+        _refresh_pending("SS-17", "2526", 10, 1_787_900_002),
+    ])
+
+    assert [env["SOFASCORE_SCOPE_KEY"] for env in planned] == [
+        "campaign-test:17:1726", "campaign-test:8:826",
+    ]
+    head, sliced = planned
+    assert head["SOFASCORE_SCOPE_MAX_MATCHES"] == "100"
+    # 7200 - (100 x 25 + 180) = 4520 s left -> (4520 - 180) // 25 matches.
+    assert sliced["SOFASCORE_SCOPE_MAX_MATCHES"] == str((4520 - 180) // 25)
+    assert sliced["SOFASCORE_SCOPE_BYTE_CAP"] == str(173 * 49_342)
+    estimate = int(sliced["SOFASCORE_SCOPE_ESTIMATE_S"])
+    assert estimate == 173 * 25 + 180
+    assert int(head["SOFASCORE_SCOPE_ESTIMATE_S"]) + estimate <= 7200
+    assert sliced["SOFASCORE_SCOPE_TIMEOUT_S"] == str((estimate * 3 + 1) // 2)
+
+
+@pytest.mark.unit
+def test_refresh_window_closes_on_a_slice_under_twenty_matches():
+    planned = _window_plan([
+        # 280 x 25 + 180 = 7180 s: 20 s of the window are left.
+        _refresh_pending("SS-17", "2627", 280, 1_787_900_004),
+        _refresh_pending("SS-8", "2627", 50, 1_787_900_003),
+        _refresh_pending("SS-17", "2526", 1, 1_787_900_002),
+    ])
+
+    assert [env["SOFASCORE_SCOPE_KEY"] for env in planned] == [
+        "campaign-test:17:1726"
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_window_caps_one_task_at_two_hours_and_logs_a_batch_cut(caplog):
+    planned = _window_plan(
+        [
+            _refresh_pending("SS-17", "2627", 1, 1_787_900_004),
+            _refresh_pending("SS-8", "2627", 1, 1_787_900_003),
+        ],
+        batch_size=1,
+    )
+    assert len(planned) == 1
+    assert "SOFASCORE_REFRESH_BATCH_SIZE=1" in caplog.text
+
+    unbounded = plan_refresh_batch(
+        _refresh_snapshot(), [_refresh_pending("SS-17", "2627", 5_000)],
+        queue_mode="fresh",
+    )
+    assert unbounded[0]["SOFASCORE_SCOPE_TIMEOUT_S"] == str(2 * 3600)

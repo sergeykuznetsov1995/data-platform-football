@@ -310,6 +310,32 @@ def _pending_targets(runtime, ids: Iterable[str], build_specs) -> tuple[str, ...
     return tuple(pending)
 
 
+def _scope_max_matches() -> Optional[int]:
+    """#1358: the refresh lane's per-scope match ceiling, or ``None``."""
+
+    if not os.environ.get("SOFASCORE_SCOPE_MAX_MATCHES", "").strip():
+        return None
+    return _positive_env_int("SOFASCORE_SCOPE_MAX_MATCHES", 1)
+
+
+def _cap_pending_matches(pending: Sequence[str], limit: Optional[int]) -> tuple[str, ...]:
+    """Keep the first ``limit`` pending matches; the rest wait for the next run.
+
+    The order of ``pending`` is the order the scope should spend its window
+    in; the runner reports the cut-off matches as ``remaining_matches``.
+    """
+
+    pending = tuple(pending)
+    if limit is None or len(pending) <= limit:
+        return pending
+    print(
+        f"SofaScore targets plan keeps {limit} of {len(pending)} pending "
+        "matches (SOFASCORE_SCOPE_MAX_MATCHES); the rest waits for the next run",
+        file=sys.stderr,
+    )
+    return pending[:limit]
+
+
 def _season_freshness_key() -> str:
     return os.environ.get(
         "SOFASCORE_SEASON_FRESHNESS_KEY", ""
@@ -574,6 +600,9 @@ def prepare_workload_plan(
 
         pending_matches = _pending_targets(runtime, matches, event_specs)
         if phase == "targets":
+            pending_matches = _cap_pending_matches(
+                pending_matches, _scope_max_matches()
+            )
             # This snapshot is intentionally match-only.  Player evidence is
             # not stable until every match allocation has committed Bronze.
             workloads.append(
