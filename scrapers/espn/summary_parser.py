@@ -1085,8 +1085,11 @@ def parse_summary(
         if game_info[-1]:
             extras["gameInfo"] = game_info[-1]
         extra_json = canonical_json(extras)
-    except EspnParseError as exc:
-        # The raw body stays in the raw store; nothing of it is published.
+    except (EspnParseError, ValueError, ArithmeticError, RecursionError) as exc:
+        # Everything in this block is driven by the response content: a JSON
+        # number too large for float, too many digits or nesting too deep is
+        # a malformed source as well.  The raw body stays in the raw store;
+        # nothing of it is published.
         return SummaryParseResult(
             event_id=event.event_id,
             lineup=(),
@@ -1096,7 +1099,11 @@ def parse_summary(
             parser_version=PARSER_VERSION,
             extra_json="{}",
             disposition=SummaryDisposition.SOURCE_MALFORMED,
-            reason=str(exc),
+            reason=(
+                str(exc)
+                if isinstance(exc, EspnParseError)
+                else f"{type(exc).__name__}: {exc}"
+            ),
             anomalies=(),
             events=(),
             advance_team_id=None,

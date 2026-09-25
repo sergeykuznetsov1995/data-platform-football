@@ -832,6 +832,37 @@ def test_non_object_body_is_source_malformed(raw: bytes, reason: str) -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("literal", "reason"),
+    [
+        ("1" + "0" * 400, "OverflowError"),
+        ("1" * 5000, "ValueError"),
+        ("[" * 100_000 + "]" * 100_000, "RecursionError"),
+    ],
+    ids=["float_overflow", "too_many_digits", "too_deep"],
+)
+def test_content_numeric_and_depth_errors_are_source_malformed(
+    literal: str, reason: str
+) -> None:
+    payload = _load("native_summary.json")
+    payload["rosters"][0]["roster"][0]["statistics"] = [
+        {"name": "totalGoals", "value": "__LITERAL__"}
+    ]
+    raw = _raw(payload).replace(b'"__LITERAL__"', literal.encode())
+    competition, edition, schedule = _schedule()
+
+    broken = parse_summary(
+        raw, competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert broken.disposition is SummaryDisposition.SOURCE_MALFORMED
+    assert reason in (broken.reason or "")
+    assert broken.lineup == () and broken.matchsheet == ()
+    neighbour = _summary(_load("native_summary.json"))
+    assert neighbour.disposition is SummaryDisposition.CAPTURED
+
+
+@pytest.mark.unit
 def test_caller_bugs_still_raise() -> None:
     competition, edition, schedule = _schedule()
     with pytest.raises(TypeError, match="raw payload must be bytes"):
