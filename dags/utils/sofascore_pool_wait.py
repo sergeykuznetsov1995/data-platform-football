@@ -13,7 +13,7 @@ a task instance's ``start_date`` minus the later of its DagRun's start and
 the latest ``end_date`` of the run's task instances that started before it.
 Scheduler hand-overs take up to ``WAIT_THRESHOLD_S``; only gaps above it are
 waiting. Only first tries are measured (a retry's gap is its retry delay);
-every earlier task instance of the run counts as a predecessor.
+every earlier attempt of the run, retries included, counts as a predecessor.
 """
 
 from __future__ import annotations
@@ -29,7 +29,11 @@ DAILY_DAG_ID = "dag_ingest_sofascore"
 # The refresh lane's pool: the former players lane (#1244), absorbed by #1360
 # with its name kept (deploy/sofascore/airflow.compose.yaml).
 REFRESH_POOL = "sofascore_players_pool"
+HISTORY_POOL = "sofascore_history_pool"
 HISTORY_SCOPE_TASK_ID = "run_historical_scope"
+# Task instance rows keep the latest try only; earlier tries of a retried task
+# live in task_instance_history (Airflow >= 2.10). Both are read as attempts.
+_ATTEMPT_COLUMNS = "dag_id, run_id, task_id, try_number, state, pool, start_date, end_date"
 
 _UTC_LITERAL = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -40,41 +44,62 @@ def _check(t0_utc: str, t1_utc: str) -> None:
             raise ValueError(f"not a UTC timestamp literal: {bound!r}")
 
 
+def _attempts(where: str) -> str:
+    return (
+        f"SELECT {_ATTEMPT_COLUMNS} FROM task_instance WHERE {where} "
+        f"UNION ALL SELECT {_ATTEMPT_COLUMNS} FROM task_instance_history WHERE {where}"
+    )
+
+
 def pool_wait_sql(t0_utc: str, t1_utc: str) -> str:
     """One row ``runs|waiting_runs|wait_sum_s|wait_max_s`` over the refresh
-    DAG's first-try terminal task instances started in ``[t0_utc, t1_utc)``.
+    DagRuns started in ``[t0_utc, t1_utc)``.
 
-    ``wait_sum_s`` sums gaps above the threshold; ``wait_max_s`` is the
-    largest gap of any measured task instance, threshold or not."""
+    Every first try that started is measured, finished or not, retried or not
+    (its first try is read from ``task_instance_history``). A task still
+    ``scheduled``/``queued`` while nothing of its run runs is waiting right
+    now and is measured up to ``now()``. ``wait_sum_s`` sums gaps above the
+    threshold; ``wait_max_s`` is the largest gap, threshold or not."""
 
     _check(t0_utc, t1_utc)
-    measured = (
-        f"t.dag_id = '{REFRESH_DAG_ID}' "
-        "AND t.try_number = 1 "
-        "AND t.state IN ('success', 'failed') "
-        f"AND t.start_date >= '{t0_utc}'::timestamptz "
-        f"AND t.start_date < '{t1_utc}'::timestamptz"
+    pending = (
+        "EXISTS (SELECT 1 FROM task_instance p "
+        f"WHERE p.dag_id = '{REFRESH_DAG_ID}' AND p.run_id = r.run_id "
+        "AND p.start_date IS NULL AND p.state IN ('scheduled', 'queued')) "
+        "AND NOT EXISTS (SELECT 1 FROM attempts b WHERE b.run_id = r.run_id "
+        "AND b.start_date IS NOT NULL AND b.end_date IS NULL)"
     )
     return (
         "WITH runs AS ("
-        f"SELECT DISTINCT t.run_id FROM task_instance t WHERE {measured}"
-        "), ti AS ("
-        "SELECT t.dag_id, t.run_id, t.try_number, t.state, t.start_date, "
-        "GREATEST(dr.start_date, max(t.end_date) OVER ("
-        "PARTITION BY t.run_id ORDER BY t.start_date "
+        "SELECT run_id, start_date AS run_start FROM dag_run "
+        f"WHERE dag_id = '{REFRESH_DAG_ID}' "
+        f"AND start_date >= '{t0_utc}'::timestamptz "
+        f"AND start_date < '{t1_utc}'::timestamptz"
+        "), attempts AS ("
+        + _attempts(
+            f"dag_id = '{REFRESH_DAG_ID}' AND run_id IN (SELECT run_id FROM runs)"
+        )
+        + "), started AS ("
+        "SELECT a.run_id, a.try_number, a.state, a.start_date, "
+        "GREATEST(r.run_start, max(a.end_date) OVER ("
+        "PARTITION BY a.run_id ORDER BY a.start_date "
         "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)) AS ready_at "
-        "FROM task_instance t "
-        "JOIN dag_run dr ON dr.dag_id = t.dag_id AND dr.run_id = t.run_id "
-        f"WHERE t.dag_id = '{REFRESH_DAG_ID}' AND t.start_date IS NOT NULL "
-        "AND t.run_id IN (SELECT run_id FROM runs)"
+        "FROM attempts a JOIN runs r ON r.run_id = a.run_id "
+        "WHERE a.start_date IS NOT NULL"
         "), gaps AS ("
-        "SELECT t.run_id, "
-        "GREATEST(extract(epoch FROM t.start_date - t.ready_at), 0) AS gap_s "
-        f"FROM ti t WHERE {measured}"
-        "), per_run AS ("
         "SELECT run_id, "
-        f"coalesce(sum(gap_s) FILTER (WHERE gap_s > {WAIT_THRESHOLD_S}), 0) AS wait_s, "
-        "max(gap_s) AS max_gap_s FROM gaps GROUP BY run_id"
+        "GREATEST(extract(epoch FROM start_date - ready_at), 0) AS gap_s "
+        "FROM started WHERE try_number = 1 "
+        "AND state NOT IN ('skipped', 'upstream_failed', 'removed') "
+        "UNION ALL "
+        "SELECT r.run_id, GREATEST(extract(epoch FROM now() - GREATEST(r.run_start, "
+        "(SELECT max(e.end_date) FROM attempts e WHERE e.run_id = r.run_id))), 0) "
+        f"FROM runs r WHERE {pending}"
+        "), per_run AS ("
+        "SELECT r.run_id, "
+        f"coalesce(sum(g.gap_s) FILTER (WHERE g.gap_s > {WAIT_THRESHOLD_S}), 0) AS wait_s, "
+        "coalesce(max(g.gap_s), 0) AS max_gap_s "
+        "FROM runs r LEFT JOIN gaps g ON g.run_id = r.run_id GROUP BY r.run_id"
         ") "
         "SELECT count(*), count(*) FILTER (WHERE wait_s > 0), "
         "round(coalesce(sum(wait_s), 0)), round(coalesce(max(max_gap_s), 0)::numeric, 1) "
@@ -83,29 +108,34 @@ def pool_wait_sql(t0_utc: str, t1_utc: str) -> str:
 
 
 def lane_overlap_sql(t0_utc: str, t1_utc: str) -> str:
-    """One row ``history_during_daily|daily_in_refresh_pool`` for task
-    instances started in ``[t0_utc, t1_utc)``: history scope attempts that
-    started inside a daily DagRun, and daily task instances that took the
-    refresh lane's pool (expected 0)."""
+    """One row ``history_during_daily|daily_in_refresh_pool|daily_in_history_pool``:
+    history scope attempts started in ``[t0_utc, t1_utc)`` inside a daily
+    DagRun, and daily attempts that held the refresh or the history pool at
+    any moment of the window (started before it included; expected 0)."""
 
     _check(t0_utc, t1_utc)
-    window = (
-        f"t.start_date >= '{t0_utc}'::timestamptz "
-        f"AND t.start_date < '{t1_utc}'::timestamptz"
+    started_in_window = (
+        f"a.start_date >= '{t0_utc}'::timestamptz "
+        f"AND a.start_date < '{t1_utc}'::timestamptz"
     )
+    held_in_window = (
+        f"a.start_date < '{t1_utc}'::timestamptz "
+        f"AND coalesce(a.end_date, now()) > '{t0_utc}'::timestamptz"
+    )
+    daily = _attempts(f"dag_id = '{DAILY_DAG_ID}' AND start_date IS NOT NULL")
     return (
         "SELECT ("
-        "SELECT count(*) FROM task_instance t "
-        f"WHERE t.dag_id = '{HISTORY_DAG_ID}' "
-        f"AND t.task_id = '{HISTORY_SCOPE_TASK_ID}' AND {window} "
+        "SELECT count(*) FROM ("
+        + _attempts(f"dag_id = '{HISTORY_DAG_ID}' AND task_id = '{HISTORY_SCOPE_TASK_ID}'")
+        + f") a WHERE {started_in_window} "
         "AND EXISTS (SELECT 1 FROM dag_run d "
         f"WHERE d.dag_id = '{DAILY_DAG_ID}' AND d.start_date IS NOT NULL "
-        "AND t.start_date >= d.start_date "
-        "AND t.start_date < coalesce(d.end_date, now()))"
+        "AND a.start_date >= d.start_date "
+        "AND a.start_date < coalesce(d.end_date, now()))"
         "), ("
-        "SELECT count(*) FROM task_instance t "
-        f"WHERE t.dag_id = '{DAILY_DAG_ID}' AND t.pool = '{REFRESH_POOL}' "
-        f"AND {window}"
+        f"SELECT count(*) FROM ({daily}) a WHERE a.pool = '{REFRESH_POOL}' AND {held_in_window}"
+        "), ("
+        f"SELECT count(*) FROM ({daily}) a WHERE a.pool = '{HISTORY_POOL}' AND {held_in_window}"
         ")"
     )
 
@@ -119,12 +149,13 @@ class PoolWait(NamedTuple):
     wait_max_s: float
     history_during_daily: int
     daily_in_refresh_pool: int
+    daily_in_history_pool: int
 
     @property
     def verdict(self) -> str:  # "ok" | "wait" | "no_data"
         if self.runs == 0:
             return "no_data"
-        if self.waiting_runs or self.daily_in_refresh_pool:
+        if self.waiting_runs or self.daily_in_refresh_pool or self.daily_in_history_pool:
             return "wait"
         return "ok"
 
@@ -140,10 +171,10 @@ def parse_rows(wait_out: str, overlap_out: str) -> PoolWait:
     """``psql -tA`` outputs of :func:`pool_wait_sql` and :func:`lane_overlap_sql`."""
 
     runs, waiting, wait_sum, wait_max = _fields(wait_out, 4)
-    during, in_pool = _fields(overlap_out, 2)
+    during, in_refresh, in_history = _fields(overlap_out, 3)
     return PoolWait(
         int(runs), int(waiting), float(wait_sum), float(wait_max),
-        int(during), int(in_pool),
+        int(during), int(in_refresh), int(in_history),
     )
 
 
@@ -154,11 +185,12 @@ def _minutes(seconds: float) -> str:
 
 def format_line(wait: PoolWait) -> str:
     """The morning-report line; ✅ only when no refresh run waited and no
-    daily task instance took the refresh pool."""
+    daily task instance took the refresh or the history pool."""
 
     tail = (
         f"история во время дейли: {wait.history_during_daily} скоупов · "
-        f"дейли в пуле актуалки: {wait.daily_in_refresh_pool}"
+        "дейли в пулах актуалки/истории: "
+        f"{wait.daily_in_refresh_pool}/{wait.daily_in_history_pool}"
     )
     if wait.verdict == "no_data":
         return f"ожидание пула актуалкой: ⚠️ нет прогонов · {tail}"

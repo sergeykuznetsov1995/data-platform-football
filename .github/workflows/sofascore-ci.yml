@@ -71,7 +71,7 @@ jobs:
           python -m pip install --disable-pip-version-check \
             pytest "ruff==0.15.20" pandas numpy pyarrow trino requests PyYAML jinja2 \
             jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
-            rapidfuzz Unidecode nicknames "sqlglot==30.12.0"
+            rapidfuzz Unidecode nicknames "sqlglot==30.12.0" "duckdb==1.5.4"
 
       - name: Static checks
         run: |
