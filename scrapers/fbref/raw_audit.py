@@ -204,6 +204,7 @@ def _list_s3_pages(
 
     token: str | None = None
     start_after: str | None = None
+    seen_tokens: set[str] = set()
     while True:
         request: dict[str, Any] = {
             "Bucket": bucket,
@@ -219,6 +220,9 @@ def _list_s3_pages(
         yield contents
         if page.get("IsTruncated") and page.get("NextContinuationToken"):
             token = str(page["NextContinuationToken"])
+            if token in seen_tokens:
+                raise RawAuditError("S3 raw listing repeated a continuation token")
+            seen_tokens.add(token)
             continue
         token = None
         if len(contents) < _S3_LIST_PAGE_SIZE:

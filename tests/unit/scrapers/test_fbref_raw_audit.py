@@ -838,11 +838,25 @@ def test_s3_inventory_resumes_full_page_that_claims_not_truncated(
         {"Key": "raw/targets-v2/competition/1.json", "Size": 2,
          "LastModified": modified, "ETag": '"c1"'}
     ]
+    responses = iter(
+        [
+            {"Contents": full_page, "IsTruncated": False},
+            {"Contents": tail, "IsTruncated": False},
+        ]
+    )
     client = MagicMock()
-    client.list_objects_v2.side_effect = [
-        {"Contents": full_page, "IsTruncated": False},
-        {"Contents": tail, "IsTruncated": False},
-    ]
+    client.list_objects_v2.side_effect = lambda **_: next(responses)
+
+    def paginate(**kwargs):
+        # boto3 paginator semantics: stop as soon as IsTruncated is false.
+        while True:
+            page = client.list_objects_v2(**kwargs)
+            yield page
+            if not page.get("IsTruncated"):
+                return
+            kwargs["ContinuationToken"] = page["NextContinuationToken"]
+
+    client.get_paginator.return_value.paginate.side_effect = paginate
     monkeypatch.setattr(
         raw_audit_module, "_s3_list_client", lambda: client
     )
@@ -878,6 +892,21 @@ def test_s3_inventory_fails_when_listing_stops_advancing(monkeypatch):
     )
 
     with pytest.raises(RawAuditError, match="stopped advancing"):
+        list(raw_audit_module._walk_s3_raw_files(MagicMock(root="bucket/raw")))
+
+
+def test_s3_inventory_fails_on_repeated_continuation_token(monkeypatch):
+    client = MagicMock()
+    client.list_objects_v2.return_value = {
+        "Contents": [],
+        "IsTruncated": True,
+        "NextContinuationToken": "same",
+    }
+    monkeypatch.setattr(
+        raw_audit_module, "_s3_list_client", lambda: client
+    )
+
+    with pytest.raises(RawAuditError, match="repeated a continuation token"):
         list(raw_audit_module._walk_s3_raw_files(MagicMock(root="bucket/raw")))
 
 def test_audit_reuses_baseline_hashes_then_uses_metadata_guard(
