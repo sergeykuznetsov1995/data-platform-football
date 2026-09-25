@@ -143,7 +143,7 @@ def test_non_numeric_cell_fails_closed(riverplate_html):
 
 @pytest.mark.parametrize("old, new", [
     ("<th>Elo %</th><th>FT</th>", "<th>FT</th><th>Elo %</th>"),  # swapped columns
-    ("<th>New Elo</th>", "<th>Elo</th>"),  # renamed column
+    ("<th>P</th>", "<th>Pen</th>"),  # renamed column
 ])
 def test_match_headers_must_match_exactly(riverplate_html, old, new):
     assert old in riverplate_html
