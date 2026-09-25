@@ -54,6 +54,12 @@ MODEL_VERSION = "web-2026"
 SOURCE = "clubelo_html"
 CLOSED_STATUSES = frozenset({"done", "no_page"})
 DEFAULT_BATCH_SIZE = 200
+# A club without a page answers exactly "302 → /" (fixture lsapi-2483). Any
+# other redirect is unexpected: failed, never a closing no_page (Sol r1 #2).
+NO_PAGE_LOCATIONS = frozenset({"/", "https://clubelo.com/"})
+# /Ranking links 498 club pages (24–25.09.2026). A truncated but well-formed
+# page must not pass for a complete queue and close the history (Sol r1 #5).
+MIN_QUEUE = 400
 MAX_REPORTED_FAILURES = 50
 
 _META = [
@@ -288,6 +294,8 @@ class _Run:
         raw = self._raw_row(page)
         self.store.append(RAW_TABLE, [raw])
         self.rating_date, slugs = parse_ranking_slugs(gzip.decompress(raw["body"]).decode("utf-8"))
+        if len(slugs) < MIN_QUEUE:
+            raise LayoutChanged(f"/Ranking links {len(slugs)} club pages, expected >= {MIN_QUEUE}")
         self.result["rating_date"] = self.rating_date.isoformat()
         return slugs
 
@@ -298,8 +306,12 @@ class _Run:
             self._fail(slug, str(exc))
             return
         if 300 <= page.status < 400:
-            # A club without a page answers 302 → '/': no_page, never followed.
             self.result["redirects"] += 1
+            if page.status != 302 or page.location not in NO_PAGE_LOCATIONS:
+                self._fail(slug, f"unexpected redirect HTTP {page.status} to {page.location}",
+                           http_status=page.status, fetched_at=page.fetched_at)
+                return
+            # A club without a page answers 302 → '/': no_page, never followed.
             self.result["no_page"] += 1
             self._manifest(
                 slug,

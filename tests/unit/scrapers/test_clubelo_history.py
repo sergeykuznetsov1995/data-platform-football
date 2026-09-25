@@ -22,6 +22,7 @@ from tests.unit.scrapers.clubelo_fakes import (
     MemoryStore,
     fixture_html,
     fixture_response,
+    gzip_response,
     network_error,
     no_sleep,
     redirect_response,
@@ -272,3 +273,30 @@ def test_store_frames_survive_the_real_arrow_conversion(extra):
         assert aligned.num_rows == len(frame)
         if table == history.MANIFEST_TABLE:
             assert aligned.column("first_point").type == pa.date32()
+
+
+@pytest.mark.parametrize("response", [
+    FakeResponse(307, b"", {"location": "/"}),
+    FakeResponse(301, b"", {"location": "/Arsenal/"}),
+    FakeResponse(302, b"", {"location": "/login/"}),
+])
+def test_unexpected_redirect_is_failed_not_closed(response):
+    result, store, _, _ = _run(_answers(**{"/Arsenal": response}), CLUBS)
+    manifest = {r["slug"]: r for r in _manifest_new(store)}
+    assert manifest["Arsenal"]["status"] == "failed"
+    assert (result["redirects"], result["no_page"], result["pages_failed"]) == (1, 0, 1)
+    assert result["pending_after"] == 1 and history.exit_code(result) == 1
+    assert "Arsenal" not in history.closed_from_manifest(store.rows(history.MANIFEST_TABLE))
+
+
+def test_truncated_ranking_does_not_close_the_history():
+    html = fixture_html("Ranking.html.gz")
+    # keep the first country section only: well-formed, but far too few clubs
+    head = html.index('<div class="accordion-item"><div class="accordion-header"> <a href="GER">')
+    second = html.index('<div class="accordion-item"><div class="accordion-header">', head + 10)
+    truncated = html[:second] + "</div></div></body></html>"
+    assert 0 < len(parse_ranking_slugs(truncated)[1]) < history.MIN_QUEUE
+    result, store, session, _ = _run({"/Ranking": gzip_response(truncated)}, CLUBS)
+    assert "expected >= 400" in result["error"]
+    assert [c["path"] for c in session.calls] == ["/Ranking"]
+    assert _manifest_new(store) == [] and history.exit_code(result) == 1
