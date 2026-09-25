@@ -674,6 +674,11 @@ def parse_results(html: str) -> ResultsPage:
         rows.append(row)
     if not rows:
         raise LayoutChanged("C5 results table has no rows")
+    if not any(row["home_slug"] or row["away_slug"] for row in rows):
+        # 50/63 teams are linked on 24.09: no link at all = the link markup
+        # changed and every key would silently become "~CC:Name", so the MERGE
+        # would add a second copy of each match (Sol r2 log)
+        raise LayoutChanged("C7 results table has no club links")
     if not separators:
         # the ~3-day window always has older dates; without separators every
         # row would get the h1 date (Sol r1 #6)

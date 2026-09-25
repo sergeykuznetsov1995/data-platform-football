@@ -384,6 +384,11 @@ def test_results_duplicate_key_keeps_first(results_html):
     assert page.rows[1]["row_seq"] == 2  # the page order is kept
 
 
+def test_results_without_club_links_fail_closed(results_html):
+    with pytest.raises(LayoutChanged, match="C7 results table has no club links"):
+        parse_results(results_html.replace('class="max640"', 'class="compact-code"'))
+
+
 def test_results_without_date_separators_fail_closed(results_html):
     # Sol r1 #6: every row would get the h1 date
     broken = re.sub(r'<tr><td class="l" colspan="3">[^<]*</td></tr>', "", results_html)
