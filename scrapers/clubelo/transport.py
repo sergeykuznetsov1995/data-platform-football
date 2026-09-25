@@ -30,6 +30,7 @@ import hashlib
 import logging
 import re
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -175,7 +176,13 @@ class ClubEloTransport:
                 last_error = f"HTTP {status}"
                 logger.warning("ClubElo %s attempt %d: HTTP %d", path, attempt + 1, status)
                 continue
-            return _page(path, status, headers, wire)
+            try:
+                return _page(path, status, headers, wire)
+            except (OSError, EOFError, zlib.error) as exc:
+                # A truncated/corrupt gzip body is a transfer error: retry it.
+                last_error = f"broken gzip body: {type(exc).__name__}: {exc}"
+                logger.warning("ClubElo %s attempt %d: %s", path, attempt + 1, last_error)
+                continue
         raise ClubEloFetchError(f"{path}: {last_error} after {self.retries + 1} attempts")
 
 

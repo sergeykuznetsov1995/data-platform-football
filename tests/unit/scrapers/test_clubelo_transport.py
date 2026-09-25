@@ -161,3 +161,13 @@ def test_unexpected_encoding_is_a_fetch_error():
     session = FakeSession({"/login/": FakeResponse(200, b"xx", {"content-encoding": "br"})})
     with pytest.raises(ClubEloFetchError, match="content-encoding"):
         _transport(session).get("/login/")
+
+
+def test_truncated_gzip_is_retried_then_a_fetch_error():
+    wire = (FIXTURE_DIR / "club_riverplate.html.gz").read_bytes()[:1000]
+    session = FakeSession({"/riverplate": [FakeResponse(200, wire, {"content-encoding": "gzip"})
+                                           for _ in range(3)]})
+    transport = _transport(session)
+    with pytest.raises(ClubEloFetchError, match="broken gzip"):
+        transport.get("/riverplate")
+    assert transport.requests == 3 and transport.wire_bytes == 3000
