@@ -673,3 +673,49 @@ def test_stale_match_that_core_reports_played_is_written_with_its_summary(tmp_pa
         "STATUS_FULL_TIME", True, 2, 0
     )
     assert row["lineup_state"] == "captured"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"events": []}',  # no root league: the body itself is broken
+        b"[]",  # not an object
+        # An event no league owns cannot be attributed to a tournament.
+        json.dumps({"leagues": [{}], "events": [{"id": "1", "uid": "s:600~e:1"}]}).encode(),
+    ],
+)
+def test_broken_day_body_fails_the_plan_instead_of_an_empty_day(tmp_path, body) -> None:
+    from scrapers.espn.parser_common import EspnParseError
+
+    _state_path(tmp_path)
+    client = FakeClient(_responses(body, _day()))
+
+    with pytest.raises(EspnParseError):
+        _plan(client, WaveTrino(), tmp_path)
+
+
+@pytest.mark.unit
+def test_failed_status_check_reds_the_tournament_after_its_matches_publish(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    yesterday = json.loads(_first_day()[0])
+    for event in yesterday["events"]:
+        if int(event["id"]) == 900003:
+            event["date"] = "2026-09-24T22:00Z"  # kickoff changed: planned again
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = _day(
+        *[e for e in yesterday["events"] if int(e["id"]) != 900002]
+    )
+    client.responses[_req_key(urls.event_status("eng.1", 900002))] = HttpStatusError(503, "busy")
+
+    plan = _plan(client, trino, tmp_path)
+    (outcome,) = _run(plan, client, trino)
+
+    (work,) = plan.works
+    assert (work.slug, work.event_ids, work.error) == (
+        "eng.1", (900003,), "status of 900002: HttpStatusError: busy"
+    )
+    assert outcome["state"] == wave.RED
+    assert outcome["first_error"] == "WavePlanError: status of 900002: HttpStatusError: busy"
+    rows = _matches(trino)
+    assert rows[900003]["kickoff"] == datetime(2026, 9, 24, 22)
+    assert rows[900002]["disposition"] is None  # left unmarked, checked again next wave

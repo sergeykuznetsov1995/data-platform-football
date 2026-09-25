@@ -477,10 +477,12 @@ def split_day(
 ) -> tuple[dict[str, list[ScheduleRow]], dict[str, str]]:
     """Rows of one ``all/scoreboard`` day per target slug, and parse errors per slug.
 
-    The day parser fails the whole body on one broken event; then each target's
-    events are parsed on their own, so one broken tournament is red and the
-    rest of the day stays usable.  Events without a league in their ``uid``
-    cannot belong to a tournament and are dropped with a warning.
+    The day parser fails the whole body on one broken event.  When the body
+    itself is sound (one root league, an event list, every event bound to a
+    league by its ``uid``), each target's events are then parsed on their own:
+    only the tournament that owns the broken event is red.  A broken body or
+    an event no league owns keeps the whole-day error — nothing can be
+    attributed, so nothing is compared.
     """
 
     try:
@@ -488,18 +490,27 @@ def split_day(
         return {slug: list(rows) for slug, rows in parsed.items()}, {}
     except EspnParseError as exc:
         whole = exc
-    document = json.loads(body)
+    try:
+        document = json.loads(body)
+    except ValueError:
+        raise whole from None
+    leagues = document.get("leagues") if isinstance(document, dict) else None
     events = document.get("events") if isinstance(document, dict) else None
-    if not isinstance(events, list):
+    if (
+        not isinstance(leagues, list)
+        or len(leagues) != 1
+        or not isinstance(leagues[0], dict)
+        or not isinstance(events, list)
+    ):
         raise whole
     groups: dict[int, list[Any]] = {}
     for event in events:
+        if isinstance(event, dict) and not event:
+            continue  # the parser skips a bare {} too
         uid = event.get("uid") if isinstance(event, dict) else None
         match = _ALL_UID.match(uid) if isinstance(uid, str) else None
         if match is None:
-            if event:
-                logger.warning("all/scoreboard %s: event without league uid dropped", day)
-            continue
+            raise whole
         if int(match.group(1)) in targets:
             groups.setdefault(int(match.group(1)), []).append(event)
     rows: dict[str, list[ScheduleRow]] = {c.slug: [] for c in targets.values()}
@@ -569,13 +580,15 @@ def _changed(row: ScheduleRow, stored: BronzeMatch | None) -> bool:
     )
 
 
-def check_presence(client, stored: BronzeMatch) -> tuple[str | None, str | None]:
-    """``(presence, new status)`` of a known match no fetched day lists.
+def check_presence(
+    client, stored: BronzeMatch
+) -> tuple[str | None, str | None, str | None]:
+    """``(presence, new status, error)`` of a known match no fetched day lists.
 
     404 -> WITHDRAWN; any status answer -> MOVED, with the status when it
     differs from the stored one and is in the status map (a played final is
-    then written with its Summary).  Another failure leaves the match
-    unmarked: ``(None, None)``.
+    then written with its Summary).  Any other failure leaves the match
+    unmarked and names the error: its tournament is red in the wave.
     """
 
     request = urls.event_status(stored.competition_slug, stored.event_id)
@@ -583,17 +596,13 @@ def check_presence(client, stored: BronzeMatch) -> tuple[str | None, str | None]
         status = parse_event_status(_fetch(client, request, force_refresh=True).json_data)
     except HttpStatusError as exc:
         if exc.status == 404:
-            return WITHDRAWN, None
-        logger.warning("ESPN status of %s: HTTP %s", stored.event_id, exc.status)
-        return None, None
+            return WITHDRAWN, None, None
+        return None, None, f"status of {stored.event_id}: HttpStatusError: {exc}"
     except _STATUS_ERRORS as exc:
-        logger.warning(
-            "ESPN status of %s: %s: %s", stored.event_id, type(exc).__name__, exc
-        )
-        return None, None
+        return None, None, f"status of {stored.event_id}: {type(exc).__name__}: {exc}"
     if status == stored.status or status not in STATUS_MAP:
-        return MOVED, None
-    return MOVED, status
+        return MOVED, None, None
+    return MOVED, status, None
 
 
 def _error_work(
@@ -713,8 +722,13 @@ def plan_wave(
             if event_id in stale_ids and event_id not in found
             and event_id not in {item.event_id for item in absent}
         )
+    status_errors: dict[str, str] = {}
     for match in absent:
-        mark, status = check_presence(client, match)
+        mark, status, error = check_presence(client, match)
+        if error is not None:
+            logger.warning("ESPN %s: %s", match.competition_slug, error)
+            status_errors.setdefault(match.competition_slug, error)
+            continue
         if mark is None or (mark == match.disposition and status is None):
             continue
         if status is not None:
@@ -745,8 +759,17 @@ def plan_wave(
                 topup_days=tuple(topup),
                 presence={key: presence[key] for key in sorted(ids) if key in presence},
                 statuses={key: statuses[key] for key in sorted(ids) if key in statuses},
+                # A failed status check: the planned matches still publish,
+                # then the tournament is red with that error.
+                error=status_errors.get(slug),
             )
         )
+    planned = {work.slug for work in works}
+    works.extend(
+        _error_work(by_slug[slug], snapshot, days, error)
+        for slug, error in sorted(status_errors.items())
+        if slug not in planned
+    )
     logger.info(
         "ESPN wave plan: %d tournament(s) (%d red at planning), %d match(es), "
         "%d status check(s), days %s",
@@ -858,7 +881,7 @@ def run_tournament(
     red); Summary shapes never raise — they are dispositions.
     """
 
-    if work.error is not None:
+    if work.error is not None and not work.event_ids:
         raise WavePlanError(work.error)
     failure: BaseException | None = None
     try:
@@ -924,6 +947,9 @@ def run_tournament(
                 raise
             # The tournament's own error is the one to report.
             logger.exception("ESPN request journal of %s not written", work.slug)
+    if work.error is not None:
+        # Its planned matches are written; the tournament is still red.
+        raise WavePlanError(work.error)
     dispositions = Counter(
         payload.summary.disposition.value if payload.summary is not None else payload.presence
         for payload in payloads
