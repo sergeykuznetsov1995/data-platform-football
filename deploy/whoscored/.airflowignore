@@ -1,0 +1,18 @@
+# Контур WhoScored (#1017/#1473): белый список DagBag — ТОЛЬКО два DAG:
+#   dag_ingest_whoscored.py, dag_backfill_whoscored.py
+# Файл лежит копией в <runtime>/dags/ (каталог смонтирован в /opt/airflow/dags); копирует
+# deploy/whoscored/auto_deliver.sh вместе с двумя DAG. Файловый bind-mount не используем:
+# checkout меняет инод, и маунт молча остаётся на старом файле (мина #1263).
+#
+# Движок — RE2 (airflow/utils/file.py, Airflow 2.11): negative lookahead нет, поэтому
+# «всё, кроме двух имён» записано дополнением: строка 1 — имя расходится с общим
+# префиксом dag_ (или короче его), строки 2 и 4 — расходится/обрывается внутри одного
+# из двух имён, строки 3 и 5 — длиннее имени (.bak, .pyc, ~ …). Каталоги (__pycache__,
+# подпапки) тоже ловит строка 1 или 2–5. Символ решётки в шаблонах нельзя —
+# Airflow срезает всё после него как комментарий. Сгенерировано и проверено перебором
+# мутаций имён на google-re2 при #1473; при смене имён DAG — перегенерировать.
+^(?:$|[^d]|d$|d[^a]|da$|da[^g]|dag$|dag[^_]|dag_$|dag_[^bi])
+^dag_i(?:$|[^n]|n$|n[^g]|ng$|ng[^e]|nge$|nge[^s]|nges$|nges[^t]|ngest$|ngest[^_]|ngest_$|ngest_[^w]|ngest_w$|ngest_w[^h]|ngest_wh$|ngest_wh[^o]|ngest_who$|ngest_who[^s]|ngest_whos$|ngest_whos[^c]|ngest_whosc$|ngest_whosc[^o]|ngest_whosco$|ngest_whosco[^r]|ngest_whoscor$|ngest_whoscor[^e]|ngest_whoscore$|ngest_whoscore[^d]|ngest_whoscored$|ngest_whoscored[^\.]|ngest_whoscored\.$|ngest_whoscored\.[^p]|ngest_whoscored\.p$|ngest_whoscored\.p[^y])
+^dag_ingest_whoscored\.py.
+^dag_b(?:$|[^a]|a$|a[^c]|ac$|ac[^k]|ack$|ack[^f]|ackf$|ackf[^i]|ackfi$|ackfi[^l]|ackfil$|ackfil[^l]|ackfill$|ackfill[^_]|ackfill_$|ackfill_[^w]|ackfill_w$|ackfill_w[^h]|ackfill_wh$|ackfill_wh[^o]|ackfill_who$|ackfill_who[^s]|ackfill_whos$|ackfill_whos[^c]|ackfill_whosc$|ackfill_whosc[^o]|ackfill_whosco$|ackfill_whosco[^r]|ackfill_whoscor$|ackfill_whoscor[^e]|ackfill_whoscore$|ackfill_whoscore[^d]|ackfill_whoscored$|ackfill_whoscored[^\.]|ackfill_whoscored\.$|ackfill_whoscored\.[^p]|ackfill_whoscored\.p$|ackfill_whoscored\.p[^y])
+^dag_backfill_whoscored\.py.

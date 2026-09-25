@@ -1,0 +1,60 @@
+# Выделенный FlareSolverr для изолированного WhoScored (#1017; в master с #1473).
+# Перенесено 1:1 из живого /root/whoscored-1017-runtime/whoscored-gw.compose.yaml (25.09.2026).
+# Отдельный compose-проект по п.3 SHARED-STACK-PROTOCOL: чужой `docker compose up`
+# его не пересоздаёт. Общий контейнер `flaresolverr` (сеть dp-backend, проект
+# data-platform, поднят из /root/dpf-whoscored-engine29) НЕ используется — он
+# делится с fbref/sofifa и принадлежит чужому дереву.
+#
+# Образ уже локально; его расширение байт-в-байт == master scripts/flaresolverr_extended.py
+# (sha256 6a37011652dbb9e7b7b9edcbac2457b23b7ea2c0fad6d5b913ad3a5b37adc2d5).
+# direct_only использует POST /v1/xhr — ванильный flaresolverr:v3.4.6 не подходит.
+# Конфигурация (read_only + tmpfs + user 1000) зеркалит рабочий контейнер.
+#
+# Запуск:
+#   docker compose -p whoscored-gw \
+#     -f ${WHOSCORED_RUNTIME_DIR}/src/deploy/whoscored/gw.compose.yaml up -d --no-deps whoscored_flaresolverr
+name: whoscored-gw
+
+services:
+  whoscored_flaresolverr:
+    image: 127.0.0.1:5000/ws954/flaresolverr-whoscored@sha256:95343000456a5b2cc962cb2de376bfecf5803fb6d7390637f199ccbe8a5cf70c
+    pull_policy: never
+    container_name: whoscored_flaresolverr
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770
+      - /config:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700
+      - /app/.config:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
+      - /app/.local:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+      - seccomp=builtin
+    cap_drop:
+      - ALL
+    cap_add: []
+    # Порт наружу НЕ публикуем: 127.0.0.1:8191 занят общим flaresolverr.
+    # Доступ — только по имени whoscored_flaresolverr в сети whoscored-net.
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      TZ: UTC
+    shm_size: "1g"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits: {memory: 4G}
+        reservations: {memory: 512M}
+    networks: [whoscored-net]
+
+networks:
+  whoscored-net:
+    external: true
+    name: whoscored-net
