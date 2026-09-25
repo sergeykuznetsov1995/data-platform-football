@@ -1,4 +1,4 @@
-"""Orchestration contract of ``dag_espn_current`` (#1504).
+"""Orchestration contract of ``dag_espn_current`` (#1504, wave log #1505).
 
 The DAG file lives in ``deploy/espn/dags/`` (the espn-airflow DAG folder,
 #1507), so it is imported by path under the Airflow stubs of this package.
@@ -84,7 +84,36 @@ def _outcome(slug, state="green", error=None):
 
 def _context(instances):
     dag_run = SimpleNamespace(get_task_instances=lambda: instances, start_date=None)
-    return {"dag_run": dag_run, "ti": _SummaryTI(instances)}
+    return {"dag_run": dag_run, "ti": _SummaryTI(instances), "run_id": "scheduled__x"}
+
+
+class _LogConn:
+    """Trino connection of the wave log: records the statements."""
+
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+
+    def cursor(self):
+        conn = self
+
+        class _Cursor:
+            def execute(self, sql):
+                conn.sql.append(sql)
+
+            def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+        return _Cursor()
+
+
+@pytest.fixture(autouse=True)
+def log_conn(dag_module, monkeypatch):
+    conn = _LogConn()
+    monkeypatch.setattr(dag_module, "_trino", lambda: SimpleNamespace(connection=conn))
+    return conn
 
 
 @pytest.mark.unit
@@ -107,3 +136,49 @@ def test_wave_summary_is_red_when_the_plan_failed(dag_module) -> None:
 
     with pytest.raises(AirflowException, match="plan_wave: failed"):
         dag_module.wave_summary(**_context(instances))
+
+
+@pytest.mark.unit
+def test_prepare_creates_the_wave_log_table(dag_module, log_conn, monkeypatch) -> None:
+    import scrapers.base.iceberg_writer as iceberg_writer
+    import scrapers.espn.bronze_schema as bronze_schema
+
+    monkeypatch.setattr(iceberg_writer, "IcebergWriter", lambda: None)
+    monkeypatch.setattr(bronze_schema, "ensure_bronze_tables", lambda writer: None)
+
+    dag_module.prepare()
+
+    assert any(
+        "CREATE TABLE IF NOT EXISTS iceberg.ops.espn_wave_tournament_v1" in sql
+        for sql in log_conn.sql
+    )
+
+
+@pytest.mark.unit
+def test_wave_summary_writes_the_log_before_a_red_wave_fails(dag_module, log_conn) -> None:
+    from airflow.exceptions import AirflowException
+
+    instances = [_TI("plan_wave", "success")] + [
+        _TI("run_tournament", "failed", i, _outcome(f"x.{i}", "red", "RuntimeError: boom"))
+        for i in range(2)
+    ] + [_TI("run_tournament", "success", 2, _outcome("x.2"))]
+
+    with pytest.raises(AirflowException, match="ESPN wave red"):
+        dag_module.wave_summary(**_context(instances))
+
+    (insert,) = [sql for sql in log_conn.sql if sql.startswith("INSERT")]
+    assert insert.startswith("INSERT INTO iceberg.ops.espn_wave_tournament_v1 (run_id, ")
+    assert "'scheduled__x'" in insert
+    assert "'(wave)', NULL, 'red', 3, '2 of 3 tournaments red (> 20%)'" in insert
+    assert "'x.0', 2026, 'red', 1, 'RuntimeError: boom'" in insert
+    assert "'x.2', 2026, 'green', 1, NULL" in insert
+
+
+@pytest.mark.unit
+def test_wave_summary_writes_the_log_of_a_green_wave(dag_module, log_conn) -> None:
+    instances = [_TI("plan_wave", "success"), _TI("run_tournament", "success", 0, _outcome("x.0"))]
+
+    dag_module.wave_summary(**_context(instances))
+
+    (insert,) = [sql for sql in log_conn.sql if sql.startswith("INSERT")]
+    assert "'(wave)', NULL, 'green', 1, NULL" in insert

@@ -14,6 +14,15 @@ core answers -> ``moved`` (new kickoff when another fetched day lists it, the
 old one otherwise — ``competitions/{id}/status`` carries no date).  The wave
 counts them and warns above ``ESPN_WITHDRAWN_ALERT``; it never stops on them.
 
+Freshness meter (#1505): every match row carries ``status_checked_at`` (when
+its status was read) and ``first_published_at`` (carried from the stored row,
+never moved by a republication).  A match that is not a played final and
+whose stored status predates kickoff + 2 h is written once more with a day
+status read after that moment.  The 00 wave also reads the core event list
+of every live tournament for the last three ESPN days: an event core lists
+that neither bronze nor the fetched days have is taken from its league day
+(``topup_days`` of its tournament) and planned like any other match.
+
 Pure functions: the client (``EspnHttpClient``), Trino (``TrinoTableManager``)
 and the journal connection come in as parameters, the DAG is a thin shell.
 """
@@ -21,7 +30,7 @@ and the journal connection come in as parameters, the DAG is a thin shell.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 import json
 import logging
@@ -33,7 +42,7 @@ from . import editions_store, urls
 from .bronze_rows import MOVED, PENDING, PRESENCE_VALUES, WITHDRAWN, MatchPayload, RawRef
 from .bronze_schema import BRONZE_DATABASE, MATCH_TABLE
 from .bronze_writer import TournamentBatch, write_tournament_batch
-from .core_lists import parse_event_status
+from .core_lists import collect_refs, event_ids as core_event_ids, parse_event_status
 from .denominator import DenominatorRow
 from .editions import EditionState
 from .journal import flush_journal, journal_rows
@@ -75,6 +84,10 @@ RED_SHARE = 0.20
 # all/scoreboard has no count: exactly this many events means it was cut.
 ALL_DAY_LIMIT = 1000
 STALE_AFTER = timedelta(days=3)
+# A match ends ~2 h after kickoff: a status read before that is not final (#1505).
+RECHECK_AFTER = timedelta(hours=2)
+# The 00 wave compares the core event list of the last CORE_DAYS ESPN days.
+CORE_DAYS = 3
 GREEN = "green"
 RED = "red"
 _MATCH = f"iceberg.{BRONZE_DATABASE}.{MATCH_TABLE}"
@@ -185,6 +198,8 @@ _MATCH_COLUMNS = (
     "raw_uri",
     "raw_sha256",
     "_source_fetched_at",
+    "first_published_at",
+    "status_checked_at",
 )
 
 
@@ -227,12 +242,16 @@ class BronzeMatch:
     raw_uri: str
     raw_sha256: str
     source_fetched_at: datetime
+    first_published_at: datetime | None = None
+    status_checked_at: datetime | None = None
 
     @classmethod
     def from_row(cls, row: Sequence[Any]) -> "BronzeMatch":
         values = dict(zip(_MATCH_COLUMNS, row))
         values["source_fetched_at"] = values.pop("_source_fetched_at")
         values["kickoff"] = _aware(values["kickoff"])
+        if values["status_checked_at"] is not None:
+            values["status_checked_at"] = _aware(values["status_checked_at"])
         values["season_year"] = int(values["season_year"])
         values["event_id"] = int(values["event_id"])
         return cls(**values)
@@ -243,6 +262,13 @@ class BronzeMatch:
 
     def raw_ref(self) -> RawRef:
         return RawRef(self.raw_uri, self.raw_sha256, self.source_fetched_at)
+
+    def carried(self, payload: MatchPayload) -> MatchPayload:
+        """``payload`` with the stored ``first_published_at`` carried over."""
+
+        if self.first_published_at is None:
+            return payload
+        return replace(payload, first_published_at=self.first_published_at)
 
     def schedule_row(
         self,
@@ -389,6 +415,9 @@ class TournamentWork:
     presence: Mapping[int, str] = field(default_factory=dict)
     # event_id -> status from core for a match no fetched day lists.
     statuses: Mapping[int, str] = field(default_factory=dict)
+    # event_id -> ISO time core answered the status of a match no fetched
+    # day lists (``status_checked_at`` of its row).
+    checked_at: Mapping[int, str] = field(default_factory=dict)
     # Set when planning already failed for this tournament: the mapped task
     # turns it red with this first error, its neighbours still publish.
     error: str | None = None
@@ -416,6 +445,7 @@ class TournamentWork:
             "topup_days": [day.isoformat() for day in self.topup_days],
             "presence": {str(key): value for key, value in sorted(self.presence.items())},
             "statuses": {str(key): value for key, value in sorted(self.statuses.items())},
+            "checked_at": {str(key): value for key, value in sorted(self.checked_at.items())},
             "error": self.error,
         }
 
@@ -434,6 +464,7 @@ class TournamentWork:
             topup_days=tuple(date.fromisoformat(item) for item in value["topup_days"]),
             presence={int(key): item for key, item in value["presence"].items()},
             statuses={int(key): item for key, item in value["statuses"].items()},
+            checked_at={int(key): item for key, item in value.get("checked_at", {}).items()},
             error=value.get("error"),
         )
 
@@ -537,20 +568,22 @@ def split_day(
 
 def _day_rows(
     client, targets: Mapping[int, Competition], day: date
-) -> tuple[dict[int, ScheduleRow], bool, dict[str, str]]:
+) -> tuple[dict[int, ScheduleRow], bool, dict[str, str], datetime]:
     """Rows of one day for every target; tops up by league when ``all`` is cut.
 
-    Returns the rows, whether the day was cut, and errors per slug.
+    Returns the rows, whether the day was cut, errors per slug and when the
+    ``all`` body was fetched (the moment its statuses were read).
     """
 
     result = _fetch(client, urls.all_scoreboard_day(day), force_refresh=True)
+    checked = _aware(datetime.fromisoformat(result.fetched_at))
     by_slug, errors = split_day(result.body, targets, day)
     rows: dict[int, ScheduleRow] = {}
     for group in by_slug.values():
         rows.update((row.event_id, row) for row in group)
     events = result.json_data.get("events") if isinstance(result.json_data, dict) else None
     if not isinstance(events, list) or len(events) < ALL_DAY_LIMIT:
-        return rows, False, errors
+        return rows, False, errors, checked
     logger.warning(
         "all/scoreboard %s returned %d events: topping up %d leagues",
         day,
@@ -569,13 +602,35 @@ def _day_rows(
             raise
         except _STATUS_ERRORS as exc:
             errors[competition.slug] = f"{type(exc).__name__}: {exc}"
-    return rows, True, errors
+    return rows, True, errors, checked
 
 
-def _changed(row: ScheduleRow, stored: BronzeMatch | None) -> bool:
+def _needs_recheck(
+    row: ScheduleRow, stored: BronzeMatch, checked_at: datetime | None
+) -> bool:
+    """A non-final match whose stored status predates kickoff + 2 h, seen after it.
+
+    Written once more so that ``status_checked_at`` shows the status after
+    the match should have ended (#1505); afterwards it is past that moment
+    and the match stays out of the wave until something changes.
+    """
+
+    if row.played_final or checked_at is None:
+        return False
+    due = _aware(row.kickoff) + RECHECK_AFTER
+    return checked_at >= due and (
+        stored.status_checked_at is None or stored.status_checked_at < due
+    )
+
+
+def _changed(
+    row: ScheduleRow, stored: BronzeMatch | None, checked_at: datetime | None = None
+) -> bool:
     if stored is None:
         return True
     if row.played_final and not stored.summary_captured:
+        return True
+    if _needs_recheck(row, stored, checked_at):
         return True
     home = row.home_score if row.played_final else None
     away = row.away_score if row.played_final else None
@@ -636,6 +691,43 @@ def _error_work(
     )
 
 
+def _core_missing(
+    client,
+    competition: Competition,
+    first: date,
+    last: date,
+    known: set[int],
+) -> tuple[dict[int, tuple[date, ScheduleRow, datetime]], list[int]]:
+    """Events core lists for ESPN days ``first..last`` that ``known`` lacks.
+
+    Each is looked up on its league day (a fresh read): returns the rows
+    found ``event_id -> (day, row, fetched_at)`` and the ids no league day
+    lists.  Core is the denominator of the freshness meter (R-09): the day
+    scoreboard is only what was downloaded.
+    """
+
+    slug = competition.slug
+    listed = core_event_ids(
+        collect_refs(
+            lambda page: _fetch(
+                client, urls.events_window(slug, first, last, page), force_refresh=True
+            ).body,
+            f"{slug} core events",
+        )
+    )
+    missing = set(listed) - known
+    found: dict[int, tuple[date, ScheduleRow, datetime]] = {}
+    day = first
+    while missing - set(found) and day <= last:
+        result = _fetch(client, urls.league_scoreboard_day(slug, day), force_refresh=True)
+        fetched = _aware(datetime.fromisoformat(result.fetched_at))
+        for row in _league_day_rows(result.body, competition, day):
+            if row.event_id in missing:
+                found[row.event_id] = (day, row, fetched)
+        day += timedelta(days=1)
+    return found, sorted(missing - set(found))
+
+
 def plan_wave(
     *,
     client,
@@ -644,12 +736,14 @@ def plan_wave(
     state_path: Path,
     now: datetime,
     check_stale: bool,
+    check_core: bool = False,
 ) -> WavePlan:
     """Tournament-seasons with something to write in this wave.
 
     A tournament whose planning failed (no edition, a broken day, a failed
     top-up) comes back as a work item with ``error``: red in the wave
-    summary, without touching its neighbours.
+    summary, without touching its neighbours.  ``check_core`` (the 00 wave)
+    adds the events of the core list no day and no bronze row has.
     """
 
     if now.tzinfo is None:
@@ -672,25 +766,61 @@ def plan_wave(
     }
 
     found: dict[int, tuple[date, ScheduleRow]] = {}
+    checked: dict[int, datetime] = {}
     topup: list[date] = []
     for day in days:
-        day_rows, cut, day_errors = _day_rows(client, targets, day)
+        day_rows, cut, day_errors, day_checked = _day_rows(client, targets, day)
         for slug, error in day_errors.items():
             errors.setdefault(slug, f"{day.isoformat()}: {error}")
         if cut:
             topup.append(day)
         # The later day wins a match both days list (its status is newer).
         found.update((event_id, (day, row)) for event_id, row in day_rows.items())
+        checked.update((event_id, day_checked) for event_id in day_rows)
     stored = {
         match.event_id: match
         for match in bronze_window(trino, days[0] - timedelta(days=1), days[-1] + timedelta(days=1))
     }
     # Only tournaments whose days were read completely are compared.
     usable = {slug for slug in by_slug if slug not in errors}
+    status_errors: dict[str, str] = {}
+    core_days: dict[str, set[date]] = {}
+    core_added = 0
+    if check_core:
+        first = today - timedelta(days=CORE_DAYS - 1)
+        for competition in sorted(targets.values(), key=lambda item: item.slug):
+            if competition.slug not in usable or not any(
+                edition.start_date <= today and edition.end_date >= first
+                for edition in competition.open_editions()
+            ):
+                continue
+            try:
+                added, unlisted = _core_missing(
+                    client, competition, first, today, set(found) | set(stored)
+                )
+            except AllOriginsBlocked:
+                raise
+            except _STATUS_ERRORS as exc:
+                status_errors.setdefault(
+                    competition.slug, f"core events: {type(exc).__name__}: {exc}"
+                )
+                continue
+            for event_id, (day, row, fetched) in added.items():
+                found[event_id] = (day, row)
+                checked[event_id] = fetched
+                core_days.setdefault(competition.slug, set()).add(day)
+            core_added += len(added)
+            if unlisted:
+                status_errors.setdefault(
+                    competition.slug,
+                    f"core lists {len(unlisted)} event(s) no league day has: "
+                    + ", ".join(str(event_id) for event_id in unlisted[:5]),
+                )
 
     event_ids: dict[tuple[str, int], set[int]] = {}
     presence: dict[int, str] = {}
     statuses: dict[int, str] = {}
+    checked_at: dict[int, str] = {}
 
     def add(slug: str, year: int, event_id: int) -> None:
         event_ids.setdefault((slug, year), set()).add(event_id)
@@ -699,7 +829,7 @@ def plan_wave(
         if row.competition_slug not in usable:
             continue
         known = stored.get(event_id)
-        if not _changed(row, known):
+        if not _changed(row, known, checked.get(event_id)):
             continue
         if (
             known is not None
@@ -731,7 +861,6 @@ def plan_wave(
             if event_id in stale_ids and event_id not in found
             and event_id not in {item.event_id for item in absent}
         )
-    status_errors: dict[str, str] = {}
     for match in absent:
         mark, status, error = check_presence(client, match)
         if error is not None:
@@ -740,6 +869,8 @@ def plan_wave(
             continue
         if mark is None or (mark == match.disposition and status is None):
             continue
+        if mark == MOVED:
+            checked_at[match.event_id] = _naive(now).isoformat()
         if status is not None:
             statuses[match.event_id] = status
         # A played final carries its Summary disposition, not a presence.
@@ -765,9 +896,10 @@ def plan_wave(
                 start=state.start,
                 end=state.end,
                 days=days,
-                topup_days=tuple(topup),
+                topup_days=tuple(sorted(set(topup) | core_days.get(slug, set()))),
                 presence={key: presence[key] for key in sorted(ids) if key in presence},
                 statuses={key: statuses[key] for key in sorted(ids) if key in statuses},
+                checked_at={key: checked_at[key] for key in sorted(ids) if key in checked_at},
                 # A failed status check: the planned matches still publish,
                 # then the tournament is red with that error.
                 error=status_errors.get(slug),
@@ -781,11 +913,12 @@ def plan_wave(
     )
     logger.info(
         "ESPN wave plan: %d tournament(s) (%d red at planning), %d match(es), "
-        "%d status check(s), days %s",
+        "%d status check(s), %d added from core, days %s",
         len(works),
         len(errors),
         sum(len(work.event_ids) for work in works),
         len(absent),
+        core_added,
         [day.isoformat() for day in days],
     )
     return WavePlan(tuple(works), days, tuple(topup), len(absent))
@@ -865,6 +998,10 @@ def _absent_payload(
     Summary header, since no day lists the match.
     """
 
+    checked = work.checked_at.get(known.event_id)
+    status_checked_at = (
+        datetime.fromisoformat(checked) if checked is not None else known.status_checked_at
+    )
     status = work.statuses.get(known.event_id)
     if status is not None and STATUS_MAP[status].played_final:
         result = _fetch(client, urls.summary(work.slug, known.event_id), force_refresh=False)
@@ -874,11 +1011,19 @@ def _absent_payload(
             parsed = parse_summary(
                 result.body, competition=competition, edition=edition, event=schedule
             )
-            return MatchPayload(schedule, parsed, _raw_ref(result))
+            return known.carried(
+                MatchPayload(
+                    schedule, parsed, _raw_ref(result), status_checked_at=status_checked_at
+                )
+            )
         logger.warning("ESPN %s: final without a header score, kept as moved", known.event_id)
         status, presence = None, MOVED
     schedule = known.schedule_row(competition, edition, status=status)
-    return MatchPayload(schedule, None, known.raw_ref(), presence)
+    return known.carried(
+        MatchPayload(
+            schedule, None, known.raw_ref(), presence, status_checked_at=status_checked_at
+        )
+    )
 
 
 def run_tournament(
@@ -928,17 +1073,22 @@ def run_tournament(
                 continue
             schedule, raw = found
             if not schedule.played_final:
-                payloads.append(MatchPayload(schedule, None, raw, presence))
-                continue
-            result = _summary_result(
-                client,
-                urls.summary(work.slug, event_id),
-                captured=known is not None and known.summary_captured,
-            )
-            parsed = parse_summary(
-                result.body, competition=competition, edition=edition, event=schedule
-            )
-            payloads.append(MatchPayload(schedule, parsed, _raw_ref(result)))
+                payload = MatchPayload(
+                    schedule, None, raw, presence, status_checked_at=raw.fetched_at
+                )
+            else:
+                result = _summary_result(
+                    client,
+                    urls.summary(work.slug, event_id),
+                    captured=known is not None and known.summary_captured,
+                )
+                parsed = parse_summary(
+                    result.body, competition=competition, edition=edition, event=schedule
+                )
+                payload = MatchPayload(
+                    schedule, parsed, _raw_ref(result), status_checked_at=raw.fetched_at
+                )
+            payloads.append(known.carried(payload) if known is not None else payload)
 
         # Bronze rows never point at a raw body that is not written yet.
         client.flush()

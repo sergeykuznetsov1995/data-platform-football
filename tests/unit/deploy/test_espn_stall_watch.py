@@ -1,4 +1,5 @@
-"""Сторож простоя ESPN (#1496): «DAG на паузе → тревога», «36 ч без новых матчей → тревога».
+"""Сторож простоя ESPN (#1496): «DAG на паузе → тревога», «36 ч без новых матчей → тревога»;
+#1505: «турнир красный 3 волны подряд → тревога» по журналу волн.
 
 Заглушки не отвечают на всё одинаково: SQL сторожа ИСПОЛНЯЕТСЯ — запрос к метабазе в sqlite
 над записанной таблицей `dag` (формат `psql -At`: `dag_id|t`), запрос к Trino в duckdb над
@@ -66,6 +67,8 @@ class World:
             "espn_lineup_generation_v2": [(401, LAST_FETCH_2409)],
             "espn_matchsheet_generation_v2": [(401, "2026-08-13 10:02:11.000001")],
         }
+        # Журнал волн (#1505): None — таблицы ещё нет (до #1507).
+        self.wave_log: list[tuple] | None = None
         self.sent: list[str] = []
         self.gh_calls: list[list[str]] = []
         self.open_issues: list[dict] = []
@@ -96,8 +99,29 @@ class World:
                 # _ingested_at врёт (= execution_date) и всегда «свежее» — сторож не должен его читать
                 con.execute(f"INSERT INTO iceberg.bronze.{table} VALUES (?, ?, ?)",
                             [event_id, fetched, _ts(NOW)])
-        rows = con.execute(sql).fetchall()
+        if self.wave_log is not None:
+            con.execute("CREATE SCHEMA iceberg.ops")
+            con.execute("CREATE TABLE iceberg.ops.espn_wave_tournament_v1 (run_id VARCHAR, "
+                        "wave_started_at TIMESTAMP, wave_finished_at TIMESTAMP, slug VARCHAR, "
+                        "season_year INTEGER, state VARCHAR, matches INTEGER, first_error VARCHAR)")
+            con.executemany("INSERT INTO iceberg.ops.espn_wave_tournament_v1 VALUES "
+                            "(?, ?, ?, ?, ?, ?, ?, ?)", self.wave_log)
+        try:
+            rows = con.execute(sql).fetchall()
+        except duckdb.Error:   # как trino-ro.sh: запрос упал (нет таблицы) — ненулевой код
+            return None
         return "".join(",".join(f'"{c}"' for c in row) + "\n" for row in rows)
+
+    def add_wave(self, started, **states):
+        """Волна: строка '(wave)' и по строке на турнир (state или (state, first_error))."""
+        run_id = f"scheduled__{started.isoformat()}"
+        rows = [(run_id, _ts(started), _ts(started + timedelta(minutes=20)), "(wave)", None,
+                 "green", 0, None)]
+        for slug, value in states.items():
+            state, error = value if isinstance(value, tuple) else (value, None)
+            rows.append((run_id, _ts(started), _ts(started + timedelta(minutes=20)),
+                         slug.replace("_", "."), 2026, state, 1, error))
+        self.wave_log = (self.wave_log or []) + rows
 
     def tg_send(self, text):
         self.sent.append(text)
@@ -342,3 +366,61 @@ def test_dry_run_sends_nothing_and_opens_no_issue(world, tmp_path, capsys):
 def test_dry_run_refuses_the_production_state(world):
     with pytest.raises(SystemExit):
         watch.main(["--dry-run"])
+
+
+# 4. #1505: турнир красный 3 волны подряд
+
+def _quiet(world):
+    """Старый контур в порядке — остаются только тревоги по турнирам."""
+    world.set_dags(**{d: "f" for d in EXPECTED})
+    world.bronze = {"espn_lineup_generation_v2": [(1, _ts(NOW + timedelta(hours=h)))
+                                                  for h in range(-24, 48, 6)]}
+
+
+def test_no_wave_log_is_silently_skipped(world, tmp_path, capsys):
+    _quiet(world)
+    state = _run(tmp_path, NOW)
+    assert world.sent == [] and state["episodes"] == {}
+    assert "red=no_wave_log" in capsys.readouterr().out
+
+
+def test_tournament_red_three_waves_in_a_row_alerts_once_then_clears(world, tmp_path):
+    _quiet(world)
+    err = ("WavePlanError", "2026-09-24: HttpStatusError: down")
+    world.add_wave(NOW - timedelta(hours=12), eng_1=("red", ": ".join(err)), ger_2="green")
+    world.add_wave(NOW - timedelta(hours=6), eng_1=("red", ": ".join(err)), ger_2="red")
+    state = _run(tmp_path, NOW - timedelta(hours=5))
+    assert world.sent == []   # два красных подряд — ещё не тревога
+
+    world.add_wave(NOW, eng_1=("red", ": ".join(err)), ger_2="red")
+    state = _run(tmp_path, NOW + timedelta(minutes=15))
+    assert world.sent == ["🔴 ESPN: турнир eng.1 красный 3 волны подряд (последняя "
+                          "2026-09-24 20:00 UTC): WavePlanError: 2026-09-24: HttpStatusError: down. #1505"]
+    assert set(state["episodes"]) == {"red:eng.1"}
+
+    world.sent.clear()
+    world.add_wave(NOW + timedelta(hours=6), eng_1="red", ger_2="green")
+    _run(tmp_path, NOW + timedelta(hours=6, minutes=15))
+    assert world.sent == []   # та же серия — тишина, ger.2 красный лишь 2 волны
+    _run(tmp_path, NOW + timedelta(hours=25))
+    assert len(world.sent) == 1
+    assert world.sent[0].startswith("⏳ ESPN: продолжается (25 ч) — 🔴 ESPN: турнир eng.1 ")
+    assert world.gh_calls == []   # без issue
+
+    world.sent.clear()
+    world.add_wave(NOW + timedelta(hours=30), eng_1="green")
+    state = _run(tmp_path, NOW + timedelta(hours=30, minutes=15))
+    assert world.sent == ["✅ ESPN: отбой — турнир eng.1 красный 3 волны подряд "
+                          "(эпизод с 2026-09-24T20:15Z)"]
+    assert state["episodes"] == {}
+
+
+def test_red_rule_left_alone_when_trino_is_down(world, tmp_path):
+    _quiet(world)
+    for hours in (12, 6, 0):
+        world.add_wave(NOW - timedelta(hours=hours), eng_1="red")
+    _run(tmp_path, NOW)
+    world.trino_up = False
+    world.sent.clear()
+    state = _run(tmp_path, NOW + timedelta(hours=1))
+    assert world.sent == [] and set(state["episodes"]) == {"red:eng.1"}

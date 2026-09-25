@@ -20,6 +20,7 @@ import re
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
+import pandas as pd
 import pytest
 
 from scrapers.espn import editions_store, urls, wave
@@ -96,7 +97,7 @@ class FakeClient:
 
 
 def _py(value):
-    if value is None:
+    if value is None or value is pd.NaT:
         return None
     if isinstance(value, float) and math.isnan(value):
         return None
@@ -736,3 +737,112 @@ def test_single_403_is_the_tournament_error_and_all_blocked_stops_the_wave(tmp_p
     client.responses[status_key] = AllOriginsBlocked("every origin 403")
     with pytest.raises(AllOriginsBlocked):
         _plan(client, trino, tmp_path)
+
+
+# ------------------------------------------------------- freshness meter (#1505)
+
+
+@pytest.mark.unit
+def test_status_checked_at_and_first_published_at_are_written_and_carried(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    rows = _matches(trino)
+    fetched = datetime(2026, 9, 25, 13)  # fetched_at of the recorded day bodies
+    assert rows[578281]["status_checked_at"] == fetched
+    assert rows[900001]["status_checked_at"] == fetched
+    first = rows[578281]["first_published_at"]
+    assert first is not None and first == rows[578281]["_ingested_at"]
+    assert rows[900001]["first_published_at"] is None  # not played yet
+    # An older first publication stays through a republication of the match.
+    old = datetime(2026, 9, 24, 23)
+    for row in trino.tables["espn_match"]:
+        if row["event_id"] == 578281:
+            row["first_published_at"] = old
+    yesterday = json.loads(_first_day()[0])
+    yesterday["events"][0]["status"]["type"]["name"] = "STATUS_FINAL_AET"
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = json.dumps(yesterday).encode()
+
+    plan = _plan(client, trino, tmp_path)
+    _run(plan, client, trino)
+
+    assert [(w.slug, w.event_ids) for w in plan.works] == [("eng.1", (578281,))]
+    row = _matches(trino)[578281]
+    assert row["status"] == "STATUS_FINAL_AET"
+    assert row["first_published_at"] == old
+    assert row["_ingested_at"] > old
+
+
+@pytest.mark.unit
+def test_status_read_before_kickoff_is_read_again_once_after_it(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    # 900002 (kickoff 24.09 21:00) was last read before its kickoff.
+    for row in trino.tables["espn_match"]:
+        if row["event_id"] == 900002:
+            row["status_checked_at"] = datetime(2026, 9, 24, 12)
+
+    plan = _plan(client, trino, tmp_path)
+    _run(plan, client, trino)
+
+    # 900001 (kickoff 25.09 19:00) is not due yet: it stays out.
+    assert [(w.slug, w.event_ids) for w in plan.works] == [("eng.1", (900002,))]
+    assert _matches(trino)[900002]["status_checked_at"] == datetime(2026, 9, 25, 13)
+    assert _plan(client, trino, tmp_path).works == ()
+
+
+def _core_list(*event_ids: int) -> bytes:
+    items = [
+        {"$ref": f"http://sports.core.api.espn.com/v2/sports/soccer/leagues/x/events/{event_id}"}
+        for event_id in event_ids
+    ]
+    if not items:
+        return json.dumps({"count": 0, "pageIndex": 0, "pageSize": 1000, "pageCount": 0, "items": []}).encode()
+    return json.dumps(
+        {"count": len(items), "pageIndex": 1, "pageSize": 1000, "pageCount": 1, "items": items}
+    ).encode()
+
+
+@pytest.mark.unit
+def test_midnight_wave_adds_an_event_core_lists_and_bronze_lacks(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    first = TODAY - timedelta(days=2)
+    body = _summary("eng.1")
+    body["header"]["id"] = "900009"
+    league = lambda slug, espn_id, *events: json.dumps(  # noqa: E731
+        {"leagues": [{"id": espn_id, "slug": slug}], "events": list(events)}
+    ).encode()
+    client.responses.update({
+        # 578281 is already in bronze; 900009 is on no fetched day.
+        _req_key(urls.events_window("eng.1", first, TODAY)): _core_list(578281, 900009),
+        _req_key(urls.events_window("ger.2", first, TODAY)): _core_list(),
+        # 777777: core lists it, no league day has it.
+        _req_key(urls.events_window("uefa.champions", first, TODAY)): _core_list(777777),
+        _req_key(urls.league_scoreboard_day("eng.1", first)): league(
+            "eng.1", "700", _event("eng.1", when="2026-09-23T18:00Z", event_id=900009)
+        ),
+        _summary_key("eng.1", 900009): json.dumps(body).encode(),
+    })
+    for day in (first, YESTERDAY, TODAY):
+        client.responses[_req_key(urls.league_scoreboard_day("uefa.champions", day))] = league(
+            "uefa.champions", "775"
+        )
+
+    assert _plan(client, trino, tmp_path).works == ()  # not the 00 wave: no core read
+    plan = wave.plan_wave(
+        client=client, trino=trino, rows=_rows(), state_path=tmp_path / "editions.json",
+        now=NOW, check_stale=False, check_core=True,
+    )
+    outcomes = {o["slug"]: o for o in _run(plan, client, trino)}
+
+    works = {w.slug: w for w in plan.works}
+    assert works["eng.1"].event_ids == (900009,)
+    assert works["eng.1"].topup_days == (first,)
+    assert works["uefa.champions"].error == (
+        "core lists 1 event(s) no league day has: 777777"
+    )
+    assert "ger.2" not in works
+    assert outcomes["eng.1"]["state"] == wave.GREEN
+    assert outcomes["uefa.champions"]["state"] == wave.RED
+    row = _matches(trino)[900009]
+    assert (row["played_final"], row["lineup_state"]) == (True, "captured")
+    assert row["first_published_at"] is not None
+    core_calls = client.network("/events?dates=20260923-20260925")
+    assert len(core_calls) == 3 and {refresh for _, refresh in core_calls} == {True}

@@ -12,6 +12,11 @@
            прогона — R-02), и по `_source_fetched_at`: `_ingested_at` старых таблиц врёт
            (= execution_date прогона). Trino недоступен — правило пропускается, эпизод не
            трогаем («не знаю» ≠ «простоя нет»).
+  red:<slug> — (#1505) турнир красный в RED_WAVES последних волнах `dag_espn_current` подряд
+           (журнал волн WAVE_LOG, строка волны slug = '(wave)'): тревога один раз, «продолжается»
+           раз в сутки, без issue; отбой — когда последняя волна с этим турниром зелёная или его
+           нет ни в одной из RED_WAVES последних волн. Однократный сбой не тревожит. Журнала ещё
+           нет (до #1507) или Trino недоступен — правило молча пропускается.
 Эпизод (механика — /root/watchdog/transfermarkt_stall_watch.py, #1389): новое правило —
 тревога; то же — молчим, «⏳ продолжается N ч» не чаще раза в 24 ч от последнего сообщения;
 через ISSUE_AFTER_H от первой тревоги — issue (labels ISSUE_LABELS, заголовок с ключом
@@ -30,6 +35,7 @@ Cron: */15 * * * *. Ручной прогон: --dry-run --state <ОТДЕЛЬН
 --dry-run не трогаются — печатается, что было бы).
 """
 import argparse
+import csv
 import fcntl
 import json
 import os
@@ -46,6 +52,11 @@ EXPECTED_DAGS = ("dag_ingest_espn", "dag_trigger_espn_daily", "dag_monitor_espn"
                  "dag_discover_espn_registry")
 BRONZE_TABLES = ("espn_lineup_generation_v2", "espn_matchsheet_generation_v2")
 TS_COL = "_source_fetched_at"   # честное время загрузки; _ingested_at = execution_date прогона
+# #1505: журнал волн нового контура (scrapers/espn/wave_log.py) и порог «красный N волн подряд».
+WAVE_LOG = "iceberg.ops.espn_wave_tournament_v1"
+WAVE_ROW = "(wave)"
+RED_WAVES = 3
+SENTINEL = "__sentinel__"
 STALL_H = 36
 ISSUE_AFTER_H = 24
 STATE_DEFAULT = Path("/root/watchdog/state/espn_stall_state.json")
@@ -61,6 +72,13 @@ RULE_TITLE = {
     "paused": "DAG ESPN на паузе или metadb недоступен",
     "stall": f"нет новых матчей в bronze {STALL_H} ч",
 }
+RED_PREFIX = "red:"
+
+
+def rule_title(rule):
+    if rule.startswith(RED_PREFIX):
+        return f"турнир {rule[len(RED_PREFIX):]} красный {RED_WAVES} волны подряд"
+    return RULE_TITLE[rule]
 
 
 def psql(sql, timeout=40):
@@ -129,6 +147,55 @@ def read_bronze(now):
         if len(cells) == 2 and cells[0].isdigit():
             return int(cells[0]), (None if cells[1] == "нет" else cells[1])
     return None
+
+
+def red_waves_sql():
+    """Турниры RED_WAVES последних волн. Строка-заглушка: пустой ответ trino-ro.sh = падение."""
+    return (f"SELECT w.run_id, cast(w.started AS varchar), t.slug, t.state, "
+            f"coalesce(t.first_error, '') FROM (SELECT run_id, max(wave_started_at) AS started "
+            f"FROM {WAVE_LOG} WHERE slug = '{WAVE_ROW}' GROUP BY run_id ORDER BY started DESC "
+            f"LIMIT {RED_WAVES}) w JOIN {WAVE_LOG} t ON t.run_id = w.run_id "
+            f"WHERE t.slug <> '{WAVE_ROW}' "
+            f"UNION ALL SELECT '{SENTINEL}', '', '', '', ''")
+
+
+def read_red_waves():
+    """[(run_id, старт, {slug: (state, first_error)})] последних волн, новые первыми; None —
+    журнала нет или Trino недоступен (правило пропускается)."""
+    out = trino(red_waves_sql())
+    if out is None:
+        return None
+    waves, seen = {}, False
+    for cells in csv.reader((out or "").splitlines()):
+        if len(cells) != 5:
+            continue
+        if cells[0] == SENTINEL:
+            seen = True
+            continue
+        run_id, started, slug, state, error = cells
+        waves.setdefault((started, run_id), {})[slug] = (state, error)
+    if not seen:
+        return None
+    return [(run_id, started, slugs) for (started, run_id), slugs in sorted(waves.items(), reverse=True)]
+
+
+def evaluate_red(waves, known):
+    """{"red:<slug>": текст | None (отбой)} по волнам read_red_waves; known — правила red:*
+    из state (их отбой считается, даже если турнира уже нет в волнах)."""
+    alerts = {}
+    slugs = {slug for _, _, tournaments in waves for slug in tournaments}
+    slugs |= {rule[len(RED_PREFIX):] for rule in known if rule.startswith(RED_PREFIX)}
+    for slug in sorted(slugs):
+        states = [tournaments.get(slug) for _, _, tournaments in waves]
+        if len(waves) >= RED_WAVES and all(s and s[0] == "red" for s in states[:RED_WAVES]):
+            _, started, _ = waves[0]
+            alerts[RED_PREFIX + slug] = (f"🔴 ESPN: турнир {slug} красный {RED_WAVES} волны подряд "
+                                         f"(последняя {started[:16]} UTC): {states[0][1] or '—'}. #1505")
+            continue
+        latest = next((s for s in states if s), None)
+        if latest is None or latest[0] != "red":
+            alerts[RED_PREFIX + slug] = None
+    return alerts
 
 
 def evaluate(now, dag_rows, bronze):
@@ -280,14 +347,14 @@ def send_pending(state, now):
     return len(keep)
 
 
-def episode(state, rule, text, now, msgs, bits, dry_run):
+def episode(state, rule, text, now, msgs, bits, dry_run, issue=True):
     """text=None — условие снято: отбой и эпизод забыт. Иначе новое — тревога; то же — раз в
-    сутки «продолжается», через ISSUE_AFTER_H — issue."""
+    сутки «продолжается», через ISSUE_AFTER_H — issue (issue=False — без issue, #1505)."""
     ep = state["episodes"].get(rule)
     if text is None:
         if ep:
             state["episodes"].pop(rule)
-            msgs.append(f"✅ ESPN: отбой — {RULE_TITLE[rule]} (эпизод с {ep['first'][:16]}Z"
+            msgs.append(f"✅ ESPN: отбой — {rule_title(rule)} (эпизод с {ep['first'][:16]}Z"
                         + (f", issue #{ep['issue']}" if ep.get("issue") else "") + ")")
             bits.append(f"{rule}=cleared")
         return
@@ -297,7 +364,7 @@ def episode(state, rule, text, now, msgs, bits, dry_run):
         bits.append(f"{rule}=new")
         return
     hours = (now - parse_ts(ep["first"])).total_seconds() / 3600
-    escalated = hours >= ISSUE_AFTER_H and not ep.get("blocked")
+    escalated = issue and hours >= ISSUE_AFTER_H and not ep.get("blocked")
     if escalated:   # issue ещё нет или карточка не встала — (повторная) эскалация
         second = escalate(rule, ep, text, now, dry_run)
         if second:
@@ -334,6 +401,7 @@ def main(argv=None):
     dag_rows = read_dags()
     bronze = read_bronze(now)
     alerts = evaluate(now, dag_rows, bronze)
+    waves = read_red_waves()
 
     state = load_state(args.state)
     msgs, bits = [], []
@@ -342,6 +410,11 @@ def main(argv=None):
     for rule in ("paused", "stall"):
         if rule in alerts:
             episode(state, rule, alerts[rule], now, msgs, bits, args.dry_run)
+    if waves is None:
+        bits.append("red=no_wave_log")
+    else:
+        for rule, text in evaluate_red(waves, state["episodes"]).items():
+            episode(state, rule, text, now, msgs, bits, args.dry_run, issue=False)
 
     failed = 0
     if args.dry_run:

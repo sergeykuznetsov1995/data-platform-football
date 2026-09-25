@@ -45,6 +45,10 @@ PENDING = "pending"
 WITHDRAWN = "withdrawn"
 MOVED = "moved"
 PRESENCE_VALUES = frozenset({WITHDRAWN, MOVED})
+# Part states that close a played final for the freshness meter (#1505).
+PUBLISHED_STATES = frozenset(
+    {EntityParseState.CAPTURED.value, EntityParseState.VALID_EMPTY.value}
+)
 
 # Anomaly classes that name no single team: every team of the match is flagged.
 _TEAM_ATTRIBUTED = frozenset(
@@ -78,6 +82,10 @@ class MatchPayload:
     raw: RawRef
     # WITHDRAWN / MOVED for a match without Summary that left its day.
     presence: str | None = None
+    # ``first_published_at`` of the stored row: carried, never moved (#1505).
+    first_published_at: datetime | None = None
+    # When the status of this payload was read; ``raw.fetched_at`` if None.
+    status_checked_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.presence is not None:
@@ -128,6 +136,8 @@ def match_row(
     raw: RawRef,
     stamp: BatchStamp,
     presence: str | None = None,
+    first_published_at: datetime | None = None,
+    status_checked_at: datetime | None = None,
 ) -> dict[str, Any]:
     played = schedule.played_final
     sides = _sides(summary) if summary is not None else {}
@@ -166,6 +176,13 @@ def match_row(
             events_state = EntityParseState.VALID_EMPTY.value
         first_fetched_at = _utc(raw.fetched_at)
         parser_version = summary.parser_version
+    if (
+        first_published_at is None
+        and played
+        and lineup_state in PUBLISHED_STATES
+        and team_stats_state in PUBLISHED_STATES
+    ):
+        first_published_at = stamp.ingested_at
 
     return {
         **_scope(schedule),
@@ -211,6 +228,10 @@ def match_row(
         "parse_state": schedule.parse_state.value,
         "first_fetched_at": first_fetched_at,
         "rechecked_at": None,
+        "first_published_at": _utc(first_published_at),
+        "status_checked_at": _utc(
+            status_checked_at if status_checked_at is not None else raw.fetched_at
+        ),
         **_lineage(raw=raw, parser_version=parser_version, stamp=stamp),
     }
 
@@ -401,7 +422,13 @@ def batch_rows(
         args = (payload.schedule, payload.summary)
         kwargs = {"raw": payload.raw, "stamp": stamp}
         tables[MATCH_TABLE].append(
-            match_row(*args, **kwargs, presence=payload.presence)
+            match_row(
+                *args,
+                **kwargs,
+                presence=payload.presence,
+                first_published_at=payload.first_published_at,
+                status_checked_at=payload.status_checked_at,
+            )
         )
         tables[LINEUP_TABLE].extend(lineup_rows(*args, **kwargs))
         tables[TEAM_STATS_TABLE].extend(team_stats_rows(*args, **kwargs))
@@ -414,6 +441,7 @@ __all__ = (
     "MOVED",
     "MatchPayload",
     "PRESENCE_VALUES",
+    "PUBLISHED_STATES",
     "RawRef",
     "WITHDRAWN",
     "batch_rows",
