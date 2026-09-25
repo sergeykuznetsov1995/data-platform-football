@@ -141,6 +141,8 @@ def _trino_connect():
     try:
         import trino
         import trino.auth as trino_auth
+
+        from scrapers.sofascore import trino_accounting
     except ImportError as e:
         logger.error("trino client unavailable: %s", e)
         return None
@@ -148,7 +150,7 @@ def _trino_connect():
     user = os.environ.get("TRINO_USER", "airflow")
     password = os.environ.get("TRINO_PASSWORD")
     if password:
-        return trino.dbapi.connect(
+        return trino_accounting.counted_connection(trino.dbapi.connect(
             host=os.environ.get("TRINO_HOST", "trino"),
             port=int(os.environ.get("TRINO_PORT", 8443)),
             user=user,
@@ -156,13 +158,13 @@ def _trino_connect():
             http_scheme="https",
             auth=trino_auth.BasicAuthentication(user, password),
             verify=False,
-        )
-    return trino.dbapi.connect(
+        ))
+    return trino_accounting.counted_connection(trino.dbapi.connect(
         host=os.environ.get("TRINO_HOST", "trino"),
         port=int(os.environ.get("TRINO_PORT", 8080)),
         user=user,
         catalog="iceberg",
-    )
+    ))
 
 
 def _resolve_match_ids_from_bronze(
@@ -857,6 +859,30 @@ def _rejected_rows_summary(rejected_rows) -> dict:
     return summary
 
 
+def _restamp_trino_queries(path: str) -> None:
+    """Refresh ``traffic.trino_queries`` of an already written report (#1357).
+
+    Touches only that one field, after raw and manifest are durable; a report
+    that is missing, unreadable or has no ``traffic`` is left as it is.
+    """
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        return
+    traffic = payload.get("traffic") if isinstance(payload, dict) else None
+    if not isinstance(traffic, dict):
+        return
+    from scrapers.sofascore import trino_accounting
+
+    traffic["trino_queries"] = trino_accounting.snapshot()
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, default=str)
+    except OSError as e:
+        logger.warning("Could not restamp trino_queries in %s: %s", path, e)
+
+
 def _flush_manifest_store(manifest_store) -> None:
     """Force pending batched manifest records into durable Iceberg state."""
     flush = getattr(manifest_store, "flush", None)
@@ -1043,6 +1069,12 @@ def _run_match_capture(
             )
         source_tournament_id, source_season_id = _source_context(
             league, season, season_short
+        )
+        # #1357: one manifest SELECT for the scope before the resume plan.
+        from scrapers.sofascore.manifest import preload_manifest_scope
+
+        preload_manifest_scope(
+            capture_runtime.manifest_store, source_tournament_id, source_season_id
         )
         canonical_url = _tournament_canonical_url(league, source_tournament_id)
         freshness_key = _planned_freshness_key(
@@ -2169,6 +2201,12 @@ def _run_player_capture(
 
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
+    traffic = payload.get("traffic")
+    if isinstance(traffic, dict):
+        # #1357: Trino round-trips of this process (plan + capture).
+        from scrapers.sofascore import trino_accounting
+
+        traffic["trino_queries"] = trino_accounting.snapshot()
     try:
         with open(path, "w") as f:
             json.dump(payload, f, default=str)
@@ -2263,6 +2301,12 @@ def _run_season_capture_engine(
     try:
         source_tournament_id, source_season_id = _source_context(
             league, season, canonical_season
+        )
+        # #1357: one manifest SELECT for the scope before the season plan.
+        from scrapers.sofascore.manifest import preload_manifest_scope
+
+        preload_manifest_scope(
+            capture_runtime.manifest_store, source_tournament_id, source_season_id
         )
         freshness_key = _planned_freshness_key(
             workload_plan,
@@ -2945,7 +2989,12 @@ def main(argv=None):
     finally:
         # Runners flush at their success boundaries; this covers every early
         # return and error path so no buffered observation outlives the task.
-        _flush_manifest_store(capture_runtime.manifest_store)
+        try:
+            _flush_manifest_store(capture_runtime.manifest_store)
+        finally:
+            # #1357: an error path writes its report before this last flush;
+            # restamp the counter so that flush's statements are included.
+            _restamp_trino_queries(args.output)
 
 
 if __name__ == "__main__":

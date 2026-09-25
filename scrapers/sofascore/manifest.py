@@ -187,6 +187,17 @@ class InMemoryManifestStore:
             return [r for r in self._records.values() if r.run_id == run_id]
 
 
+def preload_manifest_scope(
+    store: object, source_tournament_id: str | int, source_season_id: str | int
+) -> int:
+    """One manifest read per scope when the store supports it (#1357)."""
+
+    preload = getattr(store, "preload_scope", None)
+    if not callable(preload):
+        return 0
+    return preload(source_tournament_id, source_season_id)
+
+
 class BatchingManifestStore:
     """Write-behind buffer bounding Iceberg snapshot growth (#1003).
 
@@ -213,6 +224,15 @@ class BatchingManifestStore:
         self.max_pending = max_pending
         self._pending: Dict[ManifestKey, EndpointManifest] = {}
         self._lock = threading.RLock()
+
+    def preload_scope(
+        self, source_tournament_id: str | int, source_season_id: str | int
+    ) -> int:
+        """Delegate the scope index (#1357); in-memory stores need none."""
+
+        return preload_manifest_scope(
+            self.inner, source_tournament_id, source_season_id
+        )
 
     def get(self, key: ManifestKey) -> Optional[EndpointManifest]:
         with self._lock:

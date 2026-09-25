@@ -144,6 +144,7 @@ jobs:
             tests/unit/scrapers/test_sofascore_lease_client.py \
             tests/unit/scrapers/test_sofascore_live_capture.py \
             tests/unit/scrapers/test_sofascore_manifest_batching.py \
+            tests/unit/scrapers/test_sofascore_manifest_scope_index.py \
             tests/unit/scrapers/test_sofascore_pipeline.py \
             tests/unit/scrapers/test_sofascore_workload_plan.py \
             tests/unit/scrapers/test_sofascore_workload_runtime.py \

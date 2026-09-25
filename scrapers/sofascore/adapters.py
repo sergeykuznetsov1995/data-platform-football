@@ -20,6 +20,7 @@ from scrapers.sofascore.manifest import (
     ManifestStatus,
     ManifestStore,
 )
+from scrapers.sofascore import trino_accounting
 from scripts.proxy_filter.budget import BudgetAccountingError
 
 
@@ -167,11 +168,17 @@ class TrinoManifestStore(ManifestStore):
         validate_identifier(schema, "schema")
         validate_identifier(table, "table")
         validate_identifier(manager.catalog, "catalog")
+        # #1357: every statement this store's manager sends is counted.
+        trino_accounting.instrument_manager(manager)
         self.manager = manager
         self.catalog = manager.catalog
         self.schema = schema
         self.table = table
         self.qualified = f"{self.catalog}.{self.schema}.{self.table}"
+        # Scope index (#1357): one SELECT per (tournament, season) instead of
+        # one per endpoint.  Authoritative for keys inside the scope.
+        self._index: Optional[dict[ManifestKey, EndpointManifest]] = None
+        self._index_scope: Optional[tuple[str, str]] = None
         if ensure_table:
             self.ensure_table()
 
@@ -189,7 +196,57 @@ class TrinoManifestStore(ManifestStore):
     def _select_columns() -> str:
         return ", ".join(f'"{column}"' for column in MANIFEST_COLUMNS)
 
+    def preload_scope(
+        self, source_tournament_id: str | int, source_season_id: str | int
+    ) -> int:
+        """Load the whole scope's manifest with ONE SELECT (#1357).
+
+        Afterwards ``get`` answers keys of this scope from memory: a miss means
+        the key was never committed and returns ``None`` without Trino.  Keys
+        of any other scope keep the point SELECT.  Commits update the index.
+        """
+
+        scope = (
+            str(source_tournament_id).strip(),
+            str(source_season_id).strip(),
+        )
+        if not all(scope):
+            raise ValueError("preload scope ids must not be empty")
+        rows = self.manager._execute(
+            f"SELECT {self._select_columns()} FROM {self.qualified} "
+            'WHERE "source_tournament_id" = ? AND "source_season_id" = ?',
+            fetch=True,
+            params=scope,
+        )
+        index: dict[ManifestKey, EndpointManifest] = {}
+        for row in rows or []:
+            record = manifest_from_row(row)
+            if record.key in index:
+                raise RuntimeError(
+                    "SofaScore ops manifest natural key is duplicated: "
+                    + record.key.stable_id()
+                )
+            index[record.key] = record
+        self._index = index
+        self._index_scope = scope
+        return len(index)
+
+    def _in_index_scope(self, key: ManifestKey) -> bool:
+        return self._index is not None and self._index_scope == (
+            key.source_tournament_id,
+            key.source_season_id,
+        )
+
+    def _index_commit(self, records: Iterable[EndpointManifest]) -> None:
+        if self._index is None:
+            return
+        for record in records:
+            if self._in_index_scope(record.key):
+                self._index[record.key] = record
+
     def get(self, key: ManifestKey) -> Optional[EndpointManifest]:
+        if self._in_index_scope(key):
+            return self._index.get(key)
         where = " AND ".join(f'"{column}" = ?' for column in MANIFEST_KEY_COLUMNS)
         rows = self.manager._execute(
             f"SELECT {self._select_columns()} FROM {self.qualified} "
@@ -208,12 +265,14 @@ class TrinoManifestStore(ManifestStore):
 
     def upsert(self, record: EndpointManifest) -> None:
         frame = pd.DataFrame([manifest_to_row(record)], columns=MANIFEST_COLUMNS)
-        self.manager.insert_dataframe_atomic(
-            self.schema,
-            self.table,
-            frame,
-            merge_keys=MANIFEST_KEY_COLUMNS,
-        )
+        with trino_accounting.write_batch():
+            self.manager.insert_dataframe_atomic(
+                self.schema,
+                self.table,
+                frame,
+                merge_keys=MANIFEST_KEY_COLUMNS,
+            )
+        self._index_commit((record,))
 
     def upsert_many(self, records: Sequence[EndpointManifest]) -> None:
         """Commit many observations as ONE MERGE (one Iceberg snapshot).
@@ -231,12 +290,14 @@ class TrinoManifestStore(ManifestStore):
             [manifest_to_row(record) for record in deduped.values()],
             columns=MANIFEST_COLUMNS,
         )
-        self.manager.insert_dataframe_atomic(
-            self.schema,
-            self.table,
-            frame,
-            merge_keys=MANIFEST_KEY_COLUMNS,
-        )
+        with trino_accounting.write_batch():
+            self.manager.insert_dataframe_atomic(
+                self.schema,
+                self.table,
+                frame,
+                merge_keys=MANIFEST_KEY_COLUMNS,
+            )
+        self._index_commit(deduped.values())
 
     def list_for_run(self, run_id: str) -> list[EndpointManifest]:
         run_id = str(run_id).strip()
