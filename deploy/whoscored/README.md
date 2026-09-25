@@ -60,9 +60,12 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
    - фаза `delivered` → ждём первый прогон `dag_ingest_whoscored`, стартовавший после доставки, до его
      конца. Провал = `discover_catalog` или `ingest_daily` не `success`, либо `import_error` > 0, либо
      у DAG `has_import_errors` → **откат** на прежний SHA + 🔴 (SHA помечается `rejected`).
-     Задачи `success`, но прирост строк `whoscored_matches` и `whoscored_match_ingest_manifest` = 0 →
-     ⚠️ «НУЖНЫ РУКИ» **без отката** (источник мог быть пуст), SHA принимается.
-     Иначе ✅ с приростом. `validate_data` в приёмку не входит до #1476 (сейчас красный всегда).
+     Задачи `success` → прирост = строки `whoscored_matches` и `whoscored_events` с `_ingested_at`
+     позже доставки (манифест — только в отчёт). Есть строки → ✅, SHA принят. Нет ни матчей, ни
+     событий → ⚠️ «НУЖНЫ РУКИ» **без отката** (источник мог быть пуст), но и **не принято**: доставка
+     остаётся висящей, следующий завершённый прогон разбирается заново (прирост — от момента
+     доставки). Принять руками: `echo <sha> > whoscored-accepted`, удалить `whoscored-inflight`;
+     отказаться — `--rollback`. `validate_data` в приёмку не входит до #1476 (сейчас красный всегда).
    - Нет прогона 30 ч — напоминание раз в сутки. Trino не ответил — приёмка повторится следующим тиком.
    - Откат ждёт, пока контур занят.
 4. **Доставка** — только если висящей нет, в окне **02:00–05:00 UTC**, раз в сутки, в метабазе контура
@@ -79,7 +82,7 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
       `whoscored-airflow-scheduler` (`python -c 'import dag_ingest_whoscored, dag_backfill_whoscored'`
       из `/opt/airflow/dags`) → при смене `dags/utils` — `docker restart whoscored-airflow-scheduler`,
       при смене `airflow.compose.yaml` — `docker compose -p whoscored-airflow … up -d --no-deps
-      airflow-scheduler` (смена `gw.compose.yaml` — только уведомление, flaresolverr пересоздаётся
+      --force-recreate airflow-scheduler` (смена `gw.compose.yaml` — только уведомление, flaresolverr пересоздаётся
       руками) → ждём перечитывания по метабазе (до 10 мин): оба DAG `has_import_errors = f` и
       `last_parsed_time` > метки + 60 с, `import_error` = 0. airflow CLI не используем — он строит свой
       DagBag с диска;
@@ -110,8 +113,18 @@ echo <sha-мержа-полный> > /root/watchdog/state/whoscored-accepted
 # пересоздание контура из master-compose: сначала `docker compose config` новых и живых файлов —
 # разница только в путях; затем поимённо, общий стек не трогается:
 docker compose -p whoscored-airflow -f $RT/src/deploy/whoscored/airflow.compose.yaml \
-  --env-file /root/data-platform-football/.env up -d --no-deps airflow-metadb airflow-scheduler
+  --env-file /root/data-platform-football/.env up -d --no-deps airflow-metadb
+# scheduler — ПРИНУДИТЕЛЬНО пересоздать: при равной конфигурации `up -d` оставил бы старый
+# контейнер, и сменившиеся после checkout dags/utils остались бы в памяти процесса
+docker compose -p whoscored-airflow -f $RT/src/deploy/whoscored/airflow.compose.yaml \
+  --env-file /root/data-platform-football/.env up -d --no-deps --force-recreate airflow-scheduler
 docker compose -p whoscored-gw -f $RT/src/deploy/whoscored/gw.compose.yaml up -d --no-deps whoscored_flaresolverr
+# import-check и перечитывание (метабаза, не airflow CLI):
+docker exec -w /opt/airflow/dags -e PYTHONDONTWRITEBYTECODE=1 whoscored-airflow-scheduler \
+  python -c 'import dag_ingest_whoscored, dag_backfill_whoscored'
+docker exec whoscored-airflow-metadb psql -U airflow -d airflow -At -c \
+  "select dag_id, has_import_errors, last_parsed_time from dag; select count(*) from import_error"
+#   → оба DAG has_import_errors = f, last_parsed_time позже пересоздания, import_error = 0
 /root/whoscored-auto-deliver.sh --check
 ```
 

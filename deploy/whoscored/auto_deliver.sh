@@ -72,11 +72,13 @@ is_sha() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]] && g cat-file -e "$1^{commit}" 2>/de
 put() { echo "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }   # атомарная запись маркера
 iget() { sed -n "s/^$1=//p" "$INFLIGHT" 2>/dev/null | head -1; }
 
-# Строки bronze: «матчи манифест» или пусто, если Trino не ответил.
+# Строки bronze, записанные после момента $1 (время метабазы, UTC; _ingested_at — UTC без зоны):
+# «матчи события манифест» или пусто, если Trino не ответил. Приёмка — по матчам/событиям,
+# манифест только в отчёт: его рост без новых матчей и событий доставку не принимает.
 measure() {
-  local r
-  r=$("$TRINO_RO" "select (select count(*) from whoscored_matches), (select count(*) from whoscored_match_ingest_manifest)" 2>/dev/null | tr -d '"' | tail -1)
-  [[ "$r" =~ ^[0-9]+,[0-9]+$ ]] && echo "${r/,/ }"
+  local t="${1:0:19}" r
+  r=$("$TRINO_RO" "select (select count(*) from whoscored_matches where _ingested_at > timestamp '$t'), (select count(*) from whoscored_events where _ingested_at > timestamp '$t'), (select count(*) from whoscored_match_ingest_manifest where _ingested_at > timestamp '$t')" 2>/dev/null | tr -d '"' | tail -1)
+  [[ "$r" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]] && echo "${r//,/ }"
 }
 
 # Причина не трогать бой сейчас (пусто — можно): идёт прогон или жива история.
@@ -136,7 +138,7 @@ deploy_to() {
   if [ -n "$up" ] && [ -f "$SRC/$AF_COMPOSE" ]; then
     log "  изменён $AF_COMPOSE — пересоздаю только airflow-scheduler"
     docker compose -p "$COMPOSE_PROJECT" -f "$SRC/$AF_COMPOSE" --env-file "$COMPOSE_ENV_FILE" \
-      up -d --no-deps airflow-scheduler >> "$LOG" 2>&1 || { REASON="compose up airflow-scheduler"; return 1; }
+      up -d --no-deps --force-recreate airflow-scheduler >> "$LOG" 2>&1 || { REASON="compose up airflow-scheduler"; return 1; }
   elif [ -n "$up$restart" ]; then
     [ -n "$up" ] && log "  в ${to:0:12} нет $AF_COMPOSE — только рестарт (compose — руками)"
     log "  изменены dags/utils — рестарт $SCHED"
@@ -234,6 +236,7 @@ fi
 # --- висящая доставка: прерванная — откат; доставленная — приёмка первым завершённым прогоном
 if [ -f "$INFLIGHT" ]; then
   SHA=$(iget sha); PREV=$(iget prev); PHASE=$(iget phase); AT=$(iget at)
+  AFTER=$(iget after); AFTER=${AFTER:-$AT}   # прогоны до AFTER уже разобраны (нулевой прирост)
   if [ "$PHASE" = rollback ]; then
     [ "$CHECK" = 1 ] && stop "ручной откат на ${SHA:0:12} прерван — руками (--rollback повторно)"
     touch "$OFF"; journal "ручной откат прерван, выключатель"
@@ -245,9 +248,9 @@ if [ -f "$INFLIGHT" ]; then
     BUSY=$(busy_reason); [ -z "$BUSY" ] || { log "прерванная доставка, откат ждёт: $BUSY"; exit 0; }
     auto_rollback "$PREV" "автомат прерван на фазе '$PHASE'" "$SHA"
   fi
-  RUN=$(q "select run_id || '|' || state from dag_run where dag_id='dag_ingest_whoscored' and start_date > timestamptz '$AT' order by start_date limit 1")
+  RUN=$(q "select run_id || '|' || state from dag_run where dag_id='dag_ingest_whoscored' and start_date > timestamptz '$AFTER' order by start_date limit 1")
   if [ -z "$RUN" ] || [[ "$RUN" != *"|success" && "$RUN" != *"|failed" ]]; then
-    log "доставка ${SHA:0:12} ждёт приёмки: прогон после $AT ${RUN:-ещё не стартовал}"
+    log "доставка ${SHA:0:12} ждёт приёмки: прогон после $AFTER ${RUN:-ещё не стартовал}"
     AGE=$(q "select extract(epoch from now() - timestamptz '$AT')::int / 3600")
     R="$STATE/whoscored-inflight-reminded-$DAY"
     if [ "$CHECK" = 0 ] && [ "${AGE:-0}" -ge 30 ] && [ ! -f "$R" ]; then
@@ -267,19 +270,26 @@ if [ -f "$INFLIGHT" ]; then
     BUSY=$(busy_reason); [ -z "$BUSY" ] || { log "приёмка провалена, откат ждёт: $BUSY"; exit 0; }
     auto_rollback "$PREV" "$WHY" "$SHA"
   fi
-  NOW=$(measure) || { log "Trino не ответил — приёмка ${SHA:0:12} повторится следующим тиком"; exit 0; }
-  read -r M0 F0 <<< "$(iget base)"; read -r M1 F1 <<< "$NOW"
-  DM=$((M1 - M0)); DF=$((F1 - F0))
-  [ "$CHECK" = 1 ] && { log "заметка: приёмка сейчас прошла бы; прирост матчей $DM, манифеста $DF"; exit 0; }
+  NOW=$(measure "$AT") || { log "Trino не ответил — приёмка ${SHA:0:12} повторится следующим тиком"; exit 0; }
+  read -r NM NE NF <<< "$NOW"
+  if [ "$NM" -le 0 ] && [ "$NE" -le 0 ]; then
+    # Задачи зелёные, а строк нет: источник мог быть пуст — без отката, но и НЕ принято.
+    # Доставка остаётся висящей; следующий завершённый прогон разбирается заново.
+    [ "$CHECK" = 1 ] && { log "заметка: прогон $RID зелёный, но строк после доставки нет (манифест +$NF) — не принято, без отката"; exit 0; }
+    NEXT=$(q "select start_date from dag_run where dag_id='dag_ingest_whoscored' and run_id='$RID'")
+    [ -n "$NEXT" ] || { log "метабаза не ответила — повтор следующим тиком"; exit 0; }
+    put "$INFLIGHT" "$(grep -v '^after=' "$INFLIGHT")
+after=$NEXT" || { touch "$OFF"; tg "🆘 WhoScored: не записан $INFLIGHT — НУЖНЫ РУКИ; автомат выключен"; exit 2; }
+    journal "прогон $RID зелёный, строк после доставки 0 (манифест +$NF) — не принято, ждёт следующий прогон"
+    tg "⚠️ WhoScored: доставка ${SHA:0:7}: прогон $RID зелёный, но новых строк матчей/событий после доставки нет (манифест +$NF) — НУЖНЫ РУКИ; без отката, не принято, жду следующий прогон"
+    exit 0
+  fi
+  [ "$CHECK" = 1 ] && { log "заметка: приёмка сейчас прошла бы; после доставки матчей +$NM, событий +$NE, манифест +$NF"; exit 0; }
   put "$ACCEPTED_PREV" "$PREV"; put "$ACCEPTED" "$SHA" \
     || { touch "$OFF"; tg "🆘 WhoScored: приёмка ${SHA:0:7} пройдена, но $ACCEPTED не записан — НУЖНЫ РУКИ; автомат выключен"; exit 2; }
   rm -f "$INFLIGHT"
-  journal "принято прогоном $RID: матчи +$DM, манифест +$DF"
-  if [ "$DM" -le 0 ] && [ "$DF" -le 0 ]; then
-    tg "⚠️ WhoScored: доставка ${SHA:0:7} принята (задачи прогона $RID success), но прирост строк 0 (матчи $M0→$M1, манифест $F0→$F1) — НУЖНЫ РУКИ, без отката"
-  else
-    tg "✅ WhoScored: доставка ${SHA:0:7} принята прогоном $RID: матчи +$DM, манифест +$DF"
-  fi
+  journal "принято прогоном $RID: матчи +$NM, события +$NE, манифест +$NF"
+  tg "✅ WhoScored: доставка ${SHA:0:7} принята прогоном $RID: после доставки матчей +$NM, событий +$NE, манифест +$NF"
   exit 0
 fi
 
@@ -314,20 +324,17 @@ for f in $DAG_FILES; do
   g show "$SHA:dags/$f" | python3 -I -S -c 'import sys; compile(sys.stdin.read(), sys.argv[1], "exec")' "$f" \
     || stop "dags/$f из ${SHA:0:7} не компилируется"
 done
-BASE=$(measure) || stop "Trino не ответил — нет базы прироста, доставка ${SHA:0:7} отложена"
-log "к доставке: ${ACC:0:12} → ${SHA:0:12} ($(g diff --name-only "$ACC" "$SHA" -- $WS_PATHS | wc -l) файлов в путях WhoScored); строки до: матчи/манифест $BASE"
+log "к доставке: ${ACC:0:12} → ${SHA:0:12} ($(g diff --name-only "$ACC" "$SHA" -- $WS_PATHS | wc -l) файлов в путях WhoScored)"
 if [ "$CHECK" = 1 ]; then log "проверки пройдены (--check, ничего не записано)"; exit 0; fi
 
 # --- доставка. Состояние для отката пишется ДО checkout; не записалось — бой не трогаем.
 put "$INFLIGHT" "phase=deploying
 sha=$SHA
-prev=$ACC
-base=$BASE" || stop "не записан $INFLIGHT — бой не тронут"
+prev=$ACC" || stop "не записан $INFLIGHT — бой не тронут"
 if deploy_to "$SHA" "$ACC"; then
   put "$INFLIGHT" "phase=delivered
 sha=$SHA
 prev=$ACC
-base=$BASE
 at=$DELIVERED_AT" || { touch "$OFF"; tg "🆘 WhoScored: ${SHA:0:7} доставлен, но $INFLIGHT не записан — НУЖНЫ РУКИ; автомат выключен"; exit 2; }
   journal "доставлено ${ACC:0:12} → ${SHA:0:12}, ждёт приёмки прогоном"
   tg "🚚 WhoScored: доставлено ${SHA:0:7} (было ${ACC:0:7}), DAG перечитаны; приёмка — ближайшим прогоном ежедневника"
