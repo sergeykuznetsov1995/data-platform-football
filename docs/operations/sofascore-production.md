@@ -780,6 +780,28 @@ docker exec -i sofascore_gw_history python3 - --base-url http://127.0.0.1:8899 \
 Прямой замер задержки авторизованного `stats` на стороне задачи — отдельная задача
 (follow-up в #1350).
 
+## План скоупа одним запросом (#1357)
+
+- **Манифест на скоуп одним запросом.** `TrinoManifestStore.preload_scope(tournament, season)` читает
+  весь `iceberg.ops.sofascore_capture_manifest` скоупа одним `SELECT` (таблица партиционирована по
+  этой паре); дальше `get` ключа этого скоупа отвечает из памяти — промах значит «не записано», без
+  Trino. Ключ другого скоупа по-прежнему читается точечным `SELECT`. Коммиты (`upsert`/`upsert_many`)
+  дописывают индекс, запись как была — пачками по `SOFASCORE_MANIFEST_BATCH_SIZE`. Preload делают
+  оба экземпляра хранилища фазы: план (`prepare_workload_plan`) и захват (`_run_match_capture`);
+  история (`--phase all`) идёт тем же кодом. Раньше план спрашивал манифест на каждый эндпоинт каждого
+  матча (216 858 HTTPS к Trino за прогон 15:30).
+- **`trino_queries` в отчёте фазы.** Модуль `scrapers/sofascore/trino_accounting.py` считает запросы
+  SofaScore к Trino (`select`/`merge`/`other`; базовый `TrinoTableManager` не тронут), счётчик
+  обнуляется в начале `run_phase`. Число пишется в `traffic.trino_queries` отчёта раннера и в фазу
+  результата скоупа — `refresh-results/*.json` (актуалка) и `results/*.json` (история). Ожидание на
+  скоуп: `select` ≤ 10, `merge` ≈ ⌈записей / 200⌉.
+- **`squads` не планируется.** Сезонный маршрут отвечает 404 (`endpoint_coverage.yaml`:
+  `unsupported`), а дневной `freshness_key` покупал новый платный 404 на каждую команду каждый день.
+  Спек `squads` больше не строится; вселенная игроков — игроки матчей (lineups и др.) плюс составы из
+  raw, сохранённого раньше под тем же `freshness_key`; отсутствие составов — не разрыв вселенной.
+  Подписанный `configs/sofascore/workload_policy.json` и `raw_replay_endpoints` не менялись: резерв
+  байт на `squads` в оценке остаётся (завышение, безвредно), реплей старых raw работает.
+
 ## Мины, которые уже стреляли
 
 - Дерево 0700 от `mktemp` → шлюз в цикле `Permission denied` (25.08); `freeze_release.sh`

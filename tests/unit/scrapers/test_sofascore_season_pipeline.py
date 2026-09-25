@@ -282,6 +282,13 @@ def _seed_complete_partition_roots(
     _seed_full_event_referee(store, event_id=14000001, referee_id=900)
 
 
+def _seed_stored_squads(store, team_ids, body: bytes) -> None:
+    """Squads are no longer planned (#1357); seed raw stored earlier by team."""
+
+    for team_id in team_ids:
+        _seed_raw(store, build_squad_spec(team_id=team_id, **_common()), body)
+
+
 def _complete_plan_with_expansion_raw(store, manifest):
     _seed_complete_partition_roots(store)
     plan = plan_season_partition(
@@ -289,10 +296,9 @@ def _complete_plan_with_expansion_raw(store, manifest):
         manifest,
         **_common(),
     )
+    _seed_stored_squads(store, plan.team_ids, FIXTURE_PATHS["squads"].read_bytes())
     for spec in plan.specs:
-        if spec.key.endpoint == "squads":
-            _seed_raw(store, spec, FIXTURE_PATHS["squads"].read_bytes())
-        elif spec.key.endpoint == "referee_profile":
+        if spec.key.endpoint == "referee_profile":
             _seed_raw(
                 store,
                 spec,
@@ -702,7 +708,7 @@ def test_promised_schedule_page_404_replays_to_legitimate_empty_and_closes(
 
 
 @pytest.mark.unit
-def test_planner_expands_squads_and_referees_from_stored_evidence(tmp_path):
+def test_planner_expands_referees_but_never_plans_squads(tmp_path):
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     _seed_json(
@@ -742,9 +748,8 @@ def test_planner_expands_squads_and_referees_from_stored_evidence(tmp_path):
 
     assert plan.team_ids == ("42", "44")
     assert plan.referee_ids == ("900",)
-    assert [
-        spec.key.target_id for spec in plan.specs if spec.key.endpoint == "squads"
-    ] == ["42", "44"]
+    # #1357: the season-scoped squad route is dead (404) -> never planned.
+    assert not [spec for spec in plan.specs if spec.key.endpoint == "squads"]
     assert [
         spec.key.target_id
         for spec in plan.specs
@@ -862,12 +867,7 @@ def test_empty_participants_cannot_prove_player_universe(tmp_path):
 
     assert plan.team_ids == ("42", "44")
     assert participants.key in plan.pending_keys
-    assert {
-        spec.key.target_id for spec in plan.specs if spec.key.endpoint == "squads"
-    } == {
-        "42",
-        "44",
-    }
+    assert not [spec for spec in plan.specs if spec.key.endpoint == "squads"]
     assert plan.player_universe_evidence_gaps == (
         "participants returned no teams; squad universe is unproven",
     )
@@ -877,7 +877,7 @@ def test_empty_participants_cannot_prove_player_universe(tmp_path):
 
 
 @pytest.mark.unit
-def test_partial_participants_and_missing_squad_stay_incomplete(tmp_path):
+def test_partial_participants_stay_incomplete_without_planning_squads(tmp_path):
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     evidence = _payload(PLAYER_EVIDENCE_CASES)
@@ -904,8 +904,9 @@ def test_partial_participants_and_missing_squad_stay_incomplete(tmp_path):
 
     assert plan.team_ids == ("42", "44")
     assert participants.key in plan.pending_keys
-    assert missing_squad in plan.pending_keys
-    assert missing_squad in plan.missing_raw_keys
+    # #1357: a missing squad is neither pending nor a paid request any more.
+    assert missing_squad not in plan.pending_keys
+    assert missing_squad not in plan.missing_raw_keys
     assert plan.player_universe_evidence_gaps == (
         "participants omitted scheduled team ids: 44",
     )
@@ -936,9 +937,7 @@ def test_disabled_bracket_placeholders_stay_out_of_team_universe(tmp_path):
     plan = plan_season_partition(raw_store, manifest, **_common())
 
     assert plan.team_ids == ("17", "33", "42", "44")
-    assert {
-        spec.key.target_id for spec in plan.specs if spec.key.endpoint == "squads"
-    } == {"17", "33", "42", "44"}
+    assert not [spec for spec in plan.specs if spec.key.endpoint == "squads"]
     assert plan.placeholder_team_ids == ("999901", "999902")
     assert plan.player_universe_evidence_gaps == ()
     assert "14000101" in plan.schedule_event_ids
@@ -956,10 +955,13 @@ def test_unfinished_cup_bracket_plan_completes_without_placeholder_squads(
         schedule_next_payload=_payload(CUP_BRACKET_NEXT_PAGE),
     )
     initial = plan_season_partition(raw_store, manifest, **_common())
+    _seed_stored_squads(
+        raw_store,
+        initial.team_ids,
+        json.dumps(evidence["nonempty_squad"]).encode(),
+    )
     for spec in initial.specs:
-        if spec.key.endpoint == "squads":
-            _seed_json(raw_store, spec, evidence["nonempty_squad"])
-        elif spec.key.endpoint == "referee_profile":
+        if spec.key.endpoint == "referee_profile":
             _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
     engine, transport = _engine(
         tmp_path,
@@ -1064,7 +1066,7 @@ def test_mixed_event_keeps_real_disabled_false_team_and_drops_placeholder(
 
 
 @pytest.mark.unit
-def test_empty_squad_is_not_terminal_player_universe_success(tmp_path):
+def test_stored_empty_squad_is_not_planned_and_adds_no_players(tmp_path):
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     evidence = _payload(PLAYER_EVIDENCE_CASES)
@@ -1098,24 +1100,11 @@ def test_empty_squad_is_not_terminal_player_universe_success(tmp_path):
 
     plan = plan_season_partition(raw_store, manifest, **_common())
 
-    assert empty_squad.key in plan.pending_keys
-    assert empty_squad.key not in plan.missing_raw_keys
-    assert plan.player_universe_evidence_gaps == (
-        "scheduled/participating team 44 has an empty squad",
-    )
-    # #1351: the gap closes the player universe, not the season publication.
-    assert plan.player_universe_ready is False
-    with pytest.raises(SeasonPlanningError, match="empty squad"):
-        squad_player_ids(raw_store, plan)
-    with pytest.raises(
-        SeasonMaterializationError, match="do not match the planned partition"
-    ):
-        materialize_season_partition(
-            plan,
-            [],
-            canonical_league="ENG-Premier League",
-            canonical_season="2025/26",
-        )
+    # #1357: squads are not planned, so an empty stored squad is no gap; the
+    # stored non-empty squad of team 42 still contributes its players.
+    assert empty_squad.key not in plan.pending_keys
+    assert plan.player_universe_evidence_gaps == ()
+    assert squad_player_ids(raw_store, plan) == ("1001", "1002")
 
 
 @pytest.mark.unit
@@ -1124,8 +1113,10 @@ def test_source_unsupported_season_squads_do_not_fake_historical_rosters(tmp_pat
     manifest = InMemoryManifestStore()
     _seed_complete_partition_roots(raw_store)
     preliminary = plan_season_partition(raw_store, manifest, **_common())
+    # #1357: not planned any more; 404s stored by older runs must stay inert.
     squad_specs = [
-        spec for spec in preliminary.specs if spec.key.endpoint == "squads"
+        build_squad_spec(team_id=team_id, **_common())
+        for team_id in preliminary.team_ids
     ]
     assert squad_specs
 
@@ -1165,10 +1156,13 @@ def test_full_team_and_squad_evidence_builds_nonempty_universe(tmp_path):
     evidence = _payload(PLAYER_EVIDENCE_CASES)
     _seed_complete_partition_roots(raw_store)
     initial = plan_season_partition(raw_store, manifest, **_common())
+    _seed_stored_squads(
+        raw_store,
+        initial.team_ids,
+        json.dumps(evidence["nonempty_squad"]).encode(),
+    )
     for spec in initial.specs:
-        if spec.key.endpoint == "squads":
-            _seed_json(raw_store, spec, evidence["nonempty_squad"])
-        elif spec.key.endpoint == "referee_profile":
+        if spec.key.endpoint == "referee_profile":
             _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
     engine, _ = _engine(
         tmp_path,
@@ -1233,7 +1227,6 @@ def test_whole_partition_offline_replay_materializes_with_zero_network(tmp_path)
         "rounds",
         "cup_trees",
         "participants",
-        "squads",
         "referee_profile",
     }
 
@@ -1350,7 +1343,6 @@ def test_deferred_normalized_results_materialize_before_atomic_merge_finalize(
             "rounds",
             "cup_trees",
             "participants",
-            "squads",
             "referee_profile",
         )
     )
@@ -1481,6 +1473,8 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     assert replay_transport.calls == 0
     browser.assert_not_called()
     no_op = json.loads(no_op_output.read_text(encoding="utf-8"))
+    # #1357: Trino round-trips of the process; the count is process-wide.
+    assert set(no_op["traffic"].pop("trino_queries")) == {"select", "merge", "other"}
     assert no_op["traffic"] == {
         "paid_proxy_bytes": 0,
         "paid_proxy_mb": 0.0,
@@ -1512,10 +1506,13 @@ def test_runner_signed_season_with_player_universe_gap_publishes_at_zero_traffic
         raw_store, participants_payload=evidence["partial_participants"]
     )
     initial = plan_season_partition(raw_store, manifest, **_common())
+    _seed_stored_squads(
+        raw_store,
+        initial.team_ids,
+        json.dumps(evidence["nonempty_squad"]).encode(),
+    )
     for spec in initial.specs:
-        if spec.key.endpoint == "squads":
-            _seed_json(raw_store, spec, evidence["nonempty_squad"])
-        elif spec.key.endpoint == "referee_profile":
+        if spec.key.endpoint == "referee_profile":
             _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
     engine, transport = _engine(
         tmp_path,
@@ -1637,10 +1634,13 @@ def test_runner_main_with_a_real_signed_season_plan_publishes_despite_universe_g
         raw_store, participants_payload=evidence["partial_participants"]
     )
     initial = plan_season_partition(raw_store, manifest, **_common())
+    _seed_stored_squads(
+        raw_store,
+        initial.team_ids,
+        json.dumps(evidence["nonempty_squad"]).encode(),
+    )
     for spec in initial.specs:
-        if spec.key.endpoint == "squads":
-            _seed_json(raw_store, spec, evidence["nonempty_squad"])
-        elif spec.key.endpoint == "referee_profile":
+        if spec.key.endpoint == "referee_profile":
             _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
     engine, transport = _engine(
         tmp_path,
@@ -2884,10 +2884,13 @@ def test_player_universe_gap_does_not_block_the_season_or_match_phase(tmp_path):
         raw_store, participants_payload=evidence["partial_participants"]
     )
     initial = plan_season_partition(raw_store, manifest, **_common())
+    _seed_stored_squads(
+        raw_store,
+        initial.team_ids,
+        json.dumps(evidence["nonempty_squad"]).encode(),
+    )
     for spec in initial.specs:
-        if spec.key.endpoint == "squads":
-            _seed_json(raw_store, spec, evidence["nonempty_squad"])
-        elif spec.key.endpoint == "referee_profile":
+        if spec.key.endpoint == "referee_profile":
             _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
     engine, transport = _engine(
         tmp_path, raw_store=raw_store, manifest_store=manifest

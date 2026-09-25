@@ -1013,30 +1013,11 @@ def plan_season_partition(
     # from silently shrinking the squad/profile universe.
     team_ids = scheduled_team_ids | participant_team_ids
 
-    for team_id in sorted(team_ids, key=int):
-        spec = build_squad_spec(team_id=team_id, **common)
-        specs.append(spec)
-        stored = inspect(spec)
-        squad_manifest = manifest_store.get(spec.key)
-        squad_not_supported = bool(
-            squad_manifest
-            and squad_manifest.status == ManifestStatus.NOT_SUPPORTED
-            and stored.raw is not None
-            and stored.raw.http_status in spec.not_supported_http_statuses
-        )
-        if stored.has_valid_json and not stored.payload["players"]:
-            player_universe_evidence_gaps.append(
-                f"scheduled/participating team {team_id} has an empty squad"
-            )
-        elif (
-            not stored.has_valid_json
-            and squad_manifest is not None
-            and squad_manifest.is_terminal
-            and not squad_not_supported
-        ):
-            player_universe_evidence_gaps.append(
-                f"scheduled/participating team {team_id} has no usable squad evidence"
-            )
+    # #1357: ``squads`` is not planned at all. The season-scoped route answers
+    # 404 (configs/sofascore/endpoint_coverage.yaml: unsupported) and a
+    # day-keyed freshness bought a new paid 404 per team every day. The player
+    # universe comes from match evidence plus any squad raw stored earlier
+    # (``squad_player_ids``); a missing squad is no longer a universe gap.
 
     referee_ids = set(embedded_referee_ids)
     for event_id in event_ids:
@@ -1563,12 +1544,12 @@ def squad_player_ids(
     raw_store: RawPayloadStore,
     plan: SeasonPartitionPlan,
 ) -> tuple[str, ...]:
-    """Resolve registered players from exact planned squad raw, without I/O.
+    """Resolve registered players from squad raw stored earlier, without I/O.
 
-    A source-supported season squad contributes registered players. SofaScore
-    currently returns 404 for the season-scoped squad route; that explicit
-    terminal ``not_supported`` state contributes no IDs and is not confused
-    with missing/malformed evidence. The current-only ``/team/{id}/players``
+    ``squads`` is no longer planned (#1357): SofaScore answers 404 for the
+    season-scoped squad route. A squad payload already stored under the plan's
+    freshness key still contributes registered players; an absent or 404 raw
+    contributes none, and the universe then rests on match evidence. The current-only ``/team/{id}/players``
     route is deliberately not used for historical season attribution.
     """
     if plan.player_universe_evidence_gaps:
@@ -1580,21 +1561,18 @@ def squad_player_ids(
         raise SeasonPlanningError("season plan has no team evidence")
 
     player_ids: set[str] = set()
-    squad_team_ids: set[str] = set()
-    for spec in plan.specs:
-        if spec.key.endpoint != "squads":
-            continue
-        squad_team_ids.add(str(spec.key.target_id))
+    for team_id in plan.team_ids:
+        # Squads are no longer planned (#1357): read only raw stored earlier
+        # under the plan's freshness key; absent or 404 contributes nothing.
+        spec = build_squad_spec(
+            source_tournament_id=plan.source_tournament_id,
+            source_season_id=plan.source_season_id,
+            team_id=team_id,
+            freshness_key=plan.freshness_key,
+        )
         stored = _load_stored_payload(raw_store, spec)
-        if (
-            stored.raw is not None
-            and stored.raw.http_status in spec.not_supported_http_statuses
-        ):
-            continue
         if not stored.has_valid_json:
-            raise SeasonPlanningError(
-                f"planned squad {spec.key.target_id} has no valid raw payload"
-            )
+            continue
         for index, entry in enumerate(stored.payload["players"]):
             if not isinstance(entry, Mapping):
                 raise SeasonPlanningError(
@@ -1611,12 +1589,6 @@ def squad_player_ids(
                 raise SeasonPlanningError(
                     f"squad {spec.key.target_id} entry {index} has invalid player id"
                 ) from exc
-    missing_squads = set(plan.team_ids) - squad_team_ids
-    if missing_squads:
-        raise SeasonPlanningError(
-            "season plan omitted squad endpoints for team ids: "
-            + ",".join(sorted(missing_squads, key=int))
-        )
     return tuple(sorted(player_ids, key=int))
 
 
