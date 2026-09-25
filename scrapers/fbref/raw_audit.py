@@ -189,6 +189,50 @@ def _s3_list_client():
     )
 
 
+_S3_LIST_PAGE_SIZE = 1_000
+
+
+def _list_s3_pages(
+    client: Any, bucket: str, prefix: str
+) -> Iterator[list[dict[str, Any]]]:
+    """Page ListObjectsV2 without trusting IsTruncated on a full page.
+
+    SeaweedFS can end a full page on a directory marker (``targets-v2/``)
+    with ``IsTruncated=False`` and drop the whole subtree (#1535); a full
+    page therefore resumes with ``StartAfter`` from its last key.
+    """
+
+    token: str | None = None
+    start_after: str | None = None
+    seen_tokens: set[str] = set()
+    while True:
+        request: dict[str, Any] = {
+            "Bucket": bucket,
+            "Prefix": prefix,
+            "MaxKeys": _S3_LIST_PAGE_SIZE,
+        }
+        if token:
+            request["ContinuationToken"] = token
+        elif start_after:
+            request["StartAfter"] = start_after
+        page = client.list_objects_v2(**request)
+        contents = list(page.get("Contents") or ())
+        yield contents
+        if page.get("IsTruncated") and page.get("NextContinuationToken"):
+            token = str(page["NextContinuationToken"])
+            if token in seen_tokens:
+                raise RawAuditError("S3 raw listing repeated a continuation token")
+            seen_tokens.add(token)
+            continue
+        token = None
+        if len(contents) < _S3_LIST_PAGE_SIZE:
+            return
+        last_key = str(contents[-1].get("Key") or "")
+        if not last_key or last_key == start_after:
+            raise RawAuditError("S3 raw listing stopped advancing")
+        start_after = last_key
+
+
 def _walk_s3_raw_files(store: RawPageStore) -> Iterator[_RawObjectInfo]:
     """Use bounded ListObjectsV2 pages instead of directory-per-key walks."""
 
@@ -199,14 +243,8 @@ def _walk_s3_raw_files(store: RawPageStore) -> Iterator[_RawObjectInfo]:
     list_prefix = f"{normalized_prefix}/" if normalized_prefix else ""
     client = _s3_list_client()
     try:
-        paginator = client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(
-            Bucket=bucket,
-            Prefix=list_prefix,
-            PaginationConfig={"PageSize": 1_000},
-        )
-        for page in pages:
-            for item in page.get("Contents") or ():
+        for page in _list_s3_pages(client, bucket, list_prefix):
+            for item in page:
                 object_key = str(item.get("Key") or "")
                 if not object_key or object_key.endswith("/"):
                     continue
