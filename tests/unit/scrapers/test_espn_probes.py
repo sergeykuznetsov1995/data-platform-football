@@ -1,4 +1,4 @@
-"""ESPN core parsers against real recorded ESPN responses (#1498).
+"""ESPN core parsers against real recorded ESPN responses (#1498, #1502).
 
 Bodies are verbatim copies of the 24.09.2026 review probes; the source URL of
 every file is listed in ``tests/fixtures/espn/probes/README.md``.  No network.
@@ -15,7 +15,7 @@ import pytest
 from scrapers.espn.models import CapabilityState
 from scrapers.espn.parsers import (
     EntityParseState,
-    EspnParseError,
+    SummaryDisposition,
     parse_scoreboards,
     parse_summary,
 )
@@ -118,6 +118,7 @@ def test_real_summary_is_captured_with_two_starting_elevens(
     assert event.played_final
     assert (event.home_score, event.away_score) == score
     assert result.event_id == event_id
+    assert result.disposition is SummaryDisposition.CAPTURED
     assert result.lineup_state is EntityParseState.CAPTURED
     assert len(result.lineup) == lineup_rows
     starters: dict[int, int] = {}
@@ -128,31 +129,170 @@ def test_real_summary_is_captured_with_two_starting_elevens(
     assert len(result.matchsheet) == 2
 
 
+# Nine recorded Summary bodies (#1502): five history probes c3/recon and four
+# C6-F1 cases; every one gets a disposition, none raises.
+_DISPOSITIONS = [
+    # name, disposition, anomalies, lineup state, matchsheet state,
+    # lineup rows, starters by team, formation on both teams
+    ("summary_eng1_2005.json", "captured", (), "captured", "captured", 32,
+     {368: 11, 360: 11}, False),
+    # Fulham has 13 rows flagged starter.
+    ("summary_eng1_2010.json", "lineup_anomaly", ("starters_not_11",), "captured",
+     "captured", 38, {382: 11, 370: 13}, True),
+    # Auxerre has 12 rows flagged starter.
+    ("summary_ucl_2010.json", "lineup_anomaly", ("starters_not_11",), "captured",
+     "captured", 37, {103: 11, 172: 12}, True),
+    # World Cup 2010: ``roster: []`` for both teams, statistics present.
+    ("summary_fifaworld_2010.json", "captured", (), "valid_empty", "captured", 0,
+     {}, True),
+    ("summary_ger2_2016.json", "captured", (), "captured", "captured", 36,
+     {3070: 11, 269: 11}, True),
+    ("summary_eng1_2020.json", "captured", (), "captured", "captured", 40,
+     {359: 11, 331: 11}, True),
+    # uru.1 401905201: 10 + 11 starters, no formationPlace, no statistics.
+    ("summary_uru1_2026_ten_starters.json", "lineup_anomaly", ("starters_not_11",),
+     "captured", "valid_empty", 40, {9902: 10, 8416: 11}, False),
+    # jpn.1 401877180: FC Tokyo fields 10 starters.
+    ("summary_jpn1_2026_ten_starters.json", "lineup_anomaly", ("starters_not_11",),
+     "captured", "captured", 39, {3384: 10, 22167: 11}, True),
+    # arg.2 401844030: athlete 408183 is both starter and subbed in.
+    ("summary_arg2_2026_contradictory_flag.json", "lineup_anomaly",
+     ("contradictory_flags",), "captured", "captured", 39, {10743: 11, 236: 11},
+     True),
+    # gua.1 401879625: no ``roster`` key, no statistics - the honest empty.
+    ("summary_gua1_2026_no_roster.json", "valid_empty", (), "valid_empty",
+     "valid_empty", 0, {}, False),
+]
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("name", "message"),
-    [
-        # eng.1 2010-11, Man City 1-1 Fulham: Fulham has 13 rows flagged starter.
-        (
-            "summary_eng1_2010.json",
-            r"11 starters per team for event 292828; got \{382: 11, 370: 13\}",
-        ),
-        # UCL 2010-11, AC Milan 2-0 Auxerre: Auxerre has 12 rows flagged starter.
-        (
-            "summary_ucl_2010.json",
-            r"11 starters per team for event 307787; got \{103: 11, 172: 12\}",
-        ),
-        # World Cup 2010, South Africa 1-1 Mexico: both roster lists are empty.
-        ("summary_fifaworld_2010.json", "team roster must not be empty"),
-    ],
+    (
+        "name",
+        "disposition",
+        "anomalies",
+        "lineup_state",
+        "matchsheet_state",
+        "lineup_rows",
+        "starters",
+        "formation",
+    ),
+    _DISPOSITIONS,
 )
-def test_real_2010_summary_fails_strictly_until_disposition(
-    name: str, message: str
+def test_real_summary_gets_a_disposition_without_raising(
+    name: str,
+    disposition: str,
+    anomalies: tuple[str, ...],
+    lineup_state: str,
+    matchsheet_state: str,
+    lineup_rows: int,
+    starters: dict[int, int],
+    formation: bool,
 ) -> None:
-    # #1502 moves these real 2010 shapes to source_malformed / lineup_anomaly
-    # instead of an exception; until then the strict parser must refuse them.
-    with pytest.raises(EspnParseError, match=message):
-        _parse(name)
+    event, result = _parse(name)
+    payload = _json(name)
+
+    assert result.disposition is SummaryDisposition(disposition)
+    assert result.reason is None
+    assert result.anomalies == anomalies
+    assert result.lineup_state is EntityParseState(lineup_state)
+    assert result.matchsheet_state is EntityParseState(matchsheet_state)
+    assert len(result.lineup) == lineup_rows
+    counted: dict[int, int] = {}
+    for row in result.lineup:
+        counted[row.team_id] = counted.get(row.team_id, 0) + (row.starter is True)
+    assert counted == starters
+    # Shirt numbers live on the roster entry, not on the athlete (C6-F5).
+    assert sum(row.jersey is not None for row in result.lineup) == lineup_rows
+    # Match facts are written for both teams even without team statistics.
+    assert len(result.matchsheet) == 2
+    if matchsheet_state == "valid_empty":
+        assert {row.total_shots for row in result.matchsheet} == {None}
+    for row in result.matchsheet:
+        assert (row.formation is not None) is formation
+        assert row.score == (
+            event.home_score if row.is_home else event.away_score
+        )
+        if row.score_h1 is not None:
+            assert row.score_h1 + row.score_h2 == row.score
+    # Every keyEvents and commentary record becomes one event row.
+    assert len(result.events) == len(payload.get("keyEvents") or []) + len(
+        payload.get("commentary") or []
+    )
+    # Commentary lines share a play (a foul and the free kick it wins), so
+    # their key is the sequence; bodies without sequence fall back to play_id.
+    keys = {
+        (
+            row.kind,
+            row.play_id
+            if row.kind == "key_event" or row.sequence is None
+            else row.sequence,
+        )
+        for row in result.events
+    }
+    assert len(keys) == len(result.events)
+    # Only unknown keys inside parsed blocks; news/videos/odds/... are dropped.
+    assert set(json.loads(result.extra_json)) <= {
+        "header",
+        "headerSections",
+        "boxscore",
+        "rosters",
+        "gameInfo",
+    }
+
+
+@pytest.mark.unit
+def test_real_summary_referee_linescores_and_attendance() -> None:
+    _, eng1_2010 = _parse("summary_eng1_2010.json")
+    # Three officials, all "Referee", order 1-3: the first ordered one wins.
+    assert {row.referee for row in eng1_2010.matchsheet} == {"Peter Walton"}
+    assert [(row.score_h1, row.score_h2) for row in eng1_2010.matchsheet] == [
+        (1, 0),
+        (0, 1),
+    ]
+
+    _, eng1_2005 = _parse("summary_eng1_2005.json")
+    assert {row.referee for row in eng1_2005.matchsheet} == {"G Poll"}
+    assert {(row.score_h1, row.score_h2, row.score_et) for row in eng1_2005.matchsheet} == {
+        (None, None, None)
+    }
+    assert {row.formation for row in eng1_2005.matchsheet} == {None}
+
+    # No team statistics: match facts still come from header and gameInfo.
+    _, uru1 = _parse("summary_uru1_2026_ten_starters.json")
+    assert [(row.score_h1, row.score_h2) for row in uru1.matchsheet] == [
+        (1, 0),
+        (0, 1),
+    ]
+    assert {(row.venue_id, row.venue) for row in uru1.matchsheet} == {
+        (10435, "Estadio Arquitecto Antonio Eleuterio Ubilla")
+    }
+    _, gua1 = _parse("summary_gua1_2026_no_roster.json")
+    assert [(row.score_h1, row.score_h2) for row in gua1.matchsheet] == [
+        (3, 0),
+        (0, 0),
+    ]
+
+    _, ucl_2010 = _parse("summary_ucl_2010.json")
+    # ESPN reports attendance 0 when it does not know it.
+    assert {row.attendance for row in ucl_2010.matchsheet} == {None}
+
+    _, eng1_2020 = _parse("summary_eng1_2020.json")
+    assert {row.attendance for row in eng1_2020.matchsheet} == {10000}
+    assert {row.formation for row in eng1_2020.matchsheet} == {"4-2-3-1", "4-3-3"}
+    goal = next(
+        row
+        for row in eng1_2020.events
+        if row.kind == "key_event" and row.type_text == "Goal"
+    )
+    assert goal.scoring_play is True
+    assert goal.team_id is not None and json.loads(goal.athlete_ids)
+    assert goal.clock_display is not None
+    # Summary events carry no card/penalty/own-goal flags (core plays do).
+    assert {row.red_card for row in eng1_2020.events} == {None}
+    commentary = [row for row in eng1_2020.events if row.kind == "commentary"]
+    assert {row.team_id for row in commentary} == {None}
+    assert any('"participants"' in row.extra_json for row in commentary)
 
 
 @pytest.mark.unit

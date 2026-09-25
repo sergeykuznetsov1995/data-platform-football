@@ -7,7 +7,7 @@ import re
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from .models import CapabilityState, Competition, Edition
+from .models import Competition, Edition
 from .parser_common import (
     EspnParseError,
     canonical_json,
@@ -20,16 +20,18 @@ from .parser_common import (
     required_mapping,
     required_string,
     unknown_fields,
-    utc_datetime,
 )
 from .parser_contracts import (
     EntityParseState,
+    LINEUP_ANOMALY_CLASSES,
     LINEUP_STAT_MAP_VERSION,
     LineupRow,
     MATCHSHEET_STAT_MAP_VERSION,
+    MatchEventRow,
     MatchsheetRow,
     PARSER_VERSION,
     ScheduleRow,
+    SummaryDisposition,
     SummaryParseResult,
 )
 
@@ -65,9 +67,6 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
         "effectiveTackles": "effective_tackles",
         "foulsCommitted": "fouls_committed",
         "fouls": "fouls_committed",
-        "goalAssists": "goal_assists",
-        "goalDifference": "goal_difference",
-        "goalsConceded": "goals_conceded",
         "interceptions": "interceptions",
         "longballPct": "longball_pct",
         "offsides": "offsides",
@@ -83,7 +82,6 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
         "tacklePct": "tackle_pct",
         "totalClearance": "total_clearance",
         "totalCrosses": "total_crosses",
-        "totalGoals": "total_goals",
         "totalLongBalls": "total_long_balls",
         "totalPasses": "total_passes",
         "shots": "total_shots",
@@ -96,80 +94,156 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
 )
 
 
-def _valid_empty_or_fail(capability: CapabilityState, entity: str) -> EntityParseState:
-    if capability is CapabilityState.PROVEN:
-        raise EspnParseError(f"proven {entity} section is absent or empty")
-    if capability not in {
-        CapabilityState.PARTIAL,
-        CapabilityState.ABSENT,
-        CapabilityState.UNKNOWN,
-    }:
-        raise EspnParseError(f"{entity} capability does not permit valid_empty")
-    return EntityParseState.VALID_EMPTY
+class _SourceMalformed(EspnParseError):
+    """A Summary shape this parser cannot read without guessing.
+
+    It stops the current match only: ``parse_summary`` turns it (and any
+    ``EspnParseError`` of the shared helpers) into ``SOURCE_MALFORMED``.
+    """
+
+
+class _Anomalies:
+    """Lineup anomaly classes collected while the rows are still written."""
+
+    def __init__(self) -> None:
+        self.classes: set[str] = set()
+
+    def add(self, name: str) -> None:
+        if name not in LINEUP_ANOMALY_CLASSES:
+            raise ValueError(f"unknown lineup anomaly class {name!r}")
+        self.classes.add(name)
+
+
+# Summary blocks ESPN sends that are neither parsed nor kept (grill decision 3).
+_DROPPED_BLOCKS = (
+    "news",
+    "article",
+    "videos",
+    "odds",
+    "pickcenter",
+    "lastFiveGames",
+    "seasonseries",
+    "standings",
+    "broadcasts",
+    "leaders",
+)
 
 
 def _validate_context(
     competition: Competition, edition: Edition, event: ScheduleRow
 ) -> None:
+    # The context only names the match and its season; a mismatch is a caller
+    # bug, not a source shape.
     if not isinstance(competition, Competition) or not isinstance(edition, Edition):
         raise TypeError("competition and edition must be registry models")
     if not isinstance(event, ScheduleRow):
         raise TypeError("event must be a normalized ScheduleRow")
-    if edition not in competition.editions:
-        raise EspnParseError("edition is not promoted for this competition")
     if (
         event.competition_id != competition.espn_id
         or event.source_season_year != edition.source_season_year
         or event.scope_id != competition.scope_id(edition)
     ):
-        raise EspnParseError("Summary parser context does not match schedule scope")
+        raise ValueError("Summary parser context does not match schedule scope")
+
+
+def _count(value: Any, field: str) -> int | None:
+    """Non-negative whole number from an ESPN int, integral float or digits."""
+
+    if isinstance(value, Mapping):
+        value = value.get("value", value.get("displayValue"))
+    if value is None:
+        return None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+    return optional_nonnegative_int(value, field)
+
+
+def _linescores(competitor: Mapping[str, Any], field: str) -> tuple[int | None, ...]:
+    if competitor.get("linescores") is None:
+        return None, None, None
+    periods = [
+        _count(item, f"{field}.linescores[{index}]")
+        for index, item in enumerate(
+            required_list(competitor["linescores"], f"{field}.linescores")
+        )
+    ]
+    first = periods[0] if periods else None
+    second = periods[1] if len(periods) > 1 else None
+    extra = [value for value in periods[2:] if value is not None]
+    return first, second, sum(extra) if extra else None
 
 
 def _header_sides(
     payload: Mapping[str, Any], event: ScheduleRow
-) -> tuple[Mapping[str, Any], dict[int, tuple[str, str]], dict[str, Any]]:
+) -> tuple[
+    dict[int, tuple[str, str]], dict[int, dict[str, Any]], int | None, dict[str, Any]
+]:
     header = required_mapping(payload.get("header"), "summary.header")
     header_id = native_id(header.get("id"), "summary.header.id")
     if header_id != event.event_id:
-        raise EspnParseError("summary.header.id does not match schedule event_id")
+        raise _SourceMalformed("summary.header.id does not match schedule event_id")
     competitions = required_list(
         header.get("competitions"), "summary.header.competitions"
     )
     if len(competitions) != 1:
-        raise EspnParseError("summary.header must have exactly one competition")
+        raise _SourceMalformed("summary.header must have exactly one competition")
     header_competition = required_mapping(
         competitions[0], "summary.header.competitions[0]"
     )
-    kickoff = utc_datetime(
-        header_competition.get("date"), "summary.header.competitions[0].date"
-    )
-    if kickoff != event.kickoff:
-        raise EspnParseError("Summary kickoff does not match normalized schedule event")
     competitors = required_list(
         header_competition.get("competitors"),
         "summary.header.competitions[0].competitors",
     )
     if len(competitors) != 2:
-        raise EspnParseError("Summary header must have exactly two competitors")
+        raise _SourceMalformed("Summary header must have exactly two competitors")
     by_team: dict[int, tuple[str, str]] = {}
     by_side: dict[str, int] = {}
+    side_facts: dict[int, dict[str, Any]] = {}
     nested_extras: dict[str, Any] = {}
     for index, raw_competitor in enumerate(competitors):
         field = f"summary.header.competitors[{index}]"
         competitor = required_mapping(raw_competitor, field)
         home_away = required_string(competitor.get("homeAway"), f"{field}.homeAway")
         if home_away not in {"home", "away"} or home_away in by_side:
-            raise EspnParseError("Summary header must have unique home and away sides")
+            raise _SourceMalformed(
+                "Summary header must have unique home and away sides"
+            )
         team = required_mapping(competitor.get("team"), f"{field}.team")
         team_id = native_id(team.get("id"), f"{field}.team.id")
         team_name = required_string(
             team.get("displayName"), f"{field}.team.displayName"
         )
         if team_id in by_team:
-            raise EspnParseError("Summary header team IDs must be distinct")
+            raise _SourceMalformed("Summary header team IDs must be distinct")
         by_team[team_id] = (home_away, team_name)
         by_side[home_away] = team_id
-        competitor_extra = unknown_fields(competitor, ("homeAway", "team", "score"))
+        score_h1, score_h2, score_et = _linescores(competitor, field)
+        side_facts[team_id] = {
+            "score_h1": score_h1,
+            "score_h2": score_h2,
+            "score_et": score_et,
+            "shootout_score": _count(
+                competitor.get("shootoutScore"), f"{field}.shootoutScore"
+            ),
+            "aggregate_score": _count(
+                competitor.get("aggregateScore"), f"{field}.aggregateScore"
+            ),
+            "advance": optional_bool(competitor.get("advance"), f"{field}.advance"),
+        }
+        competitor_extra = unknown_fields(
+            competitor,
+            (
+                "homeAway",
+                "team",
+                "score",
+                "linescores",
+                "shootoutScore",
+                "aggregateScore",
+                "advance",
+            ),
+        )
         team_extra = unknown_fields(team, ("id", "displayName"))
         if competitor_extra or team_extra:
             nested_extras[home_away] = {
@@ -182,13 +256,14 @@ def _header_sides(
             }
     expected = {event.home_team_id: "home", event.away_team_id: "away"}
     if {team_id: side for team_id, (side, _) in by_team.items()} != expected:
-        raise EspnParseError("Summary header teams/homeAway do not match schedule")
+        raise _SourceMalformed("Summary header teams/homeAway do not match schedule")
+    leg = _count(header_competition.get("leg"), "summary.header.competitions[0].leg")
     competition_extra = unknown_fields(
-        header_competition, ("date", "competitors", "id", "status", "venue")
+        header_competition, ("date", "competitors", "id", "status", "venue", "leg")
     )
     if competition_extra:
         nested_extras["competition"] = competition_extra
-    return header_competition, by_team, nested_extras
+    return by_team, side_facts, leg, nested_extras
 
 
 def _team_block(
@@ -198,12 +273,12 @@ def _team_block(
     team = required_mapping(block.get("team"), f"{field}.team")
     team_id = native_id(team.get("id"), f"{field}.team.id")
     if team_id not in by_team:
-        raise EspnParseError(f"{field}.team.id is not a Summary header team")
+        raise _SourceMalformed(f"{field}.team.id is not a Summary header team")
     side, header_name = by_team[team_id]
     if "homeAway" in block:
         block_side = required_string(block["homeAway"], f"{field}.homeAway")
         if block_side != side:
-            raise EspnParseError(f"{field}.homeAway conflicts with native team ID")
+            raise _SourceMalformed(f"{field}.homeAway conflicts with native team ID")
     team_name = optional_string(team.get("displayName"), f"{field}.team.displayName")
     if team_name is not None and team_name != header_name:
         # Display strings are not identity; retain the section-local value.
@@ -211,12 +286,26 @@ def _team_block(
     return team_id, side, header_name, block
 
 
+def _team_blocks(
+    value: Any, field: str, by_team: Mapping[int, tuple[str, str]]
+) -> dict[int, tuple[str, str, Mapping[str, Any]]]:
+    """Section blocks by native team ID; a repeated team is unreadable."""
+
+    blocks: dict[int, tuple[str, str, Mapping[str, Any]]] = {}
+    for index, raw in enumerate(required_list(value, field)):
+        team_id, side, team_name, block = _team_block(raw, f"{field}[{index}]", by_team)
+        if team_id in blocks:
+            raise _SourceMalformed(f"{field} contain a duplicate team ID")
+        blocks[team_id] = (side, team_name, block)
+    return blocks
+
+
 def _substitution_flag(value: Any, field: str) -> bool | None:
     if value is None or type(value) is bool:
         return value
     detail = required_mapping(value, field)
     if "didSub" not in detail:
-        raise EspnParseError(f"{field}.didSub is required for substitution objects")
+        raise _SourceMalformed(f"{field}.didSub is required for substitution objects")
     return optional_bool(detail["didSub"], f"{field}.didSub")
 
 
@@ -242,7 +331,7 @@ def _small_sided_size(payload: Mapping[str, Any]) -> int | None:
     if configured_size is None:
         return None
     if type(configured_size) is not int or not 1 <= configured_size <= 7:
-        raise EspnParseError(
+        raise _SourceMalformed(
             "summary.format.startersPerTeam must be an integer from 1 to 7"
         )
     return configured_size
@@ -291,128 +380,82 @@ def _legacy_substitutions(
 
 
 def _parse_game_info(
-    payload: Mapping[str, Any], event: ScheduleRow
-) -> tuple[
-    int | None,
-    str | None,
-    int | None,
-    str | None,
-    int | None,
-    str | None,
-    dict[str, Any],
-    tuple[dict[str, Any], ...],
-]:
+    payload: Mapping[str, Any],
+) -> tuple[int | None, str | None, int | None, str | None, dict[str, Any]]:
+    """Venue, attendance and the referee; no gameInfo -> all NULL."""
+
     if "gameInfo" not in payload or payload["gameInfo"] is None:
-        return None, None, None, None, None, None, {}, ()
+        return None, None, None, None, {}
     info = required_mapping(payload["gameInfo"], "summary.gameInfo")
     venue_id: int | None = None
     venue_name: str | None = None
-    capacity: str | None = None
     venue_extra: dict[str, Any] = {}
     if "venue" in info and info["venue"] is not None:
+        # The Summary venue wins over the schedule one: it is the later fetch.
         venue = required_mapping(info["venue"], "summary.gameInfo.venue")
         if "id" in venue and venue["id"] is not None:
             venue_id = native_id(venue["id"], "summary.gameInfo.venue.id")
         venue_name = optional_string(
             venue.get("fullName"), "summary.gameInfo.venue.fullName"
         )
-        capacity_value = optional_nonnegative_int(
-            venue.get("capacity"), "summary.gameInfo.venue.capacity"
-        )
-        capacity = str(capacity_value) if capacity_value is not None else None
         venue_extra = unknown_fields(venue, ("id", "fullName"))
-        if (
-            event.venue_id is not None
-            and venue_id is not None
-            and event.venue_id != venue_id
-        ):
-            raise EspnParseError("Summary venue ID conflicts with schedule venue ID")
-    attendance = optional_nonnegative_int(
-        info.get("attendance"), "summary.gameInfo.attendance"
+    # ESPN answers 0 when it does not know the attendance.
+    attendance = (
+        optional_nonnegative_int(info.get("attendance"), "summary.gameInfo.attendance")
+        or None
     )
-    referee_id: int | None = None
+    officials = [
+        required_mapping(raw, f"summary.gameInfo.officials[{index}]")
+        for index, raw in enumerate(
+            required_list(info.get("officials", []), "summary.gameInfo.officials")
+        )
+    ]
+    labelled: list[int] = []
+    for index, official in enumerate(officials):
+        if official.get("position") is None:
+            # ESPN commonly emits fourth/reserve officials without a role.
+            continue
+        position = required_mapping(
+            official["position"], f"summary.gameInfo.officials[{index}].position"
+        )
+        label = position.get("name", position.get("displayName"))
+        if isinstance(label, str) and label.strip().upper() in {
+            "REFEREE",
+            "MATCH REFEREE",
+        }:
+            labelled.append(index)
+    # The referee is the official ordered first (eng.1 2010 lists the same
+    # referee three times, order 1-3), else the first one labelled Referee.
+    referee_index = next(
+        (index for index, row in enumerate(officials) if row.get("order") == 1),
+        labelled[0] if labelled else None,
+    )
     referee_name: str | None = None
-    ambiguous_officials: tuple[dict[str, Any], ...] = ()
     official_extras: list[dict[str, Any]] = []
-    if "officials" in info:
-        officials = required_list(info["officials"], "summary.gameInfo.officials")
-        referees: list[tuple[int, Mapping[str, Any]]] = []
-        for index, raw_official in enumerate(officials):
-            official = required_mapping(
-                raw_official, f"summary.gameInfo.officials[{index}]"
+    for index, official in enumerate(officials):
+        if index != referee_index:
+            official_extras.append(dict(official))
+            continue
+        field = f"summary.gameInfo.officials[{index}]"
+        referee_name = optional_string(
+            official.get("fullName", official.get("displayName")), f"{field}.fullName"
+        )
+        extra = unknown_fields(
+            official, ("fullName", "displayName", "order", "position")
+        )
+        if isinstance(official.get("position"), Mapping):
+            position_extra = unknown_fields(
+                official["position"], ("name", "displayName")
             )
-            raw_position = official.get("position")
-            if raw_position is None:
-                # ESPN commonly emits fourth/reserve officials without a role.
-                # With no explicit classification, preserve the full source row.
-                official_extras.append(dict(official))
-                continue
-            position = required_mapping(
-                raw_position, f"summary.gameInfo.officials[{index}].position"
-            )
-            label = position.get("name", position.get("displayName"))
-            primary = isinstance(label, str) and label.strip().upper() in {
-                "REFEREE",
-                "MATCH REFEREE",
-            }
-            if primary:
-                referees.append((index, official))
-            else:
-                # An explicit but unrecognized role cannot safely populate the
-                # primary referee fields. Preserve the complete official row.
-                official_extras.append(dict(official))
-                continue
-            official_extra = unknown_fields(official, ("id", "fullName", "position"))
-            position_extra = unknown_fields(position, ("name", "displayName"))
-            if official_extra or position_extra:
-                official_extras.append(
-                    {
-                        **official_extra,
-                        **({"position": position_extra} if position_extra else {}),
-                    }
-                )
-            else:
-                official_extras.append({})
-        if len(referees) > 1:
-            # A scalar referee column cannot represent multiple equally typed
-            # source rows. Validate and preserve all officials without guessing.
-            for index, referee in referees:
-                if "id" in referee and referee["id"] is not None:
-                    native_id(
-                        referee["id"],
-                        f"summary.gameInfo.officials[{index}].id",
-                    )
-                required_string(
-                    referee.get("fullName"),
-                    f"summary.gameInfo.officials[{index}].fullName",
-                )
-            official_extras = [
-                dict(required_mapping(row, f"summary.gameInfo.officials[{index}]"))
-                for index, row in enumerate(officials)
-            ]
-            ambiguous_officials = tuple(official_extras)
-        elif referees:
-            _, referee = referees[0]
-            if "id" in referee and referee["id"] is not None:
-                referee_id = native_id(referee["id"], "summary referee.id")
-            referee_name = required_string(
-                referee.get("fullName"), "summary referee.fullName"
-            )
+            if position_extra:
+                extra["position"] = position_extra
+        official_extras.append(extra)
     extra = unknown_fields(info, ("venue", "attendance", "officials"))
     if venue_extra:
         extra["venue"] = venue_extra
     if any(official_extras):
         extra["officials"] = official_extras
-    return (
-        venue_id,
-        venue_name,
-        attendance,
-        capacity,
-        referee_id,
-        referee_name,
-        extra,
-        ambiguous_officials,
-    )
+    return venue_id, venue_name, attendance, referee_name, extra
 
 
 def _lineup_stat_entries(statistics: Any, field: str) -> list[tuple[str, Any, str]]:
@@ -454,7 +497,7 @@ def _lineup_stat_values(sources: list[tuple[str, Any]], field: str) -> dict[str,
             if target is None:
                 continue
             if isinstance(value, bool):
-                raise EspnParseError(f"{item_field}.value must be numeric")
+                raise _SourceMalformed(f"{item_field}.value must be numeric")
             if isinstance(value, (int, float)):
                 normalized = float(value)
             elif (
@@ -464,12 +507,12 @@ def _lineup_stat_values(sources: list[tuple[str, Any]], field: str) -> dict[str,
             ):
                 normalized = float(value.strip())
             else:
-                raise EspnParseError(f"{item_field}.value must be numeric")
+                raise _SourceMalformed(f"{item_field}.value must be numeric")
             if not math.isfinite(normalized):
-                raise EspnParseError(f"{item_field}.value must be finite")
+                raise _SourceMalformed(f"{item_field}.value must be finite")
             existing = values.get(target)
             if existing is not None and existing != normalized:
-                raise EspnParseError(
+                raise _SourceMalformed(
                     f"{field} has conflicting mapped statistic {target!r}: "
                     f"{existing} versus {normalized}"
                 )
@@ -483,42 +526,26 @@ def _lineup(
     competition: Competition,
     edition: Edition,
     event: ScheduleRow,
+    blocks: Mapping[int, tuple[str, str, Mapping[str, Any]]],
     by_team: Mapping[int, tuple[str, str]],
+    anomalies: _Anomalies,
 ) -> tuple[tuple[LineupRow, ...], EntityParseState]:
-    capability = edition.capabilities.lineup
-    if "rosters" not in payload:
-        return (), _valid_empty_or_fail(capability, "lineup")
-    rosters = required_list(payload["rosters"], "summary.rosters")
-    if not rosters:
-        return (), _valid_empty_or_fail(capability, "lineup")
-    blocks: dict[int, tuple[str, str, Mapping[str, Any]]] = {}
-    for index, raw_roster in enumerate(rosters):
-        team_id, side, team_name, block = _team_block(
-            raw_roster, f"summary.rosters[{index}]", by_team
-        )
-        if team_id in blocks:
-            raise EspnParseError("Summary rosters contain a duplicate team ID")
-        blocks[team_id] = (side, team_name, block)
-    if set(blocks) != set(by_team):
-        raise EspnParseError("Summary lineup must contain both event teams")
-    roster_presence = ["roster" in block for _, _, block in blocks.values()]
-    if not any(roster_presence):
-        return (), _valid_empty_or_fail(capability, "lineup")
-    if not all(roster_presence):
-        raise EspnParseError(
-            "Summary lineup rosters must exist for both or neither team"
-        )
+    rosters = {
+        team_id: required_list(block["roster"], f"summary.rosters[{team_id}].roster")
+        for team_id, (_, _, block) in blocks.items()
+        if block.get("roster") is not None
+    }
+    # Only an answer without a single player is honestly empty (C6-F1).
+    if not any(rosters.values()):
+        return (), EntityParseState.VALID_EMPTY
+    if any(not rosters.get(team_id) for team_id in by_team):
+        anomalies.add("one_sided_roster")
 
     rows: list[LineupRow] = []
     per_team_rows: dict[int, list[LineupRow]] = {}
-    contradictory_substitution_semantics = False
     seen: set[tuple[int, int, int]] = set()
-    for team_id, (side, team_name, block) in blocks.items():
-        roster = required_list(
-            block.get("roster"), f"summary.rosters[{team_id}].roster"
-        )
-        if not roster:
-            raise EspnParseError("Summary lineup team roster must not be empty")
+    for team_id, roster in rosters.items():
+        side, team_name, block = blocks[team_id]
         team_rows: list[LineupRow] = []
         for index, raw_player in enumerate(roster):
             field = f"summary.rosters[{team_id}].roster[{index}]"
@@ -530,19 +557,18 @@ def _lineup(
             )
             key = (event.event_id, team_id, athlete_id)
             if key in seen:
-                raise EspnParseError(
-                    "Summary lineup has duplicate event/team/athlete row"
-                )
+                anomalies.add("duplicate_player")
+                continue
             seen.add(key)
-            jersey_raw = athlete.get("jersey")
+            # ESPN puts the shirt number on the roster entry (C6-F5).
+            jersey_raw = player.get("jersey", athlete.get("jersey"))
             if jersey_raw is None:
                 jersey = None
             elif type(jersey_raw) is int and jersey_raw >= 0:
                 jersey = str(jersey_raw)
             else:
-                jersey = optional_string(jersey_raw, f"{field}.athlete.jersey")
+                jersey = optional_string(jersey_raw, f"{field}.jersey")
             starter = optional_bool(player.get("starter"), f"{field}.starter")
-            captain = optional_bool(player.get("captain"), f"{field}.captain")
             subbed_in = _substitution_flag(player.get("subbedIn"), f"{field}.subbedIn")
             subbed_out = _substitution_flag(
                 player.get("subbedOut"), f"{field}.subbedOut"
@@ -550,7 +576,7 @@ def _lineup(
             if (starter is True and subbed_in is True) or (
                 starter is False and subbed_out is True and subbed_in is not True
             ):
-                contradictory_substitution_semantics = True
+                anomalies.add("contradictory_flags")
             sub_in, sub_out = _legacy_substitutions(
                 player,
                 field=field,
@@ -611,8 +637,8 @@ def _lineup(
                 player,
                 (
                     "athlete",
+                    "jersey",
                     "starter",
-                    "captain",
                     "subbedIn",
                     "subbedOut",
                     "substitution",
@@ -644,7 +670,6 @@ def _lineup(
                 position=position,
                 formation_place=formation_place,
                 starter=starter,
-                captain=captain,
                 subbed_in=subbed_in,
                 subbed_out=subbed_out,
                 sub_in=sub_in,
@@ -676,68 +701,21 @@ def _lineup(
             rows.append(row)
             team_rows.append(row)
         per_team_rows[team_id] = team_rows
+        if block.get("formation") is not None:
+            starters = [row for row in team_rows if row.starter is True]
+            missing = sum(row.formation_place is None for row in starters)
+            # No formationPlace at all (2005-2016 bodies) is the source norm.
+            if 0 < missing < len(starters):
+                anomalies.add("formation_place_missing")
 
-    explicit_starter_semantics = any(
-        row.starter is not None
-        for team_rows in per_team_rows.values()
-        for row in team_rows
-    )
-    if explicit_starter_semantics:
+    # Starter counts are checked only when ESPN sets starter flags at all.
+    if any(row.starter is not None for row in rows):
+        expected = _small_sided_size(payload) or 11
         if any(
-            row.starter is None
+            sum(row.starter is True for row in team_rows) != expected
             for team_rows in per_team_rows.values()
-            for row in team_rows
         ):
-            raise EspnParseError(
-                "explicit starter semantics require a starter flag for every athlete"
-            )
-        starter_counts = {
-            team_id: sum(row.starter is True for row in team_rows)
-            for team_id, team_rows in per_team_rows.items()
-        }
-        counts = tuple(starter_counts.values())
-        conventional_xi = all(count == 11 for count in counts)
-        small_sided_size = _small_sided_size(payload)
-        # Non-XI capture requires explicit source format evidence.
-        balanced_small_sided = (
-            small_sided_size is not None
-            and len(set(counts)) == 1
-            and counts[0] == small_sided_size
-        )
-        # No small-sided escape here, unlike the truncated branch below: the
-        # inference "this team does not field eleven starters" is void once the
-        # source declares a different format, while "one athlete is both a
-        # starter and a substitute" contradicts itself at any team size.
-        if contradictory_substitution_semantics:
-            raise EspnParseError(
-                "Summary lineup has contradictory starter/substitution "
-                f"semantics for event {event.event_id}; "
-                f"starters {tuple(sorted(starter_counts.items()))}"
-            )
-
-    if explicit_starter_semantics:
-        if not conventional_xi and not balanced_small_sided:
-            # Some ESPN competitions expose a sparse event-participant list in
-            # ``rosters`` (for example, only the scorer) while still attaching
-            # explicit starter flags.  Fewer than seven athlete rows cannot
-            # field a conventional team.  Never publish those partial player
-            # rows, but let a non-PROVEN capability preserve the event's
-            # schedule and matchsheet.  Complete rosters with bad starter
-            # semantics remain a hard error below, and explicit balanced
-            # small-sided formats were accepted above.
-            incomplete_conventional_roster = any(
-                len(team_rows) < 7 for team_rows in per_team_rows.values()
-            )
-            if (
-                incomplete_conventional_roster
-                and small_sided_size is None
-                and capability is not CapabilityState.PROVEN
-            ):
-                return (), _valid_empty_or_fail(capability, "lineup")
-            raise EspnParseError(
-                "explicit conventional lineup must contain 11 starters per team "
-                f"for event {event.event_id}; got {starter_counts}"
-            )
+            anomalies.add("starters_not_11")
     return (
         tuple(
             sorted(
@@ -757,37 +735,17 @@ def _stat_scalar(stat: Mapping[str, Any], field: str) -> str:
     if value is None:
         value = stat.get("displayValue")
     if isinstance(value, bool) or isinstance(value, (list, Mapping)) or value is None:
-        raise EspnParseError(f"{field}.value must be a supported scalar value")
+        raise _SourceMalformed(f"{field}.value must be a supported scalar value")
     if isinstance(value, (int, float)):
         if isinstance(value, float) and not math.isfinite(value):
-            raise EspnParseError(f"{field}.value must be finite")
+            raise _SourceMalformed(f"{field}.value must be finite")
         return str(value)
     if isinstance(value, str):
         display = value.strip()
         if not display or _NUMERIC_DISPLAY_RE.fullmatch(display) is None:
-            raise EspnParseError(f"{field}.value must be a numeric display scalar")
+            raise _SourceMalformed(f"{field}.value must be a numeric display scalar")
         return display
-    raise EspnParseError(f"{field}.value must be a supported scalar value")
-
-
-def _statistics_are_blank(statistics: list[Any], field: str) -> bool:
-    """Report whether every statistic in the block is a zero placeholder.
-
-    Anything the capture path itself would reject is not provably blank: say so
-    instead of raising, so a malformed block keeps its own failure text rather
-    than a scalar-format complaint raised from a probe.
-    """
-
-    for index, raw_stat in enumerate(statistics):
-        try:
-            stat = required_mapping(raw_stat, f"{field}[{index}]")
-            required_string(stat.get("name"), f"{field}[{index}].name")
-            scalar = _stat_scalar(stat, f"{field}[{index}]")
-        except EspnParseError:
-            return False
-        if float(scalar.rstrip("%")) != 0.0:
-            return False
-    return True
+    raise _SourceMalformed(f"{field}.value must be a supported scalar value")
 
 
 def _stat_values(statistics: list[Any], field: str) -> dict[str, str]:
@@ -800,7 +758,7 @@ def _stat_values(statistics: list[Any], field: str) -> dict[str, str]:
             continue
         scalar = _stat_scalar(stat, f"{field}[{index}]")
         if target in values:
-            raise EspnParseError(f"{field} maps duplicate statistic {target!r}")
+            raise _SourceMalformed(f"{field} maps duplicate statistic {target!r}")
         values[target] = scalar
     return values
 
@@ -812,146 +770,55 @@ def _matchsheet(
     edition: Edition,
     event: ScheduleRow,
     by_team: Mapping[int, tuple[str, str]],
-    game_info: tuple[
-        int | None,
-        str | None,
-        int | None,
-        str | None,
-        int | None,
-        str | None,
-        dict[str, Any],
-        tuple[dict[str, Any], ...],
-    ],
+    rosters: Mapping[int, tuple[str, str, Mapping[str, Any]]],
+    side_facts: Mapping[int, Mapping[str, Any]],
+    leg: int | None,
+    game_info: tuple[int | None, str | None, int | None, str | None, dict[str, Any]],
+    anomalies: _Anomalies,
 ) -> tuple[tuple[MatchsheetRow, ...], EntityParseState]:
-    capability = edition.capabilities.matchsheet
-    if "boxscore" not in payload:
-        return (), _valid_empty_or_fail(capability, "matchsheet")
-    boxscore = required_mapping(payload["boxscore"], "summary.boxscore")
-    if "teams" not in boxscore:
-        raise EspnParseError("summary.boxscore.teams is required when boxscore exists")
-    teams = required_list(boxscore["teams"], "summary.boxscore.teams")
-    if not teams:
-        return (), _valid_empty_or_fail(capability, "matchsheet")
-    blocks: dict[int, tuple[str, str, Mapping[str, Any]]] = {}
-    for index, raw_team in enumerate(teams):
-        team_id, side, team_name, block = _team_block(
-            raw_team, f"summary.boxscore.teams[{index}]", by_team
-        )
-        if team_id in blocks:
-            raise EspnParseError("Summary boxscore contains a duplicate team ID")
-        blocks[team_id] = (side, team_name, block)
-    if set(blocks) != set(by_team):
-        raise EspnParseError("Summary matchsheet must contain both event teams")
-    statistics_presence = ["statistics" in block for _, _, block in blocks.values()]
-    if not any(statistics_presence):
-        return (), _valid_empty_or_fail(capability, "matchsheet")
-    if not all(statistics_presence):
-        # Same asymmetry as the empty-list branch below, one shape earlier: the
-        # side that does carry a block carries only zeros, so nothing is lost by
-        # treating the pair as empty.
-        if all(
-            _statistics_are_blank(
-                required_list(
-                    block.get("statistics"),
-                    f"summary.boxscore.teams[{team_id}].statistics",
-                ),
-                f"summary.boxscore.teams[{team_id}].statistics",
-            )
-            for team_id, (_, _, block) in blocks.items()
-            if "statistics" in block
-        ):
-            return (), _valid_empty_or_fail(capability, "matchsheet")
-        raise EspnParseError(
-            "Summary matchsheet statistics must exist for both or neither team"
-        )
+    boxscore = required_mapping(payload.get("boxscore", {}), "summary.boxscore")
+    blocks = (
+        _team_blocks(boxscore["teams"], "summary.boxscore.teams", by_team)
+        if "teams" in boxscore
+        else {}
+    )
     statistics_by_team = {
         team_id: required_list(
-            block.get("statistics"),
-            f"summary.boxscore.teams[{team_id}].statistics",
+            block["statistics"], f"summary.boxscore.teams[{team_id}].statistics"
         )
         for team_id, (_, _, block) in blocks.items()
+        if block.get("statistics") is not None
     }
-    empty_statistics = {
-        team_id for team_id, statistics in statistics_by_team.items() if not statistics
-    }
-    if len(empty_statistics) == len(statistics_by_team):
-        return (), _valid_empty_or_fail(capability, "matchsheet")
-    if empty_statistics:
-        # ESPN sometimes answers a played fixture with a zero-filled statistics
-        # skeleton on one side and no statistics at all on the other.  That
-        # asymmetry is syntactic: neither side carries an observation, so the
-        # matchsheet is empty rather than half captured, and the skeleton is
-        # discarded instead of being published as captured data.  One side
-        # holding real values stays a hard failure.
-        #
-        # The trade is deliberate and matches the both-sides-empty branch above:
-        # valid_empty is terminal, so a source that back-fills the box score
-        # later is never re-read for this event.  A loud failure that blocks the
-        # whole cohort is worse than a quiet gap on a source that is not proven
-        # to carry the section at all.
-        if all(
-            _statistics_are_blank(
-                statistics, f"summary.boxscore.teams[{team_id}].statistics"
-            )
-            for team_id, statistics in statistics_by_team.items()
-            if team_id not in empty_statistics
-        ):
-            return (), _valid_empty_or_fail(capability, "matchsheet")
-        raise EspnParseError(
-            "Summary matchsheet statistics must be empty for both or neither team"
-        )
+    # The state describes team statistics only: honestly empty when neither
+    # team carries one (C6-F1).  Match facts are written regardless, one row
+    # per header competitor with NULL statistic columns (plan amendment 25.09).
+    state = (
+        EntityParseState.CAPTURED
+        if any(statistics_by_team.values())
+        else EntityParseState.VALID_EMPTY
+    )
+    if state is EntityParseState.CAPTURED and any(
+        not statistics_by_team.get(team_id) for team_id in by_team
+    ):
+        anomalies.add("one_sided_statistics")
 
-    (
-        venue_id,
-        venue_name,
-        attendance,
-        capacity,
-        referee_id,
-        referee_name,
-        _,
-        ambiguous_officials,
-    ) = game_info
-    roster_by_team: dict[int, str] = {}
-    if "rosters" in payload:
-        rosters = required_list(payload["rosters"], "summary.rosters")
-        for index, raw_roster in enumerate(rosters):
-            roster_team_id, _, _, roster_block = _team_block(
-                raw_roster, f"summary.rosters[{index}]", by_team
-            )
-            if roster_team_id in roster_by_team:
-                raise EspnParseError("Summary rosters contain a duplicate team ID")
-            if "roster" in roster_block:
-                roster_by_team[roster_team_id] = canonical_json(
-                    required_list(
-                        roster_block["roster"],
-                        f"summary.rosters[{index}].roster",
-                    )
-                )
-    score_by_team = {
-        event.home_team_id: event.home_score,
-        event.away_team_id: event.away_score,
-    }
+    venue_id, venue_name, attendance, referee_name, _ = game_info
     rows: list[MatchsheetRow] = []
-    for team_id, (side, team_name, block) in blocks.items():
-        statistics = statistics_by_team[team_id]
+    for team_id, (side, team_name) in by_team.items():
+        statistics = statistics_by_team.get(team_id) or []
+        block = blocks[team_id][2] if team_id in blocks else {}
         values = _stat_values(
             statistics, f"summary.boxscore.teams[{team_id}].statistics"
         )
-        if not set(values).intersection(
+        if statistics and not set(values).intersection(
             {"total_shots", "shots_on_target", "possession_pct"}
         ):
-            raise EspnParseError(
+            raise _SourceMalformed(
                 "Summary matchsheet team must contain a recognized core statistic"
             )
-        extra = unknown_fields(
-            block, ("team", "homeAway", "statistics", "displayOrder")
-        )
-        if ambiguous_officials:
-            if "summaryGameInfo" in extra:
-                raise EspnParseError(
-                    "Summary matchsheet extra field collides with preserved gameInfo"
-                )
-            extra["summaryGameInfo"] = {"officials": ambiguous_officials}
+        roster_block = rosters.get(team_id, (None, None, {}))[2]
+        roster = roster_block.get("roster")
+        facts = side_facts[team_id]
         rows.append(
             MatchsheetRow(
                 scope_id=event.scope_id,
@@ -962,19 +829,24 @@ def _matchsheet(
                 team=team_name,
                 home_away=side,
                 is_home=side == "home",
-                score=score_by_team[team_id],
+                # Not played -> NULL, never a literal 0:0 (C6-F6).
+                score=(
+                    (
+                        event.home_score
+                        if team_id == event.home_team_id
+                        else event.away_score
+                    )
+                    if event.played_final
+                    else None
+                ),
                 accurate_crosses=values.get("accurate_crosses"),
                 accurate_long_balls=values.get("accurate_long_balls"),
                 accurate_passes=values.get("accurate_passes"),
                 blocked_shots=values.get("blocked_shots"),
-                capacity=capacity,
                 cross_pct=values.get("cross_pct"),
                 effective_clearance=values.get("effective_clearance"),
                 effective_tackles=values.get("effective_tackles"),
                 fouls_committed=values.get("fouls_committed"),
-                goal_assists=values.get("goal_assists"),
-                goal_difference=values.get("goal_difference"),
-                goals_conceded=values.get("goals_conceded"),
                 interceptions=values.get("interceptions"),
                 longball_pct=values.get("longball_pct"),
                 offsides=values.get("offsides"),
@@ -983,38 +855,167 @@ def _matchsheet(
                 penalty_kick_shots=values.get("penalty_kick_shots"),
                 possession_pct=values.get("possession_pct"),
                 red_cards=values.get("red_cards"),
-                roster=roster_by_team.get(team_id),
+                roster=canonical_json(roster) if roster is not None else None,
                 saves=values.get("saves"),
                 shot_pct=values.get("shot_pct"),
                 shots_on_target=values.get("shots_on_target"),
                 tackle_pct=values.get("tackle_pct"),
                 total_clearance=values.get("total_clearance"),
                 total_crosses=values.get("total_crosses"),
-                total_goals=values.get("total_goals"),
                 total_long_balls=values.get("total_long_balls"),
                 total_passes=values.get("total_passes"),
                 total_shots=values.get("total_shots"),
                 total_tackles=values.get("total_tackles"),
                 won_corners=values.get("won_corners"),
                 yellow_cards=values.get("yellow_cards"),
-                corner_kicks=values.get("won_corners"),
                 statistics_json=canonical_json(statistics),
                 stat_map_version=MATCHSHEET_STAT_MAP_VERSION,
                 venue_id=venue_id,
                 venue=venue_name,
                 attendance=attendance,
-                referee_id=referee_id,
                 referee=referee_name,
+                formation=optional_string(
+                    roster_block.get("formation"),
+                    f"summary.rosters[{team_id}].formation",
+                ),
+                score_h1=facts["score_h1"],
+                score_h2=facts["score_h2"],
+                score_et=facts["score_et"],
+                shootout_score=facts["shootout_score"],
+                aggregate_score=facts["aggregate_score"],
+                advance=facts["advance"],
+                leg=leg,
                 league=event.league,
                 season=event.season,
                 game=event.game,
                 parser_version=PARSER_VERSION,
-                extra_json=canonical_json(extra),
+                extra_json=canonical_json(
+                    unknown_fields(
+                        block, ("team", "homeAway", "statistics", "displayOrder")
+                    )
+                ),
             )
         )
-    return (
-        tuple(sorted(rows, key=lambda row: row.home_away != "home")),
-        EntityParseState.CAPTURED,
+    return tuple(sorted(rows, key=lambda row: row.home_away != "home")), state
+
+
+_EVENT_KEYS = (
+    "id",
+    "type",
+    "text",
+    "period",
+    "clock",
+    "team",
+    "participants",
+    "scoringPlay",
+    "redCard",
+    "yellowCard",
+    "penaltyKick",
+    "ownGoal",
+    "homeScore",
+    "awayScore",
+    "fieldPositionX",
+    "fieldPositionY",
+)
+
+
+def _optional_number(value: Any, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _SourceMalformed(f"{field} must be a number")
+    return float(value)
+
+
+def _optional_text(value: Any, field: str) -> str | None:
+    if value is None or value == "":
+        return None
+    return required_string(value, field)
+
+
+def _event_row(event_id: int, kind: str, raw: Any, field: str) -> MatchEventRow:
+    record = required_mapping(raw, field)
+    extra: dict[str, Any] = {}
+    if kind == "commentary":
+        play = required_mapping(record.get("play", {}), f"{field}.play")
+        clock = record.get("time", play.get("clock"))
+        extra.update(unknown_fields(record, ("sequence", "time", "text", "play")))
+        field = f"{field}.play"
+    else:
+        play = record
+        clock = record.get("clock")
+    play_extra = unknown_fields(play, _EVENT_KEYS)
+    clock = required_mapping(clock or {}, f"{field}.clock")
+    event_type = required_mapping(play.get("type") or {}, f"{field}.type")
+    if unknown_fields(event_type, ("id", "text")):
+        play_extra["type"] = unknown_fields(event_type, ("id", "text"))
+    team = required_mapping(play.get("team") or {}, f"{field}.team")
+    team_id = native_id(team["id"], f"{field}.team.id") if "id" in team else None
+    if team and team_id is None:
+        # Commentary plays name the team without its ID.
+        play_extra["team"] = dict(team)
+    participants = [
+        required_mapping(
+            required_mapping(item, f"{field}.participants[{index}]").get("athlete"),
+            f"{field}.participants[{index}].athlete",
+        )
+        for index, item in enumerate(
+            required_list(play.get("participants", []), f"{field}.participants")
+        )
+    ]
+    athlete_ids = [
+        native_id(athlete["id"], f"{field}.participants.athlete.id")
+        for athlete in participants
+        if "id" in athlete
+    ]
+    if len(athlete_ids) != len(participants):
+        play_extra["participants"] = play["participants"]
+    if kind == "commentary" and play_extra:
+        extra["play"] = play_extra
+    elif play_extra:
+        extra.update(play_extra)
+    return MatchEventRow(
+        event_id=event_id,
+        kind=kind,
+        play_id=_optional_text(play.get("id"), f"{field}.id"),
+        sequence=optional_nonnegative_int(record.get("sequence"), f"{field}.sequence"),
+        period=optional_nonnegative_int(
+            required_mapping(play.get("period") or {}, f"{field}.period").get("number"),
+            f"{field}.period.number",
+        ),
+        clock_value=_optional_number(clock.get("value"), f"{field}.clock.value"),
+        clock_display=_optional_text(
+            clock.get("displayValue"), f"{field}.clock.displayValue"
+        ),
+        team_id=team_id,
+        athlete_ids=canonical_json(athlete_ids),
+        type_id=_optional_text(event_type.get("id"), f"{field}.type.id"),
+        type_text=_optional_text(event_type.get("text"), f"{field}.type.text"),
+        text=_optional_text(record.get("text"), f"{field}.text"),
+        x=_optional_number(play.get("fieldPositionX"), f"{field}.fieldPositionX"),
+        y=_optional_number(play.get("fieldPositionY"), f"{field}.fieldPositionY"),
+        scoring_play=optional_bool(play.get("scoringPlay"), f"{field}.scoringPlay"),
+        red_card=optional_bool(play.get("redCard"), f"{field}.redCard"),
+        yellow_card=optional_bool(play.get("yellowCard"), f"{field}.yellowCard"),
+        penalty_kick=optional_bool(play.get("penaltyKick"), f"{field}.penaltyKick"),
+        own_goal=optional_bool(play.get("ownGoal"), f"{field}.ownGoal"),
+        home_score=optional_nonnegative_int(
+            play.get("homeScore"), f"{field}.homeScore"
+        ),
+        away_score=optional_nonnegative_int(
+            play.get("awayScore"), f"{field}.awayScore"
+        ),
+        extra_json=canonical_json(extra),
+    )
+
+
+def _events(payload: Mapping[str, Any], event_id: int) -> tuple[MatchEventRow, ...]:
+    return tuple(
+        _event_row(event_id, kind, raw, f"summary.{key}[{index}]")
+        for key, kind in (("keyEvents", "key_event"), ("commentary", "commentary"))
+        for index, raw in enumerate(
+            required_list(payload.get(key, []), f"summary.{key}")
+        )
     )
 
 
@@ -1025,64 +1026,101 @@ def parse_summary(
     edition: Edition,
     event: ScheduleRow,
 ) -> SummaryParseResult:
-    """Decode one Summary exactly once and derive both Bronze entity shapes."""
+    """Decode one Summary once; every answer gets exactly one disposition.
+
+    No response shape raises: an unreadable one becomes ``SOURCE_MALFORMED``
+    with its reason, so the neighbouring matches of the scope still publish.
+    ``TypeError``/``ValueError`` remain for caller bugs (wrong argument types
+    or a context from another scope).
+    """
     _validate_context(competition, edition, event)
-    payload = decode_object(raw, "Summary")
-    _, by_team, header_nested_extra = _header_sides(payload, event)
-    game_info = _parse_game_info(payload, event)
-    lineup, lineup_state = _lineup(
-        payload,
-        competition=competition,
-        edition=edition,
-        event=event,
-        by_team=by_team,
-    )
-    matchsheet, matchsheet_state = _matchsheet(
-        payload,
-        competition=competition,
-        edition=edition,
-        event=event,
-        by_team=by_team,
-        game_info=game_info,
-    )
-    root_extra = unknown_fields(payload, ("header", "boxscore", "rosters", "gameInfo"))
-    header_extra = unknown_fields(
-        required_mapping(payload["header"], "summary.header"),
-        ("id", "competitions", "season", "week", "league"),
-    )
-    extras: dict[str, Any] = {}
-    if root_extra:
-        extras.update(root_extra)
-    if header_extra:
-        extras["header"] = header_extra
-    if header_nested_extra:
-        extras["headerSections"] = header_nested_extra
-    if "boxscore" in payload and isinstance(payload["boxscore"], Mapping):
-        boxscore_extra = unknown_fields(payload["boxscore"], ("teams",))
+    anomalies = _Anomalies()
+    try:
+        payload = decode_object(raw, "Summary")
+        by_team, side_facts, leg, header_nested_extra = _header_sides(payload, event)
+        rosters = (
+            _team_blocks(payload["rosters"], "summary.rosters", by_team)
+            if "rosters" in payload
+            else {}
+        )
+        game_info = _parse_game_info(payload)
+        lineup, lineup_state = _lineup(
+            payload,
+            competition=competition,
+            edition=edition,
+            event=event,
+            blocks=rosters,
+            by_team=by_team,
+            anomalies=anomalies,
+        )
+        matchsheet, matchsheet_state = _matchsheet(
+            payload,
+            competition=competition,
+            edition=edition,
+            event=event,
+            by_team=by_team,
+            rosters=rosters,
+            side_facts=side_facts,
+            leg=leg,
+            game_info=game_info,
+            anomalies=anomalies,
+        )
+        events = _events(payload, event.event_id)
+        extras: dict[str, Any] = {}
+        header_extra = unknown_fields(
+            payload["header"], ("id", "competitions", "season", "week", "league")
+        )
+        if header_extra:
+            extras["header"] = header_extra
+        if header_nested_extra:
+            extras["headerSections"] = header_nested_extra
+        boxscore_extra = unknown_fields(payload.get("boxscore", {}), ("teams",))
         if boxscore_extra:
             extras["boxscore"] = boxscore_extra
-    if "rosters" in payload and isinstance(payload["rosters"], list):
-        roster_extras: dict[str, Any] = {}
-        for index, raw_roster in enumerate(payload["rosters"]):
-            if not isinstance(raw_roster, Mapping):
-                continue
-            block_extra = unknown_fields(raw_roster, ("homeAway", "team", "roster"))
-            raw_team = raw_roster.get("team")
-            team_extra = (
-                unknown_fields(raw_team, ("id", "displayName"))
-                if isinstance(raw_team, Mapping)
-                else {}
+        roster_extras = {
+            str(team_id): unknown_fields(
+                block, ("homeAway", "team", "roster", "formation")
             )
-            if block_extra or team_extra:
-                roster_extras[str(index)] = {
-                    key: value
-                    for key, value in (("roster", block_extra), ("team", team_extra))
-                    if value
-                }
-        if roster_extras:
-            extras["rosters"] = roster_extras
-    if game_info[-2]:
-        extras["gameInfo"] = game_info[-2]
+            for team_id, (_, _, block) in rosters.items()
+        }
+        if any(roster_extras.values()):
+            extras["rosters"] = {k: v for k, v in roster_extras.items() if v}
+        if game_info[-1]:
+            extras["gameInfo"] = game_info[-1]
+        extra_json = canonical_json(extras)
+    except (EspnParseError, ValueError, ArithmeticError, RecursionError) as exc:
+        # Everything in this block is driven by the response content: a JSON
+        # number too large for float, too many digits or nesting too deep is
+        # a malformed source as well.  The raw body stays in the raw store;
+        # nothing of it is published.
+        return SummaryParseResult(
+            event_id=event.event_id,
+            lineup=(),
+            matchsheet=(),
+            lineup_state=EntityParseState.MALFORMED,
+            matchsheet_state=EntityParseState.MALFORMED,
+            parser_version=PARSER_VERSION,
+            extra_json="{}",
+            disposition=SummaryDisposition.SOURCE_MALFORMED,
+            reason=(
+                str(exc)
+                if isinstance(exc, EspnParseError)
+                else f"{type(exc).__name__}: {exc}"
+            ),
+            anomalies=(),
+            events=(),
+            advance_team_id=None,
+        )
+    if (
+        lineup_state is EntityParseState.VALID_EMPTY
+        and matchsheet_state is EntityParseState.VALID_EMPTY
+    ):
+        disposition = SummaryDisposition.VALID_EMPTY
+    elif anomalies.classes:
+        disposition = SummaryDisposition.LINEUP_ANOMALY
+    else:
+        disposition = SummaryDisposition.CAPTURED
+    advancing = [team_id for team_id, facts in side_facts.items() if facts["advance"]]
     return SummaryParseResult(
         event_id=event.event_id,
         lineup=lineup,
@@ -1090,5 +1128,10 @@ def parse_summary(
         lineup_state=lineup_state,
         matchsheet_state=matchsheet_state,
         parser_version=PARSER_VERSION,
-        extra_json=canonical_json(extras),
+        extra_json=extra_json,
+        disposition=disposition,
+        reason=None,
+        anomalies=tuple(sorted(anomalies.classes)),
+        events=events,
+        advance_team_id=advancing[0] if len(advancing) == 1 else None,
     )

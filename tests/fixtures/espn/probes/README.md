@@ -80,3 +80,27 @@
 (Trino, выгрузка ревью `v2/sched_0919_0921.csv`): все матчи тура на «2026-09-20 18:00» —
 заглушка тура; реальные времена того дня — в `scoreboard_esp1_20260920.json` (5 матчей, 4 разных
 времени).
+
+## Summary: случаи C6-F1 для мягкого режима (#1502)
+
+Сняты 24.09.2026 16:18 UTC напрямую с VM, без прокси (пробы ревью 24.09
+`c6/probes/s_12…s_15_*.json`, байт-в-байт). Используются `test_espn_probes.py`: вместе с
+шестью summary выше — таблица 9 тел × disposition (`captured` / `valid_empty` /
+`source_malformed` / `lineup_anomaly`).
+
+| Файл | Проба | Байт | URL | Суть случая |
+|---|---|---|---|---|
+| `summary_uru1_2026_ten_starters.json` | c6 s_12 | 156193 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/uru.1/summary?event=401905201 | 10 + 11 стартовых, `formation`/`formationPlace` нет, статистики команд нет → `lineup_anomaly` (`starters_not_11`), matchsheet `valid_empty` |
+| `summary_jpn1_2026_ten_starters.json` | c6 s_13 | 336314 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/jpn.1/summary?event=401877180 | у FC Tokyo 10 стартовых → `lineup_anomaly` (`starters_not_11`) |
+| `summary_arg2_2026_contradictory_flag.json` | c6 s_14 | 258868 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/arg.2/summary?event=401844030 | игрок 408183 одновременно `starter` и `subbedIn` → `lineup_anomaly` (`contradictory_flags`) |
+| `summary_gua1_2026_no_roster.json` | c6 s_15 | 55205 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/gua.1/summary?event=401879625 | ключа `roster` нет у обеих команд, статистики нет → контроль «честно пусто» (`valid_empty`) |
+
+- Записанных summary с серией пенальти (`shootoutScore`), суммой двух матчей
+  (`aggregateScore`), `advance` и `leg` нет ни одного: эти поля берутся по ключам C6-F6 и
+  проверяются в `test_espn_parsers.py` на синтетике той же формы competitor, что в записанных
+  телах.
+- Флагов `redCard/yellowCard/penaltyKick/ownGoal` и счёта `homeScore/awayScore` в
+  `keyEvents`/`commentary` девяти тел нет — они есть только в core plays (задача 18 карты);
+  колонки `MatchEventRow` читаются по этим ключам и на записанных телах пустые, тип события —
+  `type_id/type_text`. У записей `commentary` команда и участники — только имена без ID:
+  `team_id`/`athlete_ids` пустые, имена — в `extra_json`.
