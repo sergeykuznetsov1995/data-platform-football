@@ -287,3 +287,24 @@ def test_percent_display_values_reach_the_table_in_recorded_units() -> None:
     stats = trino.tables["espn_team_stats"]
     assert len(stats) == 2
     assert (55.5, 0.8) in {(row["possession_pct"], row["pass_pct"]) for row in stats}
+
+
+@pytest.mark.unit
+def test_team_without_statistics_gets_no_team_stats_row() -> None:
+    def one_sided(payload: dict) -> None:
+        payload["boxscore"]["teams"][1]["statistics"] = []
+
+    match = _reparsed(one_sided)
+    assert match.summary.anomalies == ("one_sided_statistics",)
+    trino = FakeTrino()
+
+    receipt = write_tournament_batch(_batch(match), trino=trino)
+
+    (stats,) = trino.tables["espn_team_stats"]
+    assert stats["total_shots"] is not None
+    (row,) = trino.tables["espn_match"]
+    assert row["disposition"] == "lineup_anomaly"
+    assert row["home_formation"] and row["away_formation"]
+    assert receipt.rows_per_table["espn_team_stats"] == 1
+    # The class names no single team: every lineup row carries the flag.
+    assert {r["lineup_anomaly"] for r in trino.tables["espn_match_lineup"]} == {True}

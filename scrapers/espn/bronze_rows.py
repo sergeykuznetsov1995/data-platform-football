@@ -309,6 +309,9 @@ def team_stats_rows(
             **lineage,
         }
         for row in summary.matchsheet
+        # A team without statistics (one_sided_statistics) keeps only its
+        # match facts, which live on espn_match.
+        if any(getattr(row, name) is not None for name in TEAM_STAT_COLUMNS)
     ]
 
 
