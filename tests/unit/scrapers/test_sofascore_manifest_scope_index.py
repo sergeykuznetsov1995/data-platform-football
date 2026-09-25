@@ -477,3 +477,344 @@ def test_capture_writing_many_batches_keeps_reads_within_ten(tmp_path, monkeypat
     assert counts["select"] <= 10
     assert counts["merge"] == batches
     assert manager.selects - selects_before <= 10
+
+
+def _season_runner_selects(tmp_path, monkeypatch, *, preload: bool) -> tuple[int, dict]:
+    """One offline season replay through a Trino-backed store; SELECTs sent."""
+
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import manifest as manifest_module
+    from scrapers.sofascore.pipeline import DeferredCaptureSink
+    from tests.unit.scrapers.test_sofascore_season_pipeline import (
+        FRESHNESS,
+        SEASON_ID,
+        TOURNAMENT_ID,
+        _complete_plan_with_expansion_raw,
+        _engine,
+        _raw_store,
+    )
+
+    raw_store = _raw_store(tmp_path)
+    _complete_plan_with_expansion_raw(raw_store, InMemoryManifestStore())
+    manager = FakeTrinoManager()
+    store = BatchingManifestStore(TrinoManifestStore(manager))
+    engine, transport = _engine(
+        tmp_path, raw_store=raw_store, manifest_store=store, sink=DeferredCaptureSink()
+    )
+    runtime = CaptureRuntime(engine, store, raw_store)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID))
+    switch = (
+        patch.object(manifest_module, "preload_manifest_scope", lambda *a: 0)
+        if not preload
+        else patch.object(manifest_module, "preload_manifest_scope",
+                          manifest_module.preload_manifest_scope)
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame.assign(
+        _entity_type=entity, _ingested_at="fixture"
+    )
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: (
+        "iceberg.bronze." + kwargs["table_name"]
+    )
+    output = tmp_path / "season.json"
+    trino_accounting.reset()
+    with switch, patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, payload["errors"]
+    assert transport.calls == 0
+    return manager.selects, payload
+
+
+@pytest.mark.unit
+def test_season_runner_preloads_its_own_scope(tmp_path, monkeypatch):
+    """Round 3, item 1: the season runner builds its own runtime, so the
+    planner's preload never helped it; history/daily season phases read the
+    manifest per page/profile/replan until it preloads itself."""
+
+    without, _ = _season_runner_selects(tmp_path / "a", monkeypatch, preload=False)
+    with_preload, payload = _season_runner_selects(
+        tmp_path / "b", monkeypatch, preload=True
+    )
+
+    assert without > 10
+    assert with_preload <= 10
+    assert payload["traffic"]["trino_queries"]["select"] <= 10
+
+
+@pytest.mark.unit
+def test_error_report_counts_the_final_flush(tmp_path, monkeypatch):
+    """Round 3, item 2: an error path writes its report before ``main``'s last
+    flush; the report is restamped after that flush."""
+
+    from dags.scripts import run_sofascore_scraper as runner
+
+    for name in ("AIRFLOW_CTX_DAG_ID", "SOFASCORE_RUN_ID", "AIRFLOW_CTX_DAG_RUN_ID"):
+        monkeypatch.delenv(name, raising=False)
+    manager = FakeTrinoManager()
+    runtime = _runtime(tmp_path, manager, max_pending=200)
+    output = tmp_path / "matches.json"
+
+    def failing_capture(**kwargs):
+        store = kwargs["capture_runtime"].manifest_store
+        store.upsert(_success(_spec(MATCH_IDS[0], "lineups")))
+        assert store.pending_count == 1
+        runner._write_results(
+            kwargs["output_path"],
+            {"entity": "match_capture", "errors": ["boom"], "traffic": {"requests": 0}},
+        )
+        return 1
+
+    monkeypatch.setattr(runner, "_run_match_capture", failing_capture)
+    trino_accounting.reset()
+    with patch(
+        "scrapers.sofascore.pipeline.build_capture_runtime", return_value=runtime
+    ):
+        rc = runner.main([
+            "--entity", "match_capture",
+            "--league", "ENG-Premier League",
+            "--season", "2526",
+            "--allow-inactive-season",
+            "--manifest-backend", "trino",
+            "--output", str(output),
+        ])
+
+    assert rc == 1
+    assert runtime.manifest_store.pending_count == 0
+    assert manager.merges == 1
+    counts = json.loads(output.read_text(encoding="utf-8"))["traffic"]["trino_queries"]
+    # The last flush's staged MERGE (MERGE + CREATE/INSERT/count/DROP) is in
+    # the report; before the restamp it read merge 0, other 0.
+    assert counts["merge"] == 1
+    assert counts["other"] >= 4
+
+
+class _FakeTrinoWire:
+    """A dbapi double behind a REAL ``TrinoTableManager``: answers the
+    statements the manifest store and the staged batch MERGE send."""
+
+    def __init__(self, rows=()):
+        from scrapers.sofascore.adapters import render_manifest_ddl
+
+        self.rows = [tuple(row) for row in rows]
+        self.sent: list[str] = []
+        self.stage_rows: dict[str, int] = {}
+        body = render_manifest_ddl().split("(", 1)[1].rsplit(")", 1)[0]
+        self.describe = [
+            (line.split()[0], line.split()[1], "", "")
+            for line in body.split("WITH")[0].strip().rstrip(")").splitlines()
+            if line.strip() and not line.strip().startswith(")")
+        ]
+
+    def cursor(self):
+        wire = self
+
+        class Cursor:
+            def __init__(self):
+                self.result = []
+
+            def execute(self, sql, params=None):
+                wire.sent.append(sql)
+                head = sql.lstrip().split(None, 1)[0].upper()
+                if sql.startswith("SELECT 1"):
+                    self.result = [(1,)]
+                elif head == "DESCRIBE":
+                    self.result = list(wire.describe)
+                elif head == "INSERT":
+                    stage = sql.split()[2]
+                    wire.stage_rows[stage] = wire.stage_rows.get(stage, 0) + (
+                        sql.count("),\n(") + 1
+                    )
+                    self.result = []
+                elif sql.startswith("SELECT count(*) FROM "):
+                    self.result = [(wire.stage_rows[sql.split()[3]],)]
+                elif head == "SELECT" and "sofascore_capture_manifest WHERE" in sql:
+                    t, s = params[0], params[1]
+                    self.result = [
+                        row for row in wire.rows if row[0] == t and row[1] == s
+                    ][: None if len(params) == 2 else 0]
+                else:
+                    self.result = []
+
+            def fetchall(self):
+                return self.result
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+    def close(self):
+        pass
+
+    def count(self, predicate) -> int:
+        return sum(1 for sql in self.sent if predicate(sql))
+
+
+@pytest.mark.unit
+def test_signed_plan_to_runner_on_a_real_manager_over_several_batches(
+    tmp_path, monkeypatch
+):
+    """Round 3, item 3 (урок 60): a REAL signed targets plan made by
+    ``prepare_workload_plan`` is loaded and verified by ``main``; the runner
+    replays 30 pending matches through a real ``BatchingManifestStore`` over
+    ``TrinoManifestStore`` over a real ``TrinoTableManager`` whose dbapi
+    cursor is a double.  Several staged batch MERGEs, reads bounded."""
+
+    from dags.scripts import run_sofascore_scraper as runner
+    from dags.scripts.prepare_sofascore_workload import (
+        CompetitionSeason,
+        prepare_workload_plan,
+    )
+    from scrapers.base.trino_manager import TrinoTableManager
+    from scrapers.sofascore.pipeline import DeferredCaptureSink, ingest_prefetched_records
+    from tests.unit.scrapers.test_sofascore_pipeline import (
+        MetadataScraper,
+        _event_records_for,
+        _event_spec,
+        _recording_writer_lock,
+    )
+    from tests.unit.scripts.test_prepare_sofascore_workload import TOKEN, _policy
+
+    match_ids = [str(20_000_000 + n) for n in range(30)]
+    monkeypatch.setattr(TrinoTableManager, "_trino_unreachable", False)
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", "b" * 64)
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_refresh_sofascore_all_mens")
+    monkeypatch.setenv("SOFASCORE_RUN_ID", "refresh-1")
+
+    def real_store(wire, max_pending):
+        manager = TrinoTableManager()
+        manager._create_connection = lambda: wire
+        return BatchingManifestStore(TrinoManifestStore(manager), max_pending=max_pending)
+
+    raw = RawPayloadStore(fs.LocalFileSystem(), str(tmp_path / "raw"))
+
+    def runtime_on(store):
+        engine = SofaScoreCaptureEngine(
+            raw_store=raw,
+            manifest_store=store,
+            transport=NoNetworkTransport(),
+            run_id="refresh-1::targets",
+            task_id="match-capture",
+            sink=DeferredCaptureSink(),
+            rate_limiter=UnlimitedLimiter(),
+            retry_policy=RetryPolicy(max_attempts=1),
+            max_workers=2,
+        )
+        return CaptureRuntime(engine, store, raw)
+
+    # Raw for every endpoint is already stored (captured earlier, replayed now).
+    seed = runtime_on(InMemoryManifestStore())
+    specs = {
+        (match_id, endpoint): _event_spec(match_id, endpoint)
+        for match_id in match_ids
+        for endpoint in EVENT_PATHS
+    }
+    records = {}
+    for match_id in match_ids:
+        records.update(_event_records_for(match_id))
+    ingest_prefetched_records(seed, specs=specs, records=records)
+
+    # 1) the signed plan, from the production planner on its own store.
+    catalog = MagicMock()
+    catalog.competition.return_value = SimpleNamespace(
+        capture_allowed=True, unique_tournament_id=int(TOURNAMENT)
+    )
+    catalog.resolve_source_season.return_value = SimpleNamespace(
+        season_id=int(SEASON), format="split_year"
+    )
+    module = "dags.scripts.prepare_sofascore_workload"
+    plan_wire = _FakeTrinoWire()
+    with (
+        patch(f"{module}.load_static_workload_policy", return_value=_policy()),
+        patch(
+            f"{module}.build_capture_runtime",
+            return_value=runtime_on(real_store(plan_wire, 200)),
+        ),
+        patch(f"{module}.SofaScoreCatalog.load", return_value=catalog),
+        patch(f"{module}._finished_match_ids", return_value=set(match_ids)),
+    ):
+        plan_path = prepare_workload_plan(
+            dag_id="dag_refresh_sofascore_all_mens",
+            base_run_id="refresh-1",
+            phase="targets",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "target-plan.json",
+            allow_inactive_season=True,
+            season_freshness_key="final",
+            season_evidence="bronze",
+        )
+    def manifest_reads(sql):
+        return sql.lstrip().startswith("SELECT") and (
+            "sofascore_capture_manifest WHERE" in sql
+        )
+
+    assert plan_wire.count(manifest_reads) == 1  # 150 endpoint probes, one SELECT
+
+    # 2) main() verifies the signed plan and runs the capture on a real store.
+    wire = _FakeTrinoWire()
+    store = real_store(wire, 40)
+    monkeypatch.setattr(
+        runner, "_resolve_match_ids_from_bronze", lambda *a, **k: list(match_ids)
+    )
+    monkeypatch.setattr(runner, "_source_context", lambda *a: (int(TOURNAMENT), int(SEASON)))
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *a: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    _recording_writer_lock(monkeypatch, [])
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+
+    def add_metadata(frame, entity_type):
+        frame = MetadataScraper._add_metadata(frame, entity_type)
+        frame["_ingested_at"] = "2026-09-25T00:00:00Z"
+        return frame
+
+    scraper._add_metadata.side_effect = add_metadata
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: (
+        "iceberg.bronze." + kwargs["table_name"]
+    )
+    output = tmp_path / "matches.json"
+    trino_accounting.reset()
+    with (
+        patch("scrapers.sofascore.pipeline.build_capture_runtime", return_value=runtime_on(store)),
+        patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper),
+    ):
+        rc = runner.main([
+            "--entity", "match_capture",
+            "--league", "ENG-Premier League",
+            "--season", "2526",
+            "--allow-inactive-season",
+            "--manifest-backend", "trino",
+            "--workload-plan", str(plan_path),
+            "--offline-replay",
+            "--output", str(output),
+        ])
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, payload["errors"]
+    batches = wire.count(lambda sql: sql.lstrip().upper().startswith("MERGE"))
+    assert batches >= 3  # 150 terminal records through a 40-record buffer
+    counts = payload["traffic"]["trino_queries"]
+    assert counts["select"] <= 10
+    assert counts["merge"] == batches
+    assert wire.count(manifest_reads) == 1
+    # The index answers every committed key after upsert_many, without SELECT.
+    inner = store.inner
+    assert all(inner.get(spec.key).is_terminal for spec in specs.values())
+    assert wire.count(manifest_reads) == 1

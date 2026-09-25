@@ -859,6 +859,30 @@ def _rejected_rows_summary(rejected_rows) -> dict:
     return summary
 
 
+def _restamp_trino_queries(path: str) -> None:
+    """Refresh ``traffic.trino_queries`` of an already written report (#1357).
+
+    Touches only that one field, after raw and manifest are durable; a report
+    that is missing, unreadable or has no ``traffic`` is left as it is.
+    """
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        return
+    traffic = payload.get("traffic") if isinstance(payload, dict) else None
+    if not isinstance(traffic, dict):
+        return
+    from scrapers.sofascore import trino_accounting
+
+    traffic["trino_queries"] = trino_accounting.snapshot()
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, default=str)
+    except OSError as e:
+        logger.warning("Could not restamp trino_queries in %s: %s", path, e)
+
+
 def _flush_manifest_store(manifest_store) -> None:
     """Force pending batched manifest records into durable Iceberg state."""
     flush = getattr(manifest_store, "flush", None)
@@ -2278,6 +2302,12 @@ def _run_season_capture_engine(
         source_tournament_id, source_season_id = _source_context(
             league, season, canonical_season
         )
+        # #1357: one manifest SELECT for the scope before the season plan.
+        from scrapers.sofascore.manifest import preload_manifest_scope
+
+        preload_manifest_scope(
+            capture_runtime.manifest_store, source_tournament_id, source_season_id
+        )
         freshness_key = _planned_freshness_key(
             workload_plan,
             "season",
@@ -2959,7 +2989,12 @@ def main(argv=None):
     finally:
         # Runners flush at their success boundaries; this covers every early
         # return and error path so no buffered observation outlives the task.
-        _flush_manifest_store(capture_runtime.manifest_store)
+        try:
+            _flush_manifest_store(capture_runtime.manifest_store)
+        finally:
+            # #1357: an error path writes its report before this last flush;
+            # restamp the counter so that flush's statements are included.
+            _restamp_trino_queries(args.output)
 
 
 if __name__ == "__main__":
