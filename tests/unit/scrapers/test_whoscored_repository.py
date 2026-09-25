@@ -1067,8 +1067,8 @@ def test_sequential_cross_scope_match_commit_writes_a_distinct_physical_batch(
 
     monkeypatch.setattr(repository, "_current_dataset_counts", lambda _commits: {})
 
-    def physical_counts(table, batch_ids):
-        stored = physical.get(table, {})
+    def physical_counts(table, batch_ids, *, league, season):
+        stored = physical.get((table, league, season), {})
         return {
             batch_id: stored[batch_id] for batch_id in batch_ids if batch_id in stored
         }
@@ -1101,11 +1101,15 @@ def test_sequential_cross_scope_match_commit_writes_a_distinct_physical_batch(
             return
         if "_game_batch_id" not in frame.columns:
             return
-        counts = frame.groupby("_game_batch_id").size().to_dict()
-        physical.setdefault(table, {}).update(
-            {str(batch_id): int(count) for batch_id, count in counts.items()}
-        )
-        physical_writes.extend(str(batch_id) for batch_id in counts)
+        assert _kwargs["bulk_arrow"] is True
+        for (league, season, batch_id), count in (
+            frame.groupby(["league", "season", "_game_batch_id"]).size().items()
+        ):
+            physical.setdefault((table, league, season), {})[str(batch_id)] = int(
+                count
+            )
+            if str(batch_id) not in physical_writes:
+                physical_writes.append(str(batch_id))
 
     writer.write_dataframe.side_effect = write_dataframe
 
@@ -1319,6 +1323,9 @@ def test_idempotent_match_commit_verifies_manifest_and_physical_counts():
         repository.commit_matches((_commit(),))
 
     writer.write_dataframe.assert_not_called()
+    physical_sql = trino.execute_query.call_args_list[1].args[0]
+    assert "whoscored_events" in physical_sql
+    assert "league = 'INT-World Cup' AND season = '2026'" in physical_sql
 
 
 @pytest.mark.unit

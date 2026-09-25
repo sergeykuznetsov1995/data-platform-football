@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import pickle
+import random
 import re
 import sqlite3
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -37,6 +40,8 @@ from scrapers.whoscored.domain import WhoScoredScope
 from scrapers.whoscored.parsers import MATCH_AVAILABILITY_VERSION, PARSER_VERSION
 from scrapers.whoscored.profile_policy import MAX_DAILY_PROFILE_CANDIDATES
 from scrapers.whoscored.runtime_contract import require_production_runtime_class
+
+logger = logging.getLogger(__name__)
 
 
 MATCH_MANIFEST_TABLE = "whoscored_match_ingest_manifest"
@@ -103,6 +108,12 @@ MATCH_DATASET_TABLES = {
     "team_match_stats": "whoscored_team_match_stats",
     "player_match_stats": "whoscored_player_match_stats",
 }
+
+# PyIceberg optimistic-commit retry for match tables (same schedule as
+# TrinoTableManager._execute_committing: 0.5s * 2^n + jitter, capped at 8s).
+MATCH_COMMIT_RETRIES = 5
+MATCH_COMMIT_BACKOFF_BASE_SECONDS = 0.5
+MATCH_COMMIT_BACKOFF_CAP_SECONDS = 8.0
 
 PREVIEW_DATASET_TABLES = {
     "missing_players": "whoscored_missing_players",
@@ -4953,17 +4964,80 @@ class WhoScoredRepository:
         return result
 
     def _match_physical_counts(
-        self, table: str, batch_ids: Sequence[str]
+        self, table: str, batch_ids: Sequence[str], *, league: str, season: str
     ) -> dict[str, int]:
         if not batch_ids or not self.trino.table_exists(self.schema, table):
             return {}
         values = ",".join(_sql_string(value) for value in batch_ids)
+        # league/season are the partition columns: prune the scan to them.
         rows = self.trino.execute_query(
             f"SELECT _game_batch_id, COUNT(*) FROM "
             f"{self.catalog}.{self.schema}.{table} "
-            f"WHERE _game_batch_id IN ({values}) GROUP BY _game_batch_id"
+            f"WHERE league = {_sql_string(league)} "
+            f"AND season = {_sql_string(season)} "
+            f"AND _game_batch_id IN ({values}) GROUP BY _game_batch_id"
         )
         return {str(row[0]): int(row[1]) for row in rows}
+
+    def _match_physical_counts_by_scope(
+        self,
+        table: str,
+        batch_ids_by_scope: Mapping[tuple[str, str], Sequence[str]],
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for (league, season), batch_ids in batch_ids_by_scope.items():
+            counts.update(
+                self._match_physical_counts(
+                    table, batch_ids, league=league, season=season
+                )
+            )
+        return counts
+
+    def _write_match_frame(
+        self, table: str, frame: pd.DataFrame, *, league: str, season: str
+    ) -> None:
+        """Append one match table frame via PyIceberg, retrying commit races.
+
+        Only ``CommitFailedException`` is retried: PyIceberg raises it when the
+        optimistic snapshot commit lost a race, so nothing was published and a
+        fresh ``write_dataframe`` (which reloads the table) is safe.  Any other
+        failure has an unknown commit outcome; retrying it could append the
+        same physical batch twice, so it propagates.
+        """
+
+        from pyiceberg.exceptions import CommitFailedException
+
+        for attempt in range(MATCH_COMMIT_RETRIES):
+            try:
+                self.writer.write_dataframe(
+                    frame,
+                    database=self.schema,
+                    table=table,
+                    partition_spec=[("league", "identity"), ("season", "identity")],
+                    source="whoscored",
+                    bulk_arrow=True,
+                )
+                return
+            except CommitFailedException as exc:
+                if attempt >= MATCH_COMMIT_RETRIES - 1:
+                    raise
+                delay = min(
+                    MATCH_COMMIT_BACKOFF_CAP_SECONDS,
+                    MATCH_COMMIT_BACKOFF_BASE_SECONDS * (2**attempt),
+                )
+                delay += random.uniform(0, MATCH_COMMIT_BACKOFF_BASE_SECONDS)
+                logger.warning(
+                    "WhoScored %s %s/%s commit conflict (attempt %d/%d), "
+                    "retrying in %.1fs: %s",
+                    table,
+                    league,
+                    season,
+                    attempt + 1,
+                    MATCH_COMMIT_RETRIES,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
 
     @_lock_commit_sequence
     def commit_matches(self, commits: Sequence[MatchCommit]) -> tuple[str, ...]:
@@ -5029,11 +5103,18 @@ class WhoScoredRepository:
         names = sorted(
             {name for _, datasets, _, _ in prepared.values() for name in datasets}
         )
+        batch_ids_by_scope: dict[tuple[str, str], list[str]] = {}
+        for batch_id, (commit, _datasets, _counts, _fingerprint) in prepared.items():
+            batch_ids_by_scope.setdefault((commit.league, commit.season), []).append(
+                batch_id
+            )
         physical = {
-            name: self._match_physical_counts(MATCH_DATASET_TABLES[name], batch_ids)
+            name: self._match_physical_counts_by_scope(
+                MATCH_DATASET_TABLES[name], batch_ids_by_scope
+            )
             for name in names
         }
-        frames: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
+        frames: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for batch_id, (commit, datasets, counts, fingerprint) in prepared.items():
             if batch_id in manifests and manifests[batch_id] != counts:
                 raise BatchConflict(
@@ -5073,23 +5154,23 @@ class WhoScoredRepository:
                     for key, value in tuple(row.items()):
                         if isinstance(value, (dict, list)):
                             row[key] = self._canonical_json(value)
-                    frames[name].append(row)
+                    frames.setdefault(
+                        (name, commit.league, commit.season), []
+                    ).append(row)
 
-        for name, rows in frames.items():
-            if not rows:
-                continue
-            self.writer.write_dataframe(
-                self._normalise_frame_types(
-                    pd.DataFrame(rows), table=MATCH_DATASET_TABLES[name]
-                ),
-                database=self.schema,
-                table=MATCH_DATASET_TABLES[name],
-                partition_spec=[("league", "identity"), ("season", "identity")],
-                source="whoscored",
+        for (name, league, season), rows in frames.items():
+            table = MATCH_DATASET_TABLES[name]
+            self._write_match_frame(
+                table,
+                self._normalise_frame_types(pd.DataFrame(rows), table=table),
+                league=league,
+                season=season,
             )
 
         verified = {
-            name: self._match_physical_counts(MATCH_DATASET_TABLES[name], batch_ids)
+            name: self._match_physical_counts_by_scope(
+                MATCH_DATASET_TABLES[name], batch_ids_by_scope
+            )
             for name in names
         }
         new_manifests: list[dict[str, Any]] = []
@@ -5188,6 +5269,19 @@ class WhoScoredRepository:
         return tuple(commit.batch_id for commit in ordered)
 
     def record_failure(self, failure: ManifestFailure) -> Optional[str]:
+        row, outcome_batch_id = self.build_failure_row(failure)
+        self.write_failure_rows([row])
+        return outcome_batch_id
+
+    def build_failure_row(
+        self, failure: ManifestFailure
+    ) -> tuple[dict[str, Any], Optional[str]]:
+        """Validate one match failure and build its manifest row.
+
+        The not-available outcome batch id is deterministic, so it is known
+        before the row is written; callers may batch rows with
+        :meth:`write_failure_rows`.
+        """
         if failure.state not in {
             "retryable",
             "terminal",
@@ -5243,11 +5337,48 @@ class WhoScoredRepository:
                 "_entity_type": "match_manifest",
             }
         )
+        return row, outcome_batch_id
+
+    def write_failure_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Append built match failure manifest rows in one write."""
+        if not rows:
+            return
         self.writer.write_dataframe(
-            pd.DataFrame([row]),
+            pd.DataFrame([dict(row) for row in rows]),
             database=self.schema,
             table=MATCH_MANIFEST_TABLE,
             partition_spec=[("league", "identity"), ("season", "identity")],
             source="whoscored",
         )
-        return outcome_batch_id
+
+    def drop_stale_stage_tables(self, max_age_hours: float = 6) -> list[str]:
+        """Drop abandoned WhoScored Trino stage tables older than the cutoff.
+
+        Age is the newest Iceberg snapshot commit of the stage; a stage without
+        snapshots is left alone.  Returns the dropped table names.
+        """
+        rows = self.trino.execute_query(
+            "SELECT table_name FROM "
+            f"{self.catalog}.information_schema.tables "
+            f"WHERE table_schema = {_sql_string(self.schema)} "
+            "AND table_name LIKE 'whoscored\\_%\\_\\_stg\\_%' ESCAPE '\\' "
+            "ORDER BY table_name"
+        )
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        dropped: list[str] = []
+        for (table,) in rows:
+            table = str(table)
+            snapshot_rows = self.trino.execute_query(
+                "SELECT max(committed_at) FROM "
+                f'{self.catalog}.{self.schema}."{table}$snapshots"'
+            )
+            committed_at = snapshot_rows[0][0] if snapshot_rows else None
+            if not isinstance(committed_at, datetime):
+                continue
+            if committed_at.tzinfo is None:
+                committed_at = committed_at.replace(tzinfo=timezone.utc)
+            if committed_at >= cutoff:
+                continue
+            self.trino.drop_table(self.schema, table, if_exists=True)
+            dropped.append(table)
+        return dropped
