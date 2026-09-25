@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 import os
+import queue
 import threading
 import uuid
 import zlib
@@ -165,13 +166,23 @@ class EspnRawStore:
             return stream.read()
 
     def _write_bytes(self, relative: str, payload: bytes) -> None:
-        """Publish a complete object; local aliases use atomic rename."""
+        """Publish a complete object; local aliases use atomic rename.
+
+        Object stores get exactly one PUT: no HEAD and no directory markers.
+        A filesystem that needs a parent directory gets it on first failure.
+        """
         path = self._path(relative)
-        self.filesystem.create_dir(str(PurePosixPath(path).parent), recursive=True)
+        parent = str(PurePosixPath(path).parent)
         if not isinstance(self.filesystem, fs.LocalFileSystem):
-            with self.filesystem.open_output_stream(path, compression=None) as stream:
+            try:
+                stream = self.filesystem.open_output_stream(path, compression=None)
+            except OSError:
+                self.filesystem.create_dir(parent, recursive=True)
+                stream = self.filesystem.open_output_stream(path, compression=None)
+            with stream:
                 stream.write(payload)
             return
+        self.filesystem.create_dir(parent, recursive=True)
         temporary = f"{path}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
         try:
             with self.filesystem.open_output_stream(
@@ -201,15 +212,6 @@ class EspnRawStore:
         digest = cls._digest(content_hash, "content_hash")
         return f"blobs/sha256/{digest[:2]}/{digest}.json.gz"
 
-    def _quarantine(self, relative: str) -> None:
-        """Move a damaged object aside before publishing any replacement."""
-        if not self._exists(relative):
-            return
-        quarantine = f"quarantine/{relative}.{uuid.uuid4().hex}"
-        target = self._path(quarantine)
-        self.filesystem.create_dir(str(PurePosixPath(target).parent), recursive=True)
-        self.filesystem.move(self._path(relative), target)
-
     def has_target(self, target: CanonicalTargetLike) -> bool:
         return self._exists(self._alias_key(target.url_fingerprint))
 
@@ -224,7 +226,35 @@ class EspnRawStore:
         direct_bytes: Optional[int] = None,
         transport_origin: Optional[str] = None,
     ) -> RawJsonRecord:
-        """Persist body first, then atomically publish its replay alias."""
+        """Persist body first, then publish its replay alias: two PUTs.
+
+        The blob is content-addressed and gzip is deterministic (``mtime=0``),
+        so re-writing an existing blob is idempotent; no HEAD or read-back.
+        """
+        prepared = self.prepare(
+            target,
+            endpoint,
+            body,
+            fetched_at=fetched_at,
+            http_status=http_status,
+            direct_bytes=direct_bytes,
+            transport_origin=transport_origin,
+        )
+        self.write(prepared)
+        return prepared.record
+
+    def prepare(
+        self,
+        target: CanonicalTargetLike,
+        endpoint: object,
+        body: bytes,
+        *,
+        fetched_at: Optional[str] = None,
+        http_status: int = 200,
+        direct_bytes: Optional[int] = None,
+        transport_origin: Optional[str] = None,
+    ) -> "PreparedRawWrite":
+        """Validate and encode one capture without any storage I/O."""
         if not isinstance(body, bytes):
             raise TypeError("ESPN raw body must be bytes")
         fingerprint = self._digest(target.url_fingerprint, "url_fingerprint")
@@ -277,23 +307,13 @@ class EspnRawStore:
             json.dumps(alias_payload, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
 
+        return PreparedRawWrite(record, body, compressed, alias)
+
+    def write(self, prepared: "PreparedRawWrite") -> None:
+        record = prepared.record
         with self._write_lock:
-            if self._exists(blob_key) and blob_key not in self._verified_blobs:
-                try:
-                    current = self._read_bytes(blob_key)
-                    valid = (
-                        len(current) == len(compressed)
-                        and _strict_gzip_decompress(current) == body
-                    )
-                except (RawStoreError, OSError, EOFError, gzip.BadGzipFile, zlib.error):
-                    valid = False
-                if not valid:
-                    self._quarantine(blob_key)
-            if not self._exists(blob_key):
-                self._write_bytes(blob_key, compressed)
-            self._verified_blobs.add(blob_key)
-            self._write_bytes(self._alias_key(fingerprint), alias)
-        return record
+            self._write_bytes(record.blob_key, prepared.compressed)
+            self._write_bytes(self._alias_key(record.url_fingerprint), prepared.alias)
 
     def load(self, target: CanonicalTargetLike) -> tuple[bytes, RawJsonRecord]:
         fingerprint = self._digest(target.url_fingerprint, "url_fingerprint")
@@ -406,13 +426,96 @@ class EspnRawStore:
         return body
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedRawWrite:
+    record: RawJsonRecord
+    body: bytes
+    compressed: bytes
+    alias: bytes
+
+
+class RawWriteQueue:
+    """One background writer so fetching never waits for the object store.
+
+    ``put`` encodes the capture synchronously (the record is final) and queues
+    the two PUTs; ``flush`` waits for the queue and raises the first write
+    error.  Captures still in the queue stay readable through ``pending``.
+    """
+
+    def __init__(self, store: EspnRawStore, maxsize: int = 64) -> None:
+        self.store = store
+        self._queue: "queue.Queue[Optional[PreparedRawWrite]]" = queue.Queue(maxsize)
+        self._pending: dict[str, PreparedRawWrite] = {}
+        self._lock = threading.Lock()
+        self._error: Optional[BaseException] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def put(self, target: CanonicalTargetLike, endpoint: object, body: bytes, **meta):
+        prepared = self.store.prepare(target, endpoint, body, **meta)
+        with self._lock:
+            self._pending[prepared.record.url_fingerprint] = prepared
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="espn-raw-writer", daemon=True
+                )
+                self._thread.start()
+        self._queue.put(prepared)
+        return prepared.record
+
+    def pending(self, target: CanonicalTargetLike):
+        with self._lock:
+            prepared = self._pending.get(target.url_fingerprint)
+        if prepared is None:
+            return None
+        return prepared.body, prepared.record
+
+    def flush(self) -> None:
+        self._queue.join()
+        with self._lock:
+            error, self._error = self._error, None
+        if error is not None:
+            raise RawStoreError("ESPN raw write failed") from error
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            with self._lock:
+                thread, self._thread = self._thread, None
+            if thread is not None:
+                self._queue.put(None)
+                thread.join()
+
+    def _run(self) -> None:
+        while True:
+            prepared = self._queue.get()
+            try:
+                if prepared is None:
+                    return
+                try:
+                    self.store.write(prepared)
+                except BaseException as exc:  # surfaced on flush()
+                    with self._lock:
+                        if self._error is None:
+                            self._error = exc
+                finally:
+                    with self._lock:
+                        fingerprint = prepared.record.url_fingerprint
+                        if self._pending.get(fingerprint) is prepared:
+                            del self._pending[fingerprint]
+            finally:
+                self._queue.task_done()
+
+
 __all__ = [
     "EspnRawStore",
     "LEGACY_RAW_MANIFEST_VERSION",
+    "PreparedRawWrite",
     "RAW_MANIFEST_VERSION",
     "RAW_STORE_ENV",
     "RawJsonRecord",
     "RawStoreError",
     "RawTargetCorrupt",
     "RawTargetNotFound",
+    "RawWriteQueue",
 ]

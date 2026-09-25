@@ -5,26 +5,32 @@ from __future__ import annotations
 import gzip
 import io
 import json
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import requests
 from pyarrow import fs
 
+from scrapers.espn.gate import TransportGate, load_transport_policy
 from scrapers.espn.raw_store import EspnRawStore, RawTargetCorrupt
 from scrapers.espn.transport import (
+    AllOriginsBlocked,
     AmbientProxyError,
-    BudgetExceeded,
-    CircuitOpen,
     DirectTransportError,
     EndpointType,
     EspnHttpClient,
     HttpStatusError,
+    OriginBlocked,
     ResponseTooLarge,
     RetryExhausted,
-    TaskBudget,
     canonicalize_target,
 )
+
+FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "espn" / "probes"
+WEB = "https://site.web.api.espn.com"
+SITE = "https://site.api.espn.com"
 
 
 class FakeResponse:
@@ -78,14 +84,41 @@ def _clear_proxy_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def _client(monkeypatch, tmp_path, responses, **kwargs):
+class GateClock:
+    def __init__(self):
+        self.now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += timedelta(seconds=seconds)
+
+
+def _gate(tmp_path, clock=None, lane="live"):
+    clock = clock or GateClock()
+    gate = TransportGate(
+        load_transport_policy(),
+        tmp_path / "gate" / "gate.json",
+        lane,
+        step_ceiling=0,
+        utcnow_fn=clock,
+        sleep_fn=clock.sleep,
+    )
+    gate.clock = clock
+    return gate
+
+
+def _client(monkeypatch, tmp_path, responses, gate=None, **kwargs):
     _clear_proxy_env(monkeypatch)
     store = EspnRawStore.from_uri(tmp_path.as_uri())
     session = FakeSession(responses)
     sleeps = []
-    kwargs.setdefault("allow_site_origin_failover", True)
     client = EspnHttpClient(
         store,
+        gate=gate or _gate(tmp_path),
         session=session,
         sleep_fn=sleeps.append,
         monotonic_fn=lambda: 0.0,
@@ -95,20 +128,16 @@ def _client(monkeypatch, tmp_path, responses, **kwargs):
     return client, session, sleeps, store
 
 
-
 @pytest.mark.unit
-def test_pace_above_defaults_is_accepted_and_non_positive_is_rejected(
+def test_non_positive_bounds_are_rejected_and_pace_lives_in_the_gate(
     monkeypatch, tmp_path
 ):
-    # #1498: the contour sets the pace (S0 = 60/min); the transport keeps
-    # only the positivity guard, not a hard ceiling at the defaults.
-    client, _, _, _ = _client(
-        monkeypatch, tmp_path, [], rate_per_minute=60, burst=8, max_attempts=6
-    )
-    assert (client.rate_per_minute, client.burst, client.max_attempts) == (60, 8, 6)
-    for name in ("rate_per_minute", "burst", "max_attempts"):
-        with pytest.raises(ValueError, match="positive"):
-            _client(monkeypatch, tmp_path, [], **{name: 0})
+    client, _, _, _ = _client(monkeypatch, tmp_path, [], max_attempts=6)
+    assert client.max_attempts == 6 and client.lane == "live"
+    for name in ("rate_per_minute", "burst", "request_permit", "budget"):
+        assert not hasattr(client, name)
+    with pytest.raises(ValueError, match="positive"):
+        _client(monkeypatch, tmp_path, [], max_attempts=0)
 
 @pytest.mark.unit
 def test_success_is_raw_first_measured_and_cached(monkeypatch, tmp_path):
@@ -123,7 +152,6 @@ def test_success_is_raw_first_measured_and_cached(monkeypatch, tmp_path):
     result = client.fetch_json(
         "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
         EndpointType.SCOREBOARD,
-        competition_id=700,
     )
 
     assert result.json_data == {"events": [{"id": "1"}]}
@@ -131,6 +159,7 @@ def test_success_is_raw_first_measured_and_cached(monkeypatch, tmp_path):
     assert result.attempts == 1 and not result.cache_hit
     assert result.direct_bytes == len(encoded) and result.proxy_bytes == 0
     assert result.raw_uri.endswith(".json.gz") and result.content_hash
+    client.flush()
     assert store.load(result.target)[0] == body
     assert session.trust_env is False and session.proxies == {}
     assert session.calls[0][1]["timeout"] == (5.0, 20.0)
@@ -144,7 +173,6 @@ def test_success_is_raw_first_measured_and_cached(monkeypatch, tmp_path):
     cached = client.fetch_json(
         result.target.canonical_url,
         EndpointType.SCOREBOARD,
-        competition_id=700,
     )
     assert cached.cache_hit and cached.attempts == cached.direct_bytes == 0
     assert len(session.calls) == 1
@@ -161,7 +189,7 @@ def test_replay_has_zero_network_calls_and_corrupt_cache_refetches(
     target = canonicalize_target(url)
     record = store.store(target, EndpointType.SUMMARY, b'{"old":true}')
 
-    replayed = client.replay_json(url, EndpointType.SUMMARY, event_id=9)
+    replayed = client.replay_json(url, EndpointType.SUMMARY)
     assert replayed.cache_hit and replayed.attempts == 0
     assert len(session.calls) == 0
 
@@ -169,10 +197,11 @@ def test_replay_has_zero_network_calls_and_corrupt_cache_refetches(
     with pytest.raises(RawTargetCorrupt):
         store.load(target)
     fetched = client.fetch_json(
-        url, EndpointType.SUMMARY, event_id=9, force_refresh=False
+        url, EndpointType.SUMMARY, force_refresh=False
     )
     assert fetched.json_data == {"header": {}}
     assert len(session.calls) == 1
+    client.flush()
     assert store.load(target)[0] == b'{"header":{}}'
 
 
@@ -189,7 +218,6 @@ def test_force_refresh_daily_get_ignores_existing_mutable_target_alias(
     fetched = client.fetch_json(
         url,
         EndpointType.SUMMARY,
-        event_id=9,
         force_refresh=True,
     )
 
@@ -212,7 +240,6 @@ def test_retryable_statuses_honor_retry_after(monkeypatch, tmp_path, status):
     result = client.fetch_json(
         "https://site.api.espn.com/apis/site/v2/sports/soccer/summary?event=10",
         "Summary",
-        event_id=10,
     )
     assert result.attempts == 2
     assert sleeps == [3.0]
@@ -259,11 +286,13 @@ def test_timeout_retries_but_nonretryable_4xx_fails_once(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
-def test_rate_limit_is_thirty_per_minute_with_burst_four(monkeypatch, tmp_path):
+def test_pace_is_the_gate_step_s0_one_request_per_second(monkeypatch, tmp_path):
+    gate = _gate(tmp_path)
     client, session, sleeps, _ = _client(
         monkeypatch,
         tmp_path,
         [FakeResponse(200, b"{}") for _ in range(5)],
+        gate=gate,
     )
 
     for index in range(5):
@@ -274,17 +303,17 @@ def test_rate_limit_is_thirty_per_minute_with_burst_four(monkeypatch, tmp_path):
         )
 
     assert len(session.calls) == 5
-    assert sleeps == [2.0]
-
+    assert sleeps == []
+    assert gate.clock.sleeps == [pytest.approx(1.0)] * 4
 
 @pytest.mark.unit
-def test_each_real_attempt_uses_shared_durable_request_permit(monkeypatch, tmp_path):
-    permits = []
+def test_each_real_attempt_takes_one_gate_permit(monkeypatch, tmp_path):
+    gate = _gate(tmp_path)
     client, session, _, _ = _client(
         monkeypatch,
         tmp_path,
         [FakeResponse(503), FakeResponse(200, b"{}")],
-        request_permit=lambda: permits.append("permit"),
+        gate=gate,
     )
 
     client.fetch_json(
@@ -293,12 +322,12 @@ def test_each_real_attempt_uses_shared_durable_request_permit(monkeypatch, tmp_p
         force_refresh=True,
     )
 
-    assert permits == ["permit", "permit"]
+    assert gate.snapshot()["daily"]["live"]["requests"] == 2
     assert len(session.calls) == 2
-
+    assert client.ledger[-1].origin_attempts == ((WEB, 503), (WEB, 200))
 
 @pytest.mark.unit
-def test_oversize_circuit_and_budgets_fail_closed(monkeypatch, tmp_path):
+def test_oversize_response_fails_closed(monkeypatch, tmp_path):
     oversize, _, _, _ = _client(
         monkeypatch,
         tmp_path / "large",
@@ -311,92 +340,38 @@ def test_oversize_circuit_and_budgets_fail_closed(monkeypatch, tmp_path):
             "catalog",
         )
 
-    failures = [FakeResponse(503, b"x") for _ in range(5)]
-    circuit, session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "circuit",
-        failures,
-        max_attempts=1,
-    )
-    for _ in range(5):
-        with pytest.raises(RetryExhausted):
-            circuit.fetch_json(
-                "https://site.api.espn.com/apis/site/v2/sports/soccer/leagues",
-                "catalog",
-                force_refresh=True,
-            )
-    with pytest.raises(CircuitOpen):
-        circuit.fetch_json(
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/leagues",
-            "catalog",
-            force_refresh=True,
-        )
-    assert len(session.calls) == 5
-
-    budgeted, budget_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "budget",
-        [FakeResponse(200, b"{}")],
-        budget=TaskBudget(max_requests=0),
-    )
-    with pytest.raises(BudgetExceeded):
-        budgeted.fetch_json(
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/leagues",
-            "catalog",
-        )
-    assert budget_session.calls == []
-
-
 @pytest.mark.unit
 def test_ambient_proxy_and_non_https_are_rejected(monkeypatch, tmp_path):
     _clear_proxy_env(monkeypatch)
     monkeypatch.setenv("https_proxy", "http://proxy.invalid")
     with pytest.raises(AmbientProxyError):
         EspnHttpClient(
-            EspnRawStore.from_uri(tmp_path.as_uri()), session=FakeSession([])
+            EspnRawStore.from_uri(tmp_path.as_uri()),
+            gate=_gate(tmp_path),
+            session=FakeSession([]),
         )
 
     _clear_proxy_env(monkeypatch)
     client = EspnHttpClient(
-        EspnRawStore.from_uri(tmp_path.as_uri()), session=FakeSession([])
+        EspnRawStore.from_uri(tmp_path.as_uri()),
+        gate=_gate(tmp_path),
+        session=FakeSession([]),
     )
     with pytest.raises(ValueError, match="HTTPS"):
         client.fetch_json("http://site.api.espn.com/summary?event=1", "summary")
 
 
 @pytest.mark.unit
-def test_exact_defaults_and_unique_competition_event_budgets(monkeypatch, tmp_path):
-    budget = TaskBudget(max_competitions=1, max_summary_events=1)
-    client, session, _, _ = _client(
-        monkeypatch,
-        tmp_path,
-        [FakeResponse(200, b"{}"), FakeResponse(200, b"{}")],
-        budget=budget,
-    )
+def test_exact_defaults(monkeypatch, tmp_path):
+    client, _, _, _ = _client(monkeypatch, tmp_path, [])
     assert client.connect_timeout == 5.0
     assert client.read_timeout == 20.0
     assert client.response_cap_bytes == 16 * 1024 * 1024
-    assert client.rate_per_minute == 30
-    assert client.burst == 4
     assert client.max_attempts == 4
-    assert budget.max_competitions == 1
-    assert budget.max_summary_events == 1
-
-    client.fetch_json(
-        "https://site.api.espn.com/summary?event=1",
-        "summary",
-        competition_id=7,
-        event_id=1,
+    assert client.session.headers["User-Agent"] == (
+        "data-platform-football/espn-native-v2"
     )
-    with pytest.raises(BudgetExceeded):
-        client.fetch_json(
-            "https://site.api.espn.com/summary?event=2",
-            "summary",
-            competition_id=8,
-            event_id=2,
-        )
-    assert len(session.calls) == 1
-
+    assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
 
 @pytest.mark.unit
 def test_raw_store_requires_configuration_and_content_addresses(monkeypatch, tmp_path):
@@ -432,52 +407,20 @@ def test_exact_blob_read_ignores_moved_alias_and_rejects_uri_hash_drift(tmp_path
 
 
 @pytest.mark.unit
-def test_byte_budget_reserves_before_network_and_never_overruns(monkeypatch, tmp_path):
-    exhausted, exhausted_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "empty",
-        [FakeResponse(200, b"{}")],
-        budget=TaskBudget(max_bytes=0),
-    )
-    with pytest.raises(BudgetExceeded):
-        exhausted.fetch_json("https://site.api.espn.com/catalog", "catalog")
-    assert exhausted_session.calls == []
-
-    framed, _, _, _ = _client(
-        monkeypatch,
-        tmp_path / "framed",
-        [FakeResponse(200, b"12", {"Content-Length": "2"})],
-        budget=TaskBudget(max_bytes=1),
-    )
-    with pytest.raises(BudgetExceeded):
-        framed.fetch_json("https://site.api.espn.com/catalog", "catalog")
-    assert framed.budget.bytes_used <= 1
-
-    unframed, _, _, _ = _client(
-        monkeypatch,
-        tmp_path / "unframed",
-        [FakeResponse(200, b"12")],
-        budget=TaskBudget(max_bytes=1),
-    )
-    with pytest.raises(BudgetExceeded):
-        unframed.fetch_json("https://site.api.espn.com/catalog", "catalog")
-    assert unframed.budget.bytes_used <= 1
-
-
-@pytest.mark.unit
 def test_partial_read_timeout_charges_wire_bytes_and_retries(monkeypatch, tmp_path):
     partial = FakeResponse(200)
     partial.raw = PartialTimeoutRaw(b"123")
+    gate = _gate(tmp_path)
     client, session, _, _ = _client(
         monkeypatch,
         tmp_path,
         [partial, FakeResponse(200, b'{"ok":true}')],
-        budget=TaskBudget(max_bytes=32),
+        gate=gate,
     )
     result = client.fetch_json("https://site.api.espn.com/catalog", "catalog")
     assert result.attempts == 2
     assert result.direct_bytes == 3 + len(b'{"ok":true}')
-    assert client.budget.bytes_used == result.direct_bytes
+    assert gate.snapshot()["daily"]["live"]["bytes"] == result.direct_bytes
     assert len(session.calls) == 2
 
 
@@ -497,6 +440,7 @@ def test_retryable_status_is_classified_before_bad_body(monkeypatch, tmp_path):
     )
     result = client.fetch_json("https://site.api.espn.com/catalog", "catalog")
     assert result.attempts == 2 and sleeps == [4.0]
+    client.flush()
     assert store.load(result.target)[0] == b'{"ok":true}'
 
 
@@ -557,6 +501,7 @@ def test_secrets_never_reach_alias_ledger_exception_or_repr(monkeypatch, tmp_pat
     url = f"https://site.api.espn.com/catalog?apikey={secret}&event=7"
     client, _, _, store = _client(monkeypatch, tmp_path, [FakeResponse(200, b"{}")])
     result = client.fetch_json(url, "catalog")
+    client.flush()
     alias = store._read_bytes(store._alias_key(result.target.url_fingerprint))
     combined = alias + repr(result).encode() + repr(client.ledger).encode()
     assert secret.encode() not in combined
@@ -596,462 +541,191 @@ def test_off_domain_https_and_mixed_case_proxy_are_rejected(monkeypatch, tmp_pat
     monkeypatch.setenv("HtTp_PrOxY", "http://proxy.invalid")
     with pytest.raises(AmbientProxyError):
         EspnHttpClient(
-            EspnRawStore.from_uri(tmp_path.as_uri()), session=FakeSession([])
+            EspnRawStore.from_uri(tmp_path.as_uri()),
+            gate=_gate(tmp_path),
+            session=FakeSession([]),
         )
 
 
+def _akamai_403():
+    body = (FIXTURES / "site_api_403_akamai.body").read_bytes()
+    return FakeResponse(403, body, {"Content-Type": "text/html"})
+
+
+SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+
+
 @pytest.mark.unit
-def test_exact_primary_403_fails_over_once_to_official_site_mirror(
+def test_site_api_url_goes_to_web_api_primary_keeping_logical_identity(
     monkeypatch, tmp_path
 ):
-    url = (
-        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
-        "?dates=20260801&limit=1000"
+    body = b'{"header":{}}'
+    encoded = gzip.compress(body, mtime=0)
+    client, session, _, store = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(200, encoded, {"Content-Encoding": "gzip"})],
     )
-    body = b'{"events":[{"id":"1"}]}'
-    permits = []
+    target = canonicalize_target(SUMMARY, {"event": 740880})
+    result = client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 740880})
+    client.flush()
+
+    assert session.calls[0][0] == target.canonical_url.replace(SITE, WEB, 1)
+    assert result.target.url_fingerprint == target.url_fingerprint
+    assert result.transport_origin == WEB
+    assert result.attempts == 1
+    stored_body, record = store.load(target)
+    assert stored_body == body and record.transport_origin == WEB
+
+
+@pytest.mark.unit
+def test_direct_web_api_request_is_allowed(monkeypatch, tmp_path):
+    url = "https://site.web.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    client, session, _, _ = _client(monkeypatch, tmp_path, [FakeResponse(200, b"{}")])
+    result = client.fetch_json(url, EndpointType.SUMMARY, {"event": 9})
+    assert result.transport_origin == WEB
+    assert session.calls[0][0].startswith(WEB + "/")
+    replayed = client.replay_json(url, EndpointType.SUMMARY, {"event": 9})
+    assert replayed.cache_hit and len(session.calls) == 1
+
+
+@pytest.mark.unit
+def test_akamai_403_defers_request_without_retry(monkeypatch, tmp_path):
+    gate = _gate(tmp_path)
     client, session, sleeps, store = _client(
         monkeypatch,
         tmp_path,
-        [FakeResponse(403, b"blocked"), FakeResponse(200, body)],
-        request_permit=lambda: permits.append("permit"),
-        burst=1,
+        [_akamai_403(), FakeResponse(200, b"{}")],
+        gate=gate,
     )
+    with pytest.raises(OriginBlocked) as exc_info:
+        client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 9})
 
-    result = client.fetch_json(
-        url,
-        EndpointType.SCOREBOARD,
-        competition_id=700,
-        force_refresh=True,
+    # The reserve starts closed, so the whole site cluster is blocked.
+    assert isinstance(exc_info.value, AllOriginsBlocked)
+    entry = exc_info.value.ledger_entry
+    assert entry.disposition == "blocked_deferred"
+    assert (entry.status, entry.attempts, entry.host) == (
+        403,
+        1,
+        "site.web.api.espn.com",
     )
+    assert entry.origin_attempts == ((WEB, 403),)
+    assert len(session.calls) == 1 and sleeps == []
+    assert gate.snapshot()["daily"]["live"]["requests"] == 1
+    client.flush()
+    assert not store.has_target(canonicalize_target(SUMMARY, {"event": 9}))
 
-    assert result.target.canonical_url == canonicalize_target(url).canonical_url
-    assert result.target.url_fingerprint == canonicalize_target(url).url_fingerprint
-    assert result.transport_origin == "https://site.web.api.espn.com"
-    assert result.attempts == 2
-    assert result.direct_bytes == len(body)
-    assert client.budget.requests_used == 2
-    assert client.budget.bytes_used == len(body)
-    assert permits == ["permit", "permit"]
-    assert sleeps == [2.0]
-    assert [call[0] for call in session.calls] == [
-        canonicalize_target(url).canonical_url,
-        canonicalize_target(url).canonical_url.replace(
-            "https://site.api.espn.com", "https://site.web.api.espn.com", 1
-        ),
-    ]
-    assert all(call[1]["allow_redirects"] is False for call in session.calls)
-    stored_body, record = store.load(result.target)
-    alias = json.loads(
-        store._read_bytes(store._alias_key(result.target.url_fingerprint))
-    )
-    assert stored_body == body
-    assert record.transport_origin == "https://site.web.api.espn.com"
-    assert record.manifest_version == "espn-raw-v2"
-    assert alias["transport_origin"] == "https://site.web.api.espn.com"
-    assert client.ledger[-1].transport_origin == "https://site.web.api.espn.com"
+    with pytest.raises(AllOriginsBlocked) as blocked:
+        client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 10})
+    assert blocked.value.ledger_entry.attempts == 0
+    assert len(session.calls) == 1
 
 
 @pytest.mark.unit
-def test_site_mirror_nonretryable_failure_is_terminal_without_origin_cycle(
+def test_primary_403_moves_next_requests_to_open_reserve_one_permit_each(
     monkeypatch, tmp_path
 ):
-    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    """Criterion 1 at the client: no second attempt, the reserve serves next."""
+    gate = _gate(tmp_path)
+    gate.choose_origin("site")
+    gate.clock.now += timedelta(days=1)  # the reserve's daily probe is due
     client, session, _, _ = _client(
         monkeypatch,
         tmp_path,
-        [FakeResponse(403), FakeResponse(403), FakeResponse(200, b"{}")],
+        [_akamai_403()] + [FakeResponse(200, b"{}") for _ in range(4)],
+        gate=gate,
     )
+    with pytest.raises(OriginBlocked) as exc_info:
+        client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 1})
+    assert not isinstance(exc_info.value, AllOriginsBlocked)
+    assert len(session.calls) == 1
 
-    with pytest.raises(HttpStatusError) as exc_info:
-        client.fetch_json(
-            url,
-            EndpointType.SUMMARY,
-            {"event": 9},
-            competition_id=700,
-            event_id=9,
-            force_refresh=True,
-        )
-
-    assert exc_info.value.status == 403
-    assert exc_info.value.ledger_entry.attempts == 2
-    assert (
-        exc_info.value.ledger_entry.transport_origin == "https://site.web.api.espn.com"
-    )
-    assert len(session.calls) == 2
+    before = gate.snapshot()["daily"]["live"]["requests"]
+    for event in (2, 3, 4, 5):
+        result = client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": event})
+        assert result.attempts == 1 and result.transport_origin == SITE
+    assert gate.snapshot()["daily"]["live"]["requests"] - before == 4
+    assert [call[0].split("/apis")[0] for call in session.calls] == [WEB] + [SITE] * 4
 
 
 @pytest.mark.unit
-def test_site_mirror_retryable_scoreboard_failure_retries_same_mirror(
+def test_retryable_failure_retries_same_origin_with_new_permit(
     monkeypatch, tmp_path
 ):
-    url = (
-        "https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.euro_u21/scoreboard"
-    )
-    params = {"dates": "20250201-20250303", "limit": 1000}
-    permits = []
+    gate = _gate(tmp_path)
     client, session, sleeps, _ = _client(
         monkeypatch,
         tmp_path,
-        [
-            FakeResponse(403),
-            FakeResponse(502),
-            FakeResponse(200, b'{"events":[]}'),
-        ],
-        request_permit=lambda: permits.append("permit"),
+        [FakeResponse(502), requests.Timeout("late"), FakeResponse(200, b"{}")],
+        gate=gate,
     )
-
-    result = client.fetch_json(
-        url,
-        EndpointType.SCOREBOARD,
-        params,
-        competition_id=5693,
-        force_refresh=True,
-    )
-
-    target = canonicalize_target(url, params)
-    mirror_url = target.canonical_url.replace(
-        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
-    )
+    result = client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 9})
     assert result.attempts == 3
-    assert result.target.url_fingerprint == target.url_fingerprint
-    assert result.transport_origin == "https://site.web.api.espn.com"
-    assert [call[0] for call in session.calls] == [
-        target.canonical_url,
-        mirror_url,
-        mirror_url,
-    ]
-    assert client.budget.requests_used == 3
-    assert permits == ["permit", "permit", "permit"]
-    assert sleeps == [2.0]
+    assert [call[0].split("/apis")[0] for call in session.calls] == [WEB] * 3
+    assert sleeps == [1.0, 2.0]
+    assert client.ledger[-1].origin_attempts == ((WEB, 502), (WEB, None), (WEB, 200))
+    assert gate.snapshot()["daily"]["live"]["requests"] == 3
 
 
 @pytest.mark.unit
-def test_site_mirror_retryable_failure_stays_bounded(monkeypatch, tmp_path):
-    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
-    client, session, sleeps, _ = _client(
+def test_retryable_failure_stays_bounded(monkeypatch, tmp_path):
+    client, session, _, _ = _client(
         monkeypatch,
         tmp_path,
-        [
-            FakeResponse(403),
-            FakeResponse(502),
-            FakeResponse(503),
-            FakeResponse(503),
-        ],
+        [FakeResponse(503) for _ in range(5)],
     )
-
     with pytest.raises(RetryExhausted) as exc_info:
-        client.fetch_json(
-            url,
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-            force_refresh=True,
-        )
-
-    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
-        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
-    )
+        client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 9})
     assert exc_info.value.ledger_entry.attempts == 4
-    assert (
-        exc_info.value.ledger_entry.transport_origin == "https://site.web.api.espn.com"
-    )
-    assert [call[0] for call in session.calls] == [
-        canonicalize_target(url, {"event": 9}).canonical_url,
-        mirror_url,
-        mirror_url,
-        mirror_url,
-    ]
-    assert sleeps == [2.0, 4.0]
+    assert exc_info.value.ledger_entry.disposition == "retry_exhausted"
+    assert len(session.calls) == 4
 
 
 @pytest.mark.unit
-def test_site_mirror_retries_remain_circuit_and_rate_bounded(monkeypatch, tmp_path):
-    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
-    client, session, sleeps, _ = _client(
-        monkeypatch,
-        tmp_path,
-        [
-            FakeResponse(403),
-            FakeResponse(502),
-            FakeResponse(503),
-            FakeResponse(200, b"{}"),
-        ],
-        burst=1,
-        circuit_failure_threshold=2,
-    )
-
-    with pytest.raises(RetryExhausted) as exc_info:
-        client.fetch_json(
-            url,
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-            force_refresh=True,
-        )
-
-    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
-        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
-    )
-    assert exc_info.value.ledger_entry.attempts == 3
-    assert client.circuit_is_open
-    assert [call[0] for call in session.calls] == [
-        canonicalize_target(url, {"event": 9}).canonical_url,
-        mirror_url,
-        mirror_url,
-    ]
-    assert sleeps == [2.0, 2.0, 2.0]
-
-
-@pytest.mark.unit
-def test_site_mirror_timeout_retries_same_mirror(monkeypatch, tmp_path):
-    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
-    client, session, sleeps, _ = _client(
-        monkeypatch,
-        tmp_path,
-        [FakeResponse(403), requests.Timeout("late"), FakeResponse(200, b"{}")],
-    )
-
-    result = client.fetch_json(
-        url,
-        EndpointType.SUMMARY,
-        {"event": 9},
-        event_id=9,
-        force_refresh=True,
-    )
-
-    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
-        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
-    )
-    assert result.attempts == 3
-    assert [call[0] for call in session.calls] == [
-        canonicalize_target(url, {"event": 9}).canonical_url,
-        mirror_url,
-        mirror_url,
-    ]
-    assert sleeps == [2.0]
-
-
-@pytest.mark.unit
-def test_site_mirror_partial_read_timeout_retries_same_mirror(monkeypatch, tmp_path):
-    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
-    partial = FakeResponse(200)
-    partial.raw = PartialTimeoutRaw(b"{")
-    client, session, sleeps, _ = _client(
-        monkeypatch,
-        tmp_path,
-        [FakeResponse(403), partial, FakeResponse(200, b"{}")],
-    )
-
-    result = client.fetch_json(
-        url,
-        EndpointType.SUMMARY,
-        {"event": 9},
-        event_id=9,
-        force_refresh=True,
-    )
-
-    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
-        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
-    )
-    assert result.attempts == 3
-    assert result.direct_bytes == 3
-    assert [call[0] for call in session.calls] == [
-        canonicalize_target(url, {"event": 9}).canonical_url,
-        mirror_url,
-        mirror_url,
-    ]
-    assert sleeps == [2.0]
-
-
-@pytest.mark.unit
-def test_site_mirror_is_not_used_for_other_hosts_statuses_endpoints_or_paths(
+def test_ledger_records_address_status_bytes_encoding_latency_step_lane(
     monkeypatch, tmp_path
 ):
-    cases = (
-        (
-            "other-host",
-            "https://sports.core.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
-            EndpointType.SCOREBOARD,
-            403,
-            {"competition_id": 700},
-        ),
-        (
-            "other-status",
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
-            EndpointType.SCOREBOARD,
-            401,
-            {"competition_id": 700},
-        ),
-        (
-            "catalog-endpoint",
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
-            EndpointType.CATALOG,
-            403,
-            {},
-        ),
-        (
-            "catalog-path",
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/leagues",
-            EndpointType.CATALOG,
-            403,
-            {},
-        ),
-        (
-            "other-path",
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/standings",
-            EndpointType.SCOREBOARD,
-            403,
-            {"competition_id": 700},
-        ),
-        (
-            "endpoint-path-mismatch",
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
-            EndpointType.SUMMARY,
-            403,
-            {"competition_id": 700, "event_id": 9},
-        ),
-        (
-            "unexpected-query",
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event=9&token=secret",
-            EndpointType.SUMMARY,
-            403,
-            {"event_id": 9},
-        ),
-        (
-            "event-identity-mismatch",
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event=10",
-            EndpointType.SUMMARY,
-            403,
-            {"event_id": 9},
-        ),
+    """Criterion 4: every request leaves one ledger entry with its address."""
+    body = b'{"header":{"id":"740880"}}'
+    encoded = gzip.compress(body, mtime=0)
+    client, _, _, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(200, encoded, {"Content-Encoding": "gzip"})],
     )
-
-    for name, url, endpoint, status, identity in cases:
-        client, session, _, _ = _client(
-            monkeypatch,
-            tmp_path / name,
-            [FakeResponse(status), FakeResponse(200, b"{}")],
-        )
-        with pytest.raises(HttpStatusError) as exc_info:
-            client.fetch_json(url, endpoint, force_refresh=True, **identity)
-        assert exc_info.value.status == status
-        assert len(session.calls) == 1
-        if name == "unexpected-query":
-            combined = f"{exc_info.value!s}{exc_info.value!r}{client.ledger!r}"
-            assert "secret" not in combined
+    client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 740880})
+    entry = client.ledger[-1]
+    assert entry.host == "site.web.api.espn.com"
+    assert entry.transport_origin == WEB
+    assert entry.status == 200 and entry.attempts == 1
+    assert entry.direct_bytes == len(encoded)
+    assert entry.content_encoding == "gzip"
+    assert entry.latency_ms == 0.0
+    assert (entry.step, entry.lane) == (0, "live")
+    assert entry.requested_at == "2026-07-31T00:00:00+00:00"
+    assert entry.disposition == "success"
 
 
 @pytest.mark.unit
-def test_site_mirror_is_internal_only_and_failover_requires_explicit_policy(
-    monkeypatch, tmp_path
+def test_uncompressed_body_over_100kb_warns_and_is_journaled(
+    monkeypatch, tmp_path, caplog
 ):
-    direct, direct_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "direct-mirror",
-        [FakeResponse(200, b"{}")],
-    )
-    with pytest.raises(ValueError, match="mirror"):
-        direct.fetch_json(
-            "https://site.web.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary",
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-        )
-    assert direct_session.calls == []
-
-    disabled, disabled_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "disabled",
-        [FakeResponse(403), FakeResponse(200, b"{}")],
-        allow_site_origin_failover=False,
-    )
-    with pytest.raises(HttpStatusError) as exc_info:
-        disabled.fetch_json(
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary",
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-            force_refresh=True,
-        )
-    assert exc_info.value.status == 403
-    assert len(disabled_session.calls) == 1
+    body = b'{"pad":"' + b"x" * 102400 + b'"}'
+    client, _, _, _ = _client(monkeypatch, tmp_path, [FakeResponse(200, body)])
+    with caplog.at_level(logging.WARNING, logger="scrapers.espn.transport"):
+        client.fetch_json(SUMMARY, EndpointType.SUMMARY, {"event": 9})
+    assert "uncompressed" in caplog.text
+    entry = client.ledger[-1]
+    assert entry.content_encoding == "identity" and entry.direct_bytes > 102400
 
 
 @pytest.mark.unit
-def test_failover_obeys_request_and_attempt_budgets(monkeypatch, tmp_path):
-    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
-    permits = []
-    budgeted, budgeted_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "request-budget",
-        [FakeResponse(403), FakeResponse(200, b"{}")],
-        budget=TaskBudget(max_requests=1),
-        request_permit=lambda: permits.append("permit"),
-    )
-    with pytest.raises(BudgetExceeded):
-        budgeted.fetch_json(
-            url,
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-            force_refresh=True,
-        )
-    assert budgeted.budget.requests_used == 1
-    assert len(budgeted_session.calls) == 1
-    assert permits == ["permit"]
-
-    retry_budgeted, retry_budgeted_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "mirror-retry-budget",
-        [FakeResponse(403), FakeResponse(502), FakeResponse(200, b"{}")],
-        budget=TaskBudget(max_requests=2),
-    )
-    with pytest.raises(BudgetExceeded) as retry_budget_error:
-        retry_budgeted.fetch_json(
-            url,
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-            force_refresh=True,
-        )
-    assert retry_budget_error.value.ledger_entry.attempts == 2
-    assert retry_budgeted.budget.requests_used == 2
-    assert len(retry_budgeted_session.calls) == 2
-
-    bounded, bounded_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "attempt-budget",
-        [FakeResponse(403), FakeResponse(200, b"{}")],
-        max_attempts=1,
-    )
-    with pytest.raises(HttpStatusError) as exc_info:
-        bounded.fetch_json(
-            url,
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-            force_refresh=True,
-        )
-    assert exc_info.value.status == 403
-    assert len(bounded_session.calls) == 1
-
-    capped, capped_session, _, _ = _client(
-        monkeypatch,
-        tmp_path / "byte-budget",
-        [FakeResponse(403), FakeResponse(200, b"12")],
-        response_cap_bytes=1,
-    )
-    with pytest.raises(ResponseTooLarge):
-        capped.fetch_json(
-            url,
-            EndpointType.SUMMARY,
-            {"event": 9},
-            event_id=9,
-            force_refresh=True,
-        )
-    assert len(capped_session.calls) == 2
-    assert capped.budget.bytes_used <= 1
+def test_unknown_espn_host_has_no_transport_cluster(monkeypatch, tmp_path):
+    client, session, _, _ = _client(monkeypatch, tmp_path, [FakeResponse(200, b"{}")])
+    with pytest.raises(ValueError, match="cluster"):
+        client.fetch_json("https://www.espn.com/soccer/", "catalog")
+    assert session.calls == []
 
 
 @pytest.mark.unit
@@ -1074,7 +748,6 @@ def test_legacy_raw_alias_cache_hit_stays_network_free_and_origin_is_additive(
         url,
         EndpointType.SUMMARY,
         {"event": 9},
-        event_id=9,
     )
 
     assert result.json_data == {"old": True}
