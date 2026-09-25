@@ -1,0 +1,210 @@
+# Изолированный WhoScored-Airflow (#1017; в master с #1473). Проект whoscored-airflow, своя
+# metadata-DB, scheduler на пинованном образе, код — bind-mount дерева
+# ${WHOSCORED_RUNTIME_DIR}/src (git worktree, detached на SHA master; ставит его
+# deploy/whoscored/auto_deliver.sh). Проект data-platform (общий стек) НЕ трогаем.
+# Перенесено 1:1 из живого /root/whoscored-1017-runtime/whoscored-airflow.compose.yaml
+# (25.09.2026): изменены только пути хоста — через ${WHOSCORED_RUNTIME_DIR} и
+# ${WHOSCORED_PROXY_HOST_FILE} с прежними значениями по умолчанию.
+#
+# ВАЖНО: дерево монтируется в /opt/whoscored-src, а НЕ в /opt/airflow.
+#   * run_whoscored_scraper.py:33 — при __file__ под /opt/airflow требуется вшитый
+#     в образ .pth-якорь (в чистом образе fbref-590579 его нет);
+#   * runtime_contract.py:1311-1315 — при root==/opt/airflow чтение
+#     configs/medallion/competitions.yaml падает RuntimeContractError, т.к. в master
+#     validate_runtime_contract — no-op и не ставит sys._whoscored_runtime_import_guard.
+#   Оба ограничения снимаются мягким якорем (REQUIRE_FULL=False), который runner
+#   исполняет сам, когда живёт вне /opt/airflow. Проверено pre-flight-прогоном.
+#
+# DAG: каталог ${WHOSCORED_RUNTIME_DIR}/dags (→ /opt/airflow/dags) держит КОПИИ двух DAG
+# и deploy/whoscored/.airflowignore; копирует их auto_deliver.sh. Файловый bind-mount
+# из дерева не используем — checkout меняет инод (мина #1263).
+#
+# Сети: whoscored-net (своя, external, ручного создания; там же whoscored-gw)
+#       + dp-storage (чужая, ради алиасов trino/seaweedfs/lakekeeper).
+# dp-backend сознательно НЕ подключаем: там алиас postgres общей Airflow-БД
+# (тот же довод, что у sofascore).
+#
+# Запуск — только свой проект и сервисы поимённо (голый `up` запрещён, SHARED-STACK-PROTOCOL):
+#   docker compose -p whoscored-airflow \
+#     -f ${WHOSCORED_RUNTIME_DIR}/src/deploy/whoscored/airflow.compose.yaml \
+#     --env-file /root/data-platform-football/.env up -d --no-deps airflow-scheduler
+name: whoscored-airflow
+
+x-ws-airflow-common: &ws-airflow-common
+  image: data-platform-airflow-scheduler:fbref-590579ef4649810ec7f0132a67e40a942b730e98
+  pull_policy: never
+  shm_size: '512m'
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  cap_add: [CHOWN, SETGID, SETUID, SYS_PTRACE]
+  environment: &ws-airflow-env
+    # ---------- Airflow core ----------
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # СВОЯ metadata-DB. Ни при каких обстоятельствах не менять на общий postgres.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@whoscored-airflow-metadb:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    # utils.* берутся из смонтированного master-дерева. Порядок совпадает с тем,
+    # что якорь ставит в sys.path (root, root/dags) — этого требует
+    # runtime_contract._effective_import_paths().
+    PYTHONPATH: /opt/whoscored-src:/opt/whoscored-src/dags
+
+    # ---------- Trino (через dp-storage) ----------
+    TRINO_HOST: trino
+    TRINO_PORT: ${TRINO_PORT}
+    TRINO_USER: ${TRINO_USER:-airflow}
+    TRINO_PASSWORD: ${TRINO_PASSWORD}
+
+    # ---------- S3 / Iceberg (общее хранилище) ----------
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+    S3_SECRET_KEY: ${S3_SECRET_KEY}
+    S3_ENDPOINT: seaweedfs:8333
+    S3_SCHEME: http
+    S3_REGION: ${S3_REGION:-us-east-1}
+    ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE}
+    ICEBERG_REST_WAREHOUSE: ${ICEBERG_REST_WAREHOUSE:-football}
+    ICEBERG_REST_URI: ${ICEBERG_REST_URI:-http://lakekeeper:8181/catalog}
+
+    # ---------- WhoScored raw store ----------
+    # s3://football/raw/whoscored — здесь уже лежит тёплый кеш.
+    WHOSCORED_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/whoscored
+    WHOSCORED_RAW_S3_ENDPOINT: seaweedfs:8333
+    WHOSCORED_RAW_S3_SCHEME: http
+    WHOSCORED_RAW_S3_REGION: ${S3_REGION:-us-east-1}
+    WHOSCORED_RAW_IO_ATTEMPTS: "4"
+    WHOSCORED_RAW_RETRY_BASE_SECONDS: "0.2"
+    WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS: "55"
+    WHOSCORED_RAW_SNAPSHOT_LOCK_TIMEOUT_SECONDS: "300"
+
+    # ---------- Транспорт ----------
+    # [1471] живой пул — общий /root/dpf-whoscored-merge/proxys.txt (58 портов), маунт ниже.
+    WHOSCORED_PROXY_FILE: /opt/airflow/proxys.txt
+    # [1471] корень дерева для master-DAG (cd + PYTHONPATH); дефолт в DAG — /opt/airflow.
+    WHOSCORED_RUNTIME_ROOT: /opt/whoscored-src
+    FLARESOLVERR_URL: http://whoscored_flaresolverr:8191
+    WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE: "60"
+    WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: "60"
+    WHOSCORED_SCOPE_WRITE_CHUNK_ROWS: "20000"
+    # Платный путь недоступен by construction: policy direct_only, gateway URL пуст.
+    WHOSCORED_PAID_GATEWAY_URL: ""
+
+    # ---------- Персистентное состояние ----------
+    WHOSCORED_SOURCE_CIRCUIT_PATH: /opt/airflow/state/circuit/source-circuit-v1.json
+    WHOSCORED_SOURCE_CIRCUIT_WAIT: "0"
+    WHOSCORED_REQUEST_LEDGER_PATH: /opt/airflow/logs/whoscored/request_ledger.jsonl
+    WHOSCORED_LOCK_DIR: /opt/airflow/logs/whoscored/commit_locks
+    WHOSCORED_RAW_LOCK_DIR: /opt/airflow/logs/whoscored/raw_locks
+    WHOSCORED_SCOPE_SPOOL_DIR: /opt/airflow/spool/whoscored
+
+    # ---------- Алерты ----------
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ALERT_ENV: whoscored-isolated
+
+  volumes:
+    - ${WHOSCORED_RUNTIME_DIR:-/root/whoscored-1017-runtime}/src:/opt/whoscored-src:ro
+    - ${WHOSCORED_RUNTIME_DIR:-/root/whoscored-1017-runtime}/dags:/opt/airflow/dags:ro
+    - ${WHOSCORED_RUNTIME_DIR:-/root/whoscored-1017-runtime}/logs:/opt/airflow/logs
+    - ${WHOSCORED_RUNTIME_DIR:-/root/whoscored-1017-runtime}/spool:/opt/airflow/spool
+    - ${WHOSCORED_RUNTIME_DIR:-/root/whoscored-1017-runtime}/circuit:/opt/airflow/state/circuit
+    - ${WHOSCORED_PROXY_HOST_FILE:-/root/dpf-whoscored-merge/proxys.txt}:/opt/airflow/proxys.txt:ro
+  networks: [whoscored-net, dp-storage]
+
+services:
+  airflow-metadb:
+    image: postgres:16-alpine
+    container_name: whoscored-airflow-metadb
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, FOWNER, DAC_READ_SEARCH]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes: [ws_airflow_pgdata:/var/lib/postgresql/data]
+    networks: [whoscored-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits: {memory: 512M}
+        reservations: {memory: 128M}
+
+  airflow-init:
+    <<: *ws-airflow-common
+    container_name: whoscored-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        airflow db migrate
+        airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME} \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD} \
+          --firstname Admin --lastname User --role Admin \
+          --email admin@example.com || true
+        airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers (isolated whoscored stack #1017)'
+        echo "whoscored-airflow init complete"
+    environment:
+      <<: *ws-airflow-env
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    restart: "no"
+    depends_on:
+      airflow-metadb: {condition: service_healthy}
+
+  airflow-scheduler:
+    <<: *ws-airflow-common
+    container_name: whoscored-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {memory: 8G}
+        reservations: {memory: 1G}
+
+  # Опциональный UI: … --profile ui up -d ; http://127.0.0.1:8085
+  airflow-webserver:
+    <<: *ws-airflow-common
+    container_name: whoscored-airflow-webserver
+    command: webserver
+    profiles: ["ui"]
+    ports: ["127.0.0.1:8085:8080"]
+    environment:
+      <<: *ws-airflow-env
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources: {limits: {memory: 2G}}
+
+volumes:
+  ws_airflow_pgdata:
+    name: whoscored_airflow_pgdata
+
+networks:
+  whoscored-net: {external: true, name: whoscored-net}
+  dp-storage:    {external: true, name: dp-storage}
