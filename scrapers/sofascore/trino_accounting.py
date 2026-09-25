@@ -5,18 +5,20 @@ round-trips to Trino in one 15:30 run).  The phase report now carries these
 counters as ``traffic.trino_queries`` so a regression is visible per scope.
 Counting happens at the dbapi cursor: every statement a counted connection
 executes (a batch MERGE's staging CREATE/INSERT/count/MERGE/DROP and the
-connect probe included) is one query.  The shared ``TrinoTableManager``
+connect probe included) is one query; ``classify`` names its kind.  The shared ``TrinoTableManager``
 class is left untouched; ``instrument_manager`` wraps one instance.
 """
 
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 
 KINDS = ("select", "merge", "other")
 
 _lock = threading.Lock()
 _counts = dict.fromkeys(KINDS, 0)
+_write = threading.local()
 
 
 def record(kind: str) -> None:
@@ -27,13 +29,31 @@ def record(kind: str) -> None:
 
 
 def classify(sql: str) -> str:
+    """``select`` is a read; statements serving a batch write never are.
+
+    Inside ``write_batch`` the staged MERGE's own verification ``SELECT
+    count(*)`` is part of the write and counts as ``other``, so ``select``
+    measures reads (the thing #1357 bounds) and ``merge`` the batch MERGEs.
+    """
+
     head = str(sql).lstrip().split(None, 1)
     word = head[0].lower() if head else ""
-    if word in ("select", "with"):
-        return "select"
     if word == "merge":
         return "merge"
+    if word in ("select", "with") and not getattr(_write, "depth", 0):
+        return "select"
     return "other"
+
+
+@contextmanager
+def write_batch():
+    """Mark the statements of one batch write on this thread."""
+
+    _write.depth = getattr(_write, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _write.depth -= 1
 
 
 def record_sql(sql: str) -> None:

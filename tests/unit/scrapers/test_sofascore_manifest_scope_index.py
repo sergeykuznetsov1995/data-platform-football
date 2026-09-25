@@ -175,8 +175,9 @@ def test_commits_update_the_index_through_the_batching_wrapper():
     assert all(inner.get(spec.key) is not None for spec in specs)
     assert manager.selects == 1
     # init: CREATE SCHEMA + DDL; preload: 1 SELECT; one flush: the five hidden
-    # statements of the staged batch MERGE (count SELECT + MERGE + 3 other).
-    assert trino_accounting.snapshot() == {"select": 2, "merge": 1, "other": 5}
+    # statements of the staged batch MERGE (its count SELECT belongs to the
+    # write -> other; MERGE -> merge).
+    assert trino_accounting.snapshot() == {"select": 1, "merge": 1, "other": 6}
 
 
 @pytest.mark.unit
@@ -196,8 +197,8 @@ def test_in_memory_stores_need_no_preload():
     assert batching.preload_scope(TOURNAMENT, SEASON) == 0
 
 
-def _runtime(tmp_path, manager):
-    store = BatchingManifestStore(TrinoManifestStore(manager))
+def _runtime(tmp_path, manager, *, sink=None, max_pending=200):
+    store = BatchingManifestStore(TrinoManifestStore(manager), max_pending=max_pending)
     raw = RawPayloadStore(fs.LocalFileSystem(), str(tmp_path / "raw"))
     engine = SofaScoreCaptureEngine(
         raw_store=raw,
@@ -205,7 +206,7 @@ def _runtime(tmp_path, manager):
         transport=NoNetworkTransport(),
         run_id="fixture-run",
         task_id="match-capture",
-        sink=SuccessSink(),
+        sink=sink or SuccessSink(),
         rate_limiter=UnlimitedLimiter(),
         retry_policy=RetryPolicy(max_attempts=1),
         max_workers=2,
@@ -429,3 +430,50 @@ def test_whole_refresh_phase_plan_plus_capture_stays_within_ten_queries(
     # manifest flush adds the five statements of one staged batch MERGE.
     assert counts == {"select": 2, "merge": 0, "other": 4}
     assert sum(counts.values()) <= 10
+
+
+@pytest.mark.unit
+def test_capture_writing_many_batches_keeps_reads_within_ten(tmp_path, monkeypatch):
+    """A real (offline-replay) capture of 30 pending matches: 150 endpoint
+    records through a 20-record batch = several flushes, Bronze MERGE and
+    finalize.  Reads stay bounded; writes scale only with the batch count."""
+
+    from scrapers.sofascore.pipeline import DeferredCaptureSink, ingest_prefetched_records
+    from tests.unit.scrapers.test_sofascore_pipeline import (
+        _event_records_for,
+        _event_spec,
+        _run_match_pass,
+    )
+
+    match_ids = [str(20_000_000 + n) for n in range(30)]
+    manager = FakeTrinoManager()
+    runtime = _runtime(
+        tmp_path, manager, sink=DeferredCaptureSink(), max_pending=20
+    )
+    specs = {
+        (match_id, endpoint): _event_spec(match_id, endpoint)
+        for match_id in match_ids
+        for endpoint in EVENT_PATHS
+    }
+    records = {}
+    for match_id in match_ids:
+        records.update(_event_records_for(match_id))
+    ingest_prefetched_records(runtime, specs=specs, records=records)
+    runtime.manifest_store.flush()
+    # Seeding ran without a preload: that is the old per-endpoint read cost.
+    assert manager.selects >= 150
+    trino_accounting.reset()
+    merges_before, selects_before = manager.merges, manager.selects
+
+    rc, result, saved, _events = _run_match_pass(
+        runtime, match_ids, tmp_path / "matches.json", monkeypatch
+    )
+
+    assert rc == 0, result["errors"]
+    assert "sofascore_match_capture_status" in saved
+    counts = result["traffic"]["trino_queries"]
+    batches = manager.merges - merges_before
+    assert batches >= 5  # 150 terminal records through a 20-record buffer
+    assert counts["select"] <= 10
+    assert counts["merge"] == batches
+    assert manager.selects - selects_before <= 10

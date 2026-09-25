@@ -265,12 +265,13 @@ class TrinoManifestStore(ManifestStore):
 
     def upsert(self, record: EndpointManifest) -> None:
         frame = pd.DataFrame([manifest_to_row(record)], columns=MANIFEST_COLUMNS)
-        self.manager.insert_dataframe_atomic(
-            self.schema,
-            self.table,
-            frame,
-            merge_keys=MANIFEST_KEY_COLUMNS,
-        )
+        with trino_accounting.write_batch():
+            self.manager.insert_dataframe_atomic(
+                self.schema,
+                self.table,
+                frame,
+                merge_keys=MANIFEST_KEY_COLUMNS,
+            )
         self._index_commit((record,))
 
     def upsert_many(self, records: Sequence[EndpointManifest]) -> None:
@@ -289,12 +290,13 @@ class TrinoManifestStore(ManifestStore):
             [manifest_to_row(record) for record in deduped.values()],
             columns=MANIFEST_COLUMNS,
         )
-        self.manager.insert_dataframe_atomic(
-            self.schema,
-            self.table,
-            frame,
-            merge_keys=MANIFEST_KEY_COLUMNS,
-        )
+        with trino_accounting.write_batch():
+            self.manager.insert_dataframe_atomic(
+                self.schema,
+                self.table,
+                frame,
+                merge_keys=MANIFEST_KEY_COLUMNS,
+            )
         self._index_commit(deduped.values())
 
     def list_for_run(self, run_id: str) -> list[EndpointManifest]:
