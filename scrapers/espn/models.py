@@ -35,7 +35,7 @@ class AgeClass(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-MODEL_SCHEMA_VERSION = 1
+MODEL_SCHEMA_VERSION = 2
 
 
 class CapabilityState(str, Enum):

@@ -1538,6 +1538,21 @@ def test_matchday_placeholder_kickoff_is_not_confirmed() -> None:
     assert len(rows) == 10
     assert not any(row.kickoff_confirmed for row in rows)
 
+    # The same ten simultaneous kickoffs once the matches are under way are
+    # factual, not a placeholder; three scheduled ones stay below the rule.
+    for event in events:
+        event["status"]["type"]["name"] = "STATUS_FIRST_HALF"
+    for event in events[:3]:
+        event["status"]["type"]["name"] = "STATUS_SCHEDULED"
+    live = parse_scoreboards(
+        [_raw({**real, "events": events})],
+        competition=competition,
+        edition=edition,
+        query_start=date(2026, 9, 20),
+        query_end=date(2026, 9, 20),
+    )
+    assert all(row.kickoff_confirmed for row in live)
+
 
 @pytest.mark.unit
 def test_real_esp1_day_with_distinct_kickoffs_is_confirmed() -> None:

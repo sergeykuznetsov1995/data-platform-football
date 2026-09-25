@@ -58,9 +58,10 @@
 | `scoreboard_esp1_20260920.json` | c4 12 | 65789 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard?dates=20260920 |
 | `all_scoreboard_event_timevalid_false.json` | c2 03 (вырезка) | 7119 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard?dates=20260924 |
 
-- `seasons_eng.fa_page0_limit3.json` — единственное записанное тело со страницей > 1:
-  `limit=3` → `count=25, pageSize=3, pageCount=9, pageIndex=1`. Остальные страницы в тестах
-  синтетические той же формы.
+- `seasons_eng.fa_page0_limit3.json` — единственное записанное тело списка из нескольких
+  страниц: `limit=3` → `count=25, pageSize=3, pageCount=9, pageIndex=1`. Записана только
+  первая страница; страницы 2–9 в тестах синтетические той же формы (живой записи страницы
+  с `pageIndex > 1` среди проб нет).
 - `types_eng.fa_2026_empty.json` — `count=0, pageIndex=0, pageCount=0`: сезона 2026 у Кубка
   Англии ESPN ещё не открыл; пустой список законен.
 - `events_window_eng1_395d_400.json`, `events_nodtype_404.json`, `scoreboard_range_400.json` —

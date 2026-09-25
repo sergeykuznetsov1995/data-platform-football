@@ -37,9 +37,11 @@ from .parser_contracts import (
 
 logger = logging.getLogger(__name__)
 
-# One kickoff shared by this many open matches of one tournament on one ESPN
-# day is a matchday placeholder, not a confirmed time (V2.md:109, R-09).
+# One kickoff shared by this many not-yet-started matches of one tournament on
+# one ESPN day is a matchday placeholder, not a confirmed time (V2.md:109,
+# R-09).  A match already under way has a factual kickoff and never counts.
 PLACEHOLDER_MIN_EVENTS = 4
+_NOT_STARTED = frozenset({"STATUS_SCHEDULED", "STATUS_PRE_GAME"})
 # Open statuses that ESPN leaves open for good once the match is moved.
 STALE_OPEN_STATUSES = frozenset({"STATUS_POSTPONED", "STATUS_SUSPENDED"})
 _ALL_UID_RE = re.compile(r"^s:600~l:(\d+)~e:(\d+)$")
@@ -370,16 +372,16 @@ def _event_row(
 
 
 def _mark_placeholder_kickoffs(rows: Iterable[ScheduleRow]) -> list[ScheduleRow]:
-    """Unconfirm a kickoff shared by a whole round of one tournament's open matches."""
+    """Unconfirm a kickoff shared by a whole round of not-yet-started matches."""
 
     rows = list(rows)
     groups: dict[tuple[str, date, datetime], int] = defaultdict(int)
     for row in rows:
-        if not row.terminal:
+        if row.status in _NOT_STARTED:
             groups[(row.scope_id, espn_day(row.kickoff), row.kickoff)] += 1
     return [
         replace(row, kickoff_confirmed=False)
-        if not row.terminal
+        if row.status in _NOT_STARTED
         and groups[(row.scope_id, espn_day(row.kickoff), row.kickoff)]
         >= PLACEHOLDER_MIN_EVENTS
         else row
