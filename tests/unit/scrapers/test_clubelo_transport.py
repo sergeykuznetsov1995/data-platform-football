@@ -47,7 +47,8 @@ def test_white_list_accepts(path):
 
 
 @pytest.mark.parametrize(
-    "path", ["/Arsenal/Results", "/2026-09-22/Ranking", "/", "", "Ranking", "/a?b=1", "/Fixtures/", "/.."]
+    "path", ["/Arsenal/Results", "/2026-09-22/Ranking", "/", "", "Ranking", "/a?b=1", "/Fixtures/", "/..",
+             "/.", "/...", "/Arsenal%2FResults", "/%2e%2e", "/a\\b", "/a#b"]
 )
 def test_white_list_rejects_before_any_request(path):
     session = FakeSession({})

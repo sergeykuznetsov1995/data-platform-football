@@ -40,8 +40,9 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://clubelo.com"
 FIXED_PATHS = frozenset({"/Ranking", "/Results", "/login/"})
-# One path segment: no further "/", no query or fragment.
-_SLUG_PATH = re.compile(r"^/[^/?#\s]+$")
+# One path segment: no "/", "\\", query, fragment or percent-escape (an
+# escaped "%2F" or "%2e%2e" would smuggle a second segment or a dot-segment).
+_SLUG_PATH = re.compile(r"^/[^/\\?#%\s]+$")
 BLOCK_STATUSES = frozenset({403, 429})
 
 
@@ -71,7 +72,7 @@ def check_path(path: str) -> str:
 
     if path in FIXED_PATHS:
         return path
-    if _SLUG_PATH.match(path) and path not in {"/.", "/.."}:
+    if _SLUG_PATH.match(path) and path.strip("/."):
         return path
     raise ValueError(f"path is not on the ClubElo white list: {path!r}")
 
