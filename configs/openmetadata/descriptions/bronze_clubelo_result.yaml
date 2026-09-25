@@ -1,0 +1,85 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_result
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_result
+  description: |
+    Результаты матчей со страницы /Results ClubElo (#1463): окно ~3 дня, частичное.
+    Пишет scrapers/clubelo/daily.py (dag_ingest_clubelo) MERGE-ем по ключу
+    (match_date, home_key, away_key): новый забор обновляет счёт и is_final, строки
+    прошлых заборов не стираются. Строки без счёта хранятся. Партиция
+    identity(match_date). h1-дата /Results может быть новее h1-даты /Ranking того
+    же прогона (решение владельца 25.09); старше — ничего не пишется. Модель 'web-2026'.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_date
+    description: Дата матча из строки-разделителя; строки до первого разделителя — дата рейтинга страницы. Партиция.
+  - name: home_key
+    description: Ключ хозяев — slug или '~CC:Имя', если ссылки нет.
+  - name: away_key
+    description: Ключ гостей — slug или '~CC:Имя'.
+  - name: row_seq
+    description: Порядок строки на странице последнего забора (с 0).
+  - name: home_slug
+    description: Slug хозяев; NULL без ссылки.
+  - name: home_tlc
+    description: Трёхбуквенный код хозяев.
+  - name: home_name
+    description: Имя хозяев (обе части длинного имени склеены).
+  - name: home_country
+    description: Код страны хозяев (alt флага).
+  - name: home_rank
+    description: Место хозяев в рейтинге; NULL, если нет.
+  - name: away_slug
+    description: Slug гостей; NULL без ссылки.
+  - name: away_tlc
+    description: Трёхбуквенный код гостей.
+  - name: away_name
+    description: Имя гостей.
+  - name: away_country
+    description: Код страны гостей.
+  - name: away_rank
+    description: Место гостей в рейтинге; NULL, если нет.
+  - name: prior_delta
+    description: Prior Δ — разница рейтингов до матча.
+  - name: prior_delta_sigma
+    description: Погрешность Prior Δ (число после ±).
+  - name: prior_delta_raw
+    description: Ячейка Prior Δ как есть («-100.0 ±80»; «NEW» у клуба без прежнего рейтинга — тогда prior_delta NULL).
+  - name: hfa
+    description: Преимущество своего поля (HFA).
+  - name: elo_pct
+    description: Ожидаемый результат хозяев, % (точное значение span.min1081).
+  - name: ft
+    description: Счёт основного времени; NULL, если матч ещё без счёта.
+  - name: et
+    description: Счёт дополнительного времени.
+  - name: pen
+    description: Счёт серии пенальти.
+  - name: game_delta
+    description: Game Δ; NULL, пока сайт не пересчитал матч.
+  - name: game_delta_sigma
+    description: Погрешность Game Δ.
+  - name: post_game_delta
+    description: Post-Game Δ.
+  - name: post_game_delta_sigma
+    description: Погрешность Post-Game Δ.
+  - name: is_final
+    description: true, когда Game Δ заполнен (матч учтён в рейтинге).
+  - name: rating_date
+    description: h1-дата страницы /Results последнего забора.
+  - name: page_created_at
+    description: Время сборки /Results сайтом («Page created on …»), UTC без пояса.
+  - name: fetched_at
+    description: Момент получения /Results (UTC).
+  - name: model_version
+    description: Версия модели Elo; всегда 'web-2026'.
+  - name: _source
+    description: Источник данных ('clubelo_html'); метаколонка Bronze.
+  - name: _ingested_at
+    description: Момент записи строки в Bronze (UTC); метаколонка.
+  - name: _batch_id
+    description: Идентификатор дневного прогона; метаколонка.

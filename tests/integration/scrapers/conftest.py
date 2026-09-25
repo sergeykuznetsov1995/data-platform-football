@@ -224,21 +224,6 @@ def matchhistory_scraper(soccerdata_available, minimal_leagues, minimal_seasons)
     scraper.close()
 
 
-@pytest.fixture
-def clubelo_scraper(soccerdata_available, minimal_leagues):
-    """ClubElo scraper - no Tor required (may have server issues)."""
-    if not soccerdata_available:
-        pytest.skip("soccerdata library not installed")
-
-    from scrapers.clubelo import ClubEloScraper
-
-    scraper = ClubEloScraper(
-        leagues=minimal_leagues,
-    )
-    yield scraper
-    scraper.close()
-
-
 # =============================================================================
 # Scraper Fixtures (with Tor)
 # =============================================================================

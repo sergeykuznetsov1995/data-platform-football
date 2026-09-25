@@ -1,0 +1,59 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_rank_snapshot
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_rank_snapshot
+  description: |
+    Дневной снимок рейтинга ClubElo со страницы /Ranking (#1463): все клубы eloData
+    (~1741) плюс провизорные клубы таблиц стран («1255p», «-29p»; в eloData их нет).
+    Пишет scrapers/clubelo/daily.py (dag_ingest_clubelo, 09:30 и 21:30 UTC).
+    Партиция identity(rating_date) — дата рейтинга из h1 самой страницы, не дата
+    прогона; партиция заменяется целиком одной транзакцией Iceberg, никогда APPEND
+    (#314). Перед заменой — fail-closed-контракт страницы и guard полноты (≥ 95 % от
+    1741 и от прошлой rating_date; ≥ 90 % от уже записанной той же даты).
+    Grain — одна строка на клуб (club_key) и rating_date. Модель 'web-2026'.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: rating_date
+    description: Дата рейтинга сайта из <h1><a href="/<date>/Ranking">; партиция.
+  - name: page_created_at
+    description: Время сборки страницы сайтом («Page created on …»), UTC без пояса.
+  - name: fetched_at
+    description: Момент получения /Ranking (UTC).
+  - name: club_key
+    description: Ключ клуба — slug как есть (регистр сохранён, 'Vikingur' ≠ 'vikingur') или '~CC:Имя' для клуба без ссылки.
+  - name: slug
+    description: Slug страницы клуба из eloData; NULL у провизорных клубов.
+  - name: name
+    description: Имя клуба (в eloData полное; у провизорных — из таблицы страны, до 16 символов).
+  - name: country
+    description: Код страны из alt флага (GER, ENG…); NULL, если флага нет.
+  - name: level
+    description: Уровень лиги из заголовка «Level N (k teams)» таблицы страны; NULL для «Lower» и несопоставленных.
+  - name: level_group
+    description: Заголовок группы таблицы страны как есть («Level 1 (18 teams) ⌀1751», «Lower»).
+  - name: level_section
+    description: Раздел таблиц стран (страна), где найден клуб.
+  - name: rank
+    description: Место в мировом рейтинге; NULL у клубов без места.
+  - name: elo
+    description: Elo, целое (как на странице); у провизорных — число без суффикса p.
+  - name: elo_precise
+    description: Точный Elo из vegaJson /Ranking (топ-100, сопоставлен по стране и имени); иначе NULL.
+  - name: golo
+    description: Golo из eloData; NULL у провизорных.
+  - name: elo_delta_1d_raw
+    description: Изменение за день сырым текстом eloData (на 2026-09-22 у всех '-0.00'); NULL у провизорных.
+  - name: is_provisional
+    description: true — клуб с предварительным рейтингом («1255p»), есть только в таблице страны.
+  - name: model_version
+    description: Версия модели Elo; всегда 'web-2026' (R-17).
+  - name: _source
+    description: Источник данных ('clubelo_html'); метаколонка Bronze.
+  - name: _ingested_at
+    description: Момент записи строки в Bronze (UTC), не дата данных; метаколонка.
+  - name: _batch_id
+    description: Идентификатор дневного прогона ('clubelo-daily-<UTC>-<hex>'); метаколонка.

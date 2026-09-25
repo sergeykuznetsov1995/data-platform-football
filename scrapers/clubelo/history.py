@@ -64,6 +64,8 @@ NO_PAGE_LOCATIONS = frozenset({"/"})
 # page must not pass for a complete queue and close the history (Sol r1 #5).
 MIN_QUEUE = 400
 MAX_REPORTED_FAILURES = 50
+# The daily run adds at most this many new club pages per rating date (#1463).
+MAX_NEW_SLUGS = 10
 
 _META = [
     ("model_version", pa.string()),
@@ -171,6 +173,13 @@ class IcebergHistoryStore:
     def ensure_tables(self) -> None:
         for table in WRITE_ORDER:
             self.writer.create_table_if_not_exists(self.database, table, SCHEMAS[table])
+
+    def known_slugs(self) -> Set[str]:
+        """Every slug that has any manifest row (done, no_page or failed)."""
+
+        frame = self.writer.read_table(self.database, MANIFEST_TABLE, columns=["slug"])
+        # An empty table comes back as a DataFrame without columns (Sol r1 #2).
+        return set(frame["slug"]) if len(frame) else set()
 
     def closed_slugs(self) -> Set[str]:
         frame = self.writer.read_table(
@@ -425,6 +434,40 @@ def run_history(
         result["requests"] = transport.requests
         result["elapsed_s"] = round(clock() - started, 1)
     return result
+
+
+def collect_new_slugs(
+    run: "_Run",
+    linked_slugs: Iterable[str],
+    *,
+    limit: int = MAX_NEW_SLUGS,
+) -> Dict[str, Any]:
+    """Daily branch (#1463): history pages of clubs that newly got a link.
+
+    New = slugs linked from today's /Ranking (already fetched and parsed by
+    the caller, no second request) minus every slug of the manifest; the first
+    ``limit`` go through ``_Run.club`` and are flushed like a history batch.
+    Until the first full history run (#1465) the manifest is empty, so this
+    is simply the first ``limit`` clubs of the queue — each is then closed and
+    skipped by that full run.
+    """
+
+    known = run.store.known_slugs()
+    new = [slug for slug in linked_slugs if slug not in known]
+    picked = new[:limit]
+    try:
+        for slug in picked:
+            run.club(slug)
+    finally:
+        run.flush()
+    return {
+        "history_new_candidates": len(new),
+        "history_new_fetched": len(picked),
+        "history_new_ok": run.result["pages_ok"],
+        "history_new_no_page": run.result["no_page"],
+        "history_new_failed": run.result["pages_failed"],
+        "history_new_failed_slugs": run.result["failed_slugs"],
+    }
 
 
 def exit_code(result: Dict[str, Any]) -> int:

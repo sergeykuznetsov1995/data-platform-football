@@ -77,7 +77,7 @@ class FakeSession:
 
 
 class MemoryStore:
-    """In-memory stand-in for ``IcebergHistoryStore`` (same three methods)."""
+    """In-memory stand-in for ``IcebergHistoryStore`` (same four methods)."""
 
     def __init__(self, manifest: List[Dict] = None) -> None:
         self.tables: Dict[str, List[Dict]] = {}
@@ -88,6 +88,9 @@ class MemoryStore:
 
     def ensure_tables(self) -> None:
         self.ensured = True
+
+    def known_slugs(self):
+        return {row["slug"] for row in self.tables.get("clubelo_history_manifest", [])}
 
     def closed_slugs(self):
         from scrapers.clubelo.history import closed_from_manifest
