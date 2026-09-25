@@ -2132,6 +2132,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if os.environ.get("WHOSCORED_SCHEMA_READY") != "1":
                 repository.ensure_schema()
                 os.environ["WHOSCORED_SCHEMA_READY"] = "1"
+            try:
+                dropped = repository.drop_stale_stage_tables(max_age_hours=6)
+                if dropped:
+                    logger.info(
+                        "Dropped %d stale WhoScored stage tables: %s",
+                        len(dropped),
+                        ", ".join(dropped),
+                    )
+            except Exception as exc:
+                # Housekeeping must never fail an ingest run.
+                logger.warning("WhoScored stage table cleanup failed: %s", exc)
             if args.command == "backfill" and (args.full_history or args.all_catalog):
                 discovery_report = _new_report("discover", ())
                 backfill_discovery_result = _run_discover(

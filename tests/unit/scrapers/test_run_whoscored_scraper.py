@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import date
 from types import SimpleNamespace
@@ -769,6 +770,53 @@ def test_replay_uses_direct_service_and_emits_stable_v2_report(monkeypatch, tmp_
     assert report["tables_by_entity"]["lineups"].endswith(".whoscored_lineups")
     assert "iceberg.bronze.whoscored_match_ingest_manifest" in report["tables"]
     assert report["traffic"]["paid_proxy_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_network_run_drops_stale_stage_tables_after_schema(monkeypatch, tmp_path):
+    calls = []
+
+    def ensure_schema(self):
+        calls.append("ensure_schema")
+
+    def drop_stale_stage_tables(self, *, max_age_hours):
+        calls.append(("drop_stale_stage_tables", max_age_hours))
+        return ["whoscored_events__stg_old"]
+
+    monkeypatch.setattr(_Repository, "ensure_schema", ensure_schema)
+    monkeypatch.setattr(
+        _Repository, "drop_stale_stage_tables", drop_stale_stage_tables, raising=False
+    )
+
+    rc, _report, _service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["replay", "--scope", "ENG-Premier League=2526", "--game-id", "123"],
+    )
+
+    assert rc == 0
+    assert calls == ["ensure_schema", ("drop_stale_stage_tables", 6)]
+
+
+@pytest.mark.unit
+def test_stage_table_cleanup_failure_only_warns(monkeypatch, tmp_path, caplog):
+    def drop_stale_stage_tables(self, *, max_age_hours):
+        raise RuntimeError("trino unavailable")
+
+    monkeypatch.setattr(
+        _Repository, "drop_stale_stage_tables", drop_stale_stage_tables, raising=False
+    )
+
+    with caplog.at_level(logging.WARNING, logger=runner.logger.name):
+        rc, report, _service_cls, _ = _run(
+            monkeypatch,
+            tmp_path,
+            ["replay", "--scope", "ENG-Premier League=2526", "--game-id", "123"],
+        )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert "stage table cleanup failed: trino unavailable" in caplog.text
 
 
 @pytest.mark.unit

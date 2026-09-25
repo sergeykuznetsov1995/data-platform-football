@@ -352,6 +352,7 @@ class _Repository:
     def __init__(self):
         self.commits = []
         self.failures = []
+        self.failure_writes = []
         self.profile_candidates = []
         self.profile_candidate_scope_requests = []
         self.profile_commits = []
@@ -390,10 +391,18 @@ class _Repository:
             raise ValueError("preview structure is incomplete")
 
     def record_failure(self, failure):
-        self.failures.append(failure)
+        row, batch_id = self.build_failure_row(failure)
+        self.write_failure_rows([row])
+        return batch_id
+
+    def write_failure_rows(self, rows):
+        self.failure_writes.append(list(rows))
+        self.failures.extend(rows)
+
+    def build_failure_row(self, failure):
         if failure.state != "not_available":
-            return None
-        return deterministic_match_not_available_batch_id(
+            return failure, None
+        return failure, deterministic_match_not_available_batch_id(
             failure.game_id,
             league=failure.league,
             season=failure.season,
@@ -2997,13 +3006,13 @@ def test_match_not_available_rejects_a_foreign_valid_outcome_id(tmp_path):
         };</script>
         """
     )
-    original = repository.record_failure
+    original = repository.build_failure_row
 
     def foreign(failure):
-        original(failure)
-        return "wsna2-v3-" + "f" * 64
+        row, _batch_id = original(failure)
+        return row, "wsna2-v3-" + "f" * 64
 
-    repository.record_failure = foreign
+    repository.build_failure_row = foreign
 
     result = service.sync_matches()
 
@@ -3157,6 +3166,86 @@ def test_match_terminal_failure_keeps_attempt_and_has_no_retry_deadline(tmp_path
     assert failure.retry_after is None
 
 
+class _PartlyFailingTransport:
+    """Serve the match page for game 123; fail every other game."""
+
+    def __init__(self, delegate):
+        self.delegate = delegate
+
+    def __getattr__(self, name):
+        return getattr(self.delegate, name)
+
+    @property
+    def raw_cache(self):
+        return self.delegate.raw_cache
+
+    @raw_cache.setter
+    def raw_cache(self, value):
+        self.delegate.raw_cache = value
+
+    def fetch(self, url, **kwargs):
+        if "/Matches/123/" in url:
+            return self.delegate.fetch(url, **kwargs)
+        raise WhoScoredTransportError(
+            "origin rejected request",
+            kind=FailureKind.HTTP_STATUS,
+            url=url,
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=403,
+            retryable=False,
+        )
+
+
+def _candidates(repository, game_ids):
+    template = repository.list_match_candidates()[0]
+    return [replace(template, game_id=game_id) for game_id in game_ids]
+
+
+def test_match_failures_are_written_in_one_append_after_commit(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    candidates = _candidates(repository, (201, 202, 203))
+    repository.list_match_candidates = lambda *_args, **_kwargs: candidates
+    service.transport = _PartlyFailingTransport(service.transport)
+
+    result = service.sync_matches()
+
+    assert len(repository.failure_writes) == 1
+    assert [failure.game_id for failure in repository.failure_writes[0]] == [
+        201,
+        202,
+        203,
+    ]
+    assert result.terminal == ["201", "202", "203"]
+
+
+def test_match_failures_are_written_even_when_match_commit_fails(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    candidates = _candidates(repository, (123, 201, 202))
+    repository.list_match_candidates = lambda *_args, **_kwargs: candidates
+    service.transport = _PartlyFailingTransport(service.transport)
+    order = []
+
+    def failing_commit(commits):
+        order.append(("commit", [commit.game_id for commit in commits]))
+        raise RuntimeError("iceberg unavailable")
+
+    original_write = repository.write_failure_rows
+
+    def write_failure_rows(rows):
+        order.append(("failures", [row.game_id for row in rows]))
+        original_write(rows)
+
+    repository.commit_matches = failing_commit
+    repository.write_failure_rows = write_failure_rows
+
+    result = service.sync_matches()
+
+    assert order == [("commit", [123]), ("failures", [201, 202])], result.errors
+    assert result.terminal == ["201", "202"]
+    assert result.committed_batches["match"] == []
+    assert any("iceberg unavailable" in error for error in result.errors)
+
+
 def test_match_failure_manifest_error_is_visible_without_aborting_result(tmp_path):
     service, repository, _ = _service(tmp_path)
     service.transport = _FailingTransport(
@@ -3169,10 +3258,10 @@ def test_match_failure_manifest_error_is_visible_without_aborting_result(tmp_pat
         )
     )
 
-    def fail_manifest(_failure):
+    def fail_manifest(_rows):
         raise RuntimeError("manifest sink unavailable")
 
-    repository.record_failure = fail_manifest
+    repository.write_failure_rows = fail_manifest
 
     result = service.sync_matches()
 

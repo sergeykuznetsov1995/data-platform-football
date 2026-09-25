@@ -2774,6 +2774,11 @@ class WhoScoredIngestService:
         }
         self._bound_paid_fallback(len(candidates))
         pending: list[tuple[MatchCommit, Any]] = []
+        # Failure manifests are appended once, after the match batch commit
+        # (in ``finally``: they persist even when commit_matches fails).  The
+        # result bookkeeping of each failure is applied only once it landed.
+        failure_rows: list[dict[str, Any]] = []
+        failure_outcomes: list[tuple[str, str]] = []
         for candidate in candidates:
             target = match_page_target(candidate.game_id)
             response: Optional[TransportResponse] = None
@@ -2904,7 +2909,7 @@ class WhoScoredIngestService:
                         tzinfo=None
                     ) + timedelta(hours=delay_hours)
                 try:
-                    failure_batch_id = self.repository.record_failure(
+                    failure_row, failure_batch_id = self.repository.build_failure_row(
                         ManifestFailure(
                             game_id=candidate.game_id,
                             league=self.scope.competition_id,
@@ -2932,6 +2937,7 @@ class WhoScoredIngestService:
                             raw_uri=getattr(exc, "raw_uri", None),
                         )
                     )
+                    failure_rows.append(failure_row)
                 except Exception as manifest_exc:
                     result.errors.append(
                         f"game {candidate.game_id} failure manifest: "
@@ -2970,25 +2976,16 @@ class WhoScoredIngestService:
                                 "exact not-available outcome identity"
                             )
                         else:
-                            result.committed_batches["match_not_available"].append(
-                                failure_batch_id
-                            )
-                            result.succeeded += 1
-                            result.counts["not_available"] = (
-                                result.counts.get("not_available", 0) + 1
+                            failure_outcomes.append(
+                                ("not_available", failure_batch_id)
                             )
                     elif state == "parse_failed":
                         result.errors.append(f"game {candidate.game_id}: {exc}")
                     else:
-                        target_list = (
-                            result.retryable
-                            if state == "retryable"
-                            else result.terminal
-                        )
-                        target_list.append(str(candidate.game_id))
+                        failure_outcomes.append((state, str(candidate.game_id)))
             except WhoScoredParseError as exc:
                 try:
-                    self.repository.record_failure(
+                    failure_row, _failure_batch_id = self.repository.build_failure_row(
                         ManifestFailure(
                             game_id=candidate.game_id,
                             league=self.scope.competition_id,
@@ -3031,6 +3028,7 @@ class WhoScoredIngestService:
                             ),
                         )
                     )
+                    failure_rows.append(failure_row)
                 except Exception as manifest_exc:
                     result.errors.append(
                         f"game {candidate.game_id} failure manifest: "
@@ -3041,30 +3039,33 @@ class WhoScoredIngestService:
                 result.errors.append(
                     f"game {candidate.game_id}: {type(exc).__name__}: {exc}"
                 )
-        if pending:
-            try:
-                expected_batch_ids = tuple(
-                    commit.batch_id for commit, _parsed in pending
-                )
-                committed_batch_ids = tuple(
-                    self.repository.commit_matches(
-                        [commit for commit, _parsed in pending]
+        try:
+            if pending:
+                try:
+                    expected_batch_ids = tuple(
+                        commit.batch_id for commit, _parsed in pending
                     )
-                )
-                if committed_batch_ids != expected_batch_ids:
-                    raise RuntimeError(
-                        "match repository returned different committed batch ids"
-                    )
-            except Exception as exc:
-                result.errors.append(f"match batch: {type(exc).__name__}: {exc}")
-            else:
-                result.committed_batches["match"].extend(committed_batch_ids)
-                result.succeeded += len(pending)
-                for _commit, parsed in pending:
-                    for name, dataset in parsed.datasets.items():
-                        result.counts[name] = (
-                            result.counts.get(name, 0) + dataset.row_count
+                    committed_batch_ids = tuple(
+                        self.repository.commit_matches(
+                            [commit for commit, _parsed in pending]
                         )
+                    )
+                    if committed_batch_ids != expected_batch_ids:
+                        raise RuntimeError(
+                            "match repository returned different committed batch ids"
+                        )
+                except Exception as exc:
+                    result.errors.append(f"match batch: {type(exc).__name__}: {exc}")
+                else:
+                    result.committed_batches["match"].extend(committed_batch_ids)
+                    result.succeeded += len(pending)
+                    for _commit, parsed in pending:
+                        for name, dataset in parsed.datasets.items():
+                            result.counts[name] = (
+                                result.counts.get(name, 0) + dataset.row_count
+                            )
+        finally:
+            self._write_match_failures(failure_rows, failure_outcomes, result)
         if candidates or result.succeeded:
             result.tables.extend(
                 [
@@ -3079,6 +3080,34 @@ class WhoScoredIngestService:
                 ]
             )
         return result
+
+    def _write_match_failures(
+        self,
+        rows: list[dict[str, Any]],
+        outcomes: list[tuple[str, str]],
+        result: EntityResult,
+    ) -> None:
+        if not rows:
+            return
+        try:
+            self.repository.write_failure_rows(rows)
+        except Exception as exc:
+            result.errors.append(
+                f"match failure manifests ({len(rows)} rows): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        for state, value in outcomes:
+            if state == "not_available":
+                result.committed_batches["match_not_available"].append(value)
+                result.succeeded += 1
+                result.counts["not_available"] = (
+                    result.counts.get("not_available", 0) + 1
+                )
+            elif state == "retryable":
+                result.retryable.append(value)
+            else:
+                result.terminal.append(value)
 
     def sync_previews(
         self,

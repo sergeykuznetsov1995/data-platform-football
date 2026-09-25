@@ -1,0 +1,92 @@
+{
+  "1946345": {
+    "events": {
+      "rows": 1516,
+      "sha256": "5a400fa48226a427680a0d77ac951240b2ee0751f78c7b60f18391d7c427dc91"
+    },
+    "formations": {
+      "rows": 9,
+      "sha256": "563df9664568bef02c0a72609dfea2999c721c51e2aef28cd17f4a92738d79d2"
+    },
+    "lineups": {
+      "rows": 44,
+      "sha256": "83e010e3ae725e845e7898fe8a324645f01beb9645e05a9f52954e26370d4793"
+    },
+    "matches": {
+      "rows": 1,
+      "sha256": "5f901ee584424a77839ddca4d31000ca29ac6eb282ecc006a8983a56d07d29b9"
+    },
+    "player_match_stats": {
+      "rows": 5005,
+      "sha256": "b88cd8294f33bab85b9e14395702e83286b6d25ef88f7bd69b00c350cd600d2e"
+    },
+    "substitutions": {
+      "rows": 16,
+      "sha256": "de6f335cb0a1d9eea48baa0e0f29ee0d13c21f67c91643d5faf418358a2d8ffa"
+    },
+    "team_match_stats": {
+      "rows": 1647,
+      "sha256": "4292ebc3dc546596ba22f081010fff8928b4fab55a4aa44c02bce8c199c3918b"
+    }
+  },
+  "1952492": {
+    "events": {
+      "rows": 2043,
+      "sha256": "aa8de21b560d594b2e1ea5015432bbbfb6abd2537d440f87eb0b73ea88792a6b"
+    },
+    "formations": {
+      "rows": 10,
+      "sha256": "197a342ef0b7e37c963e61681f25b4b902b4283dfe65db5a8f328deee946d658"
+    },
+    "lineups": {
+      "rows": 46,
+      "sha256": "6d00fad9f6911bb9ebd2e861e7a55a6d2256dc9e6643e870bc5fef315824d676"
+    },
+    "matches": {
+      "rows": 1,
+      "sha256": "35db537203dad67ccb3971c6c89abc2632545b262b42599bbcd8be5080fc9779"
+    },
+    "player_match_stats": {
+      "rows": 6288,
+      "sha256": "afb1750ba869655244b9089f420c87d561ede469530dc6af05ba3306f2c6a50a"
+    },
+    "substitutions": {
+      "rows": 18,
+      "sha256": "0a672abbbd770b851f99bb4650efeff6651128d6667ab755d128eb9932a1ce6a"
+    },
+    "team_match_stats": {
+      "rows": 2456,
+      "sha256": "e225ded15d0d56588c7ef5dd09920f8e7f1088d39cbb596c57fee34cb0566106"
+    }
+  },
+  "1955749": {
+    "events": {
+      "rows": 1403,
+      "sha256": "43c0628f3dcc98e20f18027ad35a0143e0622a2e354c472ef74b5cc790de9750"
+    },
+    "formations": {
+      "rows": 8,
+      "sha256": "6f9bde9da01b2e3d5d4218392e0f6c991f1786eafe79ca0f30b042f91030fde8"
+    },
+    "lineups": {
+      "rows": 45,
+      "sha256": "17c970f3cb05e51d8cc727e57a8de1a85efaa61370f0208a1627dc92ba892edf"
+    },
+    "matches": {
+      "rows": 1,
+      "sha256": "5ef64ddece226902e48adb843db1fde8cc18e21be1fbb6845369eaa4dbc12e68"
+    },
+    "player_match_stats": {
+      "rows": 4681,
+      "sha256": "512a84a84be23af7e060f4591aa6799193bf09ecf6a109e70d36edd39137c14f"
+    },
+    "substitutions": {
+      "rows": 16,
+      "sha256": "4a4c419c9104a16c3f11ea9137791d70c6f06fb3030f665f8460a7a65864c4d1"
+    },
+    "team_match_stats": {
+      "rows": 1855,
+      "sha256": "6e6bb69cb44235d8054138f3d2221e3ce751e8977d6c8dc89dd5e02411226d78"
+    }
+  }
+}
