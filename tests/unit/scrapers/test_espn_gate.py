@@ -390,3 +390,30 @@ def test_all_blocked_pause_runs_from_the_last_closure_in_any_order(tmp_path):
     clock.advance(1)
     probe = gate.acquire("site")
     assert (probe.origin, probe.probe) == (WEB, True)
+
+
+@pytest.mark.unit
+def test_all_blocked_pause_starts_even_when_the_first_block_already_expired(
+    tmp_path,
+):
+    clock = Clock()
+    gate = _gate(tmp_path, clock)
+    gate.choose_origin("site")
+    clock.advance(86400)
+    gate.report(gate.acquire("site"), status=200)  # reserve probe: open
+    primary = gate.acquire("site")
+    assert not gate.report(primary, status=403).all_blocked  # T = 0
+    clock.advance(1799)
+    reserve = gate.acquire("site")
+    assert reserve.origin == SITE
+    clock.advance(2)  # the reserve's 403 lands after the primary's block expired
+    assert gate.report(reserve, status=403).all_blocked
+    history = _gate(tmp_path, clock, lane="history")
+    with pytest.raises(LaneClosed):
+        history.acquire("site")
+    clock.advance(1799)
+    with pytest.raises(AllOriginsBlocked):
+        gate.acquire("site")
+    clock.advance(1)
+    probe = gate.acquire("site")
+    assert (probe.origin, probe.probe) == (WEB, True)

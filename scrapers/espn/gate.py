@@ -517,9 +517,10 @@ class TransportGate:
 
         all_blocked = False
         if origin_closed:
-            try:
-                self._pick_origin(state, permit.cluster, now, claim=False)
-            except AllOriginsBlocked:
+            # Every origin of the cluster closed, even if a probe is already
+            # due: the cluster is blocked and the pause starts now.
+            origins = [o for o in self._cluster(permit.cluster) if o is not None]
+            if all(state["origins"][o]["closed"] for o in origins):
                 all_blocked = True
                 if not state["all_blocked"].get(permit.cluster):
                     state["all_blocked"][permit.cluster] = now
