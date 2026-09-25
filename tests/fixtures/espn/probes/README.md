@@ -29,4 +29,54 @@
 снято 24.09.2026 16:19 UTC. Используется `test_espn_transport.py` (#1500): 403 → запрос
 отложен, адрес закрыт. Записанного 429 нет — в тестах он синтетический.
 
-Тела со страницей > 1 (`pageCount > 1`) среди проб нет — появится в #1501.
+
+## Списки core, сезоны, статусы дня (#1501)
+
+Сняты 24.09.2026 напрямую с VM, без прокси (пробы `c2/`, `c3/`, `c4/`, `v2/`, `recon/` ревью
+24.09). Используются `test_espn_urls.py`, `test_espn_core_lists.py`, `test_espn_editions.py`,
+`test_espn_parsers.py`. Адреса в колонке URL — ровно те, что сверяет `test_espn_urls.py`
+(кроме `scoreboard_esp1_20260920.json` — проба снята без `limit`, и
+`events_window_eng1_395d_400.json` — без `lang/region`).
+
+| Файл | Проба | Байт | URL |
+|---|---|---|---|
+| `league_detail_uefa.champions.json` | c2 12 | 9006 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions?lang=en&region=us |
+| `seasons_uefa.champions.json` | c2 01 | 3029 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons?limit=100&lang=en&region=us |
+| `seasons_eng.fa_page0_limit3.json` | c2 08 | 381 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.fa/seasons?limit=3&lang=en&region=us |
+| `season_uefa.champions_2010.json` | c3 p02 | 6345 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010?lang=en&region=us |
+| `types_uefa.champions_2026.json` | c2 06 | 795 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2026/types?lang=en&region=us |
+| `types_eng.fa_2026_empty.json` | c2 09 | 64 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.fa/seasons/2026/types?lang=en&region=us |
+| `type_events_uefa.champions_2026_t1.json` | c2 07 | 17059 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2026/types/1/events?limit=1000&lang=en&region=us |
+| `type_events_fifa.world_2010_t1.json` | c3 p07 | 5394 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/fifa.world/seasons/2010/types/1/events?limit=1000&lang=en&region=us |
+| `events_window_eng1_30d.json` | c2 13 | 3336 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/events?dates=20260901-20260930&limit=1000&lang=en&region=us |
+| `events_window_eng1_395d_400.json` | v2 p07 | 74 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/events?dates=20250601-20260701&limit=1000 |
+| `events_nodtype_404.json` | c3 p04 | 52 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/events?limit=1000&lang=en&region=us |
+| `event_status_first_half.json` | c2 14 | 348 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.nations/events/401861047/competitions/401861047/status?lang=en&region=us |
+| `scoreboard_range_400.json` | recon 10 | 55 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates=20260801-20260831&limit=1000 |
+| `all_scoreboard_20260923.json` | c2 05 | 580017 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard?dates=20260923&limit=1000 |
+| `scoreboard_eng1_20050813_postponed.json` | recon 23 | 88715 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates=20050813&limit=1000 |
+| `scoreboard_esp1_20260920.json` | c4 12 | 65789 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard?dates=20260920 |
+| `all_scoreboard_event_timevalid_false.json` | c2 03 (вырезка) | 7119 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard?dates=20260924 |
+
+- `seasons_eng.fa_page0_limit3.json` — единственное записанное тело списка из нескольких
+  страниц: `limit=3` → `count=25, pageSize=3, pageCount=9, pageIndex=1`. Записана только
+  первая страница; страницы 2–9 в тестах синтетические той же формы (живой записи страницы
+  с `pageIndex > 1` среди проб нет).
+- `types_eng.fa_2026_empty.json` — `count=0, pageIndex=0, pageCount=0`: сезона 2026 у Кубка
+  Англии ESPN ещё не открыл; пустой список законен.
+- `events_window_eng1_395d_400.json`, `events_nodtype_404.json`, `scoreboard_range_400.json` —
+  тела ошибок ESPN (400 «The dates range specified is too large», 404 сезона без type,
+  400 web.api на `scoreboard?dates=A-B`).
+- `scoreboard_esp1_20260920.json` — распакованный gzip пробы `c4/probes/12_sb_esp1_day.body`.
+- `all_scoreboard_event_timevalid_false.json` — из `c2/probes/03_all_scoreboard_today_web.json`
+  (604 КБ, 100 событий) вырезано единственное событие с `competitions[0].timeValid=false`
+  (id 732409): `{"leagues": <leagues тела>, "events": [<событие 732409>]}`, JSON без
+  пробелов, `ensure_ascii=False`.
+- Календарная лига для перехода сезона — записанная деталь `league_detail_fifa.world.u20.json`
+  (сезон 2025: 2025-01-01T05:00Z…2026-01-01T04:59Z, то есть ET-год 2025); «осень–весна» —
+  `league_detail_sui.1.json` (2025-26), в тесте у неё меняется только `season` на 2026.
+
+`../schedule_esp1_20260920_placeholder.csv` — 10 строк esp.1 из замороженного расписания
+(Trino, выгрузка ревью `v2/sched_0919_0921.csv`): все матчи тура на «2026-09-20 18:00» —
+заглушка тура; реальные времена того дня — в `scoreboard_esp1_20260920.json` (5 матчей, 4 разных
+времени).

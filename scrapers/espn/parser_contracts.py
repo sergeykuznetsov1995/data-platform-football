@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-PARSER_VERSION = "espn-native-parser-v3"
+PARSER_VERSION = "espn-native-parser-v4"
 STATUS_MAP_VERSION = "espn-status-v2"
 LINEUP_STAT_MAP_VERSION = "espn-lineup-stat-map-v1"
 MATCHSHEET_STAT_MAP_VERSION = "espn-matchsheet-stat-map-v1"
@@ -15,6 +15,13 @@ MATCHSHEET_STAT_MAP_VERSION = "espn-matchsheet-stat-map-v1"
 class EntityParseState(str, Enum):
     CAPTURED = "captured"
     VALID_EMPTY = "valid_empty"
+
+
+class ScheduleParseState(str, Enum):
+    PARSED = "parsed"
+    # Unknown ESPN status name: the match waits for review, the tournament
+    # still publishes (#1501, R-11).
+    QUARANTINED = "quarantined"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +59,12 @@ class ScheduleRow:
     away_goals: str | None
     parser_version: str
     extra_json: str
+    # False when ESPN marks the time invalid or the kickoff is a matchday
+    # placeholder (one time for the whole round).
+    kickoff_confirmed: bool = True
+    # "<slug>:<year>" of the edition that owns the same native event_id.
+    duplicate_of: str | None = None
+    parse_state: ScheduleParseState = ScheduleParseState.PARSED
 
 
 @dataclass(frozen=True, slots=True)

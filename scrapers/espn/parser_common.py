@@ -5,6 +5,11 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 import json
 from typing import Any, Mapping, Sequence
+from zoneinfo import ZoneInfo
+
+# ESPN files a match under the US Eastern calendar day: all/scoreboard for
+# 20260923 carries kickoffs from 23.09 04:00Z to 24.09 02:00Z (#1501, R-08).
+ESPN_DAY_TZ = ZoneInfo("America/New_York")
 
 
 class EspnParseError(ValueError):
@@ -120,6 +125,14 @@ def utc_datetime(value: Any, field: str) -> datetime:
 def unknown_fields(value: Mapping[str, Any], known: Sequence[str]) -> dict[str, Any]:
     known_set = set(known)
     return {str(key): item for key, item in value.items() if key not in known_set}
+
+
+def espn_day(kickoff_utc: datetime) -> date:
+    """The ESPN (US Eastern) calendar day of a timezone-aware kickoff."""
+
+    if kickoff_utc.tzinfo is None or kickoff_utc.utcoffset() is None:
+        raise ValueError("kickoff must be timezone-aware")
+    return kickoff_utc.astimezone(ESPN_DAY_TZ).date()
 
 
 def source_day_bounds(start: date, end: date) -> tuple[date, date]:

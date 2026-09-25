@@ -35,19 +35,7 @@ class AgeClass(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-ADMITTED_AGE_CLASSES = frozenset(
-    {
-        AgeClass.SENIOR,
-        AgeClass.U17,
-        AgeClass.U19,
-        AgeClass.U20,
-        AgeClass.U21,
-        AgeClass.U23,
-        AgeClass.COLLEGE,
-    }
-)
-
-MODEL_SCHEMA_VERSION = 1
+MODEL_SCHEMA_VERSION = 2
 
 
 class CapabilityState(str, Enum):
@@ -164,6 +152,28 @@ class EntityCapabilities(CanonicalModel):
 
 
 @dataclass(frozen=True, slots=True)
+class SeasonType(CanonicalModel):
+    """One ESPN season stage (``seasons/{year}/types/{id}``).
+
+    A bare ``$ref`` list carries only the id; name and dates come with the
+    embedded form (league detail, ``seasons/{year}``).
+    """
+
+    id: int
+    name: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+    def __post_init__(self) -> None:
+        _positive_int(self.id, "season type id")
+        if self.name is not None:
+            _required_string(self.name, "season type name")
+        for value in (self.start_date, self.end_date):
+            if value is not None and type(value) is not date:
+                raise TypeError("season type dates must be date values")
+
+
+@dataclass(frozen=True, slots=True)
 class Edition(CanonicalModel):
     source_season_year: int
     display_name: str
@@ -171,6 +181,7 @@ class Edition(CanonicalModel):
     end_date: date
     current: bool
     capabilities: EntityCapabilities
+    types: tuple[SeasonType, ...] = ()
 
     def __post_init__(self) -> None:
         _positive_int(self.source_season_year, "source_season_year", minimum=1800)
@@ -183,6 +194,13 @@ class Edition(CanonicalModel):
             raise TypeError("edition capabilities must be EntityCapabilities")
         if self.start_date > self.end_date:
             raise ValueError("edition date window starts after it ends")
+        if not isinstance(self.types, (list, tuple)) or not all(
+            isinstance(item, SeasonType) for item in self.types
+        ):
+            raise TypeError("edition types must contain SeasonType values")
+        object.__setattr__(self, "types", tuple(self.types))
+        if len({item.id for item in self.types}) != len(self.types):
+            raise ValueError("edition types repeat a type id")
 
     @property
     def scope_suffix(self) -> str:
@@ -259,16 +277,16 @@ class Competition(CanonicalModel):
         _positive_int(year, "source_season_year", minimum=1800)
         return f"{self.espn_id}:{year}"
 
-    @property
-    def current_edition(self) -> Edition:
+    def open_editions(self) -> tuple[Edition, ...]:
+        """Every open edition: a new season opens before the old one closes (#1501)."""
+
         current = tuple(edition for edition in self.editions if edition.current)
-        if len(current) != 1:
-            raise ValueError("competition must have exactly one current edition")
-        return current[0]
+        if not current:
+            raise ValueError("competition must have at least one open edition")
+        return current
 
 
 __all__ = [
-    "ADMITTED_AGE_CLASSES",
     "AgeClass",
     "CanonicalModel",
     "CapabilityState",
@@ -278,4 +296,5 @@ __all__ = [
     "Gender",
     "LegacyAliases",
     "MODEL_SCHEMA_VERSION",
+    "SeasonType",
 ]

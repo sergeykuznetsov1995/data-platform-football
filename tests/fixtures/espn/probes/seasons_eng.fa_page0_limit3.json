@@ -1,0 +1,1 @@
+{"count":25,"pageIndex":1,"pageSize":3,"pageCount":9,"items":[{"$ref":"http://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.fa/seasons/2025?lang=en&region=us"},{"$ref":"http://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.fa/seasons/2024?lang=en&region=us"},{"$ref":"http://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.fa/seasons/2023?lang=en&region=us"}]}

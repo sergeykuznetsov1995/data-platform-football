@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -18,15 +18,20 @@ from scrapers.espn.models import (
     Gender,
     LegacyAliases,
 )
+from scrapers.espn.denominator import DEFAULT_DENOMINATOR_PATH, load_denominator
 from scrapers.espn.parsers import (
     EntityParseState,
     EspnParseError,
+    espn_day,
+    parse_all_scoreboard_day,
     parse_competition_detail_bytes,
     parse_scoreboard_calendar,
     parse_scoreboards,
     parse_soccer_dropdown_bytes,
     parse_summary,
+    stale_open_events,
 )
+from scrapers.espn.parser_contracts import ScheduleParseState
 from scrapers.espn.parser_common import source_day_bounds
 
 
@@ -209,11 +214,28 @@ def test_postponed_native_event_can_transition_to_rescheduled_final() -> None:
 
 
 @pytest.mark.unit
-def test_unknown_status_and_required_schema_drift_fail_closed() -> None:
+def test_unknown_status_quarantines_the_match_and_schema_drift_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #1501 (R-11): an unknown status name holds back one match, not the
+    # whole tournament; required-schema drift still fails closed.
     payload = _load("native_scoreboard.json")
+    known = deepcopy(payload["events"][0])
+    known["id"] = "401000002"
     payload["events"][0]["status"]["type"]["name"] = "STATUS_NEW_FROM_UPSTREAM"
-    with pytest.raises(EspnParseError, match="unknown ESPN status"):
-        _schedule(payload)
+    payload["events"].append(known)
+    with caplog.at_level("WARNING", logger="scrapers.espn.schedule_parser"):
+        _, _, rows = _schedule(payload)
+
+    by_id = {row.event_id: row for row in rows}
+    quarantined = by_id[401000001]
+    assert quarantined.status == "STATUS_NEW_FROM_UPSTREAM"
+    assert quarantined.parse_state is ScheduleParseState.QUARANTINED
+    assert not quarantined.terminal and not quarantined.played_final
+    assert not quarantined.summary_required
+    assert by_id[401000002].parse_state is ScheduleParseState.PARSED
+    assert by_id[401000002].played_final
+    assert "STATUS_NEW_FROM_UPSTREAM" in caplog.text
 
     payload = _load("native_scoreboard.json")
     payload["events"][0]["competitions"][0]["competitors"] = "drift"
@@ -1460,3 +1482,208 @@ def test_versioned_stat_name_maps_populate_full_legacy_surfaces() -> None:
         for target in matchsheet_names.values()
     )
     assert matchsheet.won_corners == "31"
+
+
+# --------------------------------------------------------------------------
+# #1501: kickoff confirmation, all/scoreboard day, ESPN day, stale open.
+
+PROBES = FIXTURES / "probes"
+
+
+def _probe_bytes(name: str) -> bytes:
+    return (PROBES / name).read_bytes()
+
+
+def _esp1_scope():
+    return _scope(
+        espn_id=740,
+        slug="esp.1",
+        year=2026,
+        start=date(2026, 6, 1),
+        end=date(2027, 5, 31),
+    )
+
+
+@pytest.mark.unit
+def test_matchday_placeholder_kickoff_is_not_confirmed() -> None:
+    # Frozen schedule of 20.09.2026 (Trino, V2 review): all 10 esp.1 matches
+    # of the round sit on "2026-09-20 18:00". Rebuilt as a scoreboard from the
+    # real esp.1 day body with the placeholder time and a scheduled status.
+    real = json.loads(_probe_bytes("scoreboard_esp1_20260920.json"))
+    template = real["events"][0]
+    events = []
+    with (FIXTURES / "schedule_esp1_20260920_placeholder.csv").open() as handle:
+        for line in handle:
+            event_id, slug, kickoff = (part.strip('"') for part in line.strip().split(","))
+            assert slug == "esp.1"
+            event = deepcopy(template)
+            event["id"] = event_id
+            event["date"] = kickoff[:16].replace(" ", "T") + "Z"
+            event["status"]["type"]["name"] = "STATUS_SCHEDULED"
+            for side in event["competitions"][0]["competitors"]:
+                side["score"] = None
+            events.append(event)
+    assert len(events) == 10
+    placeholder = {**real, "events": events}
+    competition, edition = _esp1_scope()
+
+    rows = parse_scoreboards(
+        [_raw(placeholder)],
+        competition=competition,
+        edition=edition,
+        query_start=date(2026, 9, 20),
+        query_end=date(2026, 9, 20),
+    )
+
+    assert len(rows) == 10
+    assert not any(row.kickoff_confirmed for row in rows)
+
+    # The same ten simultaneous kickoffs once the matches are under way are
+    # factual, not a placeholder; three scheduled ones stay below the rule.
+    for event in events:
+        event["status"]["type"]["name"] = "STATUS_FIRST_HALF"
+    for event in events[:3]:
+        event["status"]["type"]["name"] = "STATUS_SCHEDULED"
+    live = parse_scoreboards(
+        [_raw({**real, "events": events})],
+        competition=competition,
+        edition=edition,
+        query_start=date(2026, 9, 20),
+        query_end=date(2026, 9, 20),
+    )
+    assert all(row.kickoff_confirmed for row in live)
+
+
+@pytest.mark.unit
+def test_real_esp1_day_with_distinct_kickoffs_is_confirmed() -> None:
+    competition, edition = _esp1_scope()
+
+    rows = parse_scoreboards(
+        [_probe_bytes("scoreboard_esp1_20260920.json")],
+        competition=competition,
+        edition=edition,
+        query_start=date(2026, 9, 20),
+        query_end=date(2026, 9, 20),
+    )
+
+    assert len(rows) == 5
+    assert len({row.kickoff for row in rows}) == 4
+    assert all(row.kickoff_confirmed for row in rows)
+
+
+@pytest.mark.unit
+def test_time_valid_false_event_is_not_confirmed() -> None:
+    # Event 732409 cut from all/scoreboard?dates=20260924 (the only
+    # timeValid=false of 100 events that day).
+    competition, edition = _scope(
+        espn_id=20114, slug="x.20114", year=2025,
+        start=date(2025, 1, 1), end=date(2026, 12, 31),
+    )
+
+    rows = parse_all_scoreboard_day(
+        _probe_bytes("all_scoreboard_event_timevalid_false.json"),
+        {20114: competition},
+        date(2026, 9, 24),
+    )
+
+    (row,) = rows["x.20114"]
+    assert row.event_id == 732409
+    assert row.kickoff_confirmed is False
+
+
+def _target_competitions() -> dict[int, Competition]:
+    denominator = load_denominator(DEFAULT_DENOMINATOR_PATH)
+    targets: dict[int, Competition] = {}
+    for row in denominator.rows.values():
+        if not (row.in_target and row.live and row.espn_id):
+            continue
+        editions = tuple(
+            Edition(
+                year,
+                f"{year} {row.slug}",
+                date(year, 1, 1),
+                date(year + 1, 12, 31),
+                True,
+                EntityCapabilities(
+                    CapabilityState.UNKNOWN,
+                    CapabilityState.UNKNOWN,
+                    CapabilityState.UNKNOWN,
+                ),
+            )
+            for year in (2025, 2026)
+        )
+        targets[row.espn_id] = Competition(
+            row.espn_id, row.slug, row.name, Gender.MALE, AgeClass.SENIOR, True, editions
+        )
+    return targets
+
+
+@pytest.mark.unit
+def test_all_scoreboard_day_binds_events_to_targets_through_uid() -> None:
+    # all/scoreboard?dates=20260923&limit=1000: 78 events, leagues[0] without
+    # an id; 23 belong to 12 target tournaments, 55 to women's, NCAA and
+    # friendly leagues outside the target set.
+    raw = _probe_bytes("all_scoreboard_20260923.json")
+    document = json.loads(raw)
+    assert len(document["events"]) == 78
+    assert "id" not in document["leagues"][0]
+    targets = _target_competitions()
+    assert len(targets) == 161
+
+    by_slug = parse_all_scoreboard_day(raw, targets, date(2026, 9, 23))
+
+    assert set(by_slug) == {competition.slug for competition in targets.values()}
+    counts = {slug: len(rows) for slug, rows in by_slug.items() if rows}
+    assert counts == {
+        "ned.cup": 6, "concacaf.nations.league": 3, "chi.copa_chi": 3,
+        "slv.1": 2, "global.gulf_cup": 2, "usa.1": 1, "usa.usl.1": 1,
+        "eng.fa_qual": 1, "sco.challenge": 1, "col.1": 1, "per.1": 1, "gua.1": 1,
+    }
+    rows = [row for group in by_slug.values() for row in group]
+    for row in rows:
+        assert row.competition_slug in counts
+        assert f"~l:{row.competition_id}~e:{row.event_id}" in json.dumps(document)
+    assert {row.status for row in rows} <= {"STATUS_FULL_TIME", "STATUS_FINAL_PEN"}
+    # Every kickoff falls on ESPN day 23.09 (US Eastern), not on UTC 23.09.
+    assert {espn_day(row.kickoff) for row in rows} == {date(2026, 9, 23)}
+
+
+@pytest.mark.unit
+def test_all_scoreboard_uid_without_league_fails_closed() -> None:
+    document = json.loads(_probe_bytes("all_scoreboard_event_timevalid_false.json"))
+    document["events"][0]["uid"] = "s:600~e:732409"
+    with pytest.raises(EspnParseError, match="has no league"):
+        parse_all_scoreboard_day(_raw(document), {}, date(2026, 9, 24))
+
+
+@pytest.mark.unit
+def test_espn_day_is_the_us_eastern_calendar_day() -> None:
+    assert espn_day(datetime(2026, 9, 21, 2, 30, tzinfo=timezone.utc)) == date(2026, 9, 20)
+    assert espn_day(datetime(2026, 9, 23, 4, 0, tzinfo=timezone.utc)) == date(2026, 9, 23)
+    assert espn_day(datetime(2026, 1, 10, 4, 30, tzinfo=timezone.utc)) == date(2026, 1, 9)
+
+
+@pytest.mark.unit
+def test_postponed_matches_become_stale_after_three_days() -> None:
+    # eng.1 13.08.2005: events 184196 and 184203 stayed STATUS_POSTPONED.
+    competition, edition = _scope(
+        espn_id=700, slug="eng.1", year=2005,
+        start=date(2005, 8, 1), end=date(2006, 5, 31),
+    )
+    rows = parse_scoreboards(
+        [_probe_bytes("scoreboard_eng1_20050813_postponed.json")],
+        competition=competition,
+        edition=edition,
+        query_start=date(2005, 8, 13),
+        query_end=date(2005, 8, 13),
+    )
+    kickoff = datetime(2005, 8, 13, 14, 0, tzinfo=timezone.utc)
+    postponed = [row for row in rows if row.status == "STATUS_POSTPONED"]
+    assert [row.event_id for row in postponed] == [184196, 184203]
+    assert all(row.kickoff_confirmed for row in rows)
+
+    assert stale_open_events(rows, kickoff + timedelta(days=2)) == ()
+    assert stale_open_events(rows, kickoff + timedelta(days=3, seconds=1)) == (
+        184196,
+        184203,
+    )
