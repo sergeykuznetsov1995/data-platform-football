@@ -17,7 +17,7 @@ columns:
   - name: slug
     description: Slug клуба.
   - name: status
-    description: "done — страница снята и разобрана; no_page — ответ 3xx (страницы нет); failed — сеть/5xx после ретраев, иной HTTP-статус или LayoutChanged."
+    description: "done — страница снята и разобрана; no_page — ответ ровно 302 с Location '/' (страницы нет); failed — сеть/5xx/битый gzip после ретраев, любой другой редирект или HTTP-статус, LayoutChanged."
   - name: http_status
     description: HTTP-статус последней попытки; NULL при сетевой ошибке.
   - name: error

@@ -279,6 +279,7 @@ def test_store_frames_survive_the_real_arrow_conversion(extra):
     FakeResponse(307, b"", {"location": "/"}),
     FakeResponse(301, b"", {"location": "/Arsenal/"}),
     FakeResponse(302, b"", {"location": "/login/"}),
+    FakeResponse(302, b"", {"location": "https://clubelo.com/"}),
 ])
 def test_unexpected_redirect_is_failed_not_closed(response):
     result, store, _, _ = _run(_answers(**{"/Arsenal": response}), CLUBS)

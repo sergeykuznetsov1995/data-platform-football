@@ -59,7 +59,7 @@ CLOSED_STATUSES = frozenset({"done", "no_page"})
 DEFAULT_BATCH_SIZE = 200
 # A club without a page answers exactly "302 → /" (fixture lsapi-2483). Any
 # other redirect is unexpected: failed, never a closing no_page (Sol r1 #2).
-NO_PAGE_LOCATIONS = frozenset({"/", "https://clubelo.com/"})
+NO_PAGE_LOCATIONS = frozenset({"/"})
 # /Ranking links 498 club pages (24–25.09.2026). A truncated but well-formed
 # page must not pass for a complete queue and close the history (Sol r1 #5).
 MIN_QUEUE = 400
