@@ -1,8 +1,11 @@
 """Tournament-season batch writer of the ESPN bronze tables (#1503).
 
 One batch = one ``competition_slug``/``season_year`` = four Iceberg commits,
-in the order match -> lineup -> team_stats -> events (R-43: batches per
-tournament, not per scope phase).  Each table is replaced for exactly the
+in the order lineup -> team_stats -> events -> match (R-43: batches per
+tournament, not per scope phase).  The match row goes last: its states
+(``lineup_state`` etc.) claim the children, so it is committed only once they
+are — a batch cut after a child commit leaves the old match row and the next
+wave writes the match again (#1504).  Each table is replaced for exactly the
 matches of the batch: ``insert_dataframe_atomic`` with a ``delete_filter`` on
 the partition and the batch event ids and ``single_statement_replace=True``
 (one MERGE with tombstones, no committed empty window; the FBref typed bronze
@@ -21,7 +24,17 @@ import pandas as pd
 import pyarrow as pa
 
 from .bronze_rows import BatchStamp, MatchPayload, batch_rows
-from .bronze_schema import BRONZE_DATABASE, TABLES
+from .bronze_schema import (
+    BRONZE_DATABASE,
+    EVENTS_TABLE,
+    LINEUP_TABLE,
+    MATCH_TABLE,
+    TABLES,
+    TEAM_STATS_TABLE,
+)
+
+# Children first, the match row (the completion marker) last.
+WRITE_ORDER = (LINEUP_TABLE, TEAM_STATS_TABLE, EVENTS_TABLE, MATCH_TABLE)
 
 
 class BronzeBatchError(RuntimeError):
@@ -95,7 +108,8 @@ def write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | N
         pa.Table.from_pylist(rows[table], schema=schema)
         frames[table] = pd.DataFrame(rows[table], columns=schema.names)
     written: dict[str, int] = {}
-    for table, schema in TABLES.items():
+    for table in WRITE_ORDER:
+        schema = TABLES[table]
         frame = frames[table]
         inserted = trino.insert_dataframe_atomic(
             BRONZE_DATABASE,

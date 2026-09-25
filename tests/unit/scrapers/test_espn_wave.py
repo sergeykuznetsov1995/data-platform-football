@@ -110,13 +110,18 @@ def _py(value):
 class WaveTrino(FakeTrino):
     """In-memory bronze that also answers the wave's reads."""
 
-    def __init__(self, fail_slug: str | None = None) -> None:
+    def __init__(self, fail_slug: str | None = None, fail_table: str | None = None) -> None:
         super().__init__()
         self.fail_slug = fail_slug
+        self.fail_table = fail_table
         self.queries: list[str] = []
 
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
-        if self.fail_slug and f"competition_slug = '{self.fail_slug}'" in kwargs["delete_filter"]:
+        if (
+            self.fail_slug
+            and f"competition_slug = '{self.fail_slug}'" in kwargs["delete_filter"]
+            and self.fail_table in (None, table)
+        ):
             raise RuntimeError(f"commit of {table} refused")
         return super().insert_dataframe_atomic(schema, table, df, **kwargs)
 
@@ -321,7 +326,7 @@ def test_one_failing_tournament_does_not_stop_its_neighbours(tmp_path) -> None:
     ]
     by_slug = {item["slug"]: item for item in outcomes}
     assert by_slug["ger.2"]["state"] == wave.RED
-    assert by_slug["ger.2"]["first_error"] == "RuntimeError: commit of espn_match refused"
+    assert by_slug["ger.2"]["first_error"] == "RuntimeError: commit of espn_match_lineup refused"
     assert by_slug["eng.1"]["state"] == by_slug["uefa.champions"]["state"] == wave.GREEN
     matches = _matches(trino)
     assert {row["competition_slug"] for row in matches.values()} == {"eng.1", "uefa.champions"}
@@ -331,7 +336,9 @@ def test_one_failing_tournament_does_not_stop_its_neighbours(tmp_path) -> None:
     assert len([r for r in trino.tables["espn_match_lineup"] if r["event_id"] == 578281]) == 40
     assert by_slug["eng.1"]["matches"] == 4  # final + three scheduled
     summary = wave.summarize_wave(outcomes, [])
-    assert summary.table[1] == "ger.2:2016 -> red -> RuntimeError: commit of espn_match refused"
+    assert summary.table[1] == (
+        "ger.2:2016 -> red -> RuntimeError: commit of espn_match_lineup refused"
+    )
     assert summary.red and summary.reason == "1 of 3 tournaments red (> 20%)"
 
 
@@ -548,3 +555,121 @@ def test_stale_postponed_match_is_checked_in_the_midnight_wave(tmp_path) -> None
     assert plan.works[0].statuses == {900002: "STATUS_CANCELED"}
     row = _matches(trino)[900002]
     assert (row["status"], row["terminal"], row["disposition"]) == ("STATUS_CANCELED", True, "moved")
+
+
+@pytest.mark.unit
+def test_batch_cut_after_a_child_commit_is_written_again_next_wave(tmp_path) -> None:
+    # The match row is committed last: a batch that fails on its events
+    # leaves no captured match row, so the next wave takes the final again.
+    _state_path(tmp_path)
+    client = FakeClient(_responses(*_first_day()))
+    trino = WaveTrino("ger.2", fail_table="espn_match_events")
+    first = _run(_plan(client, trino, tmp_path), client, trino)
+
+    assert {o["slug"]: o["state"] for o in first}["ger.2"] == wave.RED
+    assert 456996 not in _matches(trino)
+    assert any(r["event_id"] == 456996 for r in trino.tables["espn_match_lineup"])
+
+    trino.fail_slug = None
+    again = _plan(client, trino, tmp_path)
+    assert [(w.slug, w.event_ids) for w in again.works] == [("ger.2", (456996,))]
+    _run(again, client, trino)
+    assert _matches(trino)[456996]["lineup_state"] == "captured"
+
+
+@pytest.mark.unit
+def test_one_broken_event_of_a_day_reds_only_its_tournament(tmp_path) -> None:
+    _state_path(tmp_path)
+    yesterday = json.loads(_first_day()[0])
+    broken = next(e for e in yesterday["events"] if int(e["id"]) == 456996)
+    broken["competitions"] = [{"competitors": []}]  # the day parser rejects it
+    client = FakeClient(_responses(json.dumps(yesterday).encode(), _first_day()[1]))
+    trino = WaveTrino()
+
+    plan = _plan(client, trino, tmp_path)
+    outcomes = {o["slug"]: o for o in _run(plan, client, trino)}
+
+    assert outcomes["ger.2"]["state"] == wave.RED
+    assert outcomes["ger.2"]["first_error"].startswith(
+        "WavePlanError: 2026-09-24: EspnParseError: event[456996] must have exactly two"
+    )
+    assert outcomes["eng.1"]["state"] == outcomes["uefa.champions"]["state"] == wave.GREEN
+    assert {r["competition_slug"] for r in _matches(trino).values()} == {"eng.1", "uefa.champions"}
+
+
+@pytest.mark.unit
+def test_league_without_any_edition_is_red_until_core_answers(tmp_path) -> None:
+    path = tmp_path / "editions.json"
+    detail = {
+        _req_key(urls.league_detail(slug)): HttpStatusError(503, "busy") for slug in SLUGS
+    }
+    client = FakeClient(_responses(*_first_day(), **detail))
+    trino = WaveTrino()
+
+    plan = _plan(client, trino, tmp_path)
+    summary = wave.summarize_wave(_run(plan, client, trino), [])
+
+    assert [(w.slug, w.error) for w in plan.works] == [
+        (slug, "no open edition: HttpStatusError: busy") for slug in SLUGS
+    ]
+    assert summary.red and summary.red_tournaments == 3
+    assert editions_store.load(path).failed.keys() == set(SLUGS)
+    # A fresh snapshot still reads the failed leagues again.
+    calls = len(client.network("/leagues/"))
+    _plan(client, trino, tmp_path)
+    assert len(client.network("/leagues/")) == calls + 3
+
+
+@pytest.mark.unit
+def test_cut_day_with_a_failed_league_top_up_reds_that_league(tmp_path) -> None:
+    _state_path(tmp_path)
+    filler = [{"id": str(10_000 + i), "uid": f"s:600~l:99999~e:{10_000 + i}"} for i in range(1000)]
+    cut = json.dumps({"leagues": [{}], "events": filler}).encode()
+    extra = {
+        _req_key(urls.league_scoreboard_day("eng.1", YESTERDAY)): HttpStatusError(500, "down"),
+    }
+    for slug, espn_id in (("ger.2", "3927"), ("uefa.champions", "775")):
+        extra[_req_key(urls.league_scoreboard_day(slug, YESTERDAY))] = json.dumps(
+            {"leagues": [{"id": espn_id, "slug": slug}], "events": []}
+        ).encode()
+    client = FakeClient(_responses(cut, _day(), **extra))
+
+    plan = _plan(client, WaveTrino(), tmp_path)
+
+    assert [(w.slug, w.error) for w in plan.works] == [
+        ("eng.1", "2026-09-24: HttpStatusError: down")
+    ]
+
+
+@pytest.mark.unit
+def test_stale_match_that_core_reports_played_is_written_with_its_summary(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    later = NOW + timedelta(days=5)
+    for row in trino.tables["espn_match"]:
+        if row["event_id"] == 900002:
+            row["status"] = "STATUS_POSTPONED"
+    client.responses[_req_key(urls.event_status("eng.1", 900002))] = json.dumps(
+        {"type": {"name": "STATUS_FULL_TIME"}}
+    ).encode()
+    # The recorded eng.1 Summary (Arsenal 2-0 Brighton) stands for the match.
+    body = json.loads((PROBES / SUMMARIES["eng.1"]).read_bytes())
+    body["header"]["id"] = "900002"
+    client.responses[_summary_key("eng.1", 900002)] = json.dumps(body).encode()
+    client.responses.update({
+        _req_key(urls.all_scoreboard_day(later.date() - timedelta(days=1))): _day(),
+        _req_key(urls.all_scoreboard_day(later.date())): _day(),
+    })
+    for slug in SLUGS:
+        client.responses[_req_key(urls.league_detail(slug))] = HttpStatusError(503, "busy")
+
+    plan = _plan(client, trino, tmp_path, now=later, check_stale=True)
+    (outcome,) = [o for o in _run(plan, client, trino) if o["slug"] == "eng.1"]
+
+    (work,) = [w for w in plan.works if w.slug == "eng.1"]
+    assert work.statuses == {900002: "STATUS_FULL_TIME"} and work.presence == {}
+    assert outcome["state"] == wave.GREEN
+    row = _matches(trino)[900002]
+    assert (row["status"], row["played_final"], row["home_score"], row["away_score"]) == (
+        "STATUS_FULL_TIME", True, 2, 0
+    )
+    assert row["lineup_state"] == "captured"

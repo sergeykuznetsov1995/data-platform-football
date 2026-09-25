@@ -22,6 +22,7 @@ import pytest
 from scrapers.espn.bronze_rows import MatchPayload, RawRef
 from scrapers.espn.bronze_schema import NATURAL_KEYS, TABLES
 from scrapers.espn.bronze_writer import (
+    WRITE_ORDER,
     TournamentBatch,
     delete_filter,
     write_tournament_batch,
@@ -141,11 +142,12 @@ def test_four_commits_in_order_scoped_to_the_batch_events() -> None:
         _batch(_match(7, "aa"), _match(5, "aa", summary=False)), trino=trino
     )
 
+    # The match row claims its children, so it is committed last (#1504).
     assert [call["table"] for call in trino.calls] == [
-        "espn_match",
         "espn_match_lineup",
         "espn_team_stats",
         "espn_match_events",
+        "espn_match",
     ]
     for call in trino.calls:
         assert call["schema"] == "bronze"
@@ -226,7 +228,7 @@ def test_real_manager_replaces_with_one_merge_per_table() -> None:
     assert [
         re.search(r"MERGE INTO iceberg\.bronze\.(\w+) t", sql).group(1)
         for sql in merges
-    ] == list(TABLES)
+    ] == list(WRITE_ORDER)
     assert all("WHEN MATCHED THEN DELETE" in sql for sql in merges)
     statements = [call.args[0] for call in executed.call_args_list]
     assert not [sql for sql in statements if sql.startswith("DELETE FROM")]

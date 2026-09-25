@@ -5,7 +5,9 @@ editions.json``, env ``ESPN_EDITIONS_STATE_PATH``).  It is derived entirely
 from ESPN core: when it is missing, unreadable or older than 24 hours the wave
 planner reads ``leagues/{slug}`` of every live target and moves the editions
 through ``plan_editions`` (season transition, #1501).  Losing the file is
-harmless — the next wave recomputes it (~161 requests a day).
+harmless — the next wave recomputes it (~161 requests a day).  A league core
+did not answer is remembered in ``failed`` and read again by every wave until
+it answers; until then a league without any known edition is red in the wave.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
@@ -62,6 +64,8 @@ def default_state_path() -> Path:
 class EditionsSnapshot:
     refreshed_at: datetime
     editions: tuple[EditionState, ...]
+    # slug -> "<Type>: <message>" of the last failed core read.
+    failed: Mapping[str, str] = field(default_factory=dict)
 
     def of(self, slug: str) -> tuple[EditionState, ...]:
         return tuple(state for state in self.editions if state.competition_slug == slug)
@@ -89,6 +93,7 @@ def _encode(snapshot: EditionsSnapshot) -> str:
                 }
                 for state in snapshot.editions
             ],
+            "failed": dict(sorted(snapshot.failed.items())),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -115,6 +120,7 @@ def _decode(text: str) -> EditionsSnapshot:
             )
             for item in document["editions"]
         ),
+        {str(key): str(value) for key, value in document.get("failed", {}).items()},
     )
 
 
@@ -166,6 +172,7 @@ def refresh(
     """
 
     editions: list[EditionState] = []
+    failed: dict[str, str] = {}
     for row in sorted(rows, key=lambda item: item.slug):
         previous = [state for state in known if state.competition_slug == row.slug]
         request = urls.league_detail(row.slug)
@@ -189,9 +196,10 @@ def refresh(
                 exc,
             )
             editions.extend(previous)
+            failed[row.slug] = f"{type(exc).__name__}: {exc}"
             continue
         editions.extend(plan.open_now + plan.close_now + plan.keep)
-    return EditionsSnapshot(now, tuple(editions))
+    return EditionsSnapshot(now, tuple(editions), failed)
 
 
 def load_or_refresh(
@@ -202,14 +210,29 @@ def load_or_refresh(
     schedule_terminal: Callable[[], Mapping[str, Mapping[int, bool]]],
     now: datetime,
 ) -> EditionsSnapshot:
-    """Cached snapshot when younger than 24 h, else a refreshed and saved one."""
+    """Cached snapshot when younger than 24 h, else a refreshed and saved one.
+
+    Leagues that failed last time are read again even in a fresh snapshot.
+    """
 
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
     with _locked(path):
         snapshot = load(path)
         if snapshot is not None and now - snapshot.refreshed_at < MAX_AGE:
-            return snapshot
+            retry = [row for row in rows if row.slug in snapshot.failed]
+            if not retry:
+                return snapshot
+            again = refresh(client, retry, snapshot.editions, schedule_terminal(), now=now)
+            slugs = {row.slug for row in retry}
+            merged = EditionsSnapshot(
+                snapshot.refreshed_at,
+                tuple(s for s in snapshot.editions if s.competition_slug not in slugs)
+                + again.editions,
+                again.failed,
+            )
+            save(path, merged)
+            return merged
         known = snapshot.editions if snapshot is not None else ()
         fresh = refresh(client, rows, known, schedule_terminal(), now=now)
         save(path, fresh)

@@ -59,6 +59,14 @@ def _gate_closed(exc: BaseException) -> bool:
     return isinstance(exc, (AllOriginsBlocked, LaneClosed))
 
 
+def _no_retry(exc: BaseException) -> bool:
+    """Gate closed or planning already failed: a retry would change nothing."""
+
+    from scrapers.espn.wave import WavePlanError
+
+    return _gate_closed(exc) or isinstance(exc, WavePlanError)
+
+
 def _task_name(ti) -> str:
     map_index = getattr(ti, "map_index", -1)
     return f"{ti.task_id}[{map_index}]" if map_index is not None and map_index >= 0 else ti.task_id
@@ -129,8 +137,8 @@ def run_tournament(work: dict[str, Any], **context: Any) -> dict[str, Any]:
         )
     except Exception as exc:
         ti.xcom_push(key=OUTCOME_KEY, value=wave.failed_outcome(item, exc).as_dict())
-        if _gate_closed(exc):
-            raise AirflowFailException(f"ESPN gate closed: {type(exc).__name__}: {exc}") from exc
+        if _no_retry(exc):
+            raise AirflowFailException(f"ESPN {item.slug}: {type(exc).__name__}: {exc}") from exc
         raise
     result = outcome.as_dict()
     ti.xcom_push(key=OUTCOME_KEY, value=result)
