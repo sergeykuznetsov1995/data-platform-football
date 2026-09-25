@@ -8,7 +8,10 @@ One run:
    ``no_page``; a killed or failed run is resumed by the next one.
 3. Pending slugs go in batches of ``batch_size``. Per batch the write order is
    raw pages → vega points → match rows → manifest rows, so a slug is closed
-   only after its data is committed (a crash re-fetches it next time).
+   only after its data is committed (a crash re-fetches it next time; rows
+   written before the crash stay without a ``done`` manifest row, so readers
+   take points/matches fenced by a ``done`` manifest row of the same
+   ``slug`` and ``_batch_id``).
 4. Every page is parsed from the stored gzip bytes (raw-first, R-54) and fails
    closed: a page that does not parse is ``failed``, nothing parsed is written.
 

@@ -227,6 +227,10 @@ rm -f /tmp/clubelo_history_result.json && \
         append_env=True,
         # Overrides LIGHT_ARGS' 5 min (R-57): ~500 pages at 1 req/s.
         execution_timeout=timedelta(minutes=30),
+        # No Airflow retry (LIGHT_ARGS has one): a block (403/429) must stop
+        # the run, and a red partial run must stay red; the next manual run
+        # resumes from the manifest (Sol r1 #3).
+        retries=0,
     )
 
     # Daily chain: current ratings → validate.

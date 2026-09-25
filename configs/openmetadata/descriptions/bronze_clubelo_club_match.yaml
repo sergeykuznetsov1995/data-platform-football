@@ -9,6 +9,11 @@ table:
     has_result=false) и дубли одного дня (R-41). Разбор позиционный и
     fail-closed; значение и σ хранятся раздельно. Append-only, без партиций.
     Grain — строка (slug, captured_rating_date, row_seq).
+    Читать через манифест: брать строки, для которых в clubelo_history_manifest
+    есть строка status='done' с тем же slug и _batch_id. Таблицы коммитятся по
+    очереди (raw → точки → матчи → манифест); при сбое между ними строки
+    незакрытого клуба остаются, а следующий прогон пишет их заново (дубли без
+    done в манифесте).
   tags:
     - Tier.Bronze
     - Domain.Football

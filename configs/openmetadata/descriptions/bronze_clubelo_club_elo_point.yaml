@@ -9,6 +9,11 @@ table:
     неделю и не содержит матчей без пересчёта — дыру закрывает clubelo_club_match
     (R-32). Модель 'web-2026', с архивом clubelo_team_history не совпадает (R-17).
     Append-only, без партиций. Grain — точка (slug, captured_rating_date, point_seq).
+    Читать через манифест: брать строки, для которых в clubelo_history_manifest
+    есть строка status='done' с тем же slug и _batch_id. Таблицы коммитятся по
+    очереди (raw → точки → матчи → манифест); при сбое между ними строки
+    незакрытого клуба остаются, а следующий прогон пишет их заново (дубли без
+    done в манифесте).
   tags:
     - Tier.Bronze
     - Domain.Football

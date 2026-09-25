@@ -219,6 +219,8 @@ class TestHistoryBranch:
         assert 'rm -f /tmp/clubelo_history_result.json' in cmd
         # LIGHT_ARGS' 5 min would kill the ~15 min branch (R-57)
         assert scrape._init_kwargs['execution_timeout'] == timedelta(minutes=30)
+        # no automatic retry of a blocked / partial run (LIGHT_ARGS has retries)
+        assert scrape._init_kwargs['retries'] == 0
 
     def test_daily_chain_is_gated(self, dag_module):
         gate = _python_task('gate_daily')
