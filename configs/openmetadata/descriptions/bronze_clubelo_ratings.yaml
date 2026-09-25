@@ -4,10 +4,20 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_ratings
   description: |
-    Ежедневный снимок клубных ELO-рейтингов с clubelo.com (метод soccerdata
-    read_by_date через scrapers/clubelo, dag_ingest_clubelo, ежедневно). ELO —
-    «оценка силы» клуба как очки в шахматах (база ≈1500). Grain — один row на клуб
-    за дату снимка. Партиционирование ['rating_date'].
+    АРХИВ, замороженная таблица — не перезаписывать, optimize не запускать (#1460).
+    Источник (api.clubelo.com) закрыт с 09.2026, заново собрать нельзя; версия
+    модели Elo — `api-legacy` (новый сайт clubelo.com пересчитал историю, значения
+    с ним не совпадают). Страховая копия: clubelo_ratings_archive_20260924.
+    Бывший ежедневный снимок клубных ELO-рейтингов (soccerdata read_by_date,
+    dag_ingest_clubelo); 2 924 строки, rating_date 2026-04-27 … 2026-08-31.
+    Grain — один row на клуб за дату снимка. Партиционирование ['rating_date'].
+    Семантика from/to: интервал действия значения Elo; to указывает на день перед
+    следующим матчем по расписанию (в будущем у 2 721 из 2 924 строк), 2026-12-31 —
+    заглушка сайта «до следующего матча / открытый конец»; отрезки режутся и при
+    смене места, Elo в соседних снимках может «дрожать» в 4-м знаке (float32) —
+    сравнивать с округлением до 0.01.
+    Особенности: 1 224 строки level 2 (27.04–28.06) с league = NULL — данные второго
+    дивизиона до правки фильтра; 34 строки level 1 без места (rank NULL).
   tags:
     - Tier.Bronze
     - Domain.Football
@@ -16,7 +26,7 @@ columns:
   - name: team
     description: Название клуба в написании ClubElo (e.g. 'Man City').
   - name: rank
-    description: Место клуба по ELO (1 = сильнейший); double, ~47% NULL (rank проставлен не у всех клубов).
+    description: Место клуба по ELO (1 = сильнейший); double, NULL у 1 096 из 2 924 строк (34 level 1 + 1 062 level 2).
   - name: country
     description: ISO-код страны клуба (e.g. 'ENG','GER').
   - name: level
@@ -24,13 +34,13 @@ columns:
   - name: elo
     description: Рейтинг ELO клуба на дату снимка (double; база ≈1500).
   - name: from
-    description: Начало периода действия этого рейтинга (timestamp).
+    description: Начало интервала действия значения Elo (timestamp).
   - name: to
-    description: Конец периода действия этого рейтинга (timestamp).
+    description: Конец интервала действия значения Elo (timestamp); день перед следующим матчем, 2026-12-31 — заглушка открытого конца.
   - name: league
-    description: Лига клуба; varchar, ~55% NULL (заполнено лишь для 'ENG-Premier League').
+    description: Лига клуба; varchar, NULL у 1 224 строк level 2 (27.04–28.06).
   - name: rating_date
-    description: Дата снимка рейтинга (timestamp); partition key.
+    description: Дата снимка рейтинга (varchar 'YYYY-MM-DD'); partition key.
   - name: _source
     description: Источник данных ('clubelo'); метаколонка Bronze.
   - name: _entity_type

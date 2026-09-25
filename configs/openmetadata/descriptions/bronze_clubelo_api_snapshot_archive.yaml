@@ -1,0 +1,44 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_api_snapshot_archive
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_api_snapshot_archive
+  description: |
+    АРХИВ — не перезаписывать (#1460). 88 снимков CSV старого API api.clubelo.com
+    (закрыт с 09.2026) из кэша soccerdata контейнера airflow-scheduler, даты
+    2025-07-13 … 2026-08-31; 54 010 строк, ≈614 клубов на дату. Загружено одной
+    пачкой 2026-09-24 скриптом scripts/clubelo_freeze_archive.py
+    (_batch_id 'clubelo-archive-20260924'); исходные CSV с SHA256SUMS — на хосте
+    /root/clubelo-archive/soccerdata-cache-20260924/. Версия модели `api-legacy`.
+    Grain — один row на клуб за дату снимка (rating_date = имя файла). Без партиций.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: rank
+    description: Место клуба (CSV Rank); NULL, где API писал 'None' (клубы без места).
+  - name: club
+    description: Название клуба в написании ClubElo (CSV Club).
+  - name: country
+    description: Код страны клуба (CSV Country).
+  - name: level
+    description: Дивизион (CSV Level; 1 = высший).
+  - name: elo
+    description: Рейтинг ELO (CSV Elo; double).
+  - name: valid_from
+    description: Начало интервала действия значения Elo (CSV From).
+  - name: valid_to
+    description: Конец интервала действия (CSV To); 2026-12-31 — заглушка сайта «до следующего матча», хранится как есть.
+  - name: rating_date
+    description: Дата снимка 'YYYY-MM-DD' из имени CSV-файла (varchar, как в архивных таблицах).
+  - name: source_file
+    description: Имя исходного CSV-файла кэша.
+  - name: model_version
+    description: Версия модели Elo; всегда 'api-legacy' (старый API, не совпадает с новым сайтом).
+  - name: _source
+    description: Источник данных ('clubelo_api_cache'); метаколонка Bronze.
+  - name: _ingested_at
+    description: Момент загрузки пачки в Bronze (2026-09-24), не дата данных; метаколонка.
+  - name: _batch_id
+    description: Идентификатор пачки ('clubelo-archive-20260924'); метаколонка.
