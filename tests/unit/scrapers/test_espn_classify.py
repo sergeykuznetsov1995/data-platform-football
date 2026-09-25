@@ -68,6 +68,8 @@ def test_rule_on_the_catalog_reproduces_the_file():
         ("xyz.1", "Some Women Cup", "MALE", "women", "rule:women_name"),
         ("esp.reserves", "Spanish Reserves", "MALE", "reserve", "rule:reserve"),
         ("ger.3", "Bayern II", "MALE", "reserve", "rule:reserve"),
+        ("xyz.b", "Some League", "MALE", "reserve", "rule:reserve"),
+        ("xyz_b", "Some League", "MALE", "reserve", "rule:reserve"),
     ],
 )
 def test_point_cases(slug, name, gender, cls, reason):

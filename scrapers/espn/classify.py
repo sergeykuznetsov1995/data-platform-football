@@ -88,7 +88,7 @@ def classify(slug: str, name: str, gender: str) -> Classification:
         return Classification("friendly", "rule:friendly")
     if slug in INVITATIONAL:
         return Classification("friendly", "manual:" + INVITATIONAL[slug])
-    if _RESERVE_RE.search(slug + " " + name):
+    if _RESERVE_RE.search(slug) or _RESERVE_RE.search(name):
         return Classification("reserve", "rule:reserve")
     return Classification("senior_official", "rule:default")
 
