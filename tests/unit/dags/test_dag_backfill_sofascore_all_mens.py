@@ -83,7 +83,6 @@ def _planner_kwargs(module, monkeypatch):
         captured.update(kwargs)
         return []
 
-    monkeypatch.setattr(module, "_production_dag_active", lambda: False)
     monkeypatch.setattr(
         module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
     )
@@ -190,16 +189,25 @@ def test_invalid_history_lane_knob_fails_dag_parse(monkeypatch, name, value):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    ("production_active", "expected"), [(False, True), (True, False)]
-)
-def test_history_admission_protects_the_daily_window(
-    production_active, expected
-):
-    module = importlib.import_module("dags.dag_backfill_sofascore_all_mens")
-    assert module._history_start_allowed(
-        production_active=production_active,
-    ) is expected
+def test_history_plans_while_the_daily_ingest_runs(monkeypatch):
+    """#1360: history has its own gateway and pool since 03.09, so a queued or
+    running ``dag_ingest_sofascore`` must not empty its plan (it used to, and
+    the lane idled 30 min per turn through the whole daily run)."""
+
+    from tests.unit.utils.test_sofascore_all_mens_state import _snapshot
+
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    shipped_policy = repo_root / "configs" / "sofascore" / "workload_policy.json"
+    module = _load_dag_module()
+    monkeypatch.setattr(module, "WORKLOAD_ARTIFACT", str(shipped_policy))
+    # The daily run is in flight; before #1360 this emptied the plan.
+    monkeypatch.setattr(module, "_production_dag_active", lambda: True, raising=False)
+    monkeypatch.setattr(module.state, "read_snapshot", lambda *a, **k: _snapshot())
+    monkeypatch.setattr(module.state, "read_completed", lambda *a, **k: set())
+    monkeypatch.setattr(module.state, "read_failures", lambda *a, **k: {})
+
+    assert module._plan_historical_batch(run_id="manual__1")
+    assert not hasattr(module, "_history_start_allowed")
     assert not hasattr(module, "HISTORY_BLACKOUT_START_HOUR_UTC")
 
 
@@ -503,7 +511,6 @@ def test_shipped_static_policy_authorizes_the_ready_history_scopes(monkeypatch):
 
     module = _load_dag_module()
     monkeypatch.setattr(module, "WORKLOAD_ARTIFACT", str(shipped_policy))
-    monkeypatch.setattr(module, "_production_dag_active", lambda: False)
     monkeypatch.setattr(module.state, "read_snapshot", lambda *a, **k: snapshot)
     monkeypatch.setattr(module.state, "read_completed", lambda *a, **k: set())
     monkeypatch.setattr(module.state, "read_failures", lambda *a, **k: {})
