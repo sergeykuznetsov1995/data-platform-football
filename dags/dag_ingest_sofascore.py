@@ -30,6 +30,7 @@ All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
 import hashlib
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -295,6 +296,80 @@ CLUB_LEAGUES = [PRIMARY_CLUB_LEAGUE] + [
 ]
 
 
+def _requested_leagues(dag_run: Any) -> List[str]:
+    """The competitions this run covers: ``conf.competition_ids`` or all (#1359).
+
+    The 00:20 daily tail (``dag_trigger_sofascore_daily_tail``) runs only the
+    registry leagues the refresh lane leaves to the daily.  The list is taken
+    only as a subset of the enabled catalog: an unknown id would plan a league
+    no task exists for, so it fails the run instead.  The primary club league
+    is required, because ``validate_data`` anchors every run on its result.
+    """
+
+    conf = getattr(dag_run, "conf", None) or {}
+    if not isinstance(conf, dict) or conf.get("competition_ids") is None:
+        return list(SOFASCORE_LEAGUES)
+    requested = conf["competition_ids"]
+    if (
+        not isinstance(requested, list)
+        or not requested
+        or not all(isinstance(league, str) for league in requested)
+    ):
+        raise AirflowException(
+            "conf.competition_ids must be a non-empty list of competition ids"
+        )
+    unknown = sorted(set(requested) - set(SOFASCORE_LEAGUES))
+    if unknown:
+        raise AirflowException(
+            "conf.competition_ids outside the enabled SofaScore catalog: "
+            + ", ".join(unknown)
+        )
+    if PRIMARY_CLUB_LEAGUE not in requested:
+        raise AirflowException(
+            f"conf.competition_ids must include {PRIMARY_CLUB_LEAGUE!r}: "
+            "validate_data anchors every run on the primary club league"
+        )
+    return [league for league in SOFASCORE_LEAGUES if league in set(requested)]
+
+
+def _run_leagues(context: Dict[str, Any]) -> List[str]:
+    return _requested_leagues(context.get("dag_run"))
+
+
+def _league_in_scope(dag_run: Any, league: str) -> bool:
+    """Jinja macro ``sofascore_in_scope``: a bad conf fails at render time."""
+
+    return league in _requested_leagues(dag_run)
+
+
+def _season_freshness_key(dag_run: Any) -> str:
+    """Jinja macro ``sofascore_season_freshness_key`` (#1359).
+
+    A run limited by ``conf.competition_ids`` (the 00:20 tail) reads the
+    season pages under a key of its own: under the shared ``day-<date>`` key
+    the 14:00 daily would find the tail's season plan complete and reuse its
+    raw, so no status change between the two would ever be seen.  ``""``
+    keeps the default day key.
+    """
+
+    conf = getattr(dag_run, "conf", None) or {}
+    if not isinstance(conf, dict) or conf.get("competition_ids") is None:
+        return ""
+    run_id = str(getattr(dag_run, "run_id", "") or "")
+    return "subset-" + hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _scope_guard(league: str) -> str:
+    """Bash prefix: a league outside this run's competitions skips (exit 99)."""
+
+    name = json.dumps(league, ensure_ascii=False)
+    return (
+        f"{{% if not sofascore_in_scope(dag_run, {name}) %}}"
+        f"echo {name}' is outside conf.competition_ids; skipped' && exit 99"
+        "{% endif %}"
+    )
+
+
 def _dag_season_arg(league: str) -> str:
     """Return a club Jinja value or the configured calendar-year season."""
 
@@ -390,11 +465,12 @@ def validate_data(**context) -> Dict[str, Any]:
 
     logger = logging.getLogger(__name__)
 
+    run_leagues = _run_leagues(context)
     _require_successful_producers(
         context,
         [
-            *[_schedule_task_id(league) for league in SOFASCORE_LEAGUES],
-            *[_match_capture_task_id(league) for league in SOFASCORE_LEAGUES],
+            *[_schedule_task_id(league) for league in run_leagues],
+            *[_match_capture_task_id(league) for league in run_leagues],
         ],
     )
     schedule_path = _result_path(SCHEDULE_RESULT_PATH, context)
@@ -531,6 +607,8 @@ def validate_data(**context) -> Dict[str, Any]:
     # its own floor so the legacy primary result is neither over-counted nor
     # allowed to hide a dead secondary capture.
     for _club_league in CLUB_LEAGUES[1:]:
+        if _club_league not in run_leagues:
+            continue
         _slug = _league_slug(_club_league)
         _club_floors = _competition_floors(_club_league)
         _club_schedule_path = _result_path(
@@ -604,6 +682,8 @@ def validate_data(**context) -> Dict[str, Any]:
     # small tournament can legitimately be below them; ``run_sofascore_dq``
     # below hard-fails canonical manifest completeness for every planned event.
     for _t_league in TOURNAMENT_LEAGUES:
+        if _t_league not in run_leagues:
+            continue
         _slug = _league_slug(_t_league)
         _t_floors = {
             k: _scale(u, b, _t_league) for k, (u, b) in _SS_FLOOR_BASES.items()
@@ -704,7 +784,7 @@ def run_sofascore_dq(**context) -> Dict[str, Any]:
     _require_successful_producers(context, ["validate_data"])
     checked: List[str] = []
     rejected: Dict[str, int] = {}
-    for league in SOFASCORE_LEAGUES:
+    for league in _run_leagues(context):
         slug = _league_slug(league)
         schedule_legacy = (
             SCHEDULE_RESULT_PATH
@@ -941,7 +1021,7 @@ def _due_player_leagues(context: Dict[str, Any]) -> set:
     force = bool(params.get("run_players"))
     return {
         league
-        for league in SOFASCORE_LEAGUES
+        for league in _run_leagues(context)
         if player_rotation_due(
             league,
             rotation_date=rotation_date,
@@ -971,6 +1051,11 @@ def _gate_player_capture(**context) -> bool:
 
     logger = logging.getLogger(__name__)
 
+    conf = getattr(context.get("dag_run"), "conf", None) or {}
+    if isinstance(conf, dict) and conf.get("run_players") is False:
+        # #1359: the daily tail asks for matches only, Saturday or not.
+        logger.info("conf.run_players=false → skip per-player capture.")
+        return False
     params = context.get("params") or {}
     if params.get("run_players"):
         decision = "run_players=True → running per-player capture on demand."
@@ -1363,6 +1448,10 @@ with DAG(
     # avoids avoidable lease rejection/retry storms without an operator-owned
     # Airflow pool and still reuses one warmed session inside each task.
     max_active_tasks=1,
+    user_defined_macros={
+        "sofascore_in_scope": _league_in_scope,
+        "sofascore_season_freshness_key": _season_freshness_key,
+    },
     params={
         "leagues": SOFASCORE_LEAGUES,
         # UI-configurable season for the 10-season backfill (#711, epic #708).
@@ -1453,8 +1542,13 @@ with DAG(
     - Capture activation is registry-gated to reviewed adult men's tournaments.
     """,
 ) as dag:
+    # #1359: a subset run's own season freshness key ("" = the day key).
+    _SEASON_FRESHNESS_KEY = "{{ sofascore_season_freshness_key(dag_run) }}"
+    # #1359: a run with conf.competition_ids plans only those competitions.
     _competition_season_args = " ".join(
+        f"{{% if sofascore_in_scope(dag_run, {json.dumps(league, ensure_ascii=False)}) %}}"
         f'--competition-season "{league}={_dag_season_arg(league)}"'
+        "{% endif %}"
         for league in SOFASCORE_LEAGUES
     )
     prepare_season_plan_task = BashOperator(
@@ -1471,6 +1565,7 @@ cd /opt/airflow && \\
             "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
             "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
             "HOME": "/home/airflow",
+            "SOFASCORE_SEASON_FRESHNESS_KEY": _SEASON_FRESHNESS_KEY,
         },
         append_env=True,
         do_xcom_push=True,
@@ -1496,6 +1591,7 @@ cd /opt/airflow && \\
             "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
             "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
             "HOME": "/home/airflow",
+            "SOFASCORE_SEASON_FRESHNESS_KEY": _SEASON_FRESHNESS_KEY,
         },
         append_env=True,
         do_xcom_push=True,
@@ -1528,6 +1624,7 @@ cd /opt/airflow && \\
             "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
             "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
             "HOME": "/home/airflow",
+            "SOFASCORE_SEASON_FRESHNESS_KEY": _SEASON_FRESHNESS_KEY,
         },
         append_env=True,
         do_xcom_push=True,
@@ -1536,6 +1633,7 @@ cd /opt/airflow && \\
     scrape_data_task = BashOperator(
         task_id="scrape_sofascore_data",
         bash_command=f"""
+{_scope_guard(PRIMARY_CLUB_LEAGUE)}
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{Path(SCHEDULE_RESULT_PATH).name}" && \\
@@ -1565,6 +1663,7 @@ rm -f "$SOFASCORE_RESULT_DIR/{Path(SCHEDULE_RESULT_PATH).name}" && \\
         schedule_tasks[_schedule_league] = BashOperator(
             task_id=_schedule_task_id(_schedule_league),
             bash_command=f"""
+{_scope_guard(_schedule_league)}
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/sofascore_result_{_schedule_slug}.json" && \\
@@ -1613,6 +1712,7 @@ rm -f "$SOFASCORE_RESULT_DIR/sofascore_result_{_schedule_slug}.json" && \\
         match_capture_tasks[_league] = BashOperator(
             task_id=_mc_task_id,
             bash_command=f"""
+{_scope_guard(_league)}
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{_mc_output}" && \\
@@ -1678,6 +1778,7 @@ rm -f "$SOFASCORE_RESULT_DIR/{_mc_output}" && \\
     scrape_player_capture_task = BashOperator(
         task_id="scrape_player_capture",
         bash_command=f"""
+{_scope_guard(PRIMARY_CLUB_LEAGUE)}
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{Path(PLAYER_CAPTURE_RESULT_PATH).name}" && \\
@@ -1709,6 +1810,7 @@ rm -f "$SOFASCORE_RESULT_DIR/{Path(PLAYER_CAPTURE_RESULT_PATH).name}" && \\
         player_capture_tasks[_player_league] = BashOperator(
             task_id=_player_capture_task_id(_player_league),
             bash_command=f"""
+{_scope_guard(_player_league)}
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{_player_output}" && \\

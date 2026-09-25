@@ -397,3 +397,41 @@ def test_every_production_dag_refuses_to_capture_without_a_plan(dag_id, monkeypa
             season=2025,
             offline_replay=False,
         )
+
+
+def test_runner_takes_the_allocations_in_the_plan_s_target_order(
+    tmp_path, monkeypatch
+):
+    """#1359: the order file beside a refresh plan puts the allocation with
+    the nearest deadline first; it never adds or drops an allocation."""
+    from scrapers.sofascore.workload_runtime import write_target_order
+
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-backfill-1")
+    monkeypatch.delenv("SOFASCORE_RUN_ID", raising=False)
+    policy = WorkloadBudgetPolicy("c" * 64, {MATCH_WORKLOAD_CLASS: _match_budget()})
+    ids = tuple(str(value) for value in range(1, 31))
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_backfill_sofascore_all_mens",
+        run_id="scheduled-backfill-1::targets",
+        partitions=[PartitionWorkload("SS-17", "2526", 17, pending_match_ids=ids)],
+        control_token=TOKEN,
+    )
+    path = write_plan(tmp_path / "targets.json", plan)
+
+    _loaded, plain = _load_runtime_workload_plan(
+        str(path), entity=ENTITY_MATCH_CAPTURE, league="SS-17", season=2526,
+        offline_replay=False,
+    )
+    write_target_order(path, ("30", "1"))
+    _loaded, ordered = _load_runtime_workload_plan(
+        str(path), entity=ENTITY_MATCH_CAPTURE, league="SS-17", season=2526,
+        offline_replay=False,
+    )
+
+    assert [item.batch_index for item in plain] == [0, 1]
+    assert "30" in target_ids(ordered[0])
+    assert [item.batch_index for item in ordered] == [1, 0]
+    assert set(ordered) == set(plain)

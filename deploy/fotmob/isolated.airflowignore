@@ -37,3 +37,7 @@
 # автомата считает только даги %fotmob% и чужих в DagBag не заметит, поэтому хостовую копию
 # дописать append-ом ДО первой доставки цели ≥ 5395f4f4.
 ^(dag_sofascore_manifest_maintenance|dag_trigger_sofascore_daily)\.py$
+
+# v2.4 (25.09.2026, #1359): мини-DAG хвоста дейли SofaScore — тот же случай, что v2.3.
+# Хостовую копию дописать append-ом ДО первой доставки цели с этим файлом.
+^dag_trigger_sofascore_daily_tail\.py$

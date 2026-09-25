@@ -2748,6 +2748,7 @@ def _load_runtime_workload_plan(
     from scrapers.sofascore.workload_runtime import (
         allocations_for_partition,
         load_plan,
+        order_allocations,
     )
 
     plan = load_plan(path)
@@ -2795,6 +2796,9 @@ def _load_runtime_workload_plan(
         canonical_season=canonical_season,
         scope=scope,
     )
+    if scope == "match":
+        # #1359: nearest deadlines first when the plan carries an order.
+        allocations = order_allocations(allocations, path)
     return plan, allocations
 
 

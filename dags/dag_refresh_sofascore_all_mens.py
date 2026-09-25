@@ -30,6 +30,7 @@ from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
+from scrapers.sofascore.match_deadline import match_deadline_sql
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils import sofascore_all_mens_state as state
 
@@ -179,28 +180,35 @@ REFRESH_TASK_IDS = frozenset({
 # Finished games of campaign partitions that have no complete capture yet,
 # per partition.  ``season`` is CAST on both sides because the
 # schedule stores it as the source ships it while the status table is text.
+# #1359: per season also the nearest deadline that has NOT passed yet (end of
+# the match + 24 h, the rule of the milestone-1 meter, ``match_deadline``) and
+# how many pending matches still have an open deadline.
 PENDING_PARTITIONS_SQL = """
-SELECT s.league, CAST(s.season AS varchar) AS season,
-       count(DISTINCT s.game_id) AS pending_matches,
-       MAX(CASE
-           WHEN TRY_CAST(s.start_timestamp AS bigint) BETWEEN 1
-                AND CAST(to_unixtime(current_timestamp + INTERVAL '6' HOUR) AS bigint)
-           THEN TRY_CAST(s.start_timestamp AS bigint)
-       END) AS newest_pending_start_timestamp
-FROM iceberg.bronze.sofascore_schedule s
-LEFT JOIN iceberg.bronze.sofascore_match_capture_status c
-  ON c.league = s.league
- AND CAST(c.season AS varchar) = CAST(s.season AS varchar)
- AND c.match_id = CAST(s.game_id AS varchar)
- AND c.capture_complete = true
-WHERE s.league LIKE 'SS-%'
-  AND s.status_type = 'finished'
-  AND c.match_id IS NULL
+SELECT p.league, p.season,
+       count(*) AS pending_matches,
+       min(CASE WHEN p.deadline >= to_unixtime(current_timestamp)
+                THEN CAST(p.deadline AS bigint) END) AS min_open_deadline_ts,
+       count_if(p.deadline >= to_unixtime(current_timestamp))
+           AS open_deadline_matches
+FROM (
+    SELECT DISTINCT s.league, CAST(s.season AS varchar) AS season, s.game_id,
+           """ + match_deadline_sql("s.start_timestamp", "s.changes_change_timestamp") + """
+               AS deadline
+    FROM iceberg.bronze.sofascore_schedule s
+    LEFT JOIN iceberg.bronze.sofascore_match_capture_status c
+      ON c.league = s.league
+     AND CAST(c.season AS varchar) = CAST(s.season AS varchar)
+     AND c.match_id = CAST(s.game_id AS varchar)
+     AND c.capture_complete = true
+    WHERE s.league LIKE 'SS-%'
+      AND s.status_type = 'finished'
+      AND c.match_id IS NULL
+) p
 GROUP BY 1, 2
 """
 
 
-def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None]]:
+def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int]]:
     """Query at task runtime; no Trino client is touched at DAG parse."""
 
     from utils.silver_tasks import _get_trino_connection
@@ -214,9 +222,10 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None]]:
                 str(league),
                 str(season),
                 int(count),
-                int(timestamp) if timestamp is not None else None,
+                int(deadline) if deadline is not None else None,
+                int(open_matches or 0),
             )
-            for league, season, count, timestamp in cursor.fetchall()
+            for league, season, count, deadline, open_matches in cursor.fetchall()
         ]
     finally:
         conn.close()
@@ -241,20 +250,17 @@ def _dag_run_type_name(dag_run: Any) -> str:
 
 
 def _refresh_queue_mode(context: dict[str, Any]) -> str:
-    """Resolve F,F,B for scheduled/backfill runs and manual explicit intent."""
+    """One queue for every slot (#1359); a manual run may ask for the debt only.
+
+    Scheduled 00:30, 08:30 and 15:30 runs all plan by deadline: open deadlines
+    first, the debt fills the rest of the window.  ``conf.queue_mode=backlog``
+    on a manual run plans the debt tier alone.
+    """
 
     dag_run = context.get("dag_run")
     run_type = _dag_run_type_name(dag_run)
     if run_type in {"scheduled", "backfill"}:
-        interval_end = context.get("data_interval_end")
-        if not isinstance(interval_end, datetime) or interval_end.tzinfo is None:
-            raise AirflowException("data_interval_end must be an aware datetime")
-        interval_end = interval_end.astimezone(timezone.utc)
-        modes = {(0, 30): "fresh", (8, 30): "fresh", (15, 30): "backlog"}
-        try:
-            return modes[(interval_end.hour, interval_end.minute)]
-        except KeyError as exc:
-            raise AirflowException("data_interval_end is not an F,F,B slot") from exc
+        return "deadline"
     if run_type != "manual":
         raise AirflowException(f"unsupported refresh run_type: {run_type!r}")
     conf = getattr(dag_run, "conf", {}) or {}
@@ -262,9 +268,11 @@ def _refresh_queue_mode(context: dict[str, Any]) -> str:
         raise AirflowException(
             "manual DagRun queue_mode configuration must be a mapping"
         )
-    queue_mode = conf.get("queue_mode", "fresh")
-    if queue_mode not in {"fresh", "backlog"}:
-        raise AirflowException("queue_mode must be 'fresh' or 'backlog'")
+    queue_mode = conf.get("queue_mode", "deadline")
+    if queue_mode not in state.REFRESH_QUEUE_MODES:
+        raise AirflowException(
+            "queue_mode must be one of " + ", ".join(sorted(state.REFRESH_QUEUE_MODES))
+        )
     return queue_mode
 
 

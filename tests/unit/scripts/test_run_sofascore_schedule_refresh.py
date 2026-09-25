@@ -212,6 +212,9 @@ def offline(monkeypatch, tmp_path):
         return "bronze.sofascore_schedule"
 
     monkeypatch.setattr(refresh, "bronze_partitions", partitions)
+    monkeypatch.setattr(
+        refresh, "overdue_partitions", lambda: dict(calls.get("overdue", {}))
+    )
     monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
     monkeypatch.setattr(refresh, "fetch_season_fixtures", fixtures)
     monkeypatch.setattr(refresh, "schedule_rows_from_events", rows)
@@ -289,8 +292,9 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
     assert by_class["seed"]["chase_before"] == {}
     assert calls["window_hours"] == 36
     # Only the classes that are not "playing right now" take the fixture page:
-    # a due season is being refreshed for its result, not its calendar.
-    assert calls["fixtures"] == [[], [(23, 88001)]]
+    # a due season is being refreshed for its result, not its calendar.  The
+    # (empty here) overdue class takes it first (#1359).
+    assert calls["fixtures"] == [[], [], [(23, 88001)]]
     client = _FakeClient.created[0]
     assert client["control_url"] == "http://sofascore-gw:8899"
     assert client["budget_cap_bytes"] == 44_000_000
@@ -324,15 +328,18 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
         "idle_runs": 0,
         # Every class was WALKED, so none of them is holding its anchor after a
         # cut-short walk (audit after Sol r28).
-        "interrupted_runs": {"due": 0, "stale": 0, "seed": 0},
+        "interrupted_runs": {"overdue": 0, "due": 0, "stale": 0, "seed": 0},
         # #1358: the due slice is exactly its members, so the slice is FULL and
         # its anchor moves past the one taken (the whole class is still taken
         # on every run); the other classes are wider than their one member.
-        "index": {"due": [23, 88001], "stale": [7, 96518], "seed": [7, 96518]},
+        "index": {
+            "overdue": [7, 96518],
+            "due": [23, 88001], "stale": [7, 96518], "seed": [7, 96518],
+        },
     }
     # An anchor that stayed put means the class was walked whole — which is
     # only readable next to the size of the class itself.
-    assert report["class_members"] == {"due": 1, "stale": 0, "seed": 1}
+    assert report["class_members"] == {"overdue": 0, "due": 1, "stale": 0, "seed": 1}
     assert report["idle_runs"] == 0
 
 
@@ -375,7 +382,8 @@ def test_every_class_is_merged_before_the_next_one_is_fetched(offline, monkeypat
 
     # due fetched and written, stale fetched and written, seed exploded — and the due rows
     # are in Bronze all the same.
-    assert order == ["fetch:1", "write", "fetch:1", "write", "fetch:1"]
+    # (#1359: the empty overdue slice is walked first and writes nothing.)
+    assert order == ["fetch:0", "fetch:1", "write", "fetch:1", "write", "fetch:1"]
     assert offline["calls"]["writes"][0] == [{"game_id": 0, "league": "SS-7"}]
     report = json.loads(offline["output"].read_text())
     assert report["status"] == "failed"
@@ -418,7 +426,9 @@ def test_a_lone_due_season_does_not_drag_the_other_cursors(offline):
     assert [target.pair for target in plan["seed"]] == [(6, 6), (7, 7)]
     # The due class has fewer members than its cap, so its anchor stays at the
     # head; stale and seed stopped right behind their own slices.
-    assert cursors == {"due": (0, 0), "stale": (2, 2), "seed": (8, 8)}
+    assert cursors == {
+        "overdue": (0, 0), "due": (0, 0), "stale": (2, 2), "seed": (8, 8),
+    }
 
     plan, cursors, members = refresh.plan_sweep(
         targets, known, due, cursors, max_due=10, max_stale=2, max_seed=2,
@@ -442,11 +452,14 @@ def test_a_failed_run_leaves_the_cursor_where_it_was(offline, monkeypatch):
     cursor = json.loads(offline["cursor"].read_text())
     # The anchors are exactly where they were: the walk did not finish, so no
     # class may claim to have covered its slice.
-    assert cursor["index"] == {"due": None, "stale": None, "seed": [23, 88001]}
+    assert cursor["index"] == {
+        "overdue": None, "due": None, "stale": None, "seed": [23, 88001],
+    }
     # ...but the interruption is COUNTED now.  Escaping the class loop before
     # this line meant the anti-wedge counter never grew, so a target with a
     # permanent 403 froze its class for ever (code review of PR #1216).
-    assert cursor["interrupted_runs"]["due"] == 1
+    # (The first class walked is ``overdue`` since #1359.)
+    assert cursor["interrupted_runs"][refresh.SWEEP_CLASSES[0]] == 1
     report = json.loads(offline["output"].read_text())
     assert report["status"] == "failed"
     assert report["errors"] == ["RuntimeError: gateway said 429"]
@@ -666,7 +679,7 @@ def test_a_cursor_that_is_not_an_anchor_starts_from_the_head(tmp_path, payload):
         path.write_text(payload)
 
     assert refresh.read_cursor(path) == {
-        "due": None, "stale": None, "seed": None,
+        "overdue": None, "due": None, "stale": None, "seed": None,
     }
 
 
@@ -684,7 +697,7 @@ def test_the_cursor_outlives_a_reissued_snapshot(tmp_path):
     }))
 
     assert refresh.read_cursor(path) == {
-        "due": (7, 96518), "stale": (23, 88001), "seed": None,
+        "overdue": None, "due": (7, 96518), "stale": (23, 88001), "seed": None,
     }
 
 
@@ -1112,7 +1125,7 @@ def test_the_default_plan_fits_the_page_budget_and_its_derived_cap():
     )
 
     # 2 400 pages hold 800 due seasons at 3 pages each; nothing is left.
-    assert limits == {"due": 800, "seed": 0, "stale": 0}
+    assert limits == {"overdue": 0, "due": 800, "seed": 0, "stale": 0}
     assert refresh.worst_case_pages(*knobs) <= refresh.DEFAULT_PAGE_BUDGET
     cap = refresh.derive_budget_cap(*knobs)
     assert refresh.worst_case_bytes(*knobs, refresh.DISCOVERY_LEASE_MAX_BYTES, cap) < cap
@@ -1121,7 +1134,7 @@ def test_the_default_plan_fits_the_page_budget_and_its_derived_cap():
 @pytest.mark.unit
 def test_budget_limits_take_due_first_then_seed_then_shrink_stale():
     costs = refresh.class_page_costs(3, 12)
-    assert costs == {"due": 3, "stale": 4, "seed": 17}
+    assert costs == {"overdue": 4, "due": 3, "stale": 4, "seed": 17}
 
     limits = refresh.budget_class_limits(
         {"due": 205, "stale": 1200, "seed": 60},
@@ -1139,7 +1152,7 @@ def test_budget_limits_take_due_first_then_seed_then_shrink_stale():
         page_budget=2400, chase_pages=3, seed_pages=12,
         max_due=4096, max_stale=200, max_seed=40,
     )
-    assert heavy == {"due": 700, "seed": 17, "stale": 2}
+    assert heavy == {"overdue": 0, "due": 700, "seed": 17, "stale": 2}
     # The emergency bound still bounds due.
     capped = refresh.budget_class_limits(
         {"due": 700, "stale": 0, "seed": 0},
@@ -1828,8 +1841,8 @@ def test_an_empty_plan_over_a_non_empty_campaign_is_a_failure(offline, monkeypat
     monkeypatch.setattr(
         refresh, "plan_sweep",
         lambda *args, **kwargs: (
-            {"due": [], "stale": [], "seed": []}, {},
-            {"due": 0, "stale": 0, "seed": 0},
+            {"overdue": [], "due": [], "stale": [], "seed": []}, {},
+            {"overdue": 0, "due": 0, "stale": 0, "seed": 0},
         ),
     )
 
@@ -2204,7 +2217,9 @@ def test_the_estimate_counts_the_leases_that_shrink_with_the_budget(
     # knobs measured above.
     monkeypatch.setattr(
         refresh, "budget_class_limits",
-        lambda members, **_: {"due": max_due, "stale": max_stale, "seed": max_seed},
+        lambda members, **_: {
+            "overdue": 0, "due": max_due, "stale": max_stale, "seed": max_seed,
+        },
     )
     output = offline["output"]
     argv = _argv(
@@ -2301,7 +2316,7 @@ def test_a_lease_that_would_end_exactly_on_its_ceiling_is_refused(
     # they are cut — still before a single paid request.
     monkeypatch.setattr(
         refresh, "budget_class_limits",
-        lambda members, **_: {"due": 1, "stale": 1, "seed": 1},
+        lambda members, **_: {"overdue": 0, "due": 1, "stale": 1, "seed": 1},
     )
     argv = _argv(
         offline,
@@ -2317,3 +2332,79 @@ def test_a_lease_that_would_end_exactly_on_its_ceiling_is_refused(
     assert "exactly on its ceiling" in report["errors"][0]
     # Refused before a single paid request: no client was ever built.
     assert _FakeClient.created == []
+
+
+@pytest.mark.unit
+def test_overdue_seasons_are_read_first_with_their_fixture_page(offline):
+    # #1359: a season whose kicked-off game still has no final status is read
+    # before everything else — tail visit plus fixture page, like stale — and
+    # it does not ALSO ride in due.
+    offline["calls"]["known"] = {("SS-7", "2627")}
+    offline["calls"]["due"] = {("SS-7", "2627")}
+    # The stuck game kicked off before the newest finished one (1 000 000):
+    # the chase goes back past it (Astra #1359 r3, finding 2).
+    offline["calls"]["overdue"] = {("SS-7", "2627"): 999_000}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    by_class = _fetch_by_class(offline)
+    assert by_class["overdue"]["targets"] == [(7, 96518)]
+    assert by_class["overdue"]["chase_before"] == {(7, 96518): 998_999}
+    assert by_class["due"]["targets"] == []
+    assert offline["calls"]["fixtures"][0] == [(7, 96518)]
+    report = json.loads(offline["output"].read_text())
+    assert report["overdue_partitions"] == 1
+    assert report["overdue_targets"] == 1
+    assert report["class_limits"]["overdue"] == 1
+    assert report["class_members"]["overdue"] == 1
+    assert report["overdue_fixtures"]["pages"] == 1
+    # overdue costs a tail visit and a fixture page, inside the page budget.
+    assert report["planned_pages"] <= report["page_budget"]
+
+
+@pytest.mark.unit
+def test_overdue_takes_its_pages_before_due():
+    limits = refresh.budget_class_limits(
+        {"overdue": 100, "due": 800, "stale": 1000, "seed": 60},
+        page_budget=2400, chase_pages=3, seed_pages=12,
+        max_due=4096, max_stale=200, max_seed=40,
+    )
+
+    assert limits["overdue"] == 100
+    assert limits["due"] == (2400 - 100 * 4) // 3
+    assert limits["seed"] == 0 and limits["stale"] == 0
+
+
+@pytest.mark.unit
+def test_the_overdue_query_shares_the_owed_predicate(monkeypatch):
+    executed = []
+    monkeypatch.setattr(
+        refresh, "_trino_rows",
+        lambda sql: executed.append(sql)
+        or [("SS-7", "2627", 1_787_000_000), ("SS-8", 2026, None)],
+    )
+
+    assert refresh.overdue_partitions() == {
+        ("SS-7", "2627"): 1_787_000_000, ("SS-8", "2026"): None,
+    }
+
+    sql = executed[0]
+    assert refresh.OWED_STATUS_SQL in sql
+    assert refresh.OWED_STATUS_SQL in refresh.KNOWN_PARTITIONS_SQL
+    assert "<> 'finished'" in sql
+    assert f"- {refresh.PLAYED_GRACE_HOURS} * 3600" in sql
+    assert f"- {refresh.OVERDUE_LOOKBACK_DAYS} * 86400" in sql
+    import sqlglot
+
+    sqlglot.parse_one(sql, read="trino")
+
+
+@pytest.mark.unit
+def test_overdue_chase_keeps_the_known_boundary_when_it_is_deeper(offline):
+    offline["calls"]["known"] = {("SS-7", "2627")}
+    offline["calls"]["overdue"] = {("SS-7", "2627"): 2_000_000}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    by_class = _fetch_by_class(offline)
+    assert by_class["overdue"]["chase_before"] == {(7, 96518): 1_000_000}

@@ -350,38 +350,35 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("run_type", "interval_end", "conf", "expected_mode"),
+    ("run_type", "interval_end", "conf"),
     [
-        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}, "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 8, 30, tzinfo=timezone.utc), {}, "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}, "backlog"),
-        (DagRunType.SCHEDULED, datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}, "fresh"),
-        (DagRunType.BACKFILL, datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}, "backlog"),
-        ("backfill", datetime(2026, 8, 27, 2, 30, tzinfo=timezone(timedelta(hours=2))), {}, "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 17, 30, tzinfo=timezone(timedelta(hours=2))), {}, "backlog"),
-        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {"queue_mode": "backlog"}, "fresh"),
-        ("backfill", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {"queue_mode": "fresh"}, "backlog"),
+        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", datetime(2026, 8, 27, 8, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}),
+        (DagRunType.SCHEDULED, datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}),
+        (DagRunType.BACKFILL, datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", datetime(2026, 8, 27, 11, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", None, {"queue_mode": "backlog"}),
     ],
 )
-def test_plan_task_derives_ffb_mode_from_interval_end_not_delayed_task_start(
-    clean_env, monkeypatch, run_type, interval_end, conf, expected_mode
+def test_plan_task_uses_one_deadline_queue_for_every_slot(
+    clean_env, monkeypatch, run_type, interval_end, conf
 ):
+    # #1359: no fresh/backlog split by slot; conf on a scheduled run is ignored.
     module = _load_dag_module(monkeypatch)
-    delayed_start = datetime(2026, 8, 27, 20, 4, tzinfo=timezone.utc)
 
     kwargs = _planner_kwargs(
         module,
         monkeypatch,
         dag_run=SimpleNamespace(run_type=run_type, conf=conf),
         data_interval_end=interval_end,
-        ti=SimpleNamespace(start_date=delayed_start),
     )
 
-    assert kwargs["queue_mode"] == expected_mode
+    assert kwargs["queue_mode"] == "deadline"
 
 
 @pytest.mark.unit
-def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
+def test_plan_task_manual_defaults_to_deadline_and_allows_backlog_override(
     clean_env, monkeypatch
 ):
     module = _load_dag_module(monkeypatch)
@@ -390,7 +387,6 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
         module,
         monkeypatch,
         dag_run=SimpleNamespace(run_type=DagRunType.MANUAL, conf={}),
-        data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
     )
     overridden = _planner_kwargs(
         module,
@@ -398,10 +394,9 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
         dag_run=SimpleNamespace(
             run_type=DagRunType.MANUAL, conf={"queue_mode": "backlog"}
         ),
-        data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
     )
 
-    assert default["queue_mode"] == "fresh"
+    assert default["queue_mode"] == "deadline"
     assert overridden["queue_mode"] == "backlog"
 
 
@@ -415,17 +410,16 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
             "queue_mode",
         ),
         (
-            SimpleNamespace(run_type="scheduled", conf={}),
-            datetime(2026, 8, 27, 11, 30, tzinfo=timezone.utc),
-            "data_interval_end",
+            SimpleNamespace(run_type="manual", conf={"queue_mode": "fresh"}),
+            None,
+            "queue_mode",
         ),
-        (SimpleNamespace(run_type="scheduled", conf={}), None, "data_interval_end"),
-        (SimpleNamespace(run_type="scheduled", conf={}), datetime(2026, 8, 27, 0, 30), "data_interval_end"),
+        (SimpleNamespace(run_type="manual", conf=["backlog"]), None, "mapping"),
         (SimpleNamespace(run_type="unexpected", conf={}), None, "run_type"),
         (SimpleNamespace(conf={}), None, "run_type"),
     ],
 )
-def test_plan_task_fails_closed_for_invalid_mode_or_non_ffb_interval(
+def test_plan_task_fails_closed_for_invalid_mode_or_run_type(
     clean_env, monkeypatch, dag_run, interval_end, message
 ):
     from airflow.exceptions import AirflowException
@@ -463,8 +457,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
 
         def fetchall(self):
             return [
-                ("SS-17", "2627", 12, 1_787_788_800),
-                ("SS-8", 2026, 3, None),
+                ("SS-17", "2627", 12, 1_787_788_800, 5),
+                ("SS-8", 2026, 3, None, 0),
             ]
 
     class _Connection:
@@ -484,8 +478,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     partitions = module._pending_refresh_partitions()
 
     assert partitions == [
-        ("SS-17", "2627", 12, 1_787_788_800),
-        ("SS-8", "2026", 3, None),
+        ("SS-17", "2627", 12, 1_787_788_800, 5),
+        ("SS-8", "2026", 3, None, 0),
     ]
     assert connection.closed is True
     sql = executed[0]
@@ -494,13 +488,20 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     assert "LIKE 'SS-%'" in sql
     assert "status_type = 'finished'" in sql
     assert "capture_complete" in sql
-    normalized_sql = " ".join(sql.upper().split())
+    # #1359: the nearest deadline that has not passed, by the meter's rule.
+    from scrapers.sofascore.match_deadline import match_deadline_sql
+
+    assert match_deadline_sql(
+        "s.start_timestamp", "s.changes_change_timestamp"
+    ) in sql
+    normalized_sql = " ".join(sql.split())
+    assert "SELECT DISTINCT s.league" in normalized_sql
     assert (
-        "MAX(CASE WHEN TRY_CAST(S.START_TIMESTAMP AS BIGINT) BETWEEN 1 AND "
-        "CAST(TO_UNIXTIME(CURRENT_TIMESTAMP + INTERVAL '6' HOUR) AS BIGINT) "
-        "THEN TRY_CAST(S.START_TIMESTAMP AS BIGINT) END) "
-        "AS NEWEST_PENDING_START_TIMESTAMP"
+        "min(CASE WHEN p.deadline >= to_unixtime(current_timestamp) "
+        "THEN CAST(p.deadline AS bigint) END) AS min_open_deadline_ts"
     ) in normalized_sql
+    assert "AS open_deadline_matches" in normalized_sql
+    assert "count(*) AS pending_matches" in normalized_sql
 
 
 def _refresh_env(result_path, scope_key="c:8:825"):

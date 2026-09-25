@@ -372,7 +372,7 @@ def _refresh_snapshot():
 
 
 def _refresh_pending(league, season, count, timestamp=1_787_788_800):
-    """One Bronze pending row under the timestamp-aware planner contract."""
+    """One Bronze pending row: ``timestamp`` is the nearest open deadline (#1359)."""
 
     return (league, season, count, timestamp)
 
@@ -390,7 +390,7 @@ def test_refresh_planner_skips_tournament_with_null_seasons():
     planned = plan_refresh_batch(
         snapshot,
         [_refresh_pending("SS-17", "2627", 1), _refresh_pending("SS-8", "2526", 10)],
-        batch_size=2, queue_mode="fresh",
+        batch_size=2, queue_mode="deadline",
     )
 
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
@@ -499,8 +499,11 @@ def test_refresh_planner_skips_malformed_snapshot_records(caplog):
 
     planned = plan_refresh_batch(
         snapshot,
-        [_refresh_pending("SS-17", "2627", 1), _refresh_pending("SS-8", "2627", 2)],
-        batch_size=2, queue_mode="fresh",
+        [
+            _refresh_pending("SS-17", "2627", 1),
+            _refresh_pending("SS-8", "2627", 2, 1_787_788_000),
+        ],
+        batch_size=2, queue_mode="deadline",
     )
 
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
@@ -510,7 +513,7 @@ def test_refresh_planner_skips_malformed_snapshot_records(caplog):
 
 
 @pytest.mark.unit
-def test_refresh_planner_orders_fresh_rows_by_timestamp_with_deterministic_ties():
+def test_refresh_planner_orders_open_deadlines_nearest_first_with_stable_ties():
     snapshot = _refresh_snapshot()
     tournament = snapshot["tournaments"][0]
     tournament["seasons"].append({
@@ -541,34 +544,35 @@ def test_refresh_planner_orders_fresh_rows_by_timestamp_with_deterministic_ties(
             _refresh_pending("SS-8", "2627", 10, 1_787_817_600),
             _refresh_pending("SS-17", "2526", 9, 1_787_702_400),
         ],
-        batch_size=8, queue_mode="fresh",
+        batch_size=8, queue_mode="deadline",
     )
 
+    # #1359: the nearest open deadline first, whatever the season or size.
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
-        "campaign-test:8:826",   # current, more pending matches
-        "campaign-test:17:1726",  # current, fewer pending matches
-        "campaign-test:17:1725",  # history, most pending matches
-        "campaign-test:17:1723",  # history equal-count ties: league then season
+        "campaign-test:8:825",    # nearest deadline
+        "campaign-test:17:1723",  # equal deadline ties: league then season
         "campaign-test:17:1724",
-        "campaign-test:8:825",
+        "campaign-test:17:1725",
+        "campaign-test:17:1726",
+        "campaign-test:8:826",    # farthest deadline
     ]
 
 
 @pytest.mark.unit
-def test_refresh_planner_fresh_prioritizes_a_newer_small_partition_over_old_backlog():
+def test_refresh_planner_open_deadline_small_partition_goes_before_the_debt():
     snapshot = _refresh_snapshot()
     pending = [
         _refresh_pending("SS-17", "2627", 1, 1_787_821_200),
-        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
+        _refresh_pending("SS-8", "2526", 10, None),
     ]
 
     planned = plan_refresh_batch(
-        snapshot, pending, batch_size=2, queue_mode="fresh"
+        snapshot, pending, batch_size=2, queue_mode="deadline"
     )
 
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
-        "campaign-test:17:1726",  # current, even with fewer pending matches
-        "campaign-test:8:825",     # historical fallback
+        "campaign-test:17:1726",  # open deadline, even with fewer pending matches
+        "campaign-test:8:825",     # debt: no deadline left
     ]
 
 
@@ -589,16 +593,16 @@ def test_refresh_planner_prioritizes_an_explicit_calendar_year_current_partition
     ).encode()).hexdigest()
     pending = [
         _refresh_pending("SS-17", "2026", 1, 1_787_821_200),
-        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
+        _refresh_pending("SS-8", "2526", 10, None),
     ]
 
     planned = plan_refresh_batch(
-        snapshot, pending, batch_size=2, queue_mode="fresh"
+        snapshot, pending, batch_size=2, queue_mode="deadline"
     )
 
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
-        "campaign-test:17:1726",  # current calendar year
-        "campaign-test:8:825",     # older split year fallback
+        "campaign-test:17:1726",  # calendar year season with an open deadline
+        "campaign-test:8:825",     # older split year debt
     ]
 
 
@@ -606,22 +610,24 @@ def test_refresh_planner_prioritizes_an_explicit_calendar_year_current_partition
 def test_refresh_planner_backlog_preserves_largest_old_partition_first():
     snapshot = _refresh_snapshot()
     pending = [
-        _refresh_pending("SS-17", "2526", 3, 1_787_821_200),
-        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
+        _refresh_pending("SS-17", "2627", 1, 1_787_821_200),
+        _refresh_pending("SS-17", "2526", 3, None),
+        _refresh_pending("SS-8", "2526", 10, None),
     ]
 
     planned = plan_refresh_batch(
-        snapshot, pending, batch_size=2, queue_mode="backlog"
+        snapshot, pending, batch_size=3, queue_mode="backlog"
     )
 
+    # The manual backlog mode drains the debt alone, the biggest first.
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
-        "campaign-test:8:825",  # historical backlog, most pending matches
+        "campaign-test:8:825",
         "campaign-test:17:1725",
     ]
 
 
 @pytest.mark.unit
-def test_refresh_planner_fresh_uses_null_last_newest_timestamp_and_stable_ties():
+def test_refresh_planner_puts_the_debt_last_and_breaks_deadline_ties_stably():
     snapshot = _refresh_snapshot()
     snapshot["tournaments"][0]["seasons"].extend([
         {
@@ -654,16 +660,16 @@ def test_refresh_planner_fresh_uses_null_last_newest_timestamp_and_stable_ties()
             _refresh_pending("SS-8", "2627", 4, 1_787_738_400),
         ],
         batch_size=8,
-        queue_mode="fresh",
+        queue_mode="deadline",
     )
 
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
-        "campaign-test:17:1726",  # newest timestamp
-        "campaign-test:8:825",   # same timestamp, larger pending count
-        "campaign-test:17:1723",  # same count: league then canonical season
+        "campaign-test:17:1723",  # nearest deadline: league then canonical season
         "campaign-test:17:1724",
+        "campaign-test:8:825",
         "campaign-test:8:826",
-        "campaign-test:17:1725",  # null timestamp is always last
+        "campaign-test:17:1726",  # later deadline
+        "campaign-test:17:1725",  # no open deadline: debt, always last
     ]
 
 
@@ -693,7 +699,7 @@ def test_refresh_planner_filters_poisoned_rows_before_timestamp_normalization():
             _refresh_pending("SS-17", "2425", 99, "not-a-timestamp"),
         ],
         batch_size=8,
-        queue_mode="fresh",
+        queue_mode="deadline",
         exclude_tournament_ids={8},
     )
 
@@ -719,16 +725,16 @@ def test_refresh_planner_requires_an_explicit_queue_mode():
 
 
 @pytest.mark.unit
-def test_refresh_planner_ranks_partitions_by_pending_matches_and_bounds_batch():
+def test_refresh_planner_ranks_partitions_by_deadline_and_bounds_batch():
     snapshot = _refresh_snapshot()
     pending = [
-        _refresh_pending("SS-8", "2526", 3),
-        _refresh_pending("SS-17", "2627", 10),
-        _refresh_pending("SS-17", "2526", 1),
+        _refresh_pending("SS-8", "2526", 3, 1_787_788_900),
+        _refresh_pending("SS-17", "2627", 10, 1_787_788_800),
+        _refresh_pending("SS-17", "2526", 1, None),
     ]
 
     planned = plan_refresh_batch(
-        snapshot, pending, batch_size=2, queue_mode="fresh", dag_run_id="scheduled__1",
+        snapshot, pending, batch_size=2, queue_mode="deadline", dag_run_id="scheduled__1",
         task_env={"SOFASCORE_PROXY_CONTROL_URL": "http://gw:8080"},
     )
 
@@ -773,7 +779,7 @@ def test_refresh_planner_skips_configured_unknown_and_excluded_partitions():
     ]
 
     planned = plan_refresh_batch(
-        snapshot, pending, batch_size=8, queue_mode="fresh", exclude_tournament_ids={8}
+        snapshot, pending, batch_size=8, queue_mode="deadline", exclude_tournament_ids={8}
     )
 
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
@@ -786,11 +792,11 @@ def test_refresh_planner_rejects_a_stale_snapshot_and_bad_batch_size():
     snapshot = _refresh_snapshot()
 
     with pytest.raises(CampaignPlanningError, match="batch_size"):
-        plan_refresh_batch(snapshot, [], batch_size=0, queue_mode="fresh")
+        plan_refresh_batch(snapshot, [], batch_size=0, queue_mode="deadline")
     snapshot["snapshot_id"] = "0" * 64
     with pytest.raises(CampaignPlanningError, match="digest"):
         plan_refresh_batch(
-            snapshot, [_refresh_pending("SS-17", "2627", 1)], queue_mode="fresh"
+            snapshot, [_refresh_pending("SS-17", "2627", 1)], queue_mode="deadline"
         )
 
 
@@ -1156,13 +1162,14 @@ def test_tournament_missing_from_the_file_is_queued_last_with_a_warning(caplog):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("queue_mode", ["fresh", "backlog"])
+@pytest.mark.parametrize("queue_mode", ["deadline", "backlog"])
 def test_refresh_planner_skips_student_and_ranks_core_before_disputed(queue_mode):
     snapshot = _refresh_snapshot()
-    # The disputed tournament has the newer AND the bigger partition.
+    # The disputed tournament has the nearer deadline AND the bigger debt.
+    open_mode = queue_mode == "deadline"
     pending = [
-        _refresh_pending("SS-17", "2627", 1, 1_787_000_000),
-        _refresh_pending("SS-8", "2627", 50, 1_787_900_000),
+        _refresh_pending("SS-17", "2627", 1, 1_787_900_000 if open_mode else None),
+        _refresh_pending("SS-8", "2627", 50, 1_787_000_000 if open_mode else None),
     ]
 
     planned = plan_refresh_batch(
@@ -1194,7 +1201,7 @@ def test_current_season_targets_skip_esoccer_tournaments():
 
 
 def _window_plan(pending, **kwargs):
-    kwargs.setdefault("queue_mode", "fresh")
+    kwargs.setdefault("queue_mode", "deadline")
     return plan_refresh_batch(
         _refresh_snapshot(), pending, batch_size=kwargs.pop("batch_size", 8),
         scope_budget_s=kwargs.pop("scope_budget_s", 7200), **kwargs,
@@ -1216,18 +1223,19 @@ def test_refresh_window_takes_every_small_scope_that_fits():
         assert env["SOFASCORE_SCOPE_MAX_MATCHES"] == "10"
         assert env["SOFASCORE_SCOPE_BYTE_CAP"] == str(10 * 49_342)
         assert env["SOFASCORE_SCOPE_ESTIMATE_S"] == str(10 * 25 + 180)
-        # estimate x 1.5 would leave the runner's 5 min stop margin no room on
-        # a small scope, so the timeout keeps 10 min over the estimate.
-        assert env["SOFASCORE_SCOPE_TIMEOUT_S"] == str(430 + 600)
+        # estimate x 1.5 would leave no room on a small scope for the runner's
+        # admission rule (an allocation of up to 25 matches at twice its
+        # estimate + 5 min), so the timeout keeps 25 x 25 s + 300 s over it.
+        assert env["SOFASCORE_SCOPE_TIMEOUT_S"] == str(430 + 925)
         assert env["SOFASCORE_REFRESH_SECONDS_PER_MATCH"] == "25"
 
 
 @pytest.mark.unit
 def test_refresh_window_slices_the_scope_that_does_not_fit_whole():
     planned = _window_plan([
-        _refresh_pending("SS-17", "2627", 100, 1_787_900_004),
-        _refresh_pending("SS-8", "2627", 5_920, 1_787_900_003),
-        _refresh_pending("SS-17", "2526", 10, 1_787_900_002),
+        _refresh_pending("SS-17", "2627", 100, 1_787_900_001),
+        _refresh_pending("SS-8", "2627", 5_920, 1_787_900_002),
+        _refresh_pending("SS-17", "2526", 10, 1_787_900_003),
     ])
 
     assert [env["SOFASCORE_SCOPE_KEY"] for env in planned] == [
@@ -1247,11 +1255,11 @@ def test_refresh_window_slices_the_scope_that_does_not_fit_whole():
 @pytest.mark.unit
 def test_refresh_window_closes_on_a_slice_under_twenty_matches():
     planned = _window_plan([
-        # 280 x 25 + 180 = 7180 s: 20 s of the window are left.
-        _refresh_pending("SS-17", "2627", 280, 1_787_900_004),
-        _refresh_pending("SS-8", "2627", 50, 1_787_900_003),
-        _refresh_pending("SS-17", "2526", 1, 1_787_900_002),
-    ])
+        # 100 x 25 + 180 = 2680 s of a 2700 s window: 20 s are left.
+        _refresh_pending("SS-17", "2627", 100, 1_787_900_001),
+        _refresh_pending("SS-8", "2627", 50, 1_787_900_002),
+        _refresh_pending("SS-17", "2526", 1, 1_787_900_003),
+    ], scope_budget_s=2700)
 
     assert [env["SOFASCORE_SCOPE_KEY"] for env in planned] == [
         "campaign-test:17:1726"
@@ -1272,6 +1280,126 @@ def test_refresh_window_caps_one_task_at_two_hours_and_logs_a_batch_cut(caplog):
 
     unbounded = plan_refresh_batch(
         _refresh_snapshot(), [_refresh_pending("SS-17", "2627", 5_000)],
-        queue_mode="fresh",
+        queue_mode="deadline",
     )
     assert unbounded[0]["SOFASCORE_SCOPE_TIMEOUT_S"] == str(2 * 3600)
+
+
+@pytest.mark.unit
+def test_refresh_queue_a_fresh_far_deadline_season_does_not_overtake_a_near_one():
+    # #1359: an American season that finished five minutes ago (deadline in
+    # ~24 h) waits behind a European one whose deadline closes in an hour —
+    # "freshest first" was what let the far one eat the window.
+    planned = _window_plan([
+        _refresh_pending("SS-17", "2627", 4, 1_787_900_000 + 24 * 3600),
+        _refresh_pending("SS-8", "2627", 40, 1_787_900_000 + 3600),
+    ])
+
+    assert [env["SOFASCORE_SCOPE_KEY"] for env in planned] == [
+        "campaign-test:8:826", "campaign-test:17:1726",
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_queue_an_esoccer_sized_debt_goes_second_tier_and_sliced():
+    # A 5 920-match debt with no open deadline fills only what the open tier
+    # left of the window, and only as a slice.
+    planned = _window_plan([
+        _refresh_pending("SS-8", "2627", 5_920, None),
+        _refresh_pending("SS-17", "2627", 100, 1_787_900_000),
+    ])
+
+    assert [env["SOFASCORE_SCOPE_KEY"] for env in planned] == [
+        "campaign-test:17:1726", "campaign-test:8:826",
+    ]
+    assert planned[0]["SOFASCORE_SCOPE_MAX_MATCHES"] == "100"
+    # 7200 - (100 x 25 + 180) = 4520 s left -> (4520 - 180) // 25 matches.
+    assert planned[1]["SOFASCORE_SCOPE_MAX_MATCHES"] == str((4520 - 180) // 25)
+
+
+def _parts(planned):
+    return [
+        (
+            env["SOFASCORE_SCOPE_KEY"],
+            env.get("SOFASCORE_SCOPE_DEBT_ONLY") == "1",
+            int(env["SOFASCORE_SCOPE_MAX_MATCHES"]),
+        )
+        for env in planned
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_queue_one_urgent_match_does_not_carry_its_seasons_debt_ahead():
+    # Astra #1359 finding 3 and r3: SS-17/2627 has one open deadline and 999
+    # matches of debt.  Its urgent match keeps its place (nearest deadline
+    # first); its debt is a scope of its own after every urgent scope, and it
+    # fills the window.
+    planned = _window_plan([
+        (*_refresh_pending("SS-17", "2627", 1_000, 1_787_900_001), 1),
+        (*_refresh_pending("SS-8", "2627", 30, 1_787_900_002), 30),
+        (*_refresh_pending("SS-17", "2526", 50, 1_787_900_003), 50),
+    ])
+
+    # 7200 - (1 + 30 + 50) x 25 - 4 x 180 = 4455 s -> 178 matches of debt.
+    assert _parts(planned) == [
+        ("campaign-test:17:1726", False, 1),
+        ("campaign-test:8:826", False, 30),
+        ("campaign-test:17:1725", False, 50),
+        ("campaign-test:17:1726", True, 178),
+    ]
+    assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) > 7200 - 25
+    assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) <= 7200
+    urgent, debt = planned[0], planned[3]
+    # Two tasks of one scope: separate gateway plans and result files.
+    assert debt["SOFASCORE_SCOPE_RUN_ID"] == urgent["SOFASCORE_SCOPE_RUN_ID"] + "--debt"
+    assert debt["SOFASCORE_SCOPE_RESULT_PATH"] != urgent["SOFASCORE_SCOPE_RESULT_PATH"]
+    assert debt["SOFASCORE_SCOPE_OUTPUT_DIR"] != urgent["SOFASCORE_SCOPE_OUTPUT_DIR"]
+    assert "SOFASCORE_SCOPE_DEBT_ONLY" not in urgent
+
+
+@pytest.mark.unit
+def test_refresh_queue_debt_goes_biggest_first_after_every_open_deadline():
+    planned = _window_plan([
+        (*_refresh_pending("SS-8", "2627", 60, 1_787_900_001), 10),
+        (*_refresh_pending("SS-17", "2526", 90, None), 0),
+        (*_refresh_pending("SS-17", "2627", 101, 1_787_900_002), 1),
+    ])
+
+    # Tier 1: the open matches of both open seasons; tier 2: the debts,
+    # the biggest first — every debt that fits the window is taken.
+    assert _parts(planned) == [
+        ("campaign-test:8:826", False, 10),
+        ("campaign-test:17:1726", False, 1),
+        ("campaign-test:17:1726", True, 100),
+        ("campaign-test:17:1725", False, 90),
+        ("campaign-test:8:826", True, 50),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pending", [1, 10, 20, 25, 26, 100, 173, 243, 5_000])
+def test_refresh_scope_timeout_admits_every_allocation_at_its_estimate(pending):
+    """Astra #1358 r2: the planner's timeout and the runner's admission rule
+    agree — at the estimated speed no allocation of the scope is refused."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from utils import sofascore_all_mens_state as state
+
+    assert runner.ALLOCATION_OVERRUN_FACTOR == state.REFRESH_ALLOCATION_OVERRUN_FACTOR
+    assert runner.SCOPE_STOP_MARGIN_SECONDS == state.REFRESH_RUNNER_STOP_MARGIN_SECONDS
+    (env,) = _window_plan([_refresh_pending("SS-17", "2627", pending, 1_787_900_001)])
+    matches = int(env["SOFASCORE_SCOPE_MAX_MATCHES"])
+    timeout = int(env["SOFASCORE_SCOPE_TIMEOUT_S"])
+    assert timeout <= 2 * 3600
+    limits = runner._scope_capture_limits({
+        "SOFASCORE_SCOPE_DEADLINE_EPOCH": str(timeout),
+        "SOFASCORE_SCOPE_BYTE_CAP": env["SOFASCORE_SCOPE_BYTE_CAP"],
+        "SOFASCORE_SCOPE_MAX_MATCHES": env["SOFASCORE_SCOPE_MAX_MATCHES"],
+        "SOFASCORE_REFRESH_SECONDS_PER_MATCH": "25",
+    })
+    now, spent, left = state.REFRESH_SCOPE_OVERHEAD_SECONDS, 0, matches
+    while left:
+        batch = min(state.REFRESH_ALLOCATION_MATCHES, left)
+        assert runner._capture_stop_reason(limits, spent, batch, now=now) is None
+        now += batch * 25
+        spent += batch * state.REFRESH_BYTES_PER_MATCH
+        left -= batch

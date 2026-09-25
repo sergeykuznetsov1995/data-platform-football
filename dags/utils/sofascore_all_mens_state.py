@@ -56,6 +56,9 @@ UNKNOWN_RELEASE = "unknown"
 # #1358: only an upper bound on the number of scopes; the 2 h window decides
 # how many actually go (a small-scope queue must be able to fill it).
 DEFAULT_REFRESH_BATCH_SIZE = 64
+# #1359: ``deadline`` for every scheduled slot; ``backlog`` (manual conf) plans
+# only the seasons without an open deadline.
+REFRESH_QUEUE_MODES = frozenset({"deadline", "backlog"})
 DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
 # #1358: a refresh scope is sized by its own volume, not by the worst case of
 # the slowest one.  Measured match phase 20-25.09: 12-13 requests a minute,
@@ -68,10 +71,25 @@ REFRESH_SCOPE_OVERHEAD_SECONDS = 180
 REFRESH_MIN_SLICE_MATCHES = 20
 # One task never runs longer than this, whatever its estimate says.
 REFRESH_MAX_SCOPE_TIMEOUT_SECONDS = 2 * 3600
-# The runner stops taking allocations this long before its timeout, so the
-# timeout has to leave at least this much (plus a margin) over the estimate.
+# The runner stops taking allocations this long before its timeout, and an
+# allocation (``match_batch_25`` of the signed policy: up to 25 matches) may
+# start only if it fits at twice its estimate (``run_sofascore_scraper``:
+# ``SCOPE_STOP_MARGIN_SECONDS``, ``ALLOCATION_OVERRUN_FACTOR``).  The timeout
+# leaves that room over the estimate for the last allocation of the scope.
 REFRESH_RUNNER_STOP_MARGIN_SECONDS = 300
-REFRESH_MIN_TIMEOUT_HEADROOM_SECONDS = 600
+REFRESH_ALLOCATION_MATCHES = 25
+REFRESH_ALLOCATION_OVERRUN_FACTOR = 2
+
+
+def refresh_timeout_headroom(seconds_per_match: int) -> int:
+    """Seconds a scope's timeout keeps over its estimate (Astra #1358 r2)."""
+
+    return (
+        REFRESH_ALLOCATION_MATCHES
+        * seconds_per_match
+        * (REFRESH_ALLOCATION_OVERRUN_FACTOR - 1)
+        + REFRESH_RUNNER_STOP_MARGIN_SECONDS
+    )
 # Per-match byte ceiling of the SIGNED workload policy (``match_batch_25_*``:
 # ``hard_task_bytes`` 1 233 561 for 25 matches).  The policy file is signed and
 # is not edited here; the ceiling is derived from its own number.
@@ -609,13 +627,20 @@ def _scope_task_env(
     result_dir: str,
     workload_artifact: str,
     dag_run_id: str,
+    part: str = "",
 ) -> dict[str, str]:
-    """Environment of one scope-cycle task (history capture or refresh)."""
+    """Environment of one scope-cycle task (history capture or refresh).
+
+    ``part`` (#1359) tells apart a second task of the same scope in one
+    DagRun (the refresh lane's ``debt`` scope): its own plan, run id and
+    result files.
+    """
 
     season_id = int(season["source_season_id"])
     scope_key = campaign_scope_key(campaign_id, tournament_id, season_id)
+    suffix = f"--{part}" if part else ""
     safe_run = hashlib.sha256(
-        f"{dag_run_id}:{scope_key}".encode("utf-8")
+        f"{dag_run_id}:{scope_key}{':' + part if part else ''}".encode("utf-8")
     ).hexdigest()[:20]
     return {
         **lane_env,
@@ -635,7 +660,9 @@ def _scope_task_env(
         # The gateway ledger holds one immutable plan per run_id,
         # so scopes of one DagRun must not share it (batch > 1).
         # An Airflow retry keeps the same id and reuses the plan.
-        "SOFASCORE_SCOPE_RUN_ID": f"{dag_run_id}--{tournament_id}-{season_id}",
+        "SOFASCORE_SCOPE_RUN_ID": (
+            f"{dag_run_id}--{tournament_id}-{season_id}{suffix}"
+        ),
     }
 
 
@@ -658,20 +685,26 @@ def plan_refresh_batch(
     scope_budget_s: int | None = None,
     seconds_per_match: int = DEFAULT_REFRESH_SECONDS_PER_MATCH,
 ) -> list[dict[str, str]]:
-    """Select a timestamp-aware fresh or largest-backlog refresh batch.
+    """Select a deadline-ordered refresh batch (#1359).
 
     ``pending_partitions`` are ``(league, season, pending_matches,
-    newest_pending_start_timestamp)`` rows from Bronze: ``SS-<id>`` partitions
-    holding finished games that have no complete capture yet.  Each row is
+    min_open_deadline_ts[, open_deadline_matches])`` rows from Bronze:
+    ``SS-<id>`` partitions holding finished games that have no complete
+    capture yet, with the nearest deadline (match end + 24 h,
+    ``scrapers.sofascore.match_deadline``) that has not passed.  Each row is
     resolved against the snapshot (``capture_key`` -> tournament,
     ``canonical_season`` -> season); the
     configured leagues in ``exclude_tournament_ids`` belong to the daily
     ingest, an unknown partition or an excluded season is skipped with a log
     line (the scope cycle would refuse it anyway).  A pending season is
     accepted: the refresh lane runs the matches phase from Bronze evidence
-    without season pages.  ``fresh`` ranks the newest timestamp first, while
-    ``backlog`` ranks the largest unfinished partition first.  Both rank
-    behind the denominator's ``queue_priority`` (#1353): core before disputed
+    without season pages.  ``deadline`` plans the open-deadline matches first,
+    nearest deadline first, then the debt (matches whose deadline has passed)
+    biggest first in what is left of the window — a season with both runs its
+    debt as a second scope (``--debt``, ``SOFASCORE_SCOPE_DEBT_ONLY``) after
+    every urgent scope; ``backlog`` plans the debt of the seasons without an open
+    deadline alone.  Inside each tier the
+    denominator's ``queue_priority`` (#1353) ranks first: core before disputed
     buckets, and a ``0`` tournament (esoccer, student) is never planned.
 
     #1358: the batch holds as many scopes as their estimates fit into
@@ -704,8 +737,10 @@ def plan_refresh_batch(
         or batch_size < 1
     ):
         raise CampaignPlanningError("batch_size must be a positive integer")
-    if queue_mode not in {"fresh", "backlog"}:
-        raise CampaignPlanningError("queue_mode must be 'fresh' or 'backlog'")
+    if queue_mode not in REFRESH_QUEUE_MODES:
+        raise CampaignPlanningError(
+            "queue_mode must be one of " + ", ".join(sorted(REFRESH_QUEUE_MODES))
+        )
     snapshot_id = str(snapshot.get("snapshot_id") or "")
     if not snapshot_id or snapshot_id != _snapshot_digest(snapshot):
         raise CampaignPlanningError("campaign snapshot digest mismatch")
@@ -726,9 +761,13 @@ def plan_refresh_batch(
         ):
             index[(capture_key, canonical)] = (tournament_id, season)
     candidates: list[
-        tuple[str, str, int, int | None, int, Mapping[str, Any], int]
+        tuple[str, str, int, int | None, int, Mapping[str, Any], int, int]
     ] = []
-    for league, canonical, count, timestamp in pending_partitions:
+    for row in pending_partitions:
+        league, canonical, count, timestamp = row[:4]
+        # ``open_deadline_matches``; a 4-column row counts every pending match
+        # as open when it has a deadline.
+        open_count = row[4] if len(row) > 4 else None
         league = str(league)
         canonical = str(canonical)
         if league in configured_keys:
@@ -755,69 +794,121 @@ def plan_refresh_batch(
         priority = denominator.queue_priority(tournament_id)
         if priority == 0:
             continue
+        pending = max(1, int(count))
+        if normalized_timestamp is None:
+            open_matches = 0
+        elif isinstance(open_count, int) and not isinstance(open_count, bool):
+            open_matches = min(pending, max(1, open_count))
+        else:
+            open_matches = pending
         candidates.append(
             (
                 league,
                 canonical,
-                int(count),
+                pending,
                 normalized_timestamp,
                 tournament_id,
                 season,
                 priority,
+                open_matches,
             )
         )
-    if queue_mode == "fresh":
-        candidates.sort(
-            key=lambda item: (
-                item[6],
-                item[3] is None,
-                -(item[3] or 0),
-                -item[2],
-                item[0],
-                item[1],
-            )
-        )
-    else:
-        candidates.sort(key=lambda item: (item[6], -item[2], item[0], item[1]))
-    planned: list[dict[str, str]] = []
+    # #1359: tier 1 — the open-deadline matches of every season that has one,
+    # the nearest deadline first; tier 2 — the debt (matches whose deadline has
+    # passed), the biggest first, in what the window has left.  A season's debt
+    # never overtakes another season's open deadline — otherwise the
+    # esoccer-sized debt would eat every window again (Astra #1359, finding 3).
+    # The debt of a season that also has open deadlines is its own ``debt``
+    # scope in tier 2: the urgent part keeps its place, the debt still fills
+    # the window, and the debt of an always-active league cannot starve
+    # (Astra #1358/#1359 r3).
+    open_tier = sorted(
+        (item for item in candidates if item[3] is not None),
+        key=lambda item: (item[6], item[3], item[0], item[1]),
+    )
+    debt_tier = sorted(
+        (
+            item for item in candidates
+            if item[2] > item[7] and (queue_mode == "deadline" or item[3] is None)
+        ),
+        key=lambda item: (item[6], -(item[2] - item[7]), item[0], item[1]),
+    )
+    entries: list[tuple[tuple, str, int]] = []
+    opened: set[tuple[str, str]] = set()
     left = scope_budget_s
-    for position, (
-        league, canonical, count, _timestamp, tournament_id, season, _p
-    ) in enumerate(candidates):
-        if len(planned) == batch_size:
-            logger.warning(
-                "refresh batch cut at SOFASCORE_REFRESH_BATCH_SIZE=%s scopes; "
-                "%s more candidates wait for the next run (window left: %s s)",
-                batch_size,
-                len(candidates) - position,
-                left,
-            )
-            break
-        matches = max(1, int(count))
-        estimate = matches * seconds_per_match + REFRESH_SCOPE_OVERHEAD_SECONDS
-        if left is not None and estimate > left:
-            matches = (left - REFRESH_SCOPE_OVERHEAD_SECONDS) // seconds_per_match
-            if matches < REFRESH_MIN_SLICE_MATCHES:
-                logger.info(
-                    "refresh window closed at %s/%s: %s s left hold %s of its "
-                    "%s pending matches (< %s)",
-                    league, canonical, left, max(matches, 0), count,
-                    REFRESH_MIN_SLICE_MATCHES,
-                )
-                break
-            estimate = matches * seconds_per_match + REFRESH_SCOPE_OVERHEAD_SECONDS
+    closed = False
+    headroom = refresh_timeout_headroom(seconds_per_match)
+    # A scope whose estimate plus that headroom passes the 2 h task ceiling
+    # would have its last allocations refused by its own runner.
+    scope_capacity = max(
+        1,
+        (
+            REFRESH_MAX_SCOPE_TIMEOUT_SECONDS
+            - REFRESH_SCOPE_OVERHEAD_SECONDS
+            - headroom
+        ) // seconds_per_match,
+    )
+
+    def _fit(item: tuple, wanted: int) -> int | None:
+        """Matches of ``wanted`` that fit; ``None`` closes the batch."""
+
+        nonlocal left
+        overhead = REFRESH_SCOPE_OVERHEAD_SECONDS
+        if left is None:
+            return wanted
+        if wanted * seconds_per_match + overhead <= left:
+            left -= wanted * seconds_per_match + overhead
+            return wanted
+        fits = (left - overhead) // seconds_per_match
+        if fits < REFRESH_MIN_SLICE_MATCHES:
             logger.info(
-                "refresh scope %s/%s sliced to %s of %s pending matches",
-                league, canonical, matches, count,
+                "refresh window closed at %s/%s: %s s left hold %s of its "
+                "%s wanted matches (< %s)",
+                item[0], item[1], left, max(fits, 0), wanted,
+                REFRESH_MIN_SLICE_MATCHES,
             )
-        if left is not None:
-            left -= estimate
+            return None
+        logger.info(
+            "refresh scope %s/%s sliced to %s of %s wanted matches",
+            item[0], item[1], fits, wanted,
+        )
+        left -= fits * seconds_per_match + overhead
+        return fits
+
+    tiers = [("debt", debt_tier)] if queue_mode == "backlog" else [
+        ("open", open_tier), ("debt", debt_tier),
+    ]
+    for tier, items in tiers:
+        for position, item in enumerate(items):
+            if len(entries) == batch_size:
+                logger.warning(
+                    "refresh batch cut at SOFASCORE_REFRESH_BATCH_SIZE=%s "
+                    "scopes; %s more %s candidates wait for the next run "
+                    "(window left: %s s)",
+                    batch_size, len(items) - position, tier, left,
+                )
+                closed = True
+                break
+            key = (item[0], item[1])
+            wanted = item[7] if tier == "open" else item[2] - item[7]
+            fits = _fit(item, min(wanted, scope_capacity))
+            if fits is None:
+                closed = True
+                break
+            part = "debt" if tier == "debt" and key in opened else ""
+            if tier == "open":
+                opened.add(key)
+            entries.append((item, part, fits))
+        if closed:
+            break
+
+    planned: list[dict[str, str]] = []
+    for item, part, matches in entries:
+        _league, _canonical, _count, _ts, tournament_id, season, _p, _open = item
+        estimate = matches * seconds_per_match + REFRESH_SCOPE_OVERHEAD_SECONDS
         timeout = min(
             REFRESH_MAX_SCOPE_TIMEOUT_SECONDS,
-            max(
-                (estimate * 3 + 1) // 2,
-                estimate + REFRESH_MIN_TIMEOUT_HEADROOM_SECONDS,
-            ),
+            max((estimate * 3 + 1) // 2, estimate + headroom),
         )
         env = _scope_task_env(
             "refresh",
@@ -831,6 +922,7 @@ def plan_refresh_batch(
             result_dir=result_dir,
             workload_artifact=workload_artifact,
             dag_run_id=dag_run_id,
+            part=part,
         )
         env.update({
             "SOFASCORE_SCOPE_MAX_MATCHES": str(matches),
@@ -839,6 +931,10 @@ def plan_refresh_batch(
             "SOFASCORE_SCOPE_TIMEOUT_S": str(timeout),
             "SOFASCORE_REFRESH_SECONDS_PER_MATCH": str(seconds_per_match),
         })
+        if part == "debt":
+            # Its open-deadline matches belong to the season's urgent scope
+            # of this batch; this one takes only the passed deadlines.
+            env["SOFASCORE_SCOPE_DEBT_ONLY"] = "1"
         planned.append(env)
     return planned
 

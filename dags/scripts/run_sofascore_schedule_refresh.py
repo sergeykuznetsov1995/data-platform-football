@@ -143,6 +143,12 @@ MAX_INTERRUPTED_RUNS = 3
 # ``run_sofascore_scraper.py`` (Sol round 8, finding 2).  A NULL kick-off counts
 # as owed for the same reason it does there: only evidence buys a quiet zero,
 # and a NULL is the absence of evidence (Sol round 9, finding 3).
+# #1359: the "owed" status predicate, shared by ``KNOWN_PARTITIONS_SQL`` and
+# ``OVERDUE_STATUS_PARTITIONS_SQL`` — one definition of "a game the source still
+# has to play or report", so the two cannot drift apart.
+OWED_STATUS_SQL = (
+    "coalesce(status_type, 'unknown') NOT IN ('postponed', 'canceled')"
+)
 KNOWN_PARTITIONS_SQL = """
 SELECT league,
        CAST(season AS varchar) AS season,
@@ -150,14 +156,30 @@ SELECT league,
        count_if((start_timestamp IS NULL
                  OR start_timestamp
                     < to_unixtime(current_timestamp) - {grace} * 3600)
-                AND coalesce(status_type, 'unknown')
-                    NOT IN ('postponed', 'canceled')) AS owed
+                AND """ + OWED_STATUS_SQL + """) AS owed
 FROM iceberg.bronze.sofascore_schedule
 WHERE league LIKE 'SS-%'
 GROUP BY league, CAST(season AS varchar)
 """
 # How long after kick-off a match is expected to be over and on the tail page.
 PLAYED_GRACE_HOURS = 6
+# #1359: seasons holding a game that kicked off 6 h - 7 days ago and still has
+# no final status (not finished / postponed / canceled): their status is stale
+# in Bronze, and nothing re-reads it — the tail and fixture pages of these
+# seasons are read FIRST, as the ``overdue`` class, back to the oldest such
+# game (``oldest``: the chase does not stop at the newest finished one).
+OVERDUE_LOOKBACK_DAYS = 7
+OVERDUE_STATUS_PARTITIONS_SQL = """
+SELECT league, CAST(season AS varchar) AS season,
+       CAST(min(start_timestamp) AS bigint) AS oldest
+FROM iceberg.bronze.sofascore_schedule
+WHERE league LIKE 'SS-%'
+  AND start_timestamp >= to_unixtime(current_timestamp) - {days} * 86400
+  AND start_timestamp < to_unixtime(current_timestamp) - {grace} * 3600
+  AND coalesce(status_type, 'unknown') <> 'finished'
+  AND """ + OWED_STATUS_SQL + """
+GROUP BY league, CAST(season AS varchar)
+"""
 
 # Campaign partitions with a match around now: their results change today.
 # Kick-off lives in ``start_timestamp`` (epoch seconds as the source ships it);
@@ -257,7 +279,9 @@ def targets_digest(targets: Sequence[SeasonTarget]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-SWEEP_CLASSES = ("due", "stale", "seed")
+# ``overdue`` (#1359) is read first: a season whose kicked-off game still has no
+# final status.  Like ``stale`` it gets the tail visit and the fixture page.
+SWEEP_CLASSES = ("overdue", "due", "stale", "seed")
 
 
 def read_cursor(path: Path) -> dict[str, Optional[tuple[int, int]]]:
@@ -584,6 +608,20 @@ def bronze_partitions(
         for league, season in _trino_rows(DUE_PARTITIONS_SQL.format(hours=int(window_hours)))
     }
     return known, due, played
+
+
+def overdue_partitions() -> dict[tuple[str, str], Optional[int]]:
+    """Partitions with a kicked-off game that has no final status (#1359),
+    with the kick-off of the oldest such game."""
+
+    return {
+        (str(league), str(season)): int(oldest) if oldest is not None else None
+        for league, season, oldest in _trino_rows(
+            OVERDUE_STATUS_PARTITIONS_SQL.format(
+                days=OVERDUE_LOOKBACK_DAYS, grace=PLAYED_GRACE_HOURS
+            )
+        )
+    }
 
 
 def write_schedule_rows(rows: list[dict]) -> str:
@@ -914,6 +952,7 @@ def class_page_costs(chase_pages: int, seed_pages: int) -> dict[str, int]:
     """Worst-case pages ONE target of each class costs (see ``worst_case_pages``)."""
 
     return {
+        "overdue": chase_pages + 1,
         "due": chase_pages,
         "stale": chase_pages + 1,
         "seed": seed_pages + MAX_BACKTRACK_PAGES + 2,
@@ -932,7 +971,8 @@ def budget_class_limits(
 ) -> dict[str, int]:
     """#1358: slice limits of the classes cut to the run's page budget.
 
-    ``due`` takes its share first — every due season, bounded only by the
+    ``overdue`` (#1359) goes first — every season with a game whose status
+    is overdue; then ``due`` — every due season, bounded only by the
     emergency ``max_due`` and the budget; then ``seed`` (the resumed chains
     are part of its share, see ``main``); then ``stale`` from what is left.
     ``stale`` shrinks instead of blocking the start: the old fixed caps made
@@ -942,12 +982,20 @@ def budget_class_limits(
     costs = class_page_costs(chase_pages, seed_pages)
     left = int(page_budget)
     limits: dict[str, int] = {}
-    for name, cap in (("due", max_due), ("seed", max_seed), ("stale", max_stale)):
-        # ``due`` is exactly the due seasons of the run.  ``seed`` carries the
-        # resume queue, which ``members`` does not count, so its share is
-        # reserved whole up to ``max_seed``; ``stale`` keeps its rotation cap
-        # and gets what is left.
-        wanted = min(int(cap), int(members.get(name, 0))) if name == "due" else int(cap)
+    for name, cap in (
+        ("overdue", None), ("due", max_due), ("seed", max_seed), ("stale", max_stale),
+    ):
+        # ``overdue`` and ``due`` are exactly their members (``due`` under its
+        # emergency bound).  ``seed`` carries the resume queue, which
+        # ``members`` does not count, so its share is reserved whole up to
+        # ``max_seed``; ``stale`` keeps its rotation cap and gets what is left.
+        count = int(members.get(name, 0))
+        if name == "overdue":
+            wanted = count
+        elif name == "due":
+            wanted = min(int(cap), count)
+        else:
+            wanted = int(cap)
         limits[name] = max(0, min(wanted, left // costs[name]))
         left -= limits[name] * costs[name]
     return limits
@@ -988,6 +1036,7 @@ def sweep_predicates(
     known: set[tuple[str, str]],
     due: set[tuple[str, str]],
     pinned: Optional[set[tuple[int, int]]] = None,
+    overdue: Optional[set[tuple[str, str]]] = None,
 ) -> dict[str, Any]:
     """What makes a target a member of each class.
 
@@ -997,17 +1046,26 @@ def sweep_predicates(
     """
 
     held = pinned or set()
+    late = overdue or set()
     return {
+        "overdue": lambda target: (
+            target.partition in late and target.pair not in held
+        ),
         "due": lambda target: (
-            target.partition in due and target.pair not in held
+            target.partition in due
+            and target.partition not in late
+            and target.pair not in held
         ),
         "stale": lambda target: (
             target.partition not in due
+            and target.partition not in late
             and target.partition in known
             and target.pair not in held
         ),
         "seed": lambda target: (
-            target.partition not in due and target.partition not in known
+            target.partition not in due
+            and target.partition not in late
+            and target.partition not in known
         ),
     }
 
@@ -1021,6 +1079,8 @@ def plan_sweep(
     max_stale: int,
     max_seed: int,
     pinned: Optional[set[tuple[int, int]]] = None,
+    overdue: Optional[set[tuple[str, str]]] = None,
+    max_overdue: int = 0,
 ) -> tuple[
     dict[str, list[SeasonTarget]],
     dict[str, Optional[tuple[int, int]]],
@@ -1051,8 +1111,10 @@ def plan_sweep(
     carries on from the saved page (Sol round 6, finding 1).
     """
 
-    wanted = sweep_predicates(known, due, pinned)
-    limits = {"due": max_due, "stale": max_stale, "seed": max_seed}
+    wanted = sweep_predicates(known, due, pinned, overdue)
+    limits = {
+        "overdue": max_overdue, "due": max_due, "stale": max_stale, "seed": max_seed,
+    }
     plan: dict[str, list[SeasonTarget]] = {}
     next_cursors: dict[str, Optional[tuple[int, int]]] = {}
     members: dict[str, int] = {}
@@ -1115,6 +1177,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         idle_runs = read_idle_runs(cursor_path)
         interrupted_runs = read_interrupted_runs(cursor_path)
         known, due, played = bronze_partitions(args.window_hours)
+        overdue = overdue_partitions()
         # Seasons cut short by the page bound last run come first: Bronze
         # already knows their partition, so nothing else would pick them up.
         # The queue rotates on a cursor of its own — a head entry that keeps
@@ -1123,7 +1186,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         queued = [target for target in all_targets if target.pair in unfinished]
         # #1358: the slices are cut to the page budget — due first, then the
         # seed share (resume queue included), then stale from what is left.
-        wanted_now = sweep_predicates(set(known), due, set(unfinished))
+        wanted_now = sweep_predicates(set(known), due, set(unfinished), overdue)
         limits = budget_class_limits(
             {
                 name: sum(1 for target in all_targets if wanted_now[name](target))
@@ -1143,13 +1206,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             all_targets, set(known), due, cursors, limits["due"],
             limits["stale"], limits["seed"] - len(retry_targets),
             pinned=set(unfinished),
+            overdue=overdue,
+            max_overdue=limits["overdue"],
         )
         # The knobs are read from the environment, so an override can ask for
         # more pages than the byte cap admits.  Refuse before a single paid
         # request instead of dying fail-closed with the sweep half done.
+        # ``overdue`` costs what ``stale`` does (tail visit + fixture page).
         knobs = (
-            limits["due"], limits["stale"], limits["seed"], args.chase_pages,
-            args.seed_pages,
+            limits["due"], limits["stale"] + limits["overdue"], limits["seed"],
+            args.chase_pages, args.seed_pages,
         )
         budget_cap_bytes = args.budget_cap_bytes or derive_budget_cap(
             *knobs, args.per_lease_max_bytes
@@ -1189,16 +1255,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # whole chain is new, and the seed bound is what stops it.
         chase_before = {
             target.pair: known[target.partition]
-            for target in plan["due"] + plan["stale"]
+            for target in plan["overdue"] + plan["due"] + plan["stale"]
             if known.get(target.partition) is not None
         }
+        # An overdue season is chased back past its oldest stuck game, not
+        # only to its newest finished one: the stuck game may sit pages
+        # deeper (Astra #1359 r3, finding 2).
+        for target in plan["overdue"]:
+            oldest = overdue.get(target.partition)
+            if oldest is not None:
+                chase_before[target.pair] = min(
+                    chase_before.get(target.pair, oldest - 1), oldest - 1
+                )
         # Bronze speaks (league, canonical season); the source — and therefore
         # the fetcher — speaks (tournament id, season id).  Handing the fetcher
         # the Bronze keys made every membership test false, so the absence check
         # silently had an empty denominator (Sol round 8, finding 1).
         owed_pages = {
             target.pair
-            for target in plan["due"] + plan["stale"]
+            for target in plan["overdue"] + plan["due"] + plan["stale"]
             if target.partition in played
         }
         report.update(
@@ -1207,6 +1282,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "targets_total": len(all_targets),
                 "known_partitions": len(known),
                 "due_partitions": len(due),
+                "overdue_partitions": len(overdue),
+                "overdue_targets": len(plan["overdue"]),
                 "due_targets": len(plan["due"]),
                 "stale_targets": len(plan["stale"]),
                 "seed_targets": len(plan["seed"]),
@@ -1218,6 +1295,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # round 13, finding 3).
                 "class_members": members,
                 "class_limits": {
+                    "overdue": limits["overdue"],
                     "due": limits["due"],
                     "stale": limits["stale"],
                     "seed": limits["seed"] - len(retry_targets),
@@ -1409,7 +1487,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # cut short — and the byte accounting of this run is already in
             # doubt, which is exactly why the sweep stops.  Paying for more
             # pages of a slice we could not read is waste.
-            if name in ("stale", "seed") and tail_walked:
+            if name in ("overdue", "stale", "seed") and tail_walked:
                 # The seasons Bronze has never seen, and the ones it has not
                 # looked at for a while, also get their FIXTURE page: without a
                 # future match in Bronze the ``due`` window can never open for

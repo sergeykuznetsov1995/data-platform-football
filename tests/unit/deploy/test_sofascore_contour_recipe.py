@@ -37,7 +37,11 @@ SCRIPTS = (
     DEPLOY / "postdeploy_checks.sh",
     DEPLOY / "auto_deliver.sh",
 )
-MINI_DAGS = ("dag_trigger_sofascore_daily.py", "dag_sofascore_manifest_maintenance.py")
+MINI_DAGS = (
+    "dag_trigger_sofascore_daily.py",
+    "dag_trigger_sofascore_daily_tail.py",
+    "dag_sofascore_manifest_maintenance.py",
+)
 
 # Три полосы источника (#1244): свой шлюз, свой дневной потолок, свой слот аренды,
 # свой каталог состояния. До развода все три ходили через sofascore_gw_951 и давали
