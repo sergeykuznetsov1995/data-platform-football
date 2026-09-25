@@ -211,7 +211,7 @@ def test_real_day_scoreboard_yields_every_event_of_the_day() -> None:
 )
 def test_real_core_list_page_shape(name: str, count: int, ref_prefix: str) -> None:
     # Contract for #1499/#1501: one page carries the whole list as $ref links.
-    # A body with pageCount > 1 has not been recorded yet (#1501).
+    # Lists longer than one page: test_espn_core_lists.py (eng.fa, pageCount 9).
     page = _json(name)
 
     assert page["count"] == count == len(page["items"])

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 from scrapers.espn.classify import classify
+from scrapers.espn.core_lists import parse_ref_page
 from scrapers.espn.denominator import Denominator, DenominatorRow
 from scrapers.espn.discovery import CompetitionDetail
 from scrapers.espn.parser_common import EspnParseError
@@ -32,25 +33,16 @@ def parse_core_league_refs(payload: Mapping[str, Any]) -> list[str]:
 
     if not isinstance(payload, Mapping):
         raise EspnParseError("core leagues list must be an object")
-    items = payload.get("items")
-    if not isinstance(items, list):
-        raise EspnParseError("core leagues list has no items array")
-    if payload.get("pageCount") != 1:
+    page = parse_ref_page(payload, "core leagues list")
+    if page.page_count != 1:
         raise EspnParseError(
-            f"core leagues list must be one page, got pageCount="
-            f"{payload.get('pageCount')!r}"
-        )
-    if payload.get("count") != len(items):
-        raise EspnParseError(
-            f"core leagues list count={payload.get('count')!r} "
-            f"differs from {len(items)} items"
+            f"core leagues list must be one page, got pageCount={page.page_count!r}"
         )
     slugs: list[str] = []
-    for item in items:
-        ref = item.get("$ref") if isinstance(item, Mapping) else None
-        match = _REF_SLUG_RE.search(ref) if isinstance(ref, str) else None
+    for ref in page.refs:
+        match = _REF_SLUG_RE.search(ref)
         if match is None:
-            raise EspnParseError(f"core leagues item has no league $ref: {item!r}")
+            raise EspnParseError(f"core leagues item has no league $ref: {ref!r}")
         slugs.append(match.group(1))
     if len(set(slugs)) != len(slugs):
         raise EspnParseError("core leagues list repeats a slug")

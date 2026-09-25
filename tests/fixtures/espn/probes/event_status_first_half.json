@@ -1,0 +1,1 @@
+{"$ref":"http://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.nations/events/401861047/competitions/401861047/status?lang=en&region=us","clock":1080.0,"addedClock":0.0,"displayClock":"18'","period":1,"type":{"id":"25","name":"STATUS_FIRST_HALF","state":"in","completed":false,"description":"First Half","detail":"18'","shortDetail":"18'"}}
