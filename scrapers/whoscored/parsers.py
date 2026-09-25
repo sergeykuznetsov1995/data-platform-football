@@ -1521,6 +1521,7 @@ def _parse_match_stats(
             if not present_blocks:
                 continue
             blocks_present = True
+            entity_fingerprint = schema_fingerprint(entity)
             player_id = (
                 _required_int(
                     entity.get("playerId"), f"players[{entity_index}].playerId"
@@ -1558,7 +1559,7 @@ def _parse_match_stats(
                             # The entity object is shared by every flattened
                             # stat leaf. Keep its shape for drift detection;
                             # the complete document remains in raw storage.
-                            "source_schema_fingerprint": schema_fingerprint(entity),
+                            "source_schema_fingerprint": entity_fingerprint,
                         }
                     )
     if not rows and not blocks_present:
