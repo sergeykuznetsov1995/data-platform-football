@@ -77,7 +77,7 @@ _RESET_KEYS = {
     "double_reset_window_seconds",
     "double_reset_hold_seconds",
 }
-_LANE_KEYS = {"daily_requests", "daily_bytes"}
+_LANE_KEYS = {"daily_requests"}
 
 
 @dataclass(frozen=True)
@@ -438,10 +438,9 @@ class TransportGate:
             raise LaneClosed("ESPN history lane is frozen")
         caps = self.policy.lanes[self.lane]
         daily = self._daily(state)
-        if (
-            daily["requests"] >= caps["daily_requests"]
-            or daily["bytes"] >= caps["daily_bytes"]
-        ):
+        # Daily request fuse per lane (R-44); bytes are counted, never capped
+        # (roadmap assumption 4: no daily MB ceilings).
+        if daily["requests"] >= caps["daily_requests"]:
             raise DailyCapExceeded(f"ESPN {self.lane} lane daily cap reached")
         self._pick_origin(state, cluster, now, claim=False)
         if state["next_permit_at"] > now:

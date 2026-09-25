@@ -93,7 +93,7 @@ outside (0, 1) or missing lanes fail closed.
 | `all_blocked_pause_seconds`, `all_blocked_probe_seconds` | no open origin in a cluster: 30 min pause, then one probe every 5 min; `history` freezes first and reopens last |
 | `steps` | pace ladder S0…S3, requests per minute; the ceiling is `ESPN_GATE_STEP_CEILING` (default 0 = S0; raising it is #1510) |
 | `live_share` | share of each minute reserved for `live`: `history` is admitted only while its permits of the last minute stay below `1 - live_share` of the step |
-| `lanes` | per-lane daily fuses (`daily_requests`, `daily_bytes`), set above the S3 maximum; UTC date |
+| `lanes` | per-lane daily request fuse (`daily_requests`), set above the S3 maximum; UTC date. Bytes are counted per lane (state `daily`) but never capped: no daily MB ceilings (roadmap assumption 4) |
 | `reset` | auto-reset: a 429, ≥ 3 × 403 in 60 s, or 5xx+timeouts > 2 % of ≥ 50 requests in 5 min → one step down, 15 min cooldown with `history` frozen, then back to the ceiling; two resets within an hour → S0 for 6 h and an `alert` in the state file |
 | `uncompressed_warn_bytes` | an `identity` response larger than this is logged as a warning |
 

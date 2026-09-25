@@ -17,8 +17,8 @@
   "steps": [60, 120, 240, 360],
   "live_share": 0.5,
   "lanes": {
-    "live": {"daily_requests": 259200, "daily_bytes": 17179869184},
-    "history": {"daily_requests": 518400, "daily_bytes": 34359738368}
+    "live": {"daily_requests": 259200},
+    "history": {"daily_requests": 518400}
   },
   "reset": {
     "http403_count": 3,

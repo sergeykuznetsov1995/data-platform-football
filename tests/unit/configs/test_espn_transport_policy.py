@@ -24,6 +24,7 @@ def test_policy_file_parses_with_s0_ladder_and_half_for_live():
     assert policy.steps == (60, 120, 240, 360)
     assert policy.live_share == 0.5
     assert set(policy.lanes) == {"live", "history"}
+    assert all(set(spec) == {"daily_requests"} for spec in policy.lanes.values())
     assert policy.reset["cooldown_seconds"] == 900
     assert policy.uncompressed_warn_bytes == 102400
 
@@ -54,6 +55,7 @@ def _mutated(path, value):
         (("lanes",), {}),
         (("lanes", "history"), KeyError),
         (("lanes", "live", "daily_requests"), 0),
+        (("lanes", "live", "daily_bytes"), 10**9),
         (("reset", "error_share"), 2),
         (("reset", "cooldown_seconds"), KeyError),
         (("clusters", "site", "primary"), "http://site.web.api.espn.com"),

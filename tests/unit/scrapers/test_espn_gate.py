@@ -211,8 +211,8 @@ def test_history_gets_at_most_half_of_the_minute_live_always_when_tokens(tmp_pat
 def test_daily_lane_cap_and_utc_date_rollover(tmp_path):
     raw = load_transport_policy()
     lanes = {
-        "live": {"daily_requests": 2, "daily_bytes": 10**9},
-        "history": {"daily_requests": 5, "daily_bytes": 100},
+        "live": {"daily_requests": 2},
+        "history": {"daily_requests": 5},
     }
     policy = type(raw)(**{**raw.__dict__, "lanes": lanes})
     clock = Clock(datetime(2026, 9, 25, 23, 59, 0, tzinfo=timezone.utc))
@@ -222,8 +222,10 @@ def test_daily_lane_cap_and_utc_date_rollover(tmp_path):
     with pytest.raises(DailyCapExceeded):
         live.acquire("site")
     history = _gate(tmp_path, clock, lane="history", policy=policy)
-    history.report(history.acquire("site"), status=200, direct_bytes=100)
-    with pytest.raises(DailyCapExceeded):  # byte cap of the lane
+    for _ in range(5):  # bytes are counted, never capped
+        history.report(history.acquire("site"), status=200, direct_bytes=10**12)
+    assert history.snapshot()["daily"]["history"]["bytes"] == 5 * 10**12
+    with pytest.raises(DailyCapExceeded):  # request fuse of the lane
         history.acquire("site")
     clock.advance(120)  # new UTC date
     assert live.acquire("site").origin == WEB
