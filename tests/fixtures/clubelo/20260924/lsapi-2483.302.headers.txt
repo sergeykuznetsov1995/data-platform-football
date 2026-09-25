@@ -1,0 +1,16 @@
+HTTP/2 302 
+date: Thu, 24 Sep 2026 18:43:32 GMT
+content-type: text/html; charset=utf-8
+server: cloudflare
+location: /
+x-frame-options: ALLOWALL
+vary: Cookie
+x-content-type-options: nosniff
+referrer-policy: same-origin
+cross-origin-opener-policy: same-origin
+x-do-app-origin: 07980161-a7e1-4b3b-a20f-3c3ce4e2e5b9
+cache-control: private
+x-do-orig-status: 302
+cf-cache-status: BYPASS
+cf-ray: a403ef6f3fa062f2-HAM
+alt-svc: h3=":443"; ma=86400

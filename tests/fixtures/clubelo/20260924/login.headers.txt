@@ -1,0 +1,17 @@
+HTTP/2 200 
+date: Thu, 24 Sep 2026 19:18:57 GMT
+content-type: text/html; charset=utf-8
+server: cloudflare
+expires: Thu, 24 Sep 2026 19:18:57 GMT
+cache-control: max-age=0, no-cache, no-store, must-revalidate, private
+vary: Cookie
+x-frame-options: ALLOWALL
+x-content-type-options: nosniff
+referrer-policy: same-origin
+cross-origin-opener-policy: same-origin
+x-do-app-origin: 07980161-a7e1-4b3b-a20f-3c3ce4e2e5b9
+x-do-orig-status: 200
+cf-cache-status: BYPASS
+content-encoding: gzip
+cf-ray: a404234f3dd9d2ae-FRA
+alt-svc: h3=":443"; ma=86400

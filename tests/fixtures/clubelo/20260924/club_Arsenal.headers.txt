@@ -1,0 +1,27 @@
+HTTP/1.1 301 Moved Permanently
+Date: Thu, 24 Sep 2026 15:25:28 GMT
+Content-Type: text/html; charset=UTF-8
+Transfer-Encoding: chunked
+Connection: keep-alive
+Location: https://clubelo.com/Arsenal
+Server: cloudflare
+CF-RAY: a402cd4b0a8262fb-HAM
+alt-svc: h3=":443"; ma=86400
+
+HTTP/2 200 
+date: Thu, 24 Sep 2026 15:25:28 GMT
+content-type: text/html; charset=utf-8
+server: cloudflare
+vary: Accept-Encoding, Cookie
+cache-control: public, max-age=10
+x-frame-options: ALLOWALL
+x-content-type-options: nosniff
+referrer-policy: same-origin
+cross-origin-opener-policy: same-origin
+last-modified: Thu, 24 Sep 2026 15:25:28 GMT
+x-do-app-origin: 07980161-a7e1-4b3b-a20f-3c3ce4e2e5b9
+x-do-orig-status: 200
+cf-cache-status: EXPIRED
+content-encoding: br
+cf-ray: a402cd4b8f20dba3-FRA
+alt-svc: h3=":443"; ma=86400
