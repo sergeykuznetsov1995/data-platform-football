@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_history_manifest
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_history_manifest
+  description: |
+    Журнал ветки истории ClubElo (#1462): одна строка на попытку снять страницу
+    клуба. Очередь — slug со ссылкой в таблицах стран сегодняшней /Ranking (M-05);
+    следующий прогон берёт slug, чья ПОСЛЕДНЯЯ строка не done/no_page. «История
+    закрыта»: done + no_page покрывают все slug со ссылкой на дату закрытия (R-45,
+    R-60). Append-only, без партиций.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: slug
+    description: Slug клуба.
+  - name: status
+    description: "done — страница снята и разобрана; no_page — ответ 3xx (страницы нет); failed — сеть/5xx после ретраев, иной HTTP-статус или LayoutChanged."
+  - name: http_status
+    description: HTTP-статус последней попытки; NULL при сетевой ошибке.
+  - name: error
+    description: Причина failed / адрес редиректа для no_page.
+  - name: points
+    description: Число точек vegaJson (для done).
+  - name: first_point
+    description: Дата первой точки графика (для done).
+  - name: last_point
+    description: Дата последней точки графика (для done).
+  - name: matches
+    description: Число строк таблицы матчей (для done).
+  - name: fetched_at
+    description: Момент попытки (UTC).
+  - name: captured_rating_date
+    description: Дата рейтинга из h1 страницы клуба.
+  - name: rating_date
+    description: Дата рейтинга из h1 /Ranking этого прогона (отличие от captured_rating_date — счётчик date_mismatch, M-09).
+  - name: club_name
+    description: Название клуба из h1 страницы.
+  - name: elo
+    description: "Текущий Elo из шапки страницы («Elo: N»)."
+  - name: elo_best
+    description: "Лучший Elo из шапки («Best: N»)."
+  - name: elo_best_reached_on
+    description: Дата лучшего Elo из шапки («reached on YYYY-MM-DD»).
+  - name: golo
+    description: Текущий Golo из шапки.
+  - name: model_version
+    description: Версия модели Elo; всегда 'web-2026' — новый сайт пересчитал историю, с архивом 'api-legacy' без пометки не склеивать (R-17).
+  - name: _source
+    description: Источник данных ('clubelo_html'); метаколонка Bronze.
+  - name: _ingested_at
+    description: Момент записи строки в Bronze (UTC), не дата данных; метаколонка.
+  - name: _batch_id
+    description: Идентификатор прогона истории ('clubelo-history-<UTC>-<hex>'); метаколонка.

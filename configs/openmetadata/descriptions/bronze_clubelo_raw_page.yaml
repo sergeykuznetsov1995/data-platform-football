@@ -1,0 +1,45 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_raw_page
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_raw_page
+  description: |
+    Сырые страницы clubelo.com (raw-first, #1462): каждая скачанная страница
+    (/Ranking и /{slug} клубов ветки истории) — gzip-байтами в body до разбора,
+    чтобы после смены вёрстки перепарсить тот же день (R-54). Пишет
+    scrapers/clubelo/history.py (dag_ingest_clubelo, ручной run_history=true).
+    Append-only, без партиций; replace/merge/optimize не применяются.
+    Grain — одна строка на ответ 200; 302 (клуб без страницы) сюда не пишется.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: rating_date
+    description: Дата рейтинга сайта из h1 самой страницы (<h1><a href="/<date>/…">); NULL, если h1 не найден.
+  - name: page
+    description: Путь запроса ('/Ranking', '/<slug>').
+  - name: http_status
+    description: HTTP-статус ответа (сохраняются только 200).
+  - name: fetched_at
+    description: Момент получения ответа (UTC).
+  - name: sha256
+    description: sha256 распакованного тела страницы (не gzip-потока — он может отличаться при том же теле).
+  - name: wire_bytes
+    description: Байты по проводу (сжатые, как прислал сервер) — мера трафика «минимум МБ».
+  - name: identity_bytes
+    description: Размер распакованного тела, байт.
+  - name: content_encoding
+    description: Content-Encoding ответа ('gzip' или 'identity').
+  - name: gzip_by
+    description: "'wire' — body это байты сервера как есть; 'us' — сервер прислал без сжатия, сжали мы."
+  - name: body
+    description: gzip-байты страницы (varbinary).
+  - name: model_version
+    description: Версия модели Elo; всегда 'web-2026' — новый сайт пересчитал историю, с архивом 'api-legacy' без пометки не склеивать (R-17).
+  - name: _source
+    description: Источник данных ('clubelo_html'); метаколонка Bronze.
+  - name: _ingested_at
+    description: Момент записи строки в Bronze (UTC), не дата данных; метаколонка.
+  - name: _batch_id
+    description: Идентификатор прогона истории ('clubelo-history-<UTC>-<hex>'); метаколонка.
