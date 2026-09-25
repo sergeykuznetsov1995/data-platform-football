@@ -86,6 +86,8 @@ class MatchPayload:
     first_published_at: datetime | None = None
     # When the status of this payload was read; ``raw.fetched_at`` if None.
     status_checked_at: datetime | None = None
+    # Set by the recheck (#1506) and carried from the stored row afterwards.
+    rechecked_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.presence is not None:
@@ -129,6 +131,27 @@ def _sides(summary: SummaryParseResult) -> dict[str, MatchsheetRow]:
     return {row.home_away: row for row in summary.matchsheet}
 
 
+def schedule_shootout(schedule: ScheduleRow) -> tuple[int | None, int | None]:
+    """Home and away shootout score of a day row (``extra_json`` keeps the
+    scoreboard ``competitor.shootoutScore``); None where the day has none."""
+
+    try:
+        sides = json.loads(schedule.extra_json).get("sides") or {}
+    except (ValueError, AttributeError):
+        return None, None
+
+    def score(side: str) -> int | None:
+        node = sides.get(side) if isinstance(sides, dict) else None
+        competitor = node.get("competitor") if isinstance(node, dict) else None
+        value = competitor.get("shootoutScore") if isinstance(competitor, dict) else None
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return score("home"), score("away")
+
+
 def match_row(
     schedule: ScheduleRow,
     summary: SummaryParseResult | None,
@@ -138,6 +161,7 @@ def match_row(
     presence: str | None = None,
     first_published_at: datetime | None = None,
     status_checked_at: datetime | None = None,
+    rechecked_at: datetime | None = None,
 ) -> dict[str, Any]:
     played = schedule.played_final
     sides = _sides(summary) if summary is not None else {}
@@ -183,6 +207,15 @@ def match_row(
         and team_stats_state in PUBLISHED_STATES
     ):
         first_published_at = stamp.ingested_at
+    # A shootout the day lists wins over the Summary: a shootout change is a
+    # reason to write the match again (#1506), so the row must take it.
+    day_shootout = schedule_shootout(schedule) if played else (None, None)
+    home_shootout = (
+        day_shootout[0] if day_shootout[0] is not None else side(home, "shootout_score")
+    )
+    away_shootout = (
+        day_shootout[1] if day_shootout[1] is not None else side(away, "shootout_score")
+    )
 
     return {
         **_scope(schedule),
@@ -205,8 +238,8 @@ def match_row(
         "away_score_h2": side(away, "score_h2"),
         "home_score_et": side(home, "score_et"),
         "away_score_et": side(away, "score_et"),
-        "home_shootout": side(home, "shootout_score"),
-        "away_shootout": side(away, "shootout_score"),
+        "home_shootout": home_shootout,
+        "away_shootout": away_shootout,
         "home_aggregate": side(home, "aggregate_score"),
         "away_aggregate": side(away, "aggregate_score"),
         "leg": leg,
@@ -227,7 +260,7 @@ def match_row(
         "duplicate_of": schedule.duplicate_of,
         "parse_state": schedule.parse_state.value,
         "first_fetched_at": first_fetched_at,
-        "rechecked_at": None,
+        "rechecked_at": _utc(rechecked_at),
         "first_published_at": _utc(first_published_at),
         "status_checked_at": _utc(
             status_checked_at if status_checked_at is not None else raw.fetched_at
@@ -428,6 +461,7 @@ def batch_rows(
                 presence=payload.presence,
                 first_published_at=payload.first_published_at,
                 status_checked_at=payload.status_checked_at,
+                rechecked_at=payload.rechecked_at,
             )
         )
         tables[LINEUP_TABLE].extend(lineup_rows(*args, **kwargs))
@@ -448,5 +482,6 @@ __all__ = (
     "event_rows",
     "lineup_rows",
     "match_row",
+    "schedule_shootout",
     "team_stats_rows",
 )

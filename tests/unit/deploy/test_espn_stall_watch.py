@@ -1,5 +1,6 @@
 """Сторож простоя ESPN (#1496): «DAG на паузе → тревога», «36 ч без новых матчей → тревога»;
-#1505: «турнир красный 3 волны подряд → тревога» по журналу волн.
+#1505: «турнир красный 3 волны подряд → тревога» по журналу волн;
+#1506: «downgrade_rejected за 24 ч → тревога раз в сутки» по журналу перепроверок.
 
 Заглушки не отвечают на всё одинаково: SQL сторожа ИСПОЛНЯЕТСЯ — запрос к метабазе в sqlite
 над записанной таблицей `dag` (формат `psql -At`: `dag_id|t`), запрос к Trino в duckdb над
@@ -69,6 +70,8 @@ class World:
         }
         # Журнал волн (#1505): None — таблицы ещё нет (до #1507).
         self.wave_log: list[tuple] | None = None
+        # Журнал перепроверок (#1506): None — таблицы ещё нет (до #1507).
+        self.recheck_log: list[tuple] | None = None
         self.sent: list[str] = []
         self.gh_calls: list[list[str]] = []
         self.open_issues: list[dict] = []
@@ -99,8 +102,15 @@ class World:
                 # _ingested_at врёт (= execution_date) и всегда «свежее» — сторож не должен его читать
                 con.execute(f"INSERT INTO iceberg.bronze.{table} VALUES (?, ?, ?)",
                             [event_id, fetched, _ts(NOW)])
-        if self.wave_log is not None:
+        if self.wave_log is not None or self.recheck_log is not None:
             con.execute("CREATE SCHEMA iceberg.ops")
+        if self.recheck_log is not None:
+            con.execute("CREATE TABLE iceberg.ops.espn_recheck_v1 (checked_at TIMESTAMP, "
+                        "run_id VARCHAR, slug VARCHAR, season_year INTEGER, event_id BIGINT, "
+                        "kind VARCHAR, before_parts VARCHAR, after_parts VARCHAR, outcome VARCHAR)")
+            con.executemany("INSERT INTO iceberg.ops.espn_recheck_v1 VALUES "
+                            "(?, 'r', ?, 2026, ?, 'recheck', '{}', '{}', ?)", self.recheck_log)
+        if self.wave_log is not None:
             con.execute("CREATE TABLE iceberg.ops.espn_wave_tournament_v1 (run_id VARCHAR, "
                         "wave_started_at TIMESTAMP, wave_finished_at TIMESTAMP, slug VARCHAR, "
                         "season_year INTEGER, state VARCHAR, matches INTEGER, first_error VARCHAR)")
@@ -443,3 +453,50 @@ def test_one_red_season_makes_the_tournament_red_in_any_row_order(world, tmp_pat
     _run(tmp_path, NOW + timedelta(minutes=15))
     assert world.sent == ["🔴 ESPN: турнир eng.1 красный 3 волны подряд (последняя "
                           "2026-09-24 20:00 UTC): E: old. #1505"]
+
+
+# 4. #1506: «downgrade_rejected за 24 ч → тревога раз в сутки, без issue»
+
+def test_no_recheck_log_is_silently_skipped(world, tmp_path, capsys):
+    _quiet(world)
+    state = _run(tmp_path, NOW)
+    assert world.sent == [] and state["episodes"] == {}
+    assert "downgrade=no_recheck_log" in capsys.readouterr().out
+
+
+def test_downgrade_alerts_once_a_day_with_leagues_then_clears(world, tmp_path):
+    _quiet(world)
+    world.recheck_log = [
+        (_ts(NOW - timedelta(hours=3)), "bra.copa_do_brazil", 401866354, "downgrade_rejected"),
+        (_ts(NOW - timedelta(hours=2)), "bra.copa_do_brazil", 401866355, "downgrade_rejected"),
+        (_ts(NOW - timedelta(hours=1)), "eng.1", 578281, "downgrade_rejected"),
+        (_ts(NOW - timedelta(hours=1)), "eng.1", 578282, "filled"),
+        # Older than 24 h: outside.
+        (_ts(NOW - timedelta(hours=30)), "ger.2", 456996, "downgrade_rejected"),
+    ]
+    state = _run(tmp_path, NOW)
+    assert world.sent == ["🟠 ESPN: downgrade_rejected за 24 ч — 3 (ESPN прислал беднее, "
+                          "оставлено старое): bra.copa_do_brazil 2, eng.1 1. #1506"]
+    assert set(state["episodes"]) == {"downgrade"}
+
+    world.sent.clear()
+    _run(tmp_path, NOW + timedelta(minutes=15))
+    _run(tmp_path, NOW + timedelta(hours=6))
+    assert world.sent == []   # одно сообщение в сутки
+    world.recheck_log.append((_ts(NOW + timedelta(hours=23)), "eng.1", 578283, "downgrade_rejected"))
+    _run(tmp_path, NOW + timedelta(hours=24))
+    assert len(world.sent) == 1
+    assert world.sent[0].startswith("⏳ ESPN: продолжается (24 ч) — 🟠 ESPN: downgrade_rejected")
+    assert world.gh_calls == []   # без issue даже после суток
+
+    world.sent.clear()
+    state = _run(tmp_path, NOW + timedelta(hours=48))
+    assert world.sent == ["✅ ESPN: отбой — downgrade_rejected за 24 ч (эпизод с 2026-09-24T20:00Z)"]
+    assert state["episodes"] == {}
+
+
+def test_empty_recheck_log_is_quiet(world, tmp_path):
+    _quiet(world)
+    world.recheck_log = [(_ts(NOW - timedelta(hours=1)), "eng.1", 1, "same")]
+    state = _run(tmp_path, NOW)
+    assert world.sent == [] and state["episodes"] == {}
