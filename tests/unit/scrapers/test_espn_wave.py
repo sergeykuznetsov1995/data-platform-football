@@ -1,0 +1,550 @@
+"""Current-data waves of the ESPN contour (#1504).
+
+Acceptance of #1504 on recorded answers: a wave of three tournaments publishes
+two of them while the third fails; a match that leaves its day is withdrawn or
+moved, never an accident.  Day bodies are assembled from the headers of
+recorded Summary bodies (probes of 24.09, ``tests/fixtures/espn/probes/``)
+moved onto the wave days; the Summary bodies themselves are the recorded ones.
+No network, no Trino: a fake client serves bodies by address and the
+in-memory Trino of the #1503 writer test also answers the wave's reads.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import json
+import math
+import re
+from types import SimpleNamespace
+from urllib.parse import urlencode
+
+import pytest
+
+from scrapers.espn import editions_store, urls, wave
+from scrapers.espn.denominator import load_denominator
+from scrapers.espn.editions import EditionState
+from scrapers.espn.raw_store import RawTargetNotFound
+from scrapers.espn.transport_contracts import HttpStatusError
+from tests.unit.scrapers.test_espn_bronze_writer import FakeTrino
+from tests.unit.scrapers.test_espn_probes import PROBES
+
+NOW = datetime(2026, 9, 25, 13, 0, tzinfo=timezone.utc)
+YESTERDAY, TODAY = date(2026, 9, 24), date(2026, 9, 25)
+SLUGS = ("eng.1", "ger.2", "uefa.champions")
+SUMMARIES = {
+    "eng.1": "summary_eng1_2020.json",
+    "ger.2": "summary_ger2_2016.json",
+    "uefa.champions": "summary_ucl_2010.json",
+}
+
+
+def _key(url: str, params) -> str:
+    return f"{url}?{urlencode(list((params or {}).items()))}"
+
+
+def _req_key(request: urls.EspnRequest) -> str:
+    return _key(request.url, request.params)
+
+
+class FakeClient:
+    """``EspnHttpClient`` surface the wave uses; bodies are served by address."""
+
+    def __init__(self, responses: dict[str, bytes | Exception]) -> None:
+        self.responses = responses
+        self.stored: dict[str, bytes] = {}
+        self.calls: list[tuple[str, bool]] = []
+        self.replays: list[str] = []
+        self.flushes = 0
+        self.ledger = ()
+
+    def _result(self, body: bytes, *, cache_hit: bool):
+        sha = hashlib.sha256(body).hexdigest()
+        return SimpleNamespace(
+            json_data=json.loads(body),
+            body=body,
+            raw_uri=f"raw://{sha[:12]}",
+            content_hash=sha,
+            fetched_at="2026-09-25T13:00:00+00:00",
+            cache_hit=cache_hit,
+        )
+
+    def fetch_json(self, url, endpoint, params=None, *, force_refresh=False):
+        key = _key(url, params)
+        self.calls.append((key, force_refresh))
+        if not force_refresh and key in self.stored:
+            return self._result(self.stored[key], cache_hit=True)
+        value = self.responses[key]
+        if isinstance(value, Exception):
+            raise value
+        self.stored[key] = value
+        return self._result(value, cache_hit=False)
+
+    def replay_json(self, url, endpoint, params=None):
+        key = _key(url, params)
+        self.replays.append(key)
+        if key not in self.stored:
+            raise RawTargetNotFound(key)
+        return self._result(self.stored[key], cache_hit=True)
+
+    def flush(self) -> None:
+        self.flushes += 1
+
+    def network(self, fragment: str) -> list[tuple[str, bool]]:
+        return [call for call in self.calls if fragment in call[0]]
+
+
+def _py(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if hasattr(value, "to_pydatetime"):
+        return value.to_pydatetime()
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+class WaveTrino(FakeTrino):
+    """In-memory bronze that also answers the wave's reads."""
+
+    def __init__(self, fail_slug: str | None = None) -> None:
+        super().__init__()
+        self.fail_slug = fail_slug
+        self.queries: list[str] = []
+
+    def insert_dataframe_atomic(self, schema, table, df, **kwargs):
+        if self.fail_slug and f"competition_slug = '{self.fail_slug}'" in kwargs["delete_filter"]:
+            raise RuntimeError(f"commit of {table} refused")
+        return super().insert_dataframe_atomic(schema, table, df, **kwargs)
+
+    def _rows(self):
+        return [{key: _py(value) for key, value in row.items()} for row in self.tables["espn_match"]]
+
+    def execute_query(self, sql, params=None):
+        self.queries.append(sql)
+        columns = wave._MATCH_COLUMNS
+        if "bool_and(terminal)" in sql:
+            groups: dict[tuple[str, int], bool] = {}
+            for row in self._rows():
+                key = (row["competition_slug"], row["season_year"])
+                groups[key] = groups.get(key, True) and bool(row["terminal"])
+            return [[slug, year, terminal] for (slug, year), terminal in groups.items()]
+        if "kickoff >= ? AND kickoff < ?" in sql:
+            start, end = params
+            keep = [row for row in self._rows() if start <= row["kickoff"] < end]
+        elif "status IN" in sql:
+            (before,) = params
+            keep = [
+                row
+                for row in self._rows()
+                if row["status"] in {"STATUS_POSTPONED", "STATUS_SUSPENDED"}
+                and not row["terminal"]
+                and row["kickoff"] < before
+            ]
+        else:
+            slug, year = params
+            ids = {int(item) for item in re.search(r"IN \(([\d, ]+)\)", sql)[1].split(", ")}
+            keep = [
+                row
+                for row in self._rows()
+                if row["competition_slug"] == slug
+                and row["season_year"] == year
+                and row["event_id"] in ids
+            ]
+        return [[row[name] for name in columns] for row in keep]
+
+
+class FakeConn:
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+
+    def cursor(self):
+        conn = self
+
+        class _Cursor:
+            def execute(self, sql):
+                conn.sql.append(sql)
+
+            def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+        return _Cursor()
+
+
+# ---------------------------------------------------------------- fixtures
+
+
+def _summary(slug: str) -> dict:
+    return json.loads((PROBES / SUMMARIES[slug]).read_bytes())
+
+
+def _event(slug: str, *, when: str, event_id: int | None = None, status: str | None = None) -> dict:
+    """A scoreboard event built from the recorded Summary header of ``slug``."""
+
+    header = _summary(slug)["header"]
+    competition = header["competitions"][0]
+    status_node = deepcopy(competition["status"])
+    sides = []
+    for side in competition["competitors"]:
+        item = {
+            "homeAway": side["homeAway"],
+            "team": {"id": side["team"]["id"], "displayName": side["team"]["displayName"]},
+        }
+        if status is None:
+            item["score"] = side.get("score")
+        sides.append(item)
+    if status is not None:
+        status_node["type"]["name"] = status
+    identifier = event_id or int(header["id"])
+    return {
+        "id": str(identifier),
+        "uid": f"s:600~l:{header['league']['id']}~e:{identifier}",
+        "date": when,
+        "season": {"year": header["season"]["year"]},
+        "status": status_node,
+        "competitions": [{"competitors": sides}],
+    }
+
+
+def _day(*events: dict) -> bytes:
+    return json.dumps({"leagues": [{}], "events": list(events)}).encode()
+
+
+def _year(slug: str) -> int:
+    return _summary(slug)["header"]["season"]["year"]
+
+
+def _rows():
+    denominator = load_denominator()
+    return [denominator.row(slug) for slug in SLUGS]
+
+
+def _state_path(tmp_path, slugs=SLUGS):
+    path = tmp_path / "editions.json"
+    editions_store.save(
+        path,
+        editions_store.EditionsSnapshot(
+            NOW - timedelta(hours=1),
+            tuple(
+                EditionState(slug, _year(slug), f"{slug} test", date(2026, 7, 1), date(2027, 6, 30))
+                for slug in slugs
+            ),
+        ),
+    )
+    return path
+
+
+def _summary_key(slug: str, event_id: int | None = None) -> str:
+    return _req_key(urls.summary(slug, event_id or int(_summary(slug)["header"]["id"])))
+
+
+def _responses(yesterday: bytes, today: bytes, **extra) -> dict:
+    responses = {
+        _req_key(urls.all_scoreboard_day(YESTERDAY)): yesterday,
+        _req_key(urls.all_scoreboard_day(TODAY)): today,
+    }
+    for slug in SLUGS:
+        responses[_summary_key(slug)] = (PROBES / SUMMARIES[slug]).read_bytes()
+    responses.update(extra)
+    return responses
+
+
+def _first_day() -> tuple[bytes, bytes]:
+    yesterday = _day(
+        _event("eng.1", when="2026-09-24T15:00Z"),
+        _event("ger.2", when="2026-09-24T16:00Z"),
+        _event("uefa.champions", when="2026-09-24T19:00Z"),
+        _event("eng.1", when="2026-09-24T21:00Z", event_id=900002, status="STATUS_SCHEDULED"),
+        _event("eng.1", when="2026-09-24T21:30Z", event_id=900003, status="STATUS_SCHEDULED"),
+    )
+    today = _day(
+        _event("eng.1", when="2026-09-25T19:00Z", event_id=900001, status="STATUS_SCHEDULED"),
+    )
+    return yesterday, today
+
+
+def _plan(client, trino, tmp_path, *, now=NOW, check_stale=False):
+    return wave.plan_wave(
+        client=client,
+        trino=trino,
+        rows=_rows(),
+        state_path=tmp_path / "editions.json",
+        now=now,
+        check_stale=check_stale,
+    )
+
+
+def _run(plan, client, trino):
+    """What the mapped tasks do: each tournament on its own, red on error."""
+
+    outcomes = []
+    for work in plan.works:
+        work = wave.TournamentWork.from_xcom(json.loads(json.dumps(work.to_xcom())))
+        try:
+            outcome = wave.run_tournament(
+                work, client=client, trino=trino, conn=FakeConn(), run_id="r", task_id="t"
+            )
+        except Exception as exc:  # noqa: BLE001 - the mapped task fails, the wave goes on
+            outcome = wave.failed_outcome(work, exc)
+        outcomes.append(outcome.as_dict())
+    return outcomes
+
+
+def _matches(trino) -> dict[int, dict]:
+    return {row["event_id"]: {k: _py(v) for k, v in row.items()} for row in trino.tables["espn_match"]}
+
+
+def _wave1(tmp_path, *, fail_slug=None, **extra):
+    _state_path(tmp_path)
+    client = FakeClient(_responses(*_first_day(), **extra))
+    trino = WaveTrino(fail_slug)
+    plan = _plan(client, trino, tmp_path)
+    return client, trino, plan, _run(plan, client, trino)
+
+
+# ------------------------------------------------------------------- tests
+
+
+@pytest.mark.unit
+def test_one_failing_tournament_does_not_stop_its_neighbours(tmp_path) -> None:
+    broken_ucl = {_summary_key("uefa.champions"): b'{"header": "not a header"}'}
+    client, trino, plan, outcomes = _wave1(tmp_path, fail_slug="ger.2", **broken_ucl)
+
+    assert [(work.slug, work.season_year) for work in plan.works] == [
+        ("eng.1", 2020), ("ger.2", 2016), ("uefa.champions", 2010)
+    ]
+    by_slug = {item["slug"]: item for item in outcomes}
+    assert by_slug["ger.2"]["state"] == wave.RED
+    assert by_slug["ger.2"]["first_error"] == "RuntimeError: commit of espn_match refused"
+    assert by_slug["eng.1"]["state"] == by_slug["uefa.champions"]["state"] == wave.GREEN
+    matches = _matches(trino)
+    assert {row["competition_slug"] for row in matches.values()} == {"eng.1", "uefa.champions"}
+    # A broken Summary body is a disposition of its match, not a failure.
+    assert matches[307787]["disposition"] == "source_malformed"
+    assert matches[578281]["disposition"] == "captured"
+    assert len([r for r in trino.tables["espn_match_lineup"] if r["event_id"] == 578281]) == 40
+    assert by_slug["eng.1"]["matches"] == 4  # final + three scheduled
+    summary = wave.summarize_wave(outcomes, [])
+    assert summary.table[1] == "ger.2:2016 -> red -> RuntimeError: commit of espn_match refused"
+    assert summary.red and summary.reason == "1 of 3 tournaments red (> 20%)"
+
+
+@pytest.mark.unit
+def test_red_share_threshold_of_the_wave() -> None:
+    def outcomes(red: int) -> list[dict]:
+        return [
+            {"slug": f"x.{i}", "season_year": 2026, "state": wave.RED if i < red else wave.GREEN,
+             "matches": 1, "dispositions": {}, "first_error": "E: x" if i < red else None}
+            for i in range(6)
+        ]
+
+    assert wave.summarize_wave(outcomes(1), []).red is False
+    two = wave.summarize_wave(outcomes(2), [])
+    assert two.red is True and two.red_tournaments == 2
+    # A mapped task that ended without an outcome counts as red.
+    assert wave.summarize_wave(outcomes(1), ["run_tournament[7]=failed"]).red is True
+    assert wave.summarize_wave([], []).red is False
+    assert wave.summarize_wave([], [], plan_error="failed").reason == "plan_wave: failed"
+
+
+@pytest.mark.unit
+def test_day_statuses_are_fresh_and_summaries_cache_first(tmp_path) -> None:
+    client, _, _, outcomes = _wave1(tmp_path)
+
+    assert {item["state"] for item in outcomes} == {wave.GREEN}
+    # plan_wave forces both day statuses; run_tournament re-reads the stored bodies.
+    for day in (YESTERDAY, TODAY):
+        key = _req_key(urls.all_scoreboard_day(day))
+        calls = [refresh for url, refresh in client.calls if url == key]
+        assert calls[0] is True and set(calls[1:]) == {False}
+    summary_calls = client.network("/summary?")
+    assert sorted(url for url, _ in summary_calls) == sorted(_summary_key(s) for s in SLUGS)
+    assert {refresh for _, refresh in summary_calls} == {False}
+    assert _summary_key("eng.1") == (
+        "https://site.web.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event=578281"
+    )
+
+
+@pytest.mark.unit
+def test_captured_unchanged_match_stays_out_of_the_next_wave(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+
+    again = _plan(client, trino, tmp_path)
+
+    assert again.works == ()
+    assert again.status_checks == 0
+
+
+@pytest.mark.unit
+def test_status_change_of_a_captured_final_replays_its_summary(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    yesterday = json.loads(_first_day()[0])
+    yesterday["events"][0]["status"]["type"]["name"] = "STATUS_FINAL_AET"
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = json.dumps(yesterday).encode()
+    before = len(client.network("/summary?"))
+
+    plan = _plan(client, trino, tmp_path)
+    (outcome,) = _run(plan, client, trino)
+
+    assert [(w.slug, w.event_ids) for w in plan.works] == [("eng.1", (578281,))]
+    assert outcome["state"] == wave.GREEN
+    assert client.replays == [_summary_key("eng.1")]
+    assert len(client.network("/summary?")) == before
+    row = _matches(trino)[578281]
+    assert row["status"] == "STATUS_FINAL_AET" and row["lineup_state"] == "captured"
+    assert len([r for r in trino.tables["espn_match_lineup"] if r["event_id"] == 578281]) == 40
+
+
+@pytest.mark.unit
+def test_match_leaving_its_day_is_withdrawn_or_moved(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    yesterday, _ = _first_day()
+    # 900001 (today) and 900002 (yesterday) are gone; 900003 moved to today.
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = _day(
+        *[e for e in json.loads(yesterday)["events"] if int(e["id"]) not in {900002, 900003}]
+    )
+    client.responses[_req_key(urls.all_scoreboard_day(TODAY))] = _day(
+        _event("eng.1", when="2026-09-25T20:00Z", event_id=900003, status="STATUS_SCHEDULED")
+    )
+    client.responses[_req_key(urls.event_status("eng.1", 900001))] = HttpStatusError(404, "gone")
+    client.responses[_req_key(urls.event_status("eng.1", 900002))] = json.dumps(
+        {"type": {"name": "STATUS_POSTPONED"}}
+    ).encode()
+
+    plan = _plan(client, trino, tmp_path)
+    outcomes = _run(plan, client, trino)
+
+    (work,) = plan.works
+    assert work.presence == {900001: "withdrawn", 900002: "moved", 900003: "moved"}
+    assert work.statuses == {900002: "STATUS_POSTPONED"}
+    rows = _matches(trino)
+    assert rows[900001]["disposition"] == "withdrawn"
+    assert rows[900001]["kickoff"] == datetime(2026, 9, 25, 19)
+    assert rows[900002]["disposition"] == "moved"
+    assert rows[900002]["status"] == "STATUS_POSTPONED"
+    assert rows[900002]["kickoff"] == datetime(2026, 9, 24, 21)
+    assert rows[900003]["disposition"] == "moved"
+    assert rows[900003]["kickoff"] == datetime(2026, 9, 25, 20)
+    summary = wave.summarize_wave(outcomes, [])
+    assert (summary.withdrawn_count, summary.moved_count, summary.red) == (1, 2, False)
+    # Marked matches are not checked again every wave.
+    assert _plan(client, trino, tmp_path).status_checks == 0
+
+
+@pytest.mark.unit
+def test_many_withdrawn_matches_warn_without_failing() -> None:
+    outcomes = [
+        {"slug": "eng.1", "season_year": 2026, "state": wave.GREEN, "matches": 9,
+         "dispositions": {"withdrawn": 9}, "first_error": None}
+    ]
+
+    summary = wave.summarize_wave(outcomes, [])
+
+    assert summary.red is False
+    assert summary.warnings == ("9 withdrawn matches in one wave (alert above 8)",)
+    assert wave.summarize_wave(
+        [{**outcomes[0], "dispositions": {"withdrawn": 8}}], []
+    ).warnings == ()
+
+
+@pytest.mark.unit
+def test_day_cut_at_1000_events_is_topped_up_by_league(tmp_path) -> None:
+    _state_path(tmp_path)
+    filler = [
+        {"id": str(10_000 + i), "uid": f"s:600~l:99999~e:{10_000 + i}"} for i in range(999)
+    ]
+    final = _event("eng.1", when="2026-09-24T15:00Z")
+    cut = json.dumps({"leagues": [{}], "events": filler + [{}]}).encode()
+    league = json.dumps({"leagues": [{"id": "700", "slug": "eng.1"}], "events": [final]}).encode()
+    extra = {_req_key(urls.league_scoreboard_day("eng.1", YESTERDAY)): league}
+    for slug, espn_id in (("ger.2", "3927"), ("uefa.champions", "775")):
+        extra[_req_key(urls.league_scoreboard_day(slug, YESTERDAY))] = json.dumps(
+            {"leagues": [{"id": espn_id, "slug": slug}], "events": []}
+        ).encode()
+    client = FakeClient(_responses(cut, _day(), **extra))
+    trino = WaveTrino()
+
+    plan = _plan(client, trino, tmp_path)
+    outcomes = _run(plan, client, trino)
+
+    assert plan.topup_days == (YESTERDAY,)
+    league_calls = client.network("/scoreboard?dates=20260924&limit=1000")
+    assert sorted(url.split("/soccer/")[1].split("/")[0] for url, refresh in league_calls if refresh) == [
+        "all", "eng.1", "ger.2", "uefa.champions"
+    ]
+    assert [(w.slug, w.event_ids) for w in plan.works] == [("eng.1", (578281,))]
+    assert outcomes[0]["state"] == wave.GREEN
+    assert _matches(trino)[578281]["disposition"] == "captured"
+
+
+@pytest.mark.unit
+def test_plan_on_the_recorded_all_scoreboard_day(tmp_path) -> None:
+    denominator = load_denominator()
+    rows = wave.live_rows(denominator)
+    assert len(rows) == 161
+    editions_store.save(
+        tmp_path / "editions.json",
+        editions_store.EditionsSnapshot(
+            NOW,
+            tuple(
+                EditionState(row.slug, year, f"{year} {row.slug}", date(year, 1, 1), date(year + 1, 12, 31))
+                for row in rows
+                for year in (2025, 2026)
+            ),
+        ),
+    )
+    responses = {
+        _req_key(urls.all_scoreboard_day(date(2026, 9, 22))): _day(),
+        _req_key(urls.all_scoreboard_day(date(2026, 9, 23))): (
+            PROBES / "all_scoreboard_20260923.json"
+        ).read_bytes(),
+    }
+
+    plan = wave.plan_wave(
+        client=FakeClient(responses),
+        trino=WaveTrino(),
+        rows=rows,
+        state_path=tmp_path / "editions.json",
+        now=datetime(2026, 9, 23, 20, tzinfo=timezone.utc),
+        check_stale=False,
+    )
+
+    counts = {work.slug: len(work.event_ids) for work in plan.works}
+    assert counts == {
+        "ned.cup": 6, "concacaf.nations.league": 3, "chi.copa_chi": 3,
+        "slv.1": 2, "global.gulf_cup": 2, "usa.1": 1, "usa.usl.1": 1,
+        "eng.fa_qual": 1, "sco.challenge": 1, "col.1": 1, "per.1": 1, "gua.1": 1,
+    }
+
+
+@pytest.mark.unit
+def test_stale_postponed_match_is_checked_in_the_midnight_wave(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    later = NOW + timedelta(days=5)
+    for row in trino.tables["espn_match"]:
+        if row["event_id"] == 900002:
+            row["status"] = "STATUS_POSTPONED"
+    status_key = _req_key(urls.event_status("eng.1", 900002))
+    client.responses[status_key] = json.dumps({"type": {"name": "STATUS_CANCELED"}}).encode()
+    days = {
+        _req_key(urls.all_scoreboard_day(later.date() - timedelta(days=1))): _day(),
+        _req_key(urls.all_scoreboard_day(later.date())): _day(),
+    }
+    client.responses.update(days)
+    # Editions of the cache are older than 24 h by then: core is read again.
+    for slug in SLUGS:
+        client.responses[_req_key(urls.league_detail(slug))] = HttpStatusError(503, "busy")
+
+    assert _plan(client, trino, tmp_path, now=later, check_stale=False).works == ()
+    plan = _plan(client, trino, tmp_path, now=later, check_stale=True)
+    _run(plan, client, trino)
+
+    assert plan.works[0].statuses == {900002: "STATUS_CANCELED"}
+    row = _matches(trino)[900002]
+    assert (row["status"], row["terminal"], row["disposition"]) == ("STATUS_CANCELED", True, "moved")

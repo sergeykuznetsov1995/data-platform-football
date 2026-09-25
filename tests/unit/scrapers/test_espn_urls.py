@@ -77,6 +77,9 @@ def _split(url: str) -> tuple[str, dict[str, str]]:
             "scoreboard_eng1_day.json",
             urls.league_scoreboard_day("eng.1", date(2026, 9, 20)),
         ),
+        # Summary of a match (#1504): site.web.api, only ``event``.
+        ("summary_eng1_2020.json", urls.summary("eng.1", 578281)),
+        ("summary_ucl_2010.json", urls.summary("uefa.champions", 307787)),
     ],
 )
 def test_addresses_match_the_recorded_probe_urls(fixture, request_) -> None:
