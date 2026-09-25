@@ -790,11 +790,16 @@ docker exec -i sofascore_gw_history python3 - --base-url http://127.0.0.1:8899 \
   оба экземпляра хранилища фазы: план (`prepare_workload_plan`) и захват (`_run_match_capture`);
   история (`--phase all`) идёт тем же кодом. Раньше план спрашивал манифест на каждый эндпоинт каждого
   матча (216 858 HTTPS к Trino за прогон 15:30).
-- **`trino_queries` в отчёте фазы.** Модуль `scrapers/sofascore/trino_accounting.py` считает запросы
-  SofaScore к Trino (`select`/`merge`/`other`; базовый `TrinoTableManager` не тронут), счётчик
-  обнуляется в начале `run_phase`. Число пишется в `traffic.trino_queries` отчёта раннера и в фазу
-  результата скоупа — `refresh-results/*.json` (актуалка) и `results/*.json` (история). Ожидание на
-  скоуп: `select` ≤ 10, `merge` ≈ ⌈записей / 200⌉.
+- **`trino_queries` в отчёте фазы.** Модуль `scrapers/sofascore/trino_accounting.py` считает каждый
+  оператор, ушедший в Trino через курсор (`select`/`merge`/`other`): все операторы менеджера хранилища
+  манифеста — включая проверочный `SELECT 1` при соединении и скрытые шаги пакетной записи (staging
+  CREATE/INSERT, `SELECT count`, `MERGE`, DROP) — и запросы помощников `_trino_connect` плана и раннера.
+  Класс `TrinoTableManager` не тронут: обёртка ставится на экземпляр. Запись Bronze (свой менеджер
+  скрапера) и учёт трафика в `ops.proxy_traffic_runs` в счётчик не входят. Счётчик обнуляется в
+  начале `run_phase`; число пишется в `traffic.trino_queries` отчёта раннера и в фазу результата
+  скоупа — `refresh-results/*.json` (актуалка) и `results/*.json` (история). Ожидание на скоуп:
+  `select` ≤ 10; каждая сброшенная пачка манифеста (≤ `SOFASCORE_MANIFEST_BATCH_SIZE` записей)
+  добавляет один `merge` и ещё несколько служебных операторов.
 - **`squads` не планируется.** Сезонный маршрут отвечает 404 (`endpoint_coverage.yaml`:
   `unsupported`), а дневной `freshness_key` покупал новый платный 404 на каждую команду каждый день.
   Спек `squads` больше не строится; вселенная игроков — игроки матчей (lineups и др.) плюс составы из

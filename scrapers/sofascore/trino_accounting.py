@@ -1,10 +1,12 @@
-"""Process-wide count of SofaScore queries sent to Trino (#1357).
+"""Process-wide count of SofaScore statements sent to Trino (#1357).
 
 The refresh plan used to spend one SELECT per endpoint (216 858 HTTPS
 round-trips to Trino in one 15:30 run).  The phase report now carries these
 counters as ``traffic.trino_queries`` so a regression is visible per scope.
-Only SofaScore call sites increment them; the shared ``TrinoTableManager``
-is deliberately left untouched.
+Counting happens at the dbapi cursor: every statement a counted connection
+executes (a batch MERGE's staging CREATE/INSERT/count/MERGE/DROP and the
+connect probe included) is one query.  The shared ``TrinoTableManager``
+class is left untouched; ``instrument_manager`` wraps one instance.
 """
 
 from __future__ import annotations
@@ -78,3 +80,31 @@ def counted_connection(connection):
     if connection is None:
         return None
     return _CountingConnection(connection)
+
+
+def instrument_manager(manager) -> None:
+    """Count every statement one ``TrinoTableManager`` instance sends.
+
+    Wraps the instance's connection factory (the base class stays as is), so
+    connections made later — the lazy first one, a reset after a connection
+    error — are counted too.  Idempotent.  A manager without a connection
+    factory (test doubles) gets its ``_execute`` counted instead.
+    """
+
+    if getattr(manager, "_sofascore_trino_counted", False):
+        return
+    factory = getattr(manager, "_create_connection", None)
+    if callable(factory):
+        manager._create_connection = lambda: counted_connection(factory())
+        existing = getattr(manager, "_conn", None)
+        if existing is not None:
+            manager._conn = counted_connection(existing)
+    else:
+        execute = manager._execute
+
+        def _counted_execute(sql, *args, **kwargs):
+            record_sql(sql)
+            return execute(sql, *args, **kwargs)
+
+        manager._execute = _counted_execute
+    manager._sofascore_trino_counted = True

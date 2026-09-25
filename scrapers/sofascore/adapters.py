@@ -168,6 +168,8 @@ class TrinoManifestStore(ManifestStore):
         validate_identifier(schema, "schema")
         validate_identifier(table, "table")
         validate_identifier(manager.catalog, "catalog")
+        # #1357: every statement this store's manager sends is counted.
+        trino_accounting.instrument_manager(manager)
         self.manager = manager
         self.catalog = manager.catalog
         self.schema = schema
@@ -181,9 +183,7 @@ class TrinoManifestStore(ManifestStore):
             self.ensure_table()
 
     def ensure_table(self) -> None:
-        trino_accounting.record("other")
         self.manager.create_schema(self.schema)
-        trino_accounting.record("other")
         self.manager._execute(
             render_manifest_ddl(
                 catalog=self.catalog,
@@ -212,7 +212,6 @@ class TrinoManifestStore(ManifestStore):
         )
         if not all(scope):
             raise ValueError("preload scope ids must not be empty")
-        trino_accounting.record("select")
         rows = self.manager._execute(
             f"SELECT {self._select_columns()} FROM {self.qualified} "
             'WHERE "source_tournament_id" = ? AND "source_season_id" = ?',
@@ -249,7 +248,6 @@ class TrinoManifestStore(ManifestStore):
         if self._in_index_scope(key):
             return self._index.get(key)
         where = " AND ".join(f'"{column}" = ?' for column in MANIFEST_KEY_COLUMNS)
-        trino_accounting.record("select")
         rows = self.manager._execute(
             f"SELECT {self._select_columns()} FROM {self.qualified} "
             f"WHERE {where}",
@@ -267,7 +265,6 @@ class TrinoManifestStore(ManifestStore):
 
     def upsert(self, record: EndpointManifest) -> None:
         frame = pd.DataFrame([manifest_to_row(record)], columns=MANIFEST_COLUMNS)
-        trino_accounting.record("merge")
         self.manager.insert_dataframe_atomic(
             self.schema,
             self.table,
@@ -292,7 +289,6 @@ class TrinoManifestStore(ManifestStore):
             [manifest_to_row(record) for record in deduped.values()],
             columns=MANIFEST_COLUMNS,
         )
-        trino_accounting.record("merge")
         self.manager.insert_dataframe_atomic(
             self.schema,
             self.table,
@@ -305,7 +301,6 @@ class TrinoManifestStore(ManifestStore):
         run_id = str(run_id).strip()
         if not run_id:
             raise ValueError("run_id must not be empty")
-        trino_accounting.record("select")
         rows = self.manager._execute(
             f"SELECT {self._select_columns()} FROM {self.qualified} "
             'WHERE "run_id" = ?',

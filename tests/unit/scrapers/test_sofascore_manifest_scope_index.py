@@ -40,9 +40,21 @@ MATCH_IDS = [str(14_000_000 + index) for index in range(30)]
 
 
 class FakeTrinoManager:
-    """Filters stored rows by the SQL's key columns and counts every call."""
+    """Filters stored rows by the SQL's key columns and counts every call.
+
+    ``insert_dataframe_atomic`` sends the same statement sequence as the base
+    manager's staged batch MERGE through ``_execute``, so the accounting sees
+    the hidden per-flush statements too.
+    """
 
     catalog = "iceberg"
+    BATCH_STATEMENTS = (
+        "CREATE TABLE iceberg.ops.stage_x (LIKE iceberg.ops.sofascore_capture_manifest)",
+        "INSERT INTO iceberg.ops.stage_x VALUES (?)",
+        "SELECT count(*) FROM iceberg.ops.stage_x",
+        "MERGE INTO iceberg.ops.sofascore_capture_manifest t USING iceberg.ops.stage_x s",
+        "DROP TABLE IF EXISTS iceberg.ops.stage_x",
+    )
 
     def __init__(self):
         self.rows: list[dict] = []
@@ -50,11 +62,11 @@ class FakeTrinoManager:
         self.merges = 0
 
     def create_schema(self, schema):
-        pass
+        self._execute(f"CREATE SCHEMA IF NOT EXISTS iceberg.{schema}")
 
     def _execute(self, sql, fetch=False, params=None):
-        if not sql.lstrip().upper().startswith("SELECT"):
-            return None
+        if "sofascore_capture_manifest WHERE" not in sql:
+            return [(1,)] if fetch else None
         self.selects += 1
         where = sql.split(" WHERE ", 1)[1]
         columns = [part.split('"')[1] for part in where.split(" AND ")]
@@ -67,6 +79,8 @@ class FakeTrinoManager:
 
     def insert_dataframe_atomic(self, schema, table, df, *, merge_keys):
         self.merges += 1
+        for statement in self.BATCH_STATEMENTS:
+            self._execute(statement, fetch=statement.startswith("SELECT"))
         for record in df.to_dict("records"):
             self.rows = [
                 row
@@ -160,7 +174,9 @@ def test_commits_update_the_index_through_the_batching_wrapper():
     assert manager.merges == 1
     assert all(inner.get(spec.key) is not None for spec in specs)
     assert manager.selects == 1
-    assert trino_accounting.snapshot() == {"select": 1, "merge": 1, "other": 2}
+    # init: CREATE SCHEMA + DDL; preload: 1 SELECT; one flush: the five hidden
+    # statements of the staged batch MERGE (count SELECT + MERGE + 3 other).
+    assert trino_accounting.snapshot() == {"select": 2, "merge": 1, "other": 5}
 
 
 @pytest.mark.unit
@@ -305,3 +321,111 @@ def test_phase_report_carries_trino_queries(tmp_path):
     )
 
     assert _phase_report(report_path)["trino_queries"] == counts
+
+
+@pytest.mark.unit
+def test_real_manager_counts_every_statement_including_the_connect_probe(
+    monkeypatch,
+):
+    from scrapers.base.trino_manager import TrinoTableManager
+
+    monkeypatch.setattr(TrinoTableManager, "_trino_unreachable", False)
+    sent = []
+
+    class Cursor:
+        def execute(self, sql, *args):
+            sent.append(sql)
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            pass
+
+    connection = MagicMock()
+    connection.cursor.side_effect = Cursor
+    manager = TrinoTableManager()
+    manager._create_connection = lambda: connection
+    trino_accounting.instrument_manager(manager)
+    trino_accounting.instrument_manager(manager)  # idempotent
+
+    manager._execute("SELECT 2", fetch=True)
+    manager._execute("MERGE INTO t USING s ON 1=1")
+    manager._execute("DROP TABLE IF EXISTS s")
+
+    # The connect probe (SELECT 1) is a real round-trip and is counted too.
+    assert sent == ["SELECT 1", "SELECT 2", "MERGE INTO t USING s ON 1=1", "DROP TABLE IF EXISTS s"]
+    assert trino_accounting.snapshot() == {"select": 2, "merge": 1, "other": 1}
+
+
+@pytest.mark.unit
+def test_whole_refresh_phase_plan_plus_capture_stays_within_ten_queries(
+    tmp_path, monkeypatch
+):
+    """run_phase's window: the plan and the capture, two stores, one counter."""
+
+    from dags.scripts import run_sofascore_scraper as runner
+    from dags.scripts.prepare_sofascore_workload import (
+        CompetitionSeason,
+        prepare_workload_plan,
+    )
+    from tests.unit.scripts.test_prepare_sofascore_workload import TOKEN, _policy
+
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", "b" * 64)
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    manager = _seeded_manager()
+    catalog = MagicMock()
+    catalog.competition.return_value = SimpleNamespace(
+        capture_allowed=True, unique_tournament_id=int(TOURNAMENT)
+    )
+    catalog.resolve_source_season.return_value = SimpleNamespace(
+        season_id=int(SEASON), format="split_year"
+    )
+    module = "dags.scripts.prepare_sofascore_workload"
+    trino_accounting.reset()
+    with (
+        patch(f"{module}.load_static_workload_policy", return_value=_policy()),
+        patch(
+            f"{module}.build_capture_runtime",
+            return_value=_runtime(tmp_path / "plan", manager),
+        ),
+        patch(f"{module}.SofaScoreCatalog.load", return_value=catalog),
+        patch(f"{module}._finished_match_ids", return_value=set(MATCH_IDS)),
+    ):
+        prepare_workload_plan(
+            dag_id="dag_refresh_sofascore_all_mens",
+            base_run_id="refresh-1",
+            phase="targets",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "target-plan.json",
+            allow_inactive_season=True,
+            season_freshness_key="final",
+            season_evidence="bronze",
+        )
+    monkeypatch.setattr(
+        runner, "_resolve_match_ids_from_bronze", lambda *args, **kwargs: MATCH_IDS
+    )
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (int(TOURNAMENT), int(SEASON))
+    )
+    with patch(
+        "scrapers.sofascore.SofaScoreScraper",
+        MagicMock(side_effect=AssertionError("no-op opened a scraper")),
+    ):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(tmp_path / "matches.json"),
+            capture_runtime=_runtime(tmp_path / "capture", manager),
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    counts = trino_accounting.snapshot()
+    # Two stores x (CREATE SCHEMA + DDL + one preload SELECT); every further
+    # manifest flush adds the five statements of one staged batch MERGE.
+    assert counts == {"select": 2, "merge": 0, "other": 4}
+    assert sum(counts.values()) <= 10
