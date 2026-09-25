@@ -9,6 +9,7 @@ prepare -> plan_wave -> run_tournament (mapped, one tournament-season each)
 -> wave_summary (all_done).  The logic is ``scrapers.espn.wave``; this file
 only wires Airflow, the transport and Trino.  ``wave_summary`` writes the wave
 log (``scrapers.espn.wave_log``, #1505) before it turns a red wave red.
+``prepare`` also creates the recheck journal (``scrapers.espn.recheck``, #1506).
 """
 
 from __future__ import annotations
@@ -77,12 +78,14 @@ def prepare(**_: Any) -> None:
     from scrapers.base.iceberg_writer import IcebergWriter
     from scrapers.espn.bronze_schema import ensure_bronze_tables
     from scrapers.espn.journal import ensure_journal_table
+    from scrapers.espn.recheck import ensure_recheck_table
     from scrapers.espn.wave_log import ensure_wave_log_table
 
     ensure_bronze_tables(IcebergWriter())
     connection = _trino().connection
     ensure_journal_table(connection)
     ensure_wave_log_table(connection)
+    ensure_recheck_table(connection)
 
 
 def plan_wave(**context: Any) -> list[dict[str, Any]]:
@@ -106,6 +109,9 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
             # and the core event list against bronze (#1505, R-09).
             check_stale=midnight,
             check_core=midnight,
+            # Once a day too: rechecks at kickoff + 7…10 days and the 5 %
+            # sample at +24/72 h, under the "not worse" rule (#1506).
+            check_recheck=midnight,
         )
     except BaseException as exc:
         failure = exc

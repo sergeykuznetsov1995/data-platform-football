@@ -1,4 +1,4 @@
-"""Daily DQ checks of the ESPN bronze tables (#1505).
+"""Daily DQ checks of the ESPN bronze tables (#1505) and the recheck lines (#1506).
 
 Every check runs on DuckDB (Trino -> DuckDB via sqlglot) over synthetic
 rows: it stays silent on clean data and names its own breakage.
@@ -11,8 +11,8 @@ from datetime import datetime, timedelta
 import pytest
 
 from scrapers.espn.quality import (
-    DOWNGRADE_REJECTED_LINE,
     build_quality_sql,
+    build_recheck_sql,
     build_summary_loads_sql,
     render_quality_lines,
 )
@@ -44,7 +44,27 @@ def _db():
         "CREATE TABLE ops.espn_request_journal_v1 (request_date date, url_fingerprint varchar, "
         "endpoint varchar, disposition varchar)"
     )
+    con.execute(
+        "CREATE TABLE ops.espn_recheck_v1 (checked_at timestamp, run_id varchar, slug varchar, "
+        "season_year integer, event_id bigint, kind varchar, before_parts varchar, "
+        "after_parts varchar, outcome varchar)"
+    )
     return con
+
+
+def _load(con, fingerprint, day="2026-10-11", disposition="success", times=1):
+    for _ in range(times):
+        con.execute(
+            "INSERT INTO ops.espn_request_journal_v1 VALUES (CAST(? AS date), ?, 'summary', ?)",
+            [day, fingerprint, disposition],
+        )
+
+
+def _recheck(con, event_id, outcome, *, slug="eng.1", kind="recheck", at=AT):
+    con.execute(
+        "INSERT INTO ops.espn_recheck_v1 VALUES (?, 'r', ?, 2026, ?, ?, '{}', '{}', ?)",
+        [at, slug, event_id, kind, outcome],
+    )
 
 
 def _match(con, event_id, slug="eng.1", disposition="captured", *, played=True,
@@ -75,21 +95,29 @@ def _clean(con):
         )
 
 
-def _lines(con):
+def _query(con, sql):
     import sqlglot
 
-    rows = []
-    for sql in (build_quality_sql(DAY), build_summary_loads_sql(DAY)):
-        duck = sqlglot.transpile(sql, read="trino", write="duckdb")[0]
-        duck = duck.replace("iceberg.bronze.", "bronze.").replace("iceberg.ops.", "ops.")
-        rows.extend(con.execute(duck).fetchall())
-    return render_quality_lines(DAY, rows)
+    duck = sqlglot.transpile(sql, read="trino", write="duckdb")[0]
+    duck = duck.replace("iceberg.bronze.", "bronze.").replace("iceberg.ops.", "ops.")
+    return con.execute(duck).fetchall()
 
 
-def test_clean_day_prints_only_the_downgrade_stub():
+def _lines(con):
+    rows = _query(con, build_quality_sql(DAY)) + _query(con, build_summary_loads_sql(DAY))
+    return render_quality_lines(DAY, rows, _query(con, build_recheck_sql(DAY)))
+
+
+NO_RECHECK = [
+    "• ESPN перепроверка 11.10: downgrade_rejected за сутки: 0",
+    "• ESPN перепроверка 11.10: перепроверок не было",
+]
+
+
+def test_clean_day_prints_only_the_recheck_lines():
     con = _db()
     _clean(con)
-    assert _lines(con) == [DOWNGRADE_REJECTED_LINE]
+    assert _lines(con) == NO_RECHECK
 
 
 @pytest.mark.parametrize(
@@ -122,14 +150,10 @@ def test_clean_day_prints_only_the_downgrade_stub():
             "• ESPN DQ 11.10: сыгранный без счёта (NULL вместо 0) eng.1: 1 из 11 ‼️",
         ),
         (
-            lambda con: [
-                con.execute(
-                    "INSERT INTO ops.espn_request_journal_v1 VALUES "
-                    "(DATE '2026-10-11', 'fp2', 'summary', 'success')"
-                )
-                for _ in range(2)
-            ],
-            "• ESPN DQ 11.10: summary качали > 2 раз за сутки: 1 матч(ей) ‼️",
+            # fp2: two more loads on D-6 (outside the 3-day peak): the week is 12/10.
+            lambda con: _load(con, "fp2", day="2026-10-05", times=2),
+            "• ESPN DQ 11.10: summary в среднем 1.20 загрузки на матч за 7 суток (> 1.1): "
+            "12 на 10 матч(ей) ‼️",
         ),
     ],
     ids=["valid_empty", "source_malformed", "lineup_anomaly", "duplicate", "ingest_order",
@@ -139,10 +163,79 @@ def test_each_check_catches_its_breakage(breakage, expected):
     con = _db()
     _clean(con)
     breakage(con)
-    assert _lines(con) == [expected, DOWNGRADE_REJECTED_LINE]
+    assert _lines(con) == [expected, *NO_RECHECK]
+
+
+# ---------------------------------------------------- summary loads (#1506)
+
+
+def _loads_lines(con):
+    return render_quality_lines(DAY, _query(con, build_summary_loads_sql(DAY)), [])[:-2]
+
+
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        # 10 matches over the week with 10, 11 and 12 network loads.
+        (0, []),
+        (1, []),
+        (2, ["• ESPN DQ 11.10: summary в среднем 1.20 загрузки на матч за 7 суток (> 1.1): "
+             "12 на 10 матч(ей) ‼️"]),
+    ],
+    ids=["1.0", "1.1", "1.2"],
+)
+def test_week_average_of_summary_loads(extra, expected):
+    con = _db()
+    for index in range(10):
+        # Spread over the week; D-7 and cache hits are outside.
+        _load(con, f"fp{index}", day=f"2026-10-{5 + index % 7:02d}")
+        _load(con, f"fp{index}", day="2026-10-04")
+        _load(con, f"fp{index}", disposition="cache_hit")
+    for index in range(extra):
+        # A second load of fp{index} four days later: the 3-day peak stays at 1.
+        _load(con, f"fp{index}", day=f"2026-10-{9 + index % 7:02d}")
+    assert _loads_lines(con) == expected
+
+
+@pytest.mark.parametrize(
+    "loads, expected",
+    [
+        (2, []),
+        (3, ["• ESPN DQ 11.10: summary качали > 2 раз за 3 суток: 1 матч(ей) ‼️"]),
+    ],
+)
+def test_three_day_peak_of_summary_loads(loads, expected):
+    con = _db()
+    # 30 other matches keep the week average under 1.1 whatever fp0 does.
+    for index in range(1, 31):
+        _load(con, f"fp{index}")
+    for offset in range(loads):
+        _load(con, "fp0", day=f"2026-10-{11 - offset:02d}")
+    assert _loads_lines(con) == expected
+
+
+def test_downgrades_and_fill_rate_of_the_recheck():
+    con = _db()
+    _clean(con)
+    for event_id, outcome in ((1, "filled"), (2, "same"), (3, "failed"), (4, "same")):
+        _recheck(con, event_id, outcome)
+    _recheck(con, 5, "filled", slug="gua.1")
+    _recheck(con, 6, "downgrade_rejected", slug="bra.copa_do_brazil")
+    _recheck(con, 7, "downgrade_rejected", slug="bra.copa_do_brazil", kind="sample_24h")
+    _recheck(con, 8, "downgrade_rejected", slug="eng.1", kind="refresh")
+    # Samples do not count in the fill rate; another day is outside.
+    _recheck(con, 9, "filled", kind="sample_72h")
+    _recheck(con, 10, "downgrade_rejected", at=AT - timedelta(days=1))
+
+    assert _lines(con) == [
+        "• ESPN перепроверка 11.10: downgrade_rejected за сутки: 3 "
+        "(bra.copa_do_brazil 2, eng.1 1) ‼️",
+        "• ESPN перепроверка 11.10: дозаполнено при перепроверке: 2 из 6 (33.3 %); "
+        "по лигам: eng.1 1/4, gua.1 1/1",
+    ]
 
 
 def test_failed_query_is_named_not_hidden():
-    assert render_quality_lines(DAY, None) == [
-        "• ESPN DQ 11.10: не посчитано ⚠️", DOWNGRADE_REJECTED_LINE,
+    assert render_quality_lines(DAY, None, None) == [
+        "• ESPN DQ 11.10: не посчитано ⚠️", "• ESPN перепроверка 11.10: не посчитано ⚠️",
     ]

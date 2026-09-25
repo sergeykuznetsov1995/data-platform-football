@@ -2,7 +2,7 @@
 
 ## `espn_stall_watch.py` — сторож простоя сбора ESPN (#1496)
 
-Хостовый скрипт (cron `*/15`), не часть Airflow. Три правила, у каждого своя серия тревог в
+Хостовый скрипт (cron `*/15`), не часть Airflow. Четыре правила, у каждого своя серия тревог в
 Telegram:
 
 | Правило | Когда тревога |
@@ -10,6 +10,7 @@ Telegram:
 | `paused` | любой из `EXPECTED_DAGS` (`dag_ingest_espn`, `dag_trigger_espn_daily`, `dag_monitor_espn`, `dag_discover_espn_registry`) в metadb `espn-airflow-airflow-metadb-1` на паузе или отсутствует; metadb не отвечает — тревога того же правила «недоступен» |
 | `stall` | в `espn_lineup_generation_v2` ∪ `espn_matchsheet_generation_v2` нет ни одного матча с `_source_fetched_at` за 36 ч (не `_ingested_at` — в этих таблицах оно = execution_date прогона); Trino недоступен — правило пропускается |
 | `red:<slug>` (#1505) | турнир красный в 3 последних волнах `dag_espn_current` подряд по журналу волн `iceberg.ops.espn_wave_tournament_v1`; без issue; отбой — последняя волна с турниром зелёная или его нет ни в одной из 3 последних; журнала нет (до #1507) или Trino недоступен — правило молча пропускается |
+| `downgrade` (#1506) | за 24 ч в журнале перепроверок `iceberg.ops.espn_recheck_v1` есть хотя бы один `downgrade_rejected` (ESPN прислал беднее — оставлено старое); текст — число и лиги; «продолжается» раз в сутки, без issue; отбой — за 24 ч случаев нет; журнала нет (до #1507) или Trino недоступен — молчит (`downgrade=no_recheck_log`) |
 
 Серия: первая тревога → тишина, «⏳ продолжается N ч» раз в 24 ч → через 24 ч issue
 (`source:espn,area:bronze,type:bug`, заголовок `ESPN: сторож [<правило>] — …`; открытая issue с
@@ -30,12 +31,12 @@ State — `/root/watchdog/state/espn_stall_state.json` (+ `.lock`), неподт
 cp -p /root/watchdog/espn_stall_watch.py /root/watchdog/espn_stall_watch.py.prev-$(date +%Y%m%d)
 cp deploy/espn/espn_stall_watch.py /root/watchdog/espn_stall_watch.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile /root/watchdog/espn_stall_watch.py
-python3 /root/watchdog/espn_stall_watch.py --dry-run --state /tmp/espn-dry.json   # до #1507: red=no_wave_log
+python3 /root/watchdog/espn_stall_watch.py --dry-run --state /tmp/espn-dry.json   # до #1507: red=no_wave_log downgrade=no_recheck_log
 ```
 
 Откат: `cp -p /root/watchdog/espn_stall_watch.py.prev-<дата> /root/watchdog/espn_stall_watch.py`.
-State `/root/watchdog/state/espn_stall_state.json` совместим в обе стороны (эпизоды `red:<slug>`
-старый файл просто не читает).
+State `/root/watchdog/state/espn_stall_state.json` совместим в обе стороны (эпизоды `red:<slug>` и
+`downgrade` старый файл просто не читает).
 
 ### Первая установка на хост (#1496, после мержа)
 
@@ -152,15 +153,17 @@ ctime каталога, который пинует сторож WhoScored (`scr
 
 | Задача | Что делает | Повторы |
 |---|---|---|
-| `prepare` | `ensure_bronze_tables(IcebergWriter())` + `ensure_journal_table` + `ensure_wave_log_table` (идемпотентно, каждый прогон) | 2 |
+| `prepare` | `ensure_bronze_tables(IcebergWriter())` + `ensure_journal_table` + `ensure_wave_log_table` + `ensure_recheck_table` (#1506) (идемпотентно, каждый прогон) | 2 |
 | `plan_wave` | издания из кэша (лиги с `failed` — перечитываются) → статусы дня `all/scoreboard` за вчера и сегодня UTC (`force_refresh`) → сверка с `bronze.espn_match` → список турнир-сезонов с работой; в волну 00 — ещё проверка зависших POSTPONED/SUSPENDED старше 3 суток и сверка со списком core (#1505) | 2 |
 | `run_tournament` | map по турнир-сезону (`max_active_tis_per_dag=4`): summary новых финалов (cache-first — одна загрузка на матч) → разбор → одна пачка `write_tournament_batch` → журнал запросов | 2, через 3 мин |
 | `wave_summary` | `all_done`: таблица «турнир → состояние → первая ошибка», счётчики `withdrawn`/`moved`, время волны; журнал волн пишется **до** решения «волна красная» (#1505) | 0 |
 
 - **В волну попадает турнир-сезон**, если у него есть финал без захваченного summary
-  (`lineup_state = pending` или строки нет), новый матч или изменился статус/счёт/kickoff. Уже
-  захваченный неизменный матч в пачку не идёт; захваченный с изменившимся статусом идёт вместе со
-  своим summary, перечитанным из raw store (пачка несёт полное состояние матча).
+  (`lineup_state = pending` или строки нет), новый матч или изменился статус/счёт/kickoff/серия
+  пенальти (#1506). Уже захваченный неизменный матч в пачку не идёт; захваченный с изменившимся
+  статусом идёт вместе со своим summary, перечитанным из raw store (пачка несёт полное состояние
+  матча), через правило «не хуже» (см. «Перепроверка и «не хуже»»). В волну 00 добавляются
+  перепроверки и выборка 5 %.
 - **День ровно с 1000 событиями** (`all/scoreboard` без счётчика — признак обрезки) добирается
   `league_scoreboard_day` по всем 161 живым целям (≈ 2,7 мин на S0, редкий случай).
 - **Пропавший матч — не авария.** Известный незавершённый матч, которого нет в ответе его дня:
@@ -249,10 +252,50 @@ p95 длительности волн за сутки в сводке (`criterio
 **DQ bronze** — `scrapers/espn/quality.py`, за вчерашние UTC-сутки (строки с `_ingested_at` в D):
 доли `valid_empty` / `source_malformed` / `lineup_anomaly` по турниру (> 20 % при ≥ 5 матчах),
 дубли `event_id`, `_ingested_at < _source_fetched_at` (R-18, должно быть 0), сыгранный без счёта,
-загрузок summary на матч по журналу запросов (> 2 за сутки). В сводку — только нарушения и
-заглушка `downgrade_rejected` (данные появятся с перепроверкой #1506).
+загрузки summary на матч по журналу запросов (#1506: в среднем > 1,1 за 7 суток, > 2 на один матч
+за 3 суток). В сводку — только нарушения, затем две строки перепроверки (см. ниже).
 
 **Где строка.** Секция «🔵 ESPN» утренней сводки `/root/watchdog/morning_report.py`: строка
 свежести заменяет временный измеритель #1496, ниже p95 волн и DQ. Пакет наложения —
-`/root/espn-deliveries/1505/summary/` (ставит Fable после мержа). До #1507 новых таблиц нет:
-строка честно пишет «нет сыгранных в новых таблицах».
+`/root/espn-deliveries/1505/summary/` (ставит Fable после мержа; с #1506 —
+`/root/espn-deliveries/1506/summary/`). До #1507 новых таблиц нет: строка честно пишет «нет
+сыгранных в новых таблицах».
+
+## Перепроверка и «не хуже» (#1506)
+
+ESPN иногда дописывает матч позже (составы/судья/лента низших лиг — через 8–10 суток, 6 из 124
+матчей) и иногда присылает урезанный ответ (13.08: 13 матчей `bra.copa_do_brazil` — игроки без
+статистики, 0 командных статов при тех же keyEvents). Логика — `scrapers/espn/recheck.py`.
+
+- **Одна загрузка summary на матч.** Захваченный матч перекачивается только по смене статуса,
+  kickoff, счёта или серии пенальти (`wave._changed`; `parser_version` и остальной `extra_json` —
+  не повод). Смена парсера — перечитывание тела из raw store (`replay_json`, 0 байт). Серия
+  пенальти из дня (`competitor.shootoutScore` в `extra_json`) пишется в `home/away_shootout` поверх
+  summary — иначе смена серии возвращала бы матч в каждую волну.
+- **Перепроверка — одна, в волну 00, на kickoff + 7…10 суток**, только для неполных матчей:
+  сыгранный, захваченный, `rechecked_at IS NULL`, и `disposition ∈ {valid_empty, lineup_anomaly}`
+  или часть (`lineup_state` / `team_stats_state` / `events_state`) не `captured`, когда в той же
+  лиге за 30 дней ≥ 50 % матчей эту часть имеют. Полный матч не перепроверяется никогда. Загрузка —
+  `force_refresh`; `rechecked_at = now` при любом исходе (и `same`, и `failed`): второй нет.
+- **Выборка 5 %** — `event_id % 20 = 0` среди сыгранных и опубликованных, в первую волну 00 после
+  `first_published_at` + 24 ч и + 72 ч (окно — сутки): журнал «когда ESPN дописывает»;
+  `rechecked_at` не трогает. Перепроверка важнее выборки у одного матча.
+- **Правило «не хуже»** — ко всякому повторному summary (перепроверка, выборка, смена статуса после
+  захвата с изменившимся телом): новое и хранимое тела разбираются, по каждой части (строки
+  состава, игроки со статистикой, заполненные командные статы, события) число единиц нового ≥
+  старого → пишем новое (`filled` — стало богаче, `changed` — правки значений, `same`); хоть одна
+  часть беднее → остаётся хранимый разбор, перечитанный по `raw_uri`/`raw_sha256`
+  (`EspnRawStore.load_exact`), в журнал — `downgrade_rejected`. Сравнение — по разобранному, не по
+  хешу байтов (ESPN меняет байты у 69 % ответов).
+- **Журнал** `iceberg.ops.espn_recheck_v1` (создаёт `prepare`): строка на попытку — `checked_at,
+  run_id, slug, season_year, event_id, kind` (`recheck` / `sample_24h` / `sample_72h` / `refresh` —
+  смена статуса с новым телом), `before_parts` / `after_parts` (JSON частей; `NULL` после неудачной
+  загрузки), `outcome` (`filled` / `same` / `changed` / `downgrade_rejected` / `failed`). Пишется
+  после записи пачки: в журнале — то, что лежит в bronze.
+- **Нормы загрузок** (DQ сводки, журнал запросов, `disposition = 'success'` на `url_fingerprint`):
+  в среднем ≤ 1,1 за 7 суток, ≤ 2 на матч за 3 суток. Ожидание по построению: 1 + 0,05 × 2
+  (выборка) + доля перепроверок; проверяется на живом журнале после #1507.
+- **Сводка:** `• ESPN перепроверка DD.MM: downgrade_rejected за сутки: N` (с лигами, `‼️` при N > 0)
+  и `• ESPN перепроверка DD.MM: дозаполнено при перепроверке: X из Y (Z %); по лигам: …`
+  (`quality.build_recheck_sql` / `render_recheck_lines`). **Сторож:** правило `downgrade`.
+- **Темп:** перепроверки и выборка идут по полосе `live` той же заслонки (S0).

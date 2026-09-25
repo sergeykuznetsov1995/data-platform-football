@@ -17,6 +17,10 @@
            раз в сутки, без issue; отбой — когда последняя волна с этим турниром зелёная или его
            нет ни в одной из RED_WAVES последних волн. Однократный сбой не тревожит. Журнала ещё
            нет (до #1507) или Trino недоступен — правило молча пропускается.
+  downgrade — (#1506) за последние DOWNGRADE_H часов в журнале перепроверок RECHECK_LOG есть
+           хотя бы один `downgrade_rejected` (ESPN прислал беднее, чем лежит, — оставили старое):
+           тревога с лигами, «продолжается» раз в сутки, без issue; отбой — когда за DOWNGRADE_H
+           часов случаев нет. Журнала ещё нет (до #1507) или Trino недоступен — молчит.
 Эпизод (механика — /root/watchdog/transfermarkt_stall_watch.py, #1389): новое правило —
 тревога; то же — молчим, «⏳ продолжается N ч» не чаще раза в 24 ч от последнего сообщения;
 через ISSUE_AFTER_H от первой тревоги — issue (labels ISSUE_LABELS, заголовок с ключом
@@ -56,6 +60,9 @@ TS_COL = "_source_fetched_at"   # честное время загрузки; _i
 WAVE_LOG = "iceberg.ops.espn_wave_tournament_v1"
 WAVE_ROW = "(wave)"
 RED_WAVES = 3
+# #1506: журнал перепроверок (scrapers/espn/recheck.py) и окно правила downgrade.
+RECHECK_LOG = "iceberg.ops.espn_recheck_v1"
+DOWNGRADE_H = 24
 SENTINEL = "__sentinel__"
 STALL_H = 36
 ISSUE_AFTER_H = 24
@@ -71,6 +78,7 @@ TG_ENV = Path("/root/.claude/telegram.env")
 RULE_TITLE = {
     "paused": "DAG ESPN на паузе или metadb недоступен",
     "stall": f"нет новых матчей в bronze {STALL_H} ч",
+    "downgrade": f"downgrade_rejected за {DOWNGRADE_H} ч",
 }
 RED_PREFIX = "red:"
 
@@ -202,6 +210,41 @@ def evaluate_red(waves, known):
         if latest is None or latest[0] != "red":
             alerts[RED_PREFIX + slug] = None
     return alerts
+
+
+def downgrade_sql(now):
+    """Лиги с downgrade_rejected за DOWNGRADE_H ч. Строка-заглушка: пустой ответ = падение."""
+    lo, hi = sql_ts(now - timedelta(hours=DOWNGRADE_H)), sql_ts(now)
+    return (f"SELECT slug, cast(count(*) AS varchar) FROM {RECHECK_LOG} "
+            f"WHERE outcome = 'downgrade_rejected' AND checked_at > timestamp '{lo}' "
+            f"AND checked_at <= timestamp '{hi}' GROUP BY slug "
+            f"UNION ALL SELECT '{SENTINEL}', ''")
+
+
+def read_downgrades(now):
+    """{slug: случаев} за DOWNGRADE_H ч; None — журнала нет или Trino недоступен."""
+    out = trino(downgrade_sql(now))
+    if out is None:
+        return None
+    found, seen = {}, False
+    for cells in csv.reader(out.splitlines()):
+        if len(cells) != 2:
+            continue
+        if cells[0] == SENTINEL:
+            seen = True
+        elif cells[1].isdigit():
+            found[cells[0]] = int(cells[1])
+    return found if seen else None
+
+
+def evaluate_downgrade(found):
+    """{"downgrade": текст | None (отбой)} по read_downgrades."""
+    if not found:
+        return {"downgrade": None}
+    leagues = ", ".join(f"{slug} {n}" for slug, n in sorted(found.items()))
+    return {"downgrade": (f"🟠 ESPN: downgrade_rejected за {DOWNGRADE_H} ч — "
+                          f"{sum(found.values())} (ESPN прислал беднее, оставлено старое): "
+                          f"{leagues}. #1506")}
 
 
 def evaluate(now, dag_rows, bronze):
@@ -408,6 +451,7 @@ def main(argv=None):
     bronze = read_bronze(now)
     alerts = evaluate(now, dag_rows, bronze)
     waves = read_red_waves()
+    downgrades = read_downgrades(now)
 
     state = load_state(args.state)
     msgs, bits = [], []
@@ -420,6 +464,11 @@ def main(argv=None):
         bits.append("red=no_wave_log")
     else:
         for rule, text in evaluate_red(waves, state["episodes"]).items():
+            episode(state, rule, text, now, msgs, bits, args.dry_run, issue=False)
+    if downgrades is None:
+        bits.append("downgrade=no_recheck_log")
+    else:
+        for rule, text in evaluate_downgrade(downgrades).items():
             episode(state, rule, text, now, msgs, bits, args.dry_run, issue=False)
 
     failed = 0

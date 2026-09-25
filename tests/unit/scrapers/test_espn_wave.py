@@ -26,6 +26,7 @@ import pytest
 from scrapers.espn import editions_store, urls, wave
 from scrapers.espn.denominator import load_denominator
 from scrapers.espn.editions import EditionState
+from scrapers.espn.parser_contracts import PARSER_VERSION
 from scrapers.espn.raw_store import RawTargetNotFound
 from scrapers.espn.transport_contracts import HttpStatusError
 from tests.unit.scrapers.test_espn_bronze_writer import FakeTrino
@@ -871,3 +872,46 @@ def test_failed_summary_download_keeps_the_final_in_the_denominator(tmp_path) ->
     assert [(w.slug, w.event_ids) for w in again.works] == [("ger.2", (456996,))]
     _run(again, client, trino)
     assert _matches(trino)[456996]["lineup_state"] == "captured"
+
+
+# ------------------------------------------------------ recheck key (#1506)
+
+
+@pytest.mark.unit
+def test_shootout_change_alone_brings_the_final_back_once(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    yesterday = json.loads(_first_day()[0])
+    for side, score in zip(yesterday["events"][0]["competitions"][0]["competitors"], (4, 3)):
+        side["shootoutScore"] = score
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = json.dumps(yesterday).encode()
+    downloads = len(client.network("/summary?"))
+
+    plan = _plan(client, trino, tmp_path)
+    _run(plan, client, trino)
+
+    assert [(w.slug, w.event_ids) for w in plan.works] == [("eng.1", (578281,))]
+    row = _matches(trino)[578281]
+    assert (row["home_shootout"], row["away_shootout"]) == (4, 3)
+    assert row["lineup_state"] == "captured"
+    assert len(client.network("/summary?")) == downloads  # replayed from the raw store
+    # Written with the day's shootout: the next wave has nothing to do.
+    assert _plan(client, trino, tmp_path).works == ()
+
+
+@pytest.mark.unit
+def test_new_parser_version_downloads_nothing(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    for row in trino.tables["espn_match"]:
+        row["parser_version"] = "espn-native-parser-v4"
+    downloads = len(client.network("/summary?"))
+
+    assert _plan(client, trino, tmp_path).works == ()  # not a reason to fetch
+
+    yesterday = json.loads(_first_day()[0])
+    yesterday["events"][0]["status"]["type"]["name"] = "STATUS_FINAL_AET"
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = json.dumps(yesterday).encode()
+    _run(_plan(client, trino, tmp_path), client, trino)
+
+    assert len(client.network("/summary?")) == downloads
+    assert client.replays == [_summary_key("eng.1")]
+    assert _matches(trino)[578281]["parser_version"] == PARSER_VERSION
