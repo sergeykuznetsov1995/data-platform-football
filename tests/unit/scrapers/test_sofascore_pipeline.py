@@ -2366,6 +2366,8 @@ def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(
         == "sofascore_player_universe"
     )
     result = json.loads(output.read_text(encoding="utf-8"))
+    # #1357: Trino round-trips of the process; the count is process-wide.
+    assert set(result["traffic"].pop("trino_queries")) == {"select", "merge", "other"}
     assert result["traffic"] == {
         "paid_proxy_bytes": 0,
         "paid_proxy_mb": 0.0,
@@ -2411,6 +2413,8 @@ def test_match_runner_long_manifest_noop_is_exact_zero_before_browser(
     assert transport.calls == 0
     browser.assert_not_called()
     result = json.loads(output.read_text(encoding="utf-8"))
+    # #1357: Trino round-trips of the process; the count is process-wide.
+    assert set(result["traffic"].pop("trino_queries")) == {"select", "merge", "other"}
     assert result["traffic"] == {
         "paid_proxy_bytes": 0,
         "paid_proxy_mb": 0.0,
@@ -3024,6 +3028,8 @@ def test_empty_bronze_schedule_fails_before_any_browser_or_source_fallback(
     browser.assert_not_called()
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert "refusing browser/source fallback" in payload["errors"][0]
+    # #1357: Trino round-trips of the process; the count is process-wide.
+    assert set(payload["traffic"].pop("trino_queries")) == {"select", "merge", "other"}
     assert payload["traffic"] == {
         "paid_proxy_bytes": 0,
         "paid_proxy_mb": 0.0,

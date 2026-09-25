@@ -23,7 +23,9 @@ except ValueError:
     pass
 sys.path.insert(0, str(ROOT))
 
+from scrapers.sofascore import trino_accounting
 from scrapers.sofascore.catalog import SofaScoreCatalog
+from scrapers.sofascore.manifest import preload_manifest_scope
 from scrapers.sofascore.pipeline import (
     EVENT_PATHS,
     PLAYER_PATHS,
@@ -206,7 +208,7 @@ def _trino_connect():
     user = os.environ.get("TRINO_USER", "airflow")
     password = os.environ.get("TRINO_PASSWORD")
     if password:
-        return trino.dbapi.connect(
+        return trino_accounting.counted_connection(trino.dbapi.connect(
             host=os.environ.get("TRINO_HOST", "trino"),
             port=int(os.environ.get("TRINO_PORT", "8443")),
             user=user,
@@ -214,13 +216,13 @@ def _trino_connect():
             http_scheme="https",
             auth=BasicAuthentication(user, password),
             verify=False,
-        )
-    return trino.dbapi.connect(
+        ))
+    return trino_accounting.counted_connection(trino.dbapi.connect(
         host=os.environ.get("TRINO_HOST", "trino"),
         port=int(os.environ.get("TRINO_PORT", "8080")),
         user=user,
         catalog="iceberg",
-    )
+    ))
 
 
 def _missing_table(exc: BaseException) -> bool:
@@ -446,6 +448,13 @@ def prepare_workload_plan(
             raise RuntimeError(
                 f"{item.league} {canonical} has no discovered SofaScore season"
             )
+        # #1357: one manifest SELECT for the whole scope; every later
+        # per-endpoint read of this scope is answered from memory.
+        preload_manifest_scope(
+            runtime.manifest_store,
+            tournament.unique_tournament_id,
+            source_season.season_id,
+        )
         drop_reason = None
         season_plan = None
         if season_evidence == "pages":

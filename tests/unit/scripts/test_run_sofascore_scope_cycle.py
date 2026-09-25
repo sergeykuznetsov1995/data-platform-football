@@ -199,6 +199,8 @@ def test_run_phase_plans_matches_from_the_scope_season_evidence(tmp_path):
         "exit_code": 0,
         "plan": str(plan),
         "errors": [],
+        # #1357: planner and runner are doubles here -> no Trino round-trip.
+        "trino_queries": {"select": 0, "merge": 0, "other": 0},
     }
     assert planner.call_args.kwargs["phase"] == "targets"
     assert planner.call_args.kwargs["season_evidence"] == "bronze"

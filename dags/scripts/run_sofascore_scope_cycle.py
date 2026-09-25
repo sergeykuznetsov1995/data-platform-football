@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "dags") not in sys.path:
     sys.path.insert(0, str(ROOT / "dags"))
 
+from scrapers.sofascore import trino_accounting  # noqa: E402
 from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
     ScopeOverlayPaths,
     load_exact_scope,
@@ -72,6 +73,7 @@ def _phase_report(path: Path) -> dict[str, Any]:
             "control_channel_failures",
             "accounting_uncertain",
             "player_universe_gaps",
+            "trino_queries",
         ):
             if field in traffic:
                 report[field] = traffic[field]
@@ -99,6 +101,8 @@ def run_phase(
 
     if phase not in {"season", "matches"}:
         raise ValueError("phase must be season or matches")
+    # #1357: count this phase's Trino round-trips from zero.
+    trino_accounting.reset()
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     capture_key = str(scope["capture_key"])
@@ -136,6 +140,7 @@ def run_phase(
             "plan": None,
             "errors": [f"workload_plan_prepare: {type(exc).__name__}: {exc}"],
             "source_request_count": 0,
+            "trino_queries": trino_accounting.snapshot(),
         }
     argv = [
         "--entity", entity,
@@ -156,12 +161,15 @@ def run_phase(
     # previous try must not be read as this one's.
     report_path.unlink(missing_ok=True)
     exit_code = int(run_capture(argv))
+    report = _phase_report(report_path)
+    # A runner report without ``traffic`` still gets the phase's count.
+    report.setdefault("trino_queries", trino_accounting.snapshot())
     return {
         "phase": phase,
         "status": "success" if exit_code == 0 else "failed",
         "exit_code": exit_code,
         "plan": str(plan),
-        **_phase_report(report_path),
+        **report,
     }
 
 
