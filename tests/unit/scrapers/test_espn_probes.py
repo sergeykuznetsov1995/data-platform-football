@@ -204,7 +204,10 @@ def test_real_summary_gets_a_disposition_without_raising(
     assert counted == starters
     # Shirt numbers live on the roster entry, not on the athlete (C6-F5).
     assert sum(row.jersey is not None for row in result.lineup) == lineup_rows
-    assert len(result.matchsheet) == (2 if matchsheet_state == "captured" else 0)
+    # Match facts are written for both teams even without team statistics.
+    assert len(result.matchsheet) == 2
+    if matchsheet_state == "valid_empty":
+        assert {row.total_shots for row in result.matchsheet} == {None}
     for row in result.matchsheet:
         assert (row.formation is not None) is formation
         assert row.score == (
@@ -254,6 +257,21 @@ def test_real_summary_referee_linescores_and_attendance() -> None:
         (None, None, None)
     }
     assert {row.formation for row in eng1_2005.matchsheet} == {None}
+
+    # No team statistics: match facts still come from header and gameInfo.
+    _, uru1 = _parse("summary_uru1_2026_ten_starters.json")
+    assert [(row.score_h1, row.score_h2) for row in uru1.matchsheet] == [
+        (1, 0),
+        (0, 1),
+    ]
+    assert {(row.venue_id, row.venue) for row in uru1.matchsheet} == {
+        (10435, "Estadio Arquitecto Antonio Eleuterio Ubilla")
+    }
+    _, gua1 = _parse("summary_gua1_2026_no_roster.json")
+    assert [(row.score_h1, row.score_h2) for row in gua1.matchsheet] == [
+        (3, 0),
+        (0, 0),
+    ]
 
     _, ucl_2010 = _parse("summary_ucl_2010.json")
     # ESPN reports attendance 0 when it does not know it.

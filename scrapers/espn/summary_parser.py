@@ -789,22 +789,28 @@ def _matchsheet(
         for team_id, (_, _, block) in blocks.items()
         if block.get("statistics") is not None
     }
-    # Honestly empty only when neither team carries a statistic (C6-F1).
-    if not any(statistics_by_team.values()):
-        return (), EntityParseState.VALID_EMPTY
-    if any(not statistics_by_team.get(team_id) for team_id in by_team):
+    # The state describes team statistics only: honestly empty when neither
+    # team carries one (C6-F1).  Match facts are written regardless, one row
+    # per header competitor with NULL statistic columns (plan amendment 25.09).
+    state = (
+        EntityParseState.CAPTURED
+        if any(statistics_by_team.values())
+        else EntityParseState.VALID_EMPTY
+    )
+    if state is EntityParseState.CAPTURED and any(
+        not statistics_by_team.get(team_id) for team_id in by_team
+    ):
         anomalies.add("one_sided_statistics")
 
     venue_id, venue_name, attendance, referee_name, _ = game_info
     rows: list[MatchsheetRow] = []
-    for team_id, statistics in statistics_by_team.items():
-        if not statistics:
-            continue
-        side, team_name, block = blocks[team_id]
+    for team_id, (side, team_name) in by_team.items():
+        statistics = statistics_by_team.get(team_id) or []
+        block = blocks[team_id][2] if team_id in blocks else {}
         values = _stat_values(
             statistics, f"summary.boxscore.teams[{team_id}].statistics"
         )
-        if not set(values).intersection(
+        if statistics and not set(values).intersection(
             {"total_shots", "shots_on_target", "possession_pct"}
         ):
             raise _SourceMalformed(
@@ -890,10 +896,7 @@ def _matchsheet(
                 ),
             )
         )
-    return (
-        tuple(sorted(rows, key=lambda row: row.home_away != "home")),
-        EntityParseState.CAPTURED,
-    )
+    return tuple(sorted(rows, key=lambda row: row.home_away != "home")), state
 
 
 _EVENT_KEYS = (

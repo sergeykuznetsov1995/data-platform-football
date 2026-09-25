@@ -948,7 +948,12 @@ def test_matchsheet_without_team_statistics_is_valid_empty(empty: str) -> None:
     result = _summary(payload)
 
     assert result.lineup_state is EntityParseState.CAPTURED
-    assert result.matchsheet == ()
+    # Match facts are kept, one row per team; statistic columns stay NULL.
+    assert [row.team_id for row in result.matchsheet] == [10, 20]
+    for row in result.matchsheet:
+        assert row.total_shots is None and row.possession_pct is None
+        assert row.statistics_json == "[]"
+        assert row.score is not None and row.venue is not None
     assert result.matchsheet_state is EntityParseState.VALID_EMPTY
     # Only both entities empty make the match VALID_EMPTY.
     assert result.disposition is SummaryDisposition.CAPTURED
@@ -984,8 +989,10 @@ def test_one_sided_statistics_write_the_other_side_and_flag_the_match(
 
     assert result.disposition is SummaryDisposition.LINEUP_ANOMALY
     assert result.anomalies == ("one_sided_statistics",)
-    assert [row.team_id for row in result.matchsheet] == [10]
+    assert [row.team_id for row in result.matchsheet] == [10, 20]
     assert result.matchsheet[0].total_shots == "0"
+    assert result.matchsheet[1].total_shots is None
+    assert result.matchsheet[1].statistics_json == "[]"
     assert result.lineup_state is EntityParseState.CAPTURED
 
 
