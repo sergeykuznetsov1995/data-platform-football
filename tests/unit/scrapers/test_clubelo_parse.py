@@ -139,3 +139,13 @@ def test_non_numeric_cell_fails_closed(riverplate_html):
     broken = riverplate_html.replace('<td class="r">1732</td>', '<td class="r">n/a</td>', 1)
     with pytest.raises(LayoutChanged, match="New Elo"):
         parse_club_page(broken, "riverplate")
+
+
+@pytest.mark.parametrize("old, new", [
+    ("<th>Elo %</th><th>FT</th>", "<th>FT</th><th>Elo %</th>"),  # swapped columns
+    ("<th>New Elo</th>", "<th>Elo</th>"),  # renamed column
+])
+def test_match_headers_must_match_exactly(riverplate_html, old, new):
+    assert old in riverplate_html
+    with pytest.raises(LayoutChanged, match="headers changed"):
+        parse_club_page(riverplate_html.replace(old, new), "riverplate")

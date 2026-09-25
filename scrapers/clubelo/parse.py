@@ -18,6 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from lxml import html as lxml_html
 
 MATCH_TABLE_COLUMNS = 14
+# Positional parse: the 14 headers must be exactly these, in this order. The
+# first one is "<year> Date" (the year span changes), so only "Date" is fixed.
+MATCH_TABLE_HEADERS = (
+    "Date", "H/A", "Opponent", "Prior Δ", "HFA", "Elo %", "FT", "ET", "P",
+    "Game Δ", "Post-Game Δ", "Elo +/-", "New Elo", "New Rank",
+)
 MATCH_ROW_CELLS = (6, 14)  # 6 = fixture without a result, 14 = played match
 
 _H1_HREF = re.compile(r'<h1><a href="/(\d{4}-\d{2}-\d{2})/([^"]+)">')
@@ -168,6 +174,10 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
     header = table.xpath("./tr[th]|./thead/tr[th]|./tbody/tr[th]")
     if len(header) != 1 or len(header[0].xpath("./th")) != MATCH_TABLE_COLUMNS:
         raise LayoutChanged("match table header is not one row of 14 th")
+    names = [_text(th) for th in header[0].xpath("./th")]
+    names[0] = re.sub(r"^\d{4}\s*", "", names[0])  # "2026Date" → "Date"
+    if tuple(names) != MATCH_TABLE_HEADERS:
+        raise LayoutChanged(f"match table headers changed: {names}")
     rows = []
     for seq, tr in enumerate(table.xpath(".//tr[td]")):
         tds = tr.xpath("./td")
