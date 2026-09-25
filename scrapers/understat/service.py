@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
+import json
 import logging
-from typing import Any, Mapping, Optional
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional
+from urllib.parse import quote
 
 import pandas as pd
 
@@ -19,6 +22,7 @@ from .client import UnderstatClient
 from .client import UnderstatHTTPError
 from .closed_check import league_payload_hashes
 from .parsers import (
+    UnderstatSchemaDrift,
     parse_match_payload,
     parse_player_season_stats,
     parse_schedule,
@@ -65,6 +69,48 @@ class UnderstatSource:
         self.catalog = UnderstatCatalog(client, today=self.today)
         # #1431: fingerprints of the last parsed league response.
         self.last_league_hashes: dict[str, str] = {}
+
+    def _validate(
+        self,
+        validator: Callable[..., None],
+        payload: Mapping[str, Any],
+        cache_name: str,
+        **kwargs: Any,
+    ) -> None:
+        """Run a payload validator; on drift keep the response, then re-raise.
+
+        #1428 (R-02): the regular cache file is overwritten by the next run,
+        so a drifted response is copied to ``<cache_dir>/schema_drift/``.
+        Saving is best-effort and never replaces the drift exception.
+        """
+
+        try:
+            validator(payload, **kwargs)
+        except UnderstatSchemaDrift:
+            self._save_drift_payload(payload, cache_name)
+            raise
+
+    def _save_drift_payload(self, payload: Any, cache_name: str) -> None:
+        cache_dir = getattr(self.client, "cache_dir", None)
+        if cache_dir is None:
+            return
+        try:
+            folder = Path(cache_dir) / "schema_drift"
+            folder.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            target = folder / f"{stamp}_{cache_name}"
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+        except Exception:  # the drift itself stays the verdict
+            logger.warning(
+                "Unable to save Understat schema-drift payload %s",
+                cache_name,
+                exc_info=True,
+            )
+            return
+        logger.warning("Understat schema-drift payload saved to %s", target)
 
     def _scope(self, league: str, season_slug: str, source_season_id: int):
         definition = LEAGUE_BY_CANONICAL.get(league)
@@ -118,7 +164,11 @@ class UnderstatSource:
             return {}
         if not isinstance(league_payload, Mapping):
             raise TypeError("getLeagueData payload must be an object")
-        validate_league_payload(league_payload)
+        self._validate(
+            validate_league_payload,
+            league_payload,
+            _league_cache_name(definition.source_league, source_season_id),
+        )
         return league_payload_hashes(
             {
                 "schedule": parse_schedule(league_payload, scope),
@@ -157,7 +207,11 @@ class UnderstatSource:
             league_payload = {"dates": [], "players": [], "teams": {}}
         if not isinstance(league_payload, Mapping):
             raise TypeError("getLeagueData payload must be an object")
-        validate_league_payload(league_payload)
+        self._validate(
+            validate_league_payload,
+            league_payload,
+            _league_cache_name(definition.source_league, source_season_id),
+        )
 
         schedule = parse_schedule(league_payload, scope)
         players = parse_player_season_stats(league_payload, scope)
@@ -188,7 +242,11 @@ class UnderstatSource:
                 raise
             if not match_payload:
                 continue
-            validate_match_payload(match_payload)
+            self._validate(
+                validate_match_payload,
+                match_payload,
+                f"match_{quote(str(row['game_id']), safe='')}.json",
+            )
             schedule.loc[
                 schedule["game_id"] == row["game_id"], "has_data"
             ] = _match_payload_has_rows(match_payload)
@@ -204,11 +262,13 @@ class UnderstatSource:
         breakdown_frames: list[pd.DataFrame] = []
         # A schedule-only future scope deliberately makes no per-team calls.
         if played_rows:
+            # #1428: a team without a played match (empty history) has no
+            # team page yet; asking for it only returns empty statistics.
             teams = sorted(
                 (
                     (int(team["id"]), str(team["title"]))
                     for team in _team_records(league_payload.get("teams"))
-                    if team.get("id") not in (None, "") and team.get("title")
+                    if team.get("history")
                 ),
                 key=lambda item: item[0],
             )
@@ -218,7 +278,12 @@ class UnderstatSource:
                     source_season_id,
                     force_refresh=refresh_scope or mode == "reparse",
                 )
-                validate_team_payload(team_payload)
+                self._validate(
+                    validate_team_payload,
+                    team_payload,
+                    _team_cache_name(team_name, source_season_id),
+                    source_season_id=source_season_id,
+                )
                 player_team, breakdowns = parse_team_payload(
                     team_payload,
                     scope,
@@ -243,6 +308,19 @@ class UnderstatSource:
                 breakdown_frames, empty_breakdowns
             ),
         }
+
+
+def _league_cache_name(source_league: str, source_season_id: int) -> str:
+    """Same file name as ``UnderstatClient.get_league_data`` caches."""
+
+    return f"league_{quote(source_league, safe='_-')}_{source_season_id}.json"
+
+
+def _team_cache_name(team_name: str, source_season_id: int) -> str:
+    """Same file name as ``UnderstatClient.get_team_data`` caches."""
+
+    slug = quote(team_name.replace(" ", "_"), safe="_-")
+    return f"team_{slug}_{source_season_id}.json"
 
 
 def _team_records(value: Any) -> list[Mapping[str, Any]]:
