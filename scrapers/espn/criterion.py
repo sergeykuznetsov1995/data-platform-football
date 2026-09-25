@@ -27,13 +27,15 @@ that copy (package ``/root/espn-deliveries/1505/summary``).
   ``kickoff + 2 h`` (``unchecked`` — a stopped collection shows up here
   instead of an empty denominator).
 * The streak counts consecutive days with deadlines whose ``ok / due`` is at
-  least 99 % (exact ratio, not the rounded display); days without deadlines
-  (``due = 0``) are neutral and do not break it.  Milestone 1 = a streak of 3.
+  least 99 % (exact ratio, not the rounded display); measured days without
+  deadlines (``due = 0``) are neutral and do not break it, an unmeasured day
+  does.  Milestone 1 = a streak of 3.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Optional, Sequence
 
@@ -178,12 +180,18 @@ def day_result(day: str, rows: Sequence[Sequence]) -> DayResult:
 def summarize_days(days: Iterable[DayResult]) -> int:
     """Streak of consecutive days with deadlines meeting the target.
 
-    Walks back from the newest day; days with ``due = 0`` are neutral
-    (skipped), the first day with deadlines below ``TARGET_PCT`` ends it.
+    Walks back from the newest day; measured days with ``due = 0`` are
+    neutral (skipped), the first day with deadlines below ``TARGET_PCT`` ends
+    it, and so does a missing day: an unmeasured day is not a neutral one.
     """
 
     streak = 0
+    expected: date | None = None
     for result in sorted(days, key=lambda item: item.day, reverse=True):
+        day = date.fromisoformat(result.day)
+        if expected is not None and day != expected:
+            break
+        expected = day - timedelta(days=1)
         if result.due <= 0:
             continue
         if not meets(result.ok, result.due):

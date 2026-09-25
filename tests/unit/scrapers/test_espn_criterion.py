@@ -179,6 +179,14 @@ def test_days_without_deadlines_are_neutral_and_do_not_break_the_streak():
     assert summarize_days(days + [DayResult("2026-10-15", due=10, ok=9)]) == 0
 
 
+def test_an_unmeasured_day_breaks_the_streak():
+    """Astra 1505 r2: 10, 12 and 14.10 measured, 11 and 13 not — no streak of 3."""
+    gaps = [DayResult(day, due=10, ok=10) for day in ("2026-10-10", "2026-10-12", "2026-10-14")]
+    assert summarize_days(gaps) == 1
+    # A measured neutral day in between keeps it.
+    assert summarize_days(gaps + [DayResult("2026-10-13", due=0, ok=0)]) == 2
+
+
 def test_streak_threshold_uses_the_exact_ratio_not_the_rounded_pct():
     near_miss = DayResult("2026-10-11", due=96, ok=95)
     assert near_miss.pct == Decimal("99.0")
