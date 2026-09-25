@@ -2,13 +2,14 @@
 
 ## `espn_stall_watch.py` — сторож простоя сбора ESPN (#1496)
 
-Хостовый скрипт (cron `*/15`), не часть Airflow. Два правила, у каждого своя серия тревог в
+Хостовый скрипт (cron `*/15`), не часть Airflow. Три правила, у каждого своя серия тревог в
 Telegram:
 
 | Правило | Когда тревога |
 | --- | --- |
 | `paused` | любой из `EXPECTED_DAGS` (`dag_ingest_espn`, `dag_trigger_espn_daily`, `dag_monitor_espn`, `dag_discover_espn_registry`) в metadb `espn-airflow-airflow-metadb-1` на паузе или отсутствует; metadb не отвечает — тревога того же правила «недоступен» |
 | `stall` | в `espn_lineup_generation_v2` ∪ `espn_matchsheet_generation_v2` нет ни одного матча с `_source_fetched_at` за 36 ч (не `_ingested_at` — в этих таблицах оно = execution_date прогона); Trino недоступен — правило пропускается |
+| `red:<slug>` (#1505) | турнир красный в 3 последних волнах `dag_espn_current` подряд по журналу волн `iceberg.ops.espn_wave_tournament_v1`; без issue; отбой — последняя волна с турниром зелёная или его нет ни в одной из 3 последних; журнала нет (до #1507) или Trino недоступен — правило молча пропускается |
 
 Серия: первая тревога → тишина, «⏳ продолжается N ч» раз в 24 ч → через 24 ч issue
 (`source:espn,area:bronze,type:bug`, заголовок `ESPN: сторож [<правило>] — …`; открытая issue с
@@ -19,10 +20,24 @@ State — `/root/watchdog/state/espn_stall_state.json` (+ `.lock`), неподт
 ждут в `pending` и повторяются следующим тиком.
 
 Контракт на #1504: реакция нового контура на сбой — красный турнир, никаких `pause_all` /
-`on_failure → pause`; тревога на турнир, красный N волн подряд, — #1505 (этот сторож ловит паузу и
-общий простой).
+`on_failure → pause`; тревога на турнир, красный 3 волны подряд, — правило `red:<slug>` (#1505).
 
-### Установка на хост (после мержа)
+### Обновление установленного сторожа (#1505 и дальше)
+
+Сторож уже стоит в cron (#1496): crontab не трогать, заменить только файл, сохранив прежний.
+
+```bash
+cp -p /root/watchdog/espn_stall_watch.py /root/watchdog/espn_stall_watch.py.prev-$(date +%Y%m%d)
+cp deploy/espn/espn_stall_watch.py /root/watchdog/espn_stall_watch.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile /root/watchdog/espn_stall_watch.py
+python3 /root/watchdog/espn_stall_watch.py --dry-run --state /tmp/espn-dry.json   # до #1507: red=no_wave_log
+```
+
+Откат: `cp -p /root/watchdog/espn_stall_watch.py.prev-<дата> /root/watchdog/espn_stall_watch.py`.
+State `/root/watchdog/state/espn_stall_state.json` совместим в обе стороны (эпизоды `red:<slug>`
+старый файл просто не читает).
+
+### Первая установка на хост (#1496, после мержа)
 
 ```bash
 cp deploy/espn/espn_stall_watch.py /root/watchdog/espn_stall_watch.py
@@ -86,7 +101,8 @@ PY
   `source_malformed` / `lineup_anomaly`, NULL до загрузки summary), `anomalies` (JSON-список
   классов), `reason`, `lineup_state` / `team_stats_state` / `events_state` (`captured` /
   `valid_empty` / `malformed`, `pending` до summary), `deep_state` (`pending` до волны 3),
-  `first_fetched_at`, `rechecked_at` (NULL до перепроверки #1506).
+  `first_fetched_at`, `rechecked_at` (NULL до перепроверки #1506), `first_published_at` и
+  `status_checked_at` (измеритель свежести #1505, см. «Свежесть и DQ»).
 - Запись: пачка = турнир-сезон = 4 коммита (lineup → team_stats → events → match; строка матча —
   последней, это признак завершённой публикации, #1504), каждый —
   `insert_dataframe_atomic(delete_filter="competition_slug=… AND season_year=… AND event_id IN (…)",
@@ -136,10 +152,10 @@ ctime каталога, который пинует сторож WhoScored (`scr
 
 | Задача | Что делает | Повторы |
 |---|---|---|
-| `prepare` | `ensure_bronze_tables(IcebergWriter())` + `ensure_journal_table` (идемпотентно, каждый прогон) | 2 |
-| `plan_wave` | издания из кэша (лиги с `failed` — перечитываются) → статусы дня `all/scoreboard` за вчера и сегодня UTC (`force_refresh`) → сверка с `bronze.espn_match` → список турнир-сезонов с работой; в волну 00 — ещё проверка зависших POSTPONED/SUSPENDED старше 3 суток | 2 |
+| `prepare` | `ensure_bronze_tables(IcebergWriter())` + `ensure_journal_table` + `ensure_wave_log_table` (идемпотентно, каждый прогон) | 2 |
+| `plan_wave` | издания из кэша (лиги с `failed` — перечитываются) → статусы дня `all/scoreboard` за вчера и сегодня UTC (`force_refresh`) → сверка с `bronze.espn_match` → список турнир-сезонов с работой; в волну 00 — ещё проверка зависших POSTPONED/SUSPENDED старше 3 суток и сверка со списком core (#1505) | 2 |
 | `run_tournament` | map по турнир-сезону (`max_active_tis_per_dag=4`): summary новых финалов (cache-first — одна загрузка на матч) → разбор → одна пачка `write_tournament_batch` → журнал запросов | 2, через 3 мин |
-| `wave_summary` | `all_done`: таблица «турнир → состояние → первая ошибка», счётчики `withdrawn`/`moved`, время волны | 0 |
+| `wave_summary` | `all_done`: таблица «турнир → состояние → первая ошибка», счётчики `withdrawn`/`moved`, время волны; журнал волн пишется **до** решения «волна красная» (#1505) | 0 |
 
 - **В волну попадает турнир-сезон**, если у него есть финал без захваченного summary
   (`lineup_state = pending` или строки нет), новый матч или изменился статус/счёт/kickoff. Уже
@@ -169,8 +185,8 @@ ctime каталога, который пинует сторож WhoScored (`scr
   турнир, без повторов. Одиночный 403 (`OriginBlocked`) при проверке статуса, доборе дня или
   чтении издания — ошибка своего турнира, не волны. Алертов в Telegram из DAG нет:
   красный турнир виден в итоге `wave_summary` (строка «турнир → состояние → первая ошибка» в
-  логе и XCom). Тревога на повторяющийся сбой (турнир красный N волн подряд) — задача
-  [#1505](https://github.com/sergeykuznetsov1995/data-platform-football/issues/1505).
+  логе и XCom) и в журнале волн; тревога на турнир, красный 3 волны подряд, — правило
+  `red:<slug>` сторожа (#1505).
 - **Время волны** пишется в лог `wave_summary`; p95 (конец − старт) ≤ 60 мин за 3 суток меряется
   по полным границам прогона — `dag_run.end_date − dag_run.start_date` `dag_espn_current` в metadb
   `espn-airflow` (подготовка, ожидание пула и запись после последнего запроса входят); журнал
@@ -189,3 +205,54 @@ ctime каталога, который пинует сторож WhoScored (`scr
 
 **Что включает #1507:** каталог DAG `deploy/espn/dags` и `PYTHONPATH` в `espn-airflow`, пул
 `espn_live`, env выше, снятие паузы `dag_espn_current`; сторож (`EXPECTED_DAGS`/`METADB`) — там же.
+
+## Свежесть и DQ (#1505)
+
+Одно правило для утренней сводки, сторожей и приёмки вехи 1 — `scrapers/espn/criterion.py`
+(docstring = определение; сводка копирует SQL дословно, менять только вместе с пакетом сводки).
+
+- **Знаменатель** — строки `bronze.espn_match` целевых турниров (`senior_official`,
+  `Denominator.targets()`, 163), `duplicate_of IS NULL`; единица — матч (R-40). Срок =
+  `kickoff + 26 ч` (kickoff последний известный: перенос считается от новой даты); сутки D —
+  UTC-день срока.
+- **Вне знаменателя:** `disposition = 'withdrawn'` (отдельный счётчик) и не сыгранный матч,
+  подтверждённый после kickoff: `terminal_nonplayed` или `STATUS_POSTPONED` при
+  `status_checked_at > kickoff`.
+- **Попал** — `played_final`, `lineup_state` и `team_stats_state` ∈ {captured, valid_empty},
+  `first_published_at ≤ срок`. Всё остальное — промах, в том числе матч, чей статус не читался
+  после `kickoff + 2 ч` (остановка сбора видна как промах, а не как пустой знаменатель).
+- **Серия** — подряд сутки со сроками при ok/due ≥ 99 % (точное отношение); сутки без сроков
+  нейтральны. Веха 1 = серия 3. Строка сводки: `• ESPN: сыгранных за сутки DD.MM N, ≤ 24 ч X %
+  (ok/N), серия Y дн. (веха 1: 3 дня ≥ 99 %)`; при N = 0 — «нет сыгранных в новых таблицах».
+
+Колонки `espn_match` для правила (#1505): `first_published_at` — момент перед коммитом строки
+матча (после дочерних таблиц) в пачке, где матч впервые стал сыгранным с терминальными частями
+(погрешность — один MERGE, не вся пачка); каждая следующая пачка переносит его из хранимой строки,
+`_ingested_at` остаётся меткой последней пачки. Новый финал, чей summary не скачался, пишется без
+summary (`pending`, промах измерителя) — матч не выпадает из знаменателя; турнир красный
+(`SummaryFetchError`), задача повторяется. `status_checked_at` —
+`fetched_at` тела дня (или момент ответа core), из которого взят статус. Несыгранный матч, чей
+статус прочитан до `kickoff + 2 ч`, волна переписывает один раз со статусом, прочитанным после.
+
+**Полнота знаменателя (R-09).** Волна 00 UTC читает список событий core
+(`leagues/{slug}/events?dates=D-2..D`, `force_refresh`) по живым целям с открытым изданием в этом
+окне (≤ 161 запрос в сутки); событие core, которого нет ни в bronze, ни в скачанных днях, ищется в
+`league_scoreboard_day` своего турнира и планируется как обычный матч (`topup_days` турнира).
+Событие, которого нет ни в одном дне лиги, — ошибка турнира (красный), не молчаливая потеря.
+
+**Журнал волн** — `iceberg.ops.espn_wave_tournament_v1` (`scrapers/espn/wave_log.py`): строка на
+турнир на волну (`run_id, wave_started_at, wave_finished_at, slug, season_year, state, matches,
+first_error`) и строка самой волны `slug = '(wave)'`. Отсюда тревога `red:<slug>` сторожа и
+p95 длительности волн за сутки в сводке (`criterion.WAVE_DURATION_SQL`, порог 60 мин —
+критерий 3 #1504).
+
+**DQ bronze** — `scrapers/espn/quality.py`, за вчерашние UTC-сутки (строки с `_ingested_at` в D):
+доли `valid_empty` / `source_malformed` / `lineup_anomaly` по турниру (> 20 % при ≥ 5 матчах),
+дубли `event_id`, `_ingested_at < _source_fetched_at` (R-18, должно быть 0), сыгранный без счёта,
+загрузок summary на матч по журналу запросов (> 2 за сутки). В сводку — только нарушения и
+заглушка `downgrade_rejected` (данные появятся с перепроверкой #1506).
+
+**Где строка.** Секция «🔵 ESPN» утренней сводки `/root/watchdog/morning_report.py`: строка
+свежести заменяет временный измеритель #1496, ниже p95 волн и DQ. Пакет наложения —
+`/root/espn-deliveries/1505/summary/` (ставит Fable после мержа). До #1507 новых таблиц нет:
+строка честно пишет «нет сыгранных в новых таблицах».

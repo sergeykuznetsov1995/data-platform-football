@@ -72,6 +72,9 @@ def test_captured_summary_gives_full_match_and_children() -> None:
     assert match["attendance"] == 10000
     assert match["first_fetched_at"] == datetime(2026, 9, 25, 10)
     assert match["rechecked_at"] is None
+    # #1505: first publication = this batch; status read from the given body.
+    assert match["first_published_at"] == STAMP.ingested_at
+    assert match["status_checked_at"] == datetime(2026, 9, 25, 10)
     assert len(lineup) == 40
     assert not any(row["lineup_anomaly"] for row in lineup)
     assert {row["deep_stats_json"] for row in lineup} == {None}
@@ -175,6 +178,7 @@ def test_match_without_summary_is_pending_with_no_children() -> None:
     assert match["lineup_state"] == "pending"
     assert match["team_stats_state"] == match["events_state"] == "pending"
     assert match["first_fetched_at"] is None
+    assert match["first_published_at"] is None
     assert lineup_rows(event, None, **kwargs) == []
     assert team_stats_rows(event, None, **kwargs) == []
     assert event_rows(event, None, **kwargs) == []

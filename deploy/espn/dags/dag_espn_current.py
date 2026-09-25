@@ -7,7 +7,8 @@ collect ESPN (roadmap assumption 8).  Paused on creation all the same.
 
 prepare -> plan_wave -> run_tournament (mapped, one tournament-season each)
 -> wave_summary (all_done).  The logic is ``scrapers.espn.wave``; this file
-only wires Airflow, the transport and Trino.
+only wires Airflow, the transport and Trino.  ``wave_summary`` writes the wave
+log (``scrapers.espn.wave_log``, #1505) before it turns a red wave red.
 """
 
 from __future__ import annotations
@@ -76,9 +77,12 @@ def prepare(**_: Any) -> None:
     from scrapers.base.iceberg_writer import IcebergWriter
     from scrapers.espn.bronze_schema import ensure_bronze_tables
     from scrapers.espn.journal import ensure_journal_table
+    from scrapers.espn.wave_log import ensure_wave_log_table
 
     ensure_bronze_tables(IcebergWriter())
-    ensure_journal_table(_trino().connection)
+    connection = _trino().connection
+    ensure_journal_table(connection)
+    ensure_wave_log_table(connection)
 
 
 def plan_wave(**context: Any) -> list[dict[str, Any]]:
@@ -87,6 +91,7 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
 
     now = datetime.now(timezone.utc)
     boundary = context.get("data_interval_end") or now
+    midnight = boundary.astimezone(timezone.utc).hour == 0
     trino = _trino()
     client = _client()
     failure: BaseException | None = None
@@ -97,8 +102,10 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
             rows=wave.live_rows(load_denominator()),
             state_path=editions_store.default_state_path(),
             now=now,
-            # Stuck POSTPONED/SUSPENDED matches: once a day, in the 00 wave.
-            check_stale=boundary.astimezone(timezone.utc).hour == 0,
+            # Once a day, in the 00 wave: stuck POSTPONED/SUSPENDED matches
+            # and the core event list against bronze (#1505, R-09).
+            check_stale=midnight,
+            check_core=midnight,
         )
     except BaseException as exc:
         failure = exc
@@ -151,7 +158,7 @@ def _state(ti) -> str:
 
 
 def wave_summary(**context: Any) -> dict[str, Any]:
-    from scrapers.espn import wave
+    from scrapers.espn import wave, wave_log
 
     dag_run = context["dag_run"]
     ti = context["ti"]
@@ -174,12 +181,28 @@ def wave_summary(**context: Any) -> dict[str, Any]:
         else:
             failed.append(f"{_task_name(instance)}={state}")
     started = getattr(dag_run, "start_date", None)
-    duration = (
-        (datetime.now(timezone.utc) - started).total_seconds() if started is not None else None
-    )
+    finished = datetime.now(timezone.utc)
+    duration = (finished - started).total_seconds() if started is not None else None
     summary = wave.summarize_wave(
         outcomes, failed, plan_error=plan_error, duration_s=duration
     )
+    # The log goes first: a red wave leaves its trace too (#1505).
+    try:
+        wave_log.write_wave_log(
+            _trino().connection,
+            wave_log.wave_log_rows(
+                outcomes,
+                failed,
+                summary,
+                run_id=str(context.get("run_id") or "manual"),
+                started_at=started,
+                finished_at=finished,
+            ),
+        )
+    except Exception:
+        if not summary.red:
+            raise
+        logger.exception("ESPN wave log not written")
     for line in summary.table:
         logger.info("ESPN wave: %s", line)
     for warning in summary.warnings:

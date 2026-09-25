@@ -11,6 +11,8 @@ the partition and the batch event ids and ``single_statement_replace=True``
 (one MERGE with tombstones, no committed empty window; the FBref typed bronze
 pattern).  Repeating a batch replaces the rows of its matches, it never
 appends a generation; other matches of the partition stay untouched.
+``first_published_at`` of a match the batch publishes first is the moment
+just before the match commit, after the children (#1505).
 """
 
 from __future__ import annotations
@@ -101,6 +103,13 @@ def write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | N
         ingested_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     rows = batch_rows(batch.matches, stamp=stamp)
+    # Matches this batch publishes first (no carried value); their time is
+    # taken just before the match commit below.
+    first_published = [
+        row
+        for row, payload in zip(rows[MATCH_TABLE], batch.matches)
+        if payload.first_published_at is None and row["first_published_at"] is not None
+    ]
     scope = delete_filter(batch.competition_slug, batch.season_year, event_ids)
     # Types of every row are checked against the DDL before the first commit.
     frames = {}
@@ -111,6 +120,14 @@ def write_tournament_batch(batch: TournamentBatch, *, trino) -> BatchReceipt | N
     for table in WRITE_ORDER:
         schema = TABLES[table]
         frame = frames[table]
+        if table == MATCH_TABLE and first_published:
+            # #1505: first publication = the start of the match commit, after
+            # the children (the match row is what makes the match published);
+            # the meter is off by one MERGE at most, never by the whole batch.
+            published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            for row in first_published:
+                row["first_published_at"] = published_at
+            frame = pd.DataFrame(rows[table], columns=schema.names)
         inserted = trino.insert_dataframe_atomic(
             BRONZE_DATABASE,
             table,
