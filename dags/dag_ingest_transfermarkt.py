@@ -168,7 +168,15 @@ def _probe_gateway_exit(
         ) from exc
 
     status_code = int(outcome.status_code or 0)
-    body_bytes = int(outcome.decoded_body_bytes or 0)
+    # decoded_body_bytes sums every attempt, blocked ones included; the gate
+    # is about the page the last (successful) exit returned.
+    value = outcome.value
+    if isinstance(value, bytes):
+        body_bytes = len(value)
+    elif isinstance(value, str):
+        body_bytes = len(value.encode('utf-8'))
+    else:
+        body_bytes = 0
     if str(outcome.error or '').startswith('transport:'):
         failure = str(outcome.error)
     elif status_code != 200:
@@ -183,6 +191,7 @@ def _probe_gateway_exit(
         'url': GATEWAY_PROBE_URL,
         'status_code': status_code,
         'body_bytes': body_bytes,
+        'decoded_body_bytes_all_attempts': int(outcome.decoded_body_bytes or 0),
         'provider_metered_bytes': outcome.provider_metered_bytes,
     }
 

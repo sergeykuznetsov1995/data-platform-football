@@ -1534,6 +1534,15 @@ class TestGatewayProbe:
         assert provider.closed == ['lease-1', 'lease-2']
         assert len(factory.clients) == 2
 
+    def test_blocked_body_does_not_count_toward_the_page_gate(self, real_probe_module, monkeypatch):
+        call, provider, _ = self._probe(
+            real_probe_module, monkeypatch,
+            [_ProbeResponse(b'b' * 55 * 1024, status=405), _ProbeResponse(b'x' * 10 * 1024)],
+        )
+        with pytest.raises(Exception, match=r'шлюз/пул: body 10240 байт'):
+            call()
+        assert provider.closed == ['lease-1', 'lease-2']
+
     def test_every_exit_blocked_fails_after_three_leases(self, real_probe_module, monkeypatch):
         call, provider, _ = self._probe(
             real_probe_module, monkeypatch, [_ProbeResponse(b'blocked', status=405)] * 3,
