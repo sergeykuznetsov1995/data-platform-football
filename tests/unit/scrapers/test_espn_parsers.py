@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -22,6 +23,9 @@ from scrapers.espn.denominator import DEFAULT_DENOMINATOR_PATH, load_denominator
 from scrapers.espn.parsers import (
     EntityParseState,
     EspnParseError,
+    LINEUP_STAT_NAME_MAP,
+    MATCHSHEET_STAT_NAME_MAP,
+    SummaryDisposition,
     espn_day,
     parse_all_scoreboard_day,
     parse_competition_detail_bytes,
@@ -533,20 +537,44 @@ def test_world_cup_stage_ranges_expand_without_outer_shell_or_heuristic() -> Non
     )
 
 
+def _summary(payload: dict, **scope_kwargs):
+    competition, edition, schedule = _schedule(**scope_kwargs)
+    return parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+
+def _full_rosters(payload: dict, counts: dict[str, tuple[int, int]]) -> None:
+    """Replace each roster with ``rows`` athletes, the first ``starters`` start."""
+
+    for roster in payload["rosters"]:
+        seed = roster["roster"][0]
+        base_id = 100 if roster["homeAway"] == "home" else 200
+        rows, starters = counts[roster["homeAway"]]
+        roster["roster"] = []
+        for offset in range(1, rows + 1):
+            player = deepcopy(seed)
+            player["starter"] = offset <= starters
+            player["subbedIn"] = False
+            player["subbedOut"] = False
+            player["athlete"]["id"] = str(base_id + offset)
+            player["athlete"]["displayName"] = f"Player {base_id + offset}"
+            roster["roster"].append(player)
+
+
 @pytest.mark.unit
 def test_summary_is_parsed_once_and_joins_reordered_sections_by_native_team_id() -> (
     None
 ):
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     payload["header"]["competitions"][0]["competitors"].reverse()
     payload["rosters"].reverse()
     assert "form" not in payload["boxscore"]
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
+    assert result.disposition is SummaryDisposition.CAPTURED
+    assert result.reason is None and result.anomalies == ()
     assert result.lineup_state is EntityParseState.CAPTURED
     assert result.matchsheet_state is EntityParseState.CAPTURED
     assert {(row.team_id, row.home_away, row.athlete_id) for row in result.lineup} == {
@@ -566,29 +594,39 @@ def test_summary_is_parsed_once_and_joins_reordered_sections_by_native_team_id()
     assert result.lineup[0].statistics_json.startswith("[")
     assert result.matchsheet[0].venue_id == 99
     assert result.matchsheet[0].is_home
-    assert result.matchsheet[0].referee_id == 77
-    assert '"optionalSummaryField":{"a":1,"z":2}' in result.extra_json
+    assert result.matchsheet[0].referee == "Ref Example"
+    assert [row.score for row in result.matchsheet] == [2, 1]
+    assert result.parser_version == "espn-native-parser-v5"
 
 
 @pytest.mark.unit
 def test_summary_missing_optionals_still_normalizes_rows() -> None:
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     payload.pop("gameInfo")
     for roster in payload["rosters"]:
-        athlete = roster["roster"][0]["athlete"]
-        athlete.pop("jersey", None)
-        roster["roster"][0].pop("captain", None)
+        roster["roster"][0]["athlete"].pop("jersey", None)
         roster["roster"][0].pop("statistics", None)
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    result = _summary(payload)
+
+    assert result.disposition is SummaryDisposition.CAPTURED
+    assert all(row.jersey is None for row in result.lineup)
+    assert all(
+        row.venue_id is None and row.referee is None and row.attendance is None
+        for row in result.matchsheet
     )
 
-    assert all(row.jersey is None and row.captain is None for row in result.lineup)
-    assert all(
-        row.venue_id is None and row.referee_id is None for row in result.matchsheet
-    )
+
+@pytest.mark.unit
+def test_jersey_is_read_from_the_roster_entry_before_the_athlete() -> None:
+    payload = _load("native_summary.json")
+    for roster in payload["rosters"]:
+        roster["roster"][0]["jersey"] = "21"
+
+    result = _summary(payload)
+
+    assert {row.jersey for row in result.lineup} == {"21"}
+    assert all('"jersey"' not in row.extra_json for row in result.lineup)
 
 
 @pytest.mark.unit
@@ -625,16 +663,41 @@ def test_consumed_nested_optionals_are_retained_in_canonical_extra_json() -> Non
         "address": {"city": "Rome", "country": "IT"},
         "capacity": 42000,
     }
-    assert summary_extra["gameInfo"]["officials"][0]["order"] == 1
-    assert summary_extra["gameInfo"]["officials"][0]["position"] == {"rank": 3}
-    assert '"address":{"city":"Rome","country":"IT"}' in result.extra_json
+    assert summary_extra["gameInfo"]["officials"] == [
+        {"id": "77", "position": {"rank": 3}}
+    ]
+
+
+@pytest.mark.unit
+def test_dropped_summary_blocks_never_reach_extra_json() -> None:
+    payload = _load("native_summary.json")
+    for block in (
+        "news",
+        "article",
+        "videos",
+        "odds",
+        "pickcenter",
+        "lastFiveGames",
+        "seasonseries",
+        "standings",
+        "broadcasts",
+        "leaders",
+    ):
+        payload[block] = {"sentinel": block}
+    payload["boxscore"]["newBoxscoreField"] = 1
+
+    result = _summary(payload)
+
+    assert "sentinel" not in result.extra_json
+    # Root-level keys outside the parsed blocks are not kept either.
+    assert "optionalSummaryField" not in result.extra_json
+    assert json.loads(result.extra_json)["boxscore"] == {"newBoxscoreField": 1}
 
 
 @pytest.mark.unit
 def test_summary_official_position_is_optional_and_unclassified_rows_are_retained() -> (
     None
 ):
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     payload["gameInfo"]["officials"] = [
         {
@@ -649,142 +712,169 @@ def test_summary_official_position_is_optional_and_unclassified_rows_are_retaine
             "position": {"name": "VIDEO_ASSISTANT", "rank": 2},
             "providerExtra": {"code": "VAR"},
         },
-        {
-            "id": "90",
-            "fullName": "Reserve Official",
-            "position": None,
-        },
+        {"id": "90", "fullName": "Reserve Official", "position": None},
     ]
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
-    assert all(
-        row.referee_id is None and row.referee is None for row in result.matchsheet
-    )
+    assert all(row.referee is None for row in result.matchsheet)
     officials = json.loads(result.extra_json)["gameInfo"]["officials"]
     assert officials == payload["gameInfo"]["officials"]
 
 
 @pytest.mark.unit
-def test_multiple_primary_referees_are_preserved_without_guessing_a_scalar() -> None:
-    competition, edition, schedule = _schedule()
+def test_referee_is_the_official_ordered_first() -> None:
+    # eng.1 2010 lists one referee three times with order 1-3; the old parser
+    # refused to pick one and left the column empty.
     payload = _load("native_summary.json")
     payload["gameInfo"]["officials"] = [
         {
-            "fullName": "First Referee",
-            "displayName": "First Referee",
-            "order": 1,
-            "position": {
-                "id": "1",
-                "name": "Referee",
-                "displayName": "Referee",
-            },
-        },
-        {
             "fullName": "Second Referee",
-            "displayName": "Second Referee",
             "order": 2,
-            "position": {
-                "id": "1",
-                "name": "Referee",
-                "displayName": "Referee",
-            },
+            "position": {"name": "Referee"},
         },
+        {"fullName": "First Referee", "order": 1},
     ]
 
+    result = _summary(payload)
+
+    assert {row.referee for row in result.matchsheet} == {"First Referee"}
+    officials = json.loads(result.extra_json)["gameInfo"]["officials"]
+    assert officials[0] == payload["gameInfo"]["officials"][0]
+
+
+@pytest.mark.unit
+def test_referee_falls_back_to_the_first_labelled_referee() -> None:
+    payload = _load("native_summary.json")
+    payload["gameInfo"]["officials"] = [
+        {"fullName": "Assistant", "position": {"name": "Assistant Referee"}},
+        {"fullName": "Main Referee", "position": {"displayName": "Match Referee"}},
+        {"fullName": "Other Referee", "position": {"name": "Referee"}},
+    ]
+
+    result = _summary(payload)
+
+    assert {row.referee for row in result.matchsheet} == {"Main Referee"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (
+            lambda p: p["gameInfo"]["officials"][0].update(position="REFEREE"),
+            r"officials\[0\].position",
+        ),
+        (
+            lambda p: p["rosters"][0]["roster"][0]["athlete"].pop("id"),
+            r"athlete.id",
+        ),
+        (lambda p: p.update(rosters={"home": []}), r"summary.rosters must be an array"),
+        (
+            lambda p: p["header"]["competitions"][0]["competitors"].append(
+                deepcopy(p["header"]["competitions"][0]["competitors"][0])
+            ),
+            "exactly two competitors",
+        ),
+        (lambda p: p["header"].update(id="401000002"), "header.id"),
+        (
+            lambda p: p["header"]["competitions"][0]["competitors"][1].update(
+                homeAway="home"
+            ),
+            "unique home and away",
+        ),
+        (
+            lambda p: p["rosters"].append(deepcopy(p["rosters"][0])),
+            "duplicate team ID",
+        ),
+        (lambda p: p.update(keyEvents={"id": 1}), r"summary.keyEvents must be an array"),
+        (
+            lambda p: p["boxscore"]["teams"][0]["statistics"][0].update(value="twelve"),
+            "value",
+        ),
+    ],
+)
+def test_unknown_shape_is_source_malformed_and_the_next_match_still_publishes(
+    mutate, reason: str
+) -> None:
+    payload = _load("native_summary.json")
+    mutate(payload)
+
+    broken = _summary(payload)
+
+    assert broken.disposition is SummaryDisposition.SOURCE_MALFORMED
+    assert broken.reason is not None
+    assert re.search(reason, broken.reason)
+    assert broken.lineup == () and broken.matchsheet == () and broken.events == ()
+    assert broken.lineup_state is EntityParseState.MALFORMED
+    assert broken.matchsheet_state is EntityParseState.MALFORMED
+
+    neighbour = _summary(_load("native_summary.json"))
+
+    assert neighbour.disposition is SummaryDisposition.CAPTURED
+    assert neighbour.lineup and neighbour.matchsheet
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [(b"not json", "valid JSON"), (b"[]", "root must be an object")],
+)
+def test_non_object_body_is_source_malformed(raw: bytes, reason: str) -> None:
+    competition, edition, schedule = _schedule()
+
     result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        raw, competition=competition, edition=edition, event=schedule[0]
     )
 
-    assert all(
-        row.referee_id is None and row.referee is None for row in result.matchsheet
-    )
-    assert (
-        json.loads(result.extra_json)["gameInfo"]["officials"]
-        == payload["gameInfo"]["officials"]
-    )
-    assert all(
-        json.loads(row.extra_json)["summaryGameInfo"]["officials"]
-        == payload["gameInfo"]["officials"]
-        for row in result.matchsheet
-    )
+    assert result.disposition is SummaryDisposition.SOURCE_MALFORMED
+    assert reason in (result.reason or "")
 
 
 @pytest.mark.unit
-def test_multiple_primary_referees_still_reject_a_malformed_source_row() -> None:
+def test_caller_bugs_still_raise() -> None:
     competition, edition, schedule = _schedule()
-    payload = _load("native_summary.json")
-    payload["gameInfo"]["officials"].append(
-        {"fullName": None, "position": {"name": "REFEREE"}}
-    )
-
-    with pytest.raises(EspnParseError, match=r"officials\[1\].fullName"):
+    with pytest.raises(TypeError, match="raw payload must be bytes"):
         parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
-
-
-@pytest.mark.unit
-def test_multiple_primary_referees_reject_extra_json_key_collision() -> None:
-    competition, edition, schedule = _schedule()
-    payload = _load("native_summary.json")
-    payload["gameInfo"]["officials"].append(
-        {"fullName": "Second Referee", "position": {"name": "REFEREE"}}
-    )
-    payload["boxscore"]["teams"][0]["summaryGameInfo"] = {"source": True}
-
-    with pytest.raises(EspnParseError, match="collides"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
-
-
-@pytest.mark.unit
-def test_summary_official_position_rejects_non_object_when_non_null() -> None:
-    competition, edition, schedule = _schedule()
-    payload = _load("native_summary.json")
-    payload["gameInfo"]["officials"][0]["position"] = "REFEREE"
-
-    with pytest.raises(EspnParseError, match=r"officials\[0\].position"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
-
-
-@pytest.mark.unit
-def test_malformed_athlete_and_one_sided_sections_fail_not_valid_empty() -> None:
-    competition, edition, schedule = _schedule()
-    malformed = _load("native_summary.json")
-    malformed["rosters"][0]["roster"][0]["athlete"].pop("id")
-    with pytest.raises(EspnParseError, match="athlete.id"):
-        parse_summary(
-            _raw(malformed),
+            _load("native_summary.json"),  # type: ignore[arg-type]
             competition=competition,
             edition=edition,
             event=schedule[0],
         )
-
-    one_sided = _load("native_summary.json")
-    one_sided["rosters"] = one_sided["rosters"][:1]
-    with pytest.raises(EspnParseError, match="both event teams"):
+    other_competition, other_edition = _scope(espn_id=700, slug="eng.1")
+    with pytest.raises(ValueError, match="context does not match"):
         parse_summary(
-            _raw(one_sided),
-            competition=competition,
-            edition=edition,
+            _raw(_load("native_summary.json")),
+            competition=other_competition,
+            edition=other_edition,
             event=schedule[0],
         )
 
 
 @pytest.mark.unit
-def test_structurally_valid_prematch_stub_is_valid_empty_only_when_permitted() -> None:
-    competition, edition = _scope(
-        lineup=CapabilityState.PARTIAL, matchsheet=CapabilityState.ABSENT
-    )
-    _, _, schedule = _schedule(
-        lineup=CapabilityState.PARTIAL, matchsheet=CapabilityState.ABSENT
-    )
+def test_schedule_kickoff_and_venue_are_not_identity() -> None:
+    # A rescheduled match or a matchday placeholder kickoff (#1501) must not
+    # cost the Summary; the Summary venue wins over the schedule one.
+    payload = _load("native_summary.json")
+    payload["header"]["competitions"][0]["date"] = "2020-09-20T12:00Z"
+    payload["gameInfo"]["venue"]["id"] = "98"
+
+    result = _summary(payload)
+
+    assert result.disposition is SummaryDisposition.CAPTURED
+    assert {row.venue_id for row in result.matchsheet} == {98}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "capability",
+    (CapabilityState.PROVEN, CapabilityState.UNKNOWN, CapabilityState.QUARANTINED),
+)
+def test_structurally_valid_prematch_stub_is_valid_empty_whatever_the_capability(
+    capability: CapabilityState,
+) -> None:
+    # The parser no longer reads edition capabilities (C8-F4).
+    _, _, schedule = _schedule()
     stub = {
         "header": {
             "id": str(schedule[0].event_id),
@@ -806,134 +896,31 @@ def test_structurally_valid_prematch_stub_is_valid_empty_only_when_permitted() -
         }
     }
 
-    result = parse_summary(
-        _raw(stub), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(stub, lineup=capability, matchsheet=capability)
 
+    assert result.disposition is SummaryDisposition.VALID_EMPTY
     assert result.lineup_state is EntityParseState.VALID_EMPTY
     assert result.matchsheet_state is EntityParseState.VALID_EMPTY
-
-    proven_competition, proven_edition = _scope()
-    with pytest.raises(EspnParseError, match="proven lineup"):
-        parse_summary(
-            _raw(stub),
-            competition=proven_competition,
-            edition=proven_edition,
-            event=schedule[0],
-        )
+    assert result.reason is None
 
 
 @pytest.mark.unit
-def test_structurally_valid_prematch_stub_allows_unknown_capabilities() -> None:
-    competition, edition = _scope(
-        lineup=CapabilityState.UNKNOWN, matchsheet=CapabilityState.UNKNOWN
-    )
-    _, _, schedule = _schedule(
-        lineup=CapabilityState.UNKNOWN, matchsheet=CapabilityState.UNKNOWN
-    )
-    stub = {
-        "header": {
-            "id": str(schedule[0].event_id),
-            "competitions": [
-                {
-                    "date": schedule[0].kickoff.isoformat(),
-                    "competitors": [
-                        {
-                            "homeAway": "home",
-                            "team": {"id": "10", "displayName": "Home FC"},
-                        },
-                        {
-                            "homeAway": "away",
-                            "team": {"id": "20", "displayName": "Away FC"},
-                        },
-                    ],
-                }
-            ],
-        }
-    }
-
-    result = parse_summary(
-        _raw(stub), competition=competition, edition=edition, event=schedule[0]
-    )
-
-    assert result.lineup_state is EntityParseState.VALID_EMPTY
-    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
-
-
-@pytest.mark.unit
-def test_matchsheet_without_team_statistics_is_valid_empty_only_when_permitted() -> (
-    None
-):
-    competition, edition, schedule = _schedule(matchsheet=CapabilityState.UNKNOWN)
+@pytest.mark.parametrize("empty", ("absent", "empty"))
+def test_matchsheet_without_team_statistics_is_valid_empty(empty: str) -> None:
     payload = _load("native_summary.json")
     for team in payload["boxscore"]["teams"]:
-        team.pop("statistics")
+        if empty == "absent":
+            team.pop("statistics")
+        else:
+            team["statistics"] = []
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
     assert result.lineup_state is EntityParseState.CAPTURED
     assert result.matchsheet == ()
     assert result.matchsheet_state is EntityParseState.VALID_EMPTY
-
-    proven_competition, proven_edition, proven_schedule = _schedule()
-    with pytest.raises(EspnParseError, match="proven matchsheet"):
-        parse_summary(
-            _raw(payload),
-            competition=proven_competition,
-            edition=proven_edition,
-            event=proven_schedule[0],
-        )
-
-
-@pytest.mark.unit
-def test_matchsheet_rejects_one_sided_missing_team_statistics() -> None:
-    competition, edition, schedule = _schedule(matchsheet=CapabilityState.UNKNOWN)
-    payload = _load("native_summary.json")
-    payload["boxscore"]["teams"][0].pop("statistics")
-
-    with pytest.raises(EspnParseError, match="both or neither"):
-        parse_summary(
-            _raw(payload),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
-
-
-@pytest.mark.unit
-def test_matchsheet_with_bilateral_empty_statistics_is_valid_empty_only_when_permitted() -> (
-    None
-):
-    competition, edition, schedule = _schedule(matchsheet=CapabilityState.PARTIAL)
-    payload = _load("native_summary.json")
-    for team in payload["boxscore"]["teams"]:
-        team["statistics"] = []
-
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
-
-    assert result.matchsheet == ()
-    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
-
-    payload["boxscore"]["teams"][0]["statistics"] = [{"name": "shots", "value": 1}]
-    with pytest.raises(EspnParseError, match="empty for both or neither"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
-
-    for team in payload["boxscore"]["teams"]:
-        team["statistics"] = []
-    proven_competition, proven_edition, proven_schedule = _schedule()
-    with pytest.raises(EspnParseError, match="proven matchsheet"):
-        parse_summary(
-            _raw(payload),
-            competition=proven_competition,
-            edition=proven_edition,
-            event=proven_schedule[0],
-        )
+    # Only both entities empty make the match VALID_EMPTY.
+    assert result.disposition is SummaryDisposition.CAPTURED
 
 
 def _zero_skeleton() -> list[dict[str, object]]:
@@ -946,397 +933,312 @@ def _zero_skeleton() -> list[dict[str, object]]:
     ]
 
 
-@pytest.mark.parametrize(
-    "capability",
-    (CapabilityState.PARTIAL, CapabilityState.ABSENT, CapabilityState.UNKNOWN),
-)
 @pytest.mark.unit
-def test_matchsheet_one_sided_zero_skeleton_is_valid_empty_only_when_permitted(
-    capability: CapabilityState,
+@pytest.mark.parametrize("empty_side", ("absent", "empty", "missing_team"))
+def test_one_sided_statistics_write_the_other_side_and_flag_the_match(
+    empty_side: str,
 ) -> None:
-    """A zero-filled skeleton opposite an absent block is emptiness, not capture.
-
-    ESPN answered scope 19834:2026 event 401908161 (played, full time) with
-    ``statistics: []`` for one team and a 28-field all-zero block for the other.
-    """
-
-    competition, edition, schedule = _schedule(matchsheet=capability)
+    # ESPN answered 19834:2026 event 401908161 with ``statistics: []`` for one
+    # team and a zero skeleton for the other.
     payload = _load("native_summary.json")
-    payload["boxscore"]["teams"][0]["statistics"] = []
-    payload["boxscore"]["teams"][1]["statistics"] = _zero_skeleton()
+    if empty_side == "absent":
+        payload["boxscore"]["teams"][0].pop("statistics")
+    elif empty_side == "empty":
+        payload["boxscore"]["teams"][0]["statistics"] = []
+    else:
+        payload["boxscore"]["teams"].pop(0)
+    payload["boxscore"]["teams"][-1]["statistics"] = _zero_skeleton()
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
-    assert result.matchsheet == ()
-    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
-    # The rest of the Summary still parses: dropping the skeleton must not cost
-    # the lineup, which is the whole point of not failing the scope.
+    assert result.disposition is SummaryDisposition.LINEUP_ANOMALY
+    assert result.anomalies == ("one_sided_statistics",)
+    assert [row.team_id for row in result.matchsheet] == [10]
+    assert result.matchsheet[0].total_shots == "0"
     assert result.lineup_state is EntityParseState.CAPTURED
-    assert result.lineup
-
-    proven_competition, proven_edition, proven_schedule = _schedule()
-    with pytest.raises(EspnParseError, match="proven matchsheet"):
-        parse_summary(
-            _raw(payload),
-            competition=proven_competition,
-            edition=proven_edition,
-            event=proven_schedule[0],
-        )
 
 
 @pytest.mark.unit
-def test_matchsheet_one_sided_statistics_with_any_real_value_still_fails() -> None:
-    competition, edition, schedule = _schedule(matchsheet=CapabilityState.PARTIAL)
-    payload = _load("native_summary.json")
-    payload["boxscore"]["teams"][0]["statistics"] = []
-    # The real value sits last: an early return would hide it.
-    skeleton = _zero_skeleton()
-    skeleton.append({"name": "wonCorners", "displayValue": "3"})
-    payload["boxscore"]["teams"][1]["statistics"] = skeleton
-
-    with pytest.raises(EspnParseError, match="empty for both or neither"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
-
-
-@pytest.mark.unit
-def test_matchsheet_one_sided_absent_statistics_key_follows_the_same_rule() -> None:
-    """The key may be missing rather than empty; the pair is still blank."""
-
-    competition, edition, schedule = _schedule(matchsheet=CapabilityState.PARTIAL)
-    payload = _load("native_summary.json")
-    payload["boxscore"]["teams"][0].pop("statistics")
-    payload["boxscore"]["teams"][1]["statistics"] = _zero_skeleton()
-
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
-
-    assert result.matchsheet == ()
-    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
-
-    payload["boxscore"]["teams"][1]["statistics"].append(
-        {"name": "wonCorners", "displayValue": "3"}
-    )
-    with pytest.raises(EspnParseError, match="exist for both or neither"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
-
-
-@pytest.mark.parametrize(
-    "malformed",
-    (
-        {"name": "unmappedThing", "displayValue": "0/0"},
-        {"displayValue": "0"},
-    ),
-)
-@pytest.mark.unit
-def test_matchsheet_blankness_probe_never_replaces_the_one_sided_failure(
-    malformed: dict[str, object],
-) -> None:
-    """A block the capture path would reject is not provably blank.
-
-    The probe must not raise its own scalar-format complaint, and must not call
-    a nameless entry blank either — both would mislead whoever reads the log.
-    """
-
-    competition, edition, schedule = _schedule(matchsheet=CapabilityState.PARTIAL)
-    payload = _load("native_summary.json")
-    payload["boxscore"]["teams"][0]["statistics"] = []
-    payload["boxscore"]["teams"][1]["statistics"] = [*_zero_skeleton(), malformed]
-
-    with pytest.raises(EspnParseError, match="empty for both or neither"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
-
-
-@pytest.mark.unit
-def test_lineup_without_team_rosters_is_valid_empty_only_when_permitted() -> None:
-    competition, edition, schedule = _schedule(lineup=CapabilityState.PARTIAL)
+@pytest.mark.parametrize("empty", ("absent", "empty"))
+def test_lineup_without_any_player_is_valid_empty(empty: str) -> None:
     payload = _load("native_summary.json")
     for team in payload["rosters"]:
-        team.pop("roster")
+        if empty == "absent":
+            team.pop("roster")
+        else:
+            team["roster"] = []
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
     assert result.lineup == ()
     assert result.lineup_state is EntityParseState.VALID_EMPTY
     assert result.matchsheet_state is EntityParseState.CAPTURED
-
-    proven_competition, proven_edition, proven_schedule = _schedule()
-    with pytest.raises(EspnParseError, match="proven lineup"):
-        parse_summary(
-            _raw(payload),
-            competition=proven_competition,
-            edition=proven_edition,
-            event=proven_schedule[0],
-        )
+    assert result.disposition is SummaryDisposition.CAPTURED
 
 
 @pytest.mark.unit
-def test_lineup_rejects_one_sided_missing_team_roster() -> None:
-    competition, edition, schedule = _schedule(lineup=CapabilityState.PARTIAL)
+@pytest.mark.parametrize("empty_side", ("absent", "empty", "missing_block"))
+def test_one_sided_roster_writes_the_other_team(empty_side: str) -> None:
     payload = _load("native_summary.json")
-    payload["rosters"][0].pop("roster")
+    away = next(block for block in payload["rosters"] if block["homeAway"] == "away")
+    if empty_side == "absent":
+        away.pop("roster")
+    elif empty_side == "empty":
+        away["roster"] = []
+    else:
+        payload["rosters"].remove(away)
 
-    with pytest.raises(EspnParseError, match="both or neither"):
-        parse_summary(
-            _raw(payload),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
+    result = _summary(payload)
+
+    assert result.disposition is SummaryDisposition.LINEUP_ANOMALY
+    assert result.anomalies == ("one_sided_roster",)
+    assert [row.team_id for row in result.lineup] == [10]
 
 
 @pytest.mark.unit
-def test_conventional_xi_requires_22_unique_starters() -> None:
-    competition, edition, schedule = _schedule()
+def test_starters_not_11_writes_rows_and_flags_the_match() -> None:
     payload = _load("native_summary.json")
-    for roster in payload["rosters"]:
-        seed = roster["roster"][0]
-        base_id = 100 if roster["homeAway"] == "home" else 200
-        roster["roster"] = []
-        for offset in range(1, 12):
-            player = deepcopy(seed)
-            player["starter"] = True
-            player["subbedIn"] = False
-            player["subbedOut"] = False
-            player["athlete"]["id"] = str(base_id + offset)
-            player["athlete"]["displayName"] = f"Player {base_id + offset}"
-            roster["roster"].append(player)
+    _full_rosters(payload, {"home": (11, 11), "away": (11, 11)})
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
+    assert result.disposition is SummaryDisposition.CAPTURED
     assert sum(row.starter is True for row in result.lineup) == 22
 
-    payload["rosters"][0]["roster"][0]["starter"] = False
-    with pytest.raises(EspnParseError, match="11 starters"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
+    for counts in (
+        {"home": (11, 10), "away": (11, 11)},
+        {"home": (20, 11), "away": (20, 13)},
+        # A sparse participant list (only the scorer) is written as well.
+        {"home": (1, 1), "away": (20, 11)},
+    ):
+        payload = _load("native_summary.json")
+        _full_rosters(payload, counts)
 
-    asymmetric = _load("native_summary.json")
-    for roster in asymmetric["rosters"]:
-        seed = roster["roster"][0]
-        base_id = 100 if roster["homeAway"] == "home" else 200
-        roster["roster"] = []
-        count = 11 if roster["homeAway"] == "home" else 10
-        for offset in range(1, count + 1):
-            player = deepcopy(seed)
-            player["starter"] = True
-            player["athlete"]["id"] = str(base_id + offset)
-            roster["roster"].append(player)
-    with pytest.raises(EspnParseError, match="starter|conventional"):
-        parse_summary(
-            _raw(asymmetric),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
+        result = _summary(payload)
+
+        assert result.disposition is SummaryDisposition.LINEUP_ANOMALY
+        assert result.anomalies == ("starters_not_11",)
+        assert len(result.lineup) == counts["home"][0] + counts["away"][0]
+        assert result.lineup_state is EntityParseState.CAPTURED
 
 
 @pytest.mark.unit
-def test_sparse_explicit_participant_roster_discards_the_whole_lineup() -> None:
-    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
+def test_contradictory_flags_write_rows_and_flag_the_match() -> None:
     payload = _load("native_summary.json")
-    for roster in payload["rosters"]:
-        seed = roster["roster"][0]
-        is_home = roster["homeAway"] == "home"
-        base_id = 100 if is_home else 200
-        row_count = 1 if is_home else 20
-        starter_count = 1 if is_home else 11
-        roster["roster"] = []
-        for offset in range(1, row_count + 1):
-            player = deepcopy(seed)
-            player["starter"] = offset <= starter_count
-            player["subbedIn"] = False
-            player["subbedOut"] = False
-            player["athlete"]["id"] = str(base_id + offset)
-            player["athlete"]["displayName"] = f"Player {base_id + offset}"
-            roster["roster"].append(player)
-
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
-
-    assert result.lineup == ()
-    assert result.lineup_state is EntityParseState.VALID_EMPTY
-    assert result.matchsheet_state is EntityParseState.CAPTURED
-
-    seven_player_boundary = deepcopy(payload)
-    sparse_roster = next(
-        roster
-        for roster in seven_player_boundary["rosters"]
-        if roster["homeAway"] == "home"
-    )
-    seed = sparse_roster["roster"][0]
-    for offset in range(2, 8):
-        player = deepcopy(seed)
-        player["athlete"]["id"] = str(100 + offset)
-        player["athlete"]["displayName"] = f"Player {100 + offset}"
-        sparse_roster["roster"].append(player)
-    with pytest.raises(EspnParseError, match="11 starters"):
-        parse_summary(
-            _raw(seven_player_boundary),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
-
-    malformed = deepcopy(payload)
-    malformed["rosters"][1]["roster"][0]["athlete"].pop("id")
-    with pytest.raises(EspnParseError, match="athlete.id"):
-        parse_summary(
-            _raw(malformed),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
-
-    proven_competition, proven_edition, proven_schedule = _schedule()
-    with pytest.raises(EspnParseError, match="11 starters"):
-        parse_summary(
-            _raw(payload),
-            competition=proven_competition,
-            edition=proven_edition,
-            event=proven_schedule[0],
-        )
-
-
-@pytest.mark.unit
-def test_complete_rosters_with_bad_starter_counts_still_fail() -> None:
-    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
-    payload = _load("native_summary.json")
-    for roster in payload["rosters"]:
-        seed = roster["roster"][0]
-        is_home = roster["homeAway"] == "home"
-        base_id = 100 if is_home else 200
-        starter_count = 11 if is_home else 10
-        roster["roster"] = []
-        for offset in range(1, 21):
-            player = deepcopy(seed)
-            player["starter"] = offset <= starter_count
-            player["subbedIn"] = False
-            player["subbedOut"] = False
-            player["athlete"]["id"] = str(base_id + offset)
-            player["athlete"]["displayName"] = f"Player {base_id + offset}"
-            roster["roster"].append(player)
-
-    with pytest.raises(EspnParseError, match="11 starters"):
-        parse_summary(
-            _raw(payload),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
-
-
-@pytest.mark.unit
-def test_unreviewed_bench_player_marked_only_as_subbed_out_is_rejected() -> None:
-    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
-    payload = _load("native_summary.json")
-    for roster in payload["rosters"]:
-        seed = roster["roster"][0]
-        base_id = 100 if roster["homeAway"] == "home" else 200
-        roster["roster"] = []
-        for offset in range(1, 12):
-            player = deepcopy(seed)
-            player["starter"] = True
-            player["subbedIn"] = False
-            player["subbedOut"] = False
-            player["athlete"]["id"] = str(base_id + offset)
-            roster["roster"].append(player)
+    _full_rosters(payload, {"home": (11, 11), "away": (11, 11)})
     bench = deepcopy(payload["rosters"][0]["roster"][0])
     bench["athlete"]["id"] = "999"
-    bench["starter"] = False
-    bench["subbedIn"] = False
-    bench["subbedOut"] = True
+    bench.update(starter=False, subbedIn=False, subbedOut=True)
     payload["rosters"][0]["roster"].append(bench)
 
-    with pytest.raises(EspnParseError, match="contradictory"):
-        parse_summary(
-            _raw(payload),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
+    result = _summary(payload)
+
+    assert result.disposition is SummaryDisposition.LINEUP_ANOMALY
+    assert result.anomalies == ("contradictory_flags",)
+    assert 999 in {row.athlete_id for row in result.lineup}
+
+
+@pytest.mark.unit
+def test_duplicate_player_keeps_the_first_row() -> None:
+    payload = _load("native_summary.json")
+    twin = deepcopy(payload["rosters"][0]["roster"][0])
+    twin["position"] = {"name": "Goalkeeper"}
+    payload["rosters"][0]["roster"].append(twin)
+
+    result = _summary(payload)
+
+    assert result.disposition is SummaryDisposition.LINEUP_ANOMALY
+    assert result.anomalies == ("duplicate_player",)
+    away = [row for row in result.lineup if row.team_id == 20]
+    assert [(row.athlete_id, row.position) for row in away] == [(201, "Forward")]
+
+
+@pytest.mark.unit
+def test_formation_place_missing_only_when_formation_is_declared() -> None:
+    def _payload(formation: str | None, places: list[str | None]) -> dict:
+        payload = _load("native_summary.json")
+        _full_rosters(payload, {"home": (11, 11), "away": (11, 11)})
+        for block in payload["rosters"]:
+            if formation is not None:
+                block["formation"] = formation
+            for player, place in zip(block["roster"], places * 11):
+                player.pop("formationPlace", None)
+                if place is not None:
+                    player["formationPlace"] = place
+        return payload
+
+    partial = _summary(_payload("4-4-2", ["1", None]))
+    assert partial.anomalies == ("formation_place_missing",)
+    assert {row.formation for row in partial.matchsheet} == {"4-4-2"}
+
+    # 2005-2016 bodies: a formation and no formationPlace at all.
+    assert _summary(_payload("4-4-2", [None])).anomalies == ()
+    # No formation: nothing to check against.
+    no_formation = _summary(_payload(None, ["1", None]))
+    assert no_formation.anomalies == ()
+    assert {row.formation for row in no_formation.matchsheet} == {None}
 
 
 @pytest.mark.unit
 def test_balanced_small_sided_explicit_lineup_is_genuinely_non_conventional() -> None:
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     payload["format"] = {"startersPerTeam": 5}
-    for roster in payload["rosters"]:
-        seed = roster["roster"][0]
-        base_id = 100 if roster["homeAway"] == "home" else 200
-        roster["roster"] = []
-        for offset in range(1, 6):
-            player = deepcopy(seed)
-            player["starter"] = True
-            player["athlete"]["id"] = str(base_id + offset)
-            roster["roster"].append(player)
+    _full_rosters(payload, {"home": (5, 5), "away": (5, 5)})
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
+    assert result.disposition is SummaryDisposition.CAPTURED
     assert sum(row.starter is True for row in result.lineup) == 10
 
-    unknown_competition, unknown_edition, unknown_schedule = _schedule(
-        lineup=CapabilityState.UNKNOWN
-    )
-    unbalanced = deepcopy(payload)
-    next(roster for roster in unbalanced["rosters"] if roster["homeAway"] == "home")[
-        "roster"
-    ].pop()
-    with pytest.raises(EspnParseError, match="11 starters"):
-        parse_summary(
-            _raw(unbalanced),
-            competition=unknown_competition,
-            edition=unknown_edition,
-            event=unknown_schedule[0],
-        )
+    _full_rosters(payload, {"home": (4, 4), "away": (5, 5)})
+    unbalanced = _summary(payload)
+    assert unbalanced.anomalies == ("starters_not_11",)
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("bad_value", [None, True, [12], {"value": 12}, "twelve"])
-def test_matchsheet_rejects_malformed_stat_values(bad_value: object) -> None:
-    competition, edition, schedule = _schedule()
+def test_match_level_fields_come_from_the_same_summary() -> None:
+    # No recorded Summary has a shootout or a two-legged tie: the shapes are
+    # the C6-F6 keys on the competitor/competition form of the recorded bodies.
     payload = _load("native_summary.json")
-    payload["boxscore"]["teams"][0]["statistics"][0]["value"] = bad_value
+    competition_raw = payload["header"]["competitions"][0]
+    competition_raw["leg"] = {"value": 2, "displayValue": "2nd Leg"}
+    home, away = competition_raw["competitors"]
+    home.update(
+        linescores=[
+            {"displayValue": "1"},
+            {"displayValue": "0"},
+            {"displayValue": "1"},
+            {"displayValue": "0"},
+        ],
+        shootoutScore=4,
+        aggregateScore=2.0,
+        advance=True,
+    )
+    away.update(
+        linescores=[{"displayValue": "0"}, {"value": 1.0, "displayValue": "1"}],
+        shootoutScore="3",
+        aggregateScore=2,
+        advance=False,
+    )
+    payload["gameInfo"]["attendance"] = 0
+    payload["rosters"][0]["formation"] = "4-4-2"
 
-    with pytest.raises(EspnParseError, match="statistic.*value|scalar"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
+    result = _summary(payload)
+
+    by_side = {row.home_away: row for row in result.matchsheet}
+    assert (by_side["home"].score_h1, by_side["home"].score_h2) == (1, 0)
+    assert by_side["home"].score_et == 1
+    assert (by_side["away"].score_h1, by_side["away"].score_h2) == (0, 1)
+    assert by_side["away"].score_et is None
+    assert (by_side["home"].shootout_score, by_side["away"].shootout_score) == (4, 3)
+    assert (by_side["home"].aggregate_score, by_side["away"].aggregate_score) == (2, 2)
+    assert (by_side["home"].advance, by_side["away"].advance) == (True, False)
+    assert {row.leg for row in result.matchsheet} == {2}
+    assert result.advance_team_id == 10
+    assert {row.attendance for row in result.matchsheet} == {None}
+    assert (by_side["away"].formation, by_side["home"].formation) == ("4-4-2", None)
+    extra = json.loads(result.extra_json)
+    assert "leg" not in extra.get("headerSections", {}).get("competition", {})
+    assert "headerSections" not in extra
+
+
+@pytest.mark.unit
+def test_unplayed_match_has_null_score() -> None:
+    scoreboard = _load("native_scoreboard.json")
+    scoreboard["events"][0]["status"] = {
+        "type": {"name": "STATUS_SCHEDULED", "completed": False}
+    }
+    competition, edition, schedule = _schedule(scoreboard)
+    assert not schedule[0].played_final
+
+    result = parse_summary(
+        _raw(_load("native_summary.json")),
+        competition=competition,
+        edition=edition,
+        event=schedule[0],
+    )
+
+    assert [row.score for row in result.matchsheet] == [None, None]
+
+
+@pytest.mark.unit
+def test_key_event_flags_and_scores_are_read_when_present() -> None:
+    payload = _load("native_summary.json")
+    payload["keyEvents"] = [
+        {
+            "id": "7001",
+            "type": {"id": "94", "text": "Red Card", "type": "red-card"},
+            "period": {"number": 2},
+            "clock": {"value": 5460.0, "displayValue": "90'+1'"},
+            "team": {"id": "10", "displayName": "Home FC"},
+            "participants": [{"athlete": {"id": "101", "displayName": "Home Player"}}],
+            "scoringPlay": False,
+            "redCard": True,
+            "yellowCard": False,
+            "penaltyKick": False,
+            "ownGoal": False,
+            "homeScore": 2,
+            "awayScore": 1,
+            "fieldPositionX": 0.5,
+            "fieldPositionY": 0.25,
+            "wallclock": "2020-09-19T20:40:00Z",
+        }
+    ]
+    payload["commentary"] = [
+        {"sequence": 0, "time": {"value": 0.0, "displayValue": ""}, "text": "Hello"}
+    ]
+
+    result = _summary(payload)
+
+    key_event, commentary = result.events
+    assert (key_event.kind, key_event.play_id, key_event.period) == (
+        "key_event",
+        "7001",
+        2,
+    )
+    assert key_event.clock_display == "90'+1'"
+    assert key_event.team_id == 10 and json.loads(key_event.athlete_ids) == [101]
+    assert (key_event.red_card, key_event.yellow_card) == (True, False)
+    assert (key_event.home_score, key_event.away_score) == (2, 1)
+    assert (key_event.x, key_event.y) == (0.5, 0.25)
+    assert json.loads(key_event.extra_json) == {
+        "type": {"type": "red-card"},
+        "wallclock": "2020-09-19T20:40:00Z",
+    }
+    assert (commentary.kind, commentary.sequence, commentary.text) == (
+        "commentary",
+        0,
+        "Hello",
+    )
+    assert commentary.clock_display is None and commentary.play_id is None
 
 
 @pytest.mark.unit
 def test_matchsheet_uses_numeric_display_value_when_value_is_null() -> None:
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     for team in payload["boxscore"]["teams"]:
         team["statistics"] = [{"name": "shots", "value": None, "displayValue": "12"}]
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
     assert [row.total_shots for row in result.matchsheet] == ["12", "12"]
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("bad_value", [None, True, [12], {"value": 12}, "twelve"])
+def test_matchsheet_malformed_stat_values_are_source_malformed(
+    bad_value: object,
+) -> None:
+    payload = _load("native_summary.json")
+    payload["boxscore"]["teams"][0]["statistics"][0]["value"] = bad_value
+
+    result = _summary(payload)
+
+    assert result.disposition is SummaryDisposition.SOURCE_MALFORMED
+    assert re.search("statistic.*value|scalar", result.reason or "")
+
+
+@pytest.mark.unit
 def test_unknown_structured_matchsheet_stats_remain_canonical_without_failing() -> None:
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     for team in payload["boxscore"]["teams"]:
         team["statistics"].append(
@@ -1346,9 +1248,7 @@ def test_unknown_structured_matchsheet_stats_remain_canonical_without_failing() 
             }
         )
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
     assert all(row.total_shots is not None for row in result.matchsheet)
     assert all("newProviderShape" in row.statistics_json for row in result.matchsheet)
@@ -1356,7 +1256,6 @@ def test_unknown_structured_matchsheet_stats_remain_canonical_without_failing() 
 
 @pytest.mark.unit
 def test_dual_lineup_stat_sources_and_mapping_shapes_populate_legacy_fields() -> None:
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     for roster in payload["rosters"]:
         player = roster["roster"][0]
@@ -1367,9 +1266,7 @@ def test_dual_lineup_stat_sources_and_mapping_shapes_populate_legacy_fields() ->
             "goalAssists": 1,
         }
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
     assert all(row.total_shots == 4.0 for row in result.lineup)
     assert all(row.appearances == 3.0 for row in result.lineup)
@@ -1380,18 +1277,17 @@ def test_dual_lineup_stat_sources_and_mapping_shapes_populate_legacy_fields() ->
 
 
 @pytest.mark.unit
-def test_conflicting_dual_lineup_stat_sources_fail_closed() -> None:
-    competition, edition, schedule = _schedule()
+def test_conflicting_dual_lineup_stat_sources_are_source_malformed() -> None:
     payload = _load("native_summary.json")
     for roster in payload["rosters"]:
         player = roster["roster"][0]
         player["stats"] = [{"name": "totalShots", "value": 4}]
         player["statistics"] = {"totalShots": 5}
 
-    with pytest.raises(EspnParseError, match="conflicting.*total_shots"):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=schedule[0]
-        )
+    result = _summary(payload)
+
+    assert result.disposition is SummaryDisposition.SOURCE_MALFORMED
+    assert re.search("conflicting.*total_shots", result.reason or "")
 
 
 @pytest.mark.unit
@@ -1399,9 +1295,9 @@ def test_versioned_stat_name_maps_populate_full_legacy_surfaces() -> None:
     from scrapers.espn.parser_contracts import (
         LINEUP_STAT_MAP_VERSION,
         MATCHSHEET_STAT_MAP_VERSION,
+        MatchsheetRow,
     )
 
-    competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
     lineup_names = {
         "appearances": "appearances",
@@ -1429,9 +1325,6 @@ def test_versioned_stat_name_maps_populate_full_legacy_surfaces() -> None:
         "effectiveClearance": "effective_clearance",
         "effectiveTackles": "effective_tackles",
         "foulsCommitted": "fouls_committed",
-        "goalAssists": "goal_assists",
-        "goalDifference": "goal_difference",
-        "goalsConceded": "goals_conceded",
         "interceptions": "interceptions",
         "longballPct": "longball_pct",
         "offsides": "offsides",
@@ -1446,7 +1339,6 @@ def test_versioned_stat_name_maps_populate_full_legacy_surfaces() -> None:
         "tacklePct": "tackle_pct",
         "totalClearance": "total_clearance",
         "totalCrosses": "total_crosses",
-        "totalGoals": "total_goals",
         "totalLongBalls": "total_long_balls",
         "totalPasses": "total_passes",
         "totalShots": "total_shots",
@@ -1466,14 +1358,19 @@ def test_versioned_stat_name_maps_populate_full_legacy_surfaces() -> None:
             for index, name in enumerate(matchsheet_names)
         ]
 
-    result = parse_summary(
-        _raw(payload), competition=competition, edition=edition, event=schedule[0]
-    )
+    result = _summary(payload)
 
     lineup = result.lineup[0]
     matchsheet = result.matchsheet[0]
     assert LINEUP_STAT_MAP_VERSION == "espn-lineup-stat-map-v1"
-    assert MATCHSHEET_STAT_MAP_VERSION == "espn-matchsheet-stat-map-v1"
+    assert MATCHSHEET_STAT_MAP_VERSION == "espn-matchsheet-stat-map-v2"
+    assert set(LINEUP_STAT_NAME_MAP) == set(lineup_names)
+    assert set(MATCHSHEET_STAT_NAME_MAP) == set(matchsheet_names) | {
+        "fouls",
+        "possession",
+        "shots",
+        "cornerKicks",
+    }
     assert all(
         isinstance(getattr(lineup, target), float) for target in lineup_names.values()
     )
@@ -1481,7 +1378,19 @@ def test_versioned_stat_name_maps_populate_full_legacy_surfaces() -> None:
         isinstance(getattr(matchsheet, target), str)
         for target in matchsheet_names.values()
     )
-    assert matchsheet.won_corners == "31"
+    assert matchsheet.won_corners == "27"
+    # Dead in ESPN itself (C6-F5): never reintroduce.
+    dead = {
+        "capacity",
+        "referee_id",
+        "goal_assists",
+        "goal_difference",
+        "goals_conceded",
+        "total_goals",
+        "corner_kicks",
+    }
+    assert not dead & set(MatchsheetRow.__dataclass_fields__)
+    assert "captain" not in type(lineup).__dataclass_fields__
 
 
 # --------------------------------------------------------------------------
