@@ -296,6 +296,42 @@ def test_ranking_layout_breaks_fail_closed(ranking_html, old, new, check):
         parse_ranking(ranking_html.replace(old, new, 1))
 
 
+def test_renamed_level_headers_fail_closed(ranking_html):
+    # every level would be NULL while the rows still match (Sol r1 #3)
+    with pytest.raises(LayoutChanged, match="C3 country table 'Germany': group header"):
+        parse_ranking(ranking_html.replace("<i> Level ", "<i> Tier "))
+
+
+def test_fallback_key_needs_country_and_name(ranking_html, results_html):
+    # Sol r1 #4: '~GER:' / '~:Jaguares' must not be written as keys
+    lok = '<span class="NonAst">LOK</span><span class="Ast">Lok Leipzig</span>'
+    assert lok in ranking_html
+    with pytest.raises(LayoutChanged, match="provisional club without country or name"):
+        parse_ranking(ranking_html.replace(lok, '<span class="NonAst">LOK</span><span class="Ast"></span>', 1))
+    jag = ('<a href="/COL"><img alt="COL" src="/static/flags/col.png" style="width:20px; opacity:0.8;"/></a> '
+           '<span class="min481"></span> <span class="max640">JAG</span>')
+    assert jag in results_html
+    with pytest.raises(LayoutChanged, match="without link, country or name"):
+        parse_results(results_html.replace(jag, '<span class="min481"></span> <span class="max640">JAG</span>', 1))
+
+
+def test_lost_club_links_fail_closed(ranking_html):
+    # Sol r1 #5: without the NonAst links the page still matches levels by name
+    page = parse_ranking(ranking_html.replace('<span class="NonAst">', '<span class="Code">'))
+    assert page.linked_slugs == []
+    with pytest.raises(LayoutChanged, match="C7 country tables link 0 club pages"):
+        check_ranking(page)
+
+
+def test_duplicate_club_key_fails_closed(ranking_html):
+    # Sol r1 #7: Bayern twice instead of Man City
+    assert '<a href="/ManCity">Man City<span class="min481">' in ranking_html
+    broken = ranking_html.replace('<a href="/ManCity">Man City<span class="min481">',
+                                  '<a href="/Bayern">Bayern München<span class="min481">', 1)
+    with pytest.raises(LayoutChanged, match="C3 club_key not unique: \\['Bayern'\\]"):
+        parse_ranking(broken)
+
+
 def test_ranking_without_country_tables_fails_closed(ranking_html):
     broken = ranking_html.replace('<div class="accordion-header"> <a href=',
                                   '<div class="accordion-header"> <b x=')
@@ -348,9 +384,18 @@ def test_results_duplicate_key_keeps_first(results_html):
     assert page.rows[1]["row_seq"] == 2  # the page order is kept
 
 
+def test_results_without_date_separators_fail_closed(results_html):
+    # Sol r1 #6: every row would get the h1 date
+    broken = re.sub(r'<tr><td class="l" colspan="3">[^<]*</td></tr>', "", results_html)
+    with pytest.raises(LayoutChanged, match="no date separators"):
+        parse_results(broken)
+
+
 @pytest.mark.parametrize("old, new, check", [
     ('<td class="l" colspan="3">2026-09-21</td>', '<td class="l" colspan="3">21.09.2026</td>',
      "not an ISO date"),
+    ('<td class="l" colspan="3">2026-09-20</td>', '<td class="l" colspan="3">2026-09-21</td>',
+     "separator 2026-09-21 is not before 2026-09-21"),
     ("<th>FT</th>", "<th>Score</th>", "C1 results table headers changed"),
     ('<td class="c">57</td>', '<td class="c">57</td><td>x</td>', "C3 results row 0 has 11 cells"),
     ('<h1><a href="/2026-09-22/Results">', '<h1><a href="/2026-09-22/Fixtures">', "expected 'Results'"),

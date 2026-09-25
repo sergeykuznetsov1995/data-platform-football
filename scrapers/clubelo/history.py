@@ -178,7 +178,8 @@ class IcebergHistoryStore:
         """Every slug that has any manifest row (done, no_page or failed)."""
 
         frame = self.writer.read_table(self.database, MANIFEST_TABLE, columns=["slug"])
-        return set(frame["slug"])
+        # An empty table comes back as a DataFrame without columns (Sol r1 #2).
+        return set(frame["slug"]) if len(frame) else set()
 
     def closed_slugs(self) -> Set[str]:
         frame = self.writer.read_table(

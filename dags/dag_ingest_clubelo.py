@@ -117,6 +117,10 @@ rm -f {DAILY_RESULT} && \
         append_env=True,
         # /Results may be retried 3 x 10 min (M-09) plus up to 10 club pages.
         execution_timeout=timedelta(minutes=45),
+        # No Airflow retry (LIGHT_ARGS has one): a retry after a written
+        # snapshot sees the same rating date, skips the failed new-slug pages
+        # and would turn the red run green (Sol r1 #1); a block must stop.
+        retries=0,
         pool='default_pool',
     )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 from datetime import date, datetime
+from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pytest
@@ -317,3 +318,18 @@ def test_unexpected_parse_crash_fails_the_page_not_the_queue(monkeypatch):
     assert "AttributeError" in result["failed_slugs"][0]
     assert [c["path"] for c in session.calls][-1] == "/lsapi-4199"
     assert result["error"] is None and history.exit_code(result) == 1
+
+
+def test_known_slugs_on_an_empty_manifest():
+    """The real ``read_table`` returns ``pd.DataFrame()`` (no columns) for an
+    empty table — the first daily run before #1465 (Sol r1 #2, #1463)."""
+
+    import pandas as pd
+
+    writer = MagicMock()
+    writer.read_table.return_value = pd.DataFrame()
+    assert history.IcebergHistoryStore(writer).known_slugs() == set()
+    assert history.IcebergHistoryStore(writer).closed_slugs() == set()
+    writer.read_table.return_value = pd.DataFrame(
+        [["Arsenal"], ["riverplate"], ["Arsenal"]], columns=["slug"])
+    assert history.IcebergHistoryStore(writer).known_slugs() == {"Arsenal", "riverplate"}

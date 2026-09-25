@@ -95,6 +95,10 @@ class TestDailyChain:
 
         assert _bash_task('scrape_daily')._init_kwargs['execution_timeout'] == timedelta(minutes=45)
 
+    def test_daily_is_not_retried(self, dag_module):
+        # a retry would see the same rating date and skip failed new-slug pages
+        assert _bash_task('scrape_daily')._init_kwargs['retries'] == 0
+
     def test_every_task_is_in_the_default_pool(self, dag_module):
         tasks = [_python_task(t) for t in ('gate_daily', 'validate_data', 'gate_history')]
         tasks += [_bash_task(t) for t in ('scrape_daily', 'scrape_history')]

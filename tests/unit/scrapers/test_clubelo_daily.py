@@ -198,18 +198,18 @@ def test_layout_change_writes_nothing_parsed_and_names_the_check():
 
 
 def test_dates_differ_retry_three_times_then_nothing_written():
-    stale = [_results_with_date("2026-09-21") for _ in range(4)]
+    stale = [_results_with_date("2026-09-23") for _ in range(4)]
     result, store, hist, session, sent, slept = _run(_answers(**{"/Results": stale}))
     assert slept == [daily.RESULTS_RETRY_PAUSE] * 3
     assert [c["path"] for c in session.calls].count("/Results") == 4
     assert result["results_attempts"] == 4
-    assert result["check"].startswith("M-09 /Results h1 date 2026-09-21")
+    assert result["check"].startswith("M-09 /Results h1 date 2026-09-23")
     assert store.snapshot == {} and store.results == {}
     assert daily.exit_code(result) == 1 and "M-09" in sent[0]
 
 
 def test_dates_converge_on_a_retry():
-    answers = _answers(**{"/Results": [_results_with_date("2026-09-21"),
+    answers = _answers(**{"/Results": [_results_with_date("2026-09-23"),
                                        fixture_response("Results.html.gz")]})
     result, store, _, _, _, slept = _run(answers)
     assert slept == [daily.RESULTS_RETRY_PAUSE] and result["results_attempts"] == 2

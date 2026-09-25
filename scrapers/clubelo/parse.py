@@ -275,6 +275,10 @@ def parse_club_page(html: str, slug: str) -> ClubPage:
 
 RANKING_MIN_ROWS = 1500  # eloData rows; 1741 on 2026-09-22 (C5)
 LEVELS_MIN_RATIO = 0.97  # eloData clubs found in a country table (1722/1741)
+# Club-page links of the country tables: 498 on 22–25.09.2026 (the history
+# queue, same floor as history.MIN_QUEUE). Fewer = the link markup changed and
+# the new-slug branch would silently see nothing (Sol r1 #5).
+RANKING_MIN_LINKED = 400
 RESULTS_HEADERS = (
     "Home", "Away", "Prior Δ", "HFA", "Elo %", "FT", "ET", "P", "Game Δ", "Post-Game Δ",
 )
@@ -419,6 +423,10 @@ def _country_tables(doc) -> List[Dict[str, Any]]:
             if tr.xpath('./td[@class="l"]/i'):
                 group = " ".join(_text(td) for td in tr.xpath("./td"))  # "Level 1 (18 teams) ⌀1751"
                 match = _LEVEL_GROUP.match(group)
+                if not match and group.split(" ")[0] != "Lower":
+                    # only "Level N (k teams)" and "Lower" exist: a renamed
+                    # header would leave every level NULL (Sol r1 #3)
+                    raise LayoutChanged(f"C3 country table {section_name!r}: group header {group!r}")
                 level = int(match.group(1)) if match else None
                 continue
             tds = tr.xpath("./td")
@@ -516,6 +524,8 @@ def parse_ranking(html: str) -> RankingPage:
     for row in table_rows:
         if not row["is_provisional"]:
             continue
+        if not row["slug"] and not (row["country"] and row["name"]):
+            raise LayoutChanged(f"C3 provisional club without country or name: {row!r:.200}")
         provisional += 1
         rows.append(
             {
@@ -534,6 +544,10 @@ def parse_ranking(html: str) -> RankingPage:
                 "is_provisional": True,
             }
         )
+    keys = [row["club_key"] for row in rows]
+    if len(set(keys)) != len(keys):
+        twins = sorted({k for k in keys if keys.count(k) > 1})[:5]
+        raise LayoutChanged(f"C3 club_key not unique: {twins}")
     return RankingPage(
         rating_date=rating_date,
         page_created_at=created,
@@ -552,8 +566,9 @@ def check_ranking(
     *,
     min_rows: int = RANKING_MIN_ROWS,
     min_levels_ratio: float = LEVELS_MIN_RATIO,
+    min_linked: int = RANKING_MIN_LINKED,
 ) -> None:
-    """Fail-closed thresholds of a parsed /Ranking (C5 rows, C6 matched levels)."""
+    """Fail-closed thresholds of a parsed /Ranking (C5 rows, C6 levels, C7 links)."""
 
     if page.elo_rows < min_rows:
         raise LayoutChanged(f"C5 eloData has {page.elo_rows} rows, expected >= {min_rows}")
@@ -561,6 +576,10 @@ def check_ranking(
         raise LayoutChanged(
             f"C6 levels matched {page.levels_matched}/{page.elo_rows} "
             f"({page.levels_matched_pct}%), expected >= {min_levels_ratio:.0%}"
+        )
+    if len(page.linked_slugs) < min_linked:
+        raise LayoutChanged(
+            f"C7 country tables link {len(page.linked_slugs)} club pages, expected >= {min_linked}"
         )
 
 
@@ -576,8 +595,8 @@ def _team(td) -> Dict[str, Any]:
         "country": _first(td.xpath(".//img/@alt")),
         "rank": _integer(rank.strip(), "team rank") if rank and rank.strip() else None,
     }
-    if not team["slug"] and not team["name"]:
-        raise LayoutChanged(f"C3 result team without link and name: {_text(td)!r}")
+    if not team["slug"] and not (team["country"] and team["name"]):
+        raise LayoutChanged(f"C3 result team without link, country or name: {_text(td)!r}")
     team["key"] = team["slug"] or f"~{team['country'] or ''}:{team['name']}"
     return team
 
@@ -606,12 +625,16 @@ def parse_results(html: str) -> ResultsPage:
         raise LayoutChanged(f"C1 results table headers changed: {names}")
     rows: List[Dict[str, Any]] = []
     seen = set()
-    duplicates = 0
+    duplicates = separators = 0
     current = rating_date
     for tr in tables[0].xpath(".//tr[td]"):
         tds = tr.xpath("./td")
         if len(tds) == 1 and tds[0].get("colspan"):
-            current = _iso_date(_text(tds[0]), "C3 results date separator")
+            day = _iso_date(_text(tds[0]), "C3 results date separator")
+            if day >= current:
+                raise LayoutChanged(f"C3 results date separator {day} is not before {current}")
+            current = day
+            separators += 1
             continue
         if len(tds) not in RESULT_ROW_CELLS:
             raise LayoutChanged(f"C3 results row {len(rows)} has {len(tds)} cells")
@@ -651,5 +674,9 @@ def parse_results(html: str) -> ResultsPage:
         rows.append(row)
     if not rows:
         raise LayoutChanged("C5 results table has no rows")
+    if not separators:
+        # the ~3-day window always has older dates; without separators every
+        # row would get the h1 date (Sol r1 #6)
+        raise LayoutChanged("C3 results table has no date separators")
     return ResultsPage(rating_date=rating_date, page_created_at=created, rows=rows,
                        duplicates=duplicates)
