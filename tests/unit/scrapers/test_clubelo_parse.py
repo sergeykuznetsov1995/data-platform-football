@@ -250,6 +250,14 @@ def test_negative_provisional_elo(ranking_html):
     assert lok["elo"] == -29 and lok["is_provisional"] is True
 
 
+def test_signed_one_day_delta_is_kept_raw(ranking_html):
+    # the live page of 2026-09-25 carries "+0.00" next to "-0.00"
+    page = parse_ranking(ranking_html.replace("'2046', '-0.00', '2.38'", "'2046', '+0.00', '2.38'", 1))
+    assert page.rows[0]["elo_delta_1d_raw"] == "+0.00"
+    with pytest.raises(LayoutChanged, match="1-day"):
+        parse_ranking(ranking_html.replace("'2046', '-0.00', '2.38'", "'2046', '±0.00', '2.38'", 1))
+
+
 def test_slug_twins_are_not_glued(ranking):
     twins = {r["club_key"]: r for r in ranking.rows if r["slug"] in ("Vikingur", "vikingur")}
     assert set(twins) == {"Vikingur", "vikingur"}
@@ -319,6 +327,17 @@ def test_results_fixture(results_html):
     assert final["match_date"] == date(2026, 9, 21) and final["is_final"] is True
     assert (final["game_delta"], final["game_delta_sigma"]) == (-423.4, 456.0)
     assert (final["post_game_delta"], final["post_game_delta_sigma"]) == (-110.5, 79.0)
+
+
+def test_results_prior_new_is_kept_raw(results_html):
+    # the live /Results of 2026-09-25 shows "NEW" for a club without a prior rating
+    old = '<td class="r">201.9<span class="min961"> ±82</span></td>'
+    assert old in results_html
+    row = parse_results(results_html.replace(old, '<td class="r">NEW</td>', 1)).rows[2]
+    assert (row["prior_delta"], row["prior_delta_sigma"], row["prior_delta_raw"]) == (None, None, "NEW")
+    assert parse_results(results_html).rows[2]["prior_delta_raw"] == "201.9 ±82"
+    with pytest.raises(LayoutChanged, match="Prior Δ"):
+        parse_results(results_html.replace(old, '<td class="r">OLD</td>', 1))
 
 
 def test_results_duplicate_key_keeps_first(results_html):

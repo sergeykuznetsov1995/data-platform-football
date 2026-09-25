@@ -290,6 +290,7 @@ _ELO_CELL = re.compile(
 )
 _ELO_INT = re.compile(r"^-?\d+$")
 _ELO_DECIMAL = re.compile(r"^-?\d+\.\d+$")
+_ELO_DELTA = re.compile(r"^[-+]?\d+\.\d+$")  # "-0.00" and "+0.00" both occur (25.09)
 _TABLE_ELO = re.compile(r"^(-?\d+)(p?)$")  # "2046", provisional "1255p" / "-29p"
 _LEVEL_GROUP = re.compile(r"^Level (\d+) \((\d+) teams\)")
 
@@ -353,7 +354,7 @@ def _elo_data(html: str) -> List[Dict[str, Any]]:
             raise LayoutChanged(f"C3 eloData row {seq} club cell unparsed: {row[0]!r:.200}")
         if not _ELO_INT.match(row[1]):
             raise LayoutChanged(f"C3 eloData row {seq} Elo is not an integer: {row[1]!r}")
-        if not _ELO_DECIMAL.match(row[2]):
+        if not _ELO_DELTA.match(row[2]):
             raise LayoutChanged(f"C3 eloData row {seq} 1-day Δ unparsed: {row[2]!r}")
         if not _ELO_DECIMAL.match(row[3]):
             raise LayoutChanged(f"C3 eloData row {seq} Golo unparsed: {row[3]!r}")
@@ -619,7 +620,8 @@ def parse_results(html: str) -> ResultsPage:
         elo_pct = "".join(tds[4].xpath('./span[@class="min1081"]/text()')).strip()
         if not elo_pct:
             raise LayoutChanged(f"C3 results row {len(rows)}: Elo % (span.min1081) is empty")
-        prior, prior_sigma = _value_sigma(cells[2], "Prior Δ")
+        # "NEW" instead of a number: a club without a prior rating (25.09)
+        prior, prior_sigma = (None, None) if cells[2] == "NEW" else _value_sigma(cells[2], "Prior Δ")
         game, game_sigma = _value_sigma(cells[8], "Game Δ")
         post, post_sigma = _value_sigma(cells[9], "Post-Game Δ")
         key = (current, home["key"], away["key"])
@@ -634,6 +636,7 @@ def parse_results(html: str) -> ResultsPage:
         row.update(
             prior_delta=prior,
             prior_delta_sigma=prior_sigma,
+            prior_delta_raw=cells[2],
             hfa=_number(cells[3], "HFA"),
             elo_pct=_number(elo_pct, "Elo %"),
             ft=cells[5] or None,

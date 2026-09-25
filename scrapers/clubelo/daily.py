@@ -115,6 +115,7 @@ RESULT_SCHEMA = pa.schema(
         ("away_rank", pa.int32()),
         ("prior_delta", pa.float64()),
         ("prior_delta_sigma", pa.float64()),
+        ("prior_delta_raw", pa.string()),  # cell text: "-100.0 ±80" or "NEW"
         ("hfa", pa.float64()),
         ("elo_pct", pa.float64()),
         ("ft", pa.string()),

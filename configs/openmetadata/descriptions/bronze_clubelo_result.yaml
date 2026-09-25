@@ -47,6 +47,8 @@ columns:
     description: Prior Δ — разница рейтингов до матча.
   - name: prior_delta_sigma
     description: Погрешность Prior Δ (число после ±).
+  - name: prior_delta_raw
+    description: Ячейка Prior Δ как есть («-100.0 ±80»; «NEW» у клуба без прежнего рейтинга — тогда prior_delta NULL).
   - name: hfa
     description: Преимущество своего поля (HFA).
   - name: elo_pct
