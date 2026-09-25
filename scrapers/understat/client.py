@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
+import logging
 from pathlib import Path
 import random
 import time
@@ -21,6 +22,8 @@ DEFAULT_USER_AGENT = (
 )
 RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
+logger = logging.getLogger(__name__)
+
 
 class UnderstatHTTPError(RuntimeError):
     def __init__(self, url: str, status_code: int):
@@ -31,6 +34,56 @@ class UnderstatHTTPError(RuntimeError):
 
 class UnderstatPayloadError(RuntimeError):
     pass
+
+
+def league_cache_name(source_league: str, source_season_id: int) -> str:
+    return f"league_{quote(source_league, safe='_-')}_{source_season_id}.json"
+
+
+def match_cache_name(match_id: int | str) -> str:
+    return f"match_{quote(str(match_id), safe='')}.json"
+
+
+def team_cache_name(team_name: str, source_season_id: int) -> str:
+    slug = quote(team_name.replace(" ", "_"), safe="_-")
+    return f"team_{slug}_{source_season_id}.json"
+
+
+def save_schema_drift_payload(
+    cache_dir: Optional[Path | str], cache_name: str, payload: Any
+) -> Optional[Path]:
+    """#1428 (R-02): keep a rejected source response for later repair.
+
+    The regular cache file is overwritten by the next run, so the response
+    goes to ``<cache_dir>/schema_drift/<UTC ts>_<cache name>``; a ``str``
+    payload is the raw response text, anything else is written as JSON.
+    Best-effort:
+    without a cache or on any write error nothing is saved and the caller's
+    drift exception stays the verdict.
+    """
+
+    if cache_dir is None:
+        return None
+    try:
+        folder = Path(cache_dir) / "schema_drift"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        target = folder / f"{stamp}_{cache_name}"
+        text = (
+            payload
+            if isinstance(payload, str)
+            else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
+        target.write_text(text, encoding="utf-8")
+    except Exception:
+        logger.warning(
+            "Unable to save Understat schema-drift payload %s",
+            cache_name,
+            exc_info=True,
+        )
+        return None
+    logger.warning("Understat schema-drift payload saved to %s", target)
+    return target
 
 
 class _EvenPacer:
@@ -139,7 +192,7 @@ class UnderstatClient:
         slug = quote(source_league, safe="_-")
         return self._get_json(
             f"/getLeagueData/{slug}/{source_season_id}",
-            f"league_{slug}_{source_season_id}.json",
+            league_cache_name(source_league, source_season_id),
             force_refresh=force_refresh,
         )
 
@@ -149,7 +202,7 @@ class UnderstatClient:
         match = quote(str(match_id), safe="")
         return self._get_json(
             f"/getMatchData/{match}",
-            f"match_{match}.json",
+            match_cache_name(match_id),
             force_refresh=force_refresh,
         )
 
@@ -163,7 +216,7 @@ class UnderstatClient:
         slug = quote(team_name.replace(" ", "_"), safe="_-")
         return self._get_json(
             f"/getTeamData/{slug}/{source_season_id}",
-            f"team_{slug}_{source_season_id}.json",
+            team_cache_name(team_name, source_season_id),
             force_refresh=force_refresh,
         )
 
@@ -183,8 +236,10 @@ class UnderstatClient:
         try:
             payload = response.json()
         except Exception as exc:
+            self._save_rejected(response, cache_name)
             raise UnderstatPayloadError(f"Invalid JSON from {url}") from exc
         if not isinstance(payload, dict):
+            self._save_rejected(response, cache_name, payload)
             raise UnderstatPayloadError(f"Expected an object from {url}")
 
         if cache_path is not None:
@@ -196,6 +251,14 @@ class UnderstatClient:
             )
             temporary.replace(cache_path)
         return payload
+
+    def _save_rejected(
+        self, response: Any, cache_name: str, payload: Any = None
+    ) -> None:
+        text = getattr(response, "text", None)
+        save_schema_drift_payload(
+            self.cache_dir, cache_name, text if isinstance(text, str) else payload
+        )
 
     def _ensure_cookies(self) -> None:
         if self._cookies_initialized:
@@ -267,4 +330,5 @@ __all__ = [
     "UnderstatClient",
     "UnderstatHTTPError",
     "UnderstatPayloadError",
+    "save_schema_drift_payload",
 ]

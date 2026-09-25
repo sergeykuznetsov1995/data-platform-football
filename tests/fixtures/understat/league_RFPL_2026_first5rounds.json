@@ -1,0 +1,3567 @@
+{
+ "dates": [
+  {
+   "id": "30569",
+   "isResult": true,
+   "h": {
+    "id": "185",
+    "title": "CSKA Moscow",
+    "short_title": "CSK"
+   },
+   "a": {
+    "id": "278",
+    "title": "Baltika",
+    "short_title": "BAL"
+   },
+   "goals": {
+    "h": "2",
+    "a": "1"
+   },
+   "xG": {
+    "h": "2.19287",
+    "a": "1.55573"
+   },
+   "datetime": "2026-07-24 17:00:00",
+   "forecast": {
+    "w": "0.5403",
+    "d": "0.2583",
+    "l": "0.2014"
+   }
+  },
+  {
+   "id": "30570",
+   "isResult": true,
+   "h": {
+    "id": "190",
+    "title": "Dinamo Moscow",
+    "short_title": "DIN"
+   },
+   "a": {
+    "id": "194",
+    "title": "Krylya Sovetov Samara",
+    "short_title": "KSS"
+   },
+   "goals": {
+    "h": "0",
+    "a": "0"
+   },
+   "xG": {
+    "h": "1.18919",
+    "a": "0.989463"
+   },
+   "datetime": "2026-07-25 11:00:00",
+   "forecast": {
+    "w": "0.3978",
+    "d": "0.2951",
+    "l": "0.3071"
+   }
+  },
+  {
+   "id": "30571",
+   "isResult": true,
+   "h": {
+    "id": "283",
+    "title": "Akron",
+    "short_title": "AKR"
+   },
+   "a": {
+    "id": "189",
+    "title": "Zenit St. Petersburg",
+    "short_title": "ZEN"
+   },
+   "goals": {
+    "h": "0",
+    "a": "5"
+   },
+   "xG": {
+    "h": "0.776927",
+    "a": "2.57093"
+   },
+   "datetime": "2026-07-25 13:15:00",
+   "forecast": {
+    "w": "0.0592",
+    "d": "0.129",
+    "l": "0.8118"
+   }
+  },
+  {
+   "id": "30572",
+   "isResult": true,
+   "h": {
+    "id": "277",
+    "title": "Fakel",
+    "short_title": "FAK"
+   },
+   "a": {
+    "id": "284",
+    "title": "Dynamo Makhachkala",
+    "short_title": "DNM"
+   },
+   "goals": {
+    "h": "1",
+    "a": "2"
+   },
+   "xG": {
+    "h": "1.25347",
+    "a": "1.1411"
+   },
+   "datetime": "2026-07-25 15:30:00",
+   "forecast": {
+    "w": "0.378",
+    "d": "0.3291",
+    "l": "0.2929"
+   }
+  },
+  {
+   "id": "30573",
+   "isResult": true,
+   "h": {
+    "id": "183",
+    "title": "Spartak Moscow",
+    "short_title": "SPA"
+   },
+   "a": {
+    "id": "292",
+    "title": "Rodina",
+    "short_title": "ROD"
+   },
+   "goals": {
+    "h": "3",
+    "a": "0"
+   },
+   "xG": {
+    "h": "3.12371",
+    "a": "0.409375"
+   },
+   "datetime": "2026-07-25 17:45:00",
+   "forecast": {
+    "w": "0.9329",
+    "d": "0.0533",
+    "l": "0.0138"
+   }
+  },
+  {
+   "id": "30574",
+   "isResult": true,
+   "h": {
+    "id": "199",
+    "title": "FC Orenburg",
+    "short_title": "ORE"
+   },
+   "a": {
+    "id": "187",
+    "title": "FC Rostov",
+    "short_title": "ROS"
+   },
+   "goals": {
+    "h": "2",
+    "a": "1"
+   },
+   "xG": {
+    "h": "1.57351",
+    "a": "0.588781"
+   },
+   "datetime": "2026-07-26 11:30:00",
+   "forecast": {
+    "w": "0.659",
+    "d": "0.2302",
+    "l": "0.1108"
+   }
+  },
+  {
+   "id": "30575",
+   "isResult": true,
+   "h": {
+    "id": "192",
+    "title": "Lokomotiv Moscow",
+    "short_title": "LOK"
+   },
+   "a": {
+    "id": "188",
+    "title": "FK Akhmat",
+    "short_title": "AKH"
+   },
+   "goals": {
+    "h": "1",
+    "a": "1"
+   },
+   "xG": {
+    "h": "1.5902",
+    "a": "2.17706"
+   },
+   "datetime": "2026-07-26 14:00:00",
+   "forecast": {
+    "w": "0.246",
+    "d": "0.2348",
+    "l": "0.5192"
+   }
+  },
+  {
+   "id": "30576",
+   "isResult": true,
+   "h": {
+    "id": "186",
+    "title": "Rubin Kazan",
+    "short_title": "RUB"
+   },
+   "a": {
+    "id": "196",
+    "title": "FC Krasnodar",
+    "short_title": "KRA"
+   },
+   "goals": {
+    "h": "1",
+    "a": "3"
+   },
+   "xG": {
+    "h": "0.775964",
+    "a": "2.85281"
+   },
+   "datetime": "2026-07-26 16:30:00",
+   "forecast": {
+    "w": "0.0378",
+    "d": "0.109",
+    "l": "0.8532"
+   }
+  },
+  {
+   "id": "30577",
+   "isResult": true,
+   "h": {
+    "id": "292",
+    "title": "Rodina",
+    "short_title": "ROD"
+   },
+   "a": {
+    "id": "187",
+    "title": "FC Rostov",
+    "short_title": "ROS"
+   },
+   "goals": {
+    "h": "2",
+    "a": "4"
+   },
+   "xG": {
+    "h": "0.942922",
+    "a": "2.14974"
+   },
+   "datetime": "2026-07-31 17:00:00",
+   "forecast": {
+    "w": "0.0931",
+    "d": "0.2159",
+    "l": "0.691"
+   }
+  },
+  {
+   "id": "30530",
+   "isResult": true,
+   "h": {
+    "id": "283",
+    "title": "Akron",
+    "short_title": "AKR"
+   },
+   "a": {
+    "id": "186",
+    "title": "Rubin Kazan",
+    "short_title": "RUB"
+   },
+   "goals": {
+    "h": "1",
+    "a": "2"
+   },
+   "xG": {
+    "h": "0.767292",
+    "a": "1.50741"
+   },
+   "datetime": "2026-08-01 11:00:00",
+   "forecast": {
+    "w": "0.158",
+    "d": "0.282",
+    "l": "0.56"
+   }
+  },
+  {
+   "id": "30531",
+   "isResult": true,
+   "h": {
+    "id": "185",
+    "title": "CSKA Moscow",
+    "short_title": "CSK"
+   },
+   "a": {
+    "id": "194",
+    "title": "Krylya Sovetov Samara",
+    "short_title": "KSS"
+   },
+   "goals": {
+    "h": "1",
+    "a": "1"
+   },
+   "xG": {
+    "h": "1.12785",
+    "a": "0.473097"
+   },
+   "datetime": "2026-08-01 13:15:00",
+   "forecast": {
+    "w": "0.5235",
+    "d": "0.3302",
+    "l": "0.1463"
+   }
+  },
+  {
+   "id": "30532",
+   "isResult": true,
+   "h": {
+    "id": "284",
+    "title": "Dynamo Makhachkala",
+    "short_title": "DNM"
+   },
+   "a": {
+    "id": "192",
+    "title": "Lokomotiv Moscow",
+    "short_title": "LOK"
+   },
+   "goals": {
+    "h": "2",
+    "a": "1"
+   },
+   "xG": {
+    "h": "1.56011",
+    "a": "1.49405"
+   },
+   "datetime": "2026-08-01 15:30:00",
+   "forecast": {
+    "w": "0.3708",
+    "d": "0.2924",
+    "l": "0.3368"
+   }
+  },
+  {
+   "id": "30533",
+   "isResult": true,
+   "h": {
+    "id": "278",
+    "title": "Baltika",
+    "short_title": "BAL"
+   },
+   "a": {
+    "id": "190",
+    "title": "Dinamo Moscow",
+    "short_title": "DIN"
+   },
+   "goals": {
+    "h": "2",
+    "a": "1"
+   },
+   "xG": {
+    "h": "1.64147",
+    "a": "0.975537"
+   },
+   "datetime": "2026-08-01 17:45:00",
+   "forecast": {
+    "w": "0.5728",
+    "d": "0.258",
+    "l": "0.1692"
+   }
+  },
+  {
+   "id": "30534",
+   "isResult": true,
+   "h": {
+    "id": "199",
+    "title": "FC Orenburg",
+    "short_title": "ORE"
+   },
+   "a": {
+    "id": "189",
+    "title": "Zenit St. Petersburg",
+    "short_title": "ZEN"
+   },
+   "goals": {
+    "h": "0",
+    "a": "3"
+   },
+   "xG": {
+    "h": "0.549851",
+    "a": "0.813837"
+   },
+   "datetime": "2026-08-02 13:00:00",
+   "forecast": {
+    "w": "0.2296",
+    "d": "0.375",
+    "l": "0.3954"
+   }
+  },
+  {
+   "id": "30535",
+   "isResult": true,
+   "h": {
+    "id": "196",
+    "title": "FC Krasnodar",
+    "short_title": "KRA"
+   },
+   "a": {
+    "id": "277",
+    "title": "Fakel",
+    "short_title": "FAK"
+   },
+   "goals": {
+    "h": "3",
+    "a": "2"
+   },
+   "xG": {
+    "h": "1.19478",
+    "a": "1.69608"
+   },
+   "datetime": "2026-08-02 15:15:00",
+   "forecast": {
+    "w": "0.2289",
+    "d": "0.2663",
+    "l": "0.5048"
+   }
+  },
+  {
+   "id": "30536",
+   "isResult": true,
+   "h": {
+    "id": "188",
+    "title": "FK Akhmat",
+    "short_title": "AKH"
+   },
+   "a": {
+    "id": "183",
+    "title": "Spartak Moscow",
+    "short_title": "SPA"
+   },
+   "goals": {
+    "h": "1",
+    "a": "2"
+   },
+   "xG": {
+    "h": "0.856164",
+    "a": "1.04462"
+   },
+   "datetime": "2026-08-02 17:30:00",
+   "forecast": {
+    "w": "0.2713",
+    "d": "0.3683",
+    "l": "0.3604"
+   }
+  },
+  {
+   "id": "30537",
+   "isResult": true,
+   "h": {
+    "id": "194",
+    "title": "Krylya Sovetov Samara",
+    "short_title": "KSS"
+   },
+   "a": {
+    "id": "278",
+    "title": "Baltika",
+    "short_title": "BAL"
+   },
+   "goals": {
+    "h": "0",
+    "a": "2"
+   },
+   "xG": {
+    "h": "0.302774",
+    "a": "1.44939"
+   },
+   "datetime": "2026-08-08 12:30:00",
+   "forecast": {
+    "w": "0.059",
+    "d": "0.2247",
+    "l": "0.7163"
+   }
+  },
+  {
+   "id": "30538",
+   "isResult": true,
+   "h": {
+    "id": "192",
+    "title": "Lokomotiv Moscow",
+    "short_title": "LOK"
+   },
+   "a": {
+    "id": "283",
+    "title": "Akron",
+    "short_title": "AKR"
+   },
+   "goals": {
+    "h": "0",
+    "a": "0"
+   },
+   "xG": {
+    "h": "1.22174",
+    "a": "0.860944"
+   },
+   "datetime": "2026-08-08 15:00:00",
+   "forecast": {
+    "w": "0.447",
+    "d": "0.2985",
+    "l": "0.2545"
+   }
+  },
+  {
+   "id": "30539",
+   "isResult": true,
+   "h": {
+    "id": "187",
+    "title": "FC Rostov",
+    "short_title": "ROS"
+   },
+   "a": {
+    "id": "185",
+    "title": "CSKA Moscow",
+    "short_title": "CSK"
+   },
+   "goals": {
+    "h": "0",
+    "a": "0"
+   },
+   "xG": {
+    "h": "0.608005",
+    "a": "0.892612"
+   },
+   "datetime": "2026-08-08 17:30:00",
+   "forecast": {
+    "w": "0.2311",
+    "d": "0.365",
+    "l": "0.4039"
+   }
+  },
+  {
+   "id": "30540",
+   "isResult": true,
+   "h": {
+    "id": "190",
+    "title": "Dinamo Moscow",
+    "short_title": "DIN"
+   },
+   "a": {
+    "id": "284",
+    "title": "Dynamo Makhachkala",
+    "short_title": "DNM"
+   },
+   "goals": {
+    "h": "3",
+    "a": "1"
+   },
+   "xG": {
+    "h": "1.1391",
+    "a": "1.12965"
+   },
+   "datetime": "2026-08-09 11:30:00",
+   "forecast": {
+    "w": "0.3364",
+    "d": "0.331",
+    "l": "0.3326"
+   }
+  },
+  {
+   "id": "30541",
+   "isResult": true,
+   "h": {
+    "id": "189",
+    "title": "Zenit St. Petersburg",
+    "short_title": "ZEN"
+   },
+   "a": {
+    "id": "292",
+    "title": "Rodina",
+    "short_title": "ROD"
+   },
+   "goals": {
+    "h": "1",
+    "a": "2"
+   },
+   "xG": {
+    "h": "1.21168",
+    "a": "1.04813"
+   },
+   "datetime": "2026-08-09 14:00:00",
+   "forecast": {
+    "w": "0.3755",
+    "d": "0.3158",
+    "l": "0.3087"
+   }
+  },
+  {
+   "id": "30542",
+   "isResult": true,
+   "h": {
+    "id": "183",
+    "title": "Spartak Moscow",
+    "short_title": "SPA"
+   },
+   "a": {
+    "id": "196",
+    "title": "FC Krasnodar",
+    "short_title": "KRA"
+   },
+   "goals": {
+    "h": "1",
+    "a": "2"
+   },
+   "xG": {
+    "h": "1.79022",
+    "a": "1.23661"
+   },
+   "datetime": "2026-08-09 17:30:00",
+   "forecast": {
+    "w": "0.5087",
+    "d": "0.2604",
+    "l": "0.2309"
+   }
+  },
+  {
+   "id": "30543",
+   "isResult": true,
+   "h": {
+    "id": "186",
+    "title": "Rubin Kazan",
+    "short_title": "RUB"
+   },
+   "a": {
+    "id": "199",
+    "title": "FC Orenburg",
+    "short_title": "ORE"
+   },
+   "goals": {
+    "h": "1",
+    "a": "1"
+   },
+   "xG": {
+    "h": "0.350539",
+    "a": "1.06948"
+   },
+   "datetime": "2026-08-09 17:30:00",
+   "forecast": {
+    "w": "0.1046",
+    "d": "0.3247",
+    "l": "0.5707"
+   }
+  },
+  {
+   "id": "30544",
+   "isResult": true,
+   "h": {
+    "id": "277",
+    "title": "Fakel",
+    "short_title": "FAK"
+   },
+   "a": {
+    "id": "188",
+    "title": "FK Akhmat",
+    "short_title": "AKH"
+   },
+   "goals": {
+    "h": "0",
+    "a": "0"
+   },
+   "xG": {
+    "h": "1.65452",
+    "a": "0.291056"
+   },
+   "datetime": "2026-08-10 16:30:00",
+   "forecast": {
+    "w": "0.7617",
+    "d": "0.189",
+    "l": "0.0493"
+   }
+  },
+  {
+   "id": "30545",
+   "isResult": true,
+   "h": {
+    "id": "199",
+    "title": "FC Orenburg",
+    "short_title": "ORE"
+   },
+   "a": {
+    "id": "192",
+    "title": "Lokomotiv Moscow",
+    "short_title": "LOK"
+   },
+   "goals": {
+    "h": "1",
+    "a": "1"
+   },
+   "xG": {
+    "h": "2.57316",
+    "a": "0.414877"
+   },
+   "datetime": "2026-08-14 14:00:00",
+   "forecast": {
+    "w": "0.892",
+    "d": "0.0878",
+    "l": "0.0202"
+   }
+  },
+  {
+   "id": "30546",
+   "isResult": true,
+   "h": {
+    "id": "292",
+    "title": "Rodina",
+    "short_title": "ROD"
+   },
+   "a": {
+    "id": "283",
+    "title": "Akron",
+    "short_title": "AKR"
+   },
+   "goals": {
+    "h": "3",
+    "a": "3"
+   },
+   "xG": {
+    "h": "0.846269",
+    "a": "2.27979"
+   },
+   "datetime": "2026-08-15 11:00:00",
+   "forecast": {
+    "w": "0.0615",
+    "d": "0.176",
+    "l": "0.7625"
+   }
+  },
+  {
+   "id": "30547",
+   "isResult": true,
+   "h": {
+    "id": "185",
+    "title": "CSKA Moscow",
+    "short_title": "CSK"
+   },
+   "a": {
+    "id": "277",
+    "title": "Fakel",
+    "short_title": "FAK"
+   },
+   "goals": {
+    "h": "1",
+    "a": "0"
+   },
+   "xG": {
+    "h": "0.983945",
+    "a": "0.4856"
+   },
+   "datetime": "2026-08-15 13:15:00",
+   "forecast": {
+    "w": "0.5304",
+    "d": "0.3402",
+    "l": "0.1294"
+   }
+  },
+  {
+   "id": "30548",
+   "isResult": true,
+   "h": {
+    "id": "187",
+    "title": "FC Rostov",
+    "short_title": "ROS"
+   },
+   "a": {
+    "id": "186",
+    "title": "Rubin Kazan",
+    "short_title": "RUB"
+   },
+   "goals": {
+    "h": "1",
+    "a": "1"
+   },
+   "xG": {
+    "h": "0.622545",
+    "a": "1.18859"
+   },
+   "datetime": "2026-08-15 15:30:00",
+   "forecast": {
+    "w": "0.1449",
+    "d": "0.3093",
+    "l": "0.5458"
+   }
+  },
+  {
+   "id": "30549",
+   "isResult": true,
+   "h": {
+    "id": "196",
+    "title": "FC Krasnodar",
+    "short_title": "KRA"
+   },
+   "a": {
+    "id": "188",
+    "title": "FK Akhmat",
+    "short_title": "AKH"
+   },
+   "goals": {
+    "h": "1",
+    "a": "0"
+   },
+   "xG": {
+    "h": "1.06844",
+    "a": "0.912562"
+   },
+   "datetime": "2026-08-15 17:45:00",
+   "forecast": {
+    "w": "0.3708",
+    "d": "0.3258",
+    "l": "0.3034"
+   }
+  },
+  {
+   "id": "30550",
+   "isResult": true,
+   "h": {
+    "id": "189",
+    "title": "Zenit St. Petersburg",
+    "short_title": "ZEN"
+   },
+   "a": {
+    "id": "190",
+    "title": "Dinamo Moscow",
+    "short_title": "DIN"
+   },
+   "goals": {
+    "h": "3",
+    "a": "0"
+   },
+   "xG": {
+    "h": "1.22196",
+    "a": "0.485918"
+   },
+   "datetime": "2026-08-16 11:30:00",
+   "forecast": {
+    "w": "0.6294",
+    "d": "0.2689",
+    "l": "0.1017"
+   }
+  },
+  {
+   "id": "30551",
+   "isResult": true,
+   "h": {
+    "id": "194",
+    "title": "Krylya Sovetov Samara",
+    "short_title": "KSS"
+   },
+   "a": {
+    "id": "284",
+    "title": "Dynamo Makhachkala",
+    "short_title": "DNM"
+   },
+   "goals": {
+    "h": "1",
+    "a": "4"
+   },
+   "xG": {
+    "h": "1.32517",
+    "a": "2.0941"
+   },
+   "datetime": "2026-08-16 14:00:00",
+   "forecast": {
+    "w": "0.1994",
+    "d": "0.2214",
+    "l": "0.5792"
+   }
+  },
+  {
+   "id": "30552",
+   "isResult": true,
+   "h": {
+    "id": "278",
+    "title": "Baltika",
+    "short_title": "BAL"
+   },
+   "a": {
+    "id": "183",
+    "title": "Spartak Moscow",
+    "short_title": "SPA"
+   },
+   "goals": {
+    "h": "1",
+    "a": "2"
+   },
+   "xG": {
+    "h": "0.56059",
+    "a": "0.935597"
+   },
+   "datetime": "2026-08-16 16:30:00",
+   "forecast": {
+    "w": "0.1989",
+    "d": "0.3478",
+    "l": "0.4533"
+   }
+  },
+  {
+   "id": "30553",
+   "isResult": true,
+   "h": {
+    "id": "277",
+    "title": "Fakel",
+    "short_title": "FAK"
+   },
+   "a": {
+    "id": "199",
+    "title": "FC Orenburg",
+    "short_title": "ORE"
+   },
+   "goals": {
+    "h": "0",
+    "a": "0"
+   },
+   "xG": {
+    "h": "0.737073",
+    "a": "1.18966"
+   },
+   "datetime": "2026-08-22 12:30:00",
+   "forecast": {
+    "w": "0.1785",
+    "d": "0.3233",
+    "l": "0.4982"
+   }
+  },
+  {
+   "id": "30554",
+   "isResult": true,
+   "h": {
+    "id": "188",
+    "title": "FK Akhmat",
+    "short_title": "AKH"
+   },
+   "a": {
+    "id": "187",
+    "title": "FC Rostov",
+    "short_title": "ROS"
+   },
+   "goals": {
+    "h": "4",
+    "a": "1"
+   },
+   "xG": {
+    "h": "1.14022",
+    "a": "0.641588"
+   },
+   "datetime": "2026-08-22 15:00:00",
+   "forecast": {
+    "w": "0.498",
+    "d": "0.3126",
+    "l": "0.1894"
+   }
+  },
+  {
+   "id": "30555",
+   "isResult": true,
+   "h": {
+    "id": "185",
+    "title": "CSKA Moscow",
+    "short_title": "CSK"
+   },
+   "a": {
+    "id": "192",
+    "title": "Lokomotiv Moscow",
+    "short_title": "LOK"
+   },
+   "goals": {
+    "h": "3",
+    "a": "2"
+   },
+   "xG": {
+    "h": "2.57102",
+    "a": "2.1119"
+   },
+   "datetime": "2026-08-22 17:30:00",
+   "forecast": {
+    "w": "0.4875",
+    "d": "0.227",
+    "l": "0.2855"
+   }
+  },
+  {
+   "id": "30556",
+   "isResult": true,
+   "h": {
+    "id": "283",
+    "title": "Akron",
+    "short_title": "AKR"
+   },
+   "a": {
+    "id": "194",
+    "title": "Krylya Sovetov Samara",
+    "short_title": "KSS"
+   },
+   "goals": {
+    "h": "0",
+    "a": "3"
+   },
+   "xG": {
+    "h": "0.716978",
+    "a": "1.84027"
+   },
+   "datetime": "2026-08-23 10:00:00",
+   "forecast": {
+    "w": "0.0973",
+    "d": "0.2013",
+    "l": "0.7014"
+   }
+  },
+  {
+   "id": "30557",
+   "isResult": true,
+   "h": {
+    "id": "190",
+    "title": "Dinamo Moscow",
+    "short_title": "DIN"
+   },
+   "a": {
+    "id": "292",
+    "title": "Rodina",
+    "short_title": "ROD"
+   },
+   "goals": {
+    "h": "3",
+    "a": "1"
+   },
+   "xG": {
+    "h": "2.60982",
+    "a": "0.813936"
+   },
+   "datetime": "2026-08-23 12:15:00",
+   "forecast": {
+    "w": "0.8349",
+    "d": "0.1283",
+    "l": "0.0368"
+   }
+  },
+  {
+   "id": "30558",
+   "isResult": true,
+   "h": {
+    "id": "284",
+    "title": "Dynamo Makhachkala",
+    "short_title": "DNM"
+   },
+   "a": {
+    "id": "196",
+    "title": "FC Krasnodar",
+    "short_title": "KRA"
+   },
+   "goals": {
+    "h": "0",
+    "a": "1"
+   },
+   "xG": {
+    "h": "0.842375",
+    "a": "0.468092"
+   },
+   "datetime": "2026-08-23 14:30:00",
+   "forecast": {
+    "w": "0.4414",
+    "d": "0.378",
+    "l": "0.1806"
+   }
+  },
+  {
+   "id": "30559",
+   "isResult": true,
+   "h": {
+    "id": "183",
+    "title": "Spartak Moscow",
+    "short_title": "SPA"
+   },
+   "a": {
+    "id": "189",
+    "title": "Zenit St. Petersburg",
+    "short_title": "ZEN"
+   },
+   "goals": {
+    "h": "2",
+    "a": "0"
+   },
+   "xG": {
+    "h": "0.807468",
+    "a": "0.558674"
+   },
+   "datetime": "2026-08-23 17:00:00",
+   "forecast": {
+    "w": "0.3889",
+    "d": "0.3819",
+    "l": "0.2292"
+   }
+  },
+  {
+   "id": "30560",
+   "isResult": true,
+   "h": {
+    "id": "278",
+    "title": "Baltika",
+    "short_title": "BAL"
+   },
+   "a": {
+    "id": "186",
+    "title": "Rubin Kazan",
+    "short_title": "RUB"
+   },
+   "goals": {
+    "h": "1",
+    "a": "1"
+   },
+   "xG": {
+    "h": "0.704646",
+    "a": "0.822429"
+   },
+   "datetime": "2026-08-24 17:30:00",
+   "forecast": {
+    "w": "0.2802",
+    "d": "0.3512",
+    "l": "0.3686"
+   }
+  },
+  {
+   "id": "30602",
+   "isResult": false,
+   "h": {
+    "id": "188",
+    "title": "FK Akhmat",
+    "short_title": "AKH"
+   },
+   "a": {
+    "id": "278",
+    "title": "Baltika",
+    "short_title": "BAL"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  },
+  {
+   "id": "30603",
+   "isResult": false,
+   "h": {
+    "id": "185",
+    "title": "CSKA Moscow",
+    "short_title": "CSK"
+   },
+   "a": {
+    "id": "292",
+    "title": "Rodina",
+    "short_title": "ROD"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  },
+  {
+   "id": "30604",
+   "isResult": false,
+   "h": {
+    "id": "277",
+    "title": "Fakel",
+    "short_title": "FAK"
+   },
+   "a": {
+    "id": "192",
+    "title": "Lokomotiv Moscow",
+    "short_title": "LOK"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  },
+  {
+   "id": "30605",
+   "isResult": false,
+   "h": {
+    "id": "187",
+    "title": "FC Rostov",
+    "short_title": "ROS"
+   },
+   "a": {
+    "id": "283",
+    "title": "Akron",
+    "short_title": "AKR"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  },
+  {
+   "id": "30606",
+   "isResult": false,
+   "h": {
+    "id": "196",
+    "title": "FC Krasnodar",
+    "short_title": "KRA"
+   },
+   "a": {
+    "id": "189",
+    "title": "Zenit St. Petersburg",
+    "short_title": "ZEN"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  },
+  {
+   "id": "30607",
+   "isResult": false,
+   "h": {
+    "id": "194",
+    "title": "Krylya Sovetov Samara",
+    "short_title": "KSS"
+   },
+   "a": {
+    "id": "183",
+    "title": "Spartak Moscow",
+    "short_title": "SPA"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  },
+  {
+   "id": "30608",
+   "isResult": false,
+   "h": {
+    "id": "199",
+    "title": "FC Orenburg",
+    "short_title": "ORE"
+   },
+   "a": {
+    "id": "284",
+    "title": "Dynamo Makhachkala",
+    "short_title": "DNM"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  },
+  {
+   "id": "30609",
+   "isResult": false,
+   "h": {
+    "id": "186",
+    "title": "Rubin Kazan",
+    "short_title": "RUB"
+   },
+   "a": {
+    "id": "190",
+    "title": "Dinamo Moscow",
+    "short_title": "DIN"
+   },
+   "goals": {
+    "h": null,
+    "a": null
+   },
+   "xG": {
+    "h": null,
+    "a": null
+   },
+   "datetime": "2026-10-10 15:00:00"
+  }
+ ],
+ "players": [],
+ "teams": {
+  "183": {
+   "id": "183",
+   "title": "Spartak Moscow",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 3.12371,
+     "xGA": 0.409375,
+     "npxG": 3.12371,
+     "npxGA": 0.409375,
+     "ppda": {
+      "att": 208,
+      "def": 27
+     },
+     "ppda_allowed": {
+      "att": 243,
+      "def": 18
+     },
+     "deep": 27,
+     "deep_allowed": 2,
+     "scored": 3,
+     "missed": 0,
+     "xpts": 2.852,
+     "result": "w",
+     "date": "2026-07-25 17:45:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 2.714335
+    },
+    {
+     "h_a": "a",
+     "xG": 1.04462,
+     "xGA": 0.856164,
+     "npxG": 1.04462,
+     "npxGA": 0.101889,
+     "ppda": {
+      "att": 97,
+      "def": 32
+     },
+     "ppda_allowed": {
+      "att": 327,
+      "def": 15
+     },
+     "deep": 9,
+     "deep_allowed": 1,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.4495,
+     "result": "w",
+     "date": "2026-08-02 17:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.9427310000000001
+    },
+    {
+     "h_a": "h",
+     "xG": 1.79022,
+     "xGA": 1.23661,
+     "npxG": 1.79022,
+     "npxGA": 1.23661,
+     "ppda": {
+      "att": 134,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 255,
+      "def": 27
+     },
+     "deep": 11,
+     "deep_allowed": 11,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 1.7865,
+     "result": "l",
+     "date": "2026-08-09 17:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": 0.5536099999999999
+    },
+    {
+     "h_a": "a",
+     "xG": 0.935597,
+     "xGA": 0.56059,
+     "npxG": 0.935597,
+     "npxGA": 0.56059,
+     "ppda": {
+      "att": 85,
+      "def": 17
+     },
+     "ppda_allowed": {
+      "att": 294,
+      "def": 22
+     },
+     "deep": 3,
+     "deep_allowed": 7,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.7077,
+     "result": "w",
+     "date": "2026-08-16 16:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.375007
+    },
+    {
+     "h_a": "h",
+     "xG": 0.807468,
+     "xGA": 0.558674,
+     "npxG": 0.807468,
+     "npxGA": 0.558674,
+     "ppda": {
+      "att": 300,
+      "def": 23
+     },
+     "ppda_allowed": {
+      "att": 174,
+      "def": 24
+     },
+     "deep": 2,
+     "deep_allowed": 8,
+     "scored": 2,
+     "missed": 0,
+     "xpts": 1.5486,
+     "result": "w",
+     "date": "2026-08-23 17:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.24879399999999996
+    }
+   ]
+  },
+  "185": {
+   "id": "185",
+   "title": "CSKA Moscow",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 2.19287,
+     "xGA": 1.55573,
+     "npxG": 2.19287,
+     "npxGA": 1.55573,
+     "ppda": {
+      "att": 132,
+      "def": 20
+     },
+     "ppda_allowed": {
+      "att": 341,
+      "def": 21
+     },
+     "deep": 7,
+     "deep_allowed": 5,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.8792,
+     "result": "w",
+     "date": "2026-07-24 17:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.63714
+    },
+    {
+     "h_a": "h",
+     "xG": 1.12785,
+     "xGA": 0.473097,
+     "npxG": 1.12785,
+     "npxGA": 0.473097,
+     "ppda": {
+      "att": 224,
+      "def": 27
+     },
+     "ppda_allowed": {
+      "att": 309,
+      "def": 36
+     },
+     "deep": 8,
+     "deep_allowed": 9,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 1.9007,
+     "result": "d",
+     "date": "2026-08-01 13:15:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.654753
+    },
+    {
+     "h_a": "a",
+     "xG": 0.892612,
+     "xGA": 0.608005,
+     "npxG": 0.892612,
+     "npxGA": 0.608005,
+     "ppda": {
+      "att": 256,
+      "def": 22
+     },
+     "ppda_allowed": {
+      "att": 215,
+      "def": 17
+     },
+     "deep": 3,
+     "deep_allowed": 9,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 1.5767,
+     "result": "d",
+     "date": "2026-08-08 17:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.28460699999999994
+    },
+    {
+     "h_a": "h",
+     "xG": 0.983945,
+     "xGA": 0.4856,
+     "npxG": 0.229669,
+     "npxGA": 0.4856,
+     "ppda": {
+      "att": 182,
+      "def": 16
+     },
+     "ppda_allowed": {
+      "att": 250,
+      "def": 16
+     },
+     "deep": 7,
+     "deep_allowed": 4,
+     "scored": 1,
+     "missed": 0,
+     "xpts": 1.9314,
+     "result": "w",
+     "date": "2026-08-15 13:15:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": -0.25593099999999996
+    },
+    {
+     "h_a": "h",
+     "xG": 2.57102,
+     "xGA": 2.1119,
+     "npxG": 2.57102,
+     "npxGA": 2.1119,
+     "ppda": {
+      "att": 239,
+      "def": 27
+     },
+     "ppda_allowed": {
+      "att": 261,
+      "def": 14
+     },
+     "deep": 9,
+     "deep_allowed": 2,
+     "scored": 3,
+     "missed": 2,
+     "xpts": 1.6895,
+     "result": "w",
+     "date": "2026-08-22 17:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.45912
+    }
+   ]
+  },
+  "186": {
+   "id": "186",
+   "title": "Rubin Kazan",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 0.775964,
+     "xGA": 2.85281,
+     "npxG": 0.775964,
+     "npxGA": 2.85281,
+     "ppda": {
+      "att": 233,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 78,
+      "def": 15
+     },
+     "deep": 2,
+     "deep_allowed": 9,
+     "scored": 1,
+     "missed": 3,
+     "xpts": 0.2224,
+     "result": "l",
+     "date": "2026-07-26 16:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -2.0768459999999997
+    },
+    {
+     "h_a": "a",
+     "xG": 1.50741,
+     "xGA": 0.767292,
+     "npxG": 1.50741,
+     "npxGA": 0.767292,
+     "ppda": {
+      "att": 279,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 151,
+      "def": 18
+     },
+     "deep": 4,
+     "deep_allowed": 6,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.9620000000000002,
+     "result": "w",
+     "date": "2026-08-01 11:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.7401179999999999
+    },
+    {
+     "h_a": "h",
+     "xG": 0.350539,
+     "xGA": 1.06948,
+     "npxG": 0.350539,
+     "npxGA": 1.06948,
+     "ppda": {
+      "att": 102,
+      "def": 16
+     },
+     "ppda_allowed": {
+      "att": 199,
+      "def": 26
+     },
+     "deep": 4,
+     "deep_allowed": 8,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 0.6385,
+     "result": "d",
+     "date": "2026-08-09 17:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.718941
+    },
+    {
+     "h_a": "a",
+     "xG": 1.18859,
+     "xGA": 0.622545,
+     "npxG": 0.434318,
+     "npxGA": 0.622545,
+     "ppda": {
+      "att": 168,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 179,
+      "def": 24
+     },
+     "deep": 3,
+     "deep_allowed": 5,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 1.9466999999999999,
+     "result": "d",
+     "date": "2026-08-15 15:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.18822700000000003
+    },
+    {
+     "h_a": "a",
+     "xG": 0.822429,
+     "xGA": 0.704646,
+     "npxG": 0.822429,
+     "npxGA": 0.704646,
+     "ppda": {
+      "att": 180,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 154,
+      "def": 18
+     },
+     "deep": 6,
+     "deep_allowed": 7,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 1.4569999999999999,
+     "result": "d",
+     "date": "2026-08-24 17:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.11778299999999997
+    }
+   ]
+  },
+  "187": {
+   "id": "187",
+   "title": "FC Rostov",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 0.588781,
+     "xGA": 1.57351,
+     "npxG": 0.588781,
+     "npxGA": 1.57351,
+     "ppda": {
+      "att": 105,
+      "def": 19
+     },
+     "ppda_allowed": {
+      "att": 195,
+      "def": 21
+     },
+     "deep": 5,
+     "deep_allowed": 2,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 0.5626,
+     "result": "l",
+     "date": "2026-07-26 11:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.984729
+    },
+    {
+     "h_a": "a",
+     "xG": 2.14974,
+     "xGA": 0.942922,
+     "npxG": 1.39547,
+     "npxGA": 0.942922,
+     "ppda": {
+      "att": 141,
+      "def": 26
+     },
+     "ppda_allowed": {
+      "att": 142,
+      "def": 22
+     },
+     "deep": 10,
+     "deep_allowed": 0,
+     "scored": 4,
+     "missed": 2,
+     "xpts": 2.2889,
+     "result": "w",
+     "date": "2026-07-31 17:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.45254799999999995
+    },
+    {
+     "h_a": "h",
+     "xG": 0.608005,
+     "xGA": 0.892612,
+     "npxG": 0.608005,
+     "npxGA": 0.892612,
+     "ppda": {
+      "att": 215,
+      "def": 17
+     },
+     "ppda_allowed": {
+      "att": 256,
+      "def": 22
+     },
+     "deep": 9,
+     "deep_allowed": 3,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 1.0583,
+     "result": "d",
+     "date": "2026-08-08 17:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.28460699999999994
+    },
+    {
+     "h_a": "h",
+     "xG": 0.622545,
+     "xGA": 1.18859,
+     "npxG": 0.622545,
+     "npxGA": 0.434318,
+     "ppda": {
+      "att": 179,
+      "def": 24
+     },
+     "ppda_allowed": {
+      "att": 168,
+      "def": 21
+     },
+     "deep": 5,
+     "deep_allowed": 3,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 0.744,
+     "result": "d",
+     "date": "2026-08-15 15:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.18822700000000003
+    },
+    {
+     "h_a": "a",
+     "xG": 0.641588,
+     "xGA": 1.14022,
+     "npxG": 0.641588,
+     "npxGA": 1.14022,
+     "ppda": {
+      "att": 238,
+      "def": 31
+     },
+     "ppda_allowed": {
+      "att": 222,
+      "def": 19
+     },
+     "deep": 13,
+     "deep_allowed": 5,
+     "scored": 1,
+     "missed": 4,
+     "xpts": 0.8808,
+     "result": "l",
+     "date": "2026-08-22 15:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.49863199999999996
+    }
+   ]
+  },
+  "188": {
+   "id": "188",
+   "title": "FK Akhmat",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 2.17706,
+     "xGA": 1.5902,
+     "npxG": 2.17706,
+     "npxGA": 1.5902,
+     "ppda": {
+      "att": 207,
+      "def": 17
+     },
+     "ppda_allowed": {
+      "att": 226,
+      "def": 14
+     },
+     "deep": 4,
+     "deep_allowed": 7,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 1.7923999999999998,
+     "result": "d",
+     "date": "2026-07-26 14:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.5868599999999999
+    },
+    {
+     "h_a": "h",
+     "xG": 0.856164,
+     "xGA": 1.04462,
+     "npxG": 0.101889,
+     "npxGA": 1.04462,
+     "ppda": {
+      "att": 327,
+      "def": 15
+     },
+     "ppda_allowed": {
+      "att": 97,
+      "def": 32
+     },
+     "deep": 1,
+     "deep_allowed": 9,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 1.1822,
+     "result": "l",
+     "date": "2026-08-02 17:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.9427310000000001
+    },
+    {
+     "h_a": "a",
+     "xG": 0.291056,
+     "xGA": 1.65452,
+     "npxG": 0.291056,
+     "npxGA": 1.65452,
+     "ppda": {
+      "att": 224,
+      "def": 14
+     },
+     "ppda_allowed": {
+      "att": 224,
+      "def": 25
+     },
+     "deep": 1,
+     "deep_allowed": 5,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 0.3369,
+     "result": "d",
+     "date": "2026-08-10 16:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -1.363464
+    },
+    {
+     "h_a": "a",
+     "xG": 0.912562,
+     "xGA": 1.06844,
+     "npxG": 0.912562,
+     "npxGA": 1.06844,
+     "ppda": {
+      "att": 219,
+      "def": 9
+     },
+     "ppda_allowed": {
+      "att": 170,
+      "def": 18
+     },
+     "deep": 5,
+     "deep_allowed": 6,
+     "scored": 0,
+     "missed": 1,
+     "xpts": 1.236,
+     "result": "l",
+     "date": "2026-08-15 17:45:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.15587800000000007
+    },
+    {
+     "h_a": "h",
+     "xG": 1.14022,
+     "xGA": 0.641588,
+     "npxG": 1.14022,
+     "npxGA": 0.641588,
+     "ppda": {
+      "att": 222,
+      "def": 19
+     },
+     "ppda_allowed": {
+      "att": 238,
+      "def": 31
+     },
+     "deep": 5,
+     "deep_allowed": 13,
+     "scored": 4,
+     "missed": 1,
+     "xpts": 1.8066,
+     "result": "w",
+     "date": "2026-08-22 15:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.49863199999999996
+    }
+   ]
+  },
+  "189": {
+   "id": "189",
+   "title": "Zenit St. Petersburg",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 2.57093,
+     "xGA": 0.776927,
+     "npxG": 2.57093,
+     "npxGA": 0.776927,
+     "ppda": {
+      "att": 284,
+      "def": 15
+     },
+     "ppda_allowed": {
+      "att": 267,
+      "def": 23
+     },
+     "deep": 6,
+     "deep_allowed": 6,
+     "scored": 5,
+     "missed": 0,
+     "xpts": 2.5644,
+     "result": "w",
+     "date": "2026-07-25 13:15:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 1.794003
+    },
+    {
+     "h_a": "a",
+     "xG": 0.813837,
+     "xGA": 0.549851,
+     "npxG": 0.813837,
+     "npxGA": 0.549851,
+     "ppda": {
+      "att": 118,
+      "def": 10
+     },
+     "ppda_allowed": {
+      "att": 400,
+      "def": 25
+     },
+     "deep": 8,
+     "deep_allowed": 4,
+     "scored": 3,
+     "missed": 0,
+     "xpts": 1.5612,
+     "result": "w",
+     "date": "2026-08-02 13:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.26398600000000005
+    },
+    {
+     "h_a": "h",
+     "xG": 1.21168,
+     "xGA": 1.04813,
+     "npxG": 1.21168,
+     "npxGA": 1.04813,
+     "ppda": {
+      "att": 141,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 275,
+      "def": 14
+     },
+     "deep": 14,
+     "deep_allowed": 2,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 1.4423000000000001,
+     "result": "l",
+     "date": "2026-08-09 14:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": 0.16355000000000008
+    },
+    {
+     "h_a": "h",
+     "xG": 1.22196,
+     "xGA": 0.485918,
+     "npxG": 0.467688,
+     "npxGA": 0.485918,
+     "ppda": {
+      "att": 225,
+      "def": 16
+     },
+     "ppda_allowed": {
+      "att": 255,
+      "def": 27
+     },
+     "deep": 1,
+     "deep_allowed": 2,
+     "scored": 3,
+     "missed": 0,
+     "xpts": 2.1571,
+     "result": "w",
+     "date": "2026-08-16 11:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": -0.018230000000000024
+    },
+    {
+     "h_a": "a",
+     "xG": 0.558674,
+     "xGA": 0.807468,
+     "npxG": 0.558674,
+     "npxGA": 0.807468,
+     "ppda": {
+      "att": 174,
+      "def": 24
+     },
+     "ppda_allowed": {
+      "att": 300,
+      "def": 23
+     },
+     "deep": 8,
+     "deep_allowed": 2,
+     "scored": 0,
+     "missed": 2,
+     "xpts": 1.0695000000000001,
+     "result": "l",
+     "date": "2026-08-23 17:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.24879399999999996
+    }
+   ]
+  },
+  "190": {
+   "id": "190",
+   "title": "Dinamo Moscow",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 1.18919,
+     "xGA": 0.989463,
+     "npxG": 1.18919,
+     "npxGA": 0.989463,
+     "ppda": {
+      "att": 136,
+      "def": 23
+     },
+     "ppda_allowed": {
+      "att": 316,
+      "def": 19
+     },
+     "deep": 3,
+     "deep_allowed": 8,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 1.4885,
+     "result": "d",
+     "date": "2026-07-25 11:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.199727
+    },
+    {
+     "h_a": "a",
+     "xG": 0.975537,
+     "xGA": 1.64147,
+     "npxG": 0.975537,
+     "npxGA": 0.887194,
+     "ppda": {
+      "att": 83,
+      "def": 14
+     },
+     "ppda_allowed": {
+      "att": 358,
+      "def": 31
+     },
+     "deep": 6,
+     "deep_allowed": 8,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 0.7656,
+     "result": "l",
+     "date": "2026-08-01 17:45:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": 0.08834299999999995
+    },
+    {
+     "h_a": "h",
+     "xG": 1.1391,
+     "xGA": 1.12965,
+     "npxG": 1.1391,
+     "npxGA": 1.12965,
+     "ppda": {
+      "att": 131,
+      "def": 28
+     },
+     "ppda_allowed": {
+      "att": 289,
+      "def": 25
+     },
+     "deep": 5,
+     "deep_allowed": 1,
+     "scored": 3,
+     "missed": 1,
+     "xpts": 1.3401999999999998,
+     "result": "w",
+     "date": "2026-08-09 11:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.009449999999999958
+    },
+    {
+     "h_a": "a",
+     "xG": 0.485918,
+     "xGA": 1.22196,
+     "npxG": 0.485918,
+     "npxGA": 0.467688,
+     "ppda": {
+      "att": 255,
+      "def": 27
+     },
+     "ppda_allowed": {
+      "att": 225,
+      "def": 16
+     },
+     "deep": 2,
+     "deep_allowed": 1,
+     "scored": 0,
+     "missed": 3,
+     "xpts": 0.574,
+     "result": "l",
+     "date": "2026-08-16 11:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": 0.018230000000000024
+    },
+    {
+     "h_a": "h",
+     "xG": 2.60982,
+     "xGA": 0.813936,
+     "npxG": 2.60982,
+     "npxGA": 0.813936,
+     "ppda": {
+      "att": 154,
+      "def": 23
+     },
+     "ppda_allowed": {
+      "att": 255,
+      "def": 15
+     },
+     "deep": 13,
+     "deep_allowed": 1,
+     "scored": 3,
+     "missed": 1,
+     "xpts": 2.6329999999999996,
+     "result": "w",
+     "date": "2026-08-23 12:15:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 1.795884
+    }
+   ]
+  },
+  "192": {
+   "id": "192",
+   "title": "Lokomotiv Moscow",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 1.5902,
+     "xGA": 2.17706,
+     "npxG": 1.5902,
+     "npxGA": 2.17706,
+     "ppda": {
+      "att": 226,
+      "def": 14
+     },
+     "ppda_allowed": {
+      "att": 207,
+      "def": 17
+     },
+     "deep": 7,
+     "deep_allowed": 4,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 0.9728,
+     "result": "d",
+     "date": "2026-07-26 14:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.5868599999999999
+    },
+    {
+     "h_a": "a",
+     "xG": 1.49405,
+     "xGA": 1.56011,
+     "npxG": 1.49405,
+     "npxGA": 1.56011,
+     "ppda": {
+      "att": 136,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 260,
+      "def": 21
+     },
+     "deep": 7,
+     "deep_allowed": 10,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 1.3028,
+     "result": "l",
+     "date": "2026-08-01 15:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.06606000000000001
+    },
+    {
+     "h_a": "h",
+     "xG": 1.22174,
+     "xGA": 0.860944,
+     "npxG": 1.22174,
+     "npxGA": 0.860944,
+     "ppda": {
+      "att": 197,
+      "def": 22
+     },
+     "ppda_allowed": {
+      "att": 241,
+      "def": 23
+     },
+     "deep": 11,
+     "deep_allowed": 6,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 1.6395,
+     "result": "d",
+     "date": "2026-08-08 15:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.360796
+    },
+    {
+     "h_a": "a",
+     "xG": 0.414877,
+     "xGA": 2.57316,
+     "npxG": 0.414877,
+     "npxGA": 1.68725,
+     "ppda": {
+      "att": 128,
+      "def": 25
+     },
+     "ppda_allowed": {
+      "att": 129,
+      "def": 29
+     },
+     "deep": 3,
+     "deep_allowed": 8,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 0.1484,
+     "result": "d",
+     "date": "2026-08-14 14:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -1.272373
+    },
+    {
+     "h_a": "a",
+     "xG": 2.1119,
+     "xGA": 2.57102,
+     "npxG": 2.1119,
+     "npxGA": 2.57102,
+     "ppda": {
+      "att": 261,
+      "def": 14
+     },
+     "ppda_allowed": {
+      "att": 239,
+      "def": 27
+     },
+     "deep": 2,
+     "deep_allowed": 9,
+     "scored": 2,
+     "missed": 3,
+     "xpts": 1.0835,
+     "result": "l",
+     "date": "2026-08-22 17:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.45912
+    }
+   ]
+  },
+  "194": {
+   "id": "194",
+   "title": "Krylya Sovetov Samara",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 0.989463,
+     "xGA": 1.18919,
+     "npxG": 0.989463,
+     "npxGA": 1.18919,
+     "ppda": {
+      "att": 316,
+      "def": 19
+     },
+     "ppda_allowed": {
+      "att": 136,
+      "def": 23
+     },
+     "deep": 8,
+     "deep_allowed": 3,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 1.2164,
+     "result": "d",
+     "date": "2026-07-25 11:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.199727
+    },
+    {
+     "h_a": "a",
+     "xG": 0.473097,
+     "xGA": 1.12785,
+     "npxG": 0.473097,
+     "npxGA": 1.12785,
+     "ppda": {
+      "att": 309,
+      "def": 36
+     },
+     "ppda_allowed": {
+      "att": 224,
+      "def": 27
+     },
+     "deep": 9,
+     "deep_allowed": 8,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 0.7691000000000001,
+     "result": "d",
+     "date": "2026-08-01 13:15:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.654753
+    },
+    {
+     "h_a": "h",
+     "xG": 0.302774,
+     "xGA": 1.44939,
+     "npxG": 0.302774,
+     "npxGA": 1.44939,
+     "ppda": {
+      "att": 126,
+      "def": 16
+     },
+     "ppda_allowed": {
+      "att": 344,
+      "def": 26
+     },
+     "deep": 7,
+     "deep_allowed": 3,
+     "scored": 0,
+     "missed": 2,
+     "xpts": 0.4017,
+     "result": "l",
+     "date": "2026-08-08 12:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -1.1466159999999999
+    },
+    {
+     "h_a": "h",
+     "xG": 1.32517,
+     "xGA": 2.0941,
+     "npxG": 1.32517,
+     "npxGA": 2.0941,
+     "ppda": {
+      "att": 141,
+      "def": 22
+     },
+     "ppda_allowed": {
+      "att": 284,
+      "def": 14
+     },
+     "deep": 5,
+     "deep_allowed": 6,
+     "scored": 1,
+     "missed": 4,
+     "xpts": 0.8196,
+     "result": "l",
+     "date": "2026-08-16 14:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.7689300000000001
+    },
+    {
+     "h_a": "a",
+     "xG": 1.84027,
+     "xGA": 0.716978,
+     "npxG": 1.84027,
+     "npxGA": 0.716978,
+     "ppda": {
+      "att": 238,
+      "def": 33
+     },
+     "ppda_allowed": {
+      "att": 148,
+      "def": 14
+     },
+     "deep": 8,
+     "deep_allowed": 9,
+     "scored": 3,
+     "missed": 0,
+     "xpts": 2.3055,
+     "result": "w",
+     "date": "2026-08-23 10:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 1.1232920000000002
+    }
+   ]
+  },
+  "196": {
+   "id": "196",
+   "title": "FC Krasnodar",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 2.85281,
+     "xGA": 0.775964,
+     "npxG": 2.85281,
+     "npxGA": 0.775964,
+     "ppda": {
+      "att": 78,
+      "def": 15
+     },
+     "ppda_allowed": {
+      "att": 233,
+      "def": 21
+     },
+     "deep": 9,
+     "deep_allowed": 2,
+     "scored": 3,
+     "missed": 1,
+     "xpts": 2.6685999999999996,
+     "result": "w",
+     "date": "2026-07-26 16:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 2.0768459999999997
+    },
+    {
+     "h_a": "h",
+     "xG": 1.19478,
+     "xGA": 1.69608,
+     "npxG": 1.19478,
+     "npxGA": 0.941806,
+     "ppda": {
+      "att": 164,
+      "def": 19
+     },
+     "ppda_allowed": {
+      "att": 290,
+      "def": 20
+     },
+     "deep": 8,
+     "deep_allowed": 8,
+     "scored": 3,
+     "missed": 2,
+     "xpts": 0.953,
+     "result": "w",
+     "date": "2026-08-02 15:15:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.2529739999999999
+    },
+    {
+     "h_a": "a",
+     "xG": 1.23661,
+     "xGA": 1.79022,
+     "npxG": 1.23661,
+     "npxGA": 1.79022,
+     "ppda": {
+      "att": 255,
+      "def": 27
+     },
+     "ppda_allowed": {
+      "att": 134,
+      "def": 21
+     },
+     "deep": 11,
+     "deep_allowed": 11,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 0.9531000000000001,
+     "result": "w",
+     "date": "2026-08-09 17:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": -0.5536099999999999
+    },
+    {
+     "h_a": "h",
+     "xG": 1.06844,
+     "xGA": 0.912562,
+     "npxG": 1.06844,
+     "npxGA": 0.912562,
+     "ppda": {
+      "att": 170,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 219,
+      "def": 9
+     },
+     "deep": 6,
+     "deep_allowed": 5,
+     "scored": 1,
+     "missed": 0,
+     "xpts": 1.4382000000000001,
+     "result": "w",
+     "date": "2026-08-15 17:45:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.15587800000000007
+    },
+    {
+     "h_a": "a",
+     "xG": 0.468092,
+     "xGA": 0.842375,
+     "npxG": 0.468092,
+     "npxGA": 0.842375,
+     "ppda": {
+      "att": 123,
+      "def": 24
+     },
+     "ppda_allowed": {
+      "att": 228,
+      "def": 16
+     },
+     "deep": 2,
+     "deep_allowed": 4,
+     "scored": 1,
+     "missed": 0,
+     "xpts": 0.9198000000000001,
+     "result": "w",
+     "date": "2026-08-23 14:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": -0.374283
+    }
+   ]
+  },
+  "199": {
+   "id": "199",
+   "title": "FC Orenburg",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 1.57351,
+     "xGA": 0.588781,
+     "npxG": 1.57351,
+     "npxGA": 0.588781,
+     "ppda": {
+      "att": 195,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 105,
+      "def": 19
+     },
+     "deep": 2,
+     "deep_allowed": 5,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 2.2072000000000003,
+     "result": "w",
+     "date": "2026-07-26 11:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.984729
+    },
+    {
+     "h_a": "h",
+     "xG": 0.549851,
+     "xGA": 0.813837,
+     "npxG": 0.549851,
+     "npxGA": 0.813837,
+     "ppda": {
+      "att": 400,
+      "def": 25
+     },
+     "ppda_allowed": {
+      "att": 118,
+      "def": 10
+     },
+     "deep": 4,
+     "deep_allowed": 8,
+     "scored": 0,
+     "missed": 3,
+     "xpts": 1.0638,
+     "result": "l",
+     "date": "2026-08-02 13:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.26398600000000005
+    },
+    {
+     "h_a": "a",
+     "xG": 1.06948,
+     "xGA": 0.350539,
+     "npxG": 1.06948,
+     "npxGA": 0.350539,
+     "ppda": {
+      "att": 199,
+      "def": 26
+     },
+     "ppda_allowed": {
+      "att": 102,
+      "def": 16
+     },
+     "deep": 8,
+     "deep_allowed": 4,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 2.0368,
+     "result": "d",
+     "date": "2026-08-09 17:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.718941
+    },
+    {
+     "h_a": "h",
+     "xG": 2.57316,
+     "xGA": 0.414877,
+     "npxG": 1.68725,
+     "npxGA": 0.414877,
+     "ppda": {
+      "att": 129,
+      "def": 29
+     },
+     "ppda_allowed": {
+      "att": 128,
+      "def": 25
+     },
+     "deep": 8,
+     "deep_allowed": 3,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 2.7638000000000003,
+     "result": "d",
+     "date": "2026-08-14 14:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 1.272373
+    },
+    {
+     "h_a": "a",
+     "xG": 1.18966,
+     "xGA": 0.737073,
+     "npxG": 0.435383,
+     "npxGA": 0.737073,
+     "ppda": {
+      "att": 159,
+      "def": 26
+     },
+     "ppda_allowed": {
+      "att": 97,
+      "def": 17
+     },
+     "deep": 7,
+     "deep_allowed": 5,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 1.8178999999999998,
+     "result": "d",
+     "date": "2026-08-22 12:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.30168999999999996
+    }
+   ]
+  },
+  "277": {
+   "id": "277",
+   "title": "Fakel",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 1.25347,
+     "xGA": 1.1411,
+     "npxG": 1.25347,
+     "npxGA": 1.1411,
+     "ppda": {
+      "att": 239,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 324,
+      "def": 21
+     },
+     "deep": 3,
+     "deep_allowed": 1,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 1.4630999999999998,
+     "result": "l",
+     "date": "2026-07-25 15:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": 0.11237000000000008
+    },
+    {
+     "h_a": "a",
+     "xG": 1.69608,
+     "xGA": 1.19478,
+     "npxG": 0.941806,
+     "npxGA": 1.19478,
+     "ppda": {
+      "att": 290,
+      "def": 20
+     },
+     "ppda_allowed": {
+      "att": 164,
+      "def": 19
+     },
+     "deep": 8,
+     "deep_allowed": 8,
+     "scored": 2,
+     "missed": 3,
+     "xpts": 1.7807000000000002,
+     "result": "l",
+     "date": "2026-08-02 15:15:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.2529739999999999
+    },
+    {
+     "h_a": "h",
+     "xG": 1.65452,
+     "xGA": 0.291056,
+     "npxG": 1.65452,
+     "npxGA": 0.291056,
+     "ppda": {
+      "att": 224,
+      "def": 25
+     },
+     "ppda_allowed": {
+      "att": 224,
+      "def": 14
+     },
+     "deep": 5,
+     "deep_allowed": 1,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 2.4741,
+     "result": "d",
+     "date": "2026-08-10 16:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 1.363464
+    },
+    {
+     "h_a": "a",
+     "xG": 0.4856,
+     "xGA": 0.983945,
+     "npxG": 0.4856,
+     "npxGA": 0.229669,
+     "ppda": {
+      "att": 250,
+      "def": 16
+     },
+     "ppda_allowed": {
+      "att": 182,
+      "def": 16
+     },
+     "deep": 4,
+     "deep_allowed": 7,
+     "scored": 0,
+     "missed": 1,
+     "xpts": 0.7283999999999999,
+     "result": "l",
+     "date": "2026-08-15 13:15:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": 0.25593099999999996
+    },
+    {
+     "h_a": "h",
+     "xG": 0.737073,
+     "xGA": 1.18966,
+     "npxG": 0.737073,
+     "npxGA": 0.435383,
+     "ppda": {
+      "att": 97,
+      "def": 17
+     },
+     "ppda_allowed": {
+      "att": 159,
+      "def": 26
+     },
+     "deep": 5,
+     "deep_allowed": 7,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 0.8588,
+     "result": "d",
+     "date": "2026-08-22 12:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 0.30168999999999996
+    }
+   ]
+  },
+  "278": {
+   "id": "278",
+   "title": "Baltika",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 1.55573,
+     "xGA": 2.19287,
+     "npxG": 1.55573,
+     "npxGA": 2.19287,
+     "ppda": {
+      "att": 341,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 132,
+      "def": 20
+     },
+     "deep": 5,
+     "deep_allowed": 7,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 0.8624999999999999,
+     "result": "l",
+     "date": "2026-07-24 17:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.63714
+    },
+    {
+     "h_a": "h",
+     "xG": 1.64147,
+     "xGA": 0.975537,
+     "npxG": 0.887194,
+     "npxGA": 0.975537,
+     "ppda": {
+      "att": 358,
+      "def": 31
+     },
+     "ppda_allowed": {
+      "att": 83,
+      "def": 14
+     },
+     "deep": 8,
+     "deep_allowed": 6,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.9764,
+     "result": "w",
+     "date": "2026-08-01 17:45:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": -0.08834299999999995
+    },
+    {
+     "h_a": "a",
+     "xG": 1.44939,
+     "xGA": 0.302774,
+     "npxG": 1.44939,
+     "npxGA": 0.302774,
+     "ppda": {
+      "att": 344,
+      "def": 26
+     },
+     "ppda_allowed": {
+      "att": 126,
+      "def": 16
+     },
+     "deep": 3,
+     "deep_allowed": 7,
+     "scored": 2,
+     "missed": 0,
+     "xpts": 2.3736,
+     "result": "w",
+     "date": "2026-08-08 12:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 1.1466159999999999
+    },
+    {
+     "h_a": "h",
+     "xG": 0.56059,
+     "xGA": 0.935597,
+     "npxG": 0.56059,
+     "npxGA": 0.935597,
+     "ppda": {
+      "att": 294,
+      "def": 22
+     },
+     "ppda_allowed": {
+      "att": 85,
+      "def": 17
+     },
+     "deep": 7,
+     "deep_allowed": 3,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 0.9445,
+     "result": "l",
+     "date": "2026-08-16 16:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.375007
+    },
+    {
+     "h_a": "h",
+     "xG": 0.704646,
+     "xGA": 0.822429,
+     "npxG": 0.704646,
+     "npxGA": 0.822429,
+     "ppda": {
+      "att": 154,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 180,
+      "def": 18
+     },
+     "deep": 7,
+     "deep_allowed": 6,
+     "scored": 1,
+     "missed": 1,
+     "xpts": 1.1918,
+     "result": "d",
+     "date": "2026-08-24 17:30:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.11778299999999997
+    }
+   ]
+  },
+  "283": {
+   "id": "283",
+   "title": "Akron",
+   "history": [
+    {
+     "h_a": "h",
+     "xG": 0.776927,
+     "xGA": 2.57093,
+     "npxG": 0.776927,
+     "npxGA": 2.57093,
+     "ppda": {
+      "att": 267,
+      "def": 23
+     },
+     "ppda_allowed": {
+      "att": 284,
+      "def": 15
+     },
+     "deep": 6,
+     "deep_allowed": 6,
+     "scored": 0,
+     "missed": 5,
+     "xpts": 0.3066,
+     "result": "l",
+     "date": "2026-07-25 13:15:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -1.794003
+    },
+    {
+     "h_a": "h",
+     "xG": 0.767292,
+     "xGA": 1.50741,
+     "npxG": 0.767292,
+     "npxGA": 1.50741,
+     "ppda": {
+      "att": 151,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 279,
+      "def": 18
+     },
+     "deep": 6,
+     "deep_allowed": 4,
+     "scored": 1,
+     "missed": 2,
+     "xpts": 0.756,
+     "result": "l",
+     "date": "2026-08-01 11:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.7401179999999999
+    },
+    {
+     "h_a": "a",
+     "xG": 0.860944,
+     "xGA": 1.22174,
+     "npxG": 0.860944,
+     "npxGA": 1.22174,
+     "ppda": {
+      "att": 241,
+      "def": 23
+     },
+     "ppda_allowed": {
+      "att": 197,
+      "def": 22
+     },
+     "deep": 6,
+     "deep_allowed": 11,
+     "scored": 0,
+     "missed": 0,
+     "xpts": 1.062,
+     "result": "d",
+     "date": "2026-08-08 15:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -0.360796
+    },
+    {
+     "h_a": "a",
+     "xG": 2.27979,
+     "xGA": 0.846269,
+     "npxG": 2.27979,
+     "npxGA": 0.846269,
+     "ppda": {
+      "att": 102,
+      "def": 12
+     },
+     "ppda_allowed": {
+      "att": 294,
+      "def": 21
+     },
+     "deep": 2,
+     "deep_allowed": 4,
+     "scored": 3,
+     "missed": 3,
+     "xpts": 2.4635,
+     "result": "d",
+     "date": "2026-08-15 11:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": 1.4335210000000003
+    },
+    {
+     "h_a": "h",
+     "xG": 0.716978,
+     "xGA": 1.84027,
+     "npxG": 0.716978,
+     "npxGA": 1.84027,
+     "ppda": {
+      "att": 148,
+      "def": 14
+     },
+     "ppda_allowed": {
+      "att": 238,
+      "def": 33
+     },
+     "deep": 9,
+     "deep_allowed": 8,
+     "scored": 0,
+     "missed": 3,
+     "xpts": 0.49319999999999997,
+     "result": "l",
+     "date": "2026-08-23 10:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -1.1232920000000002
+    }
+   ]
+  },
+  "284": {
+   "id": "284",
+   "title": "Dynamo Makhachkala",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 1.1411,
+     "xGA": 1.25347,
+     "npxG": 1.1411,
+     "npxGA": 1.25347,
+     "ppda": {
+      "att": 324,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 239,
+      "def": 21
+     },
+     "deep": 1,
+     "deep_allowed": 3,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.2078,
+     "result": "w",
+     "date": "2026-07-25 15:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": -0.11237000000000008
+    },
+    {
+     "h_a": "h",
+     "xG": 1.56011,
+     "xGA": 1.49405,
+     "npxG": 1.56011,
+     "npxGA": 1.49405,
+     "ppda": {
+      "att": 260,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 136,
+      "def": 18
+     },
+     "deep": 10,
+     "deep_allowed": 7,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.4048,
+     "result": "w",
+     "date": "2026-08-01 15:30:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.06606000000000001
+    },
+    {
+     "h_a": "a",
+     "xG": 1.12965,
+     "xGA": 1.1391,
+     "npxG": 1.12965,
+     "npxGA": 1.1391,
+     "ppda": {
+      "att": 289,
+      "def": 25
+     },
+     "ppda_allowed": {
+      "att": 131,
+      "def": 28
+     },
+     "deep": 1,
+     "deep_allowed": 5,
+     "scored": 1,
+     "missed": 3,
+     "xpts": 1.3288,
+     "result": "l",
+     "date": "2026-08-09 11:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.009449999999999958
+    },
+    {
+     "h_a": "a",
+     "xG": 2.0941,
+     "xGA": 1.32517,
+     "npxG": 2.0941,
+     "npxGA": 1.32517,
+     "ppda": {
+      "att": 284,
+      "def": 14
+     },
+     "ppda_allowed": {
+      "att": 141,
+      "def": 22
+     },
+     "deep": 6,
+     "deep_allowed": 5,
+     "scored": 4,
+     "missed": 1,
+     "xpts": 1.959,
+     "result": "w",
+     "date": "2026-08-16 14:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": 0.7689300000000001
+    },
+    {
+     "h_a": "h",
+     "xG": 0.842375,
+     "xGA": 0.468092,
+     "npxG": 0.842375,
+     "npxGA": 0.468092,
+     "ppda": {
+      "att": 228,
+      "def": 16
+     },
+     "ppda_allowed": {
+      "att": 123,
+      "def": 24
+     },
+     "deep": 4,
+     "deep_allowed": 2,
+     "scored": 0,
+     "missed": 1,
+     "xpts": 1.7022,
+     "result": "l",
+     "date": "2026-08-23 14:30:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": 0.374283
+    }
+   ]
+  },
+  "292": {
+   "id": "292",
+   "title": "Rodina",
+   "history": [
+    {
+     "h_a": "a",
+     "xG": 0.409375,
+     "xGA": 3.12371,
+     "npxG": 0.409375,
+     "npxGA": 3.12371,
+     "ppda": {
+      "att": 243,
+      "def": 18
+     },
+     "ppda_allowed": {
+      "att": 208,
+      "def": 27
+     },
+     "deep": 2,
+     "deep_allowed": 27,
+     "scored": 0,
+     "missed": 3,
+     "xpts": 0.0947,
+     "result": "l",
+     "date": "2026-07-25 17:45:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -2.714335
+    },
+    {
+     "h_a": "h",
+     "xG": 0.942922,
+     "xGA": 2.14974,
+     "npxG": 0.942922,
+     "npxGA": 1.39547,
+     "ppda": {
+      "att": 142,
+      "def": 22
+     },
+     "ppda_allowed": {
+      "att": 141,
+      "def": 26
+     },
+     "deep": 0,
+     "deep_allowed": 10,
+     "scored": 2,
+     "missed": 4,
+     "xpts": 0.4952,
+     "result": "l",
+     "date": "2026-07-31 17:00:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -0.45254799999999995
+    },
+    {
+     "h_a": "a",
+     "xG": 1.04813,
+     "xGA": 1.21168,
+     "npxG": 1.04813,
+     "npxGA": 1.21168,
+     "ppda": {
+      "att": 275,
+      "def": 14
+     },
+     "ppda_allowed": {
+      "att": 141,
+      "def": 18
+     },
+     "deep": 2,
+     "deep_allowed": 14,
+     "scored": 2,
+     "missed": 1,
+     "xpts": 1.2419,
+     "result": "w",
+     "date": "2026-08-09 14:00:00",
+     "wins": 1,
+     "draws": 0,
+     "loses": 0,
+     "pts": 3,
+     "npxGD": -0.16355000000000008
+    },
+    {
+     "h_a": "h",
+     "xG": 0.846269,
+     "xGA": 2.27979,
+     "npxG": 0.846269,
+     "npxGA": 2.27979,
+     "ppda": {
+      "att": 294,
+      "def": 21
+     },
+     "ppda_allowed": {
+      "att": 102,
+      "def": 12
+     },
+     "deep": 4,
+     "deep_allowed": 2,
+     "scored": 3,
+     "missed": 3,
+     "xpts": 0.3605,
+     "result": "d",
+     "date": "2026-08-15 11:00:00",
+     "wins": 0,
+     "draws": 1,
+     "loses": 0,
+     "pts": 1,
+     "npxGD": -1.4335210000000003
+    },
+    {
+     "h_a": "a",
+     "xG": 0.813936,
+     "xGA": 2.60982,
+     "npxG": 0.813936,
+     "npxGA": 2.60982,
+     "ppda": {
+      "att": 255,
+      "def": 15
+     },
+     "ppda_allowed": {
+      "att": 154,
+      "def": 23
+     },
+     "deep": 1,
+     "deep_allowed": 13,
+     "scored": 1,
+     "missed": 3,
+     "xpts": 0.2387,
+     "result": "l",
+     "date": "2026-08-23 12:15:00",
+     "wins": 0,
+     "draws": 0,
+     "loses": 1,
+     "pts": 0,
+     "npxGD": -1.795884
+    }
+   ]
+  }
+ }
+}

@@ -113,6 +113,8 @@ class QualityReport:
     # the number of source HTTP requests the attempt made.
     league_payload_hashes: Mapping[str, str] = field(default_factory=dict)
     request_count: Optional[int] = None
+    # #1428: schedule teams without a played match yet (season start).
+    teams_pending_first_match: Sequence[str] = ()
 
     @property
     def publishable(self) -> bool:
@@ -153,6 +155,7 @@ class QualityReport:
             "issues": [issue.to_dict() for issue in self.issues],
             "league_payload_hashes": dict(self.league_payload_hashes),
             "request_count": self.request_count,
+            "teams_pending_first_match": sorted(self.teams_pending_first_match),
         }
 
 
@@ -669,6 +672,18 @@ def validate_understat_scope(
                 non_schedule_rows=non_schedule_rows,
             )
 
+    # #1428: breakdowns are owed only by teams of completed games.
+    schedule_team_ids: set[str] = set()
+    played_team_ids: set[str] = set()
+    if {"game_id", "home_team_id", "away_team_id"}.issubset(schedule.columns):
+        for game_id, home_id, away_id in schedule.loc[
+            :, ["game_id", "home_team_id", "away_team_id"]
+        ].itertuples(index=False, name=None):
+            game_teams = _normalized_ids((home_id, away_id))
+            schedule_team_ids |= game_teams
+            if _normalized_ids((game_id,)) & completed_ids:
+                played_team_ids |= game_teams
+
     if completed_ids:
         for entity in UNDERSTAT_ENTITIES[1:]:
             if row_counts[entity] == 0:
@@ -899,15 +914,14 @@ def validate_understat_scope(
         breakdowns = normalized_frames[breakdown_entity]
         schedule_team_columns = {"home_team_id", "away_team_id"}
         if schedule_team_columns.issubset(schedule.columns):
-            expected_team_ids = _normalized_ids(schedule["home_team_id"]) | (
-                _normalized_ids(schedule["away_team_id"])
-            )
+            expected_team_ids = played_team_ids
             if not breakdowns.empty and {"team_id", "dimension"}.issubset(
                 breakdowns.columns
             ):
                 actual_team_ids = _normalized_ids(breakdowns["team_id"])
                 missing_teams = expected_team_ids - actual_team_ids
-                extra_teams = actual_team_ids - expected_team_ids
+                # A not-yet-played schedule team may carry breakdowns.
+                extra_teams = actual_team_ids - schedule_team_ids
                 if missing_teams or extra_teams:
                     _issue(
                         issues,
@@ -926,7 +940,9 @@ def validate_understat_scope(
                     ].dropna().itertuples(index=False, name=None)
                 }
                 dimension_gaps: dict[str, dict[str, list[str]]] = {}
-                for team_id in sorted(expected_team_ids):
+                for team_id in sorted(
+                    expected_team_ids | (actual_team_ids & schedule_team_ids)
+                ):
                     observed = {
                         dimension
                         for observed_team, dimension in observed_pairs
@@ -1025,6 +1041,9 @@ def validate_understat_scope(
         site_result_game_ids=tuple(sorted(completed_ids)),
         league_payload_hashes=dict(league_payload_hashes or {}),
         request_count=request_count,
+        teams_pending_first_match=tuple(
+            sorted(schedule_team_ids - played_team_ids)
+        ),
     )
 
 

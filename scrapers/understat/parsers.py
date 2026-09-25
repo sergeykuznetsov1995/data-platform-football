@@ -245,6 +245,10 @@ def validate_league_payload(payload: Mapping[str, Any]) -> None:
     for index, team in enumerate(teams):
         team = _require_mapping(team, f"getLeagueData.teams[{index}]")
         _reject_unknown(team, _TEAM_FIELDS, f"getLeagueData.teams[{index}]")
+        # #1428: before its first match a team may be a bare placeholder
+        # without id/title; one with history must stay fully identified.
+        if not {"id", "title"} <= set(team) and team.get("history") in (None, []):
+            continue
         _require_fields(team, _TEAM_FIELDS, f"getLeagueData.teams[{index}]")
         histories = _require_list(
             team["history"], f"getLeagueData.teams[{index}].history"
@@ -338,20 +342,39 @@ def validate_match_payload(payload: Mapping[str, Any]) -> None:
             _validate_enum(shot, "result", SHOT_RESULTS, path)
 
 
-def validate_team_payload(payload: Mapping[str, Any]) -> None:
+def validate_team_payload(
+    payload: Mapping[str, Any], source_season_id: Optional[int] = None
+) -> None:
     payload = _validate_object(
         payload, path="getTeamData", allowed=_TEAM_TOP_LEVEL_FIELDS
+    )
+    # #1428 (R-38): for a team outside the requested season the source silently
+    # answers with its previous season. Lower bound only: 2019/20 ran into
+    # August 2020.
+    season_start = (
+        f"{int(source_season_id):04d}-07-01"
+        if source_season_id is not None
+        else None
     )
     dates = _require_list(payload["dates"], "getTeamData.dates")
     for index, match in enumerate(dates):
         match = _require_mapping(match, f"getTeamData.dates[{index}]")
         _validate_match_record(match, f"getTeamData.dates[{index}]", team=True)
+        if season_start is not None and str(match["datetime"]).strip() < season_start:
+            raise UnderstatSchemaDrift(
+                f"getTeamData.dates[{index}].datetime {match['datetime']!r} is "
+                f"before {season_start}: payload belongs to previous season"
+            )
     players = _require_list(payload["players"], "getTeamData.players")
     for index, player in enumerate(players):
         player = _require_mapping(player, f"getTeamData.players[{index}]")
         _reject_unknown(player, _PLAYER_FIELDS, f"getTeamData.players[{index}]")
         _require_fields(player, _PLAYER_REQUIRED_FIELDS, f"getTeamData.players[{index}]")
-    statistics = _require_mapping(payload["statistics"], "getTeamData.statistics")
+    statistics = payload["statistics"]
+    # #1428: a team without a played match answers [], null or {}.
+    if statistics is None or (isinstance(statistics, list) and not statistics):
+        statistics = {}
+    statistics = _require_mapping(statistics, "getTeamData.statistics")
     _reject_unknown(statistics, _BREAKDOWN_DIMENSIONS, "getTeamData.statistics")
     if statistics:
         _require_fields(
