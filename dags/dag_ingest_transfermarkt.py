@@ -71,8 +71,10 @@ STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
 # before any scope is planned.  A dead pool answers the CONNECT with a pseudo
 # status or a short error page; a real competition start page is well over
 # 60 KiB, so a 200 with a small body is an error page, not the source.  One
-# blocked exit (403/405/429) is not a dead pool: the client closes the lease
-# and asks the gateway for another exit, at most three leases per probe.
+# blocked exit (403/405/429), one gateway 5xx or one transport failure is
+# not a dead pool: the client closes the lease and asks the gateway for
+# another exit, at most three leases per probe (a 200 challenge page: two,
+# the client's own cap).  A dead pool therefore costs three short leases.
 GATEWAY_PROBE_URL = (
     'https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1'
 )

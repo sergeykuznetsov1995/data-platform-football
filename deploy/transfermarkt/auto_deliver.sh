@@ -186,6 +186,7 @@ pool_want(){  # pool_want <pool>: слоты из снимка, иначе 1 (в
 }
 pool_desc(){
   case "$1" in
+    ingest_scraper_pool) printf '%s' 'Serialize heavy ingest scrapers to avoid VM swap (#671)' ;;
     transfermarkt_proxy) printf '%s' 'Transfermarkt production and registry proxy work' ;;
     transfermarkt_backfill_proxy) printf '%s' 'Transfermarkt historical backfill only; bounded dedicated proxy slot' ;;
     *) printf '%s' 'Transfermarkt historical planning and DQ only; isolated from daily ingest' ;;
