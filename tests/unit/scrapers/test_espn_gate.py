@@ -350,3 +350,43 @@ def test_a_waiting_request_rechecks_blocks_and_resets_after_its_wait(tmp_path):
     )
     with pytest.raises(LaneClosed):  # history froze while it waited
         history.acquire("site")
+
+
+@pytest.mark.unit
+def test_open_reserve_is_rechecked_a_day_after_its_last_successful_probe(tmp_path):
+    clock = Clock()
+    gate = _gate(tmp_path, clock)
+    gate.choose_origin("site")
+    clock.advance(86400)
+    probe = gate.acquire("site")
+    assert (probe.origin, probe.probe) == (SITE, True)
+    gate.report(probe, status=200)
+    assert gate.acquire("site").origin == WEB
+    clock.advance(86400)
+    again = gate.acquire("site")
+    assert (again.origin, again.probe) == (SITE, True)
+    assert gate.acquire("site").origin == WEB  # one re-check only
+    gate.report(again, status=200)
+    assert gate.acquire("site").origin == WEB
+
+
+@pytest.mark.unit
+def test_all_blocked_pause_runs_from_the_last_closure_in_any_order(tmp_path):
+    clock = Clock()
+    gate = _gate(tmp_path, clock)
+    gate.choose_origin("site")
+    clock.advance(86400)
+    gate.report(gate.acquire("site"), status=200)  # reserve probe: open
+    primary = gate.acquire("site")
+    assert primary.origin == WEB
+    assert not gate.report(primary, status=403).all_blocked
+    clock.advance(1799)
+    reserve = gate.acquire("site")
+    assert reserve.origin == SITE
+    assert gate.report(reserve, status=403).all_blocked
+    clock.advance(1799)  # 30 minutes from the reserve's 403, not the primary's
+    with pytest.raises(AllOriginsBlocked):
+        gate.acquire("site")
+    clock.advance(1)
+    probe = gate.acquire("site")
+    assert (probe.origin, probe.probe) == (WEB, True)

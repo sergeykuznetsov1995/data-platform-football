@@ -381,22 +381,31 @@ class TransportGate:
         ]
         # A due reserve probe goes first, so the reserve is re-checked once a
         # day even while the primary is healthy.
-        due_reserve = [c for c in candidates if c[2] and self._probe_due(c[1], now)]
+        due_reserve = [
+            c for c in candidates if c[2] and self._probe_due(c[1], now, True)
+        ]
         for origin, entry, is_reserve in due_reserve + candidates:
+            if self._probe_due(entry, now, is_reserve):
+                if claim:
+                    # One probe: nobody else probes this origin meanwhile.
+                    if entry["closed"]:
+                        entry["blocked_until"] = now + self._probe_interval(
+                            state, cluster, is_reserve
+                        )
+                    else:
+                        entry["recheck_at"] = now + self.policy.reserve_probe_seconds
+                return origin, True
             if not entry["closed"]:
                 return origin, False
-            if self._probe_due(entry, now):
-                if claim:
-                    # One probe: keep it closed for everyone else meanwhile.
-                    entry["blocked_until"] = now + self._probe_interval(
-                        state, cluster, is_reserve
-                    )
-                return origin, True
         raise AllOriginsBlocked(f"all ESPN origins of cluster {cluster!r} are blocked")
 
     @staticmethod
-    def _probe_due(entry: dict, now: float) -> bool:
-        return entry["closed"] and now >= entry["blocked_until"]
+    def _probe_due(entry: dict, now: float, is_reserve: bool) -> bool:
+        if entry["closed"]:
+            return now >= entry["blocked_until"]
+        # An open reserve is idle while the primary works: re-check it daily.
+        recheck_at = entry.get("recheck_at")
+        return is_reserve and recheck_at is not None and now >= recheck_at
 
     def _probe_interval(self, state, cluster: str, is_reserve: bool) -> int:
         if is_reserve:
@@ -497,6 +506,8 @@ class TransportGate:
             entry["last_status"] = status
             entry["closed"] = False
             entry["blocked_until"] = 0.0
+            if is_reserve and permit.probe:
+                entry["recheck_at"] = now + policy.reserve_probe_seconds
             if permit.probe and state["all_blocked"].pop(permit.cluster, None):
                 # Live resumes now; history reopens last, after a cooldown.
                 state["history_frozen_until"] = max(
@@ -512,8 +523,13 @@ class TransportGate:
                 all_blocked = True
                 if not state["all_blocked"].get(permit.cluster):
                     state["all_blocked"][permit.cluster] = now
-                    if not is_reserve:
-                        entry["blocked_until"] = now + policy.all_blocked_pause_seconds
+                    # The pause runs from the last closure, whichever origin
+                    # closed last; the reserve keeps its daily probe.
+                    primary_entry = state["origins"][self._cluster(permit.cluster)[0]]
+                    primary_entry["blocked_until"] = max(
+                        primary_entry["blocked_until"],
+                        now + policy.all_blocked_pause_seconds,
+                    )
                     logger.error(
                         "ESPN gate: all origins of cluster %s are blocked",
                         permit.cluster,
