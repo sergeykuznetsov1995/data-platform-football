@@ -195,10 +195,11 @@ for _ in $(seq 1 30); do
   timeout -k 5 60 docker exec "$SCHED" airflow pools list >/dev/null 2>&1 8>&- && break
   sleep 5
 done
+set_pool ingest_scraper_pool 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
 set_pool transfermarkt_proxy 1 'Transfermarkt production and registry proxy work'
 set_pool transfermarkt_backfill_proxy 1 'Transfermarkt historical backfill only; bounded dedicated proxy slot'
 set_pool transfermarkt_backfill_control 1 'Transfermarkt historical planning and DQ only; isolated from daily ingest'
-log "pools set: transfermarkt_proxy=1 transfermarkt_backfill_proxy=1 transfermarkt_backfill_control=1"
+log "pools set: ingest_scraper_pool=1 transfermarkt_proxy=1 transfermarkt_backfill_proxy=1 transfermarkt_backfill_control=1"
 
 STEP="acceptance"
 present=""; errs=""

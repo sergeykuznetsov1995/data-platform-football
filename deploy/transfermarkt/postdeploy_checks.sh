@@ -96,7 +96,7 @@ running=$($PSQL "SELECT count(*) FROM dag_run WHERE state='running';")
 echo "  running-прогонов: $running"
 
 echo "== 4. Пулы =="
-for p in transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control; do
+for p in ingest_scraper_pool transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control; do
   s=$($PSQL "SELECT slots FROM slot_pool WHERE pool='$p';")
   [ "$s" = 1 ] && ok "$p = 1" || fail "$p = '$s' (ожидалось 1)"
 done
