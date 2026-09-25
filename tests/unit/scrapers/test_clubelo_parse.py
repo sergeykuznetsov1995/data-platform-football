@@ -149,3 +149,28 @@ def test_match_headers_must_match_exactly(riverplate_html, old, new):
     assert old in riverplate_html
     with pytest.raises(LayoutChanged, match="headers changed"):
         parse_club_page(riverplate_html.replace(old, new), "riverplate")
+
+
+def test_match_table_without_rows_fails_closed(riverplate_html):
+    start = riverplate_html.index("<tr><td>", riverplate_html.index("<h3>Calculation</h3>"))
+    end = riverplate_html.index("</table>", start)
+    with pytest.raises(LayoutChanged, match="no rows"):
+        parse_club_page(riverplate_html[:start] + riverplate_html[end:], "riverplate")
+
+
+def test_missing_elo_pct_span_fails_closed(riverplate_html):
+    broken = riverplate_html.replace('<span class="min1081">67.9</span>', "", 1)
+    with pytest.raises(LayoutChanged, match="Elo %"):
+        parse_club_page(broken, "riverplate")
+
+
+@pytest.mark.parametrize("old, new, what", [
+    ('"Elo": 1784.0233989796975', '"Elo": NaN', "Elo"),
+    ('"Golo": 1.3348056', '"Golo": Infinity', "Golo"),
+    ('"Elo": 1784.0233989796975', '"Elo": "1784"', "Elo"),
+    ('"segment_id": 0', '"segment_id": 1.5', "segment_id"),
+])
+def test_bad_vega_values_fail_closed(riverplate_html, old, new, what):
+    assert old in riverplate_html
+    with pytest.raises(LayoutChanged, match=what):
+        parse_club_page(riverplate_html.replace(old, new, 1), "riverplate")

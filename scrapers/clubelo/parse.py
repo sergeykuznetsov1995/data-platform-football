@@ -10,6 +10,7 @@ before parsing, so a fixed parser can re-read it later.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -120,19 +121,27 @@ def _vega_points(html: str) -> List[Dict[str, Any]]:
     for seq, row in enumerate(filled[0]):
         if not isinstance(row, dict) or any(k not in row for k in _POINT_KEYS):
             raise LayoutChanged(f"vega point {seq} lacks {_POINT_KEYS}: {row!r}")
-        try:
-            points.append(
-                {
-                    "point_seq": seq,
-                    "point_date": _iso_date(str(row["Date"])[:10], "vega Date"),
-                    "elo": float(row["Elo"]),
-                    "golo": None if row["Golo"] is None else float(row["Golo"]),
-                    "segment_id": int(row["segment_id"]),
-                }
-            )
-        except (TypeError, ValueError) as exc:
-            raise LayoutChanged(f"vega point {seq} unreadable: {exc}") from None
+        segment = row["segment_id"]
+        if not isinstance(segment, int) or isinstance(segment, bool):
+            raise LayoutChanged(f"vega point {seq}: segment_id is not an integer: {segment!r}")
+        points.append(
+            {
+                "point_seq": seq,
+                "point_date": _iso_date(str(row["Date"])[:10], "vega Date"),
+                "elo": _finite(row["Elo"], f"vega point {seq} Elo"),
+                "golo": None if row["Golo"] is None else _finite(row["Golo"], f"vega point {seq} Golo"),
+                "segment_id": segment,
+            }
+        )
     return points
+
+
+def _finite(value: Any, what: str) -> float:
+    """A JSON number that is finite ("NaN"/"Infinity" strings or values fail)."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise LayoutChanged(f"{what}: not a finite number: {value!r}")
+    return float(value)
 
 
 def _number(text: str, what: str) -> Optional[float]:
@@ -189,6 +198,8 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
         opp_href = _first(opp.xpath('.//a[span[@class="max640"]]/@href'))
         opp_rank = _first(opp.xpath(".//small/text()"))
         elo_pct = "".join(tds[5].xpath('./span[@class="min1081"]/text()')).strip()
+        if not elo_pct:
+            raise LayoutChanged(f"match row {seq}: Elo % (span.min1081) is empty")
         prior, prior_sigma = _value_sigma(cells[3], "Prior Δ")
         game, game_sigma = _value_sigma(cells[9], "Game Δ")
         post, post_sigma = _value_sigma(cells[10], "Post-Game Δ")
@@ -221,6 +232,8 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
                 "has_result": bool(cells[6]),
             }
         )
+    if not rows:
+        raise LayoutChanged("match table has no rows")
     return rows
 
 
