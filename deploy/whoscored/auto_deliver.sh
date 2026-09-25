@@ -129,18 +129,28 @@ deploy_to() {
       && mv -f "$DAGS_DIR/.airflowignore.tmp" "$DAGS_DIR/.airflowignore" || { REASON="копия .airflowignore"; return 1; }
   fi
   log "  дерево и копии DAG = ${to:0:12}"
-  timeout 300 docker exec -w /opt/airflow/dags -e PYTHONDONTWRITEBYTECODE=1 "$SCHED" \
-    python -c 'import dag_ingest_whoscored, dag_backfill_whoscored' >> "$LOG" 2>&1 \
-    || { REASON="import-check в $SCHED"; return 1; }
-  log "  import-check пройден"
   g diff --quiet "$from" "$to" -- dags/utils || restart=1
   g diff --quiet "$from" "$to" -- "$AF_COMPOSE" || up=1
+  # Контейнер приводится к конфигурации цели ДО import-check: при откате с compose, на котором
+  # scheduler не поднялся, импорт в неисправном контейнере невозможен — сначала пересоздание.
   if [ -n "$up" ] && [ -f "$SRC/$AF_COMPOSE" ]; then
     log "  изменён $AF_COMPOSE — пересоздаю только airflow-scheduler"
     docker compose -p "$COMPOSE_PROJECT" -f "$SRC/$AF_COMPOSE" --env-file "$COMPOSE_ENV_FILE" \
       up -d --no-deps --force-recreate airflow-scheduler >> "$LOG" 2>&1 || { REASON="compose up airflow-scheduler"; return 1; }
-  elif [ -n "$up$restart" ]; then
-    [ -n "$up" ] && log "  в ${to:0:12} нет $AF_COMPOSE — только рестарт (compose — руками)"
+    restart=""
+  elif [ -n "$up" ]; then
+    log "  в ${to:0:12} нет $AF_COMPOSE — только рестарт (compose — руками)"; restart=1
+  fi
+  if [ "$(docker inspect -f '{{.State.Running}}' "$SCHED" 2>/dev/null)" != true ]; then
+    log "  $SCHED не запущен — рестарт до import-check"
+    docker restart "$SCHED" >> "$LOG" 2>&1 || { REASON="рестарт $SCHED"; return 1; }
+    restart=""
+  fi
+  timeout 300 docker exec -w /opt/airflow/dags -e PYTHONDONTWRITEBYTECODE=1 "$SCHED" \
+    python -c 'import dag_ingest_whoscored, dag_backfill_whoscored' >> "$LOG" 2>&1 \
+    || { REASON="import-check в $SCHED"; return 1; }
+  log "  import-check пройден"
+  if [ -n "$restart" ]; then
     log "  изменены dags/utils — рестарт $SCHED"
     docker restart "$SCHED" >> "$LOG" 2>&1 || { REASON="рестарт $SCHED"; return 1; }
   fi

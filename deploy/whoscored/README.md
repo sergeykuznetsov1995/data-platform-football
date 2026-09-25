@@ -76,16 +76,18 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
       dags/scripts configs/medallion deploy/whoscored`) нет изменений → «без изменений», выход;
    2. копия автомата = `deploy/whoscored/auto_deliver.sh` пина (иначе стоп: переустановить копию);
       Id образа по тегу из `airflow.compose.yaml` = образу работающего scheduler (тег мог быть
-      пересобран); оба DAG пина компилируются; базовые счётчики строк из Trino;
+      пересобран); оба DAG пина компилируются;
    3. `whoscored-inflight` (фаза `deploying`) — **до** checkout; не записался — бой не трогаем;
-   4. `checkout --detach <пин>` → копии двух DAG и `.airflowignore` → import-check в
-      `whoscored-airflow-scheduler` (`python -c 'import dag_ingest_whoscored, dag_backfill_whoscored'`
-      из `/opt/airflow/dags`) → при смене `dags/utils` — `docker restart whoscored-airflow-scheduler`,
-      при смене `airflow.compose.yaml` — `docker compose -p whoscored-airflow … up -d --no-deps
-      --force-recreate airflow-scheduler` (смена `gw.compose.yaml` — только уведомление, flaresolverr пересоздаётся
-      руками) → ждём перечитывания по метабазе (до 10 мин): оба DAG `has_import_errors = f` и
-      `last_parsed_time` > метки + 60 с, `import_error` = 0. airflow CLI не используем — он строит свой
-      DagBag с диска;
+   4. `checkout --detach <пин>` → копии двух DAG и `.airflowignore` → при смене `airflow.compose.yaml`
+      — `docker compose -p whoscored-airflow … up -d --no-deps --force-recreate airflow-scheduler`
+      **до** import-check (откат с compose, на котором scheduler не поднялся, иначе упёрся бы в
+      import-check неисправного контейнера); scheduler не запущен — `docker restart` до import-check →
+      import-check в `whoscored-airflow-scheduler` (`python -c 'import dag_ingest_whoscored,
+      dag_backfill_whoscored'` из `/opt/airflow/dags`) → при смене `dags/utils` — `docker restart
+      whoscored-airflow-scheduler` (смена `gw.compose.yaml` — только уведомление, flaresolverr
+      пересоздаётся руками) → ждём перечитывания по метабазе (до 10 мин): оба DAG
+      `has_import_errors = f` и `last_parsed_time` > метки + 60 с, `import_error` = 0. airflow CLI не
+      используем — он строит свой DagBag с диска;
    5. успех → фаза `delivered`, 🚚; любой провал → откат на прежний SHA тем же порядком, 🔴;
       откат не подтвердился → 🆘, выключатель.
 
@@ -95,7 +97,7 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
   `GIT_OPTIONAL_LOCKS=0`): пин — по локальному `origin/master`; окно, занятость, выключатель — только
   заметки. Печатает «к доставке: …» и «проверки пройдены» либо причину стопа (exit 1).
 - `--rollback [sha]` — на указанный SHA, без аргумента — на прежний (`whoscored-accepted-prev`, при
-  висящей доставке — её `prev`); тем же порядком (checkout → копии → import-check → рестарт при нужде →
+  висящей доставке — её `prev`); тем же порядком (checkout → копии → пересоздание/рестарт при нужде → import-check →
   перечитывание). Окно не нужно, но контур должен быть свободен. Успех → `accepted` = цель,
   `accepted-prev` = откуда ушли (второй `--rollback` без аргумента возвращает обратно); если цель не
   `origin/master` — текущий master помечается `rejected`, чтобы ночь не поставила его снова.
