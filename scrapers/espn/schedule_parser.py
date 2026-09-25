@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, timedelta
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
+import logging
+import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -12,7 +15,9 @@ from .parser_common import (
     EspnParseError,
     canonical_json,
     decode_object,
+    espn_day,
     native_id,
+    optional_bool,
     optional_nonnegative_int,
     optional_string,
     required_list,
@@ -23,7 +28,21 @@ from .parser_common import (
     unknown_fields,
     utc_datetime,
 )
-from .parser_contracts import PARSER_VERSION, STATUS_MAP_VERSION, ScheduleRow
+from .parser_contracts import (
+    PARSER_VERSION,
+    STATUS_MAP_VERSION,
+    ScheduleParseState,
+    ScheduleRow,
+)
+
+logger = logging.getLogger(__name__)
+
+# One kickoff shared by this many open matches of one tournament on one ESPN
+# day is a matchday placeholder, not a confirmed time (V2.md:109, R-09).
+PLACEHOLDER_MIN_EVENTS = 4
+# Open statuses that ESPN leaves open for good once the match is moved.
+STALE_OPEN_STATUSES = frozenset({"STATUS_POSTPONED", "STATUS_SUSPENDED"})
+_ALL_UID_RE = re.compile(r"^s:600~l:(\d+)~e:(\d+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,10 +212,18 @@ def _event_row(
         status_type.get("name"), f"event[{event_id}].status.type.name"
     )
     semantics = STATUS_MAP.get(status_name)
+    parse_state = ScheduleParseState.PARSED
     if semantics is None:
-        raise EspnParseError(
-            f"unknown ESPN status {status_name!r} in {STATUS_MAP_VERSION}"
+        # One match waits for review; the tournament still publishes (R-11).
+        logger.warning(
+            "unknown ESPN status %r in %s: event %s of %s quarantined",
+            status_name,
+            STATUS_MAP_VERSION,
+            event_id,
+            competition.scope_id(edition),
         )
+        semantics = _OPEN
+        parse_state = ScheduleParseState.QUARANTINED
 
     competitions = required_list(
         event.get("competitions"), f"event[{event_id}].competitions"
@@ -205,6 +232,9 @@ def _event_row(
         raise EspnParseError(f"event[{event_id}] must have exactly one competition")
     event_competition = required_mapping(
         competitions[0], f"event[{event_id}].competitions[0]"
+    )
+    time_valid = optional_bool(
+        event_competition.get("timeValid"), f"event[{event_id}].timeValid"
     )
     competitors = required_list(
         event_competition.get("competitors"),
@@ -334,7 +364,41 @@ def _event_row(
         away_goals=str(away[2]) if away[2] is not None else None,
         parser_version=PARSER_VERSION,
         extra_json=canonical_json(extras),
+        kickoff_confirmed=time_valid is not False,
+        parse_state=parse_state,
     )
+
+
+def _mark_placeholder_kickoffs(rows: Iterable[ScheduleRow]) -> list[ScheduleRow]:
+    """Unconfirm a kickoff shared by a whole round of one tournament's open matches."""
+
+    rows = list(rows)
+    groups: dict[tuple[str, date, datetime], int] = defaultdict(int)
+    for row in rows:
+        if not row.terminal:
+            groups[(row.scope_id, espn_day(row.kickoff), row.kickoff)] += 1
+    return [
+        replace(row, kickoff_confirmed=False)
+        if not row.terminal
+        and groups[(row.scope_id, espn_day(row.kickoff), row.kickoff)]
+        >= PLACEHOLDER_MIN_EVENTS
+        else row
+        for row in rows
+    ]
+
+
+def _sorted_rows(by_event: Mapping[int, ScheduleRow]) -> tuple[ScheduleRow, ...]:
+    rows = _mark_placeholder_kickoffs(by_event.values())
+    return tuple(sorted(rows, key=lambda row: (row.kickoff, row.event_id)))
+
+
+def _keep_unique(by_event: dict[int, ScheduleRow], row: ScheduleRow) -> None:
+    existing = by_event.get(row.event_id)
+    if existing is not None and existing != row:
+        raise EspnParseError(
+            f"conflicting duplicate event_id {row.event_id} across scoreboards"
+        )
+    by_event[row.event_id] = row
 
 
 def parse_scoreboards(
@@ -378,10 +442,100 @@ def parse_scoreboards(
             )
             if row is None:
                 continue
-            existing = by_event.get(row.event_id)
-            if existing is not None and existing != row:
-                raise EspnParseError(
-                    f"conflicting duplicate event_id {row.event_id} across scoreboards"
-                )
-            by_event[row.event_id] = row
-    return tuple(sorted(by_event.values(), key=lambda row: (row.kickoff, row.event_id)))
+            _keep_unique(by_event, row)
+    return _sorted_rows(by_event)
+
+
+def parse_all_scoreboard_day(
+    raw: bytes, targets: Mapping[int, Competition], day: date
+) -> Mapping[str, tuple[ScheduleRow, ...]]:
+    """Rows of one ``all/scoreboard?dates=D`` split by target tournament.
+
+    ``all`` has no per-league root (``leagues[0]`` carries no id), so each event
+    is bound through its ``uid`` ``s:600~l:<leagueId>~e:<eventId>``; events of
+    non-target leagues are dropped unread.  An event of a season the registry
+    has no edition for is skipped with a warning (the core season check opens
+    that edition).  Every target slug is present, possibly empty.
+    """
+
+    if type(day) is not date:
+        raise TypeError("day must be a date value")
+    document = decode_object(raw, "all scoreboard")
+    leagues = required_list(document.get("leagues"), "all scoreboard.leagues")
+    if len(leagues) != 1:
+        raise EspnParseError("all scoreboard must contain exactly one root league")
+    required_mapping(leagues[0], "all scoreboard.leagues[0]")
+    source_extra: dict[str, Any] = {}
+    root_extra = unknown_fields(document, ("events", "leagues"))
+    if root_extra:
+        source_extra["scoreboard"] = root_extra
+    by_slug: dict[str, dict[int, ScheduleRow]] = {
+        competition.slug: {} for competition in targets.values()
+    }
+    for index, raw_event in enumerate(
+        required_list(document.get("events"), "all scoreboard.events")
+    ):
+        event = required_mapping(raw_event, f"all scoreboard.events[{index}]")
+        if not event:
+            continue
+        uid = required_string(event.get("uid"), f"all scoreboard.events[{index}].uid")
+        match = _ALL_UID_RE.match(uid)
+        if match is None:
+            raise EspnParseError(f"all scoreboard event uid {uid!r} has no league")
+        if native_id(match.group(2), "uid event id") != native_id(
+            event.get("id"), f"all scoreboard.events[{index}].id"
+        ):
+            raise EspnParseError(f"all scoreboard event uid {uid!r} differs from id")
+        competition = targets.get(native_id(match.group(1), "uid league id"))
+        if competition is None:
+            continue
+        season = required_mapping(event.get("season"), f"event[{uid}].season")
+        year = source_year(season.get("year"), f"event[{uid}].season.year")
+        edition = next(
+            (item for item in competition.editions if item.source_season_year == year),
+            None,
+        )
+        if edition is None:
+            logger.warning(
+                "all scoreboard %s: %s has no edition %s, event %s skipped",
+                day,
+                competition.slug,
+                year,
+                match.group(2),
+            )
+            continue
+        row = _event_row(
+            event,
+            competition=competition,
+            edition=edition,
+            query_start=day,
+            query_end=day,
+            source_extra=source_extra,
+        )
+        if row is not None:
+            _keep_unique(by_slug[competition.slug], row)
+    return MappingProxyType(
+        {slug: _sorted_rows(rows) for slug, rows in sorted(by_slug.items())}
+    )
+
+
+def stale_open_events(
+    rows: Iterable[ScheduleRow],
+    now: datetime,
+    older_than: timedelta = timedelta(days=3),
+) -> tuple[int, ...]:
+    """POSTPONED/SUSPENDED matches whose kickoff is older than ``older_than``.
+
+    These get a daily ``competitions/{id}/status`` check (#1504); the new
+    kickoff comes back through the core window list.
+    """
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return tuple(
+        sorted(
+            row.event_id
+            for row in rows
+            if row.status in STALE_OPEN_STATUSES and row.kickoff < now - older_than
+        )
+    )
