@@ -8,8 +8,8 @@ table:
     Пишет scrapers/clubelo/daily.py (dag_ingest_clubelo) MERGE-ем по ключу
     (match_date, home_key, away_key): новый забор обновляет счёт и is_final, строки
     прошлых заборов не стираются. Строки без счёта хранятся. Партиция
-    identity(match_date). h1-дата /Results обязана совпасть с h1-датой /Ranking того
-    же прогона, иначе ничего не пишется. Модель 'web-2026'.
+    identity(match_date). h1-дата /Results может быть новее h1-даты /Ranking того
+    же прогона (решение владельца 25.09); старше — ничего не пишется. Модель 'web-2026'.
   tags:
     - Tier.Bronze
     - Domain.Football

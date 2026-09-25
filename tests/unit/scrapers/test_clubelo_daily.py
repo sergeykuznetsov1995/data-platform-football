@@ -197,23 +197,44 @@ def test_layout_change_writes_nothing_parsed_and_names_the_check():
     assert [c["path"] for c in session.calls] == ["/Ranking"]
 
 
-def test_dates_differ_retry_three_times_then_nothing_written():
-    stale = [_results_with_date("2026-09-23") for _ in range(4)]
-    result, store, hist, session, sent, slept = _run(_answers(**{"/Results": stale}))
+def _ranking_with_date(day: str) -> FakeResponse:
+    html = fixture_html("Ranking.html.gz").replace(
+        '<h1><a href="/2026-09-22/Ranking">', f'<h1><a href="/{day}/Ranking">', 1)
+    return gzip_response(html)
+
+
+def test_newer_results_are_written_with_their_own_date():
+    # owner decision 25.09 (M-09): /Ranking 2026-09-22, /Results 2026-09-23 → both written
+    result, store, _, session, sent, slept = _run(
+        _answers(**{"/Results": _results_with_date("2026-09-23")}))
+    assert daily.exit_code(result) == 0 and sent == [] and slept == []
+    assert (result["rating_date"], result["results_rating_date"]) == ("2026-09-22", "2026-09-23")
+    assert result["results_attempts"] == 1
+    assert list(store.snapshot) == [RATING_DATE]
+    assert len(store.results) == 63
+    assert {r["rating_date"] for r in store.results.values()} == {date(2026, 9, 23)}
+
+
+def test_older_results_retry_three_times_then_nothing_written():
+    stale = [fixture_response("Results.html.gz") for _ in range(4)]  # h1 2026-09-22
+    result, store, hist, session, sent, slept = _run(
+        _answers(**{"/Ranking": _ranking_with_date("2026-09-23"), "/Results": stale}))
     assert slept == [daily.RESULTS_RETRY_PAUSE] * 3
     assert [c["path"] for c in session.calls].count("/Results") == 4
     assert result["results_attempts"] == 4
-    assert result["check"].startswith("M-09 /Results h1 date 2026-09-23")
+    assert result["check"].startswith("M-09 /Results h1 date 2026-09-22 older than /Ranking 2026-09-23")
     assert store.snapshot == {} and store.results == {}
     assert daily.exit_code(result) == 1 and "M-09" in sent[0]
 
 
-def test_dates_converge_on_a_retry():
-    answers = _answers(**{"/Results": [_results_with_date("2026-09-23"),
-                                       fixture_response("Results.html.gz")]})
+def test_older_results_catch_up_on_a_retry():
+    answers = _answers(**{"/Ranking": _ranking_with_date("2026-09-23"),
+                          "/Results": [fixture_response("Results.html.gz"),
+                                       _results_with_date("2026-09-23")]})
     result, store, _, _, _, slept = _run(answers)
     assert slept == [daily.RESULTS_RETRY_PAUSE] and result["results_attempts"] == 2
     assert daily.exit_code(result) == 0 and len(store.results) == 63
+
 
 
 def test_block_stops_the_run():

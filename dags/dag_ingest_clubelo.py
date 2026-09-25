@@ -10,7 +10,7 @@ legacy runner (BashOperator, no LocalExecutor fork).
   ``bronze.clubelo_rank_snapshot`` (the ``rating_date`` partition replaced in
   one transaction — NEVER APPEND, #314) and ``bronze.clubelo_result`` (MERGE by
   match date + both club keys). Fail-closed: a changed layout, a small
-  snapshot or /Results of another rating date writes nothing parsed and the
+  snapshot or /Results older than the rating date writes nothing parsed and the
   task goes red.
 - History (#1462), manual only: club pages ``/{slug}``.
 """
@@ -76,8 +76,9 @@ with DAG(
     Red and nothing parsed written when: the page layout changed (h1 date,
     "Page created", eloData, vegaJson, country tables, a cell), fewer than 1500
     clubs, levels matched < 97 %, fewer than 95 % of 1741 clubs or of the
-    previous rating date, `/Results` of another rating date after 3 retries
-    10 min apart. The alert names the failed check. `validate_data` reads only
+    previous rating date, `/Results` with an h1 date older than `/Ranking`
+    after 3 retries 10 min apart (a newer one is written: each page under its
+    own date). The alert names the failed check. `validate_data` reads only
     this run's result file and rejects a file older than the run.
 
     ### Club-page history (#1462)
@@ -115,7 +116,7 @@ rm -f {DAILY_RESULT} && \
             'HOME': '/home/airflow',
         },
         append_env=True,
-        # /Results may be retried 3 x 10 min (M-09) plus up to 10 club pages.
+        # An older /Results may be retried 3 x 10 min (M-09) plus up to 10 club pages.
         execution_timeout=timedelta(minutes=45),
         # No Airflow retry (LIGHT_ARGS has one): a retry after a written
         # snapshot sees the same rating date, skips the failed new-slug pages

@@ -4,10 +4,12 @@ One run, in this order:
 
 1. ``/Ranking`` → raw row (``bronze.clubelo_raw_page``) first, then the parse
    and the fail-closed contract (``parse_ranking`` + ``check_ranking``, C1–C6).
-2. ``/Results`` → raw row, parse. Its h1 date must equal the /Ranking h1 date
-   of this run (the site rebuilds pages one by one, M-09): otherwise it is
-   fetched again after ``results_retry_pause`` (10 min), up to
-   ``results_retries`` (3) times; still different → nothing parsed is written.
+2. ``/Results`` → raw row, parse. Its h1 date may be newer than the /Ranking
+   h1 date (owner decision 25.09 on M-09: the site rebuilds /Ranking later,
+   live 25.09 /Ranking 2026-09-22 vs /Results 2026-09-24) — both are written,
+   each under its own date. Only an OLDER /Results is fetched again after
+   ``results_retry_pause`` (10 min), up to ``results_retries`` (3) times;
+   still older → nothing parsed is written.
 3. Completeness guard of the snapshot (``check_completeness``): absolute
    (>= 95 % of 1741 clubs), against the previous rating date (>= 95 %) and,
    only when this rating date is already stored, ``min_replace_ratio`` 0.9
@@ -139,7 +141,7 @@ class GuardRefused(RuntimeError):
 
 
 class DatesDiffer(RuntimeError):
-    """/Results kept another h1 date than /Ranking after every retry."""
+    """/Results kept an h1 date older than /Ranking after every retry."""
 
 
 class IcebergDailyStore:
@@ -266,14 +268,14 @@ class _Daily:
             page, html = self.fetch("/Results")
             parsed = parse_results(html)
             self.result["results_attempts"] = attempt + 1
-            if parsed.rating_date == rating_date:
+            if parsed.rating_date >= rating_date:
                 return page, parsed
             logger.warning(
-                "ClubElo /Results h1 date %s != /Ranking %s (attempt %d of %d)",
+                "ClubElo /Results h1 date %s older than /Ranking %s (attempt %d of %d)",
                 parsed.rating_date, rating_date, attempt + 1, retries + 1,
             )
         raise DatesDiffer(
-            f"M-09 /Results h1 date {parsed.rating_date} != /Ranking {rating_date} "
+            f"M-09 /Results h1 date {parsed.rating_date} older than /Ranking {rating_date} "
             f"after {retries + 1} attempts"
         )
 
