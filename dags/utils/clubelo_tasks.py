@@ -64,6 +64,28 @@ def gate_full_ratings(**context) -> bool:
     return False
 
 
+def gate_history(**context) -> bool:
+    """ShortCircuit hook of the club-page history branch (#1462).
+
+    TRUE only when a manual "Trigger DAG w/ config" sets ``run_history=True``.
+    No calendar, no external-trigger rule: ``dag_master_pipeline`` triggers
+    without conf, so the default ``False`` keeps the branch off (R-02, R-61).
+    """
+    params = context.get('params') or {}
+    return bool(params.get('run_history'))
+
+
+def gate_daily(**context) -> bool:
+    """ShortCircuit hook in front of the daily current-ratings task (#1462).
+
+    A manual history run (``run_history=True``) skips the daily chain, so the
+    dead ClubElo API cannot paint the history run red. Every other run
+    (scheduled, master trigger, ``run_full``) keeps the daily chain.
+    """
+    params = context.get('params') or {}
+    return not params.get('run_history')
+
+
 def validate_data(**context) -> Dict[str, Any]:
     """
     Validate scraped data quality.

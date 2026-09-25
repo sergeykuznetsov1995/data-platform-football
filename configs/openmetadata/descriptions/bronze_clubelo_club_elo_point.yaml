@@ -1,0 +1,45 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.clubelo_club_elo_point
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_club_elo_point
+  description: |
+    Точки графика Elo со страниц клубов (#1462): vegaJson страницы /{slug},
+    скользящее окно ≈4 года до даты рейтинга (R-31), отстаёт от рейтинга ~на
+    неделю и не содержит матчей без пересчёта — дыру закрывает clubelo_club_match
+    (R-32). Модель 'web-2026', с архивом clubelo_team_history не совпадает (R-17).
+    Append-only, без партиций. Grain — точка (slug, captured_rating_date, point_seq).
+    Читать через манифест: брать строки, для которых в clubelo_history_manifest
+    есть строка status='done' с тем же slug и _batch_id. Таблицы коммитятся по
+    очереди (raw → точки → матчи → манифест); при сбое между ними строки
+    незакрытого клуба остаются, а следующий прогон пишет их заново (дубли без
+    done в манифесте).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: slug
+    description: Slug клуба на clubelo.com (путь страницы /{slug}).
+  - name: point_seq
+    description: Порядковый номер точки в наборе vegaJson страницы (с 0).
+  - name: point_date
+    description: Дата точки (поле Date графика).
+  - name: elo
+    description: Elo клуба на дату точки (double, как на графике).
+  - name: golo
+    description: Golo на дату точки (второй график страницы).
+  - name: segment_id
+    description: Номер отрезка графика (segment_id vega).
+  - name: captured_rating_date
+    description: Дата рейтинга из h1 страницы, с которой снята точка.
+  - name: fetched_at
+    description: Момент скачивания страницы (UTC).
+  - name: model_version
+    description: Версия модели Elo; всегда 'web-2026' — новый сайт пересчитал историю, с архивом 'api-legacy' без пометки не склеивать (R-17).
+  - name: _source
+    description: Источник данных ('clubelo_html'); метаколонка Bronze.
+  - name: _ingested_at
+    description: Момент записи строки в Bronze (UTC), не дата данных; метаколонка.
+  - name: _batch_id
+    description: Идентификатор прогона истории ('clubelo-history-<UTC>-<hex>'); метаколонка.

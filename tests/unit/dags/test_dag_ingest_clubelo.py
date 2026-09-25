@@ -69,6 +69,8 @@ class TestDagTopology:
         assert _python_task('validate_data') is not None
         assert _python_task('gate_full_ratings') is not None
         assert _bash_task('scrape_full_ratings') is not None
+        assert _python_task('gate_history') is not None
+        assert _bash_task('scrape_history') is not None
 
     def test_gate_callable_is_wired(self, dag_module):
         gate = _python_task('gate_full_ratings')
@@ -187,3 +189,57 @@ class TestGateFullRatings:
             logical_date=datetime(2024, 1, 7),
             dag_run=SimpleNamespace(external_trigger=True),
         ) is False
+
+
+@pytest.mark.unit
+class TestHistoryBranch:
+    """#1462: manual-only club-page history branch; it skips the daily chain."""
+
+    def test_default_param_off(self, dag_module):
+        assert dag_module.dag._dag_kwargs['params']['run_history'] is False
+
+    def test_history_branch_is_its_own_root(self, dag_module):
+        gate = _python_task('gate_history')
+        scrape = _bash_task('scrape_history')
+        assert gate.python_callable is dag_module.gate_history
+        assert gate.upstream_task_ids == set()  # not after the daily chain
+        assert gate.downstream_task_ids == {'scrape_history'}
+        assert scrape.upstream_task_ids == {'gate_history'}
+        assert gate._init_kwargs.get('trigger_rule') in (None, 'all_success')
+        assert gate._init_kwargs['ignore_downstream_trigger_rules'] is False
+
+    def test_history_command_and_timeout(self, dag_module):
+        from datetime import timedelta
+
+        scrape = _bash_task('scrape_history')
+        cmd = scrape.bash_command
+        assert '/opt/legacy-scraper-venv/bin/python dags/scripts/run_clubelo_scraper.py' in cmd
+        assert '--mode history' in cmd and '--batch-size 200' in cmd
+        assert '/tmp/clubelo_history_result.json' in cmd
+        assert 'rm -f /tmp/clubelo_history_result.json' in cmd
+        # LIGHT_ARGS' 5 min would kill the ~15 min branch (R-57)
+        assert scrape._init_kwargs['execution_timeout'] == timedelta(minutes=30)
+        # no automatic retry of a blocked / partial run (LIGHT_ARGS has retries)
+        assert scrape._init_kwargs['retries'] == 0
+
+    def test_daily_chain_is_gated(self, dag_module):
+        gate = _python_task('gate_daily')
+        assert gate.python_callable is dag_module.gate_daily
+        assert _bash_task('scrape_current_ratings').upstream_task_ids == {'gate_daily'}
+        # default True: a skip reaches the all_done validate/gate_full tasks too
+        assert 'ignore_downstream_trigger_rules' not in gate._init_kwargs
+
+    def test_gate_history_only_on_param(self, dag_module):
+        assert dag_module.gate_history(params={'run_history': True}) is True
+        assert dag_module.gate_history(params={'run_history': False}) is False
+        # master pipeline triggers without conf; Sunday does not matter
+        assert dag_module.gate_history(
+            params={}, logical_date=datetime(2024, 1, 7),
+            dag_run=SimpleNamespace(external_trigger=True),
+        ) is False
+
+    def test_gate_daily_skips_only_history_runs(self, dag_module):
+        assert dag_module.gate_daily(params={'run_history': True}) is False
+        assert dag_module.gate_daily(params={'run_history': False}) is True
+        assert dag_module.gate_daily(params={'run_full': True}) is True
+        assert dag_module.gate_daily() is True

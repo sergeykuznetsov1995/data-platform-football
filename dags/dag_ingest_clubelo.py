@@ -37,7 +37,12 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
-from utils.clubelo_tasks import gate_full_ratings, validate_data
+from utils.clubelo_tasks import (
+    gate_daily,
+    gate_full_ratings,
+    gate_history,
+    validate_data,
+)
 from utils.config import LEAGUES, SCHEDULES, DAG_TAGS
 from utils.default_args import LIGHT_ARGS
 
@@ -71,6 +76,11 @@ with DAG(
         # Bypass the completeness guard — for the deliberate first backfill, where
         # the new historical depth legitimately rewrites the partition set.
         'force_replace': False,
+        # #1462: collect the history from the club pages /{slug} of
+        # clubelo.com (resumable batches into four append-only tables).
+        # Manual only — "Trigger DAG w/ config" {"run_history": true}; the
+        # daily chain is skipped in that run.
+        'run_history': False,
     },
     doc_md="""
     ## ClubElo Data Ingestion
@@ -108,12 +118,30 @@ with DAG(
     - Club name, country, current ELO rating, rank, rating date (daily)
     - Weekly-sampled historical ELO snapshots (gated)
 
+    ### Club-page history (#1462)
+
+    Manual only: "Trigger DAG w/ config" `{"run_history": true}`. The
+    `gate_history` branch is a root of its own (no calendar, no `all_done`
+    after the daily chain); scheduled runs and `dag_master_pipeline`
+    triggers keep it skipped. In that run `gate_daily` skips the daily chain.
+    Batches of 200 clubs are resumable: a new run continues
+    with the clubs not yet closed in `bronze.clubelo_history_manifest`. Any
+    failed page, redirect, block or pending club makes the task red.
+
     ### Notes
 
     - Data is partitioned by `rating_date` (date-only ISO).
     - Written to Parquet fallback (PyIceberg disabled for stability).
     """,
 ) as dag:
+
+    # #1462: a manual history run skips the daily chain (dead API must not
+    # paint it red). Default ignore_downstream_trigger_rules=True skips every
+    # downstream task, incl. the all_done validate/gate_full tasks.
+    gate_daily_task = ShortCircuitOperator(
+        task_id='gate_daily',
+        python_callable=gate_daily,
+    )
 
     scrape_ratings_task = BashOperator(
         task_id='scrape_current_ratings',
@@ -171,7 +199,43 @@ rm -f /tmp/clubelo_full_result.json && \
         execution_timeout=timedelta(minutes=90),
     )
 
+    # ---- Club-page history (#1462) — manual run_history=True only ----------
+    # A root of its own: not after the daily chain, no all_done, no calendar.
+    # ignore_downstream_trigger_rules=False: skipping touches only the
+    # direct downstream scrape_history.
+    gate_history_task = ShortCircuitOperator(
+        task_id='gate_history',
+        python_callable=gate_history,
+        ignore_downstream_trigger_rules=False,
+    )
+
+    scrape_history_task = BashOperator(
+        task_id='scrape_history',
+        bash_command="""
+cd /opt/airflow && \
+rm -f /tmp/clubelo_history_result.json && \
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_clubelo_scraper.py \
+    --mode history \
+    --batch-size 200 \
+    --output /tmp/clubelo_history_result.json
+""",
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+        },
+        append_env=True,
+        # Overrides LIGHT_ARGS' 5 min (R-57): ~500 pages at 1 req/s.
+        execution_timeout=timedelta(minutes=30),
+        # No Airflow retry (LIGHT_ARGS has one): a block (403/429) must stop
+        # the run, and a red partial run must stay red; the next manual run
+        # resumes from the manifest (Sol r1 #3).
+        retries=0,
+    )
+
     # Daily chain: current ratings → validate.
-    scrape_ratings_task >> validate_data_task
+    gate_daily_task >> scrape_ratings_task >> validate_data_task
     # Weekly/manual gated branch: skipped on weekday runs and master triggers.
     scrape_ratings_task >> gate_full_ratings_task >> scrape_full_ratings_task
+    # Manual history branch (#1462).
+    gate_history_task >> scrape_history_task
