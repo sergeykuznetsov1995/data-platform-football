@@ -63,7 +63,7 @@ def metadb():
     for table in ("task_instance", "task_instance_history"):
         con.execute(
             f"CREATE TABLE {table}(dag_id VARCHAR, run_id VARCHAR, task_id VARCHAR, "
-            "try_number INT, state VARCHAR, pool VARCHAR, "
+            "map_index INT, try_number INT, state VARCHAR, pool VARCHAR, "
             "start_date TIMESTAMPTZ, end_date TIMESTAMPTZ)"
         )
     return con
@@ -76,8 +76,8 @@ def _run(con, dag_id, run_id, start, end=None):
 def _ti(con, dag_id, run_id, task_id, start, end, *, try_number=1, state="success",
         pool="p", table="task_instance"):
     con.execute(
-        f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [dag_id, run_id, task_id, try_number, state, pool, start, end],
+        f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [dag_id, run_id, task_id, -1, try_number, state, pool, start, end],
     )
 
 
@@ -115,6 +115,17 @@ def test_a_retried_task_keeps_its_first_try_wait(pool_wait, metadb):
     # The next task is measured from the retry's end, not the first try's.
     _ti(metadb, R, "r", "validate", "2026-09-24 16:30:30+00", "2026-09-24 16:31:00+00")
     assert _wait(pool_wait, metadb) == (1, 1, 600.0, 600.0)
+
+
+def test_a_retry_that_waits_for_the_slot_after_its_delay_is_waiting(pool_wait, metadb):
+    # Astra r3: the first try started at once and failed at 16:00; after the
+    # 2 min retry delay the retry waited for the busy pool until 16:20.
+    _run(metadb, R, "r", "2026-09-24 15:30:00+00")
+    _ti(metadb, R, "r", "scope", "2026-09-24 15:30:20+00", "2026-09-24 16:00:00+00",
+        state="failed", table="task_instance_history")
+    _ti(metadb, R, "r", "scope", "2026-09-24 16:20:00+00", "2026-09-24 16:40:00+00",
+        try_number=2)
+    assert _wait(pool_wait, metadb) == (1, 1, 1080.0, 1080.0)
 
 
 def test_a_task_still_waiting_for_the_slot_is_not_a_false_zero(pool_wait, metadb):

@@ -12,8 +12,10 @@ granted, so that difference is always ~0. The honest measure is the *gap*:
 a task instance's ``start_date`` minus the later of its DagRun's start and
 the latest ``end_date`` of the run's task instances that started before it.
 Scheduler hand-overs take up to ``WAIT_THRESHOLD_S``; only gaps above it are
-waiting. Only first tries are measured (a retry's gap is its retry delay);
-every earlier attempt of the run, retries included, counts as a predecessor.
+waiting. A retry is measured from its own previous try's end plus the
+lane's retry delay (``RETRY_DELAY_S``), so the delay itself is not waiting
+but a pool wait after it is; every earlier attempt of the run, retries
+included, counts as a predecessor.
 """
 
 from __future__ import annotations
@@ -22,6 +24,9 @@ import re
 from typing import NamedTuple
 
 WAIT_THRESHOLD_S = 60
+# retry_delay of the only retrying refresh task (run_refresh_scope, 2 min in
+# dags/dag_refresh_sofascore_all_mens.py); every other task has retries=0.
+RETRY_DELAY_S = 120
 
 REFRESH_DAG_ID = "dag_refresh_sofascore_all_mens"
 HISTORY_DAG_ID = "dag_backfill_sofascore_all_mens"
@@ -33,7 +38,9 @@ HISTORY_POOL = "sofascore_history_pool"
 HISTORY_SCOPE_TASK_ID = "run_historical_scope"
 # Task instance rows keep the latest try only; earlier tries of a retried task
 # live in task_instance_history (Airflow >= 2.10). Both are read as attempts.
-_ATTEMPT_COLUMNS = "dag_id, run_id, task_id, try_number, state, pool, start_date, end_date"
+_ATTEMPT_COLUMNS = (
+    "dag_id, run_id, task_id, map_index, try_number, state, pool, start_date, end_date"
+)
 
 _UTC_LITERAL = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -55,8 +62,9 @@ def pool_wait_sql(t0_utc: str, t1_utc: str) -> str:
     """One row ``runs|waiting_runs|wait_sum_s|wait_max_s`` over the refresh
     DagRuns started in ``[t0_utc, t1_utc)``.
 
-    Every first try that started is measured, finished or not, retried or not
-    (its first try is read from ``task_instance_history``). A task still
+    Every attempt that started is measured, finished or not; earlier tries
+    are read from ``task_instance_history``. A retry's gap starts after its
+    previous try's end plus ``RETRY_DELAY_S``. A task still
     ``scheduled``/``queued`` while nothing of its run runs is waiting right
     now and is measured up to ``now()``. ``wait_sum_s`` sums gaps above the
     threshold; ``wait_max_s`` is the largest gap, threshold or not."""
@@ -83,14 +91,18 @@ def pool_wait_sql(t0_utc: str, t1_utc: str) -> str:
         "SELECT a.run_id, a.try_number, a.state, a.start_date, "
         "GREATEST(r.run_start, max(a.end_date) OVER ("
         "PARTITION BY a.run_id ORDER BY a.start_date "
-        "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)) AS ready_at "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)) AS ready_at, "
+        "lag(a.end_date) OVER ("
+        "PARTITION BY a.run_id, a.task_id, a.map_index ORDER BY a.try_number"
+        ") AS previous_try_end "
         "FROM attempts a JOIN runs r ON r.run_id = a.run_id "
         "WHERE a.start_date IS NOT NULL"
         "), gaps AS ("
         "SELECT run_id, "
-        "GREATEST(extract(epoch FROM start_date - ready_at), 0) AS gap_s "
-        "FROM started WHERE try_number = 1 "
-        "AND state NOT IN ('skipped', 'upstream_failed', 'removed') "
+        "GREATEST(extract(epoch FROM start_date - GREATEST(ready_at, "
+        f"previous_try_end + INTERVAL '{RETRY_DELAY_S} seconds')), 0) AS gap_s "
+        "FROM started "
+        "WHERE state NOT IN ('skipped', 'upstream_failed', 'removed') "
         "UNION ALL "
         "SELECT r.run_id, GREATEST(extract(epoch FROM now() - GREATEST(r.run_start, "
         "(SELECT max(e.end_date) FROM attempts e WHERE e.run_id = r.run_id))), 0) "
