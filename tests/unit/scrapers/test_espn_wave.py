@@ -750,7 +750,8 @@ def test_status_checked_at_and_first_published_at_are_written_and_carried(tmp_pa
     assert rows[578281]["status_checked_at"] == fetched
     assert rows[900001]["status_checked_at"] == fetched
     first = rows[578281]["first_published_at"]
-    assert first is not None and first == rows[578281]["_ingested_at"]
+    # Stamped just before the match commit: not before the batch stamp.
+    assert first is not None and first >= rows[578281]["_ingested_at"]
     assert rows[900001]["first_published_at"] is None  # not played yet
     # An older first publication stays through a republication of the match.
     old = datetime(2026, 9, 24, 23)
@@ -846,3 +847,27 @@ def test_midnight_wave_adds_an_event_core_lists_and_bronze_lacks(tmp_path) -> No
     assert row["first_published_at"] is not None
     core_calls = client.network("/events?dates=20260923-20260925")
     assert len(core_calls) == 3 and {refresh for _, refresh in core_calls} == {True}
+
+
+@pytest.mark.unit
+def test_failed_summary_download_keeps_the_final_in_the_denominator(tmp_path) -> None:
+    """#1505 (Astra r1 p.1): the match row lands pending, the tournament is red."""
+    busy = {_summary_key("ger.2"): HttpStatusError(503, "busy")}
+    client, trino, plan, outcomes = _wave1(tmp_path, **busy)
+
+    by_slug = {o["slug"]: o for o in outcomes}
+    assert by_slug["ger.2"]["state"] == wave.RED
+    assert by_slug["ger.2"]["first_error"].startswith(
+        "SummaryFetchError: 1 Summary download(s) failed, first: summary of 456996: HttpStatusError"
+    )
+    row = _matches(trino)[456996]
+    assert (row["played_final"], row["lineup_state"], row["first_published_at"]) == (
+        True, "pending", None
+    )
+    assert not [r for r in trino.tables["espn_match_lineup"] if r["event_id"] == 456996]
+    # Next wave takes the final again with its Summary.
+    client.responses[_summary_key("ger.2")] = (PROBES / SUMMARIES["ger.2"]).read_bytes()
+    again = _plan(client, trino, tmp_path)
+    assert [(w.slug, w.event_ids) for w in again.works] == [("ger.2", (456996,))]
+    _run(again, client, trino)
+    assert _matches(trino)[456996]["lineup_state"] == "captured"

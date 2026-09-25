@@ -19,8 +19,9 @@ that copy (package ``/root/espn-deliveries/1505/summary``).
   ``STATUS_POSTPONED`` with ``status_checked_at > kickoff``.
 * *On time* (``ok``): ``played_final``, ``lineup_state`` and
   ``team_stats_state`` in (captured, valid_empty) and ``first_published_at``
-  (commit of the batch that first published the match that way; a
-  republication never moves it) ``<= deadline``.
+  (start of the match commit of the batch that first published the match
+  that way, after its children; a republication never moves it)
+  ``<= deadline``.
 * Everything else in ``due`` is a miss: no data, late, a Summary still
   pending or malformed, and a match whose status was not read after
   ``kickoff + 2 h`` (``unchecked`` — a stopped collection shows up here

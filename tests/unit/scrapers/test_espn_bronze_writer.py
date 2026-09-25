@@ -310,3 +310,31 @@ def test_team_without_statistics_gets_no_team_stats_row() -> None:
     assert receipt.rows_per_table["espn_team_stats"] == 1
     # The class names no single team: every lineup row carries the flag.
     assert {r["lineup_anomaly"] for r in trino.tables["espn_match_lineup"]} == {True}
+
+
+@pytest.mark.unit
+def test_first_publication_is_stamped_after_the_children_commits() -> None:
+    """#1505: a slow child commit cannot make a late publication look on time."""
+    import time
+    from datetime import timezone
+
+    class SlowTrino(FakeTrino):
+        def __init__(self) -> None:
+            super().__init__()
+            self.committed: dict[str, datetime] = {}
+
+        def insert_dataframe_atomic(self, schema, table, df, **kwargs):
+            time.sleep(0.01)
+            self.committed[table] = datetime.now(timezone.utc).replace(tzinfo=None)
+            return super().insert_dataframe_atomic(schema, table, df, **kwargs)
+
+    trino = SlowTrino()
+    old = datetime(2026, 9, 1, 12)
+    carried = replace(_match(2, "cd"), first_published_at=old)
+    receipt = write_tournament_batch(_batch(_match(1, "ab"), carried), trino=trino)
+
+    rows = {row["event_id"]: row for row in trino.tables["espn_match"]}
+    first = rows[1]["first_published_at"].to_pydatetime()
+    assert first > receipt.ingested_at
+    assert trino.committed["espn_match_events"] <= first <= trino.committed["espn_match"]
+    assert rows[2]["first_published_at"].to_pydatetime() == old

@@ -152,11 +152,11 @@ MATCH_SCHEMA = _schema(
     pa.field("first_fetched_at", _TS),
     # NULL until the recheck (#1506).
     pa.field("rechecked_at", _TS),
-    # Freshness meter (#1505, ``criterion.py``): commit time of the batch in
-    # which the match first became a played final with lineup and team
-    # statistics terminal (captured / valid_empty); carried over by every
-    # later batch, so a republication never moves it.  ``_ingested_at``
-    # stays the time of the latest commit.
+    # Freshness meter (#1505, ``criterion.py``): start of the match commit
+    # (after the children) of the batch in which the match first became a
+    # played final with lineup and team statistics terminal (captured /
+    # valid_empty); carried over by every later batch, so a republication
+    # never moves it.  ``_ingested_at`` stays the stamp of the latest batch.
     pa.field("first_published_at", _TS),
     # ``fetched_at`` of the day body (or core status answer) the status of
     # the row was read from.

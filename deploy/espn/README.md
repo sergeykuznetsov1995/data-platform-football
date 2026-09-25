@@ -22,7 +22,22 @@ State — `/root/watchdog/state/espn_stall_state.json` (+ `.lock`), неподт
 Контракт на #1504: реакция нового контура на сбой — красный турнир, никаких `pause_all` /
 `on_failure → pause`; тревога на турнир, красный 3 волны подряд, — правило `red:<slug>` (#1505).
 
-### Установка на хост (после мержа)
+### Обновление установленного сторожа (#1505 и дальше)
+
+Сторож уже стоит в cron (#1496): crontab не трогать, заменить только файл, сохранив прежний.
+
+```bash
+cp -p /root/watchdog/espn_stall_watch.py /root/watchdog/espn_stall_watch.py.prev-$(date +%Y%m%d)
+cp deploy/espn/espn_stall_watch.py /root/watchdog/espn_stall_watch.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile /root/watchdog/espn_stall_watch.py
+python3 /root/watchdog/espn_stall_watch.py --dry-run --state /tmp/espn-dry.json   # до #1507: red=no_wave_log
+```
+
+Откат: `cp -p /root/watchdog/espn_stall_watch.py.prev-<дата> /root/watchdog/espn_stall_watch.py`.
+State `/root/watchdog/state/espn_stall_state.json` совместим в обе стороны (эпизоды `red:<slug>`
+старый файл просто не читает).
+
+### Первая установка на хост (#1496, после мержа)
 
 ```bash
 cp deploy/espn/espn_stall_watch.py /root/watchdog/espn_stall_watch.py
@@ -210,9 +225,12 @@ ctime каталога, который пинует сторож WhoScored (`scr
   нейтральны. Веха 1 = серия 3. Строка сводки: `• ESPN: сыгранных за сутки DD.MM N, ≤ 24 ч X %
   (ok/N), серия Y дн. (веха 1: 3 дня ≥ 99 %)`; при N = 0 — «нет сыгранных в новых таблицах».
 
-Колонки `espn_match` для правила (#1505): `first_published_at` — время коммита пачки, в которой
-матч впервые стал сыгранным с терминальными частями; каждая следующая пачка переносит его из
-хранимой строки, `_ingested_at` остаётся временем последнего коммита. `status_checked_at` —
+Колонки `espn_match` для правила (#1505): `first_published_at` — момент перед коммитом строки
+матча (после дочерних таблиц) в пачке, где матч впервые стал сыгранным с терминальными частями
+(погрешность — один MERGE, не вся пачка); каждая следующая пачка переносит его из хранимой строки,
+`_ingested_at` остаётся меткой последней пачки. Новый финал, чей summary не скачался, пишется без
+summary (`pending`, промах измерителя) — матч не выпадает из знаменателя; турнир красный
+(`SummaryFetchError`), задача повторяется. `status_checked_at` —
 `fetched_at` тела дня (или момент ответа core), из которого взят статус. Несыгранный матч, чей
 статус прочитан до `kickoff + 2 ч`, волна переписывает один раз со статусом, прочитанным после.
 

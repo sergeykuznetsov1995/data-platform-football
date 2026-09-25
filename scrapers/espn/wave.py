@@ -473,6 +473,11 @@ class WavePlanError(RuntimeError):
     """Planning already failed for this tournament (a day or its editions)."""
 
 
+class SummaryFetchError(RuntimeError):
+    """A new final's Summary did not download; the match row is written
+    without it (pending, a miss of the freshness meter) and the task retries."""
+
+
 @dataclass(frozen=True, slots=True)
 class WavePlan:
     works: tuple[TournamentWork, ...]
@@ -1032,7 +1037,10 @@ def run_tournament(
     """Write the planned matches of one tournament-season as one batch.
 
     Network and write errors raise (the task retries, then the tournament is
-    red); Summary shapes never raise — they are dispositions.
+    red); Summary shapes never raise — they are dispositions.  A new final
+    whose Summary does not download is written without it (pending) before
+    ``SummaryFetchError`` is raised, so the match stays in the denominator of
+    the freshness meter (#1505).
     """
 
     if work.error is not None and not work.event_ids:
@@ -1058,6 +1066,7 @@ def run_tournament(
         stored = bronze_matches(trino, work.slug, work.season_year, work.event_ids)
 
         payloads: list[MatchPayload] = []
+        summary_errors: list[str] = []
         for event_id in work.event_ids:
             presence = work.presence.get(event_id)
             known = stored.get(event_id)
@@ -1077,17 +1086,31 @@ def run_tournament(
                     schedule, None, raw, presence, status_checked_at=raw.fetched_at
                 )
             else:
-                result = _summary_result(
-                    client,
-                    urls.summary(work.slug, event_id),
-                    captured=known is not None and known.summary_captured,
-                )
-                parsed = parse_summary(
-                    result.body, competition=competition, edition=edition, event=schedule
-                )
-                payload = MatchPayload(
-                    schedule, parsed, _raw_ref(result), status_checked_at=raw.fetched_at
-                )
+                captured = known is not None and known.summary_captured
+                try:
+                    result = _summary_result(
+                        client, urls.summary(work.slug, event_id), captured=captured
+                    )
+                except AllOriginsBlocked:
+                    raise
+                except _STATUS_ERRORS as exc:
+                    if captured:
+                        # Written without it, the match would lose its children.
+                        raise
+                    # The match is the failure unit (#1505): its row lands
+                    # without Summary (pending), so the meter counts it as a
+                    # miss instead of losing it from the denominator.
+                    summary_errors.append(f"summary of {event_id}: {type(exc).__name__}: {exc}")
+                    payload = MatchPayload(
+                        schedule, None, raw, presence, status_checked_at=raw.fetched_at
+                    )
+                else:
+                    parsed = parse_summary(
+                        result.body, competition=competition, edition=edition, event=schedule
+                    )
+                    payload = MatchPayload(
+                        schedule, parsed, _raw_ref(result), status_checked_at=raw.fetched_at
+                    )
             payloads.append(known.carried(payload) if known is not None else payload)
 
         # Bronze rows never point at a raw body that is not written yet.
@@ -1109,6 +1132,11 @@ def run_tournament(
     if work.error is not None:
         # Its planned matches are written; the tournament is still red.
         raise WavePlanError(work.error)
+    if summary_errors:
+        # The rows are written; the tournament is red and the task retries.
+        raise SummaryFetchError(
+            f"{len(summary_errors)} Summary download(s) failed, first: {summary_errors[0]}"
+        )
     dispositions = Counter(
         payload.summary.disposition.value if payload.summary is not None else payload.presence
         for payload in payloads
@@ -1200,6 +1228,7 @@ __all__ = [
     "ESPN_WITHDRAWN_ALERT",
     "LIVE_POOL",
     "RED_SHARE",
+    "SummaryFetchError",
     "TournamentOutcome",
     "TournamentWork",
     "WavePlan",

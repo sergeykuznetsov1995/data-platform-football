@@ -424,3 +424,22 @@ def test_red_rule_left_alone_when_trino_is_down(world, tmp_path):
     world.sent.clear()
     state = _run(tmp_path, NOW + timedelta(hours=1))
     assert world.sent == [] and set(state["episodes"]) == {"red:eng.1"}
+
+
+def test_one_red_season_makes_the_tournament_red_in_any_row_order(world, tmp_path):
+    """Astra 1505 р1 п.3: строка журнала — турнир-сезон; зелёный сезон не затирает красный."""
+    _quiet(world)
+    world.wave_log = []
+    for hours, first in ((12, "green"), (6, "red"), (0, "green")):
+        started = NOW - timedelta(hours=hours)
+        run_id = f"r{hours}"
+        end = started + timedelta(minutes=20)
+        world.wave_log += [(run_id, _ts(started), _ts(end), "(wave)", None, "green", 0, None)]
+        seasons = [(2025, "red", "E: old"), (2026, "green", None)]
+        if first == "green":
+            seasons.reverse()
+        world.wave_log += [(run_id, _ts(started), _ts(end), "eng.1", year, state, 1, error)
+                           for year, state, error in seasons]
+    _run(tmp_path, NOW + timedelta(minutes=15))
+    assert world.sent == ["🔴 ESPN: турнир eng.1 красный 3 волны подряд (последняя "
+                          "2026-09-24 20:00 UTC): E: old. #1505"]

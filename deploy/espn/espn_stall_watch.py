@@ -173,7 +173,13 @@ def read_red_waves():
             seen = True
             continue
         run_id, started, slug, state, error = cells
-        waves.setdefault((started, run_id), {})[slug] = (state, error)
+        # Строка журнала — турнир-сезон: любой красный сезон делает турнир красным,
+        # ошибка — наименьшая по тексту (детерминированно при любом порядке строк).
+        slugs = waves.setdefault((started, run_id), {})
+        prev = slugs.get(slug)
+        if prev is None or (state == "red") > (prev[0] == "red") or (
+                state == prev[0] == "red" and error < prev[1]):
+            slugs[slug] = (state, error)
     if not seen:
         return None
     return [(run_id, started, slugs) for (started, run_id), slugs in sorted(waves.items(), reverse=True)]
