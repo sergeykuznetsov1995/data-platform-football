@@ -2221,6 +2221,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     next_retry_at=(
                         min(
                             observed_at + timedelta(hours=48),
+                            # #1546: дыра по старому матчу не должна отменять
+                            # возврат после ближайшего матча по расписанию (#1193).
+                            # bundle здесь не None — это условие source_gap_evidence.
+                            observed_at
+                            + _schedule_cooldown(bundle.matches, observed_at),
                             gap_retry_due or datetime.max,
                         )
                         if automatic_lane == ScopeLane.CURRENT
