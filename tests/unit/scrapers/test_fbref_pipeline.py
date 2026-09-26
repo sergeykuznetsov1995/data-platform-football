@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import get_args, get_type_hints
 
 import pytest
@@ -14241,3 +14242,113 @@ def test_infrastructure_failure_on_a_repeat_observation_fails_the_wave(
     reason = str(control.frontier[target.target_id]["last_error_message"])
     assert reason.startswith("dead_letter:GenericPersistenceError:")
     assert type(exception).__name__ not in reason
+
+
+def test_live_waves_profile_each_wave_by_stage(tmp_path):
+    """#1320: every progress document splits wave time by storage stage."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    now = [0.0]
+
+    def spend(seconds):
+        now[0] += seconds
+
+    pipeline.stage_clock = lambda: now[0]
+    pipeline.sleep = spend
+    pipeline.clock = lambda: datetime(2026, 9, 26, tzinfo=timezone.utc)
+
+    @contextmanager
+    def guard(*_args):
+        spend(0.5)  # lock SQL on enter
+        yield True
+        spend(0.25)  # commit on exit
+
+    control.spend = spend
+    control.guard = guard
+    raw.spend = spend
+    pipeline.generic_writer.spend = spend
+    pipeline.typed_adapter.writer = SimpleNamespace(spend=spend)
+
+    def fetch_wave(*_args, **_kwargs):
+        pipeline._wait_for_slot(
+            datetime(2026, 9, 26, 0, 0, 6, tzinfo=timezone.utc)
+        )
+        pipeline.raw_store.spend(0.5)
+        pipeline.control.spend(0.25)
+        spend(2.0)  # network, outside every store
+        return WaveResult(claimed=1, fetched=1)
+
+    def parse_wave(*_args, **_kwargs):
+        pipeline.raw_store.spend(0.125)
+        with pipeline.control.guard("target") as verdict:
+            assert verdict is True
+            # A typed write under the content lock is Trino time, not Postgres.
+            pipeline.typed_adapter.writer.spend(1.5)
+        pipeline.generic_writer.spend(4.0)
+        pipeline.control.spend(0.75)
+        spend(1.0)  # parse CPU
+        return WaveResult(cohort_size=1, parsed=1)
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = parse_wave
+    documents = []
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["match"],
+        settings=_settings(),
+        max_batches=2,
+        on_batch=documents.append,
+    )
+
+    first = documents[0]
+    assert first["fetch"]["domain_wait_ms"] == 6000
+    assert first["fetch"]["raw_store_ms"] == 500
+    assert first["fetch"]["postgres_ms"] == 250
+    assert first["fetch"]["wall_ms"] == 8750
+    assert first["parse"]["raw_store_ms"] == 125
+    assert first["parse"]["postgres_ms"] == 1500
+    assert first["parse"]["trino_typed_ms"] == 1500
+    assert first["parse"]["trino_generic_ms"] == 4000
+    assert first["parse"]["wall_ms"] == 8125
+    # The run aggregate sums the stages across batches like any counter.
+    assert result.parse.trino_generic_ms == 8000
+    assert result.fetch.wall_ms == 17500
+    # The stores are the real ones again once the waves are over.
+    assert pipeline.control is control
+    assert pipeline.raw_store is raw
+    assert pipeline._stage_ms is None
+
+
+def test_profiled_wave_restores_the_stores_when_the_wave_raises(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    writer = FakeWriter()
+    pipeline = FBrefPipeline(control, raw, generic_writer=writer)
+    typed_writer = pipeline.typed_adapter.writer
+
+    pipeline.sleep = lambda seconds: None
+    pipeline.clock = lambda: datetime(2026, 9, 26, tzinfo=timezone.utc)
+    slot = datetime(2026, 9, 26, 0, 0, 2, tzinfo=timezone.utc)
+    with pytest.raises(RuntimeError):
+        with pipeline._profiled_wave() as outer:
+            with pytest.raises(ValueError):
+                with pipeline._profiled_wave() as inner:
+                    pipeline._wait_for_slot(slot)
+                    raise ValueError("inner wave failed")
+            # The outer wave keeps counting once the inner one is gone.
+            assert pipeline._stage_ms is outer
+            pipeline._wait_for_slot(slot)
+            raise RuntimeError("wave failed")
+
+    assert inner["domain_wait_ms"] == 2000
+    assert outer["domain_wait_ms"] == 2000
+
+    assert pipeline.control is control
+    assert pipeline.raw_store is raw
+    assert pipeline.generic_writer is writer
+    assert pipeline.typed_adapter.writer is typed_writer
+    assert pipeline._stage_ms is None
