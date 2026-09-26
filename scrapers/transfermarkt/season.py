@@ -6,9 +6,12 @@ Transfermarkt keys every edition by a four-digit ``saison_id``:
   ``saison_id=2025``;
 * a calendar-year edition (``2026``) is keyed by the year BEFORE it —
   ``saison_id=2025``.  Leagues with a season selector show it (BRA1
-  ``saison_id=2025`` is labelled "2026"), and tmapi ``competition/{id}/club``
-  answers the calendar cups the same way (measured in #1390 on Copa do
-  Brasil, Copa Libertadores, US Open Cup and J.League Cup).
+  ``saison_id=2025`` is labelled "2026"), and so do cup pages without one:
+  their ``<tm-competition-homepage season-id>`` follows this rule on all 303
+  pages of the 17.07.2026 discovery cache that carry it (177 calendar, e.g.
+  Copa do Brasil "2026" -> 2025).  The tmapi ``competition/{id}/club``
+  parameter is not measured yet (#1390): the review of 23.09 saw
+  ``season.id=2025`` for the "2026" edition of Copa do Brasil.
 
 The canonical season is the Bronze slug: ``2526`` for a split year, ``2026``
 for a calendar year.  Edition labels printed by the site ("25/26", "91/92",

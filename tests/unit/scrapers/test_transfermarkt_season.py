@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -22,15 +25,27 @@ from scrapers.transfermarkt.season import (
     split_year_bounds,
 )
 
-# Calendar cups as the site states them (discovery cache 17.07.2026): the
-# printed label and the page's own <tm-competition-homepage season-id>.
+# Calendar cups as the site states them: excerpts of the discovery cache
+# 17.07.2026 (title and the page's own <tm-competition-homepage season-id>).
 # J.League Cup switched to a split year with the league.
-CALENDAR_CUPS = (
-    ("BRC", "Copa do Brasil", "2026", SINGLE_YEAR, 2025),
-    ("CLI", "Copa Libertadores", "2026", SINGLE_YEAR, 2025),
-    ("MLSP", "US Open Cup", "2026", SINGLE_YEAR, 2025),
-    ("JAPC", "J. League Cup", "26/27", SPLIT_YEAR, 2026),
+FIXTURE = (
+    Path(__file__).parents[2] / "fixtures" / "transfermarkt" / "season"
+    / "calendar_cups.json"
 )
+_PAGES = json.loads(FIXTURE.read_text(encoding="utf-8"))["pages"]
+
+
+def _cup(cid):
+    page = _PAGES[cid]
+    label = re.search(
+        r"((?:\d{2}/\d{2})|(?:\d{4}))\s*\|", page["title"]
+    ).group(1)
+    season_id = int(re.search(r'season-id="(\d{4})"', page["homepage_tag"]).group(1))
+    fmt = SINGLE_YEAR if len(label) == 4 else SPLIT_YEAR
+    return cid, page["title"], label, fmt, season_id
+
+
+CALENDAR_CUPS = tuple(_cup(cid) for cid in ("BRC", "CLI", "MLSP", "JAPC"))
 
 
 @pytest.mark.parametrize(
@@ -62,6 +77,10 @@ def test_two_digit_label_uses_the_century_window_not_2000():
 
 @pytest.mark.parametrize(("cid", "name", "label", "fmt", "page_saison_id"), CALENDAR_CUPS)
 def test_calendar_cups_follow_the_league_rule(cid, name, label, fmt, page_saison_id):
+    assert (cid, label, page_saison_id) in {
+        ("BRC", "2026", 2025), ("CLI", "2026", 2025),
+        ("MLSP", "2026", 2025), ("JAPC", "26/27", 2026),
+    }
     season = label_to_season(label, fmt)
     assert season_to_saison_id(season, fmt) == page_saison_id, (cid, name)
     assert saison_id_to_season(page_saison_id, fmt) == season

@@ -271,7 +271,8 @@ def test_current_lane_plans_denominator_core_first_and_skips_amateur(tmp_path):
     lines = ['\t'.join(COLUMNS)]
     for cid, klass, live in (
         ('COR', 'core_club', '1'), ('NAT', 'core_national', '1'),
-        ('YTH', 'youth', '1'), ('AMA', 'amateur', '1'), ('OLD', 'archive', '0'),
+        ('YTH', 'youth', '1'), ('YTX', 'youth', '1'),
+        ('AMA', 'amateur', '1'), ('OLD', 'archive', '0'),
     ):
         lines.append('\t'.join([
             cid, f'Name {cid}', 'Test', 'UEFA', '1', klass, 'wettbewerb', live,
@@ -279,18 +280,29 @@ def test_current_lane_plans_denominator_core_first_and_skips_amateur(tmp_path):
         ]))
     path = tmp_path / 'denominator.tsv'
     path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    ids = ('AMA', 'COR', 'MIS', 'NAT', 'OLD', 'YTH')
+    ids = ('AMA', 'COR', 'MIS', 'NAT', 'OLD', 'YTH', 'YTX')
+    competitions = [_competition(cid) for cid in ids]
+    # A real youth competition is excluded by the registry (age uxx): the
+    # registry crawl gate still keeps it out, whatever the file says.
+    youth_evidence = replace(
+        competitions[-1].evidence[0], age_category=AgeCategory.UXX,
+    )
+    competitions[-1] = replace(
+        competitions[-1], age_category=AgeCategory.UXX, evidence=(youth_evidence,),
+    )
+    assert not competitions[-1].crawl_eligible
     plan = planner.plan_transfermarkt_scopes(
         {},
         parent_cycle_id='scheduled__denominator',
-        competitions=[_competition(cid) for cid in ids],
+        competitions=competitions,
         editions=[_edition(cid, '2025') for cid in ids],
         now=NOW,
         selection_mode='current_only',
         denominator=load_denominator(path),
     )
-    # Core first (order inside core unchanged), then youth and the competition
-    # the file does not know; amateur and archive are not planned.
+    # Core first (order inside core unchanged), then the tail (a youth class
+    # the registry admits, the competition the file does not know); amateur
+    # and archive are not planned, a registry-excluded youth one neither.
     assert [item['competition_id'] for item in plan.mapped_payloads] == [
         'COR', 'NAT', 'MIS', 'YTH',
     ]

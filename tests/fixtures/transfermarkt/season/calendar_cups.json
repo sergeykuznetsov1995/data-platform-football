@@ -1,0 +1,29 @@
+{
+ "source": "discovery checkpoint tm-registry-1940cd55b5c89e8d30ac38c3 (17.07.2026), excerpts",
+ "pages": {
+  "BRC": {
+   "url": "https://www.transfermarkt.com/copa-do-brasil/startseite/pokalwettbewerb/BRC",
+   "title": "Copa do Brasil 2026 | Transfermarkt",
+   "homepage_tag": "<tm-competition-homepage competition-id=\"BRC\" season-id=\"2025\">",
+   "body_sha256": "3b848b08250f903f0a58b72c4d2578e70106bf05ff9302fa1fd4a48046fba9a8"
+  },
+  "CLI": {
+   "url": "https://www.transfermarkt.com/copa-libertadores/startseite/pokalwettbewerb/CLI",
+   "title": "Copa Libertadores 2026 | Transfermarkt",
+   "homepage_tag": "<tm-competition-homepage competition-id=\"CLI\" season-id=\"2025\">",
+   "body_sha256": "fc408697139d276d640c06f5d4fc99d78648525e254d240803369e8cd64576c7"
+  },
+  "MLSP": {
+   "url": "https://www.transfermarkt.com/us-open-cup/startseite/pokalwettbewerb/MLSP",
+   "title": "US Open Cup 2026 | Transfermarkt",
+   "homepage_tag": "<tm-competition-homepage competition-id=\"MLSP\" season-id=\"2025\">",
+   "body_sha256": "30d79f80c50f2629a71813f4b29a0836d3c8fbba6dcc6b7589b5ccc3a6885505"
+  },
+  "JAPC": {
+   "url": "https://www.transfermarkt.com/j-league-cup/startseite/pokalwettbewerb/JAPC",
+   "title": "J. League Cup 26/27 | Transfermarkt",
+   "homepage_tag": "<tm-competition-homepage competition-id=\"JAPC\" season-id=\"2026\">",
+   "body_sha256": "0f1e1731e13c2de518ea66ef9bd894a245eadcd5d191ce22c065a3b950c67cfb"
+  }
+ }
+}

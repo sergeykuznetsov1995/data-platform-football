@@ -20,7 +20,11 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup, Tag
 
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
-from scrapers.transfermarkt.season import label_to_season, season_to_saison_id
+from scrapers.transfermarkt.season import (
+    SeasonRuleError,
+    label_to_season,
+    season_to_saison_id,
+)
 from scrapers.transfermarkt.registry import (
     AgeCategory,
     ClassificationEvidence,
@@ -29,6 +33,7 @@ from scrapers.transfermarkt.registry import (
     EditionRecord,
     EvidenceOrigin,
     Gender,
+    RegistryError,
     RegistryPage,
     SeasonFormat,
     TeamType,
@@ -1000,6 +1005,11 @@ class TransfermarktCompetitionDiscovery:
             raise DiscoverySchemaError("complete catalog contains no competitions")
 
         profiles: dict[str, tuple[_Document, BeautifulSoup]] = {}
+        # A competition whose own pages cannot be read is quarantined: it is
+        # published with season_format=unknown and no editions, so the
+        # registry reports it (quarantined_competition_ids) and nothing
+        # plans it, while the rest of the snapshot still publishes (#1390).
+        quarantined: dict[str, str] = {}
         for candidate in sorted(candidates.values(), key=lambda item: item.competition_id):
             document = self._get(candidate.profile_url)
             soup = self._soup(document)
@@ -1020,11 +1030,9 @@ class TransfermarktCompetitionDiscovery:
                 declared_id.get("data-competition-id")
             ) != candidate.competition_id:
                 # One inconsistent profile quarantines its competition only.
-                logger.warning(
-                    "transfermarkt competition %s quarantined: profile identity "
-                    "mismatch: %s", candidate.competition_id, candidate.profile_url,
+                quarantined[candidate.competition_id] = (
+                    f"profile identity mismatch: {candidate.profile_url}"
                 )
-                continue
             profiles[candidate.competition_id] = (document, soup)
 
         snapshot_material = {
@@ -1047,36 +1055,78 @@ class TransfermarktCompetitionDiscovery:
         edition_records: dict[str, tuple[EditionRecord, ...]] = {}
         editionless: list[str] = []
         for competition_id, candidate in sorted(candidates.items()):
-            if competition_id not in profiles:
-                editionless.append(competition_id)
-                continue
             profile_document, profile_soup = profiles[competition_id]
-            try:
-                options = _selector_options(
-                    profile_soup, profile_url=candidate.profile_url
-                )
-                season_format = _season_format(options, candidate.profile_url)
-            except DiscoverySchemaError as exc:
-                if "edition selector missing" not in str(exc):
-                    # An unreadable edition selector quarantines this
-                    # competition; the snapshot of the rest still publishes.
-                    logger.warning(
-                        "transfermarkt competition %s quarantined: %s",
-                        competition_id, exc,
+            options: tuple = ()
+            season_format = SeasonFormat.UNKNOWN
+            editions: list[EditionRecord] = []
+            if competition_id not in quarantined:
+                try:
+                    options = _selector_options(
+                        profile_soup, profile_url=candidate.profile_url
                     )
-                # The source publishes no edition at all for these — a Brazilian
-                # relegation play-off, Japan's "100 Year Vision" leagues — so
-                # there is nothing to crawl and nothing to register.
-                editionless.append(competition_id)
-                continue
-            season_evidence = ClassificationEvidence(
-                source_field="edition_selector",
-                source_value=",".join(item[1] for item in options),
-                source_url=candidate.profile_url,
-                origin=EvidenceOrigin.STRUCTURED,
-                season_format=season_format,
-            )
-            evidence = tuple(candidate.evidence) + (season_evidence,)
+                    season_format = _season_format(options, candidate.profile_url)
+                    for edition_id, label, current, attrs in options:
+                        edition_format = _label_season_format(
+                            label, candidate.profile_url
+                        )
+                        editions.append(
+                            EditionRecord(
+                                competition_id=competition_id,
+                                edition_id=edition_id,
+                                edition_label=label,
+                                canonical_season=canonical_season(
+                                    label, edition_format
+                                ),
+                                season_format=edition_format,
+                                start_date=attrs.get("data-start-date"),
+                                end_date=attrs.get("data-end-date"),
+                                active="disabled" not in attrs,
+                                current=current,
+                                participant_count=attrs.get(
+                                    "data-participant-count"
+                                ),
+                                participant_hash=attrs.get(
+                                    "data-participant-hash"
+                                ),
+                                source_url=(
+                                    candidate.profile_url.rstrip("/")
+                                    + f"/saison_id/{edition_id}"
+                                ),
+                                discovered_at=discovered_at,
+                                registry_snapshot_id=snapshot_id,
+                                source_body_hash=profile_document.payload_hash,
+                                parser_revision=PARSER_REVISION,
+                                schema_revision=SCHEMA_REVISION,
+                            )
+                        )
+                except DiscoverySchemaError as exc:
+                    if "edition selector missing" in str(exc):
+                        # The source publishes no edition at all for these — a
+                        # Brazilian relegation play-off, Japan's "100 Year
+                        # Vision" leagues — so there is nothing to crawl and
+                        # nothing to register.
+                        editionless.append(competition_id)
+                        continue
+                    quarantined[competition_id] = str(exc)
+                except (RegistryError, SeasonRuleError) as exc:
+                    quarantined[competition_id] = str(exc)
+            if competition_id in quarantined:
+                logger.warning(
+                    "transfermarkt competition %s quarantined: %s",
+                    competition_id, quarantined[competition_id],
+                )
+                options, season_format, editions = (), SeasonFormat.UNKNOWN, []
+            evidence = tuple(candidate.evidence)
+            if options:
+                evidence += (
+                    ClassificationEvidence(
+                        source_field="edition_selector",
+                        source_value=",".join(item[1] for item in options),
+                        source_url=candidate.profile_url,
+                        origin=EvidenceOrigin.STRUCTURED,
+                        season_format=season_format,
+                    ),
+                )
             competition_type = _unique_signal(
                 evidence,
                 "competition_type",
@@ -1117,34 +1167,6 @@ class TransfermarktCompetitionDiscovery:
                 parser_revision=PARSER_REVISION,
                 schema_revision=SCHEMA_REVISION,
             )
-
-            editions = []
-            for edition_id, label, current, attrs in options:
-                edition_source_url = (
-                    candidate.profile_url.rstrip("/") + f"/saison_id/{edition_id}"
-                )
-                edition_format = _label_season_format(label, candidate.profile_url)
-                editions.append(
-                    EditionRecord(
-                        competition_id=competition_id,
-                        edition_id=edition_id,
-                        edition_label=label,
-                        canonical_season=canonical_season(label, edition_format),
-                        season_format=edition_format,
-                        start_date=attrs.get("data-start-date"),
-                        end_date=attrs.get("data-end-date"),
-                        active="disabled" not in attrs,
-                        current=current,
-                        participant_count=attrs.get("data-participant-count"),
-                        participant_hash=attrs.get("data-participant-hash"),
-                        source_url=edition_source_url,
-                        discovered_at=discovered_at,
-                        registry_snapshot_id=snapshot_id,
-                        source_body_hash=profile_document.payload_hash,
-                        parser_revision=PARSER_REVISION,
-                        schema_revision=SCHEMA_REVISION,
-                    )
-                )
             edition_records[competition_id] = tuple(editions)
 
         for competition_id in editionless:

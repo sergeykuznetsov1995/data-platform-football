@@ -336,6 +336,33 @@ def test_discovery_drops_a_competition_the_source_never_staged() -> None:
     assert snapshot.competitions
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A split label spanning two years cannot be read as a season.
+        '<!doctype html><html lang="en"><head>'
+        "<title>Africa Cup of Nations 25/27 | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="AFCN">Cup</h1></body></html>',
+        # The profile declares another competition's identity.
+        '<!doctype html><html lang="en"><head>'
+        "<title>Africa Cup of Nations 2026 | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="OTHER">Cup</h1></body></html>',
+    ],
+)
+def test_one_unreadable_profile_is_quarantined_and_reported(body) -> None:
+    pages, *_ = _discover(
+        fetch=FixtureFetch(
+            {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": body}
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+
+    assert "AFCN" in snapshot.quarantined_competition_ids
+    assert "AFCN" not in {item.competition_id for item in snapshot.competitions}
+    assert "AFCN" not in {item.competition_id for item in snapshot.editions}
+    assert {"GB1", "CL"} <= {item.competition_id for item in snapshot.competitions}
+
+
 def test_catalog_table_groups_classify_rows_the_section_only_brackets() -> None:
     listing = (
         '<!doctype html><html lang="en"><head>'

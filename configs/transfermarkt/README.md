@@ -13,7 +13,14 @@ The milestone-1 denominator is `live = 1` and `class` in `core_club`,
 `core_national`. The current lane (`transfermarkt_scope_planner`, mode
 `current_only`) plans those first, then `youth`/`reserve` and any competition
 the file does not know yet; `amateur` and `archive` are not planned. The
-history lane takes the same live core.
+registry's own crawl gate (`classification_status = eligible`) still applies
+first, and today it excludes every youth and reserve competition, so the tail
+holds only competitions the file does not know until that gate admits them
+(follow-up). The history lane takes the same live core.
+
+Known debt: `current_saison_id` of EURO, AFCN and AFAC is still the registry's
+future edition, not the last played one — to be set from tmapi
+`competition/{id}/regulation` once the Transfermarkt gateway reaches tmapi.
 
 Tab-separated, UTF-8, sorted by `id`. Columns:
 

@@ -3,8 +3,9 @@
 ``configs/transfermarkt/denominator.tsv`` classifies every competition of the
 registry.  The milestone-1 denominator is the set of live core competitions
 (``live=1`` and class ``core_club`` or ``core_national``); youth and reserve
-competitions are collected after core, outside the percentage; amateur and
-archive competitions are not planned by the current lane.  Any format error
+competitions are queued after core, outside the percentage (the registry
+crawl gate still applies first and today excludes them); amateur and archive
+competitions are not planned by the current lane.  Any format error
 fails closed: planners must not guess.
 """
 
