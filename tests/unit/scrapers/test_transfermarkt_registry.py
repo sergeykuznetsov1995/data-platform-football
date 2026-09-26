@@ -17,7 +17,6 @@ from scrapers.transfermarkt.registry import (
     EvidenceOrigin,
     Gender,
     IncompleteSnapshotError,
-    RegistryConflictError,
     RegistryPage,
     SeasonFormat,
     TeamType,
@@ -243,7 +242,7 @@ def test_reconcile_is_deterministic_and_checks_inventory(
         reconcile_registry_pages(pages, expected_competition_ids={"GB1"})
 
 
-def test_conflicting_duplicate_source_identity_blocks_snapshot(
+def test_conflicting_duplicate_source_identity_quarantines_only_it(
     pages: tuple[RegistryPage, ...],
 ) -> None:
     gb1 = next(item for item in pages[0].competitions if item.competition_id == "GB1")
@@ -251,17 +250,20 @@ def test_conflicting_duplicate_source_identity_blocks_snapshot(
     page_two = replace(
         pages[1], competitions=pages[1].competitions + (conflicting,)
     )
-    with pytest.raises(RegistryConflictError, match="conflicting competition"):
-        reconcile_registry_pages((pages[0], page_two))
+    snapshot = reconcile_registry_pages((pages[0], page_two))
+    ids = {item.competition_id for item in snapshot.competitions}
+    assert "GB1" in snapshot.quarantined_competition_ids
+    assert "GB1" not in ids
+    assert "GB1" not in {item.competition_id for item in snapshot.editions}
+    assert {"CL", "FIWC"} <= ids
 
 
 def test_all_required_positive_fixtures_have_safe_scopes(snapshot) -> None:
-    assert snapshot.blocked_competition_ids == ("MYSTERY",)
-    assert snapshot.promotable is False
-    with pytest.raises(UnsafeCrawlError, match="MYSTERY"):
-        snapshot.crawl_scopes()
+    assert snapshot.blocked_competition_ids == ()
+    assert snapshot.quarantined_competition_ids == ("MYSTERY",)
+    assert snapshot.promotable is True
 
-    scopes = snapshot.crawl_scopes(strict=False)
+    scopes = snapshot.crawl_scopes()
     assert {(item.competition_id, item.canonical_season) for item in scopes} == {
         ("GB1", "2526"),
         ("CL", "2526"),
@@ -282,9 +284,12 @@ def test_women_youth_and_reserve_are_source_proven_exclusions(snapshot) -> None:
     assert "team_type=reserve" in records["GB1R"].crawl_block_reason
 
 
-def test_name_is_not_sufficient_positive_classification_evidence(snapshot) -> None:
+def test_name_is_not_sufficient_positive_classification_evidence(pages) -> None:
     mystery = next(
-        item for item in snapshot.competitions if item.competition_id == "MYSTERY"
+        item
+        for page in pages
+        for item in page.competitions
+        if item.competition_id == "MYSTERY"
     )
     assert mystery.name == "Men's Senior Mystery League"
     assert mystery.classification_status is ClassificationStatus.UNKNOWN

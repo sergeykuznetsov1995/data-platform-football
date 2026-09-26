@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup, Tag
 
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+from scrapers.transfermarkt.season import label_to_season, season_to_saison_id
 from scrapers.transfermarkt.registry import (
     AgeCategory,
     ClassificationEvidence,
@@ -36,6 +38,8 @@ from scrapers.transfermarkt.registry import (
     resolve_competition,
 )
 
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.transfermarkt.com"
 SEED_ROUTES: tuple[str, ...] = (
@@ -62,7 +66,7 @@ _CANONICAL_SECTION = "startseite"
 # immutable, so the parser revision is part of the snapshot identity. Bump it
 # whenever parsing or classification changes — otherwise a restated catalogue
 # cannot be published over the snapshot id it would otherwise reuse.
-PARSER_REVISION = "tm-html-discovery-v2"
+PARSER_REVISION = "tm-html-discovery-v3"  # v3: title edition id = saison_id (#1390)
 SCHEMA_REVISION = "1"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
@@ -776,11 +780,11 @@ def _title_edition(
         raise DiscoverySchemaError(f"edition selector missing: {profile_url}")
     label = _normalise_text(matches[-1])
     season_format = _label_season_format(label, profile_url)
-    if season_format is SeasonFormat.SINGLE_YEAR:
-        edition_id = label
-    else:
-        start = re.split(r"\s*[/\-]\s*", label)[0]
-        edition_id = start if len(start) == 4 else f"20{start}"
+    # The edition id is the source's saison_id, by the one rule in season.py:
+    # a calendar "2026" is saison_id 2025, "91/92" is 1991 (not 2091).
+    edition_id = str(
+        season_to_saison_id(label_to_season(label, season_format), season_format)
+    )
     return {edition_id: (label, True, {})}
 
 
@@ -1015,9 +1019,12 @@ class TransfermarktCompetitionDiscovery:
             if declared_id is not None and str(
                 declared_id.get("data-competition-id")
             ) != candidate.competition_id:
-                raise DiscoverySchemaError(
-                    f"profile identity mismatch: {candidate.profile_url}"
+                # One inconsistent profile quarantines its competition only.
+                logger.warning(
+                    "transfermarkt competition %s quarantined: profile identity "
+                    "mismatch: %s", candidate.competition_id, candidate.profile_url,
                 )
+                continue
             profiles[candidate.competition_id] = (document, soup)
 
         snapshot_material = {
@@ -1040,20 +1047,28 @@ class TransfermarktCompetitionDiscovery:
         edition_records: dict[str, tuple[EditionRecord, ...]] = {}
         editionless: list[str] = []
         for competition_id, candidate in sorted(candidates.items()):
+            if competition_id not in profiles:
+                editionless.append(competition_id)
+                continue
             profile_document, profile_soup = profiles[competition_id]
             try:
                 options = _selector_options(
                     profile_soup, profile_url=candidate.profile_url
                 )
+                season_format = _season_format(options, candidate.profile_url)
             except DiscoverySchemaError as exc:
                 if "edition selector missing" not in str(exc):
-                    raise
+                    # An unreadable edition selector quarantines this
+                    # competition; the snapshot of the rest still publishes.
+                    logger.warning(
+                        "transfermarkt competition %s quarantined: %s",
+                        competition_id, exc,
+                    )
                 # The source publishes no edition at all for these — a Brazilian
                 # relegation play-off, Japan's "100 Year Vision" leagues — so
                 # there is nothing to crawl and nothing to register.
                 editionless.append(competition_id)
                 continue
-            season_format = _season_format(options, candidate.profile_url)
             season_evidence = ClassificationEvidence(
                 source_field="edition_selector",
                 source_value=",".join(item[1] for item in options),

@@ -22,7 +22,6 @@ from scrapers.transfermarkt.registry import (
     EvidenceOrigin,
     Gender,
     SeasonFormat,
-    UnsafeCrawlError,
     reconcile_registry_pages,
 )
 
@@ -285,6 +284,36 @@ def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
     assert editions[0].current is True
 
 
+@pytest.mark.parametrize(
+    ("title", "edition_id", "season"),
+    [
+        # A calendar edition is keyed by the year before it, as leagues are.
+        ("Africa Cup of Nations 2026", "2025", "2026"),
+        # A two-digit split label is read by the century window, not 20xx.
+        ("1992 King Fahd Cup 91/92", "1991", "9192"),
+    ],
+)
+def test_title_edition_id_is_the_source_saison_id(title, edition_id, season) -> None:
+    cup = (
+        '<!doctype html><html lang="en"><head>'
+        f"<title>{title} | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="AFCN">Cup</h1>'
+        "</body></html>"
+    )
+    pages, *_ = _discover(
+        fetch=FixtureFetch(
+            {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": cup}
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+    editions = [item for item in snapshot.editions if item.competition_id == "AFCN"]
+
+    assert [(item.edition_id, item.canonical_season) for item in editions] == [
+        (edition_id, season)
+    ]
+    assert editions[0].source_url.endswith(f"/saison_id/{edition_id}")
+
+
 def test_discovery_drops_a_competition_the_source_never_staged() -> None:
     afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
     unstaged = (
@@ -451,8 +480,9 @@ def test_discovered_records_cover_all_required_competition_types_and_seasons() -
         "AFCN",
         "UNLA",
         "FIWC",
-        "MYSTERY",
     }
+    # The name-only competition is quarantined, not published (#1390).
+    assert snapshot.quarantined_competition_ids == ("MYSTERY",)
     assert competitions["GB1"].competition_type is CompetitionType.DOMESTIC_LEAGUE
     assert competitions["GB1W"].competition_type is CompetitionType.DOMESTIC_LEAGUE
     assert competitions["GB1W"].gender is Gender.WOMEN
@@ -519,22 +549,28 @@ def test_womens_section_is_source_backed_exclusion_without_default_mens_signal()
     assert all(
         item.source_field != "transfermarkt_taxonomy" for item in women.evidence
     )
-    assert snapshot.blocked_competition_ids == ("MYSTERY",)
+    assert snapshot.blocked_competition_ids == ()
+    assert snapshot.quarantined_competition_ids == ("MYSTERY",)
 
 
-def test_name_only_unknown_classification_blocks_snapshot_promotion() -> None:
+def test_name_only_unknown_classification_is_quarantined_and_snapshot_promotes() -> None:
     pages, *_ = _discover()
-    snapshot = reconcile_registry_pages(pages)
     mystery = next(
-        item for item in snapshot.competitions if item.competition_id == "MYSTERY"
+        item
+        for page in pages
+        for item in page.competitions
+        if item.competition_id == "MYSTERY"
     )
     assert mystery.name == "Men's Senior Mystery League"
     assert mystery.classification_status is ClassificationStatus.UNKNOWN
-    assert snapshot.blocked_competition_ids == ("MYSTERY",)
-    assert snapshot.promotable is False
-    with pytest.raises(UnsafeCrawlError, match="MYSTERY"):
-        snapshot.crawl_scopes()
-    assert {item.competition_id for item in snapshot.crawl_scopes(strict=False)} == {
+    snapshot = reconcile_registry_pages(pages)
+    # One unknown competition is quarantined; the rest of the snapshot
+    # publishes (#1390).
+    assert "MYSTERY" not in {item.competition_id for item in snapshot.competitions}
+    assert snapshot.quarantined_competition_ids == ("MYSTERY",)
+    assert snapshot.blocked_competition_ids == ()
+    assert snapshot.promotable is True
+    assert {item.competition_id for item in snapshot.crawl_scopes()} == {
         "GB1",
         "FAC",
         "CL",

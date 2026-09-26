@@ -1158,6 +1158,9 @@ def _execute_once(
             },
             "classification_counts": dict(sorted(classifications.items())),
             "blocked_competition_ids": list(snapshot.blocked_competition_ids),
+            "quarantined_competition_ids": list(
+                snapshot.quarantined_competition_ids
+            ),
             "promotable": snapshot.promotable,
             "crawl_scope_count": len(scopes),
             "crawl_scopes": list(scopes),
