@@ -784,7 +784,9 @@ services:
       FBREF_CAMOUFOX_GEOIP_DATABASE_PATH: /opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb
       # Default-off until saved-raw differential and recovery gates pass.
       FBREF_BATCH_PERSIST: ${FBREF_BATCH_PERSIST:-0}
-      FBREF_BATCH_PERSIST_MATCHES: ${FBREF_BATCH_PERSIST_MATCHES:-8}
+      # 25 = one persist group per live batch; each group costs ~40 s of
+      # fixed Trino MERGE time regardless of its size (#1320 profile).
+      FBREF_BATCH_PERSIST_MATCHES: ${FBREF_BATCH_PERSIST_MATCHES:-25}
       FBREF_BATCH_PERSIST_MAX_CELLS: ${FBREF_BATCH_PERSIST_MAX_CELLS:-150000}
       # Scheduler-only because LocalExecutor children inherit it. WhoScored's
       # admission policy validates this exact FBref-only binary control.
