@@ -1,0 +1,9 @@
+{
+ "success": true,
+ "message": "OK",
+ "data": {
+  "competitionId": "BRA3",
+  "clubIds": [],
+  "seasonId": 2026
+ }
+}

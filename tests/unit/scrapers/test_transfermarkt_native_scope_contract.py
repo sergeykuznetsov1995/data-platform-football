@@ -60,11 +60,37 @@ def _patch_one_squad(monkeypatch, scraper: TransfermarktScraper):
         ],
     )
 
+    monkeypatch.setattr(
+        tm,
+        "_parse_participant_table",
+        lambda _html: [
+            {
+                "club_id": "10",
+                "club_slug": "example-team",
+                "club_name": "Example Team",
+            }
+        ],
+    )
+
     def _fetch(url, label="html", context=None):
         calls.append({"url": url, "label": label, "context": context})
         return "<html/>"
 
+    def _fetch_json(url, label="json", context=None):
+        # tmapi participants of a cup / national-team scope (#1392).
+        calls.append({"url": url, "label": label, "context": context})
+        query = parse_qs(urlsplit(url).query)
+        return {
+            "success": True,
+            "data": {
+                "competitionId": urlsplit(url).path.split("/")[2],
+                "seasonId": int(query["season"][0]),
+                "clubIds": ["10"],
+            },
+        }
+
     monkeypatch.setattr(scraper, "_fetch_html", _fetch)
+    monkeypatch.setattr(scraper, "_fetch_json", _fetch_json)
     return calls
 
 

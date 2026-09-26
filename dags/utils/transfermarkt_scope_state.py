@@ -281,7 +281,10 @@ class ScopeManifest:
         # the policy is the only remaining authorization trace.  One-shot runs
         # keep their journal and simply omit the key.
         provenance = {'standing_policy_hash', 'silver_trigger_allowed'}
-        optional = coverage | provenance
+        # #1392: a cup / national-team scope states both participant proofs
+        # (tmapi + /teilnehmer/) and every scope whether it holds squad rows.
+        participants = {'participant_evidence', 'has_squad_rows'}
+        optional = coverage | provenance | participants
         if not isinstance(value, Mapping):
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
         present = set(value)
@@ -307,6 +310,16 @@ class ScopeManifest:
             raise ScopeManifestError(
                 'silver_trigger_allowed must be a boolean'
             )
+        if (
+            'has_squad_rows' in present
+            and not isinstance(value['has_squad_rows'], bool)
+        ):
+            raise ScopeManifestError('has_squad_rows must be a boolean')
+        participant_evidence = value.get('participant_evidence')
+        if 'participant_evidence' in present and not isinstance(
+            participant_evidence, Mapping,
+        ):
+            raise ScopeManifestError('participant evidence must be a mapping')
         if value['status'] != 'passed':
             raise ScopeManifestError('scope DQ evidence is not green')
         if not isinstance(value['edition_current'], bool):
@@ -359,12 +372,31 @@ class ScopeManifest:
         if capture['gender'] != 'men' or capture['age_category'] != 'senior':
             raise ScopeManifestError('scope capture is not senior men')
         listing_status = str(capture['listing_status'])
+        if listing_status == 'unknown':
+            # #1392: neither tmapi nor /teilnehmer/ proved the participants;
+            # the scope is not complete and stays in the queue.
+            raise ScopeManifestError(
+                'scope participants are unknown (tmapi and /teilnehmer/ '
+                'both unproven)'
+            )
         if listing_status not in {'ok', 'authoritative_empty'}:
             raise ScopeManifestError('scope participant listing is not authoritative')
         # #1025: authoritative_empty = source renders the competition page
         # with no participant listing at all; the scope completes with zero
         # participants and every entity authoritative_empty.
         listing_empty = listing_status == 'authoritative_empty'
+        if listing_empty and str(capture['listing_source_url']).startswith(
+            'https://tmapi.transfermarkt.technology/',
+        ) and not (
+            isinstance(participant_evidence, Mapping)
+            and participant_evidence.get('tmapi_count') == 0
+            and participant_evidence.get('teilnehmer_count') == 0
+        ):
+            # #1392: an empty cup / national-team scope needs BOTH proofs.
+            raise ScopeManifestError(
+                'authoritative-empty participants lack tmapi and '
+                '/teilnehmer/ proof'
+            )
         for field in ('listing_source_url', 'listing_source_body_hash'):
             if not isinstance(capture[field], str) or not capture[field].strip():
                 raise ScopeManifestError(f'scope capture {field} is empty')

@@ -1366,7 +1366,18 @@ def _build_scope_manifest(
         'participant_contract': dict(participant_dq),
         'roster_coverage': roster_coverage,
         'career_fetches_pending': pending_total,
+        # #1392: milestone-1 progress is measured by squad rows (#1395).
+        'has_squad_rows': any(
+            int((run.result.get('outputs') or {}).get('memberships', {}).get(
+                'rows', 0,
+            )) > 0
+            for run in runs
+            if run.parser_entity == 'players'
+        ),
     }
+    participant_evidence = runs[0].result.get('participant_evidence')
+    if isinstance(participant_evidence, Mapping):
+        dq_evidence['participant_evidence'] = dict(participant_evidence)
     if _approval_mode(args) == 'standing_policy':
         # The autonomous schedule authorizes this paid scope from the standing
         # policy instead of a one-shot packet, so the policy is the only
