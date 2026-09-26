@@ -9,8 +9,8 @@
            тревога того же правила «metadb недоступен» (тот же ключ: серия не дублируется);
   stall  — в bronze (BRONZE_TABLES) нет ни одного матча с TS_COL за последние STALL_H часов.
            Меряем по матчам, а не по возрасту прогона (монитор старого контура мерил возраст
-           прогона — R-02), и по `_source_fetched_at`: `_ingested_at` старых таблиц врёт
-           (= execution_date прогона). Trino недоступен — правило пропускается, эпизод не
+           прогона — R-02), и по `_source_fetched_at` (у старых таблиц `_ingested_at` врал —
+           = execution_date прогона). Trino недоступен — правило пропускается, эпизод не
            трогаем («не знаю» ≠ «простоя нет»).
   red:<slug> — (#1505) турнир красный в RED_WAVES последних волнах `dag_espn_current` подряд
            (журнал волн WAVE_LOG, строка волны slug = '(wave)'): тревога один раз, «продолжается»
@@ -48,14 +48,13 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Старый контур (все 7 DAG на паузе с 15.08). Переключаются задачами #1503 (свой контур
-# ESPN: metadb, DAG) и #1507 (автодоставка, новые таблицы bronze по #1156).
-METADB = "espn-airflow-airflow-metadb-1"
-# dag_backfill_espn / dag_repair_espn / dag_replay_espn — по требованию, их паузу не ждём.
-EXPECTED_DAGS = ("dag_ingest_espn", "dag_trigger_espn_daily", "dag_monitor_espn",
-                 "dag_discover_espn_registry")
-BRONZE_TABLES = ("espn_lineup_generation_v2", "espn_matchsheet_generation_v2")
-TS_COL = "_source_fetched_at"   # честное время загрузки; _ingested_at = execution_date прогона
+# #1507: новый контур — проект espn-live (deploy/espn/airflow.compose.yaml), его единственный
+# DAG актуалки и таблица матчей нового bronze (#1503). Старый контур espn-airflow (7 DAG на
+# паузе) сторож больше не спрашивает — он точка отката до задачи 21.
+METADB = "espn-live-airflow-metadb-1"
+EXPECTED_DAGS = ("dag_espn_current",)
+BRONZE_TABLES = ("espn_match",)
+TS_COL = "_source_fetched_at"   # время ответа ESPN; _ingested_at — метка последней пачки
 # #1505: журнал волн нового контура (scrapers/espn/wave_log.py) и порог «красный N волн подряд».
 WAVE_LOG = "iceberg.ops.espn_wave_tournament_v1"
 WAVE_ROW = "(wave)"
