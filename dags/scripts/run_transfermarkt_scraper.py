@@ -3634,6 +3634,11 @@ def _run_entity(
                 capture = _native_scope_capture(scraper)
                 if capture is not None:
                     results['scope_capture'] = capture
+                getter = getattr(scraper, 'get_participant_evidence', None)
+                evidence = getter() if callable(getter) else None
+                if isinstance(evidence, Mapping):
+                    # #1392: both participant proofs (tmapi + /teilnehmer/).
+                    results['participant_evidence'] = dict(evidence)
             authoritative_frame = frames.get(authoritative_key)
             checkpoint_frame = (
                 frames.get('stints')

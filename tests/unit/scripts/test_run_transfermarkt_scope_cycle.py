@@ -362,6 +362,10 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
     assert manifest['dq']['participant_contract']['endpoint_coverage'] == 1.0
     assert manifest['dq_evidence']['status'] == 'passed'
     assert manifest['dq_evidence']['registry_participant_count'] == 20
+    # #1392: the scope states whether it holds squad rows; a league scope
+    # carries no cup participant evidence.
+    assert manifest['dq_evidence']['has_squad_rows'] is True
+    assert 'participant_evidence' not in manifest['dq_evidence']
     player_result = json.loads(
         (
             Path(payload['result_paths']['entity_staging_dir']) / 'players.json'
@@ -470,6 +474,27 @@ def test_optional_authoritative_empty_is_hash_bound_when_proven(tmp_path):
         'market_value_points'
     ]
     assert contract['allowed_statuses'] == ['ok', 'authoritative_empty']
+
+
+def test_participant_evidence_of_players_enters_the_manifest_hash(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    evidence = {'source': 'tmapi', 'tmapi_count': 20, 'teilnehmer_count': 20}
+
+    def mutate(command, result):
+        if command[command.index('--entity') + 1] == 'players':
+            result['participant_evidence'] = dict(evidence)
+        return result
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([], mutate=mutate),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+    )
+    assert manifest['dq_evidence']['participant_evidence'] == evidence
 
 
 def test_optional_authoritative_empty_without_typed_proof_is_blocked(tmp_path):

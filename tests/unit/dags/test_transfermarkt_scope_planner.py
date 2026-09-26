@@ -545,6 +545,20 @@ def test_promoted_registry_query_is_read_only_and_escapes_snapshot_literal():
     assert 'DELETE ' not in sql
 
 
+def test_old_empty_pokal_scopes_are_not_counted_as_closed():
+    # #1392: a cup closed empty from the script-rendered /pokalwettbewerb/
+    # page proved nothing — it returns to the queue; the rows are kept.
+    sql = planner.build_promoted_registry_query()
+    cte = sql[sql.index('last_complete_scope AS'):sql.index('WHERE rn = 1')]
+
+    assert "'$.dq_evidence.scope_capture.listing_status'" in cte
+    assert "= 'authoritative_empty'" in cte
+    assert "'$.dq_evidence.scope_capture.listing_source_url'" in cte
+    assert "LIKE '%/pokalwettbewerb/%'" in cte
+    assert 'AND NOT (' in cte
+    assert 'DELETE ' not in sql
+
+
 def test_latest_registry_query_still_uses_only_the_canonical_pointer():
     sql = planner.build_promoted_registry_query()
 

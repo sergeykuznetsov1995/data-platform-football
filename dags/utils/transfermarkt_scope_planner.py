@@ -1007,6 +1007,18 @@ def build_promoted_registry_query(
         ) AS rn
         FROM {SCOPE_MANIFEST_TABLE}
         WHERE status = '{SCOPE_COMPLETION_STATUS}'
+          -- #1392: a cup scope closed empty from the script-rendered
+          -- /pokalwettbewerb/ page alone proved nothing; it goes back to the
+          -- queue.  New empties carry the tmapi URL, so this marker, not a
+          -- date, selects exactly the old rows.  Rows are kept (reversible).
+          AND NOT (
+              COALESCE(json_extract_scalar(entity_manifest_json,
+                  '$.dq_evidence.scope_capture.listing_status'), '')
+                  = 'authoritative_empty'
+              AND COALESCE(json_extract_scalar(entity_manifest_json,
+                  '$.dq_evidence.scope_capture.listing_source_url'), '')
+                  LIKE '%/pokalwettbewerb/%'
+          )
     )
     WHERE rn = 1
 )
