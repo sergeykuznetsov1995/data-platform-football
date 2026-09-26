@@ -36,7 +36,10 @@ DAILY_RESULT = "/tmp/clubelo_daily_{{ run_id | replace(':', '_') }}.json"
 # DAG definition
 with DAG(
     dag_id='dag_ingest_clubelo',
-    default_args=LIGHT_ARGS,
+    # #1464: no per-task Telegram message (it repeated for 24 days); a red
+    # run stays visible in the morning report, and the one TG alert with
+    # dedup is the host watchdog clubelo_stall_watch.py.
+    default_args={**LIGHT_ARGS, 'on_failure_callback': None},
     description='ClubElo HTML: daily /Ranking + /Results snapshot, manual club-page history',
     # The site rebuilds the rating at ~08:50 UTC (its date lags ~2 days);
     # two runs a day until task 5 of the epic measures the rebuild time.
