@@ -58,8 +58,8 @@ class RawClient(FakeClient):
 
         self.raw_store = _Store()
 
-    def _result(self, body, *, cache_hit):
-        result = super()._result(body, cache_hit=cache_hit)
+    def _result(self, body, *, cache_hit, fetched_at=None):
+        result = super()._result(body, cache_hit=cache_hit, fetched_at=fetched_at)
         self.blobs[result.content_hash] = body
         return result
 
@@ -104,17 +104,21 @@ def _captured(tmp_path, first_body: bytes | None = None):
     client = RawClient(_responses(*_first_day(), **extra))
     trino = WaveTrino()
     _execute(_plan(client, trino, tmp_path), client, trino)
+    # The Summary was downloaded before the recheck wave plans (at ``NOW``).
+    client.fetched[_summary_key("eng.1")] = "2026-09-24T23:00:00+00:00"
     return client, trino
 
 
-_JOURNAL_ROW = r"'([^']*)', (\d+), (\d+), '([a-z_0-9]+)'"
+_JOURNAL_ROW = (
+    r"'([^']*)', (\d+), (\d+), '([a-z_0-9]+)', (?:'[^']*'|NULL), (?:'[^']*'|NULL), '([a-z_]+)'\)"
+)
 
 
-def _execute(plan, client, trino):
+def _execute(plan, client, trino, refuse=None):
     conns, outcomes = [], []
     for work in plan.works:
         work = wave.TournamentWork.from_xcom(json.loads(json.dumps(work.to_xcom())))
-        conn = FakeConn()
+        conn = FakeConn(refuse)
         conns.append(conn)
         try:
             outcome = wave.run_tournament(
@@ -126,8 +130,8 @@ def _execute(plan, client, trino):
     journal = [sql for conn in conns for sql in conn.sql if recheck.RECHECK_TABLE in sql]
     # What the journal now holds, for the next run's ``recheck.journalled``.
     for sql in journal:
-        for slug, year, event_id, kind in re.findall(_JOURNAL_ROW, sql):
-            trino.rechecks.append((slug, int(year), int(event_id), kind))
+        for slug, year, event_id, kind, outcome in re.findall(_JOURNAL_ROW, sql):
+            trino.rechecks.append((slug, int(year), int(event_id), kind, outcome))
     return outcomes, journal
 
 
@@ -150,6 +154,7 @@ def _recheck_plan(monkeypatch, client, trino, tmp_path, body, kind=recheck.RECHE
     assert [(w.slug, w.event_ids, dict(w.rechecks)) for w in plan.works] == [
         ("eng.1", (EVENT,), {EVENT: kind})
     ]
+    client.clock = "2026-09-25T13:05:00+00:00"  # downloads of the recheck wave
     return plan
 
 
@@ -259,11 +264,13 @@ def test_failed_recheck_is_red_keeps_the_match_and_is_not_repeated(tmp_path, mon
     assert "'failed'" in journal[0] and "NULL" in journal[0]
     assert len(client.network("/summary?")) == downloads + 1
 
-    # The task retries from the same plan: no second download, no second row.
+    # The task retries from the same plan: no second download, no second
+    # row, and the tournament stays red (the failure is not retried away).
     client.responses[_summary_key("eng.1")] = _body()
-    outcomes, journal = _execute(plan, client, trino)
-
-    assert outcomes[0]["state"] == wave.GREEN and journal == []
+    for _attempt in range(2):
+        outcomes, journal = _execute(plan, client, trino)
+        assert outcomes[0]["state"] == wave.RED and journal == []
+        assert "578281: failed in an earlier attempt" in outcomes[0]["first_error"]
     assert len(client.network("/summary?")) == downloads + 1
     assert _matches(trino)[EVENT]["rechecked_at"] == row["rechecked_at"]
 
@@ -289,20 +296,50 @@ def test_retry_never_downloads_a_journalled_recheck_again(tmp_path, monkeypatch,
     assert (after["raw_sha256"], after["rechecked_at"]) == (row["raw_sha256"], row["rechecked_at"])
 
 
-def test_recheck_already_stamped_is_not_downloaded_even_without_journal(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("kind", [recheck.RECHECK, recheck.SAMPLE_24H, recheck.SAMPLE_72H])
+def test_refused_journal_write_is_recovered_without_a_download(
+    tmp_path, monkeypatch, kind
 ) -> None:
-    """The journal written after bronze can be missing: ``rechecked_at`` is enough."""
+    """Bronze is written, the journal write is refused: the retry replays the
+    body the first attempt downloaded (0 downloads) and writes the row."""
 
     client, trino = _captured(tmp_path)
-    plan = _recheck_plan(monkeypatch, client, trino, tmp_path, _body())
-    _execute(plan, client, trino)
-    trino.rechecks.clear()
+    plan = _recheck_plan(monkeypatch, client, trino, tmp_path, _body(_edit), kind)
     downloads = len(client.network("/summary?"))
 
-    _, journal = _execute(plan, client, trino)
+    outcomes, journal = _execute(plan, client, trino, refuse=recheck.RECHECK_TABLE)
 
-    assert journal == [] and len(client.network("/summary?")) == downloads
+    assert outcomes[0]["state"] == wave.RED and journal == [] and trino.rechecks == []
+    written = _matches(trino)[EVENT]["raw_sha256"]
+    assert len(client.network("/summary?")) == downloads + 1
+
+    for _attempt in range(2):
+        outcomes, _ = _execute(plan, client, trino)
+        assert outcomes[0]["state"] == wave.GREEN
+
+    assert len(client.network("/summary?")) == downloads + 1
+    assert [row[3:] for row in trino.rechecks] == [(kind, "same")]
+    assert _matches(trino)[EVENT]["raw_sha256"] == written
+
+
+def test_stamped_recheck_without_journal_or_body_is_red_without_a_download(
+    tmp_path, monkeypatch
+) -> None:
+    """A failed download whose journal write was refused: the retry sees the
+    stamp and no body of this wave, journals ``failed`` and stays red."""
+
+    client, trino = _captured(tmp_path)
+    plan = _recheck_plan(monkeypatch, client, trino, tmp_path, HttpStatusError(503, "busy"))
+    downloads = len(client.network("/summary?"))
+    _execute(plan, client, trino, refuse=recheck.RECHECK_TABLE)
+    assert _matches(trino)[EVENT]["rechecked_at"] is not None
+
+    outcomes, journal = _execute(plan, client, trino)
+
+    assert outcomes[0]["state"] == wave.RED
+    assert "download failed in an earlier attempt" in outcomes[0]["first_error"]
+    assert "'failed'" in journal[0]
+    assert len(client.network("/summary?")) == downloads + 1
 
 
 @pytest.mark.parametrize(
@@ -515,7 +552,8 @@ def test_day_row_of_a_recheck_is_used_when_the_day_lists_it(tmp_path, monkeypatc
     _recheck_wave(monkeypatch, client, trino, tmp_path, _body())
 
     assert len(client.network("/summary?")) == before + 1
-    assert client.replays == []
+    # One raw store read: the stored body is older than the plan, so it downloads.
+    assert client.replays == [_summary_key("eng.1")]
     row = _matches(trino)[EVENT]
     assert row["status"] == "STATUS_FINAL_AET" and row["rechecked_at"] is not None
 
