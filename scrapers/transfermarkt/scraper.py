@@ -476,29 +476,39 @@ def _parse_participant_table(html: str) -> List[Dict]:
     return clubs
 
 
-def _participant_page_is_empty(
+def _participant_page_is_for(
     html: str, competition_id: str, saison_id: int | str,
 ) -> bool:
-    """True when a ``/teilnehmer/`` page states no participant at all.
-
-    The page must self-identify as the participant page of the requested
-    edition (hreflang alternates carry ``/teilnehmer/.../{id}/saison_id/
-    {saison_id}``) and carry no ``table.items``: a consent/error page, another
-    route or season, or a drifted layout proves nothing.
+    """True when a page self-identifies as the participant page of exactly
+    this edition: hreflang alternates carry ``/teilnehmer/.../{id}/saison_id/
+    {saison_id}``.  A consent/error page, another route or another season
+    proves nothing — neither participants nor their absence.
     """
     from bs4 import BeautifulSoup
 
-    soup = BeautifulSoup(html, 'html.parser')
-    if soup.find('table', {'class': 'items'}) is not None:
-        return False
     pattern = re.compile(
         r'/teilnehmer/(?:pokal)?wettbewerb/' + re.escape(str(competition_id))
         + r'/saison_id/' + re.escape(str(saison_id)) + r'(?:[/?#]|$)'
     )
     return any(
         pattern.search(str(link.get('href') or ''))
-        for link in soup.find_all('link', rel='alternate')
+        for link in BeautifulSoup(html, 'html.parser').find_all(
+            'link', rel='alternate',
+        )
     )
+
+
+def _participant_page_is_empty(
+    html: str, competition_id: str, saison_id: int | str,
+) -> bool:
+    """True when this edition's ``/teilnehmer/`` page states no participant:
+    it is the page of the edition and carries no ``table.items``."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    if soup.find('table', {'class': 'items'}) is not None:
+        return False
+    return _participant_page_is_for(html, competition_id, saison_id)
 
 
 def _uses_participant_api(competition: CompetitionRecord) -> bool:
@@ -1806,12 +1816,16 @@ class TransfermarktScraper(BaseScraper):
             page_url, label='teilnehmer', context=context,
         )
         page_clubs = (
-            _parse_participant_table(page_html) if page_html is not None else None
+            _parse_participant_table(page_html)
+            if page_html is not None and _participant_page_is_for(
+                page_html, scope['competition_id'], saison_id,
+            )
+            else None  # not this edition's participant page: no proof
         )
         if page_clubs == [] and not _participant_page_is_empty(
             page_html, scope['competition_id'], saison_id,
         ):
-            page_clubs = None  # zero rows without a self-identifying page
+            page_clubs = None  # zero rows but still a table: no proof
         page_hash = (
             self._last_outcome.payload_hash
             if page_html is not None and self._last_outcome is not None
