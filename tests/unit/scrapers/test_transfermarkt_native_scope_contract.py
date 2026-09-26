@@ -77,12 +77,14 @@ def test_split_and_single_year_scopes_reach_native_output(monkeypatch):
     calls = _patch_one_squad(monkeypatch, scraper)
 
     premier_league = scraper.read_squad_data("GB1", 2025)
-    world_cup = scraper.read_squad_data("FIWC", 2026)
+    # A calendar edition is keyed by the year before it (season.py, #1390):
+    # the 2026 World Cup is saison_id 2025.
+    world_cup = scraper.read_squad_data("FIWC", 2025)
 
     assert premier_league["memberships"].iloc[0]["season"] == "2526"
     assert premier_league["memberships"].iloc[0]["edition_id"] == "2025"
     assert world_cup["memberships"].iloc[0]["season"] == "2026"
-    assert world_cup["memberships"].iloc[0]["edition_id"] == "2026"
+    assert world_cup["memberships"].iloc[0]["edition_id"] == "2025"
     assert [call["label"] for call in calls].count("squad") == 2
 
 

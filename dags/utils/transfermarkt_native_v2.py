@@ -2697,8 +2697,9 @@ def _gold_contract_report(
 
 
 def _season_slug(season: int) -> str:
-    value = int(season)
-    return f'{value % 100:02d}{(value + 1) % 100:02d}'
+    from scrapers.transfermarkt.season import SPLIT_YEAR, saison_id_to_season
+
+    return saison_id_to_season(int(season), SPLIT_YEAR)
 
 
 def _coverage_result(

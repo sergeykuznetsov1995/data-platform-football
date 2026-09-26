@@ -376,7 +376,7 @@ def _http_zero_discovery(*, fetch, checkpoint, traffic_ledger, clock):
     )
 
 
-def test_cached_dry_run_retains_unknown_but_never_emits_its_scope(tmp_path):
+def test_cached_dry_run_quarantines_unknown_and_never_emits_its_scope(tmp_path):
     mod = _load()
     (tmp_path / "checkpoint.json").write_text(
         json.dumps({"resume": {"status": "ok"}}), encoding="utf-8"
@@ -395,15 +395,15 @@ def test_cached_dry_run_retains_unknown_but_never_emits_its_scope(tmp_path):
         monotonic=iter((10.0, 12.0)).__next__,
     )
 
+    # The unknown competition is quarantined out of the snapshot (#1390).
     assert result.manifest["rows"] == {
-        "competitions": 2,
-        "competition_editions": 2,
+        "competitions": 1,
+        "competition_editions": 1,
     }
-    assert result.manifest["classification_counts"] == {
-        "eligible": 1,
-        "unknown": 1,
-    }
-    assert result.manifest["blocked_competition_ids"] == ["UNK"]
+    assert result.manifest["classification_counts"] == {"eligible": 1}
+    assert result.manifest["blocked_competition_ids"] == []
+    assert result.manifest["quarantined_competition_ids"] == ["UNK"]
+    assert result.manifest["promotable"] is True
     assert result.manifest["crawl_scope_count"] == 1
     assert result.manifest["crawl_scopes"][0]["competition_id"] == "GB1"
     assert result.manifest["writes"] == []
@@ -486,7 +486,7 @@ def test_approved_production_is_metered_and_writes_one_batch_per_table(
     assert all(call["delete_filter"].endswith(f"'{SNAPSHOT_ID}'") for call in writer.calls)
     assert tuple(writer.calls[0]["frame"].columns) == mod.COMPETITION_COLUMNS
     assert tuple(writer.calls[1]["frame"].columns) == mod.EDITION_COLUMNS
-    assert set(writer.calls[0]["frame"]["competition_id"]) == {"GB1", "UNK"}
+    assert set(writer.calls[0]["frame"]["competition_id"]) == {"GB1"}
     assert result.manifest["traffic"]["requests"] == 1
     assert result.manifest["traffic"]["provider_metered_bytes"] == 100
     assert result.manifest["traffic"]["by_entity"]["competition_registry"][
@@ -650,8 +650,8 @@ def test_post_validation_write_failure_keeps_exact_row_hashes(
     )
     failure = raised.value.manifest
     assert failure["rows"] == {
-        "competitions": 2,
-        "competition_editions": 2,
+        "competitions": 1,
+        "competition_editions": 1,
     }
     assert failure["hashes"] == {
         "competitions": mod.stable_payload_hash(competition_rows),

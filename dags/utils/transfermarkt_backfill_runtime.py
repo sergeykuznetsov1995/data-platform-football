@@ -14,6 +14,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from scrapers.transfermarkt.denominator import load_denominator
 from scrapers.transfermarkt.models import MAX_SCOPE_BATCH
 from scrapers.transfermarkt.raw_store import RawResponseStore
 from utils import transfermarkt_backfill_state as state
@@ -1038,7 +1039,12 @@ def historical_targets_from_registry(
 ) -> tuple[state.HistoricalScopeTarget, ...]:
     items = tuple(dict(item) for item in rows)
     targets = eligible_registry_scopes(items)
-    historical = tuple(item for item in targets if not item.current)
+    # History is collected for the denominator file's live core only (#1390).
+    core = load_denominator().denominator_ids()
+    historical = tuple(
+        item for item in targets
+        if not item.current and item.competition_id in core
+    )
     if not historical:
         raise BackfillRuntimeError(
             "promoted registry has no historical senior-men scopes"

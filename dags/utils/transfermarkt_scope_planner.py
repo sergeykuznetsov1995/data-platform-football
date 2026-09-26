@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
+from scrapers.transfermarkt.denominator import Denominator, load_denominator
 from scrapers.transfermarkt.registry import (
     ClassificationStatus,
     CompetitionRecord,
@@ -29,6 +31,8 @@ from utils.transfermarkt_scope_state import (
     SCOPE_COMPLETION_STATUS,
 )
 
+
+logger = logging.getLogger(__name__)
 
 RESULT_ROOT = '/opt/airflow/logs/transfermarkt-native-v2'
 MAX_BATCH_SIZE = 8
@@ -78,6 +82,9 @@ class ScopePlan:
     remaining_count: int
     total_selected_count: int
     parent_ledger: ParentCycleLedger
+    # Competitions left out of this plan because their registry rows conflict
+    # or their classification is unknown; the rest is planned (#1390).
+    quarantined_competitions: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         """Return a value accepted by JSON XCom serializers."""
@@ -90,6 +97,7 @@ class ScopePlan:
             'remaining_count': self.remaining_count,
             'total_selected_count': self.total_selected_count,
             'parent_ledger': self.parent_ledger.as_dict(),
+            'quarantined_competitions': self.quarantined_competitions,
         }
 
 
@@ -248,6 +256,18 @@ def _edition_from_joined_row(row: Mapping[str, Any]) -> EditionRecord:
     })
 
 
+def _quarantine(
+    quarantined: dict[str, str], competition_id: str, reason: str,
+) -> None:
+    """Leave one competition out of the plan instead of failing all of it."""
+
+    if competition_id not in quarantined:
+        logger.warning(
+            'transfermarkt competition %s quarantined: %s', competition_id, reason,
+        )
+        quarantined[competition_id] = reason
+
+
 def _load_registry(
     *,
     competitions: Iterable[CompetitionRecord | Mapping[str, Any]] | None,
@@ -258,58 +278,92 @@ def _load_registry(
     dict[tuple[str, str], EditionRecord],
     dict[tuple[str, str], datetime | None],
     dict[tuple[str, str], int],
+    dict[str, str],
 ]:
+    """Read the registry; a conflict of one competition quarantines only it.
+
+    The last element maps each quarantined competition id to its reason.
+    """
+
     competition_map: dict[str, CompetitionRecord] = {}
     edition_map: dict[tuple[str, str], EditionRecord] = {}
     last_success: dict[tuple[str, str], datetime | None] = {}
     career_pending: dict[tuple[str, str], int] = {}
+    quarantined: dict[str, str] = {}
 
     def add_competition(record: CompetitionRecord) -> None:
         existing = competition_map.get(record.competition_id)
         if existing is not None and existing != record:
-            raise ScopePlanningError(
-                f'conflicting competition rows for {record.competition_id}'
+            _quarantine(
+                quarantined, record.competition_id, 'conflicting competition rows',
             )
+            return
         competition_map[record.competition_id] = record
 
     def add_edition(record: EditionRecord) -> None:
         key = (record.competition_id, record.edition_id)
         existing = edition_map.get(key)
         if existing is not None and existing != record:
-            raise ScopePlanningError(
-                f'conflicting edition rows for {record.competition_id}/'
-                f'{record.edition_id}'
+            _quarantine(
+                quarantined, record.competition_id,
+                f'conflicting edition rows for {record.edition_id}',
             )
+            return
         edition_map[key] = record
 
-    try:
-        for value in competitions or ():
+    def owner(value: Any) -> str:
+        if isinstance(value, (CompetitionRecord, EditionRecord)):
+            return value.competition_id
+        competition_id = str(
+            (value or {}).get('competition_id') or ''
+        ).strip() if isinstance(value, Mapping) else ''
+        if not competition_id:
+            raise ScopePlanningError('registry row has no competition_id')
+        return competition_id
+
+    for value in competitions or ():
+        try:
             add_competition(
                 value
                 if isinstance(value, CompetitionRecord)
                 else CompetitionRecord.from_mapping(value)
             )
-        for value in editions or ():
+        except (RegistryError, RegistryConflictError) as exc:
+            _quarantine(quarantined, owner(value), str(exc))
+    for value in editions or ():
+        try:
             add_edition(
                 value
                 if isinstance(value, EditionRecord)
                 else EditionRecord.from_mapping(value)
             )
-        for row in registry_rows or ():
+        except (RegistryError, RegistryConflictError) as exc:
+            _quarantine(quarantined, owner(value), str(exc))
+    for row in registry_rows or ():
+        try:
             competition = _competition_from_joined_row(row)
             edition = _edition_from_joined_row(row)
-            add_competition(competition)
-            add_edition(edition)
-            key = (competition.competition_id, edition.edition_id)
-            observed = _as_utc(row.get('last_success_at'))
-            if key in last_success and last_success[key] != observed:
-                raise ScopePlanningError(
-                    f'conflicting last_success_at rows for {key[0]}/{key[1]}'
-                )
-            last_success[key] = observed
-            career_pending[key] = int(row.get('career_fetches_pending') or 0)
-    except (RegistryError, RegistryConflictError) as exc:
-        raise ScopePlanningError(str(exc)) from exc
+        except (RegistryError, RegistryConflictError) as exc:
+            _quarantine(quarantined, owner(row), str(exc))
+            continue
+        add_competition(competition)
+        add_edition(edition)
+        key = (competition.competition_id, edition.edition_id)
+        observed = _as_utc(row.get('last_success_at'))
+        if key in last_success and last_success[key] != observed:
+            _quarantine(
+                quarantined, key[0],
+                f'conflicting last_success_at rows for {key[1]}',
+            )
+        last_success[key] = observed
+        career_pending[key] = int(row.get('career_fetches_pending') or 0)
+
+    for competition_id in quarantined:
+        competition_map.pop(competition_id, None)
+    for key in [key for key in edition_map if key[0] in quarantined]:
+        edition_map.pop(key)
+        last_success.pop(key, None)
+        career_pending.pop(key, None)
 
     if not competition_map or not edition_map:
         raise ScopePlanningError('the promoted registry contains no scopes')
@@ -320,7 +374,24 @@ def _load_registry(
         raise ScopePlanningError(
             f'edition has no competition row: {orphan_editions[0]}'
         )
-    return competition_map, edition_map, last_success, career_pending
+    return competition_map, edition_map, last_success, career_pending, quarantined
+
+
+def _classification_quarantine(
+    competitions: Mapping[str, CompetitionRecord],
+    quarantined: dict[str, str],
+) -> None:
+    """An active competition of unknown/conflicting class is quarantined."""
+
+    for item in sorted(competitions.values(), key=lambda value: value.competition_id):
+        if item.active and item.classification_status in {
+            ClassificationStatus.UNKNOWN,
+            ClassificationStatus.CONFLICT,
+        }:
+            _quarantine(
+                quarantined, item.competition_id,
+                f'classification {item.classification_status.value}',
+            )
 
 
 def _competition_aliases(record: CompetitionRecord) -> set[str]:
@@ -477,6 +548,8 @@ def _select_candidates(
     career_pending: Mapping[tuple[str, str], int] | None = None,
     batch_size: int = MAX_BATCH_SIZE,
     selection_mode: ScopeSelectionMode = 'all_due',
+    quarantined: dict[str, str] | None = None,
+    denominator: Denominator | None = None,
 ) -> list[_Candidate]:
     scopes = _normalise_sequence(params.get('scopes'), name='scopes')
     leagues = _normalise_sequence(params.get('leagues'), name='leagues')
@@ -536,28 +609,27 @@ def _select_candidates(
     else:
         if season not in (None, ''):
             raise ScopePlanningError('params.season requires leagues or scopes')
-        blocked = sorted(
-            item.competition_id
-            for item in competitions.values()
-            if item.active
-            and item.classification_status in {
-                ClassificationStatus.UNKNOWN,
-                ClassificationStatus.CONFLICT,
-            }
-        )
-        if blocked:
-            raise ScopePlanningError(
-                'active registry classifications block crawl: '
-                + ', '.join(blocked)
-            )
+        # A competition of unknown class is left out, not the whole plan.
+        blocked = quarantined if quarantined is not None else {}
+        _classification_quarantine(competitions, blocked)
+        # The current lane plans the denominator file's live core first and
+        # youth/reserve after it; amateur and archive are not planned (#1390).
+        queues: tuple[list[_Candidate], list[_Candidate]] = ([], [])
         for key, edition in editions.items():
             competition = competitions[key[0]]
+            if competition.competition_id in blocked:
+                continue
             if not competition.crawl_eligible or not edition.active:
                 continue
             if selection_mode == 'current_only' and not edition.current:
                 continue
             if selection_mode == 'historical_only' and edition.current:
                 continue
+            rank = 0
+            if selection_mode == 'current_only' and denominator is not None:
+                rank = denominator.queue_rank(competition.competition_id)
+                if rank is None:
+                    continue
             candidate = _Candidate(
                 competition=competition,
                 edition=edition,
@@ -565,8 +637,12 @@ def _select_candidates(
                 career_fetches_pending=int((career_pending or {}).get(key, 0)),
             )
             if _is_due(candidate, now):
-                selected.append(candidate)
-        selected = _quota_order(selected, batch_size=batch_size)
+                queues[rank].append(candidate)
+        selected = [
+            item
+            for queue in queues
+            for item in _quota_order(queue, batch_size=batch_size)
+        ]
 
     deduplicated: list[_Candidate] = []
     seen: set[tuple[str, str]] = set()
@@ -653,25 +729,13 @@ def eligible_registry_scopes(
     previously served competition with a partial table.
     """
 
-    competitions, editions, _, _ = _load_registry(
+    competitions, editions, _, _, quarantined = _load_registry(
         competitions=None,
         editions=None,
         registry_rows=registry_rows,
     )
-    blocked = sorted(
-        item.competition_id
-        for item in competitions.values()
-        if item.active
-        and item.classification_status in {
-            ClassificationStatus.UNKNOWN,
-            ClassificationStatus.CONFLICT,
-        }
-    )
-    if blocked:
-        raise ScopePlanningError(
-            'active registry classifications block slot coverage: '
-            + ', '.join(blocked)
-        )
+    # A quarantined competition is left out of the slot, not the whole slot.
+    _classification_quarantine(competitions, quarantined)
     targets = tuple(
         RegistryScopeTarget(
             scope_id=deterministic_scope_id(*key),
@@ -689,7 +753,8 @@ def eligible_registry_scopes(
             age_category=competitions[key[0]].age_category.value,
         )
         for key, edition in sorted(editions.items())
-        if competitions[key[0]].crawl_eligible and edition.active
+        if key[0] not in quarantined
+        and competitions[key[0]].crawl_eligible and edition.active
     )
     if not targets:
         raise ScopePlanningError('promoted registry has no eligible active scopes')
@@ -738,6 +803,7 @@ def plan_transfermarkt_scopes(
     result_root: str = RESULT_ROOT,
     selection_mode: ScopeSelectionMode = 'all_due',
     resume_cycle_id: str | None = None,
+    denominator: Denominator | None = None,
 ) -> ScopePlan:
     """Plan one bounded mapping batch without network, SQL, or Airflow calls.
 
@@ -763,11 +829,15 @@ def plan_transfermarkt_scopes(
     current_time = _as_utc(now or datetime.now(timezone.utc))
     assert current_time is not None
 
-    competition_map, edition_map, last_success, career_pending = _load_registry(
-        competitions=competitions,
-        editions=editions,
-        registry_rows=registry_rows,
+    competition_map, edition_map, last_success, career_pending, quarantined = (
+        _load_registry(
+            competitions=competitions,
+            editions=editions,
+            registry_rows=registry_rows,
+        )
     )
+    if denominator is None and selection_mode == 'current_only':
+        denominator = load_denominator()
     selected = _select_candidates(
         params or {},
         competitions=competition_map,
@@ -777,6 +847,8 @@ def plan_transfermarkt_scopes(
         now=current_time,
         batch_size=batch_size,
         selection_mode=selection_mode,
+        quarantined=quarantined,
+        denominator=denominator,
     )
     selection_identity = [
         {
@@ -882,6 +954,7 @@ def plan_transfermarkt_scopes(
         remaining_count=remaining_count,
         total_selected_count=len(selected),
         parent_ledger=ledger,
+        quarantined_competitions=len(quarantined),
     )
     # Keep the serialization guarantee close to the producer contract.
     json.dumps(plan.as_dict(), sort_keys=True)

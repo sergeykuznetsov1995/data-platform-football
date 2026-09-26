@@ -246,13 +246,13 @@ def test_whoscored_paid_lease_rejects_host_before_provider_dial(mod, host):
 
 @pytest.mark.parametrize(
     "host",
-    ["www.transfermarkt.com", "www.transfermarkt.us"],
+    ["www.transfermarkt.com", "www.transfermarkt.us", "tmapi.transfermarkt.technology"],
 )
-def test_transfermarkt_paid_lease_has_an_exact_https_host_scope(mod, host):
+def test_transfermarkt_paid_lease_has_an_exact_https_host_scope(shared_mod, host):
     lease = SimpleNamespace(source="transfermarkt")
-    assert mod._lease_host_allowed(lease, host, 443)
-    assert not mod._lease_host_allowed(lease, host, 80)
-    assert not mod._lease_host_allowed(lease, f"evil.{host}", 443)
+    assert shared_mod._lease_host_allowed(lease, host, 443)
+    assert not shared_mod._lease_host_allowed(lease, host, 80)
+    assert not shared_mod._lease_host_allowed(lease, f"evil.{host}", 443)
 
 
 def test_unknown_paid_lease_source_has_no_host_scope(mod):

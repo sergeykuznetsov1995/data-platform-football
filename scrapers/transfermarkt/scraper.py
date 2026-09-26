@@ -62,6 +62,7 @@ from scrapers.transfermarkt.registry import (
     resolve_competition,
     season_window_year,
 )
+from scrapers.transfermarkt.season import saison_id_to_season
 from scrapers.utils.proxy_manager import ProxyManager
 from scrapers.utils.rate_limiter import RateLimiter
 
@@ -830,7 +831,11 @@ def _extract_club_id_from_href(href) -> Optional[str]:
 
 
 def _normalise_event_season(raw, transfer_date: Optional[date]) -> Optional[str]:
-    """Normalise a source event season to the Bronze ``2526`` convention."""
+    """Normalise a source event season to the Bronze ``2526`` convention.
+
+    The season a transfer belongs to (July rule) is not an edition's
+    ``saison_id``; that rule lives in ``season.py`` (#1390).
+    """
 
     if raw is not None:
         value = str(raw).strip()
@@ -1575,10 +1580,10 @@ class TransfermarktScraper(BaseScraper):
         edition = str(edition_id).strip()
         if not edition:
             raise TransfermarktError('edition_id is required')
-        # The source offsets some calendar leagues' saison_id from the season it
-        # names (saison_id 2023 is the 2024 season), so a registry-planned scope
-        # states its season and the edition id is only a fallback.
-        canonical = self._canonical_season or canonical_season(
+        # A registry-planned scope states its season; without it the edition
+        # id is read as a saison_id by the one rule (season.py, #1390), the
+        # same fallback the runner uses — calendar saison_id 2023 is 2024.
+        canonical = self._canonical_season or saison_id_to_season(
             edition, record.season_format,
         )
         return {

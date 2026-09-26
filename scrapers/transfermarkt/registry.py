@@ -10,11 +10,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Sequence, Type, TypeVar
+
+from scrapers.transfermarkt.season import (
+    SeasonRuleError,
+    label_to_season,
+    split_year_bounds,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class RegistryError(ValueError):
@@ -142,39 +152,12 @@ def _compact_json(value: Any) -> str:
 
 
 def _split_year_bounds(raw: str) -> tuple[int, int]:
-    """The two calendar years a split-year edition spans."""
+    """The two calendar years a split-year edition spans (``season.py``)."""
 
-    # The oldest leagues in the registry reach back into the 1890s.
-    pair = re.fullmatch(
-        r"(?P<start>(?:18|19|20|21)?\d{2})\s*[/\-]\s*"
-        r"(?P<end>(?:18|19|20|21)?\d{2})",
-        raw,
-    )
-    if pair is not None:
-        start_text = pair.group("start")
-        end_text = pair.group("end")
-        if len(start_text) == 2:
-            start_year = 2000 + int(start_text)
-        else:
-            start_year = int(start_text)
-        if len(end_text) == 2:
-            century = (start_year // 100) * 100
-            end_year = century + int(end_text)
-            if end_year < start_year:
-                end_year += 100
-        else:
-            end_year = int(end_text)
-        if end_year != start_year + 1:
-            raise RegistryError(
-                f"split-year edition must span one year: {raw!r}"
-            )
-        return start_year, end_year
-
-    if re.fullmatch(r"(19|20|21)\d{2}", raw):
-        start_year = int(raw)
-        return start_year, start_year + 1
-
-    raise RegistryError(f"invalid split-year edition: {raw!r}")
+    try:
+        return split_year_bounds(raw)
+    except SeasonRuleError as exc:
+        raise RegistryError(str(exc)) from exc
 
 
 def canonical_season(
@@ -189,18 +172,12 @@ def canonical_season(
     """
 
     fmt = _enum_value(SeasonFormat, season_format)
-    raw = str(edition_id_or_label).strip()
     if fmt is SeasonFormat.UNKNOWN:
         raise RegistryError("season_format=unknown cannot produce a season")
-
-    if fmt is SeasonFormat.SINGLE_YEAR:
-        match = re.fullmatch(r"(18|19|20|21)\d{2}", raw)
-        if match is None:
-            raise RegistryError(f"invalid single-year edition: {raw!r}")
-        return raw
-
-    start_year, end_year = _split_year_bounds(raw)
-    return f"{start_year % 100:02d}{end_year % 100:02d}"
+    try:
+        return label_to_season(edition_id_or_label, fmt)
+    except SeasonRuleError as exc:
+        raise RegistryError(str(exc)) from exc
 
 
 def season_window_year(
@@ -828,6 +805,9 @@ class RegistrySnapshot:
     competitions: tuple[CompetitionRecord, ...]
     editions: tuple[EditionRecord, ...]
     snapshot_hash: str
+    # Competitions left out of this snapshot because their rows conflict or
+    # their class is unknown; the rest of the snapshot publishes (#1390).
+    quarantined_competition_ids: tuple[str, ...] = ()
 
     @property
     def blocked_competition_ids(self) -> tuple[str, ...]:
@@ -911,19 +891,41 @@ def reconcile_registry_pages(
 
     competitions: dict[str, CompetitionRecord] = {}
     editions: dict[tuple[str, str], EditionRecord] = {}
+    quarantined: dict[str, str] = {}
     for page_number in sorted(by_page):
         page = by_page[page_number]
         for record in page.competitions:
-            _insert_unique(
-                competitions, record.competition_id, record, "competition"
-            )
+            try:
+                _insert_unique(
+                    competitions, record.competition_id, record, "competition"
+                )
+            except RegistryConflictError as exc:
+                quarantined.setdefault(record.competition_id, str(exc))
         for record in page.editions:
-            _insert_unique(
-                editions,
-                (record.competition_id, record.edition_id),
-                record,
-                "edition",
+            try:
+                _insert_unique(
+                    editions,
+                    (record.competition_id, record.edition_id),
+                    record,
+                    "edition",
+                )
+            except RegistryConflictError as exc:
+                quarantined.setdefault(record.competition_id, str(exc))
+    for record in competitions.values():
+        if record.active and record.classification_status in {
+            ClassificationStatus.UNKNOWN, ClassificationStatus.CONFLICT,
+        }:
+            quarantined.setdefault(
+                record.competition_id,
+                f"classification {record.classification_status.value}",
             )
+    for competition_id, reason in sorted(quarantined.items()):
+        logger.warning(
+            "transfermarkt competition %s quarantined: %s", competition_id, reason
+        )
+        competitions.pop(competition_id, None)
+    for key in [key for key in editions if key[0] in quarantined]:
+        editions.pop(key)
 
     missing_parents = sorted(
         {record.competition_id for record in editions.values()} - set(competitions)
@@ -935,7 +937,7 @@ def reconcile_registry_pages(
         )
     if expected_competition_ids is not None:
         expected_ids = {_required_text("competition_id", item) for item in expected_competition_ids}
-        actual_ids = set(competitions)
+        actual_ids = set(competitions) | set(quarantined)
         if actual_ids != expected_ids:
             raise IncompleteSnapshotError(
                 "competition inventory mismatch: "
@@ -952,6 +954,8 @@ def reconcile_registry_pages(
         "page_hashes": page_hashes,
         "snapshot_id": next(iter(snapshot_ids)),
     }
+    if quarantined:
+        digest_payload["quarantined"] = sorted(quarantined)
     snapshot_hash = hashlib.sha256(
         _compact_json(digest_payload).encode("utf-8")
     ).hexdigest()
@@ -962,6 +966,7 @@ def reconcile_registry_pages(
         competitions=competition_rows,
         editions=edition_rows,
         snapshot_hash=snapshot_hash,
+        quarantined_competition_ids=tuple(sorted(quarantined)),
     )
 
 
