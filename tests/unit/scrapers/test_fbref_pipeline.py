@@ -14330,10 +14330,22 @@ def test_profiled_wave_restores_the_stores_when_the_wave_raises(tmp_path):
     pipeline = FBrefPipeline(control, raw, generic_writer=writer)
     typed_writer = pipeline.typed_adapter.writer
 
+    pipeline.sleep = lambda seconds: None
+    pipeline.clock = lambda: datetime(2026, 9, 26, tzinfo=timezone.utc)
+    slot = datetime(2026, 9, 26, 0, 0, 2, tzinfo=timezone.utc)
     with pytest.raises(RuntimeError):
-        with pipeline._profiled_wave():
-            with pipeline._profiled_wave():
-                raise RuntimeError("wave failed")
+        with pipeline._profiled_wave() as outer:
+            with pytest.raises(ValueError):
+                with pipeline._profiled_wave() as inner:
+                    pipeline._wait_for_slot(slot)
+                    raise ValueError("inner wave failed")
+            # The outer wave keeps counting once the inner one is gone.
+            assert pipeline._stage_ms is outer
+            pipeline._wait_for_slot(slot)
+            raise RuntimeError("wave failed")
+
+    assert inner["domain_wait_ms"] == 2000
+    assert outer["domain_wait_ms"] == 2000
 
     assert pipeline.control is control
     assert pipeline.raw_store is raw
