@@ -37,7 +37,11 @@ SCRIPTS = (
     DEPLOY / "postdeploy_checks.sh",
     DEPLOY / "auto_deliver.sh",
 )
-MINI_DAGS = ("dag_trigger_sofascore_daily.py", "dag_sofascore_manifest_maintenance.py")
+MINI_DAGS = (
+    "dag_trigger_sofascore_daily.py",
+    "dag_trigger_sofascore_daily_tail.py",
+    "dag_sofascore_manifest_maintenance.py",
+)
 
 # Три полосы источника (#1244): свой шлюз, свой дневной потолок, свой слот аренды,
 # свой каталог состояния. До развода все три ходили через sofascore_gw_951 и давали
@@ -174,7 +178,7 @@ def test_airflow_compose_pins_the_live_scheduler_shape() -> None:
     env = scheduler["environment"]
     assert env["SOFASCORE_PROXY_CONTROL_URL"] == "http://sofascore_proxy_filter:8899"
     assert env["SOFASCORE_ALL_MENS_STATE"] == "/opt/airflow/runtime/sofascore/all-men/state.json"
-    assert env["SOFASCORE_REFRESH_BATCH_SIZE"] == "${SOFASCORE_REFRESH_BATCH_SIZE:-3}"
+    assert env["SOFASCORE_REFRESH_BATCH_SIZE"] == "${SOFASCORE_REFRESH_BATCH_SIZE:-64}"
     # Полосы (#1244, #1360): история и актуалка ходят к своим шлюзам и держат свои
     # пулы; дейли остаётся на дефолтах (sofascore_proxy_filter/ingest_scraper_pool).
     assert env["SOFASCORE_HISTORY_POOL"] == "sofascore_history_pool"

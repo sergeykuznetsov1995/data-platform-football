@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -25,6 +26,7 @@ REFRESH_KNOBS = (
     "SOFASCORE_REFRESH_RESULT_DIR",
     "SOFASCORE_REFRESH_PROXY_CONTROL_URL",
     "SOFASCORE_METADATA_SEASONS_PER_RUN",
+    "SOFASCORE_REFRESH_SECONDS_PER_MATCH",
 )
 
 
@@ -105,14 +107,16 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         "schedule-sweep-incomplete.json",
     ):
         assert flag in fetch.bash_command
-    # 150 * 3 + 200 * (3 + 1) + 40 * (12 + 3 + 2) = 1930 pages at ~20-27 KB
-    # plus the per-lease warm-ups has to fit the cap, or the worst plan dies on
-    # bytes; the fixture page of every stale and seeded season and the step-back
-    # allowance of a resumed chain count too (Sol round 6, finding 5).
-    assert fetch.env["SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES"] == str(64 * 1024 * 1024)
+    # #1358: the sweep is sized in pages — 150 min x 20/min x 0.8 — and the
+    # byte cap is derived from them by the run (0 = derive, no fixed 64 MiB).
+    assert '--page-budget "${SOFASCORE_REFRESH_PAGE_BUDGET}"' in fetch.bash_command
+    assert fetch.env["SOFASCORE_REFRESH_PAGE_BUDGET"] == "2400"
+    assert module.REFRESH_PAGE_BUDGET == 2400
+    assert fetch.env["SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES"] == "0"
     # The preflight counts one warm-up per lease, so the ceiling has to reach it.
     assert fetch.env["SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES"] == str(8 * 1024 * 1024)
-    assert fetch.env["SOFASCORE_REFRESH_MAX_DUE"] == "150"
+    # Every due season of the run; the env value is an emergency bound only.
+    assert fetch.env["SOFASCORE_REFRESH_MAX_DUE"] == "4096"
     assert fetch.env["SOFASCORE_REFRESH_MAX_STALE"] == "200"
     assert fetch.env["SOFASCORE_REFRESH_CHASE_PAGES"] == "3"
     assert fetch.env["SOFASCORE_REFRESH_MAX_SEED"] == "40"
@@ -130,25 +134,31 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     # it instead.
     assert fetch._init_kwargs["retries"] == 0
     assert fetch._init_kwargs["execution_timeout"] == timedelta(minutes=150)
-    # And the batch is sized for BOTH attempts a scope may take, so the DagRun
-    # window holds the worst case instead of only the happy path.
-    assert module.REFRESH_SCOPE_ATTEMPTS == 2
+    # #1358: 7 h hold the sweep, the scopes' shared window, the reserve for
+    # their retries and the metadata enrichment: 150 min + 2 h + 2 h + 25 min.
+    assert module.REFRESH_SCOPE_BUDGET == timedelta(hours=2)
+    assert module.REFRESH_RETRY_RESERVE == timedelta(hours=2)
     assert (
         module.REFRESH_FETCH_TIMEOUT
-        + module.REFRESH_BATCH_FITS
-        * module.REFRESH_SCOPE_TIMEOUT
-        * module.REFRESH_SCOPE_ATTEMPTS
+        + module.REFRESH_SCOPE_BUDGET
+        + module.REFRESH_RETRY_RESERVE
+        + module.METADATA_TIMEOUT
         <= module.REFRESH_DAGRUN_TIMEOUT
     )
+    assert not hasattr(module, "REFRESH_BATCH_FITS")
+    assert module.REFRESH_BATCH_SIZE == 64
+    assert module.REFRESH_SECONDS_PER_MATCH == 25
 
     run = operators["run_refresh_scope"]
     assert run.is_mapped
-    assert run._expand_kwargs["env"].operator.task_id == "plan_refresh_batch"
+    # Every scope brings its own timeout in the mapped kwargs.
+    assert run._expand_kwargs_arg.operator.task_id == "plan_refresh_batch"
+    assert run._expand_kwargs_strict is False
+    assert "execution_timeout" not in run._init_kwargs
     assert run._init_kwargs["pool"] == "ingest_scraper_pool"
     assert run._init_kwargs["priority_weight"] == 5
     assert run._init_kwargs["retries"] == 1
     assert run._init_kwargs["retry_delay"] >= timedelta(seconds=60)
-    assert run._init_kwargs["execution_timeout"] == timedelta(hours=2)
     assert run._init_kwargs["max_active_tis_per_dag"] == 1
     assert run._init_kwargs["do_xcom_push"] is False
     for flag in (
@@ -232,11 +242,11 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
         monkeypatch,
         dag_run=SimpleNamespace(run_type=DagRunType.MANUAL, conf={}),
     )
-    # The env asks for 3, but only ONE scope fits the DagRun window next to the
-    # sweep: the cap is what actually fits, not what was configured, and a
-    # scope is allowed two attempts (Sol r12 #2 — counting one made the
-    # arithmetic decorative).
-    assert kwargs["batch_size"] == 1
+    # #1358: the env value is only the upper bound on the number of scopes;
+    # the shared window decides how many actually go.
+    assert kwargs["batch_size"] == 3
+    assert kwargs["scope_budget_s"] == 2 * 3600
+    assert kwargs["seconds_per_match"] == 25
     assert kwargs["result_dir"] == "/tmp/refresh"
     assert kwargs["task_env"] == {
         "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-refresh:8080"
@@ -269,7 +279,8 @@ def test_task_env_survives_airflow_template_rendering(clean_env, monkeypatch):
     [
         ("SOFASCORE_REFRESH_BATCH_SIZE", "0"),
         ("SOFASCORE_REFRESH_MAX_ACTIVE_TASKS", "two"),
-        ("SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", "0"),
+        ("SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", "-1"),
+        ("SOFASCORE_REFRESH_SECONDS_PER_MATCH", "0"),
         ("SOFASCORE_REFRESH_MAX_DUE", "0"),
         ("SOFASCORE_REFRESH_MAX_SEED", "0"),
         ("SOFASCORE_REFRESH_SEED_PAGES", "нет"),
@@ -327,10 +338,10 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
         ("SS-17", "2627", 4, 1_787_788_800)
     ]
     assert kwargs["exclude_tournament_ids"] == frozenset({17, 8})
-    # Campaign-wide default is 8; the lane runs its batch serially inside a 7 h
-    # DagRun, so it takes only what fits (Sol round 5, finding 8) — and what
-    # fits counts BOTH attempts a scope is allowed (Sol round 12, finding 2).
-    assert kwargs["batch_size"] == 1
+    # #1358: the batch size (64) is only the upper bound on the number of
+    # scopes; the planner fills the 2 h scope window by their estimates.
+    assert kwargs["batch_size"] == 64
+    assert kwargs["scope_budget_s"] == 7200
     assert kwargs["dag_run_id"] == "manual__1"
     assert kwargs["snapshot_path"] == module.SNAPSHOT_PATH
     assert kwargs["workload_artifact"] == module.WORKLOAD_ARTIFACT
@@ -339,38 +350,35 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("run_type", "interval_end", "conf", "expected_mode"),
+    ("run_type", "interval_end", "conf"),
     [
-        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}, "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 8, 30, tzinfo=timezone.utc), {}, "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}, "backlog"),
-        (DagRunType.SCHEDULED, datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}, "fresh"),
-        (DagRunType.BACKFILL, datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}, "backlog"),
-        ("backfill", datetime(2026, 8, 27, 2, 30, tzinfo=timezone(timedelta(hours=2))), {}, "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 17, 30, tzinfo=timezone(timedelta(hours=2))), {}, "backlog"),
-        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {"queue_mode": "backlog"}, "fresh"),
-        ("backfill", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {"queue_mode": "fresh"}, "backlog"),
+        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", datetime(2026, 8, 27, 8, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}),
+        (DagRunType.SCHEDULED, datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}),
+        (DagRunType.BACKFILL, datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", datetime(2026, 8, 27, 11, 30, tzinfo=timezone.utc), {}),
+        ("scheduled", None, {"queue_mode": "backlog"}),
     ],
 )
-def test_plan_task_derives_ffb_mode_from_interval_end_not_delayed_task_start(
-    clean_env, monkeypatch, run_type, interval_end, conf, expected_mode
+def test_plan_task_uses_one_deadline_queue_for_every_slot(
+    clean_env, monkeypatch, run_type, interval_end, conf
 ):
+    # #1359: no fresh/backlog split by slot; conf on a scheduled run is ignored.
     module = _load_dag_module(monkeypatch)
-    delayed_start = datetime(2026, 8, 27, 20, 4, tzinfo=timezone.utc)
 
     kwargs = _planner_kwargs(
         module,
         monkeypatch,
         dag_run=SimpleNamespace(run_type=run_type, conf=conf),
         data_interval_end=interval_end,
-        ti=SimpleNamespace(start_date=delayed_start),
     )
 
-    assert kwargs["queue_mode"] == expected_mode
+    assert kwargs["queue_mode"] == "deadline"
 
 
 @pytest.mark.unit
-def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
+def test_plan_task_manual_defaults_to_deadline_and_allows_backlog_override(
     clean_env, monkeypatch
 ):
     module = _load_dag_module(monkeypatch)
@@ -379,7 +387,6 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
         module,
         monkeypatch,
         dag_run=SimpleNamespace(run_type=DagRunType.MANUAL, conf={}),
-        data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
     )
     overridden = _planner_kwargs(
         module,
@@ -387,10 +394,9 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
         dag_run=SimpleNamespace(
             run_type=DagRunType.MANUAL, conf={"queue_mode": "backlog"}
         ),
-        data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
     )
 
-    assert default["queue_mode"] == "fresh"
+    assert default["queue_mode"] == "deadline"
     assert overridden["queue_mode"] == "backlog"
 
 
@@ -404,17 +410,16 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
             "queue_mode",
         ),
         (
-            SimpleNamespace(run_type="scheduled", conf={}),
-            datetime(2026, 8, 27, 11, 30, tzinfo=timezone.utc),
-            "data_interval_end",
+            SimpleNamespace(run_type="manual", conf={"queue_mode": "fresh"}),
+            None,
+            "queue_mode",
         ),
-        (SimpleNamespace(run_type="scheduled", conf={}), None, "data_interval_end"),
-        (SimpleNamespace(run_type="scheduled", conf={}), datetime(2026, 8, 27, 0, 30), "data_interval_end"),
+        (SimpleNamespace(run_type="manual", conf=["backlog"]), None, "mapping"),
         (SimpleNamespace(run_type="unexpected", conf={}), None, "run_type"),
         (SimpleNamespace(conf={}), None, "run_type"),
     ],
 )
-def test_plan_task_fails_closed_for_invalid_mode_or_non_ffb_interval(
+def test_plan_task_fails_closed_for_invalid_mode_or_run_type(
     clean_env, monkeypatch, dag_run, interval_end, message
 ):
     from airflow.exceptions import AirflowException
@@ -452,8 +457,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
 
         def fetchall(self):
             return [
-                ("SS-17", "2627", 12, 1_787_788_800),
-                ("SS-8", 2026, 3, None),
+                ("SS-17", "2627", 12, 1_787_788_800, 5),
+                ("SS-8", 2026, 3, None, 0),
             ]
 
     class _Connection:
@@ -473,8 +478,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     partitions = module._pending_refresh_partitions()
 
     assert partitions == [
-        ("SS-17", "2627", 12, 1_787_788_800),
-        ("SS-8", "2026", 3, None),
+        ("SS-17", "2627", 12, 1_787_788_800, 5),
+        ("SS-8", "2026", 3, None, 0),
     ]
     assert connection.closed is True
     sql = executed[0]
@@ -483,13 +488,20 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     assert "LIKE 'SS-%'" in sql
     assert "status_type = 'finished'" in sql
     assert "capture_complete" in sql
-    normalized_sql = " ".join(sql.upper().split())
+    # #1359: the nearest deadline that has not passed, by the meter's rule.
+    from scrapers.sofascore.match_deadline import match_deadline_sql
+
+    assert match_deadline_sql(
+        "s.start_timestamp", "s.changes_change_timestamp"
+    ) in sql
+    normalized_sql = " ".join(sql.split())
+    assert "SELECT DISTINCT s.league" in normalized_sql
     assert (
-        "MAX(CASE WHEN TRY_CAST(S.START_TIMESTAMP AS BIGINT) BETWEEN 1 AND "
-        "CAST(TO_UNIXTIME(CURRENT_TIMESTAMP + INTERVAL '6' HOUR) AS BIGINT) "
-        "THEN TRY_CAST(S.START_TIMESTAMP AS BIGINT) END) "
-        "AS NEWEST_PENDING_START_TIMESTAMP"
+        "min(CASE WHEN p.deadline >= to_unixtime(current_timestamp) "
+        "THEN CAST(p.deadline AS bigint) END) AS min_open_deadline_ts"
     ) in normalized_sql
+    assert "AS open_deadline_matches" in normalized_sql
+    assert "count(*) AS pending_matches" in normalized_sql
 
 
 def _refresh_env(result_path, scope_key="c:8:825"):
@@ -518,8 +530,8 @@ def test_validate_refresh_scope_checks_provenance_without_marking_completed(
     monkeypatch.setattr(module.state, "mark_completed", _forbidden)
     monkeypatch.setattr(module.state, "clear_failed", _forbidden)
 
-    assert module._validate_refresh_scope(**_refresh_env(result)) == {
-        "status": "refreshed", "scope_key": "c:8:825"
+    assert module._validate_refresh_scope(env=_refresh_env(result)) == {
+        "status": "refreshed", "scope_key": "c:8:825", "elapsed_s": None
     }
 
 
@@ -555,7 +567,7 @@ def test_validate_refresh_scope_fails_closed(
     result.write_text(document)
 
     with pytest.raises(AirflowException, match=message):
-        module._validate_refresh_scope(**_refresh_env(result))
+        module._validate_refresh_scope(env=_refresh_env(result))
 
 
 @pytest.mark.unit
@@ -571,8 +583,8 @@ def test_validate_refresh_scope_accepts_a_snapshot_revised_after_planning(
         ' "tournament_id": 8, "source_season_id": 825}'
     )
 
-    assert module._validate_refresh_scope(**_refresh_env(result)) == {
-        "status": "refreshed", "scope_key": "c:8:825"
+    assert module._validate_refresh_scope(env=_refresh_env(result)) == {
+        "status": "refreshed", "scope_key": "c:8:825", "elapsed_s": None
     }
 
 
@@ -589,7 +601,7 @@ def test_validate_refresh_scope_rejects_other_campaign_actions(
     environment["SOFASCORE_CAMPAIGN_ACTION"] = "capture"
 
     with pytest.raises(AirflowException, match="unknown SofaScore campaign action"):
-        module._validate_refresh_scope(**environment)
+        module._validate_refresh_scope(env=environment)
 
 
 @pytest.mark.unit
@@ -621,7 +633,9 @@ def test_propagate_refresh_status_is_the_single_honest_leaf(
         with pytest.raises(AirflowException, match=", ".join(failed)):
             module._propagate_status(dag_run=dag_run)
     else:
-        assert module._propagate_status(dag_run=dag_run) == {"status": "success"}
+        verdict = module._propagate_status(dag_run=dag_run)
+        assert verdict["status"] == "success"
+        assert verdict["partial"] == 0
 
 
 @pytest.mark.unit
@@ -633,19 +647,14 @@ def test_enrich_season_metadata_task_shape(clean_env, monkeypatch):
     assert enrich._init_kwargs["retries"] == 0
     assert enrich._init_kwargs["execution_timeout"] == module.METADATA_TIMEOUT
     # Astra r1 #2: the enrichment runs inside the same DagRun window as the
-    # sweep and both attempts of every scope (with their retry delay).
-    run = _operators()["run_refresh_scope"]
+    # sweep, the scopes' window and the reserve for their retries (#1358).
     assert (
         module.REFRESH_FETCH_TIMEOUT
-        + module.REFRESH_BATCH_FITS
-        * (
-            module.REFRESH_SCOPE_TIMEOUT * module.REFRESH_SCOPE_ATTEMPTS
-            + run._init_kwargs["retry_delay"]
-        )
+        + module.REFRESH_SCOPE_BUDGET
+        + module.REFRESH_RETRY_RESERVE
         + module.METADATA_TIMEOUT
         <= module.REFRESH_DAGRUN_TIMEOUT
     )
-    assert module.REFRESH_BATCH_FITS >= 1
     assert enrich._init_kwargs["pool"] == "ingest_scraper_pool"
     assert enrich._init_kwargs["priority_weight"] < 5
     # A failed enrichment is a red task, never a red DagRun.
@@ -739,3 +748,81 @@ def test_enrich_season_metadata_zero_seasons_skips(clean_env, monkeypatch, tmp_p
     with pytest.raises(AirflowSkipException):
         module._enrich_season_metadata(run_id="manual__x")
     assert calls == []
+
+
+@pytest.mark.unit
+def test_validate_refresh_scope_accepts_a_partial_scope(
+    clean_env, monkeypatch, tmp_path
+):
+    # #1358: a scope that stopped at its own ceiling is a finished task, and
+    # says what it left for the next run.
+    module = _load_dag_module(monkeypatch)
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps({
+        "status": "partial", "snapshot_id": "s", "campaign_id": "c",
+        "tournament_id": 8, "source_season_id": 825, "elapsed_s": 1_700.0,
+        "remaining_matches": 60, "stop_reason": "time_budget", "bytes": 9_000,
+    }))
+
+    assert module._validate_refresh_scope(
+        env=_refresh_env(result), execution_timeout=timedelta(minutes=30)
+    ) == {
+        "status": "partial", "scope_key": "c:8:825", "elapsed_s": 1_700.0,
+        "remaining_matches": 60, "stop_reason": "time_budget", "bytes": 9_000,
+    }
+
+
+@pytest.mark.unit
+def test_plan_task_maps_each_scope_with_its_own_timeout(clean_env, monkeypatch):
+    module = _load_dag_module(monkeypatch)
+    monkeypatch.setattr(
+        module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
+    )
+    monkeypatch.setattr(module, "_pending_refresh_partitions", lambda: [])
+    monkeypatch.setattr(module, "_configured_tournament_ids", lambda: frozenset())
+    monkeypatch.setattr(
+        module.state, "plan_refresh_batch",
+        lambda *a, **k: [{"SOFASCORE_SCOPE_TIMEOUT_S": "1030", "X": "1"}],
+    )
+
+    monkeypatch.setattr(module.time, "time", lambda: 1_000_000.0)
+
+    items = module._plan_refresh_batch(
+        run_id="manual__1",
+        dag_run=SimpleNamespace(run_type=DagRunType.MANUAL, conf={}),
+    )
+
+    # Every scope, and every retry of it, stops by the batch's own deadline:
+    # plan time + the 2 h window + the 2 h retry reserve.
+    assert items == [{
+        "env": {
+            "SOFASCORE_SCOPE_TIMEOUT_S": "1030",
+            "X": "1",
+            "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": str(1_000_000 + 4 * 3600),
+        },
+        "execution_timeout": timedelta(seconds=1030),
+    }]
+
+
+@pytest.mark.unit
+def test_propagate_reports_partial_scopes_and_window_use(clean_env, monkeypatch):
+    module = _load_dag_module(monkeypatch)
+    dag_run = SimpleNamespace(get_task_instances=lambda: [
+        SimpleNamespace(task_id="run_refresh_scope", state="success"),
+    ])
+    ti = SimpleNamespace(xcom_pull=lambda task_ids: [
+        {"status": "refreshed", "scope_key": "c:1:1", "elapsed_s": 1_800.0},
+        {"status": "partial", "scope_key": "c:2:2", "elapsed_s": 3_600.0,
+         "remaining_matches": 12, "stop_reason": "time_budget"},
+    ])
+
+    verdict = module._propagate_status(dag_run=dag_run, ti=ti)
+
+    assert verdict["status"] == "success"
+    assert verdict["scopes"] == 2
+    assert verdict["partial"] == 1
+    assert verdict["partial_scopes"] == [
+        {"scope_key": "c:2:2", "stop_reason": "time_budget", "remaining_matches": 12}
+    ]
+    assert verdict["window_used_s"] == 5_400.0
+    assert verdict["window_use"] == 0.75

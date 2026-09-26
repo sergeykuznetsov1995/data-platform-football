@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import sys
+import time
 import warnings
 from collections import Counter
 from datetime import datetime, timezone
@@ -883,6 +884,93 @@ def _restamp_trino_queries(path: str) -> None:
         logger.warning("Could not restamp trino_queries in %s: %s", path, e)
 
 
+# #1358: the refresh lane hands a scope its own ceilings in the environment.
+# The runner stops taking allocations this long before the task's timeout, so
+# the final MERGE and the manifest flush still happen inside it.
+SCOPE_STOP_MARGIN_SECONDS = 300
+# An allocation is not interrupted once it runs, so it may start only if it
+# fits even at this multiple of its estimate (Astra #1358, finding 4).
+ALLOCATION_OVERRUN_FACTOR = 2
+
+
+def _scope_capture_limits(environ=None) -> dict:
+    """The refresh scope's ceilings; every one is absent outside that lane."""
+
+    env = os.environ if environ is None else environ
+
+    def _number(name):
+        raw = str(env.get(name, "") or "").strip()
+        return float(raw) if raw else None
+
+    return {
+        "deadline": _number("SOFASCORE_SCOPE_DEADLINE_EPOCH"),
+        "byte_cap": _number("SOFASCORE_SCOPE_BYTE_CAP"),
+        "max_matches": _number("SOFASCORE_SCOPE_MAX_MATCHES"),
+        "seconds_per_match": _number("SOFASCORE_REFRESH_SECONDS_PER_MATCH") or 25.0,
+    }
+
+
+def _capture_stop_reason(limits, spent_bytes, matches, now=None):
+    """Why the next allocation of ``matches`` must not start, or ``None``."""
+
+    byte_cap = limits.get("byte_cap")
+    if byte_cap is not None:
+        # The next allocation is charged at the scope's own bytes per match,
+        # so the cap stops the pass before it, not after it overran.
+        per_match = (
+            byte_cap / limits["max_matches"] if limits.get("max_matches") else 0
+        )
+        if spent_bytes >= byte_cap or spent_bytes + matches * per_match > byte_cap:
+            return "byte_cap"
+    deadline = limits.get("deadline")
+    if deadline is not None:
+        now = time.time() if now is None else now
+        projected = now + ALLOCATION_OVERRUN_FACTOR * matches * float(
+            limits.get("seconds_per_match") or 25.0
+        )
+        if projected > deadline - SCOPE_STOP_MARGIN_SECONDS:
+            return "time_budget"
+    return None
+
+
+def _replay_would_hit(capture_runtime, spec) -> bool:
+    """Whether an offline replay of ``spec`` succeeds (``CaptureEngine.capture``).
+
+    A target outside the scope's signed slice may only be replayed if its
+    saved answer is one the engine accepts offline; anything else (no raw, a
+    403/429/5xx raw) is the next run's (Astra #1358, finding 1).
+    """
+
+    from scrapers.sofascore.manifest import ManifestStatus
+    from scrapers.sofascore.raw_store import RawPayloadNotFound
+
+    if not spec.supported:
+        return True
+    try:
+        _, raw = capture_runtime.raw_store.load_bytes(spec.raw_target)
+    except RawPayloadNotFound:
+        raw = None
+    if raw is not None:
+        return (
+            200 <= raw.http_status < 300
+            or raw.http_status in spec.not_supported_http_statuses
+            or raw.http_status in spec.legitimate_empty_http_statuses
+        )
+    existing = capture_runtime.manifest_store.get(spec.key)
+    return bool(
+        existing is not None
+        and existing.is_terminal
+        and not (existing.raw_content_hash or existing.raw_blob_key)
+        and (
+            existing.status == ManifestStatus.NOT_SUPPORTED
+            or (
+                existing.status == ManifestStatus.LEGITIMATE_EMPTY
+                and existing.http_status in spec.legitimate_empty_http_statuses
+            )
+        )
+    )
+
+
 def _flush_manifest_store(manifest_store) -> None:
     """Force pending batched manifest records into durable Iceberg state."""
     flush = getattr(manifest_store, "flush", None)
@@ -937,6 +1025,12 @@ def _run_match_capture(
         season,
         season_short,
     )
+    started = time.monotonic()
+    scope_limits = _scope_capture_limits()
+    # Matches this pass leaves for the next run (#1358) and why.
+    deferred_targets: set = set()
+    stop_reason = None
+    spent_bytes = 0
 
     logger.info(
         "match_capture: league=%s season=%s (short=%s) limit=%s",
@@ -1210,6 +1304,22 @@ def _run_match_capture(
                             for spec in live_specs
                             if spec.key.target_id in batch_ids
                         ]
+                        if batch_specs and stop_reason is None:
+                            stop_reason = _capture_stop_reason(
+                                scope_limits,
+                                spent_bytes,
+                                len({spec.key.target_id for spec in batch_specs}),
+                            )
+                        if batch_specs and stop_reason is not None:
+                            # #1358: this allocation is the next run's.  Its
+                            # specs leave the pass whole: none of them may be
+                            # replayed as if it had been captured.
+                            deferred_targets.update(
+                                spec.key.target_id for spec in batch_specs
+                            )
+                            for spec in batch_specs:
+                                remaining_specs.pop(spec.key, None)
+                            continue
                         if excluded:
                             batch_specs = apply_endpoint_exclusions(
                                 batch_specs,
@@ -1233,6 +1343,10 @@ def _run_match_capture(
                             )
                             pipeline_results.extend(captured)
                             traffic_parts.append(batch_traffic)
+                            spent_bytes += int(
+                                (batch_traffic or {}).get("paid_proxy_bytes", 0)
+                                or 0
+                            )
                             for spec in batch_specs:
                                 remaining_specs.pop(spec.key, None)
                         if excluded is None and not force_replace:
@@ -1264,6 +1378,28 @@ def _run_match_capture(
                                     f"{league}:{season_short}",
                                     ", ".join(sorted(excluded)),
                                 )
+                    if (
+                        remaining_specs
+                        and scope_limits["max_matches"] is not None
+                        and not force_replace
+                    ):
+                        # #1358: the signed plan was cut to the scope's match
+                        # ceiling.  A target it did not allocate and that an
+                        # offline replay cannot serve is the next run's, not a
+                        # hole.
+                        unreplayable = {
+                            spec.key.target_id
+                            for spec in remaining_specs.values()
+                            if not _replay_would_hit(capture_runtime, spec)
+                        }
+                        if unreplayable:
+                            deferred_targets.update(unreplayable)
+                            stop_reason = stop_reason or "match_cap"
+                            remaining_specs = {
+                                key: spec
+                                for key, spec in remaining_specs.items()
+                                if spec.key.target_id not in unreplayable
+                            }
                     if remaining_specs:
                         if not workload_allocations and not force_replace:
                             # C5: a signed plan with no allocation for this
@@ -1291,6 +1427,33 @@ def _run_match_capture(
                             )
                         )
                     live_traffic = _merge_live_traffic(traffic_parts)
+                if deferred_targets:
+                    match_ids = [
+                        match_id
+                        for match_id in match_ids
+                        if str(match_id) not in deferred_targets
+                    ]
+                    results["partial"] = {
+                        "remaining_matches": len(deferred_targets),
+                        "stop_reason": stop_reason,
+                        "elapsed_s": round(time.monotonic() - started, 1),
+                        "bytes": spent_bytes,
+                    }
+                    logger.warning(
+                        "match_capture stops early (%s): %d matches left for "
+                        "the next run",
+                        stop_reason,
+                        len(deferred_targets),
+                    )
+                    if not pipeline_results:
+                        # Nothing was captured or replayed: no projection to
+                        # commit and no manifest to flush.
+                        results["traffic"] = _logical_capture_traffic(
+                            capture_runtime.engine,
+                            live_traffic,
+                        )
+                        _write_results(output_path, results)
+                        return 0
                 expected = {
                     (str(match_id), endpoint)
                     for match_id in match_ids
@@ -2585,6 +2748,7 @@ def _load_runtime_workload_plan(
     from scrapers.sofascore.workload_runtime import (
         allocations_for_partition,
         load_plan,
+        order_allocations,
     )
 
     plan = load_plan(path)
@@ -2632,6 +2796,9 @@ def _load_runtime_workload_plan(
         canonical_season=canonical_season,
         scope=scope,
     )
+    if scope == "match":
+        # #1359: nearest deadlines first when the plan carries an order.
+        allocations = order_allocations(allocations, path)
     return plan, allocations
 
 

@@ -2060,3 +2060,197 @@ class TestValidatePlayerDataUnderRotation:
 
         with pytest.raises(Exception, match="dropped from the signed player plan"):
             dag_module.validate_player_data(**self._forced_context(states, plan_path))
+
+
+# ---------------------------------------------------------------------------
+# #1359: conf.competition_ids — the 00:20 daily tail runs a subset.
+# ---------------------------------------------------------------------------
+
+def _render(template, dag_module, conf):
+    """Render a bash_command the way Airflow would, with the DAG's macros."""
+
+    import jinja2
+
+    environment = jinja2.Environment()
+    environment.globals.update(
+        dag_module.dag._dag_kwargs["user_defined_macros"]
+    )
+    return environment.from_string(template).render(
+        dag_run=SimpleNamespace(conf=conf),
+        run_id="tail__20260926T002000",
+        params={"season": 2026, "run_players": False},
+        ti=SimpleNamespace(xcom_pull=lambda **_kw: "/tmp/plan.json"),
+    )
+
+
+class TestCompetitionSubset:
+    def _subset(self, dag_module):
+        others = [
+            league for league in dag_module.SOFASCORE_LEAGUES
+            if league != dag_module.PRIMARY_CLUB_LEAGUE
+        ]
+        return [others[0], dag_module.PRIMARY_CLUB_LEAGUE]
+
+    def test_no_conf_means_the_whole_catalog(self, dag_module):
+        assert dag_module._requested_leagues(SimpleNamespace(conf={})) == (
+            dag_module.SOFASCORE_LEAGUES
+        )
+        assert dag_module._requested_leagues(None) == dag_module.SOFASCORE_LEAGUES
+
+    def test_a_subset_keeps_catalog_order(self, dag_module):
+        subset = self._subset(dag_module)
+        leagues = dag_module._requested_leagues(
+            SimpleNamespace(conf={"competition_ids": subset})
+        )
+        assert set(leagues) == set(subset)
+        assert leagues == [
+            league for league in dag_module.SOFASCORE_LEAGUES if league in subset
+        ]
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            (["XXX-Not A League"], "outside the enabled SofaScore catalog"),
+            ([], "non-empty list"),
+            ("ENG-Premier League", "non-empty list"),
+            ([17], "non-empty list"),
+        ],
+    )
+    def test_a_league_outside_the_catalog_fails_the_run(
+        self, dag_module, value, message
+    ):
+        from airflow.exceptions import AirflowException
+
+        if isinstance(value, list) and value and isinstance(value[0], str):
+            value = value + [dag_module.PRIMARY_CLUB_LEAGUE]
+        with pytest.raises(AirflowException, match=message):
+            dag_module._requested_leagues(
+                SimpleNamespace(conf={"competition_ids": value})
+            )
+
+    def test_a_subset_without_the_primary_league_fails(self, dag_module):
+        from airflow.exceptions import AirflowException
+
+        other = self._subset(dag_module)[0]
+        with pytest.raises(AirflowException, match="must include"):
+            dag_module._requested_leagues(
+                SimpleNamespace(conf={"competition_ids": [other]})
+            )
+
+    def test_plans_and_league_tasks_render_only_the_subset(self, dag_module):
+        subset = self._subset(dag_module)
+        conf = {"competition_ids": subset}
+        for task_id in (
+            "prepare_sofascore_season_plan", "prepare_sofascore_target_plan",
+        ):
+            rendered = _render(_bash_task(task_id).bash_command, dag_module, conf)
+            for league in dag_module.SOFASCORE_LEAGUES:
+                assert (f'--competition-season "{league}=' in rendered) is (
+                    league in subset
+                ), (task_id, league)
+            full = _render(_bash_task(task_id).bash_command, dag_module, {})
+            for league in dag_module.SOFASCORE_LEAGUES:
+                assert f'--competition-season "{league}=' in full
+
+        for league in dag_module.SOFASCORE_LEAGUES:
+            for task_id in (
+                dag_module._schedule_task_id(league),
+                dag_module._match_capture_task_id(league),
+                dag_module._player_capture_task_id(league),
+            ):
+                rendered = _render(_bash_task(task_id).bash_command, dag_module, conf)
+                assert ("exit 99" in rendered) is (league not in subset), task_id
+                assert "exit 99" not in _render(
+                    _bash_task(task_id).bash_command, dag_module, {}
+                )
+
+    def test_a_bad_conf_fails_at_render(self, dag_module):
+        import jinja2  # noqa: F401 - rendering needs it
+        from airflow.exceptions import AirflowException
+
+        with pytest.raises(AirflowException, match="outside"):
+            _render(
+                _bash_task("prepare_sofascore_season_plan").bash_command,
+                dag_module,
+                {"competition_ids": ["XXX-Not A League"]},
+            )
+
+    def test_dq_barrier_checks_only_the_subset(self, dag_module, monkeypatch):
+        subset = self._subset(dag_module)
+        monkeypatch.setattr(dag_module, "_load_result", lambda path, _log: {"ok": 1})
+        monkeypatch.setattr(dag_module, "_endpoints_closed", lambda _result: True)
+
+        result = dag_module.run_sofascore_dq(
+            run_id="tail__1",
+            dag_run=SimpleNamespace(conf={"competition_ids": subset}),
+        )
+
+        assert {entry.split(":")[0] for entry in result["checked"]} == set(subset)
+
+    def test_validate_data_demands_only_the_subset_producers(
+        self, dag_module, monkeypatch
+    ):
+        subset = self._subset(dag_module)
+        asked = []
+
+        def _producers(_context, task_ids):
+            asked.extend(task_ids)
+            raise RuntimeError("stop after the producer check")
+
+        monkeypatch.setattr(dag_module, "_require_successful_producers", _producers)
+        with pytest.raises(RuntimeError):
+            dag_module.validate_data(
+                run_id="tail__1",
+                dag_run=SimpleNamespace(conf={"competition_ids": subset}),
+            )
+        assert set(asked) == {
+            task_id
+            for league in subset
+            for task_id in (
+                dag_module._schedule_task_id(league),
+                dag_module._match_capture_task_id(league),
+            )
+        }
+
+    def test_run_players_false_skips_players_even_on_saturday(self, dag_module):
+        assert (
+            dag_module._gate_player_capture(
+                params={"run_players": False},
+                dag_run=SimpleNamespace(
+                    external_trigger=True, conf={"run_players": False}
+                ),
+                logical_date=datetime(2024, 1, 6),
+                data_interval_end=datetime(2024, 1, 6),
+            )
+            is False
+        )
+
+
+class TestSubsetSeasonFreshness:
+    """Astra #1359 finding 2: the tail must not share the daily's day key."""
+
+    def test_a_subset_run_reads_the_season_pages_under_its_own_key(self, dag_module):
+        import jinja2
+
+        environment = jinja2.Environment()
+        environment.globals.update(dag_module.dag._dag_kwargs["user_defined_macros"])
+        subset = [dag_module.PRIMARY_CLUB_LEAGUE]
+
+        def key(task_id, conf, run_id):
+            template = _bash_task(task_id).env["SOFASCORE_SEASON_FRESHNESS_KEY"]
+            return environment.from_string(template).render(
+                dag_run=SimpleNamespace(conf=conf, run_id=run_id)
+            )
+
+        for task_id in (
+            "prepare_sofascore_season_plan",
+            "prepare_sofascore_target_plan",
+            "prepare_sofascore_player_plan",
+        ):
+            # The daily keeps the default ``day-<date>`` key ("" = unset).
+            assert key(task_id, {}, "scheduled__2026-09-25") == ""
+            tail = key(task_id, {"competition_ids": subset}, "tail__20260926T002000")
+            assert tail.startswith("subset-")
+            assert tail != key(
+                task_id, {"competition_ids": subset}, "tail__20260927T002000"
+            )

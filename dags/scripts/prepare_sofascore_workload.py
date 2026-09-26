@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 from scrapers.sofascore import trino_accounting
 from scrapers.sofascore.catalog import SofaScoreCatalog
 from scrapers.sofascore.manifest import preload_manifest_scope
+from scrapers.sofascore.match_deadline import match_deadline_sql
 from scrapers.sofascore.pipeline import (
     EVENT_PATHS,
     PLAYER_PATHS,
@@ -54,6 +55,7 @@ from scrapers.sofascore.workload_runtime import (
     load_plan,
     plan_path_for_run,
     write_plan,
+    write_target_order,
 )
 
 
@@ -270,6 +272,66 @@ def _finished_match_ids(league: str, season: str) -> set[str]:
     )
 
 
+def _finished_match_deadlines(league: str, season: str) -> dict[str, Optional[int]]:
+    """Finished games of the partition with their deadline (#1359).
+
+    The same rows as ``_finished_match_ids`` plus the match's deadline (end +
+    24 h, ``scrapers.sofascore.match_deadline``), so the refresh lane spends
+    its window on the matches that can still make it first.
+    """
+
+    connection = _trino_connect()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT DISTINCT CAST(game_id AS varchar), CAST("
+            + match_deadline_sql()
+            + " AS bigint) FROM iceberg.bronze.sofascore_schedule "
+            "WHERE league = ? AND CAST(season AS varchar) = ? "
+            "AND status_type = 'finished'",
+            (league, season),
+        )
+        deadlines: dict[str, Optional[int]] = {}
+        for row in cursor.fetchall():
+            if not row or row[0] is None:
+                continue
+            deadline = int(row[1]) if row[1] is not None else None
+            previous = deadlines.get(str(row[0]))
+            if previous is None or (deadline is not None and deadline < previous):
+                deadlines[str(row[0])] = deadline
+        return deadlines
+    except Exception as exc:
+        if _missing_table(exc):
+            return {}
+        raise RuntimeError(
+            f"workload probe failed on bronze.sofascore_schedule: {exc}"
+        ) from exc
+    finally:
+        connection.close()
+
+
+def _deadline_order(
+    pending: Sequence[str],
+    deadlines: dict[str, Optional[int]],
+    now: float,
+    debt_only: bool = False,
+) -> tuple[str, ...]:
+    """Open deadlines first, nearest first; then the rest in their own order.
+
+    ``debt_only`` is the debt scope of a season whose open matches run in a
+    scope of their own earlier in the batch (#1358/#1359): it keeps the rest.
+    """
+
+    open_ids = [
+        match_id for match_id in pending
+        if deadlines.get(match_id) is not None and deadlines[match_id] >= now
+    ]
+    open_ids.sort(key=lambda match_id: (deadlines[match_id], int(match_id)))
+    chosen = set(open_ids)
+    rest = tuple(match_id for match_id in pending if match_id not in chosen)
+    return rest if debt_only else tuple(open_ids) + rest
+
+
 def _observed_player_ids(league: str, season: str) -> set[str]:
     """Read the match-derived Bronze universe, never an older universe snapshot.
 
@@ -308,6 +370,32 @@ def _pending_targets(runtime, ids: Iterable[str], build_specs) -> tuple[str, ...
         if any(_needs_network(runtime, spec) for spec in build_specs(target_id)):
             pending.append(target_id)
     return tuple(pending)
+
+
+def _scope_max_matches() -> Optional[int]:
+    """#1358: the refresh lane's per-scope match ceiling, or ``None``."""
+
+    if not os.environ.get("SOFASCORE_SCOPE_MAX_MATCHES", "").strip():
+        return None
+    return _positive_env_int("SOFASCORE_SCOPE_MAX_MATCHES", 1)
+
+
+def _cap_pending_matches(pending: Sequence[str], limit: Optional[int]) -> tuple[str, ...]:
+    """Keep the first ``limit`` pending matches; the rest wait for the next run.
+
+    The order of ``pending`` is the order the scope should spend its window
+    in; the runner reports the cut-off matches as ``remaining_matches``.
+    """
+
+    pending = tuple(pending)
+    if limit is None or len(pending) <= limit:
+        return pending
+    print(
+        f"SofaScore targets plan keeps {limit} of {len(pending)} pending "
+        "matches (SOFASCORE_SCOPE_MAX_MATCHES); the rest waits for the next run",
+        file=sys.stderr,
+    )
+    return pending[:limit]
 
 
 def _season_freshness_key() -> str:
@@ -391,6 +479,7 @@ def prepare_workload_plan(
                 "existing immutable workload plan has different provenance"
             )
         return destination
+    target_order: list[str] = []
     runtime = build_capture_runtime(
         run_id=phase_run_id,
         task_id=f"prepare-{phase}",
@@ -558,7 +647,15 @@ def prepare_workload_plan(
                 )
             )
             continue
-        matches = _finished_match_ids(item.league, canonical)
+        # #1358/#1359: a refresh scope with a match ceiling spends its window
+        # by deadline, so it reads the deadlines along with the ids.
+        scope_cap = _scope_max_matches() if phase == "targets" else None
+        deadlines: dict[str, Optional[int]] = {}
+        if scope_cap is not None:
+            deadlines = _finished_match_deadlines(item.league, canonical)
+            matches = set(deadlines)
+        else:
+            matches = _finished_match_ids(item.league, canonical)
         def event_specs(target_id: str):
             return tuple(
                 build_event_spec(
@@ -574,6 +671,17 @@ def prepare_workload_plan(
 
         pending_matches = _pending_targets(runtime, matches, event_specs)
         if phase == "targets":
+            if scope_cap is not None:
+                pending_matches = _cap_pending_matches(
+                    _deadline_order(
+                        pending_matches,
+                        deadlines,
+                        datetime.now(timezone.utc).timestamp(),
+                        os.environ.get("SOFASCORE_SCOPE_DEBT_ONLY", "").strip() == "1",
+                    ),
+                    scope_cap,
+                )
+                target_order.extend(pending_matches)
             # This snapshot is intentionally match-only.  Player evidence is
             # not stable until every match allocation has committed Bronze.
             workloads.append(
@@ -642,7 +750,11 @@ def prepare_workload_plan(
         freshness_keys=freshness_keys,
         partitions=workloads,
     )
-    return write_plan(destination, plan)
+    written = write_plan(destination, plan)
+    # #1359: the signed plan groups targets by id; the runner takes the
+    # deadline order from beside it (``order_allocations``).
+    write_target_order(written, target_order)
+    return written
 
 
 def main(argv=None) -> int:

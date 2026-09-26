@@ -11,6 +11,7 @@ on:
       - "dags/dag_backfill_sofascore_all_mens.py"
       - "dags/dag_refresh_sofascore_all_mens.py"
       - "dags/dag_trigger_sofascore_daily.py"
+      - "dags/dag_trigger_sofascore_daily_tail.py"
       - "dags/dag_sofascore_manifest_maintenance.py"
       - "dags/.airflowignore"
       - "dags/utils/sofascore_all_mens_state.py"
@@ -81,6 +82,7 @@ jobs:
             dags/dag_backfill_sofascore_all_mens.py \
             dags/dag_refresh_sofascore_all_mens.py \
             dags/dag_trigger_sofascore_daily.py \
+            dags/dag_trigger_sofascore_daily_tail.py \
             dags/dag_sofascore_manifest_maintenance.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_sofascore_pipeline.py \
@@ -102,7 +104,8 @@ jobs:
             scrapers/sofascore dags/scripts dags/utils scripts/proxy_filter \
             dags/dag_ingest_sofascore.py \
             dags/dag_sofascore_pipeline.py \
-            dags/dag_trigger_sofascore_daily.py dags/dag_sofascore_manifest_maintenance.py \
+            dags/dag_trigger_sofascore_daily.py dags/dag_trigger_sofascore_daily_tail.py \
+            dags/dag_sofascore_manifest_maintenance.py \
             scripts/migrate_sofascore_production.py
           python -m py_compile \
             dags/dag_iceberg_maintenance.py \

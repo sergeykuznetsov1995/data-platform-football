@@ -96,10 +96,9 @@ x-ss-airflow-common: &ss-airflow-common
     # Какой релиз в бою (#1351): карантин скоупа кампании привязан к sha8
     # релиза и сам снимается на следующем (одна попытка).
     SOFASCORE_RELEASE_ROOT: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}
-    # Батч полосы актуалки урезан с дефолтных 8 до 3: при max_active_tasks=1 и
-    # execution_timeout=2h на скоуп восемь скоупов не влезают в dagrun_timeout=5h
-    # (находка code-review 25.08). Вернуть к 8 после замера реальной длительности скоупа.
-    SOFASCORE_REFRESH_BATCH_SIZE: ${SOFASCORE_REFRESH_BATCH_SIZE:-3}
+    # #1358: только верхняя граница числа скоупов; сколько их реально идёт, решает
+    # окно 2 ч по оценкам скоупов (plan_refresh_batch), упор в границу пишется в лог.
+    SOFASCORE_REFRESH_BATCH_SIZE: ${SOFASCORE_REFRESH_BATCH_SIZE:-64}
     # Метаданные сезонов (#1354): задача enrich_season_metadata актуалки
     # проверяет столько pending-сезонов снапшота за прогон (0 — выключить).
     SOFASCORE_METADATA_SEASONS_PER_RUN: ${SOFASCORE_METADATA_SEASONS_PER_RUN:-170}

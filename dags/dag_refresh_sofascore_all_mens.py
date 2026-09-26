@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
+from scrapers.sofascore.match_deadline import match_deadline_sql
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils import sofascore_all_mens_state as state
 
@@ -56,36 +58,49 @@ RESULT_DIR = (
 # batch runs SERIALLY on one pool slot (``max_active_tasks`` is 1).
 REFRESH_DAGRUN_TIMEOUT = timedelta(hours=7)
 REFRESH_FETCH_TIMEOUT = timedelta(minutes=150)
-REFRESH_SCOPE_TIMEOUT = timedelta(hours=2)
+# Ceiling of one scope task; its real timeout is its own estimate x 1.5.
+REFRESH_SCOPE_TIMEOUT = timedelta(seconds=state.REFRESH_MAX_SCOPE_TIMEOUT_SECONDS)
 # Season metadata enrichment (#1354) runs after the scopes inside the same
 # window: 170 seasons plus their tournaments' identity checks are <= 340
 # requests, ~17 min at the lane's 20/min.
 METADATA_TIMEOUT = timedelta(minutes=25)
-# Whatever the campaign-wide default (8) or an operator's override says, the
-# batch is capped by what actually fits: sweep + batch * scope * attempts <=
-# DagRun.  A batch of 8 would need 18 h in a 7 h window and the run would be
-# killed halfway through, losing the scopes it was in the middle of (Sol round
-# 5, finding 8).  With the sweep at 2.5 h and a scope at 2 h x 2 attempts the
-# honest answer is ONE scope per run — three a day.  The lane's job is the
-# schedule sweep; the bulk of the match phase belongs to the campaign DAG,
-# which has the whole day for it.
-# A scope may be attempted twice (``retries=1`` below, which the workload plan
-# supports on purpose — the retry resumes on the remainder of its allocation),
-# so the window has to hold both attempts.  Counting one attempt per scope made
-# the "fits" arithmetic decorative: 2.5 h + 2 x 2 h looked like 6.5 h of a 7 h
-# window, while a single retried scope already ran to 8.5 h and the DagRun
-# timeout killed the batch mid-scope — the very thing the cap exists to prevent
-# (Sol round 12, finding 2).
-REFRESH_SCOPE_ATTEMPTS = 2
-REFRESH_BATCH_FITS = int(
-    (REFRESH_DAGRUN_TIMEOUT - REFRESH_FETCH_TIMEOUT - METADATA_TIMEOUT)
-    / (REFRESH_SCOPE_TIMEOUT * REFRESH_SCOPE_ATTEMPTS)
+# #1358: the scopes of one run share ONE window instead of each being sized
+# for the worst case of the slowest one.  The old arithmetic (sweep + batch x
+# 2 h x 2 attempts <= DagRun) admitted exactly one scope a run, while a scope
+# really takes 10-60 min — most of the window went unused, and the backlog run
+# still turned red on a scope that could not finish in 2 h.  Now the scopes
+# share REFRESH_SCOPE_BUDGET by their own estimates (pending matches x
+# SECONDS_PER_MATCH + warm-up, ``state.plan_refresh_batch``), every task gets
+# a timeout from its own estimate, and a scope that hits its time or byte
+# ceiling stops taking allocations and ends ``partial`` — the rest of it is
+# the next run's.  The other half of the old window is the reserve for the
+# retries (``retries=1`` below: the workload plan supports a resumed retry).
+REFRESH_SCOPE_BUDGET = timedelta(hours=2)
+REFRESH_RETRY_RESERVE = timedelta(hours=2)
+if (
+    REFRESH_FETCH_TIMEOUT
+    + REFRESH_SCOPE_BUDGET
+    + REFRESH_RETRY_RESERVE
+    + METADATA_TIMEOUT
+    > REFRESH_DAGRUN_TIMEOUT
+):
+    raise AirflowException(
+        "refresh window does not fit the DagRun: sweep + scope budget + "
+        "retry reserve + metadata > dagrun_timeout"
+    )
+# Pace of the match phase, measured 20-25.09 (SS-10240: 790 requests in
+# 59 min; SS-13470: 450 in 38 min) -> ~24 s a match; an env override retunes
+# the estimate without a release.
+REFRESH_SECONDS_PER_MATCH = state.env_int(
+    "SOFASCORE_REFRESH_SECONDS_PER_MATCH",
+    state.DEFAULT_REFRESH_SECONDS_PER_MATCH,
+    1,
+    600,
 )
-REFRESH_BATCH_SIZE = min(
-    state.env_int(
-        "SOFASCORE_REFRESH_BATCH_SIZE", state.DEFAULT_REFRESH_BATCH_SIZE, 1, 64
-    ),
-    REFRESH_BATCH_FITS,
+# Only an upper bound on the NUMBER of scopes now; the window decides how many
+# actually go.  A cut by this bound is logged by the planner.
+REFRESH_BATCH_SIZE = state.env_int(
+    "SOFASCORE_REFRESH_BATCH_SIZE", state.DEFAULT_REFRESH_BATCH_SIZE, 1, 64
 )
 REFRESH_POOL = (
     os.environ.get("SOFASCORE_REFRESH_POOL", "").strip() or INGEST_SCRAPER_POOL
@@ -93,21 +108,27 @@ REFRESH_POOL = (
 REFRESH_MAX_ACTIVE_TASKS = state.env_int(
     "SOFASCORE_REFRESH_MAX_ACTIVE_TASKS", 1, 1, 16
 )
-# One season page is ~20-27 KB on the campaign's own accounting, plus ~75-80 KB
-# per lease for the browser warm-up; the gateway meters them per DagRun.  The
-# knobs below admit 150 * 3 + 200 * (3 + 1) + 40 * (12 + 3 + 2) = 1930 pages
-# ~ 50 MB with warm-ups when every tail visit has to chase, every stale and
-# seeded season takes its fixture page and every resumed chain steps back —
-# ~95 minutes at the gateway's pace, inside both this cap and the fetch timeout.
-# The run computes that worst case itself and refuses to start when an override
-# pushes it over the cap (Sol round 6, finding 5).
-REFRESH_DISCOVERY_BUDGET_BYTES = state.env_int(
-    "SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", 64 * 1024 * 1024, 1, 1024 ** 3
+# #1358: the sweep is sized by PAGES, not by fixed class caps.  Its budget is
+# what the fetch window holds at the lane's pace with a 20 % margin:
+# 150 min x 20 requests/min x 0.8 = 2 400 pages.  The ``due`` class takes its
+# share first, then the seed slice, then ``stale`` from what is left — stale
+# shrinks instead of blocking the start.  The byte cap of the run is derived
+# from the planned pages by ``worst_case_bytes`` (page size + lease warm-ups);
+# a non-zero ``SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES`` is an operator
+# override, and the run refuses a plan that does not fit it (Sol round 6,
+# finding 5).
+REFRESH_PAGES_PER_MINUTE = 20
+REFRESH_PAGE_BUDGET = int(
+    REFRESH_FETCH_TIMEOUT.total_seconds() / 60 * REFRESH_PAGES_PER_MINUTE * 0.8
 )
-# Seasons playing in the window get their tail pages on every run — up to this
-# many; beyond the cap the class rotates on its cursor like the others.  That
-# is what keeps the "match finished -> row in Bronze" lag inside the interval.
-REFRESH_MAX_DUE = state.env_int("SOFASCORE_REFRESH_MAX_DUE", 150, 1, 4096)
+REFRESH_DISCOVERY_BUDGET_BYTES = state.env_int(
+    "SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", 0, 0, 1024 ** 3
+)
+# Seasons playing in the window get their tail pages on every run — all of
+# them: the class limit is the number of due seasons of the run, bounded by
+# the page budget.  This env value is only an emergency upper bound.  That is
+# what keeps the "match finished -> row in Bronze" lag inside the interval.
+REFRESH_MAX_DUE = state.env_int("SOFASCORE_REFRESH_MAX_DUE", 4096, 1, 4096)
 # Known seasons outside the window get their tail page a slice at a time: a
 # league playing once a week is outside it most of the time, and nothing else
 # would ever ask for its next round.  Three runs a day take the slice around
@@ -159,28 +180,35 @@ REFRESH_TASK_IDS = frozenset({
 # Finished games of campaign partitions that have no complete capture yet,
 # per partition.  ``season`` is CAST on both sides because the
 # schedule stores it as the source ships it while the status table is text.
+# #1359: per season also the nearest deadline that has NOT passed yet (end of
+# the match + 24 h, the rule of the milestone-1 meter, ``match_deadline``) and
+# how many pending matches still have an open deadline.
 PENDING_PARTITIONS_SQL = """
-SELECT s.league, CAST(s.season AS varchar) AS season,
-       count(DISTINCT s.game_id) AS pending_matches,
-       MAX(CASE
-           WHEN TRY_CAST(s.start_timestamp AS bigint) BETWEEN 1
-                AND CAST(to_unixtime(current_timestamp + INTERVAL '6' HOUR) AS bigint)
-           THEN TRY_CAST(s.start_timestamp AS bigint)
-       END) AS newest_pending_start_timestamp
-FROM iceberg.bronze.sofascore_schedule s
-LEFT JOIN iceberg.bronze.sofascore_match_capture_status c
-  ON c.league = s.league
- AND CAST(c.season AS varchar) = CAST(s.season AS varchar)
- AND c.match_id = CAST(s.game_id AS varchar)
- AND c.capture_complete = true
-WHERE s.league LIKE 'SS-%'
-  AND s.status_type = 'finished'
-  AND c.match_id IS NULL
+SELECT p.league, p.season,
+       count(*) AS pending_matches,
+       min(CASE WHEN p.deadline >= to_unixtime(current_timestamp)
+                THEN CAST(p.deadline AS bigint) END) AS min_open_deadline_ts,
+       count_if(p.deadline >= to_unixtime(current_timestamp))
+           AS open_deadline_matches
+FROM (
+    SELECT DISTINCT s.league, CAST(s.season AS varchar) AS season, s.game_id,
+           """ + match_deadline_sql("s.start_timestamp", "s.changes_change_timestamp") + """
+               AS deadline
+    FROM iceberg.bronze.sofascore_schedule s
+    LEFT JOIN iceberg.bronze.sofascore_match_capture_status c
+      ON c.league = s.league
+     AND CAST(c.season AS varchar) = CAST(s.season AS varchar)
+     AND c.match_id = CAST(s.game_id AS varchar)
+     AND c.capture_complete = true
+    WHERE s.league LIKE 'SS-%'
+      AND s.status_type = 'finished'
+      AND c.match_id IS NULL
+) p
 GROUP BY 1, 2
 """
 
 
-def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None]]:
+def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int]]:
     """Query at task runtime; no Trino client is touched at DAG parse."""
 
     from utils.silver_tasks import _get_trino_connection
@@ -194,9 +222,10 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None]]:
                 str(league),
                 str(season),
                 int(count),
-                int(timestamp) if timestamp is not None else None,
+                int(deadline) if deadline is not None else None,
+                int(open_matches or 0),
             )
-            for league, season, count, timestamp in cursor.fetchall()
+            for league, season, count, deadline, open_matches in cursor.fetchall()
         ]
     finally:
         conn.close()
@@ -221,20 +250,17 @@ def _dag_run_type_name(dag_run: Any) -> str:
 
 
 def _refresh_queue_mode(context: dict[str, Any]) -> str:
-    """Resolve F,F,B for scheduled/backfill runs and manual explicit intent."""
+    """One queue for every slot (#1359); a manual run may ask for the debt only.
+
+    Scheduled 00:30, 08:30 and 15:30 runs all plan by deadline: open deadlines
+    first, the debt fills the rest of the window.  ``conf.queue_mode=backlog``
+    on a manual run plans the debt tier alone.
+    """
 
     dag_run = context.get("dag_run")
     run_type = _dag_run_type_name(dag_run)
     if run_type in {"scheduled", "backfill"}:
-        interval_end = context.get("data_interval_end")
-        if not isinstance(interval_end, datetime) or interval_end.tzinfo is None:
-            raise AirflowException("data_interval_end must be an aware datetime")
-        interval_end = interval_end.astimezone(timezone.utc)
-        modes = {(0, 30): "fresh", (8, 30): "fresh", (15, 30): "backlog"}
-        try:
-            return modes[(interval_end.hour, interval_end.minute)]
-        except KeyError as exc:
-            raise AirflowException("data_interval_end is not an F,F,B slot") from exc
+        return "deadline"
     if run_type != "manual":
         raise AirflowException(f"unsupported refresh run_type: {run_type!r}")
     conf = getattr(dag_run, "conf", {}) or {}
@@ -242,16 +268,18 @@ def _refresh_queue_mode(context: dict[str, Any]) -> str:
         raise AirflowException(
             "manual DagRun queue_mode configuration must be a mapping"
         )
-    queue_mode = conf.get("queue_mode", "fresh")
-    if queue_mode not in {"fresh", "backlog"}:
-        raise AirflowException("queue_mode must be 'fresh' or 'backlog'")
+    queue_mode = conf.get("queue_mode", "deadline")
+    if queue_mode not in state.REFRESH_QUEUE_MODES:
+        raise AirflowException(
+            "queue_mode must be one of " + ", ".join(sorted(state.REFRESH_QUEUE_MODES))
+        )
     return queue_mode
 
 
-def _plan_refresh_batch(**context: Any) -> list[dict[str, str]]:
+def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
     queue_mode = _refresh_queue_mode(context)
     snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
-    return state.plan_refresh_batch(
+    planned = state.plan_refresh_batch(
         snapshot,
         _pending_refresh_partitions(),
         batch_size=REFRESH_BATCH_SIZE,
@@ -263,16 +291,44 @@ def _plan_refresh_batch(**context: Any) -> list[dict[str, str]]:
         workload_artifact=WORKLOAD_ARTIFACT,
         dag_run_id=str(context.get("run_id") or "manual"),
         task_env=REFRESH_TASK_ENV,
+        scope_budget_s=int(REFRESH_SCOPE_BUDGET.total_seconds()),
+        seconds_per_match=REFRESH_SECONDS_PER_MATCH,
     )
+    # The whole batch, retries included, must stop inside the window plus its
+    # retry reserve: each task's own timeout restarts on a retry, so the scope
+    # cycle stops at whichever deadline comes first (Astra #1358, finding 3).
+    window_deadline = int(
+        time.time()
+        + (REFRESH_SCOPE_BUDGET + REFRESH_RETRY_RESERVE).total_seconds()
+    )
+    for env in planned:
+        env["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"] = str(window_deadline)
+    # One mapped task per scope, each with the timeout of its OWN estimate
+    # (``expand_kwargs`` below): the timeout is part of the mapped kwargs.
+    return [
+        {
+            "env": env,
+            "execution_timeout": timedelta(
+                seconds=int(env["SOFASCORE_SCOPE_TIMEOUT_S"])
+            ),
+        }
+        for env in planned
+    ]
 
 
-def _validate_refresh_scope(**environment: str) -> dict[str, Any]:
+def _validate_refresh_scope(
+    env: dict[str, str], execution_timeout: Any = None
+) -> dict[str, Any]:
+    environment = env
     result_path = Path(environment["SOFASCORE_SCOPE_RESULT_PATH"])
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AirflowException(f"scope result is unreadable: {exc}") from exc
-    if result.get("status") != "success":
+    status = result.get("status")
+    # #1358: ``partial`` is a scope that stopped at its own time/byte/match
+    # ceiling with the rest left for the next run — a finished task, not red.
+    if status not in {"success", "partial"}:
         raise AirflowException("scope cycle did not finish successfully")
     if environment.get("SOFASCORE_CAMPAIGN_ACTION") != "refresh":
         raise AirflowException("unknown SofaScore campaign action")
@@ -290,7 +346,15 @@ def _validate_refresh_scope(**environment: str) -> dict[str, Any]:
         raise AirflowException("scope result provenance mismatch")
     # A refreshed scope is never "completed": the next DagRun re-plans it
     # from Bronze evidence as new games finish.
-    return {"status": "refreshed", "scope_key": environment["SOFASCORE_SCOPE_KEY"]}
+    outcome: dict[str, Any] = {
+        "status": "partial" if status == "partial" else "refreshed",
+        "scope_key": environment["SOFASCORE_SCOPE_KEY"],
+        "elapsed_s": result.get("elapsed_s"),
+    }
+    if status == "partial":
+        for field in ("remaining_matches", "stop_reason", "bytes"):
+            outcome[field] = result.get(field)
+    return outcome
 
 
 def _enrich_season_metadata(**context: Any) -> dict[str, Any]:
@@ -360,11 +424,50 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
             continue
         if _task_state(task_instance) in {"failed", "upstream_failed"}:
             failures.append(task_instance.task_id)
+    summary = _window_summary(context)
+    print(f"SofaScore refresh window: {json.dumps(summary, sort_keys=True)}")
     if failures:
         raise AirflowException(
             "SofaScore refresh attempt failed: " + ", ".join(sorted(failures))
         )
-    return {"status": "success"}
+    return {"status": "success", **summary}
+
+
+def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
+    """#1358: how many scopes ended partial and how much of the window went."""
+
+    outcomes: list[Any] = []
+    ti = context.get("ti")
+    if ti is not None:
+        try:
+            pulled = ti.xcom_pull(task_ids="validate_refresh_scope")
+        except Exception as exc:  # the verdict above must not hinge on it
+            print(f"refresh window summary unavailable: {exc}")
+            pulled = None
+        if isinstance(pulled, dict):
+            outcomes = [pulled]
+        elif pulled is not None:
+            outcomes = [item for item in pulled if isinstance(item, dict)]
+    used = sum(
+        float(item.get("elapsed_s") or 0)
+        for item in outcomes
+    )
+    budget = REFRESH_SCOPE_BUDGET.total_seconds()
+    return {
+        "scopes": len(outcomes),
+        "partial": sum(1 for item in outcomes if item.get("status") == "partial"),
+        "partial_scopes": [
+            {
+                key: item.get(key)
+                for key in ("scope_key", "stop_reason", "remaining_matches")
+            }
+            for item in outcomes
+            if item.get("status") == "partial"
+        ],
+        "window_used_s": round(used, 1),
+        "window_budget_s": budget,
+        "window_use": round(used / budget, 3),
+    }
 
 
 FETCH_COMMAND = """
@@ -374,6 +477,7 @@ cd /opt/airflow
   dags/scripts/run_sofascore_schedule_refresh.py \
   --snapshot "${SOFASCORE_CAMPAIGN_SNAPSHOT}" \
   --budget-cap-bytes "${SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES}" \
+  --page-budget "${SOFASCORE_REFRESH_PAGE_BUDGET}" \
   --max-due "${SOFASCORE_REFRESH_MAX_DUE}" \
   --max-stale "${SOFASCORE_REFRESH_MAX_STALE}" \
   --chase-pages "${SOFASCORE_REFRESH_CHASE_PAGES}" \
@@ -438,6 +542,7 @@ with DAG(
                 REFRESH_DISCOVERY_BUDGET_BYTES
             ),
             "SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES": str(REFRESH_PER_LEASE_MAX_BYTES),
+            "SOFASCORE_REFRESH_PAGE_BUDGET": str(REFRESH_PAGE_BUDGET),
             "SOFASCORE_REFRESH_MAX_DUE": str(REFRESH_MAX_DUE),
             "SOFASCORE_REFRESH_MAX_STALE": str(REFRESH_MAX_STALE),
             "SOFASCORE_REFRESH_CHASE_PAGES": str(REFRESH_CHASE_PAGES),
@@ -459,11 +564,10 @@ with DAG(
         # own unfinished chains as it finishes, so the next scheduled run picks
         # up exactly where this one stopped, 8 h later at worst.
         retries=0,
-        # Worst case is max_due * chase_pages + max_stale * (chase_pages + 1)
-        # + max_seed * (seed_pages + backtrack + overlap + 1) = 450 + 800 + 680 = 1930
-        # requests (the fixture page of every stale and seeded season and the
-        # step-back allowance count too); at the lane's 20/min that is ~95 min,
-        # so the task window clears it with room for the source being slow.
+        # The class slices are cut to REFRESH_PAGE_BUDGET worst-case pages
+        # (the fixture page of every stale and seeded season and the step-back
+        # allowance count too): at the lane's 20/min that is 80 % of this
+        # window, the rest is room for the source being slow (#1358).
         execution_timeout=REFRESH_FETCH_TIMEOUT,
     )
     plan = PythonOperator(
@@ -485,8 +589,10 @@ with DAG(
         # plan and a latched lease is re-claimed after the reaper grace.
         retries=1,
         retry_delay=timedelta(minutes=2),
-        execution_timeout=REFRESH_SCOPE_TIMEOUT,
-    ).expand(env=plan.output)
+        # ``execution_timeout`` comes from each item of the plan (#1358):
+        # the scope's own estimate x 1.5, at most REFRESH_SCOPE_TIMEOUT.
+        # ``strict=False`` lets the mapped value replace the default_args one.
+    ).expand_kwargs(plan.output, strict=False)
     validate = PythonOperator.partial(
         task_id="validate_refresh_scope",
         python_callable=_validate_refresh_scope,

@@ -208,6 +208,59 @@ def target_ids(allocation: WorkloadAllocation) -> tuple[str, ...]:
     return tuple(parse_qualified_work_unit(unit)[1] for unit in allocation.units)
 
 
+# #1359: the run order of a plan's targets, next to the plan.  It is not
+# signed and does not need to be: it can only reorder the signed allocations
+# (never add or drop one), so the matches with the nearest deadline run first
+# even though the signed plan groups targets by id.
+TARGET_ORDER_SUFFIX = ".order.json"
+
+
+def target_order_path(plan_path: os.PathLike[str] | str) -> Path:
+    path = Path(plan_path)
+    return path.with_name(path.name + TARGET_ORDER_SUFFIX)
+
+
+def write_target_order(
+    plan_path: os.PathLike[str] | str, order: Sequence[str]
+) -> Optional[Path]:
+    """Write the order beside a new plan; no order removes a stale file."""
+
+    path = target_order_path(plan_path)
+    if not order:
+        path.unlink(missing_ok=True)
+        return None
+    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    temporary.write_text(
+        json.dumps({"target_order": [str(item) for item in order]}) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    return path
+
+
+def order_allocations(
+    allocations: Sequence[WorkloadAllocation],
+    plan_path: os.PathLike[str] | str,
+) -> tuple[WorkloadAllocation, ...]:
+    """Allocations holding the earliest targets of the order file first."""
+
+    path = target_order_path(plan_path)
+    if not allocations or not path.exists():
+        return tuple(allocations)
+    order = json.loads(path.read_text(encoding="utf-8"))["target_order"]
+    rank = {str(target): index for index, target in enumerate(order)}
+
+    def first(allocation: WorkloadAllocation) -> int:
+        return min(
+            (rank.get(target, len(rank)) for target in target_ids(allocation)),
+            default=len(rank),
+        )
+
+    return tuple(
+        sorted(allocations, key=lambda item: (first(item), item.batch_index))
+    )
+
+
 def plan_path_for_run(
     dag_id: str,
     run_id: str,
