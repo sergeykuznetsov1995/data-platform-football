@@ -341,7 +341,8 @@ ESPN иногда дописывает матч позже (составы/су�
 
 Хост-копия `/root/espn-deploy/auto_deliver.py` (= master, иначе «обнови автомат» в Telegram и
 стоп), cron `*/5`, лог — `/root/watchdog/espn_auto_deliver_cron.log`. Каталог проекта compose —
-`/root/espn-deploy` (метка `working_dir` не держит дерево кода). Состояние
+`/root/espn-deploy` (метка `working_dir` не держит дерево кода). Посеян 26.09.2026 (master e2f5ba59).
+Состояние
 `/root/espn-deploy/state/`:
 
 | Файл | Смысл |
