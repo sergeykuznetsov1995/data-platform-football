@@ -117,6 +117,8 @@ class WaveTrino(FakeTrino):
         self.fail_slug = fail_slug
         self.fail_table = fail_table
         self.queries: list[str] = []
+        # ``(slug, season_year, event_id, kind)`` rows of the recheck journal.
+        self.rechecks: list[tuple[str, int, int, str]] = []
 
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         if (
@@ -132,6 +134,9 @@ class WaveTrino(FakeTrino):
 
     def execute_query(self, sql, params=None):
         self.queries.append(sql)
+        if "espn_recheck_v1" in sql:
+            slug, year = params
+            return [[e, k] for s_, y, e, k in self.rechecks if (s_, y) == (slug, year)]
         columns = wave._MATCH_COLUMNS
         if "bool_and(terminal)" in sql:
             groups: dict[tuple[str, int], bool] = {}
