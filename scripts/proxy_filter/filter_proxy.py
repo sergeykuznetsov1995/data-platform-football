@@ -87,7 +87,7 @@ import ssl
 import stat
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -433,6 +433,19 @@ class _DeadExitResponse(RuntimeError):
 
     Nothing is left in transport read-ahead, so the lease may fail over to a
     fresh exit instead of latching accounting uncertainty.
+    """
+
+    def __init__(self, code: int | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _ProviderConnectRejected(RuntimeError):
+    """Transfermarkt: the provider refused CONNECT before any tunnel existed.
+
+    Its whole rejection response was metered (EOF or an exact
+    Content-Length), so no provider byte can hide in transport read-ahead:
+    this is a counted provider refusal, not accounting uncertainty (#1388).
     """
 
     def __init__(self, code: int | None = None) -> None:
@@ -1036,6 +1049,9 @@ class Lease:
     provider_reserved_bytes: int = field(default=0, repr=False)
     pending_client_hellos: int = field(default=0, repr=False)
     upstream_repins: int = 0
+    # Transfermarkt CONNECTs the provider refused with a fully metered
+    # response: counted, never latched as uncertainty (#1388).
+    provider_rejected_connects: int = 0
     closed: bool = False
     close_recorded: bool = False
     budget_exceeded: bool = False
@@ -1099,6 +1115,7 @@ class Lease:
             "reserved_bytes": self.reserved_bytes,
             "global_budget_escrow_bytes": self.global_budget_escrow_bytes,
             "upstream_repins": self.upstream_repins,
+            "provider_rejected_connects": self.provider_rejected_connects,
             "closed": self.closed,
             "expired": self.expired,
             "budget_exceeded": self.budget_exceeded,
@@ -5711,6 +5728,7 @@ def _transfermarkt_only_health_report(mgr) -> dict[str, Any]:
         ),
         "transfermarkt_backfill_dag_ids": sorted(TRANSFERMARKT_BACKFILL_DAG_IDS),
         "transfermarkt_backfill_uses_production_daily_budget": False,
+        "provider_rejected_connects": dict(PROVIDER_REJECTED_CONNECTS),
         **_transfermarkt_permit_health(),
         "source_mode": SOURCE_MODE,
     }
@@ -5766,6 +5784,7 @@ def _service_health_report(mgr) -> dict[str, Any]:
         ),
         "transfermarkt_backfill_budget_namespace": ("transfermarkt_backfill_dagrun"),
         "transfermarkt_backfill_uses_production_daily_budget": False,
+        "provider_rejected_connects": dict(PROVIDER_REJECTED_CONNECTS),
         **_transfermarkt_permit_health(),
         "whoscored_default_paid_cap_bytes": DEFAULT_WHOSCORED_PAID_CAP_BYTES,
         "whoscored_signed_campaigns_required": True,
@@ -6596,6 +6615,23 @@ async def _open_lease_upstream_tunnel(
                 )
                 observed_down_bytes += head_bytes + drained
                 raise _DeadExitResponse(code)
+            if code != 200 and lease.source in TRANSFERMARKT_ONLY_SOURCES:
+                # #1388: the tunnel was never established.  Meter the whole
+                # rejection (Decodo bills request + response as seen at its
+                # gateway) and, once it is provably complete, report a counted
+                # provider refusal instead of latching uncertainty.  No
+                # failover: the lease keeps its one-exit contract.
+                drained = await _drain_dead_exit_response(
+                    srv_r,
+                    lease,
+                    host,
+                    already=head_bytes,
+                    content_length=_dead_exit_body_length(response_headers),
+                )
+                if drained is None:
+                    # Unproven tail: the caller latches as before.
+                    return srv_r, srv_w, status, response_headers
+                raise _ProviderConnectRejected(code)
             return srv_r, srv_w, status, response_headers
         except BaseException as exc:
             # No failed attempt may leak its socket or its tunnel_writers entry.
@@ -6677,6 +6713,9 @@ EXIT_POOL_DEGRADED_RATIO = 0.5
 # answered CONNECT with non-200 (fingerprint -> monotonic deadline).  It only feeds /health: ProxyManager rotation is left untouched so
 # WhoScored/SofaScore exit selection and a non-empty pick pool are unchanged.
 DEAD_EXITS: dict[str, float] = {}
+# #1388: Transfermarkt CONNECT refusals with a fully metered provider response,
+# by status class, since process start (surfaced on /health).
+PROVIDER_REJECTED_CONNECTS: Counter[str] = Counter()
 
 
 def _mark_exit_dead(
@@ -6740,12 +6779,16 @@ def _write_connect_rejection(client_w, upstream_class: str) -> None:
     )
 
 
-def _record_connect_rejected(lease: "Lease | None", upstream_class: str) -> None:
+def _record_connect_rejected(
+    lease: "Lease | None", upstream_class: str, **extra: Any
+) -> None:
     # The WhoScored canary ledger validator rejects unknown event types.
     if lease is None or lease.source == "whoscored":
         return
     try:
-        _append_budget_event("connect_rejected", lease, reason=upstream_class)
+        _append_budget_event(
+            "connect_rejected", lease, reason=upstream_class, **extra
+        )
     except Exception:  # noqa: BLE001 - diagnostic event, no billed bytes
         log.exception("could not persist connect rejection for lease %s", lease.lease_id)
 
@@ -7005,6 +7048,27 @@ async def handle(
                             await client_w.drain()
                         else:
                             client_w.close()
+                        return
+                    except _ProviderConnectRejected as exc:
+                        upstream_class = _connect_code_class(exc.code)
+                        _mark_exit_dead(lease.upstream, lease)
+                        lease.provider_rejected_connects += 1
+                        PROVIDER_REJECTED_CONNECTS[upstream_class] += 1
+                        log.warning(
+                            "lease %s provider rejected CONNECT with status %s "
+                            "before the tunnel; whole response metered",
+                            lease.lease_id,
+                            upstream_class,
+                        )
+                        if not local_connect_established:
+                            _write_connect_rejection(client_w, upstream_class)
+                            _record_connect_rejected(
+                                lease,
+                                upstream_class,
+                                classification="provider_rejected",
+                            )
+                            await client_w.drain()
+                        client_w.close()
                         return
                     except (
                         asyncio.TimeoutError,
