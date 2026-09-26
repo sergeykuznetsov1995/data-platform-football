@@ -476,12 +476,15 @@ def _parse_participant_table(html: str) -> List[Dict]:
     return clubs
 
 
-def _participant_page_is_empty(html: str, competition_id: str) -> bool:
+def _participant_page_is_empty(
+    html: str, competition_id: str, saison_id: int | str,
+) -> bool:
     """True when a ``/teilnehmer/`` page states no participant at all.
 
-    The page must self-identify the requested competition (hreflang
-    alternates, as ``_listing_page_is_empty_shell``) and carry no
-    ``table.items``: a consent/error page or a drifted layout proves nothing.
+    The page must self-identify as the participant page of the requested
+    edition (hreflang alternates carry ``/teilnehmer/.../{id}/saison_id/
+    {saison_id}``) and carry no ``table.items``: a consent/error page, another
+    route or season, or a drifted layout proves nothing.
     """
     from bs4 import BeautifulSoup
 
@@ -489,7 +492,8 @@ def _participant_page_is_empty(html: str, competition_id: str) -> bool:
     if soup.find('table', {'class': 'items'}) is not None:
         return False
     pattern = re.compile(
-        r'/(?:pokal)?wettbewerb/' + re.escape(str(competition_id)) + r'(?:/|$)'
+        r'/teilnehmer/(?:pokal)?wettbewerb/' + re.escape(str(competition_id))
+        + r'/saison_id/' + re.escape(str(saison_id)) + r'(?:[/?#]|$)'
     )
     return any(
         pattern.search(str(link.get('href') or ''))
@@ -1805,7 +1809,7 @@ class TransfermarktScraper(BaseScraper):
             _parse_participant_table(page_html) if page_html is not None else None
         )
         if page_clubs == [] and not _participant_page_is_empty(
-            page_html, scope['competition_id'],
+            page_html, scope['competition_id'], saison_id,
         ):
             page_clubs = None  # zero rows without a self-identifying page
         page_hash = (
@@ -1824,8 +1828,11 @@ class TransfermarktScraper(BaseScraper):
         if api_ids is not None and page_clubs is not None:
             # Qualifying rounds may list clubs on one side only: a flag, not
             # an error (FA Cup: tmapi 124 = the main draw).
-            evidence['tmapi_only'] = len(set(api_ids) - set(slugs))
-            evidence['teilnehmer_only'] = len(set(slugs) - set(api_ids))
+            # Ids, not counts: every difference stays auditable (#1392 B6).
+            evidence['tmapi_only'] = sorted(set(api_ids) - set(slugs), key=int)
+            evidence['teilnehmer_only'] = sorted(
+                set(slugs) - set(api_ids), key=int,
+            )
         if competition.team_type.value == 'national_team':
             # Until measured (#1392 B5) a national team's squad page is its
             # current squad, not proven to be the tournament roster.

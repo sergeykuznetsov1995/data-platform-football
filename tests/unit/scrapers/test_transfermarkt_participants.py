@@ -121,10 +121,17 @@ def test_teilnehmer_page_matches_tmapi_126_of_126():
 
 
 def test_empty_teilnehmer_proof_needs_a_self_identifying_page():
-    assert tm._participant_page_is_empty(_empty_teilnehmer(), 'BRC')
-    assert not tm._participant_page_is_empty(_empty_teilnehmer(), 'CL')
-    assert not tm._participant_page_is_empty(_teilnehmer(), 'BRC')
-    assert not tm._participant_page_is_empty('<html></html>', 'BRC')
+    assert tm._participant_page_is_empty(_empty_teilnehmer(), 'BRC', 2025)
+    assert not tm._participant_page_is_empty(_empty_teilnehmer(), 'CL', 2025)
+    # Another edition or another route of the same competition proves nothing.
+    assert not tm._participant_page_is_empty(_empty_teilnehmer(), 'BRC', 2024)
+    startseite = _empty_teilnehmer().replace(
+        '/teilnehmer/pokalwettbewerb/BRC/saison_id/2025',
+        '/startseite/pokalwettbewerb/BRC',
+    )
+    assert not tm._participant_page_is_empty(startseite, 'BRC', 2025)
+    assert not tm._participant_page_is_empty(_teilnehmer(), 'BRC', 2025)
+    assert not tm._participant_page_is_empty('<html></html>', 'BRC', 2025)
 
 
 # -------------------------------------------------------- read_squad_data ---
@@ -181,7 +188,7 @@ def test_cup_participants_come_from_tmapi_with_teilnehmer_slugs(monkeypatch):
     assert bundle['memberships']['club_id'].nunique() == 126
     evidence = scraper.get_participant_evidence()
     assert evidence['tmapi_count'] == evidence['teilnehmer_count'] == 126
-    assert evidence['tmapi_only'] == evidence['teilnehmer_only'] == 0
+    assert evidence['tmapi_only'] == evidence['teilnehmer_only'] == []
     assert evidence['source'] == 'tmapi'
 
 
@@ -196,8 +203,8 @@ def test_empty_shell_with_tmapi_participants_is_never_empty(monkeypatch):
     assert capture['listing_status'] == 'ok'
     assert len(capture['expected_team_ids']) == 126
     assert not bundle['memberships'].empty
-    assert scraper.get_participant_evidence()['teilnehmer_only'] == 0
-    assert scraper.get_participant_evidence()['tmapi_only'] == 126
+    assert scraper.get_participant_evidence()['teilnehmer_only'] == []
+    assert len(scraper.get_participant_evidence()['tmapi_only']) == 126
 
 
 def test_empty_shell_without_tmapi_is_unknown_not_empty(monkeypatch):
@@ -261,7 +268,7 @@ def test_club_missing_from_teilnehmer_keeps_its_id_with_placeholder_slug(
 
     scraper.read_squad_data('BRC', 2026)
 
-    assert scraper.get_participant_evidence()['tmapi_only'] == 1
+    assert scraper.get_participant_evidence()['tmapi_only'] == ['999999']
     squads = [url for label, url in calls if label == 'squad']
     assert any('/x/kader/verein/999999/' in url for url in squads)
 
@@ -289,3 +296,16 @@ def test_teilnehmer_fetch_validator_rejects_a_page_that_proves_nothing():
     assert validate(_teilnehmer()) is None
     assert validate(_empty_teilnehmer()) is None
     assert validate('<html><body><p>consent</p></body></html>') is not None
+
+
+def test_club_only_on_teilnehmer_is_recorded_by_id(monkeypatch):
+    api = _json('brc_club_2025.json')
+    dropped = api['data']['clubIds'][0]
+    api['data']['clubIds'] = api['data']['clubIds'][1:]
+    scraper, _calls = _scraper(monkeypatch, api=api, page=_teilnehmer())
+
+    scraper.read_squad_data('BRC', 2026)
+
+    evidence = scraper.get_participant_evidence()
+    assert evidence['teilnehmer_only'] == [dropped]
+    assert evidence['tmapi_only'] == []
