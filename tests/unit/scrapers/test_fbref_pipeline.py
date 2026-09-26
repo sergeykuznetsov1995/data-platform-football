@@ -14251,14 +14251,22 @@ def test_live_waves_profile_each_wave_by_stage(tmp_path):
     control = FakeControl(raw)
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
     now = [0.0]
-    pipeline.stage_clock = lambda: now[0]
-    pipeline.sleep = lambda seconds: None
-    pipeline.clock = lambda: datetime(2026, 9, 26, tzinfo=timezone.utc)
 
     def spend(seconds):
         now[0] += seconds
 
+    pipeline.stage_clock = lambda: now[0]
+    pipeline.sleep = spend
+    pipeline.clock = lambda: datetime(2026, 9, 26, tzinfo=timezone.utc)
+
+    @contextmanager
+    def guard(*_args):
+        spend(0.5)  # lock SQL on enter
+        yield True
+        spend(0.25)  # commit on exit
+
     control.spend = spend
+    control.guard = guard
     raw.spend = spend
     pipeline.generic_writer.spend = spend
     pipeline.typed_adapter.writer = SimpleNamespace(spend=spend)
@@ -14274,8 +14282,11 @@ def test_live_waves_profile_each_wave_by_stage(tmp_path):
 
     def parse_wave(*_args, **_kwargs):
         pipeline.raw_store.spend(0.125)
+        with pipeline.control.guard("target") as verdict:
+            assert verdict is True
+            # A typed write under the content lock is Trino time, not Postgres.
+            pipeline.typed_adapter.writer.spend(1.5)
         pipeline.generic_writer.spend(4.0)
-        pipeline.typed_adapter.writer.spend(1.5)
         pipeline.control.spend(0.75)
         spend(1.0)  # parse CPU
         return WaveResult(cohort_size=1, parsed=1)
@@ -14297,16 +14308,35 @@ def test_live_waves_profile_each_wave_by_stage(tmp_path):
     assert first["fetch"]["domain_wait_ms"] == 6000
     assert first["fetch"]["raw_store_ms"] == 500
     assert first["fetch"]["postgres_ms"] == 250
-    assert first["fetch"]["wall_ms"] == 2750
+    assert first["fetch"]["wall_ms"] == 8750
     assert first["parse"]["raw_store_ms"] == 125
-    assert first["parse"]["trino_generic_ms"] == 4000
+    assert first["parse"]["postgres_ms"] == 1500
     assert first["parse"]["trino_typed_ms"] == 1500
-    assert first["parse"]["postgres_ms"] == 750
-    assert first["parse"]["wall_ms"] == 7375
+    assert first["parse"]["trino_generic_ms"] == 4000
+    assert first["parse"]["wall_ms"] == 8125
     # The run aggregate sums the stages across batches like any counter.
     assert result.parse.trino_generic_ms == 8000
-    assert result.fetch.wall_ms == 5500
+    assert result.fetch.wall_ms == 17500
     # The stores are the real ones again once the waves are over.
     assert pipeline.control is control
     assert pipeline.raw_store is raw
+    assert pipeline._stage_ms is None
+
+
+def test_profiled_wave_restores_the_stores_when_the_wave_raises(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    writer = FakeWriter()
+    pipeline = FBrefPipeline(control, raw, generic_writer=writer)
+    typed_writer = pipeline.typed_adapter.writer
+
+    with pytest.raises(RuntimeError):
+        with pipeline._profiled_wave():
+            with pipeline._profiled_wave():
+                raise RuntimeError("wave failed")
+
+    assert pipeline.control is control
+    assert pipeline.raw_store is raw
+    assert pipeline.generic_writer is writer
+    assert pipeline.typed_adapter.writer is typed_writer
     assert pipeline._stage_ms is None

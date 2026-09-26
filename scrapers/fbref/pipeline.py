@@ -846,13 +846,41 @@ class _TimedCalls:
         def timed(*args, **kwargs):
             started = self._clock()
             try:
-                return value(*args, **kwargs)
+                returned = value(*args, **kwargs)
             finally:
-                self._stage_ms[self._stage] += int(
-                    (self._clock() - started) * 1000
-                )
+                self._add(started)
+            if hasattr(returned, "__enter__") and hasattr(returned, "__exit__"):
+                # Lock/guard contexts do their SQL on enter and exit; the body
+                # between them belongs to whatever stage runs inside it.
+                return _TimedContext(returned, self)
+            return returned
 
         return timed
+
+    def _add(self, started: float) -> None:
+        self._stage_ms[self._stage] += int((self._clock() - started) * 1000)
+
+
+class _TimedContext:
+    """Times a proxied context's ``__enter__`` and ``__exit__``, not its body."""
+
+    def __init__(self, context, timer: _TimedCalls) -> None:
+        self._context = context
+        self._timer = timer
+
+    def __enter__(self):
+        started = self._timer._clock()
+        try:
+            return self._context.__enter__()
+        finally:
+            self._timer._add(started)
+
+    def __exit__(self, *exc_info):
+        started = self._timer._clock()
+        try:
+            return self._context.__exit__(*exc_info)
+        finally:
+            self._timer._add(started)
 
 
 @dataclass(frozen=True)
@@ -3052,13 +3080,13 @@ class FBrefPipeline:
         self.typed_adapter.writer = _TimedCalls(
             typed_writer, stage_ms, "trino_typed_ms", clock
         )
-        self._stage_ms = stage_ms
+        previous_stage_ms, self._stage_ms = self._stage_ms, stage_ms
         started = clock()
         try:
             yield stage_ms
         finally:
             stage_ms["wall_ms"] = int((clock() - started) * 1000)
-            self._stage_ms = None
+            self._stage_ms = previous_stage_ms
             self.control, self.raw_store, self.generic_writer = stores
             self.typed_adapter.writer = typed_writer
 
