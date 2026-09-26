@@ -142,25 +142,61 @@ def test_postponed_match_takes_the_row_of_its_kickoff_month(tmp_path, monkeypatc
     assert row["status"] == 1
 
 
-def test_moved_match_outside_both_months_takes_the_later_document(
+def _with_kickoff(payload: bytes, kickoff: str, *, status: int) -> bytes:
+    document = json.loads(payload)
+    for tournament in document["tournaments"]:
+        for match in tournament["matches"]:
+            match["startTimeUtc"] = kickoff
+            match["status"] = status
+    return json.dumps(document).encode()
+
+
+def test_moved_match_outside_every_month_takes_the_later_document(
     tmp_path, monkeypatch
 ):
-    july = json.loads(POSTPONED_JULY.read_bytes())
-    july["tournaments"][0]["matches"][0]["startTimeUtc"] = "2026-09-02T18:00:00Z"
     result, repository, _ = _sync_schedule(
         tmp_path,
         monkeypatch,
         today=(2026, 8, 20),
         months={
-            "202607": json.dumps(july).encode(),
-            "202608": _set_status(POSTPONED_AUGUST.read_bytes(), 1),
+            "202607": _with_kickoff(
+                POSTPONED_JULY.read_bytes(), "2026-09-02T18:00:00Z", status=2
+            ),
+            "202608": _with_kickoff(
+                POSTPONED_AUGUST.read_bytes(), "2026-09-05T18:00:00Z", status=1
+            ),
         },
     )
 
     assert result.status == "success", result.as_dict()
     (snapshot,) = repository.scope_snapshots
     (row,) = snapshot["datasets"]["whoscored_schedule"]
-    assert row["date"] == datetime(2026, 8, 19, 18, 0)
+    assert row["date"] == datetime(2026, 9, 5, 18, 0)
+    assert row["status"] == 1
+
+
+def test_matching_month_wins_even_when_traversed_before_a_stale_one(
+    tmp_path, monkeypatch
+):
+    result, repository, _ = _sync_schedule(
+        tmp_path,
+        monkeypatch,
+        today=(2026, 8, 20),
+        months={
+            "202607": _with_kickoff(
+                POSTPONED_JULY.read_bytes(), "2026-07-20T18:00:00Z", status=6
+            ),
+            "202608": _with_kickoff(
+                POSTPONED_AUGUST.read_bytes(), "2026-09-05T18:00:00Z", status=1
+            ),
+        },
+    )
+
+    assert result.status == "success", result.as_dict()
+    (snapshot,) = repository.scope_snapshots
+    (row,) = snapshot["datasets"]["whoscored_schedule"]
+    assert row["date"] == datetime(2026, 7, 20, 18, 0)
+    assert row["status"] == 6
 
 
 def test_closed_month_with_unplayed_postponed_match_keeps_the_active_ttl(
