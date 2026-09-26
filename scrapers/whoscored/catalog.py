@@ -168,6 +168,14 @@ DEFAULT_TOURNAMENT_OVERRIDES: tuple[TournamentOverride, ...] = (
         TournamentEligibility.INCLUDED,
         "audited senior men: EFL Trophy; empty future source calendar",
     ),
+    # The source marks the Toulon Tournament ``sex=1`` like any men's event,
+    # but it is an under-21/23 youth tournament (#1474, review F-C2-09).
+    TournamentOverride(
+        203,
+        TournamentEligibility.EXCLUDED_YOUTH,
+        "audited youth: Toulon Tournament (U21/U23 national teams)",
+        version="2026-09-26-v1",
+    ),
 )
 
 

@@ -121,13 +121,25 @@ class _Catalog:
         except KeyError as exc:
             raise ValueError(f"unknown scope {competition_id}={season_id}") from exc
 
+    _TOURNAMENT_IDS = {"ENG-Premier League": 2, "INT-World Cup": 36}
+
     def competition(self, competition_id):
         if not any(key[0] == competition_id for key in self._scopes):
             raise ValueError(f"unknown competition {competition_id}")
-        return SimpleNamespace(whoscored_enabled=True)
+        return SimpleNamespace(
+            whoscored_enabled=True,
+            tournament_id=self._TOURNAMENT_IDS.get(competition_id),
+        )
 
     def eligible_scopes(self, *, active_only):
         del active_only
+        return list(self._scopes.values())
+
+    def enabled_scopes(self):
+        return list(self._scopes.values())
+
+    def active_scopes(self, *, on=None):
+        del on
         return list(self._scopes.values())
 
 
@@ -1149,7 +1161,7 @@ def test_explicit_discovery_can_expand_the_historical_stage_catalog(
 
 
 @pytest.mark.unit
-def test_daily_without_scope_reads_all_active_persisted_scopes(monkeypatch, tmp_path):
+def test_daily_without_scope_reads_the_denominator_scopes(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner._WHOSCORED_RUNTIME_CONTRACT,
         "validate_runtime_contract",
@@ -1177,6 +1189,27 @@ def test_daily_without_scope_reads_all_active_persisted_scopes(monkeypatch, tmp_
         ]
         for service in service_cls.instances
     )
+
+
+@pytest.mark.unit
+def test_daily_without_scope_skips_scopes_outside_the_denominator(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        _Catalog,
+        "_TOURNAMENT_IDS",
+        {"ENG-Premier League": 2, "INT-World Cup": 999},
+    )
+
+    rc, report, service_cls, _catalog = _run(
+        monkeypatch,
+        tmp_path,
+        ["daily", "--skip-profiles"],
+    )
+
+    assert rc == 0
+    assert [item["scope"] for item in report["scopes"]] == ["ENG-Premier League=2526"]
+    assert len(service_cls.instances) == 1
 
 
 @pytest.mark.unit

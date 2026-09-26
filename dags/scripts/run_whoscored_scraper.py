@@ -1003,14 +1003,38 @@ def _persisted_scope_index(
 
 
 def resolve_daily_scope_specs() -> list[str]:
-    """Public DAG helper: return deterministic active persisted scopes.
+    """Public DAG helper: return the deterministic daily denominator scopes.
 
     This function is intentionally called by an Airflow *task*, never while a
     DAG file is imported.  A missing catalog therefore produces a visible task
     failure instead of an Airflow import error or a silent six-league fallback.
     """
     repository = _new_repository()
-    return sorted(_persisted_scope_index(repository, active_only=True))
+    _generation, catalog = repository.load_catalog_generation_snapshot()
+    return [scope.spec for scope, _runtime in _select_denominator_scopes(catalog)]
+
+
+def _select_denominator_scopes(catalog: Any) -> list[tuple[RunnerScope, Any]]:
+    """Daily scopes = explicit denominator + probe scopes (#1474).
+
+    The catalog keeps every eligible scope (``active_scopes`` is untouched);
+    only the daily selection narrows to the class-A tournaments (current and
+    just finished season) and the scopes still being probed.
+    """
+    from scrapers.whoscored.denominator import (
+        denominator_scopes,
+        missing_probe_specs,
+    )
+
+    missing = missing_probe_specs(catalog)
+    if missing:
+        logger.warning(
+            "WhoScored probe scopes absent from the catalog: %s", ", ".join(missing)
+        )
+    selected = [(_scope_value(value), value) for value in denominator_scopes(catalog)]
+    if not selected:
+        raise RuntimeError("WhoScored denominator selected no catalog scopes")
+    return selected
 
 
 def _select_persisted_scopes(
@@ -2185,19 +2209,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         batch_id=str(args.catalog_batch_id)
                     )
                 )
-                selected = _select_catalog_snapshot_scopes(
-                    catalog_snapshot,
-                    scopes,
-                    active_only=True,
+                selected = (
+                    _select_catalog_snapshot_scopes(
+                        catalog_snapshot,
+                        scopes,
+                        active_only=True,
+                    )
+                    if scopes
+                    else _select_denominator_scopes(catalog_snapshot)
                 )
             else:
                 catalog_generation, catalog_snapshot = (
                     repository.load_catalog_generation_snapshot()
                 )
-                selected = _select_catalog_snapshot_scopes(
-                    catalog_snapshot,
-                    scopes,
-                    active_only=(args.command == "daily"),
+                selected = (
+                    _select_denominator_scopes(catalog_snapshot)
+                    if args.command == "daily" and not scopes
+                    else _select_catalog_snapshot_scopes(
+                        catalog_snapshot,
+                        scopes,
+                        active_only=(args.command == "daily"),
+                    )
                 )
         except Exception as exc:
             if scopes:
