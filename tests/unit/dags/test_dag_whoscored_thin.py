@@ -47,7 +47,8 @@ def test_ingest_dag_shape(ingest):
     from utils.default_args import SCRAPER_ARGS
 
     assert ingest.dag.dag_id == "dag_ingest_whoscored"
-    assert ingest.dag.schedule == "0 10 * * *"
+    # #1474: two runs a day, set in the DAG itself (utils/config.py is locked).
+    assert ingest.dag.schedule == "0 10,22 * * *"
     assert ingest.dag._dag_kwargs["max_active_runs"] == 1
     assert ingest.dag._dag_kwargs["catchup"] is False
     assert ingest.dag._dag_kwargs["default_args"] is SCRAPER_ARGS
@@ -55,12 +56,16 @@ def test_ingest_dag_shape(ingest):
 
 def test_ingest_tasks_are_direct_pool_native(ingest):
     discover = _bash("discover_catalog")
-    daily = _bash("ingest_daily")
+    daily = _bash("ingest_matches")
     assert "run_whoscored_scraper.py discover" in discover._init_kwargs["bash_command"]
+    # #1474: the catalog is refreshed once a week; the runner short-circuits.
+    assert "--weekly-gate" in discover._init_kwargs["bash_command"]
     cmd = daily._init_kwargs["bash_command"]
     assert "run_whoscored_scraper.py daily" in cmd
     assert "--skip-profiles" in cmd
     assert "--transport-policy direct_only" in cmd
+    assert "--daily-part" not in cmd
+    assert "--weekly-gate" not in cmd
     # No ceremony flags survive on the daily path.
     for banned in ("--proxy-approval", "direct_then_paid", "gateway", "--catalog-batch-id"):
         assert banned not in cmd
@@ -69,11 +74,39 @@ def test_ingest_tasks_are_direct_pool_native(ingest):
     assert daily._init_kwargs["append_env"] is True
 
 
-def test_ingest_daily_has_eight_hour_timeout(ingest):
+def test_ingest_matches_has_eight_hour_timeout(ingest):
     from datetime import timedelta
 
-    daily = _bash("ingest_daily")
+    daily = _bash("ingest_matches")
     assert daily._init_kwargs["execution_timeout"] == timedelta(hours=8)
+
+
+def test_ingest_stages_is_a_separate_weekly_task(ingest):
+    # #1474: stage feeds live in their own task; its failure never fails
+    # ingest_matches, and it runs whatever ingest_matches ended with.
+    from datetime import timedelta
+
+    stages = _bash("ingest_stages")
+    matches = _bash("ingest_matches")
+    cmd = stages._init_kwargs["bash_command"]
+    assert "run_whoscored_scraper.py daily" in cmd
+    assert "--daily-part stages" in cmd
+    assert "--weekly-gate" in cmd
+    assert "--skip-profiles" in cmd
+    assert "--transport-policy direct_only" in cmd
+    assert "|| [ -s" in cmd
+    assert ingest.STAGES_RESULT_PATH in cmd
+    assert ingest.RESULT_PATH not in cmd
+    assert stages._init_kwargs["trigger_rule"] == "all_done"
+    assert stages._init_kwargs["execution_timeout"] == timedelta(hours=8)
+    assert "WHOSCORED_PROXY_FILE" in stages._init_kwargs["env"]
+    assert stages.upstream_task_ids == {"ingest_matches"}
+    assert stages.downstream_task_ids == set()
+    assert matches.downstream_task_ids == {
+        "ingest_stages",
+        "validate_data",
+        "validate_bronze_freshness",
+    }
 
 
 @pytest.mark.parametrize("module_name", ["dag_ingest_whoscored", "dag_backfill_whoscored"])
@@ -91,7 +124,7 @@ def test_proxy_file_has_no_default(monkeypatch, module_name):
 @pytest.mark.parametrize(
     ("module_name", "task_ids"),
     [
-        ("dag_ingest_whoscored", ("discover_catalog", "ingest_daily")),
+        ("dag_ingest_whoscored", ("discover_catalog", "ingest_matches", "ingest_stages")),
         ("dag_backfill_whoscored", ("run_backfill_chunk",)),
     ],
 )
@@ -178,23 +211,23 @@ def _scopes(total, failed_names=()):
     return scopes
 
 
-def test_ingest_daily_tolerates_runner_rc_when_report_exists(ingest):
+def test_ingest_matches_tolerates_runner_rc_when_report_exists(ingest):
     # Красный rc раннера при живом отчёте — норма (#1053): судит бюджет.
-    cmd = _bash("ingest_daily")._init_kwargs["bash_command"]
+    cmd = _bash("ingest_matches")._init_kwargs["bash_command"]
     assert "|| [ -s" in cmd
 
 
 def test_freshness_is_not_the_sole_leaf(ingest):
     # #1053: единственный all_done-лист красил ран зелёным при упавшем сборе.
     # Теперь гейт качества — самостоятельный лист, а freshness висит на
-    # ingest_daily параллельной веткой.
+    # ingest_matches параллельной веткой.
     validate = _python("validate_data")
     freshness = _python("validate_bronze_freshness")
     assert freshness._init_kwargs["trigger_rule"] == "all_done"
     assert validate.downstream_task_ids == set()
     assert freshness.downstream_task_ids == set()
-    assert freshness.upstream_task_ids == {"ingest_daily"}
-    assert validate.upstream_task_ids == {"ingest_daily"}
+    assert freshness.upstream_task_ids == {"ingest_matches"}
+    assert validate.upstream_task_ids == {"ingest_matches"}
 
 
 def test_validate_data_passes_within_error_budget(ingest, tmp_path):

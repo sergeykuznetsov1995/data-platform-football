@@ -91,6 +91,13 @@ REPORT_SCHEMA_VERSION = 3
 # Per-scope cap of the daily match run: a duration guard only (#1474).  The
 # largest denominator backlog on 26.09.2026 was 264 (MLS 2026), 1 350 in all.
 DAILY_MATCH_LIMIT_PER_SCOPE = 300
+# Weekly work (catalog discovery, stage feeds) runs only in the Monday morning
+# run of the twice-daily DAG (10:00 and 22:00 UTC, #1474).  The gate judges the
+# run slot the DAG passes (data_interval_end), not the wall clock: ingest_stages
+# starts only after ingest_matches, hours after the slot.
+WEEKLY_GATE_WEEKDAY = 0
+WEEKLY_GATE_BEFORE_HOUR_UTC = 12
+DAILY_PARTS = ("matches", "stages")
 PUBLIC_COMMANDS = ("discover", "daily", "backfill", "replay")
 COMMANDS = PUBLIC_COMMANDS
 DEFAULT_BACKFILL_CHUNK_SIZE = 25
@@ -190,6 +197,18 @@ class RunnerScope:
 
 def _utc_now_iso() -> str:
     return datetime_lib.datetime.now(datetime_lib.timezone.utc).isoformat()
+
+
+def _parse_run_slot(value: str) -> datetime_lib.datetime:
+    try:
+        slot = datetime_lib.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"run slot must be an ISO-8601 datetime, got {value!r}"
+        ) from exc
+    if slot.tzinfo is None:
+        slot = slot.replace(tzinfo=datetime_lib.timezone.utc)
+    return slot.astimezone(datetime_lib.timezone.utc)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -314,6 +333,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SHA-256 of the exact due-profile player-id set",
     )
     parser.add_argument("--max-matches", type=int, default=None)
+    parser.add_argument(
+        "--daily-part",
+        choices=DAILY_PARTS,
+        default="matches",
+        help=(
+            "daily only: 'matches' = schedule, previews and matches; "
+            "'stages' = weekly stage statistics feeds"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-gate",
+        metavar="RUN_SLOT",
+        type=_parse_run_slot,
+        default=None,
+        help=(
+            "discover / daily --daily-part stages: ISO-8601 run slot; work "
+            "runs only for the Monday morning slot (UTC), otherwise the "
+            "runner exits successfully without work"
+        ),
+    )
     parser.add_argument("--output", default="/tmp/whoscored_result.json")
     return parser
 
@@ -552,6 +591,17 @@ def _validate_args(
         parser.error("--skip-profiles/--profiles-only are valid only for daily")
     if args.skip_profiles and args.profiles_only:
         parser.error("--skip-profiles and --profiles-only are mutually exclusive")
+    if args.daily_part == "stages" and (
+        args.command != "daily" or not args.skip_profiles
+    ):
+        parser.error("--daily-part stages is valid only for daily --skip-profiles")
+    if args.weekly_gate is not None and not (
+        args.command == "discover"
+        or (args.command == "daily" and args.daily_part == "stages")
+    ):
+        parser.error(
+            "--weekly-gate is valid only for discover or daily --daily-part stages"
+        )
     if args.full_history and args.command not in {"discover", "backfill"}:
         parser.error("--full-history is valid only for discover or backfill")
     if args.catalog_batch_id:
@@ -1476,10 +1526,19 @@ def _paid_proxy_bytes(traffic: Mapping[str, Any]) -> int:
     return 0
 
 
-def _operations(command: str) -> tuple[str, ...]:
+def _operations(command: str, daily_part: str = "matches") -> tuple[str, ...]:
     if command == "daily":
+        if daily_part == "stages":
+            return ("stages",)
         return ("schedule", "previews", "matches")
     raise AssertionError(f"workflow {command!r} has no implicit entity sequence")
+
+
+def _weekly_gate_open(slot: datetime_lib.datetime) -> bool:
+    return (
+        slot.weekday() == WEEKLY_GATE_WEEKDAY
+        and slot.hour < WEEKLY_GATE_BEFORE_HOUR_UTC
+    )
 
 
 def _invoke(
@@ -1492,6 +1551,8 @@ def _invoke(
 ) -> Any:
     if operation == "schedule":
         return service.sync_schedule()
+    if operation == "stages":
+        return service.sync_stage_feeds()
     if operation == "previews":
         preview_ids = getattr(
             args,
@@ -2020,6 +2081,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scopes = _validate_args(parser, args)
     report = _new_report(args.command, scopes)
     _bind_report_transport_identity(report, args)
+    if args.weekly_gate is not None and not _weekly_gate_open(args.weekly_gate):
+        logger.info(
+            "WhoScored %s: weekly gate closed for run slot %s (runs for the "
+            "Monday slot before %02d:00 UTC); no work this run",
+            args.command,
+            args.weekly_gate.isoformat(),
+            WEEKLY_GATE_BEFORE_HOUR_UTC,
+        )
+        return _finish(report, args.output)
 
     try:
         _configure_transport_environment(args)
@@ -2279,7 +2349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     repository=repository,
                     report=report,
                     args=args,
-                    operations=_operations("daily"),
+                    operations=_operations("daily", args.daily_part),
                 )
                 try:
                     _validate_scheduled_scope_attempts(report, args)

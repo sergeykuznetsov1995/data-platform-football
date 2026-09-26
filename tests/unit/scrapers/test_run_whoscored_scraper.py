@@ -83,6 +83,13 @@ DEFAULT_RESULTS = {
             "iceberg.bronze.whoscored_match_ingest_manifest",
         ],
     ),
+    "stages": _result(
+        "stages",
+        counts={"team_stage_stats": 1},
+        tables=["iceberg.bronze.whoscored_team_stage_stats"],
+        metadata={"source_stage_ids": [23752], "source_stage_count": 1},
+        committed_batches={"scope": ["wss2-" + "2" * 64]},
+    ),
     "profiles": _result(
         "profiles",
         counts={"player_profile": 1},
@@ -344,6 +351,16 @@ def _runtime(
             if "schedule" not in configured:
                 digest = hashlib.sha256(
                     f"scope\0{self._scope_spec()}".encode("utf-8")
+                ).hexdigest()
+                result.committed_batches = {"scope": ["wss2-" + digest]}
+            return result
+
+        def sync_stage_feeds(self):
+            self.calls.append(("stages", None))
+            result = SimpleNamespace(**vars(self._value("stages")))
+            if "stages" not in configured:
+                digest = hashlib.sha256(
+                    f"stages\0{self._scope_spec()}".encode("utf-8")
                 ).hexdigest()
                 result.committed_batches = {"scope": ["wss2-" + digest]}
             return result
@@ -710,7 +727,7 @@ def test_non_mapped_airflow_task_reports_map_index_minus_one(monkeypatch, tmp_pa
     # report must still carry a valid attempt identity (#1471).
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_whoscored")
     monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "manual__1471")
-    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_daily")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_matches")
     monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
     monkeypatch.delenv("AIRFLOW_CTX_MAP_INDEX", raising=False)
 
@@ -1201,6 +1218,130 @@ def test_daily_without_scope_skips_scopes_outside_the_denominator(
     assert rc == 0
     assert [item["scope"] for item in report["scopes"]] == ["ENG-Premier League=2526"]
     assert len(service_cls.instances) == 1
+
+
+MONDAY_MORNING_SLOT = "2026-09-28T10:00:00+00:00"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("slot", "is_open"),
+    [
+        (MONDAY_MORNING_SLOT, True),
+        ("2026-09-28T13:00:00+03:00", True),
+        ("2026-09-28T10:00:00", True),
+        ("2026-09-28T22:00:00+00:00", False),
+        ("2026-09-27T22:00:00+00:00", False),
+        ("2026-09-29T10:00:00+00:00", False),
+    ],
+)
+def test_weekly_gate_opens_only_for_the_monday_morning_slot(slot, is_open):
+    assert runner._weekly_gate_open(runner._parse_run_slot(slot)) is is_open
+
+
+@pytest.mark.unit
+def test_weekly_gate_closed_short_circuits_discover(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "discover",
+            "--as-of-date",
+            "2026-09-28",
+            "--weekly-gate",
+            "2026-09-28T22:00:00+00:00",
+        ],
+    )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert report["scopes"] == []
+    assert service_cls.discovery_calls == []
+
+
+@pytest.mark.unit
+def test_weekly_gate_open_runs_discover(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "discover",
+            "--as-of-date",
+            "2026-09-27",
+            "--weekly-gate",
+            MONDAY_MORNING_SLOT,
+        ],
+    )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert len(service_cls.discovery_calls) == 1
+
+
+@pytest.mark.unit
+def test_daily_stages_part_runs_only_the_stage_feeds(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--daily-part",
+            "stages",
+            "--skip-profiles",
+            "--weekly-gate",
+            MONDAY_MORNING_SLOT,
+        ],
+    )
+
+    assert rc == 0, report
+    assert report["status"] == "success"
+    assert [item["scope"] for item in report["scopes"]] == [
+        "ENG-Premier League=2526",
+        "INT-World Cup=2026",
+    ]
+    assert all(
+        service.calls == [("stages", None)] for service in service_cls.instances
+    )
+
+
+@pytest.mark.unit
+def test_daily_stages_part_is_skipped_outside_the_weekly_slot(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--daily-part",
+            "stages",
+            "--skip-profiles",
+            "--weekly-gate",
+            "2026-09-29T10:00:00+00:00",
+        ],
+    )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert report["scopes"] == []
+    assert service_cls.instances == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["daily", "--daily-part", "stages"],
+        ["daily", "--daily-part", "stages", "--profiles-only"],
+        ["discover", "--daily-part", "stages"],
+        ["daily", "--skip-profiles", "--weekly-gate", MONDAY_MORNING_SLOT],
+        ["backfill", "--weekly-gate", MONDAY_MORNING_SLOT],
+        ["discover", "--weekly-gate", "monday"],
+    ],
+)
+def test_daily_part_and_weekly_gate_are_rejected_outside_their_commands(argv):
+    parser = runner._build_parser()
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(argv)
+        runner._validate_args(parser, args)
 
 
 @pytest.mark.unit
