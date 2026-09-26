@@ -3698,6 +3698,10 @@ def parse_schedule_bets(schedule: ParsedDataset) -> ParsedDataset:
                 raise WhoScoredParseError(
                     f"game {game_id} bets contains an invalid outcome key"
                 )
+            if market is None:
+                # The source publishes ``null`` for a market without offers
+                # (e.g. ``bets.home`` before a bookmaker prices it, #1059).
+                continue
             if not isinstance(market, Mapping):
                 raise WhoScoredParseError(
                     f"game {game_id} bets.{source_outcome} must be an object"

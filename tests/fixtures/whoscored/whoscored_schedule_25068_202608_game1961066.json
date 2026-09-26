@@ -1,0 +1,177 @@
+{
+ "_fixture": {
+  "source": "raw/whoscored schedule_month",
+  "target_id": "whoscored:schedule:25068:202608",
+  "fetched_at": "2026-07-29T11:05:40.674521+00:00",
+  "content_hash": "f625790b5d3f5d2845cf33297e5ad7ebf3c6192b92f954a57e0fcff81ccf9d53",
+  "trimmed_to_games": [
+   1961066
+  ]
+ },
+ "createdAt": "2026-07-29T11:05:40Z",
+ "version": 639202299610000000,
+ "timeout": 258860,
+ "tournaments": [
+  {
+   "tournamentId": 48,
+   "stageId": 25068,
+   "stageName": "Superettan",
+   "regionId": 212,
+   "tournamentName": "Superettan",
+   "seasonName": "2026",
+   "seasonId": 10998,
+   "stageSortOrder": 3,
+   "sex": 1,
+   "tournamentSortOrder": 0,
+   "regionCode": "se",
+   "regionName": "Sweden",
+   "isOpta": false,
+   "navigationDisplayMode": 0,
+   "matches": [
+    {
+     "stageId": 25068,
+     "id": 1961066,
+     "status": 1,
+     "startTime": "2026-08-02T14:00:00",
+     "homeTeamId": 29106,
+     "homeTeamName": "Nordic United FC",
+     "homeYellowCards": 0,
+     "homeRedCards": 0,
+     "awayTeamId": 490,
+     "awayTeamName": "Ljungskile",
+     "awayYellowCards": 0,
+     "awayRedCards": 0,
+     "hasIncidentsSummary": false,
+     "hasPreview": false,
+     "scoreChangedAt": "",
+     "elapsed": "",
+     "lastScorer": null,
+     "isTopMatch": false,
+     "homeTeamCountryCode": "se",
+     "awayTeamCountryCode": "se",
+     "commentCount": 0,
+     "isLineupConfirmed": false,
+     "isStreamAvailable": false,
+     "matchIsOpta": false,
+     "homeTeamCountryName": "Sweden",
+     "awayTeamCountryName": "Sweden",
+     "startTimeUtc": "2026-08-02T13:00:00Z",
+     "homeScore": null,
+     "awayScore": null,
+     "incidents": [],
+     "bets": {
+      "home": null,
+      "draw": {
+       "betName": "X",
+       "betId": "27249947180",
+       "offers": [
+        {
+         "oddsDecimal": "3.4",
+         "oddsFractional": "12/5",
+         "oddsUS": "+240",
+         "clickOutUrl": "https://www.bet365.com/dl/SportsbookRedirect.ashx?affiliate=365_03208357&bs=198286557-1742937884~12/5&bet=1",
+         "bettingProvider": "B3",
+         "providerId": 23
+        }
+       ]
+      },
+      "away": {
+       "betName": "Ljungskile",
+       "betId": "27249947198",
+       "offers": [
+        {
+         "oddsDecimal": "2.9",
+         "oddsFractional": "19/10",
+         "oddsUS": "+190",
+         "clickOutUrl": "https://www.bet365.com/dl/SportsbookRedirect.ashx?affiliate=365_03208357&bs=198286557-1742937885~19/10&bet=1",
+         "bettingProvider": "B3",
+         "providerId": 23
+        }
+       ]
+      }
+     },
+     "aggregateWinnerField": null,
+     "winnerField": null,
+     "period": 0,
+     "extraResultField": null,
+     "homeExtratimeScore": null,
+     "awayExtratimeScore": null,
+     "homePenaltyScore": null,
+     "awayPenaltyScore": null,
+     "startedAtUtc": null,
+     "firstHalfEndedAtUtc": null,
+     "secondHalfStartedAtUtc": null
+    }
+   ]
+  }
+ ],
+ "localization": {
+  "match_status_all": "All",
+  "match_status_live": "In Play",
+  "match_status_upcoming": "Upcoming",
+  "livescores_info_refresh": "Refreshing in {0} seconds...",
+  "livescores_info_starts_hrs_mins": "Matches start in {0} hours {1} minutes",
+  "livescores_info_starts_mins": "Matches start in {0} minutes",
+  "livescores_info_loading": "Loading...",
+  "favourite_info_please": "Please",
+  "favourite_lnk_singin": "Sign In",
+  "favourite_lnk_register": "Sign Up",
+  "info_today": "Today",
+  "lbl_user_odds_display_type": "Odds",
+  "sex_abbrv_woman": "W",
+  "ls_view_in_mc": "View in Match Centre",
+  "lnk_datepicker_view_current_week": "View current week",
+  "lnk_datepicker_view_current_month": "View current month ",
+  "fltr_livescores_summary_yesterday": "Yesterday",
+  "fltr_livescores_summary_today": "Today",
+  "fltr_livescores_summary_tomorrow": "Tomorrow",
+  "GK": "GK",
+  "DR": "DR",
+  "DC": "DC",
+  "DL": "DL",
+  "DMR": "DMR",
+  "DMC": "DMC",
+  "DML": "DML",
+  "MR": "MR",
+  "MC": "MC",
+  "ML": "ML",
+  "AMR": "AMR",
+  "AMC": "AMC",
+  "AM": "AMC",
+  "AML": "AML",
+  "FWR": "FWR",
+  "FW": "FW",
+  "FC": "FW",
+  "FWL": "FWL",
+  "Sub": "Sub",
+  "abd": "Abd",
+  "aet": "AET",
+  "can": "Can",
+  "et1": "ET1",
+  "et2": "ET2",
+  "ft": "FT",
+  "ht": "HT",
+  "pen": "PEN",
+  "post": "Post",
+  "susp": "Susp"
+ },
+ "meta": {
+  "imagesUrlBase": "https://d2zywfiolv4f83.cloudfront.net/img/"
+ },
+ "showOddsToggle": true,
+ "isSummary": false,
+ "oddsToggled": false,
+ "bookmakerCode": "DZA",
+ "bookmakers": [
+  "DZA",
+  "AZF",
+  "B3",
+  "SK",
+  "PIN",
+  "PIT"
+ ],
+ "timezoneOffset": 60,
+ "locale": "en",
+ "calendarType": null,
+ "fixtureDate": null
+}
