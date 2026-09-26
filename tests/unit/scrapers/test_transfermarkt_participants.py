@@ -309,3 +309,14 @@ def test_club_only_on_teilnehmer_is_recorded_by_id(monkeypatch):
     evidence = scraper.get_participant_evidence()
     assert evidence['teilnehmer_only'] == [dropped]
     assert evidence['tmapi_only'] == []
+
+
+def test_populated_teilnehmer_page_of_another_edition_proves_nothing(monkeypatch):
+    other = _teilnehmer().replace('/saison_id/2025', '/saison_id/2024')
+    assert len(tm._parse_participant_table(other)) == 126
+    scraper, _calls = _scraper(monkeypatch, api=None, page=other)
+
+    scraper.read_squad_data('BRC', 2026)
+
+    assert scraper.get_scope_capture()['listing_status'] == 'unknown'
+    assert scraper.get_participant_evidence()['teilnehmer_count'] is None
