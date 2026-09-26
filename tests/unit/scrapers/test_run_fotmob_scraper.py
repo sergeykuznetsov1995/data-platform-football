@@ -1377,11 +1377,12 @@ class TestFotmobNativeRunner:
 
     @staticmethod
     def _source_gap_attempts(mod, monkeypatch, kickoff, runs, second_match=False,
-                             later_match_limit=None):
+                             later_match_limit=None, future_kickoff=None):
         """Прогоняет скоуп с матчем «данных нет» `runs` раз, сдвигая часы планера.
 
         `second_match` добавляет второй такой же матч 101 после 100;
-        `later_match_limit` — `--match-limit` со второго рана.
+        `later_match_limit` — `--match-limit` со второго рана;
+        `future_kickoff` добавляет несыгранный матч 102 с этим временем начала.
         """
 
         from scrapers.fotmob import planner
@@ -1397,6 +1398,12 @@ class TestFotmobNativeRunner:
             extra["id"] = 101
             extra["pageUrl"] = "/matches/alpha-vs-beta/y#101"
             league["fixtures"]["allMatches"].append(extra)
+        if future_kickoff is not None:
+            upcoming = json.loads(json.dumps(league["fixtures"]["allMatches"][0]))
+            upcoming["id"] = 102
+            upcoming["pageUrl"] = "/matches/alpha-vs-beta/z#102"
+            upcoming["status"] = {"finished": False, "utcTime": future_kickoff}
+            league["fixtures"]["allMatches"].append(upcoming)
         responses = {
             canonicalize_target("allLeagues").canonical_url: {
                 "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
@@ -1529,6 +1536,36 @@ class TestFotmobNativeRunner:
 
         assert second["outcome"] == "source_gap"
         assert second["delay"] > timedelta(hours=47)
+
+    @pytest.mark.unit
+    def test_confirmed_source_gap_returns_after_the_next_scheduled_match(
+        self, monkeypatch
+    ):
+        """#1546: признанная дыра не держит турнир 48 ч, если впереди матч.
+
+        Источник не отдаёт старый товарищеский матч; дыра признана, но ближайший
+        матч турнира через 10 ч — скоуп возвращается вскоре после него
+        (10 ч + запас на доигрывание), как в ветке успеха (#1193).
+        """
+
+        from datetime import timezone
+
+        mod = self._module()
+        # Сдвиг рана двигает только часы планера; observed_at раннера — настоящее
+        # «сейчас», от него и считается срок.
+        future_kickoff = (datetime.now(timezone.utc) + timedelta(hours=10)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        _first, second = self._source_gap_attempts(
+            mod,
+            monkeypatch,
+            "2026-01-01T12:00:00.000Z",
+            runs=(0, 1),
+            future_kickoff=future_kickoff,
+        )
+
+        assert second["outcome"] == "source_gap"
+        assert timedelta(hours=12) < second["delay"] <= timedelta(hours=13)
 
     @pytest.mark.unit
     def test_unconfirmed_gap_matches_counts_runs_spread_and_success(self):
