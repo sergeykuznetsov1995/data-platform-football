@@ -88,6 +88,9 @@ logger = logging.getLogger(__name__)
 
 
 REPORT_SCHEMA_VERSION = 3
+# Per-scope cap of the daily match run: a duration guard only (#1474).  The
+# largest denominator backlog on 26.09.2026 was 264 (MLS 2026), 1 350 in all.
+DAILY_MATCH_LIMIT_PER_SCOPE = 300
 PUBLIC_COMMANDS = ("discover", "daily", "backfill", "replay")
 COMMANDS = PUBLIC_COMMANDS
 DEFAULT_BACKFILL_CHUNK_SIZE = 25
@@ -1555,17 +1558,11 @@ def _invoke(
             "limit": (
                 args.max_matches
                 if args.max_matches is not None
-                else 100
+                else DAILY_MATCH_LIMIT_PER_SCOPE
                 if daily_incremental
                 else None
             ),
             "force_replay": bool(getattr(args, "_force_replay", False)),
-            "kickoff_from": (
-                datetime_lib.datetime.now(datetime_lib.timezone.utc)
-                - datetime_lib.timedelta(days=7)
-                if daily_incremental
-                else None
-            ),
         }
         if bool(getattr(args, "_historical_replay", False)):
             match_kwargs["historical_replay"] = True

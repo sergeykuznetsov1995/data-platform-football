@@ -2834,7 +2834,6 @@ class WhoScoredIngestService:
         limit: Optional[int] = None,
         force_replay: bool = False,
         historical_replay: bool = False,
-        kickoff_from: Optional[datetime] = None,
     ) -> EntityResult:
         result = EntityResult(
             "matches",
@@ -2848,7 +2847,6 @@ class WhoScoredIngestService:
             match_ids=match_ids,
             limit=limit,
             include_success=force_replay,
-            kickoff_from=kickoff_from,
             include_exact_count=True,
         )
         result.attempted = len(candidates)

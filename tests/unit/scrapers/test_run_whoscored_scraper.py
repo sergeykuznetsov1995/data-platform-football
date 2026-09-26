@@ -388,14 +388,11 @@ def _runtime(
             limit,
             force_replay,
             historical_replay=False,
-            kickoff_from=None,
         ):
             self.match_force_replays.append(bool(force_replay))
             self.match_historical_replays.append(bool(historical_replay))
             if historical_replay:
                 assert force_replay is True
-            if kickoff_from is not None:
-                assert kickoff_from.tzinfo is not None
             call = ("matches", limit)
             if match_ids is not None:
                 call = (*call, tuple(match_ids))
@@ -881,7 +878,7 @@ def test_daily_runs_each_v2_entity_once_in_order(monkeypatch, tmp_path):
     assert service_cls.instances[0].calls == [
         ("schedule", None),
         ("previews", None),
-        ("matches", 100),
+        ("matches", runner.DAILY_MATCH_LIMIT_PER_SCOPE),
     ]
     assert report["rows"] == 4
     assert report["scopes"][0]["entities"]["missing_players"]["rows_written"] == 0
@@ -1185,7 +1182,7 @@ def test_daily_without_scope_reads_the_denominator_scopes(monkeypatch, tmp_path)
         == [
             ("schedule", None),
             ("previews", None),
-            ("matches", 100),
+            ("matches", runner.DAILY_MATCH_LIMIT_PER_SCOPE),
         ]
         for service in service_cls.instances
     )
@@ -1993,7 +1990,7 @@ def test_scheduled_scope_freezes_signed_targets_across_schedule_mutation():
     assert service.calls[1][0] == "match"
     assert service.calls[1][1]["match_ids"] == (11, 12)
     assert service.calls[1][1]["limit"] is None
-    assert service.calls[1][1]["kickoff_from"] is None
+    assert "kickoff_from" not in service.calls[1][1]
 
     attempts = args._scheduled_scope_attempts
     report = {
@@ -2044,7 +2041,7 @@ def test_scheduled_scope_preserves_explicit_empty_target_sets():
     kwargs = runner._invoke(Service(), "matches", args)
     assert kwargs["match_ids"] == ()
     assert kwargs["limit"] is None
-    assert kwargs["kickoff_from"] is None
+    assert "kickoff_from" not in kwargs
 
 
 @pytest.mark.unit

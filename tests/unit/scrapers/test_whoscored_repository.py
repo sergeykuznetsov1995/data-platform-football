@@ -2836,23 +2836,58 @@ def test_scope_bundle_recovers_only_its_unpublished_partial_batch(monkeypatch):
     assert len(writer.write_dataframe.call_args_list) == 3
 
 
-@pytest.mark.unit
-def test_match_candidates_keep_retryable_under_cap_past_the_kickoff_window():
-    from scrapers.whoscored.repository import DAILY_RETRYABLE_MAX_ATTEMPTS
-
+def _daily_candidate_sql(**kwargs):
     trino = MagicMock()
     trino.execute_query.return_value = []
     repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    repository.list_match_candidates("ENG-Premier League", "2627", **kwargs)
+    return " ".join(trino.execute_query.call_args.args[0].split())
 
-    repository.list_match_candidates(
-        "ENG-Premier League",
-        "2526",
-        limit=100,
-        kickoff_from=datetime(2026, 7, 13, 10, 0, 0, tzinfo=timezone.utc),
+
+@pytest.mark.unit
+def test_daily_match_candidates_have_no_kickoff_window_and_newest_first():
+    sql = _daily_candidate_sql(limit=300)
+
+    assert "s.date >= TIMESTAMP" not in sql
+    assert "ORDER BY date DESC, game_id DESC LIMIT 300" in sql
+    assert "s.status = 6 AND s.is_lineup_confirmed = TRUE" in sql
+    # A successful final match of the current parser is never re-fetched.
+    assert "INTERVAL '7' DAY" not in sql
+    assert "INTERVAL '30' DAY AS TIMESTAMP ) AND COALESCE( m.fetched_at" not in sql
+
+
+@pytest.mark.unit
+def test_daily_match_candidates_gate_on_stage_availability():
+    from scrapers.whoscored.repository import (
+        DAILY_RETRYABLE_MAX_ATTEMPTS,
+        NOT_AVAILABLE_REPROBE_HOURS,
+        STAGE_REPROBE_DAYS,
     )
 
-    sql = trino.execute_query.call_args.args[0]
-    # The kickoff lower bound never sheds a still-retryable match under the cap.
-    assert "s.date >= TIMESTAMP" in sql
-    assert "m.state = 'retryable'" in sql
+    sql = _daily_candidate_sql()
+
+    assert NOT_AVAILABLE_REPROBE_HOURS == 72
+    assert STAGE_REPROBE_DAYS == 30
+    assert "WHEN COUNT_IF(m.state = 'success') > 0 THEN 'available'" in sql
+    assert (
+        "WHEN COUNT_IF( m.state = 'not_available' AND s.is_lineup_confirmed = TRUE"
+        " ) >= 2 THEN 'unavailable' ELSE 'unknown'"
+    ) in sql
+    # Unknown/unavailable stage: one probe, its latest played game, every 30 days.
+    assert "PARTITION BY s.stage_id ORDER BY s.date DESC, s.game_id DESC" in sql
+    assert "WHERE stage_availability = 'available' OR ( stage_probe_rank = 1" in sql
+    assert "INTERVAL '30' DAY AS TIMESTAMP" in sql
+    # "Not available" in an available stage: exactly one re-probe after 72 h.
+    assert "COALESCE(na.not_available_count, 0) <= 1" in sql
+    assert "INTERVAL '72' HOUR" in sql
     assert f"COALESCE(m.attempt_no, 0) < {DAILY_RETRYABLE_MAX_ATTEMPTS}" in sql
+
+
+@pytest.mark.unit
+def test_explicit_match_ids_keep_the_ungated_candidate_policy():
+    sql = _daily_candidate_sql(match_ids=[11, 12])
+
+    assert "stage_availability" not in sql
+    assert "is_lineup_confirmed" not in sql
+    assert "'not_available'" not in sql
+    assert "ORDER BY date, game_id" in sql
