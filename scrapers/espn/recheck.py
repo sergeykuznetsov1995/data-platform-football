@@ -196,6 +196,21 @@ def plan_recheck(trino, now: datetime) -> dict[int, tuple[str, int, str]]:
 # --------------------------------------------------------------- journal
 
 
+def journalled(trino, slug: str, season_year: int, rechecks: Mapping[int, str]) -> set[int]:
+    """Events of ``rechecks`` (``event_id -> kind``) the journal already has
+    with that kind, whatever the outcome: each is downloaded at most once."""
+
+    if not rechecks:
+        return set()
+    ids = ", ".join(str(int(event_id)) for event_id in sorted(rechecks))
+    rows = trino.execute_query(
+        f"SELECT DISTINCT event_id, kind FROM {RECHECK_TABLE} "
+        f"WHERE slug = ? AND season_year = ? AND event_id IN ({ids})",
+        (slug, int(season_year)),
+    )
+    return {int(event_id) for event_id, kind in rows if rechecks.get(int(event_id)) == kind}
+
+
 def ensure_recheck_table(conn) -> None:
     _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {JOURNAL_SCHEMA}")
     columns = ", ".join(f"{name} {sql_type}" for name, sql_type in RECHECK_COLUMNS)
@@ -260,6 +275,7 @@ __all__ = [
     "compare_parts",
     "ensure_recheck_table",
     "flush_rechecks",
+    "journalled",
     "plan_recheck",
     "recheck_row",
     "select_candidates",
