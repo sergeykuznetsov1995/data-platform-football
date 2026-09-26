@@ -291,6 +291,8 @@ def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
         ("Africa Cup of Nations 2026", "2025", "2026"),
         # A two-digit split label is read by the century window, not 20xx.
         ("1992 King Fahd Cup 91/92", "1991", "9192"),
+        # A stated century is kept.
+        ("Campeonato Sudamericano 1920/21", "1920", "2021"),
     ],
 )
 def test_title_edition_id_is_the_source_saison_id(title, edition_id, season) -> None:
@@ -347,6 +349,12 @@ def test_discovery_drops_a_competition_the_source_never_staged() -> None:
         '<!doctype html><html lang="en"><head>'
         "<title>Africa Cup of Nations 2026 | Transfermarkt</title>"
         '</head><body><h1 data-competition-id="OTHER">Cup</h1></body></html>',
+        # The canonical route points at another competition.
+        '<!doctype html><html lang="en"><head>'
+        "<title>Africa Cup of Nations 2026 | Transfermarkt</title>"
+        '<link rel="canonical" href="https://www.transfermarkt.com/'
+        'other-cup/startseite/pokalwettbewerb/OTHER">'
+        '</head><body><h1>Cup</h1></body></html>',
     ],
 )
 def test_one_unreadable_profile_is_quarantined_and_reported(body) -> None:

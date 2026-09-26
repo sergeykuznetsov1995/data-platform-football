@@ -19,6 +19,7 @@ from scrapers.transfermarkt.season import (
     SINGLE_YEAR,
     SPLIT_YEAR,
     SeasonRuleError,
+    label_to_saison_id,
     label_to_season,
     saison_id_to_season,
     season_to_saison_id,
@@ -95,3 +96,17 @@ def test_invalid_values_fail_closed():
         label_to_season("2025", "unknown")
     with pytest.raises(RegistryError):
         canonical_season("25/27", SeasonFormat.SPLIT_YEAR)
+
+
+@pytest.mark.parametrize(
+    ("label", "season_format", "saison_id"),
+    [
+        ("1920/21", SPLIT_YEAR, 1920),
+        ("1899/1900", SPLIT_YEAR, 1899),
+        ("91/92", SPLIT_YEAR, 1991),
+        ("25/26", SPLIT_YEAR, 2025),
+        ("2026", SINGLE_YEAR, 2025),
+    ],
+)
+def test_label_keeps_its_stated_century(label, season_format, saison_id):
+    assert label_to_saison_id(label, season_format) == saison_id

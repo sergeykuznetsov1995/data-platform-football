@@ -99,6 +99,22 @@ def label_to_season(label: Any, season_format: Any) -> str:
     return f"{start % 100:02d}{end % 100:02d}"
 
 
+def label_to_saison_id(label: Any, season_format: Any) -> int:
+    """The ``saison_id`` of a printed label, keeping a stated century.
+
+    ``"1920/21"`` is 1920 and ``"91/92"`` is 1991; a calendar ``"2026"`` is
+    2025.  Going through the two-digit slug would lose the century.
+    """
+
+    fmt = _format(season_format)
+    text = str(label).strip()
+    if fmt == SINGLE_YEAR:
+        if not _YEAR_RE.fullmatch(text):
+            raise SeasonRuleError(f"invalid single-year edition: {text!r}")
+        return int(text) - 1
+    return split_year_bounds(text)[0]
+
+
 def season_to_saison_id(season: Any, season_format: Any) -> int:
     """The ``saison_id`` of a canonical season.
 
@@ -135,6 +151,7 @@ __all__ = [
     "SINGLE_YEAR",
     "SPLIT_YEAR",
     "SeasonRuleError",
+    "label_to_saison_id",
     "label_to_season",
     "saison_id_to_season",
     "season_to_saison_id",

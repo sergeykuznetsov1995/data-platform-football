@@ -22,8 +22,7 @@ from bs4 import BeautifulSoup, Tag
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from scrapers.transfermarkt.season import (
     SeasonRuleError,
-    label_to_season,
-    season_to_saison_id,
+    label_to_saison_id,
 )
 from scrapers.transfermarkt.registry import (
     AgeCategory,
@@ -787,9 +786,7 @@ def _title_edition(
     season_format = _label_season_format(label, profile_url)
     # The edition id is the source's saison_id, by the one rule in season.py:
     # a calendar "2026" is saison_id 2025, "91/92" is 1991 (not 2091).
-    edition_id = str(
-        season_to_saison_id(label_to_season(label, season_format), season_format)
-    )
+    edition_id = str(label_to_saison_id(label, season_format))
     return {edition_id: (label, True, {})}
 
 
@@ -1015,14 +1012,18 @@ class TransfermarktCompetitionDiscovery:
             soup = self._soup(document)
             if not _has_season_markup(soup):
                 canonical = _canonical_profile_route(soup, candidate.profile_url)
-                if canonical is not None:
+                identity = _profile_identity(canonical) if canonical else None
+                if canonical is not None and (
+                    identity is None or identity[0] != candidate.competition_id
+                ):
+                    # A canonical link to another competition quarantines this
+                    # one only; the foreign page is not fetched.
+                    quarantined[candidate.competition_id] = (
+                        f"canonical route changes identity: {canonical}"
+                    )
+                elif canonical is not None:
                     document = self._get(canonical)
                     soup = self._soup(document)
-                    identity = _profile_identity(canonical)
-                    if identity is None or identity[0] != candidate.competition_id:
-                        raise DiscoverySchemaError(
-                            f"canonical route changes identity: {canonical}"
-                        )
                     candidate.slug = identity[1]
                     candidate.profile_url = canonical
             declared_id = soup.select_one("[data-competition-id]")
