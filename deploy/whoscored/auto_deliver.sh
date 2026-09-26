@@ -50,6 +50,17 @@ LOG="$OUT/auto_deliver.log"
 SHA=""
 CHECK=0; [ "$MODE" = --check ] && CHECK=1
 
+# --- приёмка прогона ежедневника: обе формы DAG — до #1474 (ingest_daily) и после
+# (ingest_matches). discover_catalog после #1474 работает раз в неделю, но в остальные
+# прогоны раннер выходит по недельному гейту с rc=0 — задача всё равно success.
+tasks_ok() {
+  case "$1" in
+    "discover_catalog=success ingest_daily=success" | \
+    "discover_catalog=success ingest_matches=success") return 0 ;;
+  esac
+  return 1
+}
+
 # --- вывод: в --check ничего не пишется на диск (ни лог, ни журнал, ни замок)
 log() { echo "$*"; [ "$CHECK" = 1 ] || echo "$(date -u +%FT%TZ) [$MODE] $*" >> "$LOG"; }
 journal() { [ "$CHECK" = 1 ] || echo "$(date -u +%FT%TZ) mode=$MODE sha=${SHA:0:12} $*" >> "$OUT/journal.log"; }
@@ -269,12 +280,12 @@ if [ -f "$INFLIGHT" ]; then
     exit 0
   fi
   RID=${RUN%|*}
-  TASKS=$(q "select string_agg(task_id || '=' || coalesce(state,'none'), ' ' order by task_id) from task_instance where dag_id='dag_ingest_whoscored' and run_id='$RID' and task_id in ('discover_catalog','ingest_matches')")
+  TASKS=$(q "select string_agg(task_id || '=' || coalesce(state,'none'), ' ' order by task_id) from task_instance where dag_id='dag_ingest_whoscored' and run_id='$RID' and task_id in ('discover_catalog','ingest_daily','ingest_matches')")
   IE=$(q "select count(*) from import_error")
   HIE=$(q "select count(*) from dag where dag_id in ($DAG_IDS) and has_import_errors")
   log "приёмка ${SHA:0:12} прогоном $RID: $TASKS; import_error=$IE; DAG с ошибкой импорта=$HIE"
   # validate_data в приёмку не входит до #1476 (сейчас красный всегда).
-  if [ "$TASKS" != "discover_catalog=success ingest_matches=success" ] || [ "$IE" != "0" ] || [ "$HIE" != "0" ]; then
+  if ! tasks_ok "$TASKS" || [ "$IE" != "0" ] || [ "$HIE" != "0" ]; then
     WHY="прогон $RID: ${TASKS:-задач нет}; import_error=${IE:-?}"
     [ "$CHECK" = 1 ] && { log "заметка: приёмка провалена ($WHY) — cron-тик откатит на ${PREV:0:12}"; exit 0; }
     BUSY=$(busy_reason); [ -z "$BUSY" ] || { log "приёмка провалена, откат ждёт: $BUSY"; exit 0; }

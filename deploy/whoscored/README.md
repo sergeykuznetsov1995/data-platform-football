@@ -58,7 +58,7 @@ $RUNTIME/{logs,spool,circuit}   состояние контура
 3. **Висящая доставка** (`whoscored-inflight`):
    - фаза `deploying` (автомат умер между checkout и перечитыванием) → откат на прежний SHA;
    - фаза `delivered` → ждём первый прогон `dag_ingest_whoscored`, стартовавший после доставки, до его
-     конца. Провал = `discover_catalog` или `ingest_matches` не `success`, либо `import_error` > 0, либо
+     конца. Провал = `discover_catalog` или задача матчей (`ingest_matches`, до #1474 — `ingest_daily`) не `success`, либо `import_error` > 0, либо
      у DAG `has_import_errors` → **откат** на прежний SHA + 🔴 (SHA помечается `rejected`).
      Задачи `success` → прирост = строки `whoscored_matches` и `whoscored_events` с `_ingested_at`
      позже доставки (манифест — только в отчёт). Есть строки → ✅, SHA принят. Нет ни матчей, ни

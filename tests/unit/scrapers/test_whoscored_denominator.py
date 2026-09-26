@@ -1,4 +1,4 @@
-"""#1474: explicit daily denominator of WhoScored."""
+"""#1474: explicit daily denominator of WhoScored (scrapers/whoscored/catalog.py)."""
 
 from __future__ import annotations
 
@@ -6,13 +6,11 @@ from datetime import date
 from types import SimpleNamespace
 
 from scrapers.whoscored.catalog import (
-    DEFAULT_TOURNAMENT_OVERRIDES,
-    classify_tournament,
-)
-from scrapers.whoscored.denominator import (
     CLASS_A_TOURNAMENT_IDS,
+    DEFAULT_TOURNAMENT_OVERRIDES,
     EXCLUDED_TOURNAMENT_IDS,
     PROBE_SCOPE_SPECS,
+    classify_tournament,
     denominator_scopes,
     missing_probe_specs,
 )

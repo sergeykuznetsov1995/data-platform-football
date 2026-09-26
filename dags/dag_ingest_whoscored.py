@@ -3,7 +3,7 @@
 Runs twice a day (10:00 and 22:00, #1474).  One isolated runner refreshes the
 persisted men's-competition catalog once a week (Monday gate inside the runner,
 a short-circuit otherwise) and then ingests the explicit daily denominator
-(``scrapers/whoscored/denominator.py``: class-A tournaments plus probe scopes):
+(``scrapers/whoscored/catalog.py`` denominator: class-A tournaments plus probe scopes):
 schedule and matches (events, lineups, match stats) in ``ingest_matches``,
 the weekly stage-statistics feeds in a separate ``ingest_stages`` task whose
 failure never fails the matches.  Traffic egresses through the residential

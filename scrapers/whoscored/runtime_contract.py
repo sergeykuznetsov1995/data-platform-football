@@ -100,7 +100,6 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/utils/rate_limiter.py",
     "scrapers/whoscored/__init__.py",
     "scrapers/whoscored/catalog.py",
-    "scrapers/whoscored/denominator.py",
     "scrapers/whoscored/detailed_feeds.py",
     "scrapers/whoscored/domain.py",
     "scrapers/whoscored/parsers.py",

@@ -1074,7 +1074,7 @@ def _select_denominator_scopes(catalog: Any) -> list[tuple[RunnerScope, Any]]:
     only the daily selection narrows to the class-A tournaments (current and
     just finished season) and the scopes still being probed.
     """
-    from scrapers.whoscored.denominator import (
+    from scrapers.whoscored.catalog import (
         denominator_scopes,
         missing_probe_specs,
     )
