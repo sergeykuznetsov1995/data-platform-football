@@ -225,8 +225,9 @@ with DAG(
         task_id="ingest_stages",
         # Stage-statistics feeds, once a week: the runner gates on the run
         # slot (data_interval_end = 10:00 Monday), not on the start time.
-        # all_done: runs after ingest_matches whatever its state, and its own
-        # failure is a separate red task that never fails ingest_matches.
+        # all_done: runs after ingest_matches whatever its state.  The task
+        # has no report gate, so any failed stage scope turns it red; that
+        # red never reaches ingest_matches or validate_data.
         bash_command=(
             "cd {root} && rm -f {result} && "
             "python {runner} daily "
@@ -234,8 +235,7 @@ with DAG(
             "--skip-profiles "
             "--weekly-gate {{{{ data_interval_end.isoformat() }}}} "
             "--transport-policy direct_only "
-            "--output {result} "
-            "|| [ -s {result} ]"
+            "--output {result}"
         ).format(root=RUNTIME_ROOT, runner=RUNNER, result=STAGES_RESULT_PATH),
         env=_TASK_ENV,
         append_env=True,

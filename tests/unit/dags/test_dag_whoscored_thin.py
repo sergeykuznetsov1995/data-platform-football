@@ -94,7 +94,8 @@ def test_ingest_stages_is_a_separate_weekly_task(ingest):
     assert "--weekly-gate" in cmd
     assert "--skip-profiles" in cmd
     assert "--transport-policy direct_only" in cmd
-    assert "|| [ -s" in cmd
+    # No report gate downstream: a failed stage scope must turn the task red.
+    assert "|| [ -s" not in cmd
     assert ingest.STAGES_RESULT_PATH in cmd
     assert ingest.RESULT_PATH not in cmd
     assert stages._init_kwargs["trigger_rule"] == "all_done"

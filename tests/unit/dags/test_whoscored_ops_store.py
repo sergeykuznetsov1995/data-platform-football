@@ -114,7 +114,7 @@ def test_plan_identity_binds_catalog_generation_and_candidate_policy(
         "pinned-catalog-stage-count-v1"
     )
     assert first["policy"]["schedule_request_units_per_stage"] == 70
-    assert first["policy"]["policy_version"] == 7
+    assert first["policy"]["policy_version"] == 8
     assert first["policy"]["match_capacity_policy"] == (
         "exact-match-plus-preview-cardinality-v1"
     )

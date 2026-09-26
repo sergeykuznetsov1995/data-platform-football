@@ -2875,7 +2875,10 @@ def test_daily_match_candidates_gate_on_stage_availability():
     ) in sql
     # Unknown/unavailable stage: one probe, its latest played game, every 30 days.
     assert "PARTITION BY s.stage_id ORDER BY s.date DESC, s.game_id DESC" in sql
-    assert "WHERE stage_availability = 'available' OR ( stage_probe_rank = 1" in sql
+    assert (
+        "WHERE (stage_availability = 'available' AND game_reprobe_due) OR ("
+        " stage_availability <> 'available' AND stage_probe_rank = 1"
+    ) in sql
     assert "INTERVAL '30' DAY AS TIMESTAMP" in sql
     # "Not available" in an available stage: exactly one re-probe after 72 h.
     assert "COALESCE(na.not_available_count, 0) <= 1" in sql

@@ -137,6 +137,24 @@ SCOPE_DATASET_TABLES = {
     "whoscored_referee_stage_stats",
 }
 
+# #1474: the stage-statistics feeds moved from the daily "season" bundle to
+# their own weekly "stages" bundle.  Their current snapshot (view and
+# no-shrink guard) is the latest successful bundle of the scope that published
+# the table, whatever its entity group, so the pre-split season snapshot stays
+# visible until the first "stages" bundle replaces it.
+SCOPE_STAGE_FEED_TABLES = frozenset(
+    {
+        "whoscored_team_stage_stats",
+        "whoscored_player_stage_stats",
+        "whoscored_referee_stage_stats",
+    }
+)
+
+
+def _scope_published_table_sql(table: str) -> str:
+    return f"json_extract_scalar(entity_counts_json, '$.{table}') IS NOT NULL"
+
+
 # Betting offers are an expiring source snapshot: WhoScored removes providers
 # and prices after a match starts or finishes.  The physical Iceberg batches
 # remain append-only, while the current manifest is allowed to publish the
@@ -1883,12 +1901,26 @@ class WhoScoredRepository:
         for table in sorted(SCOPE_DATASET_TABLES):
             if not self.trino.table_exists(self.schema, table):
                 continue
+            table_latest = latest
+            if table in SCOPE_STAGE_FEED_TABLES:
+                table_latest = f"""(
+                    SELECT * FROM (
+                        SELECT m.*, ROW_NUMBER() OVER (
+                            PARTITION BY league, season
+                            ORDER BY completed_at DESC, _ingested_at DESC,
+                                     batch_id DESC
+                        ) AS _manifest_rank
+                        FROM {self._scope_manifest} m
+                        WHERE state = 'success'
+                          AND {_scope_published_table_sql(table)}
+                    ) WHERE _manifest_rank = 1
+                )"""
             self.trino._execute(
                 f"""
                 CREATE OR REPLACE VIEW {self.catalog}.{self.schema}.{table}_current AS
                 SELECT d.*
                 FROM {self.catalog}.{self.schema}.{table} d
-                JOIN {latest} m
+                JOIN {table_latest} m
                   ON m.league = d.league
                  AND m.season = d.season
                  AND m.batch_id = d._scope_batch_id
@@ -1897,7 +1929,7 @@ class WhoScoredRepository:
                 FROM {self.catalog}.{self.schema}.{table} d
                 WHERE d._scope_batch_id IS NULL
                   AND NOT EXISTS (
-                      SELECT 1 FROM {latest} m
+                      SELECT 1 FROM {table_latest} m
                       WHERE m.league = d.league
                         AND m.season = d.season
                   )
@@ -3658,19 +3690,13 @@ class WhoScoredRepository:
             if daily
             else ""
         )
+        # Daily: every "not available" game stays eligible here; the stage
+        # filter below decides.  In an available stage it is re-probed once
+        # after NOT_AVAILABLE_REPROBE_HOURS; in an unknown/unavailable stage
+        # the latest game is the monthly stage probe whatever its NA count.
         reprobe_filter = (
-            f"""
-                    OR (
-                        m.state = 'not_available'
-                        AND COALESCE(na.not_available_count, 0) <= 1
-                        AND COALESCE(
-                            m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
-                        ) <= CAST(
-                            CURRENT_TIMESTAMP
-                            - INTERVAL '{int(NOT_AVAILABLE_REPROBE_HOURS)}' HOUR
-                            AS TIMESTAMP
-                        )
-                    )"""
+            """
+                    OR m.state = 'not_available'"""
             if daily
             else ""
         )
@@ -3773,8 +3799,21 @@ class WhoScoredRepository:
             else ""
         )
         daily_projection = (
-            """,
+            f""",
                    COALESCE(st.availability, 'unknown') AS stage_availability,
+                   (
+                       m.state IS DISTINCT FROM 'not_available'
+                       OR (
+                           COALESCE(na.not_available_count, 0) <= 1
+                           AND COALESCE(
+                               m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
+                           ) <= CAST(
+                               CURRENT_TIMESTAMP
+                               - INTERVAL '{int(NOT_AVAILABLE_REPROBE_HOURS)}' HOUR
+                               AS TIMESTAMP
+                           )
+                       )
+                   ) AS game_reprobe_due,
                    st.last_attempt_at AS stage_last_attempt_at,
                    ROW_NUMBER() OVER (
                        PARTITION BY s.stage_id
@@ -3785,9 +3824,10 @@ class WhoScoredRepository:
         )
         stage_filter = (
             f"""
-            WHERE stage_availability = 'available'
+            WHERE (stage_availability = 'available' AND game_reprobe_due)
                OR (
-                    stage_probe_rank = 1
+                    stage_availability <> 'available'
+                    AND stage_probe_rank = 1
                     AND (
                         stage_last_attempt_at IS NULL
                         OR stage_last_attempt_at <= CAST(
@@ -4094,11 +4134,19 @@ class WhoScoredRepository:
                     )
             return batch_id
 
+        stage_feed_tables = sorted(SCOPE_STAGE_FEED_TABLES & set(counts))
+        previous_filter = (
+            "("
+            + " OR ".join(_scope_published_table_sql(t) for t in stage_feed_tables)
+            + ")"
+            if stage_feed_tables
+            else f"entity_group = {_sql_string(entity_group)}"
+        )
         previous_rows = self.trino.execute_query(
             f"SELECT entity_counts_json FROM {self._scope_manifest} "
             f"WHERE league = {_sql_string(league)} "
             f"AND season = {_sql_string(season)} "
-            f"AND entity_group = {_sql_string(entity_group)} AND state = 'success' "
+            f"AND {previous_filter} AND state = 'success' "
             "ORDER BY completed_at DESC, _ingested_at DESC LIMIT 1"
         )
         previous = json.loads(str(previous_rows[0][0])) if previous_rows else {}

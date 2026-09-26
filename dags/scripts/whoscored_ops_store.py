@@ -27,8 +27,10 @@ from scrapers.whoscored.runtime_contract import require_production_runtime_class
 
 OPS_SCHEMA_VERSION = 1
 BACKFILL_PLAN_VERSION = 5
-BACKFILL_RECEIPT_VERSION = 6
-BACKFILL_POLICY_VERSION = 7
+# #1474: receipt 7 / policy 8 — the schedule receipt no longer carries
+# non_opta_game_ids and the 2-match probe stage is gone.
+BACKFILL_RECEIPT_VERSION = 7
+BACKFILL_POLICY_VERSION = 8
 LEGACY_BACKFILL_CHECKPOINT_VERSION = 2
 BACKFILL_CHECKPOINT_VERSION = 3
 BACKFILL_CHECKPOINT_DATA_VERSION = 1
