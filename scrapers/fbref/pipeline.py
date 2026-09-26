@@ -807,9 +807,52 @@ class WaveResult:
     # to the next run instead of failing the wave (#1324).
     deferred_target_failures: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    # Wall-clock profile of the wave in whole milliseconds (#1320).  Integers,
+    # because the run aggregate sums every counter through ``int()``.
+    wall_ms: int = 0
+    domain_wait_ms: int = 0
+    raw_store_ms: int = 0
+    postgres_ms: int = 0
+    trino_generic_ms: int = 0
+    trino_typed_ms: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+_STAGE_FIELDS = (
+    "domain_wait_ms",
+    "raw_store_ms",
+    "postgres_ms",
+    "trino_generic_ms",
+    "trino_typed_ms",
+)
+
+
+class _TimedCalls:
+    """Proxy adding the wall time of every method call to one stage (#1320)."""
+
+    def __init__(self, target, stage_ms: dict, stage: str, clock) -> None:
+        self._target = target
+        self._stage_ms = stage_ms
+        self._stage = stage
+        self._clock = clock
+
+    def __getattr__(self, name):
+        value = getattr(self._target, name)
+        if not callable(value):
+            return value
+
+        def timed(*args, **kwargs):
+            started = self._clock()
+            try:
+                return value(*args, **kwargs)
+            finally:
+                self._stage_ms[self._stage] += int(
+                    (self._clock() - started) * 1000
+                )
+
+        return timed
 
 
 @dataclass(frozen=True)
@@ -2473,6 +2516,10 @@ class FBrefPipeline:
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
+        # Stage profiling clock, separate from ``monotonic`` so profiling
+        # never consumes a deterministic test's scripted deadline ticks.
+        self.stage_clock: Callable[[], float] = time.perf_counter
+        self._stage_ms: Optional[dict] = None
 
     @classmethod
     def from_env(cls) -> "FBrefPipeline":
@@ -2980,6 +3027,45 @@ class FBrefPipeline:
             )
         if wait_seconds:
             self.sleep(wait_seconds)
+            if self._stage_ms is not None:
+                self._stage_ms["domain_wait_ms"] += int(wait_seconds * 1000)
+
+    @contextmanager
+    def _profiled_wave(self):
+        """Time one wave's storage calls by stage for the progress log (#1320).
+
+        Yields the stage dict; ``wall_ms`` is filled on exit.  The stores are
+        swapped for timing proxies only for the duration of the wave.
+        """
+
+        stage_ms = dict.fromkeys(_STAGE_FIELDS, 0)
+        typed_writer = self.typed_adapter.writer
+        stores = (self.control, self.raw_store, self.generic_writer)
+        clock = self.stage_clock
+        self.control = _TimedCalls(self.control, stage_ms, "postgres_ms", clock)
+        self.raw_store = _TimedCalls(
+            self.raw_store, stage_ms, "raw_store_ms", clock
+        )
+        self.generic_writer = _TimedCalls(
+            self.generic_writer, stage_ms, "trino_generic_ms", clock
+        )
+        self.typed_adapter.writer = _TimedCalls(
+            typed_writer, stage_ms, "trino_typed_ms", clock
+        )
+        self._stage_ms = stage_ms
+        started = clock()
+        try:
+            yield stage_ms
+        finally:
+            stage_ms["wall_ms"] = int((clock() - started) * 1000)
+            self._stage_ms = None
+            self.control, self.raw_store, self.generic_writer = stores
+            self.typed_adapter.writer = typed_writer
+
+    @staticmethod
+    def _apply_stage_ms(result: WaveResult, stage_ms: Mapping[str, int]) -> None:
+        for name, value in stage_ms.items():
+            setattr(result, name, value)
 
     @staticmethod
     def _page_target_for_lease(lease) -> PageTarget:
@@ -4285,22 +4371,26 @@ class FBrefPipeline:
                         # its aggregate.
                         aggregate.deadline_reached = True
                         break
-                    fetched = self.fetch_wave(
-                        run_id,
-                        worker_id=f"{worker_id}:batch-{batch:02d}",
-                        page_kinds=page_kinds,
-                        settings=settings,
-                        _live_session=live_session,
-                    )
+                    with self._profiled_wave() as fetch_ms:
+                        fetched = self.fetch_wave(
+                            run_id,
+                            worker_id=f"{worker_id}:batch-{batch:02d}",
+                            page_kinds=page_kinds,
+                            settings=settings,
+                            _live_session=live_session,
+                        )
+                    self._apply_stage_ms(fetched, fetch_ms)
                     live_session.rollover_if_due(
                         self.control,
                         within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,
                     )
-                    parsed = self.parse_wave(
-                        run_id,
-                        page_kinds=page_kinds,
-                        settings=settings,
-                    )
+                    with self._profiled_wave() as parse_ms:
+                        parsed = self.parse_wave(
+                            run_id,
+                            page_kinds=page_kinds,
+                            settings=settings,
+                        )
+                    self._apply_stage_ms(parsed, parse_ms)
                     aggregate.batches = batch
                     self._merge_wave_result(aggregate.fetch, fetched)
                     self._merge_wave_result(aggregate.parse, parsed)
@@ -4338,6 +4428,11 @@ class FBrefPipeline:
                     if fetched.claimed == 0 and parsed.cohort_size == 0:
                         aggregate.frontier_closed = True
                         break
+                loop_finished = self.stage_clock()
+            logger.info(
+                "FBref live waves deferred scope reconcile took %d ms",
+                int((self.stage_clock() - loop_finished) * 1000),
+            )
             if (
                 aggregate.frontier_closed
                 and isinstance(reconciliation, Mapping)
@@ -4365,12 +4460,17 @@ class FBrefPipeline:
             failed = False
             return aggregate
         finally:
+            close_started = self.stage_clock()
             live_session.close(
                 self.control,
                 status="failed" if failed else "closed",
             )
             if settings.persistent_http_session and not failed:
                 self.control.assert_persistent_metering_reconciled(run_id)
+            logger.info(
+                "FBref live waves session close took %d ms",
+                int((self.stage_clock() - close_started) * 1000),
+            )
 
     def _eligible_competitions(self) -> dict[str, dict]:
         return {
