@@ -1,0 +1,175 @@
+# Новый контур ESPN (#1507): свой Airflow проекта espn-live — своя metadb, свой том, DAG
+# нового контура из deploy/espn/dags. Старый проект espn-airflow (7 DAG на паузе) не трогаем
+# до задачи 21 — он точка отката; тот же -p пересоздал бы его контейнеры.
+#
+# Код и образ едут вместе: образ — по digest прямо здесь, код — каталоги (не файлы: rename при
+# checkout теряет файловый bind-mount) из неизменяемого корня релиза ${ESPN_RELEASE_ROOT}
+# (git archive <sha> → /root/espn-release-<sha>, ro). Корень задаёт только автомат
+# deploy/espn/auto_deliver.py по своему пину state/accepted — в env-файле его нет.
+# Env-файл /root/.secrets/espn.env (0600) — только секреты. Никаких *_PROXY (транспорт ESPN
+# падает AmbientProxyError), canary-state, контрольной БД, RELEASE_COMMIT/TREE_SHA256.
+#
+# Запуск — только через автомат (README «Доставка»), всегда поимённо и с --no-deps:
+#   ESPN_RELEASE_ROOT=/root/espn-release-<sha> docker compose -p espn-live \
+#     --project-directory /root/espn-deploy -f <корень>/deploy/espn/airflow.compose.yaml \
+#     --env-file /root/.secrets/espn.env up -d --no-deps --force-recreate \
+#     airflow-scheduler airflow-webserver
+name: espn-live
+
+x-espn-live-common: &espn-live-common
+  image: data-platform-airflow-scheduler@sha256:5286d9cf18bf4328c8a360d6098e384d6bce8ea7bb559377ae1aad6a143617cf
+  pull_policy: never
+  user: "50000:0"
+  shm_size: 512m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+  labels:
+    # По метке уборка корней релизов узнаёт, что корень ещё смонтирован.
+    espn.release_root: ${ESPN_RELEASE_ROOT:?корень релиза задаёт deploy/espn/auto_deliver.py}
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: UTC
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?}
+    # Пароль — hex (посев), в DSN без экранирования.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${ESPN_LIVE_DB_PASSWORD:?}@espn-live-metadb:5432/airflow
+    PYTHONPATH: /opt/airflow
+    PYTHONPYCACHEPREFIX: /tmp/pycache
+    TRINO_HOST: trino
+    TRINO_PORT: ${TRINO_PORT:?}
+    TRINO_USER: ${TRINO_USER:?}
+    TRINO_PASSWORD: ${TRINO_PASSWORD:?}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:?}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:?}
+    ESPN_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE:?}/raw/espn
+  volumes:
+    - espn_live_logs:/opt/airflow/logs
+    # Заслонка gate.json и издания editions.json ($AIRFLOW_HOME/state/espn) переживают выкаты.
+    - espn_live_state:/opt/airflow/state
+    - type: bind
+      source: ${ESPN_RELEASE_ROOT}/deploy/espn/dags
+      target: /opt/airflow/dags
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${ESPN_RELEASE_ROOT}/scrapers
+      target: /opt/airflow/scrapers
+      read_only: true
+      bind:
+        create_host_path: false
+    # scrapers/espn читают configs/espn по пути parents[2]/configs/espn.
+    - type: bind
+      source: ${ESPN_RELEASE_ROOT}/configs/espn
+      target: /opt/airflow/configs/espn
+      read_only: true
+      bind:
+        create_host_path: false
+  networks:
+    - default
+    - storage
+    - backend
+
+services:
+  airflow-metadb:
+    image: postgres@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+    pull_policy: never
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - FOWNER
+      - DAC_READ_SEARCH
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${ESPN_LIVE_DB_PASSWORD:?}
+      POSTGRES_DB: airflow
+    volumes:
+      - espn_live_pgdata:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases:
+          - espn-live-metadb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Только схема metadb и пулы из pools.json; паузы DAG и прочее не трогает.
+  airflow-init:
+    <<: *espn-live-common
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -euc
+      - |
+        airflow db migrate
+        airflow pools import /opt/espn-deploy/pools.json
+    volumes:
+      - type: bind
+        source: ${ESPN_RELEASE_ROOT}/deploy/espn
+        target: /opt/espn-deploy
+        read_only: true
+        bind:
+          create_host_path: false
+
+  airflow-scheduler:
+    <<: *espn-live-common
+    command: scheduler
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 1G
+
+  airflow-webserver:
+    <<: *espn-live-common
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8089:8080"
+
+# Тома создаёт посев (README «Доставка»): state и logs — владелец 50000:0, иначе Airflow
+# (uid 50000) не пишет в свежий том, смонтированный на отсутствующий в образе путь.
+volumes:
+  espn_live_pgdata:
+    external: true
+    name: espn_live_pgdata
+  espn_live_logs:
+    external: true
+    name: espn_live_logs
+  espn_live_state:
+    external: true
+    name: espn_live_state
+
+networks:
+  default: {}
+  storage:
+    external: true
+    name: dp-storage
+  backend:
+    external: true
+    name: dp-backend

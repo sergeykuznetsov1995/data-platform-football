@@ -7,8 +7,8 @@ Telegram:
 
 | Правило | Когда тревога |
 | --- | --- |
-| `paused` | любой из `EXPECTED_DAGS` (`dag_ingest_espn`, `dag_trigger_espn_daily`, `dag_monitor_espn`, `dag_discover_espn_registry`) в metadb `espn-airflow-airflow-metadb-1` на паузе или отсутствует; metadb не отвечает — тревога того же правила «недоступен» |
-| `stall` | в `espn_lineup_generation_v2` ∪ `espn_matchsheet_generation_v2` нет ни одного матча с `_source_fetched_at` за 36 ч (не `_ingested_at` — в этих таблицах оно = execution_date прогона); Trino недоступен — правило пропускается |
+| `paused` | `EXPECTED_DAGS` (с #1507 — `dag_espn_current`) в metadb нового контура `espn-live-airflow-metadb-1` на паузе или отсутствует; metadb не отвечает — тревога того же правила «недоступен» |
+| `stall` | в `BRONZE_TABLES` (с #1507 — `espn_match` нового bronze) нет ни одного матча с `_source_fetched_at` за 36 ч; Trino недоступен или таблицы ещё нет (до первой волны) — правило пропускается |
 | `red:<slug>` (#1505) | турнир красный в 3 последних волнах `dag_espn_current` подряд по журналу волн `iceberg.ops.espn_wave_tournament_v1`; без issue; отбой — последняя волна с турниром зелёная или его нет ни в одной из 3 последних; журнала нет (до #1507) или Trino недоступен — правило молча пропускается |
 | `downgrade` (#1506) | за 24 ч в журнале перепроверок `iceberg.ops.espn_recheck_v1` есть хотя бы один `downgrade_rejected` (ESPN прислал беднее — оставлено старое); текст — число и лиги; «продолжается» раз в сутки, без issue; отбой — за 24 ч случаев нет; журнала нет (до #1507) или Trino недоступен — молчит (`downgrade=no_recheck_log`) |
 
@@ -73,10 +73,9 @@ PY
 
 ### Что менять дальше
 
-- **#1503** (свой контур ESPN): `METADB` и `EXPECTED_DAGS` — на контейнер и DAG нового контура.
-- **#1507** (автодоставка): `BRONZE_TABLES` — на новые таблицы bronze (#1156); если в них
-  `_ingested_at` честное (время коммита), `TS_COL` можно оставить `_source_fetched_at` — правило
-  «новые матчи за 36 ч» от этого не меняется.
+- **#1507 сделано:** `METADB` = `espn-live-airflow-metadb-1`, `EXPECTED_DAGS` = `('dag_espn_current',)`,
+  `BRONZE_TABLES` = `('espn_match',)`, `TS_COL` остался `_source_fetched_at`. Ставится на хост
+  после посева нового контура (раздел «Доставка»), по «Обновлению установленного сторожа».
 
 ## Таблицы bronze нового контура (#1503)
 
@@ -144,8 +143,8 @@ PY
 Файл DAG — `deploy/espn/dags/dag_espn_current.py`, **не `dags/`**: новый файл в `dags/` меняет
 ctime каталога, который пинует сторож WhoScored (`scrapers/whoscored/runtime_contract.py:311-319`),
 и роняет его воркеры; к тому же волна 1 целиком живёт в проекте `espn-airflow` (допущение 8).
-**#1507 подключает `deploy/espn/dags` как каталог DAG проекта `espn-airflow`** (и кладёт корень
-релиза в `PYTHONPATH`, чтобы импортировался `scrapers.espn`). DAG создаётся на паузе
+**#1507 подключает `deploy/espn/dags` как каталог DAG своего проекта `espn-live`** (раздел
+«Доставка»; корень релиза — `/opt/airflow`, он же `PYTHONPATH`, чтобы импортировался `scrapers.espn`). DAG создаётся на паузе
 (`is_paused_upon_creation=True`); первый живой прогон — после автодоставки #1507.
 
 Расписание `0 0,6,12,18 * * *` (UTC), `max_active_runs=1`, `catchup=False`, `dagrun_timeout` 55 мин.
@@ -204,10 +203,11 @@ ctime каталога, который пинует сторож WhoScored (`scr
 | `ESPN_EDITIONS_STATE_PATH` | кэш изданий, по умолчанию `$AIRFLOW_HOME/state/espn/editions.json` (рядом с `gate.json`); старше 24 ч или потерян — пересчитывается из core (`leagues/{slug}` → `plan_editions`), потеря безвредна |
 | `ESPN_GATE_STEP_CEILING` | ступень заслонки (S0 по умолчанию), полоса `live` |
 | `ESPN_RAW_STORE_URI` | raw store транспорта (#1500) |
-| пул `espn_live` | у `plan_wave` и `run_tournament`; создаёт #1507 |
+| пул `espn_live` | у `plan_wave` и `run_tournament`; 4 слота, объявлен в `deploy/espn/pools.json` (#1507) |
 
-**Что включает #1507:** каталог DAG `deploy/espn/dags` и `PYTHONPATH` в `espn-airflow`, пул
-`espn_live`, env выше, снятие паузы `dag_espn_current`; сторож (`EXPECTED_DAGS`/`METADB`) — там же.
+**Что включает #1507:** проект `espn-live` с каталогом DAG `deploy/espn/dags`, пул `espn_live`,
+env выше, автодоставку; снятие паузы `dag_espn_current` — после посева; сторож
+(`EXPECTED_DAGS`/`METADB`/`BRONZE_TABLES`) — там же. Раздел «Доставка».
 
 ## Свежесть и DQ (#1505)
 
@@ -309,3 +309,100 @@ ESPN иногда дописывает матч позже (составы/су�
   и `• ESPN перепроверка DD.MM: дозаполнено при перепроверке: X из Y (Z %); по лигам: …`
   (`quality.build_recheck_sql` / `render_recheck_lines`). **Сторож:** правило `downgrade`.
 - **Темп:** перепроверки и выборка идут по полосе `live` той же заслонки (S0).
+
+## Доставка (#1507)
+
+Новый контур живёт в своём compose-проекте **`espn-live`** (`deploy/espn/airflow.compose.yaml`):
+своя metadb (`espn-live-airflow-metadb-1`, том `espn_live_pgdata`, пароль — свежий, не из
+сожжённых 10.08), scheduler + webserver (UI `127.0.0.1:8089`), тома `espn_live_logs` и
+`espn_live_state` (→ `/opt/airflow/state`: заслонка `gate.json`, издания `editions.json`), сети
+`dp-storage`/`dp-backend`. Старый проект `espn-airflow` (7 DAG на паузе, 8086) не трогается до
+задачи 21 — тот же `-p` пересоздал бы его контейнеры. Общий стек и общий `compose.yaml` — не
+трогаются.
+
+- **Образ** — digest `data-platform-airflow-scheduler@sha256:5286d9cf…` прямо в compose
+  (`pull_policy: never`): код и образ едут одним коммитом, пересборки нет.
+- **Код** — неизменяемый корень релиза `/root/espn-release-<sha>` (`git archive <sha> --
+  deploy/espn scrapers configs/espn`, права без записи). Монтируются **каталоги** ro:
+  `deploy/espn/dags` → `/opt/airflow/dags`, `scrapers` → `/opt/airflow/scrapers`, `configs/espn` →
+  `/opt/airflow/configs/espn`; `PYTHONPATH=/opt/airflow`. Файловых монтирований нет (rename при
+  checkout теряет файловый bind-mount). Тест: замыкание импортов DAG ⊆ смонтированных каталогов.
+- **Env** — `/root/.secrets/espn.env` (0600), только секреты: `AIRFLOW__CORE__FERNET_KEY`,
+  `AIRFLOW__WEBSERVER__SECRET_KEY`, `ESPN_LIVE_DB_PASSWORD` (hex), `TRINO_PORT`, `TRINO_USER`,
+  `TRINO_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `ICEBERG_WAREHOUSE`. Никаких `*_PROXY`
+  (транспорт ESPN падает `AmbientProxyError`), `ESPN_RELEASE_ROOT`, canary-state, контрольной БД,
+  `RELEASE_COMMIT/TREE_SHA256` — автомат отказывается работать с таким env-файлом.
+- **Пулы — кодом:** `deploy/espn/pools.json` (`espn_live`: 4 слота = `max_active_tis_per_dag`;
+  файл добавлен `git add -f` — `*.json` в `.gitignore`). `airflow-init` делает только
+  `airflow db migrate` + `airflow pools import`; запускается при посеве и когда `pools.json`
+  цели отличается от живого.
+
+### Автомат `auto_deliver.py`
+
+Хост-копия `/root/espn-deploy/auto_deliver.py` (= master, иначе «обнови автомат» в Telegram и
+стоп), cron `*/5`, лог — `/root/watchdog/espn_auto_deliver_cron.log`. Каталог проекта compose —
+`/root/espn-deploy` (метка `working_dir` не держит дерево кода). Состояние
+`/root/espn-deploy/state/`:
+
+| Файл | Смысл |
+| --- | --- |
+| `accepted` | живой SHA — **единственный пин**; корень релиза = `/root/espn-release-<accepted>` |
+| `accepted-prev` | прежний принятый — цель `--rollback` |
+| `rejected` | SHA, не прошедшие приёмку (по строке); master с тем же содержимым контура не выкатывается повторно |
+| `inflight` | выкат идёт/оборвался; висит — автомат стоит и раз в сутки просит руки |
+| `off` | выключатель: есть файл — автомат ничего не делает |
+| `lock` | flock от параллельного запуска |
+| `notified` | какие остановки уже ушли в Telegram сегодня (повтор — раз в сутки) |
+
+Шаг cron: `fetch` → самопроверка → цель = `origin/master`, если он потомок `accepted`
+(`merge-base --is-ancestor`; иначе стоп «нужны руки»), не в `rejected` и `git diff accepted..master`
+задевает пути контура (`deploy/espn`, `configs/espn` + замыкание импортов DAG из
+`deploy/espn/dags`, в т.ч. `scrapers/base/*` и относительные импорты) → окно: нет
+running/queued `dag_espn_current` и до волны 00/06/12/18 UTC ≥ 10 мин → корень релиза →
+[`run --rm --no-deps -T airflow-init`] → `up -d --no-deps --force-recreate airflow-scheduler
+airflow-webserver` с `ESPN_RELEASE_ROOT=<корень>` в окружении вызова → приёмка ≤ 7 мин:
+
+- `dag.last_parsed_time` `dag_espn_current` позже момента выката, `has_import_errors = f`,
+  `import_error` = 0 (свежая ошибка разбора — провал сразу);
+- `/opt/airflow/dags` scheduler смонтирован из корня цели; sha256 файлов `deploy/espn/dags` и
+  `scrapers/espn` в контейнере = корню;
+- пулы metadb = `pools.json` (слоты каждого объявленного пула);
+- в env контейнера нет `*_PROXY`.
+
+Успех → `accepted-prev ← accepted`, `accepted ← sha`, Telegram «✅ ESPN выкачен <sha>», уборка
+корней (храним 3 новейших + `accepted`/`accepted-prev`; корень удаляется, только если на него не
+ссылается метка `espn.release_root` ни одного контейнера). Провал → SHA в `rejected`, тот же `up`
+на `accepted`, повторная приёмка, Telegram «❌ … откат принят» с причиной; откат не подтвердился —
+`off` + Telegram «🆘 НУЖНЫ РУКИ».
+
+Ручные режимы (из-под root, как cron):
+
+```bash
+python3 /root/espn-deploy/auto_deliver.py --target <sha|ветка>   # выкат потомка accepted вне фильтра путей (проверка отката)
+python3 /root/espn-deploy/auto_deliver.py --rollback              # вернуть accepted-prev; текущий → rejected
+touch /root/espn-deploy/state/off                                 # выключить; rm — включить
+```
+
+Окно и приёмка — те же, что у cron; вне окна ручной режим отказывается (стоп с причиной).
+
+### Посев (один раз, после мержа)
+
+Скрипт посева — вне репозитория (`/root/espn-deliveries/1507/seed.sh`): свежие пароль metadb,
+Fernet и secret key; S3/Trino — копия значений из старого env-файла по именам; тома с владельцем
+`50000:0` для `state`/`logs`; хост-копия автомата из master; затем
+
+```bash
+python3 /root/espn-deploy/auto_deliver.py --seed <sha мержа>
+```
+
+— `up -d --wait airflow-metadb` → `airflow-init` → scheduler/webserver → та же приёмка →
+`accepted`. Дальше cron-строка:
+
+```
+*/5 * * * * /usr/bin/python3 /root/espn-deploy/auto_deliver.py >> /root/watchdog/espn_auto_deliver_cron.log 2>&1
+```
+
+`dag_espn_current` создаётся на паузе; снятие паузы — отдельным шагом после посева.
+
+**Откат контура целиком:** `touch /root/espn-deploy/state/off`, `docker compose -p espn-live …
+stop airflow-scheduler airflow-webserver` (поимённо). Старый `espn-airflow` так и стоит на паузе.

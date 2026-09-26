@@ -1,0 +1,7 @@
+{
+  "espn_live": {
+    "slots": 4,
+    "description": "ESPN current waves: plan_wave + run_tournament (= max_active_tis_per_dag of dag_espn_current)",
+    "include_deferred": false
+  }
+}

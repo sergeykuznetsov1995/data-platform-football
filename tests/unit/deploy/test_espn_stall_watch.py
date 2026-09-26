@@ -37,20 +37,14 @@ def _load_module():
 watch = _load_module()
 
 NOW = datetime(2026, 9, 24, 20, 0, tzinfo=timezone.utc)
-# Записано 24.09.2026 (премиса-чек #1496): docker exec espn-airflow-airflow-metadb-1
-# psql -U airflow -d airflow -At -c "SELECT dag_id, is_paused FROM dag ORDER BY 1"
-DAG_TABLE_2409 = """dag_backfill_espn|t
-dag_discover_espn_registry|t
-dag_ingest_espn|t
-dag_monitor_espn|t
-dag_repair_espn|t
-dag_replay_espn|t
-dag_trigger_espn_daily|t
+# #1507: metadb нового контура espn-live после посева — единственный DAG, на паузе с создания
+# (is_paused_upon_creation). Построено по коду DAG, не записано: metadb появится при посеве.
+DAG_TABLE_NEW = """dag_espn_current|t
 """
-# Записано 24.09.2026: max(_source_fetched_at) espn_lineup_generation_v2 через trino-ro.sh.
+# Записано 24.09.2026: max(_source_fetched_at) espn_lineup_generation_v2 через trino-ro.sh —
+# последняя загрузка ESPN вообще; здесь — как строка новой таблицы матчей.
 LAST_FETCH_2409 = "2026-08-13 11:38:28.616770"
-EXPECTED = ("dag_ingest_espn", "dag_trigger_espn_daily", "dag_monitor_espn",
-            "dag_discover_espn_registry")
+EXPECTED = ("dag_espn_current",)
 
 
 def _ts(dt):
@@ -60,13 +54,12 @@ def _ts(dt):
 class World:
     """Метабаза, bronze, Telegram и gh, которые видит сторож."""
 
-    def __init__(self, dag_table=DAG_TABLE_2409, bronze=None):
+    def __init__(self, dag_table=DAG_TABLE_NEW, bronze=None):
         self.dags = [tuple(line.split("|")) for line in dag_table.splitlines() if line]
         self.metadb_up = True
         self.trino_up = True
         self.bronze = bronze if bronze is not None else {
-            "espn_lineup_generation_v2": [(401, LAST_FETCH_2409)],
-            "espn_matchsheet_generation_v2": [(401, "2026-08-13 10:02:11.000001")],
+            "espn_match": [(401, LAST_FETCH_2409), (400, "2026-08-13 10:02:11.000001")],
         }
         # Журнал волн (#1505): None — таблицы ещё нет (до #1507).
         self.wave_log: list[tuple] | None = None
@@ -95,7 +88,7 @@ class World:
         con = duckdb.connect()
         con.execute("ATTACH ':memory:' AS iceberg")
         con.execute("CREATE SCHEMA iceberg.bronze")
-        for table in ("espn_lineup_generation_v2", "espn_matchsheet_generation_v2"):
+        for table in watch.BRONZE_TABLES:
             con.execute(f"CREATE TABLE iceberg.bronze.{table} "
                         "(event_id BIGINT, _source_fetched_at TIMESTAMP, _ingested_at TIMESTAMP)")
             for event_id, fetched in self.bronze.get(table, []):
@@ -172,40 +165,48 @@ def _run(tmp_path, now, *extra):
 
 # 1. «DAG на паузе → тревога»
 
-def test_recorded_2409_metadb_all_expected_dags_paused_raise_alarm(world):
+def test_new_contour_constants():
+    """#1507: сторож смотрит metadb проекта espn-live, DAG актуалки и таблицу матчей нового bronze."""
+    assert watch.METADB == "espn-live-airflow-metadb-1"
+    assert watch.EXPECTED_DAGS == ("dag_espn_current",)
+    assert watch.BRONZE_TABLES == ("espn_match",)
+    assert watch.TS_COL == "_source_fetched_at"
+    assert "FROM iceberg.bronze.espn_match)" in watch.bronze_sql(NOW)
+
+
+def test_dag_paused_since_creation_raises_alarm(world):
     alerts = watch.evaluate(NOW, watch.read_dags(), None)
-    for dag in EXPECTED:
-        assert f"{dag} (пауза)" in alerts["paused"]
-    # backfill/repair/replay — по требованию, их пауза не тревога
-    assert "dag_backfill_espn" not in alerts["paused"]
+    assert alerts["paused"].startswith("⏸ ESPN: DAG на паузе/нет: dag_espn_current (пауза)")
     assert "stall" not in alerts
 
 
 def test_one_paused_dag_raises_alarm_with_its_name(world):
     world.set_dags(**{d: "f" for d in EXPECTED})
-    world.set_dags(dag_ingest_espn="t")
+    world.dags.append(("dag_ingest_espn", "t"))   # старый DAG в metadb нового контура — не спрашиваем
+    world.set_dags(dag_espn_current="t")
     alerts = watch.evaluate(NOW, watch.read_dags(), None)
-    assert alerts["paused"].startswith("⏸ ESPN: DAG на паузе/нет: dag_ingest_espn (пауза)")
-    assert "dag_monitor_espn" not in alerts["paused"]
+    assert alerts["paused"].startswith("⏸ ESPN: DAG на паузе/нет: dag_espn_current (пауза)")
+    assert "dag_ingest_espn" not in alerts["paused"]
 
 
-def test_all_expected_dags_running_no_alarm_even_if_backfill_paused(world):
+def test_all_expected_dags_running_no_alarm_even_if_old_contour_dags_paused(world):
+    world.dags += [("dag_ingest_espn", "t"), ("dag_trigger_espn_daily", "t")]
     world.set_dags(**{d: "f" for d in EXPECTED})
     assert watch.evaluate(NOW, watch.read_dags(), None) == {"paused": None}
 
 
 def test_missing_dag_raises_alarm(world):
     world.set_dags(**{d: "f" for d in EXPECTED})
-    world.dags = [row for row in world.dags if row[0] != "dag_monitor_espn"]
+    world.dags = [row for row in world.dags if row[0] != "dag_espn_current"]
     alerts = watch.evaluate(NOW, watch.read_dags(), None)
-    assert "dag_monitor_espn (нет в metadb)" in alerts["paused"]
+    assert "dag_espn_current (нет в metadb)" in alerts["paused"]
 
 
 def test_metadb_unavailable_raises_alarm_under_the_same_rule(world):
     world.metadb_up = False
     assert watch.read_dags() is None
     alerts = watch.evaluate(NOW, None, None)
-    assert "espn-airflow-airflow-metadb-1" in alerts["paused"]
+    assert "espn-live-airflow-metadb-1" in alerts["paused"]
     assert "недоступен" in alerts["paused"]
 
 
@@ -213,8 +214,8 @@ def test_metadb_unavailable_raises_alarm_under_the_same_rule(world):
 
 def test_no_new_matches_for_37h_raises_alarm(world):
     last = NOW - timedelta(hours=37)
-    world.bronze = {"espn_lineup_generation_v2": [(1, _ts(last)), (2, _ts(last - timedelta(hours=5)))],
-                    "espn_matchsheet_generation_v2": [(1, _ts(last - timedelta(minutes=3)))]}
+    world.bronze = {"espn_match": [(1, _ts(last)), (2, _ts(last - timedelta(hours=5))),
+                                   (1, _ts(last - timedelta(minutes=3)))]}
     bronze = watch.read_bronze(NOW)
     assert bronze[0] == 0
     alerts = watch.evaluate(NOW, None, bronze)
@@ -230,8 +231,8 @@ def test_recorded_2409_bronze_gives_about_a_thousand_hours(world):
 
 def test_three_fresh_matches_clear_the_stall(world):
     fresh = NOW - timedelta(hours=1)
-    world.bronze = {"espn_lineup_generation_v2": [(1, _ts(fresh)), (2, _ts(fresh)), (2, _ts(fresh))],
-                    "espn_matchsheet_generation_v2": [(3, _ts(fresh)), (1, _ts(fresh))]}
+    world.bronze = {"espn_match": [(1, _ts(fresh)), (2, _ts(fresh)), (2, _ts(fresh)),
+                                   (3, _ts(fresh)), (1, _ts(fresh))]}
     bronze = watch.read_bronze(NOW)
     assert bronze[0] == 3
     assert bronze[1].startswith(fresh.strftime("%Y-%m-%d %H:%M:%S"))
@@ -240,8 +241,8 @@ def test_three_fresh_matches_clear_the_stall(world):
 
 def test_rows_after_now_do_not_count(world):
     """--now в прошлом: загрузки позже «сейчас» не делают прошлое свежим."""
-    world.bronze = {"espn_lineup_generation_v2": [(1, _ts(NOW - timedelta(hours=40))),
-                                                  (2, _ts(NOW + timedelta(hours=2)))]}
+    world.bronze = {"espn_match": [(1, _ts(NOW - timedelta(hours=40))),
+                                   (2, _ts(NOW + timedelta(hours=2)))]}
     assert watch.read_bronze(NOW)[0] == 0
 
 
@@ -272,7 +273,7 @@ def test_series_alarm_once_then_escalate_then_all_clear(world, tmp_path):
 
     world.sent.clear()
     world.set_dags(**{d: "f" for d in EXPECTED})
-    world.bronze = {"espn_lineup_generation_v2": [(7, _ts(NOW + timedelta(hours=25)))]}
+    world.bronze = {"espn_match": [(7, _ts(NOW + timedelta(hours=25)))]}
     state = _run(tmp_path, NOW + timedelta(hours=26))
     assert sorted(world.sent) == sorted([
         "✅ ESPN: отбой — DAG ESPN на паузе или metadb недоступен (эпизод с 2026-09-24T20:00Z, issue #9001)",
@@ -383,7 +384,7 @@ def test_dry_run_refuses_the_production_state(world):
 def _quiet(world):
     """Старый контур в порядке — остаются только тревоги по турнирам."""
     world.set_dags(**{d: "f" for d in EXPECTED})
-    world.bronze = {"espn_lineup_generation_v2": [(1, _ts(NOW + timedelta(hours=h)))
+    world.bronze = {"espn_match": [(1, _ts(NOW + timedelta(hours=h)))
                                                   for h in range(-24, 48, 6)]}
 
 
