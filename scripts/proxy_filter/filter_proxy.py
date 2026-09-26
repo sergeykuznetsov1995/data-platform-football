@@ -197,7 +197,7 @@ TRANSFERMARKT_PERMIT_STATE_PATH = (
     "/opt/airflow/logs/proxy_filter/transfermarkt_request_permits.json"
 )
 TRANSFERMARKT_PROXY_ALLOWED_HOSTS = frozenset(
-    {"www.transfermarkt.com", "www.transfermarkt.us"}
+    {"www.transfermarkt.com", "www.transfermarkt.us", "tmapi.transfermarkt.technology"}
 )
 FBREF_DAG_IDS = frozenset(
     {
