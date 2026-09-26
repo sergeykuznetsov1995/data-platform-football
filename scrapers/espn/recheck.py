@@ -196,19 +196,27 @@ def plan_recheck(trino, now: datetime) -> dict[int, tuple[str, int, str]]:
 # --------------------------------------------------------------- journal
 
 
-def journalled(trino, slug: str, season_year: int, rechecks: Mapping[int, str]) -> set[int]:
-    """Events of ``rechecks`` (``event_id -> kind``) the journal already has
-    with that kind, whatever the outcome: each is downloaded at most once."""
+def journalled(
+    trino, slug: str, season_year: int, rechecks: Mapping[int, str]
+) -> dict[int, str]:
+    """``event_id -> outcome`` of the ``rechecks`` (``event_id -> kind``) the
+    journal already has with that kind: each is downloaded at most once.  A
+    ``failed`` outcome is kept only when no other row of the pair exists."""
 
     if not rechecks:
-        return set()
+        return {}
     ids = ", ".join(str(int(event_id)) for event_id in sorted(rechecks))
     rows = trino.execute_query(
-        f"SELECT DISTINCT event_id, kind FROM {RECHECK_TABLE} "
+        f"SELECT DISTINCT event_id, kind, outcome FROM {RECHECK_TABLE} "
         f"WHERE slug = ? AND season_year = ? AND event_id IN ({ids})",
         (slug, int(season_year)),
     )
-    return {int(event_id) for event_id, kind in rows if rechecks.get(int(event_id)) == kind}
+    done: dict[int, str] = {}
+    for event_id, kind, outcome in rows:
+        event_id = int(event_id)
+        if rechecks.get(event_id) == kind and done.get(event_id) in (None, FAILED):
+            done[event_id] = str(outcome)
+    return done
 
 
 def ensure_recheck_table(conn) -> None:

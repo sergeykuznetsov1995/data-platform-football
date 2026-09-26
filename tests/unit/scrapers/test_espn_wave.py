@@ -60,15 +60,18 @@ class FakeClient:
         self.replays: list[str] = []
         self.flushes = 0
         self.ledger = ()
+        # Time of a download; a stored body keeps the time it was downloaded.
+        self.clock = "2026-09-25T13:00:00+00:00"
+        self.fetched: dict[str, str] = {}
 
-    def _result(self, body: bytes, *, cache_hit: bool):
+    def _result(self, body: bytes, *, cache_hit: bool, fetched_at: str | None = None):
         sha = hashlib.sha256(body).hexdigest()
         return SimpleNamespace(
             json_data=json.loads(body),
             body=body,
             raw_uri=f"raw://{sha[:12]}",
             content_hash=sha,
-            fetched_at="2026-09-25T13:00:00+00:00",
+            fetched_at=fetched_at or self.clock,
             cache_hit=cache_hit,
         )
 
@@ -76,11 +79,12 @@ class FakeClient:
         key = _key(url, params)
         self.calls.append((key, force_refresh))
         if not force_refresh and key in self.stored:
-            return self._result(self.stored[key], cache_hit=True)
+            return self._result(self.stored[key], cache_hit=True, fetched_at=self.fetched.get(key))
         value = self.responses[key]
         if isinstance(value, Exception):
             raise value
         self.stored[key] = value
+        self.fetched[key] = self.clock
         return self._result(value, cache_hit=False)
 
     def replay_json(self, url, endpoint, params=None):
@@ -88,7 +92,7 @@ class FakeClient:
         self.replays.append(key)
         if key not in self.stored:
             raise RawTargetNotFound(key)
-        return self._result(self.stored[key], cache_hit=True)
+        return self._result(self.stored[key], cache_hit=True, fetched_at=self.fetched.get(key))
 
     def flush(self) -> None:
         self.flushes += 1
@@ -117,8 +121,8 @@ class WaveTrino(FakeTrino):
         self.fail_slug = fail_slug
         self.fail_table = fail_table
         self.queries: list[str] = []
-        # ``(slug, season_year, event_id, kind)`` rows of the recheck journal.
-        self.rechecks: list[tuple[str, int, int, str]] = []
+        # ``(slug, season_year, event_id, kind, outcome)`` rows of the recheck journal.
+        self.rechecks: list[tuple[str, int, int, str, str]] = []
 
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         if (
@@ -136,7 +140,7 @@ class WaveTrino(FakeTrino):
         self.queries.append(sql)
         if "espn_recheck_v1" in sql:
             slug, year = params
-            return [[e, k] for s_, y, e, k in self.rechecks if (s_, y) == (slug, year)]
+            return [[e, k, o] for s_, y, e, k, o in self.rechecks if (s_, y) == (slug, year)]
         columns = wave._MATCH_COLUMNS
         if "bool_and(terminal)" in sql:
             groups: dict[tuple[str, int], bool] = {}
@@ -170,14 +174,18 @@ class WaveTrino(FakeTrino):
 
 
 class FakeConn:
-    def __init__(self) -> None:
+    def __init__(self, refuse: str | None = None) -> None:
         self.sql: list[str] = []
+        # A statement containing ``refuse`` fails (a journal write refused).
+        self.refuse = refuse
 
     def cursor(self):
         conn = self
 
         class _Cursor:
             def execute(self, sql):
+                if conn.refuse is not None and conn.refuse in sql:
+                    raise RuntimeError("journal write refused")
                 conn.sql.append(sql)
 
             def fetchall(self):

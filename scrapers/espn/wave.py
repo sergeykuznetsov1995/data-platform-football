@@ -452,6 +452,9 @@ class TournamentWork:
     checked_at: Mapping[int, str] = field(default_factory=dict)
     # event_id -> recheck kind (#1506): the Summary is downloaded again.
     rechecks: Mapping[int, str] = field(default_factory=dict)
+    # ISO time of the plan with rechecks: a Summary the raw store holds from
+    # at or after it was downloaded by an earlier attempt of this wave.
+    planned_at: str | None = None
     # Set when planning already failed for this tournament: the mapped task
     # turns it red with this first error, its neighbours still publish.
     error: str | None = None
@@ -481,6 +484,7 @@ class TournamentWork:
             "statuses": {str(key): value for key, value in sorted(self.statuses.items())},
             "checked_at": {str(key): value for key, value in sorted(self.checked_at.items())},
             "rechecks": {str(key): value for key, value in sorted(self.rechecks.items())},
+            "planned_at": self.planned_at,
             "error": self.error,
         }
 
@@ -501,6 +505,7 @@ class TournamentWork:
             statuses={int(key): item for key, item in value["statuses"].items()},
             checked_at={int(key): item for key, item in value.get("checked_at", {}).items()},
             rechecks={int(key): item for key, item in value.get("rechecks", {}).items()},
+            planned_at=value.get("planned_at"),
             error=value.get("error"),
         )
 
@@ -958,6 +963,7 @@ def plan_wave(
                 statuses={key: statuses[key] for key in sorted(ids) if key in statuses},
                 checked_at={key: checked_at[key] for key in sorted(ids) if key in checked_at},
                 rechecks={key: rechecks[key] for key in sorted(ids) if key in rechecks},
+                planned_at=now.isoformat() if any(key in rechecks for key in ids) else None,
                 # A failed status check: the planned matches still publish,
                 # then the tournament is red with that error.
                 error=status_errors.get(slug),
@@ -1045,6 +1051,19 @@ class _Again:
     error: str | None = None
 
 
+def _downloaded_since(client, request: urls.EspnRequest, planned_at: datetime | None):
+    """The raw store's body of ``request`` when it was downloaded at or after
+    ``planned_at`` (an earlier attempt of this wave), else None."""
+
+    if planned_at is None:
+        return None
+    try:
+        result = client.replay_json(request.url, request.endpoint, request.params)
+    except RawStoreError:
+        return None
+    return result if datetime.fromisoformat(result.fetched_at) >= planned_at else None
+
+
 def _stored_summary(
     client, known: BronzeMatch, schedule: ScheduleRow, competition: Competition, edition: Edition
 ) -> SummaryParseResult:
@@ -1062,34 +1081,40 @@ def _summary_again(
     edition: Edition,
     *,
     force: bool,
+    planned_at: datetime | None = None,
+    stamped: bool = False,
 ) -> _Again:
     """Summary of a captured match under the "not worse" rule.
 
-    ``force`` (recheck, sample) downloads it; a failed download keeps the
-    stored parse (``failed``).  Otherwise (a status change) the stored body
-    is replayed as before.  A new body is compared, parsed, with the stored
-    one: a poorer answer keeps the stored parse and its raw body.
+    ``force`` (recheck, sample) downloads it once per wave: a body the raw
+    store holds from ``planned_at`` on was downloaded by an earlier attempt
+    and is replayed instead; a recheck ``stamped`` by an earlier attempt
+    without such a body is that attempt's failed download, not repeated.  A
+    failed download keeps the stored parse (``failed``, the tournament is
+    red).  Otherwise (a status change) the stored body is replayed as before.
+    A new body is compared, parsed, with the stored one: a poorer answer
+    keeps the stored parse and its raw body.
     """
+
+    def failed(error: str) -> _Again:
+        logger.warning("ESPN recheck of %s failed: %s", known.event_id, error)
+        old = _stored_summary(client, known, schedule, competition, edition)
+        return _Again(
+            old, known.raw_ref(), recheck.FAILED, recheck.summary_parts(old), None, error=error
+        )
 
     request = urls.summary(known.competition_slug, known.event_id)
     if force:
-        try:
-            result = _fetch(client, request, force_refresh=True)
-        except AllOriginsBlocked:
-            raise
-        except _STATUS_ERRORS as exc:
-            logger.warning(
-                "ESPN recheck of %s failed: %s: %s", known.event_id, type(exc).__name__, exc
-            )
-            old = _stored_summary(client, known, schedule, competition, edition)
-            return _Again(
-                old,
-                known.raw_ref(),
-                recheck.FAILED,
-                recheck.summary_parts(old),
-                None,
-                error=f"{type(exc).__name__}: {exc}",
-            )
+        result = _downloaded_since(client, request, planned_at)
+        if result is None and stamped:
+            return failed("download failed in an earlier attempt of this wave")
+        if result is None:
+            try:
+                result = _fetch(client, request, force_refresh=True)
+            except AllOriginsBlocked:
+                raise
+            except _STATUS_ERRORS as exc:
+                return failed(f"{type(exc).__name__}: {exc}")
     else:
         result = _summary_result(client, request, captured=True)
     new = parse_summary(result.body, competition=competition, edition=edition, event=schedule)
@@ -1206,6 +1231,7 @@ def run_tournament(
         # A retry of the task (or a rerun of the wave) plans from the same
         # XCom: a recheck or sample already journalled is not downloaded again.
         done = recheck.journalled(trino, work.slug, work.season_year, work.rechecks)
+        planned_at = datetime.fromisoformat(work.planned_at) if work.planned_at else None
 
         payloads: list[MatchPayload] = []
         summary_errors: list[str] = []
@@ -1234,8 +1260,12 @@ def run_tournament(
             if found is not None and found[0].source_season_year != work.season_year:
                 found = None
             kind = work.rechecks.get(event_id)
-            stamped = known is not None and known.rechecked_at is not None
-            if kind is not None and (event_id in done or (kind == recheck.RECHECK and stamped)):
+            if kind is not None and event_id in done:
+                if done[event_id] == recheck.FAILED:
+                    # The failure stays the tournament's on every retry.
+                    summary_errors.append(
+                        f"{kind} of {event_id}: failed in an earlier attempt of this wave"
+                    )
                 if found is None and presence is None and event_id not in work.statuses:
                     continue  # planned for the recheck only: written by the first attempt
                 kind = None
@@ -1250,7 +1280,16 @@ def run_tournament(
                 else:
                     schedule = known.schedule_row(competition, edition)
                     checked = known.status_checked_at
-                again = _summary_again(client, known, schedule, competition, edition, force=True)
+                again = _summary_again(
+                    client,
+                    known,
+                    schedule,
+                    competition,
+                    edition,
+                    force=True,
+                    planned_at=planned_at,
+                    stamped=kind == recheck.RECHECK and known.rechecked_at is not None,
+                )
                 note(event_id, kind, again)
                 if again.error is not None:
                     summary_errors.append(f"{kind} of {event_id}: {again.error}")
