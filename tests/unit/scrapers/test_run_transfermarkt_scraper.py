@@ -668,6 +668,9 @@ class TestRunnerFlags:
                     'fetched_at': '2026-07-11T00:00:00+00:00',
                 }
 
+            def get_participant_evidence(self):
+                return {'source': 'tmapi', 'tmapi_count': 2}
+
             def get_traffic_stats(self):
                 return {
                     'decoded_response_body_bytes': 10,
@@ -692,6 +695,10 @@ class TestRunnerFlags:
         assert rc == 1
         scraper.save_to_iceberg.assert_not_called()
         assert 'participant mismatch' in _load_results(temp_output)['errors'][0]
+        # #1392: the cup participant proofs travel with the capture.
+        assert _load_results(temp_output)['participant_evidence'] == {
+            'source': 'tmapi', 'tmapi_count': 2,
+        }
 
     def test_native_only_mode_never_materializes_or_writes_legacy(self, temp_output):
         memberships = pd.DataFrame({

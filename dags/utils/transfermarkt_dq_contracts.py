@@ -196,6 +196,11 @@ def validate_scope_capture(
             ),
             'fresh': True,
         }
+    if value.listing_status == 'unknown':
+        # #1392: tmapi and /teilnehmer/ both unproven — not an empty scope.
+        raise ScopeDQError(
+            'participants unknown: tmapi and /teilnehmer/ both unproven'
+        )
     if value.listing_status != 'ok':
         raise ScopeDQError(
             f'participant listing is not authoritative: {value.listing_status!r}'

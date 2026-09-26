@@ -1,0 +1,658 @@
+{
+ "success": true,
+ "message": "OK",
+ "data": [
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    82,
+    166,
+    176
+   ],
+   "winnerClubId": null,
+   "tournamentStart": "2027-06-19T00:00:00+02:00",
+   "tournamentEnd": "2027-07-17T00:00:00+02:00",
+   "season": {
+    "id": 2026,
+    "display": "2027",
+    "cyclicalName": "2027",
+    "nonCyclicalName": "26/27"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2026"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    107
+   ],
+   "winnerClubId": 3575,
+   "tournamentStart": "2025-12-21T00:00:00+01:00",
+   "tournamentEnd": "2026-01-18T00:00:00+01:00",
+   "season": {
+    "id": 2024,
+    "display": "2025",
+    "cyclicalName": "2025",
+    "nonCyclicalName": "24/25"
+   },
+   "isCurrentSeason": true,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2024"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    38
+   ],
+   "winnerClubId": 3591,
+   "tournamentStart": "2024-01-13T00:00:00+01:00",
+   "tournamentEnd": "2024-02-11T00:00:00+01:00",
+   "season": {
+    "id": 2023,
+    "display": "2024",
+    "cyclicalName": "2024",
+    "nonCyclicalName": "23/24"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2023"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    31
+   ],
+   "winnerClubId": 3499,
+   "tournamentStart": "2022-01-09T00:00:00+01:00",
+   "tournamentEnd": "2022-02-06T00:00:00+01:00",
+   "season": {
+    "id": 2021,
+    "display": "2022",
+    "cyclicalName": "2022",
+    "nonCyclicalName": "21/22"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2021"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    2
+   ],
+   "winnerClubId": 3614,
+   "tournamentStart": "2019-06-21T00:00:00+02:00",
+   "tournamentEnd": "2019-07-19T00:00:00+02:00",
+   "season": {
+    "id": 2018,
+    "display": "2019",
+    "cyclicalName": "2019",
+    "nonCyclicalName": "18/19"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2018"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    51
+   ],
+   "winnerClubId": 3434,
+   "tournamentStart": "2017-01-14T00:00:00+01:00",
+   "tournamentEnd": "2017-02-05T00:00:00+01:00",
+   "season": {
+    "id": 2016,
+    "display": "2017",
+    "cyclicalName": "2017",
+    "nonCyclicalName": "16/17"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2016"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    8
+   ],
+   "winnerClubId": 3591,
+   "tournamentStart": "2015-01-17T00:00:00+01:00",
+   "tournamentEnd": "2015-02-08T00:00:00+01:00",
+   "season": {
+    "id": 2014,
+    "display": "2015",
+    "cyclicalName": "2015",
+    "nonCyclicalName": "14/15"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2014"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    159
+   ],
+   "winnerClubId": 3444,
+   "tournamentStart": "2013-01-19T00:00:00+01:00",
+   "tournamentEnd": "2013-02-10T00:00:00+01:00",
+   "season": {
+    "id": 2012,
+    "display": "2013",
+    "cyclicalName": "2013",
+    "nonCyclicalName": "12/13"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2012"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    51,
+    8
+   ],
+   "winnerClubId": 3703,
+   "tournamentStart": "2012-01-21T00:00:00+01:00",
+   "tournamentEnd": "2012-02-12T00:00:00+01:00",
+   "season": {
+    "id": 2011,
+    "display": "2012",
+    "cyclicalName": "2012",
+    "nonCyclicalName": "11/12"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2011"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    6
+   ],
+   "winnerClubId": 3672,
+   "tournamentStart": "2010-01-10T00:00:00+01:00",
+   "tournamentEnd": "2010-01-31T00:00:00+01:00",
+   "season": {
+    "id": 2009,
+    "display": "2010",
+    "cyclicalName": "2010",
+    "nonCyclicalName": "09/10"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2009"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    54
+   ],
+   "winnerClubId": 3672,
+   "tournamentStart": "2008-01-20T00:00:00+01:00",
+   "tournamentEnd": "2008-02-10T00:00:00+01:00",
+   "season": {
+    "id": 2007,
+    "display": "2008",
+    "cyclicalName": "2008",
+    "nonCyclicalName": "07/08"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2007"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    2
+   ],
+   "winnerClubId": 3672,
+   "tournamentStart": "2006-01-20T00:00:00+01:00",
+   "tournamentEnd": "2006-02-10T00:00:00+01:00",
+   "season": {
+    "id": 2005,
+    "display": "2006",
+    "cyclicalName": "2006",
+    "nonCyclicalName": "05/06"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2005"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    173
+   ],
+   "winnerClubId": 3670,
+   "tournamentStart": "2004-01-24T00:00:00+01:00",
+   "tournamentEnd": "2004-02-14T00:00:00+01:00",
+   "season": {
+    "id": 2003,
+    "display": "2004",
+    "cyclicalName": "2004",
+    "nonCyclicalName": "03/04"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2003"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    105
+   ],
+   "winnerClubId": 3434,
+   "tournamentStart": "2002-01-19T00:00:00+01:00",
+   "tournamentEnd": "2002-02-10T00:00:00+01:00",
+   "season": {
+    "id": 2001,
+    "display": "2002",
+    "cyclicalName": "2002",
+    "nonCyclicalName": "01/02"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=2001"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    54,
+    124
+   ],
+   "winnerClubId": 3434,
+   "tournamentStart": "2000-01-22T00:00:00+01:00",
+   "tournamentEnd": "2000-02-13T00:00:00+01:00",
+   "season": {
+    "id": 1999,
+    "display": "2000",
+    "cyclicalName": "2000",
+    "nonCyclicalName": "99/00"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1999"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    29
+   ],
+   "winnerClubId": 3672,
+   "tournamentStart": "1998-02-07T00:00:00+01:00",
+   "tournamentEnd": "1998-02-28T00:00:00+01:00",
+   "season": {
+    "id": 1997,
+    "display": "1998",
+    "cyclicalName": "1998",
+    "nonCyclicalName": "97/98"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1997"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    159
+   ],
+   "winnerClubId": 3806,
+   "tournamentStart": "1996-01-13T00:00:00+01:00",
+   "tournamentEnd": "1996-02-03T00:00:00+01:00",
+   "season": {
+    "id": 1995,
+    "display": "1996",
+    "cyclicalName": "1996",
+    "nonCyclicalName": "95/96"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1995"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    173
+   ],
+   "winnerClubId": 3444,
+   "tournamentStart": "1994-03-26T00:00:00+01:00",
+   "tournamentEnd": "1994-04-10T00:00:00+02:00",
+   "season": {
+    "id": 1993,
+    "display": "1994",
+    "cyclicalName": "1994",
+    "nonCyclicalName": "93/94"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1993"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    149
+   ],
+   "winnerClubId": 3591,
+   "tournamentStart": "1992-01-12T00:00:00+01:00",
+   "tournamentEnd": "1992-01-26T00:00:00+01:00",
+   "season": {
+    "id": 1991,
+    "display": "1992",
+    "cyclicalName": "1992",
+    "nonCyclicalName": "91/92"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1991"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    4
+   ],
+   "winnerClubId": 3614,
+   "tournamentStart": "1990-03-02T00:00:00+01:00",
+   "tournamentEnd": "1990-03-16T00:00:00+01:00",
+   "season": {
+    "id": 1989,
+    "display": "1990",
+    "cyclicalName": "1990",
+    "nonCyclicalName": "89/90"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1989"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    107
+   ],
+   "winnerClubId": 3434,
+   "tournamentStart": "1988-03-13T00:00:00+01:00",
+   "tournamentEnd": "1988-03-27T00:00:00+01:00",
+   "season": {
+    "id": 1987,
+    "display": "1988",
+    "cyclicalName": "1988",
+    "nonCyclicalName": "87/88"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1987"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    2
+   ],
+   "winnerClubId": 3672,
+   "tournamentStart": "1986-03-07T00:00:00+01:00",
+   "tournamentEnd": "1986-03-21T00:00:00+01:00",
+   "season": {
+    "id": 1985,
+    "display": "1986",
+    "cyclicalName": "1986",
+    "nonCyclicalName": "85/86"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1985"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    38
+   ],
+   "winnerClubId": 3434,
+   "tournamentStart": "1984-03-04T00:00:00+01:00",
+   "tournamentEnd": "1984-03-18T00:00:00+01:00",
+   "season": {
+    "id": 1983,
+    "display": "1984",
+    "cyclicalName": "1984",
+    "nonCyclicalName": "83/84"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1983"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    96
+   ],
+   "winnerClubId": 3441,
+   "tournamentStart": "1982-03-05T00:00:00+01:00",
+   "tournamentEnd": "1982-03-19T00:00:00+01:00",
+   "season": {
+    "id": 1981,
+    "display": "1982",
+    "cyclicalName": "1982",
+    "nonCyclicalName": "81/82"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1981"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    124
+   ],
+   "winnerClubId": 3444,
+   "tournamentStart": "1980-03-08T00:00:00+01:00",
+   "tournamentEnd": "1980-03-22T00:00:00+01:00",
+   "season": {
+    "id": 1979,
+    "display": "1980",
+    "cyclicalName": "1980",
+    "nonCyclicalName": "79/80"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1979"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    54
+   ],
+   "winnerClubId": 3441,
+   "tournamentStart": "1978-03-05T00:00:00+01:00",
+   "tournamentEnd": "1978-03-16T00:00:00+01:00",
+   "season": {
+    "id": 1977,
+    "display": "1978",
+    "cyclicalName": "1978",
+    "nonCyclicalName": "77/78"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1977"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    11
+   ],
+   "winnerClubId": 3575,
+   "tournamentStart": "1976-02-29T00:00:00+01:00",
+   "tournamentEnd": "1976-03-14T00:00:00+01:00",
+   "season": {
+    "id": 1975,
+    "display": "1976",
+    "cyclicalName": "1976",
+    "nonCyclicalName": "75/76"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1975"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    2
+   ],
+   "winnerClubId": 26440,
+   "tournamentStart": "1974-03-01T00:00:00+01:00",
+   "tournamentEnd": "1974-03-14T00:00:00+01:00",
+   "season": {
+    "id": 1973,
+    "display": "1974",
+    "cyclicalName": "1974",
+    "nonCyclicalName": "73/74"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1973"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    31
+   ],
+   "winnerClubId": 3702,
+   "tournamentStart": "1972-02-23T00:00:00+01:00",
+   "tournamentEnd": "1972-03-05T00:00:00+01:00",
+   "season": {
+    "id": 1971,
+    "display": "1972",
+    "cyclicalName": "1972",
+    "nonCyclicalName": "71/72"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1971"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    160
+   ],
+   "winnerClubId": 13313,
+   "tournamentStart": "1970-02-06T00:00:00+01:00",
+   "tournamentEnd": "1970-02-16T00:00:00+01:00",
+   "season": {
+    "id": 1969,
+    "display": "1970",
+    "cyclicalName": "1970",
+    "nonCyclicalName": "69/70"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1969"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    11
+   ],
+   "winnerClubId": 3854,
+   "tournamentStart": "1968-01-12T00:00:00+01:00",
+   "tournamentEnd": "1968-01-21T00:00:00+01:00",
+   "season": {
+    "id": 1967,
+    "display": "1968",
+    "cyclicalName": "1968",
+    "nonCyclicalName": "67/68"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1967"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    173
+   ],
+   "winnerClubId": 3441,
+   "tournamentStart": "1965-11-12T00:00:00+01:00",
+   "tournamentEnd": "1965-11-21T00:00:00+01:00",
+   "season": {
+    "id": 1964,
+    "display": "1965",
+    "cyclicalName": "1965",
+    "nonCyclicalName": "64/65"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1964"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    54
+   ],
+   "winnerClubId": 3441,
+   "tournamentStart": "1963-11-24T00:00:00+01:00",
+   "tournamentEnd": "1963-12-01T00:00:00+01:00",
+   "season": {
+    "id": 1962,
+    "display": "1963",
+    "cyclicalName": "1963",
+    "nonCyclicalName": "62/63"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1962"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    11
+   ],
+   "winnerClubId": 13941,
+   "tournamentStart": "1962-01-14T00:00:00+01:00",
+   "tournamentEnd": "1962-01-21T00:00:00+01:00",
+   "season": {
+    "id": 1961,
+    "display": "1962",
+    "cyclicalName": "1962",
+    "nonCyclicalName": "61/62"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1961"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    2
+   ],
+   "winnerClubId": 3672,
+   "tournamentStart": "1959-05-22T00:00:00+01:00",
+   "tournamentEnd": "1959-05-29T00:00:00+01:00",
+   "season": {
+    "id": 1958,
+    "display": "1959",
+    "cyclicalName": "1959",
+    "nonCyclicalName": "58/59"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1958"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [
+    160
+   ],
+   "winnerClubId": 3672,
+   "tournamentStart": "1957-02-10T00:00:00+01:00",
+   "tournamentEnd": "1957-02-16T00:00:00+01:00",
+   "season": {
+    "id": 1956,
+    "display": "1957",
+    "cyclicalName": "1957",
+    "nonCyclicalName": "56/57"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/africa-cup-of-nations/startseite/pokalwettbewerb/AFCN?saison_id=1956"
+  }
+ ]
+}

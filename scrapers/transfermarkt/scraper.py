@@ -62,7 +62,8 @@ from scrapers.transfermarkt.registry import (
     resolve_competition,
     season_window_year,
 )
-from scrapers.transfermarkt.season import saison_id_to_season
+from scrapers.transfermarkt import tmapi
+from scrapers.transfermarkt.season import saison_id_to_season, season_to_saison_id
 from scrapers.utils.proxy_manager import ProxyManager
 from scrapers.utils.rate_limiter import RateLimiter
 
@@ -82,6 +83,16 @@ _TM_BASE = "https://www.transfermarkt.com"
 # variant exposes the wider, detailed squad table — same selector contract
 # as the default page but with extra metadata columns visible.)
 _CLUB_SQUAD_PATH = "/{club_slug}/kader/verein/{club_id}/saison_id/{year}/plus/1"
+# Participants of a script-rendered competition page (cups, continental
+# cups, national-team tournaments) — the reserve and cross-check of tmapi.
+_COMPETITION_PARTICIPANTS_PATH = (
+    "/{competition_slug}/teilnehmer/pokalwettbewerb/{competition_id}"
+    "/saison_id/{year}"
+)
+# tmapi states club ids only.  A club missing from the /teilnehmer/ page gets
+# this placeholder slug; whether the squad page accepts any slug for the id is
+# measured in #1392 (B7) before the draft becomes ready.
+_ID_ONLY_CLUB_SLUG = "x"
 # JSON, no auth, no proxy required cookie-wise (but TM CF still requires proxy).
 _PLAYER_MV_HISTORY_PATH = "/ceapi/marketValueDevelopment/graph/{player_id}"
 _PLAYER_TRANSFERS_PATH = "/ceapi/transferHistory/list/{player_id}"
@@ -435,6 +446,64 @@ def _parse_club_listing(html: str) -> List[Dict]:
             'href': a['href'],
         })
     return clubs
+
+
+def _parse_participant_table(html: str) -> List[Dict]:
+    """Club rows of a ``/teilnehmer/`` page: every ``table.items``, in order.
+
+    The page splits participants over several tables (Copa do Brasil 2026:
+    4 + 122 = the 126 ids tmapi states); rows repeat the club link in the
+    crest cell, so clubs are de-duplicated by id.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    clubs: List[Dict] = []
+    seen: set = set()
+    for table in soup.find_all('table', {'class': 'items'}):
+        for td in table.find_all('td', class_='hauptlink'):
+            a = td.find('a', href=True)
+            m = _CLUB_HREF_RE.match(a['href']) if a else None
+            if not m or m.group('id') in seen:
+                continue
+            seen.add(m.group('id'))
+            clubs.append({
+                'club_id': m.group('id'),
+                'club_slug': m.group('slug'),
+                'club_name': a.get_text(strip=True),
+                'href': a['href'],
+            })
+    return clubs
+
+
+def _participant_page_is_empty(html: str, competition_id: str) -> bool:
+    """True when a ``/teilnehmer/`` page states no participant at all.
+
+    The page must self-identify the requested competition (hreflang
+    alternates, as ``_listing_page_is_empty_shell``) and carry no
+    ``table.items``: a consent/error page or a drifted layout proves nothing.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    if soup.find('table', {'class': 'items'}) is not None:
+        return False
+    pattern = re.compile(
+        r'/(?:pokal)?wettbewerb/' + re.escape(str(competition_id)) + r'(?:/|$)'
+    )
+    return any(
+        pattern.search(str(link.get('href') or ''))
+        for link in soup.find_all('link', rel='alternate')
+    )
+
+
+def _uses_participant_api(competition: CompetitionRecord) -> bool:
+    """Script-rendered competition pages: participants come from tmapi."""
+
+    return (
+        '/pokalwettbewerb/' in str(competition.source_url)
+        or competition.team_type.value == 'national_team'
+    )
 
 
 def _listing_page_is_empty_shell(html: str, competition_id: str) -> bool:
@@ -1544,6 +1613,7 @@ class TransfermarktScraper(BaseScraper):
         self._last_outcome: Optional[FetchOutcome] = None
         self._fetch_records: Dict[str, Dict[str, FetchRecord]] = defaultdict(dict)
         self._scope_capture: Optional[Dict] = None
+        self._participant_evidence: Optional[Dict] = None
         self._materialization_failure_streak = 0
         self._materialization_circuit_open = False
         self._environment_decoded_budget_started = False
@@ -1688,6 +1758,107 @@ class TransfermarktScraper(BaseScraper):
         """Immutable response/transport envelopes emitted by the HTTP client."""
 
         return self._http_client.get_raw_attempt_records()
+
+    def _competition_participants(
+        self, scope: Dict, league: str, season,
+    ) -> tuple[str, List[Dict], str, Optional[str]]:
+        """Participants of a script-rendered competition (#1392).
+
+        tmapi is the source; the ``/teilnehmer/`` page is the cross-check,
+        the slug source and the reserve.  Returns ``(listing_status, clubs,
+        source_url, body_hash)``: ``authoritative_empty`` only when BOTH
+        answered and both stated no participant; ``unknown`` when neither
+        proves anything — the scope then stays in the queue.
+        """
+
+        competition = scope['record']
+        saison_id = scope['saison_id']
+        context = {
+            'league': league,
+            'season': season,
+            'competition_id': scope['competition_id'],
+            'edition_id': scope['edition_id'],
+            'scope': scope['scope_id'],
+        }
+        api_url = tmapi.competition_clubs_url(scope['competition_id'], saison_id)
+        api_ids = tmapi.competition_clubs(
+            lambda url: self._fetch_json(
+                url, label='participants_api', context=context,
+            ),
+            scope['competition_id'],
+            saison_id,
+        )
+        api_hash = (
+            self._last_outcome.payload_hash
+            if api_ids is not None and self._last_outcome is not None
+            else None
+        )
+        page_url = _TM_BASE + _COMPETITION_PARTICIPANTS_PATH.format(
+            competition_slug=competition.slug,
+            competition_id=scope['competition_id'],
+            year=saison_id,
+        )
+        page_html = self._fetch_html(
+            page_url, label='teilnehmer', context=context,
+        )
+        page_clubs = (
+            _parse_participant_table(page_html) if page_html is not None else None
+        )
+        if page_clubs == [] and not _participant_page_is_empty(
+            page_html, scope['competition_id'],
+        ):
+            page_clubs = None  # zero rows without a self-identifying page
+        page_hash = (
+            self._last_outcome.payload_hash
+            if page_html is not None and self._last_outcome is not None
+            else None
+        )
+        slugs = {club['club_id']: club for club in page_clubs or ()}
+        evidence = {
+            'saison_id': int(saison_id),
+            'tmapi_url': api_url,
+            'tmapi_count': None if api_ids is None else len(api_ids),
+            'teilnehmer_url': page_url,
+            'teilnehmer_count': None if page_clubs is None else len(page_clubs),
+        }
+        if api_ids is not None and page_clubs is not None:
+            # Qualifying rounds may list clubs on one side only: a flag, not
+            # an error (FA Cup: tmapi 124 = the main draw).
+            evidence['tmapi_only'] = len(set(api_ids) - set(slugs))
+            evidence['teilnehmer_only'] = len(set(slugs) - set(api_ids))
+        if competition.team_type.value == 'national_team':
+            # Until measured (#1392 B5) a national team's squad page is its
+            # current squad, not proven to be the tournament roster.
+            evidence['national_squad'] = 'kader_by_saison_id_unverified'
+        self._participant_evidence = evidence
+
+        if api_ids:
+            clubs = [
+                slugs.get(club_id) or {
+                    'club_id': club_id,
+                    'club_slug': _ID_ONLY_CLUB_SLUG,
+                    'club_name': '',
+                    'href': '',
+                }
+                for club_id in api_ids
+            ]
+            evidence['source'] = 'tmapi'
+            return 'ok', clubs, api_url, api_hash
+        if page_clubs:
+            evidence['source'] = 'teilnehmer'
+            return 'ok', list(page_clubs), page_url, page_hash
+        if api_ids is not None and page_clubs is not None:
+            evidence['source'] = 'tmapi+teilnehmer'
+            return 'authoritative_empty', [], api_url, api_hash
+        evidence['source'] = 'none'
+        return 'unknown', [], api_url, api_hash or page_hash
+
+    def get_participant_evidence(self) -> Optional[Dict]:
+        """Both participant proofs of a script-rendered scope (#1392)."""
+
+        if self._participant_evidence is None:
+            return None
+        return json.loads(json.dumps(self._participant_evidence, sort_keys=True))
 
     def get_scope_capture(self) -> Optional[Dict]:
         """Return listing/squad participant evidence for the exact scope."""
@@ -1957,7 +2128,9 @@ class TransfermarktScraper(BaseScraper):
 
             return _validate_json
 
-        if label not in {'listing', 'squad', 'coach_history', 'coach_profile'}:
+        if label not in {
+            'listing', 'teilnehmer', 'squad', 'coach_history', 'coach_profile',
+        }:
             return None
 
         def _validate_html(html):
@@ -1969,7 +2142,7 @@ class TransfermarktScraper(BaseScraper):
                     return 'missing coach profile headline'
             elif soup.find('table', {'class': 'items'}) is None:
                 if (
-                    label == 'listing'
+                    label in ('listing', 'teilnehmer')
                     and soup.find('table') is None
                     and soup.find('a', href=_CLUB_HREF_RE) is None
                     and soup.find('link', rel='alternate') is not None
@@ -2245,6 +2418,7 @@ class TransfermarktScraper(BaseScraper):
         league = scope['compatibility_league']
         season_short = scope['canonical_season']
         self._begin_operation_budget('players')
+        self._participant_evidence = None
         listing_url = _competition_listing_url(
             competition, scope['edition_id'],
         )
@@ -2301,77 +2475,122 @@ class TransfermarktScraper(BaseScraper):
                 'legacy_players': legacy_players,
             }
 
-        # Step 1 — exact discovered competition/edition listing → teams.
-        listing_html = self._fetch_html(
-            listing_url,
-            label='listing',
-            context={
-                'league': league,
-                'season': season,
-                'competition_id': scope['competition_id'],
-                'edition_id': scope['edition_id'],
-                'scope': scope['scope_id'],
-            },
+        participant_route = _uses_participant_api(competition)
+        # A league keeps its registry edition id; a participant-route scope
+        # fetches by the source saison_id of its season (season.py, #1392): a
+        # registry cup edition keyed by its printed year ("2026") is 2025.
+        if participant_route:
+            scope['saison_id'] = season_to_saison_id(
+                season_short, competition.season_format,
+            )
+        squad_year = (
+            scope['saison_id'] if participant_route else scope['edition_id']
         )
-        if listing_html is None:
-            listing_record = self._fetch_records.get('listing', {}).get(
-                f'{league}:{season}',
+        if participant_route:
+            status, clubs, source_url, body_hash = self._competition_participants(
+                scope, league, season,
             )
-            self._scope_capture['listing_status'] = (
-                listing_record.status.value
-                if listing_record is not None else 'retry_exhausted'
-            )
+            self._scope_capture['listing_source_url'] = source_url
+            self._scope_capture['listing_source_body_hash'] = body_hash
             self._scope_capture['fetched_at'] = (
                 datetime.now(timezone.utc).isoformat()
             )
-            logger.error(
-                "%s: league listing fetch failed for %s/%s.",
-                R0_2B_FALLBACK_MARKER, league, season,
+            self._record_materialized_rows(
+                'listing', {'league': league, 'season': season}, len(clubs),
             )
-            return _empty_bundle()
-
-        clubs = _parse_club_listing(listing_html)
-        self._scope_capture['listing_source_body_hash'] = (
-            self._last_outcome.payload_hash
-            if self._last_outcome is not None
-            else competition.source_body_hash
-        )
-        self._record_materialized_rows(
-            'listing', {'league': league, 'season': season}, len(clubs),
-        )
-        if not clubs:
-            self._scope_capture['fetched_at'] = (
-                datetime.now(timezone.utc).isoformat()
-            )
-            if _listing_page_is_empty_shell(
-                listing_html, scope['competition_id'],
-            ) and not self._bronze_scope_has_roster(league, season_short):
-                # #1025: the source shows this competition/edition with no
-                # participant listing at all — an authoritative empty scope,
-                # not selector drift. A scope that already has a Bronze
-                # roster stays on the loud schema_error path below: a
-                # populated edition cannot silently become empty.
+            if status == 'authoritative_empty':
                 self._scope_capture['listing_status'] = 'authoritative_empty'
                 self._mark_authoritative_empty(
                     'listing', {'league': league, 'season': season},
                 )
                 logger.info(
-                    "TM listing: %s/%s renders no participant listing; "
-                    "authoritative empty scope",
+                    "TM participants: %s/%s — tmapi and /teilnehmer/ both "
+                    "state no participant; authoritative empty scope",
                     league, season,
                 )
                 return _empty_bundle(fetch_status='authoritative_empty')
-            self._scope_capture['listing_status'] = 'schema_error'
-            self._mark_schema_error(
-                'listing',
-                {'league': league, 'season': season},
-                'listing table produced zero clubs; selector/layout drift',
+            if status == 'unknown':
+                # Neither source proved anything: not an empty scope.  It
+                # is not committed and stays in the queue (#1392).
+                self._scope_capture['listing_status'] = 'unknown'
+                logger.error(
+                    "%s: participants unknown for %s/%s (tmapi and "
+                    "/teilnehmer/ both unproven)",
+                    R0_2B_FALLBACK_MARKER, league, season,
+                )
+                return _empty_bundle()
+        else:
+            # Step 1 — exact discovered competition/edition listing → teams.
+            listing_html = self._fetch_html(
+                listing_url,
+                label='listing',
+                context={
+                    'league': league,
+                    'season': season,
+                    'competition_id': scope['competition_id'],
+                    'edition_id': scope['edition_id'],
+                    'scope': scope['scope_id'],
+                },
             )
-            logger.error(
-                "%s: listing parsed zero clubs for %s/%s",
-                R0_2B_FALLBACK_MARKER, league, season,
+            if listing_html is None:
+                listing_record = self._fetch_records.get('listing', {}).get(
+                    f'{league}:{season}',
+                )
+                self._scope_capture['listing_status'] = (
+                    listing_record.status.value
+                    if listing_record is not None else 'retry_exhausted'
+                )
+                self._scope_capture['fetched_at'] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+                logger.error(
+                    "%s: league listing fetch failed for %s/%s.",
+                    R0_2B_FALLBACK_MARKER, league, season,
+                )
+                return _empty_bundle()
+
+            clubs = _parse_club_listing(listing_html)
+            self._scope_capture['listing_source_body_hash'] = (
+                self._last_outcome.payload_hash
+                if self._last_outcome is not None
+                else competition.source_body_hash
             )
-            return _empty_bundle()
+            self._record_materialized_rows(
+                'listing', {'league': league, 'season': season}, len(clubs),
+            )
+            if not clubs:
+                self._scope_capture['fetched_at'] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+                if _listing_page_is_empty_shell(
+                    listing_html, scope['competition_id'],
+                ) and not self._bronze_scope_has_roster(league, season_short):
+                    # #1025: the source shows this competition/edition with no
+                    # participant listing at all — an authoritative empty scope,
+                    # not selector drift. A scope that already has a Bronze
+                    # roster stays on the loud schema_error path below: a
+                    # populated edition cannot silently become empty.
+                    self._scope_capture['listing_status'] = 'authoritative_empty'
+                    self._mark_authoritative_empty(
+                        'listing', {'league': league, 'season': season},
+                    )
+                    logger.info(
+                        "TM listing: %s/%s renders no participant listing; "
+                        "authoritative empty scope",
+                        league, season,
+                    )
+                    return _empty_bundle(fetch_status='authoritative_empty')
+                self._scope_capture['listing_status'] = 'schema_error'
+                self._mark_schema_error(
+                    'listing',
+                    {'league': league, 'season': season},
+                    'listing table produced zero clubs; selector/layout drift',
+                )
+                logger.error(
+                    "%s: listing parsed zero clubs for %s/%s",
+                    R0_2B_FALLBACK_MARKER, league, season,
+                )
+                return _empty_bundle()
         expected_team_ids = [str(club['club_id']) for club in clubs]
         self._scope_capture.update({
             'listing_status': 'ok',
@@ -2399,7 +2618,7 @@ class TransfermarktScraper(BaseScraper):
                 + _CLUB_SQUAD_PATH.format(
                     club_slug=club['club_slug'],
                     club_id=club['club_id'],
-                    year=scope['edition_id'],
+                    year=squad_year,
                 )
             )
             html = self._fetch_html(

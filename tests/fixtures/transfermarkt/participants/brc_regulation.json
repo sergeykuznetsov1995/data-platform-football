@@ -1,0 +1,456 @@
+{
+ "success": true,
+ "message": "OK",
+ "data": [
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [
+    26
+   ],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2025,
+    "display": "2026",
+    "cyclicalName": "2026",
+    "nonCyclicalName": "25/26"
+   },
+   "isCurrentSeason": true,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2025"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 199,
+   "tournamentStart": "2025-02-18T00:00:00+01:00",
+   "tournamentEnd": "2025-05-23T00:00:00+02:00",
+   "season": {
+    "id": 2024,
+    "display": "2025",
+    "cyclicalName": "2025",
+    "nonCyclicalName": "24/25"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2024"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 614,
+   "tournamentStart": "2024-02-20T00:00:00+01:00",
+   "tournamentEnd": "2024-11-10T00:00:00+01:00",
+   "season": {
+    "id": 2023,
+    "display": "2024",
+    "cyclicalName": "2024",
+    "nonCyclicalName": "23/24"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2023"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 585,
+   "tournamentStart": "2023-02-21T00:00:00+01:00",
+   "tournamentEnd": "2023-09-24T00:00:00+02:00",
+   "season": {
+    "id": 2022,
+    "display": "2023",
+    "cyclicalName": "2023",
+    "nonCyclicalName": "22/23"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2022"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 614,
+   "tournamentStart": "2022-02-22T00:00:00+01:00",
+   "tournamentEnd": "2022-10-20T00:00:00+02:00",
+   "season": {
+    "id": 2021,
+    "display": "2022",
+    "cyclicalName": "2022",
+    "nonCyclicalName": "21/22"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2021"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 330,
+   "tournamentStart": "2021-03-09T00:00:00+01:00",
+   "tournamentEnd": "2021-12-16T00:00:00+01:00",
+   "season": {
+    "id": 2020,
+    "display": "2021",
+    "cyclicalName": "2021",
+    "nonCyclicalName": "20/21"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2020"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 1023,
+   "tournamentStart": "2020-02-05T00:00:00+01:00",
+   "tournamentEnd": "2021-03-07T00:00:00+01:00",
+   "season": {
+    "id": 2019,
+    "display": "2020",
+    "cyclicalName": "2020",
+    "nonCyclicalName": "19/20"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2019"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 679,
+   "tournamentStart": "2019-02-06T00:00:00+01:00",
+   "tournamentEnd": "2019-09-18T00:00:00+02:00",
+   "season": {
+    "id": 2018,
+    "display": "2019",
+    "cyclicalName": "2019",
+    "nonCyclicalName": "18/19"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2018"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 609,
+   "tournamentStart": "2018-01-31T00:00:00+01:00",
+   "tournamentEnd": "2018-10-18T00:00:00+02:00",
+   "season": {
+    "id": 2017,
+    "display": "2018",
+    "cyclicalName": "2018",
+    "nonCyclicalName": "17/18"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2017"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 609,
+   "tournamentStart": "2017-02-08T00:00:00+01:00",
+   "tournamentEnd": "2017-09-28T00:00:00+02:00",
+   "season": {
+    "id": 2016,
+    "display": "2017",
+    "cyclicalName": "2017",
+    "nonCyclicalName": "16/17"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2016"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 210,
+   "tournamentStart": "2016-03-17T00:00:00+01:00",
+   "tournamentEnd": "2016-12-07T00:00:00+01:00",
+   "season": {
+    "id": 2015,
+    "display": "2016",
+    "cyclicalName": "2016",
+    "nonCyclicalName": "15/16"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2015"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 1023,
+   "tournamentStart": "2015-02-09T00:00:00+01:00",
+   "tournamentEnd": "2017-07-15T00:00:00+02:00",
+   "season": {
+    "id": 2014,
+    "display": "2015",
+    "cyclicalName": "2015",
+    "nonCyclicalName": "14/15"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2014"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 330,
+   "tournamentStart": "2014-02-20T00:00:00+01:00",
+   "tournamentEnd": "2014-11-27T00:00:00+01:00",
+   "season": {
+    "id": 2013,
+    "display": "2014",
+    "cyclicalName": "2014",
+    "nonCyclicalName": "13/14"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2013"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 614,
+   "tournamentStart": "2013-02-27T00:00:00+01:00",
+   "tournamentEnd": "2013-11-27T00:00:00+01:00",
+   "season": {
+    "id": 2012,
+    "display": "2013",
+    "cyclicalName": "2013",
+    "nonCyclicalName": "12/13"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2012"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 1023,
+   "tournamentStart": "2012-03-07T00:00:00+01:00",
+   "tournamentEnd": "2012-07-11T00:00:00+02:00",
+   "season": {
+    "id": 2011,
+    "display": "2012",
+    "cyclicalName": "2012",
+    "nonCyclicalName": "11/12"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2011"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 978,
+   "tournamentStart": "2011-02-16T00:00:00+01:00",
+   "tournamentEnd": "2011-06-09T00:00:00+02:00",
+   "season": {
+    "id": 2010,
+    "display": "2011",
+    "cyclicalName": "2011",
+    "nonCyclicalName": "10/11"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2010"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 221,
+   "tournamentStart": "2010-02-10T00:00:00+01:00",
+   "tournamentEnd": "2010-08-05T00:00:00+02:00",
+   "season": {
+    "id": 2009,
+    "display": "2010",
+    "cyclicalName": "2010",
+    "nonCyclicalName": "09/10"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2009"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 199,
+   "tournamentStart": "2009-02-19T00:00:00+01:00",
+   "tournamentEnd": "2009-07-02T00:00:00+02:00",
+   "season": {
+    "id": 2008,
+    "display": "2009",
+    "cyclicalName": "2009",
+    "nonCyclicalName": "08/09"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2008"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 8718,
+   "tournamentStart": "2008-02-07T00:00:00+01:00",
+   "tournamentEnd": "2008-06-12T00:00:00+02:00",
+   "season": {
+    "id": 2007,
+    "display": "2008",
+    "cyclicalName": "2008",
+    "nonCyclicalName": "07/08"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2007"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 2462,
+   "tournamentStart": "2007-02-14T00:00:00+01:00",
+   "tournamentEnd": "2007-06-07T00:00:00+02:00",
+   "season": {
+    "id": 2006,
+    "display": "2007",
+    "cyclicalName": "2007",
+    "nonCyclicalName": "06/07"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2006"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 614,
+   "tournamentStart": "2006-02-16T00:00:00+01:00",
+   "tournamentEnd": "2006-07-27T00:00:00+02:00",
+   "season": {
+    "id": 2005,
+    "display": "2006",
+    "cyclicalName": "2006",
+    "nonCyclicalName": "05/06"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2005"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 10857,
+   "tournamentStart": "2005-02-02T00:00:00+01:00",
+   "tournamentEnd": "2005-06-23T00:00:00+02:00",
+   "season": {
+    "id": 2004,
+    "display": "2005",
+    "cyclicalName": "2005",
+    "nonCyclicalName": "04/05"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2004"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 7478,
+   "tournamentStart": "2004-02-05T00:00:00+01:00",
+   "tournamentEnd": "2004-06-30T00:00:00+02:00",
+   "season": {
+    "id": 2003,
+    "display": "2004",
+    "cyclicalName": "2004",
+    "nonCyclicalName": "03/04"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2003"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 609,
+   "tournamentStart": "2003-02-05T00:00:00+01:00",
+   "tournamentEnd": "2003-06-11T00:00:00+02:00",
+   "season": {
+    "id": 2002,
+    "display": "2003",
+    "cyclicalName": "2003",
+    "nonCyclicalName": "02/03"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2002"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 199,
+   "tournamentStart": "2002-01-23T00:00:00+01:00",
+   "tournamentEnd": "2002-05-15T00:00:00+02:00",
+   "season": {
+    "id": 2001,
+    "display": "2002",
+    "cyclicalName": "2002",
+    "nonCyclicalName": "01/02"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2001"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 210,
+   "tournamentStart": "2001-03-14T00:00:00+01:00",
+   "tournamentEnd": "2001-06-17T00:00:00+02:00",
+   "season": {
+    "id": 2000,
+    "display": "2001",
+    "cyclicalName": "2001",
+    "nonCyclicalName": "00/01"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=2000"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 609,
+   "tournamentStart": "2000-03-15T00:00:00+01:00",
+   "tournamentEnd": "2000-07-09T00:00:00+02:00",
+   "season": {
+    "id": 1999,
+    "display": "2000",
+    "cyclicalName": "2000",
+    "nonCyclicalName": "99/00"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=1999"
+  },
+  {
+   "competitionId": "BRC",
+   "hostCountryIds": [],
+   "winnerClubId": 10492,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 1998,
+    "display": "1999",
+    "cyclicalName": "1999",
+    "nonCyclicalName": "98/99"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": false,
+   "relativeUrl": "/copa-do-brasil/startseite/pokalwettbewerb/BRC?saison_id=1998"
+  }
+ ]
+}

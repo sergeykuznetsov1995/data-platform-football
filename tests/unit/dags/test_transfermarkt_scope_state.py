@@ -435,3 +435,95 @@ def test_a_standing_policy_leaves_its_hash_inside_the_manifest_hash():
                     manifest.dq_evidence, standing_policy_hash=bogus,
                 ),
             ).validate(EXPECTED)
+
+
+def _empty_cup_manifest(participant_evidence=None):
+    """#1392: a cup scope whose tmapi + /teilnehmer/ both stated no club."""
+
+    from dags.utils import transfermarkt_dq_contracts as dq
+
+    manifest = _manifest('BRC:2025')
+    for name in sorted(EXPECTED):
+        manifest = _with_empty_entity(manifest, name)
+    capture = {
+        **manifest.dq_evidence['scope_capture'],
+        'competition_type': 'domestic_cup',
+        'listing_status': 'authoritative_empty',
+        'listing_source_url': (
+            'https://tmapi.transfermarkt.technology/competition/BRC/club'
+            '?season=2025'
+        ),
+        'expected_team_ids': [],
+        'observed_team_ids': [],
+        'endpoint_status_by_team': {},
+    }
+    evidence = {
+        **manifest.dq_evidence,
+        'registry_participant_count': None,
+        'scope_capture': capture,
+        'entity_contracts': dq.entity_applicability_contracts(
+            entities=EXPECTED,
+            competition_type='domestic_cup',
+            team_type='club',
+            listing_authoritative_empty=True,
+        ),
+        'participant_contract': {
+            'passed': True,
+            'competition_type': 'domestic_cup',
+            'strict': True,
+            'participant_count': 0,
+            'observed_participant_count': 0,
+            'participant_coverage': 1.0,
+            'endpoint_coverage': 1.0,
+            'minimum_participant_coverage': 1.0,
+            'fresh': True,
+        },
+        'authoritative_empty_evidence': {
+            name: {'kind': 'typed_fetch_state', 'result_sha256': 'c' * 64}
+            for name in EXPECTED
+        },
+        'has_squad_rows': False,
+    }
+    if participant_evidence is not None:
+        evidence['participant_evidence'] = participant_evidence
+    return dataclasses.replace(manifest, dq_evidence=evidence)
+
+
+def test_empty_cup_scope_needs_both_participant_proofs():
+    both_empty = {'tmapi_count': 0, 'teilnehmer_count': 0}
+    _empty_cup_manifest(both_empty).validate(EXPECTED)
+
+    for evidence in (None, {'tmapi_count': 0, 'teilnehmer_count': None}):
+        with pytest.raises(state.ScopeManifestError, match='tmapi and'):
+            _empty_cup_manifest(evidence).validate(EXPECTED)
+
+
+def test_unknown_participants_never_complete_a_scope():
+    manifest = _manifest('BRC:2025')
+    unknown = dataclasses.replace(manifest, dq_evidence={
+        **manifest.dq_evidence,
+        'scope_capture': {
+            **manifest.dq_evidence['scope_capture'],
+            'listing_status': 'unknown',
+        },
+    })
+    with pytest.raises(state.ScopeManifestError, match='participants are unknown'):
+        unknown.validate(EXPECTED)
+
+
+def test_has_squad_rows_and_participant_evidence_are_typed():
+    manifest = _manifest('GB1:2025')
+    stated = dataclasses.replace(
+        manifest, dq_evidence=dict(manifest.dq_evidence, has_squad_rows=True),
+    )
+    stated.validate(EXPECTED)
+    assert stated.digest != manifest.digest
+    with pytest.raises(state.ScopeManifestError, match='has_squad_rows'):
+        dataclasses.replace(
+            manifest, dq_evidence=dict(manifest.dq_evidence, has_squad_rows=1),
+        ).validate(EXPECTED)
+    with pytest.raises(state.ScopeManifestError, match='participant evidence'):
+        dataclasses.replace(
+            manifest,
+            dq_evidence=dict(manifest.dq_evidence, participant_evidence=[]),
+        ).validate(EXPECTED)
