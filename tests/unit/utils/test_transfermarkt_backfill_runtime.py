@@ -1075,3 +1075,19 @@ def test_post_claim_incident_resume_repairs_partial_scope_claim(tmp_path):
         claim.batch.scope_claim_generations
     )
     assert repository.transitions[-2:] == ["campaign", "batch"]
+
+
+def test_history_targets_only_the_denominator_live_core(monkeypatch):
+    from scrapers.transfermarkt import denominator as tm_denominator
+
+    rows = [_row(_competition(), _edition("2020", current=False))]
+    assert [item.competition_id for item in runtime.historical_targets_from_registry(rows)] == ["GB1"]
+
+    class _NoCore:
+        def denominator_ids(self):
+            return frozenset({"ES1"})
+
+    monkeypatch.setattr(runtime, "load_denominator", lambda: _NoCore())
+    assert tm_denominator.load_denominator().row("GB1").is_core
+    with pytest.raises(runtime.BackfillRuntimeError, match="no historical"):
+        runtime.historical_targets_from_registry(rows)

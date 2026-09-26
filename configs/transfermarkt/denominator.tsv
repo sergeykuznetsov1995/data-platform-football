@@ -1,0 +1,804 @@
+id	name	country	confederation	tier	class	route	live	current_saison_id	step2_saison_ids	fotmob_id	sofascore_id	fbref_id	reason
+17AC	Africa U-17 Cup of Nations	International	CAF	international	youth	pokal	1	2025					rule:youth
+17DA	U17 DFB-Nachwuchsliga - Vorrunde Gruppe A	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17DB	U17 DFB-Nachwuchsliga - Vorrunde Gruppe B	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17DC	U17 DFB-Nachwuchsliga - Vorrunde Gruppe C	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17DD	U17 DFB-Nachwuchsliga - Vorrunde Gruppe D	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17DE	U17 DFB-Nachwuchsliga - Vorrunde Gruppe E	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17DF	U17 DFB-Nachwuchsliga - Vorrunde Gruppe F	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17DG	U17 DFB-Nachwuchsliga - Vorrunde Gruppe G	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17DH	U17 DFB-Nachwuchsliga - Vorrunde Gruppe H	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+17WC	U17 World Cup	International	International	international	youth	pokal	1	2025					rule:youth
+19D1	U19 DFB-Nachwuchsliga - Vorrunde Gruppe A	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D2	U19 DFB-Nachwuchsliga - Vorrunde Gruppe B	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D3	U19 DFB-Nachwuchsliga - Vorrunde Gruppe C	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D4	U19 DFB-Nachwuchsliga - Vorrunde Gruppe D	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D5	U19 DFB-Nachwuchsliga - Vorrunde Gruppe E	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D6	U19 DFB-Nachwuchsliga - Vorrunde Gruppe F	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D7	U19 DFB-Nachwuchsliga - Vorrunde Gruppe G	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D8	U19 DFB-Nachwuchsliga - Vorrunde Gruppe H	Germany	UEFA	youth	youth	wettbewerb	1	2026	2024				rule:youth
+19D9	U19 DFB-Nachwuchsliga - Vorrunde Gruppe I	Germany	UEFA	youth	youth	wettbewerb	1	2026					rule:youth
+19YL	UEFA Youth League	International	UEFA	youth	youth	pokal	1	2026					rule:youth
+20AC	Africa U-20 Cup of Nations	International	CAF	international	youth	pokal	1	2026					rule:youth
+211F	U21 Division 1 Fall	Netherlands	UEFA	youth	youth	wettbewerb	1	2026	2020,2021,2022,2023,2024				rule:youth
+212F	U21 Division 2 Fall	Netherlands	UEFA	youth	youth	wettbewerb	1	2026	2020,2021,2022,2023,2024				rule:youth
+23AF	AFC U23 Asian Cup	International	AFC	international	youth	pokal	1	2025					rule:youth
+2DVB	2. Division B	Russia	UEFA	4	core_club	wettbewerb	1	2025	2023				rule:default
+510	Derde Divisie A	Netherlands	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+511	Derde Divisie B	Netherlands	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A1	Bundesliga	Austria	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	38			rule:default
+A168	AFC U17 Asian Cup	International	AFC	international	youth	pokal	1	2025					rule:youth
+A169	AFC U17 Asian Cup Qualification	International	AFC	international	youth	pokal	1	2025					rule:youth
+A1P1	Playoff Torneo Apertura	Argentina	Americas	playoff	core_club	wettbewerb	1	2025					rule:default
+A2	2. Liga	Austria	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	119	135		rule:default
+A23Q	AFC U23 Asian Cup Qualification	International	AFC	international	youth	pokal	1	2025					rule:youth
+A2SW	National Premier League - New South Wales	Australia	AFC	2	core_club	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:default
+A2VI	National Premier League - Victoria	Australia	AFC	2	core_club	wettbewerb	1	2025	2020,2021,2022,2023				rule:default
+A4B	Burgenlandliga	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4K	Kärntner Liga	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4N	1. Landesliga Niederösterreich	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4O	Oberösterreich Liga	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4S	Salzburger Liga	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4ST	Landesliga Steiermark	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4T	Tiroler Liga	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4V	Eliteliga Vorarlberg	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+A4W	Wiener Stadtliga	Austria	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+AC14	AFC Challenge Cup (- 2014)	International	AFC	international	archive	pokal	0	2013					rule:national team (review C9-F4, registry says club cup); archive: current edition 2014 is not live
+AC2Q	AFC Champions League Two Qualifying	International	AFC	international	core_club	pokal	1	2026					rule:default
+ACCQ	AFC Challenge Cup Qualifikation (- 2014)	International	AFC	international	archive	pokal	0	2012					rule:national team (review C9-F4, registry says club cup); archive: current edition 2013 is not live
+ACEQ	AFC Champions League Elite Qualifying	International	AFC	international	core_club	pokal	1	2026					rule:default
+ACFF	2de Nationale FFA	Belgium	UEFA	4	core_club	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+ACHQ	AFC Challenge League Qualifying	International	AFC	international	core_club	pokal	1	2026					rule:default
+ACL	CAF-Champions League	International	CAF	international	core_club	pokal	1	2025		526	1054		rule:default
+ACL2	AFC Champions League Two	International	AFC	international	core_club	pokal	1	2026		9469	668		rule:default
+ACLE	AFC Champions League Elite	International	AFC	international	core_club	pokal	1	2026		525	463		rule:default
+ACQ1	ASEAN Championship Qualification	International	AFC	international	core_national	pokal	1	2025					rule:national team (review C9-F4, registry says club cup)
+ACQU	Asian Cup qualification	International	AFC	international	core_national	pokal	1	2024	2024				rule:national team (review C9-F4, registry says club cup)
+AE22	2022 ASEAN Championship	International	AFC	international	archive	pokal	0	2021	2021				rule:national team (review C9-F4, registry says club cup); manual:one-off edition id of the 2022 ASEAN Championship; archive: current edition 2022 is not live
+AF16	ASEAN U17 Boys Championship	International	AFC	international	youth	pokal	1	2025					rule:youth
+AF19	ASEAN U19 Boys Championship	International	AFC	international	youth	pokal	1	2025					rule:youth
+AFAC	AFC Asian Cup	International	AFC	international	core_national	pokal	1	2026			246		rule:national team
+AFCN	Africa Cup of Nations	International	CAF	international	core_national	pokal	1	2026		289	270		rule:national team
+AFCP	AFC Challenge League	International	AFC	international	core_club	pokal	1	2026		9470	22795		rule:default
+AFCQ	Africa Cup of Nations Qualification	International	CAF	international	core_national	pokal	1	2026		10608			rule:national team (review C9-F4, registry says club cup)
+AFSE	ASEAN Championship	International	AFC	international	core_national	pokal	1	2025		9265	602		rule:national team (review C9-F4, registry says club cup)
+AFT	CONMEBOL-UEFA Cup of Champions	International	FIFA	international	core_national	pokal	1	2025					rule:national team (review C9-F4, registry says club cup)
+AG18	Asian Games	International	AFC	international	youth	pokal	1	2025		9833			rule:youth games
+AGUC	Arabian Gulf Cup	International	AFC	international	core_national	pokal	1	2025					rule:national team (review C9-F4, registry says club cup)
+ALB1	Kategoria Superiore	Albania	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	260			rule:default
+ALB2	Kategoria e Parë	Albania	UEFA	2	core_club	wettbewerb	1	2026	2018,2019,2020,2021,2022,2023,2024		722		rule:default
+ALBS	Superkupa e Shqipërisë	Albania	UEFA	supercup	core_club	pokal	1	2026		10175			rule:default
+ALG1	Ligue 1	Algeria	CAF	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	516			rule:default
+AND1	Primera Divisió	Andorra	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		742		rule:default
+ARCA	Copa Argentina	Argentina	Americas	cup	core_club	pokal	1	2025		9305	1024		rule:default
+ARCP	FIFA Arab Cup	International	AFC	international	core_national	pokal	1	2024		10242			rule:national team (review C9-F4, registry says club cup)
+ARG1	Torneo Apertura	Argentina	Americas	1	core_club	wettbewerb	1	2025					rule:default
+ARG2	Primera Nacional	Argentina	Americas	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		703		rule:default
+ARG3	Torneo Federal A	Argentina	Americas	3	core_club	wettbewerb	1	2025	2018,2019,2020,2021,2022,2023		14090		rule:default
+ARGC	Torneo Clausura	Argentina	Americas	1	core_club	wettbewerb	1	2025					rule:default
+ARLS	Regionalliga Süd	Austria	UEFA	3	core_club	wettbewerb	1	2026					rule:default
+ARM1	Premier League	Armenia	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	118			rule:default
+ARM2	Armenian First League	Armenia	UEFA	2	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+ASCC	ASEAN Club Championship	International	AFC	international	core_club	pokal	1	2026		11012	28308		rule:default
+ASCP	AFC Solidarity Cup	International	AFC	international	archive	pokal	0	2015	2015				rule:national team (review C9-F4, registry says club cup); archive: current edition 2016 is not live
+ASCQ	ASEAN Club Championship Qualifying	International	AFC	international	core_club	pokal	1	2026					rule:default
+ATRO	Regional League East	Austria	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+AU2C	AFC U20 Asian Cup qualification	International	AFC	international	youth	pokal	1	2026					rule:youth
+AUS1	A-League Men	Australia	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		136		rule:default
+AZ1	Premyer Liqa	Azerbaijan	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+BBPO	Landespokal Brandenburg	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+BCE2	Campeonato Cearense - Relegation Round	Brazil	Americas	regional	core_club	wettbewerb	1	2025	2014,2015,2022,2023				rule:Brazilian state championship
+BCP1	Campeonato Paulista	Brazil	Americas	regional	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:Brazilian state championship
+BE1	Jupiler Pro League	Belgium	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+BE2	Challenger Pro League	Belgium	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		9		rule:default
+BE3A	1ste Nationale FFA	Belgium	UEFA	3	core_club	wettbewerb	1	2026	2024				rule:default
+BE3V	1ste Nationale VV	Belgium	UEFA	3	core_club	wettbewerb	1	2026	2024				rule:default
+BE5A	3de Nationale VV A	Belgium	UEFA	5	amateur	wettbewerb	1	2026	2021,2022,2023,2024				rule:tier 5
+BE5B	3de Nationale VV B	Belgium	UEFA	5	amateur	wettbewerb	1	2026	2021,2022,2023,2024				rule:tier 5
+BESC	Volkswagen Supercup	Belgium	UEFA	supercup	core_club	pokal	1	2026					rule:default
+BGD1	Bangladesh Football League	Bangladesh	AFC	1	core_club	wettbewerb	1	2026	2015,2017,2018,2019,2020,2021,2022,2023,2024		13331		rule:default
+BH1L	Bhutan Premier League	Bhutan	AFC	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		22397		rule:default
+BH2S	Prva Liga RS	Bosnia-Herzegovina	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+BI17	Premijer Liga BiH U17	Bosnia-Herzegovina	UEFA	youth	youth	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+BI19	Premijer Liga BiH U19	Bosnia-Herzegovina	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+BO1A	División Profesional	Bolivia	Americas	1	core_club	wettbewerb	1	2025	2019,2020,2021,2022		16736		rule:default
+BOL2	Copa Simón Bolívar - Fase Departamental	Bolivia	Americas	2	core_club	pokal	1	2025					rule:default
+BOS1	Premijer Liga Bosne i Hercegovine	Bosnia-Herzegovina	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+BOS2	Prva liga FBiH	Bosnia-Herzegovina	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+BRA1	Campeonato Brasileiro Série A	Brazil	Americas	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+BRA2	Campeonato Brasileiro Série B	Brazil	Americas	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+BRA3	Campeonato Brasileiro Série C	Brazil	Americas	3	core_club	pokal	1	2025					rule:default
+BRA4	Campeonato Brasileiro Série D	Brazil	Americas	4	core_club	pokal	1	2025					rule:default
+BRAC	Campeonato Acreano	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRAL	Campeonato Alagoano	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRAP	Campeonato Amapaense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRBL	Brandenburgliga	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+BRC	Copa do Brasil	Brazil	Americas	cup	core_club	pokal	1	2025		9067			rule:default
+BRCB	Campeonato Baiano	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRCC	Troféu Farroupilha	Brazil	Americas	cup	core_club	pokal	1	2025					rule:default
+BRCE	Campeonato Cearense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRCG	Campeonato Carioca	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRCM	Campeonato Mineiro	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRCR	Campeonato Carioca - Taça Rio	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRDF	Campeonato Brasiliense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRES	Campeonato Capixaba	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRGO	Campeonato Goiano	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRMA	Campeonato Maranhense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRMS	Campeonato Mato-Grossense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRMT	Campeonato Sul-Mato-Grossense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRNE	Copa do Nordeste	Brazil	Americas	cup	core_club	pokal	1	2025		9429	1596		rule:default
+BRP1	Campeonato Paranaense - Quadrangular de Rebaixamen	Brazil	Americas	playoff	core_club	pokal	1	2025					rule:default
+BRP3	Campeonato Catarinense - Quadrangular de Rebaixame	Brazil	Americas	regional	core_club	wettbewerb	1	2025					rule:Brazilian state championship
+BRP4	Campeonato Maranhense - Quadrangular de Rebaixamen	Brazil	Americas	playoff	core_club	pokal	1	2025					rule:default
+BRP5	Campeonato Carioca - Quadrangular de Rebaixamento	Brazil	Americas	regional	core_club	wettbewerb	1	2025					rule:Brazilian state championship
+BRP6	Taça Acesc 70 Anos	Brazil	Americas	cup	core_club	pokal	1	2025					rule:default
+BRPA	Campeonato Paraense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRPB	Campeonato Paraibano	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRPE	Campeonato Pernambucano	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRPI	Campeonato Piauiense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRPR	Campeonato Paranaense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRQR	Campeonato Gaúcho - Relegation Round	Brazil	Americas	regional	core_club	wettbewerb	1	2025					rule:Brazilian state championship
+BRRD	Campeonato Rondoniense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRRN	Campeonato Potiguar	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRRR	Campeonato Roraimense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRRS	Campeonato Gaúcho	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRSC	Campeonato Catarinense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRSE	Campeonato Sergipano	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRTO	Campeonato Tocantinense	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+BRVE	Copa Verde	Brazil	Americas	cup	core_club	pokal	1	2025			10158		rule:default
+BSL1	Brunei Super League	Brunei Darussalam	AFC	1	core_club	wettbewerb	1	2026					rule:default
+BTCU	Baltic Cup	International	UEFA	international	core_national	pokal	1	2025			1060		rule:national team (review C9-F4, registry says club cup)
+BU1	efbet Liga	Bulgaria	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+BU2	Vtora Liga	Bulgaria	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1135		rule:default
+BULS	Bulgarian Super Cup	Bulgaria	UEFA	supercup	core_club	pokal	1	2026					rule:default
+BVP	Landespokal Bayern	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+BZ1A	Liga Premier de Belice Apertura	Belize	Americas	1	core_club	wettbewerb	1	2026					rule:default
+BZ1C	Liga Premier de Belice Clausura	Belize	Americas	1	core_club	wettbewerb	1	2025					rule:default
+BZP1	Liga Premier de Belice Apertura Playoffs	Belize	Americas	playoff	core_club	wettbewerb	1	2025					rule:default
+BZP2	Liga Premier de Belice Clausura Playoffs	Belize	Americas	playoff	core_club	wettbewerb	1	2025					rule:default
+C1	Super League	Switzerland	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	69			rule:default
+C17C	Schweizer Cup U17	Switzerland	UEFA	youth	youth	pokal	1	2026					rule:youth
+C191	Swiss U19 Elite League	Switzerland	UEFA	youth	youth	wettbewerb	1	2026	2023,2024				rule:youth
+C2	Challenge League	Switzerland	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	163			rule:default
+C20Q	CONCACAF U-20 Championship-Qualifying	International	Americas	international	youth	pokal	1	2025					rule:youth
+C220	CONCACAF U-20 Championship	International	Americas	international	youth	pokal	1	2025					rule:youth
+C3BR	Championnat National 2 - Groupe E	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C3CM	Championnat National 2 - Groupe A	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C3HF	Championnat National 2 - Groupe G	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C3IF	Championnat National 2 - Groupe H	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C3NA	Championnat National 2 - Groupe B	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C3NO	Championnat National 2 - Groupe F	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C3PL	Championnat National 2 - Groupe D	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C3VL	Championnat National 2 - Groupe C	France	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+C591	Campeonato Sudamericano 1959	International	Americas	international	archive	pokal	0	1958					rule:national team (review C9-F4, registry says club cup); archive: current edition 1959 is not live
+C592	Campeonato Sudamericano 1959 Ecuador	International	Americas	international	archive	pokal	0	1958					rule:national team (review C9-F4, registry says club cup); archive: current edition 1959 is not live
+CA1	Campeonato Sudamericano 1916	International	Americas	international	archive	pokal	0	1915					rule:national team (review C9-F4, registry says club cup); archive: current edition 1916 is not live
+CA16	Copa América Centenario 2016	International	Americas	international	archive	pokal	0	2015	2015				rule:national team (review C9-F4, registry says club cup); archive: current edition 2016 is not live
+CA17	Caribbean Cup (- 2017)	International	Americas	international	archive	pokal	0	2016	2016				rule:national team (review C9-F4, registry says club cup); archive: current edition 2017 is not live
+CA19	Campeonato Sudamericano 1919	International	Americas	international	archive	pokal	0	1918					rule:national team (review C9-F4, registry says club cup); archive: current edition 1919 is not live
+CA2	Campeonato Sudamericano 1917	International	Americas	international	archive	pokal	0	1916					rule:national team (review C9-F4, registry says club cup); archive: current edition 1917 is not live
+CA20	Campeonato Sudamericano 1920	International	Americas	international	archive	pokal	0	1919					rule:national team (review C9-F4, registry says club cup); archive: current edition 1920 is not live
+CA21	Campeonato Sudamericano 1921	International	Americas	international	archive	pokal	0	1920					rule:national team (review C9-F4, registry says club cup); archive: current edition 1921 is not live
+CA22	Campeonato Sudamericano 1922	International	Americas	international	archive	pokal	0	1921					rule:national team (review C9-F4, registry says club cup); archive: current edition 1922 is not live
+CA23	Campeonato Sudamericano 1923	International	Americas	international	archive	pokal	0	1922					rule:national team (review C9-F4, registry says club cup); archive: current edition 1923 is not live
+CA24	Campeonato Sudamericano 1924	International	Americas	international	archive	pokal	0	1923					rule:national team (review C9-F4, registry says club cup); archive: current edition 1924 is not live
+CA25	Campeonato Sudamericano 1925	International	Americas	international	archive	pokal	0	1924					rule:national team (review C9-F4, registry says club cup); archive: current edition 1925 is not live
+CA26	Campeonato Sudamericano 1926	International	Americas	international	archive	pokal	0	1925					rule:national team (review C9-F4, registry says club cup); archive: current edition 1926 is not live
+CA27	Campeonato Sudamericano 1927	International	Americas	international	archive	pokal	0	1926					rule:national team (review C9-F4, registry says club cup); archive: current edition 1927 is not live
+CA29	Campeonato Sudamericano 1929	International	Americas	international	archive	pokal	0	1928					rule:national team (review C9-F4, registry says club cup); archive: current edition 1929 is not live
+CA35	Campeonato Sudamericano 1935	International	Americas	international	archive	pokal	0	1934					rule:national team (review C9-F4, registry says club cup); archive: current edition 1935 is not live
+CA37	Campeonato Sudamericano 1937	International	Americas	international	archive	pokal	0	1936					rule:national team (review C9-F4, registry says club cup); archive: current edition 1937 is not live
+CA39	Campeonato Sudamericano 1939	International	Americas	international	archive	pokal	0	1938					rule:national team (review C9-F4, registry says club cup); archive: current edition 1939 is not live
+CA41	Campeonato Sudamericano 1941	International	Americas	international	archive	pokal	0	1940					rule:national team (review C9-F4, registry says club cup); archive: current edition 1941 is not live
+CA43	Campeonato Sudamericano 1942	International	Americas	international	archive	pokal	0	1941					rule:national team (review C9-F4, registry says club cup); archive: current edition 1942 is not live
+CA45	Campeonato Sudamericano 1945	International	Americas	international	archive	pokal	0	1944					rule:national team (review C9-F4, registry says club cup); archive: current edition 1945 is not live
+CA46	Campeonato Sudamericano 1946	International	Americas	international	archive	pokal	0	1945					rule:national team (review C9-F4, registry says club cup); archive: current edition 1946 is not live
+CA47	Campeonato Sudamericano 1947	International	Americas	international	archive	pokal	0	1946					rule:national team (review C9-F4, registry says club cup); archive: current edition 1947 is not live
+CA49	Campeonato Sudamericano 1949	International	Americas	international	archive	pokal	0	1948					rule:national team (review C9-F4, registry says club cup); archive: current edition 1949 is not live
+CA53	Campeonato Sudamericano 1953	International	Americas	international	archive	pokal	0	1952					rule:national team (review C9-F4, registry says club cup); archive: current edition 1953 is not live
+CA55	Campeonato Sudamericano 1955	International	Americas	international	archive	pokal	0	1954					rule:national team (review C9-F4, registry says club cup); archive: current edition 1955 is not live
+CA56	Campeonato Sudamericano 1956	International	Americas	international	archive	pokal	0	1955					rule:national team (review C9-F4, registry says club cup); archive: current edition 1956 is not live
+CA57	Campeonato Sudamericano 1957	International	Americas	international	archive	pokal	0	1956					rule:national team (review C9-F4, registry says club cup); archive: current edition 1957 is not live
+CA63	Campeonato Sudamericano 1963	International	Americas	international	archive	pokal	0	1962					rule:national team (review C9-F4, registry says club cup); archive: current edition 1963 is not live
+CA67	Campeonato Sudamericano 1967	International	Americas	international	archive	pokal	0	1966					rule:national team (review C9-F4, registry says club cup); archive: current edition 1967 is not live
+CACG	Central American and Caribbean Games	International	Americas	international	youth	pokal	1	2025					rule:youth games
+CACP	Copa América Centenario Play-In	International	Americas	international	archive	pokal	0	2015	2015				rule:national team (review C9-F4, registry says club cup); archive: current edition 2016 is not live
+CAFA	CAFA Nations Cup	International	AFC	international	core_national	pokal	1	2024			28858		rule:national team (review C9-F4, registry says club cup)
+CAFC	CAF Confederation Cup	International	CAF	international	core_club	pokal	1	2025					rule:default
+CAFS	CAF-Supercup	International	CAF	international	core_club	pokal	1	2026					rule:default
+CAN	Canadian Championship	Canada	Americas	cup	core_club	pokal	1	2025		9837	9230		rule:default
+CARQ	Caribbean Cup Qualifikation	International	Americas	international	archive	pokal	0	2016	2016				rule:national team (review C9-F4, registry says club cup); archive: current edition 16/17 is not live
+CB20	CBF Brasileiro U20	Brazil	Americas	youth	youth	pokal	1	2025					rule:youth
+CC89	CONCACAF Championship (- 1989)	International	Americas	international	archive	pokal	0	1988					rule:national team (review C9-F4, registry says club cup); archive: current edition 1989 is not live
+CC92	1992 King Fahd Cup	International	FIFA	international	archive	pokal	0	1991					rule:national team (review C9-F4, registry says club cup); archive: current edition 91/92 is not live
+CC95	König-Fahd-Pokal 1995	International	FIFA	international	archive	pokal	0	1994					rule:national team (review C9-F4, registry says club cup); archive: current edition 1995 is not live
+CCAC	CONCACAF Central American Cup	International	Americas	international	core_club	pokal	1	2026		9682	20695		rule:default
+CCC1	CONCACAF Caribbean Cup	International	Americas	international	core_club	pokal	1	2026			20931		rule:default
+CCCF	Campeonato Centroamericano y del Caribe	International	Americas	international	archive	pokal	0	1960					rule:national team (review C9-F4, registry says club cup); archive: current edition 1961 is not live
+CCL	CONCACAF Champions Cup	International	Americas	international	core_club	pokal	1	2025		297	498		rule:default
+CCLS	CFU Club Shield	International	Americas	international	core_club	pokal	1	2026			20785		rule:default
+CCPL	CONCACAF Cup	International	Americas	international	archive	pokal	0	2015	2015				rule:national team (review C9-F4, registry says club cup); archive: current edition 15/16 is not live
+CDN1	Canadian Premier League	Canada	Americas	1	core_club	wettbewerb	1	2025	2019,2020,2021,2022,2023		13470		rule:default
+CDR	Copa del Rey	Spain	UEFA	cup	core_club	pokal	1	2026		138	329		rule:default
+CEF1	Copa Federation	Spain	UEFA	cup	core_club	pokal	1	2026					rule:default
+CENC	UNCAF Nations Cup	International	Americas	international	archive	pokal	0	2016	2016				rule:national team (review C9-F4, registry says club cup); archive: current edition 2017 is not live
+CEQ	UNCAF Nations Cup-Qualifikation	International	Americas	international	archive	pokal	0	1996					rule:national team (review C9-F4, registry says club cup); archive: current edition 1997 is not live
+CF17	CAFA U17 Championship	International	AFC	international	youth	pokal	1	2025					rule:youth
+CF20	CAFA U20 Championship	International	AFC	international	youth	pokal	1	2025					rule:youth
+CGB	EFL Cup	England	UEFA	cup	core_club	pokal	1	2026		133	21		rule:default
+CH17	Swiss U17 Elite League	Switzerland	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+CH1C	Copa Chile	Chile	Americas	cup	core_club	pokal	1	2025		9091	1221		rule:default
+CHAN	African Nations Championship	International	CAF	international	core_national	pokal	1	2024		9428	637		rule:national team (review C9-F4, registry says club cup)
+CHC1	1. Liga Classic group 1	Switzerland	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CHC2	1. Liga Classic group 2	Switzerland	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CHC3	1. Liga Classic group 3	Switzerland	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CHFA	Chinese FA Cup	China	AFC	cup	core_club	pokal	1	2025		9550			rule:default
+CHI3	Segunda División Profesional	Chile	Americas	3	core_club	wettbewerb	1	2025					rule:default
+CHL3	China League Two A	China	AFC	3	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+CHPR	Promotion League	Switzerland	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1101		rule:default
+CHSC	Chinese FA Super Cup	China	AFC	supercup	core_club	pokal	1	2025					rule:default
+CIR1	2. Liga interregional - Gruppe 1	Switzerland	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+CIR2	2. Liga interregional - Gruppe 2	Switzerland	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+CIR3	2. Liga interregional - Gruppe 3	Switzerland	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+CIR4	2. Liga interregional - Gruppe 4	Switzerland	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+CIR5	2. Liga interregional - Gruppe 5	Switzerland	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022				rule:tier 5
+CIT	Italy Cup	Italy	UEFA	cup	core_club	pokal	1	2026					rule:default
+CITP	Coppa Italia Primavera	Italy	UEFA	youth	youth	pokal	1	2026					rule:youth
+CL	UEFA Champions League	International	UEFA	international	core_club	pokal	1	2026			7		rule:default
+CL2B	Liga de Ascenso	Chile	Americas	2	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023	9126			rule:default
+CL3S	China League Two B	China	AFC	3	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+CLI	Copa Libertadores	International	Americas	international	core_club	pokal	1	2025		45			rule:default
+CLIY	U20 Copa Libertadores	International	Americas	youth	youth	pokal	1	2025					rule:youth
+CLLC	Copa de la Liga de Chile	Chile	Americas	cup	core_club	pokal	1	2025					rule:default
+CLO	China League One	China	AFC	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	9137			rule:default
+CLPD	Liga de Primera	Chile	Americas	1	core_club	wettbewerb	1	2025	2017,2018,2019,2020,2021,2022,2023	273	11653		rule:default
+CLPF	Copa LPF Proyección Clausura	Argentina	Americas	youth	youth	wettbewerb	1	2025	2022,2023				rule:youth
+CLPI	Copa LPF Proyección Apertura	Argentina	Americas	youth	youth	wettbewerb	1	2025	2019,2020,2021,2023				rule:youth
+CLQ	UEFA Champions League Qualifying	International	UEFA	international	core_club	pokal	1	2026					rule:default
+CN2A	Championnat National 1 - Groupe A	France	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CN2B	Championnat National 1 - Groupe B	France	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CN2C	Championnat National 1 - Groupe C	France	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CN41	Chinese Champions League (Regional Stage)	China	AFC	4	core_club	pokal	1	2025					rule:default
+CN43	China Youth Football League U20 (Placement Stage)	China	AFC	4	youth	pokal	1	2025					rule:youth
+CNAT	National League	England	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	117	173		rule:tier 5
+CNIC	Copa Primera de Nicaragua	Nicaragua	Americas	cup	core_club	pokal	1	2025					rule:default
+CNLA	CONCACAF Nations League A	International	Americas	international	core_national	pokal	1	2024	2024				rule:national team (review C9-F4, registry says club cup)
+CNLB	CONCACAF Nations League B	International	Americas	international	core_national	pokal	1	2024	2024				rule:national team (review C9-F4, registry says club cup)
+CNLC	CONCACAF Nations League C	International	Americas	international	core_national	pokal	1	2024	2024				rule:national team (review C9-F4, registry says club cup)
+CNLQ	CONCACAF Nations League Qualifikation	International	Americas	international	archive	pokal	0	2018	2018				rule:national team (review C9-F4, registry says club cup); archive: current edition 18/19 is not live
+CNNF	CONCACAF Nations League Finals	International	Americas	international	core_national	pokal	1	2024	2024				rule:national team (review C9-F4, registry says club cup)
+CO17	CONCACAF U17-Championship	International	Americas	international	youth	pokal	1	2025					rule:youth
+CO2P	Fase Final Torneo DIMAYOR I	Colombia	Americas	playoff	core_club	wettbewerb	1	2025	2020,2021,2022,2023				rule:default
+CO2T	Torneo DIMAYOR I	Colombia	Americas	2	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+COL1	Liga Dimayor Finalización	Colombia	Americas	1	core_club	wettbewerb	1	2024	2014,2015,2016,2017,2018,2020,2021,2022,2023				rule:default
+COLF	Fase Final Liga DIMAYOR I	Colombia	Americas	playoff	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+COLP	Liga DIMAYOR Apertura	Colombia	Americas	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+COM1	Championnat des Comores de D1	Comoros	CAF	1	core_club	wettbewerb	1	2026					rule:default
+CONC	Confederations Cup	International	FIFA	international	archive	pokal	0	2016	2016				rule:national team (review C9-F4, registry says club cup); archive: current edition 2017 is not live
+COPA	Copa América	International	Americas	international	core_national	pokal	1	2023	2023	44	133		rule:national team
+COPO	Copa Colombia	Colombia	Americas	cup	core_club	pokal	1	2025		9490	1335		rule:default
+COSP	Superliga Águila de Campeones	Colombia	Americas	supercup	core_club	pokal	1	2025					rule:default
+CPFU	Panamerican Championship (- 1960)	International	Americas	international	archive	pokal	0	1959					rule:national team (review C9-F4, registry says club cup); archive: current edition 1960 is not live
+CPO1	Kypello Kyprou	Cyprus	UEFA	cup	core_club	pokal	1	2026					rule:default
+CPP1	Copa LPF Proyección Apertura Playoff	Argentina	Americas	playoff	core_club	wettbewerb	1	2025	2021,2023				rule:default
+CPSA	Campeonato de Portugal - Série A	Portugal	UEFA	4	core_club	wettbewerb	1	2026	2024				rule:default
+CPSB	Campeonato de Portugal - Série B	Portugal	UEFA	4	core_club	wettbewerb	1	2026	2023,2024				rule:default
+CPSC	Campeonato de Portugal - Série C	Portugal	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CPSD	Campeonato de Portugal - Série D	Portugal	UEFA	4	core_club	wettbewerb	1	2026	2024				rule:default
+CRPD	Primera División Apertura	Costa Rica	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CS	Copa Sudamericana	International	Americas	international	core_club	pokal	1	2025		299			rule:default
+CSC2	Recopa Costa Rica	Costa Rica	Americas	supercup	core_club	pokal	1	2026					rule:default
+CSL	Chinese Super League	China	AFC	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		649		rule:default
+CSUC	Supercopa de Chile	Chile	Americas	supercup	core_club	pokal	1	2025			1309		rule:default
+CSUS	Copa Sul-Sudeste	Brazil	Americas	cup	core_club	pokal	1	2025			33495		rule:default
+CYP2	2. Division	Cyprus	UEFA	2	core_club	wettbewerb	1	2026	2021,2022,2023,2024	9100			rule:default
+CYSC	Cypriot Super Cup	Cyprus	UEFA	supercup	core_club	pokal	1	2026			550		rule:default
+CZ19	1. Dorostenecka liga	Czech Republic	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+CZ3C	Ceska fotbalova liga	Czech Republic	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+CZ3M	Moravskoslezska fotbalova liga	Czech Republic	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+DFB	DFB-Pokal	Germany	UEFA	cup	core_club	pokal	1	2026		209	217		rule:default
+DFBJ	DFB-Pokal der Junioren	Germany	UEFA	youth	youth	pokal	1	2026					rule:youth
+DFL	Franz-Beckenbauer-Supercup	Germany	UEFA	supercup	core_club	pokal	1	2026			799		rule:default
+DK1	Superliga	Denmark	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+DK2	1.Division	Denmark	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	85			rule:default
+DK3O	2.Division	Denmark	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	239			rule:default
+DK4L	3.Division	Denmark	UEFA	4	core_club	wettbewerb	1	2026	2021,2022,2023,2024	240			rule:default
+DKDD	U19 Boys Division	Denmark	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+DKDL	U19 Boys League	Denmark	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+DKP	Betano Pokalen	Denmark	UEFA	cup	core_club	pokal	1	2026					rule:default
+DO1P	Liga Dominicana de Fútbol - Liguilla	Dominican Republic	Americas	1	core_club	wettbewerb	1	2025	2017,2020,2021,2022,2023				rule:default
+DOM1	Liga Dominicana de Fútbol	Dominican Republic	Americas	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2019,2020,2021,2022,2023		20209		rule:default
+DOMP	Liga Dominicana de Fútbol - Playoff	Dominican Republic	Americas	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2019,2020,2021,2022,2023				rule:default
+E3G1	Primera Federación - Grupo I	Spain	UEFA	3	core_club	wettbewerb	1	2026	2021,2022,2023,2024				rule:default
+E3G2	Primera Federación - Grupo II	Spain	UEFA	3	core_club	wettbewerb	1	2026	2021,2022,2023,2024				rule:default
+E4G1	Segunda Federación - Grupo I	Spain	UEFA	4	core_club	wettbewerb	1	2026	2021,2022,2023,2024				rule:default
+E4G2	Segunda Federación - Grupo II	Spain	UEFA	4	core_club	wettbewerb	1	2026	2021,2022,2023,2024				rule:default
+E4G3	Segunda Federación - Grupo III	Spain	UEFA	4	core_club	wettbewerb	1	2026	2021,2022,2023,2024				rule:default
+E4G4	Segunda Federación - Grupo IV	Spain	UEFA	4	core_club	wettbewerb	1	2026	2021,2022,2023,2024				rule:default
+E4G5	Segunda Federación - Grupo V	Spain	UEFA	4	core_club	wettbewerb	1	2026	2021,2022,2023,2024				rule:default
+EAFC	East Asian Football Championship	International	AFC	international	core_national	pokal	1	2024					rule:national team (review C9-F4, registry says club cup)
+EC1N	LigaPro Serie A	Ecuador	Americas	1	core_club	wettbewerb	1	2025	2018		240		rule:default
+EC2L	Liga Pro Serie B	Ecuador	Americas	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+ECLQ	UEFA Conference League Qualifying	International	UEFA	international	core_club	pokal	1	2026					rule:default
+ECSC	Supercopa Ecuador	Ecuador	Americas	supercup	core_club	pokal	1	2025			14660		rule:default
+ECUP	Copa Ecuador	Ecuador	Americas	cup	core_club	pokal	1	2025		10046	13684		rule:default
+EE19	U19 Eliitliiga Esiliiga	Estonia	UEFA	youth	youth	wettbewerb	1	2025	2017,2018,2019,2020,2021,2022,2023				rule:youth
+EGY1	Egyptian Premier League	Egypt	CAF	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		808		rule:default
+EL	UEFA Europa League	International	UEFA	international	core_club	pokal	1	2026			679		rule:default
+ELC1	Copa El Salvador	El Salvador	Americas	cup	core_club	pokal	1	2025					rule:default
+ELME	U19 Eliitliiga Meistriliiga	Estonia	UEFA	youth	youth	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:youth
+ELMP	U19 Eliitliiga Meistriliiga Playoffs	Estonia	UEFA	playoff	youth	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:youth
+ELQ	UEFA Europa League Qualifying	International	UEFA	international	core_club	pokal	1	2026					rule:default
+ELSC	Supercopa de El Salvador	El Salvador	Americas	supercup	core_club	pokal	1	2026			28911		rule:default
+EMQ	European Qualifiers	International	UEFA	international	core_national	pokal	1	2022	2022				rule:national team (review C9-F4, registry says club cup)
+ES1	LaLiga	Spain	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	87	8		rule:default
+ES17	U17 Eliitliiga Esiliiga	Estonia	UEFA	youth	youth	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:youth
+ES2	LaLiga2	Spain	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	140			rule:default
+EST1	Premium Liiga	Estonia	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		178		rule:default
+EST2	Esiliiga	Estonia	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		678		rule:default
+EST3	Esiliiga B	Estonia	UEFA	3	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		19886		rule:default
+ESTP	Eesti Karikas	Estonia	UEFA	cup	core_club	pokal	1	2026			731		rule:default
+ETP1	Ethiopian Premier League	Ethiopia	CAF	1	core_club	wettbewerb	1	2026	2024		16601		rule:default
+EURO	UEFA Euro	International	UEFA	international	core_national	pokal	1	2027					rule:national team
+F18Q	P18 SM Qualification	Finland	UEFA	youth	youth	wettbewerb	1	2025					rule:youth
+F19A	National U19 Championship - Group A	France	UEFA	youth	youth	wettbewerb	1	2026	2018,2019,2020,2021,2022,2023,2024				rule:youth
+F19B	Championnat National U19 - Groupe B	France	UEFA	youth	youth	wettbewerb	1	2026	2019,2020,2021,2022,2023,2024				rule:youth
+F4KP	Kolmonen Pohjoinen	Finland	UEFA	5	amateur	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:tier 5
+F4LA	Kolmonen Läntinen	Finland	UEFA	5	amateur	wettbewerb	1	2025	2021,2022,2023				rule:tier 5
+FAPO	Løgmanssteypið	Faroe Islands	UEFA	cup	core_club	pokal	1	2025		9523			rule:default
+FAR2	1. deild	Faroe Islands	UEFA	2	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+FARO	Meistaradeildin	Faroe Islands	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+FARQ	FIFA Arab Cup Qualification	International	AFC	international	core_national	pokal	1	2024					rule:national team (review C9-F4, registry says club cup)
+FASC	Stórsteypadystur	Faroe Islands	UEFA	supercup	core_club	pokal	1	2025					rule:default
+FFAC	Australia Cup	Australia	AFC	cup	core_club	pokal	1	2025		9471	1786		rule:default
+FI1	Veikkausliiga	Finland	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	51	41		rule:default
+FI18	P18 SM	Finland	UEFA	youth	youth	wettbewerb	1	2025					rule:youth
+FI2	Ykkösliiga	Finland	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	251	55		rule:default
+FI3A	Kakkonen - Group A	Finland	UEFA	4	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023		179		rule:default
+FI3B	Kakkonen - Group B	Finland	UEFA	4	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023		180		rule:default
+FI3C	Kakkonen - Group C	Finland	UEFA	4	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023		181		rule:default
+FI4L	Kolmonen Itäinen	Finland	UEFA	5	amateur	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+FIJ1	Fiji Premier League	Fiji	AFC	1	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+FIL	Liigacup	Finland	UEFA	cup	core_club	pokal	1	2025			83		rule:default
+FIP1	Regions Cup	Finland	UEFA	cup	core_club	pokal	1	2025					rule:default
+FIS	Suomen Cup	Finland	UEFA	cup	core_club	pokal	1	2025		143	220		rule:default
+FIWC	World Cup	International	FIFA	international	core_national	pokal	1	2025		77			rule:national team
+FIYK	Ykkönen	Finland	UEFA	3	core_club	wettbewerb	1	2025	2023	8969	22020		rule:default
+FR1	Ligue 1	France	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	53			rule:default
+FR2	Ligue 2	France	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	110	182		rule:default
+FR3	Ligue 3	France	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	8970	183		rule:default
+FRCH	Trophée des Champions	France	UEFA	supercup	core_club	pokal	1	2026		207	339		rule:default
+FS	International Friendlies	International	FIFA	international	core_national	pokal	1	2026					rule:national team (review C9-F4, registry says club cup)
+G19C	Kypello Super League U19	Greece	UEFA	youth	youth	pokal	1	2025					rule:youth
+GB1	Premier League	England	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	47			rule:default
+GB18	U18 Premier League	England	UEFA	youth	youth	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+GB2	Championship	England	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	48			rule:default
+GB21	Premier League 2	England	UEFA	reserve	reserve	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:reserve team
+GB3	League One	England	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	108	24		rule:default
+GB4	League Two	England	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	109	25		rule:default
+GBCS	Community Shield	England	UEFA	supercup	core_club	pokal	1	2026		247	346		rule:default
+GBFL	EFL Trophy	England	UEFA	cup	core_club	pokal	1	2026		142			rule:default
+GCQ5	Gold Cup Play-Off	International	Americas	international	archive	pokal	0	2016	2016				rule:national team (review C9-F4, registry says club cup); archive: current edition 16/17 is not live
+GCQU	Gold Cup Qualification	International	Americas	international	core_national	pokal	1	2024	2024				rule:national team (review C9-F4, registry says club cup)
+GE1N	Erovnuli Liga	Georgia	UEFA	1	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023	439	704		rule:default
+GEO2	Erovnuli Liga 2	Georgia	UEFA	2	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023		726		rule:default
+GEP1	David Kipiani Cup	Georgia	UEFA	cup	core_club	pokal	1	2024					rule:default
+GESC	Georgian Super Cup	Georgia	UEFA	supercup	core_club	pokal	1	2025			766		rule:default
+GHPL	Ghana Premier League	Ghana	CAF	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2019,2020,2021,2022,2023,2024		1191		rule:default
+GI1	Gibraltar Football League	Gibraltar	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1542		rule:default
+GOCU	Gold Cup	International	Americas	international	core_national	pokal	1	2024					rule:national team
+GR1	Super League 1	Greece	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	135			rule:default
+GR20	Super League U19	Greece	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+GRP3	Kypello Elladas Amateur	Greece	UEFA	cup	core_club	pokal	1	2025					rule:default
+GRS2	Super League 2	Greece	UEFA	2	core_club	wettbewerb	1	2026	2019,2020,2021,2022,2023,2024	8815	186		rule:default
+GRSC	Greek Super Cup	Greece	UEFA	supercup	core_club	pokal	1	2026					rule:default
+GU1A	National League Apertura	Guatemala	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+GUPA	National League Apertura Play-Off	Guatemala	Americas	playoff	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+GUPC	National League Clausura Play-Off	Guatemala	Americas	playoff	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2020,2021,2022,2023				rule:default
+HBPO	Landespokal Bremen	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+HEPO	Landespokal Hessen	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+HGKG	Hong Kong Premier League	Hongkong	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		947		rule:default
+HK22	Hong Kong U22 League	Hongkong	AFC	reserve	reserve	wettbewerb	1	2026	2024				rule:reserve team
+HK2L	Hong Kong First Division	Hongkong	AFC	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+HK3L	Hong Kong Second Division	Hongkong	AFC	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+HKSE	Hokushin'etsu Football League (Div.1)	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+HO1A	Liga Nacional Apertura	Honduras	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+HOSC	Supercopa de Honduras	Honduras	Americas	supercup	core_club	pokal	1	2025			36066		rule:default
+HOSL	Hokkaido Soccer League	Japan	AFC	5	amateur	wettbewerb	1	2025	2018,2019,2020,2021,2022,2023				rule:tier 5
+IJ1	Primavera 1	Italy	UEFA	youth	youth	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+IJ2A	Primavera 2 - A	Italy	UEFA	youth	youth	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+IJ2B	Primavera 2 - B	Italy	UEFA	youth	youth	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+ILI2	Championship Indonesia	Indonesia	AFC	2	core_club	wettbewerb	1	2026	2017,2018,2019,2020,2022,2023,2024				rule:default
+IN1L	Super League	Indonesia	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2021,2022,2023,2024	8983			rule:default
+IN4L	I-League 3	India	AFC	4	core_club	wettbewerb	1	2025	2023,2024		23521		rule:default
+IND1	Indian Super League	India	AFC	1	core_club	wettbewerb	1	2026	2014,2015,2017,2018,2019,2020,2021,2022,2023,2024	9478	1900		rule:default
+IND2	I-League 2	India	AFC	3	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2022,2023,2024		21882		rule:default
+INDC	Durand Cup	India	AFC	cup	core_club	pokal	1	2025		10309	20809		rule:default
+INIL	Indian Football League	India	AFC	2	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	8982			rule:default
+INR1	Super League Kerala	India	AFC	regional	amateur	wettbewerb	1	2025	2024				rule:regional championship outside Brazil
+IR1	League of Ireland Premier Division	Ireland	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+IR2	League of Ireland First Division	Ireland	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+IRLC	Leinster Senior Cup	Ireland	UEFA	cup	core_club	pokal	1	2025			24715		rule:default
+IRLP	Aluf haAlufim	Israel	UEFA	supercup	core_club	pokal	1	2026					rule:default
+IRMC	Munster Senior Cup	Ireland	UEFA	cup	core_club	pokal	1	2025			24544		rule:default
+IRN1	Persian Gulf Pro League	Iran	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		915		rule:default
+IRN2	Azadegan League	Iran	AFC	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	9372	11338		rule:default
+IRN3	League 2	Iran	AFC	3	core_club	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+IRPC	President of Ireland's Cup	Ireland	UEFA	supercup	core_club	pokal	1	2025					rule:default
+IRPO	FAI Cup	Ireland	UEFA	cup	core_club	pokal	1	2025		219	195		rule:default
+IRQ1	Iraq Stars League	Iraq	AFC	1	core_club	wettbewerb	1	2026	2023,2024		24040		rule:default
+IS1	Besta deild	Iceland	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+IS2	Lengjudeild	Iceland	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+ISL	Lengjubikarinn	Iceland	UEFA	cup	core_club	pokal	1	2025					rule:default
+ISL3	2. deild	Iceland	UEFA	3	core_club	wettbewerb	1	2025	2018,2019,2020,2021,2022,2023	10226			rule:default
+ISLS	Meistarakeppni	Iceland	UEFA	supercup	core_club	pokal	1	2025					rule:default
+ISP	Mjólkurbikarinn	Iceland	UEFA	cup	core_club	pokal	1	2025					rule:default
+ISR1	Ligat ha'Al	Israel	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	127			rule:default
+ISR2	Liga Leumit	Israel	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+IT1	Serie A	Italy	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	55	23		rule:default
+IT2	Serie B	Italy	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	86	53		rule:default
+IT3A	Serie C - Girone A	Italy	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		11445		rule:default
+IT3B	Serie C - Girone B	Italy	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		11447		rule:default
+IT3C	Serie C - Girone C	Italy	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		11446		rule:default
+IT4A	Serie D - Girone A	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1374		rule:default
+IT4B	Serie D - Girone B	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1376		rule:default
+IT4C	Serie D - Girone C	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1378		rule:default
+IT4D	Serie D - Girone D	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1380		rule:default
+IT4E	Serie D - Girone E	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1382		rule:default
+IT4F	Serie D - Girone F	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1384		rule:default
+IT4G	Serie D - Girone G	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1386		rule:default
+IT4H	Serie D - Girone H	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1388		rule:default
+IT4I	Serie D - Girone I	Italy	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1390		rule:default
+ITJ4	Campionato Under 17 - A	Italy	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+ITJ5	Campionato nazionale Under 17 - B	Italy	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+ITJ6	Campionato nazionale Under 17 - C	Italy	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+ITJ7	Campionato Under 18	Italy	UEFA	youth	youth	wettbewerb	1	2026	2019,2020,2021,2022,2023,2024				rule:youth
+J18E	Prince Takamado U18 Premier League East	Japan	AFC	youth	youth	wettbewerb	1	2025	2014,2015,2016,2017,2018,2020,2021,2022,2023				rule:youth
+J18W	Prince Takamado U18 Premier League West	Japan	AFC	youth	youth	wettbewerb	1	2025	2014,2015,2016,2017,2018,2020,2021,2022,2023				rule:youth
+J6H2	Hokushin'etsu Football League (Div.2)	Japan	AFC	6	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 6
+J6K2	Kanto Soccer League (Div.2)	Japan	AFC	6	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 6
+J6KA	Kansai Soccer League (Div.2)	Japan	AFC	6	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 6
+J6T2	Tokai Soccer League (Div.2)	Japan	AFC	6	amateur	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:tier 6
+J6TN	Tohoku Soccer League (Div.2 North)	Japan	AFC	6	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 6
+J6TS	Tohoku Soccer League (Div.2 South)	Japan	AFC	6	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 6
+JAP1	J1 League	Japan	AFC	1	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023		196		rule:default
+JAP2	J2 League	Japan	AFC	2	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		402		rule:default
+JAP3	J3 League	Japan	AFC	3	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		2293		rule:default
+JAPC	J. League Cup	Japan	AFC	cup	core_club	pokal	1	2026		224	101		rule:default
+JCSL	Chugoku Soccer League	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+JEMP	Emperor's Cup	Japan	AFC	cup	core_club	pokal	1	2025					rule:default
+JFL	Japan Football League	Japan	AFC	4	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		2294		rule:default
+JGD2	ÖFB Jugendliga U18	Austria	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+JGD3	ÖFB Jugendliga U16	Austria	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:youth
+JO1L	Jordanian Pro League	Jordan	AFC	1	core_club	wettbewerb	1	2026	2024				rule:default
+JPKA	Kansai Soccer League (Div.1)	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+JPKS	Kyushu Soccer League	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+JPL1	Jamaica Premier League	Jamaica	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		1892		rule:default
+K18C	K League U18 Championship	Korea, South	AFC	youth	youth	pokal	1	2025					rule:youth
+K3L	K3 League	Korea, South	AFC	3	core_club	wettbewerb	1	2025	2019,2020,2021,2022,2023		10268		rule:default
+K4L	K4 League	Korea, South	AFC	4	core_club	wettbewerb	1	2025	2019,2020,2021,2022,2023		25158		rule:default
+KAJ1	QJ League	Kazakhstan	UEFA	youth	youth	wettbewerb	1	2025	2022,2023				rule:youth
+KAS1	Premier Liga	Kazakhstan	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+KAS2	Pervaya Liga	Kazakhstan	UEFA	2	core_club	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:default
+KASC	Kasachischer Supercup	Kazakhstan	UEFA	supercup	core_club	pokal	1	2025					rule:default
+KAZP	Kazakhstan Cup	Kazakhstan	UEFA	cup	core_club	pokal	1	2025			749		rule:default
+KG1L	Jogorku Liga	Kyrgyzstan	AFC	1	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+KGPO	Kyrgyzstan Cup	Kyrgyzstan	AFC	cup	core_club	pokal	1	2025			35611		rule:default
+KHM1	Cambodian Premier League	Cambodia	AFC	1	core_club	wettbewerb	1	2026	2018,2019,2020,2021,2023,2024		10741		rule:default
+KO1	Superliga e Kosovës	Kosovo	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+KOBU	Uzbekistan Cup	Uzbekistan	AFC	cup	core_club	pokal	1	2025			27238		rule:default
+KOG1	Kolmonen Etelä Group A	Finland	UEFA	5	amateur	wettbewerb	1	2025	2018,2019,2020,2021,2022,2023				rule:tier 5
+KOG2	Kolmonen Etelä Group B	Finland	UEFA	5	amateur	wettbewerb	1	2025	2018,2019,2020,2021,2022,2023				rule:tier 5
+KOG3	Kolmonen Etelä Group C	Finland	UEFA	5	amateur	wettbewerb	1	2025	2017,2018,2020,2021,2022,2023				rule:tier 5
+KR1	SuperSport HNL	Croatia	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+KR2	Prva Nogometna Liga	Croatia	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+KRC3	K3·K4 Championship	Korea, South	AFC	cup	core_club	pokal	1	2025					rule:default
+KSC1	Korean Super Cup	Korea, South	AFC	supercup	core_club	pokal	1	2025					rule:default
+KTOS	Kanto Soccer League (Div.1)	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+L1	Bundesliga	Germany	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	54			rule:default
+L2	2. Bundesliga	Germany	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	146	44		rule:default
+L3	3. Liga	Germany	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	208	491		rule:default
+LAO1	Lao League 1	Laos	AFC	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2024				rule:default
+LBMI	Landesliga Bayern Mitte	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LBNO	Landesliga Bayern Nordost	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LBNW	Landesliga Bayern Nordwest	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LBSO	Landesliga Bayern Südost	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LBSW	Landesliga Bayern Südwest	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LET1	Virsliga	Latvia	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	226	197		rule:default
+LET2	Futbola Pirmā līga	Latvia	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+LETP	Latvian Cup	Latvia	UEFA	cup	core_club	pokal	1	2025					rule:default
+LI1	Toplyga	Lithuania	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	228	198		rule:default
+LLHA	Landesliga Hansa	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2022,2023,2024				rule:tier 6
+LLHB	Landesliga Bremen	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LLHM	Landesliga Hammonia	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2022,2023,2024				rule:tier 6
+LLHO	Landesliga Holstein	Germany	UEFA	6	amateur	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LLL	Landesliga Lüneburg	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LLSA	Schröder-Liga Saar	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LLSL	Landesliga Schleswig	Germany	UEFA	6	amateur	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LNBR	Landesliga Braunschweig	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LNHA	Landesliga Hannover	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LNR1	Landesliga Niederrhein - Gruppe 1	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LNR2	Landesliga Niederrhein - Gruppe 2	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LNWE	Landesliga Weser-Ems	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+LPL	Libyan Premier League	Libya	CAF	1	core_club	wettbewerb	1	2026	2024				rule:default
+LT19	U-19 Elites Grupa	Latvia	UEFA	youth	youth	wettbewerb	1	2025	2023,2024				rule:youth
+LTSC	Lithuanian Supercup	Lithuania	UEFA	supercup	core_club	pokal	1	2025					rule:default
+LTU2	I Lyga	Lithuania	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+LTVP	Lithuanian Cup	Lithuania	UEFA	cup	core_club	pokal	1	2025					rule:default
+LUCL	Coupe de la Ligue Luxemburg	Luxembourg	UEFA	supercup	core_club	pokal	1	2026					rule:default
+LUX1	BGL Ligue	Luxembourg	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+LUX2	Ehrenpromotion	Luxembourg	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+M191	Liga MX U19 Apertura	Mexico	Americas	youth	youth	wettbewerb	1	2026	2024				rule:youth
+M192	Liga MX U19 Clausura	Mexico	Americas	youth	youth	wettbewerb	1	2026	2024				rule:youth
+M21A	Liga MX U21 Apertura	Mexico	Americas	youth	youth	wettbewerb	1	2026					rule:youth
+M21C	Liga MX U21 Clausura	Mexico	Americas	youth	youth	wettbewerb	1	2026					rule:youth
+MAR1	Botola Pro Inwi	Morocco	CAF	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+MAZ1	Prva Makedonska Fudbalska Liga	North Macedonia	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+MDL2	Liga 1	Moldova	UEFA	2	core_club	wettbewerb	1	2026					rule:default
+MEX1	Liga MX Clausura	Mexico	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		11620		rule:default
+MEX2	Liga de Expansión MX Clausura	Mexico	Americas	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		11612		rule:default
+MEXA	Liga MX Apertura	Mexico	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		11621		rule:default
+MEXB	Liga de Expansión MX Apertura	Mexico	Americas	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		11611		rule:default
+MLD1	Dhivehi Premier League	Maldives	AFC	1	core_club	wettbewerb	1	2026			16554		rule:default
+MLS1	Major League Soccer	United States	Americas	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+MLSP	US Open Cup	United States	Americas	cup	core_club	pokal	1	2025			495		rule:default
+MNE1	Meridianbet 1. CFL	Montenegro	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+MNE2	2. CFL	Montenegro	UEFA	2	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+MNP3	MLS Next Pro	United States	Americas	3	core_club	wettbewerb	1	2025	2021,2022,2023	10282	18641		rule:default
+MO1N	Super Liga	Moldova	UEFA	1	core_club	wettbewerb	1	2026	2016,2017,2018,2020,2021,2022,2023,2024				rule:default
+MPPO	Landespokal Mecklenburg-Vorpommern	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+MRPO	Landespokal Mittelrhein	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+MT1N	Premier League Opening Round	Malta	UEFA	1	core_club	wettbewerb	1	2026	2024				rule:default
+MXSC	Campeón de Campeones	Mexico	Americas	supercup	core_club	pokal	1	2025		11039			rule:default
+MYA1	Myanmar National League	Myanmar	AFC	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2024		10535		rule:default
+MYS1	Malaysia Super League	Malaysia	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2024		1000		rule:default
+NC1A	Liga Primera de Nicaragua Apertura	Nicaragua	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+NCL1	National League - Central	New Zealand	AFC	1	core_club	wettbewerb	1	2025	2020,2021,2022,2023				rule:default
+NIR1	Premiership	Northern Ireland	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	129			rule:default
+NIR2	Championship	Northern Ireland	UEFA	2	core_club	wettbewerb	1	2026	2017,2018,2019,2021,2022,2023,2024				rule:default
+NIR3	National Conference League	Northern Ireland	UEFA	3	core_club	wettbewerb	1	2026	2017,2018,2021,2022,2023,2024		31777		rule:default
+NL1	Eredivisie	Netherlands	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	57			rule:default
+NL2	Keuken Kampioen Divisie	Netherlands	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+NLEV	U19 Division 2 Fall	Netherlands	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2024				rule:youth
+NLJV	U19 Division 1 Fall	Netherlands	UEFA	youth	youth	wettbewerb	1	2026	2015,2016,2017,2018,2019,2024				rule:youth
+NLN6	National League North	England	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+NLS6	National League South	England	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+NLSC	Johan Cruijff Schaal	Netherlands	UEFA	supercup	core_club	pokal	1	2026			340		rule:default
+NNL1	National League - North	New Zealand	AFC	1	core_club	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:default
+NO1	Eliteserien	Norway	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	59	20		rule:default
+NO2	OBOS-ligaen	Norway	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	203			rule:default
+NO31	PostNord-ligaen Avd. 1	Norway	UEFA	3	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+NO32	PostNord-ligaen Avd. 2	Norway	UEFA	3	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+NO41	Norsk Tipping-Ligaen avdeling 1	Norway	UEFA	4	core_club	wettbewerb	1	2025	2016,2017,2018,2020,2021,2022,2023				rule:default
+NO42	Norsk Tipping-Ligaen avdeling 2	Norway	UEFA	4	core_club	wettbewerb	1	2025	2016,2017,2018,2020,2021,2022,2023				rule:default
+NO43	Norsk Tipping-Ligaen avdeling 3	Norway	UEFA	4	core_club	wettbewerb	1	2025	2016,2017,2018,2020,2021,2022,2023				rule:default
+NO44	Norsk Tipping-Ligaen avdeling 4	Norway	UEFA	4	core_club	wettbewerb	1	2025	2016,2017,2018,2020,2021,2022,2023				rule:default
+NO45	Norsk Tipping-Ligaen avdeling 5	Norway	UEFA	4	core_club	wettbewerb	1	2025	2016,2017,2018,2020,2021,2022,2023				rule:default
+NO46	Norsk Tipping-Ligaen avdeling 6	Norway	UEFA	4	core_club	wettbewerb	1	2025	2016,2017,2018,2020,2021,2022,2023				rule:default
+NOPO	NM-Cup	Norway	UEFA	cup	core_club	pokal	1	2025			29		rule:default
+NP34	Landespokal Niedersachsen (3. und 4. Liga)	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+NPAM	Regional Cup Lower Saxony (Amateure)	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+NPFL	Nigeria Professional Football League	Nigeria	CAF	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+NRPO	Landespokal Niederrhein	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+NSC	NIFL Charity Shield	Northern Ireland	UEFA	supercup	core_club	wettbewerb	1	2026	2022,2023,2024				rule:default
+NSL1	National League - South	New Zealand	AFC	1	core_club	wettbewerb	1	2025	2020,2021,2022,2023				rule:default
+NTD	Tweede Divisie	Netherlands	UEFA	3	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024	9195	11402		rule:default
+NZP1	Chatham Cup	New Zealand	AFC	cup	core_club	pokal	1	2025			27789		rule:default
+OBLB	Oberliga Baden-Württemberg	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OBLC	Hessenliga	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OBLF	NOFV-Oberliga Nord	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OBLG	NOFV-Oberliga Süd	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OBLJ	Oberliga Hamburg	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OBLK	Bremenliga	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OBLL	Oberliga Schleswig-Holstein	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OBLN	Oberliga Niedersachsen	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OCL	OFC-Champions League	International	AFC	international	core_club	pokal	1	2025			1222		rule:default
+OCLP	OFC-Champions League Preliminary	International	AFC	international	core_club	pokal	1	2025					rule:default
+OFCN	OFC Nations Cup	International	AFC	international	core_national	pokal	1	2023	2023				rule:national team (review C9-F4, registry says club cup)
+OFPL	OFC Professional League	International	AFC	international	core_club	pokal	1	2025					rule:default
+OLB1	Bayernliga Nord	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OLB2	Bayernliga Süd	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OLMR	Mittelrheinliga	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OLNI	Oberliga Niederrhein	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OLRP	Oberliga Rheinland-Pfalz/Saar	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OLW3	Oberliga Westfalen	Germany	UEFA	5	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 5
+OM1L	Oman Jindal League	Oman	AFC	1	core_club	wettbewerb	1	2026	2022,2023,2024				rule:default
+OPHH	Landespokal Hamburg	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+PAR2	División Intermedia	Paraguay	Americas	2	core_club	wettbewerb	1	2025			1254		rule:default
+PER2	Liga 2	Peru	Americas	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+PL1	PKO BP Ekstraklasa	Poland	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+PL2	Betclic 1 Liga	Poland	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		229		rule:default
+PL2L	Betclic 2 Liga	Poland	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		515		rule:default
+PL31	Betclic 3 Liga - Group I	Poland	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+PL32	Betclic 3 Liga - Group II	Poland	UEFA	4	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+PL33	Betclic 3 Liga - Group III	Poland	UEFA	4	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+PL34	Betclic 3 Liga - Group IV	Poland	UEFA	4	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+PLI3	Liga 3	Peru	Americas	3	core_club	wettbewerb	1	2025					rule:default
+PLSC	Superpuchar Polski	Poland	UEFA	supercup	core_club	pokal	1	2026		200	511		rule:default
+PLZJ	Central Youth League	Poland	UEFA	youth	youth	wettbewerb	1	2026	2018,2019,2020,2021,2022,2023,2024				rule:youth
+PN1A	Liga Panameña de Fútbol Apertura	Panama	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023		11534		rule:default
+PN1C	Liga Panameña de Fútbol Clausura	Panama	Americas	1	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023		11533		rule:default
+PNF1	Liga Panameña de Fútbol Clausura Playoff	Panama	Americas	playoff	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+PO1	Liga Portugal	Portugal	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	61			rule:default
+PO2	Liga Portugal 2	Portugal	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	185	239		rule:default
+POEM	European Qualifiers Play-offs	International	UEFA	international	core_national	pokal	1	2023	2023				rule:national team (review C9-F4, registry says club cup)
+POPO	Taça de Portugal	Portugal	UEFA	cup	core_club	pokal	1	2026		186	336		rule:default
+POPU	STS Polish Cup	Poland	UEFA	cup	core_club	pokal	1	2026					rule:default
+POSU	Supercup Candido de Oliveira	Portugal	UEFA	supercup	core_club	pokal	1	2026					rule:default
+POWM	World Cup Qualification Playoffs	International	FIFA	international	core_national	pokal	1	2025					rule:national team (review C9-F4, registry says club cup)
+PR1A	Primera División Apertura	Paraguay	Americas	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+PR1C	Primera División Clausura	Paraguay	Americas	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+PRA1	Liga Puerto Rico Apertura	Puerto Rico	Americas	1	core_club	wettbewerb	1	2026	2024				rule:default
+PT3A	Liga 3	Portugal	UEFA	3	core_club	wettbewerb	1	2026	2021,2022,2023,2024	9112			rule:default
+QELM	U19 Eliitliiga Qualification	Estonia	UEFA	playoff	youth	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:youth
+QSL	Qatar Stars League	Qatar	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	535			rule:default
+QU2L	Qatari Second Division	Qatar	AFC	2	core_club	wettbewerb	1	2026	2019,2020,2021,2022,2023,2024				rule:default
+QUSU	Qualifikation Campeonato Sudamericano	International	Americas	international	archive	pokal	0	1965					rule:national team (review C9-F4, registry says club cup); archive: current edition 1966 is not live
+R3D1	2. Division A (Phase 1)	Russia	UEFA	3	core_club	wettbewerb	1	2026	2023,2024				rule:default
+R3D2	2. Division A (Phase 2)	Russia	UEFA	3	core_club	wettbewerb	1	2025	2023,2024				rule:default
+R3P2	2. Division A Playoff 2	Russia	UEFA	playoff	core_club	wettbewerb	1	2025	2023				rule:default
+RCBR	Recopa Gaúcha	Brazil	Americas	supercup	core_club	pokal	1	2025		10078	19814		rule:default
+RECO	Recopa Sudamericana	International	Americas	international	core_club	pokal	1	2025		491			rule:default
+RHL	Rheinlandliga	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+RJL2	U19 M-Liga (since 2024)	Russia	UEFA	youth	youth	wettbewerb	1	2025	2023				rule:youth
+RKPO	Korea Cup	Korea, South	AFC	cup	core_club	pokal	1	2025					rule:default
+RLB3	Regionalliga Bayern	Germany	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+RLN3	Regionalliga Nord	Germany	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+RLN4	Regionalliga Northeast	Germany	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+RLNA	Regionalliga Nord	Austria	UEFA	3	core_club	wettbewerb	1	2026					rule:default
+RLSW	Regionalliga Südwest	Germany	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+RLW3	Regionalliga West	Germany	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+RLWA	Regionalliga West	Austria	UEFA	3	core_club	wettbewerb	1	2026					rule:default
+RO1	SuperLiga	Romania	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+RO2	Liga 2	Romania	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+ROMS	Romanian Supercup	Romania	UEFA	supercup	core_club	pokal	1	2026					rule:default
+RSK1	K League 1	Korea, South	AFC	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		410		rule:default
+RSK2	K League 2	Korea, South	AFC	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		777		rule:default
+RU1	Premier Liga	Russia	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+RU2	1.Division	Russia	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	338			rule:default
+RUP	Russian Cup	Russia	UEFA	cup	core_club	pokal	1	2026		193	91		rule:default
+RUSS	Russian Super Cup	Russia	UEFA	supercup	core_club	pokal	1	2026					rule:default
+SA1	Saudi Pro League	Saudi Arabia	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	536	955		rule:default
+SA19	SAFF U20 Championship	International	AFC	international	youth	pokal	1	2025					rule:youth
+SA2L	Saudi First Division League	Saudi Arabia	AFC	2	core_club	wettbewerb	1	2026	2020,2021,2022,2023,2024				rule:default
+SAC1	South Asian Football Federation Championship	International	AFC	international	core_club	pokal	1	2025					rule:default
+SAKC	King's Cup	Saudi Arabia	AFC	cup	core_club	pokal	1	2025		9942			rule:default
+SAM7	U-17 South American Championship	International	Americas	international	youth	pokal	1	2025					rule:youth
+SANP	Landespokal Sachsen-Anhalt	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+SBP	Landespokal Südbaden	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+SC1	Scottish Premiership	Scotland	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		36		rule:default
+SC2	Scottish Championship	Scotland	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		206		rule:default
+SC3	Scottish League One	Scotland	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		207		rule:default
+SC4	Scottish League Two	Scotland	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		209		rule:default
+SC5H	Scottish Highland Football League	Scotland	UEFA	5	amateur	wettbewerb	1	2026	2020,2021,2022,2023,2024				rule:tier 5
+SC5L	Scottish Lowland Football League	Scotland	UEFA	5	amateur	wettbewerb	1	2026	2020,2021,2022,2023,2024				rule:tier 5
+SCBR	Supercopa Rei	Brazil	Americas	supercup	core_club	pokal	1	2025					rule:default
+SCC	Swiss Cup	Switzerland	UEFA	cup	core_club	pokal	1	2026		164			rule:default
+SCCR	Supercopa de Costa Rica	Costa Rica	Americas	supercup	core_club	pokal	1	2026					rule:default
+SCGU	Supercopa de Guatemala	Guatemala	Americas	cup	core_club	pokal	1	2025					rule:default
+SCI	Supercoppa Italiana	Italy	UEFA	supercup	core_club	pokal	1	2026			341		rule:default
+SCIJ	Supercoppa Primavera	Italy	UEFA	supercup	youth	pokal	1	2026					rule:youth
+SCP	Scottish League Cup	Scotland	UEFA	cup	core_club	pokal	1	2026			332		rule:default
+SE1	Allsvenskan	Sweden	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	67	40		rule:default
+SE2	Superettan	Sweden	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	168	46		rule:default
+SE3N	Ettan Norra	Sweden	UEFA	3	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		67		rule:default
+SE3S	Ettan Södra	Sweden	UEFA	3	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		68		rule:default
+SEC	Svenska Cupen	Sweden	UEFA	cup	core_club	pokal	1	2026		171	80		rule:default
+SEN1	Ligue 1	Senegal	CAF	1	core_club	wettbewerb	1	2026	2020,2021,2022,2023,2024				rule:default
+SER1	Super liga Srbije	Serbia	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+SER2	Prva liga Srbije	Serbia	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+SFA	Scottish FA Cup	Scotland	UEFA	cup	core_club	pokal	1	2026					rule:default
+SFA1	Betway Premiership	South Africa	CAF	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+SHPO	Landespokal Schleswig-Holstein	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+SHSL	Shikoku Soccer League	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+SIN1	Singapore Premier League	Singapore	AFC	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2024		634		rule:default
+SIN2	Singapore Premier League 2	Singapore	AFC	reserve	reserve	wettbewerb	1	2026			28908		rule:reserve team
+SK19	I. Liga starsieho dorastu	Slovakia	UEFA	youth	youth	wettbewerb	1	2026	2021,2022,2023,2024				rule:youth
+SK2	II. Liga	Slovakia	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+SL1	Prva Liga	Slovenia	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	173			rule:default
+SL19	NextGen Liga	Slovenia	UEFA	youth	youth	wettbewerb	1	2026	2023,2024				rule:youth
+SL1A	Primera División Apertura	El Salvador	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+SL1C	Primera División Clausura	El Salvador	Americas	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+SL2	Druga Liga	Slovenia	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+SL2P	Scottish League Two Play Offs	Scotland	UEFA	playoff	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2020,2021,2022,2023,2024				rule:default
+SLI	Sachsenliga	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+SLO1	Niké Liga	Slovakia	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		211		rule:default
+SMR1	Campionato Sammarinese	San Marino	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2020,2021,2022,2023,2024		738		rule:default
+SPjr	Copa São Paulo de Futebol Júnior	Brazil	Americas	youth	youth	pokal	1	2025					rule:youth
+SSC	Scottish Challenge Cup	Scotland	UEFA	cup	core_club	pokal	1	2025			331		rule:default
+SUIC	Swiss Cup qualifiers	Switzerland	UEFA	cup	core_club	pokal	1	2026					rule:default
+T191	U19 Süper Lig	Türkiye	UEFA	youth	youth	wettbewerb	1	2026	2018,2019,2020,2021,2022,2023,2024				rule:youth
+TAD1	Vysshaya Liga	Tajikistan	AFC	1	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2020,2021,2022,2023		169		rule:default
+TADS	Tajik Supercup	Tajikistan	AFC	supercup	core_club	pokal	1	2025					rule:default
+TDeA	Liga 1 Apertura	Peru	Americas	1	core_club	wettbewerb	1	2025	2014,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+TDeC	Liga 1 Clausura	Peru	Americas	1	core_club	wettbewerb	1	2025	2014,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+TFPL	Taiwan Football Premier League	Chinese Taipei	AFC	1	core_club	wettbewerb	1	2026	2016,2017,2018,2019,2020,2021,2022,2023		22256		rule:default
+TFVP	Landespokal Thüringen	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+THA1	Thai League	Thailand	AFC	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2020,2021,2022,2023,2024	8984			rule:default
+THA2	Thai League 2	Thailand	AFC	2	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2020,2021,2022,2023,2024	9498	10511		rule:default
+THLI	Thüringenliga	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+TLE1	Liga Timorense - Primeira Divisão	Timor-Leste	AFC	1	core_club	wettbewerb	1	2025					rule:default
+TOHL	Tohoku Soccer League (Div.1)	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+TOSL	Tokai Soccer League (Div.1)	Japan	AFC	5	amateur	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:tier 5
+TR1	Süper Lig	Türkiye	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	71			rule:default
+TR2	1.Lig	Türkiye	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	165			rule:default
+TR3A	2.Lig Beyaz	Türkiye	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+TR3B	2.Lig Kirmizi	Türkiye	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+TR4A	3.Lig Grup 1	Türkiye	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+TR4B	3.Lig Grup 2	Türkiye	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+TR4C	3.Lig Grup 3	Türkiye	UEFA	4	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+TRIN	Intercontinental Cup	International	AFC	international	archive	pokal	0	2022	2022				rule:default; archive: current edition 2023 is not live
+TRS	TFF Süper Kupa	Türkiye	UEFA	supercup	core_club	pokal	1	2026			505		rule:default
+TS1	Chance Liga	Czech Republic	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+TS2	Chance Narodni Liga	Czech Republic	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+TSP	MOL Cup	Czech Republic	UEFA	cup	core_club	pokal	1	2026			282		rule:default
+TUN1	Ligue 1	Tunisia	CAF	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+UA2P	U21 Premier Liga	Ukraine	UEFA	youth	youth	wettbewerb	1	2026					rule:youth
+UA3L	Druga Liga	Ukraine	UEFA	3	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+UAE1	UAE Pro League	United Arab Emirates	AFC	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		971		rule:default
+UCOL	UEFA Conference League	International	UEFA	international	core_club	pokal	1	2025			17015		rule:default
+UGL1	Uganda Premier League	Uganda	CAF	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		10166		rule:default
+UKR1	Premier Liga	Ukraine	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+UKR2	Persha Liga	Ukraine	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+UN2	Nemzeti Bajnokság II.	Hungary	UEFA	2	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+UNFI	UEFA Nations League Finals	International	UEFA	international	core_national	pokal	1	2024					rule:national team (review C9-F4, registry says club cup)
+UNG1	Nemzeti Bajnokság	Hungary	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+UNLA	UEFA Nations League A	International	UEFA	international	core_national	pokal	1	2026		9806			rule:national team (review C9-F4, registry says club cup)
+UNLB	UEFA Nations League B	International	UEFA	international	core_national	pokal	1	2026		9807			rule:national team (review C9-F4, registry says club cup)
+UNLC	UEFA Nations League C	International	UEFA	international	core_national	pokal	1	2026		9808			rule:national team (review C9-F4, registry says club cup)
+UNLD	UEFA Nations League D	International	UEFA	international	core_national	pokal	1	2026		9809			rule:national team (review C9-F4, registry says club cup)
+UNPO	UEFA Nations League Play-off	International	UEFA	international	core_national	pokal	1	2025					rule:national team (review C9-F4, registry says club cup)
+UR2T	Segunda División - Torneo Competencia	Uruguay	Americas	2	core_club	wettbewerb	1	2025	2021,2022,2023				rule:default
+URL3	Primera B Metropolitana	Argentina	Americas	3	core_club	wettbewerb	1	2025			1347		rule:default
+URSC	Supercopa Uruguaya	Uruguay	Americas	supercup	core_club	pokal	1	2025			11705		rule:default
+URU1	Liga AUF Apertura	Uruguay	Americas	1	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+URU2	Segunda División - Fase Regular	Uruguay	Americas	2	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+URU3	Segunda División Play-off	Uruguay	Americas	playoff	core_club	wettbewerb	1	2025	2015,2016,2018,2019,2020,2021,2022,2023				rule:default
+URUI	Liga AUF Intermedio	Uruguay	Americas	1	core_club	wettbewerb	1	2025	2016,2017,2018,2019,2021,2022,2023				rule:default
+USC	UEFA Super Cup	International	UEFA	international	core_club	pokal	1	2026		74	465		rule:default
+USC3	USL League One	United States	Americas	3	core_club	wettbewerb	1	2025	2018,2019,2020,2021,2022,2023	9296	13362		rule:default
+USL	USL Championship	United States	Americas	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023	8972	13363		rule:default
+USLC	USL Cup	United States	Americas	cup	core_club	pokal	1	2025		10654			rule:default
+USMX	Leagues Cup	International	Americas	international	core_club	pokal	1	2025		10043	13783		rule:default
+UZ1	O'zbekiston Superligasi	Uzbekistan	AFC	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+UZ2L	O'zbekiston Pro Liga	Uzbekistan	AFC	2	core_club	wettbewerb	1	2025	2019,2020,2021,2022,2023				rule:default
+VFVA	2de Nationale VV A	Belgium	UEFA	4	core_club	wettbewerb	1	2026	2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+VFVB	2de Nationale VV B	Belgium	UEFA	4	core_club	wettbewerb	1	2026	2018,2019,2020,2021,2022,2023,2024				rule:default
+VIE1	V.League 1	Vietnam	AFC	1	core_club	wettbewerb	1	2026	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024		626		rule:default
+VLBA	Verbandsliga Baden	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLBE	Berlin-Liga	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLBW	Verbandsliga Württemberg	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLHM	Verbandsliga Hessen-Mitte	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLHN	Verbandsliga Hessen-Nord	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLHS	Verbandsliga Hessen-Süd	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLMV	Verbandsliga Mecklenburg-Vorpommern	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLSA	Verbandsliga Sachsen-Anhalt	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLSB	Verbandsliga Südbaden	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLSW	Verbandsliga Südwest	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLW1	Westfalenliga 1	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VLW2	Westfalenliga 2	Germany	UEFA	6	amateur	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:tier 6
+VN2A	Liga FUTVE 2	Venezuela	Americas	2	core_club	wettbewerb	1	2025	2022,2023		22799		rule:default
+VZ1A	Liga FUTVE Apertura	Venezuela	Americas	1	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2019,2023				rule:default
+VZOA	Liga FUTVE Apertura. Fase Final	Venezuela	Americas	playoff	core_club	wettbewerb	1	2025	2015,2016,2017,2018,2023				rule:default
+WA2S	Cymru South	Wales	UEFA	2	core_club	wettbewerb	1	2026	2019,2021,2022,2023,2024		13821		rule:default
+WAF1	WAFF Championship	International	AFC	international	archive	pokal	0	2018	2018		842		rule:national team (review C9-F4, registry says club cup); archive: current edition 2019 is not live
+WAFF	WAFF U20 Championship	International	AFC	international	youth	pokal	1	2025					rule:youth
+WAL1	Cymru Premier	Wales	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024	116	254		rule:default
+WAL2	Cymru North	Wales	UEFA	2	core_club	wettbewerb	1	2026	2018,2019,2021,2022,2023,2024		13820		rule:default
+WER1	Vysheyshaya Liga	Belarus	UEFA	1	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023				rule:default
+WER2	Pershaya Liga	Belarus	UEFA	2	core_club	wettbewerb	1	2025	2014,2015,2016,2017,2018,2019,2020,2021,2022,2023		776		rule:default
+WFPO	Landespokal Westfalen	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+WFVP	Landespokal Württemberg	Germany	UEFA	cup	amateur	pokal	1	2026					rule:German state cup
+WMQ1	World Cup qualification Asia	International	FIFA	international	core_national	pokal	1	2024					rule:national team (review C9-F4, registry says club cup)
+WMQ2	World Cup Qualification Africa	International	FIFA	international	core_national	pokal	1	2023	2023				rule:national team (review C9-F4, registry says club cup)
+WMQ3	World Cup qualification CONCACAF	International	FIFA	international	core_national	pokal	1	2023	2023	10198			rule:national team (review C9-F4, registry says club cup)
+WMQ4	World Cup qualification South America	International	FIFA	international	core_national	pokal	1	2023	2023				rule:national team
+WMQ5	World Cup qualification Oceania	International	FIFA	international	core_national	pokal	1	2024	2024				rule:national team (review C9-F4, registry says club cup)
+WMQ6	World Cup Qualifiers (Europe)	International	FIFA	international	core_national	pokal	1	2024					rule:national team
+WRPO	Belarusian Cup	Belarus	UEFA	cup	core_club	pokal	1	2026		9521			rule:default
+Y047	YFL U17	Russia	UEFA	youth	youth	wettbewerb	1	2025	2023				rule:youth
+Y246	YFL U16	Russia	UEFA	youth	youth	wettbewerb	1	2025	2023				rule:youth
+YKCP	Ykkösliigacup	Finland	UEFA	cup	core_club	pokal	1	2025			21927		rule:default
+ZYP1	Cyprus League	Cyprus	UEFA	1	core_club	wettbewerb	1	2026	2015,2016,2017,2018,2019,2020,2021,2022,2023,2024				rule:default
+brti	Troféu Inconfidência	Brazil	Americas	regional	core_club	pokal	1	2025					rule:Brazilian state championship
+ofb	ÖFB-Cup	Austria	UEFA	cup	core_club	pokal	1	2026			445		rule:default

@@ -222,28 +222,78 @@ def test_a_calendar_league_scope_names_the_source_edition_not_its_season():
     ] == [('2024', '2025')]
 
 
-def test_unknown_active_classification_blocks_empty_and_explicit_plans():
+def test_unknown_classification_quarantines_only_that_competition():
     unknown = _competition('UNK', status='unknown')
-    edition = _edition('UNK', '2025')
-    with pytest.raises(
-        planner.ScopePlanningError,
-        match='active registry classifications block crawl: UNK',
-    ):
-        planner.plan_transfermarkt_scopes(
-            {},
-            parent_cycle_id='scheduled__blocked',
-            competitions=[unknown],
-            editions=[edition],
-            now=NOW,
-        )
+    healthy = _competition('OK1')
+    plan = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__quarantine',
+        competitions=[unknown, healthy],
+        editions=[_edition('UNK', '2025'), _edition('OK1', '2025')],
+        now=NOW,
+    )
+    assert [item['competition_id'] for item in plan.mapped_payloads] == ['OK1']
+    assert plan.quarantined_competitions == 1
+    assert plan.as_dict()['quarantined_competitions'] == 1
+    # An explicit request for the quarantined competition still fails closed.
     with pytest.raises(planner.ScopePlanningError, match='classification blocks'):
         planner.plan_transfermarkt_scopes(
             {'scopes': ['UNK:2025']},
             parent_cycle_id='manual__blocked',
             competitions=[unknown],
-            editions=[edition],
+            editions=[_edition('UNK', '2025')],
             now=NOW,
         )
+
+
+def test_conflicting_registry_rows_quarantine_one_competition_not_the_plan():
+    healthy = _competition('OK1')
+    conflicted = _competition('BAD')
+    rows = [
+        _joined_row(healthy, _edition('OK1', '2025')),
+        _joined_row(conflicted, _edition('BAD', '2025')),
+        _joined_row(
+            replace(conflicted, name='Renamed BAD'), _edition('BAD', '2024', current=False),
+        ),
+    ]
+    plan = planner.plan_transfermarkt_scopes(
+        {}, parent_cycle_id='scheduled__conflict', registry_rows=rows, now=NOW,
+    )
+    assert [item['competition_id'] for item in plan.mapped_payloads] == ['OK1']
+    assert plan.quarantined_competitions == 1
+    targets = planner.eligible_registry_scopes(rows)
+    assert [item.competition_id for item in targets] == ['OK1']
+
+
+def test_current_lane_plans_denominator_core_first_and_skips_amateur(tmp_path):
+    from scrapers.transfermarkt.denominator import COLUMNS, load_denominator
+
+    lines = ['\t'.join(COLUMNS)]
+    for cid, klass, live in (
+        ('COR', 'core_club', '1'), ('NAT', 'core_national', '1'),
+        ('YTH', 'youth', '1'), ('AMA', 'amateur', '1'), ('OLD', 'archive', '0'),
+    ):
+        lines.append('\t'.join([
+            cid, f'Name {cid}', 'Test', 'UEFA', '1', klass, 'wettbewerb', live,
+            '2025', '', '', '', '', 'test',
+        ]))
+    path = tmp_path / 'denominator.tsv'
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    ids = ('AMA', 'COR', 'MIS', 'NAT', 'OLD', 'YTH')
+    plan = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__denominator',
+        competitions=[_competition(cid) for cid in ids],
+        editions=[_edition(cid, '2025') for cid in ids],
+        now=NOW,
+        selection_mode='current_only',
+        denominator=load_denominator(path),
+    )
+    # Core first (order inside core unchanged), then youth and the competition
+    # the file does not know; amateur and archive are not planned.
+    assert [item['competition_id'] for item in plan.mapped_payloads] == [
+        'COR', 'NAT', 'MIS', 'YTH',
+    ]
 
 
 def test_empty_params_selects_due_oldest_first_and_caps_batch_at_eight():
