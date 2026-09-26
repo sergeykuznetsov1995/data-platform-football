@@ -70,6 +70,7 @@ from scrapers.transfermarkt.registry import (
     resolve_competition,
 )
 from scrapers.transfermarkt.raw_store import RawResponseStore
+from scrapers.transfermarkt.season import saison_id_to_season
 
 
 MIB = 1024 * 1024
@@ -362,14 +363,15 @@ def _scope_identity(args: argparse.Namespace) -> ScopeIdentity:
         canonical = edition.canonical_season
         edition_current = bool(edition.current)
         edition_participant_count = edition.participant_count
-    # The source offsets some calendar leagues' saison_id from the season it
-    # names (saison_id 2023 is labelled "2024"), so the registered edition is
-    # checked against the label it was derived from, exactly as registry DQ
-    # does. Only a caller who passed no edition record at all is left with the
-    # edition id as the sole statement of its season.
-    expected_canonical = canonical_season(
-        edition.edition_label if raw_edition is not None else edition_id,
-        competition.season_format,
+    # A calendar saison_id names the next year (saison_id 2023 is labelled
+    # "2024"), so the registered edition is checked against the label it was
+    # derived from, exactly as registry DQ does. A caller who passed no edition
+    # record gets the edition id read as a saison_id by the one rule
+    # (season.py, #1390).
+    expected_canonical = (
+        canonical_season(edition.edition_label, competition.season_format)
+        if raw_edition is not None
+        else saison_id_to_season(edition_id, competition.season_format)
     )
     canonical = _required(canonical or expected_canonical, 'canonical_season')
     if canonical != expected_canonical:

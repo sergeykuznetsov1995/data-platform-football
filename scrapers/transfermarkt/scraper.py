@@ -830,7 +830,11 @@ def _extract_club_id_from_href(href) -> Optional[str]:
 
 
 def _normalise_event_season(raw, transfer_date: Optional[date]) -> Optional[str]:
-    """Normalise a source event season to the Bronze ``2526`` convention."""
+    """Normalise a source event season to the Bronze ``2526`` convention.
+
+    The season a transfer belongs to (July rule) is not an edition's
+    ``saison_id``; that rule lives in ``season.py`` (#1390).
+    """
 
     if raw is not None:
         value = str(raw).strip()

@@ -430,7 +430,7 @@ def _competition_record(value: str):
 
 
 def _canonical_scope_season(competition: str, edition_id: int | str) -> str:
-    from scrapers.transfermarkt.registry import canonical_season
+    from scrapers.transfermarkt.season import saison_id_to_season
 
     record = _competition_record(competition)
     if not record.crawl_eligible:
@@ -438,13 +438,12 @@ def _canonical_scope_season(competition: str, edition_id: int | str) -> str:
             f'{record.competition_id}: classification blocks crawl: '
             f'{record.crawl_block_reason}'
         )
-    # The source offsets some calendar leagues' saison_id from the season it
-    # names, so the registered season — not the edition id — is the truth. The
-    # edition id is only a fallback for a caller that states no season.
+    # The registered season is the truth; a caller that states no season gets
+    # the edition id read as a saison_id by the one rule (season.py, #1390).
     registered = str(os.environ.get('TM_CANONICAL_SEASON') or '').strip()
     if registered:
         return registered
-    return canonical_season(edition_id, record.season_format)
+    return saison_id_to_season(edition_id, record.season_format)
 
 
 def _scope_season(competition: str, edition_id: int | str) -> Dict[str, Any]:
