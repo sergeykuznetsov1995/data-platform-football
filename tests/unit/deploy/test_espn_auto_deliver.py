@@ -104,7 +104,8 @@ class World:
         self.parsed: datetime | None = None
         self.dag_error = False
         self.import_errors: list[tuple[str, datetime]] = []
-        self.pools: dict[str, int] = {"default_pool": 128, "espn_live": 4}
+        # slot_pool: имя → (слоты, include_deferred)
+        self.pools: dict[str, tuple[int, bool]] = {"default_pool": (128, False), "espn_live": (4, False)}
         self.running = 0
         self.metadb_up = True
         self.env = ["AIRFLOW_HOME=/opt/airflow", "TRINO_PASSWORD=secret"]
@@ -173,8 +174,10 @@ class FakeHost(ad.Host):
         w.compose_calls.append(args)
         w.compose_envs.append(str(root))
         if args[:1] == ["run"]:
-            if not w.ignore_init:
-                w.pools.update(ad.pools_of(root))
+            if not w.ignore_init:   # как airflow-init: import + удаление пулов не из кода
+                code = json.loads((root / ad.POOLS_REL).read_text())
+                w.pools = {"default_pool": w.pools["default_pool"], **{
+                    n: (c["slots"], c.get("include_deferred", False)) for n, c in code.items()}}
             return 0, "", ""
         if "airflow-metadb" in args:
             return 0, "", ""
@@ -214,8 +217,10 @@ class FakeHost(ad.Host):
                 return 0, "", ""
             fresh = w.parsed is not None and visible(w.parsed) and w.parsed > cut
             return 0, f"{'t' if w.dag_error else 'f'}|{'t' if fresh else 'f'}\n", ""
-        if sql.startswith("SELECT pool || '|' || slots"):
-            return 0, "".join(f"{p}|{s}\n" for p, s in sorted(w.pools.items())), ""
+        if sql.startswith("SELECT pool || '|' || slots || '|' || CASE WHEN include_deferred"):
+            assert "WHERE pool <> 'default_pool'" in sql
+            return 0, "".join(f"{p}|{s}|{'t' if d else 'f'}\n" for p, (s, d) in sorted(w.pools.items())
+                              if p != "default_pool"), ""
         raise AssertionError(sql)
 
 
@@ -323,7 +328,7 @@ def test_pools_change_runs_init_before_up_and_is_accepted(env):
     sha = repo.commit({"deploy/espn/pools.json": json.dumps({"espn_live": {"slots": 6, "description": "d"}})}, "pools")
     assert ad.main([], host=host) == 0
     assert [c[0] for c in world.compose_calls] == ["run", "up"]
-    assert world.pools["espn_live"] == 6
+    assert world.pools["espn_live"] == (6, False)
     assert state(paths, "accepted") == sha
 
 
@@ -451,8 +456,39 @@ def test_pools_differ_from_code_fail_acceptance(env):
     world.ignore_init = True
     sha = repo.commit({"deploy/espn/pools.json": json.dumps({"espn_live": {"slots": 6, "description": "d"}})}, "pools")
     assert ad.main([], host=host) == 1   # откат на старые пулы (4) проходит
-    assert "пулы ≠ pools.json: espn_live=4 (надо 6)" in host.sent[0]
+    assert "пулы ≠ pools.json (слоты|include_deferred): espn_live=4|f (надо 6|f)" in host.sent[0]
     assert state(paths, "rejected") == sha
+
+
+def test_include_deferred_change_runs_init_and_extra_pool_fails_acceptance(env):
+    repo, paths, world, host, base = env
+    seed(env)
+    sha = repo.commit({"deploy/espn/pools.json": json.dumps(
+        {"espn_live": {"slots": 4, "description": "d", "include_deferred": True}})}, "deferred")
+    assert ad.main([], host=host) == 0
+    assert [c[0] for c in world.compose_calls] == ["run", "up"]
+    assert world.pools["espn_live"] == (4, True) and state(paths, "accepted") == sha
+    # лишний пул в metadb (завели руками) — пулы ≠ коду, приёмка не проходит
+    world.compose_calls.clear()
+    world.pools["espn_manual"] = (1, False)
+    bad = repo.commit({"scrapers/espn/helper.py": "def go():\n    return 7\n"}, "next")
+    assert ad.main([], host=host) == 2
+    assert "espn_manual=1|f (надо нет)" in host.sent[-1]
+    assert state(paths, "rejected") == bad
+
+
+def test_syntax_broken_rejected_release_does_not_block_the_fix(env):
+    """Astra 1507 р1 п.1: отклонённый релиз с синтаксической ошибкой в DAG не валит следующий cron."""
+    repo, paths, world, host, base = env
+    seed(env)
+    repo.branch("espn/syntax")
+    bad = repo.commit({"deploy/espn/dags/dag_espn_current.py": "def (:\n# BROKEN\n"}, "s", branch="espn/syntax")
+    assert ad.main(["--target", "origin/espn/syntax"], host=host) == 1
+    assert state(paths, "rejected") == bad
+    repo.checkout("master")
+    fix = repo.commit({"scrapers/espn/helper.py": "def go():\n    return 2\n"}, "fix")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == fix
 
 
 def test_dag_not_reparsed_times_out_after_7_min(env):
@@ -597,6 +633,12 @@ def test_dag_import_closure_is_inside_mounted_dirs():
     assert all(any(f.startswith(p) for p in ad.ARCHIVE_PATHS) for f in closure)
 
 
+def test_compose_metadb_healthcheck_is_tcp():
+    """Astra 1507 р1 п.5: временный сервер инициализации слушает только сокет."""
+    test = _compose()["services"]["airflow-metadb"]["healthcheck"]["test"]
+    assert "pg_isready -h 127.0.0.1" in test[-1]
+
+
 def test_pools_json_matches_dag_pool_and_concurrency():
     pools = ad.pools_of(ROOT)
     src = (ROOT / "deploy/espn/dags/dag_espn_current.py").read_text()
@@ -605,4 +647,4 @@ def test_pools_json_matches_dag_pool_and_concurrency():
                      and getattr(n.targets[0], "id", None) == "LIVE_POOL")
     tis = [kw.value.value for n in ast.walk(tree) if isinstance(n, ast.Call)
            for kw in n.keywords if kw.arg == "max_active_tis_per_dag"]
-    assert pools == {live_pool: tis[0]} == {"espn_live": 4}
+    assert pools == {live_pool: f"{tis[0]}|f"} == {"espn_live": "4|f"}

@@ -334,8 +334,8 @@ ESPN иногда дописывает матч позже (составы/су�
   `RELEASE_COMMIT/TREE_SHA256` — автомат отказывается работать с таким env-файлом.
 - **Пулы — кодом:** `deploy/espn/pools.json` (`espn_live`: 4 слота = `max_active_tis_per_dag`;
   файл добавлен `git add -f` — `*.json` в `.gitignore`). `airflow-init` делает только
-  `airflow db migrate` + `airflow pools import`; запускается при посеве и когда `pools.json`
-  цели отличается от живого.
+  `airflow db migrate` + `airflow pools import` + удаление пулов, которых нет в `pools.json`
+  (кроме `default_pool`); запускается при посеве и когда `pools.json` цели отличается от живого.
 
 ### Автомат `auto_deliver.py`
 
@@ -366,7 +366,7 @@ airflow-webserver` с `ESPN_RELEASE_ROOT=<корень>` в окружении �
   `import_error` = 0 (свежая ошибка разбора — провал сразу);
 - `/opt/airflow/dags` scheduler смонтирован из корня цели; sha256 файлов `deploy/espn/dags` и
   `scrapers/espn` в контейнере = корню;
-- пулы metadb = `pools.json` (слоты каждого объявленного пула);
+- пулы metadb (кроме `default_pool`) = `pools.json`: тот же набор, слоты и `include_deferred`;
 - в env контейнера нет `*_PROXY`.
 
 Успех → `accepted-prev ← accepted`, `accepted ← sha`, Telegram «✅ ESPN выкачен <sha>», уборка

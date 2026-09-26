@@ -41,6 +41,7 @@ METADB = f"{PROJECT}-airflow-metadb-1"
 SCHEDULER = f"{PROJECT}-airflow-scheduler-1"
 SERVICES = ("airflow-scheduler", "airflow-webserver")
 LABEL = "espn.release_root"
+DEFAULT_POOL = "default_pool"   # пул Airflow, не наш: в pools.json его нет
 # Что попадает в корень релиза (всё, что монтирует compose).
 ARCHIVE_PATHS = ("deploy/espn", "scrapers", "configs/espn")
 # Пути контура сверх замыкания импортов DAG: код доставки и данные, которые читает код.
@@ -207,7 +208,10 @@ def import_closure(read, entries) -> set[str]:
             continue
         seen.add(rel)
         package = rel.rsplit("/", 1)[0].replace("/", ".") if "/" in rel else ""
-        tree = ast.parse(read(rel), rel)
+        try:
+            tree = ast.parse(read(rel), rel)
+        except SyntaxError:
+            continue   # сломанный файл (отклонённый релиз) — сам в контуре, импортов не даёт
         lazy = {id(n) for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "__getattr__"}
         nodes = [tree]
         while nodes:
@@ -357,9 +361,10 @@ def check_env_file(h: Host) -> None:
         raise Stop(f"{path} задаёт {', '.join(bad)} — корень релиза пинует только state/accepted, прокси запрещены")
 
 
-def pools_of(root: Path) -> dict[str, int]:
-    return {name: int(cfg["slots"]) for name, cfg in
-            json.loads((root / POOLS_REL).read_text()).items()}
+def pools_of(root: Path) -> dict[str, str]:
+    """Пулы кода: имя → 'слоты|include_deferred' (как их отдаёт metadb)."""
+    return {name: f"{int(cfg['slots'])}|{'t' if cfg.get('include_deferred', False) else 'f'}"
+            for name, cfg in json.loads((root / POOLS_REL).read_text()).items()}
 
 
 def roll_out(h: Host, root: Path, init: bool) -> str | None:
@@ -412,13 +417,15 @@ def static_checks(h: Host, root: Path) -> str | None:
         if got != host_hashes(root / rel):
             return f"байты {target} в контейнере ≠ {rel} корня релиза"
     want = pools_of(root)
-    out = psql(h, "SELECT pool || '|' || slots FROM slot_pool ORDER BY 1")
+    out = psql(h, "SELECT pool || '|' || slots || '|' || CASE WHEN include_deferred THEN 't' ELSE 'f' END "
+                  f"FROM slot_pool WHERE pool <> '{DEFAULT_POOL}' ORDER BY 1")
     if out is None:
         return "пулы не прочитаны: metadb не отвечает"
     have = dict(line.split("|", 1) for line in out.splitlines() if "|" in line)
-    wrong = sorted(n for n, s in want.items() if have.get(n) != str(s))
+    wrong = sorted(n for n in want.keys() | have.keys() if have.get(n) != want.get(n))
     if wrong:
-        return "пулы ≠ pools.json: " + ", ".join(f"{n}={have.get(n, 'нет')} (надо {want[n]})" for n in wrong)
+        return "пулы ≠ pools.json (слоты|include_deferred): " + ", ".join(
+            f"{n}={have.get(n, 'нет')} (надо {want.get(n, 'нет')})" for n in wrong)
     return None
 
 

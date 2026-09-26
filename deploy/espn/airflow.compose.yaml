@@ -105,12 +105,14 @@ services:
         aliases:
           - espn-live-metadb
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      # По TCP: временный сервер первичной инициализации слушает только сокет — не «готов».
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U airflow -d airflow"]
       interval: 10s
       timeout: 5s
       retries: 12
 
-  # Только схема metadb и пулы из pools.json; паузы DAG и прочее не трогает.
+  # Только схема metadb и пулы = pools.json (импорт + удаление пулов, которых нет в коде, кроме
+  # default_pool); паузы DAG и прочее не трогает.
   airflow-init:
     <<: *espn-live-common
     restart: "no"
@@ -120,6 +122,16 @@ services:
       - |
         airflow db migrate
         airflow pools import /opt/espn-deploy/pools.json
+        python - <<'PY'
+        import json
+        from airflow.models import Pool
+        from airflow.utils.session import create_session
+        keep = set(json.load(open("/opt/espn-deploy/pools.json"))) | {Pool.DEFAULT_POOL_NAME}
+        with create_session() as session:
+            for pool in session.query(Pool).filter(Pool.pool.notin_(keep)):
+                print("pool removed (not in pools.json):", pool.pool)
+                session.delete(pool)
+        PY
     volumes:
       - type: bind
         source: ${ESPN_RELEASE_ROOT}/deploy/espn
