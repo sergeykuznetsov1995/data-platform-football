@@ -10579,3 +10579,122 @@ def test_transfermarkt_only_backfill_token_requires_backfill_pool(
             shared_mod, monkeypatch, tmp_path,
             env={"TM_BACKFILL_PROXY_CONTROL_TOKEN": "b" * 32},
         )
+
+
+# --- #1388: provider CONNECT refusal is counted, not accounting uncertainty --
+
+
+def test_tm_connect_502_is_provider_rejected_not_uncertain(
+    shared_mod, monkeypatch, caplog
+):
+    # Decodo refuses the CONNECT before any tunnel exists and closes: the
+    # whole rejection is metered, so the lease is not latched (#1388).
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    # Keep-alive lease that already billed an earlier tunnel (the field case).
+    shared_mod._account_lease_bytes(lease, "www.transfermarkt.com", "down", 10)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+    shared_mod.PROVIDER_REJECTED_CONNECTS.clear()
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(_DEAD_EXIT_RESPONSE), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    with caplog.at_level("WARNING"):
+        client_writer = _tm_connect(shared_mod, lease, mgr)
+
+    payload = bytes(client_writer.payload)
+    assert payload.startswith(b"HTTP/1.1 502 Bad Gateway (upstream=502)\r\n")
+    assert lease.accounting_uncertain is False
+    assert lease.accounting_uncertain_reason == ""
+    assert lease.usable is True
+    assert lease.provider_rejected_connects == 1
+    assert lease.report()["provider_rejected_connects"] == 1
+    assert shared_mod.PROVIDER_REJECTED_CONNECTS["502"] == 1
+    assert lease.upstream_repins == 0
+    assert lease.down_bytes == 10 + len(_DEAD_EXIT_RESPONSE)
+    assert lease.reserved_bytes == 0
+    assert "accounting is uncertain" not in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "CRITICAL"]
+    rejected = [
+        e for e in _ledger_events(shared_mod) if e["event_type"] == "connect_rejected"
+    ]
+    assert [(e["reason"], e["classification"]) for e in rejected] == [
+        ("502", "provider_rejected")
+    ]
+    health = shared_mod._service_health_report(mgr)
+    assert health["provider_rejected_connects"] == {"502": 1}
+
+
+def test_tm_connect_502_with_unproven_tail_stays_uncertain(shared_mod, monkeypatch):
+    # No Content-Length and no EOF: provider bytes may hide in read-ahead, so
+    # this is real uncertainty and still latches as before.
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+    monkeypatch.setattr(
+        shared_mod, "LEASE_CLIENT_HANGUP_DRAIN_SECONDS", 0.02, raising=False
+    )
+    shared_mod.PROVIDER_REJECTED_CONNECTS.clear()
+    head = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+
+    async def fake_open(host, port):
+        return (
+            _FakeUpstreamReader(head + b"partial", block_when_empty=True),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    client_writer = _tm_connect(shared_mod, lease, mgr)
+
+    assert b"502 Bad Gateway" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
+    assert lease.provider_rejected_connects == 0
+    assert not shared_mod.PROVIDER_REJECTED_CONNECTS
+
+
+def test_tm_provider_break_mid_tunnel_stays_uncertain(shared_mod, monkeypatch):
+    # The tunnel was established and the provider reset mid-response: the
+    # billed tail is unknowable, so the lease latches exactly as before.
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_transfermarkt_lease(shared_mod, mgr)
+    _relax_provider_head_timeout(shared_mod, monkeypatch)
+    shared_mod.PROVIDER_REJECTED_CONNECTS.clear()
+
+    class _ResettingReader(_FakeUpstreamReader):
+        async def read(self, size):
+            if not self.buf:
+                raise ConnectionResetError("provider reset mid-tunnel")
+            return await super().read(size)
+
+    async def fake_open(host, port):
+        return (
+            _ResettingReader(_LIVE_CONNECT_HEAD + b"\x16\x03\x03partial"),
+            _FakeUpstreamWriter(),
+        )
+
+    _patch_upstream_opener(shared_mod, monkeypatch, fake_open)
+    client_writer = _ClientWriter()
+
+    async def scenario():
+        try:
+            await asyncio.wait_for(
+                shared_mod.handle(
+                    _ClientConnectReader(_connect_header_lines(lease, host="www.transfermarkt.com")),
+                    client_writer,
+                    mgr,
+                    require_lease=True,
+                ),
+                2.0,
+            )
+        except ConnectionResetError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.accounting_uncertain is True
+    assert lease.accounting_uncertain_reason == "provider_read_error"
+    assert lease.provider_rejected_connects == 0
+    assert not shared_mod.PROVIDER_REJECTED_CONNECTS
