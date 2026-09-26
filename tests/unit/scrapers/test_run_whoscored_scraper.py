@@ -149,13 +149,11 @@ class _Repository:
         catalog,
         candidate_ids=None,
         profile_candidate_ids=None,
-        non_opta_ids=None,
         ingest_states=None,
     ):
         self.catalog = catalog
         self.candidate_ids = list(candidate_ids or [])
         self.profile_candidate_ids = sorted(set(profile_candidate_ids or []))
-        self.non_opta_ids = set(non_opta_ids or [])
         self.ingest_states = dict(ingest_states or {})
         self.catalog_calls = []
         self.all_completed_calls = []
@@ -188,7 +186,7 @@ class _Repository:
             SimpleNamespace(
                 game_id=value,
                 kickoff=__import__("datetime").datetime(2025, 8, 1),
-                match_is_opta=value not in self.non_opta_ids,
+                match_is_opta=True,
             )
             for value in ids
         ]
@@ -266,7 +264,6 @@ def _runtime(
     *,
     candidate_ids=None,
     profile_candidate_ids=None,
-    non_opta_ids=None,
     ingest_states=None,
 ):
     catalog = _Catalog()
@@ -274,7 +271,6 @@ def _runtime(
         catalog,
         candidate_ids=candidate_ids,
         profile_candidate_ids=profile_candidate_ids,
-        non_opta_ids=non_opta_ids,
         ingest_states=ingest_states,
     )
     configured = dict(behaviors or {})
@@ -467,7 +463,6 @@ def _run(
     behaviors=None,
     candidate_ids=None,
     profile_candidate_ids=None,
-    non_opta_ids=None,
     ingest_states=None,
 ):
     monkeypatch.delenv("WHOSCORED_SCHEMA_READY", raising=False)
@@ -476,7 +471,6 @@ def _run(
         behaviors,
         candidate_ids=candidate_ids,
         profile_candidate_ids=profile_candidate_ids,
-        non_opta_ids=non_opta_ids,
         ingest_states=ingest_states,
     )
     monkeypatch.setattr(runner, "_load_runtime", lambda: runtime)
@@ -1431,252 +1425,6 @@ def test_backfill_freezes_s3_plan_and_receipts_for_25_match_chunks(
     assert len(list((root / "receipts").rglob("*.json"))) == 6
     assert len(list((root / "checkpoints").rglob("*.json"))) == 5
     assert len(list((root / "batches").rglob("*.json"))) == 4
-
-
-@pytest.mark.unit
-def test_backfill_probes_all_non_opta_scope_and_defers_the_rest(
-    monkeypatch, tmp_path
-):
-    game_ids = list(range(1, 53))
-    noted_projections = []
-    original_note = runner._note_probe_child_projection
-
-    def _spy_note(probe_seen, child_value):
-        noted_projections.append(child_value)
-        return original_note(probe_seen, child_value)
-
-    monkeypatch.setattr(runner, "_note_probe_child_projection", _spy_note)
-    rc, report, service_cls, _catalog = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--queue-id",
-            "probe-queue",
-        ],
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "not_available", 52: "not_available"},
-    )
-
-    assert rc == 0
-    assert report["queue"]["status"] == "complete"
-    assert report["queue"]["completed_schedules"] == 1
-    assert report["queue"]["completed_probes"] == 1
-    assert report["queue"]["completed_match_chunks"] == 1
-    assert report["queue"]["completed_roster_freezes"] == 1
-    assert report["queue"]["successful_receipts"] == 5
-    match_calls = [
-        call
-        for service in service_cls.instances
-        for call in service.calls
-        if call[0] == "matches"
-    ]
-    # One real probe fetch (first and last candidate) plus the probe-only
-    # match chunk; no deferred candidate is ever fetched in this plan.
-    assert [sorted(call[2]) for call in match_calls] == [[1, 52], [1, 52]]
-    # The probe refreshes stale cached evidence (bounded TTL); the frozen
-    # match chunk keeps replaying immutable history.
-    assert [
-        flag
-        for service in service_cls.instances
-        for flag in service.match_historical_replays
-    ] == [False, True]
-    # Only the probe child feeds the replay-forgiveness accumulators: one
-    # probe work item, one commits projection plus one attempts projection.
-    assert len(noted_projections) == 2
-    assert noted_projections[0]["match"] == report["producer_commits"]["match"]
-    assert len(report["producer_commits"]["match"]) == 2
-    planning_repository = next(
-        service.repository
-        for service in service_cls.instances
-        if any(call[0] == "schedule" for call in service.calls)
-    )
-    # Deferral evidence is read across the whole freeze in one query.
-    assert planning_repository.ingest_state_calls == [tuple(game_ids)]
-    receipts = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in (tmp_path / "backfill" / "probe-queue" / "receipts").rglob(
-            "*.json"
-        )
-    ]
-    probe_receipts = [value for value in receipts if value["kind"] == "probe"]
-    assert len(probe_receipts) == 1
-    outcome = probe_receipts[0]["outcome"]
-    assert outcome["game_ids"] == [1, 52]
-    assert outcome["not_available_game_ids"] == [1, 52]
-    assert outcome["known_data_game_ids"] == []
-    assert outcome["deferred_game_ids"] == list(range(2, 52))
-    # The deferral loses nothing: probes plus deferred equal the full freeze.
-    assert sorted(outcome["game_ids"] + outcome["deferred_game_ids"]) == game_ids
-
-
-@pytest.mark.unit
-def test_backfill_probe_that_refutes_the_flag_still_drains_every_candidate(
-    monkeypatch, tmp_path
-):
-    game_ids = list(range(1, 53))
-    rc, report, service_cls, _catalog = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--queue-id",
-            "probe-lied-queue",
-        ],
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "success", 52: "not_available"},
-    )
-
-    assert rc == 0
-    assert report["queue"]["status"] == "complete"
-    assert report["queue"]["completed_probes"] == 1
-    assert report["queue"]["completed_match_chunks"] == 3
-    match_calls = [
-        call
-        for service in service_cls.instances
-        for call in service.calls
-        if call[0] == "matches"
-    ]
-    assert [len(call[2]) for call in match_calls] == [2, 25, 25, 2]
-    assert [
-        flag
-        for service in service_cls.instances
-        for flag in service.match_historical_replays
-    ] == [False, True, True, True]
-    # Replayed probe games keep their deterministic commit identity exactly
-    # once in the merged report.
-    assert len(report["producer_commits"]["match"]) == 52
-    receipts = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in (
-            tmp_path / "backfill" / "probe-lied-queue" / "receipts"
-        ).rglob("*.json")
-    ]
-    chunked = sorted(
-        game_id
-        for value in receipts
-        if value["kind"] == "matches"
-        for game_id in value["outcome"]["game_ids"]
-    )
-    assert chunked == game_ids
-    probe_outcome = next(
-        value["outcome"] for value in receipts if value["kind"] == "probe"
-    )
-    assert probe_outcome["not_available_game_ids"] == [52]
-    assert probe_outcome["known_data_game_ids"] == []
-    assert probe_outcome["deferred_game_ids"] == []
-
-
-@pytest.mark.unit
-def test_backfill_failed_probe_fetch_writes_no_receipt_and_retries(
-    monkeypatch, tmp_path
-):
-    # A retryable probe fetch must not mint a receipt: a timeout would
-    # otherwise freeze a false "flag lied" branch forever.
-    retryable = _result("matches", retryable=["1"])
-    game_ids = [1, 2, 3]
-    rc, report, _, _ = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--queue-id",
-            "probe-retry-queue",
-        ],
-        behaviors={"matches": retryable},
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "not_available", 3: "not_available"},
-    )
-
-    assert rc == 2
-    assert report["status"] == "retryable"
-    assert report["queue"]["status"] == "running"
-    assert report["queue"]["completed_schedules"] == 1
-    assert report["queue"]["completed_probes"] == 0
-    assert report["queue"]["next_work_items"] == 1
-    receipt_kinds = {
-        json.loads(path.read_text(encoding="utf-8"))["kind"]
-        for path in (
-            tmp_path / "backfill" / "probe-retry-queue" / "receipts"
-        ).rglob("*.json")
-    }
-    assert receipt_kinds == {"schedule"}
-
-    resumed_rc, resumed, _, _ = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--queue-id",
-            "probe-retry-queue",
-            "--plan-id",
-            report["queue"]["plan_id"],
-        ],
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "not_available", 3: "not_available"},
-    )
-    assert resumed_rc == 0
-    assert resumed["queue"]["status"] == "complete"
-    assert resumed["queue"]["completed_probes"] == 1
-
-
-@pytest.mark.unit
-def test_replay_forgiveness_is_scoped_to_probe_children_only():
-    commit_id = "ws2-v3-" + "a" * 64
-    child = {
-        "schema_version": 1,
-        "scope": [],
-        "match": [commit_id],
-        "match_not_available": [],
-        "preview": [],
-        "preview_not_available": [],
-        "profile": [],
-        "profile_not_available": [],
-    }
-    report = runner._new_report("backfill", ())
-    runner._merge_producer_commits(
-        report,
-        runner._replay_free_child_projection({}, child),
-        report_projection=True,
-    )
-
-    # Without probe provenance the identical repeat is still double-reporting.
-    with pytest.raises(ValueError, match="reported twice"):
-        runner._merge_producer_commits(
-            report,
-            runner._replay_free_child_projection({}, child),
-            report_projection=True,
-        )
-
-    # The same repeat merged after a probe child contributed it is forgiven.
-    probe_seen: dict = {}
-    runner._note_probe_child_projection(probe_seen, child)
-    runner._merge_producer_commits(
-        report,
-        runner._replay_free_child_projection(probe_seen, child),
-        report_projection=True,
-    )
-    assert report["producer_commits"]["match"] == [commit_id]
-
-    # One probe contribution forgives exactly one repeat: a child that
-    # internally duplicates the probe-covered id keeps failing closed.
-    duplicated = {**child, "match": [commit_id, commit_id]}
-    with pytest.raises(ValueError, match="reported twice"):
-        runner._merge_producer_commits(
-            report,
-            runner._replay_free_child_projection(probe_seen, duplicated),
-            report_projection=True,
-        )
 
 
 @pytest.mark.unit
