@@ -124,6 +124,8 @@ def _is_source_stage_statistics_unavailable(exc: WhoScoredTransportError) -> boo
 
 
 ACTIVE_SCHEDULE_CACHE_TTL = timedelta(hours=6)
+# #1474: season and stage-calendar pages are re-read once a week.
+WEEKLY_SCHEDULE_PAGE_CACHE_TTL = timedelta(days=7)
 MIN_INITIAL_CATALOG_TOURNAMENTS = 100
 DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE = 60
 MAX_STRUCTURED_REQUESTS_PER_MINUTE = 60
@@ -279,6 +281,23 @@ def _schedule_status(row: Mapping[str, Any]) -> Optional[int]:
         return int(row.get("status"))
     except (TypeError, ValueError):
         return None
+
+
+@dataclass(frozen=True)
+class _SeasonSchedule:
+    """Merged season schedule of one scope (see ``_collect_season_schedule``)."""
+
+    source_season_id: int
+    today: date
+    active: bool
+    stage_rows: list[dict[str, Any]]
+    schedule_by_id: dict[int, dict[str, Any]]
+    incident_by_key: dict[str, dict[str, Any]]
+    bet_by_key: dict[str, dict[str, Any]]
+    season_dataset_rows: dict[str, list[Mapping[str, Any]]]
+    season_dataset_statuses: dict[str, list[DatasetStatus]]
+    raw_uris: list[str]
+    payload_hashes: list[str]
 
 
 @dataclass(frozen=True)
@@ -2212,7 +2231,247 @@ class WhoScoredIngestService:
             lease_ttl_seconds=current.lease_ttl_seconds,
         )
 
+    def _collect_season_schedule(self) -> _SeasonSchedule:
+        """Fetch and merge one scope's season page, stage calendars and months.
+
+        Shared by ``sync_schedule`` (daily) and ``sync_stage_feeds`` (weekly):
+        the season page and calendars keep a weekly TTL, months the active TTL
+        only around the current month, so the second caller reads the raw
+        cache the first one just wrote.
+        """
+
+        # Validate the memory ceiling before any source request. A typo in
+        # production configuration must not consume network/proxy bytes
+        # and then fail only after every stage has been parsed.
+        scope_write_chunk_rows_from_env()
+        source_season_id = self._source_season_id()
+        today = date.today()
+        active = self._scope_is_active()
+        if (
+            self.competition.region_id is None
+            or self.competition.tournament_id is None
+        ):
+            raise RuntimeError(f"{self.scope.spec}: missing region/tournament ids")
+        season_target = stage_page_target(
+            self.scope,
+            region_id=self.competition.region_id,
+            tournament_id=self.competition.tournament_id,
+            source_season_id=source_season_id,
+        )
+
+        season_response, season_raw_uri, season_page = self._fetch_parsed(
+            season_target,
+            parser=lambda response: parse_season_page(
+                response.text,
+                scope=self.scope,
+                region_id=int(self.competition.region_id),
+                tournament_id=int(self.competition.tournament_id),
+                source_season_id=source_season_id,
+            ),
+            cache_ttl=WEEKLY_SCHEDULE_PAGE_CACHE_TTL if active else None,
+        )
+        raw_uris = [season_raw_uri]
+        payload_hashes = [season_response.sha256]
+        stage_rows = [dict(row) for row in season_page.stages.rows]
+        source_stage_ids = sorted({int(row["stage_id"]) for row in stage_rows})
+        expected_stage_ids = sorted(
+            {int(stage_id) for stage_id in self.catalog_season.stage_ids}
+        )
+        if source_stage_ids != expected_stage_ids:
+            raise WhoScoredParseError(
+                "source schedule stages differ from the frozen catalog: "
+                f"expected={expected_stage_ids}, observed={source_stage_ids}"
+            )
+        schedule_by_id: dict[int, dict[str, Any]] = {}
+        incident_by_key: dict[str, dict[str, Any]] = {}
+        bet_by_key: dict[str, dict[str, Any]] = {}
+        month_documents: list[_ScheduleMonthDocument] = []
+        season_dataset_rows: dict[str, list[Mapping[str, Any]]] = {
+            "standings": [],
+            "forms": [],
+            "streaks": [],
+            "performance": [],
+        }
+        season_dataset_statuses: dict[str, list[DatasetStatus]] = {
+            name: [] for name in season_dataset_rows
+        }
+        for stage in stage_rows:
+            stage_id = int(stage["stage_id"])
+            # Discovery and scope ingestion share one raw target.  Bind it
+            # to the same source-provided stage URL in both paths; using a
+            # constructed ``/Stages/{id}`` URL here while discovery used
+            # ``/Stages/{id}/Fixtures/{slug}`` made each workflow
+            # quarantine the other's otherwise valid manifest as a target
+            # mismatch and refetch the page direct.
+            calendar_url = urljoin(
+                "https://www.whoscored.com/",
+                str(
+                    stage.get("source_url")
+                    or (
+                        f"/Regions/{self.competition.region_id}"
+                        f"/Tournaments/{self.competition.tournament_id}"
+                        f"/Seasons/{source_season_id}/Stages/{stage_id}"
+                    )
+                ),
+            )
+            calendar_target = self._html_target(
+                page_kind="stage_calendar",
+                target_id=f"whoscored:calendar:{stage_id}",
+                url=calendar_url,
+                source_ids={"stage_id": str(stage_id)},
+            )
+
+            calendar_response, calendar_raw_uri, calendar_bundle = (
+                self._fetch_parsed(
+                    calendar_target,
+                    parser=lambda response: (
+                        parse_calendar_months(response.text),
+                        parse_season_tables(
+                            response.text,
+                            scope=self.scope,
+                            source_season_id=source_season_id,
+                        ),
+                    ),
+                    cache_ttl=WEEKLY_SCHEDULE_PAGE_CACHE_TTL if active else None,
+                )
+            )
+            months, stage_tables = calendar_bundle
+            for name, dataset in stage_tables.items():
+                season_dataset_rows[name].extend(dataset.rows)
+                season_dataset_statuses[name].append(dataset.status)
+            raw_uris.append(calendar_raw_uri)
+            payload_hashes.append(calendar_response.sha256)
+            for month in months:
+                month_target = schedule_month_target(
+                    stage_id, month.year, month.month
+                )
+                if month.month == 12:
+                    next_month = date(month.year + 1, 1, 1)
+                else:
+                    next_month = date(month.year, month.month + 1, 1)
+                # A month is immutable after a grace period for postponed
+                # games and corrections. Mutable months use the same short
+                # TTL, so retries are offline but changes arrive same-day.
+                closed_month = next_month + timedelta(days=7) <= today
+                # #1474: only the current month +/- 1 is re-read daily; a
+                # farther open month stays in the raw cache until it nears.
+                near_month = (
+                    abs(
+                        (month.year - today.year) * 12
+                        + month.month
+                        - today.month
+                    )
+                    <= 1
+                )
+
+                def month_parser(
+                    response: TransportResponse,
+                    current_stage: int = stage_id,
+                    stage_row: Mapping[str, Any] = stage,
+                ) -> ParsedDataset:
+                    return parse_schedule_json(
+                        response.content,
+                        scope=self.scope,
+                        stage_id=current_stage,
+                        stage=stage_row.get("stage_name") or stage_row.get("stage"),
+                    )
+
+                month_response, month_raw_uri, parsed = self._fetch_parsed(
+                    month_target,
+                    parser=month_parser,
+                    content_type="application/json",
+                    cache_ttl=(
+                        ACTIVE_SCHEDULE_CACHE_TTL
+                        if active and not closed_month and near_month
+                        else None
+                    ),
+                )
+                month_documents.append(
+                    _ScheduleMonthDocument.parse(
+                        target=month_target,
+                        parser=month_parser,
+                        month=month,
+                        closed=closed_month,
+                        raw_index=len(raw_uris),
+                        schedule=parsed,
+                    )
+                )
+                raw_uris.append(month_raw_uri)
+                payload_hashes.append(month_response.sha256)
+
+        # A postponed game can sit in a closed month cached without expiry
+        # while its new date appears in another month (#1059).  Such a
+        # closed month keeps the active TTL until the game is played.
+        if active:
+            owners = _schedule_game_owners(month_documents)
+            occurrences: dict[int, int] = {}
+            for document in month_documents:
+                for row in document.schedule.rows:
+                    game_id = int(row["game_id"])
+                    occurrences[game_id] = occurrences.get(game_id, 0) + 1
+            for index, document in enumerate(month_documents):
+                if not document.closed or not any(
+                    (
+                        _schedule_status(row) == SCHEDULE_STATUS_POSTPONED
+                        or occurrences[int(row["game_id"])] > 1
+                    )
+                    and _schedule_status(owners[int(row["game_id"])][1])
+                    != SCHEDULE_STATUS_PLAYED
+                    for row in document.schedule.rows
+                ):
+                    continue
+                month_response, month_raw_uri, parsed = self._fetch_parsed(
+                    document.target,
+                    parser=document.parser,
+                    content_type="application/json",
+                    cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL,
+                )
+                raw_uris[document.raw_index] = month_raw_uri
+                payload_hashes[document.raw_index] = month_response.sha256
+                month_documents[index] = _ScheduleMonthDocument.parse(
+                    target=document.target,
+                    parser=document.parser,
+                    month=document.month,
+                    closed=document.closed,
+                    raw_index=document.raw_index,
+                    schedule=parsed,
+                )
+
+        # One game can appear in two month documents (postponed/moved).
+        # Its schedule row, incidents and bets all come from the one
+        # document chosen by ``_schedule_game_owners``; a conflict inside
+        # one document is still rejected by ``parse_schedule_json``.
+        owners = _schedule_game_owners(month_documents)
+        for index, document in enumerate(month_documents):
+            for row in document.schedule.rows:
+                game_id = int(row["game_id"])
+                if owners[game_id][0] != index:
+                    continue
+                schedule_by_id[game_id] = dict(row)
+                for incident in document.incidents.get(game_id, ()):
+                    incident_by_key[str(incident["entity_key"])] = dict(incident)
+                for bet in document.bets.get(game_id, ()):
+                    bet_by_key[str(bet["entity_key"])] = dict(bet)
+
+        if not schedule_by_id:
+            raise WhoScoredParseError("season schedule contains no matches")
+
+        return _SeasonSchedule(
+            source_season_id=source_season_id,
+            today=today,
+            active=active,
+            stage_rows=stage_rows,
+            schedule_by_id=schedule_by_id,
+            incident_by_key=incident_by_key,
+            bet_by_key=bet_by_key,
+            season_dataset_rows=season_dataset_rows,
+            season_dataset_statuses=season_dataset_statuses,
+            raw_uris=raw_uris,
+            payload_hashes=payload_hashes,
+        )
+
     def sync_schedule(self) -> EntityResult:
+        """Daily: season schedule, incidents, bets and season tables."""
         result = EntityResult(
             "schedule",
             self.scope.spec,
@@ -2220,220 +2479,25 @@ class WhoScoredIngestService:
             committed_batches={"scope": []},
         )
         self._bound_paid_fallback(2)
-        scope_spools: list[WhoScoredScopeRowSpool] = []
         try:
-            # Validate the memory ceiling before any source request. A typo in
-            # production configuration must not consume network/proxy bytes
-            # and then fail only after every stage has been parsed.
-            scope_write_chunk_rows_from_env()
-            source_season_id = self._source_season_id()
-            today = date.today()
-            active = self._scope_is_active()
-            if (
-                self.competition.region_id is None
-                or self.competition.tournament_id is None
-            ):
-                raise RuntimeError(f"{self.scope.spec}: missing region/tournament ids")
-            season_target = stage_page_target(
-                self.scope,
-                region_id=self.competition.region_id,
-                tournament_id=self.competition.tournament_id,
-                source_season_id=source_season_id,
-            )
-
-            season_response, season_raw_uri, season_page = self._fetch_parsed(
-                season_target,
-                parser=lambda response: parse_season_page(
-                    response.text,
-                    scope=self.scope,
-                    region_id=int(self.competition.region_id),
-                    tournament_id=int(self.competition.tournament_id),
-                    source_season_id=source_season_id,
-                ),
-                cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL if active else None,
-            )
-            raw_uris = [season_raw_uri]
-            payload_hashes = [season_response.sha256]
-            stage_rows = [dict(row) for row in season_page.stages.rows]
-            source_stage_ids = sorted({int(row["stage_id"]) for row in stage_rows})
+            collected = self._collect_season_schedule()
             result.metadata.update(
                 {
-                    "source_stage_ids": source_stage_ids,
-                    "source_stage_count": len(source_stage_ids),
+                    "source_stage_ids": sorted(
+                        {int(row["stage_id"]) for row in collected.stage_rows}
+                    ),
+                    "source_stage_count": len(
+                        {int(row["stage_id"]) for row in collected.stage_rows}
+                    ),
                 }
             )
-            expected_stage_ids = sorted(
-                {int(stage_id) for stage_id in self.catalog_season.stage_ids}
-            )
-            if source_stage_ids != expected_stage_ids:
-                raise WhoScoredParseError(
-                    "source schedule stages differ from the frozen catalog: "
-                    f"expected={expected_stage_ids}, observed={source_stage_ids}"
-                )
-            schedule_by_id: dict[int, dict[str, Any]] = {}
-            incident_by_key: dict[str, dict[str, Any]] = {}
-            bet_by_key: dict[str, dict[str, Any]] = {}
-            month_documents: list[_ScheduleMonthDocument] = []
-            season_dataset_rows: dict[str, list[Mapping[str, Any]]] = {
-                "standings": [],
-                "forms": [],
-                "streaks": [],
-                "performance": [],
-            }
-            season_dataset_statuses: dict[str, list[DatasetStatus]] = {
-                name: [] for name in season_dataset_rows
-            }
-            for stage in stage_rows:
-                stage_id = int(stage["stage_id"])
-                # Discovery and scope ingestion share one raw target.  Bind it
-                # to the same source-provided stage URL in both paths; using a
-                # constructed ``/Stages/{id}`` URL here while discovery used
-                # ``/Stages/{id}/Fixtures/{slug}`` made each workflow
-                # quarantine the other's otherwise valid manifest as a target
-                # mismatch and refetch the page direct.
-                calendar_url = urljoin(
-                    "https://www.whoscored.com/",
-                    str(
-                        stage.get("source_url")
-                        or (
-                            f"/Regions/{self.competition.region_id}"
-                            f"/Tournaments/{self.competition.tournament_id}"
-                            f"/Seasons/{source_season_id}/Stages/{stage_id}"
-                        )
-                    ),
-                )
-                calendar_target = self._html_target(
-                    page_kind="stage_calendar",
-                    target_id=f"whoscored:calendar:{stage_id}",
-                    url=calendar_url,
-                    source_ids={"stage_id": str(stage_id)},
-                )
-
-                calendar_response, calendar_raw_uri, calendar_bundle = (
-                    self._fetch_parsed(
-                        calendar_target,
-                        parser=lambda response: (
-                            parse_calendar_months(response.text),
-                            parse_season_tables(
-                                response.text,
-                                scope=self.scope,
-                                source_season_id=source_season_id,
-                            ),
-                        ),
-                        cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL if active else None,
-                    )
-                )
-                months, stage_tables = calendar_bundle
-                for name, dataset in stage_tables.items():
-                    season_dataset_rows[name].extend(dataset.rows)
-                    season_dataset_statuses[name].append(dataset.status)
-                raw_uris.append(calendar_raw_uri)
-                payload_hashes.append(calendar_response.sha256)
-                for month in months:
-                    month_target = schedule_month_target(
-                        stage_id, month.year, month.month
-                    )
-                    if month.month == 12:
-                        next_month = date(month.year + 1, 1, 1)
-                    else:
-                        next_month = date(month.year, month.month + 1, 1)
-                    # A month is immutable after a grace period for postponed
-                    # games and corrections. Mutable months use the same short
-                    # TTL, so retries are offline but changes arrive same-day.
-                    closed_month = next_month + timedelta(days=7) <= today
-
-                    def month_parser(
-                        response: TransportResponse,
-                        current_stage: int = stage_id,
-                        stage_row: Mapping[str, Any] = stage,
-                    ) -> ParsedDataset:
-                        return parse_schedule_json(
-                            response.content,
-                            scope=self.scope,
-                            stage_id=current_stage,
-                            stage=stage_row.get("stage_name") or stage_row.get("stage"),
-                        )
-
-                    month_response, month_raw_uri, parsed = self._fetch_parsed(
-                        month_target,
-                        parser=month_parser,
-                        content_type="application/json",
-                        cache_ttl=(
-                            ACTIVE_SCHEDULE_CACHE_TTL
-                            if active and not closed_month
-                            else None
-                        ),
-                    )
-                    month_documents.append(
-                        _ScheduleMonthDocument.parse(
-                            target=month_target,
-                            parser=month_parser,
-                            month=month,
-                            closed=closed_month,
-                            raw_index=len(raw_uris),
-                            schedule=parsed,
-                        )
-                    )
-                    raw_uris.append(month_raw_uri)
-                    payload_hashes.append(month_response.sha256)
-
-            # A postponed game can sit in a closed month cached without expiry
-            # while its new date appears in another month (#1059).  Such a
-            # closed month keeps the active TTL until the game is played.
-            if active:
-                owners = _schedule_game_owners(month_documents)
-                occurrences: dict[int, int] = {}
-                for document in month_documents:
-                    for row in document.schedule.rows:
-                        game_id = int(row["game_id"])
-                        occurrences[game_id] = occurrences.get(game_id, 0) + 1
-                for index, document in enumerate(month_documents):
-                    if not document.closed or not any(
-                        (
-                            _schedule_status(row) == SCHEDULE_STATUS_POSTPONED
-                            or occurrences[int(row["game_id"])] > 1
-                        )
-                        and _schedule_status(owners[int(row["game_id"])][1])
-                        != SCHEDULE_STATUS_PLAYED
-                        for row in document.schedule.rows
-                    ):
-                        continue
-                    month_response, month_raw_uri, parsed = self._fetch_parsed(
-                        document.target,
-                        parser=document.parser,
-                        content_type="application/json",
-                        cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL,
-                    )
-                    raw_uris[document.raw_index] = month_raw_uri
-                    payload_hashes[document.raw_index] = month_response.sha256
-                    month_documents[index] = _ScheduleMonthDocument.parse(
-                        target=document.target,
-                        parser=document.parser,
-                        month=document.month,
-                        closed=document.closed,
-                        raw_index=document.raw_index,
-                        schedule=parsed,
-                    )
-
-            # One game can appear in two month documents (postponed/moved).
-            # Its schedule row, incidents and bets all come from the one
-            # document chosen by ``_schedule_game_owners``; a conflict inside
-            # one document is still rejected by ``parse_schedule_json``.
-            owners = _schedule_game_owners(month_documents)
-            for index, document in enumerate(month_documents):
-                for row in document.schedule.rows:
-                    game_id = int(row["game_id"])
-                    if owners[game_id][0] != index:
-                        continue
-                    schedule_by_id[game_id] = dict(row)
-                    for incident in document.incidents.get(game_id, ()):
-                        incident_by_key[str(incident["entity_key"])] = dict(incident)
-                    for bet in document.bets.get(game_id, ()):
-                        bet_by_key[str(bet["entity_key"])] = dict(bet)
-
-            if not schedule_by_id:
-                raise WhoScoredParseError("season schedule contains no matches")
-
+            schedule_by_id = collected.schedule_by_id
+            incident_by_key = collected.incident_by_key
+            bet_by_key = collected.bet_by_key
+            season_dataset_rows = collected.season_dataset_rows
+            season_dataset_statuses = collected.season_dataset_statuses
+            raw_uris = list(collected.raw_uris)
+            payload_hashes = list(collected.payload_hashes)
             datasets: dict[str, Sequence[Mapping[str, Any]]] = {
                 "whoscored_schedule": list(schedule_by_id.values()),
                 "whoscored_match_incidents": list(incident_by_key.values()),
@@ -2468,6 +2532,71 @@ class WhoScoredIngestService:
                 else:
                     source_unavailable.add(table)
 
+            combined_hash = hashlib.sha256(
+                json.dumps(sorted(payload_hashes), separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            scope_batch_id = self.repository.commit_scope_bundle(
+                league=self.scope.competition_id,
+                season=self.scope.season_id,
+                entity_group="season",
+                datasets=datasets,
+                distinct_keys=distinct_keys,
+                payload_sha256=combined_hash,
+                raw_uris=raw_uris,
+                source_empty=source_empty,
+                source_unavailable=source_unavailable,
+            )
+            result.committed_batches["scope"].append(str(scope_batch_id))
+            result.succeeded = 1
+            for table, rows in datasets.items():
+                result.counts[table.removeprefix("whoscored_")] = len(rows)
+                result.tables.append(f"iceberg.bronze.{table}")
+        except Exception as exc:
+            result.errors.append(f"schedule: {type(exc).__name__}: {exc}")
+        return result
+
+    def sync_stage_feeds(self) -> EntityResult:
+        """Weekly: team/player/referee stage statistics feeds (#1474).
+
+        Published as their own scope bundle (``entity_group="stages"``) so a
+        failing feed never blocks the daily schedule and match ingestion.
+        """
+        result = EntityResult(
+            "stages",
+            self.scope.spec,
+            attempted=1,
+            committed_batches={"scope": []},
+        )
+        self._bound_paid_fallback(2)
+        scope_spools: list[WhoScoredScopeRowSpool] = []
+        try:
+            collected = self._collect_season_schedule()
+            result.metadata.update(
+                {
+                    "source_stage_ids": sorted(
+                        {int(row["stage_id"]) for row in collected.stage_rows}
+                    ),
+                    "source_stage_count": len(
+                        {int(row["stage_id"]) for row in collected.stage_rows}
+                    ),
+                }
+            )
+            source_season_id = collected.source_season_id
+            today = collected.today
+            active = collected.active
+            stage_rows = collected.stage_rows
+            schedule_by_id = collected.schedule_by_id
+            # The season page anchors the raw identity even when every feed
+            # of the scope is unavailable at the source.
+            raw_uris = [collected.raw_uris[0]]
+            payload_hashes = [collected.payload_hashes[0]]
+            datasets: dict[str, Sequence[Mapping[str, Any]]] = {}
+            distinct_keys: dict[str, str] = {}
+            source_empty: set[str] = set()
+            source_unavailable: set[str] = set()
+            feed_states: dict[str, str] = {}
             # Team/player feeds expose one JSON table per UI tab. Team paging
             # must mirror the browser's empty defaults; the player endpoint
             # accepts one bounded page above any plausible stage population.
@@ -2486,7 +2615,6 @@ class WhoScoredIngestService:
                 # Register each resource immediately so a later constructor
                 # failure still closes every already-open SQLite file.
                 scope_spools.append(spool)
-            feed_states: dict[str, str] = {}
             for stage in stage_rows:
                 stage_id = int(stage["stage_id"])
                 stage_kickoffs = [
@@ -2806,7 +2934,7 @@ class WhoScoredIngestService:
             scope_batch_id = self.repository.commit_scope_bundle(
                 league=self.scope.competition_id,
                 season=self.scope.season_id,
-                entity_group="season",
+                entity_group="stages",
                 datasets=datasets,
                 distinct_keys=distinct_keys,
                 payload_sha256=combined_hash,
@@ -2821,7 +2949,7 @@ class WhoScoredIngestService:
                 result.counts[table.removeprefix("whoscored_")] = len(rows)
                 result.tables.append(f"iceberg.bronze.{table}")
         except Exception as exc:
-            result.errors.append(f"schedule: {type(exc).__name__}: {exc}")
+            result.errors.append(f"stages: {type(exc).__name__}: {exc}")
         finally:
             for spool in scope_spools:
                 spool.close()
@@ -2834,7 +2962,6 @@ class WhoScoredIngestService:
         limit: Optional[int] = None,
         force_replay: bool = False,
         historical_replay: bool = False,
-        kickoff_from: Optional[datetime] = None,
     ) -> EntityResult:
         result = EntityResult(
             "matches",
@@ -2848,7 +2975,6 @@ class WhoScoredIngestService:
             match_ids=match_ids,
             limit=limit,
             include_success=force_replay,
-            kickoff_from=kickoff_from,
             include_exact_count=True,
         )
         result.attempted = len(candidates)

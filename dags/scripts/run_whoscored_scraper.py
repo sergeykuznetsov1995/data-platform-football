@@ -88,6 +88,16 @@ logger = logging.getLogger(__name__)
 
 
 REPORT_SCHEMA_VERSION = 3
+# Per-scope cap of the daily match run: a duration guard only (#1474).  The
+# largest denominator backlog on 26.09.2026 was 264 (MLS 2026), 1 350 in all.
+DAILY_MATCH_LIMIT_PER_SCOPE = 300
+# Weekly work (catalog discovery, stage feeds) runs only in the Monday morning
+# run of the twice-daily DAG (10:00 and 22:00 UTC, #1474).  The gate judges the
+# run slot the DAG passes (data_interval_end), not the wall clock: ingest_stages
+# starts only after ingest_matches, hours after the slot.
+WEEKLY_GATE_WEEKDAY = 0
+WEEKLY_GATE_BEFORE_HOUR_UTC = 12
+DAILY_PARTS = ("matches", "stages")
 PUBLIC_COMMANDS = ("discover", "daily", "backfill", "replay")
 COMMANDS = PUBLIC_COMMANDS
 DEFAULT_BACKFILL_CHUNK_SIZE = 25
@@ -187,6 +197,18 @@ class RunnerScope:
 
 def _utc_now_iso() -> str:
     return datetime_lib.datetime.now(datetime_lib.timezone.utc).isoformat()
+
+
+def _parse_run_slot(value: str) -> datetime_lib.datetime:
+    try:
+        slot = datetime_lib.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"run slot must be an ISO-8601 datetime, got {value!r}"
+        ) from exc
+    if slot.tzinfo is None:
+        slot = slot.replace(tzinfo=datetime_lib.timezone.utc)
+    return slot.astimezone(datetime_lib.timezone.utc)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -311,6 +333,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SHA-256 of the exact due-profile player-id set",
     )
     parser.add_argument("--max-matches", type=int, default=None)
+    parser.add_argument(
+        "--daily-part",
+        choices=DAILY_PARTS,
+        default="matches",
+        help=(
+            "daily only: 'matches' = schedule, previews and matches; "
+            "'stages' = weekly stage statistics feeds"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-gate",
+        metavar="RUN_SLOT",
+        type=_parse_run_slot,
+        default=None,
+        help=(
+            "discover / daily --daily-part stages: ISO-8601 run slot; work "
+            "runs only for the Monday morning slot (UTC), otherwise the "
+            "runner exits successfully without work"
+        ),
+    )
     parser.add_argument("--output", default="/tmp/whoscored_result.json")
     return parser
 
@@ -549,6 +591,17 @@ def _validate_args(
         parser.error("--skip-profiles/--profiles-only are valid only for daily")
     if args.skip_profiles and args.profiles_only:
         parser.error("--skip-profiles and --profiles-only are mutually exclusive")
+    if args.daily_part == "stages" and (
+        args.command != "daily" or not args.skip_profiles
+    ):
+        parser.error("--daily-part stages is valid only for daily --skip-profiles")
+    if args.weekly_gate is not None and not (
+        args.command == "discover"
+        or (args.command == "daily" and args.daily_part == "stages")
+    ):
+        parser.error(
+            "--weekly-gate is valid only for discover or daily --daily-part stages"
+        )
     if args.full_history and args.command not in {"discover", "backfill"}:
         parser.error("--full-history is valid only for discover or backfill")
     if args.catalog_batch_id:
@@ -1003,14 +1056,38 @@ def _persisted_scope_index(
 
 
 def resolve_daily_scope_specs() -> list[str]:
-    """Public DAG helper: return deterministic active persisted scopes.
+    """Public DAG helper: return the deterministic daily denominator scopes.
 
     This function is intentionally called by an Airflow *task*, never while a
     DAG file is imported.  A missing catalog therefore produces a visible task
     failure instead of an Airflow import error or a silent six-league fallback.
     """
     repository = _new_repository()
-    return sorted(_persisted_scope_index(repository, active_only=True))
+    _generation, catalog = repository.load_catalog_generation_snapshot()
+    return [scope.spec for scope, _runtime in _select_denominator_scopes(catalog)]
+
+
+def _select_denominator_scopes(catalog: Any) -> list[tuple[RunnerScope, Any]]:
+    """Daily scopes = explicit denominator + probe scopes (#1474).
+
+    The catalog keeps every eligible scope (``active_scopes`` is untouched);
+    only the daily selection narrows to the class-A tournaments (current and
+    just finished season) and the scopes still being probed.
+    """
+    from scrapers.whoscored.catalog import (
+        denominator_scopes,
+        missing_probe_specs,
+    )
+
+    missing = missing_probe_specs(catalog)
+    if missing:
+        logger.warning(
+            "WhoScored probe scopes absent from the catalog: %s", ", ".join(missing)
+        )
+    selected = [(_scope_value(value), value) for value in denominator_scopes(catalog)]
+    if not selected:
+        raise RuntimeError("WhoScored denominator selected no catalog scopes")
+    return selected
 
 
 def _select_persisted_scopes(
@@ -1225,52 +1302,6 @@ def _table_for_entity(entity: str, tables: Sequence[str]) -> Optional[str]:
         (table for table in tables if table.rsplit(".", 1)[-1] == expected),
         None,
     )
-
-
-def _replay_free_child_projection(
-    probe_seen: Mapping[str, Any],
-    child_value: Any,
-) -> Any:
-    """Drop child entries byte-identical to an earlier probe contribution.
-
-    A probe work item and the match chunk that later covers the same frozen
-    game_ids replay identical immutable raw payloads, so their deterministic
-    commit ids and attempted snapshots repeat exactly.  Only that probe
-    provenance is forgiven: ``probe_seen`` accumulates probe children alone,
-    so for every other work-item pairing a repeated identity still fails
-    closed in the strict merge below.
-    """
-
-    if not isinstance(child_value, Mapping) or not probe_seen:
-        return child_value
-    projected: dict[str, Any] = {}
-    for key, value in child_value.items():
-        if not isinstance(value, list):
-            projected[key] = value
-            continue
-        # Multiset removal: one probe contribution forgives exactly one
-        # repeat, so a child's own internal duplicate survives the filter
-        # and still fails closed in the strict merge below.
-        remaining = list(probe_seen.get(key, []))
-        kept: list[Any] = []
-        for item in value:
-            if item in remaining:
-                remaining.remove(item)
-            else:
-                kept.append(item)
-        projected[key] = kept
-    return projected
-
-
-def _note_probe_child_projection(
-    probe_seen: dict[str, list[Any]],
-    child_value: Any,
-) -> None:
-    if not isinstance(child_value, Mapping):
-        return
-    for key, value in child_value.items():
-        if isinstance(value, list):
-            probe_seen.setdefault(key, []).extend(value)
 
 
 def _merge_producer_commits(
@@ -1495,10 +1526,19 @@ def _paid_proxy_bytes(traffic: Mapping[str, Any]) -> int:
     return 0
 
 
-def _operations(command: str) -> tuple[str, ...]:
+def _operations(command: str, daily_part: str = "matches") -> tuple[str, ...]:
     if command == "daily":
+        if daily_part == "stages":
+            return ("stages",)
         return ("schedule", "previews", "matches")
     raise AssertionError(f"workflow {command!r} has no implicit entity sequence")
+
+
+def _weekly_gate_open(slot: datetime_lib.datetime) -> bool:
+    return (
+        slot.weekday() == WEEKLY_GATE_WEEKDAY
+        and slot.hour < WEEKLY_GATE_BEFORE_HOUR_UTC
+    )
 
 
 def _invoke(
@@ -1511,6 +1551,8 @@ def _invoke(
 ) -> Any:
     if operation == "schedule":
         return service.sync_schedule()
+    if operation == "stages":
+        return service.sync_stage_feeds()
     if operation == "previews":
         preview_ids = getattr(
             args,
@@ -1531,17 +1573,11 @@ def _invoke(
             "limit": (
                 args.max_matches
                 if args.max_matches is not None
-                else 100
+                else DAILY_MATCH_LIMIT_PER_SCOPE
                 if daily_incremental
                 else None
             ),
             "force_replay": bool(getattr(args, "_force_replay", False)),
-            "kickoff_from": (
-                datetime_lib.datetime.now(datetime_lib.timezone.utc)
-                - datetime_lib.timedelta(days=7)
-                if daily_incremental
-                else None
-            ),
         }
         if bool(getattr(args, "_historical_replay", False)):
             match_kwargs["historical_replay"] = True
@@ -2045,6 +2081,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scopes = _validate_args(parser, args)
     report = _new_report(args.command, scopes)
     _bind_report_transport_identity(report, args)
+    if args.weekly_gate is not None and not _weekly_gate_open(args.weekly_gate):
+        logger.info(
+            "WhoScored %s: weekly gate closed for run slot %s (runs for the "
+            "Monday slot before %02d:00 UTC); no work this run",
+            args.command,
+            args.weekly_gate.isoformat(),
+            WEEKLY_GATE_BEFORE_HOUR_UTC,
+        )
+        return _finish(report, args.output)
 
     try:
         _configure_transport_environment(args)
@@ -2185,19 +2230,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         batch_id=str(args.catalog_batch_id)
                     )
                 )
-                selected = _select_catalog_snapshot_scopes(
-                    catalog_snapshot,
-                    scopes,
-                    active_only=True,
+                selected = (
+                    _select_catalog_snapshot_scopes(
+                        catalog_snapshot,
+                        scopes,
+                        active_only=True,
+                    )
+                    if scopes
+                    else _select_denominator_scopes(catalog_snapshot)
                 )
             else:
                 catalog_generation, catalog_snapshot = (
                     repository.load_catalog_generation_snapshot()
                 )
-                selected = _select_catalog_snapshot_scopes(
-                    catalog_snapshot,
-                    scopes,
-                    active_only=(args.command == "daily"),
+                selected = (
+                    _select_denominator_scopes(catalog_snapshot)
+                    if args.command == "daily" and not scopes
+                    else _select_catalog_snapshot_scopes(
+                        catalog_snapshot,
+                        scopes,
+                        active_only=(args.command == "daily"),
+                    )
                 )
         except Exception as exc:
             if scopes:
@@ -2296,7 +2349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     repository=repository,
                     report=report,
                     args=args,
-                    operations=_operations("daily"),
+                    operations=_operations("daily", args.daily_part),
                 )
                 try:
                     _validate_scheduled_scope_attempts(report, args)
@@ -2426,8 +2479,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             plan_id = str(plan["plan_id"])
             work_count = 0
             output_dir = Path(args.output).parent
-            probe_commit_replays: dict[str, list[Any]] = {}
-            probe_attempt_replays: dict[str, list[Any]] = {}
             while work_count < int(args.max_work_items):
                 batch_id = f"cli-{report['run_id']}-{work_count:06d}"
                 batch = state.create_batch(
@@ -2475,29 +2526,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
                     _merge_producer_commits(
                         report,
-                        _replay_free_child_projection(
-                            probe_commit_replays,
-                            child.get("producer_commits"),
-                        ),
+                        child.get("producer_commits"),
                         report_projection=True,
                     )
                     _merge_producer_attempts(
                         report,
-                        _replay_free_child_projection(
-                            probe_attempt_replays,
-                            child.get("producer_attempts"),
-                        ),
+                        child.get("producer_attempts"),
                         report_projection=True,
                     )
-                    if str(item["kind"]) == "probe":
-                        _note_probe_child_projection(
-                            probe_commit_replays,
-                            child.get("producer_commits"),
-                        )
-                        _note_probe_child_projection(
-                            probe_attempt_replays,
-                            child.get("producer_attempts"),
-                        )
                     child_traffic = child.get("traffic")
                     if isinstance(child_traffic, Mapping):
                         _merge_traffic(report["traffic"], child_traffic)

@@ -83,6 +83,13 @@ DEFAULT_RESULTS = {
             "iceberg.bronze.whoscored_match_ingest_manifest",
         ],
     ),
+    "stages": _result(
+        "stages",
+        counts={"team_stage_stats": 1},
+        tables=["iceberg.bronze.whoscored_team_stage_stats"],
+        metadata={"source_stage_ids": [23752], "source_stage_count": 1},
+        committed_batches={"scope": ["wss2-" + "2" * 64]},
+    ),
     "profiles": _result(
         "profiles",
         counts={"player_profile": 1},
@@ -121,13 +128,25 @@ class _Catalog:
         except KeyError as exc:
             raise ValueError(f"unknown scope {competition_id}={season_id}") from exc
 
+    _TOURNAMENT_IDS = {"ENG-Premier League": 2, "INT-World Cup": 36}
+
     def competition(self, competition_id):
         if not any(key[0] == competition_id for key in self._scopes):
             raise ValueError(f"unknown competition {competition_id}")
-        return SimpleNamespace(whoscored_enabled=True)
+        return SimpleNamespace(
+            whoscored_enabled=True,
+            tournament_id=self._TOURNAMENT_IDS.get(competition_id),
+        )
 
     def eligible_scopes(self, *, active_only):
         del active_only
+        return list(self._scopes.values())
+
+    def enabled_scopes(self):
+        return list(self._scopes.values())
+
+    def active_scopes(self, *, on=None):
+        del on
         return list(self._scopes.values())
 
 
@@ -137,13 +156,11 @@ class _Repository:
         catalog,
         candidate_ids=None,
         profile_candidate_ids=None,
-        non_opta_ids=None,
         ingest_states=None,
     ):
         self.catalog = catalog
         self.candidate_ids = list(candidate_ids or [])
         self.profile_candidate_ids = sorted(set(profile_candidate_ids or []))
-        self.non_opta_ids = set(non_opta_ids or [])
         self.ingest_states = dict(ingest_states or {})
         self.catalog_calls = []
         self.all_completed_calls = []
@@ -176,7 +193,7 @@ class _Repository:
             SimpleNamespace(
                 game_id=value,
                 kickoff=__import__("datetime").datetime(2025, 8, 1),
-                match_is_opta=value not in self.non_opta_ids,
+                match_is_opta=True,
             )
             for value in ids
         ]
@@ -254,7 +271,6 @@ def _runtime(
     *,
     candidate_ids=None,
     profile_candidate_ids=None,
-    non_opta_ids=None,
     ingest_states=None,
 ):
     catalog = _Catalog()
@@ -262,7 +278,6 @@ def _runtime(
         catalog,
         candidate_ids=candidate_ids,
         profile_candidate_ids=profile_candidate_ids,
-        non_opta_ids=non_opta_ids,
         ingest_states=ingest_states,
     )
     configured = dict(behaviors or {})
@@ -340,6 +355,16 @@ def _runtime(
                 result.committed_batches = {"scope": ["wss2-" + digest]}
             return result
 
+        def sync_stage_feeds(self):
+            self.calls.append(("stages", None))
+            result = SimpleNamespace(**vars(self._value("stages")))
+            if "stages" not in configured:
+                digest = hashlib.sha256(
+                    f"stages\0{self._scope_spec()}".encode("utf-8")
+                ).hexdigest()
+                result.committed_batches = {"scope": ["wss2-" + digest]}
+            return result
+
         def sync_previews(self, *, match_ids, force_replay):
             self.preview_force_replays.append(bool(force_replay))
             self.calls.append(("previews", None))
@@ -376,14 +401,11 @@ def _runtime(
             limit,
             force_replay,
             historical_replay=False,
-            kickoff_from=None,
         ):
             self.match_force_replays.append(bool(force_replay))
             self.match_historical_replays.append(bool(historical_replay))
             if historical_replay:
                 assert force_replay is True
-            if kickoff_from is not None:
-                assert kickoff_from.tzinfo is not None
             call = ("matches", limit)
             if match_ids is not None:
                 call = (*call, tuple(match_ids))
@@ -458,7 +480,6 @@ def _run(
     behaviors=None,
     candidate_ids=None,
     profile_candidate_ids=None,
-    non_opta_ids=None,
     ingest_states=None,
 ):
     monkeypatch.delenv("WHOSCORED_SCHEMA_READY", raising=False)
@@ -467,7 +488,6 @@ def _run(
         behaviors,
         candidate_ids=candidate_ids,
         profile_candidate_ids=profile_candidate_ids,
-        non_opta_ids=non_opta_ids,
         ingest_states=ingest_states,
     )
     monkeypatch.setattr(runner, "_load_runtime", lambda: runtime)
@@ -707,7 +727,7 @@ def test_non_mapped_airflow_task_reports_map_index_minus_one(monkeypatch, tmp_pa
     # report must still carry a valid attempt identity (#1471).
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_whoscored")
     monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "manual__1471")
-    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_daily")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_matches")
     monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
     monkeypatch.delenv("AIRFLOW_CTX_MAP_INDEX", raising=False)
 
@@ -869,7 +889,7 @@ def test_daily_runs_each_v2_entity_once_in_order(monkeypatch, tmp_path):
     assert service_cls.instances[0].calls == [
         ("schedule", None),
         ("previews", None),
-        ("matches", 100),
+        ("matches", runner.DAILY_MATCH_LIMIT_PER_SCOPE),
     ]
     assert report["rows"] == 4
     assert report["scopes"][0]["entities"]["missing_players"]["rows_written"] == 0
@@ -1149,7 +1169,7 @@ def test_explicit_discovery_can_expand_the_historical_stage_catalog(
 
 
 @pytest.mark.unit
-def test_daily_without_scope_reads_all_active_persisted_scopes(monkeypatch, tmp_path):
+def test_daily_without_scope_reads_the_denominator_scopes(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner._WHOSCORED_RUNTIME_CONTRACT,
         "validate_runtime_contract",
@@ -1173,10 +1193,155 @@ def test_daily_without_scope_reads_all_active_persisted_scopes(monkeypatch, tmp_
         == [
             ("schedule", None),
             ("previews", None),
-            ("matches", 100),
+            ("matches", runner.DAILY_MATCH_LIMIT_PER_SCOPE),
         ]
         for service in service_cls.instances
     )
+
+
+@pytest.mark.unit
+def test_daily_without_scope_skips_scopes_outside_the_denominator(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        _Catalog,
+        "_TOURNAMENT_IDS",
+        {"ENG-Premier League": 2, "INT-World Cup": 999},
+    )
+
+    rc, report, service_cls, _catalog = _run(
+        monkeypatch,
+        tmp_path,
+        ["daily", "--skip-profiles"],
+    )
+
+    assert rc == 0
+    assert [item["scope"] for item in report["scopes"]] == ["ENG-Premier League=2526"]
+    assert len(service_cls.instances) == 1
+
+
+MONDAY_MORNING_SLOT = "2026-09-28T10:00:00+00:00"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("slot", "is_open"),
+    [
+        (MONDAY_MORNING_SLOT, True),
+        ("2026-09-28T13:00:00+03:00", True),
+        ("2026-09-28T10:00:00", True),
+        ("2026-09-28T22:00:00+00:00", False),
+        ("2026-09-27T22:00:00+00:00", False),
+        ("2026-09-29T10:00:00+00:00", False),
+    ],
+)
+def test_weekly_gate_opens_only_for_the_monday_morning_slot(slot, is_open):
+    assert runner._weekly_gate_open(runner._parse_run_slot(slot)) is is_open
+
+
+@pytest.mark.unit
+def test_weekly_gate_closed_short_circuits_discover(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "discover",
+            "--as-of-date",
+            "2026-09-28",
+            "--weekly-gate",
+            "2026-09-28T22:00:00+00:00",
+        ],
+    )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert report["scopes"] == []
+    assert service_cls.discovery_calls == []
+
+
+@pytest.mark.unit
+def test_weekly_gate_open_runs_discover(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "discover",
+            "--as-of-date",
+            "2026-09-27",
+            "--weekly-gate",
+            MONDAY_MORNING_SLOT,
+        ],
+    )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert len(service_cls.discovery_calls) == 1
+
+
+@pytest.mark.unit
+def test_daily_stages_part_runs_only_the_stage_feeds(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--daily-part",
+            "stages",
+            "--skip-profiles",
+            "--weekly-gate",
+            MONDAY_MORNING_SLOT,
+        ],
+    )
+
+    assert rc == 0, report
+    assert report["status"] == "success"
+    assert [item["scope"] for item in report["scopes"]] == [
+        "ENG-Premier League=2526",
+        "INT-World Cup=2026",
+    ]
+    assert all(
+        service.calls == [("stages", None)] for service in service_cls.instances
+    )
+
+
+@pytest.mark.unit
+def test_daily_stages_part_is_skipped_outside_the_weekly_slot(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--daily-part",
+            "stages",
+            "--skip-profiles",
+            "--weekly-gate",
+            "2026-09-29T10:00:00+00:00",
+        ],
+    )
+
+    assert rc == 0
+    assert report["status"] == "success"
+    assert report["scopes"] == []
+    assert service_cls.instances == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["daily", "--daily-part", "stages"],
+        ["daily", "--daily-part", "stages", "--profiles-only"],
+        ["discover", "--daily-part", "stages"],
+        ["daily", "--skip-profiles", "--weekly-gate", MONDAY_MORNING_SLOT],
+        ["backfill", "--weekly-gate", MONDAY_MORNING_SLOT],
+        ["discover", "--weekly-gate", "monday"],
+    ],
+)
+def test_daily_part_and_weekly_gate_are_rejected_outside_their_commands(argv):
+    parser = runner._build_parser()
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(argv)
+        runner._validate_args(parser, args)
 
 
 @pytest.mark.unit
@@ -1401,252 +1566,6 @@ def test_backfill_freezes_s3_plan_and_receipts_for_25_match_chunks(
     assert len(list((root / "receipts").rglob("*.json"))) == 6
     assert len(list((root / "checkpoints").rglob("*.json"))) == 5
     assert len(list((root / "batches").rglob("*.json"))) == 4
-
-
-@pytest.mark.unit
-def test_backfill_probes_all_non_opta_scope_and_defers_the_rest(
-    monkeypatch, tmp_path
-):
-    game_ids = list(range(1, 53))
-    noted_projections = []
-    original_note = runner._note_probe_child_projection
-
-    def _spy_note(probe_seen, child_value):
-        noted_projections.append(child_value)
-        return original_note(probe_seen, child_value)
-
-    monkeypatch.setattr(runner, "_note_probe_child_projection", _spy_note)
-    rc, report, service_cls, _catalog = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--queue-id",
-            "probe-queue",
-        ],
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "not_available", 52: "not_available"},
-    )
-
-    assert rc == 0
-    assert report["queue"]["status"] == "complete"
-    assert report["queue"]["completed_schedules"] == 1
-    assert report["queue"]["completed_probes"] == 1
-    assert report["queue"]["completed_match_chunks"] == 1
-    assert report["queue"]["completed_roster_freezes"] == 1
-    assert report["queue"]["successful_receipts"] == 5
-    match_calls = [
-        call
-        for service in service_cls.instances
-        for call in service.calls
-        if call[0] == "matches"
-    ]
-    # One real probe fetch (first and last candidate) plus the probe-only
-    # match chunk; no deferred candidate is ever fetched in this plan.
-    assert [sorted(call[2]) for call in match_calls] == [[1, 52], [1, 52]]
-    # The probe refreshes stale cached evidence (bounded TTL); the frozen
-    # match chunk keeps replaying immutable history.
-    assert [
-        flag
-        for service in service_cls.instances
-        for flag in service.match_historical_replays
-    ] == [False, True]
-    # Only the probe child feeds the replay-forgiveness accumulators: one
-    # probe work item, one commits projection plus one attempts projection.
-    assert len(noted_projections) == 2
-    assert noted_projections[0]["match"] == report["producer_commits"]["match"]
-    assert len(report["producer_commits"]["match"]) == 2
-    planning_repository = next(
-        service.repository
-        for service in service_cls.instances
-        if any(call[0] == "schedule" for call in service.calls)
-    )
-    # Deferral evidence is read across the whole freeze in one query.
-    assert planning_repository.ingest_state_calls == [tuple(game_ids)]
-    receipts = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in (tmp_path / "backfill" / "probe-queue" / "receipts").rglob(
-            "*.json"
-        )
-    ]
-    probe_receipts = [value for value in receipts if value["kind"] == "probe"]
-    assert len(probe_receipts) == 1
-    outcome = probe_receipts[0]["outcome"]
-    assert outcome["game_ids"] == [1, 52]
-    assert outcome["not_available_game_ids"] == [1, 52]
-    assert outcome["known_data_game_ids"] == []
-    assert outcome["deferred_game_ids"] == list(range(2, 52))
-    # The deferral loses nothing: probes plus deferred equal the full freeze.
-    assert sorted(outcome["game_ids"] + outcome["deferred_game_ids"]) == game_ids
-
-
-@pytest.mark.unit
-def test_backfill_probe_that_refutes_the_flag_still_drains_every_candidate(
-    monkeypatch, tmp_path
-):
-    game_ids = list(range(1, 53))
-    rc, report, service_cls, _catalog = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--queue-id",
-            "probe-lied-queue",
-        ],
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "success", 52: "not_available"},
-    )
-
-    assert rc == 0
-    assert report["queue"]["status"] == "complete"
-    assert report["queue"]["completed_probes"] == 1
-    assert report["queue"]["completed_match_chunks"] == 3
-    match_calls = [
-        call
-        for service in service_cls.instances
-        for call in service.calls
-        if call[0] == "matches"
-    ]
-    assert [len(call[2]) for call in match_calls] == [2, 25, 25, 2]
-    assert [
-        flag
-        for service in service_cls.instances
-        for flag in service.match_historical_replays
-    ] == [False, True, True, True]
-    # Replayed probe games keep their deterministic commit identity exactly
-    # once in the merged report.
-    assert len(report["producer_commits"]["match"]) == 52
-    receipts = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in (
-            tmp_path / "backfill" / "probe-lied-queue" / "receipts"
-        ).rglob("*.json")
-    ]
-    chunked = sorted(
-        game_id
-        for value in receipts
-        if value["kind"] == "matches"
-        for game_id in value["outcome"]["game_ids"]
-    )
-    assert chunked == game_ids
-    probe_outcome = next(
-        value["outcome"] for value in receipts if value["kind"] == "probe"
-    )
-    assert probe_outcome["not_available_game_ids"] == [52]
-    assert probe_outcome["known_data_game_ids"] == []
-    assert probe_outcome["deferred_game_ids"] == []
-
-
-@pytest.mark.unit
-def test_backfill_failed_probe_fetch_writes_no_receipt_and_retries(
-    monkeypatch, tmp_path
-):
-    # A retryable probe fetch must not mint a receipt: a timeout would
-    # otherwise freeze a false "flag lied" branch forever.
-    retryable = _result("matches", retryable=["1"])
-    game_ids = [1, 2, 3]
-    rc, report, _, _ = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--queue-id",
-            "probe-retry-queue",
-        ],
-        behaviors={"matches": retryable},
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "not_available", 3: "not_available"},
-    )
-
-    assert rc == 2
-    assert report["status"] == "retryable"
-    assert report["queue"]["status"] == "running"
-    assert report["queue"]["completed_schedules"] == 1
-    assert report["queue"]["completed_probes"] == 0
-    assert report["queue"]["next_work_items"] == 1
-    receipt_kinds = {
-        json.loads(path.read_text(encoding="utf-8"))["kind"]
-        for path in (
-            tmp_path / "backfill" / "probe-retry-queue" / "receipts"
-        ).rglob("*.json")
-    }
-    assert receipt_kinds == {"schedule"}
-
-    resumed_rc, resumed, _, _ = _run(
-        monkeypatch,
-        tmp_path,
-        [
-            "backfill",
-            "--queue-id",
-            "probe-retry-queue",
-            "--plan-id",
-            report["queue"]["plan_id"],
-        ],
-        candidate_ids=game_ids,
-        non_opta_ids=game_ids,
-        ingest_states={1: "not_available", 3: "not_available"},
-    )
-    assert resumed_rc == 0
-    assert resumed["queue"]["status"] == "complete"
-    assert resumed["queue"]["completed_probes"] == 1
-
-
-@pytest.mark.unit
-def test_replay_forgiveness_is_scoped_to_probe_children_only():
-    commit_id = "ws2-v3-" + "a" * 64
-    child = {
-        "schema_version": 1,
-        "scope": [],
-        "match": [commit_id],
-        "match_not_available": [],
-        "preview": [],
-        "preview_not_available": [],
-        "profile": [],
-        "profile_not_available": [],
-    }
-    report = runner._new_report("backfill", ())
-    runner._merge_producer_commits(
-        report,
-        runner._replay_free_child_projection({}, child),
-        report_projection=True,
-    )
-
-    # Without probe provenance the identical repeat is still double-reporting.
-    with pytest.raises(ValueError, match="reported twice"):
-        runner._merge_producer_commits(
-            report,
-            runner._replay_free_child_projection({}, child),
-            report_projection=True,
-        )
-
-    # The same repeat merged after a probe child contributed it is forgiven.
-    probe_seen: dict = {}
-    runner._note_probe_child_projection(probe_seen, child)
-    runner._merge_producer_commits(
-        report,
-        runner._replay_free_child_projection(probe_seen, child),
-        report_projection=True,
-    )
-    assert report["producer_commits"]["match"] == [commit_id]
-
-    # One probe contribution forgives exactly one repeat: a child that
-    # internally duplicates the probe-covered id keeps failing closed.
-    duplicated = {**child, "match": [commit_id, commit_id]}
-    with pytest.raises(ValueError, match="reported twice"):
-        runner._merge_producer_commits(
-            report,
-            runner._replay_free_child_projection(probe_seen, duplicated),
-            report_projection=True,
-        )
 
 
 @pytest.mark.unit
@@ -1960,7 +1879,7 @@ def test_scheduled_scope_freezes_signed_targets_across_schedule_mutation():
     assert service.calls[1][0] == "match"
     assert service.calls[1][1]["match_ids"] == (11, 12)
     assert service.calls[1][1]["limit"] is None
-    assert service.calls[1][1]["kickoff_from"] is None
+    assert "kickoff_from" not in service.calls[1][1]
 
     attempts = args._scheduled_scope_attempts
     report = {
@@ -2011,7 +1930,7 @@ def test_scheduled_scope_preserves_explicit_empty_target_sets():
     kwargs = runner._invoke(Service(), "matches", args)
     assert kwargs["match_ids"] == ()
     assert kwargs["limit"] is None
-    assert kwargs["kickoff_from"] is None
+    assert "kickoff_from" not in kwargs
 
 
 @pytest.mark.unit
