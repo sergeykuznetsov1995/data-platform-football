@@ -234,6 +234,8 @@ class TestNoPerTaskTelegram:
         from utils.default_args import LIGHT_ARGS
         assert {k: v for k, v in default_args.items() if k != 'on_failure_callback'} == {
             k: v for k, v in LIGHT_ARGS.items() if k != 'on_failure_callback'}
+        # Tasks inherit default_args in Airflow; the stub keeps only explicit
+        # kwargs, so this loop asserts that no task sets its own callback back.
         tasks = list(BashOperator._instances) + list(PythonOperator._instances)
         assert len(tasks) == 5
         for t in tasks:
