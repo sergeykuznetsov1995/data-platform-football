@@ -217,3 +217,26 @@ class TestHistoryBranch:
         assert dag_module.gate_daily(params={'run_history': True}) is False
         assert dag_module.gate_daily(params={'run_history': False}) is True
         assert dag_module.gate_daily() is True
+
+
+@pytest.mark.unit
+class TestNoPerTaskTelegram:
+    """#1464: the per-task TG callback is off; one deduped alert lives on the host."""
+
+    def test_dag_and_tasks_have_no_failure_callback(self, dag_module):
+        from airflow.operators.bash import BashOperator
+        from airflow.operators.python import PythonOperator
+
+        default_args = dag_module.dag._dag_kwargs['default_args']
+        assert 'on_failure_callback' in default_args
+        assert default_args['on_failure_callback'] is None
+        # The rest of LIGHT_ARGS is kept (pool, retries, timeout).
+        from utils.default_args import LIGHT_ARGS
+        assert {k: v for k, v in default_args.items() if k != 'on_failure_callback'} == {
+            k: v for k, v in LIGHT_ARGS.items() if k != 'on_failure_callback'}
+        # Tasks inherit default_args in Airflow; the stub keeps only explicit
+        # kwargs, so this loop asserts that no task sets its own callback back.
+        tasks = list(BashOperator._instances) + list(PythonOperator._instances)
+        assert len(tasks) == 5
+        for t in tasks:
+            assert t._init_kwargs.get('on_failure_callback') is None, t.task_id
