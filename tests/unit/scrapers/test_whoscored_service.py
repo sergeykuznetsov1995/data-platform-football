@@ -2451,6 +2451,13 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     ]
     assert policy[("schedule_month", "202607")] == ACTIVE_SCHEDULE_CACHE_TTL
     assert policy[("schedule_month", "202601")] is None
+    # A closed month without a postponed or moved game is read exactly once,
+    # from the permanent cache (#1475 refreshes only unsettled months).
+    assert [
+        kwargs.get("cache_ttl")
+        for kind, ids, kwargs in calls
+        if kind == "schedule_month" and ids.get("month") == "202601"
+    ] == [None]
     assert all(kwargs["allow_cache"] is True for _, _, kwargs in calls)
 
     team_params = [

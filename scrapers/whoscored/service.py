@@ -26,6 +26,7 @@ from .detailed_feeds import (
 from .parsers import (
     MAX_PLAYER_STAGE_STAT_PAGES,
     PARSER_VERSION,
+    CalendarMonth,
     DatasetStatus,
     MatchCentreDataAbsent,
     ParsedDataset,
@@ -267,6 +268,66 @@ class EntityResult:
             "errors": list(self.errors),
             "traffic": dict(self.traffic),
         }
+
+
+SCHEDULE_STATUS_POSTPONED = 2
+SCHEDULE_STATUS_PLAYED = 6
+
+
+def _schedule_status(row: Mapping[str, Any]) -> Optional[int]:
+    try:
+        return int(row.get("status"))
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class _ScheduleMonthDocument:
+    """One parsed ``schedule_month`` document with its per-game side tables."""
+
+    target: RawTarget
+    parser: Callable[[TransportResponse], Any]
+    month: CalendarMonth
+    closed: bool
+    raw_index: int
+    schedule: ParsedDataset
+    incidents: Mapping[int, Sequence[Mapping[str, Any]]]
+    bets: Mapping[int, Sequence[Mapping[str, Any]]]
+
+    @classmethod
+    def parse(cls, *, schedule: ParsedDataset, **fields: Any) -> _ScheduleMonthDocument:
+        incidents: dict[int, list[Mapping[str, Any]]] = {}
+        for incident in parse_schedule_incidents(schedule).rows:
+            incidents.setdefault(int(incident["game_id"]), []).append(incident)
+        bets: dict[int, list[Mapping[str, Any]]] = {}
+        for bet in parse_schedule_bets(schedule).rows:
+            bets.setdefault(int(bet["game_id"]), []).append(bet)
+        return cls(schedule=schedule, incidents=incidents, bets=bets, **fields)
+
+
+def _schedule_game_owners(
+    documents: Sequence[_ScheduleMonthDocument],
+) -> dict[int, tuple[int, Mapping[str, Any]]]:
+    """Choose the month document that owns each game (#1059).
+
+    The owner is the document of the month containing the game's
+    ``startTimeUtc``; among several such documents, or when none matches,
+    the later one in traversal order wins.
+    """
+
+    owners: dict[int, tuple[int, Mapping[str, Any], bool]] = {}
+    for index, document in enumerate(documents):
+        for row in document.schedule.rows:
+            game_id = int(row["game_id"])
+            kickoff = row.get("date")
+            in_month = isinstance(kickoff, datetime) and (
+                kickoff.year,
+                kickoff.month,
+            ) == (document.month.year, document.month.month)
+            previous = owners.get(game_id)
+            if previous is None or in_month or not previous[2]:
+                owners[game_id] = (index, row, in_month)
+    return {game_id: (index, row) for game_id, (index, row, _) in owners.items()}
 
 
 @dataclass(frozen=True)
@@ -2212,6 +2273,7 @@ class WhoScoredIngestService:
             schedule_by_id: dict[int, dict[str, Any]] = {}
             incident_by_key: dict[str, dict[str, Any]] = {}
             bet_by_key: dict[str, dict[str, Any]] = {}
+            month_documents: list[_ScheduleMonthDocument] = []
             season_dataset_rows: dict[str, list[Mapping[str, Any]]] = {
                 "standings": [],
                 "forms": [],
@@ -2280,17 +2342,21 @@ class WhoScoredIngestService:
                     # TTL, so retries are offline but changes arrive same-day.
                     closed_month = next_month + timedelta(days=7) <= today
 
+                    def month_parser(
+                        response: TransportResponse,
+                        current_stage: int = stage_id,
+                        stage_row: Mapping[str, Any] = stage,
+                    ) -> ParsedDataset:
+                        return parse_schedule_json(
+                            response.content,
+                            scope=self.scope,
+                            stage_id=current_stage,
+                            stage=stage_row.get("stage_name") or stage_row.get("stage"),
+                        )
+
                     month_response, month_raw_uri, parsed = self._fetch_parsed(
                         month_target,
-                        parser=lambda response, current_stage=stage_id, stage_row=stage: (
-                            parse_schedule_json(
-                                response.content,
-                                scope=self.scope,
-                                stage_id=current_stage,
-                                stage=stage_row.get("stage_name")
-                                or stage_row.get("stage"),
-                            )
-                        ),
+                        parser=month_parser,
                         content_type="application/json",
                         cache_ttl=(
                             ACTIVE_SCHEDULE_CACHE_TTL
@@ -2298,38 +2364,72 @@ class WhoScoredIngestService:
                             else None
                         ),
                     )
+                    month_documents.append(
+                        _ScheduleMonthDocument.parse(
+                            target=month_target,
+                            parser=month_parser,
+                            month=month,
+                            closed=closed_month,
+                            raw_index=len(raw_uris),
+                            schedule=parsed,
+                        )
+                    )
                     raw_uris.append(month_raw_uri)
                     payload_hashes.append(month_response.sha256)
-                    for incident in parse_schedule_incidents(parsed).rows:
-                        entity_key = str(incident["entity_key"])
-                        candidate_incident = dict(incident)
-                        previous_incident = incident_by_key.get(entity_key)
-                        if (
-                            previous_incident is not None
-                            and previous_incident != candidate_incident
-                        ):
-                            raise WhoScoredParseError(
-                                f"incident {entity_key} appears with conflicting data"
-                            )
-                        incident_by_key[entity_key] = candidate_incident
-                    for bet in parse_schedule_bets(parsed).rows:
-                        entity_key = str(bet["entity_key"])
-                        candidate_bet = dict(bet)
-                        previous_bet = bet_by_key.get(entity_key)
-                        if previous_bet is not None and previous_bet != candidate_bet:
-                            raise WhoScoredParseError(
-                                f"bet offer {entity_key} appears with conflicting data"
-                            )
-                        bet_by_key[entity_key] = candidate_bet
-                    for row in parsed.rows:
+
+            # A postponed game can sit in a closed month cached without expiry
+            # while its new date appears in another month (#1059).  Such a
+            # closed month keeps the active TTL until the game is played.
+            if active:
+                owners = _schedule_game_owners(month_documents)
+                occurrences: dict[int, int] = {}
+                for document in month_documents:
+                    for row in document.schedule.rows:
                         game_id = int(row["game_id"])
-                        candidate = dict(row)
-                        previous = schedule_by_id.get(game_id)
-                        if previous is not None and previous != candidate:
-                            raise WhoScoredParseError(
-                                f"game {game_id} appears with conflicting stage data"
-                            )
-                        schedule_by_id[game_id] = candidate
+                        occurrences[game_id] = occurrences.get(game_id, 0) + 1
+                for index, document in enumerate(month_documents):
+                    if not document.closed or not any(
+                        (
+                            _schedule_status(row) == SCHEDULE_STATUS_POSTPONED
+                            or occurrences[int(row["game_id"])] > 1
+                        )
+                        and _schedule_status(owners[int(row["game_id"])][1])
+                        != SCHEDULE_STATUS_PLAYED
+                        for row in document.schedule.rows
+                    ):
+                        continue
+                    month_response, month_raw_uri, parsed = self._fetch_parsed(
+                        document.target,
+                        parser=document.parser,
+                        content_type="application/json",
+                        cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL,
+                    )
+                    raw_uris[document.raw_index] = month_raw_uri
+                    payload_hashes[document.raw_index] = month_response.sha256
+                    month_documents[index] = _ScheduleMonthDocument.parse(
+                        target=document.target,
+                        parser=document.parser,
+                        month=document.month,
+                        closed=document.closed,
+                        raw_index=document.raw_index,
+                        schedule=parsed,
+                    )
+
+            # One game can appear in two month documents (postponed/moved).
+            # Its schedule row, incidents and bets all come from the one
+            # document chosen by ``_schedule_game_owners``; a conflict inside
+            # one document is still rejected by ``parse_schedule_json``.
+            owners = _schedule_game_owners(month_documents)
+            for index, document in enumerate(month_documents):
+                for row in document.schedule.rows:
+                    game_id = int(row["game_id"])
+                    if owners[game_id][0] != index:
+                        continue
+                    schedule_by_id[game_id] = dict(row)
+                    for incident in document.incidents.get(game_id, ()):
+                        incident_by_key[str(incident["entity_key"])] = dict(incident)
+                    for bet in document.bets.get(game_id, ()):
+                        bet_by_key[str(bet["entity_key"])] = dict(bet)
 
             if not schedule_by_id:
                 raise WhoScoredParseError("season schedule contains no matches")
