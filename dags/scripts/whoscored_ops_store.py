@@ -27,8 +27,10 @@ from scrapers.whoscored.runtime_contract import require_production_runtime_class
 
 OPS_SCHEMA_VERSION = 1
 BACKFILL_PLAN_VERSION = 5
-BACKFILL_RECEIPT_VERSION = 6
-BACKFILL_POLICY_VERSION = 7
+# #1474: receipt 7 / policy 8 — the schedule receipt no longer carries
+# non_opta_game_ids and the 2-match probe stage is gone.
+BACKFILL_RECEIPT_VERSION = 7
+BACKFILL_POLICY_VERSION = 8
 LEGACY_BACKFILL_CHECKPOINT_VERSION = 2
 BACKFILL_CHECKPOINT_VERSION = 3
 BACKFILL_CHECKPOINT_DATA_VERSION = 1
@@ -43,10 +45,6 @@ CHECKPOINT_MAX_GENERATION = (10**CHECKPOINT_GENERATION_DIGITS) - 1
 BACKFILL_BATCH_VERSION = 2
 DEFAULT_WORK_LIMIT = 100
 MATCH_CHUNK_SIZE = 25
-# A scope whose frozen schedule flags every candidate as non-Opta fetches this
-# many real probe matches first; the manifest verdicts of those probes decide
-# whether the remaining candidates are chunked or deferred.
-PROBE_SAMPLE_SIZE = 2
 PROFILE_CHUNK_SIZE = 200
 SCHEDULE_REQUEST_UNITS_PER_STAGE = 70
 SCHEDULE_MINIMUM_STAGE_COUNT = 1
@@ -124,10 +122,9 @@ def _policy_identity() -> dict[str, Any]:
 
     return {
         "policy_version": BACKFILL_POLICY_VERSION,
-        "match_candidate_policy": (
-            "all_completed_schedule_matches+non_opta_probe_v1"
-        ),
-        "probe_sample_size": PROBE_SAMPLE_SIZE,
+        # #1474: no probe stage; stage availability lives in the candidate
+        # policy of the repository, never in the schedule's matchIsOpta flag.
+        "match_candidate_policy": "all_completed_schedule_matches_v2",
         "profile_candidate_policy": "all_post_match_frozen_roster_players",
         "parser_version": PARSER_VERSION,
         "availability_version": MATCH_AVAILABILITY_VERSION,
@@ -713,7 +710,6 @@ class WhoScoredBackfillState:
         if kind == "schedule":
             if set(outcome) != {
                 "candidate_game_ids",
-                "non_opta_game_ids",
                 "preview_game_ids",
                 "source_stage_ids",
                 "source_request_attempts",
@@ -724,13 +720,6 @@ class WhoScoredBackfillState:
             candidate_ids = cls._int_ids(
                 outcome["candidate_game_ids"], field="candidate_game_ids"
             )
-            non_opta_ids = cls._int_ids(
-                outcome["non_opta_game_ids"], field="non_opta_game_ids"
-            )
-            if not set(non_opta_ids) <= set(candidate_ids):
-                raise WhoScoredOpsStoreError(
-                    "non_opta_game_ids must be completed candidate_game_ids"
-                )
             preview_ids = cls._int_ids(
                 outcome["preview_game_ids"], field="preview_game_ids"
             )
@@ -760,53 +749,6 @@ class WhoScoredBackfillState:
             ):
                 raise WhoScoredOpsStoreError(
                     "schedule receipt request-unit accounting is invalid"
-                )
-        elif kind == "probe":
-            if set(outcome) != {
-                "game_ids",
-                "not_available_game_ids",
-                "known_data_game_ids",
-                "deferred_game_ids",
-            }:
-                raise WhoScoredOpsStoreError("invalid probe receipt outcome schema")
-            game_ids = cls._int_ids(
-                outcome["game_ids"],
-                field="game_ids",
-                maximum=PROBE_SAMPLE_SIZE,
-            )
-            if game_ids != work_item["game_ids"]:
-                raise WhoScoredOpsStoreError("probe receipt outcome identity mismatch")
-            not_available_ids = cls._int_ids(
-                outcome["not_available_game_ids"], field="not_available_game_ids"
-            )
-            if not set(not_available_ids) <= set(game_ids):
-                raise WhoScoredOpsStoreError(
-                    "not_available_game_ids must be probed game_ids"
-                )
-            known_data_ids = cls._int_ids(
-                outcome["known_data_game_ids"], field="known_data_game_ids"
-            )
-            if not set(known_data_ids) <= (
-                set(work_item["candidate_game_ids"]) - set(game_ids)
-            ):
-                raise WhoScoredOpsStoreError(
-                    "known_data_game_ids must be non-probed candidates"
-                )
-            deferred_ids = cls._int_ids(
-                outcome["deferred_game_ids"], field="deferred_game_ids"
-            )
-            # Deferral must never lose a candidate: only a scope where every
-            # probe verdict is not_available AND no other candidate already
-            # carries manifest evidence of data defers exactly candidates
-            # minus probes; any other combination defers nothing at all.
-            expected_deferred = (
-                sorted(set(work_item["candidate_game_ids"]) - set(game_ids))
-                if not_available_ids == game_ids and not known_data_ids
-                else []
-            )
-            if deferred_ids != expected_deferred:
-                raise WhoScoredOpsStoreError(
-                    "probe receipt deferral must preserve every frozen candidate"
                 )
         elif kind == "roster":
             if set(outcome) != {"profile_player_ids"}:
@@ -1122,8 +1064,6 @@ class WhoScoredBackfillState:
             return expected
         if kind == "roster":
             return ROSTER_REQUEST_UNITS
-        if kind == "probe":
-            return len(item.get("game_ids", [])) * MATCH_REQUEST_UNITS_PER_GAME
         if kind == "matches":
             game_ids = item.get("game_ids", [])
             preview_game_ids = item.get("preview_game_ids", [])
@@ -1134,65 +1074,6 @@ class WhoScoredBackfillState:
         if kind == "profiles":
             return len(item.get("player_ids", [])) * PROFILE_REQUESTS_PER_PLAYER
         raise WhoScoredOpsStoreError(f"unknown work item kind: {kind!r}")
-
-    @staticmethod
-    def _probe_game_ids(candidate_game_ids: list[int]) -> list[int]:
-        """Pick evenly spread probes over the sorted freeze (first and last
-        for two).  A first-N prefix would systematically sample the earliest
-        cup rounds — exactly where stubs concentrate — and could defer a
-        scope whose later rounds carry real data.
-        """
-
-        count = min(PROBE_SAMPLE_SIZE, len(candidate_game_ids))
-        if count <= 1:
-            return list(candidate_game_ids[:count])
-        last_index = len(candidate_game_ids) - 1
-        indexes = sorted(
-            {(step * last_index) // (count - 1) for step in range(count)}
-        )
-        return [candidate_game_ids[index] for index in indexes]
-
-    @staticmethod
-    def _probe_work(scope: str, candidate_game_ids: list[int]) -> dict[str, Any]:
-        game_ids = WhoScoredBackfillState._probe_game_ids(candidate_game_ids)
-        encoded = (
-            ",".join(str(item) for item in game_ids)
-            + "|"
-            + ",".join(str(item) for item in candidate_game_ids)
-        )
-        digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()[:12]
-        return {
-            "work_id": f"probe-{_scope_digest(scope)}-{digest}",
-            "kind": "probe",
-            "scope": scope,
-            "game_ids": game_ids,
-            "candidate_game_ids": list(candidate_game_ids),
-        }
-
-    @classmethod
-    def _probe_work_from_schedule(
-        cls,
-        plan: Mapping[str, Any],
-        scope: str,
-        schedule_outcome: Mapping[str, Any],
-    ) -> Optional[dict[str, Any]]:
-        """Derive the probe stage for an all-non-Opta frozen scope, or None.
-
-        ``match_is_opta`` is metadata, not an availability gate (the schedule
-        flag lies in both directions), so no candidate is ever filtered on it.
-        The probe fetches real matches and only their source-owned manifest
-        verdicts decide the deferral.  Explicit game_id selectors demanded the
-        exact frozen set, so they never probe.
-        """
-
-        if plan.get("selector", {}).get("game_ids"):
-            return None
-        candidate_game_ids = list(schedule_outcome["candidate_game_ids"])
-        if not candidate_game_ids:
-            return None
-        if schedule_outcome["non_opta_game_ids"] != candidate_game_ids:
-            return None
-        return cls._probe_work(scope, candidate_game_ids)
 
     @staticmethod
     def _match_work(
@@ -1250,19 +1131,6 @@ class WhoScoredBackfillState:
             expected = WhoScoredBackfillState._schedule_work(plan, scope)
         elif kind == "roster":
             expected = WhoScoredBackfillState._roster_work(scope)
-        elif kind == "probe":
-            candidate_game_ids = item.get("candidate_game_ids")
-            if (
-                not isinstance(candidate_game_ids, list)
-                or not candidate_game_ids
-                or any(
-                    type(value) is not int or value <= 0
-                    for value in candidate_game_ids
-                )
-                or candidate_game_ids != sorted(set(candidate_game_ids))
-            ):
-                raise WhoScoredOpsStoreError("invalid probe work item")
-            expected = WhoScoredBackfillState._probe_work(scope, candidate_game_ids)
         elif kind == "matches":
             game_ids = item.get("game_ids")
             preview_game_ids = item.get("preview_game_ids")
@@ -1319,15 +1187,11 @@ class WhoScoredBackfillState:
         plan: Mapping[str, Any],
         earliest: Mapping[str, Mapping[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        """Derive probe and match work deterministically from frozen receipts.
+        """Derive match work deterministically from frozen schedule receipts.
 
-        The branch is a pure function of receipt contents so every plan resume
-        re-derives byte-identical work items: an all-non-Opta scope probes
-        first, and its match chunks stay undecidable until the probe receipt
-        freezes the source-owned verdicts.  The receipt's deferred_game_ids is
-        the single source of truth: non-empty (all probes not_available and no
-        manifest evidence of data behind any other candidate) shrinks the
-        chunked set to the probes themselves; empty chunks every candidate.
+        The probe stage is retired (#1474): every frozen candidate is chunked.
+        The probe list stays in the return shape (always empty) so frontier
+        and checkpoint formats are unchanged until the history lane (#1480).
         """
 
         schedules = [self._schedule_work(plan, scope) for scope in plan["scopes"]]
@@ -1339,18 +1203,6 @@ class WhoScoredBackfillState:
                 continue
             game_ids = receipt["outcome"]["candidate_game_ids"]
             preview_ids = set(receipt["outcome"]["preview_game_ids"])
-            probe = self._probe_work_from_schedule(
-                plan,
-                str(schedule["scope"]),
-                receipt["outcome"],
-            )
-            if probe is not None:
-                probe_work.append(probe)
-                probe_receipt = earliest.get(probe["work_id"])
-                if probe_receipt is None:
-                    continue
-                if probe_receipt["outcome"]["deferred_game_ids"]:
-                    game_ids = probe["game_ids"]
             chunks = [
                 game_ids[index : index + MATCH_CHUNK_SIZE]
                 for index in range(0, len(game_ids), MATCH_CHUNK_SIZE)

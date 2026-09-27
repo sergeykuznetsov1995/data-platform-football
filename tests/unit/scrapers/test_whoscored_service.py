@@ -42,6 +42,7 @@ from scrapers.whoscored.repository import (
 )
 from scrapers.whoscored.service import (
     ACTIVE_SCHEDULE_CACHE_TTL,
+    WEEKLY_SCHEDULE_PAGE_CACHE_TTL,
     CATALOG_REQUEST_BURST_SIZE,
     DEFAULT_CATALOG_REQUESTS_PER_MINUTE,
     DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE,
@@ -2320,7 +2321,7 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
       Group Stage</option></select>
     """
     calendar_html = """
-    <script>var wsCalendar = {mask:{2026:{0:{1:1},6:{1:1}}}};</script>
+    <script>var wsCalendar = {mask:{2026:{0:{1:1},6:{1:1},8:{1:1}}}};</script>
     """
 
     def fake_fetch(target, **kwargs):
@@ -2425,32 +2426,35 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
         "source_stage_ids": [700],
         "source_stage_count": 1,
     }
-    assert sum(structured_batch_sizes) == 17 + 2 * len(DETAILED_FEED_OPTIONS)
-    assert max(structured_batch_sizes) == STRUCTURED_PARSE_BATCH_SIZE
+    # #1474: the daily schedule no longer touches the stage-statistics feeds.
+    assert structured_batch_sizes == []
+    assert not team_statistics_urls
+    assert not player_statistics_urls
+    assert not team_stage_feed_urls
     assert result.counts == {
-        "schedule": 2,
+        "schedule": 3,
         "match_incidents": 0,
-        "match_bets": 2,
+        "match_bets": 3,
         "stage_standings": 0,
         "stage_forms": 0,
         "stage_streaks": 0,
         "stage_performance": 0,
-        "team_stage_stats": 0,
-        "player_stage_stats": 0,
-        "referee_stage_stats": 0,
     }
     assert service.transport.budgets.max_paid_urls == 3
     policy = {
         (kind, ids.get("month")): kwargs.get("cache_ttl") for kind, ids, kwargs in calls
     }
-    assert policy[("season_stages", None)] == ACTIVE_SCHEDULE_CACHE_TTL
-    assert policy[("stage_calendar", None)] == ACTIVE_SCHEDULE_CACHE_TTL
+    # #1474: season page and calendars are re-read once a week.
+    assert policy[("season_stages", None)] == WEEKLY_SCHEDULE_PAGE_CACHE_TTL
+    assert policy[("stage_calendar", None)] == WEEKLY_SCHEDULE_PAGE_CACHE_TTL
     assert calendar_urls == [
         "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
         "Stages/700/Fixtures/world-cup-2026"
     ]
     assert policy[("schedule_month", "202607")] == ACTIVE_SCHEDULE_CACHE_TTL
     assert policy[("schedule_month", "202601")] is None
+    # #1474: an open month two months ahead is not re-read daily.
+    assert policy[("schedule_month", "202609")] is None
     # A closed month without a postponed or moved game is read exactly once,
     # from the permanent cache (#1475 refreshes only unsettled months).
     assert [
@@ -2458,6 +2462,40 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
         for kind, ids, kwargs in calls
         if kind == "schedule_month" and ids.get("month") == "202601"
     ] == [None]
+    assert all(kwargs["allow_cache"] is True for _, _, kwargs in calls)
+
+    assert len(repository.scope_snapshots) == 1
+    snapshot = repository.scope_snapshots[0]
+    assert set(snapshot["datasets"]) == {
+        "whoscored_schedule",
+        "whoscored_match_incidents",
+        "whoscored_match_bets",
+        "whoscored_stage_standings",
+        "whoscored_stage_forms",
+        "whoscored_stage_streaks",
+        "whoscored_stage_performance",
+    }
+    assert snapshot["entity_group"] == "season"
+    assert len(snapshot["datasets"]["whoscored_match_bets"]) == 3
+    assert not snapshot.get("feed_states")
+
+    calls.clear()
+    stages = service.sync_stage_feeds()
+
+    assert stages.status == "success", stages.as_dict()
+    assert stages.entity == "stages"
+    assert stages.committed_batches == {"scope": ["wss2-" + "a" * 64]}
+    assert stages.metadata == {
+        "source_stage_ids": [700],
+        "source_stage_count": 1,
+    }
+    assert sum(structured_batch_sizes) == 17 + 2 * len(DETAILED_FEED_OPTIONS)
+    assert max(structured_batch_sizes) == STRUCTURED_PARSE_BATCH_SIZE
+    assert stages.counts == {
+        "team_stage_stats": 0,
+        "player_stage_stats": 0,
+        "referee_stage_stats": 0,
+    }
     assert all(kwargs["allow_cache"] is True for _, _, kwargs in calls)
 
     team_params = [
@@ -2548,22 +2586,14 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     assert stage_feed_params[-1]["field"] == ["-1"]
     assert stage_feed_params[-1]["against"] == ["-1"]
 
-    assert len(repository.scope_snapshots) == 1
-    snapshot = repository.scope_snapshots[0]
+    assert len(repository.scope_snapshots) == 2
+    snapshot = repository.scope_snapshots[1]
     assert set(snapshot["datasets"]) == {
-        "whoscored_schedule",
-        "whoscored_match_incidents",
-        "whoscored_match_bets",
-        "whoscored_stage_standings",
-        "whoscored_stage_forms",
-        "whoscored_stage_streaks",
-        "whoscored_stage_performance",
         "whoscored_team_stage_stats",
         "whoscored_player_stage_stats",
         "whoscored_referee_stage_stats",
     }
-    assert snapshot["entity_group"] == "season"
-    assert len(snapshot["datasets"]["whoscored_match_bets"]) == 2
+    assert snapshot["entity_group"] == "stages"
     assert len(snapshot["feed_states"]) == 68
     assert set(snapshot["feed_states"].values()) == {"empty"}
 
@@ -2571,6 +2601,8 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     service.catalog_season = replace(service.catalog_season, end=date(2020, 1, 1))
     historical = service.sync_schedule()
     assert historical.status == "success", historical.as_dict()
+    historical_stages = service.sync_stage_feeds()
+    assert historical_stages.status == "success", historical_stages.as_dict()
     assert all(kwargs.get("cache_ttl") is None for _, _, kwargs in calls)
 
 

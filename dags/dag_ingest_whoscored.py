@@ -1,8 +1,12 @@
 """Source-native WhoScored daily ingestion DAG.
 
-One isolated runner refreshes the persisted men's-competition catalog and then
-ingests every active scope (schedule, previews, matches, events, lineups and
-match stats) for the current window.  Traffic egresses through the residential
+Runs twice a day (10:00 and 22:00, #1474).  One isolated runner refreshes the
+persisted men's-competition catalog once a week (Monday gate inside the runner,
+a short-circuit otherwise) and then ingests the explicit daily denominator
+(``scrapers/whoscored/catalog.py`` denominator: class-A tournaments plus probe scopes):
+schedule and matches (events, lineups, match stats) in ``ingest_matches``,
+the weekly stage-statistics feeds in a separate ``ingest_stages`` task whose
+failure never fails the matches.  Traffic egresses through the residential
 proxy pool: WhoScored blocks the datacentre host IP at Cloudflare, so the
 transport reads ``WHOSCORED_PROXY_FILE`` and routes the direct curl/FlareSolverr
 requests through one sticky pool member (see ``WhoScoredTransport``).
@@ -27,7 +31,7 @@ from airflow.exceptions import AirflowException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
-from utils.config import DAG_TAGS, SCHEDULES
+from utils.config import DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
 
 logger = logging.getLogger(__name__)
@@ -36,6 +40,9 @@ DAG_ID = "dag_ingest_whoscored"
 RUNNER = "dags/scripts/run_whoscored_scraper.py"
 DISCOVERY_PATH = "/tmp/whoscored_discovery_{{ ts_nodash }}.json"
 RESULT_PATH = "/tmp/whoscored_result_{{ ts_nodash }}.json"
+STAGES_RESULT_PATH = "/tmp/whoscored_stages_result_{{ ts_nodash }}.json"
+# Two runs a day (#1474).  Set here, not in dags/utils/config.py (locked).
+SCHEDULE = "0 10,22 * * *"
 # Tree the Bash tasks run from; the isolated WhoScored stack mounts it outside
 # /opt/airflow and sets WHOSCORED_RUNTIME_ROOT.
 RUNTIME_ROOT = os.environ.get("WHOSCORED_RUNTIME_ROOT", "/opt/airflow")
@@ -174,7 +181,7 @@ def validate_bronze_freshness(**_context: Any) -> None:
 with DAG(
     dag_id=DAG_ID,
     default_args=SCRAPER_ARGS,
-    schedule=SCHEDULES.get(DAG_ID),
+    schedule=SCHEDULE,
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
@@ -186,6 +193,7 @@ with DAG(
             "cd {root} && rm -f {discovery} && "
             "python {runner} discover "
             "--as-of-date {{{{ ds }}}} "
+            "--weekly-gate {{{{ data_interval_end.isoformat() }}}} "
             "--transport-policy direct_only "
             "--output {discovery}"
         ).format(root=RUNTIME_ROOT, runner=RUNNER, discovery=DISCOVERY_PATH),
@@ -193,8 +201,8 @@ with DAG(
         append_env=True,
     )
 
-    ingest_daily = BashOperator(
-        task_id="ingest_daily",
+    ingest_matches = BashOperator(
+        task_id="ingest_matches",
         # The runner exits non-zero whenever ANY scope failed, which is the
         # steady state (#1053). A written report means the run completed and
         # the error-budget gate downstream is the judge; the task itself only
@@ -209,8 +217,30 @@ with DAG(
         ).format(root=RUNTIME_ROOT, runner=RUNNER, result=RESULT_PATH),
         env=_TASK_ENV,
         append_env=True,
-        # SCRAPER_ARGS gives 2h; one daily over ~141 active scopes needs more.
+        # SCRAPER_ARGS gives 2h; one daily over the denominator needs more.
         execution_timeout=timedelta(hours=8),
+    )
+
+    ingest_stages = BashOperator(
+        task_id="ingest_stages",
+        # Stage-statistics feeds, once a week: the runner gates on the run
+        # slot (data_interval_end = 10:00 Monday), not on the start time.
+        # all_done: runs after ingest_matches whatever its state.  The task
+        # has no report gate, so any failed stage scope turns it red; that
+        # red never reaches ingest_matches or validate_data.
+        bash_command=(
+            "cd {root} && rm -f {result} && "
+            "python {runner} daily "
+            "--daily-part stages "
+            "--skip-profiles "
+            "--weekly-gate {{{{ data_interval_end.isoformat() }}}} "
+            "--transport-policy direct_only "
+            "--output {result}"
+        ).format(root=RUNTIME_ROOT, runner=RUNNER, result=STAGES_RESULT_PATH),
+        env=_TASK_ENV,
+        append_env=True,
+        execution_timeout=timedelta(hours=8),
+        trigger_rule="all_done",
     )
 
     validate = PythonOperator(
@@ -228,5 +258,6 @@ with DAG(
     # bronze_freshness stays useful on a red run (all_done), but it must not
     # be the sole leaf that colours the run green while validate_data is
     # upstream_failed (#1053) — the gate is a leaf of its own now.
-    discover_catalog >> ingest_daily >> validate
-    ingest_daily >> bronze_freshness
+    discover_catalog >> ingest_matches >> validate
+    ingest_matches >> bronze_freshness
+    ingest_matches >> ingest_stages

@@ -52,12 +52,15 @@ CATALOG_MANIFEST_TABLE = "whoscored_catalog_manifest"
 SCOPE_MANIFEST_TABLE = "whoscored_scope_ingest_manifest"
 MATCH_COMPLETION_GRACE = timedelta(hours=3)
 MATCH_REFRESH_DAYS = 7
-# A match that keeps failing transiently must not silently fall out of the daily
-# window the moment it ages past ``kickoff_from``: it stays a candidate while it
-# is still ``retryable`` and under this attempt cap.  The cap bounds paid-retry
-# churn on a permanently-stuck match (there is no attempt->terminal transition);
-# once exhausted it leaves the daily window and only backfill/manual re-attempts.
+# A match that keeps failing transiently stays a daily candidate while it is
+# ``retryable`` and under this attempt cap.  The cap bounds retry churn on a
+# permanently-stuck match (there is no attempt->terminal transition); once
+# exhausted it leaves the daily run and only backfill/manual re-attempts.
 DAILY_RETRYABLE_MAX_ATTEMPTS = 8
+# #1474: one re-probe of a "not available" match in an available stage, and one
+# probe of an unknown/unavailable stage per this period.
+NOT_AVAILABLE_REPROBE_HOURS = 72
+STAGE_REPROBE_DAYS = 30
 PREVIEW_REFRESH_HOURS = 6
 PROFILE_REFRESH_DAYS = 90
 
@@ -133,6 +136,24 @@ SCOPE_DATASET_TABLES = {
     "whoscored_player_stage_stats",
     "whoscored_referee_stage_stats",
 }
+
+# #1474: the stage-statistics feeds moved from the daily "season" bundle to
+# their own weekly "stages" bundle.  Their current snapshot (view and
+# no-shrink guard) is the latest successful bundle of the scope that published
+# the table, whatever its entity group, so the pre-split season snapshot stays
+# visible until the first "stages" bundle replaces it.
+SCOPE_STAGE_FEED_TABLES = frozenset(
+    {
+        "whoscored_team_stage_stats",
+        "whoscored_player_stage_stats",
+        "whoscored_referee_stage_stats",
+    }
+)
+
+
+def _scope_published_table_sql(table: str) -> str:
+    return f"json_extract_scalar(entity_counts_json, '$.{table}') IS NOT NULL"
+
 
 # Betting offers are an expiring source snapshot: WhoScored removes providers
 # and prices after a match starts or finishes.  The physical Iceberg batches
@@ -1880,12 +1901,26 @@ class WhoScoredRepository:
         for table in sorted(SCOPE_DATASET_TABLES):
             if not self.trino.table_exists(self.schema, table):
                 continue
+            table_latest = latest
+            if table in SCOPE_STAGE_FEED_TABLES:
+                table_latest = f"""(
+                    SELECT * FROM (
+                        SELECT m.*, ROW_NUMBER() OVER (
+                            PARTITION BY league, season
+                            ORDER BY completed_at DESC, _ingested_at DESC,
+                                     batch_id DESC
+                        ) AS _manifest_rank
+                        FROM {self._scope_manifest} m
+                        WHERE state = 'success'
+                          AND {_scope_published_table_sql(table)}
+                    ) WHERE _manifest_rank = 1
+                )"""
             self.trino._execute(
                 f"""
                 CREATE OR REPLACE VIEW {self.catalog}.{self.schema}.{table}_current AS
                 SELECT d.*
                 FROM {self.catalog}.{self.schema}.{table} d
-                JOIN {latest} m
+                JOIN {table_latest} m
                   ON m.league = d.league
                  AND m.season = d.season
                  AND m.batch_id = d._scope_batch_id
@@ -1894,7 +1929,7 @@ class WhoScoredRepository:
                 FROM {self.catalog}.{self.schema}.{table} d
                 WHERE d._scope_batch_id IS NULL
                   AND NOT EXISTS (
-                      SELECT 1 FROM {latest} m
+                      SELECT 1 FROM {table_latest} m
                       WHERE m.league = d.league
                         AND m.season = d.season
                   )
@@ -3599,10 +3634,22 @@ class WhoScoredRepository:
         include_success: bool = False,
         include_failed: bool = False,
         include_all_completed: bool = False,
-        kickoff_from: Optional[datetime] = None,
         include_exact_count: bool = False,
     ) -> list[MatchCandidate]:
         """Return completed games without a successful manifest commit.
+
+        Without explicit ``match_ids`` (the daily run, #1474) a candidate is a
+        played game (``status=6``) with a confirmed lineup, no success of the
+        current parser, no final "not available" verdict, in a stage that is
+        not unavailable.  Stage availability per (league, season, stage_id)
+        from the latest manifest: available (>= 1 success), unavailable
+        (>= 2 "not available" with a confirmed lineup and 0 success), unknown.
+        A "not available" with a lineup in an available stage is re-probed
+        once after ``NOT_AVAILABLE_REPROBE_HOURS``; an unknown or unavailable
+        stage offers one probe (its latest played game with a lineup) at most
+        every ``STAGE_REPROBE_DAYS`` after its last "not available" verdict
+        (a transient failure does not start that clock).  There is no kickoff window; the newest
+        games come first.
 
         ``include_exact_count`` adds the exact pre-``LIMIT`` backlog size to
         every returned candidate (``exact_candidate_count``), so a bounded
@@ -3619,28 +3666,13 @@ class WhoScoredRepository:
             return []
         if include_success and not ids and not include_all_completed:
             raise ValueError("include_success requires explicit match_ids")
+        daily = not explicit_ids and not include_success and not include_all_completed
         id_filter = ""
         if ids:
             id_filter = (
                 " AND CAST(s.game_id AS BIGINT) IN ("
                 + ",".join(str(value) for value in ids)
                 + ")"
-            )
-        kickoff_filter = ""
-        if kickoff_from is not None:
-            value = kickoff_from.replace(tzinfo=None).isoformat(
-                sep=" ", timespec="seconds"
-            )
-            # A still-retryable match under the attempt cap is never aged out of
-            # the daily window: otherwise a match that keeps failing past the
-            # kickoff window is silently dropped and never re-attempted.
-            kickoff_filter = (
-                " AND (s.date >= TIMESTAMP {value}"
-                " OR (m.state = 'retryable'"
-                " AND COALESCE(m.attempt_no, 0) < {cap}))"
-            ).format(
-                value=_sql_string(value),
-                cap=int(DAILY_RETRYABLE_MAX_ATTEMPTS),
             )
         if limit is not None and int(limit) < 0:
             raise ValueError("match candidate limit must be non-negative")
@@ -3652,6 +3684,21 @@ class WhoScoredRepository:
         )
         failed_filter = (
             " OR m.state IN ('terminal', 'parse_failed')" if include_failed else ""
+        )
+        retry_cap = (
+            f" AND COALESCE(m.attempt_no, 0) < {int(DAILY_RETRYABLE_MAX_ATTEMPTS)}"
+            if daily
+            else ""
+        )
+        # Daily: every "not available" game stays eligible here; the stage
+        # filter below decides.  In an available stage it is re-probed once
+        # after NOT_AVAILABLE_REPROBE_HOURS; in an unknown/unavailable stage
+        # the latest game is the monthly stage probe whatever its NA count.
+        reprobe_filter = (
+            """
+                    OR m.state = 'not_available'"""
+            if daily
+            else ""
         )
         manifest_filter = (
             "TRUE"
@@ -3668,25 +3715,12 @@ class WhoScoredRepository:
                         OR m.payload_sha256 IS NULL
                         OR m.parser_version IS DISTINCT FROM
                             {_sql_string(PARSER_VERSION)}
-                        OR (
-                            m.parser_version = {_sql_string(PARSER_VERSION)}
-                            AND s.date >= CAST(
-                                CURRENT_TIMESTAMP - INTERVAL '30' DAY AS TIMESTAMP
-                            )
-                            AND COALESCE(
-                                m.fetched_at,
-                                TIMESTAMP '1970-01-01 00:00:00'
-                            ) <= CAST(
-                                CURRENT_TIMESTAMP - INTERVAL '{MATCH_REFRESH_DAYS}' DAY
-                                AS TIMESTAMP
-                            )
-                        )
                     )
                     )
                     OR (
                         m.state = 'retryable'
                         AND COALESCE(m.retry_after, TIMESTAMP '1970-01-01 00:00:00')
-                            <= CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
+                            <= CAST(CURRENT_TIMESTAMP AS TIMESTAMP){retry_cap}
                     )
                     OR (
                         m.state = 'parse_failed'
@@ -3696,10 +3730,118 @@ class WhoScoredRepository:
                             OR m.availability_version IS DISTINCT FROM
                                 {_sql_string(MATCH_AVAILABILITY_VERSION)}
                         )
-                    )
+                    ){reprobe_filter}
                     {failed_filter}
                 )
             """
+        )
+        played_filter = (
+            "s.status = 6 AND s.is_lineup_confirmed = TRUE"
+            if daily
+            else """(
+                    s.status = 6
+                    OR (
+                        s.status = 1
+                        AND s.home_score IS NOT NULL
+                        AND s.away_score IS NOT NULL
+                        AND s.date <= CAST(
+                            CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP
+                        )
+                    )
+              )"""
+        )
+        daily_ctes = (
+            f""",
+            not_available_attempts AS (
+                SELECT game_id, COUNT(*) AS not_available_count
+                FROM {self._manifest}
+                WHERE league = {_sql_string(league)}
+                  AND season = {_sql_string(season)}
+                  AND state = 'not_available'
+                GROUP BY game_id
+            ),
+            stage_availability AS (
+                SELECT s.stage_id,
+                       CASE
+                           WHEN COUNT_IF(m.state = 'success') > 0
+                           THEN 'available'
+                           WHEN COUNT_IF(
+                               m.state = 'not_available'
+                               AND s.is_lineup_confirmed = TRUE
+                           ) >= 2
+                           THEN 'unavailable'
+                           ELSE 'unknown'
+                       END AS availability,
+                       MAX(
+                           CASE
+                               WHEN m.state = 'not_available'
+                               THEN COALESCE(m.fetched_at, m.completed_at)
+                           END
+                       ) AS last_attempt_at
+                FROM schedule s
+                JOIN {latest} m
+                  ON m.league = s.league
+                 AND m.season = s.season
+                 AND m.game_id = CAST(s.game_id AS BIGINT)
+                WHERE s.rn = 1
+                GROUP BY s.stage_id
+            )"""
+            if daily
+            else ""
+        )
+        daily_joins = (
+            """
+            LEFT JOIN not_available_attempts na
+              ON na.game_id = CAST(s.game_id AS BIGINT)
+            LEFT JOIN stage_availability st
+              ON st.stage_id IS NOT DISTINCT FROM s.stage_id"""
+            if daily
+            else ""
+        )
+        daily_projection = (
+            f""",
+                   COALESCE(st.availability, 'unknown') AS stage_availability,
+                   (
+                       m.state IS DISTINCT FROM 'not_available'
+                       OR (
+                           COALESCE(na.not_available_count, 0) <= 1
+                           AND COALESCE(
+                               m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
+                           ) <= CAST(
+                               CURRENT_TIMESTAMP
+                               - INTERVAL '{int(NOT_AVAILABLE_REPROBE_HOURS)}' HOUR
+                               AS TIMESTAMP
+                           )
+                       )
+                   ) AS game_reprobe_due,
+                   st.last_attempt_at AS stage_last_attempt_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY s.stage_id
+                       ORDER BY s.date DESC, s.game_id DESC
+                   ) AS stage_probe_rank"""
+            if daily
+            else ""
+        )
+        stage_filter = (
+            f"""
+            WHERE (stage_availability = 'available' AND game_reprobe_due)
+               OR (
+                    stage_availability <> 'available'
+                    AND stage_probe_rank = 1
+                    AND (
+                        stage_last_attempt_at IS NULL
+                        OR stage_last_attempt_at <= CAST(
+                            CURRENT_TIMESTAMP
+                            - INTERVAL '{int(STAGE_REPROBE_DAYS)}' DAY
+                            AS TIMESTAMP
+                        )
+                    )
+               )"""
+            if daily
+            else ""
+        )
+        order_sql = (
+            "ORDER BY date DESC, game_id DESC" if daily else "ORDER BY date, game_id"
         )
         sql = f"""
             WITH schedule AS (
@@ -3710,36 +3852,31 @@ class WhoScoredRepository:
                 FROM {self.catalog}.{self.schema}.whoscored_schedule_current
                 WHERE league = {_sql_string(league)}
                   AND season = {_sql_string(season)}
+            ){daily_ctes},
+            eligible AS (
+                SELECT CAST(s.game_id AS BIGINT) AS game_id, s.league, s.season,
+                       s.game, s.date, CAST(s.status AS INTEGER) AS status,
+                       s.match_is_opta,
+                       CASE
+                           WHEN m.state = 'retryable'
+                           THEN COALESCE(m.attempt_no, 0) + 1
+                           ELSE 1
+                       END AS attempt_no{daily_projection}
+                FROM schedule s
+                LEFT JOIN {latest} m
+                  ON m.league = s.league
+                 AND m.season = s.season
+                 AND m.game_id = CAST(s.game_id AS BIGINT){daily_joins}
+                WHERE s.rn = 1
+                  AND s.game_id IS NOT NULL
+                  AND {played_filter}
+                  AND ({manifest_filter})
+                  {id_filter}
             )
-            SELECT CAST(s.game_id AS BIGINT), s.league, s.season, s.game,
-                   s.date, CAST(s.status AS INTEGER), s.match_is_opta,
-                   CASE
-                       WHEN m.state = 'retryable'
-                       THEN COALESCE(m.attempt_no, 0) + 1
-                       ELSE 1
-                   END AS attempt_no{count_projection}
-            FROM schedule s
-            LEFT JOIN {latest} m
-              ON m.league = s.league
-             AND m.season = s.season
-             AND m.game_id = CAST(s.game_id AS BIGINT)
-            WHERE s.rn = 1
-              AND s.game_id IS NOT NULL
-              AND (
-                    s.status = 6
-                    OR (
-                        s.status = 1
-                        AND s.home_score IS NOT NULL
-                        AND s.away_score IS NOT NULL
-                        AND s.date <= CAST(
-                            CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP
-                        )
-                    )
-              )
-              AND ({manifest_filter})
-              {id_filter}
-              {kickoff_filter}
-            ORDER BY s.date, s.game_id
+            SELECT game_id, league, season, game, date, status, match_is_opta,
+                   attempt_no{count_projection}
+            FROM eligible{stage_filter}
+            {order_sql}
             {limit_sql}
         """
         rows = self.trino.execute_query(sql)
@@ -3997,11 +4134,19 @@ class WhoScoredRepository:
                     )
             return batch_id
 
+        stage_feed_tables = sorted(SCOPE_STAGE_FEED_TABLES & set(counts))
+        previous_filter = (
+            "("
+            + " OR ".join(_scope_published_table_sql(t) for t in stage_feed_tables)
+            + ")"
+            if stage_feed_tables
+            else f"entity_group = {_sql_string(entity_group)}"
+        )
         previous_rows = self.trino.execute_query(
             f"SELECT entity_counts_json FROM {self._scope_manifest} "
             f"WHERE league = {_sql_string(league)} "
             f"AND season = {_sql_string(season)} "
-            f"AND entity_group = {_sql_string(entity_group)} AND state = 'success' "
+            f"AND {previous_filter} AND state = 'success' "
             "ORDER BY completed_at DESC, _ingested_at DESC LIMIT 1"
         )
         previous = json.loads(str(previous_rows[0][0])) if previous_rows else {}

@@ -685,6 +685,7 @@ def test_default_overrides_cover_only_audited_empty_calendar_senior_men():
     assert by_id[999999]["classification_reason"] == "source_sex_not_yet_observed"
     assert {item.tournament_id for item in DEFAULT_TOURNAMENT_OVERRIDES} == {
         23,
+        203,
         252,
         416,
         480,
