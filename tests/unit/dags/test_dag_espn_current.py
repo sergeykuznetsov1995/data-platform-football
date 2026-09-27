@@ -182,3 +182,14 @@ def test_wave_summary_writes_the_log_of_a_green_wave(dag_module, log_conn) -> No
 
     (insert,) = [sql for sql in log_conn.sql if sql.startswith("INSERT")]
     assert "'(wave)', NULL, 'green', 1, NULL" in insert
+
+
+@pytest.mark.unit
+def test_trino_is_the_espn_manager_without_dynamic_filtering(
+    dag_module, monkeypatch
+) -> None:
+    """#1557: the tombstone MERGE needs a connection without dynamic filtering."""
+    from scrapers.espn.trino_manager import EspnTrinoTableManager
+
+    monkeypatch.undo()  # the autouse log_conn stub replaces _trino
+    assert type(dag_module._trino()) is EspnTrinoTableManager

@@ -41,9 +41,10 @@ DEFAULT_ARGS: dict[str, Any] = {
 
 
 def _trino():
-    from scrapers.base.trino_manager import TrinoTableManager
+    # Without dynamic filtering: the tombstone MERGE loses NULL rows (#1557).
+    from scrapers.espn.trino_manager import EspnTrinoTableManager
 
-    return TrinoTableManager()
+    return EspnTrinoTableManager()
 
 
 def _client():
