@@ -5,6 +5,8 @@ with one MERGE matching tombstones ``IS NOT DISTINCT FROM`` on every column.
 With dynamic filtering on, a filter built from a join column drops the target
 rows whose value is NULL, so a row with any NULL column was never deleted and
 every repeat appended a copy.  Sandbox tables get unique names and are dropped.
+The base ``TrinoTableManager`` still has dynamic filtering on and must fail
+(strict xfail: the bug reproduced); ``EspnTrinoTableManager`` must pass.
 
 Run: ``ESPN_TEST_TRINO_APPLY=1 TRINO_HOST=… TRINO_PORT=… TRINO_PASSWORD=…``.
 """
@@ -20,13 +22,27 @@ import pytest
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture
-def manager():
+@pytest.fixture(
+    params=[
+        pytest.param(
+            "base",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=AssertionError,
+                reason="#1557: dynamic filter loses NULL rows",
+            ),
+        ),
+        "espn",
+    ]
+)
+def manager(request):
     if os.environ.get("ESPN_TEST_TRINO_APPLY") != "1":
         pytest.skip("set ESPN_TEST_TRINO_APPLY=1 for the destructive Trino smoke")
     from scrapers.base.trino_manager import TrinoTableManager
+    from scrapers.espn.trino_manager import EspnTrinoTableManager
 
-    trino = TrinoTableManager(host=os.environ.get("TRINO_HOST", "trino"))
+    factory = {"base": TrinoTableManager, "espn": EspnTrinoTableManager}
+    trino = factory[request.param](host=os.environ.get("TRINO_HOST", "trino"))
     try:
         yield trino
     finally:
