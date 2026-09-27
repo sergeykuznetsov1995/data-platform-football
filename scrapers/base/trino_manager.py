@@ -197,7 +197,14 @@ class TrinoTableManager:
         return self._conn
 
     def _create_connection(self):
-        """Create a new Trino connection."""
+        """Create a new Trino connection.
+
+        Dynamic filtering is off, as in ``get_trino_connection``: a dynamic
+        filter built from an ``IS NOT DISTINCT FROM`` join column drops target
+        rows whose value is NULL, so the tombstone MERGE of
+        ``single_statement_replace`` never deleted a row with a NULL (#1557).
+        """
+        session_properties = {'enable_dynamic_filtering': 'false'}
         if self._password:
             return trino.dbapi.connect(
                 host=self.host,
@@ -207,6 +214,7 @@ class TrinoTableManager:
                 http_scheme='https',
                 auth=trino.auth.BasicAuthentication(self.user, self._password),
                 verify=False,  # self-signed certificate
+                session_properties=session_properties,
             )
         else:
             return trino.dbapi.connect(
@@ -214,6 +222,7 @@ class TrinoTableManager:
                 port=self.port,
                 user=self.user,
                 catalog=self.catalog,
+                session_properties=session_properties,
             )
 
     def _connect_with_retry(self):
