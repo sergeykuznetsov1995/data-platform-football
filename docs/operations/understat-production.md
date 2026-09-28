@@ -61,15 +61,17 @@ it does not launch a duplicate crawl.
 
 ## Historical DAG
 
-`dag_backfill_understat` is created paused and scheduled `@continuous`. After
-it is unpaused, every run discovers source seasons, selects the oldest closed
-scope that is not complete for the current contract, processes at most one
-scope, then cools down for five minutes (30 minutes when idle). The manifest is
-the durable cursor, so scheduler restarts do not reset progress.
+`dag_backfill_understat` is created paused and scheduled daily at 12:00 UTC
+(`0 12 * * *`, after the 09:00 daily DAG). The plan runs one manifest query
+(no site request, no physical scope verification) and selects up to 12 closed
+scopes, oldest first, whose latest attempt for the current contract is not
+`complete`. With no work the mapped runner is skipped and the shared scraper
+pool is not used. The manifest is the durable cursor, so scheduler restarts do
+not reset progress.
 
 Current data has priority 100 and history priority 10 in the same one-slot
 scraper pool. Do not add Airflow date catchup or a hand-written season list:
-history admission is source discovery plus manifest state.
+history admission is manifest state.
 
 ## Publication and DQ fence
 

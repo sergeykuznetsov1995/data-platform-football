@@ -772,6 +772,65 @@ class UnderstatManifestRepository:
                 return scope
         return None
 
+    def incomplete_closed_scopes(
+        self,
+        *,
+        before_source_season_id: int,
+        contract_version: str = CONTRACT_VERSION,
+        limit: int,
+    ) -> list[ScopeKey]:
+        """Return closed manifest scopes not complete for ``contract_version``.
+
+        One SQL statement, oldest source season first. Scope keys come from
+        every manifest row (any contract or mode); completeness follows
+        ``is_scope_complete(..., verify_physical=False)``: the latest attempt
+        in the contract must be ``complete``. No physical verification.
+        """
+
+        contract_version = _required(contract_version, "contract_version")
+        before = int(before_source_season_id)
+        limit = int(limit)
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self._execute(
+            "WITH keys AS ("
+            'SELECT DISTINCT "league", "season", "source_league", '
+            'TRY_CAST("source_season_id" AS integer) AS "source_season_id" '
+            f"FROM {self.qualified} "
+            'WHERE TRY_CAST("source_season_id" AS integer) < ?'
+            "), latest AS ("
+            'SELECT "league", "season", "status", ROW_NUMBER() OVER ('
+            'PARTITION BY "league", "season" '
+            'ORDER BY "completed_at" DESC, "attempt_id" DESC) AS "rn" '
+            f"FROM {self.qualified} "
+            'WHERE "contract_version" = ?'
+            ") "
+            'SELECT k."league", k."season", k."source_league", k."source_season_id" '
+            "FROM keys k LEFT JOIN latest l "
+            'ON l."league" = k."league" AND l."season" = k."season" AND l."rn" = 1 '
+            "WHERE l.\"status\" IS NULL OR l.\"status\" <> ? "
+            'ORDER BY k."source_season_id", k."league" LIMIT ?',
+            params=(before, contract_version, ManifestStatus.COMPLETE.value, limit),
+        )
+        scopes: list[ScopeKey] = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                values = [
+                    row.get(column)
+                    for column in ("league", "season", "source_league", "source_season_id")
+                ]
+            else:
+                values = list(row)
+            scopes.append(
+                ScopeKey(
+                    league=str(values[0]),
+                    season=str(values[1]),
+                    source_league=str(values[2]),
+                    source_season_id=str(int(values[3])),
+                )
+            )
+        return scopes
+
     def verify_physical_batch(self, attempt: ScopeAttempt) -> bool:
         """Verify the manifest's logical commit against all Bronze partitions.
 
