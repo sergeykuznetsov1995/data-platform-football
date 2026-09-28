@@ -80,6 +80,19 @@
   .dash .shot { display: block; border: 1px solid var(--img-border); background: #fff; }
   .dash .shot img { display: block; width: 100%; height: auto; }
 
+  .nb { margin: 0 0 56px; }
+  .nb .intro { display: grid; grid-template-columns: 2fr 3fr; gap: 24px 40px; border-top: 1px solid var(--rule); padding: 22px 0; }
+  .nb h3 { margin: 0 0 8px; font-weight: 400; font-size: 27px; line-height: 1.15; letter-spacing: -.01em; }
+  .nb h3 a { text-decoration: none; }
+  .nb h3 a:hover { text-decoration: underline; text-underline-offset: 5px; text-decoration-color: var(--accent); }
+  .nb p { margin: 0 0 14px; color: var(--ink-2); max-width: 44ch; }
+  .nb .open { font-size: 14px; letter-spacing: .04em; color: var(--accent); text-decoration: none; }
+  .nb .open:hover { text-decoration: underline; text-underline-offset: 4px; }
+  .nb .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px 20px; border-bottom: 1px solid var(--rule); padding-bottom: 22px; }
+  .nb figure { margin: 0; }
+  .nb figure a { display: block; border: 1px solid var(--img-border); background: #0f1218; aspect-ratio: 900 / 460; overflow: hidden; }
+  .nb figure img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; }
+  .nb figcaption { margin-top: 8px; font-size: 13px; color: var(--ink-2); line-height: 1.35; }
   .foot { display: grid; grid-template-columns: 1fr 1fr; gap: 24px 40px; border-top: 1px solid var(--ink); padding-top: 22px; font-size: 15px; }
   .foot p { margin: 0 0 6px; }
   .foot .muted { color: var(--ink-2); }
@@ -98,6 +111,9 @@
     .dash li { grid-template-columns: 1fr; gap: 14px; }
     .dash .shot { order: -1; }
     .dash h3 { font-size: 23px; }
+    .nb .intro { grid-template-columns: 1fr; gap: 14px; }
+    .nb h3 { font-size: 23px; }
+    .nb .grid { grid-template-columns: 1fr; }
     .foot { grid-template-columns: 1fr; }
   }
 </style>
@@ -144,6 +160,44 @@
     </li>
   </ol>
 
+  <h2 data-i18n="h_nb">Ноутбук</h2>
+  <section class="nb">
+    <div class="intro">
+      <div class="text">
+        <h3 class="serif"><a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" data-i18n="nb">Разбор матча в Jupyter</a></h3>
+        <p data-i18n="nbs">Juventus — Lazio 2:2, Serie A 2025/26: шесть графиков по событиям с координатами и ударам с xG. Только pandas и matplotlib поверх слоя gold — так же можно считать любой матч из хранилища.</p>
+        <a class="open" href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" data-i18n="nb_open">Открыть ноутбук на GitHub →</a>
+      </div>
+      <p class="muted" data-i18n="nb_note">Данные в ноутбуке читаются из Trino напрямую; выводы сохранены, поэтому графики видны прямо на GitHub без запуска.</p>
+    </div>
+    <div class="grid">
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-losses.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb1">Потери в своей трети: звёзды — те, что привели к удару соперника</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-form.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb2">Форма команд Serie A: последние 7 туров против начала сезона</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-xg-timeline.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb3">Накопленный xG матча и кто давит по 5-минутным отрезкам</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-pass-map.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb4">Карта передач игрока и его перцентили по лиге</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-shots-entries.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb5">Удары по xG и входы в 20-метровую зону у ворот</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/feat/public-landing/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-pass-network.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb6">Сети передач обеих команд</figcaption>
+      </figure>
+    </div>
+  </section>
+
   <footer class="foot">
     <div>
       <p><a href="https://github.com/sergeykuznetsov1995/data-platform-football" rel="noopener" data-i18n="gh">Код на GitHub</a></p>
@@ -172,6 +226,17 @@
       d1: "Обзор лиги + игроки", d1s: "Таблица со «сверх-очками» относительно xPTS, форма команд по турам, Elo, трансферы и зарплаты, лидеры сезона, вратари.",
       d2: "Сводный обзор лиги — игроки", d2s: "Голы против xG, рейтинги SofaScore, ключевые передачи и динамика игроков по матчам за сезон 2025/26.",
       open: "Открыть дашборд →",
+      h_nb: "Ноутбук",
+      nb: "Разбор матча в Jupyter",
+      nbs: "Juventus — Lazio 2:2, Serie A 2025/26: шесть графиков по событиям с координатами и ударам с xG. Только pandas и matplotlib поверх слоя gold — так же можно считать любой матч из хранилища.",
+      nb_open: "Открыть ноутбук на GitHub →",
+      nb_note: "Данные в ноутбуке читаются из Trino напрямую; выводы сохранены, поэтому графики видны прямо на GitHub без запуска.",
+      nb1: "Потери в своей трети: звёзды — те, что привели к удару соперника",
+      nb2: "Форма команд Serie A: последние 7 туров против начала сезона",
+      nb3: "Накопленный xG матча и кто давит по 5-минутным отрезкам",
+      nb4: "Карта передач игрока и его перцентили по лиге",
+      nb5: "Удары по xG и входы в 20-метровую зону у ворот",
+      nb6: "Сети передач обеих команд",
       gh: "Код на GitHub",
       stack: "Python, Airflow, Apache Iceberg, Trino, Superset. Архитектура bronze / silver / gold.",
       sql: "Нужен SQL или Jupyter — напишите: ",
@@ -192,6 +257,17 @@
       d1: "League overview + players", d1s: "Table with over-performance vs xPTS, team form by round, Elo, transfers and payroll, season leaders, keepers.",
       d2: "League overview — players", d2s: "Goals vs xG, SofaScore ratings, key passes and per-match player trends across the 2025/26 season.",
       open: "Open dashboard →",
+      h_nb: "Notebook",
+      nb: "Match analysis in Jupyter",
+      nbs: "Juventus — Lazio 2:2, Serie A 2025/26: six charts from event data with coordinates and shots with xG. Plain pandas and matplotlib on top of the gold layer — any match in the warehouse can be analysed the same way.",
+      nb_open: "Open the notebook on GitHub →",
+      nb_note: "The notebook reads Trino directly; outputs are saved, so the charts render on GitHub without running anything.",
+      nb1: "Losses in own third: stars led to an opponent shot",
+      nb2: "Serie A form change: last 7 rounds vs. the season before",
+      nb3: "Cumulative match xG and territorial pressure by 5-minute bins",
+      nb4: "A player's pass map and league percentiles",
+      nb5: "Shots sized by xG and entries into the 20-metre zone",
+      nb6: "Pass networks of both teams",
       gh: "Code on GitHub",
       stack: "Python, Airflow, Apache Iceberg, Trino, Superset. Bronze / silver / gold architecture.",
       sql: "Need SQL or Jupyter access? Message me: ",

@@ -71,6 +71,9 @@ def test_landing_links_dashboards_github_and_telegram():
     assert "https://github.com/sergeykuznetsov1995/data-platform-football" in html
     assert "https://t.me/Sergeykuznetsov1995" in html
     assert "world-cup" not in html, "владелец: чемпионат мира на лендинге не нужен"
+    assert "notebooks/match_visuals_showcase.ipynb" in html, "блок «Ноутбук» со ссылкой на GitHub"
+    for img in re.findall(r'src="(img/[^"]+)"', html):
+        assert (LANDING.parent / img).is_file(), img
     assert '<meta name="viewport"' in html
     assert "prefers-color-scheme: dark" in html
     assert "<script src=" not in html and "<link rel=\"stylesheet\"" not in html, "без внешних зависимостей"
