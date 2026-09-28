@@ -17,6 +17,10 @@ from collections import Counter
 from typing import Callable, Dict, Optional
 from urllib.parse import urlsplit
 
+from scrapers.fbref.browser_runtime import (
+    CAMOUFOX_FIREFOX_MAJOR,
+    EXECUTABLE_PATH as CAMOUFOX_EXECUTABLE_PATH,
+)
 from scrapers.sofascore._flatten import _auto_flatten
 
 logger = logging.getLogger(__name__)
@@ -412,7 +416,16 @@ class SofascoreCamoufoxCapture:
     def __enter__(self) -> "SofascoreCamoufoxCapture":
         from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
 
-        kwargs = {"headless": self._headless}
+        kwargs = {
+            "headless": self._headless,
+            # Since 2026-09-27 SofaScore's edge answers every /api/v1 request
+            # from the v135 build with 403 "challenge"; the image's pinned v152
+            # build passes (#1560).  ff_version keeps the generated fingerprint
+            # on the same major as the executable.
+            "executable_path": str(CAMOUFOX_EXECUTABLE_PATH),
+            "ff_version": CAMOUFOX_FIREFOX_MAJOR,
+            "i_know_what_im_doing": True,
+        }
         if self._proxy:
             kwargs["proxy"] = self._proxy
             kwargs["geoip"] = self._geoip  # match locale/timezone to proxy exit

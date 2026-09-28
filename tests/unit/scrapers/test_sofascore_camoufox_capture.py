@@ -635,6 +635,27 @@ class TestEnterCleanupOnFailedStart:
         assert cap._cm is None
 
 
+def test_launches_the_pinned_v152_browser_build():
+    """SofaScore's edge refuses the v135 build with 403 "challenge" (#1560)."""
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+    fake_sync_api = MagicMock()
+    with patch.dict(sys.modules, {
+        "camoufox": MagicMock(sync_api=fake_sync_api),
+        "camoufox.sync_api": fake_sync_api,
+    }):
+        SofascoreCamoufoxCapture(proxy={"server": "http://exit:1"}).__enter__()
+
+    kwargs = fake_sync_api.Camoufox.call_args.kwargs
+    assert kwargs["executable_path"] == "/opt/fbref-camoufox/camoufox-bin"
+    assert kwargs["ff_version"] == 152
+    # Same acknowledgement as FBref's launch of this pinned build.
+    assert kwargs["i_know_what_im_doing"] is True
+
+
 # --------------------------------------------------------------------------- #
 #  fetch_api_json (#879)                                                      #
 # --------------------------------------------------------------------------- #

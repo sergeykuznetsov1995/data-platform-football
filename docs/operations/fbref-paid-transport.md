@@ -152,9 +152,10 @@ docker compose -p fbref-acceptance-949 \
 
 ## Isolated browser runtime
 
-FBref uses the checksum-pinned browser in `/opt/fbref-camoufox`. SofaScore uses
-its own reviewed browser in `/home/airflow/.cache/camoufox`; never replace that
-directory during an FBref deploy. The durable scheduler build is the
+FBref uses the checksum-pinned browser in `/opt/fbref-camoufox`. Since #1560
+SofaScore launches the same build (the SofaScore edge refuses its old v135 build
+in `/home/airflow/.cache/camoufox`), so a browser bump in
+`scrapers/fbref/browser_runtime.py` / the Dockerfile changes both sources. The durable scheduler build is the
 `airflow-scheduler` target in `docker/images/airflow/Dockerfile`, and
 `compose.yaml` points the scheduler at that target.
 
