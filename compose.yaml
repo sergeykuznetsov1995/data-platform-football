@@ -1101,6 +1101,7 @@ services:
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
       - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
+      - ./configs/superset/create_public_role.py:/app/pythonpath/create_public_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -1151,6 +1152,7 @@ services:
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
       - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
+      - ./configs/superset/create_public_role.py:/app/pythonpath/create_public_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -1194,6 +1196,7 @@ services:
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
       - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
+      - ./configs/superset/create_public_role.py:/app/pythonpath/create_public_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -1741,6 +1744,8 @@ services:
       PLATFORM_DOMAIN: ${PLATFORM_DOMAIN:-platform-domain-unset}
     volumes:
       - ./configs/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Публичный лендинг football.<домен> (#1570): статика, без прокси
+      - ./configs/caddy/landing:/srv/landing:ro
       # JSON access-log для fail2ban на хосте (configs/fail2ban/)
       - /var/log/caddy:/var/log/caddy
       - caddy_data:/data

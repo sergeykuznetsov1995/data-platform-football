@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Football Data Platform</title>
+<meta name="description" content="Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов и ЧМ-2026, живые дашборды без регистрации.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%232f6df6'/%3E%3Ccircle cx='16' cy='16' r='5' fill='white'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f6f7fb;
+    --card: #ffffff;
+    --text: #15181f;
+    --muted: #5d6474;
+    --line: #e3e6ee;
+    --accent: #2f6df6;
+    --accent-text: #ffffff;
+    --accent-soft: #e8efff;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1117;
+    --card: #181b24;
+    --text: #eef0f5;
+    --muted: #9aa2b4;
+    --line: #2a2f3c;
+    --accent: #5b8cff;
+    --accent-text: #0b0e16;
+    --accent-soft: #1e2740;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1117;
+      --card: #181b24;
+      --text: #eef0f5;
+      --muted: #9aa2b4;
+      --line: #2a2f3c;
+      --accent: #5b8cff;
+      --accent-text: #0b0e16;
+      --accent-soft: #1e2740;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 48px; }
+  .top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .brand { font-weight: 700; letter-spacing: .01em; display: flex; align-items: center; gap: 8px; color: var(--accent); }
+  .brand .ball { flex: none; }
+  .controls { display: flex; gap: 8px; }
+  .controls button {
+    border: 1px solid var(--line); background: var(--card); color: var(--text);
+    border-radius: 999px; padding: 6px 12px; font: inherit; font-size: 14px; cursor: pointer;
+  }
+  .controls button:hover { border-color: var(--accent); }
+  .controls button svg { display: block; }
+  h1 { font-size: clamp(30px, 6vw, 44px); line-height: 1.12; margin: 40px 0 12px; letter-spacing: -.02em; }
+  .lead { font-size: 18px; color: var(--muted); margin: 0 0 8px; max-width: 640px; }
+  .note { font-size: 14px; color: var(--muted); margin: 0 0 28px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 0 0 36px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  .stat b { display: block; font-size: 26px; line-height: 1.1; letter-spacing: -.02em; }
+  .stat span { display: block; margin-top: 6px; font-size: 14px; color: var(--muted); }
+  h2 { font-size: 20px; margin: 0 0 12px; }
+  .dash { display: grid; gap: 12px; margin: 0 0 36px; }
+  .dash a {
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    background: var(--accent); color: var(--accent-text); text-decoration: none;
+    border-radius: 14px; padding: 16px 18px; font-weight: 600; font-size: 17px;
+  }
+  .dash a small { display: block; font-weight: 400; font-size: 14px; opacity: .85; margin-top: 2px; }
+  .dash a:hover { filter: brightness(1.06); }
+  .dash a::after { content: "→"; font-size: 22px; flex: none; }
+  .links { display: grid; gap: 12px; }
+  .link { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; }
+  .link a { font-weight: 600; text-decoration: none; }
+  .link a:hover { text-decoration: underline; }
+  footer { margin-top: 40px; font-size: 13px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 16px; }
+  @media (max-width: 640px) {
+    h1 { margin-top: 28px; }
+    .stats { grid-template-columns: 1fr 1fr; }
+    .stat.wide { grid-column: 1 / -1; }
+    .stat b { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand"><svg class="ball" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7l4.5 3.3-1.7 5.4H9.2L7.5 10.3z" fill="currentColor"/></svg> Football Data Platform</div>
+    <div class="controls">
+      <button id="lang" type="button" aria-label="Switch language">EN</button>
+      <button id="theme" type="button" aria-label="Switch theme"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" fill="currentColor"/></svg></button>
+    </div>
+  </header>
+
+  <h1 data-i18n="title">Футбольные данные для авторов и аналитиков</h1>
+  <p class="lead" data-i18n="lead">Платформа собирает открытые футбольные данные из 11 источников в единое хранилище и показывает их в интерактивных дашбордах.</p>
+  <p class="note" data-i18n="note">Дашборды открываются без регистрации. Данные — топ-5 европейских лиг по сезон 2025/26 включительно и чемпионат мира 2026.</p>
+
+  <section class="stats" aria-label="stats">
+    <div class="stat wide"><b data-i18n="s_leagues_v">Топ-5 лиг</b><span data-i18n="s_leagues">10 сезонов: 2016/17–2025/26 + ЧМ-2026</span></div>
+    <div class="stat"><b>11</b><span data-i18n="s_sources">источников данных</span></div>
+    <div class="stat"><b data-i18n="s_matches_v">18 тыс.</b><span data-i18n="s_matches">матчей</span></div>
+    <div class="stat"><b data-i18n="s_events_v">28 млн</b><span data-i18n="s_events">событий</span></div>
+    <div class="stat"><b data-i18n="s_shots_v">429 тыс.</b><span data-i18n="s_shots">ударов</span></div>
+  </section>
+
+  <h2 data-i18n="h_dash">Дашборды</h2>
+  <nav class="dash" aria-label="dashboards">
+    <a href="https://bi.sk-vpn-2026.uk/superset/dashboard/league-overview/">
+      <span><span data-i18n="d1">Обзор лиги + игроки</span><small data-i18n="d1s">таблица, форма команд, Elo, трансферы, лидеры сезона</small></span>
+    </a>
+    <a href="https://bi.sk-vpn-2026.uk/superset/dashboard/player-overview-league/">
+      <span><span data-i18n="d2">Сводный обзор лиги — игроки</span><small data-i18n="d2s">xG, голы, рейтинги и динамика игроков за сезон</small></span>
+    </a>
+    <a href="https://bi.sk-vpn-2026.uk/superset/dashboard/world-cup/">
+      <span><span data-i18n="d3">Чемпионаты мира</span><small data-i18n="d3s">матчи, таблицы групп, удары, рекорды турниров</small></span>
+    </a>
+  </nav>
+
+  <section class="links">
+    <div class="link">
+      <a href="https://github.com/sergeykuznetsov1995/data-platform-football" rel="noopener" data-i18n="gh">Код на GitHub</a>
+      <span data-i18n="gh_s"> — Python, Airflow, Apache Iceberg, Trino, dbt, Superset</span>
+    </div>
+    <div class="link">
+      <span data-i18n="sql">Нужен SQL или Jupyter — напишите: </span>
+      <a href="https://t.me/Sergeykuznetsov1995" rel="noopener">@Sergeykuznetsov1995</a>
+    </div>
+  </section>
+
+  <footer data-i18n="foot">Пет-проект Сергея Кузнецова. Данные — из открытых источников, для некоммерческого использования.</footer>
+</div>
+
+<script>
+(function () {
+  var i18n = {
+    ru: {
+      title: "Футбольные данные для авторов и аналитиков",
+      lead: "Платформа собирает открытые футбольные данные из 11 источников в единое хранилище и показывает их в интерактивных дашбордах.",
+      note: "Дашборды открываются без регистрации. Данные — топ-5 европейских лиг по сезон 2025/26 включительно и чемпионат мира 2026.",
+      s_sources: "источников данных",
+      s_leagues_v: "Топ-5 лиг", s_leagues: "10 сезонов: 2016/17–2025/26 + ЧМ-2026",
+      s_matches_v: "18 тыс.", s_matches: "матчей",
+      s_events_v: "28 млн", s_events: "событий",
+      s_shots_v: "429 тыс.", s_shots: "ударов",
+      h_dash: "Дашборды",
+      d1: "Обзор лиги + игроки", d1s: "таблица, форма команд, Elo, трансферы, лидеры сезона",
+      d2: "Сводный обзор лиги — игроки", d2s: "xG, голы, рейтинги и динамика игроков за сезон",
+      d3: "Чемпионаты мира", d3s: "матчи, таблицы групп, удары, рекорды турниров",
+      gh: "Код на GitHub", gh_s: " — Python, Airflow, Apache Iceberg, Trino, dbt, Superset",
+      sql: "Нужен SQL или Jupyter — напишите: ",
+      foot: "Пет-проект Сергея Кузнецова. Данные — из открытых источников, для некоммерческого использования.",
+      langBtn: "EN", desc: "Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов и ЧМ-2026, живые дашборды без регистрации."
+    },
+    en: {
+      title: "Football data for writers and analysts",
+      lead: "The platform collects open football data from 11 sources into a single warehouse and serves it through interactive dashboards.",
+      note: "Dashboards open without sign-up. Data covers the top-5 European leagues up to and including 2025/26, plus the 2026 World Cup.",
+      s_sources: "data sources",
+      s_leagues_v: "Top-5 leagues", s_leagues: "10 seasons: 2016/17–2025/26 + WC 2026",
+      s_matches_v: "18k", s_matches: "matches",
+      s_events_v: "28M", s_events: "events",
+      s_shots_v: "429k", s_shots: "shots",
+      h_dash: "Dashboards",
+      d1: "League overview + players", d1s: "table, team form, Elo, transfers, season leaders",
+      d2: "League overview — players", d2s: "xG, goals, ratings and player trends over the season",
+      d3: "World Cups", d3s: "matches, group tables, shots, tournament records",
+      gh: "Code on GitHub", gh_s: " — Python, Airflow, Apache Iceberg, Trino, dbt, Superset",
+      sql: "Need SQL or Jupyter access? Message me: ",
+      foot: "A pet project by Sergey Kuznetsov. Data comes from open sources, for non-commercial use.",
+      langBtn: "RU", desc: "Football data platform for writers and analysts: top-5 leagues over 10 seasons and the 2026 World Cup, live dashboards without sign-up."
+    }
+  };
+  var store = { get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+                set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+  var SUN = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="currentColor"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></g></svg>';
+  var MOON = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" fill="currentColor"/></svg>';
+  var root = document.documentElement;
+  var langBtn = document.getElementById("lang");
+  var themeBtn = document.getElementById("theme");
+
+  function applyLang(lang) {
+    var t = i18n[lang];
+    document.querySelectorAll("[data-i18n]").forEach(function (el) {
+      var key = el.getAttribute("data-i18n");
+      if (t[key] !== undefined) el.textContent = t[key];
+    });
+    root.setAttribute("lang", lang);
+    document.querySelector('meta[name="description"]').setAttribute("content", t.desc);
+    langBtn.textContent = t.langBtn;
+    store.set("lang", lang);
+  }
+  function currentTheme() {
+    var t = root.getAttribute("data-theme");
+    if (t) return t;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  function applyTheme(theme) {
+    root.setAttribute("data-theme", theme);
+    themeBtn.innerHTML = theme === "dark" ? SUN : MOON;
+    store.set("theme", theme);
+  }
+
+  var lang = store.get("lang") || ((navigator.language || "").toLowerCase().indexOf("ru") === 0 ? "ru" : "en");
+  applyLang(lang);
+  var savedTheme = store.get("theme");
+  if (savedTheme) applyTheme(savedTheme); else themeBtn.innerHTML = currentTheme() === "dark" ? SUN : MOON;
+
+  langBtn.addEventListener("click", function () { applyLang(root.getAttribute("lang") === "ru" ? "en" : "ru"); });
+  themeBtn.addEventListener("click", function () { applyTheme(currentTheme() === "dark" ? "light" : "dark"); });
+})();
+</script>
+</body>
+</html>

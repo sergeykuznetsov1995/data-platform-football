@@ -142,6 +142,16 @@ def FLASK_APP_MUTATOR(app):
 
 
 # -----------------------------------------------------------------------------
+# Гость без логина (#1570): роль Public для анонимных запросов — просмотр
+# дашбордов с лендинга football.<домен>. Права роли выдаёт
+# create_public_role.py (шаг 6 bootstrap.sh) и только их. PUBLIC_ROLE_LIKE
+# намеренно НЕ задан: `superset init` скопировал бы в Public всю Gamma,
+# включая сохранение чартов/дашбордов и Explore.
+# -----------------------------------------------------------------------------
+AUTH_ROLE_PUBLIC = "Public"
+
+
+# -----------------------------------------------------------------------------
 # SSO через Keycloak (docs/design/analyst-access.md, фаза 7).
 # SUPERSET_OAUTH_ENABLED=true  -> AUTH_OAUTH: analysts = Gamma+sql_lab+analyst_data,
 #                                 platform-admins = Admin, авторегистрация

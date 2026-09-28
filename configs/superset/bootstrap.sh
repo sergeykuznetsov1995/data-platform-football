@@ -12,6 +12,7 @@
 #   3) superset init (роли + permissions)
 #   4) Импорт datasources (через python implant; читает datasources.yaml)
 #   5) (опционально) Импорт dashboards из ZIP-файлов в /app/pythonpath/dashboards/
+#   6) Роль Public — гостевой просмотр дашбордов без логина (create_public_role.py)
 # =============================================================================
 set -euo pipefail
 
@@ -97,6 +98,15 @@ if [ -d "${DASHBOARDS_DIR}" ]; then
 else
     echo "[superset-bootstrap] (5/5) ${DASHBOARDS_DIR} does not exist; skipping dashboards"
 fi
+
+# -----------------------------------------------------------------------------
+# (6) роль Public — гостевой просмотр дашбордов без логина (#1570).
+#     После дашбордов: права выдаются на их датасеты. Идемпотентно, лишние
+#     права с роли снимает.
+# -----------------------------------------------------------------------------
+echo "[superset-bootstrap] (6) ensuring Public (guest) role..."
+python "${PYTHONPATH_DIR}/create_public_role.py" \
+    || echo "[superset-bootstrap] WARNING: create_public_role failed — гость не увидит дашборды; повторить вручную: ./scripts/compose.sh exec superset python /app/pythonpath/create_public_role.py"
 
 echo "[superset-bootstrap] done."
 exit 0

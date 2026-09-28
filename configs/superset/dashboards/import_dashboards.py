@@ -31,6 +31,7 @@ log = logging.getLogger("import_dashboards")
 DASHBOARDS: list[str] = [
     "player_overview",
     "league_overview",
+    "world_cup",
 ]
 
 
