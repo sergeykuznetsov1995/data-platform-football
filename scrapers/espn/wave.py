@@ -884,9 +884,14 @@ def plan_wave(
     if check_core or window is not None:
         first, last = window or (today - timedelta(days=CORE_DAYS - 1), today)
         for competition in sorted(targets.values(), key=lambda item: item.slug):
-            if competition.slug not in usable or not any(
-                edition.start_date <= last and edition.end_date >= first
-                for edition in competition.open_editions()
+            # A window is read for every tournament: an event of a season with
+            # no open edition is on no parsed day and comes back unlisted (red).
+            if competition.slug not in usable or (
+                window is None
+                and not any(
+                    edition.start_date <= last and edition.end_date >= first
+                    for edition in competition.open_editions()
+                )
             ):
                 continue
             try:

@@ -80,7 +80,8 @@ def _window(context: dict[str, Any]) -> tuple[date | None, date | None]:
 
     conf = getattr(context.get("dag_run"), "conf", None) or {}
     since, until = (
-        date.fromisoformat(str(conf[key])) if conf.get(key) else None
+        # A key present with any value is parsed: "" or 0 is an error, not "no window".
+        date.fromisoformat(str(conf[key])) if key in conf else None
         for key in ("since", "until")
     )
     return since, until

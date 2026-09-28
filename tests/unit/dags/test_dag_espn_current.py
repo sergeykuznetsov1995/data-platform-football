@@ -248,6 +248,9 @@ def test_plan_wave_without_conf_plans_the_usual_wave(dag_module, planned) -> Non
         {"since": "2026-08-15", "until": "2026-08-13"},
         {"since": "2999-01-01", "until": "2999-01-02"},
         {"since": "13.08.2026", "until": "2026-08-15"},
+        {"since": "", "until": ""},
+        {"since": 0, "until": False},
+        {"since": None, "until": "2026-08-15"},
     ],
 )
 def test_plan_wave_fails_without_retry_on_a_bad_window(dag_module, planned, conf) -> None:

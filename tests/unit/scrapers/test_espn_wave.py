@@ -1025,3 +1025,45 @@ def test_catch_up_window_is_checked_before_any_request(tmp_path) -> None:
 def test_without_a_window_the_wave_plans_yesterday_and_today(tmp_path) -> None:
     _, _, plan, _ = _wave1(tmp_path)
     assert plan.days == (YESTERDAY, TODAY)
+
+
+@pytest.mark.unit
+def test_window_event_of_a_season_without_an_open_edition_reds_its_tournament(tmp_path) -> None:
+    """#1508 (Astra r1 p.1): the open edition starts after the window; the old
+    season's final on a window day is on no parsed day, core still lists it."""
+    path = _state_path(tmp_path)
+    snapshot = editions_store.load(path)
+    editions_store.save(
+        path,
+        editions_store.EditionsSnapshot(
+            snapshot.refreshed_at,
+            tuple(
+                EditionState(s.competition_slug, s.year + 1, s.display_name,
+                              date(2026, 9, 23), s.end)
+                if s.competition_slug == "eng.1" else s
+                for s in snapshot.editions
+            ),
+        ),
+    )
+    responses = {
+        _req_key(urls.all_scoreboard_day(SINCE)): _day(_event("eng.1", when="2026-09-20T15:00Z")),
+        _req_key(urls.all_scoreboard_day(date(2026, 9, 21))): _day(),
+        _req_key(urls.all_scoreboard_day(UNTIL)): _day(),
+        _req_key(urls.events_window("eng.1", SINCE, UNTIL)): _core_list(578281),
+        _req_key(urls.events_window("ger.2", SINCE, UNTIL)): _core_list(),
+        _req_key(urls.events_window("uefa.champions", SINCE, UNTIL)): _core_list(),
+    }
+    for day in (SINCE, date(2026, 9, 21), UNTIL):
+        responses[_req_key(urls.league_scoreboard_day("eng.1", day))] = _league(
+            "eng.1", "700", *([_event("eng.1", when="2026-09-20T15:00Z")] if day == SINCE else [])
+        )
+    client = FakeClient(responses)
+
+    plan = wave.plan_wave(
+        client=client, trino=WaveTrino(), rows=_rows(), state_path=path,
+        now=NOW, check_stale=False, since=SINCE, until=UNTIL,
+    )
+
+    (work,) = plan.works
+    assert (work.slug, work.event_ids) == ("eng.1", ())
+    assert work.error == "core lists 1 event(s) no league day has: 578281"
