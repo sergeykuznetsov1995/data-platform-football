@@ -32,6 +32,8 @@ VIEW_PERMISSIONS = (
     ("can_dashboard_permalink", "Superset"),  # /superset/dashboard/p/<key>/
     ("can_read", "Dashboard"),
     ("can_read", "Chart"),                    # /api/v1/chart/data — данные чартов и фильтров
+    ("can_explore_json", "Superset"),         # legacy /superset/explore_json/ — данные чартов старых
+                                              # viz-типов (player_overview); CSV через него закрыт: нет can_csv
     ("can_read", "Dataset"),                  # колонки датасета для нативных фильтров
     ("can_read", "CssTemplate"),
     ("can_read", "DashboardFilterStateRestApi"),

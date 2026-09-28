@@ -23,12 +23,13 @@ pytestmark = pytest.mark.unit
 
 # Ровно то, что нужно гостю для просмотра дашборда с нативными фильтрами.
 # Ничего с записью в metadata DB (can_log, can_write on Chart/Dashboard/…),
-# Explore, SQL Lab, экспортом, списками БД.
+# Explore (UI), SQL Lab, экспортом (can_csv), списками БД.
 EXPECTED_VIEW_PERMISSIONS = {
     ("can_dashboard", "Superset"),
     ("can_dashboard_permalink", "Superset"),
     ("can_read", "Dashboard"),
     ("can_read", "Chart"),
+    ("can_explore_json", "Superset"),  # legacy chart data, без can_csv
     ("can_read", "Dataset"),
     ("can_read", "CssTemplate"),
     ("can_read", "DashboardFilterStateRestApi"),
