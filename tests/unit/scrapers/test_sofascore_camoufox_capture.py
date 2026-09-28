@@ -640,7 +640,6 @@ def test_launches_the_pinned_v152_browser_build():
     import sys
     from unittest.mock import MagicMock, patch
 
-    from scrapers.fbref.browser_runtime import EXECUTABLE_PATH
     from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
 
     fake_sync_api = MagicMock()
@@ -651,8 +650,10 @@ def test_launches_the_pinned_v152_browser_build():
         SofascoreCamoufoxCapture(proxy={"server": "http://exit:1"}).__enter__()
 
     kwargs = fake_sync_api.Camoufox.call_args.kwargs
-    assert kwargs["executable_path"] == str(EXECUTABLE_PATH)
+    assert kwargs["executable_path"] == "/opt/fbref-camoufox/camoufox-bin"
     assert kwargs["ff_version"] == 152
+    # Same acknowledgement as FBref's launch of this pinned build.
+    assert kwargs["i_know_what_im_doing"] is True
 
 
 # --------------------------------------------------------------------------- #

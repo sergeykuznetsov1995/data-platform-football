@@ -342,9 +342,9 @@ RUN PIP_FIND_LINKS=/tmp/whoscored-wheelhouse \
 
 # The Python package's `fetch` command selects a mutable "latest compatible"
 # GitHub release. Fetch each source's exact supported browser asset instead and
-# verify its digest and byte size before offline extraction. SofaScore's paid
-# runtime remains on the measured v135 browser in its package-default cache;
-# FBref's v152 browser lives only in its explicit /opt tree.
+# verify its digest and byte size before offline extraction. The v152 browser
+# in /opt/fbref-camoufox is launched by both FBref and SofaScore (#1560: the
+# SofaScore edge refuses v135); the v135 package-default cache is unused.
 RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
       "https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip" \
       -o /tmp/sofascore-camoufox.zip \
