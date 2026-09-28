@@ -5,7 +5,7 @@ folder, #1507), never in ``dags/``.  Paused on creation; the owner unpauses it.
 
 prepare -> run_history.  The logic is ``scrapers.espn.history``: one run walks
 the queue ``iceberg.ops.espn_history_queue_v1`` until it is empty, the time
-budget (20 min) ends, the live lane has a debt, the gate closes the
+budget (12 min from the DAG run start) ends, the live lane has a debt, the gate closes the
 ``history`` lane or the stop file appears; each of those is a clean end.
 Never ahead of the live lane: its own pool ``espn_history`` (1 slot),
 ``priority_weight=1`` with ``weight_rule="absolute"`` and the ``history``
@@ -32,12 +32,14 @@ SCHEDULE = "*/30 * * * *"
 # Pool of the history lane; created by the espn-live delivery from pools.json.
 HISTORY_POOL = "espn_history"
 RUN_TASK_ID = "run_history"
-# The run stops itself after the budget; the task timeout is the backstop.
-# Budget well below the 30-min interval: >= 10 min (2 ticks of the */5 delivery
-# cron) between runs, else busy_reason starves the espn-live delivery.
-BUDGET = timedelta(minutes=20)
-TASK_TIMEOUT = timedelta(minutes=25)
-DAGRUN_TIMEOUT = timedelta(minutes=28)
+# The whole DAG run ends within DAGRUN_TIMEOUT of its start: >= 10 min (2 ticks
+# of the */5 delivery cron) before the next run, else busy_reason starves the
+# espn-live delivery.  The budget counts from the DAG run start (prepare and
+# queueing included) and leaves room for the write after it; the timeouts are
+# the backstop.
+BUDGET = timedelta(minutes=12)
+TASK_TIMEOUT = timedelta(minutes=18)
+DAGRUN_TIMEOUT = timedelta(minutes=20)
 
 DEFAULT_ARGS: dict[str, Any] = {
     "owner": "data-platform",
@@ -73,6 +75,12 @@ def prepare(**_: Any) -> None:
     ensure_queue_table(connection)
 
 
+def _run_start(context: dict[str, Any]) -> datetime:
+    # The budget is for the whole DAG run, not for this task.
+    start = getattr(context.get("dag_run"), "start_date", None)
+    return start or datetime.now(timezone.utc)
+
+
 def run_history(**context: Any) -> dict[str, Any]:
     from scrapers.espn import history
     from scrapers.espn.denominator import load_denominator
@@ -91,7 +99,7 @@ def run_history(**context: Any) -> dict[str, Any]:
             denominator=load_denominator(),
             scope=history.load_scope(),
             run_id=str(context.get("run_id") or "manual"),
-            deadline=datetime.now(timezone.utc) + BUDGET,
+            deadline=_run_start(context) + BUDGET,
             stop_file=stop_file,
             task_id=RUN_TASK_ID,
         )

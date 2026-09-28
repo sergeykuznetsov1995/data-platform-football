@@ -53,21 +53,42 @@ def test_run_is_below_the_live_lane_and_bounded_in_time(dag_module) -> None:
     assert run._init_kwargs["pool"] == "espn_history"
     assert run._init_kwargs["priority_weight"] == 1
     assert run._init_kwargs["weight_rule"] == "absolute"
-    assert run._init_kwargs["execution_timeout"] == timedelta(minutes=25)
-    assert dag_module.BUDGET == timedelta(minutes=20)
-    assert dag_module.dag._dag_kwargs["dagrun_timeout"] == timedelta(minutes=28)
+    assert run._init_kwargs["execution_timeout"] == timedelta(minutes=18)
+    assert dag_module.BUDGET == timedelta(minutes=12)
+    assert dag_module.dag._dag_kwargs["dagrun_timeout"] == timedelta(minutes=20)
     assert run._init_kwargs["retries"] == 0
 
 
-def test_runs_leave_a_delivery_window_between_them(dag_module) -> None:
-    # busy_reason of auto_deliver (cron */5) waits for a history run: budget plus
-    # two delivery ticks must fit the 30-min interval, and a stuck run is killed
-    # before the next one is due.
-    interval = timedelta(minutes=30)
-    tick = timedelta(minutes=5)
+def test_runs_leave_a_delivery_window_between_them(dag_module, monkeypatch, tmp_path) -> None:
+    # busy_reason of auto_deliver (cron */5) waits for a history run.  Scenario:
+    # the DAG run starts at :00, prepare and queueing take 7 min, the write after
+    # the budget runs long.  The runner deadline is the DAG run start + budget
+    # (not the task start), and the scheduler ends the DAG run at DAGRUN_TIMEOUT
+    # at the latest, so the ticks :20 and :25 see no running history before the
+    # next run at :30.
     assert dag_module.SCHEDULE == "*/30 * * * *"
-    assert dag_module.BUDGET + 2 * tick <= interval
-    assert dag_module.BUDGET < dag_module.TASK_TIMEOUT < dag_module.DAGRUN_TIMEOUT < interval
+    start = datetime(2026, 10, 1, 3, 0, tzinfo=timezone.utc)
+    task_start = start + timedelta(minutes=7)
+    monkeypatch.setattr(history, "default_stop_file", lambda: tmp_path / "history.off")
+    monkeypatch.setattr(dag_module, "_client", lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(dag_module, "_trino", lambda: SimpleNamespace(connection="conn"))
+    seen = {}
+    monkeypatch.setattr(history, "run_history",
+                        lambda **kw: seen.update(kw) or history.HistoryRun(history.ERROR, 0, 0, 0))
+
+    dag_module.run_history(run_id="r", dag_run=SimpleNamespace(start_date=start))
+
+    assert seen["deadline"] == start + timedelta(minutes=12)
+    write_overrun = timedelta(minutes=6)            # accumulated batch + journal after the budget
+    end = min(seen["deadline"] + write_overrun,
+              task_start + dag_module.TASK_TIMEOUT,
+              start + dag_module.dag._dag_kwargs["dagrun_timeout"])
+    assert end <= start + timedelta(minutes=20)
+    next_start = start + timedelta(minutes=30)
+    free_ticks = [start + timedelta(minutes=m) for m in range(0, 30, 5)
+                  if end <= start + timedelta(minutes=m) < next_start]
+    assert free_ticks == [start + timedelta(minutes=20), start + timedelta(minutes=25)]
+    assert next_start - (start + dag_module.dag._dag_kwargs["dagrun_timeout"]) >= timedelta(minutes=10)
 
 
 def test_prepare_creates_the_queue_table(dag_module, monkeypatch) -> None:
@@ -131,7 +152,7 @@ def test_run_uses_the_history_lane_scope_budget_and_stop_file(dag_module, monkey
     assert seen["client"] is client and seen["conn"] == "conn" and seen["stop_file"] == stop
     assert seen["scope"] == (("eng.1", 2015),) and seen["run_id"] == "scheduled__1"
     assert seen["task_id"] == "run_history"
-    assert timedelta(minutes=19) < seen["deadline"] - before <= timedelta(minutes=20, seconds=5)
+    assert timedelta(minutes=11) < seen["deadline"] - before <= timedelta(minutes=12, seconds=5)
     assert closed == [True]
 
 
