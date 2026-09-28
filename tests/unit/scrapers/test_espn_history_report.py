@@ -142,6 +142,7 @@ def test_history_line_from_the_queue_and_the_journal(db) -> None:
         row("uefa.champions", 2010, 1, history.DONE, today),
         row("uefa.champions", 2010, 5, history.LISTED, today),
         row("uefa.champions", 2011, 0, history.PENDING, yesterday),
+        row("ger.2", 0, 1, history.RED, today, attempts=2, last_error="seasons: 503"),
     ])
     for state, matches, at in (("idle", 300, today), ("live_debt", 80, today),
                                ("live_debt", 5, today), ("budget", 999, yesterday)):
@@ -157,13 +158,15 @@ def test_history_line_from_the_queue_and_the_journal(db) -> None:
     (journal,) = db.run(render_journal_sql(DAY))
 
     # Seasons: eng.1 2015 (finished today), 2014 (finished yesterday), 2013
-    # (red), UCL 2010 (a type still listed), UCL 2011 (types not read).
-    assert tuple(queue) == (5, 1, 2, 1, 385, 2)
+    # (red), UCL 2010 (a type still listed), UCL 2011 (types not read); the
+    # failed season list of ger.2 is red too.
+    assert tuple(queue) == (5, 1, 2, 2, 385, 2)
     assert tuple(journal) == (2, 40960)
     line = render_history_line(DAY, queue, journal, defects=3)
     assert line == (
-        "• ESPN история 28.09: сезонов готово за сутки 1 (всего готово 2 из 5), красных 1, "
+        "• ESPN история 28.09: сезонов готово за сутки 1 (всего готово 2 из 5), красных 2, "
         "матчей 385, запросов 2, 40 КБ (≈ 0.0 запр. и 0 КБ на матч), пауз из-за актуалки 2; "
         "пустых частей в полных сезонах 3 ‼️"
     )
     assert render_history_line(DAY, (0, 0, 0, 0, 0, 0), None) == "• ESPN история 28.09: очередь пуста"
+    assert "красных 1" in render_history_line(DAY, (0, 0, 0, 1, 0, 0), None)

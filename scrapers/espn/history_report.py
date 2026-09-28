@@ -14,7 +14,8 @@
   them is absent for the season ("без составов" / "без статов"); its
   ``valid_empty`` rows are then no defect.  Nothing is kept by hand.
 * ``HISTORY_QUEUE_SQL`` / ``HISTORY_JOURNAL_SQL`` — the report line: seasons
-  finished during the day and in the queue, red seasons, matches written,
+  finished during the day and in the queue, red seasons and red inventories
+  (a slug whose season list failed), matches written,
   pauses for the live debt (run rows of the queue) and the network requests
   and bytes of the ``history`` lane (request journal).
 """
@@ -99,7 +100,9 @@ SELECT (SELECT count(*) FROM seasons) AS seasons,
        (SELECT count_if(finished AND last_at >= {_DAY}
                         AND last_at < {_DAY} + INTERVAL '1' DAY) FROM seasons) AS finished_day,
        (SELECT count_if(finished) FROM seasons) AS finished,
-       (SELECT count_if(red) FROM seasons) AS red,
+       (SELECT count_if(red) FROM seasons)
+         + (SELECT count_if(state = 'red') FROM iceberg.ops.espn_history_queue_v1
+            WHERE slug <> '(run)' AND season_year = 0) AS red,
        (SELECT coalesce(sum(matches), 0) FROM runs) AS matches,
        (SELECT count_if(state = 'live_debt') FROM runs) AS pauses"""
 
@@ -167,7 +170,7 @@ def render_history_line(
     """The history line of the morning report for UTC day ``day``."""
 
     dd = f"{day[8:10]}.{day[5:7]}"
-    if queue is None or int(queue[0]) == 0:
+    if queue is None or (int(queue[0]) == 0 and int(queue[3]) == 0):
         return f"• ESPN история {dd}: очередь пуста"
     seasons, finished_day, finished, red, matches, pauses = (int(value) for value in queue)
     requests, size = (int(value) for value in journal) if journal else (0, 0)

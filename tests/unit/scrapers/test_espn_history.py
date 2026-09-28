@@ -70,9 +70,13 @@ class Bodies(dict):
         super().__init__(bodies)
         self.summaries = summaries
         self.light = light
+        # Served for any other address when set (an error for every other slug).
+        self.otherwise = None
 
     def __missing__(self, key: str):
         match = re.search(r"/soccer/([^/]+)/summary\?event=(\d+)$", key)
+        if (match is None or match[1] not in self.summaries) and self.otherwise is not None:
+            return self.otherwise
         if match is None or match[1] not in self.summaries:
             raise KeyError(key)
         return _summary_as(self.summaries[match[1]], int(match[2]), self.light)
@@ -103,6 +107,13 @@ class HistoryTrino(WaveTrino):
         self.debt = debt
 
     def execute_query(self, sql, params=None):
+        if sql.startswith("UPDATE"):
+            owner, slug, year = params
+            ids = {int(item) for item in re.search(r"IN \(([\d, ]+)\)", sql)[1].split(", ")}
+            for row in self.tables["espn_match"]:
+                if (row["competition_slug"], row["season_year"]) == (slug, year) and row["event_id"] in ids:
+                    row["duplicate_of"] = owner
+            return [[len(ids)]]
         if "AS debt" in sql:
             self.queries.append(sql)
             return [[self.debt]]
@@ -422,19 +433,7 @@ def test_event_already_held_by_another_tournament_becomes_a_duplicate(conn) -> N
     ids = _ucl_ids()
     client, trino = HistoryClient(_ucl_2010()), HistoryTrino()
     _run(client, trino, conn, scope=(("uefa.champions", 2010),))
-    qualifier = _ids(PROBES / "type_events_uefa.champions_2010_t2.json")[0]
-    season = json.loads((PROBES / "season_uefa.champions_2010.json").read_bytes())
-    season["types"] = {**season["types"], "count": 1, "pageSize": 1, "items": season["types"]["items"][1:2]}
-    events = json.loads((PROBES / "type_events_uefa.champions_2010_t2.json").read_bytes())
-    events["items"], events["count"] = events["items"][:1], 1
-    client.responses.update(
-        {
-            _req_key(urls.league_seasons("uefa.champions_qual", limit=100)): (PROBES / "seasons_uefa.champions.json").read_bytes().replace(b"uefa.champions/", b"uefa.champions_qual/"),
-            _req_key(urls.season("uefa.champions_qual", 2010)): json.dumps(season).encode(),
-            _req_key(urls.type_events("uefa.champions_qual", 2010, 2, limit=100)): json.dumps(events).encode(),
-        }
-    )
-    client.responses.summaries["uefa.champions_qual"] = "summary_ucl_2010.json"
+    qualifier = _qual_2010(client)
 
     run = _run(client, trino, conn, scope=(("uefa.champions_qual", 2010),))
 
@@ -486,3 +485,86 @@ def test_old_seasons_are_parsed_leniently(conn, slug, year, event_id, template, 
     assert run.matches == 1 and run.failed == 0
     assert row["disposition"] != "source_malformed"
     assert (row["lineup_state"], row["team_stats_state"]) == (lineup, stats)
+
+
+def _qual_2010(client) -> int:
+    """uefa.champions_qual 2010 of one type listing the first qualifier of UCL 2010."""
+
+    qualifier = _ids(PROBES / "type_events_uefa.champions_2010_t2.json")[0]
+    season = json.loads((PROBES / "season_uefa.champions_2010.json").read_bytes())
+    season["types"] = {**season["types"], "count": 1, "pageSize": 1, "items": season["types"]["items"][1:2]}
+    events = json.loads((PROBES / "type_events_uefa.champions_2010_t2.json").read_bytes())
+    events["items"], events["count"] = events["items"][:1], 1
+    client.responses.update(
+        {
+            _req_key(urls.league_seasons("uefa.champions_qual", limit=100)): (PROBES / "seasons_uefa.champions.json").read_bytes().replace(b"uefa.champions/", b"uefa.champions_qual/"),
+            _req_key(urls.season("uefa.champions_qual", 2010)): json.dumps(season).encode(),
+            _req_key(urls.type_events("uefa.champions_qual", 2010, 2, limit=100)): json.dumps(events).encode(),
+        }
+    )
+    client.responses.summaries["uefa.champions_qual"] = "summary_ucl_2010.json"
+    return qualifier
+
+
+def test_main_competition_written_after_its_qualifying_takes_the_match_over(conn) -> None:
+    client, trino = HistoryClient(_ucl_2010()), HistoryTrino()
+    qualifier = _qual_2010(client)
+    _run(client, trino, conn, scope=(("uefa.champions_qual", 2010),))
+
+    _run(client, trino, conn, scope=(("uefa.champions", 2010),))
+
+    rows = {row["competition_slug"]: row["duplicate_of"] for row in trino._rows() if row["event_id"] == qualifier}
+    assert rows == {"uefa.champions": None, "uefa.champions_qual": "uefa.champions:2010"}
+
+
+def test_stored_pre_match_summary_of_a_closed_season_is_downloaded_again(conn) -> None:
+    listed = _ids(*ENG_2015_PAGES)
+    client, trino = HistoryClient(_eng_2015()), HistoryTrino()
+    key = _req_key(urls.summary("eng.1", listed[0]))
+    stub = json.loads(_summary_as("summary_eng1_2015_422285.json", listed[0], light=True))
+    stub["header"]["competitions"][0]["status"]["type"]["name"] = "STATUS_SCHEDULED"
+    client.stored[key] = json.dumps(stub).encode()  # what the live lane stored before kickoff
+
+    run = _run(client, trino, conn)
+
+    assert run.matches == 380 and key in client.network
+    assert _matches(trino)[listed[0]]["status"] == "STATUS_FULL_TIME"
+
+
+def test_queue_follows_the_scope_file(conn) -> None:
+    bodies = _eng_2015()
+    for year in range(2016, 2026):  # the other past seasons fail: their rows turn red
+        bodies[_req_key(urls.season("eng.1", year))] = HttpStatusError(503, "busy")
+    client, trino = HistoryClient(bodies), HistoryTrino()
+    _run(client, trino, conn)
+    before = len(client.network)
+
+    # An empty allow: every past season of the last ten years joins the queue
+    # (the season lists of the other target slugs fail here: red inventories).
+    bodies.otherwise = HttpStatusError(503, "busy")
+    wide = _run(client, trino, conn, scope=())
+
+    queue = _queue(conn)
+    assert queue[("eng.1", 0, history.ALL_SEASONS)].matches == 10
+    assert {key[1] for key in queue if key[0] == "eng.1" and key[1]} == set(range(2015, 2026))
+    assert all(queue[("eng.1", year, 0)].state == history.RED for year in range(2016, 2026))
+    assert wide.reason == history.IDLE
+    assert queue[("ger.2", 0, history.ALL_SEASONS)].state == history.RED
+    # Back to the narrow allow: the red seasons outside it are not tried again.
+    after = len(client.network)
+    _run(client, trino, conn)
+    assert len(client.network) == after and after > before
+    assert queue[("eng.1", 2015, 1)].state == history.DONE
+
+
+def test_allowed_season_core_does_not_list_is_a_red_season(conn) -> None:
+    client, trino = HistoryClient(_eng_2015()), HistoryTrino()
+
+    run = _run(client, trino, conn, scope=(("eng.1", 1990), ("eng.1", 2026)))
+
+    queue = _queue(conn)
+    assert run.matches == 0 and queue[("eng.1", 0, 0)].state == history.DONE
+    for year in (1990, 2026):
+        assert queue[("eng.1", year, 0)].state == history.RED
+        assert queue[("eng.1", year, 0)].attempts == history.MAX_ATTEMPTS
+    assert len(client.network) == 1  # the season list only

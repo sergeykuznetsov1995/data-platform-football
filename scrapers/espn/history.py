@@ -12,7 +12,8 @@ gate (``TransportGate(lane="history")``):
    league, the editions of ten years of a national-team tournament).  The
    scope file ``configs/espn/history_scope.json`` narrows it: a non-empty
    ``allow`` is the exact list of (slug, year); an empty one means every
-   ``Denominator.targets()`` slug;
+   ``Denominator.targets()`` slug.  The queue follows the file: a widened
+   scope inventories what it lacks, rows outside the scope wait;
 2. season — ``seasons/{year}``: window (label ``year`` from core) and types;
    the season row becomes one row per type (or ``empty`` without types);
 3. type — ``types/{t}/events`` over every page (``limit=100``) -> event ids;
@@ -26,16 +27,19 @@ failure unit is the match: a Summary that fails is counted, the type row ends
 red.  A match already in bronze with its Summary is never downloaded again, so
 an interrupted run continues where it stopped.
 
-Cache: a season closed more than ``CLOSED_AFTER`` ago is read cache-first
-(season, lists, Summaries: 0 network requests on a repeat); an open one reads
-lists fresh and replays only a stored Summary with a terminal status.
+Cache: the season and the lists of a season closed more than
+``CLOSED_AFTER`` ago are read cache-first, an open season's lists fresh; a
+stored Summary is replayed only when its status is terminal (a pre-match body
+the live lane stored is downloaded again).  A repeat of a closed season makes
+0 network requests.
 
 Duplicates: inside a season an event listed by two types is written once
 (the first type); across tournaments one SELECT per batch finds the event ids
 bronze already holds under another (slug, season): the new row gets
-``duplicate_of`` of that owner unless the new one is the main competition
-and the stored one its ``_qual`` slug (``editions`` rule: main before
-``_qual``, otherwise whoever was written first).
+``duplicate_of`` of that owner (``editions`` rule: whoever was written
+first) — unless the new one is a main competition and the stored one a
+``_qual`` slug: then the stored rows become duplicates of the new batch
+(main before ``_qual``).
 
 Never ahead of the live lane: the gate gives ``history`` only what the live
 share leaves and freezes it first on 403/429 — ``LaneClosed`` ends the run
@@ -94,6 +98,9 @@ QUEUE_COLUMNS = (
 # types are not read yet; ``slug`` of the row each run appends.
 INVENTORY = 0
 SEASON = 0
+# ``season_type`` of the inventory row made for an empty ``allow`` (every past
+# season of the slug); a non-empty ``allow`` inventories under ``SEASON``.
+ALL_SEASONS = 1
 RUN_ROW = "(run)"
 PENDING, LISTED, DONE, RED, EMPTY = "pending", "listed", "done", "red", "empty"
 # Why a run ended (state of its run row).
@@ -268,12 +275,19 @@ def _is_qual(slug: str) -> bool:
     return slug.endswith("_qual")
 
 
-def duplicate_owners(trino, slug: str, year: int, event_ids: Sequence[int]) -> dict[int, str]:
-    """``event_id -> "<slug>:<year>"`` of another edition that owns the match."""
+def duplicate_owners(
+    trino, slug: str, year: int, event_ids: Sequence[int]
+) -> tuple[dict[int, str], dict[tuple[str, int], list[int]]]:
+    """Owners of the batch ids stored under another (slug, season).
+
+    Returns ``event_id -> "<slug>:<year>"`` for the ids this batch writes as
+    duplicates, and ``(slug, year) -> ids`` of stored ``_qual`` rows that the
+    batch (a main competition) takes over: they become its duplicates.
+    """
 
     ids = sorted({int(event_id) for event_id in event_ids})
     if not ids:
-        return {}
+        return {}, {}
     rows = trino.execute_query(
         f"SELECT event_id, competition_slug, season_year FROM {_MATCH} "
         "WHERE duplicate_of IS NULL AND event_id IN ("
@@ -282,16 +296,27 @@ def duplicate_owners(trino, slug: str, year: int, event_ids: Sequence[int]) -> d
         (slug, int(year)),
     )
     owners: dict[int, str] = {}
+    retake: dict[tuple[str, int], list[int]] = {}
     for event_id, other_slug, other_year in rows:
         if not _is_qual(slug) and _is_qual(other_slug):
-            # The main competition owns it; the stored _qual row keeps its own.
-            logger.warning(
-                "ESPN %s:%s owns event %s also stored under %s:%s",
-                slug, year, event_id, other_slug, other_year,
-            )
-            continue
-        owners.setdefault(int(event_id), f"{other_slug}:{int(other_year)}")
-    return owners
+            retake.setdefault((other_slug, int(other_year)), []).append(int(event_id))
+        else:
+            owners.setdefault(int(event_id), f"{other_slug}:{int(other_year)}")
+    for event_id in owners:
+        for ids_of in retake.values():
+            if event_id in ids_of:
+                ids_of.remove(event_id)
+    return owners, {key: value for key, value in retake.items() if value}
+
+
+def mark_duplicates(trino, owner: str, slug: str, year: int, event_ids: Sequence[int]) -> None:
+    """``duplicate_of = owner`` on stored match rows (children carry no such column)."""
+
+    trino.execute_query(
+        f"UPDATE {_MATCH} SET duplicate_of = ? WHERE competition_slug = ? AND season_year = ? "
+        "AND event_id IN (" + ", ".join(str(int(event_id)) for event_id in sorted(event_ids)) + ")",
+        (owner, slug, int(year)),
+    )
 
 
 def _collected(known: BronzeMatch | None) -> bool:
@@ -441,10 +466,11 @@ class _Runner:
             )
         )
 
-    def _summary(self, slug: str, event_id: int, closed: bool):
+    def _summary(self, slug: str, event_id: int):
+        """A stored Summary only with a terminal status (a pre-match body of
+        the live lane is read again), otherwise a fresh download."""
+
         request = urls.summary(slug, event_id)
-        if closed:
-            return _fetch(self.client, request, force_refresh=False)
         try:
             result = self.client.replay_json(request.url, request.endpoint, request.params)
         except RawStoreError:
@@ -454,10 +480,8 @@ class _Runner:
             return result
         return _fetch(self.client, request, force_refresh=True)
 
-    def _payload(
-        self, event_id: int, competition: Competition, edition: Edition, closed: bool
-    ) -> MatchPayload:
-        result = self._summary(competition.slug, event_id, closed)
+    def _payload(self, event_id: int, competition: Competition, edition: Edition) -> MatchPayload:
+        result = self._summary(competition.slug, event_id)
         schedule = schedule_row_from_header(
             result.body, competition=competition, edition=edition
         )
@@ -472,9 +496,13 @@ class _Runner:
         return MatchPayload(schedule, parsed, raw, status_checked_at=raw.fetched_at)
 
     def _write(self, slug: str, year: int, payloads: list[MatchPayload]) -> None:
-        owners = duplicate_owners(
+        owners, retake = duplicate_owners(
             self.trino, slug, year, [payload.schedule.event_id for payload in payloads]
         )
+        # Before the write: a failed write leaves the _qual rows pointing at an
+        # owner the next run writes (its matches stay uncollected until then).
+        for (other_slug, other_year), ids in sorted(retake.items()):
+            mark_duplicates(self.trino, f"{slug}:{year}", other_slug, other_year, ids)
         payloads = [
             replace(payload, schedule=replace(payload.schedule, duplicate_of=owners[eid]))
             if (eid := payload.schedule.event_id) in owners
@@ -495,19 +523,40 @@ class _Runner:
             return sorted({slug for slug, _ in self.scope})
         return sorted(self.denominator.targets())
 
+    def _in_scope(self, slug: str, year: int) -> bool:
+        if self.scope:
+            return (slug, year) in self.scope
+        return self.denominator.is_target(slug)
+
     def _inventory(self, queue) -> None:
+        """List the seasons of every scope slug the queue does not cover yet.
+
+        A non-empty ``allow`` needs its (slug, year) pairs in the queue; an
+        empty one needs an ``ALL_SEASONS`` inventory row per target slug, so
+        widening the scope file lists what is new and nothing twice.
+        """
+
+        queued = {key[:2] for key in queue}
         for slug in self._slugs():
-            key = (slug, INVENTORY, SEASON)
+            if self.scope:
+                wanted = {year for other, year in self.scope if other == slug}
+                key = (slug, INVENTORY, SEASON)
+                if all((slug, year) in queued for year in wanted):
+                    continue
+            else:
+                key = (slug, INVENTORY, ALL_SEASONS)
+                if key in queue and queue[key].state == DONE:
+                    continue
             row = queue.get(key)
             if key in self._touched or (
-                row is not None and not (row.state == RED and row.attempts < MAX_ATTEMPTS)
+                row is not None and row.state == RED and row.attempts >= MAX_ATTEMPTS
             ):
                 continue
             self._touched.add(key)
             self._between()
             attempts = (row.attempts if row is not None else 0) + 1
             registry = self.denominator.row(slug)
-            base = row or QueueRow(slug, INVENTORY, SEASON, PENDING)
+            base = row or QueueRow(*key, PENDING)
             if registry is None or not registry.in_target or registry.espn_id is None:
                 raise ValueError(f"history scope names {slug}, not an ESPN target")
             current = registry.current_season_year
@@ -535,29 +584,33 @@ class _Runner:
                 if match is None:
                     raise EspnParseError(f"{slug} seasons: not a season $ref {ref!r}")
                 listed.add(int(match.group(1)))
-            error = None
+            rows = []
             if self.scope:
-                wanted = {year for other, year in self.scope if other == slug}
                 years = tuple(
                     sorted((year for year in wanted if year in listed and year < current), reverse=True)
                 )
-                if set(years) != wanted:
-                    error = "not a past season core lists: " + ", ".join(
-                        str(year) for year in sorted(wanted - set(years))
+                # An allowed season core does not list (or not a past one) is a
+                # red season row: visible, never tried again.
+                rows += [
+                    self._row(
+                        QueueRow(slug, year, SEASON, RED),
+                        attempts=MAX_ATTEMPTS,
+                        last_error=f"core lists no past season {year} (current {current})",
                     )
+                    for year in sorted(wanted - set(years))
+                    if (slug, year) not in queued
+                ]
             else:
                 years = history_years(listed, current)
-            rows = [
-                self._row(
-                    base, state=DONE, matches=len(years), attempts=attempts, last_error=error
-                )
-            ]
+            rows.append(self._row(base, state=DONE, matches=len(years), attempts=attempts,
+                                  last_error=None))
             rows += [
                 self._row(QueueRow(slug, year, SEASON, PENDING))
                 for year in years
-                if not any(other[:2] == (slug, year) for other in queue)
+                if (slug, year) not in queued
             ]
             self._save(queue, rows)
+            queued.update(row.key[:2] for row in rows)
 
     def _order(self, row: QueueRow) -> tuple:
         priority = self.denominator.queue_priority(row.slug)
@@ -575,6 +628,7 @@ class _Runner:
             for row in queue.values()
             if row.season_year != INVENTORY
             and row.key not in self._touched
+            and self._in_scope(row.slug, row.season_year)
             and (
                 row.state in (PENDING, LISTED)
                 or (row.state == RED and row.attempts < MAX_ATTEMPTS)
@@ -655,7 +709,7 @@ class _Runner:
             for event_id in todo[start : start + BATCH_MATCHES]:
                 try:
                     self._between()
-                    payload = self._payload(event_id, competition, edition, season.closed)
+                    payload = self._payload(event_id, competition, edition)
                 except (_Stop, LaneClosed, AllOriginsBlocked) as exc:
                     interrupted = exc
                     break
@@ -770,6 +824,7 @@ __all__ = [
     "append_run_row",
     "default_stop_file",
     "duplicate_owners",
+    "mark_duplicates",
     "ensure_queue_table",
     "history_stopped",
     "history_years",
