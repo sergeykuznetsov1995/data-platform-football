@@ -992,6 +992,35 @@ def test_failures_journal_is_a_separate_table_with_the_manifest_schema():
         repository.append_failure(_complete_attempt())
 
 
+
+class _DuckQuery:
+    """Run the repository's real SQL text on an in-memory DuckDB manifest."""
+
+    def __init__(self, rows):
+        import duckdb
+
+        self.calls = []
+        self.connection = duckdb.connect()
+        self.connection.execute("ATTACH ':memory:' AS iceberg")
+        self.connection.execute("CREATE SCHEMA iceberg.ops")
+        self.connection.execute(
+            render_manifest_ddl().replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
+            .split("WITH (")[0]
+        )
+        columns = ", ".join(MANIFEST_COLUMNS)
+        placeholders = ", ".join("?" for _ in MANIFEST_COLUMNS)
+        for row in rows:
+            self.connection.execute(
+                f"INSERT INTO iceberg.ops.{MANIFEST_TABLE} ({columns}) "
+                f"VALUES ({placeholders})",
+                [row.get(column) for column in MANIFEST_COLUMNS],
+            )
+
+    def execute_query(self, sql, params=None):
+        self.calls.append((sql, params))
+        return self.connection.execute(sql).fetchall()
+
+
 def _manifest_row(
     league: str,
     season: str,
@@ -1013,67 +1042,33 @@ def _manifest_row(
     }
 
 
-def _evaluate_incomplete_query(rows):
-    """Evaluate the plan-query semantics in Python over manifest fixtures."""
-
-    def handler(_sql, params):
-        before, contract, complete, limit = params
-        keys = {
-            (r["league"], r["season"], r["source_league"], int(r["source_season_id"]))
-            for r in rows
-            if int(r["source_season_id"]) < before
-        }
-        latest = {}
-        for r in sorted(
-            (r for r in rows if r["contract_version"] == contract),
-            key=lambda r: (r["completed_at"], r["attempt_id"]),
-        ):
-            latest[(r["league"], r["season"])] = r["status"]
-        selected = [
-            key for key in keys if latest.get((key[0], key[1])) != complete
-        ]
-        return sorted(selected, key=lambda key: (key[3], key[0]))[:limit]
-
-    return handler
-
-
-def test_incomplete_closed_scopes_is_one_parameterized_query():
-    query = _FakeQuery()
-    repository = UnderstatManifestRepository(
+def _history_repository(rows):
+    query = _DuckQuery(rows)
+    return query, UnderstatManifestRepository(
         writer=_FakeWriter(), query=query, ensure_table_on_write=False
     )
 
-    assert repository.incomplete_closed_scopes(
-        before_source_season_id=2025, limit=12
-    ) == []
 
-    assert len(query.calls) == 1
-    sql, params = query.calls[0]
-    assert params == (2025, CONTRACT_VERSION, "complete", 12)
-    assert f"FROM iceberg.ops.{MANIFEST_TABLE}" in sql
-    assert 'ORDER BY "completed_at" DESC, "attempt_id" DESC' in sql
-    assert "LIMIT ?" in sql
-    assert "UNION ALL" not in sql  # no physical verification
-
-
-def test_incomplete_closed_scopes_follows_latest_contract_attempt():
-    rows = [
-        # complete then failed -> incomplete (later failure invalidates).
-        _manifest_row("ENG-Premier League", "1415", 2014, "complete", "2026-09-01"),
-        _manifest_row("ENG-Premier League", "1415", 2014, "failed", "2026-09-02"),
-        # only an older contract -> incomplete for the current one.
-        _manifest_row(
-            "ESP-La Liga", "1415", 2014, "complete", "2026-09-01",
-            contract_version="understat-bronze-v1",
-        ),
-        # complete in the current contract -> done.
-        _manifest_row("ITA-Serie A", "1415", 2014, "complete", "2026-09-01"),
-        # current (open) season -> never a history scope.
-        _manifest_row("GER-Bundesliga", "2526", 2025, "failed", "2026-09-03"),
-    ]
-    query = _FakeQuery(_evaluate_incomplete_query(rows))
-    repository = UnderstatManifestRepository(
-        writer=_FakeWriter(), query=query, ensure_table_on_write=False
+def test_incomplete_closed_scopes_real_sql_follows_latest_contract_attempt():
+    query, repository = _history_repository(
+        [
+            # complete then failed -> incomplete (later failure invalidates).
+            _manifest_row("ENG-Premier League", "1415", 2014, "complete", "2026-09-01"),
+            _manifest_row("ENG-Premier League", "1415", 2014, "failed", "2026-09-02"),
+            # failed then complete -> done.
+            _manifest_row("FRA-Ligue 1", "1415", 2014, "failed", "2026-09-01"),
+            _manifest_row("FRA-Ligue 1", "1415", 2014, "complete", "2026-09-02"),
+            # only an older contract -> incomplete for the current one.
+            _manifest_row(
+                "ESP-La Liga", "1415", 2014, "complete", "2026-09-01",
+                contract_version="understat-bronze-v1",
+            ),
+            # complete in the current contract -> done.
+            _manifest_row("ITA-Serie A", "1415", 2014, "complete", "2026-09-01"),
+            # open season at/after the boundary -> never a history scope.
+            _manifest_row("GER-Bundesliga", "2526", 2025, "failed", "2026-09-03"),
+            _manifest_row("GER-Bundesliga", "2627", 2026, "failed", "2026-09-03"),
+        ]
     )
 
     scopes = repository.incomplete_closed_scopes(
@@ -1085,11 +1080,47 @@ def test_incomplete_closed_scopes_follows_latest_contract_attempt():
         ScopeKey("ESP-La Liga", "1415", source_league="ESP", source_season_id="2014"),
     ]
     assert len(query.calls) == 1
+    sql, params = query.calls[0]
+    assert params is None
+    assert f"FROM iceberg.ops.{MANIFEST_TABLE}" in sql
+    assert "UNION ALL" not in sql  # no physical verification
 
 
-def test_incomplete_closed_scopes_rejects_non_positive_limit():
+def test_incomplete_closed_scopes_real_sql_orders_oldest_first_and_limits():
+    rows = [
+        _manifest_row(league, str(season)[2:] + str(season + 1)[2:], season, "failed", "2026-09-01")
+        for season in (2016, 2014, 2015)
+        for league in ("ITA-Serie A", "ENG-Premier League")
+    ]
+    _query, repository = _history_repository(rows)
+
+    scopes = repository.incomplete_closed_scopes(
+        before_source_season_id=2025, limit=3
+    )
+
+    assert [(scope.league, scope.season) for scope in scopes] == [
+        ("ENG-Premier League", "1415"),
+        ("ITA-Serie A", "1415"),
+        ("ENG-Premier League", "1516"),
+    ]
+
+
+def test_incomplete_closed_scopes_real_sql_is_empty_when_drained():
+    _query, repository = _history_repository(
+        [_manifest_row("ENG-Premier League", "1415", 2014, "complete", "2026-09-01")]
+    )
+    assert repository.incomplete_closed_scopes(
+        before_source_season_id=2025, limit=12
+    ) == []
+
+
+def test_incomplete_closed_scopes_rejects_unsafe_inputs():
     repository = UnderstatManifestRepository(
         writer=_FakeWriter(), query=_FakeQuery(), ensure_table_on_write=False
     )
     with pytest.raises(ValueError, match="limit"):
         repository.incomplete_closed_scopes(before_source_season_id=2025, limit=0)
+    with pytest.raises(ValueError, match="contract_version"):
+        repository.incomplete_closed_scopes(
+            before_source_season_id=2025, contract_version="x' OR 1=1 --", limit=1
+        )

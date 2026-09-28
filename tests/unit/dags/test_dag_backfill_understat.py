@@ -204,8 +204,9 @@ def test_planner_selects_incomplete_closed_scopes_in_manifest_order(
     assert {item["UNDERSTAT_SOURCE_DISCOVERED"] for item in plan} == {"true"}
     assert len(query.calls) == 1
     sql, params = query.calls[0]
-    assert 'ORDER BY k."source_season_id", k."league" LIMIT ?' in sql
-    assert params[-1] == dag_module.HISTORY_SCOPES_PER_RUN == 12
+    assert params is None
+    assert dag_module.HISTORY_SCOPES_PER_RUN == 12
+    assert sql.endswith('ORDER BY k."source_season_id", k."league" LIMIT 12')
 
 
 def test_planner_bounds_history_by_current_source_season(dag_module, monkeypatch):
@@ -217,7 +218,7 @@ def test_planner_bounds_history_by_current_source_season(dag_module, monkeypatch
 
     dag_module.plan_history_scope(run_id="scheduled__bound")
 
-    assert query.calls[0][1][0] == 2031
+    assert 'TRY_CAST("source_season_id" AS integer) < 2031)' in query.calls[0][0]
 
 
 def test_planner_fails_loudly_when_manifest_query_fails(dag_module, monkeypatch):
@@ -227,3 +228,49 @@ def test_planner_fails_loudly_when_manifest_query_fails(dag_module, monkeypatch)
     with pytest.raises(RuntimeError, match="does not exist"):
         dag_module.plan_history_scope(run_id="scheduled__broken")
     assert len(query.calls) == 1
+
+
+def test_planner_full_path_on_cold_trino_connection_sends_two_statements(
+    dag_module, monkeypatch
+):
+    """Count statements on the wire: connection ping + one manifest query.
+
+    Bind parameters would add the driver's ``EXECUTE IMMEDIATE`` probe on a
+    cold connection, so the manifest query must reach the cursor unbound.
+    """
+
+    import scrapers.understat as understat
+    from scrapers.base.trino_manager import TrinoTableManager
+
+    statements = []
+
+    class _Cursor:
+        def execute(self, sql, *params):
+            statements.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            pass
+
+    class _Connection:
+        def cursor(self):
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    def _no_site(*_args, **_kwargs):
+        raise AssertionError("history plan must not contact Understat")
+
+    monkeypatch.setattr(understat, "UnderstatClient", _no_site)
+    monkeypatch.setattr(understat, "UnderstatCatalog", _no_site)
+    monkeypatch.setattr(TrinoTableManager, "_create_connection", lambda self: _Connection())
+
+    assert dag_module.plan_history_scope(run_id="scheduled__cold") == []
+
+    assert [sql for sql, _params in statements][0] == "SELECT 1"
+    assert len(statements) == 2
+    assert statements[1][0].startswith("WITH keys AS")
+    assert statements[1][1] == ()
