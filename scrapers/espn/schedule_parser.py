@@ -521,6 +521,76 @@ def parse_all_scoreboard_day(
     )
 
 
+def schedule_row_from_header(
+    raw: bytes, *, competition: Competition, edition: Edition
+) -> ScheduleRow:
+    """The schedule row of one match from its Summary ``header`` (#1509).
+
+    The history lane reads no scoreboard: the event is rebuilt in the shape
+    of a scoreboard event (id, kickoff, season year, status, the two sides
+    with ``shootoutScore``, venue and attendance from ``gameInfo``) and goes
+    through the same ``_event_row``, so the row equals the scoreboard row of
+    the same match except ``extra_json``.  A header of another season or a
+    kickoff outside the edition window is an error, never a skipped match.
+    """
+
+    _validate_scope(competition, edition)
+    payload = decode_object(raw, "Summary")
+    header = required_mapping(payload.get("header"), "Summary.header")
+    competitions = required_list(header.get("competitions"), "header.competitions")
+    if len(competitions) != 1:
+        raise EspnParseError("header must have exactly one competition")
+    node = required_mapping(competitions[0], "header.competitions[0]")
+    game_info = payload.get("gameInfo")
+    game_info = game_info if isinstance(game_info, Mapping) else {}
+    sides = []
+    for index, raw_side in enumerate(
+        required_list(node.get("competitors"), "header.competitors")
+    ):
+        side = required_mapping(raw_side, f"header.competitors[{index}]")
+        team = required_mapping(side.get("team"), f"header.competitors[{index}].team")
+        item: dict[str, Any] = {
+            "homeAway": side.get("homeAway"),
+            "team": {"id": team.get("id"), "displayName": team.get("displayName")},
+            "score": side.get("score"),
+        }
+        if side.get("shootoutScore") is not None:
+            item["shootoutScore"] = side["shootoutScore"]
+        sides.append(item)
+    event_competition: dict[str, Any] = {"competitors": sides}
+    if header.get("timeValid") is not None:
+        event_competition["timeValid"] = header["timeValid"]
+    venue = game_info.get("venue")
+    if isinstance(venue, Mapping):
+        event_competition["venue"] = {"id": venue.get("id"), "fullName": venue.get("fullName")}
+    if game_info.get("attendance") is not None:
+        event_competition["attendance"] = game_info["attendance"]
+    status = required_mapping(node.get("status"), "header.status")
+    status_type = required_mapping(status.get("type"), "header.status.type")
+    event = {
+        "id": header.get("id"),
+        "date": node.get("date"),
+        "season": {"year": required_mapping(header.get("season"), "header.season").get("year")},
+        "status": {"type": {"name": status_type.get("name")}},
+        "competitions": [event_competition],
+    }
+    kickoff = utc_datetime(event["date"], "header.competitions[0].date")
+    row = _event_row(
+        event,
+        competition=competition,
+        edition=edition,
+        query_start=kickoff.date(),
+        query_end=kickoff.date(),
+        source_extra={},
+    )
+    if row is None:
+        raise EspnParseError(
+            f"Summary header of event {header.get('id')} is outside "
+            f"{competition.scope_id(edition)}"
+        )
+    return row
+
+
 def stale_open_events(
     rows: Iterable[ScheduleRow],
     now: datetime,

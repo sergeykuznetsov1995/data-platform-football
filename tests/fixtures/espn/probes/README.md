@@ -104,3 +104,45 @@
   колонки `MatchEventRow` читаются по этим ключам и на записанных телах пустые, тип события —
   `type_id/type_text`. У записей `commentary` команда и участники — только имена без ID:
   `team_id`/`athlete_ids` пустые, имена — в `extra_json`.
+
+
+## История: списки core прошлых сезонов (#1509)
+
+Сняты 28.09.2026 10:40–10:41 UTC (13:40–13:41 МСК) напрямую с VM, без прокси, подпись
+парсера `data-platform-football/espn-native-v2`, пауза ≥ 3 с между запросами: 17 запросов,
+все 200, 711 331 байт (списки — 59 629 байт, два summary — 651 702). В репозиторий положены
+16 тел: второе summary (`summary?event=422664`, 333 230 байт) тестам не нужно и не добавлено.
+Используются `test_espn_history.py`. Адреса — ровно те, что строит раннер истории
+(`limit=100`, страницы с `page=N`).
+
+| Файл | Байт | URL |
+|---|---|---|
+| `seasons_eng1_limit100.json` | 2795 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/seasons?limit=100&lang=en&region=us |
+| `season_eng1_2015.json` | 2143 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/seasons/2015?lang=en&region=us |
+| `types_eng1_2015.json` | 176 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/seasons/2015/types?lang=en&region=us |
+| `type_events_eng1_2015_t1_p1.json` | 10666 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/seasons/2015/types/1/events?limit=100&lang=en&region=us |
+| `type_events_eng1_2015_t1_p2.json` | 10666 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/seasons/2015/types/1/events?limit=100&page=2&lang=en&region=us |
+| `type_events_eng1_2015_t1_p3.json` | 10666 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/seasons/2015/types/1/events?limit=100&page=3&lang=en&region=us |
+| `type_events_eng1_2015_t1_p4.json` | 8546 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/seasons/2015/types/1/events?limit=100&page=4&lang=en&region=us |
+| `type_events_uefa.champions_2010_t1.json` | 524 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/1/events?limit=100&lang=en&region=us |
+| `type_events_uefa.champions_2010_t2.json` | 3975 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/2/events?limit=100&lang=en&region=us |
+| `type_events_uefa.champions_2010_t3.json` | 3515 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/3/events?limit=100&lang=en&region=us |
+| `type_events_uefa.champions_2010_t4.json` | 2365 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/4/events?limit=100&lang=en&region=us |
+| `type_events_uefa.champions_2010_t6.json` | 1905 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/6/events?limit=100&lang=en&region=us |
+| `type_events_uefa.champions_2010_t7.json` | 984 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/7/events?limit=100&lang=en&region=us |
+| `type_events_uefa.champions_2010_t8.json` | 524 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/8/events?limit=100&lang=en&region=us |
+| `type_events_uefa.champions_2010_t9.json` | 179 | https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions/seasons/2010/types/9/events?limit=100&lang=en&region=us |
+| `summary_eng1_2015_422285.json` | 318472 | https://site.web.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event=422285 |
+
+- eng.1 2015 — один type (`types_eng1_2015.json`: `count=1`), 380 матчей на четырёх страницах
+  `limit=100` (`pageCount=4`, на четвёртой 80): единственная живая запись страницы с
+  `pageIndex > 1`. Сезон закрыт (`endDate` 2016-06-01), раннер читает его из raw store.
+- UCL 2010 — восемь types рядом с записанной группой (`core_events_ucl_2010_type5.json`, снята
+  с `limit=1000`; тест отдаёт её по адресу `limit=100`: 96 матчей, одна страница при любом
+  лимите). Всего 213 матчей, пересечений между types нет — повтор внутри сезона и двойник
+  между турнирами в тестах синтетические (тот же `$ref` во втором списке).
+- `summary_eng1_2015_422285.json` — первый матч первой страницы; сезоны из сотен матчей в
+  тестах берут это тело под каждым id списка (в `header` переписаны `id`).
+- Сезоны eng.1 2005 и ЧМ 2010 (глубина: без формаций; пустые составы при полной статистике)
+  в тестах — синтетические списки одного матча вокруг записанных summary
+  `summary_eng1_2005.json` и `summary_fifaworld_2010.json`.
