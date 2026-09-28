@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Football Data Platform</title>
-<meta name="description" content="Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов и ЧМ-2026, живые дашборды без регистрации.">
+<meta name="description" content="Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов, живые дашборды без регистрации.">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23111'/%3E%3Ctext x='16' y='22' font-family='Georgia,serif' font-size='18' fill='white' text-anchor='middle'%3EF%3C/text%3E%3C/svg%3E">
 <style>
@@ -114,11 +114,11 @@
 
   <h1 class="serif" data-i18n="title">Футбольные данные для авторов и аналитиков</h1>
   <p class="lead" data-i18n="lead">Открытые данные из 11 источников собраны в одно хранилище: матчи, события, удары, xG, составы, трансферы, рейтинги.</p>
-  <p class="lead-2" data-i18n="lead2">Дашборды ниже открываются без регистрации. Данные — топ-5 европейских лиг по сезон 2025/26 включительно и чемпионат мира 2026.</p>
+  <p class="lead-2" data-i18n="lead2">Дашборды ниже открываются без регистрации. Данные — топ-5 европейских лиг за десять сезонов, по 2025/26 включительно.</p>
 
   <section class="figures" aria-label="figures">
     <div class="fig"><b class="serif">11</b><span data-i18n="f_sources">источников данных</span></div>
-    <div class="fig"><b class="serif">10</b><span data-i18n="f_seasons">сезонов топ-5 лиг, 2016/17–2025/26, плюс ЧМ-2026</span></div>
+    <div class="fig"><b class="serif">10</b><span data-i18n="f_seasons">сезонов топ-5 лиг, 2016/17–2025/26</span></div>
     <div class="fig"><b class="serif" data-i18n="f_matches_v">18 тыс.</b><span data-i18n="f_matches">матчей</span></div>
     <div class="fig"><b class="serif" data-i18n="f_events_v">28 млн</b><span data-i18n="f_events">событий</span></div>
     <div class="fig"><b class="serif" data-i18n="f_shots_v">429 тыс.</b><span data-i18n="f_shots">ударов</span></div>
@@ -170,9 +170,9 @@
     ru: {
       title: "Футбольные данные для авторов и аналитиков",
       lead: "Открытые данные из 11 источников собраны в одно хранилище: матчи, события, удары, xG, составы, трансферы, рейтинги.",
-      lead2: "Дашборды ниже открываются без регистрации. Данные — топ-5 европейских лиг по сезон 2025/26 включительно и чемпионат мира 2026.",
+      lead2: "Дашборды ниже открываются без регистрации. Данные — топ-5 европейских лиг за десять сезонов, по 2025/26 включительно.",
       f_sources: "источников данных",
-      f_seasons: "сезонов топ-5 лиг, 2016/17–2025/26, плюс ЧМ-2026",
+      f_seasons: "сезонов топ-5 лиг, 2016/17–2025/26",
       f_matches_v: "18 тыс.", f_matches: "матчей",
       f_events_v: "28 млн", f_events: "событий",
       f_shots_v: "429 тыс.", f_shots: "ударов",
@@ -186,14 +186,14 @@
       sql: "Нужен SQL или Jupyter — напишите: ",
       foot: "Пет-проект Сергея Кузнецова. Данные из открытых источников, для некоммерческого использования.",
       langBtn: "English", themeDark: "Тёмная", themeLight: "Светлая",
-      desc: "Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов и ЧМ-2026, живые дашборды без регистрации."
+      desc: "Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов, живые дашборды без регистрации."
     },
     en: {
       title: "Football data for writers and analysts",
       lead: "Open data from 11 sources, collected into one warehouse: matches, events, shots, xG, line-ups, transfers, ratings.",
-      lead2: "The dashboards below open without sign-up. Data covers the top-5 European leagues up to and including 2025/26, plus the 2026 World Cup.",
+      lead2: "The dashboards below open without sign-up. Data covers ten seasons of the top-5 European leagues, up to and including 2025/26.",
       f_sources: "data sources",
-      f_seasons: "seasons of the top-5 leagues, 2016/17–2025/26, plus WC 2026",
+      f_seasons: "seasons of the top-5 leagues, 2016/17–2025/26",
       f_matches_v: "18k", f_matches: "matches",
       f_events_v: "28M", f_events: "events",
       f_shots_v: "429k", f_shots: "shots",
@@ -207,7 +207,7 @@
       sql: "Need SQL or Jupyter access? Message me: ",
       foot: "A pet project by Sergey Kuznetsov. Data from open sources, for non-commercial use.",
       langBtn: "Русский", themeDark: "Dark", themeLight: "Light",
-      desc: "Football data platform for writers and analysts: top-5 leagues over 10 seasons and the 2026 World Cup, live dashboards without sign-up."
+      desc: "Football data platform for writers and analysts: top-5 leagues over 10 seasons, live dashboards without sign-up."
     }
   };
   var store = { get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
