@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -72,16 +74,31 @@ def test_landing_links_three_dashboards_github_and_telegram():
     assert "<script src=" not in html and "<link rel=\"stylesheet\"" not in html, "без внешних зависимостей"
 
 
-def test_tracked_docs_and_configs_do_not_leak_vm_address():
-    pattern = re.compile(r"159\.195\.193\.250|ssh\s+\S*\s*root@\d|2a0a:4cc0")
+def _tracked_files() -> list[Path]:
+    out = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True
+    ).stdout
+    return [ROOT / p for p in out.decode().split("\0") if p]
+
+
+def test_tracked_files_do_not_leak_vm_address():
+    """Адрес VM в репозитории не хранится — сравниваем по хешу, чтобы не хранить
+    его и в этом тесте. Плюс ни одного ``ssh … root@<ip>``."""
+    vm_ip_sha256 = "17ee8084e74a1544ddff2fe2e1c9243759b7437b2953f2b067df9426f9ed5c54"
+    ipv4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    ssh_root_ip = re.compile(r"ssh\b[^\n]*\broot@(?:\d{1,3}\.){3}\d{1,3}")
     offenders = []
-    for base in ("docs", "configs"):
-        for path in (ROOT / base).rglob("*"):
-            if path.is_file() and path.suffix in {".md", ".py", ".sh", ".local", ".yaml", ".yml", ".html", ".example", ""}:
-                try:
-                    text = path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    continue
-                if pattern.search(text):
-                    offenders.append(str(path.relative_to(ROOT)))
+    for path in _tracked_files():
+        if path.suffix in {".png", ".jpg", ".jpeg", ".gif", ".ico", ".zip", ".parquet", ".pdf", ".woff", ".woff2"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
+            continue
+        if ssh_root_ip.search(text):
+            offenders.append(f"{path.relative_to(ROOT)}: ssh root@<ip>")
+        for token in set(ipv4.findall(text)):
+            if hashlib.sha256(token.encode()).hexdigest() == vm_ip_sha256:
+                offenders.append(f"{path.relative_to(ROOT)}: адрес VM")
+                break
     assert not offenders, offenders
