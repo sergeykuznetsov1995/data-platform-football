@@ -928,3 +928,100 @@ def test_new_parser_version_downloads_nothing(tmp_path) -> None:
     assert len(client.network("/summary?")) == downloads
     assert client.replays == [_summary_key("eng.1")]
     assert _matches(trino)[578281]["parser_version"] == PARSER_VERSION
+
+
+SINCE, UNTIL = date(2026, 9, 20), date(2026, 9, 22)
+
+
+def _league(slug: str, espn_id: str, *events: dict) -> bytes:
+    return json.dumps({"leagues": [{"id": espn_id, "slug": slug}], "events": list(events)}).encode()
+
+
+@pytest.mark.unit
+def test_manual_window_catches_up_its_days_and_the_core_list(tmp_path) -> None:
+    """#1508: a manual run plans ``since..until`` only, core over the window."""
+    _state_path(tmp_path)
+    body = _summary("eng.1")
+    body["header"]["id"] = "900009"
+    responses = _responses(_day(), _day())
+    del responses[_req_key(urls.all_scoreboard_day(YESTERDAY))]
+    del responses[_req_key(urls.all_scoreboard_day(TODAY))]
+    responses.update({
+        _req_key(urls.all_scoreboard_day(SINCE)): _day(
+            _event("eng.1", when="2026-09-20T15:00Z"),
+            _event("ger.2", when="2026-09-20T16:00Z"),
+        ),
+        _req_key(urls.all_scoreboard_day(date(2026, 9, 21))): _day(),
+        _req_key(urls.all_scoreboard_day(UNTIL)): _day(),
+        # 900009: core lists it, no fetched day has it; it is on its league day 21.09.
+        _req_key(urls.events_window("eng.1", SINCE, UNTIL)): _core_list(578281, 900009),
+        _req_key(urls.events_window("ger.2", SINCE, UNTIL)): _core_list(),
+        _req_key(urls.events_window("uefa.champions", SINCE, UNTIL)): _core_list(),
+        _req_key(urls.league_scoreboard_day("eng.1", SINCE)): _league("eng.1", "700"),
+        _req_key(urls.league_scoreboard_day("eng.1", date(2026, 9, 21))): _league(
+            "eng.1", "700", _event("eng.1", when="2026-09-21T18:00Z", event_id=900009)
+        ),
+        _summary_key("eng.1", 900009): json.dumps(body).encode(),
+    })
+    client = FakeClient(responses)
+    trino = WaveTrino()
+
+    def plan():
+        # The 00-wave flags are ignored in a window: no rechecks, no stale checks.
+        return wave.plan_wave(
+            client=client, trino=trino, rows=_rows(), state_path=tmp_path / "editions.json",
+            now=NOW, check_stale=True, check_core=False, check_recheck=True,
+            since=SINCE, until=UNTIL,
+        )
+
+    first = plan()
+    works = {w.slug: w for w in first.works}
+    ger2 = int(_summary("ger.2")["header"]["id"])
+
+    assert first.days == (SINCE, date(2026, 9, 21), UNTIL)
+    assert works["eng.1"].event_ids == (578281, 900009)
+    assert works["eng.1"].topup_days == (date(2026, 9, 21),)
+    assert works["ger.2"].event_ids == (ger2,)
+    assert "uefa.champions" not in works
+    assert not client.network("dates=20260924") and not client.network("dates=20260925")
+    assert not any("status IN" in sql or "_share" in sql for sql in trino.queries)
+
+    outcomes = _run(first, client, trino)
+    assert {o["slug"]: o["state"] for o in outcomes} == {"eng.1": wave.GREEN, "ger.2": wave.GREEN}
+    rows = _matches(trino)
+    assert {578281, 900009, ger2} <= set(rows)
+    assert rows[900009]["played_final"] is True
+
+    # The same window again writes nothing: bronze already has its matches.
+    assert plan().works == ()
+
+
+@pytest.mark.unit
+def test_catch_up_window_is_checked_before_any_request(tmp_path) -> None:
+    today = NOW.date()
+    assert wave.check_window(None, None, today) is None
+    assert wave.check_window(date(2026, 9, 12), today, today) == (date(2026, 9, 12), today)
+    for since, until in (
+        (SINCE, None),
+        (None, UNTIL),
+        (UNTIL, SINCE),
+        (SINCE, today + timedelta(days=1)),
+        (date(2026, 9, 11), today),  # 15 days
+    ):
+        with pytest.raises(ValueError):
+            wave.check_window(since, until, today)
+
+    _state_path(tmp_path)
+    client = FakeClient({})
+    with pytest.raises(ValueError, match="both since and until"):
+        wave.plan_wave(
+            client=client, trino=WaveTrino(), rows=_rows(),
+            state_path=tmp_path / "editions.json", now=NOW, check_stale=False, since=SINCE,
+        )
+    assert client.calls == []
+
+
+@pytest.mark.unit
+def test_without_a_window_the_wave_plans_yesterday_and_today(tmp_path) -> None:
+    _, _, plan, _ = _wave1(tmp_path)
+    assert plan.days == (YESTERDAY, TODAY)

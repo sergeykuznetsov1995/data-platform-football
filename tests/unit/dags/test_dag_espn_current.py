@@ -193,3 +193,78 @@ def test_trino_is_the_espn_manager_without_dynamic_filtering(
 
     monkeypatch.undo()  # the autouse log_conn stub replaces _trino
     assert type(dag_module._trino()) is EspnTrinoTableManager
+
+
+@pytest.fixture
+def planned(dag_module, monkeypatch):
+    """``plan_wave`` of the DAG with the wave logic stubbed: records its kwargs."""
+    import scrapers.espn.denominator as denominator
+    from scrapers.espn import editions_store, wave
+
+    seen: dict = {}
+
+    def plan_wave(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(works=())
+
+    monkeypatch.setattr(wave, "plan_wave", plan_wave)
+    monkeypatch.setattr(wave, "live_rows", lambda denominator: [])
+    monkeypatch.setattr(wave, "finish_requests", lambda *args, **kwargs: None)
+    monkeypatch.setattr(denominator, "load_denominator", lambda: None)
+    monkeypatch.setattr(editions_store, "default_state_path", lambda: None)
+    monkeypatch.setattr(dag_module, "_client", lambda: None)
+    return seen
+
+
+def _plan_context(**conf):
+    return {"dag_run": SimpleNamespace(conf=conf), "run_id": "manual__x"}
+
+
+@pytest.mark.unit
+def test_plan_wave_passes_the_catch_up_window_of_the_conf(dag_module, planned) -> None:
+    """#1508: conf {"since", "until"} of a manual run reaches the wave plan."""
+    from datetime import date
+
+    dag_module.plan_wave(**_plan_context(since="2026-08-13", until="2026-08-15"))
+
+    assert (planned["since"], planned["until"]) == (date(2026, 8, 13), date(2026, 8, 15))
+
+
+@pytest.mark.unit
+def test_plan_wave_without_conf_plans_the_usual_wave(dag_module, planned) -> None:
+    dag_module.plan_wave(**_plan_context())
+    assert (planned["since"], planned["until"]) == (None, None)
+    planned.clear()
+    dag_module.plan_wave(dag_run=SimpleNamespace(), run_id="scheduled__x")
+    assert (planned["since"], planned["until"]) == (None, None)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "conf",
+    [
+        {"since": "2026-08-13"},
+        {"since": "2026-08-13", "until": "2026-08-27"},  # 15 days
+        {"since": "2026-08-15", "until": "2026-08-13"},
+        {"since": "2999-01-01", "until": "2999-01-02"},
+        {"since": "13.08.2026", "until": "2026-08-15"},
+    ],
+)
+def test_plan_wave_fails_without_retry_on_a_bad_window(dag_module, planned, conf) -> None:
+    from airflow.exceptions import AirflowFailException
+
+    with pytest.raises(AirflowFailException, match="catch-up window"):
+        dag_module.plan_wave(**_plan_context(**conf))
+    assert planned == {}
+
+
+@pytest.mark.unit
+def test_wave_row_of_a_catch_up_run_shows_its_window(dag_module, log_conn) -> None:
+    instances = [_TI("plan_wave", "success"), _TI("run_tournament", "success", 0, _outcome("x.0"))]
+    context = _context(instances)
+    context["dag_run"].conf = {"since": "2026-08-13", "until": "2026-08-15"}
+
+    dag_module.wave_summary(**context)
+
+    (insert,) = [sql for sql in log_conn.sql if sql.startswith("INSERT")]
+    assert "'(wave)', NULL, 'green', 1, 'window 2026-08-13..2026-08-15'" in insert
