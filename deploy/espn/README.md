@@ -320,7 +320,7 @@ ESPN иногда дописывает матч позже (составы/су�
 | расписание | каждые 30 мин (`*/30 * * * *`), `max_active_runs=1`, создаётся **на паузе** |
 | задачи | `prepare` (таблицы bronze, журнал запросов, очередь) → `run_history` |
 | пул | `espn_history`: 1 слот, `priority_weight=1`, `weight_rule="absolute"` (`pools.json`) |
-| время | бюджет прогона 30 мин (раннер выходит сам), таймаут задачи 35 мин, ретраев нет — следующий прогон через 30 мин |
+| время | бюджет прогона 20 мин (раннер выходит сам), таймаут задачи 25 мин, `dagrun_timeout` 28 мин, ретраев нет — следующий прогон через 30 мин; между прогонами истории ≥ 10 мин окна для доставки |
 | заслонка | полоса `history`: только остаток сверх доли актуалки (`live_share` 0,5), при 403/429 замирает первой — `LaneClosed`, прогон выходит без ошибки |
 | долг актуалки | перед каждой пачкой: есть матч живого турнира с kickoff 14…72 ч назад, который измеритель считает «в сроке», а он не опубликован, — прогон выходит до следующего |
 | очередь | `iceberg.ops.espn_history_queue_v1`: строка на турнир × сезон × type (`pending → listed → done | red | empty`) + строка `(run)` на каждый прогон (причина выхода, матчей записано) |
@@ -416,7 +416,7 @@ FROM iceberg.ops.espn_history_queue_v1 ORDER BY updated_at DESC LIMIT 20;
 (`merge-base --is-ancestor`; иначе стоп «нужны руки»), не в `rejected` и `git diff accepted..master`
 задевает пути контура (`deploy/espn`, `configs/espn` + замыкание импортов DAG из
 `deploy/espn/dags`, в т.ч. `scrapers/base/*` и относительные импорты) → окно: нет
-running/queued `dag_espn_current` и `dag_espn_history` (#1509; прогон истории ≤ 35 мин) и до
+running/queued `dag_espn_current` и `dag_espn_history` (#1509; прогон истории ≤ 25 мин, между прогонами ≥ 10 мин окна) и до
 волны 00/06/12/18 UTC ≥ 10 мин → корень релиза →
 [`run --rm --no-deps -T airflow-init`] → `up -d --no-deps --force-recreate airflow-scheduler
 airflow-webserver` с `ESPN_RELEASE_ROOT=<корень>` в окружении вызова → приёмка ≤ 7 мин:

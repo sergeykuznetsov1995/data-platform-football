@@ -53,9 +53,21 @@ def test_run_is_below_the_live_lane_and_bounded_in_time(dag_module) -> None:
     assert run._init_kwargs["pool"] == "espn_history"
     assert run._init_kwargs["priority_weight"] == 1
     assert run._init_kwargs["weight_rule"] == "absolute"
-    assert run._init_kwargs["execution_timeout"] == timedelta(minutes=35)
-    assert dag_module.BUDGET == timedelta(minutes=30)
+    assert run._init_kwargs["execution_timeout"] == timedelta(minutes=25)
+    assert dag_module.BUDGET == timedelta(minutes=20)
+    assert dag_module.dag._dag_kwargs["dagrun_timeout"] == timedelta(minutes=28)
     assert run._init_kwargs["retries"] == 0
+
+
+def test_runs_leave_a_delivery_window_between_them(dag_module) -> None:
+    # busy_reason of auto_deliver (cron */5) waits for a history run: budget plus
+    # two delivery ticks must fit the 30-min interval, and a stuck run is killed
+    # before the next one is due.
+    interval = timedelta(minutes=30)
+    tick = timedelta(minutes=5)
+    assert dag_module.SCHEDULE == "*/30 * * * *"
+    assert dag_module.BUDGET + 2 * tick <= interval
+    assert dag_module.BUDGET < dag_module.TASK_TIMEOUT < dag_module.DAGRUN_TIMEOUT < interval
 
 
 def test_prepare_creates_the_queue_table(dag_module, monkeypatch) -> None:
@@ -119,7 +131,7 @@ def test_run_uses_the_history_lane_scope_budget_and_stop_file(dag_module, monkey
     assert seen["client"] is client and seen["conn"] == "conn" and seen["stop_file"] == stop
     assert seen["scope"] == (("eng.1", 2015),) and seen["run_id"] == "scheduled__1"
     assert seen["task_id"] == "run_history"
-    assert timedelta(minutes=29) < seen["deadline"] - before <= timedelta(minutes=30, seconds=5)
+    assert timedelta(minutes=19) < seen["deadline"] - before <= timedelta(minutes=20, seconds=5)
     assert closed == [True]
 
 

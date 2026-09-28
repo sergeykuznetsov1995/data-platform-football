@@ -5,7 +5,7 @@ folder, #1507), never in ``dags/``.  Paused on creation; the owner unpauses it.
 
 prepare -> run_history.  The logic is ``scrapers.espn.history``: one run walks
 the queue ``iceberg.ops.espn_history_queue_v1`` until it is empty, the time
-budget (30 min) ends, the live lane has a debt, the gate closes the
+budget (20 min) ends, the live lane has a debt, the gate closes the
 ``history`` lane or the stop file appears; each of those is a clean end.
 Never ahead of the live lane: its own pool ``espn_history`` (1 slot),
 ``priority_weight=1`` with ``weight_rule="absolute"`` and the ``history``
@@ -33,8 +33,11 @@ SCHEDULE = "*/30 * * * *"
 HISTORY_POOL = "espn_history"
 RUN_TASK_ID = "run_history"
 # The run stops itself after the budget; the task timeout is the backstop.
-BUDGET = timedelta(minutes=30)
-TASK_TIMEOUT = timedelta(minutes=35)
+# Budget well below the 30-min interval: >= 10 min (2 ticks of the */5 delivery
+# cron) between runs, else busy_reason starves the espn-live delivery.
+BUDGET = timedelta(minutes=20)
+TASK_TIMEOUT = timedelta(minutes=25)
+DAGRUN_TIMEOUT = timedelta(minutes=28)
 
 DEFAULT_ARGS: dict[str, Any] = {
     "owner": "data-platform",
@@ -107,7 +110,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     is_paused_upon_creation=True,
-    dagrun_timeout=timedelta(minutes=45),
+    dagrun_timeout=DAGRUN_TIMEOUT,
     tags=["espn", "bronze", "scraping", "history"],
     doc_md=__doc__,
 ) as dag:
