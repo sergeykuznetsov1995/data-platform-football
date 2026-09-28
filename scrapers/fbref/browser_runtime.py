@@ -15,8 +15,8 @@ CURL_CFFI_PACKAGE_VERSION = "0.15.0"
 # versions is to use the nearest previous fingerprint with current headers.
 HTTP_IMPERSONATE_TARGET = "firefox147"
 
-# FBref is isolated from SofaScore's reviewed v135 browser. Updating one source
-# must never silently change the other's paid-canary runtime.
+# SofaScore launches this same build since #1560 (its v135 build is refused by
+# the SofaScore edge): a bump here changes both sources' browser.
 INSTALL_DIR = Path("/opt/fbref-camoufox")
 EXECUTABLE_PATH = INSTALL_DIR / "camoufox-bin"
 FONTCONFIG_PATH = INSTALL_DIR / "fontconfig" / CAMOUFOX_TARGET_OS
