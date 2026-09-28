@@ -107,6 +107,9 @@ class World:
         # slot_pool: имя → (слоты, include_deferred)
         self.pools: dict[str, tuple[int, bool]] = {"default_pool": (128, False), "espn_live": (4, False)}
         self.running = 0
+        self.running_history = 0              # dag_run running/queued dag_espn_history
+        self.stale_dags: set[str] = set()      # DAG, которые после выката не перечитаны
+        self.missing_dags: set[str] = set()    # DAG, чьих файлов нет в выкаченном корне
         self.metadb_up = True
         self.env = ["AIRFLOW_HOME=/opt/airflow", "TRINO_PASSWORD=secret"]
         self.tamper: set[str] = set()          # относительные пути, чьи байты в контейнере «чужие»
@@ -186,7 +189,10 @@ class FakeHost(ad.Host):
             w.labelled.discard(str(w.root))
         w.root = root
         w.labelled.add(str(root))
-        broken = "BROKEN" in (root / "deploy/espn/dags/dag_espn_current.py").read_text()
+        current = root / "deploy/espn/dags/dag_espn_current.py"
+        # DAG удалён из корня: строка в metadb остаётся, но не перечитывается
+        w.missing_dags = set() if current.exists() else {ad.DAG_ID}
+        broken = current.exists() and "BROKEN" in current.read_text()
         at = self.clock + timedelta(seconds=30)
         if broken:
             w.import_errors = [("/opt/airflow/dags/dag_espn_current.py", at)]
@@ -207,7 +213,7 @@ class FakeHost(ad.Host):
         if sql == "SELECT now()":
             return 0, self.clock.isoformat() + "\n", ""
         if sql.startswith("SELECT count(*) FROM dag_run"):
-            return 0, f"{w.running}\n", ""
+            return 0, f"{w.running_history if ad.HISTORY_DAG_ID in sql else w.running}\n", ""
         if sql.startswith("SELECT filename FROM import_error"):
             return 0, "".join(f"{f}\n" for f, t in w.import_errors if visible(t) and t > cut), ""
         if sql == "SELECT count(*) FROM import_error":
@@ -216,6 +222,7 @@ class FakeHost(ad.Host):
             if w.parsed is None and not w.dag_error:
                 return 0, "", ""
             fresh = w.parsed is not None and visible(w.parsed) and w.parsed > cut
+            fresh = fresh and re.search(r"dag_id = '([^']+)'", sql).group(1) not in w.stale_dags | w.missing_dags
             return 0, f"{'t' if w.dag_error else 'f'}|{'t' if fresh else 'f'}\n", ""
         if sql.startswith("SELECT pool || '|' || slots || '|' || CASE WHEN include_deferred"):
             assert "WHERE pool <> 'default_pool'" in sql
@@ -639,12 +646,69 @@ def test_compose_metadb_healthcheck_is_tcp():
     assert "pg_isready -h 127.0.0.1" in test[-1]
 
 
+def _constant(tree, name):
+    return next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
+                and getattr(n.targets[0], "id", None) == name)
+
+
 def test_pools_json_matches_dag_pool_and_concurrency():
     pools = ad.pools_of(ROOT)
-    src = (ROOT / "deploy/espn/dags/dag_espn_current.py").read_text()
-    tree = ast.parse(src)
-    live_pool = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
-                     and getattr(n.targets[0], "id", None) == "LIVE_POOL")
+    tree = ast.parse((ROOT / "deploy/espn/dags/dag_espn_current.py").read_text())
     tis = [kw.value.value for n in ast.walk(tree) if isinstance(n, ast.Call)
            for kw in n.keywords if kw.arg == "max_active_tis_per_dag"]
-    assert pools == {live_pool: f"{tis[0]}|f"} == {"espn_live": "4|f"}
+    history = ast.parse((ROOT / "deploy/espn/dags/dag_espn_history.py").read_text())
+    assert pools == {_constant(tree, "LIVE_POOL"): f"{tis[0]}|f",
+                     _constant(history, "HISTORY_POOL"): "1|f"} == {"espn_live": "4|f", "espn_history": "1|f"}
+    # Автомат знает оба DAG контура.
+    assert set(ad.BUSY_DAGS) == {_constant(tree, "DAG_ID"), _constant(history, "DAG_ID")}
+
+
+# ---------- история (#1509) ----------
+
+HISTORY_DAG = DAG_OK.replace("wave", "history")
+
+
+def test_running_history_blocks_the_rollout(env):
+    repo, paths, world, host, base = env
+    seed(env)
+    world.running_history = 1
+    sha = repo.commit({"scrapers/espn/helper.py": "def go():\n    return 2\n"}, "fix")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == base and up_calls(world) == []
+    assert ad.busy_reason(host) == "идёт история: dag_espn_history running/queued = 1"
+    world.running_history = 0
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == sha
+
+
+def test_acceptance_waits_for_both_dags_and_rollback_only_for_its_own(env):
+    repo, paths, world, host, base = env
+    seed(env)
+    sha = repo.commit({"deploy/espn/dags/dag_espn_history.py": HISTORY_DAG,
+                       "scrapers/espn/history.py": "X = 1\n"}, "history")
+    world.stale_dags = {"dag_espn_history"}
+    assert ad.main([], host=host) == 1
+    assert "dag_espn_history: has_import_errors|перечитан = 'f|f'" in host.sent[0]
+    # Откат на корень без истории её разбора не ждёт и принимается.
+    assert state(paths, "accepted") == base and sha in (paths.state / "rejected").read_text()
+    assert ad.dag_ids(paths.root(base)) == ["dag_espn_current"]
+    assert f"откат на {base[:12]} принят" in host.sent[0]
+
+    fix = repo.commit({"deploy/espn/dags/dag_espn_history.py": HISTORY_DAG + "# fixed\n"}, "fix")
+    world.stale_dags = set()
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == fix
+    assert ad.dag_ids(paths.root(fix)) == ["dag_espn_current", "dag_espn_history"]
+
+
+def test_root_without_the_current_dag_is_never_accepted(env, tmp_path):
+    repo, paths, world, host, base = env
+    seed(env)
+    (tmp_path / "empty" / ad.DAG_DIR_REL).mkdir(parents=True)
+    assert ad.dag_ids(tmp_path / "empty") == ["dag_espn_current"]
+    sh("git", "rm", "-q", "deploy/espn/dags/dag_espn_current.py", cwd=repo.work)
+    sha = repo.commit({"deploy/espn/dags/dag_espn_history.py": HISTORY_DAG,
+                       "scrapers/espn/history.py": "X = 1\n"}, "no current")
+    assert ad.main([], host=host) == 1
+    assert "dag_espn_current: has_import_errors|перечитан = 'f|f'" in host.sent[0]
+    assert state(paths, "accepted") == base and sha in (paths.state / "rejected").read_text()

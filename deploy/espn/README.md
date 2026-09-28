@@ -310,6 +310,62 @@ ESPN иногда дописывает матч позже (составы/су�
   (`quality.build_recheck_sql` / `render_recheck_lines`). **Сторож:** правило `downgrade`.
 - **Темп:** перепроверки и выборка идут по полосе `live` той же заслонки (S0).
 
+## История — `dag_espn_history` (#1509)
+
+Прошлые сезоны на остатке скорости актуалки. Логика — `scrapers/espn/history.py`, SQL и строка
+сводки — `scrapers/espn/history_report.py`, DAG — `deploy/espn/dags/dag_espn_history.py`.
+
+| Что | Как |
+| --- | --- |
+| расписание | каждые 30 мин (`*/30 * * * *`), `max_active_runs=1`, создаётся **на паузе** |
+| задачи | `prepare` (таблицы bronze, журнал запросов, очередь) → `run_history` |
+| пул | `espn_history`: 1 слот, `priority_weight=1`, `weight_rule="absolute"` (`pools.json`) |
+| время | бюджет 12 мин от старта DAG-прогона (раннер выходит сам, запись пачки — после), таймаут задачи 18 мин, `dagrun_timeout` 20 мин, ретраев нет — следующий прогон через 30 мин; между прогонами истории ≥ 10 мин окна для доставки |
+| заслонка | полоса `history`: только остаток сверх доли актуалки (`live_share` 0,5), при 403/429 замирает первой — `LaneClosed`, прогон выходит без ошибки |
+| долг актуалки | перед каждой пачкой: есть матч живого турнира с kickoff 14…72 ч назад, который измеритель считает «в сроке», а он не опубликован, — прогон выходит до следующего |
+| очередь | `iceberg.ops.espn_history_queue_v1`: строка на турнир × сезон × type (`pending → listed → done | red | empty`) + строка `(run)` на каждый прогон (причина выхода, матчей записано) |
+| охват | `configs/espn/history_scope.json` |
+
+Путь запросов: `leagues/{slug}/seasons?limit=100` (раз на турнир) → `seasons/{год}` (окно, types)
+→ `types/{t}/events` все страницы `limit=100` → summary по id; строка расписания — из `header`
+summary, scoreboard не нужен. Закрытый сезон (конец в core > 7 дн назад) читается из raw store:
+повтор — 0 сетевых запросов. Пачка — до 400 матчей одного турнира-сезона-type; упавший матч
+делает строку type красной, её пробует ещё один следующий прогон, дальше она остаётся красной.
+
+**Включение** (после доставки автоматом, владельцем):
+
+```bash
+docker exec espn-live-airflow-scheduler-1 airflow dags unpause dag_espn_history
+```
+
+**Стоп-файл** — выключить историю, не трогая DAG и актуалку (проверяется в начале прогона и между
+матчами; прогон выходит, записав собранное):
+
+```bash
+docker exec espn-live-airflow-scheduler-1 touch /opt/airflow/state/espn/history.off   # стоп
+docker exec espn-live-airflow-scheduler-1 rm /opt/airflow/state/espn/history.off      # снова в работу
+```
+
+**Охват** — правкой `configs/espn/history_scope.json` в master (доставка — автоматом):
+
+- `{"allow": [["eng.1", 2015]]}` — ровно эти турнир × сезон (так включено в #1509);
+- добавить пары — список пополняется, новые сезоны встанут в очередь следующим прогоном;
+- `{"allow": []}` — все целевые турниры (`Denominator.targets()`): прошлые сезоны, начавшиеся за
+  последние 10 лет (лига — 10 сезонов, сборные — издания 10 лет); уже собранное не качается.
+
+Строки очереди вне охвата ждут; сезон из `allow`, которого нет в core, — красная строка.
+
+Проверка (read-only Trino):
+
+```sql
+SELECT slug, season_year, season_type, state, matches, done, failed, attempts, last_error
+FROM iceberg.ops.espn_history_queue_v1 ORDER BY updated_at DESC LIMIT 20;
+```
+
+Строка утренней сводки — `history_report.render_history_line` (сезонов готово за сутки / всего,
+красных, матчей, запросов и КБ на матч по журналу `lane='history'`, пауз из-за актуалки); в
+живой `morning_report.py` её ставит Fable пакетом после мержа.
+
 ## Доставка (#1507)
 
 Новый контур живёт в своём compose-проекте **`espn-live`** (`deploy/espn/airflow.compose.yaml`):
@@ -333,6 +389,7 @@ ESPN иногда дописывает матч позже (составы/су�
   (транспорт ESPN падает `AmbientProxyError`), `ESPN_RELEASE_ROOT`, canary-state, контрольной БД,
   `RELEASE_COMMIT/TREE_SHA256` — автомат отказывается работать с таким env-файлом.
 - **Пулы — кодом:** `deploy/espn/pools.json` (`espn_live`: 4 слота = `max_active_tis_per_dag`;
+  `espn_history`: 1 слот, #1509;
   файл добавлен `git add -f` — `*.json` в `.gitignore`). `airflow-init` делает только
   `airflow db migrate` + `airflow pools import` + удаление пулов, которых нет в `pools.json`
   (кроме `default_pool`); запускается при посеве и когда `pools.json` цели отличается от живого.
@@ -359,12 +416,14 @@ ESPN иногда дописывает матч позже (составы/су�
 (`merge-base --is-ancestor`; иначе стоп «нужны руки»), не в `rejected` и `git diff accepted..master`
 задевает пути контура (`deploy/espn`, `configs/espn` + замыкание импортов DAG из
 `deploy/espn/dags`, в т.ч. `scrapers/base/*` и относительные импорты) → окно: нет
-running/queued `dag_espn_current` и до волны 00/06/12/18 UTC ≥ 10 мин → корень релиза →
+running/queued `dag_espn_current` и `dag_espn_history` (#1509; прогон истории ≤ 20 мин, между прогонами ≥ 10 мин окна) и до
+волны 00/06/12/18 UTC ≥ 10 мин → корень релиза →
 [`run --rm --no-deps -T airflow-init`] → `up -d --no-deps --force-recreate airflow-scheduler
 airflow-webserver` с `ESPN_RELEASE_ROOT=<корень>` в окружении вызова → приёмка ≤ 7 мин:
 
-- `dag.last_parsed_time` `dag_espn_current` позже момента выката, `has_import_errors = f`,
-  `import_error` = 0 (свежая ошибка разбора — провал сразу);
+- `dag.last_parsed_time` каждого DAG корня (`deploy/espn/dags/dag_*.py`: `dag_espn_current`,
+  `dag_espn_history`) позже момента выката, `has_import_errors = f`, `import_error` = 0 (свежая
+  ошибка разбора — провал сразу); откат на корень без истории её не ждёт;
 - `/opt/airflow/dags` scheduler смонтирован из корня цели; sha256 файлов `deploy/espn/dags` и
   `scrapers/espn` в контейнере = корню;
 - пулы metadb (кроме `default_pool`) = `pools.json`: тот же набор, слоты и `include_deferred`;

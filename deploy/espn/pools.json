@@ -3,5 +3,10 @@
     "slots": 4,
     "description": "ESPN current waves: plan_wave + run_tournament (= max_active_tis_per_dag of dag_espn_current)",
     "include_deferred": false
+  },
+  "espn_history": {
+    "slots": 1,
+    "description": "ESPN history lane: run_history of dag_espn_history (one run at a time, below the live waves)",
+    "include_deferred": false
   }
 }
