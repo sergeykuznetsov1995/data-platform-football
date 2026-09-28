@@ -3,7 +3,8 @@
 
 Хост-копия /root/espn-deploy/auto_deliver.py, cron */5. Шаг:
   самопроверка (хост-копия = master) → fetch → цель: master, потомок принятого SHA, не
-  отклонённый, diff задевает пути контура → окно (нет running/queued dag_espn_current, до волны
+  отклонённый, diff задевает пути контура → окно (нет running/queued dag_espn_current и
+  dag_espn_history, до волны
   00/06/12/18 UTC ≥ 10 мин) → git archive → /root/espn-release-<sha> (ro) → [airflow-init при
   смене pools.json] → up -d --no-deps --force-recreate scheduler/webserver → приёмка по metadb,
   байтам в контейнере, пулам и env → успех: пин; провал: тот же up на принятом, SHA → rejected.
@@ -37,6 +38,9 @@ COMPOSE_REL = "deploy/espn/airflow.compose.yaml"
 POOLS_REL = "deploy/espn/pools.json"
 DAG_DIR_REL = "deploy/espn/dags"
 DAG_ID = "dag_espn_current"
+HISTORY_DAG_ID = "dag_espn_history"
+# Выкат ждёт идущий прогон любого из них (история — ≤ 35 мин, #1509).
+BUSY_DAGS = (DAG_ID, HISTORY_DAG_ID)
 METADB = f"{PROJECT}-airflow-metadb-1"
 SCHEDULER = f"{PROJECT}-airflow-scheduler-1"
 SERVICES = ("airflow-scheduler", "airflow-webserver")
@@ -279,12 +283,13 @@ def busy_reason(h: Host) -> str | None:
     wave = next_wave(now)
     if wave - now < WINDOW:
         return f"до волны {wave:%H:%M} UTC меньше {int(WINDOW.total_seconds() // 60)} мин"
-    n = psql(h, f"SELECT count(*) FROM dag_run WHERE dag_id = '{DAG_ID}' "
-                "AND state IN ('running', 'queued')")
-    if n is None:
-        return f"metadb {METADB} не отвечает"
-    if n != "0":
-        return f"идёт волна: dag_run running/queued = {n}"
+    for dag_id, what in zip(BUSY_DAGS, ("волна", "история")):
+        n = psql(h, f"SELECT count(*) FROM dag_run WHERE dag_id = '{dag_id}' "
+                    "AND state IN ('running', 'queued')")
+        if n is None:
+            return f"metadb {METADB} не отвечает"
+        if n != "0":
+            return f"идёт {what}: {dag_id} running/queued = {n}"
     return None
 
 
@@ -429,25 +434,33 @@ def static_checks(h: Host, root: Path) -> str | None:
     return None
 
 
+def dag_ids(root: Path) -> list[str]:
+    """DAG корня релиза: файл deploy/espn/dags/dag_*.py = dag_id (откат на корень без
+    истории не ждёт её разбора)."""
+    return sorted(p.stem for p in (root / DAG_DIR_REL).glob("dag_*.py"))
+
+
 def accept(h: Host, root: Path, cut: str) -> str | None:
-    """Приёмка выката (≤ 7 мин); None — принято, иначе причина."""
+    """Приёмка выката (≤ 7 мин): каждый DAG корня перечитан без ошибок; None — принято."""
     deadline = h.now() + timedelta(seconds=ACCEPT_TIMEOUT_S)
-    reason = f"{DAG_ID} не перечитан за {ACCEPT_TIMEOUT_S // 60} мин"
+    wanted = dag_ids(root)
+    reason = f"{', '.join(wanted)} не перечитан(ы) за {ACCEPT_TIMEOUT_S // 60} мин"
     while True:
         fresh = psql(h, f"SELECT filename FROM import_error WHERE \"timestamp\" > timestamptz '{cut}' ORDER BY 1")
         if fresh:
             return f"import_error после выката: {fresh.splitlines()[0][:200]}"
         errors = psql(h, "SELECT count(*) FROM import_error")
-        dag = psql(h, f"SELECT has_import_errors, last_parsed_time > timestamptz '{cut}' "
-                      f"FROM dag WHERE dag_id = '{DAG_ID}'")
-        if errors == "0" and dag == "f|t":
+        dags = {dag_id: psql(h, f"SELECT has_import_errors, last_parsed_time > timestamptz '{cut}' "
+                                f"FROM dag WHERE dag_id = '{dag_id}'") for dag_id in wanted}
+        if errors == "0" and all(dag == "f|t" for dag in dags.values()):
             break
-        if errors is None or dag is None:
+        if errors is None or any(dag is None for dag in dags.values()):
             reason = f"metadb {METADB} не отвечает"
         elif errors != "0":
             reason = f"import_error = {errors}"
         else:
-            reason = f"{DAG_ID}: has_import_errors|перечитан = '{dag or 'нет в metadb'}'"
+            dag_id, dag = next((k, v) for k, v in dags.items() if v != "f|t")
+            reason = f"{dag_id}: has_import_errors|перечитан = '{dag or 'нет в metadb'}'"
         if h.now() >= deadline:
             return reason
         h.sleep(ACCEPT_POLL_S)
