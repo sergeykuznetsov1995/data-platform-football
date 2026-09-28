@@ -23,6 +23,10 @@ of every live tournament for the last three ESPN days: an event core lists
 that neither bronze nor the fetched days have is taken from its league day
 (``topup_days`` of its tournament) and planned like any other match.
 
+A manual run with a window (``since``/``until``, #1508) plans those days
+instead of yesterday and today and compares the core list over them: the
+catch-up of a tail, without rechecks and stale checks.
+
 Recheck and "not worse" (#1506, ``recheck.py``): a captured match is written
 again only when its status, kickoff, score or shootout changes (a new parser
 replays the stored body, 0 bytes).  The 00 wave adds the rechecks (kickoff +
@@ -103,6 +107,8 @@ STALE_AFTER = timedelta(days=3)
 RECHECK_AFTER = timedelta(hours=2)
 # The 00 wave compares the core event list of the last CORE_DAYS ESPN days.
 CORE_DAYS = 3
+# A manual catch-up window (#1508) spans at most this many days per run.
+MAX_WINDOW_DAYS = 14
 GREEN = "green"
 RED = "red"
 _MATCH = f"iceberg.{BRONZE_DATABASE}.{MATCH_TABLE}"
@@ -779,6 +785,28 @@ def _core_missing(
     return found, sorted(missing - set(found))
 
 
+def check_window(
+    since: date | None, until: date | None, today: date
+) -> tuple[date, date] | None:
+    """The manual catch-up window ``(since, until)`` or ``None`` (#1508).
+
+    Both ends or none; ``since <= until <= today`` and at most
+    ``MAX_WINDOW_DAYS`` days, so that a mistake never plans a whole year.
+    """
+
+    if since is None and until is None:
+        return None
+    if since is None or until is None:
+        raise ValueError("a catch-up window needs both since and until")
+    if not since <= until <= today:
+        raise ValueError(f"catch-up window {since}..{until}: need since <= until <= {today}")
+    if (until - since).days + 1 > MAX_WINDOW_DAYS:
+        raise ValueError(
+            f"catch-up window {since}..{until}: more than {MAX_WINDOW_DAYS} days"
+        )
+    return since, until
+
+
 def plan_wave(
     *,
     client,
@@ -789,6 +817,8 @@ def plan_wave(
     check_stale: bool,
     check_core: bool = False,
     check_recheck: bool = False,
+    since: date | None = None,
+    until: date | None = None,
 ) -> WavePlan:
     """Tournament-seasons with something to write in this wave.
 
@@ -797,10 +827,17 @@ def plan_wave(
     summary, without touching its neighbours.  ``check_core`` (the 00 wave)
     adds the events of the core list no day and no bronze row has;
     ``check_recheck`` (the 00 wave) adds the rechecks and the sample (#1506).
+
+    ``since``/``until`` (a manual run, #1508): the days of the plan are that
+    window instead of yesterday and today, the core list is compared over
+    the window whatever the wave, and there are no rechecks and no stale
+    checks — only the catch-up.
     """
 
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+    today = now.astimezone(timezone.utc).date()
+    window = check_window(since, until, today)
     snapshot = editions_store.load_or_refresh(
         state_path,
         client=client,
@@ -810,8 +847,13 @@ def plan_wave(
     )
     targets = target_competitions(rows, snapshot)
     by_slug = {row.slug: row for row in rows}
-    today = now.astimezone(timezone.utc).date()
-    days = (today - timedelta(days=1), today)
+    if window is None:
+        days = (today - timedelta(days=1), today)
+    else:
+        days = tuple(
+            window[0] + timedelta(days=offset)
+            for offset in range((window[1] - window[0]).days + 1)
+        )
     errors: dict[str, str] = {
         row.slug: "no open edition: " + snapshot.failed.get(row.slug, "core season unknown")
         for row in rows
@@ -839,17 +881,22 @@ def plan_wave(
     status_errors: dict[str, str] = {}
     core_days: dict[str, set[date]] = {}
     core_added = 0
-    if check_core:
-        first = today - timedelta(days=CORE_DAYS - 1)
+    if check_core or window is not None:
+        first, last = window or (today - timedelta(days=CORE_DAYS - 1), today)
         for competition in sorted(targets.values(), key=lambda item: item.slug):
-            if competition.slug not in usable or not any(
-                edition.start_date <= today and edition.end_date >= first
-                for edition in competition.open_editions()
+            # A window is read for every tournament: an event of a season with
+            # no open edition is on no parsed day and comes back unlisted (red).
+            if competition.slug not in usable or (
+                window is None
+                and not any(
+                    edition.start_date <= last and edition.end_date >= first
+                    for edition in competition.open_editions()
+                )
             ):
                 continue
             try:
                 added, unlisted = _core_missing(
-                    client, competition, first, today, set(found) | set(stored)
+                    client, competition, first, last, set(found) | set(stored)
                 )
             except AllOriginsBlocked:
                 raise
@@ -901,7 +948,7 @@ def plan_wave(
         and espn_day(match.kickoff) in days
         and match.disposition not in PRESENCE_VALUES
     ]
-    if check_stale:
+    if check_stale and window is None:
         stale = {
             match.event_id: match
             for match in bronze_stale(trino, now)
@@ -932,7 +979,7 @@ def plan_wave(
         add(match.competition_slug, match.season_year, match.event_id)
 
     rechecks: dict[int, str] = {}
-    if check_recheck:
+    if check_recheck and window is None:
         for event_id, (slug, year, kind) in sorted(recheck.plan_recheck(trino, now).items()):
             if slug not in usable or snapshot.edition(slug, year) is None:
                 logger.info("ESPN %s %s: %s skipped (not a live edition)", slug, event_id, kind)
@@ -1487,6 +1534,7 @@ __all__ = [
     "WaveSummary",
     "build_competition",
     "check_presence",
+    "check_window",
     "failed_outcome",
     "finish_requests",
     "live_rows",

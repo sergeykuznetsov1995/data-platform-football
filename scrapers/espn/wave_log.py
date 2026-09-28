@@ -50,12 +50,14 @@ def wave_log_rows(
     run_id: str,
     started_at: datetime | None,
     finished_at: datetime,
+    window: str | None = None,
 ) -> list[dict[str, Any]]:
     """Rows of one wave: the wave row, then a row per tournament.
 
     ``failed`` names mapped tasks that ended without an outcome; they are red
     rows under their task name (no slug is known for them).  ``summary`` is
-    the ``wave.WaveSummary`` of the same outcomes.
+    the ``wave.WaveSummary`` of the same outcomes.  ``window`` (a manual
+    catch-up run, #1508) is written into the wave row after its reason.
     """
 
     base = {
@@ -70,7 +72,8 @@ def wave_log_rows(
             "season_year": None,
             "state": "red" if summary.red else "green",
             "matches": sum(int(item.get("matches") or 0) for item in outcomes),
-            "first_error": summary.reason,
+            "first_error": "; ".join(item for item in (summary.reason, window) if item)
+            or None,
         }
     ]
     rows.extend(

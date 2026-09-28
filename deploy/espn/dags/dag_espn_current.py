@@ -15,7 +15,7 @@ log (``scrapers.espn.wave_log``, #1505) before it turns a red wave red.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from airflow import DAG
@@ -75,6 +75,26 @@ def _task_name(ti) -> str:
     return f"{ti.task_id}[{map_index}]" if map_index is not None and map_index >= 0 else ti.task_id
 
 
+def _window(context: dict[str, Any]) -> tuple[date | None, date | None]:
+    """``since``/``until`` of a manual run's conf (#1508); ``None`` without them."""
+
+    conf = getattr(context.get("dag_run"), "conf", None) or {}
+    since, until = (
+        # A key present with any value is parsed: "" or 0 is an error, not "no window".
+        date.fromisoformat(str(conf[key])) if key in conf else None
+        for key in ("since", "until")
+    )
+    return since, until
+
+
+def _window_note(context: dict[str, Any]) -> str | None:
+    try:
+        since, until = _window(context)
+    except ValueError:
+        return None
+    return f"window {since}..{until}" if since and until else None
+
+
 def prepare(**_: Any) -> None:
     from scrapers.base.iceberg_writer import IcebergWriter
     from scrapers.espn.bronze_schema import ensure_bronze_tables
@@ -96,6 +116,12 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
     boundary = context.get("data_interval_end") or now
     midnight = boundary.astimezone(timezone.utc).hour == 0
+    # A manual run with conf {"since", "until"} catches up that window (#1508).
+    try:
+        since, until = _window(context)
+        wave.check_window(since, until, now.date())
+    except ValueError as exc:
+        raise AirflowFailException(f"ESPN catch-up window: {exc}") from exc
     trino = _trino()
     client = _client()
     failure: BaseException | None = None
@@ -113,6 +139,8 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
             # Once a day too: rechecks at kickoff + 7…10 days and the 5 %
             # sample at +24/72 h, under the "not worse" rule (#1506).
             check_recheck=midnight,
+            since=since,
+            until=until,
         )
     except BaseException as exc:
         failure = exc
@@ -193,6 +221,9 @@ def wave_summary(**context: Any) -> dict[str, Any]:
     summary = wave.summarize_wave(
         outcomes, failed, plan_error=plan_error, duration_s=duration
     )
+    window = _window_note(context)
+    if window is not None:
+        logger.info("ESPN wave: manual catch-up, %s", window)
     # The log goes first: a red wave leaves its trace too (#1505).
     try:
         wave_log.write_wave_log(
@@ -204,6 +235,7 @@ def wave_summary(**context: Any) -> dict[str, Any]:
                 run_id=str(context.get("run_id") or "manual"),
                 started_at=started,
                 finished_at=finished,
+                window=window,
             ),
         )
     except Exception:
