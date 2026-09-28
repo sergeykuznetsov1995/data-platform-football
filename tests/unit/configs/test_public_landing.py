@@ -85,7 +85,10 @@ def test_tracked_files_do_not_leak_vm_address():
     """Адрес VM в репозитории не хранится — сравниваем по хешу, чтобы не хранить
     его и в этом тесте. Плюс ни одного ``ssh … root@<ip>``."""
     vm_ip_sha256 = "17ee8084e74a1544ddff2fe2e1c9243759b7437b2953f2b067df9426f9ed5c54"
+    # IPv6 VM: хеш первых двух хекстетов (в доке был только префикс).
+    vm_ip6_prefix_sha256 = "1c06f9bdaa0c9f982c4f488a2fba545edd534629725602f6c4243bfdf3cfc9be"
     ipv4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    ipv6_prefix = re.compile(r"\b([0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}):")
     ssh_root_ip = re.compile(r"ssh\b[^\n]*\broot@(?:\d{1,3}\.){3}\d{1,3}")
     offenders = []
     for path in _tracked_files():
@@ -99,6 +102,10 @@ def test_tracked_files_do_not_leak_vm_address():
             offenders.append(f"{path.relative_to(ROOT)}: ssh root@<ip>")
         for token in set(ipv4.findall(text)):
             if hashlib.sha256(token.encode()).hexdigest() == vm_ip_sha256:
-                offenders.append(f"{path.relative_to(ROOT)}: адрес VM")
+                offenders.append(f"{path.relative_to(ROOT)}: адрес VM (IPv4)")
+                break
+        for token in set(ipv6_prefix.findall(text)):
+            if hashlib.sha256(token.lower().encode()).hexdigest() == vm_ip6_prefix_sha256:
+                offenders.append(f"{path.relative_to(ROOT)}: адрес VM (IPv6)")
                 break
     assert not offenders, offenders

@@ -66,6 +66,9 @@ def run(security_manager: Any, session: Any, dashboard_model: Any) -> dict[str, 
         if dashboard is None:
             missing.append(f"dashboard {slug} (сначала импорт дашбордов)")
             continue
+        if not dashboard.datasources:
+            missing.append(f"dashboard {slug}: ни одного датасета (чарты без датасета?)")
+            continue
         for datasource in dashboard.datasources:
             pvm = security_manager.find_permission_view_menu(
                 "datasource_access", datasource.perm

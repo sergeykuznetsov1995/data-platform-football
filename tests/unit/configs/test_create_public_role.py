@@ -190,6 +190,21 @@ def test_missing_dashboard_is_an_error_after_syncing_what_exists():
     assert ("datasource_access", "[trino_iceberg].[v_lo_team_season](id:19)") in _granted(sm)
 
 
+def test_dashboard_without_datasources_is_an_error():
+    mod = _load_module()
+    sm = _SecurityManager(EXPECTED_VIEW_PERMISSIONS)
+    dashboards = dict(_DASHBOARDS, **{"world-cup": _Dashboard([])})
+    session = _Session(dashboards)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.run(sm, session, object)
+
+    assert "world-cup" in str(exc.value) and "датасета" in str(exc.value)
+    assert _granted(sm) == EXPECTED_VIEW_PERMISSIONS | (_EXPECTED_DATASOURCES - {
+        ("datasource_access", "[trino_iceberg].[v_wc_match](id:29)")
+    })
+
+
 def test_missing_permission_is_an_error():
     mod = _load_module()
     sm = _SecurityManager(EXPECTED_VIEW_PERMISSIONS - {("can_time_range", "Api")})
