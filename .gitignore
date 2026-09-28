@@ -186,6 +186,7 @@ logs/
 
 # Secrets
 .env.proxy-pool
+.env.bak*
 *.pem
 *.key
 *.jks
