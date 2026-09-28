@@ -27,11 +27,12 @@ failure unit is the match: a Summary that fails is counted, the type row ends
 red.  A match already in bronze with its Summary is never downloaded again, so
 an interrupted run continues where it stopped.
 
-Cache: the season and the lists of a season closed more than
-``CLOSED_AFTER`` ago are read cache-first, an open season's lists fresh; a
-stored Summary is replayed only when its status is terminal (a pre-match body
-the live lane stored is downloaded again).  A repeat of a closed season makes
-0 network requests.
+Cache (plan decision 4): a season closed more than ``CLOSED_AFTER`` ago
+reads its season, lists and Summaries with a terminal status from the raw
+store (a pre-match body the live lane stored is downloaded again); an open
+season reads everything fresh.  A repeat of a closed season makes 0 network
+requests.  A match whose Summary is still not terminal is written (its row
+keeps its place) but counts as failed: the type row is red, not done.
 
 Duplicates: inside a season an event listed by two types is written once
 (the first type); across tournaments one SELECT per batch finds the event ids
@@ -466,11 +467,14 @@ class _Runner:
             )
         )
 
-    def _summary(self, slug: str, event_id: int):
-        """A stored Summary only with a terminal status (a pre-match body of
-        the live lane is read again), otherwise a fresh download."""
+    def _summary(self, slug: str, event_id: int, closed: bool):
+        """A closed season replays a stored Summary with a terminal status (a
+        pre-match body of the live lane is read again); an open season always
+        downloads it."""
 
         request = urls.summary(slug, event_id)
+        if not closed:
+            return _fetch(self.client, request, force_refresh=True)
         try:
             result = self.client.replay_json(request.url, request.endpoint, request.params)
         except RawStoreError:
@@ -480,8 +484,10 @@ class _Runner:
             return result
         return _fetch(self.client, request, force_refresh=True)
 
-    def _payload(self, event_id: int, competition: Competition, edition: Edition) -> MatchPayload:
-        result = self._summary(competition.slug, event_id)
+    def _payload(
+        self, event_id: int, competition: Competition, edition: Edition, closed: bool
+    ) -> MatchPayload:
+        result = self._summary(competition.slug, event_id, closed)
         schedule = schedule_row_from_header(
             result.body, competition=competition, edition=edition
         )
@@ -709,7 +715,7 @@ class _Runner:
             for event_id in todo[start : start + BATCH_MATCHES]:
                 try:
                     self._between()
-                    payload = self._payload(event_id, competition, edition)
+                    payload = self._payload(event_id, competition, edition, season.closed)
                 except (_Stop, LaneClosed, AllOriginsBlocked) as exc:
                     interrupted = exc
                     break
@@ -721,9 +727,17 @@ class _Runner:
                     continue
                 known = stored.get(event_id)
                 payloads.append(known.carried(payload) if known is not None else payload)
+                if not payload.schedule.terminal:
+                    # Written (the row keeps its place in bronze) but not
+                    # finished: a failure of the match, the type row is red.
+                    failed += 1
+                    self.failed += 1
+                    first_error = first_error or (
+                        f"{event_id}: status {payload.schedule.status} is not terminal"
+                    )
             if payloads:
                 self._write(slug, year, payloads)
-                done += len(payloads)
+                done += sum(payload.schedule.terminal for payload in payloads)
             self._save(queue, [progress(state=LISTED)])
             if interrupted is not None:
                 raise interrupted

@@ -568,3 +568,42 @@ def test_allowed_season_core_does_not_list_is_a_red_season(conn) -> None:
         assert queue[("eng.1", year, 0)].state == history.RED
         assert queue[("eng.1", year, 0)].attempts == history.MAX_ATTEMPTS
     assert len(client.network) == 1  # the season list only
+
+
+def _stub(event_id: int, status: str = "STATUS_SCHEDULED") -> bytes:
+    body = json.loads(_summary_as("summary_eng1_2015_422285.json", event_id, light=True))
+    body["header"]["competitions"][0]["status"]["type"]["name"] = status
+    return json.dumps(body).encode()
+
+
+def test_match_still_not_terminal_keeps_its_type_red(conn) -> None:
+    listed = _ids(*ENG_2015_PAGES)
+    key = _req_key(urls.summary("eng.1", listed[3]))
+    client = HistoryClient(_eng_2015(**{key: _stub(listed[3])}))
+    client.stored[key] = _stub(listed[3])
+    trino = HistoryTrino()
+
+    first = _run(client, trino, conn)
+
+    assert first.matches == 380 and first.failed == 1 and key in client.network
+    row = _queue(conn)[("eng.1", 2015, 1)]
+    assert (row.state, row.done, row.failed, row.attempts) == ("red", 379, 1, 1)
+    assert "STATUS_SCHEDULED is not terminal" in row.last_error
+    assert _matches(trino)[listed[3]]["lineup_state"] == "pending"
+
+    second = _run(client, trino, conn)
+    assert second.matches == 1 and client.network.count(key) == 2
+    assert _queue(conn)[("eng.1", 2015, 1)].attempts == 2
+
+
+def test_open_season_downloads_even_a_stored_final(conn) -> None:
+    listed = _ids(*ENG_2015_PAGES)
+    client, trino = HistoryClient(_eng_2015()), HistoryTrino()
+    key = _req_key(urls.summary("eng.1", listed[0]))
+    client.stored[key] = _stub(listed[0], "STATUS_FULL_TIME")
+
+    # 20.05.2016: the season ends 01.06.2016, it is still open.
+    run = _run(client, trino, conn, now=datetime(2016, 5, 20, 12, tzinfo=timezone.utc))
+
+    assert run.matches == 380 and key in client.network
+    assert len(client.network) == 1 + 1 + 4 + 380
