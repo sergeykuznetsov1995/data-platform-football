@@ -19,7 +19,8 @@ LANDING = ROOT / "configs" / "caddy" / "landing" / "index.html"
 BOOTSTRAP = ROOT / "configs" / "superset" / "bootstrap.sh"
 CONFIG = ROOT / "configs" / "superset" / "superset_config.py"
 
-DASHBOARD_SLUGS = ("league-overview", "player-overview-league", "world-cup")
+# На лендинге два дашборда (владелец: без чемпионата мира); роль Public — см. test_create_public_role.
+LANDING_SLUGS = ("league-overview", "player-overview-league")
 
 pytestmark = pytest.mark.unit
 
@@ -63,12 +64,13 @@ def test_superset_config_sets_public_role_without_gamma_copy():
     assert not re.search(r"^PUBLIC_ROLE_LIKE\s*=", text, re.M), "Gamma даёт гостю запись"
 
 
-def test_landing_links_three_dashboards_github_and_telegram():
+def test_landing_links_dashboards_github_and_telegram():
     html = LANDING.read_text(encoding="utf-8")
-    for slug in DASHBOARD_SLUGS:
+    for slug in LANDING_SLUGS:
         assert f"/superset/dashboard/{slug}/" in html, slug
     assert "https://github.com/sergeykuznetsov1995/data-platform-football" in html
     assert "https://t.me/Sergeykuznetsov1995" in html
+    assert "world-cup" not in html, "владелец: чемпионат мира на лендинге не нужен"
     assert '<meta name="viewport"' in html
     assert "prefers-color-scheme: dark" in html
     assert "<script src=" not in html and "<link rel=\"stylesheet\"" not in html, "без внешних зависимостей"
