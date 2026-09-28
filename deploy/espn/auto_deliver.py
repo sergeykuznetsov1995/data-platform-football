@@ -435,9 +435,10 @@ def static_checks(h: Host, root: Path) -> str | None:
 
 
 def dag_ids(root: Path) -> list[str]:
-    """DAG корня релиза: файл deploy/espn/dags/dag_*.py = dag_id (откат на корень без
-    истории не ждёт её разбора)."""
-    return sorted(p.stem for p in (root / DAG_DIR_REL).glob("dag_*.py"))
+    """DAG, которые приёмка ждёт перечитанными: всегда dag_espn_current (корень без актуалки
+    не принимается) + каждый deploy/espn/dags/dag_*.py корня (файл = dag_id; откат на корень
+    без истории не ждёт её разбора)."""
+    return sorted({DAG_ID} | {p.stem for p in (root / DAG_DIR_REL).glob("dag_*.py")})
 
 
 def accept(h: Host, root: Path, cut: str) -> str | None:

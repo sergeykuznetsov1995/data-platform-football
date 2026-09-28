@@ -109,6 +109,7 @@ class World:
         self.running = 0
         self.running_history = 0              # dag_run running/queued dag_espn_history
         self.stale_dags: set[str] = set()      # DAG, которые после выката не перечитаны
+        self.missing_dags: set[str] = set()    # DAG, чьих файлов нет в выкаченном корне
         self.metadb_up = True
         self.env = ["AIRFLOW_HOME=/opt/airflow", "TRINO_PASSWORD=secret"]
         self.tamper: set[str] = set()          # относительные пути, чьи байты в контейнере «чужие»
@@ -188,7 +189,10 @@ class FakeHost(ad.Host):
             w.labelled.discard(str(w.root))
         w.root = root
         w.labelled.add(str(root))
-        broken = "BROKEN" in (root / "deploy/espn/dags/dag_espn_current.py").read_text()
+        current = root / "deploy/espn/dags/dag_espn_current.py"
+        # DAG удалён из корня: строка в metadb остаётся, но не перечитывается
+        w.missing_dags = set() if current.exists() else {ad.DAG_ID}
+        broken = current.exists() and "BROKEN" in current.read_text()
         at = self.clock + timedelta(seconds=30)
         if broken:
             w.import_errors = [("/opt/airflow/dags/dag_espn_current.py", at)]
@@ -218,7 +222,7 @@ class FakeHost(ad.Host):
             if w.parsed is None and not w.dag_error:
                 return 0, "", ""
             fresh = w.parsed is not None and visible(w.parsed) and w.parsed > cut
-            fresh = fresh and re.search(r"dag_id = '([^']+)'", sql).group(1) not in w.stale_dags
+            fresh = fresh and re.search(r"dag_id = '([^']+)'", sql).group(1) not in w.stale_dags | w.missing_dags
             return 0, f"{'t' if w.dag_error else 'f'}|{'t' if fresh else 'f'}\n", ""
         if sql.startswith("SELECT pool || '|' || slots || '|' || CASE WHEN include_deferred"):
             assert "WHERE pool <> 'default_pool'" in sql
@@ -695,3 +699,16 @@ def test_acceptance_waits_for_both_dags_and_rollback_only_for_its_own(env):
     assert ad.main([], host=host) == 0
     assert state(paths, "accepted") == fix
     assert ad.dag_ids(paths.root(fix)) == ["dag_espn_current", "dag_espn_history"]
+
+
+def test_root_without_the_current_dag_is_never_accepted(env, tmp_path):
+    repo, paths, world, host, base = env
+    seed(env)
+    (tmp_path / "empty" / ad.DAG_DIR_REL).mkdir(parents=True)
+    assert ad.dag_ids(tmp_path / "empty") == ["dag_espn_current"]
+    sh("git", "rm", "-q", "deploy/espn/dags/dag_espn_current.py", cwd=repo.work)
+    sha = repo.commit({"deploy/espn/dags/dag_espn_history.py": HISTORY_DAG,
+                       "scrapers/espn/history.py": "X = 1\n"}, "no current")
+    assert ad.main([], host=host) == 1
+    assert "dag_espn_current: has_import_errors|перечитан = 'f|f'" in host.sent[0]
+    assert state(paths, "accepted") == base and sha in (paths.state / "rejected").read_text()
