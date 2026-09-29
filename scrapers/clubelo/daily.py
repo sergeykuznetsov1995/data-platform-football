@@ -361,7 +361,10 @@ def run_daily(
         )
         same, previous = store.snapshot_counts(ranking.rating_date)
         # #1465: the rating date is already stored with its /Results — the
-        # 4-hourly re-run does not fetch /Results again.
+        # 4-hourly re-run does not fetch /Results again. Equality of dates on
+        # purpose: while /Results runs ahead of /Ranking (M-09) the re-run still
+        # fetches it — skipping on "a newer date is stored" would miss /Results
+        # dates that appear before /Ranking catches up.
         result["results_skipped"] = same is not None and store.results_present(ranking.rating_date)
         if not result["results_skipped"]:
             results_page, results = daily.results(

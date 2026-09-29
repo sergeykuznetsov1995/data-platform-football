@@ -179,6 +179,17 @@ def test_same_date_with_stored_results_does_not_fetch_results_again():
     assert len(store.results) == 63
 
 
+def test_results_ahead_of_ranking_are_fetched_again_on_the_same_date():
+    # M-09: /Ranking 2026-09-22, /Results 2026-09-23 stored — the same /Ranking
+    # date fetches /Results again (it may have moved on; no rows of 09-22 stored)
+    store = MemoryDailyStore()
+    answers = lambda: _answers(**{"/Results": _results_with_date("2026-09-23")})
+    _run(answers(), store=store)
+    result, store, _, session, *_ = _run(answers(), store=store)
+    assert [c["path"] for c in session.calls] == ["/Ranking", "/Results"]
+    assert result["results_skipped"] is False and daily.exit_code(result) == 0
+
+
 def test_new_date_fetches_results_even_when_earlier_results_are_stored():
     store = MemoryDailyStore()
     _run(store=store)
