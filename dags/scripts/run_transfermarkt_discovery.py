@@ -627,12 +627,22 @@ def read_registry_facts(connection) -> tuple[str | None, int, datetime | None]:
 def read_previous_registry(
     connection, snapshot_id: str | None,
 ) -> PreviousRegistry | None:
-    """Rows of the canonical (or the named) snapshot, read-only."""
+    """Rows of the canonical snapshot, read-only.
 
+    ``snapshot_id`` is the canonical the DAG sized this run for; the live
+    canonical must still be that snapshot, otherwise the run would carry and
+    compare against a superseded registry.
+    """
+
+    canonical_id, _count, _last_full = read_registry_facts(connection)
+    if snapshot_id is not None and canonical_id != str(snapshot_id):
+        raise DiscoveryRunnerError(
+            "previous registry snapshot drifted: "
+            f"pinned {snapshot_id}, canonical {canonical_id}"
+        )
+    snapshot_id = canonical_id
     if snapshot_id is None:
-        snapshot_id, _count, _last_full = read_registry_facts(connection)
-        if snapshot_id is None:
-            return None
+        return None
     if not _SNAPSHOT_ID.fullmatch(str(snapshot_id)):
         raise DiscoveryRunnerError("unsafe previous registry snapshot id")
     literal = f"'{snapshot_id}'"

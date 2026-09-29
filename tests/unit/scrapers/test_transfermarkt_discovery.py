@@ -831,6 +831,30 @@ def test_regulation_gives_every_season_of_a_cup_and_marks_its_current() -> None:
     } == {"2025", "2024"}
 
 
+def test_a_failed_regulation_after_a_full_run_carries_the_cup_history() -> None:
+    first, _ = _run(fetch=_big_catalogue(), fetch_json=RegulationFetch())
+    later = NOW + timedelta(days=7)
+    fetch_json = RegulationFetch(
+        {competition_regulation_url("FAC"): _failed(504)}
+    )
+
+    snapshot, report = _run(
+        fetch=_big_catalogue(), fetch_json=fetch_json, now=later,
+        previous=_previous(first),
+    )
+    fac = [item for item in snapshot.editions if item.competition_id == "FAC"]
+
+    # The HTML selector lists 2 of the 12 FA Cup seasons: the cup is carried
+    # whole with its own discovery time instead of losing ten seasons.
+    assert report["carried_competition_ids"] == ["FAC"]
+    assert "2 of 12" in report["carried"]["FAC"]
+    assert len(fac) == 12
+    assert {item.discovered_at for item in fac} == {NOW}
+    # A fallback that keeps every previous edition is an ordinary refresh.
+    gb1 = next(item for item in snapshot.competitions if item.competition_id == "GB1")
+    assert gb1.discovered_at == later
+
+
 def test_national_team_regulation_current_is_the_last_played_edition() -> None:
     snapshot, report = _run(fetch_json=RegulationFetch())
     editions = {

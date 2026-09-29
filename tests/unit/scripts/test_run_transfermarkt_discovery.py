@@ -1175,6 +1175,71 @@ def test_regulation_fetch_is_json_with_a_short_cache_and_one_405_retry(
     assert regulation["cache_ttl_seconds"] == mod.REGULATION_CACHE_TTL_SECONDS
 
 
+class _RegistryCursor:
+    def __init__(self, canonical_id, queries):
+        self.canonical_id = canonical_id
+        self.queries = queries
+        self.description = ()
+        self._rows = []
+
+    def execute(self, sql):
+        self.queries.append(sql)
+        if "registry_state" in sql:
+            self.description = [("registry_snapshot_id",), ("competitions",), ("last_full_at",)]
+            self._rows = (
+                [] if self.canonical_id is None
+                else [(self.canonical_id, 1, NOW)]
+            )
+            return
+        page = _page()
+        if "competition_editions" in sql:
+            items = [item.as_dict() for item in page.editions if item.competition_id == "GB1"]
+        else:
+            items = [
+                item.as_dict() for item in page.competitions if item.competition_id == "GB1"
+            ]
+        for item in items:
+            item.setdefault("is_current", item.pop("current", False))
+        columns = list(items[0])
+        self.description = [(name,) for name in columns]
+        self._rows = [tuple(item[name] for name in columns) for item in items]
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
+
+
+class _RegistryConnection:
+    def __init__(self, canonical_id):
+        self.canonical_id = canonical_id
+        self.queries = []
+
+    def cursor(self):
+        return _RegistryCursor(self.canonical_id, self.queries)
+
+
+def test_pinned_previous_snapshot_is_checked_against_the_live_canonical():
+    mod = _load()
+    moved = _RegistryConnection("tm-discovery-" + "e" * 24)
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="drifted"):
+        mod.read_previous_registry(moved, SNAPSHOT_ID)
+    # Only the canonical pointer was read; no rows of either snapshot.
+    assert len(moved.queries) == 1
+
+    live = _RegistryConnection(SNAPSHOT_ID)
+    previous = mod.read_previous_registry(live, SNAPSHOT_ID)
+    assert previous.snapshot_id == SNAPSHOT_ID
+    assert set(previous.competitions) == {"GB1"}
+    assert f"'{SNAPSHOT_ID}'" in live.queries[1]
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="drifted"):
+        mod.read_previous_registry(_RegistryConnection(None), SNAPSHOT_ID)
+    assert mod.read_previous_registry(_RegistryConnection(None), None) is None
+
+
 def test_previous_snapshot_drift_fails_before_client_io(tmp_path):
     mod = _load()
     _FakeClient.instances.clear()
