@@ -46,6 +46,7 @@ from utils.fotmob_publication import (
     seal_fotmob_publication,
     validate_fotmob_writer_fence,
 )
+from scrapers.fotmob import constants as fotmob_constants
 from scrapers.fotmob.scope_codec import (
     format_scope_token,
     parse_scope_token,
@@ -94,9 +95,9 @@ FOTMOB_SILVER_BRONZE_INPUTS = frozenset(
         "iceberg.bronze.fotmob_transfer_events",
     }
 )
-# #1575: Silver is switched off until the Trino memory failure of team_match
-# is understood; ingest seals bronze-only generations instead.
-FOTMOB_SILVER_ENABLED = False
+# #1575: Silver is switched off (source of truth: scrapers.fotmob.constants);
+# ingest seals bronze-only generations instead.
+FOTMOB_SILVER_ENABLED = fotmob_constants.FOTMOB_SILVER_ENABLED
 ISSUE_930_REPLAY_ENTITIES = [
     "leaderboards",
     "matches",

@@ -416,6 +416,16 @@ def _canonical_binding_timestamp(value: object, *, field: str) -> datetime:
     return parsed
 
 
+def _scheduled_run_names_valid(names: Any) -> bool:
+    """#1575: a Silver child is optional only while Silver is switched off."""
+
+    required = {"owner", "ingest", "sofascore", "finalizer"}
+    with_silver = required | {"silver"}
+    if runtime_binding.fotmob_silver_enabled():
+        return set(names) == with_silver
+    return set(names) in (required, with_silver)
+
+
 def _scheduled_generation_id(binding: Mapping[str, Any]) -> str:
     payload = json.dumps(dict(binding), sort_keys=True, separators=(",", ":"))
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fotmob-publication:{payload}"))
@@ -437,7 +447,7 @@ def _scheduled_observation(
         or not isinstance(identity, Mapping)
         or dict(identity) != deployment
         or not isinstance(runs, Mapping)
-        or set(runs) != {"owner", "ingest", "silver", "sofascore", "finalizer"}
+        or not _scheduled_run_names_valid(runs)
         or not isinstance(publication, Mapping)
     ):
         raise PurgeRefused("scheduled observation is not bound to the live deployment")
@@ -509,6 +519,8 @@ def _scheduled_observation(
             "state": "success",
         },
     }
+    if "silver" not in runs:
+        expected_runs.pop("silver")
     for name, expected in expected_runs.items():
         item = runs.get(name)
         if not isinstance(item, Mapping) or any(
@@ -523,9 +535,15 @@ def _scheduled_observation(
     if (
         runs["ingest"].get("run_id")
         != f"fotmob_orchestrated__{generation_id}"
-        or runs["silver"].get("run_id") != f"fotmob_silver__{generation_id}"
+        or (
+            "silver" in runs
+            and (
+                runs["silver"].get("run_id") != f"fotmob_silver__{generation_id}"
+                or runs["silver"].get("ingest_run_id")
+                != runs["ingest"].get("run_id")
+            )
+        )
         or runs["ingest"].get("owner_run_id") != runs["owner"].get("run_id")
-        or runs["silver"].get("ingest_run_id") != runs["ingest"].get("run_id")
         or runs["finalizer"].get("run_id") != runs["sofascore"].get("run_id")
     ):
         raise PurgeRefused("scheduled observation run lineage is not exact")
@@ -1265,8 +1283,7 @@ def _plan_scheduled_observation(plan: Mapping[str, Any]) -> ScheduledObservation
             "data_interval_end",
             "runtime_fingerprint",
         }
-        or set(observation.runs)
-        != {"owner", "ingest", "silver", "sofascore", "finalizer"}
+        or not _scheduled_run_names_valid(observation.runs)
     ):
         raise PurgeRefused("plan scheduled observation identity is invalid")
     try:
@@ -2598,7 +2615,7 @@ class TrinoAirflowRawBackend:
                 "(lane := xcom(session, 'dag_orchestrate_fotmob', owner.run_id, 'choose_fotmob_lane')) is not None and lane.get('lane') == 'daily'",
                 "(attestation := xcom(session, 'dag_orchestrate_fotmob', owner.run_id, 'attest_isolated_runtime')) is not None and all(attestation.get(k) == expected[k] for k in ('deployment_id', 'git_sha', 'scheduler_container_id'))",
                 "(initializer := xcom(session, 'dag_orchestrate_fotmob', owner.run_id, 'initialize_fotmob_publication')) is not None and initializer.get('generation_id') == expected['generation_id'] and initializer.get('binding') == expected['binding']",
-                "all((child := run(session, expected['runs'][name]['dag_id'], expected['runs'][name]['run_id'])) is not None and state(child.state) == 'success' and isinstance(child.conf, dict) and child.conf.get('fotmob_publication', {}).get('generation_id') == expected['generation_id'] and child.conf.get('fotmob_publication', {}).get('binding') == expected['binding'] for name in ('ingest', 'silver'))",
+                "all((child := run(session, expected['runs'][name]['dag_id'], expected['runs'][name]['run_id'])) is not None and state(child.state) == 'success' and isinstance(child.conf, dict) and child.conf.get('fotmob_publication', {}).get('generation_id') == expected['generation_id'] and child.conf.get('fotmob_publication', {}).get('binding') == expected['binding'] for name in ('ingest', 'silver') if name in expected['runs'])",
                 "(publication := ControlStore.from_env().get_publication_generation(expected['generation_id'], source='fotmob')) is not None and publication.get('generation_id') == expected['generation_id'] and publication.get('source') == 'fotmob' and publication.get('binding') == expected['binding'] and publication.get('status') == 'succeeded' and publication.get('phase') == 'published' and publication.get('active') is False and publication.get('lock_active') is False and publication.get('consumer') == {'dag_id': 'dag_sofascore_pipeline', 'run_id': expected['runs']['sofascore']['run_id']}",
             )
         )

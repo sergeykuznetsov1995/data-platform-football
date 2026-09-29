@@ -2171,3 +2171,13 @@ def test_cli_expired_empty_journal_recovers_and_releases_journaled_fence(
     assert called is True
     assert backend.apply_fence is None
     assert json.loads(journal_path.read_text())["apply_fence_generation_id"] is None
+
+
+@pytest.fixture(autouse=True)
+def _silver_enabled_contract(monkeypatch):
+    """#1575: tests above pin the Silver-enabled contract; the disabled
+    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
+
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)

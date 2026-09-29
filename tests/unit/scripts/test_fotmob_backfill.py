@@ -1302,3 +1302,89 @@ def test_nonpositive_attempt_fails_before_any_external_action(tmp_path, monkeypa
     with pytest.raises(mod.BackfillError, match="positive integer"):
         mod.run_backfill(_args(tmp_path, publication_attempt=0))
     assert called is False
+
+
+@pytest.fixture(autouse=True)
+def _silver_enabled_contract(monkeypatch):
+    """#1575: tests above pin the Silver-enabled contract; the disabled
+    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
+
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
+
+
+def _bronze_only_state(phase: str) -> dict:
+    state = _state(phase)
+    state["candidate"] = {
+        "schema": "fotmob-publication-v1",
+        "generation_id": GENERATION_ID,
+        "candidate_kind": "bronze_only",
+        "validation_task_id": "validate_data",
+        "validated_bronze": {"status": "success"},
+        "digest": "b" * 64,
+    }
+    return state
+
+
+def _wire_bronze_only_recovery(monkeypatch, tmp_path, *, candidate_state):
+    calls: list[tuple] = []
+    arguments = _wire_recovery(monkeypatch, tmp_path, calls, "ready_pending_abandon")
+    monkeypatch.setattr(
+        mod,
+        "_exact_run",
+        lambda _args, dag_id, run_id, **_kw: (
+            None
+            if dag_id == mod.SILVER_DAG_ID
+            else {"run_id": run_id, "state": "success"}
+        ),
+    )
+    monkeypatch.setattr(mod, "_get_publication", lambda *_a, **_kw: candidate_state)
+    monkeypatch.setattr(mod, "_validation_xcom", lambda *_args, **_kw: _validation())
+    monkeypatch.setattr(
+        mod,
+        "_transition_publication",
+        lambda *_args, **_kw: pytest.fail("abandoned recovery must be read-only"),
+    )
+    return arguments
+
+
+def test_recovery_silver_disabled_accepts_bronze_only_generation(tmp_path, monkeypatch):
+    # #1575: ingest success without a Silver child is green while Silver is off.
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+    arguments = _wire_bronze_only_recovery(
+        monkeypatch, tmp_path, candidate_state=_bronze_only_state("abandoned")
+    )
+
+    report = mod.recover_backfill(arguments)
+
+    assert report["passed"] is True
+    assert report["phase"] == "abandoned"
+    assert report["candidate"]["transform_task_ids"] is None
+
+
+def test_recovery_silver_disabled_rejects_silver_candidate_without_silver_run(
+    tmp_path, monkeypatch
+):
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+    arguments = _wire_bronze_only_recovery(
+        monkeypatch, tmp_path, candidate_state=_state("abandoned")
+    )
+
+    report = mod.recover_backfill(arguments)
+    assert report["passed"] is False
+    assert "not bronze-only" in str(report.get("error"))
+
+
+def test_recovery_silver_enabled_requires_silver_child(tmp_path, monkeypatch):
+    arguments = _wire_bronze_only_recovery(
+        monkeypatch, tmp_path, candidate_state=_bronze_only_state("abandoned")
+    )
+
+    report = mod.recover_backfill(arguments)
+    assert report["passed"] is False
+    assert "no successful exact Silver child" in str(report.get("error"))

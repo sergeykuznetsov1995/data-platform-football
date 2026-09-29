@@ -1432,8 +1432,11 @@ class TestSilverDependency:
         # #1575: Silver is off; changed Silver inputs must not trigger it.
         from airflow.exceptions import AirflowException
 
+        from scrapers.fotmob import constants as fotmob_constants
+
         mod = _reload_dag_module()
         assert mod.FOTMOB_SILVER_ENABLED is False
+        assert fotmob_constants.FOTMOB_SILVER_ENABLED is False
 
         class _TI:
             def xcom_pull(self, *, task_ids):

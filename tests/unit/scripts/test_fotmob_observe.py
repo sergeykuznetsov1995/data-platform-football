@@ -658,3 +658,71 @@ def test_main_writes_only_a_successful_stable_observation(tmp_path, monkeypatch)
     assert result == 0
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert json.loads(output.read_text(encoding="utf-8")) == report
+
+
+@pytest.fixture(autouse=True)
+def _silver_enabled_contract(monkeypatch):
+    """#1575: tests above pin the Silver-enabled contract; the disabled
+    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
+
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
+
+
+def _bronze_only_observation(tmp_path):
+    isolated = _isolated_snapshot()
+    bronze_only = isolated["daily_runs"][0]
+    bronze_only["ingest_trigger_states"] = ["skipped"]
+    bronze_only["silver_runs"] = []
+    bronze_only["silver_active_tasks"] = []
+    context = _context(tmp_path)
+    return context, isolated
+
+
+def _purge_accepts(tmp_path, context, report):
+    from scripts import purge_fotmob_competitions as purge
+    from tests.unit.scripts.test_purge_fotmob_competitions import (
+        _scheduled_observation_payload,
+    )
+
+    evidence = Path(context["evidence_dir"])
+    deployment, _example = _scheduled_observation_payload(evidence_dir=evidence)
+    deployment_path = Path(context["deployment_report"])
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    deployment_path.chmod(0o600)
+    output = evidence / "first-scheduled-observation.json"
+    mod.write_protected_observation(context, output, report)
+    return purge._scheduled_observation(output, deployment_report=deployment_path)
+
+
+def test_observation_silver_disabled_selects_bronze_only_daily_for_purge(
+    tmp_path, monkeypatch
+):
+    # #1575: with Silver off the earliest bronze-only daily is the observation.
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+    context, isolated = _bronze_only_observation(tmp_path)
+
+    report = mod.validate_observation(context, isolated, _shared_snapshot())
+
+    assert report["runs"]["owner"]["run_id"] == OWNER_RUN_ID
+    assert "silver" not in report["runs"]
+    accepted = _purge_accepts(tmp_path, context, report)
+    assert set(accepted.runs) == {"owner", "ingest", "sofascore", "finalizer"}
+
+
+def test_observation_silver_enabled_purge_rejects_bronze_only_lineage(
+    tmp_path, monkeypatch
+):
+    from scripts import purge_fotmob_competitions as purge
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+    context, isolated = _bronze_only_observation(tmp_path)
+    report = mod.validate_observation(context, isolated, _shared_snapshot())
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
+
+    with pytest.raises(purge.PurgeRefused, match="not bound to the live deployment"):
+        _purge_accepts(tmp_path, context, report)

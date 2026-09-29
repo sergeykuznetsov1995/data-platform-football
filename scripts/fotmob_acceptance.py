@@ -94,6 +94,17 @@ LIVE_CANDIDATE_FIELDS = frozenset(
         "quality_gate",
     }
 )
+# #1575: candidate sealed by ingest while Silver is switched off.
+BRONZE_ONLY_CANDIDATE_FIELDS = frozenset(
+    {
+        "schema",
+        "generation_id",
+        "candidate_kind",
+        "validation_task_id",
+        "validated_bronze",
+        "digest",
+    }
+)
 _GENERATION_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
@@ -707,14 +718,27 @@ def load_lifecycle_report(
         raise ValueError("lifecycle DAG and native runner identities differ")
 
     ingest_terminal = _mapping(payload.get("ingest_terminal"), field="ingest_terminal")
-    silver_terminal = _mapping(payload.get("silver_terminal"), field="silver_terminal")
+    # #1575: with Silver switched off the lifecycle has no Silver child.
+    bronze_only = (
+        payload.get("silver_terminal") is None
+        and not runtime_binding.fotmob_silver_enabled()
+    )
+    if bronze_only:
+        silver_exact = True
+    else:
+        silver_terminal = _mapping(
+            payload.get("silver_terminal"), field="silver_terminal"
+        )
+        silver_exact = (
+            silver_terminal.get("dag_id") == SILVER_DAG_ID
+            and silver_terminal.get("run_id") == expected_runs["silver_run_id"]
+            and str(silver_terminal.get("state") or "").casefold() == "success"
+        )
     if (
         ingest_terminal.get("dag_id") != INGEST_DAG_ID
         or ingest_terminal.get("run_id") != expected_runs["ingest_run_id"]
         or str(ingest_terminal.get("state") or "").casefold() != "success"
-        or silver_terminal.get("dag_id") != SILVER_DAG_ID
-        or silver_terminal.get("run_id") != expected_runs["silver_run_id"]
-        or str(silver_terminal.get("state") or "").casefold() != "success"
+        or not silver_exact
     ):
         raise ValueError("lifecycle terminal DAG run identities are not exact")
     completed_at, completed_since = _timestamp(
@@ -745,17 +769,28 @@ def load_lifecycle_report(
         set(candidate) != {"generation_id", "digest", "transform_task_ids"}
         or candidate.get("generation_id") != generation_id
         or re.fullmatch(r"[0-9a-f]{64}", candidate_digest) is None
-        or not isinstance(transform_task_ids, list)
-        or not transform_task_ids
-        or any(not isinstance(item, str) or not item for item in transform_task_ids)
-        or len(set(transform_task_ids)) != len(transform_task_ids)
-        or transform_task_ids != sorted(transform_task_ids)
+        or (bronze_only and transform_task_ids is not None)
+        or (
+            not bronze_only
+            and (
+                not isinstance(transform_task_ids, list)
+                or not transform_task_ids
+                or any(
+                    not isinstance(item, str) or not item
+                    for item in transform_task_ids
+                )
+                or len(set(transform_task_ids)) != len(transform_task_ids)
+                or transform_task_ids != sorted(transform_task_ids)
+            )
+        )
     ):
         raise ValueError("lifecycle Silver candidate identity is invalid")
     normalized_candidate = {
         "generation_id": generation_id,
         "digest": candidate_digest,
-        "transform_task_ids": list(transform_task_ids),
+        "transform_task_ids": (
+            None if bronze_only else list(transform_task_ids)
+        ),
     }
     publication_state = _mapping(
         payload.get("publication_state"), field="publication_state"
@@ -793,7 +828,9 @@ def load_lifecycle_report(
         scope_count=APPROVED_SCOPE_COUNT,
         entities=ISSUE_930_SCOPE_ENTITIES,
         candidate_digest=candidate_digest,
-        candidate_transform_task_ids=tuple(transform_task_ids),
+        candidate_transform_task_ids=(
+            () if bronze_only else tuple(transform_task_ids)
+        ),
         publication_binding=expected_binding,
     )
 
@@ -899,6 +936,11 @@ def _validate_live_candidate(
     """Validate the complete immutable Silver candidate stored in ControlStore."""
 
     candidate = _mapping(value, field="live publication candidate")
+    if (
+        not lineage.candidate_transform_task_ids
+        and not runtime_binding.fotmob_silver_enabled()
+    ):
+        return _validate_live_bronze_only_candidate(candidate, lineage)
     if set(candidate) != LIVE_CANDIDATE_FIELDS:
         raise ValueError("live publication candidate fields are not exact")
     task_ids = candidate.get("transform_task_ids")
@@ -991,6 +1033,43 @@ def _validate_live_candidate(
         "row_count_total": total_rows,
         "quality_passed": passed,
         "quality_total": total,
+    }
+
+
+def _validate_live_bronze_only_candidate(
+    candidate: Mapping[str, Any], lineage: AcceptanceLineage
+) -> Mapping[str, Any]:
+    """#1575: validate the bronze-only candidate sealed while Silver is off."""
+
+    if set(candidate) != BRONZE_ONLY_CANDIDATE_FIELDS:
+        raise ValueError("live bronze-only candidate fields are not exact")
+    validated = candidate.get("validated_bronze")
+    if (
+        candidate.get("schema") != PUBLICATION_SCHEMA
+        or candidate.get("generation_id") != lineage.generation_id
+        or candidate.get("digest") != lineage.candidate_digest
+        or candidate.get("candidate_kind") != "bronze_only"
+        or candidate.get("validation_task_id") != "validate_data"
+        or not isinstance(validated, Mapping)
+        or validated.get("status") not in {"success", "partial_success"}
+    ):
+        raise ValueError("live bronze-only candidate identity differs from lifecycle")
+    unsigned = {key: candidate[key] for key in candidate if key != "digest"}
+    try:
+        observed_digest = hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("live bronze-only candidate is not canonical JSON") from exc
+    if observed_digest != lineage.candidate_digest:
+        raise ValueError("live bronze-only candidate digest differs from lifecycle")
+    return {
+        "schema": PUBLICATION_SCHEMA,
+        "generation_id": lineage.generation_id,
+        "digest": observed_digest,
+        "candidate_kind": "bronze_only",
+        "transform_task_ids": [],
+        "transform_count": 0,
     }
 
 
