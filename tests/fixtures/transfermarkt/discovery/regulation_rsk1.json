@@ -1,0 +1,118 @@
+{
+ "success": true,
+ "message": "OK",
+ "data": [
+  {
+   "competitionId": "RSK1",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2026,
+    "display": "2027",
+    "cyclicalName": "2027",
+    "nonCyclicalName": "2027"
+   },
+   "isCurrentSeason": true,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/k-league-1/startseite/wettbewerb/RSK1?saison_id=2026"
+  },
+  {
+   "competitionId": "RSK1",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2025,
+    "display": "2026",
+    "cyclicalName": "2026",
+    "nonCyclicalName": "2026"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/k-league-1/startseite/wettbewerb/RSK1?saison_id=2025"
+  },
+  {
+   "competitionId": "RSK1",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2024,
+    "display": "2025",
+    "cyclicalName": "2025",
+    "nonCyclicalName": "2025"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/k-league-1/startseite/wettbewerb/RSK1?saison_id=2024"
+  },
+  {
+   "competitionId": "RSK1",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2023,
+    "display": "2024",
+    "cyclicalName": "2024",
+    "nonCyclicalName": "2024"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/k-league-1/startseite/wettbewerb/RSK1?saison_id=2023"
+  },
+  {
+   "competitionId": "RSK1",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2022,
+    "display": "2023",
+    "cyclicalName": "2023",
+    "nonCyclicalName": "2023"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/k-league-1/startseite/wettbewerb/RSK1?saison_id=2022"
+  },
+  {
+   "competitionId": "RSK1",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2021,
+    "display": "2022",
+    "cyclicalName": "2022",
+    "nonCyclicalName": "2022"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/k-league-1/startseite/wettbewerb/RSK1?saison_id=2021"
+  },
+  {
+   "competitionId": "RSK1",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2020,
+    "display": "2021",
+    "cyclicalName": "2021",
+    "nonCyclicalName": "2021"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/k-league-1/startseite/wettbewerb/RSK1?saison_id=2020"
+  }
+ ]
+}

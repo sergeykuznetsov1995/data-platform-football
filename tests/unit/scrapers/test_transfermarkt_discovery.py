@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -10,18 +11,27 @@ from scrapers.transfermarkt.discovery import (
     BASE_URL,
     SEED_ROUTES,
     SEED_URLS,
+    Country,
     DiscoveryCheckpointError,
+    DiscoveryError,
     DiscoveryFetchError,
     DiscoverySchemaError,
+    ExtraCompetition,
+    PreviousRegistry,
     discover_competition_registry,
+    load_countries,
 )
+from scrapers.transfermarkt.tmapi import competition_regulation_url
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from scrapers.transfermarkt.registry import (
+    ClassificationEvidence,
     ClassificationStatus,
     CompetitionType,
     EvidenceOrigin,
     Gender,
+    AgeCategory,
     SeasonFormat,
+    TeamType,
     reconcile_registry_pages,
 )
 
@@ -643,9 +653,10 @@ def test_persistent_checkpoint_resume_performs_zero_fetches() -> None:
         (FetchStatus.SCHEMA_ERROR, 404, "http=404"),
     ],
 )
-def test_404_504_and_http_zero_abort_without_partial_snapshot(
+def test_404_504_and_http_zero_on_a_seed_page_abort_without_partial_snapshot(
     status, status_code, expected_http
 ) -> None:
+    # #1391: only a seed page still aborts; other pages carry their rows.
     first_url = SEED_URLS[0]
     outcome = FetchOutcome[str](
         status=status,
@@ -718,3 +729,479 @@ def test_naive_discovery_clock_is_rejected() -> None:
             traffic_ledger=LedgerSpy(),
             clock=lambda: datetime(2026, 7, 11),
         )
+
+
+# --------------------------------------------------------------------- #1391
+
+
+def _json_outcome(value):
+    return FetchOutcome(
+        status=FetchStatus.OK,
+        value=value,
+        status_code=200,
+        attempts=1,
+        label="competition_registry",
+    )
+
+
+class RegulationFetch:
+    """tmapi regulation answers from fixtures; anything else is a 404."""
+
+    def __init__(self, overrides=None) -> None:
+        self.calls: list[str] = []
+        self.overrides = overrides or {}
+        self.payloads = {
+            competition_regulation_url(competition_id): json.loads(
+                (FIXTURES / f"regulation_{competition_id.lower()}.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for competition_id in ("FAC", "AFCN", "RSK1")
+        }
+
+    def __call__(self, url: str):
+        self.calls.append(url)
+        if url in self.overrides:
+            override = self.overrides[url]
+            return override if isinstance(override, FetchOutcome) else _json_outcome(override)
+        if url in self.payloads:
+            return _json_outcome(self.payloads[url])
+        return FetchOutcome(
+            status=FetchStatus.SCHEMA_ERROR, status_code=404, attempts=1,
+            error="fixture: no regulation",
+        )
+
+
+def _failed(status_code):
+    return FetchOutcome[str](
+        status=(
+            FetchStatus.BLOCKED if status_code == 405
+            else FetchStatus.SCHEMA_ERROR if status_code == 404
+            else FetchStatus.RETRY_EXHAUSTED
+        ),
+        status_code=status_code,
+        attempts=2,
+        error="fixture failure",
+    )
+
+
+def _run(fetch=None, *, now=NOW, **options):
+    report: dict = {}
+    pages = discover_competition_registry(
+        fetch=fetch or FixtureFetch(),
+        checkpoint={},
+        traffic_ledger=LedgerSpy(),
+        clock=lambda: now,
+        report=report,
+        **options,
+    )
+    return reconcile_registry_pages(pages), report
+
+
+def _previous(snapshot) -> PreviousRegistry:
+    return PreviousRegistry.from_rows(
+        snapshot.snapshot_id,
+        [item.as_dict() for item in snapshot.competitions],
+        [item.as_dict() for item in snapshot.editions],
+    )
+
+
+def test_regulation_gives_every_season_of_a_cup_and_marks_its_current() -> None:
+    snapshot, report = _run(fetch_json=RegulationFetch())
+    editions = sorted(
+        (item for item in snapshot.editions if item.competition_id == "FAC"),
+        key=lambda item: item.edition_id,
+    )
+    fac = next(item for item in snapshot.competitions if item.competition_id == "FAC")
+
+    # The HTML selector had two FA Cup seasons; the regulation has twelve.
+    assert len(editions) == 12
+    assert [item.edition_id for item in editions if item.current] == ["2025"]
+    assert editions[0].canonical_season == "1415"
+    assert editions[-1].source_url == (
+        BASE_URL + "/fa-cup/startseite/pokalwettbewerb/FAC/saison_id/2025"
+    )
+    assert any(item.source_field == "regulation" for item in fac.evidence)
+    assert fac.classification_status is ClassificationStatus.ELIGIBLE
+    assert report["regulation_current"]["FAC"] == "2025"
+    # Competitions whose regulation is unavailable keep the HTML editions.
+    assert "GB1" in report["regulation_unavailable"]
+    assert {
+        item.edition_id for item in snapshot.editions if item.competition_id == "GB1"
+    } == {"2025", "2024"}
+
+
+def test_national_team_regulation_current_is_the_last_played_edition() -> None:
+    snapshot, report = _run(fetch_json=RegulationFetch())
+    editions = {
+        item.edition_id: item
+        for item in snapshot.editions
+        if item.competition_id == "AFCN"
+    }
+
+    assert editions["2024"].current is True
+    assert editions["2024"].canonical_season == "2025"
+    # Listed ahead of the current one: registered, never planned.
+    assert editions["2026"].active is False
+    assert editions["2026"].current is False
+    # The HTML profile calls 2025 current: reported, not fatal.
+    assert {
+        "competition_id": "AFCN", "html": "2025", "regulation": "2024",
+    } in report["current_mismatches"]
+
+
+def test_a_title_only_edition_is_reported_when_no_regulation_answers() -> None:
+    cup = (
+        '<!doctype html><html lang="en"><head>'
+        "<title>CAF Champions League 25/26 | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="AFCN">CAF Champions League</h1>'
+        "</body></html>"
+    )
+    regulation = RegulationFetch(
+        {competition_regulation_url("AFCN"): _failed(405)}
+    )
+
+    snapshot, report = _run(
+        fetch=FixtureFetch(
+            {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": cup}
+        ),
+        fetch_json=regulation,
+    )
+
+    assert "AFCN" in report["title_only_competition_ids"]
+    assert [
+        item.edition_id for item in snapshot.editions if item.competition_id == "AFCN"
+    ] == ["2025"]
+
+
+def test_country_page_brings_the_fa_cup_with_its_real_country() -> None:
+    europa = (FIXTURES / "europa.html").read_text(encoding="utf-8").replace(
+        '<a href="/wettbewerbe/national/wettbewerbe/189">England</a>', ""
+    )
+    fetch = FixtureFetch({BASE_URL + "/wettbewerbe/europa": europa})
+
+    without, _ = _run(fetch=FixtureFetch({BASE_URL + "/wettbewerbe/europa": europa}))
+    snapshot, _ = _run(
+        fetch=fetch, countries=(Country("189", "England", "UEFA"),)
+    )
+
+    assert "FAC" not in {item.competition_id for item in without.competitions}
+    fac = next(item for item in snapshot.competitions if item.competition_id == "FAC")
+    assert fac.country == "England"
+    assert fac.confederation == "UEFA"
+    assert BASE_URL + "/wettbewerbe/national/wettbewerbe/189" in fetch.calls
+
+
+def test_committed_country_list_is_well_formed() -> None:
+    countries = load_countries()
+
+    assert len(countries) >= 200
+    by_id = {item.country_id: item for item in countries}
+    assert by_id["189"].country == "England"
+    assert by_id["50"].country == "France"
+    assert by_id["122"].country == "Netherlands"
+    assert {item.confederation for item in countries} <= {
+        "UEFA", "CAF", "AFC", "Americas", "OFC",
+    }
+    assert sum(item.confederation == "CAF" for item in countries) >= 50
+
+
+def test_extra_competition_joins_when_no_page_lists_it() -> None:
+    extra = ExtraCompetition(
+        competition_id="KLUB",
+        slug="fifa-klub-wm",
+        route="pokalwettbewerb",
+        name="FIFA Club World Cup",
+        country="World",
+        confederation="FIFA",
+        competition_type=CompetitionType.CONTINENTAL_CLUB,
+        team_type=TeamType.CLUB,
+        age_category=AgeCategory.SENIOR,
+    )
+    profile = (
+        '<!doctype html><html lang="en"><body>'
+        '<h1 data-competition-id="KLUB">FIFA Club World Cup</h1>'
+        '<select name="saison_id"><option value="2024" selected>2025</option>'
+        "</select></body></html>"
+    )
+
+    snapshot, _ = _run(
+        fetch=FixtureFetch({extra.profile_url: profile}),
+        extra_competitions=(extra,),
+    )
+    klub = next(item for item in snapshot.competitions if item.competition_id == "KLUB")
+
+    assert klub.classification_status is ClassificationStatus.ELIGIBLE
+    assert klub.competition_type is CompetitionType.CONTINENTAL_CLUB
+
+
+# A catalogue big enough for the 10 % rule: twenty leagues on Europe's page.
+LEAGUES = tuple(f"L{index:02d}" for index in range(1, 21))
+
+
+def _league_url(competition_id: str) -> str:
+    return BASE_URL + f"/league-{competition_id.lower()}/startseite/wettbewerb/{competition_id}"
+
+
+def _big_catalogue(failures=None) -> FixtureFetch:
+    rows = "".join(
+        f'<tr><td><a href="/league-{item.lower()}/startseite/wettbewerb/{item}">'
+        f"League {item}</a></td></tr>"
+        for item in LEAGUES
+    )
+    europa = (FIXTURES / "europa.html").read_text(encoding="utf-8").replace(
+        "</body>",
+        '<div class="box"><h2 class="content-box-headline">National leagues</h2>'
+        f'<table class="items"><tbody>{rows}</tbody></table></div></body>',
+    )
+    overrides = {BASE_URL + "/wettbewerbe/europa": europa}
+    for item in LEAGUES:
+        overrides[_league_url(item)] = (
+            '<!doctype html><html lang="en"><body>'
+            f'<h1 data-competition-id="{item}">League {item}</h1>'
+            '<select name="saison_id"><option value="2025" selected>25/26</option>'
+            '<option value="2024">24/25</option></select></body></html>'
+        )
+    overrides.update(failures or {})
+    return FixtureFetch(overrides)
+
+
+def test_two_unavailable_profiles_publish_a_partial_snapshot_with_carried_rows() -> None:
+    first, _ = _run(fetch=_big_catalogue())
+    later = NOW + timedelta(days=7)
+
+    snapshot, report = _run(
+        fetch=_big_catalogue(
+            {_league_url("L01"): _failed(404), _league_url("L02"): _failed(405)}
+        ),
+        now=later,
+        previous=_previous(first),
+    )
+    by_id = {item.competition_id: item for item in snapshot.competitions}
+
+    assert report["carried_competition_ids"] == ["L01", "L02"]
+    assert "http=405" in report["carried"]["L02"]
+    assert set(by_id) == {item.competition_id for item in first.competitions}
+    # Carried rows keep their own discovery time; refreshed rows are new.
+    assert by_id["L01"].discovered_at == NOW
+    assert by_id["L03"].discovered_at == later
+    assert by_id["L01"].registry_snapshot_id == snapshot.snapshot_id
+    assert {
+        item.edition_id for item in snapshot.editions if item.competition_id == "L01"
+    } == {"2025", "2024"}
+    assert snapshot.snapshot_id != first.snapshot_id
+
+
+def test_more_than_ten_percent_unavailable_drops_the_snapshot() -> None:
+    first, _ = _run(fetch=_big_catalogue())
+    failures = {_league_url(item): _failed(504) for item in LEAGUES[:3]}
+
+    # 3 of 27 published competitions = 11 %.
+    with pytest.raises(DiscoveryError, match="carried over"):
+        _run(fetch=_big_catalogue(failures), previous=_previous(first))
+
+
+def test_a_new_competition_with_an_unavailable_page_is_not_published() -> None:
+    snapshot, report = _run(
+        fetch=_big_catalogue({_league_url("L05"): _failed(405)})
+    )
+
+    assert "L05" not in {item.competition_id for item in snapshot.competitions}
+    assert "L05" in report["unavailable_new"]
+    assert report["carried_competition_ids"] == []
+
+
+def test_an_unavailable_listing_page_carries_what_only_it_listed() -> None:
+    first, _ = _run(fetch=_big_catalogue())
+    fetch = _big_catalogue(
+        {BASE_URL + "/wettbewerbe/national/wettbewerbe/189?page=2": _failed(502)}
+    )
+
+    snapshot, report = _run(fetch=fetch, previous=_previous(first))
+
+    assert report["listing_failures"][0]["url"].endswith("189?page=2")
+    # The FA Cup and the WSL are listed on that page only: carried, not dropped.
+    assert report["carried_competition_ids"] == ["FAC", "GB1W"]
+    assert {item.competition_id for item in snapshot.competitions} == {
+        item.competition_id for item in first.competitions
+    }
+
+
+def _k_league_previous() -> PreviousRegistry:
+    """K League 1 as the registry holds it in December 2026."""
+
+    competition = {
+        "competition_id": "RSK1",
+        "slug": "k-league-1",
+        "name": "K League 1",
+        "country": "Korea, South",
+        "confederation": "AFC",
+        "competition_type": "domestic_league",
+        "gender": "men",
+        "team_type": "club",
+        "age_category": "senior",
+        "season_format": "single_year",
+        "active": True,
+        "source_url": BASE_URL + "/k-league-1/startseite/wettbewerb/RSK1",
+        "discovered_at": datetime(2026, 12, 28, 18, 0),
+        "canonical_competition_id": None,
+        "classification_evidence": json.dumps(
+            [
+                ClassificationEvidence(
+                    source_field="section_label",
+                    source_value="National leagues",
+                    source_url=BASE_URL + "/wettbewerbe/asien",
+                    origin=EvidenceOrigin.SOURCE_PAGE,
+                    precedence=2,
+                    competition_type=CompetitionType.DOMESTIC_LEAGUE,
+                    team_type=TeamType.CLUB,
+                    age_category=AgeCategory.SENIOR,
+                ).as_dict(),
+                ClassificationEvidence(
+                    source_field="transfermarkt_taxonomy",
+                    source_value="main men's competitions taxonomy",
+                    source_url=BASE_URL + "/wettbewerbe/asien",
+                    origin=EvidenceOrigin.STRUCTURED,
+                    gender=Gender.MEN,
+                ).as_dict(),
+                ClassificationEvidence(
+                    source_field="edition_selector",
+                    source_value="2026,2025",
+                    source_url=BASE_URL + "/k-league-1/startseite/wettbewerb/RSK1",
+                    origin=EvidenceOrigin.STRUCTURED,
+                    season_format=SeasonFormat.SINGLE_YEAR,
+                ).as_dict(),
+            ]
+        ),
+        "source_body_hash": "a" * 64,
+        "parser_revision": "tm-html-discovery-v3",
+        "schema_revision": "1",
+    }
+    editions = [
+        {
+            "competition_id": "RSK1",
+            "edition_id": saison,
+            "edition_label": label,
+            "canonical_season": label,
+            "season_format": "single_year",
+            "start_date": None,
+            "end_date": None,
+            "active": True,
+            "is_current": saison == "2025",
+            "participant_count": None,
+            "participant_hash": None,
+            "source_url": BASE_URL
+            + f"/k-league-1/startseite/wettbewerb/RSK1/saison_id/{saison}",
+            "discovered_at": datetime(2026, 12, 31, 18, 0),
+            "source_body_hash": "b" * 64,
+            "parser_revision": "tm-html-discovery-v3",
+            "schema_revision": "1",
+        }
+        for saison, label in (("2025", "2026"), ("2024", "2025"))
+    ]
+    return PreviousRegistry.from_rows(
+        "tm-discovery-" + "c" * 24, [competition], editions
+    )
+
+
+def test_january_2027_mine_daily_run_moves_a_calendar_league_to_2027() -> None:
+    """The regulation marks K League 2027 current; the planner takes 2027."""
+
+    from dags.utils.transfermarkt_scope_planner import eligible_registry_scopes
+
+    january = datetime(2027, 1, 2, 18, 0, tzinfo=timezone.utc)
+    previous = _k_league_previous()
+    fetch = FixtureFetch()
+
+    snapshot, report = _run(
+        fetch=fetch,
+        now=january,
+        mode="daily",
+        previous=previous,
+        fetch_json=RegulationFetch(),
+    )
+
+    assert fetch.calls == []  # daily mode reads no HTML
+    current = [item for item in snapshot.editions if item.current]
+    assert [(item.edition_id, item.canonical_season) for item in current] == [
+        ("2026", "2027")
+    ]
+    assert current[0].discovered_at == january
+    competition = snapshot.competitions[0]
+    # The competition row keeps the last full crawl's time.
+    assert competition.discovered_at == datetime(2026, 12, 28, 18, 0, tzinfo=timezone.utc)
+    assert report["new_current_editions"] == [
+        {"competition_id": "RSK1", "previous": "2025", "current": "2026"}
+    ]
+
+    rows = [
+        {
+            "competition_id": competition.competition_id,
+            "slug": competition.slug,
+            "name": competition.name,
+            "country": competition.country,
+            "confederation": competition.confederation,
+            "competition_type": competition.competition_type.value,
+            "gender": competition.gender.value,
+            "team_type": competition.team_type.value,
+            "age_category": competition.age_category.value,
+            "competition_season_format": competition.season_format.value,
+            "competition_active": competition.active,
+            "competition_source_url": competition.source_url,
+            "competition_discovered_at": competition.discovered_at.isoformat(),
+            "classification_status": competition.classification_status.value,
+            "classification_evidence": json.dumps(
+                [item.as_dict() for item in competition.evidence]
+            ),
+            "registry_snapshot_id": snapshot.snapshot_id,
+            "edition_id": edition.edition_id,
+            "edition_label": edition.edition_label,
+            "canonical_season": edition.canonical_season,
+            "edition_season_format": edition.season_format.value,
+            "edition_active": edition.active,
+            "is_current": edition.current,
+            "edition_source_url": edition.source_url,
+            "edition_discovered_at": edition.discovered_at.isoformat(),
+        }
+        for edition in snapshot.editions
+    ]
+    targets = [item for item in eligible_registry_scopes(rows) if item.current]
+    assert [(item.edition_id, item.canonical_season) for item in targets] == [
+        ("2026", "2027")
+    ]
+
+
+def test_daily_run_that_refreshes_nothing_fails() -> None:
+    previous = _k_league_previous()
+    regulation = RegulationFetch({competition_regulation_url("RSK1"): _failed(504)})
+
+    with pytest.raises(DiscoveryError, match="refreshed no competition"):
+        _run(
+            fetch=FixtureFetch(),
+            mode="daily",
+            previous=previous,
+            fetch_json=regulation,
+        )
+
+
+def test_budget_guard_carries_known_and_defers_new_competitions() -> None:
+    first, _ = _run(fetch=_big_catalogue())
+    fetch = _big_catalogue()
+    spent = {"calls": 0}
+
+    def can_spend(requests):
+        spent["calls"] += 1
+        # Budget for every known competition but the last two checks.
+        return spent["calls"] <= len(first.competitions) - 2
+
+    with pytest.raises(DiscoveryError, match="carried over"):
+        # Carrying never hides a spent budget beyond the 10 % rule.
+        _run(fetch=fetch, previous=_previous(first), can_spend=lambda n: False)
+
+    snapshot, report = _run(
+        fetch=_big_catalogue(), previous=_previous(first), can_spend=can_spend
+    )
+    assert len(report["carried_competition_ids"]) == 2
+    assert all(
+        reason == "request budget spent" for reason in report["carried"].values()
+    )
