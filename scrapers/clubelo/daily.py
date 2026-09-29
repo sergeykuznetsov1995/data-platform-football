@@ -9,7 +9,10 @@ One run, in this order:
    live 25.09 /Ranking 2026-09-22 vs /Results 2026-09-24) — both are written,
    each under its own date. Only an OLDER /Results is fetched again after
    ``results_retry_pause`` (10 min), up to ``results_retries`` (3) times;
-   still older → nothing parsed is written.
+   still older → nothing parsed is written. Skipped (``results_skipped``)
+   when the /Ranking date is already stored in the snapshot AND in
+   ``clubelo_result`` (#1465: the run is every 4 h, the date lives ~10–57 h);
+   the ~3-day /Results window of the next date updates ``is_final``.
 3. Completeness guard of the snapshot (``check_completeness``): absolute
    (>= 95 % of 1741 clubs), against the previous rating date (>= 95 %) and,
    only when this rating date is already stored, ``min_replace_ratio`` 0.9
@@ -27,7 +30,9 @@ One run, in this order:
    but does not roll back the written snapshot.
 
 Any failed contract check, guard, date mismatch, block or error before step 4
-writes nothing parsed, alerts with the failed check and exits non-zero.
+writes nothing parsed, logs the failed check and exits non-zero. No Telegram
+from here (#1465): with a run every 4 h it would repeat on every red run; the
+alert with dedup is the host watchdog ``clubelo_stall_watch.py``.
 """
 
 from __future__ import annotations
@@ -182,6 +187,15 @@ class IcebergDailyStore:
                 previous = int(count)
         return same, previous
 
+    def results_present(self, rating_date: date) -> bool:
+        """Whether ``clubelo_result`` already holds rows of this /Results date."""
+
+        table = f"{self.writer.catalog}.{self.database}.{RESULT_TABLE}"
+        rows = self.writer._get_trino_manager().execute_query(
+            f"SELECT 1 FROM {table} WHERE rating_date = DATE '{rating_date.isoformat()}' LIMIT 1"
+        )
+        return bool(rows)
+
     def replace_snapshot(self, rating_date: date, rows: List[Dict[str, Any]]) -> int:
         table = pa.Table.from_pylist(rows, schema=SNAPSHOT_SCHEMA)
         # The writer compares the partition column with a string value; the
@@ -289,7 +303,6 @@ def run_daily(
     history_store,
     *,
     source: str = "html",
-    notifier: Callable[[str], None] = history.notify,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     results_retries: int = RESULTS_RETRIES,
@@ -314,6 +327,7 @@ def run_daily(
         "elo_precise_matched": 0,
         "same_date": None,
         "results_rating_date": None,
+        "results_skipped": False,
         "results_attempts": 0,
         "results_rows": 0,
         "results_final": 0,
@@ -345,11 +359,18 @@ def run_daily(
             levels_matched_pct=ranking.levels_matched_pct,
             elo_precise_matched=ranking.elo_precise_matched,
         )
-        results_page, results = daily.results(
-            ranking.rating_date, results_retries, results_retry_pause, sleep
-        )
-        result["results_rating_date"] = results.rating_date.isoformat()
         same, previous = store.snapshot_counts(ranking.rating_date)
+        # #1465: the rating date is already stored with its /Results — the
+        # 4-hourly re-run does not fetch /Results again. Equality of dates on
+        # purpose: while /Results runs ahead of /Ranking (M-09) the re-run still
+        # fetches it — skipping on "a newer date is stored" would miss /Results
+        # dates that appear before /Ranking catches up.
+        result["results_skipped"] = same is not None and store.results_present(ranking.rating_date)
+        if not result["results_skipped"]:
+            results_page, results = daily.results(
+                ranking.rating_date, results_retries, results_retry_pause, sleep
+            )
+            result["results_rating_date"] = results.rating_date.isoformat()
         check_completeness(ranking.elo_rows, same, previous)
         result["same_date"] = same is not None
 
@@ -358,15 +379,16 @@ def run_daily(
         snapshot = [daily.row(**common, **row) for row in ranking.rows]
         result["snapshot_rows"] = store.replace_snapshot(ranking.rating_date, snapshot)
         result["rows"], result["provisional"] = ranking.elo_rows, ranking.provisional
-        common = {"rating_date": results.rating_date, "page_created_at": results.page_created_at,
-                  "fetched_at": results_page.fetched_at}
-        store.merge_results([daily.row(**common, **row) for row in results.rows])
+        if not result["results_skipped"]:
+            common = {"rating_date": results.rating_date, "page_created_at": results.page_created_at,
+                      "fetched_at": results_page.fetched_at}
+            store.merge_results([daily.row(**common, **row) for row in results.rows])
+            result.update(
+                results_rows=len(results.rows),
+                results_final=sum(row["is_final"] for row in results.rows),
+                results_duplicates=results.duplicates,
+            )
         result["written"] = True
-        result.update(
-            results_rows=len(results.rows),
-            results_final=sum(row["is_final"] for row in results.rows),
-            results_duplicates=results.duplicates,
-        )
         logger.info("ClubElo daily written: %s", {k: result[k] for k in (
             "rating_date", "rows", "provisional", "same_date", "results_rows")})
         result["wire_bytes_daily"] = transport.wire_bytes
@@ -380,11 +402,9 @@ def run_daily(
     except ClubEloBlocked as exc:
         result["blocked"] = str(exc)
         logger.error("ClubElo blocked us, daily run stopped: %s", exc)
-        _alert(notifier, f"ClubElo дневной снимок: сайт блокирует запросы, прогон остановлен. {exc}")
     except (LayoutChanged, GuardRefused, DatesDiffer) as exc:
         result["check"] = str(exc)
         logger.error("ClubElo daily check failed, nothing written: %s", exc)
-        _alert(notifier, f"ClubElo дневной снимок: проверка не пройдена, ничего не записано. {exc}")
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         logger.error("ClubElo daily failed: %s", result["error"], exc_info=True)
@@ -395,13 +415,6 @@ def run_daily(
         result["requests"] = transport.requests
         result["elapsed_s"] = round(clock() - started, 1)
     return result
-
-
-def _alert(notifier: Callable[[str], None], message: str) -> None:
-    try:
-        notifier(message)
-    except Exception as exc:  # the alert must not hide the failure
-        logger.error("Telegram alert failed: %s", exc)
 
 
 def exit_code(result: Dict[str, Any]) -> int:

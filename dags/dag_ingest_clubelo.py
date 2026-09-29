@@ -6,7 +6,7 @@ The ClubElo API is dead (#1459): the collection reads the HTML pages of
 clubelo.com through ``dags/scripts/run_clubelo_scraper.py`` in the isolated
 legacy runner (BashOperator, no LocalExecutor fork).
 
-- Daily (#1463), twice a day: ``/Ranking`` + ``/Results`` →
+- Daily (#1463), every 4 hours: ``/Ranking`` + ``/Results`` →
   ``bronze.clubelo_rank_snapshot`` (the ``rating_date`` partition replaced in
   one transaction — NEVER APPEND, #314) and ``bronze.clubelo_result`` (MERGE by
   match date + both club keys). Fail-closed: a changed layout, a small
@@ -41,9 +41,10 @@ with DAG(
     # dedup is the host watchdog clubelo_stall_watch.py.
     default_args={**LIGHT_ARGS, 'on_failure_callback': None},
     description='ClubElo HTML: daily /Ranking + /Results snapshot, manual club-page history',
-    # The site rebuilds the rating at ~08:50 UTC (its date lags ~2 days);
-    # two runs a day until task 5 of the epic measures the rebuild time.
-    schedule='30 9,21 * * *',
+    # #1465: a rating date stays on the site from ~10 h to >= 57 h and comes
+    # out at any hour (window measurement, epic #1459) — two runs a day could
+    # miss a date for good, so every 4 hours.
+    schedule='30 */4 * * *',
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=DAG_TAGS.get('clubelo', ['scraping', 'clubelo', 'bronze', 'elo']),
@@ -65,7 +66,7 @@ with DAG(
 
     ### Daily snapshot (#1463) — `gate_daily >> scrape_daily >> validate_data`
 
-    Runs at 09:30 and 21:30 UTC (the site rebuilds at ~08:50 UTC).
+    Runs every 4 hours at :30 UTC (a rating date may live on the site only ~10 h).
 
     1. `/Ranking` → `bronze.clubelo_rank_snapshot`: ~1741 clubs + provisional
        clubs of the country tables, partition `rating_date` (the page's own

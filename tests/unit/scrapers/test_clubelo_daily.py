@@ -10,7 +10,7 @@ from __future__ import annotations
 import gzip
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 import pytest
@@ -62,6 +62,9 @@ class MemoryDailyStore:
         for row in rows:
             self.results[tuple(row[k] for k in daily.RESULT_KEYS)] = row
 
+    def results_present(self, rating_date):
+        return any(r["rating_date"] == rating_date for r in self.results.values())
+
 
 def _manifest_closed_except(open_slugs):
     return [{"slug": s, "status": "done", "fetched_at": T0, "_ingested_at": T0}
@@ -83,10 +86,13 @@ def _run(answers=None, *, store=None, open_slugs=NEW, limit=10, retries=3):
     store = store or MemoryDailyStore()
     history_store = MemoryStore(_manifest_closed_except(open_slugs))
     sent, slept = [], []
-    result = daily.run_daily(
-        transport, store, history_store, notifier=sent.append, sleep=slept.append,
-        results_retries=retries, new_slugs_limit=limit, batch_id="test-daily",
-    )
+    # #1465: the daily run sends no Telegram — any call of the platform
+    # notifier would land in ``sent``
+    with patch.object(history, "notify", sent.append):
+        result = daily.run_daily(
+            transport, store, history_store, sleep=slept.append,
+            results_retries=retries, new_slugs_limit=limit, batch_id="test-daily",
+        )
     return result, store, history_store, session, sent, slept
 
 
@@ -162,13 +168,45 @@ def test_same_rating_date_is_a_replace_without_alert_or_new_slugs():
     assert result["wire_bytes"] == result["wire_bytes_daily"] == 88609 + 46210
 
 
+def test_same_date_with_stored_results_does_not_fetch_results_again():
+    store = MemoryDailyStore()
+    _run(store=store)
+    result, store, _, session, sent, _ = _run(store=store)
+    assert [c["path"] for c in session.calls] == ["/Ranking"]
+    assert result["results_skipped"] is True and result["results_rows"] == 0
+    assert result["same_date"] is True and store.replaces == [RATING_DATE, RATING_DATE]
+    assert daily.exit_code(result) == 0 and sent == []
+    assert len(store.results) == 63
+
+
+def test_results_ahead_of_ranking_are_fetched_again_on_the_same_date():
+    # M-09: /Ranking 2026-09-22, /Results 2026-09-23 stored — the same /Ranking
+    # date fetches /Results again (it may have moved on; no rows of 09-22 stored)
+    store = MemoryDailyStore()
+    answers = lambda: _answers(**{"/Results": _results_with_date("2026-09-23")})
+    _run(answers(), store=store)
+    result, store, _, session, *_ = _run(answers(), store=store)
+    assert [c["path"] for c in session.calls] == ["/Ranking", "/Results"]
+    assert result["results_skipped"] is False and daily.exit_code(result) == 0
+
+
+def test_new_date_fetches_results_even_when_earlier_results_are_stored():
+    store = MemoryDailyStore()
+    _run(store=store)
+    result, store, _, session, *_ = _run(
+        _answers(**{"/Ranking": _ranking_with_date("2026-09-23"),
+                    "/Results": _results_with_date("2026-09-23")}), store=store)
+    assert [c["path"] for c in session.calls][:2] == ["/Ranking", "/Results"]
+    assert result["results_skipped"] is False and daily.exit_code(result) == 0
+
+
 def test_completeness_against_the_previous_date_guards_a_new_partition():
     # the new rating date has no partition yet: G2 still compares with 2026-09-21
     store = MemoryDailyStore({date(2026, 9, 21): 1900})
     result, store, _, _, sent, _ = _run(store=store)
     assert result["check"].startswith("G2 1741 clubs")
     assert store.replaces == [] and store.results == {}
-    assert daily.exit_code(result) == 1 and "G2" in sent[0]
+    assert daily.exit_code(result) == 1 and sent == []
 
 
 @pytest.mark.parametrize("elo_rows, same, previous, check", [
@@ -191,7 +229,7 @@ def test_layout_change_writes_nothing_parsed_and_names_the_check():
     broken = fixture_html("Ranking.html.gz").replace("eloData = [", "eloRows = [")
     result, store, hist, session, sent, _ = _run(_answers(**{"/Ranking": gzip_response(broken)}))
     assert result["check"] == "C1 eloData not found"
-    assert daily.exit_code(result) == 1 and "C1 eloData not found" in sent[0]
+    assert daily.exit_code(result) == 1 and sent == []
     assert store.snapshot == {} and store.results == {}
     assert [r["page"] for r in hist.rows(history.RAW_TABLE)] == ["/Ranking"]  # raw kept
     assert [c["path"] for c in session.calls] == ["/Ranking"]
@@ -224,7 +262,7 @@ def test_older_results_retry_three_times_then_nothing_written():
     assert result["results_attempts"] == 4
     assert result["check"].startswith("M-09 /Results h1 date 2026-09-22 older than /Ranking 2026-09-23")
     assert store.snapshot == {} and store.results == {}
-    assert daily.exit_code(result) == 1 and "M-09" in sent[0]
+    assert daily.exit_code(result) == 1 and sent == []
 
 
 def test_older_results_catch_up_on_a_retry():
@@ -240,7 +278,16 @@ def test_older_results_catch_up_on_a_retry():
 def test_block_stops_the_run():
     result, store, _, _, sent, _ = _run(_answers(**{"/Results": FakeResponse(403)}))
     assert result["blocked"] and daily.exit_code(result) == 1
-    assert store.snapshot == {} and "блокирует" in sent[0]
+    assert store.snapshot == {} and sent == []
+
+
+def test_red_run_logs_and_sends_no_telegram(caplog):
+    broken = fixture_html("Ranking.html.gz").replace("eloData = [", "eloRows = [")
+    with patch("utils.alerts.send_telegram_message", create=True) as tg:
+        result, *_, sent, _ = _run(_answers(**{"/Ranking": gzip_response(broken)}))
+    assert daily.exit_code(result) == 1 and sent == [] and not tg.called
+    assert "ClubElo daily check failed, nothing written: C1 eloData not found" in caplog.text
+    assert "notifier" not in daily.run_daily.__code__.co_varnames
 
 
 def test_network_failure_is_an_error():
@@ -250,8 +297,10 @@ def test_network_failure_is_an_error():
 
 
 def test_results_merge_updates_is_final():
+    # #1465: the same rating date does not fetch /Results again, so the update
+    # comes with a new /Ranking date (/Results may run ahead of /Ranking, M-09)
     store = MemoryDailyStore()
-    _run(store=store)
+    _run(_answers(**{"/Ranking": _ranking_with_date("2026-09-21")}), store=store)
     key = (date(2026, 9, 22), "audax-italiano", "colo-colo")
     assert store.results[key]["is_final"] is False
     final = fixture_html("Results.html.gz").replace(
@@ -311,6 +360,17 @@ def test_store_snapshot_counts_same_and_previous():
     assert daily.IcebergDailyStore(writer).snapshot_counts(RATING_DATE) == (None, 1739)
     trino.execute_query.return_value = []
     assert daily.IcebergDailyStore(writer).snapshot_counts(RATING_DATE) == (None, None)
+
+
+def test_store_results_present_by_results_date():
+    writer = MagicMock(catalog="iceberg")
+    trino = writer._get_trino_manager.return_value
+    trino.execute_query.return_value = [[1]]
+    assert daily.IcebergDailyStore(writer).results_present(RATING_DATE) is True
+    sql = trino.execute_query.call_args[0][0]
+    assert "iceberg.bronze.clubelo_result" in sql and "rating_date = DATE '2026-09-22'" in sql
+    trino.execute_query.return_value = []
+    assert daily.IcebergDailyStore(writer).results_present(RATING_DATE) is False
 
 
 def test_store_creates_date_partitioned_tables():
