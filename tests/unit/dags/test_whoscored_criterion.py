@@ -141,6 +141,9 @@ def _world(con):
     for game_id in (20, 21):
         _game(con, game_id, stage_id=200)
         _attempt(con, game_id, "not_available", KICKOFF + timedelta(hours=3))
+    # Stage 300 has no manifest row at all (unknown): its game is missing,
+    # never silently dropped by a NULL ceiling.
+    _game(con, 30, stage_id=300)
     # First success counts even when a later re-ingest exists.
     _game(con, 11)
     _attempt(con, 11, "success", KICKOFF + timedelta(hours=10))
@@ -156,9 +159,9 @@ def test_daily_criterion_grades_each_denominator_game():
     days = criterion.day_results(rows)
 
     assert [(d.day, d.due, d.ok, d.late, d.missing, d.ceiling) for d in days] == [
-        ("2026-09-29", 7, 2, 1, 3, 1)
+        ("2026-09-29", 8, 2, 1, 4, 1)
     ]
-    assert days[0].pct == Decimal("33.3")
+    assert days[0].pct == Decimal("28.6")
     assert days[0].meets_target is False
 
 
@@ -171,9 +174,9 @@ def test_missed_and_overdue_lists():
     missed = query(criterion.render_missed_sql(NOW))
     overdue = query(criterion.render_overdue_sql(NOW))
 
-    assert sorted(row[3] for row in missed) == [2, 3, 5, 6]
+    assert sorted(row[3] for row in missed) == [2, 3, 5, 6, 30]
     assert missed[0][0] == "England / Premier League"
-    assert sorted(row[2] for row in overdue) == [3, 5, 6]
+    assert sorted(row[2] for row in overdue) == [3, 5, 6, 30]
 
 
 @pytest.mark.unit

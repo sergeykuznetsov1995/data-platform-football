@@ -95,7 +95,7 @@ due AS (
            s.date + INTERVAL '26' HOUR AS deadline,
            f.collected_at,
            f.collected_at IS NULL
-               AND l.state = 'not_available'
+               AND COALESCE(l.state = 'not_available', FALSE)
                AND (
                    COALESCE(n.verdicts, 0) >= 2
                    OR COALESCE(st.availability, 'unknown') <> 'available'
