@@ -484,14 +484,31 @@ def _freshness_row(competition_id, *, competition_age, edition_age):
     }
 
 
-def test_registry_freshness_checks_every_row_not_only_latest():
-    # #1391: the weekly full crawl refreshes competitions (<= 8 days), the
-    # daily run refreshes editions (<= 24 h); every row is checked.
+def test_carried_by_a_full_then_refreshed_by_daily_is_left_out_not_fatal():
+    # #1391: a partial full carries ES1 with its old competition row; the next
+    # daily runs refresh its editions but keep that row. Once the row is past
+    # 8 days the competition waits for the next full crawl; the campaign
+    # still builds from the rest.
+    fresh = _freshness_row(
+        "GB1", competition_age=timedelta(days=1), edition_age=timedelta(0)
+    )
+    carried_then_daily = _freshness_row(
+        "ES1", competition_age=timedelta(days=9), edition_age=timedelta(0)
+    )
+
+    result = runtime.validate_fresh_registry_snapshot(
+        [fresh, carried_then_daily], now=NOW
+    )
+
+    assert result == (fresh,)
+
+
+def test_no_full_crawl_for_over_8_days_fails_the_campaign():
     rows = [
-        _freshness_row("GB1", competition_age=timedelta(0), edition_age=timedelta(0)),
         _freshness_row(
-            "ES1", competition_age=timedelta(days=9), edition_age=timedelta(0)
-        ),
+            competition_id, competition_age=timedelta(days=9), edition_age=timedelta(0)
+        )
+        for competition_id in ("GB1", "ES1")
     ]
 
     with pytest.raises(runtime.BackfillRuntimeError, match="fresh full discovery"):

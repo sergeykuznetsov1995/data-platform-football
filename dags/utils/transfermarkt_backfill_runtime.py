@@ -1022,9 +1022,11 @@ def validate_fresh_registry_snapshot(
     Editions must be at most ``max_age`` old (the daily run refreshes them)
     and their competitions at most ``competition_max_age`` (the weekly full
     crawl).  A competition discovery could not read is carried over with its
-    own old stamps — every one of its editions is stale: the history lane
-    leaves it out instead of failing the campaign.  A snapshot with nothing
-    fresh, or a competition with only some editions refreshed, still fails.
+    own old stamps: every one of its editions is stale, or — when a later
+    daily run refreshed its editions — its competition row is.  The history
+    lane leaves such a competition out until the next full crawl instead of
+    failing the campaign.  A snapshot with nothing fresh, or a competition
+    with only some editions refreshed, still fails.
     """
 
     items = tuple(dict(item) for item in rows)
@@ -1040,14 +1042,19 @@ def validate_fresh_registry_snapshot(
     cutoff = observed - max_age
     competition_cutoff = observed - competition_max_age
     stale_editions: dict[str, list[bool]] = {}
+    stale_competitions: set[str] = set()
     for item in items:
+        competition_id = str(item.get("competition_id") or "")
         stale = _utc_timestamp(
             item.get("edition_discovered_at"), field="edition_discovered_at"
         ) < cutoff
-        stale_editions.setdefault(str(item.get("competition_id") or ""), []).append(
-            stale
-        )
-    carried = {
+        stale_editions.setdefault(competition_id, []).append(stale)
+        if _utc_timestamp(
+            item.get("competition_discovered_at"),
+            field="competition_discovered_at",
+        ) < competition_cutoff:
+            stale_competitions.add(competition_id)
+    carried = stale_competitions | {
         competition_id
         for competition_id, flags in stale_editions.items()
         if all(flags)
@@ -1065,11 +1072,6 @@ def validate_fresh_registry_snapshot(
         if _utc_timestamp(
             item.get("edition_discovered_at"), field="edition_discovered_at"
         ) < cutoff:
-            raise BackfillRuntimeError(stale_message)
-        if _utc_timestamp(
-            item.get("competition_discovered_at"),
-            field="competition_discovered_at",
-        ) < competition_cutoff:
             raise BackfillRuntimeError(stale_message)
     return fresh
 
