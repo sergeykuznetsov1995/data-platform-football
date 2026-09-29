@@ -94,6 +94,9 @@ FOTMOB_SILVER_BRONZE_INPUTS = frozenset(
         "iceberg.bronze.fotmob_transfer_events",
     }
 )
+# #1575: Silver is switched off until the Trino memory failure of team_match
+# is understood; ingest seals bronze-only generations instead.
+FOTMOB_SILVER_ENABLED = False
 ISSUE_930_REPLAY_ENTITIES = [
     "leaderboards",
     "matches",
@@ -1061,6 +1064,8 @@ def _should_transform(**context: Any) -> bool:
         not isinstance(table, str) for table in changed
     ):
         raise AirflowException("FotMob changed Bronze input evidence is invalid")
+    if not FOTMOB_SILVER_ENABLED:
+        return False
     normalized = {table.strip().casefold() for table in changed}
     return bool(normalized & FOTMOB_SILVER_BRONZE_INPUTS)
 
@@ -1239,6 +1244,7 @@ python dags/scripts/run_fotmob_scraper.py \\
         op_kwargs={
             "validation_task_id": "validate_data",
             "silver_input_tables": sorted(FOTMOB_SILVER_BRONZE_INPUTS),
+            "silver_enabled": FOTMOB_SILVER_ENABLED,
         },
         retries=0,
     )

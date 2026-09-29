@@ -2040,6 +2040,41 @@ def test_bronze_candidate_defers_to_silver_without_record_conflict(monkeypatch):
     record.assert_not_called()
 
 
+def test_bronze_candidate_is_recorded_when_silver_is_disabled(monkeypatch):
+    # #1575: with Silver off, changed Silver inputs still seal bronze-only.
+    _ceremony_env(monkeypatch)
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    record = MagicMock(return_value={"phase": "writing"})
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(record_publication_candidate=record),
+    )
+    context = _context()
+    context["ti"].xcom_pull.return_value = {
+        "status": "success",
+        "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
+    }
+    kwargs = {
+        "validation_task_id": "validate_data",
+        "silver_input_tables": ["iceberg.bronze.fotmob_player_snapshots"],
+    }
+
+    result = publication.record_fotmob_bronze_only_candidate(
+        silver_enabled=False, **kwargs, **context
+    )
+
+    assert result["candidate_kind"] == "bronze_only"
+    assert record.call_count == 1
+    assert record.call_args.args[1] == result
+    enabled = publication.record_fotmob_bronze_only_candidate(
+        silver_enabled=True, **kwargs, **context
+    )
+    assert enabled["status"] == "silver_required"
+    assert enabled["recorded"] is False
+    assert record.call_count == 1
+
+
 def test_xref_consumer_preflight_requires_full_active_claim(monkeypatch):
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     context = _context()
