@@ -2546,3 +2546,105 @@ def test_requeued_failure_clears_backoff_and_skips_this_runs_target():
     )
     assert seen["target_status"] == "skipped"
     assert seen["attempt_status"] is True
+
+
+def test_batch_latest_content_guard_uses_one_connection_in_target_order():
+    latest_refresh = str(uuid.uuid4())
+    stale_refresh = str(uuid.uuid4())
+    captured = []
+
+    def handler(sql, params):
+        captured.append((sql, params))
+        target = params[0]
+        if "FROM fbref_control.page_frontier" in sql:
+            if target == "fbref:match:bbbb":
+                return [{"state": "leased", "last_content_hash": "h"}], 1
+            return [{"state": "fetched", "last_content_hash": "h"}], 1
+        if "FROM fbref_control.fetch_attempt" in sql:
+            return [
+                {"logical_refresh_id": latest_refresh, "content_hash": "h"}
+            ], 1
+        raise AssertionError(sql)
+
+    factory = FakeFactory(handler)
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=factory,
+    )
+
+    with store.guard_latest_contents([
+        ("fbref:match:cccc", "h", stale_refresh),
+        ("fbref:match:aaaa", "h", latest_refresh),
+        ("fbref:match:bbbb", "h", latest_refresh),
+    ]) as verdicts:
+        assert verdicts == {
+            "fbref:match:aaaa": True,
+            "fbref:match:bbbb": None,
+            "fbref:match:cccc": False,
+        }
+        assert factory.connections[0].committed is False
+
+    assert len(factory.connections) == 1
+    assert factory.connections[0].committed is True
+    locked = [
+        params[0]
+        for sql, params in captured
+        if "FOR NO KEY UPDATE" in sql
+    ]
+    assert locked == [
+        "fbref:match:aaaa",
+        "fbref:match:bbbb",
+        "fbref:match:cccc",
+    ]
+
+
+def test_batch_latest_content_guard_rolls_back_on_body_error():
+    refresh = str(uuid.uuid4())
+
+    def handler(sql, _params):
+        if "FROM fbref_control.page_frontier" in sql:
+            return [{"state": "fetched", "last_content_hash": "h"}], 1
+        return [{"logical_refresh_id": refresh, "content_hash": "h"}], 1
+
+    factory = FakeFactory(handler)
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=factory,
+    )
+
+    with pytest.raises(RuntimeError, match="typed write failed"):
+        with store.guard_latest_contents([("fbref:match:aaaa", "h", refresh)]):
+            raise RuntimeError("typed write failed")
+
+    assert factory.connections[0].rolled_back is True
+    assert factory.connections[0].committed is False
+
+
+def test_batch_latest_content_guard_empty_opens_no_connection():
+    factory = FakeFactory(lambda sql, _params: (_ for _ in ()).throw(
+        AssertionError(sql)
+    ))
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=factory,
+    )
+
+    with store.guard_latest_contents([]) as verdicts:
+        assert verdicts == {}
+
+    assert factory.connections == []
+
+
+def test_batch_latest_content_guard_rejects_duplicate_target():
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(lambda *_: ([], 0)),
+    )
+    refresh = str(uuid.uuid4())
+
+    with pytest.raises(ValueError, match="duplicate"):
+        with store.guard_latest_contents([
+            ("fbref:match:aaaa", "h", refresh),
+            ("fbref:match:aaaa", "h", refresh),
+        ]):
+            pass

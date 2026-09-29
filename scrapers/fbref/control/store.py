@@ -8674,39 +8674,82 @@ class ControlStore:
         expected_hash = _text(content_hash, "content_hash")
         expected_refresh = _uuid(logical_refresh_id, "logical_refresh_id")
         with self._transaction() as cursor:
-            cursor.execute(
-                """
-                SELECT state, last_content_hash
-                FROM fbref_control.page_frontier
-                WHERE target_id = %s
-                FOR NO KEY UPDATE
-                """,
-                (target,),
+            yield self._latest_content_verdict(
+                cursor, target, expected_hash, expected_refresh
             )
-            row = _fetchone(cursor)
-            if row is None or row["state"] == "leased":
-                # ``None`` means retry later: absence or an in-flight refresh
-                # is not evidence that this raw observation is stale.
-                yield None
-            else:
-                cursor.execute(
-                    """
-                    SELECT logical_refresh_id, content_hash
-                    FROM fbref_control.fetch_attempt
-                    WHERE target_id = %s AND status = 'succeeded'
-                    ORDER BY lease_epoch DESC, attempt_number DESC
-                    LIMIT 1
-                    """,
-                    (target,),
+
+    @contextmanager
+    def guard_latest_contents(
+        self, guards: Sequence[tuple[object, object, object]]
+    ):
+        """Fence a whole typed batch on one control transaction.
+
+        Same rows, lock mode and target order as entering
+        ``guard_latest_content`` per match, but one connection instead of
+        one per match: a 25-match batch must not take 25 slots of the shared
+        Postgres (#1320, run 2026-09-27).
+        """
+
+        parsed = sorted(
+            (
+                _text(target_id, "target_id"),
+                _text(content_hash, "content_hash"),
+                _uuid(logical_refresh_id, "logical_refresh_id"),
+            )
+            for target_id, content_hash, logical_refresh_id in guards
+        )
+        targets = [target for target, _hash, _refresh in parsed]
+        if len(set(targets)) != len(targets):
+            raise ValueError("duplicate target_id in latest-content guard")
+        if not parsed:
+            yield {}
+            return
+        with self._transaction() as cursor:
+            yield {
+                target: self._latest_content_verdict(
+                    cursor, target, expected_hash, expected_refresh
                 )
-                latest = _fetchone(cursor)
-                yield (
-                    latest is not None
-                    and str(latest["logical_refresh_id"]) == expected_refresh
-                    and str(latest.get("content_hash") or "") == expected_hash
-                    and str(row.get("last_content_hash") or "")
-                    == expected_hash
-                )
+                for target, expected_hash, expected_refresh in parsed
+            }
+
+    def _latest_content_verdict(
+        self,
+        cursor: Any,
+        target: str,
+        expected_hash: str,
+        expected_refresh: str,
+    ) -> Optional[bool]:
+        cursor.execute(
+            """
+            SELECT state, last_content_hash
+            FROM fbref_control.page_frontier
+            WHERE target_id = %s
+            FOR NO KEY UPDATE
+            """,
+            (target,),
+        )
+        row = _fetchone(cursor)
+        if row is None or row["state"] == "leased":
+            # ``None`` means retry later: absence or an in-flight refresh
+            # is not evidence that this raw observation is stale.
+            return None
+        cursor.execute(
+            """
+            SELECT logical_refresh_id, content_hash
+            FROM fbref_control.fetch_attempt
+            WHERE target_id = %s AND status = 'succeeded'
+            ORDER BY lease_epoch DESC, attempt_number DESC
+            LIMIT 1
+            """,
+            (target,),
+        )
+        latest = _fetchone(cursor)
+        return (
+            latest is not None
+            and str(latest["logical_refresh_id"]) == expected_refresh
+            and str(latest.get("content_hash") or "") == expected_hash
+            and str(row.get("last_content_hash") or "") == expected_hash
+        )
 
     def claim_observation_processing(
         self,
@@ -11501,6 +11544,13 @@ class _CursorBoundReplayControlStore(ControlStore):
             if latest is True:
                 self._guarded_targets.add(source_target)
             yield latest
+
+    @contextmanager
+    def guard_latest_contents(self, guards):
+        raise ControlStoreError(
+            "replay control maps identities per target; use guard_latest_content"
+        )
+        yield  # pragma: no cover
 
     def record_dataset_manifest(
         self,
