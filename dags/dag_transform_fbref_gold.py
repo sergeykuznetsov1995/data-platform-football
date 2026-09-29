@@ -58,8 +58,8 @@ Other:
 - ``gold.fct_team_season_stats_audit`` — DQ-audit diff'ы для fct_team_season_stats
 - ``gold.fct_player_match``   — player metrics per match
 - ``gold.fct_player_unavailable`` — confirmed absences (E5; from WhoScored)
-- ``gold.fct_player_market_value`` — FotMob market_value timeline per player×date
-                                     (issue #11; bridge via silver.xref_player)
+- ``gold.fct_player_market_value`` — market_value timeline per player×date
+                                     (issue #11/#430; Transfermarkt since #1590)
 """
 
 from __future__ import annotations
@@ -141,10 +141,9 @@ STAGE_2D_SEASON_BLOCKS = [
     ('fct_player_season_stats',   'dags/sql/gold/fct_player_season_stats.sql.j2',
      'fct_player_season_stats',   ['league', 'season']),
     # #175 — keeper-variant per-season facts. Restored lost wiring (SQL + DQ
-    # checks shipped in T5 but never registered in a STAGE list). Reads
-    # silver.fotmob_keeper_profile (per-90 cols pass through as-is), so the
-    # #174 FotMob count-drift does not apply here. Main facts precede both
-    # audits (audit ref_integrity → main).
+    # checks shipped in T5 but never registered in a STAGE list). The FotMob
+    # keeper branch was removed in #1590 (its columns are typed NULL). Main
+    # facts precede both audits (audit ref_integrity → main).
     ('fct_keeper_season_stats',   'dags/sql/gold/fct_keeper_season_stats.sql.j2',
      'fct_keeper_season_stats',   ['league', 'season']),
     ('fct_player_season_stats_audit',
@@ -183,8 +182,8 @@ STAGE_3_FACTS = [
     # E5: confirmed absences — самостоятельный narrow fact (WhoScored Silver).
     ('fct_player_unavailable', 'dags/sql/gold/fct_player_unavailable.sql',
      'fct_player_unavailable', ['league', 'season']),
-    # issue #430: market_value timeline from TWO sources (fotmob +
-    # transfermarkt, source in PK). Pointwise off-field fact — a career-long
+    # issue #430: market_value timeline (transfermarkt; the fotmob source was
+    # removed in #1590; source stays in PK). Pointwise off-field fact — a career-long
     # timeline with no season key → unpartitioned (None), like fct_team_elo.
     ('fct_player_market_value', 'dags/sql/gold/fct_player_market_value.sql',
      'fct_player_market_value_legacy', None),
@@ -242,13 +241,12 @@ STAGE_3_FALLBACKS = {
         'fallback_sql_file': 'dags/sql/gold/fct_player_unavailable_empty.sql',
         'require_silver':    ['whoscored_player_unavailable'],
     },
-    # issue #430: market_value needs BOTH Silver sources; either may be absent
-    # in an MVP env without FotMob / Transfermarkt ingest. Fallback holds the
-    # empty contract.
+    # issue #430: market_value Silver may be absent in an MVP env without
+    # Transfermarkt ingest. Fallback holds the empty contract. (#1590: the
+    # FotMob source was removed with the legacy FotMob Silver layer.)
     'fct_player_market_value': {
         'fallback_sql_file': 'dags/sql/gold/fct_player_market_value_empty.sql',
-        'require_silver':    ['fotmob_player_market_value_history',
-                              'transfermarkt_market_value_history'],
+        'require_silver':    ['transfermarkt_market_value_history'],
     },
     # issue #429: Transfermarkt Silver строится отдельным DAG'ом
     # (dag_transform_transfermarkt_silver) и может отсутствовать в env без

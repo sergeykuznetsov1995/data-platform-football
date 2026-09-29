@@ -1,17 +1,16 @@
 """
 Unit tests for Gold ``fct_player_market_value`` SQL logic (issue #430).
 
-Two-source market-value timeline, one row per
-(player_id, valuation_date, source). Logic under test:
+Market-value timeline, one row per (player_id, valuation_date, source).
+The FotMob branch (legacy FotMob Silver) was removed in #1590; only
+Transfermarkt remains. Logic under test:
 
-  * FotMob is bridged to canonical via silver.xref_player with a LEFT JOIN;
-    Transfermarkt reads canonical_id straight from Silver.  Unresolved points
+  * Transfermarkt reads canonical_id straight from Silver.  Unresolved points
     retain stable source-prefixed ids (issue #871).
-  * `source` in the PK keeps a FotMob and a Transfermarkt point on the same
-    (player, date) as two distinct rows.
-  * cross-season collapse: the same FotMob (player, date) point lands in
-    several season partitions of Silver — ROW_NUMBER over the design PK keeps
-    exactly one row.
+  * cross-season collapse: the same (player, date) point lands in several
+    season partitions of Silver — ROW_NUMBER over the design PK keeps exactly
+    one row.
+  * the SQL no longer reads any legacy FotMob Silver table (#1590).
 
 Strategy: Trino -> DuckDB transpile via sqlglot, fixture rows in an in-memory
 silver schema, execute, assert.
@@ -47,49 +46,6 @@ def _translate(sql_text: str) -> str:
 def _bootstrap(con) -> None:
     con.execute("CREATE SCHEMA IF NOT EXISTS silver")
 
-    # xref_player — only the FotMob bridge rows matter here.
-    con.execute("""
-        CREATE TABLE silver.xref_player (
-            canonical_id  VARCHAR,
-            source        VARCHAR,
-            source_id     VARCHAR,
-            league        VARCHAR,
-            season        VARCHAR,
-            confidence    VARCHAR
-        )
-    """)
-    con.executemany(
-        "INSERT INTO silver.xref_player VALUES (?, ?, ?, ?, ?, ?)",
-        [
-            ("fb_x", "fotmob", "500", LEAGUE, "2425", "exact"),
-            ("fb_x", "fotmob", "500", LEAGUE, "2526", "exact"),
-            # Explicit orphan bridge row; the Gold fallback remains fm_900.
-            ("fm_900", "fotmob", "900", LEAGUE, "2526", "orphan"),
-        ],
-    )
-
-    con.execute("""
-        CREATE TABLE silver.fotmob_player_market_value_history (
-            player_id            VARCHAR,
-            value_date           DATE,
-            market_value_eur     BIGINT,
-            currency             VARCHAR,
-            _bronze_ingested_at  TIMESTAMP,
-            league               VARCHAR,
-            season               VARCHAR
-        )
-    """)
-    con.executemany(
-        "INSERT INTO silver.fotmob_player_market_value_history VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [
-            # SAME (player, date) point re-emitted in two season partitions.
-            ("500", date(2024, 1, 1), 100_000_000, "EUR", INGESTED, LEAGUE, "2425"),
-            ("500", date(2024, 1, 1), 100_000_000, "EUR", INGESTED2, LEAGUE, "2526"),
-            # Orphan FotMob player -> retained with a stable prefixed id.
-            ("900", date(2024, 1, 1), 5_000_000, "EUR", INGESTED, LEAGUE, "2526"),
-        ],
-    )
-
     con.execute("""
         CREATE TABLE silver.transfermarkt_market_value_history (
             player_id            VARCHAR,
@@ -107,9 +63,11 @@ def _bootstrap(con) -> None:
         "INSERT INTO silver.transfermarkt_market_value_history "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            # Resolved canonical — same (player, date) as FotMob, different source.
+            # SAME resolved (player, date) point re-emitted in two season partitions.
+            ("700", "fb_x", date(2024, 1, 1), 90_000_000, "Man City", 24,
+             INGESTED, LEAGUE, "2425"),
             ("700", "fb_x", date(2024, 1, 1), 95_000_000, "Man City", 24,
-             INGESTED, LEAGUE, "2526"),
+             INGESTED2, LEAGUE, "2526"),
             # Orphan (canonical_id NULL) -> retained with a stable prefixed id.
             ("701", None, date(2024, 2, 1), 3_000_000, "Youth FC", 19,
              INGESTED, LEAGUE, "2526"),
@@ -145,22 +103,15 @@ pytestmark = pytest.mark.unit
 
 class TestFctPlayerMarketValue:
 
-    def test_all_four_source_points_are_retained(self, gold_rows):
-        # Resolved FotMob collapses across seasons; both source orphans survive.
-        assert len(gold_rows) == 4
+    def test_both_transfermarkt_points_are_retained(self, gold_rows):
+        # Resolved point collapses across seasons; the orphan survives.
+        assert len(gold_rows) == 2
 
     def test_distinct_sources(self, gold_rows):
-        assert {r["source"] for r in gold_rows} == {"fotmob", "transfermarkt"}
+        assert {r["source"] for r in gold_rows} == {"transfermarkt"}
 
-    def test_fotmob_point_collapsed_cross_season(self, gold_rows):
-        fm = [
-            r for r in gold_rows
-            if r["source"] == "fotmob" and r["player_id"] == "fb_x"
-        ]
-        assert len(fm) == 1, "the two season partitions must collapse to one row"
-        assert fm[0]["player_id"] == "fb_x"
-        assert fm[0]["valuation_date"] == date(2024, 1, 1)
-        assert fm[0]["market_value_eur"] == 100_000_000
+    def test_no_legacy_fotmob_silver_read(self):
+        assert "silver.fotmob_" not in SQL_PATH.read_text(encoding="utf-8")
 
     def test_transfermarkt_point_present(self, gold_rows):
         tm = next(
@@ -168,12 +119,14 @@ class TestFctPlayerMarketValue:
             if r["source"] == "transfermarkt" and r["player_id"] == "fb_x"
         )
         assert tm["player_id"] == "fb_x"
+        assert tm["valuation_date"] == date(2024, 1, 1)
+        # the two season partitions collapse to the freshest ingest
         assert tm["market_value_eur"] == 95_000_000
         assert tm["currency"] == "EUR"
 
     def test_orphans_are_retained_with_stable_source_prefixes(self, gold_rows):
         ids = {r["player_id"] for r in gold_rows}
-        assert {"fm_900", "tm_701"} <= ids
+        assert "tm_701" in ids
 
     def test_pk_unique_with_source(self, gold_rows):
         pks = [(r["player_id"], r["valuation_date"], r["source"])

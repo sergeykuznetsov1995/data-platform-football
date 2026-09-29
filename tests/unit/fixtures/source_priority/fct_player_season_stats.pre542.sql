@@ -2,21 +2,21 @@
 -- Gold: fct_player_season_stats
 -- =============================================================================
 --
--- Per-season cross-source stats per игрок: FBref+FotMob+WhoScored+Understat+
--- SofaScore объединены через silver.xref_player. Правило выбора источников
+-- Per-season cross-source stats per игрок: FBref+WhoScored+Understat+
+-- SofaScore объединены через silver.xref_player. #1590: FotMob-ветка (старый
+-- FotMob Silver) удалена; UNIQUE_FOTMOB-колонки остаются типизированным NULL
+-- (схема витрины не меняется). Правило выбора источников
 -- зафиксировано в docs/research/RX_cross_source_player_profile.md (D3) и
 -- memory/feedback_audit_in_separate_table.md:
 --
 --   * HARD_FACT (счётные event-метрики, identical definition) →
---     single column через COALESCE(fb→fm→ws→us→ss). FBref — primary spine.
+--     single column через COALESCE(fb→ws→us→ss). FBref — primary spine.
 --     Cross-source diff'ы выносятся в `fct_player_season_stats_audit`.
 --   * MODELED — два решения после исследований:
 --     - xG / xA: Understat выбран как primary (RX2 — coverage 99% vs
 --       82-85%; r≥0.989 между источниками). Single column через
---       COALESCE(us → fm → ss).
---     - RATING: SofaScore (Opta-derived) выбран как единственный источник —
---       FotMob rating дропнут из business-fct; cross-source diff остаётся
---       в audit-таблице.
+--       COALESCE(us → ss).
+--     - RATING: SofaScore (Opta-derived) выбран как единственный источник.
 --   * UNIQUE_<source> (метрика отсутствует у других) → single column,
 --     без суффикса.
 --
@@ -36,7 +36,6 @@
 -- Cross-source season type (all varchar slug 'YYNN' after #404):
 --   * silver.xref_player.season                       = varchar slug '2526'
 --   * silver.fbref_player_season_profile.season       = varchar slug '2526'
---   * silver.fotmob_player_season_profile.season      = varchar slug '2526'
 --   * silver.whoscored_player_season_aggregate.season = varchar slug
 --   * silver.understat_player_season_aggregate.season = varchar slug
 --   * silver.sofascore_player_season_aggregate.season = varchar slug
@@ -54,20 +53,9 @@ xref_fbref AS (
         source_id                                         AS fbref_player_id,
         league,
         season                                            AS season_slug,  -- varchar '2526' (для WS/US/SS JOIN)
-        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year   -- slug '2526' (для FBref/FotMob JOIN)
+        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year   -- slug '2526' (для FBref JOIN)
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
-      AND confidence <> 'orphan'
-),
-
-xref_fotmob AS (
-    SELECT DISTINCT
-        canonical_id,
-        source_id                                         AS fotmob_player_id,
-        league,
-        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
-    FROM iceberg.silver.xref_player
-    WHERE source = 'fotmob'
       AND confidence <> 'orphan'
 ),
 
@@ -146,29 +134,6 @@ fb_dedup AS (
         FROM iceberg.silver.fbref_player_season_profile
         WINDOW w AS (PARTITION BY player_id, league, season)
     ) WHERE rn = 1
-),
-
--- FotMob отдаёт shots/tackles/clearances/… как per-90 (не счётчики). Restore
--- season-count ≈ per_90 × minutes / 90 (±1, per_90 округлён источником до 2 знаков).
--- raw counts для этих метрик в FotMob API недоступны (issue #174). Pass-through
--- колонки (goals/assists/cards/xG/big_chances/…) уже счётчики — через SELECT *.
-fotmob_counts AS (
-    SELECT
-        *,
-        ROUND(shots_per_90               * minutes_played / 90.0) AS shots,
-        ROUND(shots_on_target_per_90     * minutes_played / 90.0) AS shots_on_target,
-        ROUND(interceptions_per_90       * minutes_played / 90.0) AS interceptions,
-        ROUND(tackles_per_90             * minutes_played / 90.0) AS tackles,
-        ROUND(fouls_per_90               * minutes_played / 90.0) AS fouls_committed,
-        ROUND(clearances_per_90          * minutes_played / 90.0) AS clearances,
-        ROUND(recoveries_per_90          * minutes_played / 90.0) AS ball_recoveries,
-        ROUND(blocks_per_90              * minutes_played / 90.0) AS blocks,
-        ROUND(successful_dribbles_per_90 * minutes_played / 90.0) AS successful_dribbles,
-        ROUND(accurate_passes_per_90     * minutes_played / 90.0) AS accurate_passes,
-        ROUND(accurate_long_balls_per_90 * minutes_played / 90.0) AS accurate_long_balls,
-        ROUND(defensive_actions_per_90   * minutes_played / 90.0) AS defensive_actions,
-        ROUND(poss_won_final_third_per_90 * minutes_played / 90.0) AS poss_won_final_third
-    FROM iceberg.silver.fotmob_player_season_profile
 )
 
 SELECT
@@ -183,25 +148,21 @@ SELECT
         'fb_' || lower(regexp_replace(fb.squad, '[^a-zA-Z0-9]+', '_'))
     )                                                    AS team_id,
 
-    -- ========= HARD_FACT (single column, COALESCE fb→fm→ws→us→ss) =========
+    -- ========= HARD_FACT (single column, COALESCE fb→ws→us→ss) =========
     -- Integer counters get CAST(... AS BIGINT) — COALESCE между гетерогенными
     -- source types (FBref varchar, FotMob bigint, US bigint) иначе промотит
     -- в double и BI показывает `90.0` / `3.0`. Cross-source diff'ы (FBref - Х)
     -- хранятся в fct_player_season_stats_audit.
-    CAST(COALESCE(fb.mp,                  fm.matches_played, ws.matches_seen, us.games_played) AS BIGINT) AS matches,
-    CAST(COALESCE(fb.minutes,             fm.minutes_played, us.minutes_played)               AS BIGINT) AS minutes,
-    CAST(COALESCE(fb.goals,               fm.goals,          us.goals)                        AS BIGINT) AS goals,
-    CAST(COALESCE(fb.assists,             fm.assists,        us.assists)                      AS BIGINT) AS assists,
-    CAST(COALESCE(fb.yellow_cards,        fm.yellow_cards,   us.yellow_cards)                 AS BIGINT) AS yellow_cards,
-    CAST(COALESCE(fb.red_cards,           fm.red_cards,      us.red_cards)                    AS BIGINT) AS red_cards,
+    CAST(COALESCE(fb.mp, ws.matches_seen, us.games_played) AS BIGINT) AS matches,
+    CAST(COALESCE(fb.minutes, us.minutes_played)               AS BIGINT) AS minutes,
+    CAST(COALESCE(fb.goals,          us.goals)                        AS BIGINT) AS goals,
+    CAST(COALESCE(fb.assists,        us.assists)                      AS BIGINT) AS assists,
+    CAST(COALESCE(fb.yellow_cards,   us.yellow_cards)                 AS BIGINT) AS yellow_cards,
+    CAST(COALESCE(fb.red_cards,      us.red_cards)                    AS BIGINT) AS red_cards,
     CAST(COALESCE(fb.penalty_goals,                                                   ss.penalty_goals)  AS BIGINT) AS penalty_goals,
     CAST(COALESCE(fb.penalty_attempts,                                                ss.penalties_taken) AS BIGINT) AS penalty_attempts,
-    CAST(COALESCE(fb.penalties_won,       fm.penalties_won,                           ss.penalty_won)    AS BIGINT) AS penalties_won,
-    CAST(COALESCE(fb.penalties_conceded,  fm.penalties_conceded,                      ss.penalty_conceded) AS BIGINT) AS penalties_conceded,
-    -- NB (issue #154): FotMob silver больше не отдаёт абсолютные счётчики
-    -- (shots/tackles/clearances/... — только `*_per_90`), поэтому `fm.<count>`
-    -- удалён из COALESCE-цепочек ниже. FBref остаётся primary spine; ws/us/ss
-    -- покрывают эти HARD_FACT. НЕ возвращай `fm.<count>` — колонок нет в Silver.
+    CAST(COALESCE(fb.penalties_won,                           ss.penalty_won)    AS BIGINT) AS penalties_won,
+    CAST(COALESCE(fb.penalties_conceded,                      ss.penalty_conceded) AS BIGINT) AS penalties_conceded,
     CAST(COALESCE(fb.shots,                                  ws.shots_total,         us.shots,           ss.total_shots) AS BIGINT) AS shots,
     CAST(COALESCE(fb.shots_on_target,                        ws.shots_on_target_proxy, ss.shots_on_target) AS BIGINT) AS shots_on_target,
     CAST(COALESCE(fb.interceptions,                          ws.interceptions,        ss.interceptions)  AS BIGINT) AS interceptions,
@@ -230,12 +191,12 @@ SELECT
     -- every row. Previously us.non_penalty_goals was Understat-first while
     -- goals/penalty_goals were FBref-first → cross-source arithmetic mismatch.
     -- Trino can't reference a SELECT alias at the same level, so repeat verbatim.
-    CAST(COALESCE(fb.goals,         fm.goals,          us.goals)         AS BIGINT)
+    CAST(COALESCE(fb.goals,                            us.goals)         AS BIGINT)
       - CAST(COALESCE(fb.penalty_goals,                ss.penalty_goals) AS BIGINT)                      AS non_penalty_goals,
 
     -- ========= Percentages (single column, COALESCE) =========
     -- Платформы вычисляют по-разному, но разница ≤2% — приемлемо для single
-    -- column. FotMob → WhoScored → SofaScore приоритет (sample-size order).
+    -- column. WhoScored → SofaScore приоритет (sample-size order).
     ROUND(COALESCE(CAST(ws.pass_pct    AS DOUBLE), ss.accurate_passes_pct), 2)        AS pass_pct,
     ROUND(COALESCE(CAST(ws.takeon_pct  AS DOUBLE), ss.dribbles_pct), 2)               AS take_on_pct,
     ROUND(COALESCE(CAST(ws.tackle_pct  AS DOUBLE), ss.tackles_won_pct), 2)            AS tackle_pct,
@@ -249,11 +210,12 @@ SELECT
     -- Cross-source diff'ы (FBref - <source> aren't applicable here; the
     -- relevant diff is us vs fm vs ss) хранятся в fct_player_season_stats_audit.
     -- См. docs/research/RX2_xg_source_selection.md.
-    ROUND(COALESCE(us.expected_goals, fm.expected_goals, ss.expected_goals), 2)   AS expected_goals,
-    ROUND(COALESCE(us.expected_assists, fm.expected_assists), 2)                  AS expected_assists,
+    ROUND(COALESCE(us.expected_goals, ss.expected_goals), 2)   AS expected_goals,
+    ROUND(us.expected_assists, 2)                  AS expected_assists,
     -- expected_goals_on_target / xG-Chain / xG-Buildup — source-unique
     -- метрики (нет аналогов у других провайдеров), single column как UNIQUE_*.
-    ROUND(fm.expected_goals_on_target, 2)                AS expected_goals_on_target,
+    CAST(NULL AS double)                                 AS expected_goals_on_target,  -- FotMob-only, NULL since #1590
+
     ROUND(us.non_penalty_xg, 2)                          AS non_penalty_xg_understat,
     ROUND(us.xg_chain, 2)                                AS xg_chain_understat,
     ROUND(us.xg_buildup, 2)                              AS xg_buildup_understat,
@@ -273,17 +235,15 @@ SELECT
     ROUND(fb.on_off_impact, 2)                           AS on_off_impact,
     ROUND(fb.goals_per_shot, 2)                          AS goals_per_shot,
 
-    -- ========= UNIQUE_FOTMOB =========
+    -- ========= UNIQUE_FOTMOB — typed NULL since #1590 =========
     -- defensive_actions — FotMob composite (нет в других). big_chances_*/
     -- chances_created — FotMob proprietary. poss_won_final_third — FotMob
     -- pressing-метрика (SS даёт att_third, но определения отличаются).
-    -- defensive_actions / poss_won_final_third: FotMob silver хранит только
-    -- per-90 форму (issue #154) → выносим как `*_per_90` (count-формы нет).
-    fm.defensive_actions_per_90,
-    ROUND(fm.big_chances_created, 2)                     AS big_chances_created,
-    ROUND(fm.big_chances_missed, 2)                      AS big_chances_missed,
-    ROUND(fm.chances_created, 2)                         AS chances_created,
-    fm.poss_won_final_third_per_90,
+    CAST(NULL AS double)                                 AS defensive_actions_per_90,
+    CAST(NULL AS double)                                 AS big_chances_created,
+    CAST(NULL AS double)                                 AS big_chances_missed,
+    CAST(NULL AS double)                                 AS chances_created,
+    CAST(NULL AS double)                                 AS poss_won_final_third_per_90,
 
     -- ========= UNIQUE_WHOSCORED =========
     -- bad_touches/touches_in_box/avg_x/avg_y — WS-specific event-aggregates,
@@ -344,14 +304,6 @@ LEFT JOIN xref_team_fbref xt
     ON  xt.fbref_team_name = fb.squad
     AND xt.league          = xf.league
     AND xt.season          = xf.season_year
-LEFT JOIN xref_fotmob xfm
-    ON  xfm.canonical_id = xf.canonical_id
-    AND xfm.league       = xf.league
-    AND xfm.season_year  = xf.season_year
-LEFT JOIN fotmob_counts fm
-    ON  fm.player_id = xfm.fotmob_player_id
-    AND fm.league    = xfm.league
-    AND fm.season    = xfm.season_year
 LEFT JOIN iceberg.silver.whoscored_player_season_aggregate ws
     ON  ws.canonical_id = xf.canonical_id
     AND ws.league       = xf.league

@@ -1,8 +1,9 @@
 """Render-smoke for ``dags/sql/gold/fct_player_season_stats_audit.sql``.
 
-T5 audit: DQ-таблица для cross-source согласованности FBref vs FotMob.
-INNER JOIN на оба источника → rows только где обе стороны не-NULL.
-Не business-витрина: ТОЛЬКО PK + 6 FotMob diff-колонок + lineage.
+T5 audit: DQ-таблица для cross-source согласованности FBref vs другие источники.
+#1590: FotMob-сравнение (старый FotMob Silver) убрано — spine теперь все FBref
+outfield-игроки, 6 FotMob diff-колонок оставлены в схеме как NULL.
+Не business-витрина: ТОЛЬКО PK + diff-колонки + lineage.
 """
 
 from __future__ import annotations
@@ -33,16 +34,16 @@ pytestmark = pytest.mark.unit
 
 class TestFctPlayerSeasonStatsAuditSql:
 
-    def test_reads_xref_and_both_silver_sources(self):
+    def test_reads_xref_and_silver_sources(self):
         sql = _strip_comments(_read_sql())
         assert "iceberg.silver.xref_player" in sql
         assert "iceberg.silver.fbref_player_season_profile" in sql
-        assert "iceberg.silver.fotmob_player_season_profile" in sql
+        assert "silver.fotmob_" not in sql  # #1590
         assert "iceberg.silver.whoscored_player_season_aggregate" in sql
         assert "iceberg.silver.understat_player_season_aggregate" in sql
 
-    def test_inner_join_fbref_fotmob_left_join_ws_us(self):
-        """FBref + FotMob — INNER JOIN (классический FotMob audit subset).
+    def test_inner_join_fbref_left_join_ws_us(self):
+        """FBref — INNER JOIN spine; FotMob INNER JOIN убран в #1590.
         WhoScored + Understat — LEFT JOIN: добавочные diffs, не сужают spine."""
         sql = _read_sql()
         # #463: FBref spine идёт через fb_dedup CTE (max-minutes club);
@@ -54,12 +55,10 @@ class TestFctPlayerSeasonStatsAuditSql:
         assert "iceberg.silver.fbref_player_season_profile" in sql, (
             "fb_dedup CTE must read silver.fbref_player_season_profile"
         )
-        # FotMob INNER-джойнится через CTE fotmob_counts (per-90 → count recompute,
-        # issue #174); CTE читает iceberg.silver.fotmob_player_season_profile.
-        assert re.search(
-            r"INNER\s+JOIN\s+fotmob_counts",
-            sql, re.IGNORECASE,
-        ), "audit must INNER JOIN на fotmob_counts (FotMob subset)"
+        # #1590: FotMob subset (INNER JOIN fotmob_counts) убран.
+        assert not re.search(
+            r"JOIN\s+fotmob_counts", _strip_comments(sql), re.IGNORECASE,
+        ), "FotMob join must be gone (#1590)"
         assert re.search(
             r"LEFT\s+JOIN\s+iceberg\.silver\.whoscored_player_season_aggregate",
             sql, re.IGNORECASE,
@@ -120,20 +119,18 @@ class TestFctPlayerSeasonStatsAuditSql:
                 f"audit-таблица не должна содержать business-метрику `{col}`"
             )
 
-    def test_fotmob_count_diffs_coalesce_to_zero(self):
-        """#564: разреженные FotMob счётчики COALESCE→0 (иначе diff=NULL
-        съедает ~38% пар). penalties_won/conceded удалены — FotMob не отдаёт
-        сезонные пенальти (колонки были полностью NULL)."""
+    def test_fotmob_diffs_are_null_placeholders(self):
+        """#1590: 6 FotMob diff-колонок остаются в схеме как CAST(NULL AS DOUBLE)
+        (решение владельца: схему не менять). penalties_won/conceded (#564)
+        по-прежнему удалены."""
         sql = _strip_comments(_read_sql())
-        for metric in ['goals', 'assists', 'yellow_cards', 'red_cards']:
+        for col in ['matches', 'minutes', 'goals', 'assists',
+                    'yellow_cards', 'red_cards']:
             assert re.search(
-                rf"COALESCE\(fm\.{metric},\s*0\)", sql, re.IGNORECASE,
-            ), f"FotMob `{metric}` diff должен COALESCE→0 (#564)"
-        # matches/minutes НЕ coalesce'им (NULL ≠ 0).
-        for raw in ['matches_played', 'minutes_played']:
-            assert not re.search(
-                rf"COALESCE\(fm\.{raw}", sql, re.IGNORECASE,
-            ), f"FotMob `{raw}` НЕ должен coalesce'иться (NULL ≠ 0)"
+                rf"CAST\(NULL AS DOUBLE\)\s+AS\s+{col}_diff_fotmob\b",
+                sql, re.IGNORECASE,
+            ), f"`{col}_diff_fotmob` must be a NULL placeholder (#1590)"
+        assert not re.search(r"\bfm\.", sql), "no FotMob alias left (#1590)"
         for dropped in ['penalties_won_diff_fotmob',
                         'penalties_conceded_diff_fotmob']:
             assert not re.search(rf"\bAS\s+{dropped}\b", sql, re.IGNORECASE), (

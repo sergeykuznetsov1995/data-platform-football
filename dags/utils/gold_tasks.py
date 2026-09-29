@@ -956,12 +956,8 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=50, severity='WARNING'),
         CHECK.value_range('gold.fct_team_match', 'pass_accuracy_pct',
                           min_val=0, max_val=100, severity='WARNING'),
-        # issue #97: FotMob 5th source. xa (team-grain xA, FotMob-only)
-        # and xgot per team-match rarely exceed 4; cap 10 to catch parser regressions.
-        CHECK.value_range('gold.fct_team_match', 'xa',
-                          min_val=0, max_val=10, severity='WARNING'),
-        CHECK.value_range('gold.fct_team_match', 'xgot',
-                          min_val=0, max_val=10, severity='WARNING'),
+        # #1590: xa / xgot value_range removed — FotMob-only columns (#97),
+        # typed NULL since the legacy FotMob Silver was removed.
 
         # ----- issue #46: fct_player_match multi-source xG/xA/rating sanity -----
         # xG/xA per single match: top observed values редко превышают 3.0 даже
@@ -1264,10 +1260,8 @@ def validate_gold_quality() -> Dict[str, Any]:
         # ============================================================
         # T4: dim_player_attributes — cross-source snapshot per canonical
         # player. Additive относительно dim_player (per-season FBref-only).
-        # FotMob coverage низкая (~40%) потому что FotMob Bronze покрывает
-        # только APL 2025, а FBref-spine — все сезоны (history). Coverage
-        # thresholds выставлены под реальный baseline; tighten после
-        # подключения R3 источников (Sofascore/Transfermarkt).
+        # Coverage thresholds выставлены под реальный baseline. #1590:
+        # FotMob-блок (*_fotmob) — типизированный NULL, его чеки удалены.
         # ============================================================
         CHECK.no_duplicates('gold.dim_player_attributes',
                             pk=['player_id']),
@@ -1279,15 +1273,7 @@ def validate_gold_quality() -> Dict[str, Any]:
             'player_id',
             parent_key='canonical_id',
         ),
-        CHECK.value_range('gold.dim_player_attributes', 'height_cm_fotmob',
-                          min_val=140, max_val=220, severity='WARNING'),
-        CHECK.coverage('gold.dim_player_attributes', column='height_cm_fotmob',
-                       warn_threshold=0.30, error_threshold=0.15),
-        CHECK.coverage('gold.dim_player_attributes', column='dob_fotmob',
-                       warn_threshold=0.30, error_threshold=0.15),
-        CHECK.coverage('gold.dim_player_attributes', column='foot_fotmob',
-                       warn_threshold=0.30, error_threshold=0.15),
-        # SofaScore block — coverage ниже FotMob потому что Bronze покрывает
+        # SofaScore block — coverage низкая потому что Bronze покрывает
         # только current APL season (~500 игроков из ~1200 в FBref-spine).
         CHECK.value_range('gold.dim_player_attributes', 'height_cm_sofascore',
                           min_val=140, max_val=220, severity='WARNING'),
@@ -1338,7 +1324,8 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=5_000_000, severity='WARNING'),
 
         # ============================================================
-        # issue #430: fct_player_market_value — two-source MV timeline, one row
+        # issue #430: fct_player_market_value — MV timeline (Transfermarkt;
+        # FotMob removed in #1590), one row
         # per (player_id, valuation_date, source). Pointwise off-field
         # fact (no league/season). The design PK is asserted in
         # build_star_gate_checks (pointwise, like fct_team_elo); here we keep
@@ -1355,19 +1342,12 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
         CHECK.value_range('gold.fct_player_market_value', 'market_value_eur',
                           min_val=0, max_val=500_000_000, severity='ERROR'),
-        # Coverage `current_market_value_eur_fotmob` в dim_player_attributes:
-        # бизнес-DoD issue #11 ≥50% применим к APL 2025/26 cohort, но dim
-        # содержит full FBref-spine (~28K canonical_id × все сезоны истории),
-        # а FotMob Bronze покрывает только current APL — measured baseline
-        # ~1.6%. Threshold выставлен под реальную форму spine; WARNING-only,
-        # detects полный регресс FotMob ingest.
-        CHECK.coverage('gold.dim_player_attributes',
-                       column='current_market_value_eur_fotmob',
-                       warn_threshold=0.05, error_threshold=0.01),
+        # #1590: coverage `current_market_value_eur_fotmob` removed — the
+        # column is a typed NULL since the legacy FotMob Silver was removed.
 
         # ============================================================
         # T5: fct_player_season_stats — cross-source per-season stats.
-        # FBref-spine + FotMob bridge через silver.xref_player. Outfield
+        # FBref-spine через silver.xref_player. Outfield
         # only (вратари в fct_keeper_season_stats). Business-витрина:
         # PK + ref_integrity ERROR; audit-diff чеки переехали в _audit.
         # ============================================================
@@ -1442,8 +1422,8 @@ def validate_gold_quality() -> Dict[str, Any]:
 
         # ============================================================
         # T5 audit: fct_player_season_stats_audit — DQ-таблица для
-        # cross-source согласованности FBref vs FotMob по HARD_FACT.
-        # INNER JOIN на оба источника → rows только где обе стороны не-NULL.
+        # cross-source согласованности по HARD_FACT. Spine = FBref outfield
+        # (#1590: FotMob INNER JOIN и *_fotmob diff-чеки удалены).
         # ERROR: PK uniqueness, ref к main fct (audit ⊆ main fct).
         # WARNING: audit-diff coverage ≥95% rows укладываются в threshold
         #          (план «<5% beyond» в acceptance). Threshold per metric:
@@ -1460,37 +1440,10 @@ def validate_gold_quality() -> Dict[str, Any]:
             'player_id',
             parent_key='player_id',
         ),
-        # 6 audit-diff coverage WARNING-only (error_threshold=0). Audit —
+        # audit-diff coverage WARNING-only (error_threshold=0). Audit —
         # observability, не gate; ERROR ломал бы DAG при нормальных
         # cross-source расхождениях (mid-season transfer, разные методики
         # подсчёта). NULL diff засчитывается как "not measured" (passed).
-        # #564: goals/assists/cards FotMob теперь COALESCE→0 в SQL (NULL=«не
-        # было события»); penalties_won/conceded diff-колонки удалены (FotMob
-        # не отдаёт сезонные пенальти — были полностью NULL).
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.matches]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(minutes_diff_fotmob) <= 90 OR minutes_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.minutes]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(goals_diff_fotmob) <= 1 OR goals_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.goals]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(assists_diff_fotmob) <= 1 OR assists_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.assists]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(yellow_cards_diff_fotmob) <= 1 OR yellow_cards_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.yellow_cards]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(red_cards_diff_fotmob) <= 1 OR red_cards_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.red_cards]'),
         # ----- WhoScored audit (1: только matches есть в event-aggregate) -----
         CHECK.coverage('gold.fct_player_season_stats_audit',
                        condition='ABS(matches_diff_whoscored) <= 1 OR matches_diff_whoscored IS NULL',
@@ -1535,18 +1488,6 @@ def validate_gold_quality() -> Dict[str, Any]:
             'player_id',
             parent_key='player_id',  # #696: audit + main fct both plain player_id
         ),
-        CHECK.coverage('gold.fct_keeper_season_stats_audit',
-                       condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_keeper_season_stats_audit.matches]'),
-        CHECK.coverage('gold.fct_keeper_season_stats_audit',
-                       condition='ABS(minutes_diff_fotmob) <= 90 OR minutes_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_keeper_season_stats_audit.minutes]'),
-        CHECK.coverage('gold.fct_keeper_season_stats_audit',
-                       condition='ABS(clean_sheets_diff_fotmob) <= 1 OR clean_sheets_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_keeper_season_stats_audit.clean_sheets]'),
         # WhoScored saves diff (SPADL keeper_save vs FBref `saves` — разная
         # дефиниция; threshold выше: ±5 reasonable cross-source noise).
         CHECK.coverage('gold.fct_keeper_season_stats_audit',
@@ -1577,10 +1518,8 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=150, severity='ERROR'),
         CHECK.value_range('gold.fct_team_season_stats', 'npxg',
                           min_val=0, max_val=150, severity='ERROR'),
-        # issue #97: FotMob-only team-grain xA (season SUM). NULL для сезонов вне
-        # FotMob-покрытия (value_range игнорирует NULL). Cap 150 как у xG-семейства.
-        CHECK.value_range('gold.fct_team_season_stats', 'expected_assists',
-                          min_val=0, max_val=150, severity='ERROR'),
+        # #1590: expected_assists value_range removed — FotMob-only (#97),
+        # typed NULL since the legacy FotMob Silver was removed.
         # Pct metrics — все в [0, 100] (ERROR).
         CHECK.value_range('gold.fct_team_season_stats', 'possession_pct',
                           min_val=0, max_val=100, severity='ERROR'),
@@ -1671,31 +1610,6 @@ def validate_gold_quality() -> Dict[str, Any]:
                        condition='ABS(xg_diff_us_vs_ss) <= 0.5 OR xg_diff_us_vs_ss IS NULL',
                        warn_threshold=0.90, error_threshold=0.0,
                        name='audit_diff[fct_team_season_stats_audit.xg_us_vs_ss]'),
-        # ----- FotMob diff (LEFT — NULL when absent; #97). WARNING-only -----
-        CHECK.coverage('gold.fct_team_season_stats_audit',
-                       condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_team_season_stats_audit.matches_fotmob]'),
-        CHECK.coverage('gold.fct_team_season_stats_audit',
-                       condition='ABS(goals_diff_fotmob) <= 1 OR goals_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_team_season_stats_audit.goals_fotmob]'),
-        CHECK.coverage('gold.fct_team_season_stats_audit',
-                       condition='ABS(goals_against_diff_fotmob) <= 1 OR goals_against_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_team_season_stats_audit.goals_against_fotmob]'),
-        CHECK.coverage('gold.fct_team_season_stats_audit',
-                       condition='ABS(shots_diff_fotmob) <= 2 OR shots_diff_fotmob IS NULL',
-                       warn_threshold=0.85, error_threshold=0.0,
-                       name='audit_diff[fct_team_season_stats_audit.shots_fotmob]'),
-        CHECK.coverage('gold.fct_team_season_stats_audit',
-                       condition='ABS(shots_on_target_diff_fotmob) <= 2 OR shots_on_target_diff_fotmob IS NULL',
-                       warn_threshold=0.85, error_threshold=0.0,
-                       name='audit_diff[fct_team_season_stats_audit.shots_on_target_fotmob]'),
-        CHECK.coverage('gold.fct_team_season_stats_audit',
-                       condition='ABS(xg_diff_us_vs_fm) <= 0.5 OR xg_diff_us_vs_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_season_stats_audit.xg_us_vs_fm]'),
 
         # ============================================================
         # issue #46 audit: fct_player_match_audit — cross-source diff на
@@ -2019,55 +1933,6 @@ def validate_gold_quality() -> Dict[str, Any]:
                        warn_threshold=0.90, error_threshold=0.0,
                        name='audit_diff[fct_team_match_audit.fouls_ss_ws]'),
 
-        # ----- FotMob diff (LEFT — NULL when absent; #97). WARNING-only -----
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(goals_for_diff_fm) <= 1 OR goals_for_diff_fm IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.goals_for_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(goals_against_diff_fm) <= 1 OR goals_against_diff_fm IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.goals_against_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(shots_diff_fm) <= 2 OR shots_diff_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.shots_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(shots_on_target_diff_fm) <= 2 OR shots_on_target_diff_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.shots_on_target_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(possession_diff_fm) <= 5 OR possession_diff_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.possession_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(yellow_cards_diff_fm) <= 1 OR yellow_cards_diff_fm IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.yellow_cards_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(red_cards_diff_fm) <= 1 OR red_cards_diff_fm IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.red_cards_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(xg_diff_us_fm) <= 0.5 OR xg_diff_us_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.xg_us_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(passes_diff_ss_fm) <= 30 OR passes_diff_ss_fm IS NULL',
-                       warn_threshold=0.85, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.passes_ss_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(corners_diff_ss_fm) <= 2 OR corners_diff_ss_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.corners_ss_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(fouls_diff_ss_fm) <= 2 OR fouls_diff_ss_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.fouls_ss_fm]'),
-        CHECK.coverage('gold.fct_team_match_audit',
-                       condition='ABS(offsides_diff_ss_fm) <= 2 OR offsides_diff_ss_fm IS NULL',
-                       warn_threshold=0.90, error_threshold=0.0,
-                       name='audit_diff[fct_team_match_audit.offsides_ss_fm]'),
 
         # ============================================================
         # E1.5: post-cutover ref_integrity / canonical-format checks
@@ -2140,13 +2005,11 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # gaps. Keeper baseline ≈204; floor 50.
         CHECK.row_count('gold.fct_player_season_stats', min_rows=400),
         CHECK.row_count('gold.fct_keeper_season_stats', min_rows=50),
-        # issue #11: FotMob market_value timeline — ~500 игроков × несколько
-        # точек, APL 2025/26 floor ≥1000.
+        # issue #11: market_value timeline (Transfermarkt since #1590) —
+        # floor ≥1000.
         CHECK.row_count('gold.fct_player_market_value', min_rows=1000),
-        # T5 audit: subset main fct (INNER JOIN на оба источника). FotMob
-        # покрывает только 2025/26 → audit-row только для пересечения.
-        # Outfield baseline ≈270 rows (2025/26 only); floor 100.
-        # Keeper baseline ≈25; floor 10.
+        # T5 audit: spine = FBref (#1590: был INNER JOIN FBref ∩ FotMob), так
+        # что audit теперь ≥ прежнего пересечения; floors 100 / 10 сохранены.
         CHECK.row_count('gold.fct_player_season_stats_audit', min_rows=100),
         CHECK.row_count('gold.fct_keeper_season_stats_audit', min_rows=10),
         # issue #46: multi-source это column-wise обогащение spine, не

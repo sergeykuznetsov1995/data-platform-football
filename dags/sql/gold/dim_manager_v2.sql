@@ -13,32 +13,6 @@ WITH managers AS (
     GROUP BY canonical_id
 ),
 
-xref_fotmob AS (
-    SELECT canonical_id, source_id AS fotmob_coach_id
-    FROM (
-        SELECT
-            canonical_id,
-            source_id,
-            ROW_NUMBER() OVER (
-                PARTITION BY canonical_id ORDER BY season DESC
-            ) AS rn
-        FROM iceberg.silver.xref_manager
-        WHERE source = 'fotmob'
-          AND confidence <> 'orphan'
-    )
-    WHERE rn = 1
-),
-
-fotmob_manager AS (
-    SELECT
-        player_id,
-        MAX_BY(nationality, season)                       AS nationality,
-        MAX_BY(date_of_birth, season)                     AS date_of_birth
-    FROM iceberg.silver.fotmob_manager_profile
-    WHERE player_id IS NOT NULL
-    GROUP BY player_id
-),
-
 xref_tm_source AS (
     SELECT
         CAST(source_id AS varchar)                        AS coach_id,
@@ -78,9 +52,8 @@ tm_manager AS (
 SELECT
     m.manager_id,
     m.manager_name,
-    COALESCE(fm.nationality, tm.nationality)               AS nationality,
-    COALESCE(TRY_CAST(fm.date_of_birth AS date), tm.dob)   AS dob
+    -- #1590: FotMob silver branch removed; Transfermarkt is the only source.
+    tm.nationality                                         AS nationality,
+    tm.dob                                                 AS dob
 FROM managers m
-LEFT JOIN xref_fotmob xf ON xf.canonical_id = m.manager_id
-LEFT JOIN fotmob_manager fm ON fm.player_id = xf.fotmob_coach_id
 LEFT JOIN tm_manager tm ON tm.canonical_id = m.manager_id

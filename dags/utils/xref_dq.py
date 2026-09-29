@@ -330,8 +330,8 @@ def build_xref_manager_checks() -> List[Check]:
     per-season presence × 3 sources ≈ 900 rows worst case — max 2000 keeps
     headroom; revisit per league onboarded. Per-source orphan-rate is
     evaluated separately by :func:`evaluate_orphan_rate_per_source` and
-    appended by the DAG callable; TM-vs-FotMob dob disagreement by
-    :func:`evaluate_manager_dob_collisions` (Phase 2.7).
+    appended by the DAG callable. (The TM-vs-FotMob dob-collision check,
+    Phase 2.7, was removed in #1590 with the legacy FotMob Silver layer.)
     """
     table = 'iceberg.silver.xref_manager'
     checks = [
@@ -887,18 +887,11 @@ def report_orphan_teams(
 # Cross-source DOB conflicts (companion to the resolver's name_team_dob tier)
 # ---------------------------------------------------------------------------
 
-#: Source DOB projections: (source, SQL yielding (source_id, dob)). FotMob uses
-#: its native-backed Silver profile; WhoScored uses its manifest-backed current
-#: view; Transfermarkt uses its state-selected canonical reader. None of these
+#: Source DOB projections: (source, SQL yielding (source_id, dob)). WhoScored
+#: uses its manifest-backed current view; Transfermarkt uses its state-selected canonical reader. None of these
 #: readers depends on xref_player, so the projections introduce no cycle.
 #: Trino dialect; tests inject DuckDB-compatible projections instead.
 DEFAULT_PLAYER_DOB_PROJECTIONS = (
-    ('fotmob',
-     "SELECT CAST(player_id AS varchar) AS source_id, "
-     "max_by(TRY_CAST(date_of_birth AS DATE), _bronze_ingested_at) AS dob "
-     "FROM iceberg.silver.fotmob_player_profile "
-     "WHERE player_id IS NOT NULL AND date_of_birth IS NOT NULL "
-     "GROUP BY CAST(player_id AS varchar)"),
     ('sofascore',
      "SELECT CAST(player_id AS varchar) AS source_id, "
      "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
@@ -1003,110 +996,17 @@ def evaluate_dob_conflicts(
     }
 
 
-def evaluate_manager_dob_collisions(
-    xref_table: str = 'iceberg.silver.xref_manager',
-    fotmob_profile_table: str = 'iceberg.silver.fotmob_manager_profile',
-    tm_coaches_table: str = 'iceberg.silver.transfermarkt_coaches',
-    tolerance_days: int = 1,
-    limit: int = 50,
-) -> Dict[str, Any]:
-    """Report manager canonicals where FotMob and TM disagree on birth date.
-
-    DOB corroboration for the manager bridge: a canonical carrying both a
-    FotMob coachId and a TM coach_id whose profile DOBs differ by more than
-    ``tolerance_days`` is a suspected false merge — the strongest signal for
-    ``name_initial``-tier rows (the confidence of the TM row is included so
-    the reviewer sees which tier produced the link). Candidates for a
-    ``manager_aliases.yaml`` correction.
-
-    Reads stable canonical Silver readers, never a physical ``_v2`` table.
-    The state-selected Transfermarkt v2 compatibility adapter retains the
-    legacy-shaped (coach_id, league, season) contract required by this scoped
-    comparison. Neither profile reader consumes xref_manager.
-
-    Returns ``{'collisions': N, 'rows': [...≤limit], 'truncated': bool,
-    'verdict': 'OK'|'WARNING'}`` — never escalates to ERROR.
-    """
-    xq = _qualify(xref_table)
-    fmq = _qualify(fotmob_profile_table)
-    tmq = _qualify(tm_coaches_table)
-    sql = (
-        "WITH fm AS (\n"
-        "    SELECT x.canonical_id, x.league, x.season,\n"
-        "           MAX(TRY_CAST(p.date_of_birth AS DATE)) AS fm_dob\n"
-        f"    FROM {xq} x\n"
-        f"    JOIN {fmq} p\n"
-        "      ON p.player_id = x.source_id\n"
-        "     AND p.league = x.league AND p.season = x.season\n"
-        "    WHERE x.source = 'fotmob' AND x.confidence <> 'orphan'\n"
-        "    GROUP BY x.canonical_id, x.league, x.season\n"
-        "),\n"
-        "tm AS (\n"
-        "    SELECT x.canonical_id, x.league, x.season, x.confidence,\n"
-        "           MAX(c.dob) AS tm_dob\n"
-        f"    FROM {xq} x\n"
-        f"    JOIN {tmq} c\n"
-        "      ON CAST(c.coach_id AS varchar) = x.source_id\n"
-        "     AND c.league = x.league AND c.season = x.season\n"
-        "    WHERE x.source = 'transfermarkt' AND x.confidence <> 'orphan'\n"
-        "    GROUP BY x.canonical_id, x.league, x.season, x.confidence\n"
-        ")\n"
-        "SELECT tm.canonical_id, tm.league, tm.season, tm.confidence,\n"
-        "       fm.fm_dob, tm.tm_dob\n"
-        "FROM tm\n"
-        "JOIN fm ON fm.canonical_id = tm.canonical_id\n"
-        "       AND fm.league = tm.league AND fm.season = tm.season\n"
-        "WHERE fm.fm_dob IS NOT NULL AND tm.tm_dob IS NOT NULL\n"
-        f"  AND abs(date_diff('day', fm.fm_dob, tm.tm_dob)) > {int(tolerance_days)}\n"
-        "ORDER BY tm.canonical_id, tm.season"
-    )
-    conn = _get_conn()
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute(sql)
-            rows = cur.fetchall()
-        finally:
-            cur.close()
-    finally:
-        conn.close()
-
-    out_rows: List[Dict[str, Any]] = []
-    for cid, league, season, confidence, fm_dob, tm_dob in rows[:limit]:
-        out_rows.append({
-            'canonical_id': cid,
-            'league': league,
-            'season': season,
-            'tm_confidence': confidence,
-            'fotmob_dob': str(fm_dob),
-            'tm_dob': str(tm_dob),
-        })
-    return {
-        'collisions': len(rows),
-        'rows': out_rows,
-        'truncated': len(rows) > limit,
-        'verdict': 'OK' if not rows else 'WARNING',
-    }
-
-
 # ---------------------------------------------------------------------------
 # Source-vs-xref freshness gap (Issue #15 regression guard)
 # ---------------------------------------------------------------------------
 
 #: Default source relations consulted by
-#: :func:`evaluate_bronze_xref_freshness_gap`. FotMob points at the
-#: native-backed Silver relation consumed by the resolver, not the stopped
-#: legacy Bronze feed. Tuple shape is kept for caller compatibility.
+#: :func:`evaluate_bronze_xref_freshness_gap`. (#1590: the FotMob entry — the
+#: legacy FotMob Silver season profile — was removed with that layer.) Tuple
+#: shape is kept for caller compatibility.
 DEFAULT_FRESHNESS_BRONZE_TABLES = (
     ('understat', 'iceberg.bronze.understat_player_team_season_stats'),
-    ('fotmob', 'iceberg.silver.fotmob_player_season_profile'),
 )
-
-# Timestamp contract differs by layer. Kept outside the public tuple so callers
-# that inject historical two-tuples continue to work unchanged.
-_FRESHNESS_TS_COLUMN_BY_RELATION = {
-    'iceberg.silver.fotmob_player_season_profile': '_bronze_ingested_at',
-}
 
 
 def _freshness_source_sql(
@@ -1209,7 +1109,7 @@ def evaluate_bronze_xref_freshness_gap(
 
     Args:
         bronze_tables: Iterable of (source_label, qualified source relation).
-            Defaults to Understat + FotMob; WhoScored excluded because the
+            Defaults to Understat; WhoScored excluded because the
             resolver reads players from ``bronze.whoscored_events_current`` which is
             too large to scan freshness-per-season cheaply.
         xref_table: Iceberg table whose snapshot timestamp represents the
@@ -1253,14 +1153,11 @@ def evaluate_bronze_xref_freshness_gap(
             per_partition: List[Dict[str, Any]] = []
             for source_label, bronze_table in bronze_tables:
                 bronze_qualified = _qualify(bronze_table)
-                ts_column = _FRESHNESS_TS_COLUMN_BY_RELATION.get(
-                    bronze_qualified, '_ingested_at'
-                )
                 cur.execute(
                     _freshness_source_sql(
                         source_label,
                         bronze_qualified,
-                        ts_column,
+                        '_ingested_at',
                     )
                 )
                 for season_str, bronze_max in cur.fetchall():

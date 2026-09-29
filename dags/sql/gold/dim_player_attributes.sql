@@ -8,8 +8,10 @@
 -- Принципы (см. docs/decisions/RX-implementation-plan.md):
 --   - FBref-spine: WHERE source='fbref' AND confidence != 'orphan' →
 --     `xref_fbref` даёт ровно один row на canonical_id.
---   - FotMob-side bridge: per canonical_id берётся latest season — атрибуты
---     time-invariant, но xref хранит row per (source, source_id, season).
+--   - FotMob-side (#1590): ветка старого FotMob Silver (player profile) удалена вместе
+--     со старым FotMob Silver. Колонки `*_fotmob` остаются в схеме как
+--     типизированный NULL (решение владельца 29.09: схема витрины не
+--     меняется, новый Silver сможет снова их наполнить).
 --   - SofaScore-side: silver.sofascore_player_profile уже несёт canonical_id
 --     (заполняется при материализации Silver), JOIN напрямую без xref hop;
 --     MAX_BY(..., season) сворачивает до одного row per canonical_id.
@@ -26,7 +28,6 @@
 --
 -- Сross-source season type discrepancy (CLAUDE.md):
 --   - silver.fbref_player_season_profile.season = varchar slug ('2526')  -- #404
---   - silver.fotmob_player_profile.season       = varchar slug ('2526')  -- #404
 --   - silver.sofascore_player_profile.season    = varchar ('2526')
 --   - silver.xref_player.season                 = varchar ('2526')
 -- В этом SQL season НЕ используется в JOIN-ключе — snapshot-зерно делает
@@ -60,28 +61,6 @@ fbref_latest AS (
         MAX_BY(nation, season)  AS nationality,
         MAX_BY(squad,  season)  AS current_team
     FROM fbref_profile_dedup
-    GROUP BY player_id
-),
-
-fotmob_latest AS (
-    SELECT
-        player_id,
-        MAX_BY(player_name,    season) AS player_name,
-        MAX_BY(date_of_birth,  season) AS date_of_birth,
-        MAX_BY(nationality,    season) AS nationality,
-        MAX_BY(country_code,   season) AS country_code,
-        MAX_BY(height_cm,      season) AS height_cm,
-        MAX_BY(foot,           season) AS foot,
-        MAX_BY(shirt_number,   season) AS shirt_number,
-        -- contract_end + current_market_value_eur frozen as of
-        -- card_observed_at. Регулярную историю ведёт Transfermarkt; FotMob
-        -- остаётся дополнительным one-time snapshot source.
-        MAX_BY(contract_end,             season) AS contract_end,
-        MAX_BY(current_market_value_eur, season) AS current_market_value_eur,
-        MAX_BY(market_value_currency,    season) AS market_value_currency,
-        MAX_BY(card_observed_at,         season) AS card_observed_at
-    FROM iceberg.silver.fotmob_player_profile
-    WHERE player_id IS NOT NULL
     GROUP BY player_id
 ),
 
@@ -162,30 +141,11 @@ xref_fbref AS (
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
       AND confidence <> 'orphan'
-),
-
--- FotMob-side: один row per canonical_id, source_id из latest season.
--- ROW_NUMBER ORDER BY season DESC — берём свежий маппинг (даже если игрок
--- сменил FotMob ID между сезонами, это редкость, но защита есть).
-xref_fotmob_latest AS (
-    SELECT canonical_id, fotmob_player_id
-    FROM (
-        SELECT
-            canonical_id,
-            source_id AS fotmob_player_id,
-            ROW_NUMBER() OVER (
-                PARTITION BY canonical_id
-                ORDER BY season DESC
-            ) AS rn
-        FROM iceberg.silver.xref_player
-        WHERE source = 'fotmob'
-    )
-    WHERE rn = 1
 )
 
 SELECT
     xf.canonical_id                                    AS player_id,
-    COALESCE(fb.player_name, fm.player_name, ss.player_name, tm.player_name)
+    COALESCE(fb.player_name, ss.player_name, tm.player_name)
                                                        AS player_name,
 
     -- Current club — единый источник FBref (spine 100% coverage,
@@ -194,30 +154,30 @@ SELECT
 
     -- Identity attributes
     fb.born_year                                       AS born_year_fbref,
-    fm.date_of_birth                                   AS dob_fotmob,
+    CAST(NULL AS varchar)                              AS dob_fotmob,
     ss.date_of_birth                                   AS dob_sofascore,
     fb.nationality                                     AS nationality_fbref,
-    fm.nationality                                     AS nationality_fotmob,
+    CAST(NULL AS varchar)                              AS nationality_fotmob,
     ss.nationality                                     AS nationality_sofascore,
-    fm.country_code                                    AS country_code_fotmob,
+    CAST(NULL AS varchar)                              AS country_code_fotmob,
     ss.country_code                                    AS country_code_sofascore,
 
     -- Physical attributes
-    fm.height_cm                                       AS height_cm_fotmob,
+    CAST(NULL AS integer)                              AS height_cm_fotmob,
     ss.height_cm                                       AS height_cm_sofascore,
-    fm.foot                                            AS foot_fotmob,
+    CAST(NULL AS varchar)                              AS foot_fotmob,
     ss.preferred_foot                                  AS foot_sofascore,
 
     -- Squad attributes
-    fm.shirt_number                                    AS shirt_number_fotmob,
+    CAST(NULL AS integer)                              AS shirt_number_fotmob,
     ss.shirt_number                                    AS shirt_number_sofascore,
     ss.retired                                         AS retired_sofascore,
 
     -- Contract / market value (slowly-changing, as-of-latest-ingest)
-    fm.contract_end                                    AS contract_end_fotmob,
-    fm.current_market_value_eur                        AS current_market_value_eur_fotmob,
-    fm.market_value_currency                           AS market_value_currency_fotmob,
-    fm.card_observed_at                                AS card_observed_at_fotmob,
+    CAST(NULL AS date)                                 AS contract_end_fotmob,
+    CAST(NULL AS bigint)                               AS current_market_value_eur_fotmob,
+    CAST(NULL AS varchar)                              AS market_value_currency_fotmob,
+    CAST(NULL AS timestamp(6))                         AS card_observed_at_fotmob,
 
     -- Transfermarkt block (snapshot, as-of-latest-ingest). Primary source
     -- for height_cm (parsed from official club profile) и MV в EUR.
@@ -246,10 +206,6 @@ SELECT
 FROM xref_fbref xf
 LEFT JOIN fbref_latest fb
     ON fb.player_id = xf.fbref_player_id
-LEFT JOIN xref_fotmob_latest xfm
-    ON xfm.canonical_id = xf.canonical_id
-LEFT JOIN fotmob_latest fm
-    ON fm.player_id = xfm.fotmob_player_id
 LEFT JOIN sofascore_latest ss
     ON ss.canonical_id = xf.canonical_id
 LEFT JOIN transfermarkt_latest tm

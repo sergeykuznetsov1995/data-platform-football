@@ -169,35 +169,6 @@ def test_contract_model_keeps_explicit_empty_without_carry_forward():
 def _bootstrap_market_value(con, transfermarkt_table: str) -> None:
     con.execute("CREATE SCHEMA silver")
     con.execute(
-        '''CREATE TABLE silver.xref_player (
-            canonical_id varchar, source varchar, source_id varchar,
-            league varchar, season varchar, confidence varchar
-        )'''
-    )
-    con.executemany(
-        "INSERT INTO silver.xref_player VALUES (?,?,?,?,?,?)",
-        [
-            ("fb_1", "fotmob", "1", "ENG", "2526", "exact"),
-            ("fb_a", "fotmob", "2", "ENG", "2526", "exact"),
-            ("fb_b", "fotmob", "2", "ENG", "2526", "exact"),
-        ],
-    )
-    con.execute(
-        '''CREATE TABLE silver.fotmob_player_market_value_history (
-            player_id varchar, value_date date, market_value_eur bigint,
-            currency varchar, _bronze_ingested_at timestamp,
-            league varchar, season varchar
-        )'''
-    )
-    con.executemany(
-        "INSERT INTO silver.fotmob_player_market_value_history VALUES (?,?,?,?,?,?,?)",
-        [
-            ("1", date(2026, 1, 1), 10, "EUR", "2026-07-11", "ENG", "2526"),
-            ("2", date(2026, 1, 1), 20, "EUR", "2026-07-11", "ENG", "2526"),
-            ("3", date(2026, 1, 1), 30, "EUR", "2026-07-11", "ENG", "2526"),
-        ],
-    )
-    con.execute(
         f'''CREATE TABLE silver.{transfermarkt_table} (
             player_id varchar, canonical_id varchar, mv_date date,
             value_eur bigint, _bronze_ingested_at timestamp
@@ -230,12 +201,10 @@ def test_market_value_gold_retains_unresolved_and_ambiguous_players(
     facts = [dict(zip(names, row)) for row in rows]
     keys = {(fact["player_id"], fact["source"]) for fact in facts}
 
-    assert len(facts) == 5
-    assert ("fb_1", "fotmob") in keys
+    # #1590: the FotMob branch (legacy FotMob Silver) was removed.
+    assert len(facts) == 2
     assert ("fb_1", "transfermarkt") in keys
-    assert ("fm_2", "fotmob") in keys  # ambiguous xref is lossless, not fanout
-    assert ("fm_3", "fotmob") in keys  # no xref
-    assert ("tm_2", "transfermarkt") in keys
+    assert ("tm_2", "transfermarkt") in keys  # unresolved is lossless
     assert len(keys) == len(facts)
 
 
@@ -246,8 +215,8 @@ def test_market_value_gold_uses_source_aware_natural_key():
         assert "player_id" in partition
         assert "valuation_date" in partition
         assert "source" in partition
-        assert "LEFT JOIN xref_fotmob" in sql
-        assert "CONCAT('fm_'" in sql
+        assert "silver.fotmob_" not in sql  # #1590
+        assert "CONCAT('fm_'" not in sql
         assert "CONCAT('tm_'" in sql
 
 

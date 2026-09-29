@@ -126,11 +126,13 @@ class TestInlineSourceRefs:
     def test_silver_team_match_sources_present(self):
         for name, body in (("main", _main_body()), ("audit", _audit_body())):
             stripped = _strip_comments(body)
-            for src in ("understat", "whoscored", "sofascore", "fotmob"):
+            for src in ("understat", "whoscored", "sofascore"):
                 assert f"iceberg.silver.{src}_team_match" in stripped, (
                     f"{name}: ожидается инлайн-CTE над "
                     f"silver.{src}_team_match"
                 )
+            # #1590: FotMob rollup над старым FotMob Silver удалён.
+            assert "silver.fotmob_" not in stripped, name
 
     def test_ws_penalties_reads_silver_not_bronze(self):
         """#736: ws_penalties (#161) теперь one-hop — читает
@@ -186,8 +188,8 @@ _DIVERGENT_CTES = {"ss_team_season"}
 # набора при рефакторе парсинга (#740). ws_name_to_id особенно: в #705 там
 # вручную правился double-cast в обоих файлах, прежний тест бы это не поймал.
 _MUST_COVER_CTES = {
-    "xref_fbref", "xref_ws", "xref_ss", "xref_fm", "ws_name_to_id",
-}
+    "xref_fbref", "xref_ws", "xref_ss", "ws_name_to_id",
+}  # xref_fm removed with the legacy FotMob Silver (#1590)
 
 
 def _cte_names(sql_body: str) -> set:

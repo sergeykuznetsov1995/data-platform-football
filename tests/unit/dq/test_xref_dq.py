@@ -690,18 +690,16 @@ def test_bronze_xref_freshness_ok_when_xref_fresher_than_bronze(monkeypatch):
 
     xref_ts = datetime(2026, 5, 17, 14, 0, tzinfo=timezone.utc)
     us_ts = datetime(2026, 5, 17, 9, 0)
-    fm_ts = datetime(2026, 5, 17, 7, 0)
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(xref_ts,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.silver.fotmob_player_season_profile', [('2526', fm_ts)]),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
 
     assert res['verdict'] == 'OK'
     assert res['breaches'] == []
-    assert len(res['per_partition']) == 2
+    assert len(res['per_partition']) == 1
     for p in res['per_partition']:
         assert p['verdict'] == 'OK'
         assert p['lag_hours'] <= 0
@@ -716,17 +714,15 @@ def test_bronze_xref_freshness_warning_when_bronze_ahead(monkeypatch):
 
     xref_ts = datetime(2026, 5, 15, 14, 54, tzinfo=timezone.utc)
     us_ts = datetime(2026, 5, 17, 9, 0)
-    fm_ts = datetime(2026, 5, 17, 7, 0)
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(xref_ts,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.silver.fotmob_player_season_profile', [('2526', fm_ts)]),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
 
     assert res['verdict'] == 'WARNING'
-    assert len(res['breaches']) == 2
+    assert len(res['breaches']) == 1
     us = next(p for p in res['per_partition'] if p['source'] == 'understat')
     assert us['lag_hours'] > 24
     assert us['lag_hours'] < 72
@@ -742,7 +738,6 @@ def test_bronze_xref_freshness_error_when_lag_exceeds_3_days(monkeypatch):
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(xref_ts,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.silver.fotmob_player_season_profile', []),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
@@ -765,7 +760,6 @@ def test_bronze_xref_freshness_handles_empty_xref_snapshots(monkeypatch):
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(None,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.silver.fotmob_player_season_profile', []),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
@@ -845,13 +839,10 @@ def test_xref_player_review_rule_enum_includes_dob_veto():
 
 
 def test_default_player_dob_projections_use_stable_canonical_readers():
-    """DOB inputs are native-backed/canonical and never frozen FotMob legacy."""
+    """DOB inputs are native-backed/canonical; no legacy FotMob Silver (#1590)."""
     for src, proj in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS:
-        if src == 'fotmob':
-            assert 'iceberg.silver.fotmob_player_profile' in proj
-            assert 'fotmob_team_squad' not in proj
-            assert '_bronze_ingested_at' in proj
-        elif src == 'whoscored':
+        assert 'silver.fotmob_' not in proj
+        if src == 'whoscored':
             assert 'iceberg.silver.whoscored_player_profile_current' in proj
         elif src == 'transfermarkt':
             assert 'iceberg.silver.transfermarkt_players' in proj
@@ -861,23 +852,16 @@ def test_default_player_dob_projections_use_stable_canonical_readers():
             assert 'silver' not in proj, f"{src}: circular silver read"
         assert 'xref_player' not in proj.lower()
     assert {s for s, _ in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS} == {
-        'fotmob', 'sofascore', 'transfermarkt', 'sofifa', 'whoscored',
+        'sofascore', 'transfermarkt', 'sofifa', 'whoscored',
     }
 
 
-def test_default_freshness_relations_exclude_frozen_fotmob_legacy():
+def test_default_freshness_relations_exclude_fotmob():
+    """#1590: the legacy FotMob Silver relation is no longer a freshness input."""
     relations = dict(xref_dq.DEFAULT_FRESHNESS_BRONZE_TABLES)
-    assert relations['understat'] == (
-        'iceberg.bronze.understat_player_team_season_stats'
-    )
-    assert relations['fotmob'] == (
-        'iceberg.silver.fotmob_player_season_profile'
-    )
-    assert all('fotmob_player_stats' not in rel for rel in relations.values())
-    assert (
-        xref_dq._FRESHNESS_TS_COLUMN_BY_RELATION[relations['fotmob']]
-        == '_bronze_ingested_at'
-    )
+    assert relations == {
+        'understat': 'iceberg.bronze.understat_player_team_season_stats',
+    }
 
 
 def test_understat_freshness_uses_the_same_manifest_cutover_as_resolver():
@@ -946,58 +930,9 @@ def test_evaluate_dob_conflicts_empty_table_is_ok(duck_conn):
                    'verdict': 'OK'}
 
 
-def _seed_manager_dob_fixture(duck_conn, tm_dob: str):
-    """xref_manager + fotmob_manager_profile + transfermarkt_coaches."""
-    duck_conn.execute(
-        """
-        CREATE TABLE iceberg.silver.xref_manager (
-            canonical_id VARCHAR, source VARCHAR, source_id VARCHAR,
-            display_name VARCHAR, league VARCHAR, season VARCHAR,
-            confidence VARCHAR, match_score DOUBLE
-        )
-        """
-    )
-    duck_conn.execute(
-        "INSERT INTO iceberg.silver.xref_manager VALUES "
-        "('coach_a', 'fbref', 'Coach A', 'Coach A', 'ENG', '2425', "
-        " 'name_normalize', NULL), "
-        "('coach_a', 'fotmob', '500', 'Coach A', 'ENG', '2425', "
-        " 'name_normalize', NULL), "
-        "('coach_a', 'transfermarkt', '900', 'C. A', 'ENG', '2425', "
-        " 'name_initial', NULL)"
-    )
-    duck_conn.execute(
-        "CREATE TABLE iceberg.silver.fotmob_manager_profile AS "
-        "SELECT '500' AS player_id, 'Coach A' AS name, "
-        "'1970-01-01' AS date_of_birth, 'ENG' AS league, '2425' AS season"
-    )
-    duck_conn.execute(
-        f"CREATE TABLE iceberg.silver.transfermarkt_coaches AS "
-        f"SELECT '900' AS coach_id, 'C. A' AS name, DATE '{tm_dob}' AS dob, "
-        f"'ENG' AS league, '2425' AS season"
-    )
-
-
-def test_evaluate_manager_dob_collisions_flags_mismatch(duck_conn):
-    """FotMob-vs-TM dob disagreement on one canonical → WARNING with the TM
-    row's confidence exposed (name_initial = suspected false merge)."""
-    _seed_manager_dob_fixture(duck_conn, tm_dob='1965-05-05')
-    res = xref_dq.evaluate_manager_dob_collisions()
-    assert res['verdict'] == 'WARNING'
-    assert res['collisions'] == 1
-    row = res['rows'][0]
-    assert row['canonical_id'] == 'coach_a'
-    assert row['tm_confidence'] == 'name_initial'
-    assert row['fotmob_dob'] == '1970-01-01'
-    assert row['tm_dob'] == '1965-05-05'
-
-
-def test_evaluate_manager_dob_collisions_ok_when_agreeing(duck_conn):
-    _seed_manager_dob_fixture(duck_conn, tm_dob='1970-01-01')
-    res = xref_dq.evaluate_manager_dob_collisions()
-    assert res['verdict'] == 'OK'
-    assert res['collisions'] == 0
-    assert res['rows'] == []
+def test_manager_dob_collision_check_removed():
+    """#1590: the FotMob-vs-TM manager DOB check read the legacy FotMob Silver."""
+    assert not hasattr(xref_dq, 'evaluate_manager_dob_collisions')
 
 
 def test_orphan_rate_group_by_league(duck_conn):

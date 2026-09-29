@@ -48,11 +48,11 @@ pytestmark = pytest.mark.unit
 
 class TestFctPlayerSeasonStatsSql:
 
-    def test_reads_xref_player_and_both_silver_sources(self):
+    def test_reads_xref_player_and_silver_sources(self):
         sql = _strip_comments(_read_sql())
         assert "iceberg.silver.xref_player" in sql
         assert "iceberg.silver.fbref_player_season_profile" in sql
-        assert "iceberg.silver.fotmob_player_season_profile" in sql
+        assert "silver.fotmob_" not in sql  # #1590: legacy FotMob Silver removed
         assert "iceberg.silver.whoscored_player_season_aggregate" in sql
         assert "iceberg.silver.understat_player_season_aggregate" in sql
 
@@ -101,15 +101,15 @@ class TestFctPlayerSeasonStatsSql:
         silver.xref_player имеет per-(source, source_id, season) rows;
         без season-condition fan-out 1.5-4×."""
         sql = _strip_comments(_read_sql())
-        # Ищем bridge-JOIN на xref_fotmob CTE (FotMob bridge)
-        # и убеждаемся что там league и season_year предикаты присутствуют.
-        # Эвристика: bridge JOIN определяется по слову xref_fotmob+ON+league+season.
-        assert re.search(r"xfm\.league", sql), (
-            "xref_fotmob bridge JOIN must include league predicate"
+        # #1590: FotMob bridge (xref_fotmob / xfm) удалён вместе со старым
+        # FotMob Silver; оставшийся xref-bridge — xref_team_fbref (xt).
+        assert re.search(r"xt\.league\s*=\s*xf\.league", sql), (
+            "xref_team bridge JOIN must include league predicate"
         )
-        assert re.search(r"xfm\.season_year", sql), (
-            "xref_fotmob bridge JOIN must include season_year predicate"
+        assert re.search(r"xt\.season\s*=\s*xf\.season_year", sql), (
+            "xref_team bridge JOIN must include season predicate"
         )
+        assert "xfm." not in sql
 
     def test_season_slug_passthrough(self):
         """#404: xref season is slug — passed straight through as season_year,
@@ -240,20 +240,20 @@ class TestFctPlayerSeasonStatsSql:
                 f"UNIQUE_FBREF column `{col}` must come from fb."
             )
 
-    def test_unique_fotmob_columns_present(self):
-        """UNIQUE_FOTMOB метрики, отсутствующие у других источников."""
+    def test_unique_fotmob_columns_are_null_placeholders(self):
+        """UNIQUE_FOTMOB метрики: после #1590 (старый FotMob Silver удалён)
+        колонки остаются в схеме как CAST(NULL AS double)."""
         sql = _read_sql()
-        # issue #154: FotMob silver хранит defensive_actions / poss_won_final_third
-        # только в per-90 форме (absolute-полей больше нет) → проецируем `*_per_90`.
         unique_fotmob = [
             'defensive_actions_per_90',
             'big_chances_created', 'big_chances_missed', 'chances_created',
             'poss_won_final_third_per_90',
         ]
         for col in unique_fotmob:
-            assert re.search(rf"fm\.{col}\b", sql, re.IGNORECASE), (
-                f"UNIQUE_FOTMOB column `{col}` must come from fm."
-            )
+            assert re.search(
+                rf"CAST\(NULL AS double\)\s+AS\s+{col}\b", sql, re.IGNORECASE
+            ), f"UNIQUE_FOTMOB column `{col}` must be a NULL placeholder (#1590)"
+        assert not re.search(r"\bfm\.", _strip_comments(sql))
 
     def test_unique_whoscored_columns_present(self):
         """UNIQUE_WHOSCORED метрики, отсутствующие у других источников."""

@@ -118,7 +118,6 @@ class TestFetchUnderstatIdentityUniverse:
         for fetcher in (
             "_fetch_fbref_players",
             "_fetch_whoscored_players",
-            "_fetch_fotmob_players",
             "_fetch_sofascore_players",
             "_fetch_transfermarkt_players",
             "_fetch_capology_players",
@@ -283,44 +282,6 @@ class TestNormalizeName:
         # of the cascade's fuzzy matching, not normalize_name.
         assert xpr.normalize_name("Son Heung-min") == "son heung-min"
         assert xpr.normalize_name("Heung-Min Son") == "heung-min son"
-
-
-# ---------------------------------------------------------------------------
-# _is_youth_team — FotMob U21/U23 youth-squad detection (issue #563)
-# ---------------------------------------------------------------------------
-class TestIsYouthTeam:
-    @pytest.mark.parametrize(
-        "team",
-        [
-            "Arsenal U21",
-            "Manchester City U23",
-            "Chelsea U19",
-            "West Ham United U21",
-            "Sunderland U21",
-            "Tottenham Under-21",
-            "Crystal Palace U-21",
-        ],
-    )
-    def test_youth_squads_match(self, team):
-        assert xpr._is_youth_team(team) is True
-
-    @pytest.mark.parametrize(
-        "team",
-        [
-            "Arsenal",
-            "Brighton & Hove Albion",
-            "AFC Bournemouth",
-            "Wolverhampton Wanderers",
-            "Manchester City",
-            "Luton Town",  # contains 'u' but no youth marker — must NOT match
-        ],
-    )
-    def test_senior_teams_do_not_match(self, team):
-        assert xpr._is_youth_team(team) is False
-
-    def test_none_and_empty_are_not_youth(self):
-        assert xpr._is_youth_team(None) is False
-        assert xpr._is_youth_team("") is False
 
 
 # ---------------------------------------------------------------------------

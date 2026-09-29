@@ -12,11 +12,13 @@
 --
 -- Sources:
 --   iceberg.silver.xref_referee          (spine: canonical_id + display_name)
---   iceberg.silver.fotmob_match_referee  (country — FotMob is the only source
---                                         carrying referee nationality)
 --   iceberg.silver.fbref_match_enriched  (first/last_seen via match dates)
 --
--- Both enrichment JOINs go through xref_referee WITH the (league, season)
+-- country: typed NULL since #1590 — its only source was the legacy FotMob
+-- Silver layer (removed); the column stays so the dim schema is unchanged and
+-- the new FotMob Silver can fill it again.
+--
+-- The enrichment JOIN goes through xref_referee WITH the (league, season)
 -- predicate — xref rows are per-(source, source_id, league, season); without
 -- it a referee active across N seasons fans out N× (memory:
 -- feedback_xref_join_season_predicate).
@@ -39,20 +41,6 @@ WITH ref_spine AS (
     GROUP BY canonical_id
 ),
 
-fotmob_country AS (
-    SELECT
-        xr.canonical_id,
-        MAX(fm.referee_country) AS country
-    FROM iceberg.silver.fotmob_match_referee fm
-    INNER JOIN iceberg.silver.xref_referee xr
-        ON  xr.source    = 'fotmob'
-        AND xr.source_id = fm.referee_name
-        AND xr.league    = fm.league
-        AND xr.season    = fm.season
-    WHERE fm.referee_country IS NOT NULL
-    GROUP BY xr.canonical_id
-),
-
 fbref_seen AS (
     SELECT
         xr.canonical_id,
@@ -72,11 +60,9 @@ fbref_seen AS (
 SELECT
     r.referee_id,
     r.referee_name,
-    c.country,
+    CAST(NULL AS varchar) AS country,
     f.first_seen_date,
     f.last_seen_date
 FROM ref_spine r
-LEFT JOIN fotmob_country c
-    ON c.canonical_id = r.referee_id
 LEFT JOIN fbref_seen f
     ON f.canonical_id = r.referee_id

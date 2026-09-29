@@ -921,8 +921,8 @@ def _build_fct_lineup_checks() -> List[Check]:
         the surviving count is small. Live 2026-06-20: 682 rows survived as
         lineup_source='sofascore' (of 15,189 SS lineup rows — the other ~14.5K
         deduped under FBref and supplied is_captain). Floor catches a dead branch.)
-      * fotmob ≥ 1000 (WARNING, #693 — same idea; live 2026-06-20: 2,378 rows
-        survived, 1,372 with a resolved player_id.)
+      * fotmob — no floor since #1590 (FotMob lineup source removed together
+        with the legacy FotMob Silver layer).
       * whoscored ≥ 10 (WARNING, #693 — inferred lineup; ~99.8% dedup under
         FBref, so only ~32 net rows survive live 2026-06-20. Low dead-branch floor.)
     """
@@ -1029,16 +1029,6 @@ def _build_fct_lineup_checks() -> List[Check]:
             where="lineup_source = 'sofascore'",
             severity="WARNING",
             name="sofascore_coverage_present",
-        ),
-        # FotMob as a full source (#693). Net contribution = FBref-gap rows that
-        # survive dedup. Live 2026-06-20: 2,378 survived (1,372 with a resolved
-        # player_id). Floor 1000 catches a dead branch. WARNING-only.
-        CHECK.row_count(
-            table=table,
-            min_rows=1_000,
-            where="lineup_source = 'fotmob'",
-            severity="WARNING",
-            name="fotmob_coverage_present",
         ),
         # WhoScored as a full source (#693). Lineup is INFERRED from events
         # (appeared & not subbed-on); its players resolve to FBref canonicals so

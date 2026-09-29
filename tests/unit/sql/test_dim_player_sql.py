@@ -3,7 +3,8 @@ Unit tests for ``dags/sql/gold/dim_player.sql.j2`` — star-schema grain (#425).
 
 dim_player is one row per PLAYER (no season in the grain): spine =
 silver.xref_player (source='fbref', canonical 'fb_<id>'), attributes
-COALESCE'd from FotMob / SofaScore / Transfermarkt / SoFIFA. Since #435 it is
+COALESCE'd from SofaScore / Transfermarkt / SoFIFA (the FotMob branch was
+removed in #1590). Since #435 it is
 a Jinja template (.sql.j2) rendered by dim_loaders: the nationality COALESCE
 maps the FBref FIFA code to a full name via the {{ country_map_values_sql }}
 placeholder and canonicalizes source spellings via the
@@ -78,13 +79,14 @@ class TestDimPlayerStarStructure:
             )
 
     def test_multi_source_enrichment(self):
-        """All four enrichment sources are joined."""
+        """All three enrichment sources are joined (#1590: no legacy FotMob)."""
         sql = _strip_comments(_read_sql())
-        for src in ("fotmob_player_profile", "sofascore_player_profile",
+        for src in ("sofascore_player_profile",
                     "transfermarkt_players", "sofifa_player_profile"):
             assert f"iceberg.silver.{src}" in sql, (
                 f"dim_player.sql must enrich from silver.{src}"
             )
+        assert "silver.fotmob_" not in sql
 
     def test_height_priority_transfermarkt_first(self):
         """TM is the primary height source (official club profile)."""
@@ -166,13 +168,13 @@ class TestDimPlayerStarStructure:
         ), "missing nationality_alias CTE (#585 variant->canonical map)"
         # na.canonical_name is the FIRST term of the nationality COALESCE.
         assert re.search(
-            r"COALESCE\(\s*na\.canonical_name\s*,\s*fm\.nationality",
+            r"COALESCE\(\s*na\.canonical_name\s*,\s*ss\.nationality",
             sql, re.IGNORECASE,
         ), "nationality COALESCE must lead with na.canonical_name (#585)"
-        # The alias JOIN keys on the COALESCE of the four source spellings.
+        # The alias JOIN keys on the COALESCE of the three source spellings.
         assert re.search(
             r"LEFT\s+JOIN\s+nationality_alias\s+na\s+ON\s+na\.variant\s*=\s*"
-            r"COALESCE\(\s*fm\.nationality",
+            r"COALESCE\(\s*ss\.nationality",
             sql, re.IGNORECASE,
         ), "nationality_alias JOIN must key on COALESCE(source nationalities)"
 

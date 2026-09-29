@@ -48,10 +48,8 @@ class TestDimPlayerAttributesSql:
             "dim_player_attributes.sql must read fbref_player_season_profile "
             "(born_year + nation_fbref source)"
         )
-        assert "iceberg.silver.fotmob_player_profile" in sql, (
-            "dim_player_attributes.sql must read silver.fotmob_player_profile "
-            "(height/dob/foot/nationality FotMob source)"
-        )
+        # #1590: the legacy FotMob Silver branch was removed.
+        assert "silver.fotmob_" not in sql
 
     def test_fbref_spine_filter(self):
         """Один row per canonical_id обеспечивается фильтром source='fbref' +
@@ -65,19 +63,6 @@ class TestDimPlayerAttributesSql:
         ) or re.search(
             r"confidence\s*!=\s*'orphan'", sql, re.IGNORECASE,
         ), "dim_player_attributes.sql must exclude FBref orphan rows from spine"
-
-    def test_fotmob_bridge_latest_season(self):
-        """FotMob source_id берётся из latest-season row в xref_player
-        (xref хранит per-(source, source_id, season) → fan-out без dedup)."""
-        sql = _read_sql()
-        # ROW_NUMBER ... ORDER BY season DESC anywhere in fotmob-CTE area.
-        assert re.search(
-            r"ROW_NUMBER\s*\(\s*\)\s*OVER\s*\([^)]*season\s+DESC",
-            sql, re.IGNORECASE,
-        ), (
-            "dim_player_attributes.sql must dedup FotMob xref by latest "
-            "season (ROW_NUMBER OVER (PARTITION BY canonical_id ORDER BY season DESC))"
-        )
 
     def test_per_source_attribute_columns_named_with_suffix(self):
         """Контракт: атрибутные колонки имеют суффикс _fbref / _fotmob —
@@ -98,20 +83,19 @@ class TestDimPlayerAttributesSql:
                 f"dim_player_attributes.sql must project `{col}`"
             )
 
-    def test_fotmob_contract_block_carries_card_observation_time(self):
-        """Frozen FotMob contract/value fields must expose their as-of time."""
+    def test_fotmob_columns_are_typed_nulls(self):
+        """#1590: FotMob-only columns stay in the schema as typed NULLs."""
         sql = _strip_comments(_read_sql())
-        assert re.search(
-            r"MAX_BY\s*\(\s*card_observed_at\s*,\s*season\s*\)\s+"
-            r"AS\s+card_observed_at",
-            sql,
-            re.IGNORECASE,
-        )
-        assert re.search(
-            r"fm\.card_observed_at\s+AS\s+card_observed_at_fotmob",
-            sql,
-            re.IGNORECASE,
-        )
+        for typ, col in [
+            ("varchar", "dob_fotmob"),
+            ("integer", "height_cm_fotmob"),
+            ("date", "contract_end_fotmob"),
+            ("bigint", "current_market_value_eur_fotmob"),
+            (r"timestamp\(6\)", "card_observed_at_fotmob"),
+        ]:
+            assert re.search(
+                rf"CAST\(NULL AS {typ}\)\s+AS\s+{col}\b", sql, re.IGNORECASE,
+            ), col
 
     def test_player_name_uses_coalesce_only_for_label(self):
         """Единственное место где допустим COALESCE между источниками — это

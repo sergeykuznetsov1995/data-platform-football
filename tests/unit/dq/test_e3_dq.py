@@ -84,7 +84,7 @@ class TestCheckCounts:
 
     def test_gold_e3_total_check_count(self):
         """Gold builders total: fct_event (11) + fct_shot (7) + fct_shot_audit (4,
-        #602) + fct_lineup (14) = 36.
+        #602) + fct_lineup (13) = 35.
 
         fct_lineup grew by 1 in #839 — added the ``lineup_starter_orphan_zero``
         ERROR gate (every FBref starter must resolve; unused-sub NULLs are an
@@ -96,12 +96,13 @@ class TestCheckCounts:
         fct_lineup grew by 1 in issue #242 — added the canon-spine
         ``ref_integrity[fct_lineup.fbref->dim_match]`` alt-hex guard — by 1
         more in #439 (``is_captain_coverage_present``) — and by 3 more in #693
-        (``sofascore_`` + ``fotmob_`` + ``whoscored_coverage_present``).
+        (``sofascore_`` + ``fotmob_`` + ``whoscored_coverage_present``); #1590
+        removed ``fotmob_coverage_present`` with the legacy FotMob Silver.
         fct_shot_audit (#602): no_duplicates + no_nulls + coverage + xg_divergence.
         """
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 36, (
-            f"Gold E3 expected 36 checks, got {len(checks)}: "
+        assert len(checks) == 35, (
+            f"Gold E3 expected 35 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -138,16 +139,17 @@ class TestCheckCounts:
             if c.params.get("table") == "iceberg.gold.fct_lineup"
             or c.params.get("child") == "gold.fct_lineup"
         ]
-        assert len(fct_lineup) == 14  # +lineup_starter_orphan_zero ERROR (#839)
+        # +lineup_starter_orphan_zero ERROR (#839); -fotmob_coverage_present (#1590)
+        assert len(fct_lineup) == 13
 
     def test_build_all_e3_checks_total(self):
-        """39 silver + 36 gold = 75 total E3 standard DQ checks.
+        """39 silver + 35 gold = 74 total E3 standard DQ checks.
 
         Bump when either ``build_silver_e3_checks`` (40) or
-        ``build_gold_e3_checks`` (36) gains a builder.
+        ``build_gold_e3_checks`` (35) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 75
+        assert len(all_checks) == 74
 
 
 # ===========================================================================

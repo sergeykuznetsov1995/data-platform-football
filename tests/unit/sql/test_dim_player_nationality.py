@@ -99,13 +99,9 @@ def _bootstrap(con) -> None:
         ('fb_aaa', 'fbref',  'aaa',    'high', '2324'),
         ('fb_bbb', 'fbref',  'bbb',    'high', '2324'),
         ('fb_ccc', 'fbref',  'ccc',    'high', '2425'),
-        -- player C also has a FotMob xref row (current-APL enrichment)
-        ('fb_ccc', 'fotmob', 'fm_ccc', 'high', '2425'),
         -- #585: D = source variant spelling, E = canonical source spelling
         ('fb_ddd', 'fbref',  'ddd',    'high', '2425'),
-        ('fb_ddd', 'fotmob', 'fm_ddd', 'high', '2425'),
-        ('fb_eee', 'fbref',  'eee',    'high', '2425'),
-        ('fb_eee', 'fotmob', 'fm_eee', 'high', '2425')
+        ('fb_eee', 'fbref',  'eee',    'high', '2425')
     """)
 
     con.execute("""
@@ -120,38 +116,32 @@ def _bootstrap(con) -> None:
         ('aaa', 2324, 'Danny Rose',    'eng ENG', 'DF', 900,  'Newcastle United'),
         -- B: historical, XYZ absent from map → raw code 'XYZ'
         ('bbb', 2324, 'Test Unmapped', 'xyz XYZ', 'MF', 800,  'Club B'),
-        -- C: current, FBref says SCO; FotMob (below) overrides with England
+        -- C: current, FBref says SCO; SofaScore (below) overrides with England
         ('ccc', 2425, 'Kieran Tierney','sco SCO', 'DF', 1000, 'Arsenal'),
-        -- D/E (#585): FotMob nationality wins; alias canonicalizes it
+        -- D/E (#585): SofaScore nationality wins; alias canonicalizes it
         ('ddd', 2425, 'Variant Src',   'usa USA', 'FW', 700,  'Club D'),
         ('eee', 2425, 'Canon Src',     'usa USA', 'FW', 700,  'Club E')
     """)
 
-    # --- Enrichment sources (mostly empty; FotMob carries player C) ---
-    con.execute("""
-        CREATE TABLE silver.fotmob_player_profile (
-            player_id VARCHAR, season BIGINT, player_name VARCHAR,
-            date_of_birth VARCHAR, nationality VARCHAR, height_cm INTEGER,
-            foot VARCHAR
-        )
-    """)
-    con.execute("""
-        INSERT INTO silver.fotmob_player_profile VALUES
-        -- Deliberately 'England' (≠ map's 'Scotland' for SCO) to prove the
-        -- source wins over the code map in the COALESCE order.
-        ('fm_ccc', 2425, 'Kieran Tierney', '1997-06-05', 'England', 180, 'left'),
-        -- D (#585): variant 'USA' → canonicalized to 'United States'
-        ('fm_ddd', 2425, 'Variant Src', '2000-01-01', 'USA', 175, 'right'),
-        -- E (#585): already-canonical 'United States' → passes through unchanged
-        ('fm_eee', 2425, 'Canon Src', '2000-01-01', 'United States', 175, 'right')
-    """)
-
+    # --- Enrichment sources (mostly empty; SofaScore carries C/D/E) ---
+    # #1590: the source-precedence fixture moved from the removed legacy
+    # FotMob Silver branch to SofaScore (canonical_id-keyed, no xref hop).
     con.execute("""
         CREATE TABLE silver.sofascore_player_profile (
             canonical_id VARCHAR, season BIGINT, player_name VARCHAR,
             date_of_birth DATE, nationality VARCHAR, height_cm INTEGER,
             preferred_foot VARCHAR
         )
+    """)
+    con.execute("""
+        INSERT INTO silver.sofascore_player_profile VALUES
+        -- Deliberately 'England' (≠ map's 'Scotland' for SCO) to prove the
+        -- source wins over the code map in the COALESCE order.
+        ('fb_ccc', 2425, 'Kieran Tierney', DATE '1997-06-05', 'England', 180, 'left'),
+        -- D (#585): variant 'USA' → canonicalized to 'United States'
+        ('fb_ddd', 2425, 'Variant Src', DATE '2000-01-01', 'USA', 175, 'right'),
+        -- E (#585): already-canonical 'United States' → passes through unchanged
+        ('fb_eee', 2425, 'Canon Src', DATE '2000-01-01', 'United States', 175, 'right')
     """)
     con.execute("""
         CREATE TABLE silver.transfermarkt_players (
@@ -222,7 +212,7 @@ class TestDimPlayerNationality:
         assert _nat(gold_rows, "fb_bbb") == "XYZ"
 
     def test_source_wins_over_code_map(self, gold_rows):
-        """FotMob full name takes precedence over the FBref-code map
+        """SofaScore full name takes precedence over the FBref-code map
         (cm.country_name sits AFTER the sources in the COALESCE)."""
         assert _nat(gold_rows, "fb_ccc") == "England"
 

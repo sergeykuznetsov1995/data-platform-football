@@ -398,7 +398,6 @@ def _validate_xref(**context) -> Dict[str, Any]:
         build_all_xref_checks,
         evaluate_bronze_xref_freshness_gap,
         evaluate_dob_conflicts,
-        evaluate_manager_dob_collisions,
         evaluate_orphan_rate_per_source,
         report_orphan_teams,
     )
@@ -520,33 +519,6 @@ def _validate_xref(**context) -> Dict[str, Any]:
         logger.exception("dob-conflict evaluation failed (non-fatal)")
         report.results.append(CheckResult(
             name='dob_conflicts[xref_player]',
-            kind='coverage',
-            severity='WARNING',
-            passed=False,
-            error=str(e),
-        ))
-
-    # Manager DOB corroboration: FotMob-vs-TM disagreement per canonical is a
-    # suspected false merge (strongest signal for name_initial-tier rows).
-    try:
-        mgr_dob = evaluate_manager_dob_collisions()
-        report.results.append(CheckResult(
-            name='dob_collisions[xref_manager]',
-            kind='coverage',
-            severity='WARNING',
-            passed=mgr_dob['verdict'] == 'OK',
-            details=(
-                f"verdict={mgr_dob['verdict']}, "
-                f"collisions={mgr_dob['collisions']}, "
-                f"rows={mgr_dob['rows'][:10]}"
-            ),
-            value=float(mgr_dob['collisions']),
-        ))
-        context['ti'].xcom_push(key='manager_dob_collisions', value=mgr_dob)
-    except Exception as e:
-        logger.exception("manager dob-collision evaluation failed (non-fatal)")
-        report.results.append(CheckResult(
-            name='dob_collisions[xref_manager]',
             kind='coverage',
             severity='WARNING',
             passed=False,

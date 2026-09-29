@@ -2,9 +2,14 @@
 -- Gold: fct_keeper_season_stats
 -- =============================================================================
 --
--- Per-season cross-source stats для вратарей: FBref+FotMob объединены через
+-- Per-season cross-source stats для вратарей: FBref (+ WhoScored) через
 -- silver.xref_player. Структурно идентично fct_player_season_stats, но
--- источники = silver.fbref_keeper_profile + silver.fotmob_keeper_profile.
+-- источник = silver.fbref_keeper_profile.
+--
+-- #1590: FotMob-ветка (старый FotMob Silver keeper-профиль) удалена. Колонки,
+-- питавшиеся только FotMob (save_percentage_fotmob, saves_per_90,
+-- psxg_minus_ga, accurate_*_per_90, fotmob_rating), остаются в схеме как
+-- типизированный NULL — схема витрины не меняется (решение владельца 29.09).
 --
 -- Design contract: docs/design/gold-star-schema.md §5.3 (issue #428).
 -- Grain: (player_id, league, season). PK: natural composite — non-NULL по
@@ -33,11 +38,11 @@
 --    который и есть PSxG − GA (xGOT faced минус пропущенные).
 --
 -- HARD_FACT (5): matches, minutes, clean_sheets, yellow_cards, red_cards —
---                overlap, COALESCE FBref→FotMob.
+--                FBref only since #1590.
 -- UNIQUE_FBREF (~13): goals_against, goals_against_per90, shots_on_target_against,
 --                     saves, save_pct_fbref, wins, draws, losses, clean_sheet_pct,
 --                     pk_faced, pk_allowed, pk_saved, pk_missed, pk_save_pct.
--- UNIQUE_FOTMOB (5): save_percentage_fotmob, saves_per_90, goals_prevented,
+-- UNIQUE_FOTMOB (typed NULL since #1590): save_percentage_fotmob, saves_per_90, goals_prevented,
 --                    accurate_passes_per_90, accurate_long_balls_per_90,
 --                    fotmob_rating.
 -- UNIQUE_WHOSCORED (3): keeper_saves_whoscored, keeper_pickups_whoscored,
@@ -60,17 +65,6 @@ xref_fbref AS (
         season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
-      AND confidence <> 'orphan'
-),
-
-xref_fotmob AS (
-    SELECT DISTINCT
-        canonical_id,
-        source_id                                         AS fotmob_player_id,
-        league,
-        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
-    FROM iceberg.silver.xref_player
-    WHERE source = 'fotmob'
       AND confidence <> 'orphan'
 ),
 
@@ -159,7 +153,7 @@ SELECT
         'fb_' || lower(regexp_replace(fb.squad, '[^a-zA-Z0-9]+', '_'))
     )                                                    AS team_id,
 
-    -- ========= HARD_FACT overlap (FBref primary, COALESCE FotMob) =========
+    -- ========= HARD_FACT (FBref; FotMob fallback removed in #1590) =========
     -- #542: cross-source COALESCE priority rendered from source_priority.yaml.
     {{ m_matches }}
     {{ m_minutes }}
@@ -185,14 +179,14 @@ SELECT
     fb.pk_missed,
     fb.pk_save_pct,
 
-    -- ========= UNIQUE_FOTMOB (keeper-specific) =========
-    fm.save_percentage                                   AS save_percentage_fotmob,
-    fm.saves_per_90,
-    -- #428 §5.3: FotMob goals_prevented ≡ PSxG − GA (FBref PSxG мёртв Feb-2026).
-    fm.goals_prevented                                   AS psxg_minus_ga,
-    fm.accurate_passes_per_90,
-    fm.accurate_long_balls_per_90,
-    fm.fotmob_rating,
+    -- ========= UNIQUE_FOTMOB (keeper-specific) — typed NULL since #1590 =========
+    CAST(NULL AS double)                                 AS save_percentage_fotmob,
+    CAST(NULL AS double)                                 AS saves_per_90,
+    -- #428 §5.3: был FotMob goals_prevented ≡ PSxG − GA (FBref PSxG мёртв Feb-2026).
+    CAST(NULL AS double)                                 AS psxg_minus_ga,
+    CAST(NULL AS double)                                 AS accurate_passes_per_90,
+    CAST(NULL AS double)                                 AS accurate_long_balls_per_90,
+    CAST(NULL AS double)                                 AS fotmob_rating,
 
     -- ========= UNIQUE_WHOSCORED (3) =========
     ws.keeper_saves                                      AS keeper_saves_whoscored,
@@ -217,14 +211,6 @@ LEFT JOIN xref_team_fbref xt
     ON  xt.fbref_team_name = fb.squad
     AND xt.league          = xf.league
     AND xt.season          = xf.season_year
-LEFT JOIN xref_fotmob xfm
-    ON  xfm.canonical_id = xf.canonical_id
-    AND xfm.league       = xf.league
-    AND xfm.season_year  = xf.season_year
-LEFT JOIN iceberg.silver.fotmob_keeper_profile fm
-    ON  fm.player_id = xfm.fotmob_player_id
-    AND fm.league    = xfm.league
-    AND fm.season    = xfm.season_year
 -- WhoScored event-aggregate: keeper_saves/pickups/claims. JOIN на varchar slug.
 LEFT JOIN iceberg.silver.whoscored_player_season_aggregate ws
     ON  ws.canonical_id = xf.canonical_id

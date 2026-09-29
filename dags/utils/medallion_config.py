@@ -1763,7 +1763,9 @@ def get_source_priority_exprs(table_name: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for alias, spec in metrics.items():
         exprs = [s['expr'] for s in spec['sources']]
-        coalesce = f"COALESCE({', '.join(exprs)})"
+        # #1590: a metric left with one source (FotMob removed) renders the
+        # bare expr — Trino rejects single-argument COALESCE.
+        coalesce = exprs[0] if len(exprs) == 1 else f"COALESCE({', '.join(exprs)})"
         wrap = spec.get('wrap')
         body = wrap.replace('{coalesce}', coalesce) if wrap else coalesce
         out[f"m_{alias}"] = f"{body} AS {alias},"
