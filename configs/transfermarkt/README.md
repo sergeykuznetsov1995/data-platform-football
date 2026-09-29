@@ -50,19 +50,3 @@ Tab-separated, UTF-8, sorted by `id`. Columns:
    championships outside Brazil. Brazilian state championships stay `core_club`.
 5. `core_club` — everything else.
 6. `archive` overrides any class when the competition is not live.
-
-## Country pages (`countries.tsv`, #1391)
-
-The weekly full discovery crawl reads `/wettbewerbe/national/wettbewerbe/<id>`
-for every row, next to the six confederation pages. No catalogue page links the
-country pages; the ids are the flag ids the confederation listings show next to
-each league (`…/flagge/tiny/<id>.png`, discovery checkpoint of 16.07.2026, 211
-countries). The country and confederation of a row are what a competition first
-found on that page is registered with (a catalogue region such as `Europe` is
-replaced by the real country). Countries the listings show only on the FIFA page
-carry their confederation by membership; Oceania is `OFC`.
-
-Tab-separated, UTF-8, sorted by `country_id`: `country_id`, `country`,
-`confederation`. Loader: `scrapers/transfermarkt/discovery.py`
-(`load_countries()`); any format error fails closed. The number of rows is part
-of the discovery request budget (`standing_registry_policy.json`, `scaling`).

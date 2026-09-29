@@ -105,9 +105,14 @@ _REGION_NAMES = frozenset(
     {"Unknown", "International", "Worldwide", "World",
      "Europe", "Americas", "Asia", "Africa"}
 )
+# Country pages the full crawl reads next to the confederation pages. No
+# catalogue page links them; the ids are the flag ids the confederation
+# listings show (discovery checkpoint of 16.07.2026). Columns: country_id,
+# country, confederation (tab-separated). It lives under dags/ because only
+# dags/ and scrapers/ are mounted into the Airflow containers.
 COUNTRIES_PATH = (
     Path(__file__).resolve().parents[2]
-    / "configs" / "transfermarkt" / "countries.tsv"
+    / "dags" / "configs" / "transfermarkt" / "countries.tsv"
 )
 _COUNTRY_ID_RE = re.compile(r"[1-9][0-9]{0,3}")
 
@@ -1514,6 +1519,41 @@ class TransfermarktCompetitionDiscovery:
                 if regulation is not None:
                     regulations[competition_id] = regulation
 
+        # Without regulation a known competition falls back to its HTML
+        # selector, which often lists fewer seasons than the previous
+        # canonical holds (regulation history, or a cup with no selector).
+        # Such a fallback would silently drop history, so the competition is
+        # carried whole instead; a fallback that keeps every previous edition
+        # is a normal refresh.
+        if self._previous is not None:
+            for competition_id in sorted(candidates):
+                if (
+                    competition_id in regulations
+                    or competition_id in quarantined
+                    or competition_id in carried
+                    or competition_id not in profiles
+                    or competition_id not in previous_ids
+                ):
+                    continue
+                known = {
+                    str(item["edition_id"])
+                    for item in self._previous.editions.get(competition_id, ())
+                }
+                try:
+                    found = {
+                        item[0]
+                        for item in _selector_options(
+                            profiles[competition_id][1],
+                            profile_url=candidates[competition_id].profile_url,
+                        )
+                    }
+                except DiscoverySchemaError:
+                    found = set()
+                if not known <= found:
+                    carried[competition_id] = (
+                        "regulation unavailable, HTML fallback lists "
+                        f"{len(known & found)} of {len(known)} previous editions"
+                    )
         for competition_id in list(carried) + list(unavailable_new):
             candidates.pop(competition_id, None)
         self._check_carried_share(len(carried), len(candidates))
