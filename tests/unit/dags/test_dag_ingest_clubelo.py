@@ -62,8 +62,8 @@ class TestDailyChain:
         # master_pipeline triggers by this id.
         assert dag_module.dag.dag_id == 'dag_ingest_clubelo'
 
-    def test_schedule_literal_twice_a_day(self, dag_module):
-        assert dag_module.dag._dag_kwargs['schedule'] == '30 9,21 * * *'
+    def test_schedule_literal_every_4_hours(self, dag_module):
+        assert dag_module.dag._dag_kwargs['schedule'] == '30 */4 * * *'
 
     def test_old_api_tasks_and_params_are_gone(self, dag_module):
         assert _bash_task('scrape_current_ratings') is None
