@@ -189,6 +189,29 @@ def test_blocked_status_rotates_proxy_once_and_records_retry(status):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(('status', 'attempts'), [(405, 2), (403, 4)])
+def test_discovery_405_cap_gives_one_more_exit_only_for_405(status, attempts):
+    """#1391: discovery stops a 405 page after one alternate exit."""
+    manager = _manager(5)
+    factory = _ClientFactory([_FakeResp(b'blocked', status=status)] * 5)
+    client = TransfermarktHttpClient(
+        proxy_manager=manager,
+        client_factory=factory,
+        rate_limiter=_NoWaitLimiter(),
+        sleep_fn=lambda _: None,
+        random_fn=lambda: 0,
+    )
+
+    outcome = client.fetch(
+        'https://www.transfermarkt.us/a', as_json=False, max_405_attempts=2,
+    )
+
+    assert outcome.status == FetchStatus.BLOCKED
+    assert outcome.attempts == attempts
+    assert len(factory.calls) == attempts
+
+
+@pytest.mark.unit
 def test_plain_json_decode_error_is_schema_error_without_retry_or_proxy_ban():
     manager = _manager(2)
     factory = _ClientFactory([
