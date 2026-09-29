@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -533,6 +533,7 @@ class FakeControl:
     def __init__(self, raw_store=None):
         self.raw_store = raw_store
         self.events = []
+        self.batch_guards = []
         self.frontier = {}
         self.fetches = []
         self.registry = {}
@@ -701,6 +702,21 @@ class FakeControl:
                 )
         finally:
             self.events.append(f"content_guard_exit:{target_id}")
+
+    @contextmanager
+    def guard_latest_contents(self, guards):
+        self.batch_guards.append([str(target) for target, _h, _r in guards])
+        with ExitStack() as stack:
+            yield {
+                str(target_id): stack.enter_context(
+                    self.guard_latest_content(
+                        target_id, content_hash, logical_refresh_id
+                    )
+                )
+                for target_id, content_hash, logical_refresh_id in sorted(
+                    guards, key=lambda guard: str(guard[0])
+                )
+            }
 
     def settle_budget(self, reservation_id, **kwargs):
         self.events.append("settle")
@@ -2784,6 +2800,21 @@ def test_generic_batch_misaligned_counts_use_idempotent_sequential_repair(
     assert len(generic.pages) == 4
     assert typed.batch_sizes == []
     assert [call[0] for call in typed.calls] == ["match", "match"]
+
+
+def test_match_batch_takes_one_batch_guard_for_the_whole_cohort(tmp_path):
+    pipeline, control, records, _generic, typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.parsed == len(records)
+    assert control.batch_guards == [
+        sorted(record.target_id for record in records)
+    ]
 
 
 def test_second_batch_guard_enter_fault_closes_first_then_fails_all_leases(

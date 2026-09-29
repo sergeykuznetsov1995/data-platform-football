@@ -6546,22 +6546,21 @@ class FBrefPipeline:
         ] = []
         lock_errors: list[Exception] = []
         with _captured_exit_stack(lock_errors) as stack:
-            verdicts = {
-                target_id: stack.enter_context(
-                    self.control.guard_latest_content(
-                        item.record.target_id,
-                        item.record.content_hash,
-                        item.record.logical_refresh_id,
-                    )
-                )
-                for target_id, item in sorted(
-                    (
-                        (item.record.target_id, item)
+            # One control transaction for the whole cohort: per-match guards
+            # took one Postgres connection each, and 25 of them overran the
+            # shared pool (#1320). Same rows, lock mode and order.
+            verdicts = stack.enter_context(
+                self.control.guard_latest_contents(
+                    [
+                        (
+                            item.record.target_id,
+                            item.record.content_hash,
+                            item.record.logical_refresh_id,
+                        )
                         for item in active_items
-                    ),
-                    key=lambda pair: pair[0],
+                    ]
                 )
-            }
+            )
             eligible = [
                 item
                 for item in active_items
