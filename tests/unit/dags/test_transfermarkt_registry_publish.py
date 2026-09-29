@@ -452,3 +452,36 @@ def test_a6_report_is_attached_but_never_blocks_the_plan():
 
     assert result.a6['status'] == 'checked'
     assert result.as_dict()['a6']['mismatches'][0]['competition_id'] == 'AFCN'
+
+
+@pytest.mark.parametrize(
+    ('base', 'ok'),
+    [(OLD_SNAPSHOT_ID, True), ('tm-discovery-' + 'c' * 24, False), (None, False)],
+)
+def test_publication_requires_the_canonical_the_snapshot_was_built_on(base, ok):
+    # #1391: canonical replaced during the crawl -> CAS never attempted.
+    manifest = deepcopy(MANIFEST)
+    manifest['previous_snapshot_id'] = base
+    manifest_hash = publish.stable_hash(manifest)
+    executor = FakeExecutor(
+        readback={**_state(revision=6, new=True), 'source_hash': manifest_hash},
+    )
+
+    def run():
+        return publish.publish_registry(
+            manifest,
+            manifest_hash=manifest_hash,
+            snapshot_id=SNAPSHOT_ID,
+            competition_count=2,
+            edition_count=3,
+            expected_revision=5,
+            apply=True,
+            executor=executor,
+        )
+
+    if ok:
+        assert run().applied is True
+    else:
+        with pytest.raises(publish.RegistryCasError, match='base drifted'):
+            run()
+        assert len(executor.statements) == 1

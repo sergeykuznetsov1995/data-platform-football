@@ -889,6 +889,29 @@ def _assert_state_before(
         raise RegistryCasError('existing canonical registry is not promoted')
 
 
+def _assert_discovery_base(
+    state: RegistryState | None, manifest: Mapping[str, Any],
+) -> None:
+    """The snapshot must be built on the canonical this CAS replaces (#1391).
+
+    A standing run carries rows over from, and diffs against, the canonical
+    it read before crawling.  The CAS is bound to the revision read here, so
+    checking that revision's snapshot id rejects a snapshot built on a base
+    another publisher replaced during the crawl.  Manifests without the key
+    (one-shot runs) carry nothing over and keep their revision-only CAS.
+    """
+
+    if 'previous_snapshot_id' not in manifest:
+        return
+    base = manifest.get('previous_snapshot_id') or None
+    current = (state.registry_snapshot_id or None) if state is not None else None
+    if base != current:
+        raise RegistryCasError(
+            f'discovery base drifted: snapshot built on {base}, '
+            f'canonical is {current}'
+        )
+
+
 def _assert_readback(state: RegistryState | None, plan: RegistryPublicationPlan) -> None:
     if state is None:
         raise RegistryCasError('registry CAS produced no canonical row')
@@ -1030,6 +1053,7 @@ def publish_registry(
             runner.execute(plan.statements[0]), allow_missing=True,
         )
         _assert_state_before(previous, expected_revision=plan.expected_revision)
+        _assert_discovery_base(previous, discovery_manifest)
 
         staging_dq: dict[str, int] | None = None
         target_dq: dict[str, int] | None = None
