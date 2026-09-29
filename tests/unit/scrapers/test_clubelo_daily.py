@@ -10,7 +10,7 @@ from __future__ import annotations
 import gzip
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 import pytest
@@ -86,10 +86,13 @@ def _run(answers=None, *, store=None, open_slugs=NEW, limit=10, retries=3):
     store = store or MemoryDailyStore()
     history_store = MemoryStore(_manifest_closed_except(open_slugs))
     sent, slept = [], []
-    result = daily.run_daily(
-        transport, store, history_store, notifier=sent.append, sleep=slept.append,
-        results_retries=retries, new_slugs_limit=limit, batch_id="test-daily",
-    )
+    # #1465: the daily run sends no Telegram — any call of the platform
+    # notifier would land in ``sent``
+    with patch.object(history, "notify", sent.append):
+        result = daily.run_daily(
+            transport, store, history_store, sleep=slept.append,
+            results_retries=retries, new_slugs_limit=limit, batch_id="test-daily",
+        )
     return result, store, history_store, session, sent, slept
 
 
@@ -192,7 +195,7 @@ def test_completeness_against_the_previous_date_guards_a_new_partition():
     result, store, _, _, sent, _ = _run(store=store)
     assert result["check"].startswith("G2 1741 clubs")
     assert store.replaces == [] and store.results == {}
-    assert daily.exit_code(result) == 1 and "G2" in sent[0]
+    assert daily.exit_code(result) == 1 and sent == []
 
 
 @pytest.mark.parametrize("elo_rows, same, previous, check", [
@@ -215,7 +218,7 @@ def test_layout_change_writes_nothing_parsed_and_names_the_check():
     broken = fixture_html("Ranking.html.gz").replace("eloData = [", "eloRows = [")
     result, store, hist, session, sent, _ = _run(_answers(**{"/Ranking": gzip_response(broken)}))
     assert result["check"] == "C1 eloData not found"
-    assert daily.exit_code(result) == 1 and "C1 eloData not found" in sent[0]
+    assert daily.exit_code(result) == 1 and sent == []
     assert store.snapshot == {} and store.results == {}
     assert [r["page"] for r in hist.rows(history.RAW_TABLE)] == ["/Ranking"]  # raw kept
     assert [c["path"] for c in session.calls] == ["/Ranking"]
@@ -248,7 +251,7 @@ def test_older_results_retry_three_times_then_nothing_written():
     assert result["results_attempts"] == 4
     assert result["check"].startswith("M-09 /Results h1 date 2026-09-22 older than /Ranking 2026-09-23")
     assert store.snapshot == {} and store.results == {}
-    assert daily.exit_code(result) == 1 and "M-09" in sent[0]
+    assert daily.exit_code(result) == 1 and sent == []
 
 
 def test_older_results_catch_up_on_a_retry():
@@ -264,7 +267,16 @@ def test_older_results_catch_up_on_a_retry():
 def test_block_stops_the_run():
     result, store, _, _, sent, _ = _run(_answers(**{"/Results": FakeResponse(403)}))
     assert result["blocked"] and daily.exit_code(result) == 1
-    assert store.snapshot == {} and "блокирует" in sent[0]
+    assert store.snapshot == {} and sent == []
+
+
+def test_red_run_logs_and_sends_no_telegram(caplog):
+    broken = fixture_html("Ranking.html.gz").replace("eloData = [", "eloRows = [")
+    with patch("utils.alerts.send_telegram_message", create=True) as tg:
+        result, *_, sent, _ = _run(_answers(**{"/Ranking": gzip_response(broken)}))
+    assert daily.exit_code(result) == 1 and sent == [] and not tg.called
+    assert "ClubElo daily check failed, nothing written: C1 eloData not found" in caplog.text
+    assert "notifier" not in daily.run_daily.__code__.co_varnames
 
 
 def test_network_failure_is_an_error():

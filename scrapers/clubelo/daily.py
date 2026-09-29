@@ -30,7 +30,9 @@ One run, in this order:
    but does not roll back the written snapshot.
 
 Any failed contract check, guard, date mismatch, block or error before step 4
-writes nothing parsed, alerts with the failed check and exits non-zero.
+writes nothing parsed, logs the failed check and exits non-zero. No Telegram
+from here (#1465): with a run every 4 h it would repeat on every red run; the
+alert with dedup is the host watchdog ``clubelo_stall_watch.py``.
 """
 
 from __future__ import annotations
@@ -301,7 +303,6 @@ def run_daily(
     history_store,
     *,
     source: str = "html",
-    notifier: Callable[[str], None] = history.notify,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     results_retries: int = RESULTS_RETRIES,
@@ -398,11 +399,9 @@ def run_daily(
     except ClubEloBlocked as exc:
         result["blocked"] = str(exc)
         logger.error("ClubElo blocked us, daily run stopped: %s", exc)
-        _alert(notifier, f"ClubElo дневной снимок: сайт блокирует запросы, прогон остановлен. {exc}")
     except (LayoutChanged, GuardRefused, DatesDiffer) as exc:
         result["check"] = str(exc)
         logger.error("ClubElo daily check failed, nothing written: %s", exc)
-        _alert(notifier, f"ClubElo дневной снимок: проверка не пройдена, ничего не записано. {exc}")
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         logger.error("ClubElo daily failed: %s", result["error"], exc_info=True)
@@ -413,13 +412,6 @@ def run_daily(
         result["requests"] = transport.requests
         result["elapsed_s"] = round(clock() - started, 1)
     return result
-
-
-def _alert(notifier: Callable[[str], None], message: str) -> None:
-    try:
-        notifier(message)
-    except Exception as exc:  # the alert must not hide the failure
-        logger.error("Telegram alert failed: %s", exc)
 
 
 def exit_code(result: Dict[str, Any]) -> int:
