@@ -961,3 +961,41 @@ class TestNeverRaises:
         assert ok is False
         msgs = " ".join(r.getMessage() for r in caplog.records)
         assert "swallowed" in msgs or "synthetic crash" in msgs
+
+
+# ===========================================================================
+# telegram_dq_summary escapes HTML in check names/details (#1477)
+# ===========================================================================
+
+
+@pytest.mark.unit
+def test_dq_summary_escapes_html_in_check_name_and_details(
+    alerts_module, monkeypatch
+):
+    from utils.data_quality import CheckResult, RunReport
+
+    sent = []
+    monkeypatch.setattr(alerts_module, "_send_telegram", sent.append)
+    report = RunReport(results=[
+        CheckResult(
+            name="freshness[x<48h]", kind="freshness", severity="ERROR",
+            passed=False, details="age 60h > 48h & stale",
+        ),
+        CheckResult(
+            name="freshness[y<48h]", kind="freshness", severity="WARNING",
+            passed=False, error="lag <48h breached",
+        ),
+    ])
+
+    alerts_module.telegram_dq_summary(report, header="WhoScored <Bronze>")
+
+    assert len(sent) == 1
+    text = sent[0]
+    assert "freshness[x&lt;48h]" in text
+    assert "freshness[y&lt;48h]" in text
+    assert "age 60h &gt; 48h &amp; stale" in text
+    assert "lag &lt;48h breached" in text
+    assert "WhoScored &lt;Bronze&gt;" in text
+    assert "<48h" not in text
+    # Markup of the message itself stays intact.
+    assert "<code>" in text and "<b>" in text
