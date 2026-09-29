@@ -1414,8 +1414,11 @@ class TestSilverDependency:
             (["iceberg.bronze.fotmob_transfer_events"], True),
         ],
     )
-    def test_silver_gate_reads_validated_committed_inputs(self, tables, expected):
+    def test_silver_gate_reads_validated_committed_inputs(
+        self, tables, expected, monkeypatch
+    ):
         mod = _reload_dag_module()
+        monkeypatch.setattr(mod, "FOTMOB_SILVER_ENABLED", True)
 
         class _TI:
             def xcom_pull(self, *, task_ids):
@@ -1423,6 +1426,30 @@ class TestSilverDependency:
                 return {"bronze_inputs_changed": tables}
 
         assert mod._should_transform(ti=_TI()) is expected
+
+    @pytest.mark.unit
+    def test_silver_gate_is_closed_while_silver_is_disabled(self):
+        # #1575: Silver is off; changed Silver inputs must not trigger it.
+        from airflow.exceptions import AirflowException
+
+        from scrapers.fotmob import constants as fotmob_constants
+
+        mod = _reload_dag_module()
+        assert mod.FOTMOB_SILVER_ENABLED is False
+        assert fotmob_constants.FOTMOB_SILVER_ENABLED is False
+
+        class _TI:
+            def xcom_pull(self, *, task_ids):
+                return {"bronze_inputs_changed": ["iceberg.bronze.fotmob_matches"]}
+
+        assert mod._should_transform(ti=_TI()) is False
+
+        class _BadTI:
+            def xcom_pull(self, *, task_ids):
+                return {"bronze_inputs_changed": "iceberg.bronze.fotmob_matches"}
+
+        with pytest.raises(AirflowException, match="evidence is invalid"):
+            mod._should_transform(ti=_BadTI())
 
     @pytest.mark.unit
     def test_validation_normalizes_changed_bronze_inputs(self, tmp_path):
@@ -1497,6 +1524,7 @@ class TestSilverDependency:
         assert bronze_candidate._init_kwargs["op_kwargs"] == {
             "validation_task_id": "validate_data",
             "silver_input_tables": sorted(mod.FOTMOB_SILVER_BRONZE_INPUTS),
+            "silver_enabled": mod.FOTMOB_SILVER_ENABLED,
         }
         assert mod.seal_publication.upstream_task_ids == {
             "record_bronze_only_publication_candidate",

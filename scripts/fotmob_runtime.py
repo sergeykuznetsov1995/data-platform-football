@@ -26,6 +26,18 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from scrapers.fotmob import constants as fotmob_constants  # noqa: E402
+
+
+def fotmob_silver_enabled() -> bool:
+    """#1575: whether a finished generation must carry an exact Silver child.
+
+    When Silver is off the ingest seals a bronze-only candidate: no Silver
+    DagRun exists and the candidate has no ``transform_task_ids``.
+    """
+
+    return bool(fotmob_constants.FOTMOB_SILVER_ENABLED)
+
 
 TRINO_ENV_KEYS = (
     "TRINO_HOST",
@@ -568,6 +580,22 @@ def validate_automatic_catalog_admission(
     canary_publication = (
         canary.get("publication") if isinstance(canary, Mapping) else None
     )
+    # #1575: a Silver-backed canary is always valid (admissions issued before
+    # the switch-off stay valid); a bronze-only canary only while Silver is off.
+    silver_backed = (
+        isinstance(canary, Mapping)
+        and canary.get("silver_run_state") == "success"
+        and isinstance(transform_task_ids, list)
+        and bool(transform_task_ids)
+        and all(isinstance(task_id, str) and task_id for task_id in transform_task_ids)
+        and transform_task_ids == sorted(set(transform_task_ids))
+    )
+    bronze_only = (
+        not fotmob_silver_enabled()
+        and isinstance(canary, Mapping)
+        and canary.get("silver_run_state") == ""
+        and transform_task_ids is None
+    )
     canary_binding = (
         canary_publication.get("binding")
         if isinstance(canary_publication, Mapping)
@@ -585,7 +613,7 @@ def validate_automatic_catalog_admission(
         is None
         or str(canary.get("generation_id") or "") != str(report.get("run_id") or "")
         or canary.get("ingest_run_state") != "success"
-        or canary.get("silver_run_state") != "success"
+        or not (silver_backed or bronze_only)
         or re.fullmatch(
             r"[0-9a-f]{64}", str(canary.get("candidate_digest") or "")
         )
@@ -610,10 +638,6 @@ def validate_automatic_catalog_admission(
         or not isinstance(final_candidate, Mapping)
         or final_candidate.get("generation_id") != canary.get("generation_id")
         or final_candidate.get("digest") != canary.get("candidate_digest")
-        or not isinstance(transform_task_ids, list)
-        or not transform_task_ids
-        or any(not isinstance(task_id, str) or not task_id for task_id in transform_task_ids)
-        or transform_task_ids != sorted(set(transform_task_ids))
     ):
         raise RuntimeBindingError(
             "automatic canary is not bound to an abandoned exact publication"

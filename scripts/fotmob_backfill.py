@@ -1485,7 +1485,10 @@ def _resolve_quiet_generation(
         raise BackfillError(
             f"exact ingest run is not terminal: state={ingest_state or 'absent'!r}"
         )
-    if silver_state != "success":
+    # #1575: with Silver switched off the successful ingest seals a
+    # bronze-only candidate and no exact Silver child may exist.
+    bronze_only = silver is None and not runtime_binding.fotmob_silver_enabled()
+    if silver_state != "success" and not bronze_only:
         raise BackfillError(
             "successful ingest has no successful exact Silver child; lock retained"
         )
@@ -1493,6 +1496,10 @@ def _resolve_quiet_generation(
         raise BackfillError("successful ingest lost its publication generation")
 
     candidate = _candidate(state, publication)
+    if bronze_only and candidate.get("candidate_kind") != "bronze_only":
+        raise BackfillError(
+            "Silver is disabled but the publication candidate is not bronze-only"
+        )
     validation_payload = _validation_xcom(args, ids["ingest_run_id"], run=run)
     validation = _validation_summary(
         validation_payload,

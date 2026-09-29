@@ -1672,3 +1672,104 @@ def test_verify_fails_closed_and_reports_a_real_payload_gap():
     assert check["details"]["categories"] == {"partial": 1}
     assert check["details"]["scopes"][0]["category"] == "partial"
     assert check["details"]["scopes"][0]["reason"] == "finished_payload_gap"
+
+
+@pytest.fixture(autouse=True)
+def _silver_enabled_contract(monkeypatch):
+    """#1575: tests above pin the Silver-enabled contract; the disabled
+    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
+
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
+
+
+def _bronze_only_live_candidate(generation_id):
+    unsigned = {
+        "schema": mod.PUBLICATION_SCHEMA,
+        "generation_id": generation_id,
+        "candidate_kind": "bronze_only",
+        "validation_task_id": "validate_data",
+        "validated_bronze": {"status": "success", "run_id": generation_id},
+    }
+    digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {**unsigned, "digest": digest}
+
+
+def _bronze_only_lifecycle(report):
+    generation_id = report["publication"]["generation_id"]
+    candidate = {
+        "generation_id": generation_id,
+        "digest": _bronze_only_live_candidate(generation_id)["digest"],
+        "transform_task_ids": None,
+    }
+    report["silver_terminal"] = None
+    report["candidate"] = candidate
+    report["publication_state"]["candidate"] = candidate
+
+
+def _load_lineage(tmp_path, mutate):
+    options = runtime_options(tmp_path)
+    lifecycle_path, report = write_lifecycle_report(tmp_path, options, mutate=mutate)
+    deployment_path = Path(options[options.index("--deployment-report") + 1])
+    compose_path = Path(options[options.index("--compose-file") + 1])
+    context = mod.runtime_binding.load_deployment_context(
+        deployment_path,
+        project="fotmob-airflow",
+        compose_file=compose_path,
+    )
+    lineage = mod.load_lifecycle_report(
+        lifecycle_path,
+        deployment_context=context,
+        deployment_report=deployment_path,
+        project="fotmob-airflow",
+    )
+    return lineage, report, context
+
+
+def test_lifecycle_silver_disabled_accepts_bronze_only_generation(
+    tmp_path, monkeypatch
+):
+    # #1575: a bronze-only lifecycle (no Silver child) is valid while Silver is off.
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+    lineage, report, _context = _load_lineage(tmp_path, _bronze_only_lifecycle)
+    assert lineage.candidate_transform_task_ids == ()
+
+    state = {
+        "generation_id": lineage.generation_id,
+        "source": "fotmob",
+        "status": "succeeded",
+        "phase": "abandoned",
+        "binding": report["publication"]["binding"],
+        "candidate": _bronze_only_live_candidate(lineage.generation_id),
+        "consumer": None,
+        "owner_dag_id": mod.PUBLICATION_OWNER_DAG_ID,
+        "active": False,
+        "lock_active": False,
+        "released_at": "2026-07-21T11:00:00Z",
+    }
+    evidence = mod.validate_live_publication_state(state, lineage)
+    assert evidence["candidate"]["candidate_kind"] == "bronze_only"
+
+    state["candidate"] = {**state["candidate"], "validation_task_id": "other"}
+    with pytest.raises(ValueError, match="bronze-only candidate identity"):
+        mod.validate_live_publication_state(state, lineage)
+
+
+def test_lifecycle_silver_disabled_still_accepts_silver_generation(
+    tmp_path, monkeypatch
+):
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+    lineage, _report, _context = _load_lineage(tmp_path, None)
+    assert lineage.candidate_transform_task_ids == ("transform_a", "transform_b")
+
+
+def test_lifecycle_silver_enabled_rejects_bronze_only_generation(tmp_path):
+    with pytest.raises(ValueError, match="silver_terminal|terminal"):
+        _load_lineage(tmp_path, _bronze_only_lifecycle)

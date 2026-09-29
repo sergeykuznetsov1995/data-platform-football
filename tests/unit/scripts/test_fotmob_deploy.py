@@ -4213,3 +4213,219 @@ def test_ordinary_deploy_cannot_overwrite_pending_automatic_bytes(tmp_path):
         mod._guard_existing_pending_activation(report)
 
     assert report.read_bytes() == original
+
+
+@pytest.fixture(autouse=True)
+def _silver_enabled_contract(monkeypatch):
+    """#1575: tests above pin the Silver-enabled contract; the disabled
+    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
+
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
+
+
+def _silver_off(monkeypatch):
+    from scrapers.fotmob import constants as fotmob_constants
+
+    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+
+
+def _bronze_only_admission():
+    payload = _automatic_catalog_admission()
+    payload["canary"]["silver_run_state"] = ""
+    payload["canary"]["final_publication"]["candidate"]["transform_task_ids"] = None
+    return payload
+
+
+@pytest.mark.parametrize("bronze_only", [False, True])
+def test_automatic_admission_silver_disabled_accepts_both_canary_shapes(
+    monkeypatch, bronze_only
+):
+    # #1575: admissions issued with Silver stay valid after the switch-off.
+    _silver_off(monkeypatch)
+    payload = _bronze_only_admission() if bronze_only else _automatic_catalog_admission()
+
+    assert mod.validate_automatic_catalog_admission(payload)["passed"] is True
+
+
+def test_automatic_admission_silver_enabled_rejects_bronze_only_canary():
+    with pytest.raises(mod.DeploymentError, match="abandoned exact publication"):
+        mod.validate_automatic_catalog_admission(_bronze_only_admission())
+
+
+def _canary_report_file(tmp_path, *, silver_run_state):
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    deployment = {
+        "deployment_id": "f" * 32,
+        "git_sha": "a" * 40,
+        "scheduler_container_id": "1" * 64,
+    }
+    generation_id = "11111111-1111-4111-8111-111111111111"
+    payload = {
+        "schema_version": mod.AUTOMATIC_CANARY_SCHEMA,
+        "passed": True,
+        "phase": "abandoned",
+        "recovery_required": False,
+        "mode": "automatic-canary",
+        **deployment,
+        "generation_id": generation_id,
+        "publication": {
+            "generation_id": generation_id,
+            "binding": {"runtime_fingerprint": deployment["git_sha"]},
+        },
+        "ingest_run_state": "success",
+        "silver_run_state": silver_run_state,
+        "final_publication": {
+            "generation_id": generation_id,
+            "phase": "abandoned",
+            "active": False,
+            "released": True,
+            "published": False,
+        },
+        "current_run_reports": [{"run_id": generation_id}],
+    }
+    path = evidence / "automatic-canary.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    return path, evidence, deployment
+
+
+@pytest.mark.parametrize("silver_run_state", ["success", ""])
+def test_canary_report_silver_disabled_accepts_bronze_only(
+    monkeypatch, tmp_path, silver_run_state
+):
+    _silver_off(monkeypatch)
+    path, evidence, deployment = _canary_report_file(
+        tmp_path, silver_run_state=silver_run_state
+    )
+
+    report = mod.load_automatic_canary_report(
+        path, evidence_dir=evidence, deployment=deployment
+    )
+
+    assert report["silver_run_state"] == silver_run_state
+
+
+def test_canary_report_silver_enabled_requires_silver_success(tmp_path):
+    path, evidence, deployment = _canary_report_file(tmp_path, silver_run_state="")
+
+    with pytest.raises(mod.DeploymentError, match="not bound to this deployment"):
+        mod.load_automatic_canary_report(
+            path, evidence_dir=evidence, deployment=deployment
+        )
+
+
+# Full ControlStore candidates; the canary keeps only their summary projection.
+_BRONZE_LIVE = {
+    "schema": "fotmob-publication-v1",
+    "generation_id": "g",
+    "candidate_kind": "bronze_only",
+    "validation_task_id": "validate_data",
+    "validated_bronze": {"status": "success"},
+    "digest": "d" * 64,
+}
+_SILVER_LIVE = {
+    "schema": "fotmob-publication-v1",
+    "generation_id": "g",
+    "digest": "d" * 64,
+    "transform_task_ids": ["silver_transforms.a"],
+    "transform_results": {"silver_transforms.a": {"status": "success"}},
+    "row_count_gate": {"status": "success"},
+    "quality_gate": {"passed": 1},
+}
+
+
+def _live_canary(silver_run_state):
+    candidate = {
+        "generation_id": "g",
+        "digest": "d" * 64,
+        "transform_task_ids": (
+            None if silver_run_state == "" else ["silver_transforms.a"]
+        ),
+    }
+    return {
+        "runner_report_path": "/tmp/fotmob_result_20260929T000000.json",
+        "ingest_run_id": "fotmob_orchestrated__g",
+        "silver_run_id": "fotmob_silver__g",
+        "silver_run_state": silver_run_state,
+        "generation_id": "g",
+        "runner_report_sha256": "c" * 64,
+        "runner_report_bytes": 10,
+        "current_run_reports": [{"run_id": "g"}],
+        "candidate_digest": "d" * 64,
+        "final_publication": {"candidate": candidate},
+    }
+
+
+def _live_run(runs, canary, live_candidate):
+    payload = {
+        "runs": runs,
+        "validation": {
+            "runner_report_path": canary["runner_report_path"],
+            "runner_report_sha256": canary["runner_report_sha256"],
+            "runner_report_bytes": canary["runner_report_bytes"],
+        },
+        "runner_sha256": canary["runner_report_sha256"],
+        "runner_bytes": canary["runner_report_bytes"],
+        "runner_report": canary["current_run_reports"][0],
+        "publication": {
+            "generation_id": "g",
+            "phase": "abandoned",
+            "active": False,
+            "released_at": "2026-09-29T00:00:00+00:00",
+            "candidate": live_candidate,
+        },
+    }
+
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_AUTOMATIC_CANARY_LIVE_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    return run
+
+
+_INGEST_OK = {"dag_id": "dag_ingest_fotmob", "run_id": "fotmob_orchestrated__g", "state": "success"}
+_SILVER_OK = {"dag_id": "dag_transform_fotmob_silver", "run_id": "fotmob_silver__g", "state": "success"}
+
+
+def test_live_canary_silver_disabled_accepts_absent_silver_run(monkeypatch):
+    _silver_off(monkeypatch)
+    canary = _live_canary("")
+
+    mod.validate_live_automatic_canary(
+        "c" * 64, canary, run=_live_run([_INGEST_OK], canary, _BRONZE_LIVE)
+    )
+    # A Silver run next to a bronze-only canary is still refused.
+    with pytest.raises(mod.DeploymentError, match="live provenance differs"):
+        mod.validate_live_automatic_canary(
+            "c" * 64,
+            canary,
+            run=_live_run([_INGEST_OK, _SILVER_OK], canary, _BRONZE_LIVE),
+        )
+    # The digest of the full live candidate is still bound to the canary.
+    with pytest.raises(mod.DeploymentError, match="live provenance differs"):
+        mod.validate_live_automatic_canary(
+            "c" * 64,
+            canary,
+            run=_live_run([_INGEST_OK], canary, {**_BRONZE_LIVE, "digest": "e" * 64}),
+        )
+
+
+def test_live_canary_silver_enabled_requires_silver_run():
+    canary = _live_canary("success")
+
+    with pytest.raises(mod.DeploymentError, match="live provenance differs"):
+        mod.validate_live_automatic_canary(
+            "c" * 64, canary, run=_live_run([_INGEST_OK], canary, _SILVER_LIVE)
+        )
+    mod.validate_live_automatic_canary(
+        "c" * 64,
+        canary,
+        run=_live_run([_INGEST_OK, _SILVER_OK], canary, _SILVER_LIVE),
+    )

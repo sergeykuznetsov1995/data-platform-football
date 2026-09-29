@@ -2432,9 +2432,14 @@ def record_fotmob_bronze_only_candidate(
     *,
     validation_task_id: str,
     silver_input_tables: Sequence[str],
+    silver_enabled: bool = True,
     **context: Any,
 ) -> dict[str, Any]:
-    """Record the validated Bronze candidate when no Silver input changed."""
+    """Record the validated Bronze candidate when no Silver input changed.
+
+    With ``silver_enabled=False`` (#1575) the candidate is recorded even when
+    Silver inputs changed, because no Silver child will run.
+    """
 
     publication = publication_from_context(context) or {}
     task_instance = context.get("ti")
@@ -2470,7 +2475,9 @@ def record_fotmob_bronze_only_candidate(
     )
     if not normalized_silver_inputs:
         raise _airflow_exception("FotMob Silver input table set is invalid")
-    if set(normalized_changed).intersection(normalized_silver_inputs):
+    if silver_enabled and set(normalized_changed).intersection(
+        normalized_silver_inputs
+    ):
         return {
             "status": "silver_required",
             "recorded": False,

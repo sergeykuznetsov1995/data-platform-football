@@ -959,10 +959,16 @@ def _validate_isolated_snapshot(
         if sum(owner_order(other)[:2] == candidate_key for other in candidates) != 1:
             raise ObservationError("earliest scheduled DAILY owner is ambiguous")
         selected = _validate_daily_pipeline(identity, activation, item)
-        if selected["silver_run_id"] is not None:
+        # #1575: while Silver is switched off a bronze-only lineage counts too.
+        if (
+            selected["silver_run_id"] is not None
+            or not runtime_binding.fotmob_silver_enabled()
+        ):
             return selected
     raise ObservationError(
         "no successful scheduled DAILY Silver lineage exists after activation"
+        if runtime_binding.fotmob_silver_enabled()
+        else "no successful scheduled DAILY bronze-only lineage exists after activation"
     )
 
 
@@ -1050,13 +1056,19 @@ def validate_observation(
                 "generation_id": generation_id,
                 "state": "success",
             },
-            "silver": {
-                "dag_id": SILVER_DAG_ID,
-                "run_id": selected["silver_run_id"],
-                "ingest_run_id": selected["ingest_run_id"],
-                "generation_id": generation_id,
-                "state": "success",
-            },
+            **(
+                {
+                    "silver": {
+                        "dag_id": SILVER_DAG_ID,
+                        "run_id": selected["silver_run_id"],
+                        "ingest_run_id": selected["ingest_run_id"],
+                        "generation_id": generation_id,
+                        "state": "success",
+                    }
+                }
+                if selected["silver_run_id"] is not None
+                else {}
+            ),
             "sofascore": {
                 "dag_id": SOFA_DAG_ID,
                 "run_id": str(sofa["run_id"]),

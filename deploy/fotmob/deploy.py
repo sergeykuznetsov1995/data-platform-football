@@ -318,7 +318,11 @@ def load_automatic_canary_report(
         or binding.get("runtime_fingerprint") != deployment.get("git_sha")
         or publication.get("generation_id") != payload.get("generation_id")
         or payload.get("ingest_run_state") != "success"
-        or payload.get("silver_run_state") != "success"
+        # #1575: no Silver child exists while Silver is switched off.
+        or payload.get("silver_run_state")
+        not in (
+            {"success"} if runtime_binding.fotmob_silver_enabled() else {"success", ""}
+        )
         or not isinstance(final_publication, Mapping)
         or final_publication.get("generation_id") != payload.get("generation_id")
         or final_publication.get("phase") != "abandoned"
@@ -999,8 +1003,15 @@ print({marker!r} + json.dumps(payload, default=str, sort_keys=True))
         raise DeploymentError("automatic canary live evidence is invalid")
     expected_runs = {
         ("dag_ingest_fotmob", str(canary.get("ingest_run_id")), "success"),
-        ("dag_transform_fotmob_silver", str(canary.get("silver_run_id")), "success"),
     }
+    # #1575: a bronze-only canary (Silver switched off) has no Silver run.
+    if (
+        runtime_binding.fotmob_silver_enabled()
+        or canary.get("silver_run_state") == "success"
+    ):
+        expected_runs.add(
+            ("dag_transform_fotmob_silver", str(canary.get("silver_run_id")), "success")
+        )
     observed_runs = {
         (str(item.get("dag_id")), str(item.get("run_id")), str(item.get("state")))
         for item in payload.get("runs") or ()
@@ -1027,7 +1038,14 @@ print({marker!r} + json.dumps(payload, default=str, sort_keys=True))
         or not isinstance(candidate, Mapping)
         or candidate.get("digest") != canary.get("candidate_digest")
         or not isinstance(final_publication, Mapping)
-        or candidate != final_publication.get("candidate")
+        # #1575: the canary stores only the summary projection of the full
+        # ControlStore candidate (backfill ``_publication_summary``).
+        or {
+            "generation_id": candidate.get("generation_id"),
+            "digest": candidate.get("digest"),
+            "transform_task_ids": candidate.get("transform_task_ids"),
+        }
+        != final_publication.get("candidate")
     ):
         raise DeploymentError("automatic canary live provenance differs")
     return dict(payload)
