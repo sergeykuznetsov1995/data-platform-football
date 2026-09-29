@@ -616,6 +616,55 @@ class StandingPolicyBudget:
 
 
 @dataclass(frozen=True)
+class StandingPolicyScaling:
+    """How a standing paid budget grows with the work it covers (#1391).
+
+    The ``paid_proxy`` caps stay the floors.  A DAG whose work is known only
+    at run time (the registry discovery: competitions of the last canonical
+    snapshot, configured country pages) derives its exact caps from these
+    committed factors instead of one fixed number.
+    """
+
+    request_multiplier: float
+    seed_pages: int
+    full_requests_per_competition: int
+    daily_requests_per_competition: int
+    retry_share: float
+    provider_bytes_per_request: int
+
+    def __post_init__(self) -> None:
+        for field in ('request_multiplier', 'retry_share'):
+            value = getattr(self, field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not value > 0
+            ):
+                raise ApprovalValidationError(f'{field} must be positive')
+        for field in (
+            'seed_pages',
+            'full_requests_per_competition',
+            'daily_requests_per_competition',
+            'provider_bytes_per_request',
+        ):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ApprovalValidationError(
+                    f'{field} must be a positive integer'
+                )
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            'daily_requests_per_competition': self.daily_requests_per_competition,
+            'full_requests_per_competition': self.full_requests_per_competition,
+            'provider_bytes_per_request': self.provider_bytes_per_request,
+            'request_multiplier': self.request_multiplier,
+            'retry_share': self.retry_share,
+            'seed_pages': self.seed_pages,
+        }
+
+
+@dataclass(frozen=True)
 class StandingPolicy:
     """A named, expiring approval that stands for scheduled runs of one DAG."""
 
@@ -627,6 +676,8 @@ class StandingPolicy:
     paid_proxy: StandingPolicyBudget
     production_write: StandingPolicyBudget
     allowed_write_tables: tuple[str, ...]
+    # Optional: absent keeps the fixed caps (and the policy hash) unchanged.
+    scaling: StandingPolicyScaling | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -686,11 +737,22 @@ class StandingPolicy:
         if not tables:
             raise ApprovalValidationError('allowed_write_tables cannot be empty')
         object.__setattr__(self, 'allowed_write_tables', tables)
+        if isinstance(self.scaling, Mapping):
+            try:
+                object.__setattr__(
+                    self, 'scaling', StandingPolicyScaling(**self.scaling),
+                )
+            except TypeError as exc:
+                raise ApprovalValidationError('scaling is invalid') from exc
+        if self.scaling is not None and not isinstance(
+            self.scaling, StandingPolicyScaling,
+        ):
+            raise ApprovalValidationError('scaling is invalid')
 
     def payload(self) -> dict[str, Any]:
         """Return the exact JSON-safe structure bound to operator approval."""
 
-        return {
+        payload = {
             'allowed_write_tables': list(self.allowed_write_tables),
             'approved_at': _timestamp(self.approved_at),
             'approved_by': self.approved_by,
@@ -700,6 +762,9 @@ class StandingPolicy:
             'policy_version': self.policy_version,
             'production_write': self.production_write.payload(),
         }
+        if self.scaling is not None:
+            payload['scaling'] = self.scaling.payload()
+        return payload
 
     @property
     def canonical_json(self) -> str:
