@@ -1038,7 +1038,14 @@ print({marker!r} + json.dumps(payload, default=str, sort_keys=True))
         or not isinstance(candidate, Mapping)
         or candidate.get("digest") != canary.get("candidate_digest")
         or not isinstance(final_publication, Mapping)
-        or candidate != final_publication.get("candidate")
+        # #1575: the canary stores only the summary projection of the full
+        # ControlStore candidate (backfill ``_publication_summary``).
+        or {
+            "generation_id": candidate.get("generation_id"),
+            "digest": candidate.get("digest"),
+            "transform_task_ids": candidate.get("transform_task_ids"),
+        }
+        != final_publication.get("candidate")
     ):
         raise DeploymentError("automatic canary live provenance differs")
     return dict(payload)

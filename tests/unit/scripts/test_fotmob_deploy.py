@@ -4317,8 +4317,34 @@ def test_canary_report_silver_enabled_requires_silver_success(tmp_path):
         )
 
 
+# Full ControlStore candidates; the canary keeps only their summary projection.
+_BRONZE_LIVE = {
+    "schema": "fotmob-publication-v1",
+    "generation_id": "g",
+    "candidate_kind": "bronze_only",
+    "validation_task_id": "validate_data",
+    "validated_bronze": {"status": "success"},
+    "digest": "d" * 64,
+}
+_SILVER_LIVE = {
+    "schema": "fotmob-publication-v1",
+    "generation_id": "g",
+    "digest": "d" * 64,
+    "transform_task_ids": ["silver_transforms.a"],
+    "transform_results": {"silver_transforms.a": {"status": "success"}},
+    "row_count_gate": {"status": "success"},
+    "quality_gate": {"passed": 1},
+}
+
+
 def _live_canary(silver_run_state):
-    candidate = {"generation_id": "g", "digest": "d" * 64, "transform_task_ids": None}
+    candidate = {
+        "generation_id": "g",
+        "digest": "d" * 64,
+        "transform_task_ids": (
+            None if silver_run_state == "" else ["silver_transforms.a"]
+        ),
+    }
     return {
         "runner_report_path": "/tmp/fotmob_result_20260929T000000.json",
         "ingest_run_id": "fotmob_orchestrated__g",
@@ -4333,7 +4359,7 @@ def _live_canary(silver_run_state):
     }
 
 
-def _live_run(runs, canary):
+def _live_run(runs, canary, live_candidate):
     payload = {
         "runs": runs,
         "validation": {
@@ -4349,7 +4375,7 @@ def _live_run(runs, canary):
             "phase": "abandoned",
             "active": False,
             "released_at": "2026-09-29T00:00:00+00:00",
-            "candidate": canary["final_publication"]["candidate"],
+            "candidate": live_candidate,
         },
     }
 
@@ -4372,21 +4398,34 @@ def test_live_canary_silver_disabled_accepts_absent_silver_run(monkeypatch):
     _silver_off(monkeypatch)
     canary = _live_canary("")
 
-    mod.validate_live_automatic_canary("c" * 64, canary, run=_live_run([_INGEST_OK], canary))
+    mod.validate_live_automatic_canary(
+        "c" * 64, canary, run=_live_run([_INGEST_OK], canary, _BRONZE_LIVE)
+    )
     # A Silver run next to a bronze-only canary is still refused.
     with pytest.raises(mod.DeploymentError, match="live provenance differs"):
         mod.validate_live_automatic_canary(
-            "c" * 64, canary, run=_live_run([_INGEST_OK, _SILVER_OK], canary)
+            "c" * 64,
+            canary,
+            run=_live_run([_INGEST_OK, _SILVER_OK], canary, _BRONZE_LIVE),
+        )
+    # The digest of the full live candidate is still bound to the canary.
+    with pytest.raises(mod.DeploymentError, match="live provenance differs"):
+        mod.validate_live_automatic_canary(
+            "c" * 64,
+            canary,
+            run=_live_run([_INGEST_OK], canary, {**_BRONZE_LIVE, "digest": "e" * 64}),
         )
 
 
 def test_live_canary_silver_enabled_requires_silver_run():
-    canary = _live_canary("")
+    canary = _live_canary("success")
 
     with pytest.raises(mod.DeploymentError, match="live provenance differs"):
         mod.validate_live_automatic_canary(
-            "c" * 64, canary, run=_live_run([_INGEST_OK], canary)
+            "c" * 64, canary, run=_live_run([_INGEST_OK], canary, _SILVER_LIVE)
         )
     mod.validate_live_automatic_canary(
-        "c" * 64, canary, run=_live_run([_INGEST_OK, _SILVER_OK], canary)
+        "c" * 64,
+        canary,
+        run=_live_run([_INGEST_OK, _SILVER_OK], canary, _SILVER_LIVE),
     )
