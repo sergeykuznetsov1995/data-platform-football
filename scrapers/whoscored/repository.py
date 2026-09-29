@@ -55,7 +55,8 @@ MATCH_REFRESH_DAYS = 7
 # A match that keeps failing transiently stays a daily candidate while it is
 # ``retryable`` and under this attempt cap.  The cap bounds retry churn on a
 # permanently-stuck match (there is no attempt->terminal transition); once
-# exhausted it leaves the daily run and only backfill/manual re-attempts.
+# exhausted it leaves the daily run and the history chunks alike (#1476); only
+# an explicit forced replay re-attempts it.
 DAILY_RETRYABLE_MAX_ATTEMPTS = 8
 # #1474: one re-probe of a "not available" match in an available stage, and one
 # probe of an unknown/unavailable stage per this period.
@@ -3685,10 +3686,9 @@ class WhoScoredRepository:
         failed_filter = (
             " OR m.state IN ('terminal', 'parse_failed')" if include_failed else ""
         )
+        # The retry ceiling holds for history (explicit ids) too (#1476).
         retry_cap = (
             f" AND COALESCE(m.attempt_no, 0) < {int(DAILY_RETRYABLE_MAX_ATTEMPTS)}"
-            if daily
-            else ""
         )
         # Daily: every "not available" game stays eligible here; the stage
         # filter below decides.  In an available stage it is re-probed once

@@ -44,6 +44,7 @@ from typing import (
     Any,
     Callable,
     Mapping,
+    NoReturn,
     Optional,
     Protocol,
     Sequence,
@@ -538,6 +539,35 @@ class ProxyBudgetRejected(RuntimeError):
     """The shared filtering proxy rejected a lease at a hard byte ceiling."""
 
 
+class ProxyUnavailable(RuntimeError):
+    """The residential pool cannot carry traffic: stop the run (#1476).
+
+    Deliberately not a ``WhoScoredTransportError``: the per-match handlers
+    catch that base and would record a retryable failure row (and a higher
+    ``attempt_no``) for every remaining candidate of a dead proxy.
+    """
+
+
+# curl: 7 = could not connect, 56 = CONNECT/recv failure, 97 = proxy handshake.
+_PROXY_CURL_CODES = frozenset({7, 56, 97})
+_PROXY_FAILURE_TEXT = re.compile(
+    r"CONNECT tunnel failed|\b407\b|curl: \((?:7|56|97)\)",
+    re.IGNORECASE,
+)
+# Egress probe through the current pool member; never a whoscored.com URL.
+EGRESS_PROBE_URL = "https://api.ipify.org"
+
+
+def _is_proxy_failure(exc: BaseException) -> bool:
+    code = getattr(exc, "code", None)
+    try:
+        if code is not None and int(code) in _PROXY_CURL_CODES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return bool(_PROXY_FAILURE_TEXT.search(str(exc)))
+
+
 class ProxyConcurrencyLimited(RuntimeError):
     """The single paid slot is in use by another task in the DagRun."""
 
@@ -615,6 +645,8 @@ class TransportBudgets:
 @dataclass
 class TransportStats:
     route_requests: Counter[str] = field(default_factory=Counter)
+    # 2xx network answers per route (raw-cache hits excluded, #1476).
+    route_successes: Counter[str] = field(default_factory=Counter)
     route_wire_bytes: Counter[str] = field(default_factory=Counter)
     failures: Counter[str] = field(default_factory=Counter)
     cache_hits: int = 0
@@ -634,6 +666,7 @@ class TransportStats:
     def as_dict(self) -> dict[str, Any]:
         return {
             "route_requests": dict(self.route_requests),
+            "route_successes": dict(self.route_successes),
             "route_wire_bytes": dict(self.route_wire_bytes),
             "failures": dict(self.failures),
             "cache_hits": self.cache_hits,
@@ -2642,6 +2675,7 @@ class WhoScoredTransport:
         self._http_session_factory = http_session_factory
         # Only a real direct_only transport (no injected session) must refuse
         # the silent host-IP fallback: WhoScored blocks that IP at Cloudflare.
+        self._pool_manager: Any = None
         self._pool_proxy_url = self._resolve_pool_proxy_url(
             required=(
                 resolved_policy is TransportPolicy.DIRECT_ONLY
@@ -2652,6 +2686,9 @@ class WhoScoredTransport:
         self._direct_http = direct_http_session or self._new_http_session(
             self._pool_proxy_url
         )
+        if direct_http_session is not None:
+            # An injected session is not ours to replace on a member swap.
+            self._pool_manager = None
         flaresolverr_identity = _attested_flaresolverr_identity()
         identity_kwargs = (
             {
@@ -2888,7 +2925,73 @@ class WhoScoredTransport:
         proxy_url = manager.get_http_proxy_url()
         if proxy_url is None and required:
             raise ValueError("WHOSCORED_PROXY_FILE has no usable pool member")
+        if proxy_url is not None:
+            self._pool_manager = manager
         return proxy_url
+
+    def _is_pool_session(self, session: Any) -> bool:
+        return self._pool_manager is not None and session is self._direct_http
+
+    def _rotate_pool_proxy(self) -> bool:
+        """Swap the sticky pool member for a different one (#1476).
+
+        Returns ``False`` when the pool has no other usable member; the caller
+        then retries once on the same member.
+        """
+        manager = self._pool_manager
+        if manager is None:
+            return False
+        current = self._pool_proxy_url
+        replacement: Optional[str] = None
+        for _ in range(max(1, int(manager.total_count)) * 4):
+            candidate = manager.get_http_proxy_url()
+            if candidate and candidate != current:
+                replacement = candidate
+                break
+        if replacement is None:
+            return False
+        previous = self._direct_http
+        self._pool_proxy_url = replacement
+        self._direct_http = self._new_http_session(replacement)
+        # A browser session keeps the member it was opened with.
+        self._drop_browser_session(
+            self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+        )
+        close = getattr(previous, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # best-effort cleanup of the old member
+                logger.debug(
+                    "Could not close replaced pool session (%s)",
+                    type(exc).__name__,
+                )
+        logger.warning("WhoScored pool member replaced after a proxy failure")
+        return True
+
+    def probe_egress(self) -> None:
+        """ipify through the current pool member before a work item (#1476).
+
+        One member swap on failure; a second failure raises
+        ``ProxyUnavailable``.  No-op without a residential pool.
+        """
+        if self._pool_manager is None:
+            return
+        detail = ""
+        for attempt in range(2):
+            try:
+                raw = self._direct_http.get(
+                    EGRESS_PROBE_URL, timeout=min(float(self.request_timeout), 30.0)
+                )
+                status = int(raw.status_code)
+                if 200 <= status < 300:
+                    return
+                detail = f"HTTP {status}"
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if attempt == 0:
+                self._rotate_pool_proxy()
+        raise ProxyUnavailable(f"WhoScored egress probe failed twice: {detail}")
 
     def _new_http_session(self, proxy_url: Optional[str]) -> Any:
         if self._http_session_factory is not None:
@@ -3879,31 +3982,26 @@ class WhoScoredTransport:
             # curl/requests otherwise follow redirects before validation,
             # which would defeat the browser endpoint's no-follow policy.
             request_kwargs["allow_redirects"] = False
+        pooled = self._is_pool_session(session)
         try:
             raw = session.get(url, **request_kwargs)
         except Exception as exc:
-            self.stats.failures[FailureKind.TIMEOUT.value] += 1
-            self._record_ledger(
-                url=url,
-                route=route,
-                status="error",
-                failure_kind=FailureKind.TIMEOUT,
-                error=exc,
-            )
-            detail = _safe_route_exception_text(exc, route=route)
-            if route not in {
-                TransportRoute.PAID_HTTP,
-                TransportRoute.PAID_FLARESOLVERR,
-                TransportRoute.PAID_LEASE,
-            }:
-                detail = f"{type(exc).__name__}: {detail}"
-            raise WhoScoredTransportError(
-                f"HTTP request failed: {detail}",
-                kind=FailureKind.TIMEOUT,
-                url=url,
-                route=route,
-                retryable=True,
-            ) from exc
+            if not (pooled and _is_proxy_failure(exc)):
+                self._raise_http_request_failure(url, route=route, exc=exc)
+            # Dead pool member: one swap and one repeat; a second proxy
+            # failure stops the run instead of failing every match (#1476).
+            self._record_proxy_failure(url, route=route, exc=exc)
+            self._rotate_pool_proxy()
+            try:
+                raw = self._direct_http.get(url, **request_kwargs)
+            except Exception as retry_exc:
+                if not _is_proxy_failure(retry_exc):
+                    self._raise_http_request_failure(url, route=route, exc=retry_exc)
+                self._record_proxy_failure(url, route=route, exc=retry_exc)
+                raise ProxyUnavailable(
+                    "WhoScored residential pool failed twice: "
+                    f"{type(retry_exc).__name__}: {str(retry_exc)[:200]}"
+                ) from retry_exc
         content = bytes(raw.content or b"")
         response = self._response(
             url=url,
@@ -3915,7 +4013,48 @@ class WhoScoredTransport:
             request_bytes=_request_wire_bytes(raw),
         )
         self._record_response(response)
+        if pooled and response.status_code >= 500:
+            # One member swap per 5xx; the caller's retry policy is unchanged.
+            self._rotate_pool_proxy()
         return response
+
+    def _record_proxy_failure(
+        self, url: str, *, route: TransportRoute, exc: BaseException
+    ) -> None:
+        self.stats.failures[FailureKind.PROXY.value] += 1
+        self._record_ledger(
+            url=url,
+            route=route,
+            status="error",
+            failure_kind=FailureKind.PROXY,
+            error=exc,
+        )
+
+    def _raise_http_request_failure(
+        self, url: str, *, route: TransportRoute, exc: BaseException
+    ) -> NoReturn:
+        self.stats.failures[FailureKind.TIMEOUT.value] += 1
+        self._record_ledger(
+            url=url,
+            route=route,
+            status="error",
+            failure_kind=FailureKind.TIMEOUT,
+            error=exc,
+        )
+        detail = _safe_route_exception_text(exc, route=route)
+        if route not in {
+            TransportRoute.PAID_HTTP,
+            TransportRoute.PAID_FLARESOLVERR,
+            TransportRoute.PAID_LEASE,
+        }:
+            detail = f"{type(exc).__name__}: {detail}"
+        raise WhoScoredTransportError(
+            f"HTTP request failed: {detail}",
+            kind=FailureKind.TIMEOUT,
+            url=url,
+            route=route,
+            retryable=True,
+        ) from exc
 
     def _browser_fetch(
         self,
@@ -4982,6 +5121,8 @@ class WhoScoredTransport:
 
     def _record_response(self, response: TransportResponse) -> None:
         self.stats.route_requests[response.route.value] += 1
+        if 200 <= response.status_code < 300:
+            self.stats.route_successes[response.route.value] += 1
         self.stats.route_wire_bytes[response.route.value] += response.wire_bytes
 
     def _validate(
@@ -5315,6 +5456,7 @@ __all__ = [
     "ProxyConcurrencyLimited",
     "ProxyCampaignControlRejected",
     "ProxyLease",
+    "ProxyUnavailable",
     "RawCacheHook",
     "RequestLedger",
     "TransportBudgetExceeded",

@@ -297,7 +297,14 @@ def _runtime(
             self.match_force_replays = []
             self.match_historical_replays = []
             self.preview_force_replays = []
+            self.probes = 0
             type(self).instances.append(self)
+
+        def probe_egress(self):
+            self.probes += 1
+            probe = configured.get("probe")
+            if isinstance(probe, BaseException):
+                raise probe
 
         @classmethod
         def discover_catalog(cls, *, repository, full_history, as_of_date):
@@ -316,6 +323,9 @@ def _runtime(
                     )
                 }
             )
+            discover_error = configured.get("discover")
+            if isinstance(discover_error, BaseException):
+                raise discover_error
             return _result(
                 "catalog",
                 counts={"competitions": 433, "seasons": 1000},
@@ -2118,3 +2128,75 @@ def test_report_rebuild_preserves_exact_paid_transport_identity():
         "proxy_work_item_id": "work-1",
         "proxy_attempt_id": "attempt-1",
     }
+
+
+# --- #1476: dead residential pool stops the run --------------------------------
+
+
+@pytest.mark.unit
+def test_egress_probe_runs_before_every_work_item(monkeypatch, tmp_path):
+    rc, _report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--scope",
+            "INT-World Cup=2026",
+            "--skip-profiles",
+        ],
+    )
+
+    assert rc == 0
+    assert [service.probes for service in service_cls.instances] == [1, 1]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("where", ["probe", "matches"])
+def test_proxy_unavailable_stops_run_with_source_unavailable(
+    monkeypatch, tmp_path, where
+):
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--scope",
+            "INT-World Cup=2026",
+            "--skip-profiles",
+        ],
+        behaviors={where: ProxyUnavailable("pool failed twice: curl (56)")},
+    )
+
+    assert rc == runner.SOURCE_UNAVAILABLE_EXIT_CODE == 3
+    assert report["status"] == "source_unavailable"
+    assert report["source_unavailable"]["scope"] == "ENG-Premier League=2526"
+    # Not a retryable scope failure: no error rows that bump retry state.
+    assert report["error_details"] == []
+    assert [item["status"] for item in report["scopes"]] == [
+        "source_unavailable",
+        "pending",
+    ]
+    # The remaining scope is not touched at all.
+    assert len(service_cls.instances) == 1
+
+
+@pytest.mark.unit
+def test_proxy_unavailable_in_discover_is_source_unavailable(monkeypatch, tmp_path):
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    rc, report, _service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["discover", "--as-of-date", "2026-07-11"],
+        behaviors={"discover": ProxyUnavailable("egress probe failed twice")},
+    )
+
+    assert rc == 3
+    assert report["status"] == "source_unavailable"
+    assert report["source_unavailable"]["scope"] is None

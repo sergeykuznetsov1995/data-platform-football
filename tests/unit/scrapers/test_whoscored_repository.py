@@ -2894,3 +2894,16 @@ def test_explicit_match_ids_keep_the_ungated_candidate_policy():
     assert "is_lineup_confirmed" not in sql
     assert "'not_available'" not in sql
     assert "ORDER BY date, game_id" in sql
+
+
+@pytest.mark.unit
+def test_history_match_ids_share_the_retry_attempt_cap():
+    from scrapers.whoscored.repository import DAILY_RETRYABLE_MAX_ATTEMPTS
+
+    # #1476: history chunks select by explicit ids; a dead-proxy retry loop
+    # reached attempt_no 50 there while the cap held only for the daily run.
+    history = _daily_candidate_sql(match_ids=[11, 12])
+    replay = _daily_candidate_sql(match_ids=[11], include_success=True)
+
+    assert f"COALESCE(m.attempt_no, 0) < {DAILY_RETRYABLE_MAX_ATTEMPTS}" in history
+    assert "attempt_no, 0) <" not in replay
