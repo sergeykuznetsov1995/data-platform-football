@@ -30,7 +30,9 @@ BACKFILL_PLAN_VERSION = 5
 # #1474: receipt 7 / policy 8 — the schedule receipt no longer carries
 # non_opta_game_ids and the 2-match probe stage is gone.
 BACKFILL_RECEIPT_VERSION = 7
-BACKFILL_POLICY_VERSION = 8
+# #1476: policy 9 — the frozen match plan drops retryable matches that
+# exhausted the retry ceiling (all_completed_schedule_matches_v3).
+BACKFILL_POLICY_VERSION = 9
 LEGACY_BACKFILL_CHECKPOINT_VERSION = 2
 BACKFILL_CHECKPOINT_VERSION = 3
 BACKFILL_CHECKPOINT_DATA_VERSION = 1
@@ -124,7 +126,7 @@ def _policy_identity() -> dict[str, Any]:
         "policy_version": BACKFILL_POLICY_VERSION,
         # #1474: no probe stage; stage availability lives in the candidate
         # policy of the repository, never in the schedule's matchIsOpta flag.
-        "match_candidate_policy": "all_completed_schedule_matches_v2",
+        "match_candidate_policy": "all_completed_schedule_matches_v3",
         "profile_candidate_policy": "all_post_match_frozen_roster_players",
         "parser_version": PARSER_VERSION,
         "availability_version": MATCH_AVAILABILITY_VERSION,

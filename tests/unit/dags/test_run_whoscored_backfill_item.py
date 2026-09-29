@@ -235,3 +235,80 @@ def test_backfill_worker_binds_paid_selector_to_decoded_work_item():
     _validate_transport_args(parser, args, work_item_id="immutable-item")
     assert args.proxy_work_item_id == "immutable-item"
     assert args.expected_proxy_work_item_id == "immutable-item"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", ["schedule", "matches", "profiles"])
+def test_history_work_item_probes_egress_first_and_stops_as_source_unavailable(
+    monkeypatch, tmp_path, kind
+):
+    import json
+
+    from dags.scripts import run_whoscored_backfill_item as backfill_item
+    from dags.scripts import run_whoscored_scraper as runner
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    calls = []
+    receipts = []
+
+    class _Service:
+        def __init__(self, runtime_scope, *, catalog, repository):
+            del runtime_scope, catalog, repository
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def probe_egress(self):
+            calls.append("probe")
+            raise ProxyUnavailable("egress probe failed twice: HTTP 407")
+
+        def __getattr__(self, name):
+            calls.append(name)
+            raise AssertionError(f"{name} ran after a failed probe")
+
+    class _State:
+        def load_plan(self, queue_id, plan_id):
+            return {"provenance": {"catalog_batch_id": "wsc2-x"}}
+
+        def validate_work_item(self, plan, item):
+            return None
+
+        def work_completed(self, *args, **kwargs):
+            return False
+
+        def append_receipt(self, **kwargs):
+            receipts.append(kwargs)
+            return {"artifact": {}}
+
+    repository = SimpleNamespace(
+        ensure_schema=lambda: None,
+        load_discovered_catalog=lambda batch_id: object(),
+    )
+    monkeypatch.setenv("WHOSCORED_SCHEMA_READY", "1")
+    monkeypatch.setattr(runner, "_new_repository", lambda: repository)
+    monkeypatch.setattr(runner, "_load_runtime", lambda: _Service)
+    monkeypatch.setattr(
+        runner,
+        "_select_catalog_snapshot_scopes",
+        lambda catalog, scopes, active_only: [(scopes[0], object())],
+    )
+    output = tmp_path / "result.json"
+
+    rc = backfill_item._run_work_item(
+        state=_State(),
+        queue_id="q",
+        plan_id="p",
+        item={"work_id": "w1", "scope": "WS-1=2026", "kind": kind},
+        output=str(output),
+    )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == runner.SOURCE_UNAVAILABLE_EXIT_CODE
+    assert report["status"] == "source_unavailable"
+    assert report["scopes"][0]["status"] == "source_unavailable"
+    assert report["error_details"] == []
+    assert calls == ["probe"]
+    assert receipts == []

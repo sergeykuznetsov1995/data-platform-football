@@ -106,7 +106,7 @@ def test_plan_identity_binds_catalog_generation_and_candidate_policy(
 
     assert first["plan_id"] != second["plan_id"]
     assert first["policy"]["match_candidate_policy"] == (
-        "all_completed_schedule_matches_v2"
+        "all_completed_schedule_matches_v3"
     )
     assert "probe_sample_size" not in first["policy"]
     assert first["policy"]["availability_version"]
@@ -114,7 +114,7 @@ def test_plan_identity_binds_catalog_generation_and_candidate_policy(
         "pinned-catalog-stage-count-v1"
     )
     assert first["policy"]["schedule_request_units_per_stage"] == 70
-    assert first["policy"]["policy_version"] == 8
+    assert first["policy"]["policy_version"] == 9
     assert first["policy"]["match_capacity_policy"] == (
         "exact-match-plus-preview-cardinality-v1"
     )
@@ -951,3 +951,20 @@ def test_segment_chain_is_periodically_compacted(monkeypatch, tmp_path):
     assert checkpoint["generation"] == CHECKPOINT_DELTAS_PER_SNAPSHOT
     assert checkpoint["deltas"] == []
     assert f"/{CHECKPOINT_DELTAS_PER_SNAPSHOT:012d}/" in checkpoint["snapshot"]["key"]
+
+
+@pytest.mark.unit
+def test_plan_frozen_before_the_retry_ceiling_is_incompatible():
+    # #1476: a policy-8 plan froze matches past the retry ceiling; its
+    # receipts must not be reused under the new candidate policy.
+    from dags.scripts.whoscored_ops_store import _policy_identity, _policy_is_compatible
+
+    current = _policy_identity()
+    old = dict(
+        current,
+        policy_version=8,
+        match_candidate_policy="all_completed_schedule_matches_v2",
+    )
+
+    assert _policy_is_compatible(current)
+    assert not _policy_is_compatible(old)
