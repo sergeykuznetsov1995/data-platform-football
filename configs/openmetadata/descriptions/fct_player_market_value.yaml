@@ -4,19 +4,16 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_market_value
   description: |
-    Timeline рыночной стоимости игроков из ДВУХ источников (issue #430). Один
-    row per (player_id, valuation_date, source) — FotMob и
-    Transfermarkt-точки хранятся бок о бок, «правильный» источник здесь НЕ
-    выбирается (feature-решение downstream). Pointwise off-field факт: market
+    Timeline рыночной стоимости игроков (issue #430). Один row per
+    (player_id, valuation_date, source). Спроектирован на два источника бок о
+    бок; FotMob-ветка удалена в #1590 вместе со старым FotMob Silver, сейчас
+    source всегда 'transfermarkt'. Pointwise off-field факт: market
     value — это career-long таймлайн, НЕ season-bound, поэтому БЕЗ league/season
     и без партиционирования (как fct_team_elo). `source` в PK не даёт точкам
     FotMob и Transfermarkt на одну (player, date) коллидировать.
-    Источники: silver.fotmob_player_market_value_history (bridge через
-    silver.xref_player с (league, season) предикатом и LEFT JOIN) и
-    silver.transfermarkt_market_value_points_v2 (глобальный native fact;
-    canonical_id разрешён через conflict-safe global xref). Неразрешённые
-    точки не удаляются: используются стабильные `fm_<source_id>` и
-    `tm_<source_id>` (#871). Поэтому FK к dim_player намеренно мягкий и
+    Источник: silver.transfermarkt_market_value_points_v2 (глобальный native
+    fact; canonical_id разрешён через conflict-safe global xref). Неразрешённые
+    точки не удаляются: используется стабильный `tm_<source_id>` (#871). Поэтому FK к dim_player намеренно мягкий и
     контролируется orphan-rate DQ. ROW_NUMBER по design-PK
     защищает PK от повторной выдачи точки источником; scrape-season
     дедупликация для Transfermarkt больше не нужна.
@@ -26,15 +23,15 @@ table:
     - PII.Low
 columns:
   - name: player_id
-    description: Канонический ID либо стабильный orphan ID `fm_`/`tm_`; soft FK → dim_player. Часть PK (player_id, valuation_date, source).
+    description: Канонический ID либо стабильный orphan ID `tm_`; soft FK → dim_player. Часть PK (player_id, valuation_date, source).
   - name: valuation_date
-    description: Дата фиксации market_value (FotMob value_date / Transfermarkt mv_date). Часть PK.
+    description: Дата фиксации market_value (Transfermarkt mv_date). Часть PK.
   - name: market_value_eur
     description: Рыночная стоимость в EUR на valuation_date (BIGINT).
   - name: currency
-    description: Валюта котировки ('EUR' для обоих источников).
+    description: Валюта котировки ('EUR').
   - name: source
-    description: Источник точки — 'fotmob' или 'transfermarkt'. Часть PK (разводит точки на одну (player, date)).
+    description: Источник точки — 'transfermarkt' ('fotmob' убран в #1590). Часть PK (разводит точки на одну (player, date)).
   - name: _bronze_ingested_at
     description: Timestamp Bronze ingest'а исходной точки.
 relationships:

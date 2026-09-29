@@ -1443,35 +1443,44 @@ def validate_gold_quality() -> Dict[str, Any]:
         # audit-diff coverage WARNING-only (error_threshold=0). Audit —
         # observability, не gate; ERROR ломал бы DAG при нормальных
         # cross-source расхождениях (mid-season transfer, разные методики
-        # подсчёта). NULL diff засчитывается как "not measured" (passed).
+        # подсчёта). #1590: spine расширился с FBref∩FotMob до всего FBref,
+        # поэтому знаменатель — только измеренные строки (where diff IS NOT
+        # NULL); иначе неизмеренные строки разбавляли бы долю расхождений.
         # ----- WhoScored audit (1: только matches есть в event-aggregate) -----
         CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(matches_diff_whoscored) <= 1 OR matches_diff_whoscored IS NULL',
+                       condition='ABS(matches_diff_whoscored) <= 1',
+                       where='matches_diff_whoscored IS NOT NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.matches_whoscored]'),
         # ----- Understat audit (6) -----
         CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(matches_diff_understat) <= 1 OR matches_diff_understat IS NULL',
+                       condition='ABS(matches_diff_understat) <= 1',
+                       where='matches_diff_understat IS NOT NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.matches_understat]'),
         CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(minutes_diff_understat) <= 90 OR minutes_diff_understat IS NULL',
+                       condition='ABS(minutes_diff_understat) <= 90',
+                       where='minutes_diff_understat IS NOT NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.minutes_understat]'),
         CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(goals_diff_understat) <= 1 OR goals_diff_understat IS NULL',
+                       condition='ABS(goals_diff_understat) <= 1',
+                       where='goals_diff_understat IS NOT NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.goals_understat]'),
         CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(assists_diff_understat) <= 1 OR assists_diff_understat IS NULL',
+                       condition='ABS(assists_diff_understat) <= 1',
+                       where='assists_diff_understat IS NOT NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.assists_understat]'),
         CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(yellow_cards_diff_understat) <= 1 OR yellow_cards_diff_understat IS NULL',
+                       condition='ABS(yellow_cards_diff_understat) <= 1',
+                       where='yellow_cards_diff_understat IS NOT NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.yellow_cards_understat]'),
         CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(red_cards_diff_understat) <= 1 OR red_cards_diff_understat IS NULL',
+                       condition='ABS(red_cards_diff_understat) <= 1',
+                       where='red_cards_diff_understat IS NOT NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.red_cards_understat]'),
 
@@ -1490,8 +1499,10 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
         # WhoScored saves diff (SPADL keeper_save vs FBref `saves` — разная
         # дефиниция; threshold выше: ±5 reasonable cross-source noise).
+        # #1590: знаменатель — только измеренные строки (spine = весь FBref).
         CHECK.coverage('gold.fct_keeper_season_stats_audit',
-                       condition='ABS(saves_diff_whoscored) <= 5 OR saves_diff_whoscored IS NULL',
+                       condition='ABS(saves_diff_whoscored) <= 5',
+                       where='saves_diff_whoscored IS NOT NULL',
                        warn_threshold=0.90, error_threshold=0.0,
                        name='audit_diff[fct_keeper_season_stats_audit.saves_whoscored]'),
 
