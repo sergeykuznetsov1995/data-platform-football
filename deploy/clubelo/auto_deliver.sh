@@ -26,6 +26,12 @@ CLUBELO_PATHS=(scrapers/clubelo dags/dag_ingest_clubelo.py dags/utils/clubelo_ta
 # Общие модули, которые импортируют файлы ClubElo (с транзитивными: default_args → alerts,
 # config → medallion_config, scrapers.base.iceberg_writer → scrapers/utils).
 SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__init__.py dags/utils/config.py dags/utils/default_args.py dags/utils/alerts.py dags/utils/medallion_config.py"
+# Разрешённое отставание общих модулей (решение владельца 29.09, #1465): «путь=git-blob» — бой может
+# побайтно равняться этому blob вместо master. Только файлы из SHARED_PATHS; состав не ослабляется.
+# alerts.py до #1477 (0caf6bca^): master отличается лишь telegram_dq_summary, которой ClubElo не
+# пользуется — тест tests/unit/deploy/test_clubelo_shared_lag.py падает, если разойдётся то, что
+# ClubElo зовёт. Удалить запись, когда #1477 доедет до боя (#1489) — README.
+ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008"
 # Порядок записи файлов вне scrapers/clubelo/ и tests/ — импортируемые раньше импортирующих.
 DAG_ORDER="dags/utils/clubelo_tasks.py dags/scripts/run_clubelo_scraper.py dags/dag_ingest_clubelo.py"
 DAGS="dag_ingest_clubelo"
@@ -185,14 +191,22 @@ ACC=$(cat "$ACCEPTED_F" 2>/dev/null)
   || stop "автомат не знает базы: $ACCEPTED_F пуст/не SHA/нет такого коммита — посей руками (README)"
 [ "$(md5sum < "$SELF" | cut -c1-32)" = "$(g show "$SHA:deploy/clubelo/auto_deliver.sh" 2>/dev/null | md5sum | cut -c1-32)" ] \
   || stop "копия автомата отстала от master ${SHA:0:7}, переустанови: cp из master (README)"
+LAGGED=""
 for f in $(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS); do
-  g show "$SHA:$f" | cmp -s - "$TREE/$f" || stop "ОТМЕНА: общий модуль $f в бою ≠ master ${SHA:0:7}"
+  g show "$SHA:$f" | cmp -s - "$TREE/$f" && continue
+  blob=$(g hash-object --no-filters "$TREE/$f" 2>/dev/null)
+  if [ -n "$blob" ] && [[ " $ALLOWED_LAG " == *" $f=$blob "* ]]; then LAGGED="$LAGGED $f=${blob:0:8}"; continue; fi
+  stop "ОТМЕНА: общий модуль $f в бою ≠ master ${SHA:0:7}"
 done
 # Состав тоже: удалённый в master или лишний в бою общий модуль (без __pycache__/.pyc) — та же отмена.
 EXTRA=$(comm -13 <(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS | LC_ALL=C sort -u) \
   <(cd "$TREE" && for p in $SHARED_PATHS; do [ -e "$p" ] && find "$p" -type f ! -path '*/__pycache__/*' ! -name '*.pyc'; done | LC_ALL=C sort -u))
 [ -z "$EXTRA" ] || stop "ОТМЕНА: общий модуль $(echo $EXTRA) в бою ≠ master ${SHA:0:7} (в master его нет)"
-log "база ${ACC:0:7} → master ${SHA:0:7}; общие модули в бою = master"
+if [ -n "$LAGGED" ]; then
+  log "общий модуль отстаёт (разрешено):$LAGGED; master ${SHA:0:7}"
+  journal "общий модуль отстаёт (разрешено):$LAGGED"
+fi
+log "база ${ACC:0:7} → master ${SHA:0:7}; общие модули в бою = master${LAGGED:+ (кроме разрешённого отставания)}"
 
 # --- бой = принятая база по всем файлам ClubElo (иначе — чужая живая правка)
 OWN=$(own_files "$ACC") || stop "нет списка файлов ClubElo в базе ${ACC:0:7}"

@@ -30,6 +30,11 @@ PATH_LINE = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 NIGHT = "2026-09-24 01:40:00"
 DAY = "20260924"
 MAIN = "scrapers/clubelo/daily.py"
+# Разрешённое отставание (#1465): в стенде alerts.py «до #1477» — этот текст; его blob
+# подставляется в ALLOWED_LAG установленной копии (и в копию в тестовом master).
+LAG_BODY = "def telegram_on_failure(ctx): pass  # до #1477\n"
+LAG_BLOB = subprocess.run(["git", "hash-object", "--stdin"], input=LAG_BODY, capture_output=True,
+                          text=True, check=True).stdout.strip()
 
 BASE_FILES = {
     "scrapers/__init__.py": "",
@@ -76,6 +81,9 @@ class Stand:
         text = AUTO.read_text(encoding="utf-8")
         assert text.count(PATH_LINE) == 1, "автомат перестал фиксировать PATH — правь тест"
         self.installed_text = text.replace(PATH_LINE, PATH_LINE.replace("export PATH=", f"export PATH={self.stubs}:"))
+        lag = [ln for ln in text.splitlines() if ln.startswith('ALLOWED_LAG="')]
+        assert lag == ['ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008"'], lag
+        self.installed_text = self.installed_text.replace(lag[0], f'ALLOWED_LAG="dags/utils/alerts.py={LAG_BLOB}"')
         self.installed = tmp / "clubelo-auto-deliver.sh"
         self.installed.write_text(self.installed_text, encoding="utf-8")
         self.installed.chmod(0o755)
@@ -427,3 +435,38 @@ def test_check_writes_nothing(stand: Stand) -> None:
     assert not (stand.state / f"clubelo-auto-deliver-attempted-{DAY}").exists()
     assert not (stand.state / "clubelo-inflight").exists()
     assert stand.tg() == ""
+
+
+@pytest.mark.parametrize("tree_alerts, ok", [(LAG_BODY, True), ("def telegram_on_failure(ctx): 3\n", False)])
+def test_allowed_lag_of_a_shared_module(stand: Stand, tree_alerts: str, ok: bool) -> None:
+    # master ушёл вперёд по alerts.py; бой = разрешённая версия → доставка с записью в журнал,
+    # бой = третья версия → отмена, как раньше
+    (stand.tree / "dags/utils/alerts.py").write_text(tree_alerts, encoding="utf-8")
+    sha = stand.master({MAIN: "VERSION = 2\n",
+                        "dags/utils/alerts.py": "def telegram_on_failure(ctx): pass  # после #1477\n"})
+    res = stand.run()
+    if ok:
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert stand.tree_text(MAIN) == "VERSION = 2\n" and stand.accepted() == sha
+        assert f"общий модуль отстаёт (разрешено): dags/utils/alerts.py={LAG_BLOB[:8]}" in stand.log()
+        assert f"общий модуль отстаёт (разрешено): dags/utils/alerts.py={LAG_BLOB[:8]}" in (
+            stand.out / "journal.log").read_text(encoding="utf-8")
+        assert stand.tree_text("dags/utils/alerts.py") == LAG_BODY   # общий модуль не тронут
+    else:
+        assert res.returncode == 1
+        assert "ОТМЕНА: общий модуль dags/utils/alerts.py в бою ≠ master" in stand.log()
+        assert stand.tree_text(MAIN) == "VERSION = 1\n" and stand.accepted() == stand.base
+
+
+def test_tree_equal_to_master_logs_no_lag(stand: Stand) -> None:
+    stand.master({MAIN: "VERSION = 2\n"})
+    assert stand.run().returncode == 0
+    assert "отстаёт" not in stand.log() and stand.tree_text(MAIN) == "VERSION = 2\n"
+
+
+def test_allowed_lag_does_not_cover_other_shared_files(stand: Stand) -> None:
+    # blob разрешён только для alerts.py: тот же текст в другом общем модуле — отмена
+    stand.master({MAIN: "VERSION = 2\n", "dags/utils/config.py": "SCHEDULES = {1: 1}\n"})
+    (stand.tree / "dags/utils/config.py").write_text(LAG_BODY, encoding="utf-8")
+    res = stand.run()
+    assert res.returncode == 1 and "ОТМЕНА: общий модуль dags/utils/config.py в бою ≠ master" in stand.log()
