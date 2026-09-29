@@ -707,7 +707,7 @@ class TestNativeValidation:
 
         Полоса обходит ~450 скоупов под временным бюджетом: требовать закрытия
         всего каталога за один ран — значит держать гейт вечно красным, а
-        вместе с ним и trigger_silver_transform (issue #1159). Красным такой
+        вместе с ним и публикацию поколения (issue #1159). Красным такой
         ран остаётся только без единого продвижения — см. гейт раннера.
         """
 
@@ -1401,56 +1401,7 @@ class TestNativeValidation:
             mod.validate_data(str(report))
 
 
-class TestSilverDependency:
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
-        ("tables", "expected"),
-        [
-            ([], False),
-            (["iceberg.bronze.fotmob_competition_scope_observations"], False),
-            (["iceberg.bronze.fotmob_catalog_batches"], False),
-            (["iceberg.bronze.fotmob_ingest_manifest"], False),
-            (["iceberg.bronze.fotmob_matches"], True),
-            (["iceberg.bronze.fotmob_transfer_events"], True),
-        ],
-    )
-    def test_silver_gate_reads_validated_committed_inputs(
-        self, tables, expected, monkeypatch
-    ):
-        mod = _reload_dag_module()
-        monkeypatch.setattr(mod, "FOTMOB_SILVER_ENABLED", True)
-
-        class _TI:
-            def xcom_pull(self, *, task_ids):
-                assert task_ids == "validate_data"
-                return {"bronze_inputs_changed": tables}
-
-        assert mod._should_transform(ti=_TI()) is expected
-
-    @pytest.mark.unit
-    def test_silver_gate_is_closed_while_silver_is_disabled(self):
-        # #1575: Silver is off; changed Silver inputs must not trigger it.
-        from airflow.exceptions import AirflowException
-
-        from scrapers.fotmob import constants as fotmob_constants
-
-        mod = _reload_dag_module()
-        assert mod.FOTMOB_SILVER_ENABLED is False
-        assert fotmob_constants.FOTMOB_SILVER_ENABLED is False
-
-        class _TI:
-            def xcom_pull(self, *, task_ids):
-                return {"bronze_inputs_changed": ["iceberg.bronze.fotmob_matches"]}
-
-        assert mod._should_transform(ti=_TI()) is False
-
-        class _BadTI:
-            def xcom_pull(self, *, task_ids):
-                return {"bronze_inputs_changed": "iceberg.bronze.fotmob_matches"}
-
-        with pytest.raises(AirflowException, match="evidence is invalid"):
-            mod._should_transform(ti=_BadTI())
-
+class TestBronzeOnlyPublication:
     @pytest.mark.unit
     def test_validation_normalizes_changed_bronze_inputs(self, tmp_path):
         import json
@@ -1471,47 +1422,25 @@ class TestSilverDependency:
         ]
 
     @pytest.mark.unit
-    def test_existing_silver_input_set_is_complete_and_native(self):
+    def test_ingest_has_no_silver_child(self):
+        # #1590: the legacy FotMob Silver transform is removed; no gate or
+        # trigger for it may remain in the ingest graph.
         mod = _reload_dag_module()
 
-        assert mod.FOTMOB_SILVER_BRONZE_INPUTS == frozenset(
-            {
-                "iceberg.bronze.fotmob_competition_seasons",
-                "iceberg.bronze.fotmob_season_teams",
-                "iceberg.bronze.fotmob_matches",
-                "iceberg.bronze.fotmob_match_payloads",
-                "iceberg.bronze.fotmob_standings",
-                "iceberg.bronze.fotmob_leaderboards",
-                "iceberg.bronze.fotmob_squad_snapshots",
-                "iceberg.bronze.fotmob_player_snapshots",
-                "iceberg.bronze.fotmob_team_snapshots",
-                "iceberg.bronze.fotmob_transfer_events",
-            }
-        )
+        assert not hasattr(mod, "trigger_silver")
+        assert not hasattr(mod, "transform_gate")
+        assert not hasattr(mod, "TriggerDagRunOperator")
+        assert not hasattr(mod, "FOTMOB_SILVER_BRONZE_INPUTS")
+        assert not hasattr(mod, "FOTMOB_SILVER_ENABLED")
+        assert not hasattr(mod, "_should_transform")
 
     @pytest.mark.unit
-    def test_ingest_waits_for_silver_before_master_can_start_xref(self):
+    def test_bronze_only_candidate_is_the_only_seal_path(self):
         from airflow.operators.python import PythonOperator
 
         PythonOperator._instances.clear()
         mod = _reload_dag_module()
 
-        assert mod.trigger_silver._init_kwargs["wait_for_completion"] is True
-        assert mod.trigger_silver._init_kwargs["poke_interval"] == 30
-        assert mod.trigger_silver._init_kwargs["allowed_states"] == ["success"]
-        assert mod.trigger_silver._init_kwargs["failed_states"] == ["failed"]
-        assert mod.trigger_silver._init_kwargs["reset_dag_run"] is False
-        assert mod.trigger_silver._init_kwargs["logical_date"] == (
-            "{{ logical_date.isoformat() }}"
-        )
-        silver_triggers = [
-            task
-            for task in PythonOperator._instances
-            if task.task_id == "trigger_silver_transform"
-        ]
-        assert silver_triggers == [mod.trigger_silver]
-        assert mod.transform_gate._init_kwargs["ignore_downstream_trigger_rules"] is False
-        assert mod.transform_gate._init_kwargs.get("op_kwargs", {}) == {}
         bronze_candidate = next(
             task
             for task in PythonOperator._instances
@@ -1523,17 +1452,15 @@ class TestSilverDependency:
         assert bronze_candidate.upstream_task_ids == {"validate_data"}
         assert bronze_candidate._init_kwargs["op_kwargs"] == {
             "validation_task_id": "validate_data",
-            "silver_input_tables": sorted(mod.FOTMOB_SILVER_BRONZE_INPUTS),
-            "silver_enabled": mod.FOTMOB_SILVER_ENABLED,
         }
         assert mod.seal_publication.upstream_task_ids == {
             "record_bronze_only_publication_candidate",
-            "trigger_silver_transform",
         }
         assert mod.seal_publication._init_kwargs["trigger_rule"] == (
             "none_failed_min_one_success"
         )
-        # The Silver child is synchronous and failed DQ is explicitly a failed
-        # state, so the seal cannot publish readiness after DQ failure.
-        assert mod.trigger_silver._init_kwargs["failed_states"] == ["failed"]
+        assert mod.finalize_publication._init_kwargs["op_kwargs"] == {
+            "success_task_id": "seal_fotmob_publication_ready",
+            "writer_task_ids": ["scrape_fotmob_data"],
+        }
         assert mod.finalize_publication._init_kwargs["trigger_rule"] == "all_done"

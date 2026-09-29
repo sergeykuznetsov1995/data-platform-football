@@ -140,13 +140,6 @@ def _scheduled_observation_payload(
                 "generation_id": generation_id,
                 "state": "success",
             },
-            "silver": {
-                "dag_id": "dag_transform_fotmob_silver",
-                "run_id": f"fotmob_silver__{generation_id}",
-                "ingest_run_id": f"fotmob_orchestrated__{generation_id}",
-                "generation_id": generation_id,
-                "state": "success",
-            },
             "sofascore": {
                 "dag_id": "dag_sofascore_pipeline",
                 "run_id": "sofa-1",
@@ -267,7 +260,7 @@ def test_apply_rejects_tampered_report_or_live_observation_drift(tmp_path):
         scheduled_observation_report=observation_path,
     )
     payload = json.loads(observation_path.read_text(encoding="utf-8"))
-    payload["runs"]["silver"]["run_id"] = "tampered"
+    payload["runs"]["ingest"]["run_id"] = "tampered"
     observation_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(
         mod.PurgeRefused,
@@ -336,7 +329,7 @@ def test_production_observation_requeries_exact_isolated_and_shared_containers(t
     assert "choose_fotmob_lane" in isolated_script
     assert "attest_isolated_runtime" in isolated_script
     assert "dag_ingest_fotmob" in isolated_script
-    assert "dag_transform_fotmob_silver" in isolated_script
+    assert "dag_transform_fotmob_silver" not in isolated_script
     assert "dag_sofascore_pipeline" in shared_script
     assert "finalize_fotmob_publication" in shared_script
     assert "ControlStore" in isolated_script
@@ -441,7 +434,6 @@ def test_generated_scheduled_observation_scripts_execute_exact_lineage(
 
     owner_run_id = observation.runs["owner"]["run_id"]
     ingest_run_id = observation.runs["ingest"]["run_id"]
-    silver_run_id = observation.runs["silver"]["run_id"]
     sofa_run_id = observation.runs["sofascore"]["run_id"]
     start = datetime.fromisoformat(binding["data_interval_start"])
     end = datetime.fromisoformat(binding["data_interval_end"])
@@ -475,15 +467,6 @@ def test_generated_scheduled_observation_scripts_execute_exact_lineage(
             DagRun,
             dag_id="dag_ingest_fotmob",
             run_id=ingest_run_id,
-            state="success",
-            run_type="manual",
-            start_date=end,
-            conf={"fotmob_publication": {"generation_id": observation.generation_id, "binding": binding}},
-        ),
-        row(
-            DagRun,
-            dag_id="dag_transform_fotmob_silver",
-            run_id=silver_run_id,
             state="success",
             run_type="manual",
             start_date=end,
@@ -1329,7 +1312,6 @@ def test_plan_refuses_any_active_new_or_legacy_writer(active):
     [
         "dag_orchestrate_fotmob",
         "dag_ingest_fotmob",
-        "dag_transform_fotmob_silver",
         "dag_iceberg_maintenance",
         "dag_iceberg_maintenance_daily",
     ],
@@ -2171,13 +2153,3 @@ def test_cli_expired_empty_journal_recovers_and_releases_journaled_fence(
     assert called is True
     assert backend.apply_fence is None
     assert json.loads(journal_path.read_text())["apply_fence_generation_id"] is None
-
-
-@pytest.fixture(autouse=True)
-def _silver_enabled_contract(monkeypatch):
-    """#1575: tests above pin the Silver-enabled contract; the disabled
-    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
-
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)

@@ -743,7 +743,6 @@ def test_deployed_runtime_rejects_legacy_owner_admission(monkeypatch, tmp_path):
                 "activation_state": "active",
                 "unpaused": [
                     "dag_ingest_fotmob",
-                    "dag_transform_fotmob_silver",
                     "dag_trigger_fotmob_daily",
                 ],
                 "paused": [],
@@ -1075,7 +1074,7 @@ def test_yesterdays_green_refresh_does_not_settle_todays_guarantee(monkeypatch):
 
 
 def test_long_running_wave_keeps_its_pause_whatever_its_age(monkeypatch):
-    """Жёсткий таймаут накрывает только scrape_fotmob_data — дальше ран ждёт Silver.
+    """Жёсткий таймаут накрывает только scrape_fotmob_data — дальше ран ждёт публикацию.
 
     Возрастом старта паузу ограничивать нечем: волна, начатая вчера в 14:00 и
     упавшая сегодня в 06:00, обязана держать паузу до 06:30.

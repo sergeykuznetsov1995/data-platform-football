@@ -2,7 +2,7 @@
 """Deploy and admit the isolated FotMob Airflow stack.
 
 Admission is deliberately fail-closed: the scheduler must be healthy, its
-DagBag must contain exactly the seven FotMob DAGs, and import errors must be empty
+DagBag must contain exactly the six FotMob DAGs, and import errors must be empty
 before any DAG is unpaused.  A JSON report is written for every attempt.
 """
 
@@ -38,7 +38,6 @@ EXPECTED_DAGS = frozenset(
     {
         "dag_orchestrate_fotmob",
         "dag_ingest_fotmob",
-        "dag_transform_fotmob_silver",
         "dag_trigger_fotmob_daily",
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
@@ -48,7 +47,6 @@ EXPECTED_DAGS = frozenset(
 EXPECTED_DAG_FILES = {
     "dag_orchestrate_fotmob": "/opt/airflow/dags/dag_orchestrate_fotmob.py",
     "dag_ingest_fotmob": "/opt/airflow/dags/dag_ingest_fotmob.py",
-    "dag_transform_fotmob_silver": ("/opt/airflow/dags/dag_transform_fotmob_silver.py"),
     "dag_trigger_fotmob_daily": "/opt/airflow/dags/dag_trigger_fotmob_daily.py",
     "dag_refresh_fotmob": "/opt/airflow/dags/dag_refresh_fotmob.py",
     "dag_backfill_fotmob": "/opt/airflow/dags/dag_backfill_fotmob.py",
@@ -59,7 +57,6 @@ EXPECTED_DAG_FILES = {
 EXPECTED_SCHEDULES = {
     "dag_orchestrate_fotmob": "*/5 * * * *",
     "dag_ingest_fotmob": "None",
-    "dag_transform_fotmob_silver": "None",
     "dag_trigger_fotmob_daily": "None",
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
@@ -75,7 +72,7 @@ LEGACY_OWNER_DAGS = frozenset(
     }
 )
 AUTOMATIC_ACTIVE_DAGS = frozenset(
-    {AUTOMATIC_OWNER_DAG_ID, "dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+    {AUTOMATIC_OWNER_DAG_ID, "dag_ingest_fotmob"}
 )
 AUTOMATIC_CANARY_SCHEMA = "fotmob-automatic-canary-v1"
 AUTOMATIC_ROLLOUT_SCHEMA = "fotmob-automatic-rollout-v1"
@@ -148,7 +145,6 @@ SHARED_RUNTIME_SUFFIXES = (
 ISOLATED_DAG_ROOT_PATHS = {
     "dags/dag_orchestrate_fotmob.py",
     "dags/dag_ingest_fotmob.py",
-    "dags/dag_transform_fotmob_silver.py",
     "dags/dag_trigger_fotmob_daily.py",
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
@@ -179,13 +175,8 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/dag_transform_e3.py",
     "dags/dag_transform_e4.py",
     "dags/dag_transform_fbref_gold.py",
-    "dags/dag_transform_fotmob_silver.py",
     "dags/dag_transform_xref.py",
     "dags/scripts/run_fotmob_scraper.py",
-    "dags/sql/silver/fotmob_keeper_profile.sql",
-    "dags/sql/silver/fotmob_manager_profile.sql",
-    "dags/sql/silver/fotmob_player_profile.sql",
-    "dags/sql/silver/fotmob_player_season_profile.sql",
     "dags/sql/silver/xref_manager.sql.j2",
     "dags/utils/fotmob_publication.py",
     "dags/utils/fotmob_orchestration.py",
@@ -318,11 +309,6 @@ def load_automatic_canary_report(
         or binding.get("runtime_fingerprint") != deployment.get("git_sha")
         or publication.get("generation_id") != payload.get("generation_id")
         or payload.get("ingest_run_state") != "success"
-        # #1575: no Silver child exists while Silver is switched off.
-        or payload.get("silver_run_state")
-        not in (
-            {"success"} if runtime_binding.fotmob_silver_enabled() else {"success", ""}
-        )
         or not isinstance(final_publication, Mapping)
         or final_publication.get("generation_id") != payload.get("generation_id")
         or final_publication.get("phase") != "abandoned"
@@ -348,7 +334,7 @@ def build_automatic_catalog_admission(
 
     candidate = canary.get("candidate")
     if not isinstance(candidate, Mapping):
-        raise DeploymentError("automatic canary has no Silver candidate")
+        raise DeploymentError("automatic canary has no Bronze candidate")
     if any(
         canary.get(key) != deployment.get(key)
         for key in ("deployment_id", "git_sha", "scheduler_container_id")
@@ -378,7 +364,6 @@ def build_automatic_catalog_admission(
             "scheduler_container_id": canary["scheduler_container_id"],
             "generation_id": canary["generation_id"],
             "ingest_run_state": canary["ingest_run_state"],
-            "silver_run_state": canary["silver_run_state"],
             "candidate_digest": canary["candidate_digest"],
             "runner_report_sha256": canary["runner_report_sha256"],
             "publication": dict(canary["publication"]),
@@ -714,8 +699,6 @@ def prepare_dagbag(release_root: Path, evidence_dir: Path, sha: str) -> Path:
         "dag_orchestrate_fotmob.py": release_root
         / "dags/dag_orchestrate_fotmob.py",
         "dag_ingest_fotmob.py": release_root / "dags/dag_ingest_fotmob.py",
-        "dag_transform_fotmob_silver.py": release_root
-        / "dags/dag_transform_fotmob_silver.py",
         "dag_trigger_fotmob_daily.py": release_root
         / "dags/dag_trigger_fotmob_daily.py",
         "dag_refresh_fotmob.py": release_root / "dags/dag_refresh_fotmob.py",
@@ -966,7 +949,6 @@ from scrapers.fbref.control import ControlStore
 s = Session()
 expected = {{
     'dag_ingest_fotmob': {str(canary.get('ingest_run_id'))!r},
-    'dag_transform_fotmob_silver': {str(canary.get('silver_run_id'))!r},
 }}
 rows = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
     DagRun.dag_id.in_(tuple(expected)), DagRun.run_id.in_(tuple(expected.values()))
@@ -1004,14 +986,6 @@ print({marker!r} + json.dumps(payload, default=str, sort_keys=True))
     expected_runs = {
         ("dag_ingest_fotmob", str(canary.get("ingest_run_id")), "success"),
     }
-    # #1575: a bronze-only canary (Silver switched off) has no Silver run.
-    if (
-        runtime_binding.fotmob_silver_enabled()
-        or canary.get("silver_run_state") == "success"
-    ):
-        expected_runs.add(
-            ("dag_transform_fotmob_silver", str(canary.get("silver_run_id")), "success")
-        )
     observed_runs = {
         (str(item.get("dag_id")), str(item.get("run_id")), str(item.get("state")))
         for item in payload.get("runs") or ()
@@ -1058,7 +1032,7 @@ def atomic_automatic_writer_transition(
     selected_date: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
-    """Validate and update all seven DagModel rows in one metadata transaction."""
+    """Validate and update all six DagModel rows in one metadata transaction."""
 
     if phase not in {"children", "owner", "pause_all"}:
         raise DeploymentError("unknown automatic writer transition")
@@ -1089,7 +1063,7 @@ try:
     models = s.query(DagModel).filter(DagModel.dag_id.in_(ids)).with_for_update().all()
     by_id = {{model.dag_id: model for model in models}}
     if set(by_id) != set(ids):
-        raise RuntimeError('exact seven DagModel rows are required')
+        raise RuntimeError('exact six DagModel rows are required')
     run_rows = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
         DagRun.dag_id.in_(ids), DagRun.state.in_(('running', 'queued'))
     ).with_for_update().all()
@@ -1136,18 +1110,18 @@ try:
             raise RuntimeError('FotMob scheduler state blocks first automatic daily')
     all_paused = all(before.values())
     children_shape = all(
-        before[dag_id] is (dag_id not in {{'dag_ingest_fotmob', 'dag_transform_fotmob_silver'}})
+        before[dag_id] is (dag_id not in {{'dag_ingest_fotmob'}})
         for dag_id in ids
     )
     if phase == 'children' and not all_paused:
-        raise RuntimeError('children transition requires all seven paused')
+        raise RuntimeError('children transition requires all six paused')
     if phase == 'owner' and not children_shape:
         raise RuntimeError('owner transition has unexpected pause shape')
     for dag_id, model in by_id.items():
         if phase == 'pause_all':
             model.is_paused = True
         elif phase == 'children':
-            model.is_paused = dag_id not in {{'dag_ingest_fotmob', 'dag_transform_fotmob_silver'}}
+            model.is_paused = dag_id not in {{'dag_ingest_fotmob'}}
         else:
             model.is_paused = dag_id in set(legacy_ids)
     s.flush()
@@ -1201,7 +1175,7 @@ def inspect_automatic_writer_pause_shape(
     expected_paused: set[str] | None,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
-    """Read all seven live DagModel rows without trusting the report snapshot."""
+    """Read all six live DagModel rows without trusting the report snapshot."""
 
     if expected_paused is not None and not expected_paused.issubset(EXPECTED_DAGS):
         raise DeploymentError("automatic writer pause expectation is invalid")
@@ -1984,8 +1958,7 @@ def _continue_pending_consumer_activation(
         raise DeploymentError("pending activation has no schedule boundary proof")
     boundary = boundary_proof.get("isolated_commit")
     try:
-        for dag_id in ("dag_ingest_fotmob", "dag_transform_fotmob_silver"):
-            _docker_unpause(isolated_container, dag_id, run=run)
+        _docker_unpause(isolated_container, "dag_ingest_fotmob", run=run)
         _docker_unpause(isolated_container, ISOLATED_DAILY_DAG_ID, run=run)
         _docker_unpause(shared_container, SHARED_CONSUMER_DAG_ID, run=run)
         activation = poll_exact_scheduled_handoff(
@@ -2546,7 +2519,6 @@ pause_ids = (
     'dag_master_pipeline',
     'dag_sofascore_pipeline',
     'dag_ingest_fotmob',
-    'dag_transform_fotmob_silver',
 )
 active_ids = (
     *pause_ids,
@@ -2829,7 +2801,6 @@ s.close()
         "dag_master_pipeline": True,
         "dag_sofascore_pipeline": True,
         "dag_ingest_fotmob": True,
-        "dag_transform_fotmob_silver": True,
     }
     if (
         not isinstance(pause_states, Mapping)
@@ -2837,7 +2808,7 @@ s.close()
         != expected_pause_states
     ):
         raise DeploymentError(
-            "shared orchestration must keep master/SofaScore/ingest/Silver paused"
+            "shared orchestration must keep master/SofaScore/ingest paused"
         )
     sofascore_schedule_boundary = validate_schedule_boundary(
         orchestration.get("sofascore_schedule_boundary"),
@@ -2886,7 +2857,6 @@ s.close()
             "dag_master_pipeline",
             "dag_sofascore_pipeline",
             "dag_ingest_fotmob",
-            "dag_transform_fotmob_silver",
             "dag_transform_xref",
             "dag_transform_e3",
             "dag_transform_e4",
@@ -2970,7 +2940,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--automatic-catalog",
         action="store_true",
-        help="Prepare the seven-DAG automatic catalog rollout (must stay paused)",
+        help="Prepare the six-DAG automatic catalog rollout (must stay paused)",
     )
     parser.add_argument(
         "--activate-automatic",
@@ -3799,7 +3769,6 @@ def deploy(
         if not args.keep_paused:
             for dag_id in (
                 "dag_ingest_fotmob",
-                "dag_transform_fotmob_silver",
             ):
                 airflow("dags", "unpause", dag_id)
             assert_paused({"dag_trigger_fotmob_daily"})
@@ -4224,7 +4193,7 @@ def activate_automatic_catalog(
 
             children_pause_shape = {
                 dag_id: dag_id
-                not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+                not in {"dag_ingest_fotmob"}
                 for dag_id in sorted(EXPECTED_DAGS)
             }
             if resume_snapshot["pause_states"] == children_pause_shape:

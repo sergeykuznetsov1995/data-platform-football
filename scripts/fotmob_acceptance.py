@@ -81,20 +81,8 @@ ISSUE_930_SCOPE_ENTITIES = (
 )
 PUBLICATION_OWNER_DAG_ID = "fotmob_issue_930_backfill"
 INGEST_DAG_ID = "dag_ingest_fotmob"
-SILVER_DAG_ID = "dag_transform_fotmob_silver"
 PUBLICATION_SCHEMA = "fotmob-publication-v1"
-LIVE_CANDIDATE_FIELDS = frozenset(
-    {
-        "schema",
-        "generation_id",
-        "digest",
-        "transform_task_ids",
-        "transform_results",
-        "row_count_gate",
-        "quality_gate",
-    }
-)
-# #1575: candidate sealed by ingest while Silver is switched off.
+# The only candidate kind: sealed by ingest from validated Bronze (#1590).
 BRONZE_ONLY_CANDIDATE_FIELDS = frozenset(
     {
         "schema",
@@ -240,7 +228,6 @@ class AcceptanceLineage:
     generation_id: str
     runner_run_id: str
     ingest_run_id: str
-    silver_run_id: str
     plan_signature: str
     completed_since: str
     scope_artifact: str
@@ -248,7 +235,6 @@ class AcceptanceLineage:
     scope_count: int
     entities: tuple[str, ...]
     candidate_digest: str
-    candidate_transform_task_ids: tuple[str, ...]
     publication_binding: Mapping[str, str]
 
     def summary(self) -> dict[str, Any]:
@@ -266,7 +252,6 @@ class AcceptanceLineage:
             "generation_id": self.generation_id,
             "runner_run_id": self.runner_run_id,
             "ingest_run_id": self.ingest_run_id,
-            "silver_run_id": self.silver_run_id,
             "plan_signature": self.plan_signature,
             "completed_since": self.completed_since,
             "scope": {
@@ -276,7 +261,6 @@ class AcceptanceLineage:
             },
             "entities": list(self.entities),
             "candidate_digest": self.candidate_digest,
-            "candidate_transform_task_ids": list(self.candidate_transform_task_ids),
             "publication_binding": dict(self.publication_binding),
         }
 
@@ -709,8 +693,6 @@ def load_lifecycle_report(
     expected_runs = {
         "ingest_dag_id": INGEST_DAG_ID,
         "ingest_run_id": (f"issue930_{mode}_a{attempt}__{compact_generation}"),
-        "silver_dag_id": SILVER_DAG_ID,
-        "silver_run_id": f"fotmob_silver__{generation_id}",
         "native_runner_run_id": generation_id,
     }
     runs = _mapping(payload.get("runs"), field="runs")
@@ -718,27 +700,10 @@ def load_lifecycle_report(
         raise ValueError("lifecycle DAG and native runner identities differ")
 
     ingest_terminal = _mapping(payload.get("ingest_terminal"), field="ingest_terminal")
-    # #1575: with Silver switched off the lifecycle has no Silver child.
-    bronze_only = (
-        payload.get("silver_terminal") is None
-        and not runtime_binding.fotmob_silver_enabled()
-    )
-    if bronze_only:
-        silver_exact = True
-    else:
-        silver_terminal = _mapping(
-            payload.get("silver_terminal"), field="silver_terminal"
-        )
-        silver_exact = (
-            silver_terminal.get("dag_id") == SILVER_DAG_ID
-            and silver_terminal.get("run_id") == expected_runs["silver_run_id"]
-            and str(silver_terminal.get("state") or "").casefold() == "success"
-        )
     if (
         ingest_terminal.get("dag_id") != INGEST_DAG_ID
         or ingest_terminal.get("run_id") != expected_runs["ingest_run_id"]
         or str(ingest_terminal.get("state") or "").casefold() != "success"
-        or not silver_exact
     ):
         raise ValueError("lifecycle terminal DAG run identities are not exact")
     completed_at, completed_since = _timestamp(
@@ -769,28 +734,13 @@ def load_lifecycle_report(
         set(candidate) != {"generation_id", "digest", "transform_task_ids"}
         or candidate.get("generation_id") != generation_id
         or re.fullmatch(r"[0-9a-f]{64}", candidate_digest) is None
-        or (bronze_only and transform_task_ids is not None)
-        or (
-            not bronze_only
-            and (
-                not isinstance(transform_task_ids, list)
-                or not transform_task_ids
-                or any(
-                    not isinstance(item, str) or not item
-                    for item in transform_task_ids
-                )
-                or len(set(transform_task_ids)) != len(transform_task_ids)
-                or transform_task_ids != sorted(transform_task_ids)
-            )
-        )
+        or transform_task_ids is not None
     ):
-        raise ValueError("lifecycle Silver candidate identity is invalid")
+        raise ValueError("lifecycle bronze-only candidate identity is invalid")
     normalized_candidate = {
         "generation_id": generation_id,
         "digest": candidate_digest,
-        "transform_task_ids": (
-            None if bronze_only else list(transform_task_ids)
-        ),
+        "transform_task_ids": None,
     }
     publication_state = _mapping(
         payload.get("publication_state"), field="publication_state"
@@ -820,7 +770,6 @@ def load_lifecycle_report(
         generation_id=generation_id,
         runner_run_id=generation_id,
         ingest_run_id=expected_runs["ingest_run_id"],
-        silver_run_id=expected_runs["silver_run_id"],
         plan_signature=plan_signature,
         completed_since=completed_since,
         scope_artifact=expected_scope["artifact"],
@@ -828,9 +777,6 @@ def load_lifecycle_report(
         scope_count=APPROVED_SCOPE_COUNT,
         entities=ISSUE_930_SCOPE_ENTITIES,
         candidate_digest=candidate_digest,
-        candidate_transform_task_ids=(
-            () if bronze_only else tuple(transform_task_ids)
-        ),
         publication_binding=expected_binding,
     )
 
@@ -933,114 +879,9 @@ def validate_live_publication_state(
 def _validate_live_candidate(
     value: Any, lineage: AcceptanceLineage
 ) -> Mapping[str, Any]:
-    """Validate the complete immutable Silver candidate stored in ControlStore."""
+    """Validate the immutable bronze-only candidate stored in ControlStore."""
 
     candidate = _mapping(value, field="live publication candidate")
-    if (
-        not lineage.candidate_transform_task_ids
-        and not runtime_binding.fotmob_silver_enabled()
-    ):
-        return _validate_live_bronze_only_candidate(candidate, lineage)
-    if set(candidate) != LIVE_CANDIDATE_FIELDS:
-        raise ValueError("live publication candidate fields are not exact")
-    task_ids = candidate.get("transform_task_ids")
-    expected_task_ids = list(lineage.candidate_transform_task_ids)
-    if (
-        candidate.get("schema") != PUBLICATION_SCHEMA
-        or candidate.get("generation_id") != lineage.generation_id
-        or candidate.get("digest") != lineage.candidate_digest
-        or task_ids != expected_task_ids
-    ):
-        raise ValueError("live publication candidate identity differs from lifecycle")
-
-    transform_results = _mapping(
-        candidate.get("transform_results"),
-        field="live publication candidate.transform_results",
-    )
-    if set(transform_results) != set(expected_task_ids) or any(
-        not isinstance(result, Mapping) or result.get("status") != "success"
-        for result in transform_results.values()
-    ):
-        raise ValueError("live publication candidate transform evidence is not exact")
-
-    row_gate = _mapping(
-        candidate.get("row_count_gate"),
-        field="live publication candidate.row_count_gate",
-    )
-    total_rows = row_gate.get("total_rows")
-    row_details = row_gate.get("details")
-    if (
-        row_gate.get("status") != "success"
-        or row_gate.get("warnings") != []
-        or not isinstance(row_details, Mapping)
-        or not row_details
-        or any(
-            not isinstance(table, str) or not table or type(rows) is not int or rows < 0
-            for table, rows in row_details.items()
-        )
-        or type(total_rows) is not int
-        or total_rows < 0
-        or total_rows != sum(row_details.values())
-    ):
-        raise ValueError("live publication candidate row-count gate is not clean")
-
-    quality_gate = _mapping(
-        candidate.get("quality_gate"),
-        field="live publication candidate.quality_gate",
-    )
-    passed = quality_gate.get("passed")
-    total = quality_gate.get("total")
-    warnings = quality_gate.get("warnings")
-    errors = quality_gate.get("errors")
-    # #1312: пока silver заморожен (``SILVER_DQ_BLOCKING = False`` в
-    # dags/utils/fotmob_publication.py), гейт помечает себя ``blocking: False``
-    # и ошибки DQ допустимы — они обязаны быть перечислены в ``errors``.
-    # Без явного ``blocking: False`` действует прежнее правило «ошибок нет».
-    non_blocking = quality_gate.get("blocking") is False
-    if (
-        (errors != [] and not non_blocking)
-        or not isinstance(errors, list)
-        or any(not isinstance(item, str) or not item for item in errors)
-        or not isinstance(warnings, list)
-        or any(not isinstance(item, str) or not item for item in warnings)
-        or type(passed) is not int
-        or type(total) is not int
-        or passed < 0
-        or total <= 0
-        or passed > total
-        or total != passed + len(warnings) + len(errors)
-    ):
-        raise ValueError("live publication candidate quality gate is not clean")
-
-    unsigned = {
-        key: candidate[key] for key in sorted(LIVE_CANDIDATE_FIELDS - {"digest"})
-    }
-    try:
-        observed_digest = hashlib.sha256(
-            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("live publication candidate is not canonical JSON") from exc
-    if observed_digest != lineage.candidate_digest:
-        raise ValueError("live publication candidate digest differs from lifecycle")
-    return {
-        "schema": PUBLICATION_SCHEMA,
-        "generation_id": lineage.generation_id,
-        "digest": observed_digest,
-        "transform_task_ids": expected_task_ids,
-        "transform_count": len(expected_task_ids),
-        "row_count_status": "success",
-        "row_count_total": total_rows,
-        "quality_passed": passed,
-        "quality_total": total,
-    }
-
-
-def _validate_live_bronze_only_candidate(
-    candidate: Mapping[str, Any], lineage: AcceptanceLineage
-) -> Mapping[str, Any]:
-    """#1575: validate the bronze-only candidate sealed while Silver is off."""
-
     if set(candidate) != BRONZE_ONLY_CANDIDATE_FIELDS:
         raise ValueError("live bronze-only candidate fields are not exact")
     validated = candidate.get("validated_bronze")
@@ -2387,50 +2228,12 @@ def _scope_parity_checks(
     return checks
 
 
-def _transfer_preservation_check(
-    client: QueryClient,
-    *,
-    catalog: str,
-    bronze_schema: str,
-    silver_schema: str,
-) -> Mapping[str, Any]:
-    def q_bronze(table: str) -> str:
-        return _qualified(catalog, bronze_schema, table)
-
-    legacy_sql = f"""-- parity:transfers:legacy
-        SELECT DISTINCT CAST(player_id AS VARCHAR),
-               CAST(from_club_id AS VARCHAR), CAST(to_club_id AS VARCHAR),
-               CAST(TRY_CAST(SUBSTR(transfer_date, 1, 10) AS DATE) AS VARCHAR),
-               CAST(league AS VARCHAR)
-        FROM {q_bronze("fotmob_transfers")}
-        WHERE player_id IS NOT NULL
-          AND TRY_CAST(SUBSTR(transfer_date, 1, 10) AS DATE) IS NOT NULL
-    """
-    silver_sql = f"""-- parity:transfers:silver
-        SELECT DISTINCT CAST(player_id AS VARCHAR),
-               CAST(from_club_id AS VARCHAR), CAST(to_club_id AS VARCHAR),
-               CAST(transfer_date AS VARCHAR), CAST(league AS VARCHAR)
-        FROM {_qualified(catalog, silver_schema, "fotmob_transfers")}
-        WHERE player_id IS NOT NULL AND transfer_date IS NOT NULL
-    """
-    return _set_comparison(
-        client,
-        name="legacy transfer identity preservation",
-        native_sql=silver_sql,
-        legacy_sql=legacy_sql,
-        width=5,
-        minimum_overlap=1.0,
-        allow_native_extras=True,
-    )
-
-
 def parity(
     client: QueryClient,
     scopes: Sequence[Scope],
     *,
     catalog: str,
     bronze_schema: str,
-    silver_schema: str,
     parser_version: str,
     lineage: AcceptanceLineage,
 ) -> dict[str, Any]:
@@ -2463,17 +2266,6 @@ def parity(
                 bronze_schema=bronze_schema,
             )
         )
-    checks.append(
-        _run_check(
-            "silver_transfer_legacy_identity_preservation",
-            lambda: _transfer_preservation_check(
-                client,
-                catalog=catalog,
-                bronze_schema=bronze_schema,
-                silver_schema=silver_schema,
-            ),
-        )
-    )
     report = _report("parity", scopes, checks, parser_version=parser_version)
     report["plan_signature"] = plan_signature
     report["completed_since"] = completed_since
@@ -2566,7 +2358,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--catalog", default="iceberg")
     parser.add_argument("--bronze-schema", default="bronze")
-    parser.add_argument("--silver-schema", default="silver")
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument(
         "--trino-env-file",
@@ -2670,7 +2461,6 @@ def main(
                     scopes,
                     catalog=args.catalog,
                     bronze_schema=args.bronze_schema,
-                    silver_schema=args.silver_schema,
                     parser_version=args.parser_version,
                     lineage=lineage,
                 )

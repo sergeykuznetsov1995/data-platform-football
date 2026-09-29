@@ -108,7 +108,6 @@ def test_writer_fence_covers_automatic_owner_and_all_manual_legacy_owners():
     assert set(mod.DAGS) == {
         "dag_orchestrate_fotmob",
         "dag_ingest_fotmob",
-        "dag_transform_fotmob_silver",
         "dag_trigger_fotmob_daily",
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
@@ -136,9 +135,12 @@ def test_writer_fence_rejects_any_active_owner(dag_id):
 
 def _candidate() -> dict:
     return {
+        "schema": "fotmob-publication-v1",
         "generation_id": GENERATION_ID,
+        "candidate_kind": "bronze_only",
+        "validation_task_id": "validate_data",
+        "validated_bronze": {"status": "success"},
         "digest": "d" * 64,
-        "transform_task_ids": ["transform_a", "transform_b"],
     }
 
 
@@ -210,7 +212,6 @@ def _prerequisite_report(tmp_path: Path) -> dict:
         "publication": publication,
         "runs": runs,
         "ingest_terminal": {"run_id": runs["ingest_run_id"], "state": "failed"},
-        "silver_terminal": None,
         "publication_state": {
             "generation_id": publication["generation_id"],
             "status": "failed",
@@ -325,12 +326,8 @@ def test_success_triggers_only_parent_and_abandons_exact_candidate(
     )
 
     def exact(_args, dag_id, run_id, **_kwargs):
-        expected = (
-            f"issue930_backfill_a1__{GENERATION_ID.replace('-', '')}"
-            if dag_id == mod.INGEST_DAG_ID
-            else f"fotmob_silver__{GENERATION_ID}"
-        )
-        assert run_id == expected
+        assert dag_id == mod.INGEST_DAG_ID
+        assert run_id == f"issue930_backfill_a1__{GENERATION_ID.replace('-', '')}"
         return {"run_id": run_id, "state": "success"}
 
     monkeypatch.setattr(mod, "_exact_run", exact)
@@ -368,9 +365,8 @@ def test_success_triggers_only_parent_and_abandons_exact_candidate(
     trigger_calls = [call for call in calls if call[:2] == ("dags", "trigger")]
     assert len(trigger_calls) == 1
     assert trigger_calls[0][2] == mod.INGEST_DAG_ID
-    assert all(
-        not (call[:2] == ("dags", "trigger") and call[2] == mod.SILVER_DAG_ID)
-        for call in calls
+    assert not any(
+        "dag_transform_fotmob_silver" in call for call in calls
     )
     assert ("dags", "unpause", mod.DAILY_DAG_ID) not in calls
     conf = json.loads(trigger_calls[0][trigger_calls[0].index("--conf") + 1])
@@ -688,7 +684,11 @@ def test_acquire_response_loss_persists_exact_recovery_identity(tmp_path, monkey
     assert report["phase"] == "acquire_ambiguous"
     assert report["recovery_required"] is True
     assert durable["publication"]["generation_id"] == GENERATION_ID
-    assert durable["runs"]["silver_run_id"] == f"fotmob_silver__{GENERATION_ID}"
+    assert set(durable["runs"]) == {
+        "ingest_dag_id",
+        "ingest_run_id",
+        "native_runner_run_id",
+    }
     assert not calls
 
 
@@ -1304,40 +1304,13 @@ def test_nonpositive_attempt_fails_before_any_external_action(tmp_path, monkeypa
     assert called is False
 
 
-@pytest.fixture(autouse=True)
-def _silver_enabled_contract(monkeypatch):
-    """#1575: tests above pin the Silver-enabled contract; the disabled
-    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
-
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
-
-
-def _bronze_only_state(phase: str) -> dict:
-    state = _state(phase)
-    state["candidate"] = {
-        "schema": "fotmob-publication-v1",
-        "generation_id": GENERATION_ID,
-        "candidate_kind": "bronze_only",
-        "validation_task_id": "validate_data",
-        "validated_bronze": {"status": "success"},
-        "digest": "b" * 64,
-    }
-    return state
-
-
 def _wire_bronze_only_recovery(monkeypatch, tmp_path, *, candidate_state):
     calls: list[tuple] = []
     arguments = _wire_recovery(monkeypatch, tmp_path, calls, "ready_pending_abandon")
     monkeypatch.setattr(
         mod,
         "_exact_run",
-        lambda _args, dag_id, run_id, **_kw: (
-            None
-            if dag_id == mod.SILVER_DAG_ID
-            else {"run_id": run_id, "state": "success"}
-        ),
+        lambda _args, dag_id, run_id, **_kw: {"run_id": run_id, "state": "success"},
     )
     monkeypatch.setattr(mod, "_get_publication", lambda *_a, **_kw: candidate_state)
     monkeypatch.setattr(mod, "_validation_xcom", lambda *_args, **_kw: _validation())
@@ -1349,13 +1322,10 @@ def _wire_bronze_only_recovery(monkeypatch, tmp_path, *, candidate_state):
     return arguments
 
 
-def test_recovery_silver_disabled_accepts_bronze_only_generation(tmp_path, monkeypatch):
-    # #1575: ingest success without a Silver child is green while Silver is off.
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+def test_recovery_accepts_bronze_only_generation(tmp_path, monkeypatch):
+    # #1590: ingest success seals a bronze-only candidate; no Silver child exists.
     arguments = _wire_bronze_only_recovery(
-        monkeypatch, tmp_path, candidate_state=_bronze_only_state("abandoned")
+        monkeypatch, tmp_path, candidate_state=_state("abandoned")
     )
 
     report = mod.recover_backfill(arguments)
@@ -1365,26 +1335,17 @@ def test_recovery_silver_disabled_accepts_bronze_only_generation(tmp_path, monke
     assert report["candidate"]["transform_task_ids"] is None
 
 
-def test_recovery_silver_disabled_rejects_silver_candidate_without_silver_run(
-    tmp_path, monkeypatch
-):
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
+def test_recovery_rejects_legacy_silver_candidate(tmp_path, monkeypatch):
+    state = _state("abandoned")
+    state["candidate"] = {
+        "generation_id": GENERATION_ID,
+        "digest": "d" * 64,
+        "transform_task_ids": ["transform_a", "transform_b"],
+    }
     arguments = _wire_bronze_only_recovery(
-        monkeypatch, tmp_path, candidate_state=_state("abandoned")
+        monkeypatch, tmp_path, candidate_state=state
     )
 
     report = mod.recover_backfill(arguments)
     assert report["passed"] is False
     assert "not bronze-only" in str(report.get("error"))
-
-
-def test_recovery_silver_enabled_requires_silver_child(tmp_path, monkeypatch):
-    arguments = _wire_bronze_only_recovery(
-        monkeypatch, tmp_path, candidate_state=_bronze_only_state("abandoned")
-    )
-
-    report = mod.recover_backfill(arguments)
-    assert report["passed"] is False
-    assert "no successful exact Silver child" in str(report.get("error"))

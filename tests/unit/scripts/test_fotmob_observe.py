@@ -121,18 +121,7 @@ def _isolated_snapshot() -> dict:
                         "conf": {**decision_conf, "fotmob_publication": publication},
                     }
                 ],
-                "ingest_trigger_states": ["success"],
                 "ingest_active_tasks": [],
-                "silver_runs": [
-                    {
-                        "dag_id": mod.SILVER_DAG_ID,
-                        "run_id": f"fotmob_silver__{_generation_id()}",
-                        "run_type": "manual",
-                        "state": "success",
-                        "conf": {"fotmob_publication": publication},
-                    }
-                ],
-                "silver_active_tasks": [],
                 "publication": {
                     **publication,
                     "source": "fotmob",
@@ -183,7 +172,7 @@ def _shared_snapshot() -> dict:
 
 
 def _later_complete_snapshots() -> tuple[dict, dict]:
-    """Build the next day's exact Silver-backed publication lineage."""
+    """Build the next day's exact bronze-only publication lineage."""
 
     isolated = _isolated_snapshot()
     item = isolated["daily_runs"][0]
@@ -217,10 +206,6 @@ def _later_complete_snapshots() -> tuple[dict, dict]:
             **item["decisions"][0]["conf"],
             "fotmob_publication": publication,
         },
-    )
-    item["silver_runs"][0].update(
-        run_id=f"fotmob_silver__{generation_id}",
-        conf={"fotmob_publication": publication},
     )
     item["publication"].update(
         **publication,
@@ -275,13 +260,6 @@ def test_validate_observation_emits_exact_purge_schema(tmp_path):
                 "dag_id": mod.INGEST_DAG_ID,
                 "run_id": f"fotmob_orchestrated__{_generation_id()}",
                 "owner_run_id": OWNER_RUN_ID,
-                "generation_id": _generation_id(),
-                "state": "success",
-            },
-            "silver": {
-                "dag_id": mod.SILVER_DAG_ID,
-                "run_id": f"fotmob_silver__{_generation_id()}",
-                "ingest_run_id": f"fotmob_orchestrated__{_generation_id()}",
                 "generation_id": _generation_id(),
                 "state": "success",
             },
@@ -373,32 +351,6 @@ def test_earliest_admitted_daily_owner_is_selected(tmp_path):
     report = mod.validate_observation(_context(tmp_path), isolated, _shared_snapshot())
 
     assert report["runs"]["owner"]["run_id"] == OWNER_RUN_ID
-
-
-def test_bronze_only_first_daily_does_not_block_later_silver_observation(tmp_path):
-    isolated = _isolated_snapshot()
-    bronze_only = isolated["daily_runs"][0]
-    bronze_only["ingest_trigger_states"] = ["skipped"]
-    bronze_only["silver_runs"] = []
-    bronze_only["silver_active_tasks"] = []
-    later, shared = _later_complete_snapshots()
-    isolated["daily_runs"].extend(later["daily_runs"])
-
-    report = mod.validate_observation(_context(tmp_path), isolated, shared)
-
-    assert report["runs"]["owner"]["run_id"] == (
-        "scheduled__2026-08-08T14:00:00+00:00"
-    )
-
-
-def test_malformed_missing_silver_first_daily_still_fails_closed(tmp_path):
-    isolated = _isolated_snapshot()
-    isolated["daily_runs"][0]["silver_runs"] = []
-    later, shared = _later_complete_snapshots()
-    isolated["daily_runs"].extend(later["daily_runs"])
-
-    with pytest.raises(mod.ObservationError, match="Silver child"):
-        mod.validate_observation(_context(tmp_path), isolated, shared)
 
 
 def test_owner_dagrun_may_start_before_owner_readback_when_attestation_is_after(
@@ -660,26 +612,6 @@ def test_main_writes_only_a_successful_stable_observation(tmp_path, monkeypatch)
     assert json.loads(output.read_text(encoding="utf-8")) == report
 
 
-@pytest.fixture(autouse=True)
-def _silver_enabled_contract(monkeypatch):
-    """#1575: tests above pin the Silver-enabled contract; the disabled
-    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
-
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
-
-
-def _bronze_only_observation(tmp_path):
-    isolated = _isolated_snapshot()
-    bronze_only = isolated["daily_runs"][0]
-    bronze_only["ingest_trigger_states"] = ["skipped"]
-    bronze_only["silver_runs"] = []
-    bronze_only["silver_active_tasks"] = []
-    context = _context(tmp_path)
-    return context, isolated
-
-
 def _purge_accepts(tmp_path, context, report):
     from scripts import purge_fotmob_competitions as purge
     from tests.unit.scripts.test_purge_fotmob_competitions import (
@@ -696,33 +628,13 @@ def _purge_accepts(tmp_path, context, report):
     return purge._scheduled_observation(output, deployment_report=deployment_path)
 
 
-def test_observation_silver_disabled_selects_bronze_only_daily_for_purge(
-    tmp_path, monkeypatch
-):
-    # #1575: with Silver off the earliest bronze-only daily is the observation.
-    from scrapers.fotmob import constants as fotmob_constants
+def test_observation_selects_bronze_only_daily_for_purge(tmp_path):
+    # #1590: the earliest bronze-only daily is the observation; no Silver run.
+    context = _context(tmp_path)
 
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
-    context, isolated = _bronze_only_observation(tmp_path)
-
-    report = mod.validate_observation(context, isolated, _shared_snapshot())
+    report = mod.validate_observation(context, _isolated_snapshot(), _shared_snapshot())
 
     assert report["runs"]["owner"]["run_id"] == OWNER_RUN_ID
     assert "silver" not in report["runs"]
     accepted = _purge_accepts(tmp_path, context, report)
     assert set(accepted.runs) == {"owner", "ingest", "sofascore", "finalizer"}
-
-
-def test_observation_silver_enabled_purge_rejects_bronze_only_lineage(
-    tmp_path, monkeypatch
-):
-    from scripts import purge_fotmob_competitions as purge
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
-    context, isolated = _bronze_only_observation(tmp_path)
-    report = mod.validate_observation(context, isolated, _shared_snapshot())
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
-
-    with pytest.raises(purge.PurgeRefused, match="not bound to the live deployment"):
-        _purge_accepts(tmp_path, context, report)

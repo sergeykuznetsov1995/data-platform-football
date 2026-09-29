@@ -26,18 +26,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from scrapers.fotmob import constants as fotmob_constants  # noqa: E402
-
-
-def fotmob_silver_enabled() -> bool:
-    """#1575: whether a finished generation must carry an exact Silver child.
-
-    When Silver is off the ingest seals a bronze-only candidate: no Silver
-    DagRun exists and the candidate has no ``transform_task_ids``.
-    """
-
-    return bool(fotmob_constants.FOTMOB_SILVER_ENABLED)
-
 
 TRINO_ENV_KEYS = (
     "TRINO_HOST",
@@ -58,7 +46,6 @@ PURGE_RAW_ENV_KEYS = (
 PROJECTION_SOURCES = {
     "dag_orchestrate_fotmob.py": "dags/dag_orchestrate_fotmob.py",
     "dag_ingest_fotmob.py": "dags/dag_ingest_fotmob.py",
-    "dag_transform_fotmob_silver.py": "dags/dag_transform_fotmob_silver.py",
     "dag_trigger_fotmob_daily.py": "dags/dag_trigger_fotmob_daily.py",
     "dag_refresh_fotmob.py": "dags/dag_refresh_fotmob.py",
     "dag_backfill_fotmob.py": "dags/dag_backfill_fotmob.py",
@@ -71,7 +58,6 @@ SHARED_CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/fotmob-admission")
 EXPECTED_DAGS = {
     "dag_orchestrate_fotmob",
     "dag_ingest_fotmob",
-    "dag_transform_fotmob_silver",
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
@@ -110,7 +96,6 @@ SHARED_RUNTIME_SUFFIXES = (
 ISOLATED_DAG_ROOT_PATHS = {
     "dags/dag_orchestrate_fotmob.py",
     "dags/dag_ingest_fotmob.py",
-    "dags/dag_transform_fotmob_silver.py",
     "dags/dag_trigger_fotmob_daily.py",
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
@@ -138,13 +123,8 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/dag_transform_e3.py",
     "dags/dag_transform_e4.py",
     "dags/dag_transform_fbref_gold.py",
-    "dags/dag_transform_fotmob_silver.py",
     "dags/dag_transform_xref.py",
     "dags/scripts/run_fotmob_scraper.py",
-    "dags/sql/silver/fotmob_keeper_profile.sql",
-    "dags/sql/silver/fotmob_manager_profile.sql",
-    "dags/sql/silver/fotmob_player_profile.sql",
-    "dags/sql/silver/fotmob_player_season_profile.sql",
     "dags/sql/silver/xref_manager.sql.j2",
     "dags/utils/fotmob_publication.py",
     "dags/utils/fotmob_orchestration.py",
@@ -179,7 +159,6 @@ SHARED_STATE_DAGS = {
     "dag_master_pipeline",
     "dag_sofascore_pipeline",
     "dag_ingest_fotmob",
-    "dag_transform_fotmob_silver",
     "dag_transform_xref",
     "dag_transform_e3",
     "dag_transform_e4",
@@ -194,7 +173,6 @@ EXPECTED_SHARED_PAUSE_STATES = {
     "dag_master_pipeline": True,
     "dag_sofascore_pipeline": True,
     "dag_ingest_fotmob": True,
-    "dag_transform_fotmob_silver": True,
 }
 SHARED_MAINTENANCE_DAGS = {
     "dag_iceberg_maintenance",
@@ -227,14 +205,12 @@ AUTOMATIC_ACTIVE_DAGS = frozenset(
     {
         "dag_orchestrate_fotmob",
         "dag_ingest_fotmob",
-        "dag_transform_fotmob_silver",
     }
 )
 AUTOMATIC_DAGBAG_DAGS = AUTOMATIC_ACTIVE_DAGS | LEGACY_OWNER_DAGS
 AUTOMATIC_EXPECTED_SCHEDULES = {
     "dag_orchestrate_fotmob": "*/5 * * * *",
     "dag_ingest_fotmob": "None",
-    "dag_transform_fotmob_silver": "None",
     "dag_trigger_fotmob_daily": "None",
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
@@ -364,7 +340,7 @@ def validate_automatic_catalog_admission(
         or writer_snapshot.get("active_runs") != {}
     ):
         raise RuntimeBindingError(
-            "automatic writer snapshot is not one atomic paused seven-DAG view"
+            "automatic writer snapshot is not one atomic paused six-DAG view"
         )
 
     legacy = value.get("legacy_owners")
@@ -580,22 +556,6 @@ def validate_automatic_catalog_admission(
     canary_publication = (
         canary.get("publication") if isinstance(canary, Mapping) else None
     )
-    # #1575: a Silver-backed canary is always valid (admissions issued before
-    # the switch-off stay valid); a bronze-only canary only while Silver is off.
-    silver_backed = (
-        isinstance(canary, Mapping)
-        and canary.get("silver_run_state") == "success"
-        and isinstance(transform_task_ids, list)
-        and bool(transform_task_ids)
-        and all(isinstance(task_id, str) and task_id for task_id in transform_task_ids)
-        and transform_task_ids == sorted(set(transform_task_ids))
-    )
-    bronze_only = (
-        not fotmob_silver_enabled()
-        and isinstance(canary, Mapping)
-        and canary.get("silver_run_state") == ""
-        and transform_task_ids is None
-    )
     canary_binding = (
         canary_publication.get("binding")
         if isinstance(canary_publication, Mapping)
@@ -613,7 +573,8 @@ def validate_automatic_catalog_admission(
         is None
         or str(canary.get("generation_id") or "") != str(report.get("run_id") or "")
         or canary.get("ingest_run_state") != "success"
-        or not (silver_backed or bronze_only)
+        # #1590: the canary seals a bronze-only candidate (no transform tasks).
+        or transform_task_ids is not None
         or re.fullmatch(
             r"[0-9a-f]{64}", str(canary.get("candidate_digest") or "")
         )
@@ -1245,7 +1206,7 @@ def validate_automatic_rollout_activation(
     all_paused = {dag_id: True for dag_id in AUTOMATIC_DAGBAG_DAGS}
     children_paused = {
         dag_id: dag_id
-        not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+        not in {"dag_ingest_fotmob"}
         for dag_id in AUTOMATIC_DAGBAG_DAGS
     }
     active_paused = {
@@ -1719,7 +1680,7 @@ def validate_pending_automatic_shared_wait(
     all_paused = {dag_id: True for dag_id in AUTOMATIC_DAGBAG_DAGS}
     children_paused = {
         dag_id: dag_id
-        not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+        not in {"dag_ingest_fotmob"}
         for dag_id in AUTOMATIC_DAGBAG_DAGS
     }
     transaction = activation.get("children_transaction")

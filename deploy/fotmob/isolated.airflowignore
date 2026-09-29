@@ -1,6 +1,6 @@
-# Изолированный fotmob-стек (#930): в DagBag пускаем ТОЛЬКО пять дагов FotMob —
-# dag_ingest_fotmob, dag_transform_fotmob_silver, dag_trigger_fotmob_daily,
-# dag_refresh_fotmob (#1021), dag_backfill_fotmob (#1020).
+# Изолированный fotmob-стек (#930): в DagBag пускаем ТОЛЬКО даги FotMob —
+# dag_ingest_fotmob, dag_trigger_fotmob_daily, dag_refresh_fotmob (#1021),
+# dag_backfill_fotmob (#1020); Silver FotMob удалён (#1590).
 #
 # ВНИМАНИЕ: движок regexp здесь RE2 (не Python re) — negative lookahead (?!...)
 # НЕ поддерживается и молча игнорируется, поэтому allow-list выразить нельзя и

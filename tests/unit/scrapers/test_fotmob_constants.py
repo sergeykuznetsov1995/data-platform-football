@@ -20,19 +20,6 @@ pytestmark = pytest.mark.unit
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SILVER_SQL = PROJECT_ROOT / "dags" / "sql" / "silver"
 MAP_CONSUMERS = {
-    "fotmob_keeper_profile.sql",
-    "fotmob_lineup.sql",
-    "fotmob_manager_profile.sql",
-    "fotmob_match_referee.sql",
-    "fotmob_player_market_value_history.sql",
-    "fotmob_player_match_aggregate.sql",
-    "fotmob_player_profile.sql",
-    "fotmob_player_season_profile.sql",
-    "fotmob_team_leaderboards.sql",
-    "fotmob_team_match.sql",
-    "fotmob_team_profile.sql",
-    "fotmob_team_standings.sql",
-    "fotmob_transfers.sql",
     "xref_manager.sql.j2",
     "xref_match.sql",
     "xref_referee.sql.j2",

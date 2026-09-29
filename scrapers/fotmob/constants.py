@@ -15,11 +15,6 @@ from types import MappingProxyType
 from typing import Mapping
 
 
-# #1575: Silver FotMob is switched off until the Trino memory failure of
-# ``team_match`` is understood.  Single source of truth for the ingest DAG and
-# for the host tools that verify a finished generation (bronze-only when off).
-FOTMOB_SILVER_ENABLED = False
-
 CONFIG_PATH = (
     Path(__file__).resolve().parents[2]
     / "configs"
