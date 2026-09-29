@@ -62,6 +62,9 @@ class MemoryDailyStore:
         for row in rows:
             self.results[tuple(row[k] for k in daily.RESULT_KEYS)] = row
 
+    def results_present(self, rating_date):
+        return any(r["rating_date"] == rating_date for r in self.results.values())
+
 
 def _manifest_closed_except(open_slugs):
     return [{"slug": s, "status": "done", "fetched_at": T0, "_ingested_at": T0}
@@ -162,6 +165,27 @@ def test_same_rating_date_is_a_replace_without_alert_or_new_slugs():
     assert result["wire_bytes"] == result["wire_bytes_daily"] == 88609 + 46210
 
 
+def test_same_date_with_stored_results_does_not_fetch_results_again():
+    store = MemoryDailyStore()
+    _run(store=store)
+    result, store, _, session, sent, _ = _run(store=store)
+    assert [c["path"] for c in session.calls] == ["/Ranking"]
+    assert result["results_skipped"] is True and result["results_rows"] == 0
+    assert result["same_date"] is True and store.replaces == [RATING_DATE, RATING_DATE]
+    assert daily.exit_code(result) == 0 and sent == []
+    assert len(store.results) == 63
+
+
+def test_new_date_fetches_results_even_when_earlier_results_are_stored():
+    store = MemoryDailyStore()
+    _run(store=store)
+    result, store, _, session, *_ = _run(
+        _answers(**{"/Ranking": _ranking_with_date("2026-09-23"),
+                    "/Results": _results_with_date("2026-09-23")}), store=store)
+    assert [c["path"] for c in session.calls][:2] == ["/Ranking", "/Results"]
+    assert result["results_skipped"] is False and daily.exit_code(result) == 0
+
+
 def test_completeness_against_the_previous_date_guards_a_new_partition():
     # the new rating date has no partition yet: G2 still compares with 2026-09-21
     store = MemoryDailyStore({date(2026, 9, 21): 1900})
@@ -250,8 +274,10 @@ def test_network_failure_is_an_error():
 
 
 def test_results_merge_updates_is_final():
+    # #1465: the same rating date does not fetch /Results again, so the update
+    # comes with a new /Ranking date (/Results may run ahead of /Ranking, M-09)
     store = MemoryDailyStore()
-    _run(store=store)
+    _run(_answers(**{"/Ranking": _ranking_with_date("2026-09-21")}), store=store)
     key = (date(2026, 9, 22), "audax-italiano", "colo-colo")
     assert store.results[key]["is_final"] is False
     final = fixture_html("Results.html.gz").replace(
@@ -311,6 +337,17 @@ def test_store_snapshot_counts_same_and_previous():
     assert daily.IcebergDailyStore(writer).snapshot_counts(RATING_DATE) == (None, 1739)
     trino.execute_query.return_value = []
     assert daily.IcebergDailyStore(writer).snapshot_counts(RATING_DATE) == (None, None)
+
+
+def test_store_results_present_by_results_date():
+    writer = MagicMock(catalog="iceberg")
+    trino = writer._get_trino_manager.return_value
+    trino.execute_query.return_value = [[1]]
+    assert daily.IcebergDailyStore(writer).results_present(RATING_DATE) is True
+    sql = trino.execute_query.call_args[0][0]
+    assert "iceberg.bronze.clubelo_result" in sql and "rating_date = DATE '2026-09-22'" in sql
+    trino.execute_query.return_value = []
+    assert daily.IcebergDailyStore(writer).results_present(RATING_DATE) is False
 
 
 def test_store_creates_date_partitioned_tables():

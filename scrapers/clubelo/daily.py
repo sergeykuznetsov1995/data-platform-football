@@ -9,7 +9,10 @@ One run, in this order:
    live 25.09 /Ranking 2026-09-22 vs /Results 2026-09-24) — both are written,
    each under its own date. Only an OLDER /Results is fetched again after
    ``results_retry_pause`` (10 min), up to ``results_retries`` (3) times;
-   still older → nothing parsed is written.
+   still older → nothing parsed is written. Skipped (``results_skipped``)
+   when the /Ranking date is already stored in the snapshot AND in
+   ``clubelo_result`` (#1465: the run is every 4 h, the date lives ~10–57 h);
+   the ~3-day /Results window of the next date updates ``is_final``.
 3. Completeness guard of the snapshot (``check_completeness``): absolute
    (>= 95 % of 1741 clubs), against the previous rating date (>= 95 %) and,
    only when this rating date is already stored, ``min_replace_ratio`` 0.9
@@ -182,6 +185,15 @@ class IcebergDailyStore:
                 previous = int(count)
         return same, previous
 
+    def results_present(self, rating_date: date) -> bool:
+        """Whether ``clubelo_result`` already holds rows of this /Results date."""
+
+        table = f"{self.writer.catalog}.{self.database}.{RESULT_TABLE}"
+        rows = self.writer._get_trino_manager().execute_query(
+            f"SELECT 1 FROM {table} WHERE rating_date = DATE '{rating_date.isoformat()}' LIMIT 1"
+        )
+        return bool(rows)
+
     def replace_snapshot(self, rating_date: date, rows: List[Dict[str, Any]]) -> int:
         table = pa.Table.from_pylist(rows, schema=SNAPSHOT_SCHEMA)
         # The writer compares the partition column with a string value; the
@@ -314,6 +326,7 @@ def run_daily(
         "elo_precise_matched": 0,
         "same_date": None,
         "results_rating_date": None,
+        "results_skipped": False,
         "results_attempts": 0,
         "results_rows": 0,
         "results_final": 0,
@@ -345,11 +358,15 @@ def run_daily(
             levels_matched_pct=ranking.levels_matched_pct,
             elo_precise_matched=ranking.elo_precise_matched,
         )
-        results_page, results = daily.results(
-            ranking.rating_date, results_retries, results_retry_pause, sleep
-        )
-        result["results_rating_date"] = results.rating_date.isoformat()
         same, previous = store.snapshot_counts(ranking.rating_date)
+        # #1465: the rating date is already stored with its /Results — the
+        # 4-hourly re-run does not fetch /Results again.
+        result["results_skipped"] = same is not None and store.results_present(ranking.rating_date)
+        if not result["results_skipped"]:
+            results_page, results = daily.results(
+                ranking.rating_date, results_retries, results_retry_pause, sleep
+            )
+            result["results_rating_date"] = results.rating_date.isoformat()
         check_completeness(ranking.elo_rows, same, previous)
         result["same_date"] = same is not None
 
@@ -358,15 +375,16 @@ def run_daily(
         snapshot = [daily.row(**common, **row) for row in ranking.rows]
         result["snapshot_rows"] = store.replace_snapshot(ranking.rating_date, snapshot)
         result["rows"], result["provisional"] = ranking.elo_rows, ranking.provisional
-        common = {"rating_date": results.rating_date, "page_created_at": results.page_created_at,
-                  "fetched_at": results_page.fetched_at}
-        store.merge_results([daily.row(**common, **row) for row in results.rows])
+        if not result["results_skipped"]:
+            common = {"rating_date": results.rating_date, "page_created_at": results.page_created_at,
+                      "fetched_at": results_page.fetched_at}
+            store.merge_results([daily.row(**common, **row) for row in results.rows])
+            result.update(
+                results_rows=len(results.rows),
+                results_final=sum(row["is_final"] for row in results.rows),
+                results_duplicates=results.duplicates,
+            )
         result["written"] = True
-        result.update(
-            results_rows=len(results.rows),
-            results_final=sum(row["is_final"] for row in results.rows),
-            results_duplicates=results.duplicates,
-        )
         logger.info("ClubElo daily written: %s", {k: result[k] for k in (
             "rating_date", "rows", "provisional", "same_date", "results_rows")})
         result["wire_bytes_daily"] = transport.wire_bytes
