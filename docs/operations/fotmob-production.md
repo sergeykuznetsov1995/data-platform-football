@@ -23,7 +23,6 @@
 | --- | --- | --- |
 | `dag_orchestrate_fotmob` | `*/5 * * * *` | unpaused |
 | `dag_ingest_fotmob` | `None` | unpaused |
-| `dag_transform_fotmob_silver` | `None` | unpaused |
 | `dag_trigger_fotmob_daily` | `None` | paused |
 | `dag_refresh_fotmob` | `None` | paused |
 | `dag_backfill_fotmob` | `None` | paused |
@@ -48,7 +47,7 @@
 - `FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH`, указывающий в shared container на тот
   же `deployment.json`;
 - shared `dag_master_pipeline`, `dag_sofascore_pipeline`,
-  `dag_ingest_fotmob` и `dag_transform_fotmob_silver` paused, без
+  `dag_ingest_fotmob` paused, без
   `running`/`queued` FotMob runs.
 
 Deploy сам проверяет container IDs, Git SHA, runtime files, общий control DB,
@@ -510,55 +509,21 @@ Bronze, raw cache и dynamic catalog/evidence сохраняются.
    Ожидается `coordinator_rollout.phase=kept_paused`, все шесть DAG paused,
    shared consumer paused и `fotmob_schedule_owner=isolated`.
 
-4. Запустить exact fenced Silver/DQ на revert commit:
+4. Проверить revert и frozen legacy tables (fenced Silver/DQ-прогон отката
+   удалён вместе с Silver FotMob, #1590):
 
    ```bash
    export FOTMOB_ROLLBACK_SHA="$FOTMOB_RELEASE_SHA"
-   export FOTMOB_ROLLBACK_PUBLICATION="$FOTMOB_EVIDENCE/rollback-publication.json"
 
-   python scripts/fotmob_rollback.py run-silver \
-     --env-file "$FOTMOB_ENV" \
-     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
-     --expected-consumer-sha "$FOTMOB_ROLLBACK_SHA" \
-     --publication-attempt 1 \
-     --timeout-seconds 43200 \
-     --execute \
-     --confirm RUN_FOTMOB_ROLLBACK_VALIDATION_SILVER \
-     --output "$FOTMOB_ROLLBACK_PUBLICATION"
-   ```
-
-   При ambiguous результате не освобождать lock вручную. Использовать:
-
-   ```bash
-   python scripts/fotmob_rollback.py recover-publication \
-     --env-file "$FOTMOB_ENV" \
-     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
-     --publication-report "$FOTMOB_ROLLBACK_PUBLICATION" \
-     --publication-attempt 1 \
-     --execute \
-     --confirm RECOVER_FOTMOB_ROLLBACK_PUBLICATION \
-     --output "$FOTMOB_EVIDENCE/rollback-publication-recovery.json"
-
-   export FOTMOB_ROLLBACK_PUBLICATION="$FOTMOB_EVIDENCE/rollback-publication-recovery.json"
-   ```
-
-   После recovery используйте последний зелёный publication report.
-
-5. Проверить revert, Silver/DQ, abandoned generation и frozen legacy tables:
-
-   ```bash
    python scripts/fotmob_rollback.py validate \
      --env-file "$FOTMOB_ENV" \
      --trino-env-file "$FOTMOB_TRINO_ENV" \
      --deployment-report "$FOTMOB_DEPLOY_REPORT" \
-     --publication-report "$FOTMOB_ROLLBACK_PUBLICATION" \
      --expected-consumer-sha "$FOTMOB_ROLLBACK_SHA" \
-     --publication-attempt 1 \
-     --silver-run-id '<run-id-from-publication-report>' \
      --output "$FOTMOB_EVIDENCE/rollback-validate.json"
    ```
 
-6. После зелёного validate вернуть исходное состояние только двух maintenance
+5. После зелёного validate вернуть исходное состояние только двух maintenance
    DAG. SHA берётся от exact проверенного файла:
 
    ```bash

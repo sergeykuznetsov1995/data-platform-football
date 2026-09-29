@@ -4314,11 +4314,22 @@ _SILVER_OK = {"dag_id": "dag_transform_fotmob_silver", "run_id": "fotmob_silver_
 
 def test_live_canary_requires_exact_bronze_only_lineage():
     canary = _live_canary()
+    commands = []
+    ok_run = _live_run([_INGEST_OK], canary, _BRONZE_LIVE)
 
-    mod.validate_live_automatic_canary(
-        "c" * 64, canary, run=_live_run([_INGEST_OK], canary, _BRONZE_LIVE)
-    )
-    # A Silver run next to a bronze-only canary is refused.
+    def recording_run(command, **kwargs):
+        commands.append(command)
+        return ok_run(command, **kwargs)
+
+    mod.validate_live_automatic_canary("c" * 64, canary, run=recording_run)
+    # The generated in-container probe asks Airflow for the ingest run only.
+    (command,) = commands
+    assert command[:3] == ("docker", "exec", "c" * 64)
+    code = command[-1]
+    assert "dag_transform_fotmob_silver" not in code
+    assert "silver" not in code.lower()
+    assert "expected = {\n    'dag_ingest_fotmob': 'fotmob_orchestrated__g',\n}" in code
+    # Host-side comparison is exact: any extra run in the evidence is refused.
     with pytest.raises(mod.DeploymentError, match="live provenance differs"):
         mod.validate_live_automatic_canary(
             "c" * 64,
