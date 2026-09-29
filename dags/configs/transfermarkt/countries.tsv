@@ -1,0 +1,212 @@
+country_id	country	confederation
+1	Afghanistan	AFC
+2	Egypt	CAF
+3	Albania	UEFA
+4	Algeria	CAF
+5	Andorra	UEFA
+6	Angola	CAF
+7	Antigua and Barbuda	Americas
+8	Equatorial Guinea	CAF
+9	Argentina	Americas
+10	Armenia	UEFA
+11	Ethiopia	CAF
+12	Australia	AFC
+13	Azerbaijan	UEFA
+14	Bahamas	Americas
+15	Bahrain	AFC
+16	Bangladesh	AFC
+17	Barbados	Americas
+18	Belarus	UEFA
+19	Belgium	UEFA
+20	Belize	Americas
+21	Benin	CAF
+22	Bhutan	AFC
+23	Bolivia	Americas
+24	Bosnia-Herzegovina	UEFA
+25	Botswana	CAF
+26	Brazil	Americas
+27	Brunei Darussalam	AFC
+28	Bulgaria	UEFA
+29	Burkina Faso	CAF
+30	Burundi	CAF
+31	Cameroon	CAF
+32	Cape Verde	CAF
+33	Chile	Americas
+34	China	AFC
+35	Comoros	CAF
+36	Costa Rica	Americas
+37	Croatia	UEFA
+38	Ivory Coast	CAF
+39	Denmark	UEFA
+40	Germany	UEFA
+41	Djibouti	CAF
+42	Dominica	Americas
+43	Dominican Republic	Americas
+44	Ecuador	Americas
+45	El Salvador	Americas
+46	Eritrea	CAF
+47	Estonia	UEFA
+48	Fiji	AFC
+49	Finland	UEFA
+50	France	UEFA
+51	Gabon	CAF
+52	The Gambia	CAF
+53	Georgia	UEFA
+54	Ghana	CAF
+55	Grenada	Americas
+56	Greece	UEFA
+58	Guatemala	Americas
+59	Guinea	CAF
+60	Guinea-Bissau	CAF
+61	Guyana	Americas
+62	Haiti	Americas
+66	Honduras	Americas
+67	India	AFC
+68	Indonesia	AFC
+69	Solomon Islands	OFC
+70	Iraq	AFC
+71	Iran	AFC
+72	Ireland	UEFA
+73	Iceland	UEFA
+74	Israel	UEFA
+75	Italy	UEFA
+76	Jamaica	Americas
+77	Japan	AFC
+78	Jordan	AFC
+79	Cambodia	AFC
+80	Canada	Americas
+81	Kazakhstan	UEFA
+82	Kenya	CAF
+83	Colombia	Americas
+85	Republic of the Congo	CAF
+86	North Korea	AFC
+87	Korea, South	AFC
+88	Cuba	Americas
+89	Kuwait	AFC
+90	Kyrgyzstan	AFC
+91	Laos	AFC
+92	Latvia	UEFA
+93	Lesotho	CAF
+94	Lebanon	AFC
+95	Liberia	CAF
+96	Libya	CAF
+97	Liechtenstein	UEFA
+98	Lithuania	UEFA
+99	Luxembourg	UEFA
+100	North Macedonia	UEFA
+101	Madagascar	CAF
+102	Malawi	CAF
+103	Malaysia	AFC
+104	Maldives	AFC
+105	Mali	CAF
+106	Malta	UEFA
+107	Morocco	CAF
+108	Mauritania	CAF
+109	Mauritius	CAF
+110	Mexico	Americas
+112	Moldova	UEFA
+114	Mongolia	AFC
+115	Mozambique	CAF
+116	Myanmar	AFC
+117	Namibia	CAF
+119	Nepal	AFC
+120	New Zealand	AFC
+121	Nicaragua	Americas
+122	Netherlands	UEFA
+123	Niger	CAF
+124	Nigeria	CAF
+125	Norway	UEFA
+126	Oman	AFC
+127	Austria	UEFA
+128	Pakistan	AFC
+130	Panama	Americas
+131	Papua New Guinea	OFC
+132	Paraguay	Americas
+133	Peru	Americas
+134	Philippines	AFC
+135	Poland	UEFA
+136	Portugal	UEFA
+137	Qatar	AFC
+138	Central African Republic	CAF
+139	Rwanda	CAF
+140	Romania	UEFA
+141	Russia	UEFA
+142	Zambia	CAF
+143	Samoa	OFC
+144	San Marino	UEFA
+145	São Tomé and Príncipe	CAF
+146	Saudi Arabia	AFC
+147	Sweden	UEFA
+148	Switzerland	UEFA
+149	Senegal	CAF
+151	Seychelles	CAF
+152	Sierra Leone	CAF
+153	Singapore	AFC
+154	Slovakia	UEFA
+155	Slovenia	UEFA
+156	Somalia	CAF
+157	Spain	UEFA
+158	Sri Lanka	AFC
+159	South Africa	CAF
+160	Sudan	CAF
+161	Suriname	Americas
+162	Eswatini	CAF
+163	Syria	AFC
+164	Chinese Taipei	AFC
+165	Tajikistan	AFC
+166	Tanzania	CAF
+167	Thailand	AFC
+168	Togo	CAF
+169	Tonga	OFC
+170	Trinidad and Tobago	Americas
+171	Chad	CAF
+172	Czech Republic	UEFA
+173	Tunisia	CAF
+174	Türkiye	UEFA
+175	Turkmenistan	AFC
+176	Uganda	CAF
+177	Ukraine	UEFA
+178	Hungary	UEFA
+179	Uruguay	Americas
+180	Uzbekistan	AFC
+181	Vanuatu	OFC
+182	Venezuela	Americas
+183	United Arab Emirates	AFC
+184	United States	Americas
+185	Vietnam	AFC
+186	Yemen	AFC
+187	Zimbabwe	CAF
+188	Cyprus	UEFA
+189	England	UEFA
+190	Scotland	UEFA
+191	Wales	UEFA
+192	Northern Ireland	UEFA
+193	Democratic Republic of the Congo	CAF
+208	Faroe Islands	UEFA
+211	Bermuda	Americas
+215	Serbia	UEFA
+216	Montenegro	UEFA
+218	Hongkong	AFC
+219	Macau	AFC
+224	Saint Vincent and the Grenadines	Americas
+225	Saint Kitts and Nevis	Americas
+226	Turks and Caicos Islands	Americas
+228	Puerto Rico	Americas
+229	Cayman Islands	Americas
+230	Saint Lucia	Americas
+231	British Virgin Islands	Americas
+232	Anguilla	Americas
+233	Aruba	Americas
+234	United States Virgin Islands	Americas
+235	Montserrat	Americas
+236	New Caledonia	OFC
+237	Tahiti	OFC
+238	Cook Islands	OFC
+239	American Samoa	OFC
+240	Palestine	AFC
+241	Guam	AFC
+242	Timor-Leste	AFC
+244	Kosovo	UEFA
+260	Curaçao	Americas
+262	South Sudan	CAF
+266	Gibraltar	UEFA

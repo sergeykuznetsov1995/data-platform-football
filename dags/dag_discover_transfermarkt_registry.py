@@ -1,4 +1,10 @@
-"""Monthly, approval-gated Transfermarkt competition registry discovery.
+"""Daily, approval-gated Transfermarkt competition registry discovery.
+
+Every day at 18:00 UTC (21:00 MSK): ``daily`` mode reads the tmapi regulation
+of every competition of the canonical snapshot (fresh current editions), and
+once the last full crawl is a week old the same run is ``full`` — catalogue,
+country pages and regulations (#1391).  The paid caps scale with that work by
+the committed standing policy's ``scaling`` block.
 
 The paid discovery and its two Bronze writes run in one proxy-only process.
 Silver publication is a separate boundary: the exact discovery manifest is
@@ -118,26 +124,68 @@ def _is_scheduled_run(context: Mapping[str, Any]) -> bool:
     return str(context.get("run_id") or "").startswith("scheduled__")
 
 
-def _load_validated_standing_policy():
-    """Load and prove the committed policy against the pinned discovery caps."""
-
+def _runner():
     try:
-        from dags.scripts.run_transfermarkt_discovery import (
-            validate_standing_policy_for_discovery,
-        )
+        from dags.scripts import run_transfermarkt_discovery as runner
     except ModuleNotFoundError:
-        from scripts.run_transfermarkt_discovery import (
-            validate_standing_policy_for_discovery,
-        )
+        from scripts import run_transfermarkt_discovery as runner
+    return runner
+
+
+def _load_validated_standing_policy(sizing=None):
+    """Load and prove the committed policy; return it with this run's caps.
+
+    Without ``sizing`` the policy floors must equal the pinned one-shot caps
+    (publication re-proves the same file); with it the caps are the ones the
+    policy's scaling grants this run's work.
+    """
+
     from utils.transfermarkt_approval import load_standing_policy
 
+    runner = _runner()
     policy = load_standing_policy(STANDING_POLICY_PATH)
-    validate_standing_policy_for_discovery(
+    # The floors are the pinned one-shot caps in every case.
+    runner.validate_standing_policy_for_discovery(
         policy,
         request_limit=PROXY_REQUEST_LIMIT,
         retry_limit=PROXY_RETRY_LIMIT,
+        byte_cap_bytes=PROVIDER_HARD_CAP_BYTES,
     )
-    return policy
+    limits = runner.discovery_limits(policy, sizing)
+    runner.validate_standing_policy_for_discovery(
+        policy,
+        request_limit=limits.request_limit,
+        retry_limit=limits.retry_limit,
+        byte_cap_bytes=limits.byte_cap_bytes,
+        sizing=sizing,
+    )
+    return policy, limits
+
+
+def _read_registry_facts():
+    """Canonical snapshot id, competition count, last full crawl (read-only)."""
+
+    connection = _connect_trino()
+    try:
+        return _runner().read_registry_facts(connection)
+    finally:
+        connection.close()
+
+
+def _discovery_sizing(now: datetime):
+    """Mode and work of this run, from the canonical snapshot (#1391)."""
+
+    from scrapers.transfermarkt.discovery import load_countries
+
+    runner = _runner()
+    snapshot_id, competitions, last_full_at = _read_registry_facts()
+    mode = runner.resolve_mode("auto", last_full_at, now)
+    sizing = runner.DiscoverySizing(
+        mode=mode,
+        previous_competitions=competitions if snapshot_id else 0,
+        country_pages=len(load_countries()),
+    )
+    return snapshot_id, sizing
 
 
 def _load_packet(path: Path):
@@ -297,10 +345,16 @@ def _prepare_discovery(
         and _is_scheduled_run(context)
         and _truthy_env(STANDING_POLICY_ENV_GATE)
     ):
-        policy = _load_validated_standing_policy()
+        previous_snapshot_id, sizing = _discovery_sizing(
+            datetime.now(timezone.utc)
+        )
+        policy, limits = _load_validated_standing_policy(sizing)
         checkpoint = STATE_ROOT / "checkpoints" / f"{cycle_id}.json"
         return {
             "TM_APPROVAL_MODE": "standing_policy",
+            "TM_MODE": sizing.mode,
+            "TM_PREVIOUS_SNAPSHOT_ID": previous_snapshot_id or "",
+            "TM_BYTE_CAP_BYTES": str(limits.byte_cap_bytes),
             "TM_CYCLE_ID": cycle_id,
             "TM_DAG_ID": DAG_ID,
             "TM_RUN_ID": run_id,
@@ -309,8 +363,8 @@ def _prepare_discovery(
             "TM_CHECKPOINT": str(checkpoint),
             "TM_CACHE": str(CACHE_PATH),
             "TM_OUTPUT_ROOT": str(OUTPUT_ROOT),
-            "TM_REQUEST_LIMIT": str(PROXY_REQUEST_LIMIT),
-            "TM_RETRY_LIMIT": str(PROXY_RETRY_LIMIT),
+            "TM_REQUEST_LIMIT": str(limits.request_limit),
+            "TM_RETRY_LIMIT": str(limits.retry_limit),
             "TM_CACHE_TTL_SECONDS": str(CACHE_TTL_SECONDS),
             "TM_LEASE_TTL_SECONDS": str(LEASE_TTL_SECONDS),
             "TM_STANDING_POLICY_PATH": STANDING_POLICY_PATH,
@@ -678,7 +732,7 @@ def _publish_registry_standing(
         str(prepared.get("TM_STANDING_POLICY_SHA256") or ""),
         field="TM_STANDING_POLICY_SHA256",
     )
-    policy = _load_validated_standing_policy()
+    policy, _limits = _load_validated_standing_policy()
     if policy.policy_hash != pinned_hash:
         raise AirflowException(
             "standing policy content drifted between plan and publication"
@@ -1003,9 +1057,10 @@ with DAG(
     dag_id=DAG_ID,
     default_args=SCRAPER_ARGS,
     description="Proxy-only Transfermarkt registry discovery and strict CAS promotion",
-    # Registry taxonomy changes slowly. Run before the weekly Monday crawl,
-    # but only once per month to avoid unnecessary residential traffic.
-    schedule="0 2 1 * *",
+    # Daily at 18:00 UTC (21:00 MSK): after the ingest day (≈15–18 MSK) and
+    # well before the nightly auto-delivery (≈04 MSK).  The run is "daily"
+    # (regulations only) unless the last full crawl is a week old (#1391).
+    schedule="0 18 * * *",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     render_template_as_native_obj=True,
@@ -1033,14 +1088,19 @@ with DAG(
         ),
     },
     doc_md="""
-    Monthly central-registry refresh. A manual trigger keeps the one-shot
+    Daily central-registry refresh (#1391): "daily" mode refreshes every
+    competition's editions from tmapi regulation; "full" (catalogue, country
+    pages, regulations) runs when the last full crawl is a week old. A page
+    that cannot be read carries its competitions over from the canonical
+    snapshot; more than 10 % carried drops the snapshot. A manual trigger keeps the one-shot
     ritual: the run fails closed until separate approved paid-proxy and
     Bronze-write packets are supplied, and after discovery the third exact
     packet must be created/approved before clearing `publish_registry`. Only
     a run_type=scheduled run with every packet parameter empty and
     TM_STANDING_POLICY_ENABLED=true is instead covered by the committed
     standing policy (dags/configs/transfermarkt/standing_registry_policy.json),
-    whose caps must equal the pinned 15 MiB/1024/96 discovery limits and whose
+    whose floors must equal the pinned 15 MiB/1024/96 discovery limits (its
+    `scaling` block grows them with the run's work) and whose
     sha256 is re-verified by the child before paid I/O and by publication.
     The gate is deliberately the same key as dag_ingest_transfermarkt's: the
     two paid contours activate together and per-DAG isolation comes from the
@@ -1078,7 +1138,12 @@ case "$TM_APPROVAL_MODE" in
     approval_args=(
       --standing-policy "$TM_STANDING_POLICY_PATH"
       --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
+      --mode "$TM_MODE"
+      --byte-cap-bytes "$TM_BYTE_CAP_BYTES"
     )
+    if [ -n "$TM_PREVIOUS_SNAPSHOT_ID" ]; then
+      approval_args+=(--previous-snapshot-id "$TM_PREVIOUS_SNAPSHOT_ID")
+    fi
     ;;
   one_shot)
     approval_args=(
@@ -1112,7 +1177,8 @@ exec python /opt/airflow/dags/scripts/run_transfermarkt_discovery.py \
         pool="transfermarkt_proxy",
         pool_slots=1,
         max_active_tis_per_dag=1,
-        execution_timeout=timedelta(hours=2),
+        # A full crawl reads ~2 000 pages at 10 requests a minute.
+        execution_timeout=timedelta(hours=6),
         do_xcom_push=True,
     )
 

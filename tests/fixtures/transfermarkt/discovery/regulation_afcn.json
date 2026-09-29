@@ -1,0 +1,86 @@
+{
+ "success": true,
+ "message": "OK",
+ "data": [
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2026,
+    "display": "2027",
+    "cyclicalName": "2027",
+    "nonCyclicalName": "2027"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/afrika-cup/startseite/pokalwettbewerb/AFCN?saison_id=2026"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2024,
+    "display": "2025",
+    "cyclicalName": "2025",
+    "nonCyclicalName": "2025"
+   },
+   "isCurrentSeason": true,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/afrika-cup/startseite/pokalwettbewerb/AFCN?saison_id=2024"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2022,
+    "display": "2023",
+    "cyclicalName": "2023",
+    "nonCyclicalName": "2023"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/afrika-cup/startseite/pokalwettbewerb/AFCN?saison_id=2022"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2020,
+    "display": "2021",
+    "cyclicalName": "2021",
+    "nonCyclicalName": "2021"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/afrika-cup/startseite/pokalwettbewerb/AFCN?saison_id=2020"
+  },
+  {
+   "competitionId": "AFCN",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2018,
+    "display": "2019",
+    "cyclicalName": "2019",
+    "nonCyclicalName": "2019"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/afrika-cup/startseite/pokalwettbewerb/AFCN?saison_id=2018"
+  }
+ ]
+}

@@ -475,20 +475,95 @@ def test_strict_preflight_requires_v2_legacy_shutdown_raw_and_durable_permits(
     assert result["candidate_slot"] == "b"
 
 
-def test_registry_freshness_checks_every_row_not_only_latest():
+def _freshness_row(competition_id, *, competition_age, edition_age):
+    return {
+        "registry_snapshot_id": "one",
+        "competition_id": competition_id,
+        "competition_discovered_at": (NOW - competition_age).isoformat(),
+        "edition_discovered_at": (NOW - edition_age).isoformat(),
+    }
+
+
+def test_carried_by_a_full_then_refreshed_by_daily_is_left_out_not_fatal():
+    # #1391: a partial full carries ES1 with its old competition row; the next
+    # daily runs refresh its editions but keep that row. Once the row is past
+    # 8 days the competition waits for the next full crawl; the campaign
+    # still builds from the rest.
+    fresh = _freshness_row(
+        "GB1", competition_age=timedelta(days=1), edition_age=timedelta(0)
+    )
+    carried_then_daily = _freshness_row(
+        "ES1", competition_age=timedelta(days=9), edition_age=timedelta(0)
+    )
+
+    result = runtime.validate_fresh_registry_snapshot(
+        [fresh, carried_then_daily], now=NOW
+    )
+
+    assert result == (fresh,)
+
+
+def test_no_full_crawl_for_over_8_days_fails_the_campaign():
     rows = [
-        {
-            "registry_snapshot_id": "one",
-            "competition_discovered_at": NOW.isoformat(),
-            "edition_discovered_at": NOW.isoformat(),
-        },
-        {
-            "registry_snapshot_id": "one",
-            "competition_discovered_at": (NOW - timedelta(days=2)).isoformat(),
-            "edition_discovered_at": NOW.isoformat(),
-        },
+        _freshness_row(
+            competition_id, competition_age=timedelta(days=9), edition_age=timedelta(0)
+        )
+        for competition_id in ("GB1", "ES1")
     ]
 
+    with pytest.raises(runtime.BackfillRuntimeError, match="fresh full discovery"):
+        runtime.validate_fresh_registry_snapshot(rows, now=NOW)
+
+
+def test_daily_refreshed_editions_of_a_week_old_full_crawl_are_fresh():
+    rows = [
+        _freshness_row(
+            "GB1", competition_age=timedelta(days=6), edition_age=timedelta(hours=3)
+        ),
+    ]
+
+    assert runtime.validate_fresh_registry_snapshot(rows, now=NOW) == tuple(rows)
+
+
+def test_carried_competition_is_left_out_without_failing_the_campaign():
+    fresh = _freshness_row(
+        "GB1", competition_age=timedelta(days=1), edition_age=timedelta(hours=1)
+    )
+    carried = [
+        _freshness_row(
+            "BRMT", competition_age=timedelta(days=40), edition_age=timedelta(days=40)
+        ),
+        _freshness_row(
+            "BRMT", competition_age=timedelta(days=40), edition_age=timedelta(days=30)
+        ),
+    ]
+
+    result = runtime.validate_fresh_registry_snapshot([fresh, *carried], now=NOW)
+
+    assert result == (fresh,)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        # Nothing refreshed in the last 24 h: discovery is dead.
+        [
+            _freshness_row(
+                "GB1", competition_age=timedelta(days=1), edition_age=timedelta(hours=25)
+            )
+        ],
+        # One edition of a refreshed competition is older than 24 h.
+        [
+            _freshness_row(
+                "GB1", competition_age=timedelta(days=1), edition_age=timedelta(hours=1)
+            ),
+            _freshness_row(
+                "GB1", competition_age=timedelta(days=1), edition_age=timedelta(hours=25)
+            ),
+        ],
+    ],
+)
+def test_edition_older_than_24h_fails_the_campaign(rows):
     with pytest.raises(runtime.BackfillRuntimeError, match="fresh full discovery"):
         runtime.validate_fresh_registry_snapshot(rows, now=NOW)
 

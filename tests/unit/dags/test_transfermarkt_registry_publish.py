@@ -384,3 +384,104 @@ def test_manifest_hash_and_exact_counts_are_mandatory():
             edition_count=3,
             expected_revision=5,
         )
+
+
+def _with_report(report: dict) -> tuple[dict, str]:
+    manifest = deepcopy(MANIFEST)
+    manifest['discovery_report'] = report
+    return manifest, publish.stable_hash(manifest)
+
+
+def test_more_than_ten_percent_carried_blocks_publication_before_sql():
+    # #1391: 1 of 2 competitions carried over is a source outage.
+    manifest, manifest_hash = _with_report({'carried_competition_ids': ['GB1']})
+    executor = FakeExecutor()
+
+    with pytest.raises(publish.RegistryManifestError, match='carried'):
+        publish.publish_registry(
+            manifest,
+            manifest_hash=manifest_hash,
+            snapshot_id=SNAPSHOT_ID,
+            competition_count=2,
+            edition_count=3,
+            expected_revision=5,
+            apply=True,
+            executor=executor,
+        )
+    assert executor.statements == []
+
+
+def test_a6_report_lists_denominator_disagreements_with_the_regulation():
+    from scrapers.transfermarkt.denominator import load_denominator
+
+    manifest, _ = _with_report(
+        {
+            'carried_competition_ids': [],
+            # AFCN: last played edition 2024 ("2025"); GB1 is a league route.
+            'regulation_current': {'AFCN': '2024', 'GB1': '2025', 'CL': '2026'},
+        }
+    )
+    denominator = load_denominator()
+
+    report = publish.a6_report(manifest, denominator=denominator)
+
+    assert report['status'] == 'checked'
+    assert report['checked'] == 2  # AFCN and CL: live pokal-route rows
+    assert {
+        'competition_id': 'AFCN',
+        'denominator': denominator.row('AFCN').current_saison_id,
+        'regulation': 2024,
+    } in report['mismatches']
+    assert all(item['competition_id'] != 'GB1' for item in report['mismatches'])
+
+
+def test_a6_report_is_attached_but_never_blocks_the_plan():
+    manifest, manifest_hash = _with_report(
+        {'carried_competition_ids': [], 'regulation_current': {'AFCN': '2024'}}
+    )
+
+    result = publish.publish_registry(
+        manifest,
+        manifest_hash=manifest_hash,
+        snapshot_id=SNAPSHOT_ID,
+        competition_count=2,
+        edition_count=3,
+        expected_revision=5,
+        apply=False,
+    )
+
+    assert result.a6['status'] == 'checked'
+    assert result.as_dict()['a6']['mismatches'][0]['competition_id'] == 'AFCN'
+
+
+@pytest.mark.parametrize(
+    ('base', 'ok'),
+    [(OLD_SNAPSHOT_ID, True), ('tm-discovery-' + 'c' * 24, False), (None, False)],
+)
+def test_publication_requires_the_canonical_the_snapshot_was_built_on(base, ok):
+    # #1391: canonical replaced during the crawl -> CAS never attempted.
+    manifest = deepcopy(MANIFEST)
+    manifest['previous_snapshot_id'] = base
+    manifest_hash = publish.stable_hash(manifest)
+    executor = FakeExecutor(
+        readback={**_state(revision=6, new=True), 'source_hash': manifest_hash},
+    )
+
+    def run():
+        return publish.publish_registry(
+            manifest,
+            manifest_hash=manifest_hash,
+            snapshot_id=SNAPSHOT_ID,
+            competition_count=2,
+            edition_count=3,
+            expected_revision=5,
+            apply=True,
+            executor=executor,
+        )
+
+    if ok:
+        assert run().applied is True
+    else:
+        with pytest.raises(publish.RegistryCasError, match='base drifted'):
+            run()
+        assert len(executor.statements) == 1

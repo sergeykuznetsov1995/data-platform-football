@@ -33,6 +33,8 @@ _TRANSFORM_FILES = {
     'competition_editions': 'transfermarkt_competition_editions_v2.sql',
 }
 _HEX_64 = re.compile(r'^[a-f0-9]{64}$')
+# More carried-over competitions than this is a source outage (#1391).
+MAX_CARRIED_SHARE = 0.10
 _SNAPSHOT_ID = re.compile(r'^tm-discovery-[a-f0-9]{24}$')
 
 _COMPETITION_COLUMNS = (
@@ -210,6 +212,8 @@ class RegistryPublicationResult:
     previous_state: RegistryState | None = None
     promoted_state: RegistryState | None = None
     dq: tuple[tuple[str, int], ...] = ()
+    # Report only (#1391): denominator current_saison_id vs regulation.
+    a6: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -222,6 +226,7 @@ class RegistryPublicationResult:
                 asdict(self.promoted_state) if self.promoted_state else None
             ),
             'dq': dict(self.dq),
+            'a6': dict(self.a6) if self.a6 is not None else None,
         }
 
 
@@ -317,6 +322,19 @@ def _validate_manifest(
         or any(not _HEX_64.fullmatch(str(value)) for value in source_hashes)
     ):
         raise RegistryManifestError('source page evidence is partial')
+
+    report = manifest.get('discovery_report')
+    if report is not None:
+        if not isinstance(report, Mapping):
+            raise RegistryManifestError('discovery_report must be an object')
+        carried = report.get('carried_competition_ids', [])
+        if not isinstance(carried, Sequence) or isinstance(carried, (str, bytes)):
+            raise RegistryManifestError('carried_competition_ids must be an array')
+        if len(carried) > MAX_CARRIED_SHARE * competitions:
+            raise RegistryManifestError(
+                f'{len(carried)} of {competitions} competitions are carried '
+                f'over (more than {MAX_CARRIED_SHARE:.0%})'
+            )
 
     writes = manifest.get('writes')
     if not isinstance(writes, Sequence) or isinstance(writes, (str, bytes)):
@@ -871,6 +889,29 @@ def _assert_state_before(
         raise RegistryCasError('existing canonical registry is not promoted')
 
 
+def _assert_discovery_base(
+    state: RegistryState | None, manifest: Mapping[str, Any],
+) -> None:
+    """The snapshot must be built on the canonical this CAS replaces (#1391).
+
+    A standing run carries rows over from, and diffs against, the canonical
+    it read before crawling.  The CAS is bound to the revision read here, so
+    checking that revision's snapshot id rejects a snapshot built on a base
+    another publisher replaced during the crawl.  Manifests without the key
+    (one-shot runs) carry nothing over and keep their revision-only CAS.
+    """
+
+    if 'previous_snapshot_id' not in manifest:
+        return
+    base = manifest.get('previous_snapshot_id') or None
+    current = (state.registry_snapshot_id or None) if state is not None else None
+    if base != current:
+        raise RegistryCasError(
+            f'discovery base drifted: snapshot built on {base}, '
+            f'canonical is {current}'
+        )
+
+
 def _assert_readback(state: RegistryState | None, plan: RegistryPublicationPlan) -> None:
     if state is None:
         raise RegistryCasError('registry CAS produced no canonical row')
@@ -929,6 +970,47 @@ def _assert_rollback_readback(
         )
 
 
+def a6_report(
+    manifest: Mapping[str, Any], *, denominator: Any | None = None,
+) -> dict[str, Any]:
+    """Denominator ``current_saison_id`` against the regulation (#1391, A6).
+
+    For every live pokal-route competition of the denominator whose
+    regulation this snapshot read, a disagreement is listed.  Report only:
+    the denominator file is corrected by a reviewed commit, never here.
+    """
+
+    report = manifest.get('discovery_report')
+    current = (
+        report.get('regulation_current') if isinstance(report, Mapping) else None
+    )
+    if not isinstance(current, Mapping):
+        return {'status': 'no_regulation', 'checked': 0, 'mismatches': []}
+    try:
+        if denominator is None:
+            from scrapers.transfermarkt.denominator import load_denominator
+
+            denominator = load_denominator()
+        rows = [
+            row for row in (
+                denominator.row(competition_id) for competition_id in current
+            )
+            if row is not None and row.live and row.route == 'pokal'
+        ]
+    except Exception as exc:  # noqa: BLE001 - a report never blocks publication
+        return {'status': f'unavailable: {exc}', 'checked': 0, 'mismatches': []}
+    mismatches = [
+        {
+            'competition_id': row.competition_id,
+            'denominator': row.current_saison_id,
+            'regulation': int(current[row.competition_id]),
+        }
+        for row in sorted(rows, key=lambda item: item.competition_id)
+        if int(current[row.competition_id]) != row.current_saison_id
+    ]
+    return {'status': 'checked', 'checked': len(rows), 'mismatches': mismatches}
+
+
 def publish_registry(
     discovery_manifest: Mapping[str, Any],
     *,
@@ -959,8 +1041,9 @@ def publish_registry(
         expected_revision=expected_revision,
         sql_root=root,
     )
+    a6 = a6_report(discovery_manifest)
     if not apply:
-        return RegistryPublicationResult(plan=plan, applied=False)
+        return RegistryPublicationResult(plan=plan, applied=False, a6=a6)
 
     runner = _SqlRunner(executor=executor, connection=connection)
     previous: RegistryState | None = None
@@ -970,6 +1053,7 @@ def publish_registry(
             runner.execute(plan.statements[0]), allow_missing=True,
         )
         _assert_state_before(previous, expected_revision=plan.expected_revision)
+        _assert_discovery_base(previous, discovery_manifest)
 
         staging_dq: dict[str, int] | None = None
         target_dq: dict[str, int] | None = None
@@ -1016,6 +1100,7 @@ def publish_registry(
             previous_state=previous,
             promoted_state=promoted,
             dq=combined_dq,
+            a6=a6,
         )
     except Exception as exc:
         if cas_attempted:
@@ -1047,6 +1132,7 @@ __all__ = [
     'RegistryPublicationPlan',
     'RegistryPublicationResult',
     'RegistryState',
+    'a6_report',
     'publish_registry',
     'stable_hash',
 ]

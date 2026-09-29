@@ -242,12 +242,13 @@ def _persist_discovery(
     return manifest, manifest_hash, manifest_path, _Ti(result)
 
 
-def test_dag_is_monthly_single_run_and_proxy_task_is_serialized(dag_module):
+def test_dag_is_daily_single_run_and_proxy_task_is_serialized(dag_module):
     from airflow.operators.bash import BashOperator
     from airflow.operators.python import PythonOperator
 
     assert dag_module.dag.dag_id == "dag_discover_transfermarkt_registry"
-    assert dag_module.dag.schedule == "0 2 1 * *"
+    # 18:00 UTC = 21:00 MSK, every day (#1391).
+    assert dag_module.dag.schedule == "0 18 * * *"
     assert dag_module.dag._dag_kwargs["max_active_runs"] == 1
     assert dag_module.dag._dag_kwargs["catchup"] is False
 
@@ -609,6 +610,8 @@ class TestStandingRegistryDiscovery:
         monkeypatch.setenv("TM_STANDING_POLICY_ENABLED", "true")
         policy_path, policy_hash = _write_registry_policy(tmp_path, **overrides)
         monkeypatch.setattr(module, "STANDING_POLICY_PATH", str(policy_path))
+        # No canonical snapshot yet: a full crawl on the policy floors.
+        monkeypatch.setattr(module, "_read_registry_facts", lambda: (None, 0, None))
         return paths, policy_path, policy_hash
 
     def _prepare_kwargs(self, module, paths, *, run_type="scheduled"):
@@ -650,6 +653,48 @@ class TestStandingRegistryDiscovery:
         assert "TM_PAID_APPROVAL_PRESENTED_HASH" not in env
         assert "TM_WRITE_APPROVAL_PRESENTED_HASH" not in env
         assert not (paths["approval_root"] / "journal.json").exists()
+
+    @pytest.mark.parametrize(
+        ("age", "mode"),
+        [(timedelta(days=1), "daily"), (timedelta(days=8), "full")],
+    )
+    def test_scheduled_prepare_scales_caps_and_picks_the_mode(
+        self, dag_module, monkeypatch, tmp_path, age, mode
+    ):
+        """#1391: ceil(1.5 * (k * competitions + countries + 6)), k by mode."""
+        import math
+
+        from scrapers.transfermarkt.discovery import load_countries
+
+        committed = json.loads(
+            (
+                Path(__file__).resolve().parents[3]
+                / "dags" / "configs" / "transfermarkt"
+                / "standing_registry_policy.json"
+            ).read_text("utf-8")
+        )
+        paths, _, _ = self._arm(
+            dag_module, monkeypatch, tmp_path, scaling=committed["scaling"]
+        )
+        snapshot_id = "tm-discovery-" + "a" * 24
+        monkeypatch.setattr(
+            dag_module,
+            "_read_registry_facts",
+            lambda: (snapshot_id, 803, datetime.now(timezone.utc) - age),
+        )
+
+        env = dag_module._prepare_discovery(
+            **self._prepare_kwargs(dag_module, paths)
+        )
+
+        countries = len(load_countries())
+        per_competition = 2 if mode == "full" else 1
+        expected = math.ceil(1.5 * (per_competition * 803 + countries + 6))
+        assert env["TM_MODE"] == mode
+        assert env["TM_PREVIOUS_SNAPSHOT_ID"] == snapshot_id
+        assert int(env["TM_REQUEST_LIMIT"]) == expected
+        assert int(env["TM_RETRY_LIMIT"]) == math.ceil(0.1 * expected)
+        assert int(env["TM_BYTE_CAP_BYTES"]) == expected * 32 * 1024
 
     def test_gate_off_scheduled_prepare_fails_closed(
         self, dag_module, monkeypatch, tmp_path

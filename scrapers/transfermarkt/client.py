@@ -1721,8 +1721,14 @@ class TransfermarktHttpClient:
         validator: Optional[Callable[[Any], Optional[str]]] = None,
         cache_key: Optional[str] = None,
         cache_ttl_seconds: Optional[float] = None,
+        max_405_attempts: Optional[int] = None,
     ) -> FetchOutcome[Any]:
-        """Fetch one logical endpoint with bounded status-aware retries."""
+        """Fetch one logical endpoint with bounded status-aware retries.
+
+        ``max_405_attempts`` lowers the blocked-exit ladder for HTTP 405 only:
+        discovery gives a 405 one more exit and then reports the page as
+        unavailable instead of spending minutes on it (#1391).
+        """
 
         context = dict(context or {})
         cache_started = self._monotonic()
@@ -2096,9 +2102,12 @@ class TransfermarktHttpClient:
                     # attempts meant one alternate exit, and a third of the
                     # residential pool cannot reach the source at any moment —
                     # so a good page was routinely abandoned as blocked.
+                    blocked_cap = min(attempts_cap, _MAX_BLOCKED_ATTEMPTS)
+                    if status_code == 405 and max_405_attempts is not None:
+                        blocked_cap = min(blocked_cap, max(1, int(max_405_attempts)))
                     retry_allowed = (
                         self._has_alternate_proxy(proxy_obj)
-                        and attempt < min(attempts_cap, _MAX_BLOCKED_ATTEMPTS)
+                        and attempt < blocked_cap
                     )
                 elif status_code >= 500 or status_code == 0:
                     terminal_status = FetchStatus.RETRY_EXHAUSTED

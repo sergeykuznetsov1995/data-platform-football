@@ -349,7 +349,7 @@ def _approved_args(mod, tmp_path, monkeypatch, *, dry_run=False, **packet_change
 
 
 def _discovery(*, call_fetch: bool, incomplete: bool = False):
-    def run(*, fetch, checkpoint, traffic_ledger, clock):
+    def run(*, fetch, checkpoint, traffic_ledger, clock, **_options):
         del traffic_ledger, clock
         if call_fetch:
             url = "https://www.transfermarkt.com/wettbewerbe/europa"
@@ -367,7 +367,7 @@ def _discovery(*, call_fetch: bool, incomplete: bool = False):
     return run
 
 
-def _http_zero_discovery(*, fetch, checkpoint, traffic_ledger, clock):
+def _http_zero_discovery(*, fetch, checkpoint, traffic_ledger, clock, **_options):
     del checkpoint, traffic_ledger, clock
     outcome = fetch("https://www.transfermarkt.com/wettbewerbe/europa")
     raise RuntimeError(
@@ -388,6 +388,7 @@ def test_cached_dry_run_quarantines_unknown_and_never_emits_its_scope(tmp_path):
         args,
         execution_argv=(str(SCRIPT), *raw),
         discovery_fn=_discovery(call_fetch=False),
+        previous_reader=lambda snapshot_id: None,
         lease_provider_factory=lambda url: object(),
         http_client_factory=_FakeClient,
         writer_factory=lambda: pytest.fail("dry-run created an Iceberg writer"),
@@ -426,6 +427,7 @@ def test_unapproved_paid_fetch_fails_before_client_io_or_write(tmp_path):
             args,
             execution_argv=(str(SCRIPT), *raw),
             discovery_fn=_discovery(call_fetch=True),
+            previous_reader=lambda snapshot_id: None,
             lease_provider_factory=lambda url: object(),
             http_client_factory=_FakeClient,
             writer_factory=lambda: pytest.fail("writer must not be created"),
@@ -445,6 +447,7 @@ def test_production_requires_separate_write_approval_before_client(tmp_path):
             args,
             execution_argv=(str(SCRIPT), *raw),
             discovery_fn=_discovery(call_fetch=True),
+            previous_reader=lambda snapshot_id: None,
             lease_provider_factory=lambda url: object(),
             http_client_factory=_FakeClient,
             utcnow=lambda: NOW,
@@ -466,6 +469,7 @@ def test_approved_production_is_metered_and_writes_one_batch_per_table(
         args,
         execution_argv=execution,
         discovery_fn=_discovery(call_fetch=True),
+        previous_reader=lambda snapshot_id: None,
         lease_provider_factory=lambda url: object(),
         http_client_factory=_FakeClient,
         writer_factory=lambda: writer,
@@ -516,6 +520,7 @@ def test_incomplete_reconciliation_happens_before_all_writes_and_closes_packet(
             args,
             execution_argv=execution,
             discovery_fn=_discovery(call_fetch=True, incomplete=True),
+            previous_reader=lambda snapshot_id: None,
             lease_provider_factory=lambda url: object(),
             http_client_factory=_FakeClient,
             writer_factory=lambda: writer,
@@ -551,6 +556,7 @@ def test_http_zero_writes_atomic_terminal_manifest_and_never_touches_bronze(
             args,
             execution_argv=execution,
             discovery_fn=_http_zero_discovery,
+            previous_reader=lambda snapshot_id: None,
             lease_provider_factory=lambda url: object(),
             http_client_factory=_HttpZeroClient,
             writer_factory=lambda: writer,
@@ -635,6 +641,7 @@ def test_post_validation_write_failure_keeps_exact_row_hashes(
             args,
             execution_argv=execution,
             discovery_fn=_discovery(call_fetch=True),
+            previous_reader=lambda snapshot_id: None,
             lease_provider_factory=lambda url: object(),
             http_client_factory=_FakeClient,
             writer_factory=lambda: writer,
@@ -682,6 +689,7 @@ def test_approval_asset_drift_fails_before_proxy_and_state_mutation(
             args,
             execution_argv=execution,
             discovery_fn=_discovery(call_fetch=True),
+            previous_reader=lambda snapshot_id: None,
             lease_provider_factory=lambda url: object(),
             http_client_factory=_FakeClient,
             utcnow=lambda: NOW,
@@ -740,6 +748,7 @@ def _execute_standing(mod, tmp_path, raw, *, writer, discovery=None):
         mod._parser().parse_args(raw),
         execution_argv=(str(SCRIPT), *raw),
         discovery_fn=discovery or _discovery(call_fetch=True),
+        previous_reader=lambda snapshot_id: None,
         lease_provider_factory=lambda url: object(),
         http_client_factory=_FakeClient,
         writer_factory=lambda: writer,
@@ -805,6 +814,7 @@ def test_dry_run_standing_writes_no_authorization_record(
         mod._parser().parse_args(raw),
         execution_argv=(str(SCRIPT), *raw),
         discovery_fn=_discovery(call_fetch=True),
+        previous_reader=lambda snapshot_id: None,
         lease_provider_factory=lambda url: object(),
         http_client_factory=_FakeClient,
         writer_factory=lambda: pytest.fail("dry-run created an Iceberg writer"),
@@ -1022,6 +1032,7 @@ def test_corrupt_checkpoint_fails_closed_without_proxy_io(tmp_path):
             args,
             execution_argv=(str(SCRIPT), *raw),
             discovery_fn=_discovery(call_fetch=False),
+            previous_reader=lambda snapshot_id: None,
             lease_provider_factory=lambda url: object(),
             http_client_factory=_FakeClient,
             utcnow=lambda: NOW,
@@ -1035,3 +1046,216 @@ def test_corrupt_checkpoint_fails_closed_without_proxy_io(tmp_path):
         "competition_registry"
     ]["provider_bytes"] == 0
     assert Path(raised.value.manifest_path).is_file()
+
+
+# --------------------------------------------------------------------- #1391
+
+
+def _previous_registry(*, last_full_at):
+    from scrapers.transfermarkt.discovery import PreviousRegistry
+
+    page = _page()
+    competition = next(
+        item for item in page.competitions if item.competition_id == "GB1"
+    ).as_dict()
+    competition["discovered_at"] = last_full_at
+    return PreviousRegistry.from_rows(
+        SNAPSHOT_ID,
+        [competition],
+        [item.as_dict() for item in page.editions if item.competition_id == "GB1"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("age", "mode"),
+    [(None, "full"), (timedelta(days=3), "daily"), (timedelta(days=7), "full")],
+)
+def test_auto_mode_runs_full_once_the_last_full_crawl_is_a_week_old(age, mode):
+    mod = _load()
+    last_full_at = None if age is None else NOW - age
+
+    assert mod.resolve_mode("auto", last_full_at, NOW) == mode
+    assert mod.resolve_mode("daily", None, NOW) == "daily"
+
+
+def test_scaled_limits_follow_the_formula_with_the_policy_floors():
+    mod = _load()
+    policy = load_standing_policy(
+        Path(__file__).resolve().parents[3]
+        / "dags" / "configs" / "transfermarkt" / "standing_registry_policy.json"
+    )
+
+    daily = mod.discovery_limits(
+        policy, mod.DiscoverySizing("daily", previous_competitions=803, country_pages=211)
+    )
+    full = mod.discovery_limits(
+        policy, mod.DiscoverySizing("full", previous_competitions=803, country_pages=211)
+    )
+    tiny = mod.discovery_limits(
+        policy, mod.DiscoverySizing("daily", previous_competitions=10, country_pages=0)
+    )
+
+    # ceil(1.5 * (803 + 211 + 6)) and ceil(1.5 * (2 * 803 + 211 + 6)).
+    assert daily.request_limit == 1530
+    assert full.request_limit == 2735
+    assert full.retry_limit == 274
+    assert full.byte_cap_bytes == 2735 * 32 * 1024
+    assert tiny == mod.DiscoveryLimits(1024, 103, 1024 * 32 * 1024)
+    assert mod.discovery_limits(policy, None) == mod.DiscoveryLimits(
+        1024, 96, mod.HARD_PROVIDER_BYTE_BUDGET
+    )
+
+
+def test_run_passes_previous_mode_and_budget_guard_and_reports(tmp_path):
+    mod = _load()
+    seen = {}
+
+    def discovery(*, fetch, checkpoint, traffic_ledger, clock, **options):
+        del fetch, checkpoint, traffic_ledger, clock
+        seen.update(options)
+        options["report"].update({"carried_competition_ids": [], "mode": "daily"})
+        return (_page(),)
+
+    raw = _raw_args(tmp_path, dry_run=True, approval=False)
+    previous = _previous_registry(last_full_at=NOW - timedelta(days=2))
+    result = mod.execute(
+        mod._parser().parse_args(raw),
+        execution_argv=(str(SCRIPT), *raw),
+        discovery_fn=discovery,
+        previous_reader=lambda snapshot_id: previous,
+        lease_provider_factory=lambda url: object(),
+        http_client_factory=_FakeClient,
+        writer_factory=lambda: pytest.fail("dry-run created an Iceberg writer"),
+        utcnow=lambda: NOW,
+        monotonic=iter((10.0, 12.0)).__next__,
+    )
+
+    assert seen["mode"] == "daily"
+    assert seen["previous"] is previous
+    assert seen["countries"] == ()
+    assert callable(seen["fetch_json"]) and callable(seen["can_spend"])
+    # A dry run of 10 requests with 2 spare retries: 8 fit, 9 do not.
+    assert seen["can_spend"](8) is True
+    assert seen["can_spend"](9) is False
+    assert result.manifest["mode"] == "daily"
+    assert result.manifest["previous_snapshot_id"] == SNAPSHOT_ID
+    assert result.manifest["discovery_report"]["carried_competition_ids"] == []
+
+
+def test_regulation_fetch_is_json_with_a_short_cache_and_one_405_retry(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    args, execution, *_ = _approved_args(mod, tmp_path, monkeypatch)
+
+    def discovery(*, fetch, checkpoint, traffic_ledger, clock, **options):
+        del checkpoint, traffic_ledger, clock
+        fetch("https://www.transfermarkt.com/wettbewerbe/europa")
+        options["fetch_json"](
+            "https://tmapi.transfermarkt.technology/competition/GB1/regulation"
+        )
+        return (_page(),)
+
+    mod.execute(
+        args,
+        execution_argv=execution,
+        discovery_fn=discovery,
+        previous_reader=lambda snapshot_id: None,
+        lease_provider_factory=lambda url: object(),
+        http_client_factory=_FakeClient,
+        writer_factory=_FakeWriter,
+        utcnow=lambda: NOW,
+        monotonic=iter((10.0, 12.0)).__next__,
+    )
+
+    html, regulation = _FakeClient.instances[-1].fetch_calls
+    assert html["as_json"] is False and regulation["as_json"] is True
+    assert html["max_405_attempts"] == regulation["max_405_attempts"] == 2
+    assert regulation["cache_ttl_seconds"] == mod.REGULATION_CACHE_TTL_SECONDS
+
+
+class _RegistryCursor:
+    def __init__(self, canonical_id, queries):
+        self.canonical_id = canonical_id
+        self.queries = queries
+        self.description = ()
+        self._rows = []
+
+    def execute(self, sql):
+        self.queries.append(sql)
+        if "registry_state" in sql:
+            self.description = [("registry_snapshot_id",), ("competitions",), ("last_full_at",)]
+            self._rows = (
+                [] if self.canonical_id is None
+                else [(self.canonical_id, 1, NOW)]
+            )
+            return
+        page = _page()
+        if "competition_editions" in sql:
+            items = [item.as_dict() for item in page.editions if item.competition_id == "GB1"]
+        else:
+            items = [
+                item.as_dict() for item in page.competitions if item.competition_id == "GB1"
+            ]
+        for item in items:
+            item.setdefault("is_current", item.pop("current", False))
+        columns = list(items[0])
+        self.description = [(name,) for name in columns]
+        self._rows = [tuple(item[name] for name in columns) for item in items]
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
+
+
+class _RegistryConnection:
+    def __init__(self, canonical_id):
+        self.canonical_id = canonical_id
+        self.queries = []
+
+    def cursor(self):
+        return _RegistryCursor(self.canonical_id, self.queries)
+
+
+def test_pinned_previous_snapshot_is_checked_against_the_live_canonical():
+    mod = _load()
+    moved = _RegistryConnection("tm-discovery-" + "e" * 24)
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="drifted"):
+        mod.read_previous_registry(moved, SNAPSHOT_ID)
+    # Only the canonical pointer was read; no rows of either snapshot.
+    assert len(moved.queries) == 1
+
+    live = _RegistryConnection(SNAPSHOT_ID)
+    previous = mod.read_previous_registry(live, SNAPSHOT_ID)
+    assert previous.snapshot_id == SNAPSHOT_ID
+    assert set(previous.competitions) == {"GB1"}
+    assert f"'{SNAPSHOT_ID}'" in live.queries[1]
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="drifted"):
+        mod.read_previous_registry(_RegistryConnection(None), SNAPSHOT_ID)
+    assert mod.read_previous_registry(_RegistryConnection(None), None) is None
+
+
+def test_previous_snapshot_drift_fails_before_client_io(tmp_path):
+    mod = _load()
+    _FakeClient.instances.clear()
+    raw = _raw_args(tmp_path, dry_run=True, approval=False)
+    raw.extend(("--previous-snapshot-id", "tm-discovery-" + "d" * 24))
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="drifted"):
+        mod.execute(
+            mod._parser().parse_args(raw),
+            execution_argv=(str(SCRIPT), *raw),
+            discovery_fn=_discovery(call_fetch=False),
+            previous_reader=lambda snapshot_id: _previous_registry(
+                last_full_at=NOW
+            ),
+            lease_provider_factory=lambda url: object(),
+            http_client_factory=_FakeClient,
+            utcnow=lambda: NOW,
+        )
+    assert _FakeClient.instances == []

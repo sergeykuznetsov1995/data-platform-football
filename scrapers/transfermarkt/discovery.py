@@ -1,9 +1,23 @@
-"""Offline-testable HTML discovery for the Transfermarkt registry.
+"""Offline-testable discovery for the Transfermarkt registry.
 
 The adapter owns traversal and parsing, not HTTP.  Callers inject a proxy-only
-``fetch(url) -> FetchOutcome[str]`` function, a persistent mutable checkpoint,
-and the same shared traffic ledger used by that transport.  Any failed
-required page or structural drift aborts the whole snapshot.
+``fetch(url) -> FetchOutcome[str]`` function (and ``fetch_json`` for tmapi), a
+persistent mutable checkpoint, and the same shared traffic ledger used by that
+transport.
+
+Two modes (#1391):
+
+* ``full`` crawls the catalogue HTML (seed pages, configured country pages,
+  profiles) and reads every competition's tmapi ``regulation``;
+* ``daily`` reads only the regulation of every competition of the previous
+  canonical snapshot and republishes that snapshot with fresh editions.
+
+Editions come from the regulation (every season plus ``isCurrentSeason``); the
+HTML selector is the fallback and the cross-check.  A page that cannot be read
+(404/405/5xx/0 after retries) no longer aborts the snapshot: the affected
+competitions are carried over from the previous canonical snapshot.  Only an
+unreadable seed page, structural drift of a seed page, or more than 10 % of
+competitions carried aborts it.
 """
 
 from __future__ import annotations
@@ -14,11 +28,13 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Protocol
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Tag
 
+from scrapers.transfermarkt import tmapi
 from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from scrapers.transfermarkt.season import (
     SeasonRuleError,
@@ -70,7 +86,7 @@ _CANONICAL_SECTION = "startseite"
 # immutable, so the parser revision is part of the snapshot identity. Bump it
 # whenever parsing or classification changes — otherwise a restated catalogue
 # cannot be published over the snapshot id it would otherwise reuse.
-PARSER_REVISION = "tm-html-discovery-v3"  # v3: title edition id = saison_id (#1390)
+PARSER_REVISION = "tm-html-discovery-v4"  # v4: regulation editions, carried rows (#1391)
 SCHEMA_REVISION = "1"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
@@ -80,6 +96,25 @@ _SECTION_PRECEDENCE = 1
 _GROUP_PRECEDENCE = 2
 _ENTRANT_PRECEDENCE = 3
 _EDITION_PATH_RE = re.compile(r"/saison_id/(?P<edition_id>\d{4})(?:/|$)")
+MODES = ("full", "daily")
+# More carried competitions than this means the source, not a page, is down:
+# the snapshot is dropped instead of republishing a stale catalogue.
+MAX_CARRIED_SHARE = 0.10
+# Catalogue region labels: a country page names the real country instead.
+_REGION_NAMES = frozenset(
+    {"Unknown", "International", "Worldwide", "World",
+     "Europe", "Americas", "Asia", "Africa"}
+)
+# Country pages the full crawl reads next to the confederation pages. No
+# catalogue page links them; the ids are the flag ids the confederation
+# listings show (discovery checkpoint of 16.07.2026). Columns: country_id,
+# country, confederation (tab-separated). It lives under dags/ because only
+# dags/ and scrapers/ are mounted into the Airflow containers.
+COUNTRIES_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "dags" / "configs" / "transfermarkt" / "countries.tsv"
+)
+_COUNTRY_ID_RE = re.compile(r"[1-9][0-9]{0,3}")
 
 
 class DiscoveryError(RuntimeError):
@@ -88,6 +123,10 @@ class DiscoveryError(RuntimeError):
 
 class DiscoveryFetchError(DiscoveryError):
     """A required page did not return an authoritative HTTP 200."""
+
+
+class DiscoveryPageUnavailable(DiscoveryFetchError):
+    """A page answered 404/405/5xx/0 after the transport's own retries."""
 
 
 class DiscoverySchemaError(DiscoveryError):
@@ -133,6 +172,181 @@ class _CompetitionCandidate:
     owner_url: str
     listing_hashes: set[str] = field(default_factory=set)
     evidence: list[ClassificationEvidence] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Country:
+    """One Transfermarkt country page the full crawl reads (#1391)."""
+
+    country_id: str
+    country: str
+    confederation: str
+
+    @property
+    def url(self) -> str:
+        return f"{BASE_URL}/wettbewerbe/national/wettbewerbe/{self.country_id}"
+
+
+@dataclass(frozen=True)
+class ExtraCompetition:
+    """A competition no catalogue page lists, with its stated class."""
+
+    competition_id: str
+    slug: str
+    route: str
+    name: str
+    country: str
+    confederation: str
+    competition_type: CompetitionType
+    team_type: TeamType
+    age_category: AgeCategory
+
+    @property
+    def profile_url(self) -> str:
+        return (
+            f"{BASE_URL}/{self.slug}/startseite/{self.route}/{self.competition_id}"
+        )
+
+
+# Neither the catalogue nor the country pages list these (review 23.09,
+# C9-F3); ids are the source's own.  The Olympic tournament is an U-23 one.
+EXTRA_COMPETITIONS: tuple[ExtraCompetition, ...] = (
+    ExtraCompetition(
+        competition_id="KLUB",
+        slug="fifa-klub-wm",
+        route="pokalwettbewerb",
+        name="FIFA Club World Cup",
+        country="World",
+        confederation="FIFA",
+        competition_type=CompetitionType.CONTINENTAL_CLUB,
+        team_type=TeamType.CLUB,
+        age_category=AgeCategory.SENIOR,
+    ),
+    ExtraCompetition(
+        competition_id="OLYM",
+        slug="olympische-spiele",
+        route="pokalwettbewerb",
+        name="Olympic Games",
+        country="World",
+        confederation="FIFA",
+        competition_type=CompetitionType.NATIONAL_TEAM_TOURNAMENT,
+        team_type=TeamType.NATIONAL_TEAM,
+        age_category=AgeCategory.UXX,
+    ),
+)
+
+
+def load_countries(path: Optional[Path] = None) -> tuple[Country, ...]:
+    """The configured country pages; any format error fails closed."""
+
+    source = Path(path) if path is not None else COUNTRIES_PATH
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise DiscoveryError(f"countries file is unreadable: {source}") from exc
+    if not lines or lines[0].split("\t") != [
+        "country_id", "country", "confederation",
+    ]:
+        raise DiscoveryError(f"{source}: unexpected header")
+    countries: dict[str, Country] = {}
+    for number, line in enumerate(lines[1:], start=2):
+        fields = line.split("\t")
+        if len(fields) != 3 or any(not item.strip() for item in fields):
+            raise DiscoveryError(f"{source}:{number}: expected three fields")
+        country_id, country, confederation = (item.strip() for item in fields)
+        if not _COUNTRY_ID_RE.fullmatch(country_id):
+            raise DiscoveryError(f"{source}:{number}: invalid country_id")
+        if country_id in countries:
+            raise DiscoveryError(f"{source}:{number}: duplicate country_id")
+        countries[country_id] = Country(country_id, country, confederation)
+    if not countries:
+        raise DiscoveryError(f"{source}: no countries")
+    return tuple(countries[key] for key in sorted(countries, key=int))
+
+
+def _utc(value: Any) -> Any:
+    """Silver stores discovery times without a zone; they are UTC."""
+
+    if isinstance(value, datetime) and (
+        value.tzinfo is None or value.utcoffset() is None
+    ):
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+@dataclass(frozen=True)
+class PreviousRegistry:
+    """The canonical snapshot a run carries rows over from (#1391)."""
+
+    snapshot_id: str
+    competitions: Mapping[str, Mapping[str, Any]]
+    editions: Mapping[str, tuple[Mapping[str, Any], ...]]
+
+    @classmethod
+    def from_rows(
+        cls,
+        snapshot_id: str,
+        competition_rows: Iterable[Mapping[str, Any]],
+        edition_rows: Iterable[Mapping[str, Any]],
+    ) -> "PreviousRegistry":
+        competitions: dict[str, dict[str, Any]] = {}
+        for row in competition_rows:
+            item = {key: _utc(value) for key, value in dict(row).items()}
+            competitions[str(item["competition_id"])] = item
+        editions: dict[str, list[dict[str, Any]]] = {}
+        for row in edition_rows:
+            item = {key: _utc(value) for key, value in dict(row).items()}
+            if "current" not in item:
+                item["current"] = item.pop("is_current", False)
+            editions.setdefault(str(item["competition_id"]), []).append(item)
+        missing = sorted(set(competitions) - set(editions))
+        if missing or set(editions) - set(competitions):
+            raise DiscoveryError(
+                "previous registry snapshot is not complete: "
+                f"competitions without editions={missing[:10]}"
+            )
+        return cls(
+            snapshot_id=str(snapshot_id),
+            competitions=competitions,
+            editions={
+                key: tuple(sorted(value, key=lambda item: str(item["edition_id"])))
+                for key, value in editions.items()
+            },
+        )
+
+    @property
+    def last_full_at(self) -> Optional[datetime]:
+        """A full crawl refreshes competition rows; a daily run keeps them."""
+
+        stamps = [
+            _aware(item.get("discovered_at"))
+            for item in self.competitions.values()
+        ]
+        stamps = [item for item in stamps if item is not None]
+        return max(stamps) if stamps else None
+
+    def current_edition(self, competition_id: str) -> Optional[str]:
+        for item in self.editions.get(competition_id, ()):
+            if item.get("current"):
+                return str(item["edition_id"])
+        return None
+
+
+def _aware(value: Any) -> Optional[datetime]:
+    value = _utc(value)
+    if isinstance(value, datetime):
+        return value
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _utc(parsed)
+
+
+@dataclass(frozen=True)
+class _Regulation:
+    options: tuple[tuple[str, str, bool, Mapping[str, Any]], ...]
+    document: "_Document"
 
 
 @dataclass(frozen=True)
@@ -584,8 +798,11 @@ def _listing_candidates(
     *,
     page_url: str,
     page_hash: str,
+    context: Optional[_ListingContext] = None,
 ) -> tuple[_CompetitionCandidate, ...]:
-    context = _listing_context(soup, page_url)
+    # A configured country page states its country in the configuration; the
+    # page's own headings are only the fallback (#1391).
+    context = context or _listing_context(soup, page_url)
     candidates: list[_CompetitionCandidate] = []
     seen_links = 0
     for anchor in soup.select("a[href]"):
@@ -891,8 +1108,50 @@ def _unique_signal(evidence: Iterable[ClassificationEvidence], name: str, unknow
     return next(iter(values)) if len(values) == 1 else unknown
 
 
+def _regulation_options(
+    seasons: tuple[tmapi.RegulationSeason, ...],
+    *,
+    competition_id: str,
+) -> tuple[tuple[str, str, bool, Mapping[str, Any]], ...]:
+    """Every regulation season as an edition option, newest first.
+
+    An edition the source lists ahead of its current one (AFCN lists 2026 but
+    marks 2024 current) is registered but not active: nothing plans a season
+    that has not started.
+    """
+
+    current = tmapi.current_saison_id(seasons)
+    options = []
+    for season in seasons:
+        label = _normalise_text(season.display)
+        if not label:
+            raise DiscoverySchemaError(
+                f"regulation season has no label: {competition_id}/{season.saison_id}"
+            )
+        _label_season_format(label, competition_id)
+        attrs: Mapping[str, Any] = (
+            {"disabled": "disabled"} if season.saison_id > current else {}
+        )
+        options.append((str(season.saison_id), label, season.is_current, attrs))
+    return tuple(sorted(options, key=lambda item: item[0], reverse=True))
+
+
+def _html_current(
+    soup: BeautifulSoup, profile_url: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """The edition the HTML profile marks current, and how it said so."""
+
+    try:
+        options = _selector_options(soup, profile_url=profile_url)
+    except (DiscoveryError, RegistryError, SeasonRuleError):
+        return None, None
+    source = "selector" if _has_season_markup(soup) else "title"
+    current = next((item[0] for item in options if item[2]), None)
+    return current, source
+
+
 class TransfermarktCompetitionDiscovery:
-    """Traverse all official competition catalogs into complete registry pages."""
+    """Discover the complete competition registry (full or daily mode)."""
 
     def __init__(
         self,
@@ -901,42 +1160,68 @@ class TransfermarktCompetitionDiscovery:
         checkpoint: MutableMapping[str, Any],
         traffic_ledger: TrafficLedger,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        fetch_json: Optional[Callable[[str], FetchOutcome[Any]]] = None,
+        previous: Optional[PreviousRegistry] = None,
+        mode: str = "full",
+        countries: Iterable[Country] = (),
+        extra_competitions: Iterable[ExtraCompetition] = (),
+        can_spend: Optional[Callable[[int], bool]] = None,
+        report: Optional[MutableMapping[str, Any]] = None,
     ) -> None:
         if traffic_ledger is None:
             raise TypeError("traffic_ledger is required")
+        if mode not in MODES:
+            raise ValueError(f"discovery mode must be one of {MODES}: {mode!r}")
+        if mode == "daily" and (previous is None or fetch_json is None):
+            raise DiscoveryError(
+                "daily discovery needs the previous canonical snapshot and tmapi"
+            )
         self._fetch = fetch
+        self._fetch_json = fetch_json
         self._checkpoint = checkpoint
         self._traffic_ledger = traffic_ledger
         self._clock = clock
+        self._previous = previous
+        self._mode = mode
+        self._countries = {item.url: item for item in countries}
+        self._extras = tuple(extra_competitions)
+        self._can_spend = can_spend
         self._documents: dict[str, _Document] = {}
+        self.report: MutableMapping[str, Any] = report if report is not None else {}
+
+    def _cached(self, key: str) -> Optional[_Document]:
+        cached = self._checkpoint.get(key)
+        if cached is None:
+            return None
+        if not isinstance(cached, Mapping):
+            raise DiscoveryCheckpointError(
+                f"checkpoint entry is not an object: {key}"
+            )
+        body = cached.get("body")
+        expected_hash = cached.get("payload_hash")
+        if cached.get("status") != FetchStatus.OK.value or not isinstance(body, str):
+            raise DiscoveryCheckpointError(
+                f"checkpoint is not an authoritative success: {key}"
+            )
+        actual_hash = _payload_hash(body)
+        if expected_hash != actual_hash:
+            raise DiscoveryCheckpointError(
+                f"checkpoint payload hash mismatch: {key}"
+            )
+        self._traffic_ledger.record_cache_hit(
+            entity="competition_registry", duration_seconds=0.0
+        )
+        document = _Document(key, body, actual_hash)
+        self._documents[key] = document
+        return document
 
     def _get(self, url: str) -> _Document:
         canonical = _canonical_url(url)
         if canonical is None:
             raise DiscoveryFetchError(f"non-Transfermarkt URL: {url!r}")
-        cached = self._checkpoint.get(canonical)
+        cached = self._cached(canonical)
         if cached is not None:
-            if not isinstance(cached, Mapping):
-                raise DiscoveryCheckpointError(
-                    f"checkpoint entry is not an object: {canonical}"
-                )
-            body = cached.get("body")
-            expected_hash = cached.get("payload_hash")
-            if cached.get("status") != FetchStatus.OK.value or not isinstance(body, str):
-                raise DiscoveryCheckpointError(
-                    f"checkpoint is not an authoritative success: {canonical}"
-                )
-            actual_hash = _payload_hash(body)
-            if expected_hash != actual_hash:
-                raise DiscoveryCheckpointError(
-                    f"checkpoint payload hash mismatch: {canonical}"
-                )
-            self._traffic_ledger.record_cache_hit(
-                entity="competition_registry", duration_seconds=0.0
-            )
-            document = _Document(canonical, body, actual_hash)
-            self._documents[canonical] = document
-            return document
+            return cached
 
         self._traffic_ledger.ensure_request_allowed()
         outcome = self._fetch(canonical)
@@ -945,7 +1230,7 @@ class TransfermarktCompetitionDiscovery:
                 f"fetch returned {type(outcome).__name__}, expected FetchOutcome: {canonical}"
             )
         if outcome.status is not FetchStatus.OK or outcome.status_code != 200:
-            raise DiscoveryFetchError(
+            raise DiscoveryPageUnavailable(
                 "required discovery page failed: "
                 f"url={canonical}, status={outcome.status.value}, "
                 f"http={outcome.status_code or 0}"
@@ -969,6 +1254,73 @@ class TransfermarktCompetitionDiscovery:
         self._documents[canonical] = document
         return document
 
+    def _regulation(self, competition_id: str) -> Optional[_Regulation]:
+        """The competition's tmapi regulation; ``None`` = not proven.
+
+        A failed fetch or an unrecognised payload is reported and falls back
+        (HTML in full mode, the previous rows in daily mode); it is never read
+        as "no editions".
+        """
+
+        if self._fetch_json is None:
+            return None
+        url = tmapi.competition_regulation_url(competition_id)
+        document = self._cached(url)
+        if document is None:
+            self._traffic_ledger.ensure_request_allowed()
+            outcome = self._fetch_json(url)
+            if not isinstance(outcome, FetchOutcome):
+                raise DiscoveryFetchError(
+                    f"fetch_json returned {type(outcome).__name__}: {url}"
+                )
+            if outcome.status is not FetchStatus.OK or outcome.status_code != 200:
+                self.report.setdefault("regulation_unavailable", {})[
+                    competition_id
+                ] = f"status={outcome.status.value}, http={outcome.status_code or 0}"
+                return None
+            body = json.dumps(
+                outcome.value, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
+            document = _Document(url, body, _payload_hash(body))
+            try:
+                options = _regulation_options(
+                    tmapi.parse_regulation(
+                        outcome.value, competition_id=competition_id,
+                    ),
+                    competition_id=competition_id,
+                )
+            except (tmapi.TmapiSchemaError, DiscoveryError, ValueError) as exc:
+                self.report.setdefault("regulation_unavailable", {})[
+                    competition_id
+                ] = f"schema: {exc}"
+                return None
+            self._checkpoint[url] = {
+                "attempts": outcome.attempts,
+                "body": body,
+                "decoded_body_bytes": outcome.decoded_body_bytes,
+                "payload_hash": document.payload_hash,
+                "status": FetchStatus.OK.value,
+                "status_code": 200,
+            }
+            self._documents[url] = document
+            return _Regulation(options=options, document=document)
+        try:
+            options = _regulation_options(
+                tmapi.parse_regulation(
+                    json.loads(document.body), competition_id=competition_id,
+                ),
+                competition_id=competition_id,
+            )
+        except (tmapi.TmapiSchemaError, DiscoveryError, ValueError) as exc:
+            raise DiscoveryCheckpointError(
+                f"checkpointed regulation is invalid: {url}: {exc}"
+            ) from exc
+        return _Regulation(options=options, document=document)
+
+    def _affordable(self, requests: int) -> bool:
+        return self._can_spend is None or bool(self._can_spend(requests))
+
     @staticmethod
     def _soup(document: _Document) -> BeautifulSoup:
         soup = BeautifulSoup(document.body, "html.parser")
@@ -979,127 +1331,287 @@ class TransfermarktCompetitionDiscovery:
         return soup
 
     def discover(self) -> tuple[RegistryPage, ...]:
+        self.report.clear()
+        self.report.update(
+            {
+                "mode": self._mode,
+                "previous_snapshot_id": (
+                    self._previous.snapshot_id if self._previous else None
+                ),
+                "regulation_unavailable": {},
+            }
+        )
+        if self._mode == "daily":
+            return self._discover_daily()
+        return self._discover_full()
+
+    # ------------------------------------------------------------------ full
+
+    def _crawl_listings(
+        self,
+    ) -> tuple[dict[str, _Document], dict[str, _CompetitionCandidate], list[dict[str, str]]]:
         listing_documents: dict[str, _Document] = {}
         candidates: dict[str, _CompetitionCandidate] = {}
-        pending = list(SEED_URLS)
+        country_candidates: list[_CompetitionCandidate] = []
+        failures: list[dict[str, str]] = []
+        pending = sorted({*SEED_URLS, *self._countries})
         queued = set(pending)
         while pending:
             url = pending.pop(0)
-            document = self._get(url)
-            soup = self._soup(document)
+            seed = url in SEED_URLS
+            try:
+                document = self._get(url)
+                soup = self._soup(document)
+                country = self._countries.get(url.split("?", 1)[0])
+                context = (
+                    _ListingContext(country.country, country.confederation)
+                    if country is not None
+                    else None
+                )
+                found = _listing_candidates(
+                    soup,
+                    page_url=url,
+                    page_hash=document.payload_hash,
+                    context=context,
+                )
+            except (DiscoveryPageUnavailable, DiscoverySchemaError) as exc:
+                if seed:
+                    raise
+                # One unreadable listing is not a missing catalogue: the
+                # competitions it would have listed are carried over.
+                failures.append({"url": url, "error": str(exc)})
+                continue
             listing_documents[url] = document
-            for candidate in _listing_candidates(
-                soup, page_url=url, page_hash=document.payload_hash
-            ):
-                _merge_candidate(candidates, candidate)
+            if _is_country_listing(url):
+                country_candidates.extend(found)
+            else:
+                for candidate in found:
+                    _merge_candidate(candidates, candidate)
             for linked_url in _listing_links(soup, url):
                 if linked_url not in queued:
                     queued.add(linked_url)
                     pending.append(linked_url)
             pending.sort()
 
+        catalogue_ids = frozenset(candidates)
+        for candidate in country_candidates:
+            existing = candidates.get(candidate.competition_id)
+            if existing is None:
+                candidates[candidate.competition_id] = candidate
+                continue
+            if (
+                existing.country in _REGION_NAMES
+                and candidate.country not in _REGION_NAMES
+            ):
+                # The country page states the real country (#1391).
+                existing.country = candidate.country
+            if candidate.competition_id in catalogue_ids and narrowest_signals(
+                existing.evidence, "competition_type"
+            ):
+                # The confederation catalogue already classified it; a second
+                # section wording must not turn it into a conflict.  The
+                # country page still names its route and label.
+                candidate.evidence = []
+            candidate.country = existing.country
+            candidate.confederation = existing.confederation
+            _merge_candidate(candidates, candidate)
+
+        fifa = BASE_URL + "/wettbewerbe/fifa"
+        for extra in self._extras:
+            if extra.competition_id in candidates or fifa not in listing_documents:
+                continue
+            evidence = [
+                ClassificationEvidence(
+                    source_field="discovery_extra_competition",
+                    source_value=extra.competition_type.value,
+                    source_url=extra.profile_url,
+                    origin=EvidenceOrigin.STRUCTURED,
+                    precedence=_ENTRANT_PRECEDENCE,
+                    competition_type=extra.competition_type,
+                    gender=Gender.MEN,
+                    team_type=extra.team_type,
+                    age_category=extra.age_category,
+                )
+            ]
+            candidates[extra.competition_id] = _CompetitionCandidate(
+                competition_id=extra.competition_id,
+                slug=extra.slug,
+                name=extra.name,
+                profile_url=extra.profile_url,
+                country=extra.country,
+                confederation=extra.confederation,
+                owner_url=fifa,
+                listing_hashes={listing_documents[fifa].payload_hash},
+                evidence=evidence,
+            )
+        return listing_documents, candidates, failures
+
+    def _discover_full(self) -> tuple[RegistryPage, ...]:
+        listing_documents, candidates, listing_failures = self._crawl_listings()
         if not candidates:
             raise DiscoverySchemaError("complete catalog contains no competitions")
 
+        previous_ids = set(self._previous.competitions) if self._previous else set()
+        carried: dict[str, str] = {}
+        unavailable_new: dict[str, str] = {}
+        if listing_failures:
+            for competition_id in sorted(previous_ids - set(candidates)):
+                carried[competition_id] = "listing page unavailable"
+
         profiles: dict[str, tuple[_Document, BeautifulSoup]] = {}
+        regulations: dict[str, _Regulation] = {}
         # A competition whose own pages cannot be read is quarantined: it is
         # published with season_format=unknown and no editions, so the
         # registry reports it (quarantined_competition_ids) and nothing
         # plans it, while the rest of the snapshot still publishes (#1390).
         quarantined: dict[str, str] = {}
-        for candidate in sorted(candidates.values(), key=lambda item: item.competition_id):
-            document = self._get(candidate.profile_url)
-            soup = self._soup(document)
-            if not _has_season_markup(soup):
-                canonical = _canonical_profile_route(soup, candidate.profile_url)
-                identity = _profile_identity(canonical) if canonical else None
-                if canonical is not None and (
-                    identity is None or identity[0] != candidate.competition_id
-                ):
-                    # A canonical link to another competition quarantines this
-                    # one only; the foreign page is not fetched.
-                    quarantined[candidate.competition_id] = (
-                        f"canonical route changes identity: {canonical}"
-                    )
-                elif canonical is not None:
-                    document = self._get(canonical)
-                    soup = self._soup(document)
-                    candidate.slug = identity[1]
-                    candidate.profile_url = canonical
+        # Known competitions first: a spent budget then defers new ones.
+        order = sorted(
+            candidates.values(),
+            key=lambda item: (item.competition_id not in previous_ids,
+                              item.competition_id),
+        )
+        for candidate in order:
+            competition_id = candidate.competition_id
+            if not self._affordable(3):
+                reason = "request budget spent"
+                if competition_id in previous_ids:
+                    carried[competition_id] = reason
+                else:
+                    unavailable_new[competition_id] = reason
+                continue
+            try:
+                document = self._get(candidate.profile_url)
+                soup = self._soup(document)
+                if not _has_season_markup(soup):
+                    canonical = _canonical_profile_route(soup, candidate.profile_url)
+                    identity = _profile_identity(canonical) if canonical else None
+                    if canonical is not None and (
+                        identity is None or identity[0] != competition_id
+                    ):
+                        # A canonical link to another competition quarantines
+                        # this one only; the foreign page is not fetched.
+                        quarantined[competition_id] = (
+                            f"canonical route changes identity: {canonical}"
+                        )
+                    elif canonical is not None:
+                        document = self._get(canonical)
+                        soup = self._soup(document)
+                        candidate.slug = identity[1]
+                        candidate.profile_url = canonical
+            except DiscoveryPageUnavailable as exc:
+                if competition_id in previous_ids:
+                    carried[competition_id] = str(exc)
+                else:
+                    unavailable_new[competition_id] = str(exc)
+                continue
             declared_id = soup.select_one("[data-competition-id]")
             if declared_id is not None and str(
                 declared_id.get("data-competition-id")
-            ) != candidate.competition_id:
+            ) != competition_id:
                 # One inconsistent profile quarantines its competition only.
-                quarantined[candidate.competition_id] = (
+                quarantined[competition_id] = (
                     f"profile identity mismatch: {candidate.profile_url}"
                 )
-            profiles[candidate.competition_id] = (document, soup)
+            profiles[competition_id] = (document, soup)
+            if competition_id not in quarantined:
+                regulation = self._regulation(competition_id)
+                if regulation is not None:
+                    regulations[competition_id] = regulation
 
-        snapshot_material = {
-            "pages": {
-                url: document.payload_hash
-                for url, document in sorted(self._documents.items())
-            },
-            "parser_revision": PARSER_REVISION,
-            "schema_revision": SCHEMA_REVISION,
-        }
-        snapshot_digest = hashlib.sha256(
-            json.dumps(snapshot_material, separators=(",", ":"), sort_keys=True).encode()
-        ).hexdigest()
-        snapshot_id = "tm-discovery-" + snapshot_digest[:24]
-        discovered_at = self._clock()
-        if discovered_at.tzinfo is None or discovered_at.utcoffset() is None:
-            raise DiscoverySchemaError("discovery clock must be timezone-aware")
+        # Without regulation a known competition falls back to its HTML
+        # selector, which often lists fewer seasons than the previous
+        # canonical holds (regulation history, or a cup with no selector).
+        # Such a fallback would silently drop history, so the competition is
+        # carried whole instead; a fallback that keeps every previous edition
+        # is a normal refresh.
+        if self._previous is not None:
+            for competition_id in sorted(candidates):
+                if (
+                    competition_id in regulations
+                    or competition_id in quarantined
+                    or competition_id in carried
+                    or competition_id not in profiles
+                    or competition_id not in previous_ids
+                ):
+                    continue
+                known = {
+                    str(item["edition_id"])
+                    for item in self._previous.editions.get(competition_id, ())
+                }
+                try:
+                    found = {
+                        item[0]
+                        for item in _selector_options(
+                            profiles[competition_id][1],
+                            profile_url=candidates[competition_id].profile_url,
+                        )
+                    }
+                except DiscoverySchemaError:
+                    found = set()
+                if not known <= found:
+                    carried[competition_id] = (
+                        "regulation unavailable, HTML fallback lists "
+                        f"{len(known & found)} of {len(known)} previous editions"
+                    )
+        for competition_id in list(carried) + list(unavailable_new):
+            candidates.pop(competition_id, None)
+        self._check_carried_share(len(carried), len(candidates))
+        discovered_at, snapshot_id = self._snapshot_identity(carried)
 
         competition_records: dict[str, CompetitionRecord] = {}
         edition_records: dict[str, tuple[EditionRecord, ...]] = {}
         editionless: list[str] = []
+        title_only: list[str] = []
+        mismatches: list[dict[str, Any]] = []
         for competition_id, candidate in sorted(candidates.items()):
             profile_document, profile_soup = profiles[competition_id]
+            regulation = regulations.get(competition_id)
             options: tuple = ()
             season_format = SeasonFormat.UNKNOWN
             editions: list[EditionRecord] = []
+            evidence_field = "edition_selector"
             if competition_id not in quarantined:
                 try:
-                    options = _selector_options(
-                        profile_soup, profile_url=candidate.profile_url
-                    )
-                    season_format = _season_format(options, candidate.profile_url)
-                    for edition_id, label, current, attrs in options:
-                        edition_format = _label_season_format(
-                            label, candidate.profile_url
+                    if regulation is not None:
+                        options = regulation.options
+                        evidence_field = "regulation"
+                        html_current, _source = _html_current(
+                            profile_soup, candidate.profile_url
                         )
-                        editions.append(
-                            EditionRecord(
-                                competition_id=competition_id,
-                                edition_id=edition_id,
-                                edition_label=label,
-                                canonical_season=canonical_season(
-                                    label, edition_format
-                                ),
-                                season_format=edition_format,
-                                start_date=attrs.get("data-start-date"),
-                                end_date=attrs.get("data-end-date"),
-                                active="disabled" not in attrs,
-                                current=current,
-                                participant_count=attrs.get(
-                                    "data-participant-count"
-                                ),
-                                participant_hash=attrs.get(
-                                    "data-participant-hash"
-                                ),
-                                source_url=(
-                                    candidate.profile_url.rstrip("/")
-                                    + f"/saison_id/{edition_id}"
-                                ),
-                                discovered_at=discovered_at,
-                                registry_snapshot_id=snapshot_id,
-                                source_body_hash=profile_document.payload_hash,
-                                parser_revision=PARSER_REVISION,
-                                schema_revision=SCHEMA_REVISION,
+                        regulation_current = next(
+                            item[0] for item in options if item[2]
+                        )
+                        if (
+                            html_current is not None
+                            and html_current != regulation_current
+                        ):
+                            mismatches.append(
+                                {
+                                    "competition_id": competition_id,
+                                    "html": html_current,
+                                    "regulation": regulation_current,
+                                }
                             )
+                    else:
+                        options = _selector_options(
+                            profile_soup, profile_url=candidate.profile_url
                         )
+                        if not _has_season_markup(profile_soup):
+                            title_only.append(competition_id)
+                    season_format = _season_format(options, candidate.profile_url)
+                    editions = self._editions(
+                        competition_id,
+                        options,
+                        profile_url=candidate.profile_url,
+                        body_hash=(
+                            regulation.document.payload_hash
+                            if regulation is not None
+                            else profile_document.payload_hash
+                        ),
+                        discovered_at=discovered_at,
+                        snapshot_id=snapshot_id,
+                    )
                 except DiscoverySchemaError as exc:
                     if "edition selector missing" in str(exc):
                         # The source publishes no edition at all for these — a
@@ -1121,9 +1633,13 @@ class TransfermarktCompetitionDiscovery:
             if options:
                 evidence += (
                     ClassificationEvidence(
-                        source_field="edition_selector",
+                        source_field=evidence_field,
                         source_value=",".join(item[1] for item in options),
-                        source_url=candidate.profile_url,
+                        source_url=(
+                            regulation.document.url
+                            if evidence_field == "regulation"
+                            else candidate.profile_url
+                        ),
                         origin=EvidenceOrigin.STRUCTURED,
                         season_format=season_format,
                     ),
@@ -1142,10 +1658,11 @@ class TransfermarktCompetitionDiscovery:
                 canonical_id = resolve_competition(competition_id).canonical_competition_id
             except UnknownCompetitionError:
                 canonical_id = None
+            hashes = candidate.listing_hashes | {profile_document.payload_hash}
+            if regulation is not None:
+                hashes = hashes | {regulation.document.payload_hash}
             combined_hash = hashlib.sha256(
-                "|".join(
-                    sorted(candidate.listing_hashes | {profile_document.payload_hash})
-                ).encode()
+                "|".join(sorted(hashes)).encode()
             ).hexdigest()
             competition_records[competition_id] = CompetitionRecord(
                 competition_id=competition_id,
@@ -1175,33 +1692,289 @@ class TransfermarktCompetitionDiscovery:
         if not candidates:
             raise DiscoverySchemaError("complete catalog contains no competitions")
 
+        carried_records = self._carried_records(carried, snapshot_id)
+        self._check_carried_share(len(carried_records), len(candidates))
         listing_urls = tuple(sorted(listing_documents))
-        page_number = {url: index + 1 for index, url in enumerate(listing_urls)}
-        pages = []
-        for url in listing_urls:
-            owned_ids = sorted(
-                competition_id
-                for competition_id, candidate in candidates.items()
-                if candidate.owner_url == url
+        groups = [
+            (
+                url,
+                listing_documents[url].payload_hash,
+                sorted(
+                    competition_id
+                    for competition_id, candidate in candidates.items()
+                    if candidate.owner_url == url
+                ),
             )
+            for url in listing_urls
+        ]
+        self.report.update(
+            {
+                "listing_failures": listing_failures,
+                "unavailable_new": dict(sorted(unavailable_new.items())),
+                "title_only_competition_ids": sorted(title_only),
+                "current_mismatches": mismatches,
+            }
+        )
+        return self._pages(
+            snapshot_id=snapshot_id,
+            groups=groups,
+            competition_records=competition_records,
+            edition_records=edition_records,
+            carried=carried,
+            carried_records=carried_records,
+        )
+
+    # ----------------------------------------------------------------- daily
+
+    def _discover_daily(self) -> tuple[RegistryPage, ...]:
+        previous = self._previous
+        assert previous is not None
+        regulations: dict[str, _Regulation] = {}
+        carried: dict[str, str] = {}
+        for competition_id in sorted(previous.competitions):
+            if not self._affordable(1):
+                carried[competition_id] = "request budget spent"
+                continue
+            regulation = self._regulation(competition_id)
+            if regulation is None:
+                carried[competition_id] = "regulation unavailable"
+                continue
+            regulations[competition_id] = regulation
+        if not regulations:
+            raise DiscoveryError("daily discovery refreshed no competition")
+        discovered_at, snapshot_id = self._snapshot_identity(carried)
+
+        competition_records: dict[str, CompetitionRecord] = {}
+        edition_records: dict[str, tuple[EditionRecord, ...]] = {}
+        for competition_id, regulation in sorted(regulations.items()):
+            row = previous.competitions[competition_id]
+            try:
+                record = CompetitionRecord.from_mapping(
+                    row, registry_snapshot_id=snapshot_id,
+                )
+                # The competition row keeps its own discovery time: only a
+                # full crawl re-reads the catalogue that states it.
+                editions = self._editions(
+                    competition_id,
+                    regulation.options,
+                    profile_url=str(row["source_url"]),
+                    body_hash=regulation.document.payload_hash,
+                    discovered_at=discovered_at,
+                    snapshot_id=snapshot_id,
+                )
+            except (DiscoveryError, RegistryError, SeasonRuleError) as exc:
+                carried[competition_id] = f"regulation not applicable: {exc}"
+                continue
+            competition_records[competition_id] = record
+            edition_records[competition_id] = tuple(editions)
+
+        carried_records = self._carried_records(carried, snapshot_id)
+        self._check_carried_share(len(carried_records), len(competition_records))
+        body = "|".join(
+            sorted(item.document.payload_hash for item in regulations.values())
+        )
+        groups = [
+            (
+                tmapi.TMAPI_BASE + "/competition/regulation",
+                _payload_hash(body),
+                sorted(competition_records),
+            )
+        ]
+        self.report.update(
+            {
+                "listing_failures": [],
+                "unavailable_new": {},
+                "title_only_competition_ids": [],
+                "current_mismatches": [],
+            }
+        )
+        return self._pages(
+            snapshot_id=snapshot_id,
+            groups=groups,
+            competition_records=competition_records,
+            edition_records=edition_records,
+            carried=carried,
+            carried_records=carried_records,
+        )
+
+    # ---------------------------------------------------------------- shared
+
+    def _snapshot_identity(self, carried: Mapping[str, str]) -> tuple[datetime, str]:
+        discovered_at = self._clock()
+        if discovered_at.tzinfo is None or discovered_at.utcoffset() is None:
+            raise DiscoverySchemaError("discovery clock must be timezone-aware")
+        snapshot_material = {
+            "pages": {
+                url: document.payload_hash
+                for url, document in sorted(self._documents.items())
+            },
+            "parser_revision": PARSER_REVISION,
+            "schema_revision": SCHEMA_REVISION,
+            # A daily run can read byte-identical regulations; it is still a
+            # new snapshot, or the Silver MERGE keyed on the snapshot id would
+            # keep yesterday's discovery times.
+            "mode": self._mode,
+            "discovered_at": discovered_at.isoformat(),
+            "previous_snapshot_id": (
+                self._previous.snapshot_id if self._previous else None
+            ),
+            "carried": sorted(carried),
+        }
+        snapshot_digest = hashlib.sha256(
+            json.dumps(snapshot_material, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        return discovered_at, "tm-discovery-" + snapshot_digest[:24]
+
+    @staticmethod
+    def _editions(
+        competition_id: str,
+        options: Iterable[tuple[str, str, bool, Mapping[str, Any]]],
+        *,
+        profile_url: str,
+        body_hash: str,
+        discovered_at: datetime,
+        snapshot_id: str,
+    ) -> list[EditionRecord]:
+        editions = []
+        for edition_id, label, current, attrs in options:
+            edition_format = _label_season_format(label, profile_url)
+            editions.append(
+                EditionRecord(
+                    competition_id=competition_id,
+                    edition_id=edition_id,
+                    edition_label=label,
+                    canonical_season=canonical_season(label, edition_format),
+                    season_format=edition_format,
+                    start_date=attrs.get("data-start-date"),
+                    end_date=attrs.get("data-end-date"),
+                    active="disabled" not in attrs,
+                    current=current,
+                    participant_count=attrs.get("data-participant-count"),
+                    participant_hash=attrs.get("data-participant-hash"),
+                    source_url=(
+                        profile_url.rstrip("/") + f"/saison_id/{edition_id}"
+                    ),
+                    discovered_at=discovered_at,
+                    registry_snapshot_id=snapshot_id,
+                    source_body_hash=body_hash,
+                    parser_revision=PARSER_REVISION,
+                    schema_revision=SCHEMA_REVISION,
+                )
+            )
+        return editions
+
+    def _carried_records(
+        self, carried: Mapping[str, str], snapshot_id: str,
+    ) -> dict[str, tuple[CompetitionRecord, tuple[EditionRecord, ...]]]:
+        """Previous rows of competitions this run could not read.
+
+        They keep their own discovery time, which is how the history lane
+        tells a carried competition from a refreshed one.
+        """
+
+        records: dict[str, tuple[CompetitionRecord, tuple[EditionRecord, ...]]] = {}
+        if self._previous is None:
+            return records
+        for competition_id in sorted(carried):
+            row = self._previous.competitions.get(competition_id)
+            if row is None:
+                continue
+            records[competition_id] = (
+                CompetitionRecord.from_mapping(
+                    row, registry_snapshot_id=snapshot_id,
+                ),
+                tuple(
+                    EditionRecord.from_mapping(
+                        item, registry_snapshot_id=snapshot_id,
+                    )
+                    for item in self._previous.editions.get(competition_id, ())
+                ),
+            )
+        return records
+
+    @staticmethod
+    def _check_carried_share(carried: int, refreshed: int) -> None:
+        total = carried + refreshed
+        if total and carried / total > MAX_CARRIED_SHARE:
+            raise DiscoveryError(
+                f"{carried} of {total} competitions would be carried over "
+                f"(more than {MAX_CARRIED_SHARE:.0%}); the snapshot is dropped"
+            )
+
+    def _pages(
+        self,
+        *,
+        snapshot_id: str,
+        groups: list[tuple[str, str, list[str]]],
+        competition_records: Mapping[str, CompetitionRecord],
+        edition_records: Mapping[str, tuple[EditionRecord, ...]],
+        carried: Mapping[str, str],
+        carried_records: Mapping[
+            str, tuple[CompetitionRecord, tuple[EditionRecord, ...]]
+        ],
+    ) -> tuple[RegistryPage, ...]:
+        groups = list(groups)
+        if carried_records:
+            previous_id = self._previous.snapshot_id if self._previous else ""
+            groups.append(
+                (
+                    f"registry-snapshot:{previous_id}",
+                    _payload_hash(previous_id),
+                    sorted(carried_records),
+                )
+            )
+        pages = []
+        for index, (url, body_hash, owned_ids) in enumerate(groups, start=1):
+            competitions = []
+            editions = []
+            for competition_id in owned_ids:
+                if competition_id in carried_records:
+                    record, carried_editions = carried_records[competition_id]
+                    competitions.append(record)
+                    editions.extend(carried_editions)
+                else:
+                    competitions.append(competition_records[competition_id])
+                    editions.extend(edition_records[competition_id])
             pages.append(
                 RegistryPage(
                     snapshot_id=snapshot_id,
-                    page_number=page_number[url],
-                    page_count=len(listing_urls),
+                    page_number=index,
+                    page_count=len(groups),
                     source_url=url,
-                    source_body_hash=listing_documents[url].payload_hash,
-                    competitions=tuple(
-                        competition_records[competition_id]
-                        for competition_id in owned_ids
-                    ),
-                    editions=tuple(
-                        edition
-                        for competition_id in owned_ids
-                        for edition in edition_records[competition_id]
-                    ),
+                    source_body_hash=body_hash,
+                    competitions=tuple(competitions),
+                    editions=tuple(editions),
                 )
             )
+
+        previous = self._previous
+        new_current = []
+        regulation_current = {}
+        for competition_id, editions in sorted(edition_records.items()):
+            current = next(
+                (item.edition_id for item in editions if item.current), None
+            )
+            if current is None:
+                continue
+            if self._documents.get(tmapi.competition_regulation_url(competition_id)):
+                regulation_current[competition_id] = current
+            before = previous.current_edition(competition_id) if previous else None
+            if before != current:
+                new_current.append(
+                    {
+                        "competition_id": competition_id,
+                        "previous": before,
+                        "current": current,
+                    }
+                )
+        self.report.update(
+            {
+                "carried": dict(sorted(carried.items())),
+                "carried_competition_ids": sorted(carried_records),
+                "regulation_current": regulation_current,
+                "new_current_editions": new_current,
+            }
+        )
         return tuple(pages)
 
 
@@ -1211,19 +1984,30 @@ def discover_competition_registry(
     checkpoint: MutableMapping[str, Any],
     traffic_ledger: TrafficLedger,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    **options: Any,
 ) -> tuple[RegistryPage, ...]:
-    """Convenience API for one complete fail-closed discovery snapshot."""
+    """Convenience API for one discovery snapshot (see the class)."""
 
     return TransfermarktCompetitionDiscovery(
         fetch=fetch,
         checkpoint=checkpoint,
         traffic_ledger=traffic_ledger,
         clock=clock,
+        **options,
     ).discover()
 
 
 __all__ = [
     "BASE_URL",
+    "COUNTRIES_PATH",
+    "EXTRA_COMPETITIONS",
+    "MAX_CARRIED_SHARE",
+    "MODES",
+    "Country",
+    "DiscoveryPageUnavailable",
+    "ExtraCompetition",
+    "PreviousRegistry",
+    "load_countries",
     "SEED_ROUTES",
     "SEED_URLS",
     "DiscoveryCheckpointError",

@@ -31,6 +31,9 @@ from utils.transfermarkt_scope_planner import (
 BACKFILL_DAG_ID = "dag_backfill_transfermarkt"
 BACKFILL_RESULT_ROOT = "/opt/airflow/logs/transfermarkt-backfill"
 DEFAULT_DISCOVERY_MAX_AGE = timedelta(hours=24)
+# Editions are refreshed by the daily discovery, competitions by the weekly
+# full crawl (#1391).
+DEFAULT_COMPETITION_MAX_AGE = timedelta(days=8)
 INITIAL_SCOPE_CHUNK_SIZE = 128
 MAX_STATE_MUTATION_SQL_BYTES = 900_000
 _OPEN_CAMPAIGN_STATUSES = (
@@ -1012,8 +1015,19 @@ def validate_fresh_registry_snapshot(
     *,
     now: datetime | None = None,
     max_age: timedelta = DEFAULT_DISCOVERY_MAX_AGE,
+    competition_max_age: timedelta = DEFAULT_COMPETITION_MAX_AGE,
 ) -> tuple[dict[str, Any], ...]:
-    """Require a complete, single, freshly discovered promoted snapshot."""
+    """Require a single promoted snapshot refreshed by discovery (#1391).
+
+    Editions must be at most ``max_age`` old (the daily run refreshes them)
+    and their competitions at most ``competition_max_age`` (the weekly full
+    crawl).  A competition discovery could not read is carried over with its
+    own old stamps: every one of its editions is stale, or — when a later
+    daily run refreshed its editions — its competition row is.  The history
+    lane leaves such a competition out until the next full crawl instead of
+    failing the campaign.  A snapshot with nothing fresh, or a competition
+    with only some editions refreshed, still fails.
+    """
 
     items = tuple(dict(item) for item in rows)
     if not items:
@@ -1024,14 +1038,42 @@ def validate_fresh_registry_snapshot(
     observed = now or datetime.now(timezone.utc)
     if observed.tzinfo is None or observed.utcoffset() is None:
         raise BackfillRuntimeError("registry freshness clock must include a timezone")
-    cutoff = observed.astimezone(timezone.utc) - max_age
+    observed = observed.astimezone(timezone.utc)
+    cutoff = observed - max_age
+    competition_cutoff = observed - competition_max_age
+    stale_editions: dict[str, list[bool]] = {}
+    stale_competitions: set[str] = set()
     for item in items:
-        for field in ("competition_discovered_at", "edition_discovered_at"):
-            if _utc_timestamp(item.get(field), field=field) < cutoff:
-                raise BackfillRuntimeError(
-                    "a fresh full discovery snapshot is required before campaign creation"
-                )
-    return items
+        competition_id = str(item.get("competition_id") or "")
+        stale = _utc_timestamp(
+            item.get("edition_discovered_at"), field="edition_discovered_at"
+        ) < cutoff
+        stale_editions.setdefault(competition_id, []).append(stale)
+        if _utc_timestamp(
+            item.get("competition_discovered_at"),
+            field="competition_discovered_at",
+        ) < competition_cutoff:
+            stale_competitions.add(competition_id)
+    carried = stale_competitions | {
+        competition_id
+        for competition_id, flags in stale_editions.items()
+        if all(flags)
+    }
+    fresh = tuple(
+        item for item in items
+        if str(item.get("competition_id") or "") not in carried
+    )
+    stale_message = (
+        "a fresh full discovery snapshot is required before campaign creation"
+    )
+    if not fresh:
+        raise BackfillRuntimeError(stale_message)
+    for item in fresh:
+        if _utc_timestamp(
+            item.get("edition_discovered_at"), field="edition_discovered_at"
+        ) < cutoff:
+            raise BackfillRuntimeError(stale_message)
+    return fresh
 
 
 def historical_targets_from_registry(
@@ -1336,6 +1378,7 @@ def registry_target_for_scope(
 __all__ = [
     "BACKFILL_DAG_ID",
     "BACKFILL_RESULT_ROOT",
+    "DEFAULT_COMPETITION_MAX_AGE",
     "DEFAULT_DISCOVERY_MAX_AGE",
     "BackfillRuntimeError",
     "BackfillStateRepository",

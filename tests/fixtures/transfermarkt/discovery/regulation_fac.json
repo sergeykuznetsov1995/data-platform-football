@@ -1,0 +1,198 @@
+{
+ "success": true,
+ "message": "OK",
+ "data": [
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2025,
+    "display": "25/26",
+    "cyclicalName": "25/26",
+    "nonCyclicalName": "25/26"
+   },
+   "isCurrentSeason": true,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2025"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2024,
+    "display": "24/25",
+    "cyclicalName": "24/25",
+    "nonCyclicalName": "24/25"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2024"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2023,
+    "display": "23/24",
+    "cyclicalName": "23/24",
+    "nonCyclicalName": "23/24"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2023"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2022,
+    "display": "22/23",
+    "cyclicalName": "22/23",
+    "nonCyclicalName": "22/23"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2022"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2021,
+    "display": "21/22",
+    "cyclicalName": "21/22",
+    "nonCyclicalName": "21/22"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2021"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2020,
+    "display": "20/21",
+    "cyclicalName": "20/21",
+    "nonCyclicalName": "20/21"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2020"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2019,
+    "display": "19/20",
+    "cyclicalName": "19/20",
+    "nonCyclicalName": "19/20"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2019"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2018,
+    "display": "18/19",
+    "cyclicalName": "18/19",
+    "nonCyclicalName": "18/19"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2018"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2017,
+    "display": "17/18",
+    "cyclicalName": "17/18",
+    "nonCyclicalName": "17/18"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2017"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2016,
+    "display": "16/17",
+    "cyclicalName": "16/17",
+    "nonCyclicalName": "16/17"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2016"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2015,
+    "display": "15/16",
+    "cyclicalName": "15/16",
+    "nonCyclicalName": "15/16"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2015"
+  },
+  {
+   "competitionId": "FAC",
+   "hostCountryIds": [],
+   "winnerClubId": null,
+   "tournamentStart": null,
+   "tournamentEnd": null,
+   "season": {
+    "id": 2014,
+    "display": "14/15",
+    "cyclicalName": "14/15",
+    "nonCyclicalName": "14/15"
+   },
+   "isCurrentSeason": false,
+   "hasCompetitionTables": true,
+   "relativeUrl": "/fa-cup/startseite/pokalwettbewerb/FAC?saison_id=2014"
+  }
+ ]
+}

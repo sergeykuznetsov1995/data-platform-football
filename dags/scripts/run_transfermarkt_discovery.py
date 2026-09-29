@@ -5,6 +5,12 @@ The command is deliberately a separate production boundary from entity
 crawling.  It has one proxy lease client, one shared byte ledger and no direct
 network fallback.  All source pages are reconciled and flattened before either
 Bronze table is touched.
+
+Two modes (#1391): ``full`` crawls the catalogue and the configured country
+pages and reads every tmapi regulation; ``daily`` reads only the regulations
+of the previous canonical snapshot.  ``auto`` runs ``full`` when the last full
+crawl is older than seven days.  The previous canonical snapshot (read from
+Silver before any paid I/O) is where unreadable competitions are carried from.
 """
 
 from __future__ import annotations
@@ -22,19 +28,22 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from dags.utils import transfermarkt_registry_publish as _registry_publish
 from dags.utils.transfermarkt_approval import (
     ApprovalJournal,
     ApprovalPacket,
     ApprovalStateError,
     ApprovalValidationError,
     StandingPolicy,
+    StandingPolicyScaling,
     load_standing_policy,
 )
 from scrapers.transfermarkt.client import (
@@ -42,7 +51,13 @@ from scrapers.transfermarkt.client import (
     TransfermarktHttpClient,
     redact_sensitive,
 )
-from scrapers.transfermarkt.discovery import discover_competition_registry
+from scrapers.transfermarkt.discovery import (
+    EXTRA_COMPETITIONS,
+    MODES,
+    PreviousRegistry,
+    discover_competition_registry,
+    load_countries,
+)
 from scrapers.utils.rate_limiter import RateLimiter
 from scrapers.transfermarkt.models import (
     FetchOutcome,
@@ -80,6 +95,35 @@ STANDING_POLICY_DAG_ID = "dag_discover_transfermarkt_registry"
 # per-DAG isolation comes from the dag_id pinned inside each policy file.
 STANDING_POLICY_ENV_GATE = "TM_STANDING_POLICY_ENABLED"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
+_SNAPSHOT_ID = re.compile(r"^tm-discovery-[a-f0-9]{24}$")
+# A full crawl refreshes the catalogue weekly; daily runs refresh editions.
+FULL_REFRESH_AFTER = timedelta(days=7)
+# 405 is one exit's block: one more exit, then the page is unavailable.
+MAX_405_ATTEMPTS = 2
+# Regulations answer "which edition is current today": a cached answer may
+# only serve a rerun of the same day's run, never the next day's.
+REGULATION_CACHE_TTL_SECONDS = 60 * 60
+# Budget guard estimate per request (observed ~27.5 KiB metered per HTML page).
+BUDGET_GUARD_BYTES_PER_REQUEST = 32 * 1024
+SOFT_STOP_MARGIN_BYTES = HARD_PROVIDER_BYTE_BUDGET - SOFT_PROVIDER_BYTE_STOP
+# The promoted registry relations are owned by the publisher, which the
+# consumer audit already classifies as a physical-v2 control reader.
+REGISTRY_STATE_TABLE = _registry_publish.REGISTRY_STATE_TABLE
+SILVER_COMPETITIONS_TABLE = _registry_publish.COMPETITIONS_TABLE
+SILVER_EDITIONS_TABLE = _registry_publish.EDITIONS_TABLE
+_PREVIOUS_COMPETITION_COLUMNS = (
+    "competition_id", "slug", "name", "country", "confederation",
+    "competition_type", "gender", "team_type", "age_category",
+    "season_format", "active", "source_url", "discovered_at",
+    "canonical_competition_id", "classification_evidence",
+    "source_body_hash", "parser_revision", "schema_revision",
+)
+_PREVIOUS_EDITION_COLUMNS = (
+    "competition_id", "edition_id", "edition_label", "canonical_season",
+    "season_format", "start_date", "end_date", "active", "is_current",
+    "participant_count", "participant_hash", "source_url", "discovered_at",
+    "source_body_hash", "parser_revision", "schema_revision",
+)
 
 COMPETITION_COLUMNS = (
     "competition_id",
@@ -400,11 +444,76 @@ def _approval_mode(args: argparse.Namespace) -> str:
     return "standing_policy" if standing else "one_shot"
 
 
+@dataclass(frozen=True)
+class DiscoverySizing:
+    """The work one run covers, known before any paid I/O (#1391)."""
+
+    mode: str
+    previous_competitions: int
+    country_pages: int
+
+
+@dataclass(frozen=True)
+class DiscoveryLimits:
+    request_limit: int
+    retry_limit: int
+    byte_cap_bytes: int
+
+
+def discovery_limits(
+    policy: StandingPolicy, sizing: DiscoverySizing | None,
+) -> DiscoveryLimits:
+    """The exact caps a standing policy grants one run.
+
+    ``request_limit = max(floor, ceil(multiplier * (k * competitions +
+    country pages + seed pages)))`` with ``k`` requests per competition of
+    the mode (full: profile + regulation; daily: regulation); retries and
+    provider bytes scale with it.  The policy's ``paid_proxy`` caps are the
+    floors, and a policy without ``scaling`` grants exactly the floors.
+    """
+
+    paid = policy.paid_proxy
+    scaling: StandingPolicyScaling | None = policy.scaling
+    if scaling is None or sizing is None:
+        return DiscoveryLimits(
+            paid.request_limit, paid.retry_limit, paid.byte_cap_bytes,
+        )
+    if sizing.mode not in MODES:
+        raise DiscoveryRunnerError(f"unknown discovery mode: {sizing.mode!r}")
+    if sizing.previous_competitions < 0 or sizing.country_pages < 0:
+        raise DiscoveryRunnerError("discovery sizing must be non-negative")
+    per_competition = (
+        scaling.full_requests_per_competition
+        if sizing.mode == "full"
+        else scaling.daily_requests_per_competition
+    )
+    work = (
+        per_competition * sizing.previous_competitions
+        + sizing.country_pages
+        + scaling.seed_pages
+    )
+    request_limit = max(
+        paid.request_limit, math.ceil(scaling.request_multiplier * work),
+    )
+    return DiscoveryLimits(
+        request_limit=request_limit,
+        retry_limit=max(
+            paid.retry_limit, math.ceil(scaling.retry_share * request_limit),
+        ),
+        byte_cap_bytes=max(
+            paid.byte_cap_bytes,
+            request_limit * scaling.provider_bytes_per_request,
+        ),
+    )
+
+
 def validate_standing_policy_for_discovery(
     policy: StandingPolicy,
     *,
     request_limit: int,
     retry_limit: int,
+    byte_cap_bytes: int = HARD_PROVIDER_BYTE_BUDGET,
+    sizing: DiscoverySizing | None = None,
 ) -> None:
     """Check one standing policy against the discovery contour's exact caps."""
 
@@ -414,10 +523,12 @@ def validate_standing_policy_for_discovery(
         )
     policy.assert_not_expired(datetime.now(timezone.utc))
     paid = policy.paid_proxy
+    expected = discovery_limits(policy, sizing)
     if (
         paid.byte_cap_bytes != HARD_PROVIDER_BYTE_BUDGET
-        or paid.request_limit != int(request_limit)
-        or paid.retry_limit != int(retry_limit)
+        or expected.request_limit != int(request_limit)
+        or expected.retry_limit != int(retry_limit)
+        or expected.byte_cap_bytes != int(byte_cap_bytes)
         or paid.concurrency != CONCURRENCY
     ):
         raise DiscoveryRunnerError(
@@ -440,7 +551,9 @@ def validate_standing_policy_for_discovery(
         )
 
 
-def _enforce_standing_policy(args: argparse.Namespace) -> StandingPolicy:
+def _enforce_standing_policy(
+    args: argparse.Namespace, *, sizing: DiscoverySizing | None = None,
+) -> StandingPolicy:
     """Prove the committed policy before the checkpoint, client or any I/O."""
 
     if os.environ.get(STANDING_POLICY_ENV_GATE, "").strip().lower() not in {
@@ -465,8 +578,119 @@ def _enforce_standing_policy(args: argparse.Namespace) -> StandingPolicy:
         policy,
         request_limit=args.request_limit,
         retry_limit=args.retry_limit,
+        byte_cap_bytes=args.byte_cap_bytes,
+        sizing=sizing,
     )
     return policy
+
+
+def _rows(cursor) -> list[dict[str, Any]]:
+    columns = [
+        str(getattr(item, "name", None) or item[0])
+        for item in (cursor.description or ())
+    ]
+    return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+
+def read_registry_facts(connection) -> tuple[str | None, int, datetime | None]:
+    """Canonical snapshot id, its competition count and its last full crawl.
+
+    A full crawl stamps every competition it read; a daily run keeps those
+    stamps, so the newest competition stamp is the last full crawl.
+    """
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT s.registry_snapshot_id, COUNT(c.competition_id) "
+            "AS competitions, MAX(c.discovered_at) AS last_full_at "
+            f"FROM {REGISTRY_STATE_TABLE} s "
+            f"LEFT JOIN {SILVER_COMPETITIONS_TABLE} c "
+            "ON c.registry_snapshot_id = s.registry_snapshot_id "
+            "WHERE s.state_key = 'canonical' AND s.status = 'promoted' "
+            "GROUP BY s.registry_snapshot_id"
+        )
+        rows = _rows(cursor)
+    finally:
+        cursor.close()
+    if not rows:
+        return None, 0, None
+    if len(rows) != 1:
+        raise DiscoveryRunnerError("canonical registry state must be one row")
+    row = rows[0]
+    last_full_at = row["last_full_at"]
+    if isinstance(last_full_at, datetime) and last_full_at.tzinfo is None:
+        last_full_at = last_full_at.replace(tzinfo=timezone.utc)
+    return str(row["registry_snapshot_id"]), int(row["competitions"]), last_full_at
+
+
+def read_previous_registry(
+    connection, snapshot_id: str | None,
+) -> PreviousRegistry | None:
+    """Rows of the canonical snapshot, read-only.
+
+    ``snapshot_id`` is the canonical the DAG sized this run for; the live
+    canonical must still be that snapshot, otherwise the run would carry and
+    compare against a superseded registry.
+    """
+
+    canonical_id, _count, _last_full = read_registry_facts(connection)
+    if snapshot_id is not None and canonical_id != str(snapshot_id):
+        raise DiscoveryRunnerError(
+            "previous registry snapshot drifted: "
+            f"pinned {snapshot_id}, canonical {canonical_id}"
+        )
+    snapshot_id = canonical_id
+    if snapshot_id is None:
+        return None
+    if not _SNAPSHOT_ID.fullmatch(str(snapshot_id)):
+        raise DiscoveryRunnerError("unsafe previous registry snapshot id")
+    literal = f"'{snapshot_id}'"
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            f"SELECT {', '.join(_PREVIOUS_COMPETITION_COLUMNS)} "
+            f"FROM {SILVER_COMPETITIONS_TABLE} "
+            f"WHERE registry_snapshot_id = {literal}"
+        )
+        competitions = _rows(cursor)
+        cursor.execute(
+            f"SELECT {', '.join(_PREVIOUS_EDITION_COLUMNS)} "
+            f"FROM {SILVER_EDITIONS_TABLE} "
+            f"WHERE registry_snapshot_id = {literal}"
+        )
+        editions = _rows(cursor)
+    finally:
+        cursor.close()
+    if not competitions:
+        raise DiscoveryRunnerError(
+            f"previous registry snapshot has no rows: {snapshot_id}"
+        )
+    return PreviousRegistry.from_rows(snapshot_id, competitions, editions)
+
+
+def _default_previous_reader(snapshot_id: str | None) -> PreviousRegistry | None:
+    from dags.utils.transfermarkt_native_v2 import connect
+
+    connection = connect()
+    try:
+        return read_previous_registry(connection, snapshot_id)
+    finally:
+        connection.close()
+
+
+def resolve_mode(
+    requested: str, last_full_at: datetime | None, now: datetime,
+) -> str:
+    """``full`` when the last full crawl is a week old (or never happened)."""
+
+    if requested in MODES:
+        return requested
+    if requested != "auto":
+        raise DiscoveryRunnerError(f"unknown discovery mode: {requested!r}")
+    if last_full_at is None or now - last_full_at >= FULL_REFRESH_AFTER:
+        return "full"
+    return "daily"
 
 
 class _StandingAuthorization:
@@ -950,6 +1174,7 @@ def _execute_once(
     writer_factory: Callable[[], Any] = _default_writer_factory,
     utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     monotonic: Callable[[], float] = time.monotonic,
+    previous_reader: Callable[[str | None], PreviousRegistry | None] | None = None,
 ) -> DiscoveryRunResult:
     """Execute one fully bounded registry snapshot (dependency-injectable)."""
 
@@ -961,6 +1186,8 @@ def _execute_once(
         raise DiscoveryRunnerError("cache TTL must be positive")
     if args.lease_ttl_seconds <= 0:
         raise DiscoveryRunnerError("lease TTL must be positive")
+    if args.byte_cap_bytes <= SOFT_STOP_MARGIN_BYTES:
+        raise DiscoveryRunnerError("provider byte cap is below the soft-stop margin")
     cycle_id = _safe_component(args.cycle_id, field="cycle_id")
     checkpoint_path = _absolute_path(args.checkpoint, field="checkpoint")
     cache_path = _absolute_path(args.cache, field="cache")
@@ -993,13 +1220,35 @@ def _execute_once(
         journal_path or "not-used-dry-run-approval-journal",
     )
     approval_mode = _approval_mode(args)
+    if approval_mode == "one_shot" and args.byte_cap_bytes != HARD_PROVIDER_BYTE_BUDGET:
+        raise DiscoveryRunnerError("one-shot discovery keeps the 15 MiB cap")
+    # The previous canonical snapshot is read (Trino, read-only) before any
+    # paid I/O: it sizes the budget, picks the mode and is what unreadable
+    # competitions are carried from.
+    requested_previous = args.previous_snapshot_id or None
+    previous = (previous_reader or _default_previous_reader)(requested_previous)
+    if requested_previous is not None and (
+        previous is None or previous.snapshot_id != requested_previous
+    ):
+        raise DiscoveryRunnerError("previous registry snapshot drifted")
+    mode = resolve_mode(
+        args.mode, previous.last_full_at if previous else None, utcnow(),
+    )
+    if mode == "daily" and previous is None:
+        raise DiscoveryRunnerError("daily discovery needs a canonical snapshot")
+    countries = load_countries()
+    sizing = DiscoverySizing(
+        mode=mode,
+        previous_competitions=len(previous.competitions) if previous else 0,
+        country_pages=len(countries),
+    )
     standing_policy: StandingPolicy | None = None
     paid_authorization: _OneShotAuthorization | _StandingAuthorization
     write_authorization: _OneShotAuthorization | _StandingAuthorization
     if approval_mode == "standing_policy":
         # The env gate, pinned sha, caps and table checks all fail here,
         # before the checkpoint, cache, lease client or any paid I/O exist.
-        standing_policy = _enforce_standing_policy(args)
+        standing_policy = _enforce_standing_policy(args, sizing=sizing)
         paid_authorization = _StandingAuthorization(standing_policy)
         write_authorization = paid_authorization
     else:
@@ -1031,8 +1280,8 @@ def _execute_once(
     checkpoint_entries_before = len(checkpoint)
     cache_entries_before = len(cache)
     ledger = SharedTrafficLedger(
-        hard_provider_bytes=HARD_PROVIDER_BYTE_BUDGET,
-        soft_provider_bytes=SOFT_PROVIDER_BYTE_STOP,
+        hard_provider_bytes=args.byte_cap_bytes,
+        soft_provider_bytes=args.byte_cap_bytes - SOFT_STOP_MARGIN_BYTES,
         retry_limit=args.retry_limit,
     )
     lease_provider = lease_provider_factory(args.proxy_control_url)
@@ -1077,7 +1326,29 @@ def _execute_once(
             validator=_validate_html,
             cache_key=hashlib.sha256(url.encode("utf-8")).hexdigest(),
             cache_ttl_seconds=args.cache_ttl_seconds,
+            max_405_attempts=MAX_405_ATTEMPTS,
         )
+        return _checked(outcome)
+
+    def fetch_json(url: str) -> FetchOutcome[Any]:
+        paid_authorization.require()
+        retries_used = int(client.get_traffic_stats().get("retries", 0))
+        remaining_retries = max(0, args.retry_limit - retries_used)
+        outcome = client.fetch(
+            url,
+            as_json=True,
+            max_attempts=min(MAX_ATTEMPTS, remaining_retries + 1),
+            label=ENTITY,
+            context={"scope": cycle_id},
+            cache_key=hashlib.sha256(url.encode("utf-8")).hexdigest(),
+            cache_ttl_seconds=min(
+                args.cache_ttl_seconds, REGULATION_CACHE_TTL_SECONDS,
+            ),
+            max_405_attempts=MAX_405_ATTEMPTS,
+        )
+        return _checked(outcome)
+
+    def _checked(outcome: FetchOutcome[Any]) -> FetchOutcome[Any]:
         if outcome.status is not FetchStatus.OK or outcome.status_code != 200:
             return outcome
         if not outcome.payload_hash:
@@ -1086,6 +1357,24 @@ def _execute_once(
             raise DiscoveryRunnerError("successful response payload hash mismatch")
         return outcome
 
+    def can_spend(requests: int) -> bool:
+        """Leave room for every retry still allowed and the byte soft stop.
+
+        When the budget runs out, known competitions are carried and new ones
+        wait for the next run instead of the snapshot failing on the cap.
+        """
+
+        used = ledger.snapshot()
+        spare_retries = max(0, args.retry_limit - int(used["retries"]))
+        return (
+            int(used["requests"]) + requests + spare_retries <= args.request_limit
+            and int(used["provider_metered_bytes"])
+            + requests * BUDGET_GUARD_BYTES_PER_REQUEST
+            <= args.byte_cap_bytes - SOFT_STOP_MARGIN_BYTES
+        )
+
+    report: dict[str, Any] = {}
+
     try:
         source_started = True
         pages = discovery_fn(
@@ -1093,6 +1382,13 @@ def _execute_once(
             checkpoint=checkpoint,
             traffic_ledger=ledger,
             clock=utcnow,
+            fetch_json=fetch_json,
+            previous=previous,
+            mode=mode,
+            countries=countries if mode == "full" else (),
+            extra_competitions=EXTRA_COMPETITIONS if mode == "full" else (),
+            can_spend=can_spend,
+            report=report,
         )
         snapshot = reconcile_registry_pages(pages)
         fetched_at = utcnow()
@@ -1107,7 +1403,7 @@ def _execute_once(
         # either production table is touched.
         client.close()
         traffic = _traffic_manifest(ledger)
-        if traffic["provider_metered_bytes"] > HARD_PROVIDER_BYTE_BUDGET:
+        if traffic["provider_metered_bytes"] > args.byte_cap_bytes:
             raise DiscoveryRunnerError("provider hard byte budget exceeded")
         if traffic["requests"] > args.request_limit:
             raise DiscoveryRunnerError("request limit exceeded")
@@ -1140,6 +1436,11 @@ def _execute_once(
             "expected_entities": list(EXPECTED_ENTITIES),
             "snapshot_id": snapshot.snapshot_id,
             "snapshot_hash": snapshot.snapshot_hash,
+            "mode": mode,
+            "previous_snapshot_id": previous.snapshot_id if previous else None,
+            # Carried/unreadable competitions, title-only editions, HTML vs
+            # regulation disagreements and new current editions (#1391).
+            "discovery_report": dict(report),
             # The snapshot's own timezone-aware capture time: standing
             # publication compares it with the canonical state's promoted_at
             # so a cleared publish task of an old run cannot replay a stale
@@ -1277,6 +1578,7 @@ def execute(
     writer_factory: Callable[[], Any] = _default_writer_factory,
     utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     monotonic: Callable[[], float] = time.monotonic,
+    previous_reader: Callable[[str | None], PreviousRegistry | None] | None = None,
 ) -> DiscoveryRunResult:
     """Execute discovery and persist terminal evidence for setup failures too."""
 
@@ -1290,6 +1592,7 @@ def execute(
             writer_factory=writer_factory,
             utcnow=utcnow,
             monotonic=monotonic,
+            previous_reader=previous_reader,
         )
     except BaseException as exc:
         if getattr(exc, "manifest_path", None):
@@ -1364,6 +1667,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--standing-policy")
     parser.add_argument("--standing-policy-sha256")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--mode", choices=("auto", *MODES), default="auto")
+    parser.add_argument("--previous-snapshot-id")
+    parser.add_argument(
+        "--byte-cap-bytes", type=int, default=HARD_PROVIDER_BYTE_BUDGET,
+    )
     return parser
 
 
