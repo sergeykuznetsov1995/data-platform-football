@@ -303,7 +303,7 @@ throwaway, а не в хрупком общем scheduler.
 ### 🟢 Live-канарейка через прокси — GREEN (по решению владельца «гнать через прокси»)
 Артефакт: `/root/whoscored-954-runtime/canary-curlcffi-20260718T062208Z.json` +
 `CANARY-GREEN-20260718.md`; раннер `ws_canary_curlcffi.py`. Non-publishing, ~1.4 MB прокси.
-- Хост-IP (IPv4 `159.195.193.250` И IPv6 `2a0a:4cc0:…`) оба Cloudflare-challenge'атся на
+- Хост-IP (и IPv4, и IPv6 VM платформы) оба Cloudflare-challenge'атся на
   EPL-поверхности; резидентный прокси (order 38950) её проходит → блокер = репутация host-IP.
 - Сквозной прогон через прокси: `/Regions/252/Tournaments/2` → 200 →
   `find_source_season_id`=10743; `/Matches/1903117/Live` → 200 (matchCentreData) →

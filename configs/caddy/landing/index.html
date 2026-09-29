@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Football Data Platform</title>
+<meta name="description" content="Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов, живые дашборды без регистрации.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23111'/%3E%3Ctext x='16' y='22' font-family='Georgia,serif' font-size='18' fill='white' text-anchor='middle'%3EF%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --ink: #17161a;
+    --ink-2: #5a5964;
+    --rule: #d9d6cd;
+    --accent: #1d4d2b;
+    --img-border: #cfcbc0;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #131315;
+    --ink: #ebe8e1;
+    --ink-2: #9b9891;
+    --rule: #34343a;
+    --accent: #8fd3a5;
+    --img-border: #3a3a41;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #131315;
+      --ink: #ebe8e1;
+      --ink-2: #9b9891;
+      --rule: #34343a;
+      --accent: #8fd3a5;
+      --img-border: #3a3a41;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 17px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .serif { font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Charter, Georgia, "Times New Roman", serif; }
+  a { color: inherit; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 22px 20px 56px; }
+
+  .top { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid var(--rule); padding-bottom: 12px; }
+  .brand { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }
+  .controls { display: flex; gap: 18px; font-size: 13px; letter-spacing: .06em; text-transform: uppercase; }
+  .controls button { background: none; border: 0; padding: 0; font: inherit; color: var(--ink-2); cursor: pointer; letter-spacing: inherit; text-transform: inherit; }
+  .controls button:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 4px; }
+
+  h1 { font-weight: 400; font-size: clamp(38px, 6.4vw, 64px); line-height: 1.05; letter-spacing: -.015em; margin: 54px 0 22px; max-width: 14ch; }
+  .lead { font-size: 19px; max-width: 58ch; margin: 0 0 8px; }
+  .lead-2 { color: var(--ink-2); max-width: 58ch; margin: 0 0 40px; }
+
+  .figures { display: grid; grid-template-columns: repeat(5, 1fr); border-top: 1px solid var(--ink); border-bottom: 1px solid var(--rule); margin: 0 0 56px; }
+  .fig { padding: 18px 16px 18px 0; border-right: 1px solid var(--rule); margin-right: 16px; }
+  .fig:last-child { border-right: 0; margin-right: 0; }
+  .fig b { display: block; font-weight: 400; font-size: 34px; line-height: 1; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .fig span { display: block; margin-top: 8px; font-size: 13px; color: var(--ink-2); line-height: 1.3; }
+
+  h2 { font-weight: 400; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); margin: 0 0 18px; }
+  .dash { list-style: none; margin: 0 0 56px; padding: 0; counter-reset: d; }
+  .dash li { border-top: 1px solid var(--rule); padding: 22px 0; display: grid; grid-template-columns: 2fr 3fr; gap: 24px 40px; align-items: start; }
+  .dash li:last-child { border-bottom: 1px solid var(--rule); }
+  .dash .text { counter-increment: d; }
+  .dash .text::before { content: counter(d, decimal-leading-zero); display: block; font-size: 13px; color: var(--ink-2); letter-spacing: .1em; margin-bottom: 8px; }
+  .dash h3 { margin: 0 0 8px; font-weight: 400; font-size: 27px; line-height: 1.15; letter-spacing: -.01em; }
+  .dash h3 a { text-decoration: none; }
+  .dash h3 a:hover { text-decoration: underline; text-underline-offset: 5px; text-decoration-color: var(--accent); }
+  .dash p { margin: 0 0 14px; color: var(--ink-2); max-width: 36ch; }
+  .dash .open { font-size: 14px; letter-spacing: .04em; color: var(--accent); text-decoration: none; }
+  .dash .open:hover { text-decoration: underline; text-underline-offset: 4px; }
+  .dash .shot { display: block; border: 1px solid var(--img-border); background: #fff; }
+  .dash .shot img { display: block; width: 100%; height: auto; }
+
+  .nb { margin: 0 0 56px; }
+  .nb .intro { display: grid; grid-template-columns: 2fr 3fr; gap: 24px 40px; border-top: 1px solid var(--rule); padding: 22px 0; }
+  .nb h3 { margin: 0 0 8px; font-weight: 400; font-size: 27px; line-height: 1.15; letter-spacing: -.01em; }
+  .nb h3 a { text-decoration: none; }
+  .nb h3 a:hover { text-decoration: underline; text-underline-offset: 5px; text-decoration-color: var(--accent); }
+  .nb p { margin: 0 0 14px; color: var(--ink-2); max-width: 44ch; }
+  .nb .open { font-size: 14px; letter-spacing: .04em; color: var(--accent); text-decoration: none; }
+  .nb .open:hover { text-decoration: underline; text-underline-offset: 4px; }
+  .nb .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px 20px; border-bottom: 1px solid var(--rule); padding-bottom: 22px; }
+  .nb figure { margin: 0; }
+  .nb figure a { display: block; border: 1px solid var(--img-border); background: #0f1218; aspect-ratio: 900 / 460; overflow: hidden; }
+  .nb figure img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; }
+  .nb figcaption { margin-top: 8px; font-size: 13px; color: var(--ink-2); line-height: 1.35; }
+  .foot { display: grid; grid-template-columns: 1fr 1fr; gap: 24px 40px; border-top: 1px solid var(--ink); padding-top: 22px; font-size: 15px; }
+  .foot p { margin: 0 0 6px; }
+  .foot .muted { color: var(--ink-2); }
+  .foot a { text-decoration: underline; text-underline-offset: 4px; text-decoration-color: var(--rule); }
+  .foot a:hover { text-decoration-color: var(--accent); }
+
+  @media (max-width: 760px) {
+    .wrap { padding: 16px 16px 40px; }
+    h1 { margin-top: 36px; }
+    .lead { font-size: 18px; }
+    .figures { grid-template-columns: 1fr 1fr; }
+    .fig { border-right: 0; margin-right: 0; border-bottom: 1px solid var(--rule); padding: 14px 0; }
+    .fig:nth-child(odd) { border-right: 1px solid var(--rule); padding-right: 14px; margin-right: 14px; }
+    .fig:last-child { border-bottom: 0; border-right: 0; }
+    .fig b { font-size: 28px; }
+    .dash li { grid-template-columns: 1fr; gap: 14px; }
+    .dash .shot { order: -1; }
+    .dash h3 { font-size: 23px; }
+    .nb .intro { grid-template-columns: 1fr; gap: 14px; }
+    .nb h3 { font-size: 23px; }
+    .nb .grid { grid-template-columns: 1fr; }
+    .foot { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">Football Data Platform</div>
+    <div class="controls">
+      <button id="lang" type="button" aria-label="Switch language">English</button>
+      <button id="theme" type="button" aria-label="Switch theme">Тёмная</button>
+    </div>
+  </header>
+
+  <h1 class="serif" data-i18n="title">Футбольные данные для авторов и аналитиков</h1>
+  <p class="lead" data-i18n="lead">Открытые данные из 11 источников собраны в одно хранилище: матчи, события, удары, xG, составы, трансферы, рейтинги.</p>
+  <p class="lead-2" data-i18n="lead2">Дашборды ниже открываются без регистрации. Данные — топ-5 европейских лиг за десять сезонов, по 2025/26 включительно.</p>
+
+  <section class="figures" aria-label="figures">
+    <div class="fig"><b class="serif">11</b><span data-i18n="f_sources">источников данных</span></div>
+    <div class="fig"><b class="serif">10</b><span data-i18n="f_seasons">сезонов топ-5 лиг, 2016/17–2025/26</span></div>
+    <div class="fig"><b class="serif" data-i18n="f_matches_v">18 тыс.</b><span data-i18n="f_matches">матчей</span></div>
+    <div class="fig"><b class="serif" data-i18n="f_events_v">28 млн</b><span data-i18n="f_events">событий</span></div>
+    <div class="fig"><b class="serif" data-i18n="f_shots_v">429 тыс.</b><span data-i18n="f_shots">ударов</span></div>
+  </section>
+
+  <h2 data-i18n="h_dash">Дашборды</h2>
+  <ol class="dash">
+    <li>
+      <div class="text">
+        <h3 class="serif"><a href="https://bi.sk-vpn-2026.uk/superset/dashboard/league-overview/" data-i18n="d1">Обзор лиги + игроки</a></h3>
+        <p data-i18n="d1s">Таблица со «сверх-очками» относительно xPTS, форма команд по турам, Elo, трансферы и зарплаты, лидеры сезона, вратари.</p>
+        <a class="open" href="https://bi.sk-vpn-2026.uk/superset/dashboard/league-overview/" data-i18n="open">Открыть дашборд →</a>
+      </div>
+      <a class="shot" href="https://bi.sk-vpn-2026.uk/superset/dashboard/league-overview/" tabindex="-1" aria-hidden="true"><img src="img/league-overview.jpg" width="1200" height="667" alt="" loading="lazy"></a>
+    </li>
+    <li>
+      <div class="text">
+        <h3 class="serif"><a href="https://bi.sk-vpn-2026.uk/superset/dashboard/player-overview-league/" data-i18n="d2">Сводный обзор лиги — игроки</a></h3>
+        <p data-i18n="d2s">Голы против xG, рейтинги SofaScore, ключевые передачи и динамика игроков по матчам за сезон 2025/26.</p>
+        <a class="open" href="https://bi.sk-vpn-2026.uk/superset/dashboard/player-overview-league/" data-i18n="open">Открыть дашборд →</a>
+      </div>
+      <a class="shot" href="https://bi.sk-vpn-2026.uk/superset/dashboard/player-overview-league/" tabindex="-1" aria-hidden="true"><img src="img/player-overview-league.jpg" width="1200" height="667" alt="" loading="lazy"></a>
+    </li>
+  </ol>
+
+  <h2 data-i18n="h_nb">Ноутбук</h2>
+  <section class="nb">
+    <div class="intro">
+      <div class="text">
+        <h3 class="serif"><a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" data-i18n="nb">Разбор матча в Jupyter</a></h3>
+        <p data-i18n="nbs">Выбираете лигу, сезон, матч, команду и игрока — шесть графиков по событиям с координатами и ударам с xG перерисовываются. Только pandas, matplotlib и ipywidgets поверх слоя gold; на снимках — Juventus — Lazio 2:2, Serie A 2025/26.</p>
+        <a class="open" href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" data-i18n="nb_open">Открыть ноутбук на GitHub →</a>
+      </div>
+      <p class="muted" data-i18n="nb_note">Ноутбук читает Trino напрямую и запускается в JupyterHub платформы; на GitHub виден код и описание, графики строятся при запуске.</p>
+    </div>
+    <div class="grid">
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-losses.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb1">Потери в своей трети: звёзды — те, что привели к удару соперника</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-form.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb2">Форма команд Serie A: последние 7 туров против начала сезона</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-xg-timeline.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb3">Накопленный xG матча и кто давит по 5-минутным отрезкам</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-pass-map.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb4">Карта передач игрока и его перцентили по лиге</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-shots-entries.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb5">Удары по xG и входы в 20-метровую зону у ворот</figcaption>
+      </figure>
+      <figure>
+        <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-pass-network.jpg" width="900" height="460" alt="" loading="lazy"></a>
+        <figcaption data-i18n="nb6">Сети передач обеих команд</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <div>
+      <p><a href="https://github.com/sergeykuznetsov1995/data-platform-football" rel="noopener" data-i18n="gh">Код на GitHub</a></p>
+      <p class="muted" data-i18n="stack">Python, Airflow, Apache Iceberg, Trino, Superset. Архитектура bronze / silver / gold.</p>
+    </div>
+    <div>
+      <p><span data-i18n="sql">Нужен SQL или Jupyter — напишите: </span><a href="https://t.me/Sergeykuznetsov1995" rel="noopener">@Sergeykuznetsov1995</a></p>
+      <p class="muted" data-i18n="foot">Пет-проект Сергея Кузнецова. Данные из открытых источников, для некоммерческого использования.</p>
+    </div>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var i18n = {
+    ru: {
+      title: "Футбольные данные для авторов и аналитиков",
+      lead: "Открытые данные из 11 источников собраны в одно хранилище: матчи, события, удары, xG, составы, трансферы, рейтинги.",
+      lead2: "Дашборды ниже открываются без регистрации. Данные — топ-5 европейских лиг за десять сезонов, по 2025/26 включительно.",
+      f_sources: "источников данных",
+      f_seasons: "сезонов топ-5 лиг, 2016/17–2025/26",
+      f_matches_v: "18 тыс.", f_matches: "матчей",
+      f_events_v: "28 млн", f_events: "событий",
+      f_shots_v: "429 тыс.", f_shots: "ударов",
+      h_dash: "Дашборды",
+      d1: "Обзор лиги + игроки", d1s: "Таблица со «сверх-очками» относительно xPTS, форма команд по турам, Elo, трансферы и зарплаты, лидеры сезона, вратари.",
+      d2: "Сводный обзор лиги — игроки", d2s: "Голы против xG, рейтинги SofaScore, ключевые передачи и динамика игроков по матчам за сезон 2025/26.",
+      open: "Открыть дашборд →",
+      h_nb: "Ноутбук",
+      nb: "Разбор матча в Jupyter",
+      nbs: "Выбираете лигу, сезон, матч, команду и игрока — шесть графиков по событиям с координатами и ударам с xG перерисовываются. Только pandas, matplotlib и ipywidgets поверх слоя gold; на снимках — Juventus — Lazio 2:2, Serie A 2025/26.",
+      nb_open: "Открыть ноутбук на GitHub →",
+      nb_note: "Ноутбук читает Trino напрямую и запускается в JupyterHub платформы; на GitHub виден код и описание, графики строятся при запуске.",
+      nb1: "Потери в своей трети: звёзды — те, что привели к удару соперника",
+      nb2: "Форма команд Serie A: последние 7 туров против начала сезона",
+      nb3: "Накопленный xG матча и кто давит по 5-минутным отрезкам",
+      nb4: "Карта передач игрока и его перцентили по лиге",
+      nb5: "Удары по xG и входы в 20-метровую зону у ворот",
+      nb6: "Сети передач обеих команд",
+      gh: "Код на GitHub",
+      stack: "Python, Airflow, Apache Iceberg, Trino, Superset. Архитектура bronze / silver / gold.",
+      sql: "Нужен SQL или Jupyter — напишите: ",
+      foot: "Пет-проект Сергея Кузнецова. Данные из открытых источников, для некоммерческого использования.",
+      langBtn: "English", themeDark: "Тёмная", themeLight: "Светлая",
+      desc: "Платформа футбольных данных для авторов статей и аналитиков: топ-5 лиг за 10 сезонов, живые дашборды без регистрации."
+    },
+    en: {
+      title: "Football data for writers and analysts",
+      lead: "Open data from 11 sources, collected into one warehouse: matches, events, shots, xG, line-ups, transfers, ratings.",
+      lead2: "The dashboards below open without sign-up. Data covers ten seasons of the top-5 European leagues, up to and including 2025/26.",
+      f_sources: "data sources",
+      f_seasons: "seasons of the top-5 leagues, 2016/17–2025/26",
+      f_matches_v: "18k", f_matches: "matches",
+      f_events_v: "28M", f_events: "events",
+      f_shots_v: "429k", f_shots: "shots",
+      h_dash: "Dashboards",
+      d1: "League overview + players", d1s: "Table with over-performance vs xPTS, team form by round, Elo, transfers and payroll, season leaders, keepers.",
+      d2: "League overview — players", d2s: "Goals vs xG, SofaScore ratings, key passes and per-match player trends across the 2025/26 season.",
+      open: "Open dashboard →",
+      h_nb: "Notebook",
+      nb: "Match analysis in Jupyter",
+      nbs: "Pick a league, season, match, team and player — six charts from event data with coordinates and shots with xG redraw. Plain pandas, matplotlib and ipywidgets on top of the gold layer; the snapshots show Juventus — Lazio 2:2, Serie A 2025/26.",
+      nb_open: "Open the notebook on GitHub →",
+      nb_note: "The notebook reads Trino directly and runs in the platform's JupyterHub; GitHub shows the code and description, the charts are built on run.",
+      nb1: "Losses in own third: stars led to an opponent shot",
+      nb2: "Serie A form change: last 7 rounds vs. the season before",
+      nb3: "Cumulative match xG and territorial pressure by 5-minute bins",
+      nb4: "A player's pass map and league percentiles",
+      nb5: "Shots sized by xG and entries into the 20-metre zone",
+      nb6: "Pass networks of both teams",
+      gh: "Code on GitHub",
+      stack: "Python, Airflow, Apache Iceberg, Trino, Superset. Bronze / silver / gold architecture.",
+      sql: "Need SQL or Jupyter access? Message me: ",
+      foot: "A pet project by Sergey Kuznetsov. Data from open sources, for non-commercial use.",
+      langBtn: "Русский", themeDark: "Dark", themeLight: "Light",
+      desc: "Football data platform for writers and analysts: top-5 leagues over 10 seasons, live dashboards without sign-up."
+    }
+  };
+  var store = { get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+                set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+  var root = document.documentElement;
+  var langBtn = document.getElementById("lang");
+  var themeBtn = document.getElementById("theme");
+
+  function currentTheme() {
+    var t = root.getAttribute("data-theme");
+    if (t) return t;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  function labelTheme() {
+    var t = i18n[root.getAttribute("lang")];
+    themeBtn.textContent = currentTheme() === "dark" ? t.themeLight : t.themeDark;
+  }
+  function applyLang(lang) {
+    var t = i18n[lang];
+    root.setAttribute("lang", lang);
+    document.querySelectorAll("[data-i18n]").forEach(function (el) {
+      var key = el.getAttribute("data-i18n");
+      if (t[key] !== undefined) el.textContent = t[key];
+    });
+    document.querySelector('meta[name="description"]').setAttribute("content", t.desc);
+    langBtn.textContent = t.langBtn;
+    labelTheme();
+    store.set("lang", lang);
+  }
+  function applyTheme(theme) {
+    root.setAttribute("data-theme", theme);
+    labelTheme();
+    store.set("theme", theme);
+  }
+
+  var savedTheme = store.get("theme");
+  if (savedTheme) root.setAttribute("data-theme", savedTheme);
+  var lang = store.get("lang") || ((navigator.language || "").toLowerCase().indexOf("ru") === 0 ? "ru" : "en");
+  applyLang(lang);
+
+  langBtn.addEventListener("click", function () { applyLang(root.getAttribute("lang") === "ru" ? "en" : "ru"); });
+  themeBtn.addEventListener("click", function () { applyTheme(currentTheme() === "dark" ? "light" : "dark"); });
+})();
+</script>
+</body>
+</html>

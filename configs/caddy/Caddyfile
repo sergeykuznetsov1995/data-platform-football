@@ -3,7 +3,8 @@
 # Trino — PASSWORD для машинных + OAUTH2 для людей).
 # /admin и master-realm Keycloak закрыты снаружи: админка — через SSH-туннель
 # на 127.0.0.1:8180 (KC_HOSTNAME_ADMIN в compose.yaml).
-# ACME HTTP-01: все A-записи -> ${PUBLIC_IP}, :80 опубликован там же.
+# ACME HTTP-01: все A-записи -> ${PUBLIC_IP}, :80 опубликован там же
+# (bi, auth, jupyter, airflow, trino, meta, football).
 # JSON access-log на /var/log/caddy (bind на хост) — его читает fail2ban.
 
 (logging) {
@@ -18,10 +19,24 @@
 	}
 }
 
-# Superset: дашборды. Защита — Keycloak SSO.
+# Superset: дашборды. Аналитики — Keycloak SSO; гость (роль Public,
+# configs/superset/create_public_role.py) видит три дашборда без логина (#1570).
 https://bi.{$PLATFORM_DOMAIN} {
 	import logging
 	reverse_proxy superset:8088
+}
+
+# Публичный лендинг (#1570): один index.html из configs/caddy/landing,
+# смонтирован в /srv/landing (compose.yaml, сервис caddy). Без гейта.
+https://football.{$PLATFORM_DOMAIN} {
+	import logging
+	root * /srv/landing
+	file_server
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Cache-Control "public, max-age=300"
+	}
 }
 
 # Keycloak: публичен только юзер-флоу (realm football).

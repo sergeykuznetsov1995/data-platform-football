@@ -8,6 +8,7 @@
 
 | Класс (группа Keycloak) | Что получает |
 |---|---|
+| гость (без логина) | три публичных дашборда с лендинга `https://football.sk-vpn-2026.uk` (роль Superset `Public`, `configs/superset/create_public_role.py`, #1570): только просмотр и фильтры |
 | `viewers` — «простой» юзер | только Superset-дашборды |
 | `analysts` — аналитик | всё из таблицы ниже |
 
@@ -112,7 +113,8 @@ jdbc:trino://trino.sk-vpn-2026.uk:443?SSL=true&externalAuthentication=true
 через туннель:
 
 ```bash
-ssh -L 8180:127.0.0.1:8180 -L 8585:127.0.0.1:8585 root@159.195.193.250
+# <хост> — адрес VM платформы, выдаёт администратор (в репозитории не хранится)
+ssh -L 8180:127.0.0.1:8180 -L 8585:127.0.0.1:8585 root@<хост>
 ```
 
 - Keycloak-админка: `http://127.0.0.1:8180/admin/` (KC_HOSTNAME_ADMIN

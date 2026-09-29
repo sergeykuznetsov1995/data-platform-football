@@ -5,8 +5,10 @@
 [DEFAULT]
 # 172.16/12 — docker bridge: OIDC-backchannel контейнеров ходит на
 # auth.<домен> через caddy-alias с этих адресов — банить нельзя.
-# 159.195.193.250 — сама VM (hairpin-проверки).
-ignoreip = 127.0.0.1/8 ::1 172.16.0.0/12 159.195.193.250
+# Публичный IP самой VM (hairpin-проверки) в репозитории не хранится:
+# на сервере он добавляется в неотслеживаемом /etc/fail2ban/jail.d/zz-local.local
+# с ПОЛНЫМ списком:  [DEFAULT]  ignoreip = 127.0.0.1/8 ::1 172.16.0.0/12 <PUBLIC_IP>
+ignoreip = 127.0.0.1/8 ::1 172.16.0.0/12
 banaction = iptables-allports[chain="DOCKER-USER"]
 
 [caddy-4xx]
