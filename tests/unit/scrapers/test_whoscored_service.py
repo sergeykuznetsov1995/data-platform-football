@@ -493,6 +493,9 @@ class _CatalogRepository:
 
 
 class _CatalogTransport:
+    def probe_egress(self):
+        return None
+
     def get_traffic_stats(self):
         return {"paid_proxy_bytes": 0, "route_requests": {"direct_http": 0}}
 
@@ -3768,3 +3771,72 @@ def test_profile_task_budget_is_backed_off_not_permanently_blacklisted(tmp_path)
     assert result.terminal == []
     assert repository.profile_failures[0]["state"] == "retryable"
     assert repository.profile_failures[0]["failure_code"] == "budget"
+
+
+# --- #1476: dead residential pool -------------------------------------------
+
+
+def test_proxy_unavailable_stops_matches_without_failure_rows(tmp_path):
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    service, repository, _ = _service(tmp_path)
+    first = repository.list_match_candidates()[0]
+    second = replace(first, game_id=124, attempt_no=3)
+    third = replace(first, game_id=125)
+    repository.list_match_candidates = lambda *_a, **_k: [first, second, third]
+    healthy = service.transport
+    calls = []
+
+    class _DyingTransport:
+        raw_cache = None
+        budgets = TransportBudgets()
+
+        def fetch(self, url, **kwargs):
+            calls.append(url)
+            if len(calls) == 1:
+                healthy.raw_cache = self.raw_cache
+                return healthy.fetch(url, **kwargs)
+            raise ProxyUnavailable("pool failed twice: curl (56)")
+
+        def get_traffic_stats(self):
+            return {}
+
+        def close(self):
+            return None
+
+    service.transport = _DyingTransport()
+
+    with pytest.raises(ProxyUnavailable):
+        service.sync_matches()
+
+    # The match fetched before the pool died is still committed ...
+    assert [commit.game_id for commit in repository.commits] == [123]
+    # ... the dead-pool match gets no retryable row (attempt_no stays 3) and
+    # the later candidate is never touched.
+    assert repository.failures == []
+    assert len(calls) == 2
+
+
+def test_proxy_unavailable_escapes_discover_catalog(monkeypatch):
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    class _DeadPool(_CatalogTransport):
+        def probe_egress(self):
+            raise ProxyUnavailable("egress probe failed twice: HTTP 407")
+
+    repository = _CatalogRepository()
+    _patch_catalog_discovery(
+        monkeypatch,
+        competition_rows=(_discovery_competition_row(),),
+        minimum=1,
+    )
+
+    with pytest.raises(ProxyUnavailable):
+        WhoScoredIngestService.discover_catalog(
+            as_of_date=date(2026, 7, 16),
+            repository=repository,
+            transport=_DeadPool(),
+            raw_store=object(),
+            full_history=True,
+        )
+    assert repository.persisted == []

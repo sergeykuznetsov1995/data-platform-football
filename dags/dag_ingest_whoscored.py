@@ -22,7 +22,7 @@ keeps the current window fresh.
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -59,14 +59,6 @@ _TASK_ENV = {
     "WHOSCORED_PROXY_FILE": os.environ.get("WHOSCORED_PROXY_FILE", ""),
 }
 
-# Global-grain Bronze tables that must keep refreshing on every daily run.
-_FRESHNESS_TABLES = (
-    "bronze.whoscored_schedule",
-    "bronze.whoscored_matches",
-    "bronze.whoscored_events",
-)
-
-
 def _load_report(path: str) -> dict[str, Any]:
     try:
         with Path(path).open("r", encoding="utf-8") as handle:
@@ -81,101 +73,217 @@ def _load_report(path: str) -> dict[str, Any]:
     return report
 
 
-# Error budget (#1053): every daily run carries a handful of source-side scope
-# failures (observed steady state: ~4 of 141), so "any failure = red" would be
-# permanently red — as useless as the permanently green all_done leaf it
-# replaces. Red is reserved for signals someone must act on: a protected
-# top-league scope failing, the failed share exceeding the budget, or a run
-# that wrote nothing at all. Everything within budget passes loudly, with the
-# counters in the log.
+# Honest colour (#1476).  Red means someone must act:
+#   (a) a denominator scope (class-A tournaments; probe scopes excluded) is not
+#       ``success`` - failed, retryable, still running or never started;
+#   (b) outside the denominator (probe scopes) more than 5 % did not succeed;
+#   (c) the run had no successful network answer or the pool was dead
+#       (report status ``source_unavailable``);
+#   (d) the reference SQL finds a denominator game past its deadline
+#       (kickoff + 26 h) without a success and without a proven "not at the
+#       source";
+#   (e) the schedule of a denominator scope is older than 48 h.
+# The message lists every rule that fired and its scopes.
 WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE = 0.05
-WHOSCORED_PROTECTED_SCOPE_PREFIXES = (
-    "ENG-Premier League",
-    "ESP-La Liga",
-    "GER-Bundesliga",
-    "ITA-Serie A",
-    "FRA-Ligue 1",
-)
+_LISTED = 10
+
+
+def _trino_query(sql: str) -> list[tuple[Any, ...]]:
+    from utils.data_quality import _get_conn
+
+    conn = _get_conn()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql)
+            return [tuple(row) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+    finally:
+        conn.close()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _listed(items: list[str]) -> str:
+    shown = ", ".join(items[:_LISTED])
+    extra = len(items) - _LISTED
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
 def validate_data(**context: Any) -> None:
-    """Error-budget gate over the runner report (#1053)."""
+    """Red when a rule (a)-(e) above fires; the message names the rules."""
+    from dags.scripts.whoscored_criterion import (
+        SCHEDULE_MAX_AGE_HOURS,
+        denominator_partitions,
+        render_overdue_sql,
+        stale_schedule_partitions,
+    )
+    from scrapers.whoscored.catalog import PROBE_SCOPE_SPECS
+
     result_path = context["templates_dict"]["result_path"]
     report = _load_report(result_path)
+    now = _utc_now()
     status = report.get("status")
     scopes = report.get("scopes") or []
-    rows = int(report.get("rows") or 0)
-    failed = [
-        str(scope.get("scope") or "")
-        for scope in scopes
-        if scope.get("status") not in {"success", "pending"}
+    probes = set(PROBE_SCOPE_SPECS)
+    denominator = [s for s in scopes if str(s.get("scope") or "") not in probes]
+    outside = [s for s in scopes if str(s.get("scope") or "") in probes]
+    fired: list[str] = []
+
+    not_success = [
+        f"{s.get('scope')}:{s.get('status')}"
+        for s in denominator
+        if s.get("status") != "success"
     ]
-    protected_failed = [
-        scope
-        for scope in failed
-        if scope.startswith(WHOSCORED_PROTECTED_SCOPE_PREFIXES)
+    if not denominator:
+        fired.append("(a) the run planned no denominator scope")
+    elif not_success:
+        fired.append(
+            f"(a) {len(not_success)}/{len(denominator)} denominator scope(s) "
+            f"not success: {_listed(not_success)}"
+        )
+    outside_failed = [
+        f"{s.get('scope')}:{s.get('status')}"
+        for s in outside
+        if s.get("status") != "success"
     ]
+    if outside and (
+        len(outside_failed) / len(outside) > WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE
+    ):
+        fired.append(
+            f"(b) {len(outside_failed)}/{len(outside)} probe scope(s) failed "
+            f"(> {WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE:.0%}): "
+            f"{_listed(outside_failed)}"
+        )
+    route_successes = (report.get("traffic") or {}).get("route_successes") or {}
+    successes = sum(int(value) for value in route_successes.values())
+    if status == "source_unavailable":
+        detail = report.get("source_unavailable") or {}
+        fired.append(
+            "(c) source unavailable (dead residential pool) at "
+            f"{detail.get('scope') or 'start'}: {detail.get('message')}"
+        )
+    elif successes == 0:
+        fired.append("(c) zero successful network answers in the run")
+
+    partitions = denominator_partitions(report)
+    try:
+        overdue = _trino_query(render_overdue_sql(now))
+    except Exception as exc:
+        fired.append(f"(d) overdue query failed: {type(exc).__name__}: {exc}")
+    else:
+        if overdue:
+            games = [f"{row[0]}={row[1]}#{row[2]}" for row in overdue]
+            fired.append(
+                f"(d) {len(overdue)} denominator game(s) past the 24 h deadline "
+                f"without a success: {_listed(games)}"
+            )
+    if partitions:
+        try:
+            stale = stale_schedule_partitions(_trino_query, partitions, now)
+        except Exception as exc:
+            fired.append(f"(e) schedule freshness query failed: {type(exc).__name__}: {exc}")
+        else:
+            if stale:
+                fired.append(
+                    f"(e) {len(stale)} denominator schedule(s) older than "
+                    f"{SCHEDULE_MAX_AGE_HOURS} h: {_listed(stale)}"
+                )
+
     logger.info(
-        "WhoScored daily: status=%s scopes=%d rows=%s failed=%d (%s) protected_failed=%s",
+        "WhoScored daily: status=%s scopes=%d denominator=%d probes=%d "
+        "rows=%s route_successes=%d rules_fired=%d",
         status,
         len(scopes),
-        rows,
-        len(failed),
-        ", ".join(failed) or "-",
-        protected_failed or "-",
+        len(denominator),
+        len(outside),
+        report.get("rows"),
+        successes,
+        len(fired),
     )
-    if not scopes:
-        if status == "success":
-            return
-        raise AirflowException(
-            f"WhoScored daily ingest planned no scopes and status={status!r}; "
-            f"errors={report.get('errors')}"
-        )
-    if protected_failed:
-        raise AirflowException(
-            f"WhoScored daily ingest failed protected scope(s): {protected_failed}"
-        )
-    share = len(failed) / len(scopes)
-    if share > WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE:
-        raise AirflowException(
-            f"WhoScored daily ingest failed {len(failed)}/{len(scopes)} scopes "
-            f"({share:.1%} > budget {WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE:.0%}); "
-            f"errors={report.get('errors')}"
-        )
-    if rows <= 0:
-        raise AirflowException(
-            "WhoScored daily ingest wrote zero rows across "
-            f"{len(scopes)} scope(s) — collection did not happen"
-        )
-    if failed:
-        logger.warning(
-            "WhoScored daily ingest is within the error budget: "
-            "%d/%d failed scope(s), %d rows written",
-            len(failed),
-            len(scopes),
-            rows,
-        )
+    if fired:
+        raise AirflowException("WhoScored daily is red: " + " | ".join(fired))
 
 
-def validate_bronze_freshness(**_context: Any) -> None:
-    """Telegram-alert when bronze.whoscored_* stops refreshing.
+def validate_bronze_freshness(**context: Any) -> None:
+    """ERROR freshness over the denominator partitions (league, season).
 
-    A direct MAX(_ingested_at) staleness check independent of the current run's
-    JSON floors: it surfaces a scheduler/storage stall where no current rows
-    were committed.  WARNING severity because the producer and result validator
-    already fail hard; 48h gives one missed daily run of grace.
+    Schedule: every denominator partition refreshed within 48 h.  Matches and
+    events: the newest write over the denominator partitions within 48 h.
+    Telegram summary, then red on any ERROR.
     """
+    from dags.scripts.whoscored_criterion import (
+        CONTENT_MAX_AGE_HOURS,
+        CONTENT_TABLES,
+        SCHEDULE_MAX_AGE_HOURS,
+        content_age_hours,
+        denominator_partitions,
+        stale_schedule_partitions,
+    )
     from utils.alerts import telegram_dq_summary
-    from utils.data_quality import CHECK, run_checks
+    from utils.data_quality import CheckResult, RunReport
 
-    checks = [
-        CHECK.freshness(table, ts_col="_ingested_at", max_age_hours=48,
-                        severity="WARNING")
-        for table in _FRESHNESS_TABLES
-    ]
-    report = run_checks(checks, raise_on_error=False)
-    logger.info("validate_bronze_freshness: %s", report.summary())
-    telegram_dq_summary(report, header="WhoScored Bronze freshness")
+    dq = RunReport()
+    now = _utc_now()
+
+    def _add(name: str, passed: bool, details: str = "", error: str = "") -> None:
+        dq.results.append(
+            CheckResult(
+                name=name,
+                kind="freshness",
+                severity="ERROR",
+                passed=passed,
+                details=details,
+                error=error or None,
+            )
+        )
+
+    try:
+        partitions = denominator_partitions(
+            _load_report(context["templates_dict"]["result_path"])
+        )
+        if not partitions:
+            raise AirflowException("the run report has no denominator scope")
+    except AirflowException as exc:
+        _add("freshness[denominator]", False, error=str(exc))
+    else:
+        name = f"freshness[whoscored_schedule per partition, max {SCHEDULE_MAX_AGE_HOURS}h]"
+        try:
+            stale = stale_schedule_partitions(_trino_query, partitions, now)
+        except Exception as exc:
+            _add(name, False, error=f"{type(exc).__name__}: {exc}")
+        else:
+            _add(
+                name,
+                not stale,
+                details=(
+                    f"{len(stale)}/{len(partitions)} stale: {_listed(stale)}"
+                    if stale
+                    else f"{len(partitions)} partitions fresh"
+                ),
+            )
+        for table in CONTENT_TABLES:
+            name = f"freshness[{table} over denominator, max {CONTENT_MAX_AGE_HOURS}h]"
+            try:
+                age = content_age_hours(_trino_query, table, partitions, now)
+            except Exception as exc:
+                _add(name, False, error=f"{type(exc).__name__}: {exc}")
+                continue
+            _add(
+                name,
+                age is not None and age <= CONTENT_MAX_AGE_HOURS,
+                details=f"age={'never' if age is None else f'{age:.0f}h'}",
+            )
+    logger.info("validate_bronze_freshness: %s", dq.summary())
+    telegram_dq_summary(dq, header="WhoScored Bronze freshness")
+    if dq.errors:
+        raise AirflowException(
+            "WhoScored Bronze freshness: "
+            + "; ".join(f"{r.name}: {r.details or r.error}" for r in dq.errors)
+        )
 
 
 with DAG(
@@ -203,10 +311,10 @@ with DAG(
 
     ingest_matches = BashOperator(
         task_id="ingest_matches",
-        # The runner exits non-zero whenever ANY scope failed, which is the
-        # steady state (#1053). A written report means the run completed and
-        # the error-budget gate downstream is the judge; the task itself only
-        # fails when the runner died without a report.
+        # The runner exits non-zero whenever ANY scope failed or the pool was
+        # dead (exit 3, #1476). A written report means the run completed and
+        # validate_data downstream is the judge; the task itself only fails
+        # when the runner died without a report.
         bash_command=(
             "cd {root} && rm -f {result} && "
             "python {runner} daily "
@@ -252,6 +360,7 @@ with DAG(
     bronze_freshness = PythonOperator(
         task_id="validate_bronze_freshness",
         python_callable=validate_bronze_freshness,
+        templates_dict={"result_path": RESULT_PATH},
         trigger_rule="all_done",
     )
 

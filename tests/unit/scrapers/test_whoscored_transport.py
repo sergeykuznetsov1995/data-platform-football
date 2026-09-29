@@ -5076,3 +5076,159 @@ def test_proxy_control_client_binds_batch_claim_and_switches_owner_atomically():
         "/v1/leases/lease-batch/endpoints/request-current/switch"
     )
     assert session.posts[1][1]["json"] == {"endpoint": labels[1]}
+
+
+# --- #1476: dead residential pool -> ProxyUnavailable ------------------------
+
+PROXY_407 = RuntimeError(
+    "Failed to perform, curl: (56) CONNECT tunnel failed, response 407."
+)
+
+
+def _pool_transport(monkeypatch, tmp_path, *sessions, http_attempts=1):
+    from scrapers.whoscored.transport import ProxyUnavailable  # noqa: F401
+
+    pool = tmp_path / "pool.txt"
+    pool.write_text(
+        "pool.example.io:10000:poolu:poolpw\n"
+        "pool.example.io:10001:poolu:poolpw\n"
+    )
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    queue = list(sessions)
+    seen = []
+
+    def factory(proxy_url):
+        seen.append(proxy_url)
+        return queue.pop(0)
+
+    transport = WhoScoredTransport(
+        direct_fs_client=FakeFSClient(),
+        paid_fs_client=FakeFSClient(),
+        http_session_factory=factory,
+        direct_http_attempts=http_attempts,
+        direct_http_retry_backoff_seconds=0,
+        context=TransportContext(transport_policy="direct_only"),
+    )
+    return transport, seen
+
+
+@pytest.mark.unit
+def test_proxy_unavailable_is_not_a_transport_error():
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    # Per-match handlers catch WhoScoredTransportError and would turn a dead
+    # pool into a retryable failure row for every candidate (V1).
+    assert not issubclass(ProxyUnavailable, WhoScoredTransportError)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error",
+    [
+        PROXY_407,
+        RuntimeError("curl: (7) Failed to connect to pool.example.io port 10000"),
+        RuntimeError("curl: (97) proxy handshake failed"),
+    ],
+)
+def test_second_proxy_failure_after_member_swap_raises_proxy_unavailable(
+    monkeypatch, tmp_path, error
+):
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    first = FakeHTTPSession(error)
+    second = FakeHTTPSession(error)
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, second)
+
+    with pytest.raises(ProxyUnavailable):
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    # Exactly one swap to a different pool member, one repeat on it.
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert len(first.calls) == 1 and len(second.calls) == 1
+    assert first.closed is True
+    stats = transport.get_traffic_stats()
+    assert stats["failures"] == {"proxy": 2}
+    assert stats["route_successes"] == {}
+
+
+@pytest.mark.unit
+def test_proxy_failure_recovers_on_swapped_member(monkeypatch, tmp_path):
+    first = FakeHTTPSession(PROXY_407)
+    second = FakeHTTPSession(FakeHTTPResponse())
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, second)
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(seen) == 2
+    assert transport.get_traffic_stats()["route_successes"] == {"direct_http": 1}
+
+
+@pytest.mark.unit
+def test_non_proxy_curl_failure_keeps_retryable_timeout_without_swap(
+    monkeypatch, tmp_path
+):
+    first = FakeHTTPSession(RuntimeError("curl: (28) Operation timed out"))
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first)
+
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert caught.value.kind is FailureKind.TIMEOUT
+    assert caught.value.retryable is True
+    assert len(seen) == 1
+
+
+@pytest.mark.unit
+def test_pool_5xx_swaps_member_once_and_keeps_retry_policy(monkeypatch, tmp_path):
+    first = FakeHTTPSession(FakeHTTPResponse(status_code=502, content=b"bad gateway"))
+    second = FakeHTTPSession(FakeHTTPResponse())
+    transport, seen = _pool_transport(
+        monkeypatch, tmp_path, first, second, http_attempts=2
+    )
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.status_code == 200
+    assert len(seen) == 2 and seen[0] != seen[1]
+    stats = transport.get_traffic_stats()
+    assert stats["route_requests"] == {"direct_http": 2}
+    assert stats["route_successes"] == {"direct_http": 1}
+
+
+@pytest.mark.unit
+def test_egress_probe_hits_ipify_only(monkeypatch, tmp_path):
+    session = FakeHTTPSession(FakeHTTPResponse(content=b"203.0.113.7"))
+    transport, seen = _pool_transport(monkeypatch, tmp_path, session)
+
+    transport.probe_egress()
+
+    assert [call[0] for call in session.calls] == ["https://api.ipify.org"]
+    assert len(seen) == 1
+    # A probe is not a source answer.
+    assert transport.get_traffic_stats()["route_successes"] == {}
+
+
+@pytest.mark.unit
+def test_egress_probe_swaps_once_then_raises_proxy_unavailable(monkeypatch, tmp_path):
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    first = FakeHTTPSession(PROXY_407)
+    second = FakeHTTPSession(FakeHTTPResponse(status_code=407, content=b""))
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, second)
+
+    with pytest.raises(ProxyUnavailable, match="HTTP 407"):
+        transport.probe_egress()
+
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert all("whoscored" not in call[0] for call in first.calls + second.calls)
+
+
+@pytest.mark.unit
+def test_egress_probe_is_noop_without_pool():
+    session = FakeHTTPSession()
+    transport, _ = _transport(session)
+
+    transport.probe_egress()
+
+    assert session.calls == []

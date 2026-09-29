@@ -99,6 +99,7 @@ from .transport import (
     CachedPayload,
     FailureKind,
     FetchRequest,
+    ProxyUnavailable,
     TransportBudgets,
     TransportContext,
     TransportResponse,
@@ -1193,6 +1194,7 @@ class WhoScoredIngestService:
         try:
             if parent_generation_error is not None:
                 raise RuntimeError(parent_generation_error)
+            network.probe_egress()
             identity_catalog = WhoScoredCatalog.from_file()
             competition_aliases = {
                 (int(item.region_id), int(item.tournament_id)): item.competition_id
@@ -2141,6 +2143,8 @@ class WhoScoredIngestService:
                     ),
                 )
                 result.succeeded = len(competition_rows)
+        except ProxyUnavailable:
+            raise
         except Exception as exc:
             result.errors.append(f"catalog: {type(exc).__name__}: {exc}")
         finally:
@@ -2553,6 +2557,8 @@ class WhoScoredIngestService:
             for table, rows in datasets.items():
                 result.counts[table.removeprefix("whoscored_")] = len(rows)
                 result.tables.append(f"iceberg.bronze.{table}")
+        except ProxyUnavailable:
+            raise
         except Exception as exc:
             result.errors.append(f"schedule: {type(exc).__name__}: {exc}")
         return result
@@ -2948,6 +2954,8 @@ class WhoScoredIngestService:
             for table, rows in datasets.items():
                 result.counts[table.removeprefix("whoscored_")] = len(rows)
                 result.tables.append(f"iceberg.bronze.{table}")
+        except ProxyUnavailable:
+            raise
         except Exception as exc:
             result.errors.append(f"stages: {type(exc).__name__}: {exc}")
         finally:
@@ -3005,6 +3013,7 @@ class WhoScoredIngestService:
         # result bookkeeping of each failure is applied only once it landed.
         failure_rows: list[dict[str, Any]] = []
         failure_outcomes: list[tuple[str, str]] = []
+        proxy_down: Optional[ProxyUnavailable] = None
         for candidate in candidates:
             target = match_page_target(candidate.game_id)
             response: Optional[TransportResponse] = None
@@ -3261,6 +3270,11 @@ class WhoScoredIngestService:
                         f"{type(manifest_exc).__name__}: {manifest_exc}"
                     )
                 result.errors.append(f"game {candidate.game_id}: {exc}")
+            except ProxyUnavailable as exc:
+                # Dead pool: no failure row, no attempt_no bump for this or
+                # any later candidate; already parsed matches still commit.
+                proxy_down = exc
+                break
             except Exception as exc:
                 result.errors.append(
                     f"game {candidate.game_id}: {type(exc).__name__}: {exc}"
@@ -3292,6 +3306,8 @@ class WhoScoredIngestService:
                             )
         finally:
             self._write_match_failures(failure_rows, failure_outcomes, result)
+        if proxy_down is not None:
+            raise proxy_down
         if candidates or result.succeeded:
             result.tables.extend(
                 [
@@ -3365,6 +3381,7 @@ class WhoScoredIngestService:
         }
         self._bound_paid_fallback(len(candidates))
         pending: list[tuple[PreviewCommit, Any]] = []
+        proxy_down: Optional[ProxyUnavailable] = None
         for candidate in candidates:
             target = preview_page_target(candidate["game_id"])
             parsed_holder: dict[str, Any] = {}
@@ -3560,6 +3577,9 @@ class WhoScoredIngestService:
                         f"{type(manifest_exc).__name__}: {manifest_exc}"
                     )
                 result.errors.append(f"preview {candidate['game_id']}: {exc}")
+            except ProxyUnavailable as exc:
+                proxy_down = exc
+                break
             except Exception as exc:
                 result.errors.append(
                     f"preview {candidate['game_id']}: {type(exc).__name__}: {exc}"
@@ -3588,6 +3608,8 @@ class WhoScoredIngestService:
                         result.counts[name] = (
                             result.counts.get(name, 0) + dataset.row_count
                         )
+        if proxy_down is not None:
+            raise proxy_down
         if candidates:
             result.tables.extend(
                 [
@@ -3896,6 +3918,10 @@ class WhoScoredIngestService:
 
     def traffic_stats(self) -> dict[str, Any]:
         return self.transport.get_traffic_stats()
+
+    def probe_egress(self) -> None:
+        """ipify through the pool before a work item (#1476)."""
+        self.transport.probe_egress()
 
     def close(self) -> None:
         self.transport.close()

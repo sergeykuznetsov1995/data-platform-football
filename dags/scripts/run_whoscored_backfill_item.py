@@ -387,6 +387,8 @@ def _run_work_item(
                 catalog=catalog,
                 repository=repository,
             ) as service:
+                # ipify through the pool before every work item (#1476).
+                service.probe_egress()
                 if item["kind"] == "schedule":
                     result = service.sync_schedule()
                     schedule_result = result
@@ -492,6 +494,9 @@ def _run_work_item(
                 airflow=_airflow_identity(),
             )
             report["backfill_receipt"] = receipt["artifact"]
+    except runner._proxy_unavailable_type() as exc:
+        # Dead pool: no receipt, no error rows; status source_unavailable.
+        runner._mark_source_unavailable(report, exc, record)
     except Exception as exc:
         if record["status"] in {"pending", "running"}:
             runner._record_error(

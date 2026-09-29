@@ -1832,8 +1832,12 @@ def test_backfill_freeze_includes_every_completed_match_regardless_manifest():
 
     assert repository.list_completed_match_candidates("INT-World Cup", "2026") == []
 
-    sql = trino.execute_query.call_args.args[0]
-    assert "AND (TRUE)" in sql
+    sql = " ".join(trino.execute_query.call_args.args[0].split())
+    # Only the retry ceiling (#1476) narrows the frozen history plan.
+    assert (
+        "AND (NOT ( COALESCE(m.state, '') = 'retryable' "
+        "AND COALESCE(m.attempt_no, 0) >= 8 ))"
+    ) in sql
     assert "retry_after" not in sql
     assert "parser_version IS DISTINCT FROM" not in sql
 

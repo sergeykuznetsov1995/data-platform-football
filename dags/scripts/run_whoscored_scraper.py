@@ -88,6 +88,9 @@ logger = logging.getLogger(__name__)
 
 
 REPORT_SCHEMA_VERSION = 3
+# Exit code of a run stopped by a dead residential pool (#1476): distinct from
+# 1 (failed) and 2 (retryable); the report is written, validate_data is red.
+SOURCE_UNAVAILABLE_EXIT_CODE = 3
 # Per-scope cap of the daily match run: a duration guard only (#1474).  The
 # largest denominator backlog on 26.09.2026 was 264 (MLS 2026), 1 350 in all.
 DAILY_MATCH_LIMIT_PER_SCOPE = 300
@@ -1730,10 +1733,37 @@ def _write_report(path: str, report: Mapping[str, Any]) -> None:
     _write_bytes_atomically(output, payload, replace=True)
 
 
+def _proxy_unavailable_type() -> type:
+    from scrapers.whoscored.transport import ProxyUnavailable
+
+    return ProxyUnavailable
+
+
+def _mark_source_unavailable(
+    report: dict[str, Any],
+    exc: BaseException,
+    scope_record: Optional[dict[str, Any]] = None,
+) -> None:
+    """Record a dead-pool stop; no scope error rows, no retry bookkeeping."""
+    scope = scope_record["scope"] if scope_record is not None else None
+    report["source_unavailable"] = {
+        "scope": scope,
+        "type": type(exc).__name__,
+        "message": str(exc),
+    }
+    report["errors"].append(f"source_unavailable [{scope or '-'}]: {exc}")
+    if scope_record is not None:
+        scope_record["status"] = "source_unavailable"
+    logger.error("WhoScored source unavailable at %s: %s", scope or "-", exc)
+
+
 def _finish(report: dict[str, Any], output: str) -> int:
     retryable_errors = [item for item in report["error_details"] if item["retryable"]]
     fatal_errors = [item for item in report["error_details"] if not item["retryable"]]
-    if fatal_errors:
+    if report.get("source_unavailable"):
+        report["status"] = "source_unavailable"
+        exit_code = SOURCE_UNAVAILABLE_EXIT_CODE
+    elif fatal_errors:
         report["status"] = "failed"
         exit_code = 1
     elif retryable_errors:
@@ -1905,6 +1935,7 @@ def _run_service_operations(
     args: argparse.Namespace,
     operations: Sequence[str],
 ) -> None:
+    proxy_unavailable = _proxy_unavailable_type()
     for scope, runtime_scope in selected:
         scope_record = _scope_record(report, scope)
         scope_record["status"] = "running"
@@ -1916,6 +1947,12 @@ def _run_service_operations(
                     repository=repository,
                 )
                 with service_context as service:
+                    try:
+                        # ipify through the pool before every work item.
+                        service.probe_egress()
+                    except proxy_unavailable:
+                        _collect_traffic(report, scope, service)
+                        raise
                     for operation in operations:
                         try:
                             result = _invoke(service, operation, args)
@@ -1929,10 +1966,18 @@ def _run_service_operations(
                                 # after any entity failure can scrape stale
                                 # candidates and spend paid budget needlessly.
                                 break
+                        except proxy_unavailable:
+                            _collect_traffic(report, scope, service)
+                            raise
                         except Exception as exc:
                             _record_error(report, scope_record, scope, operation, exc)
                             break
                     _collect_traffic(report, scope, service)
+        except proxy_unavailable as exc:
+            # Dead pool: stop the run; this and the remaining scopes are
+            # left as they are (no error rows, no retry state).
+            _mark_source_unavailable(report, exc, scope_record)
+            return
         except Exception as exc:
             _record_error(report, scope_record, scope, "service", exc)
         _set_scope_status(scope_record)
@@ -2157,6 +2202,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 full_history=args.full_history,
                 as_of_date=args.as_of_date,
             )
+        except _proxy_unavailable_type() as exc:
+            _mark_source_unavailable(report, exc)
         except Exception as exc:
             report["errors"].append(f"discover: {exc}")
             report["error_details"].append(

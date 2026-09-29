@@ -264,3 +264,45 @@ def test_stages_bundle_cannot_shrink_the_pre_split_stage_snapshot():
         "json_extract_scalar(entity_counts_json, '$.whoscored_team_stage_stats')"
         " IS NOT NULL"
     ) in previous_sql
+
+
+@pytest.mark.unit
+def test_history_plan_freeze_drops_matches_past_the_retry_ceiling():
+    """#1476: the history work item freezes its plan without exhausted games."""
+    from types import SimpleNamespace
+
+    from dags.scripts import run_whoscored_backfill_item as backfill_item
+    from dags.scripts import run_whoscored_scraper as runner
+    from scrapers.whoscored.repository import DAILY_RETRYABLE_MAX_ATTEMPTS
+
+    con = _connection()
+    for game_id in (41, 42, 43):
+        _game(con, game_id, 500, 20)
+    fetched = NOW - timedelta(days=2)
+    for game_id, attempt_no in ((41, DAILY_RETRYABLE_MAX_ATTEMPTS), (42, 3)):
+        con.execute(
+            "INSERT INTO iceberg.bronze.whoscored_match_ingest_manifest VALUES "
+            "(?, ?, ?, 'retryable', ?, NULL, NULL, ?, NULL, NULL, ?, ?, ?)",
+            [LEAGUE, SEASON, game_id, f"ws2-{game_id}", PARSER_VERSION,
+             attempt_no, fetched, fetched],
+        )
+    _candidates(con)  # creates the *_latest view over the manifest
+
+    def execute_query(sql):
+        rendered = sqlglot.transpile(sql, read="trino", write="duckdb")[0]
+        return con.execute(rendered).fetchall()
+
+    trino = MagicMock()
+    trino.execute_query.side_effect = execute_query
+    service = SimpleNamespace(
+        repository=WhoScoredRepository(writer=MagicMock(), trino=trino)
+    )
+    scope = runner.RunnerScope.parse(f"{LEAGUE}={SEASON}")
+
+    assert backfill_item._filtered_candidates(service, {"selector": {}}, scope) == [
+        42,
+        43,
+    ]
+    # An explicit selector is a deliberate replay: no ceiling.
+    explicit = {"selector": {"game_ids": [41, 42]}}
+    assert backfill_item._filtered_candidates(service, explicit, scope) == [41, 42]
