@@ -51,7 +51,12 @@ c.DockerSpawner.remove = True
 c.DockerSpawner.mem_limit = "1G"
 c.DockerSpawner.cpu_limit = 1
 c.DockerSpawner.notebook_dir = "/home/jovyan/work"
-c.DockerSpawner.volumes = {"jupyterhub-user-{username}": "/home/jovyan/work"}
+c.DockerSpawner.volumes = {
+    "jupyterhub-user-{username}": "/home/jovyan/work",
+    # Примеры для всех (read-only): том jupyterhub-examples наполняется на хосте
+    # из notebooks/ репозитория, см. docs/ANALYST_ONBOARDING.md («Примеры»).
+    "jupyterhub-examples": {"bind": "/home/jovyan/work/examples", "mode": "ro"},
+}
 # Подключение к Trino из ноутбуков: через Caddy (доверенный серт), общий
 # read-only аккаунт analyst_svc. Персональный вариант — OAuth2Authentication()
 # (см. docs/ANALYST_ONBOARDING.md).

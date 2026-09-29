@@ -71,6 +71,18 @@ host `trino.sk-vpn-2026.uk`, порт 443.
    `analyst_svc` в `password.db` (`htpasswd -nbB -C 10`, cost ≥ 8!),
    пересоздать jupyterhub. Живые ноутбуки получат пароль при следующем спавне.
 
+## Примеры (`work/examples`)
+
+В каждом ноутбуке есть папка `examples` (только чтение) с готовыми ноутбуками
+из `notebooks/` репозитория — их можно запускать как есть; чтобы править,
+скопируйте файл к себе в `work`. Обновить примеры на сервере (том
+`jupyterhub-examples`, новые серверы юзеров подхватят сразу):
+
+```bash
+docker run --rm -v jupyterhub-examples:/ex -v "$PWD/notebooks:/src:ro" alpine \
+  sh -c 'cp /src/*.ipynb /ex/ && chmod 644 /ex/*.ipynb'
+```
+
 ## Как из ноутбука ходить в Trino
 
 Переменные уже в контейнере (`TRINO_HOST/PORT/USER/PASSWORD` — общий
