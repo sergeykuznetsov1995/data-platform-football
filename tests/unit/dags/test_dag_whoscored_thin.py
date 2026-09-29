@@ -201,17 +201,6 @@ def _budget_context(tmp_path, report):
     return {"templates_dict": {"result_path": str(path)}}
 
 
-def _scopes(total, failed_names=()):
-    scopes = [
-        {"scope": name, "status": "failed"} for name in failed_names
-    ]
-    scopes += [
-        {"scope": f"OK-{i}", "status": "success"}
-        for i in range(total - len(scopes))
-    ]
-    return scopes
-
-
 def test_ingest_matches_tolerates_runner_rc_when_report_exists(ingest):
     # Красный rc раннера при живом отчёте — норма (#1053): судит бюджет.
     cmd = _bash("ingest_matches")._init_kwargs["bash_command"]
@@ -231,55 +220,175 @@ def test_freshness_is_not_the_sole_leaf(ingest):
     assert validate.upstream_task_ids == {"ingest_matches"}
 
 
-def test_validate_data_passes_within_error_budget(ingest, tmp_path):
+# ----------------------- honest colour (#1476) ------------------------------
+
+DENOMINATOR = ("ENG-Premier League=2627", "WS-182-77=2627")
+PROBE = "WS-206-63=2526"
+
+
+def _scope(spec, status="success"):
+    league, season = spec.split("=")
+    return {"scope": spec, "competition_id": league, "season_id": season,
+            "status": status}
+
+
+def _report(statuses=None, *, probe_status="success", successes=5, status="success",
+            **extra):
+    statuses = statuses or {}
     report = {
         "schema_version": 3,
-        "status": "failed",
-        "rows": 2_956_592,
-        "scopes": _scopes(141, ["RUS-Premier League=2526", "TUR-Super Lig=2526"]),
-        "errors": ["scope x: ProxyError"],
+        "status": status,
+        "rows": 10,
+        "scopes": [_scope(spec, statuses.get(spec, "success")) for spec in DENOMINATOR]
+        + [_scope(PROBE, probe_status)],
+        "traffic": {"route_successes": {"direct_http": successes} if successes else {}},
+        "errors": [],
     }
+    report.update(extra)
+    return report
+
+
+@pytest.fixture
+def trino(ingest, monkeypatch):
+    """Fake Trino: no overdue games, every schedule refreshed an hour ago."""
+    from datetime import timedelta
+
+    state = {"overdue": [], "schedule_age_h": {}, "fail": None, "sql": []}
+
+    def query(sql):
+        state["sql"].append(sql)
+        if state["fail"]:
+            raise state["fail"]
+        now = ingest._utc_now()
+        if "whoscored_schedule\nWHERE (league, season) IN" in sql:
+            rows = []
+            for spec in DENOMINATOR:
+                league, season = spec.split("=")
+                age = state["schedule_age_h"].get(spec, 1)
+                if age is not None:
+                    rows.append((league, season, now - timedelta(hours=age)))
+            return rows
+        if "AS table_name" in sql:
+            return [("t", now - timedelta(hours=state.get("content_age_h", 1)))]
+        if "WHERE collected_at IS NULL AND NOT ceiling" in sql:
+            return state["overdue"]
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(ingest, "_trino_query", query)
+    return state
+
+
+def test_validate_data_green_when_no_rule_fires(ingest, tmp_path, trino):
+    ingest.validate_data(**_budget_context(tmp_path, _report()))
+    # The reference SQL and the schedule gate both ran.
+    assert any("NOT ceiling" in sql for sql in trino["sql"])
+    assert any("MAX(_ingested_at)" in sql for sql in trino["sql"])
+
+
+@pytest.mark.parametrize("status", ["failed", "retryable", "pending", "running"])
+def test_validate_data_rule_a_any_denominator_scope_not_success(
+    ingest, tmp_path, trino, status
+):
+    from airflow.exceptions import AirflowException
+
+    report = _report({"WS-182-77=2627": status})
+    with pytest.raises(AirflowException, match=rf"\(a\) 1/2 .*WS-182-77=2627:{status}"):
+        ingest.validate_data(**_budget_context(tmp_path, report))
+
+
+def test_validate_data_rule_b_probe_failures_beyond_budget(ingest, tmp_path, trino):
+    from airflow.exceptions import AirflowException
+
+    report = _report(probe_status="failed")
+    with pytest.raises(AirflowException, match=r"\(b\) 1/1 probe") as caught:
+        ingest.validate_data(**_budget_context(tmp_path, report))
+    assert "(a)" not in str(caught.value)
+
+
+def test_validate_data_rule_c_zero_network_successes(ingest, tmp_path, trino):
+    from airflow.exceptions import AirflowException
+
+    with pytest.raises(AirflowException, match=r"\(c\) zero successful"):
+        ingest.validate_data(**_budget_context(tmp_path, _report(successes=0)))
+
+
+def test_validate_data_rule_c_source_unavailable(ingest, tmp_path, trino):
+    from airflow.exceptions import AirflowException
+
+    report = _report(
+        {"ENG-Premier League=2627": "source_unavailable", "WS-182-77=2627": "pending"},
+        status="source_unavailable",
+        source_unavailable={"scope": "ENG-Premier League=2627", "message": "407"},
+    )
+    with pytest.raises(AirflowException) as caught:
+        ingest.validate_data(**_budget_context(tmp_path, report))
+    message = str(caught.value)
+    assert "(c) source unavailable" in message
+    # Every rule that fired is named, not just the first.
+    assert "(a) 2/2" in message
+
+
+def test_validate_data_rule_d_overdue_game(ingest, tmp_path, trino):
+    from airflow.exceptions import AirflowException
+
+    trino["overdue"] = [("WS-182-77", "2627", 1990001, "A-B", "2026-09-28 16:00")]
+    with pytest.raises(AirflowException, match=r"\(d\) 1 denominator game.*WS-182-77=2627#1990001"):
+        ingest.validate_data(**_budget_context(tmp_path, _report()))
+
+
+def test_validate_data_rule_d_query_failure_is_red(ingest, tmp_path, trino):
+    from airflow.exceptions import AirflowException
+
+    trino["fail"] = RuntimeError("trino down")
+    with pytest.raises(AirflowException, match=r"\(d\) overdue query failed"):
+        ingest.validate_data(**_budget_context(tmp_path, _report()))
+
+
+@pytest.mark.parametrize("age", [49, None])
+def test_validate_data_rule_e_stale_schedule(ingest, tmp_path, trino, age):
+    from airflow.exceptions import AirflowException
+
+    trino["schedule_age_h"] = {"WS-182-77=2627": age}
+    with pytest.raises(AirflowException, match=r"\(e\) 1 denominator schedule.*WS-182-77=2627"):
+        ingest.validate_data(**_budget_context(tmp_path, _report()))
+
+
+def test_validate_data_ignores_old_protected_prefix_and_row_rules(ingest, tmp_path, trino):
+    # Probe scopes and rows are not colour signals any more; rows=0 with all
+    # denominator scopes successful and a fresh schedule is green.
+    report = _report(rows=0)
     ingest.validate_data(**_budget_context(tmp_path, report))
+    assert not hasattr(ingest, "WHOSCORED_PROTECTED_SCOPE_PREFIXES")
 
 
-def test_validate_data_fails_on_protected_scope(ingest, tmp_path):
+def test_freshness_is_error_per_denominator_partition(ingest, tmp_path, trino, monkeypatch):
     from airflow.exceptions import AirflowException
+    import utils.alerts as alerts
 
-    report = {
-        "schema_version": 3,
-        "status": "failed",
-        "rows": 1_000,
-        "scopes": _scopes(141, ["ENG-Premier League=2526"]),
-        "errors": [],
-    }
-    with pytest.raises(AirflowException, match="protected"):
-        ingest.validate_data(**_budget_context(tmp_path, report))
+    sent = []
+    monkeypatch.setattr(alerts, "telegram_dq_summary", lambda report, header: sent.append(report))
+    context = _budget_context(tmp_path, _report())
+
+    ingest.validate_bronze_freshness(**context)
+    assert sent[-1].errors == [] and len(sent[-1].results) == 3
+
+    trino["schedule_age_h"] = {"ENG-Premier League=2627": 50}
+    with pytest.raises(AirflowException, match="ENG-Premier League=2627"):
+        ingest.validate_bronze_freshness(**context)
+    assert all(result.severity == "ERROR" for result in sent[-1].results)
+
+    trino["schedule_age_h"] = {}
+    trino["content_age_h"] = 49
+    with pytest.raises(AirflowException, match="whoscored_events over denominator"):
+        ingest.validate_bronze_freshness(**context)
 
 
-def test_validate_data_fails_beyond_share_budget(ingest, tmp_path):
+def test_freshness_without_report_is_error(ingest, tmp_path, trino, monkeypatch):
     from airflow.exceptions import AirflowException
+    import utils.alerts as alerts
 
-    failed = [f"X-{i}=2526" for i in range(10)]
-    report = {
-        "schema_version": 3,
-        "status": "failed",
-        "rows": 1_000,
-        "scopes": _scopes(100, failed),
-        "errors": [],
-    }
-    with pytest.raises(AirflowException, match="budget"):
-        ingest.validate_data(**_budget_context(tmp_path, report))
-
-
-def test_validate_data_fails_on_zero_rows(ingest, tmp_path):
-    from airflow.exceptions import AirflowException
-
-    report = {
-        "schema_version": 3,
-        "status": "failed",
-        "rows": 0,
-        "scopes": _scopes(141, ["X-1=2526"]),
-        "errors": [],
-    }
-    with pytest.raises(AirflowException, match="zero rows"):
-        ingest.validate_data(**_budget_context(tmp_path, report))
+    monkeypatch.setattr(alerts, "telegram_dq_summary", lambda report, header: None)
+    context = {"templates_dict": {"result_path": str(tmp_path / "missing.json")}}
+    with pytest.raises(AirflowException, match="freshness\\[denominator\\]"):
+        ingest.validate_bronze_freshness(**context)
+    assert trino["sql"] == []
