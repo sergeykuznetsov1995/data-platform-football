@@ -93,6 +93,13 @@
   .nb figure a { display: block; border: 1px solid var(--img-border); background: #0f1218; aspect-ratio: 900 / 460; overflow: hidden; }
   .nb figure img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; }
   .nb figcaption { margin-top: 8px; font-size: 13px; color: var(--ink-2); line-height: 1.35; }
+  .access { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--ink); border-bottom: 1px solid var(--rule); margin: 0 0 56px; }
+  .access > div { padding: 20px 20px 20px 0; border-right: 1px solid var(--rule); margin-right: 20px; }
+  .access > div:last-child { border-right: 0; margin-right: 0; }
+  .access h3 { margin: 0 0 8px; font-weight: 400; font-size: 21px; line-height: 1.2; }
+  .access p { margin: 0 0 12px; color: var(--ink-2); font-size: 15px; }
+  .access .open { font-size: 14px; letter-spacing: .04em; color: var(--accent); text-decoration: none; }
+  .access .open:hover { text-decoration: underline; text-underline-offset: 4px; }
   .foot { display: grid; grid-template-columns: 1fr 1fr; gap: 24px 40px; border-top: 1px solid var(--ink); padding-top: 22px; font-size: 15px; }
   .foot p { margin: 0 0 6px; }
   .foot .muted { color: var(--ink-2); }
@@ -114,6 +121,9 @@
     .nb .intro { grid-template-columns: 1fr; gap: 14px; }
     .nb h3 { font-size: 23px; }
     .nb .grid { grid-template-columns: 1fr; }
+    .access { grid-template-columns: 1fr; }
+    .access > div { border-right: 0; margin-right: 0; padding-right: 0; border-bottom: 1px solid var(--rule); }
+    .access > div:last-child { border-bottom: 0; }
     .foot { grid-template-columns: 1fr; }
   }
 </style>
@@ -168,7 +178,7 @@
         <p data-i18n="nbs">Выбираете лигу, сезон, матч, команду и игрока — шесть графиков по событиям с координатами и ударам с xG перерисовываются. Только pandas, matplotlib и ipywidgets поверх слоя gold; на снимках — Juventus — Lazio 2:2, Serie A 2025/26.</p>
         <a class="open" href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" data-i18n="nb_open">Открыть ноутбук на GitHub →</a>
       </div>
-      <p class="muted" data-i18n="nb_note">Ноутбук читает Trino напрямую и запускается в JupyterHub платформы; на GitHub виден код и описание, графики строятся при запуске.</p>
+      <p class="muted" data-i18n="nb_note">Ноутбук читает Trino напрямую и запускается в JupyterHub платформы (доступ аналитика, см. «Доступ» ниже); на GitHub виден код и описание, графики строятся при запуске.</p>
     </div>
     <div class="grid">
       <figure>
@@ -195,6 +205,24 @@
         <a href="https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/notebooks/match_visuals_showcase.ipynb" rel="noopener" tabindex="-1" aria-hidden="true"><img src="img/nb-pass-network.jpg" width="900" height="460" alt="" loading="lazy"></a>
         <figcaption data-i18n="nb6">Сети передач обеих команд</figcaption>
       </figure>
+    </div>
+  </section>
+
+  <h2 data-i18n="h_access">Доступ</h2>
+  <section class="access">
+    <div>
+      <h3 class="serif" data-i18n="a1">Без регистрации</h3>
+      <p data-i18n="a1s">Два дашборда выше с фильтрами. Ничего заводить не нужно.</p>
+    </div>
+    <div>
+      <h3 class="serif" data-i18n="a2">После регистрации</h3>
+      <p data-i18n="a2s">Свои графики и дашборды поверх готовых наборов данных в Superset. На странице входа нажмите Register.</p>
+      <a class="open" href="https://bi.sk-vpn-2026.uk/login/keycloak" rel="noopener" data-i18n="a2_open">Зарегистрироваться →</a>
+    </div>
+    <div>
+      <h3 class="serif" data-i18n="a3">Аналитик: Jupyter и SQL</h3>
+      <p data-i18n="a3s">JupyterHub с ноутбуком-примером и SQL к слою gold через Trino. Выдаётся по запросу: зарегистрируйтесь и напишите мне.</p>
+      <a class="open" href="https://t.me/Sergeykuznetsov1995" rel="noopener" data-i18n="a3_open">Написать в Telegram →</a>
     </div>
   </section>
 
@@ -230,13 +258,19 @@
       nb: "Разбор матча в Jupyter",
       nbs: "Выбираете лигу, сезон, матч, команду и игрока — шесть графиков по событиям с координатами и ударам с xG перерисовываются. Только pandas, matplotlib и ipywidgets поверх слоя gold; на снимках — Juventus — Lazio 2:2, Serie A 2025/26.",
       nb_open: "Открыть ноутбук на GitHub →",
-      nb_note: "Ноутбук читает Trino напрямую и запускается в JupyterHub платформы; на GitHub виден код и описание, графики строятся при запуске.",
+      nb_note: "Ноутбук читает Trino напрямую и запускается в JupyterHub платформы (доступ аналитика, см. «Доступ» ниже); на GitHub виден код и описание, графики строятся при запуске.",
       nb1: "Потери в своей трети: звёзды — те, что привели к удару соперника",
       nb2: "Форма команд Serie A: последние 7 туров против начала сезона",
       nb3: "Накопленный xG матча и кто давит по 5-минутным отрезкам",
       nb4: "Карта передач игрока и его перцентили по лиге",
       nb5: "Удары по xG и входы в 20-метровую зону у ворот",
       nb6: "Сети передач обеих команд",
+      h_access: "Доступ",
+      a1: "Без регистрации", a1s: "Два дашборда выше с фильтрами. Ничего заводить не нужно.",
+      a2: "После регистрации", a2s: "Свои графики и дашборды поверх готовых наборов данных в Superset. На странице входа нажмите Register.",
+      a2_open: "Зарегистрироваться →",
+      a3: "Аналитик: Jupyter и SQL", a3s: "JupyterHub с ноутбуком-примером и SQL к слою gold через Trino. Выдаётся по запросу: зарегистрируйтесь и напишите мне.",
+      a3_open: "Написать в Telegram →",
       gh: "Код на GitHub",
       stack: "Python, Airflow, Apache Iceberg, Trino, Superset. Архитектура bronze / silver / gold.",
       sql: "Нужен SQL или Jupyter — напишите: ",
@@ -261,13 +295,19 @@
       nb: "Match analysis in Jupyter",
       nbs: "Pick a league, season, match, team and player — six charts from event data with coordinates and shots with xG redraw. Plain pandas, matplotlib and ipywidgets on top of the gold layer; the snapshots show Juventus — Lazio 2:2, Serie A 2025/26.",
       nb_open: "Open the notebook on GitHub →",
-      nb_note: "The notebook reads Trino directly and runs in the platform's JupyterHub; GitHub shows the code and description, the charts are built on run.",
+      nb_note: "The notebook reads Trino directly and runs in the platform's JupyterHub (analyst access, see “Access” below); GitHub shows the code and description, the charts are built on run.",
       nb1: "Losses in own third: stars led to an opponent shot",
       nb2: "Serie A form change: last 7 rounds vs. the season before",
       nb3: "Cumulative match xG and territorial pressure by 5-minute bins",
       nb4: "A player's pass map and league percentiles",
       nb5: "Shots sized by xG and entries into the 20-metre zone",
       nb6: "Pass networks of both teams",
+      h_access: "Access",
+      a1: "No sign-up", a1s: "The two dashboards above, with filters. Nothing to create.",
+      a2: "After sign-up", a2s: "Your own charts and dashboards on top of the prepared datasets in Superset. Click Register on the login page.",
+      a2_open: "Sign up →",
+      a3: "Analyst: Jupyter and SQL", a3s: "JupyterHub with the example notebook and SQL over the gold layer via Trino. Granted on request: sign up and message me.",
+      a3_open: "Message me on Telegram →",
       gh: "Code on GitHub",
       stack: "Python, Airflow, Apache Iceberg, Trino, Superset. Bronze / silver / gold architecture.",
       sql: "Need SQL or Jupyter access? Message me: ",

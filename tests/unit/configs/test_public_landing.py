@@ -70,6 +70,7 @@ def test_landing_links_dashboards_github_and_telegram():
         assert f"/superset/dashboard/{slug}/" in html, slug
     assert "https://github.com/sergeykuznetsov1995/data-platform-football" in html
     assert "https://t.me/Sergeykuznetsov1995" in html
+    assert "https://bi.sk-vpn-2026.uk/login/keycloak" in html, "блок «Доступ»: регистрация через вход Keycloak"
     assert "world-cup" not in html, "владелец: чемпионат мира на лендинге не нужен"
     assert "notebooks/match_visuals_showcase.ipynb" in html, "блок «Ноутбук» со ссылкой на GitHub"
     for img in re.findall(r'src="(img/[^"]+)"', html):
