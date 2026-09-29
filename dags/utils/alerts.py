@@ -1336,11 +1336,12 @@ def telegram_dq_summary(report, header: str = "DQ report") -> None:
     """
     try:
         env = _get_var('ALERT_ENV', 'dev')
-        lines = [f"<b>[{env}] {header}</b>", f"<i>{report.summary()}</i>"]
+        esc = html_lib.escape
+        lines = [f"<b>[{esc(env)}] {esc(header)}</b>", f"<i>{esc(report.summary())}</i>"]
         for r in report.errors[:10]:
-            lines.append(f"❌ <code>{r.name}</code>: {(r.details or r.error)[:200]}")
+            lines.append(f"❌ <code>{esc(r.name)}</code>: {esc((r.details or r.error)[:200])}")
         for r in report.warnings[:5]:
-            lines.append(f"⚠️ <code>{r.name}</code>: {(r.details or r.error)[:200]}")
+            lines.append(f"⚠️ <code>{esc(r.name)}</code>: {esc((r.details or r.error)[:200])}")
         _send_telegram("\n".join(lines))
     except Exception as e:
         logger.warning(f"telegram_dq_summary swallowed: {e}")
