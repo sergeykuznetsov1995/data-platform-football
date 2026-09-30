@@ -82,7 +82,9 @@ def _load_report(path: str) -> dict[str, Any]:
 #   (d) the reference SQL finds a denominator game past its deadline
 #       (kickoff + 26 h) without a success and without a proven "not at the
 #       source";
-#   (e) the schedule of a denominator scope is older than 48 h.
+#   (e) the schedule of an active denominator scope is older than 48 h, or
+#       a denominator scope (active or finished) has no schedule at all; a
+#       finished season is not re-read daily, so its age is not a signal.
 # The message lists every rule that fired and its scopes.
 WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE = 0.05
 _LISTED = 10
@@ -113,11 +115,26 @@ def _listed(items: list[str]) -> str:
     return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
+def _schedule_rule_text(older: list[str], absent: list[str], max_age: int) -> str:
+    parts = []
+    if older:
+        parts.append(
+            f"{len(older)} active denominator schedule(s) older than "
+            f"{max_age} h: {_listed(older)}"
+        )
+    if absent:
+        parts.append(
+            f"{len(absent)} denominator schedule(s) absent: {_listed(absent)}"
+        )
+    return "; ".join(parts)
+
+
 def validate_data(**context: Any) -> None:
     """Red when a rule (a)-(e) above fires; the message names the rules."""
     from dags.scripts.whoscored_criterion import (
         SCHEDULE_MAX_AGE_HOURS,
         denominator_partitions,
+        inactive_partitions,
         render_overdue_sql,
         stale_schedule_partitions,
     )
@@ -183,14 +200,15 @@ def validate_data(**context: Any) -> None:
             )
     if partitions:
         try:
-            stale = stale_schedule_partitions(_trino_query, partitions, now)
+            older, absent = stale_schedule_partitions(
+                _trino_query, partitions, now, inactive_partitions(report)
+            )
         except Exception as exc:
             fired.append(f"(e) schedule freshness query failed: {type(exc).__name__}: {exc}")
         else:
-            if stale:
+            if older or absent:
                 fired.append(
-                    f"(e) {len(stale)} denominator schedule(s) older than "
-                    f"{SCHEDULE_MAX_AGE_HOURS} h: {_listed(stale)}"
+                    "(e) " + _schedule_rule_text(older, absent, SCHEDULE_MAX_AGE_HOURS)
                 )
 
     logger.info(
@@ -211,7 +229,8 @@ def validate_data(**context: Any) -> None:
 def validate_bronze_freshness(**context: Any) -> None:
     """ERROR freshness over the denominator partitions (league, season).
 
-    Schedule: every denominator partition refreshed within 48 h.  Matches and
+    Schedule: every active denominator partition refreshed within 48 h, a
+    finished one (catalog ``is_active`` False) has schedule rows.  Matches and
     events: the newest write over the denominator partitions within 48 h.
     Telegram summary, then red on any ERROR.
     """
@@ -221,6 +240,7 @@ def validate_bronze_freshness(**context: Any) -> None:
         SCHEDULE_MAX_AGE_HOURS,
         content_age_hours,
         denominator_partitions,
+        inactive_partitions,
         stale_schedule_partitions,
     )
     from utils.alerts import telegram_dq_summary
@@ -242,9 +262,8 @@ def validate_bronze_freshness(**context: Any) -> None:
         )
 
     try:
-        partitions = denominator_partitions(
-            _load_report(context["templates_dict"]["result_path"])
-        )
+        report = _load_report(context["templates_dict"]["result_path"])
+        partitions = denominator_partitions(report)
         if not partitions:
             raise AirflowException("the run report has no denominator scope")
     except AirflowException as exc:
@@ -252,15 +271,19 @@ def validate_bronze_freshness(**context: Any) -> None:
     else:
         name = f"freshness[whoscored_schedule per partition, max {SCHEDULE_MAX_AGE_HOURS}h]"
         try:
-            stale = stale_schedule_partitions(_trino_query, partitions, now)
+            older, absent = stale_schedule_partitions(
+                _trino_query, partitions, now, inactive_partitions(report)
+            )
         except Exception as exc:
             _add(name, False, error=f"{type(exc).__name__}: {exc}")
         else:
+            stale = len(older) + len(absent)
             _add(
                 name,
                 not stale,
                 details=(
-                    f"{len(stale)}/{len(partitions)} stale: {_listed(stale)}"
+                    f"{stale}/{len(partitions)} stale: "
+                    + _schedule_rule_text(older, absent, SCHEDULE_MAX_AGE_HOURS)
                     if stale
                     else f"{len(partitions)} partitions fresh"
                 ),

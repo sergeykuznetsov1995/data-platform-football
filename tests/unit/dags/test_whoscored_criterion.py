@@ -206,9 +206,53 @@ def test_schedule_freshness_flags_old_and_absent_partitions():
         ("WS-182-77", "2627"),
     ]
 
-    stale = criterion.stale_schedule_partitions(_query(con), partitions, NOW)
+    older, absent = criterion.stale_schedule_partitions(_query(con), partitions, NOW)
 
-    assert stale == ["WS-252-29=2627 (1320h)", "WS-182-77=2627 (never)"]
+    assert older == ["WS-252-29=2627 (1320h)"]
+    assert absent == ["WS-182-77=2627"]
+
+
+@pytest.mark.unit
+def test_schedule_freshness_finished_season_needs_rows_not_age():
+    # #1601: a finished season is not re-read daily; 56 h old rows are fine,
+    # missing rows are still an error; an active season keeps the 48 h rule.
+    con = _connection()
+    con.execute(
+        "INSERT INTO iceberg.bronze.whoscored_schedule VALUES "
+        "('ENG-Premier League', '2526', ?), ('ENG-Premier League', '2627', ?)",
+        [NOW - timedelta(hours=56), NOW - timedelta(hours=56)],
+    )
+    partitions = [
+        ("ENG-Premier League", "2526"),
+        ("ENG-Premier League", "2627"),
+        ("INT-World Cup", "2026"),
+    ]
+    inactive = {("ENG-Premier League", "2526"), ("INT-World Cup", "2026")}
+
+    older, absent = criterion.stale_schedule_partitions(
+        _query(con), partitions, NOW, inactive
+    )
+
+    assert older == ["ENG-Premier League=2627 (56h)"]
+    assert absent == ["INT-World Cup=2026"]
+
+
+@pytest.mark.unit
+def test_inactive_partitions_only_from_explicit_false():
+    # A report without ``is_active`` (older format) or with None stays strict.
+    report = {
+        "scopes": [
+            {"scope": "A=2526", "competition_id": "A", "season_id": "2526",
+             "is_active": False},
+            {"scope": "A=2627", "competition_id": "A", "season_id": "2627",
+             "is_active": True},
+            {"scope": "B=2526", "competition_id": "B", "season_id": "2526",
+             "is_active": None},
+            {"scope": "C=2526", "competition_id": "C", "season_id": "2526"},
+        ]
+    }
+
+    assert criterion.inactive_partitions(report) == {("A", "2526")}
 
 
 @pytest.mark.unit

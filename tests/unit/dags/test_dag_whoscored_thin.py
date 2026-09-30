@@ -226,10 +226,13 @@ DENOMINATOR = ("ENG-Premier League=2627", "WS-182-77=2627")
 PROBE = "WS-206-63=2526"
 
 
-def _scope(spec, status="success"):
+def _scope(spec, status="success", is_active=None):
     league, season = spec.split("=")
-    return {"scope": spec, "competition_id": league, "season_id": season,
-            "status": status}
+    scope = {"scope": spec, "competition_id": league, "season_id": season,
+             "status": status}
+    if is_active is not None:
+        scope["is_active"] = is_active
+    return scope
 
 
 def _report(statuses=None, *, probe_status="success", successes=5, status="success",
@@ -344,13 +347,51 @@ def test_validate_data_rule_d_query_failure_is_red(ingest, tmp_path, trino):
         ingest.validate_data(**_budget_context(tmp_path, _report()))
 
 
-@pytest.mark.parametrize("age", [49, None])
-def test_validate_data_rule_e_stale_schedule(ingest, tmp_path, trino, age):
+@pytest.mark.parametrize(
+    ("age", "text"),
+    [
+        (49, r"\(e\) 1 active denominator schedule\(s\) older than 48 h: WS-182-77=2627 \(49h\)"),
+        (None, r"\(e\) 1 denominator schedule\(s\) absent: WS-182-77=2627"),
+    ],
+)
+def test_validate_data_rule_e_stale_schedule(ingest, tmp_path, trino, age, text):
     from airflow.exceptions import AirflowException
 
     trino["schedule_age_h"] = {"WS-182-77=2627": age}
-    with pytest.raises(AirflowException, match=r"\(e\) 1 denominator schedule.*WS-182-77=2627"):
+    with pytest.raises(AirflowException, match=text):
         ingest.validate_data(**_budget_context(tmp_path, _report()))
+
+
+def _activity_report(is_active):
+    report = _report()
+    report["scopes"] = [
+        _scope(spec, is_active=is_active) for spec in DENOMINATOR
+    ] + [_scope(PROBE)]
+    return report
+
+
+def test_validate_data_rule_e_finished_season_old_schedule_is_green(ingest, tmp_path, trino):
+    # #1601: a finished season is not re-read daily; its age is not a signal.
+    trino["schedule_age_h"] = {"WS-182-77=2627": 56}
+    ingest.validate_data(**_budget_context(tmp_path, _activity_report(False)))
+
+
+def test_validate_data_rule_e_finished_season_without_schedule_is_red(ingest, tmp_path, trino):
+    from airflow.exceptions import AirflowException
+
+    trino["schedule_age_h"] = {"WS-182-77=2627": None}
+    with pytest.raises(AirflowException, match=r"\(e\) 1 denominator schedule\(s\) absent"):
+        ingest.validate_data(**_budget_context(tmp_path, _activity_report(False)))
+
+
+@pytest.mark.parametrize("is_active", [True, None])
+def test_validate_data_rule_e_active_or_unknown_keeps_48h(ingest, tmp_path, trino, is_active):
+    # ``None`` = report without the field (older format): strict, not relaxed.
+    from airflow.exceptions import AirflowException
+
+    trino["schedule_age_h"] = {"WS-182-77=2627": 56}
+    with pytest.raises(AirflowException, match=r"older than 48 h: WS-182-77=2627 \(56h\)"):
+        ingest.validate_data(**_budget_context(tmp_path, _activity_report(is_active)))
 
 
 def test_validate_data_ignores_old_protected_prefix_and_row_rules(ingest, tmp_path, trino):
@@ -380,6 +421,31 @@ def test_freshness_is_error_per_denominator_partition(ingest, tmp_path, trino, m
     trino["schedule_age_h"] = {}
     trino["content_age_h"] = 49
     with pytest.raises(AirflowException, match="whoscored_events over denominator"):
+        ingest.validate_bronze_freshness(**context)
+
+
+def test_freshness_schedule_finished_season_needs_rows_not_age(
+    ingest, tmp_path, trino, monkeypatch
+):
+    # #1601: same rule as (e) - finished season old rows pass, absent fails.
+    from airflow.exceptions import AirflowException
+    import utils.alerts as alerts
+
+    sent = []
+    monkeypatch.setattr(alerts, "telegram_dq_summary", lambda report, header: sent.append(report))
+    context = _budget_context(tmp_path, _activity_report(False))
+
+    trino["schedule_age_h"] = {"ENG-Premier League=2627": 56}
+    ingest.validate_bronze_freshness(**context)
+    assert sent[-1].errors == []
+
+    trino["schedule_age_h"] = {"ENG-Premier League=2627": None}
+    with pytest.raises(AirflowException, match=r"1/2 stale: 1 denominator schedule\(s\) absent"):
+        ingest.validate_bronze_freshness(**context)
+
+    context = _budget_context(tmp_path, _report())
+    trino["schedule_age_h"] = {"ENG-Premier League=2627": 56}
+    with pytest.raises(AirflowException, match=r"older than 48 h: ENG-Premier League=2627 \(56h\)"):
         ingest.validate_bronze_freshness(**context)
 
 
