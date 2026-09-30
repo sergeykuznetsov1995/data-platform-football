@@ -299,6 +299,7 @@ class _SeasonSchedule:
     season_dataset_statuses: dict[str, list[DatasetStatus]]
     raw_uris: list[str]
     payload_hashes: list[str]
+    source_stage_absent: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -2281,10 +2282,25 @@ class WhoScoredIngestService:
         expected_stage_ids = sorted(
             {int(stage_id) for stage_id in self.catalog_season.stage_ids}
         )
-        if source_stage_ids != expected_stage_ids:
+        # #1598: a stage the source dropped (observed is a strict subset of
+        # the frozen catalog) must not sink the whole season schedule; the
+        # remaining stages are collected and the absence is recorded.  A new
+        # stage still needs discover, and an empty menu is never a subset.
+        source_stage_absent = sorted(set(expected_stage_ids) - set(source_stage_ids))
+        if not source_stage_ids or not set(source_stage_ids) <= set(
+            expected_stage_ids
+        ):
             raise WhoScoredParseError(
                 "source schedule stages differ from the frozen catalog: "
                 f"expected={expected_stage_ids}, observed={source_stage_ids}"
+            )
+        if source_stage_absent:
+            logger.warning(
+                "%s: source schedule no longer lists frozen catalog stage(s) %s; "
+                "collecting observed stages %s",
+                self.scope.spec,
+                source_stage_absent,
+                source_stage_ids,
             )
         schedule_by_id: dict[int, dict[str, Any]] = {}
         incident_by_key: dict[str, dict[str, Any]] = {}
@@ -2472,6 +2488,7 @@ class WhoScoredIngestService:
             season_dataset_statuses=season_dataset_statuses,
             raw_uris=raw_uris,
             payload_hashes=payload_hashes,
+            source_stage_absent=source_stage_absent,
         )
 
     def sync_schedule(self) -> EntityResult:
@@ -2495,6 +2512,10 @@ class WhoScoredIngestService:
                     ),
                 }
             )
+            if collected.source_stage_absent:
+                result.metadata["source_stage_absent"] = list(
+                    collected.source_stage_absent
+                )
             schedule_by_id = collected.schedule_by_id
             incident_by_key = collected.incident_by_key
             bet_by_key = collected.bet_by_key

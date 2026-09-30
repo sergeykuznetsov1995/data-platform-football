@@ -909,6 +909,137 @@ def test_schedule_rejects_source_stage_drift_before_stage_requests(tmp_path):
     assert "source schedule stages differ from the frozen catalog" in result.errors[0]
 
 
+def test_schedule_rejects_empty_source_stage_menu(tmp_path):
+    # #1598: an empty stage menu is not "a stage went missing".
+    service, _, _ = _service(tmp_path)
+    service.catalog_season = replace(service.catalog_season, stage_ids=(699, 700))
+    service._source_season_id = lambda: 9001
+    calls = []
+
+    def fake_fetch_parsed(target, **_kwargs):
+        calls.append(target.page_kind)
+        return (
+            SimpleNamespace(sha256="a" * 64),
+            "s3://raw/season",
+            SimpleNamespace(stages=SimpleNamespace(rows=[])),
+        )
+
+    service._fetch_parsed = fake_fetch_parsed
+
+    result = service.sync_schedule()
+
+    assert result.status == "failed"
+    assert calls == ["season_stages"]
+    assert "expected=[699, 700], observed=[]" in result.errors[0]
+
+
+def test_schedule_rejects_extra_source_stage_even_with_one_absent(tmp_path):
+    # #1598: a stage the catalog does not know still needs discover.
+    service, _, _ = _service(tmp_path)
+    service.catalog_season = replace(service.catalog_season, stage_ids=(699, 700))
+    service._source_season_id = lambda: 9001
+
+    def fake_fetch_parsed(target, **_kwargs):
+        return (
+            SimpleNamespace(sha256="a" * 64),
+            "s3://raw/season",
+            SimpleNamespace(
+                stages=SimpleNamespace(rows=[{"stage_id": 700}, {"stage_id": 701}])
+            ),
+        )
+
+    service._fetch_parsed = fake_fetch_parsed
+
+    result = service.sync_schedule()
+
+    assert result.status == "failed"
+    assert "source schedule stages differ from the frozen catalog" in result.errors[0]
+    assert "source_stage_absent" not in result.metadata
+
+
+def test_schedule_collects_observed_stages_when_source_drops_one(
+    tmp_path, monkeypatch, caplog
+):
+    # #1598: League Cup 26/27 - the source dropped a frozen catalog stage.
+    # The remaining stage is collected and committed, the absence is recorded.
+    class _FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 7, 11)
+
+    monkeypatch.setattr("scrapers.whoscored.service.date", _FixedDate)
+    service, repository, _ = _service(tmp_path)
+    service.catalog_season = replace(
+        service.catalog_season, end=None, stage_ids=(699, 700)
+    )
+    service._source_season_id = lambda: 9001
+    stage_html = """
+    <select id="stages"><option
+      value="/Regions/247/Tournaments/36/Seasons/9001/Stages/700/Fixtures/world-cup-2026">
+      Group Stage</option></select>
+    """
+    calendar_html = """
+    <script>var wsCalendar = {mask:{2026:{6:{1:1}}}};</script>
+    """
+    fetched_stage_ids = []
+
+    def fake_fetch(target, **kwargs):
+        if target.page_kind == "season_stages":
+            content = stage_html.encode()
+        elif target.page_kind == "stage_calendar":
+            fetched_stage_ids.append(target.source_ids["stage_id"])
+            content = calendar_html.encode()
+        else:
+            content = json.dumps(
+                {
+                    "tournaments": [
+                        {
+                            "matches": [
+                                {
+                                    "id": 1007,
+                                    "startTimeUtc": "2026-07-11T19:00:00Z",
+                                    "homeTeamName": "Home",
+                                    "awayTeamName": "Away",
+                                    "homeTeamId": 1,
+                                    "awayTeamId": 2,
+                                    "status": 6,
+                                    "matchIsOpta": True,
+                                    "hasPreview": True,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ).encode()
+        response = TransportResponse(
+            url=target.canonical_url,
+            content=content,
+            status_code=200,
+            headers={},
+            route=TransportRoute.DIRECT_HTTP,
+            wire_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        assert kwargs["validator"](response) is True
+        return response, f"s3://raw/{target.target_id}"
+
+    service._fetch = fake_fetch
+
+    with caplog.at_level("WARNING", logger="scrapers.whoscored.service"):
+        result = service.sync_schedule()
+
+    assert result.status == "success", result.as_dict()
+    assert result.metadata == {
+        "source_stage_ids": [700],
+        "source_stage_count": 1,
+        "source_stage_absent": [699],
+    }
+    assert fetched_stage_ids == ["700"]
+    assert result.counts["schedule"] == 1
+    assert len(repository.scope_snapshots) == 1
+    assert "no longer lists frozen catalog stage(s) [699]" in caplog.text
+
+
 def test_structured_rate_limit_is_wired_into_example_and_airflow_environment():
     root = Path(__file__).resolve().parents[3]
     env_example = (root / ".env.example").read_text(encoding="utf-8")
