@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gzip
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -389,10 +391,21 @@ def test_results_without_club_links_fail_closed(results_html):
         parse_results(results_html.replace('class="max640"', 'class="compact-code"'))
 
 
-def test_results_without_date_separators_fail_closed(results_html):
-    # Sol r1 #6: every row would get the h1 date
-    broken = re.sub(r'<tr><td class="l" colspan="3">[^<]*</td></tr>', "", results_html)
-    with pytest.raises(LayoutChanged, match="no date separators"):
+def test_results_one_day_page_without_separators():
+    # live page of 30.09 (#1465 first run): only the h1 date, no separators
+    path = Path(__file__).parents[2] / "fixtures" / "clubelo" / "20260930" / "Results.html.gz"
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        page = parse_results(fh.read())
+    assert page.rating_date == date(2026, 9, 26)
+    assert len(page.rows) == 62 and page.duplicates == 1
+    assert {row["match_date"] for row in page.rows} == {date(2026, 9, 26)}
+
+
+def test_results_changed_separator_markup_fails_closed(results_html):
+    # Sol r1 #6: a separator not read as one would give every row the h1 date
+    broken = re.sub(r'<tr><td class="l" colspan="3">([^<]*)</td></tr>',
+                    r'<tr class="d"><span>\1</span></tr>', results_html)
+    with pytest.raises(LayoutChanged, match="dates but no date separators"):
         parse_results(broken)
 
 
