@@ -1658,7 +1658,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     report.setdefault("skipped_slices", []).append(name)
                     held = 0
             cursor_state["interrupted_runs"][name] = held
-            if name == "seed" and queue_safe:
+            # A walk cut short by a refusal streak banks its rows (#1359), but
+            # the chains of the slice it never reached were not attempted:
+            # only a tail walk that ran to the end retires them (Sol r2).
+            if name == "seed" and queue_safe and tail_walked:
                 attempted.update(retried)
             committed = True
             if queue_safe:

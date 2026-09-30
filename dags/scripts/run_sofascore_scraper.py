@@ -906,7 +906,7 @@ def _scope_capture_limits(environ=None) -> dict:
         "deadline": _number("SOFASCORE_SCOPE_DEADLINE_EPOCH"),
         "byte_cap": _number("SOFASCORE_SCOPE_BYTE_CAP"),
         "max_matches": _number("SOFASCORE_SCOPE_MAX_MATCHES"),
-        "seconds_per_match": _number("SOFASCORE_REFRESH_SECONDS_PER_MATCH") or 25.0,
+        "seconds_per_match": _number("SOFASCORE_REFRESH_SECONDS_PER_MATCH") or 15.0,
     }
 
 
@@ -926,7 +926,7 @@ def _capture_stop_reason(limits, spent_bytes, matches, now=None):
     if deadline is not None:
         now = time.time() if now is None else now
         projected = now + ALLOCATION_OVERRUN_FACTOR * matches * float(
-            limits.get("seconds_per_match") or 25.0
+            limits.get("seconds_per_match") or 15.0
         )
         if projected > deadline - SCOPE_STOP_MARGIN_SECONDS:
             return "time_budget"

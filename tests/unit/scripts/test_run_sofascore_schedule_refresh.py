@@ -2468,3 +2468,42 @@ def test_a_refusal_streak_banks_what_the_walk_paid_for(offline, monkeypatch):
     report = json.loads(offline["output"].read_text())
     assert "SweepRefusedError" in report["errors"][0]
     assert report["rows_written"] > 0
+
+
+@pytest.mark.unit
+def test_a_refusal_streak_keeps_the_seed_chains_it_never_reached(
+    offline, monkeypatch
+):
+    # Sol #1359 r2: the banked rows made the class "queue safe", which marked
+    # the whole retry slice as attempted — a chain the streak cut off before
+    # it was visited fell off the queue for good.  Only a tail walk that ran to
+    # the end may retire the chains of its slice.
+    from scrapers.sofascore.schedule_refresh import SweepRefusedError
+
+    offline["calls"]["known"] = {("SS-7", "2627")}
+    offline["incomplete"].write_text(json.dumps({"seasons": [
+        [7, 96518, 3, 1_700_000],
+    ]}))
+    stub_fetch = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        targets = list(targets)
+        if kwargs.get("start_pages"):
+            events, counters, _ = stub_fetch(
+                client, targets, raw_store,
+                **{**kwargs, "start_pages": None, "resume_anchors": None},
+            )
+            assert events
+            # Paid pages come back, the queued chain is NOT in ``incomplete``:
+            # the streak stopped the walk before it got there.
+            raise SweepRefusedError(
+                "3 season pages in a row refused", status_code=403,
+                fetched=events, counters=counters, incomplete=[],
+            )
+        return stub_fetch(client, targets, raw_store, **kwargs)
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+    stored = json.loads(offline["incomplete"].read_text())
+    assert [entry[:3] for entry in stored["seasons"]] == [[7, 96518, 3]]
