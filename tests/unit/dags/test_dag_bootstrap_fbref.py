@@ -74,12 +74,12 @@ class TestFBrefBootstrapTopology:
             6 * 60 * 60 + 5 * 60
         )
         # Bootstrap is a current-lane runner with the same 25-page waves and
-        # six-hour-five-minute task timeout, so it shares the production-safe
-        # 14-wave cap rather than reviving the stale 80-wave contract.
-        assert live.op_kwargs["max_batches"] == 14
-        # Bootstrap is manual and has no schedule to protect, so the wall-clock
-        # budget stays off there and the cap remains its only bound.
-        assert live.op_kwargs["deadline_seconds"] == 0
+        # six-hour-five-minute task timeout, so it shares the production
+        # 20-wave cap rather than reviving the stale 80-wave contract.
+        assert live.op_kwargs["max_batches"] == 20
+        # A slow 20-wave run can outlast the six-hour subprocess wait, so the
+        # bootstrap uses the same wall-clock budget as ingest.
+        assert live.op_kwargs["deadline_seconds"] == 19800
 
     def test_dedicated_pool_is_created_idempotently(self):
         compose = (
