@@ -4,8 +4,10 @@ import dataclasses
 from datetime import datetime, timedelta, timezone
 import importlib
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -648,6 +650,34 @@ class TestStandingRegistryDiscovery:
         assert int(env["TM_RETRY_LIMIT"]) == 96
         assert env["TM_REQUIRE_METERED_PROXY"] == "true"
         assert "TM_PAID_PACKET" not in env
+
+    def test_prepared_env_lets_the_runner_import_its_modules(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        """30.09: the first scheduled run died on ModuleNotFoundError 'utils'.
+
+        ``dags/utils/__init__`` imports the top-level ``utils`` package, so the
+        runner needs ``/opt/airflow/dags`` on PYTHONPATH, as the ingest DAG has.
+        """
+        paths, _, _ = self._arm(dag_module, monkeypatch, tmp_path)
+
+        env = dag_module._prepare_discovery(
+            **self._prepare_kwargs(dag_module, paths)
+        )
+
+        repo = Path(__file__).resolve().parents[3]
+        result = subprocess.run(
+            [sys.executable, "dags/scripts/run_transfermarkt_discovery.py", "--help"],
+            cwd=repo,
+            env={
+                **os.environ,
+                "PYTHONPATH": env["PYTHONPATH"].replace("/opt/airflow", str(repo)),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
         assert "TM_BRONZE_PACKET" not in env
         assert "TM_APPROVAL_JOURNAL" not in env
         assert "TM_PAID_APPROVAL_PRESENTED_HASH" not in env
@@ -739,6 +769,7 @@ class TestStandingRegistryDiscovery:
 
         assert env["TM_APPROVAL_MODE"] == "one_shot"
         assert env["TM_PAID_PACKET"] == str(approvals["paid_path"])
+        assert env["PYTHONPATH"] == "/opt/airflow:/opt/airflow/dags"
         assert "TM_STANDING_POLICY_PATH" not in env
         assert "TM_STANDING_POLICY_SHA256" not in env
 
