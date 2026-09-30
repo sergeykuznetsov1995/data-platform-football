@@ -284,6 +284,7 @@ RESULTS_HEADERS = (
 )
 RESULT_ROW_CELLS = (5, 10)  # 5 = fixture without a result, 10 = played match
 
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _PAGE_CREATED = re.compile(r"Page created on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 _ELO_DATA_MARKER = "eloData = ["
 # eloData cell 0: optional flag link, optional rank, the club link.
@@ -604,6 +605,8 @@ def _team(td) -> Dict[str, Any]:
 def parse_results(html: str) -> ResultsPage:
     """Parse ``/Results``: rows under date separators, the first block is the h1 date.
 
+    A page with one day of results has no separators: all rows get the h1 date.
+
     The markup is broken (``<tr><tr>`` after a separator); lxml repairs it into
     an empty ``<tr>`` that has no cells and is skipped. A row without a score
     is kept (``ft`` NULL); ``is_final`` is true when "Game Δ" is filled. A key
@@ -679,9 +682,11 @@ def parse_results(html: str) -> ResultsPage:
         # changed and every key would silently become "~CC:Name", so the MERGE
         # would add a second copy of each match (Sol r2 log)
         raise LayoutChanged("C7 results table has no club links")
-    if not separators:
-        # the ~3-day window always has older dates; without separators every
-        # row would get the h1 date (Sol r1 #6)
-        raise LayoutChanged("C3 results table has no date separators")
+    if len(_ISO_DATE.findall(_text(tables[0]))) != separators:
+        # a one-day page has no separators (30.09, h1 2026-09-26); a date in
+        # the table that was not read as a separator means the separator
+        # markup changed and its rows would get the previous date (Sol r1 #6,
+        # Astra r1 P1: also when only some separators changed)
+        raise LayoutChanged("C3 results table has dates outside date separators")
     return ResultsPage(rating_date=rating_date, page_created_at=created, rows=rows,
                        duplicates=duplicates)
