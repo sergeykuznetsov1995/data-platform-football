@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Fail-closed rollback coordinator for FotMob consumers.
 
-Rollback is a four-step operation, intentionally split across invocations:
+Rollback is a three-step operation, intentionally split across invocations:
 
 1. ``plan`` records the exact procedure without changing anything.
 2. ``pause --execute`` pauses all FotMob DAGs and proves no writer is running.
-3. After an operator deploys the reviewed consumer revert, ``run-silver``
-   creates a synthetic publication fence, runs exact Silver/DQ and abandons
-   the candidate. ``recover-publication`` handles an ambiguous interrupted run
-   without guessing whether its lock is safe to release.
-4. ``validate`` proves the deployed revision, exact fenced Silver/DQ run,
-   abandoned candidate and availability of every frozen legacy Bronze table.
+3. After an operator deploys the reviewed consumer revert, ``validate`` proves
+   the deployed revision and availability of every frozen legacy Bronze table.
+
+The legacy Silver validation run (``run-silver``/``recover-publication``) was
+removed together with the FotMob Silver transform (#1590).
 
 The command never drops, truncates or otherwise mutates native Bronze objects.
 """
@@ -25,8 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -43,7 +41,6 @@ except ModuleNotFoundError:  # direct ``python scripts/fotmob_rollback.py``
 DAGS = (
     "dag_orchestrate_fotmob",
     "dag_ingest_fotmob",
-    "dag_transform_fotmob_silver",
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
@@ -69,12 +66,7 @@ LEGACY_TABLES = (
     "fotmob_transfers",
 )
 CONFIRM_PAUSE = "PAUSE_FOTMOB_WRITERS"
-CONFIRM_RUN_SILVER = "RUN_FOTMOB_ROLLBACK_VALIDATION_SILVER"
-CONFIRM_RECOVER_PUBLICATION = "RECOVER_FOTMOB_ROLLBACK_PUBLICATION"
 CONFIRM_RESTORE_MAINTENANCE = "RESTORE_FOTMOB_MAINTENANCE"
-ROLLBACK_PUBLICATION_SCHEMA = "fotmob-rollback-publication-v1"
-PUBLICATION_TTL_SECONDS = 14 * 24 * 60 * 60
-SILVER_DAG_ID = "dag_transform_fotmob_silver"
 SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
 ACTIVE_TASK_INSTANCE_STATES = (
     "queued",
@@ -281,191 +273,6 @@ def require_no_active_fotmob_publication(
         )
     except runtime_binding.RuntimeBindingError as exc:
         raise RollbackError(str(exc)) from exc
-
-
-def _container_python_json(
-    args: argparse.Namespace,
-    *,
-    code: str,
-    marker: str,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-    allow_null: bool = False,
-) -> dict[str, Any] | None:
-    output = run(
-        (
-            *_compose_base(args),
-            "exec",
-            "-T",
-            "airflow-scheduler",
-            "python",
-            "-c",
-            code,
-        ),
-        check=True,
-        capture_output=True,
-        text=True,
-        env=_compose_environment(args),
-    ).stdout
-    for line in reversed(output.splitlines()):
-        if not line.startswith(marker):
-            continue
-        try:
-            payload = json.loads(line.removeprefix(marker))
-        except json.JSONDecodeError as exc:
-            raise RollbackError(f"invalid {marker} evidence") from exc
-        if isinstance(payload, dict) or (allow_null and payload is None):
-            return payload
-        break
-    raise RollbackError(f"container did not emit {marker} evidence")
-
-
-def _rollback_publication_envelope(
-    args: argparse.Namespace,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-) -> dict[str, Any]:
-    context = _deployment_context(args)
-    attempt = int(args.publication_attempt)
-    if attempt <= 0:
-        raise RollbackError("--publication-attempt must be a positive integer")
-    start = _timestamp(context["generated_at"]) + timedelta(seconds=attempt)
-    end = start + timedelta(seconds=1)
-    expected_start = start.isoformat(timespec="microseconds")
-    expected_end = end.isoformat(timespec="microseconds")
-    marker = "FOTMOB_ROLLBACK_PUBLICATION_BINDING_JSON="
-    code = (
-        "import json,sys; sys.path.insert(0,'/opt/airflow/dags'); "
-        "from utils.fotmob_publication import make_publication_binding,make_generation_id; "
-        f"b=make_publication_binding(owner='isolated',data_interval_start={start.isoformat()!r},"
-        f"data_interval_end={end.isoformat()!r},fingerprint={context['git_sha']!r}); "
-        f"print('{marker}'+json.dumps({{'generation_id':make_generation_id(b),'binding':b}},"
-        "sort_keys=True))"
-    )
-    payload = _container_python_json(
-        args, code=code, marker=marker, run=run
-    )
-    binding = payload.get("binding")
-    generation_id = str(payload.get("generation_id", ""))
-    if not isinstance(binding, Mapping):
-        raise RollbackError("rollback publication binding is absent")
-    if (
-        binding.get("schema") != "fotmob-publication-v1"
-        or binding.get("source") != "fotmob"
-        or binding.get("owner") != "isolated"
-        or binding.get("runtime_fingerprint") != context["git_sha"]
-        or binding.get("data_interval_start") != expected_start
-        or binding.get("data_interval_end") != expected_end
-        or _timestamp(binding.get("data_interval_end"))
-        - _timestamp(binding.get("data_interval_start"))
-        != timedelta(seconds=1)
-        or not re.fullmatch(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-            generation_id,
-        )
-    ):
-        raise RollbackError("rollback publication binding is not exact and synthetic")
-    return {"generation_id": generation_id, "binding": dict(binding)}
-
-
-def _initialize_rollback_publication(
-    args: argparse.Namespace,
-    publication: Mapping[str, Any],
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-) -> dict[str, Any]:
-    marker = "FOTMOB_ROLLBACK_PUBLICATION_STATE_JSON="
-    binding_json = json.dumps(publication["binding"], sort_keys=True)
-    code = (
-        "import json; from scrapers.fbref.control import ControlStore; "
-        f"b=json.loads({binding_json!r}); "
-        "r=ControlStore.from_env().initialize_publication_generation("
-        f"{str(publication['generation_id'])!r},dag_id='fotmob_rollback_validation',"
-        f"binding=b,source='fotmob',ttl_seconds={PUBLICATION_TTL_SECONDS}); "
-        f"print('{marker}'+json.dumps(r,default=str,sort_keys=True))"
-    )
-    state = _container_python_json(args, code=code, marker=marker, run=run)
-    if (
-        state.get("generation_id") != publication["generation_id"]
-        or state.get("binding") != publication["binding"]
-        or state.get("status") != "running"
-        or state.get("phase") != "writing"
-        or state.get("active") is not True
-        or state.get("owner_dag_id") != "fotmob_rollback_validation"
-    ):
-        raise RollbackError("rollback publication generation was not acquired exactly")
-    return state
-
-
-def _get_rollback_publication(
-    args: argparse.Namespace,
-    generation_id: str,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-) -> dict[str, Any] | None:
-    marker = "FOTMOB_ROLLBACK_PUBLICATION_STATE_JSON="
-    code = (
-        "import json; from scrapers.fbref.control import ControlStore; "
-        "r=ControlStore.from_env().get_publication_generation("
-        f"{generation_id!r},source='fotmob'); "
-        f"print('{marker}'+json.dumps(r,default=str,sort_keys=True))"
-    )
-    return _container_python_json(
-        args, code=code, marker=marker, run=run, allow_null=True
-    )
-
-
-def _transition_rollback_publication(
-    args: argparse.Namespace,
-    generation_id: str,
-    *,
-    action: str,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-) -> dict[str, Any]:
-    marker = "FOTMOB_ROLLBACK_PUBLICATION_STATE_JSON="
-    if action == "seal":
-        expression = (
-            "s.seal_publication_generation("
-            f"{generation_id!r},source='fotmob',ttl_seconds={PUBLICATION_TTL_SECONDS})"
-        )
-    elif action == "abandon":
-        expression = (
-            "s.complete_publication_generation("
-            f"{generation_id!r},consumer=None,published=False,source='fotmob')"
-        )
-    elif action in {"fail_retain", "fail_release"}:
-        safe = action == "fail_release"
-        expression = (
-            "s.fail_publication_generation("
-            f"{generation_id!r},safe_to_release={safe!r},source='fotmob')"
-        )
-    else:  # pragma: no cover - internal callers use constants above
-        raise AssertionError(action)
-    code = (
-        "import json; from scrapers.fbref.control import ControlStore; "
-        f"s=ControlStore.from_env(); r={expression}; "
-        f"print('{marker}'+json.dumps(r,default=str,sort_keys=True))"
-    )
-    return _container_python_json(args, code=code, marker=marker, run=run)
-
-
-def _publication_state_summary(state: Mapping[str, Any]) -> dict[str, Any]:
-    candidate = state.get("candidate")
-    candidate_summary = None
-    if isinstance(candidate, Mapping):
-        candidate_summary = {
-            "generation_id": candidate.get("generation_id"),
-            "digest": candidate.get("digest"),
-            "transform_task_ids": candidate.get("transform_task_ids"),
-        }
-    return {
-        "generation_id": state.get("generation_id"),
-        "status": state.get("status"),
-        "phase": state.get("phase"),
-        "active": state.get("active"),
-        "released": state.get("released"),
-        "published": state.get("published"),
-        "candidate": candidate_summary,
-    }
 
 
 def inspect_writer_state(
@@ -1357,30 +1164,6 @@ def _sanitized_pause_failure(exc: Exception) -> str:
     return error_type
 
 
-def _exact_silver_run(
-    args: argparse.Namespace,
-    run_id: str,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-) -> dict[str, Any] | None:
-    rows = _parse_json_array(
-        _airflow(
-            args,
-            "dags",
-            "list-runs",
-            "-d",
-            SILVER_DAG_ID,
-            "--output",
-            "json",
-            run=run,
-        )
-    )
-    matches = [row for row in rows if str(row.get("run_id")) == run_id]
-    if len(matches) > 1:
-        raise RollbackError("Airflow returned duplicate exact Silver run identity")
-    return matches[0] if matches else None
-
-
 def _pause_all_writers(
     args: argparse.Namespace,
     *,
@@ -1412,534 +1195,6 @@ def _pause_all_writers(
     return state
 
 
-def _candidate_from_state(
-    state: Mapping[str, Any], publication: Mapping[str, Any]
-) -> Mapping[str, Any]:
-    candidate = state.get("candidate")
-    if (
-        state.get("generation_id") != publication["generation_id"]
-        or state.get("binding") != publication["binding"]
-        or not isinstance(candidate, Mapping)
-        or candidate.get("generation_id") != publication["generation_id"]
-        or not re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("digest", "")))
-    ):
-        raise RollbackError("Silver run did not record the exact publication candidate")
-    return candidate
-
-
-def _rollback_publication_report_base(
-    args: argparse.Namespace,
-    publication: Mapping[str, Any],
-    *,
-    silver_run_id: str,
-) -> dict[str, Any]:
-    context = _deployment_context(args)
-    return {
-        "schema_version": ROLLBACK_PUBLICATION_SCHEMA,
-        "generated_at": _now(),
-        "passed": False,
-        "mode": "run-silver",
-        "phase": "prepared_pending_acquire",
-        "project": args.project,
-        "deployment_report": str(args.deployment_report.resolve()),
-        "consumer_git_sha": context["git_sha"],
-        "publication_attempt": int(args.publication_attempt),
-        "publication": dict(publication),
-        "silver_dag_id": SILVER_DAG_ID,
-        "silver_run_id": silver_run_id,
-        "native_objects_action": "retain",
-    }
-
-
-def run_rollback_validation_silver(
-    args: argparse.Namespace,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    sleeper: Callable[[float], None] = time.sleep,
-    monotonic: Callable[[], float] = time.monotonic,
-) -> dict[str, Any]:
-    """Run one fenced Silver validation and abandon its synthetic generation."""
-
-    if not args.execute or args.confirm != CONFIRM_RUN_SILVER:
-        raise RollbackError(
-            "run-silver requires --execute --confirm " + CONFIRM_RUN_SILVER
-        )
-    expected_sha = _validate_sha(args.expected_consumer_sha)
-    context = _deployment_context(args)
-    if context.get("kept_paused") is not True or context["git_sha"] != expected_sha:
-        raise RollbackError(
-            "run-silver requires the exact --keep-paused rollback deployment"
-        )
-    validate_live_deployment(args, require_running=True, run=run)
-    require_writers_stopped(inspect_writer_state(args, run=run))
-    require_no_active_fotmob_publication(args, run=run)
-    publication = _rollback_publication_envelope(args, run=run)
-    silver_run_id = "rollback_silver__" + str(publication["generation_id"]).replace(
-        "-", ""
-    )
-    if args.silver_run_id and args.silver_run_id != silver_run_id:
-        raise RollbackError(
-            f"run-silver uses deterministic --silver-run-id {silver_run_id!r}"
-        )
-    report = _rollback_publication_report_base(
-        args, publication, silver_run_id=silver_run_id
-    )
-    # This is a write-ahead recovery identity. A process kill during DB acquire
-    # still leaves the deterministic generation/run IDs needed for inspection.
-    _atomic_json(args.output, report)
-    try:
-        acquired = _initialize_rollback_publication(args, publication, run=run)
-    except Exception as exc:
-        report.update(
-            {
-                "generated_at": _now(),
-                "passed": False,
-                "phase": "acquire_ambiguous",
-                "error": f"{type(exc).__name__}: {exc}",
-                "recovery_required": True,
-            }
-        )
-        _atomic_json(args.output, report)
-        return report
-    report.update(
-        {
-            "generated_at": _now(),
-            "phase": "acquired_pending_trigger",
-            "publication_state": _publication_state_summary(acquired),
-        }
-    )
-    _atomic_json(args.output, report)
-
-    terminal: dict[str, Any] | None = None
-    ambiguous_error: str | None = None
-    writer_state: Mapping[str, Any] | None = None
-    conf = json.dumps(
-        {"fotmob_publication": publication}, sort_keys=True, separators=(",", ":")
-    )
-    try:
-        _airflow(args, "dags", "unpause", SILVER_DAG_ID, run=run)
-        _airflow(
-            args,
-            "dags",
-            "trigger",
-            SILVER_DAG_ID,
-            "--run-id",
-            silver_run_id,
-            "--conf",
-            conf,
-            run=run,
-        )
-        report.update({"generated_at": _now(), "phase": "silver_running"})
-        _atomic_json(args.output, report)
-        deadline = monotonic() + max(1, int(args.timeout_seconds))
-        while monotonic() < deadline:
-            observed = _exact_silver_run(args, silver_run_id, run=run)
-            state = str((observed or {}).get("state", "")).casefold()
-            if state in {"success", "failed"}:
-                terminal = observed
-                break
-            sleeper(2)
-        if terminal is None:
-            ambiguous_error = "exact Silver run did not reach a terminal state before timeout"
-    except Exception as exc:
-        ambiguous_error = f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            writer_state = _pause_all_writers(args, run=run)
-        except Exception as exc:
-            ambiguous_error = ambiguous_error or (
-                f"writer quiescence could not be proven: {type(exc).__name__}: {exc}"
-            )
-
-    if ambiguous_error is not None or terminal is None or writer_state is None:
-        try:
-            retained = _transition_rollback_publication(
-                args,
-                str(publication["generation_id"]),
-                action="fail_retain",
-                run=run,
-            )
-            retained_summary: Mapping[str, Any] = _publication_state_summary(retained)
-        except Exception as exc:
-            retained_summary = {
-                "generation_id": publication["generation_id"],
-                "active": True,
-                "retention_error": f"{type(exc).__name__}: {exc}",
-            }
-        report.update(
-            {
-                "generated_at": _now(),
-                "passed": False,
-                "phase": "lock_retained_pending_terminal_proof",
-                "error": ambiguous_error or "Silver terminal state is ambiguous",
-                "publication_state": retained_summary,
-                "recovery_required": True,
-            }
-        )
-        _atomic_json(args.output, report)
-        return report
-
-    run_state = str(terminal.get("state", "")).casefold()
-    report["silver_terminal"] = dict(terminal)
-    report["writer_state_after"] = dict(writer_state)
-    if run_state == "failed":
-        released = _transition_rollback_publication(
-            args,
-            str(publication["generation_id"]),
-            action="fail_release",
-            run=run,
-        )
-        report.update(
-            {
-                "generated_at": _now(),
-                "passed": False,
-                "phase": "failed_generation_released",
-                "publication_state": _publication_state_summary(released),
-                "error": "rollback Silver validation run failed",
-            }
-        )
-        _atomic_json(args.output, report)
-        return report
-
-    generation_id = str(publication["generation_id"])
-    try:
-        state = _get_rollback_publication(args, generation_id, run=run)
-        if state is None:
-            raise RollbackError("successful Silver generation is absent")
-        candidate = _candidate_from_state(state, publication)
-        if (
-            state.get("status") != "running"
-            or state.get("phase") != "writing"
-            or state.get("active") is not True
-        ):
-            raise RollbackError("successful Silver candidate is not in writing phase")
-        sealed = _transition_rollback_publication(
-            args, generation_id, action="seal", run=run
-        )
-        if (
-            sealed.get("status") != "succeeded"
-            or sealed.get("phase") != "ready"
-            or sealed.get("active") is not True
-        ):
-            raise RollbackError("rollback publication generation was not sealed ready")
-        abandoned = _transition_rollback_publication(
-            args, generation_id, action="abandon", run=run
-        )
-        if (
-            abandoned.get("status") != "succeeded"
-            or abandoned.get("phase") != "abandoned"
-            or abandoned.get("active") is not False
-            or abandoned.get("released") is not True
-            or abandoned.get("published") is not False
-        ):
-            raise RollbackError(
-                "rollback publication generation was not abandoned safely"
-            )
-    except Exception as exc:
-        retained_summary: Mapping[str, Any] = {
-            "generation_id": generation_id,
-            "active": True,
-        }
-        try:
-            current = _get_rollback_publication(args, generation_id, run=run)
-            if current is None:
-                raise RollbackError("rollback publication generation is absent")
-            if (
-                current.get("status") == "running"
-                and current.get("phase") == "writing"
-            ):
-                current = _transition_rollback_publication(
-                    args, generation_id, action="fail_retain", run=run
-                )
-            retained_summary = _publication_state_summary(current)
-        except Exception as state_exc:
-            retained_summary = {
-                **retained_summary,
-                "retention_error": f"{type(state_exc).__name__}: {state_exc}",
-            }
-        report.update(
-            {
-                "generated_at": _now(),
-                "passed": False,
-                "phase": "lock_retained_pending_terminal_proof",
-                "error": f"{type(exc).__name__}: {exc}",
-                "publication_state": retained_summary,
-                "recovery_required": True,
-            }
-        )
-        _atomic_json(args.output, report)
-        return report
-    report.update(
-        {
-            "generated_at": _now(),
-            "passed": True,
-            "phase": "abandoned",
-            "candidate": {
-                "generation_id": candidate["generation_id"],
-                "digest": candidate["digest"],
-                "transform_task_ids": candidate.get("transform_task_ids"),
-            },
-            "publication_state": _publication_state_summary(abandoned),
-            "recovery_required": False,
-        }
-    )
-    _atomic_json(args.output, report)
-    return report
-
-
-def _load_rollback_publication_report(
-    args: argparse.Namespace,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    path = getattr(args, "publication_report", None)
-    if path is None:
-        raise RollbackError("operation requires --publication-report")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RollbackError(f"invalid rollback publication report: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != (
-        ROLLBACK_PUBLICATION_SCHEMA
-    ):
-        raise RollbackError("unsupported rollback publication report")
-    context = _deployment_context(args)
-    if (
-        payload.get("project") != args.project
-        or payload.get("deployment_report")
-        != str(args.deployment_report.resolve())
-        or payload.get("consumer_git_sha") != context["git_sha"]
-        or payload.get("publication_attempt") != int(args.publication_attempt)
-        or payload.get("silver_dag_id") != SILVER_DAG_ID
-    ):
-        raise RollbackError("rollback publication report stack identity differs")
-    publication = payload.get("publication")
-    expected = _rollback_publication_envelope(args, run=run)
-    if not isinstance(publication, Mapping) or dict(publication) != expected:
-        raise RollbackError("rollback publication report binding is not exact")
-    expected_run_id = "rollback_silver__" + expected["generation_id"].replace(
-        "-", ""
-    )
-    if payload.get("silver_run_id") != expected_run_id:
-        raise RollbackError("rollback publication report has a different Silver run")
-    return payload, expected
-
-
-def recover_rollback_publication(
-    args: argparse.Namespace,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> dict[str, Any]:
-    """Release a retained synthetic generation only after exact terminal proof."""
-
-    if not args.execute or args.confirm != CONFIRM_RECOVER_PUBLICATION:
-        raise RollbackError(
-            "recover-publication requires --execute --confirm "
-            + CONFIRM_RECOVER_PUBLICATION
-        )
-    report, publication = _load_rollback_publication_report(args, run=run)
-    validate_live_deployment(args, require_running=True, run=run)
-    writer_state = _pause_all_writers(args, run=run)
-    silver_run_id = str(report["silver_run_id"])
-    terminal = _exact_silver_run(args, silver_run_id, run=run)
-    run_state = str((terminal or {}).get("state", "")).casefold()
-    generation_id = str(publication["generation_id"])
-    if terminal is None and report.get("phase") in {
-        "prepared_pending_acquire",
-        "acquire_ambiguous",
-        "acquired_pending_trigger",
-    }:
-        state = _get_rollback_publication(args, generation_id, run=run)
-        if state is None and report.get("phase") in {
-            "prepared_pending_acquire",
-            "acquire_ambiguous",
-        }:
-            recovered = {
-                **report,
-                "generated_at": _now(),
-                "passed": False,
-                "mode": "recover-publication",
-                "phase": "no_generation_acquired",
-                "writer_state_after": writer_state,
-                "publication_state": None,
-                "error": (
-                    "exact generation and Silver run are both absent after "
-                    "pre-acquire recovery; retry the same publication attempt"
-                ),
-                "recovery_required": False,
-            }
-            _atomic_json(args.output, recovered)
-            return recovered
-        if state is None:
-            raise RollbackError(
-                "acquired-pending-trigger report has no exact control DB generation"
-            )
-        if (
-            state.get("generation_id") != generation_id
-            or state.get("binding") != publication["binding"]
-            or state.get("owner_dag_id") != "fotmob_rollback_validation"
-            or state.get("status") != "running"
-            or state.get("phase") != "writing"
-            or state.get("active") is not True
-        ):
-            raise RollbackError(
-                "pre-trigger recovery did not find the exact active writing generation"
-            )
-        released = _transition_rollback_publication(
-            args, generation_id, action="fail_release", run=run
-        )
-        if (
-            released.get("status") != "failed"
-            or released.get("phase") != "failed"
-            or released.get("active") is not False
-            or released.get("released") is not True
-        ):
-            raise RollbackError(
-                "pre-trigger publication generation was not released safely"
-            )
-        recovered = {
-            **report,
-            "generated_at": _now(),
-            "passed": False,
-            "mode": "recover-publication",
-            "phase": "pretrigger_generation_released",
-            "writer_state_after": writer_state,
-            "publication_state": _publication_state_summary(released),
-            "error": (
-                "acquire committed but the exact Silver run was never created; "
-                "generation released after pre-trigger quiescence proof. Retry with "
-                f"--publication-attempt {int(args.publication_attempt) + 1}"
-            ),
-            "recovery_required": False,
-        }
-        _atomic_json(args.output, recovered)
-        return recovered
-    if run_state not in {"success", "failed"}:
-        retained = {
-            **report,
-            "generated_at": _now(),
-            "passed": False,
-            "mode": "recover-publication",
-            "phase": "lock_retained_pending_terminal_proof",
-            "error": "exact Silver run is absent or non-terminal; lock retained",
-            "recovery_required": True,
-        }
-        _atomic_json(args.output, retained)
-        return retained
-
-    state = _get_rollback_publication(args, generation_id, run=run)
-    if state is None:
-        raise RollbackError("exact rollback publication generation is absent")
-    if state.get("binding") != publication["binding"]:
-        raise RollbackError("retained publication binding differs from recovery report")
-    phase = str(state.get("phase", "")).casefold()
-    recovered = {
-        **report,
-        "generated_at": _now(),
-        "mode": "recover-publication",
-        "silver_terminal": dict(terminal),
-        "writer_state_after": writer_state,
-    }
-    if run_state == "failed" or phase == "failed":
-        if phase == "writing" or phase == "failed":
-            released = _transition_rollback_publication(
-                args, generation_id, action="fail_release", run=run
-            )
-        else:
-            raise RollbackError(
-                f"failed Silver run has unsafe publication phase {phase!r}"
-            )
-        recovered.update(
-            {
-                "passed": False,
-                "phase": "failed_generation_released",
-                "publication_state": _publication_state_summary(released),
-                "error": (
-                    "retained generation was released after terminal proof; "
-                    "start a new rollback Silver validation with "
-                    f"--publication-attempt {int(args.publication_attempt) + 1}"
-                ),
-                "recovery_required": False,
-            }
-        )
-        _atomic_json(args.output, recovered)
-        return recovered
-
-    candidate = _candidate_from_state(state, publication)
-    if phase == "writing":
-        sealed = _transition_rollback_publication(
-            args, generation_id, action="seal", run=run
-        )
-        if sealed.get("phase") != "ready" or sealed.get("active") is not True:
-            raise RollbackError("recovered generation was not sealed ready")
-        state = sealed
-        phase = "ready"
-    if phase == "ready":
-        state = _transition_rollback_publication(
-            args, generation_id, action="abandon", run=run
-        )
-        phase = str(state.get("phase", "")).casefold()
-    if phase != "abandoned" or state.get("active") is not False:
-        raise RollbackError("recovered generation was not abandoned safely")
-    recovered.update(
-        {
-            "passed": True,
-            "phase": "abandoned",
-            "candidate": {
-                "generation_id": candidate["generation_id"],
-                "digest": candidate["digest"],
-                "transform_task_ids": candidate.get("transform_task_ids"),
-            },
-            "publication_state": _publication_state_summary(state),
-            "recovery_required": False,
-        }
-    )
-    _atomic_json(args.output, recovered)
-    return recovered
-
-
-def validate_rollback_publication_evidence(
-    args: argparse.Namespace,
-    *,
-    expected_sha: str,
-    run: Callable[..., subprocess.CompletedProcess[str]],
-) -> dict[str, Any]:
-    report, publication = _load_rollback_publication_report(args, run=run)
-    candidate = report.get("candidate")
-    if (
-        report.get("passed") is not True
-        or report.get("phase") != "abandoned"
-        or report.get("recovery_required") is not False
-        or report.get("consumer_git_sha") != expected_sha
-        or report.get("silver_run_id") != args.silver_run_id
-        or not isinstance(candidate, Mapping)
-        or candidate.get("generation_id") != publication["generation_id"]
-        or not re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("digest", "")))
-    ):
-        raise RollbackError("rollback publication report is not safely completed")
-    state = _get_rollback_publication(
-        args, str(publication["generation_id"]), run=run
-    )
-    if state is None:
-        raise RollbackError("exact rollback publication generation is absent")
-    observed_candidate = _candidate_from_state(state, publication)
-    if (
-        state.get("status") != "succeeded"
-        or state.get("phase") != "abandoned"
-        or state.get("active") is not False
-        or observed_candidate.get("digest") != candidate.get("digest")
-    ):
-        raise RollbackError("control DB does not contain the abandoned exact candidate")
-    return {
-        "generation_id": publication["generation_id"],
-        "binding": publication["binding"],
-        "candidate_digest": candidate["digest"],
-        "phase": "abandoned",
-        "active": False,
-        "released": True,
-    }
-
-
 def rollback_plan(args: argparse.Namespace) -> dict[str, Any]:
     context = _deployment_context(args)
     return {
@@ -1968,32 +1223,20 @@ def rollback_plan(args: argparse.Namespace) -> dict[str, Any]:
                 "order": 2,
                 "action": "deploy_consumer_revert",
                 "requirement": (
-                    "Deploy a reviewed immutable commit whose FotMob Silver/xref/DQ "
+                    "Deploy a reviewed immutable commit whose FotMob xref/DQ "
                     "consumers read the frozen legacy tables. Do not alter native data."
                 ),
             },
             {
                 "order": 3,
-                "action": "run_fenced_legacy_silver_and_dq",
+                "action": "validate",
                 "command": (
-                    "python scripts/fotmob_rollback.py run-silver --execute "
-                    f"--confirm {CONFIRM_RUN_SILVER} "
-                    "--expected-consumer-sha <40-hex> "
-                    "--publication-attempt <positive-int> <common options>"
+                    "python scripts/fotmob_rollback.py validate "
+                    "--expected-consumer-sha <40-hex> <common options>"
                 ),
             },
             {
                 "order": 4,
-                "action": "validate",
-                "command": (
-                    "python scripts/fotmob_rollback.py validate "
-                    "--expected-consumer-sha <40-hex> --silver-run-id <run-id> "
-                    "--publication-report <run-silver-report> "
-                    "--publication-attempt <same-int> <common options>"
-                ),
-            },
-            {
-                "order": 5,
                 "action": "restore_maintenance",
                 "command": (
                     "python scripts/fotmob_rollback.py restore-maintenance --execute "
@@ -2132,26 +1375,6 @@ def validate_rollback(
     writer_state = inspect_writer_state(args, run=run)
     require_writers_stopped(writer_state)
 
-    silver_runs = _parse_json_array(
-        _airflow(
-            args,
-            "dags",
-            "list-runs",
-            "-d",
-            "dag_transform_fotmob_silver",
-            "--output",
-            "json",
-            run=run,
-        )
-    )
-    matching = [row for row in silver_runs if str(row.get("run_id")) == args.silver_run_id]
-    if len(matching) != 1 or str(matching[0].get("state")).lower() != "success":
-        raise RollbackError(
-            f"Silver/DQ run {args.silver_run_id!r} is absent or not successful"
-        )
-    run_started_at = _timestamp(matching[0].get("start_date"))
-    if run_started_at < deployed_at:
-        raise RollbackError("Silver/DQ evidence predates the rollback deployment")
     handoff = context.get("shared_handoff_final")
     shared_container_id = (
         str(handoff.get("shared_scheduler_container") or "")
@@ -2160,9 +1383,6 @@ def validate_rollback(
     )
     shared_before = inspect_shared_consumer_pause(
         args, expected_container_id=shared_container_id, run=run
-    )
-    publication_evidence = validate_rollback_publication_evidence(
-        args, expected_sha=expected_sha, run=run
     )
     publication_before = require_no_active_fotmob_publication(args, run=run)
 
@@ -2199,8 +1419,6 @@ def validate_rollback(
         "passed": True,
         "mode": "validate",
         "consumer_git_sha": expected_sha,
-        "silver_dq_run_id": args.silver_run_id,
-        "silver_dq_started_at": run_started_at.isoformat(),
         "deployment_generated_at": deployed_at.isoformat(),
         "legacy_table_counts": counts,
         "writers_paused": list(DAGS),
@@ -2228,7 +1446,6 @@ def validate_rollback(
         "live_deployment": live_identity,
         "publication_quiescence_before": publication_before,
         "publication_quiescence_after": publication_after,
-        "rollback_publication": publication_evidence,
         "native_objects_action": "retain",
         "dynamic_catalog_evidence_action": "retain",
         "dynamic_catalog_evidence_objects": sorted(PRESERVED_DYNAMIC_CATALOG_EVIDENCE),
@@ -2243,8 +1460,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "plan",
             "pause",
-            "run-silver",
-            "recover-publication",
             "validate",
             "restore-maintenance",
         ),
@@ -2257,11 +1472,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Host-reachable Trino endpoint used only by validate",
     )
     parser.add_argument("--deployment-report", type=Path, required=True)
-    parser.add_argument(
-        "--publication-report",
-        type=Path,
-        help="Durable report from run-silver/recover-publication",
-    )
     parser.add_argument(
         "--pause-evidence",
         type=Path,
@@ -2284,17 +1494,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm")
     parser.add_argument("--expected-consumer-sha", default="")
-    parser.add_argument("--silver-run-id", default="")
-    parser.add_argument("--timeout-seconds", type=int, default=12 * 60 * 60)
-    parser.add_argument(
-        "--publication-attempt",
-        type=int,
-        default=1,
-        help=(
-            "Positive deterministic synthetic-generation attempt; increment only "
-            "after an earlier attempt is proven terminal and released"
-        ),
-    )
     parser.add_argument("--catalog", default="iceberg")
     parser.add_argument("--bronze-schema", default="bronze")
     return parser
@@ -2307,46 +1506,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = rollback_plan(args)
         elif args.command == "pause":
             report = pause_writers(args)
-        elif args.command == "run-silver":
-            report = run_rollback_validation_silver(args)
-        elif args.command == "recover-publication":
-            report = recover_rollback_publication(args)
         elif args.command == "validate":
-            if not args.silver_run_id:
-                raise RollbackError("validate requires --silver-run-id")
-            if not args.publication_report:
-                raise RollbackError("validate requires --publication-report")
             report = validate_rollback(args)
         else:
             report = restore_maintenance(args)
     except Exception as exc:
-        existing: dict[str, Any] | None = None
-        if args.command in {"run-silver", "recover-publication"}:
-            try:
-                candidate = json.loads(args.output.read_text(encoding="utf-8"))
-                if (
-                    isinstance(candidate, dict)
-                    and candidate.get("schema_version")
-                    == ROLLBACK_PUBLICATION_SCHEMA
-                ):
-                    existing = candidate
-            except (OSError, json.JSONDecodeError):
-                pass
         report = {
-            **(existing or {}),
-            "schema_version": (
-                ROLLBACK_PUBLICATION_SCHEMA
-                if existing is not None
-                else "fotmob-rollback-v1"
-            ),
+            "schema_version": "fotmob-rollback-v1",
             "generated_at": _now(),
             "passed": False,
             "mode": args.command,
             "error": f"{type(exc).__name__}: {exc}",
             "native_objects_action": "retain",
         }
-        if existing is not None:
-            report["recovery_required"] = True
     _atomic_json(args.output, report)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report.get("passed") is True else 1

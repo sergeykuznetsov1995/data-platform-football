@@ -35,10 +35,9 @@ SCRIPTS = (
     DEPLOY / "b6_deliver.sh",
     DEPLOY / "window_alert.sh",
 )
-# Ровно семь корневых DAG изолята (docs/operations/fotmob-isolated-ceremony-free.md).
+# Ровно шесть корневых DAG изолята (Silver FotMob удалён в #1590).
 CONTOUR_DAGS = {
     "dag_ingest_fotmob.py",
-    "dag_transform_fotmob_silver.py",
     "dag_trigger_fotmob_daily.py",
     "dag_refresh_fotmob.py",
     "dag_backfill_fotmob.py",

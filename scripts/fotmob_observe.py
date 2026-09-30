@@ -37,7 +37,6 @@ ISOLATED_SNAPSHOT_SCHEMA = "fotmob-scheduled-observation-isolated-v1"
 SHARED_SNAPSHOT_SCHEMA = "fotmob-scheduled-observation-shared-v1"
 OWNER_DAG_ID = "dag_orchestrate_fotmob"
 INGEST_DAG_ID = "dag_ingest_fotmob"
-SILVER_DAG_ID = "dag_transform_fotmob_silver"
 SOFA_DAG_ID = "dag_sofascore_pipeline"
 SOFA_FINALIZER_TASK_ID = "finalize_fotmob_publication"
 PUBLICATION_CONF_KEY = "fotmob_publication"
@@ -475,7 +474,6 @@ EXPECTED=json.loads({json.dumps(expected, sort_keys=True)!r})
 ACTIVE_STATES={ACTIVE_TASK_STATES!r}
 OWNER={OWNER_DAG_ID!r}
 INGEST={INGEST_DAG_ID!r}
-SILVER={SILVER_DAG_ID!r}
 
 def state(value):
     return str(getattr(value, 'value', value) or '').casefold().split('.')[-1]
@@ -545,9 +543,7 @@ try:
         initializers=(xcom_values(session, OWNER, owner.run_id, 'initialize_fotmob_publication') if daily else [])
         generation=(initializers[0].get('generation_id') if len(initializers) == 1 and isinstance(initializers[0], Mapping) else None)
         ingest_id=('fotmob_orchestrated__' + str(generation)) if generation else ''
-        silver_id=('fotmob_silver__' + str(generation)) if generation else ''
         ingest_rows=(session.query(DagRun).filter(DagRun.dag_id == INGEST, DagRun.run_id == ingest_id).all() if ingest_id else [])
-        silver_rows=(session.query(DagRun).filter(DagRun.dag_id == SILVER, DagRun.run_id == silver_id).all() if silver_id else [])
         observed.append({{
             'owner': run_value(owner),
             'attest_task_states': task_states(session, OWNER, owner.run_id, 'attest_isolated_runtime'),
@@ -558,10 +554,7 @@ try:
             'trigger_states': task_states(session, OWNER, owner.run_id, 'trigger_fotmob_ingest'),
             'active_tasks': active_tasks(session, OWNER, owner.run_id),
             'ingest_runs': [run_value(row) for row in ingest_rows],
-            'ingest_trigger_states': (task_states(session, INGEST, ingest_id, 'trigger_silver_transform') if ingest_id else []),
             'ingest_active_tasks': (active_tasks(session, INGEST, ingest_id) if ingest_id else []),
-            'silver_runs': [run_value(row) for row in silver_rows],
-            'silver_active_tasks': (active_tasks(session, SILVER, silver_id) if silver_id else []),
             'publication': (store.get_publication_generation(generation, source='fotmob') if generation else None),
         }})
 finally:
@@ -804,33 +797,6 @@ def _validate_daily_pipeline(
         raise ObservationError("ingest child success/conf lineage differs")
     _require_no_active_tasks(item.get("ingest_active_tasks"), label="ingest run")
 
-    silver_trigger_state = _state(
-        _one(item.get("ingest_trigger_states"), label="ingest Silver trigger")
-    )
-    silver_run_id: str | None
-    if silver_trigger_state == "success":
-        silver = _one(item.get("silver_runs"), label="Silver child run")
-        silver_run_id = f"fotmob_silver__{generation_id}"
-        if (
-            not isinstance(silver, Mapping)
-            or silver.get("dag_id") != SILVER_DAG_ID
-            or silver.get("run_id") != silver_run_id
-            or _state(silver.get("run_type")) != "manual"
-            or silver.get("state") != "success"
-            or silver.get("conf") != {PUBLICATION_CONF_KEY: publication}
-        ):
-            raise ObservationError("Silver child success/conf lineage differs")
-        _require_no_active_tasks(item.get("silver_active_tasks"), label="Silver run")
-    elif silver_trigger_state == "skipped":
-        if item.get("silver_runs") != []:
-            raise ObservationError(
-                "Bronze-only daily unexpectedly has a Silver child run"
-            )
-        _require_no_active_tasks(item.get("silver_active_tasks"), label="Silver run")
-        silver_run_id = None
-    else:
-        raise ObservationError("ingest Silver trigger did not succeed or skip")
-
     control = item.get("publication")
     sofa_run_id = _scheduled_run_id(binding["data_interval_start"])
     if (
@@ -854,7 +820,6 @@ def _validate_daily_pipeline(
         "binding": binding,
         "owner_run_id": str(owner["run_id"]),
         "ingest_run_id": ingest_run_id,
-        "silver_run_id": silver_run_id,
         "sofa_run_id": sofa_run_id,
     }
 
@@ -958,17 +923,9 @@ def _validate_isolated_snapshot(
         candidate_key = owner_order(item)[:2]
         if sum(owner_order(other)[:2] == candidate_key for other in candidates) != 1:
             raise ObservationError("earliest scheduled DAILY owner is ambiguous")
-        selected = _validate_daily_pipeline(identity, activation, item)
-        # #1575: while Silver is switched off a bronze-only lineage counts too.
-        if (
-            selected["silver_run_id"] is not None
-            or not runtime_binding.fotmob_silver_enabled()
-        ):
-            return selected
+        return _validate_daily_pipeline(identity, activation, item)
     raise ObservationError(
-        "no successful scheduled DAILY Silver lineage exists after activation"
-        if runtime_binding.fotmob_silver_enabled()
-        else "no successful scheduled DAILY bronze-only lineage exists after activation"
+        "no successful scheduled DAILY bronze-only lineage exists after activation"
     )
 
 
@@ -1056,19 +1013,6 @@ def validate_observation(
                 "generation_id": generation_id,
                 "state": "success",
             },
-            **(
-                {
-                    "silver": {
-                        "dag_id": SILVER_DAG_ID,
-                        "run_id": selected["silver_run_id"],
-                        "ingest_run_id": selected["ingest_run_id"],
-                        "generation_id": generation_id,
-                        "state": "success",
-                    }
-                }
-                if selected["silver_run_id"] is not None
-                else {}
-            ),
             "sofascore": {
                 "dag_id": SOFA_DAG_ID,
                 "run_id": str(sofa["run_id"]),

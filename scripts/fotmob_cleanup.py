@@ -43,7 +43,6 @@ INVENTORY_KEYS = (
 PAUSED_DAGS = {
     "dag_orchestrate_fotmob",
     "dag_ingest_fotmob",
-    "dag_transform_fotmob_silver",
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",

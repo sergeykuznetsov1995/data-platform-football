@@ -3,7 +3,8 @@
 The DAG is trigger-only: ``dag_master_pipeline`` is the single daily schedule
 owner.  One isolated runner performs catalog discovery, exact-season planning,
 raw-first ingestion and emits an atomic, run-specific report.  Validation is
-fail-closed and Silver can only run after a complete native report.
+fail-closed; a validated run seals a bronze-only publication candidate
+(the legacy FotMob Silver transform was removed in #1590).
 
 With a deployed publication ceremony every production run must be launched by
 one schedule owner with an exact ``fotmob_publication`` binding; an ad-hoc
@@ -23,8 +24,7 @@ from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator, ShortCircuitOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.operators.python import PythonOperator
 
 from utils.config import DAG_TAGS, FOTMOB_HTTP_POOL, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
@@ -46,7 +46,6 @@ from utils.fotmob_publication import (
     seal_fotmob_publication,
     validate_fotmob_writer_fence,
 )
-from scrapers.fotmob import constants as fotmob_constants
 from scrapers.fotmob.scope_codec import (
     format_scope_token,
     parse_scope_token,
@@ -81,23 +80,6 @@ RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}.json"
 NATIVE_MODES = frozenset(
     {"discover", "daily", "backfill", "replay", "refresh", PLAYER_COLLECTOR_MODE}
 )
-FOTMOB_SILVER_BRONZE_INPUTS = frozenset(
-    {
-        "iceberg.bronze.fotmob_competition_seasons",
-        "iceberg.bronze.fotmob_season_teams",
-        "iceberg.bronze.fotmob_matches",
-        "iceberg.bronze.fotmob_match_payloads",
-        "iceberg.bronze.fotmob_standings",
-        "iceberg.bronze.fotmob_leaderboards",
-        "iceberg.bronze.fotmob_squad_snapshots",
-        "iceberg.bronze.fotmob_player_snapshots",
-        "iceberg.bronze.fotmob_team_snapshots",
-        "iceberg.bronze.fotmob_transfer_events",
-    }
-)
-# #1575: Silver is switched off (source of truth: scrapers.fotmob.constants);
-# ingest seals bronze-only generations instead.
-FOTMOB_SILVER_ENABLED = fotmob_constants.FOTMOB_SILVER_ENABLED
 ISSUE_930_REPLAY_ENTITIES = [
     "leaderboards",
     "matches",
@@ -134,13 +116,6 @@ PUBLICATION_BINDING_TEMPLATE = {
         "runtime_fingerprint",
     )
 }
-# Without a publication the Silver child still needs a unique, retry-stable
-# run id; the ingest DagRun's own run_id is exactly that.
-SILVER_TRIGGER_RUN_ID_TEMPLATE = (
-    "{{ 'fotmob_silver__' ~ ("
-    + PUBLICATION_CONF_EXPR
-    + ".get('generation_id') or run_id) }}"
-)
 
 
 def _validated_exact_scope_evidence(value: Any) -> tuple[str, ...] | None:
@@ -1053,24 +1028,6 @@ def validate_data(
         return summary
 
 
-def _should_transform(**context: Any) -> bool:
-    """Run Silver only when validated committed Bronze inputs changed."""
-
-    ti = context.get("ti")
-    validation = ti.xcom_pull(task_ids="validate_data") if ti is not None else None
-    if not isinstance(validation, Mapping):
-        raise AirflowException("FotMob validate_data XCom is missing")
-    changed = validation.get("bronze_inputs_changed")
-    if not isinstance(changed, list) or any(
-        not isinstance(table, str) for table in changed
-    ):
-        raise AirflowException("FotMob changed Bronze input evidence is invalid")
-    if not FOTMOB_SILVER_ENABLED:
-        return False
-    normalized = {table.strip().casefold() for table in changed}
-    return bool(normalized & FOTMOB_SILVER_BRONZE_INPUTS)
-
-
 with DAG(
     dag_id="dag_ingest_fotmob",
     default_args=SCRAPER_ARGS,
@@ -1233,40 +1190,12 @@ python dags/scripts/run_fotmob_scraper.py \\
         retries=0,
     )
 
-    transform_gate = ShortCircuitOperator(
-        task_id="season_data_available",
-        python_callable=_should_transform,
-        ignore_downstream_trigger_rules=False,
-    )
-
     record_bronze_only_candidate = PythonOperator(
         task_id="record_bronze_only_publication_candidate",
         python_callable=record_fotmob_bronze_only_candidate,
         op_kwargs={
             "validation_task_id": "validate_data",
-            "silver_input_tables": sorted(FOTMOB_SILVER_BRONZE_INPUTS),
-            "silver_enabled": FOTMOB_SILVER_ENABLED,
         },
-        retries=0,
-    )
-
-    trigger_silver = TriggerDagRunOperator(
-        task_id="trigger_silver_transform",
-        trigger_dag_id="dag_transform_fotmob_silver",
-        trigger_run_id=SILVER_TRIGGER_RUN_ID_TEMPLATE,
-        logical_date="{{ logical_date.isoformat() }}",
-        conf={
-            "fotmob_publication": {
-                "generation_id": PUBLICATION_GENERATION_TEMPLATE,
-                "binding": PUBLICATION_BINDING_TEMPLATE,
-            }
-        },
-        wait_for_completion=True,
-        poke_interval=30,
-        allowed_states=["success"],
-        failed_states=["failed"],
-        reset_dag_run=False,
-        execution_timeout=timedelta(hours=4),
         retries=0,
     )
 
@@ -1284,7 +1213,6 @@ python dags/scripts/run_fotmob_scraper.py \\
             "success_task_id": "seal_fotmob_publication_ready",
             "writer_task_ids": [
                 "scrape_fotmob_data",
-                "trigger_silver_transform",
             ],
         },
         trigger_rule="all_done",
@@ -1292,9 +1220,6 @@ python dags/scripts/run_fotmob_scraper.py \\
     )
 
     publication_preflight >> scrape_data_task >> validate_data_task
-    validate_data_task >> record_bronze_only_candidate
-    validate_data_task >> transform_gate
-    transform_gate >> trigger_silver
-    [record_bronze_only_candidate, trigger_silver] >> seal_publication
+    validate_data_task >> record_bronze_only_candidate >> seal_publication
     seal_publication >> finalize_publication
     scrape_data_task >> replay_missing_inputs_proof >> finalize_publication

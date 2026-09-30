@@ -44,11 +44,6 @@ TABLES: dict[str, dict] = {
     'silver.fbref_keeper_profile':       {'sums': ['saves', 'goals_against']},
     'silver.fbref_player_season_profile': {'sums': ['goals', 'assists']},
     'silver.fbref_team_season_profile':  {'sums': []},
-    'silver.fotmob_keeper_profile':      {'sums': []},
-    'silver.fotmob_match_referee':       {'sums': []},
-    'silver.fotmob_player_market_value_history': {'sums': ['market_value_eur']},
-    'silver.fotmob_player_profile':      {'sums': []},
-    'silver.fotmob_player_season_profile': {'sums': []},
     'silver.matchhistory_match_odds':    {'sums': []},
     # ---- xref (value-only change for fbref/fotmob/matchhistory branches) ----
     'silver.xref_team':                  {'sums': []},

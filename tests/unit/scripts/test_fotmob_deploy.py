@@ -197,7 +197,7 @@ def _automatic_catalog_admission(
     candidate = {
         "generation_id": generation_id,
         "digest": "d" * 64,
-        "transform_task_ids": ["silver_transforms.example"],
+        "transform_task_ids": None,
     }
     publication = {
         "generation_id": generation_id,
@@ -262,7 +262,6 @@ def _automatic_catalog_admission(
             "scheduler_container_id": scheduler_container_id,
             "generation_id": generation_id,
             "ingest_run_state": "success",
-            "silver_run_state": "success",
             "candidate_digest": candidate["digest"],
             "runner_report_sha256": "c" * 64,
             "publication": publication,
@@ -367,7 +366,7 @@ def _automatic_rollout_certificate(admission, *, evidence_dir, handoff):
     all_paused = {dag_id: True for dag_id in fotmob_runtime.AUTOMATIC_DAGBAG_DAGS}
     children_paused = {
         dag_id: dag_id
-        not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+        not in {"dag_ingest_fotmob"}
         for dag_id in fotmob_runtime.AUTOMATIC_DAGBAG_DAGS
     }
     active_paused = {
@@ -1256,7 +1255,6 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
         "dags/dag_collect_fotmob_players.py",
-        "dags/dag_transform_fotmob_silver.py",
         "dags/dag_trigger_fotmob_daily.py",
         "deploy/fotmob/.airflowignore",
     ):
@@ -1267,7 +1265,6 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
     assert {path.name for path in projection.iterdir()} == {
         "dag_orchestrate_fotmob.py",
         "dag_ingest_fotmob.py",
-        "dag_transform_fotmob_silver.py",
         "dag_trigger_fotmob_daily.py",
         "dag_refresh_fotmob.py",
         "dag_backfill_fotmob.py",
@@ -1490,7 +1487,6 @@ def _orchestration_payload(
             "dag_master_pipeline": True,
             "dag_sofascore_pipeline": True,
             "dag_ingest_fotmob": True,
-            "dag_transform_fotmob_silver": True,
         },
         "sofascore_schedule_boundary": (
             dict(NEXT_SCHEDULE_BOUNDARY)
@@ -1620,7 +1616,6 @@ def test_shared_handoff_proves_production_orchestrator_and_no_running_run(tmp_pa
         "dag_master_pipeline": True,
         "dag_sofascore_pipeline": True,
         "dag_ingest_fotmob": True,
-        "dag_transform_fotmob_silver": True,
     }
     assert evidence["next_scheduled_interval"] == {
         key: value.replace("+00:00", ".000000+00:00")
@@ -1629,7 +1624,7 @@ def test_shared_handoff_proves_production_orchestrator_and_no_running_run(tmp_pa
     assert "configs/fotmob/competitions.json" in evidence["runtime_code_sha256"]
     assert "scrapers/fotmob/service.py" in evidence["runtime_code_sha256"]
     assert (
-        "dags/sql/silver/fotmob_player_profile.sql" in evidence["runtime_code_sha256"]
+        "dags/sql/silver/xref_manager.sql.j2" in evidence["runtime_code_sha256"]
     )
     assert evidence["runtime_code_sha256"] == mod.shared_runtime_manifest(tmp_path)
     assert mod.SHARED_RUNTIME_ROOTS == fotmob_runtime.SHARED_RUNTIME_ROOTS
@@ -1859,10 +1854,9 @@ def test_shared_handoff_rejects_wrong_production_pause_state(tmp_path):
             "dag_master_pipeline": False,
             "dag_sofascore_pipeline": True,
             "dag_ingest_fotmob": True,
-            "dag_transform_fotmob_silver": True,
         }
     )
-    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest/Silver"):
+    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest paused"):
         _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
@@ -1876,9 +1870,8 @@ def test_shared_handoff_rejects_unpaused_sofascore_consumer(tmp_path):
         "dag_master_pipeline": True,
         "dag_sofascore_pipeline": False,
         "dag_ingest_fotmob": True,
-        "dag_transform_fotmob_silver": True,
     }
-    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest/Silver"):
+    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest paused"):
         _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
@@ -1965,24 +1958,6 @@ def test_shared_handoff_rejects_xref_writer_outside_publication_preflight(tmp_pa
             "postgresql://control@postgres/control",
             run=_shared_handoff_runner(
                 tmp_path, _orchestration_payload(safe_xref=False)
-            ),
-        )
-
-
-def test_shared_handoff_rejects_unpaused_shared_silver(tmp_path):
-    pause_states = {
-        "dag_master_pipeline": True,
-        "dag_sofascore_pipeline": True,
-        "dag_ingest_fotmob": True,
-        "dag_transform_fotmob_silver": False,
-    }
-    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest/Silver"):
-        _validate_shared_handoff(
-            tmp_path,
-            "shared-scheduler",
-            "postgresql://control@postgres/control",
-            run=_shared_handoff_runner(
-                tmp_path, _orchestration_payload(pause_states=pause_states)
             ),
         )
 
@@ -2926,7 +2901,7 @@ def test_resume_pending_is_idempotent_after_active_commit(tmp_path, monkeypatch)
 
     assert first == second
     assert second["activation_state"] == "active"
-    assert len(unpauses) == 4
+    assert len(unpauses) == 3
 
 
 @pytest.mark.parametrize(
@@ -3439,7 +3414,7 @@ def test_atomic_writer_transaction_names_exact_seven_and_rejects_partial_result(
             "active_runs": {},
             "pause_states_after": {
                 dag_id: dag_id
-                not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+                not in {"dag_ingest_fotmob"}
                 for dag_id in mod.EXPECTED_DAGS
             },
             "phase": "children",
@@ -4215,46 +4190,18 @@ def test_ordinary_deploy_cannot_overwrite_pending_automatic_bytes(tmp_path):
     assert report.read_bytes() == original
 
 
-@pytest.fixture(autouse=True)
-def _silver_enabled_contract(monkeypatch):
-    """#1575: tests above pin the Silver-enabled contract; the disabled
-    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
-
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
-
-
-def _silver_off(monkeypatch):
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
-
-
-def _bronze_only_admission():
+def test_automatic_admission_rejects_legacy_silver_canary():
+    # #1590: the canary seals a bronze-only candidate; a Silver-backed one
+    # (with transform task ids) is no longer admissible.
     payload = _automatic_catalog_admission()
-    payload["canary"]["silver_run_state"] = ""
-    payload["canary"]["final_publication"]["candidate"]["transform_task_ids"] = None
-    return payload
-
-
-@pytest.mark.parametrize("bronze_only", [False, True])
-def test_automatic_admission_silver_disabled_accepts_both_canary_shapes(
-    monkeypatch, bronze_only
-):
-    # #1575: admissions issued with Silver stay valid after the switch-off.
-    _silver_off(monkeypatch)
-    payload = _bronze_only_admission() if bronze_only else _automatic_catalog_admission()
-
-    assert mod.validate_automatic_catalog_admission(payload)["passed"] is True
-
-
-def test_automatic_admission_silver_enabled_rejects_bronze_only_canary():
+    payload["canary"]["final_publication"]["candidate"]["transform_task_ids"] = [
+        "silver_transforms.example"
+    ]
     with pytest.raises(mod.DeploymentError, match="abandoned exact publication"):
-        mod.validate_automatic_catalog_admission(_bronze_only_admission())
+        mod.validate_automatic_catalog_admission(payload)
 
 
-def _canary_report_file(tmp_path, *, silver_run_state):
+def _canary_report_file(tmp_path):
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     deployment = {
@@ -4276,7 +4223,6 @@ def _canary_report_file(tmp_path, *, silver_run_state):
             "binding": {"runtime_fingerprint": deployment["git_sha"]},
         },
         "ingest_run_state": "success",
-        "silver_run_state": silver_run_state,
         "final_publication": {
             "generation_id": generation_id,
             "phase": "abandoned",
@@ -4292,32 +4238,17 @@ def _canary_report_file(tmp_path, *, silver_run_state):
     return path, evidence, deployment
 
 
-@pytest.mark.parametrize("silver_run_state", ["success", ""])
-def test_canary_report_silver_disabled_accepts_bronze_only(
-    monkeypatch, tmp_path, silver_run_state
-):
-    _silver_off(monkeypatch)
-    path, evidence, deployment = _canary_report_file(
-        tmp_path, silver_run_state=silver_run_state
-    )
+def test_canary_report_accepts_bronze_only(tmp_path):
+    path, evidence, deployment = _canary_report_file(tmp_path)
 
     report = mod.load_automatic_canary_report(
         path, evidence_dir=evidence, deployment=deployment
     )
 
-    assert report["silver_run_state"] == silver_run_state
+    assert "silver_run_state" not in report
 
 
-def test_canary_report_silver_enabled_requires_silver_success(tmp_path):
-    path, evidence, deployment = _canary_report_file(tmp_path, silver_run_state="")
-
-    with pytest.raises(mod.DeploymentError, match="not bound to this deployment"):
-        mod.load_automatic_canary_report(
-            path, evidence_dir=evidence, deployment=deployment
-        )
-
-
-# Full ControlStore candidates; the canary keeps only their summary projection.
+# Full ControlStore candidate; the canary keeps only its summary projection.
 _BRONZE_LIVE = {
     "schema": "fotmob-publication-v1",
     "generation_id": "g",
@@ -4326,30 +4257,17 @@ _BRONZE_LIVE = {
     "validated_bronze": {"status": "success"},
     "digest": "d" * 64,
 }
-_SILVER_LIVE = {
-    "schema": "fotmob-publication-v1",
-    "generation_id": "g",
-    "digest": "d" * 64,
-    "transform_task_ids": ["silver_transforms.a"],
-    "transform_results": {"silver_transforms.a": {"status": "success"}},
-    "row_count_gate": {"status": "success"},
-    "quality_gate": {"passed": 1},
-}
 
 
-def _live_canary(silver_run_state):
+def _live_canary():
     candidate = {
         "generation_id": "g",
         "digest": "d" * 64,
-        "transform_task_ids": (
-            None if silver_run_state == "" else ["silver_transforms.a"]
-        ),
+        "transform_task_ids": None,
     }
     return {
         "runner_report_path": "/tmp/fotmob_result_20260929T000000.json",
         "ingest_run_id": "fotmob_orchestrated__g",
-        "silver_run_id": "fotmob_silver__g",
-        "silver_run_state": silver_run_state,
         "generation_id": "g",
         "runner_report_sha256": "c" * 64,
         "runner_report_bytes": 10,
@@ -4394,14 +4312,24 @@ _INGEST_OK = {"dag_id": "dag_ingest_fotmob", "run_id": "fotmob_orchestrated__g",
 _SILVER_OK = {"dag_id": "dag_transform_fotmob_silver", "run_id": "fotmob_silver__g", "state": "success"}
 
 
-def test_live_canary_silver_disabled_accepts_absent_silver_run(monkeypatch):
-    _silver_off(monkeypatch)
-    canary = _live_canary("")
+def test_live_canary_requires_exact_bronze_only_lineage():
+    canary = _live_canary()
+    commands = []
+    ok_run = _live_run([_INGEST_OK], canary, _BRONZE_LIVE)
 
-    mod.validate_live_automatic_canary(
-        "c" * 64, canary, run=_live_run([_INGEST_OK], canary, _BRONZE_LIVE)
-    )
-    # A Silver run next to a bronze-only canary is still refused.
+    def recording_run(command, **kwargs):
+        commands.append(command)
+        return ok_run(command, **kwargs)
+
+    mod.validate_live_automatic_canary("c" * 64, canary, run=recording_run)
+    # The generated in-container probe asks Airflow for the ingest run only.
+    (command,) = commands
+    assert command[:3] == ("docker", "exec", "c" * 64)
+    code = command[-1]
+    assert "dag_transform_fotmob_silver" not in code
+    assert "silver" not in code.lower()
+    assert "expected = {\n    'dag_ingest_fotmob': 'fotmob_orchestrated__g',\n}" in code
+    # Host-side comparison is exact: any extra run in the evidence is refused.
     with pytest.raises(mod.DeploymentError, match="live provenance differs"):
         mod.validate_live_automatic_canary(
             "c" * 64,
@@ -4415,17 +4343,3 @@ def test_live_canary_silver_disabled_accepts_absent_silver_run(monkeypatch):
             canary,
             run=_live_run([_INGEST_OK], canary, {**_BRONZE_LIVE, "digest": "e" * 64}),
         )
-
-
-def test_live_canary_silver_enabled_requires_silver_run():
-    canary = _live_canary("success")
-
-    with pytest.raises(mod.DeploymentError, match="live provenance differs"):
-        mod.validate_live_automatic_canary(
-            "c" * 64, canary, run=_live_run([_INGEST_OK], canary, _SILVER_LIVE)
-        )
-    mod.validate_live_automatic_canary(
-        "c" * 64,
-        canary,
-        run=_live_run([_INGEST_OK, _SILVER_OK], canary, _SILVER_LIVE),
-    )

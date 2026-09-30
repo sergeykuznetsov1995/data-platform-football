@@ -364,7 +364,7 @@ def test_candidate_is_immutable_and_seal_requires_candidate():
         )
 
 
-def test_bronze_only_helper_completes_real_store_lifecycle_and_silver_failure_cannot_seal(
+def test_bronze_only_helper_completes_real_store_lifecycle_and_unrecorded_cannot_seal(
     monkeypatch,
 ):
     monkeypatch.setenv(
@@ -414,7 +414,6 @@ def test_bronze_only_helper_completes_real_store_lifecycle_and_silver_failure_ca
     }
     candidate = publication.record_fotmob_bronze_only_candidate(
         validation_task_id="validate_data",
-        silver_input_tables=["iceberg.bronze.fotmob_matches"],
         **_context(generation_id, no_op_validation),
     )
     ready = publication.seal_fotmob_publication(
@@ -425,30 +424,19 @@ def test_bronze_only_helper_completes_real_store_lifecycle_and_silver_failure_ca
     assert ready["phase"] == "ready"
     assert ready["candidate"] == candidate
 
-    silver_store, _database, _factory = make_store()
-    # A separate store may reuse the same canonical generation identity; the
-    # payload UUID must continue to match its immutable binding.
-    silver_generation_id = generation_id
-    silver_store.initialize_publication_generation(
-        silver_generation_id,
+    # A generation whose candidate was never recorded (the Bronze candidate
+    # task failed) can never be sealed ready.
+    unrecorded_store, _database, _factory = make_store()
+    unrecorded_store.initialize_publication_generation(
+        generation_id,
         dag_id="dag_orchestrate_fotmob",
         binding=binding,
         source="fotmob",
     )
-    monkeypatch.setattr(publication, "_control_store", lambda: silver_store)
-    silver_validation = {
-        "status": "success",
-        "bronze_inputs_changed": ["iceberg.bronze.fotmob_matches"],
-    }
-    deferred = publication.record_fotmob_bronze_only_candidate(
-        validation_task_id="validate_data",
-        silver_input_tables=["iceberg.bronze.fotmob_matches"],
-        **_context(silver_generation_id, silver_validation),
-    )
-    assert deferred["status"] == "silver_required"
+    monkeypatch.setattr(publication, "_control_store", lambda: unrecorded_store)
     with pytest.raises(StateConflict, match="without a candidate"):
         publication.seal_fotmob_publication(
-            **_context(silver_generation_id, silver_validation)
+            **_context(generation_id, no_op_validation)
         )
 
 

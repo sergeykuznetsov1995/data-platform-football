@@ -5,8 +5,8 @@ Airflow task state is not a publication contract.  This module binds one
 FotMob generation to the exact data interval, deployed Git revision and
 schedule owner, then stores its state in the shared PostgreSQL ControlStore.
 
-Only ``ready`` generations may be claimed by the master.  Bronze and Silver
-writers hold a transactional writer guard and are rejected as soon as the
+Only ``ready`` generations may be claimed by the master.  Bronze writers
+hold a transactional writer guard and are rejected as soon as the
 generation leaves ``writing`` -- including a retry by the same lock owner.
 """
 
@@ -44,10 +44,6 @@ from scrapers.fotmob.source_refresh import (
 
 
 logger = logging.getLogger(__name__)
-
-# Решение владельца 21.09.2026 (#1312): витрины заморожены 12.09, ошибки DQ silver
-# только предупреждают и не красят волну сбора. Вернуть True при разморозке silver.
-SILVER_DQ_BLOCKING: bool = False
 
 FOTMOB_PUBLICATION_SOURCE = "fotmob"
 FOTMOB_PUBLICATION_SCHEMA = "fotmob-publication-v1"
@@ -173,7 +169,6 @@ FOTMOB_EXPECTED_ISOLATED_DAGS = frozenset(
     {
         FOTMOB_AUTOMATIC_OWNER_DAG_ID,
         "dag_ingest_fotmob",
-        "dag_transform_fotmob_silver",
         FOTMOB_ISOLATED_DAILY_DAG_ID,
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
@@ -211,7 +206,6 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
         "dags/dag_collect_fotmob_players.py",
-        "dags/dag_transform_fotmob_silver.py",
         "dags/dag_trigger_fotmob_daily.py",
         "dags/scripts/run_fotmob_scraper.py",
         "dags/utils/fotmob_publication.py",
@@ -243,13 +237,8 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/dag_transform_e3.py",
         "dags/dag_transform_e4.py",
         "dags/dag_transform_fbref_gold.py",
-        "dags/dag_transform_fotmob_silver.py",
         "dags/dag_transform_xref.py",
         "dags/scripts/run_fotmob_scraper.py",
-        "dags/sql/silver/fotmob_keeper_profile.sql",
-        "dags/sql/silver/fotmob_manager_profile.sql",
-        "dags/sql/silver/fotmob_player_profile.sql",
-        "dags/sql/silver/fotmob_player_season_profile.sql",
         "dags/sql/silver/xref_manager.sql.j2",
         "dags/utils/fotmob_publication.py",
         "dags/utils/fotmob_orchestration.py",
@@ -681,24 +670,12 @@ def _active_owner_writer_authorization(
             raise _airflow_exception("FotMob writer ingest lineage is incomplete")
         if owner_dag_id == FOTMOB_PLAYER_COLLECTOR_DAG_ID:
             conf = dict(ingest.conf)
-        silver_trigger = (
-            session.query(TaskInstance)
-            .filter(
-                TaskInstance.dag_id == "dag_ingest_fotmob",
-                TaskInstance.run_id == ingest_run_id,
-                TaskInstance.task_id == "trigger_silver_transform",
-            )
-            .one_or_none()
-        )
         return {
             "owner_dag_id": owner_dag_id,
             "owner_run_id": owner_run_id,
             "ingest_run_id": ingest_run_id,
             "lane": lane,
             "conf": dict(conf),
-            "silver_trigger_state": (
-                None if silver_trigger is None else state(silver_trigger.state)
-            ),
         }
     finally:
         session.close()
@@ -796,26 +773,12 @@ def _validate_active_automatic_writer(
     dag_id = str(identity.get("dag_id") or "")
     run_id = str(identity.get("run_id") or "")
     expected_ingest = str(authorization["ingest_run_id"])
-    expected_silver = f"fotmob_silver__{generation_id}"
     if component == "bronze_runner":
         if dag_id != "dag_ingest_fotmob" or run_id != expected_ingest:
             raise _airflow_exception("FotMob active Bronze run identity differs")
     elif component == "airflow_task" and dag_id == "dag_ingest_fotmob":
         if run_id != expected_ingest:
             raise _airflow_exception("FotMob active ingest run identity differs")
-    elif component == "airflow_task" and dag_id == "dag_transform_fotmob_silver":
-        if (
-            run_id != expected_silver
-            or authorization.get("silver_trigger_state")
-            not in {"running", "success", "deferred", "up_for_reschedule"}
-        ):
-            raise _airflow_exception("FotMob active Silver lineage differs")
-        return {
-            "generation_id": generation_id,
-            "owner_run_id": authorization["owner_run_id"],
-            "ingest_run_id": expected_ingest,
-            "lane": authorization["lane"],
-        }
     else:
         raise _airflow_exception("FotMob active writer component is not authorized")
 
@@ -892,8 +855,8 @@ def _validate_automatic_kept_paused_writer(
 ) -> dict[str, Any] | None:
     """Admit only the exact manual automatic-daily canary namespace.
 
-    The canary is the sole dynamic writer allowed while all seven DAGs remain
-    paused.  It may temporarily enable only ingest and Silver; the scheduled
+    The canary is the sole dynamic writer allowed while all six DAGs remain
+    paused.  It may temporarily enable only ingest; the scheduled
     orchestrator and every legacy owner remain paused throughout.
     """
 
@@ -940,10 +903,7 @@ def _validate_automatic_kept_paused_writer(
     component = str(identity.get("component") or "")
     dag_id = str(identity.get("dag_id") or "")
     run_id = str(identity.get("run_id") or "")
-    if component == "airflow_task" and dag_id == "dag_transform_fotmob_silver":
-        if run_id != f"fotmob_silver__{generation_id}":
-            raise _airflow_exception("FotMob automatic canary Silver identity differs")
-    elif (
+    if (
         component == "airflow_task" and dag_id == "dag_ingest_fotmob"
     ) or component == "bronze_runner":
         if component == "airflow_task" and run_id != (
@@ -1015,62 +975,6 @@ def _validate_automatic_kept_paused_writer(
     }
 
 
-def _validate_rollback_kept_paused_writer(
-    report: Mapping[str, Any], identity: Mapping[str, Any]
-) -> dict[str, Any] | None:
-    """Admit only the rollback coordinator's exact Silver-only namespace."""
-
-    raw_publication = identity.get("publication")
-    raw_binding = (
-        raw_publication.get("binding")
-        if isinstance(raw_publication, Mapping)
-        else None
-    )
-    if not isinstance(raw_binding, Mapping):
-        return None
-    try:
-        binding = make_publication_binding(
-            owner=raw_binding.get("owner"),
-            data_interval_start=raw_binding.get("data_interval_start"),
-            data_interval_end=raw_binding.get("data_interval_end"),
-            fingerprint=raw_binding.get("runtime_fingerprint"),
-        )
-        generation_id = str(uuid.UUID(str(raw_publication.get("generation_id"))))
-        generated_at = datetime.fromisoformat(
-            str(report.get("generated_at", "")).replace("Z", "+00:00")
-        ).astimezone(timezone.utc)
-        start = datetime.fromisoformat(binding["data_interval_start"]).astimezone(
-            timezone.utc
-        )
-        end = datetime.fromisoformat(binding["data_interval_end"]).astimezone(
-            timezone.utc
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-    offset = (start - generated_at).total_seconds()
-    component = str(identity.get("component") or "")
-    dag_id = str(identity.get("dag_id") or "")
-    run_id = str(identity.get("run_id") or "")
-    expected_run_id = "rollback_silver__" + generation_id.replace("-", "")
-    if (
-        dict(raw_binding) != binding
-        or generation_id != make_generation_id(binding)
-        or binding["runtime_fingerprint"] != report.get("git_sha")
-        or end - start != timedelta(seconds=1)
-        or offset <= 0
-        or not offset.is_integer()
-        or component != "airflow_task"
-        or dag_id != "dag_transform_fotmob_silver"
-        or run_id != expected_run_id
-    ):
-        return None
-    return {
-        "mode": "rollback-silver",
-        "attempt": int(offset),
-        "generation_id": generation_id,
-    }
-
-
 def _validate_issue930_kept_paused_writer(
     report: Mapping[str, Any], identity: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1139,10 +1043,7 @@ def _validate_issue930_kept_paused_writer(
     dag_id = str(identity.get("dag_id") or "")
     run_id = str(identity.get("run_id") or "")
     source_fields_present = False
-    if component == "airflow_task" and dag_id == "dag_transform_fotmob_silver":
-        if run_id != f"fotmob_silver__{generation_id}":
-            raise _airflow_exception("FotMob kept-paused Silver run identity differs")
-    elif (
+    if (
         component == "airflow_task" and dag_id == "dag_ingest_fotmob"
     ) or component == "bronze_runner":
         if component == "airflow_task" and run_id != (
@@ -1414,7 +1315,6 @@ def _validate_pending_consumer_runtime(
         run_id = str(identity.get("run_id") or "")
         exact_airflow_run_ids = {
             "dag_ingest_fotmob": f"fotmob_ingest__{generation_id}",
-            "dag_transform_fotmob_silver": f"fotmob_silver__{generation_id}",
         }
         if component == "bronze_runner":
             if str(identity.get("mode") or "").strip().casefold() != "daily":
@@ -1503,7 +1403,7 @@ def attest_fotmob_isolated_runtime(
     if not fotmob_ceremony_configured(runtime_env):
         # Ceremony-free contour: there is no deployment report to attest, but
         # the stack-isolation gate stays so shared-stack tasks can never
-        # write FotMob Bronze/Silver by accident.
+        # write FotMob Bronze by accident.
         if runtime_env.get(FOTMOB_ISOLATED_STACK_ENV) != "1":
             raise _airflow_exception(
                 "FotMob ceremony-free runtime still requires "
@@ -1562,7 +1462,6 @@ def attest_fotmob_isolated_runtime(
             {
                 FOTMOB_AUTOMATIC_OWNER_DAG_ID,
                 "dag_ingest_fotmob",
-                "dag_transform_fotmob_silver",
             }
         )
     )
@@ -1687,8 +1586,6 @@ def attest_fotmob_isolated_runtime(
         identity = writer_identity or _issue930_writer_identity_from_context(context)
         lifecycle = _validate_automatic_kept_paused_writer(report, identity)
         if lifecycle is None:
-            lifecycle = _validate_rollback_kept_paused_writer(report, identity)
-        if lifecycle is None:
             lifecycle = _validate_issue930_kept_paused_writer(report, identity)
 
     expected_manifest = report.get("isolated_runtime_sha256")
@@ -1804,7 +1701,6 @@ def attest_fotmob_shared_runtime(
         == {
             FOTMOB_AUTOMATIC_OWNER_DAG_ID,
             "dag_ingest_fotmob",
-            "dag_transform_fotmob_silver",
         }
     )
     pending_automatic_wait_admission = (
@@ -1823,7 +1719,7 @@ def attest_fotmob_shared_runtime(
         }
         and isinstance(unpaused, list)
         and set(unpaused)
-        == {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+        == {"dag_ingest_fotmob"}
     )
     automatic_admission = None
     automatic_rollout = None
@@ -2334,7 +2230,7 @@ def _attest_fotmob_writer_runtime(
 def fotmob_publication_writer(
     context: Mapping[str, Any],
 ) -> Iterator[dict[str, Any]]:
-    """Hold the DB guard and attest before and after one Silver mutation."""
+    """Hold the DB guard and attest before and after one Bronze mutation."""
 
     publication = publication_from_context(context)
     if not fotmob_ceremony_configured():
@@ -2371,75 +2267,12 @@ def _normalize_candidate_value(value: Any) -> Any:
     return value
 
 
-def record_fotmob_silver_candidate(
-    *, transform_task_ids: Sequence[str], **context: Any
-) -> dict[str, Any]:
-    """Record an immutable candidate only after every transform and both DQs."""
-
-    publication = publication_from_context(context) or {}
-    task_instance = context.get("ti")
-    if task_instance is None:
-        raise _airflow_exception("FotMob candidate task has no task instance")
-    expected_ids = tuple(sorted(str(task_id) for task_id in transform_task_ids))
-    if len(expected_ids) != len(set(expected_ids)) or not expected_ids:
-        raise _airflow_exception("FotMob candidate transform set is invalid")
-    transform_results: dict[str, Any] = {}
-    for task_id in expected_ids:
-        result = task_instance.xcom_pull(task_ids=task_id)
-        if not isinstance(result, Mapping) or result.get("status") != "success":
-            raise _airflow_exception(
-                f"FotMob transform {task_id!r} has no successful result"
-            )
-        transform_results[task_id] = _normalize_candidate_value(dict(result))
-    row_gate = task_instance.xcom_pull(task_ids="validate_silver")
-    quality_gate = task_instance.xcom_pull(task_ids="validate_silver_quality")
-    if not isinstance(row_gate, Mapping) or row_gate.get("warnings"):
-        raise _airflow_exception("FotMob Silver row-count evidence is not clean")
-    if not isinstance(quality_gate, Mapping):
-        raise _airflow_exception("FotMob Silver quality evidence is not clean")
-    # #1312: пока silver заморожен, ошибки DQ не блокируют кандидата. След
-    # остаётся внутри ``quality_gate`` (ключи ``errors`` и ``blocking``); новых
-    # полей в evidence не добавляем — состав полей кандидата сверяется точным
-    # множеством в scripts/fotmob_acceptance.py (LIVE_CANDIDATE_FIELDS).
-    if quality_gate.get("errors") and SILVER_DQ_BLOCKING:
-        raise _airflow_exception("FotMob Silver quality evidence is not clean")
-    evidence = {
-        "schema": FOTMOB_PUBLICATION_SCHEMA,
-        "generation_id": publication.get("generation_id"),
-        "transform_task_ids": list(expected_ids),
-        "transform_results": transform_results,
-        "row_count_gate": _normalize_candidate_value(dict(row_gate)),
-        "quality_gate": _normalize_candidate_value(dict(quality_gate)),
-    }
-    evidence["digest"] = hashlib.sha256(
-        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    # ``record_publication_candidate`` locks and validates the same
-    # generation row in its transaction; opening a second writer transaction
-    # here would self-deadlock on PostgreSQL's row lock.  Without the
-    # ceremony there is no generation row: keep the DQ evidence gates above
-    # but skip the ControlStore write.
-    if fotmob_ceremony_configured():
-        _control_store().record_publication_candidate(
-            publication["generation_id"],
-            evidence,
-            source=FOTMOB_PUBLICATION_SOURCE,
-        )
-    return evidence
-
-
 def record_fotmob_bronze_only_candidate(
     *,
     validation_task_id: str,
-    silver_input_tables: Sequence[str],
-    silver_enabled: bool = True,
     **context: Any,
 ) -> dict[str, Any]:
-    """Record the validated Bronze candidate when no Silver input changed.
-
-    With ``silver_enabled=False`` (#1575) the candidate is recorded even when
-    Silver inputs changed, because no Silver child will run.
-    """
+    """Record the validated Bronze candidate (the only candidate kind, #1590)."""
 
     publication = publication_from_context(context) or {}
     task_instance = context.get("ti")
@@ -2461,29 +2294,6 @@ def record_fotmob_bronze_only_candidate(
     ):
         raise _airflow_exception("FotMob changed Bronze input evidence is invalid")
     normalized_changed = sorted({table.strip().casefold() for table in changed})
-    if isinstance(silver_input_tables, (str, bytes)) or not isinstance(
-        silver_input_tables, Sequence
-    ):
-        raise _airflow_exception("FotMob Silver input table set is invalid")
-    if any(
-        not isinstance(table, str) or not table.strip()
-        for table in silver_input_tables
-    ):
-        raise _airflow_exception("FotMob Silver input table set is invalid")
-    normalized_silver_inputs = sorted(
-        {table.strip().casefold() for table in silver_input_tables}
-    )
-    if not normalized_silver_inputs:
-        raise _airflow_exception("FotMob Silver input table set is invalid")
-    if silver_enabled and set(normalized_changed).intersection(
-        normalized_silver_inputs
-    ):
-        return {
-            "status": "silver_required",
-            "recorded": False,
-            "bronze_inputs_changed": normalized_changed,
-        }
-
     validated_bronze = dict(validation)
     validated_bronze["bronze_inputs_changed"] = normalized_changed
     validated_bronze = json.loads(
@@ -2509,7 +2319,7 @@ def record_fotmob_bronze_only_candidate(
 
 
 def seal_fotmob_publication(**context: Any) -> dict[str, Any]:
-    """Move ``writing`` to ``ready`` only after the Silver child succeeded."""
+    """Move ``writing`` to ``ready`` only after the Bronze candidate is recorded."""
 
     publication = publication_from_context(context)
     if not fotmob_ceremony_configured():

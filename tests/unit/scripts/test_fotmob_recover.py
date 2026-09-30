@@ -79,7 +79,7 @@ def _owner(*, state="failed", lane="daily"):
 
 
 def _isolated_snapshot(
-    *, owner_state="failed", ingest_state="failed", silver_state="failed"
+    *, owner_state="failed", ingest_state="failed"
 ):
     publication = _publication()
     return {
@@ -98,15 +98,7 @@ def _isolated_snapshot(
             "run_type": "manual",
             "state": ingest_state,
             "conf": {mod.PUBLICATION_CONF_KEY: publication},
-            "task_states": {"trigger_silver_transform": "failed"},
-        },
-        "silver": {
-            "dag_id": mod.SILVER_DAG_ID,
-            "run_id": f"fotmob_silver__{GENERATION_ID}",
-            "run_type": "manual",
-            "state": silver_state,
-            "conf": {mod.PUBLICATION_CONF_KEY: publication},
-            "task_states": {"seal_fotmob_publication": "upstream_failed"},
+            "task_states": {"seal_fotmob_publication_ready": "upstream_failed"},
         },
         "scheduler_state": _selected_state(),
         "atomic_metadata_transaction": True,
@@ -206,18 +198,12 @@ def _background_case(lane, *, phase, finalize_state, advance_state):
         }
     )
     snapshot = _isolated_snapshot(
-        owner_state="failed", ingest_state="success", silver_state="success"
+        owner_state="failed", ingest_state="success"
     )
     snapshot["owner_matches"] = [owner]
     snapshot["ingest"].update(
         {
             "run_id": f"fotmob_orchestrated__{generation_id}",
-            "conf": {mod.PUBLICATION_CONF_KEY: publication},
-        }
-    )
-    snapshot["silver"].update(
-        {
-            "run_id": f"fotmob_silver__{generation_id}",
             "conf": {mod.PUBLICATION_CONF_KEY: publication},
         }
     )
@@ -430,10 +416,6 @@ def _writing_case_for_lane(lane):
         run_id=f"fotmob_orchestrated__{generation_id}",
         conf={mod.PUBLICATION_CONF_KEY: publication},
     )
-    snapshot["silver"].update(
-        run_id=f"fotmob_silver__{generation_id}",
-        conf={mod.PUBLICATION_CONF_KEY: publication},
-    )
     control = {
         **_control(),
         "generation_id": generation_id,
@@ -535,7 +517,6 @@ def test_writing_daily_failure_waits_for_next_calendar_boundary_with_new_ids(
     assert f"fotmob_orchestrated__{next_generation_id}" != (
         f"fotmob_orchestrated__{generation_id}"
     )
-    assert f"fotmob_silver__{next_generation_id}" != (f"fotmob_silver__{generation_id}")
     assert retry["requires_new_generation_id"] is True
     assert retry["requires_new_child_run_ids"] is True
     assert report["roll_forward"]["terminal_generation_reopen_allowed"] is False
@@ -874,9 +855,9 @@ def test_recovery_rejects_running_writer_task_under_failed_dagrun(
     snapshot = _isolated_snapshot()
     snapshot["active_task_instances"] = [
         {
-            "dag_id": mod.SILVER_DAG_ID,
-            "run_id": f"fotmob_silver__{GENERATION_ID}",
-            "task_id": "transform_fotmob_player_profile",
+            "dag_id": mod.INGEST_DAG_ID,
+            "run_id": f"fotmob_orchestrated__{GENERATION_ID}",
+            "task_id": "scrape_fotmob_data",
             "state": "running",
         }
     ]
@@ -912,10 +893,10 @@ def test_ready_unclaimed_terminal_sofa_is_abandoned_not_retried(tmp_path, monkey
     }
     snapshots = [
         _isolated_snapshot(
-            owner_state="success", ingest_state="success", silver_state="success"
+            owner_state="success", ingest_state="success"
         ),
         _isolated_snapshot(
-            owner_state="success", ingest_state="success", silver_state="success"
+            owner_state="success", ingest_state="success"
         ),
     ]
     _install_common(
@@ -957,10 +938,10 @@ def test_ready_after_owner_cursor_failure_advances_then_abandons(tmp_path, monke
     }
     snapshots = [
         _isolated_snapshot(
-            owner_state="failed", ingest_state="success", silver_state="success"
+            owner_state="failed", ingest_state="success"
         ),
         _isolated_snapshot(
-            owner_state="failed", ingest_state="success", silver_state="success"
+            owner_state="failed", ingest_state="success"
         ),
     ]
     for snapshot in snapshots:
@@ -1018,10 +999,10 @@ def test_daily_ready_after_owner_finalizer_failure_advances_then_abandons(
     }
     snapshots = [
         _isolated_snapshot(
-            owner_state="failed", ingest_state="success", silver_state="success"
+            owner_state="failed", ingest_state="success"
         ),
         _isolated_snapshot(
-            owner_state="failed", ingest_state="success", silver_state="success"
+            owner_state="failed", ingest_state="success"
         ),
     ]
     for snapshot in snapshots:
@@ -1218,10 +1199,10 @@ def test_ready_abandon_lost_response_is_idempotent(tmp_path, monkeypatch):
     }
     snapshots = [
         _isolated_snapshot(
-            owner_state="success", ingest_state="success", silver_state="success"
+            owner_state="success", ingest_state="success"
         ),
         _isolated_snapshot(
-            owner_state="success", ingest_state="success", silver_state="success"
+            owner_state="success", ingest_state="success"
         ),
     ]
     for snapshot in snapshots:
@@ -1249,7 +1230,7 @@ def test_ready_recovery_rejects_nonterminal_or_started_downstream(
     ready = _control(phase="ready", status="succeeded")
     snapshots = [
         _isolated_snapshot(
-            owner_state="success", ingest_state="success", silver_state="success"
+            owner_state="success", ingest_state="success"
         )
     ]
     _install_common(monkeypatch, tmp_path, controls=[ready], snapshots=snapshots)
@@ -1272,7 +1253,7 @@ def test_ready_recovery_rejects_running_task_under_failed_downstream(
     ready = _control(phase="ready", status="succeeded")
     snapshots = [
         _isolated_snapshot(
-            owner_state="success", ingest_state="success", silver_state="success"
+            owner_state="success", ingest_state="success"
         )
     ]
     _install_common(monkeypatch, tmp_path, controls=[ready], snapshots=snapshots)

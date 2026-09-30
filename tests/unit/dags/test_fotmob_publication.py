@@ -138,7 +138,6 @@ def _isolated_runtime_evidence(tmp_path: Path):
             {
                 publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
                 "dag_ingest_fotmob",
-                "dag_transform_fotmob_silver",
             }
         ),
         "container_report_path": str(report_path),
@@ -305,7 +304,7 @@ def _pending_automatic_shared_wait_report(tmp_path: Path, report: dict) -> dict:
                 "dag_collect_fotmob_players",
             }
         ),
-        unpaused=["dag_ingest_fotmob", "dag_transform_fotmob_silver"],
+        unpaused=["dag_ingest_fotmob"],
         evidence_dir=str(tmp_path.resolve()),
         generated_at="2026-08-08T13:36:00+00:00",
         scheduler_container_id=isolated_id,
@@ -637,7 +636,6 @@ def test_active_player_collector_writer_requires_exact_child_and_profile(
         "ingest_run_id": f"fotmob_players__{generation_id}",
         "lane": "players",
         "conf": profile,
-        "silver_trigger_state": "running",
     }
     monkeypatch.setattr(
         publication,
@@ -697,7 +695,6 @@ def test_active_automatic_writer_requires_exact_child_ids_and_owner_profile(
         "ingest_run_id": f"fotmob_orchestrated__{generation_id}",
         "lane": "daily",
         "conf": profile,
-        "silver_trigger_state": "running",
     }
     monkeypatch.setattr(
         publication,
@@ -780,20 +777,13 @@ def test_active_automatic_writer_requires_exact_child_ids_and_owner_profile(
             writer_identity={**runner_identity, "player_limit": 1},
         )
 
+    # #1590: the legacy Silver child is no longer an authorized writer.
     silver = SimpleNamespace(
         dag_id="dag_transform_fotmob_silver",
         run_id=f"fotmob_silver__{generation_id}",
         conf={publication.FOTMOB_PUBLICATION_CONF_KEY: payload},
     )
-    publication.attest_fotmob_isolated_runtime(
-        environ=environment,
-        hostname="1" * 12,
-        roots=roots,
-        require_scheduled_owner=False,
-        dag_run=silver,
-    )
-    silver.run_id = f"manual__{generation_id}"
-    with pytest.raises(Exception, match="Silver lineage differs"):
+    with pytest.raises(Exception, match="component is not authorized"):
         publication.attest_fotmob_isolated_runtime(
             environ=environment,
             hostname="1" * 12,
@@ -876,19 +866,20 @@ def test_pending_runtime_allows_only_exact_daily_child_writers(tmp_path):
     )
     assert bronze["pending_consumer"]["generation_id"] == generation_id
 
+    # #1590: the legacy Silver child is no longer a pending writer.
     silver_run = SimpleNamespace(
         dag_id="dag_transform_fotmob_silver",
         run_id=f"fotmob_silver__{generation_id}",
         conf={publication.FOTMOB_PUBLICATION_CONF_KEY: payload},
     )
-    silver = publication.attest_fotmob_isolated_runtime(
-        environ=environment,
-        hostname="1" * 12,
-        roots=roots,
-        require_scheduled_owner=False,
-        dag_run=silver_run,
-    )
-    assert silver["pending_consumer"]["generation_id"] == generation_id
+    with pytest.raises(Exception, match="pending writer identity differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            dag_run=silver_run,
+        )
 
     with pytest.raises(Exception, match="pending Bronze writer is not daily"):
         publication.attest_fotmob_isolated_runtime(
@@ -903,15 +894,6 @@ def test_pending_runtime_allows_only_exact_daily_child_writers(tmp_path):
             },
         )
 
-    silver_run.run_id = f"manual__{generation_id}"
-    with pytest.raises(Exception, match="pending writer identity differs"):
-        publication.attest_fotmob_isolated_runtime(
-            environ=environment,
-            hostname="1" * 12,
-            roots=roots,
-            require_scheduled_owner=False,
-            dag_run=silver_run,
-        )
 
 
 def test_scheduled_runtime_attestation_rejects_drift_manual_and_pending(tmp_path):
@@ -1087,7 +1069,6 @@ def test_pending_automatic_sofa_sensor_waits_without_claim_then_active_claims(
             {
                 publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
                 "dag_ingest_fotmob",
-                "dag_transform_fotmob_silver",
             }
         ),
         automatic_rollout=certificate["automatic_rollout"],
@@ -1139,7 +1120,7 @@ def test_pending_automatic_report_never_authorizes_non_sensor_task(tmp_path):
         )
 
 
-def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
+def test_kept_paused_attestation_allows_only_exact_issue930_bronze(
     tmp_path,
 ):
     roots, report_path, report, environment, _dag_run = _isolated_runtime_evidence(
@@ -1187,20 +1168,21 @@ def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
         "generation_id": lifecycle_publication["generation_id"],
     }
 
+    # #1590: the legacy Silver child is no longer a coordinator writer.
     silver_run = SimpleNamespace(
         dag_id="dag_transform_fotmob_silver",
         run_id="fotmob_silver__" + lifecycle_publication["generation_id"],
         conf={"fotmob_publication": lifecycle_publication},
     )
-    silver = publication.attest_fotmob_isolated_runtime(
-        environ=environment,
-        hostname="1" * 12,
-        roots=roots,
-        require_scheduled_owner=False,
-        allow_kept_paused_writer=True,
-        dag_run=silver_run,
-    )
-    assert silver["issue930_lifecycle"]["mode"] == "replay"
+    with pytest.raises(Exception, match="not coordinator-owned"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            allow_kept_paused_writer=True,
+            dag_run=silver_run,
+        )
 
     with pytest.raises(Exception, match="mode/attempt identity differs"):
         publication.attest_fotmob_isolated_runtime(
@@ -1217,7 +1199,7 @@ def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
         )
 
 
-def test_kept_paused_attestation_accepts_exact_rollback_silver_only(tmp_path):
+def test_kept_paused_attestation_rejects_removed_rollback_silver(tmp_path):
     roots, report_path, report, environment, _dag_run = _isolated_runtime_evidence(
         tmp_path
     )
@@ -1243,24 +1225,20 @@ def test_kept_paused_attestation_accepts_exact_rollback_silver_only(tmp_path):
     run_id = "rollback_silver__" + lifecycle_publication["generation_id"].replace(
         "-", ""
     )
-    admitted = publication.attest_fotmob_isolated_runtime(
-        environ=environment,
-        hostname="1" * 12,
-        roots=roots,
-        require_scheduled_owner=False,
-        allow_kept_paused_writer=True,
-        dag_run=SimpleNamespace(
-            dag_id="dag_transform_fotmob_silver",
-            run_id=run_id,
-            conf={"fotmob_publication": lifecycle_publication},
-        ),
-    )
-
-    assert admitted["issue930_lifecycle"] == {
-        "mode": "rollback-silver",
-        "attempt": 3,
-        "generation_id": lifecycle_publication["generation_id"],
-    }
+    # #1590: the rollback Silver namespace no longer exists.
+    with pytest.raises(Exception, match="coordinator namespace"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            allow_kept_paused_writer=True,
+            dag_run=SimpleNamespace(
+                dag_id="dag_transform_fotmob_silver",
+                run_id=run_id,
+                conf={"fotmob_publication": lifecycle_publication},
+            ),
+        )
 
     with pytest.raises(Exception, match="coordinator namespace"):
         publication.attest_fotmob_isolated_runtime(
@@ -1819,12 +1797,12 @@ def test_writer_post_attestation_drift_fails_before_guard_release(monkeypatch):
 
     with pytest.raises(RuntimeError, match="post-operation runtime drift"):
         with publication.fotmob_publication_writer(_context()):
-            events.append("silver_write")
+            events.append("bronze_write")
 
     assert events == [
         "attest",
         "guard_enter",
-        "silver_write",
+        "bronze_write",
         "attest",
         "guard_exit",
     ]
@@ -1857,31 +1835,16 @@ def test_candidate_is_exact_digested_and_seal_renews_full_lease(monkeypatch):
             seal_publication_generation=seal,
         ),
     )
-    values = {
-        "silver_transforms.a": {
-            "status": "success",
-            "table": "iceberg.silver.a",
-            "rows": 10,
-        },
-        "silver_transforms.b": {
-            "status": "success",
-            "table": "iceberg.silver.b",
-            "rows": 20,
-        },
-        "validate_silver": {"status": "success", "warnings": []},
-        "validate_silver_quality": {"passed": 2, "errors": [], "warnings": []},
-    }
     context = _context()
-    context["ti"].xcom_pull.side_effect = lambda task_ids: values[task_ids]
+    context["ti"].xcom_pull.return_value = {
+        "status": "success",
+        "bronze_inputs_changed": ["iceberg.bronze.fotmob_matches"],
+    }
 
-    candidate = publication.record_fotmob_silver_candidate(
-        transform_task_ids=["silver_transforms.b", "silver_transforms.a"],
-        **context,
+    candidate = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data", **context
     )
-    assert candidate["transform_task_ids"] == [
-        "silver_transforms.a",
-        "silver_transforms.b",
-    ]
+    assert candidate["candidate_kind"] == "bronze_only"
     assert len(candidate["digest"]) == 64
     assert record.call_args.args[1] == candidate
 
@@ -1889,81 +1852,14 @@ def test_candidate_is_exact_digested_and_seal_renews_full_lease(monkeypatch):
     assert seal.call_args.kwargs["ttl_seconds"] == 14 * 24 * 60 * 60
 
 
-def _silver_candidate_context(monkeypatch, quality_gate):
-    _ceremony_env(monkeypatch)
-    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
-    record = MagicMock(return_value={"phase": "writing"})
-    monkeypatch.setattr(
-        publication,
-        "_control_store",
-        lambda: SimpleNamespace(record_publication_candidate=record),
+def test_silver_candidate_path_is_removed():
+    # #1590: the legacy FotMob Silver candidate and its DQ switch are gone.
+    assert not hasattr(publication, "record_fotmob_silver_candidate")
+    assert not hasattr(publication, "SILVER_DQ_BLOCKING")
+    assert not hasattr(publication, "_validate_rollback_kept_paused_writer")
+    assert "dag_transform_fotmob_silver" not in (
+        publication.FOTMOB_EXPECTED_ISOLATED_DAGS
     )
-    values = {
-        "silver_transforms.a": {
-            "status": "success",
-            "table": "iceberg.silver.a",
-            "rows": 10,
-        },
-        "validate_silver": {"status": "success", "warnings": []},
-        "validate_silver_quality": quality_gate,
-    }
-    context = _context()
-    context["ti"].xcom_pull.side_effect = lambda task_ids: values[task_ids]
-    return context, record
-
-
-def test_silver_dq_errors_do_not_block_the_candidate_while_silver_is_frozen(monkeypatch):
-    # #1312: витрины заморожены, ошибка DQ обязана остаться следом в evidence,
-    # но не ронять волну сбора.
-    monkeypatch.setattr(publication, "SILVER_DQ_BLOCKING", False)
-    quality_gate = {
-        "passed": 1,
-        "errors": ["no_duplicates[silver.fotmob_lineup]"],
-        "warnings": [],
-        "blocking": False,
-    }
-    context, record = _silver_candidate_context(monkeypatch, quality_gate)
-
-    candidate = publication.record_fotmob_silver_candidate(
-        transform_task_ids=["silver_transforms.a"],
-        **context,
-    )
-
-    # След ошибки живёт внутри quality_gate; состав полей кандидата не меняется —
-    # его сверяет точным множеством scripts/fotmob_acceptance.py.
-    assert candidate["quality_gate"] == quality_gate
-    assert candidate["quality_gate"]["errors"] == ["no_duplicates[silver.fotmob_lineup]"]
-    assert candidate["quality_gate"]["blocking"] is False
-    assert set(candidate) == {
-        "schema",
-        "generation_id",
-        "digest",
-        "transform_task_ids",
-        "transform_results",
-        "row_count_gate",
-        "quality_gate",
-    }
-    assert len(candidate["digest"]) == 64
-    assert record.call_args.args[1] == candidate
-
-
-def test_silver_dq_errors_block_the_candidate_when_blocking_is_restored(monkeypatch):
-    monkeypatch.setattr(publication, "SILVER_DQ_BLOCKING", True)
-    quality_gate = {
-        "passed": 1,
-        "errors": ["no_duplicates[silver.fotmob_lineup]"],
-        "warnings": [],
-        "blocking": True,
-    }
-    context, record = _silver_candidate_context(monkeypatch, quality_gate)
-
-    with pytest.raises(Exception, match="quality evidence is not clean"):
-        publication.record_fotmob_silver_candidate(
-            transform_task_ids=["silver_transforms.a"],
-            **context,
-        )
-
-    record.assert_not_called()
 
 
 def test_bronze_only_candidate_is_deterministic_from_validated_evidence(monkeypatch):
@@ -1990,16 +1886,13 @@ def test_bronze_only_candidate_is_deterministic_from_validated_evidence(monkeypa
     }
     context = _context()
     context["ti"].xcom_pull.return_value = validation
-    silver_inputs = ["iceberg.bronze.fotmob_matches"]
 
     first = publication.record_fotmob_bronze_only_candidate(
         validation_task_id="validate_data",
-        silver_input_tables=silver_inputs,
         **context,
     )
     second = publication.record_fotmob_bronze_only_candidate(
         validation_task_id="validate_data",
-        silver_input_tables=silver_inputs,
         **context,
     )
 
@@ -2011,37 +1904,9 @@ def test_bronze_only_candidate_is_deterministic_from_validated_evidence(monkeypa
     assert all(call.kwargs["source"] == "fotmob" for call in record.call_args_list)
 
 
-def test_bronze_candidate_defers_to_silver_without_record_conflict(monkeypatch):
-    _ceremony_env(monkeypatch)
-    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
-    record = MagicMock()
-    monkeypatch.setattr(
-        publication,
-        "_control_store",
-        lambda: SimpleNamespace(record_publication_candidate=record),
-    )
-    context = _context()
-    context["ti"].xcom_pull.return_value = {
-        "status": "success",
-        "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
-    }
-
-    result = publication.record_fotmob_bronze_only_candidate(
-        validation_task_id="validate_data",
-        silver_input_tables=["iceberg.bronze.fotmob_player_snapshots"],
-        **context,
-    )
-
-    assert result == {
-        "status": "silver_required",
-        "recorded": False,
-        "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
-    }
-    record.assert_not_called()
-
-
-def test_bronze_candidate_is_recorded_when_silver_is_disabled(monkeypatch):
-    # #1575: with Silver off, changed Silver inputs still seal bronze-only.
+def test_bronze_candidate_is_recorded_for_any_changed_bronze_input(monkeypatch):
+    # #1590: no Silver child exists, so every validated Bronze change seals
+    # the bronze-only candidate (the former ``silver_required`` path is gone).
     _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     record = MagicMock(return_value={"phase": "writing"})
@@ -2055,24 +1920,17 @@ def test_bronze_candidate_is_recorded_when_silver_is_disabled(monkeypatch):
         "status": "success",
         "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
     }
-    kwargs = {
-        "validation_task_id": "validate_data",
-        "silver_input_tables": ["iceberg.bronze.fotmob_player_snapshots"],
-    }
 
     result = publication.record_fotmob_bronze_only_candidate(
-        silver_enabled=False, **kwargs, **context
+        validation_task_id="validate_data", **context
     )
 
     assert result["candidate_kind"] == "bronze_only"
+    assert result["validated_bronze"]["bronze_inputs_changed"] == [
+        "iceberg.bronze.fotmob_player_snapshots"
+    ]
     assert record.call_count == 1
     assert record.call_args.args[1] == result
-    enabled = publication.record_fotmob_bronze_only_candidate(
-        silver_enabled=True, **kwargs, **context
-    )
-    assert enabled["status"] == "silver_required"
-    assert enabled["recorded"] is False
-    assert record.call_count == 1
 
 
 def test_xref_consumer_preflight_requires_full_active_claim(monkeypatch):
@@ -2158,7 +2016,7 @@ def test_master_rejects_failed_or_already_published_generation(
 
 
 def test_lost_child_response_never_releases_failed_writer(monkeypatch):
-    """A failed parent trigger may leave the exact Silver child still writing."""
+    """A failed writer task may leave its exact child still writing."""
 
     _ceremony_env(monkeypatch)
 
@@ -2170,14 +2028,14 @@ def test_lost_child_response_never_releases_failed_writer(monkeypatch):
         lambda: SimpleNamespace(fail_publication_generation=fail),
     )
     context = _context(
-        trigger_silver_transform="failed",
+        scrape_fotmob_data="failed",
         seal_fotmob_publication_ready="upstream_failed",
     )
 
     with pytest.raises(Exception, match="lock retained"):
         publication.fail_unsealed_fotmob_publication(
             success_task_id="seal_fotmob_publication_ready",
-            writer_task_ids=["trigger_silver_transform"],
+            writer_task_ids=["scrape_fotmob_data"],
             **context,
         )
     assert fail.call_args.kwargs["safe_to_release"] is False

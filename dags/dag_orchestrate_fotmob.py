@@ -37,7 +37,7 @@ SCHEDULER_STATE_VARIABLE = "fotmob.scheduler.state.v1"
 INGEST_DAG_ID = "dag_ingest_fotmob"
 OWNER_DAG_ID = "dag_orchestrate_fotmob"
 AUTOMATIC_ADMITTED_DAGS = frozenset(
-    {OWNER_DAG_ID, "dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+    {OWNER_DAG_ID, "dag_ingest_fotmob"}
 )
 LEGACY_PAUSED_DAGS = frozenset(
     {

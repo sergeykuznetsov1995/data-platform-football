@@ -5,7 +5,7 @@ The automatic owner deliberately retains the singleton publication lock when
 an Airflow trigger fails ambiguously.  This coordinator is the only production
 path that may release such a lock.  It first re-attests both live runtimes,
 pauses the exact six isolated DAGs, proves their metadata is idle, and checks
-the deterministic owner -> ingest -> Silver lineage.
+the deterministic owner -> ingest lineage.
 
 Two recoveries are intentionally narrow:
 
@@ -60,7 +60,6 @@ CONFIRM_RECOVERY = "RECOVER_FOTMOB_AUTOMATIC_PUBLICATION"
 
 OWNER_DAG_ID = "dag_orchestrate_fotmob"
 INGEST_DAG_ID = "dag_ingest_fotmob"
-SILVER_DAG_ID = "dag_transform_fotmob_silver"
 SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
 PUBLICATION_CONF_KEY = "fotmob_publication"
 SCHEDULER_STATE_VARIABLE = "fotmob.scheduler.state.v1"
@@ -76,13 +75,12 @@ FAILURE_BACKOFF = timedelta(minutes=30)
 ISOLATED_DAGS = (
     OWNER_DAG_ID,
     INGEST_DAG_ID,
-    SILVER_DAG_ID,
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
     "dag_collect_fotmob_players",
 )
-LEGACY_DAGS = frozenset(ISOLATED_DAGS[3:])
+LEGACY_DAGS = frozenset(ISOLATED_DAGS[2:])
 ACTIVE_PAUSE_STATES = {dag_id: dag_id in LEGACY_DAGS for dag_id in ISOLATED_DAGS}
 ALL_PAUSED_STATES = {dag_id: True for dag_id in ISOLATED_DAGS}
 SHARED_DOWNSTREAM_DAGS = (
@@ -612,7 +610,6 @@ DAGS={list(ISOLATED_DAGS)!r}
 ACTIVE_TI_STATES={ACTIVE_TASK_INSTANCE_STATES!r}
 OWNER={OWNER_DAG_ID!r}
 INGEST={INGEST_DAG_ID!r}
-SILVER={SILVER_DAG_ID!r}
 GENERATION={generation_id!r}
 PAUSE={pause!r}
 
@@ -711,7 +708,6 @@ try:
         owner_matches.append(payload)
 
     ingest=dag_run(session,INGEST,'fotmob_orchestrated__'+GENERATION)
-    silver=dag_run(session,SILVER,'fotmob_silver__'+GENERATION)
     default=json.dumps({{'next_background_lane':'refresh','daily_date':None,'generation':0,'updated_at':'1970-01-01T00:00:00+00:00'}},sort_keys=True,separators=(',',':'))
     scheduler=Variable.get({SCHEDULER_STATE_VARIABLE!r},default_var=default,deserialize_json=True)
     if isinstance(scheduler,str):
@@ -728,7 +724,6 @@ result={{
     'active_task_instances':active_tasks,
     'owner_matches':owner_matches,
     'ingest':ingest,
-    'silver':silver,
     'scheduler_state':scheduler,
     'atomic_metadata_transaction':True,
 }}
@@ -1144,8 +1139,6 @@ def _validate_owner_lineage(
     if ingest is None:
         if trigger_state == "success":
             raise RecoveryError("successful owner trigger has no deterministic ingest")
-        if snapshot.get("silver") is not None:
-            raise RecoveryError("Silver exists without its deterministic ingest")
         return dict(owner), dict(decision)
     if not isinstance(ingest, Mapping):
         raise RecoveryError("deterministic ingest lineage is malformed")
@@ -1161,21 +1154,6 @@ def _validate_owner_lineage(
     if not producer_failed and _normalize_state(ingest.get("state")) != "success":
         raise RecoveryError("ready generation has no successful deterministic ingest")
 
-    silver = snapshot.get("silver")
-    if silver is not None:
-        if (
-            not isinstance(silver, Mapping)
-            or silver.get("dag_id") != SILVER_DAG_ID
-            or silver.get("run_id") != f"fotmob_silver__{generation_id}"
-            or _normalize_state(silver.get("state")) not in TERMINAL_RUN_STATES
-            or not isinstance(silver.get("conf"), Mapping)
-            or silver["conf"].get(PUBLICATION_CONF_KEY) != expected_publication
-        ):
-            raise RecoveryError("deterministic Silver lineage differs")
-        if not producer_failed and _normalize_state(silver.get("state")) != "success":
-            raise RecoveryError(
-                "ready generation has no successful deterministic Silver"
-            )
     return dict(owner), dict(decision)
 
 

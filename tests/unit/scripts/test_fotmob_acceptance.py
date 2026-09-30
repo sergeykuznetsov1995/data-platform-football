@@ -134,7 +134,6 @@ def fake_lineage(**overrides):
         "generation_id": RUNNER_RUN_ID,
         "runner_run_id": RUNNER_RUN_ID,
         "ingest_run_id": "issue930_replay_a1__" + RUNNER_RUN_ID.replace("-", ""),
-        "silver_run_id": f"fotmob_silver__{RUNNER_RUN_ID}",
         "plan_signature": PLAN_SIGNATURE,
         "completed_since": COMPLETED_SINCE,
         "scope_artifact": str(mod.APPROVED_SCOPE_ARTIFACT.resolve()),
@@ -142,7 +141,6 @@ def fake_lineage(**overrides):
         "scope_count": mod.APPROVED_SCOPE_COUNT,
         "entities": mod.ISSUE_930_SCOPE_ENTITIES,
         "candidate_digest": "d" * 64,
-        "candidate_transform_task_ids": ("transform_a", "transform_b"),
         "publication_binding": {
             "schema": mod.PUBLICATION_SCHEMA,
             "source": "fotmob",
@@ -156,36 +154,18 @@ def fake_lineage(**overrides):
     return mod.AcceptanceLineage(**values)
 
 
-def full_live_candidate(generation_id, task_ids=("transform_a", "transform_b")):
-    evidence = {
+def full_live_candidate(generation_id):
+    unsigned = {
         "schema": mod.PUBLICATION_SCHEMA,
         "generation_id": generation_id,
-        "transform_task_ids": list(task_ids),
-        "transform_results": {
-            task_id: {
-                "status": "success",
-                "table": f"iceberg.silver.{task_id}",
-                "rows": index + 10,
-            }
-            for index, task_id in enumerate(task_ids)
-        },
-        "row_count_gate": {
-            "status": "success",
-            "warnings": [],
-            "details": {task_id: index + 10 for index, task_id in enumerate(task_ids)},
-            "total_rows": 21,
-        },
-        "quality_gate": {
-            "passed": 4,
-            "total": 5,
-            "errors": [],
-            "warnings": ["freshness_warning"],
-        },
+        "candidate_kind": "bronze_only",
+        "validation_task_id": "validate_data",
+        "validated_bronze": {"status": "success", "run_id": generation_id},
     }
-    evidence["digest"] = hashlib.sha256(
-        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    return evidence
+    return {**unsigned, "digest": digest}
 
 
 def write_lifecycle_report(tmp_path, options, *, mutate=None):
@@ -209,12 +189,11 @@ def write_lifecycle_report(tmp_path, options, *, mutate=None):
     generation_id = mod._publication_generation_id(binding)
     compact = generation_id.replace("-", "")
     ingest_run_id = f"issue930_{mode}_a{attempt}__{compact}"
-    silver_run_id = f"fotmob_silver__{generation_id}"
     live_candidate = full_live_candidate(generation_id)
     candidate = {
         "generation_id": generation_id,
         "digest": live_candidate["digest"],
-        "transform_task_ids": live_candidate["transform_task_ids"],
+        "transform_task_ids": None,
     }
     report = {
         "schema_version": mod.LIFECYCLE_SCHEMA_VERSION,
@@ -245,8 +224,6 @@ def write_lifecycle_report(tmp_path, options, *, mutate=None):
         "runs": {
             "ingest_dag_id": mod.INGEST_DAG_ID,
             "ingest_run_id": ingest_run_id,
-            "silver_dag_id": mod.SILVER_DAG_ID,
-            "silver_run_id": silver_run_id,
             "native_runner_run_id": generation_id,
         },
         "publication_action": "abandon_unclaimed_candidate",
@@ -257,11 +234,6 @@ def write_lifecycle_report(tmp_path, options, *, mutate=None):
             "start_date": (deployed_at + timedelta(minutes=5))
             .astimezone(timezone.utc)
             .isoformat(),
-        },
-        "silver_terminal": {
-            "dag_id": mod.SILVER_DAG_ID,
-            "run_id": silver_run_id,
-            "state": "success",
         },
         "validation": {
             "run_id": generation_id,
@@ -299,10 +271,7 @@ def live_publication_reader(report):
             "status": "succeeded",
             "phase": "abandoned",
             "binding": report["publication"]["binding"],
-            "candidate": full_live_candidate(
-                report["publication"]["generation_id"],
-                report["candidate"]["transform_task_ids"],
-            ),
+            "candidate": full_live_candidate(report["publication"]["generation_id"]),
             "consumer": None,
             "owner_dag_id": mod.PUBLICATION_OWNER_DAG_ID,
             "active": False,
@@ -454,13 +423,6 @@ class FakeParityClient:
             ]
         if ":roster:legacy" in sql:
             return [("1", str(index)) for index in range(1, 11)]
-        if "parity:transfers:silver" in sql:
-            return [
-                ("1", "2", "3", "2026-07-01", "ENG-Premier League"),
-                ("4", "5", "6", "2026-07-02", "ENG-Premier League"),
-            ]
-        if "parity:transfers:legacy" in sql:
-            return [("1", "2", "3", "2026-07-01", "ENG-Premier League")]
         if ":native" in sql or ":legacy" in sql:
             return [("101",), ("102",)]
         raise AssertionError(f"unexpected SQL: {sql}")
@@ -593,7 +555,6 @@ def test_runtime_binding_rejects_pending_trigger_activation(tmp_path):
             "paused": ["dag_trigger_fotmob_daily"],
             "unpaused": [
                 "dag_ingest_fotmob",
-                "dag_transform_fotmob_silver",
             ],
         }
     )
@@ -797,12 +758,9 @@ def test_live_publication_must_match_report_candidate_and_release(tmp_path):
         "schema": mod.PUBLICATION_SCHEMA,
         "generation_id": lineage.generation_id,
         "digest": lineage.candidate_digest,
-        "transform_task_ids": ["transform_a", "transform_b"],
-        "transform_count": 2,
-        "row_count_status": "success",
-        "row_count_total": 21,
-        "quality_passed": 4,
-        "quality_total": 5,
+        "candidate_kind": "bronze_only",
+        "transform_task_ids": [],
+        "transform_count": 0,
     }
     state["candidate"] = {**state["candidate"], "digest": "0" * 64}
 
@@ -815,87 +773,46 @@ def test_live_candidate_rejects_extra_missing_tamper_and_bad_semantics():
     candidate = full_live_candidate(lineage.generation_id)
     lineage = replace(lineage, candidate_digest=candidate["digest"])
 
+    assert mod._validate_live_candidate(candidate, lineage)["candidate_kind"] == (
+        "bronze_only"
+    )
+
     extra = {**candidate, "unexpected": True}
     with pytest.raises(ValueError, match="fields are not exact"):
         mod._validate_live_candidate(extra, lineage)
 
     missing = dict(candidate)
-    missing.pop("quality_gate")
+    missing.pop("validated_bronze")
     with pytest.raises(ValueError, match="fields are not exact"):
         mod._validate_live_candidate(missing, lineage)
 
     tampered = json.loads(json.dumps(candidate))
-    tampered["transform_results"]["transform_a"]["rows"] = 999
+    tampered["validated_bronze"]["run_id"] = "other"
     with pytest.raises(ValueError, match="digest differs"):
         mod._validate_live_candidate(tampered, lineage)
 
     bad_semantics = json.loads(json.dumps(candidate))
-    bad_semantics["quality_gate"]["errors"] = ["broken uniqueness gate"]
+    bad_semantics["validated_bronze"]["status"] = "failed"
     unsigned = {key: value for key, value in bad_semantics.items() if key != "digest"}
     bad_semantics["digest"] = hashlib.sha256(
         json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     bad_lineage = replace(lineage, candidate_digest=bad_semantics["digest"])
-    with pytest.raises(ValueError, match="quality gate is not clean"):
+    with pytest.raises(ValueError, match="bronze-only candidate identity"):
         mod._validate_live_candidate(bad_semantics, bad_lineage)
 
 
-def _resigned(candidate, lineage):
-    unsigned = {key: value for key, value in candidate.items() if key != "digest"}
-    candidate["digest"] = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    return candidate, replace(lineage, candidate_digest=candidate["digest"])
-
-
-def test_live_candidate_accepts_non_blocking_quality_gate_while_silver_is_frozen():
-    # #1312: пока silver заморожен, DQ пишет ошибки как предупреждения и метит
-    # гейт ``blocking: False``. Приёмка обязана принять такого кандидата —
-    # иначе автомат доставки откатит ночной выкат.
-    lineage = fake_lineage()
-    candidate = full_live_candidate(lineage.generation_id)
-    candidate["quality_gate"] = {
-        "passed": 3,
-        "total": 5,
-        "errors": ["no_duplicates[silver.fotmob_lineup]"],
-        "warnings": ["freshness_warning"],
-        "blocking": False,
-    }
-    candidate, lineage = _resigned(candidate, lineage)
-
-    summary = mod._validate_live_candidate(candidate, lineage)
-
-    assert summary["quality_passed"] == 3
-    assert summary["quality_total"] == 5
-
-
-def test_live_candidate_still_rejects_errors_when_gate_declares_itself_blocking():
-    lineage = fake_lineage()
-    candidate = full_live_candidate(lineage.generation_id)
-    candidate["quality_gate"] = {
-        "passed": 3,
-        "total": 5,
-        "errors": ["no_duplicates[silver.fotmob_lineup]"],
-        "warnings": ["freshness_warning"],
-        "blocking": True,
-    }
-    candidate, lineage = _resigned(candidate, lineage)
-
-    with pytest.raises(ValueError, match="quality gate is not clean"):
-        mod._validate_live_candidate(candidate, lineage)
-
-
-def test_live_candidate_fields_match_the_evidence_the_silver_dag_records():
+def test_live_candidate_fields_match_the_evidence_the_ingest_dag_records():
     # Контракт между писателем кандидата и приёмкой: состав полей сверяется
     # точным множеством, поэтому новый ключ в evidence ломает доставку (#1312).
     from utils import fotmob_publication
 
     source = Path(fotmob_publication.__file__).read_text(encoding="utf-8")
-    body = source.split("def record_fotmob_silver_candidate(", 1)[1]
+    body = source.split("def record_fotmob_bronze_only_candidate(", 1)[1]
     body = body.split("\n    evidence = {", 1)[1].split("}", 1)[0]
     written = {line.split('"')[1] for line in body.splitlines() if '":' in line}
 
-    assert written | {"digest"} == set(mod.LIVE_CANDIDATE_FIELDS)
+    assert written | {"digest"} == set(mod.BRONZE_ONLY_CANDIDATE_FIELDS)
 
 
 def test_live_publication_reader_uses_admitted_scheduler(tmp_path):
@@ -1104,13 +1021,12 @@ def test_scope_completion_rejects_mixed_runner_lineage():
     assert not any("acceptance:scope-coverage:" in sql for sql in client.sql)
 
 
-def test_parity_requires_exact_sets_roster_90_percent_and_transfer_preservation():
+def test_parity_requires_exact_sets_and_roster_90_percent():
     report = mod.parity(
         FakeParityClient(),
         [scope()],
         catalog="iceberg",
         bronze_schema="bronze",
-        silver_schema="silver",
         parser_version="fotmob-native-v2",
         lineage=fake_lineage(),
     )
@@ -1119,9 +1035,8 @@ def test_parity_requires_exact_sets_roster_90_percent_and_transfer_preservation(
     roster = by_name["47=2025/2026:roster"]
     assert roster["details"]["legacy_coverage"] == 0.9
     assert roster["details"]["only_legacy"] == 1
-    transfers = by_name["silver_transfer_legacy_identity_preservation"]
-    assert transfers["details"]["legacy_coverage"] == 1.0
-    assert transfers["details"]["only_native"] == 1
+    # #1590: the legacy Silver transfer-preservation check is removed.
+    assert "silver_transfer_legacy_identity_preservation" not in by_name
 
 
 def test_main_writes_valid_red_json_and_nonzero_on_missing_sql(tmp_path):
@@ -1674,42 +1589,6 @@ def test_verify_fails_closed_and_reports_a_real_payload_gap():
     assert check["details"]["scopes"][0]["reason"] == "finished_payload_gap"
 
 
-@pytest.fixture(autouse=True)
-def _silver_enabled_contract(monkeypatch):
-    """#1575: tests above pin the Silver-enabled contract; the disabled
-    (bronze-only) branch is covered by the ``*_silver_disabled_*`` tests."""
-
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", True)
-
-
-def _bronze_only_live_candidate(generation_id):
-    unsigned = {
-        "schema": mod.PUBLICATION_SCHEMA,
-        "generation_id": generation_id,
-        "candidate_kind": "bronze_only",
-        "validation_task_id": "validate_data",
-        "validated_bronze": {"status": "success", "run_id": generation_id},
-    }
-    digest = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    return {**unsigned, "digest": digest}
-
-
-def _bronze_only_lifecycle(report):
-    generation_id = report["publication"]["generation_id"]
-    candidate = {
-        "generation_id": generation_id,
-        "digest": _bronze_only_live_candidate(generation_id)["digest"],
-        "transform_task_ids": None,
-    }
-    report["silver_terminal"] = None
-    report["candidate"] = candidate
-    report["publication_state"]["candidate"] = candidate
-
-
 def _load_lineage(tmp_path, mutate):
     options = runtime_options(tmp_path)
     lifecycle_path, report = write_lifecycle_report(tmp_path, options, mutate=mutate)
@@ -1729,47 +1608,20 @@ def _load_lineage(tmp_path, mutate):
     return lineage, report, context
 
 
-def test_lifecycle_silver_disabled_accepts_bronze_only_generation(
-    tmp_path, monkeypatch
-):
-    # #1575: a bronze-only lifecycle (no Silver child) is valid while Silver is off.
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
-    lineage, report, _context = _load_lineage(tmp_path, _bronze_only_lifecycle)
-    assert lineage.candidate_transform_task_ids == ()
-
-    state = {
-        "generation_id": lineage.generation_id,
-        "source": "fotmob",
-        "status": "succeeded",
-        "phase": "abandoned",
-        "binding": report["publication"]["binding"],
-        "candidate": _bronze_only_live_candidate(lineage.generation_id),
-        "consumer": None,
-        "owner_dag_id": mod.PUBLICATION_OWNER_DAG_ID,
-        "active": False,
-        "lock_active": False,
-        "released_at": "2026-07-21T11:00:00Z",
-    }
-    evidence = mod.validate_live_publication_state(state, lineage)
-    assert evidence["candidate"]["candidate_kind"] == "bronze_only"
-
-    state["candidate"] = {**state["candidate"], "validation_task_id": "other"}
-    with pytest.raises(ValueError, match="bronze-only candidate identity"):
-        mod.validate_live_publication_state(state, lineage)
+def _legacy_silver_lifecycle(report):
+    generation_id = report["publication"]["generation_id"]
+    report["runs"]["silver_dag_id"] = "dag_transform_fotmob_silver"
+    report["runs"]["silver_run_id"] = f"fotmob_silver__{generation_id}"
 
 
-def test_lifecycle_silver_disabled_still_accepts_silver_generation(
-    tmp_path, monkeypatch
-):
-    from scrapers.fotmob import constants as fotmob_constants
-
-    monkeypatch.setattr(fotmob_constants, "FOTMOB_SILVER_ENABLED", False)
-    lineage, _report, _context = _load_lineage(tmp_path, None)
-    assert lineage.candidate_transform_task_ids == ("transform_a", "transform_b")
+def _legacy_silver_candidate(report):
+    candidate = {**report["candidate"], "transform_task_ids": ["transform_a"]}
+    report["candidate"] = candidate
+    report["publication_state"]["candidate"] = candidate
 
 
-def test_lifecycle_silver_enabled_rejects_bronze_only_generation(tmp_path):
-    with pytest.raises(ValueError, match="silver_terminal|terminal"):
-        _load_lineage(tmp_path, _bronze_only_lifecycle)
+@pytest.mark.parametrize("mutate", [_legacy_silver_lifecycle, _legacy_silver_candidate])
+def test_lifecycle_rejects_legacy_silver_generation(tmp_path, mutate):
+    # #1590: a lifecycle that still carries a Silver child is no longer valid.
+    with pytest.raises(ValueError, match="identities differ|candidate identity"):
+        _load_lineage(tmp_path, mutate)

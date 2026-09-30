@@ -4,7 +4,8 @@
 This coordinator is intentionally limited to an isolated deployment admitted
 with ``deploy.py --keep-paused``.  It acquires one synthetic publication
 generation, triggers the parent ingest DAG (never a writer child directly),
-waits for its exact Silver child, then abandons the unclaimed ready candidate.
+waits for its bronze-only candidate, then abandons the unclaimed ready
+candidate.
 
 Every identity is written durably before the corresponding external action.
 After Airflow acknowledges a trigger, an absent or non-terminal DagRun is
@@ -94,7 +95,6 @@ CONFIRM_RECOVER_AUTOMATIC_CANARY = "RECOVER_FOTMOB_AUTOMATIC_CANARY"
 PUBLICATION_OWNER_DAG_ID = "fotmob_issue_930_backfill"
 PUBLICATION_TTL_SECONDS = 14 * 24 * 60 * 60
 INGEST_DAG_ID = "dag_ingest_fotmob"
-SILVER_DAG_ID = "dag_transform_fotmob_silver"
 DAILY_DAG_ID = "dag_trigger_fotmob_daily"
 AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
 REFRESH_DAG_ID = "dag_refresh_fotmob"
@@ -105,7 +105,6 @@ PLAYER_COLLECTOR_DAG_ID = "dag_collect_fotmob_players"
 DAGS = (
     AUTOMATIC_OWNER_DAG_ID,
     INGEST_DAG_ID,
-    SILVER_DAG_ID,
     DAILY_DAG_ID,
     REFRESH_DAG_ID,
     BACKFILL_DAG_ID,
@@ -613,7 +612,6 @@ def _load_source_refresh_prerequisite(
         or not isinstance(ingest_terminal, Mapping)
         or ingest_terminal.get("run_id") != runs.get("ingest_run_id")
         or str(ingest_terminal.get("state") or "").casefold() != "failed"
-        or report.get("silver_terminal") is not None
         or not isinstance(publication_state, Mapping)
         or publication_state.get("generation_id") != generation_id
         or publication_state.get("active") is not False
@@ -1112,7 +1110,7 @@ def _candidate(
         or candidate.get("generation_id") != publication["generation_id"]
         or re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("digest") or "")) is None
     ):
-        raise BackfillError("publication does not contain the exact Silver candidate")
+        raise BackfillError("publication does not contain the exact Bronze candidate")
     return candidate
 
 
@@ -1284,8 +1282,6 @@ def _run_ids(publication: Mapping[str, Any], mode: str, attempt: int) -> dict[st
     return {
         "ingest_dag_id": INGEST_DAG_ID,
         "ingest_run_id": f"{prefix}_a{attempt}__{compact}",
-        "silver_dag_id": SILVER_DAG_ID,
-        "silver_run_id": f"fotmob_silver__{publication['generation_id']}",
         "native_runner_run_id": str(publication["generation_id"]),
     }
 
@@ -1429,9 +1425,7 @@ def _resolve_quiet_generation(
 ) -> dict[str, Any]:
     ids = report["runs"]
     ingest = _exact_run(args, INGEST_DAG_ID, ids["ingest_run_id"], run=run)
-    silver = _exact_run(args, SILVER_DAG_ID, ids["silver_run_id"], run=run)
     ingest_state = str((ingest or {}).get("state") or "").casefold()
-    silver_state = str((silver or {}).get("state") or "").casefold()
     state = _get_publication(args, str(publication["generation_id"]), run=run)
 
     if ingest is None:
@@ -1463,7 +1457,6 @@ def _resolve_quiet_generation(
         )
 
     report["ingest_terminal"] = dict(ingest)
-    report["silver_terminal"] = None if silver is None else dict(silver)
     if ingest_state == "failed":
         if state is None:
             raise BackfillError("failed ingest lost its publication generation")
@@ -1485,21 +1478,12 @@ def _resolve_quiet_generation(
         raise BackfillError(
             f"exact ingest run is not terminal: state={ingest_state or 'absent'!r}"
         )
-    # #1575: with Silver switched off the successful ingest seals a
-    # bronze-only candidate and no exact Silver child may exist.
-    bronze_only = silver is None and not runtime_binding.fotmob_silver_enabled()
-    if silver_state != "success" and not bronze_only:
-        raise BackfillError(
-            "successful ingest has no successful exact Silver child; lock retained"
-        )
     if state is None:
         raise BackfillError("successful ingest lost its publication generation")
 
     candidate = _candidate(state, publication)
-    if bronze_only and candidate.get("candidate_kind") != "bronze_only":
-        raise BackfillError(
-            "Silver is disabled but the publication candidate is not bronze-only"
-        )
+    if candidate.get("candidate_kind") != "bronze_only":
+        raise BackfillError("the publication candidate is not bronze-only")
     validation_payload = _validation_xcom(args, ids["ingest_run_id"], run=run)
     validation = _validation_summary(
         validation_payload,
@@ -1542,8 +1526,6 @@ def _resolve_quiet_generation(
             "generation_id": str(publication["generation_id"]),
             "ingest_run_id": ids["ingest_run_id"],
             "ingest_run_state": ingest_state,
-            "silver_run_id": ids["silver_run_id"],
-            "silver_run_state": silver_state,
             "candidate_digest": candidate["digest"],
             "runner_report_sha256": runner_sha,
             "runner_report_bytes": runner_bytes,
@@ -1703,9 +1685,7 @@ def run_backfill(
     trigger_confirmed = False
     operation_error: str | None = None
     try:
-        # Silver must be schedulable before its parent starts waiting.  The
-        # daily schedule owner remains paused throughout this operation.
-        _airflow(args, "dags", "unpause", SILVER_DAG_ID, run=run)
+        # The daily schedule owner remains paused throughout this operation.
         _airflow(args, "dags", "unpause", INGEST_DAG_ID, run=run)
         conf = {
             "fotmob_publication": publication,

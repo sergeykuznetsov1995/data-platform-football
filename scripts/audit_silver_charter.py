@@ -76,7 +76,6 @@ SANCTIONED: dict[str, tuple[str, str]] = {
     # is now COMPLIANT (season-from-season conform, not a match→season rollup —
     # R1 detector refined to require a match/event source).
     'whoscored_player_season_aggregate': ('EXCEPTION', 'player season-rollup feeding Gold; migration #370 PR2'),
-    'fotmob_player_season_profile': ('EXCEPTION', 'PIVOT of season-grain Bronze; reclassify in #370 PR2'),
     # sofascore_team_match: resolved #367 — cross-entity minutes/assists rollup
     # moved out; now a clean single-source conform (PIVOT match_stats + schedule). COMPLIANT.
     # #382 DONE: the 2 cross-source E3/E4 facts (match_cards, match_substitutions)
