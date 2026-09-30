@@ -146,8 +146,8 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         <= module.REFRESH_DAGRUN_TIMEOUT
     )
     assert not hasattr(module, "REFRESH_BATCH_FITS")
-    assert module.REFRESH_BATCH_SIZE == 64
-    assert module.REFRESH_SECONDS_PER_MATCH == 25
+    assert module.REFRESH_BATCH_SIZE == 128
+    assert module.REFRESH_SECONDS_PER_MATCH == 15
 
     run = operators["run_refresh_scope"]
     assert run.is_mapped
@@ -246,7 +246,7 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     # the shared window decides how many actually go.
     assert kwargs["batch_size"] == 3
     assert kwargs["scope_budget_s"] == 2 * 3600
-    assert kwargs["seconds_per_match"] == 25
+    assert kwargs["seconds_per_match"] == 15
     assert kwargs["result_dir"] == "/tmp/refresh"
     assert kwargs["task_env"] == {
         "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-refresh:8080"
@@ -338,9 +338,9 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
         ("SS-17", "2627", 4, 1_787_788_800)
     ]
     assert kwargs["exclude_tournament_ids"] == frozenset({17, 8})
-    # #1358: the batch size (64) is only the upper bound on the number of
+    # #1358: the batch size (128) is only the upper bound on the number of
     # scopes; the planner fills the 2 h scope window by their estimates.
-    assert kwargs["batch_size"] == 64
+    assert kwargs["batch_size"] == 128
     assert kwargs["scope_budget_s"] == 7200
     assert kwargs["dag_run_id"] == "manual__1"
     assert kwargs["snapshot_path"] == module.SNAPSHOT_PATH
