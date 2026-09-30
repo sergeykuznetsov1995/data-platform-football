@@ -64,6 +64,21 @@ _MALFORMED_FAIL_SHARE = 0.5
 # a pattern; a slice that serves nothing at all is caught by the lane's
 # ``idle_runs`` guard instead (Sol round 24).
 _FAIL_MIN_TARGETS = 2
+# #1359: a season whose page the source refuses (403, or a 5xx that outlived
+# the client's retries) costs that season, not the run: it is rolled back like
+# a broken page and counted in ``failed``.  This many refusals IN A ROW are the
+# source refusing the lane, not one season — the walk stops there, as any other
+# transport failure does, instead of paying for every target of the slice.
+_FAILED_STREAK_LIMIT = 3
+
+
+def _is_target_failure(exc: DiscoveryHTTPError) -> bool:
+    """Whether an HTTP failure belongs to one season rather than to the run."""
+
+    status = exc.status_code
+    return status is not None and (status == 403 or 500 <= status <= 599)
+
+
 # How far a resumed chain may step back when the source has repacked its pages
 # under it: three pages is ~90 matches of overlap, far more than a repack drops.
 MAX_BACKTRACK_PAGES = 3
@@ -154,18 +169,29 @@ def fetch_season_fixtures(
     fetched: list[FetchedEvent] = []
     counters = {
         "targets": 0, "pages": 0, "events": 0, "missing": 0, "foreign_season": 0,
-        "truncated": 0, "malformed": 0,
+        "truncated": 0, "malformed": 0, "failed": 0,
     }
+    failed_streak = 0
     for tournament_id, season_id in targets:
         counters["targets"] += 1
         path = fixture_page_path(tournament_id, season_id)
         try:
             body, payload = client.get_json_bytes(path)
         except DiscoveryHTTPError as exc:
-            if exc.status_code != 404:
+            if exc.status_code == 404:
+                counters["missing"] += 1
+                failed_streak = 0
+                continue
+            if not _is_target_failure(exc):
                 raise
-            counters["missing"] += 1
+            # #1359: one refused calendar costs its season, not the class.
+            counters["failed"] += 1
+            failed_streak += 1
+            if failed_streak >= _FAILED_STREAK_LIMIT:
+                raise
+            log.warning("calendar page refused, skipping: %s", exc)
             continue
+        failed_streak = 0
         record = raw_store.store_bytes(
             PayloadTarget(
                 source_tournament_id=str(int(tournament_id)),
@@ -254,6 +280,7 @@ def empty_schedule_counters() -> dict[str, int]:
         "missing_expected": 0, "empty_expected": 0, "truncated": 0,
         "foreign_season": 0, "resumed": 0, "chased": 0, "malformed": 0,
         "chase_settled": 0, "backtracked": 0, "malformed_resumed": 0,
+        "failed": 0,
     }
 
 
@@ -311,8 +338,10 @@ def fetch_season_schedules(
     disables the check outright for a slice where absences are the normal
     answer — the
     seed slice is full of seasons that have not kicked off, and failing it would
-    freeze the cursor on them forever.  Any other transport failure propagates:
-    it is a property of the run, not of the season.
+    freeze the cursor on them forever.  A season the source refuses (403 or a
+    5xx, #1359) is dropped and counted in ``failed``; ``_FAILED_STREAK_LIMIT``
+    refusals in a row, and any other transport failure, propagate: they are a
+    property of the run, not of the season.
 
     ``schedule_last`` is the season's own page, so an event of another season
     (the source occasionally carries a neighbour's tail) is dropped and counted
@@ -334,6 +363,7 @@ def fetch_season_schedules(
     # that reads "1 of 1" and fails the lane outright (Sol round 23).
     resumed_targets = 0
     resumed_malformed = 0
+    failed_streak = 0
     # Broken pages of seasons that OWED one, which is the only population the
     # combined threshold below may count: it is measured against ``expected``,
     # and counting a season the source owes nothing against that denominator let
@@ -533,6 +563,27 @@ def fetch_season_schedules(
                 expected_malformed += 1
             log.warning("season page breaks its contract, skipping: %s", exc)
             continue
+        except DiscoveryHTTPError as exc:
+            if not _is_target_failure(exc):
+                raise
+            # #1359: the source refused this season (403 in ``overdue`` froze
+            # the whole lane on 27.09).  It is dropped exactly like a broken
+            # page above — rows, counters, and a resumed chain back on the
+            # queue at the page it owes, where the caller ages it out — and the
+            # walk goes on to the next season.  A refusal streak is the source
+            # refusing the lane, and stops the walk as before.
+            del fetched[collected:]
+            counters.clear()
+            counters.update(counters_before)
+            counters["failed"] += 1
+            failed_streak += 1
+            if failed_streak >= _FAILED_STREAK_LIMIT:
+                raise
+            if owed_page:
+                incomplete.append((pair[0], pair[1], owed_page, anchor))
+            log.warning("season page refused, skipping: %s", exc)
+            continue
+        failed_streak = 0
         if bounded:
             counters["truncated"] += 1
             incomplete.append((pair[0], pair[1], stop, chain_oldest or 0))

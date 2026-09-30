@@ -191,7 +191,7 @@ def test_fetch_stores_every_season_page_and_returns_events_with_lineage(tmp_path
         "targets": 3, "expected": 3, "pages": 3, "events": 5, "missing": 0,
         "missing_expected": 0, "empty_expected": 0, "truncated": 0,
         "foreign_season": 1, "resumed": 0, "chased": 0, "chase_settled": 0,
-        "backtracked": 0, "malformed": 0, "malformed_resumed": 0,
+        "backtracked": 0, "malformed": 0, "malformed_resumed": 0, "failed": 0,
     }
     first = fetched[0].raw
     assert first.endpoint == SCHEDULE_PAGE_ENDPOINT
@@ -710,6 +710,9 @@ def test_a_slice_where_every_season_is_absent_can_be_tolerated(tmp_path):
 
 
 def test_fetch_propagates_a_transport_failure_that_is_not_a_missing_season(tmp_path):
+    # #1359: a refused season is skipped (below), but a streak of refusals is
+    # the source refusing the lane, and a failure without an HTTP status is the
+    # transport itself — both are a property of the run and still propagate.
     client = _Client({})
 
     def explode(path):
@@ -718,7 +721,66 @@ def test_fetch_propagates_a_transport_failure_that_is_not_a_missing_season(tmp_p
     client.get_json_bytes = explode
 
     with pytest.raises(DiscoveryHTTPError, match="gateway"):
+        fetch_season_schedules(
+            client, [READY_TARGET, CONFIGURED_TARGET, PREVIOUS_TARGET],
+            _store(tmp_path),
+        )
+
+    def lease_lost(path):
+        raise DiscoveryHTTPError("lease closed")
+
+    client.get_json_bytes = lease_lost
+    with pytest.raises(DiscoveryHTTPError, match="lease"):
         fetch_season_schedules(client, [READY_TARGET], _store(tmp_path))
+
+
+def test_fetch_skips_a_refused_season_and_walks_the_rest(tmp_path):
+    # #1359 (27.09): one 403 on the first ``overdue`` page failed the whole
+    # sweep, and with it every class and every scope of the run.  The refused
+    # season is dropped and counted; the next one is still walked.
+    payloads = _sweep_payloads()
+    refused = schedule_page_path(*READY_TARGET)
+
+    class _Refusing(_Client):
+        def get_json(self, path):
+            if path == refused:
+                self.paths.append(path)
+                raise DiscoveryHTTPError(
+                    f"metered browser request failed: HTTP 403 {path}",
+                    status_code=403,
+                )
+            return super().get_json(path)
+
+    client = _Refusing(payloads)
+    fetched, counters, incomplete = fetch_season_schedules(
+        client, [READY_TARGET, CONFIGURED_TARGET, PREVIOUS_TARGET],
+        _store(tmp_path),
+    )
+
+    assert client.paths == list(payloads)
+    assert counters["failed"] == 1 and counters["targets"] == 3
+    assert counters["pages"] == 2
+    assert fetched
+    assert all(
+        item.raw.source_season_id != str(READY_TARGET[1]) for item in fetched
+    )
+    assert incomplete == []
+
+
+def test_a_refused_resumed_chain_goes_back_on_the_queue(tmp_path):
+    # A resumed chain owes a page nothing else asks for: a refusal must put it
+    # back where it was, so the caller counts the attempt and ages it out.
+    class _Refusing(_Client):
+        def get_json(self, path):
+            raise DiscoveryHTTPError("HTTP 403", status_code=403)
+
+    _, counters, incomplete = fetch_season_schedules(
+        _Refusing({}), [READY_TARGET], _store(tmp_path),
+        start_pages={READY_TARGET: 3}, resume_anchors={READY_TARGET: 77},
+    )
+
+    assert counters["failed"] == 1
+    assert incomplete == [(READY_TARGET[0], READY_TARGET[1], 3, 77)]
 
 
 def test_fetch_rejects_a_page_without_events_after_keeping_the_raw_evidence(
@@ -1092,7 +1154,7 @@ def test_fixture_pages_are_stored_under_their_own_endpoint_with_lineage(tmp_path
     assert [item.event["id"] for item in fetched] == [11, 13]
     assert counters == {
         "targets": 2, "pages": 2, "events": 3, "missing": 0, "foreign_season": 1,
-        "truncated": 0, "malformed": 0,
+        "truncated": 0, "malformed": 0, "failed": 0,
     }
     record = fetched[0].raw
     # The calendar is its OWN endpoint: sharing ``schedule_last``'s target id
@@ -1157,9 +1219,15 @@ def test_a_calendar_that_is_not_a_page_is_skipped_but_transport_still_fails(tmp_
         def get_json(self, path):
             raise DiscoveryHTTPError("HTTP 503", status_code=503)
 
+    # #1359: one refused calendar costs its season; a streak of them is the
+    # source refusing the lane and propagates.
+    _, counters = fetch_season_fixtures(
+        _Boom({}), [READY_TARGET], _store(tmp_path)
+    )
+    assert counters["failed"] == 1 and counters["pages"] == 0
     with pytest.raises(DiscoveryHTTPError):
         fetch_season_fixtures(
-            _Boom({fixture_page_path(*READY_TARGET): {}}), [READY_TARGET],
+            _Boom({}), [READY_TARGET, CONFIGURED_TARGET, PREVIOUS_TARGET],
             _store(tmp_path),
         )
 
