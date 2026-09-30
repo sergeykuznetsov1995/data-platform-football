@@ -19,6 +19,12 @@ SELF="${BASH_SOURCE[0]}"
 UNDERSTAT_PATHS="scrapers/understat dags/dag_ingest_understat.py dags/dag_backfill_understat.py dags/utils/understat_tasks.py dags/scripts/run_understat_scraper.py"
 # Общие модули, которые импортируют файлы Understat (с транзитивными: default_args → alerts, config → medallion_config).
 SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__init__.py dags/utils/config.py dags/utils/default_args.py dags/utils/alerts.py dags/utils/medallion_config.py"
+# Разрешённое отставание общих модулей (решение владельца 30.09, #1594): «путь=git-blob» — бой может
+# побайтно равняться этому blob вместо master. Только файлы из SHARED_PATHS; состав не ослабляется.
+# Все три — версии принятой базы 8b61969: alerts.py до #1477 (доставка отложена до #1489), config.py
+# и medallion_config.py до #1590. Тест tests/unit/deploy/test_understat_shared_lag.py падает, если в
+# master разойдётся то, что берёт Understat. Удалить запись, когда файл в бою станет = master — README.
+ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008 dags/utils/config.py=221a12711ca7651274d22e3539a4b3b20b7284bf dags/utils/medallion_config.py=697fe43d6eb46e49c4246780f2cba59fabf87e4d"
 # Порядок записи файлов вне scrapers/understat/ — импортируемые раньше импортирующих.
 DAG_ORDER="dags/utils/understat_tasks.py dags/scripts/run_understat_scraper.py dags/dag_backfill_understat.py dags/dag_ingest_understat.py"
 DAGS="dag_ingest_understat dag_backfill_understat"
@@ -161,14 +167,22 @@ ACC=$(cat "$ACCEPTED_F" 2>/dev/null)
   || stop "автомат не знает базы: $ACCEPTED_F пуст/не SHA/нет такого коммита — посей руками (README)"
 [ "$(md5sum < "$SELF" | cut -c1-32)" = "$(g show "$SHA:deploy/understat/auto_deliver.sh" 2>/dev/null | md5sum | cut -c1-32)" ] \
   || stop "копия автомата отстала от master ${SHA:0:7}, переустанови: cp из master (README)"
+LAGGED=""
 for f in $(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS); do
-  g show "$SHA:$f" | cmp -s - "$TREE/$f" || stop "ОТМЕНА: общий модуль $f в бою ≠ master ${SHA:0:7}"
+  g show "$SHA:$f" | cmp -s - "$TREE/$f" && continue
+  blob=$(g hash-object --no-filters "$TREE/$f" 2>/dev/null)
+  if [ -n "$blob" ] && [[ " $ALLOWED_LAG " == *" $f=$blob "* ]]; then LAGGED="$LAGGED $f=${blob:0:8}"; continue; fi
+  stop "ОТМЕНА: общий модуль $f в бою ≠ master ${SHA:0:7}"
 done
 # Состав тоже: удалённый в master или лишний в бою общий модуль (без __pycache__/.pyc) — та же отмена.
 EXTRA=$(comm -13 <(g ls-tree -r --name-only "$SHA" -- $SHARED_PATHS | LC_ALL=C sort -u) \
   <(cd "$TREE" && for p in $SHARED_PATHS; do [ -e "$p" ] && find "$p" -type f ! -path '*/__pycache__/*' ! -name '*.pyc'; done | LC_ALL=C sort -u))
 [ -z "$EXTRA" ] || stop "ОТМЕНА: общий модуль $(echo $EXTRA) в бою ≠ master ${SHA:0:7} (в master его нет)"
-log "база ${ACC:0:7} → master ${SHA:0:7}; общие модули в бою = master"
+if [ -n "$LAGGED" ]; then
+  log "общий модуль отстаёт (разрешено):$LAGGED; master ${SHA:0:7}"
+  journal "общий модуль отстаёт (разрешено):$LAGGED"
+fi
+log "база ${ACC:0:7} → master ${SHA:0:7}; общие модули в бою = master${LAGGED:+ (кроме разрешённого отставания)}"
 
 # --- бой = принятая база по всем файлам Understat (иначе — чужая живая правка)
 for f in $(g ls-tree -r --name-only "$ACC" -- $UNDERSTAT_PATHS); do

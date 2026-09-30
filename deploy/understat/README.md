@@ -29,7 +29,7 @@
 |---|---|
 | Файл `understat-accepted` = полный SHA master, которому равен бой | Без базы автомат не знает, что в бою, и не может отличить чужую правку. |
 | Копия автомата = `deploy/understat/auto_deliver.sh` в master (md5) | Иначе ночью работает старая логика. |
-| Общие модули в бою = master (cmp по каждому файлу `scrapers/base/**`, `scrapers/utils/**`, `scrapers/__init__.py`, `dags/utils/{__init__,config,default_args,alerts,medallion_config}.py`) | Файлы Understat импортируют `scrapers.base.*`, `utils.config`, `utils.default_args` (а через них `utils.alerts`, `utils.medallion_config`); при расхождении новый код Understat может не сойтись с общими модулями боя. Сверяется и состав: удалённый в master или лишний в бою модуль (без `__pycache__`) — тоже отмена. Стоп, exit 1. |
+| Общие модули в бою = master или разрешённому отставанию (см. ниже) (cmp по каждому файлу `scrapers/base/**`, `scrapers/utils/**`, `scrapers/__init__.py`, `dags/utils/{__init__,config,default_args,alerts,medallion_config}.py`) | Файлы Understat импортируют `scrapers.base.*`, `utils.config`, `utils.default_args` (а через них `utils.alerts`, `utils.medallion_config`); при расхождении новый код Understat может не сойтись с общими модулями боя. Сверяется и состав: удалённый в master или лишний в бою модуль (без `__pycache__`) — тоже отмена. Стоп, exit 1. |
 | Все файлы Understat в бою = принятой базе, лишних нет (`scrapers/understat/**` и `dags/**/*understat*.py`, без `__pycache__`) | Иначе в бою чужая живая правка — перезаписать её молча нельзя. Тот же состав проверяет приёмка. |
 | В diff только `M` и `A` внутри `scrapers/understat/` | Сторож WhoScored (`scrapers/whoscored/runtime_contract.py`) роняет разбор DAG всей платформы, если ctime каталогов `dags/`, `dags/utils/`, `scrapers/`, `scrapers/base/`, `scrapers/utils/` новее старта процесса. Создание/удаление/переименование там меняет ctime. `D`, `R`, `C`, `A` вне `scrapers/understat/` (в т.ч. новые `dags/**/*understat*.py`) — стоп, «нужны руки». |
 | Новые байты `*.py` компилируются (`python3 -I -S`, строкой, без .pyc) | Синтаксическая ошибка не доезжает до боя. |
@@ -38,6 +38,29 @@
 Порядок записи: `scrapers/understat/*` (по алфавиту, `__init__.py` последним), затем
 `dags/utils/understat_tasks.py`, `dags/scripts/run_understat_scraper.py`, `dags/dag_backfill_understat.py`,
 `dags/dag_ingest_understat.py` — импортируемые раньше импортирующих.
+
+## Разрешённое отставание общих модулей (решение владельца 30.09.2026, #1594)
+
+Общие модули в бою должны быть равны master. Исключение — список `ALLOWED_LAG` в скрипте: пары
+«путь=git-blob». Если файл в бою ≠ master, но побайтно равен разрешённому blob, доставка идёт, а в лог
+и журнал пишется «общий модуль отстаёт (разрешено): путь=blob». Любая третья версия — отмена, как
+раньше. Состав общих модулей (лишний/удалённый файл) не ослабляется. Общие файлы автомат не пишет.
+Тот же приём — у ClubElo (#1465).
+
+Сейчас три записи, все — версии принятой базы `8b61969`:
+
+| Файл | Blob | Чем master новее | Что берёт Understat |
+|---|---|---|---|
+| `dags/utils/alerts.py` | `30c4988a` | #1477 — экранирование HTML в `telegram_dq_summary`; доставка отложена до #1489 | `telegram_on_failure` (через `utils.default_args`) |
+| `dags/utils/config.py` | `221a1271` | #1590 — убран ключ `dag_transform_fotmob_silver` из `SCHEDULES` | `DAG_TAGS["understat"]`, ключи `*understat*` из `SCHEDULES`, `UNDERSTAT_LEAGUES` |
+| `dags/utils/medallion_config.py` | `697fe43d` | #1590 — `COALESCE` из одного источника | ничего |
+
+Тест `tests/unit/deploy/test_understat_shared_lag.py` сверяет то, что Understat берёт, в master с
+разрешёнными версиями и падает, если master в этом разойдётся.
+
+**Когда удалить запись:** как только файл в бою станет равен master — убрать его пару из
+`ALLOWED_LAG` (все доехали — `ALLOWED_LAG=""` и удалить тест) одним PR. Упал тест — пересмотреть
+запись, а не чинить зафиксированные значения.
 
 ## Приёмка и откат
 
