@@ -682,10 +682,11 @@ def parse_results(html: str) -> ResultsPage:
         # changed and every key would silently become "~CC:Name", so the MERGE
         # would add a second copy of each match (Sol r2 log)
         raise LayoutChanged("C7 results table has no club links")
-    if not separators and _ISO_DATE.search(_text(tables[0])):
+    if len(_ISO_DATE.findall(_text(tables[0]))) != separators:
         # a one-day page has no separators (30.09, h1 2026-09-26); a date in
         # the table that was not read as a separator means the separator
-        # markup changed and every row would get the h1 date (Sol r1 #6)
-        raise LayoutChanged("C3 results table has dates but no date separators")
+        # markup changed and its rows would get the previous date (Sol r1 #6,
+        # Astra r1 P1: also when only some separators changed)
+        raise LayoutChanged("C3 results table has dates outside date separators")
     return ResultsPage(rating_date=rating_date, page_created_at=created, rows=rows,
                        duplicates=duplicates)

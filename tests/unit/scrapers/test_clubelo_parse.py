@@ -401,11 +401,16 @@ def test_results_one_day_page_without_separators():
     assert {row["match_date"] for row in page.rows} == {date(2026, 9, 26)}
 
 
-def test_results_changed_separator_markup_fails_closed(results_html):
-    # Sol r1 #6: a separator not read as one would give every row the h1 date
-    broken = re.sub(r'<tr><td class="l" colspan="3">([^<]*)</td></tr>',
+@pytest.mark.parametrize("count", [0, 1])  # all separators changed / only the second one
+def test_results_changed_separator_markup_fails_closed(results_html, count):
+    # Sol r1 #6, Astra r1 P1: a separator not read as one would give its rows
+    # the previous date
+    broken = re.sub(r'<tr><td class="l" colspan="3">(2026-09-2[01])</td></tr>',
                     r'<tr class="d"><span>\1</span></tr>', results_html)
-    with pytest.raises(LayoutChanged, match="dates but no date separators"):
+    if count:
+        broken = broken.replace('<tr class="d"><span>2026-09-21</span></tr>',
+                                '<tr><td class="l" colspan="3">2026-09-21</td></tr>')
+    with pytest.raises(LayoutChanged, match="dates outside date separators"):
         parse_results(broken)
 
 
