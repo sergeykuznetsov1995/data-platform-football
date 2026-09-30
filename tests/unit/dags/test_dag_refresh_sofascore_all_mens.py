@@ -147,7 +147,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     )
     assert not hasattr(module, "REFRESH_BATCH_FITS")
     assert module.REFRESH_BATCH_SIZE == 64
-    assert module.REFRESH_SECONDS_PER_MATCH == 25
+    assert module.REFRESH_SECONDS_PER_MATCH == 15
 
     run = operators["run_refresh_scope"]
     assert run.is_mapped
@@ -246,7 +246,7 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     # the shared window decides how many actually go.
     assert kwargs["batch_size"] == 3
     assert kwargs["scope_budget_s"] == 2 * 3600
-    assert kwargs["seconds_per_match"] == 25
+    assert kwargs["seconds_per_match"] == 15
     assert kwargs["result_dir"] == "/tmp/refresh"
     assert kwargs["task_env"] == {
         "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-refresh:8080"

@@ -61,11 +61,15 @@ DEFAULT_REFRESH_BATCH_SIZE = 64
 REFRESH_QUEUE_MODES = frozenset({"deadline", "backlog"})
 DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
 # #1358: a refresh scope is sized by its own volume, not by the worst case of
-# the slowest one.  Measured match phase 20-25.09: 12-13 requests a minute,
-# five endpoints a match -> ~24 s a match; 25 s leaves a little room.
-DEFAULT_REFRESH_SECONDS_PER_MATCH = 25
+# the slowest one.  Measured on the refresh lane 29-30.09 (Camoufox v152, 56
+# scopes of 1-16 matches): a scope task takes ~33 s plus ~12 s a match.  The
+# old 180 s + 25 s (20-25.09, the v135 browser) planned 28 scopes into the 2 h
+# window that really ran 28-34 min of it — 16 of them at one match.  15 s and
+# 45 s keep a margin over the measurement; a scope that runs slower than its
+# estimate still stops ``partial`` at its own deadline.
+DEFAULT_REFRESH_SECONDS_PER_MATCH = 15
 # Browser warm-up, Trino plan probes and the final MERGE of one scope.
-REFRESH_SCOPE_OVERHEAD_SECONDS = 180
+REFRESH_SCOPE_OVERHEAD_SECONDS = 45
 # A scope that does not fit the rest of the window whole is sliced; a slice
 # thinner than this is not worth its warm-up and closes the batch.
 REFRESH_MIN_SLICE_MATCHES = 20

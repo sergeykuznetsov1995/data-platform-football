@@ -1210,7 +1210,7 @@ def _window_plan(pending, **kwargs):
 
 @pytest.mark.unit
 def test_refresh_window_takes_every_small_scope_that_fits():
-    # #1358: four scopes of 10 matches are 4 x (250 + 180) s of a 2 h window.
+    # #1358: four scopes of 10 matches are 4 x (150 + 45) s of a 2 h window.
     planned = _window_plan([
         _refresh_pending("SS-17", "2627", 10, 1_787_900_004),
         _refresh_pending("SS-8", "2627", 10, 1_787_900_003),
@@ -1222,12 +1222,12 @@ def test_refresh_window_takes_every_small_scope_that_fits():
     for env in planned:
         assert env["SOFASCORE_SCOPE_MAX_MATCHES"] == "10"
         assert env["SOFASCORE_SCOPE_BYTE_CAP"] == str(10 * 49_342)
-        assert env["SOFASCORE_SCOPE_ESTIMATE_S"] == str(10 * 25 + 180)
+        assert env["SOFASCORE_SCOPE_ESTIMATE_S"] == str(10 * 15 + 45)
         # estimate x 1.5 would leave no room on a small scope for the runner's
         # admission rule (an allocation of up to 25 matches at twice its
-        # estimate + 5 min), so the timeout keeps 25 x 25 s + 300 s over it.
-        assert env["SOFASCORE_SCOPE_TIMEOUT_S"] == str(430 + 925)
-        assert env["SOFASCORE_REFRESH_SECONDS_PER_MATCH"] == "25"
+        # estimate + 5 min), so the timeout keeps 25 x 15 s + 300 s over it.
+        assert env["SOFASCORE_SCOPE_TIMEOUT_S"] == str(195 + 675)
+        assert env["SOFASCORE_REFRESH_SECONDS_PER_MATCH"] == "15"
 
 
 @pytest.mark.unit
@@ -1243,23 +1243,25 @@ def test_refresh_window_slices_the_scope_that_does_not_fit_whole():
     ]
     head, sliced = planned
     assert head["SOFASCORE_SCOPE_MAX_MATCHES"] == "100"
-    # 7200 - (100 x 25 + 180) = 4520 s left -> (4520 - 180) // 25 matches.
-    assert sliced["SOFASCORE_SCOPE_MAX_MATCHES"] == str((4520 - 180) // 25)
-    assert sliced["SOFASCORE_SCOPE_BYTE_CAP"] == str(173 * 49_342)
+    # 7200 - (100 x 15 + 45) = 5655 s left -> (5655 - 45) // 15 matches.
+    assert sliced["SOFASCORE_SCOPE_MAX_MATCHES"] == str((5655 - 45) // 15)
+    assert sliced["SOFASCORE_SCOPE_BYTE_CAP"] == str(374 * 49_342)
     estimate = int(sliced["SOFASCORE_SCOPE_ESTIMATE_S"])
-    assert estimate == 173 * 25 + 180
+    assert estimate == 374 * 15 + 45
     assert int(head["SOFASCORE_SCOPE_ESTIMATE_S"]) + estimate <= 7200
-    assert sliced["SOFASCORE_SCOPE_TIMEOUT_S"] == str((estimate * 3 + 1) // 2)
+    assert sliced["SOFASCORE_SCOPE_TIMEOUT_S"] == str(
+        min(2 * 3600, (estimate * 3 + 1) // 2)
+    )
 
 
 @pytest.mark.unit
 def test_refresh_window_closes_on_a_slice_under_twenty_matches():
     planned = _window_plan([
-        # 100 x 25 + 180 = 2680 s of a 2700 s window: 20 s are left.
+        # 100 x 15 + 45 = 1545 s of a 1560 s window: 15 s are left.
         _refresh_pending("SS-17", "2627", 100, 1_787_900_001),
         _refresh_pending("SS-8", "2627", 50, 1_787_900_002),
         _refresh_pending("SS-17", "2526", 1, 1_787_900_003),
-    ], scope_budget_s=2700)
+    ], scope_budget_s=1560)
 
     assert [env["SOFASCORE_SCOPE_KEY"] for env in planned] == [
         "campaign-test:17:1726"
@@ -1313,8 +1315,8 @@ def test_refresh_queue_an_esoccer_sized_debt_goes_second_tier_and_sliced():
         "campaign-test:17:1726", "campaign-test:8:826",
     ]
     assert planned[0]["SOFASCORE_SCOPE_MAX_MATCHES"] == "100"
-    # 7200 - (100 x 25 + 180) = 4520 s left -> (4520 - 180) // 25 matches.
-    assert planned[1]["SOFASCORE_SCOPE_MAX_MATCHES"] == str((4520 - 180) // 25)
+    # 7200 - (100 x 15 + 45) = 5655 s left -> (5655 - 45) // 15 matches.
+    assert planned[1]["SOFASCORE_SCOPE_MAX_MATCHES"] == str((5655 - 45) // 15)
 
 
 def _parts(planned):
@@ -1340,14 +1342,14 @@ def test_refresh_queue_one_urgent_match_does_not_carry_its_seasons_debt_ahead():
         (*_refresh_pending("SS-17", "2526", 50, 1_787_900_003), 50),
     ])
 
-    # 7200 - (1 + 30 + 50) x 25 - 4 x 180 = 4455 s -> 178 matches of debt.
+    # 7200 - (1 + 30 + 50) x 15 - 4 x 45 = 5805 s -> 387 matches of debt.
     assert _parts(planned) == [
         ("campaign-test:17:1726", False, 1),
         ("campaign-test:8:826", False, 30),
         ("campaign-test:17:1725", False, 50),
-        ("campaign-test:17:1726", True, 178),
+        ("campaign-test:17:1726", True, 387),
     ]
-    assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) > 7200 - 25
+    assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) > 7200 - 15
     assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) <= 7200
     urgent, debt = planned[0], planned[3]
     # Two tasks of one scope: separate gateway plans and result files.
@@ -1394,12 +1396,30 @@ def test_refresh_scope_timeout_admits_every_allocation_at_its_estimate(pending):
         "SOFASCORE_SCOPE_DEADLINE_EPOCH": str(timeout),
         "SOFASCORE_SCOPE_BYTE_CAP": env["SOFASCORE_SCOPE_BYTE_CAP"],
         "SOFASCORE_SCOPE_MAX_MATCHES": env["SOFASCORE_SCOPE_MAX_MATCHES"],
-        "SOFASCORE_REFRESH_SECONDS_PER_MATCH": "25",
+        "SOFASCORE_REFRESH_SECONDS_PER_MATCH": env["SOFASCORE_REFRESH_SECONDS_PER_MATCH"],
     })
+    pace = int(env["SOFASCORE_REFRESH_SECONDS_PER_MATCH"])
     now, spent, left = state.REFRESH_SCOPE_OVERHEAD_SECONDS, 0, matches
     while left:
         batch = min(state.REFRESH_ALLOCATION_MATCHES, left)
         assert runner._capture_stop_reason(limits, spent, batch, now=now) is None
-        now += batch * 25
+        now += batch * pace
         spent += batch * state.REFRESH_BYTES_PER_MATCH
         left -= batch
+
+
+@pytest.mark.unit
+def test_refresh_window_one_match_scopes_leave_the_window_to_the_debt():
+    # #1358 (29.09): 28 urgent one-match scopes planned 28 x (25 + 180) s,
+    # "closed" the window on paper and really ran 28 min of its 120.  At the
+    # measured pace they take a small part of it and the debt fills the rest.
+    pending = [
+        (*_refresh_pending(f"SS-{key}", "2627", 1, 1_787_900_000 + key), 1)
+        for key in (8, 17)
+    ] + [(*_refresh_pending("SS-17", "2526", 5_920, None), 0)]
+    planned = _window_plan(pending)
+
+    assert [part[2] for part in _parts(planned)] == [1, 1, 432]
+    assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) == (
+        2 * (15 + 45) + 432 * 15 + 45
+    )

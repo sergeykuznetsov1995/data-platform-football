@@ -88,8 +88,8 @@ if (
         "refresh window does not fit the DagRun: sweep + scope budget + "
         "retry reserve + metadata > dagrun_timeout"
     )
-# Pace of the match phase, measured 20-25.09 (SS-10240: 790 requests in
-# 59 min; SS-13470: 450 in 38 min) -> ~24 s a match; an env override retunes
+# Pace of the match phase, re-measured 29-30.09 on the refresh lane (~12 s a
+# match, ``state.DEFAULT_REFRESH_SECONDS_PER_MATCH``); an env override retunes
 # the estimate without a release.
 REFRESH_SECONDS_PER_MATCH = state.env_int(
     "SOFASCORE_REFRESH_SECONDS_PER_MATCH",
