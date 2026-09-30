@@ -60,6 +60,7 @@ from dags.utils.sofascore_all_mens_state import (  # noqa: E402
 from scrapers.sofascore.raw_store import RawPayloadStore  # noqa: E402
 from scrapers.sofascore.schedule_refresh import (  # noqa: E402
     MAX_BACKTRACK_PAGES,
+    SweepRefusedError,
     SweepVerdictError,
     empty_schedule_counters,
     fetch_season_fixtures,
@@ -1395,6 +1396,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # finish, so the class banks its rows and its queue but leaves its
             # cursor where it was — the slice has to be walked again.
             interrupted: Optional[Exception] = None
+            # #1359: the seasons of this class the source refused, by name —
+            # each is skipped, the run goes on, and the report says which.
+            failures: list[dict[str, Any]] = []
             # Whether the TAIL walk of this class ran to the end.  A tail walk
             # that died mid-slice knows nothing about the seasons it never
             # reached, so its silence may not be read as "this class had
@@ -1419,12 +1423,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         # absences here are not evidence of anything; failing on
                         # them would pin the cursor to that slice for good.
                         missing_fail_share=None,
+                        failures=failures,
                     )
                 except SweepVerdictError as exc:
                     events, counters, cut_short = (
                         exc.fetched, exc.counters, exc.incomplete
                     )
                     deferred.append(exc)
+                except SweepRefusedError as exc:
+                    # #1359: a refusal streak cuts the walk short like any
+                    # transport failure (the cursor stays), but what the walk
+                    # already paid for is banked below, not thrown away.
+                    interrupted = exc
+                    tail_walked = False
+                    events, counters, cut_short = (
+                        exc.fetched, exc.counters, exc.incomplete
+                    )
                 except Exception as exc:
                     # NOT a verdict: a transport failure that is not a 404, a
                     # dead lease, a body that is not JSON.  The fetcher lets
@@ -1456,12 +1470,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         # a page; the rest may answer 404 for as long as they
                         # like.
                         owed_pages=owed_pages,
+                        failures=failures,
                     )
                 except SweepVerdictError as exc:
                     events, counters, cut_short = (
                         exc.fetched, exc.counters, exc.incomplete
                     )
                     deferred.append(exc)
+                except SweepRefusedError as exc:
+                    # As in the seed branch: cut short, but banked.
+                    interrupted = exc
+                    tail_walked = False
+                    events, counters, cut_short = (
+                        exc.fetched, exc.counters, exc.incomplete
+                    )
                 except Exception as exc:
                     # Same as the seed branch above: a failure that is not a
                     # verdict about this slice must not escape the class loop
@@ -1495,7 +1517,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # the whole seed round to come back (Sol round 5, finding 4).
                 try:
                     fixture_events, fixture_counters = fetch_season_fixtures(
-                        client, pairs, raw_store
+                        client, pairs, raw_store, failures=failures
                     )
                 except SweepVerdictError as exc:
                     # The calendar walk is an EXTRA on top of the tail pages,
@@ -1514,6 +1536,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     fixture_events = list(exc.fetched)
                     fixture_counters = dict(exc.counters)
                     fixture_counters.setdefault("events", 0)
+                    fixture_counters["error"] = str(exc)
+                except SweepRefusedError as exc:
+                    # #1359: the calendars served before the streak are kept.
+                    interrupted = exc
+                    fixture_events = list(exc.fetched)
+                    fixture_counters = dict(exc.counters)
                     fixture_counters["error"] = str(exc)
                 except Exception as exc:
                     # NOT a verdict: a transport failure, or a bug.  The slice
@@ -1543,6 +1571,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # here is evidence for the operator, and both ``missing``
                 # counters are already in the report above.
             report[name] = counters
+            if failures:
+                report[f"{name}_failed_targets"] = failures
             try:
                 rows, row_counters = schedule_rows_from_events(
                     events, snapshot, exclude

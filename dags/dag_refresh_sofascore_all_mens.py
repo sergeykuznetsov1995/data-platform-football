@@ -100,7 +100,7 @@ REFRESH_SECONDS_PER_MATCH = state.env_int(
 # Only an upper bound on the NUMBER of scopes now; the window decides how many
 # actually go.  A cut by this bound is logged by the planner.
 REFRESH_BATCH_SIZE = state.env_int(
-    "SOFASCORE_REFRESH_BATCH_SIZE", state.DEFAULT_REFRESH_BATCH_SIZE, 1, 64
+    "SOFASCORE_REFRESH_BATCH_SIZE", state.DEFAULT_REFRESH_BATCH_SIZE, 1, 128
 )
 REFRESH_POOL = (
     os.environ.get("SOFASCORE_REFRESH_POOL", "").strip() or INGEST_SCRAPER_POOL

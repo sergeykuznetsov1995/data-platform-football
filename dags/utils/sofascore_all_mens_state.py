@@ -54,8 +54,9 @@ DEFAULT_PARK_COOLDOWN_HOURS = 24
 QUARANTINE_REASON_CHARS = 200
 UNKNOWN_RELEASE = "unknown"
 # #1358: only an upper bound on the number of scopes; the 2 h window decides
-# how many actually go (a small-scope queue must be able to fill it).
-DEFAULT_REFRESH_BATCH_SIZE = 64
+# how many actually go (a small-scope queue must be able to fill it: the 2 h
+# window over the smallest scope's estimate, 7200 / 60 s, is 120 scopes).
+DEFAULT_REFRESH_BATCH_SIZE = 128
 # #1359: ``deadline`` for every scheduled slot; ``backlog`` (manual conf) plans
 # only the seasons without an open deadline.
 REFRESH_QUEUE_MODES = frozenset({"deadline", "backlog"})

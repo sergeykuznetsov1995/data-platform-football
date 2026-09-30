@@ -1410,9 +1410,10 @@ def test_refresh_scope_timeout_admits_every_allocation_at_its_estimate(pending):
 
 @pytest.mark.unit
 def test_refresh_window_one_match_scopes_leave_the_window_to_the_debt():
-    # #1358 (29.09): 28 urgent one-match scopes planned 28 x (25 + 180) s,
-    # "closed" the window on paper and really ran 28 min of its 120.  At the
-    # measured pace they take a small part of it and the debt fills the rest.
+    # #1358 (29.09): one-match urgent scopes were planned at 25 + 180 s each,
+    # so 28 of them "closed" the window on paper and really ran 28 min of its
+    # 120.  At the measured pace they take 60 s each and the debt gets the rest
+    # (two of them here: the test snapshot has two tournaments).
     pending = [
         (*_refresh_pending(f"SS-{key}", "2627", 1, 1_787_900_000 + key), 1)
         for key in (8, 17)
@@ -1423,3 +1424,15 @@ def test_refresh_window_one_match_scopes_leave_the_window_to_the_debt():
     assert sum(int(env["SOFASCORE_SCOPE_ESTIMATE_S"]) for env in planned) == (
         2 * (15 + 45) + 432 * 15 + 45
     )
+
+
+@pytest.mark.unit
+def test_refresh_batch_bound_never_closes_the_window_before_the_budget():
+    from utils import sofascore_all_mens_state as state
+
+    # Sol #1358 r1: the scope-count bound must not be what ends a batch of
+    # smallest scopes (one match each) — the window has to run out first.
+    smallest = (
+        state.DEFAULT_REFRESH_SECONDS_PER_MATCH + state.REFRESH_SCOPE_OVERHEAD_SECONDS
+    )
+    assert state.DEFAULT_REFRESH_BATCH_SIZE * smallest >= 2 * 3600

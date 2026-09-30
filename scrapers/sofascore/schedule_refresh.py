@@ -64,19 +64,33 @@ _MALFORMED_FAIL_SHARE = 0.5
 # a pattern; a slice that serves nothing at all is caught by the lane's
 # ``idle_runs`` guard instead (Sol round 24).
 _FAIL_MIN_TARGETS = 2
-# #1359: a season whose page the source refuses (403, or a 5xx that outlived
-# the client's retries) costs that season, not the run: it is rolled back like
-# a broken page and counted in ``failed``.  This many refusals IN A ROW are the
-# source refusing the lane, not one season — the walk stops there, as any other
-# transport failure does, instead of paying for every target of the slice.
+# #1359: a season whose page the source answers with an HTTP error (a 403, a
+# 5xx that outlived the client's retries, any status but 404 and 429) costs
+# that season, not the run: it is rolled back like a broken page, counted in
+# ``failed`` and named in ``failures``.  This many refusals IN A ROW are the
+# source refusing the lane, not one season — the walk stops there
+# (``SweepRefusedError``) instead of paying for every target of the slice.  A
+# 429 is the lane's own pace and a failure without an HTTP status (a dead
+# lease, a gateway that did not answer) is the transport: both stay a property
+# of the run and propagate at once.
 _FAILED_STREAK_LIMIT = 3
 
 
 def _is_target_failure(exc: DiscoveryHTTPError) -> bool:
     """Whether an HTTP failure belongs to one season rather than to the run."""
 
-    status = exc.status_code
-    return status is not None and (status == 403 or 500 <= status <= 599)
+    return exc.status_code is not None and exc.status_code != 429
+
+
+def _record_failure(
+    failures: Optional[list], tournament_id: int, season_id: int,
+    exc: DiscoveryHTTPError,
+) -> None:
+    if failures is not None:
+        failures.append({
+            "tournament_id": int(tournament_id), "season_id": int(season_id),
+            "status": exc.status_code, "error": str(exc),
+        })
 
 
 # How far a resumed chain may step back when the source has repacked its pages
@@ -116,6 +130,30 @@ class ScheduleSweepError(SweepVerdictError):
     """The sweep itself is unsound: the source served almost no season page."""
 
 
+class SweepRefusedError(DiscoveryHTTPError):
+    """``_FAILED_STREAK_LIMIT`` seasons in a row refused (#1359).
+
+    NOT a verdict: the walk was cut short and the slice must be walked again,
+    so the caller keeps its cursor.  But it carries what the walk had already
+    paid for — the caller banks those rows and that queue rather than throwing
+    them away (lesson 94).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int],
+        fetched: list,
+        counters: Mapping[str, Any],
+        incomplete: Optional[list] = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.fetched = list(fetched)
+        self.counters = dict(counters)
+        self.incomplete = list(incomplete or [])
+
+
 @dataclass(frozen=True)
 class FetchedEvent:
     """One source event together with the raw record of the list it came from.
@@ -150,6 +188,7 @@ def fetch_season_fixtures(
     client: Any,
     targets: Iterable[tuple[int, int]],
     raw_store: RawPayloadStore,
+    failures: Optional[list] = None,
 ) -> tuple[list[FetchedEvent], dict[str, int]]:
     """Fetch the first ``schedule_next`` page of every target.
 
@@ -186,9 +225,14 @@ def fetch_season_fixtures(
                 raise
             # #1359: one refused calendar costs its season, not the class.
             counters["failed"] += 1
+            _record_failure(failures, tournament_id, season_id, exc)
             failed_streak += 1
             if failed_streak >= _FAILED_STREAK_LIMIT:
-                raise
+                raise SweepRefusedError(
+                    f"{failed_streak} calendar pages in a row refused: {exc}",
+                    status_code=exc.status_code, fetched=fetched,
+                    counters=counters,
+                ) from exc
             log.warning("calendar page refused, skipping: %s", exc)
             continue
         failed_streak = 0
@@ -219,6 +263,7 @@ def fetch_season_fixtures(
                 "calendar page breaks its contract, skipping: %s (%r/%r)",
                 path, type(events).__name__, has_next,
             )
+            failed_streak = 0
             continue
         if has_next:
             # ONE fixture page on purpose: this walk exists to open the ``due``
@@ -295,6 +340,7 @@ def fetch_season_schedules(
     chase_before: Optional[Mapping[tuple[int, int], int]] = None,
     owed_pages: Optional[Collection[tuple[int, int]]] = None,
     missing_fail_share: Optional[float] = _MISSING_FAIL_SHARE,
+    failures: Optional[list] = None,
 ) -> tuple[list[FetchedEvent], dict[str, int], list[tuple[int, int, int, int]]]:
     """Fetch the ``schedule_last`` chain of every ``(tournament_id, season_id)``.
 
@@ -338,10 +384,11 @@ def fetch_season_schedules(
     disables the check outright for a slice where absences are the normal
     answer — the
     seed slice is full of seasons that have not kicked off, and failing it would
-    freeze the cursor on them forever.  A season the source refuses (403 or a
-    5xx, #1359) is dropped and counted in ``failed``; ``_FAILED_STREAK_LIMIT``
-    refusals in a row, and any other transport failure, propagate: they are a
-    property of the run, not of the season.
+    freeze the cursor on them forever.  A season the source answers with any
+    other HTTP error but 429 (#1359) is dropped, counted in ``failed`` and
+    named in ``failures``; ``_FAILED_STREAK_LIMIT`` refusals in a row raise
+    ``SweepRefusedError`` with what was collected, and any other transport
+    failure propagates: they are a property of the run, not of the season.
 
     ``schedule_last`` is the season's own page, so an event of another season
     (the source occasionally carries a neighbour's tail) is dropped and counted
@@ -562,6 +609,8 @@ def fetch_season_schedules(
             elif expected:
                 expected_malformed += 1
             log.warning("season page breaks its contract, skipping: %s", exc)
+            # The source answered: a broken page ends a refusal streak.
+            failed_streak = 0
             continue
         except DiscoveryHTTPError as exc:
             if not _is_target_failure(exc):
@@ -576,11 +625,16 @@ def fetch_season_schedules(
             counters.clear()
             counters.update(counters_before)
             counters["failed"] += 1
-            failed_streak += 1
-            if failed_streak >= _FAILED_STREAK_LIMIT:
-                raise
+            _record_failure(failures, pair[0], pair[1], exc)
             if owed_page:
                 incomplete.append((pair[0], pair[1], owed_page, anchor))
+            failed_streak += 1
+            if failed_streak >= _FAILED_STREAK_LIMIT:
+                raise SweepRefusedError(
+                    f"{failed_streak} season pages in a row refused: {exc}",
+                    status_code=exc.status_code, fetched=fetched,
+                    counters=counters, incomplete=incomplete,
+                ) from exc
             log.warning("season page refused, skipping: %s", exc)
             continue
         failed_streak = 0

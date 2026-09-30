@@ -1777,3 +1777,69 @@ def test_two_different_matches_under_one_game_id_do_not_overwrite_each_other(tmp
     # The first copy of 77 survived, not the contradicting one.
     kept = {row["game_id"]: row for row in rows}
     assert kept[77]["raw_target_id"] == "last-0"
+
+
+@pytest.mark.unit
+def test_any_http_error_of_one_season_is_named_and_skipped(tmp_path):
+    # Sol #1359 r1: not only 403/5xx — any HTTP status but 404/429 belongs to
+    # the season.  The season is named in ``failures``; a 429 is the lane's own
+    # pace and still stops the walk at once.
+    payloads = _sweep_payloads()
+    refused = schedule_page_path(*READY_TARGET)
+
+    class _Gone(_Client):
+        status = 410
+
+        def get_json(self, path):
+            if path == refused:
+                raise DiscoveryHTTPError(f"HTTP {self.status}", status_code=self.status)
+            return super().get_json(path)
+
+    failures: list = []
+    _, counters, _ = fetch_season_schedules(
+        _Gone(payloads), [READY_TARGET, CONFIGURED_TARGET, PREVIOUS_TARGET],
+        _store(tmp_path), failures=failures,
+    )
+    assert counters["failed"] == 1
+    assert failures == [{
+        "tournament_id": READY_TARGET[0], "season_id": READY_TARGET[1],
+        "status": 410, "error": "HTTP 410",
+    }]
+
+    _Gone.status = 429
+    with pytest.raises(DiscoveryHTTPError, match="429"):
+        fetch_season_schedules(
+            _Gone(payloads), [READY_TARGET, CONFIGURED_TARGET], _store(tmp_path),
+        )
+
+
+@pytest.mark.unit
+def test_a_refusal_streak_carries_what_the_walk_already_paid_for(tmp_path):
+    # Sol #1359 r1: the streak stops the walk, but the seasons served before it
+    # and the resumed chains it refused travel with the error, so the caller
+    # can bank them.
+    from scrapers.sofascore.schedule_refresh import SweepRefusedError
+
+    payloads = _sweep_payloads()
+    served = schedule_page_path(*CONFIGURED_TARGET)
+
+    class _Refusing(_Client):
+        def get_json(self, path):
+            if path != served:
+                raise DiscoveryHTTPError("HTTP 403", status_code=403)
+            return super().get_json(path)
+
+    targets = [CONFIGURED_TARGET, READY_TARGET, PREVIOUS_TARGET, (99, 99)]
+    with pytest.raises(SweepRefusedError) as caught:
+        fetch_season_schedules(
+            _Refusing(payloads), targets, _store(tmp_path),
+            start_pages={PREVIOUS_TARGET: 2},
+        )
+
+    error = caught.value
+    assert error.fetched and all(
+        item.raw.source_season_id == str(CONFIGURED_TARGET[1])
+        for item in error.fetched
+    )
+    assert error.counters["failed"] == 3 and error.counters["pages"] == 1
+    assert [entry[:3] for entry in error.incomplete] == [(*PREVIOUS_TARGET, 2)]

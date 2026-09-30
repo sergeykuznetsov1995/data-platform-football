@@ -123,7 +123,7 @@ def offline(monkeypatch, tmp_path):
     def fetch(
         client, targets, raw_store, *, max_pages=1, start_pages=None,
         resume_anchors=None, chase_before=None, owed_pages=None,
-        missing_fail_share=refresh.fetch_season_schedules,
+        missing_fail_share=refresh.fetch_season_schedules, failures=None,
     ):
         targets = list(targets)
         calls["fetch"].append({
@@ -173,7 +173,7 @@ def offline(monkeypatch, tmp_path):
             )
         return collected
 
-    def fixtures(client, targets, raw_store):
+    def fixtures(client, targets, raw_store, failures=None):
         targets = list(targets)
         calls.setdefault("fixtures", []).append(targets)
         broken = [pair for pair in targets if pair in calls.get("fixtures_fail", ())]
@@ -985,7 +985,7 @@ def test_a_seed_slice_mute_on_both_endpoints_is_reported_not_fatal(
     monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
     monkeypatch.setattr(
         refresh, "fetch_season_fixtures",
-        lambda client, targets, raw_store: (
+        lambda client, targets, raw_store, **_: (
             [], {"targets": len(list(targets)), "pages": 0, "events": 0,
                  "missing": len(list(targets)), "foreign_season": 0},
         ),
@@ -1072,7 +1072,7 @@ def test_fixture_events_without_a_single_row_fail_the_run(offline, monkeypatch):
     monkeypatch.setattr(
         refresh, "fetch_season_fixtures",
         # The page came back with events, every one of another season.
-        lambda *a: ([], {"targets": 1, "pages": 1, "events": 12, "missing": 0,
+        lambda *a, **_: ([], {"targets": 1, "pages": 1, "events": 12, "missing": 0,
                          "foreign_season": 12}),
     )
 
@@ -1689,7 +1689,7 @@ def test_what_the_source_served_is_counted_in_events_not_pages(offline, monkeypa
                      "missing": 0, "truncated": 0, "foreign_season": 0,
                      "resumed": 0, "chased": 0, "chase_settled": 0}, [])
 
-    def fixtures(client, targets, raw_store):
+    def fixtures(client, targets, raw_store, failures=None):
         return ([], {"targets": len(list(targets)), "pages": 0, "events": 0,
                      "missing": 0, "foreign_season": 0})
 
@@ -1939,7 +1939,7 @@ def test_a_slice_of_seasons_that_have_not_started_is_not_a_failure(
     monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
     monkeypatch.setattr(
         refresh, "fetch_season_fixtures",
-        lambda client, targets, raw_store: (
+        lambda client, targets, raw_store, **_: (
             [], {"targets": len(list(targets)), "pages": 0, "events": 0,
                  "missing": len(list(targets)), "foreign_season": 0},
         ),
@@ -2017,7 +2017,7 @@ def _mute_everything(monkeypatch):
     monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
     monkeypatch.setattr(
         refresh, "fetch_season_fixtures",
-        lambda client, targets, raw_store: (
+        lambda client, targets, raw_store, **_: (
             [], {"targets": len(list(targets)), "pages": 0, "events": 0,
                  "missing": len(list(targets)), "foreign_season": 0},
         ),
@@ -2080,7 +2080,7 @@ def test_one_row_clears_the_emptiness_alarm(offline, monkeypatch):
     monkeypatch.setattr(refresh, "fetch_season_schedules", answering)
     monkeypatch.setattr(
         refresh, "fetch_season_fixtures",
-        lambda client, targets, raw_store: (
+        lambda client, targets, raw_store, **_: (
             [f"fixture-{pair}" for pair in list(targets)],
             {"targets": len(list(targets)), "pages": len(list(targets)),
              "events": len(list(targets)), "missing": 0, "foreign_season": 0},
@@ -2408,3 +2408,63 @@ def test_overdue_chase_keeps_the_known_boundary_when_it_is_deeper(offline):
 
     by_class = _fetch_by_class(offline)
     assert by_class["overdue"]["chase_before"] == {(7, 96518): 1_000_000}
+
+
+@pytest.mark.unit
+def test_a_refused_season_is_named_in_the_report_and_the_run_goes_on(
+    offline, monkeypatch
+):
+    # #1359: the fetcher skips a season the source refused; the report says
+    # which one, and the run stays green.
+    offline["calls"]["known"] = {("SS-7", "2627")}
+    stub_fetch = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        targets = list(targets)
+        if targets == [(7, 96518)]:
+            kwargs["failures"].append({
+                "tournament_id": 7, "season_id": 96518, "status": 403,
+                "error": "HTTP 403",
+            })
+        return stub_fetch(client, targets, raw_store, **kwargs)
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+    report = json.loads(offline["output"].read_text())
+    assert report["status"] == "success"
+    assert report["stale_failed_targets"] == [{
+        "tournament_id": 7, "season_id": 96518, "status": 403, "error": "HTTP 403",
+    }]
+
+
+@pytest.mark.unit
+def test_a_refusal_streak_banks_what_the_walk_paid_for(offline, monkeypatch):
+    # Sol #1359 r1: a streak of refusals stops the walk (the cursor stays), but
+    # the pages served before it are written, not thrown away (lesson 94).
+    from scrapers.sofascore.schedule_refresh import SweepRefusedError
+
+    offline["calls"]["known"] = {("SS-7", "2627")}
+    stub_fetch = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        targets = list(targets)
+        events, counters, cut = stub_fetch(client, targets, raw_store, **kwargs)
+        if targets == [(7, 96518)]:
+            assert events
+            raise SweepRefusedError(
+                "3 season pages in a row refused", status_code=403,
+                fetched=events, counters=counters, incomplete=cut,
+            )
+        return events, counters, cut
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+    assert offline["calls"]["writes"] and offline["calls"]["writes"][-1]
+    cursor = json.loads(offline["cursor"].read_text())
+    assert cursor["index"]["stale"] is None
+    assert cursor["interrupted_runs"]["stale"] == 1
+    report = json.loads(offline["output"].read_text())
+    assert "SweepRefusedError" in report["errors"][0]
+    assert report["rows_written"] > 0
