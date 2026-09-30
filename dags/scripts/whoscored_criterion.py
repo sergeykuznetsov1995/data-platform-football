@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Collection, Iterable, Optional, Sequence
 
 from scrapers.whoscored.catalog import CLASS_A_TOURNAMENT_IDS, PROBE_SCOPE_SPECS
 
@@ -281,21 +281,43 @@ def _age_hours(value: Any, now: datetime) -> Optional[float]:
     return (now - value).total_seconds() / 3600.0
 
 
+def inactive_partitions(report: dict[str, Any]) -> set[tuple[str, str]]:
+    """(league, season) of scopes the catalog marks finished (``is_active`` False).
+
+    A scope without the field (report written before #1601) or with an unknown
+    activity stays active: the strict 48 h rule applies to it.
+    """
+    return {
+        (str(scope["competition_id"]), str(scope["season_id"]))
+        for scope in report.get("scopes") or []
+        if scope.get("is_active") is False
+    }
+
+
 def stale_schedule_partitions(
     query: Callable[[str], Sequence[Sequence[Any]]],
     partitions: Sequence[tuple[str, str]],
     now: datetime,
-) -> list[str]:
-    """Denominator partitions whose schedule is older than 48 h or absent."""
+    inactive: Collection[tuple[str, str]] = frozenset(),
+) -> tuple[list[str], list[str]]:
+    """Denominator partitions failing the schedule rule, as ``(older, absent)``.
+
+    ``older``: active partitions whose newest schedule row is older than 48 h.
+    ``absent``: partitions with no schedule row at all, active or finished.
+    A finished season is not re-read by the daily run, so its age says
+    nothing; only its presence is checked.
+    """
     rows = query(render_schedule_freshness_sql(partitions))
     refreshed = {(str(row[0]), str(row[1])): row[2] for row in rows}
-    stale = []
+    older = []
+    absent = []
     for league, season in partitions:
         age = _age_hours(refreshed.get((league, season)), now)
-        if age is None or age > SCHEDULE_MAX_AGE_HOURS:
-            shown = "never" if age is None else f"{age:.0f}h"
-            stale.append(f"{league}={season} ({shown})")
-    return stale
+        if age is None:
+            absent.append(f"{league}={season}")
+        elif (league, season) not in inactive and age > SCHEDULE_MAX_AGE_HOURS:
+            older.append(f"{league}={season} ({age:.0f}h)")
+    return older, absent
 
 
 def content_age_hours(
@@ -324,6 +346,7 @@ __all__ = [
     "content_age_hours",
     "day_results",
     "denominator_partitions",
+    "inactive_partitions",
     "pct",
     "render_content_freshness_sql",
     "render_daily_criterion_sql",

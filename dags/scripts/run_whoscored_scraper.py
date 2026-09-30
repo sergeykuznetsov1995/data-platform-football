@@ -2319,6 +2319,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _finish(report, args.output)
 
         report = _new_report(args.command, [item[0] for item in selected])
+        # #1601: the catalog's activity lets the schedule freshness rule
+        # tell a finished season (not re-read daily) from a stale one.
+        for record, (_, catalog_season) in zip(report["scopes"], selected):
+            record["is_active"] = getattr(catalog_season, "is_active", None)
         _bind_report_transport_identity(report, args)
         if report["catalog_batch_id"] is None:
             report["catalog_batch_id"] = str(catalog_generation["catalog_batch_id"])

@@ -106,6 +106,7 @@ class _Catalog:
         self._scopes = {
             ("ENG-Premier League", "2526"): SimpleNamespace(
                 stage_ids=(23752,),
+                is_active=False,
                 scope=SimpleNamespace(
                     competition_id="ENG-Premier League",
                     season_id="2526",
@@ -114,6 +115,7 @@ class _Catalog:
             ),
             ("INT-World Cup", "2026"): SimpleNamespace(
                 stage_ids=tuple(range(23752, 23765)),
+                is_active=True,
                 scope=SimpleNamespace(
                     competition_id="INT-World Cup",
                     season_id="2026",
@@ -1196,6 +1198,8 @@ def test_daily_without_scope_reads_the_denominator_scopes(monkeypatch, tmp_path)
         "ENG-Premier League=2526",
         "INT-World Cup=2026",
     ]
+    # #1601: the catalog activity reaches the report for the freshness rule.
+    assert [item["is_active"] for item in report["scopes"]] == [False, True]
     assert len(service_cls.instances) == 2
     assert all(service.catalog is catalog for service in service_cls.instances)
     assert all(
