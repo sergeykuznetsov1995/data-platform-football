@@ -64,22 +64,28 @@ _MALFORMED_FAIL_SHARE = 0.5
 # a pattern; a slice that serves nothing at all is caught by the lane's
 # ``idle_runs`` guard instead (Sol round 24).
 _FAIL_MIN_TARGETS = 2
-# #1359: a season whose page the source answers with an HTTP error (a 403, a
-# 5xx that outlived the client's retries, any status but 404 and 429) costs
-# that season, not the run: it is rolled back like a broken page, counted in
-# ``failed`` and named in ``failures``.  This many refusals IN A ROW are the
+# #1359: a season whose page the source refuses with a 4xx (403, 410, ...)
+# costs that season, not the run: it is rolled back like a broken page,
+# counted in ``failed`` and named in ``failures``.  This many refusals IN A ROW are the
 # source refusing the lane, not one season — the walk stops there
 # (``SweepRefusedError``) instead of paying for every target of the slice.  A
-# 429 is the lane's own pace and a failure without an HTTP status (a dead
-# lease, a gateway that did not answer) is the transport: both stay a property
-# of the run and propagate at once.
+# 429 is the lane's own pace; 407/409 and every 5xx may come from our own
+# gateway or its control channel, not the source (lessons 13, 18); a failure
+# without an HTTP status is the transport — all of these stay a property of
+# the run and propagate at once (Sol r3).
+_RUN_LEVEL_STATUSES = frozenset({407, 409, 429})
 _FAILED_STREAK_LIMIT = 3
 
 
 def _is_target_failure(exc: DiscoveryHTTPError) -> bool:
     """Whether an HTTP failure belongs to one season rather than to the run."""
 
-    return exc.status_code is not None and exc.status_code != 429
+    status = exc.status_code
+    return (
+        status is not None
+        and 400 <= status <= 499
+        and status not in _RUN_LEVEL_STATUSES
+    )
 
 
 def _record_failure(
@@ -384,8 +390,8 @@ def fetch_season_schedules(
     disables the check outright for a slice where absences are the normal
     answer — the
     seed slice is full of seasons that have not kicked off, and failing it would
-    freeze the cursor on them forever.  A season the source answers with any
-    other HTTP error but 429 (#1359) is dropped, counted in ``failed`` and
+    freeze the cursor on them forever.  A season the source refuses with a 4xx
+    other than 407/409/429 (#1359) is dropped, counted in ``failed`` and
     named in ``failures``; ``_FAILED_STREAK_LIMIT`` refusals in a row raise
     ``SweepRefusedError`` with what was collected, and any other transport
     failure propagates: they are a property of the run, not of the season.

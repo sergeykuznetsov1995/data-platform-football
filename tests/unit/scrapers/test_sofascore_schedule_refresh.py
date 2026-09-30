@@ -1216,11 +1216,13 @@ def test_a_calendar_that_is_not_a_page_is_skipped_but_transport_still_fails(tmp_
     assert counters["malformed"] == 1 and counters["pages"] == 1
 
     class _Boom(_Client):
+        status = 403
+
         def get_json(self, path):
-            raise DiscoveryHTTPError("HTTP 503", status_code=503)
+            raise DiscoveryHTTPError(f"HTTP {self.status}", status_code=self.status)
 
     # #1359: one refused calendar costs its season; a streak of them is the
-    # source refusing the lane and propagates.
+    # source refusing the lane and propagates, and so does a 5xx at once.
     _, counters = fetch_season_fixtures(
         _Boom({}), [READY_TARGET], _store(tmp_path)
     )
@@ -1230,6 +1232,9 @@ def test_a_calendar_that_is_not_a_page_is_skipped_but_transport_still_fails(tmp_
             _Boom({}), [READY_TARGET, CONFIGURED_TARGET, PREVIOUS_TARGET],
             _store(tmp_path),
         )
+    _Boom.status = 503
+    with pytest.raises(DiscoveryHTTPError, match="503"):
+        fetch_season_fixtures(_Boom({}), [READY_TARGET], _store(tmp_path))
 
 
 def test_the_worst_case_formula_bounds_what_a_resumed_seed_really_requests(tmp_path):
@@ -1781,9 +1786,9 @@ def test_two_different_matches_under_one_game_id_do_not_overwrite_each_other(tmp
 
 @pytest.mark.unit
 def test_any_http_error_of_one_season_is_named_and_skipped(tmp_path):
-    # Sol #1359 r1: not only 403/5xx — any HTTP status but 404/429 belongs to
-    # the season.  The season is named in ``failures``; a 429 is the lane's own
-    # pace and still stops the walk at once.
+    # Sol #1359 r1/r3: any 4xx of the source belongs to the season and is
+    # named in ``failures``; 429 (the lane's pace), 407/409 and 5xx (possibly
+    # our own gateway) still stop the walk at once.
     payloads = _sweep_payloads()
     refused = schedule_page_path(*READY_TARGET)
 
@@ -1806,11 +1811,13 @@ def test_any_http_error_of_one_season_is_named_and_skipped(tmp_path):
         "status": 410, "error": "HTTP 410",
     }]
 
-    _Gone.status = 429
-    with pytest.raises(DiscoveryHTTPError, match="429"):
-        fetch_season_schedules(
-            _Gone(payloads), [READY_TARGET, CONFIGURED_TARGET], _store(tmp_path),
-        )
+    for status in (407, 409, 429, 502, 503):
+        _Gone.status = status
+        with pytest.raises(DiscoveryHTTPError, match=str(status)):
+            fetch_season_schedules(
+                _Gone(payloads), [READY_TARGET, CONFIGURED_TARGET],
+                _store(tmp_path),
+            )
 
 
 @pytest.mark.unit
