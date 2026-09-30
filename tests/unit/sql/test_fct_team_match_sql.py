@@ -14,7 +14,7 @@ Two test layers (pattern: ``test_fct_standings_logic.py``):
   * ``TestFctTeamMatchPointsResultLogic`` — Trino → DuckDB transpile via
     sqlglot; fixture: dim_match + fbref_match_enriched with a win, a draw
     and an unplayed match; empty stubs for the 5 cross-source LEFT JOIN
-    blocks (understat/whoscored/sofascore/fotmob + xref bridges).
+    blocks (understat/whoscored/sofascore + xref bridges; FotMob removed in #1590).
   * ``TestFctTeamMatchNullGuardStructure`` — regex sanity over the raw
     SQL so the guard can't drift even if DuckDB transpile breaks.
 """
@@ -234,18 +234,6 @@ def _bootstrap(con) -> None:
             total_tackles INTEGER, interceptions INTEGER,
             ground_duels_won_pct DOUBLE, aerial_duels_won_pct DOUBLE,
             fouls INTEGER, corner_kicks INTEGER, offsides INTEGER
-        )
-    """)
-    con.execute("""
-        CREATE TABLE silver.fotmob_team_match (
-            match_id VARCHAR, team_id VARCHAR,
-            league VARCHAR, season VARCHAR,
-            shots_inside_box INTEGER, big_chances INTEGER,
-            expected_goals DOUBLE, npxg DOUBLE, xgot DOUBLE,
-            expected_assists DOUBLE, touches_in_box INTEGER,
-            clearances INTEGER, big_chances_missed INTEGER,
-            shots_outside_box INTEGER, blocked_shots INTEGER,
-            shots_off_target INTEGER
         )
     """)
 

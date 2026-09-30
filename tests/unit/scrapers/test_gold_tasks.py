@@ -127,3 +127,66 @@ class TestRunGoldTransformFallback:
             )
 
         assert mock_run.call_args.kwargs['add_timestamp'] is False
+
+
+class TestSeasonAuditCoverageDenominator:
+    """#1590: the season audit spine widened from FBref∩FotMob to all FBref
+    rows, so a coverage check that counted NULL diffs as passed would be
+    diluted by unmeasured rows (100 mismatches + 10 000 unmeasured rows =
+    99 % "green"). Every audit_diff coverage check on these marts must
+    restrict its denominator to measured rows."""
+
+    _AUDITS = ('gold.fct_player_season_stats_audit',
+               'gold.fct_keeper_season_stats_audit')
+
+    def _captured_checks(self):
+        import utils.data_quality as dq
+
+        class _Stop(Exception):
+            pass
+
+        captured = {}
+
+        def _fake_run_checks(checks, **_kwargs):
+            captured['checks'] = list(checks)
+            raise _Stop
+
+        mod = _import_gold_tasks()
+        with patch.object(dq, 'run_checks', _fake_run_checks):
+            with pytest.raises(_Stop):
+                mod.validate_gold_quality()
+        return captured['checks']
+
+    def test_audit_coverage_checks_exclude_unmeasured_rows(self):
+        audit_cov = [
+            c for c in self._captured_checks()
+            if c.kind == 'coverage' and c.params['table'] in self._AUDITS
+        ]
+        assert len(audit_cov) == 8, [c.name for c in audit_cov]
+        for c in audit_cov:
+            cond = c.params['condition']
+            col = cond.split('ABS(', 1)[1].split(')', 1)[0]
+            assert 'IS NULL' not in cond, c.name
+            assert c.params['where'] == f'{col} IS NOT NULL', c.name
+
+    def test_dilution_regression(self):
+        """Semantics check on the runner: 100 mismatches among 110 measured
+        rows plus 10 000 unmeasured rows must NOT pass."""
+        from utils.data_quality import _run_coverage
+
+        check = next(
+            c for c in self._captured_checks()
+            if c.kind == 'coverage'
+            and c.params['table'] == 'gold.fct_player_season_stats_audit'
+        )
+        seen = {}
+
+        def _fake_fetchone(_conn, sql):
+            seen['sql'] = sql
+            # measured-only denominator: 110 rows, 10 within threshold
+            return (110, 10) if ' WHERE ' in sql else (10_110, 10_010)
+
+        with patch('utils.data_quality._fetchone', _fake_fetchone):
+            result = _run_coverage(None, check)
+        assert ' WHERE ' in seen['sql'] and 'IS NOT NULL' in seen['sql']
+        assert result['passed'] is False

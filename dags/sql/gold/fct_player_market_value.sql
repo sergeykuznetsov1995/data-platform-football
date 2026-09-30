@@ -2,12 +2,9 @@
 -- Gold: fct_player_market_value  (issue #430 — two sources + source in PK)
 -- =============================================================================
 -- One valuation point per (player_id, valuation_date, source).
--- Two sources, both kept side by side — we do NOT pick a "correct" one here
--- (that is a feature decision, floor 2):
+-- Designed for two sources kept side by side (FotMob + Transfermarkt); the
+-- FotMob branch was removed in #1590 with the legacy FotMob Silver layer:
 --
---   fotmob        — silver.fotmob_player_market_value_history (canonical_id is
---                   resolved when xref has one unambiguous match; otherwise a
---                   stable fm_<source_id> is retained).
 --   transfermarkt — silver.transfermarkt_market_value_history (canonical_id IS
 --                   resolved in Silver; unresolved rows retain tm_<source_id>).
 --
@@ -25,53 +22,12 @@
 -- valuation.  Source-prefixed ids are stable, collision-safe across sources,
 -- and remain visible to the soft dim_player FK DQ until xref resolves them.
 --
--- ⚠️ xref JOIN MUST include (league, season) predicate (CLAUDE.md footgun):
---   silver.xref_player has per-(source, source_id, season) rows; without the
---   season condition the FotMob join fans out 1.5-4×. Season is a varchar slug
---   '2526' on both sides after #404 (slug = slug).
---
 -- PK:           (player_id, valuation_date, source)
 -- FK:           player_id -> dim_player (soft, WARNING rate-mode)
 -- Partitioning: none (small off-field table, no season key)
 -- =============================================================================
 
-WITH xref_fotmob AS (
-    SELECT
-        source_id    AS fotmob_player_id,
-        league,
-        season       AS season_year,
-        CASE
-            WHEN COUNT(DISTINCT canonical_id) = 1 THEN MIN(canonical_id)
-            ELSE NULL
-        END AS canonical_id
-    FROM iceberg.silver.xref_player
-    WHERE source = 'fotmob'
-      AND confidence <> 'orphan'
-      AND canonical_id IS NOT NULL
-    GROUP BY source_id, league, season
-),
-
-fotmob AS (
-    SELECT
-        COALESCE(
-            xfm.canonical_id,
-            CONCAT('fm_', CAST(mv.player_id AS varchar))
-        )                                                 AS player_id,
-        mv.value_date                                     AS valuation_date,
-        mv.market_value_eur                               AS market_value_eur,
-        mv.currency                                       AS currency,
-        CAST('fotmob' AS varchar)                         AS source,
-        CAST(mv._bronze_ingested_at AS timestamp(6))      AS _bronze_ingested_at
-    FROM iceberg.silver.fotmob_player_market_value_history mv
-    LEFT JOIN xref_fotmob xfm
-        ON  xfm.fotmob_player_id = mv.player_id
-        AND xfm.league           = mv.league
-        AND xfm.season_year      = mv.season
-    WHERE mv.player_id IS NOT NULL
-      AND mv.value_date IS NOT NULL
-),
-
-transfermarkt AS (
+WITH transfermarkt AS (
     SELECT
         COALESCE(
             tm.canonical_id,
@@ -88,8 +44,9 @@ transfermarkt AS (
 ),
 
 unioned AS (
-    SELECT * FROM fotmob
-    UNION ALL
+    -- #1590: the FotMob branch (legacy FotMob Silver market-value history) was
+    -- removed; source is now always 'transfermarkt'. The `source` PK column
+    -- stays so the schema is unchanged for the new FotMob Silver.
     SELECT * FROM transfermarkt
 ),
 

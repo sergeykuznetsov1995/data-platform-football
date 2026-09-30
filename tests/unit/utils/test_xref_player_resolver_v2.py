@@ -580,28 +580,9 @@ class TestBackwardCompat:
 
 
 class TestNativeTransfermarktReaders:
-    def test_fotmob_minutes_read_native_backed_silver_profile(self, monkeypatch):
-        captured = {}
-
-        def fake_execute(_conn, sql, fetch=False):
-            captured['sql'] = sql
-            assert fetch is True
-            return [('42', 'Player', 'Arsenal', 'ENG-Premier League',
-                     '2526', 1234.0)]
-
-        monkeypatch.setattr(xpr, '_execute', fake_execute)
-
-        rows = xpr._fetch_fotmob_players(
-            object(), 'ENG-Premier League', [2025],
-        )
-
-        assert len(rows) == 1
-        assert rows[0]['bronze_signal'] == 1234.0
-        assert (
-            'iceberg.silver.fotmob_player_season_profile' in captured['sql']
-        )
-        assert 'iceberg.silver.fotmob_keeper_profile' in captured['sql']
-        assert 'iceberg.bronze.fotmob_player_stats' not in captured['sql']
+    def test_fotmob_legacy_silver_reader_removed(self):
+        """#1590: the resolver no longer reads the legacy FotMob Silver."""
+        assert not hasattr(xpr, '_fetch_fotmob_players')
 
     def test_player_anchors_read_squad_membership_grain(self, monkeypatch):
         captured = {}
@@ -639,7 +620,8 @@ class TestNativeTransfermarktReaders:
         )
         assert 'iceberg.bronze.transfermarkt_players' not in sql
 
-    def test_fotmob_dob_map_reads_native_backed_silver_profile(self, monkeypatch):
+    def test_dob_maps_do_not_read_legacy_fotmob_silver(self, monkeypatch):
+        """#1590: no FotMob DOB projection over the legacy FotMob Silver."""
         projections = {}
 
         def fake_fetch(_conn, sql, source):
@@ -650,11 +632,8 @@ class TestNativeTransfermarktReaders:
 
         xpr._fetch_dob_maps(object(), 'ENG-Premier League', ['2526'])
 
-        sql = projections['fotmob']
-        assert 'iceberg.silver.fotmob_player_profile' in sql
-        assert 'iceberg.bronze.fotmob_team_squad' not in sql
-        assert "season IN ('2526')" in sql
-        assert '_bronze_ingested_at' in sql
+        assert 'fotmob' not in projections
+        assert not any('silver.fotmob_' in sql for sql in projections.values())
 
 
 # ---------------------------------------------------------------------------

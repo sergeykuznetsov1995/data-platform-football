@@ -26,8 +26,10 @@
 #       _generic: ["Old Trafford"]          # every observed spelling, any source
 #     competition_scope: ["ENG-Premier League"]
 #
-# capacity (issue #750): PRIMARY source is now FotMob (silver.fotmob_team_profile,
-# auto + global) — dim_venue does COALESCE(fotmob_capacity, curated_capacity). The
+# capacity (issue #750): PRIMARY source was FotMob (legacy FotMob Silver team
+# profile, auto + global). #1590 removed that Silver layer, so dim_venue now takes
+# capacity from this curated register ONLY (NULL for uncovered venues) until the
+# new FotMob Silver lands. The notes below describe the #750 split. The
 # hand-curated Wikipedia register (#434) was removed for the ~29 venues FotMob covers;
 # only a small CURATED FALLBACK remains for venues FotMob's team-profile cannot supply,
 # because that endpoint reports each club's CURRENT ground for every season. So clubs

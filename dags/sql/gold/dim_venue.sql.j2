@@ -7,9 +7,6 @@
 -- Sources:
 --   iceberg.silver.fbref_match_enriched   (sch.venue per match)
 --   iceberg.silver.espn_matchsheet        (conform: venue per match, dedup'd #735)
---   iceberg.silver.fotmob_team_profile    (venue-attribute lookup only, #719 coords +
---                                          #750 city/surface/capacity/opened — does NOT
---                                          contribute venue rows; grain unchanged)
 --   iceberg.silver.sofascore_venue        (venue-attribute lookup only, #753:
 --                                          city/country/coords per match — does NOT
 --                                          contribute venue rows; grain unchanged)
@@ -35,24 +32,22 @@
 --
 -- Output columns (star-schema design, issue #425):
 --   venue_name   = canonical_name from YAML, else MAX(name) fbref > espn
---   city         = curated venue_aliases.yaml, else FotMob (#750), else SofaScore (#753)
+--   city         = curated venue_aliases.yaml, else SofaScore (#753)
 --   country      = curated venue_aliases.yaml, else SofaScore event.venue (#753)
---   capacity     = COALESCE(FotMob, curated fallback) (#750): FotMob
---                  silver.fotmob_team_profile is primary (replaced bulk of #434);
---                  small curated fallback remains for moved grounds FotMob can't
---                  supply. NULL only when neither source has it.
---   surface/opened = FotMob venue.statPairs (#750); NULL when no FotMob match
---   latitude/longitude = stadium coords: FotMob silver.fotmob_team_profile (#719)
---                  primary, SofaScore silver.sofascore_venue (#753) fills NULLs;
---                  matched by normalised venue name. NULL when neither matches.
+--   capacity     = curated venue_aliases.yaml (NULL when not curated)
+--   surface/opened = typed NULL (#1590)
+--   latitude/longitude = stadium coords from SofaScore silver.sofascore_venue
+--                  (#753), matched by normalised venue name; NULL when no match.
+--   #1590: the FotMob team-profile enrichment (#719 coords, #750
+--   city/surface/capacity/opened) was removed together with the legacy FotMob
+--   Silver layer; the columns stay (schema unchanged) for the new FotMob Silver.
 --                  Feeds flight-distance features for the home-advantage study (#558).
 --   venue_source = 'curated' (matched alias) | 'orphan' (unmatched) — kept
 --                  for the orphan-rate DQ check in validate_gold_quality
 --
 -- Notes:
---   * city: curated venue_aliases.yaml wins; FotMob fills NULLs for non-curated /
---     orphan venues (#750); SofaScore fills any remaining (#753). country: curated
---     wins, SofaScore event.venue fills the rest (#753).
+--   * city: curated venue_aliases.yaml wins; SofaScore fills the rest (#753).
+--     country: curated wins, SofaScore event.venue fills the rest (#753).
 --   * Normalisation key (NFD + strip diacritics + remove non-alphanumerics)
 --     folds apostrophe/period variants ("St James' Park" / "St. James' Park")
 --     automatically, so the curator only lists genuinely distinct spellings.
@@ -70,9 +65,8 @@ with aliases as (
         -- League predicate (issue #148): guard the JOIN on a.league = u.league
         -- so worldwide namesakes (one spelling, two cities) never cross-merge.
         league,
-        -- capacity (issue #750): CURATED FALLBACK only — COALESCE'd BEHIND FotMob in
-        -- the final SELECT, kept just for venues FotMob's current-ground team-profile
-        -- can't supply (moved grounds). 7th UNQUOTED col (include_capacity=True).
+        -- capacity (issue #750): curated value; the only capacity source since
+        -- #1590. 7th UNQUOTED col (include_capacity=True).
         capacity,
         -- Normalised join key: lower -> strip diacritics (NFD + \p{Mn}) ->
         -- remove all non-alphanumerics. Same idiom as xref_referee.sql.j2.
@@ -112,35 +106,10 @@ espn_venues as (
       and trim(venue) <> ''
 ),
 
--- FotMob venue enrichment (#719 coords + #750 city/surface/capacity/opened): keyed by
--- (league, normalised venue name). Enrichment lookup ONLY — joined into `resolved`,
--- never UNION'd into the venue feed, so dim_venue's one-row-per-venue grain is
--- untouched. Same norm idiom as the alias join; (league, norm) guards worldwide
--- namesakes. No coords filter (#750) — attributes may exist without coords; MAX
--- ignores NULLs, so each attribute is aggregated independently.
-fotmob_venue as (
-    select
-        league,
-        regexp_replace(
-            regexp_replace(normalize(lower(trim(venue)), NFD), '\p{Mn}+', ''),
-            '[^a-z0-9]+', ''
-        )                                            as norm,
-        max(venue_latitude)                          as latitude,
-        max(venue_longitude)                         as longitude,
-        max(venue_city)                              as city,
-        max(venue_surface)                           as surface,
-        max(venue_capacity)                          as capacity,
-        max(venue_opened)                            as opened
-    from iceberg.silver.fotmob_team_profile
-    where venue is not null
-      and trim(venue) <> ''
-    group by 1, 2
-),
-
 -- SofaScore venue enrichment (#753): per-match `event.venue` → historically
 -- accurate stadium (NO current-ground bias — fills moved grounds FotMob's
 -- team-profile mislabels: Goodison Park / White Hart Lane). Keyed by (league,
--- normalised stadium name) like fotmob_venue; enrichment lookup ONLY (joined
+-- normalised stadium name) like the alias join; enrichment lookup ONLY (joined
 -- into `resolved`, never UNION'd — one-row-per-venue grain untouched). MAX
 -- ignores NULLs, so each attribute aggregates independently.
 sofascore_venue as (
@@ -178,12 +147,6 @@ resolved as (
         a.city                                       as city_curated,
         a.country                                    as country_curated,
         a.capacity                                   as capacity_curated,
-        f.city                                       as city_fotmob,
-        f.capacity                                   as capacity_fotmob,
-        f.surface                                    as surface,
-        f.opened                                     as opened,
-        f.latitude,
-        f.longitude,
         s.city                                       as city_sofascore,
         s.country                                    as country_sofascore,
         s.latitude                                   as latitude_sofascore,
@@ -205,12 +168,6 @@ resolved as (
                       regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
                       '[^a-z0-9]+', ''
                   )
-    left join fotmob_venue f
-      on f.league = u.league
-     and f.norm = regexp_replace(
-                      regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
-                      '[^a-z0-9]+', ''
-                  )
     left join sofascore_venue s
       on s.league = u.league
      and s.norm = regexp_replace(
@@ -225,14 +182,8 @@ aggregated as (
         max(canonical_id)                            as canonical_id,
         max(canonical_name)                          as canonical_name,
         max(city_curated)                            as city_curated,
-        max(city_fotmob)                             as city_fotmob,
         max(country_curated)                         as country_curated,
-        max(capacity_fotmob)                         as capacity_fotmob,
         max(capacity_curated)                        as capacity_curated,
-        max(surface)                                 as surface,
-        max(opened)                                  as opened,
-        max(latitude)                                as latitude,
-        max(longitude)                               as longitude,
         max(city_sofascore)                          as city_sofascore,
         max(country_sofascore)                       as country_sofascore,
         max(latitude_sofascore)                      as latitude_sofascore,
@@ -251,29 +202,26 @@ aggregated as (
 select
     venue_id,
     coalesce(canonical_name, venue_fbref, venue_espn)                          as venue_name,
-    -- city (issue #750/#753): curated venue_aliases.yaml wins; FotMob fills the
-    -- NULLs, then SofaScore `event.venue.city` fills any still-NULL (moved /
-    -- orphan grounds).
-    coalesce(city_curated, city_fotmob, city_sofascore)                        as city,
+    -- city (issue #753): curated venue_aliases.yaml wins; SofaScore
+    -- `event.venue.city` fills any still-NULL (moved / orphan grounds).
+    coalesce(city_curated, city_sofascore)                                     as city,
     -- country (issue #753): curated wins; SofaScore `event.venue.country` fills the
     -- rest. FotMob carries TEAM country, not venue country — this was a followup
     -- (was curated-only) now closed by the SofaScore venue source.
     coalesce(country_curated, country_sofascore)                               as country,
-    -- capacity (issue #750): FotMob silver.fotmob_team_profile is PRIMARY (auto +
-    -- global, replaced the bulk of #434); COALESCE to a small curated FALLBACK for
-    -- venues FotMob's current-ground team-profile can't supply (moved grounds like
-    -- Goodison Park / White Hart Lane / Wembley). NULL only when neither has it.
-    cast(coalesce(capacity_fotmob, capacity_curated) as integer)               as capacity,
-    -- surface / opened (issue #750): new attributes from FotMob venue.statPairs.
-    surface,
-    cast(opened as integer)                                                    as opened,
-    -- latitude/longitude (issue #719 + #753): FotMob stadium coords (matched by
-    -- normalised venue name) are PRIMARY; SofaScore `event.venue.venueCoordinates`
-    -- fills NULLs WHEN PRESENT — but a live check 2026-06-23 found coords SPORADIC
-    -- in the SofaScore venue payload (often absent), so this is a bonus; the
-    -- reliable SofaScore value-add is city/country, not coords.
-    cast(coalesce(latitude, latitude_sofascore) as double)                     as latitude,
-    cast(coalesce(longitude, longitude_sofascore) as double)                   as longitude,
+    -- capacity: curated venue_aliases.yaml only since #1590 (the FotMob
+    -- team-profile primary was removed with the legacy FotMob Silver).
+    cast(capacity_curated as integer)                                          as capacity,
+    -- surface / opened (issue #750): FotMob-only attributes — typed NULL since
+    -- #1590 (column kept, schema unchanged).
+    cast(null as varchar)                                                      as surface,
+    cast(null as integer)                                                      as opened,
+    -- latitude/longitude (issue #753): SofaScore `event.venue.venueCoordinates`
+    -- (matched by normalised venue name). A live check 2026-06-23 found coords
+    -- SPORADIC in the SofaScore venue payload (often absent). The FotMob coords
+    -- primary (#719) was removed in #1590.
+    cast(latitude_sofascore as double)                                         as latitude,
+    cast(longitude_sofascore as double)                                        as longitude,
     -- Kept beyond the design's column list: the orphan-rate DQ check in
     -- gold_tasks.validate_gold_quality filters on venue_source = 'orphan'.
     case when canonical_id is not null then 'curated' else 'orphan' end        as venue_source

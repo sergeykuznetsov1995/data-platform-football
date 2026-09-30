@@ -288,7 +288,7 @@ SILVER_E3_TRANSFORMS = [
         # bronze.sofascore_league_table (dedup ROW_NUMBER, cast, season-slug as-is)
         # — NO silver.xref reads (canonical resolve deferred to Gold per charter §5),
         # so it does NOT depend on dag_transform_xref. Consumer: gold.fct_standings
-        # (primary source; FotMob silver.fotmob_team_standings is the fallback).
+        # (single source since #1590 removed the FotMob fallback).
         # Placed in e3 so it materialises before dag_transform_fbref_gold.
         'sofascore_league_table',
         'dags/sql/silver/sofascore_league_table.sql',

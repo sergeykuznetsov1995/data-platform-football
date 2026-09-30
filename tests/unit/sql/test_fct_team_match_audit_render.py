@@ -66,7 +66,7 @@ class TestFctTeamMatchAuditSql:
         assert "iceberg.silver.understat_team_match" in sql
         assert "iceberg.silver.sofascore_team_match" in sql
         assert "iceberg.silver.whoscored_team_match" in sql
-        assert "iceberg.silver.fotmob_team_match" in sql
+        assert "silver.fotmob_" not in sql  # #1590: legacy FotMob Silver removed
         assert "gold.fct_team_match" not in sql, (
             "audit must читать Silver напрямую (one-hop), не gold.fct_team_match"
         )
@@ -84,14 +84,14 @@ class TestFctTeamMatchAuditSql:
             sql, re.IGNORECASE,
         ), "audit must INNER JOIN на Understat Silver (secondary spine)"
 
-    def test_left_join_sofascore_whoscored_fotmob(self):
-        """SofaScore / WhoScored / FotMob — LEFT JOIN: добавочные diffs, не
-        сужают spine. Если источника нет → diff = NULL."""
+    def test_left_join_sofascore_whoscored(self):
+        """SofaScore / WhoScored — LEFT JOIN: добавочные diffs, не сужают
+        spine. Если источника нет → diff = NULL. FotMob (*_fm diffs) — NULL
+        с #1590 (старый FotMob Silver удалён)."""
         sql = _read_sql()
         for src in (
             "sofascore_team_match",
             "whoscored_team_match",
-            "fotmob_team_match",
         ):
             assert re.search(
                 rf"LEFT\s+JOIN\s+iceberg\.silver\.{src}",

@@ -51,7 +51,8 @@ class TestFctKeeperSeasonStatsSql:
         sql = _strip_comments(_read_sql())
         assert "iceberg.silver.xref_player" in sql
         assert "iceberg.silver.fbref_keeper_profile" in sql
-        assert "iceberg.silver.fotmob_keeper_profile" in sql
+        # #1590: the legacy FotMob Silver keeper branch was removed.
+        assert "silver.fotmob_" not in sql
         # WhoScored event-aggregate подключён за keeper_saves/pickups/claims.
         assert "iceberg.silver.whoscored_player_season_aggregate" in sql
         # outfield-таблицы НЕ должны читаться — keeper-витрина только GK
@@ -142,22 +143,21 @@ class TestFctKeeperSeasonStatsSql:
     def test_hard_fact_coalesce_columns(self):
         sql = _read_sql()
         # 5 HARD_FACT для keeper: matches/minutes/clean_sheets/yellow_cards/red_cards.
-        # Variadic COALESCE — допускает доп. источники (на будущее).
+        # #1590: FBref only (FotMob fallback removed); single-source metrics
+        # render the bare expr, CAST AS DOUBLE keeps the pre-removal type.
         hard_facts = [
-            ('mp', 'matches_played', 'matches'),
-            ('minutes', 'minutes_played', 'minutes'),
-            ('clean_sheets', 'clean_sheets', 'clean_sheets'),
-            ('yellow_cards', 'yellow_cards', 'yellow_cards'),
-            ('red_cards', 'red_cards', 'red_cards'),
+            ('mp', 'matches', False),
+            ('minutes', 'minutes', True),
+            ('clean_sheets', 'clean_sheets', True),
+            ('yellow_cards', 'yellow_cards', True),
+            ('red_cards', 'red_cards', True),
         ]
-        for fb_col, fm_col, alias in hard_facts:
-            pattern = (
-                rf"COALESCE\s*\(\s*fb\.{fb_col}\s*,\s*fm\.{fm_col}"
-                rf"(?:\s*,[^)]+)?\s*\)\s+AS\s+{alias}\b"
+        for fb_col, alias, cast_double in hard_facts:
+            expr = rf"CAST\(fb\.{fb_col} AS DOUBLE\)" if cast_double else rf"fb\.{fb_col}"
+            assert re.search(rf"{expr}\s+AS\s+{alias}\b", sql, re.IGNORECASE), (
+                f"HARD_FACT `{alias}` must be {expr}"
             )
-            assert re.search(pattern, sql, re.IGNORECASE), (
-                f"HARD_FACT `{alias}` must be COALESCE(fb.{fb_col}, fm.{fm_col}, ...)"
-            )
+        assert not re.search(r"\bfm\.", sql)
 
     def test_no_audit_diff_columns(self):
         """Audit-diff колонки вынесены в `gold.fct_keeper_season_stats_audit`."""
@@ -204,18 +204,23 @@ class TestFctKeeperSeasonStatsSql:
             'accurate_passes_per_90', 'accurate_long_balls_per_90',
             'fotmob_rating',
         ]
+        # #1590: typed NULL (schema unchanged).
         for col in unique:
-            assert re.search(rf"fm\.{col}\b", sql, re.IGNORECASE), (
-                f"UNIQUE_FOTMOB keeper column `{col}` must come from fm."
-            )
+            assert re.search(
+                rf"CAST\(NULL AS double\)\s+AS\s+{col}\b", sql, re.IGNORECASE,
+            ), f"UNIQUE_FOTMOB keeper column `{col}` must be a typed NULL"
+        assert re.search(
+            r"CAST\(NULL AS double\)\s+AS\s+save_percentage_fotmob\b",
+            sql, re.IGNORECASE,
+        )
 
-    def test_psxg_minus_ga_from_fotmob_goals_prevented(self):
-        """#428 §5.3: psxg_minus_ga = FotMob goals_prevented (≡ PSxG − GA);
-        FBref PSxG мёртв с Feb-2026 (keeper_adv expected-NULL)."""
+    def test_psxg_minus_ga_is_typed_null(self):
+        """#428 §5.3: psxg_minus_ga was FotMob goals_prevented (≡ PSxG − GA);
+        FBref PSxG мёртв с Feb-2026. #1590: FotMob removed → typed NULL."""
         sql = _strip_comments(_read_sql())
         assert re.search(
-            r"fm\.goals_prevented\s+AS\s+psxg_minus_ga\b", sql, re.IGNORECASE,
-        ), "psxg_minus_ga must be projected from fm.goals_prevented"
+            r"CAST\(NULL AS double\)\s+AS\s+psxg_minus_ga\b", sql, re.IGNORECASE,
+        ), "psxg_minus_ga must be a typed NULL"
 
     def test_unique_whoscored_keeper_columns_present(self):
         """WhoScored event-aggregate GK-метрики (3 колонки)."""

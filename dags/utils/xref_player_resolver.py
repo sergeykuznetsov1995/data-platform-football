@@ -216,7 +216,7 @@ KNOWN_PAIRS: Tuple[Tuple[str, str], ...] = (
 #: target codified in docs/research/R2_player_resolver.md.
 KNOWN_PAIR_MIN_PASS = 8
 
-#: Extended known-pair gate over FBref+SofaScore+FotMob. WARNING-only for
+#: Extended known-pair gate over FBref+SofaScore. WARNING-only for
 #: now: the historical exclusion reason (sparse sofascore_player_profile
 #: names) must be empirically disproven on live data before this can raise
 #: ResolverError like the core gate. TODO(#xref-dob): promote to a hard gate
@@ -261,17 +261,6 @@ def normalize_name(s: Optional[str]) -> str:
     from unidecode import unidecode  # type: ignore
 
     return " ".join(unidecode(s).lower().split())
-
-
-# FotMob youth squads ("Arsenal U21", "Chelsea Under-21") — the FBref APL spine
-# never carries U18-U23 teams, so these rows can only ever orphan. Matched on
-# the raw team name and excluded at ingest (issue #563).
-_YOUTH_TEAM_RE = re.compile(r"(?i)\b(?:under[-\s]?|u[-\s]?)(?:18|19|20|21|23)\b")
-
-
-def _is_youth_team(team_name: Optional[str]) -> bool:
-    """True for FotMob youth squads (e.g. 'Arsenal U21') — never in FBref spine."""
-    return bool(team_name and _YOUTH_TEAM_RE.search(team_name))
 
 
 def canonical_team_for_resolver(
@@ -1158,126 +1147,6 @@ def _fetch_whoscored_players(
     return out
 
 
-def _fetch_fotmob_players(
-    conn, league: str, fbref_seasons: List[int]
-) -> List[Dict[str, Any]]:
-    """Read FotMob player anchor rows for the resolver cascade.
-
-    Identity (player_id + name + team) comes from ``silver.fotmob_lineup``,
-    parsed from native ``bronze.fotmob_match_payloads_current.lineup_json``.
-    It deliberately does not use global player or current-squad snapshots:
-    those describe observation-time membership, not the club a player
-    represented in a historical season. The lineup contract is season-accurate
-    (team_name = the team the player appeared for in that match), and
-    ``primary_team`` is the team with the most appearances that season
-    (``max_by``), so a mid-season transfer maps to its dominant club (#825).
-
-    The minutes-played signal comes from the native-backed
-    ``silver.fotmob_player_season_profile`` (outfield) plus its
-    ``silver.fotmob_keeper_profile`` sibling. It is used for the
-    senior-appearance signal<=0 filter (#563) and the
-    _dedup_canonical_per_season tiebreaker (#70). Reading the Silver contract
-    avoids freezing the resolver on the stopped legacy FotMob feed; the Silver
-    profile itself does not consume xref_player, so this adds no dependency
-    cycle.
-
-    Both FotMob Silver tables already expose season slugs ('2526'); convert the
-    incoming FBref-style year list once for both filters.
-    """
-    season_slugs = [_fbref_year_to_slug(y, league=league) for y in fbref_seasons]
-    sql = f"""
-        WITH mins_source AS (
-            SELECT CAST(player_id AS varchar) AS player_id, league, season,
-                   minutes_played
-            FROM iceberg.silver.fotmob_player_season_profile
-            WHERE league = '{_sql_escape(league)}'
-              AND season IN ({_seasons_in_clause(season_slugs)})
-
-            UNION ALL
-
-            SELECT CAST(player_id AS varchar) AS player_id, league, season,
-                   minutes_played
-            FROM iceberg.silver.fotmob_keeper_profile
-            WHERE league = '{_sql_escape(league)}'
-              AND season IN ({_seasons_in_clause(season_slugs)})
-        ),
-        mins AS (
-            SELECT player_id, league, season,
-                   MAX(minutes_played) AS minutes_played
-            FROM mins_source
-            GROUP BY player_id, league, season
-        ),
-        per_team AS (
-            SELECT
-                player_id,
-                league,
-                season,
-                team_name,
-                arbitrary(player_name) AS player_name,
-                COUNT(*) AS apps
-            FROM iceberg.silver.fotmob_lineup
-            WHERE league = '{_sql_escape(league)}'
-              AND season IN ({_seasons_in_clause(season_slugs)})
-              AND player_id IS NOT NULL
-              AND player_name IS NOT NULL
-            GROUP BY player_id, league, season, team_name
-        ),
-        anchors AS (
-            SELECT
-                player_id,
-                max_by(player_name, apps) AS name,
-                max_by(team_name, apps)   AS primary_team_name,
-                league,
-                season
-            FROM per_team
-            GROUP BY player_id, league, season
-        )
-        SELECT a.player_id,
-               a.name,
-               a.primary_team_name,
-               a.league,
-               a.season,
-               COALESCE(m.minutes_played, 0.0) AS bronze_signal
-        FROM anchors a
-        LEFT JOIN mins m
-          ON m.player_id = a.player_id
-         AND m.league    = a.league
-         AND m.season    = a.season
-    """
-    rows = _execute(conn, sql, fetch=True) or []
-    out: List[Dict[str, Any]] = []
-    seen: set = set()
-    for pid, name, team, lg, season, signal in rows:
-        # Align FotMob population with FBref coverage (issue #563). FBref lists
-        # only players with senior APL appearances and never carries U21 squads,
-        # so youth teams and zero-minute deep-squad/reserve players are
-        # structural non-overlaps, not resolver misses — they inflate the orphan
-        # rate ~10pp. Mirrors the Capology active+loan filter (_fetch_capology).
-        if _is_youth_team(team) or float(signal or 0.0) <= 0.0:
-            continue
-        # Dedup by (pid, team, season). silver.fotmob_lineup season is already a
-        # slug, and `anchors` collapses to one row per (player_id, season), so
-        # this is a belt-and-braces guard; multi-season players keep separate
-        # xref rows.
-        key = (str(pid), team, season)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(
-            {
-                'source': 'fotmob',
-                'source_id': str(pid),
-                'player_name': name,
-                'raw_team_name': team,
-                'canonical_team': canonical_team_for_resolver(team, 'fotmob'),
-                'league': lg,
-                'season': season,
-                'bronze_signal': float(signal) if signal is not None else 0.0,
-            }
-        )
-    return out
-
-
 def _fetch_sofascore_players(
     conn, league: str, source_seasons: List[str]
 ) -> List[Dict[str, Any]]:
@@ -1620,9 +1489,8 @@ def _fetch_espn_players(
 # (no season), taking the freshest stable-source value via max_by(..., lineage).
 # Every reader degrades to an empty map on ANY error (missing table, absent
 # column) — the DOB feature is strictly additive and must never fail a run.
-# FotMob is the exception to the raw-reader pattern: its native-backed Silver
-# player profile does not JOIN xref_player, so it is safe and avoids the frozen
-# legacy squad feed. Other readers remain source-native/canonical as noted.
+# Readers remain source-native/canonical as noted. (#1590: the FotMob reader
+# over the legacy FotMob Silver player profile was removed.)
 
 
 def _fetch_dob_map(conn, sql: str, source: str) -> Dict[str, Any]:
@@ -1641,7 +1509,7 @@ def _fetch_dob_map(conn, sql: str, source: str) -> Dict[str, Any]:
 def _fetch_dob_maps(
     conn, league: str, source_seasons: List[str]
 ) -> Dict[str, Dict[str, Any]]:
-    """DOB maps for the 5 DOB-carrying sources.
+    """DOB maps for the 4 DOB-carrying sources (FotMob removed in #1590).
 
     Returns ``{source: {source_id: datetime.date}}``. Understat / Capology /
     ESPN carry no DOB in Bronze; FBref (the spine) is not scraped for DOB —
@@ -1650,16 +1518,6 @@ def _fetch_dob_maps(
     lg = _sql_escape(league)
     seasons = _seasons_in_clause(source_seasons)
     queries = {
-        # date_of_birth is a varchar passthrough (ISO). The Silver profile is
-        # native-backed and independent of xref_player (no dependency cycle).
-        'fotmob': f"""
-            SELECT CAST(player_id AS varchar),
-                   max_by(TRY_CAST(date_of_birth AS DATE), _bronze_ingested_at)
-            FROM iceberg.silver.fotmob_player_profile
-            WHERE league = '{lg}' AND season IN ({seasons})
-              AND player_id IS NOT NULL AND date_of_birth IS NOT NULL
-            GROUP BY CAST(player_id AS varchar)
-        """,
         'sofascore': """
             SELECT CAST(player_id AS varchar),
                    max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
@@ -2429,10 +2287,11 @@ _KNOWN_PAIR_CORE_SOURCES_BY_LEAGUE: Dict[str, frozenset] = {
 }
 
 #: Extended WARNING-only gate: SofaScore names come from a possibly-sparse
-#: profile JOIN and FotMob has a separate ingest, so these were historically
-#: excluded from the hard assertion. Verified softly until live pass-rates
-#: justify promotion (see KNOWN_PAIR_EXT_MIN_PASS).
-_KNOWN_PAIR_EXT_SOURCES = frozenset({'fbref', 'sofascore', 'fotmob'})
+#: profile JOIN, so it was historically excluded from the hard assertion.
+#: Verified softly until live pass-rates justify promotion (see
+#: KNOWN_PAIR_EXT_MIN_PASS). #1590: FotMob dropped from the set — the FotMob
+#: reader was removed, so requiring it would fail the gate on every run.
+_KNOWN_PAIR_EXT_SOURCES = frozenset({'fbref', 'sofascore'})
 
 
 def _verify_known_pairs(
@@ -2674,9 +2533,9 @@ def run_resolver(
         ws = _fetch_whoscored_players(conn, league, source_seasons)
         logger.info("  %d WhoScored players", len(ws))
 
-        logger.info("Reading FotMob players ...")
-        fm = _fetch_fotmob_players(conn, league, fbref_seasons)
-        logger.info("  %d FotMob players", len(fm))
+        # #1590: the FotMob reader (legacy FotMob Silver lineup/profile tables)
+        # was removed; FotMob contributes no xref_player rows until the new
+        # FotMob Silver layer lands.
 
         logger.info("Reading SofaScore players ...")
         ss = _fetch_sofascore_players(conn, league, source_seasons)
@@ -2709,7 +2568,7 @@ def run_resolver(
         dob_maps = _fetch_dob_maps(conn, league, source_seasons)
         candidates_with_dob = 0
         for src_rows, src in (
-            (fm, 'fotmob'), (ss, 'sofascore'), (tm, 'transfermarkt'),
+            (ss, 'sofascore'), (tm, 'transfermarkt'),
             (sf, 'sofifa'), (ws, 'whoscored'),
         ):
             m = dob_maps.get(src) or {}
@@ -2725,7 +2584,7 @@ def run_resolver(
         logger.info("Resolving identities ...")
         dob_stats: Dict[str, Any] = {}
         rows, review_rows, stats = _resolve_all(
-            fb, us, ws, ss, fm, tm, cap, sf, es, nn=nn,
+            fb, us, ws, ss, None, tm, cap, sf, es, nn=nn,
             detected_at=detected_at, dob_stats_out=dob_stats,
         )
         logger.info(
@@ -2771,7 +2630,7 @@ def run_resolver(
                     "Inspect alias YAML / threshold tuning before retrying."
                 )
 
-            # Extended gate (FBref+SofaScore+FotMob) — WARNING-only for now,
+            # Extended gate (FBref+SofaScore) — WARNING-only for now,
             # see KNOWN_PAIR_EXT_MIN_PASS. Never aborts the run.
             ext_passed, ext_total = _verify_known_pairs(
                 rows, required_sources=_KNOWN_PAIR_EXT_SOURCES,
@@ -2779,7 +2638,7 @@ def run_resolver(
             )
             if ext_passed < KNOWN_PAIR_EXT_MIN_PASS:
                 logger.warning(
-                    "Extended known-pair gate (fbref+sofascore+fotmob): %d/%d "
+                    "Extended known-pair gate (fbref+sofascore): %d/%d "
                     "passed, soft target ≥%d/%d — NOT failing the run "
                     "(WARNING-only gate).",
                     ext_passed, ext_total, KNOWN_PAIR_EXT_MIN_PASS, ext_total,

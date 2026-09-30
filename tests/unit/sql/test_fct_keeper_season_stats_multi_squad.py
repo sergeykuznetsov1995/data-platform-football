@@ -8,7 +8,7 @@ crucially, exercises the #515 B2 ratio re-derivation: для мульти-squad 
 pk_save_pct) ПЕРЕСЧИТЫВАЮТСЯ из суммированных счётчиков; одноклубный вратарь
 сохраняет родной FBref-ratio (0-diff к Варианту A).
 
-The two enrichment sources (FotMob keeper / WhoScored) are empty — LEFT JOINs
+The enrichment source (WhoScored; FotMob removed in #1590) is empty — LEFT JOINs
 yield NULLs, so every published column comes from the FBref keeper spine.
 """
 
@@ -39,7 +39,6 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.silver.xref_player":                       "silver_xref_player",
     "iceberg.silver.xref_team":                         "silver_xref_team",
     "iceberg.silver.fbref_keeper_profile":              "silver_fbref_keeper_profile",
-    "iceberg.silver.fotmob_keeper_profile":             "silver_fotmob_keeper_profile",
     "iceberg.silver.whoscored_player_season_aggregate": "silver_whoscored_player_season_aggregate",
 }
 
@@ -70,13 +69,6 @@ _FB_COLS = [
     "goals_against_per90", "save_pct", "clean_sheet_pct", "pk_save_pct",
 ]
 
-_FM_COLS = [
-    "player_id", "league", "season", "matches_played", "minutes_played",
-    "clean_sheets", "yellow_cards", "red_cards", "save_percentage",
-    "saves_per_90", "goals_prevented", "accurate_passes_per_90",
-    "accurate_long_balls_per_90", "fotmob_rating",
-]
-
 _WS_COLS = [
     "canonical_id", "league", "season",
     "keeper_saves", "keeper_pickups", "keeper_claims",
@@ -88,7 +80,6 @@ _TABLES = {
     "silver_xref_team":   ["canonical_id", "source", "source_id", "league",
                            "season", "confidence"],
     "silver_fbref_keeper_profile":              _FB_COLS,
-    "silver_fotmob_keeper_profile":             _FM_COLS,
     "silver_whoscored_player_season_aggregate": _WS_COLS,
 }
 

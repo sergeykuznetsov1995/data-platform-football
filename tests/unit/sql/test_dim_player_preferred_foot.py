@@ -2,7 +2,7 @@
 Executable unit test for Gold ``dim_player`` preferred_foot logic (issue #663).
 
 ``dim_player.sql.j2`` resolves ``preferred_foot`` via
-``LOWER(COALESCE(tm.foot, fm.foot, ss.preferred_foot, sf.preferred_foot))``.
+``LOWER(COALESCE(tm.foot, ss.preferred_foot, sf.preferred_foot))``.
 
 Before #663 SoFIFA was absent from the chain (its parser never extracted foot,
 so silver had no column). #663 wires it through Bronze → Silver → Gold and adds
@@ -93,14 +93,7 @@ def _bootstrap(con) -> None:
         ('z', 2425, 'Zero Zoe',     'eng ENG', 'FW', 900, 'Club Z')
     """)
 
-    # Enrichment sources — fotmob / sofascore empty (no foot from them here).
-    con.execute("""
-        CREATE TABLE silver.fotmob_player_profile (
-            player_id VARCHAR, season BIGINT, player_name VARCHAR,
-            date_of_birth VARCHAR, nationality VARCHAR, height_cm INTEGER,
-            foot VARCHAR
-        )
-    """)
+    # Enrichment source — sofascore empty (no foot from it here; FotMob removed in #1590).
     con.execute("""
         CREATE TABLE silver.sofascore_player_profile (
             canonical_id VARCHAR, season BIGINT, player_name VARCHAR,

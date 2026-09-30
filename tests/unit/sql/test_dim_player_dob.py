@@ -2,7 +2,7 @@
 Executable unit test for Gold ``dim_player`` dob logic (issue #584).
 
 ``dim_player.sql.j2`` resolves ``dob`` via
-``COALESCE(TRY_CAST(fm.date_of_birth), ss.date_of_birth, tm.dob,
+``COALESCE(ss.date_of_birth, tm.dob,
           TRY(CAST(date_parse(sf.dob, '%b %e, %Y') AS DATE)))``.
 
 SoFIFA carries dob as a ``"Mon D, YYYY"`` string (e.g. ``'Nov 9, 1982'``).
@@ -97,14 +97,7 @@ def _bootstrap(con) -> None:
         ('n', 2425, 'Nobody Ned',      'eng ENG', 'FW', 900, 'Club N')
     """)
 
-    # Enrichment sources — fotmob / sofascore empty (no dob from them here).
-    con.execute("""
-        CREATE TABLE silver.fotmob_player_profile (
-            player_id VARCHAR, season BIGINT, player_name VARCHAR,
-            date_of_birth VARCHAR, nationality VARCHAR, height_cm INTEGER,
-            foot VARCHAR
-        )
-    """)
+    # Enrichment source — sofascore empty (no dob from it here; FotMob removed in #1590).
     con.execute("""
         CREATE TABLE silver.sofascore_player_profile (
             canonical_id VARCHAR, season BIGINT, player_name VARCHAR,

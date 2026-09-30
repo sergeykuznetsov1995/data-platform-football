@@ -17,7 +17,7 @@ Danny Ings 2022/23 — Aston Villa 824 min / 6 goals, West Ham United
 minutes=1599 and goals=8 (summed across both clubs).
 
 Only the FBref spine + xref tables carry rows; the four enrichment sources
-(FotMob/WhoScored/Understat/SofaScore) are empty — LEFT JOINs yield NULLs
+(WhoScored/Understat/SofaScore; FotMob removed in #1590) are empty — LEFT JOINs yield NULLs
 and every COALESCE falls back to FBref.
 """
 
@@ -50,7 +50,6 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.silver.xref_player":                       "silver_xref_player",
     "iceberg.silver.xref_team":                         "silver_xref_team",
     "iceberg.silver.fbref_player_season_profile":       "silver_fbref_player_season_profile",
-    "iceberg.silver.fotmob_player_season_profile":      "silver_fotmob_player_season_profile",
     "iceberg.silver.whoscored_player_season_aggregate": "silver_whoscored_player_season_aggregate",
     "iceberg.silver.understat_player_season_aggregate": "silver_understat_player_season_aggregate",
     "iceberg.silver.sofascore_player_season_aggregate": "silver_sofascore_player_season_aggregate",
@@ -86,19 +85,6 @@ _FB_COLS = [
     "fouls_committed", "fouls_drawn", "offsides", "crosses", "own_goals",
     "second_yellow", "complete_matches", "starts", "subs", "unused_sub",
     "plus_minus", "points_per_match", "on_off_impact", "goals_per_shot",
-]
-
-_FM_COLS = [
-    "player_id", "league", "season", "minutes_played", "matches_played",
-    "goals", "assists", "yellow_cards", "red_cards",
-    "penalties_won", "penalties_conceded",
-    "expected_goals", "expected_assists", "expected_goals_on_target",
-    "big_chances_created", "big_chances_missed", "chances_created",
-    "shots_per_90", "shots_on_target_per_90", "interceptions_per_90",
-    "tackles_per_90", "fouls_per_90", "clearances_per_90", "recoveries_per_90",
-    "blocks_per_90", "successful_dribbles_per_90", "accurate_passes_per_90",
-    "accurate_long_balls_per_90", "defensive_actions_per_90",
-    "poss_won_final_third_per_90",
 ]
 
 _WS_COLS = [
@@ -143,7 +129,6 @@ _TABLES = {
     "silver_xref_team":   ["canonical_id", "source", "source_id", "league",
                            "season", "confidence"],
     "silver_fbref_player_season_profile":       _FB_COLS,
-    "silver_fotmob_player_season_profile":      _FM_COLS,
     "silver_whoscored_player_season_aggregate": _WS_COLS,
     "silver_understat_player_season_aggregate": _US_COLS,
     "silver_sofascore_player_season_aggregate": _SS_COLS,

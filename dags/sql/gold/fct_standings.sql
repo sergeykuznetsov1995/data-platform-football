@@ -11,24 +11,21 @@
 -- реконструкция из fct_team_match это этаж 2, не здесь.
 --
 -- Source (#702 — Gold one-hop: читаем Silver, не Bronze напрямую):
---   iceberg.silver.sofascore_league_table   (primary)
---   iceberg.silver.fotmob_team_standings     (fallback, 2-й источник)
+--   iceberg.silver.sofascore_league_table   (единственный источник с #1590)
 --   iceberg.silver.xref_team                 (canonical team-id resolve)
 -- PK:           (league, season, team_id)   -- group_id is attribute (WC groups)
 -- Partitioning: (league, season)   -- passed by run_gold_transform()
 --
--- Multi-source dedup (#702 — SofaScore-primary, FotMob whole-table fallback):
---   На каждую (league, season) берём ОДИН источник целиком: если SofaScore
---   отдал таблицу — берём SofaScore; иначе FotMob. Команды из двух источников
---   НЕ смешиваются в одной (league, season) — position считается внутри одного
---   источника. standings_source несёт провенанс строки ('sofascore'/'fotmob').
+-- Source (#1590): FotMob whole-table fallback (#702) удалён вместе со старым
+--   FotMob Silver — остаётся только SofaScore. standings_source несёт провенанс
+--   строки ('sofascore'); колонка остаётся для нового FotMob Silver.
 --
 -- Team resolution (Migrated from gold.entity_xref to silver.xref_team in E1.5,
---                  2026-05-09; #702 added FotMob block):
+--                  2026-05-09):
 --   LEFT JOIN iceberg.silver.xref_team on (source=<src>, source_id=team_name,
 --                                          league, season)
 --   * matched   -> team_id = xref_team.canonical_id, team_id_source='fbref_canonical'
---   * orphan    -> team_id = '<ss|fm>_<slug>',       team_id_source='<src>_orphan'
+--   * orphan    -> team_id = 'ss_<slug>',            team_id_source='sofascore_orphan'
 --   The JOIN excludes confidence='orphan' xref rows (#460): they carry a
 --   non-NULL source-prefixed canonical_id, so without the filter they'd be
 --   mislabeled 'fbref_canonical'. xref footgun: предикаты league И season
@@ -44,12 +41,10 @@
 -- group_id NULL for club leagues and WC knockout. PK remains (league, season, team_id).
 --
 -- Notes:
---   * SofaScore/FotMob Pts уже post-deduction; R7 trust-check deferred.
---   * position is derived (ROW_NUMBER) единообразно для обоих источников —
---     SofaScore не хранит rank; FotMob хранит, но мы пересчитываем для общего
---     code path (each (league, season) уже из одного источника).
+--   * SofaScore Pts уже post-deduction; R7 trust-check deferred.
+--   * position is derived (ROW_NUMBER) — SofaScore не хранит rank.
 --   * points_per_game uses NULLIF(played, 0) to guard against zero-game teams.
---   * season — 4-char slug ('2526') в обоих Silver-источниках и в xref_team (#404).
+--   * season — 4-char slug ('2526') в Silver-источнике и в xref_team (#404).
 -- =============================================================================
 
 with ss_raw as (
@@ -58,14 +53,16 @@ with ss_raw as (
         s.league,
         s.season,
         s.team_name                                       as team_name_raw,
-        s.played,
-        s.wins,
-        s.draws,
-        s.losses,
-        s.goals_for,
-        s.goals_against,
-        s.goal_diff,
-        s.points,
+        -- #1590: bigint casts keep the pre-removal column types (the FotMob
+        -- UNION branch was bigint and widened SofaScore's integer counters).
+        cast(s.played as bigint)                          as played,
+        cast(s.wins as bigint)                            as wins,
+        cast(s.draws as bigint)                           as draws,
+        cast(s.losses as bigint)                          as losses,
+        cast(s.goals_for as bigint)                       as goals_for,
+        cast(s.goals_against as bigint)                   as goals_against,
+        cast(s.goal_diff as bigint)                       as goal_diff,
+        cast(s.points as bigint)                          as points,
         s.group_id,
         s._bronze_ingested_at                             as snapshot_at,
         x.canonical_id                                    as canonical_team_id,
@@ -79,47 +76,9 @@ with ss_raw as (
       and x.confidence <> 'orphan'
 ),
 
-fm_raw as (
-    -- FotMob источник (fallback), резолв canonical через xref_team.
-    select
-        f.league,
-        f.season,
-        f.team_name                                       as team_name_raw,
-        f.played,
-        f.wins,
-        f.draws,
-        f.losses,
-        f.goals_for,
-        f.goals_against,
-        f.goal_diff,
-        f.points,
-        f.group_id,
-        f._bronze_ingested_at                             as snapshot_at,
-        x.canonical_id                                    as canonical_team_id,
-        'fotmob'                                          as standings_source
-    from iceberg.silver.fotmob_team_standings f
-    left join iceberg.silver.xref_team x
-      on  x.source      = 'fotmob'
-      and x.source_id   = f.team_name
-      and x.league      = f.league
-      and x.season      = f.season
-      and x.confidence <> 'orphan'
-),
-
-ss_keys as (
-    select distinct league, season from ss_raw
-),
-
 unioned as (
-    -- SofaScore целиком; FotMob только для (league, season) без SofaScore.
-    -- NOT EXISTS (а не NOT IN) — NULL-safe anti-join.
+    -- #1590: single source (FotMob fallback removed).
     select * from ss_raw
-    union all
-    select * from fm_raw f
-    where not exists (
-        select 1 from ss_keys k
-        where k.league = f.league and k.season = f.season
-    )
 )
 
 select
@@ -127,15 +86,11 @@ select
     season,
     coalesce(
         canonical_team_id,
-        case standings_source
-            when 'sofascore' then 'ss_'
-            when 'fotmob'    then 'fm_'
-        end || lower(regexp_replace(team_name_raw, '[^a-zA-Z0-9]+', '_'))
+        'ss_' || lower(regexp_replace(team_name_raw, '[^a-zA-Z0-9]+', '_'))
     )                                                     as team_id,
     case
         when canonical_team_id is not null   then 'fbref_canonical'
-        when standings_source = 'sofascore'  then 'sofascore_orphan'
-        else                                      'fotmob_orphan'
+        else                                      'sofascore_orphan'
     end                                                   as team_id_source,
     standings_source,
     team_name_raw,
@@ -159,8 +114,8 @@ select
     cast(snapshot_at as date)                             as as_of_date
 from unioned
 -- Scope to the canonical season universe (gold.dim_season, rendered from
--- configs/medallion/competitions.yaml). The Silver standings sources carry
--- FotMob/SofaScore HISTORICAL seasons beyond the platform's FBref spine
+-- configs/medallion/competitions.yaml). The Silver standings source carries
+-- SofaScore HISTORICAL seasons beyond the platform's FBref spine
 -- (e.g. 2010/11-2015/16) that dim_season does NOT list; without this filter
 -- they orphan ref_integrity[fct_standings.season -> dim_season] and fail
 -- validate_gold_quality. dim_season is a tiny config dim materialised in an

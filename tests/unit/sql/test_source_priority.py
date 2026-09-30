@@ -121,7 +121,7 @@ _SOURCE_ALIASES = {"fb", "us", "ws", "fm", "ss"}
 # goals/penalty_goals columns (Trino can't reference a same-level SELECT alias,
 # so the two COALESCE are repeated verbatim). Normalized (single-space) form.
 _ALLOWED_INLINE_COALESCE = {
-    "COALESCE(fb.goals, fm.goals, us.goals)",
+    "COALESCE(fb.goals, us.goals)",  # FotMob arg removed in #1590
     "COALESCE(fb.penalty_goals, ss.penalty_goals)",
 }
 
@@ -162,14 +162,14 @@ def test_emitter_preserves_priority_order_and_wrap():
 
     tm = get_source_priority_exprs("fct_team_match")
     assert tm["m_xg"] == (
-        "ROUND(COALESCE(us.xg, fm.expected_goals, ss.expected_goals), 4) AS xg,"
+        "ROUND(COALESCE(us.xg, ss.expected_goals), 4) AS xg,"
     )
     assert tm["m_passes"] == "COALESCE(ss.total_passes, ws.pass_total) AS passes,"
 
     pm = get_source_priority_exprs("fct_player_match")
-    # #691: FotMob appended LAST in the HARD_FACT cascade.
+    # #691 appended FotMob LAST in the HARD_FACT cascade; #1590 removed it.
     assert pm["m_goals"] == (
-        "CAST(COALESCE(fb.goals, ss.goals, ws.goals, us.goals, fm.goals) "
+        "CAST(COALESCE(fb.goals, ss.goals, ws.goals, us.goals) "
         "AS BIGINT) AS goals,"
     )
     # A computed per-source fallback expression must survive verbatim.
@@ -177,6 +177,31 @@ def test_emitter_preserves_priority_order_and_wrap():
         "CAST(COALESCE(fb.penalty_attempts, ss.penalties_missed + ss.penalty_goals) "
         "AS BIGINT) AS penalty_attempts,"
     )
+
+
+def test_emitter_single_source_emits_bare_expression():
+    """#1590: a metric left with ONE source must render the bare expression —
+    Trino rejects a single-argument COALESCE. The wrap still applies."""
+    from utils.medallion_config import get_source_priority_exprs
+
+    pm = get_source_priority_exprs("fct_player_match")
+    assert pm["m_rating"] == "ROUND(ss.rating, 2) AS rating,"
+    ks = get_source_priority_exprs("fct_keeper_season_stats")
+    assert ks["m_minutes"] == "CAST(fb.minutes AS DOUBLE) AS minutes,"
+    for exprs in (pm, ks):
+        for v in exprs.values():
+            assert not re.search(r"COALESCE\(\s*[^,()]+\)", v), v
+
+
+def test_config_has_no_legacy_fotmob_source():
+    """#1590: the legacy FotMob Silver is gone — no fotmob entries remain."""
+    import yaml
+
+    cfg = yaml.safe_load(
+        (PROJECT_ROOT / "configs" / "medallion" / "source_priority.yaml")
+        .read_text(encoding="utf-8")
+    )
+    assert "fotmob" not in repr(cfg).lower()
 
 
 def test_reordering_sources_changes_priority():

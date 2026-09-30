@@ -74,7 +74,7 @@ def stubbed_resolver(monkeypatch):
     monkeypatch.setattr(xpr, '_get_trino_connection', lambda *a, **k: _DummyConn())
     for fetcher in (
         '_fetch_fbref_players', '_fetch_understat_players',
-        '_fetch_whoscored_players', '_fetch_fotmob_players',
+        '_fetch_whoscored_players',
         '_fetch_sofascore_players', '_fetch_transfermarkt_players',
         '_fetch_capology_players', '_fetch_sofifa_players',
         '_fetch_espn_players',

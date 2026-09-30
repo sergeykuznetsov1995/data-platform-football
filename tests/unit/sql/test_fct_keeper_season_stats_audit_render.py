@@ -35,7 +35,8 @@ class TestFctKeeperSeasonStatsAuditSql:
         sql = _strip_comments(_read_sql())
         assert "iceberg.silver.xref_player" in sql
         assert "iceberg.silver.fbref_keeper_profile" in sql
-        assert "iceberg.silver.fotmob_keeper_profile" in sql
+        # #1590: the legacy FotMob Silver keeper branch was removed.
+        assert "silver.fotmob_" not in sql
         assert "iceberg.silver.whoscored_player_season_aggregate" in sql
         # outfield таблицы НЕ читаются
         assert "fbref_player_season_profile" not in sql
@@ -51,14 +52,12 @@ class TestFctKeeperSeasonStatsAuditSql:
         assert "iceberg.silver.fbref_keeper_profile" in sql, (
             "fb_dedup CTE must read silver.fbref_keeper_profile"
         )
-        assert re.search(
-            r"INNER\s+JOIN\s+iceberg\.silver\.fotmob_keeper_profile",
-            sql, re.IGNORECASE,
-        )
+        # #1590: no FotMob INNER JOIN — spine is FBref keepers.
+        assert not re.search(r"INNER\s+JOIN\s+\S*fotmob", _strip_comments(sql), re.IGNORECASE)
         assert re.search(
             r"LEFT\s+JOIN\s+iceberg\.silver\.whoscored_player_season_aggregate",
             sql, re.IGNORECASE,
-        ), "audit must LEFT JOIN на WS (не INNER — сохраняем FBref∩FotMob spine)"
+        ), "audit must LEFT JOIN на WS (не INNER — сохраняем FBref spine)"
 
     def test_grain_pk_columns(self):
         sql = _read_sql()
@@ -66,11 +65,15 @@ class TestFctKeeperSeasonStatsAuditSql:
             assert re.search(rf"\b{col}\b", sql)
 
     def test_audit_diff_columns(self):
-        """3 FotMob diffs + 1 WhoScored diff = 4 audit columns total."""
+        """3 FotMob diffs (typed NULL since #1590) + 1 WhoScored diff = 4 audit
+        columns total."""
         sql = _read_sql()
         for col in ['matches_diff_fotmob', 'minutes_diff_fotmob',
-                    'clean_sheets_diff_fotmob', 'saves_diff_whoscored']:
-            assert re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE)
+                    'clean_sheets_diff_fotmob']:
+            assert re.search(
+                rf"CAST\(NULL AS DOUBLE\)\s+AS\s+{col}\b", sql, re.IGNORECASE,
+            )
+        assert re.search(r"\bAS\s+saves_diff_whoscored\b", sql, re.IGNORECASE)
 
     def test_no_business_metric_columns(self):
         sql = _strip_comments(_read_sql())

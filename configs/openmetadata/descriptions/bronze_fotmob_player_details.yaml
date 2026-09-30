@@ -60,7 +60,7 @@ columns:
   - name: recent_matches_json
     description: Сырой JSON последних матчей (распаковывается в Silver).
   - name: market_values_json
-    description: Сырой JSON истории рыночной стоимости (распаковывается в Silver silver_fotmob_player_market_value_history).
+    description: Сырой JSON истории рыночной стоимости (старый FotMob Silver, который его распаковывал, удалён в #1590; будет читаться новым Silver).
   - name: traits_json
     description: Сырой JSON сильных/слабых сторон игрока (распаковывается в Silver).
   - name: meta_json

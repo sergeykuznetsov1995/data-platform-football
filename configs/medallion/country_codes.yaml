@@ -22,7 +22,8 @@
 # `name` MUST match the spelling emitted by FotMob/SofaScore/Transfermarkt so
 # a player resolved via the map reads identically to one resolved via a source
 # (single canonical spelling). Reconcile against:
-#   SELECT DISTINCT nationality FROM iceberg.silver.fotmob_player_profile
+#   SELECT DISTINCT nationality FROM iceberg.silver.sofascore_player_profile
+#   (the legacy FotMob Silver profile was removed in #1590)
 # Coverage MUST cover 100% of:
 #   SELECT DISTINCT REGEXP_EXTRACT(nation,'[A-Z]{3}') FROM iceberg.silver.fbref_player_season_profile
 #

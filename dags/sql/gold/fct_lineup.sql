@@ -1,8 +1,9 @@
 -- =============================================================================
 -- Gold: fct_lineup
 -- =============================================================================
--- Per-player lineup entries unified across FBref, ESPN, SofaScore, FotMob,
--- WhoScored (#693).
+-- Per-player lineup entries unified across FBref, ESPN, SofaScore, WhoScored
+-- (#693). The FotMob lineup source (legacy FotMob Silver) was removed in #1590;
+-- priority slot 3 is now unused.
 --
 -- Sources:
 --   iceberg.silver.fbref_match_lineups   — primary (complete coverage)
@@ -10,9 +11,6 @@
 --                                          real player_id (resolves via
 --                                          xref_player, unlike ESPN), native
 --                                          is_starter/is_captain/position
---   iceberg.silver.fotmob_lineup         — full lineup source (#693): starters+
---                                          subs from lineup_json; real player_id,
---                                          is_starter + jersey; is_captain NULL
 --   iceberg.silver.whoscored_lineup      — inferred lineup source (#693): real
 --                                          player_id + is_starter (appeared & not
 --                                          subbed-on); position/captain/jersey NULL
@@ -87,7 +85,7 @@
 --     2 SofaScore — real player_id + position + is_starter + native is_captain
 --                   (no jersey); cross-source dedup against FBref fires via the
 --                   shared canonical_id
---     3 FotMob    — real player_id + is_starter + jersey (#693)
+--     3 (FotMob — removed in #1590)
 --     4 WhoScored — real player_id + is_starter only (#693)
 --     5 ESPN      — player_id NOW resolves via xref_player by name+team (#692);
 --                   no jersey/captain + lowest schema richness, so ESPN sits at
@@ -302,7 +300,7 @@ espn_resolved AS (
         'espn'                                         AS lineup_source,
         -- #693: ESPN moves to the tail of the priority order. Its player_id is
         -- always NULL (no ESPN player resolver), so it never wins cross-source
-        -- dedup anyway; FBref(1) > SofaScore(2) > [FotMob(3) > WhoScored(4)] > ESPN(5).
+        -- dedup anyway; FBref(1) > SofaScore(2) > WhoScored(4) > ESPN(5).
         5                                              AS source_priority,
         -- Compose a stable per-row dedup proxy from (player, team) so that
         -- two distinct ESPN players with NULL canonical don't collapse into
@@ -385,52 +383,6 @@ sofascore_resolved AS (
 ),
 
 -- ============================================================================
--- 3c) FotMob source rows (#693) — full lineup parsed from lineup_json into
---     silver.fotmob_lineup (starters + subs, both teams). Same resolution shape
---     as SofaScore: real player_id via xref_player → cross-source dedup fires.
---   * match_id via xref_match (source='fotmob', keyed on the bronze match_id),
---     else 'fm_<id>' pseudo-id so FotMob-only matches still add coverage.
---   * (league, season) predicate on BOTH xref JOINs — mandatory.
---   * jersey_number IS available (FotMob shirtNumber); is_captain is NOT in
---     lineup_json → NULL (enriched via the SofaScore captain bridge below).
---   * position is the FotMob positionId CODE (varchar) for starters, NULL for
---     subs (they hold no formation slot) — raw passthrough, dim_position deferred.
--- ============================================================================
-fotmob_resolved AS (
-    SELECT
-        COALESCE(xm.canonical_id, 'fm_' || fl.match_id) AS match_id_canonical,
-        xt.canonical_id                                AS team_id_canonical,
-        xp.canonical_id                                AS player_id_canonical,
-        fl.player_name                                 AS player_name,
-        fl.is_starter                                  AS is_starter,
-        fl.position                                    AS position_canonical,
-        fl.jersey_number                               AS jersey_number,
-        fl.is_captain                                  AS is_captain,   -- always NULL in silver
-        fl._bronze_ingested_at                         AS _bronze_ingested_at,
-        fl.league                                      AS league,
-        fl.season                                      AS season,        -- #404 slug '2526'
-        'fotmob'                                       AS lineup_source,
-        3                                              AS source_priority,
-        fl.player_id                                   AS _raw_player_id_for_dedup
-    FROM iceberg.silver.fotmob_lineup fl
-    LEFT JOIN iceberg.silver.xref_match xm
-        ON  xm.source     = 'fotmob'
-       AND xm.source_id   = fl.match_id
-       AND xm.league      = fl.league
-       AND xm.season      = fl.season
-       AND xm.confidence <> 'orphan'
-    LEFT JOIN iceberg.silver.xref_team xt
-        ON  xt.source     = 'fotmob'
-       AND xt.source_id   = fl.team_name        -- xref_team source_id = team NAME
-       AND xt.league      = fl.league
-       AND xt.season      = fl.season
-       AND xt.confidence <> 'orphan'
-    LEFT JOIN xref_player_dedup xp
-        ON  xp.source     = 'fotmob'
-       AND xp.source_id   = fl.player_id
-),
-
--- ============================================================================
 -- 3d) WhoScored source rows (#693) — lineup INFERRED from the event stream
 --     (silver.whoscored_lineup): a player who appeared and was not subbed on
 --     started. Thinnest source: real player_id + is_starter only; position /
@@ -484,8 +436,6 @@ all_lineups AS (
     SELECT * FROM espn_resolved
     UNION ALL
     SELECT * FROM sofascore_resolved
-    UNION ALL
-    SELECT * FROM fotmob_resolved
     UNION ALL
     SELECT * FROM whoscored_resolved
 ),

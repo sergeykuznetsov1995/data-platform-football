@@ -13,9 +13,12 @@
 -- FotMob - <source>.
 --
 -- Зерно: (player_id, league, season). Один row per канонический
--- игрок × лига × сезон, **только когда обе стороны имеют запись** (INNER JOIN
--- FBref ∩ FotMob — symmetric to main fct INNER FBref). WhoScored/Understat/
--- SofaScore — LEFT JOIN → diff = NULL когда источник отсутствует.
+-- игрок × лига × сезон FBref-spine (outfield). WhoScored/Understat/SofaScore —
+-- LEFT JOIN → diff = NULL когда источник отсутствует.
+--
+-- #1590: FotMob-сравнение удалено вместе со старым FotMob Silver (до этого —
+-- INNER JOIN FBref ∩ FotMob). Колонки `*_fotmob*` остаются в схеме как
+-- типизированный NULL — схема витрины не меняется.
 --
 -- Использование:
 --   1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
@@ -41,40 +44,6 @@ xref_fbref AS (
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
       AND confidence <> 'orphan'
-),
-
-xref_fotmob AS (
-    SELECT DISTINCT
-        canonical_id,
-        source_id                                         AS fotmob_player_id,
-        league,
-        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
-    FROM iceberg.silver.xref_player
-    WHERE source = 'fotmob'
-      AND confidence <> 'orphan'
-),
-
--- FotMob отдаёт shots/tackles/clearances/… как per-90 (не счётчики). Restore
--- season-count ≈ per_90 × minutes / 90 (±1, per_90 округлён источником до 2 знаков).
--- raw counts для этих метрик в FotMob API недоступны (issue #174). Pass-through
--- колонки (goals/assists/cards/xG/…) уже счётчики — через SELECT *.
-fotmob_counts AS (
-    SELECT
-        *,
-        ROUND(shots_per_90               * minutes_played / 90.0) AS shots,
-        ROUND(shots_on_target_per_90     * minutes_played / 90.0) AS shots_on_target,
-        ROUND(interceptions_per_90       * minutes_played / 90.0) AS interceptions,
-        ROUND(tackles_per_90             * minutes_played / 90.0) AS tackles,
-        ROUND(fouls_per_90               * minutes_played / 90.0) AS fouls_committed,
-        ROUND(clearances_per_90          * minutes_played / 90.0) AS clearances,
-        ROUND(recoveries_per_90          * minutes_played / 90.0) AS ball_recoveries,
-        ROUND(blocks_per_90              * minutes_played / 90.0) AS blocks,
-        ROUND(successful_dribbles_per_90 * minutes_played / 90.0) AS successful_dribbles,
-        ROUND(accurate_passes_per_90     * minutes_played / 90.0) AS accurate_passes,
-        ROUND(accurate_long_balls_per_90 * minutes_played / 90.0) AS accurate_long_balls,
-        ROUND(defensive_actions_per_90   * minutes_played / 90.0) AS defensive_actions,
-        ROUND(poss_won_final_third_per_90 * minutes_played / 90.0) AS poss_won_final_third
-    FROM iceberg.silver.fotmob_player_season_profile
 ),
 
 -- #463/#515: silver-профиль per-(player, squad) — счётчики СУММИРУЮТСЯ по клубам
@@ -120,27 +89,13 @@ SELECT
     xf.league                                            AS league,
     xf.season_year                                       AS season,
 
-    -- ========= FotMob diff (INNER JOIN — всегда non-NULL) =========
-    -- HARD_FACT pairs с FBref-spine. NB (issue #564): FotMob отдаёт счётные
-    -- события (goals/assists/cards) разреженно — у игрока без события строки в
-    -- bronze нет, silver-пивот возвращает NULL. COALESCE(fm.*, 0) трактует
-    -- «не было события = 0» (а не NULL), иначе diff=NULL съедает ~38% пар и
-    -- искажает coverage/within-threshold. matches/minutes НЕ coalesce'им
-    -- (NULL ≠ 0, и они покрыты ~100%).
-    (CAST(fb.mp                 AS DOUBLE) - CAST(fm.matches_played            AS DOUBLE)) AS matches_diff_fotmob,
-    (CAST(fb.minutes            AS DOUBLE) - CAST(fm.minutes_played            AS DOUBLE)) AS minutes_diff_fotmob,
-    (CAST(fb.goals              AS DOUBLE) - CAST(COALESCE(fm.goals, 0)        AS DOUBLE)) AS goals_diff_fotmob,
-    (CAST(fb.assists            AS DOUBLE) - CAST(COALESCE(fm.assists, 0)      AS DOUBLE)) AS assists_diff_fotmob,
-    (CAST(fb.yellow_cards       AS DOUBLE) - CAST(COALESCE(fm.yellow_cards, 0) AS DOUBLE)) AS yellow_cards_diff_fotmob,
-    (CAST(fb.red_cards          AS DOUBLE) - CAST(COALESCE(fm.red_cards, 0)    AS DOUBLE)) AS red_cards_diff_fotmob,
-    -- penalties_won_diff_fotmob / penalties_conceded_diff_fotmob удалены (issue #564):
-    -- FotMob не отдаёт сезонные penalty_won/penalty_conceded (колонки полностью NULL,
-    -- 0/430 сравнимых пар) → нечего сравнивать. SofaScore penalties остаются (ниже).
-    -- NB (issue #154): FotMob silver больше не отдаёт абсолюты shots/
-    -- shots_on_target/interceptions/fouls/clearances/ball_recoveries/blocks/
-    -- accurate_passes/accurate_long_balls/successful_dribbles → соответствующие
-    -- diff-колонки удалены (нечего сравнивать). НЕ возвращай без восстановления
-    -- absolute-полей в silver.fotmob_player_season_profile.
+    -- ========= FotMob diff — typed NULL since #1590 =========
+    CAST(NULL AS DOUBLE)                                 AS matches_diff_fotmob,
+    CAST(NULL AS DOUBLE)                                 AS minutes_diff_fotmob,
+    CAST(NULL AS DOUBLE)                                 AS goals_diff_fotmob,
+    CAST(NULL AS DOUBLE)                                 AS assists_diff_fotmob,
+    CAST(NULL AS DOUBLE)                                 AS yellow_cards_diff_fotmob,
+    CAST(NULL AS DOUBLE)                                 AS red_cards_diff_fotmob,
 
     -- ========= WhoScored diff (LEFT JOIN → NULL if absent) =========
     (CAST(fb.mp              AS DOUBLE) - CAST(ws.matches_seen      AS DOUBLE)) AS matches_diff_whoscored,
@@ -182,11 +137,12 @@ SELECT
     -- ========= MODELED xG diff (different models, expected to disagree) =========
     -- Эти diff'ы для калибровки разных xG-моделей. Хранятся в audit чтобы DS-
     -- команда могла строить корреляции между моделями.
-    ROUND(CAST(fm.expected_goals  AS DOUBLE) - CAST(us.expected_goals AS DOUBLE), 4) AS xg_diff_fotmob_understat,
-    ROUND(CAST(fm.expected_goals  AS DOUBLE) - CAST(ss.expected_goals AS DOUBLE), 4) AS xg_diff_fotmob_sofascore,
+    -- *_fotmob_* — typed NULL since #1590.
+    CAST(NULL AS DOUBLE)                                                             AS xg_diff_fotmob_understat,
+    CAST(NULL AS DOUBLE)                                                             AS xg_diff_fotmob_sofascore,
     ROUND(CAST(us.expected_goals  AS DOUBLE) - CAST(ss.expected_goals AS DOUBLE), 4) AS xg_diff_understat_sofascore,
-    ROUND(CAST(fm.expected_assists AS DOUBLE) - CAST(us.expected_assists AS DOUBLE), 4) AS xa_diff_fotmob_understat,
-    ROUND(CAST(fm.fotmob_rating   AS DOUBLE) - CAST(ss.rating         AS DOUBLE), 4) AS rating_diff_fotmob_sofascore,
+    CAST(NULL AS DOUBLE)                                                             AS xa_diff_fotmob_understat,
+    CAST(NULL AS DOUBLE)                                                             AS rating_diff_fotmob_sofascore,
 
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                    AS _gold_created_at
@@ -197,14 +153,6 @@ INNER JOIN fb_dedup fb
     ON  fb.player_id = xf.fbref_player_id
     AND fb.league    = xf.league
     AND fb.season    = xf.season_year
-INNER JOIN xref_fotmob xfm
-    ON  xfm.canonical_id = xf.canonical_id
-    AND xfm.league       = xf.league
-    AND xfm.season_year  = xf.season_year
-INNER JOIN fotmob_counts fm
-    ON  fm.player_id = xfm.fotmob_player_id
-    AND fm.league    = xfm.league
-    AND fm.season    = xfm.season_year
 LEFT JOIN iceberg.silver.whoscored_player_season_aggregate ws
     ON  ws.canonical_id = xf.canonical_id
     AND ws.league       = xf.league

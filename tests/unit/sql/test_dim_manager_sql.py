@@ -3,7 +3,9 @@ Unit tests for Gold ``dim_manager`` SQL logic — star-schema grain (#425).
 
 dim_manager is a plain per-manager dictionary now: spine =
 silver.xref_manager GROUP BY canonical_id, manager_name prefers the FBref
-display_name, nationality/dob are enriched from FotMob by coachId (issue #434).
+display_name, nationality/dob are enriched from Transfermarkt through the
+xref bridge (issue #434; the FotMob coach-profile enrichment was removed in
+#1590 with the legacy FotMob Silver layer).
 The SCD-2 stint logic that used to live here moves to fct_manager_stint
 (issue #429) — its tests go with it (`git log -p tests/unit/sql/test_dim_manager_sql.py`).
 
@@ -79,30 +81,12 @@ def _bootstrap(con) -> None:
          'ENG-Premier League', '2526', 'orphan', NULL)
         """
     )
-    # issue #434: FotMob coach profile enriches nationality/dob by coachId.
-    # Arteta (coachId 1001) has a profile; Emery (1002) does NOT -> stays NULL.
+    # issue #434: Transfermarkt coach enrichment through the xref bridge.
+    # Arteta and Allardyce are TM-glued -> TM fills nationality/dob; Emery has
+    # no TM bridge -> stays NULL. (#1590: the FotMob coach profile is gone.)
     con.execute(
         """
-        CREATE TABLE silver.fotmob_manager_profile (
-            player_id VARCHAR, name VARCHAR, date_of_birth VARCHAR,
-            nationality VARCHAR, _bronze_ingested_at TIMESTAMP,
-            league VARCHAR, season VARCHAR
-        )
-        """
-    )
-    con.execute(
-        """
-        INSERT INTO silver.fotmob_manager_profile VALUES
-        ('1001', 'Mikel Arteta', '1982-03-26', 'Spain',
-         NULL, 'ENG-Premier League', '2526')
-        """
-    )
-    # issue #434: Transfermarkt coach enrichment, keyed on canonical_id.
-    # Arteta also appears here (different dob) to prove FotMob WINS the COALESCE;
-    # Allardyce is TM-only (no FotMob) -> TM fills his nationality/dob.
-    con.execute(
-        """
-        CREATE TABLE silver.transfermarkt_coaches (
+        CREATE TABLE silver.transfermarkt_coaches_legacy (
             coach_id VARCHAR, canonical_id VARCHAR, name VARCHAR, role VARCHAR,
             dob DATE, nationality VARCHAR, current_club_id VARCHAR,
             current_club_name VARCHAR, _bronze_ingested_at TIMESTAMP,
@@ -112,7 +96,7 @@ def _bootstrap(con) -> None:
     )
     con.execute(
         """
-        INSERT INTO silver.transfermarkt_coaches VALUES
+        INSERT INTO silver.transfermarkt_coaches_legacy VALUES
         ('5672', 'mikel_arteta', 'Mikel Arteta', 'Manager',
          DATE '1972-01-01', 'TM-Spain', '11', 'Arsenal', NULL,
          'ENG-Premier League', '2526'),
@@ -173,28 +157,24 @@ class TestDimManagerDictionary:
         assert len(emery) == 1
         assert emery[0]["manager_name"] == "U. Emery"
 
-    def test_nationality_dob_enriched_from_fotmob(self, gold_rows):
-        """issue #434: matched coachId pulls nationality/dob from FotMob."""
+    def test_nationality_dob_enriched_from_transfermarkt(self, gold_rows):
+        """#1590: with the FotMob coach profile removed, a TM-glued manager
+        takes nationality/dob from Transfermarkt."""
         import datetime
 
         arteta = [r for r in gold_rows if r["manager_id"] == "mikel_arteta"][0]
-        assert arteta["nationality"] == "Spain", arteta
-        assert arteta["dob"] == datetime.date(1982, 3, 26), arteta
+        assert arteta["nationality"] == "TM-Spain", arteta
+        assert arteta["dob"] == datetime.date(1972, 1, 1), arteta
+
+    def test_no_legacy_fotmob_silver_read(self):
+        sql = SQL_PATH.read_text(encoding="utf-8")
+        assert "silver.fotmob_" not in sql
 
     def test_unmatched_manager_attrs_null(self, gold_rows):
-        """No FotMob/TM profile for this coachId -> nationality/dob stay NULL."""
+        """No TM bridge for this manager -> nationality/dob stay NULL."""
         emery = [r for r in gold_rows if r["manager_id"] == "fm_mgr_unai"][0]
         assert emery["nationality"] is None, emery
         assert emery["dob"] is None, emery
-
-    def test_fotmob_wins_over_transfermarkt(self, gold_rows):
-        """issue #434: COALESCE priority FotMob > TM — Arteta keeps FotMob's
-        dob/nationality even though TM carries a different dob."""
-        import datetime
-
-        arteta = [r for r in gold_rows if r["manager_id"] == "mikel_arteta"][0]
-        assert arteta["nationality"] == "Spain", arteta  # not 'TM-Spain'
-        assert arteta["dob"] == datetime.date(1982, 3, 26), arteta  # not 1972
 
     def test_transfermarkt_fills_when_fotmob_absent(self, gold_rows):
         """issue #434 + xref-improvements: a FBref-only historical manager

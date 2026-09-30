@@ -54,11 +54,11 @@ pytestmark = pytest.mark.unit
 
 class TestFctPlayerMatchSql:
 
-    def test_reads_xref_and_all_five_silver_sources(self):
+    def test_reads_xref_and_all_four_silver_sources(self):
         """Multi-source spine. После issue #46 cutover читаем FBref+
         SofaScore+Understat+WhoScored Silver-агрегаты + silver.xref_player
-        + silver.xref_match (bridging match_id → canonical). Issue #691 добавил
-        FotMob 5-м источником (fotmob_player_match_aggregate)."""
+        + silver.xref_match (bridging match_id → canonical). FotMob (5-й
+        источник с #691) убран в #1590 вместе со старым FotMob Silver."""
         sql = _strip_comments(_read_sql())
         assert "iceberg.silver.xref_player" in sql
         assert "iceberg.silver.xref_match" in sql
@@ -66,7 +66,7 @@ class TestFctPlayerMatchSql:
         assert "iceberg.silver.sofascore_player_match_aggregate" in sql
         assert "iceberg.silver.understat_player_match_aggregate" in sql
         assert "iceberg.silver.whoscored_player_match_aggregate" in sql
-        assert "iceberg.silver.fotmob_player_match_aggregate" in sql
+        assert "silver.fotmob_" not in sql
 
     def test_fbref_spine_filter(self):
         """Spine = (canonical_id, league, season) FBref-only из xref_player.
@@ -219,18 +219,19 @@ class TestFctPlayerMatchSql:
                 f"(matched `{stale}`); they live in fct_player_match_audit"
             )
 
-    def test_rating_single_column_sofascore_first(self):
-        """R5 (2026-07-03): rating — единая колонка COALESCE(ss.rating,
-        fm.rating): SofaScore (Opta) primary, FotMob fallback (закрывает
-        сезоны с дырами xref sofascore). По-прежнему НИКАКИХ
-        rating_fotmob / rating_diff отдельными колонками."""
+    def test_rating_single_column_sofascore_only(self):
+        """R5 (2026-07-03): rating — единая колонка. FotMob-фолбэк
+        (COALESCE(ss.rating, fm.rating)) убран в #1590 — остаётся
+        SofaScore (Opta). По-прежнему НИКАКИХ rating_fotmob / rating_diff
+        отдельными колонками."""
         sql = _read_sql()
         assert not re.search(r"\bAS\s+rating_fotmob\b", sql, re.IGNORECASE), (
             "rating_fotmob must NOT be in fct_player_match (single-column rule)"
         )
         assert re.search(
-            r"COALESCE\(\s*ss\.rating\s*,\s*fm\.rating\s*\)", sql, re.IGNORECASE
-        ), "rating must be COALESCE(ss.rating, fm.rating) — SofaScore first (R5)"
+            r"ROUND\(\s*ss\.rating\s*,\s*2\s*\)\s+AS\s+rating\b", sql, re.IGNORECASE
+        ), "rating must be ROUND(ss.rating, 2) — SofaScore only (#1590)"
+        assert not re.search(r"\bfm\.", _strip_comments(sql)), "no FotMob alias left (#1590)"
 
     def test_partition_columns_projected_last(self):
         """`league`, `season` обязаны быть выпроецированы (CTAS-обёртка

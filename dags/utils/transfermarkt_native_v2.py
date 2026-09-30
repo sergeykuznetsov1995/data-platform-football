@@ -814,7 +814,6 @@ MODEL_CONTRACTS = (
         ('manager_id',),
         (
             'iceberg.silver.transfermarkt_coach_profiles_v2',
-            'iceberg.silver.fotmob_manager_profile',
             'iceberg.silver.xref_manager',
         ),
     ),
@@ -830,7 +829,6 @@ MODEL_CONTRACTS = (
         ('player_id', 'valuation_date', 'source'),
         (
             'iceberg.silver.transfermarkt_market_value_points_v2',
-            'iceberg.silver.fotmob_player_market_value_history',
             'iceberg.silver.xref_player',
         ),
     ),

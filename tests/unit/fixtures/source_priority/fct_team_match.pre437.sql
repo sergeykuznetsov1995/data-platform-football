@@ -1,5 +1,5 @@
 -- =============================================================================
--- Gold: fct_team_match (5-source: FBref + Understat + WhoScored + SofaScore + FotMob)
+-- Gold: fct_team_match (4-source: FBref + Understat + WhoScored + SofaScore)
 -- =============================================================================
 -- Long-form fact: one row per (match_id, team_id) — exactly 2 rows per match.
 --
@@ -11,7 +11,7 @@
 -- columns date/gameweek/result/is_completed are kept beyond the design list
 -- (scope decision in #426).
 -- A "beyond-design" metric block (saves / offsides / key_passes / takeons /
--- FotMob shot mix) is also kept — user decision in #426 review: statistical
+-- FotMob shot mix — typed NULL since #1590) is also kept — user decision in #426 review: statistical
 -- value over the narrow star minimum.
 --
 -- Sources:
@@ -20,7 +20,9 @@
 --   iceberg.silver.understat_team_match    (#91 — xg/ppda/deep)
 --   iceberg.silver.whoscored_team_match    (#92 — SPADL event aggregates)
 --   iceberg.silver.sofascore_team_match    (#93 — passes/duels/corners)
---   iceberg.silver.fotmob_team_match       (#97 — team-grain xA + xgot/big_chances)
+--   (#1590: the FotMob source — #97 team-grain xA + xgot/big_chances/shot mix —
+--    was removed with the legacy FotMob Silver; its columns stay as typed NULL
+--    so the fact schema is unchanged.)
 --   iceberg.silver.xref_team / xref_match  (canonical bridge per source)
 --   iceberg.bronze.whoscored_schedule      (numeric↔name bridge for WS team_id)
 --
@@ -115,33 +117,6 @@ xref_match_ss AS (
         season        AS season_slug
     FROM iceberg.silver.xref_match
     WHERE source = 'sofascore'
-      AND confidence <> 'orphan'
-),
-
--- ===== FotMob xref (issue #97 — 5th source) =====
--- FotMob team_id in silver.fotmob_team_match is the team NAME (== xref source_id),
--- so a direct JOIN works (no WhoScored-style numeric↔name bridge needed).
--- #404: xref_team / xref_match now store season as slug ('2425'), matching the
--- silver.fotmob_team_match fact and dim_match — all bridge JOINs are slug = slug.
-xref_team_fm AS (
-    SELECT DISTINCT
-        canonical_id,
-        source_id   AS fm_team_name,
-        league,
-        season      AS season_year
-    FROM iceberg.silver.xref_team
-    WHERE source = 'fotmob'
-      AND confidence <> 'orphan'
-),
-
-xref_match_fm AS (
-    SELECT DISTINCT
-        canonical_id  AS match_id_canonical,
-        source_id     AS fm_match_id,
-        league,
-        season        AS season_year
-    FROM iceberg.silver.xref_match
-    WHERE source = 'fotmob'
       AND confidence <> 'orphan'
 ),
 
@@ -266,17 +241,17 @@ SELECT
     -- ===== Shots =====
     u.shots,
     u.shots_on_target,
-    fm.shots_inside_box                                           AS shots_in_box,
-    fm.big_chances,
+    CAST(NULL AS integer)                                         AS shots_in_box,  -- FotMob-only, NULL since #1590
+    CAST(NULL AS integer)                                         AS big_chances,   -- FotMob-only, NULL since #1590
 
     -- ===== Expected metrics (Understat primary per RX2; FotMob then SS fallback) =====
-    ROUND(COALESCE(us.xg,          fm.expected_goals, ss.expected_goals),  4) AS xg,
-    ROUND(COALESCE(us.npxg, fm.npxg), 4)                          AS npxg,
+    ROUND(COALESCE(us.xg,          ss.expected_goals),  4)        AS xg,
+    ROUND(us.npxg, 4)                                             AS npxg,
     -- FotMob does not expose team-grain xGA at match grain → COALESCE stays us → ss.
     ROUND(COALESCE(us.xg_against,  ss.expected_goals_against), 4) AS xga,
-    ROUND(fm.xgot, 4)                                             AS xgot,
-    -- xa: FotMob is the ONLY source with team-grain xA (#97).
-    ROUND(fm.expected_assists, 4)                                 AS xa,
+    -- xgot / xa: FotMob was the ONLY source (#97) — typed NULL since #1590.
+    CAST(NULL AS double)                                          AS xgot,
+    CAST(NULL AS double)                                          AS xa,
 
     -- ===== Possession / passing =====
     u.possession                                                  AS possession_pct,
@@ -284,15 +259,16 @@ SELECT
     -- (WS block is NULL for current seasons until #120).
     COALESCE(ss.total_passes,        ws.pass_total)               AS passes,
     COALESCE(ss.accurate_passes_pct, ws.pass_pct)                 AS pass_accuracy_pct,
-    -- touches_in_box: WS is NULL for current seasons (#120) → fall back to FotMob.
-    COALESCE(ws.touches_in_box, fm.touches_in_box)                AS touches_in_box,
+    -- touches_in_box: WhoScored (the FotMob fallback was removed in #1590).
+    ws.touches_in_box                                             AS touches_in_box,
+
     us.deep_completions,
 
     -- ===== Pressing / defence =====
     us.ppda,
     COALESCE(ss.total_tackles,  ws.tackle_att)                    AS tackles,
     COALESCE(ss.interceptions,  ws.interceptions)                 AS interceptions,
-    fm.clearances,
+    CAST(NULL AS integer)                                         AS clearances,  -- FotMob-only, NULL since #1590
     ws.ball_recoveries,
 
     -- ===== Duels (SofaScore only) =====
@@ -313,10 +289,11 @@ SELECT
     ws.key_passes_ws                                              AS key_passes,
     ws.takeon_att,
     ws.takeon_won,
-    fm.big_chances_missed,
-    fm.shots_outside_box,
-    fm.blocked_shots,
-    fm.shots_off_target,
+    -- FotMob shot mix — typed NULL since #1590.
+    CAST(NULL AS integer)                                         AS big_chances_missed,
+    CAST(NULL AS integer)                                         AS shots_outside_box,
+    CAST(NULL AS integer)                                         AS blocked_shots,
+    CAST(NULL AS integer)                                         AS shots_off_target,
 
     -- ===== Partition keys (LAST in SELECT) =====
     u.league,
@@ -372,23 +349,6 @@ LEFT JOIN iceberg.silver.sofascore_team_match ss
     AND ss.team_id  = xts.ss_team_name
     AND ss.league   = u.league
     AND ss.season   = u.season_slug
-
--- ===== FotMob bridge (LEFT, #97) =====
--- silver.fotmob_team_match.team_id is the team NAME → JOIN xref_team directly.
--- #404: xref season is slug now too, so the bridge JOINs are slug = slug.
-LEFT JOIN xref_team_fm xtf
-    ON  xtf.canonical_id = u.team_id
-    AND xtf.league       = u.league
-    AND xtf.season_year  = CAST(u.season AS varchar)
-LEFT JOIN xref_match_fm xmf
-    ON  xmf.match_id_canonical = u.match_id
-    AND xmf.league             = u.league
-    AND xmf.season_year        = CAST(u.season AS varchar)
-LEFT JOIN iceberg.silver.fotmob_team_match fm
-    ON  fm.match_id = xmf.fm_match_id
-    AND fm.team_id  = xtf.fm_team_name
-    AND fm.league   = u.league
-    AND fm.season   = u.season_slug
 
 WHERE u.match_id    IS NOT NULL
   AND u.team_id     IS NOT NULL

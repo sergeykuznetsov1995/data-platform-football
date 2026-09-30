@@ -3,17 +3,19 @@
 -- =============================================================================
 --
 -- Per-season cross-source team stats: FBref + Understat + WhoScored + SofaScore
--- + FotMob объединены через silver.xref_team. Mirror of `fct_player_season_stats`
+-- объединены через silver.xref_team. #1590: FotMob-ветка (старый FotMob Silver)
+-- удалена; FotMob-only колонки (expected_assists, xgot, big_chances*,
+-- shots_*_box) остаются типизированным NULL — схема витрины не меняется. Mirror of `fct_player_season_stats`
 -- на team-уровне. Design contract: docs/decisions/T6_team_facts_schema.md §5.
 --
 --   * HARD_FACT counters (single column через COALESCE fb→us→ws→ss). FBref —
 --     primary spine. Cross-source diff'ы → `fct_team_season_stats_audit`.
 --   * MODELED xG / NPxG — Understat primary (RX2: coverage 99.2% vs SS 84.6%;
---     r ≥ 0.989). COALESCE fallback us → fm → ss.
---   * MODELED xA (expected_assists) — FotMob only (#97); team-grain xA не отдают
---     ни Understat, ни SofaScore на season-grain.
+--     r ≥ 0.989). COALESCE fallback us → ss.
+--   * MODELED xA (expected_assists) — был FotMob only (#97); team-grain xA не
+--     отдают ни Understat, ни SofaScore на season-grain → NULL с #1590.
 --   * UNIQUE_<source> — single column без суффикса (метрика отсутствует у
---     остальных источников). FotMob (#97): xgot / big_chances / shots_*_box.
+--     остальных источников).
 --
 -- Design contract: docs/design/gold-star-schema.md §5.4 (issue #428).
 -- Grain: (team_id, league, season). Spine — FBref subset из xref_team.
@@ -26,14 +28,14 @@
 -- сохраняет team_id_canonical (вне scope #428).
 --
 -- #478: производный gold-этаж удалён — per-source season rollups (бывшие
--- gold.{understat,whoscored,sofascore,fotmob}_team_season, #370) инлайнены
+-- gold.{understat,whoscored,sofascore}_team_season, #370) инлайнены
 -- ниже как CTE и читают Silver напрямую. ⚠️ Усечённые копии тех же CTE живут
 -- в fct_team_season_stats_audit.sql — синхронизировать вручную.
 --
 -- Cross-source season type (all varchar slug 'YYNN' after #404):
 --   * silver.xref_team.season                 = varchar slug '2526' (all sources)
 --   * silver.fbref_team_season_profile.season = varchar slug '2526'
---   * silver.{understat,whoscored,sofascore,fotmob}_team_match.season
+--   * silver.{understat,whoscored,sofascore}_team_match.season
 --                                             = varchar slug '2526'
 --     (season rollups над ними — инлайн-CTE ниже, #478)
 --
@@ -98,21 +100,6 @@ xref_ss AS (
         season                                            AS season_slug
     FROM iceberg.silver.xref_team
     WHERE source = 'sofascore'
-      AND confidence <> 'orphan'
-),
-
--- FotMob native xref (#930). source_season_key is converted to the
--- legacy-compatible slug ('2526') at the Silver boundary, like the other
--- sources. fm_team_season.season uses the same slug, so bridge + fact JOIN is
--- slug = slug. team_id = team NAME (== source_id).
-xref_fm AS (
-    SELECT DISTINCT
-        canonical_id,
-        source_id                                         AS fm_team_name,
-        league,
-        season                                            AS season_year_str
-    FROM iceberg.silver.xref_team
-    WHERE source = 'fotmob'
       AND confidence <> 'orphan'
 ),
 
@@ -477,49 +464,6 @@ ss_team_season AS (
         league,
         season
     FROM ss_match_rollup
-),
-
--- ex gold.fotmob_team_season: rollup silver.fotmob_team_match (match-grain;
--- team_id = FotMob team NAME, resolve до canonical — через xref_fm выше).
--- INCOMPLETE-SEASON caveat: fotmob_team_match держит только матчи со stats_json
--- (~89% фикстур) → SUM-счётчики занижены vs FBref; COALESCE primary остаётся
--- FBref/US, FotMob кормит только expected_assists + UNIQUE_FOTMOB.
-fm_team_season AS (
-    SELECT
-        team_id,
-
-        -- ========= HARD_FACT counters (SUM / COUNT) =========
-        CAST(COUNT(*)                AS INTEGER) AS appearances,
-        CAST(SUM(goals_for)          AS INTEGER) AS goals,
-        CAST(SUM(goals_against)      AS INTEGER) AS goals_conceded,
-        CAST(SUM(total_shots)        AS INTEGER) AS total_shots,
-        CAST(SUM(shots_on_target)    AS INTEGER) AS shots_on_target,
-        CAST(SUM(yellow_cards)       AS INTEGER) AS yellow_cards,
-        CAST(SUM(red_cards)          AS INTEGER) AS red_cards,
-        CAST(SUM(fouls)              AS INTEGER) AS fouls_committed,
-        CAST(SUM(offsides)           AS INTEGER) AS offsides,
-        CAST(SUM(corner_kicks)       AS INTEGER) AS corner_kicks,
-        CAST(SUM(interceptions)      AS INTEGER) AS interceptions,
-        CAST(SUM(clearances)         AS INTEGER) AS clearances,
-
-        -- ========= MODELED — xG / xA family =========
-        ROUND(SUM(expected_goals),   4)          AS expected_goals,
-        ROUND(SUM(npxg),             4)          AS npxg,
-        ROUND(SUM(xgot),             4)          AS xgot,
-        -- The whole point of issue #97 at season grain: team xA, unavailable elsewhere.
-        ROUND(SUM(expected_assists), 4)          AS expected_assists,
-
-        -- ========= UNIQUE_FOTMOB =========
-        CAST(SUM(big_chances)        AS INTEGER) AS big_chances,
-        CAST(SUM(big_chances_missed) AS INTEGER) AS big_chances_missed,
-        CAST(SUM(touches_in_box)     AS INTEGER) AS touches_in_box,
-        CAST(SUM(shots_inside_box)   AS INTEGER) AS shots_inside_box,
-        CAST(SUM(shots_outside_box)  AS INTEGER) AS shots_outside_box,
-
-        league,
-        season
-    FROM iceberg.silver.fotmob_team_match
-    GROUP BY team_id, league, season
 )
 
 SELECT
@@ -552,12 +496,11 @@ SELECT
     {{ m_penalties_conceded }}
     CAST(fb.own_goals                                                                         AS BIGINT) AS own_goals,
 
-    -- ========= MODELED — xG/xA (Understat primary per RX2; FotMob then SS fallback) =========
+    -- ========= MODELED — xG/xA (Understat primary per RX2; SS fallback) =========
     {{ m_expected_goals }}
-    -- FotMob has no team-grain xGA → COALESCE stays us → ss.
     {{ m_expected_goals_against }}
-    -- expected_assists: FotMob is the ONLY source with team-grain xA (#97).
-    ROUND(fm.expected_assists, 2)                                        AS expected_assists,
+    -- expected_assists: FotMob was the ONLY source (#97) — typed NULL since #1590.
+    CAST(NULL AS double)                                                  AS expected_assists,
     ROUND(us.xpts, 2)                                                     AS xpts,
     {{ m_npxg }}
     ROUND(us.npxg_against, 2)                                             AS npxg_against,
@@ -614,7 +557,7 @@ SELECT
     ROUND(ws.takeon_pct, 2)                               AS takeon_pct,
     ws.clearances,
     ws.ball_recoveries,
-    -- touches_in_box: WS is NULL for current seasons (#120) → fall back to FotMob.
+    -- touches_in_box: WhoScored (the FotMob fallback was removed in #1590).
     {{ m_touches_in_box }}
     ws.defensive_actions_third,
     ROUND(ws.set_piece_share_pct, 2)                      AS set_piece_share_pct,
@@ -638,12 +581,12 @@ SELECT
     ss.accurate_crosses,
     ss.total_crosses,
 
-    -- ========= UNIQUE_FOTMOB — metrics no other source provides (#97) =========
-    ROUND(fm.xgot, 4)                                     AS xgot,
-    fm.big_chances,
-    fm.big_chances_missed,
-    fm.shots_inside_box,
-    fm.shots_outside_box,
+    -- ========= UNIQUE_FOTMOB (#97) — typed NULL since #1590 =========
+    CAST(NULL AS double)                                  AS xgot,
+    CAST(NULL AS integer)                                 AS big_chances,
+    CAST(NULL AS integer)                                 AS big_chances_missed,
+    CAST(NULL AS integer)                                 AS shots_inside_box,
+    CAST(NULL AS integer)                                 AS shots_outside_box,
 
     -- ========= TEAM FINANCE — APL only, else NULL =========
     -- squad value (TM) + salary-sum wage bill (Capology) = APL 2025/26 only
@@ -704,15 +647,6 @@ LEFT JOIN ss_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
--- FotMob (#97): xref season slug now (#404); fm_team_season season slug → slug = slug.
-LEFT JOIN xref_fm xfm
-    ON  xfm.canonical_id   = xf.canonical_id
-    AND xfm.league         = xf.league
-    AND xfm.season_year_str = CAST(xf.season_year AS varchar)
-LEFT JOIN fm_team_season fm
-    ON  fm.team_id = xfm.fm_team_name
-    AND fm.league  = xf.league
-    AND fm.season  = xf.season_slug
 -- Transfermarkt squad value is already canonical team/league/season grain.
 LEFT JOIN tm_finance tmf
     ON  tmf.team_id      = xf.canonical_id
