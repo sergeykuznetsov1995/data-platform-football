@@ -42,6 +42,8 @@ DISCOVERY_SCRIPT = "/opt/airflow/dags/scripts/run_transfermarkt_discovery.py"
 STATE_ROOT = Path("/opt/airflow/logs/transfermarkt-registry")
 OUTPUT_ROOT = STATE_ROOT / "manifests"
 CACHE_PATH = STATE_ROOT / "cache" / "http.json"
+# dags/utils/__init__ imports the top-level `utils` package (as the ingest DAG).
+RUNNER_PYTHONPATH = "/opt/airflow:/opt/airflow/dags"
 APPROVAL_ROOT = Path("/opt/airflow/logs/transfermarkt-approvals")
 APPROVAL_JOURNAL = APPROVAL_ROOT / "journal.json"
 
@@ -352,6 +354,7 @@ def _prepare_discovery(
         checkpoint = STATE_ROOT / "checkpoints" / f"{cycle_id}.json"
         return {
             "TM_APPROVAL_MODE": "standing_policy",
+            "PYTHONPATH": RUNNER_PYTHONPATH,
             "TM_MODE": sizing.mode,
             "TM_PREVIOUS_SNAPSHOT_ID": previous_snapshot_id or "",
             "TM_BYTE_CAP_BYTES": str(limits.byte_cap_bytes),
@@ -452,6 +455,7 @@ def _prepare_discovery(
 
     return {
         "TM_APPROVAL_MODE": "one_shot",
+        "PYTHONPATH": RUNNER_PYTHONPATH,
         "TM_CYCLE_ID": cycle_id,
         "TM_DAG_ID": DAG_ID,
         "TM_RUN_ID": run_id,
