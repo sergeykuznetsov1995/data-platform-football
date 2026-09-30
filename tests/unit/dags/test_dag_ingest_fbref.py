@@ -106,7 +106,7 @@ class TestFBrefCurrentTopology:
         factory = sys.modules["utils.fbref_current_dag_factory"]
         assert (
             factory.CURRENT_MAX_BATCHES_POLICY
-            == "fbref-current-max-batches-14-v1"
+            == "fbref-current-max-batches-20-v1"
         )
         assert (
             factory.CURRENT_PAGE_KINDS_POLICY
@@ -116,8 +116,8 @@ class TestFBrefCurrentTopology:
             factory.CURRENT_PUBLICATION_ORDER_POLICY
             == "fbref-current-silver-after-lock-v1"
         )
-        assert factory.CURRENT_MAX_BATCHES == 14
-        assert module.CURRENT_MAX_BATCHES == 14
+        assert factory.CURRENT_MAX_BATCHES == 20
+        assert module.CURRENT_MAX_BATCHES == 20
         assert len(tasks) == 16
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"

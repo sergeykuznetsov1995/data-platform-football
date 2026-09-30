@@ -64,22 +64,20 @@ PAGE_KINDS = (
 )
 
 # One unforked process advances bounded raw-first batches while retaining the
-# same clearance and proxy quarantine for the run.  The observed full 25-page
-# cadence is about 20m21s, so at a rounded 21 minutes per wave 14 waves cost
-# about 4h54m and 16 waves about 5h36m.  The runner also pays warm-up and
-# finalisation outside the batch loop, which the cap-16 arithmetic ignored:
-# the subprocess wait is six hours (LIVE_WAVES_TIMEOUT_SECONDS) and the task
-# timeout is six hours five minutes, so a cap-16 run has no room left for the
-# tail and is killed mid-batch.  Cap 14 keeps about an hour of headroom for
-# warm-up, the last batch and finalisation.  The current-only deferred
-# reconciliation can improve throughput, but its exact speedup requires a
-# live canary.
-CURRENT_MAX_BATCHES = 14
-# Deployment marker for the reviewed cap-14 policy.  The speed release was
+# same clearance and proxy quarantine for the run.  With the 25-match write
+# batch (#1320) the live runs of 26.09-30.09 took 120-212 minutes for 14
+# batches (21-36 s per page), and every successful run stopped exactly at the
+# cap with more targets due.  Cap 20 (500 pages) is about 3h55m-5h at that
+# speed.  The time budget below (CURRENT_WAVE_DEADLINE_SECONDS, #1318) is
+# checked between batches, so a slower run ends with a partial result before
+# the six-hour subprocess wait (LIVE_WAVES_TIMEOUT_SECONDS) instead of being
+# killed mid-batch; the cap no longer has to carry that headroom itself.
+CURRENT_MAX_BATCHES = 20
+# Deployment marker for the reviewed cap policy.  The speed release was
 # merged before it was installed, so the combined Bronze delivery must carry
 # this factory as an explicit first-parent modification instead of silently
 # leaving production on the old cap-80 bytes.
-CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-14-v1"
+CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-20-v1"
 # Deployment marker for the reviewed no-players page-kind policy, carried the
 # same way as the cap above so a delivery cannot silently leave production on
 # the old list that still claims player and matchlog pages.
@@ -158,9 +156,10 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         request_limit = FBREF_PRODUCTION_REQUEST_LIMIT
         byte_limit_mb = FBREF_PRODUCTION_BYTE_LIMIT_MB
         shard_size = FBREF_MAX_WARM_SESSION_TARGETS
-        # Bootstrap is driven by hand and has no schedule to protect, so it
-        # keeps the old behaviour: the batch cap is its only bound.
-        wave_deadline_seconds = 0
+        # Bootstrap has no schedule to protect, but it shares the cap-20
+        # runner and the six-hour subprocess wait, which a slow 20-batch run
+        # can exceed; the same time budget ends it between batches instead.
+        wave_deadline_seconds = CURRENT_WAVE_DEADLINE_SECONDS
         description = "Manual non-publishing FBref current bootstrap"
         tags = ["fbref", "bronze", "raw-first", "bootstrap", "manual"]
         doc_md = """

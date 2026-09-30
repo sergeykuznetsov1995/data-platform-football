@@ -102,7 +102,7 @@ class TestFBrefCurrentFailureEdges:
         }
         live = dag.task_dict["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
-        assert live.op_kwargs["max_batches"] == 14
+        assert live.op_kwargs["max_batches"] == 20
         assert "player" not in live.op_kwargs["page_kinds"]
         assert "matchlog" not in live.op_kwargs["page_kinds"]
         factory = sys.modules["utils.fbref_current_dag_factory"]
