@@ -1404,6 +1404,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # reached, so its silence may not be read as "this class had
             # nothing to serve" — see ``queue_safe`` below.
             tail_walked = True
+            tail_visited = set(pairs)
+            tail_refused = False
             if name == "seed":
                 # The queue cursor moves as soon as its slice is TAKEN, not when
                 # the phase succeeds: the entries stay on the list until they are
@@ -1436,6 +1438,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     # already paid for is banked below, not thrown away.
                     interrupted = exc
                     tail_walked = False
+                    tail_refused = True
+                    tail_visited = set(exc.visited)
                     events, counters, cut_short = (
                         exc.fetched, exc.counters, exc.incomplete
                     )
@@ -1454,6 +1458,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     # walk was not (code review of PR #1216).
                     interrupted = exc
                     tail_walked = False
+                    tail_visited = set()
                     events, cut_short = [], []
                     counters = empty_schedule_counters()
                     counters["error"] = str(exc)
@@ -1481,6 +1486,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     # As in the seed branch: cut short, but banked.
                     interrupted = exc
                     tail_walked = False
+                    tail_refused = True
+                    tail_visited = set(exc.visited)
                     events, counters, cut_short = (
                         exc.fetched, exc.counters, exc.incomplete
                     )
@@ -1491,6 +1498,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     # interruption.
                     interrupted = exc
                     tail_walked = False
+                    tail_visited = set()
                     events, cut_short = [], []
                     counters = empty_schedule_counters()
                     counters["error"] = str(exc)
@@ -1629,7 +1637,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # events, and letting THAT move the queue would retire resumed
             # chains that were never read — the rest of those seasons would
             # never be asked for again (code review of PR #1216).
-            queue_safe = bool(rows) or (not served and tail_walked)
+            # A refusal carries its visited prefix and rolls back each refused
+            # target's events.  With no served events there is no unwritten
+            # prefix; its same-page retry attempts can safely age out.
+            queue_safe = bool(rows) or (
+                not served and (tail_walked or tail_refused)
+            )
             # This class is done: its cursor may move, and the chains it just
             # walked drop off the retry list while fresh truncations join it.
             # Only the seed phase resumes a saved chain, so only it may retire
@@ -1658,11 +1671,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     report.setdefault("skipped_slices", []).append(name)
                     held = 0
             cursor_state["interrupted_runs"][name] = held
-            # A walk cut short by a refusal streak banks its rows (#1359), but
-            # the chains of the slice it never reached were not attempted:
-            # only a tail walk that ran to the end retires them (Sol r2).
-            if name == "seed" and queue_safe and tail_walked:
-                attempted.update(retried)
+            # Retire only the visited retry prefix.  Completed chains leave;
+            # refused chains return through cut_short; unread chains stay put.
+            if name == "seed" and queue_safe:
+                attempted.update(set(retried) & tail_visited)
             committed = True
             if queue_safe:
                 queued_seasons, abandoned = requeue_chains(

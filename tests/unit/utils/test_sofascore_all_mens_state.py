@@ -1436,3 +1436,83 @@ def test_refresh_batch_bound_never_closes_the_window_before_the_budget():
         state.DEFAULT_REFRESH_SECONDS_PER_MATCH + state.REFRESH_SCOPE_OVERHEAD_SECONDS
     )
     assert state.DEFAULT_REFRESH_BATCH_SIZE * smallest >= 2 * 3600
+
+
+def test_refresh_preserves_native_seasons_sharing_a_canonical_year():
+    snapshot = _snapshot()
+    tournament = snapshot['tournaments'][1]
+    tournament['seasons'] = [dict(_season(8, 2026, 'ready'), source_season_id=sid,
+        canonical_season='2026') for sid in (98037, 95576)]
+    snapshot.pop('snapshot_id')
+    snapshot['snapshot_id'] = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False,
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    planned = plan_refresh_batch(snapshot, [
+        ('SS-8', '2026', 2, None, 0, 98037),
+        ('SS-8', '2026', 1, None, 0, 95576),
+    ], queue_mode='backlog')
+    assert [p['SOFASCORE_SOURCE_SEASON_ID'] for p in planned] == ['98037', '95576']
+    assert plan_refresh_batch(snapshot, [('SS-8', '2026', 2, None)],
+                              queue_mode='backlog') == []
+
+
+def test_season_mismatch_quarantine_survives_unrelated_release(tmp_path, monkeypatch):
+    from dags.utils import sofascore_all_mens_state as state
+    snapshot = _snapshot()
+    campaign_id = snapshot['campaign_id']
+    head = campaign_scope_key(campaign_id, 8, 825)
+    season = snapshot['tournaments'][1]['seasons'][0]
+    identity = state.season_alignment_identity(8, season)
+    path = tmp_path / 'failures.json'
+    for attempt in range(3):
+        mark_failed(path, campaign_id=campaign_id, scope_key=head,
+                    run_id=str(attempt), reason='matches: season_mismatch: 4 rows',
+                    source_requests=0, release='aaaaaaaa', season_identity=identity)
+    assert head not in _quarantine_plan(snapshot, path, release='bbbbbbbb')
+    # An unrelated snapshot change also keeps the failed scope quarantined.
+    snapshot['tournaments'][0]['seasons'][0]['team_count'] = 24
+    snapshot.pop('snapshot_id')
+    snapshot['snapshot_id'] = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False,
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    assert head not in _quarantine_plan(snapshot, path, release='bbbbbbbb')
+    monkeypatch.setattr(state, 'SEASON_ALIGNMENT_CONTRACT_VERSION', 2)
+    assert head in _quarantine_plan(snapshot, path, release='bbbbbbbb')
+    monkeypatch.setattr(state, 'SEASON_ALIGNMENT_CONTRACT_VERSION', 1)
+    season['canonical_season'] = '2025'
+    snapshot.pop('snapshot_id')
+    snapshot['snapshot_id'] = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False,
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    assert head in _quarantine_plan(snapshot, path, release='bbbbbbbb')
+
+
+def test_legacy_season_quarantine_gets_one_input_aware_attempt(tmp_path):
+    from dags.utils.sofascore_all_mens_state import season_alignment_identity
+    snapshot = _snapshot()
+    campaign_id = snapshot['campaign_id']
+    head = campaign_scope_key(campaign_id, 8, 825)
+    path = tmp_path / 'failures.json'
+    for attempt in range(3):
+        mark_failed(path, campaign_id=campaign_id, scope_key=head,
+                    run_id=str(attempt), reason='matches: season_mismatch: 4 rows',
+                    source_requests=0, release='aaaaaaaa')
+    assert head in _quarantine_plan(snapshot, path)
+    mark_failed(path, campaign_id=campaign_id, scope_key=head, run_id='migrated',
+                reason='matches: season_mismatch: 4 rows', source_requests=0,
+                release='bbbbbbbb', season_identity=season_alignment_identity(
+                    8, snapshot['tournaments'][1]['seasons'][0]))
+    assert head not in _quarantine_plan(snapshot, path, release='cccccccc')
+
+
+@pytest.mark.parametrize('deadline,open_count', [(2000, 2), (None, 0)])
+def test_native_alias_ties_do_not_depend_on_pending_query_order(deadline, open_count):
+    snapshot = _refresh_snapshot()
+    tournament = snapshot['tournaments'][0]
+    first = tournament['seasons'][0]
+    tournament['seasons'].append({**first, 'source_season_id':1799})
+    unsigned = {key:value for key,value in snapshot.items() if key != 'snapshot_id'}
+    snapshot['snapshot_id'] = hashlib.sha256(json.dumps(
+        unsigned,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    rows = [('SS-17','2627',2,deadline,open_count,native) for native in (1726,1799)]
+    choices = [plan_refresh_batch(snapshot, pending, batch_size=1,
+               queue_mode='deadline',scope_budget_s=7200)[0]['SOFASCORE_SOURCE_SEASON_ID']
+               for pending in (rows,list(reversed(rows)))]
+    assert choices == ['1726','1726']

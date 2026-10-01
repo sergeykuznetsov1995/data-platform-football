@@ -1,0 +1,644 @@
+[
+  {
+    "payload": {
+      "event": {
+        "eventState": {},
+        "tournament": {
+          "name": "Copa Paraguay",
+          "slug": "copa-paraguay",
+          "category": {
+            "name": "Paraguay",
+            "slug": "paraguay",
+            "sport": {
+              "name": "Football",
+              "slug": "football",
+              "id": 1
+            },
+            "priority": 0,
+            "country": {
+              "alpha2": "PY",
+              "alpha3": "PRY",
+              "name": "Paraguay",
+              "slug": "paraguay"
+            },
+            "id": 280,
+            "flag": "paraguay",
+            "alpha2": "PY",
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "باراغواي",
+                "ru": "Парагвай"
+              },
+              "shortNameTranslation": {}
+            }
+          },
+          "uniqueTournament": {
+            "name": "Copa Paraguay",
+            "slug": "copa-paraguay",
+            "primaryColorHex": "#012c58",
+            "secondaryColorHex": "#b1975f",
+            "category": {
+              "name": "Paraguay",
+              "slug": "paraguay",
+              "sport": {
+                "name": "Football",
+                "slug": "football",
+                "id": 1
+              },
+              "priority": 0,
+              "country": {
+                "alpha2": "PY",
+                "alpha3": "PRY",
+                "name": "Paraguay",
+                "slug": "paraguay"
+              },
+              "id": 280,
+              "flag": "paraguay",
+              "alpha2": "PY",
+              "fieldTranslations": {
+                "nameTranslation": {
+                  "ar": "باراغواي",
+                  "ru": "Парагвай"
+                },
+                "shortNameTranslation": {}
+              }
+            },
+            "userCount": 3006,
+            "hasRounds": true,
+            "hasPerformanceGraphFeature": false,
+            "liveActivityEnabled": false,
+            "country": {},
+            "id": 13614,
+            "hasEventPlayerStatistics": false,
+            "displayInverseHomeAwayTeams": false,
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "كأس باراغواي",
+                "bn": "কোপা প্যারাগুয়ে",
+                "hi": "कोपा पैराग्वे",
+                "ru": "Кубок Парагвая"
+              },
+              "shortNameTranslation": {}
+            }
+          },
+          "priority": 0,
+          "isGroup": false,
+          "competitionType": 2,
+          "isLive": false,
+          "id": 67367,
+          "fieldTranslations": {
+            "nameTranslation": {
+              "ar": "كأس باراغواي",
+              "bn": "কোপা প্যারাগুয়ে",
+              "hi": "कोपा पैराग्वे",
+              "ru": "Кубок Парагвая"
+            },
+            "shortNameTranslation": {}
+          }
+        },
+        "season": {
+          "name": "Copa Paraguay 2026",
+          "year": "2026",
+          "editor": false,
+          "id": 98037
+        },
+        "roundInfo": {
+          "round": 2,
+          "name": "Round 2",
+          "slug": "round-2"
+        },
+        "customId": "vZJsYfhb",
+        "status": {
+          "code": 100,
+          "description": "Ended",
+          "type": "finished"
+        },
+        "winnerCode": 1,
+        "homeTeam": {
+          "name": "Sportivo Iteño",
+          "slug": "sportivo-iteno",
+          "shortName": "Sportivo Iteño",
+          "gender": "M",
+          "sport": {
+            "name": "Football",
+            "slug": "football",
+            "id": 1
+          },
+          "userCount": 734,
+          "venue": {
+            "city": {
+              "name": "Ita",
+              "country": {
+                "alpha2": "PY",
+                "alpha3": "PRY",
+                "name": "Paraguay",
+                "slug": "paraguay"
+              },
+              "id": 26023
+            },
+            "venueCoordinates": {
+              "latitude": -25.508935,
+              "longitude": -57.355843
+            },
+            "hidden": true,
+            "slug": "estadio-salvador-morga",
+            "name": "Estadio Salvador Morga",
+            "capacity": 4500,
+            "country": {
+              "alpha2": "PY",
+              "alpha3": "PRY",
+              "name": "Paraguay",
+              "slug": "paraguay"
+            },
+            "id": 13706,
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "ملعب سالفادور مورغا",
+                "hi": "एस्टेडियो साल्वाडोर मोर्गा",
+                "bn": "সালভাদর মরগা স্টেডিয়াম",
+                "ru": "Стадион Estadio Salvador Morga"
+              },
+              "shortNameTranslation": {}
+            },
+            "stadium": {
+              "name": "Estadio Salvador Morga",
+              "capacity": 4500
+            }
+          },
+          "nameCode": "SPI",
+          "disabled": false,
+          "national": false,
+          "type": 0,
+          "country": {
+            "alpha2": "PY",
+            "alpha3": "PRY",
+            "name": "Paraguay",
+            "slug": "paraguay"
+          },
+          "id": 142798,
+          "fullName": "Sportivo Iteño",
+          "subTeams": [],
+          "teamColors": {
+            "primary": "#efede5",
+            "secondary": "#2c4e9c",
+            "text": "#2c4e9c"
+          },
+          "fieldTranslations": {
+            "nameTranslation": {
+              "ar": "سبورتيفو إيتينيو",
+              "ru": "Спортиво Итеño"
+            },
+            "shortNameTranslation": {
+              "ar": "سبورتيفو إيتينيو",
+              "ru": "Спортиво Итеño"
+            }
+          },
+          "timeActive": []
+        },
+        "awayTeam": {
+          "name": "Deportivo Capiatá",
+          "slug": "deportivo-capiata",
+          "shortName": "Capiatá",
+          "gender": "M",
+          "sport": {
+            "name": "Football",
+            "slug": "football",
+            "id": 1
+          },
+          "userCount": 3001,
+          "venue": {
+            "city": {
+              "name": "Capiata",
+              "country": {
+                "alpha2": "PY",
+                "alpha3": "PRY",
+                "name": "Paraguay",
+                "slug": "paraguay"
+              },
+              "id": 30939
+            },
+            "venueCoordinates": {
+              "latitude": -25.360644,
+              "longitude": -57.437492
+            },
+            "hidden": true,
+            "slug": "estadio-erico-galeano",
+            "name": "Estadio Erico Galeano",
+            "capacity": 15000,
+            "country": {
+              "alpha2": "PY",
+              "alpha3": "PRY",
+              "name": "Paraguay",
+              "slug": "paraguay"
+            },
+            "id": 11456,
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "ملعب إيريكو غاليانو",
+                "hi": "एस्टेडियो एरिको गैलेनो",
+                "bn": "এস্তাদিও এরিকো গ্যালিয়ানো",
+                "ru": "Стадион Estadio Erico Galeano"
+              },
+              "shortNameTranslation": {}
+            },
+            "stadium": {
+              "name": "Estadio Erico Galeano",
+              "capacity": 15000
+            }
+          },
+          "nameCode": "DEP",
+          "disabled": false,
+          "national": false,
+          "type": 0,
+          "country": {
+            "alpha2": "PY",
+            "alpha3": "PRY",
+            "name": "Paraguay",
+            "slug": "paraguay"
+          },
+          "id": 87470,
+          "fullName": "Deportivo Capiatá",
+          "subTeams": [],
+          "teamColors": {
+            "primary": "#0b2d7a",
+            "secondary": "#fcde1e",
+            "text": "#fcde1e"
+          },
+          "fieldTranslations": {
+            "nameTranslation": {
+              "ar": "ديبورتيفو كابياتا",
+              "ru": "Депортиво Капиата"
+            },
+            "shortNameTranslation": {
+              "ar": "كابياتا"
+            }
+          },
+          "timeActive": []
+        },
+        "homeScore": {
+          "current": 3,
+          "display": 3,
+          "period1": 1,
+          "period2": 2,
+          "normaltime": 3
+        },
+        "awayScore": {
+          "current": 2,
+          "display": 2,
+          "period1": 0,
+          "period2": 2,
+          "normaltime": 2
+        },
+        "time": {
+          "periodLength": 2700,
+          "overtimeLength": 900,
+          "totalPeriodCount": 2,
+          "currentPeriodStartTimestamp": 1784835204,
+          "lastPeriodEndTimestamp": 1784834229
+        },
+        "changes": {
+          "changes": [
+            "status.code",
+            "status.description",
+            "status.type",
+            "homeScore.normaltime",
+            "awayScore.normaltime"
+          ],
+          "changeTimestamp": 1784838200
+        },
+        "hasGlobalHighlights": true,
+        "crowdsourcingDataDisplayEnabled": false,
+        "id": 16478404,
+        "defaultPeriodCount": 2,
+        "defaultPeriodLength": 45,
+        "defaultOvertimeLength": 15,
+        "slug": "sportivo-iteno-deportivo-capiata",
+        "currentPeriodStartTimestamp": 1784835204,
+        "startTimestamp": 1784831400,
+        "finalResultOnly": false,
+        "feedLocked": true,
+        "cupMatchesInRound": 1,
+        "showTotoPromo": true,
+        "isEditor": false,
+        "eventFilters": {
+          "category": [
+            "club"
+          ],
+          "level": [
+            "pro"
+          ],
+          "gender": [
+            "M"
+          ]
+        }
+      }
+    },
+    "source_season_id": 95576,
+    "content_hash": "89832ab4eb8e36de83e62fa92b3053b27edf12177690523ccef9f5bec97594ec"
+  },
+  {
+    "payload": {
+      "event": {
+        "eventState": {},
+        "tournament": {
+          "name": "Copa Paraguay",
+          "slug": "copa-paraguay",
+          "category": {
+            "name": "Paraguay",
+            "slug": "paraguay",
+            "sport": {
+              "name": "Football",
+              "slug": "football",
+              "id": 1
+            },
+            "priority": 0,
+            "country": {
+              "alpha2": "PY",
+              "alpha3": "PRY",
+              "name": "Paraguay",
+              "slug": "paraguay"
+            },
+            "id": 280,
+            "flag": "paraguay",
+            "alpha2": "PY",
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "باراغواي",
+                "ru": "Парагвай"
+              },
+              "shortNameTranslation": {}
+            }
+          },
+          "uniqueTournament": {
+            "name": "Copa Paraguay",
+            "slug": "copa-paraguay",
+            "primaryColorHex": "#012c58",
+            "secondaryColorHex": "#b1975f",
+            "category": {
+              "name": "Paraguay",
+              "slug": "paraguay",
+              "sport": {
+                "name": "Football",
+                "slug": "football",
+                "id": 1
+              },
+              "priority": 0,
+              "country": {
+                "alpha2": "PY",
+                "alpha3": "PRY",
+                "name": "Paraguay",
+                "slug": "paraguay"
+              },
+              "id": 280,
+              "flag": "paraguay",
+              "alpha2": "PY",
+              "fieldTranslations": {
+                "nameTranslation": {
+                  "ar": "باراغواي",
+                  "ru": "Парагвай"
+                },
+                "shortNameTranslation": {}
+              }
+            },
+            "userCount": 3006,
+            "hasRounds": true,
+            "hasPerformanceGraphFeature": false,
+            "liveActivityEnabled": false,
+            "country": {},
+            "id": 13614,
+            "hasEventPlayerStatistics": false,
+            "displayInverseHomeAwayTeams": false,
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "كأس باراغواي",
+                "bn": "কোপা প্যারাগুয়ে",
+                "hi": "कोपा पैराग्वे",
+                "ru": "Кубок Парагвая"
+              },
+              "shortNameTranslation": {}
+            }
+          },
+          "priority": 0,
+          "isGroup": false,
+          "competitionType": 2,
+          "isLive": false,
+          "id": 67367,
+          "fieldTranslations": {
+            "nameTranslation": {
+              "ar": "كأس باراغواي",
+              "bn": "কোপা প্যারাগুয়ে",
+              "hi": "कोपा पैराग्वे",
+              "ru": "Кубок Парагвая"
+            },
+            "shortNameTranslation": {}
+          }
+        },
+        "season": {
+          "name": "Copa Paraguay 2026",
+          "year": "2026",
+          "editor": false,
+          "id": 98037
+        },
+        "roundInfo": {
+          "round": 2,
+          "name": "Round 2",
+          "slug": "round-2"
+        },
+        "customId": "tuLsXAYj",
+        "status": {
+          "code": 100,
+          "description": "Ended",
+          "type": "finished"
+        },
+        "winnerCode": 2,
+        "homeTeam": {
+          "name": "Dep. Sta Monica-Alto Parana",
+          "slug": "dep-sta-monica-alto-parana",
+          "gender": "M",
+          "sport": {
+            "name": "Football",
+            "slug": "football",
+            "id": 1
+          },
+          "userCount": 57,
+          "nameCode": "DEP",
+          "national": false,
+          "type": 0,
+          "country": {
+            "alpha2": "PY",
+            "alpha3": "PRY",
+            "name": "Paraguay",
+            "slug": "paraguay"
+          },
+          "id": 1246297,
+          "fullName": "Dep. Sta Monica-Alto Parana",
+          "subTeams": [],
+          "teamColors": {
+            "primary": "#374df5",
+            "secondary": "#374df5",
+            "text": "#ffffff"
+          },
+          "timeActive": []
+        },
+        "awayTeam": {
+          "name": "Resistencia FC",
+          "slug": "resistencia-fc",
+          "shortName": "Resistencia",
+          "gender": "M",
+          "sport": {
+            "name": "Football",
+            "slug": "football",
+            "id": 1
+          },
+          "userCount": 3930,
+          "manager": {
+            "name": "Ángel Martínez",
+            "slug": "angel-martinez",
+            "shortName": "Á. Martínez",
+            "country": {
+              "alpha2": "PY",
+              "alpha3": "PRY",
+              "name": "Paraguay",
+              "slug": "paraguay"
+            },
+            "id": 804885,
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "أنخيل مارتينيز",
+                "ru": "Анхель Мартинес"
+              },
+              "shortNameTranslation": {
+                "ar": "أ. مارتينيز",
+                "ru": "А. Мартинес"
+              }
+            }
+          },
+          "venue": {
+            "city": {
+              "name": "Asuncion",
+              "country": {
+                "alpha2": "PY",
+                "alpha3": "PRY",
+                "name": "Paraguay",
+                "slug": "paraguay"
+              },
+              "id": 18042
+            },
+            "venueCoordinates": {
+              "latitude": -25.30066,
+              "longitude": -57.63591
+            },
+            "hidden": true,
+            "slug": "estadio-tomas-beygon-gorea",
+            "name": "Estadio Tomas Beygon Gorea",
+            "capacity": 5700,
+            "country": {
+              "alpha2": "PY",
+              "alpha3": "PRY",
+              "name": "Paraguay",
+              "slug": "paraguay"
+            },
+            "id": 11476,
+            "fieldTranslations": {
+              "nameTranslation": {
+                "ar": "ملعب توماس بيغون غوريا",
+                "hi": "एस्टेडियो टॉमस बेगोन गोरेया",
+                "bn": "এস্তাদিও টমাস বেগন গোরিয়া",
+                "ru": "Стадион Estadio Tomas Beygon Gorea"
+              },
+              "shortNameTranslation": {}
+            },
+            "stadium": {
+              "name": "Estadio Tomas Beygon Gorea",
+              "capacity": 5700
+            }
+          },
+          "nameCode": "RES",
+          "national": false,
+          "type": 0,
+          "country": {
+            "alpha2": "PY",
+            "alpha3": "PRY",
+            "name": "Paraguay",
+            "slug": "paraguay"
+          },
+          "id": 90968,
+          "fullName": "Resistencia FC",
+          "subTeams": [],
+          "teamColors": {
+            "primary": "#87cefa",
+            "secondary": "#ff0000",
+            "text": "#ff0000"
+          },
+          "foundationDateTimestamp": -1641427200,
+          "fieldTranslations": {
+            "nameTranslation": {
+              "ar": "نادي كرة القدم ريزيستينسيا",
+              "ru": "Ресистенсия ФК"
+            },
+            "shortNameTranslation": {}
+          },
+          "timeActive": []
+        },
+        "homeScore": {
+          "current": 1,
+          "display": 1,
+          "period1": 1,
+          "period2": 0,
+          "normaltime": 1
+        },
+        "awayScore": {
+          "current": 2,
+          "display": 2,
+          "period1": 1,
+          "period2": 1,
+          "normaltime": 2
+        },
+        "time": {
+          "periodLength": 2700,
+          "overtimeLength": 900,
+          "totalPeriodCount": 2,
+          "currentPeriodStartTimestamp": 1784048594,
+          "lastPeriodEndTimestamp": 1784047675
+        },
+        "changes": {
+          "changes": [
+            "status.code",
+            "status.description",
+            "status.type",
+            "homeScore.normaltime",
+            "awayScore.normaltime"
+          ],
+          "changeTimestamp": 1784051663
+        },
+        "hasGlobalHighlights": true,
+        "crowdsourcingDataDisplayEnabled": false,
+        "id": 16480360,
+        "defaultPeriodCount": 2,
+        "defaultPeriodLength": 45,
+        "defaultOvertimeLength": 15,
+        "slug": "dep-sta-monica-alto-parana-resistencia-fc",
+        "currentPeriodStartTimestamp": 1784048594,
+        "startTimestamp": 1784044800,
+        "finalResultOnly": false,
+        "feedLocked": true,
+        "cupMatchesInRound": 1,
+        "showTotoPromo": true,
+        "isEditor": false,
+        "eventFilters": {
+          "category": [
+            "club"
+          ],
+          "level": [
+            "pro"
+          ],
+          "gender": [
+            "M"
+          ]
+        }
+      }
+    },
+    "source_season_id": 95576,
+    "content_hash": "551eac6bce80a9bc5b1746cacc12b72568e69522336c529c915849ccd9fc3d78"
+  }
+]

@@ -3237,7 +3237,8 @@ def test_empty_bronze_schedule_fails_before_any_browser_or_source_fallback(
     monkeypatch.setattr(
         runner,
         "_source_context",
-        lambda *args, **kwargs: pytest.fail("source context must not run"),
+        # Local registry identity is needed to filter the Bronze probe by native season.
+        lambda *args, **kwargs: (17, 76986),
     )
     output = tmp_path / f"empty-{offline_replay}.json"
     browser = MagicMock(side_effect=AssertionError("browser must not start"))

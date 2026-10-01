@@ -2507,3 +2507,147 @@ def test_a_refusal_streak_keeps_the_seed_chains_it_never_reached(
     assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
     stored = json.loads(offline["incomplete"].read_text())
     assert [entry[:3] for entry in stored["seasons"]] == [[7, 96518, 3]]
+
+
+def _real_refusal_sweep(
+    offline, monkeypatch, *, completed_prefix=False, overdue=False, status=403,
+):
+    """Exercise real fetch/parse/row conversion with only I/O boundaries fake."""
+    import re
+    from pathlib import Path
+    from scrapers.sofascore import schedule_refresh as real
+
+    root = Path(__file__).resolve().parents[3]
+    ids = [1, 2, 3, 4, 5]
+    snapshot = {
+        "campaign_id": "c", "snapshot_id": "s" * 64,
+        "tournaments": [
+            {
+                "capture_key": f"SS-{i}", "unique_tournament_id": i,
+                "metadata_status": "ready",
+                "seasons": [{
+                    "source_season_id": 100 + i, "start_year": 2026,
+                    "canonical_season": "2627", "metadata_status": "pending",
+                }],
+            }
+            for i in ids
+        ],
+    }
+    offline["snapshot"].write_text(json.dumps(snapshot))
+    offline["calls"]["known"] = {(f"SS-{i}", "2627") for i in ids}
+    if overdue:
+        offline["calls"]["overdue"] = {("SS-1", "2627"): 1_000_000}
+    else:
+        offline["incomplete"].write_text(json.dumps({
+            "seasons": [[i, 100 + i, 3, 1_700_000, 0] for i in ids],
+        }))
+    fixture = root / "tests/fixtures/sofascore_season_76986_schedule_last_0.json"
+    template = json.loads(fixture.read_text())["events"][0]
+    visited = []
+
+    class Client(_FakeClient):
+        def get_json_bytes(self, path):
+            match = re.search(r"unique-tournament/(\d+)/season/(\d+)", path)
+            tid, sid = map(int, match.groups())
+            visited.append((tid, path))
+            refused_ids = {1} if overdue else (
+                {2, 3, 4} if completed_prefix else {1, 2, 3}
+            )
+            if tid in refused_ids:
+                raise DiscoveryHTTPError(
+                    f"HTTP {status} fixture refusal", status_code=status,
+                )
+            event = json.loads(json.dumps(template))
+            event.update(
+                id=tid + 90000, tournament={"uniqueTournament": {"id": tid}},
+                season={"id": sid, "name": "2026/27"}, startTimestamp=1_700_000,
+            )
+            payload = {"events": [event], "hasNextPage": False}
+            return json.dumps(payload).encode(), payload
+    monkeypatch.setattr(refresh, "LeaseBrowserSofaScoreClient", Client)
+    monkeypatch.setattr(refresh, "fetch_season_schedules", real.fetch_season_schedules)
+    monkeypatch.setattr(refresh, "fetch_season_fixtures", real.fetch_season_fixtures)
+    monkeypatch.setattr(
+        refresh, "schedule_rows_from_events", real.schedule_rows_from_events,
+    )
+    return visited
+
+
+@pytest.mark.unit
+def test_three_refused_retries_age_without_rows(offline, monkeypatch):
+    _real_refusal_sweep(offline, monkeypatch)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    queue = json.loads(offline["incomplete"].read_text())["seasons"]
+    assert [row[4] for row in queue] == [1, 1, 1, 0, 0]
+
+
+@pytest.mark.unit
+def test_completed_prefix_retires_and_unvisited_tail_survives(offline, monkeypatch):
+    _real_refusal_sweep(offline, monkeypatch, completed_prefix=True)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    queue = json.loads(offline["incomplete"].read_text())["seasons"]
+    assert [row[0] for row in queue] == [2, 3, 4, 5]
+    assert [row[4] for row in queue] == [1, 1, 1, 0]
+
+
+@pytest.mark.unit
+def test_actual_overdue_http403_is_recorded_and_later_class_writes(offline, monkeypatch):
+    visited = _real_refusal_sweep(offline, monkeypatch, overdue=True)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 0
+    report = json.loads(offline["output"].read_text())
+    assert report["overdue_failed_targets"][0]["status"] == 403
+    assert report["overdue_rows"] == 0
+    assert report["stale_rows"] > 0
+    written_leagues = {
+        row["league"] for batch in offline["calls"]["writes"] for row in batch
+    }
+    assert written_leagues == {"SS-2", "SS-3", "SS-4", "SS-5"}
+    assert any(tid == 5 for tid, _ in visited)
+
+
+@pytest.mark.unit
+def test_repeated_refusal_streak_abandons_the_attempted_retries(offline, monkeypatch):
+    _real_refusal_sweep(offline, monkeypatch)
+    # All selected retry targets refuse, so seed commits no rows each round.
+    initial = [[i, 100 + i, 3, 1_700_000, 0] for i in (1, 2, 3)]
+    offline["incomplete"].write_text(json.dumps({"seasons": initial}))
+    for attempt in range(1, refresh.MAX_CHAIN_ATTEMPTS + 1):
+        assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+        queue = json.loads(offline["incomplete"].read_text())["seasons"]
+        if attempt < refresh.MAX_CHAIN_ATTEMPTS:
+            assert [row[4] for row in queue] == [attempt] * 3
+        else:
+            assert queue == []
+            report = json.loads(offline["output"].read_text())
+            assert report["abandoned_chains"] == [row[:4] for row in initial]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", [407, 409, 429, 500, 502, 503])
+def test_infrastructure_error_keeps_all_retry_chains(offline, monkeypatch, status):
+    visited = _real_refusal_sweep(
+        offline, monkeypatch, completed_prefix=True, status=status,
+    )
+    initial = json.loads(offline["incomplete"].read_text())["seasons"]
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == initial
+    report = json.loads(offline["output"].read_text())
+    assert any(f"HTTP {status}" in error for error in report["errors"])
+    assert "seed_failed_targets" not in report
+    assert [tid for tid, _ in visited] == [1, 2]
+
+
+@pytest.mark.unit
+def test_refusal_streak_with_uncommitted_rows_keeps_all_retries(offline, monkeypatch):
+    _real_refusal_sweep(offline, monkeypatch, completed_prefix=True)
+    initial = json.loads(offline["incomplete"].read_text())["seasons"]
+
+    def reject(events, *_args):
+        if events:
+            raise SofaScoreDQViolation("bronze.sofascore_schedule gate failed")
+        return [], {}
+
+    monkeypatch.setattr(refresh, "schedule_rows_from_events", reject)
+    assert refresh.main(_argv(offline, "--control-url", "http://offline")) == 1
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == initial
+    assert offline["calls"]["writes"] == []

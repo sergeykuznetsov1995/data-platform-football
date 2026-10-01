@@ -242,6 +242,7 @@ def _query_partition_ids(
     league: str,
     season: str,
     predicate: str = "",
+    source_season_id: int | None = None,
 ) -> set[str]:
     connection = _trino_connect()
     try:
@@ -252,7 +253,11 @@ def _query_partition_ids(
             "WHERE league = ? AND CAST(season AS varchar) = ?"
             + (f" AND ({predicate})" if predicate else "")
         )
-        cursor.execute(sql, (league, season))
+        if source_season_id is not None:
+            sql += " AND CAST(season_id AS bigint) = ?"
+        cursor.execute(sql, (league, season) + (
+            (int(source_season_id),) if source_season_id is not None else ()
+        ))
         return {str(row[0]) for row in cursor.fetchall() if row and row[0] is not None}
     except Exception as exc:
         if _missing_table(exc):
@@ -262,17 +267,22 @@ def _query_partition_ids(
         connection.close()
 
 
-def _finished_match_ids(league: str, season: str) -> set[str]:
+def _finished_match_ids(
+    league: str, season: str, source_season_id: int | None = None
+) -> set[str]:
     return _query_partition_ids(
         "sofascore_schedule",
         "game_id",
         league=league,
         season=season,
         predicate="status_type = 'finished'",
+        source_season_id=source_season_id,
     )
 
 
-def _finished_match_deadlines(league: str, season: str) -> dict[str, Optional[int]]:
+def _finished_match_deadlines(
+    league: str, season: str, source_season_id: int | None = None
+) -> dict[str, Optional[int]]:
     """Finished games of the partition with their deadline (#1359).
 
     The same rows as ``_finished_match_ids`` plus the match's deadline (end +
@@ -288,8 +298,9 @@ def _finished_match_deadlines(league: str, season: str) -> dict[str, Optional[in
             + match_deadline_sql()
             + " AS bigint) FROM iceberg.bronze.sofascore_schedule "
             "WHERE league = ? AND CAST(season AS varchar) = ? "
-            "AND status_type = 'finished'",
-            (league, season),
+            "AND status_type = 'finished'"
+            + (" AND CAST(season_id AS bigint) = ?" if source_season_id is not None else ""),
+            (league, season) + ((int(source_season_id),) if source_season_id is not None else ()),
         )
         deadlines: dict[str, Optional[int]] = {}
         for row in cursor.fetchall():
@@ -652,10 +663,12 @@ def prepare_workload_plan(
         scope_cap = _scope_max_matches() if phase == "targets" else None
         deadlines: dict[str, Optional[int]] = {}
         if scope_cap is not None:
-            deadlines = _finished_match_deadlines(item.league, canonical)
+            deadlines = _finished_match_deadlines(
+                item.league, canonical, source_season.season_id
+            )
             matches = set(deadlines)
         else:
-            matches = _finished_match_ids(item.league, canonical)
+            matches = _finished_match_ids(item.league, canonical, source_season.season_id)
         def event_specs(target_id: str):
             return tuple(
                 build_event_spec(

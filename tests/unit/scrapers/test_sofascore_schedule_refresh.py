@@ -1836,7 +1836,7 @@ def test_a_refusal_streak_carries_what_the_walk_already_paid_for(tmp_path):
                 raise DiscoveryHTTPError("HTTP 403", status_code=403)
             return super().get_json(path)
 
-    targets = [CONFIGURED_TARGET, READY_TARGET, PREVIOUS_TARGET, (99, 99)]
+    targets = [CONFIGURED_TARGET, READY_TARGET, PREVIOUS_TARGET, (99, 99), (100, 100)]
     with pytest.raises(SweepRefusedError) as caught:
         fetch_season_schedules(
             _Refusing(payloads), targets, _store(tmp_path),
@@ -1844,6 +1844,7 @@ def test_a_refusal_streak_carries_what_the_walk_already_paid_for(tmp_path):
         )
 
     error = caught.value
+    assert error.visited == targets[:4]
     assert error.fetched and all(
         item.raw.source_season_id == str(CONFIGURED_TARGET[1])
         for item in error.fetched

@@ -153,11 +153,15 @@ class SweepRefusedError(DiscoveryHTTPError):
         fetched: list,
         counters: Mapping[str, Any],
         incomplete: Optional[list] = None,
+        visited: Optional[list[tuple[int, int]]] = None,
     ) -> None:
         super().__init__(message, status_code=status_code)
         self.fetched = list(fetched)
         self.counters = dict(counters)
         self.incomplete = list(incomplete or [])
+        # Exact tail targets reached, including the refusing target.  The
+        # runner may retire completed chains without touching the unread tail.
+        self.visited = list(visited or [])
 
 
 @dataclass(frozen=True)
@@ -417,6 +421,7 @@ def fetch_season_schedules(
     resumed_targets = 0
     resumed_malformed = 0
     failed_streak = 0
+    visited: list[tuple[int, int]] = []
     # Broken pages of seasons that OWED one, which is the only population the
     # combined threshold below may count: it is measured against ``expected``,
     # and counting a season the source owes nothing against that denominator let
@@ -426,6 +431,7 @@ def fetch_season_schedules(
     for tournament_id, season_id in targets:
         counters["targets"] += 1
         pair = (int(tournament_id), int(season_id))
+        visited.append(pair)
         # A target is "expected" when the source owes it a page: Bronze holds a
         # match of it whose kick-off has passed (``owed_pages``).  A season
         # whose first match is still ahead legitimately answers 404, and before
@@ -639,7 +645,7 @@ def fetch_season_schedules(
                 raise SweepRefusedError(
                     f"{failed_streak} season pages in a row refused: {exc}",
                     status_code=exc.status_code, fetched=fetched,
-                    counters=counters, incomplete=incomplete,
+                    counters=counters, incomplete=incomplete, visited=visited,
                 ) from exc
             log.warning("season page refused, skipping: %s", exc)
             continue
