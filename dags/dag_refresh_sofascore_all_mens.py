@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -175,6 +176,7 @@ REFRESH_TASK_IDS = frozenset({
     "plan_refresh_batch",
     "run_refresh_scope",
     "validate_refresh_scope",
+    "refill_refresh_window",
 })
 
 # Finished games of campaign partitions that have no complete capture yet,
@@ -189,9 +191,10 @@ SELECT p.league, p.season,
        min(CASE WHEN p.deadline >= to_unixtime(current_timestamp)
                 THEN CAST(p.deadline AS bigint) END) AS min_open_deadline_ts,
        count_if(p.deadline >= to_unixtime(current_timestamp))
-           AS open_deadline_matches
+           AS open_deadline_matches, p.source_season_id
 FROM (
     SELECT DISTINCT s.league, CAST(s.season AS varchar) AS season, s.game_id,
+           CAST(s.season_id AS bigint) AS source_season_id,
            """ + match_deadline_sql("s.start_timestamp", "s.changes_change_timestamp") + """
                AS deadline
     FROM iceberg.bronze.sofascore_schedule s
@@ -204,11 +207,11 @@ FROM (
       AND s.status_type = 'finished'
       AND c.match_id IS NULL
 ) p
-GROUP BY 1, 2
+GROUP BY 1, 2, 6
 """
 
 
-def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int]]:
+def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int, int]]:
     """Query at task runtime; no Trino client is touched at DAG parse."""
 
     from utils.silver_tasks import _get_trino_connection
@@ -224,8 +227,9 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int]]
                 int(count),
                 int(deadline) if deadline is not None else None,
                 int(open_matches or 0),
+                int(source_season_id),
             )
-            for league, season, count, deadline, open_matches in cursor.fetchall()
+            for league, season, count, deadline, open_matches, source_season_id in cursor.fetchall()
         ]
     finally:
         conn.close()
@@ -357,6 +361,118 @@ def _validate_refresh_scope(
     return outcome
 
 
+def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
+    """Execute an independently signed continuation under the original deadline."""
+    deadline = float(env["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
+    remaining = min(float(env["SOFASCORE_SCOPE_TIMEOUT_S"]), deadline - time.time())
+    if remaining <= 0:
+        return {"status": "partial", "stop_reason": "time_budget", "elapsed_s": 0,
+                "scope_key": env["SOFASCORE_SCOPE_KEY"]}
+    command = [
+        "/opt/legacy-scraper-venv/bin/python",
+        "/opt/airflow/dags/scripts/run_sofascore_scope_cycle.py",
+        "--snapshot", env["SOFASCORE_CAMPAIGN_SNAPSHOT"],
+        "--tournament-id", env["SOFASCORE_TOURNAMENT_ID"],
+        "--source-season-id", env["SOFASCORE_SOURCE_SEASON_ID"],
+        "--expected-snapshot-id", env["SOFASCORE_EXPECTED_SNAPSHOT_ID"],
+        "--expected-campaign-id", env["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
+        "--phase", "matches", "--season-evidence", "bronze", "--allow-pending-season",
+        "--output-dir", env["SOFASCORE_SCOPE_OUTPUT_DIR"],
+        "--output", env["SOFASCORE_SCOPE_RESULT_PATH"],
+        "--workload-artifact", env["SOFASCORE_WORKLOAD_ARTIFACT"],
+        "--run-id", env["SOFASCORE_SCOPE_RUN_ID"],
+    ]
+    started = time.monotonic()
+    child = subprocess.Popen(
+        command, cwd="/opt/airflow", start_new_session=True,
+        env={**os.environ, **env, "AIRFLOW_CTX_DAG_ID": DAG_ID,
+             "AIRFLOW_CTX_TASK_ID": "refill_refresh_window"},
+    )
+    try:
+        code = child.wait(timeout=remaining)
+    except BaseException:
+        # Also clean up on Airflow SIGTERM/task timeout, not just child timeout.
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+        raise
+    if code:
+        return {"status": "failed", "errors": [f"scope cycle exit_code={code}"],
+                "elapsed_s": time.monotonic() - started,
+                "scope_key": env["SOFASCORE_SCOPE_KEY"]}
+    return _validate_refresh_scope(env)
+
+
+def _refill_refresh_window(**context: Any) -> dict[str, Any]:
+    from utils.sofascore_refresh_window import refill_deadline, refill_window
+    from dags.scripts.run_sofascore_scope_cycle import _atomic_json
+
+    dag_run = context["dag_run"]
+    initial_tasks = REFRESH_TASK_IDS - {"refill_refresh_window"}
+    if any(ti.task_id in initial_tasks and _task_state(ti) in {"failed", "upstream_failed"}
+           for ti in dag_run.get_task_instances()):
+        return {"status": "partial", "stop_reason": "upstream_failure", "outcomes": []}
+    items = context["ti"].xcom_pull(task_ids="plan_refresh_batch") or []
+    if not items:
+        return {"status": "success", "stop_reason": "empty_initial_plan", "outcomes": []}
+    outcomes = [_validate_refresh_scope(item["env"]) for item in items]
+    deadline = min(float(item["env"]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
+                   for item in items)
+    deadline = refill_deadline(deadline, getattr(dag_run, "start_date", None))
+    run_id = str(context.get("run_id") or "manual")
+    queue_mode = _refresh_queue_mode(context)
+    safe_run = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id)
+    report_path = Path(RESULT_DIR) / f"refill-{safe_run}.json"
+    # A manual retry/clear must not silently recreate round 1 with changed
+    # Bronze evidence under its already signed identity.
+    if report_path.exists():
+        raise AirflowException("refill already attempted for this run; wait for the next scheduled run")
+
+    def plan(rows, budget, round_number):
+        snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+        planned = state.plan_refresh_batch(
+            snapshot, rows, batch_size=1, queue_mode=queue_mode,
+            exclude_tournament_ids=_configured_tournament_ids(),
+            snapshot_path=SNAPSHOT_PATH, policy_path=POLICY_PATH,
+            result_dir=RESULT_DIR, workload_artifact=WORKLOAD_ARTIFACT,
+            dag_run_id=f"{run_id}:refill:{round_number}", task_env=REFRESH_TASK_ENV,
+            scope_budget_s=max(1, int(budget)), seconds_per_match=REFRESH_SECONDS_PER_MATCH,
+        )
+        if not planned:
+            return None
+        env = planned[0]
+        env["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"] = str(int(deadline))
+        # Active allowance, too, includes the execution itself, not only its estimate.
+        env["SOFASCORE_SCOPE_TIMEOUT_S"] = str(min(int(env["SOFASCORE_SCOPE_TIMEOUT_S"]), int(budget)))
+        return env
+
+    _atomic_json(report_path, {"status": "running", "outcomes": [], "run_id": run_id})
+    try:
+        report = refill_window(
+            initial_elapsed_s=sum(float(item["elapsed_s"]) for item in outcomes),
+            deadline_epoch=deadline, pending=_pending_refresh_partitions,
+            plan=plan, execute=_execute_refill_scope,
+            budget_s=REFRESH_SCOPE_BUDGET.total_seconds(), now=time.time,
+            persist=lambda value: _atomic_json(report_path, {**value, "run_id": run_id}),
+        )
+    except Exception as exc:
+        previous = json.loads(report_path.read_text())
+        _atomic_json(report_path, {**previous, "status": "failed", "errors": [str(exc)]})
+        raise
+    if report["status"] == "failed":
+        raise AirflowException(f"refresh refill failed; see {report_path}")
+    return report
+
+
 def _enrich_season_metadata(**context: Any) -> dict[str, Any]:
     if not METADATA_SEASONS_PER_RUN:
         raise AirflowSkipException("SOFASCORE_METADATA_SEASONS_PER_RUN is 0")
@@ -437,6 +553,7 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
     """#1358: how many scopes ended partial and how much of the window went."""
 
     outcomes: list[Any] = []
+    refill_reason = None
     ti = context.get("ti")
     if ti is not None:
         try:
@@ -448,6 +565,10 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
             outcomes = [pulled]
         elif pulled is not None:
             outcomes = [item for item in pulled if isinstance(item, dict)]
+        refill = ti.xcom_pull(task_ids="refill_refresh_window")
+        if isinstance(refill, dict):
+            outcomes.extend(refill.get("outcomes") or [])
+            refill_reason = refill.get("stop_reason")
     used = sum(
         float(item.get("elapsed_s") or 0)
         for item in outcomes
@@ -467,6 +588,7 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
         "window_used_s": round(used, 1),
         "window_budget_s": budget,
         "window_use": round(used / budget, 3),
+        "refill_stop_reason": refill_reason,
     }
 
 
@@ -598,6 +720,11 @@ with DAG(
         python_callable=_validate_refresh_scope,
         retries=0,
     ).expand(op_kwargs=plan.output)
+    refill = PythonOperator(
+        task_id="refill_refresh_window", python_callable=_refill_refresh_window,
+        trigger_rule="all_done", pool=REFRESH_POOL, priority_weight=5,
+        retries=0, execution_timeout=REFRESH_SCOPE_BUDGET + timedelta(minutes=5),
+    )
     enrich = PythonOperator(
         task_id="enrich_season_metadata",
         python_callable=_enrich_season_metadata,
@@ -620,6 +747,10 @@ with DAG(
     )
 
     fetch >> plan >> run >> validate >> enrich >> propagate
+    run >> refill
+    validate >> refill
+    run >> enrich
+    refill >> enrich
 
 
 __all__ = ["DAG_ID", "dag"]

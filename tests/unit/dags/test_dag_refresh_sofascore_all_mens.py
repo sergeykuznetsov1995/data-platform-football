@@ -84,6 +84,7 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
         "plan_refresh_batch",
         "run_refresh_scope",
         "validate_refresh_scope",
+        "refill_refresh_window",
         "enrich_season_metadata",
         "propagate_refresh_status",
     }
@@ -200,7 +201,7 @@ def test_refresh_dag_has_one_all_done_leaf(clean_env, monkeypatch):
         "run_refresh_scope"
     }
     assert operators["enrich_season_metadata"].upstream_task_ids == {
-        "validate_refresh_scope"
+        "validate_refresh_scope", "run_refresh_scope", "refill_refresh_window"
     }
     assert propagate.upstream_task_ids == {"enrich_season_metadata"}
 
@@ -457,8 +458,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
 
         def fetchall(self):
             return [
-                ("SS-17", "2627", 12, 1_787_788_800, 5),
-                ("SS-8", 2026, 3, None, 0),
+                ("SS-17", "2627", 12, 1_787_788_800, 5, 76986),
+                ("SS-8", 2026, 3, None, 0, 98037),
             ]
 
     class _Connection:
@@ -478,8 +479,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     partitions = module._pending_refresh_partitions()
 
     assert partitions == [
-        ("SS-17", "2627", 12, 1_787_788_800, 5),
-        ("SS-8", "2026", 3, None, 0),
+        ("SS-17", "2627", 12, 1_787_788_800, 5, 76986),
+        ("SS-8", "2026", 3, None, 0, 98037),
     ]
     assert connection.closed is True
     sql = executed[0]
