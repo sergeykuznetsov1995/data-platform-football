@@ -115,3 +115,30 @@ def test_summary_includes_refill_against_original_7200_seconds(monkeypatch):
     assert report['window_budget_s'] == 7200
     assert report['window_use'] == 0.769
     assert report['refill_stop_reason'] == 'empty_queue'
+
+
+def test_refill_timeout_kills_group_even_when_parent_exits_on_term(monkeypatch):
+    module = _module()
+    class Child:
+        pid = 1234
+        calls = 0
+        def wait(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise module.subprocess.TimeoutExpired('scope', timeout)
+            return -15
+    child = Child()
+    killed = []
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *a,**k:child)
+    monkeypatch.setattr(module.os, 'killpg', lambda pid,sig:killed.append(sig))
+    monkeypatch.setattr(module.time, 'time', lambda:1000)
+    env = {key:'value' for key in (
+        'SOFASCORE_CAMPAIGN_SNAPSHOT','SOFASCORE_TOURNAMENT_ID','SOFASCORE_SOURCE_SEASON_ID',
+        'SOFASCORE_EXPECTED_SNAPSHOT_ID','SOFASCORE_EXPECTED_CAMPAIGN_ID',
+        'SOFASCORE_SCOPE_OUTPUT_DIR','SOFASCORE_SCOPE_RESULT_PATH',
+        'SOFASCORE_WORKLOAD_ARTIFACT','SOFASCORE_SCOPE_RUN_ID','SOFASCORE_SCOPE_KEY')}
+    env.update(SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH='1100',SOFASCORE_SCOPE_TIMEOUT_S='1000')
+    with pytest.raises(module.subprocess.TimeoutExpired):
+        module._execute_refill_scope(env)
+    # Parent termination does not prove all browser grandchildren exited.
+    assert killed == [module.signal.SIGTERM,module.signal.SIGKILL]

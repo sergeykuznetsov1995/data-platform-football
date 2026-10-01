@@ -399,6 +399,10 @@ def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
         try:
             child.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            pass
+        finally:
+            # The parent may exit on TERM while a browser grandchild ignores
+            # it. Always reap the whole private group, not only a live parent.
             try:
                 os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
