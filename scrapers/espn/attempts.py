@@ -31,7 +31,7 @@ ATTEMPT_COLUMNS = (
 
 
 class AttemptJournal:
-    def __init__(self, path):
+    def __init__(self, path, *, utcnow_fn=lambda: datetime.now(timezone.utc)):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
@@ -39,7 +39,7 @@ class AttemptJournal:
             db.execute('CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, requested_at TEXT NOT NULL, payload TEXT NOT NULL, dirty INTEGER NOT NULL)')
             db.execute('CREATE INDEX IF NOT EXISTS attempts_requested_at ON attempts(requested_at)')
             db.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-            db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('created_at', datetime.now(timezone.utc).isoformat()))
+            db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('created_at', utc(utcnow_fn()).isoformat()))
 
     @contextmanager
     def _db(self):
@@ -66,7 +66,7 @@ class AttemptJournal:
                        (row['attempt_id'], row['requested_at'], json.dumps(row)))
         return row['attempt_id']
 
-    def finish(self, attempt_id, *, status, timeout, http_ms, direct_bytes):
+    def finish(self, attempt_id, *, status, timeout, http_ms, direct_bytes, complete=True):
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
             found = db.execute('SELECT payload FROM attempts WHERE id=?', (attempt_id,)).fetchone()
@@ -74,7 +74,7 @@ class AttemptJournal:
                 raise RuntimeError('attempt start missing; coverage lost')
             row = json.loads(found[0])
             row.update(status=status, timeout=bool(timeout), http_ms=http_ms,
-                       direct_bytes=direct_bytes, complete=True)
+                       direct_bytes=direct_bytes, complete=bool(complete))
             db.execute('UPDATE attempts SET payload=?, dirty=1 WHERE id=?', (json.dumps(row), attempt_id))
 
     def rows(self):
@@ -98,12 +98,12 @@ class AttemptJournal:
         the caller dies before SQLite acknowledgement, replay updates that id.
         Incomplete starts are published too and subsequently updated on finish.
         """
-        _execute(conn, 'CREATE SCHEMA IF NOT EXISTS iceberg.ops')
-        columns = ', '.join(f'{name} {kind}' for name, kind in ATTEMPT_COLUMNS)
-        _execute(conn, f'CREATE TABLE IF NOT EXISTS {ATTEMPT_TABLE} ({columns})')
         descriptor = os.open(str(self.path) + '.publish.lock', os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            _execute(conn, 'CREATE SCHEMA IF NOT EXISTS iceberg.ops')
+            columns = ', '.join(f'{name} {kind}' for name, kind in ATTEMPT_COLUMNS)
+            _execute(conn, f'CREATE TABLE IF NOT EXISTS {ATTEMPT_TABLE} ({columns})')
             return self._flush_locked(conn)
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)

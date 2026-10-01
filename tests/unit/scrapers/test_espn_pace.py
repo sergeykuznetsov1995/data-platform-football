@@ -118,3 +118,45 @@ def test_two_processes_cannot_double_promote(tmp_path):
     for child in children: child.join(10); assert child.exitcode == 0
     assert sorted(queue.get(timeout=2) for _ in children) == [False, True]
     assert gate.snapshot()['confirmed_ceiling'] == 1
+
+
+@pytest.mark.parametrize('field,value', [
+    ('confirmed_ceiling', 9), ('confirmed_ceiling', -1), ('confirmed_ceiling', True),
+    ('confirmed_ceiling', '3'), ('s3_expires_at', float('nan')),
+    ('s3_expires_at', float('inf')), ('s3_expires_at', 'later'),
+    ('measurement_started_at', float('nan')), ('hold_until', float('nan')),
+    ('cooldown_until', float('inf')), ('step', -1), ('revision', -1),
+])
+def test_corrupt_controller_state_fails_closed(tmp_path, field, value):
+    import json
+    from scrapers.espn.gate import _fresh_state
+    path = tmp_path/'gate.json'
+    state = _fresh_state()
+    state.update(confirmed_ceiling=3, s3_expires_at=NOW.timestamp()+21600)
+    state[field] = value
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match='invalid'):
+        gate_at(path, Clock()).acquire('core')
+
+
+def test_short_state_writes_preserve_complete_json(tmp_path, monkeypatch):
+    import json
+    import os
+    from scrapers.espn import gate as gate_module
+    path = tmp_path/'gate.json'; gate = gate_at(path, Clock())
+    original_write = os.write
+    monkeypatch.setattr(gate_module.os, 'write', lambda fd, data: original_write(fd, data[:7]))
+    snap = gate.snapshot()
+    persisted = json.loads(path.read_text())
+    assert persisted['events'] == snap['events']
+    assert persisted['confirmed_ceiling'] == 0
+
+
+def test_zero_progress_write_preserves_previous_state(tmp_path, monkeypatch):
+    from scrapers.espn import gate as gate_module
+    path = tmp_path/'gate.json'; clock = Clock(); gate = gate_at(path, clock)
+    gate.snapshot(); previous = path.read_bytes()
+    monkeypatch.setattr(gate_module.os, 'write', lambda fd, data: 0)
+    with pytest.raises(OSError, match='no progress'):
+        gate.acquire('core')
+    assert path.read_bytes() == previous

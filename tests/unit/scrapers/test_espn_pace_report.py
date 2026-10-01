@@ -65,9 +65,10 @@ def test_attempt_sql_retry_reserve_timeout_cache_and_midnight(tmp_path):
     assert journal.flush(conn) == 5
     assert journal.flush(conn) == 0
     rows = query(conn, render_attempt_sql(START, START+timedelta(minutes=10)))
-    assert rows[0] == ('A', 'history', 1, 3, 0, 2, 100.0, 30, 0)
-    assert rows[1] == ('B', 'history', 1, 1, 0, 1, 100.0, 10, 0)
+    assert rows[0] == ('A', 'history', 1, 3, 0, 0, 2, 100.0, 30, 0)
+    assert rows[1] == ('B', 'history', 1, 1, 1, 0, 1, 100.0, 10, 0)
     assert 'attempts=3' in format_rows(rows)[0]
+    assert '403=1, 429=0' in format_rows(rows)[1]
     loads = query(conn, render_load_sql(START, START+timedelta(minutes=15), step=1, policy=load_transport_policy()))
     assert [r[1:] for r in loads] == [(2, False), (2, False), (1, False)]
 
@@ -80,7 +81,8 @@ def test_load_sql_includes_empty_full_bins(tmp_path):
 
 
 def test_restart_incomplete_and_replayed_delivery_are_not_success(tmp_path):
-    path = tmp_path/'attempts.sqlite3'; journal = AttemptJournal(path)
+    path = tmp_path/'attempts.sqlite3'
+    journal = AttemptJournal(path, utcnow_fn=lambda: START-timedelta(seconds=1))
     first = begin(journal)
     second = begin(journal, START+timedelta(seconds=1)); finish(journal, second)
     conn = Connection(); conn.fail_after_commit = True
@@ -94,6 +96,7 @@ def test_restart_incomplete_and_replayed_delivery_are_not_success(tmp_path):
     finish(restarted, first)
     assert restarted.flush(conn) == 1
     assert query(conn, render_attempt_sql(START, START+timedelta(minutes=10)))[0][-1] == 0
+    assert restarted.coverage(START, START+timedelta(minutes=10))
 
 
 def test_begin_finish_continue_during_remote_publication_and_update_is_replayed(tmp_path):
@@ -120,3 +123,35 @@ def test_spool_contains_no_url_query_or_exception_secret(tmp_path):
     journal = AttemptJournal(tmp_path/'attempts.sqlite3')
     with pytest.raises(ValueError): begin(journal, origin=WEB+'/?token=secret')
     assert journal.rows() == []
+
+
+def test_coverage_changes_when_a_known_good_window_gains_an_incomplete_attempt(tmp_path):
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3', utcnow_fn=lambda: START-timedelta(seconds=1))
+    finish(journal, begin(journal))
+    end = START+timedelta(minutes=1)
+    assert journal.coverage(START, end)
+    incomplete = begin(journal, START+timedelta(seconds=1))
+    assert not journal.coverage(START, end)
+    finish(journal, incomplete)
+    assert journal.coverage(START, end)
+
+
+def test_ddl_is_inside_publisher_lock(tmp_path, monkeypatch):
+    from scrapers.espn import attempts
+    held = False
+    original_flock = attempts.fcntl.flock
+    def flock(fd, operation):
+        nonlocal held
+        original_flock(fd, operation)
+        held = operation == attempts.fcntl.LOCK_EX
+    monkeypatch.setattr(attempts.fcntl, 'flock', flock)
+    conn = Connection()
+    original_execute = conn.execute
+    def execute(sql):
+        assert held
+        original_execute(sql)
+    conn.execute = execute
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3')
+    finish(journal, begin(journal))
+    assert journal.flush(conn) == 1
+    assert not held

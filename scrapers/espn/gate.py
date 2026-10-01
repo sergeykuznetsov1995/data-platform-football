@@ -681,6 +681,23 @@ class TransportGate:
         # Old gate files never confer a confirmed ceiling.
         for key, value in _fresh_state().items():
             state.setdefault(key, value)
+        ceiling = state["confirmed_ceiling"]
+        if type(ceiling) is not int or not 0 <= ceiling < min(4, len(self.policy.steps)):
+            raise ValueError("ESPN gate state has an invalid confirmed ceiling")
+        step = state["step"]
+        if step is not None and (type(step) is not int or not 0 <= step < len(self.policy.steps)):
+            raise ValueError("ESPN gate state has an invalid step")
+        if type(state["revision"]) is not int or state["revision"] < 0:
+            raise ValueError("ESPN gate state has an invalid revision")
+        if not isinstance(state["events"], list):
+            raise ValueError("ESPN gate state has invalid events")
+        for key in ("s3_expires_at", "measurement_started_at", "hold_until",
+                    "cooldown_until", "history_frozen_until", "next_permit_at"):
+            value = state[key]
+            if value is None and key in ("s3_expires_at", "measurement_started_at"):
+                continue
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"ESPN gate state has invalid {key}")
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
@@ -690,7 +707,12 @@ class TransportGate:
         payload = json.dumps(state, sort_keys=True, separators=(",", ":"))
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(descriptor, payload.encode("utf-8"))
+            remaining = memoryview(payload.encode("utf-8"))
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("ESPN gate state write made no progress")
+                remaining = remaining[written:]
             os.fsync(descriptor)
         finally:
             os.close(descriptor)

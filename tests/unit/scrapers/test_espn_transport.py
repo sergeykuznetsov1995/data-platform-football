@@ -883,3 +883,40 @@ def test_failed_attempt_completion_does_not_disable_auto_reset(monkeypatch, tmp_
         client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
     assert client.gate.snapshot()['resets']
     assert not client.attempt_journal.rows()[0]['complete']
+
+
+def test_partial_200_non_timeout_read_failure_is_incomplete_evidence(monkeypatch, tmp_path):
+    class BrokenBody:
+        def __init__(self): self.calls = 0
+        def read(self, size):
+            self.calls += 1
+            if self.calls == 1: return b'{"partial":'
+            raise requests.ConnectionError('private error detail')
+    response = FakeResponse(200)
+    response.raw = BrokenBody()
+    client, _, _, _ = _client(monkeypatch, tmp_path, [response])
+    start = client.utcnow_fn()
+    with pytest.raises(DirectTransportError):
+        client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    row, = client.attempt_journal.rows()
+    assert row['status'] == 200 and not row['timeout']
+    assert not row['complete'] and row['direct_bytes'] == len(b'{"partial":')
+    assert not client.attempt_journal.coverage(start, start+timedelta(minutes=1))
+    from tests.unit.scrapers.test_espn_pace_report import Connection, query
+    from scrapers.espn.pace_report import render_attempt_sql
+    conn = Connection(); client.flush_attempts(conn)
+    evidence, = query(conn, render_attempt_sql(start, start+timedelta(minutes=1)))
+    assert evidence[-1] == 1
+    assert 'private' not in json.dumps(row)
+
+
+def test_response_close_failure_still_reports_429_once(monkeypatch, tmp_path):
+    response = FakeResponse(429)
+    def broken_close(): raise requests.ConnectionError('close failed')
+    response.close = broken_close
+    client, _, _, _ = _client(monkeypatch, tmp_path, [response])
+    with pytest.raises(DirectTransportError):
+        client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    assert len(client.gate.snapshot()['resets']) == 1
+    row, = client.attempt_journal.rows()
+    assert row['status'] == 429 and not row['complete']

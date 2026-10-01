@@ -222,7 +222,7 @@ class EspnHttpClient:
         self.monotonic_fn = monotonic_fn
         self.utcnow_fn = utcnow_fn
         self.attempt_journal = attempt_journal or AttemptJournal(
-            gate.state_path.with_name("http-attempts.sqlite3")
+            gate.state_path.with_name("http-attempts.sqlite3"), utcnow_fn=utcnow_fn
         )
         self.run_id = run_id or environment.get("AIRFLOW_CTX_DAG_RUN_ID") or uuid.uuid4().hex
         self.task_id = task_id or environment.get("AIRFLOW_CTX_TASK_ID") or "unknown"
@@ -304,6 +304,8 @@ class EspnHttpClient:
         response = None
         direct_bytes = 0
         timed_out = False
+        complete = True
+        request_failed = False
         started = self.monotonic_fn()
         try:
             response = self.session.get(
@@ -316,20 +318,30 @@ class EspnHttpClient:
                 body, direct_bytes, encoding = self._read_response(response)
             return response, body, direct_bytes, encoding
         except BaseException as exc:
+            request_failed = True
             direct_bytes = getattr(exc, "direct_bytes", 0)
             timed_out = isinstance(exc, (_ResponseReadTimeout, requests.Timeout,
                                         Urllib3ReadTimeoutError, TimeoutError))
+            complete = timed_out  # other aborts cannot attest complete HTTP evidence
             raise
         finally:
             try:
                 if response is not None:
                     response.close()
+            except Exception as exc:
+                complete = False
+                # Preserve an existing timeout/read exception so #1500 sees
+                # its original classification. Otherwise use the read-failure
+                # path, which still reports an observed 403/429 to the gate.
+                if not request_failed:
+                    raise _ResponseReadFailure(direct_bytes, type(exc).__name__) from None
             finally:
                 elapsed = max(0.0, (self.monotonic_fn() - started) * 1000.0)
                 try:
                     self.attempt_journal.finish(
                         attempt_id, status=int(response.status_code) if response is not None else None,
                         timeout=timed_out, http_ms=elapsed, direct_bytes=direct_bytes,
+                        complete=complete,
                     )
                 except BaseException:
                     # A failed measurement write stops this request, but must
@@ -339,7 +351,6 @@ class EspnHttpClient:
                         timeout=timed_out, direct_bytes=direct_bytes,
                     )
                     raise
-
 
     def _now_iso(self) -> str:
         return self.utcnow_fn().astimezone(timezone.utc).isoformat()

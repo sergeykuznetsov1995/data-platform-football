@@ -32,6 +32,7 @@ def render_attempt_sql(start, end):
  FROM ranked WHERE rn = 1
 )
 SELECT origin_group, lane, step, COUNT(*) AS attempts,
+ SUM(CASE WHEN status = 403 THEN 1 ELSE 0 END) AS count_403,
  SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END) AS count_429,
  SUM(CASE WHEN status = 403 OR status BETWEEN 500 AND 599 OR timeout THEN 1 ELSE 0 END) AS error_attempts,
  approx_percentile(http_ms, 0.95) AS http_p95_ms,
@@ -77,8 +78,8 @@ GROUP BY b.started_at ORDER BY b.started_at"""
 def format_rows(rows):
     """Rows returned by render_attempt_sql; all attempts, reserve failures included."""
     result = []
-    for group, lane, step, attempts, count429, errors, p95, size, incomplete in rows:
+    for group, lane, step, attempts, count403, count429, errors, p95, size, incomplete in rows:
         latency = 'unknown' if p95 is None else f'{p95:.0f} ms'
-        result.append(f'{group} {lane} S{step}: attempts={attempts}, 429={count429}, '
+        result.append(f'{group} {lane} S{step}: attempts={attempts}, 403={count403}, 429={count429}, '
                       f'errors={errors}, HTTP p95={latency}, bytes={size}, incomplete={incomplete}')
     return result
