@@ -1421,3 +1421,91 @@ class TestRawStore:
         assert payload == source
         assert gzip.decompress(store._read_bytes(repaired.blob_key)) == source
         assert list((tmp_path / "quarantine").rglob("*.json"))
+
+
+@pytest.mark.unit
+def test_1998901_source_revision_fixture_provenance_and_exact_diff():
+    import hashlib
+
+    root = Path(__file__).parents[2] / "fixtures" / "whoscored"
+    pins = json.loads((root / "match-1998901-revision.json").read_text())
+    source, parsed = {}, {}
+    for version, suffix in [("old", "before"), ("new", "corrected")]:
+        compressed = (root / f"match-1998901-{suffix}.raw.gz").read_bytes()
+        assert compressed[4:8] == b"\0" * 4  # reproducible gzip mtime
+        raw = gzip.decompress(compressed)
+        assert hashlib.sha256(raw).hexdigest() == pins[version]["payload_sha256"]
+        source[version] = extract_matchcentre_data(raw.decode())
+        parsed[version] = parse_matchcentre_data(
+            source[version],
+            scope=WORLD_CUP_SCOPE,
+            game_id=1998901,
+            game=pins["game"],
+        )
+        assert len(source[version]["events"]) == pins[version]["counts"]["events"]
+        assert {
+            name: len(dataset.rows)
+            for name, dataset in parsed[version].datasets.items()
+        } == pins[version]["counts"]
+        canonical = {
+            name: sorted(
+                json.dumps(
+                    dict(row),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                for row in dataset.rows
+            )
+            for name, dataset in parsed[version].datasets.items()
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                canonical,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+        assert digest == pins[version]["parsed_rows_sha256"]
+
+    def event_map(events):
+        return {(int(e["id"]), e["teamId"], e["eventId"]): e for e in events}
+
+    old, new = (event_map(source[v]["events"]) for v in ("old", "new"))
+    assert old.keys() - new.keys() == {tuple(pins["removed_triple"])}
+    assert not new.keys() - old.keys()
+    changed = sorted(k[0] for k in old.keys() & new.keys() if old[k] != new[k])
+    assert len(changed) == 12
+    assert changed == pins["changed_event_ids"]
+    assert old[(2946845547, 345, 139)]["outcomeType"]["displayName"] == "Successful"
+    assert new[(2946845547, 345, 139)]["outcomeType"]["displayName"] == "Unsuccessful"
+    for version in ("old", "new"):
+        assert source[version]["maxMinute"] == 122
+        assert source[version]["ftScore"] == "1 : 1"
+        away = source[version]["away"]
+        player = next(p for p in away["players"] if p["playerId"] == 83532)
+        assert ("34" in away["stats"].get("errors", {})) == (version == "old")
+        assert ("34" in player["stats"].get("errors", {})) == (version == "old")
+        assert ("9" in player["stats"]["passesAccurate"]) == (version == "old")
+        assert any(int(e["id"]) == 2946847833 for e in away["incidentEvents"]) == (
+            version == "old"
+        )
+    for name, expected in [
+        ("team_match_stats", {(345, None, "errors.34")}),
+        (
+            "player_match_stats",
+            {(345, 83532, "errors.34"), (345, 83532, "passesAccurate.9")},
+        ),
+    ]:
+        keys = {
+            v: {
+                (r["team_id"], r.get("player_id"), r["source_path"])
+                for r in parsed[v].datasets[name].rows
+            }
+            for v in ("old", "new")
+        }
+        assert keys["old"] - keys["new"] == expected
+        assert not keys["new"] - keys["old"]

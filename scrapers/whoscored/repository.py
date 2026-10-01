@@ -44,6 +44,48 @@ from scrapers.whoscored.runtime_contract import require_production_runtime_class
 logger = logging.getLogger(__name__)
 
 
+# #1600: owner-approved source correction, backed by the two raw responses
+# and their complete parsed-row diff. This authorizes only this exact transition.
+_APPROVED_MATCH_SOURCE_REVISION = MappingProxyType(
+    {
+        "issue": 1600,
+        "identity": ("INT-World Cup", "2026", 1998901),
+        "game": "2026-07-11 Norway-England",
+        "old_batch_id": "ws2-d05c934bd74ed165236afeb178c78d2a13b3a6e945a076e9b72cfe185e17e1aa",
+        "old_payload_sha256": "dd504a4987566ea4500beba6ea519eb6d66454cf1b9cfe3343c341bce0df81a1",
+        "old_raw_uri": "s3://football/raw/whoscored/blobs/sha256/dd/dd504a4987566ea4500beba6ea519eb6d66454cf1b9cfe3343c341bce0df81a1.raw.gz",
+        "old_parser_version": "whoscored-parser-v7",
+        "old_counts": MappingProxyType(
+            {
+                "matches": 1,
+                "events": 1901,
+                "lineups": 51,
+                "substitutions": 24,
+                "formations": 15,
+                "team_match_stats": 2132,
+                "player_match_stats": 5839,
+            }
+        ),
+        "new_batch_id": "ws2-v3-62e682e7f43da0bcec27dda100da6ef02e982949c72bde2ce407d8c70bf0bb52",
+        "new_payload_sha256": "b5ebec31ee1b68364e76c25ca2c155867a5bf8d21d7696375f92132f10697d3b",
+        "new_raw_uri": "s3://football/raw/whoscored/blobs/sha256/b5/b5ebec31ee1b68364e76c25ca2c155867a5bf8d21d7696375f92132f10697d3b.raw.gz",
+        "new_parser_version": "whoscored-parser-v8",
+        "new_counts": MappingProxyType(
+            {
+                "matches": 1,
+                "events": 1900,
+                "lineups": 51,
+                "substitutions": 24,
+                "formations": 15,
+                "team_match_stats": 2131,
+                "player_match_stats": 5837,
+            }
+        ),
+        "rows_sha256": "c898b97f6913ac15f8e97f7eb77c38f823a105c3a8edc96d093572fb57566782",
+    }
+)
+
+
 MATCH_MANIFEST_TABLE = "whoscored_match_ingest_manifest"
 PREVIEW_MANIFEST_TABLE = "whoscored_preview_ingest_manifest"
 PROFILE_VERSIONS_TABLE = "whoscored_player_profile_versions"
@@ -5123,6 +5165,83 @@ class WhoScoredRepository:
             }
         return result
 
+    def _approved_match_source_revision(
+        self,
+        commit: MatchCommit,
+        datasets: Mapping[str, Sequence[Mapping[str, Any]]],
+        counts: Mapping[str, int],
+        previous: Mapping[str, int],
+    ) -> bool:
+        pin = _APPROVED_MATCH_SOURCE_REVISION
+        if (
+            (commit.league, commit.season, commit.game_id) != pin["identity"]
+            or commit.game != pin["game"]
+            or not self._is_completed_match(commit)
+            or commit.payload_sha256 != pin["new_payload_sha256"]
+            or commit.raw_uri != pin["new_raw_uri"]
+            or commit.parser_version != pin["new_parser_version"]
+            or commit.batch_id != pin["new_batch_id"]
+            or previous != pin["old_counts"]
+            or counts != pin["new_counts"]
+            or dict(commit.dataset_statuses)
+            != {name: "available" for name in pin["new_counts"]}
+        ):
+            return False
+        try:
+            canonical = {
+                name: sorted(
+                    json.dumps(
+                        dict(row),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                    for row in rows
+                )
+                for name, rows in datasets.items()
+            }
+            encoded = json.dumps(
+                canonical,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return False
+        if hashlib.sha256(encoded).hexdigest() != pin["rows_sha256"]:
+            return False
+
+        # Query only after every incoming pin matches. Ambiguous or malformed
+        # published provenance must never turn a regression into an approval.
+        rows = self.trino.execute_query(
+            "SELECT batch_id, payload_sha256, raw_uri, parser_version, entity_counts_json "
+            f"FROM {self.catalog}.{self.schema}.whoscored_match_ingest_latest_success "
+            f"WHERE league = {_sql_string(commit.league)} "
+            f"AND season = {_sql_string(commit.season)} "
+            f"AND game_id = {int(commit.game_id)}"
+        )
+        if len(rows) != 1 or len(rows[0]) != 5:
+            return False
+        batch, raw, uri, parser, payload = rows[0]
+        if (batch, raw, uri, parser) != (
+            pin["old_batch_id"],
+            pin["old_payload_sha256"],
+            pin["old_raw_uri"],
+            pin["old_parser_version"],
+        ):
+            return False
+        try:
+            published = json.loads(payload)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(published, dict)
+            and all(type(value) is int for value in published.values())
+            and published == pin["old_counts"]
+        )
+
     def _match_physical_counts(
         self, table: str, batch_ids: Sequence[str], *, league: str, season: str
     ) -> dict[str, int]:
@@ -5226,17 +5345,29 @@ class WhoScoredRepository:
             prepared[commit.batch_id] = (commit, datasets, counts, fingerprint)
 
         prior_dataset_counts = self._current_dataset_counts(ordered)
-        for commit, _datasets, counts, _fingerprint in prepared.values():
+        for commit, datasets, counts, _fingerprint in prepared.values():
             previous = prior_dataset_counts.get(
                 (commit.league, commit.season, int(commit.game_id)), {}
             )
-            for name, published_count in previous.items():
-                current_count = int(counts.get(name, 0))
-                if published_count and current_count < published_count:
+            regressions = [
+                (name, int(counts.get(name, 0)), published_count)
+                for name, published_count in previous.items()
+                if published_count > int(counts.get(name, 0))
+            ]
+            if regressions:
+                if not self._approved_match_source_revision(
+                    commit, datasets, counts, previous
+                ):
+                    name, current_count, published_count = regressions[0]
                     raise BatchConflict(
                         f"game {commit.game_id}/{name} completeness regression: "
                         f"new={current_count}, published={published_count}"
                     )
+                logger.info(
+                    "approved source revision issue=1600 game=1998901 old_batch=%s new_batch=%s",
+                    _APPROVED_MATCH_SOURCE_REVISION["old_batch_id"],
+                    commit.batch_id,
+                )
 
         batch_ids = list(prepared)
         quoted = ",".join(_sql_string(value) for value in batch_ids)

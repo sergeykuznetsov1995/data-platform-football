@@ -1,0 +1,64 @@
+{
+  "issue": 1600,
+  "identity": [
+    "INT-World Cup",
+    "2026",
+    1998901
+  ],
+  "game": "2026-07-11 Norway-England",
+  "old": {
+    "payload_sha256": "dd504a4987566ea4500beba6ea519eb6d66454cf1b9cfe3343c341bce0df81a1",
+    "parser_version": "whoscored-parser-v7",
+    "counts": {
+      "matches": 1,
+      "events": 1901,
+      "lineups": 51,
+      "substitutions": 24,
+      "formations": 15,
+      "team_match_stats": 2132,
+      "player_match_stats": 5839
+    },
+    "parsed_rows_sha256": "562cda430ad15cc86d0e7ff1e962b8354e0a476afc59a7c7ef965dfa693a1762",
+    "batch_id": "ws2-d05c934bd74ed165236afeb178c78d2a13b3a6e945a076e9b72cfe185e17e1aa",
+    "fetched_at": "2026-07-13T12:01:13+03:00",
+    "raw_uri": "s3://football/raw/whoscored/blobs/sha256/dd/dd504a4987566ea4500beba6ea519eb6d66454cf1b9cfe3343c341bce0df81a1.raw.gz",
+    "parsed_rows_parser_version": "whoscored-parser-v8"
+  },
+  "new": {
+    "payload_sha256": "b5ebec31ee1b68364e76c25ca2c155867a5bf8d21d7696375f92132f10697d3b",
+    "parser_version": "whoscored-parser-v8",
+    "counts": {
+      "matches": 1,
+      "events": 1900,
+      "lineups": 51,
+      "substitutions": 24,
+      "formations": 15,
+      "team_match_stats": 2131,
+      "player_match_stats": 5837
+    },
+    "parsed_rows_sha256": "c898b97f6913ac15f8e97f7eb77c38f823a105c3a8edc96d093572fb57566782",
+    "batch_id": "ws2-v3-62e682e7f43da0bcec27dda100da6ef02e982949c72bde2ce407d8c70bf0bb52",
+    "fetched_at": "2026-09-28T05:28:42+03:00",
+    "raw_uri": "s3://football/raw/whoscored/blobs/sha256/b5/b5ebec31ee1b68364e76c25ca2c155867a5bf8d21d7696375f92132f10697d3b.raw.gz",
+    "parsed_rows_parser_version": "whoscored-parser-v8"
+  },
+  "removed_triple": [
+    2946847833,
+    345,
+    374
+  ],
+  "changed_event_ids": [
+    2946844257,
+    2946845547,
+    2946848347,
+    2946848369,
+    2946848371,
+    2946849861,
+    2946850069,
+    2946850127,
+    2946852997,
+    2946852999,
+    2946853501,
+    2946865253
+  ]
+}
