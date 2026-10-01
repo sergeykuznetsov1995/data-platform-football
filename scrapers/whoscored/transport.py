@@ -2683,6 +2683,7 @@ class WhoScoredTransport:
                 and http_session_factory is None
             )
         )
+        self._pool_member_ids = {self._pool_proxy_url: 1} if self._pool_proxy_url else {}
         self._direct_http = direct_http_session or self._new_http_session(
             self._pool_proxy_url
         )
@@ -2932,11 +2933,11 @@ class WhoScoredTransport:
     def _is_pool_session(self, session: Any) -> bool:
         return self._pool_manager is not None and session is self._direct_http
 
-    def _rotate_pool_proxy(self) -> bool:
+    def _rotate_pool_proxy(self, excluded: Optional[set[str]] = None) -> bool:
         """Swap the sticky pool member for a different one (#1476).
 
-        Returns ``False`` when the pool has no other usable member; the caller
-        then retries once on the same member.
+        Exclusions belong to one recovery operation and never leave memory.
+        Returns ``False`` after a bounded search without an eligible member.
         """
         manager = self._pool_manager
         if manager is None:
@@ -2945,13 +2946,14 @@ class WhoScoredTransport:
         replacement: Optional[str] = None
         for _ in range(max(1, int(manager.total_count)) * 4):
             candidate = manager.get_http_proxy_url()
-            if candidate and candidate != current:
+            if candidate and candidate != current and candidate not in (excluded or set()):
                 replacement = candidate
                 break
         if replacement is None:
             return False
         previous = self._direct_http
         self._pool_proxy_url = replacement
+        self._pool_member_ids.setdefault(replacement, len(self._pool_member_ids) + 1)
         self._direct_http = self._new_http_session(replacement)
         # A browser session keeps the member it was opened with.
         self._drop_browser_session(
@@ -2970,28 +2972,86 @@ class WhoScoredTransport:
         return True
 
     def probe_egress(self) -> None:
-        """ipify through the current pool member before a work item (#1476).
+        """Check ipify on at most three distinct pool members before work.
 
-        One member swap on failure; a second failure raises
-        ``ProxyUnavailable``.  No-op without a residential pool.
+        Authentication failures keep the previous two-member budget. Injected
+        sessions without a residential pool retain the no-op behavior.
         """
-        if self._pool_manager is None:
-            return
-        detail = ""
-        for attempt in range(2):
+        if self._pool_manager is not None:
+            self._probe_pool_egress(set(), replace_first=False)
+
+    def _probe_pool_egress(self, tested: set[str], *, replace_first: bool) -> None:
+        # A failed source request already consumed the first member when this
+        # helper is called by _http_fetch. The remaining checks share its cap.
+        limit = 3
+        replaced = False
+        detail = "no replacement checked"
+        reason = "budget_exhausted"
+        while len(tested) < limit:
+            if replace_first:
+                if not self._rotate_pool_proxy(tested):
+                    reason = "replacement_unavailable"
+                    break
+                replaced = True
+            member = self._pool_proxy_url
+            if member is None or member in tested:
+                reason = "replacement_unavailable"
+                break
+            tested.add(member)
+            started = time.monotonic()
+            success = False
+            authorization = False
+            transient = False
             try:
                 raw = self._direct_http.get(
                     EGRESS_PROBE_URL, timeout=min(float(self.request_timeout), 30.0)
                 )
                 status = int(raw.status_code)
-                if 200 <= status < 300:
-                    return
                 detail = f"HTTP {status}"
+                success = 200 <= status < 300
+                authorization = status == 407
+                transient = status in {502, 503, 504}
             except Exception as exc:
-                detail = f"{type(exc).__name__}: {str(exc)[:200]}"
-            if attempt == 0:
-                self._rotate_pool_proxy()
-        raise ProxyUnavailable(f"WhoScored egress probe failed twice: {detail}")
+                # Never expose proxy URLs, credentials or raw exception text.
+                detail = type(exc).__name__
+                connect_status = re.search(
+                    r"CONNECT tunnel failed, response (\d{3})\b", str(exc), re.IGNORECASE
+                )
+                if connect_status:
+                    detail += f" CONNECT {connect_status.group(1)}"
+                authorization = bool(re.search(r"\b407\b", str(exc)))
+                transient = (
+                    _is_proxy_failure(exc)
+                    # curl_cffi Timeout is an OSError, not built-in TimeoutError.
+                    # Code 28 is transient here; source timeouts keep their policy.
+                    or getattr(exc, "code", None) == 28
+                    or isinstance(exc, (ConnectionError, TimeoutError))
+                ) and not authorization
+            log_probe = logger.info if success else logger.warning
+            log_probe(
+                "WhoScored egress probe attempt=%d member=%d duration_ms=%d "
+                "result=%s replaced=%s",
+                len(tested), self._pool_member_ids[member],
+                int((time.monotonic() - started) * 1000), detail, replaced,
+            )
+            if success:
+                logger.info(
+                    "WhoScored egress recovery members=%d replacement_succeeded=%s reason=success",
+                    len(tested), replaced,
+                )
+                return
+            if authorization or not transient:
+                limit = min(limit, 2)
+                reason = "authorization" if authorization else "budget_exhausted"
+            replace_first = True
+        logger.warning(
+            "WhoScored egress recovery members=%d replacement_succeeded=False reason=%s",
+            len(tested), reason,
+        )
+        raise ProxyUnavailable(
+            f"WhoScored access check exhausted: members={len(tested)} "
+            f"reason={reason}; {detail}"
+        ) from None
 
     def _new_http_session(self, proxy_url: Optional[str]) -> Any:
         if self._http_session_factory is not None:
@@ -3988,10 +4048,15 @@ class WhoScoredTransport:
         except Exception as exc:
             if not (pooled and _is_proxy_failure(exc)):
                 self._raise_http_request_failure(url, route=route, exc=exc)
-            # Dead pool member: one swap and one repeat; a second proxy
-            # failure stops the run instead of failing every match (#1476).
             self._record_proxy_failure(url, route=route, exc=exc)
-            self._rotate_pool_proxy()
+            if re.search(r"\b407\b", str(exc)):
+                # Preserve the bounded authorization path from #1476.
+                self._rotate_pool_proxy()
+            else:
+                # Count the failed source member toward the three-member cap;
+                # only a replacement that passes ipify may replay the source.
+                tested = {self._pool_proxy_url} if self._pool_proxy_url else set()
+                self._probe_pool_egress(tested, replace_first=True)
             try:
                 raw = self._direct_http.get(url, **request_kwargs)
             except Exception as retry_exc:
@@ -3999,9 +4064,9 @@ class WhoScoredTransport:
                     self._raise_http_request_failure(url, route=route, exc=retry_exc)
                 self._record_proxy_failure(url, route=route, exc=retry_exc)
                 raise ProxyUnavailable(
-                    "WhoScored residential pool failed twice: "
-                    f"{type(retry_exc).__name__}: {str(retry_exc)[:200]}"
-                ) from retry_exc
+                    "WhoScored access check exhausted: reason=source_replay_failed; "
+                    f"{type(retry_exc).__name__}"
+                ) from None
         content = bytes(raw.content or b"")
         response = self._response(
             url=url,

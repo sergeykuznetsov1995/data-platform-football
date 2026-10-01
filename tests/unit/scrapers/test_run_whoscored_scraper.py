@@ -307,6 +307,8 @@ def _runtime(
             probe = configured.get("probe")
             if isinstance(probe, BaseException):
                 raise probe
+            if callable(probe):
+                probe()
 
         @classmethod
         def discover_catalog(cls, *, repository, full_history, as_of_date):
@@ -2204,3 +2206,56 @@ def test_proxy_unavailable_in_discover_is_source_unavailable(monkeypatch, tmp_pa
     assert rc == 3
     assert report["status"] == "source_unavailable"
     assert report["source_unavailable"]["scope"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("healthy_third", [False, True])
+def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, healthy_third):
+    from itertools import cycle
+    from scrapers.utils.proxy_manager import ProxyManager
+    from scrapers.whoscored.transport import TransportContext, WhoScoredTransport
+
+    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(3)]
+    choices = cycle(urls)
+    monkeypatch.setattr(ProxyManager, "get_http_proxy_url", lambda self: next(choices))
+    monkeypatch.setattr(ProxyManager, "total_count", property(lambda self: 3))
+    pool = tmp_path / "pool.txt"
+    pool.write_text("pool.invalid:10000:test:secret\n")
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    calls = []
+
+    class Session:
+        def __init__(self, proxy):
+            self.proxy = proxy
+
+        def get(self, url, **kwargs):
+            calls.append((self.proxy, url))
+            if self.proxy != urls[2] or not healthy_third:
+                raise RuntimeError("curl: (56) CONNECT tunnel failed, response 502")
+            return SimpleNamespace(status_code=200)
+
+        def close(self):
+            pass
+
+    transport = WhoScoredTransport(
+        http_session_factory=Session,
+        context=TransportContext(transport_policy="direct_only"),
+    )
+    rc, report, service_cls, _ = _run(
+        monkeypatch, tmp_path,
+        ["daily", "--scope", "ENG-Premier League=2526", "--scope", "INT-World Cup=2026", "--skip-profiles"],
+        behaviors={"probe": transport.probe_egress},
+    )
+    assert report["error_details"] == []
+    assert all(url == "https://api.ipify.org" for _, url in calls)
+    if healthy_third:
+        assert rc == 0
+        assert len(service_cls.instances) == 2
+        assert [service.probes for service in service_cls.instances] == [1, 1]
+        assert [proxy for proxy, _ in calls] == urls + [urls[2]]
+    else:
+        assert rc == runner.SOURCE_UNAVAILABLE_EXIT_CODE == 3
+        assert report["status"] == "source_unavailable"
+        assert [item["status"] for item in report["scopes"]] == ["source_unavailable", "pending"]
+        assert len(service_cls.instances) == 1
+        assert [proxy for proxy, _ in calls] == urls
