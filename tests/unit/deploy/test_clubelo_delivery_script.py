@@ -35,6 +35,15 @@ MAIN = "scrapers/clubelo/daily.py"
 LAG_BODY = "def telegram_on_failure(ctx): pass  # до #1477\n"
 LAG_BLOB = subprocess.run(["git", "hash-object", "--stdin"], input=LAG_BODY, capture_output=True,
                           text=True, check=True).stdout.strip()
+CONFIG_LAG_BODIES = {
+    "dags/utils/config.py": "SCHEDULES = {'dag_transform_fotmob_silver': None}\n",
+    "dags/utils/medallion_config.py": "def get_source_priority_exprs(): return 'COALESCE(x)'\n",
+}
+LAG_BLOBS = {
+    path: subprocess.run(["git", "hash-object", "--stdin"], input=body,
+                         capture_output=True, text=True, check=True).stdout.strip()
+    for path, body in {"dags/utils/alerts.py": LAG_BODY, **CONFIG_LAG_BODIES}.items()
+}
 
 BASE_FILES = {
     "scrapers/__init__.py": "",
@@ -82,8 +91,13 @@ class Stand:
         assert text.count(PATH_LINE) == 1, "автомат перестал фиксировать PATH — правь тест"
         self.installed_text = text.replace(PATH_LINE, PATH_LINE.replace("export PATH=", f"export PATH={self.stubs}:"))
         lag = [ln for ln in text.splitlines() if ln.startswith('ALLOWED_LAG="')]
-        assert lag == ['ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008"'], lag
-        self.installed_text = self.installed_text.replace(lag[0], f'ALLOWED_LAG="dags/utils/alerts.py={LAG_BLOB}"')
+        assert len(lag) == 1, lag
+        # Substitute only entries present in the real script: a missing production
+        # allowance must make the new regression fail, not get added by the fixture.
+        entries = dict(item.split("=") for item in lag[0].split('"')[1].split())
+        assert entries.keys() <= LAG_BLOBS.keys(), entries
+        fixture_lag = " ".join(f"{path}={LAG_BLOBS[path]}" for path in entries)
+        self.installed_text = self.installed_text.replace(lag[0], f'ALLOWED_LAG="{fixture_lag}"')
         self.installed = tmp / "clubelo-auto-deliver.sh"
         self.installed.write_text(self.installed_text, encoding="utf-8")
         self.installed.chmod(0o755)
@@ -470,3 +484,40 @@ def test_allowed_lag_does_not_cover_other_shared_files(stand: Stand) -> None:
     (stand.tree / "dags/utils/config.py").write_text(LAG_BODY, encoding="utf-8")
     res = stand.run()
     assert res.returncode == 1 and "ОТМЕНА: общий модуль dags/utils/config.py в бою ≠ master" in stand.log()
+
+
+@pytest.mark.parametrize("lagged", [
+    tuple(CONFIG_LAG_BODIES), ("dags/utils/config.py",),
+    ("dags/utils/medallion_config.py",), (),
+])
+def test_fotmob_config_lag_delivers_without_changing_shared_files(stand: Stand, lagged) -> None:
+    for path in lagged:
+        (stand.tree / path).write_text(CONFIG_LAG_BODIES[path], encoding="utf-8")
+    (stand.tree / "dags/utils/alerts.py").write_text(LAG_BODY, encoding="utf-8")
+    before = {p: stand.tree_text(p) for p in LAG_BLOBS}
+    sha = stand.master({MAIN: "VERSION = 2\n"})
+    checked = stand.run("--check")
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert stand.tree_text(MAIN) == "VERSION = 1\n"
+    assert stand.accepted() == stand.base
+    res = stand.run()
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert stand.tree_text(MAIN) == "VERSION = 2\n"
+    assert stand.accepted() == sha
+    assert {p: stand.tree_text(p) for p in LAG_BLOBS} == before
+    for path in lagged:
+        assert f"{path}={LAG_BLOBS[path][:8]}" in stand.log()
+
+
+@pytest.mark.parametrize("changed", CONFIG_LAG_BODIES)
+def test_fotmob_config_third_version_still_blocks(stand: Stand, changed: str) -> None:
+    for path, body in CONFIG_LAG_BODIES.items():
+        (stand.tree / path).write_text(body, encoding="utf-8")
+    with (stand.tree / changed).open("a", encoding="utf-8") as handle:
+        handle.write("# unreviewed production edit\n")
+    stand.master({MAIN: "VERSION = 2\n"})
+    res = stand.run()
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert f"ОТМЕНА: общий модуль {changed}" in stand.log()
+    assert stand.tree_text(MAIN) == "VERSION = 1\n"
+    assert stand.accepted() == stand.base
