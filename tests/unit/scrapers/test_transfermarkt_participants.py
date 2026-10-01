@@ -320,3 +320,41 @@ def test_populated_teilnehmer_page_of_another_edition_proves_nothing(monkeypatch
 
     assert scraper.get_scope_capture()['listing_status'] == 'unknown'
     assert scraper.get_participant_evidence()['teilnehmer_count'] is None
+
+
+def test_afcn_empty_participants_with_season_filter_reaches_empty_proof(monkeypatch):
+    page = (FIXTURES / 'afcn_empty_participants_2026.html').read_text()
+    validate = TransfermarktScraper._endpoint_validator('teilnehmer', False)
+    assert validate(page) is None
+    assert tm._participant_page_is_empty(page, 'AFCN', 2026)
+    assert not tm._participant_page_is_empty(page, 'AFCN', 2024)
+    api = {'success': True, 'data': {
+        'competitionId': 'AFCN', 'seasonId': 2026, 'clubIds': [],
+    }}
+    scraper, _calls = _scraper(
+        monkeypatch, api=api, page=page,
+        record=resolve_competition('AFCN'), season='2027',
+    )
+    scraper.read_squad_data('AFCN', 2027)
+    assert scraper.get_scope_capture()['listing_status'] == 'authoritative_empty'
+    assert scraper.get_participant_evidence()['source'] == 'tmapi+teilnehmer'
+
+
+@pytest.mark.parametrize('extra', [
+    '<table><tr><td>unrecognized data</td></tr></table>',
+    '<a href="/test/startseite/verein/123">Team</a>',
+])
+def test_empty_participant_filter_does_not_hide_unrecognized_data(extra):
+    page = (FIXTURES / 'afcn_empty_participants_2026.html').read_text()
+    validate = TransfermarktScraper._endpoint_validator('teilnehmer', False)
+    assert validate(page.replace('</body>', extra + '</body>')) is not None
+
+
+def test_empty_participant_filter_without_api_is_still_unknown(monkeypatch):
+    page = (FIXTURES / 'afcn_empty_participants_2026.html').read_text()
+    scraper, _calls = _scraper(
+        monkeypatch, api=None, page=page,
+        record=resolve_competition('AFCN'), season='2027',
+    )
+    scraper.read_squad_data('AFCN', 2027)
+    assert scraper.get_scope_capture()['listing_status'] == 'unknown'
