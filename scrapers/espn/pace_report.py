@@ -197,6 +197,6 @@ def format_measurement(report):
         f"  HTTP p95 {number(m.get('http_p95_ms'), ' мс')}; профиль {number(report.get('profile_p95_ms'), ' мс')}; S0 {number(report.get('baseline_p95_ms'), ' мс')}; сбросов {report.get('resets', '?')}",
         f"  нагрузка {load.get('loaded_intervals', 0)}/{load.get('eligible_intervals', 0)} интервалов; пауз {load.get('paused_intervals', 0)}, неизвестных {load.get('unknown_intervals', 0)}; квота истории {report.get('history_quota_per_minute', '?')}/мин",
         f"  Iceberg: {write_text}; свежесть {fresh.get('ok', '?')}/{fresh.get('due', '?')} за {fresh.get('day', '?')} UTC",
-        f"  изолированный стенд: p95 {isolated_text}; массовая запись — проверка #1511",
+        f"  изолированный стенд: p95 {isolated_text}; замер {isolated.get('measured_at', '?') if isolated else '?'}; массовая запись — проверка #1511",
         f"  повышение: {report.get('reason', 'нет данных ⚠️')}; измерительные чтения не увеличивают охват истории",
     ]

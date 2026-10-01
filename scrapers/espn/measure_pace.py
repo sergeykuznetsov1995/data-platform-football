@@ -246,6 +246,11 @@ class Controller:
 
     def _benchmark(self, report):
         if self.benchmark_fn is not None:
+            key = str(report['step'])
+            cached = self.state.setdefault('benchmarks', {}).get(key)
+            if cached is not None:
+                report['isolated_benchmark'] = dict(cached)
+                return
             if self.cancel.is_set() or self.stop_file.exists():
                 raise MeasurementStopped('stop before isolated benchmark')
             try:
@@ -259,7 +264,10 @@ class Controller:
                 raise
             if self.cancel.is_set() or self.stop_file.exists():
                 raise MeasurementStopped('stop after isolated benchmark')
+            result = dict(result, measured_at=self.now().isoformat())
+            self.state['benchmarks'][key] = result
             report['isolated_benchmark'] = result
+            self.store.save(self.state)
             self.store.record('lifecycle', self.now().timestamp(), event='benchmark_complete',
                               step=report['step'], result=result)
 
@@ -267,7 +275,9 @@ class Controller:
         snapshot, window, baseline, decision, report = self.evidence()
         state = self.state
         if decision.eligible:
-            final = window.step >= self.max_step
+            # S3 is a bounded probe, completed only by the gate-expiry path
+            # in observe(); there is no S3 promotion/acceptance window.
+            final = window.step == 2 and self.max_step == 2
             if final:
                 # Require a fully closed UTC freshness day overlapping S2 load.
                 day = datetime.fromisoformat(self.freshness['day']).replace(tzinfo=timezone.utc)

@@ -353,7 +353,7 @@ def test_failed_boundary_benchmark_does_not_claim_write_measurement(controller):
 def test_tick_requests_drain_instead_of_running_benchmark_with_workers(controller):
     c = controller
     called = []
-    c.benchmark_fn = lambda step: called.append(step)
+    c.benchmark_fn = lambda step: called.append(step) or {'isolated': True, 'p95_seconds': 1}
     fill_window(c)
     c.tick()
     assert c.decision_due
@@ -460,3 +460,45 @@ def test_documented_supervisor_never_installs_persistent_stop_as_execstop():
     assert '--benchmark-at-boundaries' in command
     assert 'ExecStop=' not in command
     assert '--allow-s3' not in command
+
+
+def test_full_s3_opt_in_progression_expires_to_previously_accepted_s2(controller):
+    c = controller
+    c.max_step = 3
+    for seconds in (300, 300, 86400):
+        fill_window(c, seconds)
+        assert c.decide()['reason'] == 'eligible'
+    assert c.gate.snapshot()['confirmed_ceiling'] == 3
+    assert c.state['accepted_step'] == 2
+    assert c.state['status'] == 'running'
+    c.clock.now += timedelta(seconds=21600)
+    c.observe(force=True)
+    assert c.gate.snapshot()['confirmed_ceiling'] == 2
+    assert c.state['status'] == 'complete'
+    assert c.state['report']['reason'] == 's3_expired_return_s2'
+
+
+def test_slow_final_benchmark_is_reused_without_relaxing_evidence_age(controller):
+    c = controller
+    for _ in range(2):
+        fill_window(c)
+        c.decide()
+    fill_window(c, 86400)
+    calls = []
+    def slow(step):
+        calls.append(step)
+        c.clock.now += timedelta(seconds=301)
+        return {'isolated': True, 'p95_seconds': 100}
+    c.benchmark_fn = slow
+    report = c.decide()
+    assert report['reason'] == 'stale_window'
+    assert c.state['status'] == 'running'
+    measured_at = report['isolated_benchmark']['measured_at']
+    assert c.store.get()['benchmarks']['2']['measured_at'] == measured_at
+    # Fresh evidence needs a new uninterrupted window after the observation gap.
+    c.observe(force=True)
+    fill_window(c, 86400)
+    report = c.decide()
+    assert report['reason'] == 'accepted_s2'
+    assert report['isolated_benchmark']['measured_at'] == measured_at
+    assert calls == [2]
