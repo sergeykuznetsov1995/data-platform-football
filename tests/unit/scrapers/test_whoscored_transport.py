@@ -5142,12 +5142,12 @@ def test_second_proxy_failure_after_member_swap_raises_proxy_unavailable(
     with pytest.raises(ProxyUnavailable):
         transport.fetch("https://www.whoscored.com/Matches/1/Live")
 
-    # Exactly one swap to a different pool member, one repeat on it.
+    # Authorization repeats the source; transient failures validate via ipify.
     assert len(seen) == 2 and seen[0] != seen[1]
     assert len(first.calls) == 1 and len(second.calls) == 1
     assert first.closed is True
     stats = transport.get_traffic_stats()
-    assert stats["failures"] == {"proxy": 2}
+    assert stats["failures"] == {"proxy": 2 if error is PROXY_407 else 1}
     assert stats["route_successes"] == {}
 
 
@@ -5232,3 +5232,183 @@ def test_egress_probe_is_noop_without_pool():
     transport.probe_egress()
 
     assert session.calls == []
+
+# --- #1599: bounded recovery on distinct pool members ------------------------
+
+PROXY_502 = RuntimeError("curl: (56) CONNECT tunnel failed, response 502")
+
+
+def _ordered_pool_transport(monkeypatch, tmp_path, sessions, *, choices=None):
+    from itertools import cycle
+    from scrapers.utils.proxy_manager import ProxyManager
+
+    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(len(sessions))]
+    order = cycle(choices or urls)
+    monkeypatch.setattr(ProxyManager, "get_http_proxy_url", lambda self: next(order))
+    monkeypatch.setattr(ProxyManager, "total_count", property(lambda self: len(urls)))
+    transport, seen = _pool_transport(monkeypatch, tmp_path, *sessions)
+    return transport, seen, urls
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failures", [0, 1, 2])
+def test_egress_recovery_reaches_first_healthy_member(monkeypatch, tmp_path, failures):
+    sessions = [FakeHTTPSession(PROXY_502) for _ in range(failures)]
+    sessions.append(FakeHTTPSession(FakeHTTPResponse()))
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    permit = object()
+    transport._source_circuit_permit = permit
+    transport._source_circuit_browser_blocked = True
+    transport._direct_gate_circuits.add("source-gate")
+
+    transport.probe_egress()
+
+    assert seen == urls
+    assert all(len(session.calls) == 1 for session in sessions)
+    assert all(session.closed for session in sessions[:-1])
+    assert transport._pool_proxy_url == urls[-1]
+    assert transport.get_traffic_stats()["route_successes"] == {}
+    assert transport._source_circuit_permit is permit
+    assert transport._source_circuit_browser_blocked is True
+    assert transport._direct_gate_circuits == {"source-gate"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("members", [1, 2, 3, 4])
+def test_egress_recovery_exhausts_distinct_members_only(monkeypatch, tmp_path, members):
+    sessions = [FakeHTTPSession(PROXY_502) for _ in range(members)]
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    with pytest.raises(transport_module.ProxyUnavailable, match="access check exhausted"):
+        transport.probe_egress()
+    assert seen == urls[:3]
+    assert sum(len(session.calls) for session in sessions) == min(members, 3)
+
+
+@pytest.mark.unit
+def test_egress_recovery_does_not_revisit_or_leak_credentials(monkeypatch, tmp_path, caplog):
+    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(3)]
+    secret_error = RuntimeError(f"curl: (56) CONNECT tunnel failed, response 502 {urls[0]}")
+    sessions = [FakeHTTPSession(secret_error) for _ in range(3)]
+    transport, seen, _ = _ordered_pool_transport(
+        monkeypatch, tmp_path, sessions, choices=[urls[0], urls[0], urls[1], urls[0], urls[1], urls[2]]
+    )
+    with pytest.raises(transport_module.ProxyUnavailable) as caught:
+        transport.probe_egress()
+    assert seen == urls
+    assert "secret" not in str(caught.value) + caplog.text
+    assert "pool.invalid" not in str(caught.value) + caplog.text
+    assert "reason=budget_exhausted" in caplog.text
+    assert "members=3" in caplog.text
+
+
+@pytest.mark.unit
+def test_egress_recovery_407_stays_bounded_to_two_members(monkeypatch, tmp_path):
+    sessions = [FakeHTTPSession(PROXY_407) for _ in range(3)]
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    with pytest.raises(transport_module.ProxyUnavailable):
+        transport.probe_egress()
+    assert seen == urls[:2]
+    assert sessions[2].calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("replay_fails", [False, True])
+def test_pool_recovery_probes_before_single_source_replay(monkeypatch, tmp_path, replay_fails):
+    sessions = [FakeHTTPSession(PROXY_502), FakeHTTPSession(PROXY_502),
+                FakeHTTPSession(FakeHTTPResponse(), PROXY_502 if replay_fails else FakeHTTPResponse())]
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    source = "https://www.whoscored.com/Matches/1/Live"
+    if replay_fails:
+        with pytest.raises(transport_module.ProxyUnavailable):
+            transport.fetch(source)
+    else:
+        assert transport.fetch(source).status_code == 200
+    assert seen == urls
+    assert [call[0] for session in sessions for call in session.calls] == [
+        source, transport_module.EGRESS_PROBE_URL, transport_module.EGRESS_PROBE_URL, source]
+    assert transport.get_traffic_stats()["route_successes"] == ({} if replay_fails else {"direct_http": 1})
+
+
+@pytest.mark.unit
+def test_pool_recovery_failed_validation_never_replays_source(monkeypatch, tmp_path):
+    sessions = [FakeHTTPSession(PROXY_502) for _ in range(4)]
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    source = "https://www.whoscored.com/Matches/1/Live"
+    with pytest.raises(transport_module.ProxyUnavailable):
+        transport.fetch(source)
+    assert seen == urls[:3]
+    assert [call[0] for session in sessions for call in session.calls] == [
+        source, transport_module.EGRESS_PROBE_URL, transport_module.EGRESS_PROBE_URL]
+
+
+@pytest.mark.unit
+def test_egress_recovery_member_identity_survives_next_operation(monkeypatch, tmp_path, caplog):
+    import logging
+    sessions = [FakeHTTPSession(PROXY_502), FakeHTTPSession(FakeHTTPResponse(), FakeHTTPResponse())]
+    transport, _, _ = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    caplog.set_level(logging.INFO, logger="scrapers.whoscored.transport")
+    transport.probe_egress()
+    caplog.clear()
+    transport.probe_egress()
+    assert "attempt=1 member=2" in caplog.text
+    assert all(record.levelno == logging.INFO for record in caplog.records)
+
+
+@pytest.mark.unit
+def test_egress_recovery_stops_after_bounded_replacement_search(monkeypatch, tmp_path):
+    sessions = [FakeHTTPSession(PROXY_502) for _ in range(3)]
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    calls = []
+    def stuck_choice():
+        calls.append(1)
+        return urls[0]
+    monkeypatch.setattr(transport._pool_manager, "get_http_proxy_url", stuck_choice)
+    with pytest.raises(transport_module.ProxyUnavailable, match="replacement_unavailable"):
+        transport.probe_egress()
+    assert len(calls) == 12
+    assert seen == urls[:1]
+    assert len(sessions[0].calls) == 1
+
+
+@pytest.mark.unit
+def test_pool_recovery_suppresses_credentials_in_traceback(monkeypatch, tmp_path, caplog):
+    import traceback
+    secret_error = RuntimeError("curl: (56) CONNECT tunnel failed, response 502 http://user:private-password@proxy.invalid")
+    sessions = [FakeHTTPSession(secret_error), FakeHTTPSession(FakeHTTPResponse(), secret_error)]
+    transport, _, _ = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+    with pytest.raises(transport_module.ProxyUnavailable) as caught:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+    rendered = "".join(traceback.format_exception(caught.type, caught.value, caught.tb))
+    assert "private-password" not in rendered + caplog.text
+    assert "proxy.invalid" not in rendered + caplog.text
+
+
+@pytest.mark.unit
+def test_egress_recovery_curl_timeout_does_not_hide_healthy_third(monkeypatch, tmp_path):
+    from curl_cffi.requests.exceptions import Timeout
+
+    sessions = [FakeHTTPSession(PROXY_502), FakeHTTPSession(Timeout("ipify timed out", code=28)),
+                FakeHTTPSession(FakeHTTPResponse())]
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+
+    transport.probe_egress()
+
+    assert seen == urls
+    assert [len(session.calls) for session in sessions] == [1, 1, 1]
+    assert transport.get_traffic_stats()["route_successes"] == {}
+
+
+@pytest.mark.unit
+def test_source_curl_timeout_keeps_timeout_policy_without_pool_rotation(monkeypatch, tmp_path):
+    from curl_cffi.requests.exceptions import Timeout
+
+    sessions = [FakeHTTPSession(Timeout("source timed out", code=28)), FakeHTTPSession()]
+    transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
+
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert caught.value.kind is FailureKind.TIMEOUT
+    assert caught.value.retryable is True
+    assert seen == urls[:1]
+    assert sessions[1].calls == []
