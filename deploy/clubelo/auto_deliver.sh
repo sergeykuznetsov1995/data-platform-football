@@ -31,7 +31,11 @@ SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__ini
 # alerts.py до #1477 (0caf6bca^): master отличается лишь telegram_dq_summary, которой ClubElo не
 # пользуется — тест tests/unit/deploy/test_clubelo_shared_lag.py падает, если разойдётся то, что
 # ClubElo зовёт. Удалить запись, когда #1477 доедет до боя (#1489) — README.
-ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008"
+# #1590 (решение владельца 01.10, #1465): config.py до удаления расписания FotMob Silver,
+# medallion_config.py до исправления SQL COALESCE. ClubElo не использует ни это расписание,
+# ни SQL emitter; test_clubelo_shared_lag.py фиксирует обе проверенные версии и импорты.
+# Удалять каждую пару после доставки соответствующего общего файла FotMob, не править бой.
+ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008 dags/utils/config.py=221a12711ca7651274d22e3539a4b3b20b7284bf dags/utils/medallion_config.py=697fe43d6eb46e49c4246780f2cba59fabf87e4d"
 # Порядок записи файлов вне scrapers/clubelo/ и tests/ — импортируемые раньше импортирующих.
 DAG_ORDER="dags/utils/clubelo_tasks.py dags/scripts/run_clubelo_scraper.py dags/dag_ingest_clubelo.py"
 DAGS="dag_ingest_clubelo"
