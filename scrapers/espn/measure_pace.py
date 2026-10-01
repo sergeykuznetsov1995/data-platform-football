@@ -186,8 +186,9 @@ class Controller:
             state.setdefault('report', {})['reason'] = 's3_expired_return_s2'
             self.cancel.set()
         gap = previous is not None and at - previous['at'] > MAXIMUM_GAP
+        recovered = known and previous is not None and not previous['known']
         if (snapshot['revision'] != state['revision'] or snapshot['measurement_started_at'] != state['epoch']
-                or not known or gap):
+                or not known or gap or recovered):
             state.update(start=at, revision=snapshot['revision'],
                          epoch=snapshot['measurement_started_at'], step=snapshot['step'])
             self.store.record('lifecycle', at, event='window_restarted', reason='epoch_or_observation_gap')

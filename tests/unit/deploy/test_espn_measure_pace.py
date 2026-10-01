@@ -380,3 +380,35 @@ def test_final_benchmark_cannot_accept_new_protection_without_revision_change(co
     assert report['reason'] == 'gate_changed_during_benchmark'
     assert c.state['status'] != 'complete'
     assert c.state['accepted_step'] == 1
+
+
+def test_first_known_observation_after_unknown_starts_fresh_qualifying_window(controller):
+    c = controller
+    c.trino.unknown = True
+    c.clock.now += timedelta(seconds=10)
+    c.observe(force=True)
+    unknown_start = c.state['start']
+    assert not c.observation['known']
+    c.trino.unknown = False
+    c.clock.now += timedelta(seconds=10)
+    c.observe(force=True)
+    assert c.state['start'] > unknown_start
+    assert c.state['start'] == c.clock().timestamp()
+    fill_window(c, 600)
+    assert c.decide()['reason'] == 'eligible'
+    assert c.gate.snapshot()['confirmed_ceiling'] == 1
+
+
+def test_checkout_wrapper_help_from_arbitrary_directory(tmp_path):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    wrapper = Path(__file__).resolve().parents[3] / 'deploy' / 'espn' / 'measure_pace.py'
+    environment = dict(os.environ)
+    environment.pop('PYTHONPATH', None)
+    result = subprocess.run([sys.executable, str(wrapper), '--help'], cwd=tmp_path,
+                            env=environment, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert 'benchmark-at-boundaries' in result.stdout
+    assert 'run,start,resume,status,stop,benchmark' in result.stdout
