@@ -20,6 +20,7 @@ import re
 import threading
 import time
 import zlib
+import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Callable, Mapping, Optional
@@ -30,6 +31,7 @@ from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
 from .gate import Permit, TransportGate
+from .attempts import AttemptJournal
 from .raw_store import (
     EspnRawStore,
     RawJsonRecord,
@@ -151,6 +153,10 @@ class EspnHttpClient:
         monotonic_fn: Callable[[], float] = time.monotonic,
         utcnow_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         environ: Optional[Mapping[str, str]] = None,
+        attempt_journal: Optional[AttemptJournal] = None,
+        run_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        measurement_id: Optional[str] = None,
     ) -> None:
         environment = os.environ if environ is None else environ
         proxy_names = sorted(
@@ -215,6 +221,12 @@ class EspnHttpClient:
         self.sleep_fn = sleep_fn
         self.monotonic_fn = monotonic_fn
         self.utcnow_fn = utcnow_fn
+        self.attempt_journal = attempt_journal or AttemptJournal(
+            gate.state_path.with_name("http-attempts.sqlite3")
+        )
+        self.run_id = run_id or environment.get("AIRFLOW_CTX_DAG_RUN_ID") or uuid.uuid4().hex
+        self.task_id = task_id or environment.get("AIRFLOW_CTX_TASK_ID") or "unknown"
+        self.measurement_id = measurement_id
         self._ledger: list[RequestLedgerEntry] = []
         self._lock = threading.RLock()
 
@@ -226,6 +238,10 @@ class EspnHttpClient:
     def flush(self) -> None:
         """Wait for queued raw writes; raises the first write failure."""
         self.raw_writer.flush()
+
+    def flush_attempts(self, conn) -> int:
+        """Publish/recover the durable shared attempt outbox."""
+        return self.attempt_journal.flush(conn)
 
     def close(self) -> None:
         self.raw_writer.close()
@@ -278,6 +294,52 @@ class EspnHttpClient:
                 origin_attempts=tuple(attempts.origins) if attempts else (),
             )
         )
+
+    def _http_attempt(self, permit, request_url, endpoint, tries):
+        attempt_id = self.attempt_journal.begin(
+            run_id=self.run_id, task_id=self.task_id, requested_at=self.utcnow_fn(),
+            origin=permit.origin, endpoint=endpoint, lane=permit.lane,
+            step=permit.step, measurement_id=self.measurement_id,
+        )
+        response = None
+        direct_bytes = 0
+        timed_out = False
+        started = self.monotonic_fn()
+        try:
+            response = self.session.get(
+                request_url, timeout=(self.connect_timeout, self.read_timeout),
+                stream=True, allow_redirects=False,
+            )
+            tries.finish(int(response.status_code))
+            body, encoding = b"", None
+            if 200 <= int(response.status_code) <= 299:
+                body, direct_bytes, encoding = self._read_response(response)
+            return response, body, direct_bytes, encoding
+        except BaseException as exc:
+            direct_bytes = getattr(exc, "direct_bytes", 0)
+            timed_out = isinstance(exc, (_ResponseReadTimeout, requests.Timeout,
+                                        Urllib3ReadTimeoutError, TimeoutError))
+            raise
+        finally:
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                elapsed = max(0.0, (self.monotonic_fn() - started) * 1000.0)
+                try:
+                    self.attempt_journal.finish(
+                        attempt_id, status=int(response.status_code) if response is not None else None,
+                        timeout=timed_out, http_ms=elapsed, direct_bytes=direct_bytes,
+                    )
+                except BaseException:
+                    # A failed measurement write stops this request, but must
+                    # never suppress #1500's response protections.
+                    self.gate.report(
+                        permit, status=int(response.status_code) if response is not None else None,
+                        timeout=timed_out, direct_bytes=direct_bytes,
+                    )
+                    raise
+
 
     def _now_iso(self) -> str:
         return self.utcnow_fn().astimezone(timezone.utc).isoformat()
@@ -415,15 +477,11 @@ class EspnHttpClient:
             response = None
             body = b""
             try:
-                response = self.session.get(
-                    request_url,
-                    timeout=(self.connect_timeout, self.read_timeout),
-                    stream=True,
-                    allow_redirects=False,
+                response, body, direct_bytes, encoding = self._http_attempt(
+                    permit, request_url, endpoint_type, tries
                 )
                 tries.finish(int(response.status_code))
                 if 200 <= tries.status <= 299:
-                    body, direct_bytes, encoding = self._read_response(response)
                     tries.direct_bytes += direct_bytes
                     tries.content_encoding = encoding
                     self.gate.report(
@@ -518,9 +576,6 @@ class EspnHttpClient:
                     tries,
                     None,
                 )
-            finally:
-                if response is not None:
-                    response.close()
 
             status = tries.status
             if status == 403:

@@ -40,7 +40,7 @@ class Clock:
 
 
 def _gate(tmp_path, clock, lane="live", ceiling=0, policy=None):
-    return TransportGate(
+    gate = TransportGate(
         policy or load_transport_policy(),
         tmp_path / "gate.json",
         lane,
@@ -48,6 +48,12 @@ def _gate(tmp_path, clock, lane="live", ceiling=0, policy=None):
         utcnow_fn=clock,
         sleep_fn=clock.sleep,
     )
+    if ceiling:
+        with gate._state() as state:
+            state['confirmed_ceiling'] = ceiling
+            state['s3_expires_at'] = clock().timestamp() + 21600 if ceiling == 3 else None
+    return gate
+
 
 
 @pytest.mark.unit
@@ -188,7 +194,7 @@ def test_two_resets_within_an_hour_hold_s0_for_six_hours_with_alert(tmp_path):
     clock.advance(6 * 3600 - 1)
     assert gate.acquire("site").step == 0
     clock.advance(2)
-    assert gate.acquire("site").step == 3
+    assert gate.acquire("site").step == 2  # S3 expired while held
 
 
 @pytest.mark.unit

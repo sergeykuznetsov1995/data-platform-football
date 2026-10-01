@@ -66,3 +66,13 @@ def _mutated(path, value):
 def test_broken_policy_fails_closed(path, value):
     with pytest.raises(ValueError):
         parse_transport_policy(_mutated(path, value))
+
+
+@pytest.mark.parametrize('key,value', [
+    ('error_share', 0), ('loaded_interval_fraction', 1.1),
+    ('http_p95_limit_ms', float('nan')), ('minimum_window_seconds', [7200, 86400]),
+    ('s3_max_seconds', 1.5), ('unexpected', 1),
+])
+def test_pace_configuration_fails_closed(key, value):
+    with pytest.raises(ValueError):
+        parse_transport_policy(_mutated(('pace', key), value))

@@ -390,6 +390,8 @@ class _Runner:
         self.conn = conn
         self.denominator = denominator
         self.scope = tuple(scope)
+        if hasattr(client, "attempt_journal"):
+            client.run_id, client.task_id = run_id, task_id
         self.run_id = run_id
         self.task_id = task_id
         self.deadline = deadline
@@ -430,6 +432,8 @@ class _Runner:
             queue[row.key] = row
 
     def flush_journal(self) -> None:
+        if hasattr(self.client, "flush_attempts"):
+            self.client.flush_attempts(self.conn)
         entries = self.client.ledger
         new = entries[self._journalled :]
         if new:

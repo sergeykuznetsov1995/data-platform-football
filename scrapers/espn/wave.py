@@ -1068,6 +1068,8 @@ def failed_outcome(work: TournamentWork, exc: BaseException) -> TournamentOutcom
 def finish_requests(client, conn, *, run_id: str, task_id: str) -> None:
     """Journal of the task's requests, then the queued raw bodies."""
 
+    if hasattr(client, "flush_attempts"):
+        client.flush_attempts(conn)
     flush_journal(conn, journal_rows(client.ledger, run_id=run_id, task_id=task_id))
     client.flush()
 
@@ -1254,6 +1256,8 @@ def run_tournament(
     downloads a journalled recheck or sample again.
     """
 
+    if hasattr(client, "attempt_journal"):
+        client.run_id, client.task_id = run_id, task_id
     if work.error is not None and not work.event_ids:
         raise WavePlanError(work.error)
     failure: BaseException | None = None
