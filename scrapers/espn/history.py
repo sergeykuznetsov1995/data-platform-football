@@ -60,6 +60,8 @@ import logging
 import os
 from pathlib import Path
 import re
+import time
+import threading
 from typing import Any, Callable, Iterable, Sequence
 
 from . import urls
@@ -77,6 +79,8 @@ from .raw_store import RawStoreError
 from .schedule_parser import STATUS_MAP, schedule_row_from_header
 from .summary_parser import parse_summary
 from .transport_contracts import AllOriginsBlocked, LaneClosed
+from .parallel import WORKERS, bounded_fetch, interruptible_sleep, protected
+from .pace_store import PaceStore
 from .wave import _STATUS_ERRORS, BronzeMatch, _fetch, _raw_ref, bronze_matches, build_competition
 
 logger = logging.getLogger(__name__)
@@ -384,6 +388,7 @@ class _Runner:
         deadline: datetime,
         stop_file: Path | None,
         now_fn: Callable[[], datetime],
+        worker_client_factory=None,
     ) -> None:
         self.client = client
         self.trino = trino
@@ -400,10 +405,21 @@ class _Runner:
         self.live_targets = sorted(denominator.live_targets())
         self.matches = self.failed = self.batches = 0
         self._journalled = 0
+        self.worker_client_factory = worker_client_factory
+        self._workers = []
+        self._worker_slots = {}
+        self._worker_journalled = {}
+        self._cancel = threading.Event()
+        self._pace_store = (PaceStore(client.gate.state_path.with_name('pace.sqlite3'))
+                            if hasattr(client, 'gate') else None)
         self._seasons: dict[tuple[str, int], _Season] = {}
         # Event ids of a season handled by an earlier type in this run.
         self._seen: dict[tuple[str, int], set[int]] = {}
         self._touched: set[tuple[str, int, int]] = set()
+        if hasattr(client, 'before_attempt'):
+            client.before_attempt = self._worker_check
+            client.sleep_fn = lambda seconds: interruptible_sleep(seconds, self._worker_check)
+            client.gate.sleep_fn = client.sleep_fn
 
     # -------------------------------------------------------------- checks
 
@@ -412,6 +428,37 @@ class _Runner:
             raise _Stop(STOPPED, f"stop file {self.stop_file}")
         if self.now_fn() >= self.deadline:
             raise _Stop(BUDGET)
+
+    def _worker_check(self):
+        self._between()
+        if self._cancel.is_set():
+            raise _Stop(STOPPED, 'batch interrupted')
+        if hasattr(self.client, 'gate'):
+            snapshot = self.client.gate.snapshot()
+            if protected(snapshot, self.now_fn().timestamp()):
+                raise LaneClosed('history protection active')
+
+    def _worker_limit(self):
+        if not hasattr(self.client, 'gate'):
+            return 1
+        return WORKERS[self.client.gate.snapshot()['step']]
+
+    def _new_worker(self, slot):
+        if slot in self._worker_slots:
+            return self._worker_slots[slot]
+        if self.worker_client_factory is not None:
+            client = self.worker_client_factory(slot, self._worker_check)
+        elif hasattr(self.client, 'worker'):
+            client = self.client.worker(
+                before_attempt=self._worker_check,
+                sleep_fn=lambda seconds: interruptible_sleep(seconds, self._worker_check),
+            )
+        else:
+            # Recorded-fixture clients have no parallel transport state.
+            return self.client
+        self._workers.append(client)
+        self._worker_slots[slot] = client
+        return client
 
     def _before_batch(self) -> None:
         self._between()
@@ -441,6 +488,13 @@ class _Runner:
                 self.conn, journal_rows(new, run_id=self.run_id, task_id=self.task_id)
             )
         self._journalled = len(entries)
+        for worker in self._workers:
+            entries = worker.ledger
+            offset = self._worker_journalled.get(id(worker), 0)
+            if entries[offset:]:
+                flush_journal(self.conn, journal_rows(entries[offset:], run_id=self.run_id,
+                                                       task_id=self.task_id))
+            self._worker_journalled[id(worker)] = len(entries)
 
     def _season(self, slug: str, year: int) -> _Season:
         key = (slug, year)
@@ -471,27 +525,28 @@ class _Runner:
             )
         )
 
-    def _summary(self, slug: str, event_id: int, closed: bool):
+    def _summary(self, slug: str, event_id: int, closed: bool, client=None):
         """A closed season replays a stored Summary with a terminal status (a
         pre-match body of the live lane is read again); an open season always
         downloads it."""
 
+        client = client or self.client
         request = urls.summary(slug, event_id)
         if not closed:
-            return _fetch(self.client, request, force_refresh=True)
+            return _fetch(client, request, force_refresh=True)
         try:
-            result = self.client.replay_json(request.url, request.endpoint, request.params)
+            result = client.replay_json(request.url, request.endpoint, request.params)
         except RawStoreError:
-            return _fetch(self.client, request, force_refresh=True)
+            return _fetch(client, request, force_refresh=True)
         status = STATUS_MAP.get(_header_status(result.json_data) or "")
         if status is not None and status.terminal:
             return result
-        return _fetch(self.client, request, force_refresh=True)
+        return _fetch(client, request, force_refresh=True)
 
     def _payload(
-        self, event_id: int, competition: Competition, edition: Edition, closed: bool
+        self, event_id: int, competition: Competition, edition: Edition, closed: bool, client=None
     ) -> MatchPayload:
-        result = self._summary(competition.slug, event_id, closed)
+        result = self._summary(competition.slug, event_id, closed, client)
         schedule = schedule_row_from_header(
             result.body, competition=competition, edition=edition
         )
@@ -521,7 +576,23 @@ class _Runner:
         ]
         # Bronze rows never point at a raw body that is not written yet.
         self.client.flush()
-        write_tournament_batch(TournamentBatch(slug, year, payloads), trino=self.trino)
+        for worker in self._workers:
+            worker.flush()
+        write_started = time.monotonic()
+        step = self.client.gate.snapshot()['step'] if hasattr(self.client, 'gate') else 0
+        succeeded = False
+        try:
+            write_tournament_batch(TournamentBatch(slug, year, payloads), trino=self.trino)
+            succeeded = True
+        finally:
+            if self._pace_store is not None:
+                self._pace_store.record(
+                    'write', self.now_fn().timestamp(), run_id=self.run_id,
+                    slug=slug, year=year, step=step, matches=len(payloads),
+                    write_seconds=time.monotonic() - write_started,
+                    batch_seconds=time.monotonic() - self._batch_started,
+                    success=succeeded, isolated=False,
+                )
         self.flush_journal()
         self.matches += len(payloads)
         self.batches += 1
@@ -716,29 +787,41 @@ class _Runner:
                 self._before_batch()
             payloads: list[MatchPayload] = []
             interrupted: BaseException | None = None
-            for event_id in todo[start : start + BATCH_MATCHES]:
-                try:
-                    self._between()
-                    payload = self._payload(event_id, competition, edition, season.closed)
-                except (_Stop, LaneClosed, AllOriginsBlocked) as exc:
-                    interrupted = exc
-                    break
-                except _STATUS_ERRORS as exc:
-                    failed += 1
-                    self.failed += 1
-                    first_error = first_error or f"{event_id}: {type(exc).__name__}: {exc}"
-                    logger.warning("ESPN history %s:%s %s", slug, year, first_error)
-                    continue
-                known = stored.get(event_id)
-                payloads.append(known.carried(payload) if known is not None else payload)
-                if not payload.schedule.terminal:
-                    # Written (the row keeps its place in bronze) but not
-                    # finished: a failure of the match, the type row is red.
-                    failed += 1
-                    self.failed += 1
-                    first_error = first_error or (
-                        f"{event_id}: status {payload.schedule.status} is not terminal"
-                    )
+            self._batch_started = time.monotonic()
+            self._cancel.clear()
+            fetched = bounded_fetch(
+                todo[start : start + BATCH_MATCHES],
+                lambda client, event_id: self._payload(event_id, competition, edition,
+                                                       season.closed, client),
+                limit=self._worker_limit, check=self._worker_check,
+                client_factory=self._new_worker,
+            )
+            try:
+                for event_id, payload, error in fetched:
+                    if error is not None:
+                        if isinstance(error, (_Stop, LaneClosed, AllOriginsBlocked)):
+                            interrupted = interrupted or error
+                            self._cancel.set()
+                        elif isinstance(error, _STATUS_ERRORS):
+                            failed += 1
+                            self.failed += 1
+                            first_error = first_error or f"{event_id}: {type(error).__name__}: {error}"
+                        else:
+                            interrupted = interrupted or error
+                            self._cancel.set()
+                        continue
+                    known = stored.get(event_id)
+                    payloads.append(known.carried(payload) if known is not None else payload)
+                    if not payload.schedule.terminal:
+                        failed += 1
+                        self.failed += 1
+                        first_error = first_error or (
+                            f"{event_id}: status {payload.schedule.status} is not terminal"
+                        )
+            except BaseException as exc:
+                interrupted = interrupted or exc
+            finally:
+                fetched.close()
             if payloads:
                 self._write(slug, year, payloads)
                 done += sum(payload.schedule.terminal for payload in payloads)
@@ -767,7 +850,13 @@ class _Runner:
             reason, detail = ERROR, f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            self._finish(reason, detail)
+            try:
+                self._finish(reason, detail)
+            finally:
+                for worker in self._workers:
+                    worker.close()
+                    if hasattr(worker, 'session'):
+                        worker.session.close()
         logger.info(
             "ESPN history run %s: %s, %d match(es) in %d batch(es), %d failed%s",
             self.run_id, reason, self.matches, self.batches, self.failed,
@@ -805,6 +894,7 @@ def run_history(
     stop_file: Path | None = None,
     task_id: str = "run_history",
     now_fn: Callable[[], datetime] = _utcnow,
+    worker_client_factory=None,
 ) -> HistoryRun:
     """One run of the history lane until the queue, the budget or the gate ends it.
 
@@ -827,6 +917,7 @@ def run_history(
         deadline=deadline,
         stop_file=stop_file,
         now_fn=now_fn,
+        worker_client_factory=worker_client_factory,
     ).run()
 
 

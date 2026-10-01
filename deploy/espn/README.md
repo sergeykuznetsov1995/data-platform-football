@@ -466,3 +466,115 @@ python3 /root/espn-deploy/auto_deliver.py --seed <sha мержа>
 
 **Откат контура целиком:** `touch /root/espn-deploy/state/off`, `docker compose -p espn-live …
 stop airflow-scheduler airflow-webserver` (поимённо). Старый `espn-airflow` так и стоит на паузе.
+
+## #1510: контролируемый замер темпа
+
+Рабочий модуль — `scrapers.espn.measure_pace`: scheduler монтирует `scrapers`/`configs`,
+но не `deploy/espn`. `deploy/espn/measure_pace.py` — только обёртка для checkout.
+Контроллер использует один неблокирующий lock и `pace.sqlite3` в
+`/opt/airflow/state/espn` (`espn_live_state`), рядом с общей заслонкой и журналом
+HTTP-попыток. Каталог автомата доставки не является состоянием замера.
+
+Ступени: S0 60/мин, 1 worker, 2 ч; S1 120/мин, 2 workers, 24 ч;
+S2 240/мин, 4 workers, 24 ч. Общая половинная квота истории — максимум
+30/60/120 попыток в минуту. Контроллер повторно читает фиксированные 380 принятых
+ID eng.1 2015, профиль только Summary; это не прирост исторического покрытия.
+Все запросы идут через history lane общей заслонки с прежним User-Agent.
+Raw замера сохраняется только в `measurement-raw/<measurement_id>` тома состояния;
+очередь истории, производственный Bronze и first_published_at не изменяются.
+
+Проверяются полные UTC-интервалы по 5 минут: >=80% квоты истории в >=90%
+интервалов без известного долга/защитной паузы. Нет наблюдения, незавершённая
+HTTP-попытка, пустое окно или неизвестная свежесть запрещают повышение.
+Наблюдение долга/защиты — каждые 10 с, разрыв >30 с начинает новое окно.
+Рестарт сохраняет ID, baseline, принятые ступени и события, но начинает новое
+непрерывное окно. Heartbeat/события start/stop сохраняются; простой процесса не
+считается доказательством нагрузки. Свежесть — точное >=99% по существующему
+UTC-измерителю; окончание S2 требует закрытого UTC-дня, пересекающегося с нагрузкой.
+S3 360/мин, 8 workers доступна только с явным `--allow-s3`; в приёмке #1510
+этот флаг не используется. Заслонка сама возвращает S3 в S2 через максимум 6 ч.
+
+Запуск под внешним supervisor (первый запуск или восстановление после ошибки):
+
+```bash
+docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace run --benchmark-at-boundaries
+```
+
+`run` не удаляет `measurement.off`, не начинает завершённый замер, возвращает 0
+при явном стопе/завершении и ненулевой код при ошибке. Второй процесс отклоняется
+lock без изменения заслонки владельца. Только явные `start`/`resume` удаляют
+стоп-файл этого замера. Первоначальный ручной запуск:
+
+```bash
+docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace start --benchmark-at-boundaries
+```
+
+Статус и основной способ остановки:
+
+```bash
+docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace status --format json
+docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace stop
+```
+
+После stop проверять status до `stopped`/`failed`/`complete`: уже начатые HTTP и
+последовательные записи должны закончиться. Контроллер возвращает потолок к
+последней полностью принятой ступени (изначально S0), сохраняя все hold/cooldown.
+Не заменять этот протокол убийством host-процесса `docker exec`: оно не гарантирует
+передачу сигнала Python внутри контейнера. Connect/read timeout — 5/20 с;
+ожидания разрешения/повтора проверяют стоп каждые 0,25 с. Read timeout — предел
+бездействия чтения, не общий wall-clock deadline; длительность текущей записи
+Trino также не ограничена этим числом. Supervisor должен ждать подтверждённого
+дренажа; `TimeoutStopSec=infinity` с контролем статуса не обрывает commit.
+
+Явное возобновление после принятого стопа:
+
+```bash
+docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace resume --benchmark-at-boundaries
+```
+
+Прикладной пример выделенной host-службы (после приёмки кода, не из feature-tree):
+
+```bash
+systemd-run --unit=espn-1510-measure --property=Restart=on-failure --property=RestartSec=15s --property=TimeoutStopSec=infinity --property='ExecStop=/usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace stop' /usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace run --benchmark-at-boundaries
+```
+
+Сначала выполнить модульный stop и дождаться завершения внутри контейнера,
+затем останавливать host-службу. `ExecStop` — страховка установки постоянного
+флага, не синхронное ожидание внутренних workers. Автодоставка может заменить
+контейнер; service restart выполнит `run` на новом установленном модуле, общий
+lock/state сохраняется в томе, разрыв наблюдений сбросит окно.
+
+`--benchmark-at-boundaries` запускает изолированный стенд после квалификации
+каждой S0/S1/S2. Все сетевые workers сначала дренируются, следующие сетевые окна
+начинаются после стенда. Первые 20 ID и точные content-addressed payloads
+фиксируются в `benchmark-sample.json` и одинаковы на всех ступенях. Стенд создаёт
+уникальную схему `iceberg.espn_pace_bench_<uuid>` с теми же четырьмя схемами таблиц
+и partition_spec, вызывает штатный `write_tournament_batch` (три последовательных
+повтора) и проверяет число строк. Удаляются только таблицы/схема своего запуска.
+Ошибка стенда остаётся в событиях/отчёте, производственного fallback нет.
+
+Отдельный стенд допустим только после остановки/завершения контроллера (тот же
+lock) и после записи локальных Summary замером:
+
+```bash
+docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace benchmark --benchmark-count 20
+```
+
+Полезная история сохраняет длительности каждой последовательной Bronze-пачки
+отдельно. Пустая очередь означает «нет замера записи»; результат изолированного
+стенда помечен отдельно. Массовая производственная запись подтверждается в #1511.
+
+Зависимости runtime: установленный ESPN release; существующие Trino/S3/Iceberg
+настройки scheduler для штатного writer; доступ на создание/удаление собственных
+benchmark-схем и публикацию ops-журналов; requests, pyarrow, pandas, Trino/PyIceberg
+из того же образа; доступ на запись в espn_live_state. HTTP_PROXY/HTTPS_PROXY/
+ALL_PROXY должны отсутствовать. Все caller-процессы должны разрешать потолок >=S2;
+отсутствующий ESPN_GATE_STEP_CEILING разрешает policy max, но реальная ступень
+по-прежнему только подтверждённая общая. `--expected-ids-sha256` может дополнительно
+проверять SHA256 компактного JSON-массива отсортированных ID (не SHA CSV-файла).
+
+Пакет накладки утренней сводки готовится отдельно в
+`/root/espn-deliveries/1510/summary/`: полная копия, diff, manifest SHA256,
+проверки уникальности якорей, backup и rollback. Живой файл меняется только после
+отдельного принятия конкретного SHA; изменение исходника другой сессией означает
+пересборку и повторную проверку пакета.

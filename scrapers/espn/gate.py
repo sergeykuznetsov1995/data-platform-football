@@ -487,6 +487,20 @@ class TransportGate:
             self._event(state, now, "step", "confirmed", decision.next_step)
             return decision
 
+    def lower_ceiling(self, ceiling: int, *, reason: str = "controller_stopped") -> dict:
+        """Relinquish an unproved step; this operation can never promote or lift protection."""
+        if type(ceiling) is not int or not 0 <= ceiling < len(self.policy.steps):
+            raise ValueError("invalid safe ceiling")
+        with self._state() as state:
+            now = self._now()
+            self._effective_step(state, now)
+            if ceiling < state["confirmed_ceiling"]:
+                state["confirmed_ceiling"] = ceiling
+                state["step"] = min(state["step"], ceiling)
+                state["s3_expires_at"] = None
+                self._event(state, now, "step", reason, state["step"])
+        return self.snapshot()
+
     def _history_closed(self, state, now: float) -> bool:
         return now < state["history_frozen_until"] or any(state["all_blocked"].values())
 
