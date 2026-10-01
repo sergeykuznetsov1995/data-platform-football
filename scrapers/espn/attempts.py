@@ -77,9 +77,17 @@ class AttemptJournal:
                        direct_bytes=direct_bytes, complete=bool(complete))
             db.execute('UPDATE attempts SET payload=?, dirty=1 WHERE id=?', (json.dumps(row), attempt_id))
 
-    def rows(self):
+    def rows(self, start=None, end=None):
+        where, args = [], []
+        for value, operator in ((start, ">="), (end, "<")):
+            if value is not None:
+                where.append("requested_at " + operator + " ?")
+                args.append(utc(value).isoformat())
+        sql = "SELECT payload FROM attempts"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         with self._db() as db:
-            return [json.loads(r[0]) for r in db.execute('SELECT payload FROM attempts ORDER BY requested_at, rowid')]
+            return [json.loads(r[0]) for r in db.execute(sql + " ORDER BY requested_at, rowid", args)]
 
     def coverage(self, start, end):
         """Local completeness only; PR B must additionally prove load/freshness."""

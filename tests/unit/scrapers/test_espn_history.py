@@ -607,3 +607,109 @@ def test_open_season_downloads_even_a_stored_final(conn) -> None:
 
     assert run.matches == 380 and key in client.network
     assert len(client.network) == 1 + 1 + 4 + 380
+
+
+def test_parallel_pending_limit_shrinks_without_queued_batch():
+    import threading
+    from scrapers.espn.parallel import bounded_fetch
+    from types import SimpleNamespace
+    release = threading.Event()
+    started = []
+    mutex = threading.Lock()
+    cap = [4]
+    clients = []
+    def factory(slot):
+        client = SimpleNamespace(slot=slot, flush=lambda: None)
+        clients.append(client)
+        return client
+    def fetch(client, item):
+        with mutex:
+            started.append(item)
+        if item:
+            assert release.wait(3)
+        return item
+    iterator = bounded_fetch(range(12), fetch, limit=lambda: cap[0], check=lambda: None,
+                             client_factory=factory)
+    item, _, _ = next(iterator)
+    assert item == 0
+    cap[0] = 1
+    assert len(started) <= 4
+    release.set()
+    results = [item] + [row[0] for row in iterator]
+    assert sorted(results) == list(range(12))
+    assert len(clients) == 4
+
+
+def test_parallel_stop_drains_successful_siblings_and_never_submits_remainder():
+    import threading
+    from types import SimpleNamespace
+    from scrapers.espn.parallel import bounded_fetch
+    stopped = threading.Event()
+    barrier = threading.Barrier(4)
+    started = []
+    def check():
+        if stopped.is_set():
+            raise history._Stop(history.STOPPED)
+    def fetch(client, item):
+        started.append(item)
+        barrier.wait(timeout=3)
+        if item == 0:
+            stopped.set()
+            raise LaneClosed('429 in sibling')
+        assert stopped.wait(3)
+        return item
+    results = []
+    with pytest.raises(history._Stop):
+        for result in bounded_fetch(range(400), fetch, limit=lambda: 4, check=check,
+                                    client_factory=lambda _: SimpleNamespace(flush=lambda: None)):
+            results.append(result)
+    assert sorted(started) == [0, 1, 2, 3]
+    assert sorted(item for item, result, error in results if error is None) == [1, 2, 3]
+    assert isinstance(next(error for _, _, error in results if error is not None), LaneClosed)
+
+
+def test_parallel_one_match_error_retains_every_other_result():
+    from types import SimpleNamespace
+    from scrapers.espn.parallel import bounded_fetch
+    def fetch(client, item):
+        if item == 2:
+            raise ValueError('broken match')
+        return item * 2
+    results = list(bounded_fetch(range(10), fetch, limit=lambda: 4, check=lambda: None,
+                                client_factory=lambda _: SimpleNamespace(flush=lambda: None)))
+    assert len(results) == 10
+    assert len([r for r in results if r[2] is None]) == 9
+    assert isinstance(next(r[2] for r in results if r[0] == 2), ValueError)
+
+
+def test_real_history_parallel_workers_write_on_main_thread(conn, tmp_path):
+    import threading
+    from types import SimpleNamespace
+    main_thread = threading.get_ident()
+    bodies = _eng_2015()
+    client = HistoryClient(bodies)
+    client.gate = SimpleNamespace(state_path=tmp_path / 'gate.json', snapshot=lambda: {'step': 2})
+    trino = HistoryTrino()
+    original_write = trino.insert_dataframe_atomic
+    def write(*args, **kwargs):
+        assert threading.get_ident() == main_thread
+        return original_write(*args, **kwargs)
+    trino.insert_dataframe_atomic = write
+    workers = []
+    def factory(slot, check):
+        worker = HistoryClient(bodies)
+        worker.hook = lambda _: check()
+        worker.close = lambda: None
+        workers.append(worker)
+        return worker
+    run = history.run_history(client=client, trino=trino, conn=conn,
+        denominator=load_denominator(), scope=(("eng.1", 2015),), run_id='parallel',
+        deadline=NOW + timedelta(minutes=12), now_fn=lambda: NOW, worker_client_factory=factory)
+    assert run.matches == 380
+    assert len(workers) == 4
+    assert len({id(worker.network) for worker in workers}) == 4
+    assert not _summaries(client)
+    from scrapers.espn.pace_store import PaceStore
+    timing = PaceStore(tmp_path / 'pace.sqlite3').rows('write', 0, NOW.timestamp())[0]
+    assert timing['matches'] == 380 and timing['step'] == 2
+    assert 0 <= timing['write_seconds'] <= timing['batch_seconds']

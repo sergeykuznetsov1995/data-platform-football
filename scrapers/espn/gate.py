@@ -487,6 +487,45 @@ class TransportGate:
             self._event(state, now, "step", "confirmed", decision.next_step)
             return decision
 
+    def accept_s2(self, window, baseline_p95_ms, *, expected_revision: int) -> Decision:
+        """Persist final S2 acceptance at one atomic gate-lock linearization point.
+
+        The caller collects fresh SQL evidence first. A concurrent reset,
+        effective-step change or protection invalidates that evidence here;
+        acceptance cannot lift a hold or promote the gate to S3.
+        """
+        with self._state() as state:
+            now = self._now()
+            step = self._effective_step(state, now)
+            if expected_revision != state["revision"]:
+                return Decision(False, "stale_revision", None)
+            if now < max(state["hold_until"], state["cooldown_until"], state["history_frozen_until"]) or any(state["all_blocked"].values()):
+                return Decision(False, "protection_active", None)
+            if window.step != 2 or step != 2 or state["confirmed_ceiling"] != 2:
+                return Decision(False, "final_step_mismatch", None)
+            start, end = utc(window.started_at).timestamp(), utc(window.ended_at).timestamp()
+            if start < state["measurement_started_at"] or end > now or now - end > self.policy.pace.decision_max_age_seconds:
+                return Decision(False, "stale_window", None)
+            decision = evaluate(window, baseline_p95_ms, self.policy)
+            if not decision.eligible:
+                return decision
+            self._event(state, now, "accepted", "accepted_s2", 2)
+            return Decision(True, "accepted_s2", 2)
+
+    def lower_ceiling(self, ceiling: int, *, reason: str = "controller_stopped") -> dict:
+        """Relinquish an unproved step; this operation can never promote or lift protection."""
+        if type(ceiling) is not int or not 0 <= ceiling < len(self.policy.steps):
+            raise ValueError("invalid safe ceiling")
+        with self._state() as state:
+            now = self._now()
+            self._effective_step(state, now)
+            if ceiling < state["confirmed_ceiling"]:
+                state["confirmed_ceiling"] = ceiling
+                state["step"] = min(state["step"], ceiling)
+                state["s3_expires_at"] = None
+                self._event(state, now, "step", reason, state["step"])
+        return self.snapshot()
+
     def _history_closed(self, state, now: float) -> bool:
         return now < state["history_frozen_until"] or any(state["all_blocked"].values())
 

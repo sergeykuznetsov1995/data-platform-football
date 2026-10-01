@@ -157,6 +157,7 @@ class EspnHttpClient:
         run_id: Optional[str] = None,
         task_id: Optional[str] = None,
         measurement_id: Optional[str] = None,
+        before_attempt: Optional[Callable[[], None]] = None,
     ) -> None:
         environment = os.environ if environ is None else environ
         proxy_names = sorted(
@@ -227,6 +228,7 @@ class EspnHttpClient:
         self.run_id = run_id or environment.get("AIRFLOW_CTX_DAG_RUN_ID") or uuid.uuid4().hex
         self.task_id = task_id or environment.get("AIRFLOW_CTX_TASK_ID") or "unknown"
         self.measurement_id = measurement_id
+        self.before_attempt = before_attempt
         self._ledger: list[RequestLedgerEntry] = []
         self._lock = threading.RLock()
 
@@ -245,6 +247,23 @@ class EspnHttpClient:
 
     def close(self) -> None:
         self.raw_writer.close()
+
+    def worker(self, *, before_attempt=None, sleep_fn=None):
+        """Independent Session, ledger and raw queue on the same VM gate/spool."""
+        gate = TransportGate(
+            policy=self.gate.policy, state_path=self.gate.state_path, lane=self.lane,
+            step_ceiling=self.gate.step_ceiling, utcnow_fn=self.gate.utcnow_fn,
+            sleep_fn=sleep_fn or self.gate.sleep_fn,
+        )
+        return EspnHttpClient(
+            EspnRawStore(self.raw_store.filesystem, self.raw_store.root,
+                         uri_prefix=self.raw_store.uri_prefix),
+            gate=gate, connect_timeout=self.connect_timeout, read_timeout=self.read_timeout,
+            response_cap_bytes=self.response_cap_bytes, max_attempts=self.max_attempts,
+            sleep_fn=sleep_fn or self.sleep_fn, monotonic_fn=self.monotonic_fn,
+            utcnow_fn=self.utcnow_fn, run_id=self.run_id, task_id=self.task_id,
+            measurement_id=self.measurement_id, before_attempt=before_attempt,
+        )
 
     def _append_ledger(self, entry: RequestLedgerEntry) -> RequestLedgerEntry:
         if entry.proxy_bytes != 0:
@@ -296,6 +315,8 @@ class EspnHttpClient:
         )
 
     def _http_attempt(self, permit, request_url, endpoint, tries):
+        if self.before_attempt is not None:
+            self.before_attempt()
         attempt_id = self.attempt_journal.begin(
             run_id=self.run_id, task_id=self.task_id, requested_at=self.utcnow_fn(),
             origin=permit.origin, endpoint=endpoint, lane=permit.lane,
@@ -466,6 +487,8 @@ class EspnHttpClient:
         tries = _Attempts(self._now_iso())
         last_error = ""
         while tries.count < self.max_attempts:
+            if self.before_attempt is not None:
+                self.before_attempt()
             try:
                 permit = self.gate.acquire(cluster)
             except (LaneClosed, AllOriginsBlocked, DailyCapExceeded) as exc:

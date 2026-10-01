@@ -920,3 +920,40 @@ def test_response_close_failure_still_reports_429_once(monkeypatch, tmp_path):
     assert len(client.gate.snapshot()['resets']) == 1
     row, = client.attempt_journal.rows()
     assert row['status'] == 429 and not row['complete']
+
+
+def test_pre_attempt_rechecks_stop_after_wait_before_http(tmp_path, monkeypatch):
+    _clear_proxy_env(monkeypatch)
+    gate = _gate(tmp_path)
+    session = FakeSession([FakeResponse(200, b'{}')])
+    client = EspnHttpClient(EspnRawStore.from_uri(tmp_path.as_uri()), gate=gate, session=session)
+    checks = []
+    def check():
+        checks.append(1)
+        if len(checks) == 2:
+            raise RuntimeError('deadline after permit wait')
+    client.before_attempt = check
+    with pytest.raises(RuntimeError, match='deadline'):
+        client.fetch_json(WEB + '/apis/site/v2/sports/soccer/eng.1/summary', 'summary', {'event': 1})
+    assert session.calls == []
+    assert client.attempt_journal.rows() == []
+    client.close()
+
+
+def test_worker_has_own_session_ledger_queue_but_shared_gate_and_spool(tmp_path, monkeypatch):
+    _clear_proxy_env(monkeypatch)
+    gate = _gate(tmp_path)
+    client = EspnHttpClient(EspnRawStore.from_uri(tmp_path.as_uri()), gate=gate)
+    worker = client.worker()
+    try:
+        assert worker.session is not client.session
+        assert worker.raw_writer is not client.raw_writer
+        assert worker._ledger is not client._ledger
+        assert worker.gate is not client.gate
+        assert worker.gate.state_path == client.gate.state_path
+        assert worker.attempt_journal.path == client.attempt_journal.path
+    finally:
+        worker.close()
+        worker.session.close()
+        client.close()
+        client.session.close()
