@@ -78,7 +78,7 @@ class TestFBrefBootstrapTopology:
         # 20-wave cap rather than reviving the stale 80-wave contract.
         assert live.op_kwargs["max_batches"] == 20
         # A slow 20-wave run can outlast the six-hour subprocess wait, so the
-        # bootstrap uses the same wall-clock budget as ingest.
+        # bootstrap retains its previous 5.5-hour budget independently of ingest.
         assert live.op_kwargs["deadline_seconds"] == 19800
 
     def test_dedicated_pool_is_created_idempotently(self):

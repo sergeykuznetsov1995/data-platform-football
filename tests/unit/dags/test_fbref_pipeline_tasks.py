@@ -3841,7 +3841,7 @@ def test_history_window_guard_refuses_a_run_that_would_reach_0600z():
 
     from airflow.exceptions import AirflowFailException
 
-    with pytest.raises(AirflowFailException, match="daily ingest window"):
+    with pytest.raises(AirflowFailException, match="next ingest window"):
         fbref_pipeline_tasks.guard_fbref_history_window(
             max_batches=8,
             shard_size=1,
@@ -3856,13 +3856,13 @@ def test_history_window_guard_passes_a_small_evening_run():
     verdict = fbref_pipeline_tasks.guard_fbref_history_window(
         max_batches=8,
         shard_size=1,
-        now=datetime(2026, 8, 12, 22, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 12, 22, 30, tzinfo=timezone.utc),
     )
 
     assert verdict["pages"] == 8
     # 30 минут накладных + ceil(8 * 6.1 / 60) = 31 минута
     assert verdict["projected_minutes"] == 31
-    assert verdict["deadline"] == "2026-08-13T05:15:00+00:00"
+    assert verdict["deadline"] == "2026-08-12T23:15:00+00:00"
 
 
 @pytest.mark.unit
@@ -4015,3 +4015,71 @@ def test_finalizer_keeps_a_nonpublishing_run_red_when_validation_failed(
         )
 
     release.assert_called_once()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("hour", [0, 6, 12, 18])
+@pytest.mark.parametrize("offset_seconds", [0, 60, 10800, 16199])
+def test_history_guard_blocks_active_reserved_windows(hour, offset_seconds):
+    from datetime import timedelta
+    from airflow.exceptions import AirflowFailException
+
+    start = datetime(2026, 10, 1, hour, tzinfo=timezone.utc)
+    with pytest.raises(AirflowFailException, match="reserved ingest window"):
+        fbref_pipeline_tasks.guard_fbref_history_window(
+            max_batches=1, shard_size=1, overhead_minutes=0,
+            now=start + timedelta(seconds=offset_seconds),
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("hour", [0, 12, 18])
+def test_history_guard_opens_at_small_reservation_end(hour):
+    from datetime import timedelta
+
+    start = datetime(2026, 10, 1, hour, tzinfo=timezone.utc)
+    verdict = fbref_pipeline_tasks.guard_fbref_history_window(
+        max_batches=1, shard_size=1, overhead_minutes=0,
+        now=start + timedelta(hours=4, minutes=30),
+    )
+    assert verdict["ingest_window_start"] == (start + timedelta(hours=6)).isoformat()
+    assert verdict["deadline"] == (start + timedelta(hours=5, minutes=15)).isoformat()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("at", ["2026-10-01T11:59:59+00:00", "2026-10-01T12:00:00+00:00"])
+def test_history_guard_large_reservation_joins_noon_window(at):
+    from airflow.exceptions import AirflowFailException
+
+    with pytest.raises(AirflowFailException, match="reserved ingest window"):
+        fbref_pipeline_tasks.guard_fbref_history_window(
+            max_batches=1, shard_size=1, overhead_minutes=0,
+            now=datetime.fromisoformat(at),
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("hour", [0, 12, 18])
+def test_history_guard_next_window_deadline_exact_boundary(hour):
+    from datetime import timedelta
+    from airflow.exceptions import AirflowFailException
+
+    start = datetime(2026, 10, 1, hour, tzinfo=timezone.utc)
+    last_start = start + timedelta(hours=5, minutes=14)
+    kwargs = dict(max_batches=1, shard_size=1, overhead_minutes=0)
+    verdict = fbref_pipeline_tasks.guard_fbref_history_window(now=last_start, **kwargs)
+    assert verdict["projected_end"] == verdict["deadline"]
+    with pytest.raises(AirflowFailException, match="next ingest window"):
+        fbref_pipeline_tasks.guard_fbref_history_window(
+            now=last_start + timedelta(seconds=1), **kwargs
+        )
+
+
+@pytest.mark.unit
+def test_history_guard_normalizes_utc_and_rolls_day():
+    verdict = fbref_pipeline_tasks.guard_fbref_history_window(
+        max_batches=1, shard_size=1, overhead_minutes=0,
+        now=datetime.fromisoformat("2026-10-02T00:30:00+02:00"),
+    )
+    assert verdict["ingest_window_start"] == "2026-10-02T00:00:00+00:00"
+    assert verdict["deadline"] == "2026-10-01T23:15:00+00:00"
