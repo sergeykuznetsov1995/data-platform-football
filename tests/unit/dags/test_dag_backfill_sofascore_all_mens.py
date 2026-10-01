@@ -259,6 +259,7 @@ def test_finalize_remembers_failed_scopes_by_map_index(monkeypatch):
             "reason": "scope result is unreadable",
             "source_requests": None,
             "release": "unknown",
+            "season_identity": None,
         },
     )]
     # The memory lives next to the completed-state file.
@@ -308,6 +309,7 @@ def test_finalize_remembers_a_scope_whose_validation_failed(monkeypatch):
         "reason": "scope result is unreadable",
         "source_requests": None,
         "release": "unknown",
+        "season_identity": None,
     }]
 
 
@@ -333,7 +335,8 @@ def test_finalize_passes_the_scope_result_reason_traffic_and_release(
         ],
     }))
     planned = [{**_capture_env("c:8:825"),
-                "SOFASCORE_SCOPE_RESULT_PATH": str(result)}]
+                "SOFASCORE_SCOPE_RESULT_PATH": str(result),
+                "SOFASCORE_SEASON_ALIGNMENT_IDENTITY": "season-input-identity"}]
     marked = []
     monkeypatch.setattr(
         module.state, "mark_failed", lambda path, **kw: marked.append(kw)
@@ -365,6 +368,7 @@ def test_finalize_passes_the_scope_result_reason_traffic_and_release(
         # source_request_count where the phase has it, request_count otherwise.
         "source_requests": 0,
         "release": "1a3d9890",
+        "season_identity": "season-input-identity",
     }]
 
 
@@ -378,7 +382,8 @@ def test_finalize_counts_paid_phases_as_traffic(monkeypatch, tmp_path):
         "phases": [{"phase": "season", "source_request_count": 5}],
     }))
     planned = [{**_capture_env("c:8:825"),
-                "SOFASCORE_SCOPE_RESULT_PATH": str(result)}]
+                "SOFASCORE_SCOPE_RESULT_PATH": str(result),
+                "SOFASCORE_SEASON_ALIGNMENT_IDENTITY": "season-input-identity"}]
     marked = []
     monkeypatch.setattr(
         module.state, "mark_failed", lambda path, **kw: marked.append(kw)

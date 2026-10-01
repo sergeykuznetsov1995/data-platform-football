@@ -48,9 +48,9 @@ DEFAULT_PARK_COOLDOWN_HOURS = 24
 # requests with the same reason is not unlucky, it is deterministic: the same
 # stored raw replays into the same error for free, and a park only thinned
 # that to once a day (291:84027 — 25 attempts, #1351, урок 101).  Such a scope
-# is quarantined: never planned again on the same release, and the deeper
-# seasons of its tournament do not wait behind it.  A new release lifts it for
-# one attempt; a manual lift removes its entry from failures.json.
+# is quarantined and does not block deeper seasons. Season mismatches wait
+# for a relevant mapping/contract change; other errors get one attempt per
+# release. A manual lift removes the entry from failures.json.
 QUARANTINE_REASON_CHARS = 200
 UNKNOWN_RELEASE = "unknown"
 # #1358: only an upper bound on the number of scopes; the 2 h window decides
@@ -328,6 +328,29 @@ def rejects_await_release(attempts: Mapping[str, Any], release: str) -> bool:
     return rejected > 0 and attempts.get("last_release") != release
 
 
+# Bump only when season identity validation/selection changes, not each release.
+SEASON_ALIGNMENT_CONTRACT_VERSION = 1
+
+
+def season_alignment_identity(tournament_id: int, season: Mapping[str, Any]) -> str:
+    """Identity of the inputs that can repair a deterministic season mismatch."""
+    return hashlib.sha256(json.dumps({
+        "contract": SEASON_ALIGNMENT_CONTRACT_VERSION,
+        "tournament_id": int(tournament_id),
+        "source_season_id": int(season["source_season_id"]),
+        "canonical_season": str(season["canonical_season"]),
+        "season_format": str(season.get("season_format") or ""),
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _quarantine_applies(attempts: Mapping[str, Any], release: str,
+                        season_identity: str) -> bool:
+    if "season_mismatch:" in str(attempts.get("last_reason") or ""):
+        # Legacy records get one attempt to establish their input identity.
+        return attempts.get("season_alignment_identity") == season_identity
+    return attempts.get("last_release") == release
+
+
 def is_quarantined_record(attempts: Mapping[str, Any], max_scope_attempts: int) -> bool:
     """Failure record whose no-traffic streak reached the attempt ceiling."""
 
@@ -441,8 +464,9 @@ def plan_historical_batch(
 
     A scope whose ``streak_no_traffic`` reached ``max_scope_attempts`` is
     quarantined instead (see ``QUARANTINE_REASON_CHARS``): not planned while
-    its ``last_release`` is the running ``release`` (default: from the
-    environment), and its tournament's deeper seasons are planned past it.
+    its relevant season mapping/validation contract is unchanged for
+    ``season_mismatch``, or its release is unchanged for other failures.
+    Its tournament's deeper seasons are planned past it.
 
     ``task_env`` is the lane's own environment (gateway URL, rate limit) and
     is forwarded verbatim to every planned task; campaign keys win over it.
@@ -532,7 +556,10 @@ def plan_historical_batch(
                 )
                 if key in completed_keys and not replay_rejects:
                     kind = "completed"
-                elif quarantine_record and attempts.get("last_release") == release:
+                elif quarantine_record and _quarantine_applies(
+                    attempts, release,
+                    season_alignment_identity(int(tournament["unique_tournament_id"]), season),
+                ):
                     kind = "quarantined"
                     logger.warning(
                         "campaign scope %s quarantined after %s free identical "
@@ -541,9 +568,9 @@ def plan_historical_batch(
                         attempts.get("last_reason"),
                     )
                 elif (
-                    # A quarantine from an older release is lifted: the new
-                    # release may carry the fix, so ONE attempt past the park;
-                    # the same free outcome quarantines it again.
+                    # Changed relevant inputs (or release for other errors)
+                    # grant ONE attempt past the park; the same free outcome
+                    # quarantines it again.
                     not quarantine_record
                     and int(attempts.get("count", 0)) >= max_scope_attempts
                     and not park_has_cooled(attempts, moment, park_cooldown_hours)
@@ -657,6 +684,7 @@ def _scope_task_env(
         "SOFASCORE_EXPECTED_CAMPAIGN_ID": campaign_id,
         "SOFASCORE_TOURNAMENT_ID": str(tournament_id),
         "SOFASCORE_SOURCE_SEASON_ID": str(season_id),
+        "SOFASCORE_SEASON_ALIGNMENT_IDENTITY": season_alignment_identity(tournament_id, season),
         "SOFASCORE_CANONICAL_SEASON": str(season["canonical_season"]),
         "SOFASCORE_SCOPE_KEY": scope_key,
         "SOFASCORE_SCOPE_RESULT_PATH": str(Path(result_dir) / f"{safe_run}.json"),
@@ -759,12 +787,12 @@ def plan_refresh_batch(
     # Campaign partitions are keyed ``SS-<unique_tournament_id>``.
     excluded_tournament_ids = frozenset(int(value) for value in exclude_tournament_ids)
     configured_keys = {f"SS-{value}" for value in excluded_tournament_ids}
-    index: dict[tuple[str, str], tuple[int, Mapping[str, Any]]] = {}
+    index: dict[tuple[str, str, int], tuple[int, Mapping[str, Any]]] = {}
     for tournament_id, capture_key, seasons in _refresh_snapshot_tournaments(snapshot):
         for season, _season_id, _start_year, canonical in _refresh_snapshot_seasons(
             tournament_id, seasons, require_start_year=False
         ):
-            index[(capture_key, canonical)] = (tournament_id, season)
+            index[(capture_key, canonical, _season_id)] = (tournament_id, season)
     candidates: list[
         tuple[str, str, int, int | None, int, Mapping[str, Any], int, int]
     ] = []
@@ -777,7 +805,14 @@ def plan_refresh_batch(
         canonical = str(canonical)
         if league in configured_keys:
             continue
-        entry = index.get((league, canonical))
+        native_season = row[5] if len(row) > 5 else None
+        if native_season is not None:
+            entry = index.get((league, canonical, int(native_season)))
+        else:
+            # Old callers lack native identity: accept only an unambiguous map.
+            matches = [value for key, value in index.items()
+                       if key[:2] == (league, canonical)]
+            entry = matches[0] if len(matches) == 1 else None
         if entry is None:
             logger.warning(
                 "refresh partition %s/%s (%s pending) is not a ready snapshot "
@@ -839,7 +874,7 @@ def plan_refresh_batch(
         key=lambda item: (item[6], -(item[2] - item[7]), item[0], item[1]),
     )
     entries: list[tuple[tuple, str, int]] = []
-    opened: set[tuple[str, str]] = set()
+    opened: set[tuple[str, str, int]] = set()
     left = scope_budget_s
     closed = False
     headroom = refresh_timeout_headroom(seconds_per_match)
@@ -894,7 +929,7 @@ def plan_refresh_batch(
                 )
                 closed = True
                 break
-            key = (item[0], item[1])
+            key = (item[0], item[1], int(item[5]["source_season_id"]))
             wanted = item[7] if tier == "open" else item[2] - item[7]
             fits = _fit(item, min(wanted, scope_capacity))
             if fits is None:
@@ -1077,6 +1112,7 @@ def mark_failed(
     reason: str | None = None,
     source_requests: int | None = None,
     release: str = UNKNOWN_RELEASE,
+    season_identity: str | None = None,
 ) -> None:
     """Count one failed attempt and its no-progress streak.
 
@@ -1106,6 +1142,8 @@ def mark_failed(
             "last_reason": reason_text,
             "last_release": str(release),
         }
+        if season_identity is not None and "season_mismatch:" in reason_text:
+            attempts[str(scope_key)]["season_alignment_identity"] = str(season_identity)
         if previous.get("completed_rejected_endpoints"):
             # A failed replay of a completed scope keeps waiting for the next
             # release instead of losing its journaled rejects (#1352).

@@ -172,6 +172,7 @@ def _resolve_match_ids_from_bronze(
     league: str,
     season: str,
     limit: Optional[int],
+    source_season_id: int | None = None,
 ) -> List[str]:
     """Pull finished match ids straight from ``bronze.sofascore_schedule``.
 
@@ -194,12 +195,16 @@ def _resolve_match_ids_from_bronze(
             "FROM iceberg.bronze.sofascore_schedule "
             "WHERE league = ? AND CAST(season AS varchar) = ? "
             "  AND status_type = 'finished' "
-            "ORDER BY start_timestamp DESC"
+            + (" AND CAST(season_id AS bigint) = ? " if source_season_id is not None else "")
+            + "GROUP BY game_id ORDER BY max(start_timestamp) DESC"
         )
         if limit:
             # Trino dialect: LIMIT goes in SQL; bind params don't bind it.
             sql = sql + f" LIMIT {int(limit)}"
-        cur.execute(sql, (league, season))
+        params = (league, season) + (
+            (int(source_season_id),) if source_season_id is not None else ()
+        )
+        cur.execute(sql, params)
         rows = cur.fetchall()
         return [r[0] for r in rows if r and r[0]]
     except Exception as e:
@@ -1041,9 +1046,16 @@ def _run_match_capture(
     )
 
     try:
-        match_ids = _resolve_match_ids_from_bronze(league, season_short, None)
+        source_tournament_id, source_season_id = _source_context(
+            league, season, season_short
+        )
+        match_ids = _resolve_match_ids_from_bronze(
+            league, season_short, None, source_season_id=source_season_id
+        )
         if not match_ids and season_alias:
-            match_ids = _resolve_match_ids_from_bronze(league, season_alias, None)
+            match_ids = _resolve_match_ids_from_bronze(
+                league, season_alias, None, source_season_id=source_season_id
+            )
     except Exception as exc:
         message = f"Schedule match-id probe failed: {exc}"
         logger.error(message)
@@ -1161,9 +1173,6 @@ def _run_match_capture(
                 "bronze schedule has no finished event ids; refusing "
                 "browser/source fallback outside the common raw manifest"
             )
-        source_tournament_id, source_season_id = _source_context(
-            league, season, season_short
-        )
         # #1357: one manifest SELECT for the scope before the resume plan.
         from scrapers.sofascore.manifest import preload_manifest_scope
 

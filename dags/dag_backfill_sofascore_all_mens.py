@@ -210,6 +210,7 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
             reason=reason,
             source_requests=source_requests,
             release=release,
+            season_identity=environment.get("SOFASCORE_SEASON_ALIGNMENT_IDENTITY"),
         )
     did_work = bool(planned)
     target = datetime.now(timezone.utc) + (
