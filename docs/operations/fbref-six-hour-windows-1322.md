@@ -71,11 +71,10 @@ collisions during paused history is evidence that concurrent history is safe.
 
 Existing freshness/run validation accepts partial progress while still
 checking run health and scope evidence. Export remains immutable and keyed
-by control-run UUID. Silver is triggered after lock release with that UUID,
-without waiting. Four triggers per day do not introduce a daily identifier
-collision, but green Bronze does not prove green Silver. Before this change,
-the five latest Silver runs were already failed (25–32 minutes each, observed
-2026-10-01). Record Silver outcomes separately; fixing them is outside B.
+by control-run UUID. The owner confirmed on 2026-10-01 that FBref Silver will
+be handled separately. Step B and its acceptance cover Bronze collection;
+Silver execution, health, and queue measurements are not acceptance gates.
+The existing asynchronous trigger after lock release is unchanged by B.
 
 The #1327 watchdog's two consecutive red runs can now be adjacent windows
 six hours apart, rather than daily runs 24 hours apart.
@@ -97,9 +96,9 @@ Keep #1322 open until the issue's live criteria are measured over three days:
 
 For the 12 scheduled windows, record planned and actual starts/ends, selected
 profile, progress/batch count, `deadline_reached`, scope debt, errors, lock
-release, immutable publication generation and Silver trigger/run outcome.
-Check delay of the noon window after the large run and any Silver queue
-growth. A partial run may be healthy without meeting freshness acceptance.
+release and immutable publication generation. Check delay of the noon
+window after the large run. A partial run may be healthy without meeting
+freshness acceptance.
 Do not trigger, clear, or unpause live DAGs to manufacture acceptance.
 
 The separate delivery script must copy these three runtime modules together:
