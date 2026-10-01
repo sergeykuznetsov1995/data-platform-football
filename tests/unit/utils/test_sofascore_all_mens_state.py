@@ -1500,3 +1500,19 @@ def test_legacy_season_quarantine_gets_one_input_aware_attempt(tmp_path):
                 release='bbbbbbbb', season_identity=season_alignment_identity(
                     8, snapshot['tournaments'][1]['seasons'][0]))
     assert head not in _quarantine_plan(snapshot, path, release='cccccccc')
+
+
+@pytest.mark.parametrize('deadline,open_count', [(2000, 2), (None, 0)])
+def test_native_alias_ties_do_not_depend_on_pending_query_order(deadline, open_count):
+    snapshot = _refresh_snapshot()
+    tournament = snapshot['tournaments'][0]
+    first = tournament['seasons'][0]
+    tournament['seasons'].append({**first, 'source_season_id':1799})
+    unsigned = {key:value for key,value in snapshot.items() if key != 'snapshot_id'}
+    snapshot['snapshot_id'] = hashlib.sha256(json.dumps(
+        unsigned,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    rows = [('SS-17','2627',2,deadline,open_count,native) for native in (1726,1799)]
+    choices = [plan_refresh_batch(snapshot, pending, batch_size=1,
+               queue_mode='deadline',scope_budget_s=7200)[0]['SOFASCORE_SOURCE_SEASON_ID']
+               for pending in (rows,list(reversed(rows)))]
+    assert choices == ['1726','1726']

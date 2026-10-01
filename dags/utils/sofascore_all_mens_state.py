@@ -864,14 +864,14 @@ def plan_refresh_batch(
     # (Astra #1358/#1359 r3).
     open_tier = sorted(
         (item for item in candidates if item[3] is not None),
-        key=lambda item: (item[6], item[3], item[0], item[1]),
+        key=lambda item: (item[6], item[3], item[0], item[1], int(item[5]["source_season_id"])),
     )
     debt_tier = sorted(
         (
             item for item in candidates
             if item[2] > item[7] and (queue_mode == "deadline" or item[3] is None)
         ),
-        key=lambda item: (item[6], -(item[2] - item[7]), item[0], item[1]),
+        key=lambda item: (item[6], -(item[2] - item[7]), item[0], item[1], int(item[5]["source_season_id"])),
     )
     entries: list[tuple[tuple, str, int]] = []
     opened: set[tuple[str, str, int]] = set()
