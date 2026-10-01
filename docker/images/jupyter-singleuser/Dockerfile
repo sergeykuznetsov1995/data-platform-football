@@ -7,4 +7,5 @@ RUN pip install --no-cache-dir \
     "pyiceberg[pyarrow]==0.9.1" \
     pandas \
     matplotlib \
-    ipywidgets
+    ipywidgets \
+    "plotly>=7,<8"
