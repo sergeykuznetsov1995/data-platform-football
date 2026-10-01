@@ -1565,3 +1565,89 @@ def test_gateway_502_with_upstream_header_logs_the_class(monkeypatch, caplog):
     ]
     assert len(lines) == 1
     assert "HTTP 502 proxy_status=502 upstream_class=407" in lines[0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('run_cap', [15 * 1024**2, 24 * 1024**2, 80 * 1024**2])
+def test_scaled_discovery_budget_obeys_per_lease_gateway_cap(run_cap):
+    class BoundedProvider(_FakeLeaseProvider):
+        def acquire(self, *, max_bytes, **kwargs):
+            assert 0 < max_bytes <= SCOPE_HARD_PROVIDER_BYTE_CAP
+            return super().acquire(max_bytes=max_bytes, **kwargs)
+
+    provider = BoundedProvider([LeaseTrafficSnapshot(up_bytes=100, down_bytes=900)])
+    ledger = SharedTrafficLedger(
+        hard_provider_bytes=run_cap, soft_provider_bytes=run_cap - 1024,
+    )
+    client = TransfermarktHttpClient(
+        lease_provider=provider, traffic_ledger=ledger,
+        lease_metadata=_metadata(), client_factory=_TlsFactory([_Response(b'ok')]),
+        sleep_fn=lambda _: None,
+    )
+    try:
+        outcome = client.fetch('https://www.transfermarkt.com/a', as_json=False)
+        assert outcome.status is FetchStatus.OK
+        assert provider.acquired[0][0].max_bytes == min(run_cap, SCOPE_HARD_PROVIDER_BYTE_CAP)
+        assert ledger.remaining_hard_bytes == run_cap - 1000
+    finally:
+        client.close()
+
+
+@pytest.mark.unit
+def test_discovery_rotates_byte_bounded_lease_and_accounts_close_overhead():
+    cap = SCOPE_HARD_PROVIDER_BYTE_CAP
+    used = cap - PROVIDER_GRANT_SOFT_MARGIN_BYTES // 2
+
+    class ClosingProvider(_FakeLeaseProvider):
+        def stats(self, lease):
+            delta = self.snapshots.pop(0)
+            self.current = replace(self.current, down_bytes=self.current.down_bytes + delta.down_bytes)
+            return self.current
+
+        def close(self, lease):
+            self.current = replace(self.current, up_bytes=self.current.up_bytes + 50)
+            return super().close(lease)
+
+    provider = ClosingProvider([
+        LeaseTrafficSnapshot(down_bytes=used),
+        LeaseTrafficSnapshot(down_bytes=100),
+    ])
+    run_cap = cap + 8 * 1024**2
+    ledger = SharedTrafficLedger(
+        hard_provider_bytes=run_cap,
+        soft_provider_bytes=run_cap - PROVIDER_GRANT_SOFT_MARGIN_BYTES,
+    )
+    client = TransfermarktHttpClient(
+        lease_provider=provider, traffic_ledger=ledger,
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([_Response(b'a'), _Response(b'b')]),
+        sleep_fn=lambda _: None,
+    )
+    try:
+        for path in ('a', 'b'):
+            assert client.fetch(f'https://www.transfermarkt.com/{path}', as_json=False).status is FetchStatus.OK
+        assert len(provider.acquired) == 2
+        assert provider.closed == ['lease-1']
+        assert provider.acquired[1][0].max_bytes == run_cap - used - 50
+        assert ledger.provider_bytes == used + 50 + 100
+    finally:
+        client.close()
+    assert ledger.provider_bytes == used + 50 + 100 + 50
+
+
+@pytest.mark.unit
+def test_discovery_rejects_a_grant_above_gateway_cap():
+    class OversizedProvider(_FakeLeaseProvider):
+        def acquire(self, *, max_bytes, **kwargs):
+            return super().acquire(max_bytes=max_bytes + 1, **kwargs)
+
+    provider = OversizedProvider([])
+    client = TransfermarktHttpClient(
+        lease_provider=provider,
+        traffic_ledger=SharedTrafficLedger(hard_provider_bytes=80 * 1024**2, soft_provider_bytes=79 * 1024**2),
+        lease_metadata=_metadata(), client_factory=_TlsFactory([]),
+        sleep_fn=lambda _: None,
+    )
+    with pytest.raises(TrafficMeterError, match='per-lease cap'):
+        client.fetch('https://www.transfermarkt.com/a', as_json=False)
+    assert provider.closed == ['lease-1']

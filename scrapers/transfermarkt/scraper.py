@@ -2164,12 +2164,17 @@ class TransfermarktScraper(BaseScraper):
             elif soup.find('table', {'class': 'items'}) is None:
                 if (
                     label in ('listing', 'teilnehmer')
-                    and soup.find('table') is None
+                    and all(
+                        label == 'teilnehmer'
+                        and table.find('select', attrs={'name': 'saison_id'}) is not None
+                        for table in soup.find_all('table')
+                    )
                     and soup.find('a', href=_CLUB_HREF_RE) is None
                     and soup.find('link', rel='alternate') is not None
                 ):
-                    # Empty-shell competition page (#1025): no tables and no
-                    # club links anywhere. Accept the fetch so the caller can
+                    # Empty-shell competition page (#1025): no data tables
+                    # or club links. Participant pages may have a season
+                    # filter table (AFCN 2027). Accept the fetch so the caller can
                     # decide whether it is the authoritative empty listing
                     # for the requested competition.
                     return None

@@ -625,6 +625,7 @@ class TransfermarktHttpClient:
         self._lease_metadata = dict(lease_metadata or {})
         self._lease_ttl_seconds = max(1, int(lease_ttl_seconds))
         self._lease: Optional[ProxyLease] = None
+        self._lease_provider_bytes = 0
         self._lease_acquired_at: Optional[float] = None
         self._cache = cache
         if require_raw_store is None:
@@ -861,19 +862,20 @@ class TransfermarktHttpClient:
                     "Transfermarkt provider hard byte budget exhausted"
                 )
             self._lease_acquired_at = self._time()
+            self._lease_provider_bytes = 0
             self._lease = self._lease_provider.acquire(
-                max_bytes=remaining,
+                max_bytes=min(remaining, SCOPE_HARD_PROVIDER_BYTE_CAP),
                 ttl_seconds=self._lease_ttl_seconds,
                 metadata=metadata,
             )
-            if self._lease.max_bytes > remaining:
+            if self._lease.max_bytes > min(remaining, SCOPE_HARD_PROVIDER_BYTE_CAP):
                 lease = self._lease
                 self._lease = None
                 try:
                     self._lease_provider.close(lease)
                 finally:
                     raise TrafficMeterError(
-                        "proxy lease exceeds the shared remaining byte budget"
+                        "proxy lease exceeds the shared remaining byte budget or per-lease cap"
                     )
             proxy_url = self._lease_provider.authenticated_proxy_url(self._lease)
         elif self._proxy_manager is not None:
@@ -939,6 +941,19 @@ class TransfermarktHttpClient:
             and remaining < _LEASE_RENEW_BEFORE_SECONDS
         )
 
+    def _lease_near_byte_cap(self) -> bool:
+        # Discovery's run budget can span several gateway leases. Rotate
+        # before a bounded lease runs dry, keeping the run ledger intact.
+        # Do not rotate the final lease when it already covers the remaining
+        # run budget: that cannot buy additional headroom.
+        if self._lease is None:
+            return False
+        remaining = self._lease.max_bytes - self._lease_provider_bytes
+        return (
+            remaining <= PROVIDER_GRANT_SOFT_MARGIN_BYTES
+            and self._traffic_ledger.remaining_hard_bytes > remaining
+        )
+
     def _has_alternate_proxy(self, proxy_obj) -> bool:
         if self._lease_provider is not None:
             return self._traffic_ledger.remaining_hard_bytes > 0
@@ -979,6 +994,7 @@ class TransfermarktHttpClient:
         delta_up, delta_down = self._traffic_ledger.observe_lease(
             self._lease.lease_id, snapshot,
         )
+        self._lease_provider_bytes = snapshot.provider_bytes
         self._provider_up_bytes += delta_up
         self._provider_down_bytes += delta_down
         return delta_up, delta_down
@@ -1781,7 +1797,7 @@ class TransfermarktHttpClient:
                     label=label,
                     context=context,
                 )
-                if self._lease_expiring():
+                if self._lease_expiring() or self._lease_near_byte_cap():
                     # Planned rotation right before I/O: rate-limit and
                     # permit waits (up to 65 s) can outlast the lease
                     # remainder.  Permits are bound to the run and request,
