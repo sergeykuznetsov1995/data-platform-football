@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional
 
+from .pace import Decision, PacePolicy, evaluate, parse_pace_policy, utc
+
 from .transport_contracts import (
     AllOriginsBlocked,
     DailyCapExceeded,
@@ -66,6 +68,7 @@ _TOP_KEYS = {
     "lanes",
     "reset",
     "uncompressed_warn_bytes",
+    "pace",
 }
 _RESET_KEYS = {
     "http403_count",
@@ -93,6 +96,7 @@ class TransportPolicy:
     lanes: Mapping[str, Mapping[str, int]]
     reset: Mapping[str, float]
     uncompressed_warn_bytes: int
+    pace: PacePolicy
 
     def cluster_of(self, origin: str) -> str:
         normalized = normalize_transport_origin(origin)
@@ -186,6 +190,7 @@ def parse_transport_policy(raw: object) -> TransportPolicy:
             _positive_int(value, f"reset.{key}")
 
     return TransportPolicy(
+        pace=parse_pace_policy(doc["pace"]),
         clusters=clusters,
         origin_block_seconds=_positive_int(
             doc["origin_block_seconds"], "origin_block_seconds"
@@ -243,6 +248,11 @@ def _fresh_state() -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "step": None,
+        "confirmed_ceiling": 0,
+        "s3_expires_at": None,
+        "revision": 0,
+        "measurement_started_at": None,
+        "events": [],
         "cooldown_until": 0.0,
         "hold_until": 0.0,
         "history_frozen_until": 0.0,
@@ -277,7 +287,7 @@ class TransportGate:
         self.lane = lane
         self.state_path = Path(state_path) if state_path else default_state_path()
         if step_ceiling is None:
-            raw = os.environ.get(STEP_CEILING_ENV, "").strip() or "0"
+            raw = os.environ.get(STEP_CEILING_ENV, "").strip() or str(len(self.policy.steps) - 1)
             try:
                 step_ceiling = int(raw)
             except ValueError:
@@ -333,7 +343,12 @@ class TransportGate:
             return {
                 "step": step,
                 "rate_per_minute": self.policy.steps[step],
-                "step_ceiling": self.step_ceiling,
+                "step_ceiling": min(self.step_ceiling, state["confirmed_ceiling"]),
+                "confirmed_ceiling": state["confirmed_ceiling"],
+                "s3_expires_at": state["s3_expires_at"],
+                "revision": state["revision"],
+                "measurement_started_at": state["measurement_started_at"],
+                "events": list(state["events"]),
                 "cooldown_until": state["cooldown_until"],
                 "hold_until": state["hold_until"],
                 "history_frozen_until": state["history_frozen_until"],
@@ -414,12 +429,63 @@ class TransportGate:
             return self.policy.all_blocked_probe_seconds
         return self.policy.origin_probe_seconds
 
+    def _event(self, state, now, kind, reason, step):
+        state["revision"] += 1
+        state["measurement_started_at"] = now
+        state["events"].append({
+            "sequence": state["revision"], "at": now, "kind": kind,
+            "reason": reason, "step": step,
+        })
+
     def _effective_step(self, state, now: float) -> int:
+        if state["measurement_started_at"] is None:
+            self._event(state, now, "step", "initialized_s0", 0)
+        if state["confirmed_ceiling"] == 3 and (
+            state["s3_expires_at"] is None or now >= state["s3_expires_at"]
+        ):
+            state["confirmed_ceiling"] = 2
+            state["s3_expires_at"] = None
+            self._event(state, now, "step", "s3_expired", 2)
+        ceiling = min(self.step_ceiling, state["confirmed_ceiling"])
         if now < state["hold_until"]:
             return 0
-        if state["step"] is None or now >= state["cooldown_until"]:
-            state["step"] = self.step_ceiling
-        return min(state["step"], self.step_ceiling)
+        old_step = state["step"]
+        if old_step is None or now >= state["cooldown_until"]:
+            state["step"] = ceiling
+        step = min(state["step"], ceiling)
+        if old_step is not None and step != old_step:
+            state["step"] = step
+            self._event(state, now, "step", "effective_step_changed", step)
+        return step
+
+    def confirm(self, window, baseline_p95_ms, *, expected_revision: int) -> Decision:
+        """Re-evaluate and promote one step under the permit lock.
+
+        Snapshot BEFORE gathering evidence and pass its revision here. Resets,
+        expiry, recovery and competing confirmations invalidate old evidence.
+        """
+        with self._state() as state:
+            now = self._now()
+            step = self._effective_step(state, now)
+            if expected_revision != state["revision"]:
+                return Decision(False, "stale_revision", None)
+            if now < max(state["hold_until"], state["cooldown_until"], state["history_frozen_until"]) or any(state["all_blocked"].values()):
+                return Decision(False, "protection_active", None)
+            if window.step != step or step != state["confirmed_ceiling"]:
+                return Decision(False, "step_mismatch", None)
+            start, end = utc(window.started_at).timestamp(), utc(window.ended_at).timestamp()
+            if start < state["measurement_started_at"] or end > now or now - end > self.policy.pace.decision_max_age_seconds:
+                return Decision(False, "stale_window", None)
+            decision = evaluate(window, baseline_p95_ms, self.policy)
+            if not decision.eligible:
+                return decision
+            if decision.next_step > self.step_ceiling:
+                return Decision(False, "environment_ceiling", None)
+            state["confirmed_ceiling"] = decision.next_step
+            state["step"] = decision.next_step
+            state["s3_expires_at"] = now + self.policy.pace.s3_max_seconds if decision.next_step == 3 else None
+            self._event(state, now, "step", "confirmed", decision.next_step)
+            return decision
 
     def _history_closed(self, state, now: float) -> bool:
         return now < state["history_frozen_until"] or any(state["all_blocked"].values())
@@ -434,6 +500,7 @@ class TransportGate:
 
     def _try_acquire(self, state, cluster: str, now: float):
         self._cluster(cluster)
+        self._effective_step(state, now)  # expire S3 even while admission is blocked
         if self.lane == "history" and self._history_closed(state, now):
             raise LaneClosed("ESPN history lane is frozen")
         caps = self.policy.lanes[self.lane]
@@ -559,6 +626,7 @@ class TransportGate:
         state["history_frozen_until"] = max(state["history_frozen_until"], cooldown)
         window = now - reset_policy["double_reset_window_seconds"]
         state["resets"] = [t for t in state["resets"] if t > window] + [now]
+        self._event(state, now, "reset", reason, state["step"])
         logger.warning(
             "ESPN gate auto-reset (%s): step S%d, cooldown until %s",
             reason,
@@ -569,6 +637,7 @@ class TransportGate:
             hold = now + reset_policy["double_reset_hold_seconds"]
             state["step"] = 0
             state["hold_until"] = hold
+            self._event(state, now, "step", "double_reset_hold", 0)
             state["cooldown_until"] = max(state["cooldown_until"], hold)
             alert = {
                 "at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
@@ -592,9 +661,11 @@ class TransportGate:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             state = self._read_state()
             before = json.dumps(state, sort_keys=True)
-            yield state
-            if json.dumps(state, sort_keys=True) != before:
-                self._write_state(state)
+            try:
+                yield state
+            finally:
+                if json.dumps(state, sort_keys=True) != before:
+                    self._write_state(state)
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
@@ -607,6 +678,26 @@ class TransportGate:
             return _fresh_state()
         if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
             raise ValueError("ESPN gate state has an unknown format")
+        # Old gate files never confer a confirmed ceiling.
+        for key, value in _fresh_state().items():
+            state.setdefault(key, value)
+        ceiling = state["confirmed_ceiling"]
+        if type(ceiling) is not int or not 0 <= ceiling < min(4, len(self.policy.steps)):
+            raise ValueError("ESPN gate state has an invalid confirmed ceiling")
+        step = state["step"]
+        if step is not None and (type(step) is not int or not 0 <= step < len(self.policy.steps)):
+            raise ValueError("ESPN gate state has an invalid step")
+        if type(state["revision"]) is not int or state["revision"] < 0:
+            raise ValueError("ESPN gate state has an invalid revision")
+        if not isinstance(state["events"], list):
+            raise ValueError("ESPN gate state has invalid events")
+        for key in ("s3_expires_at", "measurement_started_at", "hold_until",
+                    "cooldown_until", "history_frozen_until", "next_permit_at"):
+            value = state[key]
+            if value is None and key in ("s3_expires_at", "measurement_started_at"):
+                continue
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"ESPN gate state has invalid {key}")
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
@@ -616,11 +707,21 @@ class TransportGate:
         payload = json.dumps(state, sort_keys=True, separators=(",", ":"))
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(descriptor, payload.encode("utf-8"))
+            remaining = memoryview(payload.encode("utf-8"))
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("ESPN gate state write made no progress")
+                remaining = remaining[written:]
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
         os.replace(temporary, self.state_path)
+        directory = os.open(self.state_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 __all__ = [

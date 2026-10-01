@@ -834,3 +834,89 @@ def test_raw_alias_versions_reject_mixed_provenance_schema(tmp_path):
     store._write_bytes(alias_key, (json.dumps(current_payload) + "\n").encode())
     with pytest.raises(RawTargetCorrupt, match="identity"):
         store.load(target)
+
+
+def test_attempt_measurement_excludes_gate_wait_retry_sleep_and_store(monkeypatch, tmp_path):
+    clock = GateClock()
+    gate = _gate(tmp_path, clock)
+    responses = [FakeResponse(502), FakeResponse(200, b'{}')]
+    client, session, _, _ = _client(monkeypatch, tmp_path, responses, gate=gate)
+    client.monotonic_fn = lambda: clock.now.timestamp()
+    base_get = session.get
+    def get(*args, **kwargs):
+        clock.sleep(0.2)
+        return base_get(*args, **kwargs)
+    session.get = get
+    client.sleep_fn = lambda seconds: clock.sleep(30)
+    for response in responses:
+        original_close = response.close
+        def close(original=original_close):
+            clock.sleep(0.1)
+            original()
+        response.close = close
+    result = client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    assert result.attempts == 2
+    rows = client.attempt_journal.rows()
+    assert [r['status'] for r in rows] == [502, 200]
+    assert [r['http_ms'] for r in rows] == pytest.approx([300, 300], abs=.01)
+    assert client.ledger[-1].latency_ms > 30000
+    client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    assert len(client.attempt_journal.rows()) == 2  # cache hit adds no attempt
+
+
+def test_attempt_timeout_and_retry_survive_client_restart(monkeypatch, tmp_path):
+    client, _, _, _ = _client(monkeypatch, tmp_path, [requests.Timeout('secret'), FakeResponse(200, b'{}')])
+    client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    restarted, _, _, _ = _client(monkeypatch, tmp_path, [])
+    rows = restarted.attempt_journal.rows()
+    assert len(rows) == 2 and rows[0]['timeout'] and rows[0]['status'] is None
+    assert rows[1]['status'] == 200
+    assert all(r['complete'] for r in rows)
+    assert 'secret' not in json.dumps(rows)
+
+
+def test_failed_attempt_completion_does_not_disable_auto_reset(monkeypatch, tmp_path):
+    client, _, _, _ = _client(monkeypatch, tmp_path, [FakeResponse(429)])
+    def broken(*args, **kwargs): raise OSError('disk full')
+    monkeypatch.setattr(client.attempt_journal, 'finish', broken)
+    with pytest.raises(OSError, match='disk full'):
+        client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    assert client.gate.snapshot()['resets']
+    assert not client.attempt_journal.rows()[0]['complete']
+
+
+def test_partial_200_non_timeout_read_failure_is_incomplete_evidence(monkeypatch, tmp_path):
+    class BrokenBody:
+        def __init__(self): self.calls = 0
+        def read(self, size):
+            self.calls += 1
+            if self.calls == 1: return b'{"partial":'
+            raise requests.ConnectionError('private error detail')
+    response = FakeResponse(200)
+    response.raw = BrokenBody()
+    client, _, _, _ = _client(monkeypatch, tmp_path, [response])
+    start = client.utcnow_fn()
+    with pytest.raises(DirectTransportError):
+        client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    row, = client.attempt_journal.rows()
+    assert row['status'] == 200 and not row['timeout']
+    assert not row['complete'] and row['direct_bytes'] == len(b'{"partial":')
+    assert not client.attempt_journal.coverage(start, start+timedelta(minutes=1))
+    from tests.unit.scrapers.test_espn_pace_report import Connection, query
+    from scrapers.espn.pace_report import render_attempt_sql
+    conn = Connection(); client.flush_attempts(conn)
+    evidence, = query(conn, render_attempt_sql(start, start+timedelta(minutes=1)))
+    assert evidence[-1] == 1
+    assert 'private' not in json.dumps(row)
+
+
+def test_response_close_failure_still_reports_429_once(monkeypatch, tmp_path):
+    response = FakeResponse(429)
+    def broken_close(): raise requests.ConnectionError('close failed')
+    response.close = broken_close
+    client, _, _, _ = _client(monkeypatch, tmp_path, [response])
+    with pytest.raises(DirectTransportError):
+        client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary', 'summary', params={'event': '1'})
+    assert len(client.gate.snapshot()['resets']) == 1
+    row, = client.attempt_journal.rows()
+    assert row['status'] == 429 and not row['complete']

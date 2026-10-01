@@ -14,11 +14,20 @@
   "reserve_probe_seconds": 86400,
   "all_blocked_pause_seconds": 1800,
   "all_blocked_probe_seconds": 300,
-  "steps": [60, 120, 240, 360],
+  "steps": [
+    60,
+    120,
+    240,
+    360
+  ],
   "live_share": 0.5,
   "lanes": {
-    "live": {"daily_requests": 259200},
-    "history": {"daily_requests": 518400}
+    "live": {
+      "daily_requests": 259200
+    },
+    "history": {
+      "daily_requests": 518400
+    }
   },
   "reset": {
     "http403_count": 3,
@@ -30,5 +39,20 @@
     "double_reset_window_seconds": 3600,
     "double_reset_hold_seconds": 21600
   },
-  "uncompressed_warn_bytes": 102400
+  "uncompressed_warn_bytes": 102400,
+  "pace": {
+    "minimum_window_seconds": [
+      7200,
+      86400,
+      86400
+    ],
+    "s3_max_seconds": 21600,
+    "error_share": 0.005,
+    "http_p95_limit_ms": 1500,
+    "baseline_ratio": 1.5,
+    "load_interval_seconds": 300,
+    "history_quota_fraction": 0.8,
+    "loaded_interval_fraction": 0.9,
+    "decision_max_age_seconds": 300
+  }
 }
