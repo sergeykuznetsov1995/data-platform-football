@@ -535,12 +535,13 @@ docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace r
 Прикладной пример выделенной host-службы (после приёмки кода, не из feature-tree):
 
 ```bash
-systemd-run --unit=espn-1510-measure --property=Restart=on-failure --property=RestartSec=15s --property=TimeoutStopSec=infinity --property='ExecStop=/usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace stop' /usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace run --benchmark-at-boundaries
+systemd-run --unit=espn-1510-measure --property=Restart=on-failure --property=RestartSec=15s --property=TimeoutStopSec=infinity /usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace run --benchmark-at-boundaries
 ```
 
 Сначала выполнить модульный stop и дождаться завершения внутри контейнера,
-затем останавливать host-службу. `ExecStop` — страховка установки постоянного
-флага, не синхронное ожидание внутренних workers. Автодоставка может заменить
+затем останавливать host-службу. Не добавлять `ExecStop` с постоянным stop-флагом:
+этот hook выполняется также перед автоматическим restart и остановит восстановление.
+Сигнал host-процессу `docker exec` не гарантирует сигнал Python в контейнере. Автодоставка может заменить
 контейнер; service restart выполнит `run` на новом установленном модуле, общий
 lock/state сохраняется в томе, разрыв наблюдений сбросит окно.
 

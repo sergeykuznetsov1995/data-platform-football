@@ -412,3 +412,51 @@ def test_checkout_wrapper_help_from_arbitrary_directory(tmp_path):
     assert result.returncode == 0, result.stderr
     assert 'benchmark-at-boundaries' in result.stdout
     assert 'run,start,resume,status,stop,benchmark' in result.stdout
+
+
+@pytest.mark.parametrize('protection', ['reset', 'history_freeze'])
+def test_final_acceptance_rechecks_gate_atomically_after_freshness_sql(controller, protection):
+    c = controller
+    for _ in range(2):
+        fill_window(c)
+        c.decide()
+    fill_window(c, 86400)
+    original_query = c.trino.execute_query
+    def freshness_with_concurrent_protection(sql, *args):
+        result = original_query(sql, *args)
+        if 'AS deadline' in sql:
+            if protection == 'reset':
+                c.gate.report(c.gate.acquire('core'), status=429)
+            else:
+                with c.gate._state() as state:
+                    state['history_frozen_until'] = c.clock().timestamp() + 1800
+        return result
+    c.trino.execute_query = freshness_with_concurrent_protection
+    report = c.decide()
+    assert report['reason'] in ('stale_revision', 'protection_active')
+    assert c.state['status'] != 'complete'
+    assert c.state['accepted_step'] == 1
+    assert not any(e['kind'] == 'accepted' for e in c.gate.snapshot()['events'])
+
+
+def test_supervisor_failure_restart_runs_without_creating_operator_stop(tmp_path, monkeypatch):
+    from scrapers.espn import measure_pace, trino_manager
+    store = PaceStore(tmp_path / 'pace.sqlite3')
+    store.save({'status': 'failed', 'accepted_step': 0})
+    calls = []
+    monkeypatch.setattr(trino_manager, 'EspnTrinoTableManager', lambda: Trino())
+    monkeypatch.setattr(measure_pace, 'accepted_ids', lambda _: list(range(380)))
+    monkeypatch.setattr(Controller, 'run_locked', lambda self: calls.append(self))
+    assert main(['run', '--state-dir', str(tmp_path), '--benchmark-at-boundaries']) == 0
+    assert len(calls) == 1
+    assert not (tmp_path / 'measurement.off').exists()
+
+
+def test_documented_supervisor_never_installs_persistent_stop_as_execstop():
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[3] / 'deploy' / 'espn' / 'README.md').read_text()
+    command = next(line for line in text.splitlines() if line.startswith('systemd-run --unit=espn-1510-measure'))
+    assert 'Restart=on-failure' in command
+    assert '--benchmark-at-boundaries' in command
+    assert 'ExecStop=' not in command
+    assert '--allow-s3' not in command

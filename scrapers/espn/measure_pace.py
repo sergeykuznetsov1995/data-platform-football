@@ -6,7 +6,7 @@ queries freshness and publishes evidence; no measurement writes target Bronze.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -287,6 +287,15 @@ class Controller:
                     report['freshness'] = dict(self.freshness)
                     if not self.freshness['eligible']:
                         report['reason'] = 'freshness_changed_during_benchmark'
+                        state['report'] = report
+                        self.store.save(state)
+                        return report
+                    accepted = self.gate.accept_s2(
+                        replace(window, freshness_ok=self.freshness['eligible']), baseline,
+                        expected_revision=snapshot['revision'],
+                    )
+                    if not accepted.eligible:
+                        report['reason'] = accepted.reason
                         state['report'] = report
                         self.store.save(state)
                         return report
