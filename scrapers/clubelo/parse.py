@@ -288,8 +288,11 @@ _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _PAGE_CREATED = re.compile(r"Page created on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 _ELO_DATA_MARKER = "eloData = ["
 # eloData cell 0: optional flag link, optional rank, the club link.
+# Since 2026-10-02 the flag image can carry these rendering hints; they do
+# not change country/club identity. Keep the remaining cell contract strict.
 _ELO_CELL = re.compile(
-    r'^<td class="l">(?:<a href="/(?P<cc>[^"]*)"><img src="[^"]*" alt="(?P<alt>[^"]*)"  '
+    r'^<td class="l">(?:<a href="/(?P<cc>[^"]*)"><img(?: loading="lazy")?(?: decoding="async")?'
+    r' src="[^"]*" alt="(?P<alt>[^"]*)"  '
     r'style="width:20px; opacity:0\.8;"></a>)? (?:<small> (?P<rank>\d+) </small>)?'
     r'<a href="/(?P<slug>[^"/]+)">(?P<n1>[^<]*)<span class="min481">(?P<n2>[^<]*)</span></a></td>$'
 )
