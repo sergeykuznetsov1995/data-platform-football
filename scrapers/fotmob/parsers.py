@@ -423,6 +423,9 @@ def _parse_playoffs(
             matchups = [round_obj]
         for index, matchup_value in enumerate(matchups):
             path = f"$.playoff.{round_path}.matchups[{index}]"
+            if matchup_value is None:
+                issues.append(ParseIssue("empty_playoff_matchup", path, "matchup slot is null"))
+                continue
             if not isinstance(matchup_value, Mapping):
                 issues.append(ParseIssue("invalid_playoff_matchup", path, "matchup is not an object"))
                 continue
