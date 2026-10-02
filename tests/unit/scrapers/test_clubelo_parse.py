@@ -39,6 +39,52 @@ def test_ranking_without_h1_fails_closed():
         parse_ranking_slugs(fixture_html("Ranking.html.gz").replace("<h1>", "<h2>"))
 
 
+def test_saved_20261002_ranking_with_lazy_flags_passes_completeness():
+    import hashlib
+
+    path = Path(__file__).resolve().parents[2] / "fixtures/clubelo/20261002/Ranking.html.gz"
+    body = gzip.decompress(path.read_bytes())
+    assert hashlib.sha256(body).hexdigest() == (
+        "6b630d953414cede731367c8e1df9767dd9ef309939faa55d7d4f030f268ced1")
+    page = parse_ranking(body.decode("utf-8"))
+    check_ranking(page)
+    assert page.rating_date == date(2026, 10, 1)
+    assert (page.elo_rows, page.provisional, page.levels_matched) == (1744, 52, 1723)
+    assert len(page.linked_slugs) == 498
+    first = page.rows[0]
+    assert (first["slug"], first["name"], first["country"], first["rank"], first["elo"]) == (
+        "Bayern", "Bayern München", "GER", 1, 2046)
+    assert (first["elo_delta_1d_raw"], first["golo"]) == ("+0.00", 2.38)
+
+
+@pytest.mark.parametrize("attributes", [
+    "", ' loading="lazy"', ' decoding="async"', ' loading="lazy" decoding="async"',
+])
+def test_flag_rendering_hints_do_not_change_ranking_values(attributes):
+    original = fixture_html("Ranking.html.gz")
+    changed = original.replace("<img src=", f"<img{attributes} src=")
+    page = parse_ranking(changed)
+    check_ranking(page)
+    assert page == parse_ranking(original)
+
+
+@pytest.mark.parametrize("old, new", [
+    ('alt="GER"', 'title="GER"'),
+    ('src="/static/flags/deu.png"', 'data-src="/static/flags/deu.png"'),
+    ('href="/Bayern"', 'href="/GER/Bayern"'),
+    ('<small> 1 </small>', '<small> first </small>'),
+])
+def test_lazy_flag_cell_still_rejects_broken_required_fields(old, new):
+    html = fixture_html("Ranking.html.gz").replace(
+        '<img src=', '<img loading="lazy" decoding="async" src=')
+    # Mutate eloData, not an earlier navigation/table occurrence.
+    start = html.index("eloData = [")
+    assert old in html[start:]
+    broken = html[:start] + html[start:].replace(old, new, 1)
+    with pytest.raises(LayoutChanged, match="C3 eloData row 0 club cell"):
+        parse_ranking(broken)
+
+
 @pytest.mark.parametrize(
     "slug, points, first, last, no_result",
     [
