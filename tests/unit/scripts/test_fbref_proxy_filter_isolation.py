@@ -21,7 +21,9 @@ SHARED_FILTER_SHA256 = (
     # ``runtime_files`` — both asserted below.  #1350: ledgers flushed off
     # the per-chunk path.  #1389-B: upstream failure class, tunnels, /health.
     # #1387: transfermarkt-only source mode.
-    "13d7d8b7f834ce67392bed532fd4959fb0f4dbd4a86a29feb0cbc3c68c066f36"
+    # Refresh the merged baseline after 81bea4ce (#1392, tmapi host) and
+    # 1f933229 (#1388, provider CONNECT refusals); shared runtime unchanged here.
+    "664ceae641ddbb3a4065fe35942c80e77a9d1efe68741db2b0b6dfa52989a139"
 )
 
 

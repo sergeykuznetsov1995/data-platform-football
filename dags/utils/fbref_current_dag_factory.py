@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
 from airflow.models.param import Param
@@ -16,6 +16,13 @@ from scrapers.fbref.settings import (
 )
 
 from utils.default_args import DEFAULT_ARGS
+from utils.fbref_current_windows import (
+    BOOTSTRAP_WAVE_DEADLINE_SECONDS,
+    CURRENT_MAX_BATCHES,
+    CURRENT_SCHEDULE,
+    CURRENT_WAVE_DEADLINE_SECONDS,
+    current_window_profile,
+)
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
     FBREF_CANARY_REQUEST_LIMIT,
@@ -63,16 +70,8 @@ PAGE_KINDS = (
     "match",
 )
 
-# One unforked process advances bounded raw-first batches while retaining the
-# same clearance and proxy quarantine for the run.  With the 25-match write
-# batch (#1320) the live runs of 26.09-30.09 took 120-212 minutes for 14
-# batches (21-36 s per page), and every successful run stopped exactly at the
-# cap with more targets due.  Cap 20 (500 pages) is about 3h55m-5h at that
-# speed.  The time budget below (CURRENT_WAVE_DEADLINE_SECONDS, #1318) is
-# checked between batches, so a slower run ends with a partial result before
-# the six-hour subprocess wait (LIVE_WAVES_TIMEOUT_SECONDS) instead of being
-# killed mid-batch; the cap no longer has to carry that headroom itself.
-CURRENT_MAX_BATCHES = 20
+# One unforked process advances bounded batches, retaining session clearance.
+# Scheduled profiles and history reservations share one UTC policy module.
 # Deployment marker for the reviewed cap policy.  The speed release was
 # merged before it was installed, so the combined Bronze delivery must carry
 # this factory as an explicit first-parent modification instead of silently
@@ -86,12 +85,6 @@ CURRENT_PAGE_KINDS_POLICY = "fbref-current-page-kinds-no-players-v1"
 # lock is released and is never waited on, so the Bronze verdict and the lock
 # no longer depend on Silver.
 CURRENT_PUBLICATION_ORDER_POLICY = "fbref-current-silver-after-lock-v1"
-# Absolute wall-clock budget for the batch loop: six hours minus half an
-# hour, so the batch that is running when the budget expires still has room
-# to finish, close its lease and reconcile the meter before the six-hour
-# subprocess wait.  The cap above bounds the batch count; this bounds time,
-# which is what actually runs out when a batch is slower than its estimate.
-CURRENT_WAVE_DEADLINE_SECONDS = 19800
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -107,10 +100,19 @@ BYTE_LIMIT_MB = (
     "{{ dag_run.conf.get('byte_limit_mb', params.byte_limit_mb) }}"
 )
 SHARD_SIZE = "{{ dag_run.conf.get('shard_size', params.shard_size) }}"
-WAVE_DEADLINE_SECONDS = (
-    "{{ dag_run.conf.get('wave_deadline_seconds', "
-    "params.wave_deadline_seconds) }}"
-)
+
+
+def _window_parameter(name: str) -> str:
+    # None means automatic; explicit zero must still disable the wave budget.
+    return (
+        "{{ dag_run.conf.get('" + name + "', params." + name + ") "
+        "if dag_run.conf.get('" + name + "', params." + name + ") is not none "
+        "else fbref_current_profile(data_interval_end | default(none))." + name + " }}"
+    )
+
+
+MAX_BATCHES = _window_parameter("max_batches")
+WAVE_DEADLINE_SECONDS = _window_parameter("wave_deadline_seconds")
 
 
 def _scheduled_params() -> dict:
@@ -134,13 +136,20 @@ def _scheduled_params() -> dict:
             maximum=MAX_SHARD_SIZE,
             description="Maximum frontier targets claimed by one task",
         ),
+        "max_batches": Param(
+            None,
+            type=["null", "integer"],
+            minimum=1,
+            maximum=80,
+            description="Batch cap override; null selects the UTC window profile",
+        ),
         "wave_deadline_seconds": Param(
-            CURRENT_WAVE_DEADLINE_SECONDS,
-            type="integer",
+            None,
+            type=["null", "integer"],
             minimum=0,
             maximum=6 * 60 * 60,
             description=(
-                "Wall-clock budget for the batch loop in seconds; 0 disables it"
+                "Batch-loop seconds; null selects the UTC window, 0 disables it"
             ),
         ),
     }
@@ -158,8 +167,10 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         shard_size = FBREF_MAX_WARM_SESSION_TARGETS
         # Bootstrap has no schedule to protect, but it shares the cap-20
         # runner and the six-hour subprocess wait, which a slow 20-batch run
-        # can exceed; the same time budget ends it between batches instead.
-        wave_deadline_seconds = CURRENT_WAVE_DEADLINE_SECONDS
+        # can exceed; retain its original 5.5-hour budget independently of
+        # the shorter scheduled window budgets.
+        wave_deadline_seconds = BOOTSTRAP_WAVE_DEADLINE_SECONDS
+        max_batches = CURRENT_MAX_BATCHES
         description = "Manual non-publishing FBref current bootstrap"
         tags = ["fbref", "bronze", "raw-first", "bootstrap", "manual"]
         doc_md = """
@@ -176,16 +187,24 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         """
     else:
         dag_id = INGEST_DAG_ID
-        schedule = "0 6 * * *"
+        schedule = CURRENT_SCHEDULE
         dagrun_timeout = timedelta(hours=18)
         request_limit = REQUEST_LIMIT
         byte_limit_mb = BYTE_LIMIT_MB
         shard_size = SHARD_SIZE
         wave_deadline_seconds = WAVE_DEADLINE_SECONDS
+        max_batches = MAX_BATCHES
         description = "Durable raw-first FBref current refresh"
         tags = ["fbref", "bronze", "raw-first", "discovery"]
         doc_md = """
         ## FBref current refresh
+
+        UTC windows run at 00/06/12/18. The UTC hour of data_interval_end
+        selects 06:00's 20 batches / 16200 seconds, or 9 batches / 10800 seconds
+        otherwise, even when a task starts late. Manual runs without an interval
+        use the small profile. Null max_batches/wave_deadline_seconds params
+        select automatically; explicit conf overrides remain supported (0
+        disables the wave budget). Budgets stop new batches, not running ones.
 
         The source-discovered competition registry decides scope. Female
         competitions are recorded but never added to the crawl frontier;
@@ -206,7 +225,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         "default_args": DEFAULT_ARGS,
         "description": description,
         "schedule": schedule,
-        "start_date": datetime(2026, 7, 11),
+        "start_date": datetime(2026, 7, 11, tzinfo=timezone.utc),
         "catchup": False,
         "max_active_runs": 1,
         "max_active_tasks": 1,
@@ -222,6 +241,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         dag_kwargs["is_paused_upon_creation"] = True
     else:
         dag_kwargs["params"] = _scheduled_params()
+        dag_kwargs["user_defined_macros"] = {
+            "fbref_current_profile": current_window_profile
+        }
 
     with DAG(**dag_kwargs) as dag:
         readiness_kwargs = {
@@ -316,7 +338,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "shard_size": shard_size,
                 "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
                 "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
-                "max_batches": CURRENT_MAX_BATCHES,
+                "max_batches": max_batches,
                 "deadline_seconds": wave_deadline_seconds,
             },
             pool=FBREF_SCRAPER_POOL,

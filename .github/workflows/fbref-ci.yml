@@ -59,7 +59,7 @@ jobs:
           python -m pip install --disable-pip-version-check \
             pytest "ruff==0.15.20" pandas numpy pyarrow boto3==1.42.61 trino requests beautifulsoup4 lxml \
             psycopg2-binary python-dotenv tenacity pybreaker rapidfuzz \
-            Unidecode nicknames PyYAML jsonschema psutil
+            Unidecode nicknames PyYAML jsonschema psutil Jinja2==3.1.6
       - name: Static checks
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

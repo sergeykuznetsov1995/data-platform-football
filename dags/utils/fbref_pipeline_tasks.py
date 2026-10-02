@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, time as dt_time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -36,6 +36,8 @@ from scrapers.fbref.settings import (
     MIB,
     strict_binary_flag,
 )
+
+from utils.fbref_current_windows import current_window_reservations
 
 
 logger = logging.getLogger(__name__)
@@ -563,11 +565,10 @@ def _require_fbref_publication_mode(run: Mapping[str, object]) -> None:
         )
 
 
-# The daily publishing DAG is scheduled at 06:00Z and takes the publication
-# lock as its very first step.  A historical run still in flight then costs the
-# platform a whole day of publication, so the window is checked here — before
-# the control run exists, before the lock, before one paid request.
-FBREF_INGEST_WINDOW_START_UTC = dt_time(hour=6, minute=0)
+# Protect all four UTC publishing windows before creating a history control
+# run, acquiring its publication lock, or issuing a paid request. Current
+# ingest acquires its lock after readiness and control-run initialization.
+# Admission estimates cannot replace runtime lock/queue coordination (#1328).
 FBREF_HISTORY_WINDOW_MARGIN_MINUTES = 45
 FBREF_HISTORY_WINDOW_OVERHEAD_MINUTES = 30
 
@@ -595,11 +596,12 @@ def guard_fbref_history_window(
     overhead_minutes: int = FBREF_HISTORY_WINDOW_OVERHEAD_MINUTES,
     now=None,
 ) -> dict:
-    """Refuse a historical run whose own ceiling would reach the daily window.
+    """Refuse history inside a reserved window or too near the next one.
 
-    The projection uses the run's own hard ceiling — every batch full, every
-    page paying the polite domain interval — so it errs long, which is the
-    direction that protects the daily lane.
+    The existing page-interval projection and 45-minute margin are admission
+    estimates, not runtime ceilings (parse/queue delays are not modelled).
+    Reservations include observed current batch completion and DAG overhead;
+    late/overrunning current runs still require the publication lock (#1328).
     """
 
     batches = _normalize_live_batch_count(max_batches)
@@ -620,11 +622,16 @@ def guard_fbref_history_window(
         if now is None
         else now.astimezone(timezone.utc)
     )
-    window_start = datetime.combine(
-        started_at.date(), FBREF_INGEST_WINDOW_START_UTC, tzinfo=timezone.utc
-    )
-    if window_start <= started_at:
-        window_start += timedelta(days=1)
+    reservations = list(current_window_reservations(started_at))
+    for reserved_start, reserved_end in reservations:
+        if reserved_start <= started_at < reserved_end:
+            from airflow.exceptions import AirflowFailException
+
+            raise AirflowFailException(
+                "FBref historical run overlaps a reserved ingest window: "
+                f"{reserved_start.isoformat()} through {reserved_end.isoformat()}"
+            )
+    window_start = min(start for start, _ in reservations if start > started_at)
     deadline = window_start - timedelta(minutes=int(margin_minutes))
     projected_end = started_at + timedelta(minutes=projected_minutes)
     verdict = {
@@ -638,7 +645,7 @@ def guard_fbref_history_window(
         from airflow.exceptions import AirflowFailException
 
         raise AirflowFailException(
-            "FBref historical run would reach the daily ingest window: "
+            "FBref historical run would reach the next ingest window: "
             f"{pages} pages ≈ {projected_minutes} min, ends "
             f"{projected_end.isoformat()} > {deadline.isoformat()}"
         )

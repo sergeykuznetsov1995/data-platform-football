@@ -35,10 +35,10 @@ def loaded_dag(request):
 
 @pytest.mark.unit
 class TestFBrefCurrentTopology:
-    def test_daily_source_discovered_scope(self, loaded_dag):
+    def test_four_windows_source_discovered_scope(self, loaded_dag):
         module, _ = loaded_dag
         assert module.dag.dag_id == "dag_ingest_fbref"
-        assert module.dag.schedule == "0 6 * * *"
+        assert module.dag.schedule == "0 0,6,12,18 * * *"
         assert module.dag._dag_kwargs["max_active_runs"] == 1
         assert module.dag._dag_kwargs["max_active_tasks"] == 1
         assert module.dag._dag_kwargs["dagrun_timeout"].total_seconds() == (
@@ -53,6 +53,7 @@ class TestFBrefCurrentTopology:
             "byte_limit_mb",
             "shard_size",
             "wave_deadline_seconds",
+            "max_batches",
         }
         source = Path(module.__file__).read_text(encoding="utf-8")
         assert "LEAGUES" not in source
@@ -68,26 +69,13 @@ class TestFBrefCurrentTopology:
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["minimum"] == 1
         assert params["shard_size"]._kw["maximum"] == 25
-        # Five and a half hours: the six-hour subprocess wait minus half an hour
-        # for the batch that is running when the budget expires.
-        assert params["wave_deadline_seconds"].default == 19800
+        # Nullable defaults leave automatic UTC selection to the template.
+        assert params["wave_deadline_seconds"].default is None
         assert params["wave_deadline_seconds"]._kw["minimum"] == 0
         assert params["wave_deadline_seconds"]._kw["maximum"] == 6 * 60 * 60
-        # The deadline bounds when a batch may START, so the reserve it leaves
-        # has to cover the batch that is already running plus finalisation.
-        # Observed full 25-page cadence: 20m21s.  Anything less than that and
-        # the budget would hand the task timeout a batch it cannot finish.
-        observed_batch_seconds = 20 * 60 + 21
-        live_waves_timeout_seconds = sys.modules[
-            "utils.fbref_pipeline_tasks"
-        ].LIVE_WAVES_TIMEOUT_SECONDS
-        assert live_waves_timeout_seconds == 6 * 60 * 60
-        reserve = (
-            live_waves_timeout_seconds
-            - params["wave_deadline_seconds"].default
-        )
-        assert reserve == 1800
-        assert reserve >= observed_batch_seconds * 1.4
+        assert params["max_batches"].default is None
+        assert params["max_batches"]._kw["minimum"] == 1
+        assert params["max_batches"]._kw["maximum"] == 80
 
         initialize = tasks["initialize_run"]
         assert initialize.python_callable.__name__ == "initialize_fbref_run"
@@ -159,12 +147,9 @@ class TestFBrefCurrentTopology:
             "squad",
             "match",
         )
-        assert live.op_kwargs["max_batches"] == factory.CURRENT_MAX_BATCHES
-        assert factory.CURRENT_WAVE_DEADLINE_SECONDS == 19800
-        assert live.op_kwargs["deadline_seconds"] == (
-            "{{ dag_run.conf.get('wave_deadline_seconds', "
-            "params.wave_deadline_seconds) }}"
-        )
+        assert live.op_kwargs["max_batches"] == factory.MAX_BATCHES
+        assert factory.CURRENT_WAVE_DEADLINE_SECONDS == 16200
+        assert live.op_kwargs["deadline_seconds"] == factory.WAVE_DEADLINE_SECONDS
         expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
         assert expected_reservation_mb == 9
         assert tasks["initialize_run"].op_kwargs["reservation_mb"] == (
@@ -277,3 +262,108 @@ class TestFBrefCurrentTopology:
             for task_id, task in tasks.items()
             if task_id != "trigger_silver_transform"
         )
+
+
+def _render_live_profile(loaded_dag, *, interval_end=None, conf=None, params=None,
+                         omit_interval=False):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from jinja2 import StrictUndefined
+    from jinja2.nativetypes import NativeEnvironment
+
+    module, tasks = loaded_dag
+    dag_kwargs = module.dag._dag_kwargs
+    env = NativeEnvironment(undefined=StrictUndefined)
+    env.globals.update(dag_kwargs["user_defined_macros"])
+    defaults = {name: param.default for name, param in dag_kwargs["params"].items()}
+    defaults.update(params or {})
+    context = {
+        "dag_run": SimpleNamespace(conf=conf or {}),
+        "params": defaults,
+        # Deliberately unrelated to the interval end: late starts cannot
+        # select a different profile, nor may the logical/interval start date.
+        "logical_date": datetime(2026, 10, 1, 0, tzinfo=timezone.utc),
+        "data_interval_start": datetime(2026, 10, 1, 0, tzinfo=timezone.utc),
+        "ti": SimpleNamespace(start_date=datetime(2026, 10, 2, 18, tzinfo=timezone.utc)),
+    }
+    if not omit_interval:
+        context["data_interval_end"] = interval_end
+    live = tasks["run_live_waves"]
+    return {
+        name: env.from_string(live.op_kwargs[name]).render(context)
+        for name in ("max_batches", "deadline_seconds", "request_limit", "byte_limit_mb")
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("hour,batches,budget", [(0, 9, 10800), (6, 20, 16200),
+                                                (12, 9, 10800), (18, 9, 10800)])
+def test_native_render_selects_interval_end_profile(loaded_dag, hour, batches, budget):
+    from datetime import datetime, timezone
+
+    result = _render_live_profile(
+        loaded_dag, interval_end=datetime(2026, 10, 1, hour, tzinfo=timezone.utc)
+    )
+    assert result == {"max_batches": batches, "deadline_seconds": budget,
+                      "request_limit": 4096, "byte_limit_mb": 2048}
+    assert all(type(value) is int for value in result.values())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("end,batches,budget", [
+    ("2026-10-01T08:00:00+02:00", 20, 16200),
+    ("2026-10-01T06:00:00+02:00", 9, 10800),
+    ("2026-09-30T20:00:00-04:00", 9, 10800),
+    ("2026-10-01T06:00:00", 20, 16200),
+])
+def test_native_render_normalizes_interval_to_utc(loaded_dag, end, batches, budget):
+    from datetime import datetime
+
+    result = _render_live_profile(loaded_dag, interval_end=datetime.fromisoformat(end))
+    assert (result["max_batches"], result["deadline_seconds"]) == (batches, budget)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("omit_interval", [False, True])
+def test_manual_missing_interval_uses_small_profile(loaded_dag, omit_interval):
+    result = _render_live_profile(loaded_dag, omit_interval=omit_interval)
+    assert (result["max_batches"], result["deadline_seconds"]) == (9, 10800)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("budget", [0, 60, 19800, 21600])
+@pytest.mark.parametrize("batches", [1, 80])
+def test_native_conf_overrides_preserve_zero_and_canary(loaded_dag, budget, batches):
+    from datetime import datetime, timezone
+
+    result = _render_live_profile(
+        loaded_dag, interval_end=datetime(2026, 10, 1, 6, tzinfo=timezone.utc),
+        conf={"wave_deadline_seconds": budget, "max_batches": batches,
+              "request_limit": 100, "byte_limit_mb": 50},
+        params={"wave_deadline_seconds": 300, "max_batches": 5},
+    )
+    assert result == {"max_batches": batches, "deadline_seconds": budget,
+                      "request_limit": 100, "byte_limit_mb": 50}
+
+
+@pytest.mark.unit
+def test_native_params_override_and_null_auto(loaded_dag):
+    result = _render_live_profile(
+        loaded_dag, params={"wave_deadline_seconds": 0, "max_batches": 7}
+    )
+    assert (result["max_batches"], result["deadline_seconds"]) == (7, 0)
+    result = _render_live_profile(
+        loaded_dag, conf={"wave_deadline_seconds": None, "max_batches": None}
+    )
+    assert (result["max_batches"], result["deadline_seconds"]) == (9, 10800)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [0, 81, -1, 1.5, True, "20"])
+def test_batch_param_schema_rejects_invalid_override(loaded_dag, value):
+    import jsonschema
+
+    module, _ = loaded_dag
+    schema = module.dag._dag_kwargs["params"]["max_batches"]._kw
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(value, schema)

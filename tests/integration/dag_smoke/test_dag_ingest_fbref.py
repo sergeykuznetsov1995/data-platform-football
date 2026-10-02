@@ -47,9 +47,9 @@ def _states(values):
 
 @pytest.mark.integration
 class TestFBrefDagBag:
-    def test_current_is_daily_and_serial(self, fbref_dags):
+    def test_current_has_four_utc_windows_and_is_serial(self, fbref_dags):
         dag = fbref_dags["dag_ingest_fbref"]
-        assert str(dag.schedule_interval) == "0 6 * * *"
+        assert str(dag.schedule_interval) == "0 0,6,12,18 * * *"
         assert dag.max_active_runs == 1
         assert dag.max_active_tasks == 1
         assert "run_live_waves" in dag.task_dict
@@ -102,7 +102,7 @@ class TestFBrefCurrentFailureEdges:
         }
         live = dag.task_dict["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
-        assert live.op_kwargs["max_batches"] == 20
+        assert "fbref_current_profile" in live.op_kwargs["max_batches"]
         assert "player" not in live.op_kwargs["page_kinds"]
         assert "matchlog" not in live.op_kwargs["page_kinds"]
         factory = sys.modules["utils.fbref_current_dag_factory"]
@@ -205,3 +205,25 @@ class TestFBrefBoundedModes:
                 }
             assert validate.trigger_rule == "all_success"
             assert trigger.trigger_rule == "all_success"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("hour,batches,budget", [
+    (0, 9, 10800), (6, 20, 16200), (12, 9, 10800), (18, 9, 10800),
+])
+def test_real_airflow_native_window_templates(fbref_dags, hour, batches, budget):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    dag = fbref_dags["dag_ingest_fbref"]
+    task = dag.get_task("run_live_waves")
+    end = datetime(2026, 10, 1, hour, tzinfo=timezone.utc)
+    rendered = task.render_template(
+        {name: task.op_kwargs[name] for name in ("max_batches", "deadline_seconds")},
+        {"data_interval_end": end, "data_interval_start": end - timedelta(hours=6),
+         "logical_date": end - timedelta(hours=6),
+         "dag_run": SimpleNamespace(conf={}), "params": dag.params},
+        jinja_env=dag.get_template_env(),
+    )
+    assert rendered == {"max_batches": batches, "deadline_seconds": budget}
+    assert all(type(value) is int for value in rendered.values())
