@@ -416,6 +416,11 @@ def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
     return _validate_refresh_scope(env)
 
 
+def _refill_report_path(run_id: str) -> Path:
+    safe_run = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id)
+    return Path(RESULT_DIR) / f"refill-{safe_run}.json"
+
+
 def _refill_refresh_window(**context: Any) -> dict[str, Any]:
     from utils.sofascore_refresh_window import refill_deadline, refill_window
     from dags.scripts.run_sofascore_scope_cycle import _atomic_json
@@ -434,8 +439,7 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
     deadline = refill_deadline(deadline, getattr(dag_run, "start_date", None))
     run_id = str(context.get("run_id") or "manual")
     queue_mode = _refresh_queue_mode(context)
-    safe_run = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id)
-    report_path = Path(RESULT_DIR) / f"refill-{safe_run}.json"
+    report_path = _refill_report_path(run_id)
     # A manual retry/clear must not silently recreate round 1 with changed
     # Bronze evidence under its already signed identity.
     if report_path.exists():
@@ -558,6 +562,7 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
 
     outcomes: list[Any] = []
     refill_reason = None
+    refill = None
     ti = context.get("ti")
     if ti is not None:
         try:
@@ -569,10 +574,26 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
             outcomes = [pulled]
         elif pulled is not None:
             outcomes = [item for item in pulled if isinstance(item, dict)]
-        refill = ti.xcom_pull(task_ids="refill_refresh_window")
-        if isinstance(refill, dict):
-            outcomes.extend(refill.get("outcomes") or [])
-            refill_reason = refill.get("stop_reason")
+        try:
+            refill = ti.xcom_pull(task_ids="refill_refresh_window")
+        except Exception as exc:
+            print(f"refresh refill summary unavailable: {exc}")
+    # Failed tasks do not return an XCom; their persisted report still records
+    # spent time. Only accept this run's report, including after filename sanitization.
+    run_id = context.get("run_id")
+    if not isinstance(refill, dict) and run_id:
+        try:
+            persisted = json.loads(_refill_report_path(str(run_id)).read_text())
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            print(f"refresh refill report unavailable: {exc}")
+        else:
+            if isinstance(persisted, dict) and persisted.get("run_id") == str(run_id):
+                refill = persisted
+    if isinstance(refill, dict):
+        outcomes.extend(refill.get("outcomes") or [])
+        refill_reason = refill.get("stop_reason")
     used = sum(
         float(item.get("elapsed_s") or 0)
         for item in outcomes
