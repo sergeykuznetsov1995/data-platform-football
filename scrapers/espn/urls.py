@@ -112,6 +112,12 @@ def events_window(
     )
 
 
+def event_metadata(slug: str, event_id: int) -> EspnRequest:
+    if type(event_id) is not int or event_id < 1:
+        raise ValueError("ESPN event id must be a positive integer")
+    return _core(f"leagues/{slug}/events/{event_id}", EndpointType.SCOREBOARD)
+
+
 def event_status(slug: str, event_id: int) -> EspnRequest:
     return _core(
         f"leagues/{slug}/events/{event_id}/competitions/{event_id}/status",
@@ -148,6 +154,7 @@ __all__ = [
     "MAX_WINDOW_DAYS",
     "all_scoreboard_day",
     "event_status",
+    "event_metadata",
     "events_window",
     "league_detail",
     "league_scoreboard_day",

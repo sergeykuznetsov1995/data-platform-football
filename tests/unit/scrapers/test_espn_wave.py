@@ -56,6 +56,8 @@ class FakeClient:
     def __init__(self, responses: dict[str, bytes | Exception]) -> None:
         self.responses = responses
         self.stored: dict[str, bytes] = {}
+        self.objects: dict[str, bytes] = {}
+        self.raw_store = SimpleNamespace(load_exact=self.load_exact)
         self.calls: list[tuple[str, bool]] = []
         self.replays: list[str] = []
         self.flushes = 0
@@ -64,8 +66,14 @@ class FakeClient:
         self.clock = "2026-09-25T13:00:00+00:00"
         self.fetched: dict[str, str] = {}
 
+    def load_exact(self, uri, sha):
+        body = self.objects[sha]
+        assert uri == f"raw://{sha[:12]}" and hashlib.sha256(body).hexdigest() == sha
+        return body
+
     def _result(self, body: bytes, *, cache_hit: bool, fetched_at: str | None = None):
         sha = hashlib.sha256(body).hexdigest()
+        self.objects[sha] = body
         return SimpleNamespace(
             json_data=json.loads(body),
             body=body,
@@ -151,6 +159,12 @@ class WaveTrino(FakeTrino):
         if "kickoff >= ? AND kickoff < ?" in sql:
             start, end = params
             keep = [row for row in self._rows() if start <= row["kickoff"] < end]
+        elif "disposition = 'moved'" in sql:
+            (at,) = params
+            keep = [row for row in self._rows() if row['disposition'] == 'moved'
+                    and not row['terminal'] and row['duplicate_of'] is None
+                    and row['first_published_at'] is None
+                    and (row['kickoff'] <= at or not row['kickoff_confirmed'])]
         elif "status IN" in sql:
             (before,) = params
             keep = [
@@ -264,6 +278,21 @@ def _summary_key(slug: str, event_id: int | None = None) -> str:
     return _req_key(urls.summary(slug, event_id or int(_summary(slug)["header"]["id"])))
 
 
+def _metadata(slug, event_id, when):
+    """Core event shape from recorded core_event_eng1_2026_401879276.json."""
+    header = _summary(slug)['header']
+    path = f"http://sports.core.api.espn.com/v2/sports/soccer/leagues/{slug}"
+    year = _year(slug)
+    sides = [dict(id=side['team']['id'], homeAway=side['homeAway'],
+                  team={'$ref': path + f"/seasons/{year}/teams/{side['team']['id']}"})
+             for side in header['competitions'][0]['competitors']]
+    return json.dumps(dict(id=str(event_id), uid=f"s:600~l:{header['league']['id']}~e:{event_id}",
+                           date=when, timeValid=True, league={'$ref': path},
+                           season={'$ref': path + f'/seasons/{year}'},
+                           competitions=[dict(id=str(event_id), date=when, timeValid=True,
+                                              competitors=sides)])).encode()
+
+
 def _responses(yesterday: bytes, today: bytes, **extra) -> dict:
     responses = {
         _req_key(urls.all_scoreboard_day(YESTERDAY)): yesterday,
@@ -271,6 +300,8 @@ def _responses(yesterday: bytes, today: bytes, **extra) -> dict:
     }
     for slug in SLUGS:
         responses[_summary_key(slug)] = (PROBES / SUMMARIES[slug]).read_bytes()
+    for event_id, when in ((900001, '2026-09-25T19:00Z'), (900002, '2026-09-24T21:00Z')):
+        responses[_req_key(urls.event_metadata('eng.1', event_id))] = _metadata('eng.1', event_id, when)
     responses.update(extra)
     return responses
 
@@ -455,8 +486,8 @@ def test_match_leaving_its_day_is_withdrawn_or_moved(tmp_path) -> None:
     assert rows[900003]["kickoff"] == datetime(2026, 9, 25, 20)
     summary = wave.summarize_wave(outcomes, [])
     assert (summary.withdrawn_count, summary.moved_count, summary.red) == (1, 2, False)
-    # Marked matches are not checked again every wave.
-    assert _plan(client, trino, tmp_path).status_checks == 0
+    # An unresolved moved match stays observable; withdrawn/visible matches do not.
+    assert _plan(client, trino, tmp_path).status_checks == 1
 
 
 @pytest.mark.unit
@@ -1067,3 +1098,130 @@ def test_window_event_of_a_season_without_an_open_edition_reds_its_tournament(tm
     (work,) = plan.works
     assert (work.slug, work.event_ids) == ("eng.1", ())
     assert work.error == "core lists 1 event(s) no league day has: 578281"
+
+
+@pytest.mark.unit
+def test_unresolved_moved_reenters_planner_and_updates_actual_deadline(tmp_path):
+    """Planner -> real four-table writer -> actual debt/freshness SQL."""
+    import duckdb
+    from scrapers.espn.criterion import render_daily_criterion_sql
+    from scrapers.espn.history_report import render_live_debt_sql
+    client, trino, _, _ = _wave1(tmp_path)
+    for row in trino.tables['espn_match']:
+        if row['event_id'] == 900002:
+            row['disposition'] = 'moved'
+    yesterday, today = _first_day()
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = _day(
+        *[event for event in json.loads(yesterday)['events'] if int(event['id']) != 900002])
+    client.responses[_req_key(urls.event_status('eng.1', 900002))] = json.dumps(
+        {'type': {'name': 'STATUS_SCHEDULED'}}).encode()
+    moved = _matches(trino)[900002]
+    def grade(row, at, day):
+        columns = ('competition_slug','event_id','kickoff','status','played_final','terminal_nonplayed',
+                   'disposition','lineup_state','team_stats_state','first_published_at','status_checked_at','duplicate_of')
+        conn = duckdb.connect()
+        conn.execute("ATTACH ':memory:' AS iceberg")
+        conn.execute('CREATE SCHEMA iceberg.bronze')
+        conn.execute('CREATE TABLE iceberg.bronze.espn_match ('
+                     'competition_slug VARCHAR,event_id BIGINT,kickoff TIMESTAMP,status VARCHAR,'
+                     'played_final BOOLEAN,terminal_nonplayed BOOLEAN,disposition VARCHAR,lineup_state VARCHAR,'
+                     'team_stats_state VARCHAR,first_published_at TIMESTAMP,status_checked_at TIMESTAMP,duplicate_of VARCHAR)')
+        conn.execute('INSERT INTO iceberg.bronze.espn_match VALUES (' + ','.join('?' for _ in columns) + ')',
+                     [row[column] for column in columns])
+        result = (conn.execute(render_live_debt_sql(['eng.1'], at)).fetchone()[0],
+                  conn.execute(render_daily_criterion_sql(day, ['eng.1'])).fetchall())
+        conn.close()
+        return result
+    assert grade(moved, NOW, '2026-09-25')[0] == 1
+    plan = _plan(client, trino, tmp_path)
+    assert any(900002 in work.event_ids for work in plan.works)
+
+    work = next(work for work in plan.works if 900002 in work.event_ids)
+    assert work.metadata[900002]['sha256']
+    before_summary = len(client.network('/summary?'))
+    assert all(outcome['state'] == wave.GREEN for outcome in _run(plan, client, trino))
+    unchanged = _matches(trino)[900002]
+    assert unchanged['kickoff'] == moved['kickoff']
+    assert unchanged['first_published_at'] is None
+    assert grade(unchanged, NOW, '2026-09-25')[0] == 1
+    assert grade(unchanged, NOW, '2026-09-25')[1][0][1:3] == (1, 0)
+
+    # Two days later the old kickoff is outside the scoreboard/Bronze window.
+    # Core metadata supplies a real new date ten days later, still same edition.
+    later = NOW + timedelta(days=2)
+    client.clock = later.isoformat()
+    for day in (later.date() - timedelta(days=1), later.date()):
+        client.responses[_req_key(urls.all_scoreboard_day(day))] = _day()
+    for slug in SLUGS:
+        client.responses[_req_key(urls.league_detail(slug))] = HttpStatusError(503, 'busy')
+    metadata_key = _req_key(urls.event_metadata('eng.1', 900002))
+    client.responses[metadata_key] = _metadata('eng.1', 900002, '2026-10-05T21:00Z')
+    plan = _plan(client, trino, tmp_path, now=later)
+    assert any(900002 in work.event_ids for work in plan.works)
+    assert all(outcome['state'] == wave.GREEN for outcome in _run(plan, client, trino))
+    relocated = _matches(trino)[900002]
+    assert relocated['kickoff'] == datetime(2026, 10, 5, 21)
+    assert relocated['status'] == 'STATUS_SCHEDULED'
+    assert relocated['first_published_at'] is None
+    assert relocated['disposition'] == 'moved'
+    assert relocated['raw_sha256'] == hashlib.sha256(client.responses[metadata_key]).hexdigest()
+    assert grade(relocated, later, '2026-09-25') == (0, [])
+    assert grade(relocated, later, '2026-10-06')[1][0][1:3] == (1, 0)
+    assert len(client.network('/summary?')) == before_summary
+    calls = len(client.calls)
+    assert _plan(client, trino, tmp_path, now=later + timedelta(hours=6)).works == ()
+    assert not any('/events/900002' in key for key, _ in client.calls[calls:])
+
+    # The relocated event remains tracked until the real final, with one Summary.
+    final_at = datetime(2026, 10, 6, 13, tzinfo=timezone.utc)
+    client.clock = final_at.isoformat()
+    for day in (final_at.date() - timedelta(days=1), final_at.date()):
+        client.responses[_req_key(urls.all_scoreboard_day(day))] = _day()
+    client.responses[_req_key(urls.event_status('eng.1', 900002))] = json.dumps(
+        {'type': {'name': 'STATUS_FULL_TIME'}}).encode()
+    body = _summary('eng.1')
+    body['header']['id'] = body['header']['competitions'][0]['id'] = '900002'
+    body['header']['competitions'][0]['date'] = '2026-10-05T21:00Z'
+    client.responses[_summary_key('eng.1', 900002)] = json.dumps(body).encode()
+    final_plan = _plan(client, trino, tmp_path, now=final_at)
+    final_work = next(work for work in final_plan.works if 900002 in work.event_ids)
+    assert final_work.metadata[900002]['sha256'] == relocated['raw_sha256']
+    assert all(outcome['state'] == wave.GREEN for outcome in _run(final_plan, client, trino))
+    published = _matches(trino)[900002]
+    assert published['played_final'] and published['first_published_at'] is not None
+    assert published['kickoff'] == relocated['kickoff']
+    assert published['_batch_id'] != relocated['_batch_id']
+    assert published['status_checked_at'] > relocated['status_checked_at']
+    assert grade(published, final_at, '2026-10-06')[0] == 0
+    before_retry = len(client.calls)
+    assert all(outcome['state'] == wave.GREEN for outcome in _run(final_plan, client, trino))
+    assert all(not refresh for _, refresh in client.calls[before_retry:])
+    assert len(client.network('/summary?')) == before_summary + 2  # network helper counts cached fetch calls too
+    assert sum(not refresh for key, refresh in client.calls if 'event=900002' in key) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('failure', ['invalid_identity', 'http_error', 'unknown_status'])
+def test_moved_metadata_failure_keeps_existing_kickoff_and_unpublished_debt(tmp_path, failure):
+    client, trino, _, _ = _wave1(tmp_path)
+    for row in trino.tables['espn_match']:
+        if row['event_id'] == 900002:
+            row['disposition'] = 'moved'
+    yesterday, _ = _first_day()
+    client.responses[_req_key(urls.all_scoreboard_day(YESTERDAY))] = _day(
+        *[event for event in json.loads(yesterday)['events'] if int(event['id']) != 900002])
+    client.responses[_req_key(urls.event_status('eng.1', 900002))] = json.dumps(
+        {'type': {'name': 'STATUS_UNKNOWN_NEW' if failure == 'unknown_status' else 'STATUS_SCHEDULED'}}).encode()
+    key = _req_key(urls.event_metadata('eng.1', 900002))
+    if failure == 'http_error':
+        client.responses[key] = HttpStatusError(503, 'unavailable')
+    elif failure == 'invalid_identity':
+        body = json.loads(client.responses[key])
+        body['id'] = '1'
+        client.responses[key] = json.dumps(body).encode()
+    old = _matches(trino)[900002]
+    plan = _plan(client, trino, tmp_path)
+    assert any(work.error for work in plan.works)
+    assert any(outcome['state'] == wave.RED for outcome in _run(plan, client, trino))
+    assert _matches(trino)[900002] == old
+    assert not any('event=900002' in key for key, _ in client.calls)
