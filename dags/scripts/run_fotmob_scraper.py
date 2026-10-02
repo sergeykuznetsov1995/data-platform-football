@@ -2149,13 +2149,20 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     attempt_identities=(f"{run_id}:{scope_key}",),
                 )
             except Exception as exc:
-                completion.errors.append(
-                    f"scope {scope_key}: {type(exc).__name__}: {exc}"
+                completion.record_exception(
+                    f"scope {scope_key}: {type(exc).__name__}: {exc}", exc
+                )
+                infrastructure_failure = bool(
+                    completion.metadata.get("infrastructure_failures")
                 )
                 record_automatic_attempt(
                     item,
-                    outcome="terminal",
+                    outcome="retryable" if infrastructure_failure else "terminal",
                     reason=f"scope completion commit failed: {type(exc).__name__}",
+                    next_retry_at=(
+                        _scope_retry_due(1, observed_at)
+                        if infrastructure_failure else None
+                    ),
                     attempt_identities=(f"{run_id}:{scope_key}",),
                 )
             operations.append(completion)
@@ -2250,6 +2257,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     (previous_attempt.attempt_count + 1 if previous_attempt else 1),
                     observed_at,
                 )
+                # attempt_count includes successful historical runs. A transient
+                # outage must not inherit their 24-hour backoff tier (C1 5991933).
+                if any(op.metadata.get("infrastructure_failures") for op in scope_operations):
+                    next_due = min(next_due, _scope_retry_due(1, observed_at))
                 if gap_retry_due is not None:
                     next_due = min(next_due, gap_retry_due)
                 record_automatic_attempt(

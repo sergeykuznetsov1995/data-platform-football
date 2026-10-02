@@ -1,0 +1,228 @@
+{
+  "details": {
+    "id": 8974,
+    "type": "league",
+    "name": "J. League 2",
+    "selectedSeason": "2022",
+    "latestSeason": "2026/2027",
+    "country": "JPN",
+    "gender": "male"
+  },
+  "allAvailableSeasons": [
+    "2026/2027",
+    "2025",
+    "2024",
+    "2023",
+    "2022",
+    "2021",
+    "2020",
+    "2019",
+    "2018",
+    "2017",
+    "2016",
+    "2015",
+    "2014",
+    "2013",
+    "2012",
+    "2011",
+    "2010"
+  ],
+  "tabs": [
+    "overview",
+    "table",
+    "playoff",
+    "fixtures",
+    "stats"
+  ],
+  "playoff": {
+    "rounds": [
+      {
+        "participantCount": 4,
+        "stage": "1/2",
+        "matchups": [
+          {},
+          {
+            "homeTeamId": 164739,
+            "awayTeamId": 164720,
+            "drawOrder": 2,
+            "stage": "1/2",
+            "bestOf": 0,
+            "winner": 164720,
+            "homeScore": 0,
+            "awayScore": 3,
+            "homeTeam": "Fagiano Okayama FC",
+            "awayTeam": "Montedio Yamagata",
+            "homeTeamShortName": "OKA",
+            "awayTeamShortName": "YAM",
+            "tbdTeam1": false,
+            "tbdTeam2": false,
+            "matches": [
+              {
+                "matchId": 4053616,
+                "home": {
+                  "id": 164739,
+                  "name": "Fagiano Okayama FC",
+                  "shortName": "OKA",
+                  "score": 0,
+                  "winner": false
+                },
+                "away": {
+                  "id": 164720,
+                  "name": "Montedio Yamagata",
+                  "shortName": "YAM",
+                  "score": 3,
+                  "winner": true
+                },
+                "pageUrl": "/matches/montedio-yamagata-vs-fagiano-okayama-fc/oxk45e9#4053616",
+                "status": {
+                  "utcTime": "2022-10-30T05:00:00.000Z",
+                  "finished": true,
+                  "started": true,
+                  "cancelled": false,
+                  "awarded": false,
+                  "scoreStr": "0 - 3",
+                  "reason": {
+                    "short": "FT",
+                    "shortKey": "fulltime_short",
+                    "long": "Full-Time",
+                    "longKey": "finished"
+                  }
+                }
+              }
+            ],
+            "aggregatedResult": {
+              "homeScore": 0,
+              "awayScore": 3
+            },
+            "aggregatedWinner": 164720,
+            "aggregatedLoser": 164739
+          },
+          null,
+          {
+            "homeTeamId": 162196,
+            "awayTeamId": 4427,
+            "drawOrder": 4,
+            "stage": "1/2",
+            "bestOf": 0,
+            "homeScore": 2,
+            "awayScore": 2,
+            "homeTeam": "Roasso Kumamoto",
+            "awayTeam": "Oita Trinita",
+            "homeTeamShortName": "ROK",
+            "awayTeamShortName": "OTR",
+            "tbdTeam1": false,
+            "tbdTeam2": false,
+            "matches": [
+              {
+                "matchId": 4053615,
+                "home": {
+                  "id": 162196,
+                  "name": "Roasso Kumamoto",
+                  "shortName": "ROK",
+                  "score": 2,
+                  "winner": false
+                },
+                "away": {
+                  "id": 4427,
+                  "name": "Oita Trinita",
+                  "shortName": "OTR",
+                  "score": 2,
+                  "winner": false
+                },
+                "pageUrl": "/matches/oita-trinita-vs-roasso-kumamoto/6dkt04b#4053615",
+                "status": {
+                  "utcTime": "2022-10-30T04:05:00.000Z",
+                  "finished": true,
+                  "started": true,
+                  "cancelled": false,
+                  "awarded": false,
+                  "scoreStr": "2 - 2",
+                  "reason": {
+                    "short": "FT",
+                    "shortKey": "fulltime_short",
+                    "long": "Full-Time",
+                    "longKey": "finished"
+                  }
+                }
+              }
+            ],
+            "aggregatedResult": {
+              "homeScore": 2,
+              "awayScore": 2
+            },
+            "aggregatedWinner": null,
+            "aggregatedLoser": null
+          }
+        ],
+        "started": true
+      },
+      {
+        "participantCount": 2,
+        "stage": "final",
+        "matchups": [
+          {
+            "homeTeamId": 162196,
+            "awayTeamId": 164720,
+            "drawOrder": -1,
+            "stage": "final",
+            "bestOf": 0,
+            "homeScore": 2,
+            "awayScore": 2,
+            "homeTeam": "Roasso Kumamoto",
+            "awayTeam": "Montedio Yamagata",
+            "homeTeamShortName": "ROK",
+            "awayTeamShortName": "YAM",
+            "tbdTeam1": false,
+            "tbdTeam2": false,
+            "matches": [
+              {
+                "matchId": 4053697,
+                "home": {
+                  "id": 162196,
+                  "name": "Roasso Kumamoto",
+                  "shortName": "ROK",
+                  "score": 2,
+                  "winner": false
+                },
+                "away": {
+                  "id": 164720,
+                  "name": "Montedio Yamagata",
+                  "shortName": "YAM",
+                  "score": 2,
+                  "winner": false
+                },
+                "pageUrl": "/matches/roasso-kumamoto-vs-montedio-yamagata/ojr85q2#4053697",
+                "status": {
+                  "utcTime": "2022-11-06T04:05:00.000Z",
+                  "finished": true,
+                  "started": true,
+                  "cancelled": false,
+                  "awarded": false,
+                  "scoreStr": "2 - 2",
+                  "reason": {
+                    "short": "FT",
+                    "shortKey": "fulltime_short",
+                    "long": "Full-Time",
+                    "longKey": "finished"
+                  }
+                }
+              }
+            ],
+            "aggregatedResult": {
+              "homeScore": 2,
+              "awayScore": 2
+            },
+            "aggregatedWinner": null,
+            "aggregatedLoser": null
+          }
+        ],
+        "started": true
+      }
+    ],
+    "hasDrawOrder": true,
+    "special": [],
+    "leagueId": 8974,
+    "bronzeFinal": null,
+    "draw": null
+  }
+}

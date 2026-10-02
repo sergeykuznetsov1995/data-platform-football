@@ -1,0 +1,9 @@
+{
+  "issue": 1597,
+  "source_uri": "s3://football/raw/fotmob/blobs/sha256/af/afc37fc8f3d24933473e763d31b3e21d64e4412f16b01d28afc1f8d7cf012360.json.gz",
+  "source_target": "https://www.fotmob.com/api/leagues?id=8974&season=2022",
+  "retrieved_on": "2026-10-02",
+  "minimization": "Kept details identity/season/classification fields, allAvailableSeasons, tabs, and the entire playoff object unchanged. Removed unrelated source sections and presentation metadata. No credentials or private data included.",
+  "observed_null_path": "$.playoff.rounds[0].matchups[2]",
+  "preserved_shape": "First round retains the empty object at index 0, real matchups at indexes 1 and 3, and null at index 2; final round is unchanged."
+}

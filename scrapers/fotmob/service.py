@@ -461,6 +461,16 @@ class OperationResult:
     terminal: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def record_exception(self, message: str, exc: BaseException) -> None:
+        """Keep the manifest failure classification through scope scheduling."""
+        if _failure_status(exc) == ManifestStatus.RETRYABLE_FAILURE:
+            self.retryable.append(message)
+            self.metadata["infrastructure_failures"] = (
+                self.metadata.get("infrastructure_failures", 0) + 1
+            )
+        else:
+            self.errors.append(message)
+
     @property
     def ok(self) -> bool:
         return not self.errors and not self.retryable and not self.terminal
@@ -1850,7 +1860,7 @@ class FotMobIngestService:
                     proxy_bytes=0,
                 )
         except Exception as exc:
-            result.errors.append(f"season fetch: {type(exc).__name__}: {exc}")
+            result.record_exception(f"season fetch: {type(exc).__name__}: {exc}", exc)
             return result, None
         if not fetch.ok:
             self._commit_for_fetch(
@@ -2101,8 +2111,8 @@ class FotMobIngestService:
             try:
                 fetch = self._fetch(manifest_target.canonical_url)
             except Exception as exc:
-                result.errors.append(
-                    f"{descriptor.participant_type}/{descriptor.name}: {exc}"
+                result.record_exception(
+                    f"{descriptor.participant_type}/{descriptor.name}: {exc}", exc
                 )
                 continue
             if not fetch.ok:
@@ -2168,9 +2178,9 @@ class FotMobIngestService:
                 result.succeeded += 1
                 result.counts["rows"] = result.counts.get("rows", 0) + len(rows)
             except Exception as exc:
-                result.errors.append(
+                result.record_exception(
                     f"{descriptor.participant_type}/{descriptor.name} parse: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}: {exc}", exc
                 )
                 self._commit_for_fetch(
                     fetch,
@@ -2505,7 +2515,7 @@ class FotMobIngestService:
         for key, outcome in fetched.items():
             match = by_key[key]
             if isinstance(outcome, Exception):
-                result.errors.append(f"match {key}: {outcome}")
+                result.record_exception(f"match {key}: {outcome}", outcome)
                 continue
             fetch = outcome
             if not fetch.ok:
@@ -2562,6 +2572,13 @@ class FotMobIngestService:
                         ),
                     ]
                 )
+                # Preserve observed schema evidence even if writing its manifest
+                # fails: infrastructure recovery must not mask malformed data.
+                if missing or unknown:
+                    result.errors.append(
+                        f"match {key} incomplete: missing={missing}, "
+                        f"unknown_paths={list(unknown)}"
+                    )
                 paths_written = self._commit_for_fetch(
                     fetch,
                     target_type="match",
@@ -2589,16 +2606,11 @@ class FotMobIngestService:
                     ),
                 )
                 result.tables.extend(paths_written)
-                if missing or unknown:
-                    result.errors.append(
-                        f"match {key} incomplete: missing={missing}, "
-                        f"unknown_paths={list(unknown)}"
-                    )
-                else:
+                if not missing and not unknown:
                     result.succeeded += 1
                     result.counts["rows"] = result.counts.get("rows", 0) + 1
             except Exception as exc:
-                result.errors.append(f"match {key} parse: {type(exc).__name__}: {exc}")
+                result.record_exception(f"match {key} parse: {type(exc).__name__}: {exc}", exc)
                 self._commit_for_fetch(
                     fetch,
                     target_type="match",
@@ -2729,7 +2741,7 @@ class FotMobIngestService:
         fetched = self._fetch_many(requests)
         for key, outcome in fetched.items():
             if isinstance(outcome, Exception):
-                result.errors.append(f"team {key}: {outcome}")
+                result.record_exception(f"team {key}: {outcome}", outcome)
                 continue
             fetch = outcome
             # A team the source has no page for is not always a transport
@@ -2836,7 +2848,7 @@ class FotMobIngestService:
                     "squad_members", 0
                 ) + len(squad_rows)
             except Exception as exc:
-                result.errors.append(f"team {key} parse: {type(exc).__name__}: {exc}")
+                result.record_exception(f"team {key} parse: {type(exc).__name__}: {exc}", exc)
                 self._commit_for_fetch(
                     fetch,
                     target_type="team",
@@ -3055,9 +3067,7 @@ class FotMobIngestService:
             try:
                 current_build = build_id or self._resolve_next_build_id()
             except Exception as exc:
-                result.errors.append(
-                    f"Next build discovery: {type(exc).__name__}: {exc}"
-                )
+                result.record_exception(f"Next build discovery: {type(exc).__name__}: {exc}", exc)
                 for player_id in due:
                     terminal_outcomes[str(player_id)] = "build_discovery_failure"
                 attach_terminal_outcomes()
@@ -3080,11 +3090,11 @@ class FotMobIngestService:
                         self._fetch_many(requests_for(rotated, refreshed_build))
                     )
             except Exception as exc:
-                result.errors.append(f"Next build refresh: {type(exc).__name__}: {exc}")
+                result.record_exception(f"Next build refresh: {type(exc).__name__}: {exc}", exc)
 
         for key, outcome in fetched.items():
             if isinstance(outcome, Exception):
-                result.errors.append(f"player {key}: {outcome}")
+                result.record_exception(f"player {key}: {outcome}", outcome)
                 terminal_outcomes[str(key)] = (
                     "missing_raw_input"
                     if int(key) in missing_raw_player_ids
@@ -3160,7 +3170,7 @@ class FotMobIngestService:
                     ) + 1
                 terminal_outcomes[str(key)] = ManifestStatus.SUCCESS.value
             except Exception as exc:
-                result.errors.append(f"player {key} parse: {type(exc).__name__}: {exc}")
+                result.record_exception(f"player {key} parse: {type(exc).__name__}: {exc}", exc)
                 failure_status = _failure_status(exc)
                 self._commit_for_fetch(
                     fetch,
