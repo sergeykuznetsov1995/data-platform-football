@@ -117,6 +117,74 @@ def test_summary_includes_refill_against_original_7200_seconds(monkeypatch):
     assert report['refill_stop_reason'] == 'empty_queue'
 
 
+def test_failed_refill_report_is_counted_without_return_xcom(tmp_path, monkeypatch, capsys):
+    module = _module()
+    from utils import sofascore_refresh_window
+
+    run_id = 'scheduled__2026-10-02T08:30:00+00:00'
+    env = {'SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH': '15000'}
+    monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
+    monkeypatch.setattr(module, '_validate_refresh_scope', lambda env: {
+        'status': 'partial', 'elapsed_s': 4098.2})
+    failed = {'status': 'failed', 'stop_reason': 'scope_failure',
+              'outcomes': [{'status': 'failed', 'elapsed_s': 1653.2}]}
+
+    def refill_window(**kwargs):
+        kwargs['persist'](failed)
+        return failed
+
+    monkeypatch.setattr(sofascore_refresh_window, 'refill_window', refill_window)
+    dag_run = SimpleNamespace(run_type='scheduled', get_task_instances=lambda: [])
+    with pytest.raises(module.AirflowException, match='refresh refill failed'):
+        module._refill_refresh_window(
+            run_id=run_id, dag_run=dag_run,
+            ti=SimpleNamespace(xcom_pull=lambda task_ids: [{'env': env}]))
+    values = {'validate_refresh_scope': [
+        {'status': 'partial', 'elapsed_s': 4098.2 / 25} for _ in range(25)],
+        'refill_refresh_window': None}
+    context = {'run_id': run_id, 'dag_run': dag_run,
+               'ti': SimpleNamespace(xcom_pull=lambda task_ids: values[task_ids])}
+    summary = module._window_summary(context)
+    assert summary['scopes'] == 26
+    assert summary['window_used_s'] == 5751.4
+    assert summary['window_use'] == 0.799
+    assert summary['refill_stop_reason'] == 'scope_failure'
+    dag_run.get_task_instances = lambda: [
+        SimpleNamespace(task_id='refill_refresh_window', state='failed')]
+    with pytest.raises(module.AirflowException, match='attempt failed: refill_refresh_window'):
+        module._propagate_status(**context)
+    assert '"window_used_s": 5751.4' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('contents', [None, '{', '[]', json.dumps({
+    'run_id': 'other-run', 'outcomes': [{'elapsed_s': 1000}], 'stop_reason': 'scope_failure'})])
+def test_summary_ignores_unavailable_or_wrong_run_refill_report(tmp_path, monkeypatch, contents):
+    module = _module()
+    monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
+    if contents is not None:
+        (tmp_path / 'refill-run.json').write_text(contents)
+    values = {'validate_refresh_scope': [{'status': 'partial', 'elapsed_s': 100}],
+              'refill_refresh_window': None}
+    summary = module._window_summary({
+        'run_id': 'run', 'ti': SimpleNamespace(xcom_pull=lambda task_ids: values[task_ids])})
+    assert summary['window_used_s'] == 100
+    assert summary['refill_stop_reason'] is None
+
+
+def test_summary_does_not_count_refill_report_twice(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
+    refill = {'run_id': 'run', 'outcomes': [{'status': 'refreshed', 'elapsed_s': 200}],
+              'stop_reason': 'empty_queue'}
+    (tmp_path / 'refill-run.json').write_text(json.dumps(refill))
+    values = {'validate_refresh_scope': [{'status': 'partial', 'elapsed_s': 100}],
+              'refill_refresh_window': refill}
+    summary = module._window_summary({
+        'run_id': 'run', 'ti': SimpleNamespace(xcom_pull=lambda task_ids: values[task_ids])})
+    assert summary['scopes'] == 2
+    assert summary['window_used_s'] == 300
+
+
 def test_refill_timeout_kills_group_even_when_parent_exits_on_term(monkeypatch):
     module = _module()
     class Child:
