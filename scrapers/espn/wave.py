@@ -9,10 +9,12 @@ Each planned tournament runs on its own (mapped task): Summary of new finals
 (cache-first, one download per match), parse, one batch write.  A failing
 tournament is red with its first error; its neighbours publish.
 
-A match that left its day is not an accident: core answers 404 -> ``withdrawn``;
-core answers -> ``moved`` (new kickoff when another fetched day lists it, the
-old one otherwise — ``competitions/{id}/status`` carries no date).  The wave
-counts them and warns above ``ESPN_WITHDRAWN_ALERT``; it never stops on them.
+A match that left its day is checked through fixed core status and event
+metadata endpoints: status 404 -> ``withdrawn``; a known status and validated
+event identity/date -> ``moved`` with the current kickoff. Unpublished moved
+matches remain eligible outside the scoreboard window; a confirmed future
+kickoff waits until due. Metadata failures preserve the row and fail its
+tournament. The wave warns above ``ESPN_WITHDRAWN_ALERT`` withdrawals.
 
 Freshness meter (#1505): every match row carries ``status_checked_at`` (when
 its status was read) and ``first_published_at`` (carried from the stored row,
@@ -53,7 +55,6 @@ from . import editions_store, recheck, urls
 from .bronze_rows import (
     MOVED,
     PENDING,
-    PRESENCE_VALUES,
     WITHDRAWN,
     MatchPayload,
     RawRef,
@@ -64,6 +65,7 @@ from .bronze_writer import TournamentBatch, write_tournament_batch
 from .core_lists import collect_refs, event_ids as core_event_ids, parse_event_status
 from .denominator import DenominatorRow
 from .editions import EditionState
+from .event_metadata import parse_event_metadata
 from .journal import flush_journal, journal_rows
 from .models import (
     AgeClass,
@@ -390,6 +392,20 @@ def bronze_window(trino, start: date, end: date) -> list[BronzeMatch]:
     return [BronzeMatch.from_row(row) for row in rows]
 
 
+def bronze_unresolved_moved(trino, now: datetime) -> list[BronzeMatch]:
+    """Retain unresolved moved matches after their old scoreboard day is gone.
+
+    A confirmed future kickoff waits until due; an unconfirmed date remains
+    unresolved. These small core reads do not spend Summary downloads.
+    """
+    rows = trino.execute_query(
+        _select("disposition = 'moved' AND NOT terminal AND duplicate_of IS NULL "
+                "AND first_published_at IS NULL AND (kickoff <= ? OR NOT kickoff_confirmed)"),
+        (_naive(now),),
+    )
+    return [BronzeMatch.from_row(row) for row in rows]
+
+
 def bronze_stale(trino, now: datetime) -> list[BronzeMatch]:
     """Open POSTPONED/SUSPENDED matches older than ``STALE_AFTER``."""
 
@@ -456,6 +472,9 @@ class TournamentWork:
     # event_id -> ISO time core answered the status of a match no fetched
     # day lists (``status_checked_at`` of its row).
     checked_at: Mapping[int, str] = field(default_factory=dict)
+    # Exact raw identity of core event metadata read by the plan. No response
+    # URL is followed; the runner replays these bytes, including on retries.
+    metadata: Mapping[int, Mapping[str, str]] = field(default_factory=dict)
     # event_id -> recheck kind (#1506): the Summary is downloaded again.
     rechecks: Mapping[int, str] = field(default_factory=dict)
     # ISO time of the plan with rechecks: a Summary the raw store holds from
@@ -489,6 +508,7 @@ class TournamentWork:
             "presence": {str(key): value for key, value in sorted(self.presence.items())},
             "statuses": {str(key): value for key, value in sorted(self.statuses.items())},
             "checked_at": {str(key): value for key, value in sorted(self.checked_at.items())},
+            "metadata": {str(key): dict(value) for key, value in sorted(self.metadata.items())},
             "rechecks": {str(key): value for key, value in sorted(self.rechecks.items())},
             "planned_at": self.planned_at,
             "error": self.error,
@@ -510,6 +530,7 @@ class TournamentWork:
             presence={int(key): item for key, item in value["presence"].items()},
             statuses={int(key): item for key, item in value["statuses"].items()},
             checked_at={int(key): item for key, item in value.get("checked_at", {}).items()},
+            metadata={int(key): dict(item) for key, item in value.get("metadata", {}).items()},
             rechecks={int(key): item for key, item in value.get("rechecks", {}).items()},
             planned_at=value.get("planned_at"),
             error=value.get("error"),
@@ -721,7 +742,9 @@ def check_presence(
         raise
     except _STATUS_ERRORS as exc:
         return None, None, f"status of {stored.event_id}: {type(exc).__name__}: {exc}"
-    if status == stored.status or status not in STATUS_MAP:
+    if status not in STATUS_MAP:
+        return None, None, f"status of {stored.event_id}: unknown status {status}"
+    if status == stored.status:
         return MOVED, None, None
     return MOVED, status, None
 
@@ -876,6 +899,8 @@ def plan_wave(
         match.event_id: match
         for match in bronze_window(trino, days[0] - timedelta(days=1), days[-1] + timedelta(days=1))
     }
+    if window is None:
+        stored.update((match.event_id, match) for match in bronze_unresolved_moved(trino, now))
     # Only tournaments whose days were read completely are compared.
     usable = {slug for slug in by_slug if slug not in errors}
     status_errors: dict[str, str] = {}
@@ -921,6 +946,7 @@ def plan_wave(
     presence: dict[int, str] = {}
     statuses: dict[int, str] = {}
     checked_at: dict[int, str] = {}
+    metadata: dict[int, dict[str, str]] = {}
 
     def add(slug: str, year: int, event_id: int) -> None:
         event_ids.setdefault((slug, year), set()).add(event_id)
@@ -945,8 +971,10 @@ def plan_wave(
         if match.event_id not in found
         and not match.terminal
         and match.competition_slug in usable
-        and espn_day(match.kickoff) in days
-        and match.disposition not in PRESENCE_VALUES
+        and match.duplicate_of is None
+        and (espn_day(match.kickoff) in days or (window is None and match.disposition == MOVED))
+        and match.disposition != WITHDRAWN
+        and (match.disposition != MOVED or match.kickoff <= now or not match.kickoff_confirmed)
     ]
     if check_stale and window is None:
         stale = {
@@ -967,9 +995,27 @@ def plan_wave(
             logger.warning("ESPN %s: %s", match.competition_slug, error)
             status_errors.setdefault(match.competition_slug, error)
             continue
-        if mark is None or (mark == match.disposition and status is None):
+        if mark is None:
             continue
         if mark == MOVED:
+            competition = targets[by_slug[match.competition_slug].espn_id]
+            edition = next((item for item in competition.editions
+                            if item.source_season_year == match.season_year), None)
+            if edition is None:
+                status_errors.setdefault(match.competition_slug, f"no edition {match.season_year} for moved event")
+                continue
+            try:
+                result = _fetch(client, urls.event_metadata(match.competition_slug, match.event_id),
+                                force_refresh=True)
+                parse_event_metadata(result.body, competition=competition, edition=edition,
+                                     event=match.schedule_row(competition, edition))
+            except AllOriginsBlocked:
+                raise
+            except _STATUS_ERRORS as exc:
+                status_errors.setdefault(match.competition_slug, f"metadata of {match.event_id}: {type(exc).__name__}: {exc}")
+                continue
+            metadata[match.event_id] = dict(uri=result.raw_uri, sha256=result.content_hash,
+                                           fetched_at=result.fetched_at)
             checked_at[match.event_id] = _naive(now).isoformat()
         if status is not None:
             statuses[match.event_id] = status
@@ -1009,6 +1055,7 @@ def plan_wave(
                 presence={key: presence[key] for key in sorted(ids) if key in presence},
                 statuses={key: statuses[key] for key in sorted(ids) if key in statuses},
                 checked_at={key: checked_at[key] for key in sorted(ids) if key in checked_at},
+                metadata={key: metadata[key] for key in sorted(ids) if key in metadata},
                 rechecks={key: rechecks[key] for key in sorted(ids) if key in rechecks},
                 planned_at=now.isoformat() if any(key in rechecks for key in ids) else None,
                 # A failed status check: the planned matches still publish,
@@ -1217,11 +1264,22 @@ def _absent_payload(
         datetime.fromisoformat(checked) if checked is not None else known.status_checked_at
     )
     status = work.statuses.get(known.event_id)
+    metadata = work.metadata.get(known.event_id)
+    raw = known.raw_ref()
+    event_metadata = None
+    if metadata is not None:
+        body = client.raw_store.load_exact(metadata['uri'], metadata['sha256'])
+        event_metadata = parse_event_metadata(body, competition=competition, edition=edition,
+                                              event=known.schedule_row(competition, edition))
+        raw = RawRef(metadata['uri'], metadata['sha256'], datetime.fromisoformat(metadata['fetched_at']))
+    def schedule_row(**changes):
+        schedule = known.schedule_row(competition, edition, **changes)
+        return event_metadata.apply(schedule) if event_metadata is not None else schedule
     if status is not None and STATUS_MAP[status].played_final:
         result = _fetch(client, urls.summary(work.slug, known.event_id), force_refresh=False)
         scores = _header_scores(result.body)
         if scores is not None:
-            schedule = known.schedule_row(competition, edition, status=status, scores=scores)
+            schedule = schedule_row(status=status, scores=scores)
             parsed = parse_summary(
                 result.body, competition=competition, edition=edition, event=schedule
             )
@@ -1232,10 +1290,10 @@ def _absent_payload(
             )
         logger.warning("ESPN %s: final without a header score, kept as moved", known.event_id)
         status, presence = None, MOVED
-    schedule = known.schedule_row(competition, edition, status=status)
+    schedule = schedule_row(status=status)
     return known.carried(
         MatchPayload(
-            schedule, None, known.raw_ref(), presence, status_checked_at=status_checked_at
+            schedule, None, raw, presence, status_checked_at=status_checked_at
         )
     )
 
