@@ -539,6 +539,11 @@ docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace s
 Trino также не ограничена этим числом. Supervisor должен ждать подтверждённого
 дренажа; `TimeoutStopSec=infinity` с контролем статуса не обрывает commit.
 
+Конечный статус сохраняется как `terminal_status` перед `draining`: прерывание
+финальной публикации после принятия S2 восстанавливает `complete` без новых HTTP
+и повторного окна S2. Остаток outbox отмечается `final_publication_interrupted`
+и допубликуется командой `publish`.
+
 Перед выходом контроллер join-ит все SQL-потоки и публикует конечный срез outbox
 до времени завершения HTTP. Новые попытки других процессов не продлевают этот срез;
 число пакетов ограничено исходным числом dirty-строк. Ошибка/занятый flock оставляет

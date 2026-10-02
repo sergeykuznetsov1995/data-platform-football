@@ -879,3 +879,36 @@ def test_publish_recovery_reconciles_status_without_resuming_http(controller, mo
     assert c.stop_file.exists()
     assert c.store.get()['status'] == 'complete'
     assert c.gate.snapshot() == before
+
+
+def test_restart_after_crash_during_final_drain_never_restarts_accepted_s2(controller, monkeypatch):
+    from scrapers.espn import trino_manager
+    c = controller
+    c.state.update(status='complete', accepted_step=2, baseline_p95_ms=100,
+                   completed=[dict(step=2, reason='accepted_s2')])
+    c.store.save(c.state)
+    journal = AttemptJournal(c.store.path.parent / 'http-attempts.sqlite3', utcnow_fn=lambda: START)
+    journal.begin(run_id='r', task_id='t', requested_at=START,
+                  origin='https://site.web.api.espn.com', endpoint='summary', lane='history', step=2)
+    def crash(**kwargs):
+        raise SystemExit('process interrupted while publisher drains')
+    c.io = SimpleNamespace(close=crash)
+    c.initialize = lambda: None
+    with pytest.raises(SystemExit):
+        c.run_locked()
+    assert c.store.get()['status'] == 'draining'
+    def forbidden():
+        pytest.fail('completed recovery must not create a SQL manager or restart HTTP')
+    monkeypatch.setattr(trino_manager, 'EspnTrinoTableManager', forbidden)
+    assert main(['run', '--state-dir', str(c.store.path.parent)]) == 0
+    recovered = c.store.get()
+    assert recovered['status'] == 'complete'
+    assert recovered['accepted_step'] == 2
+    assert recovered['baseline_p95_ms'] == 100
+    assert recovered['completed'] == c.state['completed']
+    assert recovered['publication']['error'] == 'final_publication_interrupted'
+    assert recovered['publication']['total_pending'] == 1
+    assert journal.pending() == 1
+    with pytest.raises(ValueError, match='already complete'):
+        main(['resume', '--state-dir', str(c.store.path.parent)])
+    assert c.store.get()['accepted_step'] == 2

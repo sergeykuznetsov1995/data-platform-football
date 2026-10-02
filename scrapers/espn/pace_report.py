@@ -168,8 +168,11 @@ def write_metrics(rows):
 
 def format_measurement(report):
     """Compact owner-readable evidence; missing fields stay explicit warnings."""
+    publication = (report or {}).get('publication') or {}
+    publication_note = ([f"  публикация HTTP: {publication['error']} ⚠️; durable outbox сохранён"]
+                        if publication.get('error') else [])
     if not report or report.get('stale'):
-        return ['• ESPN темп: нет свежих данных контроллера ⚠️']
+        return ['• ESPN темп: нет свежих данных контроллера ⚠️'] + publication_note
     completed = report.get('completed')
     if completed:
         lines = []
@@ -177,8 +180,8 @@ def format_measurement(report):
             lines.extend(format_measurement(row))
         last = completed[-1]
         if (last.get('step'), last.get('start'), last.get('end')) != (report.get('step'), report.get('start'), report.get('end')):
-            lines.extend(format_measurement({k: v for k, v in report.items() if k != 'completed'}))
-        return lines
+            lines.extend(format_measurement({k: v for k, v in report.items() if k not in ('completed', 'publication')}))
+        return lines + publication_note
     def number(value, suffix=''):
         return 'нет данных ⚠️' if value is None else f'{value:.1f}{suffix}'
     m = report.get('metrics', {})
@@ -191,9 +194,6 @@ def format_measurement(report):
                   f"p95 {number(write.get('p95_seconds'), ' с')}, доля {number(100 * write['fraction'] if write.get('fraction') is not None else None, '%')}")
     isolated = report.get('isolated_benchmark')
     isolated_text = ('не запускался' if not isolated else number(isolated.get('p95_seconds'), ' с'))
-    publication = report.get('publication') or {}
-    publication_note = ([f"  публикация HTTP: {publication['error']} ⚠️; durable outbox сохранён"]
-                        if publication.get('error') else [])
     return [
         f"• ESPN темп S{report.get('step', '?')}: {report.get('start', '?')} — {report.get('end', '?')} UTC",
         f"  попытки A/B {m.get('attempts_a', '?')}/{m.get('attempts_b', '?')}; 403 {m.get('count_403', '?')}; 429 {m.get('count_429', '?')}; 5xx/timeout {number(share, '%')}",

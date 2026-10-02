@@ -155,3 +155,20 @@ def test_ddl_is_inside_publisher_lock(tmp_path, monkeypatch):
     finish(journal, begin(journal))
     assert journal.flush(conn) == 1
     assert not held
+
+
+@pytest.mark.parametrize('shape', ['complete_same', 'complete_new', 'stale'])
+def test_publication_error_visible_once_in_every_status_shape(shape):
+    from scrapers.espn.pace_report import format_measurement
+    row = dict(step=2, start='a', end='b', reason='accepted_s2')
+    report = dict(row, publication=dict(error='RuntimeError', pending=12))
+    if shape.startswith('complete'):
+        report['completed'] = [row]
+        if shape == 'complete_new':
+            report['end'] = 'c'
+    else:
+        report['stale'] = True
+    lines = format_measurement(report)
+    warnings = [line for line in lines if 'публикация HTTP:' in line]
+    assert len(warnings) == 1
+    assert 'RuntimeError' in warnings[0]

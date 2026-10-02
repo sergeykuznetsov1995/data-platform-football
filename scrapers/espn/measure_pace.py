@@ -77,6 +77,21 @@ def validate_state(state, policy_hash, workload_hash):
         raise ValueError('invalid persisted baseline')
 
 
+def recover_completed_drain(store, state, journal, now):
+    """A crash during final publication cannot revoke durable S2 acceptance."""
+    if state and state.get('status') == 'draining' and state.get('terminal_status') == 'complete':
+        pending = journal.pending()
+        publication = dict(at=now.timestamp(), final=True, total_pending=pending,
+                           error='final_publication_interrupted' if pending else None)
+        # Record the interrupted publication before restoring the terminal state.
+        # If either write fails, the persisted terminal intent still forbids HTTP.
+        store.record('publication', **publication)
+        state.update(status='complete', publication=publication, publication_pending=pending)
+        state.pop('terminal_status', None)
+        store.save(state)
+    return state
+
+
 class MeasurementStopped(RuntimeError):
     pass
 
@@ -124,7 +139,7 @@ class Controller:
         snapshot = self.gate.snapshot()
         policy_hash = digest(asdict(self.gate.policy))
         workload_hash = digest(dict(slug='eng.1', year=2015, ids=self.ids, endpoints=['summary']))
-        state = self.store.get()
+        state = recover_completed_drain(self.store, self.store.get(), self.journal, self.now())
         if state is None:
             if snapshot['confirmed_ceiling'] != 0:
                 raise ValueError('a new measurement must start at confirmed S0')
@@ -508,6 +523,7 @@ class Controller:
                     self.state['status'] = 'failed' if error else 'stopped'
                     self.gate.lower_ceiling(self.state['accepted_step'])
                 terminal_status = self.state['status']
+                self.state['terminal_status'] = terminal_status
                 self.state['status'] = 'draining'
                 self.state['heartbeat'] = self.now().timestamp()
                 self.store.record('lifecycle', self.state['heartbeat'], event=self.state['status'])
@@ -528,6 +544,7 @@ class Controller:
                     else:
                         self.journal.flush(self.trino.connection)
                     self.state['status'] = terminal_status
+                    self.state.pop('terminal_status', None)
                     self.store.record('lifecycle', self.now().timestamp(), event=terminal_status)
                     self.store.save(self.state)
         return self.state
@@ -605,6 +622,9 @@ def _run_owned(args, store, stop_file, parser):
     gate = None
     try:
         previous = store.get()
+        if previous and previous.get('status') == 'draining' and previous.get('terminal_status') == 'complete':
+            previous = recover_completed_drain(
+                store, previous, AttemptJournal(args.state_dir / 'http-attempts.sqlite3'), now_utc())
         if args.command == 'publish':
             from .pace_io import drain_publication
             trino = EspnTrinoTableManager()
@@ -618,6 +638,8 @@ def _run_owned(args, store, stop_file, parser):
         if args.command == 'run' and (stop_file.exists() or (previous and previous.get('status') == 'complete')):
             print('controller complete or explicitly stopped; no measurement started')
             return 0
+        if args.command in ('start', 'resume') and previous and previous.get('status') == 'complete':
+            raise ValueError('measurement already complete; use status or publish')
         gate = TransportGate(lane='history', state_path=args.state_dir / 'gate.json')
         trino = EspnTrinoTableManager()
         ids = accepted_ids(trino)
