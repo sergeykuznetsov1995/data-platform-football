@@ -99,7 +99,7 @@ class AttemptJournal:
             r['complete'] and r['http_ms'] is not None and (r['status'] is not None or r['timeout']) for r in rows
         )
 
-    def flush(self, conn):
+    def flush(self, conn, *, max_batches=None, blocking=True, before=None):
         """Recover all workers' dirty starts/results, idempotently, in batches.
 
         A separate flock serializes publishers without blocking HTTP recording. If Trino commits and
@@ -108,20 +108,27 @@ class AttemptJournal:
         """
         descriptor = os.open(str(self.path) + '.publish.lock', os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                return 0
             _execute(conn, 'CREATE SCHEMA IF NOT EXISTS iceberg.ops')
             columns = ', '.join(f'{name} {kind}' for name, kind in ATTEMPT_COLUMNS)
             _execute(conn, f'CREATE TABLE IF NOT EXISTS {ATTEMPT_TABLE} ({columns})')
-            return self._flush_locked(conn)
+            return self._flush_locked(conn, max_batches=max_batches, before=before)
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    def _flush_locked(self, conn):
-        count = 0
-        while True:
+    def _flush_locked(self, conn, *, max_batches=None, before=None):
+        count = batches = 0
+        while max_batches is None or batches < max_batches:
             with self._db() as db:
-                pending = db.execute('SELECT id, payload FROM attempts WHERE dirty=1 LIMIT 200').fetchall()
+                pending = db.execute(
+                    'SELECT id, payload FROM attempts WHERE dirty=1'
+                    + (' AND requested_at<?' if before is not None else '') + ' LIMIT 200',
+                    (utc(before).isoformat(),) if before is not None else (),
+                ).fetchall()
             if not pending:
                 return count
             rows = [json.loads(payload) for _, payload in pending]
@@ -145,3 +152,12 @@ class AttemptJournal:
                 # Acknowledge only the exact version sent, then replay updates.
                 db.executemany('UPDATE attempts SET dirty=0 WHERE id=? AND payload=?', pending)
             count += len(pending)
+            batches += 1
+        return count
+
+    def pending(self, *, before=None):
+        """Unacknowledged versions remain durable across stop and restart."""
+        with self._db() as db:
+            return db.execute('SELECT COUNT(*) FROM attempts WHERE dirty=1'
+                              + (' AND requested_at<?' if before is not None else ''),
+                              (utc(before).isoformat(),) if before is not None else ()).fetchone()[0]

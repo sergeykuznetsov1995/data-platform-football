@@ -49,7 +49,9 @@ class Journal:
         return [r for r in self.data if start <= datetime.fromisoformat(r['requested_at']) < end]
     def coverage(self, start, end):
         return self.complete and bool(self.rows(start, end))
-    def flush(self, conn):
+    def flush(self, conn, **kwargs):
+        return 0
+    def pending(self, **kwargs):
         return 0
 
 
@@ -502,3 +504,378 @@ def test_slow_final_benchmark_is_reused_without_relaxing_evidence_age(controller
     assert report['reason'] == 'accepted_s2'
     assert report['isolated_benchmark']['measured_at'] == measured_at
     assert calls == [2]
+
+
+def test_slow_debt_result_never_renews_http_admission(controller):
+    c = controller
+    original = c.trino.execute_query
+    def slow(sql, *args):
+        result = original(sql, *args)
+        if 'AS debt' in sql:
+            c.clock.now += timedelta(seconds=31)
+        return result
+    c.trino.execute_query = slow
+    c.observe(force=True)
+    with pytest.raises(LaneClosed, match='unknown or stale'):
+        c.check()
+    assert not c.observation['known']
+
+
+class AsyncSQL:
+    """Production lane fixture: one manager/connection per constructing thread."""
+    def __init__(self):
+        self.owner = threading.get_ident()
+        self.name = threading.current_thread().name.rsplit('-', 1)[-1]
+        self.connection = self
+        self.closed = False
+    def execute_query(self, sql):
+        assert threading.get_ident() == self.owner
+        return [[0]] if 'AS debt' in sql else [['eng.1', 100, 100, 0, 0, 0]]
+    def close(self):
+        assert threading.get_ident() == self.owner
+        self.closed = True
+
+
+def eventually(predicate, timeout=3):
+    import time
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            pytest.fail('condition did not become true')
+        time.sleep(0.005)
+
+
+def async_io(c, *, factory=AsyncSQL, read=None, publish=None, publish_seconds=60):
+    from scrapers.espn.measure_pace import read_freshness
+    from scrapers.espn.pace_io import PaceIO
+    if publish is not None:
+        c.journal.flush = publish
+    c.io = PaceIO(factory=factory, gate=c.gate, journal=c.journal, store=c.store,
+                  targets=c.targets, now=c.now, read_freshness=read or read_freshness,
+                  observe_seconds=0.01, freshness_seconds=60, publish_seconds=publish_seconds)
+    c.io.start()
+    c.io_started = True
+    return c.io
+
+
+def test_async_observer_survives_blocked_publication_freshness_and_aggregation(controller):
+    c = controller
+    release = threading.Event()
+    publishing, freshness = threading.Event(), threading.Event()
+    managers = []
+    def factory():
+        manager = AsyncSQL()
+        managers.append(manager)
+        return manager
+    def publish(connection, **kwargs):
+        assert connection.owner == threading.get_ident()
+        assert kwargs == dict(max_batches=1, blocking=False)
+        publishing.set()
+        assert release.wait(5)
+        return 0
+    def fresh(manager, targets, now):
+        assert manager.owner == threading.get_ident()
+        freshness.set()
+        assert release.wait(5)
+        return dict(eligible=True, checked_at=now.timestamp(), day='2026-09-30')
+    io = async_io(c, factory=factory, read=fresh, publish=publish)
+    try:
+        assert publishing.wait(2) and freshness.wait(2)
+        eventually(lambda: io.snapshot('debt'))
+        c.observe()
+        initial = len(c.store.rows('observation', 0, c.now().timestamp()))
+        # Deliberately block owner aggregation until independent observations land.
+        original = c.evidence
+        def slow_evidence():
+            eventually(lambda: len(c.store.rows('observation', 0, c.now().timestamp())) >= initial + 3)
+            return original()
+        c.evidence = slow_evidence
+        assert c.decide()['reason'] != 'eligible'
+        c.check()  # Fresh debt allows HTTP despite blocked unrelated SQL.
+        assert len({manager.owner for manager in managers}) == 3
+        assert all(manager.owner != c.owner for manager in managers)
+        assert not release.is_set()
+    finally:
+        release.set()
+        io.close()
+    assert all(manager.closed for manager in managers)
+    assert not any(thread.is_alive() for thread in io.threads)
+
+
+def test_async_slow_debt_stays_stale_until_real_recovery(controller):
+    c = controller
+    entered, release = threading.Event(), threading.Event()
+    class Slow(AsyncSQL):
+        def execute_query(self, sql):
+            if self.name == 'debt':
+                entered.set()
+                assert release.wait(5)
+            return super().execute_query(sql)
+    io = async_io(c, factory=Slow, publish=lambda *_args, **_kwargs: 0)
+    try:
+        assert entered.wait(2)
+        with pytest.raises(LaneClosed, match='unknown or stale'):
+            c.check()
+        c.clock.now += timedelta(seconds=31)
+        release.set()
+        eventually(lambda: io.snapshot('debt'))
+        # The first slow result is recorded as unknown, not a completion heartbeat.
+        eventually(lambda: any(row.get('error') == 'debt_query_stale'
+            for row in c.store.rows('observation', 0, c.now().timestamp())))
+        eventually(lambda: io.snapshot('debt')['known'])
+        c.observe()
+        assert c.state['start'] == c.now().timestamp()
+        c.check()
+        c.clock.now += timedelta(seconds=31)
+        with pytest.raises(LaneClosed, match='unknown or stale'):
+            c.check()
+    finally:
+        release.set()
+        io.close()
+
+
+def test_async_publication_failure_is_durable_and_retry_is_coalesced(controller):
+    c = controller
+    calls = []
+    def publish(conn, **kwargs):
+        calls.append(conn)
+        if len(calls) == 1:
+            raise RuntimeError('write failed')
+        return 200
+    io = async_io(c, publish=publish, publish_seconds=0.05)
+    try:
+        eventually(lambda: io.snapshot('publication'))
+        assert io.snapshot('publication')['error'] == 'RuntimeError'
+        c.observe()
+        assert c.store.rows('publication', 0, c.now().timestamp())[-1]['error'] == 'RuntimeError'
+        assert len(calls) == 1
+        io.request('publication')
+        eventually(lambda: len(calls) == 2 and io.snapshot('publication')['error'] is None)
+        assert calls[0] is calls[1]
+        assert io.snapshot('publication')['published'] == 200
+    finally:
+        io.close()
+
+
+def test_async_stop_waits_for_inflight_sql_and_closes_owned_connections(controller):
+    c = controller
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    def publish(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return 0
+    io = async_io(c, publish=publish)
+    assert entered.wait(2)
+    closer = threading.Thread(target=lambda: (io.close(), closed.set()))
+    closer.start()
+    try:
+        assert not closed.wait(0.05)
+        assert any(thread.is_alive() for thread in io.threads)
+    finally:
+        release.set()
+        closer.join(3)
+    assert closed.is_set()
+    assert not any(thread.is_alive() for thread in io.threads)
+
+
+def test_async_owner_polling_does_not_fabricate_observations_or_reset_covered_window(controller):
+    c = controller
+    io = async_io(c, publish=lambda *_args, **_kwargs: 0)
+    try:
+        eventually(lambda: io.snapshot('debt'))
+        c.observe()
+        initial = c.state['start']
+        for _ in range(4):
+            c.clock.now += timedelta(seconds=10)
+            io.request('debt')
+            eventually(lambda: io.snapshot('debt')['at'] == c.now().timestamp())
+        # Owner was busy for >30s, but actual observation had no gap.
+        c.observe()
+        assert c.state['start'] == initial
+        io.close()
+        before = c.store.rows('observation', 0, c.now().timestamp())
+        c.clock.now += timedelta(seconds=31)
+        c.observe(force=True)
+        assert c.store.rows('observation', 0, c.now().timestamp()) == before
+        with pytest.raises(LaneClosed, match='unknown or stale'):
+            c.check()
+    finally:
+        io.close()
+
+
+@pytest.mark.parametrize('protection', [None, 'history_freeze', 'reset'])
+def test_async_final_acceptance_uses_new_freshness_and_atomic_gate(controller, protection):
+    from scrapers.espn.measure_pace import read_freshness
+    c = controller
+    c.gate.policy = replace(c.gate.policy, pace=replace(c.gate.policy.pace,
+                           minimum_window_seconds=(300, 300, 300)))
+    armed = threading.Event()
+    calls = []
+    def fresh(manager, targets, now):
+        calls.append(now)
+        result = read_freshness(manager, targets, now)
+        if armed.is_set():
+            if protection == 'reset':
+                c.gate.report(c.gate.acquire('core'), status=429)
+            elif protection == 'history_freeze':
+                with c.gate._state() as state:
+                    state['history_frozen_until'] = now.timestamp() + 1800
+        return result
+    io = async_io(c, read=fresh, publish=lambda *_args, **_kwargs: 0)
+    try:
+        eventually(lambda: io.snapshot('debt') and io.snapshot('freshness'))
+        c.observe()
+        for step in range(3):
+            eventually(lambda: io.snapshot('debt')['known']
+                       and io.snapshot('debt')['revision'] == c.gate.snapshot()['revision'])
+            c.observe()
+            for _ in range(30):
+                c.clock.now += timedelta(seconds=10)
+                io.request('debt')
+                eventually(lambda: io.snapshot('debt')['at'] == c.now().timestamp())
+            fill_window(c, 300)
+            if step == 2:
+                armed.set()
+                before = len(calls)
+            report = c.decide()
+            if step < 2:
+                assert report['reason'] == 'eligible'
+        assert len(calls) > before
+        if protection:
+            assert report['reason'] in ('stale_revision', 'protection_active',
+                                        'freshness_changed_during_benchmark',
+                                        'observer_changed_during_benchmark')
+            assert c.state['status'] != 'complete'
+            assert c.state['accepted_step'] == 1
+        else:
+            assert report['reason'] == 'accepted_s2'
+            assert c.state['status'] == 'complete'
+    finally:
+        io.close()
+
+
+def test_async_run_stop_drains_and_restart_preserves_completed_baseline(controller):
+    c = controller
+    fill_window(c)
+    c.decide()
+    saved = c.store.get()
+    c.journal.flush = lambda *_args, **_kwargs: 0
+    c.journal.pending = lambda **_kwargs: 0
+    def make():
+        return Controller(gate=c.gate, journal=c.journal, store=c.store, ids=c.ids,
+                          trino=Trino(), targets=c.targets, client_factory=lambda *_: None,
+                          stop_file=c.stop_file, now=c.clock, io_factory=AsyncSQL)
+    c.clock.now += timedelta(seconds=40)
+    stopped = make()
+    c.stop_file.touch()
+    stopped.run_locked()
+    assert stopped.state['status'] == 'stopped'
+    assert stopped.state['publication']['final']
+    assert stopped.state['publication']['pending'] == 0
+    assert all(not thread.is_alive() for thread in stopped.io.threads)
+    c.stop_file.unlink()
+    resumed = make()
+    try:
+        resumed.initialize()
+        eventually(lambda: resumed.io.snapshot('debt'))
+        resumed.observe()
+        assert resumed.state['measurement_id'] == saved['measurement_id']
+        assert resumed.state['baseline_p95_ms'] == saved['baseline_p95_ms']
+        assert resumed.state['completed'] == saved['completed']
+        assert resumed.state['start'] > saved['start']
+    finally:
+        resumed.io.close()
+
+
+def test_query_start_age_gap_is_not_continuous_evidence(controller):
+    c = controller
+    start = c.state['start']
+    rows = [dict(at=start + 14, observed_at=start, known=True, debt=0, protected=False, step=0),
+            dict(at=start + 38, observed_at=start + 24, known=True, debt=0, protected=False, step=0)]
+    result = load_evidence([], rows, datetime.fromtimestamp(start + 14, timezone.utc),
+                           datetime.fromtimestamp(start + 38, timezone.utc), step=0, policy=c.gate.policy)
+    assert not result['continuous']
+
+
+def test_async_evidence_write_failure_is_visible_and_fail_closed(controller):
+    c = controller
+    original = c.store.record
+    def fail(kind, *args, **kwargs):
+        if kind == 'observation':
+            raise OSError('local disk failure')
+        return original(kind, *args, **kwargs)
+    c.store.record = fail
+    io = async_io(c, publish=lambda *_args, **_kwargs: 0)
+    try:
+        eventually(lambda: io.snapshot('debt'))
+        assert io.snapshot('debt')['error'] == 'evidence_write_OSError'
+        with pytest.raises(LaneClosed, match='unknown or stale'):
+            c.check()
+    finally:
+        io.close()
+
+
+def test_bounded_outbox_retries_exact_versions_and_final_cutoff(tmp_path, monkeypatch):
+    from scrapers.espn import attempts
+    from scrapers.espn.pace_io import drain_publication
+    journal = AttemptJournal(tmp_path / 'outbox.sqlite3', utcnow_fn=lambda: START)
+    for index in range(202):
+        at = START + timedelta(seconds=1 if index < 201 else 100)
+        identity = journal.begin(run_id='r', task_id='t', requested_at=at,
+                                 origin='https://site.web.api.espn.com', endpoint='summary',
+                                 lane='history', step=0)
+        journal.finish(identity, status=200, timeout=False, http_ms=1, direct_bytes=1)
+    queries = []
+    fail = [True]
+    def execute(conn, sql):
+        if sql.startswith('MERGE'):
+            queries.append(sql)
+            if fail[0]:
+                fail[0] = False
+                raise RuntimeError('commit acknowledgement lost')
+    monkeypatch.setattr(attempts, '_execute', execute)
+    with pytest.raises(RuntimeError):
+        journal.flush(object(), max_batches=1)
+    assert journal.pending() == 202
+    assert journal.flush(object(), max_batches=1) == 200
+    assert queries[0] == queries[1]  # same attempt IDs and values on replay
+    assert journal.pending() == 2
+    result = drain_publication(journal, SimpleNamespace(connection=object()),
+                               PaceStore(tmp_path / 'pace.sqlite3'), lambda: START + timedelta(seconds=10),
+                               START + timedelta(seconds=10))
+    assert result['pending'] == 0 and result['published'] == 1 and result['error'] is None
+    assert journal.pending() == 1  # concurrent newer traffic cannot extend final drain
+
+
+def test_publication_nonblocking_lock_preserves_dirty_outbox(tmp_path):
+    import fcntl
+    import os
+    journal = AttemptJournal(tmp_path / 'outbox.sqlite3', utcnow_fn=lambda: START)
+    descriptor = os.open(str(journal.path) + '.publish.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        assert journal.flush(object(), max_batches=1, blocking=False) == 0
+    finally:
+        os.close(descriptor)
+
+
+def test_publish_recovery_reconciles_status_without_resuming_http(controller, monkeypatch, capsys):
+    from scrapers.espn import attempts, trino_manager
+    c = controller
+    c.state.update(status='complete', publication_pending=30)
+    c.store.save(c.state)
+    c.stop_file.touch()
+    before = c.gate.snapshot()
+    journal = AttemptJournal(c.store.path.parent / 'http-attempts.sqlite3', utcnow_fn=lambda: START)
+    journal.begin(run_id='r', task_id='t', requested_at=START,
+                  origin='https://site.web.api.espn.com', endpoint='summary', lane='history', step=0)
+    monkeypatch.setattr(trino_manager, 'EspnTrinoTableManager', AsyncSQL)
+    monkeypatch.setattr(attempts, '_execute', lambda *_: None)
+    assert main(['publish', '--state-dir', str(c.store.path.parent)]) == 0
+    assert json.loads(capsys.readouterr().out)['pending'] == 0
+    report = read_status(c.store.path, now=c.clock())
+    assert report['publication_pending'] == 0
+    assert report['publication']['pending'] == 0
+    assert c.stop_file.exists()
+    assert c.store.get()['status'] == 'complete'
+    assert c.gate.snapshot() == before

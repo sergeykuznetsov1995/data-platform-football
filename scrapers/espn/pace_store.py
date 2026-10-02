@@ -65,3 +65,9 @@ class PaceStore:
             return [dict(at=at, **json.loads(payload)) for at, payload in db.execute(
                 'SELECT at, payload FROM evidence WHERE kind=? AND at>=? AND at<=? ORDER BY at, id',
                 (kind, float(start), float(end)))]
+
+    def latest(self, kind):
+        with self.db() as db:
+            row = db.execute('SELECT at, payload FROM evidence WHERE kind=? ORDER BY at DESC, id DESC LIMIT 1',
+                             (kind,)).fetchone()
+        return dict(at=row[0], **json.loads(row[1])) if row else None

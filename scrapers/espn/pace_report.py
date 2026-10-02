@@ -116,7 +116,7 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
     start, end = utc(start).timestamp(), utc(end).timestamp()
     observations = sorted(observations, key=lambda row: row['at'])
     continuous = bool(observations) and observations[0]['at'] <= start and observations[-1]['at'] >= end
-    continuous = continuous and all(0 <= b['at'] - a['at'] <= maximum_gap
+    continuous = continuous and all(0 <= b['at'] - a.get('observed_at', a['at']) <= maximum_gap
                                     for a, b in zip(observations, observations[1:]))
     continuous = continuous and all(o.get('known') is True for o in observations)
     interval = policy.pace.load_interval_seconds
@@ -136,7 +136,7 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
         right = bisect_left(observation_times, finish)
         selected = observations[max(0, left):right + 1]
         known = left >= 0 and right < len(observations) and all(o.get('known') is True for o in selected)
-        known = known and all(b['at'] - a['at'] <= maximum_gap for a, b in zip(selected, selected[1:]))
+        known = known and all(b['at'] - a.get('observed_at', a['at']) <= maximum_gap for a, b in zip(selected, selected[1:]))
         count = buckets.get(begin, 0)
         if not known:
             unknown += 1
@@ -191,6 +191,9 @@ def format_measurement(report):
                   f"p95 {number(write.get('p95_seconds'), ' с')}, доля {number(100 * write['fraction'] if write.get('fraction') is not None else None, '%')}")
     isolated = report.get('isolated_benchmark')
     isolated_text = ('не запускался' if not isolated else number(isolated.get('p95_seconds'), ' с'))
+    publication = report.get('publication') or {}
+    publication_note = ([f"  публикация HTTP: {publication['error']} ⚠️; durable outbox сохранён"]
+                        if publication.get('error') else [])
     return [
         f"• ESPN темп S{report.get('step', '?')}: {report.get('start', '?')} — {report.get('end', '?')} UTC",
         f"  попытки A/B {m.get('attempts_a', '?')}/{m.get('attempts_b', '?')}; 403 {m.get('count_403', '?')}; 429 {m.get('count_429', '?')}; 5xx/timeout {number(share, '%')}",
@@ -199,4 +202,4 @@ def format_measurement(report):
         f"  Iceberg: {write_text}; свежесть {fresh.get('ok', '?')}/{fresh.get('due', '?')} за {fresh.get('day', '?')} UTC",
         f"  изолированный стенд: p95 {isolated_text}; замер {isolated.get('measured_at', '?') if isolated else '?'}; массовая запись — проверка #1511",
         f"  повышение: {report.get('reason', 'нет данных ⚠️')}; измерительные чтения не увеличивают охват истории",
-    ]
+    ] + publication_note
