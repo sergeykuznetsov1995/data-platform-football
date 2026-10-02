@@ -2898,3 +2898,342 @@ def test_explicit_match_ids_keep_the_ungated_candidate_policy():
     assert "is_lineup_confirmed" not in sql
     assert "'not_available'" not in sql
     assert "ORDER BY date, game_id" in sql
+
+
+@pytest.fixture
+def source_revision_1998901():
+    """Parse the verified, unmodified source response through the real parser."""
+    import gzip
+    import hashlib
+    from pathlib import Path
+    from scrapers.whoscored.parsers import (
+        extract_matchcentre_data,
+        parse_matchcentre_data,
+    )
+
+    root = Path(__file__).parents[2] / "fixtures" / "whoscored"
+    pins = json.loads((root / "match-1998901-revision.json").read_text())
+    raw = gzip.decompress((root / "match-1998901-corrected.raw.gz").read_bytes())
+    assert hashlib.sha256(raw).hexdigest() == pins["new"]["payload_sha256"]
+    parsed = parse_matchcentre_data(
+        extract_matchcentre_data(raw.decode()),
+        scope=WhoScoredScope.parse("INT-World Cup=2026", season_format="single_year"),
+        game_id=1998901,
+        game=pins["game"],
+    )
+    commit = MatchCommit(
+        game_id=1998901,
+        league="INT-World Cup",
+        season="2026",
+        game=pins["game"],
+        payload_sha256=pins["new"]["payload_sha256"],
+        raw_uri=pins["new"]["raw_uri"],
+        events=parsed.events.rows,
+        lineups=parsed.lineups.rows,
+        lineups_available=True,
+        transport_mode="raw_cache",
+        parser_version=pins["new"]["parser_version"],
+        is_opta=True,
+        schedule_status=6,
+        datasets={
+            n: d.rows
+            for n, d in parsed.datasets.items()
+            if n not in {"events", "lineups"}
+        },
+        dataset_statuses={n: d.status.value for n, d in parsed.datasets.items()},
+    )
+    assert commit.batch_id == pins["new"]["batch_id"]
+    return pins, commit
+
+
+def _source_revision_harness(monkeypatch, pins, commit):
+    """Stateful append-only storage, including the old physical version."""
+    from scrapers.whoscored.repository import MATCH_DATASET_TABLES
+
+    writer, trino = MagicMock(), MagicMock()
+    repo = WhoScoredRepository(writer=writer, trino=trino)
+    old = pins["old"]
+    prior = [
+        [old[k] for k in ("batch_id", "payload_sha256", "raw_uri", "parser_version")]
+        + [json.dumps(old["counts"])]
+    ]
+    physical = {
+        table: {old["batch_id"]: count}
+        for name, table in MATCH_DATASET_TABLES.items()
+        for count in [old["counts"][name]]
+    }
+    manifests = []
+    baseline = {tuple(pins["identity"]): dict(old["counts"])}
+    monkeypatch.setattr(repo, "_current_dataset_counts", lambda _: baseline)
+    trino.table_exists.return_value = True
+
+    def query(sql):
+        if (
+            "SELECT batch_id, payload_sha256, raw_uri, parser_version, entity_counts_json"
+            in sql
+        ):
+            assert "league = 'INT-World Cup'" in sql
+            assert "season = '2026'" in sql
+            assert "game_id = 1998901" in sql
+            return prior
+        if "GROUP BY batch_id, events_count, lineups_count, entity_counts_json" in sql:
+            return [
+                (
+                    r["batch_id"],
+                    r["events_count"],
+                    r["lineups_count"],
+                    r["entity_counts_json"],
+                    1,
+                )
+                for r in manifests
+            ]
+        if "GROUP BY _game_batch_id" in sql:
+            table = next(t for t in physical if f".{t} " in sql)
+            return [(b, n) for b, n in physical[table].items() if b in sql]
+        if "SELECT league, season, game_id, batch_id, state, fetched_at" in sql:
+            return [
+                (
+                    r["league"],
+                    r["season"],
+                    r["game_id"],
+                    r["batch_id"],
+                    r["state"],
+                    r["fetched_at"],
+                )
+                for r in manifests[-1:]
+            ]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    def write(frame, *, table, **kwargs):
+        if table == "whoscored_match_ingest_manifest":
+            manifests.extend(frame.to_dict("records"))
+            baseline[tuple(pins["identity"])] = json.loads(
+                manifests[-1]["entity_counts_json"]
+            )
+        else:
+            for batch, n in frame.groupby("_game_batch_id").size().items():
+                physical[table][batch] = physical[table].get(batch, 0) + int(n)
+
+    trino.execute_query.side_effect = query
+    writer.write_dataframe.side_effect = write
+    return repo, writer, trino, prior, physical, manifests, baseline
+
+
+@pytest.mark.unit
+def test_approved_1998901_source_revision_publishes_all_datasets(
+    monkeypatch, source_revision_1998901
+):
+    from scrapers.whoscored.repository import MATCH_DATASET_TABLES
+
+    pins, commit = source_revision_1998901
+    repo, writer, trino, prior, physical, manifests, baseline = (
+        _source_revision_harness(monkeypatch, pins, commit)
+    )
+    assert repo.commit_matches((commit,)) == (pins["new"]["batch_id"],)
+    assert len(writer.write_dataframe.call_args_list) == 8
+    for name, table in MATCH_DATASET_TABLES.items():
+        assert physical[table] == {
+            pins["old"]["batch_id"]: pins["old"]["counts"][name],
+            pins["new"]["batch_id"]: pins["new"]["counts"][name],
+        }
+    assert len(manifests) == 1
+    for key in ("batch_id", "payload_sha256", "raw_uri", "parser_version"):
+        assert manifests[0][key] == pins["new"][key]
+    assert manifests[0]["state"] == "success"
+    assert json.loads(manifests[0]["entity_counts_json"]) == pins["new"]["counts"]
+    writer.reset_mock()
+    trino.reset_mock()
+    assert repo.commit_matches((commit,)) == (commit.batch_id,)
+    writer.write_dataframe.assert_not_called()
+    assert len(manifests) == 1
+    assert not any(
+        "SELECT batch_id, payload_sha256" in c.args[0]
+        for c in trino.execute_query.call_args_list
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "change",
+    [
+        "game_id",
+        "league",
+        "season",
+        "game",
+        "payload_sha256",
+        "parser_version",
+        "raw_uri",
+        "not_completed",
+        "old_batch",
+        "old_raw",
+        "old_parser",
+        "old_uri",
+        "old_counts",
+        "baseline_counts",
+        "empty_manifest",
+        "duplicate_manifest",
+        "invalid_json",
+        "non_object_counts",
+        "float_counts",
+        "bool_counts",
+        "missing_counts",
+        "events",
+        "lineups",
+        "substitutions",
+        "formations",
+        "team_match_stats",
+        "player_match_stats",
+        "event_x",
+        "stats_numeric",
+        "nan_row",
+    ],
+)
+def test_source_revision_1998901_rejects_unpinned_transition(
+    monkeypatch,
+    source_revision_1998901,
+    change,
+):
+    pins, commit = source_revision_1998901
+    repo, writer, trino, prior, physical, manifests, baseline = (
+        _source_revision_harness(monkeypatch, pins, commit)
+    )
+    query_expected = change in {
+        "old_batch",
+        "old_raw",
+        "old_parser",
+        "old_uri",
+        "old_counts",
+        "empty_manifest",
+        "duplicate_manifest",
+        "invalid_json",
+        "non_object_counts",
+        "float_counts",
+        "bool_counts",
+        "missing_counts",
+    }
+    if change in {"game_id", "league", "season"}:
+        commit = replace(
+            commit,
+            **{
+                change: {"game_id": 1998902, "league": "OTHER", "season": "2025"}[
+                    change
+                ]
+            },
+        )
+        baseline.clear()
+        baseline[(commit.league, commit.season, commit.game_id)] = dict(
+            pins["old"]["counts"]
+        )
+    elif change in {"payload_sha256", "parser_version", "raw_uri"}:
+        commit = replace(commit, **{change: "different"})
+    elif change == "game":
+        # Writer overrides parser rows with this label after checking the digest.
+        commit = replace(commit, game="Different game")
+    elif change == "not_completed":
+        commit = replace(commit, schedule_status=2)
+    elif change in {"old_batch", "old_raw", "old_uri", "old_parser"}:
+        prior[0][
+            {"old_batch": 0, "old_raw": 1, "old_uri": 2, "old_parser": 3}[change]
+        ] = "different"
+    elif change == "empty_manifest":
+        prior.clear()
+    elif change == "duplicate_manifest":
+        prior.append(list(prior[0]))
+    elif change in {"old_counts", "float_counts", "bool_counts", "missing_counts"}:
+        counts = dict(pins["old"]["counts"])
+        if change == "missing_counts":
+            del counts["matches"]
+        else:
+            counts["matches"] = {
+                "old_counts": 2,
+                "float_counts": 1.0,
+                "bool_counts": True,
+            }[change]
+        prior[0][4] = json.dumps(counts)
+    elif change == "invalid_json":
+        prior[0][4] = "{"
+    elif change == "non_object_counts":
+        prior[0][4] = "[]"
+    elif change == "baseline_counts":
+        baseline[tuple(pins["identity"])]["events"] += 1
+    elif change in {"events", "lineups"}:
+        commit = replace(commit, **{change: getattr(commit, change)[1:]})
+    elif change in {
+        "substitutions",
+        "formations",
+        "team_match_stats",
+        "player_match_stats",
+    }:
+        commit = replace(
+            commit, datasets={**commit.datasets, change: commit.datasets[change][1:]}
+        )
+    elif change in {"event_x", "nan_row"}:
+        events = list(commit.events)
+        events[0] = {**events[0], "x": float("nan") if change == "nan_row" else 99.999}
+        commit = replace(commit, events=events)
+    elif change == "stats_numeric":
+        rows = list(commit.datasets["team_match_stats"])
+        rows[0] = {**rows[0], "numeric_value": 999999.0}
+        commit = replace(commit, datasets={**commit.datasets, "team_match_stats": rows})
+    else:
+        raise AssertionError(change)
+    with pytest.raises(BatchConflict, match="completeness regression"):
+        repo.commit_matches((commit,))
+    writer.write_dataframe.assert_not_called()
+    assert trino.execute_query.call_count == int(query_expected)
+    assert manifests == []
+
+
+@pytest.mark.unit
+def test_source_revision_1998901_prior_query_failure_propagates(
+    monkeypatch, source_revision_1998901
+):
+    pins, commit = source_revision_1998901
+    repo, writer, trino, *_ = _source_revision_harness(monkeypatch, pins, commit)
+    trino.execute_query.side_effect = RuntimeError("Trino unavailable")
+    with pytest.raises(RuntimeError, match="Trino unavailable"):
+        repo.commit_matches((commit,))
+    writer.write_dataframe.assert_not_called()
+
+
+@pytest.mark.unit
+def test_source_revision_1998901_accepts_row_permutations(
+    monkeypatch, source_revision_1998901
+):
+    pins, commit = source_revision_1998901
+    commit = replace(
+        commit,
+        events=tuple(reversed(commit.events)),
+        lineups=tuple(reversed(commit.lineups)),
+        datasets={
+            name: tuple(reversed(rows)) for name, rows in commit.datasets.items()
+        },
+    )
+    repo, writer, trino, prior, physical, manifests, baseline = (
+        _source_revision_harness(monkeypatch, pins, commit)
+    )
+    assert repo.commit_matches((commit,)) == (commit.batch_id,)
+    assert json.loads(manifests[0]["entity_counts_json"]) == pins["new"]["counts"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("approved_first", [True, False])
+def test_source_revision_1998901_does_not_authorize_mixed_batch(
+    monkeypatch, source_revision_1998901, approved_first
+):
+    pins, approved = source_revision_1998901
+    repo, writer, trino, prior, physical, manifests, baseline = (
+        _source_revision_harness(monkeypatch, pins, approved)
+    )
+    other = replace(approved, game_id=1998902)
+    baseline[(other.league, other.season, other.game_id)] = dict(pins["old"]["counts"])
+    commits = (approved, other) if approved_first else (other, approved)
+    with pytest.raises(
+        BatchConflict, match="game 1998902/events completeness regression"
+    ):
+        repo.commit_matches(commits)
+    writer.write_dataframe.assert_not_called()
+    assert manifests == []
+    assert all(
+        set(batches) == {pins["old"]["batch_id"]} for batches in physical.values()
+    )
