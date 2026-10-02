@@ -1,7 +1,7 @@
 """Single persistent ESPN pace controller. Run via python -m scrapers.espn.measure_pace.
 
-Workers perform measurement HTTP only. The owning thread samples live debt,
-queries freshness and publishes evidence; no measurement writes target Bronze.
+Workers perform measurement HTTP only. Independent SQL lanes observe debt,
+check freshness and publish the outbox; no measurement writes target Bronze.
 """
 from __future__ import annotations
 
@@ -77,6 +77,21 @@ def validate_state(state, policy_hash, workload_hash):
         raise ValueError('invalid persisted baseline')
 
 
+def recover_completed_drain(store, state, journal, now):
+    """A crash during final publication cannot revoke durable S2 acceptance."""
+    if state and state.get('status') == 'draining' and state.get('terminal_status') == 'complete':
+        pending = journal.pending()
+        publication = dict(at=now.timestamp(), final=True, total_pending=pending,
+                           error='final_publication_interrupted' if pending else None)
+        # Record the interrupted publication before restoring the terminal state.
+        # If either write fails, the persisted terminal intent still forbids HTTP.
+        store.record('publication', **publication)
+        state.update(status='complete', publication=publication, publication_pending=pending)
+        state.pop('terminal_status', None)
+        store.save(state)
+    return state
+
+
 class MeasurementStopped(RuntimeError):
     pass
 
@@ -84,7 +99,7 @@ class MeasurementStopped(RuntimeError):
 class Controller:
     def __init__(self, *, gate, journal, store, ids, trino, targets, client_factory,
                  stop_file, history_stop=None, now=now_utc, monotonic=time.monotonic,
-                 max_step=2, benchmark_fn=None):
+                 max_step=2, benchmark_fn=None, io_factory=None):
         if max_step not in (2, 3):
             raise ValueError('acceptance maximum must be S2; S3 only with explicit opt-in')
         self.gate, self.journal, self.store = gate, journal, store
@@ -102,8 +117,15 @@ class Controller:
         self.last_publish = 0
         self.last_decision = 0
         self.decision_due = False
+        self.decision_requested_at = None
         self.owner = threading.get_ident()
         self.benchmark_fn = benchmark_fn
+        self.io = None
+        if io_factory is not None:
+            from .pace_io import PaceIO
+            self.io = PaceIO(factory=io_factory, gate=gate, journal=journal, store=store,
+                             targets=self.targets, now=now, read_freshness=read_freshness)
+        self.io_started = False
 
     def _main_thread(self):
         if threading.get_ident() != self.owner:
@@ -117,7 +139,7 @@ class Controller:
         snapshot = self.gate.snapshot()
         policy_hash = digest(asdict(self.gate.policy))
         workload_hash = digest(dict(slug='eng.1', year=2015, ids=self.ids, endpoints=['summary']))
-        state = self.store.get()
+        state = recover_completed_drain(self.store, self.store.get(), self.journal, self.now())
         if state is None:
             if snapshot['confirmed_ceiling'] != 0:
                 raise ValueError('a new measurement must start at confirmed S0')
@@ -140,6 +162,9 @@ class Controller:
         self.state = state
         self.store.record('lifecycle', now, event='start', measurement_id=state['measurement_id'])
         self.store.save(state)
+        if self.io is not None and not self.io_started:
+            self.io.start()
+            self.io_started = True
         self.observe(force=True)
 
     def check(self):
@@ -150,16 +175,31 @@ class Controller:
         if self.history_stop is not None and self.history_stop.exists():
             raise LaneClosed('history stop file present')
         now = self.now().timestamp()
-        observation = self.observation
-        if not observation or not observation['known'] or now - observation['at'] > MAXIMUM_GAP:
+        observation = self.io.snapshot('debt') if self.io is not None else self.observation
+        if (not observation or not observation['known']
+                or now - observation.get('observed_at', observation['at']) > MAXIMUM_GAP):
             raise LaneClosed('live-debt observation unknown or stale')
         if observation['debt']:
             raise LaneClosed('live debt pauses measurement')
-        if protected(self.gate.snapshot(), now):
+        snapshot = self.gate.snapshot()
+        if observation['revision'] != snapshot['revision']:
+            raise LaneClosed('live-debt observation belongs to a previous gate revision')
+        if protected(snapshot, now):
             raise LaneClosed('gate protection pauses measurement')
 
     def observe(self, *, force=False):
         self._main_thread()
+        if self.io is not None:
+            self.freshness = self.io.snapshot('freshness') or {}
+            observation = self.io.snapshot('debt')
+            if observation is None or observation == self.observation:
+                return
+            snapshot = self.gate.snapshot()
+            if observation.get('revision') != snapshot['revision']:
+                self.io.request('debt')
+                return
+            self._apply_observation(observation, snapshot)
+            return
         now = self.now()
         if not force and self.observation and now.timestamp() - self.observation['at'] < OBSERVE_SECONDS:
             return
@@ -173,11 +213,17 @@ class Controller:
             known, error = False, type(exc).__name__
             self.freshness = {}
         at = self.now().timestamp()
-        observation = dict(at=at, known=known, debt=debt, protected=protected(snapshot, at),
+        if at - now.timestamp() > MAXIMUM_GAP:
+            known, error = False, 'debt_query_stale'
+        observation = dict(at=at, observed_at=now.timestamp(), known=known, debt=debt, protected=protected(snapshot, at),
                            step=snapshot['step'], revision=snapshot['revision'], error=error)
+        self.store.record('observation', **observation)
+        self._apply_observation(observation, snapshot)
+
+    def _apply_observation(self, observation, snapshot):
         previous = self.observation
         self.observation = observation
-        self.store.record('observation', **observation)
+        at, known = observation['at'], observation['known']
         state = self.state
         if (self.max_step == 3 and state['step'] == 3 and snapshot['confirmed_ceiling'] == 2
                 and any(e['reason'] == 's3_expired' and e['at'] >= state['epoch']
@@ -185,22 +231,28 @@ class Controller:
             state.update(status='complete', accepted_step=2)
             state.setdefault('report', {})['reason'] = 's3_expired_return_s2'
             self.cancel.set()
-        gap = previous is not None and at - previous['at'] > MAXIMUM_GAP
+        gap = self.io is None and previous is not None and at - previous['at'] > MAXIMUM_GAP
         recovered = known and previous is not None and not previous['known']
         if (snapshot['revision'] != state['revision'] or snapshot['measurement_started_at'] != state['epoch']
-                or not known or gap or recovered):
-            state.update(start=at, revision=snapshot['revision'],
+                or not known or gap or recovered
+                or observation.get('restart_at', 0) > state['start']):
+            state.update(start=max(at if self.io is None else observation.get('restart_at', at), state['start']), revision=snapshot['revision'],
                          epoch=snapshot['measurement_started_at'], step=snapshot['step'])
-            self.store.record('lifecycle', at, event='window_restarted', reason='epoch_or_observation_gap')
+            self.store.record('lifecycle', at, event='window_restarted', reason=observation.get('error') or 'epoch_or_observation_gap')
         # The first observation defines a covered boundary after its query completed.
         if previous is None:
             state['start'] = at
         state['heartbeat'] = at
+        if self.io is not None:
+            state['publication'] = self.io.snapshot('publication')
+            state['freshness'] = self.io.snapshot('freshness')
         self.store.save(state)
 
     def evidence(self):
         self._main_thread()
         snapshot = self.gate.snapshot()  # revision captured before evidence collection
+        if self.observation is None:
+            raise LaneClosed('awaiting first live-debt observation')
         end = self.observation['at']
         start = self.state['start']
         begin, finish = (datetime.fromtimestamp(t, timezone.utc) for t in (start, end))
@@ -253,6 +305,7 @@ class Controller:
                 return
             if self.cancel.is_set() or self.stop_file.exists():
                 raise MeasurementStopped('stop before isolated benchmark')
+            timer = self.monotonic()
             try:
                 result = self.benchmark_fn(report['step'])
             except Exception as exc:
@@ -264,6 +317,8 @@ class Controller:
                 raise
             if self.cancel.is_set() or self.stop_file.exists():
                 raise MeasurementStopped('stop after isolated benchmark')
+            self.store.record('phase', self.now().timestamp(), phase='benchmark',
+                              seconds=self.monotonic() - timer)
             result = dict(result, measured_at=self.now().isoformat())
             self.state['benchmarks'][key] = result
             report['isolated_benchmark'] = result
@@ -272,9 +327,20 @@ class Controller:
                               step=report['step'], result=result)
 
     def decide(self):
+        timer = self.monotonic()
         snapshot, window, baseline, decision, report = self.evidence()
+        report['aggregation_seconds'] = self.monotonic() - timer
+        self.store.record('phase', self.now().timestamp(), phase='aggregation',
+                          seconds=report['aggregation_seconds'])
         state = self.state
+        if not self._debt_valid(state['start']):
+            report['reason'] = 'observer_changed_during_evidence'
+            state['report'] = report
+            self.store.save(state)
+            return report
         if decision.eligible:
+            if self.cancel.is_set() or self.stop_file.exists():
+                raise MeasurementStopped('stop before acceptance')
             # S3 is a bounded probe, completed only by the gate-expiry path
             # in observe(); there is no S3 promotion/acceptance window.
             final = window.step == 2 and self.max_step == 2
@@ -293,10 +359,15 @@ class Controller:
                         state['report'] = report
                         self.store.save(state)
                         return report
-                    self.freshness = read_freshness(self.trino, self.targets, self.now())
+                    self.freshness = self._final_freshness()
                     report['freshness'] = dict(self.freshness)
-                    if not self.freshness['eligible']:
+                    if not self.freshness.get('eligible'):
                         report['reason'] = 'freshness_changed_during_benchmark'
+                        state['report'] = report
+                        self.store.save(state)
+                        return report
+                    if not self._debt_valid(window.started_at.timestamp()):
+                        report['reason'] = 'observer_changed_during_benchmark'
                         state['report'] = report
                         self.store.save(state)
                         return report
@@ -331,25 +402,62 @@ class Controller:
                     self._benchmark(report)
                     # Bracket the next window with a fresh observation.
                     self.observe(force=True)
-                    state['start'] = self.observation['at']
+                    state['start'] = max(state['start'], self.observation['at'])
         state['report'] = report
         self.store.save(state)
         return report
+
+    def _debt_valid(self, start):
+        if self.io is None:
+            return True
+        debt = self.io.snapshot('debt')
+        return bool(debt and debt['known'] and not debt['debt']
+                    and debt['restart_at'] <= start
+                    and self.now().timestamp() - debt['observed_at'] <= MAXIMUM_GAP)
+
+    def _final_freshness(self):
+        if self.io is None:
+            return read_freshness(self.trino, self.targets, self.now())
+        requested = self.now().timestamp()
+        previous = self.io.snapshot('freshness') or {}
+        sequence = previous.get('sequence', 0)
+        self.io.request('freshness')
+        while not self.cancel.is_set() and not self.stop_file.exists():
+            fresh = self.io.snapshot('freshness')
+            if fresh and fresh['observed_at'] >= requested and fresh['sequence'] > sequence:
+                self.observe()
+                debt = self.io.snapshot('debt')
+                valid = (fresh.get('eligible') and debt and debt['known']
+                         and debt['restart_at'] <= self.state['start']
+                         and self.now().timestamp() - debt['observed_at'] <= MAXIMUM_GAP
+                         and self.now().timestamp() - fresh['observed_at'] <= FRESHNESS_SECONDS + MAXIMUM_GAP)
+                return dict(fresh, eligible=bool(valid))
+            self.cancel.wait(0.05)
+        raise MeasurementStopped('stop during final freshness')
 
     def tick(self):
         self.observe()
         if self.state['status'] != 'complete' and self.now().timestamp() - self.last_decision >= 60:
             # Stop submission and retry admission; bounded_fetch drains existing
             # HTTP before the owner evaluates, publishes or benchmarks.
+            if not self.decision_due:
+                self.decision_requested_at = self.monotonic()
             self.decision_due = True
 
     def finish_boundary(self):
+        if self.decision_requested_at is not None:
+            self.store.record('phase', self.now().timestamp(), phase='http_drain',
+                              seconds=self.monotonic() - self.decision_requested_at)
+            self.decision_requested_at = None
         self.observe(force=True)
         self.decision_due = False
-        if self.state['status'] != 'complete':
+        if self.state['status'] != 'complete' and self.observation is not None:
             self.decide()
         self.last_decision = self.now().timestamp()
-        self.journal.flush(self.trino.connection)
+        if self.io is not None:
+            self.io.request('publication')
+        else:
+            self.journal.flush(self.trino.connection)
         self.last_publish = self.now().timestamp()
 
     def _items(self):
@@ -370,6 +478,8 @@ class Controller:
         try:
             self.initialize()
         except BaseException:
+            if self.io_started:
+                self.io.close()
             self.gate.lower_ceiling(0, reason='controller_initialization_failed')
             raise
         error = None
@@ -393,8 +503,8 @@ class Controller:
                 except (LaneClosed, AllOriginsBlocked):
                     if self.stop_file.exists() or self.cancel.is_set():
                         break
-                    # Existing futures have drained: no HTTP overlaps an
-                    # evidence query, publisher or isolated write benchmark.
+                    # Existing HTTP futures have drained before evaluation and
+                    # isolated benchmarking. Independent observation continues.
                     if self.decision_due:
                         self.finish_boundary()
                     else:
@@ -407,18 +517,36 @@ class Controller:
             raise
         finally:
             self.cancel.set()
+            terminal_status = 'complete' if self.state['status'] == 'complete' else ('failed' if error else 'stopped')
             try:
                 if self.state['status'] != 'complete':
                     self.state['status'] = 'failed' if error else 'stopped'
                     self.gate.lower_ceiling(self.state['accepted_step'])
+                terminal_status = self.state['status']
+                self.state['terminal_status'] = terminal_status
+                self.state['status'] = 'draining'
                 self.state['heartbeat'] = self.now().timestamp()
                 self.store.record('lifecycle', self.state['heartbeat'], event=self.state['status'])
                 self.store.save(self.state)
             finally:
-                for client in self.clients:
-                    client.close()
-                    client.session.close()
-                self.journal.flush(self.trino.connection)
+                try:
+                    for client in self.clients:
+                        client.close()
+                        client.session.close()
+                finally:
+                    if self.io is not None:
+                        timer = self.monotonic()
+                        self.io.close(publish_before=self.now())
+                        self.store.record('phase', self.now().timestamp(), phase='sql_drain',
+                                          seconds=self.monotonic() - timer)
+                        self.state['publication'] = self.io.snapshot('publication')
+                        self.state['publication_pending'] = self.journal.pending()
+                    else:
+                        self.journal.flush(self.trino.connection)
+                    self.state['status'] = terminal_status
+                    self.state.pop('terminal_status', None)
+                    self.store.record('lifecycle', self.now().timestamp(), event=terminal_status)
+                    self.store.save(self.state)
         return self.state
 
 
@@ -429,21 +557,34 @@ def state_path(gate):
 def read_status(path, *, now=None):
     if not Path(path).exists():
         return {'stale': True, 'reason': 'no_controller_state'}
-    state = PaceStore(path).get()
+    store = PaceStore(path)
+    state = store.get()
     if not state:
         return {'stale': True, 'reason': 'no_controller_state'}
     report = dict(state.get('report') or {})
     now = now or now_utc()
     report.update(status=state.get('status'), accepted_step=state.get('accepted_step'),
-                  completed=state.get('completed', []), heartbeat=state.get('heartbeat'))
+                  completed=state.get('completed', []), heartbeat=state.get('heartbeat'),
+                  publication=state.get('publication'), publication_pending=state.get('publication_pending'))
     report['stale'] = state.get('status') != 'complete' and (
         state.get('status') != 'running' or now.timestamp() - state.get('heartbeat', 0) > MAXIMUM_GAP)
+    durable_publication = store.latest('publication')
+    if durable_publication and durable_publication['at'] > (report['publication'] or {}).get('at', 0):
+        report['publication'] = durable_publication
+    publication = report['publication'] or {}
+    report['publication_pending'] = publication.get('total_pending', report['publication_pending'])
+    report['observation'] = store.latest('observation')
+    report['freshness_observation'] = store.latest('freshness')
+    observation = report['observation']
+    if state.get('status') == 'running' and observation is not None:
+        report['stale'] = report['stale'] or not observation['known'] or (
+            now.timestamp() - observation.get('observed_at', observation['at']) > MAXIMUM_GAP)
     return report
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('run', 'start', 'resume', 'status', 'stop', 'benchmark'))
+    parser.add_argument('command', choices=('run', 'start', 'resume', 'status', 'stop', 'benchmark', 'publish'))
     parser.add_argument('--state-dir', type=Path, default=default_state_path().parent)
     parser.add_argument('--format', choices=('json', 'text'), default='text')
     parser.add_argument('--expected-ids-sha256')
@@ -481,9 +622,24 @@ def _run_owned(args, store, stop_file, parser):
     gate = None
     try:
         previous = store.get()
+        if previous and previous.get('status') == 'draining' and previous.get('terminal_status') == 'complete':
+            previous = recover_completed_drain(
+                store, previous, AttemptJournal(args.state_dir / 'http-attempts.sqlite3'), now_utc())
+        if args.command == 'publish':
+            from .pace_io import drain_publication
+            trino = EspnTrinoTableManager()
+            try:
+                result = drain_publication(AttemptJournal(args.state_dir / 'http-attempts.sqlite3'),
+                                           trino, store, now_utc, now_utc())
+                print(json.dumps(result, sort_keys=True))
+                return 1 if result['error'] else 0
+            finally:
+                trino.close()
         if args.command == 'run' and (stop_file.exists() or (previous and previous.get('status') == 'complete')):
             print('controller complete or explicitly stopped; no measurement started')
             return 0
+        if args.command in ('start', 'resume') and previous and previous.get('status') == 'complete':
+            raise ValueError('measurement already complete; use status or publish')
         gate = TransportGate(lane='history', state_path=args.state_dir / 'gate.json')
         trino = EspnTrinoTableManager()
         ids = accepted_ids(trino)
@@ -518,7 +674,8 @@ def _run_owned(args, store, stop_file, parser):
                                 trino=trino, targets=sorted(load_denominator().live_targets()),
                                 client_factory=factory, stop_file=stop_file,
                                 history_stop=args.state_dir / 'history.off', max_step=3 if args.allow_s3 else 2,
-                                benchmark_fn=boundary_benchmark if args.benchmark_at_boundaries else None)
+                                benchmark_fn=boundary_benchmark if args.benchmark_at_boundaries else None,
+                                io_factory=EspnTrinoTableManager)
         old = {sig: signal.signal(sig, lambda *_: controller.cancel.set())
                for sig in (signal.SIGINT, signal.SIGTERM)}
         try:

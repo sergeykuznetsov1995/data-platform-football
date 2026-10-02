@@ -116,7 +116,7 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
     start, end = utc(start).timestamp(), utc(end).timestamp()
     observations = sorted(observations, key=lambda row: row['at'])
     continuous = bool(observations) and observations[0]['at'] <= start and observations[-1]['at'] >= end
-    continuous = continuous and all(0 <= b['at'] - a['at'] <= maximum_gap
+    continuous = continuous and all(0 <= b['at'] - a.get('observed_at', a['at']) <= maximum_gap
                                     for a, b in zip(observations, observations[1:]))
     continuous = continuous and all(o.get('known') is True for o in observations)
     interval = policy.pace.load_interval_seconds
@@ -136,7 +136,7 @@ def load_evidence(rows, observations, start, end, *, step, policy, maximum_gap=3
         right = bisect_left(observation_times, finish)
         selected = observations[max(0, left):right + 1]
         known = left >= 0 and right < len(observations) and all(o.get('known') is True for o in selected)
-        known = known and all(b['at'] - a['at'] <= maximum_gap for a, b in zip(selected, selected[1:]))
+        known = known and all(b['at'] - a.get('observed_at', a['at']) <= maximum_gap for a, b in zip(selected, selected[1:]))
         count = buckets.get(begin, 0)
         if not known:
             unknown += 1
@@ -168,8 +168,11 @@ def write_metrics(rows):
 
 def format_measurement(report):
     """Compact owner-readable evidence; missing fields stay explicit warnings."""
+    publication = (report or {}).get('publication') or {}
+    publication_note = ([f"  публикация HTTP: {publication['error']} ⚠️; durable outbox сохранён"]
+                        if publication.get('error') else [])
     if not report or report.get('stale'):
-        return ['• ESPN темп: нет свежих данных контроллера ⚠️']
+        return ['• ESPN темп: нет свежих данных контроллера ⚠️'] + publication_note
     completed = report.get('completed')
     if completed:
         lines = []
@@ -177,8 +180,8 @@ def format_measurement(report):
             lines.extend(format_measurement(row))
         last = completed[-1]
         if (last.get('step'), last.get('start'), last.get('end')) != (report.get('step'), report.get('start'), report.get('end')):
-            lines.extend(format_measurement({k: v for k, v in report.items() if k != 'completed'}))
-        return lines
+            lines.extend(format_measurement({k: v for k, v in report.items() if k not in ('completed', 'publication')}))
+        return lines + publication_note
     def number(value, suffix=''):
         return 'нет данных ⚠️' if value is None else f'{value:.1f}{suffix}'
     m = report.get('metrics', {})
@@ -199,4 +202,4 @@ def format_measurement(report):
         f"  Iceberg: {write_text}; свежесть {fresh.get('ok', '?')}/{fresh.get('due', '?')} за {fresh.get('day', '?')} UTC",
         f"  изолированный стенд: p95 {isolated_text}; замер {isolated.get('measured_at', '?') if isolated else '?'}; массовая запись — проверка #1511",
         f"  повышение: {report.get('reason', 'нет данных ⚠️')}; измерительные чтения не увеличивают охват истории",
-    ]
+    ] + publication_note
