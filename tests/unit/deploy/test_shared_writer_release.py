@@ -334,3 +334,25 @@ def test_crash_after_global_marker_before_local_intent_is_recoverable(prepared, 
     assert phase(bundle) == "rolled_back"
     assert not (locks / "shared-writer-inflight.json").exists()
     assert r.digest((root / r.WRITER).read_bytes()) == r.BEFORE
+
+
+def test_parse_scope_file_is_part_of_closure_and_cannot_drift(prepared):
+    bundle, root, approval, host, locks = prepared
+    (root / "dags/.airflowignore").write_text("scripts/\n")
+    with pytest.raises(RuntimeError, match="runtime code/permissions drift"):
+        run(prepared)
+    assert phase(bundle) == "prepared"
+    assert r.digest((root / r.WRITER).read_bytes()) == r.BEFORE
+
+
+def test_every_readiness_module_is_pinned_in_tool_hashes():
+    assert {"work.py", "processes.py", "legacy_errors.py"} <= r.tool_hashes().keys()
+
+
+@pytest.mark.parametrize("action", ["check", "apply", "recover", "rollback", "rehearse"])
+def test_cli_cannot_change_policy_for_existing_bundle(monkeypatch, tmp_path, action):
+    import sys
+    monkeypatch.setattr(sys, "argv", ["release", action, "--bundle", str(tmp_path),
+                                     "--import-error-policy", "whoscored-legacy-20261003"])
+    with pytest.raises(RuntimeError, match="pinned at prepare"):
+        r.main()
