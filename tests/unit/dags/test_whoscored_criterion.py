@@ -180,6 +180,58 @@ def test_missed_and_overdue_lists():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("stage_available", [False, True])
+def test_postponed_league_one_two_games_are_not_overdue(stage_available):
+    # #1602: these four source rows have status=2 / elapsed=Post, no lineup
+    # and no manifest. A played-but-missing control must still turn red.
+    con = _connection()
+    query = _query(con)
+    for league, tournament_id, stage_id, game_ids in (
+        ("WS-252-8", 8, 25589, (1989368, 1989372, 1989376)),
+        ("WS-252-9", 9, 25590, (1990128,)),
+    ):
+        for game_id in game_ids:
+            _game(con, game_id, league=league, tournament_id=tournament_id,
+                  stage_id=stage_id, status=2)
+        if stage_available:
+            _game(con, stage_id, league=league, tournament_id=tournament_id,
+                  stage_id=stage_id, kickoff=NOW - timedelta(days=9))
+            _attempt(con, stage_id, "success", NOW - timedelta(days=8), league=league)
+    con.execute("UPDATE iceberg.bronze.whoscored_schedule_current "
+                "SET is_lineup_confirmed=FALSE WHERE status=2")
+    _game(con, 1)
+
+    days = criterion.day_results(query(criterion.render_daily_criterion_sql(NOW)))
+    assert [(d.due, d.missing, d.ceiling) for d in days] == [(1, 1, 0)]
+    assert [row[3] for row in query(criterion.render_missed_sql(NOW))] == [1]
+    assert [row[2] for row in query(criterion.render_overdue_sql(NOW))] == [1]
+
+
+@pytest.mark.unit
+def test_rescheduled_game_uses_new_date_then_returns_to_deadline_checks():
+    con = _connection()
+    query = _query(con)
+    _game(con, 1989350, status=2)
+    _game(con, 1989350, status=1, kickoff=NOW + timedelta(days=10))
+    con.execute("UPDATE iceberg.bronze.whoscored_schedule_current "
+                "SET _ingested_at=? WHERE status=1", [NOW])
+    for render in (criterion.render_daily_criterion_sql, criterion.render_missed_sql,
+                   criterion.render_overdue_sql):
+        assert query(render(NOW)) == []
+
+    # After the replacement fixture is played, its new deadline applies.
+    con.execute("UPDATE iceberg.bronze.whoscored_schedule_current "
+                "SET status=6, date=?, _ingested_at=? WHERE status=1",
+                [NOW - timedelta(hours=3), NOW + timedelta(minutes=1)])
+    assert query(criterion.render_overdue_sql(NOW)) == []
+    after_deadline = NOW + timedelta(hours=24)
+    days = criterion.day_results(query(criterion.render_daily_criterion_sql(after_deadline)))
+    assert [(d.due, d.missing) for d in days] == [(1, 1)]
+    assert [row[3] for row in query(criterion.render_missed_sql(after_deadline))] == [1989350]
+    assert [row[2] for row in query(criterion.render_overdue_sql(after_deadline))] == [1989350]
+
+
+@pytest.mark.unit
 def test_all_collected_on_time_is_one_hundred_percent():
     con = _connection()
     _game(con, 1)
@@ -294,6 +346,6 @@ def test_sql_constants_carry_the_class_a_list_and_placeholders():
         assert f"tournament_id IN ({ids})" in sql
         assert "TIMESTAMP '{now}'" in sql
         assert "INTERVAL '26' HOUR" in sql
-        assert "status NOT IN (5, 7)" in sql
+        assert "status NOT IN (2, 5, 7)" in sql
     with pytest.raises(ValueError):
         criterion.render_daily_criterion_sql(datetime.now().astimezone())

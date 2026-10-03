@@ -5,8 +5,8 @@ text below verbatim, so change it only together with that copy):
 
 * Denominator: games of the class-A tournaments (``CLASS_A_TOURNAMENTS`` in
   ``scrapers/whoscored/catalog.py``; probe scopes are not in it) from the
-  latest schedule row per game, ``status NOT IN (5, 7)`` (not postponed /
-  cancelled: a stale schedule never says "played"), in a stage that is not
+  latest schedule row per game, ``status NOT IN (2, 5, 7)`` (source status 2
+  means postponed; the existing 5/7 exclusions remain), in a stage that is not
   ``unavailable``.  Stage availability is the daily candidate rule of
   ``WhoScoredRepository.list_match_candidates``: >= 1 success -> available,
   >= 2 "not available" with a confirmed lineup and 0 success -> unavailable,
@@ -110,7 +110,7 @@ due AS (
       ON f.league = s.league AND f.season = s.season AND f.game_id = s.game_id
     LEFT JOIN na_verdicts n
       ON n.league = s.league AND n.season = s.season AND n.game_id = s.game_id
-    WHERE s.status NOT IN (5, 7)
+    WHERE s.status NOT IN (2, 5, 7)
       AND COALESCE(st.availability, 'unknown') <> 'unavailable'
       AND s.date + INTERVAL '26' HOUR <= TIMESTAMP '{now}'
       AND s.date + INTERVAL '26' HOUR > TIMESTAMP '{now}' - INTERVAL '7' DAY
