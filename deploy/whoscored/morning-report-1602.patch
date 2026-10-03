@@ -1,0 +1,20 @@
+--- a/morning_report.py
++++ b/morning_report.py
+@@ -3636,7 +3636,7 @@
+       ON f.league = s.league AND f.season = s.season AND f.game_id = s.game_id
+     LEFT JOIN na_verdicts n
+       ON n.league = s.league AND n.season = s.season AND n.game_id = s.game_id
+-    WHERE s.status NOT IN (5, 7)
++    WHERE s.status NOT IN (2, 5, 7)
+       AND COALESCE(st.availability, 'unknown') <> 'unavailable'
+       AND s.date + INTERVAL '26' HOUR <= TIMESTAMP '{now}'
+       AND s.date + INTERVAL '26' HOUR > TIMESTAMP '{now}' - INTERVAL '7' DAY
+@@ -3715,7 +3715,7 @@
+       ON f.league = s.league AND f.season = s.season AND f.game_id = s.game_id
+     LEFT JOIN na_verdicts n
+       ON n.league = s.league AND n.season = s.season AND n.game_id = s.game_id
+-    WHERE s.status NOT IN (5, 7)
++    WHERE s.status NOT IN (2, 5, 7)
+       AND COALESCE(st.availability, 'unknown') <> 'unavailable'
+       AND s.date + INTERVAL '26' HOUR <= TIMESTAMP '{now}'
+       AND s.date + INTERVAL '26' HOUR > TIMESTAMP '{now}' - INTERVAL '7' DAY
