@@ -22,6 +22,7 @@ fasteners==0.20
 filelock==3.29.4
 fsspec==2026.6.0
 git-filter-repo==2.47.0
+greenlet==3.2.4
 h11==0.16.0
 html5lib==1.1
 idna==3.18
@@ -103,6 +104,7 @@ sniffio==1.3.1
 soccerdata==1.9.0
 sortedcontainers==2.4.0
 soupsieve==2.8.4
+SQLAlchemy==2.0.43
 sqlglot==30.12.0
 strictyaml==1.7.3
 tabcompleter==1.4.1
