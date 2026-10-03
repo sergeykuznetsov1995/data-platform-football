@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,17 @@ def host(tmp_path, monkeypatch):
     (proc / 'self/ns').mkdir(parents=True)
     (proc / 'self/ns/mnt').write_text('host namespace')
     (proc / 'self/ns/pid').write_text('host pid namespace')
-    tail = tmp_path / 'tail'
+    class TrustedTail(type(tmp_path)):
+        # The fixture models a root-owned system binary even on non-root CI.
+        # Its bytes, inode and mode remain real; no chown or privilege is needed.
+        owner_uid = 0
+
+        def stat(self, **kwargs):
+            fields = list(super().stat(**kwargs))
+            fields[4] = self.owner_uid
+            return os.stat_result(fields)
+
+    tail = TrustedTail(tmp_path / 'tail')
     tail.write_bytes(b'trusted tail binary')
     tail.chmod(0o755)
     monkeypatch.setattr(processes, 'PROC_ROOT', proc)
@@ -329,4 +340,12 @@ def test_verified_historical_package_binary_survives_upgrade(host, monkeypatch):
     exe.symlink_to(previous)
     assert classify(host)[0]['blocks'] is False
     previous.write_bytes(b'changed binary with same tail name')
+    assert classify(host)[0]['blocks'] is True
+
+
+def test_non_root_owned_tail_cannot_authorize_exemption(host):
+    host['tail'].owner_uid = 1001
+    exe = host['proc'] / '10/exe'
+    exe.unlink()
+    exe.symlink_to(host['tail'])
     assert classify(host)[0]['blocks'] is True
