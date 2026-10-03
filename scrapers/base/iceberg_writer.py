@@ -531,7 +531,7 @@ class IcebergWriter:
                 transaction.append(
                     aligned,
                     snapshot_properties={
-                        "operation": "replace-identity-partition-batch",
+                        "dpf.operation": "replace-identity-partition-batch",
                         "partition-column": partition_column,
                         "partition-value": partition_value,
                     },
