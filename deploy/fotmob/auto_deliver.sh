@@ -96,6 +96,7 @@ STARTFAILS=$STATE/fotmob-campaign-start-fails  # подряд неудачных
 START_FAILS_MAX=${START_FAILS_MAX:-3}          # после стольких попыток автомат глушится
 ATTEMPTED=$STATE/fotmob-auto-deliver-attempted-$(date -u +%F)
 OFF=$STATE/fotmob-auto-deliver.off            # выключатель: ставит человек или сам автомат
+CAMPAIGN_HOLD=$STATE/fotmob-campaign.hold      # запрещает новый старт кампании, не доставку
 DELIVER_TIMEOUT=${DELIVER_TIMEOUT:-900}       # 90 с ожидания приёмки + сьют укладываются с запасом
 TG_ENV=${TG_ENV:-${FOTMOB_TG_ENV:?FOTMOB_TG_ENV не задан в env-файле}}   # файл с токеном/чатом Telegram
 METADB=${METADB:-${FOTMOB_METADB_CONTAINER:?FOTMOB_METADB_CONTAINER не задан в env-файле}}
@@ -1356,6 +1357,14 @@ if [ "$delivered" = 0 ]; then
 fi
 
 # ---- 4. Кампания истории (только после успешной доставки) --------------------
+# Отдельный запрет владельца на новые волны не должен блокировать доставку
+# исправлений и её приёмку/откат. Любой объект, включая битую ссылку, закрывает
+# допуск; его не читаем, не удаляем и не снимаем вместе с campaign/state/STOP.
+# Уже работающую кампанию этот маркер не останавливает.
+if [ -e "$CAMPAIGN_HOLD" ] || [ -L "$CAMPAIGN_HOLD" ]; then
+  log "кампания истории удержана: $CAMPAIGN_HOLD — новый драйвер не запускаю"
+  exit 0
+fi
 # До B6 в бою нет ни writer-lock (B7), ни ретрая коммита (#1199) — запускать
 # драйвер было нельзя. После доставки оба на месте.
 if pgrep -f "$CAMPAIGN/driver.sh" >/dev/null 2>&1; then
