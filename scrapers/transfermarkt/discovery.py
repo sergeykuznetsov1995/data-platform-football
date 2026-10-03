@@ -73,7 +73,7 @@ SEED_ROUTES: tuple[str, ...] = (
 SEED_URLS: tuple[str, ...] = tuple(BASE_URL + route for route in SEED_ROUTES)
 
 _COUNTRY_ROUTE_RE = re.compile(
-    r"^/wettbewerbe/national/wettbewerbe/[A-Za-z0-9_-]+(?:/.*)?$"
+    r"^(?P<root>/wettbewerbe/national/wettbewerbe/[A-Za-z0-9_-]+)(?:/.*)?$"
 )
 _COMPETITION_ROUTE_RE = re.compile(
     r"^/(?P<slug>[^/?#]+)/(?:[^?#]*/)?(?P<section>[^/?#]+)/"
@@ -86,7 +86,7 @@ _CANONICAL_SECTION = "startseite"
 # immutable, so the parser revision is part of the snapshot identity. Bump it
 # whenever parsing or classification changes — otherwise a restated catalogue
 # cannot be published over the snapshot id it would otherwise reuse.
-PARSER_REVISION = "tm-html-discovery-v4"  # v4: regulation editions, carried rows (#1391)
+PARSER_REVISION = "tm-html-discovery-v5"  # v5: country descendants and group URL identity
 SCHEMA_REVISION = "1"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
@@ -422,7 +422,9 @@ def _profile_url(url: str) -> Optional[str]:
     if canonical is None or _profile_identity(canonical) is None:
         return None
     parsed = urlsplit(canonical)
-    path = _EDITION_PATH_RE.sub("", parsed.path).rstrip("/")
+    # The matched season segment includes its trailing slash. Keep the
+    # boundary when a group route follows it (AC2Q/.../gruppe -> AC2Q/gruppe).
+    path = _EDITION_PATH_RE.sub("/", parsed.path).rstrip("/")
     query = [
         pair
         for pair in parse_qsl(parsed.query, keep_blank_values=True)
@@ -1362,7 +1364,12 @@ class TransfermarktCompetitionDiscovery:
             try:
                 document = self._get(url)
                 soup = self._soup(document)
-                country = self._countries.get(url.split("?", 1)[0])
+                # Season/plus pages belong to the same configured country;
+                # their HTML need not repeat country/confederation metadata.
+                country_path = _COUNTRY_ROUTE_RE.match(urlsplit(url).path)
+                country = self._countries.get(
+                    BASE_URL + country_path.group("root")
+                ) if country_path else None
                 context = (
                     _ListingContext(country.country, country.confederation)
                     if country is not None

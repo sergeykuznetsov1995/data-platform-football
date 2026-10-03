@@ -916,6 +916,25 @@ def test_country_page_brings_the_fa_cup_with_its_real_country() -> None:
     assert BASE_URL + "/wettbewerbe/national/wettbewerbe/189" in fetch.calls
 
 
+@pytest.mark.parametrize("suffix", ["/saison_id/2026", "/saison_id/2026/plus/1?page=2"])
+def test_country_descendants_keep_configured_context(suffix: str) -> None:
+    root = BASE_URL + "/wettbewerbe/national/wettbewerbe/189"
+    listing = (FIXTURES / "england.html").read_text().replace(
+        root.removeprefix(BASE_URL) + "?page=2",
+        root.removeprefix(BASE_URL) + suffix,
+    )
+    cups = (FIXTURES / "england_page_2.html").read_text().replace(
+        '<meta name="tm-country" content="England">', ""
+    ).replace('<meta name="tm-confederation" content="UEFA">', "")
+    snapshot, report = _run(
+        fetch=FixtureFetch({root: listing, root + suffix: cups}),
+        countries=(Country("189", "England", "UEFA"),),
+    )
+    fac = next(item for item in snapshot.competitions if item.competition_id == "FAC")
+    assert (fac.country, fac.confederation) == ("England", "UEFA")
+    assert not report["listing_failures"]
+
+
 def test_committed_country_list_is_well_formed() -> None:
     countries = load_countries()
 
@@ -928,6 +947,16 @@ def test_committed_country_list_is_well_formed() -> None:
         "UEFA", "CAF", "AFC", "Americas", "OFC",
     }
     assert sum(item.confederation == "CAF" for item in countries) >= 50
+
+
+@pytest.mark.parametrize("suffix", ["/gruppe/QR", "/gruppe/A", "", "/"])
+def test_profile_normalization_preserves_competition_boundary(suffix: str) -> None:
+    from scrapers.transfermarkt.discovery import _profile_identity, _profile_url
+
+    route = BASE_URL + "/afc/spieltag/pokalwettbewerb/AC2Q"
+    normalized = _profile_url(route + "/saison_id/2026" + suffix)
+    assert normalized == (route + suffix).rstrip("/")
+    assert _profile_identity(normalized)[0] == "AC2Q"
 
 
 def test_extra_competition_joins_when_no_page_lists_it() -> None:
