@@ -65,8 +65,9 @@ required cups and >=95% ten-season coverage must be proven after automatic
 delivery and a scheduled full. No manual rerun, deployment, wave 2 or backfill
 is authorized. A merged fix does not itself satisfy these gates.
 
-Offline replay of 454 configured-country pages: 64 remaining failures are
-pages without usable registry structure; no country-context failures remain.
+Initial offline replay of 454 configured-country pages found 64 remaining
+parse failures, including five empty club-round anchors addressed below; no
+country-context failures remained.
 All 1,631 saved group links retained their original competition identity.
 After the denominator correction A6 replays as checked=241, mismatches=[].
 Focused discovery/runner: 84 passed; denominator/publication: 25 passed.
@@ -95,5 +96,56 @@ API histories, 88 HTML fallbacks (69 ambiguous current flags, 19 empty API),
 three carried competitions and RKPO quarantined for classification conflict.
 All saved API edition IDs for those72 were preserved; source history cannot
 be fabricated. Failed/invalid API bodies are not in the checkpoint.
-Source-aware ten-season coverage needs an explicit rule for sparse/new
-histories. Retain the RKPO classification guard and current-season validation.
+The owner subsequently approved all real editions with TM saison_id 2015..2024,
+keeping all live core tournaments in the denominator and requiring evidence
+for short/irregular histories. Unproved cases do not count; mandatory cups remain
+a separate gate. Retain the RKPO classification guard and current-season validation.
+
+
+## Follow-up: country participation links and shared CI
+
+The saved France listing (country 50) aborts at an empty FIC1 round link in a
+club row; Mexico, Morocco, South Africa and Tunisia have the same structure.
+Skip this duplicate only in the country participation panel, in the explicitly
+verified Round achieved column, with a club link and the nearest named header
+in the same table matching competition ID, route and slug. Column shifts,
+colspan/rowspan changes and unrecognized nameless links remain fail-closed.
+No competition name is invented. The real direct-table header plus tbody layout
+is covered by the fixture; targeted review caught and corrected column matching.
+All five unmodified saved pages now parse; final affected suites: 151 passed.
+France continuation pages were not collected in the saved run, and its root has
+no FRP link. This fix enables navigation but does not prove Coupe de France
+coverage until a scheduled full run after delivery.
+
+The owner also authorized the shared CI repairs in a separate commit:
+official Buildx v0.37.1 linux-amd64 SHA256
+`9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b`
+and peeled tag commit `0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a` were checked
+against Docker release checksums, the downloaded binary, and the runner image.
+All immutable binary guards retain unknown-value rejection. The ESPN fixture
+race was reproduced on base and PR head: a periodic debt query crossed promotion
+and correctly invalidated the fixture before final freshness. Explicit observer
+requests synchronize only this test; its safety assertions and runtime remain
+unchanged. Focused checks: 17 CI/TLS and 48 ESPN tests passed. Separate reviews
+found no unresolved material defects in either repair package.
+
+Final combined local full suite: 13,392 passed, 24 skipped, 11 failed in 1040.12s.
+Ten failures match the reproduced unchanged-base WhoScored host-contract failures.
+The additional FBref raw-audit test failure was also reproduced on clean base:
+when rewritten file metadata including ctime collide, audit reuses the old hash
+and misses changed bytes. This is an existing runtime audit defect, not a harmless
+test flake; FBref runtime changes are outside this approval and were not made.
+No tests or required CI checks were disabled. GitHub checks on the updated head
+must be evaluated separately; this local result is not an all-green claim.
+Evidence: `tm-integrated-final-full-suite.log`, `fbref-audit-diagnosis.txt`,
+`tm-empty-link-review-final.txt`, `ci-repair-review.txt` under the local evidence
+root. An earlier intermediate full run was interrupted after review changed the
+code; it is not used as final verification.
+
+For the approved coverage rule, CAF's complete edition history and the saved
+TM regulation prove CHAN expected IDs `{2015,2017,2020,2022,2024}`. All five occur
+in the saved Silver result. The 2024 source ID denotes the edition played in
+2025 and still belongs to the approved source-ID window. Evidence and official
+CAF links: `coverage-chan-evidence.txt`, `coverage-chan-verified.json`.
+This proves one sparse-history exception, not the overall 95% threshold or
+post-delivery acceptance. No merge, manual source run or deployment is authorized.

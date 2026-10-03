@@ -795,6 +795,65 @@ def _listing_links(soup: BeautifulSoup, page_url: str) -> tuple[str, ...]:
     return tuple(sorted(links))
 
 
+def _competition_link_name(anchor: Tag) -> str:
+    image = anchor.find("img")
+    return _normalise_text(
+        anchor.get_text(" ", strip=True)
+        or anchor.get("title")
+        or (image.get("alt") if image else "")
+        or (image.get("title") if image else "")
+    )
+
+
+def _redundant_empty_participation_round(anchor: Tag, page_url: str) -> bool:
+    """Recognize an unnamed round cell, never infer a competition's name."""
+    if not _is_country_listing(page_url):
+        return False
+    if _section_label(anchor).casefold() != "playing on international stage:":
+        return False
+    profile = _profile_url(str(anchor.get("href")))
+    identity = _profile_identity(profile) if profile else None
+    if identity is None or identity[3] != "spieltag":
+        return False
+    row, table = anchor.find_parent("tr"), anchor.find_parent("table")
+    if row is None or table is None:
+        return False
+    headings = table.find("thead", recursive=False)
+    heading_rows = headings.find_all("tr", recursive=False) if headings else []
+    if len(heading_rows) != 1:
+        return False
+    heading_cells = heading_rows[0].find_all("th", recursive=False)
+    # Only the observed layout is proven: three club columns, then one round
+    # column. Reject shifted/merged cells instead of guessing their semantics.
+    if (len(heading_cells) < 2 or heading_cells[0].get("colspan") != "3"
+            or heading_cells[1].get("colspan", "1") != "1"
+            or _normalise_text(heading_cells[1].get_text(" ", strip=True)).casefold()
+            != "round achieved"):
+        return False
+    if any(cell.get("rowspan") != "1" for cell in table.select("th[rowspan], td[rowspan]")):
+        return False
+    cells = row.find_all("td", recursive=False)
+    if (len(cells) < 4 or anchor.find_parent("td") is not cells[3]
+            or any(cell.get("colspan", "1") != "1" for cell in cells[:4])):
+        return False
+    if not any(re.fullmatch(r"/[^/]+/startseite/verein/\d+(?:/saison_id/\d+)?",
+                            str(link.get("href"))) for link in row.select("a[href]")):
+        return False
+    # Real markup puts header tr directly under table, club tr inside tbody.
+    # Sibling-only traversal misses it; never borrow a header from another table.
+    header = row.find_previous("tr", class_="bg_blau_20")
+    if (header is None or header.find_parent("table") is not table
+            or "hauptlink" not in header.get("class", ())):
+        return False
+    links = [link for link in header.select("a[href]")
+             if _profile_url(str(link.get("href"))) is not None]
+    if len(links) != 1:
+        return False
+    header_identity = _profile_identity(_profile_url(str(links[0].get("href"))))
+    return bool(header_identity == (*identity[:3], "startseite")
+                and _competition_link_name(links[0]))
+
+
 def _listing_candidates(
     soup: BeautifulSoup,
     *,
@@ -818,14 +877,10 @@ def _listing_candidates(
             continue
         seen_links += 1
         competition_id, slug, _kind, _section = identity
-        image = anchor.find("img")
-        name = _normalise_text(
-            anchor.get_text(" ", strip=True)
-            or anchor.get("title")
-            or (image.get("alt") if image else "")
-            or (image.get("title") if image else "")
-        )
+        name = _competition_link_name(anchor)
         if not name:
+            if _redundant_empty_participation_round(anchor, page_url):
+                continue
             raise DiscoverySchemaError(
                 f"competition link has no name: {page_url} -> {profile_url}"
             )
