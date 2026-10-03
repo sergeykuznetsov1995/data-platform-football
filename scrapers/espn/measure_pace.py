@@ -170,7 +170,7 @@ class Controller:
     def check(self):
         if self.cancel.is_set() or self.stop_file.exists():
             raise MeasurementStopped('measurement stop requested')
-        if self.decision_due:
+        if self.decision_due or self.state.get('restart_pending') is not None:
             raise LaneClosed('controller evidence boundary; drain workers')
         if self.history_stop is not None and self.history_stop.exists():
             raise LaneClosed('history stop file present')
@@ -242,6 +242,11 @@ class Controller:
         # The first observation defines a covered boundary after its query completed.
         if previous is None:
             state['start'] = at
+        pending = state.get('restart_pending')
+        if pending is not None and known and observation.get('observed_at', at) >= pending:
+            # A real post-drain observation brackets the new loaded window.
+            state['start'] = max(at, state['start'])
+            state.pop('restart_pending')
         state['heartbeat'] = at
         if self.io is not None:
             state['publication'] = self.io.snapshot('publication')
@@ -452,13 +457,49 @@ class Controller:
         self.observe(force=True)
         self.decision_due = False
         if self.state['status'] != 'complete' and self.observation is not None:
-            self.decide()
+            report = self.decide()
+            self._restart_incomplete_window(report)
         self.last_decision = self.now().timestamp()
         if self.io is not None:
             self.io.request('publication')
         else:
             self.journal.flush(self.trino.connection)
         self.last_publish = self.now().timestamp()
+
+    def _restart_incomplete_window(self, report):
+        """Only the drained owner may retire a durably incomplete window.
+
+        begin() has no HTTP duration; finish() records one even for an abort.
+        A live/current in-flight start must be allowed to finish, not mistaken
+        for permanent evidence loss. Ordinary complete HTTP errors never reset.
+        """
+        self._main_thread()
+        state = self.state
+        if (report['reason'] != 'incomplete_coverage' or state['status'] != 'running'
+                or self.cancel.is_set() or self.stop_file.exists()
+                or state.get('restart_pending') is not None):
+            return
+        snapshot = self.gate.snapshot()
+        if (snapshot['revision'] != state['revision'] or snapshot['step'] != state['step']
+                or snapshot['measurement_started_at'] != state['epoch']
+                or datetime.fromisoformat(report['start']).timestamp() != state['start']):
+            return
+        rows = self.journal.rows(datetime.fromisoformat(report['start']),
+                                 datetime.fromisoformat(report['end']))
+        incomplete = [r for r in rows if not r['complete'] or r['http_ms'] is None
+                      or (r['status'] is None and not r['timeout'])]
+        if not incomplete or any(r['http_ms'] is None for r in incomplete):
+            return
+        at = self.now().timestamp()
+        updated = dict(state, restart_pending=at)
+        self.store.save_with_evidence(updated, 'rejected_window', at,
+            reason='durable_incomplete_attempts', report=report,
+            attempt_ids=sorted(r['attempt_id'] for r in incomplete),
+            measurement_id=state['measurement_id'], step=state['step'],
+            revision=state['revision'], epoch=state['epoch'])
+        self.state = updated
+        if self.io is not None:
+            self.io.request('debt')
 
     def _items(self):
         while not self.cancel.is_set():
