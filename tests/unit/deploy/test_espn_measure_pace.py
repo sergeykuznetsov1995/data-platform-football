@@ -545,14 +545,15 @@ def eventually(predicate, timeout=3):
         time.sleep(0.005)
 
 
-def async_io(c, *, factory=AsyncSQL, read=None, publish=None, publish_seconds=60):
+def async_io(c, *, factory=AsyncSQL, read=None, publish=None, publish_seconds=60,
+             observe_seconds=0.01):
     from scrapers.espn.measure_pace import read_freshness
     from scrapers.espn.pace_io import PaceIO
     if publish is not None:
         c.journal.flush = publish
     c.io = PaceIO(factory=factory, gate=c.gate, journal=c.journal, store=c.store,
                   targets=c.targets, now=c.now, read_freshness=read or read_freshness,
-                  observe_seconds=0.01, freshness_seconds=60, publish_seconds=publish_seconds)
+                  observe_seconds=observe_seconds, freshness_seconds=60, publish_seconds=publish_seconds)
     c.io.start()
     c.io_started = True
     return c.io
@@ -721,18 +722,26 @@ def test_async_final_acceptance_uses_new_freshness_and_atomic_gate(controller, p
                 with c.gate._state() as state:
                     state['history_frozen_until'] = now.timestamp() + 1800
         return result
-    io = async_io(c, read=fresh, publish=lambda *_args, **_kwargs: 0)
+    # Drive debt reads explicitly while advancing the fake clock. A periodic
+    # read spanning promotion correctly records gate_changed_during_debt, which
+    # would reject this fixture's window before final freshness is exercised.
+    # Requests wake the lane immediately; keep its timer beyond all bounded waits.
+    io = async_io(c, read=fresh, publish=lambda *_args, **_kwargs: 0,
+                  observe_seconds=3600)
     try:
         eventually(lambda: io.snapshot('debt') and io.snapshot('freshness'))
         c.observe()
         for step in range(3):
+            previous_sequence = io.snapshot('debt')['sequence']
+            io.request('debt')
             eventually(lambda: io.snapshot('debt')['known']
+                       and io.snapshot('debt')['sequence'] > previous_sequence
                        and io.snapshot('debt')['revision'] == c.gate.snapshot()['revision'])
             c.observe()
             for _ in range(30):
                 c.clock.now += timedelta(seconds=10)
                 io.request('debt')
-                eventually(lambda: io.snapshot('debt')['at'] == c.now().timestamp())
+                eventually(lambda: io.snapshot('debt')['observed_at'] == c.now().timestamp())
             fill_window(c, 300)
             if step == 2:
                 armed.set()

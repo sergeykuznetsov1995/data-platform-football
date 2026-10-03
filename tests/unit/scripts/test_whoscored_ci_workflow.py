@@ -1,6 +1,8 @@
 """Static contracts for the dedicated WhoScored production CI workflow."""
 
 from pathlib import Path
+import re
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -442,3 +444,23 @@ def test_ci_exercises_every_runner_moved_to_the_legacy_venv():
         "tests/unit/scrapers/test_run_understat_scraper.py",
     ):
         assert test_path in text
+
+
+def test_all_buildx_guards_accept_verified_release_and_reject_unknown_values():
+    # Official docker/buildx v0.37.1 linux-amd64 checksum and peeled tag commit.
+    # https://github.com/docker/buildx/releases/download/v0.37.1/checksums.txt
+    values = {
+        "buildx_sha": "9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b",
+        "buildx_ver": "github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a",
+    }
+    for variable, accepted in values.items():
+        guards = re.findall(r'case "\$' + variable + r'" in.*?esac',
+                            _workflow_text(), flags=re.DOTALL)
+        assert len(guards) == (6 if variable == "buildx_sha" else 2)
+        for guard in guards:
+            for value, expected in ((accepted, 0), ("unknown-buildx", 1)):
+                result = subprocess.run(
+                    ["bash", "-c", f'{variable}="$1";\n' + guard, "guard", value],
+                    capture_output=True, text=True, check=False,
+                )
+                assert result.returncode == expected, result.stderr

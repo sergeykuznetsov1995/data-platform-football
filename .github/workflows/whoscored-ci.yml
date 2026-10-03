@@ -139,11 +139,14 @@ jobs:
           # коммитом его аннотированного тега. Чужой бинарник по-прежнему
           # отвергается. Отработавшую версию из списка убирать, когда флот
           # раннеров сойдётся.
+          # v0.37.1: releases/download/v0.37.1/checksums.txt (linux-amd64);
+          # annotated tag 363b7b08 -> commit 0b265a9f, runner ubuntu24/20260927.320.
           buildx_sha="$(sha256sum "$buildx_bin" | cut -d' ' -f1)"
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
+            9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_ver="$("$buildx_bin" version)"
@@ -151,6 +154,7 @@ jobs:
             "github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782") ;;
             "github.com/docker/buildx v0.36.1 1d8dde89b8aba914e05e45366770736fea1fd690") ;;
             "github.com/docker/buildx v0.37.0 ac30b249211430b85fb8f37b6e7154b5c47ba0b6") ;;
+            "github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a") ;;
             *) echo "unpinned system buildx version: $buildx_ver" >&2; exit 1 ;;
           esac
           test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
@@ -175,6 +179,7 @@ jobs:
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
+            9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_ver="$("$buildx_exec" version)"
@@ -182,6 +187,7 @@ jobs:
             "github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782") ;;
             "github.com/docker/buildx v0.36.1 1d8dde89b8aba914e05e45366770736fea1fd690") ;;
             "github.com/docker/buildx v0.37.0 ac30b249211430b85fb8f37b6e7154b5c47ba0b6") ;;
+            "github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a") ;;
             *) echo "unpinned system buildx version: $buildx_ver" >&2; exit 1 ;;
           esac
           test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
@@ -237,6 +243,7 @@ jobs:
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
+            9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -268,6 +275,7 @@ jobs:
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
+            9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -434,6 +442,7 @@ jobs:
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
+            9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -600,6 +609,7 @@ jobs:
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
+            9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {

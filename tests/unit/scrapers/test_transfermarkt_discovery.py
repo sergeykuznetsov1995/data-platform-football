@@ -916,6 +916,25 @@ def test_country_page_brings_the_fa_cup_with_its_real_country() -> None:
     assert BASE_URL + "/wettbewerbe/national/wettbewerbe/189" in fetch.calls
 
 
+@pytest.mark.parametrize("suffix", ["/saison_id/2026", "/saison_id/2026/plus/1?page=2"])
+def test_country_descendants_keep_configured_context(suffix: str) -> None:
+    root = BASE_URL + "/wettbewerbe/national/wettbewerbe/189"
+    listing = (FIXTURES / "england.html").read_text().replace(
+        root.removeprefix(BASE_URL) + "?page=2",
+        root.removeprefix(BASE_URL) + suffix,
+    )
+    cups = (FIXTURES / "england_page_2.html").read_text().replace(
+        '<meta name="tm-country" content="England">', ""
+    ).replace('<meta name="tm-confederation" content="UEFA">', "")
+    snapshot, report = _run(
+        fetch=FixtureFetch({root: listing, root + suffix: cups}),
+        countries=(Country("189", "England", "UEFA"),),
+    )
+    fac = next(item for item in snapshot.competitions if item.competition_id == "FAC")
+    assert (fac.country, fac.confederation) == ("England", "UEFA")
+    assert not report["listing_failures"]
+
+
 def test_committed_country_list_is_well_formed() -> None:
     countries = load_countries()
 
@@ -928,6 +947,16 @@ def test_committed_country_list_is_well_formed() -> None:
         "UEFA", "CAF", "AFC", "Americas", "OFC",
     }
     assert sum(item.confederation == "CAF" for item in countries) >= 50
+
+
+@pytest.mark.parametrize("suffix", ["/gruppe/QR", "/gruppe/A", "", "/"])
+def test_profile_normalization_preserves_competition_boundary(suffix: str) -> None:
+    from scrapers.transfermarkt.discovery import _profile_identity, _profile_url
+
+    route = BASE_URL + "/afc/spieltag/pokalwettbewerb/AC2Q"
+    normalized = _profile_url(route + "/saison_id/2026" + suffix)
+    assert normalized == (route + suffix).rstrip("/")
+    assert _profile_identity(normalized)[0] == "AC2Q"
 
 
 def test_extra_competition_joins_when_no_page_lists_it() -> None:
@@ -1229,3 +1258,94 @@ def test_budget_guard_carries_known_and_defers_new_competitions() -> None:
     assert all(
         reason == "request budget spent" for reason in report["carried"].values()
     )
+
+
+def _participation_candidates(soup, *, country_page=True):
+    from scrapers.transfermarkt.discovery import _listing_candidates
+
+    page_url = (BASE_URL + "/wettbewerbe/national/wettbewerbe/50"
+                if country_page else BASE_URL + "/wettbewerbe/europa")
+    return _listing_candidates(soup, page_url=page_url, page_hash="fixture")
+
+
+@pytest.mark.parametrize("competition_id,slug,name", [
+    ("FIC1", "fifa-intercontinental-cup", "FIFA Intercontinental Cup"),
+    ("ACL", "caf-champions-league", "CAF-Champions League"),
+])
+def test_empty_participation_round_preserves_named_competition_and_cup(
+    competition_id, slug, name,
+):
+    from bs4 import BeautifulSoup
+
+    html = (FIXTURES / "country_participation.html").read_text()
+    html = html.replace("FIC1", competition_id).replace("fifa-intercontinental-cup", slug)
+    html = html.replace("FIFA Intercontinental Cup", name)
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = _participation_candidates(soup)
+    assert [(c.competition_id, c.name) for c in candidates] == [
+        ("TESTCUP", "Fixture Cup"), (competition_id, name),
+    ]
+    assert any(e.competition_type is CompetitionType.DOMESTIC_CUP
+               for e in candidates[0].evidence)
+    # Participation is not itself proof of competition type or age.
+    assert all(e.competition_type is None and e.age_category is None
+               for e in candidates[1].evidence)
+
+
+@pytest.mark.parametrize("damage", [
+    "nameless_header", "missing_header", "different_id", "different_slug",
+    "different_route", "different_table", "intervening_header", "missing_club",
+    "wrong_panel", "wrong_route", "not_country", "standalone", "no_round_column",
+    "reordered_round_column", "heading_colspan", "club_colspan", "round_colspan",
+    "heading_rowspan", "club_rowspan",
+])
+def test_unproven_empty_competition_links_still_fail_closed(damage):
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup((FIXTURES / "country_participation.html").read_text(), "html.parser")
+    panel = soup.select_one("#participation")
+    header = panel.select_one("tr.bg_blau_20")
+    header_link = header.select_one("a")
+    empty = panel.select_one('a[href*="/spieltag/"]')
+    if damage == "nameless_header":
+        header_link.clear()
+        header_link["title"] = ""
+    elif damage == "missing_header":
+        header.decompose()
+    elif damage in {"different_id", "different_slug", "different_route"}:
+        old, new = {"different_id": ("FIC1", "OTHER"),
+                    "different_slug": ("fifa-intercontinental-cup", "other-cup"),
+                    "different_route": ("pokalwettbewerb", "wettbewerb")}[damage]
+        empty["href"] = empty["href"].replace(old, new)
+    elif damage == "different_table":
+        table = soup.new_tag("table")
+        panel.insert(1, table)
+        table.append(header.extract())
+    elif damage == "intervening_header":
+        other = BeautifulSoup(str(header).replace("FIC1", "OTHER"), "html.parser").tr
+        header.insert_after(other)
+    elif damage == "missing_club":
+        for anchor in panel.select('a[href*="/verein/"]'):
+            anchor.decompose()
+    elif damage == "wrong_panel":
+        panel.h2.string = "Other competitions"
+    elif damage == "wrong_route":
+        empty["href"] = empty["href"].replace("spieltag", "startseite")
+    elif damage == "no_round_column":
+        panel.thead.decompose()
+    elif damage == "reordered_round_column":
+        headings = panel.thead.find_all("th")
+        headings[1].string = "Opponent"
+        headings[2].string = "Round achieved"
+    elif damage == "heading_colspan":
+        panel.thead.th["colspan"] = "2"
+    elif damage == "heading_rowspan":
+        panel.thead.th["rowspan"] = "2"
+    elif damage in {"club_colspan", "round_colspan", "club_rowspan"}:
+        cells = empty.find_parent("tr").find_all("td", recursive=False)
+        cell = cells[3] if damage == "round_colspan" else cells[0]
+        cell["rowspan" if damage == "club_rowspan" else "colspan"] = "2"
+    elif damage == "standalone":
+        soup.body.append(empty.extract())
+    with pytest.raises(DiscoverySchemaError, match="competition link has no name"):
+        _participation_candidates(soup, country_page=damage != "not_country")
