@@ -17,6 +17,10 @@ import subprocess
 import time
 from typing import Any
 
+from deploy.shared_writer import legacy_errors
+from deploy.shared_writer.processes import classify_processes
+from deploy.shared_writer.work import WORK_SQL, classify_work
+
 
 CONSUMERS = (
     "airflow-scheduler",
@@ -26,7 +30,9 @@ CONSUMERS = (
 )
 METADB = "postgres"
 INSPECT_FORMAT = (
-    '{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},'
+    '{"init_pid":{{json .State.Pid}},"privileged":{{json .HostConfig.Privileged}},'
+    '"pid_mode":{{json .HostConfig.PidMode}},"cap_add":{{json .HostConfig.CapAdd}},'
+    '"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},'
     '"mounts":{{json .Mounts}},"status":{{json .State.Status}},'
     '"health":{{with (index .State "Health")}}{{json .Status}}{{else}}null{{end}},'
     '"project":{{with (index .Config "Labels")}}{{json (index . "com.docker.compose.project")}}{{else}}null{{end}},'
@@ -45,21 +51,23 @@ BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL statement_timeout = '10s';
 SELECT json_build_object(
   'dags', COALESCE((SELECT json_object_agg(dag_id, json_build_object(
-    'paused', is_paused, 'errors', has_import_errors,
+    'paused', is_paused, 'errors', has_import_errors, 'fileloc', fileloc,
     'parsed', extract(epoch FROM last_parsed_time)))
     FROM dag WHERE is_active IS TRUE), '{}'::json),
-  'active', (SELECT count(*) FROM dag_run WHERE state IN ('queued','running'))
-    + (SELECT count(*) FROM task_instance WHERE state IN
-      ('queued','running','restarting','deferred','scheduled','up_for_retry','up_for_reschedule')),
-  'import_errors', (SELECT count(*) FROM import_error)
+  'work', __WORK_SQL__,
+  'import_errors', COALESCE((SELECT json_agg(json_build_object(
+    'filename', filename, 'stacktrace', stacktrace)) FROM import_error), '[]'::json)
 );
 ROLLBACK;
-"""
+""".replace("__WORK_SQL__", WORK_SQL)
 
 
 class Host:
-    def __init__(self, root: Path = Path("/root/dpf-whoscored-merge")) -> None:
+    def __init__(self, root: Path = Path("/root/dpf-whoscored-merge"), *, import_error_policy: str = "none") -> None:
         self.root = Path(root).absolute()
+        if import_error_policy not in legacy_errors.POLICIES:
+            raise RuntimeError("unknown import-error policy")
+        self.import_error_policy = import_error_policy
 
     def _run(self, args: list[str], *, deadline: float | None = None, empty: bool = False) -> str:
         timeout = 20.0 if deadline is None else min(20.0, deadline - time.monotonic())
@@ -88,6 +96,7 @@ class Host:
                 raise ValueError("incomplete inventory")
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             raise RuntimeError("invalid Docker inventory response") from exc
+        self._containers = rows
         identities = {}
         other_shared_mounts = {}
         dormant_consumers = {}
@@ -156,7 +165,9 @@ class Host:
                                     for name, mounts in other_shared_mounts.items()},
         }
 
-    def _snapshot(self, deadline: float | None = None, *, recovery: bool = False) -> dict[str, Any]:
+    def _snapshot(self, deadline: float | None = None, *, recovery: bool = False, policy: str | None = None) -> dict[str, Any]:
+        policy = self.import_error_policy if policy is None else policy
+        protected = legacy_errors.protected_hashes(self.root, policy)
         identity = self._inventory(deadline, recovery=recovery)
         output = self._run(
             ["docker", "exec", METADB, "psql", "-X", "-qAt", "-U", "airflow", "-d", "airflow",
@@ -164,17 +175,35 @@ class Host:
         )
         try:
             data = json.loads(output)
-            if not isinstance(data, dict) or set(data) != {"dags", "active", "import_errors"}:
+            if not isinstance(data, dict) or set(data) != {"dags", "work", "import_errors"}:
                 raise ValueError("invalid snapshot keys")
-            if any(type(data[k]) is not int or data[k] < 0 for k in ("active", "import_errors")):
-                raise ValueError("invalid counters")
+            work = classify_work(data["work"])
+            data["work"] = work
+            data["active"] = work["active"]
+            errors = data["import_errors"]
+            if not isinstance(errors, list):
+                raise ValueError("invalid import errors")
+            details = []
+            for error in errors:
+                if (not isinstance(error, dict) or set(error) != {"filename", "stacktrace"}
+                        or not isinstance(error["filename"], str) or not error["filename"]
+                        or not isinstance(error["stacktrace"], str) or not error["stacktrace"]):
+                    raise ValueError("invalid import error record")
+                details.append({"filename": error["filename"],
+                                "sha256": hashlib.sha256(error["stacktrace"].encode()).hexdigest()})
+            if len({e["filename"] for e in details}) != len(details):
+                raise ValueError("duplicate import error filename")
+            data["import_errors"] = len(details)
+            data["import_error_details"] = sorted(details, key=lambda e: e["filename"])
             if not isinstance(data["dags"], dict) or not data["dags"]:
                 raise ValueError("empty active DagBag")
             for dag_id, dag in data["dags"].items():
-                if not isinstance(dag_id, str) or not dag_id or not isinstance(dag, dict) or set(dag) != {"paused", "errors", "parsed"}:
+                if not isinstance(dag_id, str) or not dag_id or not isinstance(dag, dict) or set(dag) != {"paused", "errors", "parsed", "fileloc"}:
                     raise ValueError("invalid DAG record")
                 if type(dag["paused"]) is not bool or type(dag["errors"]) is not bool:
                     raise ValueError("invalid DAG boolean")
+                if not isinstance(dag["fileloc"], str) or not dag["fileloc"].startswith("/"):
+                    raise ValueError("invalid DAG file location")
                 parsed = dag["parsed"]
                 if parsed is not None and (type(parsed) not in (int, float) or not math.isfinite(parsed)):
                     raise ValueError("invalid parse timestamp")
@@ -185,10 +214,15 @@ class Host:
         pids = output.split()
         if any(not re.fullmatch(r"[1-9][0-9]*", pid) for pid in pids):
             raise RuntimeError("invalid external driver PID response")
-        return {"identity": identity, **data, "drivers": sorted({int(pid) for pid in pids})}
+        processes = classify_processes(sorted({int(pid) for pid in pids}), self._containers, self.root)
+        return {"identity": identity, **data,
+                "import_error_policy": policy, "import_error_protected": protected,
+                "drivers": [p["pid"] for p in processes if p["blocks"]], "processes": processes}
 
     def snapshot(self) -> dict[str, Any]:
-        return self._snapshot()
+        result = self._snapshot()
+        legacy_errors.validate(result)
+        return result
 
     def writer_hashes(self, expected: str) -> dict[str, str]:
         """Read the file each mounted consumer actually sees; never run Python there."""
@@ -204,20 +238,26 @@ class Host:
         return result
 
     def _preflight(self, baseline: dict[str, Any], deadline: float | None = None, *, allow_import_errors: bool = False) -> dict[str, Any]:
-        fresh = self._snapshot(deadline, recovery=allow_import_errors)
+        legacy_errors.validate(baseline)
+        fresh = self._snapshot(deadline, recovery=allow_import_errors,
+                               policy=baseline.get("import_error_policy", "none"))
         if fresh["identity"] != baseline.get("identity"):
             raise RuntimeError("shared container/mount/config identity drift")
         expected = baseline.get("dags", {})
         if set(fresh["dags"]) != set(expected):
             raise RuntimeError("active DagBag membership changed")
         for dag_id, dag in fresh["dags"].items():
+            if dag["fileloc"] != expected[dag_id].get("fileloc"):
+                raise RuntimeError("active DAG file location changed")
             if dag["paused"] != expected[dag_id].get("paused"):
                 raise RuntimeError("DAG pause state changed")
             if dag["paused"] is not True:
                 raise RuntimeError("maintenance window requires every active shared DAG paused")
             if dag["errors"] and not allow_import_errors:
                 raise RuntimeError("DAG reports import errors")
-        if fresh["active"] or (fresh["import_errors"] and not allow_import_errors) or fresh["drivers"]:
+        if not allow_import_errors:
+            legacy_errors.validate(fresh)
+        if fresh["active"] or fresh["drivers"]:
             raise RuntimeError("shared runtime has unfinished work, import errors, or external drivers")
         return fresh
 
