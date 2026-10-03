@@ -281,7 +281,10 @@ def test_b6_refuses_a_production_apply_outside_the_automaton(tmp_path: Path) -> 
 
 
 @pytest.mark.unit
-def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("hold_kind", [None, "file", "directory", "symlink", "broken-symlink"])
+def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(
+    tmp_path: Path, hold_kind: str | None,
+) -> None:
     """Настоящий автомат против заглушек: окно — из date, живые раннеры — из pgrep, метабаза
     и контейнер — из docker. Автомат берёт замок в каталоге состояния из env-файла (по
     СЫРОМУ пути, с хвостовым `/`), выписывает одноразовый пропуск и зовёт СОСЕДНИЙ
@@ -329,6 +332,17 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
         '  *) echo "dag_x | f" ;;\n'
         'esac\n',
     )
+    hold = state / "fotmob-campaign.hold"
+    hold_target = tmp_path / "hold-target"
+    hold_target.write_text("preserve", encoding="utf-8")
+    stop = campaign / "state" / "STOP"
+    stop.touch()
+    if hold_kind == "file":
+        hold.touch()
+    elif hold_kind == "directory":
+        hold.mkdir()
+    elif hold_kind in {"symlink", "broken-symlink"}:
+        hold.symlink_to(hold_target if hold_kind == "symlink" else tmp_path / "absent")
     auto = _install(tmp_path, stubs)
     proc = _run(auto, env_file=env_file, stubs=stubs)
     assert proc.returncode == 0, proc.stderr + proc.stdout
@@ -336,7 +350,17 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     assert "ОКНО ОТКРЫТО" in log and f"{auto.parent}/b6_deliver.sh apply" in log, "b6 — сосед автомата"
     assert "окно открыто" in log and "B6 ДОСТАВЛЕН" in log, "вывод b6 уходит в лог автомата"
     assert "приёмка подтверждена" in log and f"ДОСТАВЛЕНО: HEAD={two_short}" in log
-    assert "кампания истории запущена" in log
+    if hold_kind:
+        assert "кампания истории удержана" in log
+        assert "кампания истории запущена" not in log
+        assert not driver_started.exists()
+        assert stop.exists(), "hold must preserve the independent STOP marker"
+        assert hold.exists() or hold.is_symlink()
+        assert hold_target.read_text(encoding="utf-8") == "preserve"
+    else:
+        assert "кампания истории запущена" in log
+        assert driver_started.exists()
+        assert not stop.exists()
     assert _git(repo, "rev-parse", "HEAD") == two
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "deploy/fotmob-b6-master"
     assert (state / "fotmob-b6-accepted").read_text(encoding="utf-8").strip() == two_short
@@ -346,8 +370,8 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     assert not (state / "fotmob-deliver-nonce").exists(), "пропуск одноразовый"
     assert not (state / "fotmob-b6-inflight").exists()
     assert (state / "fotmob-auto-deliver-attempted-2026-01-01").exists()
-    assert (state / "fotmob-campaign-started").exists()
-    assert (campaign / "state" / "campaign_enabled").exists()
+    assert (state / "fotmob-campaign-started").exists() is (hold_kind is None)
+    assert (campaign / "state" / "campaign_enabled").exists() is (hold_kind is None)
     docker_log = calls.read_text(encoding="utf-8")
     assert "exec stub-metadb psql" in docker_log
     assert "exec stub-scheduler md5sum /opt/airflow/scrapers/fotmob/service.py" in docker_log
@@ -355,6 +379,21 @@ def test_auto_deliver_hands_lock_and_nonce_to_b6_and_accepts_against_stubs(tmp_p
     # состояния из env-файла.
     assert "FotMob B6 доставлен" in (state / "fotmob-pending-alert").read_text(encoding="utf-8")
     assert not (state / "fotmob-auto-deliver.off").exists()
+    if hold_kind:
+        # Another cron tick must keep the accepted delivery and the campaign hold.
+        again = _run(auto, env_file=env_file, stubs=stubs)
+        assert again.returncode == 0, again.stderr + again.stdout
+        assert not driver_started.exists()
+        assert stop.exists()
+        assert _git(repo, "rev-parse", "HEAD") == two
+        if hold_kind == "directory":
+            hold.rmdir()
+        else:
+            hold.unlink()
+        resumed = _run(auto, env_file=env_file, stubs=stubs)
+        assert resumed.returncode == 0, resumed.stderr + resumed.stdout
+        assert driver_started.exists(), "explicit hold removal permits the normal start"
+        assert hold_target.read_text(encoding="utf-8") == "preserve"
 
 def _date_stub(stubs: Path, hhmm: str) -> None:
     _stub(
@@ -621,12 +660,17 @@ def test_phase2_accepts_the_first_green_refresh_wave(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_phase2_rolls_back_on_a_runner_error_when_no_writer_is_alive(tmp_path: Path) -> None:
+@pytest.mark.parametrize("campaign_hold", [False, True])
+def test_phase2_rolls_back_on_a_runner_error_when_no_writer_is_alive(
+    tmp_path: Path, campaign_hold: bool,
+) -> None:
     w = _phase2_world(
         tmp_path,
         "fotmob_orchestrated__bbb|failed|2026-09-08T00:00:10|refresh",
         runner_err="[ERROR] __main__: semantic batch has 1 stored rows; expected either 0 or 2\n",
     )
+    if campaign_hold:
+        (w["state"] / "fotmob-campaign.hold").touch()
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
     assert proc.returncode == 1, proc.stderr + proc.stdout
     assert _git(w["repo"], "rev-parse", "HEAD") == w["one"], "бой вернулся на откатный пин"
