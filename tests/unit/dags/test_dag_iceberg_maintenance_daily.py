@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +21,18 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
 
     assert mod.dag._dag_kwargs["max_active_runs"] == 1
     assert mod.dag._dag_kwargs["max_active_tasks"] == 1
+    assert mod.dag._dag_kwargs["schedule"] == "0 2 * * *"
+    assert tasks["janitor_fbref_generic_stages"]._init_kwargs[
+        "execution_timeout"
+    ] == timedelta(minutes=120)
+    assert mod.dag._dag_kwargs["default_args"]["execution_timeout"] == timedelta(
+        minutes=30
+    )
+    assert all(
+        "execution_timeout" not in task._init_kwargs
+        for task_id, task in tasks.items()
+        if task_id != "janitor_fbref_generic_stages"
+    )
     assert set(tasks) == {
         "janitor_fbref_generic_stages",
         "cleanup_whoscored_dq_stage_partitions",
@@ -87,3 +99,14 @@ def test_daily_maintenance_runs_logical_dq_retention(monkeypatch) -> None:
     )
 
     assert mod._cleanup_whoscored_dq_stage() is expected
+
+
+def test_daily_fbref_callable_uses_bounded_wait(monkeypatch) -> None:
+    import utils.fbref_maintenance as maintenance
+
+    mod = _load_module()
+    expected = {"mode": "audit", "control_run_id": "maintenance"}
+    monkeypatch.setattr(
+        maintenance, "maintain_fbref_stages_with_lock_wait", lambda: expected
+    )
+    assert mod._maintain_fbref_stages() is expected

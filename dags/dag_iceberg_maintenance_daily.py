@@ -21,7 +21,7 @@ Schedule: 02:00 UTC daily — well before the 14:00 UTC master pipeline.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
@@ -91,9 +91,9 @@ def _maintain_other_high_churn(**_ctx) -> Dict[str, Any]:
 
 
 def _maintain_fbref_stages(**_ctx) -> Dict[str, Any]:
-    from utils.maintenance_tasks import maintain_fbref_generic_stages
+    from utils.fbref_maintenance import maintain_fbref_stages_with_lock_wait
 
-    return maintain_fbref_generic_stages()
+    return maintain_fbref_stages_with_lock_wait()
 
 
 with DAG(
@@ -132,6 +132,9 @@ with DAG(
     fbref_stage_janitor = PythonOperator(
         task_id="janitor_fbref_generic_stages",
         python_callable=_maintain_fbref_stages,
+        # Up to 90 minutes waiting for the midnight ingest publication lock,
+        # followed by the existing 30-minute maintenance execution budget.
+        execution_timeout=timedelta(minutes=120),
     )
 
     fbref_stage_janitor >> cleanup_whoscored_dq_stage
