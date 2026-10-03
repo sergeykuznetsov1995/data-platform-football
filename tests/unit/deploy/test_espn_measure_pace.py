@@ -912,3 +912,191 @@ def test_restart_after_crash_during_final_drain_never_restarts_accepted_s2(contr
     with pytest.raises(ValueError, match='already complete'):
         main(['resume', '--state-dir', str(c.store.path.parent)])
     assert c.store.get()['accepted_step'] == 2
+
+
+def durable_window(c):
+    """Use the production begin/finish outbox contract, not fake coverage."""
+    fill_window(c)
+    journal = AttemptJournal(c.store.path.parent / 'real-attempts.sqlite3', utcnow_fn=lambda: START)
+    for row in c.journal.data:
+        identity = journal.begin(run_id='r', task_id='measure_pace',
+            requested_at=datetime.fromisoformat(row['requested_at']), origin=row['origin'],
+            endpoint='summary', lane='history', step=row['step'], measurement_id=row['measurement_id'])
+        journal.finish(identity, status=200, timeout=False, http_ms=100, direct_bytes=1)
+    journal.flush = lambda *_args, **_kwargs: 0
+    c.journal = journal
+    return journal.rows(datetime.fromtimestamp(c.state['start'], timezone.utc))[0]['attempt_id']
+
+
+def test_drained_incomplete_window_restarts_then_healthy_traffic_promotes(controller):
+    c = controller
+    bad = durable_window(c)
+    c.journal.finish(bad, status=None, timeout=False, http_ms=5, direct_bytes=0, complete=False)
+    original = dict(c.state)
+    # Merely inspecting/evaluating a live snapshot must not restart anything.
+    assert c.decide()['reason'] == 'incomplete_coverage'
+    assert c.state['start'] == original['start']
+    c.tick()
+    c.finish_boundary()  # same owner path called after bounded_fetch drains
+    rejected = c.store.latest('rejected_window')
+    assert rejected['attempt_ids'] == [bad]
+    assert rejected['report']['reason'] == 'incomplete_coverage'
+    assert c.state['restart_pending'] == c.clock().timestamp()
+    with pytest.raises(LaneClosed, match='boundary'):
+        c.check()
+    c.clock.now += timedelta(seconds=10)
+    c.observe(force=True)
+    assert c.state['start'] == c.clock().timestamp()
+    assert 'restart_pending' not in c.state
+    assert c.state['measurement_id'] == original['measurement_id']
+    assert c.state['baseline_p95_ms'] == original['baseline_p95_ms']
+    assert c.journal.rows()[0]['complete'] is False
+    # New complete traffic qualifies independently; old audit/attempt persists.
+    real = c.journal
+    c.journal = Journal()
+    fill_window(c, seconds=600)
+    new_rows = c.journal.data
+    c.journal = real
+    for row in new_rows:
+        identity = real.begin(run_id='r', task_id='measure_pace',
+            requested_at=datetime.fromisoformat(row['requested_at']), origin=row['origin'],
+            endpoint='summary', lane='history', step=0, measurement_id=c.state['measurement_id'])
+        real.finish(identity, status=200, timeout=False, http_ms=100, direct_bytes=1)
+    c.tick()
+    c.finish_boundary()
+    assert c.gate.snapshot()['confirmed_ceiling'] == 1
+    assert len(c.store.rows('rejected_window', 0, c.clock().timestamp())) == 1
+    assert c.journal.rows()[0]['attempt_id'] == bad
+
+
+@pytest.mark.parametrize('mode', ['live_inflight', '500', 'timeout', 'stop', 'complete'])
+def test_boundary_does_not_retire_inflight_errors_or_terminal_state(controller, mode):
+    c = controller
+    bad = durable_window(c)
+    c.journal.finish(bad, status=None, timeout=False, http_ms=5, direct_bytes=0, complete=False)
+    original = dict(c.state)
+    if mode == 'live_inflight':
+        c.journal.begin(run_id='current', task_id='current', requested_at=START + timedelta(seconds=1),
+            origin='https://sports.core.api.espn.com', endpoint='scoreboard', lane='live', step=0)
+    elif mode in ('500', 'timeout'):
+        c.journal.finish(bad, status=500 if mode == '500' else None,
+                         timeout=mode == 'timeout', http_ms=5, direct_bytes=0)
+    elif mode == 'stop':
+        c.stop_file.touch()
+    else:
+        c.state.update(status='complete', accepted_step=2)
+    c.tick()
+    c.finish_boundary()
+    assert c.state['start'] == original['start']
+    assert 'restart_pending' not in c.state
+    assert c.store.latest('rejected_window') is None
+
+
+def test_rejected_window_and_pending_restart_survive_crash_without_rebaseline(controller):
+    c = controller
+    fill_window(c)
+    c.decide()  # accepted S0 baseline must survive rejection of S1
+    bad = durable_window(c)
+    c.journal.finish(bad, status=None, timeout=False, http_ms=5, direct_bytes=0, complete=False)
+    c.tick()
+    c.finish_boundary()
+    saved = c.store.get()
+    assert saved['restart_pending'] == c.clock().timestamp()
+    assert saved['step'] == 1
+    c.clock.now += timedelta(seconds=5)
+    c.observation = None
+    c.initialize()
+    assert c.state['step'] == 1
+    assert c.state['baseline_p95_ms'] == saved['baseline_p95_ms'] == 100
+    assert c.state['completed'] == saved['completed']
+    assert c.state['measurement_id'] == saved['measurement_id']
+    assert 'restart_pending' not in c.state
+    c.tick()
+    c.finish_boundary()
+    assert len(c.store.rows('rejected_window', 0, c.clock().timestamp())) == 1
+
+
+def test_async_restart_waits_for_post_drain_query_and_cannot_repeat(controller):
+    c = controller
+    bad = durable_window(c)
+    c.journal.finish(bad, status=None, timeout=False, http_ms=5, direct_bytes=0, complete=False)
+    io = async_io(c, publish=lambda *_args, **_kwargs: 0)
+    try:
+        eventually(lambda: io.snapshot('debt') is not None)
+        # Seed the already-continuous observer lineage; real IO owns subsequent polls.
+        with io.lock:
+            io.values['debt']['restart_at'] = c.state['start']
+        c.observe()
+        old = c.state['start']
+        c.tick()
+        c.finish_boundary()
+        pending = c.state['restart_pending']
+        # Polling an earlier query cannot open the new window.
+        previous = dict(c.observation)
+        c._apply_observation(dict(previous, at=pending + 1, observed_at=pending - 1), c.gate.snapshot())
+        assert c.state['restart_pending'] == pending
+        assert c.state['start'] == old
+        c.clock.now += timedelta(seconds=10)
+        eventually(lambda: io.snapshot('debt')['observed_at'] >= c.clock().timestamp())
+        c.observe()
+        assert c.state['start'] == c.clock().timestamp()
+        assert 'restart_pending' not in c.state
+        c.finish_boundary()
+        assert len(c.store.rows('rejected_window', 0, c.clock().timestamp())) == 1
+    finally:
+        io.close()
+
+
+def test_real_fetch_boundary_drains_before_retiring_incomplete_attempt(controller):
+    from scrapers.espn.parallel import bounded_fetch
+    c = controller
+    durable_window(c)
+    begun, release, finished = threading.Event(), threading.Event(), threading.Event()
+    c.last_decision = c.clock().timestamp()
+    identity = []
+    def fetch(client, item):
+        identity.append(c.journal.begin(run_id='r', task_id='measure_pace',
+            requested_at=c.clock(), origin='https://site.web.api.espn.com',
+            endpoint='summary', lane='history', step=0, measurement_id=c.state['measurement_id']))
+        begun.set()
+        assert release.wait(3)
+        c.journal.finish(identity[0], status=None, timeout=False, http_ms=5,
+                         direct_bytes=0, complete=False)
+        finished.set()
+    def tick():
+        if begun.is_set() and not release.is_set():
+            c.clock.now += timedelta(seconds=10)
+            c.observe(force=True)
+            assert c.decide()['reason'] == 'incomplete_coverage'
+            assert 'restart_pending' not in c.state
+            assert c.store.latest('rejected_window') is None
+            c.last_decision = 0
+            release.set()
+        c.tick()
+    try:
+        with pytest.raises(LaneClosed, match='drain'):
+            list(bounded_fetch([1, 2], fetch, limit=lambda: 1, check=c.check,
+                 client_factory=lambda _: SimpleNamespace(flush=lambda: None), tick=tick))
+        assert finished.is_set()
+        c.finish_boundary()
+        assert c.store.latest('rejected_window')['attempt_ids'] == identity
+        assert c.state['restart_pending'] == c.clock().timestamp()
+    finally:
+        release.set()
+
+
+def test_rejected_window_audit_and_state_are_atomic(controller):
+    import sqlite3
+    c = controller
+    bad = durable_window(c)
+    c.journal.finish(bad, status=None, timeout=False, http_ms=5, direct_bytes=0, complete=False)
+    with c.store.db() as db:
+        db.execute("""CREATE TRIGGER reject_restart BEFORE INSERT ON state
+            WHEN NEW.value LIKE '%restart_pending%'
+            BEGIN SELECT RAISE(ABORT, 'disk rejected restart'); END""")
+    c.tick()
+    with pytest.raises(sqlite3.IntegrityError, match='disk rejected restart'):
+        c.finish_boundary()
+    assert c.store.latest('rejected_window') is None
+    assert 'restart_pending' not in c.store.get()
+    assert 'restart_pending' not in c.state

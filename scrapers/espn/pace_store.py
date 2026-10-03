@@ -55,6 +55,15 @@ class PaceStore:
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO state VALUES ('controller', ?)", (payload,))
 
+    def save_with_evidence(self, state, kind, at, **evidence):
+        """Commit a window decision and its audit record as one durable change."""
+        payload = json.dumps(state, allow_nan=False, sort_keys=True)
+        audit = json.dumps(evidence, allow_nan=False, sort_keys=True)
+        with self.db() as db:
+            db.execute('INSERT INTO evidence(kind, at, payload) VALUES (?, ?, ?)',
+                       (kind, float(at), audit))
+            db.execute("INSERT OR REPLACE INTO state VALUES ('controller', ?)", (payload,))
+
     def record(self, kind, at, **payload):
         with self.db() as db:
             db.execute('INSERT INTO evidence(kind, at, payload) VALUES (?, ?, ?)',
