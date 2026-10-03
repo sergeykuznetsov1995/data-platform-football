@@ -35,13 +35,13 @@ No environment secrets are read or written into evidence.
    Example commands, to run from the reviewed isolated checkout:
 
    ```bash
-   python -B -m deploy.shared_writer.release prepare \
+   python3 -B -m deploy.shared_writer.release prepare \
      --bundle /root/shared-writer-releases/RELEASE_ID \
      --repo /root/data-platform-football --commit FULL_MERGE_SHA \
      --start START_UTC_EPOCH --end END_UTC_EPOCH
-   python -B -m deploy.shared_writer.release rehearse \
+   python3 -B -m deploy.shared_writer.release rehearse \
      --bundle /root/shared-writer-releases/RELEASE_ID --approval MANIFEST_SHA256
-   python -B -m deploy.shared_writer.release check \
+   python3 -B -m deploy.shared_writer.release check \
      --bundle /root/shared-writer-releases/RELEASE_ID --approval MANIFEST_SHA256
    ```
 
@@ -59,7 +59,7 @@ No environment secrets are read or written into evidence.
    an identity check, not permission. Then run the normal entrypoint once:
 
    ```bash
-   python -B -m deploy.shared_writer.release apply \
+   python3 -B -m deploy.shared_writer.release apply \
      --bundle /root/shared-writer-releases/RELEASE_ID --approval MANIFEST_SHA256
    ```
 
@@ -94,7 +94,7 @@ After a crash/host interruption or for an
 explicitly authorized rollback of an accepted release:
 
 ```bash
-python -B -m deploy.shared_writer.release recover \
+python3 -B -m deploy.shared_writer.release recover \
   --bundle /root/shared-writer-releases/RELEASE_ID --approval MANIFEST_SHA256
 ```
 
