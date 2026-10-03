@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -411,9 +412,18 @@ def test_more_than_ten_percent_carried_blocks_publication_before_sql():
     assert executor.statements == []
 
 
-def test_a6_report_lists_denominator_disagreements_with_the_regulation():
+@pytest.fixture
+def stale_a6_denominator():
     from scrapers.transfermarkt.denominator import load_denominator
 
+    denominator = load_denominator()
+    return replace(denominator, rows={
+        **denominator.rows,
+        'AFCN': replace(denominator.row('AFCN'), current_saison_id=2026),
+    })
+
+
+def test_a6_report_lists_denominator_disagreements_with_the_regulation(stale_a6_denominator):
     manifest, _ = _with_report(
         {
             'carried_competition_ids': [],
@@ -421,7 +431,7 @@ def test_a6_report_lists_denominator_disagreements_with_the_regulation():
             'regulation_current': {'AFCN': '2024', 'GB1': '2025', 'CL': '2026'},
         }
     )
-    denominator = load_denominator()
+    denominator = stale_a6_denominator
 
     report = publish.a6_report(manifest, denominator=denominator)
 
@@ -435,7 +445,11 @@ def test_a6_report_lists_denominator_disagreements_with_the_regulation():
     assert all(item['competition_id'] != 'GB1' for item in report['mismatches'])
 
 
-def test_a6_report_is_attached_but_never_blocks_the_plan():
+def test_a6_report_is_attached_but_never_blocks_the_plan(monkeypatch, stale_a6_denominator):
+    monkeypatch.setattr(
+        'scrapers.transfermarkt.denominator.load_denominator',
+        lambda: stale_a6_denominator,
+    )
     manifest, manifest_hash = _with_report(
         {'carried_competition_ids': [], 'regulation_current': {'AFCN': '2024'}}
     )
