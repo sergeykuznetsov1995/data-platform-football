@@ -1094,6 +1094,7 @@ def _selector_options(
         values[edition_id] = current
 
     if not values:
+        profile_identity = _profile_identity(profile_url)
         for anchor in soup.select('a[href*="saison_id"]'):
             canonical = _canonical_url(str(anchor.get("href")), base_url=profile_url)
             if canonical is None:
@@ -1110,10 +1111,25 @@ def _selector_options(
             label = _normalise_text(anchor.get_text(" ", strip=True))
             if not edition_id or not label:
                 continue
+            anchor_identity = _profile_identity(canonical)
+            if (
+                profile_identity is None
+                or anchor_identity is None
+                or anchor_identity[0] != profile_identity[0]
+            ):
+                raise DiscoverySchemaError(
+                    f"edition selector changes competition identity: {canonical}"
+                )
             selected = "active" in set(anchor.get("class", ())) or str(
                 anchor.get("aria-current", "")
             ).casefold() in {"true", "page"}
-            values[edition_id] = (label, selected, dict(anchor.attrs))
+            previous = values.get(edition_id)
+            current = (label, selected, dict(anchor.attrs))
+            if previous is not None and previous[:2] != current[:2]:
+                raise DiscoverySchemaError(
+                    f"conflicting edition selector {edition_id}: {profile_url}"
+                )
+            values[edition_id] = current
 
     if not values:
         values = _title_edition(soup, profile_url)
@@ -1842,7 +1858,25 @@ class TransfermarktCompetitionDiscovery:
                 "HTML fallback lists "
                 f"{len(known & found)} of {len(known)} previous editions"
             )
-        return _EditionSource(options, document, profile_url)
+        source = _EditionSource(options, document, profile_url)
+        self._validate_edition_source(competition_id, source)
+        return source
+
+    def _validate_edition_source(
+        self,
+        competition_id: str,
+        source: _EditionSource,
+    ) -> None:
+        """Prove that a selected source can build every strict edition row."""
+
+        self._editions(
+            competition_id,
+            source.options,
+            profile_url=source.profile_url,
+            body_hash=source.document.payload_hash,
+            discovered_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            snapshot_id="tm-discovery-validation",
+        )
 
     def _discover_daily(self) -> tuple[RegistryPage, ...]:
         previous = self._previous
@@ -1859,13 +1893,23 @@ class TransfermarktCompetitionDiscovery:
                 continue
             regulation = self._regulation(competition_id)
             if regulation is not None:
-                regulations[competition_id] = regulation
-                sources[competition_id] = _EditionSource(
+                regulation_source = _EditionSource(
                     regulation.options,
                     regulation.document,
                     str(previous.competitions[competition_id]["source_url"]),
                 )
-                continue
+                try:
+                    self._validate_edition_source(
+                        competition_id, regulation_source,
+                    )
+                except (DiscoveryError, RegistryError, SeasonRuleError) as exc:
+                    self.report.setdefault("regulation_unavailable", {})[
+                        competition_id
+                    ] = f"not applicable: {exc}"
+                else:
+                    regulations[competition_id] = regulation
+                    sources[competition_id] = regulation_source
+                    continue
             if not self._affordable(1):
                 reason = "request budget spent"
                 fallback_rejected[competition_id] = reason

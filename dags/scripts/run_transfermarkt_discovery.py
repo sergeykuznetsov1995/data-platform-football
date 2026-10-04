@@ -1039,6 +1039,7 @@ def _failure_manifest(
     cache_entries_before: int | None,
     competition_rows: list[dict[str, Any]] | None,
     edition_rows: list[dict[str, Any]] | None,
+    discovery_report: Mapping[str, Any],
     source_started: bool,
     source_validated: bool,
     write_authorized: bool,
@@ -1098,6 +1099,7 @@ def _failure_manifest(
         "run_id": str(args.run_id),
         "scope": _scope_manifest(args, cycle_id),
         "expected_entities": list(EXPECTED_ENTITIES),
+        "discovery_report": dict(discovery_report),
         # None means unknown because source completeness was not proven.  Zero
         # would incorrectly look like authoritative_empty evidence.
         "rows": {
@@ -1548,6 +1550,7 @@ def _execute_once(
             cache_entries_before=cache_entries_before,
             competition_rows=competition_rows,
             edition_rows=edition_rows,
+            discovery_report=report,
             source_started=source_started,
             source_validated=source_validated,
             write_authorized=write_authorized,
@@ -1624,6 +1627,7 @@ def execute(
                 cache_entries_before=None,
                 competition_rows=None,
                 edition_rows=None,
+                discovery_report={},
                 source_started=False,
                 source_validated=False,
                 write_authorized=False,

@@ -376,6 +376,19 @@ def _http_zero_discovery(*, fetch, checkpoint, traffic_ledger, clock, **_options
     )
 
 
+def _reported_failure_discovery(
+    *, fetch, checkpoint, traffic_ledger, clock, **options
+):
+    del fetch, checkpoint, traffic_ledger, clock
+    options["report"].update(
+        {
+            "daily_html_fallback_competition_ids": ["GB1"],
+            "daily_html_fallback_rejected": {"FAC": "title-only"},
+        }
+    )
+    raise RuntimeError("carried share exceeds 10%")
+
+
 def test_cached_dry_run_quarantines_unknown_and_never_emits_its_scope(tmp_path):
     mod = _load()
     (tmp_path / "checkpoint.json").write_text(
@@ -627,6 +640,29 @@ def test_http_zero_writes_atomic_terminal_manifest_and_never_touches_bronze(
     }
     assert mod.stable_payload_hash(failure) == raised.value.manifest_hash
     assert list((tmp_path / "manifests").rglob("*.tmp")) == []
+
+
+def test_source_failure_manifest_keeps_the_discovery_report(tmp_path):
+    mod = _load()
+    raw = _raw_args(tmp_path, dry_run=True, approval=False)
+
+    with pytest.raises(RuntimeError, match="carried share") as raised:
+        mod.execute(
+            mod._parser().parse_args(raw),
+            execution_argv=(str(SCRIPT), *raw),
+            discovery_fn=_reported_failure_discovery,
+            previous_reader=lambda snapshot_id: None,
+            lease_provider_factory=lambda url: object(),
+            http_client_factory=_FakeClient,
+            writer_factory=lambda: pytest.fail("failure created an Iceberg writer"),
+            utcnow=lambda: NOW,
+            monotonic=iter((30.0, 34.0)).__next__,
+        )
+
+    assert raised.value.manifest["discovery_report"] == {
+        "daily_html_fallback_competition_ids": ["GB1"],
+        "daily_html_fallback_rejected": {"FAC": "title-only"},
+    }
 
 
 def test_post_validation_write_failure_keeps_exact_row_hashes(

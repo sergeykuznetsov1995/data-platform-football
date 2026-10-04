@@ -1267,6 +1267,41 @@ def test_daily_uses_strict_html_fallback_for_a_known_competition() -> None:
     assert snapshot.competitions[0].discovered_at == NOW
 
 
+def test_daily_falls_back_when_regulation_editions_cannot_be_built() -> None:
+    full, _ = _run(fetch_json=RegulationFetch())
+    previous = _previous_competition(full, "GB1")
+    bad_regulation = {
+        "success": True,
+        "message": "OK",
+        "data": [
+            {
+                "competitionId": "GB1",
+                "season": {
+                    "id": 2025,
+                    "display": "25/27",
+                    "cyclicalName": "25/27",
+                    "nonCyclicalName": "25/27",
+                },
+                "isCurrentSeason": True,
+            }
+        ],
+    }
+
+    snapshot, report = _run(
+        fetch=FixtureFetch(),
+        fetch_json=RegulationFetch(
+            {competition_regulation_url("GB1"): bad_regulation}
+        ),
+        mode="daily",
+        previous=previous,
+        now=NOW + timedelta(days=1),
+    )
+
+    assert report["daily_html_fallback_competition_ids"] == ["GB1"]
+    assert report["regulation_unavailable"]["GB1"].startswith("not applicable:")
+    assert {item.edition_id for item in snapshot.editions} == {"2024", "2025"}
+
+
 def test_daily_html_fallback_never_drops_known_history() -> None:
     full, _ = _run(fetch_json=RegulationFetch())
     previous = _previous_competition(full, "FAC")
@@ -1349,6 +1384,70 @@ def test_daily_html_fallback_rejects_a_foreign_profile() -> None:
 
     assert report["daily_html_fallback_competition_ids"] == []
     assert "profile identity mismatch" in report["daily_html_fallback_rejected"]["GB1"]
+
+
+def test_daily_html_fallback_rejects_a_foreign_edition_anchor() -> None:
+    full, _ = _run(fetch_json=RegulationFetch())
+    previous = _previous_competition(full, "GB1")
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    foreign_anchor = (
+        '<!doctype html><html lang="en"><body>'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<a href="/la-liga/startseite/wettbewerb/ES1/saison_id/2025" '
+        'class="active">25/26</a>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1/saison_id/2024">'
+        '24/25</a></body></html>'
+    )
+    report: dict = {}
+
+    with pytest.raises(DiscoveryError, match="refreshed no competition"):
+        discover_competition_registry(
+            fetch=FixtureFetch({profile_url: foreign_anchor}),
+            checkpoint={},
+            traffic_ledger=LedgerSpy(),
+            clock=lambda: NOW + timedelta(days=1),
+            report=report,
+            fetch_json=RegulationFetch(),
+            mode="daily",
+            previous=previous,
+        )
+
+    assert "changes competition identity" in (
+        report["daily_html_fallback_rejected"]["GB1"]
+    )
+
+
+def test_daily_html_fallback_rejects_conflicting_edition_anchors() -> None:
+    full, _ = _run(fetch_json=RegulationFetch())
+    previous = _previous_competition(full, "GB1")
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    conflicting = (
+        '<!doctype html><html lang="en"><body>'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1/saison_id/2025" '
+        'class="active">25/26</a>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1/saison_id/2025">'
+        '2025</a>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1/saison_id/2024">'
+        '24/25</a></body></html>'
+    )
+    report: dict = {}
+
+    with pytest.raises(DiscoveryError, match="refreshed no competition"):
+        discover_competition_registry(
+            fetch=FixtureFetch({profile_url: conflicting}),
+            checkpoint={},
+            traffic_ledger=LedgerSpy(),
+            clock=lambda: NOW + timedelta(days=1),
+            report=report,
+            fetch_json=RegulationFetch(),
+            mode="daily",
+            previous=previous,
+        )
+
+    assert "conflicting edition selector" in (
+        report["daily_html_fallback_rejected"]["GB1"]
+    )
 
 
 def test_daily_html_fallback_respects_the_existing_request_guard() -> None:
