@@ -93,7 +93,7 @@ def closure(root):
             for directory in dirs:
                 safe_path(Path(parent) / directory)
             for name in sorted(names):
-                if name.endswith(".py") or name == "runtime_contract.lock":
+                if name.endswith(".py") or name in ("runtime_contract.lock", ".airflowignore"):
                     file = Path(parent) / name
                     info = regular(file)
                     files[str(file.relative_to(root))] = {
@@ -126,7 +126,7 @@ def merged(repo, commit):
 
 def tool_hashes():
     directory = Path(__file__).resolve().parent
-    return {name: digest(read(directory / name)) for name in ("release.py", "host.py", "probe.py")}
+    return {name: digest(read(directory / name)) for name in ("release.py", "host.py", "probe.py", "legacy_errors.py", "processes.py", "work.py")}
 
 
 def prepare(bundle, root, repo, commit, start, end, host):
@@ -349,6 +349,7 @@ def rehearse(bundle, approval):
 
 def main():
     from deploy.shared_writer.host import Host
+    from deploy.shared_writer.legacy_errors import POLICIES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "rehearse", "check", "apply", "recover", "rollback"))
     parser.add_argument("--bundle", type=Path, required=True)
@@ -357,8 +358,12 @@ def main():
     parser.add_argument("--commit")
     parser.add_argument("--start", type=float, help="approved window UTC epoch seconds")
     parser.add_argument("--end", type=float)
+    parser.add_argument("--import-error-policy", choices=POLICIES, default=None,
+                        help="prepare only: explicit reviewed legacy baseline; default none")
     args = parser.parse_args()
-    host = Host(ROOT)
+    require(args.import_error_policy is None or args.action == "prepare",
+            "import-error policy is pinned at prepare; cannot change an existing bundle")
+    host = Host(ROOT, import_error_policy=args.import_error_policy or "none")
     if args.action == "prepare":
         require(all(v is not None for v in (args.repo, args.commit, args.start, args.end)), "prepare needs repo/commit/start/end")
         print(prepare(args.bundle, ROOT, args.repo, args.commit, args.start, args.end, host))

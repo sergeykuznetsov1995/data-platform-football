@@ -1,6 +1,5 @@
 from copy import deepcopy
 import json
-from pathlib import Path
 import subprocess
 
 import pytest
@@ -24,8 +23,8 @@ def environment(tmp_path, monkeypatch):
                         "RW": False} for part in ("scrapers", "dags", "scripts")] if name != module.METADB else [],
         })
     env = {
-        "rows": rows, "db": {"dags": {"dag_ingest_clubelo": {"paused": True, "errors": False, "parsed": 1000}},
-                             "active": 0, "import_errors": 0},
+        "rows": rows, "db": {"dags": {"dag_ingest_clubelo": {"paused": True, "errors": False, "parsed": 1000, "fileloc": "/opt/airflow/dags/dag_ingest_clubelo.py"}},
+                             "work": {"now": 1000000, "active_runs": 0, "unstarted_tasks": 0, "tasks": [], "local_jobs": []}, "import_errors": []},
         "pids": "", "calls": [], "config": config,
     }
 
@@ -53,6 +52,8 @@ def environment(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(args, 0, output, "")
 
     monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module, "classify_processes", lambda pids, containers, root:
+                        [{"pid": pid, "blocks": True, "reason": "unverified_process"} for pid in pids])
     return module.Host(root), env
 
 
@@ -164,13 +165,13 @@ def test_busy_or_changed_window_refuses_preflight(environment, condition):
     if condition == "pause_changed":
         env["db"]["dags"]["dag_ingest_clubelo"]["paused"] = False
     elif condition == "dag_changed":
-        env["db"]["dags"]["another"] = {"paused": True, "errors": False, "parsed": 1000}
+        env["db"]["dags"]["another"] = {"paused": True, "errors": False, "parsed": 1000, "fileloc": "/opt/airflow/dags/dag_ingest_clubelo.py"}
     elif condition == "dag_error":
         env["db"]["dags"]["dag_ingest_clubelo"]["errors"] = True
     elif condition == "active":
-        env["db"]["active"] = 1
+        env["db"]["work"]["active_runs"] = 1
     elif condition == "import_error":
-        env["db"]["import_errors"] = 1
+        env["db"]["import_errors"] = [{"filename": "/new.py", "stacktrace": "new error"}]
     elif condition == "driver":
         env["pids"] = "345\n"
     with pytest.raises(RuntimeError):
@@ -180,7 +181,8 @@ def test_busy_or_changed_window_refuses_preflight(environment, condition):
 def test_rollback_allows_import_errors_and_running_unhealthy(environment):
     host, env = environment
     baseline = host.snapshot()
-    env["db"]["import_errors"] = 2
+    env["db"]["import_errors"] = [{"filename": "/new.py", "stacktrace": "new error"},
+                                    {"filename": "/other.py", "stacktrace": "other error"}]
     env["db"]["dags"]["dag_ingest_clubelo"]["errors"] = True
     env["rows"][0]["health"] = "unhealthy"
     assert host.rollback_preflight(baseline)["import_errors"] == 2
@@ -192,11 +194,12 @@ def test_rollback_allows_import_errors_and_running_unhealthy(environment):
 def test_rollback_still_rejects_unsafe_window(environment, condition):
     host, env = environment
     baseline = host.snapshot()
-    env["db"]["import_errors"] = 2
+    env["db"]["import_errors"] = [{"filename": "/new.py", "stacktrace": "new error"},
+                                    {"filename": "/other.py", "stacktrace": "other error"}]
     if condition == "unpaused":
         env["db"]["dags"]["dag_ingest_clubelo"]["paused"] = False
     elif condition == "active":
-        env["db"]["active"] = 1
+        env["db"]["work"]["active_runs"] = 1
     elif condition == "identity":
         env["rows"][0]["image"] = "sha256:" + "e" * 64
     elif condition == "metadb_unhealthy":
@@ -237,7 +240,7 @@ def test_postflight_deadline_bounds_commands_and_sleep(environment, monkeypatch)
 def test_postflight_aborts_on_busy_window_instead_of_waiting(environment, monkeypatch):
     host, env = environment
     baseline = host.snapshot()
-    env["db"]["active"] = 1
+    env["db"]["work"]["active_runs"] = 1
     monkeypatch.setattr(module.time, "sleep", lambda _: pytest.fail("must not sleep through safety failure"))
     with pytest.raises(RuntimeError, match="unfinished work"):
         host.postflight(baseline, since=0)
@@ -249,11 +252,11 @@ def test_invalid_metabase_refused(environment, malformation):
     if malformation == "empty":
         env["db"]["dags"] = {}
     elif malformation == "negative":
-        env["db"]["active"] = -1
+        env["db"]["work"]["active_runs"] = -1
     elif malformation == "nan":
         env["db"]["dags"]["dag_ingest_clubelo"]["parsed"] = float("nan")
     else:
-        env["db"]["active"] = False
+        env["db"]["work"]["active_runs"] = False
     with pytest.raises(RuntimeError, match="invalid read-only"):
         host.snapshot()
 
@@ -295,3 +298,95 @@ def test_dormant_mount_order_does_not_block_apply_or_recovery(environment):
     extra["mounts"][0]["Source"] += "-foreign"
     with pytest.raises(RuntimeError, match="identity drift"):
         host.rollback_preflight(baseline)
+
+
+def test_error_evidence_contains_hashes_not_tracebacks(environment):
+    host, env = environment
+    env["db"]["import_errors"] = [{"filename": "/new.py", "stacktrace": "do not journal raw trace"}]
+    snapshot = host._snapshot()
+    assert snapshot["import_errors"] == 1
+    assert len(snapshot["import_error_details"][0]["sha256"]) == 64
+    assert "do not journal" not in json.dumps(snapshot)
+    with pytest.raises(RuntimeError, match="unapproved"):
+        host.snapshot()
+
+
+def test_active_dag_file_change_rejected_even_without_error_flag(environment):
+    host, env = environment
+    baseline = host.snapshot()
+    env["db"]["dags"]["dag_ingest_clubelo"]["fileloc"] = "/opt/airflow/dags/other.py"
+    with pytest.raises(RuntimeError, match="file location"):
+        host.preflight(baseline)
+
+
+def test_process_exceptions_are_evidence_not_blanket_pgrep_ignore(environment, monkeypatch):
+    host, env = environment
+    env["pids"] = "100\n200\n300\n"
+    def classify(pids, containers, root):
+        assert pids == [100, 200, 300] and containers == env["rows"] and root == host.root
+        return [{"pid": 100, "blocks": False, "reason": "verified_tail"},
+                {"pid": 200, "blocks": False, "reason": "separate_container_writer"},
+                {"pid": 300, "blocks": True, "reason": "unverified_process"}]
+    monkeypatch.setattr(module, "classify_processes", classify)
+    baseline = host.snapshot()
+    assert baseline["drivers"] == [300]
+    assert len(baseline["processes"]) == 3
+    with pytest.raises(RuntimeError, match="external drivers"):
+        host.preflight(baseline)
+
+
+@pytest.fixture
+def legacy_environment(environment, monkeypatch):
+    import hashlib
+    host, env = environment
+    host.import_error_policy = module.legacy_errors.POLICY
+    raw_errors = [{"filename": name, "stacktrace": "reviewed legacy traceback"}
+                  for name in module.legacy_errors.ERRORS]
+    errors = {e["filename"]: hashlib.sha256(e["stacktrace"].encode()).hexdigest() for e in raw_errors}
+    monkeypatch.setattr(module.legacy_errors, "ERRORS", errors)
+    monkeypatch.setattr(module.legacy_errors, "protected_hashes", lambda root, policy: dict(module.legacy_errors.PROTECTED))
+    env["db"]["import_errors"] = raw_errors
+    return host, env
+
+
+def test_explicit_legacy_policy_survives_new_host_and_requires_same_errors(legacy_environment):
+    host, env = legacy_environment
+    baseline = host.snapshot()
+    assert baseline["import_errors"] == 6
+    assert baseline["import_error_policy"] == module.legacy_errors.POLICY
+    # Check/apply load the policy from the approved manifest, not a repeated flag.
+    assert module.Host(host.root).preflight(baseline) == baseline
+    env["db"]["import_errors"][0]["stacktrace"] += "new failure"
+    with pytest.raises(RuntimeError, match="baseline changed"):
+        host.preflight(baseline)
+    # A writer failure may be rolled back; healthy postflight still checks baseline.
+    assert host.rollback_preflight(baseline)["import_errors"] == 6
+    with pytest.raises(RuntimeError, match="baseline changed"):
+        host.postflight(baseline, since=0)
+    env["db"]["import_errors"][0]["stacktrace"] = "reviewed legacy traceback"
+    assert host.postflight(baseline, since=0)["import_errors"] == 6
+
+
+def test_legacy_policy_cannot_allow_active_dag_errors(legacy_environment):
+    host, env = legacy_environment
+    baseline = host.snapshot()
+    env["db"]["dags"]["dag_ingest_clubelo"]["errors"] = True
+    with pytest.raises(RuntimeError, match="DAG reports import errors"):
+        host.preflight(baseline)
+
+
+def test_legacy_file_becoming_active_is_rejected_at_prepare(legacy_environment):
+    host, env = legacy_environment
+    env["db"]["dags"]["legacy"] = {"paused": True, "errors": False, "parsed": 1000,
+                                             "fileloc": next(iter(module.legacy_errors.ERRORS))}
+    with pytest.raises(RuntimeError, match="active DAG"):
+        host.snapshot()
+
+
+@pytest.mark.parametrize("invalid", [None, {}, [{"filename": "/x", "stacktrace": None}],
+                                      [{"filename": "/x", "stacktrace": "a"}] * 2])
+def test_invalid_import_error_evidence_rejected(environment, invalid):
+    host, env = environment
+    env["db"]["import_errors"] = invalid
+    with pytest.raises(RuntimeError, match="invalid read-only"):
+        host.snapshot()
