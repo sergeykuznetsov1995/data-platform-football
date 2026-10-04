@@ -1299,6 +1299,7 @@ def test_daily_falls_back_when_regulation_editions_cannot_be_built() -> None:
 
     assert report["daily_html_fallback_competition_ids"] == ["GB1"]
     assert report["regulation_unavailable"]["GB1"].startswith("not applicable:")
+    assert report["regulation_current"] == {}
     assert {item.edition_id for item in snapshot.editions} == {"2024", "2025"}
 
 

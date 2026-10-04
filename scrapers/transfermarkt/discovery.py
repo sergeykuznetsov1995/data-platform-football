@@ -1806,6 +1806,7 @@ class TransfermarktCompetitionDiscovery:
             groups=groups,
             competition_records=competition_records,
             edition_records=edition_records,
+            regulation_competition_ids=set(regulations),
             carried=carried,
             carried_records=carried_records,
         )
@@ -1993,6 +1994,7 @@ class TransfermarktCompetitionDiscovery:
             groups=groups,
             competition_records=competition_records,
             edition_records=edition_records,
+            regulation_competition_ids=set(regulations),
             carried=carried,
             carried_records=carried_records,
         )
@@ -2108,6 +2110,7 @@ class TransfermarktCompetitionDiscovery:
         groups: list[tuple[str, str, list[str]]],
         competition_records: Mapping[str, CompetitionRecord],
         edition_records: Mapping[str, tuple[EditionRecord, ...]],
+        regulation_competition_ids: set[str],
         carried: Mapping[str, str],
         carried_records: Mapping[
             str, tuple[CompetitionRecord, tuple[EditionRecord, ...]]
@@ -2156,7 +2159,7 @@ class TransfermarktCompetitionDiscovery:
             )
             if current is None:
                 continue
-            if self._documents.get(tmapi.competition_regulation_url(competition_id)):
+            if competition_id in regulation_competition_ids:
                 regulation_current[competition_id] = current
             before = previous.current_edition(competition_id) if previous else None
             if before != current:
