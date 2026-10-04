@@ -1,10 +1,11 @@
 """Daily, approval-gated Transfermarkt competition registry discovery.
 
 Every day at 18:00 UTC (21:00 MSK): ``daily`` mode reads the tmapi regulation
-of every competition of the canonical snapshot (fresh current editions), and
-once the last full crawl is a week old the same run is ``full`` — catalogue,
-country pages and regulations (#1391).  The paid caps scale with that work by
-the committed standing policy's ``scaling`` block.
+of every competition of the canonical snapshot and uses a strict HTML season
+selector only for known competitions whose regulation is unusable. Once the
+last full crawl is a week old the same run is ``full`` — catalogue, country
+pages and regulations (#1391). The paid caps remain those calculated from the
+committed standing policy's ``scaling`` block.
 
 The paid discovery and its two Bronze writes run in one proxy-only process.
 Silver publication is a separate boundary: the exact discovery manifest is

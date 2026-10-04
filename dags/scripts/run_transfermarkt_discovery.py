@@ -7,10 +7,11 @@ network fallback.  All source pages are reconciled and flattened before either
 Bronze table is touched.
 
 Two modes (#1391): ``full`` crawls the catalogue and the configured country
-pages and reads every tmapi regulation; ``daily`` reads only the regulations
-of the previous canonical snapshot.  ``auto`` runs ``full`` when the last full
-crawl is older than seven days.  The previous canonical snapshot (read from
-Silver before any paid I/O) is where unreadable competitions are carried from.
+pages and reads every tmapi regulation; ``daily`` reads those regulations and,
+only when one is unusable, may read the known competition's strict HTML season
+selector.  ``auto`` runs ``full`` when the last full crawl is older than seven
+days.  The previous canonical snapshot (read from Silver before any paid I/O)
+is where unreadable competitions are carried from.
 """
 
 from __future__ import annotations
@@ -466,10 +467,12 @@ def discovery_limits(
     """The exact caps a standing policy grants one run.
 
     ``request_limit = max(floor, ceil(multiplier * (k * competitions +
-    country pages + seed pages)))`` with ``k`` requests per competition of
-    the mode (full: profile + regulation; daily: regulation); retries and
-    provider bytes scale with it.  The policy's ``paid_proxy`` caps are the
-    floors, and a policy without ``scaling`` grants exactly the floors.
+    country pages + seed pages)))`` with ``k`` baseline requests per
+    competition of the mode (full: profile + regulation; daily: regulation).
+    Daily HTML fallbacks spend only existing multiplier/floor headroom and stop
+    through the same guard. Retries and provider bytes scale with the result.
+    The policy's ``paid_proxy`` caps are the floors, and a policy without
+    ``scaling`` grants exactly the floors.
     """
 
     paid = policy.paid_proxy
