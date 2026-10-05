@@ -21,6 +21,7 @@ from scrapers.espn.history_report import (
     render_history_line,
     render_journal_sql,
     render_live_debt_sql,
+    render_live_debt_rows_sql,
     render_queue_sql,
 )
 
@@ -92,9 +93,12 @@ def test_live_debt_counts_only_unpublished_due_matches_of_live_targets(db) -> No
     db.match(9, kickoff=ago(20), duplicate_of="uefa.champions:2026")    # a duplicate
     db.match(10, kickoff=ago(20), competition_slug="concacaf.u23")      # not a live target
 
-    (debt,), = db.run(render_live_debt_sql(["eng.1", "ger.2"], NOW))
+    targets = ["eng.1", "ger.2"]
+    (debt,), = db.run(render_live_debt_sql(targets, NOW))
+    rows = db.run(render_live_debt_rows_sql(["event_id"], targets, NOW))
 
     assert debt == 2
+    assert {event_id for event_id, in rows} == {1, 2}
 
 
 def test_capability_is_read_from_the_season_data(db) -> None:

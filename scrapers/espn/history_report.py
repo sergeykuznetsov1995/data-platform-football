@@ -37,9 +37,7 @@ NO_LINEUPS = "без составов"
 NO_STATS = "без статов"
 NO_BOTH = "без составов и статов"
 
-LIVE_DEBT_SQL = """SELECT count(*) AS debt
-FROM iceberg.bronze.espn_match
-WHERE duplicate_of IS NULL
+_LIVE_DEBT_WHERE = """duplicate_of IS NULL
   AND competition_slug IN ({targets})
   AND kickoff > TIMESTAMP '{since}'
   AND kickoff < TIMESTAMP '{until}'
@@ -49,6 +47,10 @@ WHERE duplicate_of IS NULL
       (terminal_nonplayed OR status = 'STATUS_POSTPONED') AND status_checked_at > kickoff,
       false
   )"""
+
+LIVE_DEBT_SQL = f"""SELECT count(*) AS debt
+FROM iceberg.bronze.espn_match
+WHERE {_LIVE_DEBT_WHERE}"""
 
 HISTORY_CAPABILITY_SQL = """WITH seasons AS (
     SELECT DISTINCT slug, season_year
@@ -120,6 +122,21 @@ def _ts(value: datetime) -> str:
 
 def render_live_debt_sql(targets: Iterable[str], now: datetime) -> str:
     return LIVE_DEBT_SQL.format(
+        targets=targets_literal(targets),
+        since=_ts(now - DEBT_FROM),
+        until=_ts(now - DEBT_TO),
+    )
+
+
+def render_live_debt_rows_sql(
+    columns: Iterable[str], targets: Iterable[str], now: datetime
+) -> str:
+    """Debt rows under the exact same predicate as ``render_live_debt_sql``."""
+
+    selected = ", ".join(columns)
+    if not selected:
+        raise ValueError("live-debt row query needs columns")
+    return f"SELECT {selected} FROM iceberg.bronze.espn_match WHERE {_LIVE_DEBT_WHERE}".format(
         targets=targets_literal(targets),
         since=_ts(now - DEBT_FROM),
         until=_ts(now - DEBT_TO),
@@ -204,5 +221,6 @@ __all__ = [
     "render_history_line",
     "render_journal_sql",
     "render_live_debt_sql",
+    "render_live_debt_rows_sql",
     "render_queue_sql",
 ]

@@ -16,6 +16,10 @@ matches remain eligible outside the scoreboard window; a confirmed future
 kickoff waits until due. Metadata failures preserve the row and fail its
 tournament. The wave warns above ``ESPN_WITHDRAWN_ALERT`` withdrawals.
 
+Every match in the live-debt window remains eligible too, even after its ESPN
+day leaves the two-day scoreboard window. This makes the current lane repair a
+late final or retry an unpublished final before history is allowed to resume.
+
 Freshness meter (#1505): every match row carries ``status_checked_at`` (when
 its status was read) and ``first_published_at`` (carried from the stored row,
 never moved by a republication).  A match that is not a played final and
@@ -66,6 +70,7 @@ from .core_lists import collect_refs, event_ids as core_event_ids, parse_event_s
 from .denominator import DenominatorRow
 from .editions import EditionState
 from .event_metadata import parse_event_metadata
+from .history_report import render_live_debt_rows_sql
 from .journal import flush_journal, journal_rows
 from .models import (
     AgeClass,
@@ -388,6 +393,17 @@ def bronze_window(trino, start: date, end: date) -> list[BronzeMatch]:
             datetime.combine(start, time()),
             datetime.combine(end + timedelta(days=1), time()),
         ),
+    )
+    return [BronzeMatch.from_row(row) for row in rows]
+
+
+def bronze_live_debt(
+    trino, live_targets: Iterable[str], now: datetime
+) -> list[BronzeMatch]:
+    """Matches that currently pause history, including ones outside day lists."""
+
+    rows = trino.execute_query(
+        render_live_debt_rows_sql(_MATCH_COLUMNS, live_targets, now)
     )
     return [BronzeMatch.from_row(row) for row in rows]
 
@@ -899,8 +915,14 @@ def plan_wave(
         match.event_id: match
         for match in bronze_window(trino, days[0] - timedelta(days=1), days[-1] + timedelta(days=1))
     }
+    debt: dict[int, BronzeMatch] = {}
     if window is None:
         stored.update((match.event_id, match) for match in bronze_unresolved_moved(trino, now))
+        debt = {
+            match.event_id: match
+            for match in bronze_live_debt(trino, by_slug, now)
+        }
+        stored.update(debt)
     # Only tournaments whose days were read completely are compared.
     usable = {slug for slug in by_slug if slug not in errors}
     status_errors: dict[str, str] = {}
@@ -969,10 +991,18 @@ def plan_wave(
         match
         for match in stored.values()
         if match.event_id not in found
-        and not match.terminal
         and match.competition_slug in usable
         and match.duplicate_of is None
-        and (espn_day(match.kickoff) in days or (window is None and match.disposition == MOVED))
+        and (
+            match.event_id in debt
+            or (
+                not match.terminal
+                and (
+                    espn_day(match.kickoff) in days
+                    or (window is None and match.disposition == MOVED)
+                )
+            )
+        )
         and match.disposition != WITHDRAWN
         and (match.disposition != MOVED or match.kickoff <= now or not match.kickoff_confirmed)
     ]
@@ -997,7 +1027,20 @@ def plan_wave(
             continue
         if mark is None:
             continue
-        if mark == MOVED:
+        effective_status = status or match.status
+        retry_final = (
+            mark == MOVED
+            and match.event_id in debt
+            and match.status in STATUS_MAP
+            and STATUS_MAP[match.status].played_final
+            and effective_status in STATUS_MAP
+            and STATUS_MAP[effective_status].played_final
+        )
+        if retry_final:
+            # A final whose earlier Summary did not publish is still debt.
+            # Preserve the confirmed status so the absent-row writer retries it.
+            status = effective_status
+        if mark == MOVED and not retry_final:
             competition = targets[by_slug[match.competition_slug].espn_id]
             edition = next((item for item in competition.editions
                             if item.source_season_year == match.season_year), None)
