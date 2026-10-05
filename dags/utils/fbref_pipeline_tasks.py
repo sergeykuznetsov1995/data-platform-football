@@ -1660,7 +1660,7 @@ def acquire_fbref_publication_lock(
     dag_id: str,
     ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
 ) -> dict:
-    """Fence every FBref Bronze/Silver writer until publication is terminal."""
+    """Fence every FBref Bronze publisher until publication is terminal."""
 
     run_id = _control_run_id(
         airflow_run_id=airflow_run_id, dag_id=dag_id
@@ -1801,8 +1801,8 @@ def finalize_fbref_publication_lock(
         states.get("choose_publication_path", "missing") == "success"
         and export_state == "skipped"
     ):
-        # Непубликующая историческая полоса: Silver не запускался и не должен
-        # был.  Доказательство берём не из состояний тасков, а из durable
+        # Непубликующая историческая полоса не экспортирует downstream scope.
+        # Доказательство берём не из состояний тасков, а из durable
         # метаданных рана — ветку можно выбрать шаблоном, метаданные пишутся
         # до первой страницы и переживают ретрай.
         run = _control_store().get_run(
@@ -1827,34 +1827,8 @@ def finalize_fbref_publication_lock(
             "publishing": False,
             "status": "released_after_nonpublishing_run",
         }
-    task = context.get("task") or getattr(context.get("ti"), "task", None)
-    if "trigger_silver_transform" in set(
-        getattr(task, "upstream_task_ids", ()) or ()
-    ):
-        # A graph that still waits for Silver before this lock (today only
-        # dag_replay_fbref) keeps the pre-#1324 verdict: the lock is held
-        # while the child's state is ambiguous.
-        silver_state = states.get("trigger_silver_transform", "missing")
-        if silver_state != "success":
-            if silver_state in {"skipped", "upstream_failed"}:
-                release_fbref_publication_lock(
-                    airflow_run_id=airflow_run_id, dag_id=dag_id
-                )
-            raise AirflowException(
-                "FBref Silver publication did not succeed; publication lock "
-                + (
-                    "released because the child never started "
-                    if silver_state in {"skipped", "upstream_failed"}
-                    else "retained because child state is ambiguous "
-                )
-                + f"(state={silver_state})"
-            )
-        return release_fbref_publication_lock(
-            airflow_run_id=airflow_run_id, dag_id=dag_id
-        )
-    # #1324: the Bronze verdict ends at the publication export.  Silver is
-    # triggered only after this lock is released and is never waited on, so
-    # its state cannot hold the lock or colour the Bronze run.
+    # The Bronze verdict ends at the publication export. No downstream
+    # transform is launched from this control path.
     released = release_fbref_publication_lock(
         airflow_run_id=airflow_run_id, dag_id=dag_id
     )
@@ -1869,33 +1843,9 @@ def finalize_fbref_publication_lock(
             f"started (state={export_state})"
         )
     raise AirflowException(
-        "FBref publication export failed; lock released, Silver not "
-        f"triggered (state={export_state})"
+        "FBref publication export failed; lock released "
+        f"(state={export_state})"
     )
-
-
-def finalize_fbref_publication_lock_and_route_silver(
-    *,
-    airflow_run_id: str,
-    dag_id: str,
-    **context,
-):
-    """Branching finalizer of the lanes that trigger Silver after the lock.
-
-    #1324: the lock finalizer stays the DAG's terminal Bronze verdict.  Silver
-    is followed only after the finalizer released the lock for a successful
-    publication export; every other successful outcome (canary, dry run,
-    non-publishing backfill) skips Silver only after the verdict is known, and
-    a raising finalizer fails this task, so Silver ends upstream_failed and
-    the DagRun stays red.
-    """
-
-    result = finalize_fbref_publication_lock(
-        airflow_run_id=airflow_run_id, dag_id=dag_id, **context
-    )
-    if result.get("status") == "released_after_publication_export":
-        return "trigger_silver_transform"
-    return None
 
 
 def seed_fbref_competition_index(
@@ -2748,11 +2698,7 @@ def fbref_dag_failure_callback(context: dict) -> None:
             error_class="AirflowDagFailure",
             error_message=f"Airflow DAG failed after task {task_id}",
         )
-        if task_id not in {
-            "trigger_silver_transform",
-            "release_publication_lock",
-            "unknown",
-        }:
+        if task_id not in {"release_publication_lock", "unknown"}:
             try:
                 release_fbref_publication_lock(
                     airflow_run_id=str(airflow_run_id),
@@ -2762,8 +2708,8 @@ def fbref_dag_failure_callback(context: dict) -> None:
                 logger.exception("FBref publication lock cleanup failed")
         else:
             logger.warning(
-                "Retaining FBref publication lock after ambiguous child "
-                "or cleanup failure (task=%s)",
+                "Retaining FBref publication lock after cleanup failure "
+                "(task=%s)",
                 task_id,
             )
     except Exception:  # noqa: BLE001 - callbacks must not mask DAG state
@@ -2779,7 +2725,6 @@ __all__ = [
     "choose_fbref_publication_path",
     "export_fbref_publication_scope",
     "finalize_fbref_publication_lock",
-    "finalize_fbref_publication_lock_and_route_silver",
     "fbref_dag_failure_callback",
     "initialize_fbref_run",
     "drain_fbref_replay",

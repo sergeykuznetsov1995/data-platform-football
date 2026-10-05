@@ -1,9 +1,9 @@
 """
 Smoke integration tests for E1 (xref refactor) DAG wiring.
 
-Goal: verify ``dag_transform_xref`` parses, exposes the expected task ids,
-and is reached synchronously from validated FBref Silver.  The master pipeline
-must not launch a second racing xref run.
+Goal: verify ``dag_transform_xref`` parses, exposes the expected task ids, and
+has one master-owned launch path. The master stays paused until the replacement
+FBref Silver methodology defines the new handoff.
 
 We re-use the project-level DAG folder layout — no Airflow DB is needed,
 DagBag parses the .py files directly. The fixture is local so the test
@@ -107,31 +107,19 @@ class TestE1DagImports:
             f"max_active_tasks={dag.max_active_tasks}"
         )
 
-    def test_fbref_silver_triggers_xref_synchronously(self, dag_bag):
-        """Validated FBref identity is the sole production xref handoff."""
-        dag = dag_bag.dags["dag_transform_fbref_silver"]
-        trigger = dag.get_task("trigger_xref_transform")
-        assert getattr(trigger, "trigger_dag_id", None) == "dag_transform_xref"
-        assert trigger.wait_for_completion is True
-        assert trigger.allowed_states == ["success"]
-        assert trigger.failed_states == ["failed"]
-
-        upstream = {task.task_id for task in trigger.upstream_list}
-        assert "validate_silver_quality" in upstream
-
-    def test_master_pipeline_does_not_duplicate_xref(self, dag_bag):
+    def test_master_pipeline_owns_one_xref_launch(self, dag_bag):
         master = dag_bag.dags["dag_master_pipeline"]
-        targets = {
+        targets = [
             getattr(task, "trigger_dag_id", None)
             for task in master.tasks
-        }
-        assert "dag_transform_xref" not in targets
+        ]
+        assert targets.count("dag_transform_xref") == 1
         assert "dag_ingest_fbref" not in targets
 
     def test_xref_dag_no_import_errors(self, dag_bag):
         """No DAG-import errors at all (not just for xref-related modules).
 
-        A lazy ``import scrapers.*`` at module level in the xref, Silver, or
+        A lazy ``import scrapers.*`` at module level in the xref or
         master file would silently increase Airflow scheduler RAM by
         ~1.5GB; we surface those as import errors here.
         """
@@ -140,7 +128,7 @@ class TestE1DagImports:
         # to fix. Filter to just the modules T4 touched.
         relevant = {
             k: v for k, v in dag_bag.import_errors.items()
-            if "xref" in k or "fbref_silver" in k or "master_pipeline" in k
+            if "xref" in k or "master_pipeline" in k
         }
         assert relevant == {}, (
             "E1 DAG import errors: "
@@ -203,7 +191,7 @@ class TestE1DagImports:
         )
 
     def test_master_fbref_handoff_finishes_before_e3(self, dag_bag):
-        """The sensed FBref->Silver->xref chain finishes before E3."""
+        """The sensed FBref Bronze run and master xref finish before E3."""
         master = dag_bag.dags["dag_master_pipeline"]
         fbref = master.get_task("wait_for_scheduled_fbref")
         e3 = master.get_task("trigger_e3_transforms")

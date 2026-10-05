@@ -82,14 +82,13 @@ class TestFBrefReplayTopology:
 
     def test_graph_contains_no_fetch_or_seed_task(self, loaded_dag):
         module, tasks = loaded_dag
-        assert len(tasks) == 10
+        assert len(tasks) == 9
         assert not any(task_id.startswith("fetch") for task_id in tasks)
         assert not any(task_id.startswith("seed") for task_id in tasks)
         assert "recover_raw_before_fetch" not in tasks
         callable_names = {
             task.python_callable.__name__
-            for task_id, task in tasks.items()
-            if task_id != "trigger_silver_transform"
+            for task in tasks.values()
         }
         assert "run_fbref_live_waves" not in callable_names
         assert callable_names == {
@@ -148,7 +147,7 @@ class TestFBrefReplayTopology:
             "validate_run"
         }
 
-    def test_validation_precedes_waiting_silver_trigger(self, loaded_dag):
+    def test_validation_precedes_publication_release(self, loaded_dag):
         module, tasks = loaded_dag
         assert all(
             task._captured_kwargs.get("trigger_rule") == "all_success"
@@ -164,16 +163,9 @@ class TestFBrefReplayTopology:
         assert tasks["validate_run"].downstream_task_ids == {
             "export_publication_scope"
         }
-        trigger = tasks["trigger_silver_transform"]
-        assert trigger.upstream_task_ids == {"export_publication_scope"}
-        assert trigger._captured_kwargs["wait_for_completion"] is True
-        assert trigger._captured_kwargs["failed_states"] == ["failed"]
-        assert (
-            trigger._captured_kwargs["execution_timeout"].total_seconds()
-            == 12 * 60 * 60
-        )
-        assert trigger._captured_kwargs["retries"] == 0
-        assert trigger._captured_kwargs["reset_dag_run"] is False
-        assert trigger._captured_kwargs["execution_date"] == "{{ ti.start_date }}"
-        assert trigger._captured_kwargs["conf"]["trigger_xref"] is False
-        assert trigger.downstream_task_ids == {"release_publication_lock"}
+        assert tasks["export_publication_scope"].downstream_task_ids == {
+            "release_publication_lock"
+        }
+        assert tasks["release_publication_lock"].upstream_task_ids == {
+            "export_publication_scope"
+        }

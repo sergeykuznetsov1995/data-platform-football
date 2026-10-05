@@ -195,7 +195,7 @@ class TestMasterPipeline:
         trigger = dag.get_task('trigger_fbref_gold')
         assert getattr(trigger, 'trigger_dag_id', None) == 'dag_transform_fbref_gold'
 
-    def test_fbref_gold_runs_after_silver_and_before_check(self, dag_bag):
+    def test_fbref_gold_runs_after_prerequisites_and_before_check(self, dag_bag):
         """`trigger_fbref_gold` must run after TM/Cap/SoFIFA Silver and feed
         into the pipeline success check (issue #39)."""
         dag_id = 'dag_master_pipeline'

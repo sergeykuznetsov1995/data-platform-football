@@ -1,4 +1,4 @@
-"""Fail-closed source/Silver and separate master xref -> Gold topology."""
+"""Fail-closed scheduled-source and master xref -> Gold topology."""
 
 from __future__ import annotations
 
@@ -59,21 +59,9 @@ def _timedelta_hours(node: ast.AST) -> int:
 
 
 @pytest.mark.unit
-def test_silver_is_fbref_only_and_never_launches_xref_or_gold():
-    publication_targets = [
-        call["trigger_dag_id"].value
-        for call in _trigger_calls("dag_transform_fbref_silver.py")
-        if isinstance(call.get("trigger_dag_id"), ast.Constant)
-    ]
-    assert "dag_transform_xref" not in publication_targets
-    assert "dag_transform_fbref_gold" not in publication_targets
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize(
     ("filename", "child_dag_id", "timeout_hours"),
     [
-        ("dag_replay_fbref.py", "dag_transform_fbref_silver", 12),
         ("dag_master_pipeline.py", "dag_transform_xref", 5),
         ("dag_master_pipeline.py", "dag_transform_fbref_gold", 12),
     ],
@@ -93,60 +81,12 @@ def test_blocking_fbref_handoffs_do_not_retry_reset_child_dags(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("filename", ["dag_ingest_fbref.py", "dag_backfill_fbref.py"])
-def test_bronze_silver_handoff_fires_after_the_lock_without_waiting(filename):
-    """#1324: the Bronze verdict and lock never wait for Silver."""
-
-    trigger = _literal_trigger(filename, "dag_transform_fbref_silver")
-
-    assert _literal(trigger["wait_for_completion"]) is False
-    assert _literal(trigger["reset_dag_run"]) is False
-    assert _literal(trigger["retries"]) == 0
-    timeout = trigger["execution_timeout"]
-    assert isinstance(timeout, ast.Call) and timeout.func.id == "timedelta"
-    assert {kw.arg: _literal(kw.value) for kw in timeout.keywords} == {
-        "minutes": 10
-    }
-
-
-@pytest.mark.unit
-def test_fbref_child_runs_have_parent_unique_identity_and_never_share_ds():
-    parents = {
-        "dag_ingest_fbref.py": "dag_ingest_fbref",
-        "dag_backfill_fbref.py": "dag_backfill_fbref",
-        "dag_replay_fbref.py": "dag_replay_fbref",
-    }
-    rendered_ids = set()
-    for filename, parent_dag_id in parents.items():
-        trigger = _literal_trigger(filename, "dag_transform_fbref_silver")
-        template = _literal(trigger["trigger_run_id"])
-        assert "{{ dag.dag_id }}" in template
-        assert "{{ run_id }}" in template
-        # Airflow 2.7 names this TriggerDagRunOperator argument
-        # ``execution_date``; Airflow 2.11 keeps it as a compatible alias.
-        assert _literal(trigger["execution_date"]) == "{{ ti.start_date }}"
-        assert "logical_date" not in trigger
-        rendered_ids.add(
-            template.replace("{{ dag.dag_id }}", parent_dag_id).replace(
-                "{{ run_id }}", "same-day-run"
-            )
-        )
-
-    assert len(rendered_ids) == len(parents)
-
+def test_master_child_runs_have_parent_unique_identity():
     xref = _literal_trigger("dag_master_pipeline.py", "dag_transform_xref")
     assert "{{ dag.dag_id }}" in _literal(xref["trigger_run_id"])
     assert "{{ run_id }}" in _literal(xref["trigger_run_id"])
     assert _literal(xref["logical_date"]) == "{{ ti.start_date }}"
     assert "execution_date" not in xref
-
-
-@pytest.mark.unit
-def test_silver_run_has_a_bounded_fbref_only_timeout():
-    dag_calls = _operator_calls("dag_transform_fbref_silver.py", "DAG")
-    assert len(dag_calls) == 1
-    dag_timeout = _timedelta_hours(dag_calls[0]["dagrun_timeout"])
-    assert dag_timeout >= 8
 
 
 @pytest.mark.unit

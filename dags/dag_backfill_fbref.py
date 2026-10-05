@@ -15,7 +15,6 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import BranchPythonOperator, PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
@@ -38,7 +37,7 @@ from utils.fbref_pipeline_tasks import (
     choose_fbref_backfill_publication_path,
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
-    finalize_fbref_publication_lock_and_route_silver,
+    finalize_fbref_publication_lock,
     guard_fbref_history_window,
     initialize_fbref_run,
     plan_fbref_backfill,
@@ -128,7 +127,7 @@ with DAG(
             description=(
                 "Keep false for the isolated historical lane. Set true "
                 "explicitly only when this run should export scope and "
-                "trigger Silver after validation"
+                "publish after validation"
             ),
         ),
         "max_batches": Param(
@@ -370,34 +369,9 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    trigger_silver = TriggerDagRunOperator(
-        task_id="trigger_silver_transform",
-        trigger_dag_id="dag_transform_fbref_silver",
-        trigger_run_id="fbref_silver__{{ dag.dag_id }}__{{ run_id }}",
-        execution_date="{{ ti.start_date }}",
-        conf={
-            "fbref_source_dag_id": DAG_ID,
-            "fbref_source_run_id": AIRFLOW_RUN_ID,
-            "fbref_control_run_id": (
-                "{{ ti.xcom_pull(task_ids='initialize_run') }}"
-            ),
-            "publication_scope": "fbref_silver_only",
-            "trigger_xref": False,
-        },
-        # #1324: fire and forget after the lock is released; Silver never
-        # holds the lock or colours the Bronze run.
-        wait_for_completion=False,
-        reset_dag_run=False,
-        execution_timeout=timedelta(minutes=10),
-        retries=0,
-        trigger_rule="all_success",
-    )
-
-    # #1324: the finalizer stays the terminal Bronze verdict and branches into
-    # Silver only after a successful publication export.
-    release_publication_lock = BranchPythonOperator(
+    release_publication_lock = PythonOperator(
         task_id="release_publication_lock",
-        python_callable=finalize_fbref_publication_lock_and_route_silver,
+        python_callable=finalize_fbref_publication_lock,
         op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
         retries=0,
         trigger_rule="all_done",
@@ -405,9 +379,8 @@ with DAG(
 
     previous >> validate_freshness >> validate_run >> choose_publication_path
     choose_publication_path >> export_publication_scope >> release_publication_lock
-    release_publication_lock >> trigger_silver
     # A non-publishing historical run holds the lock for its own batches only,
-    # instead of the six-to-eighteen hours a Silver transform costs.
+    # then releases it without launching a downstream transform.
     choose_publication_path >> release_publication_lock
 
 

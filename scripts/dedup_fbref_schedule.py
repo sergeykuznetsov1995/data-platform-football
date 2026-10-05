@@ -12,8 +12,8 @@ NULL``).
 
 What is left is a different kind of bloat: 2 146 rows where *every* field is
 NULL — blank separator rows the FBref HTML parser captures between gameweeks.
-Silver already discards them (``fbref_match_enriched.sql`` filters
-``sch.date IS NOT NULL``), so this is pure Bronze hygiene.
+The retired legacy Silver implementation discarded them, so this remains pure
+Bronze hygiene.
 
 Why row-level DELETE instead of the previous CTAS + DROP + RENAME
 -----------------------------------------------------------------

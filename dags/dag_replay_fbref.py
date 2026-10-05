@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
@@ -200,31 +199,6 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    trigger_silver = TriggerDagRunOperator(
-        task_id="trigger_silver_transform",
-        trigger_dag_id="dag_transform_fbref_silver",
-        trigger_run_id="fbref_silver__{{ dag.dag_id }}__{{ run_id }}",
-        execution_date="{{ ti.start_date }}",
-        conf={
-            "fbref_source_dag_id": DAG_ID,
-            "fbref_source_run_id": AIRFLOW_RUN_ID,
-            "fbref_control_run_id": (
-                "{{ ti.xcom_pull(task_ids='initialize_run') }}"
-            ),
-            "replay_source_control_run_id": SOURCE_CONTROL_RUN_ID,
-            "publication_scope": "fbref_silver_only",
-            "trigger_xref": False,
-        },
-        wait_for_completion=True,
-        reset_dag_run=False,
-        poke_interval=30,
-        allowed_states=["success"],
-        failed_states=["failed"],
-        execution_timeout=timedelta(hours=12),
-        retries=0,
-        trigger_rule="all_success",
-    )
-
     release_publication_lock = PythonOperator(
         task_id="release_publication_lock",
         python_callable=finalize_fbref_publication_lock,
@@ -233,8 +207,7 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    previous >> validate_run >> export_publication_scope >> trigger_silver
-    trigger_silver >> release_publication_lock
+    previous >> validate_run >> export_publication_scope >> release_publication_lock
 
 
 __all__ = ["dag"]

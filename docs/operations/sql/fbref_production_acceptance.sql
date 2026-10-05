@@ -1,7 +1,8 @@
 -- FBref production acceptance for DataGrip / Trino.
 -- This file is only for the publishing 4096-request / 2048-MiB safety profile.
--- The non-publishing 100/50 canary has no publication-scope generation or
--- Silver child; use fbref_canary_acceptance.sql for that profile.
+-- The non-publishing 100/50 canary has no publication-scope generation.
+-- For that profile use fbref_canary_acceptance.sql. The legacy FBref Silver
+-- producer was retired in #1634, so this script accepts Bronze only.
 -- Set :control_run_id to the accepted PostgreSQL control run UUID.
 -- Set :expected_current_male_competitions from the control PostgreSQL
 -- datasource (never hardcode it):
@@ -543,56 +544,7 @@ CROSS JOIN season_datasets AS dataset
 ORDER BY season_is_current DESC, source_competition_id, canonical_season_id,
          route_policy, stat_route, dataset;
 
--- 4. Silver appeared after this scope generation and natural keys are unique.
--- min(_silver_created_at), plus a NULL count, prevents one fresh row from
--- masking an old or unattributed full-table replacement.
-WITH scope AS (
-    SELECT max(exported_at) AS exported_at
-    FROM iceberg.bronze.fbref_target_scope
-    WHERE source = 'fbref'
-      AND control_run_id = CAST(:control_run_id AS varchar)
-), match_silver AS (
-    SELECT count(*) AS rows,
-           count_if(match_id IS NULL OR date IS NULL) AS null_keys,
-           count(*) - count(DISTINCT match_id) AS duplicate_keys,
-           count_if(_silver_created_at IS NULL) AS null_freshness,
-           min(_silver_created_at) AS silver_created_at
-    FROM iceberg.silver.fbref_match_enriched
-), player_silver AS (
-    SELECT count(*) AS rows,
-           count_if(match_id IS NULL OR player_id IS NULL OR team IS NULL)
-               AS null_keys,
-           count(*) - count(DISTINCT (match_id, player_id, team))
-               AS duplicate_keys,
-           count_if(_silver_created_at IS NULL) AS null_freshness,
-           min(_silver_created_at) AS silver_created_at
-    FROM iceberg.silver.fbref_player_match_stats
-)
-SELECT
-    dataset,
-    CASE
-        WHEN rows > 0
-         AND null_keys = 0
-         AND duplicate_keys = 0
-         AND null_freshness = 0
-         AND CAST(silver_created_at AS timestamp(6)) >= scope.exported_at
-        THEN 'PASS' ELSE 'FAIL'
-    END AS verdict,
-    rows,
-    null_keys,
-    duplicate_keys,
-    null_freshness,
-    silver_created_at,
-    scope.exported_at AS scope_exported_at
-FROM (
-    SELECT 'fbref_match_enriched' AS dataset, * FROM match_silver
-    UNION ALL
-    SELECT 'fbref_player_match_stats', * FROM player_silver
-) AS silver
-CROSS JOIN scope
-ORDER BY dataset;
-
--- 5. Production acceptance requires no retained FBref staging tables.
+-- 4. Production acceptance requires no retained FBref staging tables.
 SELECT
     'fbref_staging_tables' AS check_name,
     CASE WHEN count(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS verdict,

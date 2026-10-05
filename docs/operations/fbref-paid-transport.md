@@ -238,7 +238,8 @@ upstream identifiers, not proxy credentials.
 Use this mode only to advance the durable current-scope queue while production
 freshness is still being established. It performs the normal raw-first
 recovery, paid fetch, parse, and raw-integrity audit, but it cannot run the
-freshness gate, export a publication scope, or trigger Silver.
+freshness gate or export a publication scope. The legacy Silver trigger was
+retired in #1634.
 
 ```bash
 airflow dags unpause dag_bootstrap_fbref
@@ -249,7 +250,7 @@ airflow dags pause dag_bootstrap_fbref
 
 `dag_bootstrap_fbref` is paused by default (#1324): every run is a paid path
 that runs the same run gates as ingest (`validate_bootstrap_run`) but has no
-freshness, publication-scope or Silver gates. Unpause it only for a manual
+freshness or publication-scope gates. Unpause it only for a manual
 bootstrap and pause it again afterwards; `schedule=None` means it can create
 only an explicitly triggered manual DagRun. Its tasks contain
 literal `4096 requests / 2048 MiB / shard 25` safety limits and literal
@@ -271,13 +272,12 @@ A successful bootstrap has these three pieces of evidence:
 2. `fbref_control.crawl_run.metadata` stores the same mode and publication
    flag, and the control run status is `succeeded`.
 3. `release_bootstrap_publication_lock` succeeds, followed by the common
-   `release_publication_lock` finalizer. No `export_publication_scope` or
-   `trigger_silver_transform` task may run.
+   `release_publication_lock` finalizer. No `export_publication_scope` task may
+   run. The legacy Silver trigger was retired in #1634.
 
 The finalizer always attempts an exact idempotent lock release, then requires
 all ten earlier bootstrap tasks (including the direct release task) to be
 `success`. If live fetch, audit, validation, or release failed, the lock is
 cleaned but the finalizer raises, so Airflow keeps the DagRun red. The
-control-run mode also blocks publication-scope export, replay-source
-selection, and the first Silver preflight. Start a normal production DagRun
-after freshness is complete.
+control-run mode also blocks publication-scope export and replay-source
+selection. Start a normal production DagRun after freshness is complete.
