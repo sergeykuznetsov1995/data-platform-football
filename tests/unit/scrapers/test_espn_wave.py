@@ -156,7 +156,28 @@ class WaveTrino(FakeTrino):
                 key = (row["competition_slug"], row["season_year"])
                 groups[key] = groups.get(key, True) and bool(row["terminal"])
             return [[slug, year, terminal] for (slug, year), terminal in groups.items()]
-        if "kickoff >= ? AND kickoff < ?" in sql:
+        if "first_published_at IS NULL" in sql and "kickoff > TIMESTAMP" in sql:
+            bounds = [datetime.fromisoformat(value) for value in re.findall(
+                r"kickoff [<>] TIMESTAMP '([^']+)'", sql
+            )]
+            targets = set(re.findall(r"'([^']+)'", re.search(
+                r"competition_slug IN \(([^)]+)\)", sql
+            )[1]))
+            since, until = bounds
+            keep = [
+                row for row in self._rows()
+                if row["duplicate_of"] is None
+                and row["competition_slug"] in targets
+                and since < row["kickoff"] < until
+                and row["first_published_at"] is None
+                and row["disposition"] != "withdrawn"
+                and not (
+                    (row["terminal_nonplayed"] or row["status"] == "STATUS_POSTPONED")
+                    and row["status_checked_at"] is not None
+                    and row["status_checked_at"] > row["kickoff"]
+                )
+            ]
+        elif "kickoff >= ? AND kickoff < ?" in sql:
             start, end = params
             keep = [row for row in self._rows() if start <= row["kickoff"] < end]
         elif "disposition = 'moved'" in sql:
@@ -349,6 +370,14 @@ def _run(plan, client, trino):
 
 def _matches(trino) -> dict[int, dict]:
     return {row["event_id"]: {k: _py(v) for k, v in row.items()} for row in trino.tables["espn_match"]}
+
+
+def _publish_other_pending(trino, keep_event_id: int) -> None:
+    """Keep a test focused on one live-debt match."""
+
+    for row in trino.tables["espn_match"]:
+        if row["event_id"] != keep_event_id and _py(row["first_published_at"]) is None:
+            row["first_published_at"] = datetime(2026, 9, 25, 14)
 
 
 def _wave1(tmp_path, *, fail_slug=None, **extra):
@@ -719,6 +748,121 @@ def test_stale_match_that_core_reports_played_is_written_with_its_summary(tmp_pa
         "STATUS_FULL_TIME", True, 2, 0
     )
     assert row["lineup_state"] == "captured"
+
+
+@pytest.mark.unit
+def test_live_debt_match_outside_day_window_is_checked_until_published(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    _publish_other_pending(trino, 900002)
+    later = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+    client.responses.update({
+        _req_key(urls.all_scoreboard_day(later.date() - timedelta(days=1))): _day(),
+        _req_key(urls.all_scoreboard_day(later.date())): _day(),
+        _req_key(urls.event_status("eng.1", 900002)): json.dumps(
+            {"type": {"name": "STATUS_FULL_TIME"}}
+        ).encode(),
+    })
+    for slug in SLUGS:
+        client.responses[_req_key(urls.league_detail(slug))] = HttpStatusError(503, "busy")
+    body = json.loads((PROBES / SUMMARIES["eng.1"]).read_bytes())
+    body["header"]["id"] = "900002"
+    client.responses[_summary_key("eng.1", 900002)] = json.dumps(body).encode()
+
+    plan = _plan(client, trino, tmp_path, now=later, check_stale=False)
+    (work,) = plan.works
+    assert (work.slug, work.event_ids, work.statuses) == (
+        "eng.1", (900002,), {900002: "STATUS_FULL_TIME"}
+    )
+
+    _run(plan, client, trino)
+    row = _matches(trino)[900002]
+    assert (row["status"], row["played_final"], row["first_published_at"] is not None) == (
+        "STATUS_FULL_TIME", True, True
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("core_status", ["STATUS_FULL_TIME", "STATUS_FINAL_AET"])
+def test_unpublished_final_outside_day_window_retries_its_summary(
+    tmp_path, core_status
+) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    _publish_other_pending(trino, 900002)
+    for row in trino.tables["espn_match"]:
+        if row["event_id"] == 900002:
+            row["status"] = "STATUS_FULL_TIME"
+            row["played_final"] = True
+            row["terminal"] = True
+    snapshot = editions_store.load(tmp_path / "editions.json")
+    assert snapshot is not None
+    old = snapshot.edition("eng.1", _year("eng.1"))
+    assert old is not None
+    editions_store.save(
+        tmp_path / "editions.json",
+        editions_store.EditionsSnapshot(
+            snapshot.refreshed_at,
+            tuple(state for state in snapshot.editions if state.competition_slug != "eng.1")
+            + (
+                EditionState(old.competition_slug, old.year, old.display_name,
+                             old.start, old.end, open=False),
+                EditionState(old.competition_slug, old.year + 1, "next season",
+                             old.end + timedelta(days=1), old.end + timedelta(days=365)),
+            ),
+        ),
+    )
+    later = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+    client.responses.update({
+        _req_key(urls.all_scoreboard_day(later.date() - timedelta(days=1))): _day(),
+        _req_key(urls.all_scoreboard_day(later.date())): _day(),
+        _req_key(urls.event_status("eng.1", 900002)): json.dumps(
+            {"type": {"name": core_status}}
+        ).encode(),
+    })
+    for slug in SLUGS:
+        client.responses[_req_key(urls.league_detail(slug))] = HttpStatusError(503, "busy")
+    body = json.loads((PROBES / SUMMARIES["eng.1"]).read_bytes())
+    body["header"]["id"] = "900002"
+    client.responses[_summary_key("eng.1", 900002)] = json.dumps(body).encode()
+    del client.responses[_req_key(urls.event_metadata("eng.1", 900002))]
+
+    plan = _plan(client, trino, tmp_path, now=later, check_stale=False)
+    (work,) = plan.works
+    assert work.statuses == {900002: core_status}
+    assert work.season_year == old.year and work.metadata == {}
+
+    _run(plan, client, trino)
+    row = _matches(trino)[900002]
+    assert row["status"] == core_status and row["first_published_at"] is not None
+    assert not client.network("/events/900002?")
+
+
+@pytest.mark.unit
+def test_unpublished_final_that_core_no_longer_has_is_withdrawn(tmp_path) -> None:
+    client, trino, _, _ = _wave1(tmp_path)
+    _publish_other_pending(trino, 900002)
+    for row in trino.tables["espn_match"]:
+        if row["event_id"] == 900002:
+            row["status"] = "STATUS_FULL_TIME"
+            row["played_final"] = True
+            row["terminal"] = True
+    later = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+    client.responses.update({
+        _req_key(urls.all_scoreboard_day(later.date() - timedelta(days=1))): _day(),
+        _req_key(urls.all_scoreboard_day(later.date())): _day(),
+        _req_key(urls.event_status("eng.1", 900002)): HttpStatusError(404, "gone"),
+    })
+    for slug in SLUGS:
+        client.responses[_req_key(urls.league_detail(slug))] = HttpStatusError(503, "busy")
+
+    plan = _plan(client, trino, tmp_path, now=later, check_stale=False)
+    (work,) = plan.works
+    assert work.presence == {900002: "withdrawn"} and work.statuses == {}
+
+    before = len(client.network("/summary?"))
+    _run(plan, client, trino)
+    row = _matches(trino)[900002]
+    assert row["disposition"] == "withdrawn" and row["first_published_at"] is None
+    assert len(client.network("/summary?")) == before
 
 
 @pytest.mark.unit
@@ -1148,6 +1292,7 @@ def test_unresolved_moved_reenters_planner_and_updates_actual_deadline(tmp_path)
 
     # Two days later the old kickoff is outside the scoreboard/Bronze window.
     # Core metadata supplies a real new date ten days later, still same edition.
+    _publish_other_pending(trino, 900002)
     later = NOW + timedelta(days=2)
     client.clock = later.isoformat()
     for day in (later.date() - timedelta(days=1), later.date()):
