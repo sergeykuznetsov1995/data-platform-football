@@ -811,13 +811,25 @@ def validate_understat_scope(
     # #1428: breakdowns are owed only by teams of completed games.
     schedule_team_ids: set[str] = set()
     played_team_ids: set[str] = set()
+    schedule_sides_by_game: dict[str, tuple[str, str]] = {}
     if {"game_id", "home_team_id", "away_team_id"}.issubset(schedule.columns):
         for game_id, home_id, away_id in schedule.loc[
             :, ["game_id", "home_team_id", "away_team_id"]
         ].itertuples(index=False, name=None):
+            normalized_game_ids = _normalized_ids((game_id,))
             game_teams = _normalized_ids((home_id, away_id))
             schedule_team_ids |= game_teams
-            if _normalized_ids((game_id,)) & completed_ids:
+            if (
+                len(normalized_game_ids) == 1
+                and not _is_missing_scalar(home_id)
+                and not _is_missing_scalar(away_id)
+            ):
+                normalized_game_id = next(iter(normalized_game_ids))
+                schedule_sides_by_game[normalized_game_id] = (
+                    str(home_id).strip(),
+                    str(away_id).strip(),
+                )
+            if normalized_game_ids & completed_ids:
                 played_team_ids |= game_teams
 
     def game_ids_of(entity: str) -> set[str]:
@@ -835,7 +847,16 @@ def validate_understat_scope(
             index=False, name=None
         ):
             game_id = str(row[0]).strip()
-            if game_id and not any(_is_missing_scalar(value) for value in row[1:]):
+            core_values = dict(zip(TEAM_MATCH_CORE_COLUMNS, row[1:]))
+            observed_sides = (
+                str(core_values["home_team_id"]).strip(),
+                str(core_values["away_team_id"]).strip(),
+            )
+            if (
+                game_id
+                and not any(_is_missing_scalar(value) for value in row[1:])
+                and observed_sides == schedule_sides_by_game.get(game_id)
+            ):
                 complete_team_match_ids.add(game_id)
 
     static_empty_match_ids: set[str] = set()

@@ -711,6 +711,39 @@ def test_only_exact_empty_match_candidate_can_enter_quarantine(mutation):
     assert report.match_quarantine == ()
 
 
+@pytest.mark.parametrize(
+    ("home_team_id", "away_team_id"),
+    [
+        (999, 998),
+        (21, 20),
+    ],
+    ids=["foreign-teams", "swapped-sides"],
+)
+def test_empty_match_candidate_requires_exact_team_match_sides(
+    home_team_id, away_team_id
+):
+    frames = _played_game_frames(20, empty_game_ids={"10019"})
+    target = frames["understat_team_match_stats"]["game_id"] == "10019"
+    frames["understat_team_match_stats"].loc[target, "home_team_id"] = home_team_id
+    frames["understat_team_match_stats"].loc[target, "away_team_id"] = away_team_id
+
+    report = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert report.match_quarantine == ()
+    assert {
+        issue.entity
+        for issue in report.issues
+        if issue.code == "missing_completed_games"
+    } >= set(EMPTY_MATCH_ENTITIES)
+
+
 def test_completed_match_roster_requires_both_schedule_teams():
     frames = _frames()
     frames["understat_player_match_stats"] = frames[
