@@ -12,7 +12,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -48,6 +48,15 @@ GAME_ENTITIES = (
     "understat_shots",
     "understat_player_match_stats",
 )
+
+EMPTY_MATCH_ENTITIES = (
+    "understat_shots",
+    "understat_player_match_stats",
+)
+EMPTY_MATCH_RETRY_DAYS = 7
+MASS_EMPTY_MIN_GAMES = 3
+MASS_EMPTY_MAX_GAMES = 5
+MASS_EMPTY_SHARE = Decimal("0.05")
 
 TEAM_MATCH_CORE_COLUMNS = tuple(
     f"{side}_{metric}"
@@ -93,6 +102,28 @@ class QualityIssue:
 
 
 @dataclass(frozen=True)
+class MatchQuarantine:
+    game_id: str
+    state: str
+    missing_entities: tuple[str, ...]
+    first_seen_at: str
+    last_checked_at: str
+    retry_until: str
+    observation_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "game_id": self.game_id,
+            "state": self.state,
+            "missing_entities": list(self.missing_entities),
+            "first_seen_at": self.first_seen_at,
+            "last_checked_at": self.last_checked_at,
+            "retry_until": self.retry_until,
+            "observation_count": self.observation_count,
+        }
+
+
+@dataclass(frozen=True)
 class QualityReport:
     scope: ScopeKey
     active: bool
@@ -115,6 +146,8 @@ class QualityReport:
     request_count: Optional[int] = None
     # #1428: schedule teams without a played match yet (season start).
     teams_pending_first_match: Sequence[str] = ()
+    match_quarantine: Sequence[MatchQuarantine] = ()
+    match_quarantine_summary: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def publishable(self) -> bool:
@@ -156,6 +189,11 @@ class QualityReport:
             "league_payload_hashes": dict(self.league_payload_hashes),
             "request_count": self.request_count,
             "teams_pending_first_match": sorted(self.teams_pending_first_match),
+            "match_quarantine": [
+                item.to_dict()
+                for item in sorted(self.match_quarantine, key=lambda item: item.game_id)
+            ],
+            "match_quarantine_summary": dict(self.match_quarantine_summary),
         }
 
 
@@ -305,12 +343,102 @@ def _is_missing_scalar(value: Any) -> bool:
         return False
 
 
+def _utc_datetime(value: datetime) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError("observed_at must be a datetime or None")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _utc_iso(value: datetime) -> str:
+    return _utc_datetime(value).isoformat()
+
+
+def _parsed_utc_datetime(value: object) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def match_quarantine_from_quality(
+    quality: Optional[Mapping[str, Any]],
+) -> dict[str, MatchQuarantine]:
+    """Read only complete, internally consistent quarantine records.
+
+    Legacy quality JSON has no ``match_quarantine`` key and therefore carries
+    nothing. Malformed records are ignored so they can never waive the closed
+    scope coverage contract.
+    """
+    if not isinstance(quality, Mapping):
+        return {}
+    raw_records = quality.get("match_quarantine")
+    if not isinstance(raw_records, (list, tuple)):
+        return {}
+
+    parsed: dict[str, MatchQuarantine] = {}
+    duplicates: set[str] = set()
+    for raw in raw_records:
+        if not isinstance(raw, Mapping):
+            continue
+        game_id = str(raw.get("game_id") or "").strip()
+        state = str(raw.get("state") or "").strip()
+        missing_entities = raw.get("missing_entities")
+        observation_count = raw.get("observation_count")
+        first_seen = _parsed_utc_datetime(raw.get("first_seen_at"))
+        last_checked = _parsed_utc_datetime(raw.get("last_checked_at"))
+        retry_until = _parsed_utc_datetime(raw.get("retry_until"))
+        if (
+            not game_id
+            or state not in {"waiting_data", "source_empty"}
+            or not isinstance(missing_entities, (list, tuple))
+            or tuple(missing_entities) != EMPTY_MATCH_ENTITIES
+            or isinstance(observation_count, bool)
+            or not isinstance(observation_count, int)
+            or observation_count < 1
+            or first_seen is None
+            or last_checked is None
+            or retry_until is None
+            or last_checked < first_seen
+            or retry_until != first_seen + timedelta(days=EMPTY_MATCH_RETRY_DAYS)
+            or state
+            != ("source_empty" if last_checked >= retry_until else "waiting_data")
+        ):
+            continue
+        if game_id in parsed:
+            duplicates.add(game_id)
+            continue
+        parsed[game_id] = MatchQuarantine(
+            game_id=game_id,
+            state=state,
+            missing_entities=EMPTY_MATCH_ENTITIES,
+            first_seen_at=_utc_iso(first_seen),
+            last_checked_at=_utc_iso(last_checked),
+            retry_until=_utc_iso(retry_until),
+            observation_count=observation_count,
+        )
+    for game_id in duplicates:
+        parsed.pop(game_id, None)
+    return parsed
+
+
 def validate_understat_scope(
     frames: Mapping[str, Optional[pd.DataFrame]],
     *,
     scope: ScopeKey,
     active: bool,
     previous_row_counts: Optional[Mapping[str, int]] = None,
+    previous_quality: Optional[Mapping[str, Any]] = None,
+    observed_at: Optional[datetime] = None,
     payload_hashes: Optional[Mapping[str, str]] = None,
     batch_id: Optional[str] = None,
     coverage_exceptions: Optional[Mapping[str, object]] = None,
@@ -326,6 +454,8 @@ def validate_understat_scope(
     """
     if not isinstance(scope, ScopeKey):
         raise TypeError("scope must be a ScopeKey")
+    observed_at_utc = _utc_datetime(observed_at or datetime.now(timezone.utc))
+    previous_quarantine = match_quarantine_from_quality(previous_quality)
     supplied = {str(key): value for key, value in dict(frames).items()}
     previous = {
         str(key): int(value)
@@ -538,6 +668,7 @@ def validate_understat_scope(
 
     schedule = normalized_frames[SCHEDULE_ENTITY]
     completed_ids: set[str] = set()
+    completed_without_data_ids: set[str] = set()
     if not schedule.empty and SCHEDULE_ENTITY not in entity_schema_broken:
         forecast_columns = (
             "forecast_home_win",
@@ -615,6 +746,11 @@ def validate_understat_scope(
             completed_ids = _normalized_ids(
                 schedule.loc[result_values.astype(bool), "game_id"]
             )
+            completed_without_data_ids = _normalized_ids(
+                schedule.loc[
+                    result_values.astype(bool) & ~data_values.astype(bool), "game_id"
+                ]
+            )
             data_without_result = _normalized_ids(
                 schedule.loc[
                     data_values.astype(bool) & ~result_values.astype(bool), "game_id"
@@ -684,6 +820,115 @@ def validate_understat_scope(
             if _normalized_ids((game_id,)) & completed_ids:
                 played_team_ids |= game_teams
 
+    def game_ids_of(entity: str) -> set[str]:
+        frame = normalized_frames[entity]
+        if frame.empty or "game_id" not in frame.columns:
+            return set()
+        return _normalized_ids(frame["game_id"])
+
+    match_game_ids = {entity: game_ids_of(entity) for entity in GAME_ENTITIES}
+    team_match = normalized_frames["understat_team_match_stats"]
+    team_match_core_columns = {"game_id", *TEAM_MATCH_CORE_COLUMNS}
+    complete_team_match_ids: set[str] = set()
+    if not team_match.empty and team_match_core_columns.issubset(team_match.columns):
+        for row in team_match.loc[:, ["game_id", *TEAM_MATCH_CORE_COLUMNS]].itertuples(
+            index=False, name=None
+        ):
+            game_id = str(row[0]).strip()
+            if game_id and not any(_is_missing_scalar(value) for value in row[1:]):
+                complete_team_match_ids.add(game_id)
+
+    static_empty_match_ids: set[str] = set()
+    for entity in EMPTY_MATCH_ENTITIES:
+        allowed_missing, _ = _coverage_allowlist(exceptions.get(entity))
+        static_empty_match_ids |= allowed_missing
+    empty_match_candidate_ids = completed_without_data_ids & (
+        complete_team_match_ids
+        - match_game_ids["understat_shots"]
+        - match_game_ids["understat_player_match_stats"]
+        - static_empty_match_ids
+    )
+    quarantined_game_ids = (
+        empty_match_candidate_ids
+        if active
+        else empty_match_candidate_ids & set(previous_quarantine)
+    )
+
+    quarantine_records: list[MatchQuarantine] = []
+    for game_id in sorted(quarantined_game_ids):
+        carried = previous_quarantine.get(game_id)
+        if carried is None:
+            first_seen = observed_at_utc
+            retry_until = first_seen + timedelta(days=EMPTY_MATCH_RETRY_DAYS)
+            last_checked = observed_at_utc
+            observation_count = 1
+        else:
+            first_seen = _parsed_utc_datetime(carried.first_seen_at)
+            previous_checked = _parsed_utc_datetime(carried.last_checked_at)
+            retry_until = _parsed_utc_datetime(carried.retry_until)
+            # match_quarantine_from_quality already validated these values.
+            assert first_seen is not None
+            assert previous_checked is not None
+            assert retry_until is not None
+            last_checked = max(observed_at_utc, previous_checked)
+            observation_count = carried.observation_count + 1
+        quarantine_records.append(
+            MatchQuarantine(
+                game_id=game_id,
+                state=(
+                    "source_empty" if last_checked >= retry_until else "waiting_data"
+                ),
+                missing_entities=EMPTY_MATCH_ENTITIES,
+                first_seen_at=_utc_iso(first_seen),
+                last_checked_at=_utc_iso(last_checked),
+                retry_until=_utc_iso(retry_until),
+                observation_count=observation_count,
+            )
+        )
+
+    played_game_count = len(completed_ids)
+    blocking_threshold = min(
+        MASS_EMPTY_MAX_GAMES,
+        max(
+            MASS_EMPTY_MIN_GAMES,
+            math.ceil(Decimal(played_game_count) * MASS_EMPTY_SHARE),
+        ),
+    )
+    empty_match_entity_blocked = bool(completed_ids) and any(
+        row_counts[entity] == 0 for entity in EMPTY_MATCH_ENTITIES
+    )
+    mass_blocked = empty_match_entity_blocked or (
+        len(empty_match_candidate_ids) >= blocking_threshold
+    )
+    if mass_blocked:
+        mass_empty_game_ids = (
+            completed_ids if empty_match_entity_blocked else empty_match_candidate_ids
+        )
+        _issue(
+            issues,
+            "mass_empty_match_coverage",
+            "empty Understat match coverage reached the publication-blocking threshold",
+            status=ManifestStatus.CONTRACT_FAILURE,
+            played=played_game_count,
+            empty=len(mass_empty_game_ids),
+            threshold=blocking_threshold,
+            share=str(MASS_EMPTY_SHARE),
+            game_ids=sorted(mass_empty_game_ids),
+        )
+
+    quarantine_summary = {
+        "waiting_data": sum(
+            record.state == "waiting_data" for record in quarantine_records
+        ),
+        "source_empty": sum(
+            record.state == "source_empty" for record in quarantine_records
+        ),
+        "empty_game_count": len(quarantine_records),
+        "played_game_count": played_game_count,
+        "blocking_threshold": blocking_threshold,
+        "mass_blocked": mass_blocked,
+    }
+
     if completed_ids:
         for entity in UNDERSTAT_ENTITIES[1:]:
             if row_counts[entity] == 0:
@@ -706,7 +951,10 @@ def validate_understat_scope(
             )
             missing = completed_ids - actual
             extra = actual - completed_ids
-            unallowed_missing = missing - allowed_missing
+            dynamic_missing = (
+                quarantined_game_ids if entity in EMPTY_MATCH_ENTITIES else set()
+            )
+            unallowed_missing = missing - allowed_missing - dynamic_missing
             unallowed_extra = extra - allowed_extra
             if unallowed_missing:
                 _issue(
@@ -751,6 +999,7 @@ def validate_understat_scope(
             allowed_missing, _ = _coverage_allowlist(
                 exceptions.get("understat_player_match_stats")
             )
+            allowed_missing |= quarantined_game_ids
             actual_teams_by_game = {
                 game_id: _normalized_ids(group["team_id"])
                 for game_id, group in player_match.assign(
@@ -1016,14 +1265,9 @@ def validate_understat_scope(
             else:
                 entity_statuses[entity] = status
 
-    def game_ids_of(entity: str) -> set[str]:
-        frame = normalized_frames[entity]
-        if frame.empty or "game_id" not in frame.columns:
-            return set()
-        return _normalized_ids(frame["game_id"])
-
-    covered_game_ids = game_ids_of("understat_shots") & game_ids_of(
-        "understat_player_match_stats"
+    covered_game_ids = (
+        match_game_ids["understat_shots"]
+        & match_game_ids["understat_player_match_stats"]
     )
 
     return QualityReport(
@@ -1044,6 +1288,8 @@ def validate_understat_scope(
         teams_pending_first_match=tuple(
             sorted(schedule_team_ids - played_team_ids)
         ),
+        match_quarantine=tuple(quarantine_records),
+        match_quarantine_summary=quarantine_summary,
     )
 
 

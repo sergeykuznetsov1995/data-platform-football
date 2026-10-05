@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -21,10 +22,13 @@ from scrapers.understat.manifest import (
     validate_scope_attempt_result,
 )
 from scrapers.understat.quality import (
+    EMPTY_MATCH_ENTITIES,
     REQUIRED_COLUMNS,
+    MatchQuarantine,
     UnderstatQualityError,
     build_failure_attempt,
     build_scope_attempt,
+    match_quarantine_from_quality,
     validate_understat_scope,
 )
 from scrapers.understat.coverage import coverage_exceptions_for_scope
@@ -137,6 +141,63 @@ def _two_game_frames() -> dict[str, pd.DataFrame]:
     frames["understat_player_match_stats"] = pd.concat(
         [frames["understat_player_match_stats"], second_roster],
         ignore_index=True,
+    )
+    return frames
+
+
+def _played_game_frames(
+    played: int,
+    *,
+    empty_game_ids: set[str] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Build a contract-valid played scope with selected empty match payloads."""
+    if played < 1:
+        raise ValueError("played must be positive")
+    empty_game_ids = set(empty_game_ids or ())
+    frames = _frames()
+
+    schedule_template = frames["understat_schedule"].iloc[0]
+    team_match_template = frames["understat_team_match_stats"].iloc[0]
+    shot_template = frames["understat_shots"].iloc[0]
+    roster_templates = tuple(
+        frames["understat_player_match_stats"].itertuples(index=False, name=None)
+    )
+    roster_columns = list(frames["understat_player_match_stats"].columns)
+
+    schedule_rows = []
+    team_match_rows = []
+    shot_rows = []
+    roster_rows = []
+    for offset in range(played):
+        game_id = str(10_000 + offset)
+
+        schedule_row = schedule_template.copy()
+        schedule_row["game_id"] = game_id
+        schedule_row["has_data"] = game_id not in empty_game_ids
+        schedule_rows.append(schedule_row)
+
+        team_match_row = team_match_template.copy()
+        team_match_row["game_id"] = game_id
+        team_match_rows.append(team_match_row)
+
+        if game_id in empty_game_ids:
+            continue
+        shot_row = shot_template.copy()
+        shot_row["game_id"] = game_id
+        shot_row["shot_id"] = str(20_000 + offset)
+        shot_rows.append(shot_row)
+        for roster_values in roster_templates:
+            roster_row = dict(zip(roster_columns, roster_values))
+            roster_row["game_id"] = game_id
+            roster_rows.append(roster_row)
+
+    frames["understat_schedule"] = pd.DataFrame(schedule_rows)
+    frames["understat_team_match_stats"] = pd.DataFrame(team_match_rows)
+    frames["understat_shots"] = pd.DataFrame(
+        shot_rows, columns=frames["understat_shots"].columns
+    )
+    frames["understat_player_match_stats"] = pd.DataFrame(
+        roster_rows, columns=roster_columns
     )
     return frames
 
@@ -353,6 +414,301 @@ def test_cross_table_missing_game_fails_unless_explicitly_allowlisted():
     assert any(
         issue.code == "allowlisted_game_coverage" for issue in allowed.issues
     )
+
+
+def test_one_empty_match_of_72_is_complete_and_waiting_but_not_covered():
+    observed_at = datetime(2026, 10, 5, 12, 20, tzinfo=timezone(timedelta(hours=3)))
+    frames = _played_game_frames(72, empty_game_ids={"10071"})
+
+    report = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=observed_at,
+    )
+
+    assert report.status is ManifestStatus.COMPLETE
+    assert report.site_result_game_ids[-1] == "10071"
+    assert "10071" not in report.covered_game_ids
+    assert report.match_quarantine == (
+        MatchQuarantine(
+            game_id="10071",
+            state="waiting_data",
+            missing_entities=EMPTY_MATCH_ENTITIES,
+            first_seen_at="2026-10-05T09:20:00+00:00",
+            last_checked_at="2026-10-05T09:20:00+00:00",
+            retry_until="2026-10-12T09:20:00+00:00",
+            observation_count=1,
+        ),
+    )
+    assert report.match_quarantine_summary == {
+        "waiting_data": 1,
+        "source_empty": 0,
+        "empty_game_count": 1,
+        "played_game_count": 72,
+        "blocking_threshold": 4,
+        "mass_blocked": False,
+    }
+    assert report.to_dict()["match_quarantine"][0]["game_id"] == "10071"
+
+
+def test_recovered_empty_match_disappears_from_quarantine():
+    observed_at = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    first = validate_understat_scope(
+        _played_game_frames(20, empty_game_ids={"10019"}),
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=observed_at,
+    )
+
+    recovered = validate_understat_scope(
+        _played_game_frames(20),
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        previous_quality=first.to_dict(),
+        observed_at=observed_at + timedelta(days=1),
+    )
+
+    assert recovered.status is ManifestStatus.COMPLETE
+    assert recovered.match_quarantine == ()
+    assert recovered.match_quarantine_summary["empty_game_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "expected_state", "expected_count"),
+    [
+        (timedelta(days=6, hours=23, minutes=59), "waiting_data", 2),
+        (timedelta(days=7), "source_empty", 2),
+    ],
+)
+def test_empty_match_becomes_source_empty_at_seven_day_boundary(
+    elapsed, expected_state, expected_count
+):
+    observed_at = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    frames = _played_game_frames(20, empty_game_ids={"10019"})
+    first = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=observed_at,
+    )
+
+    repeated = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        previous_quality=first.to_dict(),
+        observed_at=observed_at + elapsed,
+    )
+
+    quarantine = repeated.match_quarantine[0]
+    assert repeated.status is ManifestStatus.COMPLETE
+    assert quarantine.state == expected_state
+    assert quarantine.first_seen_at == "2026-10-05T09:20:00+00:00"
+    assert quarantine.retry_until == "2026-10-12T09:20:00+00:00"
+    assert quarantine.observation_count == expected_count
+
+
+@pytest.mark.parametrize(
+    ("played", "empty", "threshold", "expected_status"),
+    [
+        (72, 1, 4, ManifestStatus.COMPLETE),
+        (20, 2, 3, ManifestStatus.COMPLETE),
+        (20, 3, 3, ManifestStatus.CONTRACT_FAILURE),
+        (72, 3, 4, ManifestStatus.COMPLETE),
+        (72, 4, 4, ManifestStatus.CONTRACT_FAILURE),
+        (380, 4, 5, ManifestStatus.COMPLETE),
+        (380, 5, 5, ManifestStatus.CONTRACT_FAILURE),
+    ],
+)
+def test_empty_match_mass_threshold_boundaries(
+    played, empty, threshold, expected_status
+):
+    empty_ids = {str(10_000 + offset) for offset in range(empty)}
+    report = validate_understat_scope(
+        _played_game_frames(played, empty_game_ids=empty_ids),
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+
+    assert report.status is expected_status
+    assert len(report.match_quarantine) == empty
+    assert report.match_quarantine_summary["blocking_threshold"] == threshold
+    assert report.match_quarantine_summary["mass_blocked"] is (
+        expected_status is ManifestStatus.CONTRACT_FAILURE
+    )
+    mass_issues = [
+        issue for issue in report.issues if issue.code == "mass_empty_match_coverage"
+    ]
+    assert bool(mass_issues) is (expected_status is ManifestStatus.CONTRACT_FAILURE)
+    if mass_issues:
+        assert mass_issues[0].details == {
+            "played": played,
+            "empty": empty,
+            "threshold": threshold,
+            "share": "0.05",
+            "game_ids": sorted(empty_ids),
+        }
+
+
+@pytest.mark.parametrize("empty_entity", EMPTY_MATCH_ENTITIES)
+def test_wholly_empty_match_entity_blocks_publication(empty_entity):
+    frames = _played_game_frames(3)
+    frames[empty_entity] = frames[empty_entity].iloc[0:0].copy()
+
+    report = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert report.match_quarantine == ()
+    issue = next(
+        issue for issue in report.issues if issue.code == "mass_empty_match_coverage"
+    )
+    assert issue.details["empty"] == 3
+    assert issue.details["game_ids"] == ["10000", "10001", "10002"]
+
+
+def test_closed_scope_does_not_create_new_match_quarantine():
+    report = validate_understat_scope(
+        _played_game_frames(20, empty_game_ids={"10019"}),
+        scope=SCOPE,
+        active=False,
+        batch_id=BATCH,
+        observed_at=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert report.match_quarantine == ()
+    assert any(issue.code == "missing_completed_games" for issue in report.issues)
+
+
+@pytest.mark.parametrize(
+    ("carry_elapsed", "expected_state"),
+    [
+        (timedelta(days=1), "waiting_data"),
+        (timedelta(days=8), "source_empty"),
+    ],
+)
+def test_closed_scope_accepts_valid_carried_match_quarantine(
+    carry_elapsed, expected_state
+):
+    observed_at = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    frames = _played_game_frames(20, empty_game_ids={"10019"})
+    first = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=observed_at,
+    )
+
+    carried = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=False,
+        batch_id=BATCH,
+        previous_quality=first.to_dict(),
+        observed_at=observed_at + carry_elapsed,
+    )
+
+    assert carried.status is ManifestStatus.COMPLETE
+    assert carried.match_quarantine[0].state == expected_state
+    assert carried.match_quarantine[0].observation_count == 2
+
+
+def test_legacy_quality_without_match_quarantine_carries_nothing():
+    assert match_quarantine_from_quality({"status": "complete"}) == {}
+
+    report = validate_understat_scope(
+        _played_game_frames(20, empty_game_ids={"10019"}),
+        scope=SCOPE,
+        active=False,
+        batch_id=BATCH,
+        previous_quality={"status": "complete"},
+        observed_at=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert report.match_quarantine == ()
+
+
+def test_invalid_carried_match_quarantine_cannot_weaken_closed_contract():
+    report = validate_understat_scope(
+        _played_game_frames(20, empty_game_ids={"10019"}),
+        scope=SCOPE,
+        active=False,
+        batch_id=BATCH,
+        previous_quality={
+            "match_quarantine": [
+                {
+                    "game_id": "10019",
+                    "state": "unknown",
+                    "missing_entities": list(EMPTY_MATCH_ENTITIES),
+                    "first_seen_at": "not-a-time",
+                    "last_checked_at": "2026-10-05T09:20:00+00:00",
+                    "retry_until": "2026-10-12T09:20:00+00:00",
+                    "observation_count": 1,
+                }
+            ]
+        },
+        observed_at=datetime(2026, 10, 6, tzinfo=timezone.utc),
+    )
+
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert report.match_quarantine == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "has_data",
+        "one_entity_present",
+        "incomplete_team_match",
+    ],
+)
+def test_only_exact_empty_match_candidate_can_enter_quarantine(mutation):
+    frames = _played_game_frames(20, empty_game_ids={"10019"})
+    if mutation == "has_data":
+        frames["understat_schedule"].loc[
+            frames["understat_schedule"]["game_id"] == "10019", "has_data"
+        ] = True
+    elif mutation == "one_entity_present":
+        source = _played_game_frames(20)["understat_shots"]
+        frames["understat_shots"] = pd.concat(
+            [
+                frames["understat_shots"],
+                source.query("game_id == '10019'").copy(),
+            ],
+            ignore_index=True,
+        )
+    else:
+        frames["understat_team_match_stats"].loc[
+            frames["understat_team_match_stats"]["game_id"] == "10019",
+            "home_xg",
+        ] = pd.NA
+
+    report = validate_understat_scope(
+        frames,
+        scope=SCOPE,
+        active=True,
+        batch_id=BATCH,
+        observed_at=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert report.match_quarantine == ()
 
 
 def test_completed_match_roster_requires_both_schedule_teams():
@@ -575,6 +931,7 @@ def test_rfpl_2021_exceptions_waive_both_empty_match_entities(missing_game_id):
         "player_match_side_team_mismatch",
     }
     assert allowed.status is ManifestStatus.COMPLETE
+    assert allowed.match_quarantine == ()
     assert {
         issue.entity: issue.details["game_ids"]
         for issue in allowed.issues
