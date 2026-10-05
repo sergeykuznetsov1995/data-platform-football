@@ -419,6 +419,41 @@ def test_invalid_forecasts_for_two_game_ids_are_contract_failure():
     }
 
 
+@pytest.mark.parametrize("invalid_game_id", ["", "   "])
+def test_single_invalid_forecast_with_blank_game_id_is_contract_failure(
+    invalid_game_id,
+):
+    frames = _frames()
+    for frame in frames.values():
+        if "game_id" in frame.columns:
+            frame["game_id"] = frame["game_id"].astype("object")
+            frame.loc[:, "game_id"] = invalid_game_id
+    frames["understat_schedule"].loc[0, "forecast_home_win"] = 0.9
+
+    report = _complete_report(frames)
+
+    issue = next(issue for issue in report.issues if issue.code == "invalid_forecast")
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert issue.status is ManifestStatus.CONTRACT_FAILURE
+    assert issue.details["game_ids"] == []
+
+
+def test_invalid_forecasts_with_valid_and_null_game_ids_are_contract_failure():
+    frames = _two_game_frames()
+    schedule = frames["understat_schedule"]
+    schedule["game_id"] = schedule["game_id"].astype("object")
+    schedule.loc[0, "forecast_draw"] = None
+    schedule.loc[1, "game_id"] = None
+    schedule.loc[1, "forecast_home_win"] = 0.9
+
+    report = _complete_report(frames)
+
+    issue = next(issue for issue in report.issues if issue.code == "invalid_forecast")
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert issue.status is ManifestStatus.CONTRACT_FAILURE
+    assert issue.details["game_ids"] == ["100"]
+
+
 @pytest.mark.parametrize(
     ("forecast", "expected_issue"),
     [

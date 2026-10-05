@@ -717,9 +717,17 @@ def validate_understat_scope(
         invalid_forecasts = int(invalid_forecast_mask.sum())
         if partial_forecasts or invalid_forecasts:
             affected_forecast_mask = partial_forecast_mask | invalid_forecast_mask
-            affected_game_ids = _normalized_ids(
-                schedule.loc[affected_forecast_mask, "game_id"]
-            )
+            affected_game_ids: set[str] = set()
+            affected_game_ids_are_valid = True
+            for game_id in schedule.loc[affected_forecast_mask, "game_id"]:
+                if _is_missing_scalar(game_id):
+                    affected_game_ids_are_valid = False
+                    continue
+                normalized_game_id = str(game_id).strip()
+                if not normalized_game_id:
+                    affected_game_ids_are_valid = False
+                    continue
+                affected_game_ids.add(normalized_game_id)
             _issue(
                 issues,
                 "invalid_forecast",
@@ -727,7 +735,8 @@ def validate_understat_scope(
                 f"{invalid_forecasts} invalid probability forecasts",
                 status=(
                     None
-                    if len(affected_game_ids) == 1
+                    if affected_game_ids_are_valid
+                    and len(affected_game_ids) == 1
                     else ManifestStatus.CONTRACT_FAILURE
                 ),
                 entity=SCHEDULE_ENTITY,
