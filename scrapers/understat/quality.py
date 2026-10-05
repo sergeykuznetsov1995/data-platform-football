@@ -679,7 +679,8 @@ def validate_understat_scope(
             pd.to_numeric, errors="coerce"
         )
         supplied_forecasts = forecasts.notna().sum(axis=1)
-        partial_forecasts = int(supplied_forecasts.isin((1, 2)).sum())
+        partial_forecast_mask = supplied_forecasts.isin((1, 2))
+        partial_forecasts = int(partial_forecast_mask.sum())
         forecast_sum_tolerance = 0.02
         forecast_total_lower_bound = 1.0 - forecast_sum_tolerance
         forecast_total_upper_bound = 1.0 + forecast_sum_tolerance
@@ -709,25 +710,31 @@ def validate_understat_scope(
         forecast_sums_outside_tolerance = (
             forecast_sums_below_tolerance | forecast_sums_above_tolerance
         )
-        invalid_forecasts = int(
-            (
-                (supplied_forecasts == 3)
-                & (
-                    (~((forecasts >= 0.0) & (forecasts <= 1.0)).all(axis=1))
-                    | forecast_sums_outside_tolerance
-                )
-            ).sum()
+        invalid_forecast_mask = (supplied_forecasts == 3) & (
+            (~((forecasts >= 0.0) & (forecasts <= 1.0)).all(axis=1))
+            | forecast_sums_outside_tolerance
         )
+        invalid_forecasts = int(invalid_forecast_mask.sum())
         if partial_forecasts or invalid_forecasts:
+            affected_forecast_mask = partial_forecast_mask | invalid_forecast_mask
+            affected_game_ids = _normalized_ids(
+                schedule.loc[affected_forecast_mask, "game_id"]
+            )
             _issue(
                 issues,
                 "invalid_forecast",
                 f"{SCHEDULE_ENTITY}: {partial_forecasts} partial and "
                 f"{invalid_forecasts} invalid probability forecasts",
-                status=ManifestStatus.CONTRACT_FAILURE,
+                status=(
+                    None
+                    if len(affected_game_ids) == 1
+                    else ManifestStatus.CONTRACT_FAILURE
+                ),
                 entity=SCHEDULE_ENTITY,
                 partial_rows=partial_forecasts,
                 invalid_rows=invalid_forecasts,
+                tolerance=forecast_sum_tolerance,
+                game_ids=sorted(affected_game_ids),
             )
         result_values = schedule["is_result"].map(_truth_value)
         data_values = schedule["has_data"].map(_truth_value)

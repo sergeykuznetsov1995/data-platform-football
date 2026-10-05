@@ -362,16 +362,74 @@ def test_xg_and_forecast_ranges_are_fail_closed():
 
 
 @pytest.mark.parametrize(
-    ("forecast", "expected_status"),
+    ("forecast", "partial_rows", "invalid_rows"),
     [
-        ((0.34, 0.26, 0.38), ManifestStatus.COMPLETE),
-        ((0.34, 0.26, 0.379), ManifestStatus.CONTRACT_FAILURE),
-        ((0.34, 0.26, 0.42), ManifestStatus.COMPLETE),
-        ((0.342, 0.561, 0.117), ManifestStatus.COMPLETE),
-        ((0.34, 0.26, 0.4201), ManifestStatus.CONTRACT_FAILURE),
+        ((0.5, None, 0.25), 1, 0),
+        ((0.9, 0.25, 0.25), 0, 1),
     ],
 )
-def test_complete_forecast_sum_tolerance_is_inclusive(forecast, expected_status):
+def test_single_game_invalid_forecast_is_warning(
+    forecast, partial_rows, invalid_rows
+):
+    frames = _frames()
+    columns = [
+        "forecast_home_win",
+        "forecast_draw",
+        "forecast_away_win",
+    ]
+    for column, value in zip(columns, forecast):
+        frames["understat_schedule"].loc[0, column] = value
+
+    report = _complete_report(frames)
+
+    issue = next(issue for issue in report.issues if issue.code == "invalid_forecast")
+    assert report.status is ManifestStatus.COMPLETE
+    assert issue.status is None
+    assert issue.message == (
+        f"understat_schedule: {partial_rows} partial and {invalid_rows} "
+        "invalid probability forecasts"
+    )
+    assert issue.details == {
+        "partial_rows": partial_rows,
+        "invalid_rows": invalid_rows,
+        "tolerance": 0.02,
+        "game_ids": ["100"],
+    }
+
+
+def test_invalid_forecasts_for_two_game_ids_are_contract_failure():
+    frames = _two_game_frames()
+    schedule = frames["understat_schedule"]
+    schedule.loc[0, "forecast_draw"] = None
+    schedule.loc[1, "forecast_home_win"] = 0.9
+
+    report = _complete_report(frames)
+
+    issue = next(issue for issue in report.issues if issue.code == "invalid_forecast")
+    assert report.status is ManifestStatus.CONTRACT_FAILURE
+    assert issue.status is ManifestStatus.CONTRACT_FAILURE
+    assert issue.message == (
+        "understat_schedule: 1 partial and 1 invalid probability forecasts"
+    )
+    assert issue.details == {
+        "partial_rows": 1,
+        "invalid_rows": 1,
+        "tolerance": 0.02,
+        "game_ids": ["100", "101"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("forecast", "expected_issue"),
+    [
+        ((0.34, 0.26, 0.38), False),
+        ((0.34, 0.26, 0.379), True),
+        ((0.34, 0.26, 0.42), False),
+        ((0.342, 0.561, 0.117), False),
+        ((0.34, 0.26, 0.4201), True),
+    ],
+)
+def test_complete_forecast_sum_tolerance_is_inclusive(forecast, expected_issue):
     frames = _frames()
     columns = [
         "forecast_home_win",
@@ -385,9 +443,10 @@ def test_complete_forecast_sum_tolerance_is_inclusive(forecast, expected_status)
 
     report = _complete_report(frames)
 
-    assert report.status is expected_status
-    assert any(issue.code == "invalid_forecast" for issue in report.issues) is (
-        expected_status is ManifestStatus.CONTRACT_FAILURE
+    assert report.status is ManifestStatus.COMPLETE
+    assert (
+        any(issue.code == "invalid_forecast" for issue in report.issues)
+        is expected_issue
     )
 
 
