@@ -11,8 +11,10 @@ import pytest
 from scrapers.understat.criterion import (
     COMPLETENESS_SQL,
     DAILY_CRITERION_SQL,
+    QUARANTINE_SQL,
     DayResult,
     pct,
+    render_quarantine_sql,
     render_daily_criterion_sql,
     summarize_days,
 )
@@ -83,6 +85,151 @@ def test_sql_reads_through_the_manifest_fence_with_a_26_hour_deadline():
     assert "TIMESTAMP '2026-09-13 00:00:00'" in daily
     with pytest.raises(ValueError):
         render_daily_criterion_sql("13.09.2026")
+
+
+def test_quarantine_sql_requires_a_four_digit_season():
+    assert "season = '2627'" in render_quarantine_sql("2627")
+    with pytest.raises(ValueError, match="four-digit slug"):
+        render_quarantine_sql("2026-27")
+
+
+def test_quarantine_sql_exposes_only_the_latest_complete_v2_scope_rows():
+    sqlglot = pytest.importorskip("sqlglot")
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE SCHEMA ops")
+    con.execute(MANIFEST_DDL)
+
+    def quarantine(game_id, state="waiting_data"):
+        return {
+            "game_id": game_id,
+            "state": state,
+            "first_seen_at": "2026-10-01T09:20:00+00:00",
+            "last_checked_at": "2026-10-05T09:20:00+00:00",
+            "retry_until": "2026-10-08T09:20:00+00:00",
+        }
+
+    rows = [
+        # Latest status is a failure: the previous complete row must stay hidden.
+        (
+            "A",
+            "2627",
+            "understat-bronze-v2",
+            "a-old",
+            "a1",
+            "complete",
+            "2026-10-01T09:00:00+00:00",
+            json.dumps({"match_quarantine": [quarantine("101")]}),
+        ),
+        (
+            "A",
+            "2627",
+            "understat-bronze-v2",
+            "a-new",
+            "a2",
+            "dq_failure",
+            "2026-10-02T09:00:00+00:00",
+            "{}",
+        ),
+        # Latest complete row wins and its array is sorted by the output query.
+        (
+            "B",
+            "2627",
+            "understat-bronze-v2",
+            "b-old",
+            "b1",
+            "complete",
+            "2026-10-01T09:00:00+00:00",
+            json.dumps({"match_quarantine": [quarantine("999")]}),
+        ),
+        (
+            "B",
+            "2627",
+            "understat-bronze-v2",
+            "b-new",
+            "b2",
+            "complete",
+            "2026-10-02T09:00:00+00:00",
+            json.dumps(
+                {
+                    "match_quarantine": [
+                        quarantine("202", "source_empty"),
+                        quarantine("201"),
+                    ]
+                }
+            ),
+        ),
+        # Legacy JSON without the array is valid and contributes no rows.
+        (
+            "C",
+            "2627",
+            "understat-bronze-v2",
+            "c-new",
+            "c1",
+            "complete",
+            "2026-10-02T09:00:00+00:00",
+            "{}",
+        ),
+        # Wrong contract and wrong season are outside this summary.
+        (
+            "D",
+            "2627",
+            "understat-bronze-v1",
+            "d-new",
+            "d1",
+            "complete",
+            "2026-10-02T09:00:00+00:00",
+            json.dumps({"match_quarantine": [quarantine("401")]}),
+        ),
+        (
+            "E",
+            "2526",
+            "understat-bronze-v2",
+            "e-new",
+            "e1",
+            "complete",
+            "2026-10-02T09:00:00+00:00",
+            json.dumps({"match_quarantine": [quarantine("501")]}),
+        ),
+    ]
+    con.executemany(
+        "INSERT INTO ops.understat_ingest_manifest_v1 VALUES (?,?,?,?,?,?,?,?)",
+        rows,
+    )
+
+    sql = sqlglot.transpile(
+        render_quarantine_sql("2627"), read="trino", write="duckdb"
+    )[0].replace("iceberg.ops.", "ops.")
+    result = con.execute(sql)
+    assert [column[0] for column in result.description] == [
+        "league",
+        "game_id",
+        "state",
+        "first_seen_at",
+        "last_checked_at",
+        "retry_until",
+    ]
+    assert result.fetchall() == [
+        (
+            "B",
+            "201",
+            "waiting_data",
+            "2026-10-01T09:20:00+00:00",
+            "2026-10-05T09:20:00+00:00",
+            "2026-10-08T09:20:00+00:00",
+        ),
+        (
+            "B",
+            "202",
+            "source_empty",
+            "2026-10-01T09:20:00+00:00",
+            "2026-10-05T09:20:00+00:00",
+            "2026-10-08T09:20:00+00:00",
+        ),
+    ]
+    normalized = re.sub(r"\s+", " ", QUARANTINE_SQL)
+    assert "WHERE rn = 1 AND status = 'complete'" in normalized
+    assert "ORDER BY league, game_id" in normalized
 
 
 # --- the SQL itself on a synthetic manifest (Trino -> DuckDB via sqlglot) ---
