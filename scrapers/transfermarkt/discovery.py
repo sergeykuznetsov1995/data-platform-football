@@ -9,8 +9,9 @@ Two modes (#1391):
 
 * ``full`` crawls the catalogue HTML (seed pages, configured country pages,
   profiles) and reads every competition's tmapi ``regulation``;
-* ``daily`` reads only the regulation of every competition of the previous
-  canonical snapshot and republishes that snapshot with fresh editions.
+* ``daily`` reads the regulation of every competition of the previous
+  canonical snapshot.  When that JSON is unusable, a known competition may
+  use its strict HTML season selector without dropping known history.
 
 Editions come from the regulation (every season plus ``isCurrentSeason``); the
 HTML selector is the fallback and the cross-check.  A page that cannot be read
@@ -86,7 +87,7 @@ _CANONICAL_SECTION = "startseite"
 # immutable, so the parser revision is part of the snapshot identity. Bump it
 # whenever parsing or classification changes — otherwise a restated catalogue
 # cannot be published over the snapshot id it would otherwise reuse.
-PARSER_REVISION = "tm-html-discovery-v5"  # v5: country descendants and group URL identity
+PARSER_REVISION = "tm-html-discovery-v6"  # v6: bounded daily HTML selector fallback
 SCHEMA_REVISION = "1"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
@@ -347,6 +348,13 @@ def _aware(value: Any) -> Optional[datetime]:
 class _Regulation:
     options: tuple[tuple[str, str, bool, Mapping[str, Any]], ...]
     document: "_Document"
+
+
+@dataclass(frozen=True)
+class _EditionSource:
+    options: tuple[tuple[str, str, bool, Mapping[str, Any]], ...]
+    document: "_Document"
+    profile_url: str
 
 
 @dataclass(frozen=True)
@@ -1086,6 +1094,7 @@ def _selector_options(
         values[edition_id] = current
 
     if not values:
+        profile_identity = _profile_identity(profile_url)
         for anchor in soup.select('a[href*="saison_id"]'):
             canonical = _canonical_url(str(anchor.get("href")), base_url=profile_url)
             if canonical is None:
@@ -1102,10 +1111,25 @@ def _selector_options(
             label = _normalise_text(anchor.get_text(" ", strip=True))
             if not edition_id or not label:
                 continue
+            anchor_identity = _profile_identity(canonical)
+            if (
+                profile_identity is None
+                or anchor_identity is None
+                or anchor_identity[0] != profile_identity[0]
+            ):
+                raise DiscoverySchemaError(
+                    f"edition selector changes competition identity: {canonical}"
+                )
             selected = "active" in set(anchor.get("class", ())) or str(
                 anchor.get("aria-current", "")
             ).casefold() in {"true", "page"}
-            values[edition_id] = (label, selected, dict(anchor.attrs))
+            previous = values.get(edition_id)
+            current = (label, selected, dict(anchor.attrs))
+            if previous is not None and previous[:2] != current[:2]:
+                raise DiscoverySchemaError(
+                    f"conflicting edition selector {edition_id}: {profile_url}"
+                )
+            values[edition_id] = current
 
     if not values:
         values = _title_edition(soup, profile_url)
@@ -1782,79 +1806,195 @@ class TransfermarktCompetitionDiscovery:
             groups=groups,
             competition_records=competition_records,
             edition_records=edition_records,
+            regulation_competition_ids=set(regulations),
             carried=carried,
             carried_records=carried_records,
         )
 
     # ----------------------------------------------------------------- daily
 
+    def _daily_html_source(
+        self,
+        competition_id: str,
+        competition: Mapping[str, Any],
+    ) -> _EditionSource:
+        """Strictly read one known profile after its regulation was unusable."""
+
+        profile_url = _canonical_url(str(competition.get("source_url") or ""))
+        identity = _profile_identity(profile_url) if profile_url else None
+        if identity is None or identity[0] != competition_id:
+            raise DiscoverySchemaError(
+                f"known profile identity mismatch: {competition_id} -> {profile_url}"
+            )
+        document = self._get(profile_url)
+        soup = self._soup(document)
+        declared_id = soup.select_one("[data-competition-id]")
+        if declared_id is not None and str(
+            declared_id.get("data-competition-id")
+        ) != competition_id:
+            raise DiscoverySchemaError(f"profile identity mismatch: {profile_url}")
+        canonical = _canonical_profile_route(soup, profile_url)
+        if canonical is not None:
+            canonical_identity = _profile_identity(canonical)
+            if canonical_identity is None or canonical_identity[0] != competition_id:
+                raise DiscoverySchemaError(
+                    f"canonical route changes identity: {canonical}"
+                )
+            # The already-fetched known route is authoritative enough when it
+            # contains a strict selector and the canonical link keeps the same
+            # identity. Daily never follows it with a second HTML request.
+        if not _has_season_markup(soup):
+            raise DiscoverySchemaError(
+                f"HTML fallback has no season selector (title-only): {profile_url}"
+            )
+        options = _selector_options(soup, profile_url=profile_url)
+        _season_format(options, profile_url)
+        known = {
+            str(item["edition_id"])
+            for item in self._previous.editions.get(competition_id, ())
+        }
+        found = {item[0] for item in options}
+        if not known <= found:
+            raise DiscoverySchemaError(
+                "HTML fallback lists "
+                f"{len(known & found)} of {len(known)} previous editions"
+            )
+        source = _EditionSource(options, document, profile_url)
+        self._validate_edition_source(competition_id, source)
+        return source
+
+    def _validate_edition_source(
+        self,
+        competition_id: str,
+        source: _EditionSource,
+    ) -> None:
+        """Prove that a selected source can build every strict edition row."""
+
+        self._editions(
+            competition_id,
+            source.options,
+            profile_url=source.profile_url,
+            body_hash=source.document.payload_hash,
+            discovered_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            snapshot_id="tm-discovery-validation",
+        )
+
     def _discover_daily(self) -> tuple[RegistryPage, ...]:
         previous = self._previous
         assert previous is not None
         regulations: dict[str, _Regulation] = {}
+        sources: dict[str, _EditionSource] = {}
+        html_sources: dict[str, _EditionSource] = {}
         carried: dict[str, str] = {}
+        fallback_rejected: dict[str, str] = {}
+        title_only: list[str] = []
         for competition_id in sorted(previous.competitions):
             if not self._affordable(1):
                 carried[competition_id] = "request budget spent"
                 continue
             regulation = self._regulation(competition_id)
-            if regulation is None:
-                carried[competition_id] = "regulation unavailable"
+            if regulation is not None:
+                regulation_source = _EditionSource(
+                    regulation.options,
+                    regulation.document,
+                    str(previous.competitions[competition_id]["source_url"]),
+                )
+                try:
+                    self._validate_edition_source(
+                        competition_id, regulation_source,
+                    )
+                except (DiscoveryError, RegistryError, SeasonRuleError) as exc:
+                    self.report.setdefault("regulation_unavailable", {})[
+                        competition_id
+                    ] = f"not applicable: {exc}"
+                else:
+                    regulations[competition_id] = regulation
+                    sources[competition_id] = regulation_source
+                    continue
+            if not self._affordable(1):
+                reason = "request budget spent"
+                fallback_rejected[competition_id] = reason
+                carried[competition_id] = (
+                    "regulation unavailable; HTML fallback request budget spent"
+                )
                 continue
-            regulations[competition_id] = regulation
-        if not regulations:
+            try:
+                html_source = self._daily_html_source(
+                    competition_id, previous.competitions[competition_id],
+                )
+            except (
+                DiscoveryPageUnavailable,
+                DiscoverySchemaError,
+                RegistryError,
+                SeasonRuleError,
+            ) as exc:
+                reason = str(exc)
+                fallback_rejected[competition_id] = reason
+                carried[competition_id] = (
+                    f"regulation unavailable; HTML fallback rejected: {reason}"
+                )
+                if "title-only" in reason:
+                    title_only.append(competition_id)
+                continue
+            html_sources[competition_id] = html_source
+            sources[competition_id] = html_source
+
+        self.report.update(
+            {
+                "daily_html_fallback_competition_ids": sorted(html_sources),
+                "daily_html_fallback_rejected": dict(sorted(fallback_rejected.items())),
+                "listing_failures": [],
+                "unavailable_new": {},
+                "title_only_competition_ids": sorted(title_only),
+                "current_mismatches": [],
+            }
+        )
+        if not sources:
             raise DiscoveryError("daily discovery refreshed no competition")
         discovered_at, snapshot_id = self._snapshot_identity(carried)
 
         competition_records: dict[str, CompetitionRecord] = {}
         edition_records: dict[str, tuple[EditionRecord, ...]] = {}
-        for competition_id, regulation in sorted(regulations.items()):
+        for competition_id, source in sorted(sources.items()):
             row = previous.competitions[competition_id]
-            try:
-                record = CompetitionRecord.from_mapping(
-                    row, registry_snapshot_id=snapshot_id,
-                )
-                # The competition row keeps its own discovery time: only a
-                # full crawl re-reads the catalogue that states it.
-                editions = self._editions(
-                    competition_id,
-                    regulation.options,
-                    profile_url=str(row["source_url"]),
-                    body_hash=regulation.document.payload_hash,
-                    discovered_at=discovered_at,
-                    snapshot_id=snapshot_id,
-                )
-            except (DiscoveryError, RegistryError, SeasonRuleError) as exc:
-                carried[competition_id] = f"regulation not applicable: {exc}"
-                continue
+            record = CompetitionRecord.from_mapping(
+                row, registry_snapshot_id=snapshot_id,
+            )
+            # The competition row keeps its own discovery time: only a full
+            # crawl re-reads the catalogue that states it.
+            editions = self._editions(
+                competition_id,
+                source.options,
+                profile_url=source.profile_url,
+                body_hash=source.document.payload_hash,
+                discovered_at=discovered_at,
+                snapshot_id=snapshot_id,
+            )
             competition_records[competition_id] = record
             edition_records[competition_id] = tuple(editions)
 
         carried_records = self._carried_records(carried, snapshot_id)
         self._check_carried_share(len(carried_records), len(competition_records))
-        body = "|".join(
-            sorted(item.document.payload_hash for item in regulations.values())
-        )
-        groups = [
-            (
+        groups = []
+        if regulations:
+            body = "|".join(
+                sorted(item.document.payload_hash for item in regulations.values())
+            )
+            groups.append((
                 tmapi.TMAPI_BASE + "/competition/regulation",
                 _payload_hash(body),
-                sorted(competition_records),
-            )
-        ]
-        self.report.update(
-            {
-                "listing_failures": [],
-                "unavailable_new": {},
-                "title_only_competition_ids": [],
-                "current_mismatches": [],
-            }
+                sorted(regulations),
+            ))
+        groups.extend(
+            (source.document.url, source.document.payload_hash, [competition_id])
+            for competition_id, source in sorted(html_sources.items())
         )
         return self._pages(
             snapshot_id=snapshot_id,
             groups=groups,
             competition_records=competition_records,
             edition_records=edition_records,
+            regulation_competition_ids=set(regulations),
             carried=carried,
             carried_records=carried_records,
         )
@@ -1970,6 +2110,7 @@ class TransfermarktCompetitionDiscovery:
         groups: list[tuple[str, str, list[str]]],
         competition_records: Mapping[str, CompetitionRecord],
         edition_records: Mapping[str, tuple[EditionRecord, ...]],
+        regulation_competition_ids: set[str],
         carried: Mapping[str, str],
         carried_records: Mapping[
             str, tuple[CompetitionRecord, tuple[EditionRecord, ...]]
@@ -2018,7 +2159,7 @@ class TransfermarktCompetitionDiscovery:
             )
             if current is None:
                 continue
-            if self._documents.get(tmapi.competition_regulation_url(competition_id)):
+            if competition_id in regulation_competition_ids:
                 regulation_current[competition_id] = current
             before = previous.current_edition(competition_id) if previous else None
             if before != current:

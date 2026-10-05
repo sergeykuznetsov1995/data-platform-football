@@ -7,10 +7,11 @@ network fallback.  All source pages are reconciled and flattened before either
 Bronze table is touched.
 
 Two modes (#1391): ``full`` crawls the catalogue and the configured country
-pages and reads every tmapi regulation; ``daily`` reads only the regulations
-of the previous canonical snapshot.  ``auto`` runs ``full`` when the last full
-crawl is older than seven days.  The previous canonical snapshot (read from
-Silver before any paid I/O) is where unreadable competitions are carried from.
+pages and reads every tmapi regulation; ``daily`` reads those regulations and,
+only when one is unusable, may read the known competition's strict HTML season
+selector.  ``auto`` runs ``full`` when the last full crawl is older than seven
+days.  The previous canonical snapshot (read from Silver before any paid I/O)
+is where unreadable competitions are carried from.
 """
 
 from __future__ import annotations
@@ -466,10 +467,12 @@ def discovery_limits(
     """The exact caps a standing policy grants one run.
 
     ``request_limit = max(floor, ceil(multiplier * (k * competitions +
-    country pages + seed pages)))`` with ``k`` requests per competition of
-    the mode (full: profile + regulation; daily: regulation); retries and
-    provider bytes scale with it.  The policy's ``paid_proxy`` caps are the
-    floors, and a policy without ``scaling`` grants exactly the floors.
+    country pages + seed pages)))`` with ``k`` baseline requests per
+    competition of the mode (full: profile + regulation; daily: regulation).
+    Daily HTML fallbacks spend only existing multiplier/floor headroom and stop
+    through the same guard. Retries and provider bytes scale with the result.
+    The policy's ``paid_proxy`` caps are the floors, and a policy without
+    ``scaling`` grants exactly the floors.
     """
 
     paid = policy.paid_proxy
@@ -1036,6 +1039,7 @@ def _failure_manifest(
     cache_entries_before: int | None,
     competition_rows: list[dict[str, Any]] | None,
     edition_rows: list[dict[str, Any]] | None,
+    discovery_report: Mapping[str, Any],
     source_started: bool,
     source_validated: bool,
     write_authorized: bool,
@@ -1095,6 +1099,7 @@ def _failure_manifest(
         "run_id": str(args.run_id),
         "scope": _scope_manifest(args, cycle_id),
         "expected_entities": list(EXPECTED_ENTITIES),
+        "discovery_report": dict(discovery_report),
         # None means unknown because source completeness was not proven.  Zero
         # would incorrectly look like authoritative_empty evidence.
         "rows": {
@@ -1545,6 +1550,7 @@ def _execute_once(
             cache_entries_before=cache_entries_before,
             competition_rows=competition_rows,
             edition_rows=edition_rows,
+            discovery_report=report,
             source_started=source_started,
             source_validated=source_validated,
             write_authorized=write_authorized,
@@ -1621,6 +1627,7 @@ def execute(
                 cache_entries_before=None,
                 competition_rows=None,
                 edition_rows=None,
+                discovery_report={},
                 source_started=False,
                 source_validated=False,
                 write_authorized=False,
