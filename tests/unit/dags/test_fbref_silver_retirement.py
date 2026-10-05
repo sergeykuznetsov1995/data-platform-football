@@ -32,6 +32,22 @@ def test_legacy_fbref_silver_openmetadata_descriptions_are_absent():
     assert legacy_descriptions == ()
 
 
+def test_ci_dagbag_counts_match_bronze_only_parent_topologies():
+    workflow = (ROOT / ".github" / "workflows" / "fbref-ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        '"dag_ingest_fbref": (root / "dags/dag_ingest_fbref.py", 15)'
+        in workflow
+    )
+    assert (
+        '"dag_backfill_fbref": (root / "dags/dag_backfill_fbref.py", 17)'
+        in workflow
+    )
+    assert '"dag_replay_fbref": (root / "dags/dag_replay_fbref.py", 9)' in workflow
+
+
 @pytest.mark.parametrize("relative_path", PARENTS)
 def test_fbref_bronze_parents_do_not_trigger_legacy_silver(relative_path):
     source = (ROOT / relative_path).read_text(encoding="utf-8")

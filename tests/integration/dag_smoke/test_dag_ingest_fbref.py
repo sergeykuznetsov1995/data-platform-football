@@ -83,7 +83,7 @@ class TestFBrefDagBag:
             for task_id in replay.task_dict
         )
         assert "drain_replay" in replay.task_dict
-        assert len(replay.task_dict) == 10
+        assert len(replay.task_dict) == 9
 
 
 @pytest.mark.integration
