@@ -17,6 +17,7 @@ from scrapers.fotmob.planner import (
     TransportBudget,
     deterministic_plan_signature,
     _history_season_cycle_key,
+    catalog_scope_obligation,
     plan_seasons,
     tombstones_after_two_absences,
 )
@@ -36,6 +37,39 @@ def test_history_season_cycle_groups_calendar_and_split_year_labels():
     assert _history_season_cycle_key("2025") == (2025, "")
     assert _history_season_cycle_key("2023/2024") < (2025, "")
     assert _history_season_cycle_key(" Apertura ") == (-1, "apertura")
+
+
+def test_automatic_history_obligation_starts_at_2010_2011():
+    seasons = [
+        SeasonRef(47, "2008", source_order=6),
+        SeasonRef(47, "2009/2010", source_order=5),
+        SeasonRef(47, "2010", source_order=4),
+        SeasonRef(47, "2010 - Apertura", source_order=3),
+        SeasonRef(47, "2010/2011", source_order=2),
+        SeasonRef(47, "2010/2011 - Clausura", source_order=1),
+    ]
+
+    obligation = catalog_scope_obligation(
+        [_classified(47)],
+        seasons,
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+    )
+
+    assert obligation == (
+        (47, "2010/2011 - Clausura"),
+        (47, "2010/2011"),
+        (47, "2010 - Apertura"),
+        (47, "2010"),
+    )
+    # Явная кампания не является automatic HISTORY lane и сохраняет exact keys.
+    explicit = plan_seasons(
+        [_classified(47)],
+        seasons,
+        mode=RunMode.BACKFILL,
+        explicit_scopes={(47, "2009/2010")},
+    )
+    assert [item.identity for item in explicit] == [(47, "2009/2010")]
 
 
 def test_backfill_uses_source_order_not_a_hardcoded_competition_allowlist():
