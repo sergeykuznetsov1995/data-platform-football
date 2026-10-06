@@ -227,6 +227,7 @@ SOFASCORE_LINEUPS = BootstrapTable(
         ("is_unused_substitute", "boolean"),
         ("participation_status", "varchar"),
         ("shirt_number", "bigint"),
+        ("jersey_number", "bigint"),
         ("substitute", "boolean"),
         ("captain", "boolean"),
         *_LINEAGE_COLUMNS,
@@ -320,6 +321,27 @@ NEW_BRONZE_BOOTSTRAP_TABLES = (
     SOFASCORE_REJECTED_ROWS,
 )
 BOOTSTRAP_TABLES = (OPS_MANIFEST, *NEW_BRONZE_BOOTSTRAP_TABLES)
+
+
+@dataclass(frozen=True)
+class AdditiveColumnMigration:
+    """One explicitly allowed additive evolution of an existing table."""
+
+    schema: str
+    table: str
+    column: Column
+
+    def __post_init__(self) -> None:
+        _identifier(self.schema, "schema")
+        _identifier(self.table, "table")
+
+
+LINEUPS_JERSEY_NUMBER = AdditiveColumnMigration(
+    schema="bronze",
+    table="sofascore_lineups",
+    column=Column("jersey_number", "bigint"),
+)
+ADDITIVE_COLUMN_MIGRATIONS = (LINEUPS_JERSEY_NUMBER,)
 
 
 @dataclass(frozen=True)
@@ -431,6 +453,34 @@ def bootstrap_sql(*, catalog: str = "iceberg") -> tuple[str, ...]:
             )
         )
     return tuple(statements)
+
+
+def _render_additive_column_sql(
+    migration: AdditiveColumnMigration,
+    *,
+    catalog: str,
+) -> str:
+    _identifier(catalog, "catalog")
+    qualified = f"{catalog}.{migration.schema}.{migration.table}"
+    return (
+        f"ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS "
+        f"{_quoted_identifier(migration.column.name)} {migration.column.sql_type}"
+    )
+
+
+def additive_dry_run_steps(*, catalog: str = "iceberg") -> tuple[dict, ...]:
+    """Describe the narrow additive evolutions without connecting."""
+
+    return tuple(
+        {
+            "table": f"{migration.schema}.{migration.table}",
+            "column": migration.column.name,
+            "type": migration.column.sql_type,
+            "when": "column_absent",
+            "sql": _render_additive_column_sql(migration, catalog=catalog),
+        }
+        for migration in ADDITIVE_COLUMN_MIGRATIONS
+    )
 
 
 def legacy_dry_run_steps(*, catalog: str = "iceberg") -> tuple[dict, ...]:
@@ -666,6 +716,38 @@ def apply_legacy_migrations(manager, *, catalog: str = "iceberg") -> list[dict]:
     return actions
 
 
+def apply_additive_migrations(manager, *, catalog: str = "iceberg") -> list[dict]:
+    """Add only explicitly approved columns that are absent from existing tables."""
+
+    actions = []
+    for migration in ADDITIVE_COLUMN_MIGRATIONS:
+        qualified = f"{catalog}.{migration.schema}.{migration.table}"
+        if not manager.table_exists(migration.schema, migration.table):
+            raise SofaScoreBootstrapError(
+                f"additive migration target is missing: {qualified}"
+            )
+        columns: Mapping[str, object] = manager.get_table_columns(
+            migration.schema, migration.table
+        )
+        altered = migration.column.name not in columns
+        if altered:
+            manager.add_column(
+                migration.schema,
+                migration.table,
+                migration.column.name,
+                migration.column.sql_type,
+            )
+        actions.append(
+            {
+                "table": f"{migration.schema}.{migration.table}",
+                "column": migration.column.name,
+                "type": migration.column.sql_type,
+                "altered": altered,
+            }
+        )
+    return actions
+
+
 def _normalize_type(value: object) -> str:
     return re.sub(r"\s+", "", str(value).strip().casefold())
 
@@ -800,9 +882,11 @@ def apply_bootstrap(manager, *, catalog: str = "iceberg") -> dict:
 
     for statement in bootstrap_sql(catalog=catalog):
         manager._execute(statement)
+    additive_actions = apply_additive_migrations(manager, catalog=catalog)
     legacy_actions = apply_legacy_migrations(manager, catalog=catalog)
     report = preflight(manager, catalog=catalog)
     report["mode"] = "apply"
+    report["additive_actions"] = additive_actions
     report["legacy_actions"] = legacy_actions
     if not report["ready"]:
         failed = [
@@ -847,6 +931,9 @@ def main(
                             f"{table.schema}.{table.name}" for table in BOOTSTRAP_TABLES
                         ],
                         "statements": bootstrap_sql(catalog=args.catalog),
+                        "additive_migrations": additive_dry_run_steps(
+                            catalog=args.catalog
+                        ),
                         "legacy_migrations": legacy_dry_run_steps(catalog=args.catalog),
                     },
                     sort_keys=True,
