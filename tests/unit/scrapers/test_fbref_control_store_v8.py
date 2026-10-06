@@ -2121,6 +2121,16 @@ def test_a_holder_the_registry_cannot_place_still_parks_on_the_sentinel():
     assert len(_sentinel_parks(factory)) == 1
 
 
+def test_retired_skipped_season_without_dated_registry_url_parks_for_handover():
+    holder = _outgoing_season_row(state="skipped")
+    store, factory = make_store(_rollover_handler([holder], registry=None))
+
+    store.upsert_frontier_target(_incoming_season_target())
+
+    assert _releases(factory) == []
+    assert len(_sentinel_parks(factory)) == 1
+
+
 @pytest.mark.parametrize(
     "holder, outgoing, current, expected",
     [

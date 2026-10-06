@@ -5203,8 +5203,8 @@ class ControlStore:
                         cursor, row, canonical_url
                     ):
                         continue
-                    if str(row["state"]) == "quarantined":
-                        # A quarantined, mis-classified target still holds this
+                    if str(row["state"]) in {"skipped", "quarantined"}:
+                        # A terminal, mis-classified target still holds this
                         # canonical URL (e.g. pre-#949 discovery minted the
                         # /stats/ player-standard page as a season target with
                         # season_id='stats').  Release the URL onto a dead
