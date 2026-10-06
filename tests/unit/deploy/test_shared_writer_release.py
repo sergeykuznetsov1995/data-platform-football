@@ -195,6 +195,16 @@ def test_lock_contention_prevents_apply_and_preserves_lock_bytes(prepared):
     assert r.digest((root / r.WRITER).read_bytes()) == r.BEFORE
 
 
+def test_production_guards_use_source_specific_state_roots():
+    locks, markers = r.guard_paths(r.STATE)
+    assert r.SOFASCORE_STATE / "sofascore-auto-deliver.lock" in locks
+    assert r.TRANSFERMARKT_STATE / "transfermarkt-auto-deliver.lock" in locks
+    assert r.SOFASCORE_STATE / "sofascore-inflight" in markers
+    assert r.TRANSFERMARKT_STATE / "transfermarkt-inflight" in markers
+    assert r.STATE / "sofascore-auto-deliver.lock" not in locks
+    assert r.STATE / "transfermarkt-auto-deliver.lock" not in locks
+
+
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "parent_symlink"])
 def test_unsafe_target_refused(prepared, kind):
     bundle, root, _, _, _ = prepared
