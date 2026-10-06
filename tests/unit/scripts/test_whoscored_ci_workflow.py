@@ -13,6 +13,12 @@ def _workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
+def test_contract_timeout_leaves_room_after_bounded_spark_download() -> None:
+    contract_header = _workflow_text().split("\n    env:", 1)[0]
+
+    assert "timeout-minutes: 150" in contract_header
+
+
 def test_every_pull_request_runs_the_cross_boundary_contract():
     text = _workflow_text()
     trigger = text.split("permissions:", 1)[0]

@@ -13,6 +13,7 @@ from scrapers.fbref.discovery import (
     parse_schedule_html,
     parse_season_html,
     discover_page_links,
+    competition_eligibility,
     partition_competitions,
     sentinel_coverage,
 )
@@ -507,6 +508,16 @@ def test_gender_partition_is_decided_before_child_targets():
     assert [item.comp_id for item in partitioned[CompetitionEligibility.ELIGIBLE]] == ["1"]
     assert [item.comp_id for item in partitioned[CompetitionEligibility.SKIPPED_FEMALE]] == ["2"]
     assert [item.comp_id for item in partitioned[CompetitionEligibility.QUARANTINED_UNKNOWN]] == ["3"]
+
+
+@pytest.mark.parametrize("competition_id", ["68", "76", "79"])
+def test_discontinued_adult_leagues_are_outside_current_scope(competition_id):
+    competition = _competition(comp_id=competition_id)
+
+    assert (
+        competition_eligibility(competition)
+        == CompetitionEligibility.SKIPPED_INACTIVE
+    )
 
 
 def test_source_link_inventory_covers_graph_and_comments_without_url_synthesis():
