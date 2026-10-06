@@ -736,7 +736,10 @@ def test_failed_two_competition_batch_rolls_back_every_bronze_mutation(
     competition_ids = [item.evidence.competition_id for item in items]
 
     try:
-        with pytest.raises(ParseWaveError, match="Season discovery failed"):
+        with pytest.raises(
+            ParseWaveError,
+            match="history raw fails current-season resolution",
+        ):
             FBrefPipeline(store, raw_store).remediate_current_seasons(items)
 
         with admin.cursor() as cursor:
