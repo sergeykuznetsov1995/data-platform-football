@@ -1261,6 +1261,23 @@ def test_download_receipt_rejects_fewer_resumable_attempts() -> None:
     assert provenance._canonical_fetch_receipt(command, "curl") is False
 
 
+def test_download_receipt_rejects_extra_resumable_attempts() -> None:
+    command = RESUMABLE_DOWNLOAD_RUN.replace(
+        " && echo", f" || {RESUMABLE_FETCH} && echo", 1
+    )
+
+    assert provenance._canonical_fetch_receipt(command, "curl") is False
+
+
+def test_download_receipt_rejects_changed_middle_resumable_attempt() -> None:
+    changed_fetch = RESUMABLE_FETCH.replace("--max-time 1500", "--max-time 1499")
+    command = " || ".join(
+        [RESUMABLE_FETCH, RESUMABLE_FETCH, changed_fetch, RESUMABLE_FETCH]
+    ) + RESUMABLE_DOWNLOAD_RUN.split(RESUMABLE_FETCH, 4)[-1]
+
+    assert provenance._canonical_fetch_receipt(command, "curl") is False
+
+
 @pytest.mark.parametrize(
     "curl_flags",
     [

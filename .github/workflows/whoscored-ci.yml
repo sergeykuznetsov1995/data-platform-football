@@ -16,7 +16,7 @@ concurrency:
 jobs:
   contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       BASH_ENV: /dev/null
       ENV: /dev/null
