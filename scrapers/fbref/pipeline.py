@@ -47,7 +47,9 @@ from scrapers.fbref.control.models import CohortTarget, ObservationLease
 from scrapers.fbref.discovery import (
     DISCOVERY_PARSER_VERSION,
     CalendarType,
+    CURRENT_SCOPE_LIFECYCLE_OVERRIDES,
     CompetitionFormat,
+    CompetitionEligibility,
     CompetitionGender,
     CompetitionRef,
     DiscoveredPageLink,
@@ -2301,7 +2303,7 @@ def _competition_metadata(
     current_season_index: Mapping[str, object],
 ) -> dict:
     advertised = current_season_index.get("advertised") or {}
-    return {
+    metadata = {
         "format": item.format.value,
         "participants": item.participants.value,
         "source_section": item.source_section,
@@ -2314,6 +2316,11 @@ def _competition_metadata(
         "advertised_current_season_id": advertised.get("season_id"),
         "current_season_index": dict(current_season_index),
     }
+    lifecycle = CURRENT_SCOPE_LIFECYCLE_OVERRIDES.get(item.competition_id)
+    if lifecycle is not None:
+        metadata["current_scope_lifecycle"] = lifecycle[0]
+        metadata["current_scope_reason"] = lifecycle[1]
+    return metadata
 
 
 def _registry_entry(
@@ -2326,12 +2333,20 @@ def _registry_entry(
         CompetitionGender.FEMALE: "female",
         CompetitionGender.UNKNOWN: "unknown",
     }[item.gender]
+    eligibility = competition_eligibility(item)
+    crawl_state = {
+        CompetitionEligibility.ELIGIBLE: "active",
+        CompetitionEligibility.SKIPPED_INACTIVE: "skipped",
+        CompetitionEligibility.SKIPPED_FEMALE: "skipped",
+        CompetitionEligibility.QUARANTINED_UNKNOWN: "quarantined",
+    }[eligibility]
     return CompetitionRegistryEntry(
         competition_id=item.competition_id,
         canonical_url=item.history_url,
         name=item.name,
         gender=gender,
         classification=f"{item.format.value}:{item.participants.value}",
+        crawl_state=crawl_state,
         metadata=_competition_metadata(
             item,
             current_season_index=current_season_index,
