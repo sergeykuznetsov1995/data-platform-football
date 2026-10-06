@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from collections import Counter
+from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
 from utils.sofascore_dq import (
     COVERAGE_STATUSES,
     MANIFEST_STATES,
+    SofaScoreContractError,
     load_coverage_contract,
+    validate_coverage_contract,
 )
 
 
@@ -139,6 +142,33 @@ def test_participant_gender_is_a_male_only_pre_write_enum(coverage):
     assert "gender" in participants["required_columns"]
     assert participants["allowed_values"]["gender"] == ["M"]
     assert participants["allowed_values"]["team_side"] == ["home", "away"]
+
+
+def test_lineup_jersey_number_has_an_exact_bigint_contract(coverage):
+    lineups = coverage["tables"]["bronze.sofascore_lineups"]
+    assert lineups["column_types"] == {"jersey_number": "bigint"}
+
+
+def test_table_column_types_reject_unsupported_sql_types(coverage):
+    invalid = deepcopy(coverage)
+    invalid["tables"]["bronze.sofascore_lineups"]["column_types"] = {
+        "jersey_number": "double"
+    }
+
+    with pytest.raises(SofaScoreContractError, match="column_types"):
+        validate_coverage_contract(invalid)
+
+
+@pytest.mark.parametrize(
+    "column_types",
+    [[], {"jersey-number": "bigint"}],
+)
+def test_table_column_types_require_a_safe_column_mapping(coverage, column_types):
+    invalid = deepcopy(coverage)
+    invalid["tables"]["bronze.sofascore_lineups"]["column_types"] = column_types
+
+    with pytest.raises(SofaScoreContractError, match="column_types"):
+        validate_coverage_contract(invalid)
 
 
 def test_every_normalized_destination_has_grain_key_dq_and_downstream(coverage):

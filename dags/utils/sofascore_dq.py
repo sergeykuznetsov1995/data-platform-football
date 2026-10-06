@@ -53,6 +53,10 @@ OPTIONAL_ACCEPTABLE_STATES = frozenset({"success", "legitimate_empty", "not_supp
 RETRYABLE_HTTP_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
 
 _SAFE_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+_SAFE_SQL_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SUPPORTED_INTEGER_SQL_TYPES = frozenset(
+    {"bigint", "integer", "smallint", "tinyint"}
+)
 
 
 class SofaScoreContractError(ValueError):
@@ -334,6 +338,25 @@ def validate_coverage_contract(doc: Any) -> None:
                 f"tables.{table_name} natural-key columns missing from required_columns: "
                 + ", ".join(missing_key_columns)
             )
+        column_types = spec.get("column_types")
+        if column_types is not None:
+            if not isinstance(column_types, Mapping):
+                raise SofaScoreContractError(
+                    f"tables.{table_name}.column_types must be a mapping"
+                )
+            for column, sql_type in column_types.items():
+                if not isinstance(column, str) or not _SAFE_SQL_COLUMN_RE.fullmatch(
+                    column
+                ):
+                    raise SofaScoreContractError(
+                        f"tables.{table_name}.column_types has invalid column "
+                        f"name: {column!r}"
+                    )
+                if sql_type not in _SUPPORTED_INTEGER_SQL_TYPES:
+                    raise SofaScoreContractError(
+                        f"tables.{table_name}.column_types.{column} must be one of "
+                        f"{sorted(_SUPPORTED_INTEGER_SQL_TYPES)}, got {sql_type!r}"
+                    )
         _require_string_list(
             spec.get("partition_columns"),
             f"tables.{table_name}.partition_columns",
@@ -577,6 +600,36 @@ def _key_tuple(row: Mapping[str, Any], fields: Sequence[str]) -> tuple[Any, ...]
     return tuple(row.get(field) for field in fields)
 
 
+def _is_writer_compatible_integral(value: Any) -> bool:
+    """Return whether ``value`` can be written to an integer SQL column.
+
+    Pandas represents missing optional numeric fields as NaN, so numeric NaN
+    follows ``None`` as a SQL null. Strings use the writer's ``int(value)``
+    conversion, while non-string numerics must also be mathematically integral.
+    """
+
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (str, bytes)):
+        try:
+            if bool(math.isnan(value)):
+                return True
+        except (TypeError, ValueError):
+            pass
+    try:
+        integral = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if isinstance(value, str):
+        return True
+    try:
+        return bool(value == integral)
+    except (TypeError, ValueError):
+        return False
+
+
 def validate_table_rows(
     table_name: str,
     rows: Iterable[Mapping[str, Any]],
@@ -602,10 +655,12 @@ def validate_table_rows(
     seen: dict[tuple[Any, ...], int] = {}
     duplicates: list[tuple[Any, ...]] = []
     invalid_enums: list[tuple[int, str, Any]] = []
+    physical_type_mismatches: list[tuple[int, str, Any, str]] = []
     allowed_values = {
         column: set(values)
         for column, values in (table.get("allowed_values") or {}).items()
     }
+    column_types = dict(table.get("column_types") or {})
     for index, row in enumerate(materialized):
         missing = tuple(col for col in required_columns if col not in row)
         if missing:
@@ -636,6 +691,17 @@ def validate_table_rows(
                     "invalid_enum_value",
                     f"{column}={value!r} not in {sorted(allowed)!r}",
                 )
+        for column, sql_type in column_types.items():
+            value = row.get(column)
+            if not _is_writer_compatible_integral(value):
+                physical_type_mismatches.append(
+                    (index, column, value, sql_type)
+                )
+                report.reject_row(
+                    index,
+                    "physical_type_mismatch",
+                    f"{column}={value!r} is not compatible with {sql_type}",
+                )
 
     if missing_rows:
         report.add(
@@ -665,6 +731,14 @@ def validate_table_rows(
             f"{len(invalid_enums)} {table_name} rows violate an enum contract",
             count=len(invalid_enums),
             examples=invalid_enums[:5],
+        )
+    if physical_type_mismatches:
+        report.add(
+            "physical_type_mismatch",
+            f"{len(physical_type_mismatches)} {table_name} values violate a "
+            "physical type contract",
+            count=len(physical_type_mismatches),
+            examples=physical_type_mismatches[:5],
         )
     report.metrics[f"{table_name}.rows"] = len(materialized)
     report.metrics[f"{table_name}.duplicate_keys"] = len(set(duplicates))

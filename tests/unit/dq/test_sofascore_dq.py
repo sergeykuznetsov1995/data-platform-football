@@ -208,6 +208,61 @@ def test_table_contract_rejects_duplicates_missing_fields_and_bad_enum():
     assert {"required_field_loss", "null_natural_key"} <= codes
 
 
+def _valid_lineup_row(**overrides):
+    return {
+        "match_id": "1",
+        "player_id": "p1",
+        "team_side": "home",
+        "is_starter": True,
+        "is_bench": False,
+        "is_unused_substitute": False,
+        "participation_status": "starter",
+        "source_tournament_id": 17,
+        "source_season_id": 76986,
+        "league": "ENG-Premier League",
+        "season": "2526",
+        "raw_content_hash": "a" * 64,
+        "raw_blob_key": "sofascore/17/76986/lineups/1.json.gz",
+        "_ingested_at": "2026-07-11T00:00:00Z",
+        **overrides,
+    }
+
+
+def test_lineup_bigint_contract_rejects_fractional_jersey_number():
+    row = _valid_lineup_row(jersey_number=0.34)
+    report = validate_table_rows("bronze.sofascore_lineups", [row])
+    accepted, rejected = report.partition([row], allow_all_rejected=True)
+    assert accepted == []
+    assert rejected[0].code == "physical_type_mismatch"
+    assert "jersey_number=0.34" in rejected[0].message
+
+
+@pytest.mark.parametrize("value", [None, 0, 34, "34"])
+def test_lineup_bigint_contract_accepts_null_or_integral_jersey_number(value):
+    assert validate_table_rows(
+        "bronze.sofascore_lineups", [_valid_lineup_row(jersey_number=value)]
+    ).passed
+
+
+@pytest.mark.parametrize("value", [float("nan"), 34.0])
+def test_lineup_bigint_contract_accepts_numeric_null_or_integral_float(value):
+    assert validate_table_rows(
+        "bronze.sofascore_lineups", [_valid_lineup_row(jersey_number=value)]
+    ).passed
+
+
+@pytest.mark.parametrize("value", [True, False, 34.5, ".34", "34.0"])
+def test_lineup_bigint_contract_rejects_non_integral_writer_values(value):
+    report = validate_table_rows(
+        "bronze.sofascore_lineups", [_valid_lineup_row(jersey_number=value)]
+    )
+    assert not report.passed
+    finding = next(
+        item for item in report.findings if item.code == "physical_type_mismatch"
+    )
+    assert finding.examples == ((0, "jersey_number", value, "bigint"),)
+
+
 def test_participant_gender_enum_rejects_the_row_and_keeps_the_rest():
     base = {
         "match_id": "1",
