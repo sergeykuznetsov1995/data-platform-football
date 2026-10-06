@@ -159,6 +159,17 @@ def test_table_column_types_reject_unsupported_sql_types(coverage):
         validate_coverage_contract(invalid)
 
 
+@pytest.mark.parametrize("sql_type", [[], {}])
+def test_table_column_types_reject_unhashable_sql_types(coverage, sql_type):
+    invalid = deepcopy(coverage)
+    invalid["tables"]["bronze.sofascore_lineups"]["column_types"] = {
+        "jersey_number": sql_type
+    }
+
+    with pytest.raises(SofaScoreContractError, match="column_types"):
+        validate_coverage_contract(invalid)
+
+
 @pytest.mark.parametrize(
     "column_types",
     [[], {"jersey-number": "bigint"}],

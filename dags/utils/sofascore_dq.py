@@ -352,7 +352,10 @@ def validate_coverage_contract(doc: Any) -> None:
                         f"tables.{table_name}.column_types has invalid column "
                         f"name: {column!r}"
                     )
-                if sql_type not in _SUPPORTED_INTEGER_SQL_TYPES:
+                if (
+                    not isinstance(sql_type, str)
+                    or sql_type not in _SUPPORTED_INTEGER_SQL_TYPES
+                ):
                     raise SofaScoreContractError(
                         f"tables.{table_name}.column_types.{column} must be one of "
                         f"{sorted(_SUPPORTED_INTEGER_SQL_TYPES)}, got {sql_type!r}"
@@ -616,7 +619,7 @@ def _is_writer_compatible_integral(value: Any) -> bool:
         try:
             if bool(math.isnan(value)):
                 return True
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
     try:
         integral = int(value)

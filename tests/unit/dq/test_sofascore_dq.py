@@ -251,6 +251,14 @@ def test_lineup_bigint_contract_accepts_numeric_null_or_integral_float(value):
     ).passed
 
 
+def test_lineup_bigint_contract_accepts_arbitrarily_large_integer():
+    row = _valid_lineup_row(jersey_number=10**400)
+    report = validate_table_rows("bronze.sofascore_lineups", [row])
+
+    assert report.passed
+    assert report.partition([row]) == ([row], [])
+
+
 @pytest.mark.parametrize("value", [True, False, 34.5, ".34", "34.0"])
 def test_lineup_bigint_contract_rejects_non_integral_writer_values(value):
     report = validate_table_rows(
