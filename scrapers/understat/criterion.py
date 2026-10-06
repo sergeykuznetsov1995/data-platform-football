@@ -215,6 +215,43 @@ GROUP BY p.league
 ORDER BY p.league"""
 )
 
+QUARANTINE_SQL = """WITH
+latest AS (
+    SELECT league, status, quality_json
+    FROM (
+        SELECT league, season, status, quality_json,
+               ROW_NUMBER() OVER (
+                   PARTITION BY league, season
+                   ORDER BY completed_at DESC, attempt_id DESC
+               ) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2'
+          AND season = '{season}'
+    )
+    WHERE rn = 1 AND status = 'complete'
+),
+quarantine AS (
+    SELECT latest.league,
+           json_extract_scalar(item, '$.game_id') AS game_id,
+           json_extract_scalar(item, '$.state') AS state,
+           json_extract_scalar(item, '$.first_seen_at') AS first_seen_at,
+           json_extract_scalar(item, '$.last_checked_at') AS last_checked_at,
+           json_extract_scalar(item, '$.retry_until') AS retry_until
+    FROM latest
+    CROSS JOIN UNNEST(
+        COALESCE(
+            CAST(
+                json_extract(quality_json, '$.match_quarantine')
+                AS array(json)
+            ),
+            CAST(ARRAY[] AS array(json))
+        )
+    ) AS records (item)
+)
+SELECT league, game_id, state, first_seen_at, last_checked_at, retry_until
+FROM quarantine
+ORDER BY league, game_id"""
+
 
 def render_daily_criterion_sql(day: str, failures: str = FAILURES_RELATION) -> str:
     """SQL for deadline day ``day`` (ISO ``YYYY-MM-DD``, UTC).
@@ -230,6 +267,13 @@ def render_completeness_sql(season: str) -> str:
     if not (len(season) == 4 and season.isdigit()):
         raise ValueError(f"season must be a four-digit slug, got {season!r}")
     return COMPLETENESS_SQL.format(season=season)
+
+
+def render_quarantine_sql(season: str) -> str:
+    """SQL for current quarantine records in ``season`` (such as ``2627``)."""
+    if not (len(season) == 4 and season.isdigit()):
+        raise ValueError(f"season must be a four-digit slug, got {season!r}")
+    return QUARANTINE_SQL.format(season=season)
 
 
 def _iso_day(day: str) -> str:
@@ -282,10 +326,12 @@ __all__ = [
     "COMPLETENESS_SQL",
     "DAILY_CRITERION_SQL",
     "FAILURES_RELATION",
+    "QUARANTINE_SQL",
     "TARGET_PCT",
     "DayResult",
     "pct",
     "render_completeness_sql",
     "render_daily_criterion_sql",
+    "render_quarantine_sql",
     "summarize_days",
 ]

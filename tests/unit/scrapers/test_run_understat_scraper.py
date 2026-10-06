@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from argparse import Namespace
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -117,6 +118,67 @@ def _pending_frames() -> dict[str, pd.DataFrame]:
     row.update(is_result=False, has_data=False)
     frames["understat_schedule"] = pd.DataFrame([row])
     return frames
+
+
+def _played_game_frames(
+    played: int,
+    *,
+    empty_game_ids: set[str] | None = None,
+    source_year: int = 2026,
+) -> dict[str, pd.DataFrame]:
+    """Build a valid runner scenario with selected empty match payloads."""
+    empty_game_ids = set(empty_game_ids or ())
+    frames = _complete_frames(source_year=source_year)
+    schedule_template = frames["understat_schedule"].iloc[0]
+    team_match_template = frames["understat_team_match_stats"].iloc[0]
+    shot_template = frames["understat_shots"].iloc[0]
+    roster_templates = tuple(
+        frames["understat_player_match_stats"].itertuples(index=False, name=None)
+    )
+    roster_columns = list(frames["understat_player_match_stats"].columns)
+
+    schedule_rows = []
+    team_match_rows = []
+    shot_rows = []
+    roster_rows = []
+    for offset in range(played):
+        game_id = str(10_000 + offset)
+        schedule_row = schedule_template.copy()
+        schedule_row["game_id"] = game_id
+        schedule_row["has_data"] = game_id not in empty_game_ids
+        schedule_rows.append(schedule_row)
+
+        team_match_row = team_match_template.copy()
+        team_match_row["game_id"] = game_id
+        team_match_rows.append(team_match_row)
+        if game_id in empty_game_ids:
+            continue
+
+        shot_row = shot_template.copy()
+        shot_row["game_id"] = game_id
+        shot_row["shot_id"] = str(20_000 + offset)
+        shot_rows.append(shot_row)
+        for roster_values in roster_templates:
+            roster_row = dict(zip(roster_columns, roster_values))
+            roster_row["game_id"] = game_id
+            roster_rows.append(roster_row)
+
+    frames["understat_schedule"] = pd.DataFrame(schedule_rows)
+    frames["understat_team_match_stats"] = pd.DataFrame(team_match_rows)
+    frames["understat_shots"] = pd.DataFrame(
+        shot_rows, columns=frames["understat_shots"].columns
+    )
+    frames["understat_player_match_stats"] = pd.DataFrame(
+        roster_rows, columns=roster_columns
+    )
+    return frames
+
+
+def _freeze_runner_time(monkeypatch, observed_at: datetime) -> None:
+    monkeypatch.setattr(
+        "scrapers.understat.manifest.utc_now_iso",
+        lambda: observed_at.isoformat(),
+    )
 
 
 def _args(
@@ -770,6 +832,140 @@ def test_every_run_ensures_the_failures_journal_before_any_failure():
     assert broken_exit == 0
 
 
+def test_first_empty_match_attempt_publishes_complete_waiting_quarantine(monkeypatch):
+    observed_at = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    _freeze_runner_time(monkeypatch, observed_at)
+    factory, scraper = _scraper_factory(
+        _played_game_frames(20, empty_game_ids={"10019"})
+    )
+    repository = _Repository()
+
+    payload, exit_code = runner.run_scope(
+        _args(source_year=2026), scraper_factory=factory, repository=repository
+    )
+
+    assert exit_code == 0
+    assert payload["status"] == "complete"
+    assert scraper.save_to_iceberg.call_count == 7
+    assert [attempt.status for attempt in repository.appended] == [
+        ManifestStatus.IN_PROGRESS,
+        ManifestStatus.COMPLETE,
+    ]
+    [quarantine] = payload["scope_attempt"]["quality"]["match_quarantine"]
+    assert quarantine == {
+        "game_id": "10019",
+        "state": "waiting_data",
+        "missing_entities": [
+            "understat_shots",
+            "understat_player_match_stats",
+        ],
+        "first_seen_at": "2026-10-05T09:20:00+00:00",
+        "last_checked_at": "2026-10-05T09:20:00+00:00",
+        "retry_until": "2026-10-12T09:20:00+00:00",
+        "observation_count": 1,
+    }
+
+
+def test_repeated_empty_match_preserves_window_and_increments_observation(monkeypatch):
+    first_seen = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    frames = _played_game_frames(20, empty_game_ids={"10019"})
+    repository = _Repository()
+    _freeze_runner_time(monkeypatch, first_seen)
+    first_factory, _ = _scraper_factory(frames)
+    first, first_exit = runner.run_scope(
+        _args(source_year=2026),
+        scraper_factory=first_factory,
+        repository=repository,
+    )
+    assert first_exit == 0 and first["status"] == "complete"
+
+    _freeze_runner_time(monkeypatch, first_seen + timedelta(days=1))
+    second_factory, _ = _scraper_factory(frames)
+    second, second_exit = runner.run_scope(
+        _args(source_year=2026),
+        scraper_factory=second_factory,
+        repository=repository,
+    )
+
+    assert second_exit == 0 and second["status"] == "complete"
+    [quarantine] = second["scope_attempt"]["quality"]["match_quarantine"]
+    assert quarantine["state"] == "waiting_data"
+    assert quarantine["first_seen_at"] == "2026-10-05T09:20:00+00:00"
+    assert quarantine["retry_until"] == "2026-10-12T09:20:00+00:00"
+    assert quarantine["last_checked_at"] == "2026-10-06T09:20:00+00:00"
+    assert quarantine["observation_count"] == 2
+
+
+def test_empty_match_attempt_on_eighth_day_becomes_source_empty(monkeypatch):
+    first_seen = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    frames = _played_game_frames(20, empty_game_ids={"10019"})
+    repository = _Repository()
+    _freeze_runner_time(monkeypatch, first_seen)
+    first_factory, _ = _scraper_factory(frames)
+    first, first_exit = runner.run_scope(
+        _args(source_year=2026),
+        scraper_factory=first_factory,
+        repository=repository,
+    )
+    assert first_exit == 0 and first["status"] == "complete"
+
+    _freeze_runner_time(monkeypatch, first_seen + timedelta(days=8))
+    later_factory, _ = _scraper_factory(frames)
+    later, later_exit = runner.run_scope(
+        _args(source_year=2026),
+        scraper_factory=later_factory,
+        repository=repository,
+    )
+
+    assert later_exit == 0 and later["status"] == "complete"
+    [quarantine] = later["scope_attempt"]["quality"]["match_quarantine"]
+    assert quarantine["state"] == "source_empty"
+    assert quarantine["first_seen_at"] == "2026-10-05T09:20:00+00:00"
+    assert quarantine["retry_until"] == "2026-10-12T09:20:00+00:00"
+    assert quarantine["observation_count"] == 2
+
+
+def test_mass_empty_is_journal_only_and_keeps_previous_complete_visible(monkeypatch):
+    observed_at = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    _freeze_runner_time(monkeypatch, observed_at)
+    repository = _Repository()
+    complete_factory, _ = _scraper_factory(_played_game_frames(20))
+    published, published_exit = runner.run_scope(
+        _args(source_year=2026),
+        scraper_factory=complete_factory,
+        repository=repository,
+    )
+    assert published_exit == 0 and published["status"] == "complete"
+    published_attempt = repository.appended[-1]
+    manifest_before = list(repository.appended)
+
+    mass_factory, mass_scraper = _scraper_factory(
+        _played_game_frames(
+            20,
+            empty_game_ids={"10017", "10018", "10019"},
+        )
+    )
+    failed, failed_exit = runner.run_scope(
+        _args(source_year=2026),
+        scraper_factory=mass_factory,
+        repository=repository,
+    )
+
+    assert failed_exit == 1
+    assert failed["status"] == "contract_failure"
+    assert repository.appended == manifest_before
+    assert repository.latest_attempt(None) is published_attempt
+    assert repository.latest_attempt(None).batch_id == published["batch_id"]
+    mass_scraper.save_to_iceberg.assert_not_called()
+    [journaled] = repository.failures
+    assert journaled.status is ManifestStatus.DQ_FAILURE
+    assert journaled.quality["site_result_known"] is True
+    assert journaled.quality["match_quarantine_summary"]["mass_blocked"] is True
+    assert {
+        record["game_id"] for record in journaled.quality["match_quarantine"]
+    } == {"10017", "10018", "10019"}
+
+
 # --- #1431: weekly closed-season league-hash check -------------------------
 
 _LEAGUE_HASHES = {
@@ -810,6 +1006,40 @@ def _published_baseline(repository):
     return baseline
 
 
+def _published_quarantine_baseline(
+    monkeypatch,
+    repository,
+    *,
+    elapsed: timedelta = timedelta(0),
+):
+    first_seen = datetime(2026, 10, 5, 9, 20, tzinfo=timezone.utc)
+    frames = _played_game_frames(20, empty_game_ids={"10019"})
+    _freeze_runner_time(monkeypatch, first_seen)
+    first_scraper = _hash_scraper(
+        frames, hashes=_LEAGUE_HASHES, request_count=42
+    )
+    payload, exit_code = runner.run_scope(
+        _args(source_year=2026),
+        scraper_factory=MagicMock(return_value=first_scraper),
+        repository=repository,
+    )
+    assert exit_code == 0 and payload["status"] == "complete"
+    if elapsed:
+        _freeze_runner_time(monkeypatch, first_seen + elapsed)
+        repeated_scraper = _hash_scraper(
+            frames, hashes=_LEAGUE_HASHES, request_count=42
+        )
+        payload, exit_code = runner.run_scope(
+            _args(source_year=2026),
+            scraper_factory=MagicMock(return_value=repeated_scraper),
+            repository=repository,
+        )
+        assert exit_code == 0 and payload["status"] == "complete"
+    baseline = repository.appended[-1]
+    repository.previous = baseline
+    return first_seen, frames, baseline
+
+
 def test_closed_check_unchanged_leaves_manifest_untouched_and_reports_latest():
     repository = _Repository()
     baseline = _published_baseline(repository)
@@ -837,6 +1067,67 @@ def test_closed_check_unchanged_leaves_manifest_untouched_and_reports_latest():
             "request_count": 2,
         },
     }
+
+
+def test_closed_check_unchanged_waiting_quarantine_uses_full_path(
+    monkeypatch, caplog
+):
+    caplog.set_level("INFO", logger=runner.__name__)
+    repository = _Repository()
+    first_seen, frames, baseline = _published_quarantine_baseline(
+        monkeypatch, repository
+    )
+    assert baseline.quality["match_quarantine"][0]["state"] == "waiting_data"
+    rows_before = list(repository.appended)
+    _freeze_runner_time(monkeypatch, first_seen + timedelta(days=1))
+    probe = _hash_scraper(frames, hashes=_LEAGUE_HASHES, request_count=2)
+    full = _hash_scraper(frames, hashes=_LEAGUE_HASHES, request_count=40)
+
+    payload, exit_code = runner.run_scope(
+        _args(mode="closed_check", source_year=2026),
+        scraper_factory=MagicMock(side_effect=[probe, full]),
+        repository=repository,
+    )
+
+    assert exit_code == 0 and payload["status"] == "complete"
+    assert len(repository.appended) == len(rows_before) + 2
+    probe.league_snapshot.assert_called_once()
+    full.scrape_scope.assert_called_once_with(
+        LEAGUE, "2627", 2026, mode="current", force_refresh=True
+    )
+    assert full.save_to_iceberg.call_count == 7
+    [quarantine] = payload["scope_attempt"]["quality"]["match_quarantine"]
+    assert quarantine["state"] == "waiting_data"
+    assert quarantine["observation_count"] == 2
+    assert "game_id=10019" in caplog.text
+
+
+def test_closed_check_unchanged_source_empty_keeps_existing_skip(monkeypatch):
+    repository = _Repository()
+    first_seen, frames, baseline = _published_quarantine_baseline(
+        monkeypatch,
+        repository,
+        elapsed=timedelta(days=8),
+    )
+    assert baseline.quality["match_quarantine"][0]["state"] == "source_empty"
+    rows_before = list(repository.appended)
+    _freeze_runner_time(monkeypatch, first_seen + timedelta(days=9))
+    probe = _hash_scraper(frames, hashes=_LEAGUE_HASHES, request_count=2)
+    factory = MagicMock(return_value=probe)
+
+    payload, exit_code = runner.run_scope(
+        _args(mode="closed_check", source_year=2026),
+        scraper_factory=factory,
+        repository=repository,
+    )
+
+    assert exit_code == 0
+    assert payload["batch_id"] == baseline.batch_id
+    assert payload["closed_check"]["unchanged"] is True
+    assert repository.appended == rows_before
+    assert factory.call_count == 1
+    probe.scrape_scope.assert_not_called()
+    probe.save_to_iceberg.assert_not_called()
 
 
 def test_closed_check_changed_hash_reingests_scope_in_full():

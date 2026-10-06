@@ -21,6 +21,7 @@ import os
 import sys
 import uuid
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -328,6 +329,7 @@ def run_scope(
     from scrapers.understat.quality import (
         build_failure_attempt,
         build_scope_attempt,
+        match_quarantine_from_quality,
         validate_understat_scope,
     )
 
@@ -473,7 +475,16 @@ def run_scope(
                     and latest.status is ManifestStatus.COMPLETE
                     and latest.attempt_id == baseline.attempt_id
                 )
-                if not changed and baseline_is_latest:
+                baseline_quarantine = match_quarantine_from_quality(
+                    baseline.quality if baseline is not None else {}
+                )
+                waiting_game_ids = sorted(
+                    game_id
+                    for game_id, quarantine in baseline_quarantine.items()
+                    if quarantine.state == "waiting_data"
+                )
+                waiting_quarantine = bool(waiting_game_ids)
+                if not changed and baseline_is_latest and not waiting_quarantine:
                     try:
                         unchanged_verified = repository.verify_physical_batch(
                             baseline
@@ -527,6 +538,15 @@ def run_scope(
                         scope.league,
                         scope.season,
                     )
+                elif not changed and baseline_is_latest:
+                    for game_id in waiting_game_ids:
+                        logger.info(
+                            "closed scope unchanged with waiting quarantine: "
+                            "league=%s season=%s game_id=%s; full re-ingest",
+                            scope.league,
+                            scope.season,
+                            game_id,
+                        )
                 else:
                     logger.info(
                         "closed scope changed (%s): league=%s season=%s; "
@@ -606,6 +626,8 @@ def run_scope(
                     and args.source_season_id >= current_source_season_id()
                 ),
                 previous_row_counts=previous_counts,
+                previous_quality=previous.quality if previous is not None else {},
+                observed_at=datetime.fromisoformat(started_at),
                 batch_id=batch_id,
                 coverage_exceptions=coverage_exceptions_for_scope(scope),
                 league_payload_hashes=_scraper_league_hashes(scraper),
