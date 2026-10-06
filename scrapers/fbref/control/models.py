@@ -15,6 +15,7 @@ class CompetitionRegistryEntry:
     gender: str
     classification: str
     calendar_type: Optional[str] = None
+    crawl_state: Optional[str] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
