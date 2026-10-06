@@ -4120,6 +4120,16 @@ class ControlStore:
                 raise ValueError(
                     f"Unsupported gender {entry.gender!r} for {competition_id}"
                 )
+            crawl_state = (
+                None
+                if entry.crawl_state is None
+                else _text(entry.crawl_state, "crawl_state").lower()
+            )
+            if crawl_state not in {None, "active", "skipped", "quarantined"}:
+                raise ValueError(
+                    f"Unsupported crawl state {entry.crawl_state!r} "
+                    f"for {competition_id}"
+                )
             if competition_id in ids or canonical_url in urls:
                 raise ValueError("Competition snapshot contains duplicate IDs or URLs")
             ids.add(competition_id)
@@ -4136,6 +4146,7 @@ class ControlStore:
                         if entry.calendar_type is None
                         else _text(entry.calendar_type, "calendar_type")
                     ),
+                    crawl_state=crawl_state,
                     metadata=dict(entry.metadata),
                 )
             )
@@ -4230,7 +4241,7 @@ class ControlStore:
             counts = {"active": 0, "skipped": 0, "quarantined": 0}
             seen_ids = []
             for entry in competitions:
-                crawl_state = {
+                crawl_state = entry.crawl_state or {
                     "male": "active",
                     "female": "skipped",
                     "unknown": "quarantined",
