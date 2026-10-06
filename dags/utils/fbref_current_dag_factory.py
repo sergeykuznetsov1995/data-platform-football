@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import BranchPythonOperator, PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
@@ -38,7 +37,6 @@ from utils.fbref_pipeline_tasks import (
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
     finalize_fbref_publication_lock,
-    finalize_fbref_publication_lock_and_route_silver,
     initialize_fbref_run,
     release_fbref_publication_lock,
     run_fbref_live_waves,
@@ -81,10 +79,6 @@ CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-20-v1"
 # same way as the cap above so a delivery cannot silently leave production on
 # the old list that still claims player and matchlog pages.
 CURRENT_PAGE_KINDS_POLICY = "fbref-current-page-kinds-no-players-v1"
-# Deployment marker for #1324: Silver is triggered only after the publication
-# lock is released and is never waited on, so the Bronze verdict and the lock
-# no longer depend on Silver.
-CURRENT_PUBLICATION_ORDER_POLICY = "fbref-current-silver-after-lock-v1"
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -181,8 +175,8 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         the exact production `4096 requests / 2048 MiB / shard 25` safety profile. It
         performs raw recovery, live fetch, parse, and integrity validation,
         then releases the publication lock. It runs the same run gates as
-        ingest (`validate_bootstrap_run`) except freshness and Silver:
-        freshness, scope export, canary, and Silver tasks do not exist in
+        ingest (`validate_bootstrap_run`) except freshness and publication:
+        freshness, scope export, and canary tasks do not exist in
         this DAG.
         """
     else:
@@ -210,9 +204,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         competitions are recorded but never added to the crawl frontier;
         unknown gender is quarantined. Every network task is bounded by the
         shared PostgreSQL request/byte budget and commits raw bytes before
-        parsing. Silver is triggered only after final completeness/traffic
-        validation passes and the publication lock is released; it is not
-        awaited and does not colour the Bronze run. DagRun conf may select only the measured `100/50`
+        parsing. After final completeness/traffic validation, the DAG exports
+        the publication scope and releases the lock; no downstream transform
+        is launched. DagRun conf may select only the measured `100/50`
         canary profile or the default `4096/2048` production safety profile; every warm
         session claims at most 25 targets. A content-hashed raw inventory is
         captured before recovery/fetch, and publication is gated by a
@@ -236,8 +230,8 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         "doc_md": doc_md,
     }
     if bootstrap_only:
-        # #1324: a manual bootstrap is a paid path without freshness, scope or
-        # Silver gates, so it is created paused and unpaused only by hand.
+        # A manual bootstrap is a paid path without freshness or publication
+        # gates, so it is created paused and unpaused only by hand.
         dag_kwargs["is_paused_upon_creation"] = True
     else:
         dag_kwargs["params"] = _scheduled_params()
@@ -363,18 +357,9 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         seed_competition_index >> capture_raw_baseline >> recover_raw
         recover_raw >> live_waves >> audit_raw_integrity
 
-        # #1324: on ingest the finalizer also routes Silver (after the lock),
-        # so it stays the terminal Bronze verdict; bootstrap has no Silver.
-        release_operator = (
-            PythonOperator if bootstrap_only else BranchPythonOperator
-        )
-        release_publication_lock = release_operator(
+        release_publication_lock = PythonOperator(
             task_id="release_publication_lock",
-            python_callable=(
-                finalize_fbref_publication_lock
-                if bootstrap_only
-                else finalize_fbref_publication_lock_and_route_silver
-            ),
+            python_callable=finalize_fbref_publication_lock,
             op_kwargs={
                 "airflow_run_id": AIRFLOW_RUN_ID,
                 "dag_id": DAG_ID,
@@ -464,38 +449,11 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
                 trigger_rule="all_success",
             )
-            trigger_silver = TriggerDagRunOperator(
-                task_id="trigger_silver_transform",
-                trigger_dag_id="dag_transform_fbref_silver",
-                trigger_run_id="fbref_silver__{{ dag.dag_id }}__{{ run_id }}",
-                execution_date="{{ ti.start_date }}",
-                conf={
-                    "fbref_source_dag_id": DAG_ID,
-                    "fbref_source_run_id": AIRFLOW_RUN_ID,
-                    "fbref_control_run_id": (
-                        "{{ ti.xcom_pull(task_ids='initialize_run') }}"
-                    ),
-                    "publication_scope": "fbref_silver_only",
-                    "trigger_xref": False,
-                },
-                # #1324 (CURRENT_PUBLICATION_ORDER_POLICY): fire and forget
-                # after the lock is released; Silver never holds the lock or
-                # colours the Bronze run.
-                wait_for_completion=False,
-                reset_dag_run=False,
-                execution_timeout=timedelta(minutes=10),
-                retries=0,
-                trigger_rule="all_success",
-            )
-
             audit_raw_integrity >> choose_path
             choose_path >> validate_canary >> release_canary_lock
             choose_path >> validate_freshness >> validate_run
             validate_run >> export_publication_scope >> release_publication_lock
             release_canary_lock >> release_publication_lock
-            # The finalizer branches into Silver only after a successful
-            # publication export; its failure leaves Silver upstream_failed.
-            release_publication_lock >> trigger_silver
 
     return dag
 
@@ -505,7 +463,6 @@ __all__ = [
     "CURRENT_MAX_BATCHES",
     "CURRENT_MAX_BATCHES_POLICY",
     "CURRENT_PAGE_KINDS_POLICY",
-    "CURRENT_PUBLICATION_ORDER_POLICY",
     "CURRENT_WAVE_DEADLINE_SECONDS",
     "INGEST_DAG_ID",
     "PAGE_KINDS",

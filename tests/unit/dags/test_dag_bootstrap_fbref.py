@@ -166,7 +166,6 @@ class TestFBrefBootstrapTopology:
             "validate_current_scope_freshness",
             "validate_run",
             "export_publication_scope",
-            "trigger_silver_transform",
         }
         assert forbidden.isdisjoint(tasks)
 

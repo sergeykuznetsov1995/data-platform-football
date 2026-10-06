@@ -113,8 +113,8 @@ def test_predicate_pins_league_and_both_seasons():
 
     assert "league = 'ENG-Premier League'" in mod.PREDICATE
     assert '2010' in mod.PREDICATE and '2015' in mod.PREDICATE
-    # 8 match-level + 9 season-level. The season-level ones matter: without them
-    # the next Silver run resurrects a phantom '1516' season in the profiles.
+    # 8 match-level + 9 season-level. The replacement methodology must start
+    # from Bronze without the phantom '1516' season.
     assert len(mod.TABLES) == 17
     assert 'fbref_player_stats' in mod.TABLES
     assert 'fbref_keeper_keeper' in mod.TABLES

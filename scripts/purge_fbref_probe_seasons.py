@@ -47,8 +47,9 @@ is logged before the first delete — recover with
 
     CALL iceberg.system.rollback_to_snapshot('bronze', '<table>', <snapshot_id>)
 
-After this script, re-run the FBref Silver transforms so `fbref_match_enriched`
-drops the 760 phantom fixtures.
+The legacy FBref Silver producer was retired in #1634. Existing
+`silver.fbref_*` tables are frozen historical snapshots and are not refreshed
+by this script; wait for the replacement methodology before rebuilding them.
 
 Run inside the airflow container (so it can talk to Trino on the docker
 network). Deleting rows is irreversible in practice, so --apply is required:
@@ -89,9 +90,8 @@ TABLES = [
     'fbref_match_keeper_stats',
     'fbref_match_team_stats',
     'fbref_match_officials',
-    # season-level — feed silver.fbref_{player,team}_season_profile /
-    # fbref_keeper_profile, which would otherwise gain a phantom '1516' season
-    # on the next Silver run.
+    # season-level — the legacy Silver snapshots are intentionally frozen;
+    # the replacement methodology must derive future outputs from clean Bronze.
     'fbref_player_stats',
     'fbref_player_shooting',
     'fbref_player_misc',

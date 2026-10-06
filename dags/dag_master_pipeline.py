@@ -13,7 +13,7 @@ must never be admitted before that control becomes ``isolated``.
 
 This DAG:
 1. Triggers non-FBref ingestion DAGs in sequence
-2. Waits for each plus the scheduled FBref source/Silver run to complete
+2. Waits for each plus the scheduled FBref Bronze run to complete
 3. Publishes xref, E3/E4, and Gold through a separate fail-closed path
 4. Validates overall pipeline success and logs a summary
 """
@@ -88,8 +88,8 @@ FOTMOB_OWNER_GATE_TASK_ID = (
 FOTMOB_OWNER_XCOM_KEY = 'fotmob_schedule_owner'
 
 # Publication evidence whose failure must make the current master DagRun fail.
-# The scheduled FBref chain (Bronze -> FBref Silver, sensed fail-closed) and the
-# separately triggered xref -> E3 -> Gold path form the published generation;
+# The scheduled FBref Bronze run (sensed fail-closed) and the separately
+# triggered xref -> E3 -> Gold path form the published generation;
 # accepting a failed child
 # as a successful trigger would publish a mixed generation and let the
 # terminal report turn green despite failed DQ.
@@ -619,16 +619,14 @@ with DAG(
 
     ### E1: Silver xref step
 
-    The scheduled FBref ingestion waits only for `dag_transform_fbref_silver`
-    and its FBref-local DQ. The master uses a fail-closed external-DAG sensor
-    for that source verdict, then separately launches and waits for
-    `dag_transform_xref`. Thus xref cannot race
-    `silver.fbref_player_identity`, while xref failures from other sources do
-    not affect the ingest/backfill/replay verdict.
+    The scheduled FBref ingestion now ends at its validated Bronze publication
+    scope. The legacy FBref Silver producer was retired in #1634. This master
+    DAG remains paused and must not be enabled until a replacement Silver
+    methodology defines a safe xref/Gold handoff.
 
     ### E3: Core event facts (Silver + Gold)
 
-    After the sensed FBref Silver run and master-owned xref finish,
+    After the sensed FBref Bronze run and master-owned xref finish,
     `dag_transform_e3` runs the E3
     medallion-redesign chain: Silver `whoscored_events_spadl` +
     `espn_lineup` → Gold `fct_event` / `fct_shot` / `fct_lineup` →
@@ -684,7 +682,7 @@ with DAG(
     - Scheduled FBref is sensed at the matching 06:00 logical date
     - Optional source failures are reported as degraded; a failed/partial
       WhoScored child blocks all downstream publication and fails the master
-    - FBref Silver, master-owned xref, Gold, and direct Gold prerequisites are
+    - FBref Bronze, master-owned xref, Gold, and direct Gold prerequisites are
       fail-closed
     - Final report is generated only after successful promotion
     - SoFIFA runs weekly (Sunday) and is not included here
@@ -850,8 +848,8 @@ with DAG(
     # FBref runs once per day on its own 06:00 schedule.  The master DAG's
     # 14:00 logical date is eight hours later, so execution_delta maps to the
     # exact same daily data interval without launching another paid crawl.
-    # Waiting for the whole external DAG proves Bronze plus FBref-only Silver
-    # DQ. The source may legally run for 18 hours from 06:00, leaving ten hours
+    # Waiting for the whole external DAG proves the FBref Bronze verdict.
+    # The source may legally run for 18 hours from 06:00, leaving ten hours
     # at the master's 14:00 start; two additional hours cover scheduler slack.
     # Cross-source xref is launched below and cannot affect source verdict.
     wait_for_scheduled_fbref = ExternalTaskSensor(
