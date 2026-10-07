@@ -1382,6 +1382,7 @@ def _event_records_for(
     away_gender: str = "M",
     home_gender: str = "M",
     incidents: bool = True,
+    jersey_number=None,
 ) -> dict:
     records = {}
     for endpoint in EVENT_PATHS:
@@ -1391,6 +1392,10 @@ def _event_records_for(
             payload["event"]["id"] = int(match_id)
             payload["event"]["homeTeam"]["gender"] = home_gender
             payload["event"]["awayTeam"]["gender"] = away_gender
+            body = json.dumps(payload).encode("utf-8")
+        if endpoint == "lineups" and jersey_number is not None:
+            payload = json.loads(body)
+            payload["home"]["players"][0]["jerseyNumber"] = jersey_number
             body = json.dumps(payload).encode("utf-8")
         if endpoint == "incidents" and not incidents:
             body = b'{"incidents":[]}'
@@ -1406,7 +1411,15 @@ def _event_records_for(
 
 
 def _match_batch_runtime(
-    tmp_path, match_ids, bad_match, *, women=False, incidents_only_bad=False
+    tmp_path,
+    match_ids,
+    bad_match,
+    *,
+    women=False,
+    incidents_only_bad=False,
+    bad_gender=True,
+    bad_jersey_number=None,
+    good_jersey_number=None,
 ):
     runtime, transport = _runtime(tmp_path)
     specs = {
@@ -1420,9 +1433,12 @@ def _match_batch_runtime(
         records.update(
             _event_records_for(
                 match_id,
-                away_gender="F" if bad else "M",
+                away_gender="F" if bad and bad_gender else "M",
                 home_gender="F" if bad and women else "M",
                 incidents=bad or not incidents_only_bad,
+                jersey_number=(
+                    bad_jersey_number if bad else good_jersey_number
+                ),
             )
         )
     ingest_prefetched_records(runtime, specs=specs, records=records)
@@ -1554,6 +1570,45 @@ def test_match_runner_rejects_one_bad_row_and_publishes_the_other_24_matches(
         held = runtime.manifest_store.get(specs[(bad_match, endpoint)].key)
         assert held.status == ManifestStatus.SCHEMA_ERROR
         assert held.error_type == "RowRejected"
+
+
+def test_match_runner_quarantines_fractional_jersey_and_publishes_integral_match(
+    tmp_path,
+    monkeypatch,
+):
+    good_match = "20000101"
+    bad_match = "20000102"
+    runtime, transport, specs = _match_batch_runtime(
+        tmp_path,
+        [good_match, bad_match],
+        bad_match,
+        bad_gender=False,
+        bad_jersey_number=".34",
+        good_jersey_number="34",
+    )
+
+    rc, result, saved, _ = _run_match_pass(
+        runtime,
+        [good_match, bad_match],
+        tmp_path / "fractional-jersey.json",
+        monkeypatch,
+    )
+
+    assert rc == 0, result["errors"]
+    assert transport.calls == 0
+    lineups = saved["sofascore_lineups"]["df"]
+    assert bad_match not in set(lineups["match_id"].astype(str))
+    assert set(lineups["match_id"].astype(str)) == {good_match}
+    assert lineups.loc[lineups["jersey_number"].notna(), "jersey_number"].tolist() == [
+        34.0
+    ]
+    rejected = saved["sofascore_rejected_rows"]["df"].iloc[0]
+    assert rejected["reason_code"] == "physical_type_mismatch"
+    assert json.loads(rejected["row_json"])["jersey_number"] == 0.34
+    assert (
+        runtime.manifest_store.get(specs[(bad_match, "lineups")].key).error_type
+        == "RowRejected"
+    )
 
 
 def test_match_runner_fresh_all_rejected_is_red_once_then_quarantined(

@@ -19,11 +19,28 @@ BEFORE = "5ab88ead5d77317f17dde11db8033d79501c6ebd0a48fd5b6eb60efc70ad24d3"
 AFTER = "a1d2d2dfa33b496ca891e0752560099ac0b99fef71146c67e4a1d7f09970e9c4"
 ROOT = Path("/root/dpf-whoscored-merge")
 STATE = Path("/root/watchdog/state")
-LOCKS = ("shared-writer-release.lock", "clubelo-auto-deliver.lock",
-         "understat-auto-deliver.lock", "whoscored-deliver.lock", "fotmob-auto-deliver.lock",
-         "sofascore-auto-deliver.lock", "transfermarkt-auto-deliver.lock")
-MARKERS = ("clubelo-inflight", "understat-inflight", "whoscored-inflight", "fotmob-b6-inflight",
-           "sofascore-inflight", "transfermarkt-inflight")
+SOFASCORE_STATE = Path("/root/sofascore-runtime/auto-deliver")
+TRANSFERMARKT_STATE = Path("/root/transfermarkt-runtime/auto-deliver")
+LOCK_PATHS = (
+    STATE / "shared-writer-release.lock",
+    STATE / "clubelo-auto-deliver.lock",
+    STATE / "understat-auto-deliver.lock",
+    STATE / "whoscored-deliver.lock",
+    STATE / "fotmob-auto-deliver.lock",
+    SOFASCORE_STATE / "sofascore-auto-deliver.lock",
+    TRANSFERMARKT_STATE / "transfermarkt-auto-deliver.lock",
+)
+MARKER_PATHS = (
+    STATE / "clubelo-inflight",
+    STATE / "understat-inflight",
+    STATE / "whoscored-inflight",
+    STATE / "fotmob-b6-inflight",
+    SOFASCORE_STATE / "sofascore-inflight",
+    TRANSFERMARKT_STATE / "transfermarkt-inflight",
+)
+# Names remain public for the filesystem-transaction test fixture.
+LOCKS = tuple(path.name for path in LOCK_PATHS)
+MARKERS = tuple(path.name for path in MARKER_PATHS)
 
 
 def require(condition, message):
@@ -177,21 +194,32 @@ def check_files(m, new):
     require(closure(Path(m["root"])) == expected(m, new), "runtime code/permissions drift")
 
 
+def guard_paths(state):
+    """Use real per-source state roots in production and one root in tests."""
+    state = safe_path(state)
+    if state == STATE:
+        return LOCK_PATHS, MARKER_PATHS
+    return (tuple(state / path.name for path in LOCK_PATHS),
+            tuple(state / path.name for path in MARKER_PATHS))
+
+
 @contextmanager
 def locks(state=STATE):
     state = safe_path(state)
+    lock_paths, marker_paths = guard_paths(state)
     handles = []
     try:
-        for name in sorted(LOCKS):
-            file = state / name
+        for file in sorted(lock_paths):
+            file = safe_path(file)
             flags = os.O_RDWR | os.O_NOFOLLOW
-            if name == "shared-writer-release.lock":
+            if file == STATE / "shared-writer-release.lock":
                 flags |= os.O_CREAT
             fd = os.open(file, flags, 0o600)
             handles.append(fd)
             regular(file)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        require(not any((state / p).exists() or (state / p).is_symlink() for p in MARKERS), "another delivery is inflight")
+        require(not any(path.exists() or path.is_symlink() for path in marker_paths),
+                "another delivery is inflight")
         yield
     finally:
         for fd in reversed(handles):

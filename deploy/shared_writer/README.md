@@ -70,7 +70,9 @@ No environment secrets are read or written into evidence.
 
    The runner fetches master and requires the payload commit to be merged and
    master still to contain this exact writer. It holds shared + six existing
-   source delivery flocks, refuses inflight markers, checks quiescence again,
+   source delivery flocks in their actual state roots (the common watchdog root
+   plus the SofaScore and Transfermarkt runtime roots), refuses inflight markers,
+   checks quiescence again,
    fsyncs a saved original/staged file and journal, then performs one atomic
    rename. Source locks are not removed or truncated. No restart is required by
    the rehearsed current images. Check actual configuration again if images move.

@@ -1,20 +1,20 @@
 name: WhoScored production CI
 
 on:
-  # The production contract crosses scraper, writer, schema, DAG utility,
-  # image, dependency and Compose boundaries.  Run on every PR so a shared
-  # dependency cannot silently bypass this gate through a fragile path list.
+  # Every PR keeps real DAG imports; image builds are an explicit release check.
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: whoscored-ci-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: whoscored-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   contract:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -81,7 +81,7 @@ jobs:
           echo "WHOSCORED_CI_SETUP_PYTHON=$python_bin" >> "$GITHUB_ENV"
           dirname "$python_bin" >> "$GITHUB_PATH"
 
-      - name: Fetch the exact pull-request merge without credentials
+      - name: Fetch the exact selected release revision without credentials
         env:
           GIT_CONFIG_GLOBAL: /dev/null
           GIT_CONFIG_NOSYSTEM: "1"
@@ -96,23 +96,17 @@ jobs:
           GIT_CONFIG_VALUE_3: ""
           GIT_CONFIG_KEY_4: filter.lfs.required
           GIT_CONFIG_VALUE_4: "false"
-          WHOSCORED_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          WHOSCORED_CI_MERGE_SHA: ${{ github.sha }}
-          WHOSCORED_CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          WHOSCORED_CI_HEAD_SHA: ${{ github.sha }}
         run: |
           [[ "$WHOSCORED_CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$WHOSCORED_CI_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$WHOSCORED_CI_PR_NUMBER" =~ ^[0-9]+$ ]]
           export GIT_LFS_SKIP_SMUDGE=1
           /usr/bin/git init .
           /usr/bin/git remote add origin \
             https://github.com/sergeykuznetsov1995/data-platform-football.git
           /usr/bin/git -c protocol.version=2 fetch --no-tags --depth=3 origin \
-            "+refs/pull/${WHOSCORED_CI_PR_NUMBER}/merge:refs/remotes/pull/${WHOSCORED_CI_PR_NUMBER}/merge"
-          /usr/bin/git checkout --detach \
-            "refs/remotes/pull/${WHOSCORED_CI_PR_NUMBER}/merge"
-          test "$(/usr/bin/git rev-parse HEAD)" = "$WHOSCORED_CI_MERGE_SHA"
-          test "$(/usr/bin/git rev-parse HEAD^2)" = "$WHOSCORED_CI_HEAD_SHA"
+            "$WHOSCORED_CI_HEAD_SHA"
+          /usr/bin/git checkout --detach FETCH_HEAD
+          test "$(/usr/bin/git rev-parse HEAD)" = "$WHOSCORED_CI_HEAD_SHA"
           test -z "$(/usr/bin/git config --local --get-regexp \
             '^(include|includeIf|http\..*\.extraheader|core\.hooksPath|filter\.)' \
             || true)"
@@ -141,12 +135,16 @@ jobs:
           # раннеров сойдётся.
           # v0.37.1: releases/download/v0.37.1/checksums.txt (linux-amd64);
           # annotated tag 363b7b08 -> commit 0b265a9f, runner ubuntu24/20260927.320.
+          # v0.37.2: releases/download/v0.37.2/checksums.txt (linux-amd64);
+          # annotated tag e74cfd1c -> commit 2d379c0c;
+          # runners ubuntu24/20261004.327.1 and ubuntu24/20261005.320.
           buildx_sha="$(sha256sum "$buildx_bin" | cut -d' ' -f1)"
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
+            982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_ver="$("$buildx_bin" version)"
@@ -155,6 +153,7 @@ jobs:
             "github.com/docker/buildx v0.36.1 1d8dde89b8aba914e05e45366770736fea1fd690") ;;
             "github.com/docker/buildx v0.37.0 ac30b249211430b85fb8f37b6e7154b5c47ba0b6") ;;
             "github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a") ;;
+            "github.com/docker/buildx v0.37.2 2d379c0c3f22da0d2759d132a0ec81ca949098f0") ;;
             *) echo "unpinned system buildx version: $buildx_ver" >&2; exit 1 ;;
           esac
           test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
@@ -180,6 +179,7 @@ jobs:
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
+            982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_ver="$("$buildx_exec" version)"
@@ -188,6 +188,7 @@ jobs:
             "github.com/docker/buildx v0.36.1 1d8dde89b8aba914e05e45366770736fea1fd690") ;;
             "github.com/docker/buildx v0.37.0 ac30b249211430b85fb8f37b6e7154b5c47ba0b6") ;;
             "github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a") ;;
+            "github.com/docker/buildx v0.37.2 2d379c0c3f22da0d2759d132a0ec81ca949098f0") ;;
             *) echo "unpinned system buildx version: $buildx_ver" >&2; exit 1 ;;
           esac
           test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
@@ -244,6 +245,7 @@ jobs:
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
+            982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -276,6 +278,7 @@ jobs:
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
+            982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -443,6 +446,7 @@ jobs:
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
+            982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -610,6 +614,7 @@ jobs:
             48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778) ;;
             ae43fa08c796b44efc86d7a63c55f73f7c35f3101188dea7bf93bcd6f99577ba) ;;
             9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b) ;;
+            982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548) ;;
             *) echo "unpinned system buildx sha256: $buildx_sha" >&2; exit 1 ;;
           esac
           buildx_build() {
@@ -1130,7 +1135,7 @@ jobs:
             ready-v1)
               provenance_mode=(
                 --expect-ready-build
-                --release-revision "${{ github.event.pull_request.head.sha }}"
+                --release-revision "${{ github.sha }}"
               )
               ;;
             *) echo "unsupported provenance state: $provenance_status" >&2; exit 78 ;;
@@ -1182,6 +1187,11 @@ jobs:
         # 2.11.2 is the pinned production image; 2.7.3 remains a supported
         # backward-compatibility parser check for existing metadata upgrades.
         airflow-version: ["2.7.3", "2.11.2"]
+        include:
+          - airflow-version: "2.7.3"
+            image: apache/airflow:2.7.3-python3.11@sha256:a8c67ae095c03868e56c2d95c9a57a1b9a47e87247d923e329cb7c15e6d47ee5
+          - airflow-version: "2.11.2"
+            image: apache/airflow:2.11.2-python3.11@sha256:aac8468234dfa802c5ac4d6318bbf3b620793b55569ac230f584dc3c1f0ca49d
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -1190,13 +1200,17 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: docker/images/airflow/requirements-ci-dag-import-${{ matrix.airflow-version }}.lock
 
-      - name: Build the immutable Airflow parser runtime
+      - name: Download the locked Airflow parser wheel delta
+        env:
+          AIRFLOW_VERSION: ${{ matrix.airflow-version }}
         run: |
-          docker build \
-            --file "docker/images/airflow/Dockerfile.ci-dag-import-${{ matrix.airflow-version }}" \
-            --tag "whoscored-airflow-import:${{ matrix.airflow-version }}" \
-            docker/images/airflow
+          python -m pip download \
+            --no-deps --require-hashes --only-binary=:all: \
+            --dest "${RUNNER_TEMP}/airflow-wheels" \
+            -r "docker/images/airflow/requirements-ci-dag-import-${AIRFLOW_VERSION}.lock"
 
       - name: Stage production WhoScored DAGs
         run: |
@@ -1213,6 +1227,9 @@ jobs:
           done
 
       - name: Check real Airflow DAG imports
+        env:
+          AIRFLOW_IMAGE: ${{ matrix.image }}
+          AIRFLOW_VERSION: ${{ matrix.airflow-version }}
         run: |
           pointer_parent="$(mktemp -d /tmp/whoscored-airflow-pointer.XXXXXXXX)"
           [[ "$pointer_parent" =~ ^/tmp/whoscored-airflow-pointer\.[A-Za-z0-9]{8}$ ]]
@@ -1237,6 +1254,13 @@ jobs:
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+            --tmpfs /home/airflow/.local/lib/python3.11/site-packages/ci-delta:rw,nosuid,nodev,uid=50000,gid=0,mode=0700 \
+            -e AIRFLOW_VERSION \
+            -e PYTHONUSERBASE=/home/airflow/.local \
+            -e PIP_USER=false \
+            -e PIP_TARGET=/home/airflow/.local/lib/python3.11/site-packages/ci-delta \
+            -e PIP_NO_INDEX=1 \
+            -e PIP_FIND_LINKS=/ci-wheels \
             -e HOME=/tmp/home \
             -e AIRFLOW_HOME=/tmp/airflow \
             -e AIRFLOW__CORE__LOAD_EXAMPLES=False \
@@ -1246,7 +1270,30 @@ jobs:
             -e WHOSCORED_SCHEDULED_PAID_POINTER_ROOT=/tmp/whoscored-scheduled-pointers \
             -e PYTHONPATH=/workspace:/workspace/dags \
             -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${RUNNER_TEMP}/airflow-wheels:/ci-wheels:ro" \
             -v "${pointer_root}:/tmp/whoscored-scheduled-pointers:ro" \
+            --workdir /workspace \
             --entrypoint /bin/bash \
-            "whoscored-airflow-import:${{ matrix.airflow-version }}" \
-            -euc 'mkdir -p "$HOME" "$AIRFLOW_HOME"; airflow db migrate; airflow dags list-import-errors; python /workspace/scripts/ci/check_whoscored_dag_imports.py'
+            "$AIRFLOW_IMAGE" \
+            -euc '
+              mkdir -p "$HOME" "$AIRFLOW_HOME"
+              case "$AIRFLOW_VERSION" in
+                2.7.3)
+                  python -m pip install \
+                    --no-deps --require-hashes --only-binary=:all: \
+                    -r docker/images/airflow/requirements-ci-dag-import-2.7.3.lock
+                  ;;
+                2.11.2)
+                  python -m pip install \
+                    --no-deps --require-hashes --only-binary=:all: \
+                    -r docker/images/airflow/requirements-ci-dag-import-2.11.2.lock
+                  ;;
+                *) exit 1 ;;
+              esac
+              export PYTHONPATH="/home/airflow/.local/lib/python3.11/site-packages/ci-delta:$PYTHONPATH"
+              python -m pip check
+              test "$(airflow version)" = "$AIRFLOW_VERSION"
+              airflow db migrate
+              airflow dags list-import-errors
+              python /workspace/scripts/ci/check_whoscored_dag_imports.py
+            '

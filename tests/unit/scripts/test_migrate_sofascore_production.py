@@ -97,6 +97,12 @@ class FakeManager:
     def get_table_columns(self, schema, table):
         return dict(self.tables[(schema, table)]["columns"])
 
+    def add_column(self, schema, table, column, column_type):
+        self._execute(
+            f"ALTER TABLE {self.catalog}.{schema}.{table} "
+            f'ADD COLUMN IF NOT EXISTS "{column}" {column_type}'
+        )
+
     def _execute(self, sql, fetch=False, params=None):
         assert params is None
         self.executed.append(sql)
@@ -104,7 +110,8 @@ class FakeManager:
             for table in BOOTSTRAP_TABLES:
                 qualified = f"{self.catalog}.{table.schema}.{table.name}"
                 if sql.startswith(f"CREATE TABLE IF NOT EXISTS {qualified} "):
-                    self._install(table)
+                    if not self.table_exists(table.schema, table.name):
+                        self._install(table)
                     break
         if sql.startswith("COMMENT ON TABLE"):
             for table in BOOTSTRAP_TABLES:
@@ -121,7 +128,14 @@ class FakeManager:
                         f" COMMENT '{migration.comment}'"
                     )
                     break
-        if sql.startswith("ALTER TABLE") and "ADD COLUMN" in sql:
+        if sql.startswith(
+            "ALTER TABLE "
+            f"{self.catalog}.bronze.sofascore_lineups ADD COLUMN IF NOT EXISTS"
+        ):
+            self.tables[("bronze", "sofascore_lineups")]["columns"]["jersey_number"] = (
+                "bigint"
+            )
+        elif sql.startswith("ALTER TABLE") and "ADD COLUMN" in sql:
             self.tables[("bronze", LEGACY_MATCH_STATS.name)]["columns"][
                 "statistic_key"
             ] = "varchar"
@@ -155,6 +169,22 @@ class FakeManager:
 
     def close(self):
         self.closed = True
+
+
+class CachingFakeManager(FakeManager):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._column_cache = {}
+
+    def get_table_columns(self, schema, table):
+        key = (schema, table)
+        if key not in self._column_cache:
+            self._column_cache[key] = super().get_table_columns(schema, table)
+        return dict(self._column_cache[key])
+
+    def add_column(self, schema, table, column, column_type):
+        self._column_cache.pop((schema, table), None)
+        super().add_column(schema, table, column, column_type)
 
 
 def _payload(endpoint: str) -> object:
@@ -281,6 +311,34 @@ def test_preflight_rejects_type_partition_and_comment_drift():
     assert event["natural_key_comment_ok"] is False
 
 
+def test_lineups_bootstrap_and_preflight_require_bigint_jersey_number():
+    declared = {column.name: column.sql_type for column in SOFASCORE_LINEUPS.columns}
+    assert declared["jersey_number"] == "bigint"
+
+    manager = FakeManager(ready=True)
+    key = ("bronze", "sofascore_lineups")
+    manager.tables[key]["columns"].pop("jersey_number", None)
+    missing = preflight(manager)
+    lineups = next(
+        item
+        for item in missing["tables"]
+        if item["table"] == "bronze.sofascore_lineups"
+    )
+    assert lineups["missing_columns"] == ["jersey_number"]
+
+    manager.tables[key]["columns"]["jersey_number"] = "varchar"
+    mismatched = preflight(manager)
+    lineups = next(
+        item
+        for item in mismatched["tables"]
+        if item["table"] == "bronze.sofascore_lineups"
+    )
+    assert lineups["type_mismatches"]["jersey_number"] == {
+        "expected": "bigint",
+        "observed": "varchar",
+    }
+
+
 def test_legacy_migration_backfills_exact_keys_and_atomically_deduplicates():
     manager = FakeManager(legacy=True)
     actions = apply_legacy_migrations(manager)
@@ -360,6 +418,45 @@ def test_apply_is_idempotent_and_uses_only_create_or_comment_ddl():
     )
 
 
+def test_apply_adds_missing_lineups_jersey_number_once_and_is_idempotent():
+    manager = CachingFakeManager(ready=True)
+    manager.tables[("bronze", "sofascore_lineups")]["columns"].pop(
+        "jersey_number", None
+    )
+
+    first = apply_bootstrap(manager)
+    first_statements = tuple(manager.executed)
+    second = apply_bootstrap(manager)
+    second_statements = tuple(manager.executed[len(first_statements) :])
+    expected = (
+        "ALTER TABLE iceberg.bronze.sofascore_lineups "
+        'ADD COLUMN IF NOT EXISTS "jersey_number" bigint'
+    )
+
+    assert first["ready"] is True
+    assert second["ready"] is True
+    assert first_statements.count(expected) == 1
+    assert expected not in second_statements
+
+
+def test_apply_does_not_rewrite_wrong_lineups_jersey_number_type():
+    manager = FakeManager(ready=True)
+    manager.tables[("bronze", "sofascore_lineups")]["columns"]["jersey_number"] = (
+        "varchar"
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="bootstrap preflight failed after apply: bronze.sofascore_lineups",
+    ):
+        apply_bootstrap(manager)
+
+    assert not any(
+        statement.startswith("ALTER TABLE iceberg.bronze.sofascore_lineups")
+        for statement in manager.executed
+    )
+
+
 def test_cli_defaults_to_connection_free_dry_run(capsys):
     def forbidden_factory(**kwargs):
         raise AssertionError(f"dry-run opened Trino: {kwargs}")
@@ -369,6 +466,18 @@ def test_cli_defaults_to_connection_free_dry_run(capsys):
     assert report["mode"] == "dry_run"
     assert report["mutates"] is False
     assert len(report["tables"]) == len(BOOTSTRAP_TABLES)
+    assert report["additive_migrations"] == [
+        {
+            "column": "jersey_number",
+            "sql": (
+                "ALTER TABLE iceberg.bronze.sofascore_lineups "
+                'ADD COLUMN IF NOT EXISTS "jersey_number" bigint'
+            ),
+            "table": "bronze.sofascore_lineups",
+            "type": "bigint",
+            "when": "column_absent",
+        }
+    ]
 
 
 def test_cli_preflight_returns_two_when_migration_is_required(capsys):

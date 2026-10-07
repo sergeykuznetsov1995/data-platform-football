@@ -2937,18 +2937,16 @@ class WhoScoredTransport:
         """Swap the sticky pool member for a different one (#1476).
 
         Exclusions belong to one recovery operation and never leave memory.
-        Returns ``False`` after a bounded search without an eligible member.
+        Returns ``False`` when no eligible member remains.
         """
         manager = self._pool_manager
         if manager is None:
             return False
         current = self._pool_proxy_url
-        replacement: Optional[str] = None
-        for _ in range(max(1, int(manager.total_count)) * 4):
-            candidate = manager.get_http_proxy_url()
-            if candidate and candidate != current and candidate not in (excluded or set()):
-                replacement = candidate
-                break
+        excluded_urls = set(excluded or ())
+        if current is not None:
+            excluded_urls.add(current)
+        replacement = manager.get_http_proxy_url(excluded_http_urls=excluded_urls)
         if replacement is None:
             return False
         previous = self._direct_http
