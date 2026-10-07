@@ -1,8 +1,13 @@
 """Static contracts for the dedicated WhoScored production CI workflow."""
 
 from pathlib import Path
+import os
+import ast
+from types import SimpleNamespace
 import re
 import subprocess
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -19,12 +24,97 @@ def test_contract_timeout_leaves_room_after_bounded_spark_download() -> None:
     assert "timeout-minutes: 150" in contract_header
 
 
-def test_every_pull_request_runs_the_cross_boundary_contract():
-    text = _workflow_text()
-    trigger = text.split("permissions:", 1)[0]
+def test_pull_requests_keep_imports_but_image_builds_require_manual_dispatch():
+    workflow = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
+    assert set(workflow["on"]) == {"pull_request", "workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read"}
+    assert workflow["jobs"]["contract"]["if"] == (
+        "${{ github.event_name == 'workflow_dispatch' }}"
+    )
+    imports = workflow["jobs"]["real-airflow-dag-import"]
+    assert "if" not in imports
+    assert "needs" not in imports
+    # All build operations, including wrappers and build actions, must be
+    # confined to the manual job. PR imports cannot depend on that job.
+    for name, job in workflow["jobs"].items():
+        if name == "contract":
+            continue
+        for step in job["steps"]:
+            assert not re.search(r"docker\s+(?:build|buildx)|buildx_build", step.get("run", ""))
+            assert "build-push-action" not in step.get("uses", "")
+    concurrency = workflow["concurrency"]
+    assert "github.event_name" in concurrency["group"]
+    assert "github.ref" in concurrency["group"]
+    assert concurrency["cancel-in-progress"] == (
+        "${{ github.event_name == 'pull_request' }}"
+    )
 
-    assert "pull_request:" in trigger
-    assert "paths:" not in trigger
+
+def test_manual_contract_fetches_and_checks_the_selected_revision():
+    workflow = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
+    checkout = next(
+        step for step in workflow["jobs"]["contract"]["steps"]
+        if step["name"] == "Fetch the exact selected release revision without credentials"
+    )
+    assert checkout["env"]["WHOSCORED_CI_HEAD_SHA"] == "${{ github.sha }}"
+    assert re.search(r'fetch --no-tags --depth=3 origin\s+\\\s+"\$WHOSCORED_CI_HEAD_SHA"', checkout["run"])
+    assert 'checkout --detach FETCH_HEAD' in checkout["run"]
+    assert 'test "$(/usr/bin/git rev-parse HEAD)" = "$WHOSCORED_CI_HEAD_SHA"' in checkout["run"]
+    assert "github.event.pull_request" not in _workflow_text().split("  real-airflow-dag-import:", 1)[0].split("jobs:", 1)[1]
+
+
+def test_release_checkout_uses_exact_sha_even_after_branch_moves(tmp_path):
+    workflow = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
+    checkout = next(
+        step for step in workflow["jobs"]["contract"]["steps"]
+        if step["name"] == "Fetch the exact selected release revision without credentials"
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        return subprocess.check_output(
+            ["/usr/bin/git", *args], cwd=source, text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+
+    git("init")
+    git("config", "user.name", "CI test")
+    git("config", "user.email", "ci@example.invalid")
+    git("commit", "--allow-empty", "-m", "reviewed release")
+    reviewed_sha = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-m", "later change")
+    later_sha = git("rev-parse", "HEAD")
+    assert reviewed_sha != later_sha
+
+    destination = tmp_path / "checkout"
+    destination.mkdir()
+    script = checkout["run"].replace(
+        "https://github.com/sergeykuznetsov1995/data-platform-football.git",
+        source.as_uri(),
+    )
+    environment = {
+        **os.environ, **checkout["env"],
+        "WHOSCORED_CI_HEAD_SHA": reviewed_sha,
+    }
+    result = subprocess.run(
+        ["bash", "-euc", script], cwd=destination, env=environment,
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert subprocess.check_output(
+        ["/usr/bin/git", "rev-parse", "HEAD"], cwd=destination, text=True,
+    ).strip() == reviewed_sha
+
+    invalid_destination = tmp_path / "invalid-checkout"
+    invalid_destination.mkdir()
+    result = subprocess.run(
+        ["bash", "-euc", script], cwd=invalid_destination,
+        env={**environment, "WHOSCORED_CI_HEAD_SHA": "not-a-sha"},
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert not (invalid_destination / ".git").exists()
 
 
 def test_real_airflow_211_import_gate_is_not_a_stub_only_test():
@@ -35,8 +125,27 @@ def test_real_airflow_211_import_gate_is_not_a_stub_only_test():
     ).read_text(encoding="utf-8")
 
     assert 'airflow-version: ["2.7.3", "2.11.2"]' in text
-    assert "Dockerfile.ci-dag-import-${{ matrix.airflow-version }}" in text
-    assert "docker build" in text
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    matrix = workflow["jobs"]["real-airflow-dag-import"]["strategy"]["matrix"]
+    for entry in matrix["include"]:
+        version = entry["airflow-version"]
+        dockerfile = ROOT / f"docker/images/airflow/Dockerfile.ci-dag-import-{version}"
+        expected_image = dockerfile.read_text().splitlines()[0].split()[1]
+        assert entry["image"] == expected_image
+    assert "pip download" in job
+    assert "--no-deps --require-hashes --only-binary=:all:" in job
+    assert "-e PIP_NO_INDEX=1" in job
+    assert "-e PIP_FIND_LINKS=/ci-wheels" in job
+    assert "-e PIP_TARGET=/home/airflow/.local/lib/python3.11/site-packages/ci-delta" in job
+    assert "--workdir /workspace" in job
+    for version in matrix["airflow-version"]:
+        assert f"-r docker/images/airflow/requirements-ci-dag-import-{version}.lock" in job
+    assert "-e PYTHONUSERBASE=/home/airflow/.local" in job
+    assert "-e PIP_USER=false" in job
+    assert 'export PYTHONPATH="/home/airflow/.local/lib/python3.11/site-packages/ci-delta:$PYTHONPATH"' in job
+    assert '"${RUNNER_TEMP}/airflow-wheels:/ci-wheels:ro"' in job
+    assert "python -m pip check" in job
+    assert 'test "$(airflow version)" = "$AIRFLOW_VERSION"' in job
     assert "--read-only" in job
     assert "--network none" in job
     assert "--cap-drop ALL" in job
@@ -58,6 +167,39 @@ def test_real_airflow_211_import_gate_is_not_a_stub_only_test():
     ):
         assert dag_id in text
         assert dag_id in checker
+
+
+
+def test_parser_wheel_delta_survives_the_real_runtime_import_path_filter():
+    text = _workflow_text().split("  real-airflow-dag-import:", 1)[1]
+    target = re.search(r"-e PIP_TARGET=([^\s]+)", text).group(1)
+    assert f'export PYTHONPATH="{target}:$PYTHONPATH"' in text
+    assert f"--tmpfs {target}:rw,nosuid,nodev,uid=50000,gid=0,mode=0700" in text
+    # Execute the actual startup path filter with the parser's Python layout.
+    # It must preserve installed wheels while rejecting unrelated overlay roots.
+    startup = ROOT / "docker/images/airflow/whoscored_runtime_startup.py"
+    tree = ast.parse(startup.read_text())
+    definitions = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef)
+        and node.name in {"_validated_image_site_directory", "_trusted_python_paths"}
+    ]
+    fake_sys = SimpleNamespace(
+        version_info=SimpleNamespace(major=3, minor=11),
+        base_prefix="/usr/local", prefix="/usr/local", exec_prefix="/usr/local",
+        path=[target, "/workspace", "/workspace/dags", "/opt/untrusted-overlay",
+              "/usr/local/lib/python311.zip", "/usr/local/lib/python3.11",
+              "/usr/local/lib/python3.11/lib-dynload",
+              "/home/airflow/.local/lib/python3.11/site-packages"],
+    )
+    namespace = {
+        "_STARTUP_SYS": fake_sys, "_STARTUP_REQUIRE_FULL": False,
+        "_STARTUP_ENFORCE_TRUST_OWNERSHIP": True,
+    }
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(startup), "exec"), namespace)
+    filtered = namespace["_trusted_python_paths"]("/workspace")
+    assert target in filtered
+    assert "/opt/untrusted-overlay" not in filtered
+    assert filtered.index(target) < filtered.index("/workspace") < filtered.index("/workspace/dags")
 
 
 def test_ci_builds_auxiliary_python_images_from_their_locked_dockerfiles():
@@ -195,7 +337,7 @@ def test_ci_isolates_root_only_contracts_from_the_host_runner():
     assert "WHOSCORED_CI_PYTHON_PREFIX=$setup_python_prefix" in install_step
     assert "--require-hashes --only-binary=:all:" in install_step
     assert '-r .github/workflows/whoscored-test.lock' in install_step
-    assert text.count("-m pip install \\") == 1
+    assert text.split("  real-airflow-dag-import:", 1)[0].count("-m pip install \\") == 1
 
 
 def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
@@ -310,7 +452,7 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     )
     assert "BASH_ENV: /dev/null" in text
     assert "uses:" not in contract_job
-    assert "refs/pull/${WHOSCORED_CI_PR_NUMBER}/merge" in contract_job
+    assert 'checkout --detach FETCH_HEAD' in contract_job
     assert "fetch --no-tags --depth=3 origin" in contract_job
     assert "GIT_CONFIG_NOSYSTEM: \"1\"" in contract_job
     assert "filter.lfs.process" in contract_job
@@ -360,9 +502,9 @@ def test_ci_proves_both_production_targets_match_declared_evidence_state():
     assert "--expect-blocked" in text
     assert "--expect-ready-build" in text
     assert "--release-revision" in text
-    assert "github.event.pull_request.head.sha" in text
-    assert '"refs/remotes/pull/${WHOSCORED_CI_PR_NUMBER}/merge"' in text
-    assert "/usr/bin/git rev-parse HEAD^2" in text
+    assert '--release-revision "${{ github.sha }}"' in text
+    assert 'WHOSCORED_CI_HEAD_SHA: ${{ github.sha }}' in text
+    assert '/usr/bin/git rev-parse HEAD)' in text
     assert 'case "$provenance_status" in' in text
     assert "blocked-v1)" in text
     assert "ready-v1)" in text
