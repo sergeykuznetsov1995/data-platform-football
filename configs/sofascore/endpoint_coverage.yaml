@@ -244,6 +244,8 @@ tables:
     allowed_values:
       team_side: [home, away]
       participation_status: [starter, substitute_used, unused_substitute]
+    column_types:
+      jersey_number: bigint
     partition_columns: [league, season]
     materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
     production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
