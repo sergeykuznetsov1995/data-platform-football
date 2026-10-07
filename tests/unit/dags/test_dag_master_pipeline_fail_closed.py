@@ -523,7 +523,7 @@ def test_master_xref_failure_blocks_e3_and_gold_without_changing_source_verdict(
 
 
 @pytest.mark.parametrize("state", ["failed", "upstream_failed", "skipped", "none"])
-def test_fbref_silver_publication_rejects_every_non_success_state(state):
+def test_fbref_bronze_publication_rejects_every_non_success_state(state):
     module = _reload_master()
     from airflow.exceptions import AirflowException
 
@@ -541,7 +541,7 @@ def test_fbref_silver_publication_rejects_every_non_success_state(state):
         module.enforce_required_publication_success(dag_run=run)
 
 
-def test_fbref_silver_publication_rejects_missing_current_run_evidence():
+def test_fbref_bronze_publication_rejects_missing_current_run_evidence():
     module = _reload_master()
     from airflow.exceptions import AirflowException
 

@@ -130,13 +130,13 @@ jobs:
 
           root = Path.cwd()
           expected = {
-              "dag_ingest_fbref": (root / "dags/dag_ingest_fbref.py", 16),
+              "dag_ingest_fbref": (root / "dags/dag_ingest_fbref.py", 15),
               "dag_bootstrap_fbref": (
                   root / "dags/dag_bootstrap_fbref.py",
                   11,
               ),
-              "dag_backfill_fbref": (root / "dags/dag_backfill_fbref.py", 18),
-              "dag_replay_fbref": (root / "dags/dag_replay_fbref.py", 10),
+              "dag_backfill_fbref": (root / "dags/dag_backfill_fbref.py", 17),
+              "dag_replay_fbref": (root / "dags/dag_replay_fbref.py", 9),
               "dag_accept_fbref_bronze": (
                   root / "dags/dag_accept_fbref_bronze.py",
                   9,

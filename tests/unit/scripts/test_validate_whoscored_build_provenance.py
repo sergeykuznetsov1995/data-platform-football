@@ -67,6 +67,20 @@ BOUNDED_CURL_FLAGS = (
     "--connect-timeout 20 --speed-limit 1024 --speed-time 60 "
     "--max-time 3600 -fsSL"
 )
+RESUMABLE_CURL_FLAGS = (
+    "--proto '=https' --tlsv1.2 --proto-redir '=https' "
+    "--connect-timeout 20 --speed-limit 1024 --speed-time 60 "
+    "--max-time 1500 --continue-at - -fsSL"
+)
+RESUMABLE_FETCH = (
+    f"curl {RESUMABLE_CURL_FLAGS} {SNAPSHOT_RELEASE_URL} -o /tmp/Release"
+)
+RESUMABLE_DOWNLOAD_RUN = (
+    " || ".join([RESUMABLE_FETCH] * 4)
+    + f' && echo "{SHA_B}  /tmp/Release" | sha256sum -c -'
+    + ' && test "$(stat -c %s /tmp/Release)" -eq 1234'
+)
+
 
 def _write(path: Path, value: str | bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +138,7 @@ def test_paid_boundary_protects_five_services_with_shared_payload_mappings():
         "whoscored_paid_gateway"
     ] == provenance.PROTECTED_STAGE_RECIPE_SHA256["whoscored_proxy_filter"]
     assert provenance.PROTECTED_STAGE_RECIPE_SHA256["airflow-scheduler"] == (
-        "f784ae95f5ac83d33cd52866e81a406a23cdb65fbdad3912168cd3ed85cabe6d"
+        "5d5ba8352020aab6a2eb37335908f8f65180ccb7b7de5861d77c36e6a002e901"
     )
 
 
@@ -1206,6 +1220,60 @@ def test_download_receipt_rejects_relaxed_bounded_curl_flags(
         f"curl {BOUNDED_CURL_FLAGS.replace(bounded_flag, unsafe_value)}",
         1,
     )
+
+    assert provenance._canonical_fetch_receipt(command, "curl") is False
+
+
+def test_download_receipt_accepts_four_separate_resumable_fetches() -> None:
+    assert provenance._canonical_fetch_receipt(RESUMABLE_DOWNLOAD_RUN, "curl") is True
+
+
+def test_resumable_download_is_recorded_as_one_verified_artifact() -> None:
+    discovery = provenance._empty_discovery(ROOT, COMMIT)
+
+    records = provenance._scan_downloads(
+        "Dockerfile", 1, RESUMABLE_DOWNLOAD_RUN, discovery
+    )
+
+    assert discovery.issues == []
+    assert len(records) == 1
+    assert len(discovery.records["downloaded_artifacts"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("strict_flag", "unsafe_value"),
+    [
+        ("--max-time 1500", "--max-time 0"),
+        ("--continue-at -", "--continue-at 0"),
+    ],
+)
+def test_download_receipt_rejects_changed_resumable_curl_flags(
+    strict_flag: str, unsafe_value: str
+) -> None:
+    command = RESUMABLE_DOWNLOAD_RUN.replace(strict_flag, unsafe_value)
+
+    assert provenance._canonical_fetch_receipt(command, "curl") is False
+
+
+def test_download_receipt_rejects_fewer_resumable_attempts() -> None:
+    command = RESUMABLE_DOWNLOAD_RUN.replace(f" || {RESUMABLE_FETCH}", "", 1)
+
+    assert provenance._canonical_fetch_receipt(command, "curl") is False
+
+
+def test_download_receipt_rejects_extra_resumable_attempts() -> None:
+    command = RESUMABLE_DOWNLOAD_RUN.replace(
+        " && echo", f" || {RESUMABLE_FETCH} && echo", 1
+    )
+
+    assert provenance._canonical_fetch_receipt(command, "curl") is False
+
+
+def test_download_receipt_rejects_changed_middle_resumable_attempt() -> None:
+    changed_fetch = RESUMABLE_FETCH.replace("--max-time 1500", "--max-time 1499")
+    command = " || ".join(
+        [RESUMABLE_FETCH, RESUMABLE_FETCH, changed_fetch, RESUMABLE_FETCH]
+    ) + RESUMABLE_DOWNLOAD_RUN.split(RESUMABLE_FETCH, 4)[-1]
 
     assert provenance._canonical_fetch_receipt(command, "curl") is False
 

@@ -104,7 +104,7 @@ class TestFBrefBackfillTopology:
         module, tasks = loaded_dag
         assert module.BACKFILL_MAX_BATCHES == 80
         assert module.BACKFILL_REQUEST_LIMIT == 4096
-        assert len(tasks) == 18
+        assert len(tasks) == 17
         assert tasks["initialize_run"].downstream_task_ids == {
             "validate_current_scope_freshness_preflight"
         }
@@ -157,7 +157,7 @@ class TestFBrefBackfillTopology:
             for task_id in tasks
         )
 
-    def test_validation_is_fail_closed_before_silver(self, loaded_dag):
+    def test_validation_is_fail_closed_before_publication_release(self, loaded_dag):
         module, tasks = loaded_dag
         assert all(
             task._captured_kwargs.get("trigger_rule") == "all_success"
@@ -182,7 +182,6 @@ class TestFBrefBackfillTopology:
             "export_publication_scope",
             "release_publication_lock",
         }
-        # #1324: lock released after export; Silver after the lock, unawaited.
         assert tasks["export_publication_scope"].downstream_task_ids == {
             "release_publication_lock",
         }
@@ -191,22 +190,11 @@ class TestFBrefBackfillTopology:
             "choose_publication_path",
             "export_publication_scope",
         }
-        assert type(release) is type(tasks["choose_publication_path"])
+        assert type(release) is not type(tasks["choose_publication_path"])
         assert release.python_callable.__name__ == (
-            "finalize_fbref_publication_lock_and_route_silver"
+            "finalize_fbref_publication_lock"
         )
-        trigger = tasks["trigger_silver_transform"]
-        assert trigger.upstream_task_ids == {"release_publication_lock"}
-        assert trigger._captured_kwargs["wait_for_completion"] is False
-        assert (
-            trigger._captured_kwargs["execution_timeout"].total_seconds()
-            == 10 * 60
-        )
-        assert trigger._captured_kwargs["retries"] == 0
-        assert trigger._captured_kwargs["reset_dag_run"] is False
-        assert trigger._captured_kwargs["execution_date"] == "{{ ti.start_date }}"
-        assert trigger._captured_kwargs["conf"]["trigger_xref"] is False
-        assert trigger.downstream_task_ids == set()
+        assert release.downstream_task_ids == set()
 
     def test_raw_recovery_drains_before_the_historical_seed(self, loaded_dag):
         """A seeded season must never be judged on raw the seed itself unhid.

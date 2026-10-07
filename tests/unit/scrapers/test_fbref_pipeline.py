@@ -972,6 +972,7 @@ class FakeControl:
                 "name": entry.name,
                 "gender": entry.gender,
                 "classification": entry.classification,
+                "crawl_state": entry.crawl_state,
                 "metadata": dict(entry.metadata),
                 "last_snapshot_id": snapshot_id,
             }
@@ -998,7 +999,9 @@ class FakeControl:
             metadata["current_season_index"] = evidence
             row["last_snapshot_id"] = evidence["snapshot_id"]
         return [
-            row for row in self.registry.values() if row["gender"] == "male"
+            row for row in self.registry.values()
+            if row["gender"] == "male"
+            and row.get("crawl_state", "active") == "active"
         ]
 
     def reconcile_seasons(self, snapshot_id, competition_id, entries):
@@ -4684,6 +4687,12 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
     <h2>Domestic Leagues</h2><table id="comps"><tbody>
       <tr><td data-stat="gender">M</td><th><a href="/en/comps/9/history/Premier-League-Seasons">Premier League</a></th>
         <td data-stat="maxseason"><a href="/en/comps/9/Premier-League-Stats">2026-2027</a></td></tr>
+      <tr><td data-stat="gender">M</td><th><a href="/en/comps/68/history/Discontinued-League-Seasons">Discontinued League</a></th>
+        <td data-stat="maxseason"><a href="/en/comps/68/2009/Discontinued-League-Stats">2009</a></td></tr>
+      <tr><td data-stat="gender">M</td><th><a href="/en/comps/76/history/Discontinued-League-Two-Seasons">Discontinued League Two</a></th>
+        <td data-stat="maxseason"><a href="/en/comps/76/2017/Discontinued-League-Two-Stats">2017</a></td></tr>
+      <tr><td data-stat="gender">M</td><th><a href="/en/comps/79/history/Discontinued-League-Three-Seasons">Discontinued League Three</a></th>
+        <td data-stat="maxseason"><a href="/en/comps/79/2010/Discontinued-League-Three-Stats">2010</a></td></tr>
       <tr><td data-stat="gender">F</td><th><a href="/en/comps/189/history/Womens-Super-League-Seasons">Women's Super League</a></th></tr>
       <tr><td data-stat="gender">?</td><th><a href="/en/comps/x/history/Unknown-Seasons">Unknown Cup</a></th></tr>
     </tbody></table>
@@ -4720,7 +4729,7 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
 
     assert result.parsed == 1
     assert result.seeded == 1
-    assert result.skipped_ineligible == 2
+    assert result.skipped_ineligible == 5
     child_kinds = [
         row["page_kind"] for key, row in control.frontier.items()
         if key != "fbref:competition_index:all"
@@ -4738,6 +4747,19 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
     assert control.registry["9"]["metadata"][
         "advertised_current_season_id"
     ] == "2026-2027"
+    for competition_id, reason in {
+        "68": "last_source_season_2009",
+        "76": "last_source_season_2017",
+        "79": "last_source_season_2010",
+    }.items():
+        assert control.registry[competition_id]["crawl_state"] == "skipped"
+        assert control.registry[competition_id]["metadata"][
+            "current_scope_lifecycle"
+        ] == "discontinued"
+        assert control.registry[competition_id]["metadata"][
+            "current_scope_reason"
+        ] == reason
+        assert f"fbref:competition:{competition_id}" not in control.frontier
     index_evidence = control.registry["9"]["metadata"][
         "current_season_index"
     ]

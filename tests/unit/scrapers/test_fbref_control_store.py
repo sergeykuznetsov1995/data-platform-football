@@ -1344,16 +1344,19 @@ def test_recurring_frontier_policy_dominates_one_shot_and_requeues_upgrade():
 
 
 def test_upsert_supersedes_quarantined_canonical_url_squatter():
-    # A quarantined, mis-classified target holding a canonical URL must not
+    # A skipped or quarantined, mis-classified target holding a canonical URL
+    # must not
     # permanently block the correctly classified target from claiming it
     # (the #949 /stats/ player-standard mis-mint).  The URL is released onto a
     # dead sentinel; append-only provenance is never deleted.
     source = inspect.getsource(ControlStore.upsert_frontier_target)
 
-    assert 'str(row["state"]) == "quarantined"' in source
+    assert 'str(row["state"]) in {"skipped", "quarantined"}' in source
     assert "#superseded:" in source
     assert "UPDATE fbref_control.page_frontier" in source
-    # Non-quarantined squatters must still be a hard conflict.
+    # Active leases and all other states must still fail closed.
+    assert 'if row["state"] == "leased":' in source
+    assert "Cannot change target identity under an active lease" in source
     assert "Canonical URL already belongs to" in source
 
 

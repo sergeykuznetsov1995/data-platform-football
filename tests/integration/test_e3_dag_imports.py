@@ -296,8 +296,8 @@ class TestE3DagImports:
             f"Candidates inspected: {candidates}"
         )
 
-    def test_master_pipeline_e3_runs_after_blocking_fbref_identity_chain(self, dag_bag):
-        """E3 follows FBref ingest, whose Silver child blocks on xref DQ."""
+    def test_master_pipeline_e3_runs_after_fbref_and_xref(self, dag_bag):
+        """E3 follows the sensed FBref Bronze run and master-owned xref."""
         master = dag_bag.dags.get("dag_master_pipeline")
         if master is None:
             pytest.skip("dag_master_pipeline not loaded")
@@ -313,9 +313,7 @@ class TestE3DagImports:
         if e3_trigger is None:
             pytest.skip("No E3 trigger in master pipeline; covered by another test")
 
-        # Walk transitive upstream looking for the final FBref ingest trigger.
-        # That child cannot succeed until its blocking Silver -> xref chain
-        # succeeds (asserted against the Silver DAG below).
+        # Walk transitive upstream looking for the exact FBref ingest sensor.
         seen = set()
         stack = list(e3_trigger.upstream_list)
         while stack:
@@ -333,8 +331,3 @@ class TestE3DagImports:
         assert sensor.external_dag_id == "dag_ingest_fbref"
         assert sensor.allowed_states == ["success"]
         assert sensor.failed_states == ["failed"]
-
-        silver = dag_bag.dags["dag_transform_fbref_silver"]
-        xref = silver.get_task("trigger_xref_transform")
-        assert getattr(xref, "trigger_dag_id", None) == "dag_transform_xref"
-        assert xref.wait_for_completion is True

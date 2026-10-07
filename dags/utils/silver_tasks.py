@@ -12,8 +12,8 @@ Usage:
     from utils.silver_tasks import run_silver_transform
 
     run_silver_transform(
-        sql_file='dags/sql/silver/fbref_player_season_profile.sql',
-        table_name='fbref_player_season_profile',
+        sql_file='dags/sql/silver/sofifa_player_profile.sql',
+        table_name='sofifa_player_profile',
     )
 """
 

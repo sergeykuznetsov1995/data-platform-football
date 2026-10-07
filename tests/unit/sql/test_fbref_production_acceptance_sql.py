@@ -48,15 +48,13 @@ def test_acceptance_sql_is_read_only_and_parameterized():
     )
 
 
-def test_acceptance_sql_covers_scope_generic_typed_silver_and_staging():
+def test_acceptance_sql_covers_scope_generic_typed_and_staging():
     for relation in (
         "fbref_target_scope",
         "fbref_page_manifest",
         "fbref_table_inventory",
         "fbref_table_cells",
         "fbref_dataset_availability",
-        "fbref_match_enriched",
-        "fbref_player_match_stats",
         "information_schema.tables",
     ):
         assert relation in SQL
@@ -353,17 +351,16 @@ def test_match_matrix_anti_joins_exact_expected_match_ids():
     assert "VERIFY_POSTGRES_DIRECT_MATCH_IDENTITIES" in match_matrix
 
 
-def test_silver_freshness_uses_oldest_row_not_one_fresh_row():
-    silver = SQL.split("-- 4. Silver", 1)[1].split(
-        "-- 5. Production", 1
-    )[0]
-    assert _without_comments(silver).count("min(_silver_created_at)") == 2
-    assert "max(_silver_created_at)" not in silver
-    assert "null_freshness = 0" in silver
+def test_production_acceptance_does_not_require_retired_silver():
+    executable = _without_comments(SQL)
+
+    assert "iceberg.silver" not in executable
+    assert "_silver_created_at" not in executable
+    assert "legacy FBref Silver" in SQL
 
 
 def test_profile_specific_acceptance_scripts_are_routed_explicitly():
-    header = "\n".join(SQL.splitlines()[:8])
+    header = "\n".join(SQL.splitlines()[:10])
     assert "only for the publishing 4096-request / 2048-MiB" in header
     assert "use fbref_canary_acceptance.sql" in header
     assert "`fbref_canary_acceptance.sql`" in READINESS

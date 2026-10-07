@@ -1035,10 +1035,6 @@ def test_publication_lock_finalizer_releases_after_publication_export(
             SimpleNamespace(
                 task_id="export_publication_scope", state="success"
             ),
-            # #1324: Silver runs after the lock and never colours Bronze.
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state="failed"
-            ),
         ]
     )
     result = fbref_pipeline_tasks.finalize_fbref_publication_lock(
@@ -1079,7 +1075,7 @@ def test_publication_lock_finalizer_releases_and_fails_after_export_failure(
 
     with pytest.raises(
         AirflowException,
-        match="export failed; lock released, Silver not triggered",
+        match="export failed; lock released",
     ):
         fbref_pipeline_tasks.finalize_fbref_publication_lock(
             airflow_run_id="manual__backfill",
@@ -1090,129 +1086,7 @@ def test_publication_lock_finalizer_releases_and_fails_after_export_failure(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    ("status", "branch"),
-    [
-        ("released_after_publication_export", "trigger_silver_transform"),
-        ("released_by_canary_path", None),
-        ("released_after_nonpublishing_run", None),
-        ("not_acquired", None),
-    ],
-)
-def test_route_silver_follows_silver_only_after_publication_export(
-    monkeypatch, status, branch,
-):
-    finalizer = MagicMock(return_value={"released": True, "status": status})
-    monkeypatch.setattr(
-        fbref_pipeline_tasks, "finalize_fbref_publication_lock", finalizer
-    )
-
-    assert fbref_pipeline_tasks.finalize_fbref_publication_lock_and_route_silver(
-        airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
-        dag_id="dag_ingest_fbref",
-        dag_run="run",
-    ) == branch
-    finalizer.assert_called_once_with(
-        airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
-        dag_id="dag_ingest_fbref",
-        dag_run="run",
-    )
-
-
-@pytest.mark.unit
-def test_route_silver_propagates_a_red_verdict(monkeypatch):
-    from airflow.exceptions import AirflowException
-
-    monkeypatch.setattr(
-        fbref_pipeline_tasks,
-        "finalize_fbref_publication_lock",
-        MagicMock(side_effect=AirflowException("canary verdict is red")),
-    )
-
-    with pytest.raises(AirflowException, match="canary verdict is red"):
-        fbref_pipeline_tasks.finalize_fbref_publication_lock_and_route_silver(
-            airflow_run_id="scheduled__2026-09-23T06:00:00+00:00",
-            dag_id="dag_ingest_fbref",
-        )
-
-
-def _replay_shaped_task():
-    # dag_replay_fbref keeps export -> Silver (wait) -> lock (#1324 scope).
-    return SimpleNamespace(upstream_task_ids={"trigger_silver_transform"})
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    ("silver_state", "released", "message"),
-    [
-        ("failed", False, "retained because child state is ambiguous"),
-        ("running", False, "retained because child state is ambiguous"),
-        ("upstream_failed", True, "released because the child never started"),
-    ],
-)
-def test_replay_shaped_finalizer_keeps_the_silver_verdict(
-    monkeypatch, silver_state, released, message,
-):
-    from airflow.exceptions import AirflowException
-
-    release = MagicMock(return_value={"released": True})
-    monkeypatch.setattr(
-        fbref_pipeline_tasks, "release_fbref_publication_lock", release
-    )
-    run = SimpleNamespace(
-        get_task_instances=lambda: [
-            SimpleNamespace(
-                task_id="acquire_publication_lock", state="success"
-            ),
-            SimpleNamespace(
-                task_id="export_publication_scope", state="success"
-            ),
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state=silver_state
-            ),
-        ]
-    )
-    with pytest.raises(AirflowException, match=message):
-        fbref_pipeline_tasks.finalize_fbref_publication_lock(
-            airflow_run_id="manual__replay",
-            dag_id="dag_replay_fbref",
-            dag_run=run,
-            task=_replay_shaped_task(),
-        )
-    assert release.called is released
-
-
-@pytest.mark.unit
-def test_replay_shaped_finalizer_releases_after_silver_success(monkeypatch):
-    release = MagicMock(return_value={"released": True})
-    monkeypatch.setattr(
-        fbref_pipeline_tasks, "release_fbref_publication_lock", release
-    )
-    run = SimpleNamespace(
-        get_task_instances=lambda: [
-            SimpleNamespace(
-                task_id="acquire_publication_lock", state="success"
-            ),
-            SimpleNamespace(
-                task_id="export_publication_scope", state="success"
-            ),
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state="success"
-            ),
-        ]
-    )
-    result = fbref_pipeline_tasks.finalize_fbref_publication_lock(
-        airflow_run_id="manual__replay",
-        dag_id="dag_replay_fbref",
-        dag_run=run,
-        ti=SimpleNamespace(task=_replay_shaped_task()),
-    )
-    assert result == {"released": True}
-    release.assert_called_once()
-
-
-@pytest.mark.unit
-def test_ingest_shaped_finalizer_ignores_silver_and_releases_on_export(
+def test_publication_finalizer_releases_on_successful_export(
     monkeypatch,
 ):
     release = MagicMock(return_value={"released": True})
@@ -1291,9 +1165,6 @@ def test_publication_lock_finalizer_allows_dry_run(monkeypatch):
                 task_id="acquire_publication_lock", state="skipped"
             ),
             SimpleNamespace(task_id="plan_backfill", state="success"),
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state="skipped"
-            ),
         ]
     )
     assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
@@ -1322,9 +1193,6 @@ def test_publication_lock_finalizer_preserves_successful_canary(monkeypatch):
             SimpleNamespace(task_id="validate_canary_run", state="success"),
             SimpleNamespace(
                 task_id="release_canary_publication_lock", state="success"
-            ),
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state="upstream_failed"
             ),
         ]
     )
@@ -1357,9 +1225,6 @@ def test_publication_lock_finalizer_cleans_up_failed_canary(monkeypatch):
             SimpleNamespace(
                 task_id="release_canary_publication_lock",
                 state="upstream_failed",
-            ),
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state="skipped"
             ),
         ]
     )
@@ -3916,7 +3781,6 @@ def _nonpublishing_finalizer_dag_run(*, validate_state="success"):
             SimpleNamespace(task_id="validate_run", state=validate_state),
             SimpleNamespace(task_id="choose_publication_path", state="success"),
             SimpleNamespace(task_id="export_publication_scope", state="skipped"),
-            SimpleNamespace(task_id="trigger_silver_transform", state="skipped"),
         ]
     )
 
@@ -3925,7 +3789,7 @@ def _nonpublishing_finalizer_dag_run(*, validate_state="success"):
 def test_finalizer_releases_a_nonpublishing_run_without_painting_it_red(
     monkeypatch,
 ):
-    """Пропущенный Silver у истории — это план, а не «ребёнок не стартовал»."""
+    """Непубликующая история освобождает lock без downstream export."""
 
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(

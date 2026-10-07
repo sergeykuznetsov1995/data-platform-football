@@ -110,6 +110,7 @@ class CompetitionEligibility(str, Enum):
     """Decision made before any competition child target is created."""
 
     ELIGIBLE = "eligible"
+    SKIPPED_INACTIVE = "skipped_inactive"
     SKIPPED_FEMALE = "skipped_female"
     QUARANTINED_UNKNOWN = "quarantined_unknown_gender"
 
@@ -125,6 +126,13 @@ class CalendarType(str, Enum):
 # close to the field names used by the records.
 Gender = CompetitionGender
 Participants = ParticipantType
+
+
+CURRENT_SCOPE_LIFECYCLE_OVERRIDES = {
+    "68": ("discontinued", "last_source_season_2009"),
+    "76": ("discontinued", "last_source_season_2017"),
+    "79": ("discontinued", "last_source_season_2010"),
+}
 
 
 @dataclass(frozen=True)
@@ -203,6 +211,8 @@ def competition_eligibility(
 ) -> CompetitionEligibility:
     """Classify scope without following a female or unknown-gender URL."""
 
+    if competition.competition_id in CURRENT_SCOPE_LIFECYCLE_OVERRIDES:
+        return CompetitionEligibility.SKIPPED_INACTIVE
     if competition.gender == CompetitionGender.MALE:
         return CompetitionEligibility.ELIGIBLE
     if competition.gender == CompetitionGender.FEMALE:

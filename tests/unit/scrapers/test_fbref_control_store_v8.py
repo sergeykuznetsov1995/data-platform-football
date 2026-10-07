@@ -84,13 +84,15 @@ def make_store(handler):
     )
 
 
-def competition_entry(index, *, gender="male"):
+def competition_entry(index, *, gender="male", crawl_state=None, metadata=None):
     return CompetitionRegistryEntry(
         competition_id=str(index),
         canonical_url=f"https://fbref.com/en/comps/{index}/Competition-{index}",
         name=f"Competition {index}",
         gender=gender,
         classification="domestic_league",
+        crawl_state=crawl_state,
+        metadata={} if metadata is None else metadata,
     )
 
 
@@ -1099,6 +1101,51 @@ def test_registry_unknown_gender_is_durably_quarantined_then_blocks_caller():
     assert factory.connections[0].rolled_back is False
 
 
+def test_registry_persists_explicit_skipped_crawl_state_and_audit_metadata():
+    fetched_at = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    persisted = {}
+
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.registry_snapshot" in sql:
+            return [{
+                "successful": True,
+                "source": "fbref",
+                "fetched_at": fetched_at,
+            }], 1
+        if "SELECT max(last_seen_at) AS latest" in sql:
+            return [{"latest": None}], 1
+        if "SELECT count(*) AS count" in sql:
+            return [{"count": 0}], 1
+        if "INSERT INTO fbref_control.competition_registry" in sql:
+            persisted["crawl_state"] = params[7]
+            persisted["metadata"] = json.loads(params[12])
+            return [], 1
+        return [], 0
+
+    store, factory = make_store(handler)
+    counts = store.reconcile_competitions(
+        str(uuid.uuid4()),
+        [competition_entry(
+            68,
+            crawl_state="skipped",
+            metadata={
+                "current_scope_lifecycle": "discontinued",
+                "current_scope_reason": "last_source_season_2009",
+            },
+        )],
+    )
+
+    assert counts["skipped"] == 1
+    assert persisted == {
+        "crawl_state": "skipped",
+        "metadata": {
+            "current_scope_lifecycle": "discontinued",
+            "current_scope_reason": "last_source_season_2009",
+        },
+    }
+    assert factory.connections[0].committed is True
+
+
 def test_registry_shrink_over_ten_percent_rolls_back_without_override():
     fetched_at = datetime(2026, 7, 14, tzinfo=timezone.utc)
 
@@ -2067,6 +2114,16 @@ def test_a_holder_the_registry_cannot_place_still_parks_on_the_sentinel():
             registry=None,
         )
     )
+
+    store.upsert_frontier_target(_incoming_season_target())
+
+    assert _releases(factory) == []
+    assert len(_sentinel_parks(factory)) == 1
+
+
+def test_retired_skipped_season_without_dated_registry_url_parks_for_handover():
+    holder = _outgoing_season_row(state="skipped")
+    store, factory = make_store(_rollover_handler([holder], registry=None))
 
     store.upsert_frontier_target(_incoming_season_target())
 

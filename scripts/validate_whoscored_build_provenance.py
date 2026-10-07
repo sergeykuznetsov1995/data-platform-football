@@ -199,11 +199,11 @@ PROTECTED_SERVICE_IMAGE_ENV = {
     "whoscored_proxy_filter": "WHOSCORED_PROXY_IMAGE",
 }
 PROTECTED_STAGE_RECIPE_SHA256 = {
-    "airflow-scheduler": "f784ae95f5ac83d33cd52866e81a406a23cdb65fbdad3912168cd3ed85cabe6d",
+    "airflow-scheduler": "5d5ba8352020aab6a2eb37335908f8f65180ccb7b7de5861d77c36e6a002e901",
     "flaresolverr": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "flaresolverr_whoscored_paid": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
-    "whoscored_paid_gateway": "0cb2bdeed26cb9fe7cb33da3f50c1f29124ffcc07d31f9d09f69dc67f1b290b8",
-    "whoscored_proxy_filter": "0cb2bdeed26cb9fe7cb33da3f50c1f29124ffcc07d31f9d09f69dc67f1b290b8",
+    "whoscored_paid_gateway": "1e2bdc8eaa08ba204f5034b5ad4d8e0dc7b85159b9f57e0f3e31399f040fe865",
+    "whoscored_proxy_filter": "1e2bdc8eaa08ba204f5034b5ad4d8e0dc7b85159b9f57e0f3e31399f040fe865",
 }
 WHOSCORED_PROXY_COMMAND = (
     "python",
@@ -2445,6 +2445,12 @@ def _scan_downloads(
         executable = _segment_executable(segment)
         if executable in {"curl", "wget"}:
             fetches.append((executable, segment))
+    if (
+        len(fetches) > 1
+        and all(fetch == fetches[0] for fetch in fetches[1:])
+        and _canonical_fetch_receipt(command, "curl")
+    ):
+        fetches = fetches[:1]
     all_urls = [url.rstrip(")],") for url in _URL.findall(command)]
     fetch_urls = {
         url.rstrip(")],")
@@ -2520,13 +2526,21 @@ def _canonical_fetch_receipt(command: str, executable: str) -> bool:
     if executable != "curl":
         return False
     segments, operators = _shell_chain(command)
-    if operators != ["&&", "|", "&&"] or len(segments) != 4:
+    simple_chain = operators == ["&&", "|", "&&"] and len(segments) == 4
+    resumable_chain = operators == ["||", "||", "||", "&&", "|", "&&"] and len(
+        segments
+    ) == 7
+    if not simple_chain and not resumable_chain:
         return False
-    fetch, checksum, verifier, size_check = segments
+    fetches = segments[:1] if simple_chain else segments[:4]
+    if any(fetch != fetches[0] for fetch in fetches[1:]):
+        return False
+    fetch = fetches[0]
+    checksum, verifier, size_check = segments[-3:]
     if len(fetch) < 5:
         return False
     curl_prefix = fetch[:-3]
-    if curl_prefix not in (
+    simple_prefixes = (
         ["curl", "-fsSL"],
         [
             "curl",
@@ -2554,7 +2568,29 @@ def _canonical_fetch_receipt(command: str, executable: str) -> bool:
             "3600",
             "-fsSL",
         ],
-    ):
+    )
+    resumable_prefix = [
+        "curl",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "20",
+        "--speed-limit",
+        "1024",
+        "--speed-time",
+        "60",
+        "--max-time",
+        "1500",
+        "--continue-at",
+        "-",
+        "-fsSL",
+    ]
+    if simple_chain and curl_prefix not in simple_prefixes:
+        return False
+    if resumable_chain and curl_prefix != resumable_prefix:
         return False
     url, output_flag, output = fetch[-3:]
     if (

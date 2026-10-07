@@ -62,9 +62,23 @@ ENV SPARK_VERSION=3.5.3
 ENV HADOOP_VERSION=3
 ENV SPARK_HOME=/opt/spark
 
+# Separate curl processes preserve the partial output between time-bounded
+# attempts; curl's built-in retry can rewind to the invocation's initial size.
 RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' \
       --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
-      --max-time 3600 -fsSL \
+      --max-time 1500 --continue-at - -fsSL \
+      https://archive.apache.org/dist/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3.tgz -o /tmp/spark-3.5.3-bin-hadoop3.tgz \
+    || curl --proto '=https' --tlsv1.2 --proto-redir '=https' \
+      --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+      --max-time 1500 --continue-at - -fsSL \
+      https://archive.apache.org/dist/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3.tgz -o /tmp/spark-3.5.3-bin-hadoop3.tgz \
+    || curl --proto '=https' --tlsv1.2 --proto-redir '=https' \
+      --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+      --max-time 1500 --continue-at - -fsSL \
+      https://archive.apache.org/dist/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3.tgz -o /tmp/spark-3.5.3-bin-hadoop3.tgz \
+    || curl --proto '=https' --tlsv1.2 --proto-redir '=https' \
+      --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+      --max-time 1500 --continue-at - -fsSL \
       https://archive.apache.org/dist/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3.tgz -o /tmp/spark-3.5.3-bin-hadoop3.tgz \
     && echo "173651a8a00f5bf0ee27b74d817e0e52eed9daa49fd66d59718994974d1d367d  /tmp/spark-3.5.3-bin-hadoop3.tgz" \
         | sha256sum -c - \

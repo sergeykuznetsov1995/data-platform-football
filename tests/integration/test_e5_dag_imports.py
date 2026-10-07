@@ -41,38 +41,6 @@ def dag_bag():
 class TestE5DagImports:
     """Verify E5 task ids land in the right DAGs."""
 
-    def test_silver_dag_loads_with_e5_task(self, dag_bag):
-        """``dag_transform_fbref_silver`` must contain ``whoscored_player_unavailable``.
-
-        NB: tasks live inside a ``silver_transforms`` TaskGroup so the fully
-        qualified id is ``silver_transforms.whoscored_player_unavailable``. We
-        check on the *suffix* to stay tolerant of task-group renames.
-        """
-        if dag_bag.import_errors:
-            pytest.fail(
-                "DAG import errors: " + "; ".join(
-                    f"{k}: {v}" for k, v in dag_bag.import_errors.items()
-                )
-            )
-
-        dag_id = "dag_transform_fbref_silver"
-        assert dag_id in dag_bag.dags, (
-            f"DAG '{dag_id}' not found. "
-            f"Loaded: {sorted(dag_bag.dags.keys())}"
-        )
-        dag = dag_bag.dags[dag_id]
-        task_ids = {t.task_id for t in dag.tasks}
-        # Accept either bare task_id or a TaskGroup-prefixed one
-        present = any(
-            tid == "whoscored_player_unavailable"
-            or tid.endswith(".whoscored_player_unavailable")
-            for tid in task_ids
-        )
-        assert present, (
-            f"E5 Silver task 'whoscored_player_unavailable' missing from {dag_id}. "
-            f"Tasks: {sorted(task_ids)}"
-        )
-
     def test_gold_dag_loads_with_fct_player_unavailable(self, dag_bag):
         """``dag_transform_fbref_gold`` must contain ``fct_player_unavailable``.
 
