@@ -81,6 +81,14 @@ class Proxy:
         return f'{protocol}://{auth}{self.host}:{self.port}'
 
     @property
+    def http_url(self) -> str:
+        """HTTP URL used by requests/soccerdata and pool exclusions."""
+        auth = ''
+        if self.username and self.password:
+            auth = f'{self.username}:{self.password}@'
+        return f'http://{auth}{self.host}:{self.port}'
+
+    @property
     def masked_url(self) -> str:
         """Get proxy URL with credentials masked for safe logging."""
         auth = ''
@@ -477,6 +485,7 @@ class ProxyManager:
         self,
         respect_cooldown: bool = True,
         *,
+        excluded_http_urls: Optional[set[str]] = None,
         max_cooldown_wait_seconds: Optional[float] = None,
         sleep=None,
     ) -> Optional[Proxy]:
@@ -485,13 +494,18 @@ class ProxyManager:
 
         Args:
             respect_cooldown: Whether to respect cooldown period between uses
+            excluded_http_urls: HTTP proxy URLs ineligible for this selection
 
         Returns:
             Proxy instance or None if no proxy can become available within the
             optional bounded wait.
         """
         self._reactivate_expired_bans()
-        available = [p for p in self._proxies if not p.is_banned]
+        available = [
+            p for p in self._proxies
+            if not p.is_banned
+            and (not excluded_http_urls or p.http_url not in excluded_http_urls)
+        ]
 
         if not available:
             logger.warning("No available proxies")
@@ -640,22 +654,23 @@ class ProxyManager:
         self._consecutive_failures.clear()
         logger.info("All proxies unbanned")
 
-    def get_http_proxy_url(self) -> Optional[str]:
+    def get_http_proxy_url(
+        self, *, excluded_http_urls: Optional[set[str]] = None
+    ) -> Optional[str]:
         """
         Get HTTP proxy URL for requests/soccerdata libraries.
 
         Returns proxy in format: http://user:pass@host:port
         This format is compatible with requests library and soccerdata.
 
+        Args:
+            excluded_http_urls: HTTP proxy URLs ineligible for this selection
+
         Returns:
             HTTP proxy URL string or None if no proxies available
         """
-        proxy = self.get_proxy()
-        if proxy:
-            if proxy.username and proxy.password:
-                return f"http://{proxy.username}:{proxy.password}@{proxy.host}:{proxy.port}"
-            return f"http://{proxy.host}:{proxy.port}"
-        return None
+        proxy = self.get_proxy(excluded_http_urls=excluded_http_urls)
+        return proxy.http_url if proxy else None
 
     def get_current_proxy(self) -> Optional[Proxy]:
         """

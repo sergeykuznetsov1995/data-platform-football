@@ -5197,6 +5197,14 @@ def test_pool_5xx_swaps_member_once_and_keeps_retry_policy(monkeypatch, tmp_path
 
 
 @pytest.mark.unit
+def test_pool_5xx_rotation_excludes_current_before_random_choice(monkeypatch, tmp_path):
+    # Always picking the first entry made the bounded random search miss the
+    # healthy second member and eventually exhaust the session factory.
+    monkeypatch.setattr("scrapers.utils.proxy_manager.random.choice", lambda pool: pool[0])
+    test_pool_5xx_swaps_member_once_and_keeps_retry_policy(monkeypatch, tmp_path)
+
+
+@pytest.mark.unit
 def test_egress_probe_hits_ipify_only(monkeypatch, tmp_path):
     session = FakeHTTPSession(FakeHTTPResponse(content=b"203.0.113.7"))
     transport, seen = _pool_transport(monkeypatch, tmp_path, session)
@@ -5239,13 +5247,17 @@ PROXY_502 = RuntimeError("curl: (56) CONNECT tunnel failed, response 502")
 
 
 def _ordered_pool_transport(monkeypatch, tmp_path, sessions, *, choices=None):
-    from itertools import cycle
     from scrapers.utils.proxy_manager import ProxyManager
 
     urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(len(sessions))]
-    order = cycle(choices or urls)
-    monkeypatch.setattr(ProxyManager, "get_http_proxy_url", lambda self: next(order))
-    monkeypatch.setattr(ProxyManager, "total_count", property(lambda self: len(urls)))
+
+    def select_member(self, *, excluded_http_urls=None):
+        return next(
+            (url for url in (choices or urls) if url not in (excluded_http_urls or set())),
+            None,
+        )
+
+    monkeypatch.setattr(ProxyManager, "get_http_proxy_url", select_member)
     transport, seen = _pool_transport(monkeypatch, tmp_path, *sessions)
     return transport, seen, urls
 
@@ -5355,19 +5367,43 @@ def test_egress_recovery_member_identity_survives_next_operation(monkeypatch, tm
 
 
 @pytest.mark.unit
-def test_egress_recovery_stops_after_bounded_replacement_search(monkeypatch, tmp_path):
-    sessions = [FakeHTTPSession(PROXY_502) for _ in range(3)]
+def test_egress_recovery_stops_when_no_distinct_replacement_remains(monkeypatch, tmp_path):
+    sessions = [FakeHTTPSession(PROXY_502)]
     transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
     calls = []
-    def stuck_choice():
-        calls.append(1)
-        return urls[0]
-    monkeypatch.setattr(transport._pool_manager, "get_http_proxy_url", stuck_choice)
+    select = transport._pool_manager.get_http_proxy_url
+
+    def record_choice(*, excluded_http_urls=None):
+        calls.append(set(excluded_http_urls or ()))
+        return select(excluded_http_urls=excluded_http_urls)
+
+    monkeypatch.setattr(transport._pool_manager, "get_http_proxy_url", record_choice)
     with pytest.raises(transport_module.ProxyUnavailable, match="replacement_unavailable"):
         transport.probe_egress()
-    assert len(calls) == 12
+    assert calls == [{urls[0]}]
     assert seen == urls[:1]
     assert len(sessions[0].calls) == 1
+    assert sessions[0].closed is False
+
+
+@pytest.mark.unit
+def test_rotation_without_eligible_member_keeps_session_and_exclusions(monkeypatch, tmp_path):
+    from scrapers.utils.proxy_manager import ProxyManager
+
+    monkeypatch.setattr("scrapers.utils.proxy_manager.random.choice", lambda pool: pool[0])
+    session = FakeHTTPSession()
+    transport, seen = _pool_transport(monkeypatch, tmp_path, session)
+    manager = ProxyManager()
+    manager.add_proxy_url(seen[0])
+    transport._pool_manager = manager
+    excluded = {"http://other.invalid:8080"}
+
+    assert transport._rotate_pool_proxy(excluded) is False
+    assert excluded == {"http://other.invalid:8080"}
+    assert transport._direct_http is session
+    assert transport._pool_proxy_url == seen[0]
+    assert len(seen) == 1
+    assert session.closed is False
 
 
 @pytest.mark.unit
