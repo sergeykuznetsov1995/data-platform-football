@@ -65,3 +65,10 @@ jobs:
             --ignore=tests/unit/scripts/test_whoscored_capacity_container_runtime.py \
             --ignore=tests/unit/scripts/test_generate_whoscored_deployment_attestation.py \
             --ignore=tests/unit/scripts/test_validate_whoscored_build_provenance.py
+
+      - name: Offline BI and catalog scripts
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        # Select this file explicitly: the integration directory also contains
+        # live source/service tests. These unit checks use SDK stubs.
+        run: pytest -q tests/integration/test_bi_catalog_scripts.py -m unit
