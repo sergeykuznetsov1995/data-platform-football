@@ -6,6 +6,8 @@ import os
 import tempfile
 import time
 
+import pytest
+
 from scrapers.utils.proxy_manager import (
     Proxy,
     ProxyType,
@@ -521,6 +523,64 @@ class TestProxyManager:
 
         http_url = manager.get_http_proxy_url()
         assert http_url is None
+
+    @pytest.mark.parametrize('strategy', ['random', 'weighted', 'round_robin'])
+    @pytest.mark.parametrize('authenticated', [False, True])
+    def test_http_exclusions_apply_before_selection(self, monkeypatch, strategy, authenticated):
+        monkeypatch.setattr('scrapers.utils.proxy_manager.random.choice', lambda pool: pool[0])
+        monkeypatch.setattr(
+            'scrapers.utils.proxy_manager.random.choices',
+            lambda pool, **kwargs: [pool[0]],
+        )
+        manager = ProxyManager(rotation_strategy=strategy, unban_cooldown_seconds=0)
+        credentials = {'username': 'test', 'password': 'secret'} if authenticated else {}
+        for port in (10000, 10001, 10002):
+            manager.add_proxy('pool.invalid', port, **credentials)
+        first, banned, healthy = manager._proxies
+        banned.mark_banned()
+        exclusions = {first.http_url}
+
+        assert manager.get_http_proxy_url(excluded_http_urls=exclusions) == healthy.http_url
+        assert exclusions == {first.http_url}
+        # Exclusions apply to this call only, without banning the first member.
+        assert first.http_url in {manager.get_http_proxy_url(), manager.get_http_proxy_url()}
+        assert first.is_banned is False
+
+    def test_exclusions_precede_cooldown_and_bounded_wait(self):
+        manager = ProxyManager(cooldown_seconds=60)
+        manager.add_proxy('pool.invalid', 10000)
+        manager.add_proxy('pool.invalid', 10001)
+        excluded, cooling = manager._proxies
+        cooling.last_used = time.time()
+        slept = []
+
+        assert manager.get_proxy(
+            excluded_http_urls={excluded.http_url},
+            max_cooldown_wait_seconds=0,
+            sleep=slept.append,
+        ) is None
+        assert slept == []
+        assert manager.get_http_proxy_url(excluded_http_urls={excluded.http_url}) == cooling.http_url
+
+    def test_all_http_candidates_excluded_returns_none_without_selection(self, monkeypatch):
+        manager = ProxyManager(rotation_strategy='random')
+        manager.add_proxy('pool.invalid', 10000)
+        member = manager._proxies[0]
+
+        def unexpected_choice(pool):
+            pytest.fail('selection must not run when all candidates are excluded')
+
+        monkeypatch.setattr('scrapers.utils.proxy_manager.random.choice', unexpected_choice)
+        assert manager.get_http_proxy_url(excluded_http_urls={member.http_url}) is None
+        assert member.is_banned is False
+
+    def test_http_exclusion_uses_returned_format_for_socks_proxy(self):
+        manager = ProxyManager()
+        manager.add_proxy_url('socks5://test:secret@pool.invalid:10000')
+        assert manager.get_http_proxy_url() == 'http://test:secret@pool.invalid:10000'
+        assert manager.get_http_proxy_url(
+            excluded_http_urls={'http://test:secret@pool.invalid:10000'}
+        ) is None
 
     def test_load_from_file(self):
         manager = ProxyManager()

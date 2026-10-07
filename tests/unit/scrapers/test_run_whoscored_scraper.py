@@ -2211,14 +2211,17 @@ def test_proxy_unavailable_in_discover_is_source_unavailable(monkeypatch, tmp_pa
 @pytest.mark.unit
 @pytest.mark.parametrize("healthy_third", [False, True])
 def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, healthy_third):
-    from itertools import cycle
     from scrapers.utils.proxy_manager import ProxyManager
     from scrapers.whoscored.transport import TransportContext, WhoScoredTransport
 
     urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(3)]
-    choices = cycle(urls)
-    monkeypatch.setattr(ProxyManager, "get_http_proxy_url", lambda self: next(choices))
-    monkeypatch.setattr(ProxyManager, "total_count", property(lambda self: 3))
+    monkeypatch.setattr(
+        ProxyManager,
+        "get_http_proxy_url",
+        lambda self, *, excluded_http_urls=None: next(
+            (url for url in urls if url not in (excluded_http_urls or set())), None
+        ),
+    )
     pool = tmp_path / "pool.txt"
     pool.write_text("pool.invalid:10000:test:secret\n")
     monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
