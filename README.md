@@ -7,11 +7,18 @@ star-schema model for BI dashboards, notebooks and a data catalog.
 Everything runs on one VM with Docker Compose. Airflow orchestrates the pipelines, and
 Trino is the only query and compute engine.
 
+Start with [AGENTS.md](AGENTS.md), the [source/runbook map](docs/operations/README.md),
+[test profiles](TESTING.md) and [readiness stages](docs/operations/READINESS.md).
+Current work focuses on Bronze; Silver/Gold work needs an explicit task.
+
 ## Data sources
 
 FBref, SofaScore, WhoScored, Transfermarkt, FotMob, Understat, ClubElo, ESPN, Capology,
 SoFIFA and Football-Data (MatchHistory). Each source has its own scraper package under
-`scrapers/<source>/` and its own ingest DAG (`dags/dag_ingest_<source>.py`).
+`scrapers/<source>/`. Launch paths differ: current ESPN uses
+[`deploy/espn/dags/dag_espn_current.py`](deploy/espn/dags/dag_espn_current.py), not the
+legacy `dags/dag_ingest_espn.py`. Use the [source map](docs/operations/README.md)
+to find each entrypoint, contract and runbook.
 
 ## Architecture: Bronze → Silver → Gold
 
@@ -90,15 +97,18 @@ compose.yaml         The full service stack
 
 ## Running locally
 
+The commands below bootstrap a **new, isolated development stack** with its own
+credentials and storage. They are not instructions for the shared production host.
+On a shared host, read its stack protocol and verify mounts/configs before any
+Compose operation; `make up-lite` must not be used there.
+
 ```bash
 cp .env.example .env        # then fill in your own passwords and keys
 make up-lite                # core services: storage, catalog, Postgres, Redis, Airflow, Trino, Superset
 make ps                     # service status
 ```
 
-Tests run on the host:
-
-```bash
-pip install -r requirements-ci.txt
-pytest tests/unit -q
-```
+Tests run in a separate host venv and development checkout. Follow
+[TESTING.md](TESTING.md) for a pinned offline smoke profile, the full unit suite
+and integration requirements. Bare `pytest` also selects live tests; a successful
+smoke does not replace required CI or source acceptance.

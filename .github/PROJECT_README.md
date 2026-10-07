@@ -6,7 +6,7 @@ Single source of truth для задач по платформе. Issues жив�
 
 ### 1. Авторизовать `gh`
 
-В Claude Code чате (или в обычном терминале):
+В терминале, только если `gh` ещё не авторизован (на настроенном хосте повторный login не нужен):
 
 ```bash
 gh auth login --web --scopes "project,repo"
@@ -24,7 +24,7 @@ gh api user -q .login   # должно вернуть sergeykuznetsov1995
 ### 2. Создать labels
 
 ```bash
-cd /root/data_platform
+# Из корня своей рабочей копии репозитория:
 bash scripts/setup_github_labels.sh
 # или без auth — dry-run:
 DRY_RUN=1 bash scripts/setup_github_labels.sh
@@ -83,7 +83,11 @@ docs(catalog): seed OpenMetadata YAML for E4 facts
 
 ### Commit-to-issue linking
 
-GitHub автоматически линкует упоминания `#<num>` в commit/PR body. Для авто-закрытия issue при merge используйте ключевые слова: `Closes #42`, `Fixes #42`.
+GitHub автоматически линкует упоминания `#<num>` в commit/PR body. Если после merge
+нужна доставка или приёмка, пишите `Refs #42`: issue и карточка не переходят в Done
+до выполнения согласованного критерия. `Closes #42` / `Fixes #42` используйте только
+когда merge действительно завершает всю задачу. Стадии «код слит / доставлен /
+принят» описаны в [READINESS.md](../docs/operations/READINESS.md).
 
 ### Иерархия
 

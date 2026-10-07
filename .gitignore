@@ -108,6 +108,8 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-smoke/
+.venv-test/
 env/
 venv/
 ENV/
@@ -227,6 +229,9 @@ docs/operations/sql/*
 !docs/architecture/
 docs/architecture/*
 !docs/architecture/fotmob-native-silver.md
+!docs/design/
+docs/design/*
+!docs/design/gold-star-schema.md
 scrapers/README.md
 
 # Local ad-hoc SQL (not part of pipeline; only dags/sql/ is tracked)
