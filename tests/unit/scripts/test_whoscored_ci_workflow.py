@@ -453,11 +453,11 @@ def test_ci_exercises_every_runner_moved_to_the_legacy_venv():
 
 
 def test_all_buildx_guards_accept_verified_release_and_reject_unknown_values():
-    # Official docker/buildx v0.37.1 linux-amd64 checksum and peeled tag commit.
-    # https://github.com/docker/buildx/releases/download/v0.37.1/checksums.txt
+    # Official docker/buildx v0.37.2 linux-amd64 checksum and peeled tag commit.
+    # https://github.com/docker/buildx/releases/download/v0.37.2/checksums.txt
     values = {
-        "buildx_sha": "9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b",
-        "buildx_ver": "github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a",
+        "buildx_sha": "982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548",
+        "buildx_ver": "github.com/docker/buildx v0.37.2 2d379c0c3f22da0d2759d132a0ec81ca949098f0",
     }
     for variable, accepted in values.items():
         guards = re.findall(r'case "\$' + variable + r'" in.*?esac',
