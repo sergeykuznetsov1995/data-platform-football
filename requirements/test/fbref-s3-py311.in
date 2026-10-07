@@ -1,0 +1,5 @@
+# Direct dependencies of the existing source gate, pinned to its green CI baseline.
+pytest==9.1.1
+pyarrow==25.0.1
+boto3==1.42.61
+psycopg2-binary==2.9.13

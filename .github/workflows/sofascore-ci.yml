@@ -35,6 +35,9 @@ on:
       - "tests/unit/dags/test_maintenance_tasks.py"
       - "tests/unit/**/*sofascore*"
       - "tests/unit/scripts/test_filter_proxy.py"
+      - "requirements/test/sofascore-unit-py311.lock"
+      - "requirements/test/sofascore-unit-py311.in"
+      - "tests/unit/scripts/test_source_test_profiles.py"
 
 permissions:
   contents: read
@@ -54,25 +57,15 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: requirements/test/sofascore-unit-py311.lock
 
       - name: Install test runtime
         shell: bash
         run: |
-          # Airflow is deliberately absent: tests/unit/dags/conftest.py installs
-          # its operator stubs only when the real package is missing, and the DAG
-          # topology tests assert against those stubs. Installing Airflow here
-          # would silently disable them.
-          # ruff is pinned: it gates the merge, and an unpinned linter turns
-          # every upstream release into an unreviewed change to that gate.
-          # 0.16.0 widened the default rule set and made this job fail on
-          # untouched master (565 findings here, 844 in fbref-ci).
-          # sqlglot resolves column types in the schedule-probe SQL contract:
-          # the probe compares an epoch double to a timestamp only once, and a
-          # substring assertion cannot tell that apart from a working query.
-          python -m pip install --disable-pip-version-check \
-            pytest "ruff==0.15.20" pandas numpy pyarrow trino requests PyYAML jinja2 \
-            jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
-            rapidfuzz Unidecode nicknames "sqlglot==30.12.0" "duckdb==1.5.4"
+          # Airflow is absent so the existing DAG topology stubs stay active.
+          python -m pip install --disable-pip-version-check --require-hashes \
+            -r requirements/test/sofascore-unit-py311.lock
+          python -m pip check
 
       - name: Static checks
         run: |

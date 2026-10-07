@@ -66,10 +66,49 @@ Source workflows в [.github/workflows](.github/workflows/) проверяют �
 Не используй голый `pytest`: [pyproject.toml](pyproject.toml) выбирает всё `tests`,
 включая live-интеграции. Не все offline-тесты лежат в `tests/unit`: например,
 unit-проверки в [test_bi_catalog_scripts.py](tests/integration/test_bi_catalog_scripts.py)
-нужно выбирать дополнительно с `-m unit`, если затронут их код.
-Старый `make test-fbref-offline` обращается к общему scheduler и блокируется
-его wrapper; для локального прогона используй host test-venv и явные test paths
-из [.github/workflows/fbref-ci.yml](.github/workflows/fbref-ci.yml), не обходи wrapper.
+выбираются явно в подготовленном test-venv:
+
+```bash
+env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 \
+  python -m pytest -q tests/integration/test_bi_catalog_scripts.py -m unit
+```
+
+Состав общего автоматического гейта указан в [.github/workflows/ci.yml](.github/workflows/ci.yml);
+весь каталог integration для offline-проверки не запускай.
+
+## Offline-профили источников и FBref Make
+
+Шесть [закреплённых test-профилей](requirements/test/README.md) сохраняют существующие
+Python 3.11/3.12 и прямые/транзитивные версии успешных source CI. Это отдельные
+Linux x86_64 CPython minor-профили с wheel hashes; зависимости приложения и
+Airflow release constraints от них не меняются. Подготовка FBref:
+
+```bash
+python3.11 -m venv /tmp/dpf-fbref-test
+. /tmp/dpf-fbref-test/bin/activate
+python -m pip install --disable-pip-version-check --require-hashes \
+  -r requirements/test/fbref-unit-py311.lock
+python -m pip check
+make test-fbref-offline
+```
+
+Make использует `python3` активированного venv; `PYTHON=/path/to/test-venv/bin/python`
+выбирает другой тестовый интерпретатор. Локальный runner и
+[FBref CI](.github/workflows/fbref-ci.yml) выбирают одинаковые обычные
+`tests/unit/**/*fbref*.py` и пять maintenance/proxy extras. Runner очищает
+`PYTEST_ADDOPTS`/`PYTEST_PLUGINS`, выключает autoload и возвращает exit pytest;
+отсутствие pytest или FBref-тестов — ошибка. Сам runner не устанавливает пакеты
+и не вызывает Compose; защита общего scheduler сохраняется.
+
+Offline означает отсутствие запросов к источникам или production. Некоторые
+control/proxy unit-тесты используют временные TCP-заглушки на `127.0.0.1`.
+Среда, запрещающая любые sockets, не сможет запустить эти fixtures; для отдельной
+локальной проверки используй штатное разрешение на loopback, сохраняя отключённую
+автозагрузку плагинов и защитный wrapper. Production для этого не нужен.
+PostgreSQL/S3 semantics, Compose render и реальные Airflow imports остаются
+отдельными CI-проверками с временными сервисами. Wheelhouse-подготовка и обновление
+профилей описаны в их README; новый lock должен пройти чистую установку и source checks.
 
 ## Интеграции и SQL
 

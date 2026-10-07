@@ -1,0 +1,20 @@
+# Direct dependencies of the existing source gate, pinned to its green CI baseline.
+pytest==9.1.1
+ruff==0.15.20
+pandas==3.0.6
+numpy==2.4.6
+pyarrow==25.0.1
+trino==0.340.0
+requests==2.34.2
+PyYAML==6.0.3
+jinja2==3.1.6
+jsonschema==4.26.0
+tls-client-python==1.15.1
+python-dotenv==1.2.4
+tenacity==9.2.1
+pybreaker==1.4.1
+rapidfuzz==3.14.6
+Unidecode==1.4.0
+nicknames==1.0.1
+sqlglot==30.12.0
+duckdb==1.5.4
