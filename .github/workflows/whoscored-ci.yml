@@ -142,7 +142,8 @@ jobs:
           # v0.37.1: releases/download/v0.37.1/checksums.txt (linux-amd64);
           # annotated tag 363b7b08 -> commit 0b265a9f, runner ubuntu24/20260927.320.
           # v0.37.2: releases/download/v0.37.2/checksums.txt (linux-amd64);
-          # annotated tag e74cfd1c -> commit 2d379c0c, runner ubuntu24/20261004.327.1.
+          # annotated tag e74cfd1c -> commit 2d379c0c;
+          # runners ubuntu24/20261004.327.1 and ubuntu24/20261005.320.
           buildx_sha="$(sha256sum "$buildx_bin" | cut -d' ' -f1)"
           case "$buildx_sha" in
             d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda) ;;
