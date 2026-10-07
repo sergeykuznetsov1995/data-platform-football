@@ -725,9 +725,11 @@ unresolved discovery issues, untracked evidence and every dirty path outside
 those two generated files. It publishes the manifest first and the ready
 attestation last, so interruption remains fail-closed and an identical rerun
 is safe. Commit exactly those two files as the immediate child of the payload
-commit. CI then uses `--expect-ready-build` to prove that child and the complete
-repository closure agree. On a pull request it checks the explicit PR-head SHA
-inside GitHub's clean synthetic merge checkout, with full history available;
+commit. The manually dispatched image contract then uses `--expect-ready-build`
+to prove that child and the complete repository closure agree. Dispatch
+`whoscored-ci.yml` on the release branch, verify that the run's `headSha` is the
+reviewed promotion child, and require its `contract` job to succeed before
+release. It fetches that exact SHA with the parent history needed for validation;
 the release SHA itself must still be the single-parent promotion child. This
 CI mode is build verification only: ordinary validation and production
 admission still require the separate external deployment attestation and final
@@ -3090,6 +3092,21 @@ not a prompt to mint paid authority. Pause and investigate it; DagRun
 configuration cannot increase a budget or bypass the full-crawl sentinel.
 
 ## Validation evidence
+
+Ordinary pull requests run the repository-wide `unit-suite` and real WhoScored
+DAG imports on Airflow 2.7.3 and 2.11.2. They do not build images or download
+Spark. The import jobs use the existing digest-pinned Apache Airflow images and
+hash-checked wheel deltas, then import all four DAGs offline in a read-only
+container with a temporary database. A passing PR is not image-release evidence.
+
+Image builds, browser/runtime smokes and the isolated production contract are
+an explicit release check: run `gh workflow run whoscored-ci.yml --ref
+<reviewed-release-branch>`, record the resulting run ID and `headSha`, and check
+the `contract` result for that exact reviewed revision. The workflow does not
+publish to an external registry or deploy. Changes to the selected branch after
+dispatch require verification of the new SHA before release. This manual check
+does not block ordinary application merges and does not replace the production
+acceptance requirements below.
 
 The source change is accepted only when the isolated WhoScored CI contract,
 Compose rendering, shell syntax, real Airflow DAG-import check, runtime hash and
