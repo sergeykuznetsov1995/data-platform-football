@@ -6,6 +6,7 @@ import importlib
 import json
 import sys
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -462,7 +463,12 @@ class TestFotmobNativeRunner:
             if operation["entity"] == "season_work_plan"
         )
 
-    def _history_lane(self, mod):
+    def _history_lane(
+        self,
+        mod,
+        *,
+        historical_seasons=("2024/2025", "2023/2024"),
+    ):
         """Полоса истории на одном турнире с тремя сезонами.
 
         Общая фикстура барьера продвижения: первая волна закрывает
@@ -482,19 +488,21 @@ class TestFotmobNativeRunner:
         )
 
         root = _league_payload()
-        root["allAvailableSeasons"] = ["2025/2026", "2024/2025", "2023/2024"]
+        root["allAvailableSeasons"] = ["2025/2026", *historical_seasons]
         responses = {
             canonicalize_target("allLeagues").canonical_url: {
                 "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
             },
             canonicalize_target("leagues", {"id": 47}).canonical_url: root,
-            canonicalize_target(
-                "leagues", {"id": 47, "season": "2024/2025"}
-            ).canonical_url: _league_payload("2024/2025"),
-            canonicalize_target(
-                "leagues", {"id": 47, "season": "2023/2024"}
-            ).canonical_url: _league_payload("2023/2024"),
         }
+        responses.update(
+            {
+                canonicalize_target(
+                    "leagues", {"id": 47, "season": season}
+                ).canonical_url: _league_payload(season)
+                for season in historical_seasons
+            }
+        )
         repository = MemoryFotMobRepository()
 
         def run(run_id, *, retryable=False, deadline_at=None):
@@ -546,8 +554,9 @@ class TestFotmobNativeRunner:
         source_season_key="2024/2025",
         outcome=None,
         reason=None,
+        age_completions=True,
     ):
-        """Состарить строку журнала полосы под журнальной подписью волны.
+        """Состарить попытку и парное закрытие под подписью волны.
 
         Карта состояний выбирает САМУЮ СВЕЖУЮ запись скоупа, поэтому «старую»
         попытку нельзя дописать поверх новой — старится сама запись, ровно как
@@ -577,6 +586,82 @@ class TestFotmobNativeRunner:
                 commit.capabilities["reason"] = reason
             matched += 1
         assert matched, f"журнал не содержит попытки {source_season_key}"
+        if age_completions:
+            repository.commits = [
+                replace(commit, completed_at=aged_at)
+                if commit.target_type == "scope_completion"
+                and commit.entity_id == journal
+                and commit.source_season_key == source_season_key
+                else commit
+                for commit in repository.commits
+            ]
+
+    @pytest.mark.unit
+    def test_confirmed_source_gap_in_review_cooldown_is_not_pending(self):
+        """Подтверждённая молодая дыра источника не является долгом E4."""
+
+        from datetime import timezone
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+        first_rc, first_report = run("source-gap-cooldown-1")
+        assert first_rc == 0, first_report["errors"]
+        self._age_lane_journal(repository, first_report, hours_ago=42)
+
+        _second_rc, second_report = run("source-gap-cooldown-2", retryable=True)
+        self._age_lane_journal(
+            repository,
+            second_report,
+            hours_ago=42,
+            source_season_key="2023/2024",
+        )
+        journal = self._season_work_plan(second_report)["metadata"][
+            "journal_plan_signature"
+        ]
+        for observation, hours_ago in ((1, 41), (2, 40)):
+            repository.record_scope_attempt(
+                run_id=f"source-gap-confirmation-{observation}",
+                competition_id=47,
+                source_season_key="2023/2024",
+                plan_signature=journal,
+                outcome="source_gap",
+                reason="source-advertised finished match payloads absent",
+                last_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(hours=hours_ago),
+                attempt_identities=("source-observation-a", "source-observation-b"),
+            )
+
+        rc, report = run("source-gap-cooldown-3")
+
+        assert report["selection"]["planned_scopes"] == []
+        assert rc == 0, (mod._wave_metrics_line(report, rc), report["errors"])
+        work_plan = self._season_work_plan(report)
+        assert work_plan["metadata"]["pending_candidate_scopes"] == 0
+        assert work_plan["metadata"]["cooling_source_gap_scopes"] == ["47=2023/2024"]
+
+    @pytest.mark.unit
+    def test_fresh_completion_without_fresh_attempt_resets_lane_idle(self):
+        """Crash после completion, но до attempt не создаёт ложный E4 red."""
+
+        mod = self._module()
+        repository, run = self._history_lane(mod)
+        first_rc, first_report = run("completion-activity-1")
+        assert first_rc == 0, first_report["errors"]
+        _second_rc, second_report = run("completion-activity-2", retryable=True)
+        self._age_lane_journal(
+            repository,
+            second_report,
+            hours_ago=40,
+            age_completions=False,
+        )
+
+        rc, report = run("completion-activity-3")
+
+        assert report["selection"]["planned_scopes"] == []
+        assert rc == 0, (mod._wave_metrics_line(report, rc), report["errors"])
+        work_plan = self._season_work_plan(report)
+        assert work_plan["errors"] == []
+        assert work_plan["metadata"]["lane_idle_hours"] == 0
 
     @pytest.mark.unit
     def test_automatic_backfill_empty_plan_stays_green_while_the_lane_progresses(self):
@@ -2516,6 +2601,314 @@ class TestFotmobNativeRunner:
         }
 
     @pytest.mark.unit
+    def test_automatic_history_credits_campaign_only_for_season_matches(self):
+        """Три волны не повторяют закрытые кампанией семейства (#1287)."""
+
+        from scrapers.fotmob.planner import (
+            RunMode,
+            TransportBudget,
+            deterministic_plan_signature,
+        )
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload
+
+        mod = self._module()
+        policy = {
+            "match_policy": "finished_only",
+            "leaderboard_policy": "all_advertised",
+            "team_policy": "global_observed_snapshot",
+            "player_policy": "global_observed_snapshot",
+        }
+        campaign_signature = deterministic_plan_signature(
+            {"season", "matches"}, policy=policy
+        )
+        assert campaign_signature == (
+            "fmplan1-15baa7dff09f3aae879da775d8684bc4c4b4d6803e821f40c79f36a7cae7054b"
+        )
+        root = _league_payload()
+        root["allAvailableSeasons"] = ["2025/2026", "2024/2025"]
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: root,
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+            "https://data.fotmob.com/stats/47/season/goals.json": {"TopLists": []},
+        }
+        repository = MemoryFotMobRepository()
+        campaign_service = FotMobIngestService(
+            transport=StubTransport({}),
+            repository=repository,
+            mode=RunMode.BACKFILL,
+            budget=TransportBudget(max_requests=0, max_direct_bytes=0),
+            run_id="campaign-completion",
+        )
+        campaign_service.record_scope_completion(
+            47,
+            "2024/2025",
+            plan_signature=campaign_signature,
+            coverage={"scope_entities": ["matches", "season"]},
+            counts={"matches": 1},
+        )
+        original_campaign_commits = [
+            commit
+            for commit in repository.commits
+            if commit.target_type == "scope_completion"
+            and commit.entity_id == campaign_signature
+        ]
+
+        exact_reports = []
+        exact_transports = []
+        for wave in range(1, 4):
+            transport = StubTransport(dict(responses))
+            service = FotMobIngestService(
+                transport=transport,
+                repository=repository,
+                mode=RunMode.BACKFILL,
+                budget=TransportBudget(
+                    max_requests=100,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=f"history-exact-bridge-{wave}",
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "backfill",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season,matches",
+                    "--run-id",
+                    f"history-exact-bridge-{wave}",
+                ]
+            )
+            rc, report = _run_native_admitted(mod, args, service=service)
+            assert rc == 0, report["errors"]
+            exact_reports.append(report)
+            exact_transports.append(transport)
+
+        assert all(
+            report["selection"]["planned_scopes"] == []
+            for report in exact_reports
+        )
+        assert all(
+            not any("matchDetails" in url for url, _replay in transport.calls)
+            for transport in exact_transports
+        )
+        for report in exact_reports:
+            bridge = self._season_work_plan(report)["metadata"][
+                "campaign_completion_bridge"
+            ]
+            assert bridge["credited_family_scopes"] == {
+                "matches": 1,
+                "season": 1,
+            }
+            assert bridge["replanned_family_scopes"] == {
+                "matches": 0,
+                "season": 0,
+            }
+
+        reports = []
+        transports = []
+        services = []
+        for wave in range(1, 4):
+            transport = StubTransport(dict(responses))
+            service = FotMobIngestService(
+                transport=transport,
+                repository=repository,
+                mode=RunMode.BACKFILL,
+                budget=TransportBudget(
+                    max_requests=100,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=f"history-bridge-{wave}",
+                max_workers=2,
+            )
+            original_sync_leaderboards = service.sync_leaderboards
+            service.sync_leaderboards = MagicMock(
+                side_effect=original_sync_leaderboards
+            )
+            original_sync_season = service.sync_season
+            service.sync_season = MagicMock(side_effect=original_sync_season)
+            original_read_dependency = service.read_season_dependency
+            service.read_season_dependency = MagicMock(
+                side_effect=original_read_dependency
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "backfill",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season,leaderboards,matches",
+                    "--run-id",
+                    f"history-bridge-{wave}",
+                ]
+            )
+            rc, report = _run_native_admitted(mod, args, service=service)
+            assert rc == 0, report["errors"]
+            reports.append(report)
+            transports.append(transport)
+            services.append(service)
+
+        assert reports[0]["selection"]["planned_scopes"] == ["47=2024/2025"]
+        assert reports[1]["selection"]["planned_scopes"] == []
+        assert reports[2]["selection"]["planned_scopes"] == []
+        assert services[0].sync_leaderboards.call_count == 1
+        assert all(service.sync_season.call_count == 0 for service in services)
+        assert [
+            service.read_season_dependency.call_count for service in services
+        ] == [1, 0, 0]
+        assert all(
+            not any("matchDetails" in url for url, _replay in transport.calls)
+            for transport in transports
+        )
+        for report in reports:
+            bridge = self._season_work_plan(report)["metadata"][
+                "campaign_completion_bridge"
+            ]
+            assert bridge["plan_signature"] == campaign_signature
+            assert bridge["scope_entities"] == ["matches", "season"]
+            assert bridge["replanned_family_scopes"] == {
+                "matches": 0,
+                "season": 0,
+            }
+            assert bridge["replanned_family_scope_tokens"] == {
+                "matches": [],
+                "season": [],
+            }
+        assert [
+            self._season_work_plan(report)["metadata"]["campaign_completion_bridge"][
+                "planned_for_remaining_families"
+            ]
+            for report in reports
+        ] == [1, 0, 0]
+        assert not [
+            commit
+            for commit in repository.commits
+            if commit.target_type == "league_season"
+        ]
+
+        campaign_commits = [
+            commit
+            for commit in repository.commits
+            if commit.target_type == "scope_completion"
+            and commit.entity_id == campaign_signature
+        ]
+        assert campaign_commits == original_campaign_commits
+        history_signature = self._season_work_plan(reports[0])["metadata"][
+            "journal_plan_signature"
+        ]
+        assert history_signature != campaign_signature
+        assert repository.completed_scope_keys(history_signature) == {(47, "2024/2025")}
+        history_completion = next(
+            commit
+            for commit in repository.commits
+            if commit.target_type == "scope_completion"
+            and commit.entity_id == history_signature
+        )
+        assert history_completion.capabilities["coverage"]["scope_entities"] == [
+            "leaderboards",
+            "matches",
+            "season",
+        ]
+
+    @pytest.mark.unit
+    def test_automatic_history_does_not_credit_another_completion_signature(self):
+        """Bridge не превращается в безусловный union журналов."""
+
+        from scrapers.fotmob.planner import (
+            RunMode,
+            TransportBudget,
+            deterministic_plan_signature,
+        )
+        from scrapers.fotmob.repository import (
+            ManifestStatus,
+            MemoryFotMobRepository,
+            TargetCommit,
+        )
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _league_payload,
+        )
+
+        mod = self._module()
+        policy = {
+            "match_policy": "finished_only",
+            "leaderboard_policy": "all_advertised",
+            "team_policy": "global_observed_snapshot",
+            "player_policy": "global_observed_snapshot",
+        }
+        wrong_signature = deterministic_plan_signature({"season"}, policy=policy)
+        root = _league_payload()
+        root["allAvailableSeasons"] = ["2025/2026", "2024/2025"]
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: root,
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {
+                "content": {"matchFacts": {"events": []}}
+            },
+        }
+        repository = MemoryFotMobRepository()
+        repository.record(
+            TargetCommit(
+                run_id="other-plan",
+                target_type="scope_completion",
+                target_key="a" * 64,
+                status=ManifestStatus.SUCCESS,
+                competition_id="47",
+                source_season_key="2024/2025",
+                entity_id=wrong_signature,
+                content_hash="b" * 64,
+                capabilities={"coverage": {"scope_entities": ["season"]}},
+            )
+        )
+        transport = StubTransport(responses)
+        service = FotMobIngestService(
+            transport=transport,
+            repository=repository,
+            mode=RunMode.BACKFILL,
+            budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+            run_id="history-no-union",
+            max_workers=2,
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "backfill",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "history-no-union",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        assert any("matchDetails" in url for url, _replay in transport.calls)
+        bridge = self._season_work_plan(report)["metadata"][
+            "campaign_completion_bridge"
+        ]
+        assert bridge["eligible_scopes"] == 0
+
+    @pytest.mark.unit
     def test_stale_deferrals_do_not_leak_into_the_next_runs_evidence(self):
         """Отсрочка прошлого окна не должна становиться доказательством этого.
 
@@ -2614,7 +3007,10 @@ class TestFotmobNativeRunner:
         from scrapers.fotmob.repository import MemoryFotMobRepository
         from scrapers.fotmob.service import FotMobIngestService
         from scrapers.fotmob.transport import canonicalize_target
-        from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _league_payload,
+        )
 
         mod = self._module()
         responses = {
@@ -3746,6 +4142,9 @@ class TestFotmobNativeRunner:
         assert first_rc == 1
         assert first_report["complete"] is False
         signature = first_report["selection"]["scope_plan_signature"]
+        assert signature == (
+            "fmplan1-15baa7dff09f3aae879da775d8684bc4c4b4d6803e821f40c79f36a7cae7054b"
+        )
         assert repository.completed_scope_keys(signature) == set()
 
         second_service, second_transport = make_service(3, "backfill-2")

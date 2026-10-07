@@ -93,6 +93,12 @@ TERMINAL_RETRY_AFTER = timedelta(hours=24)
 # у уже накопленных строк этого срока просто нет.
 SOURCE_GAP_REVIEW_AFTER = timedelta(days=30)
 
+# Product floor for the automatic historical lane.  Discovery keeps every
+# exact source label, while runnable history and its contract start with the
+# 2010 calendar season / 2010-2011 split season.  Labels without a four-digit
+# start year fail closed instead of reopening unbounded pre-2010 history.
+HISTORY_MIN_START_YEAR = 2010
+
 
 def _naive_utc(value: datetime) -> datetime:
     if value.tzinfo is not None:
@@ -262,6 +268,14 @@ def _history_season_cycle_key(source_season_key: str) -> tuple[int, str]:
     return -1, label.casefold()
 
 
+def _history_season_is_in_scope(source_season_key: str) -> bool:
+    """Return whether an exact source label belongs to the approved horizon."""
+
+    label = str(source_season_key).strip()
+    match = re.search(r"(?<!\d)([12]\d{3})(?!\d)", label)
+    return match is not None and int(match.group(1)) >= HISTORY_MIN_START_YEAR
+
+
 def _plan_seasons(
     classifications: Iterable[ScopeClassification],
     seasons: Iterable[SeasonRef],
@@ -308,8 +322,9 @@ def _plan_seasons(
         is_current = _is_current_season(season)
         if lane == ScopeLane.CURRENT and not is_current:
             continue
-        if lane == ScopeLane.HISTORY and is_current:
-            continue
+        if lane == ScopeLane.HISTORY:
+            if is_current or not _history_season_is_in_scope(season.source_season_key):
+                continue
         if mode == RunMode.DAILY and not is_current:
             continue
         if mode == RunMode.BACKFILL and identity in success:
@@ -491,6 +506,7 @@ def utc_run_id(prefix: str = "fotmob") -> str:
 
 
 __all__ = [
+    "HISTORY_MIN_START_YEAR",
     "MANDATORY_COMPETITION_IDS",
     "SCOPE_PLAN_SIGNATURE_VERSION",
     "SOURCE_GAP_REVIEW_AFTER",

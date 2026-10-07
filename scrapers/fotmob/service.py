@@ -1814,12 +1814,46 @@ class FotMobIngestService:
         *,
         prefetched: Optional[FetchResult] = None,
     ) -> tuple[OperationResult, Optional[SeasonBundle]]:
+        """Fetch, parse and persist one season family."""
+
+        return self._season_bundle(
+            competition_id,
+            source_season_key,
+            prefetched=prefetched,
+            persist=True,
+        )
+
+    def read_season_dependency(
+        self,
+        competition_id: int,
+        source_season_key: str,
+        *,
+        prefetched: Optional[FetchResult] = None,
+    ) -> tuple[OperationResult, Optional[SeasonBundle]]:
+        """Parse a bundle for child families without reopening season debt."""
+
+        return self._season_bundle(
+            competition_id,
+            source_season_key,
+            prefetched=prefetched,
+            persist=False,
+        )
+
+    def _season_bundle(
+        self,
+        competition_id: int,
+        source_season_key: str,
+        *,
+        prefetched: Optional[FetchResult],
+        persist: bool,
+    ) -> tuple[OperationResult, Optional[SeasonBundle]]:
         result = OperationResult(
-            "season_bundle",
+            "season_bundle" if persist else "season_bundle_dependency",
             attempted=1,
             metadata={
                 "competition_id": int(competition_id),
                 "source_season_key": source_season_key,
+                "persisted": persist,
             },
         )
         exact = canonicalize_target(
@@ -1863,12 +1897,13 @@ class FotMobIngestService:
             result.record_exception(f"season fetch: {type(exc).__name__}: {exc}", exc)
             return result, None
         if not fetch.ok:
-            self._commit_for_fetch(
-                fetch,
-                target_type="league_season",
-                competition_id=competition_id,
-                source_season_key=source_season_key,
-            )
+            if persist:
+                self._commit_for_fetch(
+                    fetch,
+                    target_type="league_season",
+                    competition_id=competition_id,
+                    source_season_key=source_season_key,
+                )
             self._record_failure(result, fetch.url, fetch)
             return result, None
 
@@ -1940,27 +1975,29 @@ class FotMobIngestService:
                     partition_cols=("target_type",),
                 ),
             ]
-            paths = self._commit_for_fetch(
-                fetch,
-                target_type="league_season",
-                competition_id=competition_id,
-                source_season_key=source_season_key,
-                datasets=datasets,
-                expected_counts={
-                    "matches": int(bundle.capabilities.get("match_count", 0)),
-                    "standings": int(bundle.capabilities.get("standing_count", 0)),
-                    "playoff_brackets": int(
-                        bundle.capabilities.get("playoff_matchup_count", 0)
-                    ),
-                    "season_teams": int(bundle.capabilities.get("team_count", 0)),
-                    "leaderboard_categories": (
-                        int(bundle.capabilities.get("player_category_count", 0))
-                        + int(bundle.capabilities.get("team_category_count", 0))
-                    ),
-                },
-                capabilities=bundle.capabilities,
-                unknown_paths=unknown,
-            )
+            paths = []
+            if persist:
+                paths = self._commit_for_fetch(
+                    fetch,
+                    target_type="league_season",
+                    competition_id=competition_id,
+                    source_season_key=source_season_key,
+                    datasets=datasets,
+                    expected_counts={
+                        "matches": int(bundle.capabilities.get("match_count", 0)),
+                        "standings": int(bundle.capabilities.get("standing_count", 0)),
+                        "playoff_brackets": int(
+                            bundle.capabilities.get("playoff_matchup_count", 0)
+                        ),
+                        "season_teams": int(bundle.capabilities.get("team_count", 0)),
+                        "leaderboard_categories": (
+                            int(bundle.capabilities.get("player_category_count", 0))
+                            + int(bundle.capabilities.get("team_category_count", 0))
+                        ),
+                    },
+                    capabilities=bundle.capabilities,
+                    unknown_paths=unknown,
+                )
             result.tables.extend(paths)
             result.succeeded = 1
             result.counts.update(
@@ -1985,15 +2022,16 @@ class FotMobIngestService:
             ValueError,
         ) as exc:
             result.errors.append(f"season parse: {type(exc).__name__}: {exc}")
-            self._commit_for_fetch(
-                fetch,
-                target_type="league_season",
-                status=_failure_status(exc),
-                competition_id=competition_id,
-                source_season_key=source_season_key,
-                error_code=type(exc).__name__,
-                error=str(exc),
-            )
+            if persist:
+                self._commit_for_fetch(
+                    fetch,
+                    target_type="league_season",
+                    status=_failure_status(exc),
+                    competition_id=competition_id,
+                    source_season_key=source_season_key,
+                    error_code=type(exc).__name__,
+                    error=str(exc),
+                )
             return result, None
 
     def sync_leaderboards(self, bundle: SeasonBundle) -> OperationResult:

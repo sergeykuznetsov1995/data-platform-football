@@ -86,6 +86,7 @@ _SOURCE_GAP_RETRY_REASON = "source-advertised finished match payloads absent"
 _SOURCE_GAP_REASON = (
     "two successful fetches lacked source-advertised finished match payloads"
 )
+_CAMPAIGN_SCOPE_ENTITIES = frozenset({"season", "matches"})
 # Порог простоя полосы истории: сколько полоса может не закрывать НИ ОДНОГО
 # скоупа, прежде чем волна признаётся красной. 24 ч — максимальный штатный
 # бэкофф повтора (`_scope_retry_due`) и он же `planner.TERMINAL_RETRY_AFTER`,
@@ -647,6 +648,14 @@ def _match_kickoff(value: Any) -> datetime | None:
     return parsed
 
 
+def _naive_utc(value: datetime) -> datetime:
+    """Normalize a repository timestamp to the runner's naive-UTC clock."""
+
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 def _match_is_settled(match: Mapping[str, Any]) -> bool:
     """Матч, за которым больше не надо возвращаться.
 
@@ -1137,6 +1146,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
 
     from scrapers.fotmob.planner import (
         MANDATORY_COMPETITION_IDS,
+        SOURCE_GAP_REVIEW_AFTER,
         RunMode,
         ScopeLane,
         catalog_scope_obligation,
@@ -1799,17 +1809,54 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             if raw_store is not None and raw_store.has_target(target):
                 previously_complete.add(season.identity)
 
+    # The external campaign has one exact, un-laned season+matches contract.
+    # Its marker is partial evidence for the wider automatic HISTORY plan, not
+    # a full history completion: scopes still run for every other family and
+    # the history journal keeps its own signature.  Dropping transfer_policy
+    # reconstructs the unchanged explicit campaign policy exactly.
+    campaign_plan_signature: str | None = None
+    campaign_completed_scopes: set[tuple[int, str]] = set()
+    if (
+        automatic_catalog
+        and mode == RunMode.BACKFILL
+        and _CAMPAIGN_SCOPE_ENTITIES <= scope_entities
+    ):
+        campaign_plan_signature = deterministic_plan_signature(
+            _CAMPAIGN_SCOPE_ENTITIES,
+            policy={
+                key: value
+                for key, value in scope_policy.items()
+                if key != "transfer_policy"
+            },
+        )
+        campaign_completed_scopes = service.repository.completed_scope_keys(
+            campaign_plan_signature
+        )
+    remaining_scope_entities = scope_entities - _CAMPAIGN_SCOPE_ENTITIES
+    planner_complete_scopes = set(previously_complete)
+    if campaign_plan_signature is not None and not remaining_scope_entities:
+        # A season+matches-only history contract has nothing left to execute.
+        # Keep the journals separate and let the exact campaign marker satisfy
+        # this plan in memory; neither signature nor marker is rewritten.
+        planner_complete_scopes.update(campaign_completed_scopes)
+
     attempt_states = (
         service.repository.scope_attempt_states(journal_plan_signature)
         if automatic_catalog and automatic_contract is not None
         else {}
     )
+    history_completion_times = (
+        service.repository.scope_completion_times(journal_plan_signature)
+        if automatic_catalog and mode == RunMode.BACKFILL
+        else {}
+    )
+    planning_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     work = plan_seasons(
         classifications,
         seasons,
         mode=mode,
-        previously_successful=previously_complete,
+        previously_successful=planner_complete_scopes,
         explicit_scopes=(explicit_scopes or None),
         lane=(automatic_lane if automatic_catalog else None),
         attempt_states=attempt_states,
@@ -1827,11 +1874,24 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 work_item.competition_id,
             )
         )
-    # Очередь кандидатов полосы: обязательство каталога минус скоупы, уже
-    # закрытые в журнале. Именно она отличает «всё собрано» от «полоса стоит»:
-    # без неё пустой план backfill молча выглядел как законное завершение.
+    # Очередь кандидатов полосы: неизменное обязательство каталога минус
+    # закрытые скоупы и признанные дыры источника, чей 30-дневный срок
+    # пересмотра ещё не наступил. Планировщик временно исключает ровно те же
+    # дыры; считать их долгом E4 означало красить штатно пустую волну.
     obligation_scopes = set(contract_scopes)
-    pending_candidate_scopes = obligation_scopes - previously_complete
+    cooling_source_gap_scopes = {
+        identity
+        for identity, state in attempt_states.items()
+        if automatic_lane == ScopeLane.HISTORY
+        and identity in obligation_scopes
+        and state.outcome == "source_gap"
+        and len(set(state.attempt_identities)) >= 2
+        and planning_observed_at - _naive_utc(state.last_attempt_at)
+        < SOURCE_GAP_REVIEW_AFTER
+    }
+    pending_candidate_scopes = (
+        obligation_scopes - planner_complete_scopes - cooling_source_gap_scopes
+    )
     work_plan = OperationResult(
         "season_work_plan",
         attempted=len(work),
@@ -1842,16 +1902,34 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             # отличить «журнал переехал» от «журнал пуст».
             "journal_plan_signature": journal_plan_signature,
             "scope_entities": sorted(scope_entities),
-            "already_complete_scopes": len(previously_complete),
+            "already_complete_scopes": len(planner_complete_scopes),
+            "history_complete_scopes": len(previously_complete),
             "obligation_scopes": len(obligation_scopes),
             "pending_candidate_scopes": len(pending_candidate_scopes),
+            "cooling_source_gap_scopes": [
+                format_scope_token(*identity)
+                for identity in sorted(cooling_source_gap_scopes)
+            ],
             "attempt_states": len(attempt_states),
             "daily_completion_timestamps": len(daily_scope_times),
-            "debt_scopes": sum(
-                1 for item in work if item.priority[1] == 0
-            ),
+            "debt_scopes": sum(1 for item in work if item.priority[1] == 0),
         },
     )
+    if campaign_plan_signature is not None:
+        campaign_eligible_scopes = obligation_scopes & campaign_completed_scopes
+        work_plan.metadata["campaign_completion_bridge"] = {
+            "plan_signature": campaign_plan_signature,
+            "scope_entities": sorted(_CAMPAIGN_SCOPE_ENTITIES),
+            "eligible_scopes": len(campaign_eligible_scopes),
+            "planned_for_remaining_families": 0,
+            "credited_family_scopes": {
+                "matches": len(campaign_eligible_scopes),
+                "season": len(campaign_eligible_scopes),
+            },
+            "replanned_family_scopes": {"matches": 0, "season": 0},
+            "replanned_family_scope_tokens": {"matches": [], "season": []},
+            "season_dependency_scopes": 0,
+        }
     if automatic_catalog and mode == RunMode.DAILY:
         # Единственная наблюдаемая точка сигнала: N=0 при ненулевом долге в
         # утренней сводке означает, что признак сломан, и правку надо откатить.
@@ -1941,6 +2019,15 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 reason="configured season budget deferred scope",
                 next_retry_at=deferred_at + timedelta(minutes=1),
             )
+    if campaign_plan_signature is not None:
+        bridged_work_scopes = {
+            item.identity for item in work
+        } & campaign_completed_scopes
+        bridge = work_plan.metadata["campaign_completion_bridge"]
+        bridge["planned_for_remaining_families"] = len(bridged_work_scopes)
+        # A read-only parse can still materialize the bundle needed by
+        # leaderboards, teams and players; it never commits season datasets.
+        bridge["season_dependency_scopes"] = len(bridged_work_scopes)
     work_plan.counts["planned_scopes"] = len(work)
     operations.append(work_plan)
     if automatic_catalog:
@@ -1957,6 +2044,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     # the whole request budget and permanently starving child entities.
     for work_index, item in enumerate(work):
         scope_key = format_scope_token(item.competition_id, item.source_season_key)
+        campaign_scope_complete = item.identity in campaign_completed_scopes
         observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         deadline_at = getattr(args, "deadline_at", None)
         deferred_reason = None
@@ -1989,7 +2077,12 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 )
             break
         scope_operations = []
-        operation, bundle = service.sync_season(
+        season_method = (
+            service.read_season_dependency
+            if campaign_scope_complete
+            else service.sync_season
+        )
+        operation, bundle = season_method(
             item.competition_id,
             item.source_season_key,
             prefetched=selected_fetches.get(item.identity),
@@ -2004,7 +2097,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 operations.append(leaderboard_operation)
                 scope_operations.append(leaderboard_operation)
 
-            if "matches" in entities:
+            if "matches" in entities and not campaign_scope_complete:
                 capacity = service.ledger.remaining_requests // max_attempts
                 per_run_limit = args.match_limit or len(bundle.matches)
                 match_operation = service.sync_match_payloads(
@@ -2612,18 +2705,24 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             if isinstance(entry, Mapping)
             and str(entry.get("outcome")) in {"success", "source_gap"}
         )
-        lane_last_activity = max(
-            (
-                state.last_attempt_at
-                for state in attempt_states.values()
-                if state.outcome in {"success", "source_gap"}
+        lane_activity_times = [
+            _naive_utc(state.last_attempt_at)
+            for identity, state in attempt_states.items()
+            if identity in obligation_scopes
+            and (
+                state.outcome in {"success", "source_gap"}
                 or (
                     state.outcome == "retryable"
                     and state.reason == _SOURCE_GAP_RETRY_REASON
                 )
-            ),
-            default=None,
+            )
+        ]
+        lane_activity_times.extend(
+            _naive_utc(completed_at)
+            for identity, completed_at in history_completion_times.items()
+            if identity in obligation_scopes
         )
+        lane_last_activity = max(lane_activity_times, default=None)
         lane_idle = (
             None
             if lane_last_activity is None
