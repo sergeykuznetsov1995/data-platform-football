@@ -132,8 +132,12 @@ def test_real_airflow_211_import_gate_is_not_a_stub_only_test():
         assert entry["image"] == expected_image
     assert "pip download" in job
     assert "--no-deps --require-hashes --only-binary=:all:" in job
-    assert "--no-index --find-links /ci-wheels" in job
-    assert "--target /opt/ci-deps" in job
+    assert "-e PIP_NO_INDEX=1" in job
+    assert "-e PIP_FIND_LINKS=/ci-wheels" in job
+    assert "-e PIP_TARGET=/opt/ci-deps" in job
+    assert "--workdir /workspace" in job
+    for version in matrix["airflow-version"]:
+        assert f"-r docker/images/airflow/requirements-ci-dag-import-{version}.lock" in job
     assert "-e PYTHONUSERBASE=/home/airflow/.local" in job
     assert "-e PIP_USER=false" in job
     assert 'export PYTHONPATH="/opt/ci-deps:$PYTHONPATH"' in job

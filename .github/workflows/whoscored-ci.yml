@@ -1258,6 +1258,9 @@ jobs:
             -e AIRFLOW_VERSION \
             -e PYTHONUSERBASE=/home/airflow/.local \
             -e PIP_USER=false \
+            -e PIP_TARGET=/opt/ci-deps \
+            -e PIP_NO_INDEX=1 \
+            -e PIP_FIND_LINKS=/ci-wheels \
             -e HOME=/tmp/home \
             -e AIRFLOW_HOME=/tmp/airflow \
             -e AIRFLOW__CORE__LOAD_EXAMPLES=False \
@@ -1269,14 +1272,24 @@ jobs:
             -v "${GITHUB_WORKSPACE}:/workspace:ro" \
             -v "${RUNNER_TEMP}/airflow-wheels:/ci-wheels:ro" \
             -v "${pointer_root}:/tmp/whoscored-scheduled-pointers:ro" \
+            --workdir /workspace \
             --entrypoint /bin/bash \
             "$AIRFLOW_IMAGE" \
             -euc '
               mkdir -p "$HOME" "$AIRFLOW_HOME"
-              python -m pip install --no-index --find-links /ci-wheels \
-                --no-deps --require-hashes --only-binary=:all: \
-                --target /opt/ci-deps \
-                -r "/workspace/docker/images/airflow/requirements-ci-dag-import-${AIRFLOW_VERSION}.lock"
+              case "$AIRFLOW_VERSION" in
+                2.7.3)
+                  python -m pip install \
+                    --no-deps --require-hashes --only-binary=:all: \
+                    -r docker/images/airflow/requirements-ci-dag-import-2.7.3.lock
+                  ;;
+                2.11.2)
+                  python -m pip install \
+                    --no-deps --require-hashes --only-binary=:all: \
+                    -r docker/images/airflow/requirements-ci-dag-import-2.11.2.lock
+                  ;;
+                *) exit 1 ;;
+              esac
               export PYTHONPATH="/opt/ci-deps:$PYTHONPATH"
               python -m pip check
               test "$(airflow version)" = "$AIRFLOW_VERSION"
