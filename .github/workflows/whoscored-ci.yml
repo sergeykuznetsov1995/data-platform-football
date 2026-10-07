@@ -1254,11 +1254,11 @@ jobs:
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
-            --tmpfs /opt/ci-deps:rw,nosuid,nodev,uid=50000,gid=0,mode=0700 \
+            --tmpfs /home/airflow/.local/lib/python3.11/site-packages/ci-delta:rw,nosuid,nodev,uid=50000,gid=0,mode=0700 \
             -e AIRFLOW_VERSION \
             -e PYTHONUSERBASE=/home/airflow/.local \
             -e PIP_USER=false \
-            -e PIP_TARGET=/opt/ci-deps \
+            -e PIP_TARGET=/home/airflow/.local/lib/python3.11/site-packages/ci-delta \
             -e PIP_NO_INDEX=1 \
             -e PIP_FIND_LINKS=/ci-wheels \
             -e HOME=/tmp/home \
@@ -1290,7 +1290,7 @@ jobs:
                   ;;
                 *) exit 1 ;;
               esac
-              export PYTHONPATH="/opt/ci-deps:$PYTHONPATH"
+              export PYTHONPATH="/home/airflow/.local/lib/python3.11/site-packages/ci-delta:$PYTHONPATH"
               python -m pip check
               test "$(airflow version)" = "$AIRFLOW_VERSION"
               airflow db migrate

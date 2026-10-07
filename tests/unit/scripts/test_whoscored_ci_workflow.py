@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import os
+import ast
+from types import SimpleNamespace
 import re
 import subprocess
 
@@ -134,13 +136,13 @@ def test_real_airflow_211_import_gate_is_not_a_stub_only_test():
     assert "--no-deps --require-hashes --only-binary=:all:" in job
     assert "-e PIP_NO_INDEX=1" in job
     assert "-e PIP_FIND_LINKS=/ci-wheels" in job
-    assert "-e PIP_TARGET=/opt/ci-deps" in job
+    assert "-e PIP_TARGET=/home/airflow/.local/lib/python3.11/site-packages/ci-delta" in job
     assert "--workdir /workspace" in job
     for version in matrix["airflow-version"]:
         assert f"-r docker/images/airflow/requirements-ci-dag-import-{version}.lock" in job
     assert "-e PYTHONUSERBASE=/home/airflow/.local" in job
     assert "-e PIP_USER=false" in job
-    assert 'export PYTHONPATH="/opt/ci-deps:$PYTHONPATH"' in job
+    assert 'export PYTHONPATH="/home/airflow/.local/lib/python3.11/site-packages/ci-delta:$PYTHONPATH"' in job
     assert '"${RUNNER_TEMP}/airflow-wheels:/ci-wheels:ro"' in job
     assert "python -m pip check" in job
     assert 'test "$(airflow version)" = "$AIRFLOW_VERSION"' in job
@@ -165,6 +167,39 @@ def test_real_airflow_211_import_gate_is_not_a_stub_only_test():
     ):
         assert dag_id in text
         assert dag_id in checker
+
+
+
+def test_parser_wheel_delta_survives_the_real_runtime_import_path_filter():
+    text = _workflow_text().split("  real-airflow-dag-import:", 1)[1]
+    target = re.search(r"-e PIP_TARGET=([^\s]+)", text).group(1)
+    assert f'export PYTHONPATH="{target}:$PYTHONPATH"' in text
+    assert f"--tmpfs {target}:rw,nosuid,nodev,uid=50000,gid=0,mode=0700" in text
+    # Execute the actual startup path filter with the parser's Python layout.
+    # It must preserve installed wheels while rejecting unrelated overlay roots.
+    startup = ROOT / "docker/images/airflow/whoscored_runtime_startup.py"
+    tree = ast.parse(startup.read_text())
+    definitions = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef)
+        and node.name in {"_validated_image_site_directory", "_trusted_python_paths"}
+    ]
+    fake_sys = SimpleNamespace(
+        version_info=SimpleNamespace(major=3, minor=11),
+        base_prefix="/usr/local", prefix="/usr/local", exec_prefix="/usr/local",
+        path=[target, "/workspace", "/workspace/dags", "/opt/untrusted-overlay",
+              "/usr/local/lib/python311.zip", "/usr/local/lib/python3.11",
+              "/usr/local/lib/python3.11/lib-dynload",
+              "/home/airflow/.local/lib/python3.11/site-packages"],
+    )
+    namespace = {
+        "_STARTUP_SYS": fake_sys, "_STARTUP_REQUIRE_FULL": False,
+        "_STARTUP_ENFORCE_TRUST_OWNERSHIP": True,
+    }
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(startup), "exec"), namespace)
+    filtered = namespace["_trusted_python_paths"]("/workspace")
+    assert target in filtered
+    assert "/opt/untrusted-overlay" not in filtered
+    assert filtered.index(target) < filtered.index("/workspace") < filtered.index("/workspace/dags")
 
 
 def test_ci_builds_auxiliary_python_images_from_their_locked_dockerfiles():
