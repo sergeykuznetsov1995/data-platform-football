@@ -2,12 +2,13 @@
 
 > Status: **active** · Created 2026-06-07 · Owner: data-platform
 > Scope: `iceberg.silver.*` (46 tables, 9 sources + xref subsystem)
-> Companion checker: `scripts/audit_silver_charter.py` · Cheat-sheet: `dags/sql/silver/README.md`
+> Companion checker: `scripts/audit_silver_charter.py` · [Cheat-sheet](../../dags/sql/silver/README.md)
 
 This is the **normative contract** for what belongs in the Silver layer. It does not
-re-document the footguns already in [CLAUDE.md](../../CLAUDE.md) (xref `(league, season)`
+re-document the footguns in the [SQL guide](../../dags/sql/silver/README.md) (xref `(league, season)`
 predicate, `replace_partitions`, double-cast IDs, hash-PK tiebreaker) — those still apply.
-It adds the one thing CLAUDE.md leaves implicit: **the Silver/Gold boundary**.
+The guide and [AGENTS.md](../../AGENTS.md) carry the portable project instructions.
+This charter defines **the Silver/Gold boundary**.
 
 ---
 
@@ -114,7 +115,7 @@ in `_build_silver_checks()` (`dags/utils/silver_tasks.py`).
 
 - xref JOINs are the **only** sanctioned cross-table reference in Silver.
 - Every JOIN on `silver.xref_*` MUST carry `AND xref.league = e.league AND xref.season =
-  e.season` (CLAUDE.md footgun: 1.5–4× row fan-out without it). Checker R3 = ERROR.
+  e.season` (1.5–4× row fan-out without it). Checker R3 = ERROR.
 - Storing the **raw** source id and deferring resolution to Gold is **also valid** — many
   clean tables do this. The charter allows both; it only mandates the `(league, season)`
   predicate when xref *is* used.
@@ -190,7 +191,7 @@ FotMob / MatchHistory branches.
 > its source `bronze.sofascore_player_season_stats` is already season-grain (SofaScore serves
 > season stats directly), so the table is conform + xref enrichment, not an aggregation.
 
-> Note: Gold **already** has a gold-on-gold tier doing its own rollups (CLAUDE.md §Project map).
+> Note: Gold **already** has a gold-on-gold tier doing its own rollups (see `dags/utils/gold_tasks.py`).
 > Migrating these is removing duplicated logic, not adding new — which is also why it is *not*
 > done casually: the live `fct_*` tables depend on current shapes.
 
