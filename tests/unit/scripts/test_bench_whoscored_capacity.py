@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any
 import zipfile
@@ -68,6 +69,128 @@ RUNNING_CONTAINER_IDS = {
 EXPECTED_CURL_CFFI_SHA256 = (
     "2b6c847d86283b07ae69bb72c82eb8a59242277142aa35b89850f89e792a02fc"
 )
+
+# Explicit unit-host fixtures, separate from the production admission pins.
+# Both builds report util-linux 2.39.3; do not accept arbitrary host bytes.
+UNIT_UNSHARE_PATH = Path("/usr/bin/unshare")
+UNIT_UNSHARE_VERSION = "unshare from util-linux 2.39.3"
+UNIT_UNSHARE_SHA256 = frozenset(
+    {
+        "51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb",
+        "a23c8863860669003dc4660039fe642f5795c8c2195898ebc5d01afa1ac3d11c",
+    }
+)
+
+
+@pytest.fixture
+def unit_namespace_helper(monkeypatch, tmp_path):
+    """Admit pinned test bytes, retaining real namespace and metadata checks."""
+    payload = capacity._read_admitted_worker_bytes(
+        UNIT_UNSHARE_PATH, label="unit PID-namespace helper"
+    )
+    digest = hashlib.sha256(payload).hexdigest()
+    assert digest in UNIT_UNSHARE_SHA256, "unreviewed unit unshare build"
+    helper = tmp_path / "unshare"
+    helper.write_bytes(payload)
+    helper.chmod(0o755)
+    monkeypatch.setattr(capacity, "WORKER_NAMESPACE_EXECUTABLE", helper)
+    monkeypatch.setattr(capacity, "REQUIRED_UNSHARE_SHA256", digest)
+    monkeypatch.setattr(capacity, "REQUIRED_UNSHARE_VERSION", UNIT_UNSHARE_VERSION)
+    return helper
+
+
+@pytest.fixture
+def dependency_only_preflight(monkeypatch):
+    """Dependency tests exercise imports/version after the separate host gate."""
+    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
+
+
+@pytest.mark.parametrize(
+    "corruption,error",
+    (
+        ("hash", "PID-namespace helper hash mismatch"),
+        ("version", "PID-namespace helper version mismatch"),
+        ("metadata", "executable metadata is invalid"),
+    ),
+)
+def test_worker_helper_guard_blocks_launch(
+    monkeypatch, unit_namespace_helper, corruption, error
+):
+    if corruption == "hash":
+        unit_namespace_helper.write_bytes(b"corrupt executable\n")
+    elif corruption == "metadata":
+        unit_namespace_helper.chmod(0o777)
+    else:
+        real_run = capacity.subprocess.run
+
+        def wrong_version(argv, **kwargs):
+            if argv == [str(unit_namespace_helper), "--version"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, "unshare wrong version\n", ""
+                )
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(capacity.subprocess, "run", wrong_version)
+
+    real_popen = capacity.subprocess.Popen
+    launched_workers = []
+
+    def track_workers(argv, **kwargs):
+        if str(capacity.WORKER_EXEC_SCRIPT) in argv:
+            launched_workers.append(argv)
+            pytest.fail("worker launched before helper admission")
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(capacity.subprocess, "Popen", track_workers)
+    commands = [
+        capacity.WorkerCommand(index, 0, "scope", (sys.executable, "-c", "pass"))
+        for index in range(capacity.WORKER_COUNT)
+    ]
+    with pytest.raises(RuntimeError, match=error):
+        capacity._run_subprocess_round(
+            commands,
+            deadline=time.monotonic() + 10,
+            on_sample=lambda force: None,
+            on_outcome=lambda outcome: None,
+            should_stop=lambda: False,
+            before_launch=lambda: None,
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+        )
+    assert launched_workers == []
+
+
+def test_production_helper_pin_rejects_other_bytes_before_launch(monkeypatch, tmp_path):
+    # No unit helper fixture: these are the unchanged production admission pins.
+    assert capacity.WORKER_NAMESPACE_EXECUTABLE == Path("/usr/bin/unshare")
+    assert capacity.REQUIRED_UNSHARE_VERSION == "unshare from util-linux 2.39.3"
+    assert capacity.REQUIRED_UNSHARE_SHA256 == (
+        "51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb"
+    )
+    helper = tmp_path / "unshare"
+    helper.write_bytes(b"not the production helper\n")
+    helper.chmod(0o755)
+    monkeypatch.setattr(capacity, "WORKER_NAMESPACE_EXECUTABLE", helper)
+    monkeypatch.setattr(
+        capacity.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("hash rejection must precede any process"),
+    )
+    commands = [
+        capacity.WorkerCommand(index, 0, "scope", (sys.executable, "-c", "pass"))
+        for index in range(capacity.WORKER_COUNT)
+    ]
+    with pytest.raises(RuntimeError, match="PID-namespace helper hash mismatch"):
+        capacity._run_subprocess_round(
+            commands,
+            deadline=time.monotonic() + 10,
+            on_sample=lambda force: None,
+            on_outcome=lambda outcome: None,
+            should_stop=lambda: False,
+            before_launch=lambda: None,
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+        )
 
 
 def _production_deployment(tmp_path: Path) -> capacity.ProductionDeployment:
@@ -1080,7 +1203,9 @@ def test_pre_phase_dependency_failure_surfaces_actual_safe_error():
     assert len(summary["workflow_error_sha256"]) == 64
 
 
-def test_real_runtime_preflight_requires_pinned_curl_cffi(monkeypatch):
+def test_real_runtime_preflight_requires_pinned_curl_cffi(
+    monkeypatch, dependency_only_preflight
+):
     def missing_module(name: str):
         raise ModuleNotFoundError(name)
 
@@ -1092,7 +1217,7 @@ def test_real_runtime_preflight_requires_pinned_curl_cffi(monkeypatch):
 
 
 def test_real_runtime_preflight_fails_when_requests_submodule_cannot_import(
-    monkeypatch,
+    monkeypatch, dependency_only_preflight
 ):
     calls = []
 
@@ -1113,7 +1238,9 @@ def test_real_runtime_preflight_fails_when_requests_submodule_cannot_import(
     assert "SENSITIVE_SENTINEL" not in error
 
 
-def test_real_runtime_preflight_rejects_nonproduction_distribution(monkeypatch):
+def test_real_runtime_preflight_rejects_nonproduction_distribution(
+    monkeypatch, dependency_only_preflight
+):
     monkeypatch.setattr(
         capacity.importlib,
         "import_module",
@@ -1993,7 +2120,7 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding(tmp_path):
     assert normalise(public_port)["published_endpoint_contract_ok"] is False
 
 
-def test_subprocess_round_launches_four_real_isolated_processes():
+def test_subprocess_round_launches_four_real_isolated_processes(unit_namespace_helper):
     payload = json.dumps(_workflow_report(page_units=1))
     child_code = (
         "import os; "
@@ -2030,7 +2157,7 @@ def test_subprocess_round_launches_four_real_isolated_processes():
 
 
 def test_worker_control_is_absent_from_proc_cmdline_and_parent_fds_close(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_namespace_helper
 ):
     owner = "privateownerscope123456789"
     endpoint = capacity.REQUIRED_FLARESOLVERR_ENDPOINT
@@ -2063,7 +2190,8 @@ def test_worker_control_is_absent_from_proc_cmdline_and_parent_fds_close(
 
     def track_popen(*args, **kwargs):
         process = real_popen(*args, **kwargs)
-        launched_pids.append(process.pid)
+        if str(capacity.WORKER_EXEC_SCRIPT) in args[0]:
+            launched_pids.append(process.pid)
         return process
 
     real_control_pipe = capacity._capacity_control_pipe
@@ -2074,7 +2202,6 @@ def test_worker_control_is_absent_from_proc_cmdline_and_parent_fds_close(
         issued_control_fds.append(control_fd)
         return control_fd
 
-    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
     monkeypatch.setattr(capacity.subprocess, "Popen", track_popen)
     monkeypatch.setattr(capacity, "_capacity_control_pipe", track_control_pipe)
     cmdlines = []
@@ -2111,7 +2238,7 @@ def test_worker_control_is_absent_from_proc_cmdline_and_parent_fds_close(
 
 
 def test_subprocess_round_rechecks_identity_after_all_workers_are_blocked(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_namespace_helper
 ):
     marker = tmp_path / "worker-started"
     commands = [
@@ -2128,12 +2255,12 @@ def test_subprocess_round_rechecks_identity_after_all_workers_are_blocked(
         for worker_id in range(capacity.WORKER_COUNT)
     ]
     launched = []
-    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
     real_popen = capacity.subprocess.Popen
 
     def track_popen(*args, **kwargs):
         process = real_popen(*args, **kwargs)
-        launched.append(process)
+        if str(capacity.WORKER_EXEC_SCRIPT) in args[0]:
+            launched.append(process)
         return process
 
     monkeypatch.setattr(capacity.subprocess, "Popen", track_popen)
@@ -2162,7 +2289,7 @@ def test_subprocess_round_rechecks_identity_after_all_workers_are_blocked(
 
 
 def test_subprocess_round_atomic_release_failure_starts_no_worker(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_namespace_helper
 ):
     markers = [tmp_path / f"worker-{index}-started" for index in range(4)]
     commands = [
@@ -2183,10 +2310,10 @@ def test_subprocess_round_atomic_release_failure_starts_no_worker(
 
     def track_popen(*args, **kwargs):
         process = real_popen(*args, **kwargs)
-        launched.append(process)
+        if str(capacity.WORKER_EXEC_SCRIPT) in args[0]:
+            launched.append(process)
         return process
 
-    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
     monkeypatch.setattr(capacity.subprocess, "Popen", track_popen)
     monkeypatch.setattr(
         capacity,
@@ -2212,7 +2339,7 @@ def test_subprocess_round_atomic_release_failure_starts_no_worker(
 
 
 def test_subprocess_round_rechecks_deadline_after_slow_release_gate(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_namespace_helper
 ):
     marker = tmp_path / "worker-started-after-deadline"
     commands = [
@@ -2228,8 +2355,6 @@ def test_subprocess_round_rechecks_deadline_after_slow_release_gate(
         )
         for worker_id in range(capacity.WORKER_COUNT)
     ]
-    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
-
     with pytest.raises(RuntimeError, match="missed the deadline"):
         capacity._run_subprocess_round(
             commands,
@@ -2297,7 +2422,9 @@ def test_worker_barrier_rejects_eof_or_wrong_release_byte(
             process.wait(timeout=5)
 
 
-def test_subprocess_supervisor_refills_fast_slot_without_waiting_for_slowest():
+def test_subprocess_supervisor_refills_fast_slot_without_waiting_for_slowest(
+    unit_namespace_helper,
+):
     payload = json.dumps(_workflow_report(page_units=1))
     commands = []
     for worker_id in range(capacity.WORKER_COUNT):
@@ -2355,7 +2482,7 @@ def test_sigterm_handler_sets_stop_callback_once_without_async_raise():
 
 @pytest.mark.parametrize("handled_signal", [signal.SIGTERM, signal.SIGINT])
 def test_signal_flag_set_at_popen_return_registers_then_terminates_child(
-    monkeypatch, handled_signal
+    monkeypatch, handled_signal, unit_namespace_helper
 ):
     stop_requested = False
     launched_pids = []
@@ -2369,14 +2496,14 @@ def test_signal_flag_set_at_popen_return_registers_then_terminates_child(
     previous_handlers = capacity._install_termination_handlers(
         True, record_signal
     )
-    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
     real_popen = capacity.subprocess.Popen
 
     def popen_then_signal(*args, **kwargs):
         process = real_popen(*args, **kwargs)
-        launched_pids.append(process.pid)
-        handler = signal.getsignal(handled_signal)
-        handler(handled_signal, None)
+        if str(capacity.WORKER_EXEC_SCRIPT) in args[0]:
+            launched_pids.append(process.pid)
+            handler = signal.getsignal(handled_signal)
+            handler(handled_signal, None)
         return process
 
     monkeypatch.setattr(capacity.subprocess, "Popen", popen_then_signal)
@@ -2413,7 +2540,9 @@ def test_signal_flag_set_at_popen_return_registers_then_terminates_child(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux prctl contract")
-def test_real_parent_sigkill_kills_pid_namespace_worker_subtree(tmp_path):
+def test_real_parent_sigkill_kills_pid_namespace_worker_subtree(
+    tmp_path, unit_namespace_helper
+):
     worker_pid_path = tmp_path / "worker.pid"
     descendant_pid_path = tmp_path / "descendant.pid"
     descendant_code = (
@@ -2493,7 +2622,9 @@ def test_real_parent_sigkill_kills_pid_namespace_worker_subtree(tmp_path):
                 os.kill(pid, signal.SIGKILL)
 
 
-def test_base_signal_unwind_terminates_every_detached_worker_group(tmp_path):
+def test_base_signal_unwind_terminates_every_detached_worker_group(
+    tmp_path, unit_namespace_helper
+):
     pid_files = [tmp_path / f"worker-{worker_id}.pid" for worker_id in range(4)]
     commands = [
         capacity.WorkerCommand(
@@ -2600,9 +2731,8 @@ def test_stop_processes_kills_term_ignoring_descendant_after_leader_exit(
 
 
 def test_pid_namespace_cleans_descendants_before_slot_replacement(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_namespace_helper
 ):
-    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
     monkeypatch.setattr(capacity, "_TERMINATE_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(capacity, "_KILL_CONFIRM_SECONDS", 2.0)
     descendant_paths = [tmp_path / f"orphan-{index}.pid" for index in range(4)]
@@ -2658,7 +2788,9 @@ def test_pid_namespace_cleans_descendants_before_slot_replacement(
     )
 
 
-def test_gate_abort_allows_four_real_children_to_run_cleanup(tmp_path):
+def test_gate_abort_allows_four_real_children_to_run_cleanup(
+    tmp_path, unit_namespace_helper
+):
     ready_files = [tmp_path / f"worker-{worker_id}.ready" for worker_id in range(4)]
     cleanup_files = [
         tmp_path / f"worker-{worker_id}.cleanup" for worker_id in range(4)
@@ -3899,7 +4031,7 @@ def test_mixed_sigterm_and_sigkill_outcomes_still_require_and_pass_cleanup_gate(
 
 
 def test_term_ignoring_workers_are_killed_before_session_cleanup(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_namespace_helper
 ):
     monkeypatch.setattr(capacity, "_TERMINATE_GRACE_SECONDS", 0.1)
     monkeypatch.setattr(capacity, "_KILL_CONFIRM_SECONDS", 2.0)
@@ -4129,7 +4261,7 @@ def test_admitted_container_runtime_is_loaded_from_captured_bytes():
 
 
 def test_container_runtime_tree_is_materialized_at_exact_owner_path():
-    owner = f"{os.getpid():024x}"[-24:]
+    owner = uuid.uuid4().hex[:24]
     expected_owner_root = Path("/tmp") / (
         capacity._HOST_RUNTIME_OWNER_PREFIX + owner
     )
@@ -4147,10 +4279,10 @@ def test_container_runtime_tree_is_materialized_at_exact_owner_path():
         pending_runtime_tree_files={"payload.py": b"VALUE = 1\n"},
     )
 
-    capacity._materialize_admitted_container_runtime(
-        runtime, session_owner=owner
-    )
     try:
+        capacity._materialize_admitted_container_runtime(
+            runtime, session_owner=owner
+        )
         assert runtime.runtime_root == expected_owner_root / "root"
         assert runtime.source_circuit_root == expected_owner_root / "source-circuit"
         assert runtime.session_owner == owner
@@ -4160,7 +4292,7 @@ def test_container_runtime_tree_is_materialized_at_exact_owner_path():
         leftover_spool.mkdir(mode=0o700)
         (leftover_spool / "rows.sqlite3").write_bytes(b"temporary spool")
     finally:
-        runtime.close()
+        assert runtime.close(), "own test runtime cleanup failed"
     assert not expected_owner_root.exists()
 
 
@@ -4644,7 +4776,9 @@ def test_procfs_sampler_fails_when_a_required_root_is_not_visible():
         capacity._sample_process_rss([os.getpid(), 2_147_483_647])
 
 
-def test_runtime_identity_covers_canary_parser_transport_and_container_helpers():
+def test_runtime_identity_covers_canary_parser_transport_and_container_helpers(
+    unit_namespace_helper,
+):
     identity = capacity._runtime_identity(_parse_cli())
 
     assert capacity.CANARY_VERSION == "whoscored-capacity-canary-v4"
@@ -4738,7 +4872,9 @@ def test_worker_runtime_tree_rejects_unsafe_members(relative):
         capacity._materialize_worker_runtime_tree({relative: b"payload"})
 
 
-def test_worker_runtime_bundle_is_deterministic_sealed_and_checkout_free():
+def test_worker_runtime_bundle_is_deterministic_sealed_and_checkout_free(
+    unit_namespace_helper,
+):
     assert capacity._WORKER_BUNDLE_PATHS == tuple(
         sorted(capacity._WORKER_BUNDLE_PATHS)
     )

@@ -57,7 +57,14 @@ env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS \
 
 Полный suite содержит проверки предпосылок рабочего хоста. На другом компьютере
 они могут падать; сохраняй вывод и сравнивай с базой в таком же окружении. Не убирай
-их ради зелёного результата. Общий [CI unit-suite](.github/workflows/ci.yml)
+их ради зелёного результата. Процессные unit-тесты WhoScored используют явную
+fixture с `/usr/bin/unshare`, версией util-linux 2.39.3 и двумя закреплёнными SHA256
+сборок; остальные байты отвергаются. Fixture действует только в выбранных тестах,
+production admission pins не меняет. Реальные PID namespaces, prctl, завершение
+потомков и проверки metadata/seals сохраняются; нужен root Linux-хост с разрешением
+на PID namespace. Проверки Python-зависимостей отдельно изолируют host-preflight;
+негативные тесты helper подтверждают отказ до запуска worker.
+Общий [CI unit-suite](.github/workflows/ci.yml)
 явно исключает шесть WhoScored host-seal файлов; это существующее разделение CI и
 локального full suite, не разрешение копировать исключения в локальную команду.
 Source workflows в [.github/workflows](.github/workflows/) проверяют более глубокие
