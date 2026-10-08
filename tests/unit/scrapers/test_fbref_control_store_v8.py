@@ -98,7 +98,7 @@ def competition_entry(index, *, gender="male", crawl_state=None, metadata=None):
 
 def test_v8_is_append_only_schema_for_provenance_aliases_and_cancellation():
     assert tuple(migration.version for migration in MIGRATIONS) == tuple(
-        range(1, 11)
+        range(1, 12)
     )
     migration = next(item for item in MIGRATIONS if item.version == 8)
     assert migration.version == 8

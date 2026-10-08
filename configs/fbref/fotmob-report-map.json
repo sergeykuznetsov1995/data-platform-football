@@ -1,0 +1,1000 @@
+{
+  "version": 1,
+  "catalog_observed_at": "2026-10-08",
+  "evidence": "Read-only FBref competition_registry + FotMob Bronze included catalog; explicit source IDs, no runtime fuzzy joins",
+  "competitions": {
+    "122": {
+      "fbref_name": "UEFA Super Cup",
+      "fotmob_ids": [
+        "74"
+      ],
+      "fotmob_names": [
+        "UEFA Super Cup"
+      ]
+    },
+    "656": {
+      "fbref_name": "Africa Cup of Nations",
+      "fotmob_ids": [
+        "289"
+      ],
+      "fotmob_names": [
+        "Africa Cup of Nations"
+      ]
+    },
+    "681": {
+      "fbref_name": "CONCACAF Gold Cup",
+      "fotmob_ids": [
+        "298"
+      ],
+      "fotmob_names": [
+        "CONCACAF Gold Cup"
+      ]
+    },
+    "685": {
+      "fbref_name": "CONMEBOL Copa América",
+      "fotmob_ids": [
+        "44"
+      ],
+      "fotmob_names": [
+        "Copa America"
+      ]
+    },
+    "257": {
+      "fbref_name": "OFC Nations Cup",
+      "fotmob_ids": [],
+      "fotmob_names": [],
+      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+    },
+    "676": {
+      "fbref_name": "UEFA European Football Championship",
+      "fotmob_ids": [
+        "50"
+      ],
+      "fotmob_names": [
+        "EURO"
+      ]
+    },
+    "664": {
+      "fbref_name": "AFC Asian Cup",
+      "fotmob_ids": [
+        "290"
+      ],
+      "fotmob_names": [
+        "Asian Cup"
+      ]
+    },
+    "9": {
+      "fbref_name": "Premier League",
+      "fotmob_ids": [
+        "47"
+      ],
+      "fotmob_names": [
+        "Premier League"
+      ]
+    },
+    "133": {
+      "fbref_name": "CONCACAF Champions Cup",
+      "fotmob_ids": [
+        "297"
+      ],
+      "fotmob_names": [
+        "CONCACAF Champions Cup"
+      ]
+    },
+    "939": {
+      "fbref_name": "Leagues Cup",
+      "fotmob_ids": [
+        "10043"
+      ],
+      "fotmob_names": [
+        "Leagues Cup"
+      ]
+    },
+    "14": {
+      "fbref_name": "Copa Libertadores de América",
+      "fotmob_ids": [
+        "45"
+      ],
+      "fotmob_names": [
+        "Copa Libertadores"
+      ]
+    },
+    "19": {
+      "fbref_name": "UEFA Europa League",
+      "fotmob_ids": [
+        "73"
+      ],
+      "fotmob_names": [
+        "Europa League"
+      ]
+    },
+    "882": {
+      "fbref_name": "UEFA Conference League",
+      "fotmob_ids": [
+        "10216"
+      ],
+      "fotmob_names": [
+        "Conference League"
+      ]
+    },
+    "1": {
+      "fbref_name": "FIFA World Cup",
+      "fotmob_ids": [
+        "77"
+      ],
+      "fotmob_names": [
+        "World Cup"
+      ]
+    },
+    "218": {
+      "fbref_name": "International Friendlies (M)",
+      "fotmob_ids": [
+        "114"
+      ],
+      "fotmob_names": [
+        "Friendlies"
+      ]
+    },
+    "205": {
+      "fbref_name": "Copa CONMEBOL Sudamericana",
+      "fotmob_ids": [
+        "299"
+      ],
+      "fotmob_names": [
+        "Copa Sudamericana"
+      ]
+    },
+    "8": {
+      "fbref_name": "UEFA Champions League",
+      "fotmob_ids": [
+        "42"
+      ],
+      "fotmob_names": [
+        "Champions League"
+      ]
+    },
+    "719": {
+      "fbref_name": "FIFA Club World Cup",
+      "fotmob_ids": [
+        "78"
+      ],
+      "fotmob_names": [
+        "FIFA Club World Cup"
+      ]
+    },
+    "12": {
+      "fbref_name": "La Liga",
+      "fotmob_ids": [
+        "87"
+      ],
+      "fotmob_names": [
+        "LaLiga"
+      ]
+    },
+    "13": {
+      "fbref_name": "Ligue 1",
+      "fotmob_ids": [
+        "53"
+      ],
+      "fotmob_names": [
+        "Ligue 1"
+      ]
+    },
+    "20": {
+      "fbref_name": "Fußball-Bundesliga",
+      "fotmob_ids": [
+        "54"
+      ],
+      "fotmob_names": [
+        "Bundesliga"
+      ]
+    },
+    "11": {
+      "fbref_name": "Serie A (M)",
+      "fotmob_ids": [
+        "55"
+      ],
+      "fotmob_names": [
+        "Serie A"
+      ]
+    },
+    "21": {
+      "fbref_name": "Liga Profesional de Fútbol Argentina",
+      "fotmob_ids": [
+        "112"
+      ],
+      "fotmob_names": [
+        "Liga Profesional"
+      ]
+    },
+    "65": {
+      "fbref_name": "A-League Men",
+      "fotmob_ids": [
+        "113"
+      ],
+      "fotmob_names": [
+        "A-League"
+      ]
+    },
+    "56": {
+      "fbref_name": "Austrian Football Bundesliga",
+      "fotmob_ids": [
+        "38"
+      ],
+      "fotmob_names": [
+        "Bundesliga"
+      ]
+    },
+    "74": {
+      "fbref_name": "División de Fútbol Profesional",
+      "fotmob_ids": [
+        "144"
+      ],
+      "fotmob_names": [
+        "Primera Division"
+      ]
+    },
+    "666": {
+      "fbref_name": "FIFA Confederations Cup",
+      "fotmob_ids": [],
+      "fotmob_names": [],
+      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+    },
+    "24": {
+      "fbref_name": "Campeonato Brasileiro Série A",
+      "fotmob_ids": [
+        "268"
+      ],
+      "fotmob_names": [
+        "Série A"
+      ]
+    },
+    "677": {
+      "fbref_name": "UEFA Nations League",
+      "fotmob_ids": [
+        "9806",
+        "9807",
+        "9808",
+        "9809"
+      ],
+      "fotmob_names": [
+        "UEFA Nations League A",
+        "UEFA Nations League B",
+        "UEFA Nations League C",
+        "UEFA Nations League D"
+      ]
+    },
+    "67": {
+      "fbref_name": "First Professional Football League",
+      "fotmob_ids": [
+        "270"
+      ],
+      "fotmob_names": [
+        "First Professional League"
+      ]
+    },
+    "41": {
+      "fbref_name": "Categoría Primera A",
+      "fotmob_ids": [
+        "274"
+      ],
+      "fotmob_names": [
+        "Primera A"
+      ]
+    },
+    "37": {
+      "fbref_name": "Belgian Pro League",
+      "fotmob_ids": [
+        "40"
+      ],
+      "fotmob_names": [
+        "First Division A"
+      ]
+    },
+    "211": {
+      "fbref_name": "Canadian Premier League",
+      "fotmob_ids": [
+        "9986"
+      ],
+      "fotmob_names": [
+        "Premier League"
+      ]
+    },
+    "35": {
+      "fbref_name": "Liga de Primera",
+      "fotmob_ids": [
+        "273"
+      ],
+      "fotmob_names": [
+        "Liga de Primera"
+      ]
+    },
+    "62": {
+      "fbref_name": "Chinese Football Association Super League",
+      "fotmob_ids": [
+        "120"
+      ],
+      "fotmob_names": [
+        "Super League"
+      ]
+    },
+    "63": {
+      "fbref_name": "Croatian Football League",
+      "fotmob_ids": [
+        "252"
+      ],
+      "fotmob_names": [
+        "HNL"
+      ]
+    },
+    "66": {
+      "fbref_name": "Czech First League",
+      "fotmob_ids": [
+        "122"
+      ],
+      "fotmob_names": [
+        "1. Liga"
+      ]
+    },
+    "50": {
+      "fbref_name": "Danish Superliga",
+      "fotmob_ids": [
+        "46"
+      ],
+      "fotmob_names": [
+        "Superligaen"
+      ]
+    },
+    "43": {
+      "fbref_name": "Veikkausliiga",
+      "fotmob_ids": [
+        "51"
+      ],
+      "fotmob_names": [
+        "Veikkausliiga"
+      ]
+    },
+    "27": {
+      "fbref_name": "Super League Greece",
+      "fotmob_ids": [
+        "135"
+      ],
+      "fotmob_names": [
+        "Super League 1"
+      ]
+    },
+    "46": {
+      "fbref_name": "Nemzeti Bajnokság I",
+      "fotmob_ids": [
+        "212"
+      ],
+      "fotmob_names": [
+        "Nemzeti Bajnokság I"
+      ]
+    },
+    "82": {
+      "fbref_name": "Indian Super League",
+      "fotmob_ids": [
+        "9478"
+      ],
+      "fotmob_names": [
+        "Indian Super League"
+      ]
+    },
+    "80": {
+      "fbref_name": "League of Ireland Premier Division",
+      "fotmob_ids": [
+        "126"
+      ],
+      "fotmob_names": [
+        "Premier Division"
+      ]
+    },
+    "64": {
+      "fbref_name": "Persian Gulf Pro League",
+      "fotmob_ids": [
+        "523"
+      ],
+      "fotmob_names": [
+        "Persian Gulf"
+      ]
+    },
+    "25": {
+      "fbref_name": "J1 League",
+      "fotmob_ids": [
+        "223"
+      ],
+      "fotmob_names": [
+        "J. League"
+      ]
+    },
+    "55": {
+      "fbref_name": "K League 1",
+      "fotmob_ids": [
+        "9080"
+      ],
+      "fotmob_names": [
+        "K League 1"
+      ]
+    },
+    "70": {
+      "fbref_name": "Saudi Pro League",
+      "fotmob_ids": [
+        "536"
+      ],
+      "fotmob_names": [
+        "Saudi Pro League"
+      ]
+    },
+    "31": {
+      "fbref_name": "Liga MX",
+      "fotmob_ids": [
+        "230"
+      ],
+      "fotmob_names": [
+        "Liga MX"
+      ]
+    },
+    "23": {
+      "fbref_name": "Eredivisie",
+      "fotmob_ids": [
+        "57"
+      ],
+      "fotmob_names": [
+        "Eredivisie"
+      ]
+    },
+    "28": {
+      "fbref_name": "Eliteserien",
+      "fotmob_ids": [
+        "59"
+      ],
+      "fotmob_names": [
+        "Eliteserien"
+      ]
+    },
+    "61": {
+      "fbref_name": "APF División de Honor",
+      "fotmob_ids": [
+        "199"
+      ],
+      "fotmob_names": [
+        "Division Profesional"
+      ]
+    },
+    "44": {
+      "fbref_name": "Liga 1 de Fútbol Profesional",
+      "fotmob_ids": [
+        "131"
+      ],
+      "fotmob_names": [
+        "Liga 1"
+      ]
+    },
+    "36": {
+      "fbref_name": "Ekstraklasa",
+      "fotmob_ids": [
+        "196"
+      ],
+      "fotmob_names": [
+        "Ekstraklasa"
+      ]
+    },
+    "32": {
+      "fbref_name": "Primeira Liga",
+      "fotmob_ids": [
+        "61"
+      ],
+      "fotmob_names": [
+        "Liga Portugal"
+      ]
+    },
+    "47": {
+      "fbref_name": "Liga I (M)",
+      "fotmob_ids": [
+        "189"
+      ],
+      "fotmob_names": [
+        "Liga I"
+      ]
+    },
+    "52": {
+      "fbref_name": "South African Premiership",
+      "fotmob_ids": [
+        "537"
+      ],
+      "fotmob_names": [
+        "Premier Soccer League"
+      ]
+    },
+    "30": {
+      "fbref_name": "Russian Premier League",
+      "fotmob_ids": [
+        "63"
+      ],
+      "fotmob_names": [
+        "Premier League"
+      ]
+    },
+    "40": {
+      "fbref_name": "Scottish Premiership",
+      "fotmob_ids": [
+        "64"
+      ],
+      "fotmob_names": [
+        "Premiership"
+      ]
+    },
+    "54": {
+      "fbref_name": "Serbian SuperLiga",
+      "fotmob_ids": [
+        "182"
+      ],
+      "fotmob_names": [
+        "Super Liga"
+      ]
+    },
+    "57": {
+      "fbref_name": "Swiss Super League",
+      "fotmob_ids": [
+        "69"
+      ],
+      "fotmob_names": [
+        "Super League"
+      ]
+    },
+    "29": {
+      "fbref_name": "Allsvenskan",
+      "fotmob_ids": [
+        "67"
+      ],
+      "fotmob_names": [
+        "Allsvenskan"
+      ]
+    },
+    "26": {
+      "fbref_name": "Süper Lig",
+      "fotmob_ids": [
+        "71"
+      ],
+      "fotmob_names": [
+        "Süper Lig"
+      ]
+    },
+    "39": {
+      "fbref_name": "Ukrainian Premier League",
+      "fotmob_ids": [
+        "441"
+      ],
+      "fotmob_names": [
+        "Premier League"
+      ]
+    },
+    "45": {
+      "fbref_name": "Liga AUF Uruguaya",
+      "fotmob_ids": [
+        "161"
+      ],
+      "fotmob_names": [
+        "Liga AUF Uruguaya"
+      ]
+    },
+    "22": {
+      "fbref_name": "Major League Soccer",
+      "fotmob_ids": [
+        "130"
+      ],
+      "fotmob_names": [
+        "MLS"
+      ]
+    },
+    "105": {
+      "fbref_name": "Venezuelan Primera División",
+      "fotmob_ids": [
+        "339"
+      ],
+      "fotmob_names": [
+        "Primera Division"
+      ]
+    },
+    "69": {
+      "fbref_name": "Challenger Pro League",
+      "fotmob_ids": [
+        "264"
+      ],
+      "fotmob_names": [
+        "First Division B"
+      ]
+    },
+    "38": {
+      "fbref_name": "Campeonato Brasileiro Série B",
+      "fotmob_ids": [
+        "8814"
+      ],
+      "fotmob_names": [
+        "Serie B"
+      ]
+    },
+    "10": {
+      "fbref_name": "EFL Championship",
+      "fotmob_ids": [
+        "48"
+      ],
+      "fotmob_names": [
+        "Championship"
+      ]
+    },
+    "17": {
+      "fbref_name": "Spanish Segunda División",
+      "fotmob_ids": [
+        "140"
+      ],
+      "fotmob_names": [
+        "LaLiga2"
+      ]
+    },
+    "60": {
+      "fbref_name": "Ligue 2",
+      "fotmob_ids": [
+        "110"
+      ],
+      "fotmob_names": [
+        "Ligue 2"
+      ]
+    },
+    "33": {
+      "fbref_name": "2. Fußball-Bundesliga",
+      "fotmob_ids": [
+        "146"
+      ],
+      "fotmob_names": [
+        "2. Bundesliga"
+      ]
+    },
+    "378": {
+      "fbref_name": "Indian Football League",
+      "fotmob_ids": [
+        "8982"
+      ],
+      "fotmob_names": [
+        "Indian Football League"
+      ]
+    },
+    "18": {
+      "fbref_name": "Serie B (M)",
+      "fotmob_ids": [
+        "86"
+      ],
+      "fotmob_names": [
+        "Serie B"
+      ]
+    },
+    "49": {
+      "fbref_name": "J2 League",
+      "fotmob_ids": [
+        "8974"
+      ],
+      "fotmob_names": [
+        "J. League 2"
+      ]
+    },
+    "51": {
+      "fbref_name": "Eerste Divisie",
+      "fotmob_ids": [
+        "111"
+      ],
+      "fotmob_names": [
+        "Eerste Divisie"
+      ]
+    },
+    "72": {
+      "fbref_name": "Scottish Championship",
+      "fotmob_ids": [
+        "123"
+      ],
+      "fotmob_names": [
+        "Championship"
+      ]
+    },
+    "48": {
+      "fbref_name": "Superettan",
+      "fotmob_ids": [
+        "168"
+      ],
+      "fotmob_names": [
+        "Superettan"
+      ]
+    },
+    "76": {
+      "fbref_name": "North American Soccer League",
+      "fotmob_ids": [],
+      "fotmob_names": [],
+      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+    },
+    "73": {
+      "fbref_name": "USL Championship",
+      "fotmob_ids": [
+        "8972"
+      ],
+      "fotmob_names": [
+        "USL Championship"
+      ]
+    },
+    "68": {
+      "fbref_name": "USL First Division",
+      "fotmob_ids": [],
+      "fotmob_names": [],
+      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+    },
+    "79": {
+      "fbref_name": "USSF Division 2 Professional League",
+      "fotmob_ids": [],
+      "fotmob_names": [],
+      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+    },
+    "15": {
+      "fbref_name": "EFL League One",
+      "fotmob_ids": [
+        "108"
+      ],
+      "fotmob_names": [
+        "League One"
+      ]
+    },
+    "16": {
+      "fbref_name": "EFL League Two",
+      "fotmob_ids": [
+        "109"
+      ],
+      "fotmob_names": [
+        "League Two"
+      ]
+    },
+    "34": {
+      "fbref_name": "National League",
+      "fotmob_ids": [
+        "117"
+      ],
+      "fotmob_names": [
+        "National League"
+      ]
+    },
+    "59": {
+      "fbref_name": "3. Fußball-Liga",
+      "fotmob_ids": [
+        "208"
+      ],
+      "fotmob_names": [
+        "3. Liga"
+      ]
+    },
+    "137": {
+      "fbref_name": "USL League One",
+      "fotmob_ids": [
+        "9296"
+      ],
+      "fotmob_names": [
+        "USL League One"
+      ]
+    },
+    "255": {
+      "fbref_name": "FIFA World Cup Qualification — Inter-confederation play-offs",
+      "fotmob_ids": [
+        "10201"
+      ],
+      "fotmob_names": [
+        "World Cup Qualification Inter-confederation"
+      ]
+    },
+    "657": {
+      "fbref_name": "Africa Cup of Nations qualification",
+      "fotmob_ids": [
+        "10608"
+      ],
+      "fotmob_names": [
+        "Africa Cup of Nations Qualification"
+      ]
+    },
+    "2": {
+      "fbref_name": "FIFA World Cup Qualification — CAF",
+      "fotmob_ids": [
+        "10196"
+      ],
+      "fotmob_names": [
+        "World Cup Qualification CAF"
+      ]
+    },
+    "3": {
+      "fbref_name": "FIFA World Cup Qualification — CONCACAF",
+      "fotmob_ids": [
+        "10198"
+      ],
+      "fotmob_names": [
+        "World Cup Qualification CONCACAF"
+      ]
+    },
+    "4": {
+      "fbref_name": "FIFA World Cup Qualification — CONMEBOL",
+      "fotmob_ids": [
+        "10199"
+      ],
+      "fotmob_names": [
+        "World Cup Qualification CONMEBOL"
+      ]
+    },
+    "5": {
+      "fbref_name": "FIFA World Cup Qualification — OFC",
+      "fotmob_ids": [
+        "10200"
+      ],
+      "fotmob_names": [
+        "World Cup Qualification OFC"
+      ]
+    },
+    "6": {
+      "fbref_name": "FIFA World Cup Qualification — UEFA",
+      "fotmob_ids": [
+        "10195"
+      ],
+      "fotmob_names": [
+        "World Cup Qualification UEFA"
+      ]
+    },
+    "678": {
+      "fbref_name": "UEFA European Football Championship qualification",
+      "fotmob_ids": [
+        "10607"
+      ],
+      "fotmob_names": [
+        "EURO Qualification"
+      ]
+    },
+    "665": {
+      "fbref_name": "AFC Asian Cup qualification",
+      "fotmob_ids": [],
+      "fotmob_names": [],
+      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+    },
+    "7": {
+      "fbref_name": "FIFA World Cup Qualification — AFC",
+      "fotmob_ids": [
+        "10197"
+      ],
+      "fotmob_names": [
+        "World Cup Qualification AFC"
+      ]
+    },
+    "905": {
+      "fbref_name": "Copa de la Liga Profesional",
+      "fotmob_ids": [
+        "10007"
+      ],
+      "fotmob_names": [
+        "Copa de la Liga Profesional"
+      ]
+    },
+    "690": {
+      "fbref_name": "EFL Cup",
+      "fotmob_ids": [
+        "133"
+      ],
+      "fotmob_names": [
+        "EFL Cup"
+      ]
+    },
+    "602": {
+      "fbref_name": "FA Community Shield",
+      "fotmob_ids": [
+        "247"
+      ],
+      "fotmob_names": [
+        "Community Shield"
+      ]
+    },
+    "514": {
+      "fbref_name": "FA Cup",
+      "fotmob_ids": [
+        "132"
+      ],
+      "fotmob_names": [
+        "FA Cup"
+      ]
+    },
+    "569": {
+      "fbref_name": "Copa del Rey",
+      "fotmob_ids": [
+        "138"
+      ],
+      "fotmob_names": [
+        "Copa del Rey"
+      ]
+    },
+    "646": {
+      "fbref_name": "Supercopa de España",
+      "fotmob_ids": [
+        "139"
+      ],
+      "fotmob_names": [
+        "Supercopa de España"
+      ]
+    },
+    "518": {
+      "fbref_name": "Coupe de France",
+      "fotmob_ids": [
+        "134"
+      ],
+      "fotmob_names": [
+        "Coupe de France"
+      ]
+    },
+    "693": {
+      "fbref_name": "Coupe de la Ligue",
+      "fotmob_ids": [],
+      "fotmob_names": [],
+      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+    },
+    "604": {
+      "fbref_name": "Trophée des Champions",
+      "fotmob_ids": [
+        "207"
+      ],
+      "fotmob_names": [
+        "Trophée des champions"
+      ]
+    },
+    "521": {
+      "fbref_name": "DFB-Pokal",
+      "fotmob_ids": [
+        "209"
+      ],
+      "fotmob_names": [
+        "DFB Pokal"
+      ]
+    },
+    "606": {
+      "fbref_name": "Franz Beckenbauer Supercup",
+      "fotmob_ids": [
+        "8924"
+      ],
+      "fotmob_names": [
+        "Super Cup"
+      ]
+    },
+    "529": {
+      "fbref_name": "Coppa Italia",
+      "fotmob_ids": [
+        "141"
+      ],
+      "fotmob_names": [
+        "Coppa Italia"
+      ]
+    },
+    "612": {
+      "fbref_name": "Supercoppa Italiana",
+      "fotmob_ids": [
+        "222"
+      ],
+      "fotmob_names": [
+        "Supercoppa"
+      ]
+    },
+    "577": {
+      "fbref_name": "Lamar Hunt U.S. Open Cup",
+      "fotmob_ids": [
+        "9441"
+      ],
+      "fotmob_names": [
+        "Open Cup"
+      ]
+    },
+    "58": {
+      "fbref_name": "Liga Profesional Ecuador",
+      "fotmob_ids": [
+        "246"
+      ],
+      "fotmob_names": [
+        "Serie A"
+      ]
+    }
+  }
+}

@@ -530,6 +530,9 @@ class FakeReplayControl:
 
 
 class FakeControl:
+    def record_match_report_observations(self, **kwargs):
+        self.report_observations.append(kwargs)
+
     def __init__(self, raw_store=None):
         self.raw_store = raw_store
         self.events = []
@@ -543,6 +546,7 @@ class FakeControl:
         self.manifests = []
         self.observations = {}
         self.provenance = []
+        self.report_observations = []
         self.frontier_batches = []
         self.completed = []
         self.failed = []
@@ -3845,6 +3849,11 @@ def test_schedule_seeds_50_mixed_matches_in_one_frontier_batch(tmp_path):
     )
 
     assert (result.seeded, result.skipped_ineligible) == (50, 0)
+    evidence = control.report_observations[0]
+    assert evidence["fetched_at"] == datetime.fromisoformat(record.fetched_at)
+    assert evidence["raw_key"] == raw.fetch_manifest_key(record.logical_refresh_id)
+    assert len(evidence["records"]) == 50
+    assert sum(row["completed"] for row in evidence["records"]) == 25
     assert seed_eligible_reads == [1]
     assert len(control.frontier_batches) == 1
     targets, provenance = control.frontier_batches[0]
