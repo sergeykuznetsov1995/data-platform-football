@@ -1910,6 +1910,20 @@ class FotMobIngestService:
         try:
             scope = ScopeRef(int(competition_id), str(source_season_key))
             bundle = parse_season_bundle(fetch.data, scope)
+            if not bundle.matches:
+                try:
+                    known_matches = self.repository.has_committed_matches(
+                        competition_id, source_season_key
+                    )
+                except Exception as exc:
+                    # Storage unavailability cannot validate an empty calendar
+                    # and is not evidence of source schema drift.
+                    result.record_exception("calendar history lookup failed", exc)
+                    return result, None
+                if known_matches:
+                    raise CatalogShapeError(
+                        "empty calendar would replace previously committed matches"
+                    )
             blocking = [
                 issue for issue in bundle.issues if issue.code in _BLOCKING_PARSE_ISSUES
             ]

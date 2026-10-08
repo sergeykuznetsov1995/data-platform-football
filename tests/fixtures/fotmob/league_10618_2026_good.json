@@ -1,0 +1,3299 @@
+{
+  "tabs": [
+    "fixtures"
+  ],
+  "allAvailableSeasons": [
+    "2026",
+    "2025",
+    "2024",
+    "2023",
+    "2022",
+    "2021",
+    "2020",
+    "2019",
+    "2018",
+    "2017",
+    "2016",
+    "2015",
+    "2014",
+    "2013",
+    "2012",
+    "2011",
+    "2010"
+  ],
+  "details": {
+    "id": 10618,
+    "type": "league",
+    "name": "Copa Libertadores Qualification",
+    "selectedSeason": "2026",
+    "latestSeason": "2026",
+    "shortName": "Copa Libertadores Qualification",
+    "country": "INT",
+    "gender": "male",
+    "faqJSONLD": null,
+    "breadcrumbJSONLD": {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://www.fotmob.com"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Copa Libertadores Qualification",
+          "item": "https://www.fotmob.com/leagues/10618/overview/copa-libertadores-qualification"
+        }
+      ]
+    },
+    "canSyncCalendar": true,
+    "leagueColor": "#000000",
+    "dataProvider": "enet",
+    "seopath": "copa-libertadores-qualification"
+  },
+  "seostr": "copa-libertadores-qualification",
+  "QAData": [],
+  "table": null,
+  "transfers": {
+    "type": "league",
+    "data": null
+  },
+  "overview": {
+    "season": "2026",
+    "selectedSeason": "2026",
+    "table": null,
+    "topPlayers": {
+      "byRating": {
+        "seeAllLink": "/leagues/10618/stats/season//players/rating/copa-libertadores-qualification"
+      },
+      "byGoals": {
+        "seeAllLink": "/leagues/10618/stats/season//players/goals/copa-libertadores-qualification"
+      },
+      "byAssists": {
+        "seeAllLink": "/leagues/10618/stats/season//players/goal_assist/copa-libertadores-qualification"
+      },
+      "seeAllUrl": "stats"
+    },
+    "hasTotw": false,
+    "leagueOverviewMatches": [
+      {
+        "id": "5110731",
+        "pageUrl": "/matches/deportivo-tachira-vs-strongest/5tr2z#5110731",
+        "opponent": {
+          "id": "2527",
+          "name": "The Strongest",
+          "score": 2
+        },
+        "home": {
+          "id": "2527",
+          "name": "The Strongest",
+          "score": 2
+        },
+        "away": {
+          "id": "1896",
+          "name": "Deportivo Tachira",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-04T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5103754",
+        "pageUrl": "/matches/alianza-lima-vs-2-de-mayo/q0fq0r#5103754",
+        "opponent": {
+          "id": "49688",
+          "name": "2 de Mayo",
+          "score": 1
+        },
+        "home": {
+          "id": "49688",
+          "name": "2 de Mayo",
+          "score": 1
+        },
+        "away": {
+          "id": "6398",
+          "name": "Alianza Lima",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-05T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5103752",
+        "pageUrl": "/matches/juventud-de-las-piedras-vs-universidad-catolica/3gz2c47#5103752",
+        "opponent": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 0
+        },
+        "home": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 0
+        },
+        "away": {
+          "id": "113053",
+          "name": "Universidad Catolica",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-06T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5110732",
+        "pageUrl": "/matches/deportivo-tachira-vs-strongest/5tr2z#5110732",
+        "opponent": {
+          "id": "1896",
+          "name": "Deportivo Tachira",
+          "score": 1
+        },
+        "home": {
+          "id": "1896",
+          "name": "Deportivo Tachira",
+          "score": 1
+        },
+        "away": {
+          "id": "2527",
+          "name": "The Strongest",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-11T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "id": "5103755",
+        "pageUrl": "/matches/alianza-lima-vs-2-de-mayo/q0fq0r#5103755",
+        "opponent": {
+          "id": "6398",
+          "name": "Alianza Lima",
+          "score": 1
+        },
+        "home": {
+          "id": "6398",
+          "name": "Alianza Lima",
+          "score": 1
+        },
+        "away": {
+          "id": "49688",
+          "name": "2 de Mayo",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-12T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5103753",
+        "pageUrl": "/matches/juventud-de-las-piedras-vs-universidad-catolica/3gz2c47#5103753",
+        "opponent": {
+          "id": "113053",
+          "name": "Universidad Catolica",
+          "score": 3
+        },
+        "home": {
+          "id": "113053",
+          "name": "Universidad Catolica",
+          "score": 3
+        },
+        "away": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 4
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-13T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "3 - 4",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "id": "5103756",
+        "pageUrl": "/matches/huachipato-vs-carabobo-fc/nvnzf2#5103756",
+        "opponent": {
+          "id": "49681",
+          "name": "Carabobo FC",
+          "score": 1
+        },
+        "home": {
+          "id": "49681",
+          "name": "Carabobo FC",
+          "score": 1
+        },
+        "away": {
+          "id": "4056",
+          "name": "Huachipato",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-17T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5180555",
+        "pageUrl": "/matches/sporting-cristal-vs-2-de-mayo/lyotvk#5180555",
+        "opponent": {
+          "id": "49688",
+          "name": "2 de Mayo",
+          "score": 2
+        },
+        "home": {
+          "id": "49688",
+          "name": "2 de Mayo",
+          "score": 2
+        },
+        "away": {
+          "id": "1848",
+          "name": "Sporting Cristal",
+          "score": 2
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-18T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5103760",
+        "pageUrl": "/matches/liverpool-fc-vs-independiente-medellin/6plgi#5103760",
+        "opponent": {
+          "id": "2219",
+          "name": "Liverpool FC",
+          "score": 1
+        },
+        "home": {
+          "id": "2219",
+          "name": "Liverpool FC",
+          "score": 1
+        },
+        "away": {
+          "id": "2528",
+          "name": "Independiente Medellin",
+          "score": 2
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-18T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5103758",
+        "pageUrl": "/matches/ohiggins-vs-bahia/1nt17c#5103758",
+        "opponent": {
+          "id": "6296",
+          "name": "O'Higgins",
+          "score": 1
+        },
+        "home": {
+          "id": "6296",
+          "name": "O'Higgins",
+          "score": 1
+        },
+        "away": {
+          "id": "7877",
+          "name": "Bahia",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-18T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5110785",
+        "pageUrl": "/matches/barcelona-sc-vs-argentinos-juniors/29fr73#5110785",
+        "opponent": {
+          "id": "6453",
+          "name": "Barcelona SC",
+          "score": 0
+        },
+        "home": {
+          "id": "6453",
+          "name": "Barcelona SC",
+          "score": 0
+        },
+        "away": {
+          "id": "10086",
+          "name": "Argentinos Juniors",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-19T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5110786",
+        "pageUrl": "/matches/botafogo-rj-vs-nacional-potosi/6v45chm#5110786",
+        "opponent": {
+          "id": "164353",
+          "name": "Nacional Potosi",
+          "score": 1
+        },
+        "home": {
+          "id": "164353",
+          "name": "Nacional Potosi",
+          "score": 1
+        },
+        "away": {
+          "id": "8517",
+          "name": "Botafogo RJ",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-19T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5181545",
+        "pageUrl": "/matches/guarani-vs-juventud-de-las-piedras/15ah0b#5181545",
+        "opponent": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 0
+        },
+        "home": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 0
+        },
+        "away": {
+          "id": "1893",
+          "name": "Guarani",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-19T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5180383",
+        "pageUrl": "/matches/tolima-vs-deportivo-tachira/4a0mp#5180383",
+        "opponent": {
+          "id": "1896",
+          "name": "Deportivo Tachira",
+          "score": 0
+        },
+        "home": {
+          "id": "1896",
+          "name": "Deportivo Tachira",
+          "score": 0
+        },
+        "away": {
+          "id": "1894",
+          "name": "Tolima",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-20T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5103757",
+        "pageUrl": "/matches/huachipato-vs-carabobo-fc/nvnzf2#5103757",
+        "opponent": {
+          "id": "4056",
+          "name": "Huachipato",
+          "score": 1
+        },
+        "home": {
+          "id": "4056",
+          "name": "Huachipato",
+          "score": 1
+        },
+        "away": {
+          "id": "49681",
+          "name": "Carabobo FC",
+          "score": 2
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-24T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5103761",
+        "pageUrl": "/matches/liverpool-fc-vs-independiente-medellin/6plgi#5103761",
+        "opponent": {
+          "id": "2528",
+          "name": "Independiente Medellin",
+          "score": 0
+        },
+        "home": {
+          "id": "2528",
+          "name": "Independiente Medellin",
+          "score": 0
+        },
+        "away": {
+          "id": "2219",
+          "name": "Liverpool FC",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-25T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5180556",
+        "pageUrl": "/matches/sporting-cristal-vs-2-de-mayo/lyotvk#5180556",
+        "opponent": {
+          "id": "1848",
+          "name": "Sporting Cristal",
+          "score": 0
+        },
+        "home": {
+          "id": "1848",
+          "name": "Sporting Cristal",
+          "score": 0
+        },
+        "away": {
+          "id": "49688",
+          "name": "2 de Mayo",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-25T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 0",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "id": "5103759",
+        "pageUrl": "/matches/ohiggins-vs-bahia/1nt17c#5103759",
+        "opponent": {
+          "id": "7877",
+          "name": "Bahia",
+          "score": 2
+        },
+        "home": {
+          "id": "7877",
+          "name": "Bahia",
+          "score": 2
+        },
+        "away": {
+          "id": "6296",
+          "name": "O'Higgins",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-25T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 1",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "id": "5110787",
+        "pageUrl": "/matches/barcelona-sc-vs-argentinos-juniors/29fr73#5110787",
+        "opponent": {
+          "id": "10086",
+          "name": "Argentinos Juniors",
+          "score": 0
+        },
+        "home": {
+          "id": "10086",
+          "name": "Argentinos Juniors",
+          "score": 0
+        },
+        "away": {
+          "id": "6453",
+          "name": "Barcelona SC",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-26T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "id": "5110788",
+        "pageUrl": "/matches/botafogo-rj-vs-nacional-potosi/6v45chm#5110788",
+        "opponent": {
+          "id": "8517",
+          "name": "Botafogo RJ",
+          "score": 2
+        },
+        "home": {
+          "id": "8517",
+          "name": "Botafogo RJ",
+          "score": 2
+        },
+        "away": {
+          "id": "164353",
+          "name": "Nacional Potosi",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-26T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5181546",
+        "pageUrl": "/matches/guarani-vs-juventud-de-las-piedras/15ah0b#5181546",
+        "opponent": {
+          "id": "1893",
+          "name": "Guarani",
+          "score": 1
+        },
+        "home": {
+          "id": "1893",
+          "name": "Guarani",
+          "score": 1
+        },
+        "away": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 2
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-26T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5180384",
+        "pageUrl": "/matches/tolima-vs-deportivo-tachira/4a0mp#5180384",
+        "opponent": {
+          "id": "1894",
+          "name": "Tolima",
+          "score": 0
+        },
+        "home": {
+          "id": "1894",
+          "name": "Tolima",
+          "score": 0
+        },
+        "away": {
+          "id": "1896",
+          "name": "Deportivo Tachira",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-02-27T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "id": "5203736",
+        "pageUrl": "/matches/barcelona-sc-vs-botafogo-rj/1upz10#5203736",
+        "opponent": {
+          "id": "6453",
+          "name": "Barcelona SC",
+          "score": 1
+        },
+        "home": {
+          "id": "6453",
+          "name": "Barcelona SC",
+          "score": 1
+        },
+        "away": {
+          "id": "8517",
+          "name": "Botafogo RJ",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-04T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5203734",
+        "pageUrl": "/matches/sporting-cristal-vs-carabobo-fc/lyh3j2#5203734",
+        "opponent": {
+          "id": "49681",
+          "name": "Carabobo FC",
+          "score": 0
+        },
+        "home": {
+          "id": "49681",
+          "name": "Carabobo FC",
+          "score": 0
+        },
+        "away": {
+          "id": "1848",
+          "name": "Sporting Cristal",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-04T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5205282",
+        "pageUrl": "/matches/tolima-vs-ohiggins/jz255#5205282",
+        "opponent": {
+          "id": "6296",
+          "name": "O'Higgins",
+          "score": 1
+        },
+        "home": {
+          "id": "6296",
+          "name": "O'Higgins",
+          "score": 1
+        },
+        "away": {
+          "id": "1894",
+          "name": "Tolima",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-05T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5205280",
+        "pageUrl": "/matches/independiente-medellin-vs-juventud-de-las-piedras/19v2p1#5205280",
+        "opponent": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 1
+        },
+        "home": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 1
+        },
+        "away": {
+          "id": "2528",
+          "name": "Independiente Medellin",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-06T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5203737",
+        "pageUrl": "/matches/barcelona-sc-vs-botafogo-rj/1upz10#5203737",
+        "opponent": {
+          "id": "8517",
+          "name": "Botafogo RJ",
+          "score": 0
+        },
+        "home": {
+          "id": "8517",
+          "name": "Botafogo RJ",
+          "score": 0
+        },
+        "away": {
+          "id": "6453",
+          "name": "Barcelona SC",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-11T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5203735",
+        "pageUrl": "/matches/sporting-cristal-vs-carabobo-fc/lyh3j2#5203735",
+        "opponent": {
+          "id": "1848",
+          "name": "Sporting Cristal",
+          "score": 1
+        },
+        "home": {
+          "id": "1848",
+          "name": "Sporting Cristal",
+          "score": 1
+        },
+        "away": {
+          "id": "49681",
+          "name": "Carabobo FC",
+          "score": 2
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-11T22:00:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "id": "5205283",
+        "pageUrl": "/matches/tolima-vs-ohiggins/jz255#5205283",
+        "opponent": {
+          "id": "1894",
+          "name": "Tolima",
+          "score": 2
+        },
+        "home": {
+          "id": "1894",
+          "name": "Tolima",
+          "score": 2
+        },
+        "away": {
+          "id": "6296",
+          "name": "O'Higgins",
+          "score": 0
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-12T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "id": "5205281",
+        "pageUrl": "/matches/independiente-medellin-vs-juventud-de-las-piedras/19v2p1#5205281",
+        "opponent": {
+          "id": "2528",
+          "name": "Independiente Medellin",
+          "score": 2
+        },
+        "home": {
+          "id": "2528",
+          "name": "Independiente Medellin",
+          "score": 2
+        },
+        "away": {
+          "id": "9883",
+          "name": "Juventud de las Piedras",
+          "score": 1
+        },
+        "displayTournament": true,
+        "notStarted": false,
+        "tournament": {
+          "stage": ""
+        },
+        "status": {
+          "utcTime": "2026-03-13T00:30:00Z",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      }
+    ],
+    "hasOngoingMatch": false,
+    "shotMap": null,
+    "matches": {
+      "firstUnplayedMatch": null,
+      "allMatches": [
+        {
+          "round": "1",
+          "roundName": 1,
+          "pageUrl": "/matches/deportivo-tachira-vs-strongest/5tr2z#5110731",
+          "id": "5110731",
+          "home": {
+            "name": "The Strongest",
+            "shortName": "The Strongest",
+            "id": "2527"
+          },
+          "away": {
+            "name": "Deportivo Tachira",
+            "shortName": "Deportivo Tachira",
+            "id": "1896"
+          },
+          "status": {
+            "utcTime": "2026-02-04T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "2 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "1",
+          "roundName": 1,
+          "pageUrl": "/matches/alianza-lima-vs-2-de-mayo/q0fq0r#5103754",
+          "id": "5103754",
+          "home": {
+            "name": "2 de Mayo",
+            "shortName": "2 de Mayo",
+            "id": "49688"
+          },
+          "away": {
+            "name": "Alianza Lima",
+            "shortName": "Alianza Lima",
+            "id": "6398"
+          },
+          "status": {
+            "utcTime": "2026-02-05T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "1",
+          "roundName": 1,
+          "pageUrl": "/matches/juventud-de-las-piedras-vs-universidad-catolica/3gz2c47#5103752",
+          "id": "5103752",
+          "home": {
+            "name": "Juventud de las Piedras",
+            "shortName": "Juventud de las Piedras",
+            "id": "9883"
+          },
+          "away": {
+            "name": "Universidad Catolica",
+            "shortName": "Universidad Catolica",
+            "id": "113053"
+          },
+          "status": {
+            "utcTime": "2026-02-06T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "1",
+          "roundName": 1,
+          "pageUrl": "/matches/deportivo-tachira-vs-strongest/5tr2z#5110732",
+          "id": "5110732",
+          "home": {
+            "name": "Deportivo Tachira",
+            "shortName": "Deportivo Tachira",
+            "id": "1896"
+          },
+          "away": {
+            "name": "The Strongest",
+            "shortName": "The Strongest",
+            "id": "2527"
+          },
+          "status": {
+            "utcTime": "2026-02-11T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 0",
+            "reason": {
+              "short": "Pen",
+              "shortKey": "penalties_short",
+              "long": "After penalties",
+              "longKey": "afterpenalties"
+            }
+          }
+        },
+        {
+          "round": "1",
+          "roundName": 1,
+          "pageUrl": "/matches/alianza-lima-vs-2-de-mayo/q0fq0r#5103755",
+          "id": "5103755",
+          "home": {
+            "name": "Alianza Lima",
+            "shortName": "Alianza Lima",
+            "id": "6398"
+          },
+          "away": {
+            "name": "2 de Mayo",
+            "shortName": "2 de Mayo",
+            "id": "49688"
+          },
+          "status": {
+            "utcTime": "2026-02-12T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "1",
+          "roundName": 1,
+          "pageUrl": "/matches/juventud-de-las-piedras-vs-universidad-catolica/3gz2c47#5103753",
+          "id": "5103753",
+          "home": {
+            "name": "Universidad Catolica",
+            "shortName": "Universidad Catolica",
+            "id": "113053"
+          },
+          "away": {
+            "name": "Juventud de las Piedras",
+            "shortName": "Juventud de las Piedras",
+            "id": "9883"
+          },
+          "status": {
+            "utcTime": "2026-02-13T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "3 - 4",
+            "reason": {
+              "short": "Pen",
+              "shortKey": "penalties_short",
+              "long": "After penalties",
+              "longKey": "afterpenalties"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/huachipato-vs-carabobo-fc/nvnzf2#5103756",
+          "id": "5103756",
+          "home": {
+            "name": "Carabobo FC",
+            "shortName": "Carabobo FC",
+            "id": "49681"
+          },
+          "away": {
+            "name": "Huachipato",
+            "shortName": "Huachipato",
+            "id": "4056"
+          },
+          "status": {
+            "utcTime": "2026-02-17T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/sporting-cristal-vs-2-de-mayo/lyotvk#5180555",
+          "id": "5180555",
+          "home": {
+            "name": "2 de Mayo",
+            "shortName": "2 de Mayo",
+            "id": "49688"
+          },
+          "away": {
+            "name": "Sporting Cristal",
+            "shortName": "Sporting Cristal",
+            "id": "1848"
+          },
+          "status": {
+            "utcTime": "2026-02-18T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "2 - 2",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/liverpool-fc-vs-independiente-medellin/6plgi#5103760",
+          "id": "5103760",
+          "home": {
+            "name": "Liverpool FC",
+            "shortName": "Liverpool FC",
+            "id": "2219"
+          },
+          "away": {
+            "name": "Independiente Medellin",
+            "shortName": "Independiente Medellin",
+            "id": "2528"
+          },
+          "status": {
+            "utcTime": "2026-02-18T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 2",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/ohiggins-vs-bahia/1nt17c#5103758",
+          "id": "5103758",
+          "home": {
+            "name": "O'Higgins",
+            "shortName": "O'Higgins",
+            "id": "6296"
+          },
+          "away": {
+            "name": "Bahia",
+            "shortName": "Bahia",
+            "id": "7877"
+          },
+          "status": {
+            "utcTime": "2026-02-18T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/barcelona-sc-vs-argentinos-juniors/29fr73#5110785",
+          "id": "5110785",
+          "home": {
+            "name": "Barcelona SC",
+            "shortName": "Barcelona SC",
+            "id": "6453"
+          },
+          "away": {
+            "name": "Argentinos Juniors",
+            "shortName": "Argentinos Juniors",
+            "id": "10086"
+          },
+          "status": {
+            "utcTime": "2026-02-19T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/botafogo-rj-vs-nacional-potosi/6v45chm#5110786",
+          "id": "5110786",
+          "home": {
+            "name": "Nacional Potosi",
+            "shortName": "Nacional Potosi",
+            "id": "164353"
+          },
+          "away": {
+            "name": "Botafogo RJ",
+            "shortName": "Botafogo RJ",
+            "id": "8517"
+          },
+          "status": {
+            "utcTime": "2026-02-19T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/guarani-vs-juventud-de-las-piedras/15ah0b#5181545",
+          "id": "5181545",
+          "home": {
+            "name": "Juventud de las Piedras",
+            "shortName": "Juventud de las Piedras",
+            "id": "9883"
+          },
+          "away": {
+            "name": "Guarani",
+            "shortName": "Guarani",
+            "id": "1893"
+          },
+          "status": {
+            "utcTime": "2026-02-19T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/tolima-vs-deportivo-tachira/4a0mp#5180383",
+          "id": "5180383",
+          "home": {
+            "name": "Deportivo Tachira",
+            "shortName": "Deportivo Tachira",
+            "id": "1896"
+          },
+          "away": {
+            "name": "Tolima",
+            "shortName": "Tolima",
+            "id": "1894"
+          },
+          "status": {
+            "utcTime": "2026-02-20T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/huachipato-vs-carabobo-fc/nvnzf2#5103757",
+          "id": "5103757",
+          "home": {
+            "name": "Huachipato",
+            "shortName": "Huachipato",
+            "id": "4056"
+          },
+          "away": {
+            "name": "Carabobo FC",
+            "shortName": "Carabobo FC",
+            "id": "49681"
+          },
+          "status": {
+            "utcTime": "2026-02-24T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 2",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/liverpool-fc-vs-independiente-medellin/6plgi#5103761",
+          "id": "5103761",
+          "home": {
+            "name": "Independiente Medellin",
+            "shortName": "Independiente Medellin",
+            "id": "2528"
+          },
+          "away": {
+            "name": "Liverpool FC",
+            "shortName": "Liverpool FC",
+            "id": "2219"
+          },
+          "status": {
+            "utcTime": "2026-02-25T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/sporting-cristal-vs-2-de-mayo/lyotvk#5180556",
+          "id": "5180556",
+          "home": {
+            "name": "Sporting Cristal",
+            "shortName": "Sporting Cristal",
+            "id": "1848"
+          },
+          "away": {
+            "name": "2 de Mayo",
+            "shortName": "2 de Mayo",
+            "id": "49688"
+          },
+          "status": {
+            "utcTime": "2026-02-25T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 0",
+            "reason": {
+              "short": "Pen",
+              "shortKey": "penalties_short",
+              "long": "After penalties",
+              "longKey": "afterpenalties"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/ohiggins-vs-bahia/1nt17c#5103759",
+          "id": "5103759",
+          "home": {
+            "name": "Bahia",
+            "shortName": "Bahia",
+            "id": "7877"
+          },
+          "away": {
+            "name": "O'Higgins",
+            "shortName": "O'Higgins",
+            "id": "6296"
+          },
+          "status": {
+            "utcTime": "2026-02-25T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "2 - 1",
+            "reason": {
+              "short": "Pen",
+              "shortKey": "penalties_short",
+              "long": "After penalties",
+              "longKey": "afterpenalties"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/barcelona-sc-vs-argentinos-juniors/29fr73#5110787",
+          "id": "5110787",
+          "home": {
+            "name": "Argentinos Juniors",
+            "shortName": "Argentinos Juniors",
+            "id": "10086"
+          },
+          "away": {
+            "name": "Barcelona SC",
+            "shortName": "Barcelona SC",
+            "id": "6453"
+          },
+          "status": {
+            "utcTime": "2026-02-26T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 1",
+            "reason": {
+              "short": "Pen",
+              "shortKey": "penalties_short",
+              "long": "After penalties",
+              "longKey": "afterpenalties"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/botafogo-rj-vs-nacional-potosi/6v45chm#5110788",
+          "id": "5110788",
+          "home": {
+            "name": "Botafogo RJ",
+            "shortName": "Botafogo RJ",
+            "id": "8517"
+          },
+          "away": {
+            "name": "Nacional Potosi",
+            "shortName": "Nacional Potosi",
+            "id": "164353"
+          },
+          "status": {
+            "utcTime": "2026-02-26T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "2 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/guarani-vs-juventud-de-las-piedras/15ah0b#5181546",
+          "id": "5181546",
+          "home": {
+            "name": "Guarani",
+            "shortName": "Guarani",
+            "id": "1893"
+          },
+          "away": {
+            "name": "Juventud de las Piedras",
+            "shortName": "Juventud de las Piedras",
+            "id": "9883"
+          },
+          "status": {
+            "utcTime": "2026-02-26T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 2",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "2",
+          "roundName": 2,
+          "pageUrl": "/matches/tolima-vs-deportivo-tachira/4a0mp#5180384",
+          "id": "5180384",
+          "home": {
+            "name": "Tolima",
+            "shortName": "Tolima",
+            "id": "1894"
+          },
+          "away": {
+            "name": "Deportivo Tachira",
+            "shortName": "Deportivo Tachira",
+            "id": "1896"
+          },
+          "status": {
+            "utcTime": "2026-02-27T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 1",
+            "reason": {
+              "short": "Pen",
+              "shortKey": "penalties_short",
+              "long": "After penalties",
+              "longKey": "afterpenalties"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/barcelona-sc-vs-botafogo-rj/1upz10#5203736",
+          "id": "5203736",
+          "home": {
+            "name": "Barcelona SC",
+            "shortName": "Barcelona SC",
+            "id": "6453"
+          },
+          "away": {
+            "name": "Botafogo RJ",
+            "shortName": "Botafogo RJ",
+            "id": "8517"
+          },
+          "status": {
+            "utcTime": "2026-03-04T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/sporting-cristal-vs-carabobo-fc/lyh3j2#5203734",
+          "id": "5203734",
+          "home": {
+            "name": "Carabobo FC",
+            "shortName": "Carabobo FC",
+            "id": "49681"
+          },
+          "away": {
+            "name": "Sporting Cristal",
+            "shortName": "Sporting Cristal",
+            "id": "1848"
+          },
+          "status": {
+            "utcTime": "2026-03-04T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/tolima-vs-ohiggins/jz255#5205282",
+          "id": "5205282",
+          "home": {
+            "name": "O'Higgins",
+            "shortName": "O'Higgins",
+            "id": "6296"
+          },
+          "away": {
+            "name": "Tolima",
+            "shortName": "Tolima",
+            "id": "1894"
+          },
+          "status": {
+            "utcTime": "2026-03-05T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/independiente-medellin-vs-juventud-de-las-piedras/19v2p1#5205280",
+          "id": "5205280",
+          "home": {
+            "name": "Juventud de las Piedras",
+            "shortName": "Juventud de las Piedras",
+            "id": "9883"
+          },
+          "away": {
+            "name": "Independiente Medellin",
+            "shortName": "Independiente Medellin",
+            "id": "2528"
+          },
+          "status": {
+            "utcTime": "2026-03-06T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/barcelona-sc-vs-botafogo-rj/1upz10#5203737",
+          "id": "5203737",
+          "home": {
+            "name": "Botafogo RJ",
+            "shortName": "Botafogo RJ",
+            "id": "8517"
+          },
+          "away": {
+            "name": "Barcelona SC",
+            "shortName": "Barcelona SC",
+            "id": "6453"
+          },
+          "status": {
+            "utcTime": "2026-03-11T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "0 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/sporting-cristal-vs-carabobo-fc/lyh3j2#5203735",
+          "id": "5203735",
+          "home": {
+            "name": "Sporting Cristal",
+            "shortName": "Sporting Cristal",
+            "id": "1848"
+          },
+          "away": {
+            "name": "Carabobo FC",
+            "shortName": "Carabobo FC",
+            "id": "49681"
+          },
+          "status": {
+            "utcTime": "2026-03-11T22:00:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "1 - 2",
+            "reason": {
+              "short": "Pen",
+              "shortKey": "penalties_short",
+              "long": "After penalties",
+              "longKey": "afterpenalties"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/tolima-vs-ohiggins/jz255#5205283",
+          "id": "5205283",
+          "home": {
+            "name": "Tolima",
+            "shortName": "Tolima",
+            "id": "1894"
+          },
+          "away": {
+            "name": "O'Higgins",
+            "shortName": "O'Higgins",
+            "id": "6296"
+          },
+          "status": {
+            "utcTime": "2026-03-12T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "2 - 0",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        },
+        {
+          "round": "3",
+          "roundName": 3,
+          "pageUrl": "/matches/independiente-medellin-vs-juventud-de-las-piedras/19v2p1#5205281",
+          "id": "5205281",
+          "home": {
+            "name": "Independiente Medellin",
+            "shortName": "Independiente Medellin",
+            "id": "2528"
+          },
+          "away": {
+            "name": "Juventud de las Piedras",
+            "shortName": "Juventud de las Piedras",
+            "id": "9883"
+          },
+          "status": {
+            "utcTime": "2026-03-13T00:30:00Z",
+            "timezone": "",
+            "finished": true,
+            "started": true,
+            "cancelled": false,
+            "awarded": false,
+            "scoreStr": "2 - 1",
+            "reason": {
+              "short": "FT",
+              "shortKey": "fulltime_short",
+              "long": "Full-Time",
+              "longKey": "finished"
+            }
+          }
+        }
+      ],
+      "hasOngoingMatch": false,
+      "fixtureInfo": {
+        "activeRound": {
+          "roundId": "3",
+          "localizedKey": "round_fmt"
+        },
+        "rounds": [
+          {
+            "roundId": "1",
+            "localizedKey": "round_fmt"
+          },
+          {
+            "roundId": "2",
+            "localizedKey": "round_fmt"
+          },
+          {
+            "roundId": "3",
+            "localizedKey": "round_fmt"
+          }
+        ],
+        "teams": [
+          {
+            "id": 49688,
+            "name": "2 de Mayo"
+          },
+          {
+            "id": 6398,
+            "name": "Alianza Lima"
+          },
+          {
+            "id": 10086,
+            "name": "Argentinos Juniors"
+          },
+          {
+            "id": 7877,
+            "name": "Bahia"
+          },
+          {
+            "id": 6453,
+            "name": "Barcelona SC"
+          },
+          {
+            "id": 8517,
+            "name": "Botafogo RJ"
+          },
+          {
+            "id": 49681,
+            "name": "Carabobo FC"
+          },
+          {
+            "id": 1896,
+            "name": "Deportivo Tachira"
+          },
+          {
+            "id": 1893,
+            "name": "Guarani"
+          },
+          {
+            "id": 4056,
+            "name": "Huachipato"
+          },
+          {
+            "id": 2528,
+            "name": "Independiente Medellin"
+          },
+          {
+            "id": 9883,
+            "name": "Juventud de las Piedras"
+          },
+          {
+            "id": 2219,
+            "name": "Liverpool FC"
+          },
+          {
+            "id": 164353,
+            "name": "Nacional Potosi"
+          },
+          {
+            "id": 6296,
+            "name": "O'Higgins"
+          },
+          {
+            "id": 1848,
+            "name": "Sporting Cristal"
+          },
+          {
+            "id": 2527,
+            "name": "The Strongest"
+          },
+          {
+            "id": 1894,
+            "name": "Tolima"
+          },
+          {
+            "id": 113053,
+            "name": "Universidad Catolica"
+          }
+        ],
+        "groups": []
+      }
+    }
+  },
+  "stats": {},
+  "fixtures": {
+    "firstUnplayedMatch": null,
+    "allMatches": [
+      {
+        "round": "1",
+        "roundName": 1,
+        "pageUrl": "/matches/deportivo-tachira-vs-strongest/5tr2z#5110731",
+        "id": "5110731",
+        "home": {
+          "name": "The Strongest",
+          "shortName": "The Strongest",
+          "id": "2527"
+        },
+        "away": {
+          "name": "Deportivo Tachira",
+          "shortName": "Deportivo Tachira",
+          "id": "1896"
+        },
+        "status": {
+          "utcTime": "2026-02-04T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "1",
+        "roundName": 1,
+        "pageUrl": "/matches/alianza-lima-vs-2-de-mayo/q0fq0r#5103754",
+        "id": "5103754",
+        "home": {
+          "name": "2 de Mayo",
+          "shortName": "2 de Mayo",
+          "id": "49688"
+        },
+        "away": {
+          "name": "Alianza Lima",
+          "shortName": "Alianza Lima",
+          "id": "6398"
+        },
+        "status": {
+          "utcTime": "2026-02-05T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "1",
+        "roundName": 1,
+        "pageUrl": "/matches/juventud-de-las-piedras-vs-universidad-catolica/3gz2c47#5103752",
+        "id": "5103752",
+        "home": {
+          "name": "Juventud de las Piedras",
+          "shortName": "Juventud de las Piedras",
+          "id": "9883"
+        },
+        "away": {
+          "name": "Universidad Catolica",
+          "shortName": "Universidad Catolica",
+          "id": "113053"
+        },
+        "status": {
+          "utcTime": "2026-02-06T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "1",
+        "roundName": 1,
+        "pageUrl": "/matches/deportivo-tachira-vs-strongest/5tr2z#5110732",
+        "id": "5110732",
+        "home": {
+          "name": "Deportivo Tachira",
+          "shortName": "Deportivo Tachira",
+          "id": "1896"
+        },
+        "away": {
+          "name": "The Strongest",
+          "shortName": "The Strongest",
+          "id": "2527"
+        },
+        "status": {
+          "utcTime": "2026-02-11T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "round": "1",
+        "roundName": 1,
+        "pageUrl": "/matches/alianza-lima-vs-2-de-mayo/q0fq0r#5103755",
+        "id": "5103755",
+        "home": {
+          "name": "Alianza Lima",
+          "shortName": "Alianza Lima",
+          "id": "6398"
+        },
+        "away": {
+          "name": "2 de Mayo",
+          "shortName": "2 de Mayo",
+          "id": "49688"
+        },
+        "status": {
+          "utcTime": "2026-02-12T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "1",
+        "roundName": 1,
+        "pageUrl": "/matches/juventud-de-las-piedras-vs-universidad-catolica/3gz2c47#5103753",
+        "id": "5103753",
+        "home": {
+          "name": "Universidad Catolica",
+          "shortName": "Universidad Catolica",
+          "id": "113053"
+        },
+        "away": {
+          "name": "Juventud de las Piedras",
+          "shortName": "Juventud de las Piedras",
+          "id": "9883"
+        },
+        "status": {
+          "utcTime": "2026-02-13T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "3 - 4",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/huachipato-vs-carabobo-fc/nvnzf2#5103756",
+        "id": "5103756",
+        "home": {
+          "name": "Carabobo FC",
+          "shortName": "Carabobo FC",
+          "id": "49681"
+        },
+        "away": {
+          "name": "Huachipato",
+          "shortName": "Huachipato",
+          "id": "4056"
+        },
+        "status": {
+          "utcTime": "2026-02-17T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/sporting-cristal-vs-2-de-mayo/lyotvk#5180555",
+        "id": "5180555",
+        "home": {
+          "name": "2 de Mayo",
+          "shortName": "2 de Mayo",
+          "id": "49688"
+        },
+        "away": {
+          "name": "Sporting Cristal",
+          "shortName": "Sporting Cristal",
+          "id": "1848"
+        },
+        "status": {
+          "utcTime": "2026-02-18T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/liverpool-fc-vs-independiente-medellin/6plgi#5103760",
+        "id": "5103760",
+        "home": {
+          "name": "Liverpool FC",
+          "shortName": "Liverpool FC",
+          "id": "2219"
+        },
+        "away": {
+          "name": "Independiente Medellin",
+          "shortName": "Independiente Medellin",
+          "id": "2528"
+        },
+        "status": {
+          "utcTime": "2026-02-18T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/ohiggins-vs-bahia/1nt17c#5103758",
+        "id": "5103758",
+        "home": {
+          "name": "O'Higgins",
+          "shortName": "O'Higgins",
+          "id": "6296"
+        },
+        "away": {
+          "name": "Bahia",
+          "shortName": "Bahia",
+          "id": "7877"
+        },
+        "status": {
+          "utcTime": "2026-02-18T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/barcelona-sc-vs-argentinos-juniors/29fr73#5110785",
+        "id": "5110785",
+        "home": {
+          "name": "Barcelona SC",
+          "shortName": "Barcelona SC",
+          "id": "6453"
+        },
+        "away": {
+          "name": "Argentinos Juniors",
+          "shortName": "Argentinos Juniors",
+          "id": "10086"
+        },
+        "status": {
+          "utcTime": "2026-02-19T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/botafogo-rj-vs-nacional-potosi/6v45chm#5110786",
+        "id": "5110786",
+        "home": {
+          "name": "Nacional Potosi",
+          "shortName": "Nacional Potosi",
+          "id": "164353"
+        },
+        "away": {
+          "name": "Botafogo RJ",
+          "shortName": "Botafogo RJ",
+          "id": "8517"
+        },
+        "status": {
+          "utcTime": "2026-02-19T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/guarani-vs-juventud-de-las-piedras/15ah0b#5181545",
+        "id": "5181545",
+        "home": {
+          "name": "Juventud de las Piedras",
+          "shortName": "Juventud de las Piedras",
+          "id": "9883"
+        },
+        "away": {
+          "name": "Guarani",
+          "shortName": "Guarani",
+          "id": "1893"
+        },
+        "status": {
+          "utcTime": "2026-02-19T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/tolima-vs-deportivo-tachira/4a0mp#5180383",
+        "id": "5180383",
+        "home": {
+          "name": "Deportivo Tachira",
+          "shortName": "Deportivo Tachira",
+          "id": "1896"
+        },
+        "away": {
+          "name": "Tolima",
+          "shortName": "Tolima",
+          "id": "1894"
+        },
+        "status": {
+          "utcTime": "2026-02-20T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/huachipato-vs-carabobo-fc/nvnzf2#5103757",
+        "id": "5103757",
+        "home": {
+          "name": "Huachipato",
+          "shortName": "Huachipato",
+          "id": "4056"
+        },
+        "away": {
+          "name": "Carabobo FC",
+          "shortName": "Carabobo FC",
+          "id": "49681"
+        },
+        "status": {
+          "utcTime": "2026-02-24T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/liverpool-fc-vs-independiente-medellin/6plgi#5103761",
+        "id": "5103761",
+        "home": {
+          "name": "Independiente Medellin",
+          "shortName": "Independiente Medellin",
+          "id": "2528"
+        },
+        "away": {
+          "name": "Liverpool FC",
+          "shortName": "Liverpool FC",
+          "id": "2219"
+        },
+        "status": {
+          "utcTime": "2026-02-25T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/sporting-cristal-vs-2-de-mayo/lyotvk#5180556",
+        "id": "5180556",
+        "home": {
+          "name": "Sporting Cristal",
+          "shortName": "Sporting Cristal",
+          "id": "1848"
+        },
+        "away": {
+          "name": "2 de Mayo",
+          "shortName": "2 de Mayo",
+          "id": "49688"
+        },
+        "status": {
+          "utcTime": "2026-02-25T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 0",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/ohiggins-vs-bahia/1nt17c#5103759",
+        "id": "5103759",
+        "home": {
+          "name": "Bahia",
+          "shortName": "Bahia",
+          "id": "7877"
+        },
+        "away": {
+          "name": "O'Higgins",
+          "shortName": "O'Higgins",
+          "id": "6296"
+        },
+        "status": {
+          "utcTime": "2026-02-25T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 1",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/barcelona-sc-vs-argentinos-juniors/29fr73#5110787",
+        "id": "5110787",
+        "home": {
+          "name": "Argentinos Juniors",
+          "shortName": "Argentinos Juniors",
+          "id": "10086"
+        },
+        "away": {
+          "name": "Barcelona SC",
+          "shortName": "Barcelona SC",
+          "id": "6453"
+        },
+        "status": {
+          "utcTime": "2026-02-26T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/botafogo-rj-vs-nacional-potosi/6v45chm#5110788",
+        "id": "5110788",
+        "home": {
+          "name": "Botafogo RJ",
+          "shortName": "Botafogo RJ",
+          "id": "8517"
+        },
+        "away": {
+          "name": "Nacional Potosi",
+          "shortName": "Nacional Potosi",
+          "id": "164353"
+        },
+        "status": {
+          "utcTime": "2026-02-26T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/guarani-vs-juventud-de-las-piedras/15ah0b#5181546",
+        "id": "5181546",
+        "home": {
+          "name": "Guarani",
+          "shortName": "Guarani",
+          "id": "1893"
+        },
+        "away": {
+          "name": "Juventud de las Piedras",
+          "shortName": "Juventud de las Piedras",
+          "id": "9883"
+        },
+        "status": {
+          "utcTime": "2026-02-26T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "2",
+        "roundName": 2,
+        "pageUrl": "/matches/tolima-vs-deportivo-tachira/4a0mp#5180384",
+        "id": "5180384",
+        "home": {
+          "name": "Tolima",
+          "shortName": "Tolima",
+          "id": "1894"
+        },
+        "away": {
+          "name": "Deportivo Tachira",
+          "shortName": "Deportivo Tachira",
+          "id": "1896"
+        },
+        "status": {
+          "utcTime": "2026-02-27T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/barcelona-sc-vs-botafogo-rj/1upz10#5203736",
+        "id": "5203736",
+        "home": {
+          "name": "Barcelona SC",
+          "shortName": "Barcelona SC",
+          "id": "6453"
+        },
+        "away": {
+          "name": "Botafogo RJ",
+          "shortName": "Botafogo RJ",
+          "id": "8517"
+        },
+        "status": {
+          "utcTime": "2026-03-04T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/sporting-cristal-vs-carabobo-fc/lyh3j2#5203734",
+        "id": "5203734",
+        "home": {
+          "name": "Carabobo FC",
+          "shortName": "Carabobo FC",
+          "id": "49681"
+        },
+        "away": {
+          "name": "Sporting Cristal",
+          "shortName": "Sporting Cristal",
+          "id": "1848"
+        },
+        "status": {
+          "utcTime": "2026-03-04T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/tolima-vs-ohiggins/jz255#5205282",
+        "id": "5205282",
+        "home": {
+          "name": "O'Higgins",
+          "shortName": "O'Higgins",
+          "id": "6296"
+        },
+        "away": {
+          "name": "Tolima",
+          "shortName": "Tolima",
+          "id": "1894"
+        },
+        "status": {
+          "utcTime": "2026-03-05T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/independiente-medellin-vs-juventud-de-las-piedras/19v2p1#5205280",
+        "id": "5205280",
+        "home": {
+          "name": "Juventud de las Piedras",
+          "shortName": "Juventud de las Piedras",
+          "id": "9883"
+        },
+        "away": {
+          "name": "Independiente Medellin",
+          "shortName": "Independiente Medellin",
+          "id": "2528"
+        },
+        "status": {
+          "utcTime": "2026-03-06T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/barcelona-sc-vs-botafogo-rj/1upz10#5203737",
+        "id": "5203737",
+        "home": {
+          "name": "Botafogo RJ",
+          "shortName": "Botafogo RJ",
+          "id": "8517"
+        },
+        "away": {
+          "name": "Barcelona SC",
+          "shortName": "Barcelona SC",
+          "id": "6453"
+        },
+        "status": {
+          "utcTime": "2026-03-11T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "0 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/sporting-cristal-vs-carabobo-fc/lyh3j2#5203735",
+        "id": "5203735",
+        "home": {
+          "name": "Sporting Cristal",
+          "shortName": "Sporting Cristal",
+          "id": "1848"
+        },
+        "away": {
+          "name": "Carabobo FC",
+          "shortName": "Carabobo FC",
+          "id": "49681"
+        },
+        "status": {
+          "utcTime": "2026-03-11T22:00:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "1 - 2",
+          "reason": {
+            "short": "Pen",
+            "shortKey": "penalties_short",
+            "long": "After penalties",
+            "longKey": "afterpenalties"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/tolima-vs-ohiggins/jz255#5205283",
+        "id": "5205283",
+        "home": {
+          "name": "Tolima",
+          "shortName": "Tolima",
+          "id": "1894"
+        },
+        "away": {
+          "name": "O'Higgins",
+          "shortName": "O'Higgins",
+          "id": "6296"
+        },
+        "status": {
+          "utcTime": "2026-03-12T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 0",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      },
+      {
+        "round": "3",
+        "roundName": 3,
+        "pageUrl": "/matches/independiente-medellin-vs-juventud-de-las-piedras/19v2p1#5205281",
+        "id": "5205281",
+        "home": {
+          "name": "Independiente Medellin",
+          "shortName": "Independiente Medellin",
+          "id": "2528"
+        },
+        "away": {
+          "name": "Juventud de las Piedras",
+          "shortName": "Juventud de las Piedras",
+          "id": "9883"
+        },
+        "status": {
+          "utcTime": "2026-03-13T00:30:00Z",
+          "timezone": "",
+          "finished": true,
+          "started": true,
+          "cancelled": false,
+          "awarded": false,
+          "scoreStr": "2 - 1",
+          "reason": {
+            "short": "FT",
+            "shortKey": "fulltime_short",
+            "long": "Full-Time",
+            "longKey": "finished"
+          }
+        }
+      }
+    ],
+    "hasOngoingMatch": false,
+    "fixtureInfo": {
+      "activeRound": {
+        "roundId": "3",
+        "localizedKey": "round_fmt"
+      },
+      "rounds": [
+        {
+          "roundId": "1",
+          "localizedKey": "round_fmt"
+        },
+        {
+          "roundId": "2",
+          "localizedKey": "round_fmt"
+        },
+        {
+          "roundId": "3",
+          "localizedKey": "round_fmt"
+        }
+      ],
+      "teams": [
+        {
+          "id": 49688,
+          "name": "2 de Mayo"
+        },
+        {
+          "id": 6398,
+          "name": "Alianza Lima"
+        },
+        {
+          "id": 10086,
+          "name": "Argentinos Juniors"
+        },
+        {
+          "id": 7877,
+          "name": "Bahia"
+        },
+        {
+          "id": 6453,
+          "name": "Barcelona SC"
+        },
+        {
+          "id": 8517,
+          "name": "Botafogo RJ"
+        },
+        {
+          "id": 49681,
+          "name": "Carabobo FC"
+        },
+        {
+          "id": 1896,
+          "name": "Deportivo Tachira"
+        },
+        {
+          "id": 1893,
+          "name": "Guarani"
+        },
+        {
+          "id": 4056,
+          "name": "Huachipato"
+        },
+        {
+          "id": 2528,
+          "name": "Independiente Medellin"
+        },
+        {
+          "id": 9883,
+          "name": "Juventud de las Piedras"
+        },
+        {
+          "id": 2219,
+          "name": "Liverpool FC"
+        },
+        {
+          "id": 164353,
+          "name": "Nacional Potosi"
+        },
+        {
+          "id": 6296,
+          "name": "O'Higgins"
+        },
+        {
+          "id": 1848,
+          "name": "Sporting Cristal"
+        },
+        {
+          "id": 2527,
+          "name": "The Strongest"
+        },
+        {
+          "id": 1894,
+          "name": "Tolima"
+        },
+        {
+          "id": 113053,
+          "name": "Universidad Catolica"
+        }
+      ],
+      "groups": []
+    }
+  },
+  "playoff": null,
+  "seasons": []
+}

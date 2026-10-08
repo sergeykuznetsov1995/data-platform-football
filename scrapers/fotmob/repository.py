@@ -2038,6 +2038,18 @@ class FotMobRepository:
                     for item in target_types.split(",")
                 )
                 view = f"{table}_current"
+                calendar_filter = ""
+                if table == "fotmob_matches":
+                    # Old zero-success/304 manifests may already poison current.
+                    # Rank only physically nonempty calendar batches or explicit
+                    # tombstones. Never rank *after* joining physical rows: that
+                    # would resurrect a snapshot hidden by a later tombstone.
+                    calendar_filter = f"""
+                          AND (status = 'not_available' OR batch_id IN (
+                              SELECT DISTINCT _target_batch_id
+                              FROM {self.catalog}.{self.schema}.fotmob_matches
+                          ))
+                    """
                 if table in REPLACE_TARGET_CURRENT_TABLES:
                     manifest_identity = REPLACE_TARGET_MANIFEST_IDENTITIES.get(table)
                     if not manifest_identity:
@@ -2069,6 +2081,7 @@ class FotMobRepository:
                                   AND status IN ('success', 'not_modified')
                               )
                           )
+                          {calendar_filter}
                     ), committed AS (
                         SELECT DISTINCT batch_id, parser_version
                         FROM observed_targets
@@ -2089,6 +2102,20 @@ class FotMobRepository:
                           AND status IN ('success', 'not_modified')
                     )
                     """
+                membership = ""
+                if table == "fotmob_match_payloads":
+                    if not trino.table_exists(self.schema, "fotmob_matches"):
+                        raise ValueError("payload current requires the matches table")
+                    membership = f"""
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM {self.catalog}.{self.schema}.fotmob_matches_current m
+                            WHERE CAST(m.competition_id AS VARCHAR) =
+                                  CAST(r.competition_id AS VARCHAR)
+                              AND m.source_season_key = r.source_season_key
+                              AND CAST(m.match_id AS VARCHAR) = CAST(r.match_id AS VARCHAR)
+                        )
+                    """
                 trino._execute(
                     f"""
                     CREATE OR REPLACE VIEW {self.catalog}.{self.schema}.{view} AS
@@ -2106,6 +2133,7 @@ class FotMobRepository:
                         FROM {self.catalog}.{self.schema}.{table} r
                         INNER JOIN committed c
                             ON c.batch_id = r._target_batch_id
+                        {membership}
                     )
                     SELECT {quoted_columns}
                     FROM ranked
@@ -2114,6 +2142,54 @@ class FotMobRepository:
                 )
                 created.append(f"{self.catalog}.{self.schema}.{view}")
         return created
+
+    def has_committed_matches(
+        self, competition_id: int, source_season_key: str
+    ) -> bool:
+        """Whether this exact scope has ever published matches, including buffer.
+
+        Inspect physical committed history, not current or just latest_success:
+        both can already have been replaced by a legacy empty success. Query
+        only when validating a zero calendar, so normal ingestion adds no reads.
+        """
+        cid, season = str(int(competition_id)), str(source_season_key)
+        pending_batches = {
+            str(row["batch_id"])
+            for row in self._pending_manifest
+            if row.get("target_type") == "league_season"
+            and row.get("status") in SUCCESS_STATES
+            and row.get("parser_version") in {PARSER_VERSION, LEGACY_PARSER_VERSION}
+            and str(row.get("competition_id")) == cid
+            and row.get("source_season_key") == season
+        }
+        for (table, _, _), rows in self._pending.items():
+            if table == "fotmob_matches" and any(
+                str(row.get("_target_batch_id")) in pending_batches
+                and str(row.get("competition_id")) == cid
+                and row.get("source_season_key") == season
+                for row in rows
+            ):
+                return True
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            raise RuntimeError("calendar history query is unavailable")
+        trino = manager_getter()
+        if not trino.table_exists(self.schema, "fotmob_matches"):
+            return False
+        safe_season = season.replace("'", "''")
+        return bool(trino.execute_query(f"""
+            SELECT 1 FROM {self.catalog}.{self.schema}.fotmob_matches r
+            INNER JOIN {self.catalog}.{self.schema}.{MANIFEST_TABLE} m
+                ON m.batch_id = r._target_batch_id
+            WHERE CAST(r.competition_id AS VARCHAR) = '{cid}'
+              AND r.source_season_key = '{safe_season}'
+              AND CAST(m.competition_id AS VARCHAR) = '{cid}'
+              AND m.source_season_key = '{safe_season}'
+              AND m.target_type = 'league_season'
+              AND m.parser_version IN ('{PARSER_VERSION}', '{LEGACY_PARSER_VERSION}')
+              AND m.status IN ('success', 'not_modified')
+            LIMIT 1
+        """))
 
     def latest_scope_evidence(
         self, competition_ids: Iterable[int]
@@ -2963,6 +3039,25 @@ class MemoryFotMobRepository:
 
     def ensure_current_views(self) -> list[str]:
         return []
+
+    def has_committed_matches(
+        self, competition_id: int, source_season_key: str
+    ) -> bool:
+        cid, season = str(int(competition_id)), str(source_season_key)
+        batches = {
+            commit.batch_id for commit in self.commits
+            if commit.target_type == "league_season"
+            and str(commit.competition_id) == cid
+            and commit.source_season_key == season
+            and commit.status.value in SUCCESS_STATES
+            and commit.parser_version in {PARSER_VERSION, LEGACY_PARSER_VERSION}
+        }
+        return any(
+            row.get("_target_batch_id") in batches
+            and str(row.get("competition_id")) == cid
+            and row.get("source_season_key") == season
+            for row in self.tables.get("fotmob_matches", [])
+        )
 
     @property
     def manifest_index_loaded(self) -> bool:
