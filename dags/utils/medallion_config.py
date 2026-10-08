@@ -1564,6 +1564,8 @@ def get_season_team_count(competition_id: str, canonical_season) -> int:
             continue
         for s in (c.get('seasons') or []):
             if str(s['id']) == token:
+                if s.get('team_count_pending') is True:
+                    raise MedallionConfigError("season team_count evidence is pending")
                 return int(s['team_count'])
         raise MedallionConfigError(
             f"competitions.yaml: {competition_id!r} has no season {token!r} — "

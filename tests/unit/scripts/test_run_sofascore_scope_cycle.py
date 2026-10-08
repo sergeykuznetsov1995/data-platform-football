@@ -802,3 +802,39 @@ def test_cycle_deadline_is_capped_by_the_refresh_window(
     else:
         assert deadlines[0] < window
         assert deadlines[0] <= time.time() + 1800
+
+
+def test_history_cycle_forwards_exact_ids_to_signed_planner(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOFASCORE_HISTORY_MATCH_IDS_JSON", '["900", "2"]')
+    monkeypatch.setenv("SOFASCORE_HISTORY_PHASE", "matches")
+    monkeypatch.setenv("SOFASCORE_HISTORY_SEASON_EVIDENCE", "bronze")
+    paths = cycle.ScopeOverlayPaths(tmp_path / "tournaments.json", tmp_path / "competitions.yaml")
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
+    with (
+        patch("dags.scripts.prepare_sofascore_workload.prepare_workload_plan", side_effect=_plan_double) as planner,
+        patch("dags.scripts.run_sofascore_scraper.main", return_value=0),
+    ):
+        assert cycle.main(_cycle_argv(tmp_path, "--phase", "matches", "--season-evidence", "bronze", "--run-id", "july-1")) == 0
+    assert planner.call_args.kwargs["explicit_match_ids"] == ("2", "900")
+    assert planner.call_args.kwargs["base_run_id"] == "july-1"
+    assert planner.call_args.kwargs["force_replace"] is False
+
+
+@pytest.mark.parametrize("raw", ['{}', 'null', '[]', '[1]', '["01"]', '["1", "1"]', 'broken'])
+def test_history_cycle_rejects_invalid_exact_ids_before_scope_loading(tmp_path, monkeypatch, raw):
+    monkeypatch.setenv("SOFASCORE_HISTORY_MATCH_IDS_JSON", raw)
+    monkeypatch.setenv("SOFASCORE_HISTORY_PHASE", "matches")
+    monkeypatch.setenv("SOFASCORE_HISTORY_SEASON_EVIDENCE", "bronze")
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: pytest.fail("no scope load"))
+    with pytest.raises(ValueError):
+        cycle.main(_cycle_argv(tmp_path, "--phase", "matches", "--season-evidence", "bronze"))
+
+
+@pytest.mark.parametrize("flags", [[], ["--phase", "matches"], ["--phase", "matches", "--season-evidence", "bronze", "--force-replace"]])
+def test_history_cycle_requires_matches_bronze_without_force(tmp_path, monkeypatch, flags):
+    monkeypatch.setenv("SOFASCORE_HISTORY_MATCH_IDS_JSON", '["1"]')
+    monkeypatch.setenv("SOFASCORE_HISTORY_PHASE", "matches")
+    monkeypatch.setenv("SOFASCORE_HISTORY_SEASON_EVIDENCE", "bronze")
+    with pytest.raises(SystemExit):
+        cycle.main(_cycle_argv(tmp_path, *flags))

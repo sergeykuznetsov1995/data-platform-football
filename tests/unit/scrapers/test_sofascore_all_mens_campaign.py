@@ -236,7 +236,7 @@ def test_excluded_season_stays_refused_even_for_the_refresh_lane(tmp_path):
 @pytest.mark.unit
 @pytest.mark.parametrize("kind", ["league", "cup"])
 def test_pending_season_overlays_carry_no_team_count_and_fail_closed_on_pages(
-    tmp_path, kind
+    tmp_path, kind, monkeypatch
 ):
     snapshot = _pending_snapshot(tmp_path, kind=kind)
     scope = load_exact_scope(
@@ -266,8 +266,11 @@ def test_pending_season_overlays_carry_no_team_count_and_fail_closed_on_pages(
     _validate_competitions_schema(competitions)
     season_config = competitions["competitions"][0]["seasons"][0]
     assert season_config["season_format"] == "split_year"
-    with pytest.raises(WorkloadPlanError, match="outside the measured"):
-        team_count_band(season_config["team_count"])
+    assert season_config["team_count_pending"] is True
+    from dags.utils import medallion_config
+    monkeypatch.setattr(medallion_config, "load_competitions", lambda: competitions)
+    with pytest.raises(medallion_config.MedallionConfigError, match="evidence is pending"):
+        medallion_config.get_season_team_count("SS-17", "2526")
 
 
 @pytest.mark.unit

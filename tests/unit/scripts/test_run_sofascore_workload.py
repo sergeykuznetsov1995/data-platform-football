@@ -435,3 +435,114 @@ def test_runner_takes_the_allocations_in_the_plan_s_target_order(
     assert "30" in target_ids(ordered[0])
     assert [item.batch_index for item in ordered] == [1, 0]
     assert set(ordered) == set(plain)
+
+
+def _history_environment(monkeypatch, ids):
+    import json
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("SOFASCORE_HISTORY_MATCH_IDS_JSON", json.dumps(ids))
+    monkeypatch.setenv("SOFASCORE_HISTORY_PHASE", "matches")
+    monkeypatch.setenv("SOFASCORE_HISTORY_SEASON_EVIDENCE", "bronze")
+
+
+def test_history_runtime_uses_only_signed_ids_absent_from_schedule(tmp_path, monkeypatch):
+    import json
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore.workload_runtime import load_plan
+    from scrapers.sofascore.manifest import InMemoryManifestStore
+
+    ids = [str(value) for value in range(1, 28)]
+    _history_environment(monkeypatch, ids)
+    plan = load_plan(_target_plan(tmp_path))
+    monkeypatch.setattr(runner, "_source_context", lambda *a: (17, 76986))
+    monkeypatch.setattr(runner, "_resolve_match_ids_from_bronze", lambda *a, **k: pytest.fail("schedule must not determine exact universe"))
+    seen = []
+    def terminal_resume(store, specs):
+        seen.extend(specs)
+        return {}
+    monkeypatch.setattr("scrapers.sofascore.pipeline.endpoint_resume_plan", terminal_resume)
+    runtime = SimpleNamespace(manifest_store=InMemoryManifestStore())
+    output = tmp_path / "report.json"
+    assert runner._run_match_capture(
+        ["ENG-Premier League"], 2025, None, str(output), capture_runtime=runtime,
+        workload_plan=plan, workload_allocations=plan.allocations,
+    ) == 0
+    assert {spec.key.target_id for spec in seen} == set(ids)
+    assert {spec.key.source_season_id for spec in seen} == {"76986"}
+    assert {spec.key.source_tournament_id for spec in seen} == {"17"}
+    assert {spec.key.freshness_key for spec in seen} == {"final"}
+    assert json.loads(output.read_text())["matches_skipped_existing"] == len(ids)
+
+
+@pytest.mark.parametrize("changed_ids", [["900"], ["1"], [str(value) for value in range(1, 29)]])
+def test_history_runtime_rejects_changed_or_expanded_unsigned_ids(tmp_path, monkeypatch, changed_ids):
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore.workload_runtime import load_plan
+    _history_environment(monkeypatch, changed_ids)
+    plan = load_plan(_target_plan(tmp_path))
+    with pytest.raises(RuntimeError, match="differ from the signed"):
+        runner._signed_history_match_ids(plan, plan.allocations)
+
+
+@pytest.mark.parametrize("overrides", [{"force_replace": True}, {"offline_replay": True}])
+def test_history_runtime_rejects_overrides(tmp_path, monkeypatch, overrides):
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore.workload_runtime import load_plan
+    _history_environment(monkeypatch, [str(value) for value in range(1, 28)])
+    plan = load_plan(_target_plan(tmp_path))
+    with pytest.raises(RuntimeError, match="without force/offline overrides"):
+        runner._signed_history_match_ids(plan, plan.allocations, **overrides)
+
+
+def test_signed_history_capture_replays_raw_before_planned_missing_endpoints(tmp_path, monkeypatch):
+    from pyarrow import fs
+    from scrapers.sofascore.capture_engine import EndpointSpec, SofaScoreCaptureEngine
+    from scrapers.sofascore.live_capture import capture_live_specs
+    from scrapers.sofascore.manifest import InMemoryManifestStore, ManifestKey
+    from scrapers.sofascore.pipeline import CaptureRuntime, DeferredCaptureSink
+    from scrapers.sofascore.raw_store import RawPayloadStore
+    from scrapers.sofascore.workload_runtime import load_plan
+    from dags.scripts import run_sofascore_scraper as runner
+
+    ids = [str(value) for value in range(1, 28)]
+    _history_environment(monkeypatch, ids)
+    plan = load_plan(_target_plan(tmp_path))
+    assert runner._signed_history_match_ids(plan, plan.allocations) == tuple(ids)
+    raw = RawPayloadStore(fs.LocalFileSystem(), str(tmp_path / "raw"))
+    manifests = InMemoryManifestStore()
+    allocation = plan.allocations[0]
+    engine = SofaScoreCaptureEngine(
+        raw_store=raw, manifest_store=manifests, transport=SimpleNamespace(),
+        sink=DeferredCaptureSink(), run_id=plan.run_id, task_id=allocation.task_id,
+        budget=SimpleNamespace(policy=SimpleNamespace(
+            artifact_id=plan.artifact_id, hard_run_bytes=allocation.budget_bytes,
+        )),
+    )
+    runtime = CaptureRuntime(engine, manifests, raw)
+    def spec(target):
+        return EndpointSpec(
+            key=ManifestKey("17", "76986", "event", target, "event", "final"),
+            url=f"https://www.sofascore.com/api/v1/event/{target}",
+            schema_validator=lambda payload: isinstance(payload.get("items"), list),
+            empty_predicate=lambda payload: payload["items"] == [],
+            parsers={"items": lambda payload: payload["items"]}, paid_proxy=True,
+        )
+    saved, missing = spec("1"), spec("2")
+    raw.store_bytes(saved.raw_target, b'{"items":[{"id":1}]}', request_url=saved.url,
+                    http_status=200, response_headers={"content-type": "application/json"})
+    class NoSource(RuntimeError):
+        pass
+    def no_source(*args, **kwargs):
+        # The missing endpoint reached its signed allocation only after the
+        # saved nonterminal payload was replayed. No actual source is opened.
+        assert manifests.get(saved.key).error_type == "DeferredMaterialization"
+        assert engine.metrics.snapshot()["replay_hits"] == 1
+        assert manifests.get(missing.key) is None
+        raise NoSource("planned missing endpoint reached transport boundary")
+    with pytest.raises(NoSource):
+        capture_live_specs(
+            runtime, [missing, saved], canonical_url="https://www.sofascore.com/tournament/17",
+            scope="ENG-Premier League:2526", entity="match_capture", workload_plan=plan,
+            allocation_id=allocation.allocation_id, transport_factory=no_source,
+        )
+    assert engine.metrics.snapshot()["source_request_count"] == 0

@@ -20,6 +20,21 @@ def _load_dag_module():
     return importlib.import_module("dags.dag_backfill_sofascore_all_mens")
 
 
+@pytest.fixture(autouse=True)
+def _offline_history_adapter(monkeypatch, tmp_path):
+    from scrapers.sofascore import history_inventory
+    from tests.unit.scrapers.test_sofascore_history_controller import evidence
+    monkeypatch.setattr(history_inventory, "collect", lambda snapshot, **kwargs: (
+        evidence(snapshot) if snapshot.get("tournaments") else {"observed_at": "test", "scopes": []}
+    ))
+    original = _load_dag_module
+    def isolated():
+        module = original()
+        monkeypatch.setattr(module, "CONTROLLER_PATH", str(tmp_path / "controller.json"))
+        return module
+    monkeypatch.setattr(sys.modules[__name__], "_load_dag_module", isolated)
+
+
 def _run_scope_operator():
     from airflow.operators.bash import BashOperator
 
@@ -523,8 +538,10 @@ def test_shipped_static_policy_authorizes_the_ready_history_scopes(monkeypatch):
 
     planned = module._plan_historical_batch(run_id="manual__1")
 
+    from tests.unit.scrapers.test_sofascore_history_controller import evidence
     unfiltered = module.state.plan_historical_batch(
-        snapshot, completed=set(), batch_size=10
+        snapshot, completed=set(), batch_size=10,
+        history_inventory=evidence(snapshot), controller_path=module.CONTROLLER_PATH, dag_run_id="manual__1",
     )
     assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
         item["SOFASCORE_SCOPE_KEY"] for item in unfiltered
@@ -585,3 +602,55 @@ def test_finalize_remembers_journaled_rejects_of_a_green_scope(
             "release": "abcd1234",
         },
     )]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("old_state,allowed", [("failed", True), ("success", True), ("running", False), ("queued", False)])
+def test_orphan_checkpoint_reconciles_only_terminal_airflow_run(monkeypatch, tmp_path, old_state, allowed):
+    import types
+    from contextlib import contextmanager
+    from scrapers.sofascore import history_controller
+    from tests.unit.scrapers.test_sofascore_history_controller import snapshot, evidence, denominator
+    module = _load_dag_module()
+    snap = snapshot()
+    planned = history_controller.plan(snap, inventory=evidence(snap), checkpoint_path=module.CONTROLLER_PATH,
+                                      denominator=denominator(), dag_run_id="old-run")
+    old = SimpleNamespace(state=old_state)
+    query = SimpleNamespace(filter=lambda *args: SimpleNamespace(one_or_none=lambda: old))
+    @contextmanager
+    def session():
+        yield SimpleNamespace(query=lambda model: query)
+    dagrun = types.ModuleType("airflow.models.dagrun")
+    dagrun.DagRun = SimpleNamespace(dag_id="dag", run_id="run")
+    sessions = types.ModuleType("airflow.utils.session")
+    sessions.create_session = session
+    monkeypatch.setitem(sys.modules, "airflow.models.dagrun", dagrun)
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", sessions)
+    captured = []
+    def finalize(**context):
+        captured.append(context)
+        assert context["ti"].xcom_pull(task_ids="plan_historical_batch") == planned
+        history_controller.finalize(module.CONTROLLER_PATH, campaign_id=snap["campaign_id"], run_id=context["run_id"])
+    monkeypatch.setattr(module, "_finalize_historical_run", finalize)
+    if allowed:
+        module._recover_history_reservation(snap, "new-run")
+        assert captured[0]["run_id"] == "old-run"
+        assert history_controller.read_summary(module.CONTROLLER_PATH, snap["campaign_id"])["run"]["finalized"]
+    else:
+        with pytest.raises(Exception, match="no terminal DagRun"):
+            module._recover_history_reservation(snap, "new-run")
+        assert captured == []
+
+
+@pytest.mark.unit
+def test_july_portion_does_not_mark_whole_legacy_season_completed(monkeypatch, tmp_path):
+    module = _load_dag_module()
+    env = _capture_env("campaign-test:17:1725")
+    path = tmp_path / "july-result.json"
+    path.write_text(json.dumps({"status": "success", "campaign_id": "campaign-test", "tournament_id": 17, "source_season_id": 1725}))
+    env.update(SOFASCORE_SCOPE_RESULT_PATH=str(path), SOFASCORE_HISTORY_GROUP="july")
+    completed, cleared = [], []
+    monkeypatch.setattr(module.state, "mark_completed", lambda *args, **kwargs: completed.append(kwargs))
+    monkeypatch.setattr(module.state, "clear_failed", lambda *args, **kwargs: cleared.append(kwargs))
+    module._validate_historical_scope(**env)
+    assert completed == [] and len(cleared) == 1

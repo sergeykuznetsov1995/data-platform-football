@@ -1835,3 +1835,51 @@ def test_an_uncapped_targets_plan_leaves_no_order_file(tmp_path, monkeypatch):
     assert not target_order_path(path).exists()
     signed = load_plan(path, control_token=TOKEN)
     assert order_allocations(signed.allocations, path) == tuple(signed.allocations)
+
+
+def test_explicit_history_ids_are_signed_without_schedule_and_immutable(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("SOFASCORE_SCOPE_MAX_MATCHES", "25")
+    patches = _common_patches(_season_plan())
+    kwargs = dict(
+        dag_id="dag_backfill_sofascore_all_mens", base_run_id="july-1",
+        phase="targets", competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+        artifact_path=tmp_path / "artifact.json", output_path=tmp_path / "explicit.json",
+        allow_inactive_season=True, season_freshness_key="final", season_evidence="bronze",
+    )
+    with (
+        patches[0], patches[1], patches[2],
+        patch("dags.scripts.prepare_sofascore_workload._finished_match_ids", side_effect=AssertionError("no schedule discovery")),
+        patch("dags.scripts.prepare_sofascore_workload._finished_match_deadlines", side_effect=AssertionError("no schedule discovery")),
+        patch("dags.scripts.prepare_sofascore_workload._pending_targets", side_effect=AssertionError("full exact universe must be signed")),
+        patch("dags.scripts.prepare_sofascore_workload.plan_season_partition", side_effect=AssertionError("no season pages")),
+    ):
+        path = prepare_workload_plan(**kwargs, explicit_match_ids=("900", "2"))
+        original = path.read_bytes()
+        assert prepare_workload_plan(**kwargs, explicit_match_ids=("2", "900")) == path
+        with pytest.raises(RuntimeError, match="immutable.*explicit match IDs"):
+            prepare_workload_plan(**kwargs, explicit_match_ids=("2", "901"))
+        assert path.read_bytes() == original
+    plan = load_plan(path, control_token=TOKEN)
+    assert plan.freshness_key("match") == "final"
+    assert [target for allocation in plan.allocations for target in target_ids(allocation)] == ["2", "900"]
+
+
+@pytest.mark.parametrize("ids", [[], [1], [True], ["0"], ["01"], [" 1"], ["1", "1"]])
+def test_explicit_history_ids_reject_invalid_universes(tmp_path, ids):
+    with pytest.raises(ValueError, match="explicit_match_ids"):
+        prepare_workload_plan(
+            dag_id="dag_backfill_sofascore_all_mens", base_run_id="july-1", phase="targets",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json", season_evidence="bronze", explicit_match_ids=ids,
+        )
+
+
+def test_explicit_history_ids_cannot_be_silently_sliced_by_scope_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOFASCORE_SCOPE_MAX_MATCHES", "1")
+    with pytest.raises(ValueError, match="SOFASCORE_SCOPE_MAX_MATCHES"):
+        prepare_workload_plan(
+            dag_id="dag_backfill_sofascore_all_mens", base_run_id="july-1", phase="targets",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json", season_evidence="bronze", explicit_match_ids=["2", "900"],
+        )

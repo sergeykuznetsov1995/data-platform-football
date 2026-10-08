@@ -983,6 +983,38 @@ def _flush_manifest_store(manifest_store) -> None:
         flush()
 
 
+def _signed_history_match_ids(
+    workload_plan, workload_allocations, *, force_replace=False, offline_replay=False,
+):
+    """Authorize an exact controller universe through the canonical signed plan."""
+    from dags.scripts.run_sofascore_scope_cycle import _history_match_ids
+    from scrapers.sofascore.workload_runtime import target_ids
+
+    explicit_ids = _history_match_ids()
+    if explicit_ids is None:
+        return None
+    if workload_plan is None or force_replace or offline_replay:
+        raise RuntimeError("history match IDs require a signed plan without force/offline overrides")
+    workload_plan.verify()
+    if any(
+        allocation not in workload_plan.allocations or allocation.scope != "match"
+        for allocation in workload_allocations
+    ):
+        raise RuntimeError("history allocations are absent from the signed workload plan")
+    signed_ids = tuple(sorted(
+        (target for allocation in workload_allocations for target in target_ids(allocation)),
+        key=int,
+    ))
+    if signed_ids != explicit_ids or workload_plan.freshness_key("match") != "final":
+        raise RuntimeError("history match IDs differ from the signed workload plan")
+    from dags.scripts.prepare_sofascore_workload import _scope_max_matches
+
+    scope_cap = _scope_max_matches()
+    if scope_cap is not None and len(explicit_ids) > scope_cap:
+        raise RuntimeError("history match IDs exceed SOFASCORE_SCOPE_MAX_MATCHES")
+    return explicit_ids
+
+
 def _run_match_capture(
     leagues: List[str],
     season: int,
@@ -1049,10 +1081,17 @@ def _run_match_capture(
         source_tournament_id, source_season_id = _source_context(
             league, season, season_short
         )
-        match_ids = _resolve_match_ids_from_bronze(
-            league, season_short, None, source_season_id=source_season_id
+        explicit_ids = _signed_history_match_ids(
+            workload_plan, workload_allocations,
+            force_replace=force_replace, offline_replay=offline_replay,
         )
-        if not match_ids and season_alias:
+        match_ids = (
+            list(explicit_ids) if explicit_ids is not None
+            else _resolve_match_ids_from_bronze(
+                league, season_short, None, source_season_id=source_season_id
+            )
+        )
+        if not match_ids and season_alias and explicit_ids is None:
             match_ids = _resolve_match_ids_from_bronze(
                 league, season_alias, None, source_season_id=source_season_id
             )
