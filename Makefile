@@ -8,6 +8,7 @@
 # rejects caller-supplied Compose files and cannot be replaced from make's
 # command line. The default state path lives outside release checkouts.
 override COMPOSE := ./scripts/compose.sh
+PYTHON ?= python3
 
 .PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino shell-airflow shell-trino sofascore-discovery sofascore-discovery-check sofascore-discovery-lease test-fbref-offline test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
@@ -210,15 +211,7 @@ urls:
 # Deterministic FBref verification. Live traffic requires an explicit bounded
 # canary; this target never opens the production transport.
 test-fbref-offline:
-	@$(COMPOSE) exec airflow-scheduler bash -ec '\
-		tests="$$(find tests/unit -type f -name "*fbref*.py" -print | sort)"; \
-		test -n "$$tests"; \
-		python -m pytest -q $$tests \
-			tests/unit/dags/test_dag_iceberg_maintenance_daily.py \
-			tests/unit/dags/test_maintenance_tasks.py \
-			tests/unit/scripts/test_filter_proxy.py \
-			tests/unit/scrapers/test_proxy_manager.py \
-			tests/unit/scrapers/test_scrapers_lazy_import.py'
+	@"$(PYTHON)" scripts/ci/run_fbref_offline.py
 
 # Test proxy pool statistics
 test-proxy-stats:

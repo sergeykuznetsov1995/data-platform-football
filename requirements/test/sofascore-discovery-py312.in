@@ -1,0 +1,7 @@
+# Direct dependencies of the existing source gate, pinned to its green CI baseline.
+pytest==9.1.1
+PyYAML==6.0.3
+requests==2.34.2
+pandas==3.0.6
+typing-extensions==4.15.0
+tls-client-python==1.15.1
