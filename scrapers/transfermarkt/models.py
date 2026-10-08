@@ -142,6 +142,9 @@ PARENT_RETRY_LIMIT = MAX_SCOPE_BATCH * SCOPE_RETRY_LIMIT
 MAX_ROSTER_WINDOW = 500
 """Most careers (market value / transfers) one scope cycle may buy."""
 
+CAREER_WINDOW_POLICY_VERSION = 'decoded-soft-stop-75-v1'
+"""Current-refresh admission policy pinned by scope checkpoints."""
+
 PROVIDER_GRANT_ENV_VAR = 'TM_PROVIDER_BYTE_BUDGET'
 """Per-entity provider-byte grant the runner exports to its client."""
 

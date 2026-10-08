@@ -2368,6 +2368,144 @@ class TestProviderByteGrant:
         }
 
 
+@pytest.mark.parametrize('empty', [False, True])
+@pytest.mark.parametrize('failure', [None, 'write', 'manifest'])
+@pytest.mark.parametrize('hydrate', [False, True])
+def test_adaptive_runner_checkpoints_only_committed_prefix(tmp_path, monkeypatch, empty, failure, hydrate):
+    from tests.unit.scrapers.test_transfermarkt_traffic import _career_replay
+    import scrapers.transfermarkt as tm
+
+    mod = _import_runner()
+    scraper, _client, factory = _career_replay([500] * 6, empty=empty)
+    selected = [str(i) for i in range(1, 7)]
+    cache_scraper, _, _ = _career_replay([500] * 6)
+    cached = cache_scraper.read_transfer_events(
+        'ENG-Premier League', 2025, player_ids=selected,
+    )
+    events = []
+    monkeypatch.setenv('TM_DECODED_BODY_BUDGET_MB', '0.002')
+    monkeypatch.setattr(tm, 'TransfermarktScraper', lambda **kwargs: scraper)
+    monkeypatch.setattr(mod, '_load_response_cache', lambda: (None, None, None))
+    monkeypatch.setattr(mod, '_select_player_ids', lambda *a, **k: (
+        selected, 0, 0, selected if hydrate else [],
+        {'roster_size': 9, 'selected': 6, 'pending': 3},
+    ))
+    monkeypatch.setattr(mod, '_load_cached_career_frames', lambda *a: {
+        'transfer_events': cached,
+    })
+
+    def save(_scraper, spec, frames, _force, results):
+        events.append('write')
+        if failure == 'write':
+            raise RuntimeError('Bronze unavailable')
+        if not empty:
+            assert set(frames['transfer_events']['player_id']) == set(selected[:4])
+        for output in spec.outputs:
+            results['outputs'][output.key] = {
+                'rows': len(frames[output.key]),
+                'table': f'iceberg.bronze.{output.table_name}',
+            }
+
+    def manifest(*a):
+        events.append('manifest')
+        return {'status': 'failed' if failure == 'manifest' else 'success', 'rows': []}
+
+    def delete(_scraper, spec, ids, *a, **k):
+        assert ids == selected[:4]
+        events.append('write')
+        if failure == 'write':
+            raise RuntimeError('Bronze unavailable')
+        return {out.key: f'iceberg.bronze.{out.table_name}' for out in spec.outputs}
+
+    def checkpoint(_scraper, _spec, ids, rows, *a):
+        assert events == ['write', 'manifest']
+        assert ids == selected[:4]
+        assert all(row[0] == ('authoritative_empty' if empty else 'success') for row in rows)
+        events.append('checkpoint')
+        return 'success'
+
+    with (
+        patch.object(mod, '_save_frames', side_effect=save),
+        patch.object(mod, '_persist_dual_write_manifest', side_effect=manifest),
+        patch.object(mod, '_commit_checkpoint_or_pending', side_effect=checkpoint) as commit,
+        patch.object(mod, '_delete_valid_empty_rows', side_effect=delete) as delete_rows,
+        patch.object(mod, '_persist_fetch_state', return_value=True) as failed_state,
+        patch.object(mod, '_write_results') as result,
+    ):
+        rc = mod._run_entity(
+            mod.ENTITY_SPECS['transfers'], ['GB1'], 2025, 6,
+            str(tmp_path / 'result.json'), run_key='adaptive-run',
+        )
+    assert rc == (0 if failure is None else 1)
+    assert commit.call_count == (1 if failure is None else 0)
+    payload = result.call_args.args[1]
+    assert payload['career_window']['attempted'] == 4
+    assert payload['career_window']['deferred'] == 2
+    assert payload['roster_coverage']['selected'] == 4
+    assert payload['roster_coverage']['pending'] == 5
+    if hydrate:
+        assert payload['career_cache_materialized_keys'] == (0 if empty else 4)
+    assert sum(len(c.get_calls) for c in factory.clients) == 4
+    if delete_rows.called:
+        assert delete_rows.call_args.args[2] == selected[:4]
+    if failed_state.called:
+        assert failed_state.call_args.args[2] == selected[:4]
+        assert all(row[0] == 'failed' for row in failed_state.call_args.args[3])
+
+
+def test_deferred_careers_are_selected_before_newly_committed_prefix():
+    mod = _import_runner()
+    requested = [str(i) for i in range(1, 7)]
+    scraper = SimpleNamespace(get_career_window=lambda endpoint: {
+        'requested_ids': requested, 'attempted_ids': requested[:4],
+        'deferred_ids': requested[4:], 'stop_reason': 'decoded_body_soft_stop',
+        'decoded_body_soft_stop_bytes': 1000,
+    })
+    result = {'roster_coverage': {'roster_size': 6, 'selected': 6, 'pending': 0}}
+    admitted = mod._apply_career_window(scraper, mod.ENTITY_SPECS['transfers'], requested, result)
+
+    class RosterScraper:
+        def _resolve_player_ids_from_bronze(self, *args, **kwargs):
+            return requested
+
+    state = {pid: {
+        'status': 'success', 'run_key': 'previous-run',
+        'last_success_at': '2026-10-08T00:00:00+00:00',
+    } for pid in admitted}
+    with (
+        patch.object(mod, '_load_fetch_state', return_value=state),
+        patch.object(mod, '_load_pending_checkpoint', return_value=({}, None)),
+        patch.object(mod, '_load_data_derived_state', return_value={}),
+    ):
+        selected, *_ = mod._select_player_ids(
+            RosterScraper(), mod.ENTITY_SPECS['transfers'], 'ENG-Premier League',
+            2025, 2, 0, 'current', 'next-run', allow_state_writes=False,
+        )
+    assert selected == requested[4:]
+
+
+@pytest.mark.parametrize('refresh_mode', ['historical', 'force'])
+def test_other_refresh_modes_do_not_enable_adaptive_window(monkeypatch, tmp_path, refresh_mode):
+    import scrapers.transfermarkt as tm
+    from tests.unit.scrapers.test_transfermarkt_traffic import _career_replay
+
+    mod = _import_runner()
+    scraper, _, _ = _career_replay([500] * 2)
+    monkeypatch.setattr(tm, 'TransfermarktScraper', lambda **kwargs: scraper)
+    monkeypatch.setattr(mod, '_load_response_cache', lambda: (None, None, None))
+    monkeypatch.setattr(mod, '_select_player_ids', lambda *a, **k: (
+        ['1', '2'], 0, 0, [], {'roster_size': 2, 'selected': 2, 'pending': 0},
+    ))
+    with patch.object(mod, '_write_results') as result:
+        rc = mod._run_entity(
+            mod.ENTITY_SPECS['transfers'], ['GB1'], 2025, 2,
+            str(tmp_path / 'result.json'), dry_run=True, refresh_mode=refresh_mode,
+        )
+    assert rc == 0
+    assert 'career_window' not in result.call_args.args[1]
+    assert scraper.get_career_window('transfer_events') is None
+
+
 def test_cli_keeps_child_run_key_and_accepts_explicit_scope_ledger_key(
     monkeypatch,
 ):

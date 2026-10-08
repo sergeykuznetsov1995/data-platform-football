@@ -60,3 +60,26 @@ multi-source epic; #871 is fixed here by stable `tm_`/`fm_` orphan IDs; #851 is
 the traffic regression baseline; #789/#795, #790, #803/#814 and #847 are
 enforced by provider-metered manifests, fail-closed empty statuses,
 scope-aware DQ and resumable/batched writes.
+
+## Current career windows
+
+Current refreshes of transfers and market-value history admit at most 500
+players and stop before the next player once decoded response bodies reach
+75% of the entity's existing decoded cap. Each admitted player's entire career
+still passes semantic and completeness checks; the 90% success ratio includes
+failed attempts within that admitted window. Hard decoded/provider/request
+caps remain blocking, including an unexpectedly large single response.
+
+The runner reports `career_window` counts and the stop reason. Its
+`roster_coverage.selected` counts admitted players and `pending` includes the
+deferred tail; the scope manifest hashes those coverage values. Only committed
+keys receive successful checkpoints, so deferred careers retain their previous
+age and precede newly refreshed careers in the next current run. Historical
+and force refreshes retain their original window behavior and checkpoint
+identity; current checkpoint identity pins `decoded-soft-stop-75-v1`.
+
+Offline evidence: the BRA4/2025 synthetic byte replay, whole-player boundary and
+hard-cap tests in `test_transfermarkt_traffic.py`, commit/checkpoint ordering and
+next-run selection in `test_run_transfermarkt_scraper.py`, and scope coverage
+evidence in `test_run_transfermarkt_scope_cycle.py`. Scheduled production ingest
+after automatic delivery remains the runtime acceptance check.
