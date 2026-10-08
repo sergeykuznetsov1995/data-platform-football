@@ -33,6 +33,28 @@ SCOPE_DEADLINE_ENV = "SOFASCORE_SCOPE_DEADLINE_EPOCH"
 WINDOW_DEADLINE_ENV = "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"
 
 
+def _history_match_ids(environ=None) -> Optional[tuple[str, ...]]:
+    """Read the controller-only exact universe; ordinary calls stay unchanged."""
+    env = os.environ if environ is None else environ
+    raw = env.get("SOFASCORE_HISTORY_MATCH_IDS_JSON")
+    if raw is None:
+        return None
+    if (
+        env.get("SOFASCORE_HISTORY_PHASE") != "matches"
+        or env.get("SOFASCORE_HISTORY_SEASON_EVIDENCE") != "bronze"
+    ):
+        raise ValueError("history match IDs require history phase=matches and evidence=bronze")
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SOFASCORE_HISTORY_MATCH_IDS_JSON must be a JSON array") from exc
+    if not isinstance(values, list):
+        raise ValueError("SOFASCORE_HISTORY_MATCH_IDS_JSON must be a JSON array")
+    from dags.scripts.prepare_sofascore_workload import normalize_explicit_match_ids
+
+    return normalize_explicit_match_ids(values)
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
@@ -137,6 +159,8 @@ def run_phase(
             allow_inactive_season=True,
             season_freshness_key="final",
             season_evidence=str(scope.get("season_evidence") or "pages"),
+            **({"explicit_match_ids": scope["explicit_match_ids"]}
+               if "explicit_match_ids" in scope else {}),
         )
     except Exception as exc:
         # #1351: a plan that cannot be prepared from the scope's stored state
@@ -228,6 +252,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.season_evidence == "bronze" and args.phase != "matches":
         parser.error("--season-evidence bronze requires --phase matches")
+    explicit_ids = _history_match_ids()
+    if explicit_ids is not None and (
+        args.phase != "matches" or args.season_evidence != "bronze" or args.force_replace
+    ):
+        parser.error("history match IDs require --phase matches --season-evidence bronze without --force-replace")
     output_dir = Path(args.output_dir).resolve()
     output = Path(args.output).resolve()
     started = time.monotonic()
@@ -283,6 +312,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 or "dag_backfill_sofascore_all_mens"
             ),
         })
+        if explicit_ids is not None:
+            scope["explicit_match_ids"] = explicit_ids
         os.environ["SOFASCORE_REGISTRY_PATH"] = str(paths.registry_path)
         os.environ["MEDALLION_CONFIG_DIR"] = str(paths.competitions_path.parent)
         os.environ["SOFASCORE_RUN_ID"] = run_id

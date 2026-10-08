@@ -15,6 +15,7 @@ from airflow.operators.python import PythonOperator
 from airflow.sensors.python import PythonSensor
 
 from scrapers.sofascore.workload_plan import load_static_workload_policy
+from scrapers.sofascore import history_controller, history_inventory
 
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils import sofascore_all_mens_state as state
@@ -34,6 +35,8 @@ STATE_PATH = os.environ.get(
     "/opt/airflow/logs/sofascore-all-men/state.json",
 )
 FAILURES_PATH = str(Path(STATE_PATH).with_name("failures.json"))
+CONTROLLER_PATH = str(Path(STATE_PATH).with_name("history-controller.json"))
+REGISTRY_PATH = str(Path(__file__).resolve().parents[1] / "configs/sofascore/tournaments.json")
 RESULT_DIR = os.environ.get(
     "SOFASCORE_ALL_MENS_RESULT_DIR",
     "/opt/airflow/logs/sofascore-all-men/results",
@@ -81,14 +84,46 @@ HISTORY_TASK_IDS = frozenset({
 })
 
 
+def _recover_history_reservation(snapshot, run_id):
+    if not Path(CONTROLLER_PATH).exists():
+        return
+    report = history_controller.read_summary(CONTROLLER_PATH, snapshot["campaign_id"])
+    previous = report.get("run")
+    if not previous or previous["finalized"] or previous["run_id"] == run_id:
+        return
+    # A timed-out DagRun may have lost its finalizer. Reconcile its accounting
+    # only after Airflow confirms it terminal; a restart cannot steal work
+    # from a still-running reservation.
+    from airflow.models.dagrun import DagRun
+    from airflow.utils.session import create_session
+    with create_session() as session:
+        old = session.query(DagRun).filter(
+            DagRun.dag_id == DAG_ID, DagRun.run_id == previous["run_id"],
+        ).one_or_none()
+        if old is None or _task_state(old) not in {"success", "failed"}:
+            raise AirflowException("previous history reservation has no terminal DagRun")
+        class RecoveredTI:
+            def xcom_pull(self, **kwargs):
+                return previous["plan"]
+            def xcom_push(self, **kwargs):
+                pass
+        _finalize_historical_run(ti=RecoveredTI(), dag_run=old, run_id=previous["run_id"])
+
+
 def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
     campaign_id = str(snapshot.get("campaign_id") or "")
+    _recover_history_reservation(snapshot, str(context.get("run_id") or "manual"))
     completed = state.read_completed(STATE_PATH, campaign_id=campaign_id)
     failures = state.read_failures(FAILURES_PATH, campaign_id=campaign_id)
     workload_policy = load_static_workload_policy(WORKLOAD_ARTIFACT)
-    return state.plan_historical_batch(
+    inventory = history_inventory.collect(
+        snapshot, result_dir=RESULT_DIR, checkpoint_path=CONTROLLER_PATH,
+        registry_path=REGISTRY_PATH,
+    )
+    planned = state.plan_historical_batch(
         snapshot,
+        history_inventory=inventory, controller_path=CONTROLLER_PATH,
         completed=completed,
         failures=failures,
         max_scope_attempts=HISTORY_MAX_SCOPE_ATTEMPTS,
@@ -106,6 +141,11 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
         ],
         task_env=HISTORY_TASK_ENV,
     )
+    if context.get("ti") is not None:
+        report = history_controller.read_summary(CONTROLLER_PATH, campaign_id)
+        context["ti"].xcom_push(key="history_groups", value=report["groups"])
+        context["ti"].xcom_push(key="history_summary", value=report["summary"])
+    return planned
 
 
 def _validate_historical_scope(**environment: str) -> dict[str, Any]:
@@ -145,11 +185,11 @@ def _validate_historical_scope(**environment: str) -> dict[str, Any]:
         or int(result.get("source_season_id", 0)) != int(season_id)
     ):
         raise AirflowException("scope result provenance mismatch")
-    state.mark_completed(
-        STATE_PATH,
-        campaign_id=campaign_id,
-        scope_key=environment["SOFASCORE_SCOPE_KEY"],
-    )
+    if environment.get("SOFASCORE_HISTORY_GROUP") != "july":
+        state.mark_completed(
+            STATE_PATH, campaign_id=campaign_id,
+            scope_key=environment["SOFASCORE_SCOPE_KEY"],
+        )
     state.clear_failed(
         FAILURES_PATH,
         campaign_id=campaign_id,
@@ -211,6 +251,13 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
             source_requests=source_requests,
             release=release,
             season_identity=environment.get("SOFASCORE_SEASON_ALIGNMENT_IDENTITY"),
+        )
+    checkpoint = Path(CONTROLLER_PATH)
+    if checkpoint.exists():
+        snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+        history_controller.finalize(
+            checkpoint, campaign_id=snapshot["campaign_id"],
+            run_id=str(context.get("run_id") or "manual"),
         )
     did_work = bool(planned)
     target = datetime.now(timezone.utc) + (
@@ -276,7 +323,8 @@ case "${SOFASCORE_CAMPAIGN_ACTION}" in
       --source-season-id "${SOFASCORE_SOURCE_SEASON_ID}" \
       --expected-snapshot-id "${SOFASCORE_EXPECTED_SNAPSHOT_ID}" \
       --expected-campaign-id "${SOFASCORE_EXPECTED_CAMPAIGN_ID}" \
-      --phase all \
+      --phase "${SOFASCORE_HISTORY_PHASE:-all}" \
+      --season-evidence "${SOFASCORE_HISTORY_SEASON_EVIDENCE:-pages}" \
       --output-dir "${SOFASCORE_SCOPE_OUTPUT_DIR}" \
       --output "${SOFASCORE_SCOPE_RESULT_PATH}" \
       --workload-artifact "${SOFASCORE_WORKLOAD_ARTIFACT}" \
@@ -293,7 +341,7 @@ esac
 with DAG(
     dag_id=DAG_ID,
     default_args=DEFAULT_ARGS,
-    description="All adult-men SofaScore history, newest season across all first",
+    description="SofaScore history by actual debt, breadth-first within gated groups",
     schedule="@continuous",
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,

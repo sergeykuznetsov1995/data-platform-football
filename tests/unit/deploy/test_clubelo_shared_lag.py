@@ -33,6 +33,8 @@ ALLOWED_BLOBS = {
 }
 # Reviewed pre/post #1590 source, pinned in full on purpose. A future change
 # requires a fresh compatibility review even in a shallow clone without old blobs.
+# #1363: only get_season_team_count changed; it is outside the ClubElo closure.
+# Pin that reachable closure below before retaining the existing ALLOWED_LAG.
 CONFIG_SHA256 = {
     "dags/utils/config.py": (
         "df91f3f6dcd1d9c0f849721f4e33e6df3d1240c7176d55e4361a8fc340d2bb78",
@@ -40,7 +42,7 @@ CONFIG_SHA256 = {
     ),
     "dags/utils/medallion_config.py": (
         "94384b372e4776bd1178c25397ce82b6ddb5ac5d4d7b4836dc287c886fca5e15",
-        "07b782cfd39d1edca87f66df79040f9e8924377f6eacf91bef3d02dff9493e91",
+        "b3cde46db5fa568152b1a8e3c8a7775dc8b327b51ae7a323efeb21878692eb1e",
     ),
 }
 
@@ -132,6 +134,20 @@ def test_allowed_config_blob_is_the_reviewed_production_version(path):
     if got.returncode:
         pytest.skip("old blob absent in shallow clone; current source is separately pinned")
     assert hashlib.sha256(got.stdout).hexdigest() == CONFIG_SHA256[path][0]
+
+
+def test_clubelo_medallion_helpers_match_the_allowed_version():
+    entries = ("get_competition_floor_basis", "get_competition_season_format",
+               "is_single_year_competition", "get_competition_format")
+    pinned = "05e9006388c878985863182970890e8410c35ad0e220f29a776f60ba6b360bf9"
+    path = "dags/utils/medallion_config.py"
+    names, digest = closure((ROOT / path).read_text(), entries)
+    assert "get_season_team_count" not in names
+    assert digest == pinned
+    old = subprocess.run(["git", "-C", str(ROOT), "cat-file", "blob", ALLOWED_BLOBS[path]],
+                         capture_output=True, text=True)
+    if old.returncode == 0:
+        assert closure(old.stdout, entries)[1] == pinned
 
 
 def imported_module(node: ast.ImportFrom, path: Path) -> str:

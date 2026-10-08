@@ -4,7 +4,7 @@
   "meter": "proxy_filter_provider_path_v2",
   "schema_version": 4,
   "source": "sofascore",
-  "updated_at": "2026-09-03",
+  "updated_at": "2026-10-08",
   "workload_classes": {
     "match_batch_25_5943cd5a087c8ded": {
       "hard_task_bytes": 1233561,
@@ -49,6 +49,49 @@
         "shape_version": 2
       },
       "shape_digest": "cd522de61ebecd108945ca8f2b9408db9204e32b125359a536dd714bfd69e210"
+    },
+    "season_0c85282697b86c88": {
+      "hard_task_bytes": 473059,
+      "max_units": 1,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "split_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "1_7"
+      },
+      "shape_digest": "0c85282697b86c88b9993242a59f08f50d55b48ab2ab439193c3f9f388c57fb1"
     },
     "season_1da176ffa2222bcc": {
       "hard_task_bytes": 170228,
@@ -179,6 +222,49 @@
       },
       "shape_digest": "69608cf7368823a969ee653dbed73b6be441a474553e73a4cff33d0cd0e41cb6"
     },
+    "season_6b1c7c498f871177": {
+      "hard_task_bytes": 473059,
+      "max_units": 1,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "calendar_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "65_plus"
+      },
+      "shape_digest": "6b1c7c498f8711770f91591815480f32b767b4a6fe23e689b5bb3ee38306ae20"
+    },
     "season_73022f4806a39fb1": {
       "hard_task_bytes": 117354,
       "max_units": 1,
@@ -221,6 +307,92 @@
         "team_count_band": "33_48"
       },
       "shape_digest": "73022f4806a39fb149cbfd7a25820e5204023c72ad0715a5d5ef95af45288b21"
+    },
+    "season_888cdba44a48fa46": {
+      "hard_task_bytes": 473059,
+      "max_units": 1,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "calendar_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "1_7"
+      },
+      "shape_digest": "888cdba44a48fa467f933116699477e7743471bf072d10788e13bf440b2f5c9b"
+    },
+    "season_980203d5b93c70c9": {
+      "hard_task_bytes": 473059,
+      "max_units": 1,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "split_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "49_64"
+      },
+      "shape_digest": "980203d5b93c70c9b504344507b613827c3470607be4c3d21f5a4746481e0519"
     },
     "season_ae9bf9aa625c6ead": {
       "hard_task_bytes": 428985,
@@ -393,6 +565,92 @@
         "team_count_band": "16_20"
       },
       "shape_digest": "c5a3a2e2e467619dca702acad1466618f7740c41a344b47d6de60001df9d0ca8"
+    },
+    "season_e1cfb84918489ebf": {
+      "hard_task_bytes": 473059,
+      "max_units": 1,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "calendar_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "49_64"
+      },
+      "shape_digest": "e1cfb84918489ebf99dda46a518a24b23b8ea26990f00466f78e542417e4ee47"
+    },
+    "season_fc2a0c9f7a14af77": {
+      "hard_task_bytes": 473059,
+      "max_units": 1,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "split_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "65_plus"
+      },
+      "shape_digest": "fc2a0c9f7a14af77bcb128a99f170a76c74aa6f1b40d4d5b41c048d280d433b3"
     }
   }
 }

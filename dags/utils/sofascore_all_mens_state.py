@@ -437,6 +437,8 @@ def plan_historical_batch(
     moment: datetime | None = None,
     release: str | None = None,
     denominator: Denominator | None = None,
+    history_inventory: Mapping[str, Any] | None = None,
+    controller_path: str | Path | None = None,
 ) -> list[dict[str, str]]:
     """Select a bounded batch: every tournament's newest season, then deeper.
 
@@ -471,6 +473,19 @@ def plan_historical_batch(
     ``task_env`` is the lane's own environment (gateway URL, rate limit) and
     is forwarded verbatim to every planned task; campaign keys win over it.
     """
+
+    if history_inventory is not None:
+        if controller_path is None:
+            raise CampaignPlanningError("history controller_path is required")
+        from scrapers.sofascore.history_controller import plan
+        return plan(
+            snapshot, inventory=history_inventory, checkpoint_path=controller_path,
+            completed=completed, batch_size=batch_size, snapshot_path=snapshot_path,
+            policy_path=policy_path, result_dir=result_dir, workload_artifact=workload_artifact,
+            dag_run_id=dag_run_id, authorized_season_classes=authorized_season_classes,
+            task_env=task_env, failures=failures, max_scope_attempts=max_scope_attempts,
+            moment=moment, release=release, denominator=denominator,
+        )
 
     moment = moment or datetime.now(timezone.utc)
     release = current_release() if release is None else str(release)

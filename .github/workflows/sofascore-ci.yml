@@ -135,6 +135,7 @@ jobs:
             tests/unit/scrapers/test_run_sofascore_discovery.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
             tests/unit/scrapers/test_sofascore_all_mens_campaign.py \
+            tests/unit/scrapers/test_sofascore_history_controller.py \
             tests/unit/scrapers/test_sofascore_schedule_refresh.py \
             tests/unit/scrapers/test_sofascore_rate_control.py \
             tests/unit/scrapers/test_sofascore_writer_lock.py \

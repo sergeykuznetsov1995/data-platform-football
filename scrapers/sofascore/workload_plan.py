@@ -98,15 +98,17 @@ SEASON_DYNAMIC_ENDPOINTS = ("squads", "referee_profile")
 WORKLOAD_FRESHNESS_SCOPES = ("season", "match", "player")
 # Team count drives schedule/standings/squads bytes, so it is part of the season
 # shape - but only as a coarse band, otherwise every league size would need its
-# own paid measurement.  The grid is code, not config: changing it rotates the
-# runtime fingerprint and forces a re-measurement.
+# own workload class.  Existing bands keep their shape/class IDs; added bands
+# have fixed caps in the static workload policy.
 TEAM_COUNT_BAND_SCHEME = "team_count_band_v1"
 TEAM_COUNT_BAND_GRID = (
+    (1, 7, "1_7"),
     (8, 15, "8_15"),
     (16, 20, "16_20"),
     (21, 32, "21_32"),
     (33, 48, "33_48"),
     (49, 64, "49_64"),
+    (65, None, "65_plus"),
 )
 TEAM_COUNT_BANDS = tuple(band for _, _, band in TEAM_COUNT_BAND_GRID)
 SEASON_FORMATS = ("split_year", "calendar_year", "named")
@@ -333,10 +335,14 @@ def workload_shape_digest(shape: Mapping[str, object]) -> str:
 def team_count_band(team_count: int) -> str:
     """Map a season team count onto its coarse, capture-safe band."""
 
-    if isinstance(team_count, bool) or not isinstance(team_count, int):
-        raise WorkloadPlanError("team_count must be an integer")
+    if (
+        isinstance(team_count, bool)
+        or not isinstance(team_count, int)
+        or team_count <= 0
+    ):
+        raise WorkloadPlanError("team_count must be a positive integer")
     for low, high, band in TEAM_COUNT_BAND_GRID:
-        if low <= team_count <= high:
+        if low <= team_count and (high is None or team_count <= high):
             return band
     raise WorkloadPlanError(
         f"team_count={team_count} is outside the measured {TEAM_COUNT_BAND_SCHEME} grid"

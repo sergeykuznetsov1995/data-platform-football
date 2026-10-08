@@ -51,9 +51,11 @@ from scrapers.sofascore.workload_plan import (
 )
 from scrapers.sofascore.workload_runtime import (
     PartitionWorkload,
+    allocations_for_partition,
     build_partitioned_plan,
     load_plan,
     plan_path_for_run,
+    target_ids,
     write_plan,
     write_target_order,
 )
@@ -98,6 +100,20 @@ def _load_pinned_workload_policy(artifact_path: os.PathLike[str] | str):
 class CompetitionSeason:
     league: str
     season: str
+
+
+def normalize_explicit_match_ids(values: Sequence[str]) -> tuple[str, ...]:
+    """Validate a controller's exact immutable match universe."""
+    if isinstance(values, (str, bytes)) or not values:
+        raise ValueError("explicit_match_ids must be a non-empty sequence")
+    if any(
+        not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None
+        for value in values
+    ):
+        raise ValueError("explicit_match_ids must contain positive canonical string IDs")
+    if len(set(values)) != len(values):
+        raise ValueError("explicit_match_ids cannot contain duplicate IDs")
+    return tuple(sorted(values, key=int))
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -437,6 +453,7 @@ def prepare_workload_plan(
     players_force: bool = False,
     season_freshness_key: Optional[str] = None,
     season_evidence: str = "pages",
+    explicit_match_ids: Optional[Sequence[str]] = None,
 ) -> Path:
     """Snapshot local work, sign it, and atomically persist one phase plan.
 
@@ -444,6 +461,8 @@ def prepare_workload_plan(
     from the finished games in ``bronze.sofascore_schedule`` — the refresh
     lane's daily event feed — without season pages or a season-shape class:
     a pending season has no team pages and no measured team-count band.
+    ``explicit_match_ids`` replaces schedule discovery for one history scope
+    and signs the complete immutable list, including local replay-only targets.
     """
 
     if phase not in VALID_PHASES:
@@ -452,6 +471,16 @@ def prepare_workload_plan(
         raise ValueError(f"season_evidence must be one of {sorted(SEASON_EVIDENCE)}")
     if season_evidence == "bronze" and phase != "targets":
         raise ValueError("season_evidence=bronze is only valid for the targets phase")
+    explicit_ids = None
+    if explicit_match_ids is not None:
+        explicit_ids = normalize_explicit_match_ids(explicit_match_ids)
+        if phase != "targets" or season_evidence != "bronze":
+            raise ValueError("explicit_match_ids requires targets with bronze evidence")
+        if len(competition_seasons) != 1 or force_replace:
+            raise ValueError("explicit_match_ids requires one scope without force_replace")
+        scope_cap = _scope_max_matches()
+        if scope_cap is not None and len(explicit_ids) > scope_cap:
+            raise ValueError("explicit_match_ids exceeds SOFASCORE_SCOPE_MAX_MATCHES")
     if not str(base_run_id).strip() or "::" in str(base_run_id):
         raise ValueError("base_run_id must be non-empty and cannot contain '::'")
     phase_run_id = f"{base_run_id}::{phase}"
@@ -489,6 +518,18 @@ def prepare_workload_plan(
             raise RuntimeError(
                 "existing immutable workload plan has different provenance"
             )
+        if explicit_ids is not None:
+            item = competition_seasons[0]
+            allocations = allocations_for_partition(
+                existing, league=item.league,
+                canonical_season=_season_label(item.league, item.season), scope="match",
+            )
+            signed_ids = tuple(sorted(
+                (target for allocation in allocations for target in target_ids(allocation)),
+                key=int,
+            ))
+            if signed_ids != explicit_ids or existing.freshness_key("match") != "final":
+                raise RuntimeError("existing immutable workload plan has different explicit match IDs")
         return destination
     target_order: list[str] = []
     runtime = build_capture_runtime(
@@ -662,7 +703,9 @@ def prepare_workload_plan(
         # by deadline, so it reads the deadlines along with the ids.
         scope_cap = _scope_max_matches() if phase == "targets" else None
         deadlines: dict[str, Optional[int]] = {}
-        if scope_cap is not None:
+        if explicit_ids is not None:
+            matches = set(explicit_ids)
+        elif scope_cap is not None:
             deadlines = _finished_match_deadlines(
                 item.league, canonical, source_season.season_id
             )
@@ -682,9 +725,14 @@ def prepare_workload_plan(
                 for endpoint in EVENT_PATHS
             )
 
-        pending_matches = _pending_targets(runtime, matches, event_specs)
+        # Sign the full explicit universe, including terminal and replay-only
+        # targets absent from schedule. Runtime resumes endpoints normally.
+        pending_matches = (
+            explicit_ids if explicit_ids is not None
+            else _pending_targets(runtime, matches, event_specs)
+        )
         if phase == "targets":
-            if scope_cap is not None:
+            if scope_cap is not None and explicit_ids is None:
                 pending_matches = _cap_pending_matches(
                     _deadline_order(
                         pending_matches,

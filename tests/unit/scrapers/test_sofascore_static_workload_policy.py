@@ -20,6 +20,7 @@ from scrapers.sofascore import workload_plan as module
 from scrapers.sofascore.workload_plan import (
     MATCH_BATCH_SIZE,
     PLAYER_BATCH_SIZE,
+    TEAM_COUNT_BANDS,
     WORKLOAD_POLICY_SCHEMA_VERSION,
     WORKLOAD_STATIC_BUDGET_DERIVATION,
     WorkloadPolicyUnavailable,
@@ -28,6 +29,7 @@ from scrapers.sofascore.workload_plan import (
     player_workload_class,
     production_season_shape,
     season_workload_class,
+    team_count_band,
     workload_shape_digest,
 )
 
@@ -106,20 +108,63 @@ def test_every_declared_season_shape_is_reachable_from_the_production_builder():
 
     reachable = set()
     for season_format in ("calendar_year", "split_year"):
-        for band in ("8_15", "16_20", "21_32", "33_48"):
+        for band in TEAM_COUNT_BANDS:
             shape = production_season_shape(
                 season_format=season_format,
                 team_count_band=band,
                 max_pages_per_direction=50,
             )
             name = season_workload_class(shape)
-            if name in season_classes:
-                reachable.add(name)
-                assert policy.classes[name].shape_digest == workload_shape_digest(
-                    shape
-                )
+            assert name in season_classes
+            reachable.add(name)
+            assert policy.classes[name].shape_digest == workload_shape_digest(shape)
 
     assert reachable == season_classes
+
+
+@pytest.mark.unit
+def test_existing_class_ids_and_caps_are_preserved():
+    policy = load_static_workload_policy(SHIPPED_POLICY)
+    existing_caps = {
+        "match_batch_25_5943cd5a087c8ded": 1233561,
+        "player_batch_50_cd522de61ebecd10": 223963,
+        "season_1da176ffa2222bcc": 170228,
+        "season_5cf25f88ed2115bb": 473059,
+        "season_69608cf7368823a9": 328905,
+        "season_73022f4806a39fb1": 117354,
+        "season_ae9bf9aa625c6ead": 428985,
+        "season_bd9da17d9b61ec24": 199717,
+        "season_c27b42098336e271": 457548,
+        "season_c5a3a2e2e467619d": 348455,
+    }
+
+    for name, cap in existing_caps.items():
+        assert policy.classes[name].hard_task_bytes == cap
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("season_format", ["calendar_year", "split_year"])
+@pytest.mark.parametrize("team_count", [1, 7, 49, 64, 65, 100, 10**100])
+def test_added_season_bands_authorize_one_unit_at_the_fixed_cap(
+    season_format, team_count
+):
+    policy = load_static_workload_policy(SHIPPED_POLICY)
+    shape = production_season_shape(
+        season_format=season_format,
+        team_count_band=team_count_band(team_count),
+        max_pages_per_direction=50,
+    )
+    name = season_workload_class(shape)
+    budget = policy.class_for(
+        name, scope="season", units=1, shape_digest=workload_shape_digest(shape)
+    )
+
+    assert budget.hard_task_bytes == 473059
+    assert budget.max_units == 1
+    with pytest.raises(module.WorkloadPlanError, match="at most 1 units"):
+        policy.class_for(
+            name, scope="season", units=2, shape_digest=workload_shape_digest(shape)
+        )
 
 
 @pytest.mark.unit

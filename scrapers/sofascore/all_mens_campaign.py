@@ -390,15 +390,15 @@ def render_scope_overlays(
     if team_count is None:
         # A pending season has no team pages yet, but competitions.yaml
         # demands a positive team_count (a DQ-floor invariant the campaign
-        # overlay never consumes).  The placeholder sits below the measured
-        # band grid, so page-evidence planning of such a season fails closed
-        # in team_count_band() instead of authorizing an unmeasured class.
+        # overlay never consumes).  The explicit pending flag prevents this schema-only
+        # placeholder from authorizing a season budget, including the 1_7 band.
         team_count = PENDING_SEASON_TEAM_COUNT
     season_config: dict[str, Any] = {
         "id": int(canonical),
         "season_format": season_format,
         "format": "group_knockout" if is_cup else "league_round_robin",
         "team_count": team_count,
+        **({"team_count_pending": True} if scope.get("team_count") is None else {}),
     }
     if is_cup:
         # A deliberately high provisional floor cannot silently pass campaign
