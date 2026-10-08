@@ -245,6 +245,14 @@ def test_stopped_canonical_recovery_planes_are_allowed_before_removal(
 def test_wrong_inventory_evidence_leaves_state_byte_identical(tmp_path, monkeypatch):
     mod, original = _prepare(tmp_path)
     monkeypatch.setattr(mod, "_container_running", lambda _name: False)
+    docker_calls = []
+
+    def docker(*args, check=True):
+        docker_calls.append(args)
+        assert args[0] == "ps", "inventory rejection must precede Docker mutation"
+        return ""
+
+    monkeypatch.setattr(mod, "_docker", docker)
     arguments = _arguments(tmp_path)
     inventory_path = tmp_path / "inventory.json"
     inventory = json.loads(inventory_path.read_text())
@@ -255,6 +263,9 @@ def test_wrong_inventory_evidence_leaves_state_byte_identical(tmp_path, monkeypa
         mod.main(arguments)
 
     assert (tmp_path / "topology.mode").read_bytes() == original
+    assert {args[args.index("--filter") + 1] for args in docker_calls} == {
+        "label=com.docker.compose.oneoff=True", "volume=recovery-volume"
+    }
 
 
 def test_transition_rejects_reusing_failed_volume(tmp_path, monkeypatch):
