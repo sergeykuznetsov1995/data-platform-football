@@ -73,10 +73,12 @@ def report_metrics(runtime: Path, now: datetime, day: str, *, result_dir="result
         phase_path = path.with_suffix("") / "matches.json"
         matches = json.loads(phase_path.read_text()) if phase_path.exists() else {}
         traffic = matches.get("traffic", {})
-        requests = traffic.get("request_count")
-        if requests is None:
-            counts = [phase.get("request_count") for phase in payload.get("phases", [])]
-            requests = sum(counts) if counts and all(isinstance(n, int) and n >= 0 for n in counts) else None
+        phases = payload.get("phases", [])
+        if phases:
+            counts = [phase.get("request_count") for phase in phases]
+            requests = sum(counts) if all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts) else None
+        else:
+            requests = traffic.get("request_count")
         closed = matches.get("matches_complete") if payload.get("status") == "success" else 0
         for value in (closed, requests):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
@@ -86,15 +88,16 @@ def report_metrics(runtime: Path, now: datetime, day: str, *, result_dir="result
         if previous is None or observed > previous[0]:
             records[identity] = (observed, closed, requests)
     result = {}
-    usable = [row for row in records.values() if row[1] is not None]
-    if usable:
-        result["daily_closed"] = sum(closed for at, closed, _ in usable if d0 <= at < d1)
-        times = [at for at, closed, _ in usable if closed > 0]
-        result["last_progress"] = max(times).isoformat() if times else None
-    paid = [row for row in records.values() if row[2] is not None]
-    if paid:
-        times = [at for at, _, requests in paid if requests > 0]
-        result["last_paid"] = max(times).isoformat() if times else None
+    rows = list(records.values())
+    if rows and all(closed is not None for at, closed, _ in rows if d0 <= at < d1):
+        result["daily_closed"] = sum(closed for at, closed, _ in rows if d0 <= at < d1)
+    for index, field in ((1, "last_progress"), (2, "last_paid")):
+        known = [at for row in rows if row[index] is not None for at in [row[0]]]
+        times = [row[0] for row in rows if row[index] is not None and row[index] > 0]
+        last = max(times) if times else None
+        unknown_after = any(row[index] is None and (last is None or row[0] >= last) for row in rows)
+        if known and not unknown_after:
+            result[field] = last.isoformat() if last else None
     return result
 
 

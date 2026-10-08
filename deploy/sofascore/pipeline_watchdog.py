@@ -99,6 +99,14 @@ def evaluate(snapshot: dict, pauses: list[dict], now: datetime, state: dict) -> 
         if verdict == "unobservable":
             missing.append(key)
 
+    def quiet_verdict(key, activity=None):
+        token = state.get("episodes", {}).get(key)
+        if token:
+            started = timestamp(state["incidents"][token]["started_at"])
+            if activity is None or activity <= started:
+                return "deferred"  # grace is not proof of recovery
+        return "ok"
+
     day = snapshot["day"]
     d0 = timestamp(day + "T00:00:00Z")
     d1 = d0 + timedelta(days=1)
@@ -210,7 +218,8 @@ def evaluate(snapshot: dict, pauses: list[dict], now: datetime, state: dict) -> 
         if closed is True:
             since = max(timestamp(timers.setdefault(lane, stamp(now))), demand)
             elapsed = (now - since).total_seconds()
-            rule(f"{lane}:stop", "active" if elapsed >= STOP_SECONDS else "ok", f"unexplained closed lane for {elapsed:.0f}s; threshold >=900s")
+            key = f"{lane}:stop"
+            rule(key, "active" if elapsed >= STOP_SECONDS else quiet_verdict(key), f"unexplained closed lane for {elapsed:.0f}s; threshold >=900s")
         elif closed is False:
             timers.pop(lane, None)
             rule(f"{lane}:stop", "ok", "lane open")
@@ -227,7 +236,9 @@ def evaluate(snapshot: dict, pauses: list[dict], now: datetime, state: dict) -> 
             if baseline > now:
                 raise ValueError(f"{field} is in the future")
             elapsed = (now - baseline).total_seconds()
-            rule(f"{lane}:{name}", "active" if elapsed >= STALL_SECONDS else "ok", f"{elapsed:.0f}s with pending work; threshold >=21600s")
+            key = f"{lane}:{name}"
+            activity = timestamp(sample[field]) if sample[field] else None
+            rule(key, "active" if elapsed >= STALL_SECONDS else quiet_verdict(key, activity), f"{elapsed:.0f}s with pending work; threshold >=21600s")
         if sample.get("daily_closed") is not None:
             lines.append(f"{lane}: closed matches in reports for {day} UTC: {number(sample['daily_closed'], integer=True)}")
     return {"observed_at": stamp(observed), "day": day, "rules": rules, "lines": lines, "unobservable": missing}
@@ -285,7 +296,18 @@ def publish(state, publisher, checkpoint):
     for token, incident in state.get("incidents", {}).items():
         try:
             if incident["issue"] is None:
-                incident["issue"] = publisher.find(incident["marker"]) or publisher.create(incident)
+                found = publisher.find(incident["marker"])
+                if found:
+                    incident["issue"] = found
+                elif incident.get("create_attempted"):
+                    # GitHub has no issue-create idempotency key. A timed-out
+                    # POST can still be pending when a GET sees no marker.
+                    # Lookup-only until reconciliation; never submit it twice.
+                    raise RuntimeError("issue creation unconfirmed; lookup-only, explicit reconciliation required")
+                else:
+                    incident["create_attempted"] = True
+                    checkpoint()
+                    incident["issue"] = publisher.create(incident)
                 checkpoint()
             if not incident["project_added"]:
                 publisher.add_project(incident["issue"])

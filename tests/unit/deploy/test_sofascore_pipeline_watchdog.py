@@ -384,3 +384,88 @@ def test_delivery_end_gets_a_new_silence_grace_period():
     sample["observed_at"] = now.isoformat()
     sample["lanes"]["history"].pop("delivery_since")
     assert watch.step(sample, [], now, state)["rules"]["history:no_progress"]["verdict"] == "ok"
+
+
+@pytest.mark.parametrize("excuse", ["pause", "delivery"])
+def test_grace_does_not_resolve_an_existing_incident_without_recovery(excuse):
+    state, sample = {}, snapshot()
+    sample["lanes"]["history"] = demand(last_progress=None, last_paid=None, closed=True)
+    watch.step(sample, [], NOW, state)
+    now = NOW + timedelta(minutes=15)
+    sample["observed_at"] = now.isoformat()
+    watch.step(sample, [], now, state)
+    original = dict(state["episodes"])
+    assert len(original) == 3
+    now = NOW + timedelta(minutes=30)
+    sample["observed_at"] = now.isoformat()
+    policy = [pause(start=(NOW + timedelta(minutes=20)).isoformat(), end=(NOW + timedelta(hours=1)).isoformat())] if excuse == "pause" else []
+    if excuse == "delivery":
+        sample["lanes"]["history"]["delivery_since"] = now.isoformat()
+    watch.step(sample, policy, now, state)
+    now = NOW + timedelta(hours=1, minutes=15)
+    sample["observed_at"] = now.isoformat()
+    sample["lanes"]["history"].pop("delivery_since", None)
+    watch.step(sample, policy, now, state)
+    assert state["episodes"] == original
+    now += timedelta(hours=6)
+    sample["observed_at"] = now.isoformat()
+    watch.step(sample, policy, now, state)
+    assert state["episodes"] == original
+    assert len(state["incidents"]) == 3
+
+
+def test_paid_requests_include_season_phase_without_double_counting_matches(tmp_path):
+    import os
+    directory = tmp_path / "results"
+    directory.mkdir()
+    path = directory / "scope.json"
+    path.write_text(json.dumps({"run_id": "run", "scope_digest": "scope", "status": "success",
+                               "phases": [{"phase": "season", "request_count": 10}, {"phase": "matches", "request_count": 0}]}))
+    child = directory / "scope"
+    child.mkdir()
+    (child / "matches.json").write_text(json.dumps({"matches_complete": 1, "traffic": {"request_count": 0}}))
+    os.utime(path, ((NOW - timedelta(minutes=1)).timestamp(),) * 2)
+    row = metrics.report_metrics(tmp_path, NOW, "2026-10-07")
+    assert row["last_paid"] is not None
+
+
+def test_new_unknown_report_does_not_establish_silence(tmp_path):
+    import os
+    directory = tmp_path / "results"
+    directory.mkdir()
+    for name, ago in (("known", 8), ("unknown", 1)):
+        path = directory / (name + ".json")
+        path.write_text(json.dumps({"run_id": name, "scope_digest": "scope", "status": "success"}))
+        os.utime(path, ((NOW - timedelta(hours=ago)).timestamp(),) * 2)
+        if name == "known":
+            child = directory / name
+            child.mkdir()
+            (child / "matches.json").write_text(json.dumps({"matches_complete": 1, "traffic": {"request_count": 1}}))
+    row = metrics.report_metrics(tmp_path, NOW, "2026-10-08")
+    assert "daily_closed" not in row
+    assert "last_progress" not in row
+    assert "last_paid" not in row
+    sample = snapshot()
+    sample["lanes"]["history"] = demand()
+    sample["lanes"]["history"].pop("last_progress")
+    sample["lanes"]["history"].pop("last_paid")
+    sample["lanes"]["history"].update(row)
+    rules = watch.step(sample, [], NOW, {})["rules"]
+    assert rules["history:no_progress"]["verdict"] == "unobservable"
+    assert rules["history:no_paid"]["verdict"] == "unobservable"
+
+
+def test_pending_server_post_is_not_repeated_while_marker_is_absent():
+    class DelayedPublisher(Publisher):
+        def create(self, incident):
+            self.pending_marker = incident["marker"]
+            self.calls = getattr(self, "calls", 0) + 1
+            raise RuntimeError("server POST still pending")
+    publisher, state = DelayedPublisher(), incident_state()
+    assert watch.publish(state, publisher, lambda: None)
+    state = json.loads(json.dumps(state))
+    assert watch.publish(state, publisher, lambda: None)
+    assert publisher.calls == 1
+    publisher.created.append((publisher.pending_marker, {"number": 1, "node_id": "node-1"}))
+    assert not watch.publish(state, publisher, lambda: None)
+    assert publisher.calls == 1
