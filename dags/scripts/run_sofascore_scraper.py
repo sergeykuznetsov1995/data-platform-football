@@ -1015,6 +1015,62 @@ def _signed_history_match_ids(
     return explicit_ids
 
 
+def _control_matches(runtime, specs, allocations, schedule_ids, *, chronology_known):
+    """Select at most three late targets already covered by signed allocations."""
+    from scrapers.sofascore.workload_runtime import target_ids
+    from scrapers.sofascore.raw_store import RawPayloadNotFound
+
+    signed = tuple(dict.fromkeys(target for allocation in allocations
+                                 for target in target_ids(allocation)))
+    if not signed:
+        return (), "unknownchronology:target_order"
+    event_specs = {spec.key.target_id: spec for spec in specs
+                   if spec.key.endpoint == "event"}
+    timestamps = {}
+    for target in signed:
+        spec = event_specs.get(target)
+        if spec is None:
+            break
+        try:
+            body, raw = runtime.raw_store.load_bytes(spec.raw_target)
+        except RawPayloadNotFound:
+            break
+        if not 200 <= raw.http_status < 300:
+            break
+        try:
+            timestamp = json.loads(body)["event"]["startTimestamp"]
+        except (ValueError, TypeError, KeyError):
+            break
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            break
+        timestamps[target] = timestamp
+    if len(timestamps) == len(signed):
+        return tuple(sorted(signed, key=lambda target: (timestamps[target], target))[-3:]), "saved_event:startTimestamp"
+    if chronology_known:
+        # The existing schedule query returns max(start_timestamp) DESC.
+        signed_set = set(signed)
+        ordered = tuple(dict.fromkeys(str(target) for target in schedule_ids
+                                      if str(target) in signed_set))
+        if len(ordered) == len(signed):
+            return ordered[:3], "bronze_schedule:start_timestamp"
+    return signed[-3:], "unknownchronology:target_order"
+
+
+def _availability_report(runtime, specs, source_tournament_id, source_season_id,
+                         control_match_ids):
+    from scrapers.sofascore.pipeline import scope_endpoint_availability
+
+    list_scope = getattr(runtime.manifest_store, "list_for_scope", None)
+    records = (list_scope(source_tournament_id, source_season_id)
+               if callable(list_scope) else
+               [record for spec in specs
+                if (record := runtime.manifest_store.get(spec.key)) is not None])
+    return scope_endpoint_availability(
+        records, source_tournament_id=source_tournament_id,
+        source_season_id=source_season_id, control_match_ids=control_match_ids,
+    )
+
+
 def _run_match_capture(
     leagues: List[str],
     season: int,
@@ -1282,6 +1338,18 @@ def _run_match_capture(
             }
             _write_results(output_path, results)
             return 0
+        control_ids, control_basis = _control_matches(
+            capture_runtime, specs, workload_allocations, match_ids,
+            chronology_known=explicit_ids is None,
+        )
+        results["endpoint_availability"] = {
+            "control_match_ids": list(control_ids),
+            "control_basis": control_basis,
+            "before": _availability_report(
+                capture_runtime, specs, source_tournament_id, source_season_id,
+                control_ids,
+            ),
+        }
     except Exception as exc:
         results["errors"].append(f"capture_engine: {exc}")
         results["traffic"] = {
@@ -1318,9 +1386,7 @@ def _run_match_capture(
             else:
                 from scrapers.sofascore.live_capture import capture_live_specs
                 from scrapers.sofascore.pipeline import (
-                    apply_endpoint_exclusions,
                     replay_event_specs,
-                    scope_probe_exclusions,
                 )
                 from scrapers.sofascore.workload_runtime import target_ids
 
@@ -1340,11 +1406,6 @@ def _run_match_capture(
                 else:
                     remaining_specs = {spec.key: spec for spec in live_specs}
                     traffic_parts = []
-                    # A2: the first allocation probes the scope with the full
-                    # endpoint set; endpoints the source published for none
-                    # of its matches are not requested for the later ones.
-                    # A repair (--force-replace) re-captures 404s (#1039).
-                    excluded = None
                     for allocation in workload_allocations:
                         batch_ids = set(target_ids(allocation))
                         batch_specs = [
@@ -1368,12 +1429,6 @@ def _run_match_capture(
                             for spec in batch_specs:
                                 remaining_specs.pop(spec.key, None)
                             continue
-                        if excluded:
-                            batch_specs = apply_endpoint_exclusions(
-                                batch_specs,
-                                excluded,
-                                raw_store=capture_runtime.raw_store,
-                            )
                         if batch_specs:
                             captured, batch_traffic = capture_live_specs(
                                 capture_runtime,
@@ -1397,35 +1452,6 @@ def _run_match_capture(
                             )
                             for spec in batch_specs:
                                 remaining_specs.pop(spec.key, None)
-                        if excluded is None and not force_replace:
-                            # The verdict is read from the manifest for every
-                            # endpoint of the probe allocation's matches, not
-                            # from the live specs: on an Airflow retry the
-                            # probe's terminal 404s are no longer live, and
-                            # the evidence must still count.
-                            probe_specs = [
-                                build_event_spec(
-                                    source_tournament_id=source_tournament_id,
-                                    source_season_id=source_season_id,
-                                    target_id=match_id,
-                                    endpoint=endpoint,
-                                    freshness_key=freshness_key,
-                                    paid_proxy=True,
-                                )
-                                for match_id in target_ids(allocation)
-                                for endpoint in EVENT_PATHS
-                            ]
-                            excluded = scope_probe_exclusions(
-                                capture_runtime.manifest_store, probe_specs
-                            )
-                            results["excluded_endpoints"] = sorted(excluded)
-                            if excluded:
-                                logger.info(
-                                    "scope probe: %s publishes no %s — not "
-                                    "requested for the remaining allocations",
-                                    f"{league}:{season_short}",
-                                    ", ".join(sorted(excluded)),
-                                )
                     if (
                         remaining_specs
                         and scope_limits["max_matches"] is not None
@@ -1879,6 +1905,10 @@ def _run_match_capture(
                 # The commit-verification below must read durable state, not
                 # the write-behind buffer.
                 _flush_manifest_store(capture_runtime.manifest_store)
+                results["endpoint_availability"]["after"] = _availability_report(
+                    capture_runtime, specs, source_tournament_id, source_season_id,
+                    control_ids,
+                )
                 observations = []
                 expectations = []
                 final_counts = {status.value: 0 for status in ManifestStatus}
@@ -2850,7 +2880,7 @@ def _load_runtime_workload_plan(
     return plan, allocations
 
 
-def main(argv=None):
+def main(argv=None, *, manifest_store=None):
     parser = _StrictArgumentParser(description="Run SofaScore scraper")
     parser.add_argument(
         "--entity",
@@ -3129,6 +3159,7 @@ def main(argv=None):
             raw_store_uri=args.raw_store_uri,
             manifest_backend=args.manifest_backend,
             workload_class=workload_class,
+            **({"manifest_store": manifest_store} if manifest_store is not None else {}),
         )
     except Exception as exc:
         logger.error("SofaScore capture runtime failed closed: %s", exc)

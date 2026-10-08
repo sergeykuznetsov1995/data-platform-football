@@ -439,6 +439,8 @@ def plan_historical_batch(
     denominator: Denominator | None = None,
     history_inventory: Mapping[str, Any] | None = None,
     controller_path: str | Path | None = None,
+    history_slots: int | None = None,
+    history_deadline: str | None = None,
 ) -> list[dict[str, str]]:
     """Select a bounded batch: every tournament's newest season, then deeper.
 
@@ -484,7 +486,7 @@ def plan_historical_batch(
             policy_path=policy_path, result_dir=result_dir, workload_artifact=workload_artifact,
             dag_run_id=dag_run_id, authorized_season_classes=authorized_season_classes,
             task_env=task_env, failures=failures, max_scope_attempts=max_scope_attempts,
-            moment=moment, release=release, denominator=denominator,
+            moment=moment, release=release, denominator=denominator, slot_count=history_slots, run_deadline=history_deadline,
         )
 
     moment = moment or datetime.now(timezone.utc)
@@ -1144,6 +1146,8 @@ def mark_failed(
     with _state_lock(destination):
         attempts = read_failures(destination, campaign_id=campaign_id)
         previous = attempts.get(str(scope_key)) or {}
+        if previous.get("last_run_id") == str(run_id):
+            return
         streak = 0
         if free:
             streak = 1

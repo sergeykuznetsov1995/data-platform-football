@@ -409,3 +409,240 @@ def test_july_query_rereads_cohort_without_stats_timestamp_filter():
     assert 'UNION' in sql
     assert "(8,826,'7','2627')" in sql
     assert 'JOIN terminal' in sql
+
+
+def slot_queue(tmp_path, ids=(8, 17, 22, 24, 30)):
+    snap = snapshot(ids=ids)
+    workers = run(tmp_path, snap, evidence(snap), slot_count=3, result_dir=str(tmp_path / 'results'))
+    return snap, workers, tmp_path / 'controller.json'
+
+
+def claim(path, slot):
+    return controller.claim_scope(path, campaign_id='history-test', run_id='run1', slot=slot, now=NOW)
+
+
+def test_slots_fill_next_scope_while_sibling_remains_busy(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    snap, workers, path = slot_queue(tmp_path)
+    assert len(workers) == 3
+    reservations = [claim(path, i) for i in range(3)]
+    assert [int(env['SOFASCORE_TOURNAMENT_ID']) for _, env in reservations] == [8, 17, 22]
+    done = []
+    def execute(env, timeout):
+        done.append(int(env['SOFASCORE_TOURNAMENT_ID']))
+        destination = __import__('pathlib').Path(env['SOFASCORE_SCOPE_RESULT_PATH'])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps({'status':'success', 'campaign_id':snap['campaign_id'],
+            'tournament_id':int(env['SOFASCORE_TOURNAMENT_ID']),
+            'source_season_id':int(env['SOFASCORE_SOURCE_SEASON_ID']),
+            'run_id':env['SOFASCORE_SCOPE_RUN_ID']}))
+        return 0
+    assert run_slot(checkpoint=path, campaign_id='history-test', run_id='run1', slot=1,
+                    state_path=tmp_path/'state.json', failures_path=tmp_path/'failures.json',
+                    admitted=lambda:True, execute=execute, clock=lambda:NOW, release='test') == 0
+    assert done == [17,24,30]
+    stored = controller.read_summary(path,'history-test')['run']
+    assert stored['slots']['0'] == 0 and stored['slots']['2'] == 2
+    assert stored['slots']['1'] is None
+    assert stored['plan_digest'] == controller.read_summary(path,'history-test')['run']['plan_digest']
+    assert claim(path,0) == reservations[0]  # restart retains the exact identity
+
+
+def test_slot_reservation_concurrency_does_not_duplicate_scopes(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    _, _, path = slot_queue(tmp_path)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        assigned = list(executor.map(lambda slot:claim(path,slot), range(3)))
+    assert sorted(index for index,_ in assigned) == [0,1,2]
+    assert len({env['SOFASCORE_SCOPE_RUN_ID'] for _,env in assigned}) == 3
+    assert controller.read_summary(path,'history-test')['run']['cursor'] == 3
+
+
+def test_slot_outcome_recovery_accounts_failure_only_once(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    _, _, path = slot_queue(tmp_path,ids=(8,))
+    index, env = claim(path,0)
+    failure={'status':'failed','reason':'schema_error','source_requests':0}
+    controller.record_scope(path,campaign_id='history-test',run_id='run1',slot=0,index=index,outcome=failure)
+    args = dict(state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',release='test')
+    controller.account_scope(env,failure,**args)  # crash after v1 accounting, before releasing slot
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    admitted=lambda:False,clock=lambda:NOW,
+                    execute=lambda *a:pytest.fail('must not restart an accounted capture'),**args) == 1
+    assert __import__('dags.utils.sofascore_all_mens_state',fromlist=['read_failures']).read_failures(
+        args['failures_path'],campaign_id='history-test')[env['SOFASCORE_SCOPE_KEY']]['count'] == 1
+    controller.finalize(path,campaign_id='history-test',run_id='run1')
+
+
+def test_slot_finalizer_refuses_unaccounted_work(tmp_path):
+    _, _, path = slot_queue(tmp_path)
+    claim(path,0)
+    with pytest.raises(CampaignPlanningError,match='not accounted'):
+        controller.finalize(path,campaign_id='history-test',run_id='run1')
+
+
+def test_slot_digest_rejects_corrupt_cursor(tmp_path):
+    _, _, path=slot_queue(tmp_path)
+    payload=json.loads(path.read_text())
+    payload['run']['cursor']=4
+    path.write_text(json.dumps(payload))
+    with pytest.raises(CampaignPlanningError,match='ledger digest'):
+        claim(path,0)
+
+
+def test_closed_door_leaves_unissued_scopes_out_of_failure_memory(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    _, _, path=slot_queue(tmp_path)
+    failures=tmp_path/'failures.json'
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=failures,
+                    admitted=lambda:False,clock=lambda:NOW) == 0
+    assert controller.read_summary(path,'history-test')['run']['cursor']==0
+    assert not failures.exists()
+    controller.finalize(path,campaign_id='history-test',run_id='run1')
+
+
+def test_deadline_stops_new_scope_without_losing_current_accounting(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    from datetime import timedelta
+    _,_,path=slot_queue(tmp_path)
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
+                    admitted=lambda:True,clock=lambda:NOW+timedelta(hours=6))==0
+    assert controller.read_summary(path,'history-test')['run']['cursor']==0
+
+
+def test_failed_scope_retries_same_identity_and_does_not_poison_next(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    from pathlib import Path
+    _,_,path=slot_queue(tmp_path,ids=(8,17))
+    attempts=[]
+    def execute(env,timeout):
+        attempts.append(env['SOFASCORE_SCOPE_RUN_ID'])
+        destination=Path(env['SOFASCORE_SCOPE_RESULT_PATH'])
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        failed=env['SOFASCORE_TOURNAMENT_ID']=='8'
+        destination.write_text(json.dumps({'status':'failed' if failed else 'success',
+            'campaign_id':'history-test','tournament_id':int(env['SOFASCORE_TOURNAMENT_ID']),
+            'source_season_id':int(env['SOFASCORE_SOURCE_SEASON_ID']),
+            'run_id':env['SOFASCORE_SCOPE_RUN_ID'],'phases':[{'errors':['schema_error'], 'source_request_count':0}]}))
+        return 1 if failed else 0
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
+                    admitted=lambda:True,execute=execute,clock=lambda:NOW,sleep=lambda _:None)==1
+    assert attempts[0]==attempts[1] and attempts[2]!=attempts[1]
+    value=controller.read_summary(path,'history-test')['run']
+    assert all(item['accounted'] for item in value['items'].values())
+    assert value['items']['0']['outcome']['status']=='failed'
+    assert value['items']['1']['outcome']['status']=='success'
+
+
+def test_worker_termination_accounts_current_scope_and_never_starts_another(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    _,_,path=slot_queue(tmp_path)
+    attempts=[]
+    def execute(env,timeout):
+        attempts.append(env['SOFASCORE_SCOPE_RUN_ID'])
+        raise KeyboardInterrupt('SIGTERM')
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
+                    admitted=lambda:True,execute=execute,clock=lambda:NOW,
+                    sleep=lambda _:pytest.fail('termination must not retry'))==1
+    assert len(attempts)==1
+    report=controller.read_summary(path,'history-test')['run']
+    assert report['cursor']==1 and report['items']['0']['accounted']
+
+
+def test_fast_tournament_continues_deeper_without_waiting_for_slow_tournament(tmp_path):
+    snap=snapshot(years=(2026,2025,2024,2023,2022),ids=(8,17,22))
+    ev=evidence(snap)
+    group_closed(ev,26,100)
+    group_closed(ev,25,100)
+    workers=run(tmp_path,snap,ev,slot_count=3)
+    path=tmp_path/'controller.json'
+    first=[claim(path,i) for i in range(3)]
+    index,env=first[1]
+    controller.record_scope(path,campaign_id='history-test',run_id='run1',slot=1,index=index,
+                            outcome={'status':'success'},accounted=True)
+    next_index,next_env=claim(path,1)
+    assert next_env['SOFASCORE_TOURNAMENT_ID']=='17'
+    assert next_env['SOFASCORE_SOURCE_SEASON_ID']!=env['SOFASCORE_SOURCE_SEASON_ID']
+    assert next_env['SOFASCORE_HISTORY_GROUP']=='3'
+    assert claim(path,0)==first[0] and claim(path,2)==first[2]
+    assert len(controller.read_summary(path,'history-test')['run']['plan'])==9
+
+
+def test_pool_closed_during_retry_delay_does_not_recapture(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    from pathlib import Path
+    _,_,path=slot_queue(tmp_path)
+    open_door=[True]
+    attempts=[]
+    def execute(env,timeout):
+        attempts.append(env['SOFASCORE_SCOPE_RUN_ID'])
+        dest=Path(env['SOFASCORE_SCOPE_RESULT_PATH']);dest.parent.mkdir(parents=True,exist_ok=True)
+        dest.write_text(json.dumps({'status':'failed','campaign_id':'history-test',
+            'tournament_id':int(env['SOFASCORE_TOURNAMENT_ID']),
+            'source_season_id':int(env['SOFASCORE_SOURCE_SEASON_ID']),
+            'run_id':env['SOFASCORE_SCOPE_RUN_ID']}))
+        return 1
+    def sleep(seconds):open_door[0]=False
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
+                    admitted=lambda:open_door[0],execute=execute,clock=lambda:NOW,sleep=sleep)==1
+    assert len(attempts)==1 and controller.read_summary(path,'history-test')['run']['cursor']==1
+
+
+def test_slot_deadline_uses_parent_dagrun_start_not_delayed_planner(tmp_path):
+    from datetime import timedelta
+    snap=snapshot()
+    run(tmp_path,snap,evidence(snap),slot_count=3,run_deadline=(NOW+timedelta(hours=1)).isoformat())
+    report=controller.read_summary(tmp_path/'controller.json','history-test')['run']
+    assert report['deadline']==(NOW+timedelta(hours=1)).isoformat()
+    assert controller.claim_scope(tmp_path/'controller.json',campaign_id='history-test',run_id='run1',
+                                 slot=0,now=NOW+timedelta(hours=2)) is None
+
+
+@pytest.mark.parametrize('attempts',[0,1,2])
+def test_restarted_slot_never_captures_when_door_closed(tmp_path,attempts):
+    from scrapers.sofascore.history_worker import run_slot
+    _,_,path=slot_queue(tmp_path,ids=(8,))
+    index,env=claim(path,0)
+    for _ in range(attempts):
+        controller.record_scope(path,campaign_id='history-test',run_id='run1',slot=0,index=index,started_attempt=True)
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
+                    admitted=lambda:False,execute=lambda *a:pytest.fail('closed admission must prohibit capture'),
+                    clock=lambda:NOW)==(0 if attempts==0 else 1)
+    item=controller.read_summary(path,'history-test')['run']['items']['0']
+    assert item['accounted']
+    assert item['outcome']['status']==('not_started' if attempts==0 else 'failed')
+    assert not (tmp_path/'failures.json').exists() if attempts==0 else True
+
+
+def test_restarted_slot_does_not_exceed_persisted_two_attempt_limit(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    _,_,path=slot_queue(tmp_path,ids=(8,))
+    index,env=claim(path,0)
+    for _ in range(2):
+        controller.record_scope(path,campaign_id='history-test',run_id='run1',slot=0,index=index,started_attempt=True)
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
+                    admitted=lambda:True,execute=lambda *a:pytest.fail('third execution forbidden'),clock=lambda:NOW)==1
+    assert controller.read_summary(path,'history-test')['run']['items']['0']['attempts']==2
+
+
+def test_restarted_slot_accounts_saved_success_after_last_attempt_without_source(tmp_path):
+    from scrapers.sofascore.history_worker import run_slot
+    from pathlib import Path
+    _,_,path=slot_queue(tmp_path,ids=(8,))
+    index,env=claim(path,0)
+    for _ in range(2):
+        controller.record_scope(path,campaign_id='history-test',run_id='run1',slot=0,index=index,started_attempt=True)
+    dest=Path(env['SOFASCORE_SCOPE_RESULT_PATH']);dest.parent.mkdir(parents=True,exist_ok=True)
+    dest.write_text(json.dumps({'status':'success','campaign_id':'history-test',
+        'tournament_id':int(env['SOFASCORE_TOURNAMENT_ID']),
+        'source_season_id':int(env['SOFASCORE_SOURCE_SEASON_ID']),'run_id':env['SOFASCORE_SCOPE_RUN_ID']}))
+    assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
+                    state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
+                    admitted=lambda:False,execute=lambda *a:pytest.fail('saved success must not recapture'),clock=lambda:NOW)==0

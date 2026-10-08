@@ -316,7 +316,15 @@ write_drain_proof() {
       validate="$validate0"
       [ "$validate" = "-" ] && validate="$validate_ph"
       kind=$(json_field "$xcom" SOFASCORE_CAMPAIGN_ACTION)
+      if [ -n "$(json_field "$xcom" SOFASCORE_HISTORY_SLOT)" ]; then
+        kind=slots
+      fi
       case "$kind" in
+        slots)
+          key="run:$HIST_RUN"
+          accounted=$(python3 "$RELEASE/deploy/sofascore/history_drain_proof.py" \
+            "$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR" "$HIST_RUN" 2>> "$LOG") || accounted=unknown
+          case "$accounted" in t|f|unknown) ;; *) accounted=unknown ;; esac ;;
         capture)
           key=$(json_field "$xcom" SOFASCORE_SCOPE_KEY)
           accounted=f

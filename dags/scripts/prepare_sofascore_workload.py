@@ -447,6 +447,7 @@ def prepare_workload_plan(
     output_path: Optional[os.PathLike[str] | str] = None,
     raw_store_uri: Optional[str] = None,
     manifest_backend: Optional[str] = None,
+    manifest_store=None,
     force_replace: bool = False,
     allow_inactive_season: bool = False,
     players_rotation_date: Optional[date] = None,
@@ -537,6 +538,7 @@ def prepare_workload_plan(
         task_id=f"prepare-{phase}",
         raw_store_uri=raw_store_uri,
         manifest_backend=manifest_backend,
+        **({"manifest_store": manifest_store} if manifest_store is not None else {}),
     )
     catalog = SofaScoreCatalog.load()
     from utils.medallion_config import (

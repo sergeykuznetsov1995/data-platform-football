@@ -119,7 +119,9 @@ def evaluate(snapshot: dict, pauses: list[dict], now: datetime, state: dict) -> 
             raise ValueError("red share missing")
         if set(per_dag) - set(LANES.values()):
             raise ValueError("unexpected DAG in red share")
-        for failed, total in per_dag.values():
+        for dag_id, (failed, total) in per_dag.items():
+            if dag_id == red_share.HISTORY_DAG_ID and (failed, total) == (-1, -1):
+                continue
             number(failed, integer=True)
             number(total, integer=True)
             if failed > total:
@@ -131,8 +133,8 @@ def evaluate(snapshot: dict, pauses: list[dict], now: datetime, state: dict) -> 
         key = f"{lane}:red_share"
         if not daily_ready:
             rule(key, "deferred" if deferred else "unobservable", "daily window not ready")
-        elif per_dag is None or dag not in per_dag or per_dag[dag][1] == 0:
-            rule(key, "unobservable", "no terminal scope TIs")
+        elif per_dag is None or dag not in per_dag or per_dag[dag][1] <= 0:
+            rule(key, "unobservable", "no terminal scope attempts")
         else:
             failed, total = per_dag[dag]
             share = red_share.RedShare.of(failed, total)

@@ -182,6 +182,12 @@ class InMemoryManifestStore:
         with self._lock:
             self._records[record.key] = record
 
+    def list_for_scope(self, source_tournament_id, source_season_id):
+        scope = str(source_tournament_id), str(source_season_id)
+        with self._lock:
+            return [r for r in self._records.values()
+                    if r.key.as_tuple()[:2] == scope]
+
     def list_for_run(self, run_id: str) -> list[EndpointManifest]:
         with self._lock:
             return [r for r in self._records.values() if r.run_id == run_id]
@@ -233,6 +239,15 @@ class BatchingManifestStore:
         return preload_manifest_scope(
             self.inner, source_tournament_id, source_season_id
         )
+
+    def list_for_scope(self, source_tournament_id, source_season_id):
+        scope = str(source_tournament_id), str(source_season_id)
+        with self._lock:
+            records = {record.key: record for record in
+                       self.inner.list_for_scope(*scope)}
+            records.update({key: record for key, record in self._pending.items()
+                            if key.as_tuple()[:2] == scope})
+            return list(records.values())
 
     def get(self, key: ManifestKey) -> Optional[EndpointManifest]:
         with self._lock:
@@ -347,6 +362,17 @@ class JsonFileManifestStore:
                     temporary.unlink()
                 except FileNotFoundError:
                     pass
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+    def list_for_scope(self, source_tournament_id, source_season_id):
+        scope = str(source_tournament_id), str(source_season_id)
+        handle = self._locked()
+        try:
+            return [r for r in map(EndpointManifest.from_dict,
+                                  self._read_unlocked().values())
+                    if r.key.as_tuple()[:2] == scope]
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
