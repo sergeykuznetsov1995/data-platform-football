@@ -1513,6 +1513,7 @@ class TransfermarktScraper(BaseScraper):
         # A league larger than one cycle's byte cap can only be finished across
         # several cycles, and only if the pages already paid for are reused.
         response_cache = kwargs.pop('response_cache', None)
+        resume_squad_cache = kwargs.pop('resume_squad_cache', False)
         cache_ttl_seconds = kwargs.pop('cache_ttl_seconds', None)
         canonical_season_override = kwargs.pop('canonical_season', None)
         retry_budget_raw = kwargs.pop(
@@ -1621,6 +1622,7 @@ class TransfermarktScraper(BaseScraper):
             lease_ttl_seconds=lease_ttl_seconds,
             rate_limiter=self._rate_limiter,
             cache=response_cache,
+            resume_squad_cache=resume_squad_cache,
             timeout_seconds=12,
             circuit_failures=5,
         )
@@ -1773,6 +1775,9 @@ class TransfermarktScraper(BaseScraper):
         """Immutable response/transport envelopes emitted by the HTTP client."""
 
         return self._http_client.get_raw_attempt_records()
+
+    def get_cache_source_records(self) -> tuple[dict, ...]:
+        return self._http_client.get_cache_source_records()
 
     def _competition_participants(
         self, scope: Dict, league: str, season,
@@ -2724,6 +2729,10 @@ class TransfermarktScraper(BaseScraper):
                 p['club_slug'] = club['club_slug']
                 p['_source_url'] = squad_url
                 p['_source_body_hash'] = payload_hash
+                p['_source_fetched_at'] = (
+                    self._last_outcome.raw_fetched_at
+                    if self._last_outcome is not None else None
+                )
                 squad_players.append(p)
             # Smoke/dry-run limits must stop paid traversal as soon as enough
             # rows exist, rather than downloading every remaining club page.
@@ -2770,7 +2779,11 @@ class TransfermarktScraper(BaseScraper):
                 'source_body_hash': (
                     sp.get('_source_body_hash') or competition.source_body_hash
                 ),
-                'fetched_at': observed_at,
+                'fetched_at': (
+                    datetime.fromisoformat(sp['_source_fetched_at'].replace('Z', '+00:00'))
+                    .astimezone(timezone.utc).replace(tzinfo=None)
+                    if sp.get('_source_fetched_at') else observed_at
+                ),
                 'parser_revision': PARSER_REVISION,
                 'schema_revision': SCHEMA_REVISION,
                 'cycle_id': os.environ.get('TM_RUN_ID', self._batch_id),
@@ -2823,7 +2836,7 @@ class TransfermarktScraper(BaseScraper):
                     'applicability_status': 'ok',
                     'source_url': lineage['source_url'],
                     'source_body_hash': lineage['source_body_hash'],
-                    'fetched_at': observed_at,
+                    'fetched_at': lineage['fetched_at'],
                     'parser_revision': PARSER_REVISION,
                     'schema_revision': SCHEMA_REVISION,
                     'cycle_id': lineage['cycle_id'],

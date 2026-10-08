@@ -2174,3 +2174,15 @@ def test_current_checkpoint_pins_career_policy_without_changing_history():
     assert cycle._checkpoint_identity(identity, args, limits) == old_identity
     args.refresh_mode = 'current'
     assert cycle._checkpoint_identity(identity, args, limits) != old_identity
+
+
+@pytest.mark.parametrize('mode', ['current', 'historical', 'force'])
+@pytest.mark.parametrize('dag', ['dag_ingest_transfermarkt', 'dag_backfill_transfermarkt'])
+def test_squad_resume_policy_only_pins_current_ingest_checkpoint(monkeypatch, mode, dag):
+    identity, args, limits = _fixed_identity_input(None, None)
+    args.refresh_mode = mode
+    monkeypatch.setenv('TM_DAG_ID', dag)
+    before = cycle._checkpoint_identity(identity, args, limits)
+    monkeypatch.setattr(cycle, 'CURRENT_SQUAD_CACHE_POLICY_VERSION', 'future-policy')
+    after = cycle._checkpoint_identity(identity, args, limits)
+    assert (before != after) == (mode == 'current' and dag == 'dag_ingest_transfermarkt')
