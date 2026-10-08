@@ -1,5 +1,6 @@
 import json
 import hashlib
+import sqlite3
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -379,6 +380,8 @@ class FakeAcceptanceClient:
             return [(12, 30, 1000, 0)]
         if "acceptance:field-inventory" in sql:
             return [(100, 0, 0, 0)]
+        if "acceptance:current-match-consistency" in sql:
+            return [(0, 0)]
         if "acceptance:current-view:" in sql:
             return [(10, 0, 0)]
         raise AssertionError(f"unexpected SQL: {sql}")
@@ -897,9 +900,12 @@ def test_verify_checks_every_current_view_and_is_green():
     )
     assert report["passed"] is True
     assert report["summary"] == {
-        "checks": 6 + len(mod.CURRENT_VIEW_KEYS),
-        "passed": 6 + len(mod.CURRENT_VIEW_KEYS),
+        "checks": 7 + len(mod.CURRENT_VIEW_KEYS),
+        "passed": 7 + len(mod.CURRENT_VIEW_KEYS),
         "failed": 0,
+        "payload_orphans": 0,
+        "finished_without_payload": 0,
+        "current_consistency_scope": "all_current",
     }
     coverage_check = next(
         check for check in report["checks"] if check["name"] == "scope_coverage_status"
@@ -907,6 +913,150 @@ def test_verify_checks_every_current_view_and_is_green():
     assert coverage_check["details"]["categories"] == {"satisfied": 1}
     checked_views = [sql for sql in client.sql if "acceptance:current-view:" in sql]
     assert len(checked_views) == len(mod.CURRENT_VIEW_KEYS)
+
+
+@pytest.mark.parametrize("orphan_count, passed", [(0, True), (2, False)])
+def test_verify_current_consistency_is_global_and_missing_payloads_diagnostic(
+    orphan_count, passed
+):
+    class CurrentClient(FakeAcceptanceClient):
+        def query(self, sql):
+            if "acceptance:current-match-consistency" in sql:
+                return [(orphan_count, 350)]
+            return super().query(sql)
+
+    report = mod.verify(
+        CurrentClient(),
+        [scope()],
+        catalog="iceberg",
+        bronze_schema="bronze",
+        parser_version="fotmob-native-v2",
+        lineage=fake_lineage(),
+    )
+    assert report["passed"] is passed
+    assert report["summary"]["payload_orphans"] == orphan_count
+    assert report["summary"]["finished_without_payload"] == 350
+    assert report["summary"]["current_consistency_scope"] == "all_current"
+    check = next(
+        c for c in report["checks"] if c["name"] == "current_match_consistency"
+    )
+    assert check["passed"] is passed
+    assert check["details"]["scope"] == "all_current"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        [],
+        [(0,)],
+        [(0, 0), (0, 0)],
+        [(None, 0)],
+        [(0, None)],
+        [(-1, 0)],
+        [(0, -1)],
+        [(False, 0)],
+        [(0, 1.5)],
+    ],
+)
+def test_verify_current_consistency_unknown_fails_closed(result):
+    class BrokenCurrentClient(FakeAcceptanceClient):
+        def query(self, sql):
+            if "acceptance:current-match-consistency" in sql:
+                if result is None:
+                    raise RuntimeError("synthetic SQL failure")
+                return result
+            return super().query(sql)
+
+    report = mod.verify(
+        BrokenCurrentClient(),
+        [scope()],
+        catalog="iceberg",
+        bronze_schema="bronze",
+        parser_version="fotmob-native-v2",
+        lineage=fake_lineage(),
+    )
+    assert report["passed"] is False
+    assert report["summary"]["payload_orphans"] is None
+    assert report["summary"]["finished_without_payload"] is None
+    assert report["summary"]["current_consistency_scope"] == "all_current"
+    failed = [check for check in report["checks"] if not check["passed"]]
+    assert len(failed) == 1
+    assert failed[0]["name"] == "current_match_consistency"
+    assert failed[0]["error"]
+
+
+def test_current_consistency_sql_matches_full_natural_key_across_all_scopes():
+    # Execute the actual portable SELECT against local current-view fixtures.
+    # Same match IDs in other seasons/competitions must not hide missing rows.
+    with sqlite3.connect(":memory:") as connection:
+        connection.executescript("""
+            CREATE TABLE matches (
+                competition_id INTEGER, source_season_key TEXT,
+                match_id INTEGER, finished BOOLEAN
+            );
+            CREATE TABLE payloads (
+                competition_id INTEGER, source_season_key TEXT, match_id INTEGER
+            );
+            INSERT INTO matches VALUES
+                (47, '2025/2026', 1, TRUE),
+                (47, '2025/2026', 2, TRUE),
+                (47, '2025/2026', 3, TRUE),
+                (47, '2025/2026', 4, FALSE),
+                (47, '2025/2026', 5, NULL),
+                (87, '2024/2025', 6, TRUE);
+            INSERT INTO payloads VALUES
+                (47, '2025/2026', 1),
+                (47, '2024/2025', 2),
+                (87, '2025/2026', 3),
+                (87, '2024/2025', 99);
+        """)
+
+        class LocalClient:
+            def query(self, sql):
+                return connection.execute(sql).fetchall()
+
+        result = mod._current_match_consistency_check(
+            LocalClient(), matches="matches", payloads="payloads"
+        )
+        connection.executescript("DELETE FROM matches; DELETE FROM payloads;")
+        empty_result = mod._current_match_consistency_check(
+            LocalClient(), matches="matches", payloads="payloads"
+        )
+
+    assert result == {
+        "passed": False,
+        "scope": "all_current",
+        "payload_orphans": 3,
+        "finished_without_payload": 3,
+    }
+    assert empty_result == {
+        "passed": True,
+        "scope": "all_current",
+        "payload_orphans": 0,
+        "finished_without_payload": 0,
+    }
+
+
+def test_current_consistency_sql_normalizes_mixed_trino_id_types():
+    client = FakeAcceptanceClient()
+    mod._current_match_consistency_check(
+        client, matches="matches", payloads="payloads"
+    )
+    sql = " ".join(client.sql[0].lower().split())
+    # Current calendar IDs are BIGINT, while payload competition IDs are
+    # VARCHAR. SQLite's dynamic comparison cannot catch this Trino type error.
+    for key in ("competition_id", "match_id"):
+        assert f"cast(match_row.{key} as varchar)" in sql
+        assert f"cast(payload_row.{key} as varchar)" in sql
+        assert (
+            f"cast(match_row.{key} as varchar) = "
+            f"cast(payload_row.{key} as varchar)"
+        ) in sql
+        assert (
+            f"cast(payload_row.{key} as varchar) = "
+            f"cast(match_row.{key} as varchar)"
+        ) in sql
 
 
 def test_verify_records_sql_error_and_fails_closed():

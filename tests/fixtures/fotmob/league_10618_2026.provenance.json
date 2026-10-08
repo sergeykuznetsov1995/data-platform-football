@@ -1,0 +1,20 @@
+[
+  {
+    "fixture": "league_10618_2026_missing_calendar.json",
+    "fixture_sha256": "e46df6100a8bb5fde6bd1de5400e61c8eaa8f493e01c14570997fb574eaa8396",
+    "raw_sha256": "2566cbfa7a4709209fc470ce64b7860cac6874d44d58cde0f4cfe1baed30a630",
+    "raw_uri": "s3://football/raw/fotmob/blobs/sha256/25/2566cbfa7a4709209fc470ce64b7860cac6874d44d58cde0f4cfe1baed30a630.json.gz",
+    "normalization": "JSON pretty-printed; source SHA verified against original decompressed bytes on read",
+    "read_at_utc": "2026-10-08",
+    "scope": "10618/2026"
+  },
+  {
+    "fixture": "league_10618_2026_good.json",
+    "fixture_sha256": "36a732106037c22d928f528ec29562ab0be51de25de85477abf0835af0bc207a",
+    "raw_sha256": "d7161b4b6d618b931ab8ddd832ec703c2bc25edefb9677bb059d02f4ef2a9d04",
+    "raw_uri": "s3://football/raw/fotmob/blobs/sha256/d7/d7161b4b6d618b931ab8ddd832ec703c2bc25edefb9677bb059d02f4ef2a9d04.json.gz",
+    "normalization": "JSON pretty-printed; source SHA verified against original decompressed bytes on read",
+    "read_at_utc": "2026-10-08",
+    "scope": "10618/2026"
+  }
+]

@@ -200,12 +200,19 @@ def _parse_matches(
             fixture_path = "$.overview.leagueOverviewMatches"
 
     raw_matches = fixture_block.get("allMatches")
-    if not isinstance(raw_matches, list):
+    if "allMatches" not in fixture_block:
         raw_matches = _mapping(fixture_block.get("data")).get("allMatches")
-    raw_matches = _list(raw_matches)
+    # Missing/ill-typed fixtures are not evidence for an empty snapshot. A
+    # zero-row success would replace a previously accepted calendar (#1288).
+    calendar_missing = raw_matches is None and (
+        "allMatches" not in fixture_block
+        and "allMatches" not in _mapping(fixture_block.get("data"))
+    )
+    if not isinstance(raw_matches, list) and not calendar_missing:
+        raise CatalogShapeError(f"calendar {fixture_path}.allMatches must be a list")
 
     rows: OrderedDict[Any, dict[str, Any]] = OrderedDict()
-    for index, value in enumerate(raw_matches):
+    for index, value in enumerate(raw_matches or []):
         path = f"{fixture_path}.allMatches[{index}]"
         if not isinstance(value, Mapping):
             issues.append(ParseIssue("invalid_match", path, "match entry is not an object"))
@@ -244,6 +251,11 @@ def _parse_matches(
                     issues.append(ParseIssue("playoff_match_without_id", path, "match has no id"))
                     continue
                 rows[match_id] = _merge_rows(rows[match_id], row) if match_id in rows else row
+    # Some historical cups expose matches only through the playoff bracket.
+    # Preserve those real matches; an absent list without any match evidence is
+    # still drift, not an explicit empty calendar.
+    if calendar_missing and not rows:
+        raise CatalogShapeError("calendar match list is missing")
     return tuple(rows.values()), issues
 
 

@@ -1,0 +1,91 @@
+{
+  "tabs": [],
+  "allAvailableSeasons": [
+    "2026",
+    "2025",
+    "2024",
+    "2023",
+    "2022",
+    "2021",
+    "2020",
+    "2019",
+    "2018",
+    "2017",
+    "2016",
+    "2015",
+    "2014",
+    "2013",
+    "2012",
+    "2011",
+    "2010"
+  ],
+  "details": {
+    "id": 10618,
+    "type": "league",
+    "name": "Copa Libertadores Qualification",
+    "selectedSeason": "2026",
+    "latestSeason": "2026",
+    "shortName": "Copa Libertadores Qualification",
+    "country": "INT",
+    "gender": "male",
+    "faqJSONLD": null,
+    "breadcrumbJSONLD": {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://www.fotmob.com"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Copa Libertadores Qualification",
+          "item": "https://www.fotmob.com/leagues/10618/overview/copa-libertadores-qualification"
+        }
+      ]
+    },
+    "canSyncCalendar": true,
+    "leagueColor": "#000000",
+    "dataProvider": null,
+    "seopath": "copa-libertadores-qualification"
+  },
+  "seostr": "copa-libertadores-qualification",
+  "QAData": [],
+  "table": null,
+  "transfers": {
+    "type": "league",
+    "data": null
+  },
+  "overview": {
+    "season": "2026",
+    "selectedSeason": "2026",
+    "table": null,
+    "topPlayers": {
+      "byRating": {
+        "seeAllLink": "/leagues/10618/stats/season//players/rating/copa-libertadores-qualification"
+      },
+      "byGoals": {
+        "seeAllLink": "/leagues/10618/stats/season//players/goals/copa-libertadores-qualification"
+      },
+      "byAssists": {
+        "seeAllLink": "/leagues/10618/stats/season//players/goal_assist/copa-libertadores-qualification"
+      },
+      "seeAllUrl": "stats"
+    },
+    "hasTotw": false,
+    "hasOngoingMatch": false,
+    "shotMap": null,
+    "matches": {
+      "hasOngoingMatch": false
+    }
+  },
+  "stats": {},
+  "fixtures": {
+    "hasOngoingMatch": false
+  },
+  "playoff": null,
+  "seasons": []
+}

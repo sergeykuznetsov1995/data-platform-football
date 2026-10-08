@@ -1833,6 +1833,53 @@ def _view_check(
     }
 
 
+def _current_match_consistency_check(
+    client: QueryClient,
+    *,
+    matches: str,
+    payloads: str,
+) -> Mapping[str, Any]:
+    """Check all current scopes, independently of the acceptance run's scopes.
+
+    Orphan details violate the current-view contract. Finished calendar rows
+    without details are diagnostic: historical payload backfill is separate.
+    """
+    orphan_count, missing_count = _one_row(
+        client,
+        f"""-- acceptance:current-match-consistency
+        SELECT
+          (SELECT COUNT(*) FROM {payloads} payload_row
+           WHERE NOT EXISTS (
+               SELECT 1 FROM {matches} match_row
+               WHERE CAST(match_row.competition_id AS VARCHAR) =
+                     CAST(payload_row.competition_id AS VARCHAR)
+                 AND match_row.source_season_key = payload_row.source_season_key
+                 AND CAST(match_row.match_id AS VARCHAR) =
+                     CAST(payload_row.match_id AS VARCHAR)
+           )),
+          (SELECT COUNT(*) FROM {matches} match_row
+           WHERE COALESCE(match_row.finished, FALSE)
+             AND NOT EXISTS (
+               SELECT 1 FROM {payloads} payload_row
+               WHERE CAST(payload_row.competition_id AS VARCHAR) =
+                     CAST(match_row.competition_id AS VARCHAR)
+                 AND payload_row.source_season_key = match_row.source_season_key
+                 AND CAST(payload_row.match_id AS VARCHAR) =
+                     CAST(match_row.match_id AS VARCHAR)
+           ))
+        """,
+        columns=2,
+    )
+    orphans = _coverage_count(orphan_count, field="payload_orphans")
+    missing = _coverage_count(missing_count, field="finished_without_payload")
+    return {
+        "passed": orphans == 0,
+        "scope": "all_current",
+        "payload_orphans": orphans,
+        "finished_without_payload": missing,
+    }
+
+
 def verify(
     client: QueryClient,
     scopes: Sequence[Scope],
@@ -1935,6 +1982,17 @@ def verify(
             ),
         )
     )
+    consistency_check = _run_check(
+        "current_match_consistency",
+        lambda: _current_match_consistency_check(
+            client,
+            matches=_qualified(catalog, bronze_schema, "fotmob_matches_current"),
+            payloads=_qualified(
+                catalog, bronze_schema, "fotmob_match_payloads_current"
+            ),
+        ),
+    )
+    checks.append(consistency_check)
     for table, keys in CURRENT_VIEW_KEYS.items():
         checks.append(
             _run_check(
@@ -1951,6 +2009,15 @@ def verify(
             )
         )
     report = _report("verify", scopes, checks, parser_version=parser_version)
+    # Unknown counts remain null on SQL/validation errors; never report a
+    # successful zero when the current data could not actually be checked.
+    report["summary"].update(
+        payload_orphans=consistency_check.details.get("payload_orphans"),
+        finished_without_payload=consistency_check.details.get(
+            "finished_without_payload"
+        ),
+        current_consistency_scope="all_current",
+    )
     report["plan_signature"] = plan_signature
     report["completed_since"] = completed_since
     report["runner_run_id"] = lineage.runner_run_id
