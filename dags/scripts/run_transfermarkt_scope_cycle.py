@@ -47,6 +47,7 @@ from dags.utils.transfermarkt_scope_state import (
     stable_hash,
 )
 from scrapers.transfermarkt.models import (
+    CAREER_WINDOW_POLICY_VERSION,
     CAREER_ENTITY_TIMEOUT_SECONDS,  # noqa: F401 - public compatibility export
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     ENTITY_TIMEOUT_SECONDS,
@@ -1989,6 +1990,8 @@ def _checkpoint_identity(
         'request_limit': int(args.request_limit),
         'retry_limit': int(args.retry_limit),
         **parent_byte_caps,
+        **({'career_window_policy': CAREER_WINDOW_POLICY_VERSION}
+           if getattr(args, 'refresh_mode', None) == 'current' else {}),
         'parent_request_limit': int(args.parent_request_limit),
         'parent_retry_limit': int(args.parent_retry_limit),
         'career_window_limit': int(args.career_window_limit),

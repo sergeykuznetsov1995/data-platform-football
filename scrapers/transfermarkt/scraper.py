@@ -1626,6 +1626,7 @@ class TransfermarktScraper(BaseScraper):
         )
         self._last_outcome: Optional[FetchOutcome] = None
         self._fetch_records: Dict[str, Dict[str, FetchRecord]] = defaultdict(dict)
+        self._career_windows: Dict[str, Dict] = {}
         self._scope_capture: Optional[Dict] = None
         self._participant_evidence: Optional[Dict] = None
         self._materialization_failure_streak = 0
@@ -3305,6 +3306,16 @@ class TransfermarktScraper(BaseScraper):
 
         return self.read_coach_data(league, season, limit)['legacy_coaches']
 
+    def get_career_window(self, endpoint: str) -> Optional[Dict]:
+        """Return the admitted career keys, including attempts that failed."""
+        window = self._career_windows.get(endpoint)
+        if window is None:
+            return None
+        return {
+            key: list(value) if isinstance(value, list) else value
+            for key, value in window.items()
+        }
+
     def _read_player_endpoint_rows(
         self,
         *,
@@ -3318,9 +3329,13 @@ class TransfermarktScraper(BaseScraper):
         parser,
         columns: List[str],
         entity_type: str,
+        decoded_body_soft_stop_bytes: Optional[int] = None,
     ) -> pd.DataFrame:
         """Shared per-player fan-out with completeness and early-stop guards."""
 
+        self._career_windows.pop(label, None)
+        if decoded_body_soft_stop_bytes is not None and decoded_body_soft_stop_bytes <= 0:
+            raise ValueError('decoded body soft stop must be positive')
         scope = self._resolve_scope(league, season)
         league = scope['compatibility_league']
         season_short = scope['canonical_season']
@@ -3340,11 +3355,37 @@ class TransfermarktScraper(BaseScraper):
         if limit:
             selected_ids = selected_ids[: int(limit)]
 
+        window = {
+            'requested_ids': selected_ids,
+            'attempted_ids': [],
+            'deferred_ids': list(selected_ids),
+            'stop_reason': 'window_complete',
+            'decoded_body_soft_stop_bytes': decoded_body_soft_stop_bytes,
+        }
+        if decoded_body_soft_stop_bytes is not None:
+            self._career_windows[label] = window
+
         rows: List[Dict] = []
         consecutive_failures = 0
         successes = 0
         required_successes = int(math.ceil(_MIN_SUCCESS_RATIO * len(selected_ids)))
         for idx, pid in enumerate(selected_ids, start=1):
+            if decoded_body_soft_stop_bytes is not None:
+                decoded = self._http_client.get_traffic_stats().get(
+                    'decoded_response_body_bytes',
+                )
+                if not isinstance(decoded, int) or decoded < 0:
+                    raise TransfermarktError('career window decoded telemetry unavailable')
+                if decoded >= decoded_body_soft_stop_bytes:
+                    window['stop_reason'] = 'decoded_body_soft_stop'
+                    if not window['attempted_ids']:
+                        raise PartialScrapeError('no career requests admitted before decoded soft stop')
+                    required_successes = int(math.ceil(
+                        _MIN_SUCCESS_RATIO * len(window['attempted_ids']),
+                    ))
+                    break
+            window['attempted_ids'].append(pid)
+            window['deferred_ids'] = selected_ids[idx:]
             url = f"{_TM_BASE}" + path_template.format(player_id=pid)
             payload = self._fetch_json(
                 url, label=label, context={
@@ -3441,7 +3482,7 @@ class TransfermarktScraper(BaseScraper):
 
         if successes and successes < required_successes:
             raise PartialScrapeError(
-                f"only {successes}/{len(selected_ids)} {label} payloads "
+                f"only {successes}/{len(window['attempted_ids'])} {label} payloads "
                 f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
                 "existing partition"
             )
@@ -3457,6 +3498,8 @@ class TransfermarktScraper(BaseScraper):
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
         window_offset: int = 0,
+        *,
+        decoded_body_soft_stop_bytes: Optional[int] = None,
     ) -> pd.DataFrame:
         """Return global market-value facts keyed by ``(player_id, mv_date)``.
 
@@ -3475,6 +3518,7 @@ class TransfermarktScraper(BaseScraper):
             parser=_parse_mv_history,
             columns=MARKET_VALUE_POINT_COLUMNS,
             entity_type='market_value_points',
+            decoded_body_soft_stop_bytes=decoded_body_soft_stop_bytes,
         )
         if not df.empty:
             df = df.sort_values(
@@ -3493,11 +3537,14 @@ class TransfermarktScraper(BaseScraper):
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
         window_offset: int = 0,
+        *,
+        decoded_body_soft_stop_bytes: Optional[int] = None,
     ) -> pd.DataFrame:
         """Legacy adapter over global market-value points."""
 
         points = self.read_market_value_points(
             league, season, player_ids, limit, window_offset,
+            decoded_body_soft_stop_bytes=decoded_body_soft_stop_bytes,
         )
         scope = self._resolve_scope(league, season)
         return materialize_legacy_market_value_history(
@@ -3512,6 +3559,8 @@ class TransfermarktScraper(BaseScraper):
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
         window_offset: int = 0,
+        *,
+        decoded_body_soft_stop_bytes: Optional[int] = None,
     ) -> pd.DataFrame:
         """Return global transfer facts keyed by globally unique transfer_id.
 
@@ -3530,6 +3579,7 @@ class TransfermarktScraper(BaseScraper):
             parser=_parse_transfers,
             columns=TRANSFER_EVENT_COLUMNS,
             entity_type='transfer_events',
+            decoded_body_soft_stop_bytes=decoded_body_soft_stop_bytes,
         )
         if not df.empty:
             df = df.sort_values(
@@ -3548,11 +3598,14 @@ class TransfermarktScraper(BaseScraper):
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
         window_offset: int = 0,
+        *,
+        decoded_body_soft_stop_bytes: Optional[int] = None,
     ) -> pd.DataFrame:
         """Legacy adapter over global transfer events."""
 
         events = self.read_transfer_events(
             league, season, player_ids, limit, window_offset,
+            decoded_body_soft_stop_bytes=decoded_body_soft_stop_bytes,
         )
         scope = self._resolve_scope(league, season)
         return materialize_legacy_transfers(

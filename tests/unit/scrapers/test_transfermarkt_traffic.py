@@ -470,6 +470,125 @@ def test_decoded_body_budget_raises_immediately_and_reports_state():
     assert sum(len(item.get_calls) for item in factory.clients) == 1
 
 
+def _career_replay(body_sizes, *, empty=False, market_value=False):
+    import json
+
+    payload = {'transfers': [] if empty else [{
+        'id': 'source-1', 'date': 'Jul 1, 2020', 'season': '20/21',
+        'from': {'clubName': 'A', 'href': '/verein/1/'},
+        'to': {'clubName': 'B', 'href': '/verein/2/'},
+        'upcoming': False,
+    }]}
+    if market_value:
+        payload = {'list': [] if empty else [{
+            'datum_mw': 'Jan 1, 2025', 'y': 1000000,
+            'verein': 'Club', 'age': '20', 'mw': '€1m',
+        }]}
+    raw = json.dumps(payload).encode()
+    factory = _ClientFactory([
+        _FakeResp(raw + b' ' * (size - len(raw)), json_value=payload,
+                  headers={'content-type': 'application/json'})
+        for size in body_sizes
+    ])
+    client = TransfermarktHttpClient(
+        proxy='http://proxy.invalid:8000', client_factory=factory,
+        rate_limiter=_NoWaitLimiter(),
+    )
+    scraper = TransfermarktScraper()
+    scraper._http_client = client
+    return scraper, client, factory
+
+
+def test_bra4_career_replay_commits_a_window_before_decoded_cap():
+    # Same aggregate bytes/request count as BRA4/2025. Synthetic valid bodies
+    # replay the real fan-out and transport without paid requests or storage.
+    base, remainder = divmod(12608149, 422)
+    sizes = [base + (i < remainder) for i in range(500)]
+    scraper, client, factory = _career_replay(sizes)
+    frame = scraper.read_transfer_events(
+        'ENG-Premier League', 2025,
+        player_ids=[str(i) for i in range(1, 501)], limit=500,
+        decoded_body_soft_stop_bytes=12 * 1024 * 1024 * 3 // 4,
+    )
+    window = scraper.get_career_window('transfer_events')
+    assert len(frame) == len(window['attempted_ids']) == 316
+    assert len(window['deferred_ids']) == 184
+    assert window['stop_reason'] == 'decoded_body_soft_stop'
+    assert client.get_traffic_stats()['decoded_response_body_bytes'] < 12582912
+    assert client.get_traffic_stats()['budget_exhausted'] is False
+    assert sum(len(item.get_calls) for item in factory.clients) == 316
+
+
+@pytest.mark.parametrize('empty', [False, True])
+@pytest.mark.parametrize('soft_stop,expected', [(999, 2), (1000, 2), (1001, 3)])
+def test_career_soft_stop_only_at_whole_player_boundary(empty, soft_stop, expected):
+    scraper, _, factory = _career_replay([500] * 5, empty=empty)
+    frame = scraper.read_transfer_events(
+        'ENG-Premier League', 2025, player_ids=['1', '2', '3', '4', '5'],
+        decoded_body_soft_stop_bytes=soft_stop,
+    )
+    window = scraper.get_career_window('transfer_events')
+    assert window['attempted_ids'] == ['1', '2', '3', '4', '5'][:expected]
+    assert len(frame) == (0 if empty else expected)
+    assert sum(len(item.get_calls) for item in factory.clients) == expected
+    if empty:
+        outcomes = scraper.get_fetch_outcomes()['transfer_events']
+        assert set(outcomes) == set(window['attempted_ids'])
+        assert all(v['status'] == 'valid_empty' for v in outcomes.values())
+
+
+def test_career_soft_stop_keeps_hard_cap_failure():
+    scraper, _, _ = _career_replay([12 * 1024 * 1024 + 1])
+    with pytest.raises(TrafficBudgetExceeded, match='decoded-body budget'):
+        scraper.read_transfer_events(
+            'ENG-Premier League', 2025, player_ids=['1'],
+            decoded_body_soft_stop_bytes=9 * 1024 * 1024,
+        )
+
+
+def test_career_window_does_not_turn_zero_work_into_empty_success():
+    from scrapers.transfermarkt.scraper import PartialScrapeError
+
+    scraper, client, factory = _career_replay([500])
+    client._decoded_body_bytes = 1000
+    with pytest.raises(PartialScrapeError, match='no career requests'):
+        scraper.read_transfer_events(
+            'ENG-Premier League', 2025, player_ids=['1'],
+            decoded_body_soft_stop_bytes=1000,
+        )
+    assert factory.clients == []
+
+
+def test_market_value_window_uses_same_whole_career_boundary():
+    scraper, _, factory = _career_replay([500] * 5, market_value=True)
+    frame = scraper.read_market_value_points(
+        'ENG-Premier League', 2025, player_ids=['1', '2', '3', '4', '5'],
+        decoded_body_soft_stop_bytes=1000,
+    )
+    assert list(frame['player_id']) == ['1', '2']
+    assert scraper.get_career_window('market_value_points')['deferred_ids'] == ['3', '4', '5']
+    assert sum(len(c.get_calls) for c in factory.clients) == 2
+
+
+def test_soft_stop_does_not_exclude_failed_attempts_from_quality_ratio(monkeypatch):
+    from scrapers.transfermarkt.scraper import PartialScrapeError
+
+    scraper, client, _ = _career_replay([])
+    payloads = iter([None, {'transfers': []}])
+
+    def fetch(*a, **k):
+        client._decoded_body_bytes += 500
+        return next(payloads)
+
+    monkeypatch.setattr(scraper, '_fetch_json', fetch)
+    with pytest.raises(PartialScrapeError, match='only 1/2'):
+        scraper.read_transfer_events(
+            'ENG-Premier League', 2025, player_ids=[str(i) for i in range(1, 21)],
+            decoded_body_soft_stop_bytes=1000,
+        )
+    assert scraper.get_career_window('transfer_events')['attempted_ids'] == ['1', '2']
+
+
 @pytest.mark.unit
 def test_exact_decoded_cap_blocks_next_request_before_io_no_n_plus_one():
     factory = _ClientFactory([_FakeResp(b'abc'), _FakeResp(b'not-fetched')])

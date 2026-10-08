@@ -497,6 +497,33 @@ def test_participant_evidence_of_players_enters_the_manifest_hash(tmp_path):
     assert manifest['dq_evidence']['participant_evidence'] == evidence
 
 
+def test_adaptive_roster_remainder_is_part_of_scope_manifest_evidence(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    coverage = {
+        'roster_size': 3417, 'selected': 316, 'pending': 3101,
+    }
+
+    def mutate(command, result):
+        if result['entity'] == 'transfers':
+            result['roster_coverage'] = dict(coverage)
+        return result
+
+    manifest = cycle.run_scope_cycle(
+        args, operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([], mutate=mutate),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+    )
+    assert manifest['dq_evidence']['roster_coverage']['transfers'] == coverage
+    assert manifest['dq_evidence']['career_fetches_pending'] == 3101
+    original = cycle.ScopeManifest.from_mapping(manifest).digest
+    manifest['dq_evidence']['roster_coverage']['transfers']['pending'] = 0
+    manifest['dq_evidence']['career_fetches_pending'] = 0
+    assert cycle.ScopeManifest.from_mapping(manifest).digest != original
+
+
 def test_optional_authoritative_empty_without_typed_proof_is_blocked(tmp_path):
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
@@ -2136,3 +2163,14 @@ def test_checkpoint_identity_without_parent_caps_differs_and_is_stable():
     first = cycle._checkpoint_identity(identity, uncapped, limits)
     assert first == cycle._checkpoint_identity(identity, uncapped, limits)
     assert first != cycle._checkpoint_identity(identity, capped, limits)
+
+
+def test_current_checkpoint_pins_career_policy_without_changing_history():
+    identity, args, limits = _fixed_identity_input(None, None)
+    old_identity = cycle._checkpoint_identity(identity, args, limits)
+    args.refresh_mode = 'historical'
+    assert cycle._checkpoint_identity(identity, args, limits) == old_identity
+    args.refresh_mode = 'force'
+    assert cycle._checkpoint_identity(identity, args, limits) == old_identity
+    args.refresh_mode = 'current'
+    assert cycle._checkpoint_identity(identity, args, limits) != old_identity

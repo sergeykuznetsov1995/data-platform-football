@@ -34,6 +34,7 @@ from dags.utils.transfermarkt_dq_contracts import (
 # The budget canon is stdlib-only and safe at module import time; the heavy
 # scraper modules stay lazy inside _run_entity.
 from scrapers.transfermarkt.models import (
+    CAREER_WINDOW_POLICY_VERSION,
     MAX_ROSTER_WINDOW,
     PRODUCTION_ENTITY_BUDGETS,
     PROVIDER_GRANT_ENV_VAR,
@@ -2211,6 +2212,7 @@ def _read_frames(
     native_dual_write: bool,
     coach_memberships=None,
     write_mode: Optional[str] = None,
+    decoded_body_soft_stop_bytes: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], str, bool]:
     """Return output frames, authoritative key and whether native was used."""
     mode = _normalise_write_mode(
@@ -2221,6 +2223,8 @@ def _read_frames(
         if selected is not None:
             common['player_ids'] = selected
         common.update(limit=limit, window_offset=window_offset)
+        if decoded_body_soft_stop_bytes is not None:
+            common['decoded_body_soft_stop_bytes'] = decoded_body_soft_stop_bytes
     elif limit is not None:
         common['limit'] = limit
 
@@ -2301,6 +2305,38 @@ def _read_frames(
     legacy = getattr(scraper, spec.legacy_reader)(**common)
     legacy_key = next(output.key for output in spec.outputs if output.is_legacy)
     return {legacy_key: legacy}, legacy_key, False
+
+
+def _apply_career_window(scraper, spec, selected, results):
+    """Validate the admitted prefix before writes or fetch-state updates."""
+    window = scraper.get_career_window(spec.state_endpoint)
+    if not isinstance(window, Mapping):
+        raise RuntimeError('career window evidence unavailable')
+    attempted = window.get('attempted_ids')
+    deferred = window.get('deferred_ids')
+    if (
+        not isinstance(attempted, list) or not isinstance(deferred, list)
+        or window.get('requested_ids') != selected
+        or attempted != selected[:len(attempted)]
+        or attempted + deferred != selected
+        or window.get('stop_reason') not in {
+            'window_complete', 'decoded_body_soft_stop',
+        }
+    ):
+        raise RuntimeError('career window evidence differs from selected roster')
+    results['career_window'] = {
+        'policy_version': CAREER_WINDOW_POLICY_VERSION,
+        'requested': len(selected), 'attempted': len(attempted),
+        'deferred': len(deferred), 'stop_reason': window['stop_reason'],
+        'decoded_body_soft_stop_bytes': window['decoded_body_soft_stop_bytes'],
+    }
+    coverage = results.get('roster_coverage')
+    if isinstance(coverage, dict):
+        coverage.update(
+            selected=len(attempted),
+            pending=coverage['pending'] + len(deferred),
+        )
+    return list(attempted)
 
 
 def _save_frames(
@@ -3417,6 +3453,7 @@ def _run_entity(
     state_persisted = False
     data_committed = False
     failure_phase = 'platform'
+    career_soft_stop = None
 
     # Keep the configured path even when missing. The scraper owns the
     # fail-closed proxy policy; converting it to None here used to enable the
@@ -3611,11 +3648,41 @@ def _run_entity(
                 results['cache_only_materialization'] = True
             else:
                 failure_phase = 'source'
+                if (
+                    spec.state_endpoint and selected
+                    and refresh_mode == 'current'
+                ):
+                    decoded_cap = int(float(os.environ.get(
+                        'TM_DECODED_BODY_BUDGET_MB',
+                        PRODUCTION_ENTITY_BUDGETS[spec.name]['decoded_mb'],
+                    )) * 1024 * 1024)
+                    career_soft_stop = decoded_cap * 3 // 4
                 frames, authoritative_key, used_native = _read_frames(
                     scraper, spec, league, season, limit, window_offset, selected,
                     native_dual_write, coach_memberships=coach_memberships,
                     write_mode=mode,
+                    decoded_body_soft_stop_bytes=career_soft_stop,
                 )
+                if career_soft_stop is not None:
+                    selected = _apply_career_window(scraper, spec, selected, results)
+                    if not selected:
+                        raise RuntimeError('career window has no admitted player keys')
+                    if career_cache_frames is not None:
+                        # Bootstrap projection must not re-admit the deferred
+                        # tail or resurrect a newly authoritative empty career.
+                        cache_ids = set(selected) - set(_valid_empty_ids(
+                            scraper, spec, selected,
+                        ))
+                        career_hydrate_ids = [
+                            sid for sid in career_hydrate_ids if sid in cache_ids
+                        ]
+                        career_cache_frames = {
+                            key: frame[
+                                frame['player_id'].astype(str).isin(cache_ids)
+                            ].copy()
+                            for key, frame in career_cache_frames.items()
+                        }
+                        results['career_cache_materialized_keys'] = len(career_hydrate_ids)
                 if spec.name == ENTITY_COACHES and coach_cache_frames is not None:
                     frames = _merge_coach_cache_frames(
                         scraper, frames, coach_cache_frames, league, season,
@@ -4047,6 +4114,13 @@ def _run_entity(
             and checkpoint_spec is not None
             and not dry_run and not state_persisted and not data_committed
         ):
+            if career_soft_stop is not None and 'career_window' not in results:
+                # A hard response/quality failure may have admitted only a
+                # prefix. Never mark untouched tail keys as failed fetches.
+                try:
+                    selected = _apply_career_window(scraper, spec, selected, results)
+                except RuntimeError:
+                    selected = []
             failed = _state_rows(
                 scraper,
                 checkpoint_spec,
