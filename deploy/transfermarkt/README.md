@@ -48,3 +48,14 @@ ingest и discover работают, backfill и silver на паузе.
   три провальные ночи подряд — выключатель `auto-deliver/transfermarkt-auto-deliver.off`.
   `auto_deliver.sh --drill-rollback` — учения отката на копии принятого дерева.
 - `rotate_state.sh --dry-run` — что удалила бы ротация.
+
+## Current по сигналам (#1393)
+
+Контракты сбора, квалификация tmapi, warm baseline и интерфейс измерителя
+описаны в [TRANSFERMARKT-CURRENT-1393.md](../../docs/operations/TRANSFERMARKT-CURRENT-1393.md).
+Без валидного файла квалификации остаётся прежний daily ingest. Включённый
+current использует изолированный TM timetable plugin из
+`/opt/airflow/dags/utils/transfermarkt_plugins`; новые порции не стартуют
+00:15–03:00 UTC, чтобы сохранить окно штатной автодоставки 04–06 МСК.
+Наличие файла или merge не подтверждает runtime-приёмку: нужны физические
+Bronze receipts, метабаза scheduler и три дня измеренного покрытия.

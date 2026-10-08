@@ -137,7 +137,10 @@ def _safe_url(value: object) -> str:
             parsed.query,
             keep_blank_values=True,
             strict_parsing=True,
-            max_num_fields=32,
+            # #1393: a player signal packet contains up to 300 repeated,
+            # explicitly allowlisted ids[] fields. HTML routes keep their
+            # smaller admission bound below.
+            max_num_fields=300 if (parsed.hostname or '').lower() == _TRANSFERMARKT_API_HOST else 32,
         )
     except ValueError:
         raise ValueError(invalid) from None
@@ -153,14 +156,15 @@ def _safe_url(value: object) -> str:
                 or re.fullmatch(r"\d{4}", query[0][1]) is None
             ):
                 raise ValueError(invalid)
-        elif parsed.path == "/clubs":
+        elif parsed.path in {"/clubs", "/players"}:
             if (
                 not query
-                or len(query) > 250
+                or len(query) > (300 if parsed.path == "/players" else 250)
                 or any(
                     name != "ids[]" or re.fullmatch(r"\d+", query_value) is None
                     for name, query_value in query
                 )
+                or len({value for _, value in query}) != len(query)
             ):
                 raise ValueError(invalid)
         else:

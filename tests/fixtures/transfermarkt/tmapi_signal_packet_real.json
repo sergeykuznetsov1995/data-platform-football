@@ -1,0 +1,346 @@
+{
+  "success": true,
+  "message": "OK",
+  "data": [
+    {
+      "id": "100497",
+      "name": "Alejandro González",
+      "shortName": "A. González",
+      "artistName": "",
+      "displayName": "",
+      "lifeDates": {
+        "age": 38,
+        "dateOfBirth": "1988-03-23",
+        "isDateOfBirthUnknown": false,
+        "dateOfDeath": null,
+        "isDateOfDeathUnknown": false
+      },
+      "birthPlaceDetails": {
+        "placeOfBirth": "Montevideo",
+        "countryOfBirthId": 179,
+        "placeOfBirthAdditionalInfo": "",
+        "gender": "male"
+      },
+      "nationalityDetails": {
+        "passportName": "Alejandro Damián González Hernández",
+        "nationalities": {
+          "nationalityId": 179,
+          "secondNationalityId": 157
+        }
+      },
+      "attributes": {
+        "height": 1.84,
+        "preferredFootId": 2,
+        "outfitterId": 0,
+        "positionGroup": "DEFENDER",
+        "positionGroupName": "Defender",
+        "positionId": 3,
+        "firstSidePositionId": 5,
+        "secondSidePositionId": 0,
+        "lastContractRenewal": {
+          "year": null,
+          "month": null,
+          "day": null
+        },
+        "contractUntil": "2026-12-31",
+        "contractOptionId": null,
+        "formerClubsNote": "CA Peñarol (2005-2008)",
+        "consultantAgencyId": 0,
+        "preferredFoot": {
+          "id": 2,
+          "name": "right"
+        },
+        "position": {
+          "id": 3,
+          "name": "Centre-Back",
+          "shortName": "CB",
+          "category": "Defender"
+        },
+        "firstSidePosition": {
+          "id": 5,
+          "name": "Right-Back",
+          "shortName": "RB",
+          "category": "Defender"
+        }
+      },
+      "preferences": {
+        "themeId": 0
+      },
+      "nominees": [],
+      "participations": [],
+      "relativeUrl": "/alejandro-gonzalez/profil/spieler/100497",
+      "ribbon": {
+        "transferId": "6132972",
+        "ribbonType": "NEW_SIGNING"
+      },
+      "portraitUrl": "https://img.a.transfermarkt.technology/portrait/big/100497-1721058367.jpg",
+      "portraitUrlSource": "Miramar SAD",
+      "marketValueDetails": {
+        "current": {
+          "value": 0,
+          "currency": "EUR",
+          "compact": {
+            "prefix": "€",
+            "content": "0.00",
+            "suffix": ""
+          },
+          "determined": "2026-01-08"
+        },
+        "previous": {
+          "value": 10000,
+          "currency": "EUR",
+          "compact": {
+            "prefix": "€",
+            "content": "10.00",
+            "suffix": "K"
+          },
+          "determined": "2025-12-12"
+        },
+        "delta": {
+          "value": "-10.000 €",
+          "percentage": "-100,00 %",
+          "isVisible": false,
+          "type": "DECREASED"
+        },
+        "highest": {
+          "value": 2000000,
+          "currency": "EUR",
+          "compact": {
+            "prefix": "€",
+            "content": "2.00",
+            "suffix": "M"
+          },
+          "determined": "2014-01-07"
+        }
+      },
+      "clubAssignments": [
+        {
+          "playerId": "100497",
+          "clubId": "84744",
+          "shirtNumber": 2,
+          "isCaptain": true,
+          "type": "current",
+          "start": "2026-01-08"
+        }
+      ],
+      "lastClubId": 0
+    },
+    {
+      "id": "1004091",
+      "name": "Kobe Lemmens",
+      "shortName": "K. Lemmens",
+      "artistName": "",
+      "displayName": "",
+      "lifeDates": {
+        "age": 24,
+        "dateOfBirth": "2002-01-10",
+        "isDateOfBirthUnknown": false,
+        "dateOfDeath": null,
+        "isDateOfDeathUnknown": false
+      },
+      "birthPlaceDetails": {
+        "placeOfBirth": "",
+        "countryOfBirthId": 0,
+        "placeOfBirthAdditionalInfo": "",
+        "gender": "male"
+      },
+      "nationalityDetails": {
+        "passportName": "",
+        "nationalities": {
+          "nationalityId": 19,
+          "secondNationalityId": 0
+        }
+      },
+      "attributes": {
+        "height": null,
+        "preferredFootId": 1,
+        "outfitterId": 0,
+        "positionGroup": "DEFENDER",
+        "positionGroupName": "Defender",
+        "positionId": 3,
+        "firstSidePositionId": 4,
+        "secondSidePositionId": 0,
+        "lastContractRenewal": {
+          "year": 2026,
+          "month": 5,
+          "day": 3
+        },
+        "contractUntil": "2027-06-30",
+        "contractOptionId": null,
+        "formerClubsNote": "Thes Sport",
+        "consultantAgencyId": 0,
+        "preferredFoot": {
+          "id": 1,
+          "name": "left"
+        },
+        "position": {
+          "id": 3,
+          "name": "Centre-Back",
+          "shortName": "CB",
+          "category": "Defender"
+        },
+        "firstSidePosition": {
+          "id": 4,
+          "name": "Left-Back",
+          "shortName": "LB",
+          "category": "Defender"
+        }
+      },
+      "preferences": {
+        "themeId": 0
+      },
+      "nominees": [],
+      "participations": [],
+      "relativeUrl": "/kobe-lemmens/profil/spieler/1004091",
+      "clubAssignments": [
+        {
+          "playerId": "1004091",
+          "clubId": "49143",
+          "shirtNumber": 4,
+          "isCaptain": false,
+          "type": "current",
+          "debut": "2025-08-24",
+          "start": "2025-07-01"
+        }
+      ],
+      "lastClubId": 0
+    },
+    {
+      "id": "1004708",
+      "name": "Josh Acheampong",
+      "shortName": "J. Acheampong",
+      "artistName": "",
+      "displayName": "",
+      "lifeDates": {
+        "age": 20,
+        "dateOfBirth": "2006-05-05",
+        "isDateOfBirthUnknown": false,
+        "dateOfDeath": null,
+        "isDateOfDeathUnknown": false
+      },
+      "birthPlaceDetails": {
+        "placeOfBirth": "London",
+        "countryOfBirthId": 189,
+        "placeOfBirthAdditionalInfo": "",
+        "gender": "male"
+      },
+      "nationalityDetails": {
+        "passportName": "Joshua Kofi Acheampong",
+        "nationalities": {
+          "nationalityId": 189,
+          "secondNationalityId": 54
+        }
+      },
+      "attributes": {
+        "height": 1.9,
+        "preferredFootId": 2,
+        "outfitterId": 0,
+        "positionGroup": "DEFENDER",
+        "positionGroupName": "Defender",
+        "positionId": 3,
+        "firstSidePositionId": 5,
+        "secondSidePositionId": 0,
+        "lastContractRenewal": {
+          "year": 2024,
+          "month": 12,
+          "day": 18
+        },
+        "contractUntil": "2029-06-30",
+        "contractOptionId": null,
+        "formerClubsNote": "Chelsea FC (2014-2024)",
+        "consultantAgencyId": 0,
+        "goldenBoyIndex": 49.732,
+        "preferredFoot": {
+          "id": 2,
+          "name": "right"
+        },
+        "position": {
+          "id": 3,
+          "name": "Centre-Back",
+          "shortName": "CB",
+          "category": "Defender"
+        },
+        "firstSidePosition": {
+          "id": 5,
+          "name": "Right-Back",
+          "shortName": "RB",
+          "category": "Defender"
+        }
+      },
+      "preferences": {
+        "themeId": 0
+      },
+      "nominees": [
+        "golden_boy"
+      ],
+      "participations": [],
+      "relativeUrl": "/josh-acheampong/profil/spieler/1004708",
+      "portraitUrl": "https://img.a.transfermarkt.technology/portrait/big/1004708-1715156243.jpg",
+      "portraitUrlSource": "IMAGO",
+      "marketValueDetails": {
+        "current": {
+          "value": 25000000,
+          "currency": "EUR",
+          "compact": {
+            "prefix": "€",
+            "content": "25.00",
+            "suffix": "M"
+          },
+          "determined": "2026-06-03"
+        },
+        "previous": {
+          "value": 25000000,
+          "currency": "EUR",
+          "compact": {
+            "prefix": "€",
+            "content": "25.00",
+            "suffix": "M"
+          },
+          "determined": "2026-03-09"
+        },
+        "delta": {
+          "value": "0 €",
+          "percentage": "0,00 %",
+          "isVisible": false,
+          "type": "UNCHANGED"
+        },
+        "highest": {
+          "value": 25000000,
+          "currency": "EUR",
+          "compact": {
+            "prefix": "€",
+            "content": "25.00",
+            "suffix": "M"
+          },
+          "determined": "2026-06-03"
+        }
+      },
+      "clubAssignments": [
+        {
+          "playerId": "1004708",
+          "clubId": "631",
+          "shirtNumber": 34,
+          "isCaptain": false,
+          "type": "current",
+          "debut": "2024-05-02",
+          "start": "2024-12-18"
+        },
+        {
+          "playerId": "1004708",
+          "clubId": "9565",
+          "shirtNumber": null,
+          "isCaptain": false,
+          "type": "nationalTeam",
+          "debut": "2025-09-08"
+        }
+      ],
+      "lastClubId": 0
+    }
+  ],
+  "_fixture_provenance": {
+    "source": "L7_tmapi_batch_24__1011261_ids_5B_5D_1011262_ids_5B_5D_1011266_ids_5B_5D_1011267_ids_5B_5D_1011280.body",
+    "source_sha256": "a7046f8729da26ddeb6920a55ea29572ba29729ee471f2868875abb6193e8233",
+    "source_rows": 300,
+    "selection": "real current valued/contracted, no marketValueDetails, nationalTeam assignment"
+  }
+}

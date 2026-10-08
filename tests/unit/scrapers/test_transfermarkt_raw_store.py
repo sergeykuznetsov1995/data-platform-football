@@ -465,11 +465,38 @@ def test_first_party_discovery_api_routes_are_raw_storable(tmp_path, url):
         "https://tmapi.transfermarkt.technology/competition/CL/club",
         "https://tmapi.transfermarkt.technology/competition/CL/club?season=all",
         "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=281&token=secret",
-        "https://tmapi.transfermarkt.technology/players?ids%5B%5D=1",
+        "https://tmapi.transfermarkt.technology/players?ids%5B%5D=1&token=secret",
     ],
 )
 def test_unknown_discovery_api_routes_and_queries_are_rejected(tmp_path, url):
     with pytest.raises(ValueError, match="credential-free"):
+        _capture(_store(tmp_path), url=url)
+
+
+def test_full_player_signal_packet_round_trips_raw(tmp_path):
+    from urllib.parse import urlencode
+
+    store = _store(tmp_path)
+    url = 'https://tmapi.transfermarkt.technology/players?' + urlencode(
+        [('ids[]', str(i)) for i in range(1, 301)]
+    )
+    record = _capture(store, url=url)
+    _, loaded = store.load_capture(record.capture_id)
+    assert loaded.url == url
+
+
+@pytest.mark.parametrize('query', [
+    [('ids[]', str(i)) for i in range(1, 302)],
+    [('ids[]', '1'), ('ids[]', '1')],
+    [('ids[]', '1'), ('ids[]', 'not-an-id')],
+    [('ids[]', '1'), ('session', 'secret')],
+    [],
+])
+def test_player_signal_packet_rejects_unsafe_or_unbounded_ids(tmp_path, query):
+    from urllib.parse import urlencode
+
+    url = 'https://tmapi.transfermarkt.technology/players?' + urlencode(query)
+    with pytest.raises(ValueError, match='credential-free'):
         _capture(_store(tmp_path), url=url)
 
 

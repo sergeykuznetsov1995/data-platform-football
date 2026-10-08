@@ -375,6 +375,16 @@ def test_historical_success_is_immutable_and_current_fresh_scope_is_not_due():
     assert plan.mapped_payloads == ()
 
 
+def test_current_registry_query_filters_editions_without_weakening_classification():
+    current = planner.build_promoted_registry_query(current_only=True)
+    default = planner.build_promoted_registry_query()
+    assert 'WHERE e.is_current = TRUE' in current
+    assert 'WHERE e.is_current = TRUE' not in default
+    assert 'WHERE c.classification_status' not in current
+    assert 'c.classification_status' in current
+    assert 'c.active AS competition_active' in current
+
+
 def test_completed_ops_scope_is_not_replanned_due_to_status_drift():
     from dags.scripts import run_transfermarkt_scope_cycle as writer
     from dags.utils import transfermarkt_scope_state as scope_state

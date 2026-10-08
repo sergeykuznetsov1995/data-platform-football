@@ -9,9 +9,11 @@ Silver build is triggered only after every immutable child manifest is green.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
+from functools import wraps
+import time
 import os
 from pathlib import Path
 from typing import Any
@@ -67,6 +69,78 @@ STANDING_POLICY_PATH = (
     '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json'
 )
 STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
+CURRENT_QUALIFICATION_PATH = (
+    Path(__file__).resolve().parent / 'configs/transfermarkt/current_signal_qualification.json'
+)
+CURRENT_STATE_ROOT = Path('/opt/airflow/logs/transfermarkt-native-v2/current')
+
+
+def _current_qualification() -> dict[str, Any] | None:
+    """Enable the signal lane only with the measured, immutable qualification.
+
+    Missing evidence leaves the existing daily lane in place. Invalid evidence
+    is a configuration failure, never permission to weaken the detector.
+    """
+    if not CURRENT_QUALIFICATION_PATH.exists():
+        return None
+    from dags.scripts.run_transfermarkt_current import validate_qualification
+
+    return validate_qualification(json.loads(CURRENT_QUALIFICATION_PATH.read_text()))
+
+
+def _current_schedule():
+    if _current_qualification() is None:
+        return SCHEDULES.get('dag_ingest_transfermarkt', '0 4 * * *')
+    from dags.utils.transfermarkt_current_timetable import TransfermarktCurrentTimetable
+
+    if TransfermarktCurrentTimetable is None:
+        raise RuntimeError('real Airflow timetable support is required for TM current')
+    return TransfermarktCurrentTimetable()
+
+
+def _plan_current_portion(context, registry_rows, preflight, qualification):
+    from dags.utils.transfermarkt_current_timetable import work_deadline
+
+    started = context['dag_run'].start_date
+    if started.tzinfo is None:
+        from datetime import timezone
+        started = started.replace(tzinfo=timezone.utc)
+    cycle = str(context['run_id'])
+    import hashlib
+
+    key = hashlib.sha256(cycle.encode()).hexdigest()
+    job = CURRENT_STATE_ROOT / 'jobs' / f'{key}.json'
+    report = CURRENT_STATE_ROOT / 'reports' / f'{key}.json'
+    from dags.scripts.run_transfermarkt_current import _atomic
+
+    _atomic(job, {
+        # Historical rows are unnecessary for this lane and would duplicate
+        # the entire registry in every short portion's durable job.
+        'registry_rows': [row for row in registry_rows if row.get('is_current') is True],
+        'preflight': preflight,
+        'cycle_id': cycle, 'qualification': qualification,
+        'deadline_at': work_deadline(started).isoformat(),
+    })
+    return [{
+        'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+        'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+        'TM_DAG_ID': 'dag_ingest_transfermarkt', 'TM_RUN_ID': cycle,
+        'TM_WRITE_MODE': str(preflight['write_mode']),
+        'TM_STANDING_POLICY_PATH': STANDING_POLICY_PATH,
+        'TM_CURRENT_JOB': str(job), 'TM_CURRENT_REPORT': str(report),
+    }]
+
+
+def _child_operator_kwargs(environment):
+    """Bound current work without cancelling the retained one-shot path."""
+    return {
+        'env': environment,
+        'execution_timeout': timedelta(
+            minutes=45,
+        ) if environment.get('TM_CURRENT_JOB') else timedelta(
+            seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS,
+        ),
+    }
 # #1389: one paid page through the same gateway lease path as the children
 # before any scope is planned.  A dead pool answers the CONNECT with a pseudo
 # status or a short error page; a real competition start page is well over
@@ -198,7 +272,64 @@ def _probe_gateway_exit(
     }
 
 
-def _preflight_reader_route_for_paid_cycle() -> dict[str, Any]:
+def _planning_now():
+    return datetime.now(timezone.utc)
+
+
+def _planning_monotonic():
+    return time.monotonic()
+
+
+def _bounded_current_planning(function):
+    """Share the qualified DagRun deadline with every planning SQL request."""
+    @wraps(function)
+    def bounded(**context):
+        params = context.get('params') or {}
+        if (params.get('approval_bundles') or params.get('scopes') or params.get('leagues')
+            or not _is_scheduled_run(context) or not _truthy_env(STANDING_POLICY_ENV_GATE)):
+            return function(**context)
+        qualification = _current_qualification()
+        if qualification is None:
+            return function(**context)
+        from dags.utils.transfermarkt_current_timetable import work_deadline, remaining_work_seconds
+        from dags.scripts.run_transfermarkt_current import _bound_connection, _portion_alarm, CurrentPortionError
+        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+        from utils import transfermarkt_native_v2 as tm_v2
+
+        started = context['dag_run'].start_date
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        remaining = remaining_work_seconds(work_deadline(started), _planning_now())
+        if remaining <= 0:
+            raise AirflowFailException('qualified current planning reached the whole DagRun deadline')
+        deadline = _planning_monotonic() + remaining
+        original_connect = tm_v2.connect
+
+        def connect():
+            if _planning_monotonic() >= deadline:
+                raise CurrentPortionError('current planning deadline prohibits another connection')
+            return _bound_connection(original_connect(), deadline, _planning_monotonic)
+
+        try:
+            with _portion_alarm(remaining):
+                tm_v2.connect = connect
+                try:
+                    return function(**{**context, '_tm_current_qualification': qualification})
+                finally:
+                    tm_v2.connect = original_connect
+        except (CurrentPortionError, CurrentPortionDeadlineExceeded) as exc:
+            # AirflowFailException overrides inherited retry delays for this run.
+            raise AirflowFailException('qualified current planning exhausted its whole DagRun deadline') from exc
+        except Exception as exc:
+            # Continuous portions replace delayed task retries in this lane.
+            # A five-minute inherited retry can otherwise hold the DagRun
+            # beyond its shared deadline after an ordinary Trino timeout.
+            raise AirflowFailException('qualified current planning failed; retry in the next portion') from exc
+    return bounded
+
+
+@_bounded_current_planning
+def _preflight_reader_route_for_paid_cycle(**context: Any) -> dict[str, Any]:
     """Pin the live reader revision and inactive slot before any proxy I/O."""
 
     if not _truthy_env('TM_NATIVE_V2_ENABLED'):
@@ -250,7 +381,7 @@ def _description_name(item: Any) -> str:
 
 
 def _read_promoted_registry(
-    *, registry_snapshot_id: str | None = None,
+    *, registry_snapshot_id: str | None = None, current_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Read the exact promoted registry snapshot; never discover implicitly."""
 
@@ -259,6 +390,7 @@ def _read_promoted_registry(
 
     query = build_promoted_registry_query(
         registry_snapshot_id=registry_snapshot_id or None,
+        current_only=current_only,
     )
     conn = tm_v2.connect()
     cur = conn.cursor()
@@ -317,6 +449,7 @@ def _is_scheduled_run(context: Mapping[str, Any]) -> bool:
     return str(context.get('run_id') or '').startswith('scheduled__')
 
 
+@_bounded_current_planning
 def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
     """Build the bounded mapped environments from promoted registry rows."""
 
@@ -379,9 +512,13 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
         )
         approval_mode = 'standing_policy'
 
-    registry_rows = _read_promoted_registry(
-        registry_snapshot_id=str(params.get('registry_snapshot_id') or ''),
-    )
+    qualification = (context.get('_tm_current_qualification') or _current_qualification()) if approval_mode == 'standing_policy' else None
+    registry_options: dict[str, Any] = {'registry_snapshot_id': str(params.get('registry_snapshot_id') or '')}
+    if qualification is not None:
+        registry_options['current_only'] = True
+    registry_rows = _read_promoted_registry(**registry_options)
+    if qualification is not None:
+        return _plan_current_portion(context, registry_rows, preflight, qualification)
     plan = plan_transfermarkt_scopes(
         params,
         parent_cycle_id=str(context['run_id']),
@@ -961,6 +1098,20 @@ def _scope_set_failure_callback(context: Mapping[str, Any]) -> None:
 
 
 def _validate_scope_set(**context: Any) -> dict[str, Any]:
+    environments = context['ti'].xcom_pull(task_ids='plan_exact_scopes') or []
+    current_reports = [item['TM_CURRENT_REPORT'] for item in environments if item.get('TM_CURRENT_REPORT')]
+    if current_reports:
+        if len(current_reports) != 1 or len(environments) != 1:
+            raise AirflowException('current portion must own exactly one sequential writer')
+        report = _load_json_object(current_reports[0], label='current portion report')
+        if report.get('cycle_id') != str(context['run_id']):
+            raise AirflowException('current portion report belongs to another run')
+        if report.get('fatal_error'):
+            raise AirflowException(f"current portion failed: {report['fatal_error']}")
+        # Individual failures remain in the report and durable retry queue.
+        # They cannot erase Bronze commits/checks of successful scopes.
+        report['promotion_ready'] = False
+        return report
     _raise_on_failed_children(context)
     ti = context['ti']
     planned_envs = ti.xcom_pull(task_ids='plan_exact_scopes') or []
@@ -1050,7 +1201,7 @@ with DAG(
     dag_id='dag_ingest_transfermarkt',
     default_args=SCRAPER_ARGS,
     description='Bounded registry-driven Transfermarkt native-v2 ingest',
-    schedule=SCHEDULES.get('dag_ingest_transfermarkt', '0 4 * * *'),
+    schedule=_current_schedule(),
     start_date=datetime(2024, 1, 1),
     catchup=False,
     render_template_as_native_obj=True,
@@ -1144,6 +1295,10 @@ with DAG(
         task_id='run_exact_child_cycle',
         bash_command=r'''set -euo pipefail
 cd /opt/airflow
+if [ -n "${TM_CURRENT_JOB:-}" ]; then
+  exec python dags/scripts/run_transfermarkt_current.py \
+    --job "$TM_CURRENT_JOB" --report "$TM_CURRENT_REPORT"
+fi
 case "$TM_APPROVAL_MODE" in
   standing_policy)
     approval_args=(
@@ -1199,11 +1354,15 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
         # Scopes run strictly serially (max_active_tis_per_dag=1) and runs do
         # not overlap or backfill (max_active_runs=1, catchup=False), so a
         # long worst-case DagRun only delays the next scheduled one.
-        execution_timeout=timedelta(seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS),
         do_xcom_push=False,
         # #1389: one TG per run — validate_scope_set reports the aggregate.
         on_failure_callback=None,
-    ).expand(env=plan_exact_scopes_task.output)
+    ).expand_kwargs(
+        plan_exact_scopes_task.output.map(_child_operator_kwargs),
+        # SCRAPER_ARGS supplies a default execution_timeout. The controlled
+        # per-child mapping must override it for both current and one-shot.
+        strict=False,
+    )
 
     validate_scope_set_task = PythonOperator(
         task_id='validate_scope_set',

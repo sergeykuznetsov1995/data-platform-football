@@ -966,7 +966,7 @@ def _sql_literal(value: str) -> str:
 
 
 def build_promoted_registry_query(
-    *, registry_snapshot_id: str | None = None,
+    *, registry_snapshot_id: str | None = None, current_only: bool = False,
 ) -> str:
     """Build, but never execute, the promoted registry read query."""
 
@@ -1070,6 +1070,7 @@ JOIN promoted p
 LEFT JOIN last_complete_scope s
   ON s.competition_id = c.competition_id
  AND s.edition_id = e.edition_id
+{'WHERE e.is_current = TRUE' if current_only else ''}
 ORDER BY c.competition_id, e.edition_id"""
 
 
