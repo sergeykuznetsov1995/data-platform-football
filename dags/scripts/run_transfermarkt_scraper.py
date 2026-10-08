@@ -3500,6 +3500,10 @@ def _run_entity(
             leagues=[league], seasons=[season], proxy_file=proxy_file,
             retry_budget=retry_budget,
             response_cache=response_cache,
+            resume_squad_cache=(
+                spec.name == ENTITY_PLAYERS and refresh_mode == 'current'
+                and os.environ.get('TM_DAG_ID') == 'dag_ingest_transfermarkt'
+            ),
             cache_ttl_seconds=cache_ttl,
             canonical_season=os.environ.get('TM_CANONICAL_SEASON'),
         ) as scraper:
@@ -4156,6 +4160,10 @@ def _run_entity(
                     results['raw_attempts'] = []
                 else:
                     results['raw_attempts'] = list(raw_attempt_getter())
+                cache_source_getter = getattr(scraper, 'get_cache_source_records', None)
+                results['cache_sources'] = (
+                    list(cache_source_getter()) if cache_source_getter is not None else []
+                )
             except Exception as exc:  # noqa: BLE001 - evidence is mandatory
                 results['errors'].append(
                     'raw attempt evidence export failed: '

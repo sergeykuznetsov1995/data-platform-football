@@ -83,3 +83,28 @@ hard-cap tests in `test_transfermarkt_traffic.py`, commit/checkpoint ordering an
 next-run selection in `test_run_transfermarkt_scraper.py`, and scope coverage
 evidence in `test_run_transfermarkt_scope_cycle.py`. Scheduled production ingest
 after automatic delivery remains the runtime acceptance check.
+
+## Current full-roster continuation
+
+The current ingest `players` runner may reuse verified `squad` pages from a
+previous child cycle for at most 48 hours from their original response time.
+The next cycle fetches participant listings again and uses only squads named
+by that listing. URL, scope, raw body/hash and the immutable attempt chain
+must agree. Cache hits never extend response age. Existing 24-hour entries
+can be reused within this physical age bound without rewriting their proofs.
+
+Prior-cycle envelopes are reported as `cache_sources`, separately from this
+cycle's `raw_attempts` and paid traffic. Rows retain the original `fetched_at`;
+schemas and natural keys are unchanged. A budget failure still blocks writes
+and successful completion; the saved pages let a later scheduled run finish
+the full roster under the same decoded, provider and request caps. Historical,
+force, other entities and default client behavior retain strict cycle binding.
+Current ingest checkpoints pin `verified-squad-48h-v1`.
+
+Offline evidence: `test_transfermarkt_squad_resume.py` replays BRC/2025's exact
+16,933,131-byte / 105-request failure, then completes all 126 clubs with 101
+cache hits and 27 new requests. It also checks lineage, expiry, scope/URL
+binding, changed participants, full bio fields and multi-club memberships.
+Runtime acceptance remains a complete scheduled roster capture and green
+parent validation after automatic delivery; a cold attempt may remain failed
+until its scheduled continuation succeeds.

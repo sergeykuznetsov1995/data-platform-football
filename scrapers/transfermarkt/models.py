@@ -145,6 +145,12 @@ MAX_ROSTER_WINDOW = 500
 CAREER_WINDOW_POLICY_VERSION = 'decoded-soft-stop-75-v1'
 """Current-refresh admission policy pinned by scope checkpoints."""
 
+CURRENT_SQUAD_CACHE_POLICY_VERSION = 'verified-squad-48h-v1'
+"""Current players may finish a full roster from verified prior-cycle squads."""
+
+CURRENT_SQUAD_CACHE_TTL_SECONDS = 48 * 60 * 60
+"""Maximum physical response age for current squad continuation."""
+
 PROVIDER_GRANT_ENV_VAR = 'TM_PROVIDER_BYTE_BUDGET'
 """Per-entity provider-byte grant the runner exports to its client."""
 

@@ -18,10 +18,12 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import asdict, replace
+from datetime import datetime
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from scrapers.transfermarkt.models import (
+    CURRENT_SQUAD_CACHE_TTL_SECONDS,
     PROVIDER_GRANT_ENV_VAR,
     PROVIDER_GRANT_FLOOR_BYTES,
     PROVIDER_GRANT_SOFT_MARGIN_BYTES,
@@ -590,6 +592,7 @@ class TransfermarktHttpClient:
         lease_metadata: Optional[Mapping[str, Any]] = None,
         lease_ttl_seconds: int = 300,
         cache: Optional[MutableMapping[str, Mapping[str, Any]]] = None,
+        resume_squad_cache: bool = False,
         raw_store: Optional[RawResponseStore] = None,
         require_raw_store: Optional[bool] = None,
         rate_limiter=None,
@@ -628,6 +631,7 @@ class TransfermarktHttpClient:
         self._lease_provider_bytes = 0
         self._lease_acquired_at: Optional[float] = None
         self._cache = cache
+        self._resume_squad_cache = bool(resume_squad_cache)
         if require_raw_store is None:
             require_raw_store = os.environ.get(
                 "TRANSFERMARKT_REQUIRE_RAW_STORE", "false"
@@ -640,6 +644,7 @@ class TransfermarktHttpClient:
             raise RawStoreError("Transfermarkt raw store is required")
         self._raw_captures: dict[str, RawCaptureRecord] = {}
         self._raw_attempt_envelopes: dict[str, RawAttemptEnvelopeRecord] = {}
+        self._cache_sources: dict[str, RawAttemptEnvelopeRecord] = {}
         self._rate_limiter = rate_limiter
         self.timeout_seconds = float(timeout_seconds)
         self._circuit_failures = int(circuit_failures)
@@ -1376,7 +1381,7 @@ class TransfermarktHttpClient:
 
         response_envelopes = {
             record.capture_id: record
-            for record in self._raw_attempt_envelopes.values()
+            for record in (*self._cache_sources.values(), *self._raw_attempt_envelopes.values())
             if record.capture_id is not None
         }
         return tuple(
@@ -1399,6 +1404,10 @@ class TransfermarktHttpClient:
             asdict(record)
             for _, record in sorted(self._raw_attempt_envelopes.items())
         )
+
+    def get_cache_source_records(self) -> tuple[dict[str, Any], ...]:
+        """Prior-cycle evidence used as input, never a new physical attempt."""
+        return tuple(asdict(record) for _, record in sorted(self._cache_sources.items()))
 
     @staticmethod
     def _host(url: str) -> str:
@@ -1579,6 +1588,9 @@ class TransfermarktHttpClient:
         cache_key: Optional[str],
         *,
         as_json: bool,
+        label: str = 'endpoint',
+        context: Optional[Mapping[str, Any]] = None,
+        url: Optional[str] = None,
     ) -> Optional[FetchOutcome[Any]]:
         if self._cache is None or not cache_key:
             return None
@@ -1587,7 +1599,10 @@ class TransfermarktHttpClient:
             return None
         try:
             expires_at = float(raw["expires_at"])
-            if expires_at <= self._time():
+            resume_squad = self._resume_squad_cache and label == 'squad' and not as_json
+            # Existing 24h entries migrate by their immutable response age.
+            # No cache hit extends that age or rewrites a raw record.
+            if expires_at <= self._time() and not resume_squad:
                 self._cache.pop(cache_key, None)
                 return None
             outcome_raw = raw["outcome"]
@@ -1595,7 +1610,9 @@ class TransfermarktHttpClient:
                 raise ValueError("cached outcome is not an object")
             checkpoint_version = int(outcome_raw.get("version", -1))
             outcome = FetchOutcome.from_checkpoint(outcome_raw)
-            if self._require_raw_store and not outcome.raw_capture_id:
+            if (self._require_raw_store or resume_squad) and (
+                not outcome.raw_capture_id or self._raw_store is None
+            ):
                 # Pre-raw caches are deliberately retired.  They cannot prove
                 # where their decoded value came from.
                 self._cache.pop(cache_key, None)
@@ -1611,11 +1628,9 @@ class TransfermarktHttpClient:
                         raise RawStoreError(
                             "cached Transfermarkt value differs from raw replay"
                         )
-                    self._raw_captures[record.capture_id] = record
                     loaded_envelopes: list[RawAttemptEnvelopeRecord] = []
                     for envelope_id in outcome.raw_attempt_envelope_ids:
                         envelope = self._raw_store.load_attempt_envelope(envelope_id)
-                        self._raw_attempt_envelopes[envelope.envelope_id] = envelope
                         loaded_envelopes.append(envelope)
                     if not loaded_envelopes:
                         # Read-compatible migration for successful v3
@@ -1629,7 +1644,6 @@ class TransfermarktHttpClient:
                         envelope = self._raw_store.load_attempt_envelope(
                             envelope.envelope_id
                         )
-                        self._raw_attempt_envelopes[envelope.envelope_id] = envelope
                         loaded_envelopes.append(envelope)
                     if checkpoint_version == 4:
                         if len(loaded_envelopes) != outcome.attempts:
@@ -1653,19 +1667,42 @@ class TransfermarktHttpClient:
                     expected_child_cycle = os.environ.get(
                         "TM_CHILD_CYCLE_ID", ""
                     ).strip()
-                    if expected_child_cycle and any(
+                    prior_cycle = bool(expected_child_cycle) and any(
                         envelope.cycle_id != expected_child_cycle
                         for envelope in loaded_envelopes
-                    ):
+                    )
+                    if resume_squad:
+                        _, expected_scope = self._raw_attempt_identity(
+                            label=label, context=context or {},
+                        )
+                        fetched_at = datetime.fromisoformat(record.fetched_at.replace('Z', '+00:00'))
+                        age = self._time() - fetched_at.timestamp()
+                        if (
+                            not expected_child_cycle
+                            or expected_scope == 'global'
+                            or fetched_at.utcoffset() is None
+                            or not 0 <= age < CURRENT_SQUAD_CACHE_TTL_SECONDS
+                            or record.scope_id != expected_scope
+                            or record.url != cache_key
+                            or record.url != url
+                            or record.endpoint != 'squad'
+                            or outcome.label != 'squad'
+                            or record.status_code != 200
+                            or any(
+                                envelope.scope_id != record.scope_id
+                                or envelope.url != record.url
+                                or envelope.endpoint != record.endpoint
+                                or envelope.cycle_id != record.cycle_id
+                                for envelope in loaded_envelopes
+                            )
+                        ):
+                            self._cache.pop(cache_key, None)
+                            return None
+                    if prior_cycle and not resume_squad:
                         # The URL-keyed cache may outlive one daily/backfill
                         # cycle.  Its bytes remain valid raw history, but they
                         # are not evidence for this exact physical attempt.
                         self._cache.pop(cache_key, None)
-                        self._raw_captures.pop(record.capture_id, None)
-                        for envelope in loaded_envelopes:
-                            self._raw_attempt_envelopes.pop(
-                                envelope.envelope_id, None
-                            )
                         return None
                     final_envelope = loaded_envelopes[-1]
                     if (
@@ -1675,6 +1712,10 @@ class TransfermarktHttpClient:
                         raise RawStoreError(
                             "cached final attempt envelope differs from raw capture"
                         )
+                    self._raw_captures[record.capture_id] = record
+                    evidence = self._cache_sources if prior_cycle else self._raw_attempt_envelopes
+                    for envelope in loaded_envelopes:
+                        evidence[envelope.envelope_id] = envelope
                     outcome = replace(
                         outcome,
                         value=replayed,
@@ -1748,7 +1789,9 @@ class TransfermarktHttpClient:
 
         context = dict(context or {})
         cache_started = self._monotonic()
-        cached = self._load_cached_outcome(cache_key, as_json=as_json)
+        cached = self._load_cached_outcome(
+            cache_key, as_json=as_json, label=label, context=context, url=url,
+        )
         if cached is not None:
             duration = self._monotonic() - cache_started
             self._record_cache_hit(label=label, duration_seconds=duration)
