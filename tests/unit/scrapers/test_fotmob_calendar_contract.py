@@ -226,6 +226,20 @@ def test_payload_membership_follows_calendar_with_independent_batch_ids():
     assert db.current("fotmob_match_payloads") == [("10618", "2026", "1")]
 
 
+def test_calendar_batch_presence_handles_duplicate_and_null_physical_batch_keys():
+    db = CurrentSQL()
+    db.manifest("01-good")
+    db.rows("01-good", [1, 1, 2])
+    db.rows(None, [99])
+    db.manifest("02-empty")
+    repo = FotMobRepository(writer=db)
+    repo.ensure_current_views()
+    assert db.current() == [("10618", "2026", "1"), ("10618", "2026", "2")]
+    db.manifest("03-removed", status="not_available")
+    repo.ensure_current_views()
+    assert db.current() == []
+
+
 def test_known_match_lookup_uses_committed_physical_history_not_poisoned_current():
     db = CurrentSQL()
     db.manifest("01-good", version=LEGACY_PARSER_VERSION)

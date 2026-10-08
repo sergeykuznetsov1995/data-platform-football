@@ -2044,10 +2044,15 @@ class FotMobRepository:
                     # Rank only physically nonempty calendar batches or explicit
                     # tombstones. Never rank *after* joining physical rows: that
                     # would resurrect a snapshot hidden by a later tombstone.
+                    # Trino removes a plain DISTINCT in this semi-join, which can
+                    # broadcast every physical match row. The HAVING predicate
+                    # keeps batch-key aggregation before the exchange (#1288).
                     calendar_filter = f"""
                           AND (status = 'not_available' OR batch_id IN (
-                              SELECT DISTINCT _target_batch_id
+                              SELECT _target_batch_id
                               FROM {self.catalog}.{self.schema}.fotmob_matches
+                              GROUP BY _target_batch_id
+                              HAVING count(*) > 0
                           ))
                     """
                 if table in REPLACE_TARGET_CURRENT_TABLES:
