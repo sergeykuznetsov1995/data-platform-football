@@ -92,6 +92,10 @@ jobs:
             scripts/purge_sofascore_manifest_observations.py \
             scripts/sofascore_capture_manifest_guard_v1.py \
             scripts/sofascore_runtime_preflight.py \
+            deploy/sofascore/pipeline_watchdog.py \
+            deploy/sofascore/pipeline_metrics.py \
+            deploy/sofascore/pipeline_issues.py \
+            scripts/research/replay_sofascore_watchdog.py \
             scripts/proxy_filter
           python -m compileall -q \
             scrapers/sofascore dags/scripts dags/utils scripts/proxy_filter \
@@ -126,6 +130,7 @@ jobs:
             tests/unit/deploy/test_sofascore_deploy_script.py \
             tests/unit/deploy/test_sofascore_gateway_lease_watchdog.py \
             tests/unit/deploy/test_sofascore_gateway_probe_load.py \
+            tests/unit/deploy/test_sofascore_pipeline_watchdog.py \
             tests/unit/dq/test_sofascore_dq.py \
             tests/unit/scrapers/test_run_sofascore_discovery.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
