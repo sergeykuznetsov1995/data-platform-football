@@ -24,10 +24,10 @@ from typing import Any, Callable, Mapping, Sequence
 sys.dont_write_bytecode = True
 
 try:  # package import in tests / ``python -m``
-    from scripts.fotmob_acceptance import QueryClient, connect_from_env, load_trino_env
+    from scripts.fotmob_acceptance import QueryClient, TrinoQueryClient, connect_from_env, load_trino_env
     from scripts import fotmob_runtime as runtime_binding
 except ModuleNotFoundError:  # direct ``python scripts/fotmob_cleanup.py``
-    from fotmob_acceptance import QueryClient, connect_from_env, load_trino_env
+    from fotmob_acceptance import QueryClient, TrinoQueryClient, connect_from_env, load_trino_env
     import fotmob_runtime as runtime_binding
 
 
@@ -199,6 +199,7 @@ def build_plan(
     schema: str,
     older_than_hours: int,
     clock: Callable[[], datetime] = _now_dt,
+    isolated_stack: bool = False,
 ) -> dict[str, Any]:
     if older_than_hours < 1:
         raise CleanupError("--older-than-hours must be at least 1")
@@ -234,6 +235,23 @@ def build_plan(
                 "action": "drop_table",
             }
         )
+
+    if isolated_stack:
+        return {
+            "schema_version": "fotmob-cleanup-plan-v1",
+            "mode": "isolated_staging_only",
+            "generated_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=24)).isoformat(),
+            "older_than_hours": older_than_hours,
+            "catalog": catalog,
+            "schema": schema,
+            "dry_run": True,
+            "staging_targets": staging,
+            "rejected_candidates": rejected,
+            "dynamic_catalog_evidence_action": "retain",
+            "dynamic_catalog_evidence_objects": sorted(PRESERVED_DYNAMIC_CATALOG_EVIDENCE),
+            "inventory_compaction": {"source_table": INVENTORY, "action": "retain"},
+        }
 
     inventory_columns = _columns(
         client, catalog=catalog, schema=schema, table=INVENTORY
@@ -427,7 +445,9 @@ def _quiesce_isolated_scheduler(
     }
 
 
-def _validate_plan_shape(plan: Mapping[str, Any], *, clock: Callable[[], datetime]) -> None:
+def _validate_plan_shape(
+    plan: Mapping[str, Any], *, clock: Callable[[], datetime], isolated_stack: bool = False
+) -> None:
     if plan.get("schema_version") != "fotmob-cleanup-plan-v1":
         raise CleanupError("unsupported cleanup plan schema")
     now = clock().astimezone(timezone.utc)
@@ -476,6 +496,21 @@ def _validate_plan_shape(plan: Mapping[str, Any], *, clock: Callable[[], datetim
         raise CleanupError("inventory plan does not target the canonical table")
     if inventory.get("source_table") in PRESERVED_DYNAMIC_CATALOG_EVIDENCE:
         raise CleanupError("cleanup plan targets preserved dynamic catalog/evidence")
+    if isolated_stack:
+        if plan.get("mode") != "isolated_staging_only" or dict(inventory) != {
+            "source_table": INVENTORY, "action": "retain"
+        }:
+            raise CleanupError("isolated cleanup accepts staging-only plans; inventory must be retained")
+        hours = plan.get("older_than_hours")
+        if type(hours) is not int or hours < 1:
+            raise CleanupError("isolated plan misses a valid reviewed age threshold")
+        cutoff = generated_at - timedelta(hours=hours)
+        for target in targets:
+            if _timestamp(target.get("last_snapshot_at")) > cutoff:
+                raise CleanupError("staging target is newer than reviewed age cutoff")
+        return
+    if plan.get("mode") == "isolated_staging_only":
+        raise CleanupError("isolated staging plan requires --isolated-stack")
     action = inventory.get("action")
     if action not in {"none", "shadow_swap"}:
         raise CleanupError("inventory plan contains an unsupported action")
@@ -1092,6 +1127,343 @@ def _load_pending_journal(
     return payload
 
 
+ISOLATED_RUNTIME_ROOTS = (
+    "dags", "scrapers", "scripts", "configs/medallion", "configs/fotmob"
+)
+ISOLATED_BINDING_KEYS = (
+    "FOTMOB_ISOLATED_STACK", "ALERT_ENV", "FOTMOB_WRITER_LOCK",
+    "FOTMOB_DEPLOYMENT_REPORT_PATH", "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH",
+    "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", "AIRFLOW__CORE__SQL_ALCHEMY_CONN",
+    "FBREF_CONTROL_DB_URI", "CONTROL_DB_URI", *sorted(runtime_binding.TRINO_ENV_KEYS),
+)
+
+
+def _binding_digest(env: Mapping[str, str]) -> str:
+    return hashlib.sha256(json.dumps(
+        {key: env.get(key, "") for key in ISOLATED_BINDING_KEYS}, sort_keys=True
+    ).encode()).hexdigest()
+
+
+def _require_isolated_environment(env: Mapping[str, str]) -> None:
+    from urllib.parse import urlsplit
+    if env.get("FOTMOB_ISOLATED_STACK") != "1" or env.get("ALERT_ENV") != "fotmob-isolated":
+        raise CleanupError("scheduler is not the explicit isolated FotMob stack")
+    if any(env.get(key, "").strip() for key in (
+        "FOTMOB_DEPLOYMENT_REPORT_PATH", "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
+    )):
+        raise CleanupError("isolated cleanup requires a ceremony-free scheduler")
+    if env.get("FOTMOB_WRITER_LOCK", "1").strip().casefold() in {"0", "false", "no"}:
+        raise CleanupError("isolated cleanup cannot disable the writer lock")
+    if not env.get("TRINO_HOST", "").strip():
+        raise CleanupError("isolated scheduler has no Trino binding")
+    uri = env.get("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", "").strip()
+    parsed = urlsplit(uri)
+    if (parsed.scheme not in {"postgresql+psycopg2", "postgresql+psycopg", "postgresql", "postgres"}
+        or parsed.hostname != "fotmob-airflow-metadb" or parsed.port not in {None, 5432}
+        or parsed.path != "/airflow"):
+        raise CleanupError("isolated scheduler must use its own metadata DB")
+
+
+def _attest_isolated_host(args: argparse.Namespace, *, run: Callable[..., Any]) -> dict[str, Any]:
+    container = runtime_binding._inspect_container(args.scheduler_container_id, run=run)
+    labels = (container.get("Config") or {}).get("Labels") or {}
+    if (container.get("Id") != args.scheduler_container_id
+        or labels.get("com.docker.compose.project") != args.project
+        or labels.get("com.docker.compose.service") != "airflow-scheduler"
+        or container.get("Name") != "/fotmob-airflow-scheduler"
+        or not (container.get("State") or {}).get("Running")):
+        raise CleanupError("live isolated scheduler container identity mismatch")
+    env = runtime_binding._parsed_environment(container)
+    _require_isolated_environment(env)
+    root = args.release_root.resolve()
+    mounts = container.get("Mounts") or ()
+    for relative in ISOLATED_RUNTIME_ROOTS:
+        destination = "/opt/airflow/" + relative
+        matches = [item for item in mounts if item.get("Destination") == destination]
+        if (len(matches) != 1 or matches[0].get("Type") != "bind"
+            or matches[0].get("RW") is not False
+            or Path(str(matches[0].get("Source"))).resolve() != root / relative):
+            raise CleanupError(f"isolated readonly runtime mount mismatch: {destination}")
+    # Reject overlays of tracked code. The external .airflowignore is the sole
+    # admitted nested file bind in the ceremony-free recipe.
+    for item in mounts:
+        destination = str(item.get("Destination", ""))
+        if destination == "/opt/airflow/dags/.airflowignore":
+            if item.get("Type") != "bind" or item.get("RW") is not False:
+                raise CleanupError("isolated DAG ignore mount must be readonly")
+            continue
+        if any(destination.startswith("/opt/airflow/" + relative + "/")
+               for relative in ISOLATED_RUNTIME_ROOTS):
+            raise CleanupError("isolated runtime contains an unexpected nested mount")
+    def git(*arguments: str) -> str:
+        return run(("git", "-C", str(root), *arguments), check=True,
+                   capture_output=True, text=True).stdout
+    if git("rev-parse", "HEAD").strip() != args.release_sha:
+        raise CleanupError("isolated runtime SHA differs from --release-sha")
+    if git("status", "--porcelain").strip():
+        raise CleanupError("isolated runtime checkout is dirty")
+    ignored = git("ls-files", "--others", "--ignored", "--exclude-standard", "--", *ISOLATED_RUNTIME_ROOTS)
+    if any(line and not runtime_binding._is_generated_bytecode_path(line)
+           for line in ignored.splitlines()):
+        raise CleanupError("isolated runtime contains ignored untracked code")
+    manifest = {}
+    for line in git("ls-tree", "-r", "HEAD", "--", *ISOLATED_RUNTIME_ROOTS).splitlines():
+        metadata, relative = line.split("\t", 1)
+        mode, kind, blob = metadata.split()
+        path = root / relative
+        if mode not in {"100644", "100755"} or kind != "blob" or path.is_symlink():
+            raise CleanupError("isolated runtime contains unsupported tracked objects")
+        content = path.read_bytes()
+        if hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() != blob:
+            raise CleanupError("isolated runtime bytes differ from reviewed Git SHA")
+        manifest["/opt/airflow/" + relative] = hashlib.sha256(content).hexdigest()
+    if "/opt/airflow/scripts/fotmob_cleanup.py" not in manifest:
+        raise CleanupError("isolated release does not contain cleanup implementation")
+    return {
+        "scheduler_container_id": args.scheduler_container_id,
+        "git_sha": args.release_sha, "manifest": manifest,
+        "binding_digest": _binding_digest(env),
+        "hostname": str((container.get("Config") or {}).get("Hostname", "")),
+    }
+
+
+def _attest_isolated_process(identity: Mapping[str, Any]) -> None:
+    import socket
+    _require_isolated_environment(os.environ)
+    if not identity.get("hostname") or socket.gethostname() != identity["hostname"]:
+        raise CleanupError("cleanup process is not in the attested scheduler")
+    if _binding_digest(os.environ) != identity["binding_digest"]:
+        raise CleanupError("isolated scheduler Trino or lock binding changed")
+    for path, expected in identity["manifest"].items():
+        if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
+            raise CleanupError("container-visible runtime bytes differ from reviewed SHA")
+
+
+def _isolated_activity(client: QueryClient) -> dict[str, Any]:
+    from airflow.models import DagRun, TaskInstance
+    from airflow.settings import Session
+    from sqlalchemy import text
+    session = Session()
+    try:
+        session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+        runs = session.query(DagRun.dag_id).filter(
+            DagRun.dag_id.like("%fotmob%"), DagRun.state.in_(("queued", "running"))
+        ).all()
+        tasks = session.query(TaskInstance.dag_id).filter(
+            TaskInstance.dag_id.like("%fotmob%"),
+            TaskInstance.state.in_(("queued", "running", "restarting", "scheduled", "deferred", "up_for_retry", "up_for_reschedule"))
+        ).all()
+        session.commit()
+    finally:
+        session.close()
+    if runs or tasks:
+        raise CleanupError("isolated scheduler has active FotMob runs or tasks")
+    writes = client.query("""-- cleanup:active-writes
+        SELECT query_id FROM system.runtime.queries
+        WHERE state NOT IN ('FINISHED', 'FAILED')
+          AND regexp_like(lower(query), '\\b(insert|create|drop|alter|merge|delete)\\b')
+          AND lower(query) LIKE '%fotmob%'
+          AND query NOT LIKE '%cleanup:active-writes%'
+    """)
+    if writes:
+        raise CleanupError("Trino has active FotMob writes")
+    nodes = _isolated_trino_nodes(client)
+    return {"active_runs": [], "active_task_instances": [], "active_writes": [],
+            "trino_nodes": nodes, "scheduler_bound_client": True}
+
+
+def _isolated_trino_nodes(client: QueryClient) -> list[list[str]]:
+    nodes = client.query("SELECT node_id, http_uri FROM system.runtime.nodes ORDER BY node_id")
+    if not nodes:
+        raise CleanupError("isolated scheduler Trino node identity is unavailable")
+    if any(len(row) != 2 or not all(isinstance(value, str) and value for value in row)
+           for row in nodes) or len({row[0] for row in nodes}) != len(nodes):
+        raise CleanupError("isolated scheduler Trino node identity is invalid")
+    return [list(row) for row in nodes]
+
+
+class _LeaseQueryClient:
+    """Keep the PostgreSQL authority live while a Trino request is running."""
+
+    def __init__(self, client: Any, lease: Any):
+        self.client, self.lease = client, lease
+
+    def query(self, sql: str) -> list[tuple[Any, ...]]:
+        self.lease.check()
+        cursor = self.client.connection.cursor()
+        try:
+            with self.lease.watch(cursor.cancel):
+                cursor.execute(sql)
+                result = list(cursor.fetchall())
+            self.lease.check()
+            return result
+        finally:
+            cursor.close()
+
+
+def execute_isolated_plan(client: QueryClient, plan: Mapping[str, Any], *,
+                          lease: Any, clock: Callable[[], datetime] = _now_dt,
+                          before_mutation: Callable[[], None] | None = None) -> dict[str, Any]:
+    _validate_plan_shape(plan, clock=clock, isolated_stack=True)
+    lease.check()
+    catalog, schema = str(plan["catalog"]), str(plan["schema"])
+    preflight = []
+    for target in plan["staging_targets"]:
+        name = str(target["table"])
+        absent = not _table_exists(client, catalog=catalog, schema=schema, table=name)
+        if not absent:
+            current = _table_state(client, catalog=catalog, schema=schema, table=name)
+            expected = {"row_count": int(target["row_count"]), "snapshot_id": str(target["snapshot_id"]),
+                        "last_snapshot_at": _timestamp(target["last_snapshot_at"]).isoformat()}
+            if current != expected:
+                raise CleanupError(f"{name}: metadata changed after plan review")
+        preflight.append((target, absent))
+    lease.check()
+    dropped = []
+    for target, absent in preflight:
+        lease.check()
+        if not absent:
+            if before_mutation is not None:
+                before_mutation()
+            lease.check()
+            client.query(f"DROP TABLE {_qualified(catalog, schema, str(target['table']))}")
+        dropped.append({"table": target["table"], "row_count": int(target["row_count"]),
+                        "already_absent": absent})
+    lease.check()
+    return {"schema_version": "fotmob-cleanup-execution-v1", "mode": "isolated_staging_only",
+            "generated_at": clock().astimezone(timezone.utc).isoformat(), "passed": True,
+            "phase": "complete", "dropped_staging": dropped,
+            "inventory_compaction": {"source_table": INVENTORY, "action": "retain"},
+            "dynamic_catalog_evidence_action": "retain",
+            "dynamic_catalog_evidence_objects": sorted(PRESERVED_DYNAMIC_CATALOG_EVIDENCE)}
+
+
+def _connect_isolated_from_env(*, catalog: str, schema: str) -> QueryClient:
+    """No hidden POST replay; every query/cancellation has bounded network IO."""
+    import trino.dbapi
+    from trino.auth import BasicAuthentication
+
+    host = os.environ.get("TRINO_HOST", "").strip()
+    if not host:
+        raise CleanupError("TRINO_HOST is required")
+    password = os.environ.get("TRINO_PASSWORD", "")
+    user = os.environ.get("TRINO_USER", "airflow").strip()
+    options: dict[str, Any] = {
+        "host": host, "port": int(os.environ.get("TRINO_PORT", "8443")),
+        "user": user, "catalog": catalog, "schema": schema,
+        "http_scheme": os.environ.get("TRINO_HTTP_SCHEME", "https").strip(),
+        "verify": os.environ.get("TRINO_TLS_VERIFY", "true").lower() not in {"0", "false", "no"},
+        "max_attempts": 1, "request_timeout": (3.0, 5.0),
+    }
+    if password:
+        options["auth"] = BasicAuthentication(user, password)
+    return TrinoQueryClient(trino.dbapi.connect(**options))
+
+
+def _run_isolated_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Runs only through Docker exec in the attested live scheduler."""
+    _attest_isolated_process(request["identity"])
+    client = _connect_isolated_from_env(catalog=request["catalog"], schema=request["schema"])
+    try:
+        if request["command"] == "plan":
+            report = build_plan(client, catalog=request["catalog"], schema=request["schema"],
+                                older_than_hours=request["older_than_hours"], isolated_stack=True,
+                                clock=_now_dt)
+            report["data_plane_identity"] = _isolated_trino_nodes(client)
+            report["passed"] = True
+        elif request["command"] == "execute":
+            plan_bytes = request["plan_text"].encode("utf-8")
+            if hashlib.sha256(plan_bytes).hexdigest() != request["plan_sha256"]:
+                raise CleanupError("scheduler received a different reviewed plan SHA-256")
+            plan = json.loads(plan_bytes)
+            if plan.get("catalog") != request["catalog"] or plan.get("schema") != request["schema"]:
+                raise CleanupError("scheduler plan catalog/schema mismatch")
+            expected_runtime = {"scheduler_container_id": request["identity"]["scheduler_container_id"],
+                                "git_sha": request["identity"]["git_sha"],
+                                "binding_digest": request["identity"]["binding_digest"],
+                                "runtime_bytes_verified": True, "scheduler_bound_client": True}
+            if plan.get("isolated_runtime") != expected_runtime:
+                raise CleanupError("reviewed plan belongs to a different isolated runtime")
+            from dags.scripts import run_fotmob_scraper as runner
+            with runner._writer_lock() as lease:
+                if not lease or not callable(getattr(lease, "check", None)):
+                    raise CleanupError("isolated cleanup requires a live writer lease")
+                lease.check()
+                _attest_isolated_process(request["identity"])
+                guarded = _LeaseQueryClient(client, lease)
+                before = _isolated_activity(guarded)
+                if not before.get("trino_nodes") or before["trino_nodes"] != plan.get("data_plane_identity"):
+                    raise CleanupError("reviewed plan Trino nodes differ from live scheduler binding")
+                report = execute_isolated_plan(
+                    guarded, plan, lease=lease, clock=_now_dt,
+                    before_mutation=lambda: _attest_isolated_process(request["identity"]),
+                )
+                _attest_isolated_process(request["identity"])
+                report["writer_quiescence_before"] = before
+                report["writer_quiescence_after"] = _isolated_activity(guarded)
+                lease.check()
+                report["plan_sha256"] = request["plan_sha256"]
+        else:
+            raise CleanupError("unsupported isolated cleanup request")
+        report["isolated_runtime"] = {
+            "scheduler_container_id": request["identity"]["scheduler_container_id"],
+            "git_sha": request["identity"]["git_sha"], "runtime_bytes_verified": True,
+            "binding_digest": request["identity"]["binding_digest"],
+            "scheduler_bound_client": True,
+        }
+        return report
+    finally:
+        client.close()
+
+
+def _isolated_request(args: argparse.Namespace, *, run: Callable[..., Any]) -> dict[str, Any]:
+    if args.pause_evidence or args.deployment_report or args.trino_env_file:
+        raise CleanupError("isolated cleanup uses scheduler bindings, without ceremony or host Trino overrides")
+    if args.project != "fotmob-airflow" or not args.release_root:
+        raise CleanupError("isolated cleanup requires fotmob-airflow and --release-root")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.scheduler_container_id):
+        raise CleanupError("isolated cleanup requires exact --scheduler-container-id")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.release_sha):
+        raise CleanupError("isolated cleanup requires exact --release-sha")
+    request = {"command": args.command, "catalog": args.catalog, "schema": args.schema,
+               "older_than_hours": args.older_than_hours}
+    if args.command == "execute":
+        if not args.plan or args.confirm != CONFIRM_EXECUTE:
+            raise CleanupError("isolated execute requires --plan and reviewed confirmation")
+        plan_bytes = args.plan.read_bytes()
+        actual_sha = hashlib.sha256(plan_bytes).hexdigest()
+        if actual_sha != args.plan_sha256.lower():
+            raise CleanupError(f"reviewed plan SHA-256 mismatch: expected {actual_sha}")
+        plan = json.loads(plan_bytes)
+        if plan.get("catalog") != args.catalog or plan.get("schema") != args.schema:
+            raise CleanupError("CLI catalog/schema do not match reviewed plan")
+        _validate_plan_shape(plan, clock=_now_dt, isolated_stack=True)
+        request.update(plan_text=plan_bytes.decode("utf-8"), plan_sha256=actual_sha)
+    request["identity"] = _attest_isolated_host(args, run=run)
+    # Verify the exact runtime bytes before importing its cleanup module. The
+    # imported implementation repeats this proof under the same writer lease.
+    code = """import hashlib,json,sys
+sys.dont_write_bytecode = True
+sys.pycache_prefix = '/dev/null/fotmob-cleanup'
+r=json.load(sys.stdin)
+for p,h in r['identity']['manifest'].items():
+    if hashlib.sha256(open(p,'rb').read()).hexdigest()!=h:
+        raise RuntimeError('container runtime bytes mismatch before cleanup import')
+sys.path.insert(0,'/opt/airflow')
+from scripts.fotmob_cleanup import _run_isolated_request
+print('FOTMOB_ISOLATED_CLEANUP_JSON='+json.dumps(_run_isolated_request(r),sort_keys=True,default=str))
+"""
+    output = run(("docker", "exec", "-i", args.scheduler_container_id, "python", "-c", code),
+                 input=json.dumps(request), check=True, capture_output=True, text=True).stdout
+    marker = "FOTMOB_ISOLATED_CLEANUP_JSON="
+    reports = [json.loads(line[len(marker):]) for line in output.splitlines() if line.startswith(marker)]
+    if len(reports) != 1 or not isinstance(reports[0], dict):
+        raise CleanupError("isolated scheduler did not return one cleanup report")
+    if _attest_isolated_host(args, run=run) != request["identity"]:
+        raise CleanupError("isolated scheduler identity changed during cleanup")
+    return reports[0]
+
+
 def build_parser() -> argparse.ArgumentParser:
     default_compose = Path(__file__).resolve().parents[1] / "deploy/fotmob/airflow.compose.yaml"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1103,6 +1475,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compose-file", type=Path, default=default_compose)
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--deployment-report", type=Path)
+    parser.add_argument("--isolated-stack", action="store_true", help="Scheduler-bound, ceremony-free staging cleanup only")
+    parser.add_argument("--scheduler-container-id", default="", help="Exact live isolated scheduler 64-hex container ID")
+    parser.add_argument("--release-root", type=Path, help="Exact readonly mounted Git release tree")
     parser.add_argument(
         "--release-sha",
         default="",
@@ -1131,7 +1506,9 @@ def main(
     client: QueryClient | None = None
     pending_report: dict[str, Any] | None = None
     try:
-        if args.command == "plan":
+        if args.isolated_stack:
+            report = _isolated_request(args, run=run)
+        elif args.command == "plan":
             if args.trino_env_file:
                 load_trino_env(args.trino_env_file)
             client = client_factory(catalog=args.catalog, schema=args.schema)

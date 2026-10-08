@@ -49,6 +49,7 @@ from scrapers.fotmob.domain import (
     ScopeDecision,
 )
 from scrapers.fotmob.planner import ScopeAttemptState
+from scrapers.fotmob.row_identity import OBSERVATION_COLUMNS, row_multiset
 
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,7 @@ class ManifestStatus(str, Enum):
     EXCLUDED = "excluded"
     REVIEW_REQUIRED = "review_required"
     SCHEMA_DRIFT = "schema_drift"
+    INTERRUPTED = "interrupted"
 
 
 SUCCESS_STATES = frozenset(
@@ -919,6 +921,10 @@ class FotMobRepository:
         # resurrected after a proven source absence.
         self._pending_raw_entities: dict[tuple[str, str], dict[str, Any]] = {}
         self._pending_rows = 0
+        # A repeated submission is distinct from duplicate rows legitimately
+        # produced inside one dataset. Keep its signature after flush as well.
+        self._submitted_datasets: set[tuple[Any, ...]] = set()
+        self._interrupted = False
         # Батчи, чьи строки лежат в таблице без строки в манифесте: обломки
         # прерванной записи. Их физическая запись идёт с DELETE перед INSERT,
         # чтобы обломок не смешался с полной пачкой (#1311).
@@ -955,19 +961,42 @@ class FotMobRepository:
             raise self._write_guard_failure
         try:
             guard = self._write_guard()
-            guard.__enter__()
+            authority = guard.__enter__()
         except BaseException as exc:
             # Отказ ЗАХВАТА — не отказ записи: он запоминается, чтобы каждый
             # следующий commit/flush поднял его немедленно и ран покраснел.
-            self._write_guard_failure = exc
+            if isinstance(exc, Exception):
+                self._write_guard_failure = exc
             raise
+        bind = None
+        manager = None
+        check = getattr(authority, "check", None)
         try:
+            manager_getter = getattr(self.writer, "_get_trino_manager", None)
+            manager = manager_getter() if manager_getter is not None else None
+            bind = getattr(manager, "set_write_authority", None)
+            if bind is not None:
+                bind(authority if check is not None else None)
+            if check is not None:
+                check()
             yield
+            if check is not None:
+                check()
         except BaseException as exc:
+            from scrapers.fotmob.writer_lock import WriterLockLost
+
+            if isinstance(exc, WriterLockLost):
+                self._write_guard_failure = exc
+                revoke = getattr(manager, "revoke_write_authority", None)
+                if revoke is not None:
+                    revoke(exc)
             if not guard.__exit__(type(exc), exc, exc.__traceback__):
                 raise
         else:
             guard.__exit__(None, None, None)
+        finally:
+            if bind is not None:
+                bind(None)
 
     def _write(
         self,
@@ -1020,6 +1049,10 @@ class FotMobRepository:
         get the same batch id; current views can therefore deduplicate them.
         """
 
+        if self._interrupted:
+            raise RuntimeError("FotMob repository was interrupted; start a new attempt")
+        if self._write_guard_failure is not None:
+            raise self._write_guard_failure
         if commit.status not in {ManifestStatus.SUCCESS, ManifestStatus.NOT_MODIFIED}:
             if any(dataset.rows for dataset in datasets):
                 raise ValueError(
@@ -1093,7 +1126,17 @@ class FotMobRepository:
         buffered_prepared: list[
             tuple[str, str, Optional[tuple[str, ...]], list[dict[str, Any]]]
         ] = []
+        staged_submissions: set[tuple[Any, ...]] = set()
         for table, entity_type, partition_cols, rows in prepared:
+            columns = sorted(set().union(*(row.keys() for row in rows)) - OBSERVATION_COLUMNS)
+            identity = (
+                table, entity_type, partition_cols, commit.batch_id,
+                tuple(columns),
+                tuple(sorted(row_multiset(rows, columns, {}).items())),
+            )
+            if identity in self._submitted_datasets or identity in staged_submissions:
+                continue
+            staged_submissions.add(identity)
             deduplicated = self._deduplicate(
                 table,
                 rows,
@@ -1106,6 +1149,7 @@ class FotMobRepository:
 
         for table, keys in staged_seen.items():
             self._seen_keys.setdefault(table, set()).update(keys)
+        self._submitted_datasets.update(staged_submissions)
 
         for table, entity_type, partition_cols, rows in buffered_prepared:
             self._pending.setdefault((table, entity_type, partition_cols), []).extend(
@@ -1457,47 +1501,6 @@ class FotMobRepository:
         self._preloaded = True
         return len(self._manifest_index)
 
-    def _stored_batch_counts(
-        self,
-        table: str,
-        batch_ids: Iterable[str],
-        *,
-        batch_column: str,
-    ) -> Optional[dict[str, int]]:
-        """Return authoritative physical counts for deterministic batches.
-
-        ``None`` means the injected writer has no catalog interface (small unit
-        doubles). A real metadata/query failure always propagates; it must not
-        be interpreted as an empty table during crash reconciliation.
-        """
-
-        manager_getter = getattr(self.writer, "_get_trino_manager", None)
-        if manager_getter is None:
-            return None
-        trino = manager_getter()
-        resolved = tuple(dict.fromkeys(str(value) for value in batch_ids))
-        if not resolved:
-            return {}
-        if not trino.table_exists(self.schema, table):
-            return {batch_id: 0 for batch_id in resolved}
-        counts = {batch_id: 0 for batch_id in resolved}
-        # Keep the metadata query bounded when a very large row cap flushes
-        # thousands of targets at once.
-        for offset in range(0, len(resolved), 500):
-            chunk = resolved[offset : offset + 500]
-            values = ", ".join("'" + value.replace("'", "''") + "'" for value in chunk)
-            rows = trino.execute_query(
-                f"""
-                SELECT {batch_column}, COUNT(*)
-                FROM {self.catalog}.{self.schema}.{table}
-                WHERE {batch_column} IN ({values})
-                GROUP BY {batch_column}
-                """
-            )
-            for batch_id, count in rows:
-                counts[str(batch_id)] = int(count)
-        return counts
-
     @staticmethod
     def _manifest_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
         """Logical manifest identity used to resolve ambiguous appends.
@@ -1593,79 +1596,109 @@ class FotMobRepository:
                 fingerprints[fingerprint] = fingerprints.get(fingerprint, 0) + 1
         return fingerprints
 
-    @staticmethod
-    def _expected_row_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-        expected: dict[str, int] = {}
-        for row in rows:
-            batch_id = str(row.get("_target_batch_id"))
-            expected[batch_id] = expected.get(batch_id, 0) + 1
-        return expected
+    def _stored_batch_rows(
+        self, table: str, batch_ids: Iterable[str], columns: Sequence[str]
+    ) -> Optional[tuple[dict[str, list[dict[str, Any]]], dict[str, str]]]:
+        """Read only pending batches and fields; query/schema failures propagate."""
+
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return None
+        trino = manager_getter()
+        batches = tuple(dict.fromkeys(str(value) for value in batch_ids))
+        stored: dict[str, list[dict[str, Any]]] = {batch: [] for batch in batches}
+        if not trino.table_exists(self.schema, table):
+            return stored, {}
+        get_columns = getattr(trino, "get_table_columns", None)
+        types = dict(get_columns(self.schema, table)) if get_columns else {}
+        if get_columns and "_target_batch_id" not in types:
+            raise RuntimeError(f"{table}: cannot reconcile without _target_batch_id")
+        projection = ["_target_batch_id", *columns]
+        expressions = []
+        for column in projection:
+            quoted = '"' + column.replace('"', '""') + '"'
+            expressions.append(
+                f"NULL AS {quoted}" if get_columns and column not in types else quoted
+            )
+        for offset in range(0, len(batches), 500):
+            chunk = batches[offset:offset + 500]
+            values = ", ".join("'" + value.replace("'", "''") + "'" for value in chunk)
+            for values_row in trino.execute_query(
+                f"SELECT {', '.join(expressions)} "
+                f"FROM {self.catalog}.{self.schema}.{table} "
+                f"WHERE _target_batch_id IN ({values})"
+            ):
+                row = dict(zip(projection, values_row))
+                batch = str(row.pop("_target_batch_id"))
+                if batch in stored:
+                    stored[batch].append(row)
+        return stored, types
+
+    def _successful_batch_ids(self, batch_ids: Iterable[str]) -> Optional[set[str]]:
+        fingerprints = self._stored_manifest_fingerprints(batch_ids)
+        if fingerprints is None:
+            return None
+        return {str(key[0]) for key in fingerprints if key[5] == "published"}
 
     def _reconcile_pending_table(
         self,
         key: tuple[str, str, Optional[tuple[str, ...]]],
     ) -> None:
-        """Drop rows already atomically committed by an interrupted flush."""
+        """Confirm row identity, never just equal physical row counts."""
 
         rows = self._pending.get(key)
         if not rows:
             self._pending.pop(key, None)
             return
         table = key[0]
-        expected = self._expected_row_counts(rows)
-        stored = self._stored_batch_counts(
-            table,
-            expected,
-            batch_column="_target_batch_id",
+        inventory_keys = DEDUP_KEYS.get(table)
+        columns = sorted(
+            inventory_keys or (set().union(*(row.keys() for row in rows)) - OBSERVATION_COLUMNS)
         )
-        if stored is None:
+        # Match _write's DataFrame coercion (int -> float with NULL siblings).
+        expected_rows = pd.DataFrame(rows).to_dict("records")
+        by_batch: dict[str, list[dict[str, Any]]] = {}
+        for row in expected_rows:
+            by_batch.setdefault(str(row["_target_batch_id"]), []).append(row)
+        result = self._stored_batch_rows(table, by_batch, columns)
+        if result is None:
             return
-        confirmed: set[str] = set()
-        disputed: dict[str, int] = {}
-        for batch_id, expected_count in expected.items():
-            actual_count = int(stored.get(batch_id, 0))
-            if actual_count == expected_count:
-                confirmed.add(batch_id)
-            elif actual_count != 0:
-                disputed[batch_id] = actual_count
-        if disputed:
-            # Манифест — единственный журнал завершённой пачки. Нет строки в нём
-            # — лежащие строки никогда не были подтверждены, это обломок
-            # прерванной записи, а не порча: его переписывают, а не роняют
-            # волну. Есть строка — расхождение счёта настоящее, отказ закрытый.
-            manifest_counts = self._stored_batch_counts(
-                MANIFEST_TABLE,
-                disputed,
-                batch_column="batch_id",
-            )
-            for batch_id, actual_count in disputed.items():
-                expected_count = expected[batch_id]
-                if manifest_counts is None or int(manifest_counts.get(batch_id, 0)):
+        stored, types = result
+        successes: Optional[set[str]] = None
+        remaining: list[dict[str, Any]] = []
+        for batch_id, pending in by_batch.items():
+            actual = stored[batch_id]
+            wanted = row_multiset(pending, columns, types)
+            present = row_multiset(actual, columns, types)
+            if inventory_keys:
+                # Inventory ownership depends on target order. Only the keys
+                # this attempt still needs participate in the comparison.
+                present = type(present)({digest: count for digest, count in present.items() if digest in wanted})
+            if present == wanted:
+                continue
+            if actual:
+                if successes is None:
+                    successes = self._successful_batch_ids(by_batch)
+                if successes is None or batch_id in successes:
                     raise RuntimeError(
-                        f"{table}: batch {batch_id} has {actual_count} stored "
-                        f"rows; expected either 0 or {expected_count}; inspect: "
-                        f"SELECT * FROM {self.catalog}.{self.schema}.{table} "
+                        f"{table}: batch {batch_id} has {len(actual)} stored "
+                        f"rows; expected either 0 or {len(pending)} with matching "
+                        f"row identity; inspect: SELECT * FROM "
+                        f"{self.catalog}.{self.schema}.{table} "
                         f"WHERE _target_batch_id='{batch_id}'"
                     )
                 logger.warning(
-                    "%s: batch %s has %d stored rows without a manifest row; "
-                    "treating as an orphan of an interrupted write and "
-                    "overwriting with %d rows",
-                    table,
-                    batch_id,
-                    actual_count,
-                    expected_count,
+                    "%s: unconfirmed batch %s has different row identity; "
+                    "overwriting %d orphan rows with %d pending rows",
+                    table, batch_id, len(actual), len(pending),
                 )
                 self._overwrite_batches.setdefault(table, set()).add(batch_id)
-        if confirmed:
-            remaining = [
-                row for row in rows if str(row.get("_target_batch_id")) not in confirmed
-            ]
-            if remaining:
-                self._pending[key] = remaining
-            else:
-                self._pending.pop(key, None)
-            self._pending_rows = sum(len(value) for value in self._pending.values())
+            remaining.extend(pending)
+        if remaining:
+            self._pending[key] = remaining
+        else:
+            self._pending.pop(key, None)
+        self._pending_rows = sum(len(value) for value in self._pending.values())
 
     def _orphan_delete_filter(self, table: str) -> Optional[str]:
         """DELETE-условие для обломков прерванной записи этой таблицы (#1311).
@@ -1751,6 +1784,51 @@ class FotMobRepository:
         for row in self._pending_manifest:
             self._index_pending(row)
 
+    def abort(self, reason: str) -> list[str]:
+        """Record unfinished observations without publishing or flushing payload.
+
+        An ambiguous manifest append may have completed before TERM. Reconcile
+        that success first; never replace it with interruption. An interrupted
+        row is diagnostic, and cannot make its physical batch immutable.
+        """
+
+        self._interrupted = True
+        if self._write_guard_failure is not None:
+            raise self._write_guard_failure
+        if not self._pending_manifest:
+            return []
+        paths: list[str] = []
+        with self._guarded_write():
+            self._reconcile_pending_manifest()
+            interrupted = []
+            for row in self._pending_manifest:
+                interrupted.append({
+                    **row,
+                    "status": ManifestStatus.INTERRUPTED.value,
+                    "error_code": "terminated",
+                    "error": reason,
+                    "completed_at": utc_now(),
+                })
+            # The remaining payload belongs to an aborted attempt. Removing it
+            # before the diagnostic append also makes an ambiguous abort retry
+            # incapable of accidentally publishing success via flush().
+            self._pending = {}
+            self._pending_rows = 0
+            self._pending_manifest = interrupted
+            self._rebuild_pending_indexes()
+            self._reconcile_pending_manifest()
+            if self._pending_manifest:
+                path = self._write(
+                    MANIFEST_TABLE, self._pending_manifest, entity_type="ingest_manifest"
+                )
+                if path:
+                    paths.append(path)
+                for row in self._pending_manifest:
+                    self._index_committed(row)
+            self._pending_manifest = []
+            self._rebuild_pending_indexes()
+        return paths
+
     def flush(self) -> list[str]:
         """Flush buffered targets, retrying a lost Iceberg snapshot race (#1199).
 
@@ -1777,6 +1855,8 @@ class FotMobRepository:
         # обязан подняться наверх, а не превратиться в тихий пропуск целей.
         if self._write_guard_failure is not None:
             raise self._write_guard_failure
+        if self._interrupted and (self._pending or self._pending_manifest):
+            raise RuntimeError("FotMob repository was interrupted; retry abort or start a new attempt")
         if not self._pending and not self._pending_manifest:
             return []
         paths: list[str] = []
@@ -3102,6 +3182,9 @@ class MemoryFotMobRepository:
             if current is None or rank >= current[0]:
                 selected[evidence.competition_id] = (rank, evidence)
         return {competition_id: value[1] for competition_id, value in selected.items()}
+
+    def abort(self, reason: str) -> list[str]:
+        return []
 
     def flush(self) -> list[str]:
         return []

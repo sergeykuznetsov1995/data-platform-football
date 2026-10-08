@@ -872,3 +872,529 @@ def test_inventory_swap_restores_source_when_final_validation_query_fails():
         '"fotmob_field_inventory__compact_0123456789ab"'
     ]
     assert client.names == {mod.INVENTORY}
+
+
+class CleanupLease:
+    def __init__(self, *, lose_at=0):
+        self.checks = 0
+        self.lose_at = lose_at
+
+    def check(self):
+        self.checks += 1
+        if self.checks == self.lose_at:
+            raise RuntimeError('writer lease lost')
+
+
+def _isolated_plan():
+    plan = _plan()
+    plan['mode'] = 'isolated_staging_only'
+    plan['older_than_hours'] = 24
+    plan['inventory_compaction'] = {'source_table': mod.INVENTORY, 'action': 'retain'}
+    return plan
+
+
+def test_isolated_plan_never_reads_inventory():
+    client = PlanClient()
+    plan = mod.build_plan(client, catalog='iceberg', schema='bronze',
+                          older_than_hours=24, clock=lambda: NOW, isolated_stack=True)
+    assert plan['inventory_compaction'] == {'source_table': mod.INVENTORY, 'action': 'retain'}
+    assert plan['mode'] == 'isolated_staging_only'
+    assert not any('cleanup:inventory' in sql or 'fotmob_field_inventory' in sql
+                   for sql in client.sql)
+
+
+def test_isolated_execution_checks_same_lease_before_every_drop():
+    client = ExecuteClient(7)
+    lease = CleanupLease()
+    report = mod.execute_isolated_plan(client, _isolated_plan(), lease=lease, clock=lambda: NOW)
+    assert report['passed'] is True
+    assert lease.checks >= 3
+    assert [sql for sql in client.sql if sql.startswith('DROP TABLE')] == [
+        'DROP TABLE "iceberg"."bronze"."fotmob_matches__stg_0123456789ab"']
+    assert not any('fotmob_field_inventory' in sql for sql in client.sql)
+
+
+def test_isolated_execution_rejects_lost_lease_before_mutation():
+    client = ExecuteClient(7)
+    with pytest.raises(RuntimeError, match='lease lost'):
+        mod.execute_isolated_plan(client, _isolated_plan(), lease=CleanupLease(lose_at=2), clock=lambda: NOW)
+    assert not any(sql.startswith('DROP TABLE') for sql in client.sql)
+
+
+@pytest.mark.parametrize('alteration', ['age', 'compaction', 'mode', 'target'])
+def test_isolated_execution_rejects_unreviewable_targets(alteration):
+    plan = _isolated_plan()
+    if alteration == 'age':
+        plan['staging_targets'][0]['last_snapshot_at'] = (NOW - timedelta(hours=1)).isoformat()
+    elif alteration == 'compaction':
+        plan['inventory_compaction']['action'] = 'shadow_swap'
+    elif alteration == 'mode':
+        plan.pop('mode')
+    else:
+        plan['staging_targets'][0]['table'] = 'fotmob_matches'
+    client = ExecuteClient(7)
+    with pytest.raises(mod.CleanupError):
+        mod.execute_isolated_plan(client, plan, lease=CleanupLease(), clock=lambda: NOW)
+    assert not any(sql.startswith('DROP TABLE') for sql in client.sql)
+
+
+def test_isolated_all_target_preflight_still_precedes_drop():
+    plan = _isolated_plan()
+    other = dict(plan['staging_targets'][0])
+    other['table'] = 'fotmob_standings__stg_abcdef012345'
+    other['qualified_table'] = 'iceberg.bronze.' + other['table']
+    plan['staging_targets'].append(other)
+
+    class Drift(ExecuteClient):
+        def query(self, sql):
+            if 'cleanup:count:fotmob_standings' in sql:
+                self.sql.append(sql)
+                return [(999,)]
+            return super().query(sql)
+    client = Drift(7)
+    with pytest.raises(mod.CleanupError, match='metadata changed'):
+        mod.execute_isolated_plan(client, plan, lease=CleanupLease(), clock=lambda: NOW)
+    assert not any(sql.startswith('DROP TABLE') for sql in client.sql)
+
+
+def test_isolated_cli_validates_reviewed_sha_before_remote_execution(tmp_path, monkeypatch):
+    import json
+    plan = tmp_path / 'plan.json'
+    plan.write_text(json.dumps(_isolated_plan()))
+    output = tmp_path / 'result.json'
+    calls = []
+    monkeypatch.setattr(mod, '_now_dt', lambda: NOW)
+    assert mod.main(['execute', '--isolated-stack', '--output', str(output),
+                     '--plan', str(plan), '--plan-sha256', '0' * 64,
+                     '--confirm', mod.CONFIRM_EXECUTE, '--release-sha', 'a' * 40,
+                     '--release-root', str(tmp_path), '--scheduler-container-id', 'b' * 64],
+                    run=lambda *a, **k: calls.append(a)) == 1
+    assert 'SHA-256 mismatch' in json.loads(output.read_text())['error']
+    assert calls == []
+
+
+def _host_attestation(tmp_path, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+    root = tmp_path / 'release'
+    path = root / 'scripts/fotmob_cleanup.py'
+    path.parent.mkdir(parents=True)
+    content = b'# reviewed isolated cleanup\n'
+    path.write_bytes(content)
+    blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+    env = {'FOTMOB_ISOLATED_STACK': '1', 'ALERT_ENV': 'fotmob-isolated', 'TRINO_HOST': 'trino',
+           'AIRFLOW__DATABASE__SQL_ALCHEMY_CONN': 'postgresql+psycopg2://airflow:secret@fotmob-airflow-metadb:5432/airflow'}
+    container = {'Id': 'b' * 64, 'Name': '/fotmob-airflow-scheduler', 'State': {'Running': True},
+                 'Config': {'Hostname': 'b' * 12, 'Env': [key + '=' + value for key, value in env.items()],
+                            'Labels': {'com.docker.compose.project': 'fotmob-airflow',
+                                       'com.docker.compose.service': 'airflow-scheduler'}},
+                 'Mounts': [{'Destination': '/opt/airflow/' + relative, 'Source': str(root / relative),
+                             'Type': 'bind', 'RW': False} for relative in mod.ISOLATED_RUNTIME_ROOTS]}
+    args = SimpleNamespace(scheduler_container_id='b' * 64, project='fotmob-airflow',
+                           release_root=root, release_sha='a' * 40)
+    monkeypatch.setattr(mod.runtime_binding, '_inspect_container', lambda *a, **k: container)
+    git_output = {'rev-parse': 'a' * 40, 'status': '', 'ls-files': '',
+                  'ls-tree': '100644 blob ' + blob + '\tscripts/fotmob_cleanup.py\n'}
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        assert command[:1] == ('git',)
+        return subprocess.CompletedProcess(command, 0, stdout=git_output[command[3]], stderr='')
+    return args, container, git_output, calls, run
+
+
+def test_isolated_host_attests_exact_readonly_runtime_without_writes(tmp_path, monkeypatch):
+    args, _, _, calls, run = _host_attestation(tmp_path, monkeypatch)
+    identity = mod._attest_isolated_host(args, run=run)
+    assert identity['git_sha'] == 'a' * 40
+    assert identity['scheduler_container_id'] == 'b' * 64
+    assert '/opt/airflow/scripts/fotmob_cleanup.py' in identity['manifest']
+    assert 'secret' not in str(identity)
+    assert not any('checkout' in command or 'stop' in command for command in calls)
+
+
+@pytest.mark.parametrize('change', ['id', 'project', 'service', 'stopped', 'isolated', 'ceremony',
+                                     'disabled-lock', 'mount-rw', 'mount-source', 'overlay', 'sha',
+                                     'dirty', 'ignored-code', 'blob'])
+def test_isolated_host_rejects_unattested_stack(tmp_path, monkeypatch, change):
+    args, container, git_output, _, run = _host_attestation(tmp_path, monkeypatch)
+    if change == 'id':
+        container['Id'] = 'c' * 64
+    elif change == 'project':
+        container['Config']['Labels']['com.docker.compose.project'] = 'data-platform'
+    elif change == 'service':
+        container['Config']['Labels']['com.docker.compose.service'] = 'airflow-webserver'
+    elif change == 'stopped':
+        container['State']['Running'] = False
+    elif change == 'isolated':
+        container['Config']['Env'][0] = 'FOTMOB_ISOLATED_STACK=0'
+    elif change == 'ceremony':
+        container['Config']['Env'].append('FOTMOB_DEPLOYMENT_REPORT_PATH=/report.json')
+    elif change == 'disabled-lock':
+        container['Config']['Env'].append('FOTMOB_WRITER_LOCK=false')
+    elif change == 'mount-rw':
+        container['Mounts'][0]['RW'] = True
+    elif change == 'mount-source':
+        container['Mounts'][0]['Source'] = '/other/tree/dags'
+    elif change == 'overlay':
+        container['Mounts'].append({'Destination': '/opt/airflow/scripts/fotmob_cleanup.py',
+                                     'Source': '/old/cleanup.py', 'Type': 'bind', 'RW': False})
+    elif change == 'sha':
+        git_output['rev-parse'] = 'c' * 40
+    elif change == 'dirty':
+        git_output['status'] = ' M scripts/fotmob_cleanup.py'
+    elif change == 'ignored-code':
+        git_output['ls-files'] = 'scrapers/fotmob/old_untracked.py'
+    else:
+        (args.release_root / 'scripts/fotmob_cleanup.py').write_bytes(b'# altered\n')
+    with pytest.raises(mod.CleanupError):
+        mod._attest_isolated_host(args, run=run)
+
+
+def _scheduler_request():
+    import hashlib
+    import json
+    identity = {'scheduler_container_id': 'b' * 64, 'git_sha': 'a' * 40, 'binding_digest': 'd' * 64}
+    plan = _isolated_plan()
+    plan['isolated_runtime'] = {**identity, 'runtime_bytes_verified': True, 'scheduler_bound_client': True}
+    plan['data_plane_identity'] = [['trino-node', 'http://trino:8080']]
+    text = json.dumps(plan)
+    return {'identity': identity, 'command': 'execute', 'catalog': 'iceberg', 'schema': 'bronze',
+            'plan_text': text, 'plan_sha256': hashlib.sha256(text.encode()).hexdigest()}
+
+
+@pytest.mark.parametrize('refusal', ['active', 'binding', 'busy', 'disabled', 'runtime-plan'])
+def test_isolated_scheduler_refuses_before_drop(tmp_path, monkeypatch, refusal):
+    from contextlib import contextmanager
+    from dags.scripts import run_fotmob_scraper as runner
+    request = _scheduler_request()
+    client = ExecuteClient(7)
+    attestations = []
+    def attest(identity):
+        attestations.append(identity)
+        if refusal == 'binding' and len(attestations) > 1:
+            raise mod.CleanupError('binding changed')
+    @contextmanager
+    def lock():
+        if refusal == 'busy':
+            raise RuntimeError('busy')
+        yield False if refusal == 'disabled' else CleanupLease()
+    def activity(_client):
+        if refusal == 'active':
+            raise mod.CleanupError('active writes')
+        return {'trino_nodes': [['trino-node', 'http://trino:8080']]}
+    monkeypatch.setattr(mod, '_attest_isolated_process', attest)
+    monkeypatch.setattr(mod, '_isolated_activity', activity)
+    monkeypatch.setattr(mod, '_connect_isolated_from_env', lambda **k: client)
+    monkeypatch.setattr(mod, '_now_dt', lambda: NOW)
+    monkeypatch.setattr(runner, '_writer_lock', lock)
+    if refusal == 'runtime-plan':
+        request['identity']['git_sha'] = 'c' * 40
+    with pytest.raises((mod.CleanupError, RuntimeError)):
+        mod._run_isolated_request(request)
+    assert not any(sql.startswith('DROP TABLE') for sql in client.sql)
+
+
+def test_isolated_cursor_has_live_lease_watcher_during_drop():
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    events = []
+    class Lease(CleanupLease):
+        @contextmanager
+        def watch(self, cancel):
+            events.append('watch-start')
+            yield
+            events.append('watch-end')
+    class Cursor:
+        def cancel(self):
+            events.append('cancel')
+        def execute(self, sql):
+            assert events[-1] == 'watch-start'
+            events.append(sql)
+        def fetchall(self):
+            return []
+        def close(self):
+            events.append('close')
+    client = SimpleNamespace(connection=SimpleNamespace(cursor=lambda: Cursor()))
+    lease = Lease()
+    mod._LeaseQueryClient(client, lease).query('DROP TABLE "iceberg"."bronze"."fotmob_matches__stg_123"')
+    assert events[0] == 'watch-start'
+    assert events[-2:] == ['watch-end', 'close']
+    assert lease.checks == 2
+
+
+def test_isolated_scheduler_holds_one_lease_across_all_preflight_and_drops(monkeypatch):
+    from contextlib import contextmanager
+    from dags.scripts import run_fotmob_scraper as runner
+    held = [False]
+    events = []
+    lease = CleanupLease()
+    class Client(ExecuteClient):
+        def query(self, sql):
+            assert held[0]
+            events.append('drop' if sql.startswith('DROP TABLE') else 'preflight')
+            return super().query(sql)
+    client = Client(7)
+    @contextmanager
+    def lock():
+        assert not held[0]
+        held[0] = True
+        events.append('acquired')
+        try:
+            yield lease
+        finally:
+            held[0] = False
+            events.append('released')
+    def activity(_client):
+        assert held[0]
+        events.append('activity')
+        return {'trino_nodes': [['trino-node', 'http://trino:8080']]}
+    monkeypatch.setattr(mod, '_attest_isolated_process', lambda _identity: None)
+    monkeypatch.setattr(mod, '_isolated_activity', activity)
+    monkeypatch.setattr(mod, '_connect_isolated_from_env', lambda **k: client)
+    monkeypatch.setattr(mod, '_LeaseQueryClient', lambda c, _lease: c)
+    monkeypatch.setattr(mod, '_now_dt', lambda: NOW)
+    monkeypatch.setattr(runner, '_writer_lock', lock)
+    report = mod._run_isolated_request(_scheduler_request())
+    assert report['passed'] is True
+    assert events[0] == 'acquired' and events[-1] == 'released'
+    assert events.count('activity') == 2
+    assert events.index('drop') > max(i for i, value in enumerate(events) if value == 'preflight')
+    assert lease.checks >= 6
+
+
+def test_isolated_plan_cannot_use_ceremony_execute_path():
+    with pytest.raises(mod.CleanupError, match='requires --isolated-stack'):
+        mod._validate_plan_shape(_isolated_plan(), clock=lambda: NOW)
+
+
+@pytest.mark.parametrize('command', ['plan', 'execute'])
+def test_isolated_cli_uses_only_attested_scheduler_bound_request(tmp_path, monkeypatch, command):
+    import hashlib
+    import json
+    identity = {'scheduler_container_id': 'b' * 64, 'git_sha': 'a' * 40,
+                'binding_digest': 'd' * 64, 'manifest': {}, 'hostname': 'b' * 12}
+    monkeypatch.setattr(mod, '_attest_isolated_host', lambda args, **k: identity)
+    monkeypatch.setattr(mod, '_now_dt', lambda: NOW)
+    monkeypatch.setattr(mod, '_quiesce_isolated_scheduler', lambda *a, **k: pytest.fail('ceremony stop forbidden'))
+    request = _scheduler_request()
+    path = tmp_path / 'plan.json'
+    path.write_text(request['plan_text'])
+    output = tmp_path / 'result.json'
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:4] == ('docker', 'exec', '-i', 'b' * 64)
+        payload = json.loads(kwargs['input'])
+        assert payload['command'] == command
+        if command == 'execute':
+            assert payload['plan_text'].encode() == path.read_bytes()
+            assert payload['plan_sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
+        return subprocess.CompletedProcess(argv, 0, stdout='FOTMOB_ISOLATED_CLEANUP_JSON={"passed":true}\n')
+    args = [command, '--isolated-stack', '--output', str(output), '--release-sha', 'a' * 40,
+            '--release-root', str(tmp_path), '--scheduler-container-id', 'b' * 64]
+    if command == 'execute':
+        args.extend(['--plan', str(path), '--plan-sha256', request['plan_sha256'],
+                     '--confirm', mod.CONFIRM_EXECUTE])
+    assert mod.main(args, run=run, client_factory=lambda **k: pytest.fail('host client forbidden')) == 0
+    assert len(calls) == 1
+    assert json.loads(output.read_text())['passed'] is True
+
+
+@pytest.mark.parametrize('change', ['binding', 'bytes', 'hostname'])
+def test_isolated_process_rejects_runtime_drift(tmp_path, monkeypatch, change):
+    import hashlib
+    import socket
+    content = tmp_path / 'tracked.py'
+    content.write_text('reviewed')
+    env = {'FOTMOB_ISOLATED_STACK': '1', 'ALERT_ENV': 'fotmob-isolated', 'TRINO_HOST': 'trino',
+           'AIRFLOW__DATABASE__SQL_ALCHEMY_CONN': 'postgresql+psycopg2://airflow:secret@fotmob-airflow-metadb:5432/airflow'}
+    identity = {'hostname': 'scheduler', 'binding_digest': mod._binding_digest(env),
+                'manifest': {str(content): hashlib.sha256(content.read_bytes()).hexdigest()}}
+    monkeypatch.setattr(mod.os, 'environ', env)
+    monkeypatch.setattr(socket, 'gethostname', lambda: 'scheduler')
+    mod._attest_isolated_process(identity)
+    if change == 'binding':
+        env['FBREF_CONTROL_DB_URI'] = 'postgresql://different-domain/db'
+    elif change == 'bytes':
+        content.write_text('changed')
+    else:
+        identity['hostname'] = 'other'
+    with pytest.raises(mod.CleanupError):
+        mod._attest_isolated_process(identity)
+
+
+def test_sigkill_leaves_staging_for_a_new_scheduler_bound_cleanup_process(tmp_path):
+    """SIGKILL cannot run finalizers; the next process uses durable reviewed state."""
+    import json
+    import signal
+    import sys
+    from pathlib import Path
+
+    catalog = tmp_path / 'catalog.json'
+    stage = 'fotmob_matches__stg_0123456789ab'
+    unreviewed = 'fotmob_matches__stg_not_reviewed'
+    state = {stage: {'row_count': 7, 'snapshot_id': 'staging-snapshot-1',
+                     'last_snapshot_at': (NOW - timedelta(hours=48)).isoformat()},
+             unreviewed: {'row_count': 3}, mod.INVENTORY: {'row_count': 10}}
+    seed_code = """import json,sys
+from pathlib import Path
+path=Path(sys.argv[1])
+path.write_text(sys.stdin.readline())
+print('staging-ready',flush=True)
+# Simulate the paused append before promotion. SIGKILL skips this finalizer.
+try:
+    sys.stdin.read(1)
+finally:
+    state=json.loads(path.read_text())
+    state.pop('fotmob_matches__stg_0123456789ab',None)
+    path.write_text(json.dumps(state))
+"""
+    seed = subprocess.Popen([sys.executable, '-c', seed_code, str(catalog)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        seed.stdin.write(json.dumps(state) + '\n')
+        seed.stdin.flush()
+        assert seed.stdout.readline().strip() == 'staging-ready'
+        seed.kill()
+        seed.communicate(timeout=10)
+        assert seed.returncode == -signal.SIGKILL
+    finally:
+        if seed.poll() is None:
+            seed.kill()
+            seed.communicate(timeout=10)
+    assert json.loads(catalog.read_text()) == state
+
+    recovery_code = """import json,sys
+from pathlib import Path
+from datetime import datetime
+from contextlib import contextmanager
+from scripts import fotmob_cleanup as mod
+from dags.scripts import run_fotmob_scraper as runner
+path=Path(sys.argv[1])
+request=json.load(sys.stdin)
+held=False
+watching=False
+events=[]
+class Lease:
+    def check(self):
+        assert held
+        events.append('check')
+    @contextmanager
+    def watch(self,cancel):
+        global watching
+        assert held and not watching
+        watching=True
+        events.append('watch-start')
+        try:
+            yield
+        finally:
+            watching=False
+            events.append('watch-end')
+@contextmanager
+def lock():
+    global held
+    assert not held
+    held=True
+    events.append('acquired')
+    try:
+        yield Lease()
+    finally:
+        held=False
+        events.append('released')
+class Cursor:
+    def execute(self,sql):
+        assert held and watching
+        state=json.loads(path.read_text())
+        if 'cleanup:table-exists:' in sql:
+            name=sql.split('cleanup:table-exists:',1)[1].splitlines()[0]
+            self.rows=[(int(name in state),)]
+        elif 'cleanup:count:' in sql:
+            name=sql.split('cleanup:count:',1)[1].splitlines()[0]
+            self.rows=[(state[name]['row_count'],)]
+        elif 'cleanup:snapshot:' in sql:
+            name=sql.split('cleanup:snapshot:',1)[1].splitlines()[0]
+            self.rows=[(state[name]['snapshot_id'],state[name]['last_snapshot_at'])]
+        elif sql.startswith('DROP TABLE'):
+            assert events[-1]=='watch-start'
+            name=sql.rsplit('.',1)[1].strip('"')
+            assert name=='fotmob_matches__stg_0123456789ab'
+            state.pop(name)
+            path.write_text(json.dumps(state))
+            events.append('drop:'+name)
+            self.rows=[]
+        else:
+            raise AssertionError(sql)
+    def fetchall(self):
+        return self.rows
+    def cancel(self):
+        events.append('cancel')
+    def close(self):
+        pass
+class Client:
+    connection=None
+    def __init__(self):
+        self.connection=self
+    def cursor(self):
+        return Cursor()
+    def close(self):
+        pass
+def attest(identity):
+    if len(events):
+        assert held
+    events.append('attest')
+def activity(client):
+    assert held
+    events.append('activity')
+    return {'trino_nodes':[['trino-node','http://trino:8080']]}
+mod._attest_isolated_process=attest
+mod._isolated_activity=activity
+mod._connect_isolated_from_env=lambda **kwargs: Client()
+mod._now_dt=lambda: datetime.fromisoformat(json.loads(request['plan_text'])['generated_at'])
+runner._writer_lock=lock
+report=mod._run_isolated_request(request)
+print(json.dumps({'report':report,'events':events}))
+"""
+    # Fresh interpreter, persistent catalog, real lease adapter; all backends fake.
+    recovered = subprocess.run([sys.executable, '-c', recovery_code, str(catalog)],
+                               input=json.dumps(_scheduler_request()), text=True,
+                               capture_output=True, check=True, timeout=20,
+                               cwd=Path(mod.__file__).resolve().parents[1])
+    output = json.loads(recovered.stdout)
+    assert output['report']['passed'] is True
+    assert output['report']['dropped_staging'] == [
+        {'table': stage, 'row_count': 7, 'already_absent': False}]
+    assert json.loads(catalog.read_text()) == {key: value for key, value in state.items() if key != stage}
+    events = output['events']
+    assert events.count('acquired') == 1 and events.count('released') == 1
+    assert events.count('drop:' + stage) == 1
+    assert events.index('acquired') < events.index('drop:' + stage) < events.index('released')
+    assert events[-1] == 'released'
+
+
+def test_isolated_real_trino_transport_never_replays_drop_after_lease_loss(monkeypatch):
+    import requests
+    from scrapers.fotmob.writer_lock import WriterLockLost, writer_lock
+    from tests.unit.scrapers.test_fotmob_writer_lock import Connection, fake_pg
+    monkeypatch.setenv('TRINO_HOST', 'offline-only.invalid')
+    monkeypatch.setenv('TRINO_HTTP_SCHEME', 'http')
+    connection = Connection()
+    fake_pg(monkeypatch, connection)
+    factory = getattr(mod, '_connect_isolated_from_env', mod.connect_from_env)
+    client = factory(catalog='iceberg', schema='bronze')
+    attempts = []
+    with writer_lock({}, key=1, wait_seconds=0, poll_seconds=.01) as lease:
+        class OfflineSession(requests.Session):
+            def post(self, url, **kwargs):
+                attempts.append({'lost': lease._lost.is_set(), 'timeout': kwargs.get('timeout')})
+                connection.owns = False
+                assert lease._lost.wait(1), 'real heartbeat failed to revoke lease'
+                raise requests.ConnectionError('lost response after DROP')
+        client.connection._http_session = OfflineSession()
+        with pytest.raises(WriterLockLost):
+            mod._LeaseQueryClient(client, lease).query(
+                'DROP TABLE "iceberg"."bronze"."fotmob_matches__stg_review"'
+            )
+    client.close()
+    assert attempts == [{'lost': False, 'timeout': (3.0, 5.0)}]

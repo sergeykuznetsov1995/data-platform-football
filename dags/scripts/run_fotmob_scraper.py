@@ -19,12 +19,14 @@ import re
 import signal
 import sys
 import tempfile
-import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
+
+from scrapers.fotmob.interruption import FotMobTerminated
+from scrapers.fotmob.writer_lock import WriterLockBusy, writer_lock
 
 from scrapers.fotmob.scope_codec import format_scope_token, parse_scope_groups
 from scrapers.fotmob.source_refresh import (
@@ -268,70 +270,18 @@ def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, An
     )
 
 
-class WriterLockBusy(RuntimeError):
-    """Другой процесс уже держит право записи в bronze FotMob."""
-
-
 @contextmanager
-def _writer_lock(environ: Mapping[str, str] | None = None) -> Iterator[bool]:
-    """Взять advisory-замок писателя на время ОДНОЙ физической записи.
+def _writer_lock(environ: Mapping[str, str] | None = None) -> Iterator[Any]:
+    """Hold a checked session lease for one repository write/flush."""
 
-    Замок общий для всех входов: и полоса из DAG, и ручной добор, и юнит
-    кампании берут один и тот же ключ, поэтому одновременной записи в bronze
-    не бывает. Захват остаётся НЕблокирующим на уровне SQL
-    (``pg_try_advisory_lock``), а ожидание делается опросом: блокирующий
-    ``pg_advisory_lock`` ждал бы в базе без предела и без следа в логе.
-    Исчерпанное ожидание — ``WriterLockBusy``: держатель завис, и ран обязан
-    покраснеть. Отключается только явно (``FOTMOB_WRITER_LOCK=0``) — для
-    офлайн-реплея и тестов; молчаливого обхода нет, иначе защита превращается
-    в декорацию.
-    """
-
-    env = os.environ if environ is None else environ
-    if str(env.get(WRITER_LOCK_ENV, "1")).strip().casefold() in {"0", "false", "no"}:
-        logger.warning(
-            "FotMob writer lock disabled via %s — параллельная запись не защищена",
-            WRITER_LOCK_ENV,
-        )
-        yield False
-        return
-
-    import psycopg2
-
-    from scrapers.fbref.control.store import resolve_control_db_uri
-
-    connection = psycopg2.connect(resolve_control_db_uri(env))
-    try:
-        connection.autocommit = True
-        deadline = time.monotonic() + WRITER_LOCK_WAIT_SECONDS
-        waited = 0.0
-        while True:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT pg_try_advisory_lock(%s)", (_WRITER_LOCK_KEY,))
-                acquired = bool(cursor.fetchone()[0])
-            if acquired:
-                break
-            if time.monotonic() >= deadline:
-                raise WriterLockBusy(
-                    "another FotMob writer holds the bronze writer lock "
-                    f"(key {_WRITER_LOCK_KEY}) after waiting "
-                    f"{WRITER_LOCK_WAIT_SECONDS:.0f}s; refusing to write in parallel"
-                )
-            if waited == 0.0:
-                logger.info(
-                    "bronze writer lock is busy, waiting up to %.0fs for the "
-                    "current write to finish",
-                    WRITER_LOCK_WAIT_SECONDS,
-                )
-            time.sleep(WRITER_LOCK_POLL_SECONDS)
-            waited += WRITER_LOCK_POLL_SECONDS
-        if waited:
-            logger.info("bronze writer lock acquired after %.0fs", waited)
-        yield True
-    finally:
-        # Закрытие соединения снимает замок сессии — отдельный UNLOCK не нужен
-        # и был бы хуже: он не отработает при падении процесса.
-        connection.close()
+    with writer_lock(
+        environ, key=_WRITER_LOCK_KEY,
+        # TERM has a 30-second grace period. Diagnostic abort may take a free
+        # lock, but cannot spend that period waiting behind another writer.
+        wait_seconds=0.0 if _TERM_REQUESTED else WRITER_LOCK_WAIT_SECONDS,
+        poll_seconds=WRITER_LOCK_POLL_SECONDS,
+    ) as authority:
+        yield authority
 
 
 @contextmanager
@@ -1001,6 +951,7 @@ def _native_output_payload(report) -> dict[str, Any]:
 # at unit timeout) would otherwise drop up to batch_size-1 already-paid-for
 # targets; main() salvage-flushes through this handle before reporting failure.
 _ACTIVE_NATIVE_SERVICE = None
+_TERM_REQUESTED = False
 
 
 def _deactivate_native_service(service=None) -> None:
@@ -3255,19 +3206,40 @@ def _validate_args(
 
 
 def _sigterm_to_exception(signum, frame):
-    """The driver's unit timeout sends TERM (then KILL after 30s). Raising here
-    routes shutdown through main()'s failure path: salvage flush + a real
-    report instead of a silent NO_REPORT kill."""
+    """Escape ordinary failure handlers, including finish() and Trino retries."""
 
+    global _TERM_REQUESTED
+    if _TERM_REQUESTED:
+        return  # diagnostic abort must survive a repeated TERM; KILL stays final
+    _TERM_REQUESTED = True
     service = _ACTIVE_NATIVE_SERVICE
     if service is not None:
-        cancel = getattr(service, "cancel", None)
-        if cancel is not None:
-            cancel()
-    raise RuntimeError(f"terminated by signal {signum}")
+        try:
+            service.cancel()
+        except Exception:
+            logger.warning("FotMob transport cancellation failed")
+        writer = getattr(service.repository, "writer", None)
+        manager = getattr(writer, "_trino_manager", None)
+        cancel_query = getattr(manager, "cancel_active_query", None)
+        if cancel_query is not None:
+            try:
+                cancel_query()
+            except Exception:
+                logger.warning("FotMob SQL cancellation failed")
+    raise FotMobTerminated(f"terminated by signal {signum}")
 
 
-def _failure_payload(args, exc: Exception) -> dict[str, Any]:
+def _abort_native(reason: str) -> None:
+    service = _ACTIVE_NATIVE_SERVICE
+    if service is None:
+        return
+    try:
+        service.repository.abort(reason)
+    except Exception:
+        logger.exception("FotMob interruption diagnostic could not be persisted")
+
+
+def _failure_payload(args, exc: BaseException) -> dict[str, Any]:
     return {
         "run_id": args.run_id,
         "mode": args.mode,
@@ -3288,6 +3260,9 @@ def _run_native_unfenced(args) -> tuple[int, dict[str, Any]]:
 
     try:
         return _run_native(args)
+    except FotMobTerminated as exc:
+        _abort_native(str(exc))
+        return 1, _failure_payload(args, exc)
     except WriterLockBusy as exc:
         # Спасать нечем: права записи нет, и salvage-flush только повторил бы
         # ожидание замка. Класс отказа обязан доехать до верхнеуровневых
@@ -3325,6 +3300,8 @@ def main():
     # ``main`` is normally one-shot, but tests and embedded invocations can
     # call it repeatedly in one interpreter. A late TERM must never cancel a
     # completed prior run.
+    global _TERM_REQUESTED
+    _TERM_REQUESTED = False
     _deactivate_native_service()
     parser = _argument_parser()
     args = parser.parse_args()
@@ -3365,6 +3342,9 @@ def main():
             rc, payload = _run_native_unfenced(args)
         else:
             rc, payload = _run_native_under_fence(args, publication)
+    except FotMobTerminated as exc:
+        payload = _failure_payload(args, exc)
+        rc = 1
     except Exception as exc:
         # Guard acquisition/validation failed before the service was built.
         # Do not salvage-flush here: there is no publication authority.
