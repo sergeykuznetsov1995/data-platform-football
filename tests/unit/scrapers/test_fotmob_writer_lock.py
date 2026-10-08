@@ -1,6 +1,7 @@
 """Offline regressions for the bounded FotMob writer lease."""
+import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -90,9 +91,15 @@ def test_failed_probe_loses_authority_forever(monkeypatch):
 
 
 def test_socket_poll_obeys_explicit_deadline(monkeypatch):
-    from types import SimpleNamespace
-    from psycopg2.extensions import POLL_READ
-    connection = SimpleNamespace(poll=lambda: POLL_READ, fileno=lambda: 42)
+    # The unit runtime intentionally omits PostgreSQL drivers. Exercise the
+    # real polling loop with the driver's protocol, without opening a socket.
+    extensions = ModuleType("psycopg2.extensions")
+    extensions.POLL_OK, extensions.POLL_READ, extensions.POLL_WRITE = 0, 1, 2
+    driver = ModuleType("psycopg2")
+    driver.extensions = extensions
+    monkeypatch.setitem(sys.modules, "psycopg2", driver)
+    monkeypatch.setitem(sys.modules, "psycopg2.extensions", extensions)
+    connection = SimpleNamespace(poll=lambda: extensions.POLL_READ, fileno=lambda: 42)
     waits = []
     def select(read, write, errors, timeout):
         waits.append(timeout)
