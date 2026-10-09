@@ -1748,3 +1748,39 @@ def test_native_history_archive_reconciles_old_current_after_stable_child_manife
         assert result['verified'] and sum(len(client.get_calls) for client in future.clients) == 1
     actual = _table(scraper, 'transfermarkt_market_value_points')
     pd.testing.assert_frame_equal(native, actual[actual.player_id.isin(['1', '2'])].reset_index(drop=True))
+
+
+# Append to tests/unit/utils/test_transfermarkt_current_write.py; uses its real MemoryDB scraper/http fixtures.
+@pytest.mark.parametrize('mode', ['native-only', 'dual'])
+def test_generic_empty_archive_retry_recovers_original_intent_without_http(scraper, monkeypatch, tmp_path, mode):
+    import contextlib
+    import scrapers.transfermarkt
+    from scrapers.transfermarkt import write_intents, ops_traffic
+    source = http(scraper, [{'list': []}])
+    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'original-empty-child')
+    monkeypatch.setattr(ops_traffic, 'record_traffic_run', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scrapers.transfermarkt, 'TransfermarktScraper', lambda **_: contextlib.nullcontext(scraper))
+    monkeypatch.setattr(current.run, '_select_player_ids', lambda *_args, **_kwargs:
+        (['1'], 0, 0, [], {'roster_size': 1, 'selected': 1, 'pending': 0}))
+    def launch(name, child):
+        return current.run._run_entity(current.run.ENTITY_SPECS['market_value_history'], ['GB1'], 2026,
+            1, str(tmp_path / name), refresh_mode='history', run_key=child,
+            write_mode=mode, expected_reader_revision=7)
+    def fail(*_args, **_kwargs):
+        raise OSError('local archive unavailable after committed empty capture')
+    with monkeypatch.context() as patch:
+        patch.setattr(write_intents, 'archive_complete', fail)
+        assert launch('failed.json', 'original-empty-child') == 1
+    original, = write_intents.pending_intents({'kind': 'scope', 'entity': 'market_value_history'})
+    original_bytes = original[0].read_bytes()
+    assert original[1]['evidence']['results']['outputs'] == {}
+    assert launch('recovered.json', 'later-child') == 0
+    recovered = json.loads((tmp_path / 'recovered.json').read_text())
+    assert recovered['reconciled_without_http'] and recovered['career_capture_archive_status'] == 'complete'
+    assert recovered['original_capture_run_key'] == 'original-empty-child'
+    assert not write_intents.pending_intents({'kind': 'scope', 'entity': 'market_value_history'})
+    assert sum(len(client.get_calls) for client in source.clients) == 1
+    key = 'native_write_manifest' if mode == 'native-only' else 'batch_manifest'
+    unit, = recovered[key]['rows']
+    archive = write_intents.completed_capture('original-empty-child', 'market_value_points', unit['native_batch_id'])
+    assert archive['journal'] == json.loads(original_bytes)

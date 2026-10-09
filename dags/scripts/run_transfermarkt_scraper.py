@@ -2552,6 +2552,9 @@ def _reconcile_native_career_intent(scraper, spec, mode, revision, league, seaso
             connection.close()
         if snapshots:
             for output in spec.outputs:
+                # An all-empty intent precedes the first output summary. Keep
+                # the original captured frame's status when recovering it.
+                results['outputs'].setdefault(output.key, _frame_output_summary(frames[output.key]))
                 results['outputs'][output.key]['table'] = 'iceberg.bronze.' + output.table_name
         else:
             _save_frames(scraper, spec, frames, evidence['force_replace'], results)
