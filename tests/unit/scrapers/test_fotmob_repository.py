@@ -11,6 +11,7 @@ import pytest
 from scrapers.fotmob.repository import (
     CURRENT_VIEW_SPECS,
     LEGACY_PARSER_VERSION,
+    MANIFEST_TABLE,
     _COMMIT_CONFLICT_RETRIES,
     PARSER_VERSION,
     REPLACE_TARGET_MANIFEST_IDENTITIES,
@@ -1336,6 +1337,9 @@ class ReconcileTrino:
     def table_exists(self, schema, table):
         return bool(self.writer.rows.get(table))
 
+    def get_table_columns(self, schema, table):
+        return {column: "" for row in self.writer.rows.get(table, []) for column in row}
+
     def _execute(self, sql):
         # DDL of `ensure_schema`: recorded, never a source of rows.
         self.queries.append(sql)
@@ -1358,6 +1362,17 @@ class ReconcileTrino:
                 tuple(row.get(column) for column in columns)
                 for row in self.writer.rows.get(table, [])
             ]
+        if 'SELECT "_target_batch_id"' in sql:
+            expressions = sql.split("SELECT", 1)[1].split("FROM", 1)[0].split(",")
+            columns = [expression.rsplit(" AS ", 1)[-1].strip().strip('"') for expression in expressions]
+            return [tuple(row.get(column) for column in columns)
+                    for row in self.writer.rows.get(table, [])]
+        if "SELECT DISTINCT" in sql:
+            successes = {row["batch_id"] for row in self.writer.rows.get("fotmob_ingest_manifest", [])
+                         if row["status"] in {"success", "not_modified"}}
+            return [(row.get("json_path"), row.get("disposition"))
+                    for row in self.writer.rows.get(table, [])
+                    if row.get("_target_batch_id") in successes]
         batch_column = "_target_batch_id" if "_target_batch_id" in sql else "batch_id"
         counts = {}
         for row in self.writer.rows.get(table, []):
@@ -1425,7 +1440,7 @@ def test_restart_reconciles_already_committed_target_batch_without_duplicate_row
 
     assert len(writer.rows["fotmob_matches"]) == 1
     assert len(writer.rows["fotmob_ingest_manifest"]) == 1
-    assert any("GROUP BY _target_batch_id" in query for query in writer.trino.queries)
+    assert any('SELECT "_target_batch_id"' in query for query in writer.trino.queries)
 
 
 def test_restart_fails_closed_on_partial_or_duplicate_target_batch_count():
@@ -1532,7 +1547,7 @@ def test_orphan_mark_does_not_outlive_a_failed_flush_attempt():
     orphan = _commit(target_key="https://example/m/orphan")
     later = _commit(target_key="https://example/m/later")
     writer.rows["fotmob_field_inventory"] = [
-        {"_target_batch_id": orphan.batch_id, "json_path": f"content.f{index}"}
+        {**_inventory_row(f"content.f{index}"), "_target_batch_id": orphan.batch_id}
         for index in range(3)
     ]
     repository = FotMobRepository(writer=writer, batch_size=50)
@@ -1559,7 +1574,7 @@ def test_orphan_mark_does_not_outlive_a_failed_flush_attempt():
 
     # Чужой писатель довёл пачку до конца: 5 строк и строка манифеста.
     writer.rows["fotmob_field_inventory"] = [
-        {"_target_batch_id": orphan.batch_id, "json_path": f"content.f{index}"}
+        {**_inventory_row(f"content.f{index}"), "_target_batch_id": orphan.batch_id}
         for index in range(5)
     ]
     writer.rows.setdefault("fotmob_ingest_manifest", []).append(orphan.manifest_row())
@@ -2370,7 +2385,7 @@ def test_flush_retry_does_not_duplicate_rows_a_conflict_reported_after_the_commi
     assert len(writer.rows["fotmob_matches"]) == 1
     assert len(writer.rows["fotmob_ingest_manifest"]) == 1
     assert any(
-        "GROUP BY _target_batch_id" in query for query in writer.trino.queries
+        'SELECT "_target_batch_id"' in query for query in writer.trino.queries
     )
 
 
@@ -2851,3 +2866,163 @@ def test_memory_repository_reports_its_manifest_index_as_loaded():
     """
 
     assert MemoryFotMobRepository().manifest_index_loaded is True
+
+def test_1289_equal_count_cannot_confirm_different_rows():
+    writer = ReconcileWriter()
+    commit = _commit()
+    writer.rows['fotmob_matches'] = [
+        {**_match_dataset('wrong').rows[0], '_target_batch_id': commit.batch_id}
+    ]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_match_dataset('right')])
+    with pytest.raises(RuntimeError, match='identity'):
+        repository.flush()
+    assert writer.rows['fotmob_matches'][0]['match_id'] == 'wrong'
+
+
+def test_1289_exact_submission_repeat_writes_one_physical_dataset():
+    writer = ReconcileWriter()
+    commit = _commit()
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_match_dataset('1')])
+    repository.commit(commit, [_match_dataset('1')])
+    repository.flush()
+    assert len(writer.rows['fotmob_matches']) == 1
+    assert len(writer.rows[MANIFEST_TABLE]) == 1
+    restarted = FotMobRepository(writer=writer, batch_size=50)
+    restarted.commit(commit, [_match_dataset('1')])
+    restarted.flush()
+    assert len(writer.rows['fotmob_matches']) == 1
+
+
+def test_1289_interrupted_manifest_does_not_block_orphan_recovery():
+    writer = ReconcileWriter()
+    commit = _commit()
+    interrupted = {**commit.manifest_row(), 'status': 'interrupted'}
+    writer.rows[MANIFEST_TABLE] = [interrupted]
+    writer.rows['fotmob_matches'] = [
+        {**_match_dataset('wrong').rows[0], '_target_batch_id': commit.batch_id},
+        {**_match_dataset('extra').rows[0], '_target_batch_id': commit.batch_id},
+    ]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_match_dataset('right')])
+    repository.flush()
+    assert [row['match_id'] for row in writer.rows['fotmob_matches']] == ['right']
+    assert [row['status'] for row in writer.rows[MANIFEST_TABLE]] == [
+        'interrupted', 'success'
+    ]
+
+
+def test_1289_abort_records_only_interruption_and_next_attempt_succeeds():
+    writer = ReconcileWriter(fail_after_commit='fotmob_matches')
+    commit = _commit()
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_match_dataset('1')])
+    with pytest.raises(RuntimeError, match='lost writer response'):
+        repository.flush()
+    repository.abort('terminated by signal 15')
+    assert [row['status'] for row in writer.rows[MANIFEST_TABLE]] == ['interrupted']
+    assert repository.latest_success(commit.target_key) is None
+    assert repository.flush() == []
+    restarted = FotMobRepository(writer=writer, batch_size=50)
+    restarted.commit(_commit(run_id='retry'), [_match_dataset('1')])
+    restarted.flush()
+    assert len(writer.rows['fotmob_matches']) == 1
+    assert writer.rows[MANIFEST_TABLE][-1]['status'] == 'success'
+
+
+def test_1289_abort_preserves_a_success_that_landed_before_lost_response():
+    writer = ReconcileWriter(fail_after_commit=MANIFEST_TABLE)
+    commit = _commit()
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_match_dataset('1')])
+    with pytest.raises(RuntimeError, match='lost writer response'):
+        repository.flush()
+    repository.abort('terminated by signal 15')
+    assert [row['status'] for row in writer.rows[MANIFEST_TABLE]] == ['success']
+    assert len(writer.rows['fotmob_matches']) == 1
+
+
+def test_1289_inventory_reordered_after_lost_response_uses_pending_keys_only():
+    writer = ReconcileWriter(fail_after_commit='fotmob_field_inventory')
+    first = FotMobRepository(writer=writer, batch_size=50)
+    a = _commit(target_key='A')
+    b = _commit(target_key='B')
+    first.commit(b, [_inventory_dataset(['x', 'y', 'z', 'u', 'v'])])
+    first.commit(a, [_inventory_dataset(['x', 'y', 'z', 'p', 'q'])])
+    with pytest.raises(RuntimeError, match='lost writer response'):
+        first.flush()
+    first.abort('terminated by signal 15')
+    retry = FotMobRepository(writer=writer, batch_size=50)
+    retry.commit(a, [_inventory_dataset(['x', 'y', 'z', 'p', 'q'])])
+    retry.commit(b, [_inventory_dataset(['x', 'y', 'z', 'u', 'v'])])
+    retry.flush()
+    # Shared x/y/z may have another batch owner. Logical keys are all retained.
+    assert {row['json_path'] for row in writer.rows['fotmob_field_inventory']} == {
+        'x', 'y', 'z', 'p', 'q', 'u', 'v'
+    }
+    assert all(row['status'] == 'success' for row in writer.rows[MANIFEST_TABLE][-2:])
+
+
+def test_1289_reconciliation_failure_cannot_be_treated_as_empty_storage(monkeypatch):
+    writer = ReconcileWriter()
+    writer.rows['fotmob_matches'] = [{'match_id': '1'}]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(_commit(), [_match_dataset('1')])
+    with pytest.raises(RuntimeError, match='cannot reconcile'):
+        repository.flush()
+    assert writer.calls == []
+
+
+def test_1289_row_order_and_changed_observation_time_do_not_change_identity():
+    writer = ReconcileWriter()
+    commit = _commit()
+    original = TableRows('fotmob_matches', [
+        {**_match_dataset('1').rows[0], 'observed_at': datetime(2026, 7, 11)},
+        {**_match_dataset('2').rows[0], 'observed_at': datetime(2026, 7, 11)},
+    ], 'matches', ('competition_id', 'source_season_key'))
+    first = FotMobRepository(writer=writer, batch_size=50)
+    first.commit(commit, [original])
+    first.flush()
+    replay = TableRows(original.table, [
+        {**row, 'observed_at': datetime(2026, 10, 8)} for row in reversed(original.rows)
+    ], original.entity_type, original.partition_cols)
+    retry = FotMobRepository(writer=writer, batch_size=50)
+    retry.commit(_commit(run_id='revalidated'), [replay])
+    retry.flush()
+    assert len(writer.rows['fotmob_matches']) == 2
+    assert len(writer.rows[MANIFEST_TABLE]) == 2
+
+
+def test_1289_different_column_names_are_not_an_exact_repeated_submission():
+    writer = ReconcileWriter()
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    base = _match_dataset('1')
+    left = TableRows(base.table, [{**base.rows[0], 'x': 7}], base.entity_type, base.partition_cols)
+    right = TableRows(base.table, [{**base.rows[0], 'y': 7}], base.entity_type, base.partition_cols)
+    repository.commit(_commit(), [left])
+    repository.flush()
+    repository.commit(_commit(run_id='different-columns'), [right])
+    with pytest.raises(RuntimeError, match='row identity'):
+        repository.flush()
+    assert writer.rows['fotmob_matches'][0]['x'] == 7
+    assert 'y' not in writer.rows['fotmob_matches'][0]
+    assert len(writer.rows[MANIFEST_TABLE]) == 1
+
+
+def test_1289_failed_abort_cannot_be_followed_by_a_payload_flush(monkeypatch):
+    writer = ReconcileWriter()
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(_commit(), [_match_dataset('1')])
+    query = writer.trino.execute_query
+    # Force the initial diagnostic read to fail, before abort edits its buffer.
+    monkeypatch.setattr(repository, '_reconcile_pending_manifest',
+                        lambda: (_ for _ in ()).throw(RuntimeError('catalog read failed')))
+    with pytest.raises(RuntimeError, match='catalog read failed'):
+        repository.abort('terminated by signal 15')
+    monkeypatch.undo()
+    writer.trino.execute_query = query
+    with pytest.raises(RuntimeError, match='interrupted'):
+        repository.flush()
+    assert writer.calls == []

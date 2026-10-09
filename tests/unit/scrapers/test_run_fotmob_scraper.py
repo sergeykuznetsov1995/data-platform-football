@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -4612,7 +4613,7 @@ class TestFotmobNativeRunner:
     def test_sigterm_routes_through_failure_report(self, monkeypatch, tmp_path):
         # The driver's unit timeout sends TERM then KILL(+30s): the handler
         # must convert TERM into the ordinary failure path so the unit leaves
-        # a report (no more NO_REPORT kills) and flushes its buffer.
+        # a report (no more NO_REPORT kills) and records interruption without flushing more payload.
         import signal as signal_module
 
         mod = self._module()
@@ -4655,7 +4656,8 @@ class TestFotmobNativeRunner:
 
         assert rc == 1
         service.cancel.assert_called_once_with()
-        service.repository.flush.assert_called_once_with()
+        service.repository.flush.assert_not_called()
+        service.repository.abort.assert_called_once_with("terminated by signal 15")
         assert mod._ACTIVE_NATIVE_SERVICE is None
         payload = json.loads(out.read_text())
         assert any("terminated by signal" in e for e in payload["errors"])
@@ -4851,9 +4853,13 @@ class _FakeCursor:
 
     def execute(self, sql, params=None):
         self._executed.append((sql, params))
+        self._ownership = "pg_locks" in sql
 
     def fetchone(self):
-        return (self._answers(),)
+        return (True if self._ownership else self._answers(),)
+
+    def close(self):
+        pass
 
 
 class _FakeConnection:
@@ -4893,7 +4899,11 @@ def _fake_psycopg2(
         def answers():
             return acquired
 
-    def connect(dsn):
+    from scrapers.fotmob import writer_lock as lease_module
+    monkeypatch.setattr(lease_module, "_poll", lambda connection, timeout: None)
+
+    def connect(dsn, **kwargs):
+        assert kwargs == {"async_": True, "connect_timeout": 5}
         connections.append(dsn)
         connection = _FakeConnection(answers, executed)
         if opened is not None:
@@ -4994,7 +5004,7 @@ class TestFotmobWriterLock:
             statements = list(executed)
             assert opened[0].closed is False
 
-        assert held is True
+        assert hasattr(held, "check")
         # Захват остаётся НЕблокирующим на уровне SQL: pg_advisory_lock ждал бы
         # в базе без предела и без следа в логе.
         assert statements == [
@@ -5020,10 +5030,10 @@ class TestFotmobWriterLock:
             opened=opened,
         )
         slept: list[float] = []
-        monkeypatch.setattr(mod.time, "sleep", slept.append)
+        monkeypatch.setattr(time, "sleep", slept.append)
 
         with mod._writer_lock() as acquired:
-            assert acquired is True
+            assert hasattr(acquired, "check")
 
         assert len(executed) == 3
         assert {sql for sql, _params in executed} == {
@@ -5051,8 +5061,8 @@ class TestFotmobWriterLock:
             opened=opened,
         )
         clock = iter([0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0])
-        monkeypatch.setattr(mod.time, "monotonic", lambda: next(clock))
-        monkeypatch.setattr(mod.time, "sleep", lambda _delay: None)
+        monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(time, "sleep", lambda _delay: None)
 
         with pytest.raises(mod.WriterLockBusy) as excinfo:
             with mod._writer_lock():
@@ -5101,9 +5111,8 @@ class TestFotmobWriterLock:
         repository.ensure_current_views()
         assert len(opened) == 3
         assert all(connection.closed for connection in opened)
-        assert {sql for sql, _params in executed} == {
-            "SELECT pg_try_advisory_lock(%s)"
-        }
+        assert sum("pg_try_advisory_lock" in sql for sql, _params in executed) == 3
+        assert any("pg_locks" in sql for sql, _params in executed)
         assert connections == ["postgresql://airflow@metadb:5432/airflow"] * 3
 
     @pytest.mark.unit
@@ -5204,7 +5213,7 @@ class TestFotmobWriterLock:
             connections=connections,
             opened=[],
         )
-        monkeypatch.setattr(mod.time, "sleep", lambda _delay: None)
+        monkeypatch.setattr(time, "sleep", lambda _delay: None)
         writer = _LockScopeWriter()
         repository = FotMobRepository(
             writer=writer, batch_size=50, write_guard=mod._writer_lock
