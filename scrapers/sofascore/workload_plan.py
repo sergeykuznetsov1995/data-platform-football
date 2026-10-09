@@ -1720,8 +1720,8 @@ class AllocationLedger:
         for key in slim:
             run = runs[key]
             for allocation in run.get("allocations", {}).values():
-                for field in _SLIMMED_ALLOCATION_FIELDS:
-                    allocation.pop(field, None)
+                for slimmed_field in _SLIMMED_ALLOCATION_FIELDS:
+                    allocation.pop(slimmed_field, None)
             run["compacted"] = True
             run["compacted_at"] = now.isoformat()
         retired = payload.setdefault("retired_runs", {})

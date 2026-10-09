@@ -69,7 +69,8 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                 before += 1
                 if kind == "wal":
                     if str(event.get("lease_id", "")) not in finished:
-                        out.write(raw); kept += 1
+                        out.write(raw)
+                        kept += 1
                     continue
                 if kind != "paid":
                     raise ValueError("unknown registry kind")
@@ -93,9 +94,11 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                         "event_type", "lease_id", "source", "occurred_at", "dag_id", "run_id", "task_id", "map_index", "try_number",
                         "endpoint", "endpoint_path", "request_id", "reason", "error", "error_type", "total_bytes", "max_bytes", "classification", "upstream_status", "endpoint_request_provider_bytes"
                     ) if key in event}
-                    out.write(_line(forensic)); kept += 1
+                    out.write(_line(forensic))
+                    kept += 1
             for event in groups.values():
-                out.write(_line(event)); kept += 1
+                out.write(_line(event))
+                kept += 1
             out.flush()
             # The initial scan never holds the event-loop writer lock.
             with lock:
@@ -107,7 +110,8 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                     raise RuntimeError("SofaScore registry changed during compaction")
                 stream.seek(prefix)
                 for _event, raw in _events(stream, actual.st_size):
-                    out.write(raw); kept += 1
+                    out.write(raw)
+                    kept += 1
                 out.flush()
                 after = out.tell()
                 if after >= limit or after >= actual.st_size:
