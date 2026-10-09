@@ -12,7 +12,9 @@ FBREF_JANITOR_LOCK_WAIT_SECONDS = 90 * 60
 FBREF_JANITOR_LOCK_POLL_SECONDS = 30
 
 
-def maintain_fbref_stages_with_lock_wait(*, mode: str | None = None) -> dict[str, Any]:
+def maintain_fbref_stages_with_lock_wait(
+    *, mode: str | None = None, reschedule_on_busy: bool = False
+) -> dict[str, Any] | bool:
     """Wait for the publisher, then let the janitor acquire and fence its lock.
 
     The read-only probe avoids creating failed maintenance runs while ingest is
@@ -36,6 +38,11 @@ def maintain_fbref_stages_with_lock_wait(*, mode: str | None = None) -> dict[str
                 # generations and other integrity errors fail immediately.
                 if str(exc) != "FBref publication is locked by another control run":
                     raise
+        if reschedule_on_busy:
+            # A pooled writer must release its slot while the current tail
+            # needs that same pool to finish and release publication ownership.
+            logger.info("FBref janitor reschedules while publication is busy")
+            return False
         remaining = deadline - time.monotonic()
         if remaining > 0:
             logger.info(

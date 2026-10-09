@@ -14,6 +14,7 @@ accepts writer/query adapters and lazily creates the platform adapters only in
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -440,6 +441,52 @@ class QueryExecutorProtocol(Protocol):
     def execute_query(
         self, sql: str, params: Optional[tuple] = None
     ) -> Sequence[Any]: ...
+
+
+class UnderstatManifestQuery:
+    """Query the manifest without loading shared writers or runtime guards.
+
+    Used by history planning only. Connection/auth defaults match the writer's
+    Trino manager; the normal repository write path remains unchanged.
+    """
+
+    def __init__(self, *, catalog: str = "iceberg") -> None:
+        self.catalog = _validate_identifier(catalog, "catalog")
+
+    def execute_query(
+        self, sql: str, params: Optional[tuple] = None
+    ) -> Sequence[Any]:
+        import trino.auth
+        import trino.dbapi
+
+        password = os.environ.get("TRINO_PASSWORD")
+        options: dict[str, Any] = {
+            "host": os.environ.get("TRINO_HOST", "trino"),
+            "port": int(os.environ.get("TRINO_PORT", 8443 if password else 8080)),
+            "user": "airflow",
+            "catalog": self.catalog,
+        }
+        if password:
+            options.update(
+                http_scheme="https",
+                auth=trino.auth.BasicAuthentication("airflow", password),
+                verify=False,
+            )
+        connection = trino.dbapi.connect(**options)
+        try:
+            cursor = connection.cursor()
+            try:
+                # No cold-connection EXECUTE IMMEDIATE probe for the unbound
+                # history query, and no connection-ping statement.
+                if params is None:
+                    cursor.execute(sql)
+                else:
+                    cursor.execute(sql, params)
+                return cursor.fetchall()
+            finally:
+                cursor.close()
+        finally:
+            connection.close()
 
 
 def render_manifest_ddl(

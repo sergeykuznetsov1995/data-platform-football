@@ -24,6 +24,10 @@ class CatalogShapeError(ValueError):
     """Raised when a catalog/season payload cannot identify its source data."""
 
 
+class CalendarMissingError(CatalogShapeError):
+    """No calendar list or playoff match evidence exists in the source page."""
+
+
 class CatalogConflictError(CatalogShapeError):
     """Raised in strict mode when one FotMob id has conflicting metadata."""
 

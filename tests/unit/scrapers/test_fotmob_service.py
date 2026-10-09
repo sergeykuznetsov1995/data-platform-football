@@ -1432,6 +1432,49 @@ def test_transfer_pagination_uses_league_ids_and_stops_at_unique_hits():
     assert all("source_season_key" not in row for row in rows)
 
 
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        {"minAge": 15},
+        {"minDate": "2015-01-01"},
+        {"maxMarketValue": 119483344},
+        {"minAge": 15, "minDate": "2015-01-01"},
+        {"minAge": 15, "minDate": "2015-01-01", "maxMarketValue": 119483344},
+    ],
+)
+def test_transfer_filter_bounds_do_not_block_events_or_inventory(bounds):
+    url = canonicalize_target("transfers", {"leagueIds": "47", "page": 1}).canonical_url
+    payload = {
+        "hits": 1,
+        "transfers": [{"playerId": 1, "transferDate": "2026-07-01", "feeText": "Free"}],
+        **bounds,
+    }
+    service, transport, repository = _service({url: payload})
+    result = service.sync_transfers(47)
+    assert result.ok, result.errors
+    assert result.counts["events"] == 1
+    assert len(repository.tables["fotmob_transfer_events"]) == 1
+    inventory = repository.tables["fotmob_field_inventory"]
+    assert {row["json_path"] for row in inventory if row["disposition"] == "raw_only"} >= set(bounds)
+    assert json.loads(transport._results[-1].body) == payload
+
+
+@pytest.mark.parametrize("unknown", [{"newFilter": 1}, {"minAge": {"value": 15}}])
+def test_unknown_transfer_filter_still_blocks_event_publication(unknown):
+    url = canonicalize_target("transfers", {"leagueIds": "47", "page": 1}).canonical_url
+    payload = {
+        "hits": 1,
+        "transfers": [{"playerId": 1, "transferDate": "2026-07-01"}],
+        "minDate": "2015-01-01",
+        **unknown,
+    }
+    service, _, repository = _service({url: payload})
+    result = service.sync_transfers(47)
+    assert not result.ok
+    assert "unclassified transfer JSON paths" in result.errors[0]
+    assert not repository.tables.get("fotmob_transfer_events")
+
+
 def test_transfer_backfill_replays_checkpoint_pages_and_separates_windows():
     pages = {
         page: canonicalize_target(

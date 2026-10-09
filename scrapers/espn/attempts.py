@@ -29,6 +29,24 @@ ATTEMPT_COLUMNS = (
     ('measurement_id', 'varchar'),
 )
 
+# Local diagnostics only: never persist arbitrary exception names or messages.
+_ERROR_TYPES = frozenset({
+    'RequestException', 'ConnectionError', 'SSLError', 'ProxyError', 'HTTPError',
+    'Timeout', 'ConnectTimeout', 'ReadTimeout', 'ReadTimeoutError', 'TimeoutError',
+    'ConnectTimeoutError', 'NewConnectionError', 'NameResolutionError',
+    'MaxRetryError', 'ProtocolError', 'ResponseError', 'DecodeError',
+    'ChunkedEncodingError', 'ContentDecodingError', 'TooManyRedirects',
+    'InvalidURL', 'InvalidSchema', 'MissingSchema', 'InvalidHeader',
+    'RetryError', 'IncompleteRead', 'InvalidChunkLength', 'OSError',
+    'ConnectionResetError', 'ConnectionAbortedError', 'ConnectionRefusedError',
+    'BrokenPipeError', 'ValueError', 'error', '_ReadLimitExceeded',
+})
+_ERROR_PHASES = frozenset({'request', 'read', 'close'})
+
+
+def safe_error_type(value):
+    return value if type(value) is str and value in _ERROR_TYPES else 'OtherTransportError'
+
 
 class AttemptJournal:
     def __init__(self, path, *, utcnow_fn=lambda: datetime.now(timezone.utc)):
@@ -66,7 +84,8 @@ class AttemptJournal:
                        (row['attempt_id'], row['requested_at'], json.dumps(row)))
         return row['attempt_id']
 
-    def finish(self, attempt_id, *, status, timeout, http_ms, direct_bytes, complete=True):
+    def finish(self, attempt_id, *, status, timeout, http_ms, direct_bytes, complete=True,
+               error_type=None, error_phase=None):
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
             found = db.execute('SELECT payload FROM attempts WHERE id=?', (attempt_id,)).fetchone()
@@ -75,6 +94,8 @@ class AttemptJournal:
             row = json.loads(found[0])
             row.update(status=status, timeout=bool(timeout), http_ms=http_ms,
                        direct_bytes=direct_bytes, complete=bool(complete))
+            row.update(error_type=safe_error_type(error_type) if error_type is not None else None,
+                       error_phase=error_phase if type(error_phase) is str and error_phase in _ERROR_PHASES else None)
             db.execute('UPDATE attempts SET payload=?, dirty=1 WHERE id=?', (json.dumps(row), attempt_id))
 
     def rows(self, start=None, end=None):

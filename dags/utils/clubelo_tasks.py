@@ -39,6 +39,56 @@ def gate_daily(**context) -> bool:
     return not params.get('run_history')
 
 
+def gate_watch(**context) -> bool:
+    """Scheduled Monday 00:30 UTC (interval end), or explicit manual watch.
+
+    Cron logical_date is the *previous* slot, so using its weekday would
+    select the wrong run. master_pipeline triggers without run_watch stay off.
+    """
+    params = context.get('params') or {}
+    if params.get('run_history'):
+        return False
+    run_type = getattr(context.get('dag_run'), 'run_type', None)
+    run_type = getattr(run_type, 'value', run_type)
+    if run_type == 'manual':
+        return params.get('run_watch') is True
+    if run_type != 'scheduled':
+        return False
+    slot = context.get('data_interval_end')
+    if slot is None or slot.tzinfo is None:
+        return False
+    slot = slot.astimezone(timezone.utc)
+    return slot.weekday() == 0 and (slot.hour, slot.minute) == (0, 30)
+
+
+def finish_watch(results_path: str, **context) -> Dict[str, Any]:
+    """Soft report leaf for the optional branch, even on Bash failure/timeout.
+
+    validate_data remains a separate leaf: this task cannot hide daily failure.
+    """
+    import json
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        task = context['dag_run'].get_task_instance('check_watch')
+        if task.state == 'skipped':
+            return {'status': 'skipped'}
+        if task.state != 'success':
+            result = {'status': 'error', 'errors': [f'check_watch state: {task.state}']}
+        else:
+            with open(results_path, encoding='utf-8') as stream:
+                result = json.load(stream)
+            if not isinstance(result, dict) or result.get('status') not in ('success', 'error'):
+                raise ValueError('invalid watch report')
+        logger.log(logging.WARNING if result['status'] == 'error' else logging.INFO,
+                   'ClubElo watch result: %s', result)
+        return result
+    except Exception as exc:
+        logger.warning('ClubElo watch report unavailable: %s', exc)
+        return {'status': 'error', 'errors': [f'{type(exc).__name__}: {exc}']}
+
+
 def validate_data(results_path: str, **context) -> Dict[str, Any]:
     """Check the result JSON of THIS run's ``scrape_daily`` (#1463).
 

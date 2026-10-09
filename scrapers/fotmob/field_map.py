@@ -128,6 +128,9 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         # top-level fee-filter bound for the page's slider UI, not a transfer
         # event attribute.
         FieldRule("maxFee", FieldDisposition.RAW_ONLY, "transfers_raw", "fee filter bound; page chrome around the transfer stream"),
+        FieldRule("minAge", FieldDisposition.RAW_ONLY, "transfers_raw", "minimum age filter bound; retained in the raw transfer page"),
+        FieldRule("minDate", FieldDisposition.RAW_ONLY, "transfers_raw", "minimum date filter bound; retained in the raw transfer page"),
+        FieldRule("maxMarketValue", FieldDisposition.RAW_ONLY, "transfers_raw", "market value filter bound; retained in the raw transfer page"),
     ),
     "match": (
         FieldRule("", FieldDisposition.RAW_ONLY, "match_raw", "JSON document root"),

@@ -27,8 +27,18 @@ from .quality import (
     build_scope_attempt,
     validate_understat_scope,
 )
-from .scraper import UnderstatScraper
 from .service import UnderstatSource
+
+
+def __getattr__(name: str):
+    """Keep the legacy scraper facade outside catalog/planner imports."""
+    if name != "UnderstatScraper":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from .scraper import UnderstatScraper
+
+    globals()[name] = UnderstatScraper
+    return UnderstatScraper
+
 
 __all__ = [
     "LEAGUES",

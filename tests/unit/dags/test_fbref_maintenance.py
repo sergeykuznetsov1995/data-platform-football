@@ -13,9 +13,17 @@ def fbref_lock_wait(monkeypatch):
     from scrapers.fbref.control import ControlStore, StateConflict
 
     state = SimpleNamespace(
-        now=0.0, sleeps=[], events=[], owner="ingest", release_at=None,
-        acquire_error=None, fence_error=None, oversleep=0.0, raced=False,
-        race_once=False, probes=0,
+        now=0.0,
+        sleeps=[],
+        events=[],
+        owner="ingest",
+        release_at=None,
+        acquire_error=None,
+        fence_error=None,
+        oversleep=0.0,
+        raced=False,
+        race_once=False,
+        probes=0,
     )
 
     def sleep(seconds):
@@ -88,7 +96,9 @@ def fbref_lock_wait(monkeypatch):
     monkeypatch.setattr(ControlStore, "from_env", FakeControl)
     monkeypatch.setattr(maintenance, "janitor_fbref_generic_stages", janitor)
     monkeypatch.setattr(
-        waiting, "time", SimpleNamespace(monotonic=lambda: state.now, sleep=sleep),
+        waiting,
+        "time",
+        SimpleNamespace(monotonic=lambda: state.now, sleep=sleep),
         raising=False,
     )
     monkeypatch.setattr(waiting, "FBREF_JANITOR_LOCK_WAIT_SECONDS", 65)
@@ -104,8 +114,15 @@ def test_fbref_janitor_waits_for_ingest_release_then_fences_drop(fbref_lock_wait
 
     assert state.sleeps == [30, 30]
     assert state.events == [
-        "create", "start", "acquire", "janitor",
-        "renew", "assert", "drop", "release", ("finish", True),
+        "create",
+        "start",
+        "acquire",
+        "janitor",
+        "renew",
+        "assert",
+        "drop",
+        "release",
+        ("finish", True),
     ]
     assert result["control_run_id"] == "maintenance"
 
@@ -113,7 +130,9 @@ def test_fbref_janitor_waits_for_ingest_release_then_fences_drop(fbref_lock_wait
 @pytest.mark.unit
 @pytest.mark.parametrize("oversleep, expected_sleeps", [(0, [30, 30, 5]), (100, [30])])
 def test_fbref_janitor_timeout_leaves_ingest_lock_intact(
-    fbref_lock_wait, oversleep, expected_sleeps,
+    fbref_lock_wait,
+    oversleep,
+    expected_sleeps,
 ):
     maintenance, state = fbref_lock_wait
     state.oversleep = oversleep
@@ -188,9 +207,19 @@ def test_fbref_janitor_retries_atomic_acquire_race(fbref_lock_wait):
 
     assert state.sleeps == [30]
     assert state.events == [
-        "create", "start", "acquire", ("finish", False),
-        "create", "start", "acquire", "janitor", "renew", "assert", "drop",
-        "release", ("finish", True),
+        "create",
+        "start",
+        "acquire",
+        ("finish", False),
+        "create",
+        "start",
+        "acquire",
+        "janitor",
+        "renew",
+        "assert",
+        "drop",
+        "release",
+        ("finish", True),
     ]
 
 
@@ -206,3 +235,32 @@ def test_fbref_janitor_race_timeout_does_not_release_new_owner(fbref_lock_wait):
     assert state.owner == "ingest"
     assert state.sleeps == [30, 30, 5]
     assert state.events == ["create", "start", "acquire", ("finish", False)]
+
+
+def test_pooled_janitor_reschedules_without_sleep_or_control_run_while_ingest_owns_lock(
+    fbref_lock_wait,
+):
+    maintenance, state = fbref_lock_wait
+    assert (
+        maintenance.maintain_fbref_stages_with_lock_wait(reschedule_on_busy=True)
+        is False
+    )
+    assert state.sleeps == []
+    assert state.events == []
+    assert state.owner == "ingest"
+
+
+def test_pooled_janitor_lost_acquire_race_reschedules_and_preserves_current_owner(
+    fbref_lock_wait,
+):
+    maintenance, state = fbref_lock_wait
+    state.owner = None
+    state.race_once = True
+    assert (
+        maintenance.maintain_fbref_stages_with_lock_wait(reschedule_on_busy=True)
+        is False
+    )
+    assert state.sleeps == []
+    assert state.owner == "ingest"
+    assert "release" not in state.events
+    assert state.events[-1] == ("finish", False)

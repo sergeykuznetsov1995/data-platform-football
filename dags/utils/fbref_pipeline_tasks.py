@@ -125,7 +125,7 @@ FBREF_BOOTSTRAP_REQUIRED_TASK_IDS = (
     "release_bootstrap_publication_lock",
 )
 FBREF_PUBLICATION_SCOPE_TABLE = "fbref_target_scope"
-FBREF_PUBLICATION_LOCK_TTL_SECONDS = 8 * 24 * 60 * 60
+FBREF_PUBLICATION_LOCK_TTL_SECONDS = 18 * 60 * 60
 FBREF_LIVE_BUDGET_PROFILES = {
     (FBREF_PRODUCTION_REQUEST_LIMIT, FBREF_PRODUCTION_BYTE_LIMIT_MB): (
         "production"
@@ -595,13 +595,14 @@ def guard_fbref_history_window(
     margin_minutes: int = FBREF_HISTORY_WINDOW_MARGIN_MINUTES,
     overhead_minutes: int = FBREF_HISTORY_WINDOW_OVERHEAD_MINUTES,
     now=None,
+    measured_page_seconds=None,
 ) -> dict:
     """Refuse history inside a reserved window or too near the next one.
 
-    The existing page-interval projection and 45-minute margin are admission
-    estimates, not runtime ceilings (parse/queue delays are not modelled).
-    Reservations include observed current batch completion and DAG overhead;
-    late/overrunning current runs still require the publication lock (#1328).
+    The projection includes measured fetch+parse time with a conservative floor.
+    Reservations include observed current completion and overhead. The short
+    controller run/task limits and a fresh check after queue delay enforce the
+    bound independently of this admission estimate.
     """
 
     batches = _normalize_live_batch_count(max_batches)
@@ -613,9 +614,15 @@ def guard_fbref_history_window(
     if interval_seconds <= 0:
         raise ValueError("domain_interval_seconds must be positive")
 
+    from scrapers.fbref.history import HISTORY_PAGE_SECONDS_FLOOR
+    if measured_page_seconds is None:
+        measured_page_seconds = HISTORY_PAGE_SECONDS_FLOOR
+    measured = float(measured_page_seconds)
+    if not math.isfinite(measured) or measured <= 0:
+        raise ValueError("Missing or invalid measured fetch+parse duration")
     pages = batches * shard
     projected_minutes = int(overhead_minutes) + math.ceil(
-        pages * interval_seconds / 60
+        pages * max(interval_seconds, measured, HISTORY_PAGE_SECONDS_FLOOR) / 60
     )
     started_at = (
         datetime.now(timezone.utc)
@@ -1590,6 +1597,14 @@ def initialize_fbref_run(
     publishing=True,
 ) -> str:
     normalized_run_type = str(run_type).strip().casefold()
+    if normalized_run_type == "backfill":
+        if str(dag_id) != "dag_fbref_history_controller":
+            raise RuntimeError("Legacy history DAG/driver is retired; use the one authorized controller")
+        _require_history_controller_enabled()
+        if int(shard_size) != 1:
+            raise ValueError("History controller shard_size must be exactly one")
+        if _boolean_parameter(publishing, name="publishing"):
+            raise ValueError("The history controller cannot publish downstream")
     publishes = _boolean_parameter(publishing, name="publishing")
     if not publishes and normalized_run_type != "backfill":
         raise ValueError(
@@ -1659,6 +1674,7 @@ def acquire_fbref_publication_lock(
     airflow_run_id: str,
     dag_id: str,
     ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
+    queue=False,
 ) -> dict:
     """Fence every FBref Bronze publisher until publication is terminal."""
 
@@ -1669,6 +1685,7 @@ def acquire_fbref_publication_lock(
         run_id,
         dag_id=dag_id,
         ttl_seconds=int(ttl_seconds),
+        **({"queue": True} if queue else {}),
     )
     logger.info(
         "FBref publication lock acquired: owner=%s idempotent=%s",
@@ -1878,8 +1895,10 @@ def seed_fbref_historical_seasons(
         shard_size=shard_size,
         reservation_mb=reservation_mb,
     )
+    metadata = (_control_store().get_run(run_id) or {}).get("metadata", {})
     result = _pipeline().seed_historical_seasons(
-        run_id=run_id, settings=settings, limit=int(shard_size)
+        run_id=run_id, settings=settings, limit=int(shard_size),
+        **({"seasons": metadata["history_seasons"]} if "history_campaign" in metadata else {}),
     )
     logger.info("FBref backfill seed for %s: %s", run_id, result)
     return result
@@ -1910,6 +1929,7 @@ def run_recovery_wave(
         airflow_run_id=airflow_run_id, dag_id=dag_id
     )
     aggregate: dict[str, object] = {"batches": 0}
+    history_slice = dag_id == "dag_fbref_history_controller"
     while True:
         result = pipeline.recover_unprocessed_wave(
             control_run_id,
@@ -1936,6 +1956,8 @@ def run_recovery_wave(
                 aggregate[key] = bool(aggregate.get(key, False)) or value
             elif isinstance(value, int):
                 aggregate[key] = int(aggregate.get(key, 0)) + value
+        if history_slice:
+            break
         if parsed == 0 and retired == 0:
             # Расчистка сырья идёт ПЕРЕД живыми волнами, поэтому её тупик
             # раньше убивал весь ран: 31.07 три мёртвые season-страницы
@@ -2125,6 +2147,12 @@ def run_fbref_live_waves(
         shard_size=shard_size,
     )
     normalized_batches = _normalize_live_batch_count(max_batches)
+    if run_type == "backfill":
+        if dag_id != "dag_fbref_history_controller":
+            raise RuntimeError("Legacy history runner is retired")
+        guard_fbref_history_slice()
+        if int(shard_size) != 1 or normalized_batches != 1 or not 0 < float(deadline_seconds) <= 600:
+            raise ValueError("History slice must stay one page/one batch with a bounded deadline")
     command = [
         _legacy_scraper_python(),
         LIVE_WAVES_RUNNER,
@@ -2743,3 +2771,69 @@ __all__ = [
     "validate_fbref_runtime_limits",
     "validate_fbref_run",
 ]
+
+
+def wait_fbref_publication_lock(*, airflow_run_id, dag_id, ttl_seconds, **context):
+    """Sensor poke commits queue position then returns its worker/pool slot."""
+    if dag_id == "dag_fbref_history_controller":
+        guard_fbref_history_slice()
+    ttl = int(ttl_seconds)
+    dag_run = context.get("dag_run")
+    dag = context.get("dag")
+    if dag_run is not None and dag is not None and dag_run.start_date is not None:
+        deadline = dag_run.start_date + dag.dagrun_timeout
+        ttl = min(ttl, int((deadline - datetime.now(timezone.utc)).total_seconds()))
+    if ttl < 60:
+        from airflow.exceptions import AirflowFailException
+        raise AirflowFailException("No run duration remains for a publication lock")
+    result = acquire_fbref_publication_lock(airflow_run_id=airflow_run_id, dag_id=dag_id,
+                                          ttl_seconds=ttl, queue=True)
+    return bool(result.get("acquired") or result.get("idempotent"))
+
+
+def guard_fbref_history_slice(**_context):
+    _require_history_controller_enabled()
+    now = datetime.now(timezone.utc)
+    if not (now.hour == 22 and now.minute >= 30):
+        from airflow.exceptions import AirflowFailException
+        raise AirflowFailException("FBref history admission is restricted to the night window 22:30-23:00 UTC")
+    from scrapers.fbref.history import HistoryCampaign, HISTORY_SETUP_SECONDS
+    return guard_fbref_history_window(max_batches=2, shard_size=1,
+        overhead_minutes=HISTORY_SETUP_SECONDS // 60,
+        now=now,
+        measured_page_seconds=HistoryCampaign(_control_store()).page_seconds())
+
+
+def prepare_fbref_history_campaign(*, airflow_run_id, dag_id):
+    from scrapers.fbref.history import HistoryCampaign
+    campaign = HistoryCampaign(_control_store())
+    campaign.reconcile()
+    run_id = _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id)
+    selected = campaign.select(run_id)
+    return {"selected": selected, **campaign.summary()}
+
+
+def checkpoint_fbref_history_campaign(*, airflow_run_id, dag_id, **context):
+    """Persist progress on success or interruption, then release exact owner."""
+    from scrapers.fbref.history import HistoryCampaign
+    dag_run = context.get("dag_run")
+    states = {instance.task_id: str(instance.state) for instance in dag_run.get_task_instances()} if dag_run else {}
+    if states.get("prepare_history_campaign") != "success":
+        return finalize_fbref_publication_lock(airflow_run_id=airflow_run_id, dag_id=dag_id, **context)
+    run_id = _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id)
+    campaign = HistoryCampaign(_control_store())
+    try:
+        ti = context.get("ti")
+        result = ti.xcom_pull(task_ids="run_live_waves") if ti is not None else None
+        if isinstance(result, Mapping):
+            campaign.record_timing(run_id, result)
+        return campaign.reconcile()
+    finally:
+        finalize_fbref_publication_lock(airflow_run_id=airflow_run_id, dag_id=dag_id, **context)
+
+
+def _require_history_controller_enabled():
+    from scrapers.fbref.settings import strict_binary_flag
+    if not strict_binary_flag("FBREF_HISTORY_CONTROLLER_ENABLED"):
+        from airflow.exceptions import AirflowFailException
+        raise AirflowFailException("FBref history controller is disabled pending explicit launch approval")

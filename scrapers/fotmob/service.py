@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 from .catalog import (
     CLASSIFIER_VERSION,
     SEASONS_PARSER_VERSION,
+    CalendarMissingError,
     CatalogDiscovery,
     CatalogShapeError,
     SelectedSeasonMismatch,
@@ -93,6 +94,33 @@ def _failure_status(exc: BaseException) -> ManifestStatus:
     if any(base.__name__ == "TrinoError" for base in type(exc).__mro__):
         return ManifestStatus.RETRYABLE_FAILURE
     return ManifestStatus.SCHEMA_DRIFT
+
+
+def _is_calendar_unavailable_stub(payload: Mapping[str, Any]) -> bool:
+    """Recognize the retained metadata-only source page, never an empty list.
+
+    This shape was observed for six included competitions before #1288.
+    Extra calendar fields and malformed explicit lists remain schema drift.
+    Caller must still validate all JSON paths and protect committed matches.
+    """
+    overview = payload.get("overview")
+    fixtures = payload.get("fixtures")
+    overview_matches = overview.get("matches") if isinstance(overview, Mapping) else None
+    return (
+        isinstance(overview, Mapping)
+        and isinstance(fixtures, Mapping)
+        and set(fixtures) == {"hasOngoingMatch"}
+        and fixtures["hasOngoingMatch"] is False
+        and "matches" not in payload
+        and "leagueOverviewMatches" not in overview
+        and isinstance(overview_matches, Mapping)
+        and set(overview_matches) == {"hasOngoingMatch"}
+        and overview_matches["hasOngoingMatch"] is False
+        and payload.get("tabs") == []
+        and payload.get("table") is None
+        and payload.get("stats") == {}
+        and payload.get("playoff") is None
+    )
 
 
 MATCH_CONTENT_SECTIONS = (
@@ -1562,22 +1590,31 @@ class FotMobIngestService:
         try:
             seasons = parse_seasons(fetch.data, competition)
             selected = next((item for item in seasons if item.is_selected), None)
-            bundle = (
-                parse_season_bundle(fetch.data, ScopeRef.from_season(selected))
-                if selected is not None
-                else None
-            )
+            calendar_available = True
+            try:
+                bundle = (
+                    parse_season_bundle(fetch.data, ScopeRef.from_season(selected))
+                    if selected is not None
+                    else None
+                )
+            except CalendarMissingError:
+                if self.mode == RunMode.REPLAY or not _is_calendar_unavailable_stub(fetch.data):
+                    raise
+                # Discovery publishes valid season metadata, not a fabricated
+                # empty bundle. The actual season attempt stays incomplete.
+                bundle = None
+                calendar_available = False
             inventory: list[dict[str, Any]] = []
             unknown: tuple[str, ...] = ()
-            if bundle is not None:
+            if selected is not None:
                 blocking = [
                     issue
-                    for issue in bundle.issues
+                    for issue in (bundle.issues if bundle is not None else ())
                     if issue.code in _BLOCKING_PARSE_ISSUES
                 ]
                 inventory, unknown = self._inventory_rows(
                     "league_season",
-                    bundle.json_paths,
+                    bundle.json_paths if bundle is not None else inventory_json_paths(fetch.data),
                     competition_id=competition.competition_id,
                     source_season_key=selected.source_season_key,
                 )
@@ -1695,13 +1732,15 @@ class FotMobIngestService:
                     "selected_season": (
                         selected.source_season_key if selected else None
                     ),
-                    "json_paths": len(bundle.json_paths) if bundle else 0,
+                    "json_paths": len(inventory),
+                    "calendar_available": calendar_available,
                 },
                 unknown_paths=unknown,
             )
             result.tables.extend(paths_written)
             result.succeeded = len(seasons)
             result.counts["seasons"] = len(seasons)
+            result.metadata["calendar_available"] = calendar_available
             return CompetitionDiscoveryResult(
                 competition,
                 classification,
@@ -1909,7 +1948,36 @@ class FotMobIngestService:
 
         try:
             scope = ScopeRef(int(competition_id), str(source_season_key))
-            bundle = parse_season_bundle(fetch.data, scope)
+            try:
+                bundle = parse_season_bundle(fetch.data, scope)
+            except CalendarMissingError:
+                if self.mode == RunMode.REPLAY or not _is_calendar_unavailable_stub(fetch.data):
+                    raise
+                _, unknown = self._inventory_rows("league_season", inventory_json_paths(fetch.data))
+                if unknown:
+                    raise CatalogShapeError(f"unclassified calendar JSON paths: {list(unknown)}")
+                try:
+                    known_matches = self.repository.has_committed_matches(competition_id, source_season_key)
+                except Exception as exc:
+                    result.record_exception("calendar history lookup failed", exc)
+                    return result, None
+                if known_matches:
+                    raise
+                reason = f"source_calendar_unavailable: {competition_id}={source_season_key}; source publishes season metadata only"
+                result.retryable.append(reason)
+                result.metadata["calendar_available"] = False
+                if persist:
+                    self._commit_for_fetch(
+                        fetch,
+                        target_type="league_season",
+                        status=ManifestStatus.RETRYABLE_FAILURE,
+                        competition_id=competition_id,
+                        source_season_key=source_season_key,
+                        error_code="source_calendar_unavailable",
+                        error=reason,
+                        capabilities={"calendar_available": False},
+                    )
+                return result, None
             if not bundle.matches:
                 try:
                     known_matches = self.repository.has_committed_matches(

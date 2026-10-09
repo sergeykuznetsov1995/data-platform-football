@@ -28,16 +28,19 @@ def fbref_dags():
 
     bag = DagBag(dag_folder=str(DAGS_FOLDER), include_examples=False)
     expected = {
-        "dag_ingest_fbref",
-        "dag_bootstrap_fbref",
-        "dag_backfill_fbref",
-        "dag_replay_fbref",
+        "dag_ingest_fbref": 15,
+        "dag_bootstrap_fbref": 11,
+        "dag_backfill_fbref": 17,
+        "dag_fbref_history_controller": 18,
+        "dag_replay_fbref": 9,
     }
-    missing = expected.difference(bag.dags)
+    missing = set(expected).difference(bag.dags)
     assert not missing, (
         f"Missing FBref DAGs {sorted(missing)}; import errors: "
         f"{bag.import_errors}"
     )
+    for dag_id, task_count in expected.items():
+        assert len(bag.dags[dag_id].tasks) == task_count
     return {dag_id: bag.dags[dag_id] for dag_id in expected}
 
 

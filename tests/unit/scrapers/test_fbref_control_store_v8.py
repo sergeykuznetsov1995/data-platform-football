@@ -98,7 +98,7 @@ def competition_entry(index, *, gender="male", crawl_state=None, metadata=None):
 
 def test_v8_is_append_only_schema_for_provenance_aliases_and_cancellation():
     assert tuple(migration.version for migration in MIGRATIONS) == tuple(
-        range(1, 12)
+        range(1, 13)
     )
     migration = next(item for item in MIGRATIONS if item.version == 8)
     assert migration.version == 8
@@ -226,6 +226,8 @@ def test_publication_lock_acquire_is_retry_idempotent_and_owner_fenced():
     inserted = True
 
     def handler(sql, params):
+        if sql.startswith("SELECT waiter.run_id AS priority_owner"):
+            return [], 0
         nonlocal inserted
         if sql.startswith("SELECT pg_advisory_xact_lock"):
             return ([{"pg_advisory_xact_lock": None}], 1)
@@ -272,6 +274,8 @@ def test_publication_lock_rejects_an_active_different_owner():
     now = datetime.now(timezone.utc)
 
     def handler(sql, params):
+        if sql.startswith("SELECT waiter.run_id AS priority_owner"):
+            return [], 0
         if sql.startswith("SELECT pg_advisory_xact_lock"):
             return ([{"pg_advisory_xact_lock": None}], 1)
         if sql.startswith("SELECT status FROM fbref_control.crawl_run"):
@@ -785,6 +789,8 @@ def test_lane_unprocessed_raw_includes_failed_source_runs_oldest_first():
         "current",
         ["match"],
         ["match"],
+        None,
+        None,
         "page-v2",
         "typed-v3",
         "stateful-v4",
