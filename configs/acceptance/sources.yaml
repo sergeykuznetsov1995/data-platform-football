@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "board_url": "https://miro.com/app/board/uXjVEfZMz1U=/",
+  "source_table_url": "https://miro.com/app/board/uXjVEfZMz1U=/?moveToWidget=3458764685876111831",
+  "sources": {
+    "fotmob": {
+      "name": "FotMob",
+      "handoff": "/root/handoffs/fotmob-latest.md",
+      "miro_row_id": "aa7ecdeb-c893-4359-99dc-c5d950fee5f4",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/1289/night-recovery/after-first-cron-tick.json",
+        "/root/data-platform-football/.local/tasks/1289/night-recovery/operational/delivery-approval-plan.md",
+        "/root/data-platform-football/.local/tasks/1289/night-recovery/operational/pin-installation.json",
+        "/root/data-platform-football/.local/tasks/1288/delivery/production-acceptance.json"
+      ]
+    },
+    "sofascore": {
+      "name": "SofaScore",
+      "handoff": "/root/handoffs/sofascore-latest.md",
+      "miro_row_id": "89b94959-0690-46e9-921f-8ed0b693d516",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/1364/history-enable-20261009/handoff-readback.json",
+        "/root/data-platform-football/.local/tasks/1364/journal.md",
+        "/root/data-platform-football/.local/tasks/1361/",
+        "/root/data-platform-football/.local/tasks/1363/"
+      ]
+    },
+    "transfermarkt": {
+      "name": "Transfermarkt",
+      "handoff": "/root/handoffs/transfermarkt-latest.md",
+      "miro_row_id": "0c48719a-8b12-46f7-b745-e70b2b72fccf",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/1393/merge-proof.json",
+        "/root/data-platform-football/.local/tasks/1393/signal-probe-ledger.json",
+        "/root/data-platform-football/.local/tasks/1393/cohort/partial-analysis.json",
+        "/root/data-platform-football/.local/tasks/1393/cohort/retry-terminal-proof.json",
+        "/root/data-platform-football/.local/tasks/tm-brc-2025-players-resume/"
+      ]
+    },
+    "fbref": {
+      "name": "FBref",
+      "handoff": "/root/handoffs/fbref-latest.md",
+      "miro_row_id": "dbb83056-f836-4ddc-a8ce-4ac202e63241",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/fbref-1643/delivery/manifest.json",
+        "/root/data-platform-football/.local/tasks/fbref-1643/index-attempts-20261009T1214Z.json",
+        "/root/data-platform-football/.local/tasks/fbref-1643/acceptance-current-state-20261009T1212Z.txt",
+        "/root/data-platform-football/.local/tasks/fbref-1643/existing-lead-turn-status.json",
+        "/root/data-platform-football/.local/tasks/fbref-1323/current-schema-20261009T1155Z.json",
+        "/root/data-platform-football/.local/tasks/fbref-1328/merge-verification.json"
+      ]
+    },
+    "whoscored": {
+      "name": "WhoScored",
+      "handoff": "/root/handoffs/whoscored-latest.md",
+      "miro_row_id": "719b9754-c22e-4171-8481-f515ef33df9a",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/1475/acceptance-report.md",
+        "/root/data-platform-football/.local/tasks/1475/schedule-log-inventory.json",
+        "/root/data-platform-football/.local/tasks/1599/acceptance-report.md",
+        "/root/data-platform-football/.local/tasks/1599/verification.json",
+        "/root/data-platform-football/.local/tasks/1478/delivery.json",
+        "/root/data-platform-football/.local/tasks/1478/runner-after-delivery.json"
+      ]
+    },
+    "espn": {
+      "name": "ESPN",
+      "handoff": "/root/handoffs/espn-latest.md",
+      "miro_row_id": "9f815eb4-e0b7-454d-a6fc-0cf880719706",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/1510/http-diagnostics-20261009/handoff-state.json",
+        "/root/data-platform-football/.local/tasks/1510/http-diagnostics-20261009/delivery-enabled.json",
+        "/root/espn-deliveries/plans/plan-1510-approved.md"
+      ]
+    },
+    "clubelo": {
+      "name": "ClubElo",
+      "handoff": "/root/handoffs/clubelo-latest.md",
+      "miro_row_id": "2230679a-68c7-4f48-b3f1-72e9d92f4e64",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/1465/daily-activation-20261009/accepted-daily.json",
+        "/root/data-platform-football/.local/tasks/1465/daily-activation-20261009/result.md",
+        "/root/data-platform-football/.local/tasks/1465/clubelo-code-pre-unpause-20261009.json",
+        "/root/data-platform-football/.local/tasks/1466/ci-final.json"
+      ]
+    },
+    "understat": {
+      "name": "Understat",
+      "handoff": "/root/handoffs/understat-latest.md",
+      "miro_row_id": "6a860140-cabe-46ca-88fd-24af0da03316",
+      "evidence_hints": [
+        "/root/data-platform-football/.local/tasks/1434/handoff-refresh-proof.json",
+        "/root/data-platform-football/.local/tasks/1434/execution.md",
+        "/root/data-platform-football/.local/tasks/1433/execution.md",
+        "/root/data-platform-football/.local/tasks/1433/summary/"
+      ]
+    }
+  }
+}
