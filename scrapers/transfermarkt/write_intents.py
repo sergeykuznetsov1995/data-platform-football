@@ -99,3 +99,71 @@ def pending_intents(identity):
 
 def finish_intent(path):
     path.unlink()
+
+
+def snapshot_anchors(path, connection, outputs, *, capture_times=None):
+    """Persist the pre-write warehouse boundary before any career mutation."""
+    from scrapers.transfermarkt.writer import CAREER_TABLES, execute_statement
+    path = Path(path)
+    anchor_path = path.parent / 'anchors' / path.name
+    tables = sorted(output.table_name for output in outputs if output.table_name in CAREER_TABLES)
+    if not tables:
+        return {}
+    if anchor_path.exists():
+        wrapped = json.loads(anchor_path.read_text())
+        body = json.dumps(wrapped['payload'], sort_keys=True, separators=(',', ':'))
+        if hashlib.sha256(body.encode()).hexdigest() != wrapped['sha256']:
+            raise RuntimeError('career snapshot anchor checksum differs')
+        payload = wrapped['payload']
+        if payload['intent_sha256'] != path.stem or sorted(payload['tables']) != tables:
+            raise RuntimeError('career snapshot anchor identity differs')
+    else:
+        anchors = {}
+        cur = connection.cursor()
+        try:
+            for table in tables:
+                try:
+                    execute_statement(cur, f'SELECT snapshot_id FROM iceberg.bronze."{table}$snapshots" ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1')
+                    rows = cur.fetchall()
+                except Exception as exc:
+                    if not any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+                        raise
+                    rows = []
+                anchors[table] = int(rows[0][0]) if rows else None
+        finally:
+            cur.close()
+        from datetime import timezone
+        clocks = {str(player): datetime.fromisoformat(stamp).astimezone(timezone.utc).isoformat(timespec='microseconds')
+                  for player, stamp in (capture_times or {}).items()}
+        payload = {'intent_sha256': path.stem, 'tables': anchors, 'capture_times': clocks}
+        body = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        anchor_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = anchor_path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
+        with temporary.open('x') as handle:
+            json.dump({'payload': payload, 'sha256': hashlib.sha256(body.encode()).hexdigest()}, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, anchor_path)
+        directory = os.open(anchor_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    # Registry protection precedes Bronze as well. Shared maintenance cannot
+    # discard the new snapshot in the crash gap before capture_refs exists.
+    from scrapers.transfermarkt.career_refs import persist_snapshot_anchors
+    persist_snapshot_anchors(connection, payload)
+    return payload['tables']
+
+
+def read_snapshot_anchors(path):
+    path = Path(path)
+    anchor_path = path.parent / 'anchors' / path.name
+    if not anchor_path.exists():
+        return {}
+    wrapped = json.loads(anchor_path.read_text())
+    payload = wrapped['payload']
+    body = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    if hashlib.sha256(body.encode()).hexdigest() != wrapped['sha256'] or payload['intent_sha256'] != path.stem:
+        raise RuntimeError('career snapshot anchor identity/checksum differs')
+    return payload['tables']

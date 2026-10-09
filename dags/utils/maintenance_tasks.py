@@ -1376,7 +1376,7 @@ def _maintain_one(conn, fq: str, retention_threshold: str) -> dict:
             logger.warning('TM retention skipped: shared host writer lock is not configured')
             return {'retention_skipped': True, 'reason': 'shared_tm_writer_lock_required',
                 'deleted_files_count': 0, 'scanned_files_count': 0}
-        from scrapers.transfermarkt.career_refs import TABLE, LEGACY_TABLES
+        from scrapers.transfermarkt.career_refs import TABLE, LEGACY_TABLES, ANCHORS_TABLE
         native = next((key for key, legacy in LEGACY_TABLES.items() if legacy == table), table)
         snapshot_field = 'legacy_snapshot_id' if table != native else 'snapshot_id'
         with writer_lock():
@@ -1387,6 +1387,11 @@ def _maintain_one(conn, fq: str, retention_threshold: str) -> dict:
                     protected = 0  # Pre-1399 source has no new immutable pins.
                 else:
                     raise  # An unavailable pin registry cannot permit cleanup.
+            try:
+                protected += int(_fetch_scalar(conn, f"SELECT COUNT(*) FROM {ANCHORS_TABLE} WHERE table_name = '{table}'") or 0)
+            except Exception as exc:
+                if not any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+                    raise
             if protected:
                 logger.info('TM retention preserved %s: %d immutable capture receipts', fq, protected)
                 return {'retention_skipped': True, 'protected_receipt_count': protected,

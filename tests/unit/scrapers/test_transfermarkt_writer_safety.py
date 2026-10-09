@@ -120,6 +120,7 @@ def test_stale_capture_refuses_bundle_before_first_save():
     spec = run.ENTITY_SPECS[run.ENTITY_MV_HISTORY]
     frame = pd.DataFrame({'player_id': ['1'], 'fetched_at': [datetime(2026, 10, 1, tzinfo=timezone.utc)], '_ingested_at': [datetime(2026, 10, 1)]})
     scraper = MagicMock()
+    scraper._tm_career_intent_path = None
     scraper._bronze_connection.return_value.cursor.return_value.fetchall.return_value = [('1', datetime(2026, 10, 2))]
     scraper._build_partition_delete_filter.return_value = "player_id = '1'"
     with pytest.raises(writer.StaleTransfermarktWrite):
@@ -132,15 +133,16 @@ def test_dq_detects_physical_keys_across_batches_and_latest_reference_loss():
         sql = dq.build_career_write_duplicates_sql(table)
         assert 'HAVING COUNT(*) > 1' in sql and '_batch_id' not in sql
     loss = dq.build_career_write_loss_sql('iceberg.bronze.transfermarkt_market_value_points')
-    assert 'latest_refs' in loss and 'COALESCE(l.actual_rows, 0) <> r.expected_rows' in loss
-    assert 'empty_receipt.last_success_at >= r.committed_at' in loss
+    assert 'latest_refs' in loss and 'ORDER BY capture_clock DESC' in loss
+    assert 'CASE WHEN r.expected_rows = 0 THEN COALESCE(total.actual_rows, 0)' in loss
+    assert 'empty_receipt.last_success_at >= r.capture_clock' in loss
 
 
 def test_shared_maintenance_preserves_tm_original_snapshots_and_other_thresholds(monkeypatch):
     from utils import maintenance_tasks as maintenance
     conn = MagicMock()
     monkeypatch.setattr(writer, 'shared_writer_lock_ready', lambda: True)
-    monkeypatch.setattr(maintenance, '_fetch_scalar', lambda _conn, _sql: 3)
+    monkeypatch.setattr(maintenance, '_fetch_scalar', lambda _conn, _sql: 0 if 'snapshot_anchors' in _sql else 3)
     execute = MagicMock()
     monkeypatch.setattr(maintenance, '_exec_alter', execute)
     protected = maintenance._maintain_one(conn, 'iceberg."bronze"."transfermarkt_market_value_points"', '30d')
@@ -199,3 +201,56 @@ def test_committing_cursor_preserves_affected_rows_for_native_cas():
     adapted = writer.CommittingCursor(raw)
     assert _drain(adapted, sql) == [(1,)]
     assert raw.fetchall.call_count == 1
+
+
+def test_parent_immutable_events_append_only_new_cumulative_delta(monkeypatch):
+    from dags.scripts import run_transfermarkt_scope_cycle as cycle
+    from tests.unit.utils.test_transfermarkt_current_write import MemoryDB
+    from copy import deepcopy
+    db = MemoryDB()
+    fields = cycle.PROXY_EVENT_FIELDS
+    initial = {'parent_cycle_id': 'parent', 'scopes': {'scope': {'child_cycle_id': 'child',
+        'manifest_digest': 'first', 'by_entity': {'market_value_points': dict.fromkeys(fields, 10)}}}}
+    # Exercise the event journal's real SQL without unrelated seven-entity shadow.
+    monkeypatch.setattr(cycle, 'proxy_ledger_merge_sql', lambda _: 'SELECT 1')
+    cycle.persist_parent_proxy_ledger(initial, connection_factory=lambda: db)
+    next_receipt = deepcopy(initial)
+    next_receipt['scopes']['scope']['manifest_digest'] = 'second'
+    next_receipt['scopes']['scope']['by_entity']['market_value_points'] = dict.fromkeys(fields, 16)
+    cycle.persist_parent_proxy_ledger(next_receipt, connection_factory=lambda: db)
+    cycle.persist_parent_proxy_ledger(next_receipt, connection_factory=lambda: db)
+    rows = db.sql.execute('SELECT requests FROM transfermarkt_proxy_ledger_events_v1 ORDER BY requests').fetchall()
+    assert rows == [(6,), (10,)]
+    assert db.sql.execute('SELECT SUM(requests) FROM transfermarkt_proxy_ledger_events_v1').fetchone()[0] == 16
+    old = deepcopy(next_receipt)
+    old['scopes']['scope']['by_entity']['market_value_points']['requests'] = 15
+    with pytest.raises(cycle.ScopeCycleError, match='regressed'):
+        cycle.persist_parent_proxy_ledger(old, connection_factory=lambda: db)
+    assert db.sql.execute('SELECT COUNT(*) FROM transfermarkt_proxy_ledger_events_v1').fetchone()[0] == 2
+
+
+@pytest.mark.parametrize('policy_name', ['standing_approval_policy.json', 'standing_backfill_policy.json'])
+def test_additive_safety_ops_permission_migration_preserves_only_exact_old_body(policy_name):
+    from dags.scripts import run_transfermarkt_scope_cycle as cycle
+    from dags.utils.transfermarkt_approval import load_standing_policy
+    from dataclasses import replace
+    from pathlib import Path
+    policy = load_standing_policy(Path(cycle.__file__).parents[1] / ('configs/transfermarkt/' + policy_name))
+    original = replace(policy, allowed_write_tables=tuple(table for table in policy.allowed_write_tables if table not in cycle.CAREER_SAFETY_OPS_TABLES))
+    assert cycle.standing_policy_hash_compatible(policy, original.policy_hash)
+    assert cycle.CAREER_SAFETY_OPS_TABLES <= cycle.required_write_tables('dual')
+    assert cycle.CAREER_SAFETY_OPS_TABLES <= cycle.required_write_tables('native-only')
+    changed = replace(policy, paid_proxy=replace(policy.paid_proxy, request_limit=policy.paid_proxy.request_limit + 1))
+    assert not cycle.standing_policy_hash_compatible(changed, original.policy_hash)
+    assert not cycle.standing_policy_hash_compatible(policy, '0' * 64)
+
+
+def test_pending_prewrite_anchor_protects_compaction_retention_gap(monkeypatch):
+    from utils import maintenance_tasks as maintenance
+    monkeypatch.setattr(writer, 'shared_writer_lock_ready', lambda: True)
+    monkeypatch.setattr(maintenance, '_fetch_scalar', lambda _conn, sql: 1 if 'snapshot_anchors' in sql else 0)
+    execute = MagicMock()
+    monkeypatch.setattr(maintenance, '_exec_alter', execute)
+    result = maintenance._maintain_one(MagicMock(), 'iceberg.bronze.transfermarkt_transfer_events', '30d')
+    assert result['retention_skipped'] and result['protected_receipt_count'] == 1
+    execute.assert_not_called()

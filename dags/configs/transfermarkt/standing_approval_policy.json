@@ -29,11 +29,14 @@
     "iceberg.bronze.transfermarkt_transfer_events",
     "iceberg.bronze.transfermarkt_transfers",
     "iceberg.ops.proxy_traffic_runs",
+    "iceberg.ops.transfermarkt_career_capture_refs_v1",
+    "iceberg.ops.transfermarkt_career_snapshot_anchors_v1",
     "iceberg.ops.transfermarkt_current_checks_v1",
     "iceberg.ops.transfermarkt_current_signals_v1",
     "iceberg.ops.transfermarkt_dual_write_manifest_v2",
     "iceberg.ops.transfermarkt_fetch_state",
     "iceberg.ops.transfermarkt_native_write_manifest_v2",
+    "iceberg.ops.transfermarkt_proxy_ledger_events_v1",
     "iceberg.ops.transfermarkt_proxy_ledger_v2",
     "iceberg.ops.transfermarkt_scope_manifest_v2"
   ]

@@ -10,6 +10,7 @@ import pytest
 
 from dags.utils import transfermarkt_current_write as current
 from scrapers.transfermarkt import scraper as tm
+from scrapers.transfermarkt import writer as tm_writer
 from scrapers.transfermarkt.client import TransfermarktHttpClient, CurrentPortionDeadlineExceeded
 from scrapers.transfermarkt.current_capture import ClubRosterSnapshot, FullRosterSnapshot
 from scrapers.transfermarkt.raw_store import RawResponseStore
@@ -31,6 +32,15 @@ class MemoryDB:
         self.corrupt_time = False
         self.fail_sql = None
         self.next_snapshot_id = 1
+        self.snapshots = {}
+
+    def commit_snapshot(self, table):
+        snapshot = self.next_snapshot_id
+        self.next_snapshot_id += 1
+        prior = self.snapshots.get(table, [])
+        self.sql.execute(f'CREATE TABLE {table}__snapshot_{snapshot} AS SELECT * FROM {table}')
+        self.snapshots.setdefault(table, []).append((snapshot, prior[-1][0] if prior else None,
+            datetime.now(timezone.utc).replace(tzinfo=None).isoformat()))
 
     def cursor(self):
         return MemoryCursor(self)
@@ -52,10 +62,19 @@ class MemoryCursor:
         sql = re.sub(r'iceberg\.(?:bronze|ops)\.', '', sql).strip()
         if '$snapshots' in sql:
             target = re.search(r'FROM "?(\w+)\$snapshots', sql).group(1)
-            snapshot = self.db.next_snapshot_id
-            self.db.next_snapshot_id += 1
-            self.cur.execute(f'CREATE TABLE {target}__snapshot_{snapshot} AS SELECT * FROM {target}')
-            self.cur.execute('SELECT ? AS snapshot_id', (snapshot,))
+            if not self.db.sql.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (target,)).fetchone():
+                raise RuntimeError('TABLE_NOT_FOUND: ' + target)
+            self.cur.execute('DROP TABLE IF EXISTS snapshot_metadata')
+            self.cur.execute('CREATE TEMP TABLE snapshot_metadata(snapshot_id bigint, parent_id bigint, committed_at text)')
+            self.cur.executemany('INSERT INTO snapshot_metadata VALUES (?, ?, ?)', self.db.snapshots.get(target, []))
+            sql = re.sub(r'"?\w+\$snapshots"?', 'snapshot_metadata', sql)
+            self.cur.execute(sql, tuple(params))
+            self.description = self.cur.description
+            return
+        if 'CROSS JOIN UNNEST(CAST(JSON_PARSE(a.capture_times_json)' in sql:
+            placeholders = ', '.join('?' for _ in params[1:])
+            self.cur.execute('SELECT j.key source_id, MAX(j.value) FROM transfermarkt_career_snapshot_anchors_v1 a '
+                f'JOIN json_each(a.capture_times_json) j WHERE a.table_name=? AND j.key IN ({placeholders}) GROUP BY j.key', tuple(params))
             self.description = self.cur.description
             return
         sql = re.sub(r'(\w+) FOR VERSION AS OF (\d+)', r'\1__snapshot_\2', sql)
@@ -82,15 +101,20 @@ class MemoryCursor:
                         f'(SELECT 1 FROM {table} t WHERE t.endpoint=s.endpoint AND t.source_id=s.source_id '
                         f'AND t.parser_version=s.parser_version AND t.schema_version=s.schema_version)')
                     self.cur.execute('DROP TABLE fetch_source')
-                elif table in {'transfermarkt_dual_write_manifest_v2', 'transfermarkt_native_write_manifest_v2', 'transfermarkt_career_capture_refs_v1'}:
+                elif table in {'transfermarkt_dual_write_manifest_v2', 'transfermarkt_native_write_manifest_v2', 'transfermarkt_career_capture_refs_v1', 'transfermarkt_career_snapshot_anchors_v1', 'transfermarkt_proxy_ledger_events_v1'}:
                     predicate = sql.split('ON', 1)[1].split('WHEN MATCHED', 1)[0]
                     keys = re.findall(r't\.(\w+)\s*=\s*s\.\1\b', predicate)
                     assert keys, sql
                     self.cur.execute(f'CREATE TEMP TABLE manifest_source AS SELECT * FROM {table} WHERE 0')
                     self.cur.execute(f'INSERT INTO manifest_source ({columns}) VALUES {values}')
-                    self.cur.execute(f'DELETE FROM {table} WHERE EXISTS (SELECT 1 FROM manifest_source s WHERE '
-                                     + ' AND '.join(f'{table}.{key} = s.{key}' for key in keys) + ')')
-                    self.cur.execute(f'INSERT INTO {table} ({columns}) SELECT {columns} FROM manifest_source')
+                    match = ' AND '.join(f'{table}.{key} = s.{key}' for key in keys)
+                    if 'WHEN MATCHED' in sql:
+                        self.cur.execute(f'DELETE FROM {table} WHERE EXISTS (SELECT 1 FROM manifest_source s WHERE ' + match + ')')
+                        self.cur.execute(f'INSERT INTO {table} ({columns}) SELECT {columns} FROM manifest_source')
+                    else:
+                        source_cols = ', '.join('s.' + col.strip() for col in columns.split(','))
+                        self.cur.execute(f'INSERT INTO {table} ({columns}) SELECT {source_cols} FROM manifest_source s WHERE NOT EXISTS '
+                            f'(SELECT 1 FROM {table} WHERE ' + match + ')')
                     self.cur.execute('DROP TABLE manifest_source')
                 else:
                     self.cur.execute(f'INSERT INTO {table} ({columns}) VALUES {values}')
@@ -98,6 +122,9 @@ class MemoryCursor:
             else:
                 sql = re.sub(r'\s+WITH \(format =.*', '', sql, flags=re.S)
                 self.cur.execute(sql, tuple(params))
+                delete = re.match(r'DELETE FROM (transfermarkt_\w+)', sql)
+                if delete and delete.group(1) in tm_writer.CAREER_TABLES:
+                    self.db.commit_snapshot(delete.group(1))
             self.description = self.cur.description
         except sqlite3.OperationalError as exc:
             if 'no such table' in str(exc):
@@ -142,6 +169,8 @@ class MemoryWriter(IcebergWriter):
             cur.execute(f"UPDATE {table} SET source_body_hash = 'wrong-hash'")
         if self.db.corrupt_time and table == 'transfermarkt_squad_memberships':
             cur.execute(f"UPDATE {table} SET fetched_at = '2026-10-08T02:00:00.000000' WHERE club_id = '10'")
+        if table in tm_writer.CAREER_TABLES:
+            self.db.commit_snapshot(table)
         return 'iceberg.' + database + '.' + table
 
 
@@ -831,3 +860,224 @@ def test_pending_history_ops_reconcile_after_current_supersedes_without_older_ov
     pd.testing.assert_frame_equal(latest, _table(scraper, 'transfermarkt_market_value_points'))
     assert sum(len(client.get_calls) for client in first_factory.clients) == 1
     assert sum(len(client.get_calls) for client in latest_factory.clients) == 1
+
+@pytest.mark.parametrize('new_response', [
+    {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 9000000, 'verein': 'Current', 'age': '21', 'mw': 'EUR9m'}]},
+    {'list': []},
+])
+def test_before_receipt_crash_recovers_anchored_original_after_newer_current(scraper, new_response):
+    from scrapers.transfermarkt.write_intents import pending_intents
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    first = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'History', 'age': '20', 'mw': 'EUR1m'}]}])
+    scraper.test_db.fail_sql = 'CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_capture_refs_v1'
+    with pytest.raises(RuntimeError, match='injected late'):
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'old-original', decoded_body_soft_stop_bytes=100000)
+    original = _table(scraper, 'transfermarkt_market_value_points').copy()
+    assert scraper.test_db.sql.execute('SELECT COUNT(*) FROM transfermarkt_career_snapshot_anchors_v1').fetchone()[0] == 2
+    scraper.test_db.fail_sql = None
+    latest = http(scraper, [new_response])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'fresh-current', decoded_body_soft_stop_bytes=100000)
+    fresh_rows = _table(scraper, 'transfermarkt_market_value_points').copy()
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'old-recovery', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof['reconciled_without_http'] and proof['cycle_id'] == 'old-original'
+    pd.testing.assert_frame_equal(fresh_rows, _table(scraper, 'transfermarkt_market_value_points'))
+    row = proof['manifests'][0]['rows'][0]
+    snap = current.run._query_dataframe(scraper.test_db,
+        f"SELECT * FROM iceberg.bronze.transfermarkt_market_value_points FOR VERSION AS OF {row['native_snapshot_id']}", [])
+    assert current._rows(snap) == current._rows(original)
+    assert sum(len(client.get_calls) for client in first.clients) == 1
+    assert sum(len(client.get_calls) for client in latest.clients) == 1
+    if not new_response['list']:
+        assert scraper.test_db.sql.execute("SELECT status FROM transfermarkt_fetch_state WHERE source_id='1'").fetchone()[0] == 'authoritative_empty'
+
+
+def test_native_only_cached_career_reads_original_lineage_without_legacy_tables(scraper):
+    http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Current', 'age': '20', 'mw': 'EUR1m'}]}])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE,
+        {'write_mode': 'native-only', 'revision': 7}, 'native-cache', decoded_body_soft_stop_bytes=100000)
+    spec = current.run._spec_for_write_mode(current.run.ENTITY_SPECS[current.run.ENTITY_MV_HISTORY], 'native-only')
+    before = current.run._query_dataframe(scraper.test_db, 'SELECT * FROM iceberg.bronze.transfermarkt_market_value_points', [])
+    scraper.test_db.events.clear()
+    cached = current.run._load_cached_career_frames(scraper, spec, ['1'])['market_value_points']
+    assert current._rows(cached) == current._rows(before)
+    assert not any('dual_write_manifest' in sql or 'transfermarkt_market_value_history' in sql for sql in scraper.test_db.events)
+
+
+def test_failed_uncommitted_old_intent_cannot_resurrect_new_successful_empty(scraper):
+    from scrapers.transfermarkt.writer import guard_frames, StaleTransfermarktWrite
+    import pandas as pd
+    http(scraper, [{'list': []}])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'empty-clock', decoded_body_soft_stop_bytes=100000)
+    old = pd.DataFrame({'player_id': ['1'], 'fetched_at': [datetime(2020, 1, 1, tzinfo=timezone.utc)], '_batch_id': ['old']})
+    with pytest.raises(StaleTransfermarktWrite):
+        guard_frames(scraper, current.run.ENTITY_SPECS[current.run.ENTITY_MV_HISTORY].outputs, {'market_value_points': old, 'legacy_market_value_history': old})
+    assert not scraper.test_db.sql.execute("SELECT 1 FROM sqlite_master WHERE name='transfermarkt_market_value_points'").fetchall()
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_old_typed_empty_reconciles_without_deleting_fresher_current(scraper, existing):
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    value = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    if existing:
+        http(scraper, [value])
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'seed', decoded_body_soft_stop_bytes=100000)
+    original_empty = http(scraper, [{'list': []}])
+    scraper.test_db.fail_sql = 'CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_capture_refs_v1'
+    with pytest.raises(RuntimeError, match='injected late'):
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'old-empty', decoded_body_soft_stop_bytes=100000)
+    scraper.test_db.fail_sql = None
+    newest = http(scraper, [value])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'new-full', decoded_body_soft_stop_bytes=100000)
+    live = _table(scraper, 'transfermarkt_market_value_points').copy()
+    receipt = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'replay-empty', decoded_body_soft_stop_bytes=100000)
+    assert receipt['verified'] and receipt['reconciled_without_http']
+    pd.testing.assert_frame_equal(live, _table(scraper, 'transfermarkt_market_value_points'))
+    row = receipt['manifests'][0]['rows'][0]
+    assert row['physical_refs'] == [['1', row['native_batch_id'], 0]]
+    assert row['empty_capture_refs'][0]['status'] == 'authoritative_empty'
+    assert row['empty_capture_refs'][0]['raw_attempts']
+    assert sum(len(c.get_calls) for c in original_empty.clients) == 1
+    assert sum(len(c.get_calls) for c in newest.clients) == 1
+
+
+def test_two_partial_captures_share_resume_cycle_but_not_immutable_ref_unit(scraper):
+    from scrapers.transfermarkt.career_refs import physical_predicate
+    value = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    rows = []
+    for player in ('1', '2'):
+        http(scraper, [value])
+        receipt = current.fetch_current_career(scraper, 'market_value_points', [player], SCOPE, PREFLIGHT, 'stable-cycle', decoded_body_soft_stop_bytes=100000)
+        rows.append((receipt['manifest_cycle_id'], receipt['manifests'][0]['rows'][0]))
+    assert rows[0][1]['capture_unit_id'] != rows[1][1]['capture_unit_id']
+    assert rows[0][1]['native_batch_id'] != rows[1][1]['native_batch_id']
+    for cycle_id, row in rows:
+        capture = physical_predicate(scraper.test_db.cursor(), cycle_id, row['entity'], row['native_table'], batch_id=row['native_batch_id'])
+        assert capture.refs == row['physical_refs']
+
+
+def test_mixed_bundle_recovery_checks_second_original_empty_delete_snapshot(scraper):
+    full = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    http(scraper, [full])
+    current.fetch_current_career(scraper, 'market_value_points', ['2'], SCOPE, PREFLIGHT, 'seed-player2', decoded_body_soft_stop_bytes=100000)
+    original = http(scraper, [full, {'list': []}])
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    scraper.test_db.fail_sql = 'CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_capture_refs_v1'
+    with pytest.raises(RuntimeError, match='injected late'):
+        current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT, 'old-mixed', decoded_body_soft_stop_bytes=100000)
+    scraper.test_db.fail_sql = None
+    latest = http(scraper, [full])
+    current.fetch_current_career(scraper, 'market_value_points', ['2'], SCOPE, PREFLIGHT, 'new-player2', decoded_body_soft_stop_bytes=100000)
+    current_rows = _table(scraper, 'transfermarkt_market_value_points').copy()
+    receipt = current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT, 'replay-mixed', decoded_body_soft_stop_bytes=100000)
+    assert receipt['verified'] and receipt['reconciled_without_http']
+    pd.testing.assert_frame_equal(current_rows, _table(scraper, 'transfermarkt_market_value_points'))
+    row = receipt['manifests'][0]['rows'][0]
+    assert {item[0]: item[2] for item in row['physical_refs']} == {'1': 1, '2': 0}
+    assert sum(len(c.get_calls) for c in original.clients) == 2
+    assert sum(len(c.get_calls) for c in latest.clients) == 1
+
+
+def test_refs_allow_two_immutable_batches_for_same_history_child_entity(scraper):
+    from scrapers.transfermarkt.career_refs import persist_capture_refs, physical_predicate
+    full = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    units = []
+    for player in ('1', '2'):
+        http(scraper, [full])
+        current.fetch_current_career(scraper, 'market_value_points', [player], SCOPE, PREFLIGHT, 'current-' + player, decoded_body_soft_stop_bytes=100000)
+        frame = current.run._query_dataframe(scraper.test_db,
+            'SELECT * FROM iceberg.bronze.transfermarkt_market_value_points WHERE player_id=?', [player])
+        proof = persist_capture_refs(scraper.test_db, 'stable-history-child', 'market_value_points', 'transfermarkt_market_value_points', frame)
+        units.append((frame._batch_id.iloc[0], proof))
+    assert len({proof['capture_unit_id'] for _, proof in units}) == 2
+    for batch, proof in units:
+        predicate = physical_predicate(scraper.test_db.cursor(), 'stable-history-child', 'market_value_points', 'transfermarkt_market_value_points', batch_id=batch)
+        assert predicate.refs == proof['physical_refs']
+
+
+def test_two_empty_players_in_same_current_cycle_get_distinct_original_units(scraper):
+    proofs = []
+    for player in ('1', '2'):
+        http(scraper, [{'list': []}])
+        receipt = current.fetch_current_career(scraper, 'market_value_points', [player], SCOPE, PREFLIGHT, 'same-portion', decoded_body_soft_stop_bytes=100000)
+        proofs.append(receipt['manifests'][0]['rows'][0])
+    assert proofs[0]['native_batch_id'] != proofs[1]['native_batch_id']
+    assert proofs[0]['capture_unit_id'] != proofs[1]['capture_unit_id']
+    assert proofs[0]['empty_capture_refs'][0]['player_id'] == '1'
+    assert proofs[1]['empty_capture_refs'][0]['player_id'] == '2'
+    assert all(len(proof['empty_capture_refs'][0]['raw_attempts']) == 1 for proof in proofs)
+
+
+def test_uncommitted_old_journal_does_not_claim_newer_snapshot_as_original(scraper, monkeypatch):
+    from scrapers.transfermarkt.writer import StaleTransfermarktWrite
+    from scrapers.transfermarkt.write_intents import pending_intents
+    full = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    original = http(scraper, [full])
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    store = scraper._iceberg_writer
+    write = store._write_to_iceberg
+    with monkeypatch.context() as patch:
+        patch.setattr(store, '_write_to_iceberg', lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('before Bronze commit')))
+        with pytest.raises(RuntimeError, match='before Bronze'):
+            current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'never-committed', decoded_body_soft_stop_bytes=100000)
+    latest = http(scraper, [full])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'newer-committed', decoded_body_soft_stop_bytes=100000)
+    live = _table(scraper, 'transfermarkt_market_value_points').copy()
+    with pytest.raises(StaleTransfermarktWrite):
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'unproven-replay', decoded_body_soft_stop_bytes=100000)
+    pd.testing.assert_frame_equal(live, _table(scraper, 'transfermarkt_market_value_points'))
+    assert pending_intents({'kind': 'current', 'entity': 'market_value_history'})
+    assert sum(len(c.get_calls) for c in original.clients) == 1
+    assert sum(len(c.get_calls) for c in latest.clients) == 1
+
+
+def test_original_empty_proof_checksum_cannot_be_changed_under_same_unit(scraper):
+    from scrapers.transfermarkt.career_refs import physical_predicate
+    http(scraper, [{'list': []}])
+    receipt = current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'empty-proof', decoded_body_soft_stop_bytes=100000)
+    row = receipt['manifests'][0]['rows'][0]
+    scraper.test_db.sql.execute("UPDATE transfermarkt_career_capture_refs_v1 SET empty_proof_json = REPLACE(empty_proof_json, 'authoritative_empty', 'success')")
+    with pytest.raises(RuntimeError, match='original proof checksum'):
+        physical_predicate(scraper.test_db.cursor(), receipt['manifest_cycle_id'], row['entity'], row['native_table'], batch_id=row['native_batch_id'])
+
+
+def _execute_career_loss_query(scraper):
+    """Execute generated DQ with only Trino JSON syntax adapted to SQLite."""
+    from dags.utils.transfermarkt_bronze_dq import build_career_write_loss_sql
+    sql = build_career_write_loss_sql('iceberg.bronze.transfermarkt_market_value_points')
+    sql = re.sub(r'iceberg\.(?:bronze|ops)\.', '', sql)
+    sql = sql.replace('CROSS JOIN UNNEST(CAST(JSON_PARSE(refs_json) AS array(json))) AS refs(ref)', 'CROSS JOIN json_each(refs_json) ref')
+    sql = sql.replace('JSON_EXTRACT_SCALAR(ref,', 'JSON_EXTRACT_SCALAR(ref.value,')
+    # Timestamps are normalized UTC ISO text in this physical test warehouse.
+    clock_start = sql.index('COALESCE(TRY(CAST(from_iso8601_timestamp(')
+    clock_end = sql.index(' capture_clock', clock_start)
+    sql = sql[:clock_start] + '''COALESCE(json_extract(r.capture_times_json, '$."' || JSON_EXTRACT_SCALAR(ref.value, '$[0]') || '"'), r.committed_at)''' + sql[clock_end:]
+    scraper.test_db.sql.create_function('JSON_EXTRACT_SCALAR', 2,
+        lambda body, path: json.loads(body)[int(path[2:-1])])
+    return scraper.test_db.sql.execute(sql).fetchone()[0]
+
+
+def test_full_loss_dq_orders_original_source_clocks_after_late_history_reconciliation(scraper):
+    full = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    http(scraper, [full])
+    scraper.test_db.fail_sql = 'CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_capture_refs_v1'
+    with pytest.raises(RuntimeError, match='injected late'):
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'old-dq', decoded_body_soft_stop_bytes=100000)
+    scraper.test_db.fail_sql = None
+    http(scraper, [full])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'new-dq', decoded_body_soft_stop_bytes=100000)
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT, 'old-dq-reconcile', decoded_body_soft_stop_bytes=100000)
+    assert _execute_career_loss_query(scraper) == 0
+    scraper.test_db.sql.execute("DELETE FROM transfermarkt_market_value_points WHERE player_id='1'")
+    assert _execute_career_loss_query(scraper) == 1
+
+
+def test_full_loss_dq_detects_rows_left_under_any_batch_after_authoritative_empty(scraper):
+    full = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    http(scraper, [full])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'before-empty-dq', decoded_body_soft_stop_bytes=100000)
+    stored = _table(scraper, 'transfermarkt_market_value_points').copy()
+    http(scraper, [{'list': []}])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT, 'empty-dq', decoded_body_soft_stop_bytes=100000)
+    assert _execute_career_loss_query(scraper) == 0
+    stored.to_sql('transfermarkt_market_value_points', scraper.test_db.sql, if_exists='append', index=False)
+    assert _execute_career_loss_query(scraper) == 1

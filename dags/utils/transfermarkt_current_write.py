@@ -120,6 +120,11 @@ def _rows(frame):
 def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None):
     table = 'iceberg.bronze.' + output.table_name
     relation = table + (f' FOR VERSION AS OF {snapshot_id}' if snapshot_id else '')
+    if snapshot_id == 0 and frame.empty:
+        # Only anchored recovery can supply zero: the immutable pre-write
+        # boundary recorded that this table did not exist for the typed empty.
+        return {'table': table, 'batch_id': str(scraper._batch_id), 'rows': 0,
+                'physical_hash': hashlib.sha256(b'[]').hexdigest(), 'original_table_absent': True}
     if empty_ids and not (empty_key == 'club_id' and output.key == 'profiles'):
         placeholders = ', '.join('?' for _ in empty_ids)
         predicate = f'{empty_key} IN ({placeholders})'
@@ -220,14 +225,22 @@ def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids
         identity = {'cycle_id': cycle_id, 'scope_id': scope['scope_id'], 'entity': spec.name,
                     'frames': {key: _rows(frame.drop(columns=['_batch_id', '_ingested_at'], errors='ignore'))
                                for key, frame in frames.items()}}
+        if empty_ids and spec.name in {run.ENTITY_MV_HISTORY, run.ENTITY_TRANSFERS}:
+            identity['empty_captures'] = run._career_empty_capture_refs(scraper)
         unit_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
         scraper._batch_id = unit_id
         frames = {key: frame.assign(_batch_id=unit_id) for key, frame in frames.items()}
         manifest_cycle = f'{cycle_id}:current-unit:{unit_id}'
-        from scrapers.transfermarkt.career_refs import retained_bundle_snapshots, persist_capture_refs
+        from scrapers.transfermarkt.career_refs import retained_bundle_snapshots, persist_capture_refs, recover_bundle_snapshots
         connection = scraper._bronze_connection()
         try:
+            path = getattr(scraper, '_tm_career_intent_path', None)
+            if path is not None:
+                from scrapers.transfermarkt.write_intents import snapshot_anchors
+                snapshot_anchors(path, connection, spec.outputs, capture_times=getattr(scraper, '_tm_empty_capture_times', {}))
             snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
+            if not snapshots and path is not None:
+                snapshots = recover_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames, path, batch_id=str(scraper._batch_id))
         finally:
             connection.close()
         if not snapshots:
@@ -262,7 +275,7 @@ def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids
                 for output in spec.outputs:
                     if not output.is_legacy:
                         persist_capture_refs(connection, manifest_cycle, output.key, output.table_name,
-                            frames[output.key], legacy=mode == 'dual')
+                            frames[output.key], legacy=mode == 'dual', empty_refs=run._career_empty_capture_refs(scraper), batch_id=str(scraper._batch_id))
                 snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
             finally:
                 connection.close()
@@ -426,6 +439,7 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         evidence = payload['evidence']
         if evidence['mode'] != mode or evidence['revision'] != revision:
             raise CurrentWriteError('career reconciliation requires original writer authority')
+        scraper._tm_career_intent_path = path
         scraper._batch_id = evidence['batch_id']
         frames = unpack_frames(payload['frames'])
         scraper._tm_empty_capture_times = evidence.get('captured_at_by_id', {})
@@ -438,6 +452,7 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
             reconciled_without_http=True, original_capture_attempts=evidence.get('raw_attempts', []),
             original_cache_sources=evidence.get('cache_sources', []), **evidence['window'])
         finish_intent(path)
+        scraper._tm_career_intent_path = None
         return receipt
     pieces = []
     processed = []
@@ -486,6 +501,7 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         processed=processed, state_rows=state_rows, window=window,
         captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed),
         raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()))
+    scraper._tm_career_intent_path = intent_path
     receipt, _ = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
     checkpoint_status = run._commit_checkpoint_or_pending(scraper, spec, processed, state_rows, cycle_id,
         resolved['competition_id'], int(resolved['edition_id']),
@@ -493,6 +509,7 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     receipt['checkpoint_status'] = checkpoint_status
     receipt.update(business_entity=spec.state_endpoint, career_window=window, **window)
     finish_intent(intent_path)
+    scraper._tm_career_intent_path = None
     return receipt
 
 

@@ -45,7 +45,11 @@ def _isolate_tm_process_env(tmp_path):
     # process and poisons the standing-policy suite in
     # test_run_transfermarkt_scope_cycle.py (12 failures, full-suite order
     # only). Snapshot/restore the env around every test in this file.
-    with patch.dict(os.environ, {'TM_WRITE_INTENT_DIR': str(tmp_path / 'write-intents')}):
+    # These parser/CLI tests stub the storage engine. Physical anchor and
+    # crash proofs are exercised by the independent MemoryDB integration tests.
+    with patch.dict(os.environ, {'TM_WRITE_INTENT_DIR': str(tmp_path / 'write-intents')}), patch(
+        'scrapers.transfermarkt.write_intents.snapshot_anchors', return_value={}
+    ):
         yield
 
 

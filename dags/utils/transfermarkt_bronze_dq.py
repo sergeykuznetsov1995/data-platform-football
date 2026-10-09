@@ -885,25 +885,32 @@ def build_career_write_loss_sql(table, *, pins=None):
     if table not in {'iceberg.bronze.transfermarkt_market_value_points', 'iceberg.bronze.transfermarkt_transfer_events'}:
         raise ValueError('loss references apply to native careers')
     from scrapers.transfermarkt.career_refs import TABLE
-    return f"""WITH references AS (
+    return f"""WITH capture_references AS (
         SELECT JSON_EXTRACT_SCALAR(ref, '$[0]') player_id,
                JSON_EXTRACT_SCALAR(ref, '$[1]') batch_id,
-               CAST(JSON_EXTRACT_SCALAR(ref, '$[2]') AS bigint) expected_rows, r.committed_at
+               CAST(JSON_EXTRACT_SCALAR(ref, '$[2]') AS bigint) expected_rows, r.committed_at,
+               COALESCE(TRY(CAST(from_iso8601_timestamp(JSON_EXTRACT_SCALAR(r.capture_times_json,
+                   CONCAT('$["', JSON_EXTRACT_SCALAR(ref, '$[0]'), '"]'))) AS timestamp(6))), r.committed_at) capture_clock
         FROM {TABLE} r
         CROSS JOIN UNNEST(CAST(JSON_PARSE(refs_json) AS array(json))) AS refs(ref)
         WHERE native_table = {_sql_literal(table.rsplit('.', 1)[-1])}
     ), latest_refs AS (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY committed_at DESC, batch_id DESC) rn FROM references
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY capture_clock DESC, committed_at DESC, batch_id DESC) rn FROM capture_references
     ), live AS (
         SELECT player_id, _batch_id batch_id, COUNT(*) actual_rows
         FROM {_pinned(table, pins)} GROUP BY player_id, _batch_id
+    ), player_totals AS (
+        SELECT player_id, SUM(actual_rows) actual_rows FROM live GROUP BY player_id
     ) SELECT COUNT(*) FROM latest_refs r LEFT JOIN live l
       ON l.player_id = r.player_id AND l.batch_id = r.batch_id
-    WHERE r.rn = 1 AND COALESCE(l.actual_rows, 0) <> r.expected_rows
-      AND NOT EXISTS (SELECT 1 FROM iceberg.ops.transfermarkt_fetch_state empty_receipt
+      LEFT JOIN player_totals total ON total.player_id = r.player_id
+    WHERE r.rn = 1 AND CASE WHEN r.expected_rows = 0 THEN COALESCE(total.actual_rows, 0)
+      ELSE COALESCE(l.actual_rows, 0) END <> r.expected_rows
+      AND NOT (r.expected_rows > 0 AND COALESCE(total.actual_rows, 0) = 0 AND EXISTS (
+        SELECT 1 FROM iceberg.ops.transfermarkt_fetch_state empty_receipt
         WHERE empty_receipt.source_id = r.player_id AND empty_receipt.status IN ('authoritative_empty', 'valid_empty')
           AND empty_receipt.endpoint = {_sql_literal('market_value_points' if table.endswith('market_value_points') else 'transfer_events')}
-          AND empty_receipt.last_success_at >= r.committed_at)"""
+          AND empty_receipt.last_success_at >= r.capture_clock))"""
 
 
 def run_bronze_dq(

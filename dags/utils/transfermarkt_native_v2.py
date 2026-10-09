@@ -2172,7 +2172,7 @@ def _validate_native_manifest(
             )
             if cycle_id is not None:
                 projection = apply_physical_refs(projection, table=pair.native_table, batch=str(batch_id or ''),
-                    predicate=physical_predicate(cur, cycle_id, name, pair.native_table))
+                    predicate=physical_predicate(cur, cycle_id, name, pair.native_table, batch_id=str(batch_id or '')))
             execute_statement(cur, projection)
             live_rows = list(cur.fetchall())
             live_count, live_hash = _fingerprint_rows(live_rows)
@@ -2261,7 +2261,7 @@ def run_parity(
                 'legacy_only': -1, 'native_only': -1, 'passed': False,
             }
             continue
-        capture_predicate = physical_predicate(cur, cycle, pair.name, pair.native_table)
+        capture_predicate = physical_predicate(cur, cycle, pair.name, pair.native_table, batch_id=evidence['native_batch_id'])
         def bind_capture(sql):
             return apply_physical_refs(sql, table=pair.native_table, batch=evidence['native_batch_id'], predicate=capture_predicate)
         legacy_sql, native_sql = pair.queries(
@@ -3334,7 +3334,7 @@ ORDER BY cycle_id, entity
         ):
             raise ReadinessError(f'{key}: native write evidence drifted')
         pair = PARITY_BY_NAME[str(entity)]
-        capture_predicate = physical_predicate(cur, str(child), str(entity), pair.native_table)
+        capture_predicate = physical_predicate(cur, str(child), str(entity), pair.native_table, batch_id=str(native_batch))
         def bind_capture(sql):
             return apply_physical_refs(sql, table=pair.native_table, batch=str(native_batch), predicate=capture_predicate)
         if str(native_table) != pair.native_table:
@@ -6066,7 +6066,12 @@ def control_plane_bootstrap_sql() -> list[str]:
         f"ALTER TABLE {MODEL_MANIFEST_TABLE} ADD COLUMN IF NOT EXISTS scope_set_id varchar",
         f"ALTER TABLE {MODEL_MANIFEST_TABLE} ADD COLUMN IF NOT EXISTS pinned_input_snapshot_ids varchar",
         *scope_state.ddl_statements(),
-        "CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_capture_refs_v1 (cycle_id varchar, entity varchar, native_table varchar, refs_json varchar, refs_sha256 varchar, committed_at timestamp(6), snapshot_id bigint, legacy_snapshot_id bigint) WITH (format = 'PARQUET')",
+        "CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_snapshot_anchors_v1 (intent_sha256 varchar, table_name varchar, parent_snapshot_id bigint, capture_times_json varchar) WITH (format = 'PARQUET')",
+        "CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_capture_refs_v1 (cycle_id varchar, entity varchar, native_table varchar, refs_json varchar, refs_sha256 varchar, committed_at timestamp(6), snapshot_id bigint, legacy_snapshot_id bigint, native_batch_id varchar, capture_unit_id varchar, empty_proof_json varchar, capture_times_json varchar) WITH (format = 'PARQUET')",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS native_batch_id varchar",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS capture_unit_id varchar",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS empty_proof_json varchar",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS capture_times_json varchar",
     ]
 
 

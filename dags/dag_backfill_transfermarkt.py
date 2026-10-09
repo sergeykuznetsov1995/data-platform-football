@@ -130,6 +130,14 @@ def _strict_backfill_preflight() -> dict[str, Any]:
         raise AirflowException(str(exc)) from exc
 
 
+def _compatible_backfill_policy(policy, frozen_hash):
+    try:
+        from dags.scripts.run_transfermarkt_scope_cycle import standing_policy_hash_compatible
+    except ModuleNotFoundError:
+        from scripts.run_transfermarkt_scope_cycle import standing_policy_hash_compatible
+    return standing_policy_hash_compatible(policy, frozen_hash)
+
+
 def _load_backfill_policy():
     try:
         from dags.scripts.run_transfermarkt_scope_cycle import (
@@ -366,7 +374,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
             else:
                 scopes = repository.load_scopes(campaign.campaign_id)
 
-            if campaign.policy_sha256 != policy.policy_hash:
+            if not _compatible_backfill_policy(policy, campaign.policy_sha256):
                 _publish_next_poll(ti, now=now, scopes=scopes, idle=True)
                 raise BackfillRuntimeError(
                     "standing policy changed during the frozen campaign; "
@@ -465,7 +473,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
             attempts=attempts,
             payloads=payloads,
             preflight=preflight,
-            policy_hash=policy.policy_hash,
+            policy_hash=campaign.policy_sha256,
             run_id=run_id,
         )
     except Exception as exc:

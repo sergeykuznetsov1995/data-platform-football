@@ -130,7 +130,13 @@ LEGACY_TABLES = {
     'iceberg.bronze.transfermarkt_transfers',
     'iceberg.bronze.transfermarkt_coaches',
 }
+CAREER_SAFETY_OPS_TABLES = frozenset({
+    'iceberg.ops.transfermarkt_career_capture_refs_v1',
+    'iceberg.ops.transfermarkt_career_snapshot_anchors_v1',
+    'iceberg.ops.transfermarkt_proxy_ledger_events_v1',
+})
 OPS_WRITE_TABLES = {
+    *CAREER_SAFETY_OPS_TABLES,
     'iceberg.ops.transfermarkt_fetch_state',
     'iceberg.ops.proxy_traffic_runs',
     PROXY_LEDGER_TABLE,
@@ -633,6 +639,23 @@ def validate_standing_policy_for_scope_cycle(
         raise ScopeCycleError(f'standing policy omits write tables: {missing}')
 
 
+def standing_policy_hash_compatible(policy, pinned_hash):
+    """Preserve an approved paid prefix for this exact additive ops migration.
+
+    Approval dates, version, caps, concurrency and every Bronze permission stay
+    byte-for-byte bound to the old hash. The current policy must authorize all
+    three safety tables; only their omission from the original body is allowed.
+    """
+    if policy.policy_hash == pinned_hash:
+        return True
+    if not CAREER_SAFETY_OPS_TABLES <= set(getattr(policy, 'allowed_write_tables', ())):
+        return False
+    from dataclasses import replace
+    original = replace(policy, allowed_write_tables=tuple(
+        table for table in policy.allowed_write_tables if table not in CAREER_SAFETY_OPS_TABLES))
+    return original.policy_hash == pinned_hash
+
+
 def _enforce_standing_policy(
     args: argparse.Namespace,
 ) -> Mapping[str, PolicyGrant]:
@@ -649,7 +672,7 @@ def _enforce_standing_policy(
     expected_hash = _required(
         args.standing_policy_sha256, 'standing_policy_sha256',
     )
-    if policy.policy_hash != expected_hash:
+    if not standing_policy_hash_compatible(policy, expected_hash):
         raise ApprovalDriftError(
             'standing policy content differs from the pinned sha256'
         )
@@ -666,7 +689,7 @@ def _enforce_standing_policy(
     )
     grant = PolicyGrant(
         packet_id=f'standing-policy-v{policy.policy_version}',
-        packet_hash=policy.policy_hash,
+        packet_hash=expected_hash,
         policy_version=int(policy.policy_version),
     )
     return {'paid_proxy': grant, 'production_write': grant}
@@ -1648,22 +1671,49 @@ WHEN NOT MATCHED THEN INSERT (
 PROXY_LEDGER_EVENTS_TABLE = 'iceberg.ops.transfermarkt_proxy_ledger_events_v1'
 
 
-def proxy_ledger_event_statements(parent_ledger):
-    """Append immutable per-scope receipts; replay never adds traffic twice."""
-    fields = ('decoded_bytes', 'wire_bytes', 'provider_metered_bytes', 'requests', 'retries', 'cache_hits', 'duration_ms')
+PROXY_EVENT_FIELDS = ('decoded_bytes', 'wire_bytes', 'provider_metered_bytes', 'requests', 'retries', 'cache_hits', 'duration_ms')
+
+
+def proxy_ledger_event_statements(parent_ledger, previous=None):
+    """Immutable deltas from cumulative scope receipts, never cumulative sums."""
+    previous = previous or {}
+    fields = PROXY_EVENT_FIELDS
     q = lambda value: "'" + str(value).replace("'", "''") + "'"
-    scopes = parent_ledger.get('scopes', {})
     statements = [f'CREATE TABLE IF NOT EXISTS {PROXY_LEDGER_EVENTS_TABLE} (parent_cycle_id varchar, child_cycle_id varchar, scope_id varchar, manifest_digest varchar, entity varchar, '
-        + ', '.join(field + ' bigint' for field in fields) + ") WITH (format = 'PARQUET')"]
-    for scope_id, scope in sorted(scopes.items()):
+        + ', '.join(field + ' bigint' for field in fields) + ", receipt_id varchar) WITH (format = 'PARQUET')",
+        f'ALTER TABLE {PROXY_LEDGER_EVENTS_TABLE} ADD COLUMN IF NOT EXISTS receipt_id varchar']
+    for scope_id, scope in sorted(parent_ledger.get('scopes', {}).items()):
         for entity, metrics in sorted(scope['by_entity'].items()):
+            key = (scope['child_cycle_id'], scope_id, entity)
+            old = previous.get(key, (0,) * len(fields))
+            totals = tuple(int(metrics[field]) for field in fields)
+            delta = tuple(total - prior for total, prior in zip(totals, old, strict=True))
+            if any(value < 0 for value in delta):
+                raise ScopeCycleError('parent proxy event cumulative counters regressed')
+            receipt_id = stable_hash({'parent': parent_ledger['parent_cycle_id'], 'key': key,
+                'manifest_digest': scope['manifest_digest'], 'cumulative': totals})
             values = [q(parent_ledger['parent_cycle_id']), q(scope['child_cycle_id']), q(scope_id), q(scope['manifest_digest']), q(entity)]
-            values += [str(int(metrics[field])) for field in fields]
-            columns = 'parent_cycle_id, child_cycle_id, scope_id, manifest_digest, entity, ' + ', '.join(fields)
+            values += [str(value) for value in delta] + [q(receipt_id)]
+            columns = 'parent_cycle_id, child_cycle_id, scope_id, manifest_digest, entity, ' + ', '.join(fields) + ', receipt_id'
             statements.append(f'MERGE INTO {PROXY_LEDGER_EVENTS_TABLE} t USING (VALUES (' + ', '.join(values) + ')) s(' + columns + ') '
-                'ON t.parent_cycle_id=s.parent_cycle_id AND t.child_cycle_id=s.child_cycle_id AND t.scope_id=s.scope_id AND t.entity=s.entity '
+                'ON t.parent_cycle_id=s.parent_cycle_id AND t.child_cycle_id=s.child_cycle_id AND t.scope_id=s.scope_id AND t.entity=s.entity AND t.receipt_id=s.receipt_id '
                 'WHEN NOT MATCHED THEN INSERT (' + columns + ') VALUES (' + ', '.join('s.' + field.strip() for field in columns.split(',')) + ')')
     return tuple(statements)
+
+
+def _proxy_event_totals(cursor, parent_ledger):
+    totals = {}
+    fields = PROXY_EVENT_FIELDS
+    for scope_id, scope in sorted(parent_ledger.get('scopes', {}).items()):
+        for entity in sorted(scope['by_entity']):
+            execute_statement(cursor, 'SELECT ' + ', '.join('COALESCE(SUM(' + field + '), 0)' for field in fields)
+                + f' FROM {PROXY_LEDGER_EVENTS_TABLE} WHERE parent_cycle_id=? AND child_cycle_id=? AND scope_id=? AND entity=?',
+                (parent_ledger['parent_cycle_id'], scope['child_cycle_id'], scope_id, entity))
+            rows = cursor.fetchall()
+            if len(rows) != 1:
+                raise ScopeCycleError('parent proxy event readback is incomplete')
+            totals[(scope['child_cycle_id'], scope_id, entity)] = tuple(int(value) for value in rows[0])
+    return totals
 
 
 def persist_parent_proxy_ledger(
@@ -1699,8 +1749,17 @@ def persist_parent_proxy_ledger(
     try:
         from scrapers.transfermarkt.writer import writer_lock
         with writer_lock():
-            for statement in proxy_ledger_event_statements(parent_ledger):
+            ddl = proxy_ledger_event_statements(parent_ledger)[:2]
+            for statement in ddl:
                 execute_statement(cursor, statement)
+            previous = _proxy_event_totals(cursor, parent_ledger)
+            for statement in proxy_ledger_event_statements(parent_ledger, previous)[2:]:
+                execute_statement(cursor, statement)
+            actual = _proxy_event_totals(cursor, parent_ledger)
+            expected = {(scope['child_cycle_id'], scope_id, entity): tuple(int(metrics[field]) for field in PROXY_EVENT_FIELDS)
+                for scope_id, scope in parent_ledger.get('scopes', {}).items() for entity, metrics in scope['by_entity'].items()}
+            if actual != expected:
+                raise ScopeCycleError('parent proxy immutable deltas do not reconcile')
             execute_statement(cursor, sql)
         if cursor.description:
             cursor.fetchall()

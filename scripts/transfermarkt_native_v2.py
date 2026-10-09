@@ -23,6 +23,8 @@ Examples::
 """
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement
+
 import argparse
 import json
 import os
@@ -441,11 +443,11 @@ def legacy_backup_status(cur) -> dict[str, dict[str, int | None]]:
     report: dict[str, dict[str, int | None]] = {}
     for relation in LEGACY_BACKUP_RELATIONS:
         catalog, schema, table = relation.split('.')
-        cur.execute(f'SELECT COUNT(*) FROM {relation}')
+        execute_statement(cur, f'SELECT COUNT(*) FROM {relation}')
         count_rows = list(cur.fetchall())
         if len(count_rows) != 1 or len(count_rows[0]) != 1:
             raise RuntimeError(f'{relation}: row-count query shape drift')
-        cur.execute(
+        execute_statement(cur,
             f'SELECT MAX(snapshot_id) FROM '
             f'{catalog}.{schema}."{table}$snapshots"'
         )
@@ -466,11 +468,11 @@ def registry_backup_status(cur) -> dict[str, dict[str, int | None]]:
     report: dict[str, dict[str, int | None]] = {}
     for relation in REGISTRY_DISCOVERY_RELATIONS:
         catalog, schema, table = relation.split('.')
-        cur.execute(f'SELECT COUNT(*) FROM {relation}')
+        execute_statement(cur, f'SELECT COUNT(*) FROM {relation}')
         count_rows = list(cur.fetchall())
         if len(count_rows) != 1 or len(count_rows[0]) != 1:
             raise RuntimeError(f'{relation}: row-count query shape drift')
-        cur.execute(
+        execute_statement(cur,
             f'SELECT MAX(snapshot_id) FROM '
             f'{catalog}.{schema}."{table}$snapshots"'
         )
@@ -510,12 +512,11 @@ def rollback_registry_discovery(cur, cycle_id: str) -> dict[str, object]:
     exact_cycle = _normalise_registry_cycle_id(cycle_id)
     statements = registry_discovery_rollback_sql(exact_cycle)
     for statement in statements:
-        cur.execute(statement)
-        cur.fetchall()
+        execute_statement(cur, statement)
 
     remaining: dict[str, int] = {}
     for relation in REGISTRY_DISCOVERY_RELATIONS:
-        cur.execute(
+        execute_statement(cur,
             f"SELECT COUNT(*) FROM {relation} "
             f"WHERE cycle_id = '{exact_cycle}'"
         )
@@ -841,11 +842,8 @@ def _main(argv: list[str] | None = None) -> int:
     try:
         if args.command == 'bootstrap':
             for statement in bootstrap_sql():
-                cur.execute(statement)
-                # Trino requires the result stream (including DDL/DML update
-                # counts) to be consumed before the next statement; otherwise
-                # the coordinator may cancel it as USER_CANCELED.
-                cur.fetchall()
+                execute_statement(cur, statement)
+                # The TM committing adapter drains DDL/DML before advancing.
             print(json.dumps({'status': 'bootstrapped', 'statements': len(bootstrap_sql())}))
             return 0
         if args.command == 'reader-views':

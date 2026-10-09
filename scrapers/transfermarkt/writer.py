@@ -217,10 +217,17 @@ def guard_frames(scraper, outputs, frames):
                 rows = cursor.fetchall()
             except Exception as exc:
                 if any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
-                    continue
-                raise
+                    rows = []
+                else:
+                    raise
             finally:
                 cursor.close()
+            if output.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'}:
+                from scrapers.transfermarkt.career_refs import latest_capture_times
+                for player, stamp in latest_capture_times(connection, output.table_name, sorted(set(frame.player_id.astype(str)))).items():
+                    latest = pd.to_datetime(stamp, utc=True)
+                    if latest > incoming[(player,)]:
+                        raise StaleTransfermarktWrite('newer complete capture already recorded for ' + output.table_name)
             for row in rows:
                 identity = tuple(str(value) for value in row[:-1])
                 latest = row[-1]
