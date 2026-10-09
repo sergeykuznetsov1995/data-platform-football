@@ -304,7 +304,7 @@ def intent_empty_capture_refs(path):
     return refs
 
 
-def recover_bundle_snapshots(connection, cycle, outputs, frames, intent_path, *, batch_id=None):
+def recover_bundle_snapshots(connection, cycle, outputs, frames, intent_path, *, batch_id=None, partial=False):
     """Find the anchored original snapshot and at most two consecutive children.
 
     The writer holds the common lock from boundary capture through replacement.
@@ -348,7 +348,7 @@ def recover_bundle_snapshots(connection, cycle, outputs, frames, intent_path, *,
                 if frames[native.key].empty and parent is None:
                     snapshots[output.key] = 0  # Immutable pre-write boundary proves absent table.
                     continue
-                return {}
+                return snapshots if partial else {}
             if len(candidates) > 1:
                 raise RuntimeError('ambiguous direct child of original career snapshot boundary')
             if empty_refs and candidates:
@@ -371,7 +371,9 @@ def recover_bundle_snapshots(connection, cycle, outputs, frames, intent_path, *,
                     snapshots[output.key] = snapshot
                     break
             if output.key not in snapshots:
-                return {}
+                return snapshots if partial else {}
+        if partial:
+            return snapshots
         proof = {'native_snapshot_id': snapshots[native.key] or None, 'legacy_snapshot_id': None}
         for output in outputs:
             if output.is_legacy:

@@ -18,7 +18,7 @@ from typing import Any, Mapping
 import pandas as pd
 
 from dags.scripts import run_transfermarkt_scraper as run
-from scrapers.transfermarkt.writer import writer_lock, writer_deadline, guard_frames
+from scrapers.transfermarkt.writer import StaleTransfermarktWrite, writer_lock, writer_deadline, guard_frames
 from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
 from scrapers.transfermarkt.current_capture import FullRosterSnapshot
 from scrapers.transfermarkt import scraper as tm
@@ -117,7 +117,7 @@ def _rows(frame):
     return sorted(rows, key=lambda row: json.dumps(row))
 
 
-def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None):
+def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None, player_ids=()):
     table = 'iceberg.bronze.' + output.table_name
     relation = table + (f' FOR VERSION AS OF {snapshot_id}' if snapshot_id else '')
     if snapshot_id == 0 and frame.empty:
@@ -144,6 +144,9 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
     if frame.empty:
         predicate = '_batch_id = ?'
         params = [str(scraper._batch_id)]
+        if player_ids:
+            predicate += ' AND player_id IN (' + ', '.join('?' for _ in player_ids) + ')'
+            params += list(player_ids)
         if {'competition_id', 'edition_id'} <= set(frame.columns):
             predicate += ' AND competition_id = ? AND edition_id = ?'
             params += [scope['competition_id'], scope['edition_id']]
@@ -429,7 +432,7 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     if not selected:
         raise CurrentWriteError('current career selection is empty')
     spec = run._spec_for_write_mode(run.ENTITY_SPECS[name], mode)
-    from scrapers.transfermarkt.write_intents import pending_intents, save_intent, unpack_frames, finish_intent
+    from scrapers.transfermarkt.write_intents import pending_intents, save_intent, unpack_frames, finish_intent, archive_complete, retired_intents
     intent_identity = {'kind': 'current', 'scope_id': resolved['scope_id'], 'entity': name}
     pending = pending_intents(intent_identity)
     if pending:
@@ -443,17 +446,71 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         scraper._batch_id = evidence['batch_id']
         frames = unpack_frames(payload['frames'])
         scraper._tm_empty_capture_times = evidence.get('captured_at_by_id', {})
-        receipt, _ = _commit(scraper, spec, frames, resolved, mode, revision,
-            evidence['cycle_id'], empty_ids=evidence['empty'])
+        try:
+            if evidence.get('cache_resolution'):
+                from scrapers.transfermarkt.superseded import cached_supersession, verify_complete
+                from scrapers.transfermarkt.write_intents import completed_intent
+                with writer_lock():
+                    archived = completed_intent(path)
+                    if archived is not None:
+                        verify_complete(scraper, spec, archived, players=evidence['processed'])
+                        receipt = dict(archive_complete(path, archived['receipt'], unpack_frames(archived['frames'])))
+                        finish_intent(path)
+                        scraper._tm_career_intent_path = None
+                        receipt['reconciled_without_http'] = True
+                        return receipt
+                    cached, blocked = cached_supersession(scraper, spec, retired_intents(intent_identity), evidence['processed'], reconcile=True)
+                    if set(cached) != set(evidence['processed']):
+                        raise CurrentWriteError('cached pending resolution lost its exact full source')
+                    original_sources = {item['capture_id'] for item in evidence.get('cache_sources', [])}
+                    if any(cached[player]['raw']['capture_id'] not in original_sources
+                        or pd.to_datetime(cached[player]['raw']['fetched_at'], utc=True)
+                        != pd.to_datetime(evidence['captured_at_by_id'][player], utc=True)
+                        for player in evidence['processed']):
+                        raise StaleTransfermarktWrite('pending cached career has a newer complete successor')
+                    return _write_cached_supersession(scraper, spec, resolved, mode, revision, evidence['cycle_id'],
+                        evidence['window']['requested_player_ids'], cached, intent_identity, decoded_body_soft_stop_bytes, original_evidence=evidence)
+            receipt, committed_frames = _commit(scraper, spec, frames, resolved, mode, revision,
+                evidence['cycle_id'], empty_ids=evidence['empty'])
+        except StaleTransfermarktWrite:
+            from scrapers.transfermarkt.superseded import retire_partial
+            resolution = retire_partial(scraper, spec, path, payload, frames, delivery_cycle=cycle_id)
+            if resolution is None:
+                raise
+            scraper._tm_career_intent_path = None
+            return {**resolution, 'reconciled_without_http': True, 'career_window': {
+                'requested_player_ids': selected, 'processed_player_ids': [], 'deferred_player_ids': selected,
+                'stop_reason': 'superseded_partial_write'}}
         receipt['checkpoint_status'] = run._commit_checkpoint_or_pending(scraper, spec,
             evidence['processed'], evidence['state_rows'], evidence['cycle_id'],
             resolved['competition_id'], int(resolved['edition_id']), captured_at_by_id=evidence.get('captured_at_by_id'))
-        receipt.update(business_entity=spec.state_endpoint, career_window=evidence['window'],
+        receipt.update(signal_generations=evidence.get('signal_generations', {}), business_entity=spec.state_endpoint, career_window=evidence['window'],
             reconciled_without_http=True, original_capture_attempts=evidence.get('raw_attempts', []),
             original_cache_sources=evidence.get('cache_sources', []), **evidence['window'])
+        receipt['committed_at'] = archive_complete(path, receipt, committed_frames)['committed_at']
         finish_intent(path)
         scraper._tm_career_intent_path = None
         return receipt
+    requested = list(selected)
+    blocked = {}
+    retired = retired_intents(intent_identity)
+    if retired:
+        for _, _, resolution in retired:
+            if resolution['delivery_cycle_id'] == cycle_id and set(selected) & set(resolution['retired_player_ids']):
+                return {**resolution, 'reconciled_without_http': True, 'career_window': {
+                    'requested_player_ids': selected, 'processed_player_ids': [], 'deferred_player_ids': selected,
+                    'stop_reason': 'superseded_partial_write'}}
+        from scrapers.transfermarkt.superseded import cached_supersession
+        with writer_lock():
+            cached, blocked = cached_supersession(scraper, spec, retired, selected)
+            if cached:
+                return _write_cached_supersession(scraper, spec, resolved, mode, revision, cycle_id,
+                    selected, cached, intent_identity, decoded_body_soft_stop_bytes)
+        selected = [player for player in selected if player not in blocked]
+        if not selected:
+            return {'status': 'supersession_deferred', 'verified': False, 'blocking_reasons': blocked,
+                'career_window': {'requested_player_ids': requested, 'processed_player_ids': [],
+                    'deferred_player_ids': requested, 'stop_reason': 'superseding_cache_ineligible'}}
     pieces = []
     processed = []
     state_rows = []
@@ -484,8 +541,8 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         if rows[0][0] == 'authoritative_empty':
             empty.append(player)
         pieces.append(bundle)
-    deferred = selected[len(processed):]
-    window = {'requested_player_ids': selected, 'processed_player_ids': processed, 'deferred_player_ids': deferred,
+    deferred = [player for player in requested if player not in processed]
+    window = {'requested_player_ids': requested, 'processed_player_ids': processed, 'deferred_player_ids': deferred,
         'decoded_body_soft_stop_bytes': decoded_body_soft_stop_bytes,
         'stop_reason': stop_reason, 'admitted_endpoint_windows': admitted_windows}
     if not processed:
@@ -500,15 +557,101 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         batch_id=str(scraper._batch_id), cycle_id=cycle_id, empty=empty,
         processed=processed, state_rows=state_rows, window=window,
         captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed),
-        raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()))
+        raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()),
+        signal_generations=dict(getattr(scraper, '_current_career_signal_generations', {}) or {}))
     scraper._tm_career_intent_path = intent_path
-    receipt, _ = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
+    receipt, committed_frames = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
     checkpoint_status = run._commit_checkpoint_or_pending(scraper, spec, processed, state_rows, cycle_id,
         resolved['competition_id'], int(resolved['edition_id']),
         captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed))
     receipt['checkpoint_status'] = checkpoint_status
     receipt.update(business_entity=spec.state_endpoint, career_window=window, **window)
+    receipt['committed_at'] = archive_complete(intent_path, receipt, committed_frames)['committed_at']
     finish_intent(intent_path)
+    scraper._tm_career_intent_path = None
+    return receipt
+
+
+def _write_cached_supersession(scraper, spec, scope, mode, revision, cycle_id, selected, cached, identity, soft_stop, *, original_evidence=None):
+    """A new genuine cached job; never a successful acknowledgement of old dual."""
+    from scrapers.transfermarkt.write_intents import save_intent, archive_complete, finish_intent
+    from scrapers.transfermarkt.career_refs import persist_capture_refs, retained_bundle_snapshots
+    native = next(output for output in spec.outputs if not output.is_legacy)
+    ids = [player for player in selected if player in cached]
+    source_frame = pd.concat([cached[player]['frame'] for player in ids], ignore_index=True)
+    source_frame.attrs = {}
+    empty = [player for player in ids if cached[player]['state'][0] in {'authoritative_empty', 'valid_empty'}]
+    frames = run._merge_career_cache_frames(scraper, spec, {native.key: source_frame.iloc[:0]},
+        {native.key: source_frame}, scope['competition_id'], int(scope['edition_id']))
+    unit = hashlib.sha256(json.dumps({'cycle': cycle_id, 'scope': scope['scope_id'], 'entity': spec.name,
+        'sources': {player: cached[player]['raw']['capture_id'] for player in ids}}, sort_keys=True).encode()).hexdigest()[:32]
+    scraper._batch_id = unit
+    frames = run._align_batch_ids(scraper, frames)
+    if empty and source_frame.empty:
+        for frame in frames.values():
+            frame.attrs['fetch_status'] = 'authoritative_empty'
+    manifest_cycle = cycle_id + ':cached-supersession:' + unit
+    for player in ids:
+        envelope = cached[player]['raw']['envelope']
+        # This is a prior paid capture, not a new HTTP attempt.
+        scraper._http_client._cache_sources[envelope['envelope_id']] = scraper._http_client._raw_store.verify_attempt_envelope(envelope['envelope_id'])
+    clocks = {player: cached[player]['raw']['fetched_at'] for player in ids}
+    scraper._tm_empty_capture_times = clocks
+    window = {'requested_player_ids': selected, 'processed_player_ids': ids,
+        'deferred_player_ids': [player for player in selected if player not in cached],
+        'decoded_body_soft_stop_bytes': soft_stop, 'stop_reason': 'verified_superseding_cache'}
+    generations = (original_evidence.get('signal_generations', {}) if original_evidence is not None
+        else dict(getattr(scraper, '_current_career_signal_generations', {}) or {}))
+    path = save_intent(identity, frames, mode=mode, revision=revision, batch_id=unit, cycle_id=cycle_id,
+        empty=empty, processed=ids, state_rows=[cached[player]['state'] for player in ids], window=window,
+        captured_at_by_id=clocks, raw_attempts=[], cache_sources=[cached[player]['raw']['envelope'] for player in ids],
+        cache_resolution=True, signal_generations=generations)
+    scraper._tm_career_intent_path = path
+    results = {'outputs': {}, 'tables': []}
+    run._save_frames(scraper, spec, frames, False, results)
+    if empty:
+        # A fully proven newer empty was already committed, so no repeated delete.
+        for output in spec.outputs:
+            results['outputs'][output.key].update(table='iceberg.bronze.' + output.table_name,
+                applicability_status='authoritative_empty')
+    manifest = run._persist_dual_write_manifest(scraper, spec, frames, results, manifest_cycle,
+        scope['competition_id'], int(scope['edition_id']))
+    if manifest['status'] != 'success':
+        raise CurrentWriteError('superseding cached career compatibility failed')
+    connection = scraper._bronze_connection()
+    try:
+        snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
+    finally:
+        connection.close()
+    proof = {}
+    physical_frames = {}
+    original_batches = {item['player_id']: item['batch_id'] for item in frames[native.key].attrs.get('tm_original_capture_refs', [])}
+    for output in spec.outputs:
+        actual = frames[output.key].copy()
+        if output == native and original_batches:
+            actual['_batch_id'] = actual.player_id.astype(str).map(original_batches)
+        # Native may reference several original batches. Compare exact complete
+        # pinned rows through the verified refs instead of inventing one batch.
+        if output == native:
+            if not snapshots and not actual.empty:
+                raise CurrentWriteError('cached current native receipt lacks its original snapshot')
+            proof[output.key] = {'table': 'iceberg.bronze.' + output.table_name, 'rows': len(actual),
+                'physical_hash': hashlib.sha256(json.dumps(_rows(actual), sort_keys=True).encode()).hexdigest()}
+        else:
+            proof[output.key] = _read_back(scraper, output, actual, cycle_id, empty_ids=empty, scope=scope,
+                snapshot_id=snapshots.get(output.key))
+        physical_frames[output.key] = actual
+    receipt = {'verified': True, 'status': 'verified_superseding_cache', 'cycle_id': cycle_id,
+        'manifest_cycle_id': manifest_cycle, 'write_mode': mode, 'writer_revision': revision,
+        'outputs': proof, 'manifests': [manifest], 'committed_at': datetime.now(timezone.utc).isoformat(),
+        'career_window': window, 'cached_capture_ids': {player: cached[player]['raw']['capture_id'] for player in ids},
+        'business_entity': spec.state_endpoint, 'signal_generations': generations, 'reconciled_without_http': True, **window}
+    receipt['bronze_manifest'] = hashlib.sha256(json.dumps({'cycle_id': cycle_id,
+        'outputs': proof, 'manifests': [manifest]}, sort_keys=True).encode()).hexdigest()
+    receipt['checkpoint_status'] = run._commit_checkpoint_or_pending(scraper, spec, ids,
+        [cached[player]['state'] for player in ids], cycle_id, scope['competition_id'], int(scope['edition_id']), captured_at_by_id=clocks)
+    receipt['committed_at'] = archive_complete(path, receipt, physical_frames)['committed_at']
+    finish_intent(path)
     scraper._tm_career_intent_path = None
     return receipt
 

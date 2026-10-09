@@ -2432,9 +2432,10 @@ def _save_frames(
                     capture_times=getattr(scraper, '_tm_empty_capture_times', {}))
             finally:
                 connection.close()
+        native_keys = {output.key for output in spec.outputs if not output.is_legacy}
         captured_frames = {
             key: frame[frame['player_id'].astype(str).isin(frame.attrs['tm_captured_player_ids'])].copy()
-            if frame is not None and 'tm_captured_player_ids' in frame.attrs else frame
+            if key in native_keys and frame is not None and 'tm_captured_player_ids' in frame.attrs else frame
             for key, frame in frames.items()
         }
         guard_cached_frames(scraper, spec.outputs, frames)

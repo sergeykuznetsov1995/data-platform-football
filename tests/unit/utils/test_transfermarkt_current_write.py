@@ -1081,3 +1081,422 @@ def test_full_loss_dq_detects_rows_left_under_any_batch_after_authoritative_empt
     assert _execute_career_loss_query(scraper) == 0
     stored.to_sql('transfermarkt_market_value_points', scraper.test_db.sql, if_exists='append', index=False)
     assert _execute_career_loss_query(scraper) == 1
+
+
+def _partial_dual_then_newer(scraper, monkeypatch, *, old_players=('1',), newer_players=('1',), newer_empty=False):
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    old = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Old', 'age': '20', 'mw': 'EUR1m'}]}
+    fresh = {'list': []} if newer_empty else {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 9000000, 'verein': 'Fresh', 'age': '21', 'mw': 'EUR9m'}]}
+    source = http(scraper, [old for _ in old_players])
+    write = scraper._iceberg_writer._write_to_iceberg
+    def interrupted(*args, **kwargs):
+        if kwargs.get('table', args[2] if len(args) > 2 else None) == 'transfermarkt_market_value_history':
+            raise RuntimeError('cut before legacy')
+        return write(*args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(scraper._iceberg_writer, '_write_to_iceberg', interrupted)
+        with pytest.raises(RuntimeError, match='cut before legacy'):
+            current.fetch_current_career(scraper, 'market_value_points', list(old_players), old_scope, PREFLIGHT,
+                'old-partial', decoded_body_soft_stop_bytes=100000)
+    newest = http(scraper, [fresh for _ in newer_players])
+    current.fetch_current_career(scraper, 'market_value_points', list(newer_players), SCOPE, PREFLIGHT,
+        'new-complete', decoded_body_soft_stop_bytes=100000)
+    return old_scope, source, newest
+
+
+def test_partial_dual_terminal_retirement_preserves_fresh_bytes_and_allows_unrelated_same_scope(scraper, monkeypatch):
+    from scrapers.transfermarkt.write_intents import pending_intents, retired_intents
+    old_scope, source, newest = _partial_dual_then_newer(scraper, monkeypatch)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-delivery', decoded_body_soft_stop_bytes=100000)
+    assert failure['status'] == 'superseded_partial_write' and failure['verified'] is False
+    assert failure['original_native_snapshot_id'] > 0 and failure['original_legacy_snapshot_id'] is None
+    assert failure['career_window']['processed_player_ids'] == [] and failure['career_window']['deferred_player_ids'] == ['1']
+    assert failure['original_window']['processed_player_ids'] == ['1']
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history'))
+    identity = {'kind': 'current', 'scope_id': scraper._resolve_scope('GB1', '2025')['scope_id'], 'entity': 'market_value_history'}
+    assert pending_intents(identity) == []
+    retired = retired_intents(identity)
+    assert len(retired) == 1 and retired[0][0].exists()  # Never delete original paid prefix.
+    events = list(scraper.test_db.events)
+    assert current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-delivery', decoded_body_soft_stop_bytes=100000) == failure
+    assert not any('MERGE INTO iceberg.bronze.' in event for event in scraper.test_db.events[len(events):])
+    later = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 2000000, 'verein': 'Other', 'age': '20', 'mw': 'EUR2m'}]}])
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['2'], old_scope, PREFLIGHT,
+        'next-unrelated', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof['processed_player_ids'] == ['2']
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points').query("player_id == '1'").reset_index(drop=True))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history').query("player_id == '1'").reset_index(drop=True))
+    assert [sum(len(c.get_calls) for c in f.clients) for f in (source, newest, later)] == [1, 1, 1]
+    assert not scraper.test_db.sql.execute("SELECT 1 FROM transfermarkt_dual_write_manifest_v2 WHERE cycle_id LIKE 'old-partial:%'").fetchall()
+
+
+def test_next_current_job_reuses_superseding_capture_without_native_restamp_or_paid_retry(scraper, monkeypatch):
+    old_scope, source, newest = _partial_dual_then_newer(scraper, monkeypatch)
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-delivery', decoded_body_soft_stop_bytes=100000)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    latest_legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'next-cached-job', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof['status'] == 'verified_superseding_cache' and proof['reconciled_without_http']
+    assert proof['cached_capture_ids']['1'] == failure['superseding_players']['1']['raw']['capture_id']
+    assert proof['cycle_id'] == 'next-cached-job' and proof['manifest_cycle_id'] != failure['original_cycle_id']
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    actual_legacy = _table(scraper, 'transfermarkt_market_value_history')
+    pd.testing.assert_frame_equal(latest_legacy, actual_legacy[actual_legacy.season == '2627'].reset_index(drop=True))
+    assert actual_legacy[actual_legacy.season == '2526'].value_eur.tolist() == ['9000000']
+    assert [sum(len(c.get_calls) for c in f.clients) for f in (source, newest)] == [1, 1]
+
+
+def test_partial_mixed_capture_without_newer_proof_for_every_player_stays_visible(scraper, monkeypatch):
+    from scrapers.transfermarkt.writer import StaleTransfermarktWrite
+    from scrapers.transfermarkt.write_intents import pending_intents
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch, old_players=('1', '2'))
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    with pytest.raises(StaleTransfermarktWrite):
+        current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT,
+            'unsafe-mixed', decoded_body_soft_stop_bytes=100000)
+    assert pending_intents({'kind': 'current', 'entity': 'market_value_history'})
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+
+@pytest.mark.parametrize('damage', ['manifest', 'archive', 'raw'])
+def test_terminal_retirement_rejects_corrupt_or_unsuccessful_newer_capture(scraper, monkeypatch, damage):
+    from scrapers.transfermarkt.write_intents import _root, pending_intents
+    old_scope, source, newer = _partial_dual_then_newer(scraper, monkeypatch)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    if damage == 'manifest':
+        scraper.test_db.sql.execute("UPDATE transfermarkt_dual_write_manifest_v2 SET status='parity_mismatch'")
+    elif damage == 'archive':
+        archive = next((_root() / 'completed').glob('*.json'))
+        archive.write_text(archive.read_text().replace('"verified":true', '"verified":false'))
+    else:
+        raw = scraper._http_client.get_raw_attempt_records()[0]
+        record = scraper.test_store.load_capture(raw['capture_id'])[1]
+        blob = scraper.test_store.root + '/' + record.blob_key
+        from pathlib import Path
+        Path(blob).write_bytes(b'corrupt gzip raw')
+    with pytest.raises(Exception):
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+            'unsafe-recovery', decoded_body_soft_stop_bytes=100000)
+    assert pending_intents({'kind': 'current', 'entity': 'market_value_history'})
+    assert not list((_root() / 'resolutions').glob('*.json'))
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    assert [sum(len(c.get_calls) for c in f.clients) for f in (source, newer)] == [1, 1]
+
+
+def test_newer_native_without_complete_legacy_does_not_retire_old_partial_job(scraper, monkeypatch):
+    from scrapers.transfermarkt.writer import StaleTransfermarktWrite
+    from scrapers.transfermarkt.write_intents import pending_intents
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch)
+    scraper.test_db.sql.execute('DELETE FROM transfermarkt_dual_write_manifest_v2')
+    with pytest.raises(RuntimeError, match='genuine successful dual manifest'):
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+            'not-complete-dual', decoded_body_soft_stop_bytes=100000)
+    assert pending_intents({'kind': 'current', 'entity': 'market_value_history'})
+
+
+def test_typed_empty_newer_full_capture_retires_original_native_partial(scraper, monkeypatch):
+    old_scope, old, new = _partial_dual_then_newer(scraper, monkeypatch, newer_empty=True)
+    result = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'empty-superseding', decoded_body_soft_stop_bytes=100000)
+    assert result['status'] == 'superseded_partial_write' and not result['verified']
+    assert result['original_legacy_snapshot_id'] is None
+    assert _table(scraper, 'transfermarkt_market_value_points').empty
+    assert [sum(len(c.get_calls) for c in f.clients) for f in (old, new)] == [1, 1]
+
+
+def _collector_for_backend(scraper, old_scope, cycle_id, ids, *, signals=None):
+    from dags.scripts import run_transfermarkt_current as collector
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    target = scraper._resolve_scope(old_scope['competition_id'], old_scope['edition_id'])
+    scope = collector._Scope.__new__(collector._Scope)
+    scope.scraper, scope.scope, scope.preflight, scope.cycle_id = scraper, old_scope, PREFLIGHT, cycle_id
+    scope.target = SimpleNamespace(scope_id=target['scope_id'])
+    scope.cursor = SimpleNamespace(generation='generation')
+    scope.resume = {'careers': {'market_value_points': ids, 'transfer_events': []}}
+    scope.data = {'player_values': {'1': {'market_value_present': True, 'market_value_eur': 1000000}}}
+    scope.signals, scope.snapshot = signals or {}, None
+    scope.persist, scope.admission, scope._require_reconciled_signals = Mock(), Mock(), Mock()
+    scope.acknowledge = Mock(side_effect=AssertionError('terminal/mismatched job must never acknowledge'))
+    scope.career_writer = current.fetch_current_career
+    return scope
+
+
+def test_collector_terminal_failure_is_not_proof_and_cached_raw_mismatch_remains_pending(scraper, monkeypatch):
+    from dags.scripts import run_transfermarkt_current as collector
+    from dags.utils.transfermarkt_current_state import SignalObservation, SignalState
+    scope_id = scraper._resolve_scope('GB1', '2025')['scope_id']
+    observation = SignalObservation(scope_id, 'player', '1', 'a' * 64, NOW, 'test-version',
+        'signal-raw', NOW, 'https://tmapi.transfermarkt.technology/player', 'b' * 64)
+    signal = SignalState(observation)
+    scraper._current_career_signal_generations = {'1': collector.semantic_signature([
+        scope_id, 'market_value_points', '1', observation.signature, signal.first_detected_at.isoformat(), ''])}
+    old_scope, _, newer = _partial_dual_then_newer(scraper, monkeypatch)
+    from scrapers.transfermarkt.write_intents import pending_intents
+    pending = pending_intents({'kind': 'current', 'entity': 'market_value_history'})[0][1]
+    old_capture = pending['evidence']['raw_attempts'][0]['capture_id']
+    for ddl in collector.build_current_state_tables():
+        current.run._execute_cursor(scraper.test_db, ddl)
+    signal_sql = []
+    monkeypatch.setattr(collector, '_sql', lambda _scraper, sql: signal_sql.append(sql))
+    scope = _collector_for_backend(scraper, old_scope, 'collector-retirement', ['1', '2'], signals={'player:1': signal})
+    scope.careers()
+    assert len(scope.data['career_job_failures']) == 1
+    assert scope.resume['careers']['market_value_points'] == ['1', '2']
+    assert scope.signals['player:1'].status == 'failed'
+    assert scope.signals['player:1'].result.startswith('superseded_partial_write:')
+    assert not scope.data.get('career_receipts') and not scope.data.get('career_proofs')
+    scope.acknowledge.assert_not_called()
+    # Delivery windows can shrink without changing the original terminal job.
+    failure = dict(scope.data['career_job_failures'])
+    scope.resume['careers']['market_value_points'] = ['1']
+    scope.careers()
+    assert scope.data['career_job_failures'] == failure
+    assert scope.resume['careers']['market_value_points'] == ['1']
+    scope.resume['careers']['market_value_points'] = ['1', '2']
+    # A prior caller's old successful outcome must not override cached proof's
+    # exact newer capture identity during tmapi-vs-CEAPI validation.
+    scraper.get_fetch_outcomes = lambda: {'market_value_points': {'1': {'raw_capture_id': old_capture}}}
+    scope.cycle_id = 'collector-cached'
+    scope.careers()
+    assert scope.resume['careers']['market_value_points'] == ['1', '2']
+    assert scope.data['career_receipts'][-1]['collector_window']['source_mismatch_ids'] == ['1']
+    assert scope.signals['player:1'].status == 'failed'
+    scope.acknowledge.assert_not_called()
+    assert sum(len(c.get_calls) for c in newer.clients) == 1
+
+
+def test_terminal_resolution_checksum_failure_cannot_hide_original_paid_intent(scraper, monkeypatch):
+    from scrapers.transfermarkt.write_intents import _root, pending_intents
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch)
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-corruption', decoded_body_soft_stop_bytes=100000)
+    resolution = next((_root() / 'resolutions').glob('*.json'))
+    resolution.write_text(resolution.read_text().replace('superseded_partial_write', 'complete'))
+    with pytest.raises(RuntimeError, match='checksum'):
+        pending_intents({'kind': 'current', 'entity': 'market_value_history'})
+    assert list(_root().glob('*.json'))  # Original journal survives retirement.
+
+
+def test_archive_after_49_hours_can_retire_failure_but_cannot_refresh_new_current_cache(scraper, monkeypatch):
+    old_scope, old, newer = _partial_dual_then_newer(scraper, monkeypatch)
+    now = scraper._http_client._time()
+    monkeypatch.setattr(scraper._http_client, '_time', lambda: now + 49 * 3600)
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'late-retirement', decoded_body_soft_stop_bytes=100000)
+    assert failure['status'] == 'superseded_partial_write' and failure['verified'] is False
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    deferred = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'new-overdue-job', decoded_body_soft_stop_bytes=100000)
+    assert deferred['status'] == 'supersession_deferred' and not deferred['verified']
+    assert deferred['blocking_reasons'] == {'1': 'career_raw_cache_expired'}
+    assert deferred['career_window']['processed_player_ids'] == []
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history'))
+    assert [sum(len(c.get_calls) for c in f.clients) for f in (old, newer)] == [1, 1]
+
+
+def test_retired_old_observation_does_not_rebuy_when_newer_cache_generation_differs(scraper, monkeypatch):
+    scraper._current_career_signal_generations = {'1': 'original-generation'}
+    old_scope, old, newer = _partial_dual_then_newer(scraper, monkeypatch)
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-generation', decoded_body_soft_stop_bytes=100000)
+    # The archived superseding capture belongs to the original recorded
+    # generation. The caller declares a new generation; the ordinary new
+    # capture path is allowed, but the archive must not satisfy it.
+    scraper._current_career_signal_generations = {'1': 'new-generation'}
+    latest = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 11000000, 'verein': 'Newer', 'age': '21', 'mw': 'EUR11m'}]}])
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'new-observed-job', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof.get('status') != 'verified_superseding_cache'
+    assert [sum(len(c.get_calls) for c in f.clients) for f in (old, newer, latest)] == [1, 1, 1]
+
+
+def test_retired_job_uses_latest_verified_successor_after_another_current_update(scraper, monkeypatch):
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch)
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-first', decoded_body_soft_stop_bytes=100000)
+    next_source = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 12000000, 'verein': 'Newest', 'age': '21', 'mw': 'EUR12m'}]}])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT,
+        'newer-successor', decoded_body_soft_stop_bytes=100000)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'reuse-latest-successor', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof['status'] == 'verified_superseding_cache'
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    assert _table(scraper, 'transfermarkt_market_value_history').query("season == '2526'").value_eur.tolist() == ['12000000']
+    assert sum(len(c.get_calls) for c in next_source.clients) == 1
+
+
+def test_overdue_retired_player_does_not_block_unrelated_same_scope_in_exact_window(scraper, monkeypatch):
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch)
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-before-overdue', decoded_body_soft_stop_bytes=100000)
+    later = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 2000000, 'verein': 'Other', 'age': '20', 'mw': 'EUR2m'}]}])
+    now = scraper._http_client._time()
+    monkeypatch.setattr(scraper._http_client, '_time', lambda: now + 49 * 3600)
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT,
+        'overdue-plus-unrelated', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof['processed_player_ids'] == ['2'] and proof['deferred_player_ids'] == ['1']
+    assert proof['career_window']['requested_player_ids'] == ['1', '2']
+    assert sum(len(c.get_calls) for c in later.clients) == 1
+
+
+def test_crash_after_completed_archive_before_finish_replays_original_clock_and_repairs_index(scraper, monkeypatch):
+    from scrapers.transfermarkt import write_intents
+    full = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Club', 'age': '20', 'mw': 'EUR1m'}]}
+    factory = http(scraper, [full])
+    with monkeypatch.context() as patch:
+        patch.setattr(write_intents, 'finish_intent', lambda _: (_ for _ in ()).throw(RuntimeError('cut before acknowledgement')))
+        with pytest.raises(RuntimeError, match='cut before acknowledgement'):
+            current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT,
+                'archive-original', decoded_body_soft_stop_bytes=100000)
+    archive = next((write_intents._root() / 'completed').glob('*.json'))
+    initial = write_intents._read_record(archive)['receipt']['committed_at']
+    # Model the earlier crash boundary after the primary archive's fsync,
+    # before the by-unit pointer's durable acknowledgement.
+    for pointer in (write_intents._root() / 'completed/by-unit').glob('*.json'):
+        pointer.unlink()
+    rows = _table(scraper, 'transfermarkt_market_value_points').copy()
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT,
+        'archive-replay', decoded_body_soft_stop_bytes=100000)
+    assert proof['reconciled_without_http'] and proof['committed_at'] == initial
+    assert list((write_intents._root() / 'completed/by-unit').glob('*.json'))
+    assert write_intents.pending_intents({'kind': 'current'}) == []
+    pd.testing.assert_frame_equal(rows, _table(scraper, 'transfermarkt_market_value_points'))
+    assert sum(len(c.get_calls) for c in factory.clients) == 1
+
+
+def test_cached_completed_job_reconciles_after_49_hours_without_new_write_or_cache_freshness(scraper, monkeypatch):
+    from scrapers.transfermarkt import write_intents
+    old_scope, _, newest = _partial_dual_then_newer(scraper, monkeypatch)
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'cached-retirement', decoded_body_soft_stop_bytes=100000)
+    with monkeypatch.context() as patch:
+        patch.setattr(write_intents, 'finish_intent', lambda _: (_ for _ in ()).throw(RuntimeError('cut cached acknowledgement')))
+        with pytest.raises(RuntimeError, match='cut cached acknowledgement'):
+            current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+                'cached-original-job', decoded_body_soft_stop_bytes=100000)
+    path, _ = write_intents.pending_intents({'kind': 'current'})[0]
+    archive = write_intents.completed_intent(path)
+    for pointer in (write_intents._root() / 'completed/by-unit').glob('*.json'):
+        if write_intents._read_record(pointer)['intent_sha256'] == path.stem:
+            pointer.unlink()
+    monkeypatch.setattr(scraper._http_client, '_time', lambda: pd.to_datetime(
+        archive['journal']['evidence']['captured_at_by_id']['1'], utc=True).timestamp() + 49 * 3600)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    events = len(scraper.test_db.events)
+    replay = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'cached-restart', decoded_body_soft_stop_bytes=100000)
+    assert replay['verified'] and replay['reconciled_without_http']
+    assert replay['cycle_id'] == 'cached-original-job' and replay['committed_at'] == archive['receipt']['committed_at']
+    assert not write_intents.pending_intents({'kind': 'current'})
+    assert not any('MERGE INTO iceberg.bronze.' in event for event in scraper.test_db.events[events:])
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history'))
+    assert sum(len(c.get_calls) for c in newest.clients) == 1
+    fresh_job = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'new-job-after-49h', decoded_body_soft_stop_bytes=100000)
+    assert not fresh_job['verified'] and fresh_job['status'] == 'supersession_deferred'
+    assert sum(len(c.get_calls) for c in newest.clients) == 1
+
+
+@pytest.mark.parametrize('newer_empty', [False, True])
+def test_retirement_uses_selected_live_players_after_another_bundle_player_changes(scraper, monkeypatch, newer_empty):
+    old_scope, _, newest = _partial_dual_then_newer(scraper, monkeypatch,
+        newer_players=('1', '2'), newer_empty=newer_empty)
+    latest = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 12000000,
+        'verein': 'Player two newer', 'age': '22', 'mw': 'EUR12m'}]}])
+    current.fetch_current_career(scraper, 'market_value_points', ['2'], SCOPE, PREFLIGHT,
+        'p2-later-complete', decoded_body_soft_stop_bytes=100000)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-p1-after-p2-changed', decoded_body_soft_stop_bytes=100000)
+    assert failure['status'] == 'superseded_partial_write' and not failure['verified']
+    assert failure['retired_player_ids'] == ['1'] and failure['original_legacy_snapshot_id'] is None
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history'))
+    assert sum(len(c.get_calls) for c in newest.clients) == 2
+    assert sum(len(c.get_calls) for c in latest.clients) == 1
+    if not newer_empty:
+        proof = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+            'cached-p1-after-p2-changed', decoded_body_soft_stop_bytes=100000)
+        assert proof['verified'] and proof['status'] == 'verified_superseding_cache'
+        pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+        assert sum(len(c.get_calls) for c in latest.clients) == 1
+
+
+def test_pending_cached_job_keeps_original_source_and_retires_when_newer_current_supersedes_it(scraper, monkeypatch):
+    from scrapers.transfermarkt import write_intents
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch)
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-first-job', decoded_body_soft_stop_bytes=100000)
+    write = scraper._iceberg_writer._write_to_iceberg
+    def interrupted(*args, **kwargs):
+        if kwargs.get('table', args[2] if len(args) > 2 else None) == 'transfermarkt_market_value_history':
+            raise RuntimeError('cut cached legacy')
+        return write(*args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(scraper._iceberg_writer, '_write_to_iceberg', interrupted)
+        with pytest.raises(RuntimeError, match='cut cached legacy'):
+            current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+                'cached-partial-original', decoded_body_soft_stop_bytes=100000)
+    path, journal = write_intents.pending_intents({'kind': 'current'})[0]
+    original_body = path.read_bytes()
+    latest = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 12000000,
+        'verein': 'Latest', 'age': '22', 'mw': 'EUR12m'}]}])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT,
+        'latest-after-cached-partial', decoded_body_soft_stop_bytes=100000)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-cached-partial', decoded_body_soft_stop_bytes=100000)
+    assert not failure['verified'] and failure['status'] == 'superseded_partial_write'
+    assert failure['original_cycle_id'] == 'cached-partial-original'
+    assert failure['intent_sha256'] == path.stem and path.read_bytes() == original_body
+    assert failure['original_raw']['1']['capture_id'] == journal['evidence']['cache_sources'][0]['capture_id']
+    assert failure['original_legacy_snapshot_id'] is None and failure['original_native_snapshot_id'] > 0
+    assert write_intents.completed_intent(path) is None
+    assert not write_intents.pending_intents({'kind': 'current'})
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history'))
+    assert sum(len(c.get_calls) for c in latest.clients) == 1
+
+
+def test_current_transfer_partial_dual_can_retire_with_real_newer_transfer_capture(scraper, monkeypatch):
+    from scrapers.transfermarkt.write_intents import pending_intents
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    old = {'transfers': [{'date': 'Sep 1, 2025', 'season': '25/26', 'upcoming': False,
+        'from': {'clubName': 'Old', 'href': '/old/verein/10'}, 'to': {'clubName': 'Next', 'href': '/next/verein/20'}, 'fee': 'free transfer', 'marketValue': 'EUR1m'}]}
+    fresh = {'transfers': [{**old['transfers'][0], 'marketValue': 'EUR9m'}]}
+    source = http(scraper, [old])
+    writer = scraper._iceberg_writer._write_to_iceberg
+    def interrupt(*args, **kwargs):
+        if kwargs.get('table', args[2] if len(args) > 2 else None) == 'transfermarkt_transfers':
+            raise RuntimeError('cut transfer legacy')
+        return writer(*args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(scraper._iceberg_writer, '_write_to_iceberg', interrupt)
+        with pytest.raises(RuntimeError, match='cut transfer legacy'):
+            current.fetch_current_career(scraper, 'transfer_events', ['1'], old_scope, PREFLIGHT,
+                'old-transfer', decoded_body_soft_stop_bytes=100000)
+    new = http(scraper, [fresh])
+    current.fetch_current_career(scraper, 'transfer_events', ['1'], SCOPE, PREFLIGHT,
+        'fresh-transfer', decoded_body_soft_stop_bytes=100000)
+    rows = _table(scraper, 'transfermarkt_transfer_events').copy()
+    proof = current.fetch_current_career(scraper, 'transfer_events', ['1'], old_scope, PREFLIGHT,
+        'retire-transfer', decoded_body_soft_stop_bytes=100000)
+    assert proof['status'] == 'superseded_partial_write' and not proof['verified']
+    assert proof['original_legacy_snapshot_id'] is None
+    assert pending_intents({'kind': 'current', 'entity': 'transfers'}) == []
+    pd.testing.assert_frame_equal(rows, _table(scraper, 'transfermarkt_transfer_events'))
+    assert [sum(len(c.get_calls) for c in f.clients) for f in (source, new)] == [1, 1]
