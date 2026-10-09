@@ -23,7 +23,8 @@ SHARED_FILTER_SHA256 = (
     # #1387: transfermarkt-only source mode.
     # Refresh the merged baseline after 81bea4ce (#1392, tmapi host) and
     # 1f933229 (#1388, provider CONNECT refusals); shared runtime unchanged here.
-    "664ceae641ddbb3a4065fe35942c80e77a9d1efe68741db2b0b6dfa52989a139"
+    # #1398: dedicated TM stream controller; shared mode keeps its old path.
+    "912fbb0363411402a4df4aea54e8160e56733ebcb23bd78f4c8d12249ece0fd6"
 )
 
 
