@@ -17,12 +17,13 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
-from utils.config import DAG_TAGS
+from utils.config import DAG_TAGS, UNDERSTAT_LEAGUES
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils.understat_tasks import (
     RUNNER,
     scope_environment,
     validate_scope_result,
+    validate_understat_leagues,
 )
 
 
@@ -36,13 +37,16 @@ HISTORY_SCOPES_PER_RUN = 12
 def plan_history_scope(**context: Any) -> list[dict[str, str]]:
     """Return up to ``HISTORY_SCOPES_PER_RUN`` oldest incomplete closed scopes."""
 
+    validate_understat_leagues(UNDERSTAT_LEAGUES)
+
     from scrapers.understat.catalog import current_source_season_id
     from scrapers.understat.manifest import (
         CONTRACT_VERSION,
+        UnderstatManifestQuery,
         UnderstatManifestRepository,
     )
 
-    repository = UnderstatManifestRepository.from_env()
+    repository = UnderstatManifestRepository.from_env(query=UnderstatManifestQuery())
     scopes = repository.incomplete_closed_scopes(
         before_source_season_id=current_source_season_id(),
         limit=HISTORY_SCOPES_PER_RUN,

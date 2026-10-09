@@ -165,9 +165,9 @@ def _patch_repository(monkeypatch, query):
     monkeypatch.setattr(understat, "UnderstatClient", _no_site)
     monkeypatch.setattr(understat, "UnderstatCatalog", _no_site)
     monkeypatch.setattr(
-        manifest.UnderstatManifestRepository,
-        "from_env",
-        classmethod(lambda cls: cls(query=query)),
+        manifest,
+        "UnderstatManifestQuery",
+        lambda: query,
     )
 
 
@@ -230,17 +230,17 @@ def test_planner_fails_loudly_when_manifest_query_fails(dag_module, monkeypatch)
     assert len(query.calls) == 1
 
 
-def test_planner_full_path_on_cold_trino_connection_sends_two_statements(
+def test_planner_full_path_on_cold_trino_connection_sends_one_statement(
     dag_module, monkeypatch
 ):
-    """Count statements on the wire: connection ping + one manifest query.
+    """Count statements on the wire: only the manifest query.
 
     Bind parameters would add the driver's ``EXECUTE IMMEDIATE`` probe on a
     cold connection, so the manifest query must reach the cursor unbound.
     """
 
     import scrapers.understat as understat
-    from scrapers.base.trino_manager import TrinoTableManager
+    import trino.dbapi
 
     statements = []
 
@@ -266,11 +266,10 @@ def test_planner_full_path_on_cold_trino_connection_sends_two_statements(
 
     monkeypatch.setattr(understat, "UnderstatClient", _no_site)
     monkeypatch.setattr(understat, "UnderstatCatalog", _no_site)
-    monkeypatch.setattr(TrinoTableManager, "_create_connection", lambda self: _Connection())
+    monkeypatch.setattr(trino.dbapi, "connect", lambda **kwargs: _Connection())
 
     assert dag_module.plan_history_scope(run_id="scheduled__cold") == []
 
-    assert [sql for sql, _params in statements][0] == "SELECT 1"
-    assert len(statements) == 2
-    assert statements[1][0].startswith("WITH keys AS")
-    assert statements[1][1] == ()
+    assert len(statements) == 1
+    assert statements[0][0].startswith("WITH keys AS")
+    assert statements[0][1] == ()
