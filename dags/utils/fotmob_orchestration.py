@@ -12,6 +12,11 @@ from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from typing import Any, Mapping
 
+from scrapers.fotmob.transfers import (
+    TRANSFER_MAX_DIRECT_MIB,
+    TRANSFER_MAX_REQUESTS,
+    TRANSFER_RPM,
+)
 from utils.fotmob_publication import (
     FOTMOB_CATALOG_CONTRACT_SCHEMA,
     FOTMOB_DAILY_ENTITIES,
@@ -43,6 +48,13 @@ DAILY_DEADLINE = time(21, 0)
 # иначе позднее окно старта рождает волну-огрызок. Инвариант закреплён тестом
 # test_late_daily_still_has_runway_before_its_deadline.
 MIN_DAILY_RUNWAY = timedelta(minutes=120)
+
+# 03:00–05:00 МСК: отдельный бюджет трансферов расходуется до обхода матчей.
+# Последний короткий остаток окна не должен запускать заведомо пустую волну.
+TRANSFER_WINDOW_START = time(0, 0)
+TRANSFER_DEADLINE = time(2, 0)
+MIN_TRANSFER_RUNWAY = timedelta(minutes=15)
+TRANSFER_HOLD_START = _earlier(TRANSFER_DEADLINE, MIN_TRANSFER_RUNWAY)
 
 # Жёсткий стоп фона — это дедлайн и разбег, а не убийство живой волны: убитая волна
 # красит ран, автомат доставки трактует красноту как повод откатить пин, а буфер пачки
@@ -76,8 +88,9 @@ CHILD_TIMEOUT_MINUTES = 15 * 60
 
 
 class FotMobLane(str, Enum):
-    """The three mutually exclusive workloads owned by the scheduler."""
+    """The mutually exclusive workloads owned by the scheduler."""
 
+    TRANSFERS = "transfers"
     DAILY = "daily"
     REFRESH = "refresh"
     BACKFILL = "backfill"
@@ -172,11 +185,14 @@ def choose_lane(
     state: FotMobSchedulerState,
     child_running: bool,
     *,
+    transfers_done_today: bool = False,
+    transfers_budget_exhausted: bool = False,
     refresh_done_today: bool = False,
     last_failure_ended_at: datetime | None = None,
 ) -> LaneDecision:
     """Choose one workload without mutating the durable cursor.
 
+    Факты трансферов приходят из их суточного журнала, а не статуса DagRun.
     ``refresh_done_today`` и ``last_failure_ended_at`` — наблюдения из метабазы, а не
     поля состояния: форма Variable ``fotmob.scheduler.state.v1`` (четыре ключа) —
     контракт отката пином, и пятый ключ сделал бы откат невозможным.
@@ -198,6 +214,12 @@ def choose_lane(
         return LaneDecision(None, "failure_backoff")
 
     wall_time = now.time().replace(tzinfo=None)
+    if (
+        TRANSFER_WINDOW_START <= wall_time < TRANSFER_HOLD_START
+        and not transfers_done_today
+        and not transfers_budget_exhausted
+    ):
+        return LaneDecision(FotMobLane.TRANSFERS, "transfers_daily_guarantee")
     if BACKGROUND_HOLD_START <= wall_time < DAILY_WINDOW_START:
         return LaneDecision(None, "daily_window_approaching")
     if DAILY_WINDOW_START <= wall_time < DAILY_WINDOW_END:
@@ -270,6 +292,11 @@ def advance_after_success(
 #
 # rpm НЕ поднимаем — темп обращений к источнику прежний.
 _LANE_CAPS = {
+    FotMobLane.TRANSFERS: (
+        TRANSFER_MAX_REQUESTS,
+        TRANSFER_MAX_DIRECT_MIB,
+        TRANSFER_RPM,
+    ),
     FotMobLane.DAILY: (24_000, 1_536, 60),
     FotMobLane.REFRESH: (27_000, 1_536, 60),
     FotMobLane.BACKFILL: (20_000, 1_024, 45),
@@ -289,6 +316,10 @@ def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
 
     normalized_lane = FotMobLane(lane)
     now = _as_utc(now_utc)
+    if normalized_lane is FotMobLane.TRANSFERS and not (
+        TRANSFER_WINDOW_START <= now.time().replace(tzinfo=None) < TRANSFER_HOLD_START
+    ):
+        raise ValueError("FotMob transfers child cannot start outside its runway")
     if (
         normalized_lane in BACKGROUND_LANES
         and now.time().replace(tzinfo=None) >= BACKGROUND_HOLD_START
@@ -298,23 +329,33 @@ def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
             f"{BACKGROUND_HOLD_START.strftime('%H:%M')} UTC cutoff"
         )
     max_requests, max_direct_mib, rpm = _LANE_CAPS[normalized_lane]
-    deadline = (
-        _daily_deadline(now)
-        if normalized_lane is FotMobLane.DAILY
-        else _background_deadline(now)
-    ).isoformat()
+    if normalized_lane is FotMobLane.TRANSFERS:
+        deadline = datetime.combine(now.date(), TRANSFER_DEADLINE, tzinfo=UTC)
+        entities = ("transfers",)
+    else:
+        deadline = (
+            _daily_deadline(now)
+            if normalized_lane is FotMobLane.DAILY
+            else _background_deadline(now)
+        )
+        # Исторический контракт и его подпись остаются прежними. Актуальные
+        # полосы больше не расходуют матчевый бюджет на повтор трансферов.
+        entities = tuple(
+            entity for entity in FOTMOB_DAILY_ENTITIES
+            if normalized_lane is FotMobLane.BACKFILL or entity != "transfers"
+        )
     return {
         "mode": normalized_lane.value,
         "scope": "",
         "catalog_contract": FOTMOB_CATALOG_CONTRACT_SCHEMA,
-        "entities": ",".join(FOTMOB_DAILY_ENTITIES),
+        "entities": ",".join(entities),
         "max_requests": max_requests,
         "max_direct_mib": max_direct_mib,
         "max_proxy_mib": 0,
         "competition_limit": 0,
         "season_limit": 0,
         "requests_per_minute": rpm,
-        "deadline": deadline,
+        "deadline": deadline.isoformat(),
     }
 
 

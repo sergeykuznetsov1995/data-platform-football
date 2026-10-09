@@ -78,7 +78,7 @@ from scrapers.fotmob.player_collector import (
 
 RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}.json"
 NATIVE_MODES = frozenset(
-    {"discover", "daily", "backfill", "replay", "refresh", PLAYER_COLLECTOR_MODE}
+    {"discover", "daily", "backfill", "replay", "refresh", "transfers", PLAYER_COLLECTOR_MODE}
 )
 ISSUE_930_REPLAY_ENTITIES = [
     "leaderboards",
@@ -946,6 +946,11 @@ def validate_data(
                         )
                         violations.extend(collector_violations)
                         selection_summary.update(collector_summary)
+                    elif mode == "transfers":
+                        from scrapers.fotmob.transfer_contract import validate_transfer_report
+
+                        violations.extend(validate_transfer_report(result))
+                        selection_summary["profile"] = selection_profile
                     elif selection_profile:
                         source_violations, source_summary = (
                             _validate_source_refresh_selection(
@@ -1024,6 +1029,9 @@ def validate_data(
             "runner_report_sha256": hashlib.sha256(raw_result).hexdigest(),
             "runner_report_bytes": len(raw_result),
         }
+        if mode == "transfers":
+            summary["family_summary"] = result.get("family_summary")
+            summary["daily_budget"] = result.get("daily_budget")
         logger.info("FotMob native validation complete: %s", summary)
         return summary
 

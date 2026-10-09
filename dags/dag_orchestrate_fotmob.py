@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Mapping
@@ -13,6 +14,7 @@ from airflow.models import Variable
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
+from scrapers.fotmob.transfers import read_transfer_status
 from utils.default_args import DEFAULT_ARGS
 from utils.fotmob_orchestration import (
     FAILURE_BACKOFF,
@@ -32,6 +34,7 @@ from utils.fotmob_publication import (
 
 
 UTC = timezone.utc
+LOGGER = logging.getLogger(__name__)
 ISOLATED_STACK_ENV = "FOTMOB_ISOLATED_STACK"
 SCHEDULER_STATE_VARIABLE = "fotmob.scheduler.state.v1"
 INGEST_DAG_ID = "dag_ingest_fotmob"
@@ -49,6 +52,7 @@ LEGACY_PAUSED_DAGS = frozenset(
 )
 ORCHESTRATED_RUN_ID_PREFIX = "fotmob_orchestrated__"
 DECISION_TASK_ID = "choose_fotmob_lane"
+TRANSFER_STATUS_TASK_ID = "report_fotmob_transfer_freshness"
 INITIALIZER_TASK_ID = "initialize_fotmob_publication"
 TRIGGER_TASK_ID = "trigger_fotmob_ingest"
 LAUNCH_REJECTED_XCOM_KEY = "fotmob_launch_rejected"
@@ -232,6 +236,72 @@ def _context_utc_now(context: Mapping[str, Any]) -> datetime:
     return _utc_now(supplied_now if isinstance(supplied_now, datetime) else None)
 
 
+def _observe_transfer_status(now: datetime) -> dict[str, Any]:
+    try:
+        return read_transfer_status(now)
+    except Exception as exc:
+        # Неисправный журнал запрещает новый расход трансферов, но не должен
+        # вытеснять матчевые полосы или скрывать их свежесть за падением владельца.
+        LOGGER.exception("FotMob transfer status is unavailable")
+        return {
+            "day": now.date().isoformat(),
+            "checked_at": now.isoformat(),
+            "daily_complete": False,
+            "budget_exhausted": True,
+            "observation_error": type(exc).__name__,
+            "family_summary": {
+                "status": "red",
+                "included_count": 0,
+                "fresh_count": 0,
+                "stale_count": 0,
+                "unknown_count": 0,
+                "max_age_seconds": None,
+                "checked_at": now.isoformat(),
+                "observation_error": type(exc).__name__,
+            },
+        }
+
+
+def report_fotmob_transfer_freshness(**context: Any) -> dict[str, Any]:
+    """Emit a durable XCom and visible freshness signal even on an idle tick."""
+
+    status = _observe_transfer_status(_context_utc_now(context))
+    summary = status["family_summary"]
+    log = LOGGER.warning if summary.get("status") == "red" else LOGGER.info
+    log("FotMob transfers family_summary=%s", json.dumps(summary, sort_keys=True))
+    return status
+
+
+def _context_transfer_status(
+    context: Mapping[str, Any], *, use_report: bool = False
+) -> Mapping[str, Any]:
+    supplied = context.get("transfer_status")
+    if isinstance(supplied, Mapping):
+        return supplied
+    ti = context.get("ti")
+    if use_report and ti is not None:
+        reported = ti.xcom_pull(task_ids=TRANSFER_STATUS_TASK_ID)
+        if isinstance(reported, Mapping) and "family_summary" in reported:
+            return reported
+    # Read before the final boundary clock. A potentially slow SQLite read must
+    # not reopen the race between that clock and triggering the child.
+    supplied_now = context.get("now_utc")
+    now = _utc_now(supplied_now if isinstance(supplied_now, datetime) else None)
+    return _observe_transfer_status(now)
+
+
+def _transfer_admission(
+    status: Mapping[str, Any], now: datetime
+) -> dict[str, bool]:
+    # An XCom from just before midnight cannot settle the following day's debt.
+    same_day = status.get("day") == now.date().isoformat()
+    return {
+        "transfers_done_today": same_day and status.get("daily_complete") is True,
+        "transfers_budget_exhausted": bool(status.get("observation_error"))
+        or (same_day and status.get("budget_exhausted") is True),
+    }
+
+
 def _attest_owner_runtime(**context: Any) -> dict[str, Any]:
     """Retain the existing admission while naming this new scheduled owner."""
 
@@ -280,6 +350,7 @@ def select_fotmob_lane(**context: Any) -> dict[str, Any] | bool:
     """Short-circuit an idle tick, otherwise publish one immutable decision."""
 
     refresh_done_today, last_failure_ended_at = _context_child_observations(context)
+    transfer_status = _context_transfer_status(context, use_report=True)
     now = _context_utc_now(context)
     state = _load_state()
     child_running = bool(
@@ -293,6 +364,7 @@ def select_fotmob_lane(**context: Any) -> dict[str, Any] | bool:
         child_running,
         refresh_done_today=refresh_done_today,
         last_failure_ended_at=last_failure_ended_at,
+        **_transfer_admission(transfer_status, now),
     )
     if decision.lane is None:
         return False
@@ -342,6 +414,7 @@ def _launch_still_admitted(context: Mapping[str, Any]) -> bool:
         deadline = deadline.astimezone(UTC)
 
     refresh_done_today, last_failure_ended_at = _context_child_observations(context)
+    transfer_status = _context_transfer_status(context)
     child_active = bool(
         context.get("child_running")
         if "child_running" in context
@@ -358,6 +431,7 @@ def _launch_still_admitted(context: Mapping[str, Any]) -> bool:
             child_active,
             refresh_done_today=refresh_done_today,
             last_failure_ended_at=last_failure_ended_at,
+            **_transfer_admission(transfer_status, now),
         ).lane
         is not selected_lane
     ):
@@ -509,7 +583,7 @@ def finalize_or_skip_rejected_launch(**context: Any) -> dict[str, Any]:
             "lane": lane.value,
         }
 
-    # Refresh/backfill has no shared consumer.  It must release its ready
+    # Transfers/refresh/backfill have no shared consumer. Release the ready
     # source lock before the next owner tick; otherwise one background run
     # stalls every later run until the long publication TTL expires.
     from scrapers.fbref.control import ControlStore
@@ -594,7 +668,7 @@ dag = None
 if os.environ.get(ISOLATED_STACK_ENV) == "1":
     with DAG(
         dag_id=OWNER_DAG_ID,
-        description="Fair automatic adult-men FotMob daily/refresh/backfill owner",
+        description="Automatic adult-men FotMob transfers/daily/refresh/backfill owner",
         schedule="*/5 * * * *",
         start_date=datetime(2024, 1, 1, tzinfo=UTC),
         catchup=False,
@@ -613,6 +687,12 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
         choose_lane_task = ShortCircuitOperator(
             task_id=DECISION_TASK_ID,
             python_callable=select_fotmob_lane,
+            retries=0,
+        )
+
+        report_transfer_freshness = PythonOperator(
+            task_id=TRANSFER_STATUS_TASK_ID,
+            python_callable=report_fotmob_transfer_freshness,
             retries=0,
         )
 
@@ -662,6 +742,7 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
 
         (
             attest_runtime
+            >> report_transfer_freshness
             >> choose_lane_task
             >> initialize_publication
             >> trigger_ingest
@@ -677,5 +758,6 @@ __all__ = [
     "advance_fotmob_scheduler_state",
     "dag",
     "initialize_admitted_publication",
+    "report_fotmob_transfer_freshness",
     "select_fotmob_lane",
 ]
