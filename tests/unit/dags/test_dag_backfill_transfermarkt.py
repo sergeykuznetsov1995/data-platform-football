@@ -24,7 +24,11 @@ def _reload():
 
 
 @pytest.fixture
-def module():
+def module(monkeypatch):
+    monkeypatch.setenv('TM_HISTORY_STREAMS', '1')
+    from contextlib import nullcontext
+    from scrapers.transfermarkt import history_portion
+    monkeypatch.setattr(history_portion, 'bounded_trino', nullcontext)
     return _reload()
 
 

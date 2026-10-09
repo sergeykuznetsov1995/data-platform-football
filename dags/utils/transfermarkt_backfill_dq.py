@@ -195,13 +195,15 @@ def verify_manifest_entity_fingerprints(
             table = bronze_dq.ENTITY_BRONZE_TABLES.get(entity)
             if table is None or table not in pins:
                 raise BackfillDqError(f'{entity}: pinned Bronze table is absent')
-            cur.execute(build_manifest_entity_rows_sql(
-                entity,
-                snapshot_id=int(pins[table]),
-                child_cycle_id=child_cycle_id,
-                scope_id=scope_id,
-            ))
-            count, digest = _fingerprint_rows(list(cur.fetchall()))
+            receipts = getattr(manifest, 'dq_evidence', {}).get('historical_career_receipts', {}).get(entity)
+            if receipts:
+                rows = historical_career_rows(cur, entity, receipts)
+            else:
+                cur.execute(build_manifest_entity_rows_sql(
+                    entity, snapshot_id=int(pins[table]),
+                    child_cycle_id=child_cycle_id, scope_id=scope_id))
+                rows = list(cur.fetchall())
+            count, digest = _fingerprint_rows(rows)
             if (
                 count != int(evidence.dedup_rows)
                 or digest != str(evidence.key_hash)
@@ -217,6 +219,43 @@ def verify_manifest_entity_fingerprints(
     }
 
 
+def historical_career_sql(entity, receipt, *, lineage=False):
+    if entity not in {'market_value_points', 'transfer_events'}:
+        raise BackfillDqError('historical receipt must reference a native player career')
+    snapshot = receipt.get('snapshot_id')
+    if type(snapshot) is not int or snapshot <= 0:
+        raise BackfillDqError('historical career snapshot must be positive')
+    ids = receipt.get('player_ids')
+    if not isinstance(ids, list) or not ids or len(set(ids)) != len(ids) or any(not isinstance(pid, str) or not pid for pid in ids):
+        raise BackfillDqError('historical career receipt player ids are invalid')
+    columns = 'raw_capture_id, source_body_hash, scope_id, cycle_id' if lineage else ', '.join(ENTITY_FINGERPRINT_COLUMNS[entity])
+    return (f"SELECT {columns} FROM {bronze_dq.ENTITY_BRONZE_TABLES[entity]} FOR VERSION AS OF {snapshot} "
+            f"WHERE cycle_id = {_quoted(receipt['cycle_id'])} AND scope_id = {_quoted(receipt['scope_id'])} "
+            f"AND player_id IN ({', '.join(_quoted(pid) for pid in ids)})")
+
+
+def historical_career_rows(cur, entity, receipts):
+    """Verify each original snapshot, then choose each player's last full career."""
+    by_player = {}
+    for receipt in receipts:
+        if receipt['row_count'] == 0:
+            rows = []
+        else:
+            cur.execute(historical_career_sql(entity, receipt))
+            rows = list(cur.fetchall())
+        count, digest = _fingerprint_rows(rows)
+        if count != receipt['row_count'] or digest != receipt['key_hash']:
+            raise BackfillDqError('original historical career count/hash drifted')
+        grouped = {pid: [] for pid in receipt['player_ids']}
+        for row in rows:
+            pid = str(row[0])
+            if pid not in grouped:
+                raise BackfillDqError('historical career snapshot contains another player')
+            grouped[pid].append(row)
+        by_player.update(grouped)
+    return [row for rows in by_player.values() for row in rows]
+
+
 def verify_raw_lineage(
     cur: Any,
     *,
@@ -226,6 +265,7 @@ def verify_raw_lineage(
     attempt_envelopes: Sequence[Any],
     manifest_scope_cycles: Sequence[Sequence[str]],
     scope_statuses: Mapping[str, str],
+    manifests: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Resolve every newly written Bronze capture to exact immutable bytes."""
 
@@ -262,6 +302,14 @@ def verify_raw_lineage(
             child_cycle_ids=child_cycle_ids,
         ))
         rows = list(cur.fetchall())
+        for manifest in manifests:
+            for entity, receipts in getattr(manifest, 'dq_evidence', {}).get('historical_career_receipts', {}).items():
+                if bronze_dq.ENTITY_BRONZE_TABLES[entity] != table:
+                    continue
+                for receipt in receipts:
+                    if receipt['row_count']:
+                        cur.execute(historical_career_sql(entity, receipt, lineage=True))
+                        rows.extend(cur.fetchall())
         rows_by_table[table] = len(rows)
         for row in rows:
             if len(row) != 4:
@@ -372,6 +420,12 @@ def run_backfill_batch_dq(
     """Run existing scope-set DQ and the additional raw-lineage gate."""
 
     snapshots = dict(pins or pin_iceberg_snapshots(cur))
+    fingerprints = verify_manifest_entity_fingerprints(cur, pins=snapshots, manifests=manifests)
+    historical_presence = {
+        (str(manifest.scope_id), str(evidence.entity)): int(evidence.dedup_rows)
+        for manifest in manifests for evidence in manifest.entities
+        if str(evidence.entity) in getattr(manifest, 'dq_evidence', {}).get('historical_career_receipts', {})
+    }
     results = bronze_dq.run_bronze_dq(
         cur,
         registry_snapshot_id=registry_snapshot_id,
@@ -379,13 +433,9 @@ def run_backfill_batch_dq(
         zone='scope_set',
         manifests=manifests,
         scope_bindings=scope_bindings,
+        **({'historical_presence': historical_presence} if historical_presence else {}),
     )
     errors = [item for item in results if item.severity == 'ERROR' and not item.passed]
-    fingerprints = verify_manifest_entity_fingerprints(
-        cur,
-        pins=snapshots,
-        manifests=manifests,
-    )
     lineage = verify_raw_lineage(
         cur,
         pins=snapshots,
@@ -397,6 +447,7 @@ def run_backfill_batch_dq(
             for item in manifests
         ),
         scope_statuses=scope_statuses,
+        manifests=manifests,
     ) if child_cycle_ids else {
         'capture_count': 0,
         'capture_set_hash': stable_hash([]),

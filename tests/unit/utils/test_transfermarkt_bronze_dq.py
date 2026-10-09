@@ -796,3 +796,16 @@ def test_payload_columns_match_scraper_frames():
         assert keys <= set(frame), table
         semantic = set(frame) - lineage - keys
         assert set(dq.LEGACY_PAYLOAD_COLUMNS[table]) == semantic, table
+
+
+def test_verified_historical_presence_survives_current_career_deletion():
+    manifest = SimpleNamespace(child_cycle_id='history-child', scope_id='GB1__2020',
+        competition_id='GB1', edition_id='2020',
+        entities=(_evidence('market_value_points', dedup_rows=2),))
+    before = dq.run_bronze_dq(StubCursor(), registry_snapshot_id='snap-1',
+                            zone='full', manifests=[manifest])
+    assert not next(item for item in before if item.name == 'tm_scope_set_bronze_presence').passed
+    after = dq.run_bronze_dq(StubCursor(), registry_snapshot_id='snap-1',
+                           zone='full', manifests=[manifest],
+                           historical_presence={('GB1__2020', 'market_value_points'): 2})
+    assert next(item for item in after if item.name == 'tm_scope_set_bronze_presence').passed

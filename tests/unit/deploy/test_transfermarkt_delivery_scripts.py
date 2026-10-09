@@ -24,7 +24,7 @@ DAGS = (
     "dag_backfill_transfermarkt",
     "dag_transform_transfermarkt_silver",
 )
-POOLS = ("ingest_scraper_pool", "transfermarkt_proxy", "transfermarkt_backfill_proxy", "transfermarkt_backfill_control")
+POOLS = ("transfermarkt_control", "transfermarkt_proxy", "transfermarkt_backfill_proxy", "transfermarkt_backfill_control")
 SCHED = "transfermarkt-airflow-scheduler"
 GW = "transfermarkt_gw"
 
@@ -63,6 +63,13 @@ case "$cmd" in
       "airflow dags pause") [ -e "$S/pause_fails_$4" ] || echo t > "$S/paused_$4" ;;
       "airflow dags unpause") [ -e "$S/pause_fails_$4" ] || echo f > "$S/paused_$4" ;;
       "airflow pools set") echo "$5" > "$S/pool_$4" ;;
+      "python -m scrapers.transfermarkt.airflow_pools")
+        if [ "$4" = --apply ]; then
+          for p in transfermarkt_control transfermarkt_proxy; do echo 1 > "$S/pool_$p"; done
+          for p in transfermarkt_backfill_control transfermarkt_backfill_proxy; do echo 0 > "$S/pool_$p"; done
+        else
+          case "$5" in *backfill*) echo 0 ;; *) echo 1 ;; esac
+        fi ;;
       python*) echo ok ;;
       *) echo "unexpected exec: $*" >&2; exit 1 ;;
     esac ;;
@@ -290,6 +297,13 @@ case "$cmd" in
       "airflow dags unpause") echo f > "$S/paused_$4" ;;
       "airflow pools set") echo "$5" > "$S/pool_$4" ;;
       "airflow pools list") ;;
+      "python -m scrapers.transfermarkt.airflow_pools")
+        if [ "$4" = --apply ]; then
+          for p in transfermarkt_control transfermarkt_proxy; do echo 1 > "$S/pool_$p"; done
+          for p in transfermarkt_backfill_control transfermarkt_backfill_proxy; do echo 0 > "$S/pool_$p"; done
+        else
+          case "$5" in *backfill*) echo 0 ;; *) echo 1 ;; esac
+        fi ;;
       python*) echo "ok source_mode=transfermarkt-only paid_enabled=True" ;;
       *) echo "unexpected exec: $*" >&2; exit 1 ;;
     esac ;;
@@ -357,7 +371,7 @@ def test_first_deploy_on_a_fresh_metabase_registers_and_sets_pauses(tmp_path: Pa
     for dag, paused in want.items():
         assert (state / f"paused_{dag}").read_text().strip() == paused, dag
     for p in POOLS:
-        assert (state / f"pool_{p}").read_text().strip() == "1", p
+        assert (state / f"pool_{p}").read_text().strip() == ("0" if "backfill" in p else "1"), p
 
 
 @pytest.mark.unit
