@@ -1,0 +1,77 @@
+{
+  "tabs": [],
+  "allAvailableSeasons": [
+    "2026/2027"
+  ],
+  "details": {
+    "id": 10056,
+    "type": "league",
+    "name": "Liga 2",
+    "selectedSeason": "2026/2027",
+    "latestSeason": "2026/2027",
+    "shortName": "Liga 2",
+    "country": "IDN",
+    "gender": "male",
+    "nationalTeamId": 6324,
+    "faqJSONLD": null,
+    "breadcrumbJSONLD": {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://www.fotmob.com"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Liga 2",
+          "item": "https://www.fotmob.com/leagues/10056/overview/liga-2"
+        }
+      ]
+    },
+    "canSyncCalendar": true,
+    "hasFixtureDifficulty": false,
+    "leagueColor": "#333333",
+    "dataProvider": "enet",
+    "seopath": "liga-2"
+  },
+  "seostr": "liga-2",
+  "QAData": [],
+  "table": null,
+  "transfers": {
+    "type": "league",
+    "data": null
+  },
+  "overview": {
+    "season": "2026/2027",
+    "selectedSeason": "2026/2027",
+    "table": null,
+    "topPlayers": {
+      "byRating": {
+        "seeAllLink": "/leagues/10056/stats/season//players/rating/liga-2"
+      },
+      "byGoals": {
+        "seeAllLink": "/leagues/10056/stats/season//players/goals/liga-2"
+      },
+      "byAssists": {
+        "seeAllLink": "/leagues/10056/stats/season//players/goal_assist/liga-2"
+      },
+      "seeAllUrl": "stats"
+    },
+    "hasTotw": false,
+    "hasOngoingMatch": false,
+    "shotMap": null,
+    "matches": {
+      "hasOngoingMatch": false
+    }
+  },
+  "stats": {},
+  "fixtures": {
+    "hasOngoingMatch": false
+  },
+  "playoff": null,
+  "seasons": []
+}

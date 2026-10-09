@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
-from .catalog import CatalogShapeError, validate_selected_season
+from .catalog import CalendarMissingError, CatalogShapeError, validate_selected_season
 from .domain import (
     LeaderboardCategoryRef,
     ParseIssue,
@@ -255,7 +255,7 @@ def _parse_matches(
     # Preserve those real matches; an absent list without any match evidence is
     # still drift, not an explicit empty calendar.
     if calendar_missing and not rows:
-        raise CatalogShapeError("calendar match list is missing")
+        raise CalendarMissingError("calendar match list is missing")
     return tuple(rows.values()), issues
 
 

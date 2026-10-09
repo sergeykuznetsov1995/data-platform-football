@@ -658,15 +658,16 @@ def test_phase2_reports_a_red_history_wave_without_rolling_back(tmp_path: Path) 
 
 
 @pytest.mark.unit
-def test_phase2_rolls_back_a_red_refresh_wave_without_a_runner_error_and_names_the_source(tmp_path: Path) -> None:
+def test_phase2_rolls_back_red_current_without_guessing_its_cause(tmp_path: Path) -> None:
     w = _phase2_world(tmp_path, "fotmob_orchestrated__ddd|failed|2026-09-08T00:00:10|daily")
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
     assert proc.returncode == 1, proc.stderr + proc.stdout
     assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
     assert (w["state"] / "fotmob-auto-deliver.off").is_file()
     sent = w["sent"].read_text(encoding="utf-8")
-    assert "ошибки раннера нет" in sent and "no_progress_failure" in sent
-    assert "повторить доставку в ближайшее окно" in sent
+    assert "ошибки раннера нет" in sent and "причина не установлена" in sent
+    assert "no_progress_failure" not in sent and "вероятен отказ источника" not in sent
+    assert "отчёт волны" in sent
 
 
 @pytest.mark.unit

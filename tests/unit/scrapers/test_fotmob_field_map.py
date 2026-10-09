@@ -35,6 +35,17 @@ def test_unknown_path_is_schema_drift_when_no_catch_all_is_configured():
     assert coverage.has_schema_drift
 
 
+def test_transfer_filter_bounds_are_exact_raw_only_paths():
+    paths = ["minAge", "minDate", "maxMarketValue"]
+    coverage = classify_paths("transfers", paths)
+    assert coverage.raw_only == tuple(sorted(paths))
+    assert not coverage.unknown
+    unknown = ["minAge.value", "minDate.value", "maxMarketValue.value", "newFilter"]
+    assert classify_paths("transfers", unknown).unknown == tuple(sorted(unknown))
+    rules = entity_map()["transfers"]["rules"]
+    assert all(any(rule["path"] == path and rule["reason"] for rule in rules) for path in paths)
+
+
 def test_intentional_exclusions_are_exported_with_reasons():
     assert INTENTIONAL_EXCLUSIONS
     assert all(item["reason"] for item in INTENTIONAL_EXCLUSIONS)
