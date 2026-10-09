@@ -22,8 +22,9 @@ SHARED_FILTER_SHA256 = (
     # the per-chunk path.  #1389-B: upstream failure class, tunnels, /health.
     # #1387: transfermarkt-only source mode.
     # Refresh the merged baseline after 81bea4ce (#1392, tmapi host) and
-    # 1f933229 (#1388, provider CONNECT refusals); shared runtime unchanged here.
-    "664ceae641ddbb3a4065fe35942c80e77a9d1efe68741db2b0b6dfa52989a139"
+    # 1f933229 (#1388, provider CONNECT refusals). #1365: SofaScore tails,
+    # durable terminal retries, exception diagnostics and registry compaction.
+    "876308cc9d1454d36ec2563e24165bb35de62f196e5d2936264d323d27a0da64"
 )
 
 

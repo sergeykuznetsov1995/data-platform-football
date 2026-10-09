@@ -246,13 +246,11 @@ def _load_static_class_policy(
     except WorkloadPolicyUnavailable as exc:
         raise ProductionBudgetUnavailable(str(exc)) from exc
 
-    # Every endpoint of the class may reserve the whole class cap: a cold run
-    # attributes browser warm-up bytes to whichever endpoint runs first, so a
-    # per-endpoint split is not a safe upper bound.  SharedBudgetLedger and the
-    # filtering proxy still enforce the exact class total before any provider
-    # byte is forwarded.
+    # Calibrated bounds include bytes attributed to browser warm-up. Older v4
+    # policies, and endpoints without enough observations, retain the whole
+    # class cap. The capture pipeline adds the existing 15% headroom once.
     endpoint_reservations = {
-        endpoint: measured.hard_task_bytes
+        endpoint: measured.request_bound_bytes.get(endpoint, measured.hard_task_bytes)
         for endpoint in measured.required_endpoints
     }
     class_artifact_id = hashlib.sha256(
