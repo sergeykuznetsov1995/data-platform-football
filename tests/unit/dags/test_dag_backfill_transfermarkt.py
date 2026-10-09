@@ -536,3 +536,16 @@ def test_cooldown_leaf_preserves_upstream_failure(module):
     )
     with pytest.raises(module.AirflowException, match="upstream task failure"):
         module._backfill_poll_ready(ti=_Ti(), dag_run=dag_run)
+
+
+def test_history_uses_the_registered_timetable_class(monkeypatch):
+    from dags.utils import transfermarkt_current_timetable as registered
+
+    class RegisteredTimetable:
+        pass
+
+    # The source plugin registers the dags.utils class. A second import via
+    # utils creates another class identity that real Airflow cannot serialize.
+    monkeypatch.setattr(registered, 'TransfermarktCurrentTimetable', RegisteredTimetable)
+    module = _reload()
+    assert isinstance(module.dag.schedule, RegisteredTimetable)

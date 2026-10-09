@@ -33,7 +33,7 @@ from scrapers.transfermarkt.models import (
 from utils.default_args import SCRAPER_ARGS
 from scrapers.transfermarkt.streams import TransfermarktStreams
 from scrapers.transfermarkt import history_portion
-from utils.transfermarkt_current_timetable import TransfermarktCurrentTimetable, work_deadline, remaining_work_seconds, MAX_PORTION_SECONDS
+from dags.utils.transfermarkt_current_timetable import TransfermarktCurrentTimetable, work_deadline, remaining_work_seconds, MAX_PORTION_SECONDS
 from utils import transfermarkt_backfill_state as state
 from utils.transfermarkt_backfill_attempts import (
     has_matching_scope_attempt_result,
