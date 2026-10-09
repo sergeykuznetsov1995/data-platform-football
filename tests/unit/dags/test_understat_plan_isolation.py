@@ -48,10 +48,11 @@ else:
         from scrapers.understat.catalog import LEAGUES, UnderstatScope, season_slug
 
         class Client:
+            def __init__(self, **kwargs): pass
             def close(self): pass
 
         class Catalog:
-            def __init__(self, client): pass
+            def __init__(self, client, **kwargs): pass
             def rolling_scopes(self, **kwargs):
                 assert kwargs == {"window": 2, "probe_next": True}
                 return [UnderstatScope(item.league, item.source_league,

@@ -88,7 +88,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         required=True,
-        help="Per-scope JSON result consumed by the mapped Airflow validator",
+        help="JSON result destination; - emits stdout only for Airflow XCom",
     )
     parser.add_argument(
         "--run-id",
@@ -199,8 +199,8 @@ def _add_counts(*counts: Optional[int]) -> Optional[int]:
 
 def _classify_exception(exc: BaseException) -> tuple[Any, int, str]:
     from scrapers.base.base_scraper import ReplaceGuardError
+    from scrapers.base.trino_manager import TrinoError
     from scrapers.understat import (
-        UnderstatHTTPError,
         UnderstatPayloadError,
         UnderstatSchemaDrift,
     )
@@ -215,16 +215,25 @@ def _classify_exception(exc: BaseException) -> tuple[Any, int, str]:
     if isinstance(exc, PhysicalBatchFenceError):
         return (
             ManifestStatus.CONTRACT_FAILURE,
-            1,
+            2,
             f"{PHYSICAL_FENCE_MARKER}: {exc}",
         )
     if isinstance(exc, (UnderstatSchemaDrift, UnderstatPayloadError)):
-        return ManifestStatus.SCHEMA_DRIFT, 1, str(exc)
-    if isinstance(exc, (UnderstatHTTPError, TimeoutError, ConnectionError, OSError)):
+        return ManifestStatus.SCHEMA_DRIFT, 2, str(exc)
+    from scrapers.understat.client import is_retryable_error
+
+    cause = exc
+    seen: set[int] = set()
+    # The shared manager preserves the actual transport exception in __cause__.
+    # Unwrap only this known storage wrapper, never a schema/DQ error.
+    while isinstance(cause, TrinoError) and cause.__cause__ is not None:
+        if id(cause) in seen:
+            break
+        seen.add(id(cause))
+        cause = cause.__cause__
+    if is_retryable_error(cause):
         return ManifestStatus.RETRYABLE_FAILURE, 1, str(exc)
-    if isinstance(exc, (TypeError, ValueError)):
-        return ManifestStatus.CONTRACT_FAILURE, 1, str(exc)
-    return ManifestStatus.RETRYABLE_FAILURE, 1, str(exc)
+    return ManifestStatus.CONTRACT_FAILURE, 2, str(exc)
 
 
 def _append_failure_best_effort(repository: Any, attempt: Any) -> Optional[str]:
@@ -282,7 +291,7 @@ def _journal_early_failure(
         batch_id = str(uuid.uuid4())
         attempt = build_failure_attempt(
             scope=scope,
-            status=ManifestStatus.CONTRACT_FAILURE,
+            status=_classify_exception(exc)[0],
             batch_id=batch_id,
             run_id=str(
                 args.run_id
@@ -401,29 +410,27 @@ def run_scope(
                 logger.exception(
                     "Unable to verify already-complete Understat history scope"
                 )
-                verify_status, _, verify_message = _classify_exception(exc)
-                _journal_failure_best_effort(
-                    repository,
-                    build_failure_attempt(
-                        scope=scope,
-                        status=verify_status,
-                        batch_id=batch_id,
-                        run_id=run_id,
-                        mode=args.mode,
-                        parser_version=PARSER_VERSION,
-                        error_type=type(exc).__name__,
-                        error_message=verify_message,
-                        attempt_no=attempt_no,
-                        started_at=started_at,
-                    ),
+                verify_status, verify_exit, verify_message = _classify_exception(exc)
+                failure = build_failure_attempt(
+                    scope=scope,
+                    status=verify_status,
+                    batch_id=batch_id,
+                    run_id=run_id,
+                    mode=args.mode,
+                    parser_version=PARSER_VERSION,
+                    error_type=type(exc).__name__,
+                    error_message=verify_message,
+                    attempt_no=attempt_no,
+                    started_at=started_at,
                 )
+                _journal_failure_best_effort(repository, failure)
                 return _result_payload(
-                    latest,
+                    failure,
                     errors=[
                         "physical verification of the already-complete scope "
                         f"failed: {type(exc).__name__}: {exc}"
                     ],
-                ), 1
+                ), verify_exit
             if already_complete:
                 logger.info(
                     "Understat history scope already complete; skipping: %s/%s",
@@ -493,31 +500,29 @@ def run_scope(
                         logger.exception(
                             "Unable to verify unchanged closed Understat scope"
                         )
-                        verify_status, _, verify_message = _classify_exception(exc)
-                        _journal_failure_best_effort(
-                            repository,
-                            build_failure_attempt(
-                                scope=scope,
-                                status=verify_status,
-                                batch_id=batch_id,
-                                run_id=run_id,
-                                mode=args.mode,
-                                parser_version=PARSER_VERSION,
-                                error_type=type(exc).__name__,
-                                error_message=verify_message,
-                                attempt_no=attempt_no,
-                                started_at=started_at,
-                                league_payload_hashes=snapshot,
-                                request_count=probe_request_count,
-                            ),
+                        verify_status, verify_exit, verify_message = _classify_exception(exc)
+                        failure = build_failure_attempt(
+                            scope=scope,
+                            status=verify_status,
+                            batch_id=batch_id,
+                            run_id=run_id,
+                            mode=args.mode,
+                            parser_version=PARSER_VERSION,
+                            error_type=type(exc).__name__,
+                            error_message=verify_message,
+                            attempt_no=attempt_no,
+                            started_at=started_at,
+                            league_payload_hashes=snapshot,
+                            request_count=probe_request_count,
                         )
+                        _journal_failure_best_effort(repository, failure)
                         return _result_payload(
-                            baseline,
+                            failure,
                             errors=[
                                 "physical verification of the unchanged closed "
                                 f"scope failed: {type(exc).__name__}: {exc}"
                             ],
-                        ), 1
+                        ), verify_exit
                     if unchanged_verified:
                         logger.info(
                             "closed scope unchanged: league=%s season=%s hashes=%s",
@@ -664,7 +669,7 @@ def run_scope(
                         },
                     ),
                 )
-                return _result_payload(proposed_attempt, errors=[message]), 1
+                return _result_payload(proposed_attempt, errors=[message]), 2
 
             if report.status is ManifestStatus.COMPLETE:
                 entities_to_write = UNDERSTAT_ENTITIES
@@ -748,7 +753,7 @@ def run_scope(
                 proposed_attempt,
                 tables=written_tables,
                 errors=[message],
-            ), 1
+            ), 2
         return _result_payload(proposed_attempt, tables=written_tables), 0
 
     except Exception as exc:
@@ -812,17 +817,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         result, exit_code = run_scope(args)
     except Exception as exc:
         # Argument/scope validation can fail before a ScopeAttempt exists.
+        status, exit_code, message = _classify_exception(exc)
         result = {
-            "status": "contract_failure",
+            "status": status.value,
             "league": str(getattr(args, "league", "")),
             "season": str(getattr(args, "season_slug", "")),
             "source_season_id": str(getattr(args, "source_season_id", "")),
-            "errors": [str(exc)],
+            "errors": [message],
         }
-        exit_code = 1
         logger.exception("Understat runner could not initialize the requested scope")
         _journal_early_failure(args, exc)
-    _atomic_write_json(args.output, result)
+    if args.output != "-":
+        _atomic_write_json(args.output, result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
     return exit_code
 
