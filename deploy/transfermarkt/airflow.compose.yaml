@@ -34,6 +34,8 @@ x-tm-airflow-common: &tm-airflow-common
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?set the Airflow fernet key}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Source-specific plugin directory: serialized current timetable registration.
+    AIRFLOW__CORE__PLUGINS_FOLDER: /opt/airflow/dags/utils/transfermarkt_plugins
     # СВОЯ metadata-DB: сервис airflow-metadb этого проекта. Ни при каких
     # обстоятельствах не менять на общий postgres — двойной scheduler на одной БД.
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${TRANSFERMARKT_AIRFLOW_DB_PASSWORD:?set the Transfermarkt metadata-DB password}@airflow-metadb:5432/airflow

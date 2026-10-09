@@ -271,6 +271,11 @@ def _install_airflow_stubs() -> None:
         def __getitem__(self, key):
             return _StubXComArg(self.operator, key=key)
 
+        def map(self, function):
+            value = _StubXComArg(self.operator, key=self.key)
+            value.function = function
+            return value
+
     class _MappedPartial:
         def __init__(self, operator_class, kwargs):
             self.operator_class = operator_class

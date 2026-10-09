@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -90,6 +91,12 @@ _MAX_BLOCKED_ATTEMPTS = 4
 # strictly between those limits so scheduling jitter can still observe the
 # grant without allowing an orphaned ticket to outlive the proxy queue.
 TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS = 65.0
+CURRENT_PORTION_SETTLE_SECONDS = 30.0
+CURRENT_PORTION_MIN_REQUEST_SECONDS = 5.0
+
+
+class CurrentPortionDeadlineExceeded(RuntimeError):
+    """End a current work portion without treating its tail as a source failure."""
 
 
 # #1389: the gateway names the upstream CONNECT outcome (``<code|timeout|
@@ -301,6 +308,8 @@ class ProxyFilterLeaseProvider:
         timeout_seconds: float = 5.0,
         sleep_fn: Callable[[float], None] = time.sleep,
         time_fn: Callable[[], float] = time.time,
+        request_deadline_monotonic: Optional[float] = None,
+        monotonic_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         base = str(control_base_url).rstrip("/")
         parsed = urlsplit(base)
@@ -322,6 +331,26 @@ class ProxyFilterLeaseProvider:
         self.timeout_seconds = float(timeout_seconds)
         self._sleep = sleep_fn
         self._time = time_fn
+        if request_deadline_monotonic is not None and not math.isfinite(float(request_deadline_monotonic)):
+            raise ValueError("request_deadline_monotonic must be finite")
+        self.request_deadline_monotonic = float(request_deadline_monotonic) if request_deadline_monotonic is not None else None
+        self._monotonic = monotonic_fn
+
+    def _admission_timeout(self) -> float:
+        if self.request_deadline_monotonic is None:
+            return self.timeout_seconds
+        remaining = self.request_deadline_monotonic - self._monotonic() - CURRENT_PORTION_SETTLE_SECONDS
+        if remaining <= CURRENT_PORTION_MIN_REQUEST_SECONDS:
+            raise CurrentPortionDeadlineExceeded("Transfermarkt control admission reached portion tail")
+        return min(self.timeout_seconds, remaining)
+
+    def _settlement_timeout(self) -> float:
+        if self.request_deadline_monotonic is None:
+            return self.timeout_seconds
+        remaining = self.request_deadline_monotonic - self._monotonic()
+        if remaining <= 0:
+            raise TrafficMeterError("Transfermarkt portion deadline exhausted before lease settlement")
+        return min(self.timeout_seconds, remaining)
 
     def _client(self):
         if self._control_client is None:
@@ -348,7 +377,7 @@ class ProxyFilterLeaseProvider:
             f"{self.control_base_url}{path}",
             json=dict(payload) if payload is not None else None,
             headers=headers,
-            timeout=self.timeout_seconds,
+            timeout=(self._admission_timeout() if path == "/v1/leases" or path.endswith("/consume") else self._settlement_timeout()),
         )
         status = int(getattr(response, "status_code", 0) or 0)
         try:
@@ -404,13 +433,18 @@ class ProxyFilterLeaseProvider:
         started = self._time()
         granted: Mapping[str, Any] | None = None
         while granted is None:
+            timeout = self._admission_timeout()
+            if self.request_deadline_monotonic is not None:
+                timeout = min(timeout, max_wait_seconds - (self._time() - started))
+                if timeout <= 0:
+                    raise CurrentPortionDeadlineExceeded("Transfermarkt permit reached portion tail")
             headers = {"X-Proxy-Control-Token": self._control_token}
             response = self._client().request(
                 "POST",
                 f"{self.control_base_url}/v1/transfermarkt/request-permits",
                 json=payload,
                 headers=headers,
-                timeout=self.timeout_seconds,
+                timeout=timeout,
             )
             status = int(getattr(response, "status_code", 0) or 0)
             try:
@@ -434,6 +468,8 @@ class ProxyFilterLeaseProvider:
                 min(5.0, float(body.get("retry_after_seconds", 0.05))),
             )
             if elapsed + retry_after > float(max_wait_seconds):
+                if self.request_deadline_monotonic is not None:
+                    raise CurrentPortionDeadlineExceeded("Transfermarkt permit cannot complete within portion")
                 raise TrafficMeterError("request permit wait exceeded its bound")
             self._sleep(retry_after)
 
@@ -553,6 +589,8 @@ class ProxyFilterLeaseProvider:
                     f"proxy lease API rejected DELETE {path} (HTTP 409): "
                     "lease close stayed pending after drain retries"
                 )
+            if self.request_deadline_monotonic is not None and delay >= self.request_deadline_monotonic - self._monotonic():
+                raise TrafficMeterError("Transfermarkt portion has no time for lease close retry")
             self._sleep(delay)
         try:
             return LeaseTrafficSnapshot.from_mapping(body)
@@ -604,6 +642,7 @@ class TransfermarktHttpClient:
         random_fn: Callable[[], float] = random.random,
         time_fn: Callable[[], float] = time.time,
         monotonic_fn: Callable[[], float] = time.monotonic,
+        request_deadline_monotonic: Optional[float] = None,
     ) -> None:
         if lease_provider is not None and (proxy_manager is not None or proxy):
             raise ValueError(
@@ -654,6 +693,13 @@ class TransfermarktHttpClient:
         self._random = random_fn
         self._time = time_fn
         self._monotonic = monotonic_fn
+        if request_deadline_monotonic is not None and not math.isfinite(float(request_deadline_monotonic)):
+            raise ValueError("request_deadline_monotonic must be finite")
+        self._request_deadline_monotonic = float(request_deadline_monotonic) if request_deadline_monotonic is not None else None
+        if isinstance(self._lease_provider, ProxyFilterLeaseProvider) and request_deadline_monotonic is not None:
+            existing = self._lease_provider.request_deadline_monotonic
+            self._lease_provider.request_deadline_monotonic = min(existing, request_deadline_monotonic) if existing is not None else request_deadline_monotonic
+            self._lease_provider._monotonic = monotonic_fn
 
         self._client = None
         self._session_id: Optional[str] = None
@@ -800,10 +846,21 @@ class TransfermarktHttpClient:
             ).encode("utf-8")
         ).hexdigest()
         try:
+            options = {}
+            if self._request_deadline_monotonic is not None:
+                self._request_timeout()
+                options["max_wait_seconds"] = min(
+                    TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS,
+                    self._request_deadline_monotonic - self._monotonic()
+                    - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS,
+                )
             self._lease_provider.acquire_request_permit(
                 metadata=metadata,
                 request_id=request_id,
+                **options,
             )
+        except CurrentPortionDeadlineExceeded:
+            raise
         except TrafficMeterError:
             raise
         except Exception as exc:  # provider adapters vary
@@ -1552,7 +1609,17 @@ class TransfermarktHttpClient:
         return redact_sensitive(problem) if problem else None
 
     def _backoff(self, attempt: int) -> None:
-        self._sleep((0.5 * (2 ** max(0, attempt - 1))) + (0.25 * self._random()))
+        delay = (0.5 * (2 ** max(0, attempt - 1))) + (0.25 * self._random())
+        self._request_timeout(extra_seconds=delay)
+        self._sleep(delay)
+
+    def _request_timeout(self, *, extra_seconds: float = 0.0) -> float:
+        if self._request_deadline_monotonic is None:
+            return self.timeout_seconds
+        remaining = self._request_deadline_monotonic - self._monotonic() - CURRENT_PORTION_SETTLE_SECONDS - extra_seconds
+        if remaining <= CURRENT_PORTION_MIN_REQUEST_SECONDS:
+            raise CurrentPortionDeadlineExceeded("Transfermarkt request reached portion tail; retain unfinished work")
+        return min(self.timeout_seconds, remaining)
 
     def _finish(self, outcome: FetchOutcome[Any]) -> FetchOutcome[Any]:
         if outcome.is_success:
@@ -1591,11 +1658,15 @@ class TransfermarktHttpClient:
         label: str = 'endpoint',
         context: Optional[Mapping[str, Any]] = None,
         url: Optional[str] = None,
+        cache_generation: Optional[str] = None,
     ) -> Optional[FetchOutcome[Any]]:
         if self._cache is None or not cache_key:
             return None
         raw = self._cache.get(cache_key)
         if not isinstance(raw, Mapping):
+            return None
+        # Check before raw replay or the verified 48-hour squad migration.
+        if cache_generation is not None and raw.get("cache_generation") != cache_generation:
             return None
         try:
             expires_at = float(raw["expires_at"])
@@ -1698,7 +1769,7 @@ class TransfermarktHttpClient:
                         ):
                             self._cache.pop(cache_key, None)
                             return None
-                    if prior_cycle and not resume_squad:
+                    if prior_cycle and not resume_squad and cache_generation is None:
                         # The URL-keyed cache may outlive one daily/backfill
                         # cycle.  Its bytes remain valid raw history, but they
                         # are not evidence for this exact physical attempt.
@@ -1748,6 +1819,7 @@ class TransfermarktHttpClient:
         cache_key: Optional[str],
         cache_ttl_seconds: Optional[float],
         outcome: FetchOutcome[Any],
+        cache_generation: Optional[str] = None,
     ) -> None:
         if (
             self._cache is None
@@ -1761,9 +1833,46 @@ class TransfermarktHttpClient:
             "cache_version": 1,
             "expires_at": self._time() + float(cache_ttl_seconds),
             "outcome": outcome.as_checkpoint(),
+            **({"cache_generation": cache_generation} if cache_generation is not None else {}),
         }
 
     def fetch(
+        self, url: str, *, as_json: bool, max_attempts: int = 6,
+        label: str = "endpoint", context: Optional[Mapping[str, Any]] = None,
+        validator: Optional[Callable[[Any], Optional[str]]] = None,
+        cache_key: Optional[str] = None, cache_ttl_seconds: Optional[float] = None,
+        max_405_attempts: Optional[int] = None, cache_generation: Optional[str] = None,
+    ) -> FetchOutcome[Any]:
+        """Fetch using optional portion admission and exact cache generation.
+
+        A generation miss is checked before raw replay and 48-hour squad reuse.
+        Callers supply a fresh signal generation or stable club generation for
+        unfinished collection; omitting it preserves legacy cache behavior.
+        """
+        if cache_generation is not None and (not isinstance(cache_generation, str) or not cache_generation.strip()):
+            raise ValueError("cache_generation must be a nonempty string")
+        completed = False
+        deadline_stop = False
+        try:
+            self._request_timeout()
+            outcome = self._fetch(
+                url, as_json=as_json, max_attempts=max_attempts, label=label,
+                context=context, validator=validator, cache_key=cache_key,
+                cache_ttl_seconds=cache_ttl_seconds, max_405_attempts=max_405_attempts,
+                cache_generation=cache_generation,
+            )
+            completed = True
+            return outcome
+        except CurrentPortionDeadlineExceeded:
+            deadline_stop = True
+            raise
+        finally:
+            # Settle even if raw/control processing fails inside a bounded
+            # portion. Keep legacy successful-fetch connection reuse intact.
+            if deadline_stop or (self._request_deadline_monotonic is not None and not completed):
+                self.close()
+
+    def _fetch(
         self,
         url: str,
         *,
@@ -1779,6 +1888,7 @@ class TransfermarktHttpClient:
         cache_key: Optional[str] = None,
         cache_ttl_seconds: Optional[float] = None,
         max_405_attempts: Optional[int] = None,
+        cache_generation: Optional[str] = None,
     ) -> FetchOutcome[Any]:
         """Fetch one logical endpoint with bounded status-aware retries.
 
@@ -1791,6 +1901,7 @@ class TransfermarktHttpClient:
         cache_started = self._monotonic()
         cached = self._load_cached_outcome(
             cache_key, as_json=as_json, label=label, context=context, url=url,
+            cache_generation=cache_generation,
         )
         if cached is not None:
             duration = self._monotonic() - cache_started
@@ -1823,6 +1934,7 @@ class TransfermarktHttpClient:
         attempt_envelopes: list[RawAttemptEnvelopeRecord] = []
 
         for attempt in range(1, attempts_cap + 1):
+            self._request_timeout()
             proxy_status = ""
             self._check_request_budget()
             self._check_decoded_budget(before_request=True)
@@ -1834,7 +1946,13 @@ class TransfermarktHttpClient:
                     url=url, label=label, context=context, retry=attempt > 1,
                 )
                 if self._rate_limiter is not None:
-                    self._rate_limiter.acquire()
+                    if self._request_deadline_monotonic is None:
+                        self._rate_limiter.acquire()
+                    else:
+                        remaining = self._request_deadline_monotonic - self._monotonic() - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS
+                        if not self._rate_limiter.acquire(timeout=max(0.0, remaining)):
+                            raise CurrentPortionDeadlineExceeded("Transfermarkt limiter reached portion tail")
+                self._request_timeout()
                 self._consume_source_request_permit(
                     url=url,
                     label=label,
@@ -1853,7 +1971,7 @@ class TransfermarktHttpClient:
                             url=url, label=label, context=context,
                             retry=attempt > 1,
                         )
-                    except (TrafficBudgetExceeded, TrafficMeterError):
+                    except (TrafficBudgetExceeded, TrafficMeterError, CurrentPortionDeadlineExceeded):
                         raise
                     except Exception as exc:  # noqa: BLE001 - adapter errors vary
                         raise LeaseRotationError(
@@ -1862,7 +1980,7 @@ class TransfermarktHttpClient:
                         ) from exc
                 resp = client.get(
                     url,
-                    timeout=self.timeout_seconds,
+                    timeout=self._request_timeout(),
                 )
                 elapsed = self._monotonic() - started
                 attempt_duration_for_endpoint += elapsed
@@ -2036,6 +2154,7 @@ class TransfermarktHttpClient:
                                 self._store_cached_outcome(
                                     cache_key=cache_key,
                                     cache_ttl_seconds=cache_ttl_seconds,
+                                    cache_generation=cache_generation,
                                     outcome=outcome,
                                 )
                                 return outcome
@@ -2101,6 +2220,7 @@ class TransfermarktHttpClient:
                             self._store_cached_outcome(
                                 cache_key=cache_key,
                                 cache_ttl_seconds=cache_ttl_seconds,
+                                cache_generation=cache_generation,
                                 outcome=outcome,
                             )
                             return outcome
@@ -2220,6 +2340,8 @@ class TransfermarktHttpClient:
                             proxy_status,
                         )
                     break
+            except CurrentPortionDeadlineExceeded:
+                raise
             except TrafficBudgetExceeded:
                 self._budget_exhausted = True
                 self._discard_client()

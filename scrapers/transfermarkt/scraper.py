@@ -1515,6 +1515,8 @@ class TransfermarktScraper(BaseScraper):
         response_cache = kwargs.pop('response_cache', None)
         resume_squad_cache = kwargs.pop('resume_squad_cache', False)
         cache_ttl_seconds = kwargs.pop('cache_ttl_seconds', None)
+        request_deadline_monotonic = kwargs.pop('request_deadline_monotonic', None)
+        self._cache_generation_by_url = dict(kwargs.pop('cache_generation_by_url', {}) or {})
         canonical_season_override = kwargs.pop('canonical_season', None)
         retry_budget_raw = kwargs.pop(
             'retry_budget', os.environ.get('TM_RETRY_BUDGET'),
@@ -1623,6 +1625,7 @@ class TransfermarktScraper(BaseScraper):
             rate_limiter=self._rate_limiter,
             cache=response_cache,
             resume_squad_cache=resume_squad_cache,
+            request_deadline_monotonic=request_deadline_monotonic,
             timeout_seconds=12,
             circuit_failures=5,
         )
@@ -2236,6 +2239,7 @@ class TransfermarktScraper(BaseScraper):
             validator=self._endpoint_validator(label, as_json),
             cache_key=url if self._response_cache is not None else None,
             cache_ttl_seconds=self._cache_ttl_seconds,
+            cache_generation=self._cache_generation_by_url.get(url),
         )
         self._store_fetch_outcome(outcome)
         return outcome

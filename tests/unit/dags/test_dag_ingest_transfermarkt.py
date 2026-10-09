@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import importlib
 import inspect
@@ -108,7 +108,8 @@ class TestDagShape:
         task = _bash_task('run_exact_child_cycle')
         assert task is not None
         assert task.is_mapped is True
-        assert task._expand_kwargs['env'].operator.task_id == 'plan_exact_scopes'
+        assert task._expand_kwargs_arg.operator.task_id == 'plan_exact_scopes'
+        assert task._expand_kwargs_arg.function is dag_module._child_operator_kwargs
         assert task._init_kwargs['pool'] == 'transfermarkt_proxy'
         assert task._init_kwargs['pool_slots'] == 1
         assert task._init_kwargs['max_active_tis_per_dag'] == 1
@@ -159,6 +160,7 @@ class TestDagShape:
         from dags.scripts import run_transfermarkt_scope_cycle as wrapper
 
         command = _bash_task('run_exact_child_cycle').bash_command
+        command = command.split('fi\n', 1)[1]
         rendered_flags = set(re.findall(r'(?m)^\s*(--[a-z0-9-]+)\b', command))
         parser_flags = set(wrapper._parser()._option_string_actions)
         assert {'--standing-policy', '--standing-policy-sha256'} <= rendered_flags
@@ -206,7 +208,8 @@ class TestDagShape:
         from scrapers.transfermarkt import models
 
         task = _bash_task('run_exact_child_cycle')
-        execution_timeout = task._init_kwargs['execution_timeout']
+        execution_timeout = dag_module._child_operator_kwargs({})['execution_timeout']
+        assert dag_module._child_operator_kwargs({'TM_CURRENT_JOB': '/job.json'})['execution_timeout'] == timedelta(minutes=45)
         params = dag_module.dag._dag_kwargs['params']
         args = SimpleNamespace(
             entity_timeout_seconds=params['entity_timeout_seconds']._kw[
@@ -1811,3 +1814,268 @@ class TestProbeOnlyInScheduledRun:
         assert envs[0]['TM_APPROVAL_MODE'] == 'one_shot'
         assert dag_module.probe_calls == []
         assert 'проба сети пропущена: ручной ран с пакетом одобрений' in caplog.text
+
+
+class TestQualifiedCurrentLane:
+    def test_scheduled_job_has_one_writer_and_whole_run_deadline(self, dag_module, monkeypatch, tmp_path):
+        gate = TestStandingPolicyGate()
+        gate._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        monkeypatch.setattr(dag_module, 'CURRENT_STATE_ROOT', tmp_path / 'current')
+        current_row = {'competition_id': 'GB1', 'edition_id': '2026', 'is_current': True}
+        historical_row = {'competition_id': 'GB1', 'edition_id': '2025', 'is_current': False}
+        monkeypatch.setattr(dag_module, '_read_promoted_registry', lambda **kw: [current_row, historical_row])
+        evidence = {'qualified': 'checked separately by qualification validator'}
+        monkeypatch.setattr(dag_module, '_current_qualification', lambda: evidence)
+        context = gate._context(dag_module, gate._standing_params(dag_module))
+        started = datetime(2026, 10, 8, 23, 55, tzinfo=timezone.utc)
+        context['dag_run'].start_date = started
+        monkeypatch.setattr(dag_module, '_planning_now', lambda: started)
+        environments = dag_module._plan_exact_scopes(**context)
+        assert len(environments) == 1
+        job = json.loads(Path(environments[0]['TM_CURRENT_JOB']).read_text())
+        assert job['deadline_at'] == (started + timedelta(minutes=45)).isoformat()
+        assert job['preflight'] == context['ti'].xcom_pull.return_value
+        assert job['registry_rows'] == [current_row]
+        assert job['qualification'] == evidence
+        assert job['cycle_id'] == context['run_id']
+        assert dag_module._child_operator_kwargs(environments[0])['execution_timeout'] == timedelta(minutes=45)
+        assert dag_module.probe_calls == []
+
+    def test_manual_path_keeps_approvals_without_consulting_current_qualification(self, dag_module, monkeypatch, tmp_path):
+        gate = TestStandingPolicyGate()
+        payload = gate._arm(dag_module, monkeypatch, tmp_path)
+
+        def forbidden():
+            raise AssertionError('manual path must not enter current lane')
+
+        monkeypatch.setattr(dag_module, '_current_qualification', forbidden)
+        params = gate._standing_params(dag_module, approval_bundles={payload['scope_id']: {
+            'paid_proxy_packet_id': 'paid-1', 'paid_proxy_packet_hash': 'a' * 64,
+            'production_write_packet_id': 'write-1', 'production_write_packet_hash': 'b' * 64,
+        }})
+        environment, = dag_module._plan_exact_scopes(**gate._context(dag_module, params, run_type='manual'))
+        assert environment['TM_APPROVAL_MODE'] == 'one_shot'
+        assert 'TM_CURRENT_JOB' not in environment
+        assert dag_module._child_operator_kwargs(environment)['execution_timeout'] == timedelta(
+            seconds=dag_module.SCOPE_WALL_CLOCK_TIMEOUT_SECONDS)
+
+    def test_successful_scope_report_survives_individual_failure_without_promotion(self, dag_module, tmp_path):
+        path = tmp_path / 'report.json'
+        path.write_text(json.dumps({'policy_version': 'change-signals-v1', 'cycle_id': 'portion-1',
+                                    'scopes': [{'scope_id': 'healthy', 'status': 'complete'},
+                                               {'scope_id': 'broken', 'status': 'failed'}]}))
+        ti = MagicMock()
+        ti.xcom_pull.return_value = [{'TM_CURRENT_REPORT': str(path)}]
+        result = dag_module._validate_scope_set(ti=ti, run_id='portion-1')
+        assert len(result['scopes']) == 2
+        assert result['promotion_ready'] is False
+
+    def test_missing_or_wrong_run_report_is_not_success(self, dag_module, tmp_path):
+        path = tmp_path / 'report.json'
+        ti = MagicMock()
+        ti.xcom_pull.return_value = [{'TM_CURRENT_REPORT': str(path)}]
+        with pytest.raises(Exception):
+            dag_module._validate_scope_set(ti=ti, run_id='portion-1')
+        path.write_text(json.dumps({'cycle_id': 'another-run', 'scopes': []}))
+        with pytest.raises(Exception, match='another run'):
+            dag_module._validate_scope_set(ti=ti, run_id='portion-1')
+
+    def test_missing_qualification_keeps_existing_daily_schedule(self, dag_module, monkeypatch, tmp_path):
+        monkeypatch.setattr(dag_module, 'CURRENT_QUALIFICATION_PATH', tmp_path / 'missing.json')
+        assert dag_module._current_qualification() is None
+        assert dag_module._current_schedule() == dag_module.SCHEDULES.get('dag_ingest_transfermarkt', '0 4 * * *')
+
+    def test_invalid_qualification_stops_activation(self, dag_module, monkeypatch, tmp_path):
+        path = tmp_path / 'invalid.json'
+        path.write_text('{}')
+        monkeypatch.setattr(dag_module, 'CURRENT_QUALIFICATION_PATH', path)
+        with pytest.raises(Exception, match='qualification'):
+            dag_module._current_qualification()
+
+
+class TestCurrentPlanningDeadline:
+    def arm(self, module, monkeypatch, *, age=0):
+        gate = TestStandingPolicyGate()
+        monkeypatch.setenv('TM_NATIVE_V2_ENABLED', 'true')
+        monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+        monkeypatch.setattr(module, '_current_qualification', lambda: {'validated': True})
+        started = datetime(2026, 10, 9, 10, tzinfo=timezone.utc)
+        context = gate._context(module, gate._standing_params(module))
+        context['dag_run'].start_date = started
+        clock = SimpleNamespace(elapsed=float(age))
+        monkeypatch.setattr(module, '_planning_now', lambda: started + timedelta(seconds=clock.elapsed))
+        monkeypatch.setattr(module, '_planning_monotonic', lambda: clock.elapsed)
+        return context, clock
+
+    @pytest.mark.parametrize('function', ['_preflight_reader_route_for_paid_cycle', '_plan_exact_scopes'])
+    @pytest.mark.parametrize('when', ['expired', '00:15', '01:00', '02:59'])
+    def test_expired_and_quiet_tasks_fail_without_sql_or_retry(self, dag_module, monkeypatch, function, when):
+        from airflow.exceptions import AirflowFailException
+        from utils import transfermarkt_native_v2 as tm_v2
+        context, clock = self.arm(dag_module, monkeypatch, age=2701)
+        if when != 'expired':
+            hour, minute = map(int, when.split(':'))
+            stamp = context['dag_run'].start_date.replace(hour=hour, minute=minute)
+            context['dag_run'].start_date = stamp
+            monkeypatch.setattr(dag_module, '_planning_now', lambda: stamp)
+        connect = MagicMock(side_effect=AssertionError('deadline must prohibit first SQL'))
+        monkeypatch.setattr(tm_v2, 'connect', connect)
+        with pytest.raises(AirflowFailException, match='whole DagRun deadline'):
+            getattr(dag_module, function)(**context)
+        connect.assert_not_called()
+        assert tm_v2.connect is connect
+
+    @pytest.mark.parametrize('function', ['_preflight_reader_route_for_paid_cycle', '_plan_exact_scopes'])
+    def test_real_trino_poll_chain_has_one_shared_deadline_and_restores_backend(self, dag_module, monkeypatch, tmp_path, function):
+        import requests
+        import signal
+        import trino
+        from airflow.exceptions import AirflowFailException
+        from utils import transfermarkt_native_v2 as tm_v2
+        context, clock = self.arm(dag_module, monkeypatch, age=2660)
+        if function == '_plan_exact_scopes':
+            policy_path, _ = _write_standing_policy(tmp_path)
+            monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+            monkeypatch.setenv('TM_PROXY_CONTROL_URL', 'http://offline.invalid')
+        calls = []
+        session = requests.Session()
+        def request(method, url, **kwargs):
+            calls.append((method, kwargs['timeout']))
+            clock.elapsed += 4
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps({'id': 'q', 'infoUri': 'http://offline.invalid/info',
+                'nextUri': 'http://offline.invalid/next', 'stats': {}, 'data': []}).encode()
+            return response
+        session.request = request
+        connection = trino.dbapi.connect(host='offline.invalid', user='unit', http_session=session, max_attempts=4)
+        connect = lambda: connection
+        monkeypatch.setattr(tm_v2, 'connect', connect)
+        monkeypatch.setattr(tm_v2, 'read_reader_state', lambda cursor, **kw: cursor.execute('SELECT 1').fetchall())
+        handler = signal.getsignal(signal.SIGALRM)
+        timer = signal.getitimer(signal.ITIMER_REAL)
+        with pytest.raises(AirflowFailException, match='whole DagRun deadline'):
+            getattr(dag_module, function)(**context)
+        assert calls == [('POST', 10), ('GET', 6), ('GET', 2)]
+        assert connection.max_attempts == 1
+        assert tm_v2.connect is connect
+        assert signal.getsignal(signal.SIGALRM) == handler
+        assert signal.getitimer(signal.ITIMER_REAL) == timer
+
+    def test_absolute_alarm_interrupts_blocked_actual_http_request(self, dag_module, monkeypatch):
+        import requests
+        import signal
+        import time
+        import trino
+        from contextlib import contextmanager
+        from dags.scripts import run_transfermarkt_current as runner
+        from airflow.exceptions import AirflowFailException
+        from utils import transfermarkt_native_v2 as tm_v2
+        context, clock = self.arm(dag_module, monkeypatch, age=2660)
+        original_alarm = runner._portion_alarm
+        admitted = []
+        @contextmanager
+        def quick_alarm(seconds):
+            admitted.append(seconds)
+            with original_alarm(.025):
+                yield
+        monkeypatch.setattr(runner, '_portion_alarm', quick_alarm)
+        requests_seen = []
+        session = requests.Session()
+        def request(method, url, **kwargs):
+            requests_seen.append(method)
+            time.sleep(.2)  # a socket read can stall without advancing a fake clock
+            raise AssertionError('absolute alarm must interrupt the blocked request')
+        session.request = request
+        connection = trino.dbapi.connect(host='offline.invalid', user='unit', http_session=session, max_attempts=4)
+        connect = lambda: connection
+        monkeypatch.setattr(tm_v2, 'connect', connect)
+        monkeypatch.setattr(tm_v2, 'read_reader_state', lambda cursor, **kw: cursor.execute('SELECT 1').fetchall())
+        handler = signal.getsignal(signal.SIGALRM)
+        with pytest.raises(AirflowFailException, match='whole DagRun deadline'):
+            dag_module._preflight_reader_route_for_paid_cycle(**context)
+        assert admitted == [40]
+        assert requests_seen == ['POST']
+        assert tm_v2.connect is connect
+        assert signal.getsignal(signal.SIGALRM) == handler
+        assert signal.getitimer(signal.ITIMER_REAL) == (0, 0)
+
+    def test_preflight_time_is_not_granted_again_to_planner(self, dag_module, monkeypatch):
+        from utils import transfermarkt_native_v2 as tm_v2
+        context, clock = self.arm(dag_module, monkeypatch)
+        connections = []
+        def connect():
+            connection = SimpleNamespace(_request_timeout=10000)
+            connections.append(connection)
+            return connection
+        monkeypatch.setattr(tm_v2, 'connect', connect)
+        # Invoke the same wrappers with tiny bodies to isolate their shared
+        # admission contract while the real per-poll test exercises Trino above.
+        @dag_module._bounded_current_planning
+        def preflight(**context):
+            first = tm_v2.connect()
+            clock.elapsed += 600
+            second = tm_v2.connect()
+            assert first._request_timeout == 2670 and second._request_timeout == 2070
+            clock.elapsed += 1200
+        @dag_module._bounded_current_planning
+        def planner(**context):
+            assert tm_v2.connect()._request_timeout == 870
+        preflight(**context)
+        planner(**context)
+        assert tm_v2.connect is connect
+        assert all(connection.max_attempts == 1 for connection in connections)
+
+    @pytest.mark.parametrize('excluded', ['manual', 'scopes', 'leagues', 'approvals', 'gate_off', 'qualification_absent'])
+    def test_manual_or_legacy_context_preserves_unbounded_backend_policy(self, dag_module, monkeypatch, excluded):
+        from utils import transfermarkt_native_v2 as tm_v2
+        context, clock = self.arm(dag_module, monkeypatch, age=3000)
+        if excluded == 'manual':
+            context['dag_run'].run_type = 'manual'
+        elif excluded in ('scopes', 'leagues'):
+            context['params'][excluded] = ['explicit']
+        elif excluded == 'approvals':
+            context['params']['approval_bundles'] = {'explicit': {}}
+        elif excluded == 'gate_off':
+            monkeypatch.delenv('TM_STANDING_POLICY_ENABLED')
+        else:
+            monkeypatch.setattr(dag_module, '_current_qualification', lambda: None)
+        if excluded != 'qualification_absent':
+            monkeypatch.setattr(dag_module, '_current_qualification', lambda: pytest.fail('legacy must not validate qualification'))
+        connection = SimpleNamespace(_request_timeout=120, max_attempts=4)
+        connect = lambda: connection
+        monkeypatch.setattr(tm_v2, 'connect', connect)
+        @dag_module._bounded_current_planning
+        def old_task(**context):
+            assert tm_v2.connect is connect
+            return tm_v2.connect()
+        assert old_task(**context) is connection
+        assert connection._request_timeout == 120 and connection.max_attempts == 4
+        assert tm_v2.connect is connect
+
+
+def test_current_late_ordinary_trino_timeout_fails_without_inherited_retry_delay(dag_module, monkeypatch):
+    import requests
+    import trino
+    from airflow.exceptions import AirflowFailException
+    from utils import transfermarkt_native_v2 as tm_v2
+    context, clock = TestCurrentPlanningDeadline().arm(dag_module, monkeypatch, age=2580)
+    calls = []
+    session = requests.Session()
+    def request(method, url, **kwargs):
+        calls.append((method, kwargs['timeout']))
+        clock.elapsed += 30
+        raise requests.ReadTimeout('offline ordinary read timeout')
+    session.request = request
+    connection = trino.dbapi.connect(host='offline.invalid', user='unit', http_session=session, max_attempts=4)
+    connect = lambda: connection
+    monkeypatch.setattr(tm_v2, 'connect', connect)
+    monkeypatch.setattr(tm_v2, 'read_reader_state', lambda cursor, **kw: cursor.execute('SELECT 1').fetchall())
+    with pytest.raises(AirflowFailException, match='retry in the next portion'):
+        dag_module._preflight_reader_route_for_paid_cycle(**context)
+    assert calls == [('POST', 30)]
+    assert clock.elapsed == 2610  # ordinary failure before the absolute deadline
+    assert connection.max_attempts == 1
+    assert tm_v2.connect is connect
