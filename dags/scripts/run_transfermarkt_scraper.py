@@ -2482,6 +2482,46 @@ def _save_frames(
                 'applicability_status': 'ok',
             }
 
+def _archive_native_career_intent(scraper, spec, path, frames, results):
+    """Publish the genuine original writer proof before removing its journal."""
+    from pathlib import Path
+    from scrapers.transfermarkt import write_intents
+    journal = json.loads(Path(path).read_text())
+    evidence = journal['evidence']
+    mode = evidence['mode']
+    if mode not in {'native-only', 'dual'}:
+        return
+    records = evidence.get('raw_attempts', []) + evidence.get('cache_sources', [])
+    if not records or not evidence['checkpoint_ids']:
+        results['career_capture_archive_status'] = 'unavailable_raw_proof'
+        return  # No synthetic capture proof for mocks/cache-only materialization.
+    from scrapers.transfermarkt.superseded import _hash, attest_career_manifest, verify_complete
+    manifest = results['native_write_manifest'] if mode == 'native-only' else results['batch_manifest']
+    if manifest['status'] != 'success':
+        raise RuntimeError('career archive requires successful original writer manifest')
+    physical = {}
+    for output in _spec_for_write_mode(spec, mode).outputs:
+        frame = frames[output.key].copy()
+        batches = {item['player_id']: item['batch_id'] for item in frame.attrs.get('tm_original_capture_refs', [])} if not output.is_legacy else {}
+        if batches:
+            frame['_batch_id'] = frame.player_id.astype(str).map(batches).fillna(frame['_batch_id'])
+        physical[output.key] = frame
+    receipt = {'verified': True, 'cycle_id': evidence['run_key'], 'manifest_cycle_id': manifest['cycle_id'],
+        'writer_revision': evidence['revision'], 'write_mode': mode, 'manifests': [manifest],
+        'committed_at': datetime.now(timezone.utc).isoformat(), 'outputs': {
+            output.key: {'table': 'iceberg.bronze.' + output.table_name, 'rows': len(physical[output.key]),
+                'physical_hash': _hash(physical[output.key])}
+            for output in _spec_for_write_mode(spec, mode).outputs}}
+    receipt['bronze_manifest'] = hashlib.sha256(json.dumps({'cycle_id': receipt['cycle_id'],
+        'outputs': receipt['outputs'], 'manifests': receipt['manifests']}, sort_keys=True).encode()).hexdigest()
+    attest_career_manifest(scraper, receipt)
+    archived = {'intent_sha256': Path(path).stem, 'journal': journal,
+        'receipt': receipt, 'frames': write_intents.pack_frames(physical)}
+    verify_complete(scraper, spec, archived, players=evidence['checkpoint_ids'], live=False, allow_later_manifest=False)
+    write_intents.archive_complete(path, receipt, physical)
+    results['career_capture_archive_status'] = 'complete'
+
+
 def _reconcile_native_career_intent(scraper, spec, mode, revision, league, season, results):
     from scrapers.transfermarkt.write_intents import pending_intents, unpack_frames, finish_intent
     identity = {'kind': 'scope', 'entity': spec.name, 'league': league, 'season': int(season)}
@@ -2532,6 +2572,7 @@ def _reconcile_native_career_intent(scraper, spec, mode, revision, league, seaso
         results['native_write_complete'] = mode != 'legacy-only'
         results['reconciled_without_http'] = True
         results['original_capture_run_key'] = original_run
+        _archive_native_career_intent(scraper, spec, path, frames, results)
         finish_intent(path)
         scraper._tm_career_intent_path = None
     return True
@@ -2657,13 +2698,19 @@ def _delete_valid_empty_rows(
     source_key: Optional[str] = None,
 ) -> Dict[str, str]:
     """Authoritative empty responses remove stale rows for those exact keys."""
+    from pathlib import Path
     if not source_ids:
         return {}
     if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
         from types import SimpleNamespace
         import pandas as pd
         capture_times = dict(getattr(scraper, '_tm_empty_capture_times', {}) or {})
-        capture_times.update(_career_capture_times(scraper, spec, {}, source_ids))
+        path = getattr(scraper, '_tm_career_intent_path', None)
+        if isinstance(path, (str, Path)):
+            capture_times = {str(item['player_id']): item['captured_at']
+                for item in _career_empty_capture_refs(scraper)}
+        else:
+            capture_times.update(_career_capture_times(scraper, spec, {}, source_ids))
         guards = {}
         for output in spec.outputs:
             if output.is_legacy:
@@ -2708,10 +2755,18 @@ def _delete_valid_empty_rows(
             )):
                 # There cannot be stale rows in an absent table; the delete is
                 # an authoritative no-op for this key set.
+                path = getattr(scraper, '_tm_career_intent_path', None)
+                if isinstance(path, (str, Path)) and spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
+                    from scrapers.transfermarkt.write_intents import record_empty_commit
+                    record_empty_commit(path, conn, output.table_name, source_ids)
                 committed[output.key] = table
                 continue
             raise
         committed[output.key] = table
+        path = getattr(scraper, '_tm_career_intent_path', None)
+        if isinstance(path, (str, Path)) and spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
+            from scrapers.transfermarkt.write_intents import record_empty_commit
+            record_empty_commit(path, conn, output.table_name, source_ids)
     return committed
 
 
@@ -4086,6 +4141,7 @@ def _run_entity(
                                 )
                             if career_intent_path is not None:
                                 from scrapers.transfermarkt.write_intents import finish_intent
+                                _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)
                                 finish_intent(career_intent_path)
                                 scraper._tm_career_intent_path = None
                     else:
@@ -4299,6 +4355,7 @@ def _run_entity(
                         )
                 if career_intent_path is not None:
                     from scrapers.transfermarkt.write_intents import finish_intent
+                    _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)
                     finish_intent(career_intent_path)
                     scraper._tm_career_intent_path = None
                 exit_code = 0

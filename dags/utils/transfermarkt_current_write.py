@@ -302,10 +302,14 @@ def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids
         if any(item.get('status') != 'success' for item in manifests):
             raise CurrentWriteError('current business compatibility manifest did not pass')
         digest = hashlib.sha256(json.dumps({'cycle_id': cycle_id, 'outputs': proof, 'manifests': manifests}, sort_keys=True).encode()).hexdigest()
-        return {'verified': True, 'bronze_manifest': digest,
+        receipt = {'verified': True, 'bronze_manifest': digest,
                 'committed_at': datetime.now(timezone.utc).isoformat(), 'outputs': proof,
                 'cycle_id': cycle_id, 'manifest_cycle_id': manifest_cycle,
-                'manifests': manifests, 'writer_revision': revision, 'write_mode': mode}, frames
+                'manifests': manifests, 'writer_revision': revision, 'write_mode': mode}
+        if spec.name in {run.ENTITY_MV_HISTORY, run.ENTITY_TRANSFERS}:
+            from scrapers.transfermarkt.superseded import attest_career_manifest
+            attest_career_manifest(scraper, receipt)
+        return receipt, frames
 
 def _roster_frames(scraper, snapshot, scope, cycle_id):
     now = _stamp(getattr(scraper, '_current_roster_write_at', None) or datetime.now(timezone.utc))
@@ -648,6 +652,8 @@ def _write_cached_supersession(scraper, spec, scope, mode, revision, cycle_id, s
         'business_entity': spec.state_endpoint, 'signal_generations': generations, 'reconciled_without_http': True, **window}
     receipt['bronze_manifest'] = hashlib.sha256(json.dumps({'cycle_id': cycle_id,
         'outputs': proof, 'manifests': [manifest]}, sort_keys=True).encode()).hexdigest()
+    from scrapers.transfermarkt.superseded import attest_career_manifest
+    attest_career_manifest(scraper, receipt)
     receipt['checkpoint_status'] = run._commit_checkpoint_or_pending(scraper, spec, ids,
         [cached[player]['state'] for player in ids], cycle_id, scope['competition_id'], int(scope['edition_id']), captured_at_by_id=clocks)
     receipt['committed_at'] = archive_complete(path, receipt, physical_frames)['committed_at']

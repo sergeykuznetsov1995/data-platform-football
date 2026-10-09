@@ -31,12 +31,27 @@ scope/backfill и native ops должны использовать тот же �
 Имя journal — SHA256 его канонического тела.
 
 До первой Bronze-записи сохраняется неизменяемый snapshot anchor. Успешная
-current dual-запись сохраняет в `completed/<intent SHA>.json` оригинальный
+current или generic career-запись сохраняет в `completed/<intent SHA>.json` оригинальный
 journal, реальные physical frames и receipt. `completed/by-unit/` связывает
 `(manifest cycle, entity, native batch)` с этим архивом. Записи содержат checksum;
 публикация использует atomic replace и fsync файла и каталога. Повторное
 подтверждение сохраняет исходный `committed_at` и восстанавливает индекс после
 сбоя между архивом и индексом. Оно не создаёт новый источник свежести.
+
+Архив сохраняет actual manifest readback attestation в исходном writer namespace
+(dual или native-only). Если следующая порция stable child заменяет manifest row,
+проверка требует её точный успешный complete archive того же cycle/entity/scope
+и writer revision, обе стороны для dual, оригинальные refs/snapshots и полный
+raw. Одного `status=success` недостаточно. Проверка последнего архива не вызывает
+новую цепочку архивов. Отсутствующий или повреждённый manifest, attestation,
+последний архив или обязательный raw запрещают reconciliation.
+
+Для typed empty после дочитанного DELETE каждой карьерной таблицы, до следующего
+DELETE, сохраняется `empty-commits/<table>/<intent SHA>.json`: оригинальный
+intent, anchor, реальный snapshot и точные игроки с нулём строк. Recovery читает
+именно этот snapshot. Без receipt нельзя приписать более поздний чужой пустой
+snapshot старой работе. Сбой между DELETE и fsync receipt остаётся явной ошибкой;
+raw и исходный journal сохраняются, успешное завершение не выдумывается.
 
 Capture refs и anchors сохраняют оригинальные snapshots и raw lineage.
 Snapshot recovery ищет только ограниченную последовательность после anchor и
@@ -46,19 +61,24 @@ Snapshot recovery ищет только ограниченную последо�
 
 ## Сбой после native, до legacy
 
-Если новая полная dual-карьера заменила старую частично записанную работу,
+Если новая полная карьера заменила старую частично записанную работу,
 reconciliation может завершить старую работу статусом
 `superseded_partial_write`. Этот статус — terminal failure старой работы:
 `verified=false`, без signal acknowledgement, без успешного старого dual
 manifest и без выдуманного legacy snapshot.
 
 Для каждого игрока старой работы требуется строго более свежий полный успешный
-capture. Проверка требует настоящего успешного dual manifest, обоих физических
-count/hash, оригинального полного raw и его envelope, lineage и закреплённых
-snapshots. Typed empty проверяется отдельно.
+capture. Dual successor требует настоящего успешного dual manifest и обоих
+физических count/hash. Genuine native-only successor требует собственного
+native manifest и native count/hash; он не объявляется dual success. Оба режима
+требуют оригинального полного raw и envelope, lineage и закреплённых snapshots.
+Typed empty проверяется отдельно.
 Весь исходный bundle проверяется по закреплённым snapshots; текущие строки
 проверяются только для завершаемых игроков. Более поздний capture другого
 игрока из того же bundle не отменяет доказательство завершаемого игрока.
+Native readback использует исходные player/batch refs, включая разные batches
+одного cached bundle. Два ограниченных прохода по последним 64 candidates могут
+собрать разные актуальные successor capture для отдельных игроков.
 
 Старый native partial snapshot, raw, исходный journal и anchors сохраняются.
 Под общей блокировкой публикуется
@@ -110,7 +130,7 @@ snapshots или optimize TM без проверенной общей блоки
 защиту достаточной только потому, что отдельный TM helper не вызывает expiry:
 нужно учитывать общий weekly maintenance.
 
-Удаление retained snapshots, anchors, terminal journals, resolutions и complete
+Удаление retained snapshots, anchors, empty commit receipts, terminal journals, resolutions и complete
 archives требует отдельного явного lifecycle-контракта. Здесь не вводится TTL,
 debt policy или автоматическая уборка этих доказательств. До такого контракта
 они сохраняются; это условие последующей эксплуатации, а не выполненная

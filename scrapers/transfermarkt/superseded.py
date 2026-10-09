@@ -68,30 +68,99 @@ def _raw_player(scraper, journal, frame, player, entity):
     raise RuntimeError('supersession has no exact original successful raw capture')
 
 
-def verify_complete(scraper, spec, archived, *, players, live=True):
+def attest_career_manifest(scraper, receipt):
+    """Bind the real original writer namespace readback to its capture."""
+    from dags.scripts import run_transfermarkt_scraper as run
+    manifest, = receipt['manifests']
+    row, = manifest['rows']
+    fields = ('native_table', 'native_batch_id', 'native_rows', 'native_hash', 'writer_revision', 'write_mode', 'status')
+    mode = receipt['write_mode']
+    table = run.NATIVE_WRITE_MANIFEST_TABLE
+    if mode == 'dual':
+        fields = ('native_table', 'legacy_table', 'native_batch_id', 'legacy_batch_id',
+            'native_rows', 'legacy_rows', 'native_hash', 'legacy_hash', 'status')
+        table = run.DUAL_WRITE_MANIFEST_TABLE
+    connection = scraper._bronze_connection()
+    cursor = connection.cursor()
+    try:
+        execute_statement(cursor, 'SELECT ' + ', '.join(fields) + f' FROM {table} '
+            'WHERE cycle_id=? AND entity=? AND league=? AND season=?',
+            (receipt['manifest_cycle_id'], row['entity'], manifest['league'], manifest['season']))
+        actual = cursor.fetchall()
+        if actual != [tuple(row[field] for field in fields)] or row['status'] != 'success':
+            raise RuntimeError('career archive has no genuine original manifest readback')
+        proof = {'cycle_id': receipt['manifest_cycle_id'], 'entity': row['entity'], 'write_mode': mode,
+            'writer_revision': receipt['writer_revision'],
+            'league': manifest['league'], 'season': manifest['season'], 'fields': list(fields), 'row': list(actual[0])}
+        body = json.dumps(proof, sort_keys=True, separators=(',', ':'))
+        receipt['native_manifest_attestation' if mode == 'native-only' else 'dual_manifest_attestation'] = {'proof': proof, 'sha256': hashlib.sha256(body.encode()).hexdigest()}
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def verify_complete(scraper, spec, archived, *, players, live=True, allow_later_manifest=True):
     """Reprove real successful dual manifest, both physical sides and raw."""
     from dags.scripts import run_transfermarkt_scraper as run
     from dags.utils.transfermarkt_current_write import _read_back
     receipt, journal = archived['receipt'], archived['journal']
-    if receipt.get('verified') is not True or receipt.get('write_mode') != 'dual' or journal['evidence']['mode'] != 'dual':
-        raise RuntimeError('supersession requires a complete successful dual capture')
+    mode = receipt.get('write_mode')
+    if receipt.get('verified') is not True or mode not in {'dual', 'native-only'} or journal['evidence']['mode'] != mode:
+        raise RuntimeError('supersession requires a complete successful captured writer mode')
+    spec = run._spec_for_write_mode(run.ENTITY_SPECS[spec.name], mode)
     frames = write_intents.unpack_frames(archived['frames'])
     native = next(output for output in spec.outputs if not output.is_legacy)
-    legacy = next(output for output in spec.outputs if output.is_legacy)
     manifests = [row for manifest in receipt['manifests'] for row in manifest['rows'] if row['entity'] == native.key]
     if len(manifests) != 1:
         raise RuntimeError('supersession dual receipt identity differs')
     row = manifests[0]
     fields = ('native_table', 'legacy_table', 'native_batch_id', 'legacy_batch_id',
               'native_rows', 'legacy_rows', 'native_hash', 'legacy_hash', 'status')
+    manifest_table = run.DUAL_WRITE_MANIFEST_TABLE
+    if mode == 'native-only':
+        fields = ('native_table', 'native_batch_id', 'native_rows', 'native_hash', 'writer_revision', 'write_mode', 'status')
+        manifest_table = run.NATIVE_WRITE_MANIFEST_TABLE
+    expected_attestation = {'cycle_id': receipt['manifest_cycle_id'], 'entity': row['entity'], 'write_mode': mode,
+        'writer_revision': receipt['writer_revision'],
+        'league': receipt['manifests'][0]['league'], 'season': receipt['manifests'][0]['season'],
+        'fields': list(fields), 'row': [row[field] for field in fields]}
+    attested = receipt.get('native_manifest_attestation' if mode == 'native-only' else 'dual_manifest_attestation', {})
+    body = json.dumps(expected_attestation, sort_keys=True, separators=(',', ':'))
+    if attested.get('proof') != expected_attestation or attested.get('sha256') != hashlib.sha256(body.encode()).hexdigest():
+        raise RuntimeError('original career manifest attestation differs or is missing')
     connection = scraper._bronze_connection()
     cursor = connection.cursor()
     try:
-        execute_statement(cursor, 'SELECT ' + ', '.join(fields) + f' FROM {run.DUAL_WRITE_MANIFEST_TABLE} '
+        execute_statement(cursor, 'SELECT ' + ', '.join(fields) + f' FROM {manifest_table} '
             'WHERE cycle_id=? AND entity=? AND league=? AND season=?',
             (receipt['manifest_cycle_id'], native.key, receipt['manifests'][0]['league'], receipt['manifests'][0]['season']))
-        if cursor.fetchall() != [tuple(row[field] for field in fields)] or row['status'] != 'success':
-            raise RuntimeError('supersession lacks its genuine successful dual manifest')
+        actual_manifest = cursor.fetchall()
+        if actual_manifest != [tuple(row[field] for field in fields)]:
+            later = None
+            if allow_later_manifest and len(actual_manifest) == 1:
+                actual = dict(zip(fields, actual_manifest[0], strict=True))
+                if (actual['status'] == 'success'
+                    and (mode == 'dual' or actual['write_mode'] == mode and actual['writer_revision'] == receipt['writer_revision'])
+                    and actual['native_table'] == row['native_table']
+                    and (mode != 'dual' or actual['legacy_table'] == row['legacy_table'])
+                    and actual['native_batch_id'] != row['native_batch_id']):
+                    later = write_intents.completed_capture(receipt['manifest_cycle_id'], native.key, actual['native_batch_id'])
+            if later is None:
+                raise RuntimeError('supersession lacks its genuine successful ' + ('dual' if mode == 'dual' else 'native-only') + ' manifest')
+            later_receipt = later['receipt']
+            later_row, = later_receipt['manifests'][0]['rows']
+            if (later_receipt['write_mode'] != mode or later_receipt['writer_revision'] != receipt['writer_revision']
+                or later_receipt['manifest_cycle_id'] != receipt['manifest_cycle_id']
+                or later_receipt['manifests'][0]['league'] != receipt['manifests'][0]['league']
+                or later_receipt['manifests'][0]['season'] != receipt['manifests'][0]['season']
+                or tuple(later_row[field] for field in fields) != actual_manifest[0]):
+                raise RuntimeError('later native-only complete archive differs from actual manifest')
+            later_evidence = later['journal']['evidence']
+            verify_complete(scraper, spec, later,
+                players=later_evidence.get('processed', later_evidence.get('checkpoint_ids', [])),
+                live=False, allow_later_manifest=False)
+        if row['status'] != 'success':
+            raise RuntimeError('supersession original capture manifest is unsuccessful')
         capture = career_refs.physical_predicate(cursor, receipt['manifest_cycle_id'], native.key,
             native.table_name, batch_id=row['native_batch_id'])
         if capture is None or capture.refs != row['physical_refs']:
@@ -102,6 +171,35 @@ def verify_complete(scraper, spec, archived, *, players, live=True):
         for output in spec.outputs:
             frame = frames[output.key]
             snapshot = capture.snapshot_id if output == native else capture.legacy_snapshot_id
+            def native_readback(selected_players, *, snapshot_id=None):
+                expected = frame[frame.player_id.astype(str).isin(selected_players)]
+                refs = [item for item in capture.refs if item[0] in selected_players]
+                expected_pairs = sorted([str(player), str(batch), len(part)] for (player, batch), part
+                    in expected.groupby(['player_id', '_batch_id'], dropna=False))
+                if expected_pairs != sorted(item for item in refs if item[2] > 0):
+                    raise RuntimeError('supersession native frames differ from exact original player/batch refs')
+                terms = [f'(player_id={career_refs._q(player)} AND _batch_id={career_refs._q(batch)})'
+                    for player, batch, count in refs if count > 0]
+                terms += [f'player_id={career_refs._q(player)}' for player, _, count in refs if count == 0]
+                if snapshot_id is None:
+                    # A live full career includes every current row for these
+                    # players, so an extra/different batch cannot be hidden.
+                    terms = [f'player_id={career_refs._q(player)}' for player in selected_players]
+                relation = 'iceberg.bronze.' + output.table_name
+                if snapshot_id is not None:
+                    relation += f' FOR VERSION AS OF {snapshot_id}'
+                try:
+                    execute_statement(cursor, 'SELECT ' + ', '.join(frame.columns) + ' FROM ' + relation
+                        + ' WHERE (' + ' OR '.join(terms) + ')')
+                    actual = pd.DataFrame(cursor.fetchall(), columns=frame.columns)
+                except Exception as exc:
+                    if not expected.empty or not any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+                        raise
+                    actual = expected
+                if _hash(actual) != _hash(expected) or len(actual) != len(expected):
+                    from dags.utils.transfermarkt_current_write import CurrentWriteError
+                    raise CurrentWriteError('supersession native exact player/batch business and lineage differ')
+                return {'rows': len(actual), 'physical_hash': _hash(actual)}
             if snapshot is None:
                 if not frame.empty:
                     raise RuntimeError('supersession nonempty capture lacks its snapshot')
@@ -109,6 +207,8 @@ def verify_complete(scraper, spec, archived, *, players, live=True):
                 if output.table_name not in anchors or anchors[output.table_name] is not None:
                     raise RuntimeError('supersession absent table lacks original boundary')
                 pinned = {'rows': 0, 'physical_hash': hashlib.sha256(b'[]').hexdigest()}
+            elif output == native:
+                pinned = native_readback([item[0] for item in capture.refs], snapshot_id=snapshot)
             else:
                 pinned = _read_back(scraper, output, frame, receipt['cycle_id'], empty_ids=empty, snapshot_id=snapshot)
             if pinned['rows'] != receipt['outputs'][output.key]['rows'] or pinned['physical_hash'] != receipt['outputs'][output.key]['physical_hash']:
@@ -120,8 +220,9 @@ def verify_complete(scraper, spec, archived, *, players, live=True):
                 selected = frame[frame.player_id.astype(str).isin(players)]
                 selected_empty = [player for player in empty if player in players]
                 try:
-                    actual = _read_back(scraper, output, selected, receipt['cycle_id'],
-                        empty_ids=selected_empty, player_ids=players)
+                    actual = (native_readback(players) if output == native else
+                        _read_back(scraper, output, selected, receipt['cycle_id'],
+                            empty_ids=selected_empty, player_ids=players))
                 except Exception as exc:
                     from dags.utils.transfermarkt_current_write import CurrentWriteError
                     if isinstance(exc, CurrentWriteError):
@@ -144,7 +245,7 @@ def retire_partial(scraper, spec, path, payload, frames, *, delivery_cycle):
     native = next(output for output in spec.outputs if not output.is_legacy)
     legacy = next(output for output in spec.outputs if output.is_legacy)
     evidence = payload['evidence']
-    if evidence['mode'] != 'dual' or frames[native.key].empty:
+    if evidence['mode'] != 'dual':
         return None
     players = list(evidence['processed'])
     original = {key: frame.assign(_batch_id=str(scraper._batch_id)) for key, frame in frames.items()}
@@ -154,9 +255,17 @@ def retire_partial(scraper, spec, path, payload, frames, *, delivery_cycle):
     with writer_lock():
         connection = scraper._bronze_connection()
         try:
+            committed = None
+            if frames[native.key].empty:
+                committed = write_intents.read_empty_commit(path, native.table_name, evidence['empty'])
+                if committed is None:
+                    return None
             partial = career_refs.recover_bundle_snapshots(connection, evidence['cycle_id'], spec.outputs,
                 original, path, batch_id=str(scraper._batch_id), partial=True)
-            if not partial.get(native.key) or legacy.key in partial:
+            if committed is not None:
+                if partial.get(native.key) != (committed['snapshot_id'] or 0):
+                    return None
+            if native.key not in partial or legacy.key in partial:
                 return None
             original_raw = {player: _raw_player(scraper, payload, original[native.key][original[native.key].player_id.astype(str) == player], player, native.key)
                             for player in players}
@@ -194,7 +303,8 @@ def retire_partial(scraper, spec, path, payload, frames, *, delivery_cycle):
                 return None
             resolution = {'status': 'superseded_partial_write', 'verified': False, 'intent_sha256': Path(path).stem,
                 'delivery_cycle_id': delivery_cycle, 'original_cycle_id': evidence['cycle_id'], 'original_batch_id': str(scraper._batch_id),
-                'original_native_snapshot_id': partial[native.key], 'original_native_hash': _hash(original[native.key]),
+                'original_native_snapshot_id': partial[native.key] or None, 'original_native_hash': _hash(original[native.key]),
+                'original_native_table_absent': partial[native.key] == 0,
                 'original_legacy_snapshot_id': None, 'original_raw': original_raw,
                 'original_window': evidence['window'], 'signal_generations': evidence.get('signal_generations', {}),
                 'retired_player_ids': players, 'superseding_players': covered, 'superseding_units': units}
@@ -228,6 +338,7 @@ def cached_supersession(scraper, spec, retired, selected, *, reconcile=False):
             raise RuntimeError('retired career superseding raw archive is unavailable')
         try:
             proof = verify_complete(scraper, spec, archived, players=ids)
+            current_proofs = {player: proof for player in ids}
         except StaleTransfermarktWrite:
             # The immutable retirement points to the capture that superseded
             # the old job. Subsequent genuine captures can supersede that one.
@@ -240,23 +351,32 @@ def cached_supersession(scraper, spec, retired, selected, *, reconcile=False):
             finally:
                 cursor.close()
                 connection.close()
-            proof = None
-            for cycle, entity, batch in candidates:
+            current_proofs = {}
+            # Captures can share the same Bronze commit clock. Revisit a
+            # bundle after another candidate proved its replaced players,
+            # now checking only the remaining players. Two bounded passes.
+            for cycle, entity, batch in candidates + candidates:
                 candidate = write_intents.completed_capture(cycle, entity, batch)
-                if candidate is None or not set(ids) <= set(candidate['journal']['evidence'].get('processed', [])):
+                if candidate is None:
+                    continue
+                candidate_ids = [player for player in ids if player not in current_proofs
+                    and player in candidate['journal']['evidence'].get('processed', candidate['journal']['evidence'].get('checkpoint_ids', []))]
+                if not candidate_ids:
                     continue
                 try:
-                    newer = verify_complete(scraper, spec, candidate, players=ids)
+                    newer = verify_complete(scraper, spec, candidate, players=candidate_ids)
                 except StaleTransfermarktWrite:
                     continue
-                if any(pd.to_datetime(newer['raw'][player]['fetched_at'], utc=True) <
-                    pd.to_datetime(resolution_raw[player]['fetched_at'], utc=True) for player in ids):
-                    continue
-                proof, archived = newer, candidate
-                break
-            if proof is None:
+                current_proofs.update({player: newer for player in candidate_ids
+                    if pd.to_datetime(newer['raw'][player]['fetched_at'], utc=True) >=
+                    pd.to_datetime(resolution_raw[player]['fetched_at'], utc=True)})
+                if set(current_proofs) == set(ids):
+                    break
+            if set(current_proofs) != set(ids):
                 raise StaleTransfermarktWrite('retired job has no proven complete current successor')
         for player in ids:
+            proof = current_proofs[player]
+            archived = proof['archive']
             current_generation = current_generations.get(player)
             captured_generation = archived['journal']['evidence'].get('signal_generations', {}).get(player)
             age = scraper._http_client._time() - pd.to_datetime(proof['raw'][player]['fetched_at'], utc=True).timestamp()
@@ -272,5 +392,5 @@ def cached_supersession(scraper, spec, retired, selected, *, reconcile=False):
                 continue
             players[player] = {'frame': proof['frames'][native.key][proof['frames'][native.key].player_id.astype(str) == player].copy(),
                                'raw': proof['raw'][player], 'state': next(row for key, row in zip(
-                                   archived['journal']['evidence']['processed'], archived['journal']['evidence']['state_rows'], strict=True) if key == player)}
+                                   archived['journal']['evidence'].get('processed', archived['journal']['evidence'].get('checkpoint_ids', [])), archived['journal']['evidence']['state_rows'], strict=True) if key == player)}
     return players, blocked

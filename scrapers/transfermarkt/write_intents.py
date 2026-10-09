@@ -171,6 +171,57 @@ def read_snapshot_anchors(path):
     return payload['tables']
 
 
+def record_empty_commit(path, connection, table, players):
+    """Fsync the actual consumed career DELETE before the next output."""
+    from scrapers.transfermarkt.writer import execute_statement
+    path = Path(path)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != path.stem:
+        raise RuntimeError('empty native commit original intent checksum differs')
+    target = _root() / 'empty-commits' / table / path.name
+    if target.exists():
+        return read_empty_commit(path, table, players)
+    anchors = read_snapshot_anchors(path)
+    if table not in anchors:
+        raise RuntimeError('empty native commit has no original snapshot boundary')
+    cur = connection.cursor()
+    try:
+        placeholders = ', '.join('?' for _ in players)
+        try:
+            execute_statement(cur, f'SELECT player_id FROM iceberg.bronze.{table} WHERE player_id IN ({placeholders})', players)
+            if cur.fetchall():
+                raise RuntimeError('empty native commit still contains player rows')
+            execute_statement(cur, f'SELECT snapshot_id FROM iceberg.bronze."{table}$snapshots" ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1')
+            rows = cur.fetchall()
+        except Exception as exc:
+            if not any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+                raise
+            if anchors[table] is not None:
+                raise RuntimeError('empty native table vanished after original boundary') from exc
+            rows = []
+        value = {'intent_sha256': path.stem, 'table_name': table,
+            'player_ids': sorted(str(player) for player in players),
+            'parent_snapshot_id': anchors[table], 'snapshot_id': int(rows[0][0]) if rows else None}
+        _immutable_record(target, value)
+        return value
+    finally:
+        cur.close()
+
+
+def read_empty_commit(path, table, players):
+    path = Path(path)
+    target = _root() / 'empty-commits' / table / path.name
+    if not target.exists():
+        return None
+    value = _read_record(target)
+    anchors = read_snapshot_anchors(path)
+    if (value.get('intent_sha256') != path.stem or value.get('table_name') != table
+        or value.get('player_ids') != sorted(str(player) for player in players)
+        or table not in anchors or value.get('parent_snapshot_id') != anchors[table]
+        or value.get('snapshot_id') is not None and (type(value['snapshot_id']) is not int or value['snapshot_id'] < 1)):
+        raise RuntimeError('empty native commit identity/snapshot boundary differs')
+    return value
+
+
 def _immutable_record(path, payload):
     body = json.dumps(payload, sort_keys=True, separators=(',', ':'), allow_nan=False)
     wrapped = json.dumps({'payload': payload, 'sha256': hashlib.sha256(body.encode()).hexdigest()}, sort_keys=True, separators=(',', ':'))

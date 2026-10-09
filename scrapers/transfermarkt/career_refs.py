@@ -313,7 +313,7 @@ def recover_bundle_snapshots(connection, cycle, outputs, frames, intent_path, *,
     bounded even after thousands of later writes; full business and lineage,
     including the original batch, must match the durable parsed bundle.
     """
-    from scrapers.transfermarkt.write_intents import read_snapshot_anchors
+    from scrapers.transfermarkt.write_intents import read_snapshot_anchors, read_empty_commit
     from pathlib import Path
     import pandas as pd
     anchors = read_snapshot_anchors(intent_path) if intent_path is not None else {}
@@ -328,6 +328,11 @@ def recover_bundle_snapshots(connection, cycle, outputs, frames, intent_path, *,
             table = output.table_name
             if table not in anchors:
                 raise RuntimeError('incomplete original career snapshot boundary')
+            empty_commit = None
+            if empty_refs:
+                empty_commit = read_empty_commit(intent_path, table, [str(item['player_id']) for item in empty_refs])
+                if empty_commit is None:
+                    return snapshots if partial else {}
             expected = frames[output.key].copy()
             original = {item['player_id']: item['batch_id'] for item in expected.attrs.get('tm_original_capture_refs', [])} if not output.is_legacy else {}
             if original:
@@ -362,6 +367,8 @@ def recover_bundle_snapshots(connection, cycle, outputs, frames, intent_path, *,
                 continue
             if parent is not None:
                 candidates.append(parent)  # Cache-only projections retain this snapshot.
+            if empty_commit is not None:
+                candidates = [snapshot for snapshot in candidates if snapshot == empty_commit['snapshot_id']]
             for snapshot in candidates:
                 execute_statement(cur, 'SELECT ' + ', '.join(expected.columns) + ' FROM iceberg.bronze.' + table
                     + f' FOR VERSION AS OF {snapshot} WHERE ' + predicate)

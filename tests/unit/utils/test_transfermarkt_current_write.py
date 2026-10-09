@@ -1083,7 +1083,7 @@ def test_full_loss_dq_detects_rows_left_under_any_batch_after_authoritative_empt
     assert _execute_career_loss_query(scraper) == 1
 
 
-def _partial_dual_then_newer(scraper, monkeypatch, *, old_players=('1',), newer_players=('1',), newer_empty=False):
+def _partial_dual_then_newer(scraper, monkeypatch, *, old_players=('1',), newer_players=('1',), newer_empty=False, newer_mode='dual'):
     old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
     old = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Old', 'age': '20', 'mw': 'EUR1m'}]}
     fresh = {'list': []} if newer_empty else {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 9000000, 'verein': 'Fresh', 'age': '21', 'mw': 'EUR9m'}]}
@@ -1099,7 +1099,7 @@ def _partial_dual_then_newer(scraper, monkeypatch, *, old_players=('1',), newer_
             current.fetch_current_career(scraper, 'market_value_points', list(old_players), old_scope, PREFLIGHT,
                 'old-partial', decoded_body_soft_stop_bytes=100000)
     newest = http(scraper, [fresh for _ in newer_players])
-    current.fetch_current_career(scraper, 'market_value_points', list(newer_players), SCOPE, PREFLIGHT,
+    current.fetch_current_career(scraper, 'market_value_points', list(newer_players), SCOPE, {**PREFLIGHT, 'write_mode': newer_mode},
         'new-complete', decoded_body_soft_stop_bytes=100000)
     return old_scope, source, newest
 
@@ -1500,3 +1500,251 @@ def test_current_transfer_partial_dual_can_retire_with_real_newer_transfer_captu
     assert pending_intents({'kind': 'current', 'entity': 'transfers'}) == []
     pd.testing.assert_frame_equal(rows, _table(scraper, 'transfermarkt_transfer_events'))
     assert [sum(len(c.get_calls) for c in f.clients) for f in (source, new)] == [1, 1]
+
+
+def test_multiunit_cached_archive_restart_preserves_each_native_batch_and_unblocks_next_player(scraper, monkeypatch):
+    from scrapers.transfermarkt import write_intents
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch, old_players=('1', '2'))
+    http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 10000000, 'verein': 'Two', 'age': '21', 'mw': 'EUR10m'}]}])
+    current.fetch_current_career(scraper, 'market_value_points', ['2'], SCOPE, PREFLIGHT,
+        'separate-p2-complete', decoded_body_soft_stop_bytes=100000)
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT,
+        'retire-separate-units', decoded_body_soft_stop_bytes=100000)
+    assert not failure['verified'] and failure['retired_player_ids'] == ['1', '2']
+    with monkeypatch.context() as patch:
+        patch.setattr(write_intents, 'finish_intent', lambda _: (_ for _ in ()).throw(RuntimeError('cut multiunit acknowledgement')))
+        with pytest.raises(RuntimeError, match='cut multiunit acknowledgement'):
+            current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT,
+                'multiunit-cached', decoded_body_soft_stop_bytes=100000)
+    path, _ = write_intents.pending_intents({'kind': 'current'})[0]
+    archived = write_intents.completed_intent(path)
+    archived_native = write_intents.unpack_frames(archived['frames'])['market_value_points']
+    assert archived_native._batch_id.nunique() == 2
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    calls = sum(len(client.get_calls) for client in scraper._http_client._client_factory.clients)
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT,
+        'multiunit-restart', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof['cycle_id'] == 'multiunit-cached'
+    assert proof['committed_at'] == archived['receipt']['committed_at']
+    assert not write_intents.pending_intents({'kind': 'current'})
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history'))
+    assert sum(len(client.get_calls) for client in scraper._http_client._client_factory.clients) == calls
+    future = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 3000000, 'verein': 'Three', 'age': '21', 'mw': 'EUR3m'}]}])
+    result = current.fetch_current_career(scraper, 'market_value_points', ['3'], old_scope, PREFLIGHT,
+        'multiunit-unrelated', decoded_body_soft_stop_bytes=100000)
+    assert result['verified'] and result['processed_player_ids'] == ['3']
+    assert sum(len(client.get_calls) for client in future.clients) == 1
+    actual = _table(scraper, 'transfermarkt_market_value_points')
+    pd.testing.assert_frame_equal(native, actual[actual.player_id.isin(['1', '2'])].reset_index(drop=True))
+
+
+def _empty_partial_then_current(scraper, monkeypatch, fault, *, later_empty=False):
+    from scrapers.transfermarkt import write_intents
+    old_scope = {'competition_id': 'GB1', 'edition_id': '2025'}
+    full = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000, 'verein': 'Old', 'age': '20', 'mw': 'EUR1m'}]}
+    http(scraper, [full])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'empty-seed', decoded_body_soft_stop_bytes=100000)
+    http(scraper, [{'list': []}])
+    execute = current.run._execute_cursor
+    table = 'transfermarkt_market_value_points' if fault == 'never_committed' else 'transfermarkt_market_value_history'
+    def cut(connection, sql, *args, **kwargs):
+        if sql.startswith('DELETE FROM iceberg.bronze.' + table + ' '):
+            raise RuntimeError('cut empty DELETE')
+        return execute(connection, sql, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(current.run, '_execute_cursor', cut)
+        if fault == 'before_receipt':
+            patch.setattr(write_intents, 'record_empty_commit', lambda *_: (_ for _ in ()).throw(RuntimeError('cut empty DELETE')))
+        with pytest.raises(RuntimeError, match='cut empty DELETE'):
+            current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+                'original-empty-partial', decoded_body_soft_stop_bytes=100000)
+    path, journal = write_intents.pending_intents({'kind': 'current'})[0]
+    if fault == 'missing_raw':
+        raw = journal['evidence']['raw_attempts'][0]
+        record = scraper.test_store.load_capture(raw['capture_id'])[1]
+        from pathlib import Path
+        Path(scraper.test_store.root + '/' + record.blob_key).unlink()
+    native_receipt = write_intents.read_empty_commit(path, 'transfermarkt_market_value_points', ['1'])
+    assert (native_receipt is None) == (fault in {'never_committed', 'before_receipt'})
+    assert write_intents.read_empty_commit(path, 'transfermarkt_market_value_history', ['1']) is None
+    full['list'][0]['y'] = 9000000
+    if later_empty:
+        full = {'list': []}
+    future_source = http(scraper, [full])
+    current.fetch_current_career(scraper, 'market_value_points', ['1'], SCOPE, PREFLIGHT,
+        'current-after-empty-partial', decoded_body_soft_stop_bytes=100000)
+    return old_scope, path, journal, native_receipt, future_source
+
+
+@pytest.mark.parametrize('fault', ['never_committed', 'before_receipt', 'after_native'])
+def test_later_foreign_empty_delete_cannot_supply_missing_original_empty_commit(scraper, monkeypatch, fault):
+    from scrapers.transfermarkt import write_intents
+    old_scope, path, _, native_receipt, source = _empty_partial_then_current(scraper, monkeypatch, fault, later_empty=True)
+    assert _table(scraper, 'transfermarkt_market_value_points').empty
+    assert _table(scraper, 'transfermarkt_market_value_history').empty
+    if fault == 'after_native':
+        failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+            'original-empty-retired-after-foreign-empty', decoded_body_soft_stop_bytes=100000)
+        assert failure['status'] == 'superseded_partial_write' and not failure['verified']
+        assert failure['original_native_snapshot_id'] == native_receipt['snapshot_id']
+        assert failure['original_legacy_snapshot_id'] is None
+    else:
+        with pytest.raises(Exception):
+            current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+                'cannot-borrow-foreign-empty-snapshot', decoded_body_soft_stop_bytes=100000)
+        assert write_intents.pending_intents({'kind': 'current'})
+        assert write_intents.resolution_for(path) is None
+    assert sum(len(client.get_calls) for client in source.clients) == 1
+
+
+def test_native_empty_delete_partial_can_retire_without_claiming_old_legacy_success(scraper, monkeypatch):
+    from scrapers.transfermarkt import write_intents
+    old_scope, path, journal, native_receipt, source = _empty_partial_then_current(scraper, monkeypatch, 'after_native')
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    body = path.read_bytes()
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-empty-partial', decoded_body_soft_stop_bytes=100000)
+    assert failure['status'] == 'superseded_partial_write' and not failure['verified']
+    assert failure['original_native_snapshot_id'] == native_receipt['snapshot_id']
+    assert failure['original_legacy_snapshot_id'] is None and path.read_bytes() == body
+    assert failure['original_raw']['1']['capture_id'] == journal['evidence']['raw_attempts'][0]['capture_id']
+    assert not write_intents.pending_intents({'kind': 'current'})
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    pd.testing.assert_frame_equal(legacy, _table(scraper, 'transfermarkt_market_value_history'))
+    assert sum(len(client.get_calls) for client in source.clients) == 1
+    future = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 3000000, 'verein': 'Two', 'age': '21', 'mw': 'EUR3m'}]}])
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['2'], old_scope, PREFLIGHT,
+        'unrelated-after-empty-partial', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and sum(len(client.get_calls) for client in future.clients) == 1
+
+
+@pytest.mark.parametrize('fault', ['never_committed', 'before_receipt', 'missing_raw'])
+def test_empty_partial_without_exact_original_delete_proof_fails_closed(scraper, monkeypatch, fault):
+    from scrapers.transfermarkt import write_intents
+    old_scope, path, _, _, source = _empty_partial_then_current(scraper, monkeypatch, fault)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    body = path.read_bytes()
+    with pytest.raises(Exception):
+        current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+            'cannot-prove-empty-partial', decoded_body_soft_stop_bytes=100000)
+    assert path.read_bytes() == body and write_intents.pending_intents({'kind': 'current'})
+    assert write_intents.resolution_for(path) is None
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    assert sum(len(client.get_calls) for client in source.clients) == 1
+
+
+def test_cached_players_can_use_distinct_current_successors_after_one_shared_bundle_splits(scraper, monkeypatch):
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch, old_players=('1', '2'), newer_players=('1', '2'))
+    current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT,
+        'retire-shared-two', decoded_body_soft_stop_bytes=100000)
+    latest = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 12000000, 'verein': 'Later two', 'age': '22', 'mw': 'EUR12m'}]}])
+    current.fetch_current_career(scraper, 'market_value_points', ['2'], SCOPE, PREFLIGHT,
+        'only-p2-later', decoded_body_soft_stop_bytes=100000)
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    legacy = _table(scraper, 'transfermarkt_market_value_history').copy()
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['1', '2'], old_scope, PREFLIGHT,
+        'cached-split-successors', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and proof['processed_player_ids'] == ['1', '2']
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    actual = _table(scraper, 'transfermarkt_market_value_history')
+    pd.testing.assert_frame_equal(legacy, actual[actual.season == '2627'].reset_index(drop=True))
+    cached = actual[actual.season == '2526']
+    assert dict(zip(cached.player_id, cached.value_eur.astype(int))) == {'1': 9000000, '2': 12000000}
+    assert sum(len(client.get_calls) for client in latest.clients) == 1
+
+
+def test_genuine_native_only_successor_retires_dual_failure_and_allows_independent_current(scraper, monkeypatch):
+    from scrapers.transfermarkt import write_intents
+    old_scope, _, source = _partial_dual_then_newer(scraper, monkeypatch, newer_mode='native-only')
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+        'retire-via-native-only', decoded_body_soft_stop_bytes=100000)
+    assert not failure['verified'] and failure['status'] == 'superseded_partial_write'
+    assert failure['original_legacy_snapshot_id'] is None
+    assert not write_intents.pending_intents({'kind': 'current'})
+    pd.testing.assert_frame_equal(native, _table(scraper, 'transfermarkt_market_value_points'))
+    assert sum(len(client.get_calls) for client in source.clients) == 1
+    future = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 3000000, 'verein': 'Two', 'age': '21', 'mw': 'EUR3m'}]}])
+    proof = current.fetch_current_career(scraper, 'market_value_points', ['2'], old_scope, PREFLIGHT,
+        'native-only-unrelated', decoded_body_soft_stop_bytes=100000)
+    assert proof['verified'] and sum(len(client.get_calls) for client in future.clients) == 1
+
+
+def _native_history_portion(scraper, monkeypatch, tmp_path, player, value, mode='native-only'):
+    import contextlib
+    import scrapers.transfermarkt
+    source = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': value,
+        'verein': 'History', 'age': '21', 'mw': 'EUR9m'}]}])
+    scraper._batch_id = 'history-capture-' + player
+    with monkeypatch.context() as patch:
+        patch.setattr(scrapers.transfermarkt, 'TransfermarktScraper', lambda **_: contextlib.nullcontext(scraper))
+        patch.setattr(current.run, '_select_player_ids', lambda *_args, **_kwargs:
+            ([player], 0, 0, [], {'roster_size': 1, 'selected': 1, 'pending': 0}))
+        result = current.run._run_entity(current.run.ENTITY_SPECS['market_value_history'], ['GB1'], 2026,
+            1, str(tmp_path / ('history-result-' + player + '.json')), refresh_mode='history',
+            run_key='stable-history-child', write_mode=mode, expected_reader_revision=7)
+    assert result == 0
+    exported = json.loads((tmp_path / ('history-result-' + player + '.json')).read_text())
+    assert exported['career_capture_archive_status'] == 'complete'
+    return source, exported
+
+
+@pytest.mark.parametrize('mode', ['native-only', 'dual'])
+@pytest.mark.parametrize('damage', [None, 'missing_latest_archive', 'corrupt_latest_attestation', 'corrupt_latest_manifest', 'missing_latest_raw'])
+def test_native_history_archive_reconciles_old_current_after_stable_child_manifest_changes(scraper, monkeypatch, tmp_path, damage, mode):
+    from scrapers.transfermarkt import write_intents, superseded
+    old_scope, _, _ = _partial_dual_then_newer(scraper, monkeypatch)
+    manifest_key = 'native_write_manifest' if mode == 'native-only' else 'batch_manifest'
+    attestation_key = 'native_manifest_attestation' if mode == 'native-only' else 'dual_manifest_attestation'
+    _, first = _native_history_portion(scraper, monkeypatch, tmp_path, '1', 9000000, mode)
+    first_row, = first[manifest_key]['rows']
+    first_archive = write_intents.completed_capture('stable-history-child', 'market_value_points', first_row['native_batch_id'])
+    _, second = _native_history_portion(scraper, monkeypatch, tmp_path, '2', 10000000, mode)
+    second_row, = second[manifest_key]['rows']
+    second_archive = write_intents.completed_capture('stable-history-child', 'market_value_points', second_row['native_batch_id'])
+    assert first_row['native_batch_id'] != second_row['native_batch_id']
+    actual_old_attestation = first_archive['receipt'][attestation_key]
+    assert actual_old_attestation['proof']['row'][actual_old_attestation['proof']['fields'].index('native_batch_id')] == first_row['native_batch_id']
+    native = _table(scraper, 'transfermarkt_market_value_points').copy()
+    if damage == 'missing_latest_archive':
+        (write_intents._root() / 'completed' / (second_archive['intent_sha256'] + '.json')).unlink()
+    elif damage == 'corrupt_latest_attestation':
+        changed = json.loads(json.dumps(second_archive))
+        changed['receipt'][attestation_key]['sha256'] = '0' * 64
+        archive_path = write_intents._root() / 'completed' / (second_archive['intent_sha256'] + '.json')
+        archive_path.unlink()
+        # A valid outer checksum cannot turn a bad actual-row attestation into proof.
+        write_intents._immutable_record(archive_path, changed)
+    elif damage == 'corrupt_latest_manifest':
+        table = 'transfermarkt_native_write_manifest_v2' if mode == 'native-only' else 'transfermarkt_dual_write_manifest_v2'
+        scraper.test_db.sql.execute(f"UPDATE {table} SET status='parity_mismatch' WHERE cycle_id='stable-history-child'")
+    elif damage == 'missing_latest_raw':
+        raw = second_archive['journal']['evidence']['raw_attempts'][0]
+        record = scraper.test_store.load_capture(raw['capture_id'])[1]
+        from pathlib import Path
+        Path(scraper.test_store.root + '/' + record.blob_key).unlink()
+    if damage:
+        with pytest.raises(Exception):
+            superseded.verify_complete(scraper, current.run.ENTITY_SPECS['market_value_history'], first_archive, players=['1'])
+        with pytest.raises(Exception):
+            current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+                'cannot-retire-unproven-native-history', decoded_body_soft_stop_bytes=100000)
+        assert write_intents.pending_intents({'kind': 'current'})
+    else:
+        proof = superseded.verify_complete(scraper, current.run.ENTITY_SPECS['market_value_history'], first_archive, players=['1'])
+        assert proof['archive']['receipt'][attestation_key] == actual_old_attestation
+        failure = current.fetch_current_career(scraper, 'market_value_points', ['1'], old_scope, PREFLIGHT,
+            'retire-via-original-native-history', decoded_body_soft_stop_bytes=100000)
+        assert not failure['verified'] and failure['original_legacy_snapshot_id'] is None
+        assert failure['superseding_players']['1']['unit']['native_batch_id'] == first_row['native_batch_id']
+        assert not write_intents.pending_intents({'kind': 'current'})
+        future = http(scraper, [{'list': [{'datum_mw': 'Jan 1, 2025', 'y': 3000000, 'verein': 'Three', 'age': '21', 'mw': 'EUR3m'}]}])
+        result = current.fetch_current_career(scraper, 'market_value_points', ['3'], old_scope, PREFLIGHT,
+            'unrelated-after-native-history', decoded_body_soft_stop_bytes=100000)
+        assert result['verified'] and sum(len(client.get_calls) for client in future.clients) == 1
+    actual = _table(scraper, 'transfermarkt_market_value_points')
+    pd.testing.assert_frame_equal(native, actual[actual.player_id.isin(['1', '2'])].reset_index(drop=True))
