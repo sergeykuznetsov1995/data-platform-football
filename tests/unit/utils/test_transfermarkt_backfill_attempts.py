@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from pathlib import Path
 
 from dags.utils.transfermarkt_backfill_attempts import (
@@ -240,3 +241,32 @@ def test_previous_claim_files_cannot_mask_current_platform_failure(tmp_path):
 
     assert result.outcome is AttemptOutcome.PLATFORM_ERROR
     assert result.raw_evidence_ids == ()
+
+
+@pytest.mark.parametrize('stage,kind,outcome,error_class', [
+    ('platform','traffic_ledger',AttemptOutcome.PLATFORM_ERROR,'platform_traffic_ledger'),
+    ('platform','traffic_meter',AttemptOutcome.PLATFORM_ERROR,'platform_traffic_meter'),
+    ('platform','raw_store',AttemptOutcome.PLATFORM_ERROR,'platform_raw_store'),
+    ('platform','evidence_export',AttemptOutcome.PLATFORM_ERROR,'platform_evidence_export'),
+    ('source','source_outcome',AttemptOutcome.TRANSPORT_ERROR,'transport_timeout'),
+])
+def test_typed_platform_failure_wins_over_transport_and_clean_source_timeout_stays_retryable(tmp_path,stage,kind,outcome,error_class):
+    store=RawResponseStore.from_uri((tmp_path/'raw').as_uri())
+    base,entities,manifest=_paths(tmp_path)
+    envelope=store.store_transport_error(url='https://www.transfermarkt.com/page',
+        fetched_at='2026-07-21T12:00:00+00:00',cycle_id=CYCLE_ID,scope_id=SCOPE_ID,
+        endpoint='players',attempt=1,error_kind='timeout',error_type='TimeoutError')
+    campaign_id,batch_id='a'*64,'b'*64
+    failure=entities/'players-failed-1-1.json'
+    failure.write_text(json.dumps({'failure_stage':stage,'failure_kind':kind,
+        'network_fetches':1,'raw_attempts':[envelope.__dict__],'errors':['failed traffic persistence']}))
+    (entities/'.source-attempt-1-1-players.json').write_text(json.dumps({
+        'contract_version':1,'status':'entered','campaign_id':campaign_id,'child_cycle_id':CYCLE_ID,
+        'scope_id':SCOPE_ID,'batch_id':batch_id,'claim_generation':1,'attempt_sequence':1,
+        'parser_entity':'players','failure_path':str(failure)}))
+    result=collect_scope_attempt_evidence(result_base_dir=str(base),entity_dir=str(entities),
+        scope_manifest_path=str(manifest),scope_id=SCOPE_ID,raw_store=store,
+        campaign_id=campaign_id,child_cycle_id=CYCLE_ID,batch_id=batch_id,claim_generation=1,attempt_sequence=1)
+    assert result.outcome is outcome
+    assert result.error_class==error_class
+    assert result.raw_evidence_ids==(envelope.envelope_id,)

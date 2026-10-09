@@ -431,7 +431,10 @@ def collect_scope_attempt_evidence(
                 checkpoint_path=checkpoint_path,
                 observed_at=observed_at,
             )
-        if failure_stage == "platform" and latest.outcome_kind != "transport_error":
+        if failure_stage == "platform" or (
+            latest.outcome_kind == "transport_error"
+            and latest.error_kind == "proxy" and network_fetches == 0
+        ):
             return ClassifiedScopeAttempt(
                 outcome=AttemptOutcome.PLATFORM_ERROR,
                 raw_evidence_ids=unique_ids,

@@ -468,7 +468,8 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
                     repository.initialise_campaign(delta)
                 blocked_scope_ids = repository.register_season_handoffs(latest_rows, now=now)
                 available_ids = {target.scope_id for target in historical_targets_from_registry(latest_rows)} - blocked_scope_ids
-                campaign = repository.select_queue_campaign(now=now, allowed_ids=available_ids)
+                campaign = repository.select_queue_campaign(now=now, allowed_ids=available_ids,
+                                                            registry_targets=historical_targets_from_registry(latest_rows))
                 if campaign is None:
                     _publish_next_poll(ti, now=now, idle=True)
                     return []

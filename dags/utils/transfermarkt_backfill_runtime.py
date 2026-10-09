@@ -260,8 +260,10 @@ class BackfillStateRepository:
                 self.execute(mark_sql(target, status='pending', at=now))
         return {str(item['scope_id']) for item in self.query(f"SELECT scope_id FROM {TABLE} WHERE status <> 'complete'")}
 
-    def select_queue_campaign(self, *, now: datetime, allowed_ids=None) -> state.BackfillCampaign | None:
+    def select_queue_campaign(self, *, now: datetime, allowed_ids=None, registry_targets=None) -> state.BackfillCampaign | None:
         """Recover one busy batch first; otherwise pick oldest runnable entry."""
+        latest_identities = ({_semantic_target_identity(target) for target in registry_targets}
+                             if registry_targets is not None else None)
         campaigns = self.load_campaigns()
         opened = [item for item in campaigns if item.status in _OPEN_CAMPAIGN_STATUSES]
         busy = []
@@ -281,7 +283,8 @@ class BackfillStateRepository:
             scopes = self.load_scopes(campaign.campaign_id)
             held_ids = {scope_id for batch in self.load_batches(campaign.campaign_id)
                         if batch.status is state.BatchStatus.WAITING_POLICY for scope_id in batch.scope_ids}
-            if any(item.target.scope_id not in held_ids and (allowed_ids is None or item.target.scope_id in allowed_ids) and
+            if any(item.target.scope_id not in held_ids and
+                   (latest_identities is None or _semantic_target_identity(item.target) in latest_identities) and (allowed_ids is None or item.target.scope_id in allowed_ids) and
                    (item.status is state.ScopeStatus.PENDING or
                    (item.status is state.ScopeStatus.RETRYABLE_ERROR and item.next_retry_at is not None
                     and item.next_retry_at <= now)) for item in scopes):

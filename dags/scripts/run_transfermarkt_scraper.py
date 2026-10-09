@@ -2742,6 +2742,8 @@ def _delete_valid_empty_rows(
         for source_id in source_ids
     )
     season_short = _canonical_scope_season(league, season)
+    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+        _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
     conn = scraper._bronze_connection()
     committed = {}
     source_key = source_key or spec.id_column
@@ -3471,6 +3473,8 @@ def _persist_native_write_manifest(
             f'native-only outputs not committed: {sorted(missing)}'
         )
 
+    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+        _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
     conn = scraper._bronze_connection()
     _execute_cursor(conn, 'CREATE SCHEMA IF NOT EXISTS iceberg.ops')
     _execute_cursor(

@@ -206,3 +206,84 @@ def test_expired_unfinished_batch_stays_visible_while_other_entries_run():
     assert unclaimed.batch is None
     assert state.record_sha256(unclaimed.scopes[0]) == original_scope_hash
     assert state.batch_from_mapping(state.record_payload(held)) == held
+
+
+@pytest.mark.parametrize('transport,status,outcome,error_class,expected', [
+    (False,200,state.AttemptOutcome.CAPTURED,None,True),
+    (False,503,state.AttemptOutcome.SOURCE_ERROR,'http_503',True),
+    (False,200,state.AttemptOutcome.SOURCE_ERROR,'http_200',False),
+    (True,None,state.AttemptOutcome.TRANSPORT_ERROR,'transport_timeout',False),
+])
+def test_probe_verifies_real_raw_envelope_time_and_semantics(tmp_path,transport,status,outcome,error_class,expected):
+    from scrapers.transfermarkt.raw_store import RawResponseStore
+    from utils.transfermarkt_backfill_finalize import _probe_has_verified_response
+    _,_,scope,batch=claim()
+    batch=replace(batch,recovery_probe=True)
+    store=RawResponseStore.from_uri((tmp_path/'raw').as_uri())
+    fields=dict(url='https://www.transfermarkt.com/page',fetched_at=NOW.isoformat(),
+                cycle_id='original-child',scope_id=scope.target.scope_id,endpoint='listing',attempt=1)
+    if transport:
+        envelope=store.store_transport_error(**fields,error_kind='timeout',error_type='TimeoutError')
+    else:
+        capture=store.store_attempt(**fields,body=b'synthetic offline source response',status_code=status,headers={})
+        envelope=store.store_response_envelope(capture)
+    extra={'scope_manifest_uri':'s3://synthetic/manifest.json','scope_manifest_sha256':'a'*64} if outcome is state.AttemptOutcome.CAPTURED else {}
+    attempt=state.BackfillAttempt.build(scope=scope,batch_id=batch.batch_id,outcome=outcome,
+        started_at=NOW,finished_at=NOW,source_observed_at=NOW,error_class=error_class,
+        raw_evidence_ids=[envelope.envelope_id],**extra)
+    assert _probe_has_verified_response(batch,attempt,store) is expected
+    # Replay after persist_attempt reads the same real immutable envelope type.
+    assert _probe_has_verified_response(batch,attempt,store) is expected
+
+
+def test_corrected_registry_identity_does_not_starve_new_campaign():
+    from utils.transfermarkt_backfill_runtime import _semantic_target_identity
+    _,old_campaign,old_scope,_=claim()
+    old_scope=state.BackfillScopeState.initial(old_campaign,old_scope.target,now=NOW)
+    corrected=replace(old_scope.target,canonical_competition_id='TM-CORRECTED',registry_snapshot_id='new')
+    new_campaign=state.BackfillCampaign.build(registry_snapshot_id='new',policy_sha256=old_campaign.policy_sha256,
+        parser_revision='v2',schema_revision='2',targets=[corrected],now=NOW)
+    new_campaign=new_campaign.transition(state.CampaignStatus.ACTIVE,now=NOW)
+    new_scope=state.BackfillScopeState.initial(new_campaign,corrected,now=NOW)
+    old_hash=state.record_sha256(old_scope)
+    repo=object.__new__(BackfillStateRepository)
+    repo.load_campaigns=lambda:(old_campaign,new_campaign)
+    repo.load_scopes=lambda id:(old_scope,) if id==old_campaign.campaign_id else (new_scope,)
+    repo.load_batches=lambda _:()
+    assert repo.select_queue_campaign(now=NOW,allowed_ids={corrected.scope_id},registry_targets=[corrected])==new_campaign
+    assert state.record_sha256(old_scope)==old_hash
+
+
+def test_authoritative_empty_delete_rechecks_revoked_historical_authority(monkeypatch):
+    from dags.scripts import run_transfermarkt_scraper as runner
+    monkeypatch.setenv('TM_DAG_ID','dag_backfill_transfermarkt')
+    monkeypatch.setenv('TM_READER_REVISION','7')
+    calls=[]
+    def denied(mode,revision):
+        calls.append((mode,revision))
+        raise ValueError('historical policy revoked')
+    monkeypatch.setattr(runner,'_authorize_write_mode',denied)
+    monkeypatch.setattr(runner,'_canonical_scope_season',lambda *_:'2025/26')
+    class Scraper:
+        def _bronze_connection(self):
+            raise AssertionError('revoked authority must fail before any DELETE connection')
+    spec=runner._spec_for_write_mode(runner.ENTITY_SPECS['market_value_history'],'native-only')
+    with pytest.raises(ValueError,match='revoked'):
+        runner._delete_valid_empty_rows(Scraper(),spec,['1'],'TM-GB1',2025)
+    assert calls==[('native-only',7)]
+
+
+def test_empty_native_manifest_rechecks_historical_authority_before_ops_write(monkeypatch):
+    from dags.scripts import run_transfermarkt_scraper as runner
+    monkeypatch.setenv('TM_DAG_ID','dag_backfill_transfermarkt')
+    monkeypatch.setenv('TM_READER_REVISION','7')
+    def denied(*_):
+        raise ValueError('historical claim revoked')
+    monkeypatch.setattr(runner,'_authorize_write_mode',denied)
+    class Scraper:
+        def _bronze_connection(self):
+            raise AssertionError('revoked authority must fail before manifest mutation')
+    spec=runner._spec_for_write_mode(runner.ENTITY_SPECS['market_value_history'],'native-only')
+    results={'outputs':{'market_value_points':{'table':'iceberg.bronze.transfermarkt_market_value_points'}}}
+    with pytest.raises(ValueError,match='revoked'):
+        runner._persist_native_write_manifest(Scraper(),spec,{},results,'original-child','TM-GB1',2025,7)

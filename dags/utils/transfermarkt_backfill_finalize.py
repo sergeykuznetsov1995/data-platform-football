@@ -686,13 +686,14 @@ def _probe_has_verified_response(batch, attempt, raw_store):
         return True
     fresh = []
     for envelope_id in attempt.raw_evidence_ids:
-        envelope = raw_store.load_attempt_envelope(envelope_id)
-        stamp = datetime.fromisoformat(str(envelope.fetched_at).replace("Z", "+00:00"))
+        envelope = raw_store.verify_attempt_envelope(envelope_id)
+        stamp = datetime.fromisoformat(str(envelope.observed_at).replace("Z", "+00:00"))
         if stamp >= batch.claimed_at:
             fresh.append(envelope)
     semantic_response = (attempt.outcome is state.AttemptOutcome.CAPTURED
                          or attempt.outcome.value == "continuation"
-                         or str(attempt.error_class or "").startswith("http_"))
+                         or (str(attempt.error_class or "").startswith("http_")
+                             and str(attempt.error_class) != "http_200"))
     return (semantic_response and len(fresh) == 1 and fresh[0].outcome_kind == "response"
             and fresh[0].capture_id is not None and fresh[0].status_code is not None)
 
