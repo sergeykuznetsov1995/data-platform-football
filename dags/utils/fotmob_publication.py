@@ -218,6 +218,8 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/player_collector.py",
         "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
+        "scrapers/fotmob/transfers.py",
+        "scrapers/fotmob/transfer_contract.py",
     }
 )
 FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
@@ -258,6 +260,8 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/player_collector.py",
         "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
+        "scrapers/fotmob/transfers.py",
+        "scrapers/fotmob/transfer_contract.py",
         "scrapers/fotmob/transport.py",
     }
 )
@@ -640,7 +644,7 @@ def _active_owner_writer_authorization(
                 owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
                 and (
                     not isinstance(conf, Mapping)
-                    or lane not in {"daily", "refresh", "backfill"}
+                    or lane not in {"daily", "refresh", "backfill", "transfers"}
                     or conf.get("mode") != lane
                 )
             )

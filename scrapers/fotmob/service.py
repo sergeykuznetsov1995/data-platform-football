@@ -635,6 +635,9 @@ class FotMobIngestService:
     def _raise_if_cancelled(self) -> None:
         if self._cancelled.is_set():
             raise RuntimeError("FotMob ingestion cancelled")
+        deadline = getattr(self, "deadline_at", None)
+        if deadline is not None and utc_now() >= deadline:
+            raise RuntimeError("FotMob ingestion deadline reached")
 
     def _account(self, fetch: FetchResult) -> None:
         with self._budget_lock:
@@ -664,6 +667,10 @@ class FotMobIngestService:
                     "remaining request budget cannot cover one retry-bounded "
                     f"target ({self.ledger.remaining_requests}<{max_attempts})"
                 )
+            if getattr(self, "deadline_at", None) is not None and (
+                self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes
+            ):
+                raise BudgetExceeded("FotMob direct-byte budget exhausted")
         fetch = self.transport.fetch_json(endpoint, params)
         self._account(fetch)
         self._raise_if_cancelled()
@@ -2320,6 +2327,7 @@ class FotMobIngestService:
         *,
         max_pages: int = 250,
         recent_only: bool = False,
+        resume_since: Optional[datetime] = None,
     ) -> OperationResult:
         """Fetch or resume one league-filtered global transfer stream.
 
@@ -2351,7 +2359,40 @@ class FotMobIngestService:
         network_pages = 0
         stream_exhausted = False
         page = 1
-        resume_allowed = self.mode == RunMode.BACKFILL
+        resume_allowed = self.mode == RunMode.BACKFILL or resume_since is not None
+        anchor_hash = None
+
+        def checkpoint(target_key: str, *, anchor: Optional[str] = None):
+            if not resume_allowed:
+                return None
+            previous = self.repository.latest_success(target_key)
+            if previous is None or resume_since is None:
+                return previous
+            # completed_at dates the manifest, not validation by the source.
+            # replay_json clears the transport's stale flag, so reject an
+            # old fallback before it can become a trusted same-day checkpoint.
+            if previous.get("stale"):
+                return None
+            observed = previous.get("completed_at")
+            if isinstance(observed, str):
+                observed = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+            if not isinstance(observed, datetime):
+                return None
+            if observed.tzinfo is not None:
+                observed = observed.astimezone(timezone.utc).replace(tzinfo=None)
+            cutoff = resume_since
+            if cutoff.tzinfo is not None:
+                cutoff = cutoff.astimezone(timezone.utc).replace(tzinfo=None)
+            if observed < cutoff:
+                return None
+            if anchor is not None:
+                capabilities = previous.get("capabilities_json") or {}
+                if isinstance(capabilities, str):
+                    capabilities = json.loads(capabilities)
+                if capabilities.get("resume_anchor_hash") != anchor:
+                    return None
+            return previous
+
         page_one_params: dict[str, Any] = {
             "leagueIds": str(int(competition_id)),
             "page": 1,
@@ -2359,14 +2400,17 @@ class FotMobIngestService:
         if recent_only:
             page_one_params["last"] = "1year"
         page_one_target = canonicalize_target("transfers", page_one_params)
-        page_one_previous = (
-            self.repository.latest_success(page_one_target.target_key)
-            if resume_allowed
-            else None
-        )
+        page_one_previous = checkpoint(page_one_target.target_key)
         skip_anchor_revalidation = page_one_previous is not None and max_pages == 1
 
         while True:
+            try:
+                self._raise_if_cancelled()
+            except RuntimeError as exc:
+                result.retryable.append(str(exc))
+                if str(exc) == "FotMob ingestion deadline reached":
+                    result.metadata["deferred_reason"] = "deadline"
+                break
             params: dict[str, Any] = {
                 "leagueIds": str(int(competition_id)),
                 "page": page,
@@ -2374,10 +2418,8 @@ class FotMobIngestService:
             if recent_only:
                 params["last"] = "1year"
             target = canonicalize_target("transfers", params)
-            previous = (
-                self.repository.latest_success(target.target_key)
-                if resume_allowed
-                else None
+            previous = checkpoint(
+                target.target_key, anchor=anchor_hash if page > 1 else None
             )
             replay_page = bool(
                 previous is not None
@@ -2385,6 +2427,8 @@ class FotMobIngestService:
                 and (page > 1 or skip_anchor_revalidation)
             )
             if not replay_page and network_pages >= max_pages:
+                if resume_since is not None:
+                    result.metadata["deferred_reason"] = "budget"
                 break
             result.attempted += 1
             try:
@@ -2405,10 +2449,33 @@ class FotMobIngestService:
                 elif not replay_page:
                     network_pages += 1
             except Exception as exc:
-                result.errors.append(f"transfers page {page}: {exc}")
+                if str(exc) == "FotMob ingestion deadline reached":
+                    result.retryable.append(str(exc))
+                    result.metadata["deferred_reason"] = "deadline"
+                else:
+                    result.errors.append(f"transfers page {page}: {exc}")
+                break
+            if resume_since is not None and (
+                fetch.stale or fetch.outcome == FetchOutcome.STALE_REPLAY
+            ):
+                self._commit_for_fetch(
+                    fetch,
+                    target_type="transfers_page",
+                    competition_id=competition_id,
+                    entity_id=f"{stream_window}:{page}",
+                    status=ManifestStatus.RETRYABLE_FAILURE,
+                    error_code="stale_transfer_replay",
+                    error=fetch.error or "transfer page source validation failed",
+                )
+                result.retryable.append(
+                    f"transfers page {page}: stale source fallback is not fresh evidence"
+                )
+                result.metadata["stale_replay_rejected"] = True
                 break
             if replay_page:
                 resumed_pages += 1
+            if page == 1:
+                anchor_hash = fetch.content_hash
             if page == 1 and page_one_previous is not None and not replay_page:
                 page_one_changed = (
                     page_one_previous.get("content_hash") != fetch.content_hash
@@ -2478,6 +2545,11 @@ class FotMobIngestService:
                             "unique_seen": len(unique_ids),
                             "page_identity_hash": _content_hash(
                                 row["transfer_event_id"] for row in rows
+                            ),
+                            **(
+                                {"resume_anchor_hash": anchor_hash}
+                                if resume_since is not None
+                                else {}
                             ),
                         },
                         unknown_paths=unknown,

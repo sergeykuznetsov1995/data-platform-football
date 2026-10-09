@@ -1573,6 +1573,98 @@ def test_one_page_transfer_bound_advances_to_first_missing_page():
     assert resumed.metadata["network_pages"] == 1
 
 
+def _daily_transfer_pages():
+    pages = {
+        page: canonicalize_target(
+            "transfers", {"leagueIds": "47", "page": page, "last": "1year"}
+        ).canonical_url
+        for page in (1, 2, 3)
+    }
+    responses = {
+        url: {
+            "hits": 3,
+            "page": page,
+            "transfers": [
+                {
+                    "playerId": page,
+                    "name": f"Player {page}",
+                    "transferDate": f"2026-07-0{page}",
+                    "fromClubId": page * 10,
+                    "toClubId": page * 10 + 1,
+                }
+            ],
+        }
+        for page, url in pages.items()
+    }
+    return pages, responses
+
+
+def test_daily_transfer_resume_reuses_only_same_day_checkpoint():
+    pages, responses = _daily_transfer_pages()
+    service, transport, _ = _service(responses)
+    cutoff = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    assert not service.sync_transfers(
+        47, max_pages=2, recent_only=True, resume_since=cutoff
+    ).ok
+    resumed = service.sync_transfers(
+        47, max_pages=1, recent_only=True, resume_since=cutoff
+    )
+    assert resumed.ok
+    assert transport.calls[2:] == [
+        (pages[1], True),
+        (pages[2], True),
+        (pages[3], False),
+    ]
+    assert resumed.counts["events"] == 3
+    transport.calls.clear()
+    tomorrow = service.sync_transfers(
+        47, max_pages=1, recent_only=True, resume_since=cutoff + timedelta(days=1)
+    )
+    assert not tomorrow.ok
+    assert transport.calls == [(pages[1], False)]
+
+
+def test_daily_transfer_resume_does_not_mix_pages_after_changed_anchor():
+    pages, responses = _daily_transfer_pages()
+    service, transport, _ = _service(responses)
+    cutoff = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    assert not service.sync_transfers(
+        47, max_pages=2, recent_only=True, resume_since=cutoff
+    ).ok
+    responses[pages[1]]["transfers"][0]["playerId"] = 99
+    # Changing the anchor invalidates pages already saved under its old hash.
+    second = service.sync_transfers(
+        47, max_pages=2, recent_only=True, resume_since=cutoff
+    )
+    assert not second.ok
+    assert transport.calls[2:] == [(pages[1], False), (pages[2], False)]
+    resumed = service.sync_transfers(
+        47, max_pages=1, recent_only=True, resume_since=cutoff
+    )
+    assert resumed.ok
+    assert transport.calls[4:] == [
+        (pages[1], True),
+        (pages[2], True),
+        (pages[3], False),
+    ]
+
+
+def test_transfer_deadline_stops_before_fetch():
+    pages, responses = _daily_transfer_pages()
+    service, transport, _ = _service(responses)
+    service.deadline_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        seconds=1
+    )
+    result = service.sync_transfers(47, recent_only=True)
+    assert not result.ok
+    assert any("deadline" in reason for reason in result.retryable)
+    assert transport.calls == []
+
+
 def test_match_payload_uses_one_request_and_second_call_skips_success():
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
