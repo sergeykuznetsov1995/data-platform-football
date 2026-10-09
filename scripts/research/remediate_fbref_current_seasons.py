@@ -48,6 +48,7 @@ from scrapers.fbref.raw_store import (  # noqa: E402
     RawFetchRecord,
     RawPageStore,
     competition_page_target,
+    season_page_target,
 )
 
 
@@ -71,6 +72,7 @@ class CurrentSeasonRemediationPlan:
     advertised_current_label: str
     advertised_current_url: str
     action: str
+    missing_current_season_root: bool
     history_attempt_id: str
     history_run_id: str
     history_content_hash: str
@@ -122,6 +124,7 @@ class CurrentSeasonRemediationPlan:
             "advertised_current_label": self.advertised_current_label,
             "advertised_current_url": self.advertised_current_url,
             "action": self.action,
+            "missing_current_season_root": self.missing_current_season_root,
             "history_attempt_id": self.history_attempt_id,
             "history_run_id": self.history_run_id,
             "history_content_hash": self.history_content_hash,
@@ -278,6 +281,23 @@ def build_remediation_plans(
             raise RemediationEvidenceError(
                 f"competition {competition_id} current season was not installed"
             )
+        current_season = next(
+            (season for season in seasons if season.season_id == current_season_id),
+            None,
+        )
+        # Registry reconciliation can commit before frontier installation fails.
+        # Only a source-resolved SeasonRef authorizes recreating the absent root;
+        # direct-match histories and existing (including quarantined) roots retain
+        # their normal handling. An old season alias cannot satisfy this check.
+        missing_root = bool(
+            installed_id == current_season_id
+            and current_season is not None
+            and control.get_frontier_target(
+                season_page_target(
+                    competition_id, current_season_id, current_season.season_url
+                ).target_id
+            ) is None
+        )
         index_raw = dict(index["raw"])
         plan = CurrentSeasonRemediationPlan(
             competition_id=competition_id,
@@ -286,7 +306,12 @@ def build_remediation_plans(
             resolved_current_season_id=current_season_id,
             advertised_current_label=advertised.label,
             advertised_current_url=advertised.season_url,
-            action=("no_change" if installed_id == current_season_id else "reconcile"),
+            action=(
+                "no_change"
+                if installed_id == current_season_id and not missing_root
+                else "reconcile"
+            ),
+            missing_current_season_root=missing_root,
             history_attempt_id=str(history_attempt["attempt_id"]),
             history_run_id=str(history_attempt["run_id"]),
             history_content_hash=record.content_hash,
