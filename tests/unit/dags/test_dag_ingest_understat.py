@@ -124,7 +124,7 @@ def test_discovery_conflict_fails_closed(dag_module):
         dag_module._deduplicate_scopes(scopes)
 
 
-def test_current_planner_uses_runtime_rolling_catalog_and_config_scope(
+def test_current_planner_uses_all_runtime_rolling_catalog_scopes(
     dag_module, monkeypatch
 ):
     import scrapers.understat as understat
@@ -142,7 +142,7 @@ def test_current_planner_uses_runtime_rolling_catalog_and_config_scope(
             calls.append(kwargs)
             return [
                 _scope(season="2627", source_id=2026),
-                _scope(league="UNKNOWN-League", season="2627", source_id=2026),
+                _scope(league="RUS-Premier League", season="2627", source_id=2026),
             ]
 
     monkeypatch.setattr(understat, "UnderstatClient", Client)
@@ -153,9 +153,37 @@ def test_current_planner_uses_runtime_rolling_catalog_and_config_scope(
     )
 
     assert calls == [{"window": 2, "probe_next": True}]
-    assert len(plan) == 1
+    assert len(plan) == 2
     assert plan[0]["UNDERSTAT_LEAGUE"] == "ENG-Premier League"
+    assert plan[1]["UNDERSTAT_LEAGUE"] == "RUS-Premier League"
     assert "UNDERSTAT_REPARSE" not in plan[0]
+
+
+@pytest.mark.parametrize("boundary, expected_count", [
+    (datetime(2026, 9, 28, 9, tzinfo=timezone.utc), 12),
+    (datetime(2026, 9, 29, 9, tzinfo=timezone.utc), 6),
+])
+def test_catalog_six_leagues_keep_closed_season_policy(dag_module, monkeypatch, boundary, expected_count):
+    import scrapers.understat as understat
+    from scrapers.understat.catalog import PRODUCTION_LEAGUES
+
+    scopes = [
+        _scope(league=league, season=season, source_id=source_id)
+        for league in PRODUCTION_LEAGUES
+        for season, source_id in (("2526", 2025), ("2627", 2026))
+    ]
+    monkeypatch.setattr(understat, "UnderstatClient", lambda: object())
+    monkeypatch.setattr(understat, "UnderstatCatalog", lambda client: SimpleNamespace(
+        rolling_scopes=lambda **kwargs: scopes,
+    ))
+    monkeypatch.setattr(dag_module, "UNDERSTAT_LEAGUES", list(reversed(PRODUCTION_LEAGUES)))
+
+    plan = dag_module.plan_current_scopes(data_interval_end=boundary)
+    assert len(scopes) == 12
+    assert len(plan) == expected_count
+    assert {item["UNDERSTAT_LEAGUE"] for item in plan} == set(PRODUCTION_LEAGUES)
+    assert sum(item["UNDERSTAT_MODE"] == "current" for item in plan) == 6
+    assert sum(item["UNDERSTAT_MODE"] == "closed_check" for item in plan) == expected_count - 6
 
 
 # #1431: 2026-09-28 is a Monday; the 2025/26 season is closed from 2026-07-01.

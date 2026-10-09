@@ -31,6 +31,20 @@ _TASK_ENV = {
 }
 
 
+def validate_understat_leagues(configured: Iterable[str]) -> None:
+    """The source catalog owns league membership; config is only checked."""
+    from scrapers.understat.catalog import PRODUCTION_LEAGUES
+
+    expected = frozenset(PRODUCTION_LEAGUES)
+    actual = frozenset(configured)
+    if actual != expected:
+        raise AirflowException(
+            "Understat UNDERSTAT_LEAGUES disagrees with the source catalog; "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}; "
+            f"expected={sorted(expected)}, configured={sorted(actual)}"
+        )
+
+
 def _scope_value(scope: Any, name: str) -> Any:
     """Read a catalog scope from either its dataclass or mapping form."""
 

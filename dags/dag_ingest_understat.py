@@ -27,9 +27,9 @@ from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils.understat_tasks import (
     _close_understat_client,
     _deduplicate_scopes,
-    _scope_value,
     scope_environment,
     validate_scope_result,
+    validate_understat_leagues,
 )
 
 
@@ -41,6 +41,8 @@ CURRENT_PRIORITY = 100
 
 def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
     """Discover the bounded current window and prepare mapped runner inputs."""
+
+    validate_understat_leagues(UNDERSTAT_LEAGUES)
 
     # Lazy import is intentional: DAG parsing must not open a source session or
     # require the scraper-only dependency set in the scheduler process.
@@ -55,12 +57,7 @@ def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
         )
     finally:
         _close_understat_client(client)
-    configured = frozenset(UNDERSTAT_LEAGUES)
-    scopes = _deduplicate_scopes(
-        scope
-        for scope in scopes
-        if str(_scope_value(scope, "league")) in configured
-    )
+    scopes = _deduplicate_scopes(scopes)
     if not scopes:
         raise AirflowException("Understat current discovery returned no scopes")
 
