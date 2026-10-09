@@ -540,7 +540,12 @@ class Controller:
                         if failure is not None and not isinstance(failure, (LaneClosed, AllOriginsBlocked)):
                             if not isinstance(failure, _STATUS_ERRORS):
                                 raise failure
-                            self.store.record('request_error', self.now().timestamp(), error=type(failure).__name__)
+                            diagnostics = {name: getattr(failure, name, None) for name in (
+                                'attempt_id', 'error_type', 'error_phase',
+                            )}
+                            self.store.record('request_error', self.now().timestamp(),
+                                error=type(failure).__name__,
+                                **{name: value for name, value in diagnostics.items() if value is not None})
                 except (LaneClosed, AllOriginsBlocked):
                     if self.stop_file.exists() or self.cancel.is_set():
                         break
