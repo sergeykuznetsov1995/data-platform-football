@@ -14,3 +14,4 @@
 ^dag_backfill_(fbref|fotmob|sofascore_all_mens|understat|whoscored)\.py$
 ^dag_ingest_(capology|clubelo|espn|fbref|fotmob|matchhistory|sofascore|sofifa|understat|whoscored)\.py$
 ^dag_transform_(capology|e3|e4|espn|fbref|fotmob|sofifa|xref)[_.]
+^dag_fbref_history_controller\.py$

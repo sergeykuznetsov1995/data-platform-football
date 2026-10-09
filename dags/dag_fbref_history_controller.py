@@ -1,16 +1,8 @@
-"""Manual, bounded FBref historical backfill DAG.
-
-The current-refresh DAG owns registry discovery.  This DAG takes the next
-unfinished page of historical seasons from that durable registry and advances
-their frontier under the same 4096-request/2048-MiB production safety circuit as
-current ingestion (or the bounded 100/50 canary profile). Repeated manual runs
-resume automatically from PostgreSQL and immutable raw storage; no league list,
-operator cursor, or filesystem handoff is accepted.
-"""
+"""One paused-by-default Airflow controller for the durable FBref history campaign."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
 from airflow.models.param import Param
@@ -28,7 +20,6 @@ from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
     FBREF_CANARY_REQUEST_LIMIT,
-    FBREF_MAX_WARM_SESSION_TARGETS,
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
     FBREF_SCRAPER_POOL,
@@ -39,8 +30,9 @@ from utils.fbref_pipeline_tasks import (
     choose_fbref_backfill_publication_path,
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
-    finalize_fbref_publication_lock,
-    guard_fbref_history_window,
+    checkpoint_fbref_history_campaign,
+    prepare_fbref_history_campaign,
+    guard_fbref_history_slice,
     initialize_fbref_run,
     plan_fbref_backfill,
     run_recovery_wave,
@@ -65,18 +57,14 @@ BACKFILL_PAGE_KINDS = (
 )
 BACKFILL_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 BACKFILL_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
-DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
-MAX_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
-BACKFILL_MAX_BATCHES = 80
+DEFAULT_SHARD_SIZE = 1
+MAX_SHARD_SIZE = 1
+BACKFILL_MAX_BATCHES = 1
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
-REQUEST_LIMIT = (
-    "{{ dag_run.conf.get('request_limit', params.request_limit) }}"
-)
-BYTE_LIMIT_MB = (
-    "{{ dag_run.conf.get('byte_limit_mb', params.byte_limit_mb) }}"
-)
+REQUEST_LIMIT = "{{ dag_run.conf.get('request_limit', params.request_limit) }}"
+BYTE_LIMIT_MB = "{{ dag_run.conf.get('byte_limit_mb', params.byte_limit_mb) }}"
 SHARD_SIZE = "{{ dag_run.conf.get('shard_size', params.shard_size) }}"
 DRY_RUN = "{{ dag_run.conf.get('dry_run', params.dry_run) }}"
 PUBLISH = "{{ dag_run.conf.get('publish', params.publish) }}"
@@ -84,16 +72,21 @@ MAX_BATCHES = "{{ dag_run.conf.get('max_batches', params.max_batches) }}"
 
 
 with DAG(
-    dag_id="dag_backfill_fbref",
-    default_args={**DEFAULT_ARGS, "pool": FBREF_SCRAPER_POOL,
-                  "priority_weight": 10, "weight_rule": "absolute"},
-    description="Manual bounded FBref historical backfill",
-    schedule=None,
-    start_date=datetime(2026, 7, 11),
+    dag_id="dag_fbref_history_controller",
+    default_args={
+        **DEFAULT_ARGS,
+        "pool": FBREF_SCRAPER_POOL,
+        "priority_weight": 10,
+        "weight_rule": "absolute",
+    },
+    description="Durable bounded FBref history controller",
+    schedule="30 22 * * *",
+    is_paused_upon_creation=True,
+    start_date=datetime(2026, 7, 11, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
     max_active_tasks=1,
-    dagrun_timeout=timedelta(hours=18),
+    dagrun_timeout=timedelta(minutes=20),
     on_failure_callback=fbref_dag_failure_callback,
     render_template_as_native_obj=True,
     tags=["fbref", "bronze", "backfill", "raw-first"],
@@ -101,9 +94,7 @@ with DAG(
         "dry_run": Param(
             False,
             type="boolean",
-            description=(
-                "Plan the next cohort without creating a run or using proxy"
-            ),
+            description=("Plan the next cohort without creating a run or using proxy"),
         ),
         "request_limit": Param(
             BACKFILL_REQUEST_LIMIT,
@@ -127,6 +118,7 @@ with DAG(
         "publish": Param(
             False,
             type="boolean",
+            enum=[False],
             description=(
                 "Keep false for the isolated historical lane. Set true "
                 "explicitly only when this run should export scope and "
@@ -142,25 +134,20 @@ with DAG(
         ),
     },
     doc_md="""
-    ## FBref historical backfill
+    ## FBref durable history controller
 
-    Manual only. The DAG selects the next bounded unfinished page of
-    non-current seasons from the source-discovered male registry, then runs
-    up to eighty raw-first batches in one warm process under a
-    4096-request/2048-MiB emergency safety circuit.
-    A `100/50` canary profile is available through Params or DagRun conf.
-    Set `dry_run=true` to inspect the exact next cohort without creating a
-    control run, opening a proxy session, or changing frontier state.
-    Live mode checks current-scope freshness immediately after run creation,
-    before seeding, raw recovery, or any paid fetch, and checks it again after
-    all batches to catch drift during the run.
-    Completed historical targets are never requeued. Immutable historical
-    page kinds can import verified raw-v2 or raw-v1 content into a new run
-    without a network request; season roots deliberately require exact-refresh
-    raw so a reopened scope verdict cannot reuse stale season bytes. Run again
-    to resume the next remaining cohort automatically. Backfill is
-    non-publishing by default; an explicit publishing run additionally requires
-    the pre-run content inventory and post-run raw-integrity artifact.
+    One new controller, initially paused and disabled by FBREF_HISTORY_CONTROLLER_ENABLED.
+    No launch before accepted current prerequisites and explicit authorization.
+    UTC slices at 22:30 advance one season and at most one live page
+    plus one recovery page. Start-year order: 2026 through 2017 across the full
+    adult men's registry, then deeper. Missing and current-owned seasons remain
+    visible; current refresh owns its pages. Never launch the old driver alongside
+    this DAG. Retries retain pinned membership and recover committed raw.
+    Every writer shares the one-slot FBref pool. Current tasks and lock waiters
+    precede history; waiting sensors reschedule. Admission rechecks after waiting,
+    refuses unknown timing and includes measured fetch+parse duration.
+    Twenty-minute run/lock limits and a 45-minute margin protect four current
+    reservations. History stays nonpublishing. Silver is outside this controller.
     """,
 ) as dag:
     choose_mode = BranchPythonOperator(
@@ -195,12 +182,8 @@ with DAG(
 
     assert_history_window = PythonOperator(
         task_id="assert_history_window",
-        python_callable=guard_fbref_history_window,
-        op_kwargs={
-            "max_batches": MAX_BATCHES,
-            "shard_size": SHARD_SIZE,
-            "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
-        },
+        python_callable=guard_fbref_history_slice,
+        op_kwargs={},
         trigger_rule="all_success",
     )
 
@@ -224,12 +207,16 @@ with DAG(
     acquire_publication_lock = PythonSensor(
         task_id="acquire_publication_lock",
         python_callable=wait_fbref_publication_lock,
-        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID, "ttl_seconds": 18 * 60 * 60},
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "ttl_seconds": 20 * 60,
+        },
         retries=0,
         trigger_rule="all_success",
         mode="reschedule",
         poke_interval=30,
-        timeout=18 * 60 * 60,
+        timeout=20 * 60,
         pool=FBREF_SCRAPER_POOL,
     )
 
@@ -301,7 +288,13 @@ with DAG(
     # The live wave separately closes #1186 by refusing cross-run raw adoption
     # for season roots. Exact logical-refresh raw remains eligible so a crash
     # after raw commit still recovers without another paid request.
-    acquire_publication_lock >> capture_raw_baseline >> recover_raw
+    prepare_campaign = PythonOperator(
+        task_id="prepare_history_campaign",
+        python_callable=prepare_fbref_history_campaign,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        trigger_rule="all_success",
+    )
+    acquire_publication_lock >> prepare_campaign >> capture_raw_baseline >> recover_raw
     recover_raw >> seed_historical_seasons
     live_waves = PythonOperator(
         task_id="run_live_waves",
@@ -318,9 +311,10 @@ with DAG(
             "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
             "max_batches": MAX_BATCHES,
+            "deadline_seconds": 10 * 60,
         },
         pool=FBREF_SCRAPER_POOL,
-        execution_timeout=timedelta(hours=6, minutes=5),
+        execution_timeout=timedelta(minutes=15),
         retries=0,
         trigger_rule="all_success",
     )
@@ -378,7 +372,7 @@ with DAG(
 
     release_publication_lock = PythonOperator(
         task_id="release_publication_lock",
-        python_callable=finalize_fbref_publication_lock,
+        python_callable=checkpoint_fbref_history_campaign,
         op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
         retries=0,
         trigger_rule="all_done",
@@ -389,6 +383,24 @@ with DAG(
     # A non-publishing historical run holds the lock for its own batches only,
     # then releases it without launching a downstream transform.
     choose_publication_path >> release_publication_lock
+    for writer in (
+        choose_mode,
+        plan_backfill,
+        validate_production_readiness,
+        assert_history_window,
+        initialize_run,
+        acquire_publication_lock,
+        validate_freshness_preflight,
+        prepare_campaign,
+        capture_raw_baseline,
+        recover_raw,
+        seed_historical_seasons,
+        live_waves,
+        audit_raw_integrity,
+        validate_freshness,
+        validate_run,
+    ):
+        writer >> release_publication_lock
 
 
 __all__ = ["dag"]

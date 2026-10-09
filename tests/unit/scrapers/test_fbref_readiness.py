@@ -165,6 +165,7 @@ def _meter_payload(**changes):
             "dag_accept_fbref_bronze",
             "dag_backfill_fbref",
             "dag_bootstrap_fbref",
+            "dag_fbref_history_controller",
             "dag_ingest_fbref",
         ],
     }

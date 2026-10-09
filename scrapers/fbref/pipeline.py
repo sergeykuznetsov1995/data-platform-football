@@ -2956,6 +2956,7 @@ class FBrefPipeline:
         run_id: str,
         settings: PipelineSettings,
         limit: int = MAX_SHARD_SIZE,
+        seasons: Optional[Sequence[Mapping]] = None,
     ) -> dict:
         """Seed the next bounded, unfinished historical registry cohort."""
 
@@ -2987,15 +2988,22 @@ class FBrefPipeline:
         rows = (
             []
             if safe_limit <= 0
-            else self.control.list_backfill_seasons(limit=safe_limit)
+            else (list(seasons)[:safe_limit] if seasons is not None
+                  else self.control.list_backfill_seasons(limit=safe_limit))
         )
         cohort = []
         for ordinal, row in enumerate(rows):
-            target = season_page_target(
-                row["competition_id"],
-                row["season_id"],
-                row["canonical_url"],
+            target = (
+                page_target_from_link(DiscoveredPageLink(page_kind="match", canonical_url=row["canonical_url"],
+                    source_ids={"competition_id": str(row["competition_id"]), "season_id": str(row["season_id"])}))
+                if row.get("direct_match_only") else season_page_target(
+                    row["competition_id"], row["season_id"], row["canonical_url"])
             )
+            if seasons is not None:
+                existing = self.control.get_frontier_target(target.target_id)
+                if existing and existing.get("state") == "fetched" and existing.get("next_fetch_at") is None:
+                    # Durable descendants, rather than a root refetch, advance this season.
+                    continue
             base = frontier_target(target, historical=True)
             self.control.upsert_frontier_target(
                 FrontierTarget(
@@ -4590,11 +4598,8 @@ class FBrefPipeline:
             if not normalized_install_id:
                 raise ValueError("provenance_install_id must not be empty")
             install_relation_suffix = f":install:{normalized_install_id}"
-        eligible = set(
-            self._eligible_competitions()
-            if eligible_competitions is None
-            else eligible_competitions
-        )
+        registry = self._eligible_competitions() if eligible_competitions is None else eligible_competitions
+        eligible = set(registry)
         seeded_targets: set[str] = set()
         skipped_targets: set[str] = set()
         prepared_targets: dict[str, FrontierTarget] = {}
@@ -4656,7 +4661,10 @@ class FBrefPipeline:
                     source=prepared.source,
                 )
             if candidate.historical and candidate.refresh_policy is None:
-                prepared = self._preserve_live_policy(prepared)
+                competition = registry.get(str(source_ids.get("competition_id")), {})
+                discontinued = (competition.get("metadata") or {}).get("current_scope_lifecycle") == "discontinued"
+                if not discontinued:
+                    prepared = self._preserve_live_policy(prepared)
             existing = prepared_targets.get(target.target_id)
             if existing is None:
                 prepared_targets[target.target_id] = prepared
@@ -5354,6 +5362,10 @@ class FBrefPipeline:
         return self._seed_link_candidates(
             candidates,
             parent_record=record,
+            eligible_competitions=(
+                {str(row["competition_id"]): row for row in self.control.eligible_historical_competitions()}
+                if historical and hasattr(self.control,"eligible_historical_competitions") else None
+            ),
         )
 
     def _persist_generic(
@@ -7225,6 +7237,8 @@ class FBrefPipeline:
                 stateful_parser_version=DISCOVERY_PARSER_VERSION,
                 page_kinds=page_kinds,
                 limit=settings.shard_size,
+                **({"history_run_id": run_id} if (self.control.get_run(run_id) or {}).get(
+                    "metadata", {}).get("history_campaign") else {}),
             )
         elif source_run_id:
             fetches = self.control.list_replay_fetches(

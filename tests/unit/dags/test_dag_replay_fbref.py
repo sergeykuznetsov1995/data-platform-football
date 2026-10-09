@@ -93,7 +93,7 @@ class TestFBrefReplayTopology:
         assert "run_fbref_live_waves" not in callable_names
         assert callable_names == {
             "initialize_fbref_run",
-            "acquire_fbref_publication_lock",
+            "wait_fbref_publication_lock",
             "audit_fbref_raw_integrity",
             "capture_fbref_raw_baseline",
             "drain_fbref_replay",

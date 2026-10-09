@@ -13,6 +13,8 @@ from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 
+from airflow.sensors.python import PythonSensor
+
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_RESERVATION_BYTES,
@@ -22,7 +24,8 @@ from scrapers.fbref.settings import (
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
-    acquire_fbref_publication_lock,
+    FBREF_SCRAPER_POOL,
+    wait_fbref_publication_lock,
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
     drain_fbref_replay,
@@ -65,7 +68,8 @@ SOURCE_CONTROL_RUN_ID = (
 
 with DAG(
     dag_id="dag_replay_fbref",
-    default_args=DEFAULT_ARGS,
+    default_args={**DEFAULT_ARGS, "pool": FBREF_SCRAPER_POOL,
+                  "priority_weight": 10, "weight_rule": "absolute"},
     description="Raw-only, zero-network FBref parser replay",
     schedule=None,
     start_date=datetime(2026, 7, 11),
@@ -130,12 +134,16 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    acquire_publication_lock = PythonOperator(
+    acquire_publication_lock = PythonSensor(
         task_id="acquire_publication_lock",
-        python_callable=acquire_fbref_publication_lock,
-        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        python_callable=wait_fbref_publication_lock,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID, "ttl_seconds": 18 * 60 * 60},
         retries=0,
         trigger_rule="all_success",
+        mode="reschedule",
+        poke_interval=30,
+        timeout=18 * 60 * 60,
+        pool=FBREF_SCRAPER_POOL,
     )
 
     capture_raw_baseline = PythonOperator(
