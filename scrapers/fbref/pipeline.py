@@ -81,6 +81,7 @@ from scrapers.fbref.page_document import (
     parse_page_document,
     response_owns_target_page,
 )
+from scrapers.fbref.report_observations import schedule_observations
 from scrapers.fbref.raw_store import (
     PageTarget,
     RawFetchRecord,
@@ -5253,6 +5254,20 @@ class FBrefPipeline:
             season_url=record.canonical_url,
         )
 
+    def _record_schedule_report_observations(self, html, record):
+        parsed = parse_schedule_html(html, self._season_ref(record))
+        if parsed.has_errors:
+            raise ParseWaveError(f"Schedule parse failed for {record.target_id}")
+        self.control.record_match_report_observations(
+            competition_id=str(record.source_ids["competition_id"]),
+            season_id=str(record.source_ids["season_id"]),
+            fetched_at=_as_utc(record.fetched_at),
+            raw_key=self.raw_store.fetch_manifest_key(record.logical_refresh_id),
+            records=schedule_observations(
+                html, list(parsed.datasets["schedule_rows"].records)
+            ),
+        )
+
     def _parse_discovery_children(
         self,
         html: str,
@@ -6153,6 +6168,8 @@ class FBrefPipeline:
             "season_stats",
             "match",
         }
+        if record.page_kind == "schedule":
+            self._record_schedule_report_observations(html, record)
         if is_latest is None:
             raise TypedPromotionDeferred(
                 f"Stateful promotion deferred for active target {record.target_id}"

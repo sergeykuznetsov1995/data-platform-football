@@ -5503,6 +5503,71 @@ class ControlStore:
             "provenance_count": len(ordered_provenance),
         }
 
+    def record_match_report_observations(
+        self, *, competition_id: str, season_id: str,
+        fetched_at: datetime, raw_key: str, records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Preserve the earliest source read, including out-of-order replay.
+
+        This is observation evidence, not a frontier mutation or a Bronze
+        completeness verdict. No wall-clock default or legacy backfill exists.
+        """
+        competition = _text(competition_id, "competition_id")
+        season = _text(season_id, "season_id")
+        raw = _text(raw_key, "raw_key")
+        if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
+            raise ValueError("fetched_at must have a timezone")
+        values = []
+        for record in records:
+            kickoff = record.get("kickoff_at")
+            if kickoff is not None and (not isinstance(kickoff, datetime) or kickoff.tzinfo is None):
+                raise ValueError("kickoff_at must have an explicit timezone")
+            values.append((
+                competition, season, _text(record["match_id"], "match_id"),
+                _text(record["match_url"], "match_url"), fetched_at, raw,
+                fetched_at if record["completed"] else None,
+                raw if record["completed"] else None, fetched_at, kickoff, fetched_at,
+            ))
+        if not values:
+            return
+        with self._transaction() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO fbref_control.match_report_observation AS old (
+                    competition_id, season_id, match_id, match_url,
+                    first_seen_at, first_seen_raw_key, first_completed_seen_at,
+                    first_completed_raw_key, last_seen_at, kickoff_at, kickoff_observed_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (competition_id, season_id, match_id) DO UPDATE SET
+                    first_seen_raw_key = CASE
+                        WHEN EXCLUDED.first_seen_at < old.first_seen_at
+                        THEN EXCLUDED.first_seen_raw_key
+                        ELSE old.first_seen_raw_key END,
+                    first_seen_at = LEAST(old.first_seen_at, EXCLUDED.first_seen_at),
+                    first_completed_raw_key = CASE
+                        WHEN old.first_completed_seen_at IS NULL OR
+                             EXCLUDED.first_completed_seen_at < old.first_completed_seen_at
+                        THEN COALESCE(EXCLUDED.first_completed_raw_key,
+                                      old.first_completed_raw_key)
+                        ELSE old.first_completed_raw_key END,
+                    first_completed_seen_at = LEAST(
+                        old.first_completed_seen_at, EXCLUDED.first_completed_seen_at),
+                    last_seen_at = GREATEST(old.last_seen_at, EXCLUDED.last_seen_at),
+                    kickoff_at = CASE
+                        WHEN EXCLUDED.kickoff_observed_at IS NULL THEN old.kickoff_at
+                        WHEN old.kickoff_observed_at IS NULL OR
+                             EXCLUDED.kickoff_observed_at > old.kickoff_observed_at
+                            THEN EXCLUDED.kickoff_at
+                        WHEN EXCLUDED.kickoff_observed_at = old.kickoff_observed_at
+                             AND EXCLUDED.kickoff_at IS DISTINCT FROM old.kickoff_at
+                            THEN NULL
+                        ELSE old.kickoff_at END,
+                    kickoff_observed_at = GREATEST(old.kickoff_observed_at,
+                                                  EXCLUDED.kickoff_observed_at)
+                """,
+                sorted(values, key=lambda row: row[:3]),
+            )
+
     def list_frontier_provenance(
         self,
         *,

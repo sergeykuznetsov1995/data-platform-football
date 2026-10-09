@@ -872,6 +872,33 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=11,
+        name="match_report_first_seen",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS fbref_control.match_report_observation (
+                competition_id text NOT NULL,
+                season_id text NOT NULL,
+                match_id text NOT NULL,
+                match_url text NOT NULL,
+                first_seen_at timestamptz NOT NULL,
+                first_seen_raw_key text NOT NULL,
+                first_completed_seen_at timestamptz,
+                first_completed_raw_key text,
+                last_seen_at timestamptz NOT NULL,
+                kickoff_at timestamptz,
+                kickoff_observed_at timestamptz NOT NULL,
+                PRIMARY KEY (competition_id, season_id, match_id),
+                CHECK (first_seen_at <= last_seen_at),
+                CHECK ((first_completed_seen_at IS NULL) =
+                       (first_completed_raw_key IS NULL)),
+                CHECK (first_completed_seen_at IS NULL OR
+                       first_seen_at <= first_completed_seen_at)
+            )
+            """,
+        ),
+    ),
 )
 
 

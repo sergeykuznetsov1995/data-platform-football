@@ -7,7 +7,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
@@ -23,6 +23,129 @@ from scrapers.fbref.control.store import (
 
 
 pytestmark = pytest.mark.integration
+
+
+def test_match_report_first_seen_retains_raw_proof_under_concurrent_replay(isolated_postgres_uri):
+    store = ControlStore(isolated_postgres_uri)
+    baseline = datetime(2026, 10, 7, 18, tzinfo=timezone.utc)
+
+    def observe(offset, completed):
+        store.record_match_report_observations(
+            competition_id="9", season_id="2026-2027",
+            fetched_at=baseline + timedelta(hours=offset), raw_key=f"raw/{offset}",
+            records=[{"match_id": "12345678", "match_url": "https://fbref.com/en/matches/12345678/Test",
+                      "completed": completed, "kickoff_at": baseline}],
+        )
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(observe, offset, completed)
+                   for offset, completed in [(3, True), (0, False), (2, True), (1, False)]]
+        for future in futures:
+            future.result()
+    observe(5, False)
+    observe(2, True)
+    with store._transaction() as cursor:
+        cursor.execute("SELECT * FROM fbref_control.match_report_observation")
+        row = cursor.fetchone()
+    assert row["first_seen_at"] == baseline
+    assert row["first_seen_raw_key"] == "raw/0"
+    assert row["first_completed_seen_at"] == baseline + timedelta(hours=2)
+    assert row["first_completed_raw_key"] == "raw/2"
+    assert row["last_seen_at"] == baseline + timedelta(hours=5)
+    assert row["kickoff_at"] == baseline
+
+
+def test_match_report_observation_rejects_naive_time_and_preserves_other_season(isolated_postgres_uri):
+    store = ControlStore(isolated_postgres_uri)
+    kwargs = dict(competition_id="9", season_id="2026-2027", raw_key="raw/test",
+                  records=[{"match_id": "12345678", "match_url": "https://fbref.com/en/matches/12345678/Test",
+                            "completed": True}])
+    with pytest.raises(ValueError, match="timezone"):
+        store.record_match_report_observations(**kwargs, fetched_at=datetime(2026, 10, 7))
+    store.record_match_report_observations(**kwargs, fetched_at=datetime(2026, 10, 7, tzinfo=timezone.utc))
+    kwargs["season_id"] = "2025-2026"
+    store.record_match_report_observations(**kwargs, fetched_at=datetime(2025, 10, 7, tzinfo=timezone.utc))
+    with store._transaction() as cursor:
+        cursor.execute("SELECT count(*) AS n FROM fbref_control.match_report_observation")
+        assert cursor.fetchone()["n"] == 2
+
+
+def test_daily_readiness_requires_both_generic_and_typed_completion(isolated_postgres_uri):
+    from scrapers.fbref.daily_report_reader import READINESS_SQL
+    store = ControlStore(isolated_postgres_uri)
+    stamp = datetime(2026, 10, 7, 18, tzinfo=timezone.utc)
+    snapshot_id, run_id, attempt_id, refresh_id, claim_id = [str(uuid.uuid4()) for _ in range(5)]
+    store.record_match_report_observations(
+        competition_id="9", season_id="2026-2027", fetched_at=stamp, raw_key="raw/first",
+        records=[{"match_id": "12345678", "match_url": "https://fbref.com/en/matches/12345678/Test", "completed": True}],
+    )
+    with store._transaction() as cursor:
+        cursor.execute("INSERT INTO fbref_control.registry_snapshot(snapshot_id,successful,fetched_at) VALUES (%s,true,%s)", (snapshot_id,stamp))
+        cursor.execute("""INSERT INTO fbref_control.competition_registry(
+            competition_id,canonical_url,name,gender,classification,crawl_state,
+            first_seen_at,last_seen_at,first_snapshot_id,last_snapshot_id)
+            VALUES ('9','https://fbref.com/en/comps/9/history','Premier League','male','league:club','active',%s,%s,%s,%s)""", (stamp,stamp,snapshot_id,snapshot_id))
+        cursor.execute("""INSERT INTO fbref_control.season_registry(
+            competition_id,season_id,canonical_url,is_current,first_seen_at,last_seen_at,first_snapshot_id,last_snapshot_id)
+            VALUES ('9','2026-2027','https://fbref.com/en/comps/9/2026-2027',true,%s,%s,%s,%s)""", (stamp,stamp,snapshot_id,snapshot_id))
+        cursor.execute("""INSERT INTO fbref_control.page_frontier(target_id,page_kind,canonical_url,refresh_policy)
+            VALUES ('fbref:match:12345678','match','https://fbref.com/en/matches/12345678/Test','current_completed_once')""")
+        cursor.execute("INSERT INTO fbref_control.crawl_run(run_id,run_type,request_limit,byte_limit) VALUES (%s,'current',100,5000)", (run_id,))
+        cursor.execute("""INSERT INTO fbref_control.fetch_attempt(
+            attempt_id,run_id,target_id,logical_refresh_id,attempt_number,claim_token,lease_epoch,status,http_status,content_hash,finished_at)
+            VALUES (%s,%s,'fbref:match:12345678',%s,1,%s,1,'succeeded',200,'abc',%s)""", (attempt_id,run_id,refresh_id,claim_id,stamp))
+        cursor.execute("""INSERT INTO fbref_control.fetch_attempt(
+            attempt_id,run_id,target_id,logical_refresh_id,attempt_number,claim_token,lease_epoch,status,http_status,content_hash,finished_at)
+            VALUES (%s,%s,'fbref:match:12345678',%s,1,%s,2,'succeeded',200,'earlier',%s)""",
+            (str(uuid.uuid4()), run_id, str(uuid.uuid4()), str(uuid.uuid4()), stamp - timedelta(hours=1)))
+        cursor.execute("""INSERT INTO fbref_control.dataset_manifest(target_id,content_hash,parser_version,dataset,availability,
+            parse_status,persistence_status,validation_status,completed_at)
+            VALUES ('fbref:match:12345678','abc','v1','__page__','available','succeeded','succeeded','succeeded',%s)""", (stamp,))
+        query = READINESS_SQL.format(cutoff="2026-10-09T00:00:00+00:00")
+        cursor.execute(query)
+        result = cursor.fetchone()
+        data = result[next(iter(result))]
+        assert json.loads(data)[0]["bronze_ready_at"] is None
+        assert datetime.fromisoformat(json.loads(data)[0]["first_fetch_at"]) == stamp - timedelta(hours=1)
+        cursor.execute("""INSERT INTO fbref_control.dataset_manifest(target_id,content_hash,parser_version,dataset,availability,
+            parse_status,persistence_status,validation_status,completed_at)
+            VALUES ('fbref:match:12345678','abc','v1','typed:__complete__','available','succeeded','succeeded','succeeded',%s)""", (stamp,))
+        cursor.execute(query)
+        result = cursor.fetchone()
+        assert json.loads(result[next(iter(result))])[0]["bronze_ready_at"] is not None
+
+
+def test_postponed_kickoff_uses_latest_source_read_and_old_replay_cannot_undo_it(isolated_postgres_uri):
+    store = ControlStore(isolated_postgres_uri)
+    first = datetime(2026, 10, 7, 18, tzinfo=timezone.utc)
+    def observe(read, kickoff):
+        store.record_match_report_observations(
+            competition_id="9", season_id="2026-2027", fetched_at=read, raw_key=read.isoformat(),
+            records=[{"match_id": "12345678", "match_url": "https://fbref.com/en/matches/12345678/Test",
+                      "completed": True, "kickoff_at": kickoff}],
+        )
+    observe(first, first)
+    observe(first + timedelta(days=1), first + timedelta(days=1))
+    observe(first, first)
+    with store._transaction() as cursor:
+        cursor.execute("SELECT * FROM fbref_control.match_report_observation")
+        row = cursor.fetchone()
+        assert row["first_seen_at"] == first
+        assert row["kickoff_at"] == first + timedelta(days=1)
+    observe(first + timedelta(days=1), first + timedelta(days=2))
+    with store._transaction() as cursor:
+        cursor.execute("SELECT kickoff_at FROM fbref_control.match_report_observation")
+        assert cursor.fetchone()["kickoff_at"] is None
+    observe(first + timedelta(days=2), first + timedelta(days=2))
+    with store._transaction() as cursor:
+        cursor.execute("SELECT kickoff_at FROM fbref_control.match_report_observation")
+        assert cursor.fetchone()["kickoff_at"] == first + timedelta(days=2)
+    observe(first + timedelta(days=3), None)
+    observe(first + timedelta(days=2), first + timedelta(days=2))
+    with store._transaction() as cursor:
+        cursor.execute("SELECT kickoff_at,kickoff_observed_at FROM fbref_control.match_report_observation")
+        row = cursor.fetchone()
+        assert row["kickoff_at"] is None
+        assert row["kickoff_observed_at"] == first + timedelta(days=3)
 
 
 def _postgres_uri() -> str:

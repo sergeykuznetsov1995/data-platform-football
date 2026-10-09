@@ -1,0 +1,32 @@
+--- a/morning_report.py
++++ b/morning_report.py
+@@ -1767,6 +1767,20 @@
+     out = run(f"docker exec postgres psql -U airflow -d airflow -tAc \"{sql}\"", timeout=30)
+     rows = [r.strip() for r in out.splitlines() if r.strip()]
+     return rows[0] if rows else None
++
++
++def fbref_daily_measurement():
++    root = Path(os.environ.get("FBREF_DAILY_REPORT_ROOT", "/root/data-platform-football/.local/releases/fbref-1323"))
++    adapter = root / "deploy/fbref/morning_report_adapter.py"
++    if not adapter.is_file():
++        return ["• FBref #1323: измеритель ещё не доставлен ⚠️"]
++    try:
++        spec = importlib.util.spec_from_file_location("fbref_daily_report_adapter", adapter)
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module.fbref_daily_report()
++    except Exception:
++        return ["• FBref #1323: отчёт недоступен; приёмка не подтверждена ⚠️"]
+
+
+ def fbref_idle():
+@@ -3867,7 +3881,7 @@
+         "🔵 ESPN:", *espn_section(),
+         "🟤 Transfermarkt:", *transfermarkt_daily(), *transfermarkt_kib_per_request(),
+         "🟤 ClubElo:", *clubelo_section(),
+-        "🟠 FBref:", *fbref_idle(),
++        "🟠 FBref:", *fbref_idle(), *fbref_daily_measurement(),
+         "🔴 Красные раны за 24ч:", *red_runs(),
+         "🎭 Зелёное врёт:", *green_lies(),
+         "⏸ На паузе:", *paused(),
