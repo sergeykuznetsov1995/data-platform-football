@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 import json
 import hashlib
 import os
@@ -42,8 +43,11 @@ from utils.transfermarkt_backfill_runtime import (
     BACKFILL_DAG_ID,
     BackfillRuntimeError,
     BackfillStateRepository,
+    validate_fresh_registry_snapshot,
     build_campaign_from_registry,
     claim_and_plan,
+    historical_targets_from_registry,
+    existing_batch_requires_paid_io,
     plan_existing_batch,
     read_promoted_registry,
     select_recoverable_batch,
@@ -226,6 +230,7 @@ def _environment_for_scope(
         "TM_READER_REVISION": str(int(preflight["revision"])),
         "TM_CANDIDATE_SLOT": str(preflight["candidate_slot"]),
         "TM_WRITE_MODE": "native-only",
+        "TM_HISTORY_CURRENT_QUALIFICATION_SHA256": str(preflight.get("current_qualification_sha256", "")),
         "TM_PARSER_VERSION": "v2",
         "TM_SCHEMA_VERSION": "2",
         "TM_APPROVAL_MODE": "standing_policy",
@@ -285,6 +290,7 @@ def _render_planned_environments(
     persisted_attempt_ids = {item.attempt_id for item in attempts}
     if tuple(item["scope_id"] for item in payloads) != batch.scope_ids:
         raise AirflowException("mapped plan differs from durable batch membership")
+    policy_hash = batch.policy_sha256 or campaign.policy_sha256
     planned_environments: list[dict[str, str]] = []
     for payload in payloads:
         scope_id = str(payload["scope_id"])
@@ -317,9 +323,26 @@ def _render_planned_environments(
                 raise AirflowException(
                     f"{scope_id}: local attempt fence is invalid"
                 ) from exc
+        if not forced_finalize and not local_result and batch.stream_id is not None:
+            from utils.transfermarkt_history_circuit import HistoryTransportCircuit
+            circuit = HistoryTransportCircuit()
+            stream_id = (batch.scope_stream_ids or {}).get(scope_id, batch.stream_id)
+            if not circuit.authorized(stream_id, owner=batch.batch_id, now=now):
+                allowed, probe, retry_at = circuit.admit(stream_id, now=now)
+                if batch.recovery_probe and allowed and probe:
+                    allowed, _, retry_at = circuit.admit(stream_id, now=now, reserve=True, owner=batch.batch_id)
+                else:
+                    allowed = False
+                if not allowed:
+                    _publish_next_poll(ti, now=now, idle=True)
+                    if retry_at is not None:
+                        ti.xcom_push(key="next_poll_at", value=retry_at.isoformat())
+                    return []
+        payload = dict(payload)
+        payload["stream_id"] = (batch.scope_stream_ids or {}).get(scope_id, batch.stream_id or "history-0")
         planned_environments.append(_environment_for_scope(
             payload=payload,
-            preflight=preflight,
+            preflight={**preflight, **(batch.scope_writer_pins or {}).get(scope_id, {})},
             policy_hash=policy_hash,
             run_id=run_id,
             batch_id=batch.batch_id,
@@ -338,6 +361,10 @@ def _render_planned_environments(
                 in persisted_attempt_ids
             ),
         ))
+        planned_environments[-1]["TM_STREAM_ID"] = payload["stream_id"]
+        planned_environments[-1]["TM_HISTORY_RECOVERY_PROBE"] = "true" if batch.recovery_probe else "false"
+        if batch.standing_policy is not None:
+            planned_environments[-1]["TM_BACKFILL_BATCH_POLICY_JSON"] = state.canonical_json(batch.standing_policy)
     return planned_environments
 
 
@@ -399,32 +426,14 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
         with BackfillStateRepository.connect() as repository:
             repository.ensure_schema()
             campaign = repository.open_campaign()
-            if campaign is None:
-                rows = read_promoted_registry()
-                campaign = build_campaign_from_registry(
-                    rows,
-                    policy_sha256=policy.policy_hash,
-                    now=now,
-                    previous_campaigns=repository.load_campaigns(),
-                )
-                if campaign is None:
-                    _publish_next_poll(ti, now=now, idle=True)
-                    return []
-                campaign, scopes = repository.initialise_campaign(campaign)
-            elif campaign.status.value == "waiting_prerequisite":
+            if campaign is not None and campaign.status.value == "waiting_prerequisite":
                 campaign, scopes = repository.resume_waiting_campaign(campaign)
-            else:
+            elif campaign is not None:
                 scopes = repository.load_scopes(campaign.campaign_id)
-
-            if not _compatible_backfill_policy(policy, campaign.policy_sha256):
-                _publish_next_poll(ti, now=now, scopes=scopes, idle=True)
-                raise BackfillRuntimeError(
-                    "standing policy changed during the frozen campaign; "
-                    "the campaign remains blocked from paid I/O"
-                )
-
+            else:
+                scopes = ()
             incident_batch = None
-            if campaign.status in {
+            if campaign is not None and campaign.status in {
                 state.CampaignStatus.ACTIVE,
                 state.CampaignStatus.BLOCKED_PLATFORM,
             }:
@@ -432,7 +441,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
                     campaign,
                     now=now,
                 )
-            if campaign.status is state.CampaignStatus.BLOCKED_PLATFORM:
+            if campaign is not None and campaign.status is state.CampaignStatus.BLOCKED_PLATFORM:
                 if params.get("resume_platform_block") is not True:
                     _publish_next_poll(ti, now=now, scopes=scopes, idle=True)
                     repository.reconcile_platform_block(campaign, now=now)
@@ -448,30 +457,90 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
                 )
                 if incident_batch is not None:
                     resumed_incident_batch_id = resumed_batch.batch_id
-            rows = read_promoted_registry(
-                registry_snapshot_id=campaign.registry_snapshot_id,
-            )
+            recoverable = (select_recoverable_batch(campaign, scopes, repository.load_batches(campaign.campaign_id))
+                           if campaign is not None and campaign.status is state.CampaignStatus.ACTIVE else None)
+            if recoverable is None and (campaign is None or campaign.status is state.CampaignStatus.ACTIVE):
+                # Append-only queue: read latest promotion at EVERY new batch boundary.
+                latest_rows = validate_fresh_registry_snapshot(read_promoted_registry(), now=now)
+                delta = build_campaign_from_registry(latest_rows, policy_sha256=policy.policy_hash,
+                                                     now=now, previous_campaigns=repository.load_campaigns())
+                if delta is not None:
+                    repository.initialise_campaign(delta)
+                blocked_scope_ids = repository.register_season_handoffs(latest_rows, now=now)
+                available_ids = {target.scope_id for target in historical_targets_from_registry(latest_rows)} - blocked_scope_ids
+                campaign = repository.select_queue_campaign(now=now, allowed_ids=available_ids)
+                if campaign is None:
+                    _publish_next_poll(ti, now=now, idle=True)
+                    return []
+                scopes = repository.load_scopes(campaign.campaign_id)
+
             batches = repository.load_batches(campaign.campaign_id)
             batch = select_recoverable_batch(campaign, scopes, batches)
+            rows = (read_promoted_registry(registry_snapshot_id=batch.registry_snapshot_id or campaign.registry_snapshot_id)
+                    if batch is not None else latest_rows)
+            from utils.transfermarkt_history_authority import validate_batch_policy
+            from utils.transfermarkt_approval import StandingPolicy
             if batch is not None:
-                if (
-                    batch.status.value in {"claimed", "running"}
-                    and batch.batch_id != resumed_incident_batch_id
-                ):
-                    scopes = repository.recover_batch_claim(
-                        batch,
-                        scopes,
-                        lease_owner=f"{BACKFILL_DAG_ID}:{run_id}",
-                        now=now,
-                    )
-                payloads = plan_existing_batch(
-                    campaign,
-                    batch,
-                    registry_rows=rows,
-                    run_id=run_id,
-                    now=now,
-                )
+                payloads = plan_existing_batch(campaign, batch, registry_rows=rows, run_id=run_id, now=now)
+                attempts = repository.load_attempts(campaign.campaign_id)
+                needs_paid = existing_batch_requires_paid_io(campaign, batch, scopes, attempts, payloads)
+                if needs_paid:
+                    try:
+                        if batch.standing_policy is None and campaign.policy_sha256 != policy.policy_hash:
+                            raise BackfillRuntimeError("legacy batch requires its original standing policy for replay")
+                        bound_policy = StandingPolicy(**batch.standing_policy) if batch.standing_policy else policy
+                        validate_batch_policy(bound_policy, policy, write_mode="native-only",
+                                              cycle_budget_bytes=SCOPE_HARD_PROVIDER_BYTE_CAP,
+                                              request_limit=SCOPE_REQUEST_LIMIT, retry_limit=SCOPE_RETRY_LIMIT)
+                    except Exception as policy_error:
+                        # Keep incomplete paid capture, original batch and exact
+                        # checkpoints visible. Other eligible queue entries may run;
+                        # this scope is not falsely declared complete or reset.
+                        import logging
+                        logging.getLogger(__name__).error("historical batch waiting_policy %s: %s", batch.batch_id, type(policy_error).__name__)
+                        held = batch.transition(state.BatchStatus.WAITING_POLICY, now=now)
+                        repository.persist_batch_transition(batch, held)
+                        _publish_next_poll(ti, now=now, idle=True)
+                        return []
+                if (batch.status.value in {"claimed", "running"}
+                        and batch.batch_id != resumed_incident_batch_id):
+                    scopes = repository.recover_batch_claim(batch, scopes,
+                        lease_owner=f"{BACKFILL_DAG_ID}:{run_id}", now=now)
             else:
+                from utils.transfermarkt_history_circuit import HistoryTransportCircuit
+                circuit = HistoryTransportCircuit()
+                stream_id = None
+                stream_ids = []
+                recovery_probe = False
+                retry_times = []
+                for candidate in preflight.get("history_stream_ids", ()):
+                    allowed, probe, retry_at = circuit.admit(candidate, now=now)
+                    if allowed and probe:
+                        stream_id, recovery_probe = candidate, True
+                        stream_ids = [candidate]
+                        break
+                    if allowed:
+                        stream_ids.append(candidate)
+                    if retry_at is not None:
+                        retry_times.append(retry_at)
+                if not recovery_probe and stream_ids:
+                    stream_id = stream_ids[0]
+                if stream_id is None:
+                    _publish_next_poll(ti, now=now, idle=True)
+                    if retry_times:
+                        ti.xcom_push(key="next_poll_at", value=min(retry_times).isoformat())
+                    return []
+                capture_snapshot_ids = {}
+                writer_pins = {}
+                for prior in sorted(batches, key=lambda item: item.claimed_at):
+                    for scope_id in prior.scope_ids:
+                        if prior.scope_writer_pins and scope_id in prior.scope_writer_pins:
+                            writer_pins.setdefault(scope_id, prior.scope_writer_pins[scope_id])
+                        capture_snapshot_ids.setdefault(scope_id, (prior.scope_registry_snapshot_ids or {}).get(
+                            scope_id, prior.registry_snapshot_id or campaign.registry_snapshot_id))
+                for scope in scopes:
+                    writer_pins.setdefault(scope.target.scope_id, {"revision": int(preflight["revision"]),
+                                                                "candidate_slot": str(preflight["candidate_slot"])})
                 claim, payloads = claim_and_plan(
                     campaign,
                     scopes,
@@ -479,8 +548,21 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
                     run_id=run_id,
                     lease_owner=f"{BACKFILL_DAG_ID}:{run_id}",
                     now=now,
-                    limit=limit,
+                    limit=1 if recovery_probe else limit,
+                    standing_policy=policy.payload(),
+                    stream_id=stream_id,
+                    stream_ids=stream_ids,
+                    blocked_scope_ids=blocked_scope_ids | {scope_id for previous in batches
+                        if previous.status is state.BatchStatus.WAITING_POLICY for scope_id in previous.scope_ids},
+                    capture_snapshot_ids=capture_snapshot_ids,
+                    scope_writer_pins=writer_pins,
+                    recovery_probe=recovery_probe,
                 )
+                if recovery_probe and claim.batch is not None:
+                    allowed, _, _ = circuit.admit(stream_id, now=now, reserve=True, owner=claim.batch.batch_id)
+                    if not allowed:
+                        _publish_next_poll(ti, now=now, idle=True)
+                        return []
                 # The batch MERGE is the first durable claim mutation.  Keep
                 # its identity before persistence so a later scope-CAS/readback
                 # failure can be bound to an incident instead of replayed.
@@ -515,7 +597,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
             attempts=attempts,
             payloads=payloads,
             preflight=preflight,
-            policy_hash=campaign.policy_sha256,
+            policy_hash=batch.policy_sha256 or campaign.policy_sha256,
             run_id=run_id,
         )
     except Exception as exc:
@@ -559,7 +641,7 @@ def _finalize_historical_batch(**context: Any) -> dict[str, Any]:
 with DAG(
     dag_id=BACKFILL_DAG_ID,
     default_args={**SCRAPER_ARGS, 'pool': BACKFILL_CONTROL_POOL},
-    description="Continuous frozen-snapshot Transfermarkt historical Bronze backfill",
+    description="Continuous versioned-batch Transfermarkt historical Bronze backfill",
     schedule=TransfermarktCurrentTimetable() if TransfermarktCurrentTimetable is not None else '@continuous',
     start_date=datetime(2026, 7, 21),
     catchup=False,
@@ -584,8 +666,9 @@ with DAG(
         ),
     },
     doc_md="""
-    Historical senior-men scopes only. A campaign freezes one fresh promoted
-    registry snapshot and is drained in batches of at most eight. Every paid
+    Historical senior-men scopes only. New batches reread the latest promoted
+    registry and append newly eligible editions without changing original proofs.
+    Each batch freezes its standing policy and capture identities. Every paid
     attempt is raw-first, uses the dedicated backfill proxy pool/quota, writes
     Native Bronze only, and is finalized with snapshot-pinned DQ. The DAG never
     triggers Silver; current editions remain owned by dag_ingest_transfermarkt.

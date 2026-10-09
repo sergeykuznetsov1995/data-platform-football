@@ -673,7 +673,18 @@ def _enforce_standing_policy(
     expected_hash = _required(
         args.standing_policy_sha256, 'standing_policy_sha256',
     )
-    if not standing_policy_hash_compatible(policy, expected_hash):
+    historical_bound = False
+    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt' and os.environ.get('TM_BACKFILL_BATCH_POLICY_JSON'):
+        from utils.transfermarkt_history_authority import validate_batch_policy
+        bound = StandingPolicy(**json.loads(os.environ['TM_BACKFILL_BATCH_POLICY_JSON']))
+        validate_batch_policy(bound, policy, write_mode=args.write_mode,
+                              cycle_budget_bytes=int(args.cycle_budget_bytes),
+                              request_limit=int(args.request_limit), retry_limit=int(args.retry_limit))
+        policy = bound
+        historical_bound = True
+
+    if (policy.policy_hash != expected_hash if historical_bound
+            else not standing_policy_hash_compatible(policy, expected_hash)):
         raise ApprovalDriftError(
             'standing policy content differs from the pinned sha256'
         )

@@ -67,6 +67,7 @@ def _validated_manifest(
     parent_cycle_id: str | None = None,
     child_cycle_id: str | None = None,
     capture_revision: str | None = None,
+    registry_snapshot_id: str | None = None,
 ) -> ScopeManifest:
     manifest = ScopeManifest.from_mapping(value)
     manifest.validate(tm_v2.NATIVE_ENTITIES)
@@ -84,7 +85,7 @@ def _validated_manifest(
         "edition_id": scope.target.edition_id,
         "canonical_competition_id": scope.target.canonical_competition_id,
         "canonical_season": scope.target.canonical_season,
-        "registry_snapshot_id": campaign.registry_snapshot_id,
+        "registry_snapshot_id": registry_snapshot_id or campaign.registry_snapshot_id,
         "parser_revision": "v2",
         "schema_revision": "2",
     }
@@ -111,6 +112,7 @@ def _manifest(
     parent_cycle_id: str,
     child_cycle_id: str,
     capture_revision: str,
+    registry_snapshot_id: str | None = None,
 ) -> ScopeManifest:
     return _validated_manifest(
         _load_object(path),
@@ -120,6 +122,7 @@ def _manifest(
         parent_cycle_id=parent_cycle_id,
         child_cycle_id=child_cycle_id,
         capture_revision=capture_revision,
+        registry_snapshot_id=registry_snapshot_id,
     )
 
 
@@ -132,6 +135,7 @@ def _persisted_manifest(
     parent_cycle_id: str | None = None,
     child_cycle_id: str | None = None,
     capture_revision: str | None = None,
+    registry_snapshot_id: str | None = None,
 ) -> ScopeManifest:
     if scope.scope_manifest_uri is None or scope.scope_manifest_sha256 is None:
         raise BackfillFinalizeError("captured scope lacks a durable manifest")
@@ -146,6 +150,7 @@ def _persisted_manifest(
         parent_cycle_id=parent_cycle_id,
         child_cycle_id=child_cycle_id,
         capture_revision=capture_revision,
+        registry_snapshot_id=registry_snapshot_id,
     )
 
 
@@ -343,6 +348,13 @@ def _persist_platform_attempt(
         error_message=None,
     )
     transition = repository.persist_attempt(blocked_campaign, scope, attempt)
+    if batch.recovery_probe:
+        from utils.transfermarkt_history_circuit import HistoryTransportCircuit
+        stream = (batch.scope_stream_ids or {}).get(scope.target.scope_id, batch.stream_id)
+        if stream:
+            HistoryTransportCircuit().feedback(stream, attempt_id=attempt.attempt_id,
+                scope_id=scope.target.scope_id, transport_error=False, recovery_valid=False,
+                now=attempt.finished_at)
     return transition.campaign, transition.scope, blocked_batch
 
 
@@ -551,7 +563,7 @@ def _verify_completed_batch_evidence(
     expected = {
         "campaign_id": campaign.campaign_id,
         "batch_id": batch.batch_id,
-        "registry_snapshot_id": campaign.registry_snapshot_id,
+        "registry_snapshot_id": batch.registry_snapshot_id or campaign.registry_snapshot_id,
         "snapshot_ids": dict(sorted(batch.snapshot_pins.items())),
         "passed": True,
     }
@@ -623,6 +635,7 @@ def _verify_completed_batch_evidence(
                     state.AttemptOutcome.SOURCE_ERROR,
                     state.AttemptOutcome.UNAVAILABLE_CONFIRMATION,
                     state.AttemptOutcome.CONTINUATION,
+                    state.AttemptOutcome.TRANSPORT_ERROR,
                 }
                 for attempt in attempts_by_scope.get(
                     str(item.get("scope_id") or ""), ()
@@ -651,7 +664,8 @@ def _verify_completed_batch_evidence(
             manifest = _persisted_manifest(
                 artifact_store,
                 scope,
-                policy_sha256=campaign.policy_sha256,
+                policy_sha256=batch.policy_sha256 or campaign.policy_sha256,
+                registry_snapshot_id=(batch.scope_registry_snapshot_ids or {}).get(scope.target.scope_id, batch.registry_snapshot_id or campaign.registry_snapshot_id),
                 campaign=campaign,
                 parent_cycle_id=batch.batch_id,
             )
@@ -664,6 +678,23 @@ def _verify_completed_batch_evidence(
                 raise BackfillFinalizeError(
                     "complete batch manifest cycle differs from raw evidence"
                 )
+
+
+def _probe_has_verified_response(batch, attempt, raw_store):
+    """A partial probe needs one NEW paid response, never cached old raw."""
+    if not batch.recovery_probe:
+        return True
+    fresh = []
+    for envelope_id in attempt.raw_evidence_ids:
+        envelope = raw_store.load_attempt_envelope(envelope_id)
+        stamp = datetime.fromisoformat(str(envelope.fetched_at).replace("Z", "+00:00"))
+        if stamp >= batch.claimed_at:
+            fresh.append(envelope)
+    semantic_response = (attempt.outcome is state.AttemptOutcome.CAPTURED
+                         or attempt.outcome.value == "continuation"
+                         or str(attempt.error_class or "").startswith("http_"))
+    return (semantic_response and len(fresh) == 1 and fresh[0].outcome_kind == "response"
+            and fresh[0].capture_id is not None and fresh[0].status_code is not None)
 
 
 def finalize_backfill_batch(
@@ -696,7 +727,8 @@ def finalize_backfill_batch(
             str(item.get("TM_STANDING_POLICY_SHA256") or "")
             for item in planned_environments
         }
-        if policy_hashes != {campaign.policy_sha256}:
+        batch = repository.load_batch(batch_id)
+        if policy_hashes != {batch.policy_sha256 or campaign.policy_sha256}:
             raise BackfillFinalizeError(
                 "mapped authorization differs from frozen campaign policy"
             )
@@ -815,19 +847,10 @@ def finalize_backfill_batch(
                     campaign = transition.campaign
                     current = transition.scope
                 else:
-                    if environment.get("TM_BACKFILL_FINALIZE_ONLY") == "true":
-                        campaign, current, batch = _persist_platform_attempt(
-                            repository,
-                            campaign=campaign,
-                            batch=batch,
-                            scope=previous,
-                            artifact_store=artifact_store,
-                            now=now,
-                            phase="finalize_only_missing_attempt",
-                            error_class="missing_persisted_attempt_for_finalize_only",
-                        )
-                        scopes[scope_id] = current
-                        return _blocked_result(campaign_id, batch_id)
+                    # finalize_only forbids source replay in the Bash task; local
+                    # immutable evidence can legitimately precede ops attempt MERGE.
+                    # Collect and validate that exact result below, even if the
+                    # attempt journal has not yet been persisted.
                     paths = payload.get("result_paths")
                     if not isinstance(paths, Mapping):
                         raise BackfillFinalizeError(f"{scope_id}: result_paths is invalid")
@@ -865,7 +888,8 @@ def finalize_backfill_batch(
                             assert classified.manifest_path is not None
                             manifest = _manifest(
                                 classified.manifest_path,
-                                policy_sha256=campaign.policy_sha256,
+                                policy_sha256=batch.policy_sha256 or campaign.policy_sha256,
+                                registry_snapshot_id=(batch.scope_registry_snapshot_ids or {}).get(scope_id, batch.registry_snapshot_id or campaign.registry_snapshot_id),
                                 campaign=campaign,
                                 scope=previous,
                                 parent_cycle_id=batch.batch_id,
@@ -952,6 +976,13 @@ def finalize_backfill_batch(
                 current = previous
 
             scopes[scope_id] = current
+            if (batch.stream_id is not None or batch.scope_stream_ids) and accounted_attempt.outcome is not state.AttemptOutcome.PLATFORM_ERROR:
+                from utils.transfermarkt_history_circuit import HistoryTransportCircuit
+                HistoryTransportCircuit().feedback(
+                    (batch.scope_stream_ids or {}).get(scope_id, batch.stream_id), attempt_id=accounted_attempt.attempt_id, scope_id=scope_id,
+                    transport_error=accounted_attempt.outcome is state.AttemptOutcome.TRANSPORT_ERROR,
+                    now=accounted_attempt.finished_at,
+                    recovery_valid=_probe_has_verified_response(batch, accounted_attempt, raw_store))
             if accounted_attempt.outcome is state.AttemptOutcome.PLATFORM_ERROR:
                 if batch.open_platform_incident_id is None:
                     raise BackfillFinalizeError(
@@ -963,7 +994,8 @@ def finalize_backfill_batch(
                     manifest = manifest or _persisted_manifest(
                         artifact_store,
                         current,
-                        policy_sha256=campaign.policy_sha256,
+                        policy_sha256=batch.policy_sha256 or campaign.policy_sha256,
+                        registry_snapshot_id=(batch.scope_registry_snapshot_ids or {}).get(scope_id, batch.registry_snapshot_id or campaign.registry_snapshot_id),
                         campaign=campaign,
                         parent_cycle_id=batch.batch_id,
                         child_cycle_id=str(payload["child_cycle_id"]),
@@ -1083,7 +1115,7 @@ def finalize_backfill_batch(
                 repository.cursor,
                 campaign_id=campaign_id,
                 batch_id=batch_id,
-                registry_snapshot_id=campaign.registry_snapshot_id,
+                registry_snapshot_id=batch.registry_snapshot_id or campaign.registry_snapshot_id,
                 manifests=[item[1] for item in captured],
                 child_cycle_ids=[
                     str(payload["child_cycle_id"]) for payload in payloads

@@ -1377,3 +1377,25 @@ def test_legacy_retry_sidecar_and_modern_chain_corruption_refused(offline, mutat
     assert report['scopes'][0]['status'] == 'failed'
     assert offline.calls == [] and len(offline.writes) == writes
     assert next(iter(offline.state()['scopes'].values()))['roster_write_intent']
+
+
+def test_season_rollover_captures_old_roster_once_before_history_handoff(offline):
+    offline.run('cold')
+    offline.calls.clear()
+    competition = _competition('GB1')
+    rows = [_joined_row(competition, _edition('GB1', '2026', current=False)),
+            _joined_row(competition, _edition('GB1', '2027', current=True))]
+    report = current.run_current_portion(
+        rows, {'paid_io_allowed': True, 'write_mode': 'dual', 'revision': 1}, 'close',
+        denominator_rows=[{'competition_id': 'GB1', 'live': True, 'competition_class': 'core_club', 'tier': 1}],
+        state_dir=offline.root / 'state', qualification=offline.qualification,
+        max_seconds=2400, max_scopes=1, scraper_factory=offline.factory,
+        roster_writer=offline.roster_writer, career_writer=offline.career_writer, coach_writer=offline.coach_writer,
+        now_fn=lambda: offline.clock.wall, monotonic_fn=lambda: offline.clock.elapsed)
+    assert report['scopes'][0]['kind'] == 'season_close'
+    assert report['scopes'][0].get('historical_handoff') is True
+    from scrapers.transfermarkt.registry import deterministic_scope_id
+    assert report['scopes'][0]['scope_id'] == deterministic_scope_id('GB1', '2026')
+    assert len([url for _, url in offline.calls if '/kader/' in url]) == 2
+    assert not offline.state()['season_closures']
+    assert any("'complete'" in sql and 'transfermarkt_season_close_v1' in sql for sql in offline.sql)

@@ -346,6 +346,11 @@ def _authorize_write_mode(write_mode: str, expected_revision: int) -> Dict[str, 
         from dags.utils import transfermarkt_native_v2 as control
 
     revision = int(expected_revision)
+    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+        from utils.transfermarkt_backfill_runtime import BackfillStateRepository
+        from utils.transfermarkt_history_authority import authorize_historical_writer
+        with BackfillStateRepository.connect() as repository:
+            return authorize_historical_writer(repository, environment=os.environ, write_mode=write_mode)
     conn = control.connect()
     cur = conn.cursor()
     try:
@@ -2429,6 +2434,8 @@ def _save_frames(
     force_replace: bool,
     results: Dict[str, Any],
 ) -> None:
+    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+        _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
     with writer_lock():
         path = getattr(scraper, '_tm_career_intent_path', None)
         if path is not None:
