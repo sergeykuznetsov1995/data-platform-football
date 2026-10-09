@@ -1,12 +1,13 @@
-"""Разрешённое отставание общих модулей в бою для автомата Understat (#1594).
+"""Точные совместимые версии общих модулей для автомата Understat.
 
-Автомат `deploy/understat/auto_deliver.sh` пускает доставку, когда `dags/utils/alerts.py`,
-`dags/utils/config.py`, `dags/utils/medallion_config.py` в бою равны разрешённым версиям
-(ALLOWED_LAG; все три — из принятой базы 8b61969). Это безопасно, пока ВСЁ, что Understat берёт
-из этих модулей, одинаково в master и в разрешённой версии. Understat берёт:
-`telegram_on_failure` из alerts.py (через utils.default_args); `DAG_TAGS["understat"]`,
-`SCHEDULES[*understat*]`, `UNDERSTAT_LEAGUES` из config.py; из medallion_config.py — ничего.
-Падает — master разошёлся в том, чем пользуется Understat: убрать/пересмотреть ALLOWED_LAG.
+ALLOWED_LAG содержит конечные git-blob pins, произвольные версии запрещены.
+Understat берёт telegram_on_failure из alerts и проверенные константы config.
+Из medallion_config код Understat ничего не импортирует (транзитивная проверка).
+ProxyManager импортируется базовым классом, но штатный native transport не
+создаёт proxy pool; поведенческий tripwire ловит изменение этого условия.
+
+Замена medallion pin и добавление proxy pin проверены на копиях боевых модулей.
+Новый потребитель medallion или common proxy API требует пересмотра исключения.
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ AUTO = ROOT / "deploy" / "understat" / "auto_deliver.sh"
 LAG = {
     "dags/utils/alerts.py": "30c4988a7cf742d67974a9be126e0bfc829b9008",
     "dags/utils/config.py": "221a12711ca7651274d22e3539a4b3b20b7284bf",
-    "dags/utils/medallion_config.py": "697fe43d6eb46e49c4246780f2cba59fabf87e4d",
+    "dags/utils/medallion_config.py": "8b52267bf748ffa3bb0156a89c97774e14c19c91",
+    "scrapers/utils/proxy_manager.py": "01c904cbbef5f5d694648d97d13baa5431233c5a",
 }
 # Хеш замыкания telegram_on_failure в alerts.py blob 30c4988a (0caf6bca^, до #1477).
 ALERTS_PINNED = "fe0c8ab93ff3897e5dd10a7e9860bff2cb9e93094eb3cd4759b7931cc6b1d7b1"
@@ -112,7 +114,7 @@ def package_of(f: Path) -> list[str]:
 
 
 def taken_by(start: list[Path]) -> dict[str, set[str]]:
-    """Имена, которые код, достижимый импортами из start, берёт из трёх отстающих модулей.
+    """Имена, которые код, достижимый импортами из start, берёт из трёх dags-модулей.
 
     Обход транзитивный по файлам первой стороны, включая ленивые импорты и __init__.py пакетов.
     Импорт отстающего модуля объектом (`from utils import alerts`, `import utils.alerts`) — имя «*»:
@@ -231,3 +233,28 @@ def test_taken_by_follows_transitive_lazy_and_module_object_imports(tmp_path, mo
         got = taken_by([f])
         for mod, names in want.items():
             assert names <= got[mod], (src, got)
+
+def test_native_default_transport_does_not_create_common_proxy_pool(monkeypatch, tmp_path):
+    """The production facade uses its native session; legacy proxy APIs are unused."""
+    import requests
+    from scrapers.understat.scraper import UnderstatScraper
+    from scrapers.utils.proxy_manager import ProxyManager
+
+    class NoNetworkSession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("compatibility check must not request the source")
+
+    def forbidden_pool(*_args, **_kwargs):
+        raise AssertionError("Understat default transport started using common proxy APIs")
+
+    monkeypatch.setattr(ProxyManager, "__init__", forbidden_pool)
+    monkeypatch.setattr(requests, "Session", NoNetworkSession)
+    monkeypatch.setattr("scrapers.base.base_scraper.IcebergWriter", lambda: object())
+    scraper = UnderstatScraper(
+        leagues=["ENG-Premier League"], seasons=["2627"], cache_dir=tmp_path
+    )
+    assert scraper._proxy_manager is None
+    assert isinstance(scraper.client.session, NoNetworkSession)
