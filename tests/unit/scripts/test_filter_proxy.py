@@ -10337,6 +10337,242 @@ def _tm_metadata(dag_id="dag_ingest_transfermarkt"):
     }
 
 
+def test_transfermarkt_reserved_streams_survive_restart_and_lease_rotation(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+    clock = [0.0]
+    path = str(tmp_path / 'streams.json')
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=path,
+        clock=lambda: clock[0])
+
+    def request(stream, request_id):
+        return controller.request(stream_id=stream,
+            traffic_class='transfermarkt' if stream == 'current-0' else 'transfermarkt_backfill',
+            dag_id='dag_ingest_transfermarkt' if stream == 'current-0' else 'dag_backfill_transfermarkt',
+            run_id='run', request_id=request_id)
+
+    clock[0] = 5
+    first = request('history-0', 'old-lease')
+    assert first.granted
+    assert request('current-0', 'current').granted
+    clock[0] = 6
+    assert not request('history-0', 'renewed-lease').granted
+    clock[0] = 7
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=path,
+        clock=lambda: clock[0])
+    assert not request('history-0', 'after-restart').granted
+    clock[0] = 12
+    assert request('history-0', 'after-restart').granted
+
+
+def test_transfermarkt_site_feedback_requires_consumed_stream_permit(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=str(tmp_path / 'rate.json'),
+        clock=lambda: clock[0])
+    context = dict(stream_id='history-0', traffic_class='transfermarkt_backfill',
+                   dag_id='dag_backfill_transfermarkt', run_id='run', request_id='first')
+    clock[0] = 5
+    decision = controller.request(**context)
+    with pytest.raises(shared_mod.TransfermarktPermitError):
+        controller.report_block(stream_id='history-0', permit_id=decision.permit_id,
+                                status=403, challenge=False)
+    controller.consume(**context, permit_id=decision.permit_id, permit_token=decision.permit_token)
+    controller.report_block(stream_id='history-0', permit_id=decision.permit_id,
+                            status=403, challenge=False)
+    assert controller.rate.slow['history-0'] == 1805
+    assert controller.rate.slow['current-0'] == 0
+    # Repeated feedback cannot manufacture a series of three site failures.
+    for _ in range(3):
+        controller.report_block(stream_id='history-0', permit_id=decision.permit_id,
+                                status=403, challenge=False)
+    assert controller.rate.pause['history-0'] == 0
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
+    assert restarted.rate.slow['history-0'] == 1805
+
+
+def test_transfermarkt_stream_slots_and_exits_do_not_steal_current(shared_mod, monkeypatch, tmp_path):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path,
+                            ['--transfermarkt-history-streams', '2'])
+    mgr = _FakeManager(['http://u:p@pool.invalid:10000',
+                        'http://u:p@pool.invalid:10001',
+                        'http://u:p@pool.invalid:10002',
+                        'http://u:p@pool.invalid:10003'])
+    shared_mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = mgr
+    history = []
+    for i in range(2):
+        history.append(shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60,
+            metadata={**_tm_metadata('dag_backfill_transfermarkt'), 'stream_id': f'history-{i}'}))
+    current = shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60,
+                                     metadata=_tm_metadata())
+    assert current.stream_id == 'current-0'
+    assert len({lease.upstream for lease in (*history, current)}) == 3
+    with pytest.raises(RuntimeError, match='concurrency'):
+        shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60,
+                                metadata=_tm_metadata('dag_backfill_transfermarkt'))
+    # Rotate an exhausted history lease; stream's rate identity is unchanged.
+    history[0].closed = True
+    replacement = shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60,
+        metadata={**_tm_metadata('dag_backfill_transfermarkt'), 'stream_id': 'history-0'})
+    assert replacement.stream_id == history[0].stream_id
+    assert replacement.upstream not in {current.upstream, history[1].upstream}
+
+
+def test_transfermarkt_dead_or_occupied_exit_is_never_reissued(shared_mod, monkeypatch, tmp_path):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    mgr = _FakeManager(['http://u:p@pool.invalid:10000', 'http://u:p@pool.invalid:10001'])
+    shared_mod._mark_exit_dead(('pool.invalid', 10000, 'u', 'p'))
+    lease = shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60,
+                                    metadata=_tm_metadata())
+    assert lease.upstream[1] == 10001
+    with pytest.raises(RuntimeError, match='unoccupied live'):
+        shared_mod._pick_transfermarkt_upstream(mgr)
+
+
+def test_transfermarkt_history_stays_disabled_even_if_token_configured(shared_mod, monkeypatch, tmp_path):
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    mgr = _FakeManager(['http://u:p@pool.invalid:10000'])
+    shared_mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN = 'h' * 32
+    shared_mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = mgr
+    assert not shared_mod._service_health_report(mgr)['transfermarkt_backfill_paid_enabled']
+    with pytest.raises(RuntimeError, match='concurrency'):
+        shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60,
+                                metadata=_tm_metadata('dag_backfill_transfermarkt'))
+    assert mgr.calls == 0
+
+
+def test_transfermarkt_rate_file_remains_readable_by_legacy_gateway(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+    clock = [0.0]
+    path = str(tmp_path / 'rollback.json')
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=path, clock=lambda: clock[0])
+    context = dict(stream_id='history-0', traffic_class='transfermarkt_backfill',
+        dag_id='dag_backfill_transfermarkt', run_id='r', request_id='a')
+    clock[0] = 5
+    ticket = controller.request(**context)
+    controller.consume(**context, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+    controller.report_block(stream_id='history-0', permit_id=ticket.permit_id, status=403, challenge=False)
+    clock[0] = 6
+    old = shared_mod.TransfermarktRequestPermitController(state_path=path, clock=lambda: clock[0])
+    assert not old.request(traffic_class='transfermarkt', dag_id='dag_ingest_transfermarkt',
+                           run_id='r', request_id='rollback').granted
+    assert json.loads(Path(path).read_text())['schema_version'] == 1
+    # Reloading v2 does not turn the conservative rollback fence into a
+    # 30-minute outage of the unblocked current stream.
+    new = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=path, clock=lambda: clock[0])
+    assert new.rate.ready_at('current-0', 6) == 11
+    assert new.rate.slow['history-0'] == 1805
+
+
+def test_transfermarkt_failed_sidecar_write_keeps_rollback_fence_and_feedback_once(shared_mod, monkeypatch, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+    clock = [0.0]
+    path = str(tmp_path / 'uncertain-feedback.json')
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=path, clock=lambda: clock[0])
+    context = dict(stream_id='history-0', traffic_class='transfermarkt_backfill',
+                   dag_id='dag_backfill_transfermarkt', run_id='r', request_id='a')
+    clock[0] = 5
+    ticket = controller.request(**context)
+    controller.consume(**context, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+    original = shared_mod._atomic_private_bytes
+    failures = [2]
+    def fail_sidecar(target, *args, **kwargs):
+        if str(target).endswith('.streams-v2') and failures[0]:
+            failures[0] -= 1
+            raise OSError('injected sidecar failure')
+        return original(target, *args, **kwargs)
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', fail_sidecar)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='state write failed'):
+            controller.report_block(stream_id='history-0', permit_id=ticket.permit_id,
+                                    status=403, challenge=False)
+    # No successful response acknowledged the uncertain write, but the old
+    # gateway already has the conservative durable fence before v2 is retried.
+    clock[0] = 10
+    old = shared_mod.TransfermarktRequestPermitController(state_path=path, clock=lambda: clock[0])
+    assert not old.request(traffic_class='transfermarkt', dag_id='dag_ingest_transfermarkt',
+                           run_id='r', request_id='rollback').granted
+    controller.report_block(stream_id='history-0', permit_id=ticket.permit_id,
+                            status=403, challenge=False)
+    assert controller.rate.blocks == [('history-0', 5.0)]
+    assert controller.rate.pause['history-0'] == 0
+    assert controller.rate.slow['history-0'] == 1805
+    new = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=path, clock=lambda: clock[0])
+    assert new.rate.blocks == [('history-0', 5.0)]
+    assert new.rate.slow['history-0'] == 1805
+
+
+def test_transfermarkt_missing_pause_key_is_corruption(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+    path = str(tmp_path / 'missing-key.json')
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=path, clock=lambda: 0)
+    payload = json.loads(Path(controller.stream_state_path).read_text())
+    del payload['rate']['pause']['history-0']
+    Path(controller.stream_state_path).write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match='state is corrupt'):
+        shared_mod.TransfermarktStreamPermitController(
+            streams=controller.streams, state_path=path, clock=lambda: 5)
+
+
+def test_transfermarkt_stream_control_binds_lease_and_feedback(shared_mod, monkeypatch, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+    clock = [0.0]
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    monkeypatch.setattr(shared_mod, '_wall_time', lambda: clock[0])
+    shared_mod.TRANSFERMARKT_REQUEST_PERMITS = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'control-rate.json'),
+        clock=lambda: clock[0])
+    mgr = _FakeManager(['http://u:p@pool.invalid:10000'])
+    lease = shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60,
+                                    metadata=_tm_metadata())
+
+    def invoke(payload, suffix=''):
+        data = json.dumps(payload).encode()
+        class Reader:
+            async def readexactly(self, length):
+                return data
+        class Writer:
+            def __init__(self):
+                self.payload = bytearray()
+            def write(self, value):
+                self.payload.extend(value)
+            async def drain(self):
+                pass
+            def close(self):
+                pass
+        writer = Writer()
+        asyncio.run(shared_mod._handle_control('POST',
+            '/v1/transfermarkt/request-permits' + suffix,
+            {'content-length': str(len(data)), 'x-proxy-control-token': 't' * 32},
+            Reader(), writer, mgr))
+        head, body = bytes(writer.payload).split(b'\r\n\r\n', 1)
+        return int(head.split()[1]), json.loads(body)
+
+    payload = dict(dag_id=lease.dag_id, run_id=lease.run_id, request_id='attempt',
+                   lease_id=lease.lease_id, lease_token=lease.token)
+    assert invoke({**payload, 'lease_token': 'wrong'})[0] == 409
+    # A genuine gateway 429 means pending, not a site failure.
+    assert invoke(payload)[0] == 429
+    assert shared_mod.TRANSFERMARKT_REQUEST_PERMITS.rate.blocks == []
+    clock[0] = 5
+    status, decision = invoke(payload)
+    assert status == 200
+    proof = dict(permit_id=decision['permit_id'], permit_token=decision['permit_token'])
+    assert invoke({**payload, **proof}, '/consume')[0] == 200
+    feedback = {**payload, 'permit_id': decision['permit_id'], 'status': 429, 'challenge': False}
+    assert invoke(feedback, '/site-block')[0] == 200
+    assert shared_mod.TRANSFERMARKT_REQUEST_PERMITS.rate.slow['current-0'] == 1805
+    assert invoke({**feedback, 'request_id': 'other-attempt'}, '/site-block')[0] == 409
+
+
 def test_transfermarkt_only_boots_without_budget_flags(
     shared_mod, monkeypatch, tmp_path
 ):
