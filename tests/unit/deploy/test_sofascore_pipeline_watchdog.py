@@ -469,3 +469,39 @@ def test_pending_server_post_is_not_repeated_while_marker_is_absent():
     publisher.created.append((publisher.pending_marker, {"number": 1, "node_id": "node-1"}))
     assert not watch.publish(state, publisher, lambda: None)
     assert publisher.calls == 1
+
+
+def test_unknown_slot_history_does_not_hide_refresh_red_share():
+    sample = snapshot()
+    sample["red_share"][red_share.HISTORY_DAG_ID] = [-1, -1]
+    sample["red_share"][red_share.REFRESH_DAG_ID] = [5, 20]
+    result = watch.evaluate(sample, [], NOW, {})
+    assert result["rules"]["history:red_share"]["verdict"] == "unobservable"
+    assert result["rules"]["refresh:red_share"]["verdict"] == "active"
+    assert any("история недоступна" in line for line in result["lines"])
+
+
+def test_collector_combines_legacy_tis_with_finalized_scope_attempts(tmp_path, monkeypatch):
+    from tests.unit.utils.test_sofascore_red_share import _slot_report
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    results = runtime / "results"
+    results.mkdir()
+    _slot_report(results, "slot-run", 0, status="failed")
+    _slot_report(results, "slot-run", 1)
+    daily = tmp_path / "daily.jsonl"
+    daily.write_text((FIXTURES / "coverage_daily.jsonl").read_text())
+    def query(sql):
+        if sql.startswith("SELECT DISTINCT d.run_id"):
+            return "slot-run"
+        if sql.startswith("SELECT dag_id, count(*) FILTER"):
+            return red_share.HISTORY_DAG_ID + "|1|3\n" + red_share.REFRESH_DAG_ID + "|0|10"
+        raise RuntimeError("other independent adapters unused")
+    sample = metrics.collect(runtime, daily, NOW, query=query)
+    assert sample["red_share"][red_share.HISTORY_DAG_ID] == (2, 5)
+    assert sample["red_share"][red_share.REFRESH_DAG_ID] == (0, 10)
+    results.joinpath("0.json").unlink()
+    sample = metrics.collect(runtime, daily, NOW, query=query)
+    assert sample["red_share"][red_share.HISTORY_DAG_ID] == (-1, -1)
+    assert sample["red_share"][red_share.REFRESH_DAG_ID] == (0, 10)
+    assert "history_slot_reports" in sample["collection_errors"]

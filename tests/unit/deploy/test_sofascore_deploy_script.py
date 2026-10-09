@@ -190,6 +190,10 @@ def _layout(
         release / "deploy" / "sofascore" / "drain_breaker.py",
         (DEPLOY / "drain_breaker.py").read_text(encoding="utf-8"),
     )
+    _write(
+        release / "deploy" / "sofascore" / "history_drain_proof.py",
+        (DEPLOY / "history_drain_proof.py").read_text(encoding="utf-8"),
+    )
     _write(runtime / "all-men" / "snapshot.json", "{}\n")
     # #1245: the budget artifact is the static policy shipped in the release
     # tree; there is no canary workspace and no VERIFIED gate any more.
@@ -1714,3 +1718,48 @@ def test_postdeploy_fails_when_a_watchdog_guards_the_wrong_lane(
     proc = _run_postdeploy(tmp_path, scheduler, gateways, watchdogs=watchdogs)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "ПРИЁМКА: ок" not in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize("damage,expected", [(None, "t"), ("unaccounted", "f"), ("active", "f"), ("wrongrun", "unknown"), ("malformed", "unknown"), ("digest", "unknown"), ("plan_negative", "unknown"), ("plan_duplicate", "unknown"), ("plan_out_of_bounds", "unknown")])
+def test_slot_drain_proves_every_claimed_scope_instead_of_worker_map0(tmp_path, damage, expected):
+    import hashlib
+    def prepare(runtime):
+        state_dir = runtime.parent / "stub-state"
+        plan = [{"SOFASCORE_HISTORY_SLOT": "0", "SOFASCORE_CAMPAIGN_ACTION": "capture"}]
+        import sqlite3
+        con = sqlite3.connect(state_dir / "metadb.sqlite")
+        con.execute("UPDATE xcom SET value=? WHERE key='return_value'", (json.dumps(plan),))
+        con.commit()
+        con.close()
+        items = {str(index): {"plan_index": index * 2, "slot": index % 3, "started_at": "2026-10-07T10:00:00Z",
+                              "finished_at": "2026-10-07T11:00:00Z", "outcome": {"status": "success"}, "accounted": True}
+                 for index in range(4)}
+        queue = [{"scope": index} for index in range(8)]
+        run = {"mode": "slots", "run_id": _RUN_ID, "plan": queue,
+               "plan_digest": hashlib.sha256(json.dumps(queue, sort_keys=True).encode()).hexdigest(),
+               "cursor": 4, "items": items, "slots": {"0": None, "1": None, "2": None}, "finalized": True}
+        if damage == "unaccounted":
+            items["3"]["accounted"] = False
+        elif damage == "active":
+            run["slots"]["2"] = 3
+        elif damage == "wrongrun":
+            run["run_id"] = "another-run"
+        elif damage == "malformed":
+            run["cursor"] = 5
+        if damage == "plan_negative":
+            items["3"]["plan_index"] = -1
+        elif damage == "plan_duplicate":
+            items["3"]["plan_index"] = items["1"]["plan_index"]
+        elif damage == "plan_out_of_bounds":
+            items["3"]["plan_index"] = len(queue)
+        run["slot_digest"] = hashlib.sha256(json.dumps(run, sort_keys=True).encode()).hexdigest()
+        if damage == "digest":
+            items["3"]["accounted"] = False
+        (runtime / "all-men" / "history-controller.json").write_text(json.dumps({"run": run}))
+    result = _deploy(tmp_path, world={"scope_state": "success", "validate_state": "success", "validate_map": 0,
+                                     "finalize_state": "success", "scope_try": 1},
+                     turns={2: _CLOSE_RUN.format(state="success")}, pre=prepare)
+    assert result.proc.returncode == 0, result.out
+    proof = result.drain_env()
+    assert proof["DRAIN_SCOPE_KIND"] == "slots"
+    assert proof["DRAIN_ACCOUNTED"] == expected

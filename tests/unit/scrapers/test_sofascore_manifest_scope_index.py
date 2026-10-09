@@ -662,8 +662,9 @@ class _FakeTrinoWire:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("reuse_store", [False, True])
 def test_signed_plan_to_runner_on_a_real_manager_over_several_batches(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, reuse_store
 ):
     """Round 3, item 3 (урок 60): a REAL signed targets plan made by
     ``prepare_workload_plan`` is loaded and verified by ``main``; the runner
@@ -736,11 +737,12 @@ def test_signed_plan_to_runner_on_a_real_manager_over_several_batches(
     )
     module = "dags.scripts.prepare_sofascore_workload"
     plan_wire = _FakeTrinoWire()
+    plan_store = real_store(plan_wire, 40 if reuse_store else 200)
     with (
         patch(f"{module}.load_static_workload_policy", return_value=_policy()),
         patch(
             f"{module}.build_capture_runtime",
-            return_value=runtime_on(real_store(plan_wire, 200)),
+            return_value=runtime_on(plan_store),
         ),
         patch(f"{module}.SofaScoreCatalog.load", return_value=catalog),
         patch(f"{module}._finished_match_ids", return_value=set(match_ids)),
@@ -755,6 +757,7 @@ def test_signed_plan_to_runner_on_a_real_manager_over_several_batches(
             allow_inactive_season=True,
             season_freshness_key="final",
             season_evidence="bronze",
+            manifest_store=plan_store if reuse_store else None,
         )
     def manifest_reads(sql):
         return sql.lstrip().startswith("SELECT") and (
@@ -764,8 +767,8 @@ def test_signed_plan_to_runner_on_a_real_manager_over_several_batches(
     assert plan_wire.count(manifest_reads) == 1  # 150 endpoint probes, one SELECT
 
     # 2) main() verifies the signed plan and runs the capture on a real store.
-    wire = _FakeTrinoWire()
-    store = real_store(wire, 40)
+    wire = plan_wire if reuse_store else _FakeTrinoWire()
+    store = plan_store if reuse_store else real_store(wire, 40)
     monkeypatch.setattr(
         runner, "_resolve_match_ids_from_bronze", lambda *a, **k: list(match_ids)
     )
@@ -804,7 +807,7 @@ def test_signed_plan_to_runner_on_a_real_manager_over_several_batches(
             "--workload-plan", str(plan_path),
             "--offline-replay",
             "--output", str(output),
-        ])
+        ], manifest_store=store if reuse_store else None)
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert rc == 0, payload["errors"]
@@ -818,3 +821,21 @@ def test_signed_plan_to_runner_on_a_real_manager_over_several_batches(
     inner = store.inner
     assert all(inner.get(spec.key).is_terminal for spec in specs.values())
     assert wire.count(manifest_reads) == 1
+
+
+@pytest.mark.unit
+def test_scope_preload_is_reused_and_pending_observations_are_visible():
+    manager = _seeded_manager()
+    store = BatchingManifestStore(TrinoManifestStore(manager), max_pending=200)
+    count = store.preload_scope(TOURNAMENT, SEASON)
+    assert store.preload_scope(int(TOURNAMENT), int(SEASON)) == count
+    record = _success(_spec("99000000", "lineups"))
+    store.upsert(record)
+    assert record in store.list_for_scope(TOURNAMENT, SEASON)
+    assert store.get(record.key) == record
+    assert manager.selects == 1
+    assert store.pending_count == 1
+    store.flush()
+    assert record in store.list_for_scope(TOURNAMENT, SEASON)
+    assert manager.selects == 1
+    assert store.pending_count == 0

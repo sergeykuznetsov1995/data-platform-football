@@ -151,7 +151,22 @@ def collect(runtime: Path, coverage_daily: Path, now: datetime, query=psql) -> d
             return None
 
     result["coverage"] = attempt("coverage", lambda: latest_daily(coverage_daily, day))
-    result["red_share"] = attempt("red_share", lambda: red_share.parse_rows(query(red_share.red_share_sql(t0, t1))))
+    result["red_share"] = attempt("red_share", lambda: red_share.parse_rows(
+        query(red_share.red_share_sql(t0, t1, scope_reports=True))))
+    slot_runs = attempt("history_slot_runs", lambda: set(
+        query(red_share.history_slot_runs_sql(t0, t1)).splitlines()))
+    if result["red_share"] is not None:
+        if slot_runs is None:
+            result["red_share"][red_share.HISTORY_DAG_ID] = (-1, -1)
+        elif slot_runs:
+            counts = attempt("history_slot_reports", lambda: red_share.history_scope_counts(
+                runtime / "results", t0, t1, slot_runs))
+            if counts is None:
+                result["red_share"][red_share.HISTORY_DAG_ID] = (-1, -1)
+            else:
+                old = result["red_share"].get(red_share.HISTORY_DAG_ID, (0, 0))
+                result["red_share"][red_share.HISTORY_DAG_ID] = tuple(a + b for a, b in zip(old, counts))
+
     wait = attempt("pool_wait", lambda: pool_wait.parse_rows(
         query(pool_wait.pool_wait_sql(t0, t1)), query(pool_wait.lane_overlap_sql(t0, t1))))
     result["pool_wait"] = wait._asdict() if wait else None

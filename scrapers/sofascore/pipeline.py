@@ -105,6 +105,34 @@ def _with_allocation_headroom(policy):
     )
 
 
+def build_manifest_store(manifest_backend: Optional[str] = None) -> ManifestStore:
+    """Create one store for a scope phase's planning and capture runtimes."""
+    backend = (
+        manifest_backend
+        or os.environ.get('SOFASCORE_MANIFEST_BACKEND')
+        or 'json'
+    ).strip().lower()
+    if backend == 'trino':
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        # Batching bounds Iceberg snapshot growth to O(flushes) (#1003);
+        # SOFASCORE_MANIFEST_BATCH_SIZE=1 restores record-at-a-time commits.
+        store = BatchingManifestStore(
+            TrinoManifestStore(TrinoTableManager()),
+            max_pending=max(
+                1, int(os.environ.get('SOFASCORE_MANIFEST_BATCH_SIZE', '200'))
+            ),
+        )
+    elif backend == 'json':
+        path = os.environ.get(
+            'SOFASCORE_MANIFEST_PATH', '/tmp/sofascore-endpoint-manifest.json'
+        )
+        store = JsonFileManifestStore(path)
+    else:
+        raise ValueError(f'unsupported SofaScore manifest backend: {backend!r}')
+    return store
+
+
 def build_capture_runtime(
     *,
     run_id: str,
@@ -112,6 +140,7 @@ def build_capture_runtime(
     raw_store_uri: Optional[str] = None,
     manifest_backend: Optional[str] = None,
     workload_class: Optional[str] = None,
+    manifest_store: Optional[ManifestStore] = None,
 ) -> CaptureRuntime:
     """Build the shared CLI/DAG/backfill raw+manifest runtime.
 
@@ -125,29 +154,8 @@ def build_capture_runtime(
         or 'file:///tmp/sofascore-raw'
     )
     raw_store = RawPayloadStore.from_uri(raw_uri)
-    backend = (
-        manifest_backend
-        or os.environ.get('SOFASCORE_MANIFEST_BACKEND')
-        or 'json'
-    ).strip().lower()
-    if backend == 'trino':
-        from scrapers.base.trino_manager import TrinoTableManager
-
-        # Batching bounds Iceberg snapshot growth to O(flushes) (#1003);
-        # SOFASCORE_MANIFEST_BATCH_SIZE=1 restores record-at-a-time commits.
-        manifest_store: ManifestStore = BatchingManifestStore(
-            TrinoManifestStore(TrinoTableManager()),
-            max_pending=max(
-                1, int(os.environ.get('SOFASCORE_MANIFEST_BATCH_SIZE', '200'))
-            ),
-        )
-    elif backend == 'json':
-        path = os.environ.get(
-            'SOFASCORE_MANIFEST_PATH', '/tmp/sofascore-endpoint-manifest.json'
-        )
-        manifest_store = JsonFileManifestStore(path)
-    else:
-        raise ValueError(f'unsupported SofaScore manifest backend: {backend!r}')
+    if manifest_store is None:
+        manifest_store = build_manifest_store(manifest_backend)
     budget = None
     budget_error = None
     artifact_path = os.environ.get('SOFASCORE_PROXY_BUDGET_ARTIFACT', '').strip()
@@ -539,18 +547,11 @@ def scope_probe_exclusions(
     *,
     min_matches: int = 3,
 ) -> frozenset[str]:
-    """Endpoints the source does not publish for this scope (A2, #1218).
+    """Reconstruct a legacy A2 verdict for saved-manifest replay only.
 
-    The first allocation of a scope is captured with the full endpoint set.
-    An endpoint whose terminal records among those probed matches are ALL
-    ``not_supported`` — with at least ``min_matches`` of them — is excluded
-    for the remaining allocations, so a lower league without lineups costs
-    about one request per match instead of five (SS-186: 787/1320
-    not_supported).
-
-    Known limitation: a cup whose early rounds lack lineups while the final
-    publishes them loses the final's lineups; the owner's "trim by
-    availability" decision accepts this.
+    Normal production capture does not use this all-or-nothing first-batch
+    rule. New availability observations use ``scope_endpoint_availability``
+    and never infer terminal unsupported states for unobserved targets.
     """
     verdicts: dict[str, list[bool]] = {}
     for spec in probe_specs:
@@ -568,6 +569,54 @@ def scope_probe_exclusions(
         for endpoint, flags in verdicts.items()
         if len(flags) >= min_matches and all(flags)
     )
+
+
+def scope_endpoint_availability(
+    records: Iterable[EndpointManifest],
+    *,
+    source_tournament_id: str | int,
+    source_season_id: str | int,
+    control_match_ids: Sequence[str] = (),
+) -> dict[str, dict]:
+    """Measure real final HTTP evidence; never infer unobserved matches.
+
+    A saved 404 must retain raw lineage. Old scope-probe synthetic records,
+    repair freshness and transport failures cannot vote on availability.
+    A 2xx in the late CONTROL sample resets the low-availability verdict.
+    """
+    scope = str(source_tournament_id), str(source_season_id)
+    observations: dict[str, dict[str, EndpointManifest]] = {}
+    for record in records:
+        key = record.key
+        if (key.as_tuple()[:2] != scope or key.target_type != 'event'
+                or key.freshness_key != 'final' or key.endpoint not in EVENT_PATHS
+                or not record.raw_content_hash or not record.raw_blob_key):
+            continue
+        real_404 = (record.status == ManifestStatus.NOT_SUPPORTED
+                    and record.http_status == 404)
+        real_2xx = record.is_terminal and record.http_status is not None and 200 <= record.http_status < 300
+        if real_404 or real_2xx:
+            observations.setdefault(key.endpoint, {})[key.target_id] = record
+    controls = tuple(dict.fromkeys(str(target) for target in control_match_ids))
+    report = {}
+    for endpoint, observed in sorted(observations.items()):
+        count_404 = sum(record.http_status == 404 for record in observed.values())
+        count = len(observed)
+        threshold = count >= 20 and count_404 * 100 >= count * 95
+        outcomes = {target: observed[target].http_status if target in observed else None
+                    for target in controls}
+        reset = any(status is not None and 200 <= status < 300
+                    for status in outcomes.values())
+        report[endpoint] = {
+            'observed_matches': count,
+            'real_404_matches': count_404,
+            'threshold_met': threshold,
+            'low_availability': threshold and not reset,
+            'mixed_availability': count_404 > 0 and count_404 < count,
+            'control_http_status': outcomes,
+            'control_reset': threshold and reset,
+        }
+    return report
 
 
 def _has_replayable_raw(raw_store: RawPayloadStore, spec: EndpointSpec) -> bool:
@@ -664,7 +713,20 @@ def replay_event_specs(
     runtime: CaptureRuntime,
     specs: Sequence[EndpointSpec],
 ) -> list[CaptureResult]:
-    return runtime.engine.capture_many(specs, offline=True, force_replay=True)
+    # Legacy A2 rows are replayable only at their exact saved keys. No new
+    # unsupported record is inferred for another match or endpoint.
+    replay_specs = []
+    for spec in specs:
+        existing = runtime.manifest_store.get(spec.key)
+        if (existing is not None and existing.status == ManifestStatus.NOT_SUPPORTED
+                and existing.http_status is None and not existing.raw_content_hash
+                and not existing.raw_blob_key
+                and (existing.error_message or '').startswith('scope probe:')
+                and not _has_replayable_raw(runtime.raw_store, spec)):
+            spec = replace(spec, supported=False,
+                           unsupported_reason=existing.error_message)
+        replay_specs.append(spec)
+    return runtime.engine.capture_many(replay_specs, offline=True, force_replay=True)
 
 
 def replay_player_specs(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -40,6 +41,7 @@ from scrapers.sofascore.pipeline import (
     replay_event_specs,
     replay_player_specs,
     scope_probe_exclusions,
+    scope_endpoint_availability,
 )
 from scrapers.sofascore.live_capture import _AllocationBudgetView
 from scrapers.sofascore.raw_store import RawPayloadStore
@@ -1922,12 +1924,10 @@ def _patch_match_runner_environment(monkeypatch, runner, match_ids):
         monkeypatch.setattr(sofascore_dq, validator, lambda *args, **kwargs: passed)
 
 
-def test_match_runner_probes_the_first_allocation_and_excludes_missing_endpoints(
+def test_match_runner_keeps_unobserved_endpoints_after_an_all_404_first_allocation(
     tmp_path, monkeypatch
 ):
-    """A2: the first allocation is captured with the full endpoint set; every
-    endpoint the source published for none of its matches reaches the next
-    allocation as ``supported=False`` (recorded not_supported, no request)."""
+    """Three early 404s cannot synthesize unsupported on later matches."""
     from dags.scripts import run_sofascore_scraper as runner
     from scrapers.sofascore import live_capture
     from scrapers.sofascore.live_capture import _zero_traffic
@@ -1980,19 +1980,14 @@ def test_match_runner_probes_the_first_allocation_and_excludes_missing_endpoints
         for match_id in PROBE_MATCH_IDS
         for endpoint in EVENT_PATHS
     ]
-    # Second allocation: only ``event`` may still be requested.
+    # Later allocation keeps the full endpoint set; no synthetic exclusion.
     assert seen[1] == [
-        (match_id, endpoint, endpoint == "event")
+        (match_id, endpoint, True)
         for match_id in SECOND_MATCH_IDS
         for endpoint in EVENT_PATHS
     ]
     result = json.loads(output.read_text(encoding="utf-8"))
-    assert result["excluded_endpoints"] == [
-        "incidents",
-        "lineups",
-        "shotmap",
-        "statistics",
-    ]
+    assert "excluded_endpoints" not in result
     for endpoint in EVENT_PATHS:
         record = runtime.manifest_store.get(
             _event_spec(SECOND_MATCH_IDS[0], endpoint).key
@@ -2000,7 +1995,7 @@ def test_match_runner_probes_the_first_allocation_and_excludes_missing_endpoints
         assert record.is_terminal
         if endpoint != "event":
             assert record.status == ManifestStatus.NOT_SUPPORTED
-            assert "scope probe" in record.error_message
+            assert not (record.error_message or "").startswith("scope probe:")
 
 
 def _event_only_source(seen, clock=None, step=0, paid_bytes=0):
@@ -2231,13 +2226,10 @@ def test_match_runner_without_the_refresh_ceilings_is_unchanged(
     assert len(seen) == 2
 
 
-def test_match_runner_probe_reads_the_manifest_of_a_terminal_first_allocation(
+def test_match_runner_terminal_first_allocation_does_not_exclude_later_lineups(
     tmp_path, monkeypatch
 ):
-    """Sol r2 #3: on an Airflow retry the probe allocation's terminal 404s
-    are no longer live specs (endpoint_resume_plan drops them); the verdict
-    is still read from the manifest for every endpoint of the probe matches
-    and applied to the next allocation."""
+    """Saved early404s skip exact keys and cannot suppress later lineups."""
     from dags.scripts import run_sofascore_scraper as runner
     from scrapers.sofascore import live_capture
     from scrapers.sofascore.live_capture import _zero_traffic
@@ -2291,19 +2283,18 @@ def test_match_runner_probe_reads_the_manifest_of_a_terminal_first_allocation(
     assert rc == 0
     assert transport.calls == 0
     # Nothing live in the probe allocation: the source is asked once, for the
-    # second allocation, and lineups is already excluded there.
+    # second allocation, including lineups that were never observed.
     assert seen == [
         [
-            (match_id, endpoint, endpoint != "lineups")
+            (match_id, endpoint, True)
             for match_id in SECOND_MATCH_IDS
             for endpoint in EVENT_PATHS
         ]
     ]
     result = json.loads(output.read_text(encoding="utf-8"))
-    assert result["excluded_endpoints"] == ["lineups"]
+    assert "excluded_endpoints" not in result
     record = runtime.manifest_store.get(_event_spec(SECOND_MATCH_IDS[0], "lineups").key)
-    assert record.status == ManifestStatus.NOT_SUPPORTED
-    assert "scope probe" in record.error_message
+    assert record.status == ManifestStatus.SUCCESS
 
 
 def test_match_runner_repair_never_applies_the_scope_probe(tmp_path, monkeypatch):
@@ -3379,3 +3370,158 @@ def test_resumed_projection_fails_closed_when_any_long_state_is_missing():
     current = CaptureResult(manifest=store.get(specs[(EVENT_ID, "incidents")].key))
     with pytest.raises(RuntimeError, match="shotmap.*manifest"):
         _complete_manifest_records_for_projection(store, specs, [current])
+
+
+# #1364: real404 availability and exact saved-manifest replay contracts.
+def _real_404(target):
+    return replace(_not_supported_manifest(_event_spec(str(target), "lineups")),
+                   raw_content_hash="f" * 64, raw_blob_key=f"raw/{target}")
+
+
+def _availability(records, controls=()):
+    return scope_endpoint_availability(
+        records, source_tournament_id=17, source_season_id=76986,
+        control_match_ids=controls,
+    ).get("lineups", {})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("n404, n200, expected", [(19, 0, False), (19, 1, True), (18, 2, False), (20, 0, True)])
+def test_real404_threshold_requires_twenty_distinct_matches_and_95_percent(n404, n200, expected):
+    records = [_real_404(target) for target in range(n404)]
+    records += [_successful_manifest(_event_spec(str(100 + target), "lineups"))
+                for target in range(n200)]
+    result = _availability(records + records)
+    assert result["observed_matches"] == n404 + n200
+    assert result["low_availability"] is expected
+    assert result["threshold_met"] is expected
+
+
+@pytest.mark.unit
+def test_synthetic404_repair_other_scopes_and_other_target_types_cannot_vote():
+    records = [_real_404(target) for target in range(19)]
+    real = _real_404(20)
+    records.extend([
+        _not_supported_manifest(_event_spec("21", "lineups")),
+        replace(real, key=replace(real.key, freshness_key="repair-run")),
+        replace(real, key=replace(real.key, source_season_id="999")),
+        replace(real, key=replace(real.key, source_tournament_id="999")),
+        replace(real, key=replace(real.key, target_type="player")),
+        replace(real, http_status=410),
+    ])
+    assert _availability(records)["observed_matches"] == 19
+    assert _availability(records)["low_availability"] is False
+
+
+@pytest.mark.unit
+def test_control_late200_resets_low_verdict_without_inventing_unknown_outcomes():
+    records = [_real_404(target) for target in range(19)]
+    records.append(_successful_manifest(_event_spec("100", "lineups")))
+    report = _availability(records, ("18", "100", "101"))
+    assert report["threshold_met"] is True
+    assert report["mixed_availability"] is True
+    assert report["control_reset"] is True
+    assert report["low_availability"] is False
+    assert report["control_http_status"] == {"18": 404, "100": 200, "101": None}
+
+
+@pytest.mark.unit
+def test_reusable_store_does_not_create_another_manifest_backend(tmp_path, monkeypatch):
+    from scrapers.sofascore.manifest import InMemoryManifestStore
+    store = InMemoryManifestStore()
+    monkeypatch.delenv("SOFASCORE_PROXY_BUDGET_ARTIFACT", raising=False)
+    monkeypatch.delenv("SOFASCORE_PROXY_BUDGET_LEDGER", raising=False)
+    monkeypatch.setattr("scrapers.sofascore.pipeline.build_manifest_store",
+                        lambda *_args: pytest.fail("reused store was replaced"))
+    runtime = build_capture_runtime(run_id="run", task_id="capture",
+                                    raw_store_uri=tmp_path.as_uri(),
+                                    manifest_backend="trino", manifest_store=store)
+    assert runtime.manifest_store is store
+    assert runtime.engine.manifest_store is store
+
+
+@pytest.mark.unit
+def test_old_saved_scope_probe_replays_only_exact_manifest_key(tmp_path):
+    runtime, transport = _runtime(tmp_path)
+    spec = _event_spec("14023925", "lineups")
+    legacy = replace(_not_supported_manifest(spec), http_status=None,
+                     error_message="scope probe: source does not publish lineups (every sampled match answered 404)")
+    runtime.manifest_store.upsert(legacy)
+    [result] = replay_event_specs(runtime, [spec])
+    assert result.manifest == legacy
+    assert result.replay_hit is True
+    assert transport.calls == 0
+    assert runtime.manifest_store.get(_event_spec("14023926", "lineups").key) is None
+
+
+@pytest.mark.unit
+def test_control_fallback_uses_only_signed_targets_with_explicit_unknown_chronology(tmp_path):
+    from dags.scripts import run_sofascore_scraper as runner
+    runtime, _ = _runtime(tmp_path)
+    _, allocations = _two_allocation_plan(runtime)
+    specs = [_event_spec(target, endpoint) for target in (*PROBE_MATCH_IDS, *SECOND_MATCH_IDS)
+             for endpoint in EVENT_PATHS]
+    ids, basis = runner._control_matches(runtime, specs, allocations,
+                                        ["99999999", *PROBE_MATCH_IDS, *SECOND_MATCH_IDS],
+                                        chronology_known=False)
+    assert ids == (*PROBE_MATCH_IDS, *SECOND_MATCH_IDS)[-3:]
+    assert basis == "unknownchronology:target_order"
+    assert "99999999" not in ids
+
+
+@pytest.mark.unit
+def test_control_uses_existing_schedule_chronology_without_another_query(tmp_path):
+    from dags.scripts import run_sofascore_scraper as runner
+    runtime, _ = _runtime(tmp_path)
+    _, allocations = _two_allocation_plan(runtime)
+    specs = [_event_spec(target, "event") for target in (*PROBE_MATCH_IDS, *SECOND_MATCH_IDS)]
+    ordered = [SECOND_MATCH_IDS[0], PROBE_MATCH_IDS[2], PROBE_MATCH_IDS[1], PROBE_MATCH_IDS[0]]
+    ids, basis = runner._control_matches(runtime, specs, allocations, ordered, chronology_known=True)
+    assert ids == tuple(ordered[:3])
+    assert basis == "bronze_schedule:start_timestamp"
+
+
+@pytest.mark.unit
+def test_saved_real404_skips_only_the_exact_final_endpoint(tmp_path):
+    from scrapers.sofascore.pipeline import endpoint_resume_plan
+    runtime, transport = _runtime(tmp_path)
+    observed = _event_spec("14023925", "lineups")
+    runtime.manifest_store.upsert(_real_404("14023925"))
+    other_endpoint = _event_spec("14023925", "shotmap")
+    other_match = _event_spec("14023926", "lineups")
+    repair = replace(observed, key=replace(observed.key, freshness_key="repair-run"))
+    result = runtime.engine.capture(observed)
+    assert result.cache_hit is True
+    assert transport.calls == 0
+    pending = endpoint_resume_plan(runtime.manifest_store, [observed, other_endpoint, other_match, repair])
+    assert pending == {"14023925": ("shotmap", "lineups"), "14023926": ("lineups",)}
+
+
+@pytest.mark.unit
+def test_control_uses_saved_event_time_and_stays_inside_signed_allocations(tmp_path):
+    import json
+    from dags.scripts import run_sofascore_scraper as runner
+    runtime, _ = _runtime(tmp_path)
+    _, allocations = _two_allocation_plan(runtime)
+    targets = (*PROBE_MATCH_IDS, *SECOND_MATCH_IDS)
+    times = (400, 100, 300, 200)
+    specs = [_event_spec(target, "event") for target in targets]
+    for spec, timestamp in zip(specs, times):
+        runtime.raw_store.store_bytes(
+            spec.raw_target, json.dumps({"event": {"startTimestamp": timestamp}}).encode(),
+            request_url=spec.url, http_status=200,
+        )
+    ids, basis = runner._control_matches(runtime, specs, allocations, [], chronology_known=False)
+    assert ids == (targets[3], targets[2], targets[0])
+    assert basis == "saved_event:startTimestamp"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('status',[ManifestStatus.SCHEMA_ERROR,ManifestStatus.RETRYABLE_FAILURE])
+def test_nonterminal_2xx_cannot_vote_in_availability_threshold(status):
+    records=[_real_404(target) for target in range(19)]
+    records.append(replace(_successful_manifest(_event_spec('100','lineups')),status=status))
+    result=_availability(records,('100',))
+    assert result['observed_matches']==19
+    assert result['threshold_met'] is False
+    assert result['control_http_status']=={'100':None}

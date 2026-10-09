@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +18,7 @@ from airflow.sensors.python import PythonSensor
 from scrapers.sofascore.workload_plan import load_static_workload_policy
 from scrapers.sofascore import history_controller, history_inventory
 
-from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.default_args import DEFAULT_ARGS
 from utils import sofascore_all_mens_state as state
 
 
@@ -49,14 +50,14 @@ ACTIVE_COOLDOWN = timedelta(minutes=1)
 IDLE_COOLDOWN = timedelta(minutes=30)
 
 
-# History lane knobs. Defaults reproduce the single-slot campaign; a second
-# lane (own gateway, own pool, several scopes per DagRun) is configured purely
-# through the scheduler environment, without touching sealed runtime code.
+# History uses three independently refilled workers on its dedicated pool.
+# The legacy batch knob stays valid for older callers; it does not cap the queue.
+# An explicit smaller max-active value remains a safety restriction.
 HISTORY_BATCH_SIZE = state.env_int("SOFASCORE_HISTORY_BATCH_SIZE", 1, 1, 64)
 HISTORY_POOL = (
-    os.environ.get("SOFASCORE_HISTORY_POOL", "").strip() or INGEST_SCRAPER_POOL
+    os.environ.get("SOFASCORE_HISTORY_POOL", "").strip() or "sofascore_history_pool"
 )
-HISTORY_MAX_ACTIVE_TASKS = state.env_int("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", 1, 1, 16)
+HISTORY_MAX_ACTIVE_TASKS = state.env_int("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", 3, 1, 16)
 HISTORY_FIRST_START_YEAR = state.env_int(
     "SOFASCORE_HISTORY_FIRST_START_YEAR", state.DEFAULT_FIRST_START_YEAR, 2000, 2100
 )
@@ -124,6 +125,9 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     planned = state.plan_historical_batch(
         snapshot,
         history_inventory=inventory, controller_path=CONTROLLER_PATH,
+        history_slots=min(3, HISTORY_MAX_ACTIVE_TASKS),
+        history_deadline=(context["dag_run"].start_date + timedelta(hours=6)).isoformat()
+        if context.get("dag_run") and context["dag_run"].start_date else None,
         completed=completed,
         failures=failures,
         max_scope_attempts=HISTORY_MAX_SCOPE_ATTEMPTS,
@@ -139,16 +143,30 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
             for name, budget in workload_policy.classes.items()
             if budget.scope == "season"
         ],
-        task_env=HISTORY_TASK_ENV,
+        task_env={**HISTORY_TASK_ENV, "SOFASCORE_HISTORY_STATE": STATE_PATH,
+                  "SOFASCORE_HISTORY_FAILURES": FAILURES_PATH,
+                  "SOFASCORE_HISTORY_POOL": HISTORY_POOL},
     )
     if context.get("ti") is not None:
         report = history_controller.read_summary(CONTROLLER_PATH, campaign_id)
+        context["ti"].xcom_push(key="history_mode", value="slots")
         context["ti"].xcom_push(key="history_groups", value=report["groups"])
         context["ti"].xcom_push(key="history_summary", value=report["summary"])
     return planned
 
 
 def _validate_historical_scope(**environment: str) -> dict[str, Any]:
+    if "SOFASCORE_HISTORY_SLOT" in environment:
+        run = history_controller.read_summary(
+            environment["SOFASCORE_HISTORY_CONTROLLER"],
+            environment["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
+        )["run"]
+        slot = environment["SOFASCORE_HISTORY_SLOT"]
+        if (run.get("mode") != "slots" or run["run_id"] != environment["SOFASCORE_HISTORY_RUN_ID"]
+                or run["slots"].get(slot) is not None
+                or any(not item["accounted"] for item in run["items"].values() if item["slot"] == slot)):
+            raise AirflowException("history slot accounting incomplete")
+        return {"status": "slot_accounted", "slot": slot}
     result_path = Path(environment["SOFASCORE_SCOPE_RESULT_PATH"])
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -207,6 +225,12 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
     planned = context["ti"].xcom_pull(task_ids="plan_historical_batch") or []
     dag_run = context.get("dag_run")
     release = state.current_release()
+    if Path(CONTROLLER_PATH).exists():
+        snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+        report = history_controller.read_summary(CONTROLLER_PATH, snapshot["campaign_id"])
+        reservation = report.get("run")
+        if reservation and reservation.get("mode") == "slots" and reservation["run_id"] == str(context.get("run_id") or "manual"):
+            return _finalize_slots(reservation, snapshot, context, release)
     for index, environment in enumerate(planned):
         scope_key = environment.get("SOFASCORE_SCOPE_KEY")
         if not scope_key or dag_run is None:
@@ -267,6 +291,49 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
     return {"did_work": did_work, "next_poll_at": target.isoformat()}
 
 
+def _finalize_slots(reservation, snapshot, context, release):
+    from scrapers.sofascore.history_worker import stamp_result
+    campaign, run_id = snapshot["campaign_id"], reservation["run_id"]
+    for index, item in reservation["items"].items():
+        if item["accounted"]:
+            continue
+        # Called only by all_done finalizer, or terminal-DagRun recovery.
+        dag_run = context.get("dag_run")
+        ti = dag_run.get_task_instance("run_historical_scope", map_index=int(item["slot"])) if dag_run else None
+        if ti is None or _task_state(ti) not in {"success", "failed", "upstream_failed", "skipped", "removed"}:
+            raise AirflowException("history slot is not terminal; cannot reconcile")
+        environment = reservation["plan"][item["plan_index"]]
+        outcome = item["outcome"] or {"status": "not_started" if item["attempts"] == 0 else "failed",
+                                    "reason": "history worker interrupted before accounting",
+                                    "source_requests": 0 if item["attempts"] == 0 else None}
+        history_controller.record_scope(CONTROLLER_PATH, campaign_id=campaign, run_id=run_id,
+                                        slot=item["slot"], index=int(index), outcome=outcome)
+        current = history_controller.read_summary(CONTROLLER_PATH, campaign)["run"]["items"][index]
+        stamp_result(environment, current, outcome, run_id)
+        history_controller.account_scope(environment, outcome, state_path=STATE_PATH,
+                                         failures_path=FAILURES_PATH, release=release)
+        history_controller.record_scope(CONTROLLER_PATH, campaign_id=campaign, run_id=run_id,
+                                        slot=item["slot"], index=int(index), accounted=True)
+    reservation = history_controller.read_summary(CONTROLLER_PATH, campaign)["run"]
+    receipt = {"history_slots_receipt": True, "dag_run_id": run_id, "campaign_id": campaign,
+               "finalized": True, "claimed_count": reservation["cursor"],
+               "plan_digest": reservation["plan_digest"], "plan_length": len(reservation["plan"]),
+               "items": [dict(item, index=int(index), environment=reservation["plan"][item["plan_index"]])
+                                              for index, item in reservation["items"].items()]}
+    destination = Path(RESULT_DIR) / ("history-slots-" + hashlib.sha256(run_id.encode()).hexdigest()[:20] + ".json")
+    receipt["receipt_digest"] = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
+    state._write_document_atomically(destination, receipt)
+    descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    history_controller.finalize(CONTROLLER_PATH, campaign_id=campaign, run_id=run_id)
+    target = datetime.now(timezone.utc) + (ACTIVE_COOLDOWN if reservation["items"] else IDLE_COOLDOWN)
+    context["ti"].xcom_push(key="next_poll_at", value=target.isoformat())
+    return {"did_work": bool(reservation["items"]), "next_poll_at": target.isoformat(), "receipt": str(destination)}
+
+
 def _poll_ready(**context: Any) -> bool:
     raw = context["ti"].xcom_pull(
         task_ids="finalize_historical_run", key="next_poll_at"
@@ -300,6 +367,14 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
 RUN_SCOPE_COMMAND = """
 set -euo pipefail
 cd /opt/airflow
+if [ -n "${SOFASCORE_HISTORY_SLOT:-}" ]; then
+  exec /opt/legacy-scraper-venv/bin/python -m scrapers.sofascore.history_worker \
+    --checkpoint "${SOFASCORE_HISTORY_CONTROLLER}" \
+    --campaign-id "${SOFASCORE_EXPECTED_CAMPAIGN_ID}" \
+    --run-id "${AIRFLOW_CTX_DAG_RUN_ID}" --slot "${SOFASCORE_HISTORY_SLOT}" \
+    --state "${SOFASCORE_HISTORY_STATE}" --failures "${SOFASCORE_HISTORY_FAILURES}" \
+    --dag-id "${AIRFLOW_CTX_DAG_ID}" --pool "${SOFASCORE_HISTORY_POOL}"
+fi
 case "${SOFASCORE_CAMPAIGN_ACTION}" in
   metadata)
     /opt/legacy-scraper-venv/bin/python \
@@ -341,7 +416,7 @@ esac
 with DAG(
     dag_id=DAG_ID,
     default_args=DEFAULT_ARGS,
-    description="SofaScore history by actual debt, breadth-first within gated groups",
+    description="Three independent SofaScore history slots in gated breadth-first order",
     schedule="@continuous",
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
@@ -364,13 +439,13 @@ with DAG(
         pool=HISTORY_POOL,
         priority_weight=1,
         do_xcom_push=False,
-        max_active_tis_per_dag=HISTORY_MAX_ACTIVE_TASKS,
+        max_active_tis_per_dag=min(3, HISTORY_MAX_ACTIVE_TASKS),
         # One retry keeps the same run_id: the gateway reuses the signed plan,
         # finished allocations replay from raw, a latched lease is re-claimed
         # once the reaper grace (30 s) has passed.
         retries=1,
         retry_delay=timedelta(minutes=2),
-        execution_timeout=timedelta(hours=4),
+        execution_timeout=timedelta(hours=5, minutes=50),
     ).expand(env=plan.output)
     validate = PythonOperator.partial(
         task_id="validate_historical_scope",

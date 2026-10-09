@@ -22,7 +22,7 @@ env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS \
   tests/unit/utils/test_sofascore_red_share.py
 ```
 
-Ожидается **12 passed**, exit 0. Тест проверяет чистые функции и импорт без Airflow;
+Ожидается **27 passed**, exit 0. Тест проверяет чистые функции и импорт без Airflow;
 не делает HTTP/SQL-запросов и не запускает сервисы. Он подтверждает только этот
 узкий offline-профиль, не корректность источника, full suite или production.
 В уже подготовленном test-venv можно заменить путь к Python; сначала зафиксируй его

@@ -57,14 +57,14 @@ def test_all_mens_backfill_uses_one_bounded_dynamic_operator():
 
     assert dag.schedule == "@continuous"
     assert dag._dag_kwargs["max_active_runs"] == 1
-    assert dag._dag_kwargs["max_active_tasks"] == 1
+    assert dag._dag_kwargs["max_active_tasks"] == 3
     assert len(BashOperator._instances) + len(PythonOperator._instances) < 10
     mapped = next(
         item for item in BashOperator._instances
         if item.task_id == "run_historical_scope"
     )
     assert mapped._expand_kwargs["env"].operator.task_id == "plan_historical_batch"
-    assert mapped._init_kwargs["pool"] == "ingest_scraper_pool"
+    assert mapped._init_kwargs["pool"] == "sofascore_history_pool"
     assert mapped._init_kwargs["priority_weight"] == 1
     assert "run_sofascore_scope_cycle.py" in mapped.bash_command
     assert '--expected-snapshot-id "${SOFASCORE_EXPECTED_SNAPSHOT_ID}"' in (
@@ -74,7 +74,7 @@ def test_all_mens_backfill_uses_one_bounded_dynamic_operator():
     assert '--run-id "${AIRFLOW_CTX_DAG_RUN_ID}"' in mapped.bash_command
     assert '--task-id "${AIRFLOW_CTX_TASK_ID}"' in mapped.bash_command
     assert mapped._init_kwargs["do_xcom_push"] is False
-    assert mapped._init_kwargs["max_active_tis_per_dag"] == 1
+    assert mapped._init_kwargs["max_active_tis_per_dag"] == 3
 
 
 @pytest.mark.unit
@@ -113,7 +113,7 @@ def _planner_kwargs(module, monkeypatch):
 
 
 @pytest.mark.unit
-def test_history_lane_defaults_match_the_single_slot_campaign(monkeypatch):
+def test_history_lane_defaults_offer_three_independent_slots(monkeypatch):
     for name in (
         "SOFASCORE_HISTORY_BATCH_SIZE",
         "SOFASCORE_HISTORY_POOL",
@@ -127,13 +127,15 @@ def test_history_lane_defaults_match_the_single_slot_campaign(monkeypatch):
     module = _load_dag_module()
     mapped = _run_scope_operator()
 
-    assert module.dag._dag_kwargs["max_active_tasks"] == 1
-    assert mapped._init_kwargs["pool"] == "ingest_scraper_pool"
-    assert mapped._init_kwargs["max_active_tis_per_dag"] == 1
+    assert module.dag._dag_kwargs["max_active_tasks"] == 3
+    assert mapped._init_kwargs["pool"] == "sofascore_history_pool"
+    assert mapped._init_kwargs["max_active_tis_per_dag"] == 3
     kwargs = _planner_kwargs(module, monkeypatch)
     assert kwargs["batch_size"] == 1
     assert kwargs["first_start_year"] == 2025
-    assert kwargs["task_env"] == {}
+    assert kwargs["history_slots"] == 3
+    assert kwargs["task_env"]["SOFASCORE_HISTORY_STATE"] == module.STATE_PATH
+    assert kwargs["task_env"]["SOFASCORE_HISTORY_FAILURES"] == module.FAILURES_PATH
     assert kwargs["max_scope_attempts"] == 3
     assert kwargs["failures"] == {}
 
@@ -181,6 +183,9 @@ def test_history_lane_knobs_come_from_env(monkeypatch):
     assert kwargs["task_env"] == {
         "SOFASCORE_RATE_LIMIT_PER_MINUTE": "60",
         "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-history:8080",
+        "SOFASCORE_HISTORY_STATE": module.STATE_PATH,
+        "SOFASCORE_HISTORY_FAILURES": module.FAILURES_PATH,
+        "SOFASCORE_HISTORY_POOL": "sofascore_history_pool",
     }
     assert kwargs["max_scope_attempts"] == 5
 
@@ -654,3 +659,49 @@ def test_july_portion_does_not_mark_whole_legacy_season_completed(monkeypatch, t
     monkeypatch.setattr(module.state, "clear_failed", lambda *args, **kwargs: cleared.append(kwargs))
     module._validate_historical_scope(**env)
     assert completed == [] and len(cleared) == 1
+
+
+@pytest.mark.unit
+def test_slot_finalizer_recovers_terminal_worker_without_failing_unissued(monkeypatch,tmp_path):
+    from scrapers.sofascore import history_controller as controller
+    from tests.unit.scrapers.test_sofascore_history_controller import snapshot,evidence,denominator,NOW
+    module=_load_dag_module()
+    snap=snapshot(ids=(8,17,22,24))
+    workers=controller.plan(snap,inventory=evidence(snap),checkpoint_path=module.CONTROLLER_PATH,
+        denominator=denominator((8,17,22,24)),dag_run_id='old',slot_count=3,
+        result_dir=str(tmp_path/'results'),moment=NOW)
+    index,env=controller.claim_scope(module.CONTROLLER_PATH,campaign_id=snap['campaign_id'],run_id='old',slot=0,now=NOW)
+    controller.record_scope(module.CONTROLLER_PATH,campaign_id=snap['campaign_id'],run_id='old',slot=0,index=index,started_attempt=True)
+    monkeypatch.setattr(module,'STATE_PATH',str(tmp_path/'state.json'))
+    monkeypatch.setattr(module,'FAILURES_PATH',str(tmp_path/'failures.json'))
+    monkeypatch.setattr(module,'RESULT_DIR',str(tmp_path/'results'))
+    monkeypatch.setattr(module.state,'read_snapshot',lambda *args,**kwargs:snap)
+    ti=SimpleNamespace(xcom_pull=lambda **kwargs:workers,xcom_push=lambda **kwargs:None)
+    dr=SimpleNamespace(get_task_instance=lambda *args,**kwargs:SimpleNamespace(state='failed'))
+    result=module._finalize_historical_run(ti=ti,dag_run=dr,run_id='old')
+    report=controller.read_summary(module.CONTROLLER_PATH,snap['campaign_id'])['run']
+    assert report['finalized'] and report['items']['0']['accounted']
+    assert len(report['items'])==1  # unissued scopes remain debt, not failures
+    assert len(module.state.read_failures(module.FAILURES_PATH,campaign_id=snap['campaign_id']))==1
+    receipt=json.loads(pathlib.Path(result['receipt']).read_text())
+    assert receipt['dag_run_id']=='old' and receipt['history_slots_receipt']
+    assert receipt['items'][0]['environment']['SOFASCORE_SCOPE_KEY']==env['SOFASCORE_SCOPE_KEY']
+    before=pathlib.Path(module.FAILURES_PATH).read_bytes()
+    module._finalize_historical_run(ti=ti,dag_run=dr,run_id='old')
+    assert pathlib.Path(module.FAILURES_PATH).read_bytes()==before
+
+
+@pytest.mark.unit
+def test_slot_finalizer_will_not_steal_a_running_capture(monkeypatch,tmp_path):
+    from scrapers.sofascore import history_controller as controller
+    from tests.unit.scrapers.test_sofascore_history_controller import snapshot,evidence,denominator,NOW
+    module=_load_dag_module()
+    snap=snapshot()
+    workers=controller.plan(snap,inventory=evidence(snap),checkpoint_path=module.CONTROLLER_PATH,
+        denominator=denominator(),dag_run_id='old',slot_count=3,moment=NOW)
+    controller.claim_scope(module.CONTROLLER_PATH,campaign_id=snap['campaign_id'],run_id='old',slot=0,now=NOW)
+    monkeypatch.setattr(module.state,'read_snapshot',lambda *args,**kwargs:snap)
+    ti=SimpleNamespace(xcom_pull=lambda **kwargs:workers,xcom_push=lambda **kwargs:None)
+    dr=SimpleNamespace(get_task_instance=lambda *args,**kwargs:SimpleNamespace(state='running'))
+    with pytest.raises(Exception,match='not terminal'):
+        module._finalize_historical_run(ti=ti,dag_run=dr,run_id='old')

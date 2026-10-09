@@ -9,6 +9,13 @@ import pytest
 from dags.scripts import run_sofascore_scope_cycle as cycle
 
 
+@pytest.fixture(autouse=True)
+def _offline_phase_manifest(monkeypatch):
+    from scrapers.sofascore.manifest import InMemoryManifestStore
+    monkeypatch.setattr("scrapers.sofascore.pipeline.build_manifest_store",
+                        lambda _backend: InMemoryManifestStore())
+
+
 @pytest.mark.unit
 def test_cycle_sets_exact_overlays_before_running_phases(tmp_path, monkeypatch):
     scope = {
@@ -229,7 +236,7 @@ def test_cycle_reports_why_a_phase_failed(tmp_path, monkeypatch):
     )
     status_counts = {"success": 12, "retryable_failure": 3}
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         output = Path(argv[argv.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.name == "season.json":
@@ -332,7 +339,7 @@ def test_cycle_result_names_a_control_channel_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
     message = _control_channel_failure_text()
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         output = Path(argv[argv.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         # Contract of the runner's hard failure: the reason, zero paid
@@ -437,7 +444,7 @@ def test_cycle_keeps_the_stage_of_a_prefinalize_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
     monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         output = Path(argv[argv.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({
@@ -475,7 +482,7 @@ def test_cycle_result_carries_player_universe_gaps(tmp_path, monkeypatch):
     monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
     monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         output = Path(argv[argv.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({
@@ -647,7 +654,7 @@ def test_cycle_result_carries_rejected_rows_of_a_green_phase(tmp_path, monkeypat
         "bronze.sofascore_event_participants": {"invalid_enum_value": 1}
     }
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         output = Path(argv[argv.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({
@@ -686,7 +693,7 @@ def test_cycle_reports_a_partial_scope_as_a_finished_task(tmp_path, monkeypatch)
     monkeypatch.delenv(cycle.SCOPE_DEADLINE_ENV, raising=False)
     deadlines = []
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         import os
 
         deadlines.append(os.environ.get(cycle.SCOPE_DEADLINE_ENV))
@@ -738,7 +745,7 @@ def test_cycle_result_carries_elapsed_time_of_a_green_scope(tmp_path, monkeypatc
     monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: _scope())
     monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: paths)
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         output = Path(argv[argv.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({"errors": [], "traffic": {}}))
@@ -781,7 +788,7 @@ def test_cycle_deadline_is_capped_by_the_refresh_window(
     monkeypatch.delenv(cycle.SCOPE_DEADLINE_ENV, raising=False)
     deadlines = []
 
-    def run_capture(argv):
+    def run_capture(argv, **_kwargs):
         deadlines.append(float(os.environ[cycle.SCOPE_DEADLINE_ENV]))
         output = Path(argv[argv.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -838,3 +845,36 @@ def test_history_cycle_requires_matches_bronze_without_force(tmp_path, monkeypat
     monkeypatch.setenv("SOFASCORE_HISTORY_SEASON_EVIDENCE", "bronze")
     with pytest.raises(SystemExit):
         cycle.main(_cycle_argv(tmp_path, *flags))
+
+
+@pytest.mark.unit
+def test_phase_passes_one_manifest_store_between_planning_and_capture(tmp_path):
+    from scrapers.sofascore.manifest import InMemoryManifestStore
+    store = InMemoryManifestStore()
+    seen = []
+
+    def prepare(**kwargs):
+        seen.append(kwargs["manifest_store"])
+        return tmp_path / "plan.json"
+
+    def capture(argv, *, manifest_store):
+        seen.append(manifest_store)
+        return 0
+
+    with (patch("scrapers.sofascore.pipeline.build_manifest_store", return_value=store),
+          patch("dags.scripts.prepare_sofascore_workload.prepare_workload_plan", side_effect=prepare),
+          patch("dags.scripts.run_sofascore_scraper.main", side_effect=capture)):
+        result = cycle.run_phase("matches", {**_scope(), "run_id": "scope-1"},
+                                 output_dir=tmp_path,
+                                 workload_artifact=tmp_path / "policy.json")
+    assert result["status"] == "success"
+    assert seen == [store, store]
+
+
+@pytest.mark.unit
+def test_phase_report_preserves_availability_and_control_evidence(tmp_path):
+    report = {"control_match_ids": ["20", "21", "22"],
+              "control_basis": "unknownchronology:target_order", "before": {}, "after": {}}
+    path = tmp_path / "matches.json"
+    path.write_text(json.dumps({"endpoint_availability": report, "errors": []}))
+    assert cycle._phase_report(path)["endpoint_availability"] == report

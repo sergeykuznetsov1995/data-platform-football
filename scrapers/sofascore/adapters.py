@@ -212,6 +212,8 @@ class TrinoManifestStore(ManifestStore):
         )
         if not all(scope):
             raise ValueError("preload scope ids must not be empty")
+        if self._index is not None and self._index_scope == scope:
+            return len(self._index)
         rows = self.manager._execute(
             f"SELECT {self._select_columns()} FROM {self.qualified} "
             'WHERE "source_tournament_id" = ? AND "source_season_id" = ?',
@@ -230,6 +232,10 @@ class TrinoManifestStore(ManifestStore):
         self._index = index
         self._index_scope = scope
         return len(index)
+
+    def list_for_scope(self, source_tournament_id, source_season_id):
+        self.preload_scope(source_tournament_id, source_season_id)
+        return list(self._index.values())
 
     def _in_index_scope(self, key: ManifestKey) -> bool:
         return self._index is not None and self._index_scope == (
