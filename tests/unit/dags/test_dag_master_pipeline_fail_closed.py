@@ -348,7 +348,7 @@ def test_master_resolves_exact_successful_scheduled_fbref_control_run(
     store.renew_publication_lock.assert_called_once_with(
         expected_id,
         source="fbref",
-        ttl_seconds=8 * 24 * 60 * 60,
+        ttl_seconds=18 * 60 * 60,
     )
 
 

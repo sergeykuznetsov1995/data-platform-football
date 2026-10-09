@@ -289,7 +289,7 @@ def test_mini_dags_are_repository_files_hidden_only_from_the_shared_scheduler() 
         assert not any(re.match(pattern, name) for pattern in contour), f"contour must load {name}"
     for name in ("dag_ingest_sofascore.py", "dag_backfill_sofascore_all_mens.py", "dag_refresh_sofascore_all_mens.py"):
         assert not any(re.match(pattern, name) for pattern in contour), name
-    for foreign in ("dag_backup_whoscored_storage.py", "dag_ingest_fbref.py", "dag_sofascore_pipeline.py", "dag_iceberg_maintenance.py"):
+    for foreign in ("dag_backup_whoscored_storage.py", "dag_ingest_fbref.py", "dag_fbref_history_controller.py", "dag_sofascore_pipeline.py", "dag_iceberg_maintenance.py"):
         assert any(re.match(pattern, foreign) for pattern in contour), foreign
     # RE2: no lookahead in either file.
     assert "(?!" not in "".join(shared + contour)

@@ -2163,12 +2163,14 @@ def test_fbref_lease_is_scoped_metered_and_host_restricted(mod):
             "dag_ingest_fbref",
             "dag_bootstrap_fbref",
             "dag_backfill_fbref",
+            "dag_fbref_history_controller",
             "dag_accept_fbref_bronze",
         }
     )
     assert mod._source_for_dag("dag_ingest_fbref") == "fbref"
     assert mod._source_for_dag("dag_bootstrap_fbref") == "fbref"
     assert mod._source_for_dag("dag_backfill_fbref") == "fbref"
+    assert mod._source_for_dag("dag_fbref_history_controller") == "fbref"
     assert mod._source_for_dag("dag_accept_fbref_bronze") == "fbref"
     assert mod._source_for_dag("dag_replay_fbref_bronze") == ""
     lease = mod.Lease(

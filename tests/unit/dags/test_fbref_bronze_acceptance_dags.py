@@ -86,7 +86,7 @@ def test_acceptance_dag_is_one_strictly_sequential_live_batch(acceptance_dag):
         "execution_timeout"
     ].total_seconds() == 6 * 60 * 60 + 5 * 60
     assert tasks["acquire_publication_lock"].python_callable.__name__ == (
-        "acquire_fbref_acceptance_publication_lock"
+        "wait_fbref_publication_lock"
     )
     assert tasks["release_publication_lock"]._init_kwargs[
         "trigger_rule"
@@ -160,7 +160,7 @@ def test_replay_budget_is_physically_zero_and_topology_is_sequential(replay_dag)
         assert tasks[task_id].op_kwargs["trino_schema"]
         assert tasks[task_id].op_kwargs["persistence_mode"]
     assert tasks["acquire_publication_lock"].python_callable.__name__ == (
-        "acquire_fbref_acceptance_publication_lock"
+        "wait_fbref_publication_lock"
     )
     assert tasks["validate_acceptance_run"].op_kwargs["replay"] is True
 

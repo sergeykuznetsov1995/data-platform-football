@@ -7,17 +7,20 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
+from airflow.sensors.python import PythonSensor
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_bronze_acceptance_tasks import (
     ACCEPTANCE_REPLAY_DEFAULT_SCHEMA,
-    acquire_fbref_acceptance_publication_lock,
+
     initialize_fbref_acceptance_replay_run,
     parse_fbref_acceptance_replay,
     validate_fbref_acceptance_replay_readiness,
     validate_fbref_acceptance_run,
 )
 from utils.fbref_pipeline_tasks import (
+    FBREF_SCRAPER_POOL,
+    wait_fbref_publication_lock,
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
     fbref_dag_failure_callback,
@@ -41,7 +44,8 @@ PERSISTENCE_MODE = (
 
 with DAG(
     dag_id="dag_replay_fbref_bronze",
-    default_args=DEFAULT_ARGS,
+    default_args={**DEFAULT_ARGS, "pool": FBREF_SCRAPER_POOL,
+                  "priority_weight": 10, "weight_rule": "absolute"},
     description="Zero-network replay of one FBref Bronze acceptance run",
     schedule=None,
     start_date=datetime(2026, 7, 17),
@@ -109,12 +113,16 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    acquire_publication_lock = PythonOperator(
+    acquire_publication_lock = PythonSensor(
         task_id="acquire_publication_lock",
-        python_callable=acquire_fbref_acceptance_publication_lock,
-        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        python_callable=wait_fbref_publication_lock,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID, "ttl_seconds": 3 * 60 * 60},
         retries=0,
         trigger_rule="all_success",
+        mode="reschedule",
+        poke_interval=30,
+        timeout=3 * 60 * 60,
+        pool=FBREF_SCRAPER_POOL,
     )
 
     capture_raw_baseline = PythonOperator(

@@ -115,6 +115,7 @@ def test_paid_fbref_dag_allowlist_is_exact_and_bootstrap_can_acquire():
             "dag_ingest_fbref",
             "dag_bootstrap_fbref",
             "dag_backfill_fbref",
+            "dag_fbref_history_controller",
             "dag_accept_fbref_bronze",
         }
     )

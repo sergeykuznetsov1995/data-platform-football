@@ -168,10 +168,30 @@ _FRONTIER_SCOPE_CTE_TEMPLATE = """
                bool_or(competition.gender = 'female') AS has_female,
                bool_or(competition.gender = 'unknown') AS has_unknown,
                bool_or(
+                   competition.gender = 'male'
+                   AND competition.crawl_state = 'active'
+                   AND competition.lifecycle_state IN ('present', 'missing_once')
+                   AND competition.present
+                   AND (
+                       scope_frontier.page_kind = 'competition'
+                       OR (
+                           scoped.season_id IS NOT NULL
+                           AND season.lifecycle_state = 'present'
+                           AND season.present
+                           AND season.is_current
+                       )
+                   )
+               ) AS has_current_ownership,
+               bool_or(
                    competition.competition_id IS NOT NULL
                    AND (
                        competition.gender <> 'male'
-                       OR competition.crawl_state <> 'active'
+                       OR (competition.crawl_state <> 'active' AND NOT (
+                           scope_frontier.refresh_policy='historical_once'
+                           AND competition.crawl_state='skipped'
+                           AND competition.metadata->>'current_scope_lifecycle'='discontinued'
+                           AND competition.metadata->>'current_scope_reason' IS NOT NULL
+                       ))
                        OR competition.lifecycle_state NOT IN (
                            'present', 'missing_once'
                        )
@@ -195,6 +215,7 @@ _FRONTIER_SCOPE_CTE_TEMPLATE = """
                bool_or(scoped.season_id IS NULL)
                    AS has_competition_scope
         FROM canonical_scope AS scoped
+        JOIN fbref_control.page_frontier scope_frontier ON scope_frontier.target_id=scoped.target_id
         LEFT JOIN fbref_control.competition_registry AS competition
           ON competition.source = scoped.source
          AND competition.competition_id = scoped.competition_id
@@ -2346,7 +2367,8 @@ class ControlStore:
         *,
         dag_id: object,
         source: str = "fbref",
-        ttl_seconds: int = 8 * 24 * 60 * 60,
+        ttl_seconds: int = 18 * 60 * 60,
+        queue: bool = False,
     ) -> dict:
         """Acquire the source lock spanning Bronze through master Gold."""
 
@@ -2361,7 +2383,8 @@ class ControlStore:
                 cursor, normalized_source
             )
             cursor.execute(
-                "SELECT status FROM fbref_control.crawl_run WHERE run_id = %s",
+                ("SELECT status, run_type FROM fbref_control.crawl_run WHERE run_id = %s"
+                 if queue else "SELECT status FROM fbref_control.crawl_run WHERE run_id = %s"),
                 (normalized_run_id,),
             )
             run = _fetchone(cursor)
@@ -2369,6 +2392,48 @@ class ControlStore:
                 raise StateConflict(
                     "Publication lock owner must be an existing running run"
                 )
+            if not queue:
+                # Atomic current priority also applies to sealed legacy callers
+                # such as the janitor, whose acquire signature stays unchanged.
+                cursor.execute("""
+                    SELECT waiter.run_id AS priority_owner
+                    FROM fbref_control.publication_waiter waiter
+                    JOIN fbref_control.crawl_run queued_run ON queued_run.run_id=waiter.run_id
+                    JOIN fbref_control.crawl_run requester ON requester.run_id=%s
+                    WHERE waiter.source=%s AND queued_run.status='running'
+                      AND queued_run.run_type='current' AND requester.run_type<>'current'
+                      AND waiter.run_id<>requester.run_id
+                      AND NOT EXISTS (SELECT 1 FROM fbref_control.publication_lock owned
+                        WHERE owned.source=waiter.source AND owned.owner_run_id=requester.run_id
+                          AND owned.released_at IS NULL AND owned.expires_at>clock_timestamp())
+                    LIMIT 1
+                """, (normalized_run_id, normalized_source))
+                if _fetchone(cursor) is not None:
+                    raise StateConflict("FBref publication is locked by another control run")
+            if queue:
+                owned = self._select_publication_lock_for_update(cursor, normalized_source)
+                if owned and str(owned["owner_run_id"]) == normalized_run_id:
+                    if owned["released_at"] is not None or not bool(owned["active"]):
+                        raise StateConflict("Released or expired publication generation cannot be reacquired by the same run")
+                    # Queue order applies to new acquisitions. A committed owner
+                    # retry must finish/release, rather than wait on its own lock.
+                    cursor.execute("DELETE FROM fbref_control.publication_waiter WHERE source=%s AND run_id=%s",
+                                   (normalized_source, normalized_run_id))
+                    return {**owned, "acquired": False, "idempotent": True}
+                cursor.execute("""
+                    INSERT INTO fbref_control.publication_waiter(source,run_id,priority)
+                    VALUES (%s,%s,%s) ON CONFLICT(source,run_id) DO NOTHING
+                """, (normalized_source, normalized_run_id,
+                      100 if run["run_type"] == "current" else 10))
+                cursor.execute("""
+                    SELECT waiter.run_id FROM fbref_control.publication_waiter waiter
+                    JOIN fbref_control.crawl_run queued_run ON queued_run.run_id=waiter.run_id
+                    WHERE waiter.source=%s AND queued_run.status='running'
+                    ORDER BY waiter.priority DESC,waiter.queued_at,waiter.run_id LIMIT 1
+                """, (normalized_source,))
+                head = _fetchone(cursor)
+                if head and str(head["run_id"]) != normalized_run_id:
+                    return {"acquired": False, "queued": True}
             cursor.execute(
                 """
                 INSERT INTO fbref_control.publication_lock (
@@ -2409,12 +2474,17 @@ class ControlStore:
                         "Released or expired publication generation cannot "
                         "be reacquired by the same run"
                     )
+                if queue:
+                    cursor.execute("DELETE FROM fbref_control.publication_waiter WHERE source=%s AND run_id=%s",
+                                   (normalized_source, normalized_run_id))
                 return {
                     **lock,
                     "acquired": inserted,
                     "idempotent": not inserted,
                 }
             if bool(lock["active"]):
+                if queue:
+                    return {"acquired": False, "queued": True, "owner_run_id": current_owner}
                 raise StateConflict(
                     "FBref publication is locked by another control run"
                 )
@@ -2440,6 +2510,9 @@ class ControlStore:
                 ),
             )
             replaced = _fetchone(cursor)
+            if queue:
+                cursor.execute("DELETE FROM fbref_control.publication_waiter WHERE source=%s AND run_id=%s",
+                               (normalized_source, normalized_run_id))
             return {**replaced, "acquired": True, "idempotent": False}
 
     def release_publication_lock(
@@ -4405,6 +4478,24 @@ class ControlStore:
                 SELECT * FROM fbref_control.competition_registry
                 WHERE source = %s AND gender = 'male'
                   AND crawl_state = 'active'
+                  AND lifecycle_state IN ('present', 'missing_once')
+                  AND present
+                ORDER BY competition_id
+                """,
+                (_text(source, "source"),),
+            )
+            return _fetchall(cursor)
+
+    def eligible_historical_competitions(self, *, source: str = "fbref") -> list[dict]:
+        """Allow source-proven discontinued adult competitions in historical discovery."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.competition_registry
+                WHERE source = %s AND gender = 'male'
+                  AND (crawl_state = 'active' OR (crawl_state='skipped'
+                    AND metadata->>'current_scope_lifecycle'='discontinued'
+                    AND metadata->>'current_scope_reason' IS NOT NULL))
                   AND lifecycle_state IN ('present', 'missing_once')
                   AND present
                 ORDER BY competition_id
@@ -6725,6 +6816,19 @@ class ControlStore:
                       )
                     )
                   )
+                  AND (
+                    NOT EXISTS (SELECT 1 FROM fbref_control.crawl_run campaign_run
+                      WHERE campaign_run.run_id=%s AND campaign_run.metadata ? 'history_campaign')
+                    OR EXISTS (
+                      SELECT 1 FROM canonical_scope selected_scope
+                      JOIN fbref_control.crawl_run campaign_run ON campaign_run.run_id=%s
+                      CROSS JOIN LATERAL jsonb_array_elements(campaign_run.metadata->'history_seasons') selected
+                      WHERE selected_scope.target_id=frontier.target_id
+                        AND strpos(frontier.canonical_url,'#superseded:')=0
+                        AND selected_scope.competition_id=selected->>'competition_id'
+                        AND selected_scope.season_id=selected->>'season_id'
+                    )
+                  )
                   AND NOT EXISTS (
                       SELECT 1 FROM fbref_control.run_target AS existing
                       WHERE existing.run_id = %s
@@ -6766,6 +6870,8 @@ class ControlStore:
                     kinds,
                     policies,
                     policies,
+                    run,
+                    run,
                     run,
                     normalized_limit,
                 ),
@@ -7578,14 +7684,15 @@ class ControlStore:
                           )
                           AND NOT COALESCE(scope.has_female, false)
                           AND NOT COALESCE(scope.has_unknown, true)
+                          -- History may crawl a discontinued last edition,
+                          -- but that ownership cannot become current SLA debt.
+                          -- Activity and current season must share the same
+                          -- canonical/provenance scope, not separate witnesses.
+                          AND COALESCE(scope.has_current_ownership, false)
                           AND NOT COALESCE(
                               scope.inactive_competition, true
                           )
                           AND NOT COALESCE(scope.invalid_season, true)
-                          AND (
-                            frontier.page_kind = 'competition'
-                            OR COALESCE(scope.has_current_season, false)
-                          )
                         )
                       )
                 ), evaluated_scope AS (
@@ -8584,6 +8691,7 @@ class ControlStore:
         source: str = "fbref",
         page_kinds: Optional[Sequence[str]] = None,
         limit: int = 25,
+        history_run_id: Optional[str] = None,
     ) -> list[dict]:
         """Return one lane's raw missing the exact successful parse.
 
@@ -8636,6 +8744,26 @@ class ControlStore:
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL
                   AND (%s::text[] IS NULL OR frontier.page_kind = ANY(%s))
+                  AND (%s::uuid IS NULL OR EXISTS (
+                    SELECT 1 FROM fbref_control.crawl_run campaign_run
+                    CROSS JOIN LATERAL jsonb_array_elements(campaign_run.metadata->'history_seasons') selected
+                    WHERE campaign_run.run_id=%s AND (
+                      (frontier.source_ids->>'competition_id'=selected->>'competition_id'
+                       AND COALESCE((SELECT alias.season_id FROM fbref_control.season_alias alias
+                         WHERE alias.source=frontier.source
+                           AND alias.competition_id=frontier.source_ids->>'competition_id'
+                           AND alias.alias=frontier.source_ids->>'season_id'),
+                         frontier.source_ids->>'season_id')=selected->>'season_id')
+                      OR EXISTS (SELECT 1 FROM fbref_control.frontier_provenance edge
+                        WHERE edge.child_target_id=frontier.target_id
+                          AND edge.carried_competition_id=selected->>'competition_id'
+                          AND COALESCE((SELECT alias.season_id FROM fbref_control.season_alias alias
+                            WHERE alias.source=frontier.source
+                              AND alias.competition_id=edge.carried_competition_id
+                              AND alias.alias=edge.carried_season_id),
+                            edge.carried_season_id)=selected->>'season_id')
+                    )
+                  ))
                   AND NOT EXISTS (
                     SELECT 1
                     FROM fbref_control.observation_processing AS observed
@@ -8698,6 +8826,8 @@ class ControlStore:
                     lane_run_type,
                     kinds,
                     kinds,
+                    history_run_id,
+                    history_run_id,
                     parser,
                     typed_parser,
                     stateful_parser,

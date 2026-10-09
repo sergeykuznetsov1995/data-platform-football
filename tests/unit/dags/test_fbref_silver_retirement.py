@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[3]
 PARENTS = (
     "dags/utils/fbref_current_dag_factory.py",
     "dags/dag_backfill_fbref.py",
+    "dags/dag_fbref_history_controller.py",
     "dags/dag_replay_fbref.py",
 )
 
@@ -46,6 +47,7 @@ def test_ci_dagbag_counts_match_bronze_only_parent_topologies():
         in workflow
     )
     assert '"dag_replay_fbref": (root / "dags/dag_replay_fbref.py", 9)' in workflow
+    assert '"dag_fbref_history_controller": (root / "dags/dag_fbref_history_controller.py", 18)' in workflow
 
 
 @pytest.mark.parametrize("relative_path", PARENTS)

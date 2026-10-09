@@ -13,7 +13,7 @@
 --   1. Deploy the code.
 --   2. Run this read-only probe in the deployed scheduler; it must print the
 --      mapping version and cohort-policy SHA256 shown here:
---      docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import SEASON_INSTALL_REDIRECT_VERSION as v, _canonical_season_install_url as f; h=hashlib.sha256(inspect.getsource(ControlStore.create_due_run_cohort).encode()).hexdigest(); assert v == 'fbref-season-install-redirects-20260825-v1'; assert h == 'a96c7142b5e614efa9edbee722eb1b20c538e89901fedd11ac3b7c496088f2fd'; assert f('33','2026-2027','https://fbref.com/en/comps/33/2-Bundesliga-Stats') == 'https://fbref.com/en/comps/33/2'; assert f('59','2026-2027','https://fbref.com/en/comps/59/3-Liga-Stats') == 'https://fbref.com/en/comps/59/3'; print(v,h)"
+--      docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import SEASON_INSTALL_REDIRECT_VERSION as v, _canonical_season_install_url as f; h=hashlib.sha256(inspect.getsource(ControlStore.create_due_run_cohort).encode()).hexdigest(); assert v == 'fbref-season-install-redirects-20260825-v1'; assert h == '0dda965971f898747a7233de3ad349aaa723fe9be9324e92d2c1d890c8832395'; assert f('33','2026-2027','https://fbref.com/en/comps/33/2-Bundesliga-Stats') == 'https://fbref.com/en/comps/33/2'; assert f('59','2026-2027','https://fbref.com/en/comps/59/3-Liga-Stats') == 'https://fbref.com/en/comps/59/3'; print(v,h)"
 --   3. Apply this SQL while the active-run guard is clear. Its executable
 --      preflight must prove that the production cohort policy would choose
 --      comp59 then comp33 as prospective ordinals 0 and 1.
@@ -281,10 +281,30 @@ BEGIN
                    bool_or(competition.gender = 'female') AS has_female,
                    bool_or(competition.gender = 'unknown') AS has_unknown,
                    bool_or(
+                       competition.gender = 'male'
+                       AND competition.crawl_state = 'active'
+                       AND competition.lifecycle_state IN ('present', 'missing_once')
+                       AND competition.present
+                       AND (
+                           scope_frontier.page_kind = 'competition'
+                           OR (
+                               scoped.season_id IS NOT NULL
+                               AND season.lifecycle_state = 'present'
+                               AND season.present
+                               AND season.is_current
+                           )
+                       )
+                   ) AS has_current_ownership,
+                   bool_or(
                        competition.competition_id IS NOT NULL
                        AND (
                            competition.gender <> 'male'
-                           OR competition.crawl_state <> 'active'
+                           OR (competition.crawl_state <> 'active' AND NOT (
+                               scope_frontier.refresh_policy='historical_once'
+                               AND competition.crawl_state='skipped'
+                               AND competition.metadata->>'current_scope_lifecycle'='discontinued'
+                               AND competition.metadata->>'current_scope_reason' IS NOT NULL
+                           ))
                            OR competition.lifecycle_state NOT IN (
                                'present', 'missing_once'
                            )
@@ -308,6 +328,7 @@ BEGIN
                    bool_or(scoped.season_id IS NULL)
                        AS has_competition_scope
             FROM canonical_scope AS scoped
+            JOIN fbref_control.page_frontier scope_frontier ON scope_frontier.target_id=scoped.target_id
             LEFT JOIN fbref_control.competition_registry AS competition
               ON competition.source = scoped.source
              AND competition.competition_id = scoped.competition_id

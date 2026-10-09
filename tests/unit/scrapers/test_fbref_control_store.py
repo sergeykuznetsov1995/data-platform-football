@@ -1111,6 +1111,8 @@ def test_due_cohort_scope_is_narrowed_to_due_candidates():
         ["daily"],
         ["daily"],
         run_id,
+        run_id,
+        run_id,
         5,
     )
 

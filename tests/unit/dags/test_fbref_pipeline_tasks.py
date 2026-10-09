@@ -3515,6 +3515,7 @@ def _nonpublishing_summary(*, stale_kind: str | None = None) -> dict:
 def test_initialize_backfill_records_nonpublishing_evidence(monkeypatch):
     """T1: непубликующая история оставляет доказательство в метаданных рана."""
 
+    monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
     pipeline = MagicMock()
     pipeline.initialize_run.return_value = (
         "22222222-2222-4222-8222-222222222222"
@@ -3525,9 +3526,10 @@ def test_initialize_backfill_records_nonpublishing_evidence(monkeypatch):
 
     fbref_pipeline_tasks.initialize_fbref_run(
         airflow_run_id="manual__history",
-        dag_id="dag_backfill_fbref",
+        dag_id="dag_fbref_history_controller",
         run_type="backfill",
         publishing=False,
+        shard_size=1,
     )
 
     evidence = pipeline.initialize_run.call_args.kwargs["execution_metadata"]
@@ -3538,27 +3540,11 @@ def test_initialize_backfill_records_nonpublishing_evidence(monkeypatch):
 
 
 @pytest.mark.unit
-def test_initialize_backfill_default_keeps_publishing_evidence(monkeypatch):
-    """T1: у публикующего бэкфилла метаданные ровно прежние."""
-
-    pipeline = MagicMock()
-    monkeypatch.setattr(
-        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
-    )
-
-    fbref_pipeline_tasks.initialize_fbref_run(
-        airflow_run_id="manual__history",
-        dag_id="dag_backfill_fbref",
-        run_type="backfill",
-    )
-
-    assert pipeline.initialize_run.call_args.kwargs["execution_metadata"] == {
-        "bootstrap_only": False,
-        "dag_run_type": None,
-        "execution_mode": "backfill",
-        "publication_eligible": True,
-        "runtime_profile": "backfill",
-    }
+def test_initialize_backfill_default_publishing_is_rejected(monkeypatch):
+    monkeypatch.setenv("FBREF_HISTORY_CONTROLLER_ENABLED", "1")
+    with pytest.raises(ValueError, match="cannot publish"):
+        fbref_pipeline_tasks.initialize_fbref_run(airflow_run_id="manual__history",
+            dag_id="dag_fbref_history_controller",run_type="backfill",shard_size=1)
 
 
 @pytest.mark.unit
@@ -3719,14 +3705,14 @@ def test_history_window_guard_passes_a_small_evening_run():
     """T8: маленький вечерний ран проходит и объясняет свою проекцию."""
 
     verdict = fbref_pipeline_tasks.guard_fbref_history_window(
-        max_batches=8,
+        max_batches=4,
         shard_size=1,
         now=datetime(2026, 8, 12, 22, 30, tzinfo=timezone.utc),
     )
 
-    assert verdict["pages"] == 8
-    # 30 минут накладных + ceil(8 * 6.1 / 60) = 31 минута
-    assert verdict["projected_minutes"] == 31
+    assert verdict["pages"] == 4
+    # Fetch + parse: 30 минут накладных + 4 × 180 секунд.
+    assert verdict["projected_minutes"] == 42
     assert verdict["deadline"] == "2026-08-12T23:15:00+00:00"
 
 
@@ -3744,13 +3730,13 @@ def test_history_window_guard_margin_is_the_decisive_minute():
         "margin_minutes": 45,
     }
     passing = fbref_pipeline_tasks.guard_fbref_history_window(
-        now=datetime(2026, 8, 13, 5, 14, tzinfo=timezone.utc), **kwargs
+        now=datetime(2026, 8, 13, 5, 12, tzinfo=timezone.utc), **kwargs
     )
-    assert passing["projected_minutes"] == 1
+    assert passing["projected_minutes"] == 3
 
     with pytest.raises(AirflowFailException):
         fbref_pipeline_tasks.guard_fbref_history_window(
-            now=datetime(2026, 8, 13, 5, 14, 1, tzinfo=timezone.utc), **kwargs
+            now=datetime(2026, 8, 13, 5, 12, 1, tzinfo=timezone.utc), **kwargs
         )
 
 
@@ -3929,7 +3915,7 @@ def test_history_guard_next_window_deadline_exact_boundary(hour):
     from airflow.exceptions import AirflowFailException
 
     start = datetime(2026, 10, 1, hour, tzinfo=timezone.utc)
-    last_start = start + timedelta(hours=5, minutes=14)
+    last_start = start + timedelta(hours=5, minutes=12)
     kwargs = dict(max_batches=1, shard_size=1, overhead_minutes=0)
     verdict = fbref_pipeline_tasks.guard_fbref_history_window(now=last_start, **kwargs)
     assert verdict["projected_end"] == verdict["deadline"]

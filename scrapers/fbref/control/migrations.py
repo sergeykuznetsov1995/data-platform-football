@@ -899,6 +899,31 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=12,
+        name="history_campaign_and_publication_queue",
+        statements=(
+            """CREATE TABLE IF NOT EXISTS fbref_control.history_campaign_season (
+                campaign_id text NOT NULL,competition_id text NOT NULL,season_id text NOT NULL,
+                year integer NOT NULL,canonical_url text,
+                catalog_snapshot_id uuid REFERENCES fbref_control.registry_snapshot(snapshot_id),
+                direct_match_only boolean NOT NULL DEFAULT false,
+                state text NOT NULL CHECK (state IN ('pending','in_progress','closed','current_owned','unavailable','missing')),
+                discovered bigint NOT NULL DEFAULT 0,remaining bigint NOT NULL DEFAULT 0,
+                updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY(campaign_id,competition_id,season_id))""",
+            """CREATE TABLE IF NOT EXISTS fbref_control.history_timing (
+                run_id uuid PRIMARY KEY REFERENCES fbref_control.crawl_run(run_id),
+                pages integer NOT NULL CHECK(pages>0),fetch_ms bigint NOT NULL CHECK(fetch_ms>=0),
+                parse_ms bigint NOT NULL CHECK(parse_ms>=0),
+                observed_at timestamptz NOT NULL DEFAULT clock_timestamp())""",
+            """CREATE TABLE IF NOT EXISTS fbref_control.publication_waiter (
+                source text NOT NULL,run_id uuid NOT NULL REFERENCES fbref_control.crawl_run(run_id),
+                priority integer NOT NULL,queued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY(source,run_id))""",
+        ),
+    ),
+
 )
 
 

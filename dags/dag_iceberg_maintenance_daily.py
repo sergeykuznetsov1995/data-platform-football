@@ -26,6 +26,7 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.sensors.python import PythonSensor
 
 from utils.default_args import SILVER_ARGS
 
@@ -90,10 +91,16 @@ def _maintain_other_high_churn(**_ctx) -> Dict[str, Any]:
     return _fail_on_partial_maintenance(result, group="other high-churn feeds")
 
 
-def _maintain_fbref_stages(**_ctx) -> Dict[str, Any]:
+def _maintain_fbref_stages(*, reschedule_on_busy=False, **_ctx):
     from utils.fbref_maintenance import maintain_fbref_stages_with_lock_wait
 
-    return maintain_fbref_stages_with_lock_wait()
+    result = maintain_fbref_stages_with_lock_wait(
+        **({"reschedule_on_busy": True} if reschedule_on_busy else {})
+    )
+    if reschedule_on_busy and result is not False:
+        from airflow.sensors.base import PokeReturnValue
+        return PokeReturnValue(is_done=True, xcom_value=result)
+    return result
 
 
 with DAG(
@@ -129,12 +136,19 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    fbref_stage_janitor = PythonOperator(
+    fbref_stage_janitor = PythonSensor(
         task_id="janitor_fbref_generic_stages",
         python_callable=_maintain_fbref_stages,
-        # Up to 90 minutes waiting for the midnight ingest publication lock,
-        # followed by the existing 30-minute maintenance execution budget.
+        op_kwargs={"reschedule_on_busy": True},
+        mode="reschedule",
+        poke_interval=30,
+        timeout=90 * 60,
+        # Waiting pokes release the single FBref pool so ingest's tail can
+        # release publication ownership. Actual cleanup retains its time limit.
         execution_timeout=timedelta(minutes=120),
+        pool="fbref_scraper_pool",
+        priority_weight=10,
+        weight_rule="absolute",
     )
 
     fbref_stage_janitor >> cleanup_whoscored_dq_stage
