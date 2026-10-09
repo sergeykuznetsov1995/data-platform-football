@@ -205,7 +205,7 @@ class _LeaseClient:
         self.stats_calls += 1
         return self._stats(self.totals.popleft())
 
-    def begin_endpoint(self, lease, endpoint):
+    def begin_endpoint(self, lease, endpoint, *, endpoint_path=""):
         self.endpoint_counter += 1
         return f"endpoint-{self.endpoint_counter}"
 
@@ -966,6 +966,209 @@ def test_final_meter_tail_is_rejected_as_unattributed_traffic(tmp_path):
         )
 
 
+class _SyntheticTailClient(_LeaseClient):
+    def __init__(self, amounts=(100, 20), tails=(10, 5)):
+        super().__init__([], final_total=0)
+        self.amounts = deque(amounts)
+        self.tails = deque(tails)
+        self.total = 0
+        self.endpoint_map = {}
+        self.tail_owner = None
+        self.owner = None
+        self.closed = False
+        self.endpoint_paths = []
+
+    def stats(self, lease):
+        stats = self._stats(self.total, closed=self.closed)
+        stats.endpoint_request_provider_bytes = {
+            key: tuple(values) for key, values in self.endpoint_map.items()
+        }
+        return stats
+
+    def _seal_tail(self):
+        if self.tail_owner is not None:
+            amount = self.tails.popleft()
+            self.total += amount
+            self.endpoint_map[self.tail_owner].append(amount)
+            self.tail_owner = None
+
+    def begin_endpoint_with_stats(self, lease, endpoint, *, endpoint_path):
+        self._seal_tail()
+        self.owner = endpoint
+        self.endpoint_paths.append(endpoint_path)
+        self.endpoint_counter += 1
+        return f"endpoint-{self.endpoint_counter}", self.stats(lease)
+
+    def finish_endpoint(self, lease, request_id):
+        amount = self.amounts.popleft()
+        self.total += amount
+        self.endpoint_map.setdefault(self.owner, []).append(amount)
+        self.tail_owner = self.owner
+        self.owner = None
+        return self.stats(lease)
+
+    def drain(self, lease):
+        self._seal_tail()
+        self.closed = True
+        return self.stats(lease)
+
+    def close(self, lease, **kwargs):
+        assert kwargs["endpoint_request_provider_bytes"] == self.endpoint_map
+        assert self.closed
+        self.close_calls += 1
+        return self.stats(lease)
+
+
+class _OutstandingBudget(_Budget):
+    """A full reservation leaves no room for an unrelated tail reservation."""
+    def reserve(self, run_id, endpoint):
+        if self.reservations or self.spent >= self.policy.hard_run_bytes:
+            raise ProxyBudgetExceeded("local reservation has no remaining allowance")
+        return super().reserve(run_id, endpoint)
+
+
+def test_synthetic_tails_are_charged_to_their_owners_without_source_requests(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+    runtime.engine.budget = _OutstandingBudget()
+    budget = runtime.engine.budget
+    client = _SyntheticTailClient()
+    capture = _Capture([_record(b'{"items":[]}'), _record(b'{"items":[]}')])
+    factory = _TransportFactory(client, capture)
+    _, traffic = capture_live_specs(
+        runtime, [_spec(1, "event"), _spec(1, "lineups")],
+        canonical_url="https://www.sofascore.com/event/1", scope="match",
+        entity="match_capture", transport_factory=factory,
+    )
+    assert traffic["endpoint_request_provider_bytes"] == {
+        "event": [100, 10], "lineups": [20, 5],
+    }
+    assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == budget.spent == 135
+    assert traffic["source_request_count"] == 3  # one warm-up plus two fetches
+    assert traffic["request_count"] == 2
+    assert budget.reservations == {}
+    assert client.close_calls == 1
+    assert client.endpoint_paths == ["/api/v1/event/1/event", "/api/v1/event/1/lineups"]
+
+
+def test_zero_synthetic_tail_observations_preserve_the_exact_map(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+    client = _SyntheticTailClient(amounts=(100,), tails=(0,))
+    _, traffic = capture_live_specs(
+        runtime, [_spec(1)], canonical_url="https://www.sofascore.com/event/1",
+        scope="match", entity="match_capture",
+        transport_factory=_TransportFactory(client, _Capture([_record(b'{"items":[]}')])),
+    )
+    assert traffic["endpoint_request_provider_bytes"] == {"event": [100, 0]}
+    assert runtime.engine.budget.spent == 100
+
+
+@pytest.mark.parametrize("corruption", ("prefix", "unknown_owner", "meter"))
+def test_synthetic_tail_corruption_stops_before_the_next_fetch(tmp_path, corruption):
+    runtime, _ = _runtime(tmp_path)
+
+    class CorruptClient(_SyntheticTailClient):
+        def begin_endpoint_with_stats(self, lease, endpoint, *, endpoint_path):
+            boundary, stats = super().begin_endpoint_with_stats(
+                lease, endpoint, endpoint_path=endpoint_path,
+            )
+            if self.endpoint_counter == 2:
+                maps = {key: tuple(values) for key, values in self.endpoint_map.items()}
+                if corruption == "prefix":
+                    maps["event"] = (99, 11)
+                elif corruption == "unknown_owner":
+                    maps = {"event": (100,), "shotmap": (10,)}
+                else:
+                    maps["event"] = (100, 9)
+                stats.endpoint_request_provider_bytes = maps
+            return boundary, stats
+
+    capture = _Capture([_record(b'{"items":[]}'), _record(b'{"items":[]}')])
+    with pytest.raises(BudgetAccountingError):
+        capture_live_specs(
+            runtime, [_spec(1, "event"), _spec(1, "lineups")],
+            canonical_url="https://www.sofascore.com/event/1", scope="match",
+            entity="match_capture", transport_factory=_TransportFactory(CorruptClient(), capture),
+        )
+    assert len(capture.responses) == 1
+
+
+def test_synthetic_tail_meter_is_idempotent(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+    client = _SyntheticTailClient(amounts=(100,), tails=(10,))
+    factory = _TransportFactory(client, _Capture([_record(b'{"items":[]}')]))
+    capture_live_specs(
+        runtime, [_spec(1)], canonical_url="https://www.sofascore.com/event/1",
+        scope="match", entity="match_capture", transport_factory=factory,
+    )
+    snapshot = runtime.engine.metrics.snapshot()
+    factory.transport._sync_sealed_tails(client.stats(client.lease))
+    assert runtime.engine.metrics.snapshot()["paid_proxy_bytes"] == snapshot["paid_proxy_bytes"] == 110
+    assert runtime.engine.budget.spent == 110
+
+
+def test_final_synthetic_tail_requires_an_exact_drained_meter(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+
+    class UndrainedClient(_SyntheticTailClient):
+        def drain(self, lease):
+            stats = super().drain(lease)
+            stats.active_tunnels = 1
+            return stats
+
+    client = UndrainedClient(amounts=(100,), tails=(10,))
+    with pytest.raises(BudgetAccountingError, match="not final"):
+        capture_live_specs(
+            runtime, [_spec(1)], canonical_url="https://www.sofascore.com/event/1",
+            scope="match", entity="match_capture",
+            transport_factory=_TransportFactory(client, _Capture([_record(b'{"items":[]}')])),
+        )
+    assert client.close_calls == 0
+    assert runtime.engine.budget.spent == 100
+
+
+def test_ambiguous_local_tail_charge_is_never_repeated_by_close(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+
+    class AmbiguousBudget(_Budget):
+        def finish(self, run_id, token, *, reported_provider_bytes=None):
+            amount = super().finish(run_id, token, reported_provider_bytes=reported_provider_bytes)
+            if amount == 10:
+                raise OSError("local ledger failed after committing tail charge")
+            return amount
+
+    budget = AmbiguousBudget()
+    runtime.engine.budget = budget
+    capture = _Capture([_record(b'{"items":[]}'), _record(b'{"items":[]}')])
+    client = _SyntheticTailClient()
+    with pytest.raises(OSError, match="after committing"):
+        capture_live_specs(
+            runtime, [_spec(1, "event"), _spec(1, "lineups")],
+            canonical_url="https://www.sofascore.com/event/1", scope="match",
+            entity="match_capture", transport_factory=_TransportFactory(client, capture),
+        )
+    assert budget.spent == 110
+    assert client.close_calls == 0
+    assert len(capture.responses) == 1
+
+
+def test_final_close_cannot_change_the_sealed_tail_map(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+
+    class ChangedCloseClient(_SyntheticTailClient):
+        def close(self, lease, **kwargs):
+            stats = super().close(lease, **kwargs)
+            stats.endpoint_request_provider_bytes = {"event": (99, 11)}
+            return stats
+
+    client = ChangedCloseClient(amounts=(100,), tails=(10,))
+    with pytest.raises(BudgetAccountingError, match="changed the sealed meter"):
+        capture_live_specs(
+            runtime, [_spec(1)], canonical_url="https://www.sofascore.com/event/1",
+            scope="match", entity="match_capture",
+            transport_factory=_TransportFactory(client, _Capture([_record(b'{"items":[]}')])),
+        )
+
+
 def test_browser_failure_redacts_lease_token_from_manifest_and_exception(tmp_path):
     runtime, _ = _runtime(tmp_path)
     client = _LeaseClient([0, 0, 0], final_total=0, token="lease-secret")
@@ -1292,7 +1495,7 @@ class _RecordingCloseClient(_LeaseClient):
 class _EndpointConcurrentClient(_RecordingCloseClient):
     """The gateway latched the lease: the 2nd endpoint boundary is refused."""
 
-    def begin_endpoint(self, lease, endpoint):
+    def begin_endpoint(self, lease, endpoint, *, endpoint_path=""):
         if self.endpoint_counter == 1:
             raise SofascoreLeaseRejected(
                 "proxy lease API rejected POST /v1/leases/lease-1/endpoints "

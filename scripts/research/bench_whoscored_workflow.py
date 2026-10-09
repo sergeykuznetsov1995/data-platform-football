@@ -62,9 +62,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 
 _SEALED_BUNDLE_PATH = os.environ.pop("WHOSCORED_CAPACITY_BUNDLE_PATH", "")
-_SEALED_SITE_PACKAGES = os.environ.pop(
-    "WHOSCORED_CAPACITY_SITE_PACKAGES", ""
-)
+_SEALED_SITE_PACKAGES = os.environ.pop("WHOSCORED_CAPACITY_SITE_PACKAGES", "")
 if _SEALED_BUNDLE_PATH:
     if (
         not sys.flags.isolated
@@ -73,8 +71,7 @@ if _SEALED_BUNDLE_PATH:
         or not sys.dont_write_bytecode
         or re.fullmatch(r"/proc/self/fd/[0-9]+", _SEALED_BUNDLE_PATH) is None
         or not _SEALED_SITE_PACKAGES.startswith("/")
-        or Path(os.path.abspath(_SEALED_SITE_PACKAGES))
-        != Path(_SEALED_SITE_PACKAGES)
+        or Path(os.path.abspath(_SEALED_SITE_PACKAGES)) != Path(_SEALED_SITE_PACKAGES)
     ):
         raise RuntimeError("capacity sealed-runtime bootstrap is not isolated")
     trusted_stdlib = [
@@ -128,12 +125,12 @@ from scrapers.whoscored.repository import (  # noqa: E402
 from scrapers.whoscored.service import (  # noqa: E402
     DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE,
     MAX_STRUCTURED_REQUESTS_PER_MINUTE,
-    PLAYER_DETAILED_STAT_TABS,
-    PLAYER_STAGE_STAT_TABS,
-    TEAM_DETAILED_STAT_TABS,
-    TEAM_STAGE_STAT_TABS,
     STRUCTURED_REQUEST_BURST_SIZE,
     WhoScoredIngestService,
+)
+from scrapers.whoscored.detailed_feeds import (  # noqa: E402
+    DETAILED_FEED_CATALOG,
+    DetailedFeedFamily,
 )
 from scrapers.whoscored.stage_feeds import STAGE_TEAM_FEED_CATALOG  # noqa: E402
 from scrapers.whoscored.transport import (  # noqa: E402
@@ -142,6 +139,30 @@ from scrapers.whoscored.transport import (  # noqa: E402
     WhoScoredTransport,
 )
 from scrapers.base.flaresolverr_client import MAX_XHR_BATCH_URLS  # noqa: E402
+
+
+# The sealed capacity-v1 corpus and its existing consumer are a frozen legacy
+# workload. Do not couple their 68-feed contract to the current xG-only service.
+# These fixtures are not evidence of a successful production xG collection.
+TEAM_STAGE_STAT_TABS = (
+    ("summaryteam", "all", "Rating", "", "", ""),
+    ("summaryteam", "offensive", "shotsPerGame", "", "", ""),
+    ("summaryteam", "defensive", "tacklePerGame", "", "", ""),
+    ("xg-teamstats", "summary", "xG", "false", "true", "false"),
+)
+PLAYER_STAGE_STAT_TABS = (
+    ("summary", "all", False),
+    ("summary", "defensive", False),
+    ("summary", "offensive", False),
+    ("summary", "passing", False),
+    ("xg-stats", "summary", True),
+)
+TEAM_DETAILED_STAT_TABS = tuple(
+    spec for spec in DETAILED_FEED_CATALOG if spec.family is DetailedFeedFamily.TEAM
+)
+PLAYER_DETAILED_STAT_TABS = tuple(
+    spec for spec in DETAILED_FEED_CATALOG if spec.family is DetailedFeedFamily.PLAYER
+)
 
 
 LOG = logging.getLogger("bench_whoscored_workflow")
@@ -209,9 +230,7 @@ _CACHE_CAPACITY_SEED: Mapping[str, Any] = {
                 "playerId": 11,
                 "x": 25,
                 "y": 50,
-                "qualifiers": [
-                    {"type": {"value": 2, "displayName": "Cross"}}
-                ],
+                "qualifiers": [{"type": {"value": 2, "displayName": "Cross"}}],
             }
         ],
         "home": {
@@ -1420,9 +1439,10 @@ def _validate_args(args: argparse.Namespace) -> Optional[str]:
         or getattr(args, "flaresolverr_url", None) is not None
     ):
         return "cache-capacity-v1 forbids browser and network configuration"
-    if mode == DIRECT_DIAGNOSTIC_MODE and getattr(
-        args, "cache_seed_file", None
-    ) is not None:
+    if (
+        mode == DIRECT_DIAGNOSTIC_MODE
+        and getattr(args, "cache_seed_file", None) is not None
+    ):
         return "cache seed is valid only in cache-capacity-v1"
     scope = str(getattr(args, "scope", ""))
     if scope.count("=") != 1 or not all(part.strip() for part in scope.split("=", 1)):
@@ -1522,10 +1542,7 @@ def _apply_capacity_control(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def _dataset_statuses(datasets: Mapping[str, Any]) -> dict[str, str]:
-    return {
-        str(name): str(dataset.status.value)
-        for name, dataset in datasets.items()
-    }
+    return {str(name): str(dataset.status.value) for name, dataset in datasets.items()}
 
 
 def _cache_capacity_phase(
@@ -1565,10 +1582,9 @@ def _cache_capacity_phase(
                 {
                     **dict(row),
                     "entity_key": hashlib.sha256(
-                        (
-                            f"{stage_id}\0{row_index}\0"
-                            f"{row.get('source_path')}"
-                        ).encode("utf-8")
+                        (f"{stage_id}\0{row_index}\0{row.get('source_path')}").encode(
+                            "utf-8"
+                        )
                     ).hexdigest(),
                 }
             )
@@ -1591,9 +1607,7 @@ def _cache_capacity_phase(
         }
         for offset, stage_id in enumerate(stage_ids)
     )
-    feed_states = {
-        key: "not_available" for key in _expected_stage_feed_keys(stage_ids)
-    }
+    feed_states = {key: "not_available" for key in _expected_stage_feed_keys(stage_ids)}
     for stage_id in stage_ids:
         available_key = f"{stage_id}:team:summaryteam:all"
         if available_key not in feed_states:
@@ -1730,7 +1744,10 @@ def _cache_capacity_phase(
         "name": "cache_replay",
         "status": "success",
         "results": [
-            {"entity": "matches", "dataset_statuses": _dataset_statuses(match.datasets)},
+            {
+                "entity": "matches",
+                "dataset_statuses": _dataset_statuses(match.datasets),
+            },
             {
                 "entity": "previews",
                 "dataset_statuses": _dataset_statuses(preview.datasets),
@@ -1750,9 +1767,7 @@ def _cache_capacity_phase(
         ],
         "committed_rows": {
             "accepted_total": sum((metrics.get("accepted_rows") or {}).values()),
-            "idempotent_total": sum(
-                (metrics.get("idempotent_rows") or {}).values()
-            ),
+            "idempotent_total": sum((metrics.get("idempotent_rows") or {}).values()),
             "logical_current_total": sum(
                 (metrics.get("logical_current_rows") or {}).values()
             ),
@@ -1797,6 +1812,8 @@ def _run_cache_capacity(
             "retained": False,
         },
         "stage_statistics_contract": {
+            "policy": "legacy-capacity-68",
+            "production_xg_collection_evidence": False,
             "expected_feed_states_per_stage": 68,
         },
         "phases": [],
@@ -1861,8 +1878,10 @@ def _run_cache_capacity(
         report["paid_proxy_bytes"] = 0
         report["paid_route_requests"] = 0
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
-    code = 0 if report["status"] == "success" else (
-        2 if report["status"] == "configuration_error" else 1
+    code = (
+        0
+        if report["status"] == "success"
+        else (2 if report["status"] == "configuration_error" else 1)
     )
     return code, json.loads(json.dumps(report, sort_keys=True, default=str))
 
@@ -1942,6 +1961,8 @@ def run(
         },
         "paid_route_configured": False,
         "stage_statistics_contract": {
+            "policy": "legacy-capacity-68",
+            "production_xg_collection_evidence": False,
             "team_query_defaults": {
                 "page": "",
                 "numberOfTeamsToPick": "",

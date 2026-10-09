@@ -157,7 +157,7 @@ class FakeFSClient:
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
-        return result
+        return {"url": url, **result}
 
     def xhr_get(self, url, session_id, **kwargs):
         self.xhr_calls.append((url, session_id, kwargs))
@@ -5448,3 +5448,627 @@ def test_source_curl_timeout_keeps_timeout_policy_without_pool_rotation(monkeypa
     assert caught.value.retryable is True
     assert seen == urls[:1]
     assert sessions[1].calls == []
+
+
+# --- #1478: source-issued statistics token, same pooled session only ----------
+
+STAGE_TOKEN = "a" * 43 + "="
+
+
+def _statistics_html(script=None):
+    if script is None:
+        script = (
+            "window.require.config.params.site = {"
+            'gSiteHeaderName: "Model-last-Mode", '
+            f'gSiteHeaderValue: "{STAGE_TOKEN}"' + "};"
+        )
+    return (
+        "<html><head><script>" + script + "</script></head>"
+        '<body><div id="statistics-team-table-summary"></div></body></html>'
+    ).encode()
+
+
+@pytest.mark.unit
+def test_statistics_preparation_adds_source_token_to_same_http_session():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=_statistics_html()),
+        FakeHTTPResponse(content=b'{"teamTableStats":[]}'),
+    )
+    direct.cookies = requests.cookies.RequestsCookieJar()
+    direct.cookies.set("source-session", "fixture", domain="www.whoscored.com")
+    cache = KeyedMemoryRawCache()
+    transport, _ = _transport(direct, raw_cache=cache)
+    gate = []
+
+    prepared = transport.prepare_stage_statistics(
+        TEAM_STATS_BOOTSTRAP,
+        cache_key="bootstrap",
+        before_network=lambda: gate.append(1),
+        scope="scope",
+        entity="statistics_bootstrap",
+    )
+    result = transport.fetch(
+        TEAM_STATS_URL,
+        cache_key="feed",
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        validator=lambda response: json.loads(response.content) is not None,
+    )
+
+    assert transport.impersonate == "chrome142"
+    assert prepared.sha256 == hashlib.sha256(_statistics_html()).hexdigest()
+    assert prepared.route is result.route is TransportRoute.DIRECT_HTTP
+    assert cache.stored[0][1].content == _statistics_html()
+    assert gate == [1]
+    assert direct.calls[1][2]["headers"]["Model-last-Mode"] == STAGE_TOKEN
+    assert direct.calls[1][2]["headers"]["Referer"] == TEAM_STATS_BOOTSTRAP
+    assert direct.cookies.get("source-session") == "fixture"
+    stats = transport.get_traffic_stats()
+    assert stats["stage_xhr_token"] == {"available": 1, "curl_2xx_responses": 1}
+    assert STAGE_TOKEN not in json.dumps(stats)
+    assert "source-session" not in json.dumps(stats)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "script",
+    [
+        "",
+        'var gSiteHeaderName="wrong"; var gSiteHeaderValue="' + STAGE_TOKEN + '";',
+        'var gSiteHeaderName="Model-last-Mode"; var gSiteHeaderValue="bad";',
+        'var gSiteHeaderName="Model-last-Mode"; var gSiteHeaderValue=compute();',
+        'var gSiteHeaderName="Model-last-Mode"; var gSiteHeaderValue="'
+        + STAGE_TOKEN
+        + '" + "more";',
+        '// gSiteHeaderName="Model-last-Mode"; gSiteHeaderValue="' + STAGE_TOKEN + '";',
+        '/* gSiteHeaderName="Model-last-Mode"; gSiteHeaderValue="'
+        + STAGE_TOKEN
+        + '"; */',
+        'var template=`gSiteHeaderName="Model-last-Mode"; gSiteHeaderValue="'
+        + STAGE_TOKEN
+        + '";`; ',
+        "var example=\"gSiteHeaderName: 'Model-last-Mode', gSiteHeaderValue: '"
+        + STAGE_TOKEN
+        + "'\";",
+    ],
+)
+def test_complete_statistics_html_without_literal_token_is_source_absence(script):
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    cache = KeyedMemoryRawCache()
+    transport, _ = _transport(
+        FakeHTTPSession(FakeHTTPResponse(content=_statistics_html(script))),
+        raw_cache=cache,
+    )
+
+    with pytest.raises(StageStatisticsUnavailable) as caught:
+        transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+
+    assert caught.value.kind is FailureKind.CONTENT
+    assert caught.value.observed_at == cache.stored[0][1].observed_at
+    assert not caught.value.retryable
+    assert len(cache.stored) == 1
+    assert transport._stage_http_context is None
+    assert transport.get_traffic_stats()["stage_xhr_token"] == {"source_unavailable": 1}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'<html><body><div id="statistics-team-table-summary">',
+        b"<html><body>The page you requested does not exist.</body></html>",
+        b"<html><body>Maintenance</body></html>",
+    ],
+)
+def test_incomplete_statistics_html_is_not_source_absence(content):
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    fs = FakeFSClient()
+    transport, _ = _transport(
+        FakeHTTPSession(FakeHTTPResponse(content=content)), direct_fs=fs
+    )
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert caught.value.kind is FailureKind.CONTENT
+    assert not isinstance(caught.value, StageStatisticsUnavailable)
+    assert not fs.created
+
+
+@pytest.mark.unit
+def test_statistics_preparation_cf_uses_pool_and_replays_cookies():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(
+            status_code=403, content=CF_HTML, headers={"server": "cloudflare"}
+        ),
+        FakeHTTPResponse(content=b"{}"),
+    )
+    direct.cookies = requests.cookies.RequestsCookieJar()
+    direct.headers = {}
+    fs = FakeFSClient(
+        {
+            "html": _statistics_html().decode(),
+            "status": 200,
+            "cookies": [
+                {
+                    "name": "cf_clearance",
+                    "value": "fixture",
+                    "domain": "www.whoscored.com",
+                    "path": "/",
+                }
+            ],
+            "userAgent": "Chromium/142 fixture",
+        }
+    )
+    transport, _ = _transport(direct, direct_fs=fs)
+    transport._pool_proxy_url = "http://fixture.invalid:10000"
+
+    response = transport.prepare_stage_statistics(
+        TEAM_STATS_BOOTSTRAP, cache_key="bootstrap"
+    )
+    transport.fetch(TEAM_STATS_URL, browser_bootstrap_url=TEAM_STATS_BOOTSTRAP)
+
+    assert response.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert fs.created[0][1] == transport._pool_proxy_url
+    assert direct.cookies.get("cf_clearance") == "fixture"
+    assert direct.headers["User-Agent"] == "Chromium/142 fixture"
+    assert direct.calls[-1][2]["headers"]["Model-last-Mode"] == STAGE_TOKEN
+
+
+@pytest.mark.unit
+def test_statistics_preparation_preserves_cf_and_open_circuit_fail_closed():
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    circuit = FakeSourceCircuit(opened=True)
+    direct = FakeHTTPSession()
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs, source_circuit=circuit)
+    with pytest.raises(CloudflareChallenge) as caught:
+        transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert isinstance(caught.value.__cause__, SourceCircuitOpen)
+    assert not direct.calls and not fs.created
+    assert not isinstance(caught.value, StageStatisticsUnavailable)
+
+    circuit.opened = False
+    direct.responses = [
+        FakeHTTPResponse(
+            status_code=403, content=CF_HTML, headers={"server": "cloudflare"}
+        )
+    ]
+    fs.results = [FlareSolverrCFChallengeFailed("challenge")]
+    with pytest.raises(CloudflareChallenge):
+        transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert circuit.opened
+
+
+@pytest.mark.unit
+def test_statistics_raw_cache_precedes_circuit_and_does_not_bind_old_cookies():
+    cache = KeyedMemoryRawCache()
+    cache.payloads["bootstrap"] = CachedPayload(content=_statistics_html())
+    circuit = FakeSourceCircuit(opened=True)
+    direct = FakeHTTPSession()
+    transport, _ = _transport(direct, raw_cache=cache, source_circuit=circuit)
+    gate = []
+    result = transport.prepare_stage_statistics(
+        TEAM_STATS_BOOTSTRAP,
+        cache_key="bootstrap",
+        before_network=lambda: gate.append(1),
+    )
+    assert result.route is TransportRoute.RAW_CACHE
+    assert not direct.calls and not circuit.calls and not gate
+    assert transport._stage_http_context is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "url,referer",
+    [
+        (TEAM_STATS_URL, PLAYER_STATS_BOOTSTRAP),
+        (
+            TEAM_STATS_URL.replace("www.whoscored.com", "different.invalid"),
+            TEAM_STATS_BOOTSTRAP,
+        ),
+        (TEAM_STATS_URL.replace("23752", "23753"), TEAM_STATS_BOOTSTRAP),
+        (TEAM_STATS_URL + "&stageId=23753", TEAM_STATS_BOOTSTRAP),
+    ],
+)
+def test_statistics_token_never_crosses_bootstrap_host_or_stage(url, referer):
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=_statistics_html()), FakeHTTPResponse(content=b"{}")
+    )
+    transport, _ = _transport(direct)
+    transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    transport._http_fetch(
+        url, session=direct, route=TransportRoute.DIRECT_HTTP, referer=referer
+    )
+    assert "Model-last-Mode" not in direct.calls[-1][2].get("headers", {})
+
+
+@pytest.mark.unit
+def test_statistics_token_not_replayed_after_pool_rotation(monkeypatch, tmp_path):
+    first = FakeHTTPSession(FakeHTTPResponse(content=_statistics_html()), PROXY_407)
+    second = FakeHTTPSession(FakeHTTPResponse(content=b"{}"))
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, second)
+    transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    transport.fetch(TEAM_STATS_URL, browser_bootstrap_url=TEAM_STATS_BOOTSTRAP)
+    assert len(seen) == 2
+    assert "Model-last-Mode" not in second.calls[0][2]["headers"]
+    assert transport._stage_http_context is None
+
+
+@pytest.mark.unit
+def test_browser_batch_uses_pool_and_recreates_session_after_rotation(
+    monkeypatch, tmp_path
+):
+    first = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    second = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, second)
+    fs = FakeFSClient(
+        {"html": OK_HTML.decode(), "status": 200},
+        [_batch_solution(TEAM_STATS_URL)],
+        {"html": OK_HTML.decode(), "status": 200},
+        [_batch_solution(TEAM_STATS_URL)],
+    )
+    transport._direct_fs = fs
+
+    def request(key):
+        return [
+            FetchRequest(
+                url=TEAM_STATS_URL,
+                cache_key=key,
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+        ]
+
+    transport.fetch_many(request("one"))
+    assert transport._rotate_pool_proxy()
+    transport.fetch_many(request("two"))
+    assert [member for _, member in fs.created] == seen
+    assert fs.created[0][0] != fs.created[1][0]
+    assert fs.destroyed == [fs.created[0][0]]
+
+
+@pytest.mark.unit
+def test_cached_statistics_bootstrap_falls_back_to_pooled_browser_xhr():
+    cache = KeyedMemoryRawCache()
+    cache.payloads["bootstrap"] = CachedPayload(content=_statistics_html())
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(
+            status_code=403, content=CF_HTML, headers={"server": "cloudflare"}
+        )
+    )
+    fs = FakeFSClient(
+        {"html": _statistics_html().decode(), "status": 200},
+        [_batch_solution(TEAM_STATS_URL)],
+    )
+    transport, _ = _transport(direct, direct_fs=fs, raw_cache=cache)
+    transport._pool_proxy_url = "http://fixture.invalid:10000"
+    prepared = transport.prepare_stage_statistics(
+        TEAM_STATS_BOOTSTRAP, cache_key="bootstrap"
+    )
+    result = transport.fetch_many(
+        [
+            FetchRequest(
+                url=TEAM_STATS_URL,
+                cache_key="feed",
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                validator=lambda response: json.loads(response.content) is not None,
+            )
+        ]
+    )
+    assert prepared.route is TransportRoute.RAW_CACHE
+    assert "Model-last-Mode" not in direct.calls[0][2]["headers"]
+    assert result[0].route is TransportRoute.DIRECT_FLARESOLVERR
+    assert fs.created[0][1] == transport._pool_proxy_url
+    assert len(fs.xhr_many_calls) == 1
+
+
+@pytest.mark.unit
+def test_cached_statistics_bootstrap_preserves_binding_of_current_session():
+    cache = KeyedMemoryRawCache()
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=_statistics_html()), FakeHTTPResponse(content=b"{}")
+    )
+    transport, _ = _transport(direct, raw_cache=cache)
+    transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert (
+        transport.prepare_stage_statistics(
+            TEAM_STATS_BOOTSTRAP, cache_key="bootstrap"
+        ).route
+        is TransportRoute.RAW_CACHE
+    )
+    transport.fetch(TEAM_STATS_URL, browser_bootstrap_url=TEAM_STATS_BOOTSTRAP)
+    assert direct.calls[-1][2]["headers"]["Model-last-Mode"] == STAGE_TOKEN
+
+
+@pytest.mark.unit
+def test_statistics_path_feed_uses_token_for_matching_stage_only():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=_statistics_html()),
+        FakeHTTPResponse(content=b"{}"),
+        FakeHTTPResponse(content=b"{}"),
+    )
+    transport, _ = _transport(direct)
+    transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    for stage in ("23752", "23753"):
+        transport._http_fetch(
+            f"https://www.whoscored.com/stagestatfeed/{stage}/stageteams/",
+            session=direct,
+            route=TransportRoute.DIRECT_HTTP,
+            referer=TEAM_STATS_BOOTSTRAP,
+        )
+    assert direct.calls[1][2]["headers"]["Model-last-Mode"] == STAGE_TOKEN
+    assert "Model-last-Mode" not in direct.calls[2][2]["headers"]
+
+
+@pytest.mark.unit
+def test_statistics_cached_source_absence_keeps_original_observation_time():
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    observed_at = "2026-10-01T12:00:00+00:00"
+    cache = KeyedMemoryRawCache()
+    cache.payloads["bootstrap"] = CachedPayload(
+        content=_statistics_html(""), observed_at=observed_at
+    )
+    direct = FakeHTTPSession()
+    transport, _ = _transport(
+        direct, raw_cache=cache, source_circuit=FakeSourceCircuit(opened=True)
+    )
+    with pytest.raises(StageStatisticsUnavailable) as caught:
+        transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert caught.value.observed_at == observed_at
+    assert caught.value.route is TransportRoute.RAW_CACHE
+    assert not direct.calls
+
+
+@pytest.mark.unit
+def test_statistics_bootstrap_redirect_cannot_bind_destination_token():
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(
+            status_code=302,
+            content=_statistics_html(),
+            headers={"location": PLAYER_STATS_BOOTSTRAP},
+        )
+    )
+    transport, _ = _transport(direct)
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert caught.value.kind is FailureKind.HTTP_STATUS
+    assert not isinstance(caught.value, StageStatisticsUnavailable)
+    assert direct.calls[0][2]["allow_redirects"] is False
+    assert transport._stage_http_context is None
+
+
+# --- #1478 review: cache age and browser navigation evidence ------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "url",
+    [
+        TEAM_STATS_URL,
+        PLAYER_STATS_URL + "&currentPage=2",
+        "https://www.whoscored.com/Matches/123/Live",
+    ],
+)
+def test_cached_json_replay_preserves_original_observation_for_every_page(url):
+    observed_at = "2026-10-01T12:00:00+00:00"
+    cache = KeyedMemoryRawCache()
+    cache.payloads["json"] = CachedPayload(
+        content=b'{"teamTableStats":[]}', observed_at=observed_at
+    )
+    direct = FakeHTTPSession()
+    transport, _ = _transport(direct, raw_cache=cache)
+    result = transport.fetch(
+        url,
+        cache_key="json",
+        validator=lambda response: json.loads(response.content) is not None,
+    )
+    assert result.observed_at == observed_at
+    assert result.route is TransportRoute.RAW_CACHE
+    assert not direct.calls
+
+
+class _SourceURLFSApiSession:
+    """Offline API envelope exercises shared get/_post and source adaptation."""
+
+    def __init__(self, html, *, final_url=None, include_url=True):
+        self.html = html
+        self.final_url = final_url
+        self.include_url = include_url
+        self.posts = []
+
+    def post(self, url, *, json, timeout):
+        self.posts.append((url, dict(json), timeout))
+        document = {"status": "ok"}
+        if json["cmd"] == "request.get":
+            document["solution"] = {
+                "response": self.html.decode(),
+                "status": 200,
+                "cookies": [
+                    {
+                        "name": "source-session",
+                        "value": "from-browser",
+                        "domain": "www.whoscored.com",
+                        "path": "/",
+                    }
+                ],
+                "userAgent": "Chromium/142 fixture",
+            }
+            if self.include_url:
+                document["solution"]["url"] = self.final_url
+        content = transport_module.canonical_json_bytes(document)
+        return types.SimpleNamespace(
+            ok=True,
+            status_code=200,
+            text=content.decode(),
+            content=content,
+            json=lambda: document,
+        )
+
+    def close(self):
+        pass
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("script", [None, ""])
+def test_source_browser_url_adapter_accepts_exact_page_before_token_or_absence(script):
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    api = _SourceURLFSApiSession(
+        _statistics_html(script), final_url=TEAM_STATS_BOOTSTRAP
+    )
+    fs = transport_module.FlareSolverrClient(url="http://fixture.invalid:8191")
+    fs.session = api
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(
+            status_code=403, content=CF_HTML, headers={"server": "cloudflare"}
+        ),
+        FakeHTTPResponse(content=b"{}"),
+    )
+    direct.cookies = requests.cookies.RequestsCookieJar()
+    direct.headers = {}
+    cache = KeyedMemoryRawCache()
+    transport, _ = _transport(direct, direct_fs=fs, raw_cache=cache)
+    if script == "":
+        with pytest.raises(StageStatisticsUnavailable):
+            transport.prepare_stage_statistics(
+                TEAM_STATS_BOOTSTRAP, cache_key="bootstrap"
+            )
+    else:
+        result = transport.prepare_stage_statistics(
+            TEAM_STATS_BOOTSTRAP, cache_key="bootstrap"
+        )
+        assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+        transport.fetch(TEAM_STATS_URL, browser_bootstrap_url=TEAM_STATS_BOOTSTRAP)
+        assert direct.calls[-1][2]["headers"]["Model-last-Mode"] == STAGE_TOKEN
+    assert direct.cookies.get("source-session") == "from-browser"
+    assert len(cache.stored) >= 1
+    stats = fs.get_traffic_stats()
+    assert stats["requests"] == 1
+    assert stats["fs_response_bytes"] > 0
+    assert stats["sessions_created"] == 1
+    assert stats["top_traffic_urls"][0]["requests"] == 1
+    assert api.posts[1][1]["disableMedia"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "final_url,include_url",
+    [
+        (PLAYER_STATS_BOOTSTRAP, True),
+        (TEAM_STATS_BOOTSTRAP.replace("www.whoscored.com", "external.invalid"), True),
+        (None, False),
+        (None, True),
+    ],
+)
+@pytest.mark.parametrize("script", [None, ""])
+def test_source_browser_url_adapter_rejects_wrong_or_missing_page_before_replay(
+    final_url, include_url, script
+):
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    api = _SourceURLFSApiSession(
+        _statistics_html(script), final_url=final_url, include_url=include_url
+    )
+    fs = transport_module.FlareSolverrClient(url="http://fixture.invalid:8191")
+    fs.session = api
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(
+            status_code=403, content=CF_HTML, headers={"server": "cloudflare"}
+        )
+    )
+    direct.cookies = requests.cookies.RequestsCookieJar()
+    direct.headers = {}
+    cache = KeyedMemoryRawCache()
+    transport, _ = _transport(direct, direct_fs=fs, raw_cache=cache)
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.prepare_stage_statistics(TEAM_STATS_BOOTSTRAP, cache_key="bootstrap")
+    assert not isinstance(caught.value, StageStatisticsUnavailable)
+    assert caught.value.kind is FailureKind.BROWSER
+    assert not caught.value.retryable
+    assert not direct.cookies and not direct.headers
+    assert transport._stage_http_context is None
+    assert not cache.stored
+    assert [request[1]["cmd"] for request in api.posts] == [
+        "sessions.create",
+        "request.get",
+        "sessions.destroy",
+    ]
+    assert fs.get_traffic_stats()["requests"] == 1
+    assert transport.get_traffic_stats()["route_requests"]["direct_flaresolverr"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("batch", [False, True])
+def test_browser_statistics_feed_rejects_wrong_bootstrap_before_xhr(batch):
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {
+            "html": _statistics_html().decode(),
+            "status": 200,
+            "url": PLAYER_STATS_BOOTSTRAP,
+        }
+    )
+    direct.cookies = requests.cookies.RequestsCookieJar()
+    transport, _ = _transport(direct, direct_fs=fs)
+    with pytest.raises(WhoScoredTransportError) as caught:
+        if batch:
+            transport.fetch_many(
+                [
+                    FetchRequest(
+                        url=TEAM_STATS_URL,
+                        cache_key="feed",
+                        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                    )
+                ]
+            )
+        else:
+            transport.fetch(
+                TEAM_STATS_URL,
+                cache_key="feed",
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+    assert caught.value.kind is FailureKind.BROWSER
+    assert not fs.xhr_calls and not fs.xhr_many_calls
+    assert not direct.cookies
+    assert len(fs.destroyed) == 1
+
+
+@pytest.mark.unit
+def test_source_browser_url_adapter_retains_common_runtime_authority():
+    fs = transport_module.FlareSolverrClient(
+        url="http://fixture.invalid:8191",
+        expected_version="3.4.6",
+        expected_extension_sha256="a" * 64,
+    )
+    api = _SourceURLFSApiSession(_statistics_html(), final_url=TEAM_STATS_BOOTSTRAP)
+    api.get = lambda *args, **kwargs: types.SimpleNamespace(
+        ok=True,
+        json=lambda: {
+            "status": "ok",
+            "version": "unexpected",
+            "extension_sha256": "a" * 64,
+        },
+    )
+    fs.session = api
+    with pytest.raises(FlareSolverrRuntimeIdentityError):
+        fs.get(TEAM_STATS_BOOTSTRAP, "source-session")
+    assert not api.posts
+    assert fs.get_traffic_stats()["requests"] == 0
+
+
+@pytest.mark.unit
+def test_transport_source_browser_constructor_remains_patchable(monkeypatch):
+    created = []
+
+    def constructor(**kwargs):
+        created.append(kwargs)
+        return FakeFSClient()
+
+    monkeypatch.setattr(transport_module, "FlareSolverrClient", constructor)
+    transport = WhoScoredTransport(direct_http_session=FakeHTTPSession())
+    assert isinstance(transport._direct_fs, FakeFSClient)
+    assert isinstance(transport._paid_fs, FakeFSClient)
+    assert len(created) == 2
