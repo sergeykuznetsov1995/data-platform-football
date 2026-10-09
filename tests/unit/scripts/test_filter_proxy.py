@@ -9505,8 +9505,9 @@ def test_dead_exit_failover_is_refused_after_first_provider_payload_byte(
     )
 
     assert b"502 Bad Gateway" in bytes(client_writer.payload)
-    assert lease.accounting_uncertain is True
-    assert lease.accounting_uncertain_reason == "provider_connect_rejected_502"
+    assert lease.accounting_uncertain is False
+    assert lease.provider_rejected_connects == 1
+    assert lease.down_bytes == 1 + len(_DEAD_EXIT_RESPONSE)
     assert lease.upstream_repins == 0
     assert lease.upstream == ("pool.invalid", 10000, "u", "p")
 
@@ -10700,3 +10701,339 @@ def test_tm_provider_break_mid_tunnel_stays_uncertain(shared_mod, monkeypatch):
     assert lease.accounting_uncertain_reason == "provider_read_error"
     assert lease.provider_rejected_connects == 0
     assert not shared_mod.PROVIDER_REJECTED_CONNECTS
+
+
+def test_sofascore_1365_charge_failure_keeps_exception_chain(shared_mod, monkeypatch):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    def fail(*args):
+        try:
+            raise OSError("disk quota exceeded")
+        except OSError as exc:
+            raise RuntimeError("durable paid byte accounting failed") from exc
+    monkeypatch.setattr(shared_mod, "_account_lease_bytes", fail)
+    with pytest.raises(RuntimeError):
+        shared_mod._settle_observed_lease_bytes(lease, reservation=10, host="www.sofascore.com", direction="down", count=10)
+    report = lease.report()
+    assert report["accounting_uncertain_error_type"] == "RuntimeError"
+    assert "disk quota exceeded" in report["accounting_uncertain_error"]
+    assert report["accounting_uncertain_reason"] == "ledger_charge_failed"
+
+
+def test_sofascore_1365_endpoint_path_is_in_durable_records(shared_mod):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    shared_mod._finish_endpoint_request(lease, lease.current_request_id)
+    boundary = shared_mod._begin_endpoint_request(lease, "event", endpoint_path="/api/v1/event/123?token=secret")
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 7)
+    shared_mod._finish_endpoint_request(lease, boundary)
+    events = [json.loads(line) for line in Path(shared_mod.LEDGER_PATH).read_text().splitlines()]
+    byte_event = next(e for e in reversed(events) if e["event_type"] == "bytes")
+    assert byte_event["endpoint_path"] == "/api/v1/event/123"
+    assert byte_event["request_id"] == boundary
+    assert "secret" not in Path(shared_mod.LEDGER_PATH).read_text()
+
+
+def test_sofascore_1365_reaper_retries_only_terminal_wal(shared_mod, monkeypatch):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    shared_mod._latch_lease_accounting_uncertainty(lease, reason="test")
+    lease.latched_at -= shared_mod.LATCHED_SLOT_RECLAIM_GRACE_SECONDS + 1
+    append = shared_mod._append_allocation_wal
+    failed = False
+    def fail_once(kind, *args, **kwargs):
+        nonlocal failed
+        if kind == "allocation_finished" and not failed:
+            failed = True
+            raise OSError("WAL disk failure")
+        return append(kind, *args, **kwargs)
+    monkeypatch.setattr(shared_mod, "_append_allocation_wal", fail_once)
+    assert shared_mod._reap_expired_leases() == 0
+    assert lease.allocation_finish_persisted is True
+    assert lease.allocation_finished is False
+    assert shared_mod._reap_expired_leases() == 1
+    assert lease.allocation_finished is True
+    snap = shared_mod._allocation_ledger().snapshot(lease.workload_plan)
+    allocation = snap["allocations"][lease.allocation_id]
+    assert len(allocation["lease_stats"]) == 1
+    assert allocation["spent_provider_bytes"] == 0
+    assert allocation["completed"] is False
+
+
+def test_sofascore_1365_claim_replace_then_fsync_failure_rolls_back_durably(shared_mod, monkeypatch):
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 1000
+    ledger = shared_mod._allocation_ledger()
+    original = ledger._write
+    fail = True
+    def write_then_fail(value):
+        nonlocal fail
+        original(value)
+        if fail:
+            fail = False
+            raise OSError("directory fsync failure after replace")
+    monkeypatch.setattr(ledger, "_write", write_then_fail)
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    with pytest.raises(shared_mod._AccountingUnavailable):
+        shared_mod._create_lease(manager, max_bytes=1000, ttl_seconds=30, metadata=_sofascore_context(budget=1000), require_context=True)
+    assert manager.calls == 0
+    assert not shared_mod._PENDING_CLAIM_ROLLBACKS
+    assert all(v["finished"] for v in shared_mod._read_allocation_wal().values())
+    persisted = json.loads(Path(shared_mod.SOFASCORE_ALLOCATION_LEDGER_PATH).read_text())
+    assert all(a["active_claim"] is None for run in persisted["runs"].values() for a in run["allocations"].values())
+    lease = shared_mod._create_lease(manager, max_bytes=1000, ttl_seconds=30, metadata=_sofascore_context(budget=1000), require_context=True)
+    assert lease.max_bytes == 1000
+
+
+def test_sofascore_1365_synthetic_tail_has_durable_owner_and_immutable_observations(shared_mod):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    endpoint = lease.current_endpoint
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 100)
+    shared_mod._finish_endpoint_request(lease, lease.current_request_id)
+    shared_mod._begin_endpoint_request(lease, endpoint, endpoint_path="/api/v1/event/1")
+    lease.current_request_is_tail = True
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 10)
+    shared_mod._begin_endpoint_request(lease, "statistics", endpoint_path="/api/v1/event/1/statistics")
+    assert lease.endpoint_request_provider_bytes[endpoint] == [100, 10]
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 20)
+    shared_mod._finish_endpoint_request(lease, lease.current_request_id)
+    assert lease.total_bytes == 130
+    assert lease.endpoint_request_provider_bytes["statistics"] == [20]
+    assert lease.accounting_uncertain is False
+    assert sum(sum(v) for v in lease.endpoint_request_provider_bytes.values()) == lease.total_bytes
+
+
+def test_sofascore_1365_size_ceiling_refuses_new_lease_before_provider(shared_mod, monkeypatch):
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    shared_mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 1000
+    monkeypatch.setattr(shared_mod, "_sofascore_registry_bytes", lambda: shared_mod.SOFASCORE_REGISTRY_LIMIT_BYTES)
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    with pytest.raises(shared_mod._AccountingUnavailable, match="safe size"):
+        shared_mod._create_lease(manager, max_bytes=1000, ttl_seconds=30, metadata=_sofascore_context(budget=1000), require_context=True)
+    assert manager.calls == 0
+    assert not shared_mod.LEASES
+
+
+def test_sofascore_1365_control_tail_drain_then_complete_preserves_exact_map(shared_mod):
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_sofascore_lease(shared_mod, manager)
+    shared_mod._finish_endpoint_request(lease, lease.current_request_id)
+    lease.endpoint_request_provider_bytes.clear()
+    class Reader:
+        def __init__(self, body):
+            self.body = json.dumps(body).encode()
+        async def readexactly(self, count):
+            assert count == len(self.body)
+            return self.body
+    async def control(method, path, body={}):
+        reader = Reader(body)
+        writer = _ClientWriter()
+        await shared_mod._handle_control(method, path, {"x-proxy-control-token": shared_mod.CONTROL_TOKEN, "authorization": f"Bearer {lease.token}", "content-length": str(len(reader.body))}, reader, writer, manager)
+        head, payload = bytes(writer.payload).split(b"\r\n\r\n", 1)
+        return int(head.split()[1]), json.loads(payload)
+    async def scenario():
+        status, start = await control("POST", f"/v1/leases/{lease.lease_id}/endpoints", {"endpoint": "event", "endpoint_path": "/api/v1/event/1", "retain_tail_owner": True})
+        assert status == 201 and start["stats"]["endpoint_request_provider_bytes"] == {}
+        shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 100)
+        status, done = await control("DELETE", f"/v1/leases/{lease.lease_id}/endpoints/{start['request_id']}")
+        assert status == 200 and done["endpoint_request_provider_bytes"] == {"event": [100]}
+        assert lease.current_request_is_tail
+        shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 10)
+        status, start_b = await control("POST", f"/v1/leases/{lease.lease_id}/endpoints", {"endpoint": "statistics", "endpoint_path": "/api/v1/event/1/statistics", "retain_tail_owner": True})
+        assert status == 201 and start_b["stats"]["endpoint_request_provider_bytes"] == {"event": [100, 10]}
+        shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 20)
+        await control("DELETE", f"/v1/leases/{lease.lease_id}/endpoints/{start_b['request_id']}")
+        shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 5)
+        status, drained = await control("POST", f"/v1/leases/{lease.lease_id}/drain")
+        assert status == 200 and drained["closed"]
+        assert not lease.allocation_finished
+        expected = {"event": [100, 10], "statistics": [20, 5]}
+        assert drained["endpoint_request_provider_bytes"] == expected
+        status, closed = await control("DELETE", f"/v1/leases/{lease.lease_id}/close", {"endpoint_request_provider_bytes": expected, "completed": True})
+        assert status == 200 and closed["close_complete"]
+        assert closed["total_bytes"] == 135
+        assert lease.allocation_finished
+        assert not lease.accounting_uncertain
+        snap = shared_mod._allocation_ledger().snapshot(lease.workload_plan)
+        assert snap["allocations"][lease.allocation_id]["completed"] is True
+    asyncio.run(scenario())
+
+
+def test_sofascore_1365_endpoint_diagnostic_failure_does_not_repeat_wal(shared_mod, monkeypatch):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 13)
+    append = shared_mod._append_budget_event
+    def fail(kind, *args, **kwargs):
+        if kind == "endpoint_finished":
+            raise OSError("diagnostic disk failure")
+        return append(kind, *args, **kwargs)
+    monkeypatch.setattr(shared_mod, "_append_budget_event", fail)
+    boundary = lease.current_request_id
+    assert shared_mod._finish_endpoint_request(lease, boundary) == 13
+    assert lease.current_request_id == ""
+    with pytest.raises(ValueError, match="stale"):
+        shared_mod._finish_endpoint_request(lease, boundary)
+    state = shared_mod._read_allocation_wal()[lease.lease_id]
+    assert state["observations"] == {"event": [13]}
+    assert state["active_request_id"] == ""
+    shared_mod._finish_sofascore_claim(lease, completed=False)
+    assert shared_mod._read_allocation_wal()[lease.lease_id]["finished"]
+
+
+@pytest.mark.parametrize("fault", ["partial_write", "fsync"])
+def test_sofascore_1365_failed_wal_candidate_is_rolled_back_before_retry(shared_mod, monkeypatch, fault):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 13)
+    original = Path(shared_mod.SOFASCORE_ALLOCATION_WAL_PATH).read_bytes()
+    write = shared_mod.os.write
+    fsync = shared_mod.os.fsync
+    calls = 0
+    def flaky_write(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return write(fd, data[:len(data)//2])
+        if calls == 2:
+            raise OSError("partial WAL write failed")
+        return write(fd, data)
+    def flaky_fsync(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("ambiguous WAL fsync failed")
+        return fsync(fd)
+    with monkeypatch.context() as patch:
+        patch.setattr(shared_mod.os, "write" if fault == "partial_write" else "fsync", flaky_write if fault == "partial_write" else flaky_fsync)
+        with pytest.raises(shared_mod._AccountingUnavailable):
+            shared_mod._finish_endpoint_request(lease, lease.current_request_id)
+    assert Path(shared_mod.SOFASCORE_ALLOCATION_WAL_PATH).read_bytes() == original
+    assert lease.current_request_id
+    shared_mod._finish_endpoint_request(lease, lease.current_request_id)
+    assert shared_mod._read_allocation_wal()[lease.lease_id]["observations"] == {"event": [13]}
+
+
+@pytest.mark.parametrize("stage", ["read", "write", "drain"])
+def test_sofascore_1365_provider_io_failure_keeps_original_exception(shared_mod, stage):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    class Reader:
+        async def read(self, _size):
+            raise OSError("provider socket reset with diagnostic detail")
+    class Writer:
+        def write(self, _data):
+            if stage == "write":
+                raise OSError("provider write rejected with diagnostic detail")
+        async def drain(self):
+            if stage == "drain":
+                raise OSError("provider drain failed with diagnostic detail")
+        def close(self):
+            pass
+    async def scenario():
+        if stage == "read":
+            await shared_mod._pump(Reader(), Writer(), "www.sofascore.com", defaultdict(int), lease=lease, direction="down")
+        else:
+            with pytest.raises(OSError):
+                await shared_mod._write_upstream(Writer(), b"payload", lease=lease, host="www.sofascore.com", direction="up")
+    asyncio.run(scenario())
+    report = lease.report()
+    assert report["accounting_uncertain_error_type"] == "OSError"
+    assert "diagnostic detail" in report["accounting_uncertain_error"]
+    assert report["accounting_uncertain_reason"] == f"provider_{stage}_error"
+
+
+def test_sofascore_1365_recovery_attributes_exact_tail_after_unacknowledged_finish(shared_mod):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 13)
+    shared_mod._append_allocation_wal("endpoint_finished", lease.lease_id, request_id=lease.current_request_id, endpoint="event", provider_bytes=13)
+    # Disk retained a complete failed finish; the in-process old owner counted
+    # one more byte before revocation. Its exact journal survives the crash.
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 1)
+    shared_mod._RESTORED_ALLOCATION_LEASE_BYTES[lease.lease_id] = 14
+    assert shared_mod._recover_allocation_wal() == 1
+    snap = shared_mod._allocation_ledger().snapshot(lease.workload_plan)
+    allocation = snap["allocations"][lease.allocation_id]
+    assert allocation["spent_provider_bytes"] == 14
+    assert allocation["active_claim"] is None
+    assert allocation["lease_stats"][0]["endpoint_request_provider_bytes"] == {"event": [13, 1]}
+
+
+def test_sofascore_1365_pending_wal_rollback_blocks_compaction_and_appends(shared_mod, monkeypatch):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    fsync = shared_mod.os.fsync
+    with monkeypatch.context() as patch:
+        def fail(_fd):
+            raise OSError("persistent disk fault")
+        patch.setattr(shared_mod.os, "fsync", fail)
+        with pytest.raises(shared_mod._AccountingUnavailable):
+            shared_mod._append_allocation_wal("allocation_finished", lease.lease_id)
+        assert shared_mod._ALLOCATION_WAL_PENDING_ROLLBACK is not None
+        assert shared_mod._compact_sofascore_registry(shared_mod.SOFASCORE_ALLOCATION_WAL_PATH, kind="wal") is None
+        with pytest.raises(shared_mod._AccountingUnavailable):
+            shared_mod._append_allocation_wal("allocation_finished", lease.lease_id)
+    shared_mod._repair_allocation_wal_append()
+    assert shared_mod._ALLOCATION_WAL_PENDING_ROLLBACK is None
+    assert shared_mod._read_allocation_wal()[lease.lease_id]["finished"] is False
+
+
+def test_sofascore_1365_partial_paid_diagnostic_is_repaired_before_next_byte(shared_mod, monkeypatch):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 13)
+    write = shared_mod.os.write
+    calls = 0
+    def flaky(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # authoritative WAL succeeds first
+            return write(fd, data[:len(data)//2])
+        if calls == 3:
+            raise OSError("partial paid diagnostic failure")
+        return write(fd, data)
+    with monkeypatch.context() as patch:
+        patch.setattr(shared_mod.os, "write", flaky)
+        shared_mod._finish_endpoint_request(lease, lease.current_request_id)
+    assert shared_mod._PAID_LEDGER_PENDING_APPEND is None
+    shared_mod._begin_endpoint_request(lease, "statistics")
+    shared_mod._account_lease_bytes(lease, "www.sofascore.com", "down", 7)
+    events = [json.loads(line) for line in Path(shared_mod.LEDGER_PATH).read_bytes().splitlines()]
+    assert sum(e.get("bytes", 0) for e in events if e["event_type"] == "bytes") == 20
+    assert sum(e["event_type"] == "endpoint_finished" for e in events) == 1
+    assert shared_mod._read_allocation_wal()[lease.lease_id]["observations"] == {"event": [13]}
+
+
+@pytest.mark.parametrize("event_type", ["bytes", "endpoint_finished"])
+def test_sofascore_1365_pending_paid_append_blocks_io_and_repairs_once(shared_mod, monkeypatch, event_type):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    write = shared_mod.os.write
+    calls = 0
+    def persistent_fault(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return write(fd, data[:len(data)//2])
+        raise OSError("persistent paid append failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(shared_mod.os, "write", persistent_fault)
+        with pytest.raises(OSError):
+            shared_mod._append_budget_event(event_type, lease, direction="down", bytes=13)
+        assert shared_mod._PAID_LEDGER_PENDING_APPEND is not None
+        with pytest.raises(OSError):
+            shared_mod._reserve_lease_bytes(lease, 1)
+        assert lease.reserved_bytes == 0
+        with pytest.raises(OSError):
+            shared_mod._append_budget_event("lease_closed", lease)
+    shared_mod._repair_paid_ledger_append()
+    assert shared_mod._PAID_LEDGER_PENDING_APPEND is None
+    shared_mod._repair_paid_ledger_append()
+    events = [json.loads(line) for line in Path(shared_mod.LEDGER_PATH).read_bytes().splitlines()]
+    assert sum(e["event_type"] == event_type for e in events) == 1
+
+
+def test_sofascore_1365_head_timeout_keeps_original_cause(shared_mod):
+    lease = _make_sofascore_lease(shared_mod, _FakeManager(["http://u:p@pool.invalid:10000"]))
+    class Reader:
+        async def read(self, _size):
+            try:
+                raise OSError("provider poll failed with original detail")
+            except OSError as cause:
+                raise TimeoutError("CONNECT head deadline expired") from cause
+    with pytest.raises(shared_mod.UpstreamHeadTimeout):
+        asyncio.run(shared_mod._read_metered_provider_head(Reader(), lease, "www.sofascore.com", timeout_seconds=1))
+    report = lease.report()
+    assert report["accounting_uncertain_error_type"] == "TimeoutError"
+    assert "CONNECT head deadline expired" in report["accounting_uncertain_error"]
+    assert "provider poll failed with original detail" in report["accounting_uncertain_error"]
