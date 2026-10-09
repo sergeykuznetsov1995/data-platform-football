@@ -31,7 +31,7 @@ from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
 from .gate import Permit, TransportGate
-from .attempts import AttemptJournal
+from .attempts import AttemptJournal, safe_error_type
 from .raw_store import (
     EspnRawStore,
     RawJsonRecord,
@@ -95,12 +95,14 @@ class _ReadLimitExceeded(Exception):
 class _ResponseEncodingError(Exception):
     def __init__(self, direct_bytes: int, cause: Exception) -> None:
         self.direct_bytes = direct_bytes
+        self.error_type = type(cause).__name__
         self.__cause__ = cause
 
 
 class _ResponseReadTimeout(Exception):
-    def __init__(self, direct_bytes: int) -> None:
+    def __init__(self, direct_bytes: int, error_type: str) -> None:
         self.direct_bytes = direct_bytes
+        self.error_type = error_type
 
 
 class _ResponseReadFailure(Exception):
@@ -121,8 +123,10 @@ class _Attempts:
         self.step: Optional[int] = None
         self.content_encoding: Optional[str] = None
         self.origins: list[tuple[str, Optional[int]]] = []
+        self.http_diagnostics: dict = {}
 
     def start(self, permit: Permit) -> None:
+        self.http_diagnostics = {}
         self.count += 1
         self.origin = permit.origin
         self.step = permit.step
@@ -322,17 +326,20 @@ class EspnHttpClient:
             origin=permit.origin, endpoint=endpoint, lane=permit.lane,
             step=permit.step, measurement_id=self.measurement_id,
         )
+        tries.http_diagnostics = dict(attempt_id=attempt_id)
         response = None
         direct_bytes = 0
         timed_out = False
         complete = True
         request_failed = False
+        error_phase = 'request'
         started = self.monotonic_fn()
         try:
             response = self.session.get(
                 request_url, timeout=(self.connect_timeout, self.read_timeout),
                 stream=True, allow_redirects=False,
             )
+            error_phase = 'read'
             tries.finish(int(response.status_code))
             body, encoding = b"", None
             if 200 <= int(response.status_code) <= 299:
@@ -344,6 +351,11 @@ class EspnHttpClient:
             timed_out = isinstance(exc, (_ResponseReadTimeout, requests.Timeout,
                                         Urllib3ReadTimeoutError, TimeoutError))
             complete = timed_out  # other aborts cannot attest complete HTTP evidence
+            original_type = (exc.error_type if isinstance(exc, (
+                _ResponseReadTimeout, _ResponseReadFailure, _ResponseEncodingError,
+            )) else type(exc).__name__)
+            tries.http_diagnostics.update(error_type=safe_error_type(original_type),
+                                          error_phase=error_phase)
             raise
         finally:
             try:
@@ -355,6 +367,8 @@ class EspnHttpClient:
                 # its original classification. Otherwise use the read-failure
                 # path, which still reports an observed 403/429 to the gate.
                 if not request_failed:
+                    tries.http_diagnostics.update(error_type=safe_error_type(type(exc).__name__),
+                                                  error_phase='close')
                     raise _ResponseReadFailure(direct_bytes, type(exc).__name__) from None
             finally:
                 elapsed = max(0.0, (self.monotonic_fn() - started) * 1000.0)
@@ -363,6 +377,8 @@ class EspnHttpClient:
                         attempt_id, status=int(response.status_code) if response is not None else None,
                         timeout=timed_out, http_ms=elapsed, direct_bytes=direct_bytes,
                         complete=complete,
+                        error_type=tries.http_diagnostics.get('error_type'),
+                        error_phase=tries.http_diagnostics.get('error_phase'),
                     )
                 except BaseException:
                     # A failed measurement write stops this request, but must
@@ -749,7 +765,8 @@ class EspnHttpClient:
             disposition=disposition,
             error=ledger_error,
         )
-        raise error_type(message, ledger_entry=entry) from cause
+        diagnostics = tries.http_diagnostics if error_type is DirectTransportError else {}
+        raise error_type(message, ledger_entry=entry, **diagnostics) from cause
 
     def _read_response(self, response) -> tuple[bytes, int, str]:
         headers = response.headers or {}
@@ -776,7 +793,7 @@ class EspnHttpClient:
             try:
                 chunk = raw.read(min(64 * 1024, raw_limit - len(chunks)))
             except (requests.Timeout, Urllib3ReadTimeoutError, TimeoutError) as exc:
-                raise _ResponseReadTimeout(len(chunks)) from exc
+                raise _ResponseReadTimeout(len(chunks), type(exc).__name__) from exc
             except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
                 raise _ResponseReadFailure(len(chunks), type(exc).__name__) from None
             if not chunk:

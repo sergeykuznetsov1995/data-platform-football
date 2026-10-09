@@ -217,7 +217,12 @@ class InvalidJsonError(EspnTransportError):
 
 
 class DirectTransportError(EspnTransportError):
-    pass
+    def __init__(self, message: str, *, ledger_entry=None, attempt_id=None,
+                 error_type=None, error_phase=None) -> None:
+        super().__init__(message, ledger_entry=ledger_entry)
+        self.attempt_id = attempt_id
+        self.error_type = error_type
+        self.error_phase = error_phase
 
 
 def _nonnegative_int(value: object, field_name: str) -> int:

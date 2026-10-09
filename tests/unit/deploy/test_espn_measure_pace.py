@@ -268,6 +268,57 @@ def test_run_stop_drains_and_returns_to_accepted_step(controller, monkeypatch):
     assert c.gate.snapshot()['confirmed_ceiling'] == 0
 
 
+def test_request_error_correlates_with_durable_http_attempt(controller, monkeypatch):
+    import requests
+    from scrapers.espn import measure_pace
+    from scrapers.espn.transport import EspnHttpClient, DirectTransportError
+    from scrapers.espn.raw_store import EspnRawStore
+    from tests.unit.scrapers.test_espn_transport import FakeSession
+    from tests.unit.scrapers.test_espn_pace_report import Connection
+
+    c = controller
+    c.journal = AttemptJournal(c.store.path.parent/'attempts.sqlite3', utcnow_fn=c.clock)
+    c.trino.connection = Connection()
+    session = FakeSession([requests.ConnectionError('private URL token=secret')])
+    session.close = lambda: None
+    c.client_factory = lambda identity, check: EspnHttpClient(
+        EspnRawStore.from_uri((c.store.path.parent/'raw').as_uri()), gate=c.gate,
+        session=session, attempt_journal=c.journal, measurement_id=identity,
+        utcnow_fn=c.clock, environ={}, before_attempt=check)
+
+    def one_failure(items, fetch, *, client_factory, **_kwargs):
+        client = client_factory(0)
+        try:
+            fetch(client, next(items))
+        except DirectTransportError as exc:
+            yield 1, None, exc
+        else:
+            pytest.fail('transport failure expected')
+        c.cancel.set()
+    monkeypatch.setattr(measure_pace, 'bounded_fetch', one_failure)
+    c.run_locked()
+    row, = c.journal.rows()
+    error = PaceStore(c.store.path).latest('request_error')
+    assert {k: error[k] for k in ('error', 'attempt_id', 'error_type', 'error_phase')} == {
+        'error': 'DirectTransportError', 'attempt_id': row['attempt_id'],
+        'error_type': 'ConnectionError', 'error_phase': 'request'}
+    assert row['complete'] is False and c.journal.pending() == 0
+    assert 'private' not in json.dumps(error)
+
+
+def test_request_error_without_http_diagnostics_keeps_legacy_shape(controller, monkeypatch):
+    from scrapers.espn import measure_pace
+    from scrapers.espn.transport import DirectTransportError
+    c = controller
+    def one_failure(*_args, **_kwargs):
+        yield 1, None, DirectTransportError('raw store failure')
+        c.cancel.set()
+    monkeypatch.setattr(measure_pace, 'bounded_fetch', one_failure)
+    c.run_locked()
+    assert c.store.latest('request_error') == {
+        'at': c.now().timestamp(), 'error': 'DirectTransportError'}
+
+
 def test_accepted_ids_exact_season_and_cardinality():
     queries = []
     trino = SimpleNamespace(execute_query=lambda sql: queries.append(sql) or [[i] for i in range(380)])

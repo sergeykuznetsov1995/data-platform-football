@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import requests
 from pyarrow import fs
+from urllib3.exceptions import ProtocolError
 
 from scrapers.espn.gate import TransportGate, load_transport_policy
 from scrapers.espn.raw_store import EspnRawStore, RawTargetCorrupt
@@ -920,6 +921,99 @@ def test_response_close_failure_still_reports_429_once(monkeypatch, tmp_path):
     assert len(client.gate.snapshot()['resets']) == 1
     row, = client.attempt_journal.rows()
     assert row['status'] == 429 and not row['complete']
+
+
+@pytest.mark.parametrize('phase', ['request', 'read', 'close'])
+@pytest.mark.parametrize('error_class', [requests.ConnectionError, requests.exceptions.SSLError, ProtocolError])
+def test_transport_failure_diagnostics_survive_restart_and_publication(monkeypatch, tmp_path, phase, error_class):
+    from scrapers.espn.attempts import AttemptJournal, ATTEMPT_COLUMNS
+    from tests.unit.scrapers.test_espn_pace_report import Connection, query
+    from scrapers.espn.pace_report import render_attempt_sql
+
+    secret = 'https://private.invalid/?token=secret'
+    response = FakeResponse(200, b'{}')
+    if phase == 'read':
+        class BrokenBody:
+            def __init__(self): self.reads = 0
+            def read(self, _size):
+                self.reads += 1
+                if self.reads == 1:
+                    return b'{"partial":'
+                raise error_class(secret)
+        response.raw = BrokenBody()
+    elif phase == 'close':
+        def broken_close():
+            raise error_class(secret)
+        response.close = broken_close
+    responses = [error_class(secret)] if phase == 'request' else [response]
+    client, session, _, _ = _client(monkeypatch, tmp_path, responses)
+    start = client.utcnow_fn()
+    try:
+        with pytest.raises(DirectTransportError) as caught:
+            client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary',
+                              'summary', {'event': '1'}, force_refresh=True)
+        assert len(session.calls) == 1
+        row, = client.attempt_journal.rows()
+        assert row['error_type'] == error_class.__name__
+        assert row['error_phase'] == phase
+        assert caught.value.attempt_id == row['attempt_id']
+        assert caught.value.error_type == row['error_type']
+        assert caught.value.error_phase == phase
+        assert not row['complete'] and not row['timeout'] and row['http_ms'] is not None
+        assert row['status'] == (None if phase == 'request' else 200)
+        assert row['direct_bytes'] == {'request': 0, 'read': len(b'{"partial":'), 'close': 2}[phase]
+        assert 'private' not in json.dumps(row)
+        restarted = AttemptJournal(client.attempt_journal.path)
+        assert restarted.rows() == [row]
+        end = start + timedelta(minutes=1)
+        assert not restarted.coverage(start, end)
+        conn = Connection()
+        assert restarted.flush(conn) == 1
+        assert restarted.pending() == 0 and restarted.flush(conn) == 0
+        assert restarted.rows() == [row]
+        assert query(conn, render_attempt_sql(start, end))[0][-1] == 1
+        assert not {'error_type', 'error_phase'} & {name for name, _ in ATTEMPT_COLUMNS}
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('phase,close_fails', [('request', False), ('read', False), ('read', True)])
+def test_timeout_diagnostics_preserve_original_failure(monkeypatch, tmp_path, phase, close_fails):
+    response = FakeResponse(200)
+    if phase == 'read':
+        response.raw = PartialTimeoutRaw(b'{"partial":')
+    if close_fails:
+        def broken_close():
+            raise requests.ConnectionError('private close details')
+        response.close = broken_close
+    responses = [requests.Timeout('private timeout details')] if phase == 'request' else [response]
+    client, _, _, _ = _client(monkeypatch, tmp_path, responses, max_attempts=1)
+    try:
+        with pytest.raises(RetryExhausted):
+            client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary',
+                              'summary', {'event': '1'}, force_refresh=True)
+        row, = client.attempt_journal.rows()
+        assert row['timeout'] and row['status'] == (None if phase == 'request' else 200)
+        assert row['complete'] is (not (phase == 'read' and close_fails))
+        assert row['error_type'] == 'Timeout' and row['error_phase'] == phase
+        assert 'private' not in json.dumps(row)
+    finally:
+        client.close()
+
+
+def test_exception_class_name_is_allowlisted_before_persistence(monkeypatch, tmp_path):
+    private_error = type('private_token_secret', (requests.ConnectionError,), {})
+    client, _, _, _ = _client(monkeypatch, tmp_path, [private_error('secret')])
+    try:
+        with pytest.raises(DirectTransportError) as caught:
+            client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary',
+                              'summary', {'event': '1'}, force_refresh=True)
+        row, = client.attempt_journal.rows()
+        assert row['error_type'] == 'OtherTransportError'
+        assert caught.value.error_type == 'OtherTransportError'
+        assert 'private' not in json.dumps(row)
+    finally:
+        client.close()
 
 
 def test_pre_attempt_rechecks_stop_after_wait_before_http(tmp_path, monkeypatch):

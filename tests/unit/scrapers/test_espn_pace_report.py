@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 import threading
 
 import duckdb
@@ -123,6 +124,29 @@ def test_spool_contains_no_url_query_or_exception_secret(tmp_path):
     journal = AttemptJournal(tmp_path/'attempts.sqlite3')
     with pytest.raises(ValueError): begin(journal, origin=WEB+'/?token=secret')
     assert journal.rows() == []
+
+
+def test_diagnostic_fields_are_optional_and_sanitized_at_journal_boundary(tmp_path):
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3', utcnow_fn=lambda: START)
+    legacy = begin(journal)
+    finish(journal, legacy)
+    # An existing completed row from before diagnostics has neither field.
+    with journal._db() as db:
+        payload = json.loads(db.execute('SELECT payload FROM attempts WHERE id=?', (legacy,)).fetchone()[0])
+        payload.pop('error_type', None)
+        payload.pop('error_phase', None)
+        db.execute('UPDATE attempts SET payload=? WHERE id=?', (json.dumps(payload), legacy))
+    journal = AttemptJournal(journal.path)
+    assert 'error_type' not in journal.rows()[0] and 'error_phase' not in journal.rows()[0]
+    assert journal.coverage(START, START+timedelta(minutes=1))
+    failure = begin(journal, START+timedelta(seconds=1))
+    journal.finish(failure, status=None, timeout=False, http_ms=5, direct_bytes=0,
+                   complete=False, error_type='private URL token=secret',
+                   error_phase='private stage')
+    row = journal.rows()[1]
+    assert row['error_type'] == 'OtherTransportError' and row['error_phase'] is None
+    assert 'private' not in str(row) and 'secret' not in str(row)
+    assert not journal.coverage(START, START+timedelta(minutes=1))
 
 
 def test_coverage_changes_when_a_known_good_window_gains_an_incomplete_attempt(tmp_path):
