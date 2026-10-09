@@ -2840,6 +2840,965 @@ def test_scope_bundle_recovers_only_its_unpublished_partial_batch(monkeypatch):
     assert len(writer.write_dataframe.call_args_list) == 3
 
 
+def test_scope_spool_retains_published_identity_after_business_normalization(tmp_path):
+    with WhoScoredScopeRowSpool(
+        table="whoscored_player_stage_stats", league="L", season="S",
+        directory=str(tmp_path),
+    ) as spool:
+        source = {"league": "L", "season": "S", "stage_id": 1,
+                  "source_category": "xg-stats", "numeric_value": 1.5}
+        spool.append_entity_rows([source])
+        original = list(spool)[0]
+        normalized = {**original, "player": None, "text_value": None}
+        assert (
+            spool._entity_key(
+                {key: value for key, value in normalized.items() if key != "entity_key"}
+            )
+            != original["entity_key"]
+        )
+        original_fingerprint = spool.content_fingerprint()
+
+        with WhoScoredScopeRowSpool(
+            table=spool.table,
+            league="L",
+            season="S",
+            directory=str(tmp_path),
+        ) as retained:
+            retained.append_published_rows(iter([normalized]))
+            assert list(retained) == [normalized]
+            assert retained.content_fingerprint() == original_fingerprint
+            retained.append_published_rows([normalized])
+            assert len(retained) == 1
+            with pytest.raises(ValueError, match="source row already has entity_key"):
+                retained.append_entity_rows([normalized])
+
+
+@pytest.mark.parametrize("key", [None, "", "a" * 63, "a" * 65, "A" * 64, "g" * 64, 123])
+def test_scope_spool_rejects_missing_or_invalid_published_key(tmp_path, key):
+    with WhoScoredScopeRowSpool(
+        table="whoscored_player_stage_stats",
+        league="L",
+        season="S",
+        directory=str(tmp_path),
+    ) as spool:
+        row = {"league": "L", "season": "S", "stage_id": 1}
+        if key is not None:
+            row["entity_key"] = key
+        with pytest.raises(ValueError, match="64-lowerhex entity_key"):
+            spool.append_published_rows([row])
+        assert len(spool) == 0
+        assert not spool.columns
+
+
+@pytest.mark.parametrize("column", ["league", "season"])
+def test_scope_spool_rejects_published_rows_from_another_scope(tmp_path, column):
+    with WhoScoredScopeRowSpool(
+        table="whoscored_player_stage_stats",
+        league="L",
+        season="S",
+        directory=str(tmp_path),
+    ) as spool:
+        row = {"league": "L", "season": "S", "entity_key": "a" * 64, column: "OTHER"}
+        with pytest.raises(ValueError, match=f"{column}=.*outside"):
+            spool.append_published_rows([row])
+        assert len(spool) == 0
+
+
+def test_scope_spool_published_rows_flush_in_bounded_batches(tmp_path, monkeypatch):
+    import scrapers.whoscored.repository as repository_module
+
+    monkeypatch.setattr(repository_module, "_SPOOL_INSERT_BATCH_ROWS", 2)
+    with WhoScoredScopeRowSpool(
+        table="whoscored_player_stage_stats",
+        league="L",
+        season="S",
+        directory=str(tmp_path),
+    ) as spool:
+        observations = []
+
+        def rows():
+            for index in range(7):
+                observations.append(len(spool))
+                yield {
+                    "entity_key": f"{index:064x}",
+                    "league": "L",
+                    "season": "S",
+                    "numeric_value": float(index),
+                }
+
+        spool.append_published_rows(rows())
+        assert observations == [0, 0, 2, 2, 4, 4, 6]
+        assert len(spool) == 7
+        assert [row["entity_key"] for row in spool] == [
+            f"{index:064x}" for index in range(7)
+        ]
+
+
+class _StageFeedStorage:
+    """Physical rows and manifests with current-view publication semantics."""
+
+    def __init__(self):
+        self.tables = {}
+        self.manifests = []
+        self.queries = []
+        self.deletes = []
+        self.fail_manifest = False
+        self.lock_events = []
+
+    def table_exists(self, schema, table):
+        return table in self.tables
+
+    def get_table_columns(self, schema, table):
+        return list(
+            dict.fromkeys(column for row in self.tables[table] for column in row)
+        )
+
+    @staticmethod
+    def _literal(sql, column):
+        found = re.search(rf"\b{column} = '([^']*)'", sql)
+        return found.group(1) if found else None
+
+    def _published(self, sql, table=None):
+        league = self._literal(sql, "league")
+        season = self._literal(sql, "season")
+        batch = self._literal(sql, "batch_id")
+        manifests = [
+            row
+            for row in self.manifests
+            if row["league"] == league
+            and row["season"] == season
+            and row["state"] == "success"
+            and (batch is None or row["batch_id"] == batch)
+        ]
+        tables = re.findall(r"\$\.(whoscored_\w+)'", sql)
+        if table:
+            tables = [table]
+        if tables:
+            manifests = [
+                row
+                for row in manifests
+                if any(t in json.loads(row["entity_counts_json"]) for t in tables)
+            ]
+        return manifests
+
+    def _current(self, sql, table):
+        manifests = self._published(sql, table)
+        batch = manifests[-1]["batch_id"] if manifests else None
+        return [
+            row
+            for row in self.tables.get(table, [])
+            if row["league"] == self._literal(sql, "league")
+            and row["season"] == self._literal(sql, "season")
+            and row.get("_scope_batch_id") == batch
+        ]
+
+    def execute_query(self, sql):
+        self.queries.append(sql)
+        if "whoscored_scope_ingest_manifest" in sql:
+            manifests = self._published(sql)
+            if not manifests:
+                return []
+            latest = manifests[-1]
+            if sql.startswith("SELECT entity_counts_json, dataset_states_json"):
+                return [(latest["entity_counts_json"], latest["dataset_states_json"])]
+            if sql.startswith("SELECT entity_counts_json"):
+                return [(latest["entity_counts_json"],)]
+            if sql.startswith("SELECT batch_id, raw_uris_json"):
+                return [
+                    tuple(
+                        latest[key]
+                        for key in (
+                            "batch_id",
+                            "raw_uris_json",
+                            "payload_sha256",
+                            "parser_version",
+                            "dataset_states_json",
+                        )
+                    )
+                ]
+            if sql.startswith("SELECT batch_id"):
+                return [(latest["batch_id"],)]
+        table = re.search(r"FROM iceberg\.bronze\.(whoscored_\w+)", sql).group(1)
+        current = table.endswith("_current")
+        table = table.removesuffix("_current")
+        rows = (
+            self._current(sql, table)
+            if current
+            else [
+                row
+                for row in self.tables.get(table, [])
+                if row["league"] == self._literal(sql, "league")
+                and row["season"] == self._literal(sql, "season")
+                and row.get("_scope_batch_id") == self._literal(sql, "_scope_batch_id")
+            ]
+        )
+        category = self._literal(sql, "source_category")
+        if category:
+            rows = [row for row in rows if row.get("source_category") == category]
+        if sql.startswith("SELECT COUNT(*)"):
+            return [(len(rows),)]
+        if sql.startswith("SELECT stage_id, source_category, COUNT(*)"):
+            counts = {}
+            for row in rows:
+                key = (row["stage_id"], row["source_category"])
+                counts[key] = counts.get(key, 0) + 1
+            return [
+                (stage, category, count) for (stage, category), count in counts.items()
+            ]
+        stages = re.search(r"stage_id IN \(([^)]+)\)", sql)
+        stage_ids = {int(value) for value in stages.group(1).split(",")}
+        rows = [row for row in rows if row["stage_id"] in stage_ids]
+        after = re.search(r"entity_key > '([^']+)'", sql)
+        if after:
+            rows = [row for row in rows if row["entity_key"] > after.group(1)]
+        rows.sort(key=lambda row: row["entity_key"])
+        limit = int(re.search(r"LIMIT (\d+)", sql).group(1))
+        columns = re.findall(r'"([^"]+)"', sql.split(" FROM ")[0])
+        return [tuple(row.get(column) for column in columns) for row in rows[:limit]]
+
+    def _execute(self, sql):
+        self.deletes.append(sql)
+        table = re.search(r"DELETE FROM iceberg\.bronze\.(\w+)", sql).group(1)
+        league, season = self._literal(sql, "league"), self._literal(sql, "season")
+        if "_scope_batch_id IN (SELECT batch_id" in sql:
+            assert "_scope_batch_id IS NOT NULL" in sql
+            assert sql.count(f"league = '{league}'") == 3
+            assert sql.count(f"season = '{season}'") == 3
+            kept = re.search(r"_scope_batch_id <> '([^']+)'", sql).group(1)
+            published = self._published(sql, table)
+            assert published[-1]["batch_id"] == kept
+            candidates = {row["batch_id"] for row in published} - {kept}
+        else:
+            candidates = {self._literal(sql, "_scope_batch_id")}
+        self.tables[table] = [
+            row
+            for row in self.tables[table]
+            if not (
+                row["league"] == league
+                and row["season"] == season
+                and row.get("_scope_batch_id") in candidates
+            )
+        ]
+
+    def write_dataframe(self, frame, *, table, **kwargs):
+        if table == "whoscored_scope_ingest_manifest":
+            if self.fail_manifest:
+                raise RuntimeError("publication failed")
+            self.manifests.extend(frame.to_dict("records"))
+        else:
+            self.tables.setdefault(table, []).extend(frame.to_dict("records"))
+
+    def seed(
+        self,
+        *,
+        batch="legacy",
+        league="L",
+        season="S",
+        rows=None,
+        entity_group="season",
+        states=None,
+        table="whoscored_player_stage_stats",
+    ):
+        records = rows or [_xg_row("old-xg", 1), _xg_row("old-family", 1, "summary")]
+        self.tables.setdefault(table, []).extend(
+            {**row, "league": league, "season": season, "_scope_batch_id": batch}
+            for row in records
+        )
+        self.manifests.append(
+            {
+                "league": league,
+                "season": season,
+                "entity_group": entity_group,
+                "batch_id": batch,
+                "state": "success",
+                "payload_sha256": "b" * 64,
+                "parser_version": "whoscored-parser-v7",
+                "raw_uris_json": '["s3://old"]',
+                "entity_counts_json": json.dumps({table: len(records)}),
+                "dataset_states_json": json.dumps(states or {table: "available"}),
+            }
+        )
+
+
+def _xg_row(key, stage_id, category="xg-stats"):
+    return {
+        "entity_key": key,
+        "stage_id": stage_id,
+        "source_category": category,
+        "league": "L",
+        "season": "S",
+        "numeric_value": 1.5,
+    }
+
+
+def _xg_scope_commit(repository, rows, **kwargs):
+    return repository.commit_scope_bundle(
+        league="L",
+        season="S",
+        entity_group="stages",
+        datasets={"whoscored_player_stage_stats": rows},
+        distinct_keys={"whoscored_player_stage_stats": "entity_key"},
+        payload_sha256="a" * 64,
+        raw_uris=["s3://new"],
+        feed_policy="xg-only-v1",
+        **kwargs,
+    )
+
+
+def test_xg_policy_replaces_legacy_families_and_cleans_only_displaced_scope():
+    storage = _StageFeedStorage()
+    storage.seed()
+    storage.seed(batch="other", league="OTHER")
+    storage.seed(batch="other-season", season="OTHER")
+    table = "whoscored_player_stage_stats"
+    storage.tables[table].extend(
+        [
+            {**_xg_row("unpublished", 1), "_scope_batch_id": "hidden"},
+            {**_xg_row("null-legacy", 1), "_scope_batch_id": None},
+        ]
+    )
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+
+    batch = _xg_scope_commit(repository, [_xg_row("new-xg", 1)])
+
+    assert {row["entity_key"] for row in storage.tables[table]} == {
+        "new-xg",
+        "old-xg",
+        "old-family",
+        "unpublished",
+        "null-legacy",
+    }
+    assert (
+        len([row for row in storage.tables[table] if row["_scope_batch_id"] == batch])
+        == 1
+    )
+    assert not any(row["_scope_batch_id"] == "legacy" for row in storage.tables[table])
+    assert len(storage.deletes) == 1
+
+
+def test_xg_completeness_rejects_stage_shrink_hidden_by_another_stage_growth():
+    storage = _StageFeedStorage()
+    storage.seed(rows=[_xg_row("a", 1), _xg_row("b", 1), _xg_row("c", 2)])
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+
+    with pytest.raises(ValueError, match="stage=1.*new=1, old=2"):
+        _xg_scope_commit(
+            repository,
+            [
+                _xg_row("new-a", 1),
+                _xg_row("new-b", 2),
+                _xg_row("new-c", 2),
+            ],
+        )
+
+    assert len(storage.manifests) == 1
+    assert not storage.deletes
+
+
+def test_team_xg_policy_compares_feed_rows_and_ignores_old_nonxg_families():
+    storage = _StageFeedStorage()
+    table = "whoscored_team_stage_stats"
+    storage.seed(
+        table=table,
+        rows=[
+            _xg_row("old-xg", 1, "xg-teamstats"),
+            _xg_row("old-family", 1, "summary"),
+        ],
+    )
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    row = _xg_row("new-xg", 1, "xg-teamstats")
+
+    batch = repository.commit_scope_bundle(
+        league="L",
+        season="S",
+        entity_group="stages",
+        datasets={table: [row]},
+        distinct_keys={table: "entity_key"},
+        payload_sha256="a" * 64,
+        raw_uris=["s3://new"],
+        feed_policy="xg-only-v1",
+    )
+
+    assert batch.startswith("wss2-")
+    assert not storage.deletes  # Cleanup is scoped only to the player table.
+    assert [
+        row["entity_key"]
+        for row in repository.iter_stage_xg_rows(
+            "L",
+            "S",
+            table=table,
+            stage_ids=[1],
+        )
+    ] == ["new-xg"]
+
+
+def test_xg_policy_rejects_removal_of_a_whole_published_stage():
+    storage = _StageFeedStorage()
+    storage.seed(rows=[_xg_row("a", 1), _xg_row("b", 2)])
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    with pytest.raises(ValueError, match="stage=2.*new=0, old=1"):
+        _xg_scope_commit(repository, [_xg_row("new-a", 1), _xg_row("new-b", 1)])
+
+
+def test_xg_cleanup_does_not_run_when_another_player_batch_is_latest():
+    storage = _StageFeedStorage()
+    storage.seed(batch="old")
+    storage.seed(batch="latest")
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    repository._cleanup_superseded_player_stage_batches(
+        league="L",
+        season="S",
+        batch_id="old",
+        expected=2,
+    )
+    assert not storage.deletes
+
+
+def test_xg_manifest_and_cleanup_hold_player_table_and_scope_locks(monkeypatch):
+    from contextlib import contextmanager
+
+    storage = _StageFeedStorage()
+    storage.seed()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    active = []
+
+    @contextmanager
+    def locks(identities):
+        active.extend(identities)
+        try:
+            yield
+        finally:
+            for identity in identities:
+                active.remove(identity)
+
+    def verify_locks():
+        assert "scope:L:S:stages" in active
+        assert "scope-stage:L:S" in active
+        assert "scope-table:whoscored_player_stage_stats" in active
+
+    original_write = storage.write_dataframe
+    original_delete = storage._execute
+
+    def write(frame, *, table, **kwargs):
+        if table == "whoscored_scope_ingest_manifest":
+            verify_locks()
+        return original_write(frame, table=table, **kwargs)
+
+    def delete(sql):
+        verify_locks()
+        return original_delete(sql)
+
+    monkeypatch.setattr(repository, "_commit_locks", locks)
+    monkeypatch.setattr(storage, "write_dataframe", write)
+    monkeypatch.setattr(storage, "_execute", delete)
+    _xg_scope_commit(repository, [_xg_row("new", 1)])
+    assert active == []
+
+
+def test_xg_retry_recovers_cleanup_failure_after_successful_publication(monkeypatch):
+    storage = _StageFeedStorage()
+    storage.seed()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    delete = storage._execute
+    monkeypatch.setattr(
+        storage, "_execute", MagicMock(side_effect=RuntimeError("delete interrupted"))
+    )
+
+    with pytest.raises(RuntimeError, match="delete interrupted"):
+        _xg_scope_commit(repository, [_xg_row("new", 1)])
+    assert len(storage.manifests) == 2
+    batch = storage.manifests[-1]["batch_id"]
+    monkeypatch.setattr(storage, "_execute", delete)
+    assert _xg_scope_commit(repository, [_xg_row("new", 1)]) == batch
+    assert len(storage.manifests) == 2
+    assert len(storage.tables["whoscored_player_stage_stats"]) == 1
+
+
+def test_public_stage_cleanup_recovers_committed_failure_with_locks_and_scope_isolation(
+    monkeypatch,
+):
+    from contextlib import contextmanager
+
+    storage = _StageFeedStorage()
+    storage.seed()
+    storage.seed(batch="other", league="OTHER")
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    delete = storage._execute
+    monkeypatch.setattr(
+        storage, "_execute", MagicMock(side_effect=RuntimeError("cleanup failed"))
+    )
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        _xg_scope_commit(
+            repository,
+            [_xg_row("new", 1)],
+            feed_checks={
+                "1": {"checked_at": "2026-10-09T12:00:00Z", "final": True},
+            },
+        )
+    batch = storage.manifests[-1]["batch_id"]
+    manifest_count = len(storage.manifests)
+    active = []
+
+    @contextmanager
+    def locks(identities):
+        active.extend(identities)
+        try:
+            yield
+        finally:
+            for identity in identities:
+                active.remove(identity)
+
+    def locked_delete(sql):
+        assert "scope:L:S:stages" in active
+        assert "scope-stage:L:S" in active
+        assert "scope-table:whoscored_player_stage_stats" in active
+        delete(sql)
+
+    monkeypatch.setattr(repository, "_commit_locks", locks)
+    monkeypatch.setattr(storage, "_execute", locked_delete)
+    repository.cleanup_stage_feed_snapshot("L", "S", batch_id=batch)
+    repository.cleanup_stage_feed_snapshot("L", "S", batch_id=batch)
+
+    assert active == []
+    assert len(storage.manifests) == manifest_count
+    assert {
+        row["_scope_batch_id"] for row in storage.tables["whoscored_player_stage_stats"]
+    } == {batch, "other"}
+
+
+@pytest.mark.parametrize(
+    "batch,league,error",
+    [
+        ("missing", "L", "is not published"),
+        ("legacy", "L", "does not use xg-only-v1"),
+        ("legacy", "OTHER", "is not published"),
+    ],
+)
+def test_public_stage_cleanup_refuses_unknown_legacy_or_cross_scope_manifest(
+    batch, league, error
+):
+    storage = _StageFeedStorage()
+    storage.seed()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    with pytest.raises(BatchConflict, match=error):
+        repository.cleanup_stage_feed_snapshot(league, "S", batch_id=batch)
+    assert not storage.deletes
+
+
+@pytest.mark.parametrize("count", [None, -1, True, "1"])
+def test_public_stage_cleanup_refuses_invalid_player_manifest_count(count):
+    storage = _StageFeedStorage()
+    storage.seed(states={"__feed_policy__": "xg-only-v1"})
+    storage.manifests[-1]["entity_counts_json"] = json.dumps(
+        {
+            "whoscored_player_stage_stats": count,
+        }
+    )
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    with pytest.raises(BatchConflict, match="valid published player count"):
+        repository.cleanup_stage_feed_snapshot("L", "S", batch_id="legacy")
+    assert not storage.deletes
+
+
+def test_public_stage_cleanup_skips_obsolete_xg_snapshot():
+    storage = _StageFeedStorage()
+    storage.seed(batch="old", states={"__feed_policy__": "xg-only-v1"})
+    storage.seed(batch="latest", states={"__feed_policy__": "xg-only-v1"})
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    repository.cleanup_stage_feed_snapshot("L", "S", batch_id="old")
+    assert not storage.deletes
+
+
+def test_xg_cleanup_verifies_retained_physical_count_after_delete(monkeypatch):
+    storage = _StageFeedStorage()
+    storage.seed()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+
+    def corrupt_delete(sql):
+        storage.tables["whoscored_player_stage_stats"].clear()
+
+    monkeypatch.setattr(storage, "_execute", corrupt_delete)
+    with pytest.raises(BatchConflict, match="cleanup kept=0, expected=1"):
+        _xg_scope_commit(repository, [_xg_row("new", 1)])
+
+
+def test_scope_identity_is_unchanged_without_explicit_policy_and_checks():
+    storage = _StageFeedStorage()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    kwargs = dict(
+        league="L",
+        season="S",
+        entity_group="season",
+        datasets={"whoscored_schedule": [{"game_id": 1}]},
+        distinct_keys={"whoscored_schedule": "game_id"},
+        payload_sha256="a" * 64,
+        raw_uris=["s3://new"],
+    )
+    import hashlib
+
+    legacy_identity = json.dumps(
+        {
+            "league": "L",
+            "season": "S",
+            "entity_group": "season",
+            "payload_sha256": "a" * 64,
+            "parser_version": PARSER_VERSION,
+            "feed_states": {},
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    batch = repository.commit_scope_bundle(**kwargs)
+    assert batch == "wss2-" + hashlib.sha256(legacy_identity.encode()).hexdigest()
+    explicit = repository.commit_scope_bundle(**kwargs, feed_checks={})
+    assert explicit != batch
+
+
+def test_xg_publication_failure_never_cleans_published_rows():
+    storage = _StageFeedStorage()
+    storage.seed()
+    storage.fail_manifest = True
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+
+    with pytest.raises(RuntimeError, match="publication failed"):
+        _xg_scope_commit(repository, [_xg_row("new-xg", 1)])
+
+    assert not storage.deletes
+    assert repository.latest_stage_feed_snapshot("L", "S")["batch_id"] == "legacy"
+    assert any(
+        row["_scope_batch_id"] == "legacy"
+        for row in storage.tables["whoscored_player_stage_stats"]
+    )
+
+
+def test_xg_metadata_idempotency_and_retry_cleanup():
+    storage = _StageFeedStorage()
+    storage.seed()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    checks = {"1": {"checked_at": "2026-10-09T12:00:00Z", "final": False}}
+    states = {"1:player:xg-stats:summary": "available"}
+    rows = [_xg_row("new-xg", 1)]
+
+    batch = _xg_scope_commit(repository, rows, feed_checks=checks, feed_states=states)
+    # A manifest was published but cleanup crashed: retry must recover safely.
+    storage.tables["whoscored_player_stage_stats"].append(
+        {
+            **_xg_row("old-remainder", 1),
+            "_scope_batch_id": "legacy",
+        }
+    )
+    repeated = _xg_scope_commit(
+        repository, rows, feed_checks=checks, feed_states=states
+    )
+    snapshot = repository.latest_stage_feed_snapshot("L", "S")
+
+    assert repeated == batch
+    assert len(storage.manifests) == 2
+    assert snapshot == {
+        "batch_id": batch,
+        "raw_uris": ["s3://new"],
+        "payload_sha256": "a" * 64,
+        "parser_version": PARSER_VERSION,
+        "feed_states": states,
+        "feed_checks": checks,
+        "feed_policy": "xg-only-v1",
+    }
+    assert not any(
+        row["_scope_batch_id"] == "legacy"
+        for row in storage.tables["whoscored_player_stage_stats"]
+    )
+    changed = _xg_scope_commit(
+        repository,
+        rows,
+        feed_checks={
+            "1": {"checked_at": "2026-10-09T12:00:00Z", "final": True},
+        },
+        feed_states=states,
+    )
+    assert changed != batch
+    # Retrying the now-displaced batch cannot delete the newer physical rows.
+    with pytest.raises(BatchConflict, match="physical=0"):
+        _xg_scope_commit(repository, rows, feed_checks=checks, feed_states=states)
+    assert (
+        storage.tables["whoscored_player_stage_stats"][0]["_scope_batch_id"] == changed
+    )
+
+
+def test_latest_stage_snapshot_reads_legacy_season_and_ignores_nonstage_commit():
+    storage = _StageFeedStorage()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    assert repository.latest_stage_feed_snapshot("L", "S") is None
+    storage.seed()
+    storage.manifests.append(
+        {
+            **storage.manifests[-1],
+            "batch_id": "new-season",
+            "entity_counts_json": '{"whoscored_schedule":10}',
+        }
+    )
+    snapshot = repository.latest_stage_feed_snapshot("L", "S")
+    assert snapshot["batch_id"] == "legacy"
+    assert snapshot["feed_checks"] == {}
+    assert snapshot["feed_policy"] is None
+
+
+def test_iter_stage_xg_rows_pages_current_business_rows_and_stage_chunks(monkeypatch):
+    import scrapers.whoscored.repository as repository_module
+
+    monkeypatch.setattr(repository_module, "_STAGE_XG_READ_PAGE_ROWS", 2)
+    monkeypatch.setattr(repository_module, "_STAGE_XG_STAGE_CHUNK", 2)
+    storage = _StageFeedStorage()
+    storage.seed(
+        rows=[
+            _xg_row("a", 1),
+            _xg_row("b", 1),
+            _xg_row("c", 2),
+            _xg_row("d", 3),
+            _xg_row("family", 1, "summary"),
+        ]
+    )
+    table = "whoscored_player_stage_stats"
+    storage.tables[table][0].update(
+        {"_ingested_at": datetime.now(), "batch_schema_fingerprint": "f"}
+    )
+    storage.tables[table].append({**_xg_row("hidden", 1), "_scope_batch_id": "hidden"})
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+
+    iterator = iter(
+        repository.iter_stage_xg_rows("L", "S", table=table, stage_ids=[1, 2, 3])
+    )
+    assert not storage.queries
+    first = next(iterator)
+    assert first["entity_key"] == "a"
+    assert "_scope_batch_id" not in first and "_ingested_at" not in first
+    assert "batch_schema_fingerprint" not in first
+    rows = [first, *iterator]
+    assert [row["entity_key"] for row in rows] == ["a", "b", "c", "d"]
+    assert all("LIMIT 2" in sql for sql in storage.queries)
+    assert any("entity_key > 'b'" in sql for sql in storage.queries)
+    assert any("stage_id IN (3)" in sql for sql in storage.queries)
+    with pytest.raises(ValueError, match="unsupported"):
+        list(
+            repository.iter_stage_xg_rows(
+                "L", "S", table="whoscored_events", stage_ids=[1]
+            )
+        )
+
+
+def test_iter_stage_xg_rows_pins_exact_published_batch_across_pages(monkeypatch):
+    import scrapers.whoscored.repository as repository_module
+
+    monkeypatch.setattr(repository_module, "_STAGE_XG_READ_PAGE_ROWS", 2)
+    storage = _StageFeedStorage()
+    storage.seed(batch="original", rows=[_xg_row(key, 1) for key in ("a", "b", "c")])
+    storage.seed(batch="newer", rows=[_xg_row("newer-row", 1)])
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    table = "whoscored_player_stage_stats"
+
+    pinned = list(repository.iter_stage_xg_rows(
+        "L", "S", table=table, stage_ids=[1], batch_id="original",
+    ))
+    assert [row["entity_key"] for row in pinned] == ["a", "b", "c"]
+    physical_queries = [sql for sql in storage.queries if 'SELECT "entity_key"' in sql]
+    assert len(physical_queries) == 2
+    assert all("_current" not in sql for sql in physical_queries)
+    assert all("_scope_batch_id = 'original'" in sql for sql in physical_queries)
+    assert [row["entity_key"] for row in repository.iter_stage_xg_rows(
+        "L", "S", table=table, stage_ids=[1],
+    )] == ["newer-row"]
+
+
+@pytest.mark.parametrize("batch", ["hidden", "other-scope", "failed"])
+def test_iter_stage_xg_rows_rejects_unpublished_or_cross_scope_pin(batch):
+    storage = _StageFeedStorage()
+    storage.seed()
+    storage.seed(batch="other-scope", league="OTHER")
+    storage.seed(batch="failed")
+    storage.manifests[-1]["state"] = "parse_failed"
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    with pytest.raises(BatchConflict, match="is not published for L/S"):
+        list(
+            repository.iter_stage_xg_rows(
+                "L",
+                "S",
+                table="whoscored_player_stage_stats",
+                stage_ids=[1],
+                batch_id=batch,
+            )
+        )
+
+
+@pytest.mark.parametrize("expected", ["legacy", ""])
+def test_scope_bundle_rejects_changed_previous_stage_before_any_write(expected):
+    storage = _StageFeedStorage()
+    storage.seed()
+    storage.seed(batch="newer", rows=[_xg_row("newer-row", 1)])
+    writer = MagicMock(wraps=storage)
+    repository = WhoScoredRepository(writer=writer, trino=storage)
+    with pytest.raises(BatchConflict, match="stage snapshot changed"):
+        _xg_scope_commit(
+            repository,
+            [_xg_row("incoming", 1)],
+            expected_previous_stage_batch_id=expected,
+        )
+    writer.write_dataframe.assert_not_called()
+    assert not storage.deletes
+
+
+def test_stage_publishers_share_scope_lock_before_base_and_completeness_checks(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    import threading
+
+    monkeypatch.setenv("WHOSCORED_LOCK_DIR", str(tmp_path / "locks"))
+    storage = _StageFeedStorage()
+    storage.seed(rows=[_xg_row("original", 1)])
+    legacy = WhoScoredRepository(writer=storage, trino=storage)
+    stale_writer = MagicMock(wraps=storage)
+    weekly = WhoScoredRepository(writer=stale_writer, trino=storage)
+    manifest_pending = threading.Event()
+    release_manifest = threading.Event()
+    weekly_waiting = threading.Event()
+    weekly_checked = threading.Event()
+    original_write = storage.write_dataframe
+    original_query = storage.execute_query
+    weekly_locks = weekly._commit_locks
+    legacy_locks = legacy._commit_locks
+    active = threading.local()
+
+    @contextmanager
+    def checked_locks(identities, *, original, is_weekly):
+        keys = tuple(identities)
+        if is_weekly and "scope-stage:L:S" in keys:
+            weekly_waiting.set()
+        with original(keys):
+            held = getattr(active, "keys", [])
+            active.keys = held + list(keys)
+            try:
+                yield
+            finally:
+                active.keys = held
+
+    def execute(sql):
+        # Both the raw identity comparison and published completeness queries
+        # must occur within the common lock for either entity_group.
+        if (
+            sql.startswith("SELECT batch_id, raw_uris_json")
+            or sql.startswith("SELECT entity_counts_json FROM")
+            or sql.startswith("SELECT stage_id, source_category, COUNT(*)")
+        ):
+            assert "scope-stage:L:S" in getattr(active, "keys", [])
+        if threading.current_thread().name.startswith("weekly"):
+            weekly_checked.set()
+        return original_query(sql)
+
+    def write(frame, *, table, **kwargs):
+        if table == "whoscored_scope_ingest_manifest":
+            assert "scope-stage:L:S" in getattr(active, "keys", [])
+            manifest_pending.set()
+            assert release_manifest.wait(10), "test did not release legacy publication"
+        return original_write(frame, table=table, **kwargs)
+
+    monkeypatch.setattr(
+        legacy,
+        "_commit_locks",
+        lambda identities: checked_locks(
+            identities,
+            original=legacy_locks,
+            is_weekly=False,
+        ),
+    )
+    monkeypatch.setattr(
+        weekly,
+        "_commit_locks",
+        lambda identities: checked_locks(
+            identities,
+            original=weekly_locks,
+            is_weekly=True,
+        ),
+    )
+    monkeypatch.setattr(storage, "execute_query", execute)
+    monkeypatch.setattr(storage, "write_dataframe", write)
+
+    def publish_legacy():
+        return legacy.commit_scope_bundle(
+            league="L",
+            season="S",
+            entity_group="season",
+            datasets={
+                "whoscored_player_stage_stats": [_xg_row("b1", 1), _xg_row("b2", 1)]
+            },
+            distinct_keys={"whoscored_player_stage_stats": "entity_key"},
+            payload_sha256="b" * 64,
+            raw_uris=["s3://legacy-new"],
+        )
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="legacy") as legacy_pool:
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="weekly"
+        ) as weekly_pool:
+            legacy_future = legacy_pool.submit(publish_legacy)
+            try:
+                assert manifest_pending.wait(10)
+                weekly_future = weekly_pool.submit(
+                    _xg_scope_commit,
+                    weekly,
+                    [_xg_row("stale", 1)],
+                    expected_previous_stage_batch_id="legacy",
+                )
+                assert weekly_waiting.wait(10)
+                assert not weekly_checked.is_set()
+                assert not weekly_future.done()
+            finally:
+                release_manifest.set()
+            legacy_batch = legacy_future.result(timeout=10)
+            with pytest.raises(BatchConflict, match="stage snapshot changed"):
+                weekly_future.result(timeout=10)
+
+    stale_writer.write_dataframe.assert_not_called()
+    assert weekly_checked.is_set()
+    assert storage.manifests[-1]["batch_id"] == legacy_batch
+    assert not storage.deletes
+
+
+def test_scope_bundle_accepts_empty_previous_and_idempotency_ignores_newer_snapshot():
+    storage = _StageFeedStorage()
+    repository = WhoScoredRepository(writer=storage, trino=storage)
+    rows = [_xg_row("incoming", 1)]
+    batch = _xg_scope_commit(repository, rows, expected_previous_stage_batch_id="")
+    storage.seed(batch="newer", rows=[_xg_row("newer-row", 1)])
+    assert (
+        _xg_scope_commit(
+            repository,
+            rows,
+            expected_previous_stage_batch_id="",
+        )
+        == batch
+    )
+    assert len(storage.manifests) == 2
+    assert any(
+        row["_scope_batch_id"] == "newer"
+        for row in storage.tables["whoscored_player_stage_stats"]
+    )
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {"checked_at": "2026-10-09T12:00:00", "final": False},
+        {"checked_at": "2026-10-09T12:00:00+03:00", "final": False},
+        {"checked_at": "invalid", "final": False},
+        {"checked_at": "2026-10-09T12:00:00Z", "final": "false"},
+    ],
+)
+def test_xg_feed_checks_require_utc_timestamp_and_boolean(check):
+    repository = WhoScoredRepository(writer=MagicMock(), trino=MagicMock())
+    with pytest.raises(ValueError, match="feed check"):
+        _xg_scope_commit(repository, [_xg_row("new", 1)], feed_checks={"1": check})
+
+
 def _daily_candidate_sql(**kwargs):
     trino = MagicMock()
     trino.execute_query.return_value = []

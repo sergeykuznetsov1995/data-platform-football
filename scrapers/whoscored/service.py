@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlencode, urljoin
@@ -19,10 +19,6 @@ from .catalog import (
     build_technical_exclusion_audit,
 )
 from .domain import SeasonFormat, TournamentEligibility, WhoScoredScope
-from .detailed_feeds import (
-    DETAILED_FEED_CATALOG,
-    DetailedFeedFamily,
-)
 from .parsers import (
     MAX_PLAYER_STAGE_STAT_PAGES,
     PARSER_VERSION,
@@ -47,7 +43,6 @@ from .parsers import (
     parse_season_tables,
     parse_team_stage_statistics,
     parse_player_stage_statistics_page,
-    parse_referee_stage_statistics_html,
     parse_tournament_seasons,
 )
 from .raw_store import (
@@ -67,11 +62,6 @@ from .proxy_campaign import (
     WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT,
 )
 from .runtime_limits import SOURCE_PAGE_REQUESTS_PER_MINUTE
-from .stage_feeds import (
-    STAGE_TEAM_FEED_CATALOG,
-    parse_stage_team_feed,
-    stage_team_feed_url,
-)
 from .repository import (
     canonical_catalog_raw_inputs,
     canonical_catalog_rows,
@@ -99,6 +89,8 @@ from .transport import (
     CachedPayload,
     FailureKind,
     FetchRequest,
+    CloudflareChallenge,
+    StageStatisticsUnavailable,
     ProxyUnavailable,
     TransportBudgets,
     TransportContext,
@@ -107,9 +99,9 @@ from .transport import (
     WhoScoredTransportError,
 )
 
-logger = logging.getLogger(__name__)
+from .source_circuit import SourceCircuitOpen
 
-_SOURCE_STAGE_HEADER_UNAVAILABLE = "WhoScored page request header is unavailable."
+logger = logging.getLogger(__name__)
 
 
 def _is_lower_sha256(value: str) -> bool:
@@ -119,8 +111,12 @@ def _is_lower_sha256(value: str) -> bool:
 
 
 def _is_source_stage_statistics_unavailable(exc: WhoScoredTransportError) -> bool:
-    return exc.kind is FailureKind.BROWSER and _SOURCE_STAGE_HEADER_UNAVAILABLE in str(
-        exc
+    """Recognise the legacy browser diagnostic for offline consumers only.
+
+    Publication now requires persisted statistics HTML evidence instead.
+    """
+    return exc.kind is FailureKind.BROWSER and (
+        "WhoScored page request header is unavailable." in str(exc)
     )
 
 
@@ -143,29 +139,18 @@ PLAYER_STAGE_STATISTICS_ENDPOINT = (
     "https://www.whoscored.com/statisticsfeed/1/getplayerstatistics"
 )
 TEAM_STAGE_STAT_TABS: tuple[tuple[str, str, str, str, str, str], ...] = (
-    ("summaryteam", "all", "Rating", "", "", ""),
-    ("summaryteam", "offensive", "shotsPerGame", "", "", ""),
-    ("summaryteam", "defensive", "tacklePerGame", "", "", ""),
-    # Current official xG tab emits these three literal boolean filters. They
-    # are not interchangeable with the empty defaults of the other tabs.
     ("xg-teamstats", "summary", "xG", "false", "true", "false"),
 )
-# These are the five tabs emitted by the current player-statistics UI.  Keep
-# category/subcategory pairs explicit: the endpoint does not accept the old
-# shorthand categories (``defensive/all``, ``xg/all``).
 PLAYER_STAGE_STAT_TABS: tuple[tuple[str, str, bool], ...] = (
-    ("summary", "all", False),
-    ("summary", "defensive", False),
-    ("summary", "offensive", False),
-    ("summary", "passing", False),
     ("xg-stats", "summary", True),
 )
-TEAM_DETAILED_STAT_TABS = tuple(
-    spec for spec in DETAILED_FEED_CATALOG if spec.family is DetailedFeedFamily.TEAM
-)
-PLAYER_DETAILED_STAT_TABS = tuple(
-    spec for spec in DETAILED_FEED_CATALOG if spec.family is DetailedFeedFamily.PLAYER
-)
+# Existing offline capacity tooling imports these names. No Detailed request
+# belongs to the xG collection policy.
+TEAM_DETAILED_STAT_TABS: tuple = ()
+PLAYER_DETAILED_STAT_TABS: tuple = ()
+STAGE_XG_FEED_POLICY = "xg-only-v1"
+STAGE_XG_REFRESH = timedelta(days=7)
+STAGE_XG_TABLES = ("whoscored_team_stage_stats", "whoscored_player_stage_stats")
 
 
 def structured_requests_per_minute_from_env(
@@ -2252,10 +2237,7 @@ class WhoScoredIngestService:
         source_season_id = self._source_season_id()
         today = date.today()
         active = self._scope_is_active()
-        if (
-            self.competition.region_id is None
-            or self.competition.tournament_id is None
-        ):
+        if self.competition.region_id is None or self.competition.tournament_id is None:
             raise RuntimeError(f"{self.scope.spec}: missing region/tournament ids")
         season_target = stage_page_target(
             self.scope,
@@ -2287,9 +2269,7 @@ class WhoScoredIngestService:
         # remaining stages are collected and the absence is recorded.  A new
         # stage still needs discover, and an empty menu is never a subset.
         source_stage_absent = sorted(set(expected_stage_ids) - set(source_stage_ids))
-        if not source_stage_ids or not set(source_stage_ids) <= set(
-            expected_stage_ids
-        ):
+        if not source_stage_ids or not set(source_stage_ids) <= set(expected_stage_ids):
             raise WhoScoredParseError(
                 "source schedule stages differ from the frozen catalog: "
                 f"expected={expected_stage_ids}, observed={source_stage_ids}"
@@ -2341,19 +2321,17 @@ class WhoScoredIngestService:
                 source_ids={"stage_id": str(stage_id)},
             )
 
-            calendar_response, calendar_raw_uri, calendar_bundle = (
-                self._fetch_parsed(
-                    calendar_target,
-                    parser=lambda response: (
-                        parse_calendar_months(response.text),
-                        parse_season_tables(
-                            response.text,
-                            scope=self.scope,
-                            source_season_id=source_season_id,
-                        ),
+            calendar_response, calendar_raw_uri, calendar_bundle = self._fetch_parsed(
+                calendar_target,
+                parser=lambda response: (
+                    parse_calendar_months(response.text),
+                    parse_season_tables(
+                        response.text,
+                        scope=self.scope,
+                        source_season_id=source_season_id,
                     ),
-                    cache_ttl=WEEKLY_SCHEDULE_PAGE_CACHE_TTL if active else None,
-                )
+                ),
+                cache_ttl=WEEKLY_SCHEDULE_PAGE_CACHE_TTL if active else None,
             )
             months, stage_tables = calendar_bundle
             for name, dataset in stage_tables.items():
@@ -2362,9 +2340,7 @@ class WhoScoredIngestService:
             raw_uris.append(calendar_raw_uri)
             payload_hashes.append(calendar_response.sha256)
             for month in months:
-                month_target = schedule_month_target(
-                    stage_id, month.year, month.month
-                )
+                month_target = schedule_month_target(stage_id, month.year, month.month)
                 if month.month == 12:
                     next_month = date(month.year + 1, 1, 1)
                 else:
@@ -2376,12 +2352,7 @@ class WhoScoredIngestService:
                 # #1474: only the current month +/- 1 is re-read daily; a
                 # farther open month stays in the raw cache until it nears.
                 near_month = (
-                    abs(
-                        (month.year - today.year) * 12
-                        + month.month
-                        - today.month
-                    )
-                    <= 1
+                    abs((month.year - today.year) * 12 + month.month - today.month) <= 1
                 )
 
                 def month_parser(
@@ -2584,12 +2555,59 @@ class WhoScoredIngestService:
             result.errors.append(f"schedule: {type(exc).__name__}: {exc}")
         return result
 
-    def sync_stage_feeds(self) -> EntityResult:
-        """Weekly: team/player/referee stage statistics feeds (#1474).
+    def _prepare_stage_statistics(
+        self, *, stage_id: int, url: str, final: bool
+    ) -> tuple[TransportResponse, str]:
+        """Persist the source statistics page under the usual raw target lock."""
+        target = self._html_target(
+            page_kind="stage_statistics_page",
+            target_id=f"whoscored:stage-statistics:{stage_id}",
+            url=url,
+            source_ids={"stage_id": str(stage_id)},
+        )
 
-        Published as their own scope bundle (``entity_group="stages"``) so a
-        failing feed never blocks the daily schedule and match ingestion.
-        """
+        def prepare() -> tuple[TransportResponse, str]:
+            adapter = _TargetRawCache(
+                self.raw_store,
+                target,
+                allow_load=(
+                    not final
+                    and self.raw_store.is_fresh(target, max_age=STAGE_XG_REFRESH)
+                ),
+                content_type="text/html",
+            )
+            previous = self.transport.raw_cache
+            self.transport.raw_cache = adapter
+            try:
+                response = self.transport.prepare_stage_statistics(
+                    url,
+                    cache_key=target.target_id,
+                    before_network=self._rate_limiter.acquire,
+                    scope=self.scope.spec,
+                    entity=target.page_kind,
+                )
+                return response, adapter.raw_uri
+            except WhoScoredTransportError as exc:
+                if adapter.record is not None:
+                    exc.payload_sha256 = adapter.record.content_hash
+                    exc.raw_uri = adapter.raw_uri
+                raise
+            finally:
+                self.transport.raw_cache = previous
+
+        lock = getattr(self.raw_store, "target_lock", None)
+        try:
+            if callable(lock):
+                with lock(target):
+                    return prepare()
+            return prepare()
+        except RawTargetLockTimeout as exc:
+            raise WhoScoredTransportError(
+                str(exc), kind=FailureKind.CACHE, url=url, retryable=True
+            ) from exc
+
+    def sync_stage_feeds(self) -> EntityResult:
+        """Collect only xG weekly, preserving published data on deferred work."""
         result = EntityResult(
             "stages",
             self.scope.spec,
@@ -2597,390 +2615,285 @@ class WhoScoredIngestService:
             committed_batches={"scope": []},
         )
         self._bound_paid_fallback(2)
-        scope_spools: list[WhoScoredScopeRowSpool] = []
+        spools: list[WhoScoredScopeRowSpool] = []
         try:
             collected = self._collect_season_schedule()
+            stage_ids = {int(row["stage_id"]) for row in collected.stage_rows}
             result.metadata.update(
                 {
-                    "source_stage_ids": sorted(
-                        {int(row["stage_id"]) for row in collected.stage_rows}
-                    ),
-                    "source_stage_count": len(
-                        {int(row["stage_id"]) for row in collected.stage_rows}
-                    ),
+                    "source_stage_ids": sorted(stage_ids),
+                    "source_stage_count": len(stage_ids),
+                    "feed_policy": STAGE_XG_FEED_POLICY,
+                    "stage_xg_checked": [],
+                    "stage_xg_retained": [],
+                    "stage_xg_deferred": [],
                 }
             )
-            source_season_id = collected.source_season_id
-            today = collected.today
-            active = collected.active
-            stage_rows = collected.stage_rows
-            schedule_by_id = collected.schedule_by_id
-            # The season page anchors the raw identity even when every feed
-            # of the scope is unavailable at the source.
+            previous = (
+                self.repository.latest_stage_feed_snapshot(
+                    self.scope.competition_id, self.scope.season_id
+                )
+                or {}
+            )
+            feed_states = {
+                key: value
+                for key, value in previous.get("feed_states", {}).items()
+                if ":team:xg-teamstats:" in key or ":player:xg-stats:" in key
+            }
+            feed_checks = {
+                key: dict(value)
+                for key, value in previous.get("feed_checks", {}).items()
+                if int(key) in stage_ids
+            }
+            policy_current = (
+                previous.get("feed_policy") == STAGE_XG_FEED_POLICY
+                and previous.get("parser_version") == PARSER_VERSION
+            )
             raw_uris = [collected.raw_uris[0]]
             payload_hashes = [collected.payload_hashes[0]]
-            datasets: dict[str, Sequence[Mapping[str, Any]]] = {}
-            distinct_keys: dict[str, str] = {}
-            source_empty: set[str] = set()
-            source_unavailable: set[str] = set()
-            feed_states: dict[str, str] = {}
-            # Team/player feeds expose one JSON table per UI tab. Team paging
-            # must mirror the browser's empty defaults; the player endpoint
-            # accepts one bounded page above any plausible stage population.
-            stage_stat_rows: dict[str, WhoScoredScopeRowSpool] = {}
-            for table in (
-                "whoscored_team_stage_stats",
-                "whoscored_player_stage_stats",
-                "whoscored_referee_stage_stats",
-            ):
+            rows = {}
+            for table in STAGE_XG_TABLES:
                 spool = WhoScoredScopeRowSpool(
                     table=table,
                     league=self.scope.competition_id,
                     season=self.scope.season_id,
                 )
-                stage_stat_rows[table] = spool
-                # Register each resource immediately so a later constructor
-                # failure still closes every already-open SQLite file.
-                scope_spools.append(spool)
-            for stage in stage_rows:
+                spools.append(spool)
+                rows[table] = spool
+            retained: set[int] = set()
+            now = datetime.now(timezone.utc)
+            changed = False
+            for stage in collected.stage_rows:
                 stage_id = int(stage["stage_id"])
-                stage_kickoffs = [
-                    row.get("date")
-                    for row in schedule_by_id.values()
-                    if int(row.get("stage_id") or -1) == stage_id
-                    and isinstance(row.get("date"), datetime)
-                ]
-                # A completed stage is immutable even when its parent season
-                # is still active (cups often expose many finished groups).
-                # This prevents every daily run from refetching dozens of
-                # Detailed feeds for stages whose last match is long past.
-                stage_mutable = active and (
-                    not stage_kickoffs
-                    or max(stage_kickoffs).date() + timedelta(days=7) > today
+                key = str(stage_id)
+                team_key = f"{stage_id}:team:xg-teamstats:summary"
+                player_key = f"{stage_id}:player:xg-stats:summary"
+                contracts = (
+                    (team_key, STAGE_XG_TABLES[0]),
+                    (player_key, STAGE_XG_TABLES[1]),
                 )
-                stage_stats_cache_ttl = timedelta(hours=30) if stage_mutable else None
-                # Direct HTTP is attempted first.  If WhoScored returns its
-                # source-specific verification shell, the transport opens this
-                # ordinary stage page once and executes only allow-listed JSON
-                # GETs in the same direct FlareSolverr browser context.
-                statistics_bootstrap_url = (
+                kickoffs = [
+                    r["date"]
+                    for r in collected.schedule_by_id.values()
+                    if int(r.get("stage_id") or -1) == stage_id
+                    and isinstance(r.get("date"), datetime)
+                ]
+                final = not collected.active or bool(
+                    kickoffs
+                    and max(kickoffs).date() + STAGE_XG_REFRESH <= collected.today
+                )
+                check = feed_checks.get(key, {})
+                checked_at = None
+                try:
+                    checked_at = datetime.fromisoformat(check.get("checked_at", ""))
+                    if checked_at.tzinfo is None:
+                        checked_at = None
+                except (ValueError, TypeError):
+                    pass
+                if (
+                    policy_current
+                    and checked_at is not None
+                    and checked_at <= now
+                    and all(k in feed_states for k, _ in contracts)
+                    and (
+                        (final and check.get("final") is True)
+                        or (not final and now - checked_at < STAGE_XG_REFRESH)
+                    )
+                ):
+                    retained.add(stage_id)
+                    result.metadata["stage_xg_retained"].append(stage_id)
+                    continue
+                # Future fixtures do not yet prove source statistics absence.
+                # Leave the stage due; never freeze it as a historical verdict.
+                if kickoffs and min(kickoffs).date() > collected.today:
+                    retained.add(stage_id)
+                    result.metadata["stage_xg_deferred"].append(stage_id)
+                    continue
+                bootstrap_url = (
                     f"https://www.whoscored.com/Regions/{self.competition.region_id}"
                     f"/Tournaments/{self.competition.tournament_id}"
-                    f"/Seasons/{source_season_id}/Stages/{stage_id}/TeamStatistics"
+                    f"/Seasons/{collected.source_season_id}/Stages/{stage_id}/TeamStatistics"
                 )
-                structured_specs: list[_ParsedFetchSpec] = []
-                # feed-state key, destination table, fail on NOT_AVAILABLE,
-                # human-readable family for explicit drift errors.
-                structured_contracts: list[tuple[str, str, bool, str]] = []
-
-                for (
-                    category,
-                    subcategory,
-                    sort_by,
-                    sort_ascending,
-                    inc_pens,
-                    against,
-                ) in TEAM_STAGE_STAT_TABS:
-                    structured_specs.append(
-                        self._team_stage_statistics_spec(
-                            stage_id=stage_id,
-                            source_season_id=source_season_id,
-                            active=active,
-                            category=category,
-                            subcategory=subcategory,
-                            sort_by=sort_by,
-                            sort_ascending=sort_ascending,
-                            inc_pens=inc_pens,
-                            against=against,
-                            cache_ttl=stage_stats_cache_ttl,
-                            browser_bootstrap_url=statistics_bootstrap_url,
-                        )
-                    )
-                    structured_contracts.append(
-                        (
-                            f"{stage_id}:team:{category}:{subcategory}",
-                            "whoscored_team_stage_stats",
-                            True,
-                            f"team {category}/{subcategory}",
-                        )
-                    )
-
-                for detailed_spec in TEAM_DETAILED_STAT_TABS:
-                    structured_specs.append(
-                        self._team_stage_statistics_spec(
-                            stage_id=stage_id,
-                            source_season_id=source_season_id,
-                            active=active,
-                            category=detailed_spec.category,
-                            subcategory=detailed_spec.subcategory,
-                            sort_by=detailed_spec.sort_by,
-                            detailed=True,
-                            cache_ttl=stage_stats_cache_ttl,
-                            browser_bootstrap_url=statistics_bootstrap_url,
-                        )
-                    )
-                    structured_contracts.append(
-                        (
-                            f"{stage_id}:team-detailed:"
-                            f"{detailed_spec.category}:{detailed_spec.subcategory}",
-                            "whoscored_team_stage_stats",
-                            True,
-                            "team Detailed "
-                            f"{detailed_spec.category}/{detailed_spec.subcategory}",
-                        )
-                    )
-
-                for category, subcategory, inc_pens in PLAYER_STAGE_STAT_TABS:
-                    structured_specs.append(
-                        self._player_stage_statistics_spec(
-                            stage_id=stage_id,
-                            source_season_id=source_season_id,
-                            active=active,
-                            category=category,
-                            subcategory=subcategory,
-                            inc_pens=inc_pens,
-                            cache_ttl=stage_stats_cache_ttl,
-                            browser_bootstrap_url=statistics_bootstrap_url,
-                        )
-                    )
-                    structured_contracts.append(
-                        (
-                            f"{stage_id}:player:{category}:{subcategory}",
-                            "whoscored_player_stage_stats",
-                            True,
-                            f"player {category}/{subcategory}",
-                        )
-                    )
-
-                for detailed_spec in PLAYER_DETAILED_STAT_TABS:
-                    structured_specs.append(
-                        self._player_stage_statistics_spec(
-                            stage_id=stage_id,
-                            source_season_id=source_season_id,
-                            active=active,
-                            category=detailed_spec.category,
-                            subcategory=detailed_spec.subcategory,
-                            sort_by=detailed_spec.sort_by,
-                            detailed=True,
-                            cache_ttl=stage_stats_cache_ttl,
-                            browser_bootstrap_url=statistics_bootstrap_url,
-                        )
-                    )
-                    structured_contracts.append(
-                        (
-                            f"{stage_id}:player-detailed:"
-                            f"{detailed_spec.category}:{detailed_spec.subcategory}",
-                            "whoscored_player_stage_stats",
-                            True,
-                            "player Detailed "
-                            f"{detailed_spec.category}/{detailed_spec.subcategory}",
-                        )
-                    )
-
-                for feed_spec in STAGE_TEAM_FEED_CATALOG:
-                    feed_url = stage_team_feed_url(stage_id, feed_spec.type_id)
-                    feed_target = self._html_target(
-                        page_kind="team_stage_feed",
-                        target_id=(
-                            f"whoscored:team-stage-feed:{stage_id}:{feed_spec.type_id}"
+                cache_ttl = STAGE_XG_REFRESH
+                team = self._team_stage_statistics_spec(
+                    stage_id=stage_id,
+                    source_season_id=collected.source_season_id,
+                    active=collected.active,
+                    category="xg-teamstats",
+                    subcategory="summary",
+                    sort_by="xG",
+                    sort_ascending="false",
+                    inc_pens="true",
+                    against="false",
+                    cache_ttl=cache_ttl,
+                    browser_bootstrap_url=bootstrap_url,
+                )
+                player = self._player_stage_statistics_spec(
+                    stage_id=stage_id,
+                    source_season_id=collected.source_season_id,
+                    active=collected.active,
+                    category="xg-stats",
+                    subcategory="summary",
+                    inc_pens=True,
+                    cache_ttl=cache_ttl,
+                    browser_bootstrap_url=bootstrap_url,
+                )
+                specs = [
+                    replace(spec, allow_cache=False) if final else spec
+                    for spec in (team, player)
+                ]
+                if final and player.page_factory is not None:
+                    specs[1] = replace(
+                        specs[1],
+                        page_factory=lambda page, factory=player.page_factory: replace(
+                            factory(page), allow_cache=False
                         ),
-                        url=feed_url,
-                        source_ids={
-                            "stage_id": str(stage_id),
-                            "feed_type": str(feed_spec.type_id),
-                        },
                     )
-                    structured_specs.append(
-                        _ParsedFetchSpec(
-                            target=feed_target,
-                            parser=lambda response, current_stage=stage_id, current_type=feed_spec.type_id: (
-                                parse_stage_team_feed(
-                                    response.content,
-                                    scope=self.scope,
-                                    stage_id=current_stage,
-                                    feed_type=current_type,
-                                    source_season_id=source_season_id,
-                                )
-                            ),
-                            content_type="application/json",
-                            cache_ttl=stage_stats_cache_ttl,
-                            browser_bootstrap_url=statistics_bootstrap_url,
-                        )
-                    )
-                    structured_contracts.append(
-                        (
-                            f"{stage_id}:stagestatfeed:{feed_spec.type_id}",
-                            "whoscored_team_stage_stats",
-                            False,
-                            f"stage team feed {feed_spec.type_id}",
-                        )
-                    )
-
-                # WhoScored advertises the next domestic edition before its
-                # first kickoff, but the stage statistics page intentionally
-                # has no Model-last-Mode token until statistics exist. This is
-                # explicit source unavailability, not a browser failure and
-                # not a reason to discard the already available schedule.
-                if stage_kickoffs and min(stage_kickoffs).date() > today:
-                    for feed_key, table, _required, _label in structured_contracts:
-                        feed_states[feed_key] = DatasetStatus.NOT_AVAILABLE.value
-                        source_unavailable.add(table)
-                    feed_states[f"{stage_id}:referee:summary"] = (
-                        DatasetStatus.NOT_AVAILABLE.value
-                    )
-                    source_unavailable.add("whoscored_referee_stage_stats")
-                    continue
-
-                for spool in stage_stat_rows.values():
+                for spool in spools:
                     spool.begin_stage()
-                stage_raw_inputs: list[tuple[str, str]] = []
-                stage_feed_states: dict[str, str] = {}
                 try:
-                    # Parse at most one FlareSolverr XHR batch at a time. Raw
-                    # objects are still fetched/resumed under the same stage
-                    # bootstrap and nothing becomes visible until the scope
-                    # manifest is committed, but expanded rows no longer stay
-                    # resident for all 68 feeds and every stage.
-                    for offset in range(
-                        0, len(structured_specs), STRUCTURED_PARSE_BATCH_SIZE
-                    ):
-                        batch_specs = structured_specs[
-                            offset : offset + STRUCTURED_PARSE_BATCH_SIZE
-                        ]
-                        batch_contracts = structured_contracts[
-                            offset : offset + STRUCTURED_PARSE_BATCH_SIZE
-                        ]
-                        structured_results = self._fetch_parsed_many(batch_specs)
-                        (
-                            structured_results,
-                            paginated_raw_inputs,
-                        ) = self._complete_player_statistics_pages(
-                            batch_specs, structured_results
-                        )
-                        if len(structured_results) != len(batch_contracts):
-                            raise WhoScoredParseError(
-                                f"stage {stage_id} structured feed batch is incomplete"
-                            )
-                        for paginated_response, paginated_uri in paginated_raw_inputs:
-                            stage_raw_inputs.append(
-                                (paginated_uri, paginated_response.sha256)
-                            )
-                        for contract, (response, uri, parsed) in zip(
-                            batch_contracts, structured_results
-                        ):
-                            feed_key, table, require_available, label = contract
-                            stage_feed_states[feed_key] = parsed.status.value
-                            stage_raw_inputs.append((uri, response.sha256))
-                            if (
-                                require_available
-                                and parsed.status is DatasetStatus.NOT_AVAILABLE
-                            ):
-                                raise WhoScoredParseError(
-                                    f"{label} statistics structure is unavailable for "
-                                    f"stage {stage_id}"
-                                )
-                            # Explicit source unavailability for positional
-                            # feeds remains visible without removing siblings.
-                            stage_stat_rows[table].append_entity_rows(parsed.rows)
-                        del structured_results, paginated_raw_inputs, parsed
-
-                    referee_url = (
-                        "https://www.whoscored.com/Regions/"
-                        f"{self.competition.region_id}/Tournaments/"
-                        f"{self.competition.tournament_id}/Seasons/"
-                        f"{source_season_id}/Stages/{stage_id}/RefereeStatistics"
+                    bootstrap, bootstrap_uri = self._prepare_stage_statistics(
+                        stage_id=stage_id, url=bootstrap_url, final=final
                     )
-                    referee_target = self._html_target(
-                        page_kind="referee_stage_statistics",
-                        target_id=f"whoscored:referee-stats:{stage_id}",
-                        url=referee_url,
-                        source_ids={"stage_id": str(stage_id)},
+                    structured = self._fetch_parsed_many(specs)
+                    structured, paginated = self._complete_player_statistics_pages(
+                        specs, structured
                     )
-                    response, uri, parsed = self._fetch_parsed(
-                        referee_target,
-                        parser=lambda response, current_stage=stage_id: (
-                            parse_referee_stage_statistics_html(
-                                response.text,
-                                scope=self.scope,
-                                stage_id=current_stage,
-                                source_season_id=source_season_id,
-                            )
-                        ),
-                        cache_ttl=stage_stats_cache_ttl,
-                    )
-                    referee_key = f"{stage_id}:referee:summary"
-                    stage_feed_states[referee_key] = parsed.status.value
-                    stage_raw_inputs.append((uri, response.sha256))
-                    if parsed.status is DatasetStatus.NOT_AVAILABLE:
+                    if len(structured) != 2:
                         raise WhoScoredParseError(
-                            "referee statistics structure is unavailable for "
-                            f"stage {stage_id}"
+                            f"stage {stage_id} xG batch is incomplete"
                         )
-                    stage_stat_rows["whoscored_referee_stage_stats"].append_entity_rows(
-                        parsed.rows
+                    observations = [bootstrap.observed_at]
+                    stage_inputs = [(bootstrap_uri, bootstrap.sha256)]
+                    stage_states = {}
+                    for (feed_key, table), (response, uri, parsed) in zip(
+                        contracts, structured
+                    ):
+                        if parsed.status is DatasetStatus.NOT_AVAILABLE:
+                            # A missing JSON structure is drift, not an absent HTML token.
+                            raise WhoScoredParseError(
+                                f"stage {stage_id} xG structure is unavailable"
+                            )
+                        stage_states[feed_key] = parsed.status.value
+                        rows[table].append_entity_rows(parsed.rows)
+                        observations.append(response.observed_at)
+                        stage_inputs.append((uri, response.sha256))
+                    stage_inputs.extend(
+                        (uri, response.sha256) for response, uri in paginated
                     )
+                    for response, _uri in paginated:
+                        observations.append(response.observed_at)
+                    checked = min(datetime.fromisoformat(t) for t in observations)
                 except WhoScoredTransportError as exc:
-                    for spool in stage_stat_rows.values():
+                    for spool in spools:
                         spool.rollback_stage()
-                    # The restricted browser endpoint emits this exact error
-                    # only when the source-owned stage statistics token is
-                    # absent. Unrelated browser/5xx failures still fail closed.
-                    if not _is_source_stage_statistics_unavailable(exc):
+                    cause = exc
+                    cooldown = False
+                    while cause is not None:
+                        cooldown = cooldown or isinstance(cause, SourceCircuitOpen)
+                        cause = cause.__cause__
+                    if isinstance(exc, CloudflareChallenge) and cooldown:
+                        result.metadata["stage_xg_deferred"].append(stage_id)
+                        result.skipped = 1
+                        return result  # Preserve the complete previous scope snapshot.
+                    if not isinstance(exc, StageStatisticsUnavailable):
                         raise
-                    for feed_key, table, _required, _label in structured_contracts:
+                    if not getattr(exc, "raw_uri", None) or not getattr(
+                        exc, "payload_sha256", None
+                    ):
+                        raise WhoScoredParseError(
+                            "source absence requires persisted HTML evidence"
+                        ) from exc
+                    checked = datetime.fromisoformat(exc.observed_at)
+                    raw_uris.append(exc.raw_uri)
+                    payload_hashes.append(exc.payload_sha256)
+                    for feed_key, _table in contracts:
                         feed_states[feed_key] = DatasetStatus.NOT_AVAILABLE.value
-                        source_unavailable.add(table)
-                    feed_states[f"{stage_id}:referee:summary"] = (
-                        DatasetStatus.NOT_AVAILABLE.value
-                    )
-                    source_unavailable.add("whoscored_referee_stage_stats")
-                    continue
+                    retained.add(stage_id)
                 except Exception:
-                    for spool in stage_stat_rows.values():
+                    for spool in spools:
                         spool.rollback_stage()
                     raise
                 else:
-                    for spool in stage_stat_rows.values():
+                    for spool in spools:
                         spool.commit_stage()
-                    feed_states.update(stage_feed_states)
-                    for uri, payload_hash in stage_raw_inputs:
+                    feed_states.update(stage_states)
+                    for uri, digest in stage_inputs:
                         raw_uris.append(uri)
-                        payload_hashes.append(payload_hash)
-
-            for table, rows in stage_stat_rows.items():
-                datasets[table] = rows
-                distinct_keys[table] = "entity_key"
-                if not rows and table not in source_unavailable:
-                    source_empty.add(table)
-
-            combined_hash = hashlib.sha256(
-                json.dumps(sorted(payload_hashes), separators=(",", ":")).encode(
-                    "utf-8"
+                        payload_hashes.append(digest)
+                feed_checks[key] = {"checked_at": checked.isoformat(), "final": final}
+                result.metadata["stage_xg_checked"].append(stage_id)
+                changed = True
+            if not changed:
+                if policy_current and previous:
+                    self.repository.cleanup_stage_feed_snapshot(
+                        league=self.scope.competition_id,
+                        season=self.scope.season_id,
+                        batch_id=previous["batch_id"],
+                    )
+                result.skipped = 1
+                return result
+            # Copy only retained xG data. Never reintroduce the 66 retired feeds.
+            if retained and previous:
+                raw_uris.extend(previous["raw_uris"])
+                payload_hashes.append(previous["payload_sha256"])
+                for table in STAGE_XG_TABLES:
+                    rows[table].append_published_rows(
+                        self.repository.iter_stage_xg_rows(
+                            self.scope.competition_id,
+                            self.scope.season_id,
+                            table=table,
+                            stage_ids=retained,
+                            batch_id=previous["batch_id"],
+                        )
+                    )
+            source_empty = {table for table, values in rows.items() if not values}
+            source_unavailable = {
+                table
+                for index, table in enumerate(STAGE_XG_TABLES)
+                if table in source_empty
+                and any(
+                    feed_states.get(
+                        f"{stage_id}:"
+                        + (
+                            "team:xg-teamstats:summary"
+                            if index == 0
+                            else "player:xg-stats:summary"
+                        )
+                    )
+                    == DatasetStatus.NOT_AVAILABLE.value
+                    for stage_id in stage_ids
                 )
+            }
+            combined_hash = hashlib.sha256(
+                json.dumps(sorted(payload_hashes), separators=(",", ":")).encode()
             ).hexdigest()
-            scope_batch_id = self.repository.commit_scope_bundle(
+            batch_id = self.repository.commit_scope_bundle(
                 league=self.scope.competition_id,
                 season=self.scope.season_id,
                 entity_group="stages",
-                datasets=datasets,
-                distinct_keys=distinct_keys,
+                datasets=rows,
+                distinct_keys={table: "entity_key" for table in rows},
                 payload_sha256=combined_hash,
                 raw_uris=raw_uris,
-                source_empty=source_empty,
+                source_empty=source_empty - source_unavailable,
                 source_unavailable=source_unavailable,
                 feed_states=feed_states,
+                feed_policy=STAGE_XG_FEED_POLICY,
+                feed_checks=feed_checks,
+                expected_previous_stage_batch_id=previous.get("batch_id", ""),
             )
-            result.committed_batches["scope"].append(str(scope_batch_id))
+            result.committed_batches["scope"].append(str(batch_id))
             result.succeeded = 1
-            for table, rows in datasets.items():
-                result.counts[table.removeprefix("whoscored_")] = len(rows)
+            for table, values in rows.items():
+                result.counts[table.removeprefix("whoscored_")] = len(values)
                 result.tables.append(f"iceberg.bronze.{table}")
         except ProxyUnavailable:
             raise
         except Exception as exc:
             result.errors.append(f"stages: {type(exc).__name__}: {exc}")
         finally:
-            for spool in scope_spools:
+            for spool in spools:
                 spool.close()
         return result
 
@@ -3232,9 +3145,7 @@ class WhoScoredIngestService:
                                 "exact not-available outcome identity"
                             )
                         else:
-                            failure_outcomes.append(
-                                ("not_available", failure_batch_id)
-                            )
+                            failure_outcomes.append(("not_available", failure_batch_id))
                     elif state == "parse_failed":
                         result.errors.append(f"game {candidate.game_id}: {exc}")
                     else:
