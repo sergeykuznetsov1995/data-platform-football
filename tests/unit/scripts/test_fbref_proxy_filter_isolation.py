@@ -22,9 +22,9 @@ SHARED_FILTER_SHA256 = (
     # the per-chunk path.  #1389-B: upstream failure class, tunnels, /health.
     # #1387: transfermarkt-only source mode.
     # Refresh the merged baseline after 81bea4ce (#1392, tmapi host) and
-    # 1f933229 (#1388, provider CONNECT refusals); shared runtime unchanged here.
-    # #1398: dedicated TM stream controller; shared mode keeps its old path.
-    "440aac037c1c741e4617a85c4328f3f2649616e7e2ed246cb1e807bc11ec0871"
+    # 1f933229 (#1388), #1365 SofaScore accounting/registry changes, and
+    # #1398 dedicated TM streams; both source contracts are retained.
+    "afff95f368ffa9fa2cb7ea716562376994fa61883325bed7d19166b2ed6d6cd8"
 )
 
 

@@ -275,6 +275,51 @@ def test_endpoint_boundaries_are_authenticated_and_return_exact_stats():
     )
 
 
+def test_begin_with_stats_opts_into_retained_tail_and_keeps_endpoint_path():
+    session = _Session(_Response(201, {"request_id": "request-1", "stats": _stats_payload()}))
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN,
+    )
+    boundary, stats = client.begin_endpoint_with_stats(
+        _production_lease(), "event", endpoint_path="/api/v1/event/1",
+    )
+    assert boundary == "request-1"
+    assert stats.total_bytes == 1000
+    assert session.calls[0][2]["json"] == {
+        "endpoint": "event", "endpoint_path": "/api/v1/event/1", "retain_tail_owner": True,
+    }
+
+
+@pytest.mark.parametrize("field", ("closed", "active_tunnels", "reserved_bytes", "accounting_uncertain", "paid_ledger_uncertain"))
+def test_drain_requires_exact_final_accounting(field):
+    payload = _stats_payload(closed=True)
+    payload[field] = False if field == "closed" else True if "uncertain" in field else 1
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=_Session(_Response(200, payload)),
+        control_token=CONTROL_TOKEN,
+    )
+    with pytest.raises(SofascoreLeaseProtocolError, match="not exact and final"):
+        client.drain(_production_lease())
+
+
+def test_drain_keeps_the_claim_for_the_final_completed_close():
+    session = _Session(_Response(200, _stats_payload(closed=True)))
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN,
+    )
+    assert client.drain(_production_lease()).closed is True
+    assert session.calls[0][0:2] == ("POST", "http://proxy_filter:8899/v1/leases/lease-1/drain")
+
+
+def test_begin_with_stats_rejects_a_missing_boundary_snapshot():
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=_Session(_Response(201, {"request_id": "request-1"})),
+        control_token=CONTROL_TOKEN,
+    )
+    with pytest.raises(SofascoreLeaseProtocolError, match="no sealed stats"):
+        client.begin_endpoint_with_stats(_production_lease(), "event")
+
+
 @pytest.mark.parametrize(
     "field",
     ("active_tunnels", "reserved_bytes"),

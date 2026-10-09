@@ -14,13 +14,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from utils.config import DAG_TAGS, UNDERSTAT_LEAGUES
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils.understat_tasks import (
     RUNNER,
+    UnderstatScopeOperator,
     scope_environment,
     validate_scope_result,
     validate_understat_leagues,
@@ -80,13 +80,14 @@ def plan_history_scope(**context: Any) -> list[dict[str, str]]:
 RUN_HISTORY_SCOPE_COMMAND = f"""
 set -euo pipefail
 cd /opt/airflow
-/opt/legacy-scraper-venv/bin/python {RUNNER} \\
+exec /opt/legacy-scraper-venv/bin/python {RUNNER} \\
     --mode backfill \\
     --league "${{UNDERSTAT_LEAGUE}}" \\
     --season-slug "${{UNDERSTAT_SEASON_SLUG}}" \\
     --source-season-id "${{UNDERSTAT_SOURCE_SEASON_ID}}" \\
     --source-discovered "${{UNDERSTAT_SOURCE_DISCOVERED}}" \\
-    --output "${{UNDERSTAT_RESULT_PATH}}"
+    --run-id "${{UNDERSTAT_RUN_ID}}" \\
+    --output -
 """
 
 
@@ -121,22 +122,19 @@ with DAG(
         execution_timeout=timedelta(minutes=5),
     )
 
-    run_scope = BashOperator.partial(
+    run_scope = UnderstatScopeOperator.partial(
         task_id="run_history_scope",
         bash_command=RUN_HISTORY_SCOPE_COMMAND,
         append_env=True,
+        cwd="/opt/airflow",
+        do_xcom_push=True,
+        retries=2,
         pool=INGEST_SCRAPER_POOL,
         priority_weight=BACKFILL_PRIORITY,
-        execution_timeout=timedelta(hours=3),
+        execution_timeout=timedelta(minutes=45),
     ).expand(env=plan_scope.output)
 
-    validate_scope = PythonOperator.partial(
-        task_id="validate_history_scope",
-        python_callable=validate_scope_result,
-        retries=0,
-    ).expand(op_kwargs=plan_scope.output)
-
-    plan_scope >> run_scope >> validate_scope
+    plan_scope >> run_scope
 
 
 __all__ = [

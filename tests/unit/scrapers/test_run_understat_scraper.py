@@ -23,6 +23,38 @@ from scrapers.understat.quality import REQUIRED_COLUMNS, TEAM_BREAKDOWN_DIMENSIO
 LEAGUE = "ENG-Premier League"
 
 
+@pytest.mark.parametrize("temporary", [True, False])
+def test_real_storage_wrapper_preserves_retry_classification(temporary):
+    import threading
+    from requests.exceptions import ConnectionError
+    from scrapers.base.trino_manager import TrinoError, TrinoTableManager
+
+    manager = TrinoTableManager.__new__(TrinoTableManager)
+    manager._conn_lock = threading.RLock()
+    manager._conn = MagicMock()
+    error = ConnectionError("offline transport fixture") if temporary else ValueError("bad SQL")
+    manager._conn.cursor.return_value.execute.side_effect = error
+    with pytest.raises(TrinoError) as wrapped:
+        manager._execute("SELECT fixture", fetch=True)
+    status, exit_code, _ = runner._classify_exception(wrapped.value)
+    assert exit_code == (1 if temporary else 2)
+    assert status is (ManifestStatus.RETRYABLE_FAILURE if temporary else ManifestStatus.CONTRACT_FAILURE)
+
+
+def test_stdout_result_does_not_write_a_file(monkeypatch, capsys):
+    payload = {"status": "complete", "league": LEAGUE}
+    monkeypatch.setattr(runner, "run_scope", lambda args: (payload, 0))
+    def forbidden_write(*args, **kwargs):
+        raise AssertionError("stdout mode attempted a file write")
+    monkeypatch.setattr(runner, "_atomic_write_json", forbidden_write)
+    assert runner.main([
+        "--mode", "current", "--league", LEAGUE,
+        "--season-slug", "2627", "--source-season-id", "2026",
+        "--source-discovered", "true", "--output", "-",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out) == payload
+
+
 def _value(column: str, *, source_year: int = 2025):
     values = {
         "league": LEAGUE,
@@ -330,7 +362,7 @@ def test_discovered_current_scope_cannot_treat_empty_response_as_not_published()
         repository=repository,
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert payload["status"] == "contract_failure"
     assert any("source-discovered" in error for error in payload["errors"])
     scraper.save_to_iceberg.assert_not_called()
@@ -351,7 +383,7 @@ def test_empty_probe_never_cuts_over_or_hides_pre_v2_legacy_schedule(
             repository=repository,
         )
 
-        assert exit_code == 1
+        assert exit_code == 2
         assert payload["status"] == "contract_failure"
         assert any("legacy physical scope" in error for error in payload["errors"])
         # No v2 attempt means downstream LEFT JOINs still observe
@@ -398,7 +430,7 @@ def test_active_schedule_cannot_regress_to_not_published_after_empty_response():
         repository=repository,
     )
 
-    assert second_exit == 1
+    assert second_exit == 2
     assert second["status"] == "contract_failure"
     assert any("source-discovered" in message for message in second["errors"])
     empty_scraper.save_to_iceberg.assert_not_called()
@@ -418,7 +450,7 @@ def test_backfill_never_accepts_a_non_complete_scope():
         repository=repository,
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert payload["status"] == "contract_failure"
     assert payload["errors"]
     assert repository.appended == []
@@ -434,7 +466,7 @@ def test_first_v2_schema_failure_before_write_preserves_legacy_scope():
         _args(), scraper_factory=factory, repository=repository
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert payload["status"] == "schema_drift"
     scraper.save_to_iceberg.assert_not_called()
     assert repository.appended == []
@@ -485,7 +517,7 @@ def test_physical_batch_mismatch_refuses_complete_manifest():
         _args(), scraper_factory=factory, repository=repository
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert payload["status"] == "contract_failure"
     assert runner.PHYSICAL_FENCE_MARKER in payload["errors"][0]
     assert [attempt.status for attempt in repository.appended] == [
@@ -553,7 +585,7 @@ def test_pre_write_dq_failure_preserves_last_complete_publication():
         _args(), scraper_factory=failing_factory, repository=repository
     )
 
-    assert failed_exit == 1
+    assert failed_exit == 2
     assert failed["status"] == "schema_drift"
     failing_scraper.save_to_iceberg.assert_not_called()
     assert repository.latest_attempt(None) is published_attempt
@@ -655,12 +687,14 @@ def test_backfill_verification_outage_does_not_hide_existing_complete_batch():
     )
 
     assert second_exit == 1
-    assert second["status"] == "complete"
-    assert second["batch_id"] == first["batch_id"]
+    assert second["status"] == "retryable_failure"
+    assert second["batch_id"] != first["batch_id"]
+    assert repository.appended[-1].batch_id == first["batch_id"]
     assert second["errors"]
     assert repository.appended == appended_before
     stale_history_factory.assert_not_called()
     [journaled] = repository.failures
+    assert second["scope_attempt"] == journaled.to_dict()
     assert journaled.status is ManifestStatus.RETRYABLE_FAILURE
     assert journaled.error_message == "catalog unavailable"
     assert journaled.mode == "backfill"
@@ -712,7 +746,7 @@ def test_dq_failure_is_journaled_with_game_lists_and_result_is_unchanged():
         _args(), scraper_factory=factory, repository=repository
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert payload["status"] == "schema_drift"
     assert repository.appended == []
     [journaled] = repository.failures
@@ -794,7 +828,7 @@ def test_early_failure_before_attempt_is_journaled_with_next_attempt_no(
         ]
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     result = json.loads(output.read_text())
     assert set(result) == {
         "status", "league", "season", "source_season_id", "errors"
@@ -951,7 +985,7 @@ def test_mass_empty_is_journal_only_and_keeps_previous_complete_visible(monkeypa
         repository=repository,
     )
 
-    assert failed_exit == 1
+    assert failed_exit == 2
     assert failed["status"] == "contract_failure"
     assert repository.appended == manifest_before
     assert repository.latest_attempt(None) is published_attempt

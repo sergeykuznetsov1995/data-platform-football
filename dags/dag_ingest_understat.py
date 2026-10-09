@@ -14,12 +14,13 @@ the durable Understat publication manifest.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
-from airflow.operators.bash import BashOperator
+from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.operators.python import PythonOperator
 
 from utils.config import DAG_TAGS, SCHEDULES, UNDERSTAT_LEAGUES
@@ -27,6 +28,7 @@ from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils.understat_tasks import (
     _close_understat_client,
     _deduplicate_scopes,
+    UnderstatScopeOperator,
     scope_environment,
     validate_scope_result,
     validate_understat_leagues,
@@ -49,25 +51,39 @@ def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
     from scrapers.understat import UnderstatCatalog, UnderstatClient
     from scrapers.understat.closed_check import split_daily_plan
 
-    client = UnderstatClient()
-    try:
-        scopes = UnderstatCatalog(client).rolling_scopes(
-            window=2,
-            probe_next=True,
-        )
-    finally:
-        _close_understat_client(client)
-    scopes = _deduplicate_scopes(scopes)
-    if not scopes:
-        raise AirflowException("Understat current discovery returned no scopes")
-
-    # #1431: closed seasons leave the daily window; on Mondays they get one
-    # league-hash check each, queued after every current scope.
     run_boundary = (
         context.get("data_interval_end")
         or context.get("logical_date")
         or datetime.now(timezone.utc)
     )
+    from scrapers.understat.client import UnderstatPayloadError, is_retryable_error
+
+    client = UnderstatClient(cache_dir=os.getenv(
+        "UNDERSTAT_CACHE_DIR", str(Path.home() / "soccerdata/data/UnderstatNative")
+    ))
+    try:
+        catalog = UnderstatCatalog(client, today=run_boundary.date())
+        try:
+            scopes = catalog.rolling_scopes(window=2, probe_next=True)
+        except Exception as exc:
+            if not is_retryable_error(exc):
+                raise AirflowFailException(f"Understat discovery contract failed: {exc}") from exc
+            attempt = getattr(context.get("ti"), "try_number", 1)
+            if attempt <= 3:
+                raise AirflowException(f"Understat discovery transport failed: {exc}") from exc
+            logger.warning("Understat discovery exhausted retries; using calendar and last valid registry")
+            try:
+                scopes = catalog.calendar_scopes(window=2, probe_next=True)
+            except UnderstatPayloadError as fallback_error:
+                raise AirflowFailException(str(fallback_error)) from fallback_error
+    finally:
+        _close_understat_client(client)
+    scopes = _deduplicate_scopes(scopes)
+    if not scopes:
+        raise AirflowFailException("Understat current discovery returned no scopes")
+
+    # #1431: closed seasons leave the daily window; on Mondays they get one
+    # league-hash check each, queued after every current scope.
     current_scopes, closed_scopes = split_daily_plan(scopes, run_boundary)
 
     run_id = str(context.get("run_id") or "manual")
@@ -104,13 +120,14 @@ def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
 RUN_SCOPE_COMMAND = """
 set -euo pipefail
 cd /opt/airflow
-/opt/legacy-scraper-venv/bin/python dags/scripts/run_understat_scraper.py \\
+exec /opt/legacy-scraper-venv/bin/python dags/scripts/run_understat_scraper.py \\
     --mode "${UNDERSTAT_MODE}" \\
     --league "${UNDERSTAT_LEAGUE}" \\
     --season-slug "${UNDERSTAT_SEASON_SLUG}" \\
     --source-season-id "${UNDERSTAT_SOURCE_SEASON_ID}" \\
     --source-discovered "${UNDERSTAT_SOURCE_DISCOVERED}" \\
-    --output "${UNDERSTAT_RESULT_PATH}"
+    --run-id "${UNDERSTAT_RUN_ID}" \\
+    --output -
 """
 
 
@@ -144,26 +161,26 @@ with DAG(
         },
         pool=INGEST_SCRAPER_POOL,
         priority_weight=CURRENT_PRIORITY,
-        retries=1,
+        retries=3,
+        retry_delay=timedelta(minutes=15),
+        retry_exponential_backoff=True,
+        max_retry_delay=timedelta(minutes=45),
         execution_timeout=timedelta(minutes=5),
     )
 
-    run_scope = BashOperator.partial(
+    run_scope = UnderstatScopeOperator.partial(
         task_id="run_current_scope",
         bash_command=RUN_SCOPE_COMMAND,
         append_env=True,
+        cwd="/opt/airflow",
+        do_xcom_push=True,
+        retries=2,
         pool=INGEST_SCRAPER_POOL,
         priority_weight=CURRENT_PRIORITY,
-        execution_timeout=timedelta(hours=3),
+        execution_timeout=timedelta(minutes=45),
     ).expand(env=plan_scopes.output)
 
-    validate_scope = PythonOperator.partial(
-        task_id="validate_current_scope",
-        python_callable=validate_scope_result,
-        retries=0,
-    ).expand(op_kwargs=plan_scopes.output)
-
-    plan_scopes >> run_scope >> validate_scope
+    plan_scopes >> run_scope
 
 
 __all__ = [
