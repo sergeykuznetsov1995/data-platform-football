@@ -12,6 +12,8 @@ Exit codes: 0 success/no-op/dry-run, 1 hard failure, 2 genuine empty fallback,
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement, writer_lock, guard_frames, guard_cached_frames, is_mutation, locked_write
+
 import argparse
 import hashlib
 import json
@@ -593,7 +595,8 @@ def _write_results(
             run_key=safe_payload.get('run_key'),
         )
         proxy_traffic.log_traffic_summary(summary)
-        proxy_traffic.record_traffic_run(
+        from scrapers.transfermarkt.ops_traffic import record_traffic_run
+        record_traffic_run(
             summary,
             dag_run_id=os.environ.get('AIRFLOW_CTX_DAG_RUN_ID', ''),
         )
@@ -670,10 +673,10 @@ def _fallback_exit_code(reason: str) -> int:
 def _execute_cursor(conn, sql: str, params: Sequence[Any] = (), fetch=False):
     cur = conn.cursor()
     try:
-        cur.execute(sql, tuple(params))
+        committed = execute_statement(cur, sql, tuple(params))
         # Trino executes lazily; closing an unconsumed DDL/DML cursor cancels it
         # as USER_CANCELED. Always drain the result stream before close.
-        rows = cur.fetchall()
+        rows = committed if is_mutation(sql) else cur.fetchall()
         return rows if fetch else None
     finally:
         try:
@@ -702,7 +705,7 @@ def _ensure_fetch_state(conn) -> None:
 
 
 def _load_fetch_state(
-    scraper, endpoint: str, *, strict: bool = False,
+    scraper, endpoint: str, *, strict: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Read checkpoint state.
 
@@ -1249,9 +1252,6 @@ def _load_pending_checkpoint(
             raise RuntimeError(
                 f'pending checkpoint row timestamp is invalid for {source_id}'
             ) from exc
-        if committed_at < cutoff:
-            expired_source_ids.append(source_id)
-            continue
         live_row = dict(row)
         live_row['committed_at'] = committed_at.isoformat()
         live_rows.append(live_row)
@@ -1278,6 +1278,7 @@ def _load_pending_checkpoint(
     return state, payload
 
 
+@locked_write
 def _write_pending_checkpoint(
     spec: EntitySpec,
     selected: Sequence[str],
@@ -1285,6 +1286,7 @@ def _write_pending_checkpoint(
     run_key: str,
     league: str,
     season: int,
+    *, captured_at_by_id: Optional[Mapping[str, str]] = None,
 ) -> bool:
     """Durably remember a committed batch while the ops checkpoint is down."""
     endpoint = spec.state_endpoint or spec.name
@@ -1304,6 +1306,10 @@ def _write_pending_checkpoint(
                     merged[str(item['source_id'])] = preserved
         for source_id, row in zip(selected, rows):
             status, row_count, payload_hash, error = row
+            original_at = (captured_at_by_id or {}).get(str(source_id), now)
+            previous = merged.get(str(source_id))
+            if previous and _as_utc(previous['committed_at']) > _as_utc(original_at):
+                continue
             merged[str(source_id)] = {
                 'source_id': str(source_id),
                 'status': status,
@@ -1311,7 +1317,7 @@ def _write_pending_checkpoint(
                 'payload_hash': payload_hash,
                 'error': error,
                 'run_key': run_key,
-                'committed_at': now,
+                'committed_at': original_at,
             }
         payload = {
             'endpoint': endpoint,
@@ -1360,6 +1366,7 @@ def _write_pending_checkpoint(
     return False
 
 
+@locked_write
 def _clear_pending_checkpoint(endpoint: str, league: str, season: int) -> None:
     for root in _pending_checkpoint_roots():
         path = _pending_checkpoint_path(
@@ -1439,7 +1446,10 @@ def _select_player_ids(
     # The durable journal describes data that committed after the ops row.  It
     # must therefore override an older failed state; ``setdefault`` would pay
     # for the same endpoint again immediately after a successful replay.
-    state.update(pending_state)
+    state.update({key: value for key, value in pending_state.items()
+        if key not in state or _as_utc(state[key].get('last_success_at')) is None
+        or (_as_utc(value.get('last_success_at')) is not None
+            and _as_utc(value.get('last_success_at')) >= _as_utc(state[key].get('last_success_at')))})
 
     # Historical runs need proof for every globally cached success, not merely
     # an ops-state row.  This both rejects partial native-only commits and tells
@@ -1450,9 +1460,8 @@ def _select_player_ids(
         if refresh_mode == 'historical'
         else [source_id for source_id in roster if source_id not in state]
     )
-    derived = _load_data_derived_state(
-        scraper, endpoint, league, season, derived_scope,
-    )
+    derived = (_load_data_derived_state(scraper, endpoint, league, season, derived_scope)
+        if legacy_materialization_required else {})
     hydrate_ids = sorted(
         source_id for source_id, item in derived.items()
         if item.get('needs_legacy_materialization')
@@ -1503,6 +1512,8 @@ def _select_player_ids(
             if legacy_materialization_required
             else committed_native | parity_proven
         )
+        if not legacy_materialization_required:
+            hydrate_ids = sorted(set(roster) & (committed_native | parity_proven))
         candidates = [pid for pid in roster if pid not in cached]
         cache_hits = len(set(roster) & cached)
         selected = candidates[:limit]
@@ -1628,12 +1639,14 @@ def _state_rows(
     return rows
 
 
+@locked_write
 def _persist_fetch_state(
     scraper,
     spec: EntitySpec,
     selected: Sequence[str],
     rows: Sequence[Tuple[str, int, Optional[str], Optional[str]]],
     run_key: str,
+    *, committed_at_by_id: Optional[Mapping[str, datetime]] = None,
 ) -> bool:
     if not selected or not rows:
         return True
@@ -1647,11 +1660,13 @@ def _persist_fetch_state(
                     return 'NULL'
                 return "'" + str(value).replace("'", "''") + "'"
 
+            stamp = (committed_at_by_id or {}).get(str(sid), datetime.now(timezone.utc))
+            stamp_sql = "TIMESTAMP '" + _as_utc(stamp).replace(tzinfo=None).isoformat(sep=' ', timespec='microseconds') + "'"
             values.append(
                 '(' + ', '.join([
                     q(spec.state_endpoint), q(sid), q(PARSER_VERSION),
                     q(SCHEMA_VERSION), q(status), q(run_key),
-                    str(int(row_count)), q(payload_hash), q(error),
+                    str(int(row_count)), q(payload_hash), q(error), stamp_sql,
                 ]) + ')'
             )
         sql = f"""
@@ -1659,18 +1674,18 @@ MERGE INTO {FETCH_STATE_TABLE} t
 USING (
     VALUES {', '.join(values)}
 ) s(endpoint, source_id, parser_version, schema_version, status, run_key,
-    row_count, payload_hash, error)
+    row_count, payload_hash, error, captured_at)
 ON t.endpoint = s.endpoint
 AND t.source_id = s.source_id
 AND t.parser_version = s.parser_version
 AND t.schema_version = s.schema_version
-WHEN MATCHED THEN UPDATE SET
+WHEN MATCHED AND (t.last_attempt_at IS NULL OR s.captured_at >= t.last_attempt_at) THEN UPDATE SET
     status = s.status,
     run_key = s.run_key,
-    last_attempt_at = current_timestamp,
+    last_attempt_at = s.captured_at,
     last_success_at = CASE
         WHEN s.status IN ('success', 'valid_empty', 'authoritative_empty')
-          THEN current_timestamp
+          THEN s.captured_at
         ELSE t.last_success_at
     END,
     row_count = s.row_count,
@@ -1682,9 +1697,9 @@ WHEN NOT MATCHED THEN INSERT (
     row_count, payload_hash, error
 ) VALUES (
     s.endpoint, s.source_id, s.parser_version, s.schema_version, s.status, s.run_key,
-    current_timestamp, current_timestamp,
+    s.captured_at, s.captured_at,
     CASE WHEN s.status IN ('success', 'valid_empty', 'authoritative_empty')
-         THEN current_timestamp END,
+         THEN s.captured_at END,
     s.row_count, s.payload_hash, s.error
 )
 """
@@ -1722,7 +1737,8 @@ def _flush_pending_checkpoint(
             )
             for item in items
         ]
-        if not _persist_fetch_state(scraper, spec, selected, rows, run_key):
+        if not _persist_fetch_state(scraper, spec, selected, rows, run_key,
+            committed_at_by_id={str(item['source_id']): _as_utc(item['committed_at']) for item in items}):
             return False
     logger.info(
         'Recovered pending Transfermarkt checkpoint endpoint=%s rows=%d',
@@ -1731,6 +1747,27 @@ def _flush_pending_checkpoint(
     return True
 
 
+def _career_capture_times(scraper, spec, frames, selected):
+    times = {}
+    for frame in frames.values():
+        if frame is None or frame.empty or 'player_id' not in frame:
+            continue
+        column = 'fetched_at' if 'fetched_at' in frame else '_ingested_at'
+        if column not in frame:
+            continue
+        for player, part in frame.groupby('player_id'):
+            stamps = [_as_utc(value) for value in part[column]]
+            stamps = [stamp for stamp in stamps if stamp is not None]
+            if stamps:
+                times[str(player)] = min(stamps).isoformat()
+    for player, outcome in _fetch_outcome_statuses(scraper, spec.state_endpoint or spec.name).items():
+        value = outcome.get('raw_fetched_at') if isinstance(outcome, Mapping) else getattr(outcome, 'raw_fetched_at', None)
+        if _as_utc(value) is not None:
+            times[str(player)] = _as_utc(value).isoformat()
+    return {player: times[player] for player in selected if player in times}
+
+
+@locked_write
 def _commit_checkpoint_or_pending(
     scraper,
     spec: EntitySpec,
@@ -1739,19 +1776,47 @@ def _commit_checkpoint_or_pending(
     run_key: str,
     league: str,
     season: int,
+    *, captured_at_by_id: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Advance ops state or leave a recoverable local post-commit journal."""
     if not selected:
         return 'cache_complete'
     endpoint = spec.state_endpoint or spec.name
-    if _persist_fetch_state(scraper, spec, selected, rows, run_key):
+    # Save the reconciliation intent before ops. A crash after Bronze or after
+    # the successful MERGE retains an idempotent receipt and original clock.
+    if not _write_pending_checkpoint(spec, selected, rows, run_key, league, season, captured_at_by_id=captured_at_by_id):
+        raise RuntimeError('fetch-state reconciliation intent is not durable')
+    _, payload = _load_pending_checkpoint(endpoint, league, season)
+    if payload is None:
+        raise RuntimeError('durable fetch-state reconciliation intent disappeared')
+    if _flush_pending_checkpoint(scraper, spec, payload):
         _clear_pending_checkpoint(endpoint, league, season)
         return 'success'
-    if _write_pending_checkpoint(
-        spec, selected, rows, run_key, league, season,
-    ):
-        return 'committed_checkpoint_pending'
-    return 'checkpoint_unrecoverable'
+    return 'committed_checkpoint_pending'
+
+
+def _reconcile_pending_fetch_state(scraper) -> None:
+    """Reconcile committed local receipts before any new source request."""
+    from pathlib import Path
+    seen = set()
+    specs = {item.state_endpoint: item for item in ENTITY_SPECS.values() if item.state_endpoint}
+    specs[COACH_HISTORY_CHECKPOINT_SPEC.state_endpoint] = COACH_HISTORY_CHECKPOINT_SPEC
+    for root in _pending_checkpoint_roots():
+        for path in sorted(Path(root).glob('*.json')):
+            # Budget and raw-cache files can share this directory. Only the
+            # existing checkpoint file naming contract belongs to this reader.
+            if not path.name.startswith('transfermarkt_checkpoint_'):
+                continue
+            payload = json.loads(path.read_text())
+            endpoint = payload.get('endpoint')
+            identity = (endpoint, payload.get('league'), payload.get('season'))
+            if endpoint not in specs or identity in seen:
+                continue
+            seen.add(identity)
+            _, validated = _load_pending_checkpoint(*identity)
+            if validated and not _flush_pending_checkpoint(scraper, specs[endpoint], validated):
+                raise RuntimeError('pending fetch state unavailable; refusing paid I/O')
+            _clear_pending_checkpoint(*identity)
 
 
 def _native_available(scraper, method_name: str) -> bool:
@@ -1839,7 +1904,10 @@ def _select_coach_memberships(
         )
     ):
         _clear_pending_checkpoint(spec.state_endpoint, league, season)
-    state.update(pending_state)
+    state.update({key: value for key, value in pending_state.items()
+        if key not in state or _as_utc(state[key].get('last_success_at')) is None
+        or (_as_utc(value.get('last_success_at')) is not None
+            and _as_utc(value.get('last_success_at')) >= _as_utc(state[key].get('last_success_at')))})
 
     untracked = [source_id for source_id in roster if source_id not in state]
     derived = _load_data_derived_state(
@@ -1919,7 +1987,7 @@ def _query_dataframe(conn, sql: str, params: Sequence[Any]):
 
     cur = conn.cursor()
     try:
-        cur.execute(sql, tuple(params))
+        execute_statement(cur, sql, tuple(params))
         columns = [item[0] for item in (cur.description or [])]
         rows = cur.fetchall()
         return pd.DataFrame(rows, columns=columns)
@@ -1956,44 +2024,40 @@ _CAREER_CACHE_COLUMNS = {
 }
 
 
-def _load_cached_career_frames(
-    scraper,
-    spec: EntitySpec,
-    source_ids: Sequence[str],
-) -> Dict[str, Any]:
-    """Read only manifest- or bootstrap-parity-proven global career rows."""
+def _load_cached_career_frames(scraper, spec: EntitySpec, source_ids: Sequence[str]) -> Dict[str, Any]:
+    """Load complete native careers without depending on retired legacy tables."""
     import pandas as pd
-
     source_ids = [str(value) for value in dict.fromkeys(source_ids)]
     key, table, entity, columns, _ = _CAREER_CACHE_COLUMNS[spec.name]
-    legacy_output = next(output for output in spec.outputs if output.is_legacy)
-    legacy_table = f'iceberg.bronze.{legacy_output.table_name}'
     if not source_ids:
         return {key: pd.DataFrame(columns=columns)}
     placeholders = ', '.join('?' for _ in source_ids)
-    frame = _query_dataframe(
-        scraper._bronze_connection(),
-        f"SELECT {', '.join('n.' + column for column in columns)} "
-        f"FROM {table} n "
-        f"WHERE CAST(n.player_id AS varchar) IN ({placeholders}) "
-        f"AND (EXISTS (SELECT 1 FROM {DUAL_WRITE_MANIFEST_TABLE} m "
-        "WHERE m.entity = ? AND m.status = 'success' "
-        "AND m.legacy_batch_id = m.native_batch_id "
-        "AND m.legacy_rows = m.native_rows "
-        "AND m.legacy_hash = m.native_hash "
-        "AND m.native_batch_id = n._batch_id) "
-        f"OR EXISTS (SELECT 1 FROM {legacy_table} l "
-        "WHERE CAST(l.player_id AS varchar) = CAST(n.player_id AS varchar) "
-        "AND l._batch_id = n._batch_id))",
-        (*source_ids, entity),
-    )
+    proof = (f"EXISTS (SELECT 1 FROM {FETCH_STATE_TABLE} f WHERE f.endpoint = ? "
+        "AND CAST(f.source_id AS varchar) = CAST(n.player_id AS varchar) "
+        "AND f.status = 'success' AND f.parser_version = ? AND f.schema_version = ?)")
+    params = (*source_ids, entity, PARSER_VERSION, SCHEMA_VERSION)
+    try:
+        frame = _query_dataframe(scraper._bronze_connection(), f"SELECT n.* FROM {table} n WHERE CAST(n.player_id AS varchar) IN ({placeholders}) AND {proof}", params)
+    except Exception as exc:
+        if not any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+            raise
+        frame = pd.DataFrame(columns=columns)
+    loaded = set(frame['player_id'].dropna().astype(str)) if not frame.empty else set()
+    untracked = sorted(set(source_ids) - loaded)
+    legacy_output = next((output for output in spec.outputs if output.is_legacy), None)
+    if untracked and legacy_output is not None:
+        placeholders = ', '.join('?' for _ in untracked)
+        legacy_table = f'iceberg.bronze.{legacy_output.table_name}'
+        proof = (f"(EXISTS (SELECT 1 FROM {DUAL_WRITE_MANIFEST_TABLE} m WHERE m.entity = ? AND m.status = 'success' "
+            "AND m.legacy_batch_id = m.native_batch_id AND m.legacy_rows = m.native_rows "
+            "AND m.legacy_hash = m.native_hash AND m.native_batch_id = n._batch_id) "
+            f"OR EXISTS (SELECT 1 FROM {legacy_table} l WHERE CAST(l.player_id AS varchar) = CAST(n.player_id AS varchar) AND l._batch_id = n._batch_id))")
+        cached = _query_dataframe(scraper._bronze_connection(), f"SELECT n.* FROM {table} n WHERE CAST(n.player_id AS varchar) IN ({placeholders}) AND {proof}", (*untracked, entity))
+        frame = pd.concat([frame, cached], ignore_index=True) if not frame.empty else cached
     loaded = set(frame['player_id'].dropna().astype(str)) if not frame.empty else set()
     missing = sorted(set(source_ids) - loaded)
     if missing:
-        raise RuntimeError(
-            'parity-proven career cache changed before materialisation; '
-            f'missing source ids: {missing}'
-        )
+        raise RuntimeError('complete career cache changed before materialisation; missing source ids: ' + str(missing))
     return {key: frame}
 
 
@@ -2045,6 +2109,18 @@ def _merge_career_cache_frames(
     )
     if not native.empty:
         native = native.drop_duplicates(list(natural_key), keep='last')
+    # Cache hydration is a read reference, never a new native capture. Keep
+    # original native batch/lineage; the manifest records these physical refs.
+    fresh = fetched.get(key)
+    captured = sorted(set(fresh['player_id'].dropna().astype(str))) if fresh is not None and not fresh.empty else []
+    native.attrs['tm_captured_player_ids'] = captured
+    native.attrs['tm_original_capture_refs'] = [
+        {'player_id': str(player), 'batch_id': str(batch)}
+        for player, batch in native[['player_id', '_batch_id']].drop_duplicates().itertuples(index=False, name=None)
+        if str(player) not in set(captured)
+    ] if not native.empty else []
+    if not any(output.is_legacy for output in spec.outputs):
+        return {key: native}
     scope = _scope_season(league, season)
     if spec.name == ENTITY_MV_HISTORY:
         legacy = scraper.materialize_legacy_market_value_history(
@@ -2346,40 +2422,163 @@ def _save_frames(
     force_replace: bool,
     results: Dict[str, Any],
 ) -> None:
-    for output in spec.outputs:
-        if output.key not in frames:
-            continue
-        frame = frames[output.key]
-        if frame is None or getattr(frame, 'empty', True):
-            previous = results['outputs'].get(output.key, {})
-            applicability = previous.get('applicability_status')
-            results['outputs'][output.key] = {
-                'rows': 0,
-                'table': (
-                    f'iceberg.bronze.{output.table_name}'
-                    if applicability in {
-                        'authoritative_empty', 'not_applicable',
-                    }
-                    else None
-                ),
-                'applicability_status': applicability,
-            }
-            continue
-        guard = None if force_replace or not output.guard_key else _MIN_REPLACE_RATIO
-        table_path = scraper.save_to_iceberg(
-            df=frame,
-            table_name=output.table_name,
-            partition_cols=list(output.partition_cols),
-            replace_partitions=list(output.replace_keys) or None,
-            min_replace_ratio=guard,
-            replace_guard_key=output.guard_key,
-        )
-        results['tables'].append(table_path)
-        results['outputs'][output.key] = {
-            'rows': int(len(frame)),
-            'table': table_path,
-            'applicability_status': 'ok',
+    with writer_lock():
+        path = getattr(scraper, '_tm_career_intent_path', None)
+        if path is not None:
+            from scrapers.transfermarkt.write_intents import snapshot_anchors
+            connection = scraper._bronze_connection()
+            try:
+                snapshot_anchors(path, connection, spec.outputs,
+                    capture_times=getattr(scraper, '_tm_empty_capture_times', {}))
+            finally:
+                connection.close()
+        native_keys = {output.key for output in spec.outputs if not output.is_legacy}
+        captured_frames = {
+            key: frame[frame['player_id'].astype(str).isin(frame.attrs['tm_captured_player_ids'])].copy()
+            if key in native_keys and frame is not None and 'tm_captured_player_ids' in frame.attrs else frame
+            for key, frame in frames.items()
         }
+        guard_cached_frames(scraper, spec.outputs, frames)
+        guard_frames(scraper, spec.outputs, captured_frames)
+        for output in spec.outputs:
+            if output.key not in frames:
+                continue
+            logical_frame = frames[output.key]
+            frame = captured_frames[output.key]
+            if frame is not None and frame.empty and logical_frame is not None and not logical_frame.empty:
+                results['outputs'][output.key] = {
+                    'rows': int(len(logical_frame)), 'captured_rows': 0,
+                    'table': f'iceberg.bronze.{output.table_name}', 'applicability_status': 'ok',
+                }
+                continue
+            if frame is None or getattr(frame, 'empty', True):
+                previous = results['outputs'].get(output.key, {})
+                applicability = previous.get('applicability_status')
+                results['outputs'][output.key] = {
+                    'rows': 0,
+                    'table': (
+                        f'iceberg.bronze.{output.table_name}'
+                        if applicability in {
+                            'authoritative_empty', 'not_applicable',
+                        }
+                        else None
+                    ),
+                    'applicability_status': applicability,
+                }
+                continue
+            guard = None if force_replace or not output.guard_key else _MIN_REPLACE_RATIO
+            table_path = scraper.save_to_iceberg(
+                df=frame,
+                table_name=output.table_name,
+                partition_cols=list(output.partition_cols),
+                replace_partitions=list(output.replace_keys) or None,
+                min_replace_ratio=guard,
+                replace_guard_key=output.guard_key,
+            )
+            results['tables'].append(table_path)
+            results['outputs'][output.key] = {
+                'rows': int(len(logical_frame)), 'captured_rows': int(len(frame)),
+                'table': table_path,
+                'applicability_status': 'ok',
+            }
+
+def _archive_native_career_intent(scraper, spec, path, frames, results):
+    """Publish the genuine original writer proof before removing its journal."""
+    from pathlib import Path
+    from scrapers.transfermarkt import write_intents
+    journal = json.loads(Path(path).read_text())
+    evidence = journal['evidence']
+    mode = evidence['mode']
+    if mode not in {'native-only', 'dual'}:
+        return
+    records = evidence.get('raw_attempts', []) + evidence.get('cache_sources', [])
+    if not records or not evidence['checkpoint_ids']:
+        results['career_capture_archive_status'] = 'unavailable_raw_proof'
+        return  # No synthetic capture proof for mocks/cache-only materialization.
+    from scrapers.transfermarkt.superseded import _hash, attest_career_manifest, verify_complete
+    manifest = results['native_write_manifest'] if mode == 'native-only' else results['batch_manifest']
+    if manifest['status'] != 'success':
+        raise RuntimeError('career archive requires successful original writer manifest')
+    physical = {}
+    for output in _spec_for_write_mode(spec, mode).outputs:
+        frame = frames[output.key].copy()
+        batches = {item['player_id']: item['batch_id'] for item in frame.attrs.get('tm_original_capture_refs', [])} if not output.is_legacy else {}
+        if batches:
+            frame['_batch_id'] = frame.player_id.astype(str).map(batches).fillna(frame['_batch_id'])
+        physical[output.key] = frame
+    receipt = {'verified': True, 'cycle_id': evidence['run_key'], 'manifest_cycle_id': manifest['cycle_id'],
+        'writer_revision': evidence['revision'], 'write_mode': mode, 'manifests': [manifest],
+        'committed_at': datetime.now(timezone.utc).isoformat(), 'outputs': {
+            output.key: {'table': 'iceberg.bronze.' + output.table_name, 'rows': len(physical[output.key]),
+                'physical_hash': _hash(physical[output.key])}
+            for output in _spec_for_write_mode(spec, mode).outputs}}
+    receipt['bronze_manifest'] = hashlib.sha256(json.dumps({'cycle_id': receipt['cycle_id'],
+        'outputs': receipt['outputs'], 'manifests': receipt['manifests']}, sort_keys=True).encode()).hexdigest()
+    attest_career_manifest(scraper, receipt)
+    archived = {'intent_sha256': Path(path).stem, 'journal': journal,
+        'receipt': receipt, 'frames': write_intents.pack_frames(physical)}
+    verify_complete(scraper, spec, archived, players=evidence['checkpoint_ids'], live=False, allow_later_manifest=False)
+    write_intents.archive_complete(path, receipt, physical)
+    results['career_capture_archive_status'] = 'complete'
+
+
+def _reconcile_native_career_intent(scraper, spec, mode, revision, league, season, results):
+    from scrapers.transfermarkt.write_intents import pending_intents, unpack_frames, finish_intent
+    identity = {'kind': 'scope', 'entity': spec.name, 'league': league, 'season': int(season)}
+    pending = pending_intents(identity)
+    if not pending:
+        return False
+    if len(pending) != 1:
+        raise RuntimeError('ambiguous complete native career intents; refusing paid retry')
+    path, payload = pending[0]
+    evidence = payload['evidence']
+    if evidence['mode'] != mode or evidence['revision'] != revision:
+        raise RuntimeError('career reconciliation requires original writer authority')
+    frames = unpack_frames(payload['frames'])
+    scraper._tm_career_intent_path = path
+    scraper._tm_empty_capture_times = evidence.get('captured_at_by_id', {})
+    scraper._batch_id = evidence['batch_id']
+    original_run = evidence['run_key']
+    results.update(evidence['results'])
+    results['reconciliation_cache_sources'] = evidence.get('raw_attempts', []) + evidence.get('cache_sources', [])
+    with writer_lock():
+        from scrapers.transfermarkt.career_refs import retained_bundle_snapshots, recover_bundle_snapshots
+        connection = scraper._bronze_connection()
+        try:
+            snapshots = retained_bundle_snapshots(connection, original_run, spec.outputs, frames)
+            if not snapshots:
+                snapshots = recover_bundle_snapshots(connection, original_run, spec.outputs, frames, path, batch_id=str(scraper._batch_id))
+        finally:
+            connection.close()
+        if snapshots:
+            for output in spec.outputs:
+                # An all-empty intent precedes the first output summary. Keep
+                # the original captured frame's status when recovering it.
+                results['outputs'].setdefault(output.key, _frame_output_summary(frames[output.key]))
+                results['outputs'][output.key]['table'] = 'iceberg.bronze.' + output.table_name
+        else:
+            _save_frames(scraper, spec, frames, evidence['force_replace'], results)
+            _delete_valid_empty_rows(scraper, spec, evidence['valid_empty'], league, season)
+        if mode == 'dual':
+            results['batch_manifest'] = _persist_dual_write_manifest(scraper, spec, frames, results, original_run, league, season)
+            if results['batch_manifest']['status'] != 'success':
+                raise RuntimeError('reconciled career dual-write parity failed')
+            results['dual_write_complete'] = True
+        elif mode == 'native-only':
+            results['native_write_manifest'] = _persist_native_write_manifest(scraper, spec, frames, results, original_run, league, season, int(revision))
+            if results['native_write_manifest']['status'] != 'success':
+                raise RuntimeError('reconciled native career manifest failed')
+            results['native_write_manifest_complete'] = True
+        results['checkpoint_status'] = _commit_checkpoint_or_pending(scraper, spec,
+            evidence['checkpoint_ids'], evidence['state_rows'], original_run, league, season,
+            captured_at_by_id=evidence.get('captured_at_by_id'))
+        results['native_write_complete'] = mode != 'legacy-only'
+        results['reconciled_without_http'] = True
+        results['original_capture_run_key'] = original_run
+        _archive_native_career_intent(scraper, spec, path, frames, results)
+        finish_intent(path)
+        scraper._tm_career_intent_path = None
+    return True
 
 
 def _frame_output_summary(frame) -> Dict[str, Any]:
@@ -2492,6 +2691,7 @@ def _valid_empty_ids(scraper, spec: EntitySpec, selected: Sequence[str]) -> List
     return empty
 
 
+@locked_write
 def _delete_valid_empty_rows(
     scraper,
     spec: EntitySpec,
@@ -2501,8 +2701,28 @@ def _delete_valid_empty_rows(
     source_key: Optional[str] = None,
 ) -> Dict[str, str]:
     """Authoritative empty responses remove stale rows for those exact keys."""
+    from pathlib import Path
     if not source_ids:
         return {}
+    if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
+        from types import SimpleNamespace
+        import pandas as pd
+        capture_times = dict(getattr(scraper, '_tm_empty_capture_times', {}) or {})
+        path = getattr(scraper, '_tm_career_intent_path', None)
+        if isinstance(path, (str, Path)):
+            capture_times = {str(item['player_id']): item['captured_at']
+                for item in _career_empty_capture_refs(scraper)}
+        else:
+            capture_times.update(_career_capture_times(scraper, spec, {}, source_ids))
+        guards = {}
+        for output in spec.outputs:
+            if output.is_legacy:
+                continue
+            captured = [{'player_id': player, 'fetched_at': _as_utc(capture_times[player])}
+                        for player in source_ids if player in capture_times]
+            if captured:
+                guards[output.key] = pd.DataFrame(captured)
+        guard_frames(scraper, spec.outputs, guards)
     quoted_ids = ', '.join(
         "'" + str(source_id).replace("'", "''") + "'"
         for source_id in source_ids
@@ -2538,10 +2758,18 @@ def _delete_valid_empty_rows(
             )):
                 # There cannot be stale rows in an absent table; the delete is
                 # an authoritative no-op for this key set.
+                path = getattr(scraper, '_tm_career_intent_path', None)
+                if isinstance(path, (str, Path)) and spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
+                    from scrapers.transfermarkt.write_intents import record_empty_commit
+                    record_empty_commit(path, conn, output.table_name, source_ids)
                 committed[output.key] = table
                 continue
             raise
         committed[output.key] = table
+        path = getattr(scraper, '_tm_career_intent_path', None)
+        if isinstance(path, (str, Path)) and spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
+            from scrapers.transfermarkt.write_intents import record_empty_commit
+            record_empty_commit(path, conn, output.table_name, source_ids)
     return committed
 
 
@@ -2981,6 +3209,7 @@ def _carry_forward_observed_at(
     return updated
 
 
+@locked_write
 def _persist_dual_write_manifest(
     scraper,
     spec: EntitySpec,
@@ -2997,7 +3226,7 @@ def _persist_dual_write_manifest(
         raise RuntimeError(f'invalid dual-write output contract for {spec.name}')
     legacy = legacy_specs[0]
     legacy_frame = frames.get(legacy.key)
-    legacy_batch_id = _frame_batch_id(legacy_frame, run_key)
+    legacy_batch_id = _frame_batch_id(legacy_frame, str(scraper._batch_id) if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS} else run_key)
 
     committed_keys = {
         key for key, item in results.get('outputs', {}).items()
@@ -3096,7 +3325,9 @@ def _persist_dual_write_manifest(
         native_rows, native_hash = _compatibility_fingerprint(
             native_frame, contract['native'],
         )
-        native_batch_id = _frame_batch_id(native_frame, run_key)
+        native_batch_id = _frame_batch_id(native_frame, str(scraper._batch_id) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else run_key)
+        from scrapers.transfermarkt.career_refs import persist_capture_refs
+        capture_proof = persist_capture_refs(conn, run_key, contract['entity'], native.table_name, native_frame, legacy=True, empty_refs=_career_empty_capture_refs(scraper) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else [], batch_id=native_batch_id)
         if applicability == 'not_applicable':
             native_batch_id = legacy_batch_id
         status = (
@@ -3156,6 +3387,7 @@ WHEN NOT MATCHED THEN INSERT (
 """
         _execute_cursor(conn, sql)
         manifest_rows.append({
+            **capture_proof,
             'entity': contract['entity'],
             'native_table': native.table_name,
             'legacy_table': legacy.table_name,
@@ -3182,6 +3414,15 @@ WHEN NOT MATCHED THEN INSERT (
     }
 
 
+def _career_empty_capture_refs(scraper):
+    path = getattr(scraper, '_tm_career_intent_path', None)
+    if path is None:
+        return []
+    from scrapers.transfermarkt.career_refs import intent_empty_capture_refs
+    return intent_empty_capture_refs(path)
+
+
+@locked_write
 def _persist_native_write_manifest(
     scraper,
     spec: EntitySpec,
@@ -3240,7 +3481,9 @@ def _persist_native_write_manifest(
         native_rows, native_hash = _compatibility_fingerprint(
             frame, contract['native'],
         )
-        native_batch_id = _frame_batch_id(frame, run_key)
+        native_batch_id = _frame_batch_id(frame, str(scraper._batch_id) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else run_key)
+        from scrapers.transfermarkt.career_refs import persist_capture_refs
+        capture_proof = persist_capture_refs(conn, run_key, contract['entity'], native.table_name, frame, empty_refs=_career_empty_capture_refs(scraper) if native.table_name in {'transfermarkt_market_value_points', 'transfermarkt_transfer_events'} else [], batch_id=native_batch_id)
         allowed_empty = bool(
             results.get('authoritative_empty')
             or applicability in {'authoritative_empty', 'not_applicable'}
@@ -3276,6 +3519,7 @@ WHEN NOT MATCHED THEN INSERT (
 """
         _execute_cursor(conn, sql)
         manifest_rows.append({
+            **capture_proof,
             'entity': contract['entity'],
             'native_table': native.table_name,
             'native_batch_id': native_batch_id,
@@ -3507,6 +3751,12 @@ def _run_entity(
             cache_ttl_seconds=cache_ttl,
             canonical_season=os.environ.get('TM_CANONICAL_SEASON'),
         ) as scraper:
+            _reconcile_pending_fetch_state(scraper)
+            if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS} and not dry_run:
+                if _reconcile_native_career_intent(scraper, write_spec, mode, expected_reader_revision,
+                        league, season, results):
+                    data_committed = True
+                    raise _EntityRunComplete(0)
             if spec.state_endpoint:
                 checkpoint_spec = spec
                 if listing_empty_env:
@@ -3533,11 +3783,6 @@ def _run_entity(
                 results['cache_hits'] = cache_hits
                 results['bootstrap_seeded_keys'] = seeded
                 results['roster_coverage'] = coverage
-                if mode == 'native-only':
-                    # Post-retention native refresh never needs to reconstruct
-                    # a deleted legacy season partition from cached global
-                    # careers.
-                    career_hydrate_ids = []
                 if career_hydrate_ids:
                     if not (
                         native_write_enabled
@@ -3547,7 +3792,7 @@ def _run_entity(
                             'career cache projection requires native dual-write'
                         )
                     career_cache_frames = _load_cached_career_frames(
-                        scraper, spec, career_hydrate_ids,
+                        scraper, write_spec, career_hydrate_ids,
                     )
                     results['career_cache_materialized_keys'] = len(
                         career_hydrate_ids
@@ -3645,7 +3890,7 @@ def _run_entity(
                 results['cache_only_materialization'] = True
             elif selected == [] and career_cache_frames is not None:
                 frames = _merge_career_cache_frames(
-                    scraper, spec, {}, career_cache_frames, league, season,
+                    scraper, write_spec, {}, career_cache_frames, league, season,
                 )
                 authoritative_key = next(iter(career_cache_frames))
                 used_native = True
@@ -3693,7 +3938,7 @@ def _run_entity(
                     )
                 elif career_cache_frames is not None:
                     frames = _merge_career_cache_frames(
-                        scraper, spec, frames, career_cache_frames, league, season,
+                        scraper, write_spec, frames, career_cache_frames, league, season,
                     )
             allowed_keys = {output.key for output in write_spec.outputs}
             frames = {
@@ -3815,69 +4060,93 @@ def _run_entity(
                     results['authoritative_empty'] = True
                     results['rows'] = 0
                     if not dry_run:
-                        failure_phase = 'platform'
-                        deleted = _delete_valid_empty_rows(
-                            scraper, write_spec, valid_empty, league, season,
-                            source_key=checkpoint_spec.id_column,
-                        )
-                        results['outputs'] = {
-                            key: {
-                                'rows': 0,
-                                'table': table,
-                                'applicability_status': 'authoritative_empty',
+                        with writer_lock():
+                            career_intent_path = None
+                            if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
+                                from scrapers.transfermarkt.write_intents import save_intent, snapshot_anchors
+                                rows = _state_rows(scraper, checkpoint_spec, selected, checkpoint_frame)
+                                scraper._tm_empty_capture_times = _career_capture_times(scraper, spec, frames, selected)
+                                career_intent_path = save_intent(
+                                    {'kind': 'scope', 'entity': spec.name, 'league': league, 'season': int(season)}, frames,
+                                    mode=mode, revision=expected_reader_revision, batch_id=str(scraper._batch_id),
+                                    run_key=run_key, results=results, force_replace=force_replace, valid_empty=valid_empty,
+                                    checkpoint_ids=selected, state_rows=rows, captured_at_by_id=scraper._tm_empty_capture_times,
+                                    raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()))
+                                scraper._tm_career_intent_path = career_intent_path
+                                connection = scraper._bronze_connection()
+                                try:
+                                    snapshot_anchors(career_intent_path, connection, write_spec.outputs,
+                                        capture_times=scraper._tm_empty_capture_times)
+                                finally:
+                                    connection.close()
+                            failure_phase = 'platform'
+                            deleted = _delete_valid_empty_rows(
+                                scraper, write_spec, valid_empty, league, season,
+                                source_key=checkpoint_spec.id_column,
+                            )
+                            results['outputs'] = {
+                                key: {
+                                    'rows': 0,
+                                    'table': table,
+                                    'applicability_status': 'authoritative_empty',
+                                }
+                                for key, table in deleted.items()
                             }
-                            for key, table in deleted.items()
-                        }
-                        data_committed = True
-                        results['native_write_complete'] = bool(
-                            used_native and native_write_enabled
-                        )
-                        if mode == 'dual' and used_native:
-                            results['batch_manifest'] = _persist_dual_write_manifest(
-                                scraper, spec, frames, results, run_key,
-                                league, season,
+                            data_committed = True
+                            results['native_write_complete'] = bool(
+                                used_native and native_write_enabled
                             )
-                            results['dual_write_complete'] = (
-                                results['batch_manifest'].get('status') == 'success'
-                            )
-                            if not results['dual_write_complete']:
-                                raise RuntimeError(
-                                    'valid-empty dual-write compatibility parity failed'
-                                )
-                        elif mode == 'native-only' and used_native:
-                            results['native_write_manifest'] = (
-                                _persist_native_write_manifest(
+                            if mode == 'dual' and used_native:
+                                results['batch_manifest'] = _persist_dual_write_manifest(
                                     scraper, spec, frames, results, run_key,
                                     league, season,
-                                    int(expected_reader_revision),
                                 )
+                                results['dual_write_complete'] = (
+                                    results['batch_manifest'].get('status') == 'success'
+                                )
+                                if not results['dual_write_complete']:
+                                    raise RuntimeError(
+                                        'valid-empty dual-write compatibility parity failed'
+                                    )
+                            elif mode == 'native-only' and used_native:
+                                results['native_write_manifest'] = (
+                                    _persist_native_write_manifest(
+                                        scraper, spec, frames, results, run_key,
+                                        league, season,
+                                        int(expected_reader_revision),
+                                    )
+                                )
+                                results['native_write_manifest_complete'] = (
+                                    results['native_write_manifest'].get('status')
+                                    == 'success'
+                                )
+                            rows = _state_rows(
+                                scraper, checkpoint_spec, selected, checkpoint_frame,
                             )
-                            results['native_write_manifest_complete'] = (
-                                results['native_write_manifest'].get('status')
-                                == 'success'
+                            checkpoint_status = _commit_checkpoint_or_pending(
+                                scraper,
+                                checkpoint_spec,
+                                selected,
+                                rows,
+                                run_key,
+                                league,
+                                season,
                             )
-                        rows = _state_rows(
-                            scraper, checkpoint_spec, selected, checkpoint_frame,
-                        )
-                        checkpoint_status = _commit_checkpoint_or_pending(
-                            scraper,
-                            checkpoint_spec,
-                            selected,
-                            rows,
-                            run_key,
-                            league,
-                            season,
-                        )
-                        results['checkpoint_status'] = checkpoint_status
-                        state_persisted = checkpoint_status == 'success'
-                        if checkpoint_status == 'committed_checkpoint_pending':
-                            results['warnings'].append(
-                                'Bronze+manifest committed; ops checkpoint is pending recovery'
-                            )
-                        elif checkpoint_status != 'success':
-                            raise RuntimeError(
-                                'valid-empty commit has no recoverable checkpoint'
-                            )
+                            results['checkpoint_status'] = checkpoint_status
+                            state_persisted = checkpoint_status == 'success'
+                            if checkpoint_status == 'committed_checkpoint_pending':
+                                results['warnings'].append(
+                                    'Bronze+manifest committed; ops checkpoint is pending recovery'
+                                )
+                            elif checkpoint_status != 'success':
+                                raise RuntimeError(
+                                    'valid-empty commit has no recoverable checkpoint'
+                                )
+                            if career_intent_path is not None:
+                                from scrapers.transfermarkt.write_intents import finish_intent
+                                _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)
+                                finish_intent(career_intent_path)
+                                scraper._tm_career_intent_path = None
                     else:
                         results['dry_run'] = True
                     exit_code = 0
@@ -3992,86 +4261,108 @@ def _run_entity(
                 exit_code = 0
                 raise _EntityRunComplete(exit_code)
 
-            # Read the stored observation state BEFORE any write: a failed
-            # lookup must abort the whole entity, not fall back to a fresh
-            # observed_at (that is the duplication being fixed).
-            failure_phase = 'platform'
-            frames = _carry_forward_observed_at(
-                scraper, write_spec, frames, results,
-            )
-            _save_frames(
-                scraper, write_spec, frames, force_replace, results,
-            )
-            if valid_empty:
-                _delete_valid_empty_rows(
-                    scraper, write_spec, valid_empty, league, season,
-                    source_key=checkpoint_spec.id_column,
+            with writer_lock():
+                # Read the stored observation state BEFORE any write: a failed
+                # lookup must abort the whole entity, not fall back to a fresh
+                # observed_at (that is the duplication being fixed).
+                failure_phase = 'platform'
+                frames = _carry_forward_observed_at(
+                    scraper, write_spec, frames, results,
                 )
-            if (
-                legacy_write_enabled
-                and spec.name == ENTITY_COACHES
-                and all_coach_memberships is not None
-            ):
-                _delete_empty_season_coach_rows(
-                    scraper,
-                    all_coach_memberships['club_id'].dropna().astype(str).tolist(),
-                    frames.get('legacy_coaches'),
-                    league,
-                    season,
-                )
-                _delete_removed_coach_clubs(
-                    scraper, all_coach_memberships, league, season,
-                )
-            data_committed = True
-            results['native_write_complete'] = bool(
-                used_native and native_write_enabled
-            )
-            if mode == 'dual' and used_native:
-                results['batch_manifest'] = _persist_dual_write_manifest(
-                    scraper, spec, frames, results, run_key, league, season,
-                )
-                results['dual_write_complete'] = (
-                    results['batch_manifest'].get('status') == 'success'
-                )
-                if not results['dual_write_complete']:
-                    raise RuntimeError(
-                        f"dual-write compatibility parity failed for {spec.name}"
+                career_intent_path = None
+                if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
+                    from scrapers.transfermarkt.write_intents import save_intent
+                    intent_rows = _state_rows(scraper, checkpoint_spec, checkpoint_ids, checkpoint_frame)
+                    career_intent_path = save_intent(
+                        {'kind': 'scope', 'entity': spec.name, 'league': league, 'season': int(season)}, frames,
+                        mode=mode, revision=expected_reader_revision, batch_id=str(scraper._batch_id),
+                        run_key=run_key, results=results, force_replace=force_replace,
+                        valid_empty=valid_empty, checkpoint_ids=checkpoint_ids, state_rows=intent_rows,
+                        captured_at_by_id=_career_capture_times(scraper, spec, frames, checkpoint_ids),
+                        raw_attempts=list(scraper.get_raw_attempt_records()) if callable(getattr(scraper, 'get_raw_attempt_records', None)) else [],
+                        cache_sources=list(scraper.get_cache_source_records()) if callable(getattr(scraper, 'get_cache_source_records', None)) else [],
                     )
-            elif mode == 'native-only' and used_native:
-                results['native_write_manifest'] = (
-                    _persist_native_write_manifest(
-                        scraper, spec, frames, results, run_key,
-                        league, season, int(expected_reader_revision),
+                scraper._tm_career_intent_path = career_intent_path
+                scraper._tm_empty_capture_times = _career_capture_times(scraper, spec, frames, checkpoint_ids)
+                _save_frames(
+                    scraper, write_spec, frames, force_replace, results,
+                )
+                if valid_empty:
+                    _delete_valid_empty_rows(
+                        scraper, write_spec, valid_empty, league, season,
+                        source_key=checkpoint_spec.id_column,
                     )
-                )
-                results['native_write_manifest_complete'] = (
-                    results['native_write_manifest'].get('status') == 'success'
-                )
-            if selected is not None and checkpoint_spec is not None:
-                rows = _state_rows(
-                    scraper, checkpoint_spec, checkpoint_ids, checkpoint_frame,
-                )
-                checkpoint_status = _commit_checkpoint_or_pending(
-                    scraper,
-                    checkpoint_spec,
-                    checkpoint_ids,
-                    rows,
-                    run_key,
-                    league,
-                    season,
-                )
-                results['checkpoint_status'] = checkpoint_status
-                state_persisted = checkpoint_status in {'success', 'cache_complete'}
-                if checkpoint_status == 'committed_checkpoint_pending':
-                    results['warnings'].append(
-                        'Bronze+manifest committed; ops checkpoint is pending recovery'
+                if (
+                    legacy_write_enabled
+                    and spec.name == ENTITY_COACHES
+                    and all_coach_memberships is not None
+                ):
+                    _delete_empty_season_coach_rows(
+                        scraper,
+                        all_coach_memberships['club_id'].dropna().astype(str).tolist(),
+                        frames.get('legacy_coaches'),
+                        league,
+                        season,
                     )
-                elif checkpoint_status not in {'success', 'cache_complete'}:
-                    raise RuntimeError(
-                        'Bronze+manifest committed without recoverable checkpoint'
+                    _delete_removed_coach_clubs(
+                        scraper, all_coach_memberships, league, season,
                     )
-            exit_code = 0
-            raise _EntityRunComplete(exit_code)
+                data_committed = True
+                results['native_write_complete'] = bool(
+                    used_native and native_write_enabled
+                )
+                if mode == 'dual' and used_native:
+                    results['batch_manifest'] = _persist_dual_write_manifest(
+                        scraper, spec, frames, results, run_key, league, season,
+                    )
+                    results['dual_write_complete'] = (
+                        results['batch_manifest'].get('status') == 'success'
+                    )
+                    if not results['dual_write_complete']:
+                        raise RuntimeError(
+                            f"dual-write compatibility parity failed for {spec.name}"
+                        )
+                elif mode == 'native-only' and used_native:
+                    results['native_write_manifest'] = (
+                        _persist_native_write_manifest(
+                            scraper, spec, frames, results, run_key,
+                            league, season, int(expected_reader_revision),
+                        )
+                    )
+                    results['native_write_manifest_complete'] = (
+                        results['native_write_manifest'].get('status') == 'success'
+                    )
+                if selected is not None and checkpoint_spec is not None:
+                    rows = _state_rows(
+                        scraper, checkpoint_spec, checkpoint_ids, checkpoint_frame,
+                    )
+                    checkpoint_status = _commit_checkpoint_or_pending(
+                        scraper,
+                        checkpoint_spec,
+                        checkpoint_ids,
+                        rows,
+                        run_key,
+                        league,
+                        season,
+                        captured_at_by_id=_career_capture_times(scraper, spec, frames, checkpoint_ids),
+                    )
+                    results['checkpoint_status'] = checkpoint_status
+                    state_persisted = checkpoint_status in {'success', 'cache_complete'}
+                    if checkpoint_status == 'committed_checkpoint_pending':
+                        results['warnings'].append(
+                            'Bronze+manifest committed; ops checkpoint is pending recovery'
+                        )
+                    elif checkpoint_status not in {'success', 'cache_complete'}:
+                        raise RuntimeError(
+                            'Bronze+manifest committed without recoverable checkpoint'
+                        )
+                if career_intent_path is not None:
+                    from scrapers.transfermarkt.write_intents import finish_intent
+                    _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)
+                    finish_intent(career_intent_path)
+                    scraper._tm_career_intent_path = None
+                exit_code = 0
+                raise _EntityRunComplete(exit_code)
     except _EntityRunComplete as complete:
         exit_code = complete.exit_code
         if exit_code != 0:
@@ -4163,7 +4454,7 @@ def _run_entity(
                 cache_source_getter = getattr(scraper, 'get_cache_source_records', None)
                 results['cache_sources'] = (
                     list(cache_source_getter()) if cache_source_getter is not None else []
-                )
+                ) + list(results.get('reconciliation_cache_sources', []))
             except Exception as exc:  # noqa: BLE001 - evidence is mandatory
                 results['errors'].append(
                     'raw attempt evidence export failed: '

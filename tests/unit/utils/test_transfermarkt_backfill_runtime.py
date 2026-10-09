@@ -413,6 +413,9 @@ def test_large_denominator_uses_bounded_bulk_chunks_with_exact_readback(
         def execute(self, statement):
             self.statements.append(statement)
 
+        def fetchall(self):
+            return []
+
     repository = object.__new__(runtime.BackfillStateRepository)
     repository.cursor = _RecordingCursor()
     repository.query = lambda _statement: [

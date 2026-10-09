@@ -2718,3 +2718,58 @@ def test_promoted_native_manifest_does_not_require_expired_bronze_batch():
     assert report['passed'] is True
     assert report['live_batch_required'] is False
     assert set(evidence) == set(control.NATIVE_ENTITIES)
+
+
+def test_registry_rollback_retries_poll_time_iceberg_conflict(monkeypatch):
+    from scrapers.transfermarkt import writer
+    mod = _load()
+    class Cursor:
+        description = [('rows',)]
+        def __init__(self):
+            self.sql = ''
+            self.calls = []
+            self.failed = False
+        def execute(self, sql, params=()):
+            self.sql = sql
+            self.calls.append(sql)
+        def fetchall(self):
+            if self.sql.startswith('DELETE') and not self.failed:
+                self.failed = True
+                class Conflict(RuntimeError):
+                    error_name = 'ICEBERG_COMMIT_ERROR'
+                raise Conflict('poll conflict')
+            return [(0,)]
+    monkeypatch.setattr(writer.time, 'sleep', lambda _: None)
+    cur = Cursor()
+    report = mod.rollback_registry_discovery(cur, 'tm-registry-' + 'd' * 24)
+    assert report['status'] == 'rolled_back'
+    deletes = [sql for sql in cur.calls if sql.startswith('DELETE')]
+    assert len(deletes) == 3 and deletes[0] == deletes[1]
+
+
+def test_bootstrap_cli_retries_mutation_before_advancing(monkeypatch):
+    from scrapers.transfermarkt import writer
+    mod = _load()
+    class Cursor:
+        description = [('rows',)]
+        def __init__(self):
+            self.calls = []
+            self.failed = False
+        def execute(self, sql, params=()):
+            self.calls.append(sql)
+        def fetchall(self):
+            if not self.failed:
+                self.failed = True
+                class Conflict(RuntimeError):
+                    error_name = 'ICEBERG_COMMIT_ERROR'
+                raise Conflict('poll conflict')
+            return [(1,)]
+        def close(self):
+            pass
+    cur = Cursor()
+    conn = SimpleNamespace(cursor=lambda: cur, close=lambda: None)
+    monkeypatch.setattr(writer.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(mod, '_connect', lambda: conn)
+    monkeypatch.setattr(mod, 'bootstrap_sql', lambda: ['INSERT INTO iceberg.ops.fixture VALUES (1)', 'INSERT INTO iceberg.ops.fixture VALUES (2)'])
+    assert mod.main(['bootstrap', '--apply']) == 0
+    assert cur.calls == ['INSERT INTO iceberg.ops.fixture VALUES (1)', 'INSERT INTO iceberg.ops.fixture VALUES (1)', 'INSERT INTO iceberg.ops.fixture VALUES (2)']

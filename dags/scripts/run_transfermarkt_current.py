@@ -6,6 +6,8 @@ acknowledged after the writer returns verified Bronze manifest evidence.
 """
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement
+
 import fcntl
 import argparse
 import hashlib
@@ -303,7 +305,7 @@ def _sql(scraper, statement):
     connection = scraper._bronze_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute(statement)
+        execute_statement(cursor, statement)
         # Trino writes finish only after the response has been consumed.
         if hasattr(cursor, 'fetchall'):
             cursor.fetchall()
@@ -317,7 +319,7 @@ def _load_ops_signals(scraper, scope_id):
     connection = scraper._bronze_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute(f"SELECT * FROM {SIGNALS_TABLE} WHERE scope_id = '" + scope_id.replace("'", "''") + "'")
+        execute_statement(cursor, f"SELECT * FROM {SIGNALS_TABLE} WHERE scope_id = '" + scope_id.replace("'", "''") + "'")
         rows = cursor.fetchall()
         names = [column[0] for column in cursor.description] if rows else []
         parsed = []
@@ -339,7 +341,7 @@ def _existing_bronze_roster(scraper, competition_id, edition_id):
     connection = scraper._bronze_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute('SELECT 1 FROM iceberg.bronze.transfermarkt_squad_memberships '
+        execute_statement(cursor, 'SELECT 1 FROM iceberg.bronze.transfermarkt_squad_memberships '
                        'WHERE competition_id = ? AND edition_id = ? LIMIT 1',
                        (competition_id, edition_id))
         return bool(cursor.fetchall())
@@ -425,7 +427,7 @@ def seed_current_baseline(scraper, entry, preflight, verify_complete_scope):
         for offset in range(0, len(ids), 300):
             packet = ids[offset:offset + 300]
             placeholders = ','.join('?' for _ in packet)
-            cursor.execute('SELECT player_id, MAX(mv_date) FROM iceberg.bronze.transfermarkt_market_value_points '
+            execute_statement(cursor, 'SELECT player_id, MAX(mv_date) FROM iceberg.bronze.transfermarkt_market_value_points '
                            f'WHERE player_id IN ({placeholders}) GROUP BY player_id', packet)
             for player_id, latest in cursor.fetchall():
                 if latest is not None:
@@ -1381,10 +1383,39 @@ class _Scope:
                     state.first_detected_at.isoformat() if state else self.cursor.generation,
                     self.data.get('career_generations', {}).get(f'{endpoint}:{player_id}', '')])
                 self.scraper._cache_generation_by_url['https://www.transfermarkt.com' + path + player_id] = generation
+            # Use the exact existing HTTP cache generation, including scope
+            # and the source-mismatch nonce. Archives cannot bypass that gate.
+            self.scraper._current_career_signal_generations = {player_id:
+                self.scraper._cache_generation_by_url['https://www.transfermarkt.com' + path + player_id]
+                for player_id in ids}
             proof = self.career_writer(
                 self.scraper, endpoint, ids, self.scope, self.preflight, self.cycle_id,
                 decoded_body_soft_stop_bytes=decoded_start + soft_remaining,
             )
+            if proof.get('status') in {'superseded_partial_write', 'supersession_deferred'}:
+                window = proof.get('career_window', {})
+                if window.get('processed_player_ids') != [] or set(window.get('deferred_player_ids', [])) != set(ids):
+                    raise CurrentPortionError('terminal career failure changed exact requested remainder')
+                if proof.get('status') == 'supersession_deferred':
+                    self.data.setdefault('career_deferred', {})[endpoint] = dict(proof)
+                    self.persist()
+                    continue
+                failures = self.data.setdefault('career_job_failures', {})
+                digest = proof['intent_sha256']
+                failure = {key: value for key, value in proof.items()
+                    if key not in {'career_window', 'reconciled_without_http'}}
+                if digest in failures and failures[digest] != failure:
+                    raise CurrentPortionError('immutable superseded career failure differs')
+                failures[digest] = failure
+                for player in proof['retired_player_ids']:
+                    state = self.signals.get(f'player:{player}')
+                    generation = self.scraper._current_career_signal_generations.get(player)
+                    if state is not None and state.pending and proof.get('signal_generations', {}).get(player) == generation:
+                        failed = mark_failed(state, 'superseded_partial_write:' + digest)
+                        _sql(self.scraper, build_signal_merge(failed))
+                        self.signals[f'player:{player}'] = failed
+                self.persist()
+                continue  # No proof/ack/cold-complete for the original failed dual job.
             _proof(proof)
             window = proof.get('career_window')
             if not isinstance(window, Mapping):
@@ -1393,12 +1424,15 @@ class _Scope:
             if set(processed) & set(deferred) or set(processed) | set(deferred) != set(ids):
                 raise CurrentPortionError('career window does not partition requested players')
             pending[endpoint] = list(deferred)
-            mismatched_ids = []
+            stale_generation_ids = [player for player in processed
+                if proof.get('signal_generations', {}).get(player) is not None
+                and proof['signal_generations'][player] != self.scraper._current_career_signal_generations.get(player)]
+            mismatched_ids = list(stale_generation_ids)
             if endpoint == 'market_value_points':
                 from scrapers.transfermarkt.scraper import _parse_mv_history
                 outcomes = self.scraper.get_fetch_outcomes().get(endpoint, {})
                 for player_id in processed:
-                    raw_capture_id = outcomes.get(player_id, {}).get('raw_capture_id')
+                    raw_capture_id = proof.get('cached_capture_ids', {}).get(player_id) or outcomes.get(player_id, {}).get('raw_capture_id')
                     if raw_capture_id:
                         body, _ = self.scraper._http_client._raw_store.load_capture(raw_capture_id)
                         points = _parse_mv_history(json.loads(body.decode('utf-8')), player_id)
@@ -1424,7 +1458,8 @@ class _Scope:
             proof = {**dict(proof), 'collector_window': {
                 'requested_player_ids': ids,
                 'processed_player_ids': [player_id for player_id in processed if player_id not in mismatched_ids],
-                'deferred_player_ids': list(pending[endpoint]), 'source_mismatch_ids': mismatched_ids}}
+                'deferred_player_ids': list(pending[endpoint]), 'source_mismatch_ids': [player for player in mismatched_ids if player not in stale_generation_ids],
+                'stale_generation_ids': stale_generation_ids}}
             self.data.setdefault('career_proofs', {})[endpoint] = dict(proof)
             self.data.setdefault('career_receipts', []).append(dict(proof))
             self.persist()

@@ -18,6 +18,7 @@ from typing import Any, Mapping
 import pandas as pd
 
 from dags.scripts import run_transfermarkt_scraper as run
+from scrapers.transfermarkt.writer import StaleTransfermarktWrite, writer_lock, writer_deadline, guard_frames
 from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
 from scrapers.transfermarkt.current_capture import FullRosterSnapshot
 from scrapers.transfermarkt import scraper as tm
@@ -116,8 +117,14 @@ def _rows(frame):
     return sorted(rows, key=lambda row: json.dumps(row))
 
 
-def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None):
+def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None, player_ids=()):
     table = 'iceberg.bronze.' + output.table_name
+    relation = table + (f' FOR VERSION AS OF {snapshot_id}' if snapshot_id else '')
+    if snapshot_id == 0 and frame.empty:
+        # Only anchored recovery can supply zero: the immutable pre-write
+        # boundary recorded that this table did not exist for the typed empty.
+        return {'table': table, 'batch_id': str(scraper._batch_id), 'rows': 0,
+                'physical_hash': hashlib.sha256(b'[]').hexdigest(), 'original_table_absent': True}
     if empty_ids and not (empty_key == 'club_id' and output.key == 'profiles'):
         placeholders = ', '.join('?' for _ in empty_ids)
         predicate = f'{empty_key} IN ({placeholders})'
@@ -127,7 +134,7 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
             params += [scope['compatibility_league'], scope['canonical_season']]
         try:
             rows = run._execute_cursor(scraper._bronze_connection(),
-                f'SELECT {empty_key} FROM {table} WHERE {predicate}', params, fetch=True)
+                f'SELECT {empty_key} FROM {relation} WHERE {predicate}', params, fetch=True)
         except Exception as exc:
             if not frame.empty or not _missing_table(exc):
                 raise CurrentWriteError('authoritative empty physical read-back failed') from exc
@@ -137,12 +144,15 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
     if frame.empty:
         predicate = '_batch_id = ?'
         params = [str(scraper._batch_id)]
+        if player_ids:
+            predicate += ' AND player_id IN (' + ', '.join('?' for _ in player_ids) + ')'
+            params += list(player_ids)
         if {'competition_id', 'edition_id'} <= set(frame.columns):
             predicate += ' AND competition_id = ? AND edition_id = ?'
             params += [scope['competition_id'], scope['edition_id']]
         try:
             persisted = run._query_dataframe(scraper._bronze_connection(),
-                f'SELECT {", ".join(frame.columns)} FROM {table} WHERE {predicate}', params)
+                f'SELECT {", ".join(frame.columns)} FROM {relation} WHERE {predicate}', params)
         except Exception as exc:
             if not any(marker in str(exc).lower() for marker in ('table_not_found', 'table not found', 'does not exist')):
                 raise CurrentWriteError('empty output physical read-back failed') from exc
@@ -163,7 +173,7 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
         params += [str(frame.iloc[0]['competition_id']), str(frame.iloc[0]['edition_id'])]
     try:
         persisted = run._query_dataframe(scraper._bronze_connection(),
-            f'SELECT {", ".join(frame.columns)} FROM {table} WHERE {predicate}', params)
+            f'SELECT {", ".join(frame.columns)} FROM {relation} WHERE {predicate}', params)
     except Exception as exc:
         raise CurrentWriteError(f'physical read-back failed for {table}') from exc
     if list(persisted.columns) != list(frame.columns) or _rows(persisted) != _rows(frame):
@@ -209,64 +219,97 @@ def _save_current_frame(scraper, **options):
 
 
 def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids=(), empty_key='player_id'):
-    run._authorize_write_mode(mode, revision)
-    results = {'outputs': {key: run._frame_output_summary(frame) for key, frame in frames.items()}, 'tables': []}
-    frames = run._carry_forward_observed_at(scraper, spec, frames, results)
-    # A portion may write this scope twice. Distinct business bundles must not
-    # mix their batches or overwrite each other's compatibility manifest rows.
-    identity = {'cycle_id': cycle_id, 'scope_id': scope['scope_id'], 'entity': spec.name,
-                'frames': {key: _rows(frame.drop(columns=['_batch_id', '_ingested_at'], errors='ignore'))
-                           for key, frame in frames.items()}}
-    unit_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
-    scraper._batch_id = unit_id
-    frames = {key: frame.assign(_batch_id=unit_id) for key, frame in frames.items()}
-    manifest_cycle = f'{cycle_id}:current-unit:{unit_id}'
-    _precheck(scraper, spec, frames)
-    for output in spec.outputs:
-        frame = frames[output.key]
-        table = 'iceberg.bronze.' + output.table_name
-        if not frame.empty:
-            options = dict(df=frame, table_name=output.table_name, partition_cols=list(output.partition_cols))
-            if output.key == 'attribute_observations':
-                options['natural_keys'] = ['competition_id', 'edition_id', 'club_id', 'player_id', 'observed_at']
-            else:
-                options.update(replace_partitions=list(output.replace_keys) or None,
-                    min_replace_ratio=run._MIN_REPLACE_RATIO if output.guard_key else None,
-                    replace_guard_key=output.guard_key)
-            table = _save_current_frame(scraper, **options)
-        results['outputs'][output.key]['table'] = table
-    if empty_ids:
-        run._delete_valid_empty_rows(scraper, spec, empty_ids, scope['compatibility_league'],
-                                     int(scope['edition_id']), source_key=empty_key)
-    if spec.name == run.ENTITY_COACHES and mode == 'dual':
-        clubs = sorted(set(frames['stints']['club_id'].astype(str))) or list(empty_ids)
-        run._delete_empty_season_coach_rows(scraper, clubs, frames['legacy_coaches'],
-            scope['compatibility_league'], int(scope['edition_id']))
-    proof = {output.key: _read_back(scraper, output, frames[output.key], cycle_id,
-             empty_ids=empty_ids, empty_key='current_club_id' if empty_key == 'club_id' and output.is_legacy else empty_key, scope=scope)
-             for output in spec.outputs if not (empty_key == 'club_id' and output.key == 'profiles' and frames[output.key].empty)}
-    manifests = []
-    if mode == 'native-only':
-        manifests.append(run._persist_native_write_manifest(scraper, spec, frames, results,
-            manifest_cycle, scope['competition_id'], int(scope['edition_id']), revision))
-    else:
-        legacy = next(output for output in spec.outputs if output.is_legacy)
-        for native in (output for output in spec.outputs if not output.is_legacy):
-            paired = replace(spec, outputs=(native, legacy))
-            pair_frames = {native.key: frames[native.key], legacy.key: frames[legacy.key]}
-            if native.key == 'attribute_observations':
-                clubs = set(frames[native.key]['club_id'].astype(str))
-                pair_frames[legacy.key] = frames[legacy.key][frames[legacy.key]['current_club_id'].astype(str).isin(clubs)]
-            manifests.append(run._persist_dual_write_manifest(scraper, paired, pair_frames, results,
-                manifest_cycle, scope['competition_id'], int(scope['edition_id'])))
-    if any(item.get('status') != 'success' for item in manifests):
-        raise CurrentWriteError('current business compatibility manifest did not pass')
-    digest = hashlib.sha256(json.dumps({'cycle_id': cycle_id, 'outputs': proof, 'manifests': manifests}, sort_keys=True).encode()).hexdigest()
-    return {'verified': True, 'bronze_manifest': digest,
-            'committed_at': datetime.now(timezone.utc).isoformat(), 'outputs': proof,
-            'cycle_id': cycle_id, 'manifest_cycle_id': manifest_cycle,
-            'manifests': manifests, 'writer_revision': revision, 'write_mode': mode}, frames
-
+    with writer_deadline(getattr(scraper, '_current_deadline_monotonic', None)), writer_lock():
+        run._authorize_write_mode(mode, revision)
+        results = {'outputs': {key: run._frame_output_summary(frame) for key, frame in frames.items()}, 'tables': []}
+        frames = run._carry_forward_observed_at(scraper, spec, frames, results)
+        # A portion may write this scope twice. Distinct business bundles must not
+        # mix their batches or overwrite each other's compatibility manifest rows.
+        identity = {'cycle_id': cycle_id, 'scope_id': scope['scope_id'], 'entity': spec.name,
+                    'frames': {key: _rows(frame.drop(columns=['_batch_id', '_ingested_at'], errors='ignore'))
+                               for key, frame in frames.items()}}
+        if empty_ids and spec.name in {run.ENTITY_MV_HISTORY, run.ENTITY_TRANSFERS}:
+            identity['empty_captures'] = run._career_empty_capture_refs(scraper)
+        unit_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
+        scraper._batch_id = unit_id
+        frames = {key: frame.assign(_batch_id=unit_id) for key, frame in frames.items()}
+        manifest_cycle = f'{cycle_id}:current-unit:{unit_id}'
+        from scrapers.transfermarkt.career_refs import retained_bundle_snapshots, persist_capture_refs, recover_bundle_snapshots
+        connection = scraper._bronze_connection()
+        try:
+            path = getattr(scraper, '_tm_career_intent_path', None)
+            if path is not None:
+                from scrapers.transfermarkt.write_intents import snapshot_anchors
+                snapshot_anchors(path, connection, spec.outputs, capture_times=getattr(scraper, '_tm_empty_capture_times', {}))
+            snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
+            if not snapshots and path is not None:
+                snapshots = recover_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames, path, batch_id=str(scraper._batch_id))
+        finally:
+            connection.close()
+        if not snapshots:
+            guard_frames(scraper, spec.outputs, frames)
+            _precheck(scraper, spec, frames)
+            for output in spec.outputs:
+                frame = frames[output.key]
+                table = 'iceberg.bronze.' + output.table_name
+                if not frame.empty:
+                    options = dict(df=frame, table_name=output.table_name, partition_cols=list(output.partition_cols))
+                    if output.key == 'attribute_observations':
+                        options['natural_keys'] = ['competition_id', 'edition_id', 'club_id', 'player_id', 'observed_at']
+                    else:
+                        options.update(replace_partitions=list(output.replace_keys) or None,
+                            min_replace_ratio=run._MIN_REPLACE_RATIO if output.guard_key else None,
+                            replace_guard_key=output.guard_key)
+                    table = _save_current_frame(scraper, **options)
+                results['outputs'][output.key]['table'] = table
+            if empty_ids:
+                run._delete_valid_empty_rows(scraper, spec, empty_ids, scope['compatibility_league'],
+                                             int(scope['edition_id']), source_key=empty_key)
+            if spec.name == run.ENTITY_COACHES and mode == 'dual':
+                clubs = sorted(set(frames['stints']['club_id'].astype(str))) or list(empty_ids)
+                run._delete_empty_season_coach_rows(scraper, clubs, frames['legacy_coaches'],
+                    scope['compatibility_league'], int(scope['edition_id']))
+        if snapshots:
+            for output in spec.outputs:
+                results['outputs'][output.key]['table'] = 'iceberg.bronze.' + output.table_name
+        else:
+            connection = scraper._bronze_connection()
+            try:
+                for output in spec.outputs:
+                    if not output.is_legacy:
+                        persist_capture_refs(connection, manifest_cycle, output.key, output.table_name,
+                            frames[output.key], legacy=mode == 'dual', empty_refs=run._career_empty_capture_refs(scraper), batch_id=str(scraper._batch_id))
+                snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
+            finally:
+                connection.close()
+        proof = {output.key: _read_back(scraper, output, frames[output.key], cycle_id,
+                 empty_ids=empty_ids, empty_key='current_club_id' if empty_key == 'club_id' and output.is_legacy else empty_key, scope=scope, snapshot_id=snapshots.get(output.key))
+                 for output in spec.outputs if not (empty_key == 'club_id' and output.key == 'profiles' and frames[output.key].empty)}
+        manifests = []
+        if mode == 'native-only':
+            manifests.append(run._persist_native_write_manifest(scraper, spec, frames, results,
+                manifest_cycle, scope['competition_id'], int(scope['edition_id']), revision))
+        else:
+            legacy = next(output for output in spec.outputs if output.is_legacy)
+            for native in (output for output in spec.outputs if not output.is_legacy):
+                paired = replace(spec, outputs=(native, legacy))
+                pair_frames = {native.key: frames[native.key], legacy.key: frames[legacy.key]}
+                if native.key == 'attribute_observations':
+                    clubs = set(frames[native.key]['club_id'].astype(str))
+                    pair_frames[legacy.key] = frames[legacy.key][frames[legacy.key]['current_club_id'].astype(str).isin(clubs)]
+                manifests.append(run._persist_dual_write_manifest(scraper, paired, pair_frames, results,
+                    manifest_cycle, scope['competition_id'], int(scope['edition_id'])))
+        if any(item.get('status') != 'success' for item in manifests):
+            raise CurrentWriteError('current business compatibility manifest did not pass')
+        digest = hashlib.sha256(json.dumps({'cycle_id': cycle_id, 'outputs': proof, 'manifests': manifests}, sort_keys=True).encode()).hexdigest()
+        receipt = {'verified': True, 'bronze_manifest': digest,
+                'committed_at': datetime.now(timezone.utc).isoformat(), 'outputs': proof,
+                'cycle_id': cycle_id, 'manifest_cycle_id': manifest_cycle,
+                'manifests': manifests, 'writer_revision': revision, 'write_mode': mode}
+        if spec.name in {run.ENTITY_MV_HISTORY, run.ENTITY_TRANSFERS}:
+            from scrapers.transfermarkt.superseded import attest_career_manifest
+            attest_career_manifest(scraper, receipt)
+        return receipt, frames
 
 def _roster_frames(scraper, snapshot, scope, cycle_id):
     now = _stamp(getattr(scraper, '_current_roster_write_at', None) or datetime.now(timezone.utc))
@@ -308,6 +351,8 @@ def _roster_frames(scraper, snapshot, scope, cycle_id):
         ('contract_observations', contracts, tm.PLAYER_CONTRACT_OBSERVATION_COLUMNS, 'player_contract_observations')):
         bundle[key] = tm._with_metadata(rows, columns, entity_type=entity, batch_id=scraper._batch_id, ingested_at=now)
     bundle['contract_observations'].attrs['fetch_status'] = 'ok' if contracts else 'not_applicable'
+    for frame in bundle.values():
+        frame.attrs['tm_bundle_fetched_at'] = max(club.raw_fetched_at for club in snapshot.clubs.values()).isoformat()
     bundle['legacy_players'] = scraper.materialize_legacy_players(bundle['memberships'], bundle['attribute_observations'])
     bundle['attribute_observations'] = bundle['attribute_observations'][bundle['attribute_observations']['club_id'].astype(str).isin(snapshot.changed_club_ids)].copy()
     return bundle
@@ -381,6 +426,7 @@ def write_current_roster(scraper, snapshot: FullRosterSnapshot, preflight, cycle
 @_bounded_current_writer
 def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, decoded_body_soft_stop_bytes):
     mode, revision, _ = _authorize(preflight)
+    run._reconcile_pending_fetch_state(scraper)
     resolved = _scope(scraper, scope)
     name = {'market_value_points': run.ENTITY_MV_HISTORY, 'market_value_history': run.ENTITY_MV_HISTORY,
             'transfer_events': run.ENTITY_TRANSFERS, 'transfers': run.ENTITY_TRANSFERS}.get(endpoint)
@@ -390,6 +436,85 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     if not selected:
         raise CurrentWriteError('current career selection is empty')
     spec = run._spec_for_write_mode(run.ENTITY_SPECS[name], mode)
+    from scrapers.transfermarkt.write_intents import pending_intents, save_intent, unpack_frames, finish_intent, archive_complete, retired_intents
+    intent_identity = {'kind': 'current', 'scope_id': resolved['scope_id'], 'entity': name}
+    pending = pending_intents(intent_identity)
+    if pending:
+        if len(pending) != 1:
+            raise CurrentWriteError('ambiguous durable current career writes; refusing paid I/O')
+        path, payload = pending[0]
+        evidence = payload['evidence']
+        if evidence['mode'] != mode or evidence['revision'] != revision:
+            raise CurrentWriteError('career reconciliation requires original writer authority')
+        scraper._tm_career_intent_path = path
+        scraper._batch_id = evidence['batch_id']
+        frames = unpack_frames(payload['frames'])
+        scraper._tm_empty_capture_times = evidence.get('captured_at_by_id', {})
+        try:
+            if evidence.get('cache_resolution'):
+                from scrapers.transfermarkt.superseded import cached_supersession, verify_complete
+                from scrapers.transfermarkt.write_intents import completed_intent
+                with writer_lock():
+                    archived = completed_intent(path)
+                    if archived is not None:
+                        verify_complete(scraper, spec, archived, players=evidence['processed'])
+                        receipt = dict(archive_complete(path, archived['receipt'], unpack_frames(archived['frames'])))
+                        finish_intent(path)
+                        scraper._tm_career_intent_path = None
+                        receipt['reconciled_without_http'] = True
+                        return receipt
+                    cached, blocked = cached_supersession(scraper, spec, retired_intents(intent_identity), evidence['processed'], reconcile=True)
+                    if set(cached) != set(evidence['processed']):
+                        raise CurrentWriteError('cached pending resolution lost its exact full source')
+                    original_sources = {item['capture_id'] for item in evidence.get('cache_sources', [])}
+                    if any(cached[player]['raw']['capture_id'] not in original_sources
+                        or pd.to_datetime(cached[player]['raw']['fetched_at'], utc=True)
+                        != pd.to_datetime(evidence['captured_at_by_id'][player], utc=True)
+                        for player in evidence['processed']):
+                        raise StaleTransfermarktWrite('pending cached career has a newer complete successor')
+                    return _write_cached_supersession(scraper, spec, resolved, mode, revision, evidence['cycle_id'],
+                        evidence['window']['requested_player_ids'], cached, intent_identity, decoded_body_soft_stop_bytes, original_evidence=evidence)
+            receipt, committed_frames = _commit(scraper, spec, frames, resolved, mode, revision,
+                evidence['cycle_id'], empty_ids=evidence['empty'])
+        except StaleTransfermarktWrite:
+            from scrapers.transfermarkt.superseded import retire_partial
+            resolution = retire_partial(scraper, spec, path, payload, frames, delivery_cycle=cycle_id)
+            if resolution is None:
+                raise
+            scraper._tm_career_intent_path = None
+            return {**resolution, 'reconciled_without_http': True, 'career_window': {
+                'requested_player_ids': selected, 'processed_player_ids': [], 'deferred_player_ids': selected,
+                'stop_reason': 'superseded_partial_write'}}
+        receipt['checkpoint_status'] = run._commit_checkpoint_or_pending(scraper, spec,
+            evidence['processed'], evidence['state_rows'], evidence['cycle_id'],
+            resolved['competition_id'], int(resolved['edition_id']), captured_at_by_id=evidence.get('captured_at_by_id'))
+        receipt.update(signal_generations=evidence.get('signal_generations', {}), business_entity=spec.state_endpoint, career_window=evidence['window'],
+            reconciled_without_http=True, original_capture_attempts=evidence.get('raw_attempts', []),
+            original_cache_sources=evidence.get('cache_sources', []), **evidence['window'])
+        receipt['committed_at'] = archive_complete(path, receipt, committed_frames)['committed_at']
+        finish_intent(path)
+        scraper._tm_career_intent_path = None
+        return receipt
+    requested = list(selected)
+    blocked = {}
+    retired = retired_intents(intent_identity)
+    if retired:
+        for _, _, resolution in retired:
+            if resolution['delivery_cycle_id'] == cycle_id and set(selected) & set(resolution['retired_player_ids']):
+                return {**resolution, 'reconciled_without_http': True, 'career_window': {
+                    'requested_player_ids': selected, 'processed_player_ids': [], 'deferred_player_ids': selected,
+                    'stop_reason': 'superseded_partial_write'}}
+        from scrapers.transfermarkt.superseded import cached_supersession
+        with writer_lock():
+            cached, blocked = cached_supersession(scraper, spec, retired, selected)
+            if cached:
+                return _write_cached_supersession(scraper, spec, resolved, mode, revision, cycle_id,
+                    selected, cached, intent_identity, decoded_body_soft_stop_bytes)
+        selected = [player for player in selected if player not in blocked]
+        if not selected:
+            return {'status': 'supersession_deferred', 'verified': False, 'blocking_reasons': blocked,
+                'career_window': {'requested_player_ids': requested, 'processed_player_ids': [],
+                    'deferred_player_ids': requested, 'stop_reason': 'superseding_cache_ineligible'}}
     pieces = []
     processed = []
     state_rows = []
@@ -420,8 +545,8 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         if rows[0][0] == 'authoritative_empty':
             empty.append(player)
         pieces.append(bundle)
-    deferred = selected[len(processed):]
-    window = {'requested_player_ids': selected, 'processed_player_ids': processed, 'deferred_player_ids': deferred,
+    deferred = [player for player in requested if player not in processed]
+    window = {'requested_player_ids': requested, 'processed_player_ids': processed, 'deferred_player_ids': deferred,
         'decoded_body_soft_stop_bytes': decoded_body_soft_stop_bytes,
         'stop_reason': stop_reason, 'admitted_endpoint_windows': admitted_windows}
     if not processed:
@@ -431,10 +556,109 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     for frame in frames.values():
         if frame.empty and empty:
             frame.attrs['fetch_status'] = 'authoritative_empty'
-    receipt, _ = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
-    if not run._persist_fetch_state(scraper, spec, processed, state_rows, cycle_id):
-        raise CurrentWriteError('career fetch-state commit failed after Bronze write')
+    scraper._tm_empty_capture_times = run._career_capture_times(scraper, spec, frames, processed)
+    intent_path = save_intent(intent_identity, frames, mode=mode, revision=revision,
+        batch_id=str(scraper._batch_id), cycle_id=cycle_id, empty=empty,
+        processed=processed, state_rows=state_rows, window=window,
+        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed),
+        raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()),
+        signal_generations=dict(getattr(scraper, '_current_career_signal_generations', {}) or {}))
+    scraper._tm_career_intent_path = intent_path
+    receipt, committed_frames = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
+    checkpoint_status = run._commit_checkpoint_or_pending(scraper, spec, processed, state_rows, cycle_id,
+        resolved['competition_id'], int(resolved['edition_id']),
+        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed))
+    receipt['checkpoint_status'] = checkpoint_status
     receipt.update(business_entity=spec.state_endpoint, career_window=window, **window)
+    receipt['committed_at'] = archive_complete(intent_path, receipt, committed_frames)['committed_at']
+    finish_intent(intent_path)
+    scraper._tm_career_intent_path = None
+    return receipt
+
+
+def _write_cached_supersession(scraper, spec, scope, mode, revision, cycle_id, selected, cached, identity, soft_stop, *, original_evidence=None):
+    """A new genuine cached job; never a successful acknowledgement of old dual."""
+    from scrapers.transfermarkt.write_intents import save_intent, archive_complete, finish_intent
+    from scrapers.transfermarkt.career_refs import persist_capture_refs, retained_bundle_snapshots
+    native = next(output for output in spec.outputs if not output.is_legacy)
+    ids = [player for player in selected if player in cached]
+    source_frame = pd.concat([cached[player]['frame'] for player in ids], ignore_index=True)
+    source_frame.attrs = {}
+    empty = [player for player in ids if cached[player]['state'][0] in {'authoritative_empty', 'valid_empty'}]
+    frames = run._merge_career_cache_frames(scraper, spec, {native.key: source_frame.iloc[:0]},
+        {native.key: source_frame}, scope['competition_id'], int(scope['edition_id']))
+    unit = hashlib.sha256(json.dumps({'cycle': cycle_id, 'scope': scope['scope_id'], 'entity': spec.name,
+        'sources': {player: cached[player]['raw']['capture_id'] for player in ids}}, sort_keys=True).encode()).hexdigest()[:32]
+    scraper._batch_id = unit
+    frames = run._align_batch_ids(scraper, frames)
+    if empty and source_frame.empty:
+        for frame in frames.values():
+            frame.attrs['fetch_status'] = 'authoritative_empty'
+    manifest_cycle = cycle_id + ':cached-supersession:' + unit
+    for player in ids:
+        envelope = cached[player]['raw']['envelope']
+        # This is a prior paid capture, not a new HTTP attempt.
+        scraper._http_client._cache_sources[envelope['envelope_id']] = scraper._http_client._raw_store.verify_attempt_envelope(envelope['envelope_id'])
+    clocks = {player: cached[player]['raw']['fetched_at'] for player in ids}
+    scraper._tm_empty_capture_times = clocks
+    window = {'requested_player_ids': selected, 'processed_player_ids': ids,
+        'deferred_player_ids': [player for player in selected if player not in cached],
+        'decoded_body_soft_stop_bytes': soft_stop, 'stop_reason': 'verified_superseding_cache'}
+    generations = (original_evidence.get('signal_generations', {}) if original_evidence is not None
+        else dict(getattr(scraper, '_current_career_signal_generations', {}) or {}))
+    path = save_intent(identity, frames, mode=mode, revision=revision, batch_id=unit, cycle_id=cycle_id,
+        empty=empty, processed=ids, state_rows=[cached[player]['state'] for player in ids], window=window,
+        captured_at_by_id=clocks, raw_attempts=[], cache_sources=[cached[player]['raw']['envelope'] for player in ids],
+        cache_resolution=True, signal_generations=generations)
+    scraper._tm_career_intent_path = path
+    results = {'outputs': {}, 'tables': []}
+    run._save_frames(scraper, spec, frames, False, results)
+    if empty:
+        # A fully proven newer empty was already committed, so no repeated delete.
+        for output in spec.outputs:
+            results['outputs'][output.key].update(table='iceberg.bronze.' + output.table_name,
+                applicability_status='authoritative_empty')
+    manifest = run._persist_dual_write_manifest(scraper, spec, frames, results, manifest_cycle,
+        scope['competition_id'], int(scope['edition_id']))
+    if manifest['status'] != 'success':
+        raise CurrentWriteError('superseding cached career compatibility failed')
+    connection = scraper._bronze_connection()
+    try:
+        snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
+    finally:
+        connection.close()
+    proof = {}
+    physical_frames = {}
+    original_batches = {item['player_id']: item['batch_id'] for item in frames[native.key].attrs.get('tm_original_capture_refs', [])}
+    for output in spec.outputs:
+        actual = frames[output.key].copy()
+        if output == native and original_batches:
+            actual['_batch_id'] = actual.player_id.astype(str).map(original_batches)
+        # Native may reference several original batches. Compare exact complete
+        # pinned rows through the verified refs instead of inventing one batch.
+        if output == native:
+            if not snapshots and not actual.empty:
+                raise CurrentWriteError('cached current native receipt lacks its original snapshot')
+            proof[output.key] = {'table': 'iceberg.bronze.' + output.table_name, 'rows': len(actual),
+                'physical_hash': hashlib.sha256(json.dumps(_rows(actual), sort_keys=True).encode()).hexdigest()}
+        else:
+            proof[output.key] = _read_back(scraper, output, actual, cycle_id, empty_ids=empty, scope=scope,
+                snapshot_id=snapshots.get(output.key))
+        physical_frames[output.key] = actual
+    receipt = {'verified': True, 'status': 'verified_superseding_cache', 'cycle_id': cycle_id,
+        'manifest_cycle_id': manifest_cycle, 'write_mode': mode, 'writer_revision': revision,
+        'outputs': proof, 'manifests': [manifest], 'committed_at': datetime.now(timezone.utc).isoformat(),
+        'career_window': window, 'cached_capture_ids': {player: cached[player]['raw']['capture_id'] for player in ids},
+        'business_entity': spec.state_endpoint, 'signal_generations': generations, 'reconciled_without_http': True, **window}
+    receipt['bronze_manifest'] = hashlib.sha256(json.dumps({'cycle_id': cycle_id,
+        'outputs': proof, 'manifests': [manifest]}, sort_keys=True).encode()).hexdigest()
+    from scrapers.transfermarkt.superseded import attest_career_manifest
+    attest_career_manifest(scraper, receipt)
+    receipt['checkpoint_status'] = run._commit_checkpoint_or_pending(scraper, spec, ids,
+        [cached[player]['state'] for player in ids], cycle_id, scope['competition_id'], int(scope['edition_id']), captured_at_by_id=clocks)
+    receipt['committed_at'] = archive_complete(path, receipt, physical_frames)['committed_at']
+    finish_intent(path)
+    scraper._tm_career_intent_path = None
     return receipt
 
 
