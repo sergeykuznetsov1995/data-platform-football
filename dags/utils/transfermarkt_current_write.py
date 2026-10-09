@@ -18,6 +18,7 @@ from typing import Any, Mapping
 import pandas as pd
 
 from dags.scripts import run_transfermarkt_scraper as run
+from scrapers.transfermarkt.writer import writer_lock, writer_deadline, guard_frames
 from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
 from scrapers.transfermarkt.current_capture import FullRosterSnapshot
 from scrapers.transfermarkt import scraper as tm
@@ -116,8 +117,9 @@ def _rows(frame):
     return sorted(rows, key=lambda row: json.dumps(row))
 
 
-def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None):
+def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='player_id', scope=None, snapshot_id=None):
     table = 'iceberg.bronze.' + output.table_name
+    relation = table + (f' FOR VERSION AS OF {snapshot_id}' if snapshot_id else '')
     if empty_ids and not (empty_key == 'club_id' and output.key == 'profiles'):
         placeholders = ', '.join('?' for _ in empty_ids)
         predicate = f'{empty_key} IN ({placeholders})'
@@ -127,7 +129,7 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
             params += [scope['compatibility_league'], scope['canonical_season']]
         try:
             rows = run._execute_cursor(scraper._bronze_connection(),
-                f'SELECT {empty_key} FROM {table} WHERE {predicate}', params, fetch=True)
+                f'SELECT {empty_key} FROM {relation} WHERE {predicate}', params, fetch=True)
         except Exception as exc:
             if not frame.empty or not _missing_table(exc):
                 raise CurrentWriteError('authoritative empty physical read-back failed') from exc
@@ -142,7 +144,7 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
             params += [scope['competition_id'], scope['edition_id']]
         try:
             persisted = run._query_dataframe(scraper._bronze_connection(),
-                f'SELECT {", ".join(frame.columns)} FROM {table} WHERE {predicate}', params)
+                f'SELECT {", ".join(frame.columns)} FROM {relation} WHERE {predicate}', params)
         except Exception as exc:
             if not any(marker in str(exc).lower() for marker in ('table_not_found', 'table not found', 'does not exist')):
                 raise CurrentWriteError('empty output physical read-back failed') from exc
@@ -163,7 +165,7 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
         params += [str(frame.iloc[0]['competition_id']), str(frame.iloc[0]['edition_id'])]
     try:
         persisted = run._query_dataframe(scraper._bronze_connection(),
-            f'SELECT {", ".join(frame.columns)} FROM {table} WHERE {predicate}', params)
+            f'SELECT {", ".join(frame.columns)} FROM {relation} WHERE {predicate}', params)
     except Exception as exc:
         raise CurrentWriteError(f'physical read-back failed for {table}') from exc
     if list(persisted.columns) != list(frame.columns) or _rows(persisted) != _rows(frame):
@@ -209,64 +211,85 @@ def _save_current_frame(scraper, **options):
 
 
 def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids=(), empty_key='player_id'):
-    run._authorize_write_mode(mode, revision)
-    results = {'outputs': {key: run._frame_output_summary(frame) for key, frame in frames.items()}, 'tables': []}
-    frames = run._carry_forward_observed_at(scraper, spec, frames, results)
-    # A portion may write this scope twice. Distinct business bundles must not
-    # mix their batches or overwrite each other's compatibility manifest rows.
-    identity = {'cycle_id': cycle_id, 'scope_id': scope['scope_id'], 'entity': spec.name,
-                'frames': {key: _rows(frame.drop(columns=['_batch_id', '_ingested_at'], errors='ignore'))
-                           for key, frame in frames.items()}}
-    unit_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
-    scraper._batch_id = unit_id
-    frames = {key: frame.assign(_batch_id=unit_id) for key, frame in frames.items()}
-    manifest_cycle = f'{cycle_id}:current-unit:{unit_id}'
-    _precheck(scraper, spec, frames)
-    for output in spec.outputs:
-        frame = frames[output.key]
-        table = 'iceberg.bronze.' + output.table_name
-        if not frame.empty:
-            options = dict(df=frame, table_name=output.table_name, partition_cols=list(output.partition_cols))
-            if output.key == 'attribute_observations':
-                options['natural_keys'] = ['competition_id', 'edition_id', 'club_id', 'player_id', 'observed_at']
-            else:
-                options.update(replace_partitions=list(output.replace_keys) or None,
-                    min_replace_ratio=run._MIN_REPLACE_RATIO if output.guard_key else None,
-                    replace_guard_key=output.guard_key)
-            table = _save_current_frame(scraper, **options)
-        results['outputs'][output.key]['table'] = table
-    if empty_ids:
-        run._delete_valid_empty_rows(scraper, spec, empty_ids, scope['compatibility_league'],
-                                     int(scope['edition_id']), source_key=empty_key)
-    if spec.name == run.ENTITY_COACHES and mode == 'dual':
-        clubs = sorted(set(frames['stints']['club_id'].astype(str))) or list(empty_ids)
-        run._delete_empty_season_coach_rows(scraper, clubs, frames['legacy_coaches'],
-            scope['compatibility_league'], int(scope['edition_id']))
-    proof = {output.key: _read_back(scraper, output, frames[output.key], cycle_id,
-             empty_ids=empty_ids, empty_key='current_club_id' if empty_key == 'club_id' and output.is_legacy else empty_key, scope=scope)
-             for output in spec.outputs if not (empty_key == 'club_id' and output.key == 'profiles' and frames[output.key].empty)}
-    manifests = []
-    if mode == 'native-only':
-        manifests.append(run._persist_native_write_manifest(scraper, spec, frames, results,
-            manifest_cycle, scope['competition_id'], int(scope['edition_id']), revision))
-    else:
-        legacy = next(output for output in spec.outputs if output.is_legacy)
-        for native in (output for output in spec.outputs if not output.is_legacy):
-            paired = replace(spec, outputs=(native, legacy))
-            pair_frames = {native.key: frames[native.key], legacy.key: frames[legacy.key]}
-            if native.key == 'attribute_observations':
-                clubs = set(frames[native.key]['club_id'].astype(str))
-                pair_frames[legacy.key] = frames[legacy.key][frames[legacy.key]['current_club_id'].astype(str).isin(clubs)]
-            manifests.append(run._persist_dual_write_manifest(scraper, paired, pair_frames, results,
-                manifest_cycle, scope['competition_id'], int(scope['edition_id'])))
-    if any(item.get('status') != 'success' for item in manifests):
-        raise CurrentWriteError('current business compatibility manifest did not pass')
-    digest = hashlib.sha256(json.dumps({'cycle_id': cycle_id, 'outputs': proof, 'manifests': manifests}, sort_keys=True).encode()).hexdigest()
-    return {'verified': True, 'bronze_manifest': digest,
-            'committed_at': datetime.now(timezone.utc).isoformat(), 'outputs': proof,
-            'cycle_id': cycle_id, 'manifest_cycle_id': manifest_cycle,
-            'manifests': manifests, 'writer_revision': revision, 'write_mode': mode}, frames
-
+    with writer_deadline(getattr(scraper, '_current_deadline_monotonic', None)), writer_lock():
+        run._authorize_write_mode(mode, revision)
+        results = {'outputs': {key: run._frame_output_summary(frame) for key, frame in frames.items()}, 'tables': []}
+        frames = run._carry_forward_observed_at(scraper, spec, frames, results)
+        # A portion may write this scope twice. Distinct business bundles must not
+        # mix their batches or overwrite each other's compatibility manifest rows.
+        identity = {'cycle_id': cycle_id, 'scope_id': scope['scope_id'], 'entity': spec.name,
+                    'frames': {key: _rows(frame.drop(columns=['_batch_id', '_ingested_at'], errors='ignore'))
+                               for key, frame in frames.items()}}
+        unit_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
+        scraper._batch_id = unit_id
+        frames = {key: frame.assign(_batch_id=unit_id) for key, frame in frames.items()}
+        manifest_cycle = f'{cycle_id}:current-unit:{unit_id}'
+        from scrapers.transfermarkt.career_refs import retained_bundle_snapshots, persist_capture_refs
+        connection = scraper._bronze_connection()
+        try:
+            snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
+        finally:
+            connection.close()
+        if not snapshots:
+            guard_frames(scraper, spec.outputs, frames)
+            _precheck(scraper, spec, frames)
+            for output in spec.outputs:
+                frame = frames[output.key]
+                table = 'iceberg.bronze.' + output.table_name
+                if not frame.empty:
+                    options = dict(df=frame, table_name=output.table_name, partition_cols=list(output.partition_cols))
+                    if output.key == 'attribute_observations':
+                        options['natural_keys'] = ['competition_id', 'edition_id', 'club_id', 'player_id', 'observed_at']
+                    else:
+                        options.update(replace_partitions=list(output.replace_keys) or None,
+                            min_replace_ratio=run._MIN_REPLACE_RATIO if output.guard_key else None,
+                            replace_guard_key=output.guard_key)
+                    table = _save_current_frame(scraper, **options)
+                results['outputs'][output.key]['table'] = table
+            if empty_ids:
+                run._delete_valid_empty_rows(scraper, spec, empty_ids, scope['compatibility_league'],
+                                             int(scope['edition_id']), source_key=empty_key)
+            if spec.name == run.ENTITY_COACHES and mode == 'dual':
+                clubs = sorted(set(frames['stints']['club_id'].astype(str))) or list(empty_ids)
+                run._delete_empty_season_coach_rows(scraper, clubs, frames['legacy_coaches'],
+                    scope['compatibility_league'], int(scope['edition_id']))
+        if snapshots:
+            for output in spec.outputs:
+                results['outputs'][output.key]['table'] = 'iceberg.bronze.' + output.table_name
+        else:
+            connection = scraper._bronze_connection()
+            try:
+                for output in spec.outputs:
+                    if not output.is_legacy:
+                        persist_capture_refs(connection, manifest_cycle, output.key, output.table_name,
+                            frames[output.key], legacy=mode == 'dual')
+                snapshots = retained_bundle_snapshots(connection, manifest_cycle, spec.outputs, frames)
+            finally:
+                connection.close()
+        proof = {output.key: _read_back(scraper, output, frames[output.key], cycle_id,
+                 empty_ids=empty_ids, empty_key='current_club_id' if empty_key == 'club_id' and output.is_legacy else empty_key, scope=scope, snapshot_id=snapshots.get(output.key))
+                 for output in spec.outputs if not (empty_key == 'club_id' and output.key == 'profiles' and frames[output.key].empty)}
+        manifests = []
+        if mode == 'native-only':
+            manifests.append(run._persist_native_write_manifest(scraper, spec, frames, results,
+                manifest_cycle, scope['competition_id'], int(scope['edition_id']), revision))
+        else:
+            legacy = next(output for output in spec.outputs if output.is_legacy)
+            for native in (output for output in spec.outputs if not output.is_legacy):
+                paired = replace(spec, outputs=(native, legacy))
+                pair_frames = {native.key: frames[native.key], legacy.key: frames[legacy.key]}
+                if native.key == 'attribute_observations':
+                    clubs = set(frames[native.key]['club_id'].astype(str))
+                    pair_frames[legacy.key] = frames[legacy.key][frames[legacy.key]['current_club_id'].astype(str).isin(clubs)]
+                manifests.append(run._persist_dual_write_manifest(scraper, paired, pair_frames, results,
+                    manifest_cycle, scope['competition_id'], int(scope['edition_id'])))
+        if any(item.get('status') != 'success' for item in manifests):
+            raise CurrentWriteError('current business compatibility manifest did not pass')
+        digest = hashlib.sha256(json.dumps({'cycle_id': cycle_id, 'outputs': proof, 'manifests': manifests}, sort_keys=True).encode()).hexdigest()
+        return {'verified': True, 'bronze_manifest': digest,
+                'committed_at': datetime.now(timezone.utc).isoformat(), 'outputs': proof,
+                'cycle_id': cycle_id, 'manifest_cycle_id': manifest_cycle,
+                'manifests': manifests, 'writer_revision': revision, 'write_mode': mode}, frames
 
 def _roster_frames(scraper, snapshot, scope, cycle_id):
     now = _stamp(getattr(scraper, '_current_roster_write_at', None) or datetime.now(timezone.utc))
@@ -308,6 +331,8 @@ def _roster_frames(scraper, snapshot, scope, cycle_id):
         ('contract_observations', contracts, tm.PLAYER_CONTRACT_OBSERVATION_COLUMNS, 'player_contract_observations')):
         bundle[key] = tm._with_metadata(rows, columns, entity_type=entity, batch_id=scraper._batch_id, ingested_at=now)
     bundle['contract_observations'].attrs['fetch_status'] = 'ok' if contracts else 'not_applicable'
+    for frame in bundle.values():
+        frame.attrs['tm_bundle_fetched_at'] = max(club.raw_fetched_at for club in snapshot.clubs.values()).isoformat()
     bundle['legacy_players'] = scraper.materialize_legacy_players(bundle['memberships'], bundle['attribute_observations'])
     bundle['attribute_observations'] = bundle['attribute_observations'][bundle['attribute_observations']['club_id'].astype(str).isin(snapshot.changed_club_ids)].copy()
     return bundle
@@ -381,6 +406,7 @@ def write_current_roster(scraper, snapshot: FullRosterSnapshot, preflight, cycle
 @_bounded_current_writer
 def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, decoded_body_soft_stop_bytes):
     mode, revision, _ = _authorize(preflight)
+    run._reconcile_pending_fetch_state(scraper)
     resolved = _scope(scraper, scope)
     name = {'market_value_points': run.ENTITY_MV_HISTORY, 'market_value_history': run.ENTITY_MV_HISTORY,
             'transfer_events': run.ENTITY_TRANSFERS, 'transfers': run.ENTITY_TRANSFERS}.get(endpoint)
@@ -390,6 +416,29 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     if not selected:
         raise CurrentWriteError('current career selection is empty')
     spec = run._spec_for_write_mode(run.ENTITY_SPECS[name], mode)
+    from scrapers.transfermarkt.write_intents import pending_intents, save_intent, unpack_frames, finish_intent
+    intent_identity = {'kind': 'current', 'scope_id': resolved['scope_id'], 'entity': name}
+    pending = pending_intents(intent_identity)
+    if pending:
+        if len(pending) != 1:
+            raise CurrentWriteError('ambiguous durable current career writes; refusing paid I/O')
+        path, payload = pending[0]
+        evidence = payload['evidence']
+        if evidence['mode'] != mode or evidence['revision'] != revision:
+            raise CurrentWriteError('career reconciliation requires original writer authority')
+        scraper._batch_id = evidence['batch_id']
+        frames = unpack_frames(payload['frames'])
+        scraper._tm_empty_capture_times = evidence.get('captured_at_by_id', {})
+        receipt, _ = _commit(scraper, spec, frames, resolved, mode, revision,
+            evidence['cycle_id'], empty_ids=evidence['empty'])
+        receipt['checkpoint_status'] = run._commit_checkpoint_or_pending(scraper, spec,
+            evidence['processed'], evidence['state_rows'], evidence['cycle_id'],
+            resolved['competition_id'], int(resolved['edition_id']), captured_at_by_id=evidence.get('captured_at_by_id'))
+        receipt.update(business_entity=spec.state_endpoint, career_window=evidence['window'],
+            reconciled_without_http=True, original_capture_attempts=evidence.get('raw_attempts', []),
+            original_cache_sources=evidence.get('cache_sources', []), **evidence['window'])
+        finish_intent(path)
+        return receipt
     pieces = []
     processed = []
     state_rows = []
@@ -431,10 +480,19 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     for frame in frames.values():
         if frame.empty and empty:
             frame.attrs['fetch_status'] = 'authoritative_empty'
+    scraper._tm_empty_capture_times = run._career_capture_times(scraper, spec, frames, processed)
+    intent_path = save_intent(intent_identity, frames, mode=mode, revision=revision,
+        batch_id=str(scraper._batch_id), cycle_id=cycle_id, empty=empty,
+        processed=processed, state_rows=state_rows, window=window,
+        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed),
+        raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()))
     receipt, _ = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
-    if not run._persist_fetch_state(scraper, spec, processed, state_rows, cycle_id):
-        raise CurrentWriteError('career fetch-state commit failed after Bronze write')
+    checkpoint_status = run._commit_checkpoint_or_pending(scraper, spec, processed, state_rows, cycle_id,
+        resolved['competition_id'], int(resolved['edition_id']),
+        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed))
+    receipt['checkpoint_status'] = checkpoint_status
     receipt.update(business_entity=spec.state_endpoint, career_window=window, **window)
+    finish_intent(intent_path)
     return receipt
 
 

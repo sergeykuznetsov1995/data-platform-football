@@ -37,7 +37,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_tm_process_env():
+def _isolate_tm_process_env(tmp_path):
     # The runner mutates the live process env at call time (TM_DAG_ID /
     # TM_RUN_ID / TM_TASK_ID / TM_SCOPE_ID via os.environ.setdefault at
     # run_transfermarkt_scraper.py:4416) — in production that lands in a
@@ -45,11 +45,12 @@ def _isolate_tm_process_env():
     # process and poisons the standing-policy suite in
     # test_run_transfermarkt_scope_cycle.py (12 failures, full-suite order
     # only). Snapshot/restore the env around every test in this file.
-    with patch.dict(os.environ):
+    with patch.dict(os.environ, {'TM_WRITE_INTENT_DIR': str(tmp_path / 'write-intents')}):
         yield
 
 
 REAL_TM_REGISTRY = importlib.import_module('scrapers.transfermarkt.registry')
+_REAL_TM_OPS_TRAFFIC = importlib.import_module('scrapers.transfermarkt.ops_traffic')
 # The stubbed scraper module still has to date a season the way the real one
 # does — the runner and the scraper must never disagree about that again.
 _REAL_TM_SCRAPER = importlib.import_module('scrapers.transfermarkt.scraper')
@@ -192,7 +193,7 @@ def _run_main(args: list, scraper) -> int:
         sys.modules.pop("dags.scripts.run_transfermarkt_scraper", None)
         mod = importlib.import_module("dags.scripts.run_transfermarkt_scraper")
         importlib.reload(mod)
-        traffic_mod = importlib.import_module("utils.proxy_traffic")
+        traffic_mod = importlib.import_module("scrapers.transfermarkt.ops_traffic")
         with tempfile.TemporaryDirectory() as budget_dir:
             with (
                 patch.dict(
@@ -1691,7 +1692,8 @@ class TestRunnerInternals:
         assert selected == []
         assert cache_hits == 2
         assert seeded == 0
-        assert hydrate == []
+        # Native-only scopes reference original physical career captures.
+        assert hydrate == ['1', '2']
 
     def test_committed_checkpoint_outage_uses_recoverable_pending_journal(
         self, tmp_path, monkeypatch,
@@ -2225,7 +2227,7 @@ class TestNativeV2RecoverySafety:
 
     def test_read_only_result_does_not_persist_ops_traffic(self, temp_output):
         mod = _import_runner()
-        traffic_mod = importlib.import_module('utils.proxy_traffic')
+        traffic_mod = importlib.import_module('scrapers.transfermarkt.ops_traffic')
         payload = {
             'entity': 'players', 'run_key': 'dry-run',
             'traffic': {
@@ -2417,7 +2419,7 @@ def test_adaptive_runner_checkpoints_only_committed_prefix(tmp_path, monkeypatch
             raise RuntimeError('Bronze unavailable')
         return {out.key: f'iceberg.bronze.{out.table_name}' for out in spec.outputs}
 
-    def checkpoint(_scraper, _spec, ids, rows, *a):
+    def checkpoint(_scraper, _spec, ids, rows, *a, **kwargs):
         assert events == ['write', 'manifest']
         assert ids == selected[:4]
         assert all(row[0] == ('authoritative_empty' if empty else 'success') for row in rows)

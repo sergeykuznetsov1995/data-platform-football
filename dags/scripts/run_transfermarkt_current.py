@@ -6,6 +6,8 @@ acknowledged after the writer returns verified Bronze manifest evidence.
 """
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement
+
 import fcntl
 import argparse
 import hashlib
@@ -303,7 +305,7 @@ def _sql(scraper, statement):
     connection = scraper._bronze_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute(statement)
+        execute_statement(cursor, statement)
         # Trino writes finish only after the response has been consumed.
         if hasattr(cursor, 'fetchall'):
             cursor.fetchall()
@@ -317,7 +319,7 @@ def _load_ops_signals(scraper, scope_id):
     connection = scraper._bronze_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute(f"SELECT * FROM {SIGNALS_TABLE} WHERE scope_id = '" + scope_id.replace("'", "''") + "'")
+        execute_statement(cursor, f"SELECT * FROM {SIGNALS_TABLE} WHERE scope_id = '" + scope_id.replace("'", "''") + "'")
         rows = cursor.fetchall()
         names = [column[0] for column in cursor.description] if rows else []
         parsed = []
@@ -339,7 +341,7 @@ def _existing_bronze_roster(scraper, competition_id, edition_id):
     connection = scraper._bronze_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute('SELECT 1 FROM iceberg.bronze.transfermarkt_squad_memberships '
+        execute_statement(cursor, 'SELECT 1 FROM iceberg.bronze.transfermarkt_squad_memberships '
                        'WHERE competition_id = ? AND edition_id = ? LIMIT 1',
                        (competition_id, edition_id))
         return bool(cursor.fetchall())
@@ -425,7 +427,7 @@ def seed_current_baseline(scraper, entry, preflight, verify_complete_scope):
         for offset in range(0, len(ids), 300):
             packet = ids[offset:offset + 300]
             placeholders = ','.join('?' for _ in packet)
-            cursor.execute('SELECT player_id, MAX(mv_date) FROM iceberg.bronze.transfermarkt_market_value_points '
+            execute_statement(cursor, 'SELECT player_id, MAX(mv_date) FROM iceberg.bronze.transfermarkt_market_value_points '
                            f'WHERE player_id IN ({placeholders}) GROUP BY player_id', packet)
             for player_id, latest in cursor.fetchall():
                 if latest is not None:

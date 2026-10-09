@@ -1539,6 +1539,12 @@ class TransfermarktScraper(BaseScraper):
             rate_limit=None,
             **kwargs,
         )
+        from scrapers.transfermarkt.writer import TransfermarktIcebergWriter
+        original_writer = self._iceberg_writer
+        self._iceberg_writer = TransfermarktIcebergWriter(
+            trino_host=original_writer.trino_host, trino_port=original_writer.trino_port,
+            catalog=original_writer.catalog,
+        )
         require_metered = os.environ.get(
             'TM_REQUIRE_METERED_PROXY', 'false',
         ).strip().lower() in {'1', 'true', 'yes', 'on'}
@@ -2281,12 +2287,13 @@ class TransfermarktScraper(BaseScraper):
 
         import trino
         import trino.auth as trino_auth
+        from scrapers.transfermarkt.writer import CommittingConnection
 
         user = os.environ.get('TRINO_USER', 'airflow')
         password = os.environ.get('TRINO_PASSWORD')
 
         if password:
-            return trino.dbapi.connect(
+            return CommittingConnection(trino.dbapi.connect(
                 host=os.environ.get('TRINO_HOST', 'trino'),
                 port=int(os.environ.get('TRINO_PORT', 8443)),
                 user=user,
@@ -2294,13 +2301,13 @@ class TransfermarktScraper(BaseScraper):
                 http_scheme='https',
                 auth=trino_auth.BasicAuthentication(user, password),
                 verify=False,
-            )
-        return trino.dbapi.connect(
+            ))
+        return CommittingConnection(trino.dbapi.connect(
             host=os.environ.get('TRINO_HOST', 'trino'),
             port=int(os.environ.get('TRINO_PORT', 8080)),
             user=user,
             catalog='iceberg',
-        )
+        ))
 
     def _resolve_player_ids_from_bronze(
         self,

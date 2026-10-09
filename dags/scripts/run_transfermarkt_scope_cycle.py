@@ -8,6 +8,8 @@ manifest stay content-addressed under the planner-provided result directory.
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement
+
 import argparse
 import fcntl
 import hashlib
@@ -1534,7 +1536,7 @@ def persist_scope_manifest(
     connection = connection_factory()
     cursor = connection.cursor()
     try:
-        cursor.execute(sql)
+        execute_statement(cursor, sql)
         if cursor.description:
             cursor.fetchall()
     finally:
@@ -1622,13 +1624,13 @@ USING (VALUES
      hard_limit_bytes, soft_limit_bytes)
 ON t.parent_cycle_id = s.parent_cycle_id AND t.entity = s.entity
 WHEN MATCHED THEN UPDATE SET
-    decoded_bytes = s.decoded_bytes,
-    wire_bytes = s.wire_bytes,
-    provider_metered_bytes = s.provider_metered_bytes,
-    requests = s.requests,
-    retries = s.retries,
-    cache_hits = s.cache_hits,
-    duration_ms = s.duration_ms,
+    decoded_bytes = GREATEST(t.decoded_bytes, s.decoded_bytes),
+    wire_bytes = GREATEST(t.wire_bytes, s.wire_bytes),
+    provider_metered_bytes = GREATEST(t.provider_metered_bytes, s.provider_metered_bytes),
+    requests = GREATEST(t.requests, s.requests),
+    retries = GREATEST(t.retries, s.retries),
+    cache_hits = GREATEST(t.cache_hits, s.cache_hits),
+    duration_ms = GREATEST(t.duration_ms, s.duration_ms),
     hard_limit_bytes = s.hard_limit_bytes,
     soft_limit_bytes = s.soft_limit_bytes,
     updated_at = CURRENT_TIMESTAMP
@@ -1641,6 +1643,27 @@ WHEN NOT MATCHED THEN INSERT (
     s.provider_metered_bytes, s.requests, s.retries, s.cache_hits,
     s.duration_ms, s.hard_limit_bytes, s.soft_limit_bytes, CURRENT_TIMESTAMP
 )"""
+
+
+PROXY_LEDGER_EVENTS_TABLE = 'iceberg.ops.transfermarkt_proxy_ledger_events_v1'
+
+
+def proxy_ledger_event_statements(parent_ledger):
+    """Append immutable per-scope receipts; replay never adds traffic twice."""
+    fields = ('decoded_bytes', 'wire_bytes', 'provider_metered_bytes', 'requests', 'retries', 'cache_hits', 'duration_ms')
+    q = lambda value: "'" + str(value).replace("'", "''") + "'"
+    scopes = parent_ledger.get('scopes', {})
+    statements = [f'CREATE TABLE IF NOT EXISTS {PROXY_LEDGER_EVENTS_TABLE} (parent_cycle_id varchar, child_cycle_id varchar, scope_id varchar, manifest_digest varchar, entity varchar, '
+        + ', '.join(field + ' bigint' for field in fields) + ") WITH (format = 'PARQUET')"]
+    for scope_id, scope in sorted(scopes.items()):
+        for entity, metrics in sorted(scope['by_entity'].items()):
+            values = [q(parent_ledger['parent_cycle_id']), q(scope['child_cycle_id']), q(scope_id), q(scope['manifest_digest']), q(entity)]
+            values += [str(int(metrics[field])) for field in fields]
+            columns = 'parent_cycle_id, child_cycle_id, scope_id, manifest_digest, entity, ' + ', '.join(fields)
+            statements.append(f'MERGE INTO {PROXY_LEDGER_EVENTS_TABLE} t USING (VALUES (' + ', '.join(values) + ')) s(' + columns + ') '
+                'ON t.parent_cycle_id=s.parent_cycle_id AND t.child_cycle_id=s.child_cycle_id AND t.scope_id=s.scope_id AND t.entity=s.entity '
+                'WHEN NOT MATCHED THEN INSERT (' + columns + ') VALUES (' + ', '.join('s.' + field.strip() for field in columns.split(',')) + ')')
+    return tuple(statements)
 
 
 def persist_parent_proxy_ledger(
@@ -1674,7 +1697,11 @@ def persist_parent_proxy_ledger(
     connection = connection_factory()
     cursor = connection.cursor()
     try:
-        cursor.execute(sql)
+        from scrapers.transfermarkt.writer import writer_lock
+        with writer_lock():
+            for statement in proxy_ledger_event_statements(parent_ledger):
+                execute_statement(cursor, statement)
+            execute_statement(cursor, sql)
         if cursor.description:
             cursor.fetchall()
     finally:
