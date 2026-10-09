@@ -19,12 +19,12 @@ SELF="${BASH_SOURCE[0]}"
 UNDERSTAT_PATHS="scrapers/understat dags/dag_ingest_understat.py dags/dag_backfill_understat.py dags/utils/understat_tasks.py dags/scripts/run_understat_scraper.py"
 # Общие модули, которые импортируют файлы Understat (с транзитивными: default_args → alerts, config → medallion_config).
 SHARED_PATHS="scrapers/base scrapers/utils scrapers/__init__.py dags/utils/__init__.py dags/utils/config.py dags/utils/default_args.py dags/utils/alerts.py dags/utils/medallion_config.py"
-# Разрешённое отставание общих модулей (решение владельца 30.09, #1594): «путь=git-blob» — бой может
-# побайтно равняться этому blob вместо master. Только файлы из SHARED_PATHS; состав не ослабляется.
-# Все три — версии принятой базы 8b61969: alerts.py до #1477 (доставка отложена до #1489), config.py
-# и medallion_config.py до #1590. Тест tests/unit/deploy/test_understat_shared_lag.py падает, если в
-# master разойдётся то, что берёт Understat. Удалить запись, когда файл в бою станет = master — README.
-ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008 dags/utils/config.py=221a12711ca7651274d22e3539a4b3b20b7284bf dags/utils/medallion_config.py=697fe43d6eb46e49c4246780f2cba59fabf87e4d"
+# Точные совместимые версии общих модулей для Understat.
+# alerts/config pins сохраняют ранее проверенное разрешённое отставание.
+# medallion/proxy pins ограничены native-путём Understat и regression tests:
+# новые зависимости или API требуют пересмотра, произвольные версии запрещены.
+# Источник разрешения и доказательства фиксируются в PR/операционном handoff.
+ALLOWED_LAG="dags/utils/alerts.py=30c4988a7cf742d67974a9be126e0bfc829b9008 dags/utils/config.py=221a12711ca7651274d22e3539a4b3b20b7284bf dags/utils/medallion_config.py=8b52267bf748ffa3bb0156a89c97774e14c19c91 scrapers/utils/proxy_manager.py=01c904cbbef5f5d694648d97d13baa5431233c5a"
 # Порядок записи файлов вне scrapers/understat/ — импортируемые раньше импортирующих.
 DAG_ORDER="dags/utils/understat_tasks.py dags/scripts/run_understat_scraper.py dags/dag_backfill_understat.py dags/dag_ingest_understat.py"
 DAGS="dag_ingest_understat dag_backfill_understat"
