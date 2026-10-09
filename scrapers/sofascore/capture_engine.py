@@ -318,6 +318,12 @@ class CaptureMetrics:
             self.browser_sessions += payload.browser_sessions
             self.navigations += payload.navigations
 
+    def provider_tail(self, endpoint: str, provider_bytes: int) -> None:
+        """Record an exact transport tail without inventing a source request."""
+        with self._lock:
+            self.provider_bytes += provider_bytes
+            self._provider_observation(endpoint, provider_bytes)
+
     def transport_error(self, endpoint: str, error: TransportError) -> None:
         with self._lock:
             self.network_requests += 1
@@ -532,6 +538,9 @@ class SofaScoreCaptureEngine:
                 raise ProductionBudgetUnavailable(
                     "paid SofaScore capture requires a verified shared proxy budget"
                 )
+            prepare = getattr(self.transport, "prepare_provider_request", None)
+            if callable(prepare):
+                prepare(spec)
             token, maximum = self.budget.reserve(self.run_id, spec.key.endpoint)
         # A browser transport sees navigation and passive/exact XHRs that the
         # endpoint engine cannot enumerate. It owns pacing for those real HTTP
@@ -554,6 +563,22 @@ class SofaScoreCaptureEngine:
             token,
             maximum,
         )
+
+    def charge_provider_tail(self, endpoint: str, provider_bytes: int) -> None:
+        """Mirror a gateway-authorized sealed tail into this allocation's budget."""
+        if (isinstance(provider_bytes, bool) or not isinstance(provider_bytes, int)
+                or provider_bytes < 0 or not endpoint):
+            raise BudgetAccountingError("invalid sealed provider tail")
+        if self.budget is None:
+            raise ProductionBudgetUnavailable("provider tail requires a shared proxy budget")
+        if provider_bytes:
+            token, _maximum = self.budget.reserve(self.run_id, endpoint)
+            try:
+                self.budget.finish(self.run_id, token, reported_provider_bytes=provider_bytes)
+            except BaseException:
+                self.budget.cancel(self.run_id, token)
+                raise
+        self.metrics.provider_tail(endpoint, provider_bytes)
 
     def _finish_authorized_response(
         self,

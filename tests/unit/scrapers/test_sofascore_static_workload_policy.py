@@ -123,23 +123,78 @@ def test_every_declared_season_shape_is_reachable_from_the_production_builder():
 
 
 @pytest.mark.unit
-def test_existing_class_ids_and_caps_are_preserved():
+def test_calibrated_class_caps_keep_headroom_out_of_the_static_policy():
     policy = load_static_workload_policy(SHIPPED_POLICY)
-    existing_caps = {
-        "match_batch_25_5943cd5a087c8ded": 1233561,
+    calibrated_caps = {
+        "match_batch_25_5943cd5a087c8ded": 1145777,
         "player_batch_50_cd522de61ebecd10": 223963,
-        "season_1da176ffa2222bcc": 170228,
+        "season_1da176ffa2222bcc": 473059,
         "season_5cf25f88ed2115bb": 473059,
-        "season_69608cf7368823a9": 328905,
-        "season_73022f4806a39fb1": 117354,
-        "season_ae9bf9aa625c6ead": 428985,
-        "season_bd9da17d9b61ec24": 199717,
-        "season_c27b42098336e271": 457548,
-        "season_c5a3a2e2e467619d": 348455,
+        "season_69608cf7368823a9": 473059,
+        "season_73022f4806a39fb1": 473059,
+        "season_ae9bf9aa625c6ead": 496810,
+        "season_bd9da17d9b61ec24": 473059,
+        "season_c27b42098336e271": 496810,
+        "season_c5a3a2e2e467619d": 473059,
     }
 
-    for name, cap in existing_caps.items():
+    for name, cap in calibrated_caps.items():
         assert policy.classes[name].hard_task_bytes == cap
+
+
+@pytest.mark.unit
+def test_season_caps_are_nondecreasing_inside_each_format():
+    payload = _payload()["workload_classes"]
+    for season_format in ("calendar_year", "split_year"):
+        caps = [
+            payload[season_workload_class(production_season_shape(
+                season_format=season_format, team_count_band=band,
+                max_pages_per_direction=50,
+            ))]["hard_task_bytes"]
+            for band in TEAM_COUNT_BANDS
+        ]
+        assert caps == sorted(caps)
+
+
+@pytest.mark.unit
+def test_request_bounds_get_existing_headroom_exactly_once(tmp_path):
+    from scripts.proxy_filter.budget import (
+        ProxyBudgetExceeded, SharedBudgetLedger, load_verified_policy,
+    )
+    from scrapers.sofascore.pipeline import _with_allocation_headroom
+
+    policy = load_verified_policy(SHIPPED_POLICY, workload_class=match_workload_class())
+    assert policy.reservation_for("event") == 58532
+    effective = _with_allocation_headroom(policy)
+    assert effective.hard_run_bytes == 1317644
+    assert effective.reservation_for("event") == 67312
+    assert effective.reservation_for("statistics") == 6222
+    ledger = SharedBudgetLedger(tmp_path / "budget.json", effective)
+    token, amount = ledger.reserve("signed-run::allocation", "event")
+    assert amount == 67312
+    with pytest.raises(ProxyBudgetExceeded, match="exceed the endpoint's measured maximum reservation"):
+        ledger.consume("signed-run::allocation", token, amount + 1)
+
+
+@pytest.mark.unit
+def test_legacy_v4_without_request_bounds_keeps_the_class_reservation(tmp_path):
+    from scripts.proxy_filter.budget import load_verified_policy
+
+    payload = _payload()
+    for entry in payload["workload_classes"].values():
+        entry.pop("request_bound_bytes", None)
+    path = _write(tmp_path / "legacy-v4.json", payload)
+    budget = load_verified_policy(path, workload_class=match_workload_class())
+    assert budget.reservation_for("event") == budget.hard_run_bytes
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bounds", [None, [], {"unknown": 100}, {"event": 0}, {"event": True}, {"event": 1.2}])
+def test_static_policy_rejects_invalid_request_bounds(tmp_path, bounds):
+    payload = _payload()
+    payload["workload_classes"][match_workload_class()]["request_bound_bytes"] = bounds
+    with pytest.raises(WorkloadPolicyUnavailable, match="request_bound_bytes"):
+        load_static_workload_policy(_write(tmp_path / "bad-bounds.json", payload))
 
 
 @pytest.mark.unit
@@ -159,7 +214,9 @@ def test_added_season_bands_authorize_one_unit_at_the_fixed_cap(
         name, scope="season", units=1, shape_digest=workload_shape_digest(shape)
     )
 
-    assert budget.hard_task_bytes == 473059
+    assert budget.hard_task_bytes == (
+        496810 if season_format == "calendar_year" and team_count >= 49 else 473059
+    )
     assert budget.max_units == 1
     with pytest.raises(module.WorkloadPlanError, match="at most 1 units"):
         policy.class_for(

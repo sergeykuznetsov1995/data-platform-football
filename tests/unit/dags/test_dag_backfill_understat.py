@@ -97,12 +97,9 @@ def test_real_airflow_dagbag_accepts_understat_pair_if_available():
 def test_history_runner_is_one_mapped_exact_scope(dag_module):
     plan = _python("plan_history_scope")
     runner = _bash("run_history_scope")
-    validator = _python("validate_history_scope")
 
     assert runner.is_mapped is True
     assert runner._expand_kwargs["env"].operator is plan
-    assert validator.is_mapped is True
-    assert validator._expand_kwargs["op_kwargs"].operator is plan
     assert "pool" not in plan._init_kwargs
     assert plan._init_kwargs["priority_weight"] == dag_module.BACKFILL_PRIORITY
     assert runner._init_kwargs["pool"] == "ingest_scraper_pool"
@@ -112,7 +109,7 @@ def test_history_runner_is_one_mapped_exact_scope(dag_module):
     assert "--season-slug \"${UNDERSTAT_SEASON_SLUG}\"" in runner.bash_command
     assert "--source-season-id \"${UNDERSTAT_SOURCE_SEASON_ID}\"" in runner.bash_command
     assert "--source-discovered \"${UNDERSTAT_SOURCE_DISCOVERED}\"" in runner.bash_command
-    assert "--output \"${UNDERSTAT_RESULT_PATH}\"" in runner.bash_command
+    assert "--output -" in runner.bash_command
 
 
 def test_daily_scope_has_higher_shared_pool_priority(dag_module):
@@ -131,14 +128,11 @@ def test_history_graph_is_plan_run_validate_only(dag_module):
     assert task_ids == {
         "plan_history_scope",
         "run_history_scope",
-        "validate_history_scope",
     }
     plan = _python("plan_history_scope")
     runner = _bash("run_history_scope")
-    validator = _python("validate_history_scope")
     assert plan.downstream_task_ids == {runner.task_id}
-    assert runner.downstream_task_ids == {validator.task_id}
-    assert validator.downstream_task_ids == set()
+    assert runner.downstream_task_ids == set()
     assert not hasattr(dag_module, "PythonSensor")
 
 

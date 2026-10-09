@@ -982,6 +982,8 @@ class SofascoreLeaseClient:
         self,
         lease: SofascoreProxyLease,
         endpoint: str,
+        *,
+        endpoint_path: str = "",
     ) -> str:
         name = str(endpoint).strip()
         if not name:
@@ -990,7 +992,7 @@ class SofascoreLeaseClient:
             "POST",
             f"/v1/leases/{quote(lease.lease_id, safe='')}/endpoints",
             token=lease.token,
-            payload={"endpoint": name},
+            payload={"endpoint": name, **({"endpoint_path": endpoint_path} if endpoint_path else {})},
         )
         request_id = str(body.get("request_id") or "").strip()
         if not request_id:
@@ -998,6 +1000,47 @@ class SofascoreLeaseClient:
                 "proxy lease endpoint boundary has no request_id"
             )
         return request_id
+
+    def begin_endpoint_with_stats(
+        self,
+        lease: SofascoreProxyLease,
+        endpoint: str,
+        *,
+        endpoint_path: str = "",
+    ) -> tuple[str, SofascoreLeaseStats]:
+        """Install the next owner and return the sealed previous tail atomically."""
+        name = str(endpoint).strip()
+        if not name:
+            raise ValueError("endpoint must not be empty")
+        body = self._request(
+            "POST",
+            f"/v1/leases/{quote(lease.lease_id, safe='')}/endpoints",
+            token=lease.token,
+            payload={"endpoint": name, "endpoint_path": endpoint_path,
+                     "retain_tail_owner": True},
+        )
+        request_id = str(body.get("request_id") or "").strip()
+        if not request_id or not isinstance(body.get("stats"), Mapping):
+            raise SofascoreLeaseProtocolError("proxy lease endpoint has no sealed stats")
+        stats = SofascoreLeaseStats.from_mapping(body["stats"])
+        self._validate_stats_provenance(lease, stats)
+        return request_id, stats
+
+    def drain(self, lease: SofascoreProxyLease) -> SofascoreLeaseStats:
+        """Stop paid I/O before reconciling the final tail and completing the claim."""
+        body = self._request(
+            "POST",
+            f"/v1/leases/{quote(lease.lease_id, safe='')}/drain",
+            token=lease.token,
+            idempotent=True,
+        )
+        stats = SofascoreLeaseStats.from_mapping(body)
+        self._validate_stats_provenance(lease, stats)
+        if (not stats.closed or stats.active_tunnels or stats.reserved_bytes
+                or body.get("accounting_uncertain", False) is not False
+                or body.get("paid_ledger_uncertain", False) is not False):
+            raise SofascoreLeaseProtocolError("proxy lease drain meter is not exact and final")
+        return stats
 
     def finish_endpoint(
         self,

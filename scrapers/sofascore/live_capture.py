@@ -288,6 +288,10 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._upstream_fingerprint: Optional[str] = None
         self._observed_upstream_repins = 0
         self._endpoint_request_provider_bytes: dict[str, list[int]] = {}
+        self._retains_tail_owner = False
+        self._tail_accounting_failed = False
+        self._tail_endpoint: Optional[str] = None
+        self._prepared_boundary: Optional[tuple[str, str, str]] = None
         self._completed = False
         # Set (to the redacted reason) when the gateway revoked this lease
         # mid-batch; ``capture_live_specs`` may then re-lease once (#1218).
@@ -609,6 +613,56 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._capture = None
         self._capture_cm = None
 
+    def _sync_sealed_tails(self, stats: Any) -> None:
+        """Charge only append-only observations from the previous tail owner."""
+        if self._tail_accounting_failed:
+            raise BudgetAccountingError("SofaScore tail accounting previously failed")
+        stats = self._validate_stats(stats)
+        server_map = {
+            endpoint: list(values)
+            for endpoint, values in stats.endpoint_request_provider_bytes.items()
+        }
+        extra: list[tuple[str, int]] = []
+        for endpoint in set(server_map) | set(self._endpoint_request_provider_bytes):
+            old = self._endpoint_request_provider_bytes.get(endpoint, [])
+            values = server_map.get(endpoint, [])
+            if values[:len(old)] != old:
+                raise BudgetAccountingError("sealed SofaScore endpoint observations changed")
+            additions = values[len(old):]
+            if additions and endpoint != self._tail_endpoint:
+                raise BudgetAccountingError("sealed SofaScore tail has no known endpoint owner")
+            extra.extend((endpoint, amount) for amount in additions)
+        if (sum(sum(values) for values in server_map.values()) != stats.total_bytes
+                or self._accounted_provider_bytes + sum(amount for _, amount in extra)
+                != stats.total_bytes):
+            raise BudgetAccountingError("sealed SofaScore endpoint map does not equal meter")
+        for endpoint, amount in extra:
+            try:
+                self.engine.charge_provider_tail(endpoint, amount)
+            except BaseException:
+                # The local ledger may have committed before reporting an I/O
+                # failure. Close must never retry the same ambiguous charge.
+                self._tail_accounting_failed = True
+                raise
+            self._endpoint_request_provider_bytes.setdefault(endpoint, []).append(amount)
+            self._accounted_provider_bytes += amount
+        self._last_stats = stats
+
+    def prepare_provider_request(self, spec: Any) -> None:
+        """Seal the old tail before the engine reserves the next endpoint budget."""
+        begin = getattr(self._client, "begin_endpoint_with_stats", None)
+        if self.mode != "production" or not callable(begin):
+            return
+        if self._prepared_boundary is not None:
+            if self._prepared_boundary[:2] == (spec.key.endpoint, self._source_path(spec.url)):
+                return
+            raise BudgetAccountingError("SofaScore endpoint boundary is already prepared")
+        path = self._source_path(spec.url)
+        boundary, stats = begin(self._lease, spec.key.endpoint, endpoint_path=path)
+        self._retains_tail_owner = True
+        self._sync_sealed_tails(stats)
+        self._prepared_boundary = (spec.key.endpoint, path, boundary)
+
     def request(
         self,
         url: str,
@@ -655,15 +709,25 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             getattr(self._capture, "_source_request_count", 0) or 0
         )
         try:
-            request_boundary = self._client.begin_endpoint(
-                self._lease,
-                provider_budget.endpoint,
-            )
+            if self._retains_tail_owner:
+                prepared = self._prepared_boundary
+                if prepared is None or prepared[:2] != (provider_budget.endpoint, path):
+                    raise BudgetAccountingError("SofaScore paid request has no prepared owner")
+                request_boundary = prepared[2]
+                self._prepared_boundary = None
+            else:
+                request_boundary = self._client.begin_endpoint(
+                    self._lease,
+                    provider_budget.endpoint,
+                    endpoint_path=path,
+                )
             sessions, navigations = self._ensure_capture()
             nav_before = int(getattr(self._capture, "_navigation_count", 0) or 0)
             record = self._capture.fetch_api_json(path)
             nav_after = int(getattr(self._capture, "_navigation_count", 0) or 0)
             navigations += max(0, nav_after - nav_before)
+        except (BudgetAccountingError, ProxyBudgetExceeded):
+            raise
         except BaseException as exc:
             if self._browser_started and not self._browser_reported:
                 sessions = 1
@@ -721,6 +785,8 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                 self._endpoint_request_provider_bytes.setdefault(
                     provider_budget.endpoint, []
                 ).append(provider_bytes)
+                if self._retains_tail_owner:
+                    self._tail_endpoint = provider_budget.endpoint
             except BudgetAccountingError:
                 # An inconsistent meter (or the revoked lease's unreadable
                 # final meter) fails closed; the engine releases the
@@ -861,6 +927,8 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._endpoint_request_provider_bytes.setdefault(
             provider_budget.endpoint, []
         ).append(provider_bytes)
+        if self._retains_tail_owner:
+            self._tail_endpoint = provider_budget.endpoint
         if revoked or bool(getattr(after, "budget_exceeded", False)):
             message = (
                 self.lease_lost
@@ -920,6 +988,11 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         lease_error: Optional[BaseException] = None
         if self._client is not None and self._lease is not None:
             try:
+                if self._retains_tail_owner:
+                    drained = self._validate_stats(self._client.drain(self._lease))
+                    if (not drained.closed or drained.active_tunnels or drained.reserved_bytes):
+                        raise BudgetAccountingError("SofaScore tail meter is not final")
+                    self._sync_sealed_tails(drained)
                 final = self._validate_stats(
                     self._client.close(
                         self._lease,
@@ -930,6 +1003,14 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                         proxy_exit_hash=self._proxy_exit_hash,
                     )
                 )
+                if self._retains_tail_owner and (
+                    int(final.total_bytes) != self._accounted_provider_bytes
+                    or {
+                        endpoint: list(values)
+                        for endpoint, values in final.endpoint_request_provider_bytes.items()
+                    } != self._endpoint_request_provider_bytes
+                ):
+                    raise BudgetAccountingError("SofaScore final close changed the sealed meter")
                 self._last_stats = final
             except BaseException as exc:
                 lease_error = exc

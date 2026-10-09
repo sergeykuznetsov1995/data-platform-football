@@ -27,7 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 import fcntl
 import pandas as pd
@@ -192,6 +192,16 @@ SCOPE_STAGE_FEED_TABLES = frozenset(
         "whoscored_referee_stage_stats",
     }
 )
+
+STAGE_XG_CATEGORIES = MappingProxyType(
+    {
+        "whoscored_team_stage_stats": "xg-teamstats",
+        "whoscored_player_stage_stats": "xg-stats",
+    }
+)
+STAGE_XG_FEED_POLICY = "xg-only-v1"
+_STAGE_XG_READ_PAGE_ROWS = 20_000
+_STAGE_XG_STAGE_CHUNK = 100
 
 
 def _scope_published_table_sql(table: str) -> str:
@@ -363,7 +373,20 @@ class WhoScoredScopeRowSpool:
 
     def append_entity_rows(self, rows: Iterable[Mapping[str, Any]]) -> None:
         """Append rows with stable entity keys without retaining the iterable."""
+        self._append_rows(rows, published=False)
 
+    def append_published_rows(self, rows: Iterable[Mapping[str, Any]]) -> None:
+        """Retain published business rows with their exact original identity.
+
+        Storage fills absent business columns with nulls, so hashing a read row
+        again would change its identity even when the source observation is
+        unchanged. Only validated keys from the published row are accepted.
+        """
+        self._append_rows(rows, published=True)
+
+    def _append_rows(
+        self, rows: Iterable[Mapping[str, Any]], *, published: bool
+    ) -> None:
         pending: list[tuple[str, sqlite3.Binary]] = []
 
         def flush() -> None:
@@ -379,7 +402,16 @@ class WhoScoredScopeRowSpool:
 
         for source in rows:
             row = dict(source)
-            if "entity_key" in row:
+            if published:
+                key = row.get("entity_key")
+                if (
+                    not isinstance(key, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", key) is None
+                ):
+                    raise ValueError(
+                        f"{self.table} published row requires a 64-lowerhex entity_key"
+                    )
+            elif "entity_key" in row:
                 raise ValueError(f"{self.table} source row already has entity_key")
             for column, expected in (
                 ("league", self.league),
@@ -390,7 +422,8 @@ class WhoScoredScopeRowSpool:
                     raise ValueError(
                         f"{self.table} contains {column}={value!r} outside {expected!r}"
                     )
-            key = self._entity_key(row)
+            if not published:
+                key = self._entity_key(row)
             row["entity_key"] = key
             self._columns.update(str(column) for column in row)
             pending.append(
@@ -1006,10 +1039,27 @@ def _lock_catalog_commit(method):
 def _lock_scope_commit(method):
     @wraps(method)
     def wrapped(self, *args, **kwargs):
+        scope = dict(zip(("league", "season", "entity_group"), args))
+        scope.update(kwargs)
+        # Stage cleanup shares the commit lock even when its caller passes the
+        # league and season positionally and has no entity_group argument.
+        scope.setdefault("entity_group", "stages")
         identity = ":".join(
-            str(kwargs.get(name) or "") for name in ("league", "season", "entity_group")
+            str(scope.get(name) or "") for name in ("league", "season", "entity_group")
         )
-        with self._commit_locks((f"scope:{identity}",)):
+        lock_identities = [f"scope:{identity}"]
+        if (
+            method.__name__ == "cleanup_stage_feed_snapshot"
+            or SCOPE_STAGE_FEED_TABLES.intersection(scope.get("datasets", {}))
+        ):
+            # Legacy season publishers and weekly stages replace the same
+            # current rows. Serialize their checks as well as their writes so
+            # a base snapshot cannot change between validation and publication.
+            stage_scope = ":".join(
+                str(scope.get(name) or "") for name in ("league", "season")
+            )
+            lock_identities.append(f"scope-stage:{stage_scope}")
+        with self._commit_locks(lock_identities):
             return method(self, *args, **kwargs)
 
     return wrapped
@@ -4024,6 +4074,218 @@ class WhoScoredRepository:
         )
         return int(rows[0][0]) if rows else 0
 
+    def latest_stage_feed_snapshot(
+        self, league: str, season: str
+    ) -> Optional[dict[str, Any]]:
+        """Read the latest committed stage feeds, including pre-split seasons."""
+        rows = self.trino.execute_query(
+            "SELECT batch_id, raw_uris_json, payload_sha256, parser_version, "
+            f"dataset_states_json FROM {self._scope_manifest} "
+            f"WHERE league = {_sql_string(league)} "
+            f"AND season = {_sql_string(season)} AND state = 'success' "
+            "AND ("
+            + " OR ".join(
+                _scope_published_table_sql(table) for table in STAGE_XG_CATEGORIES
+            )
+            + ") ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC LIMIT 1"
+        )
+        if not rows:
+            return None
+        batch_id, raw_uris, payload_sha256, parser_version, states_json = rows[0]
+        states = json.loads(str(states_json)) if states_json else {}
+        return {
+            "batch_id": str(batch_id),
+            "raw_uris": json.loads(str(raw_uris)),
+            "payload_sha256": str(payload_sha256),
+            "parser_version": str(parser_version),
+            "feed_states": states.get("__feeds__", {}),
+            "feed_checks": states.get("__feed_checks__", {}),
+            "feed_policy": states.get("__feed_policy__"),
+        }
+
+    def iter_stage_xg_rows(
+        self,
+        league: str,
+        season: str,
+        *,
+        table: str,
+        stage_ids: Iterable[int],
+        batch_id: Optional[str] = None,
+    ) -> Iterator[Mapping[str, Any]]:
+        """Page published xG business rows without loading a season snapshot."""
+        if table not in STAGE_XG_CATEGORIES:
+            raise ValueError(f"unsupported WhoScored xG table {table!r}")
+        if not self.trino.table_exists(self.schema, table):
+            return
+        if batch_id is not None:
+            published = self.trino.execute_query(
+                f"SELECT batch_id FROM {self._scope_manifest} "
+                f"WHERE league = {_sql_string(league)} "
+                f"AND season = {_sql_string(season)} "
+                f"AND batch_id = {_sql_string(batch_id)} AND state = 'success' "
+                f"AND {_scope_published_table_sql(table)} LIMIT 1"
+            )
+            if not published:
+                raise BatchConflict(
+                    f"scope batch {batch_id}/{table} is not published for {league}/{season}"
+                )
+        read_table = table if batch_id is not None else f"{table}_current"
+        batch_filter = (
+            f" AND _scope_batch_id = {_sql_string(batch_id)}"
+            if batch_id is not None
+            else ""
+        )
+        columns = [
+            str(name)
+            for name in self.trino.get_table_columns(self.schema, table)
+            if not str(name).startswith("_") and str(name) != "batch_schema_fingerprint"
+        ]
+        if not columns or "entity_key" not in columns:
+            raise BatchConflict(f"{table} lacks the xG entity_key read contract")
+        # IDs are tiny scope metadata; only query result rows need paging.
+        ids = sorted({int(value) for value in stage_ids})
+        for start in range(0, len(ids), _STAGE_XG_STAGE_CHUNK):
+            stage_filter = ",".join(
+                str(value) for value in ids[start : start + _STAGE_XG_STAGE_CHUNK]
+            )
+            after: Optional[str] = None
+            while True:
+                key_filter = (
+                    f" AND entity_key > {_sql_string(after)}"
+                    if after is not None
+                    else ""
+                )
+                rows = self.trino.execute_query(
+                    "SELECT "
+                    + ", ".join(f'"{column}"' for column in columns)
+                    + f" FROM {self.catalog}.{self.schema}.{read_table} "
+                    f"WHERE league = {_sql_string(league)} "
+                    f"AND season = {_sql_string(season)} "
+                    f"AND source_category = {_sql_string(STAGE_XG_CATEGORIES[table])} "
+                    f"AND stage_id IN ({stage_filter})"
+                    + key_filter
+                    + batch_filter
+                    + f" ORDER BY entity_key LIMIT {_STAGE_XG_READ_PAGE_ROWS}"
+                )
+                for values in rows:
+                    yield dict(zip(columns, values))
+                if len(rows) < _STAGE_XG_READ_PAGE_ROWS:
+                    break
+                after = str(rows[-1][columns.index("entity_key")])
+
+    def _guard_stage_xg_completeness(
+        self,
+        *,
+        league: str,
+        season: str,
+        row_sources: Mapping[str, Iterable[Mapping[str, Any]]],
+    ) -> None:
+        for table, source_rows in row_sources.items():
+            category = STAGE_XG_CATEGORIES[table]
+            new_counts: dict[tuple[int, str], int] = {}
+            for row in source_rows:
+                if (
+                    row.get("source_category") != category
+                    or row.get("stage_id") is None
+                ):
+                    raise ValueError(
+                        f"{table} requires stage_id and source_category={category!r}"
+                    )
+                key = (int(row["stage_id"]), category)
+                new_counts[key] = new_counts.get(key, 0) + 1
+            if not self.trino.table_exists(self.schema, table):
+                continue
+            previous = self.trino.execute_query(
+                f"SELECT stage_id, source_category, COUNT(*) "
+                f"FROM {self.catalog}.{self.schema}.{table}_current "
+                f"WHERE league = {_sql_string(league)} "
+                f"AND season = {_sql_string(season)} "
+                f"AND source_category = {_sql_string(category)} GROUP BY stage_id, source_category"
+            )
+            for stage_id, old_category, old_count in previous:
+                new_count = new_counts.get((int(stage_id), str(old_category)), 0)
+                if new_count < int(old_count):
+                    raise ValueError(
+                        f"{table} completeness guard: stage={stage_id}, "
+                        f"category={old_category}, new={new_count}, old={old_count}, "
+                        "published snapshot cannot shrink"
+                    )
+
+    @_lock_scope_commit
+    def cleanup_stage_feed_snapshot(
+        self, league: str, season: str, *, batch_id: str
+    ) -> None:
+        """Retry post-publication xG cleanup without fetching or publishing."""
+        rows = self.trino.execute_query(
+            f"SELECT entity_counts_json, dataset_states_json FROM {self._scope_manifest} "
+            f"WHERE league = {_sql_string(league)} "
+            f"AND season = {_sql_string(season)} "
+            f"AND batch_id = {_sql_string(batch_id)} AND state = 'success' "
+            "ORDER BY completed_at DESC, _ingested_at DESC LIMIT 1"
+        )
+        if not rows:
+            raise BatchConflict(
+                f"scope stage batch {batch_id} is not published for {league}/{season}"
+            )
+        counts = json.loads(str(rows[0][0]))
+        states = json.loads(str(rows[0][1])) if rows[0][1] else {}
+        if states.get("__feed_policy__") != STAGE_XG_FEED_POLICY:
+            raise BatchConflict(f"scope stage batch {batch_id} does not use xg-only-v1")
+        table = "whoscored_player_stage_stats"
+        expected = counts.get(table)
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+            raise BatchConflict(
+                f"scope stage batch {batch_id} lacks a valid published player count"
+            )
+        with self._commit_locks(("scope-table:whoscored_player_stage_stats",)):
+            self._cleanup_superseded_player_stage_batches(
+                league=league, season=season, batch_id=batch_id, expected=expected
+            )
+
+    def _cleanup_superseded_player_stage_batches(
+        self, *, league: str, season: str, batch_id: str, expected: int
+    ) -> None:
+        """Delete only committed player batches displaced by this publication.
+
+        The caller holds the scope commit lock and the player scope-table lock.
+        Legacy rows and unpublished concurrent attempts are never candidates.
+        """
+        table = "whoscored_player_stage_stats"
+        latest_sql = (
+            f"SELECT batch_id FROM {self._scope_manifest} "
+            f"WHERE league = {_sql_string(league)} AND season = {_sql_string(season)} "
+            f"AND state = 'success' AND {_scope_published_table_sql(table)} "
+            "ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC LIMIT 1"
+        )
+        latest = self.trino.execute_query(latest_sql)
+        if not latest or str(latest[0][0]) != batch_id:
+            # An old idempotent retry must not clean the newer publication.
+            return
+        kept = self._scope_batch_count(
+            table, league=league, season=season, batch_id=batch_id
+        )
+        if kept != expected:
+            raise BatchConflict(
+                f"scope batch {batch_id}/{table}: kept={kept}, expected={expected}"
+            )
+        self.trino._execute(
+            f"DELETE FROM {self.catalog}.{self.schema}.{table} "
+            f"WHERE league = {_sql_string(league)} AND season = {_sql_string(season)} "
+            "AND _scope_batch_id IS NOT NULL "
+            f"AND _scope_batch_id <> {_sql_string(batch_id)} "
+            f"AND ({latest_sql}) = {_sql_string(batch_id)} "
+            f"AND _scope_batch_id IN (SELECT batch_id FROM {self._scope_manifest} "
+            f"WHERE league = {_sql_string(league)} AND season = {_sql_string(season)} "
+            f"AND state = 'success' AND {_scope_published_table_sql(table)})"
+        )
+        kept = self._scope_batch_count(
+            table, league=league, season=season, batch_id=batch_id
+        )
+        if kept != expected:
+            raise BatchConflict(
+                f"scope batch {batch_id}/{table}: cleanup kept={kept}, expected={expected}"
+            )
+
     @_lock_scope_commit
     def commit_scope_bundle(
         self,
@@ -4038,6 +4300,9 @@ class WhoScoredRepository:
         source_empty: Iterable[str] = (),
         source_unavailable: Iterable[str] = (),
         feed_states: Optional[Mapping[str, str]] = None,
+        feed_policy: Optional[str] = None,
+        feed_checks: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        expected_previous_stage_batch_id: Optional[str] = None,
     ) -> str:
         """Publish multiple scope datasets through one logical commit point."""
         if not datasets:
@@ -4045,6 +4310,37 @@ class WhoScoredRepository:
         if not payload_sha256 or not raw_uris:
             raise ValueError("scope commit requires raw identity")
         allowed = SCOPE_DATASET_TABLES
+        if feed_policy is not None and feed_policy != STAGE_XG_FEED_POLICY:
+            raise ValueError(f"unsupported WhoScored feed policy {feed_policy!r}")
+        if feed_policy == STAGE_XG_FEED_POLICY and set(datasets) - set(
+            STAGE_XG_CATEGORIES
+        ):
+            raise ValueError("xg-only-v1 supports only team/player stage statistics")
+        normalized_feed_checks: dict[str, dict[str, Any]] = {}
+        for raw_stage_id, check in (feed_checks or {}).items():
+            stage_id = str(raw_stage_id)
+            if not stage_id.isdecimal() or str(int(stage_id)) != stage_id:
+                raise ValueError(f"invalid WhoScored feed check stage id {stage_id!r}")
+            checked_at = check.get("checked_at")
+            final = check.get("final")
+            try:
+                checked_time = datetime.fromisoformat(
+                    str(checked_at).replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "feed checked_at must be an ISO UTC timestamp"
+                ) from exc
+            if checked_time.utcoffset() != timedelta(0) or not isinstance(
+                checked_at, str
+            ):
+                raise ValueError("feed checked_at must be an ISO UTC timestamp")
+            if not isinstance(final, bool) or set(check) != {"checked_at", "final"}:
+                raise ValueError("feed check requires checked_at and boolean final")
+            normalized_feed_checks[stage_id] = {
+                "checked_at": checked_at,
+                "final": final,
+            }
         explicit_empty = set(source_empty)
         unavailable = set(source_unavailable)
         unknown_states = (explicit_empty | unavailable) - set(datasets)
@@ -4080,6 +4376,12 @@ class WhoScoredRepository:
         }
         if normalized_feed_states:
             dataset_states["__feeds__"] = dict(sorted(normalized_feed_states.items()))
+        if feed_policy is not None:
+            dataset_states["__feed_policy__"] = feed_policy
+        if feed_checks is not None:
+            dataset_states["__feed_checks__"] = dict(
+                sorted(normalized_feed_checks.items())
+            )
         row_sources: dict[str, Iterable[Mapping[str, Any]]] = {}
         counts: dict[str, int] = {}
         schema_fields: dict[str, list[str]] = {}
@@ -4149,16 +4451,19 @@ class WhoScoredRepository:
             counts[table] = row_count
             row_sources[table] = source_rows
 
-        identity = self._canonical_json(
-            {
-                "league": league,
-                "season": season,
-                "entity_group": entity_group,
-                "payload_sha256": payload_sha256,
-                "parser_version": PARSER_VERSION,
-                "feed_states": normalized_feed_states,
-            }
-        )
+        identity_fields = {
+            "league": league,
+            "season": season,
+            "entity_group": entity_group,
+            "payload_sha256": payload_sha256,
+            "parser_version": PARSER_VERSION,
+            "feed_states": normalized_feed_states,
+        }
+        if feed_policy is not None:
+            identity_fields["feed_policy"] = feed_policy
+        if feed_checks is not None:
+            identity_fields["feed_checks"] = normalized_feed_checks
+        identity = self._canonical_json(identity_fields)
         batch_id = "wss2-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
         already = self.trino.execute_query(
             f"SELECT entity_counts_json, dataset_states_json FROM {self._scope_manifest} "
@@ -4189,7 +4494,29 @@ class WhoScoredRepository:
                         f"scope batch {batch_id}/{table}: physical={physical}, "
                         f"manifest={expected}"
                     )
+            if (
+                feed_policy == STAGE_XG_FEED_POLICY
+                and "whoscored_player_stage_stats" in counts
+            ):
+                with self._commit_locks(("scope-table:whoscored_player_stage_stats",)):
+                    self._cleanup_superseded_player_stage_batches(
+                        league=league,
+                        season=season,
+                        batch_id=batch_id,
+                        expected=counts["whoscored_player_stage_stats"],
+                    )
             return batch_id
+
+        if expected_previous_stage_batch_id is not None:
+            previous_stage_snapshot = self.latest_stage_feed_snapshot(league, season)
+            actual_previous = (
+                previous_stage_snapshot["batch_id"] if previous_stage_snapshot else ""
+            )
+            if actual_previous != expected_previous_stage_batch_id:
+                raise BatchConflict(
+                    f"scope stage snapshot changed: expected="
+                    f"{expected_previous_stage_batch_id!r}, actual={actual_previous!r}"
+                )
 
         stage_feed_tables = sorted(SCOPE_STAGE_FEED_TABLES & set(counts))
         previous_filter = (
@@ -4207,6 +4534,10 @@ class WhoScoredRepository:
             "ORDER BY completed_at DESC, _ingested_at DESC LIMIT 1"
         )
         previous = json.loads(str(previous_rows[0][0])) if previous_rows else {}
+        if feed_policy == STAGE_XG_FEED_POLICY:
+            self._guard_stage_xg_completeness(
+                league=league, season=season, row_sources=row_sources
+            )
         for table, new_count in counts.items():
             old_count = int(previous.get(table, 0))
             # WhoScored scope batches are complete snapshots.  Neither an
@@ -4217,6 +4548,9 @@ class WhoScoredRepository:
             # an unattended daily run.
             if (
                 table not in SCOPE_SHRINKABLE_DATASET_TABLES
+                and not (
+                    feed_policy == STAGE_XG_FEED_POLICY and table in STAGE_XG_CATEGORIES
+                )
                 and old_count
                 and new_count < old_count
             ):
@@ -4332,34 +4666,54 @@ class WhoScoredRepository:
                         f"expected={counts[table]}"
                     )
 
-        now = _utc_now()
-        self.writer.write_dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "league": league,
-                        "season": season,
-                        "entity_group": entity_group,
-                        "batch_id": batch_id,
-                        "payload_sha256": payload_sha256,
-                        "raw_uris_json": self._canonical_json(sorted(set(raw_uris))),
-                        "parser_version": PARSER_VERSION,
-                        "state": "success",
-                        "entity_counts_json": self._canonical_json(counts),
-                        "dataset_states_json": self._canonical_json(dataset_states),
-                        "schema_fingerprint": schema_fingerprint,
-                        "started_at": now,
-                        "completed_at": now,
-                        "error": None,
-                        "_entity_type": "scope_manifest",
-                    }
-                ]
-            ),
-            database=self.schema,
-            table=SCOPE_MANIFEST_TABLE,
-            partition_spec=[("league", "identity"), ("season", "identity")],
-            source="whoscored",
+        # All player-table publishers serialize the manifest commit with
+        # cleanup, including callers using the older season policy.
+        publish_lock = (
+            ("scope-table:whoscored_player_stage_stats",)
+            if "whoscored_player_stage_stats" in counts
+            else ()
         )
+        with self._commit_locks(publish_lock):
+            now = _utc_now()
+            self.writer.write_dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "league": league,
+                            "season": season,
+                            "entity_group": entity_group,
+                            "batch_id": batch_id,
+                            "payload_sha256": payload_sha256,
+                            "raw_uris_json": self._canonical_json(
+                                sorted(set(raw_uris))
+                            ),
+                            "parser_version": PARSER_VERSION,
+                            "state": "success",
+                            "entity_counts_json": self._canonical_json(counts),
+                            "dataset_states_json": self._canonical_json(dataset_states),
+                            "schema_fingerprint": schema_fingerprint,
+                            "started_at": now,
+                            "completed_at": now,
+                            "error": None,
+                            "_entity_type": "scope_manifest",
+                        }
+                    ]
+                ),
+                database=self.schema,
+                table=SCOPE_MANIFEST_TABLE,
+                partition_spec=[("league", "identity"), ("season", "identity")],
+                source="whoscored",
+            )
+            if (
+                feed_policy == STAGE_XG_FEED_POLICY
+                and "whoscored_player_stage_stats" in counts
+            ):
+                self._cleanup_superseded_player_stage_batches(
+                    league=league,
+                    season=season,
+                    batch_id=batch_id,
+                    expected=counts["whoscored_player_stage_stats"],
+                )
         return batch_id
 
     def list_preview_candidates(

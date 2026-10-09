@@ -3338,3 +3338,43 @@ minutes, through `2026-07-15T17:53:52Z`. This is an external source/IP blocker:
 a bounded EPL replay and full six-hour canary must exit zero before promotion.
 Pools therefore remain 2/2, WhoScored DAGs remain paused and `all_catalog`
 remains forbidden.
+
+## Stage xG collection (#1478)
+
+The roadmap of 24 September 2026 supersedes the legacy all-feed collection
+above. `sync_stage_feeds` publishes only `xg-teamstats` and `xg-stats`; player
+pagination remains complete. The existing Monday-morning stage task is kept.
+The `xg-only-v1` scope manifest carries `__feeds__`, `__feed_checks__` (UTC
+observation time and final flag per stage), and `__feed_policy__`. Live stages,
+including a proven absence of the statistics token, are checked after seven
+days; closed stages get one final observation, bypassing intermediate cache.
+A stage still advertised before its first fixture remains deferred.
+
+Structured browser batches use the current pool member. A complete source
+statistics page supplies `Model-last-Mode`; curl sends it only with the same
+session, source stage, Referer and pool identity. The HTTP profile is
+`chrome142`, matching the observed isolated Chromium 142. Cookies and header
+values are excluded from reports. `stage_xhr_token` counters record available
+HTML, source absence, and physical curl 2xx responses; they are not proof of
+parser success. Cloudflare and malformed HTML never establish source absence.
+An open source circuit leaves stage work deferred and preserves the previous
+complete snapshot, while the independent schedule/match tasks continue.
+
+Skipped stage rows are copied from the exact committed batch with their
+original entity keys. Publication rejects a concurrently changed base and
+compares completeness with published xG counts per stage. Only after successful
+publication does cleanup delete displaced committed player-statistics batches
+of that league/season; unpublished attempts and NULL legacy rows remain. A
+failed cleanup can be retried against the same committed batch.
+
+Acceptance still requires the scheduled weekly run: curl-XHR evidence,
+pool routing, source-absence/circuit outcomes, no unintended xG shrink, and
+completion within two hours. No manual DAG trigger or source probe is needed
+or authorised by this code change. Merge and production delivery retain their
+separate permissions; local unit tests do not close issue #1478.
+
+The existing sealed capacity-v1 harness retains its frozen legacy 68-feed
+fixture corpus and unchanged capacity gate. Its report labels that policy
+`legacy-capacity-68` and explicitly excludes production xG collection evidence.
+The current weekly xG contract is accepted only through the scheduled source
+run; a legacy cache-capacity receipt cannot substitute for that observation.
