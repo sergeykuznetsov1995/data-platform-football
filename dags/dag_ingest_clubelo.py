@@ -24,6 +24,8 @@ from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from utils.clubelo_tasks import (
     gate_daily,
     gate_history,
+    gate_watch,
+    finish_watch,
     validate_data,
 )
 from utils.config import DAG_TAGS
@@ -32,6 +34,7 @@ from utils.default_args import LIGHT_ARGS
 # One result file per DAG run (run_id in the path): a file of another run is
 # never read, a stale one of this run is rejected by fetched_at (R-37).
 DAILY_RESULT = "/tmp/clubelo_daily_{{ run_id | replace(':', '_') }}.json"
+WATCH_RESULT = "/tmp/clubelo_watch_{{ run_id | replace(':', '_') }}.json"
 
 # DAG definition
 with DAG(
@@ -55,6 +58,7 @@ with DAG(
         # Manual only — "Trigger DAG w/ config" {"run_history": true}; the
         # daily chain is skipped in that run.
         'run_history': False,
+        'run_watch': False,
     },
     doc_md="""
     ## ClubElo Data Ingestion (HTML of clubelo.com)
@@ -94,6 +98,16 @@ with DAG(
     continues with the clubs not yet closed in
     `bronze.clubelo_history_manifest`. Any failed page, redirect, block or
     pending club makes the task red.
+
+    ### Registration / Fixtures watch (#1466)
+
+    Weekly on Monday's 00:30 UTC slot, or manual `{"run_watch": true}`.
+    History and ordinary external triggers keep it off. The check starts
+    after scrape_daily succeeds, avoiding requests after a source block. It uses the
+    existing transport and HTML source; the API remains a stub. State and
+    Telegram dedup live in `/opt/airflow/logs/clubelo_registration_watch.json`.
+    Check errors are reported without making successful daily collection red;
+    daily validation remains a separate terminal task and can still fail.
     """,
 ) as dag:
 
@@ -172,7 +186,46 @@ rm -f /tmp/clubelo_history_result.json && \
         pool='default_pool',
     )
 
-    # Daily chain: snapshot → validate.
+    # ---- Optional registration/Fixtures watch (#1466) --------------------
+    gate_watch_task = ShortCircuitOperator(
+        task_id='gate_watch',
+        python_callable=gate_watch,
+        ignore_downstream_trigger_rules=False,
+        pool='default_pool',
+    )
+    check_watch_task = BashOperator(
+        task_id='check_watch',
+        bash_command=f"""
+cd /opt/airflow && \\
+rm -f {WATCH_RESULT} && \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_clubelo_scraper.py \\
+    --mode watch \\
+    --output {WATCH_RESULT}
+""",
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+        },
+        append_env=True,
+        trigger_rule='all_success',
+        execution_timeout=timedelta(minutes=10),
+        retries=0,
+        pool='default_pool',
+    )
+    finish_watch_task = PythonOperator(
+        task_id='finish_watch',
+        python_callable=finish_watch,
+        op_kwargs={'results_path': WATCH_RESULT},
+        trigger_rule='all_done',
+        retries=0,
+        pool='default_pool',
+    )
+
+    # Daily chain: snapshot → validate. validate_data stays a leaf so a
+    # successful finish_watch cannot mask a failed/upstream_failed daily.
     gate_daily_task >> scrape_daily_task >> validate_data_task
     # Manual history branch (#1462).
     gate_history_task >> scrape_history_task
+    gate_watch_task >> check_watch_task >> finish_watch_task
+    scrape_daily_task >> check_watch_task

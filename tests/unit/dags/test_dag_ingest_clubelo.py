@@ -69,7 +69,7 @@ class TestDailyChain:
         assert _bash_task('scrape_current_ratings') is None
         assert _python_task('gate_full_ratings') is None
         assert _bash_task('scrape_full_ratings') is None
-        assert set(dag_module.dag._dag_kwargs['params']) == {'run_history'}
+        assert set(dag_module.dag._dag_kwargs['params']) == {'run_history', 'run_watch'}
         source = open(dag_module.__file__, encoding='utf-8').read()
         assert 'LEAGUES' not in source and 'SCHEDULES' not in source
 
@@ -77,7 +77,7 @@ class TestDailyChain:
         scrape = _bash_task('scrape_daily')
         validate = _python_task('validate_data')
         assert scrape.upstream_task_ids == {'gate_daily'}
-        assert scrape.downstream_task_ids == {'validate_data'}
+        assert scrape.downstream_task_ids == {'validate_data', 'check_watch'}
         assert validate.upstream_task_ids == {'scrape_daily'}
         assert validate.python_callable is dag_module.validate_data
 
@@ -237,6 +237,52 @@ class TestNoPerTaskTelegram:
         # Tasks inherit default_args in Airflow; the stub keeps only explicit
         # kwargs, so this loop asserts that no task sets its own callback back.
         tasks = list(BashOperator._instances) + list(PythonOperator._instances)
-        assert len(tasks) == 5
+        assert len(tasks) == 8
         for t in tasks:
             assert t._init_kwargs.get('on_failure_callback') is None, t.task_id
+
+
+class TestWatchBranch:
+    def test_optional_branch_leaves_daily_failure_visible(self, dag_module):
+        gate, check, finish = _python_task('gate_watch'), _bash_task('check_watch'), _python_task('finish_watch')
+        assert gate.upstream_task_ids == set()
+        assert gate.downstream_task_ids == {'check_watch'}
+        assert gate._init_kwargs['ignore_downstream_trigger_rules'] is False
+        assert check.upstream_task_ids == {'gate_watch', 'scrape_daily'}
+        assert check.downstream_task_ids == {'finish_watch'}
+        assert finish._init_kwargs['trigger_rule'] == 'all_done'
+        assert check._init_kwargs['trigger_rule'] == 'all_success'
+        assert check._init_kwargs['retries'] == 0
+        assert _python_task('validate_data').downstream_task_ids == set()
+        assert '--mode watch' in check.bash_command and dag_module.WATCH_RESULT in check.bash_command
+
+    @pytest.mark.parametrize('run_type,params,slot,expected', [
+        ('scheduled', {}, datetime(2026, 10, 12, 0, 30, tzinfo=timezone.utc), True),
+        ('scheduled', {}, datetime(2026, 10, 12, 4, 30, tzinfo=timezone.utc), False),
+        ('scheduled', {}, datetime(2026, 10, 11, 0, 30, tzinfo=timezone.utc), False),
+        ('scheduled', {}, datetime(2026, 10, 12, 0, 30), False),
+        ('scheduled', {}, None, False),
+        ('manual', {}, datetime(2026, 10, 12, 0, 30, tzinfo=timezone.utc), False),
+        ('manual', {'run_watch': True}, None, True),
+        ('manual', {'run_watch': 'false'}, None, False),
+        ('manual', {'run_watch': True, 'run_history': True}, None, False),
+        ('backfill', {'run_watch': True}, None, False),
+    ])
+    def test_gate_uses_run_type_and_interval_end(self, dag_module, run_type, params, slot, expected):
+        assert dag_module.gate_watch(params=params, data_interval_end=slot,
+                                    dag_run=SimpleNamespace(run_type=run_type)) is expected
+
+    @pytest.mark.parametrize('state', ['failed', 'upstream_failed', 'skipped'])
+    def test_finalizer_softens_check_failure_and_skip(self, dag_module, tmp_path, state):
+        run = SimpleNamespace(get_task_instance=lambda task_id: SimpleNamespace(state=state))
+        result = dag_module.finish_watch(str(tmp_path / 'absent'), dag_run=run)
+        assert result['status'] == ('skipped' if state == 'skipped' else 'error')
+
+    def test_finalizer_reads_error_report_without_raising(self, dag_module, tmp_path):
+        import json
+        run = SimpleNamespace(get_task_instance=lambda task_id: SimpleNamespace(state='success'))
+        report = tmp_path / 'watch.json'
+        report.write_text(json.dumps({'status': 'error', 'errors': ['timeout']}))
+        assert dag_module.finish_watch(str(report), dag_run=run)['errors'] == ['timeout']
+        report.write_text('broken json')
+        assert dag_module.finish_watch(str(report), dag_run=run)['status'] == 'error'

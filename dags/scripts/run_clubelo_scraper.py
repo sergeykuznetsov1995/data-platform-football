@@ -12,8 +12,8 @@ Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 - ``--mode history`` (#1462): club pages /{slug} into the four append-only
   history tables, resumable batches.
 
-Both modes exit non-zero on ANY incompleteness, the result JSON is written
-even on failure.
+Daily/history exit non-zero on ANY incompleteness. ``--mode watch`` (#1466)
+reports optional weekly checks without making daily collection red.
 """
 
 import argparse
@@ -71,6 +71,24 @@ def run_history_mode(args) -> int:
     return code
 
 
+def run_watch_mode(args) -> int:
+    """The optional check reports errors; its exit must not fail daily."""
+    try:
+        from scrapers.clubelo.watch import run_default
+
+        results = run_default(state_file=args.state_file, source=args.source)
+    except Exception as exc:
+        logger.warning("ClubElo watch failed", exc_info=True)
+        results = {'status': 'error', 'errors': [f'{type(exc).__name__}: {exc}']}
+    print(json.dumps(results))
+    try:
+        with open(args.output, 'w') as stream:
+            json.dump(results, stream)
+    except Exception:
+        logger.warning("ClubElo watch result file unavailable", exc_info=True)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run ClubElo scraper')
     parser.add_argument(
@@ -81,11 +99,12 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['daily', 'history'],
+        choices=['daily', 'history', 'watch'],
         default='daily',
         help="daily = /Ranking + /Results snapshot of clubelo.com (#1463); "
              "history = club pages /{slug} of clubelo.com into the four "
-             "append-only history tables (#1462), resumable batches"
+             "append-only history tables (#1462), resumable batches; "
+             "watch = weekly registration and Fixtures observations (#1466)"
     )
     parser.add_argument(
         '--batch-size',
@@ -93,8 +112,14 @@ def main():
         default=200,
         help='--mode history: clubs per committed batch (default 200)'
     )
+    parser.add_argument('--state-file', default='/opt/airflow/logs/clubelo_registration_watch.json',
+                        help='--mode watch: persistent dedup state on the logs volume')
+    parser.add_argument('--source', choices=['html', 'api'], default='html',
+                        help='--mode watch: same source switch as the collection; api remains unimplemented')
     args = parser.parse_args()
 
+    if args.mode == 'watch':
+        return run_watch_mode(args)
     if args.mode == 'history':
         return run_history_mode(args)
     return run_daily_mode(args)

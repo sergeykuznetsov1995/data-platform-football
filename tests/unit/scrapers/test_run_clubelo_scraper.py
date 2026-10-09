@@ -20,6 +20,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+class TestWatchMode:
+    @pytest.mark.parametrize('outcome', ['success', 'error', 'exception', 'unwritable_output'])
+    def test_optional_watch_always_returns_zero(self, tmp_path, monkeypatch, outcome):
+        stub = MagicMock()
+        stub.run_default.return_value = {'status': outcome}
+        if outcome == 'exception':
+            stub.run_default.side_effect = RuntimeError('watch failed')
+        output = tmp_path if outcome == 'unwritable_output' else tmp_path / 'result.json'
+        monkeypatch.setattr(sys, 'argv', ['run_clubelo_scraper.py', '--mode', 'watch',
+                                        '--output', str(output), '--state-file', str(tmp_path / 'state.json')])
+        with patch.dict(sys.modules, {'scrapers.clubelo.watch': stub}):
+            module = importlib.import_module('dags.scripts.run_clubelo_scraper')
+            assert module.main() == 0
+        stub.run_default.assert_called_once_with(state_file=str(tmp_path / 'state.json'), source='html')
+        if outcome != 'unwritable_output':
+            result = json.loads(output.read_text())
+            assert result['status'] == ('error' if outcome == 'exception' else outcome)
+
+
 @pytest.fixture
 def temp_output():
     fd, path = tempfile.mkstemp(suffix=".json", prefix="clubelo_")
