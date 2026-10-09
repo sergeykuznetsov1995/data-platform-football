@@ -12,6 +12,7 @@ from scrapers.transfermarkt.writer import execute_statement
 
 import json
 import os
+from pathlib import Path
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -143,6 +144,8 @@ class BackfillStateRepository:
     def ensure_schema(self) -> None:
         for statement in state.ddl_statements():
             execute_statement(self.cursor, statement)
+        from .transfermarkt_season_handoff import ddl
+        execute_statement(self.cursor, ddl())
 
     def execute(self, statement: str) -> None:
         execute_statement(self.cursor, statement)
@@ -219,16 +222,74 @@ class BackfillStateRepository:
         statuses = ", ".join(_sql_text(item.value) for item in _OPEN_CAMPAIGN_STATUSES)
         rows = self.query(
             f"SELECT * FROM {state.CAMPAIGN_TABLE} "
-            f"WHERE status IN ({statuses}) ORDER BY created_at DESC"
+            f"WHERE status IN ({statuses}) ORDER BY created_at, campaign_id"
         )
-        if len(rows) > 1:
-            raise BackfillRuntimeError("more than one open backfill campaign exists")
         if not rows:
             return None
-        campaign_id = str(rows[0].get("campaign_id") or "")
-        scopes = self._query_scopes(campaign_id)
-        self._prefetched_scopes[campaign_id] = scopes
-        return self._parse_campaign_with_scopes(rows[0], scopes)
+        campaigns = []
+        busy = []
+        for row in rows:
+            campaign_id = str(row.get("campaign_id") or "")
+            scopes = self._query_scopes(campaign_id)
+            self._prefetched_scopes[campaign_id] = scopes
+            campaign = self._parse_campaign_with_scopes(row, scopes)
+            campaigns.append(campaign)
+            batches = self.load_batches(campaign_id) if campaign.status is state.CampaignStatus.ACTIVE else ()
+            if campaign.status is not state.CampaignStatus.ACTIVE or any(
+                    batch.status not in {state.BatchStatus.COMPLETE, state.BatchStatus.WAITING_POLICY} or batch.open_platform_incident_id
+                    for batch in batches):
+                busy.append(campaign)
+        if len(busy) > 1:
+            raise BackfillRuntimeError("more than one campaign has a recoverable batch")
+        return busy[0] if busy else campaigns[0]
+
+    def register_season_handoffs(self, rows, *, now):
+        """Notice previously current promotions before the historical claim."""
+        from .transfermarkt_season_handoff import mark_sql, closed_targets, TABLE
+        from .transfermarkt_scope_planner import EDITIONS_TABLE, REGISTRY_STATE_TABLE
+        from scrapers.transfermarkt.registry import deterministic_scope_id
+        previous = self.query(f"SELECT DISTINCT e.competition_id, e.edition_id FROM {EDITIONS_TABLE} e "
+                              f"JOIN {REGISTRY_STATE_TABLE} p ON p.registry_snapshot_id=e.registry_snapshot_id "
+                              "WHERE e.is_current=TRUE AND p.status='promoted' "
+                              "AND (p.state_key='canonical' OR regexp_like(p.state_key, '^history:[0-9]+$'))")
+        for item in previous:
+            item['scope_id'] = deterministic_scope_id(str(item['competition_id']), str(item['edition_id']))
+        historical_ids = {target.scope_id for target in historical_targets_from_registry(rows)}
+        for target in closed_targets(previous, rows):
+            if target.scope_id in historical_ids:
+                self.execute(mark_sql(target, status='pending', at=now))
+        return {str(item['scope_id']) for item in self.query(f"SELECT scope_id FROM {TABLE} WHERE status <> 'complete'")}
+
+    def select_queue_campaign(self, *, now: datetime, allowed_ids=None, registry_targets=None) -> state.BackfillCampaign | None:
+        """Recover one busy batch first; otherwise pick oldest runnable entry."""
+        latest_identities = ({_semantic_target_identity(target) for target in registry_targets}
+                             if registry_targets is not None else None)
+        campaigns = self.load_campaigns()
+        opened = [item for item in campaigns if item.status in _OPEN_CAMPAIGN_STATUSES]
+        busy = []
+        for campaign in opened:
+            scopes = self.load_scopes(campaign.campaign_id)
+            batches = self.load_batches(campaign.campaign_id)
+            if campaign.status is not state.CampaignStatus.ACTIVE or any(
+                batch.status not in {state.BatchStatus.COMPLETE, state.BatchStatus.WAITING_POLICY} or batch.open_platform_incident_id
+                for batch in batches
+            ):
+                busy.append(campaign)
+        if len(busy) > 1:
+            raise BackfillRuntimeError("more than one campaign has a recoverable batch")
+        if busy:
+            return busy[0]
+        for campaign in opened:
+            scopes = self.load_scopes(campaign.campaign_id)
+            held_ids = {scope_id for batch in self.load_batches(campaign.campaign_id)
+                        if batch.status is state.BatchStatus.WAITING_POLICY for scope_id in batch.scope_ids}
+            if any(item.target.scope_id not in held_ids and
+                   (latest_identities is None or _semantic_target_identity(item.target) in latest_identities) and (allowed_ids is None or item.target.scope_id in allowed_ids) and
+                   (item.status is state.ScopeStatus.PENDING or
+                   (item.status is state.ScopeStatus.RETRYABLE_ERROR and item.next_retry_at is not None
+                    and item.next_retry_at <= now)) for item in scopes):
+                return campaign
+        return None
 
     def latest_campaign(self) -> state.BackfillCampaign | None:
         rows = self.query(
@@ -900,18 +961,29 @@ class BackfillStateRepository:
         )
 
 
+def current_signal_qualification():
+    """Use #1393's content-based activation proof, never a readiness boolean."""
+    from scrapers.transfermarkt.signal_qualification import validate_qualification
+    path = Path(__file__).resolve().parents[1] / 'configs/transfermarkt/current_signal_qualification.json'
+    try:
+        return validate_qualification(json.loads(path.read_text()))
+    except (OSError, ValueError, TypeError) as exc:
+        raise BackfillRuntimeError("current detector qualification is required before historical paid work") from exc
+
+
 def strict_cutover_preflight(
     *,
     connection_factory: Callable[[], Any] | None = None,
     raw_store_factory: Callable[[], RawResponseStore | None] | None = None,
     proxy_health_get: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """Prove v2-only writer readiness before a campaign may claim paid work."""
+    """Prove isolated historical Native Bronze permission before paid work."""
 
     if not _truthy_env("TM_NATIVE_V2_ENABLED"):
         raise BackfillRuntimeError("TM_NATIVE_V2_ENABLED must be true")
     if not _truthy_env("TM_STANDING_POLICY_ENABLED"):
         raise BackfillRuntimeError("TM_STANDING_POLICY_ENABLED must be true")
+    qualification = current_signal_qualification()
     proxy_url = _required_env("TM_BACKFILL_PROXY_CONTROL_URL").rstrip("/")
     proxy_token = _required_env("TM_BACKFILL_PROXY_CONTROL_TOKEN")
     if len(proxy_token) < 32:
@@ -932,15 +1004,6 @@ def strict_cutover_preflight(
     cur = conn.cursor()
     try:
         reader = tm_v2.read_reader_state(cur, allow_missing=True)
-        if (
-            not reader.exists
-            or reader.active_version != "v2"
-            or reader.active_slot not in {"a", "b"}
-            or reader.legacy_writers_disabled_at is None
-        ):
-            raise BackfillRuntimeError(
-                "Transfermarkt v2 cutover and legacy-writer shutdown are required"
-            )
     finally:
         cur.close()
         conn.close()
@@ -973,7 +1036,13 @@ def strict_cutover_preflight(
         status_code != 200
         or not isinstance(health, Mapping)
         or health.get("transfermarkt_backfill_paid_enabled") is not True
-        or int(health.get("transfermarkt_requests_per_minute", 0)) != 12
+        or int(health.get("transfermarkt_requests_per_minute", 0)) <= 0
+        or not 1 <= int(health.get("transfermarkt_history_streams", 0)) <= 3
+        or not 1 <= int(health.get("transfermarkt_backfill_requests_per_minute", 0)) <= 12
+        or health.get("transfermarkt_current_reserved") is not True
+        or health.get("transfermarkt_backfill_stream_ids") != [
+            f"history-{index}" for index in range(int(health.get("transfermarkt_history_streams", 0)))
+        ]
         or health.get("transfermarkt_backfill_uses_production_daily_budget")
         is not False
         or health.get("transfermarkt_request_permit_consume_required") is not True
@@ -989,7 +1058,10 @@ def strict_cutover_preflight(
         "write_mode": "native-only",
         "active_version": reader.active_version,
         "active_slot": reader.active_slot,
-        "candidate_slot": tm_v2.inactive_slot(reader),
+        "candidate_slot": tm_v2.inactive_slot(reader) if reader.active_slot in {"a", "b"} else "a",
+        "history_stream_ids": [f"history-{index}" for index in range(int(health["transfermarkt_history_streams"]))],
+        "historical_native_authority": True,
+        "current_qualification_sha256": qualification["evidence_sha256"],
         "revision": int(reader.revision),
         "reader_views": views,
         "proxy_control_url": proxy_url,
@@ -1187,47 +1259,37 @@ def claim_and_plan(
     lease_owner: str,
     now: datetime,
     limit: int = MAX_SCOPE_BATCH,
+    standing_policy: Mapping[str, Any] | None = None,
+    stream_id: str | None = None,
+    stream_ids: Sequence[str] = (),
+    blocked_scope_ids: Iterable[str] = (),
+    capture_snapshot_ids: Mapping[str, str] | None = None,
+    scope_writer_pins: Mapping[str, Mapping[str, Any]] | None = None,
+    recovery_probe: bool = False,
 ) -> tuple[state.ClaimResult, tuple[dict[str, Any], ...]]:
     """Claim <=8 durable scopes and produce matching campaign-stable payloads."""
 
     before = tuple(scopes)
-    claim = state.claim_scopes(
-        campaign,
-        before,
-        lease_owner=lease_owner,
-        now=now,
-        limit=limit,
-    )
+    rows = tuple(registry_rows)
+    available = {item.scope_id: item for item in historical_targets_from_registry(rows)}
+    blocked_ids = set(blocked_scope_ids)
+    allowed_ids = {item.target.scope_id for item in before
+                   if item.target.scope_id not in blocked_ids
+                   and item.target.scope_id in available and
+                   _semantic_target_identity(item.target) == _semantic_target_identity(available[item.target.scope_id])}
+    # Admission filtering never rewrites excluded target state or proofs.
+    claim = state.claim_scopes(campaign, before, lease_owner=lease_owner, now=now,
+                               limit=limit, eligible_scope_ids=allowed_ids)
     if claim.batch is None:
         return claim, ()
-    claimed = {
-        item.target.scope_id: item
-        for item in claim.scopes
-        if item.batch_id == claim.batch.batch_id
-        and item.status is state.ScopeStatus.RUNNING
-    }
-    selectors = [
-        {
-            "competition_id": claimed[scope_id].target.competition_id,
-            "edition_id": claimed[scope_id].target.edition_id,
-        }
-        for scope_id in claim.batch.scope_ids
-    ]
-    plan = plan_transfermarkt_scopes(
-        {"scopes": selectors},
-        # The parent ledger is the durable batch budget.  Tying it to the
-        # Airflow run would silently reset that budget after a crash/retry.
-        parent_cycle_id=claim.batch.batch_id,
-        resume_cycle_id=campaign.campaign_id,
-        registry_rows=tuple(registry_rows),
-        max_batch_size=limit,
-        result_root=BACKFILL_RESULT_ROOT,
-        selection_mode="historical_only",
-        now=now,
-    )
-    payloads = tuple(plan.mapped_payloads)
-    if tuple(item["scope_id"] for item in payloads) != claim.batch.scope_ids:
-        raise BackfillRuntimeError("planned payloads differ from the durable claim")
+    capture_snapshots = {scope: (capture_snapshot_ids or {}).get(scope, str(rows[0]["registry_snapshot_id"]))
+                         for scope in claim.batch.scope_ids}
+    batch = replace(claim.batch, recovery_probe=recovery_probe, scope_writer_pins={scope: scope_writer_pins[scope] for scope in claim.batch.scope_ids} if scope_writer_pins else None, scope_registry_snapshot_ids=capture_snapshots, registry_snapshot_id=str(rows[0]["registry_snapshot_id"]),
+                    standing_policy=standing_policy, stream_id=stream_id,
+                    scope_stream_ids={scope: stream_ids[index % len(stream_ids)]
+                                      for index, scope in enumerate(claim.batch.scope_ids)} if stream_ids else None)
+    claim = replace(claim, batch=batch)
+    payloads = plan_existing_batch(campaign, batch, registry_rows=rows, run_id=run_id, now=now)
     return claim, payloads
 
 
@@ -1266,11 +1328,13 @@ def select_recoverable_batch(
         for item in batch_items
         if item.open_platform_incident_id is not None
     }
+    policy_held_ids = {item.batch_id for item in batch_items if item.status is state.BatchStatus.WAITING_POLICY}
     captured_batch_ids = {
         str(item.batch_id)
         for item in scope_items
         if item.status is state.ScopeStatus.CAPTURED_PENDING_DQ
         and item.batch_id is not None
+        and item.batch_id not in policy_held_ids
     }
     candidates = (
         {item.batch_id for item in unfinished} | captured_batch_ids | incident_batch_ids
@@ -1340,31 +1404,57 @@ def plan_existing_batch(
         ]
     except KeyError as exc:
         raise BackfillRuntimeError("batch scope is outside frozen campaign") from exc
-    plan = plan_transfermarkt_scopes(
-        {"scopes": selectors},
-        # Recovery must reuse the same ledger and therefore the same batch
-        # budget even though it happens in a later Airflow DagRun.
-        parent_cycle_id=batch.batch_id,
-        resume_cycle_id=campaign.campaign_id,
-        registry_rows=tuple(registry_rows),
-        max_batch_size=MAX_SCOPE_BATCH,
-        result_root=BACKFILL_RESULT_ROOT,
-        selection_mode="historical_only",
-        now=now,
-    )
-    payloads = tuple(plan.mapped_payloads)
+    rows = tuple(registry_rows)
+    snapshots = batch.scope_registry_snapshot_ids or {
+        scope_id: batch.registry_snapshot_id or campaign.registry_snapshot_id for scope_id in batch.scope_ids}
+    groups = {}
+    for scope_id, selector in zip(batch.scope_ids, selectors, strict=True):
+        groups.setdefault(snapshots[scope_id], []).append(selector)
+    planned = {}
+    for snapshot, group in groups.items():
+        capture_rows = rows if rows and str(rows[0].get('registry_snapshot_id')) == snapshot else read_promoted_registry(registry_snapshot_id=snapshot)
+        plan = plan_transfermarkt_scopes(
+            {"scopes": group}, parent_cycle_id=batch.batch_id,
+            resume_cycle_id=campaign.campaign_id, registry_rows=capture_rows,
+            max_batch_size=MAX_SCOPE_BATCH, result_root=BACKFILL_RESULT_ROOT,
+            selection_mode="historical_only", now=now)
+        planned.update({item['scope_id']: item for item in plan.mapped_payloads})
+    payloads = tuple(planned[scope_id] for scope_id in batch.scope_ids)
     if tuple(item["scope_id"] for item in payloads) != batch.scope_ids:
         raise BackfillRuntimeError("recovery plan differs from durable batch")
     for payload in payloads:
         target = targets[str(payload["scope_id"])]
         if (
-            str(payload.get("registry_snapshot_id")) != campaign.registry_snapshot_id
+            str(payload.get("registry_snapshot_id")) != snapshots[str(payload["scope_id"])]
             or str(payload.get("canonical_competition_id"))
             != target.canonical_competition_id
             or str(payload.get("canonical_season")) != target.canonical_season
         ):
             raise BackfillRuntimeError("recovery payload differs from frozen target")
     return payloads
+
+
+def existing_batch_requires_paid_io(campaign, batch, scopes, attempts, payloads):
+    """Separate immutable local reconciliation from permission to replay HTTP."""
+    from .transfermarkt_backfill_attempts import has_matching_scope_attempt_result
+    scope_by_id = {item.target.scope_id: item for item in scopes}
+    persisted = {item.attempt_id for item in attempts}
+    for payload in payloads:
+        scope = scope_by_id[str(payload['scope_id'])]
+        if scope.status is not state.ScopeStatus.RUNNING:
+            continue
+        expected = state.stable_attempt_id(campaign.campaign_id, scope.target.scope_id,
+                                          scope.attempt_count + 1, claim_generation=scope.claim_generation)
+        if expected in persisted:
+            continue
+        paths = payload['result_paths']
+        if not has_matching_scope_attempt_result(
+                result_base_dir=str(paths['base_dir']), entity_dir=str(paths['entity_staging_dir']),
+                campaign_id=campaign.campaign_id, child_cycle_id=str(payload['child_cycle_id']),
+                scope_id=scope.target.scope_id, batch_id=batch.batch_id,
+                claim_generation=scope.claim_generation, attempt_sequence=scope.attempt_count + 1):
+            return True
+    return False
 
 
 def registry_target_for_scope(

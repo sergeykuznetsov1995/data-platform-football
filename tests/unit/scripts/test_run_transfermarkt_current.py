@@ -1377,3 +1377,87 @@ def test_legacy_retry_sidecar_and_modern_chain_corruption_refused(offline, mutat
     assert report['scopes'][0]['status'] == 'failed'
     assert offline.calls == [] and len(offline.writes) == writes
     assert next(iter(offline.state()['scopes'].values()))['roster_write_intent']
+
+
+def test_season_rollover_captures_old_roster_once_before_history_handoff(offline):
+    offline.run('cold')
+    offline.calls.clear()
+    competition = _competition('GB1')
+    rows = [_joined_row(competition, _edition('GB1', '2026', current=False)),
+            _joined_row(competition, _edition('GB1', '2027', current=True))]
+    report = current.run_current_portion(
+        rows, {'paid_io_allowed': True, 'write_mode': 'dual', 'revision': 1}, 'close',
+        denominator_rows=[{'competition_id': 'GB1', 'live': True, 'competition_class': 'core_club', 'tier': 1}],
+        state_dir=offline.root / 'state', qualification=offline.qualification,
+        max_seconds=2400, max_scopes=1, scraper_factory=offline.factory,
+        roster_writer=offline.roster_writer, career_writer=offline.career_writer, coach_writer=offline.coach_writer,
+        now_fn=lambda: offline.clock.wall, monotonic_fn=lambda: offline.clock.elapsed)
+    assert report['scopes'][0]['kind'] == 'season_close'
+    assert report['scopes'][0].get('historical_handoff') is True
+    from scrapers.transfermarkt.registry import deterministic_scope_id
+    assert report['scopes'][0]['scope_id'] == deterministic_scope_id('GB1', '2026')
+    assert len([url for _, url in offline.calls if '/kader/' in url]) == 2
+    assert not offline.state()['season_closures']
+    assert any("'complete'" in sql and 'transfermarkt_season_close_v1' in sql for sql in offline.sql)
+
+
+@pytest.mark.parametrize('backend_status', ['superseded_partial_write', 'supersession_deferred'])
+def test_season_close_retains_pending_careers_after_terminal_or_deferred_backend(offline, backend_status):
+    from scrapers.transfermarkt.registry import deterministic_scope_id
+
+    offline.run('cold')
+    scope_id = deterministic_scope_id('GB1', '2026')
+    saved = offline.state()
+    data = saved['scopes'][scope_id]
+    original_receipts = json.loads(json.dumps(data['career_receipts']))
+    data['cursor']['resume_json'] = json.dumps({'careers': {'market_value_points': ['110'], 'transfer_events': []}})
+    data['cursor']['cold_complete'] = False
+    offline.write_state(saved)
+    offline.calls.clear()
+    offline.sql.clear()
+    competition = _competition('GB1')
+    rows = [_joined_row(competition, _edition('GB1', '2026', current=False)),
+            _joined_row(competition, _edition('GB1', '2027', current=True))]
+    calls = []
+
+    def uncompleted(scraper, endpoint, ids, *_args, **_kwargs):
+        calls.append((endpoint, list(ids)))
+        return {'status': backend_status, 'verified': False, 'intent_sha256': 'a' * 64,
+                'retired_player_ids': list(ids),
+                'signal_generations': dict(scraper._current_career_signal_generations),
+                'career_window': {'requested_player_ids': list(ids),
+                                  'processed_player_ids': [], 'deferred_player_ids': list(ids)}}
+
+    def close(cycle_id, writer):
+        return current.run_current_portion(
+            rows, {'paid_io_allowed': True, 'write_mode': 'dual', 'revision': 1}, cycle_id,
+            denominator_rows=[{'competition_id': 'GB1', 'live': True, 'competition_class': 'core_club', 'tier': 1}],
+            state_dir=offline.root / 'state', qualification=offline.qualification,
+            max_seconds=2400, max_scopes=1, scraper_factory=offline.factory,
+            roster_writer=offline.roster_writer, career_writer=writer, coach_writer=offline.coach_writer,
+            now_fn=lambda: offline.clock.wall, monotonic_fn=lambda: offline.clock.elapsed)
+
+    pending = close('close-uncompleted', uncompleted)['scopes'][0]
+    assert pending['kind'] == 'season_close' and pending['status'] == 'pending'
+    assert pending.get('historical_handoff') is not True
+    assert calls == [('market_value_points', ['110'])]
+    state = offline.state()
+    data = state['scopes'][scope_id]
+    assert scope_id in state['season_closures']
+    assert json.loads(data['cursor']['resume_json'])['careers']['market_value_points'] == ['110']
+    assert data['cursor']['cold_complete'] is False
+    assert data['career_receipts'] == original_receipts
+    assert not data.get('season_close_handed_off_at')
+    assert any("'pending' status," in sql and 'transfermarkt_season_close_v1' in sql for sql in offline.sql)
+    assert not any("'complete' status," in sql and 'transfermarkt_season_close_v1' in sql for sql in offline.sql)
+    assert not any('/ceapi/' in url for _, url in offline.calls)
+    assert data['season_close_roster_captured'] is True
+
+    # A later complete job can finish the pending careers and hand off the
+    # original final roster; the terminal/deferred result itself never does.
+    offline.calls.clear()
+    finished = close('close-completed', offline.career_writer)['scopes'][0]
+    assert finished['historical_handoff'] is True
+    assert not offline.state()['season_closures']
+    assert not any('/kader/' in url for _, url in offline.calls)
+    assert any("'complete' status," in sql and 'transfermarkt_season_close_v1' in sql for sql in offline.sql)

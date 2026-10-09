@@ -89,6 +89,24 @@ done
 [ -f "$TRANSFERMARKT_PROXY_POOL_FILE" ] && [ -s "$TRANSFERMARKT_PROXY_POOL_FILE" ] \
   || { echo "файл пула шлюза пуст или отсутствует: $TRANSFERMARKT_PROXY_POOL_FILE" >&2; exit 2; }
 
+# Validate the isolated history contour BEFORE stopping any service. Secret JSON
+# enters only the compose process environment, never the deployment log.
+HISTORY_POOL_JSON=""
+if [ "${TM_HISTORY_STREAMS:-0}" != 0 ] || [ -n "${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}" ]; then
+  backfill_token="${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}"
+  [ "${#backfill_token}" -ge 32 ] \
+    || { echo "history requires its separate control token" >&2; exit 2; }
+  [ "$backfill_token" != "${TM_PROXY_CONTROL_TOKEN:-}" ] \
+    || { echo "history and current control tokens must differ" >&2; exit 2; }
+  [ -n "${TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE:-}" ] \
+    && [ -f "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE" ] \
+    && [ -s "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE" ] \
+    || { echo "history requires its separate proxy pool file" >&2; exit 2; }
+  PYTHONPATH="$RELEASE" python3 -m scrapers.transfermarkt.history_pool \
+    "$TRANSFERMARKT_PROXY_POOL_FILE" "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE" || exit 2
+  HISTORY_POOL_JSON=$(cat "$TRANSFERMARKT_BACKFILL_PROXY_POOL_FILE")
+fi
+
 STEP="lock"
 transfermarkt_deploy_lock_init || exit 2
 if [ -n "${TRANSFERMARKT_DEPLOY_LOCK_FD:-}" ]; then
@@ -166,6 +184,7 @@ STEP="gateway-up"
 # Пул Decodo — только в окружение процесса compose: не в лог и не в env-файл.
 TRANSFERMARKT_RELEASE_ROOT="$RELEASE" \
 TRANSFERMARKT_PROXY_POOL_JSON="$(cat "$TRANSFERMARKT_PROXY_POOL_FILE")" \
+TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON="$HISTORY_POOL_JSON" \
 docker compose -p transfermarkt-gw -f "$GW_COMPOSE" --project-directory "$RELEASE" \
   --env-file "$TRANSFERMARKT_PLATFORM_ENV_FILE" --env-file "$ENV_FILE" \
   up -d --no-deps --force-recreate "$GW" >> "$LOG" 2>&1 8>&- || { log "gateway up failed"; exit 5; }
