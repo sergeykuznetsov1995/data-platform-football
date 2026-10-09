@@ -136,8 +136,14 @@ CAREER_SAFETY_OPS_TABLES = frozenset({
     'iceberg.ops.transfermarkt_career_snapshot_anchors_v1',
     'iceberg.ops.transfermarkt_proxy_ledger_events_v1',
 })
+SEASON_HANDOFF_OPS_TABLES = frozenset({'iceberg.ops.transfermarkt_season_close_v1'})
+SEASON_HANDOFF_POLICY_VERSIONS = {
+    'dag_ingest_transfermarkt': (3, 4),
+    'dag_backfill_transfermarkt': (1, 2),
+}
 OPS_WRITE_TABLES = {
     *CAREER_SAFETY_OPS_TABLES,
+    *SEASON_HANDOFF_OPS_TABLES,
     'iceberg.ops.transfermarkt_fetch_state',
     'iceberg.ops.proxy_traffic_runs',
     PROXY_LEDGER_TABLE,
@@ -640,21 +646,38 @@ def validate_standing_policy_for_scope_cycle(
         raise ScopeCycleError(f'standing policy omits write tables: {missing}')
 
 
-def standing_policy_hash_compatible(policy, pinned_hash):
-    """Preserve an approved paid prefix for this exact additive ops migration.
+def standing_policy_for_hash(policy, pinned_hash):
+    """Resolve only an exact original body for the known additive ops migrations.
 
-    Approval dates, version, caps, concurrency and every Bronze permission stay
+    Approval dates, caps, concurrency and every Bronze permission stay
     byte-for-byte bound to the old hash. The current policy must authorize all
-    three safety tables; only their omission from the original body is allowed.
+    safety tables. Only the career safety tables, season handoff table, or their
+    union may have been absent from the original body.
     """
     if policy.policy_hash == pinned_hash:
-        return True
+        return policy
     if not CAREER_SAFETY_OPS_TABLES <= set(getattr(policy, 'allowed_write_tables', ())):
-        return False
+        return None
     from dataclasses import replace
-    original = replace(policy, allowed_write_tables=tuple(
-        table for table in policy.allowed_write_tables if table not in CAREER_SAFETY_OPS_TABLES))
-    return original.policy_hash == pinned_hash
+    for additions in (CAREER_SAFETY_OPS_TABLES, SEASON_HANDOFF_OPS_TABLES,
+                      CAREER_SAFETY_OPS_TABLES | SEASON_HANDOFF_OPS_TABLES):
+        if not additions <= set(policy.allowed_write_tables):
+            continue
+        original = replace(policy, allowed_write_tables=tuple(
+            table for table in policy.allowed_write_tables if table not in additions))
+        if original.policy_hash == pinned_hash:
+            return original
+        versions = SEASON_HANDOFF_POLICY_VERSIONS.get(policy.dag_id)
+        if (SEASON_HANDOFF_OPS_TABLES <= additions and versions
+                and policy.policy_version == versions[1]):
+            original = replace(original, policy_version=versions[0])
+            if original.policy_hash == pinned_hash:
+                return original
+    return None
+
+
+def standing_policy_hash_compatible(policy, pinned_hash):
+    return standing_policy_for_hash(policy, pinned_hash) is not None
 
 
 def _enforce_standing_policy(
@@ -673,23 +696,24 @@ def _enforce_standing_policy(
     expected_hash = _required(
         args.standing_policy_sha256, 'standing_policy_sha256',
     )
-    historical_bound = False
+    authorization_policy = policy
+    permission_policy = policy
     if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt' and os.environ.get('TM_BACKFILL_BATCH_POLICY_JSON'):
         from utils.transfermarkt_history_authority import validate_batch_policy
         bound = StandingPolicy(**json.loads(os.environ['TM_BACKFILL_BATCH_POLICY_JSON']))
-        validate_batch_policy(bound, policy, write_mode=args.write_mode,
+        permission_policy = validate_batch_policy(bound, policy, write_mode=args.write_mode,
                               cycle_budget_bytes=int(args.cycle_budget_bytes),
                               request_limit=int(args.request_limit), retry_limit=int(args.retry_limit))
-        policy = bound
-        historical_bound = True
+        authorization_policy = bound
+    else:
+        authorization_policy = standing_policy_for_hash(policy, expected_hash)
 
-    if (policy.policy_hash != expected_hash if historical_bound
-            else not standing_policy_hash_compatible(policy, expected_hash)):
+    if authorization_policy is None or authorization_policy.policy_hash != expected_hash:
         raise ApprovalDriftError(
             'standing policy content differs from the pinned sha256'
         )
     validate_standing_policy_for_scope_cycle(
-        policy,
+        permission_policy,
         write_mode=args.write_mode,
         cycle_budget_bytes=int(args.cycle_budget_bytes),
         request_limit=int(args.request_limit),
@@ -700,9 +724,9 @@ def _enforce_standing_policy(
         ),
     )
     grant = PolicyGrant(
-        packet_id=f'standing-policy-v{policy.policy_version}',
+        packet_id=f'standing-policy-v{authorization_policy.policy_version}',
         packet_hash=expected_hash,
-        policy_version=int(policy.policy_version),
+        policy_version=int(authorization_policy.policy_version),
     )
     return {'paid_proxy': grant, 'production_write': grant}
 

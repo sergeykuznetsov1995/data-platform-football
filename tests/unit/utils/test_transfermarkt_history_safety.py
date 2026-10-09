@@ -32,12 +32,14 @@ def claim():
     return policy, campaign, result.scopes[0], batch
 
 
-def test_transport_incidents_do_not_consume_terminal_source_budget():
+@pytest.mark.parametrize('outcome', [state.AttemptOutcome.TRANSPORT_ERROR, state.AttemptOutcome.CONTINUATION])
+def test_transport_incidents_do_not_consume_terminal_source_budget(outcome):
     _, campaign, scope, batch = claim()
     for index in range(5):
         attempt = state.BackfillAttempt.build(scope=scope, batch_id=scope.batch_id,
-            outcome=state.AttemptOutcome.TRANSPORT_ERROR, started_at=NOW, finished_at=NOW + timedelta(minutes=index),
-            source_observed_at=NOW, raw_evidence_ids=['a' * 64], error_class='transport_timeout')
+            outcome=outcome, started_at=NOW, finished_at=NOW + timedelta(minutes=index),
+            source_observed_at=NOW, raw_evidence_ids=['a' * 64],
+            error_class='transport_timeout' if outcome is state.AttemptOutcome.TRANSPORT_ERROR else None)
         scope = state.apply_attempt(scope, attempt)
         assert scope.status is state.ScopeStatus.RETRYABLE_ERROR
         assert scope.source_attempt_count == scope.source_error_count == 0
@@ -210,6 +212,7 @@ def test_expired_unfinished_batch_stays_visible_while_other_entries_run():
 
 @pytest.mark.parametrize('transport,status,outcome,error_class,expected', [
     (False,200,state.AttemptOutcome.CAPTURED,None,True),
+    (False,200,state.AttemptOutcome.CONTINUATION,None,True),
     (False,503,state.AttemptOutcome.SOURCE_ERROR,'http_503',True),
     (False,200,state.AttemptOutcome.SOURCE_ERROR,'http_200',False),
     (True,None,state.AttemptOutcome.TRANSPORT_ERROR,'transport_timeout',False),
@@ -287,3 +290,92 @@ def test_empty_native_manifest_rechecks_historical_authority_before_ops_write(mo
     results={'outputs':{'market_value_points':{'table':'iceberg.bronze.transfermarkt_market_value_points'}}}
     with pytest.raises(ValueError,match='revoked'):
         runner._persist_native_write_manifest(Scraper(),spec,{},results,'original-child','TM-GB1',2025,7)
+
+
+@pytest.mark.parametrize('migration', ['career', 'season', 'both'])
+def test_additive_ops_migration_keeps_exact_original_grants_and_restrictions(migration):
+    from dags.scripts.run_transfermarkt_scope_cycle import (
+        CAREER_SAFETY_OPS_TABLES, SEASON_HANDOFF_OPS_TABLES,
+        standing_policy_for_hash, standing_policy_hash_compatible,
+    )
+    current = load_standing_policy(POLICY_PATH)
+    additions = {'career': CAREER_SAFETY_OPS_TABLES, 'season': SEASON_HANDOFF_OPS_TABLES,
+                 'both': CAREER_SAFETY_OPS_TABLES | SEASON_HANDOFF_OPS_TABLES}[migration]
+    original = replace(current, allowed_write_tables=tuple(
+        table for table in current.allowed_write_tables if table not in additions))
+    kwargs = dict(write_mode='native-only', cycle_budget_bytes=SCOPE_HARD_PROVIDER_BYTE_CAP,
+                  request_limit=SCOPE_REQUEST_LIMIT, retry_limit=SCOPE_RETRY_LIMIT, now=NOW)
+    assert standing_policy_for_hash(current, original.policy_hash) == original
+    assert validate_batch_policy(original, current, **kwargs) == current
+    assert original.policy_hash != current.policy_hash
+    restricted = replace(current, allowed_write_tables=tuple(
+        table for table in current.allowed_write_tables if table != 'iceberg.bronze.transfermarkt_transfer_events'))
+    assert not standing_policy_hash_compatible(restricted, original.policy_hash)
+    with pytest.raises(Exception, match='omits write tables'):
+        validate_batch_policy(original, restricted, **kwargs)
+    assert not standing_policy_hash_compatible(replace(current, expires_at=current.expires_at + timedelta(days=1)), original.policy_hash)
+    with pytest.raises(Exception, match='expired'):
+        validate_batch_policy(replace(original, expires_at=NOW), current, **kwargs)
+
+
+def test_historical_sql_mutation_rechecks_authority_before_cursor(monkeypatch):
+    from dags.scripts import run_transfermarkt_scraper as runner
+    monkeypatch.setenv('TM_DAG_ID', 'dag_backfill_transfermarkt')
+    monkeypatch.setenv('TM_READER_REVISION', '7')
+    def denied(*_):
+        raise ValueError('historical claim revoked')
+    monkeypatch.setattr(runner, '_authorize_write_mode', denied)
+    connection = SimpleNamespace(cursor=lambda: pytest.fail('no cursor after revoked authority'))
+    with pytest.raises(ValueError, match='revoked'):
+        runner._execute_cursor(connection, 'MERGE INTO iceberg.ops.transfermarkt_fetch_state USING data ON true WHEN NOT MATCHED THEN INSERT VALUES (1)')
+
+
+def test_historical_frame_authority_rechecks_after_waiting_for_writer_lock(monkeypatch):
+    from contextlib import contextmanager
+    from dags.scripts import run_transfermarkt_scraper as runner
+    monkeypatch.setenv('TM_DAG_ID', 'dag_backfill_transfermarkt')
+    events = []
+    @contextmanager
+    def acquired():
+        events.append('lock_acquired')
+        yield
+    def denied(*_):
+        events.append('authority_checked')
+        raise ValueError('historical claim expired while waiting')
+    monkeypatch.setattr(runner, 'writer_lock', acquired)
+    monkeypatch.setattr(runner, '_authorize_write_mode', denied)
+    with pytest.raises(ValueError, match='expired while waiting'):
+        runner._save_frames(SimpleNamespace(), SimpleNamespace(outputs=()), {}, False, {})
+    assert events == ['lock_acquired', 'authority_checked']
+
+
+@pytest.mark.parametrize('dag_id,filename,original_version,write_mode', [
+    ('dag_ingest_transfermarkt', 'standing_approval_policy.json', 3, 'dual'),
+    ('dag_backfill_transfermarkt', 'standing_backfill_policy.json', 1, 'native-only'),
+])
+def test_known_handoff_version_migration_preserves_original_grant(monkeypatch, dag_id, filename, original_version, write_mode):
+    from dags.scripts import run_transfermarkt_scope_cycle as cycle
+    path = POLICY_PATH.with_name(filename)
+    current = load_standing_policy(path)
+    original = replace(current, policy_version=original_version, allowed_write_tables=tuple(
+        table for table in current.allowed_write_tables if table not in cycle.SEASON_HANDOFF_OPS_TABLES))
+    assert cycle.standing_policy_for_hash(current, original.policy_hash) == original
+    monkeypatch.setenv('TM_DAG_ID', dag_id)
+    monkeypatch.setenv(cycle.STANDING_POLICY_ENV_GATE, 'true')
+    monkeypatch.delenv('TM_BACKFILL_BATCH_POLICY_JSON', raising=False)
+    args = SimpleNamespace(standing_policy=str(path), standing_policy_sha256=original.policy_hash,
+        write_mode=write_mode, cycle_budget_bytes=SCOPE_HARD_PROVIDER_BYTE_CAP,
+        request_limit=SCOPE_REQUEST_LIMIT, retry_limit=SCOPE_RETRY_LIMIT)
+    grant = cycle._enforce_standing_policy(args)['paid_proxy']
+    assert grant.packet_hash == original.policy_hash
+    assert grant.policy_version == original_version
+    assert grant.packet_id == f'standing-policy-v{original_version}'
+    for changed in (
+        replace(current, policy_version=current.policy_version + 1),
+        replace(current, expires_at=current.expires_at + timedelta(days=1)),
+        replace(current, allowed_write_tables=current.allowed_write_tables + ('iceberg.ops.unrelated_permission',)),
+        replace(current, allowed_write_tables=tuple(table for table in current.allowed_write_tables
+                                                  if table != 'iceberg.bronze.transfermarkt_transfer_events')),
+    ):
+        assert not cycle.standing_policy_hash_compatible(changed, original.policy_hash)
+    assert not cycle.standing_policy_hash_compatible(current, replace(original, policy_version=original_version + 2).policy_hash)

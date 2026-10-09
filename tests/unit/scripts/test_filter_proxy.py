@@ -10443,6 +10443,49 @@ def test_transfermarkt_history_stays_disabled_even_if_token_configured(shared_mo
     assert mgr.calls == 0
 
 
+def test_transfermarkt_history_dead_exit_does_not_degrade_reserved_current(shared_mod, monkeypatch):
+    monkeypatch.setattr(shared_mod, 'SOURCE_MODE', shared_mod.TRANSFERMARKT_ONLY_SOURCE_MODE)
+    current = _FakeManager(['http://u:p@current.invalid:10000'])
+    history = _FakeManager(['http://u:p@history.invalid:10001'])
+    monkeypatch.setattr(shared_mod, 'TRANSFERMARKT_BACKFILL_PROXY_MANAGER', history)
+    shared_mod._mark_exit_dead(('history.invalid', 10001, 'u', 'p'),
+                               lease=SimpleNamespace(source='transfermarkt_backfill'))
+    health = shared_mod._service_health_report(current)
+    assert health['live_exit_count'] == 1
+    assert health['dead_exit_count'] == 0
+    assert health['exit_pool_status'] == 'ok'
+    assert shared_mod._dead_exit_count() == 1
+    with pytest.raises(RuntimeError, match='unoccupied live'):
+        shared_mod._pick_transfermarkt_upstream(history)
+    assert shared_mod._pick_transfermarkt_upstream(current)[1] == 10000
+
+
+@pytest.mark.parametrize('lease', [None, SimpleNamespace(source='transfermarkt')])
+def test_transfermarkt_current_dead_exit_still_degrades_current_and_expires(shared_mod, monkeypatch, lease):
+    monkeypatch.setattr(shared_mod, 'SOURCE_MODE', shared_mod.TRANSFERMARKT_ONLY_SOURCE_MODE)
+    clock = [10.0]
+    monkeypatch.setattr(shared_mod.time, 'monotonic', lambda: clock[0])
+    current = _FakeManager(['http://u:p@current.invalid:10000'])
+    shared_mod._mark_exit_dead(('current.invalid', 10000, 'u', 'p'), lease=lease)
+    health = shared_mod._service_health_report(current)
+    assert health['live_exit_count'] == 0 and health['dead_exit_count'] == 1
+    assert health['exit_pool_status'] == 'degraded'
+    clock[0] += shared_mod.DEAD_EXIT_TTL_SECONDS
+    assert shared_mod._service_health_report(current)['live_exit_count'] == 1
+    assert shared_mod.DEAD_EXITS == {}
+    assert shared_mod.DEAD_EXIT_SOURCES == {}
+
+
+def test_shared_dead_exit_health_retains_existing_global_contract(shared_mod, monkeypatch):
+    monkeypatch.setattr(shared_mod, 'SOURCE_MODE', 'shared-no-whoscored')
+    current = _FakeManager(['http://u:p@current.invalid:10000'])
+    shared_mod._mark_exit_dead(('history.invalid', 10001, 'u', 'p'),
+                               lease=SimpleNamespace(source='transfermarkt_backfill'))
+    assert shared_mod._dead_exit_count() == 0
+    shared_mod._mark_exit_dead(('another.invalid', 10002, 'u', 'p'))
+    assert shared_mod._service_health_report(current)['live_exit_count'] == 0
+
+
 def test_transfermarkt_rate_file_remains_readable_by_legacy_gateway(shared_mod, tmp_path):
     from scrapers.transfermarkt.streams import TransfermarktStreams
     clock = [0.0]

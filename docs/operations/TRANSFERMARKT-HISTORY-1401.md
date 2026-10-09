@@ -27,6 +27,12 @@ streams и durable gateway permits. Preflight проверяет существ�
 
 Batch хранит registry для решения о допуске, содержимое standing policy,
 `scope_registry_snapshot_ids`, `scope_writer_pins` и `scope_stream_ids`.
+Совместимость ранее оплаченного prefix допускает только точное восстановление
+исходного body hash при добавлении трёх career safety ops tables, season-close
+table либо их объединения. Известный шаг версии для season-close — current3→4
+и history1→2; произвольный скачок версии не принимается. Даты, все caps и
+Bronze-права остаются исходными. Grant сохраняет прежние hash и policy_version,
+а новые служебные записи требует разрешить действующая policy.
 Продолжающийся scope сохраняет исходный registry, child cycle, пути checkpoint,
 revision/slot исходного capture. Новый registry не делает старый raw свежим.
 Новая партия получает текущую policy. Replay прежней партии проверяет её исходную
@@ -63,6 +69,11 @@ HTTP попыткой вместе с retries**. Успешный неполны
 проверенному HTTP raw envelope; cached raw, missing/schema evidence не принимаются.
 Повторный транспортный отказ или неверный probe снова дают пятнадцать минут паузы.
 Source 403/429/challenge сохраняют собственную gateway slowdown policy #1398.
+
+Health выделенного шлюза считает мёртвые exits current-пула отдельно от
+history-пула. Отказ history не ухудшает current health. Общий список мёртвых
+exits продолжает исключать их из выбора upstream; истечение TTL очищает и
+счётчик, и отметку полосы. Health общего шлюза сохраняет прежнее поведение.
 
 Приёмка остаётся отдельной: квалификация #1393 и фактические 100% live current
 изданий три дня, ≥99% изменений за24ч; затем разрешённый запуск трёх исторических

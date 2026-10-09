@@ -17,16 +17,21 @@ BACKFILL_DAG_ID = 'dag_backfill_transfermarkt'
 def validate_batch_policy(bound, current, *, write_mode, cycle_budget_bytes,
                           request_limit, retry_limit, now=None):
     """An old batch cannot use expired or more permissive replay privileges."""
-    from dags.scripts.run_transfermarkt_scope_cycle import validate_standing_policy_for_scope_cycle
+    from dags.scripts.run_transfermarkt_scope_cycle import (
+        standing_policy_hash_compatible, validate_standing_policy_for_scope_cycle,
+    )
     instant = now or datetime.now(timezone.utc)
+    additive_ops = (bound.policy_hash != current.policy_hash
+                    and standing_policy_hash_compatible(current, bound.policy_hash))
     for policy in (bound, current):
         policy.assert_not_expired(instant)
         validate_standing_policy_for_scope_cycle(
-            policy, write_mode=write_mode, cycle_budget_bytes=cycle_budget_bytes,
+            current if additive_ops else policy, write_mode=write_mode, cycle_budget_bytes=cycle_budget_bytes,
             request_limit=request_limit, retry_limit=retry_limit,
             expected_dag_id=BACKFILL_DAG_ID)
-    if bound.policy_hash != current.policy_hash and current.policy_version <= bound.policy_version:
+    if bound.policy_hash != current.policy_hash and not additive_ops and current.policy_version <= bound.policy_version:
         raise ValueError('changed historical policy must advance policy_version')
+    return current if additive_ops else bound
 
 
 def authorize_historical_writer(repository, *, environment, write_mode, now=None):
@@ -82,6 +87,9 @@ def authorize_historical_writer(repository, *, environment, write_mode, now=None
     current = load_standing_policy(environment['TM_STANDING_POLICY_PATH'])
     bound = StandingPolicy(**batch.standing_policy) if batch.standing_policy else current
     expected = batch.policy_sha256 or campaign.policy_sha256
+    if batch.standing_policy is None and bound.policy_hash != expected:
+        from dags.scripts.run_transfermarkt_scope_cycle import standing_policy_for_hash
+        bound = standing_policy_for_hash(current, expected) or current
     if bound.policy_hash != expected or environment['TM_STANDING_POLICY_SHA256'] != expected:
         raise ValueError('historical batch policy proof drifted')
     validate_batch_policy(bound, current, write_mode=write_mode,

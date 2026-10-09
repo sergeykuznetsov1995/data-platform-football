@@ -487,7 +487,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
                 needs_paid = existing_batch_requires_paid_io(campaign, batch, scopes, attempts, payloads)
                 if needs_paid:
                     try:
-                        if batch.standing_policy is None and campaign.policy_sha256 != policy.policy_hash:
+                        if batch.standing_policy is None and not _compatible_backfill_policy(policy, batch.policy_sha256 or campaign.policy_sha256):
                             raise BackfillRuntimeError("legacy batch requires its original standing policy for replay")
                         bound_policy = StandingPolicy(**batch.standing_policy) if batch.standing_policy else policy
                         validate_batch_policy(bound_policy, policy, write_mode="native-only",

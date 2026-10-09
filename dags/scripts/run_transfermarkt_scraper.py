@@ -20,6 +20,7 @@ import json
 import logging
 import numbers
 import os
+from contextlib import nullcontext
 from functools import wraps
 import re
 import sys
@@ -677,18 +678,22 @@ def _fallback_exit_code(reason: str) -> int:
 
 
 def _execute_cursor(conn, sql: str, params: Sequence[Any] = (), fetch=False):
-    cur = conn.cursor()
-    try:
-        committed = execute_statement(cur, sql, tuple(params))
-        # Trino executes lazily; closing an unconsumed DDL/DML cursor cancels it
-        # as USER_CANCELED. Always drain the result stream before close.
-        rows = committed if is_mutation(sql) else cur.fetchall()
-        return rows if fetch else None
-    finally:
+    historical_mutation = is_mutation(sql) and os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt'
+    with writer_lock() if historical_mutation else nullcontext():
+        if historical_mutation:
+            _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
+        cur = conn.cursor()
         try:
-            cur.close()
-        except Exception:  # noqa: BLE001
-            pass
+            committed = execute_statement(cur, sql, tuple(params))
+            # Trino executes lazily; closing an unconsumed DDL/DML cursor cancels it
+            # as USER_CANCELED. Always drain the result stream before close.
+            rows = committed if is_mutation(sql) else cur.fetchall()
+            return rows if fetch else None
+        finally:
+            try:
+                cur.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _ensure_fetch_state(conn) -> None:
@@ -2434,9 +2439,9 @@ def _save_frames(
     force_replace: bool,
     results: Dict[str, Any],
 ) -> None:
-    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
-        _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
     with writer_lock():
+        if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+            _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
         path = getattr(scraper, '_tm_career_intent_path', None)
         if path is not None:
             from scrapers.transfermarkt.write_intents import snapshot_anchors
@@ -2548,6 +2553,8 @@ def _reconcile_native_career_intent(scraper, spec, mode, revision, league, seaso
     evidence = payload['evidence']
     if evidence['mode'] != mode or evidence['revision'] != revision:
         raise RuntimeError('career reconciliation requires original writer authority')
+    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+        _authorize_write_mode('native-only', int(revision))
     frames = unpack_frames(payload['frames'])
     scraper._tm_career_intent_path = path
     scraper._tm_empty_capture_times = evidence.get('captured_at_by_id', {})
@@ -2556,6 +2563,8 @@ def _reconcile_native_career_intent(scraper, spec, mode, revision, league, seaso
     results.update(evidence['results'])
     results['reconciliation_cache_sources'] = evidence.get('raw_attempts', []) + evidence.get('cache_sources', [])
     with writer_lock():
+        if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+            _authorize_write_mode('native-only', int(revision))
         from scrapers.transfermarkt.career_refs import retained_bundle_snapshots, recover_bundle_snapshots
         connection = scraper._bronze_connection()
         try:
@@ -2718,6 +2727,8 @@ def _delete_valid_empty_rows(
     from pathlib import Path
     if not source_ids:
         return {}
+    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+        _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
     if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
         from types import SimpleNamespace
         import pandas as pd
@@ -2742,8 +2753,6 @@ def _delete_valid_empty_rows(
         for source_id in source_ids
     )
     season_short = _canonical_scope_season(league, season)
-    if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
-        _authorize_write_mode('native-only', int(os.environ.get('TM_READER_REVISION', '0')))
     conn = scraper._bronze_connection()
     committed = {}
     source_key = source_key or spec.id_column
@@ -4102,6 +4111,8 @@ def _run_entity_unbounded(
                                     checkpoint_ids=selected, state_rows=rows, captured_at_by_id=scraper._tm_empty_capture_times,
                                     raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()))
                                 scraper._tm_career_intent_path = career_intent_path
+                                if os.environ.get('TM_DAG_ID') == 'dag_backfill_transfermarkt':
+                                    _authorize_write_mode('native-only', int(expected_reader_revision))
                                 connection = scraper._bronze_connection()
                                 try:
                                     snapshot_anchors(career_intent_path, connection, write_spec.outputs,

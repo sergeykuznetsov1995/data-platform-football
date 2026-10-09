@@ -24,7 +24,7 @@ SHARED_FILTER_SHA256 = (
     # Refresh the merged baseline after 81bea4ce (#1392, tmapi host) and
     # 1f933229 (#1388, provider CONNECT refusals); shared runtime unchanged here.
     # #1398: dedicated TM stream controller; shared mode keeps its old path.
-    "912fbb0363411402a4df4aea54e8160e56733ebcb23bd78f4c8d12249ece0fd6"
+    "440aac037c1c741e4617a85c4328f3f2649616e7e2ed246cb1e807bc11ec0871"
 )
 
 
