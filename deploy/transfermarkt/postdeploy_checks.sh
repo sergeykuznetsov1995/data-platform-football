@@ -96,9 +96,10 @@ running=$($PSQL "SELECT count(*) FROM dag_run WHERE state='running';")
 echo "  running-прогонов: $running"
 
 echo "== 4. Пулы =="
-for p in ingest_scraper_pool transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control; do
+for p in transfermarkt_control transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control; do
   s=$($PSQL "SELECT slots FROM slot_pool WHERE pool='$p';")
-  [ "$s" = 1 ] && ok "$p = 1" || fail "$p = '$s' (ожидалось 1)"
+  want=$(timeout -k 5 30 docker exec "$SCHED" python -m scrapers.transfermarkt.airflow_pools --get "$p")
+  [ -n "$want" ] && [ "$s" = "$want" ] && ok "$p = $want" || fail "$p = '$s' (ожидалось $want)"
 done
 
 echo "== 5. Состояние вне дерева =="

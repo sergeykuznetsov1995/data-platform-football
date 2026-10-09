@@ -1060,7 +1060,7 @@ def _publish_registry(
 
 with DAG(
     dag_id=DAG_ID,
-    default_args=SCRAPER_ARGS,
+    default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
     description="Proxy-only Transfermarkt registry discovery and strict CAS promotion",
     # Daily at 18:00 UTC (21:00 MSK): after the ingest day (≈15–18 MSK) and
     # well before the nightly auto-delivery (≈04 MSK).  The run is "daily"

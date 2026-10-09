@@ -164,3 +164,67 @@ def test_batch_report_preserves_errors_and_fails_gate(monkeypatch):
     assert report.passed is False
     assert report.bronze_checks[0]['kind'] == 'lineage'
     assert report.as_dict()['report_hash'] == report.report_hash
+
+
+def test_history_dq_reads_original_career_snapshots_after_current_replacement():
+    old = ['1', '2020-01-01', 100, 'Old club', 20, 'EUR100']
+    new = ['2', '2020-01-01', 200, 'Other club', 21, 'EUR200']
+    receipts = []
+    for snapshot, row in ((10, old), (20, new)):
+        receipts.append({'snapshot_id': snapshot, 'player_ids': [row[0]],
+            'physical_refs': [[row[0], f'original-{snapshot}', 1]],
+            'row_count': 1, 'key_hash': dq._fingerprint_rows([row])[1],
+            'scope_id': 'historical-scope', 'cycle_id': 'historical-cycle',
+            'result_sha256': 'a' * 64})
+    class Cursor:
+        def __init__(self):
+            self.sql = []
+        def execute(self, sql):
+            self.sql.append(sql)
+        def fetchall(self):
+            if 'FOR VERSION AS OF 10 ' in self.sql[-1]:
+                return [old]
+            if 'FOR VERSION AS OF 20 ' in self.sql[-1]:
+                return [new]
+            # Current replacement changed player1 and removed its old cycle.
+            return [['1', '2026-10-10', 999, 'Current club', 26, 'EUR999']]
+    manifest = SimpleNamespace(scope_id='historical-scope', child_cycle_id='historical-cycle',
+        entities=[SimpleNamespace(entity='market_value_points', dedup_rows=2,
+                  key_hash=dq._fingerprint_rows([old, new])[1])],
+        dq_evidence={'historical_career_receipts': {'market_value_points': receipts}})
+    cur = Cursor()
+    result = dq.verify_manifest_entity_fingerprints(cur,
+        pins={table: 99 for table in dq.BACKFILL_PIN_TABLES}, manifests=[manifest])
+    assert result['row_count'] == 2
+    assert len(cur.sql) == 2
+    assert all('FOR VERSION AS OF 99' not in sql for sql in cur.sql)
+    assert "_batch_id = 'original-10'" in cur.sql[0]
+    assert 'cycle_id =' not in cur.sql[0]
+
+
+def test_history_original_snapshot_raw_lineage_is_checked_after_current_replacement():
+    body = b'original full career'
+    capture_id = 'b' * 64
+    body_hash = hashlib.sha256(body).hexdigest()
+    receipt = {'snapshot_id': 10, 'player_ids': ['1'], 'row_count': 1,
+        'physical_refs': [['1', 'original-10', 1]],
+        'key_hash': 'a' * 64, 'scope_id': 'historical-scope',
+        'cycle_id': 'historical-cycle', 'result_sha256': 'c' * 64}
+    class Cursor:
+        def __init__(self):
+            self.sql = []
+        def execute(self, sql):
+            self.sql.append(sql)
+        def fetchall(self):
+            return [(capture_id, body_hash, 'historical-scope', 'historical-cycle', '1', 'original-10')] if 'FOR VERSION AS OF 10 ' in self.sql[-1] else []
+    cur = Cursor()
+    result = dq.verify_raw_lineage(cur,
+        pins={table: 99 for table in dq.BACKFILL_PIN_TABLES},
+        child_cycle_ids=['historical-cycle'], raw_store=_RawStore(capture_id, body),
+        attempt_envelopes=[SimpleNamespace(outcome_kind='response', capture_id=capture_id,
+             scope_id='historical-scope', cycle_id='historical-cycle')],
+        manifest_scope_cycles=[('historical-scope', 'historical-cycle')],
+        scope_statuses={'historical-scope': 'complete'},
+        manifests=[SimpleNamespace(dq_evidence={'historical_career_receipts': {'market_value_points': [receipt]}})])
+    assert result['capture_count'] == 1
+    assert any('FOR VERSION AS OF 10 ' in sql for sql in cur.sql)

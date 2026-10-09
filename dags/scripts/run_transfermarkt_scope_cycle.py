@@ -75,6 +75,7 @@ from scrapers.transfermarkt.registry import (
 )
 from scrapers.transfermarkt.raw_store import RawResponseStore
 from scrapers.transfermarkt.season import saison_id_to_season
+from scrapers.transfermarkt import history_portion
 
 
 MIB = 1024 * 1024
@@ -1079,6 +1080,16 @@ def _traffic_metrics(
             f'{run.parser_entity} provider traffic exceeds its grant ledger'
         )
     metrics['duration_ms'] = int(run.wall_clock_duration_ms)
+    for item in result.get('history_portions', ()):
+        path = Path(item['result_path'])
+        if path.parent != Path(run.result_path).parent or _sha256_file(path) != item['result_sha256']:
+            raise ScopeCycleError('historical portion receipt hash/path mismatch')
+        prior = EntityRun(run.parser_entity, str(path), item['result_sha256'], _load_json_file(path), int(item['wall_clock_duration_ms']), True)
+        for key in ('entity', 'run_key', 'scope_id', 'competition_id', 'edition_id'):
+            if prior.result.get(key) != run.result.get(key):
+                raise ScopeCycleError('historical portion receipt identity mismatch')
+        for field, value in _traffic_metrics(prior, hard_cap=hard_cap).items():
+            metrics[field] += value
     return metrics
 
 
@@ -1295,11 +1306,11 @@ def _build_scope_manifest(
                 **owned,
             ))
 
-    if total_metrics['provider_metered_bytes'] > int(args.cycle_budget_bytes):
+    if not history_portion.enabled() and total_metrics['provider_metered_bytes'] > int(args.cycle_budget_bytes):
         raise ScopeCycleError('scope provider traffic exceeds the hard byte cap')
-    if total_metrics['requests'] > int(args.request_limit):
+    if not history_portion.enabled() and total_metrics['requests'] > int(args.request_limit):
         raise ScopeCycleError('scope requests exceed the approved limit')
-    if total_metrics['retries'] > int(args.retry_limit):
+    if not history_portion.enabled() and total_metrics['retries'] > int(args.retry_limit):
         raise ScopeCycleError('scope retries exceed the approved limit')
     participant_dq = _validate_participant_capture(
         identity,
@@ -1362,7 +1373,7 @@ def _build_scope_manifest(
     # roster this scope actually holds: a manifest that only says 'complete'
     # cannot tell a scope covering every player from one covering a hundred.
     roster_coverage = {
-        run.parser_entity: dict(run.result['roster_coverage'])
+        run.parser_entity: {key: run.result['roster_coverage'][key] for key in ('roster_size', 'selected', 'pending')}
         for run in runs
         if isinstance(run.result.get('roster_coverage'), Mapping)
     }
@@ -1403,6 +1414,9 @@ def _build_scope_manifest(
         ),
     }
     participant_evidence = runs[0].result.get('participant_evidence')
+    historical_receipts = {entity: receipts for run in runs for entity, receipts in run.result.get('historical_career_receipts', {}).items()}
+    if historical_receipts:
+        dq_evidence['historical_career_receipts'] = historical_receipts
     if isinstance(participant_evidence, Mapping):
         dq_evidence['participant_evidence'] = dict(participant_evidence)
     if _approval_mode(args) == 'standing_policy':
@@ -1464,6 +1478,24 @@ def _build_scope_manifest(
             ),
         },
     })
+    if history_portion.enabled():
+        by_entity = {}
+        for run in runs:
+            own_result = dict(run.result)
+            own_result.pop('history_portions', None)
+            own_run = EntityRun(run.parser_entity, run.result_path, run.result_sha256,
+                                own_result, run.wall_clock_duration_ms, run.resumed)
+            metrics = _traffic_metrics(own_run, hard_cap=int(args.cycle_budget_bytes))
+            owner = ENTITY_OUTPUTS[run.parser_entity][0][1]
+            for _, entity in ENTITY_OUTPUTS[run.parser_entity]:
+                by_entity[entity] = metrics if entity == owner and not run.resumed else {key: 0 for key in metrics}
+        payload['traffic']['portion_by_entity'] = by_entity
+        payload['traffic']['budget_scope'] = 'portion'
+        for field, limit in (('provider_metered_bytes', int(args.cycle_budget_bytes)),
+                             ('requests', history_portion.request_limit()), ('retries', int(args.retry_limit))):
+            if sum(item[field] for item in by_entity.values()) > limit:
+                raise ScopeCycleError(f'historical portion {field} exceeds its cap')
+        payload['traffic']['portion_id'] = os.environ['TM_HISTORY_PORTION_ID']
     return json.loads(_stable_json(payload))
 
 
@@ -1829,6 +1861,12 @@ def _update_parent_ledger(
                 **dict(manifest['traffic']['totals']),
                 'by_entity': scope_by_entity,
             }
+            portion_metrics = manifest.get('traffic', {}).get('portion_by_entity')
+            if portion_metrics is not None:
+                if set(portion_metrics) != set(EXPECTED_ENTITIES):
+                    raise ScopeCycleError('historical portion entity traffic is incomplete')
+                entry['by_entity'] = portion_metrics
+                entry.update({field: sum(int(item[field]) for item in portion_metrics.values()) for field in entity_fields})
             if existing is not None and existing != entry:
                 raise ScopeCycleError('parent proxy ledger scope evidence drift')
             scopes[identity.scope_id] = entry
@@ -2242,7 +2280,7 @@ def _record_standing_policy_authorization(
     )
 
 
-def run_scope_cycle(
+def _run_scope_cycle(
     args: argparse.Namespace,
     *,
     operation_argv: Sequence[str],
@@ -2261,6 +2299,10 @@ def run_scope_cycle(
     if checkpoint_path.exists():
         checkpoint = _load_json_file(checkpoint_path)
     runs = _resume_runs(identity, args, checkpoint, checkpoint_identity)
+    if history_portion.enabled() and history_portion.recovery_probe():
+        # Probe a fresh listing even when the full players checkpoint exists.
+        # It cannot replace that checkpoint or finish any historical entity.
+        runs = []
 
     manifest_path = Path(identity.scope_manifest_path)
     if manifest_path.exists():
@@ -2407,6 +2449,8 @@ def run_scope_cycle(
     current_requests = 0
     current_retries = 0
     for run in runs:
+        if history_portion.enabled() and run.resumed:
+            continue
         metrics = _traffic_metrics(
             run,
             hard_cap=int(args.cycle_budget_bytes),
@@ -2414,6 +2458,8 @@ def run_scope_cycle(
         current_requests += metrics['requests']
         current_retries += metrics['retries']
     for run in runs:
+        if history_portion.enabled() and run.resumed:
+            continue
         item = entity_checkpoint.get(run.parser_entity) or {}
         attempt_id = str(item.get('attempt_id') or '').strip()
         if attempt_id:
@@ -2443,8 +2489,8 @@ def run_scope_cycle(
             run,
             hard_cap=int(args.cycle_budget_bytes),
         )
-        current_requests += run_metrics['requests']
-        current_retries += run_metrics['retries']
+        current_requests += int(run.result['network_fetches']) if history_portion.enabled() else run_metrics['requests']
+        current_retries += int(run.result['retries']) if history_portion.enabled() else run_metrics['retries']
         if current_requests > int(args.request_limit):
             raise ScopeCycleError('scope request limit exceeded')
         if current_retries > int(args.retry_limit):
@@ -2479,6 +2525,10 @@ def run_scope_cycle(
         }, immutable=False)
 
     for parser_entity in ENTITY_ORDER[len(runs):]:
+        if history_portion.enabled() and history_portion.remaining_seconds() <= history_portion.HISTORY_SETTLE_SECONDS + 180:
+            _atomic_json(checkpoint_path, {'version': 1, 'identity_hash': checkpoint_identity,
+                         'entities': entity_checkpoint, 'status': 'in_progress'}, immutable=False)
+            raise history_portion.HistoryContinuation('historical portion reached paid-work boundary')
         final_path = Path(identity.entity_dir) / f'{parser_entity}.json'
         guard_totals = _attempt_guard_totals(
             identity,
@@ -2523,7 +2573,7 @@ def run_scope_cycle(
         intent_path = Path(identity.entity_dir) / (
             f'.{parser_entity}-attempt-intent.json'
         )
-        if final_path.exists():
+        if final_path.exists() and not history_portion.recovery_probe():
             adopted, adopted_attempt_id, adopted_command_sha256 = (
                 _adopt_uncheckpointed_run(
                     identity,
@@ -2565,6 +2615,8 @@ def run_scope_cycle(
             child_retry_budget,
         )
         entity_timeout = _entity_timeout_seconds(args, parser_entity)
+        if history_portion.enabled():
+            entity_timeout = min(entity_timeout, max(1, history_portion.remaining_seconds() - 60))
         attempt_seed = {
             'paid_proxy_packet_hash': packets['paid_proxy'].packet_hash,
             'child_cycle_id': identity.child_cycle_id,
@@ -2670,6 +2722,10 @@ def run_scope_cycle(
                 request_limit=int(args.parent_request_limit),
                 retry_limit=int(args.parent_retry_limit),
             )
+            if history_portion.enabled() and failed_result is not None and failed_result.get('continuation') is True and failed_result.get('failure_stage') != 'platform':
+                _atomic_json(checkpoint_path, {'version': 1, 'identity_hash': checkpoint_identity,
+                             'entities': entity_checkpoint, 'status': 'in_progress'}, immutable=False)
+                raise history_portion.HistoryContinuation('historical lease/work remainder retained')
             # The runner's captured output is the only account of why it failed,
             # and it is otherwise discarded with the subprocess.
             transcript = Path(identity.entity_dir) / f'{parser_entity}-failure.log'
@@ -2709,6 +2765,14 @@ def run_scope_cycle(
             request_limit=int(args.parent_request_limit),
             retry_limit=int(args.parent_retry_limit),
         )
+        if history_portion.enabled() and history_portion.recovery_probe():
+            _verify_adopted_raw_attempts(result, identity)
+            probe_path = Path(identity.entity_dir) / f'players-probe-{batch_id or attempt_id}.json'
+            _atomic_json(probe_path, result, immutable=True)
+            _atomic_json(checkpoint_path, {'version': 1, 'identity_hash': checkpoint_identity,
+                         'entities': entity_checkpoint, 'status': 'in_progress'}, immutable=False)
+            temporary_path.unlink()
+            raise history_portion.HistoryContinuation('one-attempt recovery probe retained')
         _validate_result_identity(result, identity, parser_entity)
         digest = _sha256_file(temporary_path)
         run = EntityRun(
@@ -2720,6 +2784,29 @@ def run_scope_cycle(
             resumed=False,
         )
         _validate_run_contract(run, identity, args)
+        if history_portion.enabled() and parser_entity in {'market_value_history', 'transfers'}:
+            coverage = result.get('roster_coverage') or {}
+            if int(coverage.get('pending', 0)):
+                remaining = coverage.get('remaining_ids')
+                if not isinstance(remaining, list) or len(remaining) != int(coverage['pending']) or len(set(remaining)) != len(remaining):
+                    raise ScopeCycleError('historical continuation lacks exact career remainder')
+                _verify_adopted_raw_attempts(result, identity)
+                archive = final_path.with_name(f'{parser_entity}-portion-{batch_id or attempt_id}.json')
+                result = {**result, 'history_wall_clock_duration_ms': int(duration_ms),
+                          'history_sequence': int(sequence_text or 0)}
+                _atomic_json(archive, result, immutable=True)
+                partial = dict(checkpoint.get('history_portions') or {})
+                partial[parser_entity] = {'result_path': str(archive), 'result_sha256': _sha256_file(archive),
+                                          'remaining_ids': remaining}
+                _atomic_json(checkpoint_path, {'version': 1, 'identity_hash': checkpoint_identity,
+                             'entities': entity_checkpoint, 'history_portions': partial,
+                             'status': 'in_progress'}, immutable=False)
+                temporary_path.unlink()
+                raise history_portion.HistoryContinuation('historical career remainder retained')
+            result = _history_complete_result(identity, parser_entity, result, final_path)
+            _atomic_json(temporary_path, result, immutable=False)
+            digest = _sha256_file(temporary_path)
+            run = EntityRun(parser_entity, str(final_path), digest, result, int(duration_ms), False)
         with temporary_path.open('rb') as handle:
             os.fsync(handle.fileno())
         command_sha256 = stable_hash(command)
@@ -2775,6 +2862,74 @@ def run_scope_cycle(
     if isinstance(grant, PolicyGrant):
         _record_standing_policy_authorization(identity, manifest, grant)
     return manifest
+
+
+def _history_complete_result(identity, parser_entity, result, final_path):
+    """Bind prior paid chunks and a full physical fingerprint to the final receipt."""
+    from utils.transfermarkt_backfill_dq import _fingerprint_rows, historical_career_rows
+    from utils import transfermarkt_native_v2 as control
+    receipts = []
+    paths = sorted(final_path.parent.glob(f'{parser_entity}-portion-*.json'),
+                   key=lambda path: (int(_load_json_file(path).get('history_sequence', 0)), path.name))
+    for path in paths:
+        prior = _load_json_file(path)
+        _validate_result_identity(prior, identity, parser_entity)
+        _verify_adopted_raw_attempts(prior, identity)
+        receipts.append({'result_path': str(path), 'result_sha256': _sha256_file(path),
+                         'wall_clock_duration_ms': int(prior.get('history_wall_clock_duration_ms', 0))})
+    value = json.loads(_stable_json(result))
+    value['history_portions'] = receipts
+    original = final_path.with_name(f"{parser_entity}-original-{os.environ.get('TM_HISTORY_PORTION_ID', '')}.json")
+    _atomic_json(original, result, immutable=True)
+    chunks = [(_load_json_file(Path(item['result_path'])), item['result_sha256']) for item in receipts]
+    chunks.append((result, _sha256_file(original)))
+    value['historical_career_receipts'] = {}
+    conn = control.connect()
+    cur = conn.cursor()
+    try:
+        for output_key, entity in ENTITY_OUTPUTS[parser_entity]:
+            original_receipts = []
+            for chunk, sha in chunks:
+                row = _manifest_rows(chunk, 'native-only').get(entity) or {}
+                count = int(chunk['outputs'][output_key]['rows'])
+                refs = row.get('physical_refs')
+                if not refs and count == 0 and chunk['outputs'][output_key].get('applicability_status') == 'not_applicable':
+                    continue
+                if not isinstance(refs, list) or not refs or not row.get('capture_unit_id'):
+                    raise ScopeCycleError('historical career chunk lacks immutable original physical refs')
+                ids = [item[0] for item in refs]
+                original_receipts.append({'snapshot_id': row.get('native_snapshot_id'), 'player_ids': ids,
+                    'row_count': int(row.get('native_rows', count)), 'key_hash': row.get('native_hash', stable_hash([])),
+                    'physical_refs': refs, 'capture_unit_id': row['capture_unit_id'],
+                    'native_batch_id': row['native_batch_id'],
+                    'empty_capture_refs': row.get('empty_capture_refs', []),
+                    'cycle_id': identity.child_cycle_id, 'scope_id': identity.scope_id, 'result_sha256': sha})
+            if not original_receipts:
+                continue
+            count, digest = _fingerprint_rows(historical_career_rows(cur, entity, original_receipts))
+            value['historical_career_receipts'][entity] = original_receipts
+            output = value['outputs'][output_key]
+            output['rows'] = count
+            output['applicability_status'] = 'ok' if count else 'authoritative_empty'
+            rows = value['native_write_manifest']['rows']
+            row = next((item for item in rows if item.get('entity') == entity), None)
+            if row is None and count:
+                row = {'entity': entity, 'status': 'success'}
+                rows.append(row)
+            if row is not None:
+                row.update(native_rows=count, native_hash=digest)
+                row.pop('native_snapshot_id', None)
+        value['native_write_manifest']['status'] = 'success'
+        value['native_write_manifest_complete'] = True
+    finally:
+        cur.close()
+        conn.close()
+    return value
+
+
+def run_scope_cycle(*args, **kwargs):
+    with history_portion.bounded_trino():
+        return _run_scope_cycle(*args, **kwargs)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2898,7 +3053,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parser.parse_args(raw_argv)
         _validate_args(args)
         operation_argv = approved_operation_argv(raw_argv)
-        manifest = run_scope_cycle(args, operation_argv=operation_argv)
+        try:
+            manifest = run_scope_cycle(args, operation_argv=operation_argv)
+        except history_portion.HistoryContinuation as exc:
+            identity = _scope_identity(args)
+            status = {'status': 'continuation', 'reason': str(exc),
+                      'parent_cycle_id': identity.parent_cycle_id, 'child_cycle_id': identity.child_cycle_id,
+                      'scope_id': identity.scope_id, 'silver_trigger_allowed': False,
+                      'backfill_campaign_id': os.environ.get('TM_BACKFILL_CAMPAIGN_ID'),
+                      'backfill_batch_id': os.environ.get('TM_BACKFILL_BATCH_ID'),
+                      'backfill_claim_generation': os.environ.get('TM_BACKFILL_CLAIM_GENERATION'),
+                      'backfill_attempt_sequence': os.environ.get('TM_BACKFILL_ATTEMPT_SEQUENCE')}
+            _atomic_json(Path(identity.result_base_dir) / 'scope-status.json', status, immutable=False)
+            print(_stable_json(status))
+            return 0
         success = {
             'status': 'complete',
             'parent_cycle_id': manifest['parent_cycle_id'],

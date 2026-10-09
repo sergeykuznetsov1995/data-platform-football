@@ -2186,3 +2186,86 @@ def test_squad_resume_policy_only_pins_current_ingest_checkpoint(monkeypatch, mo
     monkeypatch.setattr(cycle, 'CURRENT_SQUAD_CACHE_POLICY_VERSION', 'future-policy')
     after = cycle._checkpoint_identity(identity, args, limits)
     assert (before != after) == (mode == 'current' and dag == 'dag_ingest_transfermarkt')
+
+
+def test_history_partial_career_keeps_players_checkpoint_and_resumes(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from scrapers.transfermarkt import history_portion
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    args.write_mode = 'native-only'
+    args.refresh_mode = 'historical'
+    args.standing_policy_sha256 = 'a' * 64
+    monkeypatch.setenv('TM_HISTORY_DEADLINE_AT', '2026-10-10T18:45:00+00:00')
+    monkeypatch.setenv('TM_HISTORY_PORTION_ID', 'one')
+    monkeypatch.setattr(history_portion, 'remaining_seconds', lambda: 2700)
+    monkeypatch.setattr(history_portion, 'bounded_trino', nullcontext)
+    monkeypatch.setattr(cycle, '_approval_mode', lambda *a: 'standing_policy')
+    grant = cycle.PolicyGrant('history-grant', 'a' * 64, 1)
+    monkeypatch.setattr(cycle, '_consume_approvals', lambda *a, **k: {'paid_proxy': grant, 'production_write': grant})
+    monkeypatch.setattr(cycle, '_record_standing_policy_authorization', lambda *a: None)
+    calls = []
+    career_calls = 0
+    from utils.transfermarkt_backfill_dq import _fingerprint_rows
+    originals = {
+        1: [['1', '2020-01-01', 100, 'Club', 20, 'EUR100'], ['2', '2020-01-01', 200, 'Club', 20, 'EUR200']],
+        2: [['301', '2020-01-01', 300, 'Club', 20, 'EUR300'], ['302', '2020-01-01', 400, 'Club', 20, 'EUR400']],
+        3: [['501', '2020-01-01', '1', 'Club1', '2', 'Club2', 'free', False, 0, 100],
+            ['502', '2020-01-01', '2', 'Club2', '3', 'Club3', 'free', False, 0, 200]],
+    }
+    def mutate(command, result):
+        nonlocal career_calls
+        result['native_write_manifest'] = result['batch_manifest']
+        result['native_write_manifest_complete'] = True
+        if result['entity'] == 'market_value_history':
+            career_calls += 1
+            result['roster_coverage'] = {'roster_size': 600, 'selected': 300,
+                'pending': 300 if career_calls == 1 else 0,
+                'remaining_ids': [str(value) for value in range(300, 600)] if career_calls == 1 else [],
+                'roster_ids': [str(value) for value in range(600)]}
+        if result['entity'] in {'market_value_history', 'transfers'}:
+            snapshot = career_calls if result['entity'] == 'market_value_history' else 3
+            result['career_window'] = {'attempted_ids': [str(row[0]) for row in originals[snapshot]]}
+            row = result['native_write_manifest']['rows'][0]
+            row['native_snapshot_id'] = snapshot
+            row['native_hash'] = _fingerprint_rows(originals[snapshot])[1]
+            row['physical_refs'] = [[str(point[0]), f'original-{snapshot}', 1] for point in originals[snapshot]]
+            row['capture_unit_id'] = str(snapshot) * 64
+            row['native_batch_id'] = f'logical-{snapshot}'
+        return result
+    connection = mock.Mock()
+    queries = []
+    connection.cursor.return_value.execute.side_effect = queries.append
+    def fetchall():
+        query = queries[-1]
+        for snapshot, rows in originals.items():
+            if f'FOR VERSION AS OF {snapshot} ' in query:
+                return rows
+        # Current has replaced the old global career in snapshot99.
+        return [['1', '2026-10-10', 999, 'New club', 26, 'EUR999']]
+    connection.cursor.return_value.fetchall.side_effect = fetchall
+    from utils import transfermarkt_native_v2 as control
+    monkeypatch.setattr(control, 'connect', lambda: connection)
+    runner = _fake_subprocess(calls, mutate=mutate)
+    with pytest.raises(history_portion.HistoryContinuation):
+        cycle.run_scope_cycle(args, operation_argv=(), subprocess_runner=runner,
+            manifest_writer=lambda *a: None, parent_ledger_writer=lambda *a: None)
+    checkpoint_path = Path(payload['result_paths']['base_dir']) / 'scope-cycle-checkpoint.json'
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert tuple(checkpoint['entities']) == ('players',)
+    assert len(checkpoint['history_portions']['market_value_history']['remaining_ids']) == 300
+    monkeypatch.setenv('TM_HISTORY_PORTION_ID', 'two')
+    manifest = cycle.run_scope_cycle(args, operation_argv=(), subprocess_runner=runner,
+        manifest_writer=lambda *a: None, parent_ledger_writer=lambda *a: None)
+    assert [command[command.index('--entity') + 1] for command, _ in calls] == [
+        'players', 'market_value_history', 'market_value_history', 'transfers', 'coaches']
+    assert manifest['dq_evidence']['career_fetches_pending'] == 0
+    assert manifest['traffic']['totals']['requests'] == 10
+    assert manifest['traffic']['by_parser_entity']['market_value_history']['requests'] == 4
+    final = json.loads((Path(payload['result_paths']['entity_staging_dir']) / 'market_value_history.json').read_text())
+    assert len(final['history_portions']) == 1
+    assert final['outputs']['market_value_points']['rows'] == 4
+    assert [item['snapshot_id'] for item in final['historical_career_receipts']['market_value_points']] == [1, 2]
+    assert all('FOR VERSION AS OF' in query for query in queries)
+    assert json.loads(checkpoint_path.read_text())['status'] == 'complete'

@@ -922,6 +922,7 @@ def run_bronze_dq(
     manifests: Sequence[Any] | None = None,
     scope_bindings: Sequence[Sequence[str]] | None = None,
     legacy_allowlist: Iterable[Sequence[str]] = (),
+    historical_presence: Mapping[tuple[str, str], int] | None = None,
 ) -> list[BronzeCheckResult]:
     """Execute the cross-table Bronze DQ suite and return every result.
 
@@ -1261,6 +1262,12 @@ def run_bronze_dq(
                             f'{label}: unknown manifest entity {entity!r}'
                         )
                     count = pair_counts[entity].get(scope_key, 0)
+                    # Backfill supplies these only after verifying the original
+                    # snapshot fingerprints. Current may have legitimately
+                    # replaced/deleted this global career in the latest pin.
+                    original = (str(getattr(manifest, 'scope_id', '')), entity)
+                    if historical_presence is not None and original in historical_presence:
+                        count = int(historical_presence[original])
                     status = str(evidence.applicability_status)
                     if status == 'ok':
                         if int(evidence.dedup_rows) > 0 and count == 0:

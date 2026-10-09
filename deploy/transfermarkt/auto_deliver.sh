@@ -64,7 +64,7 @@ SNAPSHOT=$STATE/transfermarkt-rollback.env     # состояние боя до 
 TODAY=$(date -u +%F)
 ATTEMPTED=$STATE/transfermarkt-auto-deliver-attempted-$TODAY
 YESTERDAY=$(date -u -d "$TODAY -1 day" +%F)
-POOLS="ingest_scraper_pool transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control"
+POOLS="transfermarkt_control transfermarkt_proxy transfermarkt_backfill_proxy transfermarkt_backfill_control"
 CORE_DAGS="dag_ingest_transfermarkt dag_discover_transfermarkt_registry dag_backfill_transfermarkt dag_transform_transfermarkt_silver"
 WINDOW_FROM=${WINDOW_FROM:-0100}   # TM-DAG идут в 04:00 UTC; окно 01:00–03:00 (решение 9 #1387)
 WINDOW_TO=${WINDOW_TO:-0300}
@@ -179,14 +179,35 @@ metadb(){
 sched(){ timeout -k 5 60 docker exec "$SCHED" "$@" >> "$LOG" 2>&1 8>&- 9>&-; }
 inspect(){ timeout -k 5 30 docker inspect "$@" 2>/dev/null; }
 snap_get(){ sed -n "s/^$1=//p" "$SNAPSHOT" 2>/dev/null | head -1; }
-pool_want(){  # pool_want <pool>: слоты из снимка, иначе 1 (все пулы TM — по одному слоту)
+rollback_pools(){
+  local pools p value
+  pools=$(snap_get OLD_POOLS)
+  if [ -n "$pools" ]; then
+    for p in $pools; do
+      case "$p" in ingest_scraper_pool|transfermarkt_control|transfermarkt_proxy|transfermarkt_backfill_proxy|transfermarkt_backfill_control) ;;
+        *) return 1 ;; esac
+    done
+    printf '%s' "$pools"
+  else
+    # Older snapshots already contain the old release's actual pool rows.
+    # An absent new pool is not part of that release's rollback contract.
+    for p in ingest_scraper_pool $POOLS; do
+      value=$(snap_get "POOL_$p")
+      case "$value" in ''|*[!0-9]*) ;; *) printf '%s ' "$p" ;; esac
+    done
+  fi
+}
+pool_want(){  # rollback uses only persisted values, never a helper in old code
   local w
   w=$(snap_get "POOL_$1")
-  case "$w" in ''|*[!0-9]*) printf '1' ;; *) printf '%s' "$w" ;; esac
+  case "$w" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s' "$w" ;;
+  esac
 }
 pool_desc(){
   case "$1" in
-    ingest_scraper_pool) printf '%s' 'Serialize heavy ingest scrapers to avoid VM swap (#671)' ;;
+    transfermarkt_control) printf '%s' 'Transfermarkt current planning and DQ only' ;;
     transfermarkt_proxy) printf '%s' 'Transfermarkt production and registry proxy work' ;;
     transfermarkt_backfill_proxy) printf '%s' 'Transfermarkt historical backfill only; bounded dedicated proxy slot' ;;
     *) printf '%s' 'Transfermarkt historical planning and DQ only; isolated from daily ingest' ;;
@@ -212,7 +233,7 @@ restore_state(){
   RESTORE_PENDING=""
   RESTORE_NOTE=""
   local pool want dag
-  for pool in $POOLS; do
+  for pool in $(rollback_pools); do
     want=$(snap_get "POOL_$pool")
     [ -n "$want" ] || continue
     if ! sched airflow pools set "$pool" "$want" "$(pool_desc "$pool")"; then
@@ -242,7 +263,7 @@ gateway_health_ok(){  # 1 / 0 / X по пробе transfermarkt_gateway_health_o
 # импорта; scheduler healthy (heartbeat SchedulerJob); шлюз healthy на 1 GiB в проекте transfermarkt-gw; монты scheduler'а и шлюза в
 # этом дереве; /health шлюза в режиме transfermarkt-only; слоты пулов как в снимке.
 acceptance_seen(){  # acceptance_seen <дерево> <StartedAt scheduler'а>
-  local new="$1" started="$2" dags errs gw got c
+  local new="$1" started="$2" dags errs gw got c want
   dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
   errs=$(metadb "SELECT count(*) FROM import_error;")
   case "$dags$errs" in *X*) echo X; return ;; esac
@@ -259,10 +280,20 @@ acceptance_seen(){  # acceptance_seen <дерево> <StartedAt scheduler'а>
   got=$(gateway_health_ok)
   [ "$got" = X ] && { echo X; return; }
   [ "$got" = 1 ] || { echo 0; return; }
-  for c in $POOLS; do
+  local acceptance_pools="$POOLS"
+  if [ "$new" = "$(snap_get OLD_RELEASE_ROOT)" ]; then
+    acceptance_pools=$(rollback_pools) || { echo X; return; }
+    [ -n "$acceptance_pools" ] || { echo X; return; }
+  fi
+  for c in $acceptance_pools; do
     got=$(metadb "SELECT slots FROM slot_pool WHERE pool='$c';")
     [ "$got" = X ] && { echo X; return; }
-    [ "$got" = "$(pool_want "$c")" ] || { echo 0; return; }
+    if [ "$new" = "$(snap_get OLD_RELEASE_ROOT)" ]; then
+      want=$(pool_want "$c") || { echo X; return; }
+    else
+      want=$(timeout -k 5 30 docker exec "$SCHED" python -m scrapers.transfermarkt.airflow_pools --get "$c") || { echo X; return; }
+    fi
+    [ "$got" = "$want" ] || { echo 0; return; }
   done
   echo 1
 }
@@ -278,7 +309,10 @@ snapshot_ok(){
       *) log "снимок отката неполон: пауза $d не прочитана"; return 1 ;;
     esac
   done
-  for p in $POOLS; do
+  local old_pools
+  old_pools=$(rollback_pools) || return 1
+  [ -n "$old_pools" ] || { log "снимок отката неполон: нет старого контракта пулов"; return 1; }
+  for p in $old_pools; do
     case "$(snap_get "POOL_$p")" in
       ''|*[!0-9]*) log "снимок отката неполон: слоты пула $p не число"; return 1 ;;
     esac
@@ -871,10 +905,19 @@ fi
 {
   printf 'OLD_RELEASE_ROOT=%s\n' "$OLD"
   printf 'NEW_RELEASE_ROOT=%s\n' "$NEW"
-  printf 'SNAPSHOT_VERSION=1\n'
+  printf 'SNAPSHOT_VERSION=2\n'
   printf 'WINDOW_ID=%s\n' "$WINDOW_ID"
   for d in $CORE_DAGS; do printf '%s=%s\n' "$(paused_key "$d")" "$(metadb "SELECT is_paused FROM dag WHERE dag_id='$d';")"; done
-  for p in $POOLS; do printf 'POOL_%s=%s\n' "$p" "$(metadb "SELECT slots FROM slot_pool WHERE pool='$p';")"; done
+  old_pools=""
+  for p in ingest_scraper_pool $POOLS; do
+    slots=$(metadb "SELECT slots FROM slot_pool WHERE pool='$p';")
+    case "$slots" in
+      '') ;; # Pool absent in the old release.
+      *[!0-9]*) printf 'POOL_%s=%s\n' "$p" "$slots"; old_pools="$old_pools $p" ;;
+      *) printf 'POOL_%s=%s\n' "$p" "$slots"; old_pools="$old_pools $p" ;;
+    esac
+  done
+  printf 'OLD_POOLS=%s\n' "${old_pools# }"
   printf 'SCHED_CREATED=%s\n' "$SCHED_CREATED_BEFORE"
 } >> "$SNAPSHOT" 2>/dev/null
 snap_ok=1

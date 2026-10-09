@@ -1199,7 +1199,7 @@ def _validate_scope_set(**context: Any) -> dict[str, Any]:
 
 with DAG(
     dag_id='dag_ingest_transfermarkt',
-    default_args=SCRAPER_ARGS,
+    default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
     description='Bounded registry-driven Transfermarkt native-v2 ingest',
     schedule=_current_schedule(),
     start_date=datetime(2024, 1, 1),
