@@ -7,6 +7,13 @@ Airflow init, deploy и приёмка используют тот же Python h
 и `transfermarkt_backfill_proxy`. Общий `ingest_scraper_pool` не участвует.
 Изменение файлов рецепта не включает историю и не подтверждает доставку.
 
+`paid_proxy.concurrency=1` в standing policy относится к одному scope grant:
+его entities и оплаченные операции идут последовательно. Это осмысленное
+ограничение одной операции scope, а количество независимых scopes/streams задаёт
+`TM_HISTORY_STREAMS`. При H2/H3 planner выдаёт два/три разных stream grants;
+каждый проходит прежнюю policy-проверку concurrency1. Один общий portion ledger
+по-прежнему ограничивает суммарное число оплаченных попыток500 для всех streams.
+
 Порция получает абсолютный срок от `DagRun.start_date`: максимум 45 минут,
 включая planning, HTTP, Trino polls и ops/commit. Каждый этап использует исходный
 срок, поэтому ожидание пула не даёт новый бюджет. Перед HTTP остаётся запас

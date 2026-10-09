@@ -23,20 +23,26 @@ def test_two_units_keep_same_logical_child_and_immutable_original_refs(monkeypat
     def execute(cur, sql):
         if sql.startswith('SELECT native_table'):
             batch = re.search(r"native_batch_id = '([^']+)'", sql).group(1)
-            cur.rows = [records[batch]] if batch in records else []
+            columns = [name.strip() for name in sql.split('SELECT ', 1)[1].split(' FROM ', 1)[0].split(',')]
+            cur.rows = [tuple(records[batch][name] for name in columns)] if batch in records else []
         elif sql.startswith('SELECT snapshot_id'):
             cur.rows = [(10,)]
+        elif sql.startswith('SELECT committed_at'):
+            cur.rows = [('2026-10-09 09:05:00',)]
         elif sql.lstrip().startswith('MERGE INTO'):
             values = sql.split('USING (VALUES (', 1)[1].split('))', 1)[0]
             tokens = re.findall(r"'((?:''|[^'])*)'|\b(NULL|[0-9]+)\b", values)
             values = [a.replace("''", "'") if a else None if b == 'NULL' else int(b) for a, b in tokens]
-            cycle, entity, table, refs, digest, snapshot, legacy, batch, unit, empty_proof = values
-            records[batch] = (table, refs, digest, snapshot, legacy, empty_proof)
+            columns = [name.strip() for name in re.search(r'\)\)\s+s\(([^)]*)\)', sql).group(1).split(',')]
+            record = dict(zip(columns, values, strict=True))
+            records[record['native_batch_id']] = record
     monkeypatch.setattr(career_refs, 'execute_statement', execute)
     conn = SimpleNamespace(cursor=lambda: cur)
-    first = pd.DataFrame({'player_id': ['1', '2'], '_batch_id': ['portion-a', 'portion-a']})
+    first = pd.DataFrame({'player_id': ['1', '2'], '_batch_id': ['portion-a', 'portion-a'],
+                          'fetched_at': ['2026-10-08T09:00:00+00:00', '2026-10-09T09:00:00+00:00']})
     first.attrs.update(tm_captured_player_ids=['2'], tm_original_capture_refs=[{'player_id': '1', 'batch_id': 'current-original'}])
-    second = pd.DataFrame({'player_id': ['1', '2', '3'], '_batch_id': ['portion-b'] * 3})
+    second = pd.DataFrame({'player_id': ['1', '2', '3'], '_batch_id': ['portion-b'] * 3,
+                           'fetched_at': ['2026-10-08T09:00:00+00:00', '2026-10-09T09:00:00+00:00', '2026-10-09T10:00:00+00:00']})
     second.attrs.update(tm_captured_player_ids=['3'], tm_original_capture_refs=[
         {'player_id': '1', 'batch_id': 'current-original'}, {'player_id': '2', 'batch_id': 'portion-a'}])
     kwargs = dict(connection=conn, cycle='stable-child', entity='market_value_points',
@@ -49,6 +55,7 @@ def test_two_units_keep_same_logical_child_and_immutable_original_refs(monkeypat
     # A fresh current replaces live rows; replay still resolves the original proof.
     replay = career_refs.persist_capture_refs(frame=first, snapshot_proof={'native_snapshot_id': 99, 'legacy_snapshot_id': None}, **kwargs)
     assert replay == old and replay['native_snapshot_id'] == 10
+    assert replay['capture_times']['1'] == '2026-10-08T09:00:00.000000+00:00'
     empty = pd.DataFrame(columns=['player_id', '_batch_id'])
     typed = [{'player_id': '4', 'status': 'authoritative_empty', 'expected_rows': 0,
               'captured_at': '2026-10-08T09:00:00+00:00', 'payload_hash': 'b' * 64,
@@ -126,13 +133,17 @@ def test_original_empty_without_table_survives_new_current_rows(tmp_path):
     from scrapers.transfermarkt.client import _payload_hash
     store = RawResponseStore.from_uri((tmp_path / 'raw').as_uri())
     original = {'transfers': []}
+    rejected = store.store_attempt('https://www.transfermarkt.com/ceapi/transferHistory/list/1',
+        b'<html>challenge</html>', 200, {}, '2026-10-08T09:00:00+00:00',
+        'original-cycle', 'original-scope', 'transfer_events', 1)
+    rejected_envelope = store.store_response_envelope(rejected)
     capture = store.store_attempt('https://www.transfermarkt.com/ceapi/transferHistory/list/1',
         json.dumps(original).encode(), 200, {}, '2026-10-08T09:00:00+00:00',
-        'original-cycle', 'original-scope', 'transfer_events', 1)
+        'original-cycle', 'original-scope', 'transfer_events', 2)
     envelope = store.store_response_envelope(capture)
     proof = {'player_id': '1', 'status': 'authoritative_empty', 'expected_rows': 0,
              'captured_at': capture.fetched_at, 'payload_hash': _payload_hash(original),
-             'intent_sha256': 'a' * 64, 'raw_attempts': [asdict(envelope)], 'cache_sources': []}
+             'intent_sha256': 'a' * 64, 'raw_attempts': [asdict(rejected_envelope), asdict(envelope)], 'cache_sources': []}
     receipt = {'snapshot_id': None, 'player_ids': ['1'], 'physical_refs': [['1', 'original-batch', 0]],
                'row_count': 0, 'key_hash': dq._fingerprint_rows([])[1], 'empty_capture_refs': [proof]}
     # Current has since created the table and installed a real nonempty career.
@@ -145,6 +156,10 @@ def test_original_empty_without_table_survives_new_current_rows(tmp_path):
     dq._verify_original_empty_careers(store, 'transfer_events', receipt)
     assert db.execute('SELECT * FROM current_transfers').fetchall() == [('1', 1000000)]
     proof['captured_at'] = '2026-10-09T09:00:00+00:00'
+    with pytest.raises(dq.BackfillDqError, match='cannot be verified'):
+        dq._verify_original_empty_careers(store, 'transfer_events', receipt)
+    proof['captured_at'] = capture.fetched_at
+    proof['raw_attempts'] = [asdict(rejected_envelope)]
     with pytest.raises(dq.BackfillDqError, match='cannot be verified'):
         dq._verify_original_empty_careers(store, 'transfer_events', receipt)
     db.close()

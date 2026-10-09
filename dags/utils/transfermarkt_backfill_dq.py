@@ -301,7 +301,14 @@ def _verify_original_empty_careers(raw_store, entity, receipt):
             if capture.status_code != 200:
                 continue
             captured_at = datetime.fromisoformat(capture.fetched_at.replace('Z', '+00:00'))
-            payload = json.loads(body.decode('utf-8'))
+            if captured_at.astimezone(timezone.utc) != stamp.astimezone(timezone.utc):
+                continue
+            try:
+                payload = json.loads(body.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Earlier paid retries are evidence too. A failed response
+                # never proves empty, but must not hide the verified outcome.
+                continue
             field = 'list' if entity == 'market_value_points' else 'transfers'
             if (isinstance(payload, dict) and payload.get(field) == []
                     and _payload_hash(payload) == proof.get('payload_hash')
