@@ -172,6 +172,7 @@ def test_history_dq_reads_original_career_snapshots_after_current_replacement():
     receipts = []
     for snapshot, row in ((10, old), (20, new)):
         receipts.append({'snapshot_id': snapshot, 'player_ids': [row[0]],
+            'physical_refs': [[row[0], f'original-{snapshot}', 1]],
             'row_count': 1, 'key_hash': dq._fingerprint_rows([row])[1],
             'scope_id': 'historical-scope', 'cycle_id': 'historical-cycle',
             'result_sha256': 'a' * 64})
@@ -197,7 +198,8 @@ def test_history_dq_reads_original_career_snapshots_after_current_replacement():
     assert result['row_count'] == 2
     assert len(cur.sql) == 2
     assert all('FOR VERSION AS OF 99' not in sql for sql in cur.sql)
-    assert "cycle_id = 'historical-cycle'" in cur.sql[0]
+    assert "_batch_id = 'original-10'" in cur.sql[0]
+    assert 'cycle_id =' not in cur.sql[0]
 
 
 def test_history_original_snapshot_raw_lineage_is_checked_after_current_replacement():
@@ -205,6 +207,7 @@ def test_history_original_snapshot_raw_lineage_is_checked_after_current_replacem
     capture_id = 'b' * 64
     body_hash = hashlib.sha256(body).hexdigest()
     receipt = {'snapshot_id': 10, 'player_ids': ['1'], 'row_count': 1,
+        'physical_refs': [['1', 'original-10', 1]],
         'key_hash': 'a' * 64, 'scope_id': 'historical-scope',
         'cycle_id': 'historical-cycle', 'result_sha256': 'c' * 64}
     class Cursor:
@@ -213,7 +216,7 @@ def test_history_original_snapshot_raw_lineage_is_checked_after_current_replacem
         def execute(self, sql):
             self.sql.append(sql)
         def fetchall(self):
-            return [(capture_id, body_hash, 'historical-scope', 'historical-cycle')] if 'FOR VERSION AS OF 10 ' in self.sql[-1] else []
+            return [(capture_id, body_hash, 'historical-scope', 'historical-cycle', '1', 'original-10')] if 'FOR VERSION AS OF 10 ' in self.sql[-1] else []
     cur = Cursor()
     result = dq.verify_raw_lineage(cur,
         pins={table: 99 for table in dq.BACKFILL_PIN_TABLES},

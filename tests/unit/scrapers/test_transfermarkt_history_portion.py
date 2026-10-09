@@ -108,6 +108,30 @@ def test_history_drains_1201_exact_careers_without_global_debt(portion, monkeypa
     assert len(set(processed)) == 1201
 
 
+def test_hardkill_close_remains_bound_to_original_portion_and_grant(portion, monkeypatch):
+    lease = ProxyLease('lease-one', 'private-token', 'http://proxy.test', 1000, 2000)
+    monkeypatch.setenv('TM_PROVIDER_BYTE_BUDGET', '1234')
+    monkeypatch.setenv('TM_CYCLE_LEDGER_KEY', 'original-grant')
+    original_grant = {'ledger_path': '/original/ledger.json', 'reservation_id': 'original-reservation'}
+    monkeypatch.setenv('TM_HISTORY_GRANT_JSON', json.dumps(original_grant))
+    history.journal_lease(lease, 'scope-one')
+    monkeypatch.setenv('TM_HISTORY_PORTION_ID', 'successor')
+    monkeypatch.setenv('TM_HISTORY_ATTEMPT_LEDGER', str(portion / 'successor.json'))
+    monkeypatch.setenv('TM_PROVIDER_BYTE_BUDGET', '9999')
+    monkeypatch.setenv('TM_HISTORY_GRANT_JSON', '{}')
+    monkeypatch.setattr(history.time, 'time', lambda: 2001)
+    provider = Mock(close=Mock(return_value=LeaseTrafficSnapshot(up_bytes=4, down_bytes=6)))
+    history.reconcile_leases(provider, 'scope-one')
+    proof = json.loads(history._lease_journal('scope-one').read_text())['leases']['lease-one']
+    assert proof['portion_id'] == 'portion-one'
+    assert proof['attempt_ledger'] == str(portion / 'attempts.json')
+    assert proof['provider_byte_grant'] == '1234'
+    assert proof['grant_cycle_id'] == 'original-grant'
+    assert proof['grant'] == original_grant
+    assert proof['reconciliation_portion_id'] == 'successor'
+    assert proof['traffic']['up_bytes'] == 4
+
+
 def test_pool_sizes_share_stream_canon():
     from scrapers.transfermarkt.streams import TransfermarktStreams
     from scrapers.transfermarkt.airflow_pools import pool_sizes

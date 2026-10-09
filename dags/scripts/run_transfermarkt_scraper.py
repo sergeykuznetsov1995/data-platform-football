@@ -3690,6 +3690,7 @@ def _run_entity_unbounded(
     if history_enabled():
         cycle_ledger_key = f"{cycle_ledger_key}:{os.environ['TM_HISTORY_PORTION_ID']}"
         results['history_grant_cycle_id'] = cycle_ledger_key
+        os.environ['TM_CYCLE_LEDGER_KEY'] = cycle_ledger_key
     cycle_budget = None
     exit_code = 1
     scraper = None
@@ -3744,6 +3745,12 @@ def _run_entity_unbounded(
             os.environ[PROVIDER_GRANT_ENV_VAR] = str(effective_bytes)
             results['provider_byte_grant'] = effective_bytes
             results['cycle_budget'] = dict(cycle_budget)
+            if history_enabled():
+                os.environ['TM_HISTORY_GRANT_JSON'] = json.dumps({
+                    'ledger_path': cycle_budget['path'], 'reservation_id': cycle_budget['reservation_id'],
+                    'cycle_ledger_key': cycle_ledger_key, 'entity': spec.name,
+                    'limit_bytes': cycle_budget['limit_bytes'], 'reserved_bytes': effective_bytes,
+                }, sort_keys=True)
         response_cache, cache_path, cache_ttl = _load_response_cache()
         # #1025: set by run_transfermarkt_scope_cycle for the entities that
         # follow players once the participant listing proved authoritatively

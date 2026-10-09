@@ -2230,6 +2230,9 @@ def test_history_partial_career_keeps_players_checkpoint_and_resumes(tmp_path, m
             row = result['native_write_manifest']['rows'][0]
             row['native_snapshot_id'] = snapshot
             row['native_hash'] = _fingerprint_rows(originals[snapshot])[1]
+            row['physical_refs'] = [[str(point[0]), f'original-{snapshot}', 1] for point in originals[snapshot]]
+            row['capture_unit_id'] = str(snapshot) * 64
+            row['native_batch_id'] = f'logical-{snapshot}'
         return result
     connection = mock.Mock()
     queries = []

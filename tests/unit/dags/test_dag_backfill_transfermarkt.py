@@ -48,6 +48,7 @@ def test_dag_is_continuous_single_run_and_has_no_scope_selectors(module):
     assert module.dag.dag_id == "dag_backfill_transfermarkt"
     assert module.dag.schedule == "@continuous"
     assert module.dag._dag_kwargs["max_active_runs"] == 1
+    assert module.dag._dag_kwargs['dagrun_timeout'].total_seconds() == 2700
     assert module.dag._dag_kwargs["catchup"] is False
     params = module.dag._dag_kwargs["params"]
     assert set(params) == {"max_batch", "resume_platform_block"}

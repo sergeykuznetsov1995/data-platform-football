@@ -2892,12 +2892,20 @@ def _history_complete_result(identity, parser_entity, result, final_path):
             for chunk, sha in chunks:
                 row = _manifest_rows(chunk, 'native-only').get(entity) or {}
                 count = int(chunk['outputs'][output_key]['rows'])
-                ids = (chunk.get('career_window') or {}).get('attempted_ids')
-                if not isinstance(ids, list):
-                    raise ScopeCycleError('historical career chunk lacks exact processed ids')
+                refs = row.get('physical_refs')
+                if not refs and count == 0 and chunk['outputs'][output_key].get('applicability_status') == 'not_applicable':
+                    continue
+                if not isinstance(refs, list) or not refs or not row.get('capture_unit_id'):
+                    raise ScopeCycleError('historical career chunk lacks immutable original physical refs')
+                ids = [item[0] for item in refs]
                 original_receipts.append({'snapshot_id': row.get('native_snapshot_id'), 'player_ids': ids,
                     'row_count': int(row.get('native_rows', count)), 'key_hash': row.get('native_hash', stable_hash([])),
+                    'physical_refs': refs, 'capture_unit_id': row['capture_unit_id'],
+                    'native_batch_id': row['native_batch_id'],
+                    'empty_capture_refs': row.get('empty_capture_refs', []),
                     'cycle_id': identity.child_cycle_id, 'scope_id': identity.scope_id, 'result_sha256': sha})
+            if not original_receipts:
+                continue
             count, digest = _fingerprint_rows(historical_career_rows(cur, entity, original_receipts))
             value['historical_career_receipts'][entity] = original_receipts
             output = value['outputs'][output_key]

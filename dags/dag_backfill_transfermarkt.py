@@ -566,6 +566,7 @@ with DAG(
     render_template_as_native_obj=True,
     tags=["scraping", "transfermarkt", "bronze", "historical", "backfill"],
     max_active_runs=1,
+    dagrun_timeout=timedelta(seconds=MAX_PORTION_SECONDS),
     max_active_tasks=max(1, STREAMS.history_capacity),
     params={
         "max_batch": Param(

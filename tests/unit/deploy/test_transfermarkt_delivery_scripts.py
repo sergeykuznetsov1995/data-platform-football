@@ -64,6 +64,10 @@ case "$cmd" in
       "airflow dags unpause") [ -e "$S/pause_fails_$4" ] || echo f > "$S/paused_$4" ;;
       "airflow pools set") echo "$5" > "$S/pool_$4" ;;
       "python -m scrapers.transfermarkt.airflow_pools")
+        if [ -e "$S/old_without_helper" ] && [[ "$(head -1 "$S/mounts_$c")" == "$(cat "$S/old_without_helper")/"* ]]; then
+          echo called > "$S/helper_on_old_called"
+          exit 99
+        fi
         if [ "$4" = --apply ]; then
           for p in transfermarkt_control transfermarkt_proxy; do echo 1 > "$S/pool_$p"; done
           for p in transfermarkt_backfill_control transfermarkt_backfill_proxy; do echo 0 > "$S/pool_$p"; done
@@ -215,6 +219,26 @@ def test_a_confirmed_rollback_with_a_failed_pause_restore_is_not_a_success(stand
     assert "OUTCOME=needs-hands" in window, window
     assert "RESTORED=t" not in window
     assert (stand.auto / "transfermarkt-auto-deliver.off").exists()
+
+
+@pytest.mark.unit
+def test_first_upgrade_rolls_back_without_new_helper_or_control_pool(stand: Stand) -> None:
+    legacy_pools = ('ingest_scraper_pool', 'transfermarkt_proxy',
+                    'transfermarkt_backfill_proxy', 'transfermarkt_backfill_control')
+    snapshot = stand.auto / 'transfermarkt-rollback.env'
+    text = snapshot.read_text().replace('POOL_transfermarkt_control=1\n', '')
+    text += 'OLD_POOLS=' + ' '.join(legacy_pools) + '\nPOOL_ingest_scraper_pool=3\n'
+    snapshot.write_text(text)
+    old_deploy = stand.old / 'deploy/transfermarkt/deploy.sh'
+    old_deploy.write_text(old_deploy.read_text().replace('transfermarkt_control ', 'ingest_scraper_pool '))
+    stand.put('old_without_helper', str(stand.old))
+    result = stand.run()
+    assert result.returncode == 1, result.stderr
+    assert stand.env_root() == str(stand.old)
+    assert not (stand.state / 'helper_on_old_called').exists()
+    assert not (stand.auto / 'transfermarkt-auto-deliver.off').exists()
+    assert 'RESTORED=t' in stand.window()
+    assert (stand.state / 'pool_ingest_scraper_pool').read_text().strip() == '3'
 
 
 @pytest.mark.unit

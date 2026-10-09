@@ -90,9 +90,25 @@ def journal_lease(lease, scope, *, snapshot=None):
     value = json.loads(path.read_text()) if path.exists() else {'scope': scope, 'leases': {}}
     if value.get('scope') != scope:
         raise ValueError('historical lease journal scope mismatch')
-    record = {'lease': asdict(lease), 'portion_id': os.environ['TM_HISTORY_PORTION_ID'], 'status': 'active'}
+    record = value['leases'].get(lease.lease_id)
+    if record is None:
+        if snapshot is not None:
+            raise ValueError('historical close lacks its original acquisition journal')
+        record = {'lease': asdict(lease), 'portion_id': os.environ['TM_HISTORY_PORTION_ID'],
+                  'attempt_ledger': os.environ['TM_HISTORY_ATTEMPT_LEDGER'],
+                  'deadline_at': os.environ['TM_HISTORY_DEADLINE_AT'],
+                  'provider_byte_grant': os.environ.get('TM_PROVIDER_BYTE_BUDGET'),
+                  'grant_cycle_id': os.environ.get('TM_CYCLE_LEDGER_KEY'),
+                  'grant': json.loads(os.environ.get('TM_HISTORY_GRANT_JSON', '{}')), 'status': 'active'}
+    elif record['status'] == 'closed':
+        if snapshot is None or record['traffic'] != asdict(snapshot):
+            raise ValueError('closed historical lease evidence drifted')
+        return
+    elif record['lease'] != asdict(lease):
+        raise ValueError('historical lease acquisition identity drifted')
     if snapshot is not None:
-        record.update(status='closed', traffic=asdict(snapshot), reconciled_at=datetime.now(timezone.utc).isoformat())
+        record.update(status='closed', traffic=asdict(snapshot), reconciled_at=datetime.now(timezone.utc).isoformat(),
+                      reconciliation_portion_id=os.environ['TM_HISTORY_PORTION_ID'])
         # Closed proof needs no credential. Leave the immutable counters for audit.
         record['lease'].pop('token', None)
         record['lease'].pop('proxy_url', None)
