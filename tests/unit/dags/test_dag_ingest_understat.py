@@ -68,12 +68,10 @@ def test_daily_dag_is_the_single_0900_owner(dag_module):
 def test_runner_is_dynamically_mapped_one_scope_per_subprocess(dag_module):
     plan = _python("plan_current_scopes")
     runner = _bash("run_current_scope")
-    validator = _python("validate_current_scope")
 
     assert runner.is_mapped is True
     assert runner._expand_kwargs["env"].operator is plan
-    assert validator.is_mapped is True
-    assert validator._expand_kwargs["op_kwargs"].operator is plan
+    assert runner._init_kwargs["do_xcom_push"] is True
     assert plan._init_kwargs["pool"] == "ingest_scraper_pool"
     assert plan._init_kwargs["priority_weight"] == dag_module.CURRENT_PRIORITY
     assert runner._init_kwargs["pool"] == "ingest_scraper_pool"
@@ -83,7 +81,7 @@ def test_runner_is_dynamically_mapped_one_scope_per_subprocess(dag_module):
     assert "--season-slug \"${UNDERSTAT_SEASON_SLUG}\"" in runner.bash_command
     assert "--source-season-id \"${UNDERSTAT_SOURCE_SEASON_ID}\"" in runner.bash_command
     assert "--source-discovered \"${UNDERSTAT_SOURCE_DISCOVERED}\"" in runner.bash_command
-    assert "--output \"${UNDERSTAT_RESULT_PATH}\"" in runner.bash_command
+    assert "--output -" in runner.bash_command
     assert "/tmp/understat_result.json" not in runner.bash_command
 
 
@@ -100,8 +98,9 @@ def test_scope_environment_uses_canonical_slug_and_unique_result(dag_module):
     assert first["UNDERSTAT_SEASON_SLUG"] == "2526"
     assert first["UNDERSTAT_SOURCE_SEASON_ID"] == "2025"
     assert first["UNDERSTAT_SOURCE_DISCOVERED"] == "true"
-    assert first["UNDERSTAT_RESULT_PATH"] != second["UNDERSTAT_RESULT_PATH"]
-    assert first["UNDERSTAT_RESULT_PATH"].startswith("/tmp/understat_current_")
+    assert first["UNDERSTAT_LEAGUE"] != second["UNDERSTAT_LEAGUE"]
+    assert "UNDERSTAT_RESULT_PATH" not in first
+    assert first["UNDERSTAT_RUN_ID"] == "scheduled__2026-07-27T09:00:00+00:00"
     assert "UNDERSTAT_REPARSE" not in second
     assert first["PYTHONPATH"] == "/opt/airflow:/opt/airflow/dags"
 
@@ -132,10 +131,10 @@ def test_current_planner_uses_all_runtime_rolling_catalog_scopes(
     calls = []
 
     class Client:
-        pass
+        def __init__(self, **kwargs): pass
 
     class Catalog:
-        def __init__(self, client):
+        def __init__(self, client, **kwargs):
             assert isinstance(client, Client)
 
         def rolling_scopes(self, **kwargs):
@@ -172,8 +171,8 @@ def test_catalog_six_leagues_keep_closed_season_policy(dag_module, monkeypatch, 
         for league in PRODUCTION_LEAGUES
         for season, source_id in (("2526", 2025), ("2627", 2026))
     ]
-    monkeypatch.setattr(understat, "UnderstatClient", lambda: object())
-    monkeypatch.setattr(understat, "UnderstatCatalog", lambda client: SimpleNamespace(
+    monkeypatch.setattr(understat, "UnderstatClient", lambda **kwargs: object())
+    monkeypatch.setattr(understat, "UnderstatCatalog", lambda client, **kwargs: SimpleNamespace(
         rolling_scopes=lambda **kwargs: scopes,
     ))
     monkeypatch.setattr(dag_module, "UNDERSTAT_LEAGUES", list(reversed(PRODUCTION_LEAGUES)))
@@ -195,10 +194,10 @@ def _window_catalog(monkeypatch):
     import scrapers.understat as understat
 
     class Client:
-        pass
+        def __init__(self, **kwargs): pass
 
     class Catalog:
-        def __init__(self, client):
+        def __init__(self, client, **kwargs):
             pass
 
         def rolling_scopes(self, **kwargs):
@@ -251,7 +250,8 @@ def test_monday_plan_queues_closed_checks_after_all_current_scopes(
         ("ENG-Premier League", "2526", "closed_check"),
         ("ESP-La Liga", "2526", "closed_check"),
     ]
-    assert plan[2]["UNDERSTAT_RESULT_PATH"].startswith("/tmp/understat_closed_check_")
+    assert plan[2]["UNDERSTAT_MODE"] == "closed_check"
+    assert "UNDERSTAT_RESULT_PATH" not in plan[2]
 
 
 def _result(
@@ -311,7 +311,7 @@ def _result(
 
 def _validation_context(path: Path, *, mode="current"):
     return {
-        "UNDERSTAT_RESULT_PATH": str(path),
+        "report": json.loads(path.read_text()),
         "UNDERSTAT_MODE": mode,
         "UNDERSTAT_LEAGUE": "ENG-Premier League",
         "UNDERSTAT_SEASON_SLUG": "2526",

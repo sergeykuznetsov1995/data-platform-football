@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -493,6 +493,9 @@ class WorkloadClassBudget:
     sample_count: int = 0
     distinct_proxy_exits: int = 0
     measured_tournament_ids: tuple[str, ...] = ()
+    # Raw per-request observations. The capture pipeline adds the existing
+    # allocation headroom once, just as it does for hard_task_bytes.
+    request_bound_bytes: Mapping[str, int] = field(default_factory=dict)
 
 
 # ``hard_task_bytes`` is the exact maximum of the canary's cold samples and the
@@ -799,6 +802,15 @@ def load_static_workload_policy(
         hard_task_bytes = _positive_int(
             raw_class.get("hard_task_bytes"), f"{name}.hard_task_bytes"
         )
+        raw_bounds = raw_class.get("request_bound_bytes", {})
+        if not isinstance(raw_bounds, Mapping) or set(raw_bounds) - set(required_endpoints):
+            raise WorkloadPolicyUnavailable(
+                f"{name}.request_bound_bytes must name only required endpoints"
+            )
+        request_bounds = {
+            endpoint: _positive_int(value, f"{name}.request_bound_bytes.{endpoint}")
+            for endpoint, value in raw_bounds.items()
+        }
         classes[name] = WorkloadClassBudget(
             name=name,
             scope=scope,
@@ -806,6 +818,7 @@ def load_static_workload_policy(
             hard_task_bytes=hard_task_bytes,
             required_endpoints=required_endpoints,
             shape_digest=shape_digest,
+            request_bound_bytes=request_bounds,
         )
     return WorkloadBudgetPolicy(
         artifact_id=hashlib.sha256(raw).hexdigest(),
@@ -1707,8 +1720,8 @@ class AllocationLedger:
         for key in slim:
             run = runs[key]
             for allocation in run.get("allocations", {}).values():
-                for field in _SLIMMED_ALLOCATION_FIELDS:
-                    allocation.pop(field, None)
+                for slimmed_field in _SLIMMED_ALLOCATION_FIELDS:
+                    allocation.pop(slimmed_field, None)
             run["compacted"] = True
             run["compacted_at"] = now.isoformat()
         retired = payload.setdefault("retired_runs", {})

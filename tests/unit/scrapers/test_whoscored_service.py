@@ -17,7 +17,6 @@ from scrapers.whoscored.catalog import (
     CatalogError,
     WhoScoredCatalog,
 )
-from scrapers.whoscored.detailed_feeds import DETAILED_FEED_OPTIONS
 from scrapers.whoscored.parsers import (
     CalendarMonth,
     DatasetStatus,
@@ -46,7 +45,6 @@ from scrapers.whoscored.service import (
     CATALOG_REQUEST_BURST_SIZE,
     DEFAULT_CATALOG_REQUESTS_PER_MINUTE,
     DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE,
-    STRUCTURED_PARSE_BATCH_SIZE,
     STRUCTURED_REQUEST_BURST_SIZE,
     WhoScoredIngestService,
     _ParsedFetchSpec,
@@ -363,6 +361,9 @@ class _Repository:
         self.preview_commit_batches = []
         self.preview_failures = []
         self.scope_snapshots = []
+        self.stage_snapshot = None
+        self.stage_rows = {}
+        self.stage_cleanups = []
 
     def ensure_schema(self):
         return None
@@ -460,8 +461,24 @@ class _Repository:
         )
 
     def commit_scope_bundle(self, **snapshot):
+        snapshot["datasets"] = {
+            table: list(rows) for table, rows in snapshot["datasets"].items()
+        }
         self.scope_snapshots.append(snapshot)
         return "wss2-" + "a" * 64
+
+    def latest_stage_feed_snapshot(self, league, season):
+        return self.stage_snapshot
+
+    def iter_stage_xg_rows(self, league, season, *, table, stage_ids, batch_id=None):
+        return iter(
+            row
+            for row in self.stage_rows.get(table, [])
+            if row["stage_id"] in stage_ids
+        )
+
+    def cleanup_stage_feed_snapshot(self, **kwargs):
+        self.stage_cleanups.append(kwargs)
 
     def latest_source_season_id(self, *_args, **_kwargs):
         return None
@@ -2614,122 +2631,67 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     assert not snapshot.get("feed_states")
 
     calls.clear()
+    # Bootstrap HTML uses its own transport/raw-cache path; isolate it here,
+    # while asserting the actual xG structured request specs below.
+    observed_at = "2026-07-11T12:00:00+00:00"
+
+    def prepare_stage(**kwargs):
+        return TransportResponse(
+            url=kwargs["url"],
+            content=b"statistics HTML",
+            status_code=200,
+            headers={},
+            route=TransportRoute.DIRECT_HTTP,
+            wire_bytes=15,
+            sha256="b" * 64,
+            observed_at=observed_at,
+        ), "s3://raw/statistics"
+
+    service._prepare_stage_statistics = prepare_stage
+    original_many = service._fetch_parsed_many
+
+    def observed_many(specs):
+        return [
+            (replace(response, observed_at=observed_at), uri, parsed)
+            for response, uri, parsed in original_many(specs)
+        ]
+
+    service._fetch_parsed_many = observed_many
     stages = service.sync_stage_feeds()
 
     assert stages.status == "success", stages.as_dict()
-    assert stages.entity == "stages"
     assert stages.committed_batches == {"scope": ["wss2-" + "a" * 64]}
-    assert stages.metadata == {
-        "source_stage_ids": [700],
-        "source_stage_count": 1,
-    }
-    assert sum(structured_batch_sizes) == 17 + 2 * len(DETAILED_FEED_OPTIONS)
-    assert max(structured_batch_sizes) == STRUCTURED_PARSE_BATCH_SIZE
-    assert stages.counts == {
-        "team_stage_stats": 0,
-        "player_stage_stats": 0,
-        "referee_stage_stats": 0,
-    }
-    assert all(kwargs["allow_cache"] is True for _, _, kwargs in calls)
-
+    assert stages.metadata["feed_policy"] == "xg-only-v1"
+    assert sum(structured_batch_sizes) == 2
+    assert stages.counts == {"team_stage_stats": 0, "player_stage_stats": 0}
+    assert not team_stage_feed_urls
     team_params = [
         parse_qs(urlparse(url).query, keep_blank_values=True)
         for url in team_statistics_urls
     ]
-    assert {urlparse(url).path for url in team_statistics_urls} == {
-        "/statisticsfeed/1/getteamstatistics"
-    }
-    team_summary = team_params[:4]
-    team_detailed = team_params[4:]
-    assert [
-        (params["category"][0], params["subcategory"][0]) for params in team_summary
-    ] == [
-        ("summaryteam", "all"),
-        ("summaryteam", "offensive"),
-        ("summaryteam", "defensive"),
-        ("xg-teamstats", "summary"),
-    ]
-    assert [
-        (params["category"][0], params["subcategory"][0]) for params in team_detailed
-    ] == [(option.category, option.subcategory) for option in DETAILED_FEED_OPTIONS]
-    assert all(params["page"] == [""] for params in team_params)
-    assert all(params["numberOfTeamsToPick"] == [""] for params in team_params)
-    assert all(params["incPens"] == [""] for params in team_summary[:3])
-    assert all(params["against"] == [""] for params in team_summary[:3])
-    assert team_summary[-1]["sortAscending"] == ["false"]
-    assert team_summary[-1]["incPens"] == ["true"]
-    assert team_summary[-1]["against"] == ["false"]
-    assert all(params["sortBy"] == [""] for params in team_detailed)
-    assert all(params["incPens"] == [""] for params in team_detailed)
-    assert all(params["against"] == [""] for params in team_detailed)
-    statistics_bootstrap = (
-        "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
-        "Stages/700/TeamStatistics"
-    )
-    assert {
-        kwargs["browser_bootstrap_url"]
-        for kind, _, kwargs in calls
-        if kind in {"team_stage_statistics", "player_stage_statistics"}
-    } == {statistics_bootstrap}
-
     player_params = [
         parse_qs(urlparse(url).query, keep_blank_values=True)
         for url in player_statistics_urls
     ]
-    assert {urlparse(url).path for url in player_statistics_urls} == {
-        "/statisticsfeed/1/getplayerstatistics"
-    }
-    player_summary = player_params[:5]
-    player_detailed = player_params[5:]
-    assert [
-        (params["category"][0], params["subcategory"][0]) for params in player_summary
-    ] == [
-        ("summary", "all"),
-        ("summary", "defensive"),
-        ("summary", "offensive"),
-        ("summary", "passing"),
-        ("xg-stats", "summary"),
-    ]
-    assert [
-        (params["category"][0], params["subcategory"][0]) for params in player_detailed
-    ] == [(option.category, option.subcategory) for option in DETAILED_FEED_OPTIONS]
-    assert all(params["isMinApp"] == ["true"] for params in player_params)
-    assert all(params["numberOfPlayersToPick"] == ["5000"] for params in player_params)
-    assert all("incPens" not in params for params in player_summary[:-1])
-    assert player_summary[-1]["incPens"] == ["true"]
-    assert all("incPens" not in params for params in player_detailed)
-    assert all(params["sortBy"] == [""] for params in player_detailed)
-
-    stage_feed_params = [
-        parse_qs(urlparse(url).query, keep_blank_values=True)
-        for url in team_stage_feed_urls
-    ]
-    assert [int(params["type"][0]) for params in stage_feed_params] == [
-        2,
-        3,
-        6,
-        7,
-        8,
-        11,
-        18,
-        25,
-    ]
-    assert all(params["teamId"] == ["-1"] for params in stage_feed_params)
-    assert all(params["field"] == ["2"] for params in stage_feed_params[:-1])
-    assert all(params["against"] == ["0"] for params in stage_feed_params[:-1])
-    assert stage_feed_params[-1]["field"] == ["-1"]
-    assert stage_feed_params[-1]["against"] == ["-1"]
-
-    assert len(repository.scope_snapshots) == 2
-    snapshot = repository.scope_snapshots[1]
+    assert [p["category"] for p in team_params] == [["xg-teamstats"]]
+    assert [p["category"] for p in player_params] == [["xg-stats"]]
+    assert team_params[0]["sortAscending"] == ["false"]
+    assert team_params[0]["incPens"] == ["true"]
+    assert team_params[0]["against"] == ["false"]
+    assert player_params[0]["incPens"] == ["true"]
+    snapshot = repository.scope_snapshots[-1]
     assert set(snapshot["datasets"]) == {
         "whoscored_team_stage_stats",
         "whoscored_player_stage_stats",
-        "whoscored_referee_stage_stats",
     }
     assert snapshot["entity_group"] == "stages"
-    assert len(snapshot["feed_states"]) == 68
+    assert snapshot["feed_policy"] == "xg-only-v1"
     assert set(snapshot["feed_states"].values()) == {"empty"}
+    assert len(snapshot["feed_states"]) == 2
+    assert snapshot["feed_checks"]["700"] == {
+        "checked_at": observed_at,
+        "final": False,
+    }
 
     calls.clear()
     service.catalog_season = replace(service.catalog_season, end=date(2020, 1, 1))
@@ -2737,7 +2699,13 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     assert historical.status == "success", historical.as_dict()
     historical_stages = service.sync_stage_feeds()
     assert historical_stages.status == "success", historical_stages.as_dict()
-    assert all(kwargs.get("cache_ttl") is None for _, _, kwargs in calls)
+    stage_calls = [
+        kwargs
+        for kind, _, kwargs in calls
+        if kind in {"team_stage_statistics", "player_stage_statistics"}
+    ]
+    assert stage_calls and all(kwargs["allow_cache"] is False for kwargs in stage_calls)
+    assert repository.scope_snapshots[-1]["feed_checks"]["700"]["final"] is True
 
 
 def test_player_stage_statistics_fetches_every_declared_page(tmp_path, monkeypatch):
@@ -3971,3 +3939,368 @@ def test_proxy_unavailable_escapes_discover_catalog(monkeypatch):
             full_history=True,
         )
     assert repository.persisted == []
+
+
+def _xg_service(tmp_path, *, final=False, stages=(700,)):
+    from scrapers.whoscored.parsers import PARSER_VERSION
+
+    service, repository, _ = _service(tmp_path)
+    now = datetime.now(timezone.utc)
+    kickoffs = (-10,) if final else (-1, 10)
+    service._collect_season_schedule = lambda: SimpleNamespace(
+        today=now.date(),
+        active=True,
+        source_season_id=9001,
+        stage_rows=[{"stage_id": stage} for stage in stages],
+        schedule_by_id={
+            stage * 10 + i: {"stage_id": stage, "date": now + timedelta(days=offset)}
+            for stage in stages
+            for i, offset in enumerate(kickoffs)
+        },
+        raw_uris=["s3://raw/season"],
+        payload_hashes=["a" * 64],
+    )
+    prepared, fetched = [], []
+
+    def response(stage, observed=None):
+        return TransportResponse(
+            url=f"https://www.whoscored.com/Stages/{stage}/TeamStatistics",
+            content=b"data",
+            status_code=200,
+            headers={},
+            route=TransportRoute.DIRECT_HTTP,
+            wire_bytes=4,
+            sha256="b" * 64,
+            observed_at=(observed or now).isoformat(),
+        )
+
+    def prepare(**kwargs):
+        prepared.append(kwargs)
+        return response(kwargs["stage_id"]), f"s3://raw/html-{kwargs['stage_id']}"
+
+    def many(specs):
+        fetched.extend(specs)
+        result = []
+        for spec in specs:
+            stage = int(spec.target.source_ids["stage_id"])
+            category = spec.target.source_ids["category"]
+            row = {
+                "stage_id": stage,
+                "source_category": category,
+                "statistic": "xG",
+                "value": 1.0,
+            }
+            result.append(
+                (
+                    response(stage),
+                    f"s3://raw/{stage}-{category}",
+                    ParsedDataset("stage", DatasetStatus.AVAILABLE, (row,)),
+                )
+            )
+        return result
+
+    service._prepare_stage_statistics = prepare
+    service._fetch_parsed_many = many
+    return service, repository, now, prepared, fetched, response, PARSER_VERSION
+
+
+def _xg_previous(
+    repository,
+    now,
+    parser_version,
+    *,
+    stages=(700,),
+    final=False,
+    negative=False,
+    days_ago=1,
+):
+    repository.stage_snapshot = {
+        "batch_id": "wss2-" + "c" * 64,
+        "raw_uris": ["s3://raw/previous"],
+        "payload_sha256": "c" * 64,
+        "parser_version": parser_version,
+        "feed_policy": "xg-only-v1",
+        "feed_states": {
+            f"{stage}:{key}": "not_available" if negative else "available"
+            for stage in stages
+            for key in ("team:xg-teamstats:summary", "player:xg-stats:summary")
+        },
+        "feed_checks": {
+            str(stage): {
+                "checked_at": (now - timedelta(days=days_ago)).isoformat(),
+                "final": final,
+            }
+            for stage in stages
+        },
+    }
+    repository.stage_rows = {
+        table: [
+            {
+                "stage_id": stage,
+                "source_category": category,
+                "entity_key": hashlib.sha256(
+                    f"{stage}:{category}".encode()
+                ).hexdigest(),
+                "statistic": "xG",
+                "value": 0.5,
+            }
+            for stage in stages
+        ]
+        for table, category in (
+            ("whoscored_team_stage_stats", "xg-teamstats"),
+            ("whoscored_player_stage_stats", "xg-stats"),
+        )
+    }
+
+
+def test_xg_only_two_feeds_and_persistent_check_metadata(tmp_path):
+    service, repository, now, prepared, fetched, _, _ = _xg_service(tmp_path)
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert len(prepared) == 1 and len(fetched) == 2
+    assert {s.target.source_ids["category"] for s in fetched} == {
+        "xg-teamstats",
+        "xg-stats",
+    }
+    assert all(s.cache_ttl == timedelta(days=7) for s in fetched)
+    snapshot = repository.scope_snapshots[-1]
+    assert snapshot["feed_checks"] == {
+        "700": {"checked_at": now.isoformat(), "final": False}
+    }
+    assert snapshot["feed_policy"] == "xg-only-v1"
+    assert set(snapshot["datasets"]) == {
+        "whoscored_team_stage_stats",
+        "whoscored_player_stage_stats",
+    }
+
+
+@pytest.mark.parametrize("negative", [False, True])
+def test_xg_fresh_manifest_skips_requests_and_republication(tmp_path, negative):
+    service, repo, now, prepared, fetched, _, version = _xg_service(tmp_path)
+    _xg_previous(repo, now, version, negative=negative)
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert result.skipped == 1
+    assert result.metadata["stage_xg_retained"] == [700]
+    assert not prepared and not fetched and not repo.scope_snapshots
+
+
+def test_xg_expired_negative_reprobe_preserves_previous_positive_rows(tmp_path):
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    service, repo, now, _, fetched, response, version = _xg_service(tmp_path)
+    _xg_previous(repo, now, version, negative=True, days_ago=7)
+
+    def absent(**kwargs):
+        exc = StageStatisticsUnavailable(response(kwargs["stage_id"]))
+        exc.raw_uri = "s3://raw/absent"
+        exc.payload_sha256 = "d" * 64
+        raise exc
+
+    service._prepare_stage_statistics = absent
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert not fetched
+    snapshot = repo.scope_snapshots[-1]
+    assert set(snapshot["feed_states"].values()) == {"not_available"}
+    assert snapshot["feed_checks"]["700"]["checked_at"] == now.isoformat()
+    assert all(len(rows) == 1 for rows in snapshot["datasets"].values())
+    assert "s3://raw/absent" in snapshot["raw_uris"]
+    assert "s3://raw/previous" in snapshot["raw_uris"]
+
+
+def test_xg_negative_requires_raw_evidence(tmp_path):
+    from scrapers.whoscored.transport import StageStatisticsUnavailable
+
+    service, repo, _, _, _, response, _ = _xg_service(tmp_path)
+
+    def absent(**kwargs):
+        raise StageStatisticsUnavailable(response(kwargs["stage_id"]))
+
+    service._prepare_stage_statistics = absent
+    result = service.sync_stage_feeds()
+    assert result.status == "failed"
+    assert "persisted HTML evidence" in result.errors[0]
+    assert not repo.scope_snapshots
+
+
+def test_xg_final_collection_ignores_intermediate_cache_including_page_two(tmp_path):
+    service, repo, now, prepared, fetched, _, version = _xg_service(
+        tmp_path, final=True
+    )
+    _xg_previous(repo, now, version, final=False)
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert prepared[0]["final"] is True
+    assert all(spec.allow_cache is False for spec in fetched)
+    assert fetched[1].page_factory(2).allow_cache is False
+    assert repo.scope_snapshots[-1]["feed_checks"]["700"]["final"] is True
+
+
+def test_xg_final_snapshot_is_not_downloaded_again(tmp_path):
+    service, repo, now, prepared, fetched, _, version = _xg_service(
+        tmp_path, final=True
+    )
+    _xg_previous(repo, now, version, final=True, days_ago=40)
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert result.skipped == 1
+    assert not prepared and not fetched and not repo.scope_snapshots
+    assert repo.stage_cleanups == [
+        {
+            "league": "INT-World Cup",
+            "season": "2026",
+            "batch_id": repo.stage_snapshot["batch_id"],
+        }
+    ]
+
+
+def test_xg_mixed_refresh_keeps_skipped_stage_rows_and_original_timestamp(tmp_path):
+    service, repo, now, prepared, fetched, _, version = _xg_service(
+        tmp_path, stages=(700, 701)
+    )
+    _xg_previous(repo, now, version, stages=(700,))
+    original_check = dict(repo.stage_snapshot["feed_checks"]["700"])
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert [r["stage_id"] for r in prepared] == [701]
+    assert len(fetched) == 2
+    snapshot = repo.scope_snapshots[-1]
+    assert snapshot["feed_checks"]["700"] == original_check
+    for rows in snapshot["datasets"].values():
+        assert {r["stage_id"] for r in rows} == {700, 701}
+        assert next(r for r in rows if r["stage_id"] == 700)["value"] == 0.5
+
+
+def test_xg_open_circuit_defers_without_publishing_or_changing_checks(tmp_path):
+    from scrapers.whoscored.transport import CloudflareChallenge
+    from scrapers.whoscored.source_circuit import SourceCircuitOpen
+
+    service, repo, now, _, fetched, _, version = _xg_service(tmp_path)
+    _xg_previous(repo, now, version, days_ago=8)
+    original = json.dumps(repo.stage_snapshot, sort_keys=True)
+
+    def cooldown(**kwargs):
+        try:
+            raise SourceCircuitOpen(state="open", retry_at=now.timestamp() + 900)
+        except SourceCircuitOpen as cause:
+            raise CloudflareChallenge(
+                "cooldown",
+                url=kwargs["url"],
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+                source_wide=True,
+            ) from cause
+
+    service._prepare_stage_statistics = cooldown
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert result.skipped == 1 and result.metadata["stage_xg_deferred"] == [700]
+    assert not fetched and not repo.scope_snapshots
+    assert json.dumps(repo.stage_snapshot, sort_keys=True) == original
+
+
+def test_xg_future_stage_deferred_without_freezing_final_verdict(tmp_path):
+    service, repo, now, prepared, fetched, _, _ = _xg_service(tmp_path)
+    collected = service._collect_season_schedule()
+    collected.schedule_by_id = {1: {"stage_id": 700, "date": now + timedelta(days=15)}}
+    service._collect_season_schedule = lambda: collected
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert result.metadata["stage_xg_deferred"] == [700]
+    assert not prepared and not fetched and not repo.scope_snapshots
+
+
+def test_xg_json_drift_is_failure_without_partial_publication(tmp_path):
+    service, repo, _, _, _, _, _ = _xg_service(tmp_path)
+    original = service._fetch_parsed_many
+
+    def drift(specs):
+        responses = original(specs)
+        response, uri, _ = responses[1]
+        responses[1] = (
+            response,
+            uri,
+            ParsedDataset("players", DatasetStatus.NOT_AVAILABLE, ()),
+        )
+        return responses
+
+    service._fetch_parsed_many = drift
+    result = service.sync_stage_feeds()
+    assert result.status == "failed"
+    assert "xG structure is unavailable" in result.errors[0]
+    assert not repo.scope_snapshots
+
+
+def test_xg_skipped_final_snapshot_retries_cleanup_failure_without_source(tmp_path):
+    service, repo, now, prepared, fetched, _, version = _xg_service(
+        tmp_path, final=True
+    )
+    _xg_previous(repo, now, version, final=True)
+    attempts = []
+
+    def cleanup(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary cleanup failure")
+
+    repo.cleanup_stage_feed_snapshot = cleanup
+    first = service.sync_stage_feeds()
+    second = service.sync_stage_feeds()
+    assert first.status == "failed" and "cleanup failure" in first.errors[0]
+    assert second.status == "success" and second.skipped == 1
+    assert len(attempts) == 2
+    assert not prepared and not fetched and not repo.scope_snapshots
+
+
+def test_xg_html_bootstrap_uses_page_limiter_not_json_limiter(tmp_path):
+    service, _, _, _, _, response, _ = _xg_service(tmp_path)
+    # Restore the real raw-cache/lock integration replaced by _xg_service.
+    prepare = WhoScoredIngestService._prepare_stage_statistics.__get__(service)
+    acquired = []
+    service._rate_limiter.acquire = lambda: acquired.append("html30")
+    service._structured_rate_limiter.acquire = lambda: acquired.append("json60")
+    url = "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/Stages/700/TeamStatistics"
+
+    def transport_prepare(bootstrap_url, *, cache_key, before_network, **kwargs):
+        before_network()
+        source = replace(
+            response(700), url=bootstrap_url, sha256=hashlib.sha256(b"data").hexdigest()
+        )
+        service.transport.raw_cache.store(
+            cache_key,
+            CachedPayload(content=source.content, observed_at=source.observed_at),
+            source.sha256,
+        )
+        return source
+
+    service.transport.prepare_stage_statistics = transport_prepare
+    fetched, raw_uri = prepare(stage_id=700, url=url, final=False)
+    assert acquired == ["html30"]
+    assert fetched.url == url
+    assert raw_uri
+
+
+def test_xg_check_timestamp_uses_oldest_cached_json_not_new_bootstrap(tmp_path):
+    service, repo, now, _, _, _, _ = _xg_service(tmp_path)
+    original = service._fetch_parsed_many
+    oldest = now - timedelta(days=6, hours=23)
+
+    def cached_json(specs):
+        results = original(specs)
+        response, uri, parsed = results[0]
+        results[0] = (
+            replace(
+                response, route=TransportRoute.RAW_CACHE, observed_at=oldest.isoformat()
+            ),
+            uri,
+            parsed,
+        )
+        return results
+
+    service._fetch_parsed_many = cached_json
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert (
+        repo.scope_snapshots[-1]["feed_checks"]["700"]["checked_at"]
+        == oldest.isoformat()
+    )

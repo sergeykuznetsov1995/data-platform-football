@@ -36,9 +36,10 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import (
     Any,
@@ -56,7 +57,7 @@ import requests
 
 from scrapers.base.flaresolverr_client import (
     FlareSolverrCFChallengeFailed,
-    FlareSolverrClient,
+    FlareSolverrClient as _SharedFlareSolverrClient,
     FlareSolverrError,
     FlareSolverrErrorPage,
     FlareSolverrResponseTooLarge,
@@ -92,6 +93,48 @@ from scrapers.whoscored.source_circuit import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class FlareSolverrClient(_SharedFlareSolverrClient):
+    """WhoScored adapter retaining the browser's reported navigation URL.
+
+    The common get() still owns request policy, runtime authority and traffic
+    accounting. Only the URL it discards is retained for source validation.
+    """
+
+    def _post(
+        self,
+        payload: dict,
+        timeout: Optional[float] = None,
+        *,
+        endpoint_path: str = "/v1",
+    ) -> dict:
+        data = super()._post(payload, timeout=timeout, endpoint_path=endpoint_path)
+        if payload.get("cmd") == "request.get":
+            solution = data.get("solution")
+            self._source_final_url = (
+                solution.get("url") if isinstance(solution, Mapping) else None
+            )
+        return data
+
+    def get(
+        self,
+        url: str,
+        session_id: str,
+        max_timeout_ms: Optional[int] = None,
+        return_only_cookies: bool = False,
+        disable_media: bool = False,
+    ) -> dict:
+        self._source_final_url = None
+        solution = super().get(
+            url,
+            session_id,
+            max_timeout_ms=max_timeout_ms,
+            return_only_cookies=return_only_cookies,
+            disable_media=disable_media,
+        )
+        return {**solution, "url": self._source_final_url}
+
 
 DEFAULT_DIRECT_BROWSER_ATTEMPTS = 4
 DEFAULT_DIRECT_HTTP_RETRY_BACKOFF_SECONDS = 2.0
@@ -246,6 +289,19 @@ class CloudflareChallenge(WhoScoredTransportError):
             retryable=True,
         )
         self.source_wide = bool(source_wide)
+
+
+class StageStatisticsUnavailable(WhoScoredTransportError):
+    """A complete source statistics page does not publish a usable XHR token."""
+
+    def __init__(self, response: TransportResponse) -> None:
+        super().__init__(
+            "WhoScored statistics page request header is unavailable",
+            kind=FailureKind.CONTENT,
+            url=response.url,
+            route=response.route,
+        )
+        self.observed_at = response.observed_at
 
 
 class TransportBudgetExceeded(WhoScoredTransportError):
@@ -654,6 +710,7 @@ class TransportStats:
     browser_sessions: int = 0
     browser_batches: int = 0
     browser_batch_items: int = 0
+    stage_xhr_token: Counter[str] = field(default_factory=Counter)
     paid_urls: set[str] = field(default_factory=set)
     paid_proxy_up_bytes: int = 0
     paid_proxy_down_bytes: int = 0
@@ -674,6 +731,7 @@ class TransportStats:
             "browser_sessions": self.browser_sessions,
             "browser_batches": self.browser_batches,
             "browser_batch_items": self.browser_batch_items,
+            "stage_xhr_token": dict(self.stage_xhr_token),
             "paid_urls": len(self.paid_urls),
             "paid_proxy_up_bytes": self.paid_proxy_up_bytes,
             "paid_proxy_down_bytes": self.paid_proxy_down_bytes,
@@ -2333,6 +2391,93 @@ def _is_whoscored_stage_bootstrap_url(url: str) -> bool:
     )
 
 
+class _StageStatisticsHTML(HTMLParser):
+    """Read source markup only; scripts are never evaluated."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.scripts: list[str] = []
+        self._script: Optional[list[str]] = None
+        self.statistics = False
+        self.closed_body = False
+        self.closed_html = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag == "script":
+            self._script = []
+        if tag in {"div", "table", "section"}:
+            element_id = dict(attrs).get("id") or ""
+            if re.fullmatch(
+                r"(?:team-|player-)?statistics(?:-[a-z0-9-]+)?", element_id
+            ):
+                self.statistics = True
+
+    def handle_data(self, data: str) -> None:
+        if self._script is not None:
+            self._script.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self._script is not None:
+            self.scripts.append("".join(self._script))
+            self._script = None
+        if tag == "body":
+            self.closed_body = True
+        if tag == "html":
+            self.closed_html = True
+
+
+def _stage_statistics_source(response: TransportResponse) -> _StageStatisticsHTML:
+    source = _StageStatisticsHTML()
+    source.feed(response.text)
+    source.close()
+    if not (source.statistics and source.closed_body and source.closed_html):
+        raise WhoScoredTransportError(
+            "incomplete or unrecognised WhoScored statistics HTML",
+            kind=FailureKind.CONTENT,
+            url=response.url,
+            route=response.route,
+        )
+    return source
+
+
+def _stage_statistics_token(source: _StageStatisticsHTML) -> Optional[str]:
+    # Preserve quoted literals while discarding JS comments. Accept only literal
+    # assignments/object properties terminated by JS punctuation, never calls,
+    # concatenations, escaped strings or executable expressions.
+    lexeme = re.compile(
+        r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|"""
+        r"""//[^\r\n]*|/\*[\s\S]*?\*/|[A-Za-z_$][A-Za-z0-9_$]*|[^\s]"""
+    )
+    values: dict[str, list[str]] = {}
+    for script in source.scripts:
+        tokens = [
+            match[0]
+            for match in lexeme.finditer(script)
+            if not match[0].startswith(("//", "/*"))
+        ]
+        for index in range(len(tokens) - 2):
+            key = tokens[index]
+            if key.startswith(('"', "'")):
+                key = key[1:-1]
+                if tokens[index + 1] != ":":
+                    continue
+            if key not in {"gSiteHeaderName", "gSiteHeaderValue"}:
+                continue
+            if tokens[index + 1] not in {"=", ":"}:
+                continue
+            value = re.fullmatch(r"""(["'])([^"'\\\r\n]*)\1""", tokens[index + 2])
+            if value is None:
+                continue
+            if index + 3 < len(tokens) and tokens[index + 3] not in {",", ";", "}"}:
+                continue
+            values.setdefault(key, []).append(value[2])
+    if values.get("gSiteHeaderName") == ["Model-last-Mode"]:
+        tokens = values.get("gSiteHeaderValue", [])
+        if len(tokens) == 1 and re.fullmatch(r"[A-Za-z0-9+/]{43}=", tokens[0]):
+            return tokens[0]
+    return None
+
+
 def is_whoscored_structured_feed_access_gate(
     url: str,
     status_code: int,
@@ -2499,7 +2644,7 @@ class WhoScoredTransport:
         direct_browser_attempts: int = DEFAULT_DIRECT_BROWSER_ATTEMPTS,
         browser_retry_backoff_seconds: float = (DEFAULT_BROWSER_RETRY_BACKOFF_SECONDS),
         browser_retry_jitter_seconds: float = DEFAULT_BROWSER_RETRY_JITTER_SECONDS,
-        impersonate: str = "chrome120",
+        impersonate: str = "chrome142",
         direct_http_session: Any = None,
         direct_fs_client: Optional[FlareSolverrClient] = None,
         paid_fs_client: Optional[FlareSolverrClient] = None,
@@ -2683,7 +2828,9 @@ class WhoScoredTransport:
                 and http_session_factory is None
             )
         )
-        self._pool_member_ids = {self._pool_proxy_url: 1} if self._pool_proxy_url else {}
+        self._pool_member_ids = (
+            {self._pool_proxy_url: 1} if self._pool_proxy_url else {}
+        )
         self._direct_http = direct_http_session or self._new_http_session(
             self._pool_proxy_url
         )
@@ -2704,7 +2851,8 @@ class WhoScoredTransport:
             **identity_kwargs,
         )
         self._paid_fs = (
-            paid_fs_client or FlareSolverrClient(
+            paid_fs_client
+            or FlareSolverrClient(
                 url=flaresolverr_url,
                 **identity_kwargs,
             )
@@ -2729,6 +2877,11 @@ class WhoScoredTransport:
         self._active_context = self.context
         self._active_cache_key = ""
         self._active_request_id = ""
+        # Tokens are capabilities of the exact session + pool member + page.
+        # Never put them on session.headers, where unrelated requests inherit them.
+        self._stage_http_context: Optional[tuple[str, str, Any, Optional[str], str]] = (
+            None
+        )
         self._source_circuit_browser_blocked = False
 
     def _paid_fallback_enabled(self) -> bool:
@@ -2759,7 +2912,10 @@ class WhoScoredTransport:
         if (
             self._source_circuit is None
             or self._source_circuit_permit is not None
-            or not _is_whoscored_structured_feed_url(url)
+            or not (
+                _is_whoscored_structured_feed_url(url)
+                or _is_whoscored_stage_bootstrap_url(url)
+            )
         ):
             return True
         try:
@@ -2799,7 +2955,10 @@ class WhoScoredTransport:
         if (
             self._source_circuit is None
             or self._source_circuit_permit is None
-            or not _is_whoscored_structured_feed_url(url)
+            or not (
+                _is_whoscored_structured_feed_url(url)
+                or _is_whoscored_stage_bootstrap_url(url)
+            )
         ):
             return
         permit = self._source_circuit_permit
@@ -2842,7 +3001,10 @@ class WhoScoredTransport:
             self._source_circuit is None
             or self._source_circuit_permit is None
             or not self._source_circuit_permit.is_probe
-            or not _is_whoscored_structured_feed_url(url)
+            or not (
+                _is_whoscored_structured_feed_url(url)
+                or _is_whoscored_stage_bootstrap_url(url)
+            )
         ):
             return False
         permit = self._source_circuit_permit
@@ -2953,10 +3115,9 @@ class WhoScoredTransport:
         self._pool_proxy_url = replacement
         self._pool_member_ids.setdefault(replacement, len(self._pool_member_ids) + 1)
         self._direct_http = self._new_http_session(replacement)
+        self._stage_http_context = None
         # A browser session keeps the member it was opened with.
-        self._drop_browser_session(
-            self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
-        )
+        self._drop_browser_session(self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR)
         close = getattr(previous, "close", None)
         if callable(close):
             try:
@@ -3192,6 +3353,7 @@ class WhoScoredTransport:
 
     def _replay_browser_identity(self, solution: Mapping[str, Any]) -> None:
         """Replay solved CF cookies into direct HTTP when the session supports it."""
+        self._stage_http_context = None
         cookies = solution.get("cookies") or []
         jar = getattr(self._direct_http, "cookies", None)
         if jar is not None:
@@ -3228,6 +3390,70 @@ class WhoScoredTransport:
             scope=scope,
             entity=entity or self.context.entity or _entity_from_cache_key(cache_key),
         )
+
+    def prepare_stage_statistics(
+        self,
+        bootstrap_url: str,
+        *,
+        cache_key: str,
+        before_network: Optional[Callable[[], None]] = None,
+        scope: Optional[str] = None,
+        entity: Optional[str] = None,
+    ) -> TransportResponse:
+        """Cache-first bootstrap, preserving ordinary-page absence as evidence."""
+        if not _is_whoscored_stage_bootstrap_url(bootstrap_url):
+            raise WhoScoredTransportError(
+                "statistics bootstrap URL is invalid",
+                kind=FailureKind.CONFIG,
+                url=bootstrap_url,
+            )
+        # Clear stale capabilities before preparing a different page, including
+        # a page that later fails validation or has no token.
+        previous = self._stage_http_context
+        if previous is not None and previous[0] != bootstrap_url:
+            self._stage_http_context = None
+        try:
+            response = self.fetch(
+                bootstrap_url,
+                cache_key=cache_key,
+                validator=lambda response: bool(_stage_statistics_source(response)),
+                before_network=before_network,
+                scope=scope,
+                entity=entity,
+            )
+        except BaseException:
+            self._stage_http_context = None
+            raise
+        token = _stage_statistics_token(_stage_statistics_source(response))
+        if token is None:
+            self._stage_http_context = None
+            self.stats.stage_xhr_token["source_unavailable"] += 1
+            raise StageStatisticsUnavailable(response)
+        self.stats.stage_xhr_token["available"] += 1
+        if response.route in {
+            TransportRoute.DIRECT_HTTP,
+            TransportRoute.DIRECT_FLARESOLVERR,
+        }:
+            self._stage_http_context = (
+                bootstrap_url,
+                token,
+                self._direct_http,
+                self._pool_proxy_url,
+                response.sha256,
+            )
+        elif (
+            response.route is not TransportRoute.RAW_CACHE
+            or previous is None
+            or previous != self._stage_http_context
+            or previous[4] != response.sha256
+            or previous[2] is not self._direct_http
+            or previous[3] != self._pool_proxy_url
+        ):
+            # Raw HTML retains source evidence, but has no cookies belonging to
+            # a fresh session. Let the normal browser fallback establish them.
+            self._stage_http_context = None
+        self._direct_gate_circuits.discard(_canonical_url_key(bootstrap_url))
+        return response
 
     def fetch(
         self,
@@ -3657,7 +3883,7 @@ class WhoScoredTransport:
                         [item for _, item, _ in pending],
                         client=self._direct_fs,
                         route=TransportRoute.DIRECT_FLARESOLVERR,
-                        proxy_url=None,
+                        proxy_url=self._pool_proxy_url,
                         bootstrap_url=bootstrap_url,
                         request_ids=request_ids,
                     )
@@ -3969,6 +4195,8 @@ class WhoScoredTransport:
             route=TransportRoute.RAW_CACHE,
             wire_bytes=0,
         )
+        if payload.observed_at:
+            response = replace(response, observed_at=payload.observed_at)
         try:
             self._validate(response, validator)
         except WhoScoredTransportError as exc:
@@ -4026,6 +4254,9 @@ class WhoScoredTransport:
         referer: Optional[str] = None,
     ) -> TransportResponse:
         request_kwargs: dict[str, Any] = {"timeout": self.request_timeout}
+        if _is_whoscored_stage_bootstrap_url(url):
+            # A token from a redirect destination is not evidence for this page.
+            request_kwargs["allow_redirects"] = False
         if _is_whoscored_structured_feed_url(url):
             request_headers = {
                 "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -4036,6 +4267,25 @@ class WhoScoredTransport:
             }
             if referer:
                 request_headers["Referer"] = referer
+            bound = self._stage_http_context
+            if (
+                bound is not None
+                and route is TransportRoute.DIRECT_HTTP
+                and referer == bound[0]
+                and session is bound[2] is self._direct_http
+                and self._pool_proxy_url == bound[3]
+                and (
+                    [
+                        value
+                        for key, value in parse_qsl(urlsplit(url).query)
+                        if key == "stageId"
+                    ]
+                    if urlsplit(url).path.startswith("/statisticsfeed/")
+                    else [urlsplit(url).path.split("/")[2]]
+                )
+                == [urlsplit(referer).path.split("/")[8]]
+            ):
+                request_headers["Model-last-Mode"] = bound[1]
             request_kwargs["headers"] = request_headers
             # curl/requests otherwise follow redirects before validation,
             # which would defeat the browser endpoint's no-follow policy.
@@ -4056,6 +4306,14 @@ class WhoScoredTransport:
                 tested = {self._pool_proxy_url} if self._pool_proxy_url else set()
                 self._probe_pool_egress(tested, replace_first=True)
             try:
+                # Rotation creates a new cookie jar. The old token must never
+                # be replayed to its replacement member with the old kwargs.
+                if "headers" in request_kwargs:
+                    request_kwargs["headers"] = {
+                        key: value
+                        for key, value in request_kwargs["headers"].items()
+                        if key != "Model-last-Mode"
+                    }
                 raw = self._direct_http.get(url, **request_kwargs)
             except Exception as retry_exc:
                 if not _is_proxy_failure(retry_exc):
@@ -4076,6 +4334,12 @@ class WhoScoredTransport:
             request_bytes=_request_wire_bytes(raw),
         )
         self._record_response(response)
+        if (
+            "Model-last-Mode" in request_kwargs.get("headers", {})
+            and 200 <= response.status_code < 300
+        ):
+            # Physical HTTP outcome, independent of content/parser acceptance.
+            self.stats.stage_xhr_token["curl_2xx_responses"] += 1
         if pooled and response.status_code >= 500:
             # One member swap per 5xx; the caller's retry policy is unchanged.
             self._rotate_pool_proxy()
@@ -4118,6 +4382,25 @@ class WhoScoredTransport:
             route=route,
             retryable=True,
         ) from exc
+
+    def _require_browser_statistics_url(
+        self,
+        solution: Mapping[str, Any],
+        url: str,
+        *,
+        client: FlareSolverrClient,
+        route: TransportRoute,
+    ) -> None:
+        """Require exact page evidence before accepting cookies or source absence."""
+        if solution.get("url") != url:
+            self._drop_browser_session(client, route)
+            raise WhoScoredTransportError(
+                "WhoScored browser statistics bootstrap URL is missing or different",
+                kind=FailureKind.BROWSER,
+                url=url,
+                route=route,
+                retryable=False,
+            )
 
     def _browser_fetch(
         self,
@@ -4233,6 +4516,9 @@ class WhoScoredTransport:
                     response_bytes=len(bootstrap_content),
                 )
                 self._record_response(bootstrap_response)
+                self._require_browser_statistics_url(
+                    bootstrap_solution, bootstrap_url, client=client, route=route
+                )
                 if is_chromium_error_page(bootstrap_response.text):
                     raise FlareSolverrErrorPage(
                         "FlareSolverr returned a Chromium network-error page"
@@ -4385,6 +4671,10 @@ class WhoScoredTransport:
             response_bytes=response_bytes,
         )
         self._record_response(response)
+        if not bootstrap_url and _is_whoscored_stage_bootstrap_url(url):
+            self._require_browser_statistics_url(
+                solution, url, client=client, route=route
+            )
         if is_chromium_error_page(response.text):
             self._drop_browser_session(client, route)
             error = WhoScoredTransportError(
@@ -4513,6 +4803,9 @@ class WhoScoredTransport:
                     response_bytes=len(bootstrap_content),
                 )
                 self._record_response(bootstrap_response)
+                self._require_browser_statistics_url(
+                    bootstrap_solution, bootstrap_url, client=client, route=route
+                )
                 if is_chromium_error_page(bootstrap_response.text):
                     raise FlareSolverrErrorPage(
                         "FlareSolverr returned a Chromium network-error page"
@@ -5413,10 +5706,9 @@ class WhoScoredTransport:
                 logger.error("WhoScored source circuit probe cleanup failed")
         self._drop_browser_session(self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR)
         if self._paid_fs is not None:
-            self._drop_browser_session(
-                self._paid_fs, TransportRoute.PAID_FLARESOLVERR
-            )
+            self._drop_browser_session(self._paid_fs, TransportRoute.PAID_FLARESOLVERR)
         self._direct_gate_circuits.clear()
+        self._stage_http_context = None
         resources = [self._direct_http, self._direct_fs, self._paid_fs]
         seen: set[int] = set()
         for resource in resources:

@@ -23,6 +23,7 @@ from scrapers.sofascore.manifest import (
 )
 from scrapers.sofascore.raw_store import RawPayloadStore
 from scripts.proxy_filter.budget import (
+    BudgetAccountingError,
     ProductionBudgetUnavailable,
     ProxyBudgetExceeded,
     SharedBudgetLedger,
@@ -677,6 +678,37 @@ def _outstanding(budget, run_id="dag-run"):
         item["reserved_bytes"] - item["consumed_bytes"]
         for item in snapshot["reservations"].values()
     )
+
+
+def test_provider_tail_uses_real_budget_without_inventing_requests(tmp_path):
+    budget = _verified_budget(tmp_path)
+    engine = _engine(tmp_path, FakeTransport(), budget=budget)
+    engine.charge_provider_tail("event", 40)
+    engine.charge_provider_tail("event", 0)
+    assert budget.snapshot("dag-run")["spent_provider_bytes"] == 40
+    assert _outstanding(budget) == 0
+    metrics = engine.metrics.snapshot()
+    assert metrics["paid_proxy_bytes"] == 40
+    assert metrics["endpoint_request_provider_bytes"] == {"event": [40, 0]}
+    assert metrics["request_count"] == metrics["source_request_count"] == metrics["endpoints"] == 0
+
+
+def test_provider_tail_respects_real_budget_cap_and_releases_failed_reservation(tmp_path):
+    budget = _verified_budget(tmp_path)
+    engine = _engine(tmp_path, FakeTransport(), budget=budget)
+    with pytest.raises(ProxyBudgetExceeded):
+        engine.charge_provider_tail("event", budget.policy.hard_run_bytes + 1)
+    assert _outstanding(budget) == 0
+    assert budget.snapshot("dag-run")["spent_provider_bytes"] == 0
+    assert engine.metrics.snapshot()["paid_proxy_bytes"] == 0
+
+
+@pytest.mark.parametrize("amount", (-1, True, 1.5))
+def test_provider_tail_rejects_invalid_meter_before_local_charge(tmp_path, amount):
+    engine = _engine(tmp_path, FakeTransport(), budget=_verified_budget(tmp_path))
+    with pytest.raises(BudgetAccountingError):
+        engine.charge_provider_tail("event", amount)
+    assert engine.metrics.snapshot()["paid_proxy_bytes"] == 0
 
 
 def test_unmetered_transport_failure_closes_the_reservation_at_zero(tmp_path):

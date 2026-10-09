@@ -91,6 +91,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
+from threading import RLock
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 _REPO_ROOT = os.path.dirname(
@@ -106,6 +107,17 @@ from scripts.proxy_filter.budget import (  # noqa: E402 - standalone entry point
     SharedBudgetLedger,
     load_verified_policy,
 )
+from scripts.proxy_filter.sofascore_registry import compact as _compact_registry
+
+_REGISTRY_LOCK = RLock()
+_PENDING_CLAIM_ROLLBACKS: set[str] = set()
+_ALLOCATION_WAL_PENDING_ROLLBACK: int | None = None
+_PAID_LEDGER_PENDING_APPEND: tuple[int, bytes] | None = None
+
+class _AccountingUnavailable(RuntimeError):
+    """Durable accounting failed; this is not a budget exhaustion."""
+
+
 from scrapers.sofascore.workload_plan import (  # noqa: E402 - standalone entry point
     AllocationAccountingError,
     AllocationBudgetExceeded,
@@ -1190,6 +1202,12 @@ class Lease:
     # Why the escrow was retained. Written once by the latch (first cause
     # wins) so the gateway log and the lease report can attribute it.
     accounting_uncertain_reason: str = ""
+    accounting_uncertain_error_type: str = ""
+    accounting_uncertain_error: str = ""
+    current_endpoint_path: str = ""
+    allocation_finish_persisted: bool = False
+    retain_tail_owner: bool = False
+    current_request_is_tail: bool = False
     # An append error is ambiguous: the event may have reached the filesystem
     # before fsync failed. Never retry or release that reservation in-process,
     # because doing so could durably charge the same provider bytes twice.
@@ -1252,6 +1270,9 @@ class Lease:
             "budget_exceeded": self.budget_exceeded,
             "accounting_uncertain": self.accounting_uncertain,
             "accounting_uncertain_reason": self.accounting_uncertain_reason,
+            "accounting_uncertain_error_type": self.accounting_uncertain_error_type,
+            "accounting_uncertain_error": self.accounting_uncertain_error,
+            "endpoint_path": self.current_endpoint_path,
             "paid_ledger_uncertain": self.paid_ledger_uncertain,
             "pending_provider_bytes": pending_provider_bytes,
             "durably_settled_provider_bytes": settled_provider_bytes,
@@ -2482,8 +2503,44 @@ def _verify_whoscored_state(
     _whoscored_campaign_ledger().verify_integrity()
 
 
+def _repair_paid_ledger_append() -> None:
+    global _PAID_LEDGER_PENDING_APPEND
+    with _REGISTRY_LOCK:
+        if _PAID_LEDGER_PENDING_APPEND is None:
+            return
+        start, payload = _PAID_LEDGER_PENDING_APPEND
+        descriptor = os.open(LEDGER_PATH, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            # Complete the exact original event, not a second charge with a
+            # fresh ID. Until fsync succeeds no later writer or paid I/O runs.
+            os.ftruncate(descriptor, start)
+            os.lseek(descriptor, start, os.SEEK_SET)
+            remaining = memoryview(payload)
+            while remaining:
+                count = os.write(descriptor, remaining)
+                if count <= 0:
+                    raise OSError("paid journal repair made no progress")
+                remaining = remaining[count:]
+            os.fsync(descriptor)
+            directory = os.open(os.path.dirname(LEDGER_PATH) or ".", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            _PAID_LEDGER_PENDING_APPEND = None
+        finally:
+            os.close(descriptor)
+
+
 def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
+    with _REGISTRY_LOCK:
+        _repair_paid_ledger_append()
+        _append_budget_event_unlocked(event_type, lease, **values)
+
+
+def _append_budget_event_unlocked(event_type: str, lease: Lease, **values: Any) -> None:
     """Append and fsync exact paid accounting before another lease is served."""
+    global _PAID_LEDGER_PENDING_APPEND
     global _PAID_LEDGER_CHAIN_COUNT
     global _PAID_LEDGER_CHAIN_OFFSET
     global _PAID_LEDGER_CHAIN_TAIL
@@ -2505,6 +2562,9 @@ def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
         "capture_scope": lease.capture_scope,
         "entity": lease.entity,
         "canonical_url": lease.canonical_url,
+        "endpoint": lease.current_endpoint,
+        "endpoint_path": lease.current_endpoint_path,
+        "request_id": lease.current_request_id,
         "source": lease.source,
         **({'stream_id': lease.stream_id} if lease.stream_id else {}),
         "traffic_class": lease.source,
@@ -2569,6 +2629,7 @@ def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
     if SOURCE_MODE != "whoscored-only":
         flags |= os.O_CREAT
     descriptor = os.open(LEDGER_PATH, flags, 0o600)
+    start = os.fstat(descriptor).st_size
     try:
         os.fchmod(descriptor, 0o600)
         pending = memoryview(payload)
@@ -2578,6 +2639,14 @@ def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
                 raise OSError("paid byte ledger write made no progress")
             pending = pending[written:]
         os.fsync(descriptor)
+    except BaseException:
+        if lease.source in {"sofascore", "sofascore_discovery"}:
+            _PAID_LEDGER_PENDING_APPEND = (start, payload)
+            try:
+                _repair_paid_ledger_append()
+            except Exception:
+                pass  # Paid I/O and subsequent appends remain fail-closed.
+        raise
     finally:
         os.close(descriptor)
     if SOURCE_MODE == "whoscored-only":
@@ -3065,7 +3134,38 @@ def _whoscored_campaign_ledger() -> ProxyCampaignLedger:
     return WHOSCORED_CAMPAIGN_LEDGER
 
 
-def _append_allocation_wal(
+def _repair_allocation_wal_append() -> None:
+    global _ALLOCATION_WAL_PENDING_ROLLBACK
+    with _REGISTRY_LOCK:
+        if _ALLOCATION_WAL_PENDING_ROLLBACK is None:
+            return
+        descriptor = os.open(SOFASCORE_ALLOCATION_WAL_PATH, os.O_WRONLY)
+        try:
+            os.ftruncate(descriptor, _ALLOCATION_WAL_PENDING_ROLLBACK)
+            os.fsync(descriptor)
+            directory = os.open(os.path.dirname(SOFASCORE_ALLOCATION_WAL_PATH) or ".", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            _ALLOCATION_WAL_PENDING_ROLLBACK = None
+        finally:
+            os.close(descriptor)
+
+
+def _append_allocation_wal(event_type: str, lease_id: str, **values: Any) -> None:
+    with _REGISTRY_LOCK:
+        try:
+            _repair_allocation_wal_append()
+            _append_allocation_wal_unlocked(event_type, lease_id, **values)
+        except (OSError, RuntimeError) as exc:
+            lease = LEASES.get(lease_id)
+            if lease is not None and event_type in {"endpoint_started", "endpoint_finished"}:
+                _latch_lease_accounting_uncertainty(lease, reason="endpoint_journal_failed", error=exc)
+            raise _AccountingUnavailable("SofaScore allocation journal unavailable") from exc
+
+
+def _append_allocation_wal_unlocked(
     event_type: str,
     lease_id: str,
     **values: Any,
@@ -3076,6 +3176,7 @@ def _append_allocation_wal(
     the allocation recovery token.  It is never rendered in reports or logs.
     """
 
+    global _ALLOCATION_WAL_PENDING_ROLLBACK
     event = {
         "event_version": "sofascore-allocation-wal-v1",
         "event_id": uuid_hex(24),
@@ -3095,6 +3196,7 @@ def _append_allocation_wal(
         os.O_APPEND | os.O_CREAT | os.O_WRONLY,
         0o600,
     )
+    original_size = os.fstat(descriptor).st_size
     try:
         os.fchmod(descriptor, 0o600)
         pending = memoryview(payload)
@@ -3104,6 +3206,22 @@ def _append_allocation_wal(
                 raise OSError("allocation WAL write made no progress")
             pending = pending[written:]
         os.fsync(descriptor)
+        if original_size == 0:
+            directory = os.open(os.path.dirname(SOFASCORE_ALLOCATION_WAL_PATH) or ".", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except BaseException:
+        # No caller has acknowledged this transition or performed dependent
+        # provider I/O. Roll back even a complete but unacknowledged append,
+        # so retry cannot duplicate an endpoint finish or join a partial line.
+        _ALLOCATION_WAL_PENDING_ROLLBACK = original_size
+        try:
+            _repair_allocation_wal_append()
+        except Exception:
+            pass  # Future appends/admissions stay refused until durable repair.
+        raise
     finally:
         os.close(descriptor)
 
@@ -3172,6 +3290,7 @@ def _read_allocation_wal() -> dict[str, dict[str, Any]]:
                     ):
                         raise ValueError("invalid endpoint provider bytes")
                     state["observations"].setdefault(endpoint, []).append(amount)
+                    state["last_finished_endpoint"] = endpoint
                     state["active_request_id"] = ""
                     state["active_endpoint"] = ""
                 elif kind == "allocation_finished":
@@ -3254,6 +3373,11 @@ def _recover_allocation_wal() -> int:
             attempt_spent = journal
         remainder = attempt_spent - reported
         active_endpoint = str(state.get("active_endpoint") or "")
+        if remainder and not active_endpoint:
+            # A complete but unacknowledged finish can survive failed rollback
+            # plus a crash. Any later exact bytes still belong to the last
+            # owner: new owners require a durable endpoint_started before I/O.
+            active_endpoint = str(state.get("last_finished_endpoint") or "")
         if remainder or active_endpoint:
             if not active_endpoint:
                 raise RuntimeError(
@@ -3386,6 +3510,38 @@ def _signed_allocation_from_request(
     if not attempt_id:
         raise WorkloadPlanError("production allocation requires attempt_id")
     return plan, allocation
+
+
+SOFASCORE_REGISTRY_LIMIT_BYTES = 60_000_000
+
+
+def _sofascore_registry_bytes() -> int:
+    total = 0
+    directory = os.path.dirname(LEDGER_PATH) or "."
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False) and entry.name.endswith((".json", ".jsonl", ".bak", ".tmp")):
+                    total += entry.stat(follow_symlinks=False).st_size
+    except FileNotFoundError:
+        pass
+    return total
+
+
+def _repair_failed_claim_creations() -> None:
+    if not _PENDING_CLAIM_ROLLBACKS:
+        return
+    # claim() rolls its candidate back in memory after any failed write.
+    # Persist that rollback before a new claim can reuse the allocation. This
+    # also covers replace-success/directory-fsync-failure without restarting
+    # or replaying the active claims of other workers.
+    try:
+        _allocation_ledger().flush(force=True)
+        for lease_id in tuple(_PENDING_CLAIM_ROLLBACKS):
+            _append_allocation_wal("allocation_finished", lease_id, creation_rollback=True)
+            _PENDING_CLAIM_ROLLBACKS.remove(lease_id)
+    except Exception as exc:
+        raise _AccountingUnavailable("SofaScore claim rollback is not durable") from exc
 
 
 def _create_lease(
@@ -3573,6 +3729,11 @@ def _create_lease(
     proxy_campaign_escrowed = False
     parent_envelope: ParentRunEnvelope | None = None
     if source == "sofascore":
+        _repair_paid_ledger_append()
+        _repair_allocation_wal_append()
+        _repair_failed_claim_creations()
+        if SOURCE_MODE == "sofascore-only" and _sofascore_registry_bytes() >= SOFASCORE_REGISTRY_LIMIT_BYTES:
+            raise _AccountingUnavailable("SofaScore registries exceed safe size; new lease refused")
         workload_plan, allocation = _signed_allocation_from_request(
             metadata,
             max_bytes=max_bytes,
@@ -3603,6 +3764,9 @@ def _create_lease(
         )
         dagrun_budget = proxy_campaign_approval.caps.total_provider_bytes
     elif source == "sofascore_discovery":
+        _repair_paid_ledger_append()
+        if SOURCE_MODE == "sofascore-only" and _sofascore_registry_bytes() >= SOFASCORE_REGISTRY_LIMIT_BYTES:
+            raise _AccountingUnavailable("SofaScore registries exceed safe size; new lease refused")
         effective_expires_at = now + ttl_seconds
         dagrun_budget = SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     else:
@@ -3661,9 +3825,16 @@ def _create_lease(
                 attempt_id=str(metadata["attempt_id"]),
                 claim_token=claim_token,
             )
-        except BaseException:
+        except AllocationError:
             _append_allocation_wal("allocation_finished", lease_id, claim_rejected=True)
             raise
+        except (OSError, _AccountingUnavailable) as exc:
+            _PENDING_CLAIM_ROLLBACKS.add(lease_id)
+            try:
+                _repair_failed_claim_creations()
+            except _AccountingUnavailable:
+                pass  # Keep the unfinished intent and reject new admissions.
+            raise _AccountingUnavailable("SofaScore claim creation failed") from exc
         available = min(available, allocation_claim.remaining_provider_bytes)
         if available <= 0:
             raise AllocationBudgetExceeded(
@@ -4065,6 +4236,8 @@ async def _wait_for_reservation_turnover(lease: Lease) -> None:
 def _reserve_lease_bytes(lease: Lease, wanted: int) -> int:
     """Atomically reserve allowance before an async read/write yields control."""
     global _daily_reserved_bytes
+    if lease.source in {"sofascore", "sofascore_discovery"}:
+        _repair_paid_ledger_append()
     count = min(max(0, wanted), _lease_remaining(lease))
     lease.reserved_bytes += count
     if _uses_shared_daily_budget(lease.source):
@@ -4195,7 +4368,23 @@ def _flush_whoscored_metering(lease: Lease) -> int:
     return amount
 
 
-def _latch_lease_accounting_uncertainty(lease: Lease, *, reason: str) -> None:
+def _safe_accounting_exception(lease: Lease | None, error: BaseException) -> str:
+    parts = []
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        message = str(error)
+        message = re.sub(r"https?://[^\s/@]+:[^\s/@]+@", "http://[REDACTED]@", message)
+        for secret in ((CONTROL_TOKEN, lease.token, *lease.upstream) if lease is not None else (CONTROL_TOKEN,)):
+            if isinstance(secret, str) and len(secret) >= 4:
+                message = message.replace(secret, "[REDACTED]")
+        message = re.sub(r"(?i)(token|password|authorization|secret)([=:]\s*)[^\s,;]+", r"\1\2[REDACTED]", message)
+        parts.append(f"{type(error).__name__}: {message}")
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    return " <- ".join(parts)
+
+
+def _latch_lease_accounting_uncertainty(lease: Lease, *, reason: str, error: BaseException | None = None) -> None:
     """Revoke uncertain provider accounting without returning any escrow."""
 
     if lease.accounting_uncertain:
@@ -4215,6 +4404,14 @@ def _latch_lease_accounting_uncertainty(lease: Lease, *, reason: str) -> None:
     # First cause wins: the idempotence guard above already returned for a
     # lease that was latched earlier, so this never overwrites the origin.
     lease.accounting_uncertain_reason = reason
+    if error is not None:
+        lease.accounting_uncertain_error_type = type(error).__name__
+        lease.accounting_uncertain_error = _safe_accounting_exception(lease, error)
+    if lease.source in {"sofascore", "sofascore_discovery"}:
+        try:
+            _append_budget_event("accounting_uncertain", lease, reason=reason, error_type=lease.accounting_uncertain_error_type, error=lease.accounting_uncertain_error)
+        except Exception:
+            log.error("could not persist latch diagnostic for lease %s", lease.lease_id)
     lease.latched_at = _wall_time()
     lease.closed = True
     lease.budget_exceeded = True
@@ -4242,7 +4439,7 @@ def _latch_lease_accounting_uncertainty(lease: Lease, *, reason: str) -> None:
         "provider byte accounting is uncertain; lease %s escrow is retained; "
         "reason=%s",
         lease.lease_id,
-        reason,
+        reason + ("; " + lease.accounting_uncertain_error if error is not None else ""),
     )
 
 
@@ -4254,22 +4451,23 @@ def _settle_observed_lease_bytes(
     direction: str,
     count: int,
     uncertain_reason: str | None = None,
+    uncertain_error: BaseException | None = None,
 ) -> None:
     """Convert a local I/O reservation to durable spend, or retain it forever."""
 
     if count <= 0:
         if uncertain_reason:
-            _latch_lease_accounting_uncertainty(lease, reason=uncertain_reason)
+            _latch_lease_accounting_uncertainty(lease, reason=uncertain_reason, error=uncertain_error)
         else:
             _release_lease_reservation(lease, reservation)
         return
     try:
         _account_lease_bytes(lease, host, direction, count)
-    except BaseException:
+    except BaseException as exc:
         # Bytes were already queued to or read from the provider. Never release
         # either the local reservation or the lease-wide durable escrow when
         # exact accounting cannot be proven.
-        _latch_lease_accounting_uncertainty(lease, reason="ledger_charge_failed")
+        _latch_lease_accounting_uncertainty(lease, reason="ledger_charge_failed", error=exc)
         raise
     if uncertain_reason:
         # The observed prefix is exact, but cancellation/read failure can leave
@@ -4278,7 +4476,7 @@ def _settle_observed_lease_bytes(
         # only the unconsumed reservation as unknown.  Otherwise the reaper
         # would conservatively charge the already-accounted prefix twice.
         _release_lease_reservation(lease, min(reservation, count))
-        _latch_lease_accounting_uncertainty(lease, reason=uncertain_reason)
+        _latch_lease_accounting_uncertainty(lease, reason=uncertain_reason, error=uncertain_error)
         return
     _release_lease_reservation(lease, reservation)
 
@@ -4658,6 +4856,7 @@ async def _pump(
     provider_eof_observed = False
     # Name of the exception swallowed by the proxy boundary below, so a latch
     # in ``finally`` can attribute why the provider EOF was never observed.
+    exit_error: BaseException | None = None
     swallowed = "none"
     # Set when the client leg failed mid-response: the provider is then drained
     # to EOF (still metered per chunk) without forwarding anything further.
@@ -4722,8 +4921,8 @@ async def _pump(
                             break
                         try:
                             await _wait_for_reservation_turnover(lease)
-                        except (asyncio.TimeoutError, TimeoutError):
-                            _latch_lease_accounting_uncertainty(lease, reason="down_reservation_wait_timeout")
+                        except (asyncio.TimeoutError, TimeoutError) as exc:
+                            _latch_lease_accounting_uncertainty(lease, reason="down_reservation_wait_timeout", error=exc)
                             raise
                     if reservation <= 0:
                         break
@@ -4754,20 +4953,20 @@ async def _pump(
                         chunk = await reader.read(read_size)
                 else:
                     chunk = await reader.read(read_size)
-            except (asyncio.TimeoutError, TimeoutError):
+            except (asyncio.TimeoutError, TimeoutError) as exc:
                 if lease is not None:
                     # At the hard TTL boundary the paired provider stream may
                     # already contain billed read-ahead, even when this is the
                     # client->provider pump. Revoke the lease, close both ends,
                     # and retain every unproven escrow byte.
-                    _latch_lease_accounting_uncertainty(lease, reason="client_hangup_drain_timeout" if client_gone else "tunnel_read_timeout")
+                    _latch_lease_accounting_uncertainty(lease, reason="client_hangup_drain_timeout" if client_gone else "tunnel_read_timeout", error=exc)
                 raise
-            except BaseException:
+            except BaseException as exc:
                 if lease is not None:
                     if direction == "down":
                         # A cancelled provider read can leave unobservable
                         # transport-buffered bytes. Retain the reservation.
-                        _latch_lease_accounting_uncertainty(lease, reason="provider_read_error")
+                        _latch_lease_accounting_uncertainty(lease, reason="provider_read_error", error=exc)
                     else:
                         _release_lease_reservation(lease, reservation)
                 raise
@@ -4816,8 +5015,8 @@ async def _pump(
                             break
                         try:
                             await _wait_for_reservation_turnover(lease)
-                        except (asyncio.TimeoutError, TimeoutError):
-                            _latch_lease_accounting_uncertainty(lease, reason="up_reservation_wait_timeout")
+                        except (asyncio.TimeoutError, TimeoutError) as exc:
+                            _latch_lease_accounting_uncertainty(lease, reason="up_reservation_wait_timeout", error=exc)
                             raise
                         continue
                     prefix_size = min(len(pending), available)
@@ -4854,26 +5053,28 @@ async def _pump(
                 # LEASE_CLIENT_HANGUP_DRAIN_SECONDS) so that tail is settled
                 # exactly; a drain timeout or a later error still latches.
                 client_gone = True
-            except BaseException:
+            except BaseException as exc:
                 if lease is not None and direction == "down":
                     # Cancellation leaves the provider read-ahead unobservable.
-                    _latch_lease_accounting_uncertainty(lease, reason="client_write_cancelled")
+                    _latch_lease_accounting_uncertainty(lease, reason="client_write_cancelled", error=exc)
                 raise
             if lease is None:
                 counter[host] += len(chunk)
     except Exception as exc:  # noqa: BLE001 — proxy must never crash a flow
         swallowed = type(exc).__name__
+        exit_error = exc
     except BaseException as exc:
         # Cancellation still propagates; only the diagnostic name is recorded,
         # because ``finally`` latches before the caller can attribute it.
         swallowed = type(exc).__name__
+        exit_error = exc
         raise
     finally:
         if lease is not None and direction == "down" and not provider_eof_observed:
             # Includes TTL/closed/budget refusal before a read, reservation
             # errors swallowed by the proxy boundary, and cancellation between
             # chunks. Only an observed provider EOF may release the lifecycle.
-            _latch_lease_accounting_uncertainty(lease, reason=f"pump_exit_without_provider_eof:{swallowed}")
+            _latch_lease_accounting_uncertainty(lease, reason=f"pump_exit_without_provider_eof:{swallowed}", error=exit_error)
         if provider_reader_registered:
             lease.active_provider_readers = max(0, lease.active_provider_readers - 1)
             _ACTIVE_PROVIDER_READERS = max(0, _ACTIVE_PROVIDER_READERS - 1)
@@ -5101,7 +5302,7 @@ async def _drain_dead_exit_response(
             chunk = await asyncio.wait_for(reader.read(reservation), remaining)
         except (asyncio.TimeoutError, TimeoutError):
             return None
-        except BaseException:
+        except BaseException as exc:
             _settle_observed_lease_bytes(
                 lease,
                 reservation=reservation,
@@ -5109,6 +5310,7 @@ async def _drain_dead_exit_response(
                 direction="down",
                 count=0,
                 uncertain_reason="dead_exit_drain_cancelled",
+                uncertain_error=exc,
             )
             raise
         if not chunk:
@@ -5158,9 +5360,10 @@ async def _read_metered_provider_head(
     payload = bytearray()
     complete = False
     timed_out = False
+    head_error: BaseException | None = None
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
 
-    def settle_payload(*, uncertain_reason: str | None = None) -> None:
+    def settle_payload(*, uncertain_reason: str | None = None, uncertain_error: BaseException | None = None) -> None:
         _settle_observed_lease_bytes(
             lease,
             reservation=reservation,
@@ -5168,6 +5371,7 @@ async def _read_metered_provider_head(
             direction="down",
             count=len(payload),
             uncertain_reason=uncertain_reason,
+            uncertain_error=uncertain_error,
         )
 
     try:
@@ -5181,7 +5385,8 @@ async def _read_metered_provider_head(
                     break
                 try:
                     item = await asyncio.wait_for(reader.read(1), remaining)
-                except (asyncio.TimeoutError, TimeoutError):
+                except (asyncio.TimeoutError, TimeoutError) as exc:
+                    head_error = exc
                     timed_out = True
                     break
             if not item:
@@ -5190,14 +5395,17 @@ async def _read_metered_provider_head(
             if payload.endswith(b"\r\n\r\n") or payload.endswith(b"\n\n"):
                 complete = True
                 break
-    except BaseException:
-        settle_payload(uncertain_reason="provider_head_read_cancelled")
+    except BaseException as exc:
+        settle_payload(uncertain_reason="provider_head_read_cancelled", uncertain_error=exc)
         raise
     # A timeout (including one before the first visible byte) or exhausting the
     # bounded head window can leave provider bytes in StreamReader/transport
     # read-ahead.  Charge the exact visible prefix, revoke the lease and retain
     # every remaining escrow byte instead of treating the exit as retryable.
+    if timed_out and head_error is None:
+        head_error = UpstreamHeadTimeout("provider response head timed out")
     settle_payload(
+        uncertain_error=head_error,
         uncertain_reason=(
             "provider_head_timeout"
             if timed_out
@@ -5207,7 +5415,7 @@ async def _read_metered_provider_head(
         )
     )
     if timed_out:
-        raise UpstreamHeadTimeout("provider response head timed out")
+        raise UpstreamHeadTimeout("provider response head timed out") from head_error
     if not complete:
         if len(payload) >= reservation:
             lease.budget_exceeded = True
@@ -5289,10 +5497,12 @@ async def _send_json(
     writer.close()
 
 
-def _begin_endpoint_request(lease: Lease, endpoint: str) -> str:
+def _begin_endpoint_request(lease: Lease, endpoint: str, *, endpoint_path: str = "") -> str:
     endpoint = str(endpoint or "").strip()
     if not endpoint or len(endpoint) > 200:
         raise ValueError("endpoint must be a non-empty bounded name")
+    if lease.source == "sofascore" and lease.current_request_is_tail and not lease.closed and not lease.expired:
+        _finish_endpoint_request(lease, lease.current_request_id)
     if lease.closed or lease.expired or lease.current_request_id:
         raise RuntimeError("lease cannot start a concurrent endpoint request")
     if lease.expected_endpoint_labels and (
@@ -5304,6 +5514,12 @@ def _begin_endpoint_request(lease: Lease, endpoint: str) -> str:
         )
     ):
         raise ValueError("endpoint is absent, duplicate, or stale for this lease")
+    if not isinstance(endpoint_path, str) or len(endpoint_path) > 2048:
+        raise ValueError("endpoint_path must be a bounded path")
+    parts = urlsplit(endpoint_path)
+    if parts.scheme or parts.netloc or (endpoint_path and not parts.path.startswith("/")):
+        raise ValueError("endpoint_path must be an absolute API path")
+    endpoint_path = parts.path
     request_id = uuid_hex(24)
     if lease.source == "sofascore":
         _append_allocation_wal(
@@ -5311,6 +5527,7 @@ def _begin_endpoint_request(lease: Lease, endpoint: str) -> str:
             lease.lease_id,
             request_id=request_id,
             endpoint=endpoint,
+            endpoint_path=endpoint_path,
         )
     elif lease.source == "whoscored" and SOURCE_MODE == "whoscored-only":
         _append_budget_event(
@@ -5322,6 +5539,7 @@ def _begin_endpoint_request(lease: Lease, endpoint: str) -> str:
         )
     lease.current_request_id = request_id
     lease.current_endpoint = endpoint
+    lease.current_endpoint_path = endpoint_path
     lease.current_request_start_bytes = lease.total_bytes
     return request_id
 
@@ -5380,6 +5598,8 @@ def _finish_endpoint_request(lease: Lease, request_id: str) -> int:
     ):
         raise ValueError("endpoint request id is stale or invalid")
     endpoint = lease.current_endpoint
+    endpoint_path = lease.current_endpoint_path
+    finished_request_id = lease.current_request_id
     if lease.source == "whoscored":
         # Convert every observed byte to durable campaign spend before sealing
         # the endpoint boundary in the independent HMAC-chained proxy ledger.
@@ -5394,6 +5614,7 @@ def _finish_endpoint_request(lease: Lease, request_id: str) -> int:
             request_id=lease.current_request_id,
             endpoint=endpoint,
             provider_bytes=amount,
+            endpoint_path=lease.current_endpoint_path,
         )
     elif lease.source == "whoscored" and SOURCE_MODE == "whoscored-only":
         _append_budget_event(
@@ -5407,8 +5628,33 @@ def _finish_endpoint_request(lease: Lease, request_id: str) -> int:
     lease.endpoint_request_provider_bytes.setdefault(endpoint, []).append(amount)
     lease.current_request_id = ""
     lease.current_endpoint = ""
+    lease.current_endpoint_path = ""
+    lease.current_request_is_tail = False
     lease.current_request_start_bytes = lease.total_bytes
+    if lease.source == "sofascore":
+        try:
+            _append_budget_event("endpoint_finished", lease, endpoint=endpoint,
+                endpoint_path=endpoint_path, request_id=finished_request_id, provider_bytes=amount)
+        except Exception as exc:
+            # The allocation WAL already contains the exact durable receipt.
+            # A diagnostic append must not make retry repeat that transition.
+            log.error("endpoint diagnostic append failed for lease %s: %s",
+                lease.lease_id, _safe_accounting_exception(lease, exc))
     return amount
+
+
+def _finish_sofascore_claim(lease: Lease, *, completed: bool, **wal_fields: Any) -> None:
+    if not lease.allocation_finish_persisted:
+        _allocation_ledger().finish(
+            lease.workload_plan, lease.allocation_claim,
+            lease_id=lease.lease_id,
+            endpoint_request_provider_bytes=lease.endpoint_request_provider_bytes,
+            completed=completed, meter=WORKLOAD_METER,
+            proxy_exit_hash=lease.proxy_exit_hash,
+        )
+        lease.allocation_finish_persisted = True
+    _append_allocation_wal("allocation_finished", lease.lease_id, completed=completed, **wal_fields)
+    lease.allocation_finished = True
 
 
 def _reap_expired_leases() -> int:
@@ -5489,17 +5735,7 @@ def _reap_expired_leases() -> int:
                 try:
                     if lease.current_request_id:
                         _finish_endpoint_request(lease, lease.current_request_id)
-                    _allocation_ledger().finish(
-                        lease.workload_plan,
-                        lease.allocation_claim,
-                        lease_id=lease.lease_id,
-                        endpoint_request_provider_bytes=(
-                            lease.endpoint_request_provider_bytes
-                        ),
-                        completed=False,
-                        meter=WORKLOAD_METER,
-                        proxy_exit_hash=lease.proxy_exit_hash,
-                    )
+                    _finish_sofascore_claim(lease, completed=False, reaped_after_latch=True)
                 except Exception:  # noqa: BLE001 - retain latched, fail closed
                     log.exception(
                         "could not finish durable claim for latched sofascore "
@@ -5507,13 +5743,6 @@ def _reap_expired_leases() -> int:
                         lease.lease_id,
                     )
                 else:
-                    _append_allocation_wal(
-                        "allocation_finished",
-                        lease.lease_id,
-                        completed=False,
-                        reaped_after_latch=True,
-                    )
-                    lease.allocation_finished = True
                     if lease.reserved_bytes > 0:
                         _release_lease_reservation(lease, lease.reserved_bytes)
                     lease.provider_reserved_bytes = 0
@@ -5555,22 +5784,7 @@ def _reap_expired_leases() -> int:
                     pass
             if lease.current_request_id:
                 _finish_endpoint_request(lease, lease.current_request_id)
-            _allocation_ledger().finish(
-                lease.workload_plan,
-                lease.allocation_claim,
-                lease_id=lease.lease_id,
-                endpoint_request_provider_bytes=(lease.endpoint_request_provider_bytes),
-                completed=False,
-                meter=WORKLOAD_METER,
-                proxy_exit_hash=lease.proxy_exit_hash,
-            )
-            _append_allocation_wal(
-                "allocation_finished",
-                lease.lease_id,
-                completed=False,
-                expired=True,
-            )
-            lease.allocation_finished = True
+            _finish_sofascore_claim(lease, completed=False, expired=True)
             reaped += 1
         elif lease.source == "whoscored" and not lease.proxy_campaign_finished:
             if (
@@ -5727,25 +5941,7 @@ async def _close_lease(
             and lease.workload_plan is not None
             and lease.allocation_claim is not None
         ):
-            _allocation_ledger().finish(
-                lease.workload_plan,
-                lease.allocation_claim,
-                lease_id=lease.lease_id,
-                endpoint_request_provider_bytes=(lease.endpoint_request_provider_bytes),
-                completed=bool(
-                    completed and client_map_matches and not lease.budget_exceeded
-                ),
-                meter=WORKLOAD_METER,
-                proxy_exit_hash=lease.proxy_exit_hash,
-            )
-            _append_allocation_wal(
-                "allocation_finished",
-                lease.lease_id,
-                completed=bool(
-                    completed and client_map_matches and not lease.budget_exceeded
-                ),
-            )
-            lease.allocation_finished = True
+            _finish_sofascore_claim(lease, completed=completed and client_map_matches)
     elif lease.source == "whoscored" and SOURCE_MODE == "whoscored-only":
         try:
             normalized_internal_map = _normalize_endpoint_map(
@@ -5939,6 +6135,7 @@ def _service_health_report(mgr) -> dict[str, Any]:
         "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
         "max_active_leases": MAX_ACTIVE_LEASES,
         "sofascore_max_active_leases": SOFASCORE_MAX_ACTIVE_LEASES,
+        **({"registry_bytes": _sofascore_registry_bytes(), "registry_limit_bytes": SOFASCORE_REGISTRY_LIMIT_BYTES} if SOURCE_MODE == "sofascore-only" else {}),
         "dagrun_budget_bytes": DAGRUN_BUDGET_BYTES,
         "url_budget_bytes": URL_BUDGET_BYTES,
         "lease_proxy_url": LEASE_PROXY_URL,
@@ -6428,6 +6625,10 @@ async def _handle_control(
             status = 429 if isinstance(exc, AllocationBudgetExceeded) else 409
             await _send_json(writer, status, {"code": code, "error": str(exc)})
             return True
+        except (_AccountingUnavailable, OSError) as exc:
+            log.error("SofaScore lease accounting unavailable: %s", _safe_accounting_exception(None, exc))
+            await _send_json(writer, 503, {"code": "accounting_unavailable", "error": "durable accounting unavailable"})
+            return True
         except RuntimeError as exc:
             message = str(exc)
             code = (
@@ -6486,18 +6687,28 @@ async def _handle_control(
             if length <= 0 or length > 4096:
                 raise ValueError("endpoint request body must be in 1..4096 bytes")
             body = json.loads((await reader.readexactly(length)).decode("utf-8"))
-            if not isinstance(body, dict) or frozenset(body) != {"endpoint"}:
+            if not isinstance(body, dict) or "endpoint" not in body or not set(body) <= {"endpoint", "endpoint_path", "retain_tail_owner"}:
                 raise ValueError("endpoint request body must be an object")
-            request_id = _begin_endpoint_request(lease, body.get("endpoint"))
+            retain_tail = body.get("retain_tail_owner", False)
+            if not isinstance(retain_tail, bool):
+                raise ValueError("retain_tail_owner must be boolean")
+            if retain_tail and lease.source != "sofascore":
+                raise ValueError("tail ownership is supported only for SofaScore")
+            request_id = _begin_endpoint_request(lease, body.get("endpoint"), endpoint_path=body.get("endpoint_path", ""))
+            lease.retain_tail_owner = retain_tail
         except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             await _send_json(writer, 400, {"error": str(exc)})
+            return True
+        except _AccountingUnavailable as exc:
+            _latch_lease_accounting_uncertainty(lease, reason="endpoint_boundary_wal_failed", error=exc)
+            await _send_json(writer, 503, {"code": "accounting_unavailable", "error": "durable accounting unavailable"})
             return True
         except RuntimeError as exc:
             await _send_json(
                 writer, 409, {"code": "endpoint_concurrent", "error": str(exc)}
             )
             return True
-        await _send_json(writer, 201, {"request_id": request_id})
+        await _send_json(writer, 201, {"request_id": request_id, **({"stats": _control_report(lease)} if lease.retain_tail_owner else {})})
         return True
     if (
         len(parts) == 6
@@ -6543,7 +6754,11 @@ async def _handle_control(
             await _send_json(writer, 404, {"error": "unknown lease endpoint"})
             return True
         try:
+            endpoint, endpoint_path = lease.current_endpoint, lease.current_endpoint_path
             _finish_endpoint_request(lease, parts[4])
+            if lease.source == "sofascore" and lease.retain_tail_owner and not lease.closed and not lease.expired:
+                _begin_endpoint_request(lease, endpoint, endpoint_path=endpoint_path)
+                lease.current_request_is_tail = True
         except ValueError as exc:
             await _send_json(writer, 409, {"error": str(exc)})
             return True
@@ -6563,6 +6778,25 @@ async def _handle_control(
     lease = _authorized_control_lease(lease_id, headers.get("authorization"))
     if lease is None or not _control_token_valid(headers, source=lease.source):
         await _send_json(writer, 401, {"error": "invalid control or lease token"})
+        return True
+    if method == "POST" and action == "drain" and lease.source == "sofascore" and lease.retain_tail_owner:
+        lease.closed = True
+        _notify_reservation_turnover()
+        for tunnel_writer in tuple(lease.tunnel_writers):
+            tunnel_writer.close()
+        deadline = time.monotonic() + 2.0
+        while lease.active_tunnels and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        if lease.active_tunnels or lease.reserved_bytes or lease.accounting_uncertain:
+            await _send_json(writer, 409, {"code": "drain_incomplete", "error": "provider accounting is not final"})
+            return True
+        try:
+            if lease.current_request_id:
+                _finish_endpoint_request(lease, lease.current_request_id)
+        except (AllocationError, _AccountingUnavailable):
+            await _send_json(writer, 503, {"code": "accounting_unavailable", "error": "durable accounting unavailable"})
+            return True
+        await _send_json(writer, 200, _control_report(lease))
         return True
     if method == "POST" and action == "extend":
         try:
@@ -6689,11 +6923,11 @@ async def _write_upstream(
             return False
     try:
         writer.write(payload)
-    except BaseException:
+    except BaseException as exc:
         if lease is not None:
             # A transport may have accepted a prefix before surfacing an error.
             # Treat the complete pre-I/O reservation as unknown provider spend.
-            _latch_lease_accounting_uncertainty(lease, reason="provider_write_error")
+            _latch_lease_accounting_uncertainty(lease, reason="provider_write_error", error=exc)
         raise
     if lease is not None:
         _settle_observed_lease_bytes(
@@ -6711,13 +6945,13 @@ async def _write_upstream(
                 writer.drain(),
                 timeout=_lease_operation_timeout(lease),
             )
-    except BaseException:
+    except BaseException as exc:
         if lease is not None:
             # ``write`` may have reached the provider and a response may already
             # be buffered on the paired reader even though drain reports failure.
             # Outbound bytes are exact above; inbound read-ahead is not, so the
             # lease cannot safely fail over or return its remaining escrow.
-            _latch_lease_accounting_uncertainty(lease, reason="provider_drain_error")
+            _latch_lease_accounting_uncertainty(lease, reason="provider_drain_error", error=exc)
         raise
     return True
 
@@ -6843,7 +7077,7 @@ async def _open_lease_upstream_tunnel(
                 )
                 observed_down_bytes += head_bytes + drained
                 raise _DeadExitResponse(code)
-            if code != 200 and lease.source in TRANSFERMARKT_ONLY_SOURCES:
+            if code != 200 and (lease.source in TRANSFERMARKT_ONLY_SOURCES or lease.source == "sofascore"):
                 # #1388: the tunnel was never established.  Meter the whole
                 # rejection (Decodo bills request + response as seen at its
                 # gateway) and, once it is provably complete, report a counted
@@ -7582,6 +7816,19 @@ def _flush_ledgers() -> None:
             ledger.flush()
 
 
+def _compact_sofascore_registry(path: str, *, kind: str):
+    if kind == "wal":
+        # This bounded control journal must not change inode/offset while a
+        # failed append rollback is pending. Paid compaction remains concurrent.
+        with _REGISTRY_LOCK:
+            if _ALLOCATION_WAL_PENDING_ROLLBACK is not None:
+                return None
+            return _compact_registry(path, _REGISTRY_LOCK, kind=kind)
+    with _REGISTRY_LOCK:
+        _repair_paid_ledger_append()
+    return _compact_registry(path, _REGISTRY_LOCK, kind=kind, before_replace=_repair_paid_ledger_append)
+
+
 async def _periodic_dump(out_path: str, interval: float = 2.0) -> None:
     last_flush = time.monotonic()
     while True:
@@ -7594,9 +7841,22 @@ async def _periodic_dump(out_path: str, interval: float = 2.0) -> None:
         if time.monotonic() - last_flush >= LEDGER_FLUSH_INTERVAL_SECONDS:
             last_flush = time.monotonic()
             try:
+                _repair_paid_ledger_append()
+                _repair_allocation_wal_append()
                 _flush_ledgers()
+                _repair_failed_claim_creations()
             except Exception:  # noqa: BLE001
                 log.exception("periodic SofaScore ledger flush failed")
+            if SOURCE_MODE == "sofascore-only":
+                for kind, path in (("paid", LEDGER_PATH), ("wal", SOFASCORE_ALLOCATION_WAL_PATH)):
+                    if kind == "wal" and _ALLOCATION_WAL_PENDING_ROLLBACK is not None:
+                        continue
+                    try:
+                        result = await asyncio.to_thread(_compact_sofascore_registry, path, kind=kind)
+                        if result:
+                            log.info("SofaScore registry compacted: %s", result)
+                    except Exception:
+                        log.exception("SofaScore %s registry compaction failed; original retained", kind)
 
 
 class _SharedBudgetGuard:
@@ -8414,6 +8674,14 @@ async def main() -> None:
     except Exception:
         # Compaction is housekeeping: an uncompacted WAL still replays fine.
         log.exception("SofaScore allocation WAL compaction failed; keeping the full WAL")
+
+    if SOURCE_MODE == "sofascore-only":
+        try:
+            result = _compact_registry(LEDGER_PATH, _REGISTRY_LOCK, kind="paid")
+            if result:
+                log.info("SofaScore startup registry compacted: %s", result)
+        except Exception:
+            log.exception("SofaScore startup compaction failed; original retained, admissions bounded")
 
     pidfile = str(getattr(args, "pidfile", "/tmp/filter_proxy.pid"))
     with open(pidfile, "w") as fh:

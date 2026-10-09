@@ -517,7 +517,7 @@ def _drift_files(tmp_path: Path) -> list[Path]:
 def _assert_drift_status(exc: BaseException) -> None:
     status, exit_code, _ = runner._classify_exception(exc)
     assert status is ManifestStatus.SCHEMA_DRIFT
-    assert exit_code == 1
+    assert exit_code == 2
 
 
 def test_league_drift_payload_is_saved(tmp_path):

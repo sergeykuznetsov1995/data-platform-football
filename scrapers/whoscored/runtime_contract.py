@@ -119,6 +119,7 @@ EXPECTED_RUNTIME_FILES = (
     "scripts/proxy_filter/__init__.py",
     "scripts/proxy_filter/budget.py",
     "scripts/proxy_filter/filter_proxy.py",
+    "scripts/proxy_filter/sofascore_registry.py",
     "scripts/research/bench_whoscored_capacity.py",
     "scripts/research/bench_whoscored_workflow.py",
     "scripts/research/whoscored_capacity_container_runtime.py",

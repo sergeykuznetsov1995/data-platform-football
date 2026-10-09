@@ -74,9 +74,7 @@ def test_production_bootstrap_requires_image_anchor(monkeypatch, missing):
     if missing == "schema":
         monkeypatch.delattr(sys, "_whoscored_runtime_startup_schema", raising=False)
     else:
-        monkeypatch.setattr(
-            sys, "_whoscored_runtime_startup_schema", 2, raising=False
-        )
+        monkeypatch.setattr(sys, "_whoscored_runtime_startup_schema", 2, raising=False)
         monkeypatch.delattr(sys, "_load_whoscored_runtime_contract", raising=False)
 
     with pytest.raises(RuntimeError, match="startup anchor|runtime loader"):
@@ -631,9 +629,7 @@ def test_capacity_control_rejects_regular_file_and_cli_conflict(tmp_path):
         os.fstat(pipe_fd)
 
 
-def test_invalid_capacity_control_main_output_never_leaks_payload(
-    monkeypatch, capsys
-):
+def test_invalid_capacity_control_main_output_never_leaks_payload(monkeypatch, capsys):
     sentinel = "secret-owner-sentinel"
     control_fd = _control_pipe(
         json.dumps({"invalid": sentinel}, separators=(",", ":")).encode()
@@ -1037,9 +1033,7 @@ def test_failed_close_retry_keeps_transport_for_outer_fallback(monkeypatch, tmp_
 
 @pytest.mark.parametrize("preview_parser_error_id", [None, 101])
 def test_transport_close_error_still_fails_report_once(preview_parser_error_id):
-    factories, objects = _factories(
-        preview_parser_error_id=preview_parser_error_id
-    )
+    factories, objects = _factories(preview_parser_error_id=preview_parser_error_id)
     original_create_transport = factories.create_transport
     close_calls = 0
 
@@ -1518,3 +1512,26 @@ def test_main_prints_a_single_json_document(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert json.loads(captured.out) == expected
     assert captured.out.count("\n") == 1
+
+
+def test_frozen_capacity_corpus_remains_compatible_with_real_capacity_consumer():
+    from scrapers.whoscored import service
+
+    assert len(service.TEAM_STAGE_STAT_TABS) == 1
+    assert len(service.PLAYER_STAGE_STAT_TABS) == 1
+    spec = importlib.util.spec_from_file_location(
+        "capacity_1478_compat", SCRIPT.with_name("bench_whoscored_capacity.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    code, report = bench.run(_cache_args())
+    assert code == 0
+    assert report["stage_statistics_contract"]["policy"] == "legacy-capacity-68"
+    assert (
+        report["stage_statistics_contract"]["production_xg_collection_evidence"]
+        is False
+    )
+    entities, stage_count = module._workflow_shape(report)
+    assert set(entities) == {"matches", "previews", "profiles", "multistage"}
+    assert stage_count == 2
