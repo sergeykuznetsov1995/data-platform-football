@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
+import errno
 import logging
 from pathlib import Path
 import random
@@ -34,6 +35,27 @@ class UnderstatHTTPError(RuntimeError):
 
 class UnderstatPayloadError(RuntimeError):
     pass
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    """Only known temporary transport/storage errors authorize a scope retry."""
+    if isinstance(exc, UnderstatHTTPError):
+        return exc.status_code in RETRYABLE_STATUSES
+    from requests.exceptions import (
+        ChunkedEncodingError, ConnectionError as RequestsConnectionError,
+        SSLError, Timeout,
+    )
+
+    if isinstance(exc, SSLError):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError, RequestsConnectionError,
+                        Timeout, ChunkedEncodingError)):
+        return True
+    return isinstance(exc, OSError) and exc.errno in {
+        errno.EAGAIN, errno.EINTR, errno.ETIMEDOUT, errno.ECONNABORTED,
+        errno.ECONNREFUSED, errno.ECONNRESET, errno.ENETDOWN, errno.ENETRESET,
+        errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE,
+    }
 
 
 def league_cache_name(source_league: str, source_season_id: int) -> str:

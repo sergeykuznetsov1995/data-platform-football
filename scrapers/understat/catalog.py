@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import date
 import math
+import json
+from pathlib import Path
+import uuid
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
@@ -137,7 +140,18 @@ class UnderstatCatalog:
     def discover_scopes(self, *, force_refresh: bool = True) -> tuple[UnderstatScope, ...]:
         payload = self.client.get_stat_data(force_refresh=force_refresh)
         try:
-            return self._scopes_from(payload)
+            scopes = self._scopes_from(payload)
+            cache_dir = getattr(self.client, "cache_dir", None)
+            if cache_dir is not None:
+                target = Path(cache_dir) / "stat.last-success.json"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    temporary.write_text(json.dumps(payload), encoding="utf-8")
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            return scopes
         except UnderstatPayloadError:
             # #1428 (R-02): keep the rejected discovery response.
             save_schema_drift_payload(
@@ -246,9 +260,33 @@ class UnderstatCatalog:
 
         if window <= 0:
             raise ValueError("window must be positive")
+        return self._rolling_window(
+            self.discover_scopes(force_refresh=force_refresh),
+            window=window, probe_next=probe_next,
+        )
+
+    def calendar_scopes(
+        self, *, window: int = 2, probe_next: bool = True,
+    ) -> tuple[UnderstatScope, ...]:
+        """Calendar window using only the last validated registry, never HTTP."""
+        cache_dir = getattr(self.client, "cache_dir", None)
+        target = Path(cache_dir) / "stat.last-success.json" if cache_dir is not None else None
+        discovered = ()
+        if target is not None and target.exists():
+            try:
+                discovered = self._scopes_from(json.loads(target.read_text(encoding="utf-8")))
+            except (OSError, ValueError) as exc:
+                raise UnderstatPayloadError(f"Invalid last successful registry: {exc}") from exc
+        return self._rolling_window(discovered, window=window, probe_next=probe_next)
+
+    def _rolling_window(
+        self, scopes: tuple[UnderstatScope, ...], *, window: int, probe_next: bool,
+    ) -> tuple[UnderstatScope, ...]:
+        if window <= 0:
+            raise ValueError("window must be positive")
         discovered = {
             (scope.league, scope.source_season_id): scope
-            for scope in self.discover_scopes(force_refresh=force_refresh)
+            for scope in scopes
         }
         current = current_source_season_id(self.today)
         years = list(range(current - window + 1, current + 1))
