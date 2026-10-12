@@ -156,6 +156,9 @@ class MemoryWriter(IcebergWriter):
         cur = self.db.sql.cursor()
         columns = list(df.columns)
         cur.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(col + " TEXT" for col in columns)})')
+        existing = {row[1] for row in cur.execute(f'PRAGMA table_info({table})')}
+        for column in set(columns) - existing:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} TEXT')
         if delete_filter:
             self.db.events.append('DELETE ' + table)
             cur.execute(f'DELETE FROM {table} WHERE {delete_filter}')

@@ -137,11 +137,13 @@ CAREER_SAFETY_OPS_TABLES = frozenset({
     'iceberg.ops.transfermarkt_proxy_ledger_events_v1',
 })
 SEASON_HANDOFF_OPS_TABLES = frozenset({'iceberg.ops.transfermarkt_season_close_v1'})
+FIRST_SEEN_OPS_TABLES = frozenset({'iceberg.ops.transfermarkt_first_seen_v1'})
 SEASON_HANDOFF_POLICY_VERSIONS = {
     'dag_ingest_transfermarkt': (3, 4),
     'dag_backfill_transfermarkt': (1, 2),
 }
 OPS_WRITE_TABLES = {
+    *FIRST_SEEN_OPS_TABLES,
     *CAREER_SAFETY_OPS_TABLES,
     *SEASON_HANDOFF_OPS_TABLES,
     'iceberg.ops.transfermarkt_fetch_state',
@@ -651,16 +653,18 @@ def standing_policy_for_hash(policy, pinned_hash):
 
     Approval dates, caps, concurrency and every Bronze permission stay
     byte-for-byte bound to the old hash. The current policy must authorize all
-    safety tables. Only the career safety tables, season handoff table, or their
-    union may have been absent from the original body.
+    safety tables. Only the career safety, season handoff and first-observation
+    tables, or their explicit unions, may have been absent from the old body.
     """
     if policy.policy_hash == pinned_hash:
         return policy
     if not CAREER_SAFETY_OPS_TABLES <= set(getattr(policy, 'allowed_write_tables', ())):
         return None
     from dataclasses import replace
-    for additions in (CAREER_SAFETY_OPS_TABLES, SEASON_HANDOFF_OPS_TABLES,
-                      CAREER_SAFETY_OPS_TABLES | SEASON_HANDOFF_OPS_TABLES):
+    migrations = (CAREER_SAFETY_OPS_TABLES, SEASON_HANDOFF_OPS_TABLES,
+                  CAREER_SAFETY_OPS_TABLES | SEASON_HANDOFF_OPS_TABLES)
+    for additions in (*migrations, FIRST_SEEN_OPS_TABLES,
+                      *(item | FIRST_SEEN_OPS_TABLES for item in migrations)):
         if not additions <= set(policy.allowed_write_tables):
             continue
         original = replace(policy, allowed_write_tables=tuple(

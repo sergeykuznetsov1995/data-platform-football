@@ -109,6 +109,13 @@ Business receipts текущего пути не объявляют старый
 
 ## Интерфейс для измерителя #1395
 
+Реализация SQL измерителя, additive provenance проверок, неизменяемого first_seen
+и offline-контрольной выборки описана в
+[TRANSFERMARKT-MEASUREMENT-1395.md](TRANSFERMARKT-MEASUREMENT-1395.md).
+Независимый ежедневный аудит ingest — в
+[TRANSFERMARKT-DAILY-DQ-1395.md](TRANSFERMARKT-DAILY-DQ-1395.md).
+Эти интерфейсы не подтверждают квалификацию детектора или runtime-приёмку.
+
 `iceberg.ops.transfermarkt_current_checks_v1` содержит scope/check/cycle,
 registry snapshot, denominator hash, checked_at, status/result, raw references,
 expected/observed IDs. `complete` разрешён только при полной проверке; ошибка

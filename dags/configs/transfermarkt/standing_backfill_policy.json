@@ -33,6 +33,7 @@
     "iceberg.ops.transfermarkt_proxy_ledger_events_v1",
     "iceberg.ops.transfermarkt_proxy_ledger_v2",
     "iceberg.ops.transfermarkt_scope_manifest_v2",
-    "iceberg.ops.transfermarkt_scope_player_capture"
+    "iceberg.ops.transfermarkt_scope_player_capture",
+    "iceberg.ops.transfermarkt_first_seen_v1"
   ]
 }

@@ -49,6 +49,13 @@ def _isolate_tm_process_env(tmp_path):
     # crash proofs are exercised by the independent MemoryDB integration tests.
     with patch.dict(os.environ, {'TM_WRITE_INTENT_DIR': str(tmp_path / 'write-intents')}), patch(
         'scrapers.transfermarkt.write_intents.snapshot_anchors', return_value={}
+    ), patch(
+        # These CLI/parser tests use partial row schemas and a mocked store.
+        # Immutable-clock registration is exercised with physical SQL storage
+        # by test_transfermarkt_first_seen and test_transfermarkt_current_write.
+        'scrapers.transfermarkt.first_seen.prepare_frames', side_effect=lambda scraper, outputs, frames: dict(frames)
+    ), patch(
+        'scrapers.transfermarkt.first_seen.inherit_registered_clocks', side_effect=lambda scraper, output, frame: frame
     ):
         yield
 

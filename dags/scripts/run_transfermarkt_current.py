@@ -34,8 +34,9 @@ if str(ROOT / 'dags') not in sys.path:
 
 from dags.utils.transfermarkt_current_state import (
     CURRENT_POLICY_VERSION, CurrentWork, EditionCheck, ScopeCursor, SignalObservation,
-    SignalState, build_check_merge, build_current_state_tables,
-    build_signal_merge, build_signals_merge, current_scope_targets, daily_complete, mark_applied,
+    SignalState, build_check_merge, build_current_state_tables, build_measurement_kind_migration_sql,
+    build_signal_merge, build_signals_merge, build_check_fingerprint_migrations_sql,
+    denominator_definition_hash, edition_measurement_fingerprint, current_scope_targets, daily_complete, mark_applied,
     mark_seen, mark_failed, plan_current_work, record_check,
 )
 from dags.utils.transfermarkt_current_timetable import available_work_seconds
@@ -587,9 +588,11 @@ class _Scope:
             manifest, committed_at = _proof(baseline_proof)
             self.signals[key] = SignalState(observation=observation, applied_signature=signature,
                 first_detected_at=min(committed_at, observation.checked_at), status='applied', result='baseline_verified',
-                bronze_manifest=manifest, committed_at=committed_at)
+                bronze_manifest=manifest, committed_at=committed_at, measurement_kind='baseline')
         else:
-            self.signals[key] = mark_seen(self.signals.get(key), observation)
+            warm = self.cursor.cold_complete or bool(self.data.get('warm_baseline'))
+            self.signals[key] = mark_seen(self.signals.get(key), observation,
+                                         measurement_kind='change' if warm else 'cold')
         if write:
             _sql(self.scraper, build_signal_merge(self.signals[key]))
         if persist:
@@ -597,9 +600,17 @@ class _Scope:
         return self.signals[key]
 
     def check(self, kind, raws, expected, observed, *, status='complete', result='checked', checked_at=None):
+        if checked_at is None and raws:
+            # Cache/recovery must retain the earliest original source clock.
+            records = [self.scraper._http_client._raw_store.load_capture(raw)[1] for raw in raws]
+            if any(record.status_code != 200 for record in records):
+                raise CurrentPortionError('edition check has no successful source raw proof')
+            checked_at = min(_utc(record.fetched_at) for record in records)
         check = EditionCheck(self.target.scope_id, kind, self.cycle_id,
                              self.target.registry_snapshot_id, self.denominator_hash, checked_at or self.now(),
-                             status, result, tuple(raws), expected, observed)
+                             status, result, tuple(raws), expected, observed,
+                             edition_fingerprint=edition_measurement_fingerprint(self.row),
+                             denominator_definition_hash=self.data.get('denominator_definition_hash'))
         _sql(self.scraper, build_check_merge(check))
         self.data.setdefault('checks', {})[kind] = check.as_dict()
         if checked_at is None:
@@ -1547,6 +1558,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
     if denominator_rows is None:
         from scrapers.transfermarkt.denominator import load_denominator
         denominator_rows = list(load_denominator().rows.values())
+    denominator_rows = list(denominator_rows)
+    definition_hash = denominator_definition_hash(denominator_rows)
     registry_rows = list(registry_rows)
     targets = current_scope_targets(denominator_rows, registry_rows)
     report['denominator_competition_ids'] = list(targets.denominator_competition_ids)
@@ -1637,6 +1650,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 cursor = ScopeCursor.from_mapping(data['cursor'])
                 data['cursor'] = replace(cursor, listing_checked_at=None, players_checked_at=None, injury_checked_at=None).as_dict()
             data['denominator_hash'] = denominator_hash
+            data['denominator_definition_hash'] = definition_hash
             cache = data.setdefault('response_cache', {})
             result = {'scope_id': target.scope_id, 'kind': item.kind, 'status': 'pending'}
             child_cycle_id = 'tm-current-' + semantic_signature([cycle_id, target.scope_id, item.kind, work_index])[:32]
@@ -1672,6 +1686,9 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 scraper._bronze_connection = bounded_connection
                 _install_entity_limits(scraper, data)
                 for sql in build_current_state_tables():
+                    _sql(scraper, sql)
+                _sql(scraper, build_measurement_kind_migration_sql())
+                for sql in build_check_fingerprint_migrations_sql():
                     _sql(scraper, sql)
                 _sql(scraper, season_ddl())
                 _sql(scraper, season_mark_sql(target, status='pending' if item.kind == 'season_close' else 'current', at=now()))
