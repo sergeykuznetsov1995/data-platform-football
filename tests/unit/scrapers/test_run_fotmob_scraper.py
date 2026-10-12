@@ -8,7 +8,7 @@ import sys
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +17,339 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from scrapers.fotmob.repository import MemoryFotMobRepository
+
+
+def _transfer_cli():
+    return [
+        "--mode",
+        "transfers",
+        "--catalog-contract",
+        "fotmob-catalog-v1",
+        "--entities",
+        "transfers",
+        "--max-requests",
+        "6000",
+        "--max-direct-mib",
+        "512",
+        "--requests-per-minute",
+        "60",
+        "--deadline",
+        "2026-10-10T02:00:00Z",
+    ]
+
+
+@pytest.fixture
+def transfer_runner(monkeypatch, tmp_path):
+    from dags.scripts import run_fotmob_scraper as mod
+    import scrapers.fotmob.service as service_module
+    import scrapers.fotmob.repository as repository_module
+
+    instant = datetime(2026, 10, 10, 0, 30)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.replace(tzinfo=timezone.utc) if tz else instant
+
+    monkeypatch.setattr(mod, "datetime", Clock)
+    monkeypatch.setattr(service_module, "utc_now", lambda: instant)
+    monkeypatch.setattr(repository_module, "utc_now", lambda: instant)
+    monkeypatch.setenv(
+        "FOTMOB_TRANSFER_STATE_PATH", str(tmp_path / "transfers.sqlite3")
+    )
+    parser = mod._argument_parser()
+    args = parser.parse_args(_transfer_cli())
+    mod._validate_args(parser, args)
+    return mod, args, instant
+
+
+def _transfer_service(ids=(47,)):
+    from scrapers.fotmob.transport import canonicalize_target
+    from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+    responses = {
+        canonicalize_target("allLeagues").canonical_url: {
+            "countries": [
+                {"leagues": [{"id": value, "name": f"League {value}"} for value in ids]}
+            ]
+        }
+    }
+    for value in ids:
+        profile = _league_payload()
+        profile["details"]["id"] = value
+        profile["details"]["name"] = f"League {value}"
+        responses[canonicalize_target("leagues", {"id": value}).canonical_url] = profile
+        responses[
+            canonicalize_target(
+                "transfers", {"leagueIds": str(value), "page": 1, "last": "1year"}
+            ).canonical_url
+        ] = {
+            "hits": 0,
+            "page": 1,
+            "transfers": [],
+        }
+    return _service(responses)
+
+
+def test_transfer_only_collects_catalog_profiles_and_transfers(transfer_runner):
+    from scrapers.fotmob.transfer_contract import validate_transfer_report
+    from scripts.fotmob_catalog_acceptance import validate_report
+
+    mod, args, instant = transfer_runner
+    service, transport, repository = _transfer_service()
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 0, report["errors"]
+    assert report["complete"]
+    assert report["family_summary"]["status"] == "green"
+    assert report["selection"]["completed_transfer_competition_ids"] == [47]
+    assert report["selection"]["planned_scopes"] == []
+    assert report["selection"]["catalog_contract"]["entities"] == ["transfers"]
+    assert {commit.target_type for commit in repository.commits} <= {
+        "all_leagues",
+        "competition_profile",
+        "transfers_page",
+        "competition_completion",
+    }
+    assert len(transport.calls) == 3
+    assert validate_transfer_report(report) == []
+    accepted = validate_report(
+        report, now=instant.replace(tzinfo=timezone.utc), require_full_completion=False
+    )
+    assert accepted.ok, accepted.as_dict()
+
+
+def test_transfer_retry_skips_today_and_keeps_own_consumed_budget(transfer_runner):
+    mod, args, instant = transfer_runner
+    service, transport, repository = _transfer_service()
+    _, first = _run_native_admitted(mod, args, service=service)
+    _, second = _run_native_admitted(mod, args, service=service)
+    transfers = [url for url, _ in transport.calls if "/transfers?" in url]
+    assert len(transfers) == 1
+    assert second["selection"]["completed_transfer_competition_ids"] == [47]
+    assert second["daily_budget"]["requests"] == len(transport.calls)
+    assert second["budget"]["max_requests"] == 6000 - first["daily_budget"]["requests"]
+
+
+def test_transfer_page_bound_is_partial_and_retry_finishes_from_checkpoint(
+    transfer_runner,
+):
+    from scrapers.fotmob.transfer_contract import validate_transfer_report
+    from scripts.fotmob_catalog_acceptance import validate_report
+    from tests.unit.scrapers.test_fotmob_service import _daily_transfer_pages
+
+    mod, args, instant = transfer_runner
+    service, transport, _ = _transfer_service()
+    pages, responses = _daily_transfer_pages()
+    transport.responses.update(responses)
+    args.transfer_max_pages = 2
+    rc, first = _run_native_admitted(mod, args, service=service)
+    assert rc == 0, first["errors"]
+    assert first["status"] == "partial_success"
+    assert not first["complete"]
+    assert first["selection"]["completed_transfer_competition_ids"] == []
+    assert validate_transfer_report(first) == []
+    verdict = validate_report(
+        first, now=instant.replace(tzinfo=timezone.utc), require_full_completion=False
+    )
+    assert verdict.ok, verdict.as_dict()
+    args.transfer_max_pages = 1
+    rc, second = _run_native_admitted(mod, args, service=service)
+    assert rc == 0, second["errors"]
+    assert second["complete"]
+    assert second["daily_budget"]["requests"] == 7
+    assert validate_transfer_report(second) == []
+    transfer_calls = [
+        (url, replay) for url, replay in transport.calls if "/transfers?" in url
+    ]
+    assert transfer_calls == [
+        (pages[1], False),
+        (pages[2], False),
+        (pages[1], True),
+        (pages[2], True),
+        (pages[3], False),
+    ]
+
+
+def test_transfer_missing_hits_remains_hard_failure_at_page_bound(transfer_runner):
+    from tests.unit.scrapers.test_fotmob_service import _daily_transfer_pages
+
+    mod, args, instant = transfer_runner
+    service, transport, _ = _transfer_service()
+    pages, responses = _daily_transfer_pages()
+    responses[pages[1]].pop("hits")
+    transport.responses.update(responses)
+    args.transfer_max_pages = 1
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 1
+    assert report["status"] != "partial_success"
+    assert not report["complete"]
+
+
+@pytest.mark.parametrize(
+    "outcome, stale",
+    [("stale_replay", True), ("stale_replay", False), ("success", True)],
+)
+def test_transfer_stale_network_fallback_cannot_refresh_completion(
+    transfer_runner, outcome, stale
+):
+    from scrapers.fotmob.transport import FetchOutcome, canonicalize_target
+
+    mod, args, instant = transfer_runner
+    service, transport, repository = _transfer_service()
+    url = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 1, "last": "1year"}
+    ).canonical_url
+    cached = transport.fetch_json(url)
+    transport.calls.clear()
+    transport._results.clear()
+    transport.responses[url] = replace(
+        cached,
+        outcome=FetchOutcome(outcome),
+        http_status=503,
+        stale=stale,
+        cache_hit=True,
+        fetched_at="2026-10-01T00:00:00Z",
+        error="HTTP503",
+    )
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 1
+    assert not report["complete"]
+    assert report["family_summary"]["status"] == "red"
+    assert report["selection"]["completed_transfer_competition_ids"] == []
+    assert not any(
+        commit.target_type == "competition_completion" for commit in repository.commits
+    )
+
+
+@pytest.mark.parametrize("stale_page", [1, 2])
+def test_transfer_stale_checkpoint_requires_fresh_network_validation(
+    transfer_runner, stale_page
+):
+    from tests.unit.scrapers.test_fotmob_service import _daily_transfer_pages
+
+    mod, args, instant = transfer_runner
+    service, transport, repository = _transfer_service()
+    pages, responses = _daily_transfer_pages()
+    transport.responses.update(responses)
+    cutoff = instant.replace(hour=0, minute=0, second=0, microsecond=0)
+    assert not service.sync_transfers(
+        47, max_pages=2, recent_only=True, resume_since=cutoff
+    ).ok
+    repository.commits = [
+        replace(commit, stale=True)
+        if commit.target_type == "transfers_page"
+        and commit.entity_id == f"1year:{stale_page}"
+        else commit
+        for commit in repository.commits
+    ]
+    transport.calls.clear()
+    args.transfer_max_pages = 1
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 0, report["errors"]
+    assert not report["complete"]
+    assert report["family_summary"]["status"] == "red"
+    assert report["selection"]["completed_transfer_competition_ids"] == []
+    assert (pages[stale_page], False) in transport.calls
+    assert (pages[stale_page], True) not in transport.calls
+    # The newly network-validated checkpoint is safe to replay on the retry.
+    rc, completed = _run_native_admitted(mod, args, service=service)
+    assert rc == 0, completed["errors"]
+    assert completed["complete"]
+    assert completed["family_summary"]["status"] == "green"
+
+
+def test_transfer_deadline_inside_page_is_soft_deferral(transfer_runner, monkeypatch):
+    mod, args, instant = transfer_runner
+    service, transport, _ = _transfer_service()
+    real_fetch = service._fetch
+
+    def fetch(endpoint, params=None, **kwargs):
+        if "/transfers?" in endpoint:
+            raise RuntimeError("FotMob ingestion deadline reached")
+        return real_fetch(endpoint, params, **kwargs)
+
+    monkeypatch.setattr(service, "_fetch", fetch)
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 0, report["errors"]
+    assert report["status"] == "partial_success"
+    assert not report["complete"]
+    assert report["selection"]["deferrals"][0]["kind"] == "deadline"
+
+
+def test_transfer_oldest_first(transfer_runner):
+    from scrapers.fotmob.transfers import TransferState
+
+    mod, args, instant = transfer_runner
+    state = TransferState()
+    state.record_catalog([47, 48, 49], instant, complete=True)
+    state.record_completion(47, instant - timedelta(days=1))
+    state.record_completion(48, instant - timedelta(days=3))
+    service, transport, _ = _transfer_service((47, 48, 49))
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 0, report["errors"]
+    assert [
+        op["metadata"]["competition_id"]
+        for op in report["operations"]
+        if op["entity"] == "transfer_events"
+    ] == [49, 48, 47]
+
+
+def test_transfer_flush_failure_does_not_mark_empty_stream_complete(transfer_runner):
+    from scrapers.fotmob.transfers import read_transfer_status
+
+    mod, args, instant = transfer_runner
+    service, _, repository = _transfer_service()
+    repository.flush = MagicMock(side_effect=RuntimeError("flush failed"))
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 1
+    assert not report["complete"]
+    assert report["selection"]["completed_transfer_competition_ids"] == []
+    assert not read_transfer_status(instant)["daily_complete"]
+
+
+def test_transfer_profile_failure_cannot_shrink_into_complete(transfer_runner):
+    from scrapers.fotmob.transfers import TransferState
+
+    mod, args, instant = transfer_runner
+    service, transport, repository = _transfer_service((47, 48))
+    service.discover_catalog()
+    from scrapers.fotmob.transport import canonicalize_target
+
+    transport.responses[canonicalize_target("leagues", {"id": 48}).canonical_url] = {}
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 1
+    assert not report["transfer_status"]["daily_complete"]
+    assert report["family_summary"]["status"] == "red"
+    assert not any("/transfers?" in url for url, _ in transport.calls)
+
+
+def test_transfer_run_outside_window_does_no_network(transfer_runner):
+    mod, args, instant = transfer_runner
+    service, transport, _ = _transfer_service()
+    args.deadline_at += timedelta(days=1)
+    with pytest.raises(ValueError, match="00:00"):
+        _run_native_admitted(mod, args, service=service)
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--entities", "season,transfers"],
+        ["--max-requests", "6001"],
+        ["--catalog-contract", ""],
+        ["--deadline", "2026-10-10T03:00:00Z"],
+        ["--season-limit", "1"],
+        ["--scope", "47=2025/2026"],
+    ],
+)
+def test_transfer_admission_rejects_widened_or_wrong_profile(extra):
+    from dags.scripts import run_fotmob_scraper as mod
+
+    parser = mod._argument_parser()
+    args = parser.parse_args(_transfer_cli() + extra)
+    with pytest.raises(SystemExit):
+        mod._validate_args(parser, args)
 
 
 PUBLICATION_SHA = "a" * 40

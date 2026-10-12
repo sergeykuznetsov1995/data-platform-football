@@ -14,6 +14,10 @@ from utils.fotmob_orchestration import (
     FAILURE_BACKOFF,
     MIN_BACKGROUND_RUNWAY,
     MIN_DAILY_RUNWAY,
+    MIN_TRANSFER_RUNWAY,
+    TRANSFER_DEADLINE,
+    TRANSFER_HOLD_START,
+    TRANSFER_WINDOW_START,
     FotMobLane,
     FotMobSchedulerState,
     advance_after_success,
@@ -154,13 +158,15 @@ def test_refresh_is_guaranteed_every_day_regardless_of_the_cursor():
 
     state = _state(FotMobLane.BACKFILL)
     owed = choose_lane(
-        _at(0), state, child_running=False, refresh_done_today=False
+        _at(0), state, child_running=False, refresh_done_today=False,
+        transfers_done_today=True,
     )
     assert owed.lane is FotMobLane.REFRESH
     assert owed.reason == "refresh_daily_guarantee"
 
     settled = choose_lane(
-        _at(0), state, child_running=False, refresh_done_today=True
+        _at(0), state, child_running=False, refresh_done_today=True,
+        transfers_done_today=True,
     )
     assert settled.lane is FotMobLane.BACKFILL
     assert settled.reason == "background_fair_turn"
@@ -175,6 +181,7 @@ def test_red_refresh_is_retried_after_the_backoff_because_the_day_still_owes_one
             state,
             child_running=False,
             refresh_done_today=False,
+            transfers_done_today=True,
             last_failure_ended_at=failed_at,
         ).lane
         is FotMobLane.REFRESH
@@ -238,7 +245,7 @@ def test_red_wave_pauses_every_lane_for_the_failure_backoff():
             child_running=False,
             last_failure_ended_at=failed_at,
         ).lane
-        is FotMobLane.REFRESH
+        is FotMobLane.TRANSFERS
     )
 
 
@@ -326,7 +333,10 @@ def test_every_lane_gets_a_cooperative_deadline():
     каталогом она обходит весь каталог, и отсутствие дедлайна стало дефектом.
     """
     for lane in FotMobLane:
-        now = _at(14) if lane is FotMobLane.DAILY else _at(9)
+        now = {
+            FotMobLane.DAILY: _at(14),
+            FotMobLane.TRANSFERS: _at(0),
+        }.get(lane, _at(9))
         deadline = build_child_conf(lane, now)["deadline"]
         assert deadline, f"полоса {lane.value} осталась без кооперативного дедлайна"
         assert datetime.fromisoformat(deadline) > now
@@ -352,6 +362,7 @@ def test_lane_request_caps_are_reachable():
         return (end.hour - start.hour) * 60 + (end.minute - start.minute)
 
     windows = {
+        FotMobLane.TRANSFERS: _minutes(TRANSFER_WINDOW_START, TRANSFER_DEADLINE),
         # фоновые полосы стартуют с полуночи, дневная — не раньше своего окна
         FotMobLane.DAILY: _minutes(DAILY_WINDOW_START, DAILY_DEADLINE),
         FotMobLane.REFRESH: _minutes(time(0, 0), BACKGROUND_DEADLINE),
@@ -386,6 +397,7 @@ def test_hard_timeout_outlasts_every_lane_window():
         return (end.hour - start.hour) * 60 + (end.minute - start.minute)
 
     windows = {
+        FotMobLane.TRANSFERS: _minutes(TRANSFER_WINDOW_START, TRANSFER_DEADLINE),
         # фоновая полоса допускается к старту с полуночи, дневная — со своего окна
         FotMobLane.REFRESH: _minutes(time(0, 0), BACKGROUND_DEADLINE),
         FotMobLane.BACKFILL: _minutes(time(0, 0), BACKGROUND_DEADLINE),
@@ -428,3 +440,74 @@ def test_background_conf_fails_closed_after_daily_cutoff(now):
     cutoff = BACKGROUND_HOLD_START.strftime("%H:%M")
     with pytest.raises(ValueError, match=f"{cutoff} UTC cutoff"):
         build_child_conf(FotMobLane.REFRESH, now)
+
+
+@pytest.mark.parametrize("cursor", [FotMobLane.REFRESH, FotMobLane.BACKFILL])
+def test_transfers_have_first_turn_and_own_budget(cursor):
+    decision = choose_lane(_at(0), _state(cursor), child_running=False)
+    assert decision.lane is FotMobLane.TRANSFERS
+    assert decision.reason == "transfers_daily_guarantee"
+    conf = build_child_conf(decision.lane, _at(0))
+    assert conf["entities"] == "transfers"
+    assert conf["catalog_contract"] == "fotmob-catalog-v1"
+    assert (conf["max_requests"], conf["max_direct_mib"], conf["max_proxy_mib"]) == (
+        6_000, 512, 0,
+    )
+    assert conf["requests_per_minute"] == 60
+    assert conf["deadline"] == _at(2).isoformat()
+    assert conf["scope"] == ""
+    assert conf["competition_limit"] == conf["season_limit"] == 0
+
+
+@pytest.mark.parametrize(
+    "settled", [{"transfers_done_today": True}, {"transfers_budget_exhausted": True}]
+)
+def test_transfers_release_remaining_window_when_finished_or_budget_spent(settled):
+    assert choose_lane(_at(0), _state(), False, **settled).lane is FotMobLane.REFRESH
+
+
+def test_transfer_cutoff_preserves_useful_runway_without_changing_match_windows():
+    cutoff = _on(TRANSFER_HOLD_START)
+    assert cutoff + MIN_TRANSFER_RUNWAY == _on(TRANSFER_DEADLINE)
+    assert choose_lane(cutoff - timedelta(seconds=1), _state(), False).lane is (
+        FotMobLane.TRANSFERS
+    )
+    for now in (cutoff, _at(2), _at(9)):
+        assert choose_lane(now, _state(), False).lane is FotMobLane.REFRESH
+        with pytest.raises(ValueError, match="outside its runway"):
+            build_child_conf(FotMobLane.TRANSFERS, now)
+    assert choose_lane(_at(14), _state(), False).lane is FotMobLane.DAILY
+    assert build_child_conf(FotMobLane.DAILY, _at(14))["max_requests"] == 24_000
+
+
+def test_transfers_obey_the_shared_writer_and_failure_backoff():
+    assert choose_lane(_at(0), _state(), True).reason == "ingest_child_running"
+    assert choose_lane(
+        _at(0, 15), _state(), False, last_failure_ended_at=_at(0)
+    ).reason == "failure_backoff"
+    assert choose_lane(
+        _at(0, 30), _state(), False, last_failure_ended_at=_at(0)
+    ).lane is FotMobLane.TRANSFERS
+
+
+def test_successful_transfer_publication_does_not_settle_transfer_or_match_debt():
+    state = _state(FotMobLane.BACKFILL)
+    advanced = advance_after_success(state, FotMobLane.TRANSFERS, _at(0, 30))
+    assert advanced.next_background_lane is state.next_background_lane
+    assert advanced.daily_date == state.daily_date
+    assert advanced.generation == state.generation + 1
+    assert FotMobSchedulerState.from_dict(advanced.to_dict()) == advanced
+    assert set(advanced.to_dict()) == set(state.to_dict())
+    assert choose_lane(_at(0, 35), advanced, False).lane is FotMobLane.TRANSFERS
+
+
+def test_automatic_current_lanes_skip_transfers_but_history_keeps_its_contract():
+    from utils.fotmob_publication import FOTMOB_DAILY_ENTITIES
+
+    for lane in (FotMobLane.DAILY, FotMobLane.REFRESH):
+        conf = build_child_conf(lane, _at(9))
+        assert conf["entities"].split(",") == [
+            entity for entity in FOTMOB_DAILY_ENTITIES if entity != "transfers"
+        ]
+    history = build_child_conf(FotMobLane.BACKFILL, _at(9))
+    assert history["entities"].split(",") == list(FOTMOB_DAILY_ENTITIES)

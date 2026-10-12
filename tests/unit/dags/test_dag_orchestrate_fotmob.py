@@ -11,6 +11,11 @@ import pytest
 from utils.fotmob_orchestration import BACKGROUND_HOLD_START
 
 
+@pytest.fixture(autouse=True)
+def _isolated_transfer_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("FOTMOB_TRANSFER_STATE_PATH", str(tmp_path / "transfers.sqlite3"))
+
+
 def _hold(shift: timedelta = timedelta(0)) -> datetime:
     """Границу фонового старта берём из константы, а не из литерала."""
 
@@ -65,8 +70,13 @@ def test_isolated_owner_is_the_one_fair_active_schedule(monkeypatch):
     assert module.dag._dag_kwargs["render_template_as_native_obj"] is True
 
     assert _task("choose_fotmob_lane").upstream_task_ids == {
+        module.TRANSFER_STATUS_TASK_ID
+    }
+    reporter = _task(module.TRANSFER_STATUS_TASK_ID)
+    assert reporter.upstream_task_ids == {
         "attest_isolated_runtime"
     }
+    assert reporter.python_callable is module.report_fotmob_transfer_freshness
     assert _task("initialize_fotmob_publication").upstream_task_ids == {
         "choose_fotmob_lane"
     }
@@ -300,7 +310,7 @@ def test_daily_initializer_mints_exact_shared_1400_interval(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("lane", ("refresh", "backfill"))
+@pytest.mark.parametrize("lane", ("transfers", "refresh", "backfill"))
 def test_background_success_abandons_and_releases_generation(
     monkeypatch, lane
 ):
@@ -816,6 +826,7 @@ def test_lane_selection_feeds_both_metadb_observations_into_the_policy(monkeypat
         child_running=False,
         refresh_done_today=False,
         last_failure_ended_at=None,
+        transfer_status={"day": "2026-08-08", "daily_complete": True},
     )
     assert owed["lane"] == "refresh"
     assert owed["reason"] == "refresh_daily_guarantee"
@@ -825,6 +836,7 @@ def test_lane_selection_feeds_both_metadb_observations_into_the_policy(monkeypat
         child_running=False,
         refresh_done_today=True,
         last_failure_ended_at=None,
+        transfer_status={"day": "2026-08-08", "daily_complete": True},
     )
     assert settled["lane"] == "backfill"
 
@@ -1115,3 +1127,154 @@ def test_an_old_failure_outside_the_backoff_does_not_reach_the_policy(monkeypatc
     assert module._ingest_child_observations(
         datetime(2026, 8, 8, 6, 5, tzinfo=timezone.utc)
     ) == (False, None)
+
+
+def _transfer_status(*, complete=False, exhausted=False, day="2026-08-08"):
+    return {
+        "day": day,
+        "daily_complete": complete,
+        "budget_exhausted": exhausted,
+        "family_summary": {
+            "status": "red",
+            "included_count": 2,
+            "fresh_count": 1,
+            "stale_count": 1,
+            "unknown_count": 0,
+            "max_age_seconds": 48 * 3600 + 1,
+        },
+    }
+
+
+def test_transfer_report_is_visible_even_when_match_lane_is_idle(monkeypatch, caplog):
+    module = _reload_owner(monkeypatch, isolated=True)
+    status = _transfer_status()
+    monkeypatch.setattr(module, "read_transfer_status", lambda now: status)
+    monkeypatch.setattr(module, "_load_state", module.FotMobSchedulerState.initial)
+    now = datetime(2026, 8, 8, 23, tzinfo=timezone.utc)
+    assert module.report_fotmob_transfer_freshness(now_utc=now) == status
+    assert module.select_fotmob_lane(
+        now_utc=now,
+        child_running=False,
+        refresh_done_today=False,
+        last_failure_ended_at=None,
+        transfer_status=status,
+    ) is False
+    assert "transfers family_summary=" in caplog.text
+    assert '"status": "red"' in caplog.text
+    # The reporter is upstream of the short circuit, so an idle selection cannot
+    # skip the report and conceal an age breach.
+    assert _task(module.DECISION_TASK_ID).upstream_task_ids == {
+        module.TRANSFER_STATUS_TASK_ID
+    }
+
+
+def test_unreadable_transfer_state_blocks_its_budget_but_keeps_matches(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    monkeypatch.setattr(module, "_load_state", module.FotMobSchedulerState.initial)
+
+    def _broken(now):
+        raise OSError("unreadable transfer journal")
+
+    monkeypatch.setattr(module, "read_transfer_status", _broken)
+    now = datetime(2026, 8, 8, 0, tzinfo=timezone.utc)
+    report = module.report_fotmob_transfer_freshness(now_utc=now)
+    assert report["family_summary"]["status"] == "red"
+    assert report["observation_error"] == "OSError"
+    assert report["budget_exhausted"] is True
+    for hour, expected in [(0, "refresh"), (14, "daily")]:
+        decision = module.select_fotmob_lane(
+            now_utc=now.replace(hour=hour),
+            child_running=False,
+            refresh_done_today=False,
+            last_failure_ended_at=None,
+        )
+        assert decision["lane"] == expected
+
+
+def test_transfer_selection_uses_reported_debt_not_generic_child_success(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    monkeypatch.setattr(module, "_load_state", module.FotMobSchedulerState.initial)
+    monkeypatch.setattr(
+        module, "read_transfer_status", lambda now: pytest.fail("must use XCom")
+    )
+    report = _transfer_status()
+    ti = SimpleNamespace(xcom_pull=lambda **kwargs: report)
+    now = datetime(2026, 8, 8, 0, tzinfo=timezone.utc)
+    common = dict(
+        now_utc=now, ti=ti, child_running=False,
+        refresh_done_today=True, last_failure_ended_at=None,
+    )
+    assert module.select_fotmob_lane(**common)["lane"] == "transfers"
+    report["daily_complete"] = True
+    assert module.select_fotmob_lane(**common)["lane"] == "refresh"
+    report["day"] = "2026-08-07"
+    assert module.select_fotmob_lane(**common)["lane"] == "transfers"
+
+
+@pytest.mark.parametrize("new_status", [
+    _transfer_status(complete=True), _transfer_status(exhausted=True),
+])
+def test_transfer_launch_rechecks_durable_completion_and_budget(monkeypatch, new_status):
+    module = _reload_owner(monkeypatch, isolated=False)
+    now = datetime(2026, 8, 8, 0, tzinfo=timezone.utc)
+    state = module.FotMobSchedulerState.initial()
+    decision = {
+        "lane": "transfers",
+        "state": state.to_dict(),
+        "conf": module.build_child_conf(module.FotMobLane.TRANSFERS, now),
+    }
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(module, "read_transfer_status", lambda now: new_status)
+    ti = SimpleNamespace(xcom_pull=lambda **kwargs: decision)
+    assert module._launch_still_admitted({
+        "ti": ti, "now_utc": now, "child_running": False,
+        "refresh_done_today": False, "last_failure_ended_at": None,
+    }) is False
+
+
+def test_delayed_transfer_trigger_cannot_start_after_its_minimum_runway(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    now = datetime(2026, 8, 8, 1, 40, tzinfo=timezone.utc)
+    state = module.FotMobSchedulerState.initial()
+    decision = {
+        "lane": "transfers",
+        "state": state.to_dict(),
+        "conf": module.build_child_conf(module.FotMobLane.TRANSFERS, now),
+    }
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    ti = SimpleNamespace(xcom_pull=lambda **kwargs: decision)
+    context = dict(
+        ti=ti, now_utc=now, child_running=False, transfer_status=_transfer_status(),
+        refresh_done_today=False, last_failure_ended_at=None,
+    )
+    assert module._launch_still_admitted(context) is True
+    context["now_utc"] = now.replace(minute=45)
+    assert module._launch_still_admitted(context) is False
+
+
+def test_transfer_success_preserves_cursor_and_daily_date_across_state_retry(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    state = _state_with(module, module.FotMobLane.BACKFILL)
+    stored = [state]
+    writes = []
+    monkeypatch.setattr(module, "_load_state", lambda: stored[-1])
+
+    def _store(value):
+        stored.append(value)
+        writes.append(value)
+
+    monkeypatch.setattr(module, "_store_state", _store)
+    decision = {
+        "lane": "transfers",
+        "selected_date": "2026-08-08",
+        "state": state.to_dict(),
+        "state_generation": state.generation,
+    }
+    ti = SimpleNamespace(xcom_pull=lambda **kwargs: decision)
+    context = {"ti": ti, "now_utc": datetime(2026, 8, 8, 1, tzinfo=timezone.utc)}
+    first = module.advance_fotmob_scheduler_state(**context)
+    assert module.advance_fotmob_scheduler_state(**context) == first
+    assert len(writes) == 1
+    assert first["daily_date"] == state.to_dict()["daily_date"]
+    assert first["next_background_lane"] == state.next_background_lane.value
+    assert first["generation"] == state.generation + 1

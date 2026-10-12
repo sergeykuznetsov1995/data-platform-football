@@ -44,6 +44,17 @@ from scrapers.fotmob.player_collector import (
     player_collector_ids_sha256,
     player_collector_plan_signature,
 )
+from scrapers.fotmob.transfers import (
+    TRANSFER_MAX_DIRECT_MIB,
+    TRANSFER_MAX_REQUESTS,
+    TRANSFER_MODE,
+    TRANSFER_POLICY,
+    TRANSFER_PROFILE,
+    TRANSFER_RPM,
+    TransferState,
+    read_transfer_status,
+    transfer_journal_signature,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +76,7 @@ NATIVE_MODES = (
     "replay",
     "refresh",
     PLAYER_COLLECTOR_MODE,
+    TRANSFER_MODE,
 )
 NATIVE_ENTITIES = frozenset(
     {"season", "leaderboards", "matches", "teams", "players", "transfers"}
@@ -1070,7 +1082,7 @@ def _build_native_service(args, run_id: str):
         # 1-year transfer window).  See NATIVE_MODES.
         mode=RunMode(
             "daily"
-            if args.mode in {"refresh", PLAYER_COLLECTOR_MODE}
+            if args.mode in {"refresh", PLAYER_COLLECTOR_MODE, TRANSFER_MODE}
             else args.mode
         ),
         budget=budget,
@@ -1080,6 +1092,303 @@ def _build_native_service(args, run_id: str):
     global _ACTIVE_NATIVE_SERVICE
     _ACTIVE_NATIVE_SERVICE = service
     return service, raw_store
+
+
+def _run_transfers(args, service, started_at, operations, finish):
+    """Independent daily obligation: catalogue/profiles and transfer pages only."""
+    from scrapers.fotmob.catalog import CLASSIFIER_VERSION
+    from scrapers.fotmob.catalog_contract import build_catalog_contract
+    from scrapers.fotmob.planner import BudgetLedger, TransportBudget
+    from scrapers.fotmob.repository import PARSER_VERSION
+    from scrapers.fotmob.service import OperationResult
+
+    cutoff = started_at.replace(hour=0, minute=0, second=0, microsecond=0)
+    if started_at.hour >= 2 or args.deadline_at != cutoff + timedelta(hours=2):
+        raise ValueError("transfers must run in the daily 00:00–02:00 UTC window")
+    state = TransferState()
+    reservation = state.reserve(started_at)
+    plan = OperationResult("transfer_work_plan")
+    operations.append(plan)
+    if reservation is None:
+        plan.retryable.append("daily transfer budget exhausted or reserved")
+        rc, payload = finish()
+        payload.update(read_transfer_status(datetime.now(timezone.utc)))
+        return 1, payload
+    service.ledger = BudgetLedger(
+        TransportBudget(
+            max_requests=reservation["requests"],
+            max_direct_bytes=reservation["direct_bytes"],
+            max_proxy_bytes=0,
+        )
+    )
+    service.deadline_at = args.deadline_at
+    initial_stats = service.transport.snapshot_stats()
+    catalog = service.discover_catalog()
+    operations.append(catalog.operation)
+    catalog_ids = sorted(
+        item.competition.competition_id for item in catalog.classifications
+    )
+    by_id = {item.competition.competition_id: item for item in catalog.classifications}
+    profiles = OperationResult("transfer_profile_validation")
+    operations.append(profiles)
+    # Validate included roots without discovering any season or child entities.
+    # A failed included profile keeps the catalogue incomplete, even if its
+    # classifier now says pending_probe and removes the id from this run's set.
+    for competition_id, item in list(by_id.items()):
+        if item.decision.value != "included":
+            continue
+        profiles.attempted += 1
+        if competition_id in catalog.profile_payloads:
+            profiles.succeeded += 1
+            continue
+        try:
+            fetch = service._fetch("leagues", {"id": competition_id})
+            classification, paths = service._revalidate_included_profile(item, fetch)
+            profiles.tables.extend(paths)
+            by_id[competition_id] = classification
+            if (
+                not fetch.ok
+                or fetch.stale
+                or classification.decision.value in {"pending_probe", "review_required"}
+            ):
+                profiles.errors.append(
+                    f"competition {competition_id} fresh profile validation failed"
+                )
+            else:
+                profiles.succeeded += 1
+        except Exception as exc:
+            profiles.errors.append(
+                f"competition {competition_id} profile: {type(exc).__name__}: {exc}"
+            )
+    included_ids = sorted(
+        key for key, value in by_id.items() if value.decision.value == "included"
+    )
+    evidence = dict(service._catalog_evidence)
+    catalog_complete = bool(
+        catalog.discovery is not None
+        and catalog.operation.ok
+        and profiles.ok
+        and included_ids
+        and set(catalog_ids) == set(evidence)
+        and not any(value.decision.value == "pending_probe" for value in by_id.values())
+    )
+    catalog_contract = None
+    if catalog.discovery is not None and catalog.fetch is not None:
+        catalog_contract = build_catalog_contract(
+            catalog_batch_id=deterministic_target_batch_id_for_catalog(
+                service, catalog
+            ),
+            catalog_content_hash=catalog.fetch.content_hash,
+            classifier_version=CLASSIFIER_VERSION,
+            parser_version=PARSER_VERSION,
+            entities=["transfers"],
+            included_ids=included_ids,
+            scopes=[],
+            entity_policy={"transfer_policy": TRANSFER_POLICY},
+        )
+    if not catalog_complete:
+        plan.errors.append("transfer catalog/profile validation incomplete")
+    before = read_transfer_status(started_at)
+    completion_times = before["completion_timestamps"]
+    already_complete = set(before["completed_transfer_competition_ids"])
+    candidates = sorted(
+        set(included_ids) - already_complete,
+        key=lambda competition_id: (
+            completion_times.get(str(competition_id), ""),
+            competition_id,
+        ),
+    )
+    plan.attempted = len(candidates)
+    journal_signature = transfer_journal_signature()
+    completed = []
+    deferrals = []
+    for index, competition_id in enumerate(candidates if catalog_complete else []):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        capacity = service.ledger.remaining_requests // max(
+            1, service.transport.max_attempts
+        )
+        if (
+            now >= args.deadline_at
+            or capacity < 1
+            or service.ledger.direct_bytes >= service.ledger.budget.max_direct_bytes
+        ):
+            reason = "deadline" if now >= args.deadline_at else "budget"
+            deferred = candidates[index:]
+            plan.skipped += len(deferred)
+            plan.retryable.append(f"{reason} deferred {len(deferred)} transfer streams")
+            deferrals.append(
+                {
+                    "kind": reason,
+                    "target_type": "transfer",
+                    "targets": deferred,
+                    "reason": f"{reason} deferred transfer",
+                }
+            )
+            break
+        transfer = service.sync_transfers(
+            competition_id,
+            max_pages=min(args.transfer_max_pages, capacity),
+            recent_only=True,
+            resume_since=cutoff,
+        )
+        operations.append(transfer)
+        hits = transfer.metadata.get("source_hits")
+        observed = int(transfer.counts.get("events", 0))
+        deficit = int(transfer.metadata.get("source_hits_deficit", 0))
+        if not transfer.ok or hits is None or observed + deficit < hits:
+            reason = transfer.metadata.get("deferred_reason")
+            if (
+                reason in {"budget", "deadline"}
+                and (
+                    hits is not None or reason == "deadline" and transfer.succeeded == 0
+                )
+                and not transfer.terminal
+                and all(
+                    error.startswith("transfer pagination incomplete:")
+                    for error in transfer.errors
+                )
+                and all("deadline reached" in retry for retry in transfer.retryable)
+            ):
+                # A bounded partial stream retains its raw checkpoints. Its
+                # missing tail is a scheduling deferral, never a completion.
+                transfer.metadata["pagination_deferred_errors"] = list(transfer.errors)
+                transfer.errors.clear()
+                transfer.retryable = [f"{reason} deferred transfer pagination"]
+                deferrals.append(
+                    {
+                        "kind": reason,
+                        "target_type": "transfer",
+                        "targets": [competition_id],
+                        "reason": f"{reason} deferred transfer pagination",
+                    }
+                )
+            plan.retryable.append(
+                f"competition {competition_id} transfer stream incomplete"
+            )
+            continue
+        completion = OperationResult(
+            "competition_completion",
+            attempted=1,
+            metadata={"competition_id": competition_id, "window": "1year"},
+        )
+        operations.append(completion)
+        try:
+            completion.tables.extend(
+                service.record_competition_completion(
+                    competition_id,
+                    plan_signature=journal_signature,
+                    coverage={
+                        "window": "1year",
+                        "source_hits": hits,
+                        "observed_events": observed,
+                        "source_hits_deficit": deficit,
+                    },
+                    counts={"events": observed},
+                )
+            )
+            completion.succeeded = 1
+            completion.counts["competitions"] = 1
+            completed.append(competition_id)
+            plan.succeeded += 1
+        except Exception as exc:
+            completion.errors.append(
+                f"competition {competition_id}: {type(exc).__name__}: {exc}"
+            )
+    rc, payload = finish()
+    flushed = any(
+        op.entity == "commit_flush" and op.ok and op.succeeded == 1 for op in operations
+    )
+    checked_at = datetime.fromisoformat(payload["completed_at"].replace("Z", "+00:00"))
+    # No local freshness marker is allowed ahead of successful Bronze flush.
+    if flushed:
+        state.record_catalog(included_ids, checked_at, complete=catalog_complete)
+        for competition_id in completed:
+            state.record_completion(competition_id, checked_at)
+    stats = service.transport.snapshot_stats()
+    state.finalize(
+        reservation,
+        requests=stats.attempts - initial_stats.attempts,
+        direct_bytes=stats.direct_bytes - initial_stats.direct_bytes,
+        proxy_bytes=stats.proxy_bytes - initial_stats.proxy_bytes,
+    )
+    status = read_transfer_status(checked_at)
+    payload["family_summary"] = status["family_summary"]
+    payload["daily_budget"] = status["daily_budget"]
+    payload["transfer_status"] = status
+    payload["selection"] = {
+        "profile": TRANSFER_PROFILE,
+        "entities": ["transfers"],
+        "explicit_scopes": [],
+        "competition_limit": 0,
+        "season_limit": 0,
+        "planned_scopes": [],
+        "completed_scopes": [],
+        "scope_attempts": [],
+        "scope_lane": "current",
+        "requests_per_minute": args.requests_per_minute,
+        "scope_plan_signature": catalog_contract.plan_signature
+        if catalog_contract
+        else None,
+        "transfer_plan_signature": catalog_contract.plan_signature
+        if catalog_contract
+        else None,
+        "journal_transfer_plan_signature": journal_signature,
+        "catalog_contract": catalog_contract.as_dict() if catalog_contract else None,
+        "catalog_ids": catalog_ids,
+        "catalog_decisions": [
+            _catalog_decision_payload(evidence[key])
+            for key in catalog_ids
+            if key in evidence
+        ],
+        "completed_transfer_competition_ids": sorted(
+            set(status["completed_transfer_competition_ids"]) & set(included_ids)
+        ),
+        "completion_timestamps": {
+            key: value
+            for key, value in status["completion_timestamps"].items()
+            if int(key) in included_ids
+        },
+        "catalog_complete": catalog_complete and flushed,
+        "catalog_checked_at": status["catalog_checked_at"],
+        "flush_succeeded": flushed,
+        "deferrals": deferrals,
+    }
+    if not status["daily_complete"] or not flushed:
+        payload["complete"] = False
+        payload["status"] = "partial_success" if rc == 0 else payload["status"]
+    # Only explicit page/budget/deadline deferrals get a successful Airflow
+    # outcome. Fetch/parse/commit errors and failed profile validation stay red.
+    deferred_ids = {key for item in deferrals for key in item["targets"]}
+    unfinished_ids = set(included_ids) - set(
+        status["completed_transfer_competition_ids"]
+    )
+    if (
+        flushed
+        and catalog_complete
+        and unfinished_ids
+        and unfinished_ids <= deferred_ids
+        and not any(op.errors or op.terminal for op in operations)
+        and all(
+            not op.retryable
+            or op is plan
+            or op.entity == "transfer_events"
+            and op.metadata.get("deferred_reason") in {"budget", "deadline"}
+            for op in operations
+        )
+    ):
+        payload["status"] = "partial_success"
+        rc = 0
+    return rc, payload
+
+
+def deterministic_target_batch_id_for_catalog(service, catalog):
+    from scrapers.fotmob.repository import deterministic_target_batch_id
+
+    return deterministic_target_batch_id(
+        observation_identity=service.run_id,
+        target_key=catalog.fetch.target_key,
+        content_hash=catalog.fetch.content_hash,
+    )
 
 
 def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, Any]]:
@@ -1178,6 +1487,9 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         payload["mode"] = args.mode
         _deactivate_native_service(service)
         return (0 if report.ok else 1), payload
+
+    if args.mode == TRANSFER_MODE:
+        return _run_transfers(args, service, started_at, operations, finish)
 
     source_refresh = getattr(args, "source_refresh_contract", None)
     if args.mode == PLAYER_COLLECTOR_MODE:
@@ -3072,6 +3384,48 @@ def _validate_args(
         args.competition_scope_sha256,
         args.competition_ids_sha256,
     )
+    if args.mode == TRANSFER_MODE:
+        violations = []
+        if args.catalog_contract != "fotmob-catalog-v1":
+            violations.append("automatic catalog contract required")
+        if _parse_native_entities(args.entities) != frozenset({"transfers"}):
+            violations.append("entities must be exactly transfers")
+        if (
+            source_refresh is not None
+            or any(daily_contract_fields)
+            or _parse_scopes(args.scope)
+        ):
+            violations.append("other profiles and exact scopes must be empty")
+        if any(
+            (
+                args.competition_limit,
+                args.season_limit,
+                args.match_limit,
+                args.team_limit,
+                args.player_limit,
+            )
+        ):
+            violations.append("all planner limits must be zero")
+        if (
+            args.max_requests != TRANSFER_MAX_REQUESTS
+            or args.max_direct_mib != TRANSFER_MAX_DIRECT_MIB
+        ):
+            violations.append("transfer daily budget")
+        if (
+            args.requests_per_minute != TRANSFER_RPM
+            or args.max_attempts != 4
+            or args.workers != 4
+        ):
+            violations.append("transfer request rate/attempts/workers")
+        if args.next_build_id:
+            violations.append("Next build override must be empty")
+        if (
+            args.deadline_at is None
+            or args.deadline_at.time() != datetime.min.replace(hour=2).time()
+        ):
+            violations.append("transfer deadline must be 02:00 UTC")
+        if violations:
+            parser.error("invalid FotMob transfer collector: " + ", ".join(violations))
     if args.mode == PLAYER_COLLECTOR_MODE:
         literal_entities = tuple(
             sorted(
@@ -3129,8 +3483,8 @@ def _validate_args(
             violations.append("legacy daily contract fields must be empty")
         if _parse_scopes(args.scope):
             violations.append("automatic exact season scope must be empty")
-        if args.mode not in {"daily", "refresh", "backfill"}:
-            violations.append("mode must be daily, refresh, or backfill")
+        if args.mode not in {"daily", "refresh", "backfill", TRANSFER_MODE}:
+            violations.append("mode must be daily, refresh, backfill, or transfers")
         if args.competition_limit:
             violations.append("competition limit must be zero")
         if violations:

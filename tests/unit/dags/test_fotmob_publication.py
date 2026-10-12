@@ -668,8 +668,9 @@ def test_active_player_collector_writer_requires_exact_child_and_profile(
         )
 
 
+@pytest.mark.parametrize("lane", ["daily", "transfers"])
 def test_active_automatic_writer_requires_exact_child_ids_and_owner_profile(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, lane
 ):
     roots, _report_path, _report, environment, _dag_run = (
         _isolated_runtime_evidence(tmp_path)
@@ -690,10 +691,18 @@ def test_active_automatic_writer_requires_exact_child_ids_and_owner_profile(
         "requests_per_minute": publication.FOTMOB_DAILY_REQUESTS_PER_MINUTE,
         "deadline": "",
     }
+    if lane == "transfers":
+        profile.update(
+            mode="transfers",
+            entities="transfers",
+            max_requests=6000,
+            max_direct_mib=512,
+            deadline="2026-08-08T02:00:00+00:00",
+        )
     authorization = {
         "owner_run_id": "scheduled__owner",
         "ingest_run_id": f"fotmob_orchestrated__{generation_id}",
-        "lane": "daily",
+        "lane": lane,
         "conf": profile,
     }
     monkeypatch.setattr(
@@ -714,7 +723,7 @@ def test_active_automatic_writer_requires_exact_child_ids_and_owner_profile(
         require_scheduled_owner=False,
         dag_run=ingest,
     )
-    assert admitted["automatic_writer_lifecycle"]["lane"] == "daily"
+    assert admitted["automatic_writer_lifecycle"]["lane"] == lane
 
     for mutation in (
         {"run_id": "manual__borrowed"},

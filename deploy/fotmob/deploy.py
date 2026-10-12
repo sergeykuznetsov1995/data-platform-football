@@ -196,6 +196,8 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/fotmob/player_collector.py",
     "scrapers/fotmob/scope_codec.py",
     "scrapers/fotmob/source_refresh.py",
+    "scrapers/fotmob/transfers.py",
+    "scrapers/fotmob/transfer_contract.py",
     "scrapers/fotmob/transport.py",
 }
 MASTER_RUNTIME_PATH = "dags/dag_master_pipeline.py"
