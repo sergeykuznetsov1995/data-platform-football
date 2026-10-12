@@ -247,16 +247,24 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
 
-def stable_json(value: Any) -> str:
+class JsonText(str):
+    """Already encoded JSON, distinguished from a source string value.
+
+    Kept through the repository's two normalization passes. Callers supplying
+    pre-encoded JSON must use stable_json instead of an unmarked string.
+    """
+
+
+def stable_json(value: Any) -> JsonText:
     """Serialize nested source values without lossy coercion."""
 
-    return json.dumps(
+    return JsonText(json.dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         default=_json_default,
-    )
+    ))
 
 
 def _scope_attempt_target_key(
@@ -565,7 +573,12 @@ def normalize_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         if not isinstance(row, Mapping):
             raise TypeError(f"repository row must be a mapping, got {type(row)!r}")
-        output.append({str(key): _scalar(value) for key, value in row.items()})
+        output.append({
+            str(key): (
+                value if isinstance(value, JsonText) else stable_json(value)
+            ) if str(key).endswith("_json") else _scalar(value)
+            for key, value in row.items()
+        })
     return output
 
 
@@ -1658,24 +1671,48 @@ class FotMobRepository:
         # Match _write's DataFrame coercion (int -> float with NULL siblings).
         expected_rows = pd.DataFrame(rows).to_dict("records")
         by_batch: dict[str, list[dict[str, Any]]] = {}
+        original_by_batch: dict[str, list[dict[str, Any]]] = {}
         for row in expected_rows:
             by_batch.setdefault(str(row["_target_batch_id"]), []).append(row)
+        for row in rows:
+            original_by_batch.setdefault(str(row["_target_batch_id"]), []).append(row)
         result = self._stored_batch_rows(table, by_batch, columns)
         if result is None:
             return
         stored, types = result
+        encoded_types = {**types, **{
+            column: "VARCHAR" for column in columns if column.endswith("_json")
+        }}
         successes: Optional[set[str]] = None
         remaining: list[dict[str, Any]] = []
         for batch_id, pending in by_batch.items():
             actual = stored[batch_id]
-            wanted = row_multiset(pending, columns, types)
             present = row_multiset(actual, columns, types)
+            # New JSON values are text even if the legacy physical column was
+            # BOOLEAN/DOUBLE. Casting "0" to BOOLEAN here would wrongly accept
+            # a corrupt false. Only the exact legacy alternative uses that type.
+            wanted = row_multiset(pending, columns, encoded_types)
             if inventory_keys:
                 # Inventory ownership depends on target order. Only the keys
                 # this attempt still needs participate in the comparison.
                 present = type(present)({digest: count for digest, count in present.items() if digest in wanted})
             if present == wanted:
                 continue
+            if actual and not inventory_keys:
+                # v2 previously applied _scalar to raw values even in *_json.
+                # Derive that exact alternative from the pending source value,
+                # never by guessing the meaning of a stored string ("false"
+                # could have been a source string). Every row in the batch must
+                # match one whole representation, including non-JSON columns.
+                legacy = [
+                    {column: _scalar(json.loads(value))
+                     if column.endswith("_json") and isinstance(value, JsonText)
+                     else value for column, value in row.items()}
+                    for row in original_by_batch[batch_id]
+                ]
+                legacy = pd.DataFrame(legacy).to_dict("records")
+                if present == row_multiset(legacy, columns, types):
+                    continue
             if actual:
                 if successes is None:
                     successes = self._successful_batch_ids(by_batch)
@@ -1693,7 +1730,9 @@ class FotMobRepository:
                     table, batch_id, len(actual), len(pending),
                 )
                 self._overwrite_batches.setdefault(table, set()).add(batch_id)
-            remaining.extend(pending)
+            # Pandas unboxes JsonText to str. Keep the original encoded values
+            # for _write's normalization; coerced rows are only for comparison.
+            remaining.extend(original_by_batch[batch_id])
         if remaining:
             self._pending[key] = remaining
         else:

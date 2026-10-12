@@ -7,6 +7,13 @@ import pytest
 from scrapers.fotmob.row_identity import identity_value, row_multiset
 
 
+@pytest.mark.parametrize(("stored", "pending"), [(None, "false"), (False, "true"), ("false", '"false"'), ('{"x":1}', '{"x":2}')])
+def test_1291_json_identity_still_rejects_changed_payload(stored, pending):
+    assert row_multiset([{"fragment_json": stored}], ["fragment_json"], {}) != row_multiset(
+        [{"fragment_json": pending}], ["fragment_json"], {},
+    )
+
+
 @pytest.mark.parametrize(('expected', 'persisted', 'kind'), [
     ('7', 7, 'BIGINT'),
     (7, '7', 'VARCHAR'),

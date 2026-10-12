@@ -2099,7 +2099,7 @@ class TestFotmobNativeRunner:
             },
             canonicalize_target(
                 "matchDetails", {"matchId": "200"}
-            ).canonical_url: {
+            ).canonical_url: {"general": {"matchId": 200},
                 "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
             },
         }
@@ -2342,7 +2342,7 @@ class TestFotmobNativeRunner:
                 canonicalize_target("leagues", {"id": 47}).canonical_url: payload,
                 canonicalize_target(
                     "matchDetails", {"matchId": "100"}
-                ).canonical_url: {
+                ).canonical_url: {"general": {"matchId": 100},
                     "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
                 },
             }
@@ -2428,10 +2428,10 @@ class TestFotmobNativeRunner:
                 _competition_payload(47, "Premier League")
             ),
             canonicalize_target("leagues", {"id": 48}).canonical_url: healthy,
-            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {"general": {"matchId": 100},
                 "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
             },
-            canonicalize_target("matchDetails", {"matchId": "200"}).canonical_url: {
+            canonicalize_target("matchDetails", {"matchId": "200"}).canonical_url: {"general": {"matchId": 200},
                 "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
             },
         }
@@ -2549,7 +2549,7 @@ class TestFotmobNativeRunner:
             absent_target.canonical_url: absent_match,
             canonicalize_target(
                 "matchDetails", {"matchId": "200"}
-            ).canonical_url: {
+            ).canonical_url: {"general": {"matchId": 200},
                 "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
             },
         }
@@ -3193,7 +3193,7 @@ class TestFotmobNativeRunner:
             canonicalize_target(
                 "leagues", {"id": 47, "season": "2024/2025"}
             ).canonical_url: _league_payload("2024/2025"),
-            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {"general": {"matchId": 100},
                 "content": {"matchFacts": {"events": []}}
             },
         }
@@ -4438,7 +4438,7 @@ class TestFotmobNativeRunner:
             canonicalize_target(
                 "leagues", {"id": 47, "season": "2024/2025"}
             ).canonical_url: historical,
-            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {"general": {"matchId": 100},
                 "content": {"matchFacts": {"events": []}}
             },
         }

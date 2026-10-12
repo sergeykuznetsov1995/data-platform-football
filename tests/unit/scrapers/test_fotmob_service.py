@@ -196,6 +196,75 @@ def _service(responses, mode=RunMode.DAILY):
     return service, transport, repository
 
 
+def test_1291_new_match_key_preserves_bronze_and_success():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    payload = {
+        "general": {"matchId": "100"},
+        "content": {"matchFacts": {"events": []}, "newWidget": False},
+        "newRoot": {"nested": [None, False]},
+    }
+    service, _, repository = _service({url: payload})
+    result = service.sync_match_payloads(bundle)
+    assert result.ok and result.succeeded == 1
+    assert repository.tables["fotmob_match_payloads"][0]["payload_json"] == payload
+    assert {row["json_path"] for row in repository.tables["fotmob_field_inventory"]} >= {
+        "newRoot.nested[]", "content.newWidget",
+    }
+
+
+@pytest.mark.parametrize("source_id", [999, "999", None, False, True, 100.0, "bad"])
+def test_1291_match_identity_drift_preserves_last_good(source_id):
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    good = {"general": {"matchId": 100}, "content": {"matchFacts": {"events": []}}}
+    bad = {**good, "general": {"matchId": source_id}}
+    service, _, repository = _service({url: [good, bad]})
+    assert service.sync_match_payloads(bundle).ok
+    repository.commits[0] = replace(repository.commits[0], completed_at=datetime(2026, 7, 11))
+    target = canonicalize_target("matchDetails", {"matchId": "100"})
+    before = repository.latest_success(target.target_key)
+    service.mode = RunMode.REPLAY
+    result = service.sync_match_payloads(bundle)
+    assert not result.ok and result.succeeded == 0
+    assert repository.commits[-1].status == ManifestStatus.SCHEMA_DRIFT
+    assert repository.latest_success(target.target_key) == before
+    assert len(repository.tables["fotmob_match_payloads"]) == 1
+    assert "requested 100" in repository.commits[-1].error
+
+
+@pytest.mark.parametrize("source_id", [999, "999", None, False, True, 1.0, "bad"])
+def test_1291_team_identity_drift_preserves_last_good_and_no_fanout(source_id):
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    url = canonicalize_target("teams", {"id": "1"}).canonical_url
+    good = {"details": {"id": 1, "name": "Alpha"}, "squad": {}}
+    bad = {"details": {"id": source_id}, "squad": {
+        "squad": [{"title": "players", "members": [{"id": 999}]}],
+    }}
+    service, _, repository = _service({url: [good, bad]})
+    first, _ = service.sync_team_snapshots(bundle, limit=1)
+    assert first.ok
+    repository.commits[0] = replace(repository.commits[0], completed_at=datetime(2026, 7, 11))
+    before = repository.latest_entity_success("team", 1)
+    result, players = service.sync_team_snapshots(bundle, limit=1, refresh_after=timedelta(0))
+    assert not result.ok and result.succeeded == 0
+    assert players == set()
+    assert repository.commits[-1].status == ManifestStatus.SCHEMA_DRIFT
+    assert repository.latest_entity_success("team", 1) == before
+    assert len(repository.tables["fotmob_team_snapshots"]) == 1
+    assert "requested 1" in repository.commits[-1].error
+
+
+@pytest.mark.parametrize("value", [False, None, "false", "null"])
+def test_1291_team_json_fragment_preserves_source_scalar(value):
+    row, _, _ = FotMobIngestService._team_rows(
+        1, {"details": {"id": "1"}, "overview": value, "history": value},
+        datetime(2026, 10, 12, tzinfo=timezone.utc),
+    )
+    assert row["overview_json"] == value
+    assert row["history_json"] == value
+
+
 def _competition_payload(
     competition_id,
     name,
@@ -1668,7 +1737,7 @@ def test_transfer_deadline_stops_before_fetch():
 def test_match_payload_uses_one_request_and_second_call_skips_success():
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
-    payload = {"content": {"matchFacts": {"events": []}, "stats": {"x": 1}}}
+    payload = {"general": {"matchId": 100}, "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}}
     service, transport, repository = _service({match_url: payload})
 
     first = service.sync_match_payloads(bundle)
@@ -1733,7 +1802,7 @@ def test_match_payload_unfamiliar_error_body_stays_schema_drift():
 
     assert result.not_available == 0
     assert "intentional_not_available" not in result.metadata
-    assert any("incomplete" in error for error in result.errors)
+    assert any("id mismatch" in error for error in result.errors)
     commit = next(c for c in repository.commits if c.target_type == "match")
     assert commit.status == ManifestStatus.SCHEMA_DRIFT
 
@@ -1743,7 +1812,7 @@ def test_team_snapshots_are_global_observations_not_historical_season_rows():
     team1 = canonicalize_target("teams", {"id": "1"}).canonical_url
     team2 = canonicalize_target("teams", {"id": "2"}).canonical_url
     payload = {
-        "details": {"name": "Alpha"},
+        "details": {"id": 1, "name": "Alpha"},
         "overview": {},
         "squad": {
             "squad": [
@@ -1754,7 +1823,9 @@ def test_team_snapshots_are_global_observations_not_historical_season_rows():
             ]
         },
     }
-    service, _, repository = _service({team1: payload, team2: payload})
+    second = copy.deepcopy(payload)
+    second["details"]["id"] = 2
+    service, _, repository = _service({team1: payload, team2: second})
 
     result, player_ids = service.sync_team_snapshots(bundle)
 
@@ -1880,7 +1951,7 @@ def test_backfill_skips_fresh_prior_generation_children():
     }
     player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     team_payload = {
-        "details": {"name": "Alpha"},
+        "details": {"id": 1, "name": "Alpha"},
         "overview": {},
         "squad": {
             "squad": [
@@ -1893,9 +1964,9 @@ def test_backfill_skips_fresh_prior_generation_children():
     }
     responses = {
         leaderboard_url: {"TopLists": []},
-        match_url: {"content": {"matchFacts": {"events": []}, "stats": {}}},
+        match_url: {"general": {"matchId": 100}, "content": {"matchFacts": {"events": []}, "stats": {}}},
         team_urls[1]: team_payload,
-        team_urls[2]: team_payload,
+        team_urls[2]: {**team_payload, "details": {"id": 2, "name": "Beta"}},
         player_url: {"pageProps": {"data": {"id": 10, "name": "Player"}}},
     }
     service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
@@ -1964,7 +2035,7 @@ def test_backfill_refetches_periodic_children_but_reuses_verified_player_card():
     other_team_url = canonicalize_target("teams", {"id": "2"}).canonical_url
     player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     team_payload = {
-        "details": {"name": "Alpha"},
+        "details": {"id": 1, "name": "Alpha"},
         "overview": {},
         "squad": {
             "squad": [
@@ -1978,7 +2049,7 @@ def test_backfill_refetches_periodic_children_but_reuses_verified_player_card():
     responses = {
         leaderboard_url: {"TopLists": []},
         team_url: team_payload,
-        other_team_url: team_payload,
+        other_team_url: {**team_payload, "details": {"id": 2, "name": "Beta"}},
         player_url: {"pageProps": {"data": {"id": 10, "name": "Player"}}},
     }
     service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
@@ -2048,7 +2119,7 @@ def test_stale_raw_replay_does_not_count_as_freshness_validation():
     match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
     responses = {
         leaderboard_url: {"TopLists": []},
-        match_url: {"content": {"matchFacts": {"events": []}, "stats": {}}},
+        match_url: {"general": {"matchId": 100}, "content": {"matchFacts": {"events": []}, "stats": {}}},
     }
     service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
     for target_type, url, entity_id in (
@@ -3406,7 +3477,7 @@ def test_seasons_identity_leaves_other_target_identities_untouched():
     # bulk of every wave -- stays content-addressed.
     responses = _seasons_responses()
     match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
-    responses[match_url] = {"content": {"matchFacts": {"events": []}, "stats": {"x": 1}}}
+    responses[match_url] = {"general": {"matchId": 100}, "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}}
     service, _, repository = _service(responses)
     _last_seasons_commit(service, repository)
     service.sync_match_payloads(

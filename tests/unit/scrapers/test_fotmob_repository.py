@@ -40,6 +40,103 @@ class RecordingWriter:
         return f"iceberg.{kwargs['database']}.{kwargs['table']}"
 
 
+@pytest.mark.parametrize("value", [False, True, None, 0, 1.5, "false", "null", "text", {"flag": False}, [None, False]])
+def test_1291_json_column_roundtrips_through_physical_write(value):
+    writer = RecordingWriter()
+    repository = FotMobRepository(writer=writer)
+    repository.commit(_commit(), [TableRows("fotmob_matches", [{
+        "competition_id": "289", "source_season_key": "2017/2019", "source_json": value,
+    }], "matches")])
+    physical = writer.calls[0][0].iloc[0]["source_json"]
+    assert isinstance(physical, str)
+    assert json.loads(physical) == value
+    normalized = normalize_rows([{"source_json": value}])
+    assert normalize_rows(normalized) == normalized
+
+
+@pytest.mark.parametrize("value", [None, False, "false", {"flag": False}, [None, False]])
+def test_1291_json_encoding_survives_reconciliation_and_repeat_write(value):
+    writer = ReconcileWriter()
+    row = {"competition_id": "289", "source_season_key": "2017/2019", "source_json": value}
+    dataset = TableRows("fotmob_matches", [row], "matches")
+    first = FotMobRepository(writer=writer)
+    first.commit(_commit(), [dataset])
+    stored = writer.rows["fotmob_matches"][0]["source_json"]
+    assert json.loads(stored) == value
+    second = FotMobRepository(writer=writer)
+    second.commit(_commit(run_id="repeat"), [dataset])
+    assert len(writer.rows["fotmob_matches"]) == 1
+    assert writer.rows["fotmob_matches"][0]["source_json"] == stored
+
+
+@pytest.mark.parametrize("value", [None, False, True, 0, 1, "false", "null", "0", "text", '{"x":1}', {"x": 1}, [None, False]])
+def test_1291_replay_accepts_exact_legacy_json_encoding(value):
+    from scrapers.fotmob.repository import _scalar
+    writer = ReconcileWriter()
+    commit = _commit()
+    row = {"competition_id": "289", "source_season_key": "2017/2019", "source_json": value}
+    legacy = {**row, "source_json": _scalar(value), "_target_batch_id": commit.batch_id}
+    writer.rows["fotmob_matches"] = [legacy.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    repository = FotMobRepository(writer=writer)
+    repository.commit(commit, [TableRows("fotmob_matches", [row], "matches")])
+    assert writer.rows["fotmob_matches"] == [legacy]
+
+
+def test_1291_legacy_numeric_json_matches_physical_double():
+    writer = ReconcileWriter()
+    commit = _commit()
+    row = {"competition_id": "289", "source_season_key": "2017/2019", "source_json": 1}
+    legacy = {**row, "source_json": 1.0, "_target_batch_id": commit.batch_id}
+    writer.rows["fotmob_matches"] = [legacy.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    writer.trino.get_table_columns = lambda schema, table: {
+        key: "DOUBLE" if key == "source_json" else "VARCHAR" for value in writer.rows[table] for key in value
+    }
+    repository = FotMobRepository(writer=writer)
+    repository.commit(commit, [TableRows("fotmob_matches", [row], "matches")])
+    assert writer.rows["fotmob_matches"] == [legacy]
+
+
+@pytest.mark.parametrize(("stored", "source", "accepted"), [
+    (False, 0, False), (True, 1, False), (False, False, True), (True, True, True),
+])
+def test_1291_legacy_boolean_column_cannot_turn_json_number_into_bool(stored, source, accepted):
+    writer = ReconcileWriter()
+    commit = _commit()
+    row = {"competition_id": "289", "source_season_key": "2017/2019", "source_json": source}
+    legacy = {**row, "source_json": stored, "_target_batch_id": commit.batch_id}
+    writer.rows["fotmob_matches"] = [legacy.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    writer.trino.get_table_columns = lambda schema, table: {
+        key: "BOOLEAN" if key == "source_json" else "VARCHAR" for value in writer.rows[table] for key in value
+    }
+    repository = FotMobRepository(writer=writer)
+    if accepted:
+        repository.commit(commit, [TableRows("fotmob_matches", [row], "matches")])
+    else:
+        with pytest.raises(RuntimeError, match="matching row identity"):
+            repository.commit(commit, [TableRows("fotmob_matches", [row], "matches")])
+    assert writer.rows["fotmob_matches"] == [legacy]
+
+
+@pytest.mark.parametrize(("stored", "source"), [
+    (None, False), (False, True), ("false", "true"), ("null", "false"),
+    ('{"x":1}', {"x": 2}), (0, 1),
+])
+def test_1291_legacy_json_fallback_rejects_changed_payload(stored, source):
+    writer = ReconcileWriter()
+    commit = _commit()
+    row = {"competition_id": "289", "source_season_key": "2017/2019", "source_json": source}
+    legacy = {**row, "source_json": stored, "_target_batch_id": commit.batch_id}
+    writer.rows["fotmob_matches"] = [legacy.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    repository = FotMobRepository(writer=writer)
+    with pytest.raises(RuntimeError, match="matching row identity"):
+        repository.commit(commit, [TableRows("fotmob_matches", [row], "matches")])
+    assert writer.rows["fotmob_matches"] == [legacy]
+
+
 class ViewTrino:
     def __init__(self, columns=None):
         self.sql = []

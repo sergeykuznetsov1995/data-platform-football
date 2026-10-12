@@ -60,6 +60,7 @@ from .planner import (
 )
 from .repository import (
     PARSER_VERSION,
+    stable_json,
     SCOPE_OBSERVATIONS_TABLE,
     ManifestStatus,
     TableRows,
@@ -211,13 +212,19 @@ def _completion_target_key(
 
 
 def _json(value: Any) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    return stable_json(value)
+
+
+def _validate_response_id(kind: str, requested: Any, received: Any) -> None:
+    """Reject an unidentifiable or misrouted response before publishing rows."""
+
+    source_id = received
+    if isinstance(source_id, str) and re.fullmatch(r"[0-9]+", source_id):
+        source_id = int(source_id)
+    if type(source_id) is not int or source_id <= 0 or source_id != int(requested):
+        raise CatalogShapeError(
+            f"{kind} response id mismatch: requested {requested}, received {received!r}"
+        )
 
 
 _PROFILE_BACKOFF = (
@@ -1401,7 +1408,7 @@ class FotMobIngestService:
                     "has_catalog_conflict": False,
                     "is_tombstoned": True,
                     "tombstone_reason": "two_consecutive_complete_absences",
-                    "conflict_fields_json": "[]",
+                    "conflict_fields_json": _json([]),
                     "discovery_run_id": self.run_id,
                     "discovery_date": observed.date().isoformat(),
                 }
@@ -2614,6 +2621,11 @@ class FotMobIngestService:
     def _match_payload_row(
         match: Mapping[str, Any], payload: Mapping[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        general = payload.get("general")
+        _validate_response_id(
+            "match", match.get("match_id"),
+            general.get("matchId") if isinstance(general, Mapping) else None,
+        )
         content = payload.get("content")
         if not isinstance(content, Mapping):
             content = payload
@@ -2737,7 +2749,17 @@ class FotMobIngestService:
                 )
                 continue
             try:
-                row, coverage = self._match_payload_row(match, fetch.data)
+                try:
+                    row, coverage = self._match_payload_row(match, fetch.data)
+                except CatalogShapeError as shape_exc:
+                    result.record_exception(f"match {key} parse: {shape_exc}", shape_exc)
+                    self._commit_for_fetch(
+                        fetch, target_type="match", status=ManifestStatus.SCHEMA_DRIFT,
+                        competition_id=bundle.scope.competition_id,
+                        source_season_key=bundle.scope.source_season_key,
+                        entity_id=key, error_code=type(shape_exc).__name__, error=str(shape_exc),
+                    )
+                    continue
                 paths = inventory_json_paths(fetch.data)
                 inventory, unknown = self._inventory_rows(
                     "match",
@@ -2821,9 +2843,12 @@ class FotMobIngestService:
         payload: Mapping[str, Any],
         observed_at: datetime,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], set[int]]:
-        details = payload.get("details") or {}
-        overview = payload.get("overview") or {}
-        history = payload.get("history") or {}
+        details = payload.get("details")
+        _validate_response_id(
+            "team", team_id, details.get("id") if isinstance(details, Mapping) else None,
+        )
+        overview_value = payload.get("overview")
+        overview = overview_value if isinstance(overview_value, Mapping) else {}
         venue = (overview.get("venue") or {}).get("widget") or {}
         snapshot_date = observed_at.date().isoformat()
         team_row = {
@@ -2835,8 +2860,8 @@ class FotMobIngestService:
             "venue_city": venue.get("city"),
             "venue_capacity": venue.get("capacity"),
             "details_json": details,
-            "overview_json": overview,
-            "history_json": history,
+            "overview_json": overview_value,
+            "history_json": payload.get("history"),
             "snapshot_date": snapshot_date,
             "observed_at": observed_at,
         }
@@ -2995,9 +3020,15 @@ class FotMobIngestService:
                 continue
             try:
                 observed = _aware_datetime(fetch.fetched_at) or utc_now()
-                team_row, squad_rows, ids = self._team_rows(
-                    int(key), fetch.data, observed
-                )
+                try:
+                    team_row, squad_rows, ids = self._team_rows(int(key), fetch.data, observed)
+                except CatalogShapeError as shape_exc:
+                    result.record_exception(f"team {key} parse: {shape_exc}", shape_exc)
+                    self._commit_for_fetch(
+                        fetch, target_type="team", status=ManifestStatus.SCHEMA_DRIFT,
+                        entity_id=key, error_code=type(shape_exc).__name__, error=str(shape_exc),
+                    )
+                    continue
                 player_ids.update(ids)
                 inventory, unknown = self._inventory_rows(
                     "team", inventory_json_paths(fetch.data)
