@@ -2507,6 +2507,38 @@ def test_failed_flush_retry_writes_inventory_rows_exactly_once():
     assert set(inventory[0][0]["json_path"]) == {"content.stats", "content.lineup"}
 
 
+@pytest.mark.parametrize("table,season_column", [
+    ("fotmob_competition_seasons", "source_season_key"),
+    ("fotmob_competition_season_history", "history_season_label"),
+])
+@pytest.mark.parametrize("payload_changed", [False, True])
+def test_reobserved_seasons_compare_payload_without_discovery_time(
+    table, season_column, payload_changed,
+):
+    writer = ReconcileWriter()
+    commit = _commit(target_type="competition_seasons")
+    stored = {
+        "competition_id": "289", season_column: "2025/2026",
+        "winner_name": "Alpha", "discovered_at": datetime(2026, 9, 23),
+        "_target_batch_id": commit.batch_id,
+    }
+    writer.rows[table] = [stored.copy()]
+    writer.rows["fotmob_ingest_manifest"] = [commit.manifest_row()]
+    pending = {**stored, "discovered_at": datetime(2026, 9, 25)}
+    if payload_changed:
+        pending["winner_name"] = "Beta"
+    repository = FotMobRepository(writer=writer, batch_size=500)
+    repository.commit(commit, [TableRows(table, [pending], "competition_seasons")])
+
+    if payload_changed:
+        with pytest.raises(RuntimeError, match="with matching row identity"):
+            repository.flush()
+    else:
+        repository.flush()
+    assert writer.rows[table] == [stored]
+    assert not [call for call in writer.calls if call[1]["table"] == table]
+
+
 def test_reparsed_seasons_collide_under_one_batch_and_fail_the_reconcile():
     # The #1234 incident in one test: 46 rows of the pre-#1230 parse are
     # already stored under the content-only batch id, the new parse of the very

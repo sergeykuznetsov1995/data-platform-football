@@ -3268,6 +3268,49 @@ def _assert_seasons_wave_committed(writer, discovered, run_id, seasons):
     return row["batch_id"]
 
 
+def test_reobserved_seasons_and_history_flush_without_duplicate_rows(monkeypatch):
+    real_get = StubTransport._get
+    real_responses = _seasons_responses
+    observed_at = "2026-09-23T14:10:32+00:00"
+
+    def fetch_at(transport, endpoint, params, replay=False):
+        return replace(real_get(transport, endpoint, params, replay), fetched_at=observed_at)
+
+    def responses_with_history(variant=False):
+        responses = real_responses(variant)
+        profile = responses[canonicalize_target("leagues", {"id": 47}).canonical_url]
+        profile["seasons"] = [{
+            "seasonName": "2024/2025", "winner": {"id": 1, "name": "Alpha"},
+            "loser": {"id": 2, "name": "Beta"},
+        }]
+        return responses
+
+    monkeypatch.setattr(StubTransport, "_get", fetch_at)
+    monkeypatch.setattr(f"{__name__}._seasons_responses", responses_with_history)
+    writer = _SeasonsWriter()
+    scope, discovered = _run_seasons_wave(writer, "wave-first")
+    first_batch = _assert_seasons_wave_committed(writer, discovered, "wave-first", 2)
+
+    # A newer target observation has different bytes. Returning to the earlier
+    # bytes must exercise stored-batch reconciliation, rather than a planner skip.
+    observed_at = "2026-09-24T14:10:32+00:00"
+    _, discovered = _run_seasons_wave(writer, "wave-newer-content", scope, variant=True)
+    second_batch = _assert_seasons_wave_committed(writer, discovered, "wave-newer-content", 2)
+    assert second_batch != first_batch
+    tables = ("fotmob_competition_seasons", "fotmob_competition_season_history")
+    before = {table: copy.deepcopy(writer.rows[table]) for table in tables}
+    queries_before = len(writer.trino.queries)
+
+    observed_at = "2026-09-25T14:10:32+00:00"
+    _, discovered = _run_seasons_wave(writer, "wave-reobserved", scope)
+    assert _assert_seasons_wave_committed(writer, discovered, "wave-reobserved", 2) == first_batch
+    for table in tables:
+        assert writer.rows[table] == before[table]
+        assert any(f"FROM iceberg.bronze.{table} " in query
+                   for query in writer.trino.queries[queries_before:])
+    assert _seasons_batch_counts(writer) == {first_batch: 2, second_batch: 2}
+
+
 def test_reparsed_seasons_reach_storage_only_with_the_new_parse_identity(monkeypatch):
     # The incident end to end, on the production path (`discover_catalog` ->
     # `discover_competitions`) and the production `FotMobRepository.flush`.

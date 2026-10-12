@@ -20,7 +20,7 @@ import pandas as pd
 OBSERVATION_COLUMNS = frozenset({
     "_target_batch_id", "_payload_sha256", "_parser_version", "_raw_uri",
     "_observed_at", "_ingested_at", "_source", "_entity_type",
-    "observed_at", "discovery_run_id", "snapshot_date",
+    "observed_at", "discovered_at", "discovery_run_id", "snapshot_date",
 })
 
 
