@@ -1693,6 +1693,133 @@ def _native_history_portion(scraper, monkeypatch, tmp_path, player, value, mode=
     return source, exported
 
 
+@pytest.mark.parametrize('empty', [False, True])
+@pytest.mark.parametrize('boundary,mode', [
+    ('archive', 'native-only'), ('archive', 'dual'),
+    ('raw', 'native-only'), ('attestation', 'native-only'),
+    ('manifest', 'native-only'),
+])
+def test_history_publication_failure_after_http_is_platform_and_cannot_heal_probe(
+        scraper, monkeypatch, tmp_path, boundary, mode, empty):
+    import contextlib
+    import scrapers.transfermarkt
+    from scrapers.transfermarkt import superseded, write_intents, ops_traffic
+    from scrapers.transfermarkt.raw_store import RawStoreError
+    from utils import transfermarkt_backfill_state as state
+    from utils.transfermarkt_backfill_attempts import collect_scope_attempt_evidence
+    from utils.transfermarkt_backfill_finalize import _probe_has_verified_response
+
+    payload = {'list': [] if empty else [{'datum_mw': 'Jan 1, 2025', 'y': 9000000,
+        'verein': 'History', 'age': '21', 'mw': 'EUR9m'}]}
+    source = http(scraper, [payload])
+    entities = tmp_path / 'entities'
+    entities.mkdir()
+    output = entities / 'market_value_history-failed-1-1.json'
+    monkeypatch.setenv('TM_CHILD_CYCLE_ID', 'publication-failure-child')
+    monkeypatch.setattr(ops_traffic, 'record_traffic_run', lambda *_args, **_kwargs: None)
+    scraper._batch_id = 'publication-original-batch'
+
+    def fail(*_args, **_kwargs):
+        if boundary == 'raw':
+            raise RawStoreError('original raw archive verification failed')
+        raise OSError('local ' + boundary + ' publication failed')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scrapers.transfermarkt, 'TransfermarktScraper', lambda **_: contextlib.nullcontext(scraper))
+        patch.setattr(current.run, '_select_player_ids', lambda *_args, **_kwargs:
+            (['1'], 0, 0, [], {'roster_size': 1, 'selected': 1, 'pending': 0}))
+        if boundary == 'archive':
+            patch.setattr(write_intents, 'archive_complete', fail)
+        elif boundary == 'raw':
+            patch.setattr(superseded, 'verify_complete', fail)
+        elif boundary == 'attestation':
+            patch.setattr(superseded, 'attest_career_manifest', fail)
+        else:
+            patch.setattr(current.run, '_persist_native_write_manifest', fail)
+        result = current.run._run_entity(current.run.ENTITY_SPECS['market_value_history'], ['GB1'], 2026,
+            1, str(output), refresh_mode='history', run_key='publication-failure-child',
+            write_mode=mode, expected_reader_revision=7)
+        original_intent, = write_intents.pending_intents({'kind': 'scope', 'entity': 'market_value_history'})
+        original_journal = original_intent[0].read_bytes()
+        replay_output = tmp_path / 'publication-replay.json'
+        replay_result = current.run._run_entity(current.run.ENTITY_SPECS['market_value_history'], ['GB1'], 2026,
+            1, str(replay_output), refresh_mode='history', run_key='later-reconciliation-child',
+            write_mode=mode, expected_reader_revision=7)
+    assert result == 1
+    assert replay_result == 1
+    replay = json.loads(replay_output.read_text())
+    assert replay['failure_stage'] == 'platform'
+    if boundary != 'manifest':
+        assert replay['reconciled_without_http']
+        assert replay['original_capture_run_key'] == 'publication-failure-child'
+    exported = json.loads(output.read_text())
+    assert exported['failure_stage'] == 'platform'
+    assert exported['network_fetches'] == 1
+    assert sum(len(client.get_calls) for client in source.clients) == 1
+    pending, = write_intents.pending_intents({'kind': 'scope', 'entity': 'market_value_history'})
+    assert pending[0].read_bytes() == original_journal
+    assert pending[1]['evidence']['run_key'] == 'publication-failure-child'
+    envelope, = [scraper.test_store.verify_attempt_envelope(item['envelope_id'])
+                  for item in exported['raw_attempts']]
+    assert envelope.status_code == 200 and envelope.outcome_kind == 'response'
+    observed = datetime.fromisoformat(envelope.observed_at.replace('Z', '+00:00'))
+    target = state.HistoricalScopeTarget(envelope.scope_id, 'GB1', '2026', 'TM-GB1', '2026/27', 'offline')
+    campaign = state.BackfillCampaign.build(registry_snapshot_id='offline', policy_sha256='a' * 64,
+        parser_revision='v2', schema_revision='2', targets=[target], now=observed,
+        status=state.CampaignStatus.ACTIVE)
+    claim = state.claim_scopes(campaign, [state.BackfillScopeState.initial(campaign, target, now=observed)],
+        lease_owner='offline', now=observed)
+    batch = claim.batch
+    (entities / '.source-attempt-1-1-market_value_history.json').write_text(json.dumps({
+        'contract_version': 1, 'status': 'entered', 'campaign_id': campaign.campaign_id,
+        'child_cycle_id': envelope.cycle_id, 'scope_id': envelope.scope_id, 'batch_id': batch.batch_id,
+        'claim_generation': 1, 'attempt_sequence': 1, 'parser_entity': 'market_value_history',
+        'failure_path': str(output)}))
+    classified = collect_scope_attempt_evidence(result_base_dir=str(tmp_path), entity_dir=str(entities),
+        scope_manifest_path=str(tmp_path / 'scope-manifest.json'), scope_id=envelope.scope_id,
+        raw_store=scraper.test_store, campaign_id=campaign.campaign_id, child_cycle_id=envelope.cycle_id,
+        batch_id=batch.batch_id, claim_generation=1, attempt_sequence=1)
+    assert classified.outcome is state.AttemptOutcome.PLATFORM_ERROR
+    assert classified.error_class.startswith('platform_')
+    scope, = claim.scopes
+    attempt = state.BackfillAttempt.build(scope=scope, batch_id=batch.batch_id, outcome=classified.outcome,
+        started_at=observed, finished_at=observed, source_observed_at=classified.observed_at,
+        raw_evidence_ids=classified.raw_evidence_ids, error_class=classified.error_class)
+    failed = state.apply_attempt(scope, attempt)
+    assert failed.source_attempt_count == failed.source_error_count == 0
+    assert failed.status is state.ScopeStatus.RETRYABLE_ERROR
+    # Even a fresh successful HTTP cannot certify recovery after platform proof failure.
+    probe = replace(batch, recovery_probe=True)
+    assert not _probe_has_verified_response(probe, attempt, scraper.test_store)
+    # A later probe cannot reuse this paid response even if marked continuation.
+    old_raw_probe = replace(probe, claimed_at=observed + timedelta(seconds=1),
+                            updated_at=observed + timedelta(seconds=1))
+    continuation = replace(attempt, outcome=state.AttemptOutcome.CONTINUATION, error_class=None)
+    assert not _probe_has_verified_response(old_raw_probe, continuation, scraper.test_store)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scrapers.transfermarkt, 'TransfermarktScraper', lambda **_: contextlib.nullcontext(scraper))
+        recovered_output = tmp_path / 'publication-recovered.json'
+        recovered_result = current.run._run_entity(current.run.ENTITY_SPECS['market_value_history'], ['GB1'], 2026,
+            1, str(recovered_output), refresh_mode='history', run_key='recovery-child',
+            write_mode=mode, expected_reader_revision=7)
+    assert recovered_result == 0
+    recovered = json.loads(recovered_output.read_text())
+    assert recovered['career_capture_archive_status'] == 'complete'
+    assert recovered['reconciled_without_http']
+    assert recovered['original_capture_run_key'] == 'publication-failure-child'
+    assert not write_intents.pending_intents({'kind': 'scope', 'entity': 'market_value_history'})
+    assert sum(len(client.get_calls) for client in source.clients) == 1
+    manifest_key = 'native_write_manifest' if mode == 'native-only' else 'batch_manifest'
+    unit, = recovered[manifest_key]['rows']
+    archive = write_intents.completed_capture('publication-failure-child', 'market_value_points',
+                                              unit['native_batch_id'])
+    assert archive['journal'] == json.loads(original_journal)
+    proof = superseded.verify_complete(scraper, current.run.ENTITY_SPECS['market_value_history'], archive,
+                                      players=['1'])
+    assert proof['archive']['receipt']['cycle_id'] == 'publication-failure-child'
+
+
 @pytest.mark.parametrize('mode', ['native-only', 'dual'])
 @pytest.mark.parametrize('damage', [None, 'missing_latest_archive', 'corrupt_latest_attestation', 'corrupt_latest_manifest', 'missing_latest_raw'])
 def test_native_history_archive_reconciles_old_current_after_stable_child_manifest_changes(scraper, monkeypatch, tmp_path, damage, mode):

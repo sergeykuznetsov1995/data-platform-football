@@ -1,5 +1,5 @@
 {
-  "policy_version": 1,
+  "policy_version": 2,
   "dag_id": "dag_backfill_transfermarkt",
   "approved_by": "sergeykuznetsov1995",
   "approved_at": "2026-07-21T00:00:00Z",
@@ -24,6 +24,7 @@
     "iceberg.bronze.transfermarkt_player_contract_observations",
     "iceberg.bronze.transfermarkt_squad_memberships",
     "iceberg.bronze.transfermarkt_transfer_events",
+    "iceberg.ops.transfermarkt_season_close_v1",
     "iceberg.ops.proxy_traffic_runs",
     "iceberg.ops.transfermarkt_career_capture_refs_v1",
     "iceberg.ops.transfermarkt_career_snapshot_anchors_v1",

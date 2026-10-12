@@ -33,7 +33,7 @@ if str(ROOT / 'dags') not in sys.path:
     sys.path.append(str(ROOT / 'dags'))
 
 from dags.utils.transfermarkt_current_state import (
-    CURRENT_POLICY_VERSION, EditionCheck, ScopeCursor, SignalObservation,
+    CURRENT_POLICY_VERSION, CurrentWork, EditionCheck, ScopeCursor, SignalObservation,
     SignalState, build_check_merge, build_current_state_tables,
     build_signal_merge, build_signals_merge, current_scope_targets, daily_complete, mark_applied,
     mark_seen, mark_failed, plan_current_work, record_check,
@@ -282,7 +282,7 @@ def _production_factory(target, row, cache, deadline, used):
         request_limit=SCOPE_REQUEST_LIMIT, retry_limit=SCOPE_RETRY_LIMIT,
     )
     allowed = {table.split('.')[-1] for table in policy.allowed_write_tables}
-    if not {'transfermarkt_current_signals_v1', 'transfermarkt_current_checks_v1'} <= allowed:
+    if not {'transfermarkt_current_signals_v1', 'transfermarkt_current_checks_v1', 'transfermarkt_season_close_v1'} <= allowed:
         raise CurrentPortionError('standing policy does not authorize current ops tables')
     remaining = SCOPE_HARD_PROVIDER_BYTE_CAP - used.get('provider_metered_bytes', 0)
     soft = SCOPE_SOFT_PROVIDER_BYTE_STOP - used.get('provider_metered_bytes', 0)
@@ -993,6 +993,10 @@ class _Scope:
 
     def validate_player_business(self, snapshot):
         """Do not acknowledge a detector while a CDN serves old squad fields."""
+        if self.row.get('is_current') is False:
+            # Live player assignments describe the new edition. Closed-edition
+            # squads retain their historical membership, with normal raw/DQ guards.
+            return
         national = self.scope['record'].team_type.value == 'national_team'
         mismatches, failed = set(), []
         for key, state in self.signals.items():
@@ -1579,7 +1583,47 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
         for scope_id, cursor in list(cursors.items()):
             if state['scopes'][scope_id].get('denominator_hash') != denominator_hash:
                 cursors[scope_id] = replace(cursor, listing_checked_at=None, players_checked_at=None, injury_checked_at=None)
-        work = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes, turn=state['turn'])
+        from dags.utils.transfermarkt_season_handoff import closed_targets, ddl as season_ddl, mark_sql as season_mark_sql, TABLE as SEASON_TABLE
+        prior_targets = state.get('current_targets', [])
+        closing = {item.scope_id: item for item in closed_targets(prior_targets, registry_rows)}
+        pending_closures = state.setdefault('season_closures', {})
+        newly_detected_close = any(target.scope_id not in pending_closures for target in closing.values())
+        for target in closing.values():
+            pending_closures.setdefault(target.scope_id, {
+                'scope_id': target.scope_id, 'competition_id': target.competition_id,
+                'edition_id': target.edition_id, 'tier': target.tier})
+        production_handoff = roster_writer.__module__ == 'dags.utils.transfermarkt_current_write'
+        if production_handoff:
+            from dags.utils import transfermarkt_native_v2 as season_control
+            from scrapers.transfermarkt.registry import deterministic_scope_id
+            connection = _bound_connection(season_control.connect(), deadline, clock)
+            cursor = connection.cursor()
+            try:
+                cursor.execute(season_ddl())
+                cursor.fetchall()
+                cursor.execute(f"SELECT scope_id, competition_id, edition_id FROM {SEASON_TABLE} WHERE status='pending'")
+                for scope_id, competition, edition in cursor.fetchall():
+                    pending_closures.setdefault(str(scope_id), {'scope_id': str(scope_id),
+                        'competition_id': str(competition), 'edition_id': str(edition), 'tier': 0})
+            finally:
+                cursor.close()
+                connection.close()
+        closing = {target.scope_id: target for target in closed_targets(pending_closures.values(), registry_rows)}
+        state['current_targets'] = [{'scope_id': target.scope_id, 'competition_id': target.competition_id,
+                                    'edition_id': target.edition_id, 'tier': target.tier}
+                                   for target in targets.targets]
+        ordinary = plan_current_work(targets.targets, cursors, now=started, limit=max_scopes, turn=state['turn'])
+        closing_work = tuple(CurrentWork(target, 'season_close') for target in sorted(
+            closing.values(), key=lambda target: (
+                cursors.get(target.scope_id, ScopeCursor(target.scope_id)).last_work_at or datetime.min.replace(tzinfo=timezone.utc),
+                target.cold_priority)))
+        # A failed close cannot occupy every current slot on every portion.
+        close_quota = max(1, max_scopes // 2) if ordinary else max_scopes
+        if max_scopes == 1 and ordinary and state['turn'] % 2 and not newly_detected_close:
+            work = ordinary[:1]
+        else:
+            work = closing_work[:close_quota] + ordinary[:max_scopes - min(close_quota, len(closing_work))]
+
         state['turn'] += 1
         save = store.save
         save()
@@ -1629,6 +1673,8 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 _install_entity_limits(scraper, data)
                 for sql in build_current_state_tables():
                     _sql(scraper, sql)
+                _sql(scraper, season_ddl())
+                _sql(scraper, season_mark_sql(target, status='pending' if item.kind == 'season_close' else 'current', at=now()))
                 if not data.get('snapshot') and not data.get('roster_write_intent'):
                     if target.scope_id in bootstrap_entries:
                         if bootstrap_verifier is None:
@@ -1655,7 +1701,18 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             result.setdefault('check_failures', {})[kind] = error
                             scope.check(kind, [], 0, 0, status='uncertain', result=error)
                 else:
-                    scope.roster(weekly=item.kind == 'weekly_roster')
+                    if item.kind == 'season_close':
+                        if not data.get('season_close_roster_captured'):
+                            first_close_portion = not data.get('season_close_roster_started')
+                            if first_close_portion:
+                                scope.listing()
+                                data['season_close_roster_started'] = True
+                                scope.persist()
+                            scope.roster(weekly=first_close_portion)
+                            data['season_close_roster_captured'] = True
+                            scope.persist()
+                    else:
+                        scope.roster(weekly=item.kind == 'weekly_roster')
                     # Weekly insurance discovers changes but does not repeat
                     # careers. New/changed IDs continue in a subsequent portion.
                     if item.kind != 'weekly_roster':
@@ -1672,6 +1729,29 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                 if daily_complete(scope.cursor, now()):
                     report['daily_complete_scope_ids'].append(target.scope_id)
                 result['status'] = 'complete' if not scope.resume else 'pending'
+                if item.kind == 'season_close' and result['status'] == 'complete':
+                    if not data.get('season_close_roster_captured'):
+                        raise CurrentPortionError('season close requires a final committed full roster')
+                    proof = {'cycle_id': cycle_id, 'captured_at': now().isoformat(),
+                             'career_proofs': data.get('career_proofs', []),
+                             'coach_proofs': data.get('coach_proofs', [])}
+                    if scope.snapshot is not None:
+                        proof.update(snapshot_sha256=semantic_signature(scope.snapshot.as_dict()),
+                            club_receipts={club_id: {'raw_capture_id': club.raw_capture_id,
+                                                   'source_body_hash': club.source_body_hash,
+                                                   'bronze_manifest': club.bronze_manifest}
+                                           for club_id, club in scope.snapshot.clubs.items()})
+                    elif data.get('authoritative_empty_scope') and not scraper._bronze_scope_has_roster(
+                            scope.scope['compatibility_league'], scope.scope['canonical_season']):
+                        proof['authoritative_empty_scope'] = data['authoritative_empty_scope']
+                        proof['physical_roster_empty'] = True
+                    else:
+                        raise CurrentPortionError('season close lacks committed roster or raw-proven physical emptiness')
+                    _sql(scraper, season_mark_sql(target, status='complete', at=now(), proof=proof))
+                    pending_closures.pop(target.scope_id, None)
+                    data['season_close_handed_off_at'] = now().isoformat()
+                    save()
+                    result['historical_handoff'] = True
                 if result.get('check_failures'):
                     result['status'] = 'uncertain'
             except Exception as exc:

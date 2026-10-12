@@ -50,6 +50,10 @@ class _HealthResponse:
         return {
             "transfermarkt_backfill_paid_enabled": True,
             "transfermarkt_requests_per_minute": 12,
+            "transfermarkt_history_streams": 1,
+            "transfermarkt_backfill_requests_per_minute": 12,
+            "transfermarkt_backfill_stream_ids": ["history-0"],
+            "transfermarkt_current_reserved": True,
             "transfermarkt_backfill_uses_production_daily_budget": False,
             "transfermarkt_request_permit_consume_required": True,
             "transfermarkt_request_permit_state_durable": True,
@@ -439,12 +443,13 @@ def test_large_denominator_uses_bounded_bulk_chunks_with_exact_readback(
     assert len(state.campaign_merge_sql(campaign).encode("utf-8")) < 20_000
 
 
-def test_strict_preflight_requires_v2_legacy_shutdown_raw_and_durable_permits(
+def test_historical_preflight_requires_isolated_history_raw_and_durable_permits(
     monkeypatch,
 ):
     from utils import transfermarkt_native_v2 as tm_v2
 
     monkeypatch.setenv("TM_NATIVE_V2_ENABLED", "true")
+    monkeypatch.setattr(runtime, "current_signal_qualification", lambda: {"evidence_sha256": "f" * 64})
     monkeypatch.setenv("TM_STANDING_POLICY_ENABLED", "true")
     monkeypatch.setenv("TM_PROXY_CONTROL_TOKEN", "p" * 32)
     monkeypatch.setenv("TM_BACKFILL_PROXY_CONTROL_URL", "http://proxy:8899")
@@ -1169,3 +1174,82 @@ def test_history_targets_only_the_denominator_live_core(monkeypatch):
     assert tm_denominator.load_denominator().row("GB1").is_core
     with pytest.raises(runtime.BackfillRuntimeError, match="no historical"):
         runtime.historical_targets_from_registry(rows)
+
+
+@pytest.mark.parametrize("exists,version,slot", [(False, "legacy", None), (True, "legacy", None), (True, "v2", "a")])
+def test_historical_preflight_independent_of_cutover(monkeypatch, exists, version, slot):
+    from utils import transfermarkt_native_v2 as tm_v2
+    monkeypatch.setenv("TM_NATIVE_V2_ENABLED", "true")
+    monkeypatch.setattr(runtime, "current_signal_qualification", lambda: {"evidence_sha256": "f" * 64})
+    monkeypatch.setenv("TM_STANDING_POLICY_ENABLED", "true")
+    monkeypatch.setenv("TM_BACKFILL_PROXY_CONTROL_URL", "http://proxy:8899")
+    monkeypatch.setenv("TM_BACKFILL_PROXY_CONTROL_TOKEN", "b" * 32)
+    monkeypatch.setattr(tm_v2, "read_reader_state", lambda *_a, **_k: SimpleNamespace(
+        exists=exists, active_version=version, active_slot=slot, revision=0,
+        legacy_writers_disabled_at=None))
+    monkeypatch.setattr(tm_v2, "inactive_slot", lambda _: "b")
+    result = runtime.strict_cutover_preflight(connection_factory=_Connection,
+        raw_store_factory=lambda: SimpleNamespace(uri_prefix="s3://raw/tm"),
+        proxy_health_get=lambda *_a, **_k: _HealthResponse())
+    assert result["historical_native_authority"] is True
+    assert result["history_stream_ids"] == ["history-0"]
+
+
+@pytest.mark.parametrize("history_streams,rate,enabled", [(0, 12, True), (1, 0, True), (1, 12, False)])
+def test_historical_preflight_rejects_disabled_budget(monkeypatch, history_streams, rate, enabled):
+    from utils import transfermarkt_native_v2 as tm_v2
+    monkeypatch.setenv("TM_NATIVE_V2_ENABLED", "true")
+    monkeypatch.setattr(runtime, "current_signal_qualification", lambda: {"evidence_sha256": "f" * 64})
+    monkeypatch.setenv("TM_STANDING_POLICY_ENABLED", "true")
+    monkeypatch.setenv("TM_BACKFILL_PROXY_CONTROL_URL", "http://proxy:8899")
+    monkeypatch.setenv("TM_BACKFILL_PROXY_CONTROL_TOKEN", "b" * 32)
+    monkeypatch.setattr(tm_v2, "read_reader_state", lambda *_a, **_k: SimpleNamespace(active_slot=None, revision=0))
+    health = _HealthResponse.json()
+    health.update(transfermarkt_history_streams=history_streams,
+                  transfermarkt_requests_per_minute=rate,
+                  transfermarkt_backfill_paid_enabled=enabled)
+    with pytest.raises(runtime.BackfillRuntimeError, match="quota"):
+        runtime.strict_cutover_preflight(connection_factory=_Connection,
+            raw_store_factory=lambda: SimpleNamespace(uri_prefix="s3://raw/tm"),
+            proxy_health_get=lambda *_a, **_k: SimpleNamespace(status_code=200, json=lambda: health))
+
+
+def test_new_batch_reads_latest_but_continuation_keeps_original_capture(monkeypatch):
+    original_rows = [_row(_competition('original'), _edition('2020', current=False, snapshot='original'))]
+    latest_rows = [_row(_competition('latest'), _edition('2020', current=False, snapshot='latest'))]
+    campaign = runtime.build_campaign_from_registry(original_rows, policy_sha256=POLICY_HASH, now=NOW)
+    campaign = campaign.transition(state.CampaignStatus.ACTIVE, now=NOW)
+    scopes = [state.BackfillScopeState.initial(campaign, campaign.targets[0], now=NOW)]
+    first, initial_payloads = runtime.claim_and_plan(campaign, scopes, registry_rows=original_rows,
+        run_id='first', lease_owner='offline', now=NOW)
+    initial = first.scopes[0]
+    attempt = state.BackfillAttempt.build(scope=initial, batch_id=first.batch.batch_id,
+        outcome=state.AttemptOutcome.TRANSPORT_ERROR, started_at=NOW, finished_at=NOW,
+        source_observed_at=NOW, error_class='transport_timeout', raw_evidence_ids=['b' * 64])
+    retry = state.apply_attempt(initial, attempt)
+    requested = []
+    def pinned(*, registry_snapshot_id=None):
+        requested.append(registry_snapshot_id)
+        assert registry_snapshot_id == 'original'
+        return original_rows
+    monkeypatch.setattr(runtime, 'read_promoted_registry', pinned)
+    second, payloads = runtime.claim_and_plan(campaign, [retry], registry_rows=latest_rows,
+        capture_snapshot_ids={retry.target.scope_id: 'original'},
+        run_id='second', lease_owner='offline', now=retry.next_retry_at)
+    assert second.batch.registry_snapshot_id == 'latest'
+    assert payloads[0]['registry_snapshot_id'] == 'original'
+    assert payloads[0]['child_cycle_id'] == initial_payloads[0]['child_cycle_id']
+    assert payloads[0]['result_paths'] == initial_payloads[0]['result_paths']
+    assert requested == ['original']
+
+
+def test_new_snapshot_adds_targets_idempotently_without_mutating_prior_campaign():
+    old_rows = [_row(_competition('old'), _edition('2020', current=False, snapshot='old'))]
+    old = runtime.build_campaign_from_registry(old_rows, policy_sha256=POLICY_HASH, now=NOW)
+    original_payload = state.record_payload(old)
+    latest_rows = [_row(_competition('new'), _edition(year, current=False, snapshot='new')) for year in ('2020', '2019')]
+    delta = runtime.build_campaign_from_registry(latest_rows, policy_sha256='b' * 64, now=NOW, previous_campaigns=[old])
+    assert len(delta.targets) == 1 and delta.targets[0].edition_id == '2019'
+    assert runtime.build_campaign_from_registry(latest_rows, policy_sha256='c' * 64, now=NOW,
+                                               previous_campaigns=[old, delta]) is None
+    assert state.record_payload(old) == original_payload

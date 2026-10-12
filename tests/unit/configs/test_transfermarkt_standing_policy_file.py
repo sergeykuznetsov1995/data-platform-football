@@ -33,9 +33,10 @@ def test_committed_policy_parses_into_a_standing_policy():
     assert policy.dag_id == STANDING_POLICY_DAG_ID
     assert policy.dag_id == 'dag_ingest_transfermarkt'
     assert len(policy.policy_hash) == 64
-    # v2 = the daily-throughput caps (24 MiB / 1610 / 800 per scope); the
-    # standing-authorization records key on standing-policy-v{version}.
-    assert policy.policy_version == 3
+    # v4 adds the season-close proof table; the existing per-scope caps stay
+    # unchanged. Standing authorizations key on standing-policy-v{version}.
+    assert policy.policy_version == 4
+    assert 'iceberg.ops.transfermarkt_season_close_v1' in policy.allowed_write_tables
 
 
 def test_committed_policy_caps_equal_the_child_wrapper_constants():
@@ -83,6 +84,8 @@ def test_backfill_policy_is_native_only_and_matches_the_same_scope_caps():
     policy = load_standing_policy(BACKFILL_POLICY_PATH)
 
     assert policy.dag_id == 'dag_backfill_transfermarkt'
+    assert policy.policy_version == 2
+    assert 'iceberg.ops.transfermarkt_season_close_v1' in policy.allowed_write_tables
     assert policy.paid_proxy.byte_cap_bytes == HARD_BYTE_CAP
     assert policy.paid_proxy.request_limit == 1_610
     assert policy.paid_proxy.retry_limit == 800

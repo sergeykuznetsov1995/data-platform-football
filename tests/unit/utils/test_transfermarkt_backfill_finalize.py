@@ -197,9 +197,11 @@ class _Repository:
         return plan
 
 
+@pytest.mark.parametrize("finalize_only", [False, True])
 def test_successful_batch_is_dq_gated_and_completes_exact_campaign(
     tmp_path,
     monkeypatch,
+    finalize_only,
 ):
     campaign, scope, batch = _campaign_and_claim()
     repository = _Repository(campaign, scope, batch)
@@ -221,7 +223,7 @@ def test_successful_batch_is_dq_gated_and_completes_exact_campaign(
     entity_dir.mkdir(parents=True)
     manifest_path = base / "scope-manifest.json"
     manifest_path.write_text("{}", encoding="utf-8")
-    planned = [_planned_environment(campaign, scope, batch, base)]
+    planned = [_planned_environment(campaign, scope, batch, base, finalize_only=finalize_only)]
     monkeypatch.setattr(
         finalize.BackfillStateRepository,
         "connect",

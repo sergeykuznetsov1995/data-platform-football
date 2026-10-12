@@ -6042,7 +6042,8 @@ def _control_report(lease: Lease) -> dict[str, Any]:
 
 def _exit_pool_health(mgr) -> dict[str, Any]:
     exit_total = int(getattr(mgr, "total_count", 0))
-    dead_exits = min(_dead_exit_count(), exit_total)
+    source = 'transfermarkt' if _transfermarkt_only() else None
+    dead_exits = min(_dead_exit_count(source=source), exit_total)
     live_exits = exit_total - dead_exits
     live_ratio = live_exits / exit_total if exit_total else None
     return {
@@ -7178,6 +7179,9 @@ EXIT_POOL_DEGRADED_RATIO = 0.5
 # answered CONNECT with non-200 (fingerprint -> monotonic deadline).  It only feeds /health: ProxyManager rotation is left untouched so
 # WhoScored/SofaScore exit selection and a non-empty pick pool are unchanged.
 DEAD_EXITS: dict[str, float] = {}
+# Dedicated TM uses separate pools. Keep the global exclusion set, but count
+# health for the reserved current lane only; fingerprints never enter reports.
+DEAD_EXIT_SOURCES: dict[str, str] = {}
 # #1388: Transfermarkt CONNECT refusals with a fully metered provider response,
 # by status class, since process start (surfaced on /health).
 PROVIDER_REJECTED_CONNECTS: Counter[str] = Counter()
@@ -7190,17 +7194,26 @@ def _mark_exit_dead(
     # from its own dedicated pool, so its failures must not count here.
     if lease is not None and lease.source == "transfermarkt_backfill" and not _transfermarkt_only():
         return
-    DEAD_EXITS[_upstream_fingerprint(upstream)] = (
+    key = _upstream_fingerprint(upstream)
+    DEAD_EXITS[key] = (
         time.monotonic() + DEAD_EXIT_TTL_SECONDS
     )
+    if _transfermarkt_only():
+        DEAD_EXIT_SOURCES[key] = ('transfermarkt_backfill' if lease is not None
+                                  and lease.source == 'transfermarkt_backfill' else 'transfermarkt')
 
 
-def _dead_exit_count() -> int:
+def _dead_exit_count(*, source: str | None = None) -> int:
     now = time.monotonic()
     for key, deadline in list(DEAD_EXITS.items()):
         if deadline <= now:
             del DEAD_EXITS[key]
-    return len(DEAD_EXITS)
+    for key in list(DEAD_EXIT_SOURCES):
+        if key not in DEAD_EXITS:
+            del DEAD_EXIT_SOURCES[key]
+    if source is None:
+        return len(DEAD_EXITS)
+    return sum(DEAD_EXIT_SOURCES.get(key, 'transfermarkt') == source for key in DEAD_EXITS)
 
 
 def _lease_ttl_bounds_window(lease: "Lease", ceiling_seconds: float) -> bool:

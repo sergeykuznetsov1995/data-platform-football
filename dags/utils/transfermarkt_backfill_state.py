@@ -79,6 +79,7 @@ class AttemptOutcome(str, Enum):
     UNAVAILABLE_CONFIRMATION = "unavailable_confirmation"
     SOURCE_ERROR = "source_error"
     PLATFORM_ERROR = "platform_error"
+    TRANSPORT_ERROR = "transport_error"
 
 
 class BatchStatus(str, Enum):
@@ -87,6 +88,7 @@ class BatchStatus(str, Enum):
     DQ_PENDING = "dq_pending"
     COMPLETE = "complete"
     BLOCKED_PLATFORM = "blocked_platform"
+    WAITING_POLICY = "waiting_policy"
 
 
 TERMINAL_SCOPE_STATUSES = frozenset(
@@ -781,7 +783,7 @@ class BackfillAttempt:
             raise BackfillStateError(
                 "source attempt outcome requires raw evidence IDs"
             )
-        if outcome in {AttemptOutcome.SOURCE_ERROR, AttemptOutcome.PLATFORM_ERROR}:
+        if outcome in {AttemptOutcome.SOURCE_ERROR, AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.TRANSPORT_ERROR}:
             if self.error_class is None:
                 raise BackfillStateError("error attempt requires error_class")
         elif self.error_class is not None or self.error_message is not None:
@@ -1074,7 +1076,45 @@ class BackfillBatch:
     revision: int = 0
     contract_version: int = CONTRACT_VERSION
 
+    registry_snapshot_id: str | None = None
+    standing_policy: Mapping[str, Any] | None = None
+    stream_id: str | None = None
+    scope_stream_ids: Mapping[str, str] | None = None
+    scope_registry_snapshot_ids: Mapping[str, str] | None = None
+    scope_writer_pins: Mapping[str, Mapping[str, Any]] | None = None
+    recovery_probe: bool = False
+
+    @property
+    def policy_sha256(self) -> str | None:
+        return canonical_sha256(self.standing_policy) if self.standing_policy is not None else None
+
     def __post_init__(self) -> None:
+        if self.registry_snapshot_id is not None:
+            _required_text("registry_snapshot_id", self.registry_snapshot_id)
+        if self.standing_policy is not None:
+            from .transfermarkt_approval import StandingPolicy
+            policy = StandingPolicy(**self.standing_policy)
+            object.__setattr__(self, "standing_policy", policy.payload())
+        if not isinstance(self.recovery_probe, bool) or (self.recovery_probe and len(self.scope_ids) != 1):
+            raise BackfillStateError("recovery probe requires exactly one scope")
+        if self.scope_writer_pins is not None:
+            if set(self.scope_writer_pins) != set(self.scope_ids) or any(
+                    pin.get("candidate_slot") not in {"a", "b"} or isinstance(pin.get("revision"), bool)
+                    or not isinstance(pin.get("revision"), int) or pin["revision"] < 0
+                    for pin in self.scope_writer_pins.values()):
+                raise BackfillStateError("batch writer pins are invalid")
+        if self.scope_registry_snapshot_ids is not None:
+            if set(self.scope_registry_snapshot_ids) != set(self.scope_ids) or any(not value for value in self.scope_registry_snapshot_ids.values()):
+                raise BackfillStateError("batch capture snapshot map differs from scope membership")
+            object.__setattr__(self, "scope_registry_snapshot_ids", dict(sorted(self.scope_registry_snapshot_ids.items())))
+        if self.scope_stream_ids is not None:
+            if set(self.scope_stream_ids) != set(self.scope_ids) or any(
+                    not value.startswith("history-") or not value[8:].isdigit()
+                    for value in self.scope_stream_ids.values()):
+                raise BackfillStateError("batch stream map differs from scope membership")
+            object.__setattr__(self, "scope_stream_ids", dict(sorted(self.scope_stream_ids.items())))
+        if self.stream_id is not None and not self.stream_id.startswith("history-"):
+            raise BackfillStateError("historical batch requires a history stream")
         campaign = _required_sha256("campaign_id", self.campaign_id)
         object.__setattr__(self, "campaign_id", campaign)
         scopes = tuple(_required_text("scope_id", item) for item in self.scope_ids)
@@ -1266,10 +1306,12 @@ class BackfillBatch:
         requested = BatchStatus(status)
         allowed = {
             BatchStatus.CLAIMED: {
+                BatchStatus.WAITING_POLICY,
                 BatchStatus.RUNNING,
                 BatchStatus.BLOCKED_PLATFORM,
             },
             BatchStatus.RUNNING: {
+                BatchStatus.WAITING_POLICY,
                 BatchStatus.DQ_PENDING,
                 BatchStatus.BLOCKED_PLATFORM,
             },
@@ -1279,6 +1321,7 @@ class BackfillBatch:
             },
             BatchStatus.BLOCKED_PLATFORM: {BatchStatus.RUNNING},
             BatchStatus.COMPLETE: set(),
+            BatchStatus.WAITING_POLICY: set(),
         }
         if requested not in allowed[self.status]:
             raise BackfillStateError(
@@ -1618,6 +1661,7 @@ def claim_scopes(
     lease_owner: str,
     now: datetime,
     limit: int = MAX_SCOPE_BATCH,
+    eligible_scope_ids: Iterable[str] | None = None,
 ) -> ClaimResult:
     """Reclaim stale work and deterministically lease at most one bounded batch."""
 
@@ -1634,20 +1678,19 @@ def claim_scopes(
     reclaimed: list[str] = []
     reclaimed_records: list[BackfillScopeState] = []
     normalised: list[BackfillScopeState] = []
+    allowed = set(eligible_scope_ids) if eligible_scope_ids is not None else None
     for scope in supplied:
-        if is_stale_lease(scope, now=current):
+        if is_stale_lease(scope, now=current) and (allowed is None or scope.target.scope_id in allowed):
             scope = reclaim_stale_lease(scope, now=current)
             reclaimed.append(scope.target.scope_id)
             reclaimed_records.append(scope)
         normalised.append(scope)
     ready = [
         scope for scope in normalised
-        if scope.status is ScopeStatus.PENDING
-        or (
-            scope.status is ScopeStatus.RETRYABLE_ERROR
-            and scope.next_retry_at is not None
-            and scope.next_retry_at <= current
-        )
+        if (allowed is None or scope.target.scope_id in allowed) and (
+            scope.status is ScopeStatus.PENDING
+            or (scope.status is ScopeStatus.RETRYABLE_ERROR
+                and scope.next_retry_at is not None and scope.next_retry_at <= current))
     ]
     chosen = tuple(sorted(ready, key=_claim_sort_key)[:limit])
     if not chosen:
@@ -1722,7 +1765,7 @@ def apply_attempt(
     if attempt.claim_generation != scope.claim_generation:
         raise BackfillStateError("attempt belongs to another claim generation")
     if (
-        attempt.outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION}
+        attempt.outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION, AttemptOutcome.TRANSPORT_ERROR}
         and scope.source_attempt_count >= MAX_SOURCE_ATTEMPTS
     ):
         raise BackfillStateError("scope source-attempt limit is exhausted")
@@ -1801,6 +1844,11 @@ def apply_attempt(
             last_error_class="unavailable_confirmation_pending",
             last_error_message=None,
         )
+    if attempt.outcome is AttemptOutcome.TRANSPORT_ERROR:
+        return replace(scope, **common, status=ScopeStatus.RETRYABLE_ERROR,
+                       next_retry_at=attempt.finished_at + timedelta(minutes=1),
+                       last_error_class=attempt.error_class,
+                       last_error_message=attempt.error_message)
     if attempt.outcome is AttemptOutcome.SOURCE_ERROR:
         source_attempts = scope.source_attempt_count + 1
         source_errors = scope.source_error_count + 1
@@ -2024,7 +2072,7 @@ def verify_completion_evidence(
             )
         source_attempts = [
             item for item in linked
-            if item.outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION}
+            if item.outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION, AttemptOutcome.TRANSPORT_ERROR}
         ]
         source_errors = [
             item for item in linked
@@ -2290,6 +2338,12 @@ def record_payload(record: Any) -> dict[str, Any]:
     if not is_dataclass(record) or isinstance(record, type):
         raise BackfillStateError("record must be a contract dataclass")
     payload = _normalise_json(record)
+    if isinstance(record, BackfillBatch):
+        if not payload.get("recovery_probe"):
+            payload.pop("recovery_probe", None)
+        for name in ("registry_snapshot_id", "standing_policy", "stream_id", "scope_stream_ids", "scope_registry_snapshot_ids", "scope_writer_pins"):
+            if payload.get(name) is None:
+                payload.pop(name, None)
     if not isinstance(payload, dict):
         raise BackfillStateError("record payload must be an object")
     return payload
@@ -2519,6 +2573,13 @@ def batch_from_mapping(value: Mapping[str, Any]) -> BackfillBatch:
             open_platform_incident_id=value.get(
                 "open_platform_incident_id"
             ),
+            registry_snapshot_id=value.get("registry_snapshot_id"),
+            standing_policy=value.get("standing_policy"),
+            stream_id=value.get("stream_id"),
+            scope_stream_ids=value.get("scope_stream_ids"),
+            scope_registry_snapshot_ids=value.get("scope_registry_snapshot_ids"),
+            scope_writer_pins=value.get("scope_writer_pins"),
+            recovery_probe=value.get("recovery_probe", False),
             revision=int(value.get("revision", 0)),
             contract_version=int(value.get("contract_version", CONTRACT_VERSION)),
         )

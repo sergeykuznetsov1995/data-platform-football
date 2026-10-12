@@ -24,7 +24,7 @@ SHARED_FILTER_SHA256 = (
     # Refresh the merged baseline after 81bea4ce (#1392, tmapi host) and
     # 1f933229 (#1388), #1365 SofaScore accounting/registry changes, and
     # #1398 dedicated TM streams; both source contracts are retained.
-    "0370278e98303a815ceff8357bd5ecb70c06c274e6a9ff40daa544811b7cbad4"
+    "afff95f368ffa9fa2cb7ea716562376994fa61883325bed7d19166b2ed6d6cd8"
 )
 
 

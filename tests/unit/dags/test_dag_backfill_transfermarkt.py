@@ -29,7 +29,13 @@ def module(monkeypatch):
     from contextlib import nullcontext
     from scrapers.transfermarkt import history_portion
     monkeypatch.setattr(history_portion, 'bounded_trino', nullcontext)
-    return _reload()
+    from utils import transfermarkt_history_authority
+    # These orchestration fixtures use policy stand-ins. Real policy validation
+    # is exercised by test_transfermarkt_history_safety against actual policies.
+    monkeypatch.setattr(transfermarkt_history_authority, "validate_batch_policy", lambda *_a, **_k: None)
+    module = _reload()
+    monkeypatch.setattr(module, "existing_batch_requires_paid_io", lambda *_a: True)
+    return module
 
 
 def _bash(task_id: str):
@@ -280,6 +286,8 @@ def test_explicit_scope_platform_resume_maps_one_new_source_attempt(
         scope_ids=(scope_id,),
         scope_claim_generations=(1,),
         status=state.BatchStatus.RUNNING,
+        registry_snapshot_id=None, standing_policy=None, policy_sha256=None,
+        stream_id=None, scope_stream_ids=None, scope_writer_pins=None, recovery_probe=False,
     )
 
     class _Repository:
@@ -367,53 +375,31 @@ def test_explicit_scope_platform_resume_maps_one_new_source_attempt(
     assert planned[0]["TM_BACKFILL_FINALIZE_ONLY"] == "false"
 
 
-def test_policy_rotation_blocks_before_claim_or_registry_read(module, monkeypatch):
-    campaign = SimpleNamespace(
-        campaign_id="a" * 64,
-        policy_sha256="b" * 64,
-        status=state.CampaignStatus.ACTIVE,
-    )
-
-    class _Repository:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def ensure_schema(self):
-            pass
-
-        def open_campaign(self):
-            return campaign
-
-        def load_scopes(self, campaign_id):
-            assert campaign_id == campaign.campaign_id
-            return ()
-
-        def reconcile_open_platform_incident(self, *_args, **_kwargs):
-            raise AssertionError("policy drift must stop before reconciliation")
-
-    monkeypatch.setattr(
-        module.BackfillStateRepository, "connect", lambda: _Repository()
-    )
-    monkeypatch.setattr(
-        module,
-        "_load_backfill_policy",
-        lambda: SimpleNamespace(policy_hash="c" * 64),
-    )
-    monkeypatch.setattr(
-        module,
-        "read_promoted_registry",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("policy drift must stop before registry planning")
-        ),
-    )
-
-    with pytest.raises(module.AirflowException, match="policy changed"):
-        module._plan_historical_batch(
-            **_planner_context(module, resume_platform_block=False)
-        )
+def test_legacy_batch_policy_rotation_requires_original_policy(module, monkeypatch):
+    campaign = SimpleNamespace(campaign_id="a" * 64, registry_snapshot_id="original-registry",
+                              policy_sha256="b" * 64, status=state.CampaignStatus.ACTIVE)
+    batch = SimpleNamespace(batch_id="d" * 64, registry_snapshot_id=None, standing_policy=None)
+    held = SimpleNamespace(status=state.BatchStatus.WAITING_POLICY)
+    batch.transition = lambda status, **_k: held
+    suspended = []
+    class Repository:
+        def __enter__(self): return self
+        def __exit__(self, *_a): pass
+        def ensure_schema(self): pass
+        def open_campaign(self): return campaign
+        def load_scopes(self, *_a): return ()
+        def load_batches(self, *_a): return (batch,)
+        def reconcile_open_platform_incident(self, *_a, **_k): return campaign, None
+        def persist_batch_transition(self, before, after): suspended.append(after)
+    monkeypatch.setattr(module.BackfillStateRepository, "connect", Repository)
+    monkeypatch.setattr(module, "_load_backfill_policy", lambda: SimpleNamespace(policy_hash="c" * 64))
+    monkeypatch.setattr(module, "select_recoverable_batch", lambda *_a: batch)
+    monkeypatch.setattr(module, "read_promoted_registry", lambda **_k: ({},))
+    monkeypatch.setattr(module, "plan_existing_batch", lambda *_a, **_k: ())
+    Repository.load_attempts = lambda *_a: ()
+    monkeypatch.setattr(module, "_persist_planner_platform_incident", lambda **_k: None)
+    assert module._plan_historical_batch(**_planner_context(module, resume_platform_block=False)) == []
+    assert suspended == [held]
 
 
 def test_post_claim_environment_failure_is_bound_to_exact_durable_batch(
@@ -440,6 +426,8 @@ def test_post_claim_environment_failure_is_bound_to_exact_durable_batch(
         scope_ids=(scope_id,),
         scope_claim_generations=(1,),
         status=state.BatchStatus.RUNNING,
+        registry_snapshot_id=None, standing_policy=None, policy_sha256=None,
+        stream_id=None, scope_stream_ids=None, scope_writer_pins=None, recovery_probe=False,
     )
 
     class _Repository:

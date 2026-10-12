@@ -1,5 +1,5 @@
 {
-  "policy_version": 3,
+  "policy_version": 4,
   "dag_id": "dag_ingest_transfermarkt",
   "approved_by": "sergeykuznetsov1995",
   "approved_at": "2026-10-08T00:00:00Z",
@@ -31,6 +31,7 @@
     "iceberg.ops.proxy_traffic_runs",
     "iceberg.ops.transfermarkt_career_capture_refs_v1",
     "iceberg.ops.transfermarkt_career_snapshot_anchors_v1",
+    "iceberg.ops.transfermarkt_season_close_v1",
     "iceberg.ops.transfermarkt_current_checks_v1",
     "iceberg.ops.transfermarkt_current_signals_v1",
     "iceberg.ops.transfermarkt_dual_write_manifest_v2",
