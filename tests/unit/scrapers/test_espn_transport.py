@@ -996,6 +996,8 @@ def test_timeout_diagnostics_preserve_original_failure(monkeypatch, tmp_path, ph
         assert row['timeout'] and row['status'] == (None if phase == 'request' else 200)
         assert row['complete'] is (not (phase == 'read' and close_fails))
         assert row['error_type'] == 'Timeout' and row['error_phase'] == phase
+        assert any(node['type'] == 'Timeout' for node in row['error_chain'])
+        assert not any(node['type'] == 'ConnectionError' for node in row['error_chain'])
         assert 'private' not in json.dumps(row)
     finally:
         client.close()
@@ -1012,6 +1014,61 @@ def test_exception_class_name_is_allowlisted_before_persistence(monkeypatch, tmp
         assert row['error_type'] == 'OtherTransportError'
         assert caught.value.error_type == 'OtherTransportError'
         assert 'private' not in json.dumps(row)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('phase', ['request', 'read', 'close'])
+@pytest.mark.parametrize('kind', ['dns', 'tcp', 'tls'])
+def test_nested_connection_failure_keeps_safe_local_cause_after_restart(monkeypatch, tmp_path, phase, kind):
+    import errno
+    import socket
+    import ssl
+    from urllib3.exceptions import MaxRetryError, NameResolutionError, NewConnectionError, SSLError
+    from scrapers.espn.attempts import AttemptJournal, ATTEMPT_COLUMNS
+    from tests.unit.scrapers.test_espn_pace_report import Connection
+
+    secret = 'https://private.invalid/?token=secret'
+    if kind == 'dns':
+        underlying = socket.gaierror(socket.EAI_NONAME, secret)
+        reason = NameResolutionError('private.invalid', None, underlying)
+    elif kind == 'tcp':
+        underlying = ConnectionRefusedError(errno.ECONNREFUSED, secret)
+        reason = NewConnectionError(None, secret)
+    else:
+        underlying = ssl.SSLCertVerificationError(ssl.SSL_ERROR_SSL, secret)
+        reason = SSLError(underlying)
+    reason.__cause__ = underlying
+    failure = requests.ConnectionError(MaxRetryError(None, secret, reason))
+    response = FakeResponse(200, b'{}')
+    if phase == 'read':
+        class BrokenBody:
+            def read(self, _size): raise failure
+        response.raw = BrokenBody()
+    elif phase == 'close':
+        def broken_close(): raise failure
+        response.close = broken_close
+    client, session, _, _ = _client(monkeypatch, tmp_path, [failure] if phase == 'request' else [response])
+    try:
+        with pytest.raises(DirectTransportError):
+            client.fetch_json(WEB+'/apis/site/v2/sports/soccer/eng.1/summary',
+                              'summary', {'event': '1'}, force_refresh=True)
+        row, = client.attempt_journal.rows()
+        chain = row['error_chain']
+        assert {'type': type(underlying).__name__, 'errno': underlying.errno} in chain
+        assert {'type': 'MaxRetryError', 'errno': None} in chain
+        assert {'type': 'ConnectionError', 'errno': None} in chain
+        assert row['error_type'] == 'ConnectionError' and row['error_phase'] == phase
+        assert not row['complete'] and not row['timeout'] and len(session.calls) == 1
+        assert row['status'] == (None if phase == 'request' else 200)
+        assert 'private' not in json.dumps(row) and 'secret' not in json.dumps(row)
+        restarted = AttemptJournal(client.attempt_journal.path)
+        assert restarted.rows() == [row]
+        connection = Connection()
+        assert restarted.flush(connection) == 1
+        assert restarted.rows() == [row] and restarted.pending() == 0
+        assert 'error_chain' not in {name for name, _ in ATTEMPT_COLUMNS}
+        assert all('private' not in sql and 'secret' not in sql for sql in connection.statements)
     finally:
         client.close()
 

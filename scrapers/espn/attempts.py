@@ -8,8 +8,10 @@ shared publication lock; rows are retained locally for coverage/recovery.
 from __future__ import annotations
 
 import json
+import errno
 import fcntl
 import os
+import socket
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -40,12 +42,54 @@ _ERROR_TYPES = frozenset({
     'RetryError', 'IncompleteRead', 'InvalidChunkLength', 'OSError',
     'ConnectionResetError', 'ConnectionAbortedError', 'ConnectionRefusedError',
     'BrokenPipeError', 'ValueError', 'error', '_ReadLimitExceeded',
+    'gaierror', 'herror', 'SSLCertVerificationError', 'RemoteDisconnected',
 })
 _ERROR_PHASES = frozenset({'request', 'read', 'close'})
+_MAX_ERROR_CHAIN = 8
+_ERROR_NUMBERS = frozenset(errno.errorcode) | frozenset(
+    value for name, value in vars(socket).items()
+    if name.startswith('EAI_') and type(value) is int
+)
 
 
 def safe_error_type(value):
     return value if type(value) is str and value in _ERROR_TYPES else 'OtherTransportError'
+
+
+def safe_error_chain(value):
+    """Keep only bounded class labels and known numeric error codes."""
+    if type(value) not in (list, tuple):
+        return None
+    result = []
+    for node in value[:_MAX_ERROR_CHAIN]:
+        if type(node) is not dict:
+            continue
+        number = node.get('errno')
+        result.append({'type': safe_error_type(node.get('type')),
+                       'errno': number if type(number) is int and number in _ERROR_NUMBERS else None})
+    return result
+
+
+def exception_chain(error):
+    """Inspect exception objects without rendering messages or custom properties."""
+    pending, seen, result = [error], set(), []
+    while pending and len(result) < _MAX_ERROR_CHAIN:
+        current = pending.pop(0)
+        if not issubclass(type(current), BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        number = OSError.errno.__get__(current) if issubclass(type(current), OSError) else None
+        if issubclass(type(number), int) and type(number) is not bool:
+            number = int.__int__(number)
+        result.append({'type': type.__dict__['__name__'].__get__(type(current)), 'errno': number})
+        # Built-in descriptors bypass exception subclasses' arbitrary properties.
+        attributes = BaseException.__dict__['__dict__'].__get__(current)
+        links = [BaseException.__cause__.__get__(current),
+                 BaseException.__context__.__get__(current), dict.get(attributes, 'reason')]
+        links.extend(tuple.__getitem__(BaseException.args.__get__(current), slice(_MAX_ERROR_CHAIN)))
+        pending.extend(node for node in links if issubclass(type(node), BaseException)
+                       and id(node) not in seen)
+    return safe_error_chain(result)
 
 
 class AttemptJournal:
@@ -85,7 +129,7 @@ class AttemptJournal:
         return row['attempt_id']
 
     def finish(self, attempt_id, *, status, timeout, http_ms, direct_bytes, complete=True,
-               error_type=None, error_phase=None):
+               error_type=None, error_phase=None, error_chain=None):
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
             found = db.execute('SELECT payload FROM attempts WHERE id=?', (attempt_id,)).fetchone()
@@ -95,7 +139,8 @@ class AttemptJournal:
             row.update(status=status, timeout=bool(timeout), http_ms=http_ms,
                        direct_bytes=direct_bytes, complete=bool(complete))
             row.update(error_type=safe_error_type(error_type) if error_type is not None else None,
-                       error_phase=error_phase if type(error_phase) is str and error_phase in _ERROR_PHASES else None)
+                       error_phase=error_phase if type(error_phase) is str and error_phase in _ERROR_PHASES else None,
+                       error_chain=safe_error_chain(error_chain))
             db.execute('UPDATE attempts SET payload=?, dirty=1 WHERE id=?', (json.dumps(row), attempt_id))
 
     def rows(self, start=None, end=None):
