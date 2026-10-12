@@ -2486,6 +2486,8 @@ def _save_frames(
                 }
                 continue
             guard = None if force_replace or not output.guard_key else _MIN_REPLACE_RATIO
+            from scrapers.transfermarkt.first_seen import inherit_registered_clocks
+            frame = inherit_registered_clocks(scraper, output, frame)
             table_path = scraper.save_to_iceberg(
                 df=frame,
                 table_name=output.table_name,
@@ -4309,6 +4311,8 @@ def _run_entity_unbounded(
                 frames = _carry_forward_observed_at(
                     scraper, write_spec, frames, results,
                 )
+                from scrapers.transfermarkt.first_seen import prepare_frames
+                frames = prepare_frames(scraper, write_spec.outputs, frames)
                 career_intent_path = None
                 if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS}:
                     from scrapers.transfermarkt.write_intents import save_intent

@@ -113,6 +113,8 @@ class SignalState:
     committed_at: datetime | None = None
     # Immutable serialized events retain superseded failures for #1395.
     superseded_evidence: tuple[str, ...] = ()
+    # Additive metric provenance; old rows remain explicitly unknown.
+    measurement_kind: str = 'unknown'
 
     def __post_init__(self) -> None:
         if not isinstance(self.observation, SignalObservation):
@@ -138,6 +140,8 @@ class SignalState:
             raise CurrentStateError('committed_at requires a Bronze manifest')
         if self.status == 'failed' and not self.result:
             raise CurrentStateError('failed signal requires result evidence')
+        if self.measurement_kind not in {'unknown', 'cold', 'baseline', 'change'}:
+            raise CurrentStateError('unsupported signal measurement kind')
         object.__setattr__(self, 'superseded_evidence', tuple(self.superseded_evidence))
         for event in self.superseded_evidence:
             try:
@@ -157,7 +161,7 @@ class SignalState:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'SignalState':
-        parsed = _mapping(cls, value)
+        parsed = _mapping(cls, {'measurement_kind': 'unknown', **value})
         parsed['observation'] = SignalObservation.from_mapping(parsed['observation'])
         return cls(**parsed)
 
@@ -170,7 +174,7 @@ class SignalState:
             'raw_fetched_at', 'source_url', 'source_body_hash', 'status', 'result',
             'bronze_manifest', 'committed_at', 'superseded_evidence_json',
         }
-        if set(value) != names:
+        if set(value) - {'measurement_kind'} != names:
             raise CurrentStateError('ops signal row fields differ')
         if value['first_detected_at'] is None:
             raise CurrentStateError('ops signal row lacks detection evidence')
@@ -190,13 +194,15 @@ class SignalState:
         return cls(observation=observation, applied_signature=value['applied_signature'],
                    first_detected_at=value['first_detected_at'], status=value['status'],
                    result=value['result'], bronze_manifest=value['bronze_manifest'],
-                   committed_at=value['committed_at'], superseded_evidence=tuple(events))
+                   committed_at=value['committed_at'], superseded_evidence=tuple(events),
+                   measurement_kind=value.get('measurement_kind') or 'unknown')
 
 
-def mark_seen(previous: SignalState | None, observation: SignalObservation) -> SignalState:
+def mark_seen(previous: SignalState | None, observation: SignalObservation, *,
+              measurement_kind: str = 'unknown') -> SignalState:
     """Keep pending first detection; do not erase failure on a retry/check."""
     if previous is None:
-        return SignalState(observation=observation)
+        return SignalState(observation=observation, measurement_kind=measurement_kind)
     if previous.observation.key != observation.key:
         raise CurrentStateError('signal identity changed')
     if observation.checked_at < previous.observation.checked_at:
@@ -215,6 +221,11 @@ def mark_seen(previous: SignalState | None, observation: SignalObservation) -> S
         'status': previous.status, 'result': previous.result,
         'bronze_manifest': previous.bronze_manifest,
         'committed_at': previous.committed_at,
+        'measurement_kind': previous.measurement_kind,
+        'raw_capture_id': previous.observation.raw_capture_id,
+        'raw_fetched_at': previous.observation.raw_fetched_at,
+        'source_url': previous.observation.source_url,
+        'source_body_hash': previous.observation.source_body_hash,
     })
     # Even a return to the old applied signature needs processing: the failed
     # intermediate capture may already have committed data before its ack.
@@ -223,6 +234,7 @@ def mark_seen(previous: SignalState | None, observation: SignalObservation) -> S
         first_detected_at=observation.checked_at,
         bronze_manifest=previous.bronze_manifest, committed_at=previous.committed_at,
         superseded_evidence=previous.superseded_evidence + (event,),
+        measurement_kind=measurement_kind,
     )
 
 
@@ -260,11 +272,16 @@ class EditionCheck:
     raw_capture_ids: tuple[str, ...]
     expected_ids: int
     observed_ids: int
+    edition_fingerprint: str | None = None
+    denominator_definition_hash: str | None = None
 
     def __post_init__(self) -> None:
         for name in ('scope_id', 'cycle_id', 'registry_snapshot_id'):
             _text(name, getattr(self, name))
         _hash('denominator_hash', self.denominator_hash)
+        for name in ('edition_fingerprint', 'denominator_definition_hash'):
+            if getattr(self, name) is not None:
+                _hash(name, getattr(self, name))
         object.__setattr__(self, 'checked_at', _time(self.checked_at))
         if self.check_kind not in (*DAILY_CHECKS, 'daily_complete') or self.status not in {'complete', 'failed', 'uncertain'}:
             raise CurrentStateError('invalid edition check kind/status')
@@ -288,7 +305,30 @@ class EditionCheck:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'EditionCheck':
-        return cls(**_mapping(cls, value))
+        return cls(**_mapping(cls, {'edition_fingerprint': None, 'denominator_definition_hash': None, **value}))
+
+
+def edition_measurement_fingerprint(row: Mapping[str, Any]) -> str:
+    """Stable promoted edition meaning, excluding refresh-only snapshot/clocks."""
+    from scrapers.transfermarkt.current_capture import semantic_signature
+    names = ('competition_id', 'edition_id', 'competition_type', 'gender', 'team_type',
+             'age_category', 'competition_season_format', 'competition_active',
+             'classification_status', 'competition_source_url', 'canonical_season',
+             'edition_season_format', 'edition_active', 'is_current', 'start_date', 'end_date',
+             'participant_count', 'participant_hash', 'edition_source_url',
+             'competition_parser_revision', 'competition_schema_revision',
+             'edition_parser_revision', 'edition_schema_revision')
+    return semantic_signature({'version': 'edition-measurement-v1',
+                               'fields': {name: row.get(name) for name in names}})
+
+
+def denominator_definition_hash(rows: Iterable[Any]) -> str:
+    """The live core definition remains stable across discovery promotions."""
+    from scrapers.transfermarkt.current_capture import semantic_signature
+    core = [(str(_field(row, 'competition_id')), _field(row, 'competition_class'), _field(row, 'route'))
+            for row in rows if _field(row, 'live') is True
+            and _field(row, 'competition_class') in {'core_club', 'core_national'}]
+    return semantic_signature({'version': 'live-core-measurement-v1', 'core': sorted(core)})
 
 
 def _sql(value: Any) -> str:
@@ -310,14 +350,26 @@ scope_id varchar, entity varchar, entity_id varchar, observed_signature varchar,
 applied_signature varchar, first_detected_at timestamp(6), last_checked_at timestamp(6),
 signal_version varchar, raw_capture_id varchar, raw_fetched_at timestamp(6),
 source_url varchar, source_body_hash varchar, status varchar, result varchar,
-bronze_manifest varchar, committed_at timestamp(6), superseded_evidence_json varchar
+bronze_manifest varchar, committed_at timestamp(6), superseded_evidence_json varchar,
+measurement_kind varchar
 ) WITH (format = 'PARQUET')''',
         f'''CREATE TABLE IF NOT EXISTS {CHECKS_TABLE} (
 scope_id varchar, check_kind varchar, cycle_id varchar, registry_snapshot_id varchar,
 denominator_hash varchar, checked_at timestamp(6), status varchar, result varchar,
-raw_capture_ids_json varchar, expected_ids bigint, observed_ids bigint
+raw_capture_ids_json varchar, expected_ids bigint, observed_ids bigint,
+edition_fingerprint varchar, denominator_definition_hash varchar
 ) WITH (format = 'PARQUET')''',
     )
+
+
+def build_measurement_kind_migration_sql() -> str:
+    """Idempotent additive migration; never relabel old observations."""
+    return f'ALTER TABLE {SIGNALS_TABLE} ADD COLUMN IF NOT EXISTS measurement_kind varchar'
+
+
+def build_check_fingerprint_migrations_sql() -> tuple[str, str]:
+    return tuple(f'ALTER TABLE {CHECKS_TABLE} ADD COLUMN IF NOT EXISTS {name} varchar'
+                 for name in ('edition_fingerprint', 'denominator_definition_hash'))
 
 
 def _merge(table: str, values: Mapping[str, Any], keys: tuple[str, ...], condition: str = '') -> str:
@@ -342,6 +394,7 @@ def _signal_values(state: SignalState) -> dict[str, Any]:
         'source_body_hash': obs.source_body_hash, 'status': state.status, 'result': state.result,
         'bronze_manifest': state.bronze_manifest, 'committed_at': state.committed_at,
         'superseded_evidence_json': _json(state.superseded_evidence),
+        'measurement_kind': state.measurement_kind,
     }
 
 

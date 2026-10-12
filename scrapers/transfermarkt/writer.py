@@ -148,6 +148,14 @@ class CommittingConnection:
 
 
 class TransfermarktTrinoManager(TrinoTableManager):
+    def arrow_schema_to_trino(self, arrow_schema):
+        types = super().arrow_schema_to_trino(arrow_schema)
+        if 'first_seen_at' in types:
+            # The ops registry uses UTC timestamp(6). Never let the generic
+            # default TIMESTAMP precision round an immutable microsecond clock.
+            types['first_seen_at'] = 'TIMESTAMP(6)'
+        return types
+
     def _execute(self, sql, fetch=False, params=None):
         parent = super()._execute
         if fetch or not _MUTATION.match(sql):
@@ -262,13 +270,20 @@ def guard_cached_frames(scraper, outputs, frames):
             params = tuple(value for item in refs for value in (item['player_id'], item['batch_id']))
             cursor = connection.cursor()
             try:
-                execute_statement(cursor, 'SELECT ' + ', '.join(frame.columns) + ' FROM iceberg.bronze.'
+                projection = list(frame.columns)
+                if 'first_seen_at' in projection and expected.first_seen_at.isna().all():
+                    # Schema evolution happens at the write boundary AFTER
+                    # save_intent. An old cached cohort may precede the nullable
+                    # metadata column; its original physical projection stays
+                    # verifiable without mutating Bronze before the journal.
+                    projection.remove('first_seen_at')
+                execute_statement(cursor, 'SELECT ' + ', '.join(projection) + ' FROM iceberg.bronze.'
                     + output.table_name + ' WHERE ' + predicate, params)
-                actual = pd.DataFrame(cursor.fetchall(), columns=frame.columns)
+                actual = pd.DataFrame(cursor.fetchall(), columns=projection)
             finally:
                 cursor.close()
             from dags.utils.transfermarkt_current_write import _rows
-            if _rows(actual) != _rows(expected):
+            if _rows(actual) != _rows(expected[projection]):
                 raise StaleTransfermarktWrite('cached career physical captures changed: ' + output.table_name)
     finally:
         connection.close()

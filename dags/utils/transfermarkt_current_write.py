@@ -103,7 +103,7 @@ def _stamp(value):
 def _cell(column, value):
     if value is None or pd.isna(value):
         return None
-    if column in {'fetched_at', 'observed_at', '_ingested_at'}:
+    if column in {'fetched_at', 'observed_at', '_ingested_at', 'first_seen_at'}:
         parsed = pd.Timestamp(value)
         if parsed.tzinfo is not None:
             parsed = parsed.tz_convert('UTC').tz_localize(None)
@@ -183,6 +183,7 @@ def _read_back(scraper, output, frame, cycle_id, *, empty_ids=(), empty_key='pla
     club_hashes = ({str(club): {'rows': len(part), 'physical_hash': hashlib.sha256(json.dumps(_rows(part), sort_keys=True).encode()).hexdigest()}
                    for club, part in persisted.groupby(club_column)} if club_column else {})
     return {'table': table, 'batch_id': batch_id, 'rows': len(persisted), 'physical_hash': digest,
+            'columns': list(frame.columns),
             **({'club_hashes': club_hashes} if club_hashes else {})}
 
 
@@ -223,6 +224,12 @@ def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids
         run._authorize_write_mode(mode, revision)
         results = {'outputs': {key: run._frame_output_summary(frame) for key, frame in frames.items()}, 'tables': []}
         frames = run._carry_forward_observed_at(scraper, spec, frames, results)
+        # Careers are enriched before their durable intent. An old intent must
+        # retain its exact old columns and identity; fresh rosters/coaches have
+        # no career intent and are enriched here before identity hashing.
+        if getattr(scraper, '_tm_career_intent_path', None) is None:
+            from scrapers.transfermarkt.first_seen import prepare_frames
+            frames = prepare_frames(scraper, spec.outputs, frames)
         # A portion may write this scope twice. Distinct business bundles must not
         # mix their batches or overwrite each other's compatibility manifest rows.
         identity = {'cycle_id': cycle_id, 'scope_id': scope['scope_id'], 'entity': spec.name,
@@ -253,7 +260,9 @@ def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids
                 frame = frames[output.key]
                 table = 'iceberg.bronze.' + output.table_name
                 if not frame.empty:
-                    options = dict(df=frame, table_name=output.table_name, partition_cols=list(output.partition_cols))
+                    from scrapers.transfermarkt.first_seen import inherit_registered_clocks
+                    outgoing = inherit_registered_clocks(scraper, output, frame)
+                    options = dict(df=outgoing, table_name=output.table_name, partition_cols=list(output.partition_cols))
                     if output.key == 'attribute_observations':
                         options['natural_keys'] = ['competition_id', 'edition_id', 'club_id', 'player_id', 'observed_at']
                     else:
@@ -557,6 +566,8 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
         if frame.empty and empty:
             frame.attrs['fetch_status'] = 'authoritative_empty'
     scraper._tm_empty_capture_times = run._career_capture_times(scraper, spec, frames, processed)
+    from scrapers.transfermarkt.first_seen import prepare_frames
+    frames = prepare_frames(scraper, spec.outputs, frames)
     intent_path = save_intent(intent_identity, frames, mode=mode, revision=revision,
         batch_id=str(scraper._batch_id), cycle_id=cycle_id, empty=empty,
         processed=processed, state_rows=state_rows, window=window,
@@ -840,7 +851,12 @@ def verify_current_roster_baseline(scraper, snapshot: FullRosterSnapshot, receip
         else:
             predicate, params = 'competition_id = ? AND edition_id = ?', [scope['competition_id'], scope['edition_id']]
         try:
-            physical = run._query_dataframe(conn, f'SELECT {", ".join(frame.columns)} FROM {proof["table"]} WHERE {predicate}', params)
+            proof_columns = proof.get('columns', list(frame.columns))
+            if (not isinstance(proof_columns, list) or len(proof_columns) != len(set(proof_columns))
+                    or set(proof_columns) - set(frame.columns) - {'first_seen_at'}
+                    or not set(frame.columns) <= set(proof_columns)):
+                raise CurrentWriteError('retained output physical columns differ from contract')
+            physical = run._query_dataframe(conn, f'SELECT {", ".join(proof_columns)} FROM {proof["table"]} WHERE {predicate}', params)
         except Exception as exc:
             if frame.empty and any(marker in str(exc).lower() for marker in ('table_not_found', 'table not found', 'does not exist')):
                 physical = frame
@@ -849,7 +865,7 @@ def verify_current_roster_baseline(scraper, snapshot: FullRosterSnapshot, receip
         digest = hashlib.sha256(json.dumps(_rows(physical), sort_keys=True).encode()).hexdigest()
         if len(physical) != proof['rows'] or digest != proof['physical_hash']:
             raise CurrentWriteError('retained full-roster physical checksum differs')
-        columns = [column for column in frame.columns if column not in {'observed_at', '_ingested_at', '_batch_id'}]
+        columns = [column for column in frame.columns if column not in {'observed_at', '_ingested_at', '_batch_id', 'first_seen_at'}]
         if _rows(physical[columns]) != _rows(frame[columns]):
             raise CurrentWriteError('recovery roster business/lineage differs from committed physical rows')
         verified[output.key] = dict(proof)

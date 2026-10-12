@@ -1197,6 +1197,27 @@ def _validate_scope_set(**context: Any) -> dict[str, Any]:
     return result
 
 
+def _daily_bronze_dq(**context) -> dict[str, Any]:
+    """Independent read-only control task, including failed/unqualified ingest."""
+    from utils import transfermarkt_daily_dq as daily
+    from utils import transfermarkt_native_v2 as native
+
+    conn = native.connect()
+    cur = conn.cursor()
+    try:
+        report = daily.run_daily_bronze_dq(cur, run_id=str(context['run_id']))
+    finally:
+        cur.close()
+        conn.close()
+    logger.info(daily.format_daily_dq_summary(report))
+    if not report.get('completed') or report.get('status') == 'RED':
+        raise AirflowException(
+            'daily Bronze DQ ' + str(report.get('status')) + ': '
+            + str(report.get('execution_errors') or report.get('errors') or 'incomplete audit')
+        )
+    return report
+
+
 with DAG(
     dag_id='dag_ingest_transfermarkt',
     default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
@@ -1278,6 +1299,18 @@ with DAG(
     scopes/leagues run can become promotion-ready.
     """,
 ) as dag:
+    daily_bronze_dq_task = PythonOperator(
+        task_id='daily_bronze_dq',
+        python_callable=_daily_bronze_dq,
+        pool='transfermarkt_control',
+        retries=1,
+        retry_delay=timedelta(minutes=5),
+        execution_timeout=timedelta(minutes=10),
+        do_xcom_push=False,
+        # Preserve #1393's single run notification; the audit records RED locally.
+        on_failure_callback=None,
+    )
+
     preflight_reader_route_task = PythonOperator(
         task_id='preflight_reader_route_for_paid_cycle',
         python_callable=_preflight_reader_route_for_paid_cycle,
