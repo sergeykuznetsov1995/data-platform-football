@@ -129,8 +129,20 @@ def test_a_check_execution_error_does_not_suppress_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(dq, 'run_bronze_dq', failed_check)
     report = run(Cursor(), tmp_path)
     assert not report['completed']
-    assert report['status'] == 'RED'
+    assert report['status'] == 'UNKNOWN'
+    assert report['errors'] == []
+    assert report['execution_errors'] == ['broken']
     assert not run(Cursor(), tmp_path)['cached']
+
+
+def test_confirmed_violation_plus_query_error_is_red_incomplete(tmp_path, monkeypatch):
+    monkeypatch.setattr(dq, 'run_bronze_dq', lambda *args, **kwargs: [
+        dq.BronzeCheckResult('duplicates', 'duplicates', 'ERROR', False, value=2),
+        dq.BronzeCheckResult('broken', 'test', 'ERROR', False, error='timed out')])
+    report = run(Cursor(), tmp_path)
+    assert report['status'] == 'RED' and not report['completed']
+    assert report['errors'] == ['duplicates']
+    assert report['execution_errors'] == ['broken']
 
 
 def test_simultaneous_portions_only_run_one_full_audit(tmp_path, full_runner):

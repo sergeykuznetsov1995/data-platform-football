@@ -150,12 +150,14 @@ def build_field_metrics_sql(entity: str, implementation_at: datetime) -> str:
              else 'iceberg.bronze.transfermarkt_competition_editions'
              if entity == 'competition_editions' else dq.ENTITY_BRONZE_TABLES[entity])
     if entity == 'competitions':
-        native = '(competition_id IS NOT NULL)'
+        scope_columns = ('competition_id',)
     else:
-        comp, ed = dq._entity_scope_columns(table)
-        native = f'({comp} IS NOT NULL AND {ed} IS NOT NULL)'
+        scope_columns = dq._entity_scope_columns(table)
     after = f'(_ingested_at >= {_timestamp(implementation_at)} OR fetched_at >= {_timestamp(implementation_at)})'
-    lineage_null = ' OR '.join(f'{field} IS NULL' for field in LINEAGE)
+    known_scope = ' AND '.join(f'{field} IS NOT NULL' for field in scope_columns)
+    # Missing scope IDs do not establish an old cohort when the clocks are new.
+    native = f'(({known_scope}) OR COALESCE({after}, FALSE))'
+    lineage_null = ' OR '.join(f'{field} IS NULL' for field in (*LINEAGE, *scope_columns))
     counts = [
         'COUNT(*) AS total_rows',
         f'COUNT_IF(NOT {native}) AS legacy_rows',
@@ -364,7 +366,8 @@ def run_daily_bronze_dq(cur, *, state_root: Path = DEFAULT_STATE_ROOT,
         def remember(metrics, checks):
             # Keep each completed check before a subsequent query can fail.
             report.update(metrics=metrics, checks=[asdict(check) for check in checks])
-            report['errors'] = [check.name for check in checks if check.severity == 'ERROR' and not check.passed]
+            report['errors'] = [check.name for check in checks
+                                if check.severity == 'ERROR' and not check.passed and not check.error]
             if report['errors']:
                 report['status'] = 'RED'
         try:
@@ -386,7 +389,8 @@ def run_daily_bronze_dq(cur, *, state_root: Path = DEFAULT_STATE_ROOT,
             checks += first_seen_checks
             report.update(checks=[asdict(check) for check in checks], metrics=metrics)
             execution_errors = [check.name for check in checks if check.error]
-            errors = [check.name for check in checks if check.severity == 'ERROR' and not check.passed]
+            errors = [check.name for check in checks
+                      if check.severity == 'ERROR' and not check.passed and not check.error]
             debt = next((check.value for check in checks if check.kind == 'career_debt'), None)
             report['metrics']['career_debt'] = debt
             report['errors'] = errors

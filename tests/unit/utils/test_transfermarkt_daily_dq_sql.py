@@ -148,12 +148,27 @@ def test_all_nine_field_queries_execute_on_actual_producer_schemas(warehouse, en
 def test_legacy_scope_unknown_is_separate_and_missing_lineage_is_only_new(warehouse):
     entity = 'squad_memberships'
     old = CLOCK - timedelta(days=1)
-    _insert(warehouse, entity, _row(entity, 'legacy', competition_id=None, edition_id=None))
+    _insert(warehouse, entity, _row(entity, 'legacy', competition_id=None, edition_id=None,
+                                   fetched_at=old, _ingested_at=old))
     _insert(warehouse, entity, _row(entity, 'old', fetched_at=old, _ingested_at=old, source_url=None))
     _insert(warehouse, entity, _row(entity, 'new', source_body_hash=None))
     cur, _ = _frozen(warehouse)
     cur.execute(daily.build_field_metrics_sql(entity, NOW))
     assert cur.fetchall()[0][:6] == (3, 1, 1, 1, 1, 0)
+
+
+@pytest.mark.parametrize('entity', tuple(SCHEMAS))
+@pytest.mark.parametrize('missing', ['first', 'all'])
+def test_fresh_missing_scope_is_new_and_has_null_lineage(warehouse, entity, missing):
+    columns = ('competition_id',) if entity == 'competitions' else bronze._entity_scope_columns(_table(entity))
+    absent = {column: None for column in (columns[:1] if missing == 'first' else columns)}
+    old = CLOCK - timedelta(days=1)
+    _insert(warehouse, entity, _row(entity, 'old-unknown', **absent, fetched_at=old, _ingested_at=old))
+    # All common metadata are valid. Missing scope provenance alone is a violation.
+    _insert(warehouse, entity, _row(entity, 'fresh-unknown', **absent))
+    cur, _ = _frozen(warehouse)
+    cur.execute(daily.build_field_metrics_sql(entity, NOW))
+    assert cur.fetchall()[0][:6] == (2, 1, 0, 1, 1, 0)
 
 
 def test_contract_applicability_and_placeholder_zero_execute(warehouse):
