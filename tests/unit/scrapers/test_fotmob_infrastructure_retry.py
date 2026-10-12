@@ -20,9 +20,30 @@ def _responses():
         canonicalize_target("allLeagues").canonical_url: {
             "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]},
         canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
-        canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {
+        canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {"general": {"matchId": 100},
             "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}},
     }
+
+
+def test_1291_new_match_key_keeps_native_wave_green():
+    mod = RunnerHarness._module()
+    responses = _responses()
+    url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    responses[url]["brandNewKey"] = {"nested": False}
+    repository = MemoryFotMobRepository()
+    service = FotMobIngestService(
+        transport=StubTransport(responses), repository=repository,
+        mode=RunMode.DAILY, budget=TransportBudget(100, 10_000_000),
+        run_id="1291-new-key-wave", max_workers=1,
+    )
+    args = mod._argument_parser().parse_args([
+        "--mode", "refresh", "--catalog-contract", "fotmob-catalog-v1",
+        "--entities", "season,matches", "--run-id", service.run_id,
+    ])
+    rc, report = _run_native_admitted(mod, args, service=service)
+    assert rc == 0 and report["complete"] is True, report["errors"]
+    assert repository.tables["fotmob_match_payloads"][0]["payload_json"] == responses[url]
+    assert [c for c in repository.commits if c.target_type == "match"][-1].status == ManifestStatus.SUCCESS
 
 
 @pytest.mark.parametrize("failure_site, failure_kind", [
@@ -73,7 +94,7 @@ def test_write_failure_scope_classification_and_recovery(monkeypatch, failure_si
             another["id"] = 101
             another["pageUrl"] = "/matches/alpha-vs-beta/x#101"
             league["fixtures"]["allMatches"].append(another)
-            responses[canonicalize_target("matchDetails", {"matchId": "101"}).canonical_url] = {
+            responses[canonicalize_target("matchDetails", {"matchId": "101"}).canonical_url] = {"general": {"matchId": 101},
                 "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}}
         if failure_kind == "drift-write":
             responses[canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url] = {
