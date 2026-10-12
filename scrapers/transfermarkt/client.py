@@ -99,6 +99,14 @@ class CurrentPortionDeadlineExceeded(RuntimeError):
     """End a current work portion without treating its tail as a source failure."""
 
 
+class SourceStreamPaused(CurrentPortionDeadlineExceeded):
+    """A known site cooldown defers work; it is not a platform incident."""
+
+    def __init__(self, resume_at_epoch):
+        self.resume_at_epoch = float(resume_at_epoch)
+        super().__init__(f'Transfermarkt stream paused until {self.resume_at_epoch}; retain unfinished work')
+
+
 # #1389: the gateway names the upstream CONNECT outcome (``<code|timeout|
 # dead_exit>``) in this header; an older gateway sends none.
 PROXY_UPSTREAM_STATUS_HEADER = "X-Proxy-Upstream-Status"
@@ -335,6 +343,8 @@ class ProxyFilterLeaseProvider:
             raise ValueError("request_deadline_monotonic must be finite")
         self.request_deadline_monotonic = float(request_deadline_monotonic) if request_deadline_monotonic is not None else None
         self._monotonic = monotonic_fn
+        self._stream_lease = None
+        self._last_permit_request = None
 
     def _admission_timeout(self) -> float:
         if self.request_deadline_monotonic is None:
@@ -430,6 +440,9 @@ class ProxyFilterLeaseProvider:
             "run_id": run_id,
             "request_id": request_key,
         }
+        if self._stream_lease is not None and self._stream_lease.stream_id:
+            payload.update(lease_id=self._stream_lease.lease_id,
+                           lease_token=self._stream_lease.token)
         started = self._time()
         granted: Mapping[str, Any] | None = None
         while granted is None:
@@ -462,10 +475,24 @@ class ProxyFilterLeaseProvider:
                 raise TrafficMeterError(
                     f"request permit API rejected acquisition (HTTP {status})"
                 )
+            pause = body.get('paused_until_epoch', 0)
+            if (self._stream_lease is not None and self._stream_lease.stream_id
+                    and isinstance(pause, (int, float)) and not isinstance(pause, bool)
+                    and math.isfinite(pause) and pause > self._time()):
+                raise SourceStreamPaused(pause)
             elapsed = self._time() - started
+            server_wait = float(body.get('retry_after_seconds', 0.05))
+            if not math.isfinite(server_wait) or server_wait < 0:
+                raise TrafficMeterError('request permit retry deadline is invalid')
+            if (self._stream_lease is not None and self._stream_lease.stream_id
+                    and elapsed + server_wait > float(max_wait_seconds)):
+                # Slow configured streams can have an interval longer than
+                # this caller's poll budget. Preserve work for another portion
+                # instead of misclassifying a known rate wait as an outage.
+                raise SourceStreamPaused(self._time() + server_wait)
             retry_after = max(
                 0.05,
-                min(5.0, float(body.get("retry_after_seconds", 0.05))),
+                min(5.0, server_wait),
             )
             if elapsed + retry_after > float(max_wait_seconds):
                 if self.request_deadline_monotonic is not None:
@@ -492,7 +519,21 @@ class ProxyFilterLeaseProvider:
         )
         if consumed.get("consumed") is not True or consumed.get("permit_id") != permit_id:
             raise TrafficMeterError("request permit was not consumed")
+        self._last_permit_request = {**payload, 'permit_id': permit_id}
         return permit_id
+
+    def report_site_block(self, *, status: int, challenge: bool):
+        if self._stream_lease is None or not self._stream_lease.stream_id:
+            return
+        if self._last_permit_request is None:
+            raise TrafficMeterError('site feedback has no consumed request permit')
+        proof = dict(self._last_permit_request)
+        proof.update(lease_id=self._stream_lease.lease_id,
+                     lease_token=self._stream_lease.token,
+                     status=status, challenge=challenge)
+        body = self._request('POST', '/v1/transfermarkt/request-permits/site-block', payload=proof)
+        if body.get('recorded') is not True:
+            raise TrafficMeterError('site feedback was not durably recorded')
 
     def acquire(
         self,
@@ -516,6 +557,7 @@ class ProxyFilterLeaseProvider:
                 proxy_url=str(body["proxy_url"]),
                 max_bytes=int(body["max_bytes"]),
                 expires_at=float(body["expires_at"]),
+                stream_id=str(body.get('stream_id') or ''),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise TrafficMeterError("proxy lease API response schema mismatch") from exc
@@ -528,6 +570,10 @@ class ProxyFilterLeaseProvider:
             or lease.max_bytes <= 0
         ):
             raise TrafficMeterError("proxy lease API returned an unusable lease")
+        if lease.stream_id:
+            from .streams import browser_profile
+            browser_profile(lease.stream_id)
+        self._stream_lease = lease
         return lease
 
     def stats(self, lease: ProxyLease) -> LeaseTrafficSnapshot:
@@ -872,6 +918,11 @@ class TransfermarktHttpClient:
     # Client/proxy lifecycle
     # ------------------------------------------------------------------
 
+    def _report_site_block(self, status: int, *, challenge: bool):
+        report = getattr(self._lease_provider, 'report_site_block', None)
+        if callable(report):
+            report(status=status, challenge=challenge)
+
     def _new_tls_client(self, proxy_url: str):
         # wrapper-tls-requests 1.2.5 overwrites its per-client uuid with
         # ``session_id=None`` unless one is passed, so every request opened
@@ -879,19 +930,26 @@ class TransfermarktHttpClient:
         # connection alive for the life of the lease; a new client (new
         # exit/lease) gets a new id and ``close()`` destroys exactly it.
         self._session_id = uuid.uuid4().hex
+        headers = dict(DEFAULT_HEADERS)
+        identifier = 'chrome_133'
+        if self._lease is not None and self._lease.stream_id:
+            from .streams import browser_profile
+            identifier, version = browser_profile(self._lease.stream_id)
+            headers['User-Agent'] = headers['User-Agent'].replace('Chrome/133.', f'Chrome/{version}.')
+            headers['Sec-CH-UA'] = headers['Sec-CH-UA'].replace('v="133"', f'v="{version}"')
         if self._client_factory is not None:
             return self._client_factory(
                 proxy=proxy_url,
-                headers=dict(DEFAULT_HEADERS),
-                client_identifier="chrome_133",
+                headers=headers,
+                client_identifier=identifier,
                 session_id=self._session_id,
             )
         import tls_requests
 
         return tls_requests.Client(
             proxy=_tls_requests_compatible_proxy_url(proxy_url),
-            headers=dict(DEFAULT_HEADERS),
-            client_identifier="chrome_133",
+            headers=headers,
+            client_identifier=identifier,
             session_id=self._session_id,
         )
 
@@ -930,6 +988,8 @@ class TransfermarktHttpClient:
                 ttl_seconds=self._lease_ttl_seconds,
                 metadata=metadata,
             )
+            if self._lease.stream_id:
+                self._lease_metadata['stream_id'] = self._lease.stream_id
             if self._lease.max_bytes > min(remaining, SCOPE_HARD_PROVIDER_BYTE_CAP):
                 lease = self._lease
                 self._lease = None
@@ -2230,6 +2290,8 @@ class TransfermarktHttpClient:
                     # source breakage and fails immediately without blaming or
                     # burning the proxy.
                     is_challenge = terminal_status == FetchStatus.BLOCKED
+                    if is_challenge:
+                        self._report_site_block(status_code, challenge=True)
                     retry_allowed = (
                         is_challenge
                         and self._has_alternate_proxy(proxy_obj)
@@ -2268,6 +2330,8 @@ class TransfermarktHttpClient:
                     )
                     break
                 elif status_code in (403, 405, 429):
+                    if status_code in (403, 429):
+                        self._report_site_block(status_code, challenge=False)
                     # 405 is Transfermarkt's block of one exit, not a
                     # method error: the same page answered 405 from one
                     # residential exit and 200 from the next (25.09).

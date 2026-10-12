@@ -948,6 +948,136 @@ class TransfermarktRequestPermitController:
         return observed_at
 
 
+class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
+    """Dedicated TM slots; the shared gateway retains its existing controller."""
+
+    def __init__(self, *, streams, state_path=None, clock=time.time, **kwargs):
+        from scrapers.transfermarkt.streams import StreamRateState
+
+        super().__init__(requests_per_minute=streams.requests_per_minute,
+                         clock=clock, state_path=None, **kwargs)
+        self.streams = streams
+        self.state_path = str(state_path or '')
+        self.stream_state_path = self.state_path + '.streams-v2' if self.state_path else ''
+        self._active_stream = 'current-0'
+        self._feedback = {}
+        self._durable_feedback = set()
+        saved = None
+        legacy = None
+        if self.state_path and os.path.lexists(self.state_path):
+            try:
+                legacy = json.loads(_require_private_regular_file(
+                    self.state_path, allow_empty=False, max_bytes=8192))
+            except (ValueError, RuntimeError):
+                raise RuntimeError('Transfermarkt permit state is corrupt') from None
+        sidecar = None
+        if self.stream_state_path and os.path.lexists(self.stream_state_path):
+            try:
+                sidecar = json.loads(_require_private_regular_file(
+                    self.stream_state_path, allow_empty=False, max_bytes=8192))
+                if not isinstance(sidecar, dict) or set(sidecar) != {'rate', 'rollback_fence'}:
+                    raise ValueError()
+                if not isinstance(sidecar['rate'], dict) or type(sidecar['rate'].get('schema_version')) is not int or sidecar['rate']['schema_version'] != 2:
+                    raise ValueError()
+                StreamRateState._time(sidecar['rollback_fence'])
+                saved = sidecar['rate']
+            except (ValueError, RuntimeError):
+                raise RuntimeError('Transfermarkt stream state is corrupt') from None
+        else:
+            saved = legacy
+        try:
+            self.rate = StreamRateState(streams, clock(), saved)
+            if legacy is not None:
+                # Validate the rollback-compatible file even when a v2 sidecar
+                # exists. A legacy gateway may have granted since rollback;
+                # fold those newer grants into every resumed stream clock.
+                legacy_rate = StreamRateState(streams, 0, legacy)
+                last = max(legacy_rate.last.values())
+                if sidecar is not None and last > sidecar['rollback_fence']:
+                    self.rate.last = {key: max(value, last) for key, value in self.rate.last.items()}
+        except ValueError:
+            raise RuntimeError('Transfermarkt permit state is corrupt') from None
+        self._persist_streams()
+
+    def _persist_streams(self):
+        if self.state_path:
+            try:
+                # The old gateway reads only v1. On rollback it must neither
+                # burst nor bypass a known slowdown/pause: conservatively fence
+                # all traffic until the latest restriction has elapsed.
+                fence = max(*self.rate.last.values(), *self.rate.slow.values(),
+                            *self.rate.pause.values(), self.rate.source_slow)
+                _atomic_private_bytes(self.state_path,
+                    canonical_json_bytes({'schema_version': 1, 'last_granted_at_epoch': fence}) + b'\n',
+                    replace=os.path.isfile(self.state_path))
+                _atomic_private_bytes(self.stream_state_path,
+                    canonical_json_bytes({'rate': self.rate.dump(), 'rollback_fence': fence}) + b'\n',
+                    replace=os.path.isfile(self.stream_state_path))
+            except (OSError, RuntimeError) as exc:
+                raise RuntimeError('Transfermarkt permit state write failed') from exc
+
+    def _binding_key(self, traffic_class, dag_id, run_id, request_id):
+        return traffic_class, dag_id, run_id, request_id, self._active_stream
+
+    def _prune(self, now):
+        super()._prune(now)
+        for source, queue in self._queues.items():
+            self._queues[source] = [key for key in queue if key in self._tickets]
+        live_ids = {value.permit_id for value in self._tickets.values()}
+        self._feedback = {key: value for key, value in self._feedback.items() if key in live_ids}
+        self._durable_feedback.intersection_update(live_ids)
+
+    def _ready_at(self, now):
+        return self.rate.ready_at(self._active_stream, now)
+
+    def _grant_one(self, now):
+        for stream in self.streams.stream_ids:
+            if now < self.rate.ready_at(stream, now):
+                continue
+            source = 'transfermarkt' if stream == 'current-0' else 'transfermarkt_backfill'
+            queue = self._queues[source]
+            key = next((key for key in queue if key[-1] == stream
+                        and key in self._tickets
+                        and self._tickets[key].granted_at is None), None)
+            if key is None:
+                continue
+            self.rate.grant(stream, now)
+            self._persist_streams()
+            self._tickets[key].granted_at = now
+            queue.remove(key)
+
+    def request(self, *, stream_id, **kwargs):
+        if stream_id not in self.streams.ids(kwargs['traffic_class']):
+            raise ValueError('stream does not match traffic class')
+        self._active_stream = stream_id
+        return super().request(**kwargs)
+
+    def consume(self, *, stream_id, **kwargs):
+        if stream_id not in self.streams.ids(kwargs['traffic_class']):
+            raise TransfermarktPermitError('stream does not match traffic class')
+        self._active_stream = stream_id
+        return super().consume(**kwargs)
+
+    def report_block(self, *, stream_id, permit_id, status, challenge):
+        key = next((key for key, value in self._tickets.items()
+                    if value.permit_id == permit_id and key[-1] == stream_id
+                    and value.consumed_at is not None), None)
+        if key is None:
+            raise TransfermarktPermitError('site feedback requires a consumed stream permit')
+        if permit_id in self._durable_feedback:
+            return
+        if permit_id not in self._feedback:
+            self._feedback[permit_id] = self.rate.site_block(stream_id, self._clock(), status=status, challenge=challenge)
+        # An uncertain write may be retried, but the same consumed attempt
+        # cannot be applied as another site block. Acknowledge only durability.
+        self._persist_streams()
+        self._durable_feedback.add(permit_id)
+        # Bound feedback retention by the already bounded ticket lifetime.
+        for event in self._feedback[permit_id]:
+            log.error('%s stream=%s', event, stream_id)
+
+
+TRANSFERMARKT_STREAMS = None
 TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController()
 
 
@@ -1010,6 +1140,7 @@ class Lease:
     entity: str = ""
     canonical_url: str = ""
     source: str = ""
+    stream_id: str = ""
     workload_plan: SignedDagRunPlan | None = field(default=None, repr=False)
     allocation_claim: AllocationClaim | None = field(default=None, repr=False)
     proxy_campaign_approval: ProxyCampaignApproval | None = field(
@@ -1157,6 +1288,7 @@ class Lease:
             "entity": self.entity,
             "canonical_url": self.canonical_url,
             "source": self.source,
+            **({'stream_id': self.stream_id} if self.stream_id else {}),
             "traffic_class": self.source,
             "budget_namespace": _budget_namespace_for_source(self.source),
             "upstream_fingerprint": _upstream_fingerprint(self.upstream),
@@ -1673,6 +1805,39 @@ def _pick_upstream(mgr):
         return selected.host, selected.port, selected.username, selected.password
     u = urlsplit(selected.url)  # Compatibility with the minimal unit-test fake.
     return u.hostname, u.port, u.username, u.password
+
+
+def _tm_lease_occupies_slot(lease):
+    return ((not lease.closed and not lease.expired) or lease.active_tunnels > 0
+            or lease.reserved_bytes > 0 or lease.global_budget_escrow_bytes > 0)
+
+
+def _transfermarkt_stream_for_lease(source, metadata):
+    streams = TRANSFERMARKT_STREAMS.ids(source)
+    requested = str(metadata.get('stream_id') or '').strip()
+    if requested and requested not in streams:
+        raise ValueError('Transfermarkt stream is disabled or belongs to another lane')
+    occupied = {lease.stream_id for lease in LEASES.values()
+                if _tm_lease_occupies_slot(lease)}
+    candidates = (requested,) if requested else streams
+    chosen = next((stream for stream in candidates if stream not in occupied), None)
+    if chosen is None:
+        raise RuntimeError('Transfermarkt reserved stream concurrency limit reached')
+    return chosen
+
+
+def _pick_transfermarkt_upstream(mgr, *, exclude=None):
+    _dead_exit_count()
+    occupied = {_upstream_fingerprint(lease.upstream) for lease in LEASES.values()
+                if lease is not exclude and _tm_lease_occupies_slot(lease)}
+    if exclude is not None:
+        occupied.add(_upstream_fingerprint(exclude.upstream))
+    for _ in range(max(32, int(mgr.total_count) * 2)):
+        candidate = _pick_upstream(mgr)
+        key = _upstream_fingerprint(candidate)
+        if key not in occupied and key not in DEAD_EXITS:
+            return candidate
+    raise RuntimeError('Transfermarkt has no unoccupied live upstream exit')
 
 
 def _utc_day() -> str:
@@ -2401,6 +2566,7 @@ def _append_budget_event_unlocked(event_type: str, lease: Lease, **values: Any) 
         "endpoint_path": lease.current_endpoint_path,
         "request_id": lease.current_request_id,
         "source": lease.source,
+        **({'stream_id': lease.stream_id} if lease.stream_id else {}),
         "traffic_class": lease.source,
         "budget_namespace": _budget_namespace_for_source(lease.source),
         "budget_policy_id": _lease_budget_policy_id(lease),
@@ -3519,12 +3685,15 @@ def _create_lease(
             or item.global_budget_escrow_bytes > 0
         )
     ]
-    if source == "transfermarkt_backfill":
+    stream_id = ''
+    if _transfermarkt_only() and TRANSFERMARKT_STREAMS is not None:
+        stream_id = _transfermarkt_stream_for_lease(source, metadata)
+    if source == "transfermarkt_backfill" and not _transfermarkt_only():
         if any(item.source == "transfermarkt_backfill" for item in active_leases):
             raise RuntimeError(
                 "Transfermarkt backfill paid-proxy concurrency limit reached"
             )
-    elif (
+    elif not _transfermarkt_only() and (
         len([item for item in active_leases if item.source != "transfermarkt_backfill"])
         >= MAX_ACTIVE_LEASES
     ):
@@ -3675,7 +3844,8 @@ def _create_lease(
         lease = Lease(
             lease_id=lease_id,
             token=secrets.token_urlsafe(24),
-            upstream=_pick_upstream(lease_manager),
+            upstream=(_pick_transfermarkt_upstream(lease_manager)
+                      if _transfermarkt_only() else _pick_upstream(lease_manager)),
             created_at=now,
             expires_at=effective_expires_at,
             max_bytes=min(max_bytes, available),
@@ -3689,6 +3859,7 @@ def _create_lease(
             entity=str(metadata.get("entity") or ""),
             canonical_url=canonical_url,
             source=source,
+            stream_id=stream_id,
             workload_plan=workload_plan,
             allocation_claim=allocation_claim,
             proxy_campaign_approval=proxy_campaign_approval,
@@ -5889,7 +6060,24 @@ def _exit_pool_health(mgr) -> dict[str, Any]:
 
 def _transfermarkt_permit_health() -> dict[str, Any]:
     return {
-        "transfermarkt_requests_per_minute": TRANSFERMARKT_REQUESTS_PER_MINUTE,
+        "transfermarkt_requests_per_minute": TRANSFERMARKT_REQUEST_PERMITS.requests_per_minute,
+        **({
+            'transfermarkt_current_streams': TRANSFERMARKT_STREAMS.current_capacity,
+            'transfermarkt_history_streams': TRANSFERMARKT_STREAMS.history_capacity,
+            'transfermarkt_backfill_stream_ids': list(TRANSFERMARKT_STREAMS.ids('transfermarkt_backfill')),
+            'transfermarkt_backfill_requests_per_minute': TRANSFERMARKT_STREAMS.requests_per_minute,
+            'transfermarkt_current_reserved': True,
+            'transfermarkt_rate_state_schema': 2,
+            'transfermarkt_stream_pause_until': TRANSFERMARKT_REQUEST_PERMITS.rate.pause,
+            'transfermarkt_stream_slow_until': TRANSFERMARKT_REQUEST_PERMITS.rate.slow,
+            'transfermarkt_source_slow_until': TRANSFERMARKT_REQUEST_PERMITS.rate.source_slow,
+            'transfermarkt_alerts': ([
+                'transfermarkt_source_rate_halved'
+            ] if TRANSFERMARKT_REQUEST_PERMITS.rate.source_slow > time.time() else []) + [
+                f'transfermarkt_stream_paused:{stream}' for stream, until in
+                TRANSFERMARKT_REQUEST_PERMITS.rate.pause.items() if until > time.time()
+            ],
+        } if isinstance(TRANSFERMARKT_REQUEST_PERMITS, TransfermarktStreamPermitController) else {}),
         "transfermarkt_request_permit_consume_required": True,
         "transfermarkt_request_permit_pending_ttl_seconds": (
             TransfermarktRequestPermitController.PENDING_TTL_SECONDS
@@ -5921,6 +6109,7 @@ def _transfermarkt_only_health_report(mgr) -> dict[str, Any]:
         "transfermarkt_backfill_paid_enabled": (
             bool(TRANSFERMARKT_BACKFILL_CONTROL_TOKEN)
             and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+            and (TRANSFERMARKT_STREAMS is None or TRANSFERMARKT_STREAMS.history_capacity > 0)
         ),
         "transfermarkt_backfill_dag_ids": sorted(TRANSFERMARKT_BACKFILL_DAG_IDS),
         "transfermarkt_backfill_uses_production_daily_budget": False,
@@ -6025,7 +6214,8 @@ async def _handle_control(
 
     permit_path = "/v1/transfermarkt/request-permits"
     consume_permit_path = permit_path + "/consume"
-    if path in {permit_path, consume_permit_path}:
+    block_feedback_path = permit_path + '/site-block'
+    if path in {permit_path, consume_permit_path, block_feedback_path}:
         if method != "POST":
             await _send_json(writer, 404, {"error": "unknown control endpoint"})
             return True
@@ -6052,6 +6242,13 @@ async def _handle_control(
             expected_fields = {"dag_id", "run_id", "request_id"}
             if path == consume_permit_path:
                 expected_fields.update({"permit_id", "permit_token"})
+            streams_enabled = isinstance(TRANSFERMARKT_REQUEST_PERMITS, TransfermarktStreamPermitController)
+            if streams_enabled:
+                expected_fields.update({'lease_id', 'lease_token'})
+            if path == block_feedback_path:
+                if not streams_enabled:
+                    raise ValueError('site feedback is only available in the dedicated TM contour')
+                expected_fields.update({'permit_id', 'status', 'challenge'})
             if not isinstance(request, dict) or frozenset(request) != expected_fields:
                 raise ValueError("request permit fields are invalid")
             dag_id = str(request.get("dag_id") or "").strip()
@@ -6068,6 +6265,15 @@ async def _handle_control(
             if not _control_token_valid(headers, source=traffic_class):
                 await _send_json(writer, 401, {"error": "invalid control token"})
                 return True
+            stream_options = {}
+            if streams_enabled:
+                lease = LEASES.get(str(request.get('lease_id') or ''))
+                if (lease is None or lease.source != traffic_class
+                    or lease.dag_id != dag_id or lease.run_id != run_id
+                    or not secrets.compare_digest(lease.token, str(request.get('lease_token') or ''))
+                    or (path != block_feedback_path and not lease.usable)):
+                    raise TransfermarktPermitError('permit requires its authenticated live lease')
+                stream_options = {'stream_id': lease.stream_id}
             if _transfermarkt_only():
                 # #1387: no budget flags; a configured class is a ready class.
                 source_ready = (
@@ -6076,6 +6282,7 @@ async def _handle_control(
                     else (
                         bool(TRANSFERMARKT_BACKFILL_CONTROL_TOKEN)
                         and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+                        and (TRANSFERMARKT_STREAMS is None or TRANSFERMARKT_STREAMS.history_capacity > 0)
                     )
                 )
             else:
@@ -6091,8 +6298,24 @@ async def _handle_control(
                 raise RuntimeError(
                     "Transfermarkt request permits are unavailable for this source"
                 )
+            if path == block_feedback_path:
+                if type(request['status']) is not int or type(request['challenge']) is not bool:
+                    raise ValueError('invalid site feedback status')
+                key = TRANSFERMARKT_REQUEST_PERMITS._binding_key(
+                    traffic_class, dag_id, run_id, request_id)
+                # Set the stream before computing the exact ticket binding.
+                key = (*key[:4], lease.stream_id)
+                ticket = TRANSFERMARKT_REQUEST_PERMITS._tickets.get(key)
+                if ticket is None or ticket.permit_id != str(request['permit_id']):
+                    raise TransfermarktPermitError('site feedback request binding mismatch')
+                TRANSFERMARKT_REQUEST_PERMITS.report_block(
+                    **stream_options, permit_id=str(request['permit_id']),
+                    status=request['status'], challenge=request['challenge'])
+                await _send_json(writer, 200, {'recorded': True})
+                return True
             if path == consume_permit_path:
                 consumed_at = TRANSFERMARKT_REQUEST_PERMITS.consume(
+                    **stream_options,
                     traffic_class=traffic_class,
                     dag_id=dag_id,
                     run_id=run_id,
@@ -6103,6 +6326,7 @@ async def _handle_control(
                 decision = None
             else:
                 decision = TRANSFERMARKT_REQUEST_PERMITS.request(
+                    **stream_options,
                     traffic_class=traffic_class,
                     dag_id=dag_id,
                     run_id=run_id,
@@ -6156,6 +6380,9 @@ async def _handle_control(
             "expires_at_epoch": decision.expires_at,
             "retry_after_seconds": decision.retry_after_seconds,
         }
+        if streams_enabled:
+            response.update(stream_id=lease.stream_id,
+                paused_until_epoch=TRANSFERMARKT_REQUEST_PERMITS.rate.pause[lease.stream_id])
         if not decision.granted:
             await _send_json(
                 writer,
@@ -6418,6 +6645,7 @@ async def _handle_control(
                 "max_bytes": lease.max_bytes,
                 "expires_at": lease.expires_at,
                 "proxy_url": LEASE_PROXY_URL,
+                **({'stream_id': lease.stream_id} if lease.stream_id else {}),
                 "plan_digest": (
                     lease.workload_plan.plan_digest if lease.workload_plan else ""
                 ),
@@ -6923,11 +7151,14 @@ async def _open_lease_upstream_tunnel(
                 failover_manager = TRANSFERMARKT_BACKFILL_PROXY_MANAGER
             # The pool draw is random: re-draw (bounded) so the replacement is
             # not the exit that just failed, unless the pool has nothing else.
-            candidate = _pick_upstream(failover_manager)
-            for _redraw in range(5):
-                if candidate != previous:
-                    break
+            if _transfermarkt_only():
+                candidate = _pick_transfermarkt_upstream(failover_manager, exclude=lease)
+            else:
                 candidate = _pick_upstream(failover_manager)
+                for _redraw in range(5):
+                    if candidate != previous:
+                        break
+                    candidate = _pick_upstream(failover_manager)
             lease.upstream = candidate
             lease.upstream_repins += 1
             log.warning(
@@ -6957,7 +7188,7 @@ def _mark_exit_dead(
 ) -> None:
     # /health divides by the production pool; the Transfermarkt backfill draws
     # from its own dedicated pool, so its failures must not count here.
-    if lease is not None and lease.source == "transfermarkt_backfill":
+    if lease is not None and lease.source == "transfermarkt_backfill" and not _transfermarkt_only():
         return
     DEAD_EXITS[_upstream_fingerprint(upstream)] = (
         time.monotonic() + DEAD_EXIT_TTL_SECONDS
@@ -7686,6 +7917,7 @@ async def main() -> None:
     global TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
     global TRANSFERMARKT_BACKFILL_PROXY_MANAGER
     global TRANSFERMARKT_PERMIT_STATE_PATH, TRANSFERMARKT_REQUEST_PERMITS
+    global TRANSFERMARKT_STREAMS
     global WHOSCORED_PROXY_APPROVAL_HMAC_SECRET
     global WHOSCORED_PROXY_LEDGER_HMAC_SECRET
     global LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS, LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS
@@ -7808,6 +8040,10 @@ async def main() -> None:
     )
     ap.add_argument("--url-budget-bytes", type=int, default=2_000_000)
     ap.add_argument("--max-active-leases", type=int, default=MAX_ACTIVE_LEASES)
+    ap.add_argument('--transfermarkt-history-streams', type=int,
+                    default=int(os.environ.get('TM_HISTORY_STREAMS', '0')))
+    ap.add_argument('--transfermarkt-requests-per-minute', type=int,
+                    default=int(os.environ.get('TM_REQUESTS_PER_MINUTE', '12')))
     ap.add_argument(
         "--sofascore-max-active-leases",
         type=int,
@@ -8256,18 +8492,26 @@ async def main() -> None:
         TRANSFERMARKT_DAGRUN_BUDGET_BYTES = None
         TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = None
     try:
-        TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController(
-            requests_per_minute=TRANSFERMARKT_REQUESTS_PER_MINUTE,
-            state_path=(
-                TRANSFERMARKT_PERMIT_STATE_PATH
-                if (
-                    transfermarkt_budget_bytes > 0
-                    or transfermarkt_backfill_budget_bytes > 0
-                )
-                else None
-            ),
-        )
-    except RuntimeError as exc:
+        if _transfermarkt_only():
+            from scrapers.transfermarkt.streams import TransfermarktStreams
+
+            TRANSFERMARKT_STREAMS = TransfermarktStreams(
+                history_streams=getattr(args, 'transfermarkt_history_streams', 0),
+                requests_per_minute=getattr(args, 'transfermarkt_requests_per_minute', 12))
+            TRANSFERMARKT_REQUEST_PERMITS = TransfermarktStreamPermitController(
+                streams=TRANSFERMARKT_STREAMS,
+                state_path=TRANSFERMARKT_PERMIT_STATE_PATH)
+        else:
+            TRANSFERMARKT_STREAMS = None
+            if (getattr(args, 'transfermarkt_history_streams', 0) != 0
+                    or getattr(args, 'transfermarkt_requests_per_minute', 12) != 12):
+                raise ValueError('TM parallel streams require the dedicated Transfermarkt gateway')
+            TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController(
+                requests_per_minute=TRANSFERMARKT_REQUESTS_PER_MINUTE,
+                state_path=(TRANSFERMARKT_PERMIT_STATE_PATH if (
+                    transfermarkt_budget_bytes > 0 or transfermarkt_backfill_budget_bytes > 0
+                ) else None))
+    except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from None
     URL_BUDGET_BYTES = (
         None if SOURCE_MODE == TRANSFERMARKT_ONLY_SOURCE_MODE else url_budget_bytes

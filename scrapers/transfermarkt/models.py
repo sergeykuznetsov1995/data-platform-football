@@ -611,6 +611,7 @@ class ProxyLease:
     proxy_url: str
     max_bytes: int
     expires_at: float
+    stream_id: str = ''
 
 
 class SharedTrafficLedger:

@@ -129,6 +129,47 @@ class _ControlResponse:
         return self._payload
 
 
+def test_stream_lease_pins_profile_and_binds_feedback_to_consumed_permit():
+    control = _ControlClient([
+        _ControlResponse(201, dict(id='lease', token='lease-secret', proxy_url='http://gateway:8900',
+                                  max_bytes=1000, expires_at=1000, stream_id='history-0')),
+        _ControlResponse(200, dict(granted=True, permit_id='a' * 64, permit_token='p' * 32)),
+        _ControlResponse(200, dict(consumed=True, permit_id='a' * 64)),
+        _ControlResponse(200, dict(recorded=True)),
+    ])
+    provider = ProxyFilterLeaseProvider('http://gateway:8899', control_client=control,
+                                       control_token=CONTROL_TOKEN)
+    metadata = {**_metadata(), 'canonical_url': 'https://www.transfermarkt.com/x'}
+    lease = provider.acquire(max_bytes=1000, ttl_seconds=60, metadata=metadata)
+    assert lease.stream_id == 'history-0'
+    provider.acquire_request_permit(metadata=metadata, request_id='request')
+    provider.report_site_block(status=403, challenge=False)
+    assert control.calls[-1][2]['json'] == dict(
+        dag_id=metadata['dag_id'], run_id=metadata['run_id'], request_id='request',
+        lease_id='lease', lease_token='lease-secret', permit_id='a' * 64,
+        status=403, challenge=False)
+
+
+@pytest.mark.parametrize('wait,pause,expected', [(900,1000,1000),(120,0,220)])
+def test_known_gateway_site_pause_defers_portion_without_platform_failure(wait,pause,expected):
+    from scrapers.transfermarkt.client import SourceStreamPaused, CurrentPortionDeadlineExceeded
+    control = _ControlClient([
+        _ControlResponse(201, dict(id='lease', token='secret', proxy_url='http://gateway:8900',
+                                  max_bytes=1000, expires_at=2000, stream_id='history-0')),
+        _ControlResponse(429, dict(code='request_permit_pending', granted=False,
+                                  retry_after_seconds=wait, paused_until_epoch=pause)),
+    ])
+    provider = ProxyFilterLeaseProvider('http://gateway:8899', control_client=control,
+        control_token=CONTROL_TOKEN, time_fn=lambda:100, sleep_fn=lambda _:pytest.fail('must not sleep through pause'))
+    provider.acquire(max_bytes=1000, ttl_seconds=60,
+        metadata={**_metadata(), 'canonical_url':'https://www.transfermarkt.com/x'})
+    with pytest.raises(SourceStreamPaused) as error:
+        provider.acquire_request_permit(metadata=_metadata(), request_id='request')
+    assert isinstance(error.value, CurrentPortionDeadlineExceeded)
+    assert error.value.resume_at_epoch == expected
+    assert len(control.calls) == 2
+
+
 class _ControlClient:
     def __init__(self, responses):
         self.responses = list(responses)
