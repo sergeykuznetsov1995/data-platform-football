@@ -43,6 +43,9 @@ def _allow_policy(monkeypatch: pytest.MonkeyPatch) -> None:
 def _health(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "status": "ok",
+        "source_mode": "sofascore-only",
+        "registry_bytes": 1000,
+        "registry_limit_bytes": 60_000_000,
         "sofascore_paid_enabled": True,
         "sofascore_dagrun_budget_bytes": 326_485,
         "sofascore_budget_artifact_id": ARTIFACT_ID,
@@ -363,6 +366,11 @@ def test_gateway_health_requires_paid_mode_positive_budget_and_same_artifact() -
         )
 
 
+def test_gateway_health_refuses_disabled_registry_mode():
+    with pytest.raises(preflight.ReadinessError, match="sofascore-only"):
+        preflight.validate_gateway_health(_health(source_mode="shared-no-whoscored"), artifact_id=ARTIFACT_ID)
+
+
 def test_health_url_rejects_credentials_without_disclosing_them() -> None:
     url = "http://operator:do-not-log@localhost:8899/health"
     with pytest.raises(preflight.ReadinessError) as raised:
@@ -522,3 +530,13 @@ def test_scheduler_job_check_discards_output_and_uses_container_hostname(
     ]
     assert observed["stdout"] is subprocess.DEVNULL
     assert observed["stderr"] is subprocess.DEVNULL
+
+
+@pytest.mark.parametrize("values", [
+    {"registry_bytes": None}, {"registry_bytes": True}, {"registry_bytes": -1},
+    {"registry_bytes": 60_000_000}, {"registry_limit_bytes": None},
+    {"registry_limit_bytes": 61_000_000},
+])
+def test_gateway_health_rejects_missing_invalid_or_exhausted_registry(values):
+    with pytest.raises(preflight.ReadinessError, match="registry|registries"):
+        preflight.validate_gateway_health(_health(**values), artifact_id=ARTIFACT_ID)

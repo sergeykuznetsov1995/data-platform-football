@@ -11089,6 +11089,24 @@ def test_sofascore_1365_size_ceiling_refuses_new_lease_before_provider(shared_mo
     assert not shared_mod.LEASES
 
 
+def test_sofascore_1365_real_cli_accepts_dedicated_mode():
+    import subprocess
+    import sys
+    result = subprocess.run(
+        [sys.executable, "-B", str(_SHARED_SCRIPT_PATH), "--source-mode", "sofascore-only", "--help"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_sofascore_1365_every_lane_starts_dedicated_mode():
+    services = yaml.safe_load(_SOFASCORE_GATEWAY_COMPOSE_PATH.read_text())["services"]
+    for name in ("sofascore_proxy_filter", "sofascore_gw_history", "sofascore_gw_players"):
+        command = services[name]["command"]
+        assert "--source-mode" in command, name
+        assert command[command.index("--source-mode") + 1] == "sofascore-only", name
+
+
 def test_sofascore_1365_control_tail_drain_then_complete_preserves_exact_map(shared_mod):
     manager = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_sofascore_lease(shared_mod, manager)
@@ -11316,3 +11334,69 @@ def test_sofascore_1365_head_timeout_keeps_original_cause(shared_mod):
     assert report["accounting_uncertain_error_type"] == "TimeoutError"
     assert "CONNECT head deadline expired" in report["accounting_uncertain_error"]
     assert "provider poll failed with original detail" in report["accounting_uncertain_error"]
+
+
+@pytest.mark.parametrize("source,dag_id", [("fbref", "dag_ingest_fbref"), ("transfermarkt", "dag_ingest_transfermarkt"), ("whoscored", "dag_ingest_whoscored")])
+def test_sofascore_1365_dedicated_service_rejects_other_sources(shared_mod, source, dag_id):
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    manager = _FakeManager(["http://u:p@pool.invalid:10000"])
+    with pytest.raises(ValueError, match="dedicated SofaScore"):
+        shared_mod._create_lease(manager, max_bytes=1000, ttl_seconds=30,
+            metadata={"source":source, "dag_id":dag_id, "run_id":"r", "task_id":"t", "canonical_url":"https://example.invalid/"}, require_context=True)
+    assert manager.calls == 0
+
+
+def test_sofascore_1365_registry_size_includes_archives_and_generations(shared_mod, tmp_path):
+    for name, count in (("paid_requests.jsonl", 13), ("paid_requests.jsonl.forensics-" + "a"*64 + ".jsonl.gz", 17), ("old.bak", 19), (".registry-test.tmp", 23)):
+        (tmp_path / name).write_bytes(b"x" * count)
+    assert shared_mod._sofascore_registry_bytes() == 72
+
+
+def test_sofascore_1365_real_startup_recovers_before_both_compactions(shared_mod, monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(shared_mod, "_restore_budget_ledger", lambda *a, **k: calls.append("restore") or 0)
+    monkeypatch.setattr(shared_mod, "_recover_allocation_wal", lambda: calls.append("recover") or 0)
+    monkeypatch.setattr(shared_mod, "_compact_sofascore_registry", lambda path, kind: calls.append(kind))
+    monkeypatch.setattr(shared_mod, "_compact_allocation_wal", lambda *a: pytest.fail("legacy startup compaction"))
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path,
+        extra_argv=("--source-mode", "sofascore-only", "--sofascore-allocation-wal", str(tmp_path / "wal.jsonl")))
+    assert shared_mod.SOURCE_MODE == "sofascore-only"
+    assert calls == ["restore", "recover", "wal", "paid"]
+
+
+def test_sofascore_1365_periodic_dump_runs_real_registry_rotations(shared_mod, monkeypatch, tmp_path):
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    calls = []
+    ticks = iter([0, shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1, shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1])
+    monkeypatch.setattr(shared_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    sleeps = 0
+    async def sleep(_interval):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(shared_mod.asyncio, "sleep", sleep)
+    for name in ("_reap_expired_leases", "_dump", "_repair_paid_ledger_append", "_repair_allocation_wal_append", "_flush_ledgers", "_repair_failed_claim_creations"):
+        monkeypatch.setattr(shared_mod, name, lambda *a, **k: None)
+    monkeypatch.setattr(shared_mod, "_compact_sofascore_registry", lambda path, kind: calls.append((path, kind)))
+    async def direct(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(shared_mod.asyncio, "to_thread", direct)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(shared_mod._periodic_dump(str(tmp_path / "bytes.json")))
+    assert calls == [(shared_mod.LEDGER_PATH, "paid"), (shared_mod.SOFASCORE_ALLOCATION_WAL_PATH, "wal")]
+
+
+def test_sofascore_1365_real_cli_rejects_anonymous_paid_path(shared_mod, monkeypatch):
+    monkeypatch.setattr(shared_mod.sys, "argv", ["filter_proxy.py", "--source-mode", "sofascore-only", "--allow-legacy-noauth"])
+    with pytest.raises(SystemExit, match="forbidden.*sofascore-only"):
+        asyncio.run(shared_mod.main())
+
+
+def test_sofascore_1365_real_startup_rejects_missing_forensic_snapshot(shared_mod, monkeypatch, tmp_path):
+    path = tmp_path / "paid_requests.jsonl"
+    digest = "a" * 64
+    path.write_text(json.dumps({"event_type":"forensic_checkpoint", "schema_version":1, "source":"sofascore", "archive":f"paid_requests.jsonl.forensics-{digest}.jsonl.gz", "sha256":digest, "events_count":1, "uncompressed_bytes":100}) + "\n")
+    monkeypatch.setattr(shared_mod, "_recover_allocation_wal", lambda: pytest.fail("must fail before recovery and listeners"))
+    with pytest.raises(RuntimeError, match="missing SofaScore forensic snapshot"):
+        _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path, extra_argv=("--source-mode", "sofascore-only"))
