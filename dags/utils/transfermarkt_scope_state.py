@@ -284,12 +284,48 @@ class ScopeManifest:
         # #1392: a cup / national-team scope states both participant proofs
         # (tmapi + /teilnehmer/) and every scope whether it holds squad rows.
         participants = {'participant_evidence', 'has_squad_rows'}
-        optional = coverage | provenance | participants
+        optional = coverage | provenance | participants | {'historical_career_receipts'}
         if not isinstance(value, Mapping):
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
         present = set(value)
         if not required <= present or present - required - optional:
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
+        if 'historical_career_receipts' in present:
+            receipts = value['historical_career_receipts']
+            if not isinstance(receipts, Mapping) or not set(receipts) <= {'market_value_points', 'transfer_events'}:
+                raise ScopeManifestError('historical career receipts have invalid entities')
+            for items in receipts.values():
+                if not isinstance(items, list) or not items:
+                    raise ScopeManifestError('historical career receipt list is empty')
+                for item in items:
+                    if not isinstance(item, Mapping) or set(item) != {'snapshot_id', 'player_ids', 'row_count', 'key_hash', 'cycle_id', 'scope_id', 'result_sha256', 'physical_refs', 'capture_unit_id', 'native_batch_id', 'empty_capture_refs'}:
+                        raise ScopeManifestError('historical career receipt field set is invalid')
+                    if item['cycle_id'] != self.child_cycle_id or item['scope_id'] != self.scope_id:
+                        raise ScopeManifestError('historical career receipt capture identity drift')
+                    ids = item['player_ids']
+                    if not isinstance(ids, list) or len(set(ids)) != len(ids) or any(not isinstance(pid, str) or not pid for pid in ids):
+                        raise ScopeManifestError('historical career receipt player ids are invalid')
+                    if type(item['row_count']) is not int or item['row_count'] < 0:
+                        raise ScopeManifestError('historical career receipt row count is invalid')
+                    if item['row_count'] and (type(item['snapshot_id']) is not int or item['snapshot_id'] <= 0 or not ids):
+                        raise ScopeManifestError('historical career receipt snapshot is invalid')
+                    refs = item['physical_refs']
+                    if (not isinstance(refs, list) or not refs or any(
+                            not isinstance(ref, list) or len(ref) != 3
+                            or not isinstance(ref[0], str) or not ref[0]
+                            or not isinstance(ref[1], str) or not ref[1]
+                            or type(ref[2]) is not int or ref[2] < 0 for ref in refs)
+                            or [ref[0] for ref in refs] != ids
+                            or sum(ref[2] for ref in refs) != item['row_count']):
+                        raise ScopeManifestError('historical original physical refs drifted')
+                    if not isinstance(item['native_batch_id'], str) or not item['native_batch_id']:
+                        raise ScopeManifestError('historical capture unit batch is invalid')
+                    if not isinstance(item['empty_capture_refs'], list) or {ref[0] for ref in refs if ref[2] == 0} != {
+                            str(proof.get('player_id', '')) for proof in item['empty_capture_refs'] if isinstance(proof, Mapping)}:
+                        raise ScopeManifestError('historical zero career lacks original typed proof')
+                    for key in ('key_hash', 'result_sha256', 'capture_unit_id'):
+                        if not re.fullmatch(r'[0-9a-f]{64}', str(item[key])):
+                            raise ScopeManifestError('historical career receipt hash is invalid')
         stated = present & coverage
         if stated:
             if stated != coverage:

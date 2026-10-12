@@ -195,13 +195,15 @@ def verify_manifest_entity_fingerprints(
             table = bronze_dq.ENTITY_BRONZE_TABLES.get(entity)
             if table is None or table not in pins:
                 raise BackfillDqError(f'{entity}: pinned Bronze table is absent')
-            cur.execute(build_manifest_entity_rows_sql(
-                entity,
-                snapshot_id=int(pins[table]),
-                child_cycle_id=child_cycle_id,
-                scope_id=scope_id,
-            ))
-            count, digest = _fingerprint_rows(list(cur.fetchall()))
+            receipts = getattr(manifest, 'dq_evidence', {}).get('historical_career_receipts', {}).get(entity)
+            if receipts:
+                rows = historical_career_rows(cur, entity, receipts)
+            else:
+                cur.execute(build_manifest_entity_rows_sql(
+                    entity, snapshot_id=int(pins[table]),
+                    child_cycle_id=child_cycle_id, scope_id=scope_id))
+                rows = list(cur.fetchall())
+            count, digest = _fingerprint_rows(rows)
             if (
                 count != int(evidence.dedup_rows)
                 or digest != str(evidence.key_hash)
@@ -217,6 +219,105 @@ def verify_manifest_entity_fingerprints(
     }
 
 
+def _historical_physical_refs(receipt):
+    refs = receipt.get('physical_refs')
+    if not isinstance(refs, list) or not refs or any(
+        not isinstance(ref, (list, tuple)) or len(ref) != 3
+        or not isinstance(ref[0], str) or not ref[0]
+        or not isinstance(ref[1], str) or not ref[1]
+        or type(ref[2]) is not int or ref[2] < 0 for ref in refs
+    ):
+        raise BackfillDqError('historical career physical refs are invalid')
+    if len({ref[0] for ref in refs}) != len(refs) or [ref[0] for ref in refs] != receipt.get('player_ids'):
+        raise BackfillDqError('historical career physical player identity drifted')
+    if sum(ref[2] for ref in refs) != receipt['row_count']:
+        raise BackfillDqError('historical career physical row counts drifted')
+    return refs
+
+
+def historical_career_sql(entity, receipt, *, lineage=False):
+    if entity not in {'market_value_points', 'transfer_events'}:
+        raise BackfillDqError('historical receipt must reference a native player career')
+    snapshot = receipt.get('snapshot_id')
+    if type(snapshot) is not int or snapshot <= 0:
+        raise BackfillDqError('historical career snapshot must be positive')
+    refs = _historical_physical_refs(receipt)
+    columns = 'raw_capture_id, source_body_hash, scope_id, cycle_id, player_id, _batch_id' if lineage else ', '.join(ENTITY_FINGERPRINT_COLUMNS[entity])
+    return (f"SELECT {columns} FROM {bronze_dq.ENTITY_BRONZE_TABLES[entity]} FOR VERSION AS OF {snapshot} "
+            "WHERE " + ' OR '.join(f"(player_id = {_quoted(pid)} AND _batch_id = {_quoted(batch)})"
+                                   for pid, batch, _ in refs))
+
+
+def historical_career_rows(cur, entity, receipts):
+    """Verify each original snapshot, then choose each player's last full career."""
+    by_player = {}
+    for receipt in receipts:
+        refs = _historical_physical_refs(receipt)
+        if receipt['row_count'] == 0:
+            rows = []
+        else:
+            cur.execute(historical_career_sql(entity, receipt))
+            rows = list(cur.fetchall())
+        count, digest = _fingerprint_rows(rows)
+        if count != receipt['row_count'] or digest != receipt['key_hash']:
+            raise BackfillDqError('original historical career count/hash drifted')
+        grouped = {pid: [] for pid in receipt['player_ids']}
+        for row in rows:
+            pid = str(row[0])
+            if pid not in grouped:
+                raise BackfillDqError('historical career snapshot contains another player')
+            grouped[pid].append(row)
+        if any(len(grouped[pid]) != expected for pid, _, expected in refs):
+            raise BackfillDqError('historical original player career count drifted')
+        by_player.update(grouped)
+    return [row for rows in by_player.values() for row in rows]
+
+
+def _verify_original_empty_careers(raw_store, entity, receipt):
+    """An absent original table is valid only with exact typed empty raw proof."""
+    from datetime import timezone
+    from scrapers.transfermarkt.client import _payload_hash
+    empty_ids = {ref[0] for ref in _historical_physical_refs(receipt) if ref[2] == 0}
+    proofs = receipt.get('empty_capture_refs', [])
+    if not isinstance(proofs, list) or len(proofs) != len(empty_ids) or {
+            str(proof.get('player_id', '')) for proof in proofs if isinstance(proof, Mapping)} != empty_ids:
+        raise BackfillDqError('original empty career inventory drifted')
+    for proof in proofs:
+        if proof.get('status') != 'authoritative_empty' or proof.get('expected_rows') != 0:
+            raise BackfillDqError('original empty career lacks typed complete outcome')
+        stamp = datetime.fromisoformat(str(proof['captured_at']).replace('Z', '+00:00'))
+        if stamp.tzinfo is None or len(str(proof.get('intent_sha256', ''))) != 64:
+            raise BackfillDqError('original empty career clock/intent is invalid')
+        verified = False
+        for source in [*proof.get('raw_attempts', []), *proof.get('cache_sources', [])]:
+            capture_id = source.get('capture_id')
+            if not capture_id or str(source.get('url', '')).rstrip('/').rsplit('/', 1)[-1] != proof['player_id']:
+                continue
+            if source.get('envelope_id'):
+                envelope = raw_store.load_attempt_envelope(source['envelope_id'])
+                if envelope.capture_id != capture_id or envelope.outcome_kind != 'response':
+                    raise BackfillDqError('original empty career envelope drifted')
+            body, capture = raw_store.load_capture(capture_id)
+            if capture.status_code != 200:
+                continue
+            captured_at = datetime.fromisoformat(capture.fetched_at.replace('Z', '+00:00'))
+            if captured_at.astimezone(timezone.utc) != stamp.astimezone(timezone.utc):
+                continue
+            try:
+                payload = json.loads(body.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Earlier paid retries are evidence too. A failed response
+                # never proves empty, but must not hide the verified outcome.
+                continue
+            field = 'list' if entity == 'market_value_points' else 'transfers'
+            if (isinstance(payload, dict) and payload.get(field) == []
+                    and _payload_hash(payload) == proof.get('payload_hash')
+                    and captured_at.astimezone(timezone.utc) == stamp.astimezone(timezone.utc)):
+                verified = True
+        if not verified:
+            raise BackfillDqError('original typed empty career raw cannot be verified')
+
+
 def verify_raw_lineage(
     cur: Any,
     *,
@@ -226,6 +327,7 @@ def verify_raw_lineage(
     attempt_envelopes: Sequence[Any],
     manifest_scope_cycles: Sequence[Sequence[str]],
     scope_statuses: Mapping[str, str],
+    manifests: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Resolve every newly written Bronze capture to exact immutable bytes."""
 
@@ -252,6 +354,7 @@ def verify_raw_lineage(
         (str(item[0]), str(item[1])) for item in manifest_scope_cycles
     }
     rows_by_table: dict[str, int] = {}
+    cached_origins = {}
     for table in BACKFILL_ENTITY_TABLES:
         snapshot = pins.get(table)
         if snapshot is None:
@@ -262,6 +365,28 @@ def verify_raw_lineage(
             child_cycle_ids=child_cycle_ids,
         ))
         rows = list(cur.fetchall())
+        for manifest in manifests:
+            for entity, receipts in getattr(manifest, 'dq_evidence', {}).get('historical_career_receipts', {}).items():
+                if bronze_dq.ENTITY_BRONZE_TABLES[entity] != table:
+                    continue
+                for receipt in receipts:
+                    _verify_original_empty_careers(raw_store, entity, receipt)
+                    if receipt['row_count']:
+                        cur.execute(historical_career_sql(entity, receipt, lineage=True))
+                        original_rows = list(cur.fetchall())
+                        for row in original_rows:
+                            if len(row) != 6:
+                                raise BackfillDqError('original career lineage lacks physical player/batch identity')
+                            capture_id, body_hash, original_scope, original_cycle, player_id, physical_batch = row
+                            # A fresh capture must still belong to the exact paid
+                            # attempt inventory. Only existing physical cache can
+                            # rely on its original retained snapshot/raw proof.
+                            if capture_id not in allowed and receipt.get('native_batch_id') and physical_batch != receipt['native_batch_id']:
+                                origin = (str(original_scope), str(original_cycle))
+                                if capture_id in cached_origins and cached_origins[capture_id] != origin:
+                                    raise BackfillDqError('cached career capture ownership drifted')
+                                cached_origins[capture_id] = origin
+                        rows.extend(row[:4] for row in original_rows)
         rows_by_table[table] = len(rows)
         for row in rows:
             if len(row) != 4:
@@ -272,11 +397,12 @@ def verify_raw_lineage(
             cycle_id = str(row[3] or '').strip()
             if len(capture_id) != 64 or len(body_hash) != 64:
                 raise BackfillDqError(f'{table}: incomplete raw lineage')
-            if allowed.get(capture_id) != (scope_id, cycle_id):
+            cached = cached_origins.get(capture_id) == (scope_id, cycle_id)
+            if allowed.get(capture_id) != (scope_id, cycle_id) and not cached:
                 raise BackfillDqError(
                     f'{table}: Bronze capture is outside exact attempt evidence'
                 )
-            if (scope_id, cycle_id) not in manifested:
+            if (scope_id, cycle_id) not in manifested and not cached:
                 # A source attempt may have committed earlier entities before
                 # a later endpoint failed.  The batch may close with that scope
                 # retryable, provided every partial row is exact raw-backed;
@@ -308,6 +434,10 @@ def verify_raw_lineage(
             raise BackfillDqError(
                 f'raw capture hash differs from Bronze: {capture_id}'
             )
+        if capture_id in cached_origins and cached_origins[capture_id] != (
+            str(getattr(record, 'scope_id', '')), str(getattr(record, 'cycle_id', ''))
+        ):
+            raise BackfillDqError('cached career raw capture ownership differs from original snapshot')
     rendered_partial: list[dict[str, Any]] = []
     for (scope_id, cycle_id, table), capture_ids in sorted(
         partial_inventory.items()
@@ -372,6 +502,12 @@ def run_backfill_batch_dq(
     """Run existing scope-set DQ and the additional raw-lineage gate."""
 
     snapshots = dict(pins or pin_iceberg_snapshots(cur))
+    fingerprints = verify_manifest_entity_fingerprints(cur, pins=snapshots, manifests=manifests)
+    historical_presence = {
+        (str(manifest.scope_id), str(evidence.entity)): int(evidence.dedup_rows)
+        for manifest in manifests for evidence in manifest.entities
+        if str(evidence.entity) in getattr(manifest, 'dq_evidence', {}).get('historical_career_receipts', {})
+    }
     results = bronze_dq.run_bronze_dq(
         cur,
         registry_snapshot_id=registry_snapshot_id,
@@ -379,13 +515,9 @@ def run_backfill_batch_dq(
         zone='scope_set',
         manifests=manifests,
         scope_bindings=scope_bindings,
+        **({'historical_presence': historical_presence} if historical_presence else {}),
     )
     errors = [item for item in results if item.severity == 'ERROR' and not item.passed]
-    fingerprints = verify_manifest_entity_fingerprints(
-        cur,
-        pins=snapshots,
-        manifests=manifests,
-    )
     lineage = verify_raw_lineage(
         cur,
         pins=snapshots,
@@ -397,6 +529,7 @@ def run_backfill_batch_dq(
             for item in manifests
         ),
         scope_statuses=scope_statuses,
+        manifests=manifests,
     ) if child_cycle_ids else {
         'capture_count': 0,
         'capture_set_hash': stable_hash([]),

@@ -126,8 +126,9 @@ def test_airflow_compose_pins_the_contour_shape() -> None:
         assert targets[target].startswith("${TRANSFERMARKT_RELEASE_ROOT:?"), target
     assert scheduler["networks"] == ["transfermarkt-net", "dp-storage"]
     init = cfg["services"]["airflow-init"]["command"][-1]
-    for pool in ("ingest_scraper_pool", "transfermarkt_proxy", "transfermarkt_backfill_proxy", "transfermarkt_backfill_control"):
-        assert f"airflow pools set '{pool}' 1 " in init, pool
+    assert "python -m scrapers.transfermarkt.airflow_pools --apply" in init
+    assert "ingest_scraper_pool" not in init
+    assert env["TM_HISTORY_STREAMS"] == "${TM_HISTORY_STREAMS:-0}"
     web = cfg["services"]["airflow-webserver"]
     assert web["profiles"] == ["ui"] and web["ports"] == ["127.0.0.1:8084:8080"]
     assert cfg["volumes"]["tm_airflow_pgdata"]["name"] == "transfermarkt_airflow_pgdata"
@@ -196,8 +197,7 @@ def test_deploy_script_order_and_pool_handling() -> None:
         'TRANSFERMARKT_PROXY_POOL_JSON="$(cat "$TRANSFERMARKT_PROXY_POOL_FILE")"',
         'up -d --no-deps --force-recreate "$GW"',
         "up -d --no-deps --force-recreate airflow-scheduler",
-        "set_pool ingest_scraper_pool 1",
-        "set_pool transfermarkt_proxy 1",
+        "scrapers.transfermarkt.airflow_pools --apply",
         "last_parsed_time > TIMESTAMPTZ '$STARTED'",
         '["$INGEST"]=f ["$DISCOVER"]=f ["$BACKFILL"]=t ["$SILVER"]=t',
         'set_pause "$d" "$want"',

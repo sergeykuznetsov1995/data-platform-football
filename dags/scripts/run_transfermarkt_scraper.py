@@ -20,6 +20,7 @@ import json
 import logging
 import numbers
 import os
+from functools import wraps
 import re
 import sys
 import uuid
@@ -1548,6 +1549,9 @@ def _select_player_ids(
         'selected': len(selected),
         'pending': pending,
     }
+    from scrapers.transfermarkt.history_portion import enabled as history_enabled
+    if refresh_mode == 'historical' and history_enabled():
+        coverage.update(roster_ids=list(roster), remaining_ids=list(candidates[len(selected):]))
     logger.info(
         'Refresh selection endpoint=%s mode=%s roster=%d selected=%d '
         'cache_hits=%d pending=%d',
@@ -2396,7 +2400,7 @@ def _apply_career_window(scraper, spec, selected, results):
         or attempted != selected[:len(attempted)]
         or attempted + deferred != selected
         or window.get('stop_reason') not in {
-            'window_complete', 'decoded_body_soft_stop',
+            'window_complete', 'decoded_body_soft_stop', 'portion_boundary',
         }
     ):
         raise RuntimeError('career window evidence differs from selected roster')
@@ -2405,9 +2409,12 @@ def _apply_career_window(scraper, spec, selected, results):
         'requested': len(selected), 'attempted': len(attempted),
         'deferred': len(deferred), 'stop_reason': window['stop_reason'],
         'decoded_body_soft_stop_bytes': window['decoded_body_soft_stop_bytes'],
+        'attempted_ids': list(attempted), 'deferred_ids': list(deferred),
     }
     coverage = results.get('roster_coverage')
     if isinstance(coverage, dict):
+        if 'remaining_ids' in coverage:
+            coverage['remaining_ids'] = list(deferred) + coverage['remaining_ids']
         coverage.update(
             selected=len(attempted),
             pending=coverage['pending'] + len(deferred),
@@ -3624,7 +3631,7 @@ def _mark_failure(
     results['failure_kind'] = kind
 
 
-def _run_entity(
+def _run_entity_unbounded(
     spec: EntitySpec,
     leagues: List[str],
     season: int,
@@ -3679,6 +3686,11 @@ def _run_entity(
         scope_id=os.environ.get('TM_SCOPE_ID'),
         cycle_ledger_key=cycle_ledger_key,
     )
+    from scrapers.transfermarkt.history_portion import enabled as history_enabled
+    if history_enabled():
+        cycle_ledger_key = f"{cycle_ledger_key}:{os.environ['TM_HISTORY_PORTION_ID']}"
+        results['history_grant_cycle_id'] = cycle_ledger_key
+        os.environ['TM_CYCLE_LEDGER_KEY'] = cycle_ledger_key
     cycle_budget = None
     exit_code = 1
     scraper = None
@@ -3733,6 +3745,12 @@ def _run_entity(
             os.environ[PROVIDER_GRANT_ENV_VAR] = str(effective_bytes)
             results['provider_byte_grant'] = effective_bytes
             results['cycle_budget'] = dict(cycle_budget)
+            if history_enabled():
+                os.environ['TM_HISTORY_GRANT_JSON'] = json.dumps({
+                    'ledger_path': cycle_budget['path'], 'reservation_id': cycle_budget['reservation_id'],
+                    'cycle_ledger_key': cycle_ledger_key, 'entity': spec.name,
+                    'limit_bytes': cycle_budget['limit_bytes'], 'reserved_bytes': effective_bytes,
+                }, sort_keys=True)
         response_cache, cache_path, cache_ttl = _load_response_cache()
         # #1025: set by run_transfermarkt_scope_cycle for the entities that
         # follow players once the participant listing proved authoritatively
@@ -3899,7 +3917,7 @@ def _run_entity(
                 failure_phase = 'source'
                 if (
                     spec.state_endpoint and selected
-                    and refresh_mode == 'current'
+                    and (refresh_mode == 'current' or (refresh_mode == 'historical' and os.environ.get('TM_HISTORY_DEADLINE_AT')))
                 ):
                     decoded_cap = int(float(os.environ.get(
                         'TM_DECODED_BODY_BUDGET_MB',
@@ -4387,6 +4405,10 @@ def _run_entity(
         _mark_failure(results, stage='platform', kind='dq_write_guard')
         exit_code = 3
     except Exception as exc:  # noqa: BLE001
+        from scrapers.transfermarkt.history_portion import HistoryContinuation, enabled as history_enabled
+        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+        if history_enabled() and (isinstance(exc, (HistoryContinuation, CurrentPortionDeadlineExceeded)) or str(exc) == 'historical portion boundary reached'):
+            results['continuation'] = True
         safe_error = _redact_sensitive(exc)
         logger.error(
             '%s scrape failed hard: %s: %s',
@@ -4597,6 +4619,13 @@ def _run_entity(
             persist_traffic=not dry_run,
         )
     return exit_code
+
+
+@wraps(_run_entity_unbounded)
+def _run_entity(*args, **kwargs):
+    from scrapers.transfermarkt.history_portion import bounded_trino
+    with bounded_trino():
+        return _run_entity_unbounded(*args, **kwargs)
 
 
 def _parse_output_path(argv: Sequence[str]) -> str:

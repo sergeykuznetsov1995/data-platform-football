@@ -162,7 +162,7 @@ def has_matching_scope_attempt_result(
         "child_cycle_id": str(child_cycle_id),
         "scope_id": str(scope_id),
     }
-    if status.get("status") not in {"complete", "failed"}:
+    if status.get("status") not in {"complete", "failed", "continuation"}:
         return False
     return all(str(status.get(key) or "") == value for key, value in expected.items())
 
@@ -338,6 +338,14 @@ def collect_scope_attempt_evidence(
 
     checkpoint = base / "scope-cycle-checkpoint.json"
     checkpoint_path = str(checkpoint) if checkpoint.is_file() else None
+    if status_value is not None and status_value.get('status') == 'continuation':
+        if checkpoint_path is None:
+            raise BackfillAttemptEvidenceError('continuation lacks a durable checkpoint')
+        return ClassifiedScopeAttempt(
+            outcome=AttemptOutcome.CONTINUATION, raw_evidence_ids=unique_ids,
+            error_class=None, error_message=None, retry_after_seconds=None,
+            manifest_path=None, checkpoint_path=checkpoint_path, observed_at=observed_at,
+        )
     manifest_is_current = manifest.is_file() and (
         not backfill_context
         or (status_value is not None and status_value.get("status") == "complete")

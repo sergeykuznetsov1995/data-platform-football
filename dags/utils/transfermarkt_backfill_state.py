@@ -38,7 +38,7 @@ BATCH_TABLE = "iceberg.ops.transfermarkt_backfill_batch_v1"
 
 LEASE_GRACE = timedelta(minutes=15)
 STALE_LEASE_AFTER = timedelta(
-    seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS
+    minutes=45
 ) + LEASE_GRACE
 
 FIRST_SOURCE_RETRY_DELAY = timedelta(hours=1)
@@ -75,6 +75,7 @@ class ScopeStatus(str, Enum):
 
 class AttemptOutcome(str, Enum):
     CAPTURED = "captured"
+    CONTINUATION = "continuation"
     UNAVAILABLE_CONFIRMATION = "unavailable_confirmation"
     SOURCE_ERROR = "source_error"
     PLATFORM_ERROR = "platform_error"
@@ -745,7 +746,7 @@ class BackfillAttempt:
             source_observed = _utc_datetime(
                 "source_observed_at", source_observed
             )
-        if outcome is not AttemptOutcome.PLATFORM_ERROR and source_observed is None:
+        if outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION} and source_observed is None:
             raise BackfillStateError(
                 "source attempt requires immutable source_observed_at"
             )
@@ -776,7 +777,7 @@ class BackfillAttempt:
         object.__setattr__(self, "checkpoint_sha256", checkpoint_hash)
         object.__setattr__(self, "scope_manifest_uri", manifest_uri)
         object.__setattr__(self, "scope_manifest_sha256", manifest_hash)
-        if outcome is not AttemptOutcome.PLATFORM_ERROR and not evidence:
+        if outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION} and not evidence:
             raise BackfillStateError(
                 "source attempt outcome requires raw evidence IDs"
             )
@@ -1721,7 +1722,7 @@ def apply_attempt(
     if attempt.claim_generation != scope.claim_generation:
         raise BackfillStateError("attempt belongs to another claim generation")
     if (
-        attempt.outcome is not AttemptOutcome.PLATFORM_ERROR
+        attempt.outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION}
         and scope.source_attempt_count >= MAX_SOURCE_ATTEMPTS
     ):
         raise BackfillStateError("scope source-attempt limit is exhausted")
@@ -1748,6 +1749,10 @@ def apply_attempt(
         "updated_at": attempt.finished_at,
         "revision": scope.revision + 1,
     }
+    if attempt.outcome is AttemptOutcome.CONTINUATION:
+        return replace(scope, **common, status=ScopeStatus.RETRYABLE_ERROR,
+                       next_retry_at=attempt.finished_at, last_error_class=None,
+                       last_error_message=None)
     if attempt.outcome is AttemptOutcome.CAPTURED:
         return replace(
             scope,
@@ -2019,7 +2024,7 @@ def verify_completion_evidence(
             )
         source_attempts = [
             item for item in linked
-            if item.outcome is not AttemptOutcome.PLATFORM_ERROR
+            if item.outcome not in {AttemptOutcome.PLATFORM_ERROR, AttemptOutcome.CONTINUATION}
         ]
         source_errors = [
             item for item in linked

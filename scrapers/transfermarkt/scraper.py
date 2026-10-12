@@ -1516,6 +1516,10 @@ class TransfermarktScraper(BaseScraper):
         resume_squad_cache = kwargs.pop('resume_squad_cache', False)
         cache_ttl_seconds = kwargs.pop('cache_ttl_seconds', None)
         request_deadline_monotonic = kwargs.pop('request_deadline_monotonic', None)
+        from .history_portion import enabled as history_enabled, request_deadline
+        if history_enabled():
+            history_deadline = request_deadline()
+            request_deadline_monotonic = min(request_deadline_monotonic, history_deadline) if request_deadline_monotonic is not None else history_deadline
         self._cache_generation_by_url = dict(kwargs.pop('cache_generation_by_url', {}) or {})
         canonical_season_override = kwargs.pop('canonical_season', None)
         retry_budget_raw = kwargs.pop(
@@ -3394,6 +3398,14 @@ class TransfermarktScraper(BaseScraper):
         successes = 0
         required_successes = int(math.ceil(_MIN_SUCCESS_RATIO * len(selected_ids)))
         for idx, pid in enumerate(selected_ids, start=1):
+            from .history_portion import enabled as history_enabled, career_admitted
+            if decoded_body_soft_stop_bytes is not None and history_enabled() and not career_admitted(self._http_client):
+                window['stop_reason'] = 'portion_boundary'
+                if not window['attempted_ids']:
+                    from .history_portion import HistoryContinuation
+                    raise HistoryContinuation('no room for another complete career')
+                required_successes = int(math.ceil(_MIN_SUCCESS_RATIO * len(window['attempted_ids'])))
+                break
             if decoded_body_soft_stop_bytes is not None:
                 decoded = self._http_client.get_traffic_stats().get(
                     'decoded_response_body_bytes',

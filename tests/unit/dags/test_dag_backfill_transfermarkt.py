@@ -24,7 +24,11 @@ def _reload():
 
 
 @pytest.fixture
-def module():
+def module(monkeypatch):
+    monkeypatch.setenv('TM_HISTORY_STREAMS', '1')
+    from contextlib import nullcontext
+    from scrapers.transfermarkt import history_portion
+    monkeypatch.setattr(history_portion, 'bounded_trino', nullcontext)
     return _reload()
 
 
@@ -44,6 +48,7 @@ def test_dag_is_continuous_single_run_and_has_no_scope_selectors(module):
     assert module.dag.dag_id == "dag_backfill_transfermarkt"
     assert module.dag.schedule == "@continuous"
     assert module.dag._dag_kwargs["max_active_runs"] == 1
+    assert module.dag._dag_kwargs['dagrun_timeout'].total_seconds() == 2700
     assert module.dag._dag_kwargs["catchup"] is False
     params = module.dag._dag_kwargs["params"]
     assert set(params) == {"max_batch", "resume_platform_block"}
@@ -531,3 +536,16 @@ def test_cooldown_leaf_preserves_upstream_failure(module):
     )
     with pytest.raises(module.AirflowException, match="upstream task failure"):
         module._backfill_poll_ready(ti=_Ti(), dag_run=dag_run)
+
+
+def test_history_uses_the_registered_timetable_class(monkeypatch):
+    from dags.utils import transfermarkt_current_timetable as registered
+
+    class RegisteredTimetable:
+        pass
+
+    # The source plugin registers the dags.utils class. A second import via
+    # utils creates another class identity that real Airflow cannot serialize.
+    monkeypatch.setattr(registered, 'TransfermarktCurrentTimetable', RegisteredTimetable)
+    module = _reload()
+    assert isinstance(module.dag.schedule, RegisteredTimetable)

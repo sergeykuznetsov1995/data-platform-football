@@ -622,6 +622,7 @@ def _verify_completed_batch_evidence(
                 attempt.outcome in {
                     state.AttemptOutcome.SOURCE_ERROR,
                     state.AttemptOutcome.UNAVAILABLE_CONFIRMATION,
+                    state.AttemptOutcome.CONTINUATION,
                 }
                 for attempt in attempts_by_scope.get(
                     str(item.get("scope_id") or ""), ()

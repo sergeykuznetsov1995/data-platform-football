@@ -235,14 +235,14 @@ def test_stale_lease_reclaims_only_after_scope_timeout_plus_fifteen_minutes():
     campaign = _campaign(1)
     leased = _one_claim(campaign, _scopes(campaign)[0], NOW)
     before = NOW + timedelta(
-        seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS + (14 * 60) + 59
+        seconds=(45 * 60) + (14 * 60) + 59
     )
     boundary = NOW + timedelta(
-        seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS, minutes=15
+        minutes=60
     )
 
     assert state.STALE_LEASE_AFTER == timedelta(
-        seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS, minutes=15
+        minutes=60
     )
     assert not state.is_stale_lease(leased, now=before)
     assert state.is_stale_lease(leased, now=boundary)
@@ -1228,3 +1228,24 @@ def test_readback_verifier_requires_exactly_one_exact_hash_and_revision():
         )
     with pytest.raises(state.BackfillStateError, match="revision mismatch"):
         state.verify_record_readback(campaign, [{**good, "revision": 99}])
+
+
+def test_many_history_portions_do_not_consume_terminal_source_attempts():
+    campaign = _campaign(1)
+    scope = _scopes(campaign)[0]
+    for index in range(20):
+        at = NOW + timedelta(minutes=10 * index)
+        scope = _one_claim(campaign, scope, at)
+        attempt = _attempt(scope, state.AttemptOutcome.CONTINUATION,
+                           at=at + timedelta(minutes=5))
+        scope = state.apply_attempt(scope, attempt)
+        assert scope.attempt_count == index + 1
+        assert scope.source_attempt_count == 0
+        assert scope.source_error_count == 0
+        assert scope.status is state.ScopeStatus.RETRYABLE_ERROR
+        assert scope.lease_id is None
+    scope = _one_claim(campaign, scope, NOW + timedelta(hours=4))
+    scope = state.apply_attempt(scope, _attempt(scope, state.AttemptOutcome.CAPTURED,
+                             at=NOW + timedelta(hours=4, minutes=5)))
+    assert scope.source_attempt_count == 1
+    assert scope.status is state.ScopeStatus.CAPTURED_PENDING_DQ

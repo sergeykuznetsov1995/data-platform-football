@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
+import os
+from functools import wraps
 from typing import Any, Mapping
 
 from airflow import DAG
@@ -28,6 +31,9 @@ from scrapers.transfermarkt.models import (
     SCOPE_WALL_CLOCK_TIMEOUT_SECONDS,
 )
 from utils.default_args import SCRAPER_ARGS
+from scrapers.transfermarkt.streams import TransfermarktStreams
+from scrapers.transfermarkt import history_portion
+from dags.utils.transfermarkt_current_timetable import TransfermarktCurrentTimetable, work_deadline, remaining_work_seconds, MAX_PORTION_SECONDS
 from utils import transfermarkt_backfill_state as state
 from utils.transfermarkt_backfill_attempts import (
     has_matching_scope_attempt_result,
@@ -52,8 +58,38 @@ CHECKPOINT_TTL_DAYS = 35
 COACH_HISTORY_TTL_DAYS = 28
 BACKFILL_CONTROL_POOL = "transfermarkt_backfill_control"
 ACTIVE_RUN_COOLDOWN = timedelta(seconds=30)
-IDLE_POLL_INTERVAL = timedelta(hours=1)
+IDLE_POLL_INTERVAL = timedelta(minutes=5)
 FAILED_RUN_COOLDOWN = timedelta(minutes=5)
+STREAMS = TransfermarktStreams.from_env()
+
+
+def _bounded_historical_task(function):
+    """All phases use the original DagRun deadline, including queued tasks."""
+    @wraps(function)
+    def bounded(**context):
+        if STREAMS.history_capacity == 0:
+            raise AirflowException('historical streams are disabled')
+        started = getattr(context.get('dag_run'), 'start_date', None) or datetime.now(timezone.utc)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        deadline = work_deadline(started)
+        if remaining_work_seconds(deadline, datetime.now(timezone.utc)) <= 0:
+            raise AirflowException('historical portion reached its deadline or delivery window')
+        keys = ('TM_HISTORY_DEADLINE_AT', 'TM_HISTORY_PORTION_ID', 'TM_HISTORY_ATTEMPT_LEDGER')
+        previous = {key: os.environ.get(key) for key in keys}
+        portion_id = hashlib.sha256(str(context.get('run_id') or started.isoformat()).encode()).hexdigest()
+        os.environ.update(TM_HISTORY_DEADLINE_AT=deadline.isoformat(), TM_HISTORY_PORTION_ID=portion_id,
+                          TM_HISTORY_ATTEMPT_LEDGER=f'/opt/airflow/logs/transfermarkt-native-v2/backfill/portions/{portion_id}.json')
+        try:
+            with history_portion.bounded_trino():
+                return function(**context)
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+    return bounded
 
 
 def _publish_next_poll(
@@ -121,7 +157,8 @@ def _backfill_poll_ready(**context: Any) -> bool:
     return True
 
 
-def _strict_backfill_preflight() -> dict[str, Any]:
+@_bounded_historical_task
+def _strict_backfill_preflight(**context) -> dict[str, Any]:
     try:
         return strict_cutover_preflight()
     except Exception as exc:  # Airflow should show one stable task failure class
@@ -197,9 +234,9 @@ def _environment_for_scope(
         "TM_MV_TRANSFERS_LIMIT": str(MAX_ROSTER_WINDOW),
         "TM_REFRESH_MODE": "historical",
         "TM_COACH_HISTORY_TTL_DAYS": str(COACH_HISTORY_TTL_DAYS),
-        "TM_PROXY_LEASE_TTL_SECONDS": str(DEFAULT_ENTITY_TIMEOUT_SECONDS),
+        "TM_PROXY_LEASE_TTL_SECONDS": str(MAX_PORTION_SECONDS),
         "TM_CHECKPOINT_TTL_DAYS": str(CHECKPOINT_TTL_DAYS),
-        "TM_ENTITY_TIMEOUT_SECONDS": str(DEFAULT_ENTITY_TIMEOUT_SECONDS),
+        "TM_ENTITY_TIMEOUT_SECONDS": str(MAX_PORTION_SECONDS),
         "TM_PROVIDER_HARD_CAP_BYTES": str(SCOPE_HARD_PROVIDER_BYTE_CAP),
         "TM_PROVIDER_SOFT_STOP_BYTES": str(SCOPE_SOFT_PROVIDER_BYTE_STOP),
         "TM_PROXY_REQUEST_LIMIT": str(SCOPE_REQUEST_LIMIT),
@@ -216,6 +253,7 @@ def _environment_for_scope(
         "TM_BACKFILL_CLAIM_GENERATION": str(int(claim_generation)),
         "TM_BACKFILL_ATTEMPT_SEQUENCE": str(int(attempt_sequence)),
         "TM_BACKFILL_FINALIZE_ONLY": "true" if finalize_only else "false",
+        **{key: os.environ[key] for key in ('TM_HISTORY_DEADLINE_AT', 'TM_HISTORY_PORTION_ID', 'TM_HISTORY_ATTEMPT_LEDGER') if key in os.environ},
     }
 
 
@@ -333,6 +371,7 @@ def _persist_planner_platform_incident(
         )
 
 
+@_bounded_historical_task
 def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     ti = context["ti"]
     preflight = ti.xcom_pull(task_ids="strict_cutover_preflight") or {}
@@ -347,6 +386,9 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     limit = int(params.get("max_batch", MAX_SCOPE_BATCH))
     if not 1 <= limit <= MAX_SCOPE_BATCH:
         raise AirflowException(f"max_batch must be in 1..{MAX_SCOPE_BATCH}")
+    # Claim only the tasks this portion can start together. Queued paid tasks
+    # must not outlive the deadline established before planning.
+    limit = min(limit, STREAMS.history_capacity)
     policy = _load_backfill_policy()
     now = datetime.now(timezone.utc)
     resumed_incident_batch_id: str | None = None
@@ -494,6 +536,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
         raise AirflowException(str(exc)) from exc
 
 
+@_bounded_historical_task
 def _finalize_historical_batch(**context: Any) -> dict[str, Any]:
     planned = context["ti"].xcom_pull(task_ids="plan_historical_batch") or []
     if not planned:
@@ -515,14 +558,16 @@ def _finalize_historical_batch(**context: Any) -> dict[str, Any]:
 
 with DAG(
     dag_id=BACKFILL_DAG_ID,
-    default_args=SCRAPER_ARGS,
+    default_args={**SCRAPER_ARGS, 'pool': BACKFILL_CONTROL_POOL},
     description="Continuous frozen-snapshot Transfermarkt historical Bronze backfill",
-    schedule="@continuous",
+    schedule=TransfermarktCurrentTimetable() if TransfermarktCurrentTimetable is not None else '@continuous',
     start_date=datetime(2026, 7, 21),
     catchup=False,
     render_template_as_native_obj=True,
     tags=["scraping", "transfermarkt", "bronze", "historical", "backfill"],
     max_active_runs=1,
+    dagrun_timeout=timedelta(seconds=MAX_PORTION_SECONDS),
+    max_active_tasks=max(1, STREAMS.history_capacity),
     params={
         "max_batch": Param(
             default=MAX_SCOPE_BATCH,
@@ -550,11 +595,15 @@ with DAG(
         task_id="strict_cutover_preflight",
         python_callable=_strict_backfill_preflight,
         pool=BACKFILL_CONTROL_POOL,
+        retries=0,
+        execution_timeout=timedelta(seconds=MAX_PORTION_SECONDS),
     )
     plan_task = PythonOperator(
         task_id="plan_historical_batch",
         python_callable=_plan_historical_batch,
         pool=BACKFILL_CONTROL_POOL,
+        retries=0,
+        execution_timeout=timedelta(seconds=MAX_PORTION_SECONDS),
     )
     run_task = BashOperator.partial(
         task_id="run_historical_scope",
@@ -593,8 +642,8 @@ exit 0""",
         pool="transfermarkt_backfill_proxy",
         pool_slots=1,
         priority_weight=10,
-        max_active_tis_per_dag=1,
-        execution_timeout=timedelta(seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS),
+        max_active_tis_per_dag=max(1, STREAMS.history_capacity),
+        execution_timeout=timedelta(seconds=MAX_PORTION_SECONDS),
         do_xcom_push=False,
     ).expand(env=plan_task.output)
     finalize_task = PythonOperator(
@@ -602,13 +651,16 @@ exit 0""",
         python_callable=_finalize_historical_batch,
         trigger_rule="all_done",
         pool=BACKFILL_CONTROL_POOL,
+        retries=0,
+        execution_timeout=timedelta(seconds=MAX_PORTION_SECONDS),
     )
     cooldown_task = PythonSensor(
         task_id="wait_before_next_continuous_run",
         python_callable=_backfill_poll_ready,
         mode="reschedule",
         poke_interval=60,
-        timeout=timedelta(hours=2).total_seconds(),
+        timeout=MAX_PORTION_SECONDS,
+        execution_timeout=timedelta(seconds=MAX_PORTION_SECONDS),
         trigger_rule="all_done",
         retries=0,
         pool=BACKFILL_CONTROL_POOL,
