@@ -115,6 +115,33 @@ def test_rows_fit_their_schemas():
         pa.Table.from_pylist(rows, schema=history.SCHEMAS[table])  # raises on a type mismatch
 
 
+def test_new_prior_is_stored_as_null_with_raw_and_done_manifest():
+    html = fixture_html("club_riverplate.html.gz").replace(
+        '55<span class="min961"> ±80</span>', "NEW", 1)
+    result, store, session, sent = _run(
+        _answers(**{"/riverplate": gzip_response(html)}), ["riverplate"])
+    assert (result["pages_ok"], result["pages_failed"], result["pending_after"]) == (1, 0, 0)
+    assert history.exit_code(result) == 0 and sent == []
+    assert [call["path"] for call in session.calls] == ["/Ranking", "/riverplate"]
+    raw = next(row for row in store.rows(history.RAW_TABLE) if row["page"] == "/riverplate")
+    assert gzip.decompress(raw["body"]).decode("utf-8") == html
+    matches = store.rows(history.MATCH_TABLE)
+    assert len(matches) == 16
+    first = matches[0]
+    assert (first["prior_delta"], first["prior_delta_sigma"]) == (None, None)
+    arrow = pa.Table.from_pylist(matches, schema=history.SCHEMAS[history.MATCH_TABLE])
+    assert arrow.column("prior_delta")[0].as_py() is None
+    assert arrow.column("prior_delta_sigma")[0].as_py() is None
+    manifest = _manifest_new(store)
+    assert len(manifest) == 1
+    assert (manifest[0]["slug"], manifest[0]["status"], manifest[0]["matches"]) == (
+        "riverplate", "done", 16)
+    assert {(row["slug"], row["_batch_id"]) for row in matches} == {
+        (manifest[0]["slug"], manifest[0]["_batch_id"])}
+    assert store.appends == [history.RAW_TABLE, history.RAW_TABLE, history.POINT_TABLE,
+                             history.MATCH_TABLE, history.MANIFEST_TABLE]
+
+
 def test_302_is_no_page_and_counted_as_redirect():
     result, store, _, _ = _run(_answers(**{"/Arsenal": redirect_response()}), CLUBS)
     manifest = {r["slug"]: r for r in _manifest_new(store)}

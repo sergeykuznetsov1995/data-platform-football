@@ -135,6 +135,40 @@ def test_six_cell_row_is_a_fixture_without_result(riverplate_html):
     assert row["ft"] is None and row["new_elo"] is None and row["game_delta"] is None
 
 
+@pytest.mark.parametrize("prior_cell", ["55 ±80", "62 ±81"])
+def test_new_prior_keeps_match_and_fixture_rows(riverplate_html, prior_cell):
+    value, sigma = prior_cell.split(" ±")
+    old = f'{value}<span class="min961"> ±{sigma}</span>'
+    assert riverplate_html.count(old) == 1
+    baseline = parse_club_page(riverplate_html, "riverplate")
+    page = parse_club_page(riverplate_html.replace(old, "NEW", 1), "riverplate")
+    expected = [dict(row) for row in baseline.matches]
+    prior = float(prior_cell.split()[0])
+    changed = next(row for row in expected if row["prior_delta"] == prior)
+    changed.update(prior_delta=None, prior_delta_sigma=None)
+    assert page.matches == expected
+    assert (page.header, page.points, page.captured_rating_date) == (
+        baseline.header, baseline.points, baseline.captured_rating_date)
+
+
+@pytest.mark.parametrize("text", ["new", "UNKNOWN", "NEW ±80", "NaN"])
+def test_unknown_prior_still_fails_closed(riverplate_html, text):
+    broken = riverplate_html.replace('55<span class="min961"> ±80</span>', text, 1)
+    with pytest.raises(LayoutChanged, match="Prior Δ"):
+        parse_club_page(broken, "riverplate")
+
+
+@pytest.mark.parametrize("old, field", [
+    ("-438 ±436", "Game Δ"),
+    ('39<span class="min961"> ±79</span>', "Post-Game Δ"),
+])
+def test_new_in_other_delta_fields_still_fails_closed(riverplate_html, old, field):
+    assert old in riverplate_html
+    broken = riverplate_html.replace(old, "NEW", 1)
+    with pytest.raises(LayoutChanged, match=field):
+        parse_club_page(broken, "riverplate")
+
+
 def test_santos_keeps_both_rows_of_the_duplicate_match():
     page = parse_club_page(fixture_html("club_santos-fc_2.html.gz"), "santos-fc_2")
     same_day = [m for m in page.matches if m["match_date"] == date(2026, 9, 2)]
