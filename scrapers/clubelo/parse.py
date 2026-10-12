@@ -203,7 +203,8 @@ def _match_rows(doc) -> List[Dict[str, Any]]:
         elo_pct = "".join(tds[5].xpath('./span[@class="min1081"]/text()')).strip()
         if not elo_pct:
             raise LayoutChanged(f"match row {seq}: Elo % (span.min1081) is empty")
-        prior, prior_sigma = _value_sigma(cells[3], "Prior Δ")
+        # NEW marks a club without a prior rating, as on /Results.
+        prior, prior_sigma = (None, None) if cells[3] == "NEW" else _value_sigma(cells[3], "Prior Δ")
         game, game_sigma = _value_sigma(cells[9], "Game Δ")
         post, post_sigma = _value_sigma(cells[10], "Post-Game Δ")
         if cells[1] not in ("H", "A", "N"):
