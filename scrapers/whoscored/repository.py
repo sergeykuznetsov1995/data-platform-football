@@ -1004,6 +1004,25 @@ class BatchConflict(RuntimeError):
     """An existing physical batch disagrees with the parsed row counts."""
 
 
+class ScheduleCompletenessError(ValueError):
+    """A season schedule would hide rows in the published complete snapshot."""
+
+    def __init__(
+        self, *, new_count: int, old_count: int, missing_game_ids: Iterable[int] = ()
+    ) -> None:
+        self.new_count = new_count
+        self.old_count = old_count
+        self.missing_game_ids = tuple(sorted(set(missing_game_ids)))
+        detail = (
+            f"; missing_game_ids={list(self.missing_game_ids)}"
+            if self.missing_game_ids else ""
+        )
+        super().__init__(
+            f"whoscored_schedule completeness guard: new={new_count}, old={old_count}, "
+            f"published snapshot cannot shrink{detail}"
+        )
+
+
 def _lock_commit_sequence(method):
     """Serialize identical batch identities across Airflow task processes."""
 
@@ -4074,6 +4093,22 @@ class WhoScoredRepository:
         )
         return int(rows[0][0]) if rows else 0
 
+    def _published_schedule_game_ids(self, league: str, season: str) -> set[int]:
+        rows = self.trino.execute_query(
+            f"SELECT game_id FROM {self.catalog}.{self.schema}.whoscored_schedule_current "
+            f"WHERE league = {_sql_string(league)} AND season = {_sql_string(season)}"
+        )
+        return {int(row[0]) for row in rows}
+
+    def missing_schedule_game_ids(
+        self, league: str, season: str, observed_ids: Iterable[int]
+    ) -> tuple[int, ...]:
+        """Diagnose a rejected snapshot against the currently published rows."""
+        return tuple(sorted(
+            self._published_schedule_game_ids(league, season)
+            - {int(game_id) for game_id in observed_ids}
+        ))
+
     def latest_stage_feed_snapshot(
         self, league: str, season: str
     ) -> Optional[dict[str, Any]]:
@@ -4303,6 +4338,7 @@ class WhoScoredRepository:
         feed_policy: Optional[str] = None,
         feed_checks: Optional[Mapping[str, Mapping[str, Any]]] = None,
         expected_previous_stage_batch_id: Optional[str] = None,
+        require_schedule_game_ids: bool = False,
     ) -> str:
         """Publish multiple scope datasets through one logical commit point."""
         if not datasets:
@@ -4451,6 +4487,18 @@ class WhoScoredRepository:
             counts[table] = row_count
             row_sources[table] = source_rows
 
+        if require_schedule_game_ids:
+            if "whoscored_schedule" not in row_sources:
+                raise ValueError("schedule ID preservation requires a schedule dataset")
+            published = self._published_schedule_game_ids(league, season)
+            observed_ids = {int(row["game_id"]) for row in row_sources["whoscored_schedule"]}
+            missing = published - observed_ids
+            if missing:
+                raise ScheduleCompletenessError(
+                    new_count=counts["whoscored_schedule"], old_count=len(published),
+                    missing_game_ids=missing,
+                )
+
         identity_fields = {
             "league": league,
             "season": season,
@@ -4554,6 +4602,8 @@ class WhoScoredRepository:
                 and old_count
                 and new_count < old_count
             ):
+                if table == "whoscored_schedule":
+                    raise ScheduleCompletenessError(new_count=new_count, old_count=old_count)
                 raise ValueError(
                     f"{table} completeness guard: new={new_count}, old={old_count}, "
                     "published snapshot cannot shrink"

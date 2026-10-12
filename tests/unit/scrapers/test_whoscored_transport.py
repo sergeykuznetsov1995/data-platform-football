@@ -5180,6 +5180,106 @@ def test_non_proxy_curl_failure_keeps_retryable_timeout_without_swap(
 
 
 @pytest.mark.unit
+def test_schedule_tls_connect_error_renews_session_on_same_member(monkeypatch, tmp_path):
+    from curl_cffi.requests.cookies import Cookies
+    from curl_cffi.requests.exceptions import SSLError
+
+    first = FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35))
+    second = FakeHTTPSession(FakeHTTPResponse(content=b'{"tournaments":[]}'))
+    first.cookies = Cookies()
+    first.cookies.set("clearance", "cookie", domain="www.whoscored.com", path="/")
+    first.headers = {"X-Existing": "value"}
+    second.cookies = Cookies()
+    second.headers = {}
+    transport, seen = _pool_transport(
+        monkeypatch, tmp_path, first, second, http_attempts=3
+    )
+    original_proxy = transport._pool_proxy_url
+    transport._stage_http_context = ("bootstrap", "token", first, original_proxy)
+    ledger = []
+    transport.request_ledger = types.SimpleNamespace(append=ledger.append)
+    tokens = []
+
+    result = transport.fetch(
+        "https://www.whoscored.com/tournaments/25590/data/?d=202610",
+        entity="schedule_month",
+        before_network=lambda: tokens.append(1),
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(first.calls) == len(second.calls) == 1
+    assert seen == [original_proxy, original_proxy]
+    assert first.closed
+    assert second.cookies.get("clearance") == "cookie"
+    assert second.headers["X-Existing"] == "value"
+    assert transport._stage_http_context is None
+    assert len(tokens) == 2
+    assert [(e["status"], e["error_type"]) for e in ledger] == [
+        ("error", "SSLError"), ("success", "")
+    ]
+    assert not transport._direct_fs.get_calls
+
+
+@pytest.mark.unit
+def test_schedule_tls_session_recovery_stops_at_existing_attempt_budget(monkeypatch, tmp_path):
+    from curl_cffi.requests.exceptions import SSLError
+
+    sessions = [
+        FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35))
+        for _ in range(3)
+    ]
+    transport, seen = _pool_transport(
+        monkeypatch, tmp_path, *sessions, http_attempts=3
+    )
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch("https://www.whoscored.com/tournaments/25590/data/?d=202610")
+
+    assert caught.value.kind is FailureKind.TIMEOUT
+    assert caught.value.retryable
+    assert len(seen) == 3 and len(set(seen)) == 1
+    assert [len(s.calls) for s in sessions] == [1, 1, 1]
+    assert [s.closed for s in sessions] == [True, True, False]
+    assert not transport._direct_fs.get_calls
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("code", [28, 60])
+def test_schedule_other_curl_errors_do_not_renew_session(monkeypatch, tmp_path, code):
+    from curl_cffi.requests.exceptions import RequestException
+
+    first = FakeHTTPSession(
+        RequestException(f"curl: ({code}) other failure", code=code),
+        FakeHTTPResponse(),
+    )
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, http_attempts=3)
+    transport.fetch("https://www.whoscored.com/tournaments/25590/data/?d=202610")
+    assert len(seen) == 1 and len(first.calls) == 2
+    assert not first.closed
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("url", [
+    "https://www.whoscored.com/Matches/1/Live",
+    "https://www.whoscored.com/tournaments/25590/data/",
+    "https://www.whoscored.com/tournaments/25590/data/?d=202699",
+    "https://www.whoscored.com/tournaments/25590/data/?d=000010",
+    "http://www.whoscored.com/tournaments/25590/data/?d=202610",
+    "https://www.whoscored.com/tournaments/25590/data/?d=202610&d=202611",
+    "https://user@www.whoscored.com/tournaments/25590/data/?d=202610",
+    "https://www.whoscored.com:443/tournaments/25590/data/?d=202610",
+    "https://www.whoscored.com/tournaments/25590/data/?d=202610#fragment",
+])
+def test_non_schedule_tls_error_keeps_existing_session(monkeypatch, tmp_path, url):
+    from curl_cffi.requests.exceptions import SSLError
+
+    first = FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35), FakeHTTPResponse())
+    transport, seen = _pool_transport(monkeypatch, tmp_path, first, http_attempts=3)
+    transport.fetch(url)
+    assert len(seen) == 1 and len(first.calls) == 2
+    assert not first.closed
+
+
+@pytest.mark.unit
 def test_pool_5xx_swaps_member_once_and_keeps_retry_policy(monkeypatch, tmp_path):
     first = FakeHTTPSession(FakeHTTPResponse(status_code=502, content=b"bad gateway"))
     second = FakeHTTPSession(FakeHTTPResponse())

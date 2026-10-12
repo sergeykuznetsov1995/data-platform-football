@@ -624,6 +624,35 @@ def _is_proxy_failure(exc: BaseException) -> bool:
     return bool(_PROXY_FAILURE_TEXT.search(str(exc)))
 
 
+def _is_tls_connect_failure(exc: Optional[BaseException]) -> bool:
+    """Recognise curl35, separately from CONNECT/proxy and certificate errors."""
+    if exc is None:
+        return False
+    code = getattr(exc, "code", None)
+    if code is not None:
+        try:
+            return int(code) == 35
+        except (TypeError, ValueError):
+            return False
+    return bool(re.search(r"curl: \(35\)", str(exc)))
+
+
+def _is_schedule_month_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https" or parsed.netloc != "www.whoscored.com"
+        or parsed.fragment
+        or not re.fullmatch(r"/tournaments/[1-9][0-9]*/data/?", parsed.path.lower())
+    ):
+        return False
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    return (
+        len(query) == 1 and query[0][0] == "d"
+        and re.fullmatch(r"[0-9]{4}(?:0[1-9]|1[0-2])", query[0][1]) is not None
+        and int(query[0][1][:4]) > 0
+    )
+
+
 class ProxyConcurrencyLimited(RuntimeError):
     """The single paid slot is in use by another task in the DagRun."""
 
@@ -2834,6 +2863,7 @@ class WhoScoredTransport:
         self._direct_http = direct_http_session or self._new_http_session(
             self._pool_proxy_url
         )
+        self._owns_direct_http_session = direct_http_session is None
         if direct_http_session is not None:
             # An injected session is not ours to replace on a member swap.
             self._pool_manager = None
@@ -3094,6 +3124,45 @@ class WhoScoredTransport:
 
     def _is_pool_session(self, session: Any) -> bool:
         return self._pool_manager is not None and session is self._direct_http
+
+    def _renew_schedule_http_session(self, url: str) -> None:
+        """Discard a failed TLS handle without rotating its sticky member."""
+        if not self._owns_direct_http_session:
+            return
+        previous = self._direct_http
+        replacement = None
+        try:
+            replacement = self._new_http_session(self._pool_proxy_url)
+            if replacement is None or replacement is previous:
+                raise ValueError("HTTP session factory did not create a new session")
+            for name in ("headers", "cookies"):
+                old = getattr(previous, name, None)
+                new = getattr(replacement, name, None)
+                if old is not None and new is not None:
+                    new.update(old)
+        except Exception as exc:
+            if replacement is not None and replacement is not previous:
+                close = getattr(replacement, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            raise WhoScoredTransportError(
+                f"Could not renew schedule HTTP session ({type(exc).__name__})",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.DIRECT_HTTP,
+            ) from None
+        self._direct_http = replacement
+        self._stage_http_context = None
+        close = getattr(previous, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                logger.debug("Could not close TLS session (%s)", type(exc).__name__)
+        logger.warning("WhoScored schedule TLS session renewed on the same pool member")
 
     def _rotate_pool_proxy(self, excluded: Optional[set[str]] = None) -> bool:
         """Swap the sticky pool member for a different one (#1476).
@@ -3543,6 +3612,11 @@ class WhoScoredTransport:
                     }
                     if not retryable_direct or attempt + 1 >= self.direct_http_attempts:
                         raise
+                    if (
+                        _is_tls_connect_failure(exc.__cause__)
+                        and _is_schedule_month_url(url)
+                    ):
+                        self._renew_schedule_http_session(url)
                     self._wait_before_direct_http_retry(attempt)
                     if before_network is not None:
                         # Every physical retry consumes a source-rate token.

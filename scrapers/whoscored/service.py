@@ -84,6 +84,7 @@ from .repository import (
     scope_write_chunk_rows_from_env,
     WhoScoredScopeRowSpool,
     WhoScoredRepository,
+    ScheduleCompletenessError,
 )
 from .transport import (
     CachedPayload,
@@ -2221,7 +2222,7 @@ class WhoScoredIngestService:
             lease_ttl_seconds=current.lease_ttl_seconds,
         )
 
-    def _collect_season_schedule(self) -> _SeasonSchedule:
+    def _collect_season_schedule(self, *, refresh_months: bool = False) -> _SeasonSchedule:
         """Fetch and merge one scope's season page, stage calendars and months.
 
         Shared by ``sync_schedule`` (daily) and ``sync_stage_feeds`` (weekly):
@@ -2371,6 +2372,7 @@ class WhoScoredIngestService:
                     month_target,
                     parser=month_parser,
                     content_type="application/json",
+                    allow_cache=not refresh_months,
                     cache_ttl=(
                         ACTIVE_SCHEDULE_CACHE_TTL
                         if active and not closed_month and near_month
@@ -2393,7 +2395,7 @@ class WhoScoredIngestService:
         # A postponed game can sit in a closed month cached without expiry
         # while its new date appears in another month (#1059).  Such a
         # closed month keeps the active TTL until the game is played.
-        if active:
+        if active and not refresh_months:
             owners = _schedule_game_owners(month_documents)
             occurrences: dict[int, int] = {}
             for document in month_documents:
@@ -2472,83 +2474,119 @@ class WhoScoredIngestService:
         )
         self._bound_paid_fallback(2)
         try:
-            collected = self._collect_season_schedule()
-            result.metadata.update(
-                {
-                    "source_stage_ids": sorted(
-                        {int(row["stage_id"]) for row in collected.stage_rows}
-                    ),
-                    "source_stage_count": len(
-                        {int(row["stage_id"]) for row in collected.stage_rows}
-                    ),
+            for refresh_months in (False, True):
+                collected = (
+                    self._collect_season_schedule(refresh_months=True)
+                    if refresh_months
+                    else self._collect_season_schedule()
+                )
+                result.metadata.update(
+                    {
+                        "source_stage_ids": sorted(
+                            {int(row["stage_id"]) for row in collected.stage_rows}
+                        ),
+                        "source_stage_count": len(
+                            {int(row["stage_id"]) for row in collected.stage_rows}
+                        ),
+                    }
+                )
+                if collected.source_stage_absent:
+                    result.metadata["source_stage_absent"] = list(
+                        collected.source_stage_absent
+                    )
+                schedule_by_id = collected.schedule_by_id
+                incident_by_key = collected.incident_by_key
+                bet_by_key = collected.bet_by_key
+                season_dataset_rows = collected.season_dataset_rows
+                season_dataset_statuses = collected.season_dataset_statuses
+                raw_uris = list(collected.raw_uris)
+                payload_hashes = list(collected.payload_hashes)
+                datasets: dict[str, Sequence[Mapping[str, Any]]] = {
+                    "whoscored_schedule": list(schedule_by_id.values()),
+                    "whoscored_match_incidents": list(incident_by_key.values()),
+                    "whoscored_match_bets": list(bet_by_key.values()),
                 }
-            )
-            if collected.source_stage_absent:
-                result.metadata["source_stage_absent"] = list(
-                    collected.source_stage_absent
-                )
-            schedule_by_id = collected.schedule_by_id
-            incident_by_key = collected.incident_by_key
-            bet_by_key = collected.bet_by_key
-            season_dataset_rows = collected.season_dataset_rows
-            season_dataset_statuses = collected.season_dataset_statuses
-            raw_uris = list(collected.raw_uris)
-            payload_hashes = list(collected.payload_hashes)
-            datasets: dict[str, Sequence[Mapping[str, Any]]] = {
-                "whoscored_schedule": list(schedule_by_id.values()),
-                "whoscored_match_incidents": list(incident_by_key.values()),
-                "whoscored_match_bets": list(bet_by_key.values()),
-            }
-            distinct_keys: dict[str, str] = {
-                "whoscored_schedule": "game_id",
-                "whoscored_match_incidents": "entity_key",
-                "whoscored_match_bets": "entity_key",
-            }
-            source_empty: set[str] = set()
-            source_unavailable: set[str] = set()
-            if not incident_by_key:
-                source_empty.add("whoscored_match_incidents")
-            if not bet_by_key:
-                source_empty.add("whoscored_match_bets")
-            season_mapping = {
-                "standings": "whoscored_stage_standings",
-                "forms": "whoscored_stage_forms",
-                "streaks": "whoscored_stage_streaks",
-                "performance": "whoscored_stage_performance",
-            }
-            for name, table in season_mapping.items():
-                rows = season_dataset_rows[name]
-                statuses = season_dataset_statuses[name]
-                datasets[table] = self._entity_keyed(rows)
-                distinct_keys[table] = "entity_key"
-                if rows:
-                    continue
-                if DatasetStatus.EMPTY in statuses:
-                    source_empty.add(table)
-                else:
-                    source_unavailable.add(table)
+                distinct_keys: dict[str, str] = {
+                    "whoscored_schedule": "game_id",
+                    "whoscored_match_incidents": "entity_key",
+                    "whoscored_match_bets": "entity_key",
+                }
+                source_empty: set[str] = set()
+                source_unavailable: set[str] = set()
+                if not incident_by_key:
+                    source_empty.add("whoscored_match_incidents")
+                if not bet_by_key:
+                    source_empty.add("whoscored_match_bets")
+                season_mapping = {
+                    "standings": "whoscored_stage_standings",
+                    "forms": "whoscored_stage_forms",
+                    "streaks": "whoscored_stage_streaks",
+                    "performance": "whoscored_stage_performance",
+                }
+                for name, table in season_mapping.items():
+                    rows = season_dataset_rows[name]
+                    statuses = season_dataset_statuses[name]
+                    datasets[table] = self._entity_keyed(rows)
+                    distinct_keys[table] = "entity_key"
+                    if rows:
+                        continue
+                    if DatasetStatus.EMPTY in statuses:
+                        source_empty.add(table)
+                    else:
+                        source_unavailable.add(table)
 
-            combined_hash = hashlib.sha256(
-                json.dumps(sorted(payload_hashes), separators=(",", ":")).encode(
-                    "utf-8"
-                )
-            ).hexdigest()
-            scope_batch_id = self.repository.commit_scope_bundle(
-                league=self.scope.competition_id,
-                season=self.scope.season_id,
-                entity_group="season",
-                datasets=datasets,
-                distinct_keys=distinct_keys,
-                payload_sha256=combined_hash,
-                raw_uris=raw_uris,
-                source_empty=source_empty,
-                source_unavailable=source_unavailable,
-            )
-            result.committed_batches["scope"].append(str(scope_batch_id))
-            result.succeeded = 1
-            for table, rows in datasets.items():
-                result.counts[table.removeprefix("whoscored_")] = len(rows)
-                result.tables.append(f"iceberg.bronze.{table}")
+                combined_hash = hashlib.sha256(
+                    json.dumps(sorted(payload_hashes), separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                try:
+                    scope_batch_id = self.repository.commit_scope_bundle(
+                        league=self.scope.competition_id,
+                        season=self.scope.season_id,
+                        entity_group="season",
+                        datasets=datasets,
+                        distinct_keys=distinct_keys,
+                        payload_sha256=combined_hash,
+                        raw_uris=raw_uris,
+                        source_empty=source_empty,
+                        source_unavailable=source_unavailable,
+                        **({"require_schedule_game_ids": True} if refresh_months else {}),
+                    )
+                except ScheduleCompletenessError as exc:
+                    result.metadata["schedule_recheck"] = {
+                        "attempted": refresh_months,
+                        "new_count": exc.new_count,
+                        "old_count": exc.old_count,
+                        "raw_uris": raw_uris,
+                    }
+                    if not refresh_months and collected.active:
+                        result.metadata["schedule_recheck"]["attempted"] = True
+                        logger.warning(
+                            "%s: schedule shrank from %s to %s; rechecking all months once",
+                            self.scope.spec, exc.old_count, exc.new_count,
+                        )
+                        continue
+                    try:
+                        missing = exc.missing_game_ids or self.repository.missing_schedule_game_ids(
+                            self.scope.competition_id, self.scope.season_id, schedule_by_id
+                        )
+                        result.metadata["schedule_recheck"]["missing_game_ids"] = list(missing)
+                        logger.error(
+                            "%s: incomplete schedule after recheck; missing_game_ids=%s",
+                            self.scope.spec, list(missing),
+                        )
+                    except Exception as diagnostic_exc:
+                        result.metadata["schedule_recheck"]["diagnostic_error"] = (
+                            type(diagnostic_exc).__name__
+                        )
+                    raise
+                result.committed_batches["scope"].append(str(scope_batch_id))
+                result.succeeded = 1
+                for table, rows in datasets.items():
+                    result.counts[table.removeprefix("whoscored_")] = len(rows)
+                    result.tables.append(f"iceberg.bronze.{table}")
+                break
         except ProxyUnavailable:
             raise
         except Exception as exc:
