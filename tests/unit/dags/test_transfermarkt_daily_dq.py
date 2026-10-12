@@ -24,6 +24,7 @@ def test_daily_dq_has_no_ingest_or_paid_preflight_dependency():
     assert task._init_kwargs['retries'] == 1
     assert task._init_kwargs['retry_delay'] == timedelta(minutes=5)
     assert task._init_kwargs['do_xcom_push'] is False
+    assert task._init_kwargs['on_failure_callback'] is None
 
 
 @pytest.mark.parametrize('report,should_fail', [

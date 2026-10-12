@@ -1307,6 +1307,8 @@ with DAG(
         retry_delay=timedelta(minutes=5),
         execution_timeout=timedelta(minutes=10),
         do_xcom_push=False,
+        # Preserve #1393's single run notification; the audit records RED locally.
+        on_failure_callback=None,
     )
 
     preflight_reader_route_task = PythonOperator(
