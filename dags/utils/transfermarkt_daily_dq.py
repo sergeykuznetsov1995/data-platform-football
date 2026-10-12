@@ -206,7 +206,7 @@ def build_empty_routes_sql(routes: Mapping[str, str]) -> str:
 
 
 def collect_first_seen_metrics(cur, implementation_at: datetime,
-                               pins: Mapping[str, int]) -> tuple[dict, list]:
+                               pins: Mapping[str, int], progress=None) -> tuple[dict, list]:
     """Use the writer's canonical natural keys; no schema migration in audits."""
     from scrapers.transfermarkt.first_seen import KEYS
 
@@ -224,6 +224,14 @@ def collect_first_seen_metrics(cur, implementation_at: datetime,
         after = f'(b._ingested_at >= {_timestamp(implementation_at)} OR b.fetched_at >= {_timestamp(implementation_at)})'
         row = _row(cur, f'SELECT COUNT_IF({after}), COUNT_IF({after} AND b.first_seen_at IS NULL) FROM {table} b')
         new_rows, nulls = map(int, row)
+        checks.append(dq.BronzeCheckResult(
+            name=f'tm_daily_first_seen_completeness[{name}]', kind='daily_first_seen_completeness',
+            severity='ERROR', passed=nulls == 0, value=nulls))
+        metrics[name] = {'status': 'RED' if nulls else 'UNKNOWN',
+                         'missing_column': False, 'new_rows': new_rows,
+                         'null_new_rows': nulls, 'registry_mismatches': None}
+        if progress is not None:
+            progress(metrics, checks)
         mismatch = None
         if FIRST_SEEN_REGISTRY in pins:
             joins = []
@@ -240,17 +248,16 @@ def collect_first_seen_metrics(cur, implementation_at: datetime,
             checks.append(dq.BronzeCheckResult(
                 name=f'tm_daily_first_seen_invariance[{name}]', kind='daily_first_seen_invariance',
                 severity='ERROR', passed=mismatch == 0, value=mismatch))
-        checks.append(dq.BronzeCheckResult(
-            name=f'tm_daily_first_seen_completeness[{name}]', kind='daily_first_seen_completeness',
-            severity='ERROR', passed=nulls == 0, value=nulls))
         metrics[name] = {'status': 'RED' if nulls or mismatch else 'GREEN' if mismatch is not None else 'UNKNOWN',
                          'missing_column': False, 'new_rows': new_rows,
                          'null_new_rows': nulls, 'registry_mismatches': mismatch}
+        if progress is not None:
+            progress(metrics, checks)
     return metrics, checks
 
 
 def collect_daily_metrics(cur, implementation_at: datetime,
-                          routes: Mapping[str, str]) -> tuple[dict, list]:
+                          routes: Mapping[str, str], progress=None) -> tuple[dict, list]:
     metrics: dict[str, Any] = {'fields': {}, 'cohorts': {}, 'empty_by_route': {}}
     results = []
     for entity, fields in FIELDS.items():
@@ -273,6 +280,8 @@ def collect_daily_metrics(cur, implementation_at: datetime,
             name=f'tm_daily_null_lineage[{entity}]', kind='daily_null_lineage',
             severity='ERROR', passed=counters[4] == 0, value=counters[4],
             details=f'post-deployment cutoff {_utc(implementation_at).isoformat()}'))
+        if progress is not None:
+            progress(metrics, results)
     zeros = _row(cur, build_placeholder_zero_sql())
     if len(zeros) != 2:
         raise ValueError('invalid placeholder audit shape')
@@ -280,6 +289,8 @@ def collect_daily_metrics(cur, implementation_at: datetime,
         results.append(dq.BronzeCheckResult(
             name=f'tm_daily_placeholder_zero[{label}]', kind='daily_placeholder_zero',
             severity='ERROR', passed=int(value) == 0, value=int(value)))
+    if progress is not None:
+        progress(metrics, results)
     cur.execute(build_empty_routes_sql(routes))
     rows = list(cur.fetchall())
     for route, total, empty, unknown in rows:
@@ -294,6 +305,8 @@ def collect_daily_metrics(cur, implementation_at: datetime,
                 name='tm_daily_pokal_authoritative_empty', kind='daily_empty_route',
                 severity='ERROR', passed=empty * 20 <= total,
                 value=metrics['empty_by_route'][route], details='RED strictly above 5%'))
+        if progress is not None:
+            progress(metrics, results)
     for route in ('pokal', 'wettbewerb'):
         metrics['empty_by_route'].setdefault(route, {
             'editions': 0, 'authoritative_empty': None, 'unknown': None, 'ratio': None,
@@ -348,20 +361,29 @@ def run_daily_bronze_dq(cur, *, state_root: Path = DEFAULT_STATE_ROOT,
             'input_snapshot_ids': {}, 'checks': [], 'metrics': {},
             'paid_requests': 0,
         }
+        def remember(metrics, checks):
+            # Keep each completed check before a subsequent query can fail.
+            report.update(metrics=metrics, checks=[asdict(check) for check in checks])
+            report['errors'] = [check.name for check in checks if check.severity == 'ERROR' and not check.passed]
+            if report['errors']:
+                report['status'] = 'RED'
         try:
             pins = pin_audit_snapshots(cur, clock)
             report['input_snapshot_ids'] = pins
             frozen = _PinnedCursor(cur, pins)
             checks = dq.run_bronze_dq(frozen, registry_snapshot_id=None,
                                       pins=pins, zone='full')
-            report['checks'] = [asdict(check) for check in checks]
-            report['errors'] = [check.name for check in checks if check.severity == 'ERROR' and not check.passed]
-            if report['errors']:
-                report['status'] = 'RED'
-            metrics, daily_checks = collect_daily_metrics(frozen, deployed, routes or _routes())
-            first_seen, first_seen_checks = collect_first_seen_metrics(frozen, deployed, pins)
+            remember({}, checks)
+            metrics, daily_checks = collect_daily_metrics(
+                frozen, deployed, routes or _routes(),
+                progress=lambda m, c: remember(m, checks + c))
+            checks += daily_checks
+            remember(metrics, checks)
+            first_seen, first_seen_checks = collect_first_seen_metrics(
+                frozen, deployed, pins,
+                progress=lambda m, c: remember({**metrics, 'first_seen': m}, checks + c))
             metrics['first_seen'] = first_seen
-            checks += daily_checks + first_seen_checks
+            checks += first_seen_checks
             report.update(checks=[asdict(check) for check in checks], metrics=metrics)
             execution_errors = [check.name for check in checks if check.error]
             errors = [check.name for check in checks if check.severity == 'ERROR' and not check.passed]

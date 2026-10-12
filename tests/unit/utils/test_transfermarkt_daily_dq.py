@@ -283,3 +283,38 @@ def test_baseline_red_is_retained_when_later_daily_sql_fails(tmp_path, monkeypat
     assert report['errors'] == ['duplicates']
     assert 'late SQL failure' in report['execution_errors'][0]
     assert 'RED (неполная проверка)' in daily.format_daily_dq_summary(report)
+
+
+def test_daily_red_is_retained_when_first_seen_query_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(daily, 'pin_audit_snapshots', lambda *args: {})
+    monkeypatch.setattr(daily.dq, 'run_bronze_dq', lambda *args, **kwargs: [])
+    red = daily.dq.BronzeCheckResult(name='NULL lineage', kind='daily_null_lineage',
+                                    severity='ERROR', passed=False, value=1)
+    monkeypatch.setattr(daily, 'collect_daily_metrics', lambda *args, **kwargs: ({'fields': {'proved': 1}}, [red]))
+    def fail(*args, **kwargs):
+        raise RuntimeError('first_seen readback unavailable')
+    monkeypatch.setattr(daily, 'collect_first_seen_metrics', fail)
+    report = run(Cursor(), tmp_path)
+    assert not report['completed'] and report['status'] == 'RED'
+    assert report['errors'] == ['NULL lineage']
+    assert report['metrics']['fields'] == {'proved': 1}
+    assert report['checks'][0]['value'] == 1
+    assert 'first_seen readback unavailable' in report['execution_errors'][0]
+    assert 'RED (неполная проверка)' in daily.format_daily_dq_summary(report)
+
+
+@pytest.mark.parametrize('stage', ['fields', 'first_seen'])
+def test_collector_retains_completed_red_before_its_next_query_fails(tmp_path, full_runner, stage):
+    class BrokenCursor(Cursor):
+        def execute(self, sql):
+            if ((stage == 'fields' and 'AS total_rows' in sql and '.transfermarkt_competition_editions' in sql)
+                    or (stage == 'first_seen' and 'r.first_seen_at IS NULL' in sql)):
+                raise RuntimeError('next audit query failed')
+            return super().execute(sql)
+    report = run(BrokenCursor(lineage=int(stage == 'fields'), first_seen_null=int(stage == 'first_seen')), tmp_path)
+    assert report['status'] == 'RED' and not report['completed']
+    kind = 'daily_null_lineage' if stage == 'fields' else 'daily_first_seen_completeness'
+    assert any(c['kind'] == kind and not c['passed'] for c in report['checks'])
+    assert 'next audit query failed' in report['execution_errors'][0]
+    persisted = json.loads((tmp_path / (report['day_msk'] + '.json')).read_text())
+    assert persisted['status'] == 'RED' and persisted['errors'] == report['errors']
