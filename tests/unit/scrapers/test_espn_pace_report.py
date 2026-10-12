@@ -135,9 +135,10 @@ def test_diagnostic_fields_are_optional_and_sanitized_at_journal_boundary(tmp_pa
         payload = json.loads(db.execute('SELECT payload FROM attempts WHERE id=?', (legacy,)).fetchone()[0])
         payload.pop('error_type', None)
         payload.pop('error_phase', None)
+        payload.pop('error_chain', None)
         db.execute('UPDATE attempts SET payload=? WHERE id=?', (json.dumps(payload), legacy))
     journal = AttemptJournal(journal.path)
-    assert 'error_type' not in journal.rows()[0] and 'error_phase' not in journal.rows()[0]
+    assert not {'error_type', 'error_phase', 'error_chain'} & journal.rows()[0].keys()
     assert journal.coverage(START, START+timedelta(minutes=1))
     failure = begin(journal, START+timedelta(seconds=1))
     journal.finish(failure, status=None, timeout=False, http_ms=5, direct_bytes=0,
@@ -147,6 +148,87 @@ def test_diagnostic_fields_are_optional_and_sanitized_at_journal_boundary(tmp_pa
     assert row['error_type'] == 'OtherTransportError' and row['error_phase'] is None
     assert 'private' not in str(row) and 'secret' not in str(row)
     assert not journal.coverage(START, START+timedelta(minutes=1))
+
+
+def test_error_chain_is_sanitized_at_journal_boundary(tmp_path):
+    import errno
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3', utcnow_fn=lambda: START)
+    attempt = begin(journal)
+    journal.finish(attempt, status=None, timeout=False, http_ms=5, direct_bytes=0,
+                   complete=False, error_type='ConnectionError', error_phase='request',
+                   error_chain=[{'type': 'ConnectionRefusedError', 'errno': errno.ECONNREFUSED,
+                                 'message': 'https://private/?token=secret'},
+                                {'type': 'private_class', 'errno': 'secret'},
+                                {'type': 'OSError', 'errno': True},
+                                {'type': 'OSError', 'errno': 999999},
+                                'secret'])
+    row, = journal.rows()
+    assert row['error_chain'] == [
+        {'type': 'ConnectionRefusedError', 'errno': errno.ECONNREFUSED},
+        {'type': 'OtherTransportError', 'errno': None},
+        {'type': 'OSError', 'errno': None}, {'type': 'OSError', 'errno': None}]
+    assert 'secret' not in json.dumps(row) and 'private' not in json.dumps(row)
+    assert not journal.coverage(START, START+timedelta(minutes=1))
+
+
+def test_exception_chain_is_bounded_and_handles_cycles_without_rendering_messages():
+    from scrapers.espn.attempts import exception_chain, safe_error_chain
+    first, second = OSError('secret'), ValueError('secret')
+    first.__cause__ = second
+    second.__context__ = first
+    assert exception_chain(first) == [{'type': 'OSError', 'errno': None},
+                                      {'type': 'ValueError', 'errno': None}]
+    root = previous = OSError('secret')
+    for _ in range(20):
+        current = OSError('secret')
+        previous.__cause__ = current
+        previous = current
+    assert len(exception_chain(root)) == 8
+    assert len(safe_error_chain([{'type': 'OSError'}]*100)) == 8
+    assert safe_error_chain('secret') is None
+
+
+def test_exception_chain_bypasses_hostile_properties_and_str():
+    import errno
+    from scrapers.espn.attempts import exception_chain
+    class HostileDict(dict):
+        def get(self, *_args): raise AssertionError('Must not call custom mapping methods')
+    class HostileMeta(type):
+        @property
+        def __name__(cls): raise AssertionError('Must not call custom metaclass properties')
+        def __getattribute__(cls, name):
+            if name == '__name__': raise AssertionError('Must not call custom metaclass methods')
+            return super().__getattribute__(name)
+    class private_error(ConnectionRefusedError, metaclass=HostileMeta):
+        def __str__(self): raise AssertionError('Must not render exception')
+        def forbidden(self): raise AssertionError('Must not access custom properties')
+        args = property(forbidden)
+        errno = property(forbidden)
+        reason = property(forbidden)
+        __cause__ = property(forbidden)
+        __context__ = property(forbidden)
+        __dict__ = property(forbidden)
+    failure = private_error(errno.ECONNREFUSED, 'secret')
+    BaseException.__dict__['__dict__'].__set__(failure, HostileDict())
+    assert exception_chain(failure) == [{'type': 'OtherTransportError', 'errno': errno.ECONNREFUSED}]
+
+
+@pytest.mark.parametrize('location', ['cause', 'argument', 'errno'])
+def test_exception_chain_does_not_access_custom_class_property(location):
+    from scrapers.espn.attempts import exception_chain
+    class private_object:
+        @property
+        def __class__(self): raise AssertionError('Must not access custom class property')
+    class private_exception(Exception):
+        @property
+        def __class__(self): raise AssertionError('Must not access custom class property')
+    failure = OSError('secret')
+    if location == 'cause': failure.__cause__ = private_exception('secret')
+    elif location == 'argument': failure.args = (private_object(),)
+    else: failure = OSError(private_object(), 'secret')
+    chain = exception_chain(failure)
+    assert chain[0] == {'type': 'OSError', 'errno': None}
+    assert 'secret' not in json.dumps(chain) and 'private' not in json.dumps(chain)
 
 
 def test_coverage_changes_when_a_known_good_window_gains_an_incomplete_attempt(tmp_path):

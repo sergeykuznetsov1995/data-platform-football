@@ -31,7 +31,7 @@ from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
 from .gate import Permit, TransportGate
-from .attempts import AttemptJournal, safe_error_type
+from .attempts import AttemptJournal, exception_chain, safe_error_type
 from .raw_store import (
     EspnRawStore,
     RawJsonRecord,
@@ -332,6 +332,7 @@ class EspnHttpClient:
         timed_out = False
         complete = True
         request_failed = False
+        error_chain = None
         error_phase = 'request'
         started = self.monotonic_fn()
         try:
@@ -356,6 +357,7 @@ class EspnHttpClient:
             )) else type(exc).__name__)
             tries.http_diagnostics.update(error_type=safe_error_type(original_type),
                                           error_phase=error_phase)
+            error_chain = exception_chain(exc)
             raise
         finally:
             try:
@@ -369,6 +371,7 @@ class EspnHttpClient:
                 if not request_failed:
                     tries.http_diagnostics.update(error_type=safe_error_type(type(exc).__name__),
                                                   error_phase='close')
+                    error_chain = exception_chain(exc)
                     raise _ResponseReadFailure(direct_bytes, type(exc).__name__) from None
             finally:
                 elapsed = max(0.0, (self.monotonic_fn() - started) * 1000.0)
@@ -379,6 +382,7 @@ class EspnHttpClient:
                         complete=complete,
                         error_type=tries.http_diagnostics.get('error_type'),
                         error_phase=tries.http_diagnostics.get('error_phase'),
+                        error_chain=error_chain,
                     )
                 except BaseException:
                     # A failed measurement write stops this request, but must
