@@ -100,6 +100,8 @@ services:
     command:
       - python
       - /opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py
+      - --source-mode
+      - sofascore-only
       - --listen
       - 0.0.0.0:8899
       - --lease-listen
@@ -177,6 +179,8 @@ services:
     command:
       - python
       - /opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py
+      - --source-mode
+      - sofascore-only
       - --listen
       - 0.0.0.0:8899
       - --lease-listen
@@ -251,6 +255,8 @@ services:
     command:
       - python
       - /opt/sofascore-repo/scripts/proxy_filter/filter_proxy.py
+      - --source-mode
+      - sofascore-only
       - --listen
       - 0.0.0.0:8899
       - --lease-listen

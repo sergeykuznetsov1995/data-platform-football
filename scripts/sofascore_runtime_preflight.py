@@ -409,6 +409,14 @@ def validate_gateway_health(
     budget = payload.get("sofascore_dagrun_budget_bytes")
     if payload.get("status") != "ok":
         raise ReadinessError("gateway health status is not ok")
+    if payload.get("source_mode") != "sofascore-only":
+        raise ReadinessError("gateway must run in sofascore-only mode")
+    size = payload.get("registry_bytes")
+    limit = payload.get("registry_limit_bytes")
+    if type(size) is not int or size < 0 or type(limit) is not int or limit != 60_000_000:
+        raise ReadinessError("gateway registry size or limit is invalid")
+    if size >= limit:
+        raise ReadinessError("gateway registries exceed safe size")
     if payload.get("sofascore_paid_enabled") is not True:
         raise ReadinessError("gateway has SofaScore paid traffic disabled")
     if type(budget) is not int or budget <= 0:

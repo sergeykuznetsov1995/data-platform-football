@@ -108,6 +108,7 @@ from scripts.proxy_filter.budget import (  # noqa: E402 - standalone entry point
     load_verified_policy,
 )
 from scripts.proxy_filter.sofascore_registry import compact as _compact_registry
+from scripts.proxy_filter.sofascore_registry import validate_checkpoint as _validate_registry_checkpoint
 
 _REGISTRY_LOCK = RLock()
 _PENDING_CLAIM_ROLLBACKS: set[str] = set()
@@ -3521,7 +3522,7 @@ def _sofascore_registry_bytes() -> int:
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
-                if entry.is_file(follow_symlinks=False) and entry.name.endswith((".json", ".jsonl", ".bak", ".tmp")):
+                if entry.is_file(follow_symlinks=False) and entry.name.endswith((".json", ".jsonl", ".bak", ".tmp", ".gz")):
                     total += entry.stat(follow_symlinks=False).st_size
     except FileNotFoundError:
         pass
@@ -3575,6 +3576,8 @@ def _create_lease(
     if requested_source and requested_source != inferred_source:
         raise ValueError("paid lease source does not match dag_id")
     source = inferred_source or requested_source
+    if SOURCE_MODE == "sofascore-only" and source not in {"sofascore", "sofascore_discovery"}:
+        raise ValueError("dedicated SofaScore service rejects every other source")
     if _transfermarkt_only() and source not in TRANSFERMARKT_ONLY_SOURCES:
         raise ValueError("dedicated Transfermarkt service rejects every other source")
     lease_manager = mgr
@@ -7955,7 +7958,7 @@ async def main() -> None:
     ap.add_argument("--listen", default="0.0.0.0:8899")
     ap.add_argument(
         "--source-mode",
-        choices=("shared-no-whoscored", "whoscored-only", "transfermarkt-only"),
+        choices=("shared-no-whoscored", "whoscored-only", "transfermarkt-only", "sofascore-only"),
         default="shared-no-whoscored",
     )
     ap.add_argument(
@@ -8245,14 +8248,14 @@ async def main() -> None:
                 + ", ".join("--" + dest.replace("_", "-") for dest in supplied)
             )
 
-    if str(args.source_mode) == "whoscored-only" and bool(
+    if str(args.source_mode) in {"whoscored-only", "sofascore-only"} and bool(
         getattr(args, "allow_legacy_noauth", False)
     ):
         # Reject the unsafe combination before runtime validation, protected
         # state initialization, pool loading, or any listener/network effect.
         # Shared legacy sources retain their explicitly requested compatibility.
         raise SystemExit(
-            "--allow-legacy-noauth is forbidden with --source-mode=whoscored-only"
+            f"--allow-legacy-noauth is forbidden with --source-mode={args.source_mode}"
         )
 
     if str(args.source_mode) == "whoscored-only":
@@ -8664,6 +8667,8 @@ async def main() -> None:
     report_daily = (_daily_up_bytes, _daily_down_bytes)
     _daily_day = ""
     _daily_up_bytes = _daily_down_bytes = 0
+    if SOURCE_MODE == "sofascore-only":
+        _validate_registry_checkpoint(LEDGER_PATH)
     restored_events = _restore_budget_ledger(LEDGER_PATH, restore_daily=not tm_only)
     if sum(report_daily) > _daily_total_bytes():
         # Conservative compatibility for bytes recorded before the WAL was
@@ -8676,25 +8681,25 @@ async def main() -> None:
         "recovered %d crash-orphaned SofaScore allocation attempts",
         recovered_allocations,
     )
-    try:
-        _compact_allocation_wal(
-            {
-                lease_id
-                for lease_id, state in _read_allocation_wal().items()
-                if not state.get("finished")
-            }
-        )
-    except Exception:
-        # Compaction is housekeeping: an uncompacted WAL still replays fine.
-        log.exception("SofaScore allocation WAL compaction failed; keeping the full WAL")
-
     if SOURCE_MODE == "sofascore-only":
+        for kind, path in (("wal", SOFASCORE_ALLOCATION_WAL_PATH), ("paid", LEDGER_PATH)):
+            try:
+                result = _compact_sofascore_registry(path, kind=kind)
+                if result:
+                    log.info("SofaScore startup registry compacted: %s", result)
+            except Exception:
+                log.exception("SofaScore startup %s compaction failed; original retained, admissions bounded", kind)
+    else:
         try:
-            result = _compact_registry(LEDGER_PATH, _REGISTRY_LOCK, kind="paid")
-            if result:
-                log.info("SofaScore startup registry compacted: %s", result)
+            _compact_allocation_wal(
+                {
+                    lease_id
+                    for lease_id, state in _read_allocation_wal().items()
+                    if not state.get("finished")
+                }
+            )
         except Exception:
-            log.exception("SofaScore startup compaction failed; original retained, admissions bounded")
+            log.exception("SofaScore allocation WAL compaction failed; keeping the full WAL")
 
     pidfile = str(getattr(args, "pidfile", "/tmp/filter_proxy.pid"))
     with open(pidfile, "w") as fh:
