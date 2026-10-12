@@ -114,6 +114,16 @@ class FakeControl:
         self.history_records = {
             record.logical_refresh_id: record for record in history_records
         }
+        self.frontier = {
+            f"fbref:season:{row['competition_id']}:{row['season_id']}": {
+                "state": "fetched",
+                "canonical_url": row["canonical_url"],
+            }
+            for row in self.currents
+        }
+
+    def get_frontier_target(self, target_id):
+        return self.frontier.get(target_id)
 
     def eligible_competitions(self):
         return list(self.competitions)
@@ -347,6 +357,70 @@ def test_comp255_same_source_id_is_no_change_not_demotion(tmp_path):
 
     assert evidence["plans"][0]["action"] == "no_change"
     assert evidence["plans"][0]["advertised_current_season_id"] == "2026"
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_current_registry_with_missing_root_requires_reconcile(tmp_path, apply):
+    """A partial rollover must not be hidden by the already-current registry."""
+    raw = RawPageStore.from_uri(tmp_path.as_uri())
+    competition = _competition(
+        raw, "82", last_season="2026-2027",
+        last_season_url="https://fbref.com/en/comps/82/Indian-Super-League-Stats",
+    )
+    history = _commit_history(raw, competition, """
+      <table id="seasons"><tbody><tr><th data-stat="season"><a
+        href="/en/comps/82/2025-2026/2026-Indian-Super-League-Stats"
+      >2026</a></th></tr></tbody></table>
+    """)
+    control = FakeControl(
+        [competition], [_current("82", "2026-2027", competition["metadata"]["last_season_url"])],
+        [history],
+    )
+    # The old 2026 alias is a different season, even at the same bare URL.
+    control.frontier = {"fbref:season:82:2026": {"state": "quarantined"}}
+    calls = []
+
+    class AtomicPipeline:
+        def __init__(self, *_args):
+            pass
+
+        def remediate_current_seasons(self, items):
+            calls.append(items)
+
+    result = remediation.run_remediation(
+        control, raw, competition_ids=["82"], apply=apply,
+        source_run_id=HISTORY_RUN_ID if apply else None,
+        pipeline_factory=AtomicPipeline,
+    )
+    assert result["plans"][0]["action"] == "reconcile"
+    assert result["reconcile_count"] == 1
+    assert len(calls) == int(apply)
+    if apply:
+        assert calls[0][0].evidence.resolved_season_id == "2026-2027"
+        assert calls[0][0].history_record == history
+
+
+@pytest.mark.parametrize("state", ["queued", "fetched", "leased", "quarantined", "skipped"])
+def test_existing_current_root_does_not_request_repair_or_requeue(tmp_path, state):
+    raw = RawPageStore.from_uri(tmp_path.as_uri())
+    url = "https://fbref.com/en/comps/82/Indian-Super-League-Stats"
+    competition = _competition(raw, "82", last_season="2026-2027", last_season_url=url)
+    history = _commit_history(raw, competition, f"""
+      <table id="seasons"><tbody><tr><th data-stat="season"><a
+        href="{url}">2026-2027</a></th></tr></tbody></table>
+    """)
+    control = FakeControl([competition], [_current("82", "2026-2027", url)], [history])
+    control.frontier["fbref:season:82:2026-2027"]["state"] = state
+
+    def forbidden(*_args):
+        raise AssertionError("Existing current root must not be reinstalled")
+
+    result = remediation.run_remediation(
+        control, raw, competition_ids=["82"], apply=True,
+        source_run_id=HISTORY_RUN_ID, pipeline_factory=forbidden,
+    )
+    assert result["plans"][0]["action"] == "no_change"
+    assert result["reconcile_count"] == 0
 
 
 def test_comp664_separates_index_label_id_from_history_url_identity(tmp_path):

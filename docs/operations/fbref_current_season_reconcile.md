@@ -167,6 +167,20 @@ Save the dry-run JSON. It reports both complete inputs: all `history_*` fields
 including `history_raw_manifest_key`, and all `index_*` fields including the
 successful snapshot/run/content/raw identity.
 
+An already-current registry entry is not sufficient for `no_change`: when the
+resolved source history/index yields a season page but its exact frontier target
+is absent, the plan reports `reconcile` and `missing_current_season_root=true`.
+This repairs a partial registry/frontier install, such as competition 82 after
+rollover to `2026-2027`. The old `82:2026` alias belongs to `2025-2026` and does
+not satisfy the current-root check. Existing roots, including quarantined roots,
+are not reopened by this check. Direct-match histories without a season page
+do not acquire a fabricated season root.
+
+Reinstallation restores discovery from the two committed raw inputs. It does
+not fetch or invent the new season's schedule: ordinary current-season discovery
+must subsequently fetch the new root and prove its schedule coverage. Apply
+still requires separate data-remediation approval and the guards below.
+
 Apply invocations must be grouped by the control run that owns those exact
 history observations. Find it read-only from `fetch_attempt`, then pass it:
 
