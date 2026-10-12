@@ -903,14 +903,35 @@ def cleanup_whoscored_dq_stage_partitions() -> dict:
     }
 
 
+def _tm_career_table(fq: str) -> str | None:
+    # Narrow dispatch: only the four source-global career relations.
+    plain = fq.replace('"', '')
+    tables = {
+        'transfermarkt_market_value_points', 'transfermarkt_transfer_events',
+        'transfermarkt_market_value_history', 'transfermarkt_transfers',
+    }
+    prefix = 'iceberg.bronze.'
+    table = plain[len(prefix):] if plain.startswith(prefix) else None
+    return table if table in tables else None
+
+
 def _exec_alter(conn, sql: str) -> dict:
-    """Execute ALTER TABLE ... EXECUTE ... and return parsed stats."""
-    cur = conn.cursor()
-    try:
-        cur.execute(sql)
-        return _row_to_stats(cur)
-    finally:
-        cur.close()
+    """Execute ALTER, retaining committing protection for TM career writers."""
+    def operation():
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            return _row_to_stats(cur)
+        finally:
+            cur.close()
+    match = re.match(r'ALTER TABLE (\S+) ', sql)
+    if match and _tm_career_table(match.group(1)):
+        from scrapers.transfermarkt.writer import _execute_committing, shared_writer_lock_ready
+        if not shared_writer_lock_ready():
+            logger.warning('TM maintenance skipped: shared host writer lock is not configured')
+            return {'maintenance_skipped': True, 'reason': 'shared_tm_writer_lock_required'}
+        return _execute_committing(operation)
+    return operation()
 
 
 def _quote_identifier(value: str) -> str:
@@ -1347,18 +1368,41 @@ def _compact_exact_files(
 
 
 def _maintain_one(conn, fq: str, retention_threshold: str) -> dict:
-    """Run expire_snapshots + remove_orphan_files on a single table.
+    """Keep TM immutable capture snapshots while applying normal other retention."""
+    table = _tm_career_table(fq)
+    if table:
+        from scrapers.transfermarkt.writer import writer_lock, shared_writer_lock_ready
+        if not shared_writer_lock_ready():
+            logger.warning('TM retention skipped: shared host writer lock is not configured')
+            return {'retention_skipped': True, 'reason': 'shared_tm_writer_lock_required',
+                'deleted_files_count': 0, 'scanned_files_count': 0}
+        from scrapers.transfermarkt.career_refs import TABLE, LEGACY_TABLES, ANCHORS_TABLE
+        native = next((key for key, legacy in LEGACY_TABLES.items() if legacy == table), table)
+        snapshot_field = 'legacy_snapshot_id' if table != native else 'snapshot_id'
+        with writer_lock():
+            try:
+                protected = int(_fetch_scalar(conn, f"SELECT COUNT(*) FROM {TABLE} WHERE native_table = '{native}' AND {snapshot_field} IS NOT NULL") or 0)
+            except Exception as exc:
+                if any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+                    protected = 0  # Pre-1399 source has no new immutable pins.
+                else:
+                    raise  # An unavailable pin registry cannot permit cleanup.
+            try:
+                protected += int(_fetch_scalar(conn, f"SELECT COUNT(*) FROM {ANCHORS_TABLE} WHERE table_name = '{table}'") or 0)
+            except Exception as exc:
+                if not any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+                    raise
+            if protected:
+                logger.info('TM retention preserved %s: %d immutable capture receipts', fq, protected)
+                return {'retention_skipped': True, 'protected_receipt_count': protected,
+                    'deleted_files_count': 0, 'scanned_files_count': 0}
+            return _maintain_one_unprotected(conn, fq, retention_threshold)
+    return _maintain_one_unprotected(conn, fq, retention_threshold)
 
-    Returns parsed stats from remove_orphan_files (deleted_files_count etc.).
-    """
-    _exec_alter(
-        conn,
-        f"ALTER TABLE {fq} EXECUTE expire_snapshots(retention_threshold => '{retention_threshold}')",
-    )
-    return _exec_alter(
-        conn,
-        f"ALTER TABLE {fq} EXECUTE remove_orphan_files(retention_threshold => '{retention_threshold}')",
-    )
+
+def _maintain_one_unprotected(conn, fq: str, retention_threshold: str) -> dict:
+    _exec_alter(conn, f"ALTER TABLE {fq} EXECUTE expire_snapshots(retention_threshold => '{retention_threshold}')")
+    return _exec_alter(conn, f"ALTER TABLE {fq} EXECUTE remove_orphan_files(retention_threshold => '{retention_threshold}')")
 
 
 def maintain_iceberg_tables(

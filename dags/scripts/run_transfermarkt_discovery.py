@@ -920,9 +920,9 @@ def _dataframe(rows: list[dict[str, Any]], columns: Sequence[str]) -> pd.DataFra
 
 
 def _default_writer_factory():
-    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.transfermarkt.writer import TransfermarktIcebergWriter
 
-    return IcebergWriter()
+    return TransfermarktIcebergWriter()
 
 
 def _write_snapshot(

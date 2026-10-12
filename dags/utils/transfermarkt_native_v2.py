@@ -12,6 +12,9 @@ The canonical reader contract is fail-safe:
 """
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement, is_mutation
+from scrapers.transfermarkt.career_refs import physical_predicate, apply_physical_refs
+
 import hashlib
 import json
 import os
@@ -1045,7 +1048,7 @@ def _normalise_scope(league: str, season: int) -> tuple[str, int]:
 
 
 def _scalar(cur, sql: str):
-    cur.execute(sql)
+    execute_statement(cur, sql)
     rows = cur.fetchall()
     return rows[0][0] if rows else None
 
@@ -1071,7 +1074,7 @@ def _fetch_in_chunks(cur, sql_template: str, values: Sequence[Any]) -> list[tupl
     rows: list[tuple] = []
     for chunk in _chunked(values):
         in_list = ', '.join(_sql_literal(item) for item in chunk)
-        cur.execute(sql_template.format(in_list=in_list))
+        execute_statement(cur, sql_template.format(in_list=in_list))
         rows.extend(cur.fetchall())
     return rows
 
@@ -1478,7 +1481,7 @@ def compatibility_adapter_sql_all() -> list[str]:
 
 
 def _relation_inventory(cur) -> dict[str, str]:
-    cur.execute("""
+    execute_statement(cur, """
 SELECT table_schema, table_name, table_type
 FROM iceberg.information_schema.tables
 WHERE table_schema IN ('silver', 'gold')
@@ -1490,13 +1493,13 @@ WHERE table_schema IN ('silver', 'gold')
 
 
 def _probe_relation(cur, relation: str) -> None:
-    cur.execute(f'SELECT * FROM {relation} WHERE false')
+    execute_statement(cur, f'SELECT * FROM {relation} WHERE false')
     cur.fetchall()
 
 
 def _relation_columns(cur, relation: str) -> list[tuple[str, str]]:
     _, schema, name = relation.split('.', 2)
-    cur.execute(
+    execute_statement(cur,
         'SELECT column_name, data_type '
         'FROM iceberg.information_schema.columns '
         f'WHERE table_schema = {_sql_literal(schema)} '
@@ -1735,7 +1738,7 @@ def verify_reader_views(
     """Verify every registered canonical view and, optionally, active route."""
     relations: dict[str, Any] = {}
     for relation in CANONICAL_READER_RELATIONS:
-        cur.execute(f'SHOW CREATE VIEW {relation.canonical}')
+        execute_statement(cur, f'SHOW CREATE VIEW {relation.canonical}')
         rows = list(cur.fetchall())
         ddl = ' '.join(str(value) for row in rows for value in row)
         normalised_ddl = ''.join(ddl.replace('"', '').lower().split())
@@ -1767,7 +1770,7 @@ def verify_reader_views(
         }
     route = None
     if expected_version is not None or expected_revision is not None:
-        cur.execute(reader_selector_sql())
+        execute_statement(cur, reader_selector_sql())
         rows = list(cur.fetchall())
         route = {
             'active_version': rows[0][0] if len(rows) == 1 else None,
@@ -1815,7 +1818,7 @@ FROM {STATE_TABLE}
 WHERE state_key = '{STATE_KEY}'
 """
     try:
-        cur.execute(sql)
+        execute_statement(cur, sql)
         rows = cur.fetchall()
     except Exception as exc:  # noqa: BLE001 - connector exception hierarchy varies
         if allow_missing and _table_missing(exc):
@@ -2031,7 +2034,7 @@ FROM ranked
 WHERE rn = 1
 ORDER BY entity
 """
-    cur.execute(sql)
+    execute_statement(cur, sql)
     rows = list(cur.fetchall())
     # Include expected literals in the function contract and query text for
     # production audit logs while intentionally reading every scope attached
@@ -2115,7 +2118,7 @@ def _native_manifest_rows(
 ) -> list[tuple[Any, ...]]:
     cycle = _normalise_cycle_id(cycle_id)
     expected_league, expected_season = _normalise_scope(league, season)
-    cur.execute(f"""
+    execute_statement(cur, f"""
 WITH ranked AS (
     SELECT m.*, ROW_NUMBER() OVER (
         PARTITION BY cycle_id, league, season, entity
@@ -2143,6 +2146,7 @@ def _validate_native_manifest(
     expected_revision: int,
     require_fresh: bool,
     require_live_batch: bool = True,
+    cycle_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     expected_league, expected_season = _normalise_scope(league, season)
     revision = _normalise_revision(expected_revision)
@@ -2166,7 +2170,10 @@ def _validate_native_manifest(
                 columns=pair.fingerprint_native_columns or pair.native_columns,
                 batch_id=str(batch_id or ''),
             )
-            cur.execute(projection)
+            if cycle_id is not None:
+                projection = apply_physical_refs(projection, table=pair.native_table, batch=str(batch_id or ''),
+                    predicate=physical_predicate(cur, cycle_id, name, pair.native_table, batch_id=str(batch_id or '')))
+            execute_statement(cur, projection)
             live_rows = list(cur.fetchall())
             live_count, live_hash = _fingerprint_rows(live_rows)
         else:
@@ -2254,12 +2261,15 @@ def run_parity(
                 'legacy_only': -1, 'native_only': -1, 'passed': False,
             }
             continue
+        capture_predicate = physical_predicate(cur, cycle, pair.name, pair.native_table, batch_id=evidence['native_batch_id'])
+        def bind_capture(sql):
+            return apply_physical_refs(sql, table=pair.native_table, batch=evidence['native_batch_id'], predicate=capture_predicate)
         legacy_sql, native_sql = pair.queries(
             legacy_batch_id=evidence['legacy_batch_id'],
             native_batch_id=evidence['native_batch_id'],
         )
-        legacy_only = int(_scalar(cur, legacy_sql) or 0)
-        native_only = int(_scalar(cur, native_sql) or 0)
+        legacy_only = int(_scalar(cur, bind_capture(legacy_sql)) or 0)
+        native_only = int(_scalar(cur, bind_capture(native_sql)) or 0)
         legacy_projection, native_projection = pair.projections(
             legacy_batch_id=evidence['legacy_batch_id'],
             native_batch_id=evidence['native_batch_id'],
@@ -2270,9 +2280,9 @@ def run_parity(
                 pair.fingerprint_native_columns or pair.native_columns
             ),
         )
-        cur.execute(legacy_projection)
+        execute_statement(cur, bind_capture(legacy_projection))
         live_legacy_rows = list(cur.fetchall())
-        cur.execute(native_projection)
+        execute_statement(cur, bind_capture(native_projection))
         live_native_rows = list(cur.fetchall())
         legacy_count, legacy_hash = _fingerprint_rows(live_legacy_rows)
         native_count, native_hash = _fingerprint_rows(live_native_rows)
@@ -2362,7 +2372,7 @@ FROM ranked
 WHERE rn = 1
 ORDER BY model_name
 """
-    cur.execute(sql)
+    execute_statement(cur, sql)
     rows = list(cur.fetchall())
     by_name = {str(row[3]): row for row in rows}
     exact = set(by_name) == set(MODEL_BY_NAME) and len(rows) == len(MODEL_BY_NAME)
@@ -2707,7 +2717,7 @@ def _coverage_result(
     warn_threshold: float = 0.80,
     error_threshold: float = 0.60,
 ) -> dict[str, Any]:
-    cur.execute(sql)
+    execute_statement(cur, sql)
     rows = list(cur.fetchall())
     total = int(rows[0][0]) if rows else 0
     matched = int(rows[0][1]) if rows else 0
@@ -2810,7 +2820,7 @@ def _scope_set_evidence(
     )
     scope_set = _normalise_scope_set_id(scope_set_id)
     revision = _normalise_revision(expected_revision)
-    cur.execute(f"""
+    execute_statement(cur, f"""
 SELECT registry_snapshot_id, capture_revision, parser_revision,
        schema_revision, reader_revision, scope_digests_json, traffic_json,
        status, committed_at,
@@ -3324,6 +3334,9 @@ ORDER BY cycle_id, entity
         ):
             raise ReadinessError(f'{key}: native write evidence drifted')
         pair = PARITY_BY_NAME[str(entity)]
+        capture_predicate = physical_predicate(cur, str(child), str(entity), pair.native_table, batch_id=str(native_batch))
+        def bind_capture(sql):
+            return apply_physical_refs(sql, table=pair.native_table, batch=str(native_batch), predicate=capture_predicate)
         if str(native_table) != pair.native_table:
             raise ReadinessError(f'{key}: native write table drifted')
         if write_mode == 'dual':
@@ -3339,8 +3352,8 @@ ORDER BY cycle_id, entity
                 legacy_batch_id=str(legacy_batch),
                 native_batch_id=str(native_batch),
             )
-            legacy_only = int(_scalar(cur, legacy_sql) or 0)
-            native_only = int(_scalar(cur, native_sql) or 0)
+            legacy_only = int(_scalar(cur, bind_capture(legacy_sql)) or 0)
+            native_only = int(_scalar(cur, bind_capture(native_sql)) or 0)
             legacy_projection, native_projection = pair.projections(
                 legacy_batch_id=str(legacy_batch),
                 native_batch_id=str(native_batch),
@@ -3351,7 +3364,7 @@ ORDER BY cycle_id, entity
                     pair.fingerprint_native_columns or pair.native_columns
                 ),
             )
-            cur.execute(legacy_projection)
+            execute_statement(cur, bind_capture(legacy_projection))
             live_legacy = _fingerprint_rows(list(cur.fetchall()))
         else:
             if str(row_write_mode) != 'native-only':
@@ -3365,7 +3378,7 @@ ORDER BY cycle_id, entity
             )
             legacy_only = native_only = 0
             live_legacy = None
-        cur.execute(native_projection)
+        execute_statement(cur, bind_capture(native_projection))
         live_native = _fingerprint_rows(list(cur.fetchall()))
         expected_fingerprint = (int(native_rows), str(native_hash))
         live_match = live_native == expected_fingerprint
@@ -3763,7 +3776,7 @@ def _legacy_coverage_floor_report(
         'WHERE league IS NOT NULL AND season IS NOT NULL'
         for table in LEGACY_SCOPE_TABLES
     )
-    cur.execute(f'SELECT league, season FROM (\n{union_sql}\n) ORDER BY 1, 2')
+    execute_statement(cur, f'SELECT league, season FROM (\n{union_sql}\n) ORDER BY 1, 2')
     legacy = {
         (str(row[0]).strip(), str(row[1]).strip()) for row in cur.fetchall()
     }
@@ -3812,7 +3825,7 @@ def _scope_set_monotonicity_report(
             'missing_scope_ids': [],
         }
     approved = _normalise_scope_set_id(approved_scope_set_id)
-    cur.execute(f"""
+    execute_statement(cur, f"""
 SELECT scope_digests_json
 FROM {scope_state.SCOPE_SET_MANIFEST_TABLE}
 WHERE scope_set_id = {_sql_literal(approved)}
@@ -4213,7 +4226,7 @@ def readiness(
             ),
             league=expected_league, season=expected_season,
             expected_revision=revision_expected, require_fresh=require_fresh,
-            require_live_batch=not historical_promoted_cycle,
+            require_live_batch=not historical_promoted_cycle, cycle_id=cycle,
         )
         parity = {
             name: {
@@ -4322,7 +4335,7 @@ def _key_fingerprint_table(
         f"COALESCE(LOWER(TO_HEX(CHECKSUM(CONCAT_WS(CHR(31), {expressions})))), '') "
         f'FROM {output_table}'
     )
-    cur.execute(sql)
+    execute_statement(cur, sql)
     rows = cur.fetchall()
     if not rows:
         raise ReadinessError(f'cannot fingerprint {output_table}')
@@ -4446,7 +4459,7 @@ INSERT INTO {MODEL_MANIFEST_TABLE} (
     {_sql_literal(payload['pinned_input_snapshot_ids'])}, CURRENT_TIMESTAMP
 )
 """
-        cur.execute(sql)
+        execute_statement(cur, sql)
         cur.fetchall()
         rows.append(payload)
     assert_reader_revision(cur, revision)
@@ -4654,8 +4667,8 @@ INSERT INTO {HISTORY_TABLE} (
 
 
 def _drain(cur, sql: str) -> list[tuple[Any, ...]]:
-    cur.execute(sql)
-    return list(cur.fetchall())
+    committed = execute_statement(cur, sql)
+    return list(committed) if is_mutation(sql) else list(cur.fetchall())
 
 
 def _timestamp_restore(value: Any) -> str:
@@ -5711,7 +5724,7 @@ def post_cleanup_verify(cur) -> dict[str, Any]:
         expected_slot=state.active_slot, allow_static_slot=True,
         require_no_legacy=True,
     )
-    cur.execute("""
+    execute_statement(cur, """
 SELECT table_schema, table_name, table_type
 FROM iceberg.information_schema.tables
 WHERE table_schema IN ('bronze', 'silver', 'gold')
@@ -6053,6 +6066,12 @@ def control_plane_bootstrap_sql() -> list[str]:
         f"ALTER TABLE {MODEL_MANIFEST_TABLE} ADD COLUMN IF NOT EXISTS scope_set_id varchar",
         f"ALTER TABLE {MODEL_MANIFEST_TABLE} ADD COLUMN IF NOT EXISTS pinned_input_snapshot_ids varchar",
         *scope_state.ddl_statements(),
+        "CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_snapshot_anchors_v1 (intent_sha256 varchar, table_name varchar, parent_snapshot_id bigint, capture_times_json varchar) WITH (format = 'PARQUET')",
+        "CREATE TABLE IF NOT EXISTS iceberg.ops.transfermarkt_career_capture_refs_v1 (cycle_id varchar, entity varchar, native_table varchar, refs_json varchar, refs_sha256 varchar, committed_at timestamp(6), snapshot_id bigint, legacy_snapshot_id bigint, native_batch_id varchar, capture_unit_id varchar, empty_proof_json varchar, capture_times_json varchar) WITH (format = 'PARQUET')",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS native_batch_id varchar",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS capture_unit_id varchar",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS empty_proof_json varchar",
+        "ALTER TABLE iceberg.ops.transfermarkt_career_capture_refs_v1 ADD COLUMN IF NOT EXISTS capture_times_json varchar",
     ]
 
 

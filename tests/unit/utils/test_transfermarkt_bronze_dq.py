@@ -31,6 +31,8 @@ def _default_rows(sql: str):
         return [(0, 0, 0)]
     if "classification_status = 'eligible'" in sql:
         return []
+    if 'WITH capture_references AS' in sql:
+        return [(0,)]
     if 'ROW_NUMBER() OVER' in sql:
         return []
     if 'payload_variants' in sql:
@@ -43,6 +45,8 @@ def _default_rows(sql: str):
         return [(781,)]
     if 'SELECT DISTINCT competition_id, edition_id' in sql:
         return [(10253,)]
+    if 'duplicate_keys' in sql or 'WITH capture_references AS' in sql:
+        return [(0,)]
     if 'GROUP BY' in sql:
         return []
     return [(0,)]

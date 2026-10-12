@@ -14,6 +14,8 @@ connection itself.
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement, is_mutation
+
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
@@ -802,8 +804,8 @@ class _SqlRunner:
 
     def execute(self, sql: str) -> list[dict[str, Any]]:
         if self._cursor is not None:
-            self._cursor.execute(sql)
-            rows = list(self._cursor.fetchall())
+            committed = execute_statement(self._cursor, sql)
+            rows = list(committed) if is_mutation(sql) else list(self._cursor.fetchall())
             description = self._cursor.description or ()
             columns = [self._column_name(item) for item in description]
             if not rows:

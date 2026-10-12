@@ -8,6 +8,8 @@ registry campaign construction, and bounded scope planning.
 
 from __future__ import annotations
 
+from scrapers.transfermarkt.writer import execute_statement
+
 import json
 import os
 from dataclasses import replace
@@ -96,7 +98,7 @@ def read_promoted_registry(
     conn = (connection_factory or tm_v2.connect)()
     cur = conn.cursor()
     try:
-        cur.execute(
+        execute_statement(cur,
             build_promoted_registry_query(
                 registry_snapshot_id=registry_snapshot_id,
             )
@@ -140,13 +142,13 @@ class BackfillStateRepository:
 
     def ensure_schema(self) -> None:
         for statement in state.ddl_statements():
-            self.cursor.execute(statement)
+            execute_statement(self.cursor, statement)
 
     def execute(self, statement: str) -> None:
-        self.cursor.execute(statement)
+        execute_statement(self.cursor, statement)
 
     def query(self, statement: str) -> list[dict[str, Any]]:
-        self.cursor.execute(statement)
+        execute_statement(self.cursor, statement)
         return _rows(self.cursor)
 
     def _parse_campaign_with_scopes(
@@ -204,7 +206,7 @@ class BackfillStateRepository:
     def persist(self, record: Any, statement: str) -> None:
         """Execute one idempotent mutation and prove the exact row won."""
 
-        self.cursor.execute(statement)
+        execute_statement(self.cursor, statement)
         rows = self.query(state.record_readback_sql(record))
         try:
             state.verify_record_readback(record, rows)
@@ -295,7 +297,7 @@ class BackfillStateRepository:
                 raise BackfillRuntimeError(
                     "initial scope chunk exceeds the Trino statement bound"
                 )
-            self.cursor.execute(statement)
+            execute_statement(self.cursor, statement)
             rows = self.query(state.initial_scope_chunk_readback_sql(chunk))
             try:
                 state.verify_initial_scope_chunk_readback(chunk, rows)
