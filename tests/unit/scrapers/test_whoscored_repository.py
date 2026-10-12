@@ -2437,7 +2437,9 @@ def test_scope_bundle_authoritative_empty_cannot_shrink_published_snapshot():
     writer = MagicMock()
     repository = WhoScoredRepository(writer=writer, trino=trino)
 
-    with pytest.raises(ValueError, match="published snapshot cannot shrink"):
+    from scrapers.whoscored.repository import ScheduleCompletenessError
+
+    with pytest.raises(ScheduleCompletenessError, match="published snapshot cannot shrink") as caught:
         repository.commit_scope_bundle(
             league="INT-World Cup",
             season="2026",
@@ -2449,6 +2451,47 @@ def test_scope_bundle_authoritative_empty_cannot_shrink_published_snapshot():
             source_empty={"whoscored_schedule"},
         )
 
+    assert isinstance(caught.value, ValueError)
+    assert (caught.value.new_count, caught.value.old_count) == (0, 1)
+    writer.write_dataframe.assert_not_called()
+
+
+@pytest.mark.unit
+def test_missing_schedule_ids_are_read_only_and_bound_to_scope():
+    trino = MagicMock()
+    trino.execute_query.return_value = [(1990155,), (1990104,), (1990155,)]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+    assert repository.missing_schedule_game_ids("WS-252-9", "2627", [1990104]) == (1990155,)
+    sql = trino.execute_query.call_args.args[0]
+    assert sql.startswith("SELECT game_id")
+    assert "whoscored_schedule_current" in sql
+    assert "league = 'WS-252-9' AND season = '2627'" in sql
+    writer.write_dataframe.assert_not_called()
+    trino._execute.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("observed_ids", [(1990104, 2999999), (1990104, 2999999, 3999999)])
+def test_schedule_recheck_rejects_missing_ids_even_when_count_recovers(observed_ids):
+    from scrapers.whoscored.repository import ScheduleCompletenessError
+
+    trino = MagicMock()
+    trino.execute_query.return_value = [(1990155,), (1990104,)]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+    with pytest.raises(ScheduleCompletenessError) as caught:
+        repository.commit_scope_bundle(
+            league="WS-252-9", season="2627", entity_group="season",
+            datasets={"whoscored_schedule": [{"game_id": i} for i in observed_ids]},
+            distinct_keys={"whoscored_schedule": "game_id"}, payload_sha256="a" * 64,
+            raw_uris=["s3://raw/fresh-month.json.gz"], require_schedule_game_ids=True,
+        )
+    assert caught.value.missing_game_ids == (1990155,)
+    assert caught.value.new_count == len(observed_ids)
+    assert caught.value.old_count == 2
+    assert trino.execute_query.call_count == 1
+    assert trino.execute_query.call_args.args[0].startswith("SELECT game_id")
     writer.write_dataframe.assert_not_called()
 
 
