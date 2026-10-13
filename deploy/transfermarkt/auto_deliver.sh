@@ -215,7 +215,8 @@ pool_desc(){
 }
 paused_key(){ printf 'PAUSED_%s' "$1"; }
 
-# Возврат пауз четырёх DAG и слотов пулов к снимку. Взводится, когда снимок записан.
+# Паузы четырёх DAG возвращаются к снимку. Слоты OLD восстанавливаются точно;
+# после успешного deploy NEW сохраняет свои TM-пулы по контракту streams.
 RESTORE_PENDING=""
 RESTORE_NOTE=""
 ROLLBACK_NOTE=""
@@ -229,11 +230,18 @@ restore_pause(){  # restore_pause <dag_id> <t|f>
   return 1
 }
 restore_state(){
+  local release="${1:-old}"
+  case "$release" in old|new) ;; *) return 1 ;; esac
   [ -n "$RESTORE_PENDING" ] || return 0
   RESTORE_PENDING=""
   RESTORE_NOTE=""
   local pool want dag
   for pool in $(rollback_pools); do
+    if [ "$release" = new ]; then
+      # deploy.sh уже применил canonical TM slots; старый снимок не должен
+      # включать history admission в новом H0. Общий ingest-пул сохраняем.
+      case " $POOLS " in *" $pool "*) continue ;; esac
+    fi
     want=$(snap_get "POOL_$pool")
     [ -n "$want" ] || continue
     if ! sched airflow pools set "$pool" "$want" "$(pool_desc "$pool")"; then
@@ -261,39 +269,46 @@ gateway_health_ok(){  # 1 / 0 / X по пробе transfermarkt_gateway_health_o
 }
 # Приёмка — шесть признаков: 4 DAG перечитаны ПОСЛЕ старта этого scheduler'а и без ошибок
 # импорта; scheduler healthy (heartbeat SchedulerJob); шлюз healthy на 1 GiB в проекте transfermarkt-gw; монты scheduler'а и шлюза в
-# этом дереве; /health шлюза в режиме transfermarkt-only; слоты пулов как в снимке.
+# этом дереве; /health шлюза в режиме transfermarkt-only; NEW-пулы по streams,
+# OLD-пулы точно как в снимке. Ответ остаётся 1/0/X; причина отказа идёт в лог.
+acceptance_result(){
+  log "ACCEPTANCE result=$1 predicate=$2 ${3:-}"
+  printf '%s\n' "$1"
+}
 acceptance_seen(){  # acceptance_seen <дерево> <StartedAt scheduler'а>
   local new="$1" started="$2" dags errs gw got c want
   dags=$(metadb "SELECT count(*) FROM dag WHERE dag_id IN ($CORE_DAGS_SQL) AND is_active AND NOT has_import_errors AND last_parsed_time > TIMESTAMPTZ '$started';")
   errs=$(metadb "SELECT count(*) FROM import_error;")
-  case "$dags$errs" in *X*) echo X; return ;; esac
-  [ "$dags" = 4 ] || { echo 0; return; }
-  [ "$errs" = 0 ] || { echo 0; return; }
+  case "$dags:$errs" in *X*|*[!0-9:]*) acceptance_result X dag_parse read_failed; return ;; esac
+  [ -n "$dags" ] && [ -n "$errs" ] || { acceptance_result X dag_parse missing_counts; return; }
+  [ "$dags" = 4 ] && [ "$errs" = 0 ] || { acceptance_result 0 dag_parse "parsed=$dags import_errors=$errs"; return; }
   # Живой SchedulerJob: healthcheck контейнера — `airflow jobs check` по heartbeat.
-  got=$(inspect -f '{{.State.Health.Status}}' "$SCHED") || { echo X; return; }
-  [ "$got" = healthy ] || { echo 0; return; }
-  gw=$(inspect -f '{{.State.Health.Status}} {{.HostConfig.Memory}} {{index .Config.Labels "com.docker.compose.project"}}' "$GW") || { echo X; return; }
-  [ "$gw" = "healthy 1073741824 transfermarkt-gw" ] || { echo 0; return; }
+  got=$(inspect -f '{{.State.Health.Status}}' "$SCHED") || { acceptance_result X scheduler_health inspect_failed; return; }
+  [ "$got" = healthy ] || { acceptance_result 0 scheduler_health "observed=$got"; return; }
+  gw=$(inspect -f '{{.State.Health.Status}} {{.HostConfig.Memory}} {{index .Config.Labels "com.docker.compose.project"}}' "$GW") || { acceptance_result X gateway_container inspect_failed; return; }
+  [ "$gw" = "healthy 1073741824 transfermarkt-gw" ] || { acceptance_result 0 gateway_container "observed=$gw"; return; }
   got=$(mounts_all_in "$new")
-  [ "$got" = X ] && { echo X; return; }
-  [ "$got" = 1 ] || { echo 0; return; }
+  [ "$got" = X ] && { acceptance_result X mounts inspect_failed; return; }
+  [ "$got" = 1 ] || { acceptance_result 0 mounts "expected_tree=$new"; return; }
   got=$(gateway_health_ok)
-  [ "$got" = X ] && { echo X; return; }
-  [ "$got" = 1 ] || { echo 0; return; }
+  [ "$got" = X ] && { acceptance_result X gateway_health probe_failed; return; }
+  [ "$got" = 1 ] || { acceptance_result 0 gateway_health probe_rejected; return; }
   local acceptance_pools="$POOLS"
   if [ "$new" = "$(snap_get OLD_RELEASE_ROOT)" ]; then
-    acceptance_pools=$(rollback_pools) || { echo X; return; }
-    [ -n "$acceptance_pools" ] || { echo X; return; }
+    acceptance_pools=$(rollback_pools) || { acceptance_result X pool_slots invalid_snapshot; return; }
+    [ -n "$acceptance_pools" ] || { acceptance_result X pool_slots missing_snapshot; return; }
   fi
   for c in $acceptance_pools; do
     got=$(metadb "SELECT slots FROM slot_pool WHERE pool='$c';")
-    [ "$got" = X ] && { echo X; return; }
+    case "$got" in X|*[!0-9]*) acceptance_result X pool_slots "pool=$c read_failed"; return ;; esac
+    [ -n "$got" ] || { acceptance_result 0 pool_slots "pool=$c missing"; return; }
     if [ "$new" = "$(snap_get OLD_RELEASE_ROOT)" ]; then
-      want=$(pool_want "$c") || { echo X; return; }
+      want=$(pool_want "$c") || { acceptance_result X pool_slots "pool=$c invalid_snapshot"; return; }
     else
-      want=$(timeout -k 5 30 docker exec "$SCHED" python -m scrapers.transfermarkt.airflow_pools --get "$c") || { echo X; return; }
+      want=$(timeout -k 5 30 docker exec "$SCHED" python -m scrapers.transfermarkt.airflow_pools --get "$c") || { acceptance_result X pool_slots "pool=$c helper_failed"; return; }
     fi
-    [ "$got" = "$want" ] || { echo 0; return; }
+    case "$want" in ''|*[!0-9]*) acceptance_result X pool_slots "pool=$c invalid_helper_output"; return ;; esac
+    [ "$got" = "$want" ] || { acceptance_result 0 pool_slots "pool=$c observed=$got expected=$want"; return; }
   done
   echo 1
 }
@@ -980,11 +995,11 @@ if [ "$rc" = 4 ]; then
   tg_durable "Transfermarkt: доставка ${WANT:0:8} не состоялась — контур занят (deploy.sh rc=4, бой не тронут).$why Лог: $LOG"
   exit 0
 fi
-# deploy.sh ставит пулы и паузы по умолчанию; снимок возвращаем ДО приёмки — приёмка
-# сверяет слоты пулов со снимком.
+# NEW сохраняет TM-пулы deploy.sh по streams; ДО приёмки возвращаем исходные паузы
+# и общий ingest-пул. Откат и EXIT-trap по умолчанию возвращают все OLD-пулы.
 restored=1
 if [ "$rc" = 0 ]; then
-  restore_state || restored=0
+  restore_state new || restored=0
 fi
 accept_deadline=$(( $(date -u +%s) + ACCEPT_WAIT ))
 accept_tries=$(( ACCEPT_WAIT / ACCEPT_POLL + 1 ))
@@ -1025,7 +1040,7 @@ if [ "$rc" = 0 ] && [ "$seen" = 1 ]; then
   orphans=$( { ls -d "$RELEASES_DIR"/freeze.* 2>/dev/null || true; } | grep -c . )
   [ "$orphans" = 0 ] || extra=" Осиротевших freeze.* — $orphans (убрать руками)."
   log "ДОСТАВЛЕНО: $NEW (sha ${WANT:0:8})"
-  tg_durable "Transfermarkt: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (4 DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, шлюз healthy в transfermarkt-gw, монты в новом дереве, /health transfermarkt-only, пулы как были). Деревьев release-*: $n.${extra}"
+  tg_durable "Transfermarkt: доставлено ${WANT:0:8} → $NEW, приёмка подтверждена (4 DAG перечитаны после старта нового scheduler'а, ошибок импорта нет, шлюз healthy в transfermarkt-gw, монты в новом дереве, /health transfermarkt-only, TM-пулы по streams, исходные паузы). Деревьев release-*: $n.${extra}"
   win_write "$TODAY" "DELIVERY_PHASE=finishing" || true
   rm -f "$INFLIGHT"
   window_close "$TODAY" delivered "приёмка подтверждена" t

@@ -21,12 +21,12 @@ from typing import Any
 from airflow import DAG
 from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.models.param import Param
-from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from utils.alerts import telegram_on_failure
 from utils.config import CURRENT_SEASON, DAG_TAGS, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
+from utils.transfermarkt_bash_operator import TransfermarktBashOperator
 
 # The budget canon (scrapers/transfermarkt/models.py) is stdlib-only and is
 # the single source for every paid-traffic number the DAG pins.
@@ -1324,7 +1324,7 @@ with DAG(
         retries=0,
     )
 
-    run_exact_child_cycle_task = BashOperator.partial(
+    run_exact_child_cycle_task = TransfermarktBashOperator.partial(
         task_id='run_exact_child_cycle',
         bash_command=r'''set -euo pipefail
 cd /opt/airflow
