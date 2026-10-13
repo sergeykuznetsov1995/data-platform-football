@@ -154,6 +154,8 @@ def _walk_local_raw_files(store: RawPageStore) -> Iterator[_RawObjectInfo]:
                         path=str(entry.path),
                         size=int(metadata.st_size),
                         mtime_ns=int(metadata.st_mtime_ns),
+                        # Keep this diagnostic identity for legacy baselines;
+                        # it is not strong evidence for content-hash reuse.
                         version_token=(
                             f"local:{metadata.st_dev}:{metadata.st_ino}:"
                             f"{metadata.st_ctime_ns}"
@@ -275,7 +277,7 @@ def _walk_s3_raw_files(store: RawPageStore) -> Iterator[_RawObjectInfo]:
 
 
 def _walk_raw_files(store: RawPageStore) -> Iterator[_RawObjectInfo]:
-    """Enumerate raw objects with bounded pages and strong version tokens."""
+    """Enumerate bounded raw metadata with backend version evidence."""
 
     if isinstance(store.filesystem, fs.LocalFileSystem):
         yield from _walk_local_raw_files(store)
@@ -732,7 +734,7 @@ def _hydrate_current_hashes_from_baseline(
     store: RawPageStore,
     connection: sqlite3.Connection,
 ) -> None:
-    """Reuse immutable baseline hashes and read only new/rewritten objects."""
+    """Reuse strong baseline versions and hash every weakly versioned object."""
 
     updates: list[tuple[str, str]] = []
     rows = connection.execute(
@@ -756,6 +758,7 @@ def _hydrate_current_hashes_from_baseline(
             baseline_sha256 is not None
             and int(current_size) == int(baseline_size)
             and bool(current_version)
+            and not str(current_version).startswith("local:")
             and str(current_version) == str(baseline_version)
         ):
             digest = str(baseline_sha256)
@@ -811,7 +814,7 @@ def _verify_unversioned_objects_match(
     for key, size in current.execute(
         """
         SELECT key, encoded_bytes FROM current_object
-        WHERE version_token = '' ORDER BY key
+        WHERE version_token = '' OR version_token LIKE 'local:%' ORDER BY key
         """
     ):
         row = baseline.execute(
@@ -836,13 +839,14 @@ def _find_unstable_unversioned_object(
     for key, size in after.execute(
         """
         SELECT key, encoded_bytes FROM current_object
-        WHERE version_token = '' ORDER BY key
+        WHERE version_token = '' OR version_token LIKE 'local:%' ORDER BY key
         """
     ):
         row = before.execute(
             """
             SELECT sha256 FROM current_object
-            WHERE key = ? AND encoded_bytes = ? AND version_token = ''
+            WHERE key = ? AND encoded_bytes = ?
+              AND (version_token = '' OR version_token LIKE 'local:%')
             """,
             (key, size),
         ).fetchone()
@@ -1333,10 +1337,10 @@ def audit_raw_fetches(
 ) -> dict[str, Any]:
     """Verify attempts by reusing immutable hashes from the pre-run baseline.
 
-    Production audit performs two bounded metadata walks and hashes only
-    objects created or rewritten since the baseline. The full raw store is
-    content-hashed once, when that baseline is captured. Evidence lists are
-    capped while all verdict counts remain exact.
+    Strong backend versions allow hashes to be reused for unchanged objects.
+    Local stat tokens and absent versions require content reads on both audit
+    boundaries. Metadata walks and evidence lists remain bounded while all
+    verdict counts remain exact.
     """
 
     normalized_run_id = str(uuid.UUID(str(control_run_id)))

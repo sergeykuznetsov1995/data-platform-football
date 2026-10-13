@@ -6,6 +6,7 @@ import stat
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
+from dataclasses import replace
 from types import SimpleNamespace
 from threading import Barrier
 from unittest.mock import MagicMock, call
@@ -37,6 +38,24 @@ ATTEMPT_ID = "f1c2d5bb-a992-4423-baad-49841a1f1140"
 SECOND_RUN_ID = "d9135bf5-0a1b-4782-8f0c-70bf80fe2f38"
 THIRD_RUN_ID = "cab3cd10-6e35-4389-bda9-dac52e265610"
 FOURTH_RUN_ID = "4abbb2be-482e-4779-9e66-d7ce12f0d3c0"
+
+
+@pytest.fixture(params=["local", "strong"])
+def inventory_version_policy(request, monkeypatch):
+    """Exercise real local metadata and a content-versioned listing fixture.
+
+    The strong case models object-store version evidence. Its fixture hashes
+    small local payloads to provide tokens; it is not a claim of zero local IO.
+    Real S3 ETag/listing and pagination tests remain unchanged.
+    """
+    if request.param == "strong":
+        def listing(store):
+            for info in raw_audit_module._walk_local_raw_files(store):
+                key = store._relative_path(info.path)
+                token = "fixture-sha256:" + hashlib.sha256(store._read_bytes(key)).hexdigest()
+                yield replace(info, version_token=token)
+        monkeypatch.setattr(raw_audit_module, "_walk_raw_files", listing)
+    return request.param
 
 
 def _seed(tmp_path):
@@ -910,7 +929,7 @@ def test_s3_inventory_fails_on_repeated_continuation_token(monkeypatch):
         list(raw_audit_module._walk_s3_raw_files(MagicMock(root="bucket/raw")))
 
 def test_audit_reuses_baseline_hashes_then_uses_metadata_guard(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, inventory_version_policy
 ):
     store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
     for number in range(32):
@@ -929,7 +948,7 @@ def test_audit_reuses_baseline_hashes_then_uses_metadata_guard(
     )
 
     assert result["status"] == "passed"
-    assert hash_spy.call_count == 0
+    assert hash_spy.call_count == (0 if inventory_version_policy == "strong" else 64)
     assert result["raw_inventory_after"]["content_hashed"] is False
     assert "objects" not in result["raw_inventory_before"]
     assert "objects" not in result["raw_inventory_after"]
@@ -945,7 +964,7 @@ def test_inventory_fails_closed_at_explicit_object_bound(tmp_path):
 
 
 def test_streaming_baseline_and_disk_backed_audit_do_not_materialize_objects(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, inventory_version_policy
 ):
     store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
     object_count = 1_537  # Cross several SQLite update batches.
@@ -981,11 +1000,11 @@ def test_streaming_baseline_and_disk_backed_audit_do_not_materialize_objects(
     )
 
     assert result["status"] == "passed"
-    assert hash_spy.call_count == 0
+    assert hash_spy.call_count == (0 if inventory_version_policy == "strong" else 2 * object_count)
 
 
 def test_next_run_baseline_reuses_authenticated_rolling_hashes(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, inventory_version_policy
 ):
     store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
     store._write_bytes("immutable/a.bin", b"first")
@@ -1013,11 +1032,11 @@ def test_next_run_baseline_reuses_authenticated_rolling_hashes(
     assert second.summary["fingerprint_sha256"] == first.summary[
         "fingerprint_sha256"
     ]
-    assert hash_spy.call_count == 0
+    assert hash_spy.call_count == (0 if inventory_version_policy == "strong" else 6)
 
 
 def test_next_run_baseline_hashes_only_changed_and_new_objects(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, inventory_version_policy
 ):
     store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
     store._write_bytes("immutable/unchanged.bin", b"same")
@@ -1049,10 +1068,12 @@ def test_next_run_baseline_hashes_only_changed_and_new_objects(
         store, second_path, reuse_inventory=prior
     )
 
-    assert hashed_keys == [
-        "immutable/changed.bin",
-        "immutable/new.bin",
-    ]
+    if inventory_version_policy == "strong":
+        assert hashed_keys == ["immutable/changed.bin", "immutable/new.bin"]
+    else:
+        # Local capture checks all three objects at each publication boundary.
+        assert len(hashed_keys) == 9
+        assert set(hashed_keys) == {"immutable/changed.bin", "immutable/new.bin", "immutable/unchanged.bin"}
 
 
 @pytest.mark.parametrize("failure_kind", ["corrupt", "untrusted"])
@@ -1157,7 +1178,7 @@ def test_raw_inventory_index_retention_cleans_only_old_anchored_successes(
 
 @pytest.mark.parametrize("crash_after", ["index", "digest", "commit"])
 def test_streaming_baseline_recovers_from_every_publish_boundary_without_rehash(
-    tmp_path, monkeypatch, crash_after
+    tmp_path, monkeypatch, crash_after, inventory_version_policy
 ):
     store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
     for number in range(16):
@@ -1213,7 +1234,7 @@ def test_streaming_baseline_recovers_from_every_publish_boundary_without_rehash(
     assert path == destination
     assert baseline.summary["object_count"] == 16
     assert idempotent is True
-    assert hash_spy.call_count == 0
+    assert hash_spy.call_count == (0 if inventory_version_policy == "strong" or crash_after == "commit" else 16)
     result = audit_raw_fetches(
         store,
         [],
@@ -1222,7 +1243,7 @@ def test_streaming_baseline_recovers_from_every_publish_boundary_without_rehash(
         require_nonempty=False,
     )
     assert result["status"] == "passed"
-    assert hash_spy.call_count == 0
+    assert hash_spy.call_count == (0 if inventory_version_policy == "strong" else 32 + (0 if crash_after == "commit" else 16))
 
 
 def test_partial_streaming_baseline_is_bound_to_original_raw_root(
@@ -1255,7 +1276,7 @@ def test_partial_streaming_baseline_is_bound_to_original_raw_root(
 
 
 def test_concurrent_streaming_baseline_writers_use_one_full_hasher(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, inventory_version_policy
 ):
     store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
     for number in range(32):
@@ -1280,10 +1301,10 @@ def test_concurrent_streaming_baseline_writers_use_one_full_hasher(
     assert sum(not idempotent for _path, _inventory, idempotent in results) == 1
     digests = {inventory.baseline_sha256 for _path, inventory, _ in results}
     assert len(digests) == 1
-    assert hash_spy.call_count == 32
+    assert hash_spy.call_count == (32 if inventory_version_policy == "strong" else 96)
 
 
-def test_audit_hashes_only_the_single_rewritten_object(tmp_path, monkeypatch):
+def test_audit_hashes_only_the_single_rewritten_object(tmp_path, monkeypatch, inventory_version_policy):
     store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
     store._write_bytes("immutable/a.bin", b"first")
     store._write_bytes("immutable/b.bin", b"second")
@@ -1303,7 +1324,7 @@ def test_audit_hashes_only_the_single_rewritten_object(tmp_path, monkeypatch):
 
     assert result["status"] == "failed"
     assert result["baseline_delta"]["content_changed_object_count"] == 1
-    assert hash_spy.call_count == 1
+    assert hash_spy.call_count == (1 if inventory_version_policy == "strong" else 4)
 
 
 def test_audit_detects_same_size_rewrite_with_restored_positive_mtime(
@@ -1334,7 +1355,7 @@ def test_audit_detects_same_size_rewrite_with_restored_positive_mtime(
 
     assert result["status"] == "failed"
     assert result["baseline_delta"]["content_changed_object_count"] == 1
-    assert hash_spy.call_count == 1
+    assert hash_spy.call_count == 2
 
 
 def test_baseline_capture_detects_change_before_publishing_commit(
@@ -1358,7 +1379,10 @@ def test_baseline_capture_detects_change_before_publishing_commit(
         raw_audit_module, "_walk_raw_files", mutate_after_first_walk
     )
 
-    with pytest.raises(RawAuditError, match="changed while baseline"):
+    with pytest.raises(
+        RawAuditError,
+        match="changed while baseline|unversioned raw object changed",
+    ):
         capture_and_write_raw_inventory(store, destination)
 
     assert not destination.exists()
@@ -1545,3 +1569,138 @@ def test_concurrent_conflicting_baseline_writer_cannot_overwrite(tmp_path):
     assert sum(isinstance(item, RawAuditError) for item in outcomes) == 1
     installed, _digest = load_inventory_baseline(destination)
     assert installed in (first, second)
+
+
+def test_local_audit_rejects_same_size_rewrite_with_identical_metadata(tmp_path, monkeypatch):
+    store, _record, attempt = _seed(tmp_path)
+    target = match_page_target("096e63eb")
+    store.commit_fetch(
+        target, b"<html>other target</html>",
+        logical_refresh_id="867855e2-3db6-49fa-b56a-c2e6ff1c8502",
+        attempt_id="055fbfd6-6839-4302-8ffd-1aef8a1f50ac", http_status=200,
+    )
+    # Freeze the real enumeration seam, including size/mtime/version token.
+    # Content reads remain real, so the regression does not depend on jiffy timing.
+    frozen = tuple(raw_audit_module._walk_raw_files(store))
+    monkeypatch.setattr(raw_audit_module, "_walk_raw_files", lambda _store: iter(frozen))
+    baseline = capture_raw_inventory(store)
+    key = store._v2_target_manifest_key(target)
+    original = store._read_bytes(key)
+    rewritten = original.replace(b"\n", b" ", 1)
+    assert rewritten != original and len(rewritten) == len(original)
+    store._write_bytes(key, rewritten)
+    result = audit_raw_fetches(store, [attempt], control_run_id=RUN_ID, baseline_inventory=baseline)
+    assert result["status"] == "failed"
+    assert result["baseline_delta"]["immutable_content_changes"] == [key]
+    assert result["baseline_delta"]["allowed_target_mirror_changes"] == []
+
+
+def test_local_inventory_stat_tokens_do_not_allow_hash_reuse(tmp_path, monkeypatch):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    store._write_bytes("immutable/object.bin", b"content")
+    objects = list(raw_audit_module._walk_local_raw_files(store))
+    assert len(objects) == 1 and objects[0].version_token.startswith("local:")
+    baseline = capture_raw_inventory(store)
+    hash_spy = MagicMock(side_effect=raw_audit_module._hash_raw_object)
+    monkeypatch.setattr(raw_audit_module, "_hash_raw_object", hash_spy)
+    result = audit_raw_fetches(
+        store, [], control_run_id=RUN_ID, baseline_inventory=baseline,
+        require_nonempty=False,
+    )
+    assert result["status"] == "passed"
+    assert hash_spy.call_count == 2
+
+
+def test_local_audit_rehashes_an_existing_baseline_with_legacy_stat_tokens(tmp_path, monkeypatch):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    key = "immutable/object.bin"
+    store._write_bytes(key, b"first")
+    current_walk = raw_audit_module._walk_raw_files
+
+    def legacy_listing(raw_store):
+        for info in current_walk(raw_store):
+            yield replace(info, version_token="local:device:inode:old-ctime")
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(raw_audit_module, "_walk_raw_files", legacy_listing)
+        baseline = capture_raw_inventory(store)
+    store._write_bytes(key, b"other")
+    result = audit_raw_fetches(
+        store, [], control_run_id=RUN_ID, baseline_inventory=baseline,
+        require_nonempty=False,
+    )
+    assert result["status"] == "failed"
+    assert result["baseline_delta"]["immutable_content_changes"] == [key]
+
+
+def test_local_audit_detects_a_rewrite_during_audit_with_identical_metadata(tmp_path, monkeypatch):
+    store, _record, attempt = _seed(tmp_path)
+    target = match_page_target("096e63eb")
+    store.commit_fetch(
+        target, b"<html>other target</html>",
+        logical_refresh_id="867855e2-3db6-49fa-b56a-c2e6ff1c8502",
+        attempt_id="055fbfd6-6839-4302-8ffd-1aef8a1f50ac", http_status=200,
+    )
+    frozen = tuple(raw_audit_module._walk_raw_files(store))
+    monkeypatch.setattr(raw_audit_module, "_walk_raw_files", lambda _store: iter(frozen))
+    baseline = capture_raw_inventory(store)
+    key = store._v2_target_manifest_key(target)
+    original = store._read_bytes(key)
+    rewritten = original.replace(b"\n", b" ", 1)
+    assert rewritten != original and len(rewritten) == len(original)
+    original_audit = raw_audit_module._audit_one
+
+    def rewrite_after_validating_attempt(raw_store, row):
+        result = original_audit(raw_store, row)
+        raw_store._write_bytes(key, rewritten)
+        return result
+
+    monkeypatch.setattr(raw_audit_module, "_audit_one", rewrite_after_validating_attempt)
+    result = audit_raw_fetches(store, [attempt], control_run_id=RUN_ID, baseline_inventory=baseline)
+    assert result["status"] == "failed"
+    assert any(item["error_class"] == "RawInventoryChanged" for item in result["failures"])
+
+
+def test_local_legacy_baseline_accepts_unchanged_content_for_zero_delta_replay(tmp_path, monkeypatch):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    store._write_bytes("immutable/object.bin", b"content")
+    info = next(raw_audit_module._walk_local_raw_files(store))
+    stat_before = os.stat(info.path)
+    # Preserve the exact pre-fix token format rather than silently migrating it.
+    assert info.version_token == (
+        f"local:{stat_before.st_dev}:{stat_before.st_ino}:{stat_before.st_ctime_ns}"
+    )
+    baseline = capture_raw_inventory(store)
+    hash_spy = MagicMock(side_effect=raw_audit_module._hash_raw_object)
+    monkeypatch.setattr(raw_audit_module, "_hash_raw_object", hash_spy)
+    result = audit_raw_fetches(
+        store, [], control_run_id=RUN_ID, baseline_inventory=baseline,
+        require_nonempty=False, require_zero_delta=True,
+    )
+    assert result["status"] == "passed"
+    assert result["baseline_delta"]["metadata_only_change_count"] == 0
+    assert result["baseline_delta"]["content_changed_object_count"] == 0
+    assert hash_spy.call_count == 2
+
+
+def test_local_partial_legacy_baseline_rechecks_content_when_resumed(tmp_path, monkeypatch):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    store._write_bytes("immutable/object.bin", b"content")
+    destination = tmp_path / "acceptance" / "baseline.json"
+    original_publish = raw_audit_module._publish_prepared_file
+
+    def crash_after_index(prepared, target, **kwargs):
+        result = original_publish(prepared, target, **kwargs)
+        if str(target).endswith(".sqlite3"):
+            raise RuntimeError("synthetic crash after legacy-format index")
+        return result
+
+    with monkeypatch.context() as partial:
+        partial.setattr(raw_audit_module, "_publish_prepared_file", crash_after_index)
+        with pytest.raises(RuntimeError, match="synthetic crash"):
+            capture_and_write_raw_inventory(store, destination)
+    hash_spy = MagicMock(side_effect=raw_audit_module._hash_raw_object)
+    monkeypatch.setattr(raw_audit_module, "_hash_raw_object", hash_spy)
+    _, baseline, idempotent = capture_and_write_raw_inventory(store, destination)
+    assert idempotent is True and baseline.summary["object_count"] == 1
+    assert hash_spy.call_count == 1
