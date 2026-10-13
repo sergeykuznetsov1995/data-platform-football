@@ -77,6 +77,7 @@ from scrapers.whoscored.proxy_campaign import (
     approval_from_campaign_authority_context,
     assert_paid_runtime_available,
     canonical_json_bytes,
+    canonical_stage_statistics_path,
     proxy_campaign_authority_context,
     strict_json_loads,
 )
@@ -2385,8 +2386,10 @@ _WHOSCORED_STRUCTURED_FEED_PATHS = (
     re.compile(r"\A/stagestatfeed/[1-9][0-9]*/stageteams/\Z"),
 )
 _WHOSCORED_STAGE_BOOTSTRAP_PATH = re.compile(
-    r"\A/Regions/[1-9][0-9]*/Tournaments/[1-9][0-9]*/"
-    r"Seasons/[1-9][0-9]*/Stages/[1-9][0-9]*/TeamStatistics\Z"
+    r"\A/Regions/([1-9][0-9]*)/Tournaments/([1-9][0-9]*)/"
+    r"Seasons/([1-9][0-9]*)/Stages/([1-9][0-9]*)/TeamStatistics"
+    r"(?:/[^/]+)?\Z",
+    re.IGNORECASE | re.ASCII,
 )
 
 
@@ -2407,17 +2410,74 @@ def _is_whoscored_structured_feed_url(url: str) -> bool:
 
 
 def _is_whoscored_stage_bootstrap_url(url: str) -> bool:
-    parts = urlsplit(url)
+    if any(character.isspace() for character in url):
+        return False
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
     return bool(
         parts.scheme.lower() == "https"
         and parts.hostname == "www.whoscored.com"
-        and parts.port is None
+        and port is None
         and parts.username is None
         and parts.password is None
         and not parts.query
         and not parts.fragment
         and _WHOSCORED_STAGE_BOOTSTRAP_PATH.fullmatch(parts.path)
+        and canonical_stage_statistics_path(parts.path) == parts.path
     )
+
+
+class _StageStatisticsLinks(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.links.append(href)
+
+
+def stage_statistics_url_from_html(
+    html: str,
+    *,
+    region_id: Optional[int],
+    tournament_id: Optional[int],
+    season_id: int,
+    stage_id: int,
+) -> Optional[str]:
+    """Use a source navigation link only for the exact requested stage.
+
+    Source pages supply lowercase paths with a season slug. Constructing a
+    slugless bootstrap yields HTTP 301; following that redirect would weaken
+    the existing source-token binding. Selecting the published link needs no
+    extra request and keeps redirect following disabled.
+    """
+    source = _StageStatisticsLinks()
+    source.feed(html)
+    source.close()
+    expected = tuple(str(value) for value in (region_id, tournament_id, season_id, stage_id))
+    for href in source.links:
+        try:
+            url = urljoin("https://www.whoscored.com/", href)
+            parts = urlsplit(url)
+            path = canonical_stage_statistics_path(parts.path)
+            if path is None:
+                continue
+            url = parts._replace(path=path).geturl()
+            if not _is_whoscored_stage_bootstrap_url(url):
+                continue
+            match = _WHOSCORED_STAGE_BOOTSTRAP_PATH.fullmatch(urlsplit(url).path)
+            if match is not None and match.groups() == expected:
+                return url
+        except ValueError:
+            # Malformed or foreign anchors do not authorize another route.
+            continue
+    return None
 
 
 class _StageStatisticsHTML(HTMLParser):

@@ -7,6 +7,7 @@ import time
 import traceback
 import types
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 import requests
@@ -1448,7 +1449,7 @@ def test_exact_masked_redirect_is_not_followed_but_uses_direct_browser():
         TEAM_STATS_BOOTSTRAP + "#fragment",
         TEAM_STATS_BOOTSTRAP.replace("/Regions/247/", "/Regions/x/"),
         TEAM_STATS_BOOTSTRAP.replace("/TeamStatistics", "/PlayerStatistics"),
-        TEAM_STATS_BOOTSTRAP + "/extra",
+        TEAM_STATS_BOOTSTRAP + "/extra/path",
         TEAM_STATS_BOOTSTRAP.replace("/Stages/", "/Stages%2f"),
     ],
 )
@@ -5938,6 +5939,109 @@ def test_statistics_bootstrap_redirect_cannot_bind_destination_token():
     assert not isinstance(caught.value, StageStatisticsUnavailable)
     assert direct.calls[0][2]["allow_redirects"] is False
     assert transport._stage_http_context is None
+
+
+def test_source_statistics_link_bootstraps_without_redirect_and_binds_xhr():
+    # Shape observed in saved source HTML from the failed weekly run 12 Oct.
+    bootstrap = (
+        "https://www.whoscored.com/regions/252/tournaments/2/seasons/10743/"
+        "stages/24533/teamstatistics/england-premier-league-2025-2026"
+    )
+    feed = TEAM_STATS_URL.replace("23752", "24533")
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=_statistics_html()), FakeHTTPResponse(content=b"{}")
+    )
+    transport, _ = _transport(direct)
+    transport.prepare_stage_statistics(bootstrap, cache_key="bootstrap")
+    response = transport.fetch(feed, browser_bootstrap_url=bootstrap)
+    assert response.route is TransportRoute.DIRECT_HTTP
+    assert direct.calls[0][0] == bootstrap
+    assert direct.calls[0][2]["allow_redirects"] is False
+    assert direct.calls[1][2]["headers"]["Model-last-Mode"] == STAGE_TOKEN
+    assert direct.calls[1][2]["headers"]["Referer"] == bootstrap
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        "http://www.whoscored.com/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england",
+        "https://other.example/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england",
+        "https://www.whoscored.com:444/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england",
+        "https://user:secret@www.whoscored.com/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england",
+        "/regions/253/tournaments/2/seasons/10743/stages/24533/teamstatistics/england",
+        "/regions/252/tournaments/3/seasons/10743/stages/24533/teamstatistics/england",
+        "/regions/252/tournaments/2/seasons/11141/stages/24533/teamstatistics/england",
+        "/regions/252/tournaments/2/seasons/10743/stages/25544/teamstatistics/england",
+        "/regions/252/tournaments/2/seasons/10743/stages/24533/playerstatistics/england",
+        "/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england?stageId=25544",
+        "/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england#other",
+        "/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/../matches",
+        "https://www.whoscored.com:invalid/path",
+        "https://[malformed/path",
+    ],
+)
+def test_source_statistics_link_ignores_foreign_or_malformed_navigation(foreign):
+    canonical = (
+        "/regions/252/tournaments/2/seasons/10743/stages/24533/"
+        "teamstatistics/england-premier-league-2025-2026"
+    )
+    html = f'<a href="{foreign}">wrong</a><a href="{canonical}">Team Statistics</a>'
+    ids = dict(region_id=252, tournament_id=2, season_id=10743, stage_id=24533)
+    assert transport_module.stage_statistics_url_from_html(html, **ids) == (
+        "https://www.whoscored.com" + canonical
+    )
+    assert transport_module.stage_statistics_url_from_html(
+        f'<a href="{foreign}">wrong</a>', **ids
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "season,stage,slug",
+    [(10743, 24533, "england-premier-league-2025-2026"),
+     (11141, 25544, "england-premier-league-2026-2027")],
+)
+def test_source_statistics_link_from_saved_navigation(season, stage, slug):
+    path = Path(__file__).resolve().parents[2] / "fixtures/whoscored/statistics_navigation_excerpt.html"
+    url = transport_module.stage_statistics_url_from_html(
+        path.read_text(), region_id=252, tournament_id=2, season_id=season, stage_id=stage
+    )
+    assert url == (
+        f"https://www.whoscored.com/regions/252/tournaments/2/seasons/{season}/"
+        f"stages/{stage}/teamstatistics/{slug}"
+    )
+
+
+@pytest.mark.parametrize("season,stage,year", [(10621, 24121, 2025), (10980, 25039, 2026)])
+def test_source_unicode_statistics_link_becomes_exact_wire_uri(season, stage, year):
+    source = (
+        f"/regions/31/tournaments/95/seasons/{season}/stages/{stage}/"
+        f"teamstatistics/brazil-brasileirão-{year}"
+    )
+    uri = "https://www.whoscored.com" + source.replace("ã", "%C3%A3")
+    url = transport_module.stage_statistics_url_from_html(
+        (Path(__file__).parents[2] / "fixtures/whoscored/statistics_navigation_excerpt.html").read_text(),
+        region_id=31, tournament_id=95, season_id=season, stage_id=stage,
+    )
+    assert url == uri
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=_statistics_html()), FakeHTTPResponse(content=b"{}")
+    )
+    transport, _ = _transport(direct)
+    transport.prepare_stage_statistics(url, cache_key="bootstrap")
+    transport.fetch(TEAM_STATS_URL.replace("23752", str(stage)), browser_bootstrap_url=url)
+    assert direct.calls[0][0] == uri
+    assert direct.calls[0][2]["allow_redirects"] is False
+    assert direct.calls[1][2]["headers"]["Referer"] == uri
+    assert direct.calls[1][2]["headers"]["Model-last-Mode"] == STAGE_TOKEN
+
+
+@pytest.mark.parametrize("slug", ["bad%C3", "bad%FF", "bad%2Fslug", "bad%252Fslug", "bad%2Eslug", "bad%00slug", "bad\\slug", "bad%3Fslug"])
+def test_source_statistics_link_rejects_ambiguous_encoded_slug(slug):
+    path = "/regions/31/tournaments/95/seasons/10980/stages/25039/teamstatistics/" + slug
+    assert transport_module.stage_statistics_url_from_html(
+        f'<a href="{path}">Team Statistics</a>',
+        region_id=31, tournament_id=95, season_id=10980, stage_id=25039,
+    ) is None
 
 
 # --- #1478 review: cache age and browser navigation evidence ------------------

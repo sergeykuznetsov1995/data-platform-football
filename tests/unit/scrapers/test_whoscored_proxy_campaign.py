@@ -163,6 +163,64 @@ def _approval(**kwargs) -> ProxyCampaignApproval:
     return result
 
 
+@pytest.mark.parametrize("family", ["/Regions", "/Regions/252/Tournaments/2/Seasons/10743/Stages/24533"])
+def test_signed_region_family_accepts_official_statistics_route_alias(family):
+    raw = _allocation("source-statistics", phase="capture", budget=10)
+    raw["allowed_path_families"] = [family]
+    allocation = ProxyWorkAllocation.from_dict(raw)
+    approval = _approval(allocations=[raw], paths=[family], discovery=0, capture=10, daily=10)
+    original = approval.to_dict()
+    url = (
+        "https://www.whoscored.com/regions/252/tournaments/2/seasons/10743/"
+        "stages/24533/teamstatistics/england-premier-league-2025-2026"
+    )
+    assert allocation.allows_url(url, allowed_hosts=("www.whoscored.com",))
+    assert approval.allows_url(url, allocation_id=allocation.allocation_id)
+    assert approval.to_dict() == original
+    assert not path_matches_family(url.split(".com", 1)[1], family)
+
+
+@pytest.mark.parametrize(
+    "host,path",
+    [
+        ("other.example", "/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england"),
+        ("www.whoscored.com", "/regions/253/tournaments/2/seasons/10743/stages/24533/teamstatistics/england"),
+        ("www.whoscored.com", "/regions/252/tournaments/3/seasons/10743/stages/24533/teamstatistics/england"),
+        ("www.whoscored.com", "/regions/252/tournaments/2/seasons/11141/stages/24533/teamstatistics/england"),
+        ("www.whoscored.com", "/regions/252/tournaments/2/seasons/10743/stages/25544/teamstatistics/england"),
+        ("www.whoscored.com", "/regions/252/tournaments/2/seasons/10743/stages/24533/playerstatistics/england"),
+        ("www.whoscored.com", "/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/../england"),
+        ("www.whoscored.com", "/regions/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/%2e%2e"),
+        ("www.whoscored.com", "/regionsevil/252/tournaments/2/seasons/10743/stages/24533/teamstatistics/england"),
+    ],
+)
+def test_signed_statistics_alias_preserves_origin_and_narrow_family(host, path):
+    family = "/Regions/252/Tournaments/2/Seasons/10743/Stages/24533"
+    raw = _allocation("source-statistics", phase="capture", budget=10)
+    raw["allowed_path_families"] = [family]
+    allocation = ProxyWorkAllocation.from_dict(raw)
+    approval = _approval(allocations=[raw], paths=[family], discovery=0, capture=10, daily=10)
+    url = f"https://{host}{path}"
+    # Even if an unrelated host were explicitly permitted, it gets no aliases.
+    assert not allocation.allows_url(url, allowed_hosts=("www.whoscored.com", host))
+    assert not approval.allows_url(url, allocation_id=allocation.allocation_id)
+
+
+def test_signed_statistics_alias_accepts_encoded_source_unicode_slug():
+    raw = _allocation("brazil-statistics", phase="capture", budget=10)
+    raw["allowed_path_families"] = ["/Regions/31/Tournaments/95/Seasons/10980/Stages/25039"]
+    allocation = ProxyWorkAllocation.from_dict(raw)
+    approval = _approval(allocations=[raw], paths=raw["allowed_path_families"], discovery=0, capture=10, daily=10)
+    original = approval.to_dict()
+    url = (
+        "https://www.whoscored.com/regions/31/tournaments/95/seasons/10980/"
+        "stages/25039/teamstatistics/brazil-brasileir%C3%A3o-2026"
+    )
+    assert allocation.allows_url(url, allowed_hosts=("www.whoscored.com",))
+    assert approval.allows_url(url, allocation_id=allocation.allocation_id)
+    assert approval.to_dict() == original
+
+
 def _runtime_context(
     approval: ProxyCampaignApproval,
     allocation_id: str = "allocation-capture",

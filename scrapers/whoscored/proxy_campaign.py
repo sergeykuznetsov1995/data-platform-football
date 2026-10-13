@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 
 # Schema v2 is retained for the explicit manual/canary flow.  A scheduled
@@ -909,7 +909,38 @@ def _path_families(value: object, field: str) -> tuple[str, ...]:
     return paths
 
 
-def path_matches_family(path: str, family: str) -> bool:
+_SOURCE_STATISTICS_PATH = re.compile(
+    r"\A/regions/[1-9][0-9]*/tournaments/[1-9][0-9]*/"
+    r"seasons/[1-9][0-9]*/stages/[1-9][0-9]*/teamstatistics"
+    r"(?:/([^/]+))?\Z",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def canonical_stage_statistics_path(path: str) -> str | None:
+    """Encode one source slug without normalizing route keywords or IDs."""
+    if not _is_canonical_target_path(path):
+        return None
+    match = _SOURCE_STATISTICS_PATH.fullmatch(path)
+    if match is None:
+        return None
+    slug = match.group(1)
+    if slug is None:
+        return path
+    try:
+        decoded = unquote(slug, encoding="utf-8", errors="strict")
+        if not decoded or not decoded[0].isalnum() or any(
+            not character.isalnum() and character not in "-_" for character in decoded
+        ):
+            return None
+        return path[:match.start(1)] + quote(decoded, safe="-_")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return None
+
+
+def path_matches_family(
+    path: str, family: str, *, whoscored_stage_alias: bool = False
+) -> bool:
     """Match an exact root or a prefix on a slash boundary.
 
     ``/`` is deliberately the exact site root rather than a wildcard.  This
@@ -922,6 +953,19 @@ def path_matches_family(path: str, family: str) -> bool:
     if family == "/":
         return path == "/"
     prefix = family.rstrip("/")
+    if path == prefix or path.startswith(prefix + "/"):
+        return True
+    if whoscored_stage_alias and canonical_stage_statistics_path(path) == path:
+        # Source navigation spells these fixed route keywords in lowercase.
+        # Recognize their aliases only on the checked WhoScored origin; keep
+        # signed families, numeric IDs and the source slug byte-for-byte.
+        segments = path.split("/")
+        for position, keyword in (
+            (1, "Regions"), (3, "Tournaments"), (5, "Seasons"),
+            (7, "Stages"), (9, "TeamStatistics"),
+        ):
+            segments[position] = keyword
+        path = "/".join(segments)
     return path == prefix or path.startswith(prefix + "/")
 
 
@@ -1000,7 +1044,10 @@ class ProxyWorkAllocation:
             and parts.password is None
             and not parts.fragment
             and any(
-                path_matches_family(parts.path or "/", family)
+                path_matches_family(
+                    parts.path or "/", family,
+                    whoscored_stage_alias=parts.hostname == "www.whoscored.com",
+                )
                 for family in self.allowed_path_families
             )
         )
@@ -1892,7 +1939,10 @@ class ProxyCampaignApproval:
             parts.scheme == "https"
             and host in self.allowed_hosts
             and any(
-                path_matches_family(path, item) for item in self.allowed_path_families
+                path_matches_family(
+                    path, item,
+                    whoscored_stage_alias=parts.hostname == "www.whoscored.com",
+                ) for item in self.allowed_path_families
             )
             and self.allocation(allocation_id).allows_url(
                 url, allowed_hosts=self.allowed_hosts
