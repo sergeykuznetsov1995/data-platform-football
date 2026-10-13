@@ -1582,6 +1582,75 @@ def _inventory_dataset(json_paths):
     )
 
 
+def test_1291_published_inventory_accepts_reclassified_paths_without_deleting_old_rows():
+    writer = ReconcileWriter()
+    commit = _commit()
+    old = {**_inventory_row('content.stats'), '_target_batch_id': commit.batch_id}
+    writer.rows['fotmob_field_inventory'] = [old.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    reclassified = {**_inventory_row('content.stats'), 'disposition': 'raw_only'}
+    dataset = TableRows('fotmob_field_inventory', [reclassified, _inventory_row('content.new')], 'field_inventory')
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [dataset])
+    repository.flush()
+    stored = writer.rows['fotmob_field_inventory']
+    assert old in stored
+    assert {(row['json_path'], row['disposition']) for row in stored} == {
+        ('content.stats', 'typed'), ('content.stats', 'raw_only'), ('content.new', 'typed'),
+    }
+    assert all(not kwargs.get('delete_filter') for _, kwargs in writer.calls)
+    restarted = FotMobRepository(writer=writer, batch_size=50)
+    restarted.commit(commit, [dataset])
+    restarted.flush()
+    assert len(writer.rows['fotmob_field_inventory']) == 3
+
+
+def test_1291_inventory_retry_after_append_lost_response_does_not_duplicate_keys():
+    writer = ReconcileWriter(fail_after_commit='fotmob_field_inventory')
+    commit = _commit()
+    old = {**_inventory_row('content.old'), '_target_batch_id': commit.batch_id}
+    writer.rows['fotmob_field_inventory'] = [old.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_inventory_dataset(['content.old', 'content.new'])])
+    with pytest.raises(RuntimeError, match='lost writer response'):
+        repository.flush()
+    repository.flush()
+    assert len(writer.rows['fotmob_field_inventory']) == 2
+    assert old in writer.rows['fotmob_field_inventory']
+
+
+def test_1291_duplicate_published_inventory_key_still_fails_closed():
+    writer = ReconcileWriter()
+    commit = _commit()
+    old = {**_inventory_row('content.old'), '_target_batch_id': commit.batch_id}
+    writer.rows['fotmob_field_inventory'] = [old.copy(), old.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_inventory_dataset(['content.new'])])
+    with pytest.raises(RuntimeError, match='matching row identity'):
+        repository.flush()
+    assert writer.rows['fotmob_field_inventory'] == [old, old]
+
+
+def test_1291_inventory_reconciles_partially_landed_append_without_rewriting_keys():
+    writer = ReconcileWriter()
+    commit = _commit()
+    old = {**_inventory_row('content.old'), '_target_batch_id': commit.batch_id}
+    writer.rows['fotmob_field_inventory'] = [old.copy()]
+    writer.rows[MANIFEST_TABLE] = [commit.manifest_row()]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [_inventory_dataset(['content.old', 'content.new', 'content.more'])])
+    landed = {**_inventory_row('content.new'), '_target_batch_id': commit.batch_id}
+    writer.rows['fotmob_field_inventory'].append(landed.copy())
+    repository.flush()
+    assert len(writer.rows['fotmob_field_inventory']) == 3
+    assert old in writer.rows['fotmob_field_inventory'] and landed in writer.rows['fotmob_field_inventory']
+    inventory_writes = [frame for frame, kwargs in writer.calls if kwargs['table'] == 'fotmob_field_inventory']
+    assert len(inventory_writes) == 1
+    assert inventory_writes[0]['json_path'].tolist() == ['content.more']
+
+
 def test_orphan_batch_without_manifest_row_is_overwritten():
     # Боевая волна 20.09 (#1311): в fotmob_field_inventory с 16.09 лежали 172
     # строки одного матча без строки в манифесте, и сверка роняла всю волну.

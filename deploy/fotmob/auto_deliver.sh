@@ -789,6 +789,8 @@ fi
 # после момента доставки, и судит по её исходу: success — принято, красная — откат.
 # Волны истории (mode=backfill) вердикта не выносят: их краснота штатна (E4,
 # retryable source_gap) и от нашего кода не зависит — решение владельца 07.09.
+# Успех transfers не принимает актуалку: после него ждём refresh/daily.
+# Ошибку раннера и недоступный task-лог проверяем до исключений полос.
 wave_guard(){ # $1 = путь маркера фазы
   # Подменённый путь — та же мина, что и у прочих маркеров автомата: писать по нему
   # нельзя (запись пойдёт ПО ссылке), а верить ему — тем более: подменённый вердикт
@@ -966,7 +968,7 @@ wave_acceptance(){
   # есть у ВСЕХ волн (строку `FotMob wave metrics` пишут не все). Ручные прогоны
   # (manual__…) отсекаем: у них conf может быть пустым. Пробелов в ответе быть не
   # должно — metadb() их вырезает, поэтому дата идёт через to_char.
-  rows=$(metadb "SELECT run_id||'|'||state||'|'||to_char(start_date,'YYYY-MM-DD\"T\"HH24:MI:SS')||'|'||coalesce((regexp_match(regexp_replace(encode(conf,'escape'),'[^ -~]+','|','g'),'mode.{0,12}(refresh|backfill|daily)'))[1],'') FROM dag_run WHERE dag_id='dag_ingest_fotmob' AND run_id LIKE 'fotmob_orchestrated\_\_%' AND state IN ('success','failed') AND start_date > '$wave_t' ORDER BY start_date;")
+  rows=$(metadb "SELECT run_id||'|'||state||'|'||to_char(start_date,'YYYY-MM-DD\"T\"HH24:MI:SS')||'|'||coalesce((regexp_match(regexp_replace(encode(conf,'escape'),'[^ -~]+','|','g'),'mode.{0,12}(refresh|backfill|daily|transfers)'))[1],'') FROM dag_run WHERE dag_id='dag_ingest_fotmob' AND run_id LIKE 'fotmob_orchestrated\_\_%' AND state IN ('success','failed') AND start_date > '$wave_t' ORDER BY start_date;")
   if [ "$rows" = X ]; then
     log "вторая фаза приёмки: список волн после $wave_t не прочитан — проверю следующим заходом"
     return 0
@@ -1011,6 +1013,14 @@ wave_acceptance(){
       if [ "$st" = failed ] && ! said_today "$STATE/fotmob-wave-history-red-$run"; then
         tg_durable "ℹ️ FotMob: красная волна истории \`$run\` ($started) после доставки $head_now — ошибки раннера в логе нет, это не откат. Жду первую волну актуалки."
         mark_said "$STATE/fotmob-wave-history-red-$run"
+      fi
+      continue
+    fi
+    if [ "$mode" = transfers ]; then
+      if [ "$st" = failed ]; then
+        wave_rollback "$pending" "$verdict" "$run" \
+          "красная волна трансферов, ошибки раннера нет — причина не установлена; проверить отчёт волны и ошибки операций перед отдельным разрешением на повторную доставку"
+        return 0
       fi
       continue
     fi

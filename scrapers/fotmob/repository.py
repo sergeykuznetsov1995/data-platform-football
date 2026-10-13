@@ -1716,6 +1716,27 @@ class FotMobRepository:
             if actual:
                 if successes is None:
                     successes = self._successful_batch_ids(by_batch)
+                if (
+                    inventory_keys
+                    and successes is not None
+                    and batch_id in successes
+                    and all(
+                        row.get(column) is not None
+                        for row in actual
+                        for column in ("target_type", "json_path", "disposition")
+                    )
+                    and all(count == 1 for count in row_multiset(actual, columns, types).values())
+                    and all(count == 1 for count in wanted.values())
+                ):
+                    # Inventory is a scope-wide set, not immutable target
+                    # payload. A field-map revision can add dispositions under
+                    # the same raw/parser batch id. Preserve published keys and
+                    # append only missing ones, including after a lost response.
+                    remaining.extend(
+                        row for row in original_by_batch[batch_id]
+                        if not row_multiset([row], columns, encoded_types).keys() <= present.keys()
+                    )
+                    continue
                 if successes is None or batch_id in successes:
                     raise RuntimeError(
                         f"{table}: batch {batch_id} has {len(actual)} stored "
