@@ -974,8 +974,9 @@ def test_schedule_rejects_extra_source_stage_even_with_one_absent(tmp_path):
     assert "source_stage_absent" not in result.metadata
 
 
+@pytest.mark.parametrize("statistics_source", ["season", "calendar", "missing"])
 def test_schedule_collects_observed_stages_when_source_drops_one(
-    tmp_path, monkeypatch, caplog
+    tmp_path, monkeypatch, caplog, statistics_source
 ):
     # #1598: League Cup 26/27 - the source dropped a frozen catalog stage.
     # The remaining stage is collected and committed, the absence is recorded.
@@ -998,6 +999,15 @@ def test_schedule_collects_observed_stages_when_source_drops_one(
     calendar_html = """
     <script>var wsCalendar = {mask:{2026:{6:{1:1}}}};</script>
     """
+    statistics_url = (
+        "/regions/247/tournaments/36/seasons/9001/stages/700/"
+        "teamstatistics/world-cup-2026"
+    )
+    link = f'<a href="{statistics_url}">Team Statistics</a>'
+    if statistics_source == "season":
+        stage_html += link
+    elif statistics_source == "calendar":
+        calendar_html += link
     fetched_stage_ids = []
 
     def fake_fetch(target, **kwargs):
@@ -1042,6 +1052,16 @@ def test_schedule_collects_observed_stages_when_source_drops_one(
 
     service._fetch = fake_fetch
 
+    collected = []
+    original_collect = service._collect_season_schedule
+
+    def collect():
+        result = original_collect()
+        collected.append(result)
+        return result
+
+    service._collect_season_schedule = collect
+
     with caplog.at_level("WARNING", logger="scrapers.whoscored.service"):
         result = service.sync_schedule()
 
@@ -1055,6 +1075,10 @@ def test_schedule_collects_observed_stages_when_source_drops_one(
     assert result.counts["schedule"] == 1
     assert len(repository.scope_snapshots) == 1
     assert "no longer lists frozen catalog stage(s) [699]" in caplog.text
+    assert collected[0].stage_statistics_urls == (
+        {} if statistics_source == "missing"
+        else {700: "https://www.whoscored.com" + statistics_url}
+    )
 
 
 def test_structured_rate_limit_is_wired_into_example_and_airflow_environment():
@@ -4072,6 +4096,22 @@ def test_xg_only_two_feeds_and_persistent_check_metadata(tmp_path):
         "whoscored_team_stage_stats",
         "whoscored_player_stage_stats",
     }
+
+
+def test_xg_uses_source_statistics_link_for_bootstrap_and_all_pages(tmp_path):
+    service, _, _, prepared, fetched, _, _ = _xg_service(tmp_path)
+    collected = service._collect_season_schedule()
+    bootstrap = (
+        "https://www.whoscored.com/regions/247/tournaments/36/seasons/9001/"
+        "stages/700/teamstatistics/world-cup-2026"
+    )
+    collected.stage_statistics_urls = {700: bootstrap}
+    service._collect_season_schedule = lambda: collected
+    result = service.sync_stage_feeds()
+    assert result.status == "success", result.errors
+    assert prepared[0]["url"] == bootstrap
+    assert all(spec.browser_bootstrap_url == bootstrap for spec in fetched)
+    assert fetched[1].page_factory(2).browser_bootstrap_url == bootstrap
 
 
 @pytest.mark.parametrize("negative", [False, True])

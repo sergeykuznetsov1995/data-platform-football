@@ -98,6 +98,7 @@ from .transport import (
     TransportResponse,
     WhoScoredTransport,
     WhoScoredTransportError,
+    stage_statistics_url_from_html,
 )
 
 from .source_circuit import SourceCircuitOpen
@@ -286,6 +287,7 @@ class _SeasonSchedule:
     raw_uris: list[str]
     payload_hashes: list[str]
     source_stage_absent: list[int] = field(default_factory=list)
+    stage_statistics_urls: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2296,6 +2298,7 @@ class WhoScoredIngestService:
         season_dataset_statuses: dict[str, list[DatasetStatus]] = {
             name: [] for name in season_dataset_rows
         }
+        stage_statistics_urls: dict[int, str] = {}
         for stage in stage_rows:
             stage_id = int(stage["stage_id"])
             # Discovery and scope ingestion share one raw target.  Bind it
@@ -2335,6 +2338,17 @@ class WhoScoredIngestService:
                 cache_ttl=WEEKLY_SCHEDULE_PAGE_CACHE_TTL if active else None,
             )
             months, stage_tables = calendar_bundle
+            statistics_ids = {
+                "region_id": self.competition.region_id,
+                "tournament_id": self.competition.tournament_id,
+                "season_id": source_season_id,
+                "stage_id": stage_id,
+            }
+            statistics_url = stage_statistics_url_from_html(
+                calendar_response.text, **statistics_ids
+            ) or stage_statistics_url_from_html(season_response.text, **statistics_ids)
+            if statistics_url is not None:
+                stage_statistics_urls[stage_id] = statistics_url
             for name, dataset in stage_tables.items():
                 season_dataset_rows[name].extend(dataset.rows)
                 season_dataset_statuses[name].append(dataset.status)
@@ -2462,6 +2476,7 @@ class WhoScoredIngestService:
             raw_uris=raw_uris,
             payload_hashes=payload_hashes,
             source_stage_absent=source_stage_absent,
+            stage_statistics_urls=stage_statistics_urls,
         )
 
     def sync_schedule(self) -> EntityResult:
@@ -2747,7 +2762,7 @@ class WhoScoredIngestService:
                     retained.add(stage_id)
                     result.metadata["stage_xg_deferred"].append(stage_id)
                     continue
-                bootstrap_url = (
+                bootstrap_url = getattr(collected, "stage_statistics_urls", {}).get(stage_id) or (
                     f"https://www.whoscored.com/Regions/{self.competition.region_id}"
                     f"/Tournaments/{self.competition.tournament_id}"
                     f"/Seasons/{collected.source_season_id}/Stages/{stage_id}/TeamStatistics"
