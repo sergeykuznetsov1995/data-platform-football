@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import errno
+import math
 import fcntl
 import os
 import socket
@@ -70,6 +71,19 @@ def safe_error_chain(value):
     return result
 
 
+def safe_session_diagnostics(value):
+    """Local Session lifecycle only; this does not attest TCP connection reuse."""
+    if type(value) is not dict:
+        return {}
+    sequence, idle, recycled = (value.get('session_sequence'),
+                               value.get('session_idle_ms'), value.get('session_recycled'))
+    return dict(
+        session_sequence=sequence if type(sequence) is int and 1 <= sequence <= 2**63 - 1 else None,
+        session_idle_ms=idle if type(idle) in (int, float) and 0 <= idle <= 2**63 - 1 and math.isfinite(idle) else None,
+        session_recycled=recycled if type(recycled) is bool else None,
+    )
+
+
 def exception_chain(error):
     """Inspect exception objects without rendering messages or custom properties."""
     pending, seen, result = [error], set(), []
@@ -129,7 +143,7 @@ class AttemptJournal:
         return row['attempt_id']
 
     def finish(self, attempt_id, *, status, timeout, http_ms, direct_bytes, complete=True,
-               error_type=None, error_phase=None, error_chain=None):
+               error_type=None, error_phase=None, error_chain=None, session_diagnostics=None):
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
             found = db.execute('SELECT payload FROM attempts WHERE id=?', (attempt_id,)).fetchone()
@@ -141,6 +155,7 @@ class AttemptJournal:
             row.update(error_type=safe_error_type(error_type) if error_type is not None else None,
                        error_phase=error_phase if type(error_phase) is str and error_phase in _ERROR_PHASES else None,
                        error_chain=safe_error_chain(error_chain))
+            row.update(safe_session_diagnostics(session_diagnostics))
             db.execute('UPDATE attempts SET payload=?, dirty=1 WHERE id=?', (json.dumps(row), attempt_id))
 
     def rows(self, start=None, end=None):
