@@ -1108,3 +1108,206 @@ def test_worker_has_own_session_ledger_queue_but_shared_gate_and_spool(tmp_path,
         worker.session.close()
         client.close()
         client.session.close()
+
+class OwnedSession(FakeSession):
+    def __init__(self, clock, duration=0):
+        super().__init__([])
+        self.clock = clock
+        self.duration = duration
+        self.close_calls = 0
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        self.clock[0] += self.duration
+        return FakeResponse(200, b'{"ok":true}')
+
+    def close(self):
+        self.close_calls += 1
+
+
+def _owned_history(monkeypatch, tmp_path, *, lane='history', duration=0):
+    clock, sessions = [0.0], []
+
+    def factory():
+        session = OwnedSession(clock, duration)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(requests, 'Session', factory)
+    client = EspnHttpClient(EspnRawStore.from_uri(tmp_path.as_uri()),
+                           gate=_gate(tmp_path, lane=lane), environ={},
+                           monotonic_fn=lambda: clock[0])
+    return client, clock, sessions
+
+
+def _history_fetch(client, *, refresh=True):
+    return client.fetch_json(
+        WEB + '/apis/site/v2/sports/soccer/summary?event=1',
+        EndpointType.SUMMARY, force_refresh=refresh)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('idle,recycled', [(19.999, False), (20.0, True), (30.0, True)])
+def test_owned_history_session_idle_boundary(monkeypatch, tmp_path, idle, recycled):
+    client, clock, sessions = _owned_history(monkeypatch, tmp_path)
+    assert _history_fetch(client).status == 200
+    clock[0] = idle
+    assert _history_fetch(client).status == 200
+    assert len(sessions) == (2 if recycled else 1)
+    assert sessions[0].close_calls == int(recycled)
+    rows = client.attempt_journal.rows()
+    assert len(rows) == 2 and all(row['complete'] for row in rows)
+    assert rows[0]['session_sequence'] == 1 and rows[0]['session_idle_ms'] is None
+    assert rows[1]['session_sequence'] == (1 if recycled else 2)
+    assert rows[1]['session_idle_ms'] == pytest.approx(idle * 1000)
+    assert rows[1]['session_recycled'] is recycled
+    for session in sessions:
+        assert session.trust_env is False and session.proxies == {}
+        assert session.headers['User-Agent'] == 'data-platform-football/espn-native-v2'
+        assert session.headers['Accept'] == 'application/json'
+        assert session.headers['Accept-Encoding'] == 'gzip, deflate'
+    assert sum(len(s.calls) for s in sessions) == 2
+    client.close()
+
+
+@pytest.mark.unit
+def test_history_idle_starts_after_slow_http_and_cache_does_not_reset_it(monkeypatch, tmp_path):
+    client, clock, sessions = _owned_history(monkeypatch, tmp_path, duration=30)
+    _history_fetch(client)
+    assert clock[0] == 30
+    assert client.attempt_journal.rows()[0]['http_ms'] == 30000
+    clock[0] = 49.999
+    _history_fetch(client)
+    assert len(sessions) == 1  # 49.999 seconds since start, 19.999 since finish
+    clock[0] += 19
+    assert _history_fetch(client, refresh=False).cache_hit
+    clock[0] += 1
+    _history_fetch(client)
+    assert len(sessions) == 2
+    assert len(client.attempt_journal.rows()) == 3
+    client.close()
+
+
+@pytest.mark.unit
+def test_idle_session_scope_live_external_and_false_external(monkeypatch, tmp_path):
+    client, clock, sessions = _owned_history(monkeypatch, tmp_path / 'live', lane='live')
+    _history_fetch(client); clock[0] = 100; _history_fetch(client)
+    assert len(sessions) == 1 and sessions[0].close_calls == 0
+    assert 'session_sequence' not in client.attempt_journal.rows()[0]
+    client.close()
+
+    class FalseSession(OwnedSession):
+        def __bool__(self):
+            return False
+
+    for number, cls in enumerate((OwnedSession, FalseSession)):
+        external = cls(clock)
+        other = EspnHttpClient(EspnRawStore.from_uri((tmp_path / str(number)).as_uri()),
+                               gate=_gate(tmp_path / str(number), lane='history'),
+                               session=external, environ={}, monotonic_fn=lambda: clock[0])
+        _history_fetch(other); clock[0] += 100; _history_fetch(other)
+        assert other.session is external and external.close_calls == 0
+        assert 'session_sequence' not in other.attempt_journal.rows()[0]
+        other.close()
+
+
+@pytest.mark.unit
+def test_history_workers_have_independent_idle_sessions(monkeypatch, tmp_path):
+    parent, clock, sessions = _owned_history(monkeypatch, tmp_path)
+    worker = parent.worker()
+    _history_fetch(parent)
+    clock[0] = 10
+    _history_fetch(worker)
+    clock[0] = 20
+    _history_fetch(parent)
+    _history_fetch(worker)
+    assert len(sessions) == 3
+    assert [s.close_calls for s in sessions] == [1, 0, 0]
+    assert [len(s.calls) for s in sessions] == [1, 2, 1]
+    parent.close(); worker.close()
+
+
+@pytest.mark.unit
+def test_owned_session_never_closes_during_an_inflight_response(monkeypatch, tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    from scrapers.espn.transport import _Attempts
+    client, clock, sessions = _owned_history(monkeypatch, tmp_path)
+    _history_fetch(client)
+    clock[0] = 10
+    entered, release = threading.Event(), threading.Event()
+    original_get = sessions[0].get
+
+    def blocking_get(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_get(*args, **kwargs)
+
+    sessions[0].get = blocking_get
+    permit = client.gate.acquire(client.gate.policy.cluster_of(WEB))
+    def attempt():
+        tries = _Attempts(client._now_iso()); tries.start(permit)
+        return client._http_attempt(permit, WEB, EndpointType.SUMMARY, tries)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(attempt)
+        assert entered.wait(2)
+        clock[0] = 30
+        second = pool.submit(attempt)
+        try:
+            # With no lifecycle lock, this call rotates the active old pool
+            # (its last completed request was at zero) and returns immediately.
+            with pytest.raises(FutureTimeout):
+                second.result(timeout=0.1)
+            assert sessions[0].close_calls == 0
+        finally:
+            release.set()
+        first.result(timeout=5); second.result(timeout=5)
+    assert len(sessions) == 1 and sessions[0].close_calls == 0
+    assert [r['session_sequence'] for r in client.attempt_journal.rows()] == [1, 2, 3]
+    client.close()
+
+@pytest.mark.unit
+def test_history_failed_pool_close_is_incomplete_and_does_not_hide_primary_error(monkeypatch, tmp_path):
+    client, clock, sessions = _owned_history(monkeypatch, tmp_path)
+    _history_fetch(client)
+    clock[0] = 20
+    def broken_close():
+        raise requests.ConnectionError('private close failure')
+    sessions[0].close = broken_close
+    with pytest.raises(DirectTransportError):
+        _history_fetch(client)
+    row = client.attempt_journal.rows()[-1]
+    assert row['complete'] is False and row['status'] is None and not row['timeout']
+    assert row['error_type'] == 'ConnectionError' and 'private' not in str(row)
+    assert len(sessions[0].calls) == 1 and sessions[1].close_calls == 1
+    # A failed preparation must not reset network idle and defer a required rotation.
+    sessions[0].close = lambda: None
+    _history_fetch(client)
+    assert len(sessions) == 3 and len(sessions[2].calls) == 1
+    assert client.attempt_journal.rows()[-1]['session_recycled'] is True
+    client.close()
+
+
+@pytest.mark.unit
+def test_recycled_history_keeps_read_timeout_when_response_close_also_fails(monkeypatch, tmp_path):
+    client, clock, sessions = _owned_history(monkeypatch, tmp_path)
+    _history_fetch(client); clock[0] = 20
+    old_factory = requests.Session
+    def factory():
+        session = old_factory()
+        response = FakeResponse(200)
+        response.raw = PartialTimeoutRaw(b'{"partial":')
+        def close(): raise requests.ConnectionError('secret close')
+        response.close = close
+        session.get = lambda *_args, **_kwargs: response
+        return session
+    monkeypatch.setattr(requests, 'Session', factory)
+    client.max_attempts = 1
+    with pytest.raises(RetryExhausted): _history_fetch(client)
+    row = client.attempt_journal.rows()[-1]
+    assert row['timeout'] and not row['complete'] and row['status'] == 200
+    assert row['error_type'] == 'Timeout' and row['error_phase'] == 'read'
+    assert row['session_sequence'] == 1 and row['session_recycled'] is True
+    assert not any(n['type'] == 'ConnectionError' for n in row['error_chain'])
+    client.close()

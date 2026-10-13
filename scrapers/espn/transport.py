@@ -213,16 +213,11 @@ class EspnHttpClient:
         for name, (value, hard_maximum) in hard_bounds.items():
             if value > hard_maximum:
                 raise ValueError(f"{name} cannot exceed {hard_maximum}")
-        self.session = session or requests.Session()
-        self.session.trust_env = False
-        self.session.proxies.clear()
-        self.session.headers.update(
-            {
-                "Accept": "application/json",
-                "Accept-Encoding": "gzip, deflate",
-                "User-Agent": "data-platform-football/espn-native-v2",
-            }
-        )
+        self._owns_session = session is None
+        self.session = self._configure_session(requests.Session() if session is None else session)
+        self._session_lock = threading.RLock() if self._owns_session and self.lane == 'history' else None
+        self._session_last_finished = None
+        self._session_sequence = 0
         self.sleep_fn = sleep_fn
         self.monotonic_fn = monotonic_fn
         self.utcnow_fn = utcnow_fn
@@ -318,7 +313,26 @@ class EspnHttpClient:
             )
         )
 
+    @staticmethod
+    def _configure_session(session):
+        session.trust_env = False
+        session.proxies.clear()
+        session.headers.update({
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "User-Agent": "data-platform-football/espn-native-v2",
+        })
+        return session
+
     def _http_attempt(self, permit, request_url, endpoint, tries):
+        # A history slot normally has one caller. Serialize the owned pool's
+        # lifecycle too, so rotation cannot close an in-flight response.
+        if self._session_lock is None:
+            return self._run_http_attempt(permit, request_url, endpoint, tries)
+        with self._session_lock:
+            return self._run_http_attempt(permit, request_url, endpoint, tries)
+
+    def _run_http_attempt(self, permit, request_url, endpoint, tries):
         if self.before_attempt is not None:
             self.before_attempt()
         attempt_id = self.attempt_journal.begin(
@@ -334,8 +348,29 @@ class EspnHttpClient:
         request_failed = False
         error_chain = None
         error_phase = 'request'
+        session_diagnostics = None
         started = self.monotonic_fn()
         try:
+            if self._session_lock is not None:
+                idle = (max(0.0, started - self._session_last_finished)
+                        if self._session_last_finished is not None else None)
+                recycled = idle is not None and idle >= 20.0
+                if recycled:
+                    replacement = self._configure_session(requests.Session())
+                    try:
+                        self.session.close()
+                    except BaseException:
+                        try:
+                            replacement.close()
+                        except Exception:
+                            pass  # Cleanup must not mask the original close failure.
+                        raise
+                    self.session = replacement
+                    self._session_sequence = 0
+                self._session_sequence += 1
+                session_diagnostics = dict(session_sequence=self._session_sequence,
+                                           session_idle_ms=idle * 1000 if idle is not None else None,
+                                           session_recycled=recycled)
             response = self.session.get(
                 request_url, timeout=(self.connect_timeout, self.read_timeout),
                 stream=True, allow_redirects=False,
@@ -374,7 +409,10 @@ class EspnHttpClient:
                     error_chain = exception_chain(exc)
                     raise _ResponseReadFailure(direct_bytes, type(exc).__name__) from None
             finally:
-                elapsed = max(0.0, (self.monotonic_fn() - started) * 1000.0)
+                finished = self.monotonic_fn()
+                elapsed = max(0.0, (finished - started) * 1000.0)
+                if session_diagnostics is not None:
+                    self._session_last_finished = finished
                 try:
                     self.attempt_journal.finish(
                         attempt_id, status=int(response.status_code) if response is not None else None,
@@ -383,6 +421,7 @@ class EspnHttpClient:
                         error_type=tries.http_diagnostics.get('error_type'),
                         error_phase=tries.http_diagnostics.get('error_phase'),
                         error_chain=error_chain,
+                        session_diagnostics=session_diagnostics,
                     )
                 except BaseException:
                     # A failed measurement write stops this request, but must

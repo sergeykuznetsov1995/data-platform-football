@@ -278,3 +278,40 @@ def test_publication_error_visible_once_in_every_status_shape(shape):
     warnings = [line for line in lines if 'публикация HTTP:' in line]
     assert len(warnings) == 1
     assert 'RuntimeError' in warnings[0]
+
+@pytest.mark.parametrize('sequence,idle,recycled', [
+    (1, None, False), (2, 19999.0, False), (1, 20000, True),
+    (True, True, 1), (-1, -1, 'secret'),
+    (2**10000, 2**10000, None), (0, float('inf'), None), (1, float('nan'), False),
+])
+def test_session_diagnostics_are_local_bounded_and_survive_publication(tmp_path, sequence, idle, recycled):
+    import math
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3', utcnow_fn=lambda: START)
+    attempt = begin(journal)
+    journal.finish(attempt, status=200, timeout=False, http_ms=100, direct_bytes=2,
+                   session_diagnostics=dict(session_sequence=sequence, session_idle_ms=idle,
+                                            session_recycled=recycled, url='secret', cookie='secret'))
+    row, = journal.rows()
+    assert row['session_sequence'] == (sequence if type(sequence) is int and 1 <= sequence <= 2**63-1 else None)
+    expected_idle = idle if type(idle) in (int, float) and 0 <= idle <= 2**63-1 and math.isfinite(idle) else None
+    assert row['session_idle_ms'] == expected_idle
+    assert row['session_recycled'] is (recycled if type(recycled) is bool else None)
+    assert 'secret' not in str(row)
+    conn = Connection()
+    assert journal.flush(conn) == 1
+    assert AttemptJournal(journal.path).rows() == [row]
+    assert journal.coverage(START, START+timedelta(minutes=1))
+    assert not {'session_sequence', 'session_idle_ms', 'session_recycled'} & {name for name, _ in ATTEMPT_COLUMNS}
+    assert all('session_sequence' not in sql and 'secret' not in sql for sql in conn.statements)
+
+
+def test_session_diagnostics_absent_for_legacy_and_hostile_values(tmp_path):
+    from scrapers.espn.attempts import safe_session_diagnostics
+    class Hostile(dict):
+        def get(self, *_): raise AssertionError('Custom getters forbidden')
+    assert safe_session_diagnostics(Hostile()) == {}
+    assert safe_session_diagnostics('secret') == {}
+    journal = AttemptJournal(tmp_path/'attempts.sqlite3', utcnow_fn=lambda: START)
+    finish(journal, begin(journal))
+    assert 'session_sequence' not in AttemptJournal(journal.path).rows()[0]
+    assert journal.coverage(START, START+timedelta(minutes=1))
