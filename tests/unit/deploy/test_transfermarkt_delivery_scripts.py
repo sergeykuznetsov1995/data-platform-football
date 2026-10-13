@@ -52,8 +52,10 @@ case "$cmd" in
       case "$sql" in
         *is_paused*) dag=${sql#*dag_id=\'}; dag=${dag%%\'*}; cat "$S/paused_$dag" ;;
         *last_parsed_time*) cat "$S/dags" ;;
-        *import_error*) echo 0 ;;
-        *slot_pool*) pool=${sql#*pool=\'}; pool=${pool%%\'*}; cat "$S/pool_$pool" ;;
+        *import_error*) cat "$S/import_errors" 2>/dev/null || echo 0 ;;
+        *slot_pool*) pool=${sql#*pool=\'}; pool=${pool%%\'*}
+          [ ! -e "$S/pool_query_fails_$pool" ] || exit 1
+          cat "$S/pool_$pool" ;;
         *dag_run*) echo 0 ;;
         *) echo "unexpected sql: $sql" >&2; exit 1 ;;
       esac
@@ -72,9 +74,10 @@ case "$cmd" in
           for p in transfermarkt_control transfermarkt_proxy; do echo 1 > "$S/pool_$p"; done
           for p in transfermarkt_backfill_control transfermarkt_backfill_proxy; do echo 0 > "$S/pool_$p"; done
         else
-          case "$5" in *backfill*) echo 0 ;; *) echo 1 ;; esac
+          if [ -e "$S/want_$5" ]; then cat "$S/want_$5"
+          else case "$5" in *backfill*) echo 0 ;; *) echo 1 ;; esac; fi
         fi ;;
-      python*) echo ok ;;
+      python*) cat "$S/gateway_health" 2>/dev/null || echo ok ;;
       *) echo "unexpected exec: $*" >&2; exit 1 ;;
     esac ;;
   *) echo "unexpected docker $cmd" >&2; exit 1 ;;
@@ -180,6 +183,26 @@ class Stand:
             capture_output=True, text=True, timeout=120,
         )
 
+    def probe(self, commands: str) -> subprocess.CompletedProcess[str]:
+        # Load the real functions and env, but stop before any delivery/window logic.
+        # All docker commands still go to the filesystem-backed stub above.
+        prefix = self.automat.read_text().split("# ============================ Шаг 0:", 1)[0]
+        probe = self.automat.parent / "probe.sh"
+        probe.write_text(prefix + "\n" + commands + "\n", encoding="utf-8")
+        return subprocess.run(
+            ["bash", str(probe)],
+            env={"PATH": os.environ["PATH"], "TRANSFERMARKT_ENV_FILE": str(self.env_file)},
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def acceptance(self, tree: Path | None = None) -> subprocess.CompletedProcess[str]:
+        tree = tree or self.new
+        return self.probe(f'acceptance_seen "{tree}" "2026-09-24T01:00:00Z"')
+
+    def log(self) -> str:
+        path = self.auto / "auto_deliver.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
     def window(self) -> str:
         path = self.auto / "transfermarkt-window-2026-09-24.env"
         return path.read_text(encoding="utf-8") if path.exists() else ""
@@ -194,6 +217,116 @@ class Stand:
 @pytest.fixture
 def stand(tmp_path: Path) -> Stand:
     return Stand(tmp_path)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("history", [0, 1])
+def test_new_release_restores_pauses_and_shared_pool_but_keeps_canonical_tm_slots(
+    stand: Stand, history: int,
+) -> None:
+    # The old snapshot admits one historical task even when the new H0 contour
+    # admits none. Restoring that old value before checking the new contract
+    # caused deploy.sh DONE followed by final acceptance 0 on every poll.
+    snapshot = stand.auto / "transfermarkt-rollback.env"
+    snapshot.write_text(snapshot.read_text() + "POOL_ingest_scraper_pool=3\n")
+    stand.put("pool_ingest_scraper_pool", "1")
+    for pool in POOLS:
+        slots = str(history) if "backfill" in pool else "1"
+        stand.put(f"pool_{pool}", slots)
+        stand.put(f"want_{pool}", slots)
+    result = stand.probe(
+        f'RESTORE_PENDING=1\nrestore_state new || exit 91\n'
+        f'acceptance_seen "{stand.new}" "2026-09-24T01:00:00Z"'
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1", stand.log()
+    for pool in POOLS:
+        assert (stand.state / f"pool_{pool}").read_text().strip() == (
+            str(history) if "backfill" in pool else "1"
+        )
+    assert (stand.state / "pool_ingest_scraper_pool").read_text().strip() == "3"
+    for dag in DAGS:
+        assert (stand.state / f"paused_{dag}").read_text().strip() == (
+            "f" if "ingest" in dag or "discover" in dag else "t"
+        )
+
+
+@pytest.mark.unit
+def test_final_pool_failure_still_rolls_back_exact_old_slots(stand: Stand) -> None:
+    stand.put("pool_transfermarkt_backfill_proxy", "0")
+    stand.put("pool_transfermarkt_backfill_control", "0")
+    stand.put("pool_transfermarkt_control", "2")
+    result = stand.acceptance()
+    assert result.stdout.strip() == "0"
+    assert "predicate=pool_slots" in stand.log()
+    result = stand.run()
+    assert result.returncode == 1, result.stderr
+    assert "RESTORED=t" in stand.window()
+    assert stand.env_root() == str(stand.old)
+    for pool in POOLS:
+        assert (stand.state / f"pool_{pool}").read_text().strip() == "1"
+
+
+@pytest.mark.unit
+def test_new_release_pause_restore_failure_is_reported_without_rewriting_h0(stand: Stand) -> None:
+    stand.put("pause_fails_dag_ingest_transfermarkt", "1")
+    for pool in POOLS:
+        stand.put(f"pool_{pool}", "0" if "backfill" in pool else "1")
+    result = stand.probe('RESTORE_PENDING=1\nrestore_state new\nrc=$?\necho "$rc:$RESTORE_NOTE"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("1:"), result.stdout
+    assert "dag_ingest_transfermarkt" in result.stdout
+    assert (stand.state / "paused_dag_ingest_transfermarkt").read_text().strip() == "t"
+    assert (stand.state / "pool_transfermarkt_backfill_proxy").read_text().strip() == "0"
+
+
+@pytest.mark.unit
+def test_exit_trap_uses_old_snapshot_when_new_deploy_did_not_finish(stand: Stand) -> None:
+    for pool in POOLS:
+        stand.put(f"pool_{pool}", "0" if "backfill" in pool else "1")
+    result = stand.probe('RESTORE_PENDING=1\nexit 7')
+    assert result.returncode == 7, result.stderr
+    for pool in POOLS:
+        assert (stand.state / f"pool_{pool}").read_text().strip() == "1"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("state", "value", "predicate"),
+    [
+        ("dags", "3", "dag_parse"),
+        ("import_errors", "1", "dag_parse"),
+        (f"health_{SCHED}", "unhealthy", "scheduler_health"),
+        (f"health_{GW}", "unhealthy", "gateway_container"),
+        (f"mounts_{GW}", "/outside/releases", "mounts"),
+        ("gateway_health", "bad source_mode=shared", "gateway_health"),
+        ("pool_transfermarkt_control", "2", "pool_slots"),
+    ],
+)
+def test_acceptance_reports_failed_predicate_without_accepting(
+    stand: Stand, state: str, value: str, predicate: str,
+) -> None:
+    stand.put(state, value)
+    result = stand.acceptance()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0"
+    assert f"predicate={predicate}" in stand.log()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("state", "value"),
+    [("pool_query_fails_transfermarkt_control", "1"),
+     ("want_transfermarkt_control", "log noise\n1")],
+)
+def test_unknown_pool_read_or_invalid_helper_output_fails_closed(
+    stand: Stand, state: str, value: str,
+) -> None:
+    stand.put(state, value)
+    result = stand.acceptance()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "X"
+    assert "predicate=pool_slots" in stand.log()
 
 
 @pytest.mark.unit

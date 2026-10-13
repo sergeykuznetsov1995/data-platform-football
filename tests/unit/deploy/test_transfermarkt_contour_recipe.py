@@ -218,9 +218,9 @@ def test_auto_deliver_window_and_contract() -> None:
     assert "--drill-rollback" in text
     assert '"$old/deploy/transfermarkt/deploy.sh" "$old"' in text
     assert 'healthy 1073741824 transfermarkt-gw' in text
-    # Слоты пулов возвращаются к снимку ДО приёмки, которая их сверяет.
+    # Исходные паузы возвращаются ДО приёмки; TM-пулы сохраняют NEW streams contract.
     tail = text[text.index('log "deploy.sh вернул $rc"'):]
-    assert tail.index("restore_state || restored=0") < tail.index('seen=$(acceptance_seen "$NEW"')
+    assert tail.index("restore_state new || restored=0") < tail.index('seen=$(acceptance_seen "$NEW"')
     # Запас окна (доставка + откат) пересчитывается после заморозки, перед снимком.
     assert "NEED_BUDGET=$(( 2 * (DEPLOY_CEILING + 30 + ACCEPT_WAIT + ACCEPT_POLL) + BUDGET_RESERVE ))" in text
     # Бюджет по умолчанию (доставка + откат + резерв) влезает в окно 01:00–03:00.
@@ -228,7 +228,7 @@ def test_auto_deliver_window_and_contract() -> None:
     assert need < 7200 - 300, need
     assert text.index('freeze_release.sh" "$WANT"') < text.rindex('-lt "$NEED_BUDGET"') < text.index("Шаг 8")
     # Приёмка требует живого SchedulerJob.
-    assert "[ \"$got\" = healthy ] || { echo 0; return; }" in text
+    assert '[ "$got" = healthy ] || { acceptance_result 0 scheduler_health' in text
     # Обрыв после остановки шлюза: монты на OLD не доказывают живой бой.
     assert "[ \"$gw_health\" != healthy ]" in text
 

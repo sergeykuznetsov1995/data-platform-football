@@ -298,6 +298,7 @@ def _install_airflow_stubs() -> None:
         # Class-level registry — every instance appends itself so DAG-load
         # tests can inspect the operators that were created.
         _instances: list = []
+        template_fields = ('bash_command', 'env', 'cwd')
 
         @classmethod
         def partial(cls, **kw):

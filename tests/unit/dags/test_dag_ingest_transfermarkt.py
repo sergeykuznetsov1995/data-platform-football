@@ -108,6 +108,9 @@ class TestDagShape:
         task = _bash_task('run_exact_child_cycle')
         assert task is not None
         assert task.is_mapped is True
+        # Planner output is literal process data even on a native-rendered DAG.
+        assert 'env' not in task.template_fields
+        assert 'bash_command' in task.template_fields
         assert task._expand_kwargs_arg.operator.task_id == 'plan_exact_scopes'
         assert task._expand_kwargs_arg.function is dag_module._child_operator_kwargs
         assert task._init_kwargs['pool'] == 'transfermarkt_proxy'
