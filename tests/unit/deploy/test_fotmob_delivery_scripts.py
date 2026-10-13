@@ -576,7 +576,14 @@ def _phase2_world(tmp_path: Path, rows: str, runner_err: str = "", writer_alive:
         '&& "$*" == *"regexp_match"* '
         f'&& "$*" == *"start_date > \'{WAVE_T}\'"* '
         '&& "$*" == *"ORDER BY start_date;"* ]]; then\n'
-        f'      cat "{rows_file}"\n'
+        # Строки задают режим conf. SQL-заглушка сохраняет только те режимы,
+        # которые реальный regexp_match распознал бы в conf: неизвестный → пусто.
+        '      modes=$(printf "%s" "${@: -1}" | '
+        'sed -n "s/.*mode.{0,12}(\\([^)]*\\)).*/\\1/p")\n'
+        '      while IFS="|" read -r run state started mode; do\n'
+        '        [[ "$mode" =~ ^($modes)$ ]] || mode=""\n'
+        '        printf "%s|%s|%s|%s\\n" "$run" "$state" "$started" "$mode"\n'
+        f'      done < "{rows_file}"\n'
         '    else\n'
         '      echo "ЗАПРОС-ВОЛН-НЕ-ТОЙ-ФОРМЫ"\n'
         '    fi ;;\n'
@@ -621,10 +628,75 @@ def test_phase2_accepts_the_first_green_refresh_wave(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_phase2_rolls_back_on_a_runner_error_when_no_writer_is_alive(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["refresh", "daily"])
+@pytest.mark.parametrize("state", ["success", "failed"])
+def test_phase2_skips_green_transfers_and_judges_the_next_current_wave(
+    tmp_path: Path, mode: str, state: str,
+) -> None:
     w = _phase2_world(
         tmp_path,
-        "fotmob_orchestrated__bbb|failed|2026-09-08T00:00:10|refresh",
+        "fotmob_orchestrated__transfer|success|2026-09-08T00:00:10|transfers\n"
+        f"fotmob_orchestrated__current|{state}|2026-09-08T04:00:00|{mode}",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == (0 if state == "success" else 1), proc.stderr + proc.stdout
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert verdict.is_file(), w["log"].read_text(encoding="utf-8")
+    assert "fotmob_orchestrated__current" in verdict.read_text(encoding="utf-8")
+    assert "fotmob-wave-mode-unknown-fotmob_orchestrated__transfer" not in {
+        path.name for path in w["state"].iterdir()
+    }
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two" if state == "success" else "one"]
+
+
+@pytest.mark.unit
+def test_phase2_green_transfers_alone_do_not_accept_current(tmp_path: Path) -> None:
+    w = _phase2_world(tmp_path, "fotmob_orchestrated__transfer|success|2026-09-08T00:00:10|transfers")
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
+    assert not (w["state"] / "fotmob-wave-mode-unknown-fotmob_orchestrated__transfer").exists()
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+
+
+@pytest.mark.unit
+def test_phase2_failed_transfers_do_not_accept_a_later_green_current(tmp_path: Path) -> None:
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__transfer|failed|2026-09-08T00:00:10|transfers\n"
+        "fotmob_orchestrated__current|success|2026-09-08T04:00:00|refresh",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 1, proc.stderr + proc.stdout
+    verdict = w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}"
+    assert "fotmob_orchestrated__transfer rollback" in verdict.read_text(encoding="utf-8")
+    assert (w["state"] / "fotmob-auto-deliver.off").is_file()
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["one"]
+    assert "красная волна трансферов" in w["sent"].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_phase2_unknown_mode_still_blocks_a_later_current_verdict(tmp_path: Path) -> None:
+    w = _phase2_world(
+        tmp_path,
+        "fotmob_orchestrated__unknown|success|2026-09-08T00:00:10|future_mode\n"
+        "fotmob_orchestrated__current|failed|2026-09-08T04:00:00|refresh",
+    )
+    proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert not (w["state"] / f"fotmob-wave-verdict-{w['two_short']}-{WAVE_TC}").exists()
+    assert (w["state"] / "fotmob-wave-mode-unknown-fotmob_orchestrated__unknown").is_file()
+    assert not (w["state"] / "fotmob-auto-deliver.off").exists()
+    assert _git(w["repo"], "rev-parse", "HEAD") == w["two"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["refresh", "daily", "backfill", "transfers", "future_mode"])
+def test_phase2_rolls_back_on_a_runner_error_when_no_writer_is_alive(tmp_path: Path, mode: str) -> None:
+    w = _phase2_world(
+        tmp_path,
+        f"fotmob_orchestrated__bbb|failed|2026-09-08T00:00:10|{mode}",
         runner_err="[ERROR] __main__: semantic batch has 1 stored rows; expected either 0 or 2\n",
     )
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
@@ -671,10 +743,13 @@ def test_phase2_rolls_back_red_current_without_guessing_its_cause(tmp_path: Path
 
 
 @pytest.mark.unit
-def test_phase2_waits_for_the_gap_between_waves_and_rolls_back_on_the_next_tick(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["refresh", "daily", "backfill", "transfers", "future_mode"])
+def test_phase2_waits_for_the_gap_between_waves_and_rolls_back_on_the_next_tick(
+    tmp_path: Path, mode: str,
+) -> None:
     w = _phase2_world(
         tmp_path,
-        "fotmob_orchestrated__eee|failed|2026-09-08T00:00:10|refresh",
+        f"fotmob_orchestrated__eee|failed|2026-09-08T00:00:10|{mode}",
         runner_err="[ERROR] __main__: boom\n",
         writer_alive=True,
     )
@@ -714,11 +789,12 @@ def test_phase2_rolls_back_a_history_wave_that_carries_a_runner_error(tmp_path: 
 
 
 @pytest.mark.unit
-def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_read(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["refresh", "daily", "backfill", "transfers", "future_mode"])
+def test_phase2_defers_the_verdict_when_the_task_log_cannot_be_read(tmp_path: Path, mode: str) -> None:
     """«Лог не прочитан» ≠ «ошибки раннера нет»: иначе красная волна с нашей ошибкой
     ушла бы в «краснота истории», а следующая зелёная актуалка приняла бы этот код."""
     w = _phase2_world(
-        tmp_path, "fotmob_orchestrated__ggg|failed|2026-09-08T00:00:10|backfill", log_mode="missing",
+        tmp_path, f"fotmob_orchestrated__ggg|failed|2026-09-08T00:00:10|{mode}", log_mode="missing",
     )
     proc = _run(w["auto"], env_file=w["env_file"], stubs=w["stubs"])
     assert proc.returncode == 0, proc.stderr + proc.stdout
