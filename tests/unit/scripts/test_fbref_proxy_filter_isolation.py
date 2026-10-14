@@ -25,7 +25,8 @@ SHARED_FILTER_SHA256 = (
     # 1f933229 (#1388), #1365 SofaScore accounting/registry changes, and
     # #1398 dedicated TM streams; both source contracts are retained.
     # #1365 follow-up: executable sofascore-only mode and registry startup.
-    "3a2f88b1167ccc31f3b27604acd67ff9de523963b20279bdba616a8d4eb4b2f7"
+    # #1365 aggregate-pressure compaction; dedicated FBref bytes unchanged.
+    "3f6858b53d828c957fc117ca8dc6a4d4c88781e9fc05a762fb664c03174b72be"
 )
 
 

@@ -11352,6 +11352,100 @@ def test_sofascore_1365_registry_size_includes_archives_and_generations(shared_m
     assert shared_mod._sofascore_registry_bytes() == 72
 
 
+@pytest.mark.parametrize("size,expected_force", [(57_999_999, False), (58_000_000, True), (60_013_623, True)])
+def test_sofascore_paid_rotation_uses_aggregate_pressure(shared_mod, monkeypatch, size, expected_force):
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
+    measured = []
+    def registry_bytes():
+        measured.append(size)
+        return size
+    monkeypatch.setattr(shared_mod, "_sofascore_registry_bytes", registry_bytes)
+    calls = []
+    monkeypatch.setattr(shared_mod, "_compact_registry", lambda *a, **k: calls.append(k) or None)
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    assert calls[0].get("force", False) is expected_force
+    assert measured == [size]
+
+
+def test_sofascore_paid_rotation_rechecks_pressure_after_reduction(shared_mod, monkeypatch):
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
+    sizes = iter([60_013_623, 56_952_477])
+    monkeypatch.setattr(shared_mod, "_sofascore_registry_bytes", lambda: next(sizes))
+    calls = []
+    monkeypatch.setattr(shared_mod, "_compact_registry", lambda *a, **k: calls.append(k.get("force", False)))
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    assert calls == [True, False]
+
+
+def test_other_sources_and_wal_do_not_force_pressure_rotation(shared_mod, monkeypatch):
+    monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
+    monkeypatch.setattr(shared_mod, "_sofascore_registry_bytes", lambda: pytest.fail("unrelated pressure scan"))
+    calls = []
+    monkeypatch.setattr(shared_mod, "_compact_registry", lambda *a, **k: calls.append(k.get("force", False)))
+    shared_mod.SOURCE_MODE = "shared"
+    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    shared_mod._compact_sofascore_registry("wal.jsonl", kind="wal")
+    assert calls == [False, False]
+
+
+def test_sofascore_aggregate_pressure_compacts_same_day_paid_tail(shared_mod, monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+    from scripts.proxy_filter import sofascore_registry as registry
+
+    now = datetime.now(timezone.utc)
+    path = tmp_path / "paid.jsonl"
+    row = {"event_type": "bytes", "source": "sofascore", "occurred_at": now.isoformat(),
+           "lease_id": "lease", "run_id": "run", "direction": "down", "bytes": 13, "padding": "x" * 1000}
+    path.write_text(json.dumps(row) + "\n")
+    registry.compact(str(path), shared_mod._REGISTRY_LOCK, kind="paid", now=now)
+    with path.open("a") as out:
+        out.write((json.dumps(row) + "\n") * 12)
+    (tmp_path / "allocations.json").write_bytes(b"x" * 12_000)
+    monkeypatch.setattr(registry, "REGISTRY_LIMIT_BYTES", 20_000)
+    monkeypatch.setattr(shared_mod, "SOFASCORE_REGISTRY_LIMIT_BYTES", 20_000)
+    monkeypatch.setattr(shared_mod, "SOFASCORE_REGISTRY_COMPACT_BYTES", 18_000)
+    monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    shared_mod.LEDGER_PATH = str(path)
+    assert path.stat().st_size < registry.PAID_TRIGGER_BYTES
+    assert shared_mod._sofascore_registry_bytes() > shared_mod.SOFASCORE_REGISTRY_LIMIT_BYTES
+    assert registry.compact(str(path), shared_mod._REGISTRY_LOCK, kind="paid", now=now) is None
+    result = shared_mod._compact_sofascore_registry(str(path), kind="paid")
+    assert result is not None
+    assert shared_mod._sofascore_registry_bytes() < shared_mod.SOFASCORE_REGISTRY_LIMIT_BYTES
+    assert sum(e["bytes"] for e in registry.iter_events(path) if e["event_type"] == "bytes") == 13 * 13
+
+
+def test_sofascore_pressure_cleans_orphan_without_rewriting_compact_journal(shared_mod, monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+    from scripts.proxy_filter import sofascore_registry as registry
+
+    now = datetime.now(timezone.utc)
+    path = tmp_path / "paid.jsonl"
+    path.write_text(json.dumps({"event_type": "bytes", "source": "sofascore", "occurred_at": now.isoformat(),
+                                "lease_id": "lease", "direction": "down", "bytes": 13}) + "\n")
+    registry.compact(str(path), shared_mod._REGISTRY_LOCK, kind="paid", now=now)
+    committed = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    orphan = tmp_path / (path.name + ".forensics-" + "b" * 64 + ".jsonl.gz")
+    orphan.write_bytes(b"x" * 30_000)
+    monkeypatch.setattr(registry, "REGISTRY_LIMIT_BYTES", 20_000)
+    monkeypatch.setattr(shared_mod, "SOFASCORE_REGISTRY_LIMIT_BYTES", 20_000)
+    monkeypatch.setattr(shared_mod, "SOFASCORE_REGISTRY_COMPACT_BYTES", 18_000)
+    monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
+    monkeypatch.setattr(shared_mod, "_compact_registry", lambda *a, **k: registry.compact(*a, **k, now=now))
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    shared_mod.LEDGER_PATH = str(path)
+    assert shared_mod._sofascore_registry_bytes() > shared_mod.SOFASCORE_REGISTRY_LIMIT_BYTES
+    assert shared_mod._compact_sofascore_registry(str(path), kind="paid") is None
+    assert not orphan.exists()
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == committed
+    assert shared_mod._sofascore_registry_bytes() < shared_mod.SOFASCORE_REGISTRY_LIMIT_BYTES
+
+
 def test_sofascore_1365_real_startup_recovers_before_both_compactions(shared_mod, monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(shared_mod, "_restore_budget_ledger", lambda *a, **k: calls.append("restore") or 0)

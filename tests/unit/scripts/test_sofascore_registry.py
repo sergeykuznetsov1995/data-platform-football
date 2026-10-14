@@ -101,6 +101,68 @@ def test_irreducible_state_is_preserved_instead_of_pruned(tmp_path):
     assert path.read_bytes() == original
 
 
+def test_forced_same_day_rotation_below_trigger_preserves_recovery_and_evidence(tmp_path):
+    path = tmp_path / "paid.jsonl"
+    original = [event(), event(event_type="lease_created")]
+    write(path, original)
+    registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    appended = [event() for _ in range(6)] + [event(event_type="accounting_uncertain", reason="disk_failed")]
+    with path.open("a") as out:
+        out.write("".join(json.dumps(e) + "\n" for e in appended))
+    before = path.stat().st_size
+    assert before < registry.PAID_TRIGGER_BYTES
+    assert registry.compact(str(path), RLock(), kind="paid", now=NOW) is None
+    result = registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True)
+    assert result["after_bytes"] < before
+    assert totals(read(path)) == totals(original + appended)
+    assert {e["event_type"] for e in registry.iter_events(path)} == {"bytes", "lease_created", "accounting_uncertain"}
+
+
+def test_forced_rotation_without_reduction_keeps_committed_files(tmp_path):
+    path = tmp_path / "paid.jsonl"
+    write(path, [event(lease_id=str(i), padding="") for i in range(30)])
+    registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    with pytest.raises(RuntimeError, match="cannot compact safely"):
+        registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True)
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+
+
+@pytest.mark.parametrize("fault", ["fsync", "replace"])
+def test_forced_below_trigger_failure_keeps_original(tmp_path, monkeypatch, fault):
+    path = tmp_path / "paid.jsonl"
+    write(path, [event()])
+    registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    with path.open("a") as out:
+        out.write(json.dumps(event()) + "\n")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    def fail(*args):
+        raise OSError("injected disk failure")
+    monkeypatch.setattr(registry.os, fault, fail)
+    with pytest.raises(OSError, match="injected disk failure"):
+        registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True)
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+
+
+def test_forced_below_trigger_copies_concurrent_append_once(tmp_path, monkeypatch):
+    path = tmp_path / "paid.jsonl"
+    write(path, [event()])
+    registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    with path.open("a") as out:
+        out.write(json.dumps(event()) + "\n")
+    expanded = registry._expanded_events
+    appended = event(lease_id="during-forced-scan", bytes=17, padding="")
+    def scan(*args):
+        for index, item in enumerate(expanded(*args)):
+            if index == 0:
+                with path.open("a") as out:
+                    out.write(json.dumps(appended) + "\n")
+            yield item
+    monkeypatch.setattr(registry, "_expanded_events", scan)
+    registry.compact(str(path), RLock(), kind="paid", now=NOW, force=True)
+    assert totals(read(path)) == totals([event(), event(), appended])
+
+
 def test_another_source_is_never_rotated(tmp_path):
     path = tmp_path / "paid.jsonl"
     write(path, [event(source="whoscored")])
