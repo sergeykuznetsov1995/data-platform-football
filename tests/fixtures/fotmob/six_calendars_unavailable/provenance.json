@@ -1,0 +1,134 @@
+[
+  {
+    "cid": 10433,
+    "season": "2022/2023",
+    "record": {
+      "blob_key": "blobs/sha256/ce/ceb10146febc7f847c3e09dabbe72e19d4ddb0c92fe7da93ed7687a75665e5ba.json.gz",
+      "canonical_url": "https://www.fotmob.com/api/data/leagues?id=10433&season=2022%2F2023",
+      "compression": "gzip",
+      "content_hash": "ceb10146febc7f847c3e09dabbe72e19d4ddb0c92fe7da93ed7687a75665e5ba",
+      "decoded_bytes": 1477,
+      "etag": "W/\"t28lj4wdkf151\"",
+      "fetched_at": "2026-10-05T11:12:02.369948+00:00",
+      "hash_algorithm": "sha256",
+      "last_modified": null,
+      "manifest_version": "fotmob-raw-v1",
+      "raw_uri": "s3://football/raw/fotmob/blobs/sha256/ce/ceb10146febc7f847c3e09dabbe72e19d4ddb0c92fe7da93ed7687a75665e5ba.json.gz",
+      "source": "fotmob",
+      "source_encoded_bytes": 597,
+      "stored_bytes": 590,
+      "target_key": "1bbb8526085ff036e6b52cf62d0a73614c10561e9f7d180143d7c64fce1cfdd3",
+      "validated_at": "2026-10-14T10:10:13.717376+00:00"
+    }
+  },
+  {
+    "cid": 9170,
+    "season": "2023",
+    "record": {
+      "blob_key": "blobs/sha256/08/08c4038ed5606c91cbc248abf020e901b497309f2f0a51aab8ae3e65d38bbff9.json.gz",
+      "canonical_url": "https://www.fotmob.com/api/data/leagues?id=9170&season=2023",
+      "compression": "gzip",
+      "content_hash": "08c4038ed5606c91cbc248abf020e901b497309f2f0a51aab8ae3e65d38bbff9",
+      "decoded_bytes": 1489,
+      "etag": "W/\"kcle73op4f15d\"",
+      "fetched_at": "2026-10-14T08:51:24.544186+00:00",
+      "hash_algorithm": "sha256",
+      "last_modified": null,
+      "manifest_version": "fotmob-raw-v1",
+      "raw_uri": "s3://football/raw/fotmob/blobs/sha256/08/08c4038ed5606c91cbc248abf020e901b497309f2f0a51aab8ae3e65d38bbff9.json.gz",
+      "source": "fotmob",
+      "source_encoded_bytes": 609,
+      "stored_bytes": 601,
+      "target_key": "d6129d8f3a4d71965450595b3457c7ea737fa12d5f00e260aa4b0a03cac4c94c",
+      "validated_at": "2026-10-14T10:10:15.801111+00:00"
+    }
+  },
+  {
+    "cid": 9669,
+    "season": "2023/2024",
+    "record": {
+      "blob_key": "blobs/sha256/01/019f17de683b30a9698db72e9b0d65c336358c161484155994df74d199816826.json.gz",
+      "canonical_url": "https://www.fotmob.com/api/data/leagues?id=9669&season=2023%2F2024",
+      "compression": "gzip",
+      "content_hash": "019f17de683b30a9698db72e9b0d65c336358c161484155994df74d199816826",
+      "decoded_bytes": 1466,
+      "etag": "W/\"160m40iipbt14q\"",
+      "fetched_at": "2026-10-05T11:13:30.547014+00:00",
+      "hash_algorithm": "sha256",
+      "last_modified": null,
+      "manifest_version": "fotmob-raw-v1",
+      "raw_uri": "s3://football/raw/fotmob/blobs/sha256/01/019f17de683b30a9698db72e9b0d65c336358c161484155994df74d199816826.json.gz",
+      "source": "fotmob",
+      "source_encoded_bytes": 622,
+      "stored_bytes": 613,
+      "target_key": "cd4706a16da17e60619d42f13ee26aab9a8ba65c25aaf65aca0790794f1904d4",
+      "validated_at": "2026-10-14T10:10:17.195231+00:00"
+    }
+  },
+  {
+    "cid": 300,
+    "season": "2025",
+    "record": {
+      "blob_key": "blobs/sha256/37/3759ec6a92b64cd8b4fee43cc18116620db24801d33678754caa2ac9eb1331a4.json.gz",
+      "canonical_url": "https://www.fotmob.com/api/data/leagues?id=300&season=2025",
+      "compression": "gzip",
+      "content_hash": "3759ec6a92b64cd8b4fee43cc18116620db24801d33678754caa2ac9eb1331a4",
+      "decoded_bytes": 1409,
+      "etag": "W/\"wuvrjywcli135\"",
+      "fetched_at": "2026-09-25T08:32:37.514919+00:00",
+      "hash_algorithm": "sha256",
+      "last_modified": null,
+      "manifest_version": "fotmob-raw-v1",
+      "raw_uri": "s3://football/raw/fotmob/blobs/sha256/37/3759ec6a92b64cd8b4fee43cc18116620db24801d33678754caa2ac9eb1331a4.json.gz",
+      "source": "fotmob",
+      "source_encoded_bytes": 597,
+      "stored_bytes": 591,
+      "target_key": "6b448c9e2cde802c086f61f5764ae5b87aec42cd115527fb88010c97f625daa2",
+      "validated_at": "2026-10-14T10:10:19.196006+00:00"
+    }
+  },
+  {
+    "cid": 10840,
+    "season": "2025/2026",
+    "record": {
+      "blob_key": "blobs/sha256/3b/3bc9238d6c809e78ecaecb99df0c38b5648e60080ec8eb2983b8135e1b702c47.json.gz",
+      "canonical_url": "https://www.fotmob.com/api/data/leagues?id=10840&season=2025%2F2026",
+      "compression": "gzip",
+      "content_hash": "3bc9238d6c809e78ecaecb99df0c38b5648e60080ec8eb2983b8135e1b702c47",
+      "decoded_bytes": 1346,
+      "etag": "W/\"59shknpbvl11e\"",
+      "fetched_at": "2026-10-05T11:12:10.479543+00:00",
+      "hash_algorithm": "sha256",
+      "last_modified": null,
+      "manifest_version": "fotmob-raw-v1",
+      "raw_uri": "s3://football/raw/fotmob/blobs/sha256/3b/3bc9238d6c809e78ecaecb99df0c38b5648e60080ec8eb2983b8135e1b702c47.json.gz",
+      "source": "fotmob",
+      "source_encoded_bytes": 586,
+      "stored_bytes": 579,
+      "target_key": "111bbc45e4d7807e830d916edba2553cd76e57923d74f3958e28e5ee651d9391",
+      "validated_at": "2026-10-14T10:10:20.747008+00:00"
+    }
+  },
+  {
+    "cid": 10056,
+    "season": "2026/2027",
+    "record": {
+      "blob_key": "blobs/sha256/20/20a0c8f1323c23f1e0da9c95d4cb7f9042ebe896fa18e5e97a66a7b5dcdb3fcb.json.gz",
+      "canonical_url": "https://www.fotmob.com/api/data/leagues?id=10056&season=2026%2F2027",
+      "compression": "gzip",
+      "content_hash": "20a0c8f1323c23f1e0da9c95d4cb7f9042ebe896fa18e5e97a66a7b5dcdb3fcb",
+      "decoded_bytes": 1261,
+      "etag": "W/\"17vj0ofr30dz1\"",
+      "fetched_at": "2026-10-05T11:11:51.404264+00:00",
+      "hash_algorithm": "sha256",
+      "last_modified": null,
+      "manifest_version": "fotmob-raw-v1",
+      "raw_uri": "s3://football/raw/fotmob/blobs/sha256/20/20a0c8f1323c23f1e0da9c95d4cb7f9042ebe896fa18e5e97a66a7b5dcdb3fcb.json.gz",
+      "source": "fotmob",
+      "source_encoded_bytes": 576,
+      "stored_bytes": 569,
+      "target_key": "b4aaf4a2680bf328f59cb0ca58b5db5893cf1e9f2d1edacb6480a9468accf523",
+      "validated_at": "2026-10-14T10:10:22.819337+00:00"
+    }
+  }
+]
