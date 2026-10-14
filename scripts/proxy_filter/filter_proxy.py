@@ -3514,6 +3514,7 @@ def _signed_allocation_from_request(
 
 
 SOFASCORE_REGISTRY_LIMIT_BYTES = 60_000_000
+SOFASCORE_REGISTRY_COMPACT_BYTES = 58_000_000
 
 
 def _sofascore_registry_bytes() -> int:
@@ -7842,7 +7843,10 @@ def _compact_sofascore_registry(path: str, *, kind: str):
             return _compact_registry(path, _REGISTRY_LOCK, kind=kind)
     with _REGISTRY_LOCK:
         _repair_paid_ledger_append()
-    return _compact_registry(path, _REGISTRY_LOCK, kind=kind, before_replace=_repair_paid_ledger_append)
+        force = (SOURCE_MODE == "sofascore-only"
+                 and _sofascore_registry_bytes() >= SOFASCORE_REGISTRY_COMPACT_BYTES)
+    return _compact_registry(path, _REGISTRY_LOCK, kind=kind,
+                             before_replace=_repair_paid_ledger_append, force=force)
 
 
 async def _periodic_dump(out_path: str, interval: float = 2.0) -> None:

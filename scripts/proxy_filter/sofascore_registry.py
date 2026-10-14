@@ -236,6 +236,7 @@ def _small_cleanup(path, stream, prefix, checkpoint, snapshot, kind, lock, befor
             _sync_directory(Path(path).parent)
         else:
             _cleanup_archives(path, keep)
+    return True
 
 
 def _projected_bytes(path, after, archive_bytes, temporary_paths):
@@ -249,11 +250,16 @@ def _projected_bytes(path, after, archive_bytes, temporary_paths):
     return total
 
 
-def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before_replace=None):
-    """Compact without discarding recovery sums or seven-day evidence."""
+def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before_replace=None, force=False):
+    """Compact without discarding recovery sums or seven-day evidence.
+
+    Aggregate pressure can force a paid scan below its individual trigger.
+    It never relaxes the retained-size caps or forces WAL rotation.
+    """
     if kind not in {"paid", "wal"}:
         raise ValueError("unknown registry kind")
     path = str(path)
+    forced = force and kind == "paid"
     limit = trigger if trigger is not None else (PAID_TRIGGER_BYTES if kind == "paid" else WAL_TRIGGER_BYTES)
     current = now or datetime.now(timezone.utc)
     cutoff = (current - timedelta(days=FORENSIC_DAYS)).isoformat()
@@ -271,8 +277,12 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
             or str(checkpoint.get("occurred_at", ""))[:10] != current.date().isoformat()
         )
         if prefix < limit and not refresh:
-            _small_cleanup(path, stream, prefix, checkpoint, snapshot, kind, lock, before_replace)
-            return None
+            cleaned = _small_cleanup(path, stream, prefix, checkpoint, snapshot, kind, lock, before_replace)
+            # A previous commit can leave orphan generations after an fsync
+            # failure. Remove them by the verified cleanup path even under
+            # pressure; the next cycle remeasures before forcing another scan.
+            if cleaned or not forced:
+                return None
         groups = {}
         finished = set()
         before = kept = forensic_count = forensic_length = 0
@@ -355,7 +365,7 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                 previous_archive_bytes = os.fstat(snapshot.fileno()).st_size if snapshot else 0
                 projected = _projected_bytes(path, after, archive_bytes, (temporary, archive_tmp)) if kind == "paid" else after
                 if after >= limit or projected >= REGISTRY_LIMIT_BYTES or (
-                    prefix >= limit and after + archive_bytes >= actual.st_size + previous_archive_bytes
+                    (prefix >= limit or forced) and after + archive_bytes >= actual.st_size + previous_archive_bytes
                 ):
                     raise RuntimeError(f"SofaScore registry cannot compact safely: retained={after}, limit={limit}, projected={projected}")
                 if archive_name:
