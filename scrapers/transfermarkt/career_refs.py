@@ -99,7 +99,9 @@ def persist_capture_refs(connection, cycle, entity, table, frame, *, legacy=Fals
             WHEN NOT MATCHED THEN INSERT (cycle_id, entity, native_table, refs_json, refs_sha256, committed_at, snapshot_id, legacy_snapshot_id, native_batch_id, capture_unit_id, empty_proof_json, capture_times_json)
             VALUES (s.cycle_id, s.entity, s.native_table, s.refs_json, s.refs_sha256, {commit_sql}, s.snapshot_id, s.legacy_snapshot_id, s.native_batch_id, s.capture_unit_id, s.empty_proof_json, s.capture_times_json)""")
         execute_statement(cur, f'SELECT native_table, refs_json, refs_sha256, snapshot_id, legacy_snapshot_id, empty_proof_json, capture_times_json FROM {TABLE} WHERE cycle_id = {_q(cycle)} AND entity = {_q(entity)} AND native_batch_id = {_q(logical_batch)}')
-        if cur.fetchall() != [(table, payload, digest, native_snapshot, legacy_snapshot, empty_proof, capture_times)]:
+        # Trino returns list rows; other DBAPI cursors may return tuples.
+        # Compare exact values/cardinality independently of the row container.
+        if [tuple(row) for row in cur.fetchall()] != [(table, payload, digest, native_snapshot, legacy_snapshot, empty_proof, capture_times)]:
             raise RuntimeError('immutable career capture references drifted')
         return {'native_snapshot_id': native_snapshot, 'legacy_snapshot_id': legacy_snapshot, 'capture_unit_id': unit_id, 'physical_refs': json.loads(payload), 'empty_capture_refs': empty_refs, 'capture_times': clocks}
     finally:
@@ -228,7 +230,7 @@ def persist_snapshot_anchors(connection, payload):
                 WHEN NOT MATCHED THEN INSERT (intent_sha256, table_name, parent_snapshot_id, capture_times_json)
                 VALUES (s.intent_sha256, s.table_name, s.parent_snapshot_id, s.capture_times_json)''')
             execute_statement(cur, f'SELECT parent_snapshot_id, capture_times_json FROM {ANCHORS_TABLE} WHERE intent_sha256={_q(payload["intent_sha256"])} AND table_name={_q(table)}')
-            if cur.fetchall() != [(parent, clocks)]:
+            if [tuple(row) for row in cur.fetchall()] != [(parent, clocks)]:
                 raise RuntimeError('immutable career pre-write anchor drifted')
     finally:
         cur.close()
