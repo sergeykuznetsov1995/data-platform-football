@@ -1439,10 +1439,30 @@ def _merge_result(
             "rows_written": rows,
         }
 
+    # Keep the service's xG denominator and outcomes per scope, including
+    # partial failures and deferred work. Export only these operational fields;
+    # unrelated service metadata is not part of the report contract.
+    metadata = getattr(result, "metadata", {})
+    if getattr(result, "entity", None) == "stages":
+        stage_xg = {
+            key: list(metadata[key]) if isinstance(metadata[key], list) else metadata[key]
+            for key in (
+                "source_stage_ids",
+                "source_stage_count",
+                "feed_policy",
+                "stage_xg_checked",
+                "stage_xg_retained",
+                "stage_xg_deferred",
+            )
+            if key in metadata
+        }
+        if stage_xg:
+            scope_record["stage_xg"] = stage_xg
+
     # Surface the match backlog metric (set only by ``sync_matches``) at the
     # top level. Accumulate across scopes so a multi-scope run reports the whole
     # run's un-fetched backlog, not just the last scope. Pure observability.
-    backlog = getattr(result, "metadata", {}).get("match_candidates")
+    backlog = metadata.get("match_candidates")
     if isinstance(backlog, Mapping):
         existing = report.get("match_candidates")
         base = existing if isinstance(existing, Mapping) else {}
