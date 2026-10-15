@@ -280,12 +280,63 @@ def _refresh_queue_mode(context: dict[str, Any]) -> str:
     return queue_mode
 
 
+def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_at, capture_window=None):
+    """Optional recorder of the SAME planning read; never issues another query.
+
+    Enabling it and pinning the delivered SHA are separate source installation
+    actions. Until then this function has no filesystem or collection effect.
+    """
+    directory = os.environ.get("SOFASCORE_REFRESH_EVIDENCE_DIR", "").strip()
+    if not directory:
+        return
+    import hashlib
+    from scrapers.sofascore.denominator import denominator_path, load_denominator
+    from scrapers.sofascore.refresh_evidence import planning_snapshot, write_immutable
+
+    revision = os.environ.get("SOFASCORE_EVIDENCE_CODE_REVISION", "").strip()
+    if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+        raise AirflowException("refresh evidence needs a qualified delivered code revision")
+    denominator = load_denominator()
+    daily = _configured_tournament_ids()
+    native = {(int(str(r[0])[3:]), int(r[5])): r for r in rows}
+    selected = []
+    for env in planned:
+        key = int(env["SOFASCORE_TOURNAMENT_ID"]), int(env["SOFASCORE_SOURCE_SEASON_ID"])
+        selected.append({"scope_key": env["SOFASCORE_SCOPE_KEY"],
+                         "attempt_id": env.get("SOFASCORE_SCOPE_RUN_ID", env["SOFASCORE_SCOPE_KEY"]),
+                         "tournament_id": key[0], "source_season_id": key[1],
+                         "phase": "debt" if env.get("SOFASCORE_SCOPE_DEBT_ONLY") == "1"
+                         or native[key][4] == 0 else "open", "environment": dict(env)})
+    dag_run = context["dag_run"]
+    identity = {"run_id": str(context["run_id"]), "code_revision": revision,
+                "artifact_id": hashlib.sha256(Path(WORKLOAD_ARTIFACT).read_bytes()).hexdigest(),
+                "denominator_sha256": hashlib.sha256(denominator_path().read_bytes()).hexdigest(),
+                "snapshot_id": snapshot["snapshot_id"], "campaign_id": snapshot["campaign_id"],
+                "logical_date": dag_run.logical_date.isoformat(),
+                "started_at": dag_run.start_date.isoformat()}
+    document = planning_snapshot(identity, rows, selected,
+        core_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 1],
+        daily_ids=daily, excluded_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 0],
+        disputed_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 9],
+        input_complete=True, observed_at=observed_at)
+    document.update(stage=stage, task_try_number=int(getattr(context.get("ti"), "try_number", 1)))
+    if capture_window is not None:
+        document["capture_window"] = capture_window
+    # The snapshot digest covers census/selection, while stage is its archive key.
+    from scrapers.sofascore.refresh_evidence import _digest
+    document["digest"] = _digest({k: v for k, v in document.items() if k != "digest"})
+    run_key = hashlib.sha256(identity["run_id"].encode()).hexdigest()[:20]
+    write_immutable(Path(directory) / run_key / f"try-{document['task_try_number']}-{stage}.json", document)
+
+
 def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
     queue_mode = _refresh_queue_mode(context)
     snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
+    rows = _pending_refresh_partitions()
+    observed_at = datetime.now(timezone.utc).isoformat()
     planned = state.plan_refresh_batch(
         snapshot,
-        _pending_refresh_partitions(),
+        rows,
         batch_size=REFRESH_BATCH_SIZE,
         queue_mode=queue_mode,
         exclude_tournament_ids=_configured_tournament_ids(),
@@ -301,12 +352,16 @@ def _plan_refresh_batch(**context: Any) -> list[dict[str, Any]]:
     # The whole batch, retries included, must stop inside the window plus its
     # retry reserve: each task's own timeout restarts on a retry, so the scope
     # cycle stops at whichever deadline comes first (Astra #1358, finding 3).
+    window_started = time.time()
     window_deadline = int(
-        time.time()
+        window_started
         + (REFRESH_SCOPE_BUDGET + REFRESH_RETRY_RESERVE).total_seconds()
     )
     for env in planned:
         env["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"] = str(window_deadline)
+    _capture_refresh_evidence(context, snapshot, rows, planned, "initial", observed_at,
+        capture_window={"started_at": datetime.fromtimestamp(window_started, timezone.utc).isoformat(),
+                        "deadline_at": datetime.fromtimestamp(window_deadline, timezone.utc).isoformat()})
     # One mapped task per scope, each with the timeout of its OWN estimate
     # (``expand_kwargs`` below): the timeout is part of the mapped kwargs.
     return [
@@ -445,6 +500,17 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
     if report_path.exists():
         raise AirflowException("refill already attempted for this run; wait for the next scheduled run")
 
+    pending_state = {"number": 0, "rows": None, "observed_at": None, "snapshot": None}
+
+    def pending():
+        rows = _pending_refresh_partitions()
+        pending_state.update(number=pending_state["number"] + 1, rows=rows,
+                             observed_at=datetime.now(timezone.utc).isoformat(),
+                             snapshot=state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH))
+        _capture_refresh_evidence(context, pending_state["snapshot"], rows, [],
+            f"pending-{pending_state['number']}", pending_state["observed_at"])
+        return rows
+
     def plan(rows, budget, round_number):
         snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
         planned = state.plan_refresh_batch(
@@ -455,6 +521,8 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
             dag_run_id=f"{run_id}:refill:{round_number}", task_env=REFRESH_TASK_ENV,
             scope_budget_s=max(1, int(budget)), seconds_per_match=REFRESH_SECONDS_PER_MATCH,
         )
+        _capture_refresh_evidence(context, snapshot, pending_state["rows"] or [], planned,
+            f"refill-{round_number}", pending_state["observed_at"])
         if not planned:
             return None
         env = planned[0]
@@ -467,7 +535,8 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
     try:
         report = refill_window(
             initial_elapsed_s=sum(float(item["elapsed_s"]) for item in outcomes),
-            deadline_epoch=deadline, pending=_pending_refresh_partitions,
+            deadline_epoch=deadline, pending=pending if os.environ.get("SOFASCORE_REFRESH_EVIDENCE_DIR", "").strip()
+            else _pending_refresh_partitions,
             plan=plan, execute=_execute_refill_scope,
             budget_s=REFRESH_SCOPE_BUDGET.total_seconds(), now=time.time,
             persist=lambda value: _atomic_json(report_path, {**value, "run_id": run_id}),
@@ -478,6 +547,9 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
         raise
     if report["status"] == "failed":
         raise AirflowException(f"refresh refill failed; see {report_path}")
+    if pending_state["rows"] is not None:
+        _capture_refresh_evidence(context, pending_state["snapshot"], pending_state["rows"], [],
+            "final", pending_state["observed_at"])
     return report
 
 

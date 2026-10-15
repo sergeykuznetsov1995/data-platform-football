@@ -266,7 +266,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_dir = Path(args.output_dir).resolve()
     output = Path(args.output).resolve()
     started = time.monotonic()
-    result: dict[str, Any] = {"status": "running", "phases": [], "errors": []}
+    result: dict[str, Any] = {"status": "running", "phases": [], "errors": [],
+                              "started_at": datetime.now(timezone.utc).isoformat()}
     previous_registry = os.environ.get("SOFASCORE_REGISTRY_PATH")
     previous_medallion = os.environ.get("MEDALLION_CONFIG_DIR")
     previous_run_id = os.environ.get("SOFASCORE_RUN_ID")
@@ -286,10 +287,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def _finish(status: str) -> None:
         result["status"] = status
         result["elapsed_s"] = round(time.monotonic() - started, 1)
+        result["finished_at"] = datetime.now(timezone.utc).isoformat()
         result["bytes"] = sum(
             int(phase.get("paid_proxy_bytes") or 0) for phase in result["phases"]
         )
         _atomic_json(output, result)
+        directory = os.environ.get("SOFASCORE_REFRESH_EVIDENCE_DIR", "").strip()
+        if directory:
+            import hashlib
+            from scrapers.sofascore.refresh_evidence import write_immutable
+            # Preserve each physical attempt before a retry overwrites output.
+            # The existing runner remains the sole producer of its result.
+            attempt = hashlib.sha256((str(result.get("run_id")) + result["started_at"]).encode()).hexdigest()[:24]
+            write_immutable(Path(directory) / "scope-attempts" / (attempt + ".json"), result)
 
     try:
         scope = load_exact_scope(
