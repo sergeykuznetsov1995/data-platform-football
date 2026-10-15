@@ -7,11 +7,13 @@ are factual captures, not attestations of PASS. See the operations companion.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import re
 import sys
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -21,6 +23,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+from scrapers.fotmob.catalog import CalendarMissingError
+from scrapers.fotmob.domain import ScopeRef
+from scrapers.fotmob.field_map import classify_paths
+from scrapers.fotmob.parsers import inventory_json_paths, parse_season_bundle
+from scrapers.fotmob.scope_codec import parse_scope_token
 
 TARGET = "54717e11888550968c15cf893e2d7aa944fa7368"
 DAGS = frozenset({"dag_backfill_fotmob", "dag_collect_fotmob_players",
@@ -174,7 +181,80 @@ def qualify_delivery(manifest, baseline, probe, checkout):
             "runtime_fingerprints": 30, "dags_after_cut": sorted(DAGS)}
 
 
-def qualify_report(report, receipt, natural_runs, cut, report_sha256):
+def qualify_raw_evidence(unavailable, raw_evidence):
+    """Bind diagnostics to retained HTTP body bytes, never reserialized JSON."""
+    if not unavailable:
+        return {}
+    require(isinstance(raw_evidence, list) and raw_evidence, "raw evidence manifest required for unavailable scopes")
+    records = {}
+    uris = set()
+    for entry in raw_evidence:
+        require(isinstance(entry, dict), "invalid raw evidence entry")
+        identity = entry.get("scope")
+        require(isinstance(identity, str) and identity not in records, "duplicate or invalid raw scope")
+        uri = entry.get("raw_uri")
+        require(isinstance(uri, str) and uri and uri not in uris, "missing or duplicate raw URI")
+        records[identity] = entry
+        uris.add(uri)
+    require(set(records) == set(unavailable), "raw evidence does not exactly cover unavailable scopes")
+    verified = {}
+    for identity, evidence in unavailable.items():
+        entry = records[identity]
+        require(all(entry.get(key) == evidence[key] for key in ("url", "target_key", "raw_uri")),
+                "raw scope provenance binding differs from diagnostic")
+        require(isinstance(entry.get("local_path"), str) and Path(entry["local_path"]).is_absolute(),
+                "raw local_path must be an absolute local file")
+        try:
+            stored = Path(entry["local_path"]).read_bytes()
+        except OSError as exc:
+            raise ValueError(f"raw retained file unreadable for {identity}: {exc}") from exc
+        file_sha256 = sha(stored)
+        require(file_sha256 == entry.get("file_sha256"), "raw retained file SHA256 differs")
+        encoding = entry.get("encoding")
+        require(encoding in {"identity", "gzip"}, "raw encoding must be identity or gzip")
+        try:
+            body = gzip.decompress(stored) if encoding == "gzip" else stored
+        except (OSError, EOFError, zlib.error) as exc:
+            raise ValueError("raw gzip is corrupt") from exc
+        require(sha(body) == evidence["content_hash"], "raw HTTP body content_hash differs")
+        try:
+            payload = json.loads(body.decode("utf-8"), object_pairs_hook=unique)
+            competition_id, season = parse_scope_token(identity)
+            require(isinstance(payload, dict) and isinstance(payload.get("details"), dict)
+                    and str(payload["details"].get("id")) == str(competition_id), "raw response competition identity differs")
+            # Existing pure parser checks exact selected season and calendar
+            # presence. An explicit empty calendar must not be unavailable.
+            try:
+                parse_season_bundle(payload, ScopeRef(competition_id, season))
+            except CalendarMissingError:
+                pass
+            else:
+                raise ValueError("raw response has an explicit calendar")
+            overview = payload.get("overview")
+            # Match the retained metadata-only shape from service.py without
+            # importing its repository/writer dependencies into this local CLI.
+            require(isinstance(overview, dict)
+                    and isinstance(payload.get("fixtures"), dict)
+                    and set(payload["fixtures"]) == {"hasOngoingMatch"}
+                    and payload["fixtures"]["hasOngoingMatch"] is False
+                    and isinstance(overview.get("matches"), dict)
+                    and set(overview["matches"]) == {"hasOngoingMatch"}
+                    and overview["matches"]["hasOngoingMatch"] is False
+                    and "matches" not in payload and "leagueOverviewMatches" not in overview
+                    and payload.get("tabs") == [] and payload.get("table") is None
+                    and payload.get("stats") == {} and payload.get("playoff") is None,
+                    "raw response is not a calendar unavailable stub")
+            require(not classify_paths("league_season", inventory_json_paths(payload)).unknown,
+                    "raw unavailable response has unclassified JSON paths")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"raw unavailable response invalid for {identity}: {exc}") from exc
+        verified[identity] = {"raw_uri": entry["raw_uri"], "local_path": entry["local_path"],
+                              "file_sha256": file_sha256, "encoding": encoding,
+                              "content_hash": sha(body)}
+    return verified
+
+
+def qualify_report(report, receipt, natural_runs, cut, report_sha256, raw_evidence=None):
     require(report.get("mode") in {"refresh", "daily", "backfill"}, "report is not a seasonal mode")
     selection = report["selection"]
     require("season" in selection.get("entities", []), "report has no seasonal work")
@@ -291,10 +371,13 @@ def qualify_report(report, receipt, natural_runs, cut, report_sha256):
     require(set(unavailable_operations) == unavailable, "calendar diagnostic list differs from attempted evidence")
     require(type(report.get("complete")) is bool, "runner complete absent")
     require(not unavailable or report["complete"] is False, "unavailable calendar report cannot be complete")
+    verified_raw = qualify_raw_evidence(unavailable_operations, raw_evidence)
     return {"status": "PASS", "run_id": run_uuid, "dag_run": run,
             "diagnostics": {"calendar_unavailable_scopes": sorted(unavailable),
                             "calendar_unavailable_count": len(unavailable),
-                            "provenance": unavailable_operations},
+                            "provenance": unavailable_operations,
+                            "raw_evidence": verified_raw,
+                            "raw_bytes_verification": "PASS" if verified_raw else "NOT_APPLICABLE_NO_UNAVAILABLE"},
             "runner": {"status": report.get("status"), "complete": report["complete"],
                        "errors": report.get("errors"), "scope_attempts": attempts,
                        "planned_scopes": selection["planned_scopes"],
@@ -313,7 +396,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("manifest", "baseline-probe", "probe", "checkout-evidence", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
-    for name in ("report", "report-receipt", "natural-runs"):
+    for name in ("report", "report-receipt", "natural-runs", "raw-evidence"):
         parser.add_argument("--" + name, type=Path)
     args = parser.parse_args(argv)
     result = {"schema": "fotmob-b6-postflight-v1", "status": "FAIL", "inputs": {},
@@ -321,7 +404,7 @@ def main(argv=None):
               "first_fail_preserved": True}
     try:
         loaded = {}
-        for key in ("manifest", "baseline_probe", "probe", "checkout_evidence", "report", "report_receipt", "natural_runs"):
+        for key in ("manifest", "baseline_probe", "probe", "checkout_evidence", "report", "report_receipt", "natural_runs", "raw_evidence"):
             path = getattr(args, key)
             if path is not None:
                 loaded[key], digest = read_json(path)
@@ -340,7 +423,8 @@ def main(argv=None):
             result["captured_runner"] = {key: loaded["report"].get(key) for key in
                                          ("run_id", "mode", "status", "complete", "errors")}
             result["report"] = qualify_report(loaded["report"], loaded["report_receipt"], loaded["natural_runs"],
-                                               instant(checkout["actual_checkout_at"]), result["inputs"]["report"]["sha256"])
+                                               instant(checkout["actual_checkout_at"]), result["inputs"]["report"]["sha256"],
+                                               loaded.get("raw_evidence"))
         else:
             result["report"] = {"status": "NOT_CHECKED"}
         result["status"] = "PASS"

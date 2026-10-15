@@ -1,5 +1,6 @@
 """Captured evidence qualification; no services or source requests."""
 import copy
+import gzip
 import json
 from pathlib import Path
 
@@ -53,7 +54,18 @@ def inputs(tmp_path):
     retained_line.write_text('[2026-10-14T14:33:04.000+0000] {subprocess.py:106} INFO - ' + json.dumps(report) + '\n')
     receipt['retained_report_line_path'] = str(retained_line)
     receipt['retained_report_line_sha256'] = mod.sha(retained_line.read_bytes())
-    return copy.deepcopy((manifest, baseline, probe, checkout, report, receipt, [run]))
+    raw_evidence = []
+    for operation in report['operations']:
+        if operation['entity'] != 'season_bundle':
+            continue
+        metadata = operation['metadata']
+        evidence = metadata['calendar_unavailability']
+        path = Path(__file__).parents[2] / f"fixtures/fotmob/six_calendars_unavailable/league_{metadata['competition_id']}.json"
+        raw_evidence.append({'scope': mod.scope(metadata), 'url': evidence['url'],
+                             'target_key': evidence['target_key'], 'raw_uri': evidence['raw_uri'],
+                             'local_path': str(path.resolve()), 'file_sha256': mod.sha(path.read_bytes()),
+                             'encoding': 'identity'})
+    return copy.deepcopy((manifest, baseline, probe, checkout, report, receipt, [run], raw_evidence))
 
 
 def report_result(data, *, sync_line=True):
@@ -61,7 +73,7 @@ def report_result(data, *, sync_line=True):
         retained = Path(data[5]['retained_report_line_path'])
         retained.write_text('[2026-10-14T14:33:04.000+0000] {subprocess.py:106} INFO - ' + json.dumps(data[4]) + '\n')
         data[5]['retained_report_line_sha256'] = mod.sha(retained.read_bytes())
-    return mod.qualify_report(data[4], data[5], data[6], mod.instant(data[3]['actual_checkout_at']), 'c' * 64)
+    return mod.qualify_report(data[4], data[5], data[6], mod.instant(data[3]['actual_checkout_at']), 'c' * 64, data[7])
 
 
 def test_exact_target_and_offset_checkout_pass(inputs):
@@ -168,7 +180,7 @@ def test_green_run_without_six_does_not_prove_recovery(inputs):
 
 def test_cli_preserves_first_fail_and_reports_missing_full_report(inputs, tmp_path):
     paths = {}
-    for key, payload in zip(('manifest', 'baseline-probe', 'probe', 'checkout-evidence', 'report', 'report-receipt', 'natural-runs'), inputs):
+    for key, payload in zip(('manifest', 'baseline-probe', 'probe', 'checkout-evidence', 'report', 'report-receipt', 'natural-runs', 'raw-evidence'), inputs):
         path = tmp_path / (key + '.json')
         path.write_text(json.dumps(payload))
         paths[key] = path
@@ -244,7 +256,7 @@ def test_known_transfers_before_seasonal_report_are_not_eligible(inputs):
 @pytest.mark.parametrize('with_report', [False, True])
 def test_cli_local_success(inputs, tmp_path, with_report):
     paths = {}
-    for key, payload in zip(('manifest', 'baseline-probe', 'probe', 'checkout-evidence', 'report', 'report-receipt', 'natural-runs'), inputs):
+    for key, payload in zip(('manifest', 'baseline-probe', 'probe', 'checkout-evidence', 'report', 'report-receipt', 'natural-runs', 'raw-evidence'), inputs):
         path = tmp_path / (key + '.json')
         path.write_text(json.dumps(payload))
         paths[key] = path
@@ -252,7 +264,7 @@ def test_cli_local_success(inputs, tmp_path, with_report):
     receipt['report_sha256'] = mod.sha(paths['report'].read_bytes())
     paths['report-receipt'].write_text(json.dumps(receipt))
     if not with_report:
-        for key in ('report', 'report-receipt', 'natural-runs'):
+        for key in ('report', 'report-receipt', 'natural-runs', 'raw-evidence'):
             del paths[key]
     output = tmp_path / 'qualified.json'
     argv = [a for key, path in paths.items() for a in ('--' + key, str(path))] + ['--output', str(output)]
@@ -261,6 +273,9 @@ def test_cli_local_success(inputs, tmp_path, with_report):
     assert result['delivery']['status'] == 'PASS'
     assert result['report']['status'] == ('PASS' if with_report else 'NOT_CHECKED')
     assert all(len(v['sha256']) == 64 for v in result['inputs'].values())
+    if with_report:
+        assert 'raw_evidence' in result['inputs']
+        assert result['report']['diagnostics']['raw_bytes_verification'] == 'PASS'
 
 
 @pytest.mark.parametrize('mutation', [
@@ -378,3 +393,122 @@ def test_natural_writer_and_automatic_markers_can_change(inputs):
     inputs[1]['markers'] = {'fotmob-b6-inflight': {'exists': True}}
     inputs[2]['markers'] = {'fotmob-b6-accepted': {'exists': True}}
     assert mod.qualify_delivery(*inputs[:4])['status'] == 'PASS'
+
+
+def test_consistently_forged_raw_hash_and_uri_are_rejected(inputs):
+    bundle = next(o for o in inputs[4]['operations'] if o['entity'] == 'season_bundle')
+    bundle['metadata']['calendar_unavailability'].update(content_hash='0' * 64, raw_uri='file:///missing-retained.json.gz')
+    with pytest.raises(ValueError, match='raw'):
+        report_result(inputs)
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda raw: raw.clear(),
+    lambda raw: raw.append(dict(raw[0])),
+    lambda raw: raw[0].update(scope='999=2025'),
+    lambda raw: raw[0].pop('raw_uri'),
+    lambda raw: raw[0].update(raw_uri='file:///missing-retained.json.gz'),
+    lambda raw: raw[0].update(url='https://www.fotmob.com/api/data/leagues?id=999&season=2025'),
+    lambda raw: raw[0].update(target_key='0' * 64),
+    lambda raw: raw[0].update(file_sha256='0' * 64),
+    lambda raw: raw[0].update(local_path='/missing-retained-response.json'),
+    lambda raw: raw[0].update(encoding='unknown'),
+])
+def test_raw_manifest_missing_or_inconsistent_is_rejected(inputs, mutation):
+    mutation(inputs[7])
+    with pytest.raises((ValueError, KeyError, OSError), match='raw|scope|encoding'):
+        report_result(inputs)
+
+
+@pytest.mark.parametrize('mutation', ['wrong_hash', 'wrong_id', 'wrong_season', 'calendar_exists', 'wrong_stub', 'numeric_false_stub', 'unknown_path', 'invalid_json'])
+def test_raw_bytes_substitution_is_rejected(inputs, tmp_path, mutation):
+    entry = inputs[7][0]
+    body = Path(entry['local_path']).read_bytes()
+    payload = json.loads(body)
+    if mutation == 'wrong_id':
+        payload['details']['id'] = 999
+    elif mutation == 'wrong_season':
+        payload['details']['selectedSeason'] = '1900'
+    elif mutation == 'calendar_exists':
+        payload['fixtures']['allMatches'] = []
+    elif mutation == 'wrong_stub':
+        payload['tabs'] = ['fixtures']
+    elif mutation == 'numeric_false_stub':
+        payload['fixtures']['hasOngoingMatch'] = 0
+    elif mutation == 'unknown_path':
+        payload['unclassified_new_shape'] = 1
+    body = b'not JSON' if mutation == 'invalid_json' else json.dumps(payload).encode()
+    retained = tmp_path / 'substituted.json'
+    retained.write_bytes(body)
+    entry.update(local_path=str(retained), file_sha256=mod.sha(body))
+    if mutation != 'wrong_hash':
+        bundle = next(o for o in inputs[4]['operations'] if o['entity'] == 'season_bundle' and mod.scope(o['metadata']) == entry['scope'])
+        bundle['metadata']['calendar_unavailability']['content_hash'] = mod.sha(body)
+    with pytest.raises(ValueError):
+        report_result(inputs)
+
+
+def test_gzip_raw_uses_decoded_http_body_hash(inputs, tmp_path):
+    entry = inputs[7][0]
+    body = Path(entry['local_path']).read_bytes()
+    compressed = gzip.compress(body, mtime=0)
+    retained = tmp_path / 'response.json.gz'
+    retained.write_bytes(compressed)
+    entry.update(local_path=str(retained), file_sha256=mod.sha(compressed), encoding='gzip')
+    result = report_result(inputs)
+    assert result['diagnostics']['raw_evidence'][entry['scope']]['content_hash'] == mod.sha(body)
+    assert result['diagnostics']['raw_evidence'][entry['scope']]['file_sha256'] == mod.sha(compressed)
+
+
+def test_corrupt_gzip_is_rejected(inputs, tmp_path):
+    entry = inputs[7][0]
+    retained = tmp_path / 'corrupt.json.gz'
+    retained.write_bytes(b'broken gzip')
+    entry.update(local_path=str(retained), file_sha256=mod.sha(retained.read_bytes()), encoding='gzip')
+    with pytest.raises(ValueError, match='raw'):
+        report_result(inputs)
+
+
+def test_raw_evidence_is_required_by_default_for_unavailable(inputs):
+    with pytest.raises(ValueError, match='raw evidence manifest required'):
+        mod.qualify_report(inputs[4], inputs[5], inputs[6], mod.instant(inputs[3]['actual_checkout_at']), 'c' * 64)
+
+
+def test_duplicate_raw_uri_is_rejected(inputs):
+    inputs[7][1]['raw_uri'] = inputs[7][0]['raw_uri']
+    with pytest.raises(ValueError, match='duplicate raw URI'):
+        report_result(inputs)
+
+
+def test_hash_forgery_with_consistent_manifest_still_fails_actual_body(inputs):
+    bundle = next(o for o in inputs[4]['operations'] if o['entity'] == 'season_bundle')
+    bundle['metadata']['calendar_unavailability']['content_hash'] = '0' * 64
+    with pytest.raises(ValueError, match='raw HTTP body content_hash differs'):
+        report_result(inputs)
+
+
+def test_gzip_file_hash_cannot_replace_http_body_hash(inputs, tmp_path):
+    entry = inputs[7][0]
+    compressed = gzip.compress(Path(entry['local_path']).read_bytes(), mtime=0)
+    retained = tmp_path / 'response.json.gz'
+    retained.write_bytes(compressed)
+    entry.update(local_path=str(retained), file_sha256=mod.sha(compressed), encoding='gzip')
+    bundle = next(o for o in inputs[4]['operations'] if o['entity'] == 'season_bundle' and mod.scope(o['metadata']) == entry['scope'])
+    bundle['metadata']['calendar_unavailability']['content_hash'] = mod.sha(compressed)
+    with pytest.raises(ValueError, match='raw HTTP body content_hash differs'):
+        report_result(inputs)
+
+
+def test_cli_fails_when_required_raw_manifest_is_absent(inputs, tmp_path):
+    paths = {}
+    for key, payload in zip(('manifest', 'baseline-probe', 'probe', 'checkout-evidence', 'report', 'report-receipt', 'natural-runs'), inputs):
+        path = tmp_path / (key + '.json')
+        path.write_text(json.dumps(payload))
+        paths[key] = path
+    receipt = json.loads(paths['report-receipt'].read_text())
+    receipt['report_sha256'] = mod.sha(paths['report'].read_bytes())
+    paths['report-receipt'].write_text(json.dumps(receipt))
+    output = tmp_path / 'missing-raw-fail.json'
+    argv = [a for key, path in paths.items() for a in ('--' + key, str(path))] + ['--output', str(output)]
+    assert mod.main(argv) == 1
+    assert json.loads(output.read_text())['error'] == 'raw evidence manifest required for unavailable scopes'

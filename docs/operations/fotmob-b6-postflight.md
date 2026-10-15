@@ -16,7 +16,7 @@ python3 -B scripts/fotmob_b6_postflight.py \
   --probe after-checkout.json \
   --checkout-evidence checkout-receipt.json \
   --report runner-report.json --report-receipt report-receipt.json \
-  --natural-runs natural-runs.json \
+  --natural-runs natural-runs.json --raw-evidence raw-evidence.json \
   --output first-postflight.json
 ```
 
@@ -106,6 +106,48 @@ content hash, raw URI, fetched time, HTTP/cache/stale, retryable и следую
 восстановление зелёным окном, которое их не пыталось собирать. Ноль диагностик
 сам по себе допустим и ничего не доказывает о восстановлении источника.
 
+
+Для непустого `calendar_unavailable_scopes` обязателен `--raw-evidence`:
+сохранённый JSON-массив с одной записью на каждый диагностированный scope.
+Ни один файл по `raw_uri` CLI не скачивает; он открывает только `local_path`.
+Пример формы одной записи (значения берутся из реального captured ответа):
+
+```json
+[
+  {
+    "scope": "10433=2022/2023",
+    "url": "https://www.fotmob.com/api/data/leagues?id=10433&season=2022%2F2023",
+    "target_key": "<target_key из отчёта>",
+    "raw_uri": "<исходный raw_uri из отчёта>",
+    "local_path": "/absolute/retained-response.json.gz",
+    "file_sha256": "<SHA256 сохранённых байтов файла>",
+    "encoding": "gzip"
+  }
+]
+```
+
+Manifest обязан покрывать весь непустой список диагностики без дубликатов scope
+или URI. Его scope, URL, target key и исходный URI связываются с отчётом. CLI
+проверяет хеш локального файла. При `encoding=gzip` он снимает только storage gzip;
+при `encoding=identity` файл уже содержит HTTP body. SHA256 исходных HTTP body
+bytes должен совпасть с `calendar_unavailability.content_hash`. Повторная
+сериализация JSON или хеш gzip-файла вместо HTTP body эту проверку не заменяют.
+Отсутствие файла, порча gzip, подмена хеша, URI или scope дают FAIL.
+
+Далее существующий чистый `parse_season_bundle` сверяет exact season и отсутствие
+календаря, проверяются ID ответа и форма metadata-only stub из `service.py`.
+Реестр `classify_paths` проверяет JSON-поля. Это проверка содержимого сохранённого
+ответа; историческое наличие матчей в БД CLI не исследует. SHA manifest входит
+в `inputs.raw_evidence`, хеши файлов и HTTP body сохраняются в
+`report.diagnostics.raw_evidence`. Для непустой диагностики
+`raw_bytes_verification=PASS` выдаётся только после этих проверок.
+Пустой список не требует manifest и получает `NOT_APPLICABLE_NO_UNAVAILABLE`;
+это ничего не доказывает о восстановлении источника.
+
+Структурная согласованность отчёта без raw-байтов сама по себе недостаточна для
+критерия runtime diagnostics #1723. Отчёты прежней версии CLI сохраняются как
+история; новый результат не переписывает прежний PASS или FAIL.
+
 PASS квалификации диагностики допускает `runner.complete=false`. Результат
 сохраняет ошибки, попытки, план, завершённые scope и знаменатель. Он **не является**
 полной runtime-приёмкой #1699/#1711, SLA PASS, доказательством ремонта источника
@@ -114,5 +156,8 @@ PASS квалификации диагностики допускает `runner.
 Тестовая fixture `tests/fixtures/fotmob/b6_postflight/unavailable-report.json`
 сокращена из offline report шести настоящих сохранённых source fixtures. UUID
 и attempt identities заменены согласованными тестовыми значениями. Полный
-контракт исходного offline-каталога сохранён и проходит штатный validator. Это тестовые
+контракт исходного offline-каталога сохранён и проходит штатный validator.
+В этой тестовой копии `content_hash` равен SHA256 исходных bytes соответствующего
+файла из `six_calendars_unavailable/`: прежний offline transport пересериализовал
+JSON перед хешированием. Сами шесть retained source fixtures не меняются. Это тестовые
 данные; они не являются production postflight или новым наблюдением источника.
