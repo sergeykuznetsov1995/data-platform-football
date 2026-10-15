@@ -90,17 +90,22 @@ def _with_allocation_headroom(policy):
     the paid path is that maximum plus the structural headroom (#1044).  The
     signed plan already applies it to ``WorkloadAllocation.budget_bytes``, so
     the class-scoped local policy has to agree byte for byte: otherwise
-    ``_AllocationBudgetView`` rejects the run as a provenance mismatch, and
-    even if it did not, the local run/endpoint caps would still trip at the
-    bare measured maximum and the headroom would buy nothing.
+    ``_AllocationBudgetView`` rejects the run as a provenance mismatch.
+
+    A resumed allocation can warm the browser on any missing endpoint. Cold
+    per-request measurements attribute that bootstrap to the first endpoint
+    of the sample, so they cannot cap a different first endpoint on resume.
+    Reserve the unchanged signed class remainder for each known endpoint; the
+    shared ledger and gateway still enforce the exact allocation total. Keep
+    the artifact's per-request observations unchanged.
     """
 
     return replace(
         policy,
         hard_run_bytes=allocation_budget_bytes(policy.hard_run_bytes),
         endpoint_reservation_bytes={
-            endpoint: allocation_budget_bytes(value)
-            for endpoint, value in policy.endpoint_reservation_bytes.items()
+            endpoint: allocation_budget_bytes(policy.hard_run_bytes)
+            for endpoint in policy.endpoint_reservation_bytes
         },
     )
 

@@ -157,23 +157,45 @@ def test_season_caps_are_nondecreasing_inside_each_format():
 
 
 @pytest.mark.unit
-def test_request_bounds_get_existing_headroom_exactly_once(tmp_path):
+def test_sparse_resume_reservations_preserve_signed_cap_and_single_headroom(tmp_path):
     from scripts.proxy_filter.budget import (
-        ProxyBudgetExceeded, SharedBudgetLedger, load_verified_policy,
+        ProductionBudgetUnavailable, ProxyBudgetExceeded, SharedBudgetLedger,
+        load_verified_policy,
     )
     from scrapers.sofascore.pipeline import _with_allocation_headroom
 
+    measured = load_static_workload_policy(SHIPPED_POLICY).classes[match_workload_class()]
     policy = load_verified_policy(SHIPPED_POLICY, workload_class=match_workload_class())
-    assert policy.reservation_for("event") == 58532
+    assert measured.request_bound_bytes["event"] == 58_532
+    assert measured.request_bound_bytes["statistics"] == 5_410
+    assert policy.hard_run_bytes == 1_145_777
+    assert policy.reservation_for("lineups") == 22_547
     effective = _with_allocation_headroom(policy)
-    assert effective.hard_run_bytes == 1317644
-    assert effective.reservation_for("event") == 67312
-    assert effective.reservation_for("statistics") == 6222
+    assert effective.hard_run_bytes == 1_317_644
+    assert effective.reservation_for("statistics") == effective.hard_run_bytes
+    with pytest.raises(ProductionBudgetUnavailable, match="no reservation"):
+        effective.reservation_for("unknown")
+
     ledger = SharedBudgetLedger(tmp_path / "budget.json", effective)
-    token, amount = ledger.reserve("signed-run::allocation", "event")
-    assert amount == 67312
+    run = "signed-run::allocation"
+    token, amount = ledger.reserve(run, "lineups")
+    assert amount == effective.hard_run_bytes
+    # The first sparse endpoint owns cold browser bytes, beyond its observed
+    # request maximum. It is still charged exactly once to the signed cap.
+    assert ledger.finish(run, token, reported_provider_bytes=50_000) == 50_000
+    token, remaining = ledger.reserve(run, "statistics")
+    assert remaining == effective.hard_run_bytes - 50_000
     with pytest.raises(ProxyBudgetExceeded, match="exceed the endpoint's measured maximum reservation"):
-        ledger.consume("signed-run::allocation", token, amount + 1)
+        ledger.consume(run, token, remaining + 1)
+    with pytest.raises(ProxyBudgetExceeded, match="reported traffic exceeds endpoint reservation"):
+        ledger.finish(run, token, reported_provider_bytes=remaining + 1)
+    assert ledger.snapshot(run)["spent_provider_bytes"] == 50_000
+    ledger.consume(run, token, remaining)
+    assert ledger.finish(run, token, reported_provider_bytes=remaining) == remaining
+    assert ledger.snapshot(run)["spent_provider_bytes"] == effective.hard_run_bytes
+    assert ledger.snapshot(run)["reservations"] == {}
+    with pytest.raises(ProxyBudgetExceeded, match="budget exhausted before endpoint"):
+        ledger.reserve(run, "event")
 
 
 @pytest.mark.unit
