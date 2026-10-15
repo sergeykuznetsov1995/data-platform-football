@@ -24,6 +24,15 @@ def test_queue_accepts_only_proven_unstarted_work(snapshot):
     assert "\nCOMMIT;" not in sql
 
 
+def test_queue_sql_timing_is_bound_by_preparation_source_not_mutable_import(snapshot, monkeypatch):
+    from deploy.shared_writer import work
+    expected = p.cancellation_sql(snapshot, "a" * 64)
+    monkeypatch.setattr(work, "HISTORICAL_AGE", 0)
+    monkeypatch.setattr(work, "HEARTBEAT_AGE", 0)
+    monkeypatch.setattr(work, "INITIAL_HEARTBEAT_SKEW", 100000)
+    assert p.cancellation_sql(snapshot, "a" * 64) == expected
+
+
 @pytest.mark.parametrize("section,key,value", [
     ("runs", "state", "running"), ("runs", "dag_id", "other"),
     ("runs", "start_date", "2026-10-12T12:00:00Z"), ("runs", "end_date", "2026-10-12T12:00:00Z"),

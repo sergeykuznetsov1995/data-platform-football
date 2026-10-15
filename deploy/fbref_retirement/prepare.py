@@ -151,8 +151,10 @@ def sql_literal(value):
 def cancellation_sql(snapshot, manifest_sha):
     """Exact before rows and exclusive metadata locks prevent races.
 
-    Conservative job guard may reject old abandoned jobs; never waive it. A
-    refusal calls for investigation, not changing states or bypassing guards.
+    Historical work uses the same evidence as shared_writer.work: old waiting
+    tasks need terminal parents and absent or conclusively finished jobs; an
+    abandoned running job needs old timestamps and only old terminal references.
+    Re-evaluate under the same table locks; never mutate those residual rows.
     """
     validate_queue(snapshot)
     require(len(manifest_sha) == 64 and all(c in "0123456789abcdef" for c in manifest_sha), "invalid approval hash")
@@ -202,16 +204,50 @@ BEGIN
  THEN RAISE EXCEPTION 'parent before-image drift'; END IF;
  IF EXISTS (SELECT 1 FROM task_instance ti LEFT JOIN dag_run dr
      ON dr.dag_id=ti.dag_id AND dr.run_id=ti.run_id
-     WHERE ti.state IN ('running','queued','restarting','deferred','scheduled','up_for_retry','up_for_reschedule')
+     LEFT JOIN job j ON j.id=ti.job_id
+     WHERE (ti.state IN ('running','queued','restarting','deferred','scheduled','up_for_retry','up_for_reschedule')
        OR (ti.state IS NOT NULL AND ti.state NOT IN ('success','failed','skipped','upstream_failed','removed'))
-       OR (ti.state IS NULL AND (ti.job_id IS NOT NULL OR dr.state IS NULL)) )
+       OR (ti.state IS NULL AND (ti.job_id IS NOT NULL OR dr.state IS NULL)))
+     AND NOT COALESCE(
+       (ti.state IN ('scheduled','up_for_retry','up_for_reschedule') OR (ti.state IS NULL AND ti.job_id IS NOT NULL))
+       AND dr.state IN ('success','failed')
+       AND isfinite(ti.updated_at) AND ti.updated_at > 'epoch'::timestamptz
+       AND ti.updated_at <= CURRENT_TIMESTAMP - interval '24 hours'
+       AND ((ti.job_id IS NULL AND j.id IS NULL) OR
+         (j.id IS NOT NULL AND j.job_type='LocalTaskJob' AND j.state IN ('success','failed')
+          AND j.start_date IS NOT NULL AND j.end_date IS NOT NULL AND j.latest_heartbeat IS NOT NULL
+          AND isfinite(j.start_date) AND isfinite(j.end_date) AND isfinite(j.latest_heartbeat)
+          AND j.start_date > 'epoch'::timestamptz AND j.end_date > 'epoch'::timestamptz
+          AND j.latest_heartbeat > 'epoch'::timestamptz
+          AND j.start_date <= CURRENT_TIMESTAMP - interval '24 hours'
+          AND j.start_date <= j.latest_heartbeat + interval '1 second'
+          AND j.start_date <= j.end_date AND j.latest_heartbeat <= j.end_date
+          AND j.end_date < CURRENT_TIMESTAMP - interval '5 minutes'
+          AND j.latest_heartbeat < CURRENT_TIMESTAMP - interval '5 minutes')), false))
  THEN RAISE EXCEPTION 'executing, waiting or unknown task/job reference'; END IF;
  IF EXISTS (SELECT 1 FROM job WHERE job_type='LocalTaskJob' AND
      (state IS NULL OR state NOT IN ('success','failed') OR end_date IS NULL
       OR start_date IS NULL OR latest_heartbeat IS NULL
+      OR NOT isfinite(start_date) OR NOT isfinite(end_date) OR NOT isfinite(latest_heartbeat)
+      OR start_date<='epoch'::timestamptz OR end_date<='epoch'::timestamptz OR latest_heartbeat<='epoch'::timestamptz
+      OR start_date>CURRENT_TIMESTAMP
       OR start_date>latest_heartbeat+interval '1 second' OR start_date>end_date
-      OR latest_heartbeat>end_date OR latest_heartbeat>clock_timestamp()-interval '5 minutes'
-      OR end_date>clock_timestamp()-interval '5 minutes'))
+      OR latest_heartbeat>end_date OR latest_heartbeat>=CURRENT_TIMESTAMP-interval '5 minutes'
+      OR end_date>=CURRENT_TIMESTAMP-interval '5 minutes')
+     AND NOT COALESCE(state='running' AND end_date IS NULL
+       AND isfinite(start_date) AND isfinite(latest_heartbeat)
+       AND start_date > 'epoch'::timestamptz AND latest_heartbeat > 'epoch'::timestamptz
+       AND start_date <= CURRENT_TIMESTAMP - interval '24 hours'
+       AND latest_heartbeat <= CURRENT_TIMESTAMP - interval '24 hours'
+       AND start_date <= latest_heartbeat + interval '1 second'
+       AND NOT EXISTS (SELECT 1 FROM task_instance refs LEFT JOIN dag_run parent
+         ON parent.dag_id=refs.dag_id AND parent.run_id=refs.run_id
+         WHERE refs.job_id=job.id AND (refs.state IS NULL
+           OR refs.state NOT IN ('success','failed','skipped','upstream_failed','removed')
+           OR parent.state IS NULL OR parent.state NOT IN ('success','failed')
+           OR refs.updated_at IS NULL
+           OR NOT isfinite(refs.updated_at) OR refs.updated_at<='epoch'::timestamptz
+           OR refs.updated_at > CURRENT_TIMESTAMP - interval '24 hours')), false))
  THEN RAISE EXCEPTION 'unfinished, unknown or recent LocalTaskJob'; END IF;
  UPDATE dag_run SET state='failed',end_date=clock_timestamp()
  WHERE dag_id='{SILVER}' AND state='queued' AND id IN

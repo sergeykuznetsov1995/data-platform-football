@@ -13,6 +13,7 @@ import pytest
 
 from deploy.fbref_retirement import prepare as p
 from deploy.fbref_retirement import render_commit as renderer
+from deploy.shared_writer.work import WORK_SQL, classify_work
 
 
 @pytest.fixture
@@ -38,7 +39,7 @@ def seed(db):
 DROP TABLE IF EXISTS task_instance,dag_run,dag,job;
 CREATE TABLE dag(dag_id text PRIMARY KEY,is_active boolean,is_paused boolean);
 CREATE TABLE dag_run(id integer PRIMARY KEY,dag_id text,run_id text,state text,start_date timestamptz,end_date timestamptz,clear_number integer DEFAULT 0,creating_job_id integer);
-CREATE TABLE task_instance(dag_id text,run_id text,task_id text,map_index integer,state text,job_id integer,start_date timestamptz,end_date timestamptz,try_number integer,queued_dttm timestamptz,queued_by_job_id integer,external_executor_id text,trigger_id integer,trigger_timeout timestamptz,next_method text,next_kwargs jsonb,pid integer,duration double precision);
+CREATE TABLE task_instance(dag_id text,run_id text,task_id text,map_index integer,state text,job_id integer,start_date timestamptz,end_date timestamptz,try_number integer,queued_dttm timestamptz,queued_by_job_id integer,external_executor_id text,trigger_id integer,trigger_timeout timestamptz,next_method text,next_kwargs jsonb,pid integer,duration double precision,updated_at timestamptz);
 CREATE TABLE job(id integer PRIMARY KEY,job_type text,state text,start_date timestamptz,end_date timestamptz,latest_heartbeat timestamptz);
 """)
     dags = p.PRODUCERS + (p.SILVER,) + p.HOLD
@@ -49,7 +50,7 @@ CREATE TABLE job(id integer PRIMARY KEY,job_type text,state text,start_date time
     runs = [{"id": i+1, "dag_id": p.SILVER, "run_id": f"fbref_silver__{parent['dag_id']}__{parent['run_id']}",
              "state": "queued", "start_date": None, "end_date": None, "clear_number": 0, "creating_job_id": None} for i, parent in enumerate(parents)]
     tasks = [{"dag_id": p.SILVER, "run_id": run["run_id"], "task_id": name, "map_index": -1,
-              **{k: None for k in p.TASK_UNSET}, "try_number": 0}
+              **{k: None for k in p.TASK_UNSET}, "try_number": 0, "updated_at": None}
              for run in runs for name in ("normal", "quoted'; SELECT 'as data")]
     for table, rows in (("dag_run", parents+runs), ("task_instance", tasks)):
         db(f"INSERT INTO {table} SELECT * FROM jsonb_populate_recordset(NULL::{table}, {p.sql_literal(rows)});")
@@ -107,6 +108,98 @@ def test_old_successful_job_and_terminal_history_are_preserved(db):
     db("INSERT INTO job VALUES(7,'LocalTaskJob','success',now()-interval '1 day',now()-interval '1 hour',now()-interval '1 hour');")
     before = fingerprints(db)
     assert db(p.cancellation_sql(snapshot, "d"*64)).count("|failed|") == 2
+    assert fingerprints(db) == before
+
+
+def seed_historical_work(db):
+    """The shared host already classifies these exact old rows as historical."""
+    snapshot = seed(db)
+    db("INSERT INTO job VALUES(70,'LocalTaskJob','running',now()-interval '3 days',NULL,now()-interval '2 days');")
+    db("INSERT INTO job VALUES(71,'LocalTaskJob','running',now()-interval '3 days',NULL,now()-interval '2 days');")
+    db("INSERT INTO task_instance(dag_id,run_id,task_id,map_index,state,job_id,updated_at) VALUES "
+       "('dag_ingest_fbref','source0','terminal_residual',-1,'success',70,now()-interval '2 days'),"
+       "('dag_ingest_fbref','source0','waiting_residual',-1,'scheduled',NULL,now()-interval '2 days');")
+    return snapshot
+
+
+@pytest.mark.parametrize("include_waiting", [True, False])
+def test_shared_host_historical_rows_do_not_block_exact_queue(db, include_waiting):
+    snapshot = seed_historical_work(db)
+    if not include_waiting:
+        db("DELETE FROM task_instance WHERE task_id='waiting_residual';")
+    observed = classify_work(json.loads(db(f"SELECT {WORK_SQL};")))
+    assert observed["historical_tasks"] == int(include_waiting)
+    assert observed["historical_jobs"] == 2 and observed["abandoned_orphan_jobs"] == 1
+    assert observed["local_jobs"] == 0
+    before = fingerprints(db)
+    assert db(p.cancellation_sql(snapshot, "d"*64)).count("|failed|") == 2
+    assert fingerprints(db) == before
+
+
+@pytest.mark.parametrize("state", ['scheduled', 'up_for_retry', 'up_for_reschedule', None])
+def test_old_waiting_or_reset_task_with_finished_job_is_preserved(db, state):
+    snapshot = seed_historical_work(db)
+    db("INSERT INTO job VALUES(72,'LocalTaskJob','success',now()-interval '3 days',now()-interval '2 days',now()-interval '2 days');")
+    literal = "NULL" if state is None else f"'{state}'"
+    db(f"UPDATE task_instance SET state={literal},job_id=72 WHERE task_id='waiting_residual';")
+    observed = classify_work(json.loads(db(f"SELECT {WORK_SQL};")))
+    assert observed['historical_tasks'] + observed['historical_reset_tasks'] == 1
+    before = fingerprints(db)
+    assert db(p.cancellation_sql(snapshot, "d"*64)).count("|failed|") == 2
+    assert fingerprints(db) == before
+
+
+@pytest.mark.parametrize("mutation", [
+    "UPDATE task_instance SET state='running' WHERE task_id='waiting_residual';",
+    "UPDATE task_instance SET updated_at=now() WHERE task_id='waiting_residual';",
+    "UPDATE task_instance SET updated_at=NULL WHERE task_id='waiting_residual';",
+    "UPDATE task_instance SET job_id=999 WHERE task_id='waiting_residual';",
+    "UPDATE task_instance SET job_id=70 WHERE task_id='waiting_residual';",
+    "UPDATE task_instance SET state='deferred' WHERE task_id='waiting_residual';",
+    "UPDATE task_instance SET state='unknown_state' WHERE task_id='waiting_residual';",
+    "UPDATE task_instance SET updated_at=now() WHERE task_id='terminal_residual';",
+    "UPDATE task_instance SET updated_at=NULL WHERE task_id='terminal_residual';",
+    "UPDATE task_instance SET state=NULL WHERE task_id='terminal_residual';",
+    "UPDATE job SET latest_heartbeat=now() WHERE id=70;",
+    "UPDATE job SET start_date=NULL WHERE id=70;",
+    "UPDATE job SET latest_heartbeat=NULL WHERE id=70;",
+    "UPDATE job SET state='unknown_state' WHERE id=70;",
+    "UPDATE job SET start_date=latest_heartbeat+interval '2 seconds' WHERE id=70;",
+    "UPDATE job SET state='success' WHERE id=70;",
+    "UPDATE job SET end_date=now() WHERE id=70;",
+])
+def test_historical_exception_keeps_every_unknown_or_live_reference_blocking(db, mutation):
+    snapshot = seed_historical_work(db)
+    db(mutation)
+    before = fingerprints(db)
+    db(p.cancellation_sql(snapshot, "f"*64), ok=False)
+    assert fingerprints(db) == before
+
+
+@pytest.mark.parametrize("value", ["epoch", "1969-12-31 23:59:59+00", "-infinity", "infinity"])
+@pytest.mark.parametrize("field", ["waiting_update", "terminal_update", "job_start", "job_heartbeat"])
+def test_nonpositive_or_nonfinite_historical_timestamp_blocks(db, value, field):
+    snapshot = seed_historical_work(db)
+    if field.endswith('_update'):
+        task = 'waiting_residual' if field == 'waiting_update' else 'terminal_residual'
+        db(f"UPDATE task_instance SET updated_at='{value}'::timestamptz WHERE task_id='{task}';")
+    else:
+        column = 'start_date' if field == 'job_start' else 'latest_heartbeat'
+        db(f"UPDATE job SET {column}='{value}'::timestamptz WHERE id=70;")
+    before = fingerprints(db)
+    db(p.cancellation_sql(snapshot, "f"*64), ok=False)
+    assert fingerprints(db) == before
+
+
+@pytest.mark.parametrize("column", ["start_date", "end_date", "latest_heartbeat"])
+@pytest.mark.parametrize("value", ["epoch", "-infinity", "infinity"])
+def test_invalid_finished_job_timestamp_never_qualifies_waiting_task(db, column, value):
+    snapshot = seed_historical_work(db)
+    db("INSERT INTO job VALUES(72,'LocalTaskJob','success',now()-interval '3 days',now()-interval '2 days',now()-interval '2 days');")
+    db("UPDATE task_instance SET job_id=72 WHERE task_id='waiting_residual';")
+    db(f"UPDATE job SET {column}='{value}'::timestamptz WHERE id=72;")
+    before = fingerprints(db)
+    db(p.cancellation_sql(snapshot, "f"*64), ok=False)
     assert fingerprints(db) == before
 
 
