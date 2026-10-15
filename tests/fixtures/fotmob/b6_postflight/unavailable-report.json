@@ -1,0 +1,557 @@
+{
+  "run_id": "883a6b75-cbfd-565e-ae26-c7994796aadb",
+  "mode": "refresh",
+  "status": "incomplete",
+  "started_at": "2026-10-14T14:33:03.421574",
+  "completed_at": "2026-10-14T14:33:03.442850",
+  "errors": [
+    "retryable: scope 10433=2022/2023 has no season bundle",
+    "retryable: scope 10433=2022/2023 incomplete; outstanding={'season_bundle': 1}",
+    "retryable: scope 9170=2023 has no season bundle",
+    "retryable: scope 9170=2023 incomplete; outstanding={'season_bundle': 1}",
+    "retryable: scope 9669=2023/2024 has no season bundle",
+    "retryable: scope 9669=2023/2024 incomplete; outstanding={'season_bundle': 1}",
+    "retryable: scope 300=2025 has no season bundle",
+    "retryable: scope 300=2025 incomplete; outstanding={'season_bundle': 1}",
+    "retryable: scope 10840=2025/2026 has no season bundle",
+    "retryable: scope 10840=2025/2026 incomplete; outstanding={'season_bundle': 1}",
+    "retryable: scope 10056=2026/2027 has no season bundle",
+    "retryable: scope 10056=2026/2027 incomplete; outstanding={'season_bundle': 1}",
+    "retryable: source_calendar_unavailable: 10433=2022/2023; source publishes season metadata only",
+    "retryable: source_calendar_unavailable: 9170=2023; source publishes season metadata only",
+    "retryable: source_calendar_unavailable: 9669=2023/2024; source publishes season metadata only",
+    "retryable: source_calendar_unavailable: 300=2025; source publishes season metadata only",
+    "retryable: source_calendar_unavailable: 10840=2025/2026; source publishes season metadata only",
+    "retryable: source_calendar_unavailable: 10056=2026/2027; source publishes season metadata only"
+  ],
+  "complete": false,
+  "selection": {
+    "entities": [
+      "season",
+      "transfers"
+    ],
+    "scope_plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+    "planned_scopes": [
+      "10433=2022/2023",
+      "9170=2023",
+      "9669=2023/2024",
+      "300=2025",
+      "10840=2025/2026",
+      "10056=2026/2027"
+    ],
+    "completed_scopes": [],
+    "calendar_unavailable_scopes": [
+      "10056=2026/2027",
+      "10433=2022/2023",
+      "10840=2025/2026",
+      "300=2025",
+      "9170=2023",
+      "9669=2023/2024"
+    ],
+    "scope_lane": "current",
+    "catalog_contract": {
+      "schema": "fotmob-catalog-v1",
+      "catalog_batch_id": "fm1-9b6df2f36542243d0a33b74edfdf3ae1432fa0bcd9b6cf0b0c8747c5dee246b8",
+      "catalog_content_hash": "2d6f9238251a4d835719310a13bff19f2cee552c81b7f5fbe354461f01876dbd",
+      "classifier_version": "fotmob-men-v1",
+      "parser_version": "fotmob-native-v2",
+      "entities": [
+        "season",
+        "transfers"
+      ],
+      "entity_policy": {
+        "leaderboard_policy": "all_advertised",
+        "match_policy": "finished_only",
+        "player_policy": "global_observed_snapshot",
+        "team_policy": "global_observed_snapshot",
+        "transfer_policy": {
+          "completion_scope": "included_ids",
+          "completion_signature": "catalog_contract",
+          "pagination": "unique_hits",
+          "window": "1year"
+        }
+      },
+      "included_ids": [
+        300,
+        9170,
+        9669,
+        10056,
+        10433,
+        10840
+      ],
+      "included_count": 6,
+      "included_ids_sha256": "26eecadef059399788067a4d8db5bf84a1fe79d2db604e82836896ec6d15f3c6",
+      "scopes": [
+        "300=2025",
+        "9170=2023",
+        "9669=2023/2024",
+        "10056=2026/2027",
+        "10433=2022/2023",
+        "10840=2025/2026"
+      ],
+      "scope_count": 6,
+      "scope_sha256": "6ed433c21f16fe283e4a3426bc900ad03012ab4728c06a453679b245dc303a1c",
+      "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2"
+    },
+    "scope_attempts": [
+      {
+        "competition_id": 300,
+        "source_season_key": "2025",
+        "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+        "attempt_count": 1,
+        "last_attempt_at": "2026-10-14T14:33:03.437991+00:00",
+        "next_retry_at": "2026-10-14T14:48:03.436755+00:00",
+        "outcome": "retryable",
+        "reason": "source_calendar_unavailable",
+        "attempt_identities": [
+          "883a6b75-cbfd-565e-ae26-c7994796aadb:300=2025"
+        ]
+      },
+      {
+        "competition_id": 9170,
+        "source_season_key": "2023",
+        "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+        "attempt_count": 1,
+        "last_attempt_at": "2026-10-14T14:33:03.435187+00:00",
+        "next_retry_at": "2026-10-14T14:48:03.433936+00:00",
+        "outcome": "retryable",
+        "reason": "source_calendar_unavailable",
+        "attempt_identities": [
+          "883a6b75-cbfd-565e-ae26-c7994796aadb:9170=2023"
+        ]
+      },
+      {
+        "competition_id": 9669,
+        "source_season_key": "2023/2024",
+        "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+        "attempt_count": 1,
+        "last_attempt_at": "2026-10-14T14:33:03.436656+00:00",
+        "next_retry_at": "2026-10-14T14:48:03.435297+00:00",
+        "outcome": "retryable",
+        "reason": "source_calendar_unavailable",
+        "attempt_identities": [
+          "883a6b75-cbfd-565e-ae26-c7994796aadb:9669=2023/2024"
+        ]
+      },
+      {
+        "competition_id": 10056,
+        "source_season_key": "2026/2027",
+        "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+        "attempt_count": 1,
+        "last_attempt_at": "2026-10-14T14:33:03.440667+00:00",
+        "next_retry_at": "2026-10-14T14:48:03.439439+00:00",
+        "outcome": "retryable",
+        "reason": "source_calendar_unavailable",
+        "attempt_identities": [
+          "883a6b75-cbfd-565e-ae26-c7994796aadb:10056=2026/2027"
+        ]
+      },
+      {
+        "competition_id": 10433,
+        "source_season_key": "2022/2023",
+        "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+        "attempt_count": 1,
+        "last_attempt_at": "2026-10-14T14:33:03.433800+00:00",
+        "next_retry_at": "2026-10-14T14:48:03.432208+00:00",
+        "outcome": "retryable",
+        "reason": "source_calendar_unavailable",
+        "attempt_identities": [
+          "883a6b75-cbfd-565e-ae26-c7994796aadb:10433=2022/2023"
+        ]
+      },
+      {
+        "competition_id": 10840,
+        "source_season_key": "2025/2026",
+        "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+        "attempt_count": 1,
+        "last_attempt_at": "2026-10-14T14:33:03.439319+00:00",
+        "next_retry_at": "2026-10-14T14:48:03.438090+00:00",
+        "outcome": "retryable",
+        "reason": "source_calendar_unavailable",
+        "attempt_identities": [
+          "883a6b75-cbfd-565e-ae26-c7994796aadb:10840=2025/2026"
+        ]
+      }
+    ],
+    "planned_scope_count": 6
+  },
+  "operations": [
+    {
+      "entity": "season_work_plan",
+      "status": "retryable",
+      "attempted": 6,
+      "succeeded": 0,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {
+        "planned_scopes": 6
+      },
+      "errors": [],
+      "retryable": [
+        "scope 10433=2022/2023 has no season bundle",
+        "scope 10433=2022/2023 incomplete; outstanding={'season_bundle': 1}",
+        "scope 9170=2023 has no season bundle",
+        "scope 9170=2023 incomplete; outstanding={'season_bundle': 1}",
+        "scope 9669=2023/2024 has no season bundle",
+        "scope 9669=2023/2024 incomplete; outstanding={'season_bundle': 1}",
+        "scope 300=2025 has no season bundle",
+        "scope 300=2025 incomplete; outstanding={'season_bundle': 1}",
+        "scope 10840=2025/2026 has no season bundle",
+        "scope 10840=2025/2026 incomplete; outstanding={'season_bundle': 1}",
+        "scope 10056=2026/2027 has no season bundle",
+        "scope 10056=2026/2027 incomplete; outstanding={'season_bundle': 1}"
+      ],
+      "terminal": [],
+      "metadata": {
+        "scope_plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+        "journal_plan_signature": "fmplan1-421aeba26386dca3d6d4be5746cf5443a7ae9f854c43b7be3e3702c04f8ae72e",
+        "scope_entities": [
+          "season"
+        ],
+        "already_complete_scopes": 0,
+        "history_complete_scopes": 0,
+        "obligation_scopes": 6,
+        "pending_candidate_scopes": 6,
+        "cooling_source_gap_scopes": [],
+        "attempt_states": 0,
+        "daily_completion_timestamps": 0,
+        "debt_scopes": 6,
+        "incomplete_scopes": [
+          {
+            "scope": "10433=2022/2023",
+            "outstanding": {
+              "season_bundle": 1
+            }
+          },
+          {
+            "scope": "9170=2023",
+            "outstanding": {
+              "season_bundle": 1
+            }
+          },
+          {
+            "scope": "9669=2023/2024",
+            "outstanding": {
+              "season_bundle": 1
+            }
+          },
+          {
+            "scope": "300=2025",
+            "outstanding": {
+              "season_bundle": 1
+            }
+          },
+          {
+            "scope": "10840=2025/2026",
+            "outstanding": {
+              "season_bundle": 1
+            }
+          },
+          {
+            "scope": "10056=2026/2027",
+            "outstanding": {
+              "season_bundle": 1
+            }
+          }
+        ],
+        "source_gap_candidate_scopes": []
+      }
+    },
+    {
+      "entity": "scope_attempts",
+      "status": "success",
+      "attempted": 6,
+      "succeeded": 6,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {},
+      "errors": [],
+      "retryable": [],
+      "terminal": [],
+      "metadata": {
+        "outcomes": [
+          {
+            "competition_id": 300,
+            "source_season_key": "2025",
+            "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+            "attempt_count": 1,
+            "last_attempt_at": "2026-10-14T14:33:03.437991+00:00",
+            "next_retry_at": "2026-10-14T14:48:03.436755+00:00",
+            "outcome": "retryable",
+            "reason": "source_calendar_unavailable",
+            "attempt_identities": [
+              "883a6b75-cbfd-565e-ae26-c7994796aadb:300=2025"
+            ]
+          },
+          {
+            "competition_id": 9170,
+            "source_season_key": "2023",
+            "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+            "attempt_count": 1,
+            "last_attempt_at": "2026-10-14T14:33:03.435187+00:00",
+            "next_retry_at": "2026-10-14T14:48:03.433936+00:00",
+            "outcome": "retryable",
+            "reason": "source_calendar_unavailable",
+            "attempt_identities": [
+              "883a6b75-cbfd-565e-ae26-c7994796aadb:9170=2023"
+            ]
+          },
+          {
+            "competition_id": 9669,
+            "source_season_key": "2023/2024",
+            "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+            "attempt_count": 1,
+            "last_attempt_at": "2026-10-14T14:33:03.436656+00:00",
+            "next_retry_at": "2026-10-14T14:48:03.435297+00:00",
+            "outcome": "retryable",
+            "reason": "source_calendar_unavailable",
+            "attempt_identities": [
+              "883a6b75-cbfd-565e-ae26-c7994796aadb:9669=2023/2024"
+            ]
+          },
+          {
+            "competition_id": 10056,
+            "source_season_key": "2026/2027",
+            "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+            "attempt_count": 1,
+            "last_attempt_at": "2026-10-14T14:33:03.440667+00:00",
+            "next_retry_at": "2026-10-14T14:48:03.439439+00:00",
+            "outcome": "retryable",
+            "reason": "source_calendar_unavailable",
+            "attempt_identities": [
+              "883a6b75-cbfd-565e-ae26-c7994796aadb:10056=2026/2027"
+            ]
+          },
+          {
+            "competition_id": 10433,
+            "source_season_key": "2022/2023",
+            "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+            "attempt_count": 1,
+            "last_attempt_at": "2026-10-14T14:33:03.433800+00:00",
+            "next_retry_at": "2026-10-14T14:48:03.432208+00:00",
+            "outcome": "retryable",
+            "reason": "source_calendar_unavailable",
+            "attempt_identities": [
+              "883a6b75-cbfd-565e-ae26-c7994796aadb:10433=2022/2023"
+            ]
+          },
+          {
+            "competition_id": 10840,
+            "source_season_key": "2025/2026",
+            "plan_signature": "fmplan1-da2caad5ffc90bfa2bec47f629b143c845ca834ea552e4463ce53923dda3f7b2",
+            "attempt_count": 1,
+            "last_attempt_at": "2026-10-14T14:33:03.439319+00:00",
+            "next_retry_at": "2026-10-14T14:48:03.438090+00:00",
+            "outcome": "retryable",
+            "reason": "source_calendar_unavailable",
+            "attempt_identities": [
+              "883a6b75-cbfd-565e-ae26-c7994796aadb:10840=2025/2026"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "entity": "season_bundle",
+      "status": "retryable",
+      "attempted": 1,
+      "succeeded": 0,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {},
+      "errors": [],
+      "retryable": [
+        "source_calendar_unavailable: 10433=2022/2023; source publishes season metadata only"
+      ],
+      "terminal": [],
+      "metadata": {
+        "competition_id": 10433,
+        "source_season_key": "2022/2023",
+        "persisted": true,
+        "calendar_available": false,
+        "calendar_unavailability": {
+          "reason": "source_calendar_unavailable",
+          "url": "https://www.fotmob.com/api/data/leagues?id=10433&season=2022%2F2023",
+          "target_key": "1bbb8526085ff036e6b52cf62d0a73614c10561e9f7d180143d7c64fce1cfdd3",
+          "content_hash": "49bcf803da72b513449f585acbe0cc648ba89ecc7511f8878373badea4349d24",
+          "raw_uri": "memory://1bbb8526085ff036e6b52cf62d0a73614c10561e9f7d180143d7c64fce1cfdd3.json.gz",
+          "fetched_at": "2026-07-11T10:00:00+00:00",
+          "http_status": 200,
+          "cache_hit": false,
+          "stale": false
+        }
+      }
+    },
+    {
+      "entity": "season_bundle",
+      "status": "retryable",
+      "attempted": 1,
+      "succeeded": 0,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {},
+      "errors": [],
+      "retryable": [
+        "source_calendar_unavailable: 9170=2023; source publishes season metadata only"
+      ],
+      "terminal": [],
+      "metadata": {
+        "competition_id": 9170,
+        "source_season_key": "2023",
+        "persisted": true,
+        "calendar_available": false,
+        "calendar_unavailability": {
+          "reason": "source_calendar_unavailable",
+          "url": "https://www.fotmob.com/api/data/leagues?id=9170&season=2023",
+          "target_key": "d6129d8f3a4d71965450595b3457c7ea737fa12d5f00e260aa4b0a03cac4c94c",
+          "content_hash": "11805e97c81bbfc16b9e3b81c3ca3294e79d263ced6c0491be04563a205407bd",
+          "raw_uri": "memory://d6129d8f3a4d71965450595b3457c7ea737fa12d5f00e260aa4b0a03cac4c94c.json.gz",
+          "fetched_at": "2026-07-11T10:00:00+00:00",
+          "http_status": 200,
+          "cache_hit": false,
+          "stale": false
+        }
+      }
+    },
+    {
+      "entity": "season_bundle",
+      "status": "retryable",
+      "attempted": 1,
+      "succeeded": 0,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {},
+      "errors": [],
+      "retryable": [
+        "source_calendar_unavailable: 9669=2023/2024; source publishes season metadata only"
+      ],
+      "terminal": [],
+      "metadata": {
+        "competition_id": 9669,
+        "source_season_key": "2023/2024",
+        "persisted": true,
+        "calendar_available": false,
+        "calendar_unavailability": {
+          "reason": "source_calendar_unavailable",
+          "url": "https://www.fotmob.com/api/data/leagues?id=9669&season=2023%2F2024",
+          "target_key": "cd4706a16da17e60619d42f13ee26aab9a8ba65c25aaf65aca0790794f1904d4",
+          "content_hash": "6aa8e997678a23cd973b110e2919c1bc1f82c1b6bb61bc8460e72cc09c846e3b",
+          "raw_uri": "memory://cd4706a16da17e60619d42f13ee26aab9a8ba65c25aaf65aca0790794f1904d4.json.gz",
+          "fetched_at": "2026-07-11T10:00:00+00:00",
+          "http_status": 200,
+          "cache_hit": false,
+          "stale": false
+        }
+      }
+    },
+    {
+      "entity": "season_bundle",
+      "status": "retryable",
+      "attempted": 1,
+      "succeeded": 0,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {},
+      "errors": [],
+      "retryable": [
+        "source_calendar_unavailable: 300=2025; source publishes season metadata only"
+      ],
+      "terminal": [],
+      "metadata": {
+        "competition_id": 300,
+        "source_season_key": "2025",
+        "persisted": true,
+        "calendar_available": false,
+        "calendar_unavailability": {
+          "reason": "source_calendar_unavailable",
+          "url": "https://www.fotmob.com/api/data/leagues?id=300&season=2025",
+          "target_key": "6b448c9e2cde802c086f61f5764ae5b87aec42cd115527fb88010c97f625daa2",
+          "content_hash": "91eb6815c1bcc58ee98ab3c907ed9dd06112d7176f9371b778fec159479077f9",
+          "raw_uri": "memory://6b448c9e2cde802c086f61f5764ae5b87aec42cd115527fb88010c97f625daa2.json.gz",
+          "fetched_at": "2026-07-11T10:00:00+00:00",
+          "http_status": 200,
+          "cache_hit": false,
+          "stale": false
+        }
+      }
+    },
+    {
+      "entity": "season_bundle",
+      "status": "retryable",
+      "attempted": 1,
+      "succeeded": 0,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {},
+      "errors": [],
+      "retryable": [
+        "source_calendar_unavailable: 10840=2025/2026; source publishes season metadata only"
+      ],
+      "terminal": [],
+      "metadata": {
+        "competition_id": 10840,
+        "source_season_key": "2025/2026",
+        "persisted": true,
+        "calendar_available": false,
+        "calendar_unavailability": {
+          "reason": "source_calendar_unavailable",
+          "url": "https://www.fotmob.com/api/data/leagues?id=10840&season=2025%2F2026",
+          "target_key": "111bbc45e4d7807e830d916edba2553cd76e57923d74f3958e28e5ee651d9391",
+          "content_hash": "12f0c5360e9ae63e3f06a1f7e9d81ae9828ac0926cc398ddce17055227d1cc44",
+          "raw_uri": "memory://111bbc45e4d7807e830d916edba2553cd76e57923d74f3958e28e5ee651d9391.json.gz",
+          "fetched_at": "2026-07-11T10:00:00+00:00",
+          "http_status": 200,
+          "cache_hit": false,
+          "stale": false
+        }
+      }
+    },
+    {
+      "entity": "season_bundle",
+      "status": "retryable",
+      "attempted": 1,
+      "succeeded": 0,
+      "skipped": 0,
+      "not_available": 0,
+      "review_required": 0,
+      "tables": [],
+      "counts": {},
+      "errors": [],
+      "retryable": [
+        "source_calendar_unavailable: 10056=2026/2027; source publishes season metadata only"
+      ],
+      "terminal": [],
+      "metadata": {
+        "competition_id": 10056,
+        "source_season_key": "2026/2027",
+        "persisted": true,
+        "calendar_available": false,
+        "calendar_unavailability": {
+          "reason": "source_calendar_unavailable",
+          "url": "https://www.fotmob.com/api/data/leagues?id=10056&season=2026%2F2027",
+          "target_key": "b4aaf4a2680bf328f59cb0ca58b5db5893cf1e9f2d1edacb6480a9468accf523",
+          "content_hash": "f0eddd2b241bab7d0baea4e610ab9c3cc0856582dbd1fdeb32ecea55541d44db",
+          "raw_uri": "memory://b4aaf4a2680bf328f59cb0ca58b5db5893cf1e9f2d1edacb6480a9468accf523.json.gz",
+          "fetched_at": "2026-07-11T10:00:00+00:00",
+          "http_status": 200,
+          "cache_hit": false,
+          "stale": false
+        }
+      }
+    }
+  ]
+}
