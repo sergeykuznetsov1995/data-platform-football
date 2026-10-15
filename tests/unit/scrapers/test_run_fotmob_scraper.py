@@ -1316,7 +1316,7 @@ class TestFotmobNativeRunner:
             "obligation=5066 already_complete=589 pending=4477 success=0 "
             "source_gap=0 retryable=0 terminal=0 deferred=0 rows_total=6075 "
             "requests=450 not_modified=367 encoded_bytes=3438525 "
-            "gap_candidate=n/a lane_idle_h=n/a budget_requests_left=19550"
+            "gap_candidate=n/a calendar_unavailable=n/a lane_idle_h=n/a budget_requests_left=19550"
         )
 
     @pytest.mark.unit
@@ -1347,6 +1347,7 @@ class TestFotmobNativeRunner:
             "not_modified",
             "encoded_bytes",
             "gap_candidate",
+            "calendar_unavailable",
             "lane_idle_h",
             "budget_requests_left",
         ]
@@ -1357,6 +1358,7 @@ class TestFotmobNativeRunner:
         assert "retryable=n/a" in line
         assert "rows_total=n/a" in line
         assert "budget_requests_left=n/a" in line
+        assert "calendar_unavailable=n/a" in line
         assert "rc=n/a" in line
 
     @pytest.mark.unit

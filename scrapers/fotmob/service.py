@@ -1980,6 +1980,17 @@ class FotMobIngestService:
                 reason = f"source_calendar_unavailable: {competition_id}={source_season_key}; source publishes season metadata only"
                 result.retryable.append(reason)
                 result.metadata["calendar_available"] = False
+                result.metadata["calendar_unavailability"] = {
+                    "reason": "source_calendar_unavailable",
+                    "url": fetch.url,
+                    "target_key": fetch.target_key,
+                    "content_hash": fetch.content_hash,
+                    "raw_uri": fetch.raw_uri,
+                    "fetched_at": fetch.fetched_at,
+                    "http_status": fetch.http_status,
+                    "cache_hit": fetch.cache_hit,
+                    "stale": fetch.stale,
+                }
                 if persist:
                     self._commit_for_fetch(
                         fetch,

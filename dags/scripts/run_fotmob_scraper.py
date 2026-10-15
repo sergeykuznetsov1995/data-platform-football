@@ -921,6 +921,7 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
         ("not_modified", transport.get("not_modified")),
         ("encoded_bytes", transport.get("encoded_bytes")),
         ("gap_candidate", _count(metadata.get("source_gap_candidate_scopes"))),
+        ("calendar_unavailable", _count(selection.get("calendar_unavailable_scopes"))),
         ("lane_idle_h", metadata.get("lane_idle_hours")),
         ("budget_requests_left", requests_left),
     )
@@ -2300,6 +2301,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     # наблюдения ещё нет. До #1255 такой скоуп шёл в work_plan.retryable и красил
     # первую попытку, хотя источник честно ответил «матчей нет».
     source_gap_candidates: list[str] = []
+    calendar_unavailable_scopes: list[str] = []
     replay_gap_entries: list[dict[str, Any]] = []
 
     # Complete one exact scope end-to-end before starting the next.  This is
@@ -2352,6 +2354,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
         operations.append(operation)
         scope_operations.append(operation)
+        calendar_unavailable = (
+            bundle is None
+            and operation.metadata.get("calendar_unavailability", {}).get("reason")
+            == "source_calendar_unavailable"
+        )
+        if calendar_unavailable:
+            calendar_unavailable_scopes.append(scope_key)
         if bundle is None:
             work_plan.retryable.append(f"scope {scope_key} has no season bundle")
         else:
@@ -2628,7 +2637,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                         else (
                             _SOURCE_GAP_RETRY_REASON
                             if source_missing_matches and not outstanding
-                            else work_plan_retryable
+                            else (
+                                "source_calendar_unavailable"
+                                if calendar_unavailable else work_plan_retryable
+                            )
                         )
                     ),
                     next_retry_at=None if hard_failure else next_due,
@@ -3038,6 +3050,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         "scope_plan_signature": scope_plan_signature,
         "planned_scopes": planned_scopes,
         "completed_scopes": completed_scopes,
+        "calendar_unavailable_scopes": sorted(calendar_unavailable_scopes),
         "completed_transfer_competition_ids": (completed_transfer_competition_ids),
         "requests_per_minute": args.requests_per_minute,
     }
