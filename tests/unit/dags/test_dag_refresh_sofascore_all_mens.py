@@ -12,6 +12,8 @@ import pytest
 
 MODULE = "dags.dag_refresh_sofascore_all_mens"
 REFRESH_KNOBS = (
+    "SOFASCORE_REFRESH_EVIDENCE_DIR",
+    "SOFASCORE_EVIDENCE_CODE_REVISION",
     "SOFASCORE_REFRESH_BATCH_SIZE",
     "SOFASCORE_REFRESH_POOL",
     "SOFASCORE_REFRESH_MAX_ACTIVE_TASKS",
@@ -28,6 +30,57 @@ REFRESH_KNOBS = (
     "SOFASCORE_METADATA_SEASONS_PER_RUN",
     "SOFASCORE_REFRESH_SECONDS_PER_MATCH",
 )
+
+
+def test_optional_evidence_captures_same_full_pending_read(clean_env, monkeypatch, tmp_path):
+    from scrapers.sofascore.denominator import Denominator, DenominatorRow
+
+    module = _load_dag_module(monkeypatch)
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text("{}")
+    monkeypatch.setattr(module, "WORKLOAD_ARTIFACT", str(artifact))
+    monkeypatch.setenv("SOFASCORE_REFRESH_EVIDENCE_DIR", str(tmp_path / "evidence"))
+    monkeypatch.setenv("SOFASCORE_EVIDENCE_CODE_REVISION", "a" * 40)
+    import scrapers.sofascore.denominator as denominator
+    registry = Denominator({n: DenominatorRow(n, f"SS-{n}", str(n), "core", 1, "fixture")
+                            for n in range(1, 22)})
+    monkeypatch.setattr(denominator, "load_denominator", lambda: registry)
+    monkeypatch.setattr(denominator, "denominator_path", lambda: artifact)
+    monkeypatch.setattr(module, "_configured_tournament_ids", lambda: frozenset())
+    rows = [(f"SS-{n}", "2627", 2, 1792024800, 1, n + 100) for n in range(1, 22)]
+    selected = [{"SOFASCORE_TOURNAMENT_ID": str(n), "SOFASCORE_SOURCE_SEASON_ID": str(n + 100),
+                 "SOFASCORE_SCOPE_KEY": f"c:{n}:{n + 100}", "SOFASCORE_SCOPE_TIMEOUT_S": "300"}
+                for n in range(1, 9)]
+    context = dict(run_id="scheduled__fixture", dag_run=SimpleNamespace(
+        logical_date=datetime(2026, 10, 15, tzinfo=timezone.utc),
+        start_date=datetime(2026, 10, 15, tzinfo=timezone.utc),
+        run_type=DagRunType.SCHEDULED))
+    snapshot = {"snapshot_id": "d" * 64, "campaign_id": "e" * 64}
+    calls = []
+    monkeypatch.setattr(module, "_pending_refresh_partitions", lambda: calls.append("existing_read") or rows)
+    monkeypatch.setattr(module.state, "read_snapshot", lambda *a, **k: snapshot)
+    monkeypatch.setattr(module.state, "plan_refresh_batch", lambda snapshot, pending, **kwargs:
+                        selected if pending is rows else pytest.fail("planner input changed"))
+    assert len(module._plan_refresh_batch(**context)) == 8
+    assert calls == ["existing_read"]
+    [path] = (tmp_path / "evidence").glob("*/*.json")
+    saved = json.loads(path.read_text())
+    assert saved["due_core_scopes"] == 21 and len(saved["selected"]) == 8
+    assert saved["due_core_matches"] == 42 and saved["overdue_core_matches"] == 21
+    assert saved["identity"]["code_revision"] == "a" * 40
+    window = saved["capture_window"]
+    assert datetime.fromisoformat(window["started_at"]) > context["dag_run"].start_date
+    assert datetime.fromisoformat(window["deadline_at"]).timestamp() == int(
+        selected[0]["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
+    assert 14399 <= (datetime.fromisoformat(window["deadline_at"])
+                     - datetime.fromisoformat(window["started_at"])).total_seconds() <= 14400
+
+
+def test_disabled_evidence_has_no_input_or_filesystem_effect(clean_env, monkeypatch):
+    module = _load_dag_module(monkeypatch)
+    # Invalid inputs are deliberately untouched when the optional installation
+    # has not happened; no additional read, query, directory or task is created.
+    module._capture_refresh_evidence(None, None, None, None, None, None)
 
 
 class DagRunType(str, Enum):

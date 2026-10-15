@@ -737,7 +737,12 @@ def test_cycle_reports_a_partial_scope_as_a_finished_task(tmp_path, monkeypatch)
 
 
 @pytest.mark.unit
-def test_cycle_result_carries_elapsed_time_of_a_green_scope(tmp_path, monkeypatch):
+@pytest.mark.parametrize("archive_enabled", [False, True])
+def test_cycle_result_carries_elapsed_time_of_a_green_scope(tmp_path, monkeypatch, archive_enabled):
+    if archive_enabled:
+        monkeypatch.setenv("SOFASCORE_REFRESH_EVIDENCE_DIR", str(tmp_path / "evidence"))
+    else:
+        monkeypatch.delenv("SOFASCORE_REFRESH_EVIDENCE_DIR", raising=False)
     paths = cycle.ScopeOverlayPaths(
         tmp_path / "tournaments.json",
         tmp_path / "medallion" / "competitions.yaml",
@@ -764,6 +769,13 @@ def test_cycle_result_carries_elapsed_time_of_a_green_scope(tmp_path, monkeypatc
     assert result["status"] == "success"
     assert "elapsed_s" in result
     assert "stop_reason" not in result
+    from datetime import datetime
+    assert datetime.fromisoformat(result["started_at"]) <= datetime.fromisoformat(result["finished_at"])
+    if archive_enabled:
+        [archive] = (tmp_path / "evidence/scope-attempts").glob("*.json")
+        assert json.loads(archive.read_text()) == result
+    else:
+        assert not (tmp_path / "evidence").exists()
 
 
 @pytest.mark.unit
