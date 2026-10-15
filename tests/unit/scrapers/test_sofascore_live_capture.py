@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
+from pathlib import Path
 import os
 from types import SimpleNamespace
 
@@ -26,10 +28,23 @@ from scrapers.sofascore.lease_client import (
     SofascoreLeaseRejected,
 )
 from scrapers.sofascore.manifest import InMemoryManifestStore, ManifestKey
-from scrapers.sofascore.pipeline import CaptureRuntime, DeferredCaptureSink
+from scrapers.sofascore.pipeline import (
+    CaptureRuntime,
+    DeferredCaptureSink,
+    _with_allocation_headroom,
+)
 from scrapers.sofascore.raw_store import RawPayloadStore
-from scripts.proxy_filter.budget import BudgetAccountingError, ProxyBudgetExceeded
-from scrapers.sofascore.workload_plan import WorkloadAllocation, _signed_plan
+from scripts.proxy_filter.budget import (
+    BudgetAccountingError,
+    ProxyBudgetExceeded,
+    SharedBudgetLedger,
+    load_verified_policy,
+)
+from scrapers.sofascore.workload_plan import (
+    WorkloadAllocation,
+    _signed_plan,
+    match_workload_class,
+)
 
 
 pytestmark = pytest.mark.unit
@@ -2362,3 +2377,81 @@ def test_signed_batch_without_tolerance_still_aborts_on_schema_error(tmp_path):
 
     with pytest.raises(RuntimeError, match="did not reach a publishable state"):
         _capture_player_batch(runtime, plan, allocation)
+
+
+@pytest.mark.parametrize("endpoint", ["lineups", "incidents", "statistics", "shotmap"])
+@pytest.mark.parametrize(
+    ("tournament_id", "season_id", "target_id", "provider_bytes"),
+    [
+        (11534, 98011, 16477208, 61_923),
+        (11534, 98011, 16477208, 61_916),
+        (16676, 98454, 16574877, 61_060),
+        (16676, 98454, 16574877, 61_090),
+        (36, 96658, 16362028, 70_209),
+        (36, 96658, 16362028, 70_143),
+    ],
+)
+def test_sparse_resume_first_endpoint_accounts_browser_bootstrap(
+    tmp_path, endpoint, tournament_id, season_id, target_id, provider_bytes,
+):
+    """Replay paid totals of the six failed attempts on 2026-10-14.
+
+    Retained event raw leaves a different first endpoint owning cold browser
+    bytes. The real v4 loader, headroom and signed-allocation ledger must agree.
+    """
+    policy = _with_allocation_headroom(load_verified_policy(
+        Path(__file__).resolve().parents[3] / "configs/sofascore/workload_policy.json",
+        workload_class=match_workload_class(),
+    ))
+    runtime, _ = _runtime(tmp_path, hard_run_bytes=policy.hard_run_bytes)
+    runtime.engine.budget = SharedBudgetLedger(tmp_path / "budget.json", policy)
+    allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "9" * 32,
+        task_id="capture_match_batch_00000", scope="match",
+        workload_class=policy.workload_class, batch_index=0, units=("1",),
+        budget_bytes=policy.hard_run_bytes,
+    )
+    plan = _signed_plan(
+        artifact_id=policy.parent_artifact_id, dag_id="dag_ingest_sofascore",
+        run_id=runtime.engine.run_id, player_universe_ids=(),
+        allocations=(allocation,), control_token="c" * 32,
+    )
+    client = _LeaseClient([0, 0, provider_bytes], final_total=provider_bytes)
+    original_stats = client._stats
+    client._stats = lambda total, **values: original_stats(
+        total, artifact_id=policy.parent_artifact_id, **values
+    )
+    factory = _TransportFactory(client, _Capture([_record(b'{"items":[{"id":1}]}')]))
+
+    def scoped_spec(name):
+        return replace(
+            _spec(target_id, name),
+            key=ManifestKey(
+                str(tournament_id), str(season_id), "event", str(target_id), name, "final",
+            ),
+        )
+
+    replay_spec = scoped_spec("event")
+    runtime.raw_store.store_bytes(
+        replay_spec.raw_target, b'{"items":[{"id":1}]}',
+        request_url=replay_spec.url, http_status=200,
+        response_headers={"content-type": "application/json"},
+    )
+    results, traffic = capture_live_specs(
+        runtime, [replay_spec, scoped_spec(endpoint)],
+        canonical_url=f"https://www.sofascore.com/event/{target_id}",
+        scope=f"SS-{tournament_id}:{season_id}", entity="match_capture",
+        transport_factory=factory,
+        workload_plan=plan, allocation_id=allocation.allocation_id, attempt_id="1",
+    )
+
+    assert len(results) == 2
+    assert results[0].replay_hit is True
+    assert results[0].network_used is False
+    assert results[1].manifest.provider_bytes == provider_bytes
+    assert runtime.engine.metrics.snapshot()["replay_hits"] == 1
+    assert traffic["provider_total_bytes"] == provider_bytes
+    snapshot = runtime.engine.budget.snapshot(f"{plan.run_id}::{allocation.allocation_id}")
+    assert snapshot["spent_provider_bytes"] == provider_bytes
+    assert snapshot["hard_run_bytes"] == policy.hard_run_bytes == 1_317_644
+    assert snapshot["reservations"] == {}
