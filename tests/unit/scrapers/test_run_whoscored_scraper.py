@@ -682,6 +682,68 @@ def test_report_accumulates_match_backlog_across_scopes():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("outcome", ["checked", "deferred", "failed"])
+def test_report_preserves_scope_xg_evidence_through_serialization(tmp_path, outcome):
+    scopes = (
+        runner.RunnerScope.parse("ENG-Premier League=2526"),
+        runner.RunnerScope.parse("ESP-La Liga=2526"),
+    )
+    report = runner._new_report("weekly", scopes)
+    expected = []
+    for index, scope in enumerate(scopes):
+        stage = 23752 + index
+        evidence = {
+            "source_stage_ids": [stage, stage + 100],
+            "source_stage_count": 2,
+            "feed_policy": "xg-policy",
+            "stage_xg_checked": [stage] if outcome == "checked" else [],
+            "stage_xg_retained": [stage + 100],
+            "stage_xg_deferred": [stage] if outcome == "deferred" else [],
+        }
+        expected.append(json.loads(json.dumps(evidence)))
+        result = _result(
+            "stages",
+            scope=scope.spec,
+            counts={"team_stage_stats": 0},
+            metadata={**evidence, "private_context": "must not be exported"},
+            errors=["stage fetch failed"] if outcome == "failed" else [],
+        )
+        runner._merge_result(report, result, scope_record=report["scopes"][index])
+        # Reports own their evidence even if the service reuses its result lists.
+        evidence["source_stage_ids"].append(99999)
+        evidence["stage_xg_retained"].clear()
+        # An unrelated operation must neither replace nor clear xG evidence.
+        runner._merge_result(
+            report, _result("matches"), scope_record=report["scopes"][index]
+        )
+
+    output = tmp_path / "weekly.json"
+    runner._write_report(str(output), report)
+    persisted = json.loads(output.read_text())
+    assert [scope["stage_xg"] for scope in persisted["scopes"]] == expected
+    assert persisted["rows"] == 0
+    assert persisted["match_candidates"] is None
+    assert persisted["producer_commits"] == report["producer_commits"]
+    assert [scope["status"] for scope in persisted["scopes"]] == [
+        scope["status"] for scope in report["scopes"]
+    ]
+
+
+@pytest.mark.unit
+def test_report_does_not_invent_xg_evidence_for_legacy_or_non_stage_results():
+    scope = runner.RunnerScope.parse("ENG-Premier League=2526")
+    report = runner._new_report("daily", (scope,))
+    record = report["scopes"][0]
+    runner._merge_result(report, _result("stages"), scope_record=record)
+    runner._merge_result(
+        report,
+        _result("schedule", metadata={"source_stage_ids": [23752]}),
+        scope_record=record,
+    )
+    assert "stage_xg" not in record
+
+
+@pytest.mark.unit
 def test_report_publishes_content_bound_attempt_sidecar_in_new_directory(tmp_path):
     output = tmp_path / "nested" / "result.json"
     report = {
