@@ -1,0 +1,17 @@
+{
+  "source": "FotMob retained HTTP body, fetched by preexisting natural run; no new source request",
+  "canonical_url": "https://www.fotmob.com/api/data/transfers?last=1year&leagueIds=130&page=6",
+  "target_key": "09635b16cd1dcb355ba7c749069688cb4c445af7be1aca82e3c9496fdf7895b1",
+  "content_hash": "75d9862d00474c0bd5f3b38dba4323b18602adbfdec0f68c9efb44a8443aeb47",
+  "raw_uri": "s3://football/raw/fotmob/blobs/sha256/75/75d9862d00474c0bd5f3b38dba4323b18602adbfdec0f68c9efb44a8443aeb47.json.gz",
+  "fetched_at": "2026-10-16T00:17:14.062955+00:00",
+  "validated_at": "2026-10-16T00:17:14.062955+00:00",
+  "decoded_bytes": 36850,
+  "sha256": "75d9862d00474c0bd5f3b38dba4323b18602adbfdec0f68c9efb44a8443aeb47",
+  "legacy_batch_id": "fm1-b336db1f1015b0d63290af31d3d7ad7f4beffa7b30bd284a395a23df3e84d062",
+  "rows": 50,
+  "natural_run_id": "8eeb3661-36ac-57c7-a4a5-f463d8a9c962",
+  "original_error": "49 stored rows; expected either 0 or 50 with matching row identity",
+  "runtime_log_sha256": "2a5c274511c3faca1da6eb3727f529aa61fa6fd1251bd4072d470a35189eabf5",
+  "test_boundary": "Only page6 is the unmodified real raw body. Counterfactual preceding pages in the regression are synthetic; the previous production page state and identities of the49physicalrows were not reread."
+}
