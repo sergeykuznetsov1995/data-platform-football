@@ -147,6 +147,10 @@ TRANSFER_SOURCE_HITS_TOLERANCE = 2
 # события красил ран целиком. Поэтому допуск ещё и долевой.
 TRANSFER_SOURCE_HITS_TOLERANCE_RATIO = 0.01
 
+# Older batches dropped overlaps with earlier pages: their physical rows were
+# not a function of this page's raw bytes. Keep those published batches intact.
+TRANSFER_PAGE_ROW_POLICY = "transfer-page-snapshot-v1"
+
 _BLOCKING_PARSE_ISSUES = frozenset(
     {
         "invalid_match",
@@ -2384,6 +2388,12 @@ class FotMobIngestService:
             if not resume_allowed:
                 return None
             previous = self.repository.latest_success(target_key)
+            if previous is not None:
+                capabilities = previous.get("capabilities_json") or {}
+                if isinstance(capabilities, str):
+                    capabilities = json.loads(capabilities)
+                if capabilities.get("page_row_policy") != TRANSFER_PAGE_ROW_POLICY:
+                    return None
             if previous is None or resume_since is None:
                 return previous
             # completed_at dates the manifest, not validation by the source.
@@ -2516,11 +2526,11 @@ class FotMobIngestService:
                     raw_hits = payload.get("hits")
                     expected_hits = int(raw_hits) if raw_hits is not None else None
                 rows = list(parse_transfers(payload))
-                new_rows = [
-                    row for row in rows if row["transfer_event_id"] not in unique_ids
-                ]
-                unique_ids.update(row["transfer_event_id"] for row in new_rows)
-                for row in new_rows:
+                # Persist a full page snapshot. Deduplication across pages is
+                # only for stream coverage; otherwise an unchanged raw/parser
+                # batch can contain 49 or 50 rows as the preceding page shifts.
+                unique_ids.update(row["transfer_event_id"] for row in rows)
+                for row in rows:
                     row["competition_id"] = str(competition_id)
                     row["event_year"] = _event_year(
                         row.get("transfer_date"), fallback_year
@@ -2540,10 +2550,11 @@ class FotMobIngestService:
                         target_type="transfers_page",
                         competition_id=competition_id,
                         entity_id=f"{stream_window}:{page}",
+                        observation_id=TRANSFER_PAGE_ROW_POLICY,
                         datasets=[
                             TableRows(
                                 "fotmob_transfer_events",
-                                new_rows,
+                                rows,
                                 "transfer_events",
                             ),
                             TableRows(
@@ -2553,8 +2564,9 @@ class FotMobIngestService:
                                 partition_cols=("target_type",),
                             ),
                         ],
-                        expected_counts={"transfer_events": len(new_rows)},
+                        expected_counts={"transfer_events": len(rows)},
                         capabilities={
+                            "page_row_policy": TRANSFER_PAGE_ROW_POLICY,
                             "stream_key": stream_key,
                             "stream_window": stream_window,
                             "source_hits": expected_hits,
