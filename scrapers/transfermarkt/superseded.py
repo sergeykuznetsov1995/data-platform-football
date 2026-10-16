@@ -86,7 +86,7 @@ def attest_career_manifest(scraper, receipt):
         execute_statement(cursor, 'SELECT ' + ', '.join(fields) + f' FROM {table} '
             'WHERE cycle_id=? AND entity=? AND league=? AND season=?',
             (receipt['manifest_cycle_id'], row['entity'], manifest['league'], manifest['season']))
-        actual = cursor.fetchall()
+        actual = [tuple(row) for row in cursor.fetchall()]
         if actual != [tuple(row[field] for field in fields)] or row['status'] != 'success':
             raise RuntimeError('career archive has no genuine original manifest readback')
         proof = {'cycle_id': receipt['manifest_cycle_id'], 'entity': row['entity'], 'write_mode': mode,
@@ -134,7 +134,7 @@ def verify_complete(scraper, spec, archived, *, players, live=True, allow_later_
         execute_statement(cursor, 'SELECT ' + ', '.join(fields) + f' FROM {manifest_table} '
             'WHERE cycle_id=? AND entity=? AND league=? AND season=?',
             (receipt['manifest_cycle_id'], native.key, receipt['manifests'][0]['league'], receipt['manifests'][0]['season']))
-        actual_manifest = cursor.fetchall()
+        actual_manifest = [tuple(row) for row in cursor.fetchall()]
         if actual_manifest != [tuple(row[field] for field in fields)]:
             later = None
             if allow_later_manifest and len(actual_manifest) == 1:
