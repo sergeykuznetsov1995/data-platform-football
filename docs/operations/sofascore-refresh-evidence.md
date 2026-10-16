@@ -74,18 +74,33 @@ DagRun started_at остаётся отдельным фактом и опред
 подменять эти границы началом DagRun или временем нового поручения.
 Один зелёный DagRun не заменяет эти проверки.
 
-`tail` имеет родной run_id, night (UTC), тот же code_revision, run_players=false,
-fotmob_import_errors=0 и ровно семь строк `leagues` для **полного**
-`expected_tail_leagues`: league, status, capture_complete. Эти статусы требуют
-исходных отчётов/публикации, не только состояния trigger DAG. Пропуск лиги,
-неизвестный импорт или провал сохраняются. Только три последовательные
-фактические UTC-ночи из полного expected roster могут дать 3/3.
+`tail.evidence` содержит исходные сохранённые scheduler/runner receipts.
+`assess_run` повторно вызывает offline `assess_tail`, а не доверяет готовому PASS,
+семи `capture_complete=true` или успеху trigger DAG. Проверяются точные семь
+турниров из действующего `denominator.tsv`, родитель/child run, версия, физическая
+UTC-ночь, успешные season/match TI и пропуск всех per-player capture TI.
+Пропуски, failed/partial, чужой run/release/native season и дубликаты сохраняются.
+Только три последовательные фактические UTC-ночи из полного expected roster
+могут дать 3/3.
 
-Необязательный `third_day` содержит реальную delivered_at, measured_at на
-границе delivery+72h, checked_at не раньше факта, code_revision и отдельные
-`lanes.SS`/`lanes.daily` с closed/total. Нулевая полоса или неизвестная граница
-даёт UNKNOWN. Проверка 90% не превращается в три успешных дня; дата нового
-поручения или merge не заменяет первоначальную доставку.
+Необязательный `third_day` проверяет исходный календарный день **29.09.2026 UTC**.
+`original_delivery` содержит первоначальный release
+`70446986046371e2adecd034dba66a83afdecf99`, artifact
+`fe05605ff876b99a41d7bae740913f41b9432c57737a6cc24ee24912688aec11`
+и `delivered_at=2026-09-27T04:20:10Z`. Это фактический DONE исходной доставки.
+Поздний recorder release не меняет этот anchor. Поля `day`, реальный `measured_at`
+после конца отчётного дня и `checked_at` не раньше измерения сохраняются раздельно.
+Например, отчёт за29.09 был измерен30.09 в05:04:49+00:00; точный timestamp29.09
+не выдумывается. `lanes.SS` и `lanes.daily` принимают существующие `in24/total`
+или `closed/total`. Пустая/отсутствующая полоса даёт UNKNOWN и сохраняет известный
+отрицательный результат другой полосы. Реальные SS50/640 и daily0/0 остаются
+историческим UNKNOWN. Проверка90% не превращается в три успешных дня.
+
+`third_day_expected_revision` отдельно закрепляет выпуск сохранённого
+исторического измерения; `expected_revision` закрепляет текущую серию ночей.
+Это не разрешает менять календарный день или исходную доставку. Если в CLI
+передан `third_day`, его UNKNOWN/FAIL ограничивает общий итог; `night_status`
+сохраняет отдельный результат ночей.
 
 Выход сохраняет отдельные due_scope_completion/window_utilization/tail7,
 каждый ожидаемый run, наблюдённые fail/unknown и текущую последовательность N/3.
@@ -122,3 +137,59 @@ recorder без полного SHA план отклоняется: доказа
 readback producer и unit fixtures не создают t0 или успешные ночи.
 Откат — вернуть прежний source release/пустое включение только по разрешённой
 процедуре; сохранённые доказательства, failures и серии не удалять.
+
+
+## Offline сборка семи физических публикаций
+
+`scripts/sofascore_tail_evidence.py --input saved-tail-manifest.json --output tail.json`
+читает только перечисленные локальные JSON. Манифест содержит `expected_revision`,
+`expected_night` и пути `parent`, `child`, `task_instances`, `import_errors`,
+а также `reports` — список путей существующих runner JSON. Относительные пути
+разрешаются относительно манифеста. Выход сохраняет SHA256 исходных байтов,
+исходные `evidence` и все пробелы. Отсутствующие файлы не скачиваются.
+
+`parent`: `dag_id`, `run_id`, `child_run_id`, `code_revision`, `state`.
+`child`: `dag_id`, `run_id`, `code_revision`, `state`, `start_date`, `end_date`,
+`logical_date`, исходный `conf` с `competition_ids` и `run_players=false`.
+Сохранённый metadb `execution_date` переносится в `logical_date` без округления;
+физическая ночь определяется фактическим `start_date`, отдельно от logical date.
+Связь parent→child квалифицируется сохранённым trigger/XCom readback.
+`task_instances`: полный сохранённый список `dag_id`, `run_id`, `task_id`,
+`state`, `try_number`. `import_errors`: `isolate=fotmob`, `code_revision`,
+`checked_at` после окончания child и полный `errors` list из изолята.
+Самостоятельно выставленные import0/playersfalse не заменяют эти receipts.
+
+Нужны season и match отчёты для каждого из ровно семи турниров.
+Season принимает существующий default CLI `entity=all`, а также совместимые
+`schedule`/`league_table`; match принимает `match_capture`. Все проверки
+публикации и native identity сохраняются для каждого варианта.
+
+Текущий контракт допускает PASS только для первых физических попыток producer TI
+(`try_number=1`). Последняя успешная попытка2+ без отдельно квалифицированной
+полной истории остаётся UNKNOWN, даже при заявленном `physical_history_complete`.
+Этот пакет не вводит новый контракт восстановления retries. Переданные ранние
+failed/partial receipts сохраняются в `evidence.reports`; они не заменяются
+последним success и не исключаются из исходного пакета.
+`evidence_identity` сохраняет `dag_id`, `run_id`, `code_revision`, `logical_date`,
+`started_at`, `finished_at`, `league`, `source_tournament_id`, `source_season_id`,
+канонический `season` и целый `try_number`, совпадающий с TI.
+`publication_receipts` содержит `table`, `rows`, `location` для каждого
+**успешного возврата** существующего `save_to_iceberg`. `location` — реальный
+`iceberg.bronze.<table>`, а не новый storage snapshot. Verifier сверяет receipts
+с исходным `tables` и всеми известными счётчиками строк, включая нулевые:
+receipt с12 строками при исходном counter0 отклоняется. Положительные счётчики
+по-прежнему требуют receipts; отдельный rejected-row journal не подменяет
+публикацию матчей. Для season нужна публикация schedule;
+для match — publication capture_status и полный matches_total знаменатель.
+`manifest_committed=true` записывается только после существующего flush и
+проверки durable manifest. Дополнительных запросов или flush recorder не делает.
+
+Runner сохраняет отдельные immutable физические отчёты в
+`$SOFASCORE_REFRESH_EVIDENCE_DIR/daily-tail/<identity-sha256>/<payload-sha256>.json`
+до перезаписи обычного result при retry. Включение использует уже описанные
+каталог и полный pin. Невалидный pin при включении отклоняется. Идентичность
+берётся из существующего args/catalog/env; caller всё ещё квалифицирует pin
+по фактической доставке. Старый no-op без физического publication receipt,
+out-of-window и ошибка до получения native context не доказывают публикацию
+и остаются UNKNOWN. Уже сохранённые неудачные и частичные записи не удаляются.
+Пакет не создаёт collector, query, job, t0, новую серию или разрешение доставки.

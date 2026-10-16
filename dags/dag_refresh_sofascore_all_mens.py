@@ -476,6 +476,67 @@ def _refill_report_path(run_id: str) -> Path:
     return Path(RESULT_DIR) / f"refill-{safe_run}.json"
 
 
+def _failed_initial_report(context: dict[str, Any]) -> dict[str, Any]:
+    """Retain paid attempts on a failed path without another census or refill."""
+    import math
+    from dags.scripts.run_sofascore_scope_cycle import _atomic_json
+
+    run_id = str(context.get("run_id") or "manual")
+    ti = context.get("ti")
+    items = ti.xcom_pull(task_ids="plan_refresh_batch") if ti is not None else []
+    environments = [item["env"] for item in (items or [])]
+    expected = {env.get("SOFASCORE_SCOPE_RUN_ID"): env for env in environments}
+    attempts = {}
+    gaps = []
+    directory = os.environ.get("SOFASCORE_REFRESH_EVIDENCE_DIR", "").strip()
+    paths = sorted((Path(directory) / "scope-attempts").glob("*.json")) if directory else []
+    # Latest output is a fallback only. It may overwrite a physical retry;
+    # never describe it as a complete retry archive.
+    if not directory:
+        gaps.append("physical_attempt_archive_disabled")
+    latest_paths = {Path(env["SOFASCORE_SCOPE_RESULT_PATH"]) for env in environments
+                    if env.get("SOFASCORE_SCOPE_RESULT_PATH")}
+    paths.extend(sorted(latest_paths))
+    for path in paths:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            if path in latest_paths:
+                gaps.append(f"unreadable_scope_result:{path}")
+            continue
+        env = expected.get(value.get("run_id")) if isinstance(value, dict) else None
+        if env is None:
+            continue
+        identity = ":".join(str(value.get(key)) for key in
+                            ("campaign_id", "tournament_id", "source_season_id"))
+        if identity != env.get("SOFASCORE_SCOPE_KEY"):
+            gaps.append(f"scope_provenance_mismatch:{path}")
+            continue
+        elapsed = value.get("elapsed_s")
+        if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0:
+            gaps.append(f"invalid_elapsed:{path}")
+            continue
+        key = (value["run_id"], value.get("started_at"))
+        attempts[key] = {**value, "scope_key": identity}
+    seen = {value["run_id"] for value in attempts.values()}
+    gaps.extend(f"missing_scope_attempt:{run}" for run in expected if run not in seen)
+    if not environments:
+        gaps.append("initial_plan_unavailable")
+    report = {"run_id": run_id, "status": "partial", "stop_reason": "upstream_failure",
+              "outcomes": [], "initial_outcomes": list(attempts.values()),
+              "expected_scope_run_ids": list(expected), "evidence_gaps": sorted(set(gaps)),
+              "final_census_status": "unavailable_upstream_failure",
+              "window_budget_s": REFRESH_SCOPE_BUDGET.total_seconds()}
+    _atomic_json(_refill_report_path(run_id), report)
+    if directory:
+        import hashlib
+        from scrapers.sofascore.refresh_evidence import write_immutable
+        run_key = hashlib.sha256(run_id.encode()).hexdigest()[:20]
+        number = int(getattr(ti, "try_number", 1))
+        write_immutable(Path(directory) / run_key / f"try-{number}-failed-initial.json", report)
+    return report
+
+
 def _refill_refresh_window(**context: Any) -> dict[str, Any]:
     from utils.sofascore_refresh_window import refill_deadline, refill_window
     from dags.scripts.run_sofascore_scope_cycle import _atomic_json
@@ -484,7 +545,7 @@ def _refill_refresh_window(**context: Any) -> dict[str, Any]:
     initial_tasks = REFRESH_TASK_IDS - {"refill_refresh_window"}
     if any(ti.task_id in initial_tasks and _task_state(ti) in {"failed", "upstream_failed"}
            for ti in dag_run.get_task_instances()):
-        return {"status": "partial", "stop_reason": "upstream_failure", "outcomes": []}
+        return _failed_initial_report(context)
     items = context["ti"].xcom_pull(task_ids="plan_refresh_batch") or []
     if not items:
         return {"status": "success", "stop_reason": "empty_initial_plan", "outcomes": []}
@@ -664,6 +725,11 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
             if isinstance(persisted, dict) and persisted.get("run_id") == str(run_id):
                 refill = persisted
     if isinstance(refill, dict):
+        if "initial_outcomes" in refill:
+            # A failed mapped validation may yield no XCom at all. Physical
+            # attempt receipts retain retries and replace, rather than double
+            # count, the successful mapped-task XComs.
+            outcomes = list(refill["initial_outcomes"])
         outcomes.extend(refill.get("outcomes") or [])
         refill_reason = refill.get("stop_reason")
     used = sum(
