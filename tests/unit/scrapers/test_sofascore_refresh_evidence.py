@@ -25,16 +25,13 @@ def bundle():
                      started_at=(start + timedelta(seconds=(n - 1) * 700)).isoformat(),
                      finished_at=(start + timedelta(seconds=n * 700)).isoformat())
                 for n in range(1, 9)]
-    tail = dict(run_id="tail__20261015", night="2026-10-15", code_revision="a" * 40,
-                run_players=False, fotmob_import_errors=0,
-                leagues=[dict(league=f"league-{n}", status="success", capture_complete=True)
-                         for n in range(7)])
+    tail = dict(evidence=complete_tail())
     return dict(state="success", initial=initial, final=final, refills=[], outcomes=outcomes,
                 attempt_history_complete=True,
                 capture_window=dict(started_at=identity["started_at"],
                                     deadline_at="2026-10-15T04:30:01+00:00"),
                 refill_result=dict(status="success", stop_reason="empty_queue"),
-                tail=tail, expected_tail_leagues=[f"league-{n}" for n in range(7)],
+                tail=tail, expected_tail_leagues=sorted(complete_tail()["child"]["conf"]["competition_ids"]),
                 expected_revision="a" * 40, window_budget_s=7200)
 
 
@@ -82,13 +79,13 @@ def test_parallel_elapsed_times_are_unioned_not_summed():
 def test_incomplete_or_failed_contract(mutation):
     item = bundle()
     if mutation == "tail_missing":
-        item["tail"]["leagues"].pop()
+        item["tail"]["evidence"]["reports"].pop()
     elif mutation == "tail_failed":
-        item["tail"]["leagues"][0]["status"] = "failed"
+        item["tail"]["evidence"]["reports"][0]["errors"] = ["writer failed"]
     elif mutation == "players":
-        item["tail"]["run_players"] = True
+        item["tail"]["evidence"]["child"]["conf"]["run_players"] = True
     elif mutation == "fotmob":
-        item["tail"]["fotmob_import_errors"] = 1
+        item["tail"]["evidence"]["import_errors"]["errors"] = ["bad import"]
     elif mutation == "revision":
         item["final"]["identity"]["code_revision"] = "f" * 40
     elif mutation == "partial_no_remaining":
@@ -109,12 +106,10 @@ def test_empty_daily_lane_is_unknown_even_if_ss_high():
         lanes={"SS": dict(closed=100, total=100), "daily": dict(closed=0, total=0)}), "a" * 40)["status"] == "unknown"
 
 
-def test_third_day_uses_actual_delivery_and_both_lane_denominators():
-    data = dict(delivered_at="2026-10-12T09:00:00Z", checked_at="2026-10-15T09:00:00Z",
-                code_revision="a" * 40, lanes={"SS": dict(closed=95, total=100),
-                "daily": dict(closed=9, total=10)})
+def test_third_day_uses_original_calendar_and_both_lane_denominators():
+    data = original_day_data()
     assert evidence.assess_third_day(data, "a" * 40)["status"] == "pass"
-    data["checked_at"] = "2026-10-13T09:00:00Z"
+    data["day"] = "2026-09-28"
     assert evidence.assess_third_day(data, "a" * 40)["status"] == "unknown"
 
 
@@ -158,7 +153,7 @@ def night_bundle(day):
     for row in item["outcomes"]:
         row.update(run_id=run_id, started_at=row["started_at"].replace("10-15", f"10-{day:02}"),
                    finished_at=row["finished_at"].replace("10-15", f"10-{day:02}"))
-    item["tail"].update(run_id=f"tail__202610{day:02}", night=f"2026-10-{day:02}")
+    item["tail"] = dict(evidence=complete_tail(day))
     item["capture_window"] = {k: v.replace("10-15", f"10-{day:02}")
                               for k, v in item["capture_window"].items()}
     return run_id, item
@@ -236,7 +231,7 @@ def test_different_release_nights_cannot_form_one_accepted_series():
     rows = dict(night_bundle(day) for day in (15, 16, 17))
     for revision, item in zip(("a", "b", "c"), rows.values()):
         item["expected_revision"] = revision * 40
-        item["tail"]["code_revision"] = revision * 40
+        item["tail"] = dict(evidence=complete_tail(15, revision * 40))
         for name in ("initial", "final"):
             item[name]["identity"]["code_revision"] = revision * 40
             item[name]["digest"] = evidence._digest({k: v for k, v in item[name].items() if k != "digest"})
@@ -281,3 +276,83 @@ def test_duplicate_physical_attempt_or_incomplete_history_does_not_pass():
     item = bundle()
     item["attempt_history_complete"] = False
     assert evidence.assess_run(item)["status"] == "unknown"
+
+
+def original_day_data():
+    return dict(day="2026-09-29", measured_at="2026-09-30T05:04:49+00:00",
+                checked_at="2026-10-16T10:00:00Z", code_revision="a" * 40,
+                delivered_at="2026-09-27T04:20:10Z",
+                original_delivery=dict(code_revision="70446986046371e2adecd034dba66a83afdecf99",
+                    delivered_at="2026-09-27T04:20:10Z",
+                    artifact_id="fe05605ff876b99a41d7bae740913f41b9432c57737a6cc24ee24912688aec11"),
+                lanes={"SS": dict(closed=95, total=100), "daily": dict(closed=9, total=10)})
+
+
+def test_original_calendar_day_accepts_later_actual_measurement():
+    result = evidence.assess_third_day(original_day_data(), "a" * 40)
+    assert result["status"] == "pass"
+    assert result["day"] == "2026-09-29"
+    assert result["measured_at"] == "2026-09-30T05:04:49+00:00"
+
+
+def test_new_recorder_delivery_cannot_reanchor_historical_deadline():
+    data = original_day_data()
+    data.update(day="2026-10-18", delivered_at="2026-10-15T20:04:01Z",
+                measured_at="2026-10-18T20:04:01Z", checked_at="2026-10-18T21:00:00Z")
+    assert evidence.assess_third_day(data, "a" * 40)["status"] == "unknown"
+
+
+def test_seven_self_declared_complete_leagues_do_not_prove_publication():
+    item = bundle()
+    item["tail"] = dict(run_id="tail__20261015", night="2026-10-15", code_revision="a" * 40,
+                        run_players=False, fotmob_import_errors=0,
+                        leagues=[dict(league=name, status="success", capture_complete=True)
+                                 for name in item["expected_tail_leagues"]])
+    assert evidence.assess_run(item)["status"] == "unknown"
+
+
+
+def complete_tail(day=15, revision="a" * 40):
+    from scrapers.sofascore.tail_evidence import configured_tournaments, _task
+
+    configured = configured_tournaments()
+    run_id = f"tail__202610{day:02}T002000"
+    start, finish = f"2026-10-{day:02}T00:20:01Z", f"2026-10-{day:02}T00:30:00Z"
+    child = dict(dag_id="dag_ingest_sofascore", run_id=run_id, code_revision=revision,
+                 state="success", start_date=start, end_date=finish, logical_date=start,
+                 conf=dict(run_players=False, competition_ids=sorted(configured)))
+    parent = dict(dag_id="dag_trigger_sofascore_daily_tail", run_id="scheduled__" + start,
+                  child_run_id=run_id, code_revision=revision, state="success")
+    tasks, reports = [], []
+    for league, tournament in configured.items():
+        for prefix in ("scrape_sofascore_data", "scrape_match_capture", "scrape_player_capture"):
+            tasks.append(dict(task_id=_task(prefix, league), dag_id=child["dag_id"], run_id=run_id,
+                              state="skipped" if "player" in prefix else "success", try_number=1))
+        for phase in ("season", "match"):
+            identity = dict(dag_id=child["dag_id"], run_id=run_id, code_revision=revision,
+                            logical_date=start, started_at=start, finished_at=finish,
+                            league=league, source_tournament_id=tournament,
+                            source_season_id=tournament + 100, season="2627", try_number=1)
+            report = dict(evidence_identity=identity, errors=[], endpoint_completeness=1.0,
+                          manifest_committed=True, publication_receipts=[])
+            if phase == "season":
+                report.update(entity="all", schedule_rows=10, league_table_rows=0)
+                table, rows = "sofascore_schedule", 10
+            else:
+                report.update(entity="match_capture", capture_status_rows=5, matches_total=5,
+                              matches_complete=5, matches_skipped_existing=0)
+                table, rows = "sofascore_match_capture_status", 5
+            report["tables"] = ["iceberg.bronze." + table]
+            report["publication_receipts"].append(dict(table=table, rows=rows, location="iceberg.bronze." + table))
+            reports.append(report)
+    return dict(parent=parent, child=child, task_instances=tasks, reports=reports,
+                import_errors=dict(isolate="fotmob", code_revision=revision,
+                                   checked_at=finish, errors=[]))
+
+
+def test_null_final_snapshot_retains_failed_run_instead_of_crashing():
+    item = bundle()
+    item.update(state="failed", final=None)
+    result = evidence.assess_run(item)
+    assert result["status"] == "fail"
+    assert result["reasons"]

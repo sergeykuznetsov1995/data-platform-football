@@ -105,7 +105,7 @@ def write_immutable(path, document):
 
 
 def _validate_snapshot(doc, revision, identity=None):
-    if doc.get("schema_version") != 1 or doc.get("input_complete") is not True:
+    if not isinstance(doc, dict) or doc.get("schema_version") != 1 or doc.get("input_complete") is not True:
         raise ValueError("full planning census absent")
     if doc.get("digest") != _digest({k: v for k, v in doc.items() if k != "digest"}):
         raise ValueError("planning evidence digest mismatch")
@@ -177,18 +177,16 @@ def _union_seconds(outcomes, started, deadline):
 
 
 def _tail_status(tail, expected, identity):
-    if (not isinstance(expected, list) or len(set(expected)) != 7 or len(expected) != 7
-            or tail.get("run_players") is not False
-            or tail.get("fotmob_import_errors") != 0
-            or tail.get("code_revision") != identity["code_revision"]
-            or tail.get("night") != _instant(identity["started_at"]).date().isoformat()
-            or not tail.get("run_id")):
-        raise ValueError("tail7 identity/players/import evidence incomplete")
-    rows = tail["leagues"]
-    if len(rows) != 7 or {r["league"] for r in rows} != set(expected):
-        raise ValueError("tail7 league denominator incomplete")
-    return "pass" if all(r.get("status") == "success" and r.get("capture_complete") is True
-                         for r in rows) else "fail"
+    from .tail_evidence import assess_tail
+
+    if not isinstance(tail, dict):
+        raise ValueError("physical tail7 evidence absent")
+    proof = tail.get("evidence")
+    if not isinstance(proof, dict):
+        raise ValueError("physical tail7 capture/publication receipts absent")
+    result = assess_tail(proof, identity["code_revision"],
+                         _instant(identity["started_at"]).date().isoformat(), expected)
+    return result["status"]
 
 
 def assess_run(bundle, expected_revision=None):
@@ -276,26 +274,53 @@ def assess_run(bundle, expected_revision=None):
     return result
 
 
+# Primary Night6 calendar deadline and the retained original deployment receipt.
+# A later evidence-recorder release never replaces this feature anchor.
+THIRD_DAY = "2026-09-29"
+ORIGINAL_DELIVERY = dict(
+    code_revision="70446986046371e2adecd034dba66a83afdecf99",
+    artifact_id="fe05605ff876b99a41d7bae740913f41b9432c57737a6cc24ee24912688aec11",
+    delivered_at="2026-09-27T04:20:10Z",
+)
+
+
 def assess_third_day(data, expected_revision):
+    result = dict(status="unknown", required_day=THIRD_DAY, lanes={},
+                  retained_lanes=data.get("lanes"), observed_day=data.get("day"),
+                  observed_measured_at=data.get("measured_at"))
     try:
         if data["code_revision"] != expected_revision:
             raise ValueError("cross-release coverage")
-        # The third-day observation must cover the actual delivery+72h boundary.
-        target = _instant(data["delivered_at"]) + timedelta(days=3)
-        fact_at = _instant(data.get("measured_at", data["checked_at"]))
-        if fact_at != target or _instant(data["checked_at"]) < fact_at:
-            raise ValueError("exact third-day boundary not qualified")
-        shares = {}
+        original = data["original_delivery"]
+        if (any(original.get(k) != v for k, v in ORIGINAL_DELIVERY.items())
+                or ("delivered_at" in data and _instant(data["delivered_at"])
+                    != _instant(ORIGINAL_DELIVERY["delivered_at"]))):
+            raise ValueError("original feature delivery receipt not qualified")
+        if data["day"] != THIRD_DAY:
+            raise ValueError("original calendar reporting day29Sep required")
+        fact_at, checked = _instant(data["measured_at"]), _instant(data["checked_at"])
+        # Daily rows are measured after their UTC reporting day has ended.
+        # Their real measurement timestamp is retained, never rounded to00:00.
+        if fact_at < _instant(THIRD_DAY + "T00:00:00Z") + timedelta(days=1) or checked < fact_at:
+            raise ValueError("historical daily observation not qualified")
+        result.update(day=data["day"], measured_at=data["measured_at"],
+                      checked_at=data["checked_at"], original_delivery=dict(original))
         for name in ("SS", "daily"):
-            row = data["lanes"][name]
-            closed, total = _integer(row["closed"]), _integer(row["total"], 1)
-            if closed > total:
-                raise ValueError("invalid coverage denominator")
-            shares[name] = closed / total
-        return dict(status="pass" if min(shares.values()) >= .9 else "fail", lanes=shares,
-                    boundary=target.isoformat())
+            row = data["lanes"].get(name, {})
+            try:
+                closed = _integer(row["closed"] if "closed" in row else row["in24"])
+                total = _integer(row["total"], 1)
+                if closed > total or ("closed" in row and "in24" in row and row["in24"] != closed):
+                    raise ValueError("invalid coverage denominator")
+                result["lanes"][name] = dict(closed=closed, total=total, share=closed / total,
+                    status="pass" if closed / total >= .9 else "fail")
+            except (KeyError, TypeError, ValueError) as exc:
+                result["lanes"][name] = dict(status="unknown", retained=dict(row), reason=str(exc))
+        statuses = {row["status"] for row in result["lanes"].values()}
+        result["status"] = "unknown" if "unknown" in statuses else "fail" if "fail" in statuses else "pass"
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
-        return dict(status="unknown", reason=str(exc))
+        result["reason"] = str(exc)
+    return result
 
 
 def assess_nights(expected_runs, bundles, expected_revision=None):

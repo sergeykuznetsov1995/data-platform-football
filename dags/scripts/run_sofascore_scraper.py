@@ -1226,6 +1226,9 @@ def _run_match_capture(
         "fallback_reason": None,
         "errors": [],
     }
+    results["evidence_identity"] = _capture_identity(
+        league, season_short, source_tournament_id, source_season_id
+    )
     endpoint_plan = None
     endpoint_specs = {}
     pipeline_results = []
@@ -1660,7 +1663,7 @@ def _run_match_capture(
 
             with bronze_writer_lock():
                 if not stats_empty:
-                    spath = scraper.save_to_iceberg(
+                    spath = _save_publication(scraper, results,
                         df=stats_df,
                         table_name="sofascore_match_stats",
                         partition_cols=["league", "season"],
@@ -1686,7 +1689,7 @@ def _run_match_capture(
                 # payload has no rows to merge; any non-empty payload is committed
                 # before the completion markers below.
                 if not shot_empty:
-                    shpath = scraper.save_to_iceberg(
+                    shpath = _save_publication(scraper, results,
                         df=shot_df,
                         table_name="sofascore_event_shotmap",
                         partition_cols=["league", "season"],
@@ -1703,7 +1706,7 @@ def _run_match_capture(
                 # full-state refresh like the others. Best-effort: empty when the
                 # event payload carried no venue.
                 if not venue_empty:
-                    vpath = scraper.save_to_iceberg(
+                    vpath = _save_publication(scraper, results,
                         df=venue_df,
                         table_name="sofascore_venue",
                         partition_cols=["league", "season"],
@@ -1715,7 +1718,7 @@ def _run_match_capture(
                     logger.info("Saved %d venue rows -> %s", results["venue_rows"], vpath)
 
                 if not event_empty:
-                    evpath = scraper.save_to_iceberg(
+                    evpath = _save_publication(scraper, results,
                         df=event_df,
                         table_name="sofascore_events",
                         partition_cols=["league", "season"],
@@ -1725,7 +1728,7 @@ def _run_match_capture(
                     results["event_rows"] = int(len(event_df))
 
                 if not participant_empty:
-                    eppath = scraper.save_to_iceberg(
+                    eppath = _save_publication(scraper, results,
                         df=participant_df,
                         table_name="sofascore_event_participants",
                         partition_cols=["league", "season"],
@@ -1740,7 +1743,7 @@ def _run_match_capture(
                     results["participant_rows"] = int(len(participant_df))
 
                 if not incident_empty:
-                    ipath = scraper.save_to_iceberg(
+                    ipath = _save_publication(scraper, results,
                         df=incident_df,
                         table_name="sofascore_incidents",
                         partition_cols=["league", "season"],
@@ -1758,7 +1761,7 @@ def _run_match_capture(
                 # Save the two lineup-derived data tables after optional payloads;
                 # the explicit status manifest below is the only completion marker.
                 if not lineup_empty:
-                    lpath = scraper.save_to_iceberg(
+                    lpath = _save_publication(scraper, results,
                         df=lineup_df,
                         table_name="sofascore_lineups",
                         partition_cols=["league", "season"],
@@ -1781,7 +1784,7 @@ def _run_match_capture(
                         )
 
                 if not eps_empty:
-                    epath = scraper.save_to_iceberg(
+                    epath = _save_publication(scraper, results,
                         df=eps_df,
                         table_name="sofascore_event_player_stats",
                         partition_cols=["league", "season"],
@@ -1799,7 +1802,7 @@ def _run_match_capture(
 
                 # Ratings remains the primary data table, but is not used as status.
                 if not ratings_empty:
-                    rpath = scraper.save_to_iceberg(
+                    rpath = _save_publication(scraper, results,
                         df=ratings_df,
                         table_name="sofascore_player_ratings",
                         partition_cols=["league", "season"],
@@ -1819,7 +1822,7 @@ def _run_match_capture(
                 # manifest becomes terminal. If this write fails, exact raw stays
                 # replayable and the retry repairs status with zero source traffic.
                 if not status_empty and not pipeline_results:
-                    cpath = scraper.save_to_iceberg(
+                    cpath = _save_publication(scraper, results,
                         df=status_df,
                         table_name=_MATCH_CAPTURE_STATUS_TABLE,
                         partition_cols=["league", "season"],
@@ -1847,7 +1850,7 @@ def _run_match_capture(
                             pd.DataFrame(compatibility_rows),
                             "match_capture_status",
                         )
-                        cpath = scraper.save_to_iceberg(
+                        cpath = _save_publication(scraper, results,
                             df=compatibility,
                             table_name=_MATCH_CAPTURE_STATUS_TABLE,
                             partition_cols=["league", "season"],
@@ -1863,7 +1866,7 @@ def _run_match_capture(
                         )
 
                 if rejected_rows:
-                    rjpath = scraper.save_to_iceberg(
+                    rjpath = _save_publication(scraper, results,
                         df=_rejected_rows_frame(
                             rejected_rows,
                             league=league,
@@ -1942,6 +1945,7 @@ def _run_match_capture(
                         )
                     )
                 validate_manifest_completeness(expectations, observations).require()
+                results["manifest_committed"] = True
                 # The engine snapshot counts states as they were recorded
                 # mid-pass, where every materialized endpoint is still a
                 # deferred retryable_failure — a green run and a red one looked
@@ -2440,6 +2444,34 @@ def _run_player_capture(
         return 1
 
 
+def _capture_identity(league, season, source_tournament_id, source_season_id):
+    """Retain already-resolved runner identity; never derive a release from time."""
+    revision = os.environ.get("SOFASCORE_EVIDENCE_CODE_REVISION", "").strip()
+    if os.environ.get("SOFASCORE_REFRESH_EVIDENCE_DIR") and (
+        len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision)
+    ):
+        raise ValueError("enabled publication recorder requires a qualified code revision")
+    return dict(
+        dag_id=os.environ.get("AIRFLOW_CTX_DAG_ID", ""),
+        run_id=os.environ.get("SOFASCORE_DAG_RUN_ID") or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", ""),
+        code_revision=revision,
+        logical_date=os.environ.get("AIRFLOW_CTX_EXECUTION_DATE", ""),
+        started_at=datetime.now(timezone.utc).isoformat(),
+        league=league, source_tournament_id=source_tournament_id,
+        source_season_id=source_season_id, season=str(season),
+        try_number=int(os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "1")),
+    )
+
+
+def _save_publication(scraper, results, **kwargs):
+    """Record the existing successful save return without another storage read."""
+    location = scraper.save_to_iceberg(**kwargs)
+    results.setdefault("publication_receipts", []).append(dict(
+        table=kwargs["table_name"], rows=len(kwargs["df"]), location=location,
+    ))
+    return location
+
+
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
     traffic = payload.get("traffic")
@@ -2448,6 +2480,18 @@ def _write_results(path: str, payload: dict) -> None:
         from scrapers.sofascore import trino_accounting
 
         traffic["trino_queries"] = trino_accounting.snapshot()
+    identity = payload.get("evidence_identity")
+    if isinstance(identity, dict):
+        identity["finished_at"] = datetime.now(timezone.utc).isoformat()
+        evidence_dir = os.environ.get("SOFASCORE_REFRESH_EVIDENCE_DIR", "").strip()
+        if evidence_dir:
+            from pathlib import Path
+            from scrapers.sofascore.refresh_evidence import _digest, write_immutable
+
+            # Preserve the physical attempt before the conventional result is
+            # overwritten by a retry. The digest retains failed/partial saves.
+            write_immutable(Path(evidence_dir) / "daily-tail" / _digest(identity)
+                            / (_digest(payload) + ".json"), payload)
     try:
         with open(path, "w") as f:
             json.dump(payload, f, default=str)
@@ -2542,6 +2586,9 @@ def _run_season_capture_engine(
     try:
         source_tournament_id, source_season_id = _source_context(
             league, season, canonical_season
+        )
+        results["evidence_identity"] = _capture_identity(
+            league, canonical_season, source_tournament_id, source_season_id
         )
         # #1357: one manifest SELECT for the scope before the season plan.
         from scrapers.sofascore.manifest import preload_manifest_scope
@@ -2691,7 +2738,7 @@ def _run_season_capture_engine(
                 schedule_df = scraper._add_metadata(
                     pd.DataFrame(materialized.schedule_rows), "schedule"
                 )
-                path = scraper.save_to_iceberg(
+                path = _save_publication(scraper, results,
                     df=schedule_df,
                     table_name="sofascore_schedule",
                     partition_cols=["league", "season"],
@@ -2703,7 +2750,7 @@ def _run_season_capture_engine(
                 standings_df = scraper._add_metadata(
                     pd.DataFrame(materialized.standings_rows), "league_table"
                 )
-                path = scraper.save_to_iceberg(
+                path = _save_publication(scraper, results,
                     df=standings_df,
                     table_name="sofascore_league_table",
                     partition_cols=["league", "season"],
@@ -2748,6 +2795,7 @@ def _run_season_capture_engine(
             ),
         )
         _flush_manifest_store(capture_runtime.manifest_store)
+        results["manifest_committed"] = True
         results["pending_endpoints"] = len(committed.pending_keys)
         results["endpoint_completeness"] = 1.0
         results["traffic"] = _logical_capture_traffic(

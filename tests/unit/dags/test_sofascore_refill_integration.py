@@ -26,12 +26,50 @@ def test_refill_and_metadata_wait_for_all_mapped_scope_tasks():
     assert 'refill_refresh_window' in module.REFRESH_TASK_IDS
 
 
-def test_refill_never_retries_a_failed_initial_scope(monkeypatch):
+def test_refill_never_retries_a_failed_initial_scope(tmp_path, monkeypatch):
     module = _module()
+    monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path))
     monkeypatch.setattr(module, '_pending_refresh_partitions', lambda: pytest.fail('paid refill after failure'))
     result = module._refill_refresh_window(dag_run=SimpleNamespace(get_task_instances=lambda: [
         SimpleNamespace(task_id='run_refresh_scope', state='failed')]))
     assert result['stop_reason'] == 'upstream_failure'
+
+
+def test_failed_initial_batch_preserves_all_physical_attempts(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path / 'results'))
+    archive = tmp_path / 'evidence' / 'scope-attempts'
+    archive.mkdir(parents=True)
+    monkeypatch.setenv('SOFASCORE_REFRESH_EVIDENCE_DIR', str(archive.parent))
+    monkeypatch.setattr(module, '_pending_refresh_partitions', lambda: pytest.fail('extra census'))
+    monkeypatch.setattr(module, '_execute_refill_scope', lambda env: pytest.fail('extra source load'))
+    env = {'SOFASCORE_SCOPE_RUN_ID': 'run--19415-66626',
+           'SOFASCORE_SCOPE_KEY': 'campaign:19415:66626',
+           'SOFASCORE_SCOPE_RESULT_PATH': str(tmp_path / 'latest.json')}
+    for number, elapsed in enumerate((36.3, 18.8)):
+        (archive / f'{number}.json').write_text(json.dumps({
+            'run_id': env['SOFASCORE_SCOPE_RUN_ID'], 'campaign_id': 'campaign',
+            'tournament_id': 19415, 'source_season_id': 66626,
+            'started_at': f'2026-10-16T02:0{number}:00+00:00',
+            'status': 'failed', 'elapsed_s': elapsed,
+            'errors': ['event13972308 schema_error']}))
+    (archive / 'foreign.json').write_text(json.dumps({'run_id': 'other-run', 'elapsed_s': 999}))
+    dag_run = SimpleNamespace(get_task_instances=lambda: [
+        SimpleNamespace(task_id='run_refresh_scope', state='failed')])
+    result = module._refill_refresh_window(run_id='run', dag_run=dag_run,
+        ti=SimpleNamespace(xcom_pull=lambda task_ids: [{'env': env}]))
+    persisted = json.loads(module._refill_report_path('run').read_text())
+    assert result == persisted
+    assert len(persisted['initial_outcomes']) == 2
+    assert persisted['final_census_status'] == 'unavailable_upstream_failure'
+    values = {'validate_refresh_scope': [], 'refill_refresh_window': result}
+    summary = module._window_summary({'run_id': 'run', 'ti': SimpleNamespace(
+        xcom_pull=lambda task_ids: values[task_ids])})
+    assert summary['window_used_s'] == 55.1
+    assert summary['window_budget_s'] == 7200
+    with pytest.raises(module.AirflowException, match='run_refresh_scope'):
+        module._propagate_status(run_id='run', dag_run=dag_run, ti=SimpleNamespace(
+            xcom_pull=lambda task_ids: values[task_ids]))
 
 
 def test_refill_uses_new_plan_ids_and_common_deadline(tmp_path, monkeypatch):

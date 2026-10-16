@@ -25,7 +25,12 @@ def main():
         return 0
     result = assess_nights(source["expected_runs"], source["bundles"], source.get("expected_revision"))
     if "third_day" in source:
-        result["third_day"] = assess_third_day(source["third_day"], source["expected_revision"])
+        result["night_status"] = result["status"]
+        result["third_day"] = assess_third_day(
+            source["third_day"], source.get("third_day_expected_revision", source["expected_revision"])
+        )
+        statuses = {result["night_status"], result["third_day"]["status"]}
+        result["status"] = "fail" if "fail" in statuses else "unknown" if "unknown" in statuses else "pass"
     result.update(source_requests=0, production_changes=0, acceptance_started=False)
     write_immutable(args.output, result)
     print(json.dumps(result, ensure_ascii=False))
