@@ -344,6 +344,21 @@ def _plan_seasons(
                 < SOURCE_GAP_REVIEW_AFTER
             ):
                 continue
+            # Ожидающий повтор/terminal-пауза отсеивается ДО барьера циклов:
+            # скоуп, который источник не отдаёт (календарь 2021 у кубков),
+            # повторяется по своему графику, но не держит старшие циклы (#1292).
+            if (
+                attempt.outcome == "terminal"
+                and observed_now - _naive_utc(attempt.last_attempt_at)
+                < TERMINAL_RETRY_AFTER
+            ):
+                continue
+            retry_at = attempt.next_retry_at
+            if retry_at is not None:
+                if retry_at.tzinfo is not None:
+                    retry_at = retry_at.astimezone(timezone.utc).replace(tzinfo=None)
+                if retry_at > observed_now:
+                    continue
 
         candidates.append((season, attempt))
 
@@ -366,20 +381,6 @@ def _plan_seasons(
 
     output: list[SeasonWorkItem] = []
     for season, attempt in candidates:
-        if attempt is not None:
-            if (
-                attempt.outcome == "terminal"
-                and observed_now - _naive_utc(attempt.last_attempt_at)
-                < TERMINAL_RETRY_AFTER
-            ):
-                continue
-            retry_at = attempt.next_retry_at
-            if retry_at is not None:
-                if retry_at.tzinfo is not None:
-                    retry_at = retry_at.astimezone(timezone.utc).replace(tzinfo=None)
-                if retry_at > observed_now:
-                    continue
-
         is_current = _is_current_season(season)
         active_rank = 0 if is_current else 1
         recency = _season_recency_key(season)
@@ -435,8 +436,8 @@ def plan_seasons(
     plan. Current and history lanes are disjoint. Within a selected cycle, a
     durable retry that is not due is skipped without blocking later ready work.
     Automatic BACKFILL + HISTORY planning selects its newest unfinished cycle
-    before cooldown filtering, so a cooling retry or fresh terminal outcome in
-    that cycle blocks all older cycles. Exact season strings pass through
+    among runnable scopes: a scope waiting for its retry or terminal cooldown
+    keeps its own schedule but does not block older cycles. Exact season strings pass through
     unchanged and no hardcoded competition cohort affects order.
 
     ``scope_debt`` (played matches without details per scope) is the first
