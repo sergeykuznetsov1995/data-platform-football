@@ -151,14 +151,23 @@ def _with_recheck(before, current, recheck, cohort_value):
     _require(recheck.get("mode") == "recheck" and recheck.get("original_cohort") == cohort_value, "recheck belongs to another original cohort")
     old_rows = {row["player_id"]: row for row in before["players"]}
     current_rows = {row["player_id"]: row for row in current["players"]}
+    # Players absent from their sampled club on day 2 have no row; only a
+    # measured recheck against their current club's full page can supply it.
+    absent = _ids(current.get("missing_ids", []))
     selected = _ids(recheck.get("selected_changed_ids"))
-    _require(1 <= len(selected) <= 64 and selected <= set(old_rows) and set(old_rows) == set(current_rows), "recheck selection is not a bounded original-cohort subset")
-    _require(all(old_rows[player]["tmapi"] != current_rows[player]["tmapi"] for player in selected), "recheck did not select actual changed IDs")
+    _require(1 <= len(selected) <= 64 and selected <= set(old_rows) and set(old_rows) == set(current_rows) | absent
+             and not absent & set(current_rows) and absent <= selected, "recheck selection is not a bounded original-cohort subset")
+    _require(all(player in absent or old_rows[player]["tmapi"] != current_rows[player]["tmapi"] for player in selected), "recheck did not select actual changed IDs")
     checked, _, _ = _observation(recheck.get("qualification_observation"), selected)
     merged = deepcopy(current)
     merged["players"] = [checked[row["player_id"]][0] if row["player_id"] in checked else row for row in current["players"]]
+    merged["players"] += [checked[player][0] for player in sorted(absent, key=int)]
+    merged["missing_ids"] = []
+    merged.pop("missing_details", None)
+    merged["counts"] = {"expected": len(old_rows), "compared": len(merged["players"]), "missing": 0, "unknown": 0}
     for player in selected:
-        _require(_time(checked[player][0]["raw"]["tmapi"]["fetched_at"]) >= _time(current_rows[player]["raw"]["tmapi"]["fetched_at"]), "recheck is older than current observation")
+        previous = _time(current["observed_from"]) if player in absent else _time(current_rows[player]["raw"]["tmapi"]["fetched_at"])
+        _require(_time(checked[player][0]["raw"]["tmapi"]["fetched_at"]) >= previous, "recheck is older than current observation")
     merged["observed_from"] = min(current["observed_from"], recheck["qualification_observation"]["observed_from"])
     merged["observed_to"] = max(current["observed_to"], recheck["qualification_observation"]["observed_to"])
     merged["day_msk"] = _time(merged["observed_to"]).astimezone(ZoneInfo("Europe/Moscow")).date().isoformat()
@@ -166,8 +175,33 @@ def _with_recheck(before, current, recheck, cohort_value):
     return merged
 
 
-def validate_qualification(qualification: Mapping[str, Any]) -> dict:
-    """Validate the wrapper, linked report hashes, all rows and changed evidence."""
+def _edition_proofs(cohort_value, scopes):
+    """Every scope needs the source's own unforced competition profile selecting it."""
+    _require(cohort_value.get("scope_basis") == "source_current_edition" and cohort_value.get("source_current_editions_proven") is True,
+             "qualification needs source-proven current competition editions")
+    proofs = cohort_value.get("edition_proofs")
+    _require(isinstance(proofs, list) and all(isinstance(proof, dict) and isinstance(proof.get("scope"), str) for proof in proofs)
+             and sorted(proof["scope"] for proof in proofs) == sorted(set(scopes)), "every qualification scope needs a source edition proof")
+    stamps = []
+    for proof in proofs:
+        competition, season = proof["scope"].split("/")
+        _require(proof.get("competition_id") == competition and proof.get("edition_id") == season, "source edition proof selects another edition")
+        for field in ("capture_id", "body_sha256"):
+            _require(isinstance(proof.get(field), str) and re.fullmatch(r"[a-f0-9]{64}", proof[field]), "source edition proof identity/hash is invalid")
+        url = urlsplit(proof.get("url", ""))
+        _require(url.scheme == "https" and url.netloc == "www.transfermarkt.com" and not url.query and not url.fragment
+                 and re.fullmatch(rf"/[^/]+/startseite/(?:pokalwettbewerb|wettbewerb)/{re.escape(competition)}", url.path) is not None,
+                 "source edition proof is not the unforced competition profile")
+        stamps.append(_time(proof.get("fetched_at")))
+    return max(stamps)
+
+
+def validate_qualification(qualification: Mapping[str, Any], *, editions_proven_by_pin: bool = False) -> dict:
+    """Validate the wrapper, linked report hashes, all rows and changed evidence.
+
+    ``editions_proven_by_pin`` is only for the offline intake, which proves
+    editions against its own pinned registry; runtime callers never pass it.
+    """
     _require(isinstance(qualification, Mapping), "qualification wrapper is not an object")
     path = Path(str(qualification.get("evidence_path", "")))
     _require(path.is_file(), "qualification evidence file is missing")
@@ -184,6 +218,7 @@ def validate_qualification(qualification: Mapping[str, Any]) -> dict:
     _require(len(cohort) >= 1000 and GROUPS <= set(cohort_value.get("groups", [])), "qualification needs >=1000 players and all sample groups")
     scopes = cohort_value.get("scopes")
     _require(isinstance(scopes, list) and len(set(scopes)) >= 20 and all(isinstance(scope, str) and re.fullmatch(r"[A-Za-z0-9_-]+/(?:18|19|20|21)[0-9]{2}", scope) for scope in scopes), "qualification needs >=20 actual scopes")
+    editions_seen_at = None if editions_proven_by_pin else _edition_proofs(cohort_value, scopes)
     reports = artifact.get("reports")
     _require(isinstance(reports, list) and len(reports) == 2, "qualification needs two linked observations")
     source_reports = []
@@ -198,8 +233,9 @@ def validate_qualification(qualification: Mapping[str, Any]) -> dict:
     if "recheck" in artifact:
         second_observation = _with_recheck(first_observation, second_observation, _linked_report(artifact["recheck"], path), cohort_value)
     observations = [_observation(first_observation, cohort), _observation(second_observation, cohort)]
-    old, _, old_end = observations[0]
+    old, old_start, old_end = observations[0]
     new, new_start, new_end = observations[1]
+    _require(editions_seen_at is None or editions_seen_at <= old_start, "source edition proof was taken after the first observation")
     _require(old_end < new_start and (new_end.astimezone(ZoneInfo("Europe/Moscow")).date() - old_end.astimezone(ZoneInfo("Europe/Moscow")).date()).days == 1,
              "qualification needs observations on consecutive Moscow days")
     changes = []
@@ -228,7 +264,8 @@ def validate_qualification(qualification: Mapping[str, Any]) -> dict:
     return result
 
 
-def build_qualification(day1: str | Path, day2: str | Path, output: str | Path, *, recheck: str | Path | None = None) -> dict:
+def build_qualification(day1: str | Path, day2: str | Path, output: str | Path, *, recheck: str | Path | None = None,
+                        editions_proven_by_pin: bool = False) -> dict:
     """Build from concrete benchmark reports, then use the same runtime validator."""
     paths = [Path(day1).resolve(), Path(day2).resolve()]
     output = Path(output).resolve()
@@ -241,4 +278,4 @@ def build_qualification(day1: str | Path, day2: str | Path, output: str | Path, 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(artifact, indent=2) + "\n")
     wrapper = {"evidence_path": str(output), "evidence_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
-    return validate_qualification(wrapper)
+    return validate_qualification(wrapper, editions_proven_by_pin=editions_proven_by_pin)

@@ -136,6 +136,29 @@ runtime validator отвергает каждый из этих JSON: ни fixtu
 метку fixture на exported в qualification нельзя. Ярлык exported также не
 служит доказательством подлинности.
 
+## Живой прогон bench (#1393, cohort-v2)
+
+Runtime-валидатор (`validate_qualification`) принимает только cohort с
+`scope_basis=source_current_edition`: каждое издание доказано незафорсированной
+страницей профиля соревнования (`edition/<scope>` в режиме `cohort`), снятой до
+day1. Сезон `current_saison_id` из `denominator.tsv` — только перекрёстная
+проверка. Сезон в селекторе клубной страницы не блокирует: `/plus/1` без
+`saison_id` — текущий состав, членство доказывает tmapi participants за
+доказанное издание. Offline intake выше доказывает издания своим pin и вызывает
+builder с `editions_proven_by_pin=True`; runtime так не вызывается.
+
+Порядок: `cohort` (25 профилей + 25 participants + 45 составов) по
+`.local/tasks/1393/qualification-cohort-v2/template.json`, затем `parity` два
+дня МСК подряд, затем при нужде `recheck`, затем `qualify`. Клуб 26645
+(`BLOCKED_CLUB_IDS`) отвергается до любого запроса. Каждый parity-день:
+составы, пакеты tmapi, оба ceapi, затем закрывающие пакеты tmapi
+(`players-closing/*`). Строка засчитывается по первому пакету, совпавшему с
+полным эталоном (`detector_fetch`); не совпал ни один — расхождение. Игрок,
+ушедший из выбранного клуба, попадает в `missing_ids`/`missing_details`;
+qualification проходит только после `recheck` по полному составу клуба,
+который называет tmapi. Порция parity не стартует, если наблюдение уже
+началось в другую дату МСК или не успеет до полуночи МСК при 12 запросах/мин.
+
 Focused offline tests:
 
 ```bash

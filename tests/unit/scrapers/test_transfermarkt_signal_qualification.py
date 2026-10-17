@@ -18,7 +18,14 @@ def qualified_fixture(tmp_path, *, changes=True, players=1000):
     root = Path(tmp_path) / "qualification"
     root.mkdir(parents=True, exist_ok=True)
     ids = [str(player) for player in range(1, players + 1)]
-    cohort = {"player_ids": ids, "groups": sorted(GROUPS), "scope_basis": "configured_denominator", "source_current_editions_proven": False, "scopes": [f"TEST{scope}/2026" for scope in range(20)]}
+    scopes = [f"TEST{scope}/2026" for scope in range(20)]
+    proofs = [{"scope": scope, "competition_id": scope.split("/")[0], "edition_id": "2026",
+               "capture_id": hashlib.sha256(f"synthetic/edition/{scope}".encode()).hexdigest(),
+               "body_sha256": hashlib.sha256(f"synthetic-body/edition/{scope}".encode()).hexdigest(),
+               "url": f"https://www.transfermarkt.com/test/startseite/wettbewerb/{scope.split('/')[0]}",
+               "fetched_at": "2026-10-09T10:00:00+00:00"} for scope in scopes]
+    cohort = {"player_ids": ids, "groups": sorted(GROUPS), "scope_basis": "source_current_edition", "source_current_editions_proven": True,
+              "edition_proofs": proofs, "scopes": scopes}
     paths = []
     batch_urls = {start // 300: players_url(ids[start:start + 300]) for start in range(0, players, 300)}
     for day in (10, 11):
@@ -172,3 +179,64 @@ def test_measured_recheck_cannot_invent_a_change_on_unchanged_id(tmp_path):
     recheck_path.write_text(json.dumps(recheck))
     with pytest.raises(QualificationError, match="actual changed"):
         build_qualification(paths[0], paths[1], tmp_path / "evidence.json", recheck=recheck_path)
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda cohort: cohort.update(scope_basis="configured_denominator", source_current_editions_proven=False, edition_proofs=[]), "source-proven current"),
+    (lambda cohort: cohort["edition_proofs"].pop(), "every qualification scope"),
+    (lambda cohort: cohort["edition_proofs"][0].update(edition_id="2025"), "another edition"),
+    (lambda cohort: cohort["edition_proofs"][0].update(url="https://www.transfermarkt.com/test/startseite/wettbewerb/TEST0/saison_id/2026"), "unforced competition profile"),
+    (lambda cohort: cohort["edition_proofs"][0].update(fetched_at="2026-10-10T11:00:00+00:00"), "after the first observation"),
+])
+def test_configured_or_unproven_editions_never_qualify(tmp_path, change, message):
+    wrapper = qualified_fixture(tmp_path)
+    artifact_path = Path(wrapper["evidence_path"])
+    artifact = json.loads(artifact_path.read_text())
+    for index, link in enumerate(artifact["reports"]):
+        report_path = artifact_path.parent / link["path"]
+        report = json.loads(report_path.read_text())
+        change(report["cohort"])
+        report_path.write_text(json.dumps(report))
+        artifact["reports"][index]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    change(artifact["cohort"])
+    artifact_path.write_text(json.dumps(artifact))
+    wrapper = {"evidence_path": str(artifact_path), "evidence_sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest()}
+    with pytest.raises(QualificationError, match=message):
+        validate_qualification(wrapper)
+
+
+def test_player_absent_on_day2_qualifies_only_with_measured_recheck_of_new_club(tmp_path):
+    wrapper = qualified_fixture(tmp_path)
+    artifact = json.loads(Path(wrapper["evidence_path"]).read_text())
+    day1, day2 = [Path(wrapper["evidence_path"]).parent / link["path"] for link in artifact["reports"]]
+    report = json.loads(day2.read_text())
+    observation = report["qualification_observation"]
+    row = next(item for item in observation["players"] if item["player_id"] == "2")
+    observation["players"].remove(row)
+    observation.update(missing_ids=["2"], counts={"expected": 1000, "compared": 999, "missing": 1, "unknown": 0},
+                       missing_details=[{"player_id": "2", "reason": "absent_from_sampled_club", "sampled_club_ids": ["101"]}])
+    day2.write_text(json.dumps(report))
+    with pytest.raises(QualificationError, match="missing"):
+        build_qualification(day1, day2, tmp_path / "without-recheck.json")
+    moved = deepcopy(row)
+    moved["tmapi"]["clubs"] = ["555"]
+    moved["plus1"]["club_id"] = "555"
+    moved["ceapi"]["transfers"]["club_id"] = "555"
+    moved["raw"]["plus1"]["url"] = "https://www.transfermarkt.com/test/kader/verein/555/plus/1"
+    for proof in moved["raw"].values():
+        proof["fetched_at"] = "2026-10-11T10:05:01+00:00"
+    recheck = {"mode": "recheck", "complete": True, "task_failures": {}, "original_cohort": artifact["cohort"],
+               "selected_changed_ids": ["2"], "unrechecked_changed_ids": [],
+               "qualification_observation": {"schema_version": OBSERVATION_SCHEMA, "players": [moved], "missing_ids": [], "unknown_ids": [],
+                                             "observed_from": "2026-10-11T10:05:00+00:00", "observed_to": "2026-10-11T10:05:03+00:00", "day_msk": "2026-10-11",
+                                             "ceapi_empty_counts": {"mv": 0, "transfers": 0}, "counts": {"expected": 1, "compared": 1, "missing": 0, "unknown": 0}}}
+    recheck_path = tmp_path / "recheck.json"
+    recheck_path.write_text(json.dumps(recheck))
+    qualified = build_qualification(day1, day2, tmp_path / "with-recheck.json", recheck=recheck_path)
+    assert qualified["players_compared"] == 1000
+    assert {"player_id": "2", "field": "clubs"}.items() <= next(change for change in qualified["changed_observations"] if change["player_id"] == "2").items()
+    recheck["selected_changed_ids"] = ["1"]
+    recheck["qualification_observation"]["players"] = [deepcopy(next(item for item in observation["players"] if item["player_id"] == "1"))]
+    recheck_path.write_text(json.dumps(recheck))
+    with pytest.raises(QualificationError, match="bounded original-cohort subset"):
+        build_qualification(day1, day2, tmp_path / "absent-not-rechecked.json", recheck=recheck_path)
