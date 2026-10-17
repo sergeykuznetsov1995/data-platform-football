@@ -3579,3 +3579,129 @@ def test_match_runner_journals_a_refused_event_payload_and_keeps_the_scope(
     assert transport.calls == 0
     assert "sofascore_events" not in saved
     assert again["terminal_endpoints"] == 0
+
+
+def test_signed_match_runner_hands_the_tolerance_to_capture_live_specs(
+    tmp_path,
+    monkeypatch,
+):
+    """#1751 (lesson 60): the production branch — a signed match plan with
+    allocations — reaches ``capture_live_specs`` with the tolerance flag, and
+    the refused event is journaled; dropping the flag fails here."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import live_capture
+    from scrapers.sofascore.workload_plan import (
+        WorkloadBudgetPolicy,
+        WorkloadClassBudget,
+        match_workload_class,
+        production_match_shape,
+        workload_shape_digest,
+    )
+    from scrapers.sofascore.workload_runtime import (
+        PartitionWorkload,
+        build_partitioned_plan,
+    )
+
+    good_match, bad_match = "20000301", "20000302"
+    runtime, transport = _runtime(tmp_path)
+    specs = {
+        (match_id, endpoint): _event_spec(match_id, endpoint)
+        for match_id in (good_match, bad_match)
+        for endpoint in EVENT_PATHS
+    }
+    records = {}
+    for match_id in (good_match, bad_match):
+        records.update(_event_records_for(match_id))
+    payload = json.loads(records[f"{bad_match}:event"]["body"])
+    payload["event"]["season"] = None
+    records[f"{bad_match}:event"]["body"] = json.dumps(payload).encode("utf-8")
+    ingest_prefetched_records(runtime, specs=specs, records=records)
+    # A new runner process: durable raw/manifest state, fresh engine metrics.
+    transport = NoNetworkTransport()
+    runtime = CaptureRuntime(
+        SofaScoreCaptureEngine(
+            raw_store=runtime.raw_store,
+            manifest_store=runtime.manifest_store,
+            transport=transport,
+            run_id="scheduled-refresh-1::targets",
+            task_id="run_refresh_scope",
+            sink=DeferredCaptureSink(),
+            rate_limiter=UnlimitedLimiter(),
+            retry_policy=RetryPolicy(max_attempts=1),
+            max_workers=2,
+        ),
+        runtime.manifest_store,
+        runtime.raw_store,
+    )
+
+    token = "signed-match-control-token-at-least-32-bytes"
+    workload_class = match_workload_class()
+    policy = WorkloadBudgetPolicy("c" * 64, {workload_class: WorkloadClassBudget(
+        workload_class, "match", 25, 10_000_000, ("event",),
+        workload_shape_digest(production_match_shape()),
+    )})
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_refresh_sofascore_all_mens",
+        run_id="scheduled-refresh-1::targets",
+        freshness_keys={"season": "final", "match": "final", "player": "final"},
+        partitions=[PartitionWorkload(
+            "ENG-Premier League", "2526", 17,
+            pending_match_ids=(good_match, bad_match),
+        )],
+        control_token=token,
+    )
+    seen = []
+    real_capture = live_capture.capture_live_specs
+
+    def capture(capture_runtime, batch_specs, **kwargs):
+        # Retained raw only: the real function serves it without a lease.
+        seen.append(kwargs.get("tolerate_schema_error"))
+        return real_capture(capture_runtime, batch_specs, **kwargs)
+
+    monkeypatch.setattr(live_capture, "capture_live_specs", capture)
+    monkeypatch.setattr(
+        runner, "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [good_match, bad_match],
+    )
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    monkeypatch.setattr(
+        runner, "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    _recording_writer_lock(monkeypatch, [])
+    saved = {}
+    scraper = _runner_player_scraper()
+
+    def add_metadata(frame, entity_type):
+        frame = MetadataScraper._add_metadata(frame, entity_type)
+        frame["_ingested_at"] = "2026-09-23T00:00:00Z"
+        return frame
+
+    scraper._add_metadata.side_effect = add_metadata
+
+    def save(**kwargs):
+        saved[kwargs["table_name"]] = kwargs
+        return "iceberg.bronze." + kwargs["table_name"]
+
+    scraper.save_to_iceberg.side_effect = save
+    output = tmp_path / "signed-refused-event.json"
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=plan,
+            workload_allocations=plan.allocations,
+            offline_replay=False,
+        )
+
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 0, result["errors"]
+    assert seen and all(flag is True for flag in seen)
+    assert transport.calls == 0
+    assert set(saved["sofascore_events"]["df"]["match_id"].astype(str)) == {good_match}
+    journal = saved["sofascore_rejected_rows"]["df"]
+    assert journal["reason_code"].tolist() == ["schema_error"]
