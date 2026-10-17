@@ -602,3 +602,55 @@ def test_plan_without_debt_inputs_keeps_composition_and_pins_the_priority_form()
     ]
     assert plan[0].priority == (0, 0, datetime.min, 0, "2025/2026")
     assert plan[2].priority == (0, 1, now - timedelta(hours=24), 0, "2025/2026")
+
+
+def test_parallel_running_season_without_source_flags_is_current():
+    """#1309: 9123 flags 2026/2027 while the 2026 calendar season still runs."""
+    seasons = [
+        SeasonRef(9123, "2026/2027", is_selected=True, is_latest=True, source_order=0),
+        SeasonRef(9123, "2026", source_order=1),
+        SeasonRef(9123, "2025/2026", source_order=2),
+    ]
+    now = datetime(2026, 10, 17, 12)
+    current = plan_seasons(
+        [_classified(9123)], seasons, mode=RunMode.DAILY, lane=ScopeLane.CURRENT, now=now
+    )
+    history = plan_seasons(
+        [_classified(9123)], seasons, mode=RunMode.BACKFILL, lane=ScopeLane.HISTORY, now=now
+    )
+
+    assert {item.identity for item in current} == {
+        (9123, "2026/2027"),
+        (9123, "2026"),
+    }
+    assert all(item.is_latest for item in current)
+    assert [item.identity for item in history] == [(9123, "2025/2026")]
+
+    next_year = plan_seasons(
+        [_classified(9123)],
+        seasons,
+        mode=RunMode.DAILY,
+        lane=ScopeLane.CURRENT,
+        now=datetime(2027, 1, 1, 0, 30),
+    )
+    assert [item.identity for item in next_year] == [(9123, "2026/2027")]
+
+
+@pytest.mark.parametrize(
+    "flagged, previous",
+    [("2026/2027", "2025/2026"), ("2026", "2025"), ("2026 - Apertura", "2025 - Clausura")],
+)
+def test_previous_season_of_an_older_cycle_stays_history(flagged, previous):
+    seasons = [
+        SeasonRef(47, flagged, is_selected=True, source_order=0),
+        SeasonRef(47, previous, source_order=1),
+    ]
+    current = plan_seasons(
+        [_classified(47)],
+        seasons,
+        mode=RunMode.DAILY,
+        lane=ScopeLane.CURRENT,
+        now=datetime(2026, 10, 17, 12),
+    )
+
+    assert [item.identity for item in current] == [(47, flagged)]
