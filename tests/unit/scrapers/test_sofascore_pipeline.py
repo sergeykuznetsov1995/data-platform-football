@@ -3705,3 +3705,45 @@ def test_signed_match_runner_hands_the_tolerance_to_capture_live_specs(
     assert set(saved["sofascore_events"]["df"]["match_id"].astype(str)) == {good_match}
     journal = saved["sofascore_rejected_rows"]["df"]
     assert journal["reason_code"].tolist() == ["schema_error"]
+
+
+def test_match_runner_refusing_every_match_is_red_once_then_quarantined(
+    tmp_path,
+    monkeypatch,
+):
+    """#1751 review: a schema change that refuses EVERY event of the pass is a
+    contract defect — red once; the next pass is a quarantine replay, green."""
+    match_ids = ["20000401", "20000402", "20000403"]
+    runtime, transport = _runtime(tmp_path)
+    specs = {
+        (match_id, endpoint): _event_spec(match_id, endpoint)
+        for match_id in match_ids
+        for endpoint in EVENT_PATHS
+    }
+    records = {}
+    for match_id in match_ids:
+        records.update(_event_records_for(match_id))
+        payload = json.loads(records[f"{match_id}:event"]["body"])
+        payload["event"]["season"] = None
+        records[f"{match_id}:event"]["body"] = json.dumps(payload).encode("utf-8")
+    ingest_prefetched_records(runtime, specs=specs, records=records)
+    from dags.scripts import run_sofascore_scraper as runner
+
+    # The fixture prefetch already recorded the refusal; the first pass models
+    # a fresh capture (nothing quarantined before it).
+    with monkeypatch.context() as fresh:
+        fresh.setattr(runner, "_held_before", lambda record: False)
+        rc, result, saved, _ = _run_match_pass(
+            runtime, match_ids, tmp_path / "all-refused.json", monkeypatch
+        )
+
+    assert rc == 1
+    assert "all 3 matches refused: schema_error" in result["errors"][0]
+    assert "sofascore_events" not in saved
+
+    rc, again, saved, _ = _run_match_pass(
+        runtime, match_ids, tmp_path / "all-refused-again.json", monkeypatch
+    )
+    assert rc == 0, again["errors"]
+    assert transport.calls == 0
+    assert "sofascore_events" not in saved

@@ -644,7 +644,17 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
     # #1751: a source payload the schema validator refused (e.g. an event
     # without ``season``) holds its match like a rejected row instead of
     # failing the scope; the record stays ``schema_error`` and replays from raw.
-    rejected_rows.extend(_schema_error_rows(results, league=league, season=season))
+    refused = _schema_error_rows(results, league=league, season=season)
+    rejected_rows.extend(refused)
+    refused_ids = {str(row.row["match_id"]) for row in refused}
+    if (
+        refused_ids
+        and all_rejected is None
+        and {str(r.manifest.key.target_id) for r in results} <= refused_ids
+    ):
+        # Every match of the pass refused: a source contract change, red once
+        # (then a quarantine replay), never a green pass with no data.
+        all_rejected = f"all {len(refused_ids)} matches refused: schema_error"
     # A match that lost a row (other than a later duplicate) is incomplete:
     # drop it from every frame so no half-written match reaches Bronze. Its
     # manifest stays nonterminal and replays from raw with zero traffic.
