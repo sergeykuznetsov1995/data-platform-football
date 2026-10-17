@@ -343,10 +343,12 @@ def _deadline_order(
     now: float,
     debt_only: bool = False,
 ) -> tuple[str, ...]:
-    """Open deadlines first, nearest first; then the rest in their own order.
+    """Open deadlines first, nearest first; then the debt, the most recently
+    missed deadline first (#1751: an id order re-collected the oldest misses
+    first, so a match cap never reached the fresh ones).
 
     ``debt_only`` is the debt scope of a season whose open matches run in a
-    scope of their own earlier in the batch (#1358/#1359): it keeps the rest.
+    scope of their own earlier in the batch (#1358/#1359): it keeps the debt.
     """
 
     open_ids = [
@@ -355,7 +357,10 @@ def _deadline_order(
     ]
     open_ids.sort(key=lambda match_id: (deadlines[match_id], int(match_id)))
     chosen = set(open_ids)
-    rest = tuple(match_id for match_id in pending if match_id not in chosen)
+    rest = tuple(sorted(
+        (match_id for match_id in pending if match_id not in chosen),
+        key=lambda match_id: (-(deadlines.get(match_id) or 0), int(match_id)),
+    ))
     return rest if debt_only else tuple(open_ids) + rest
 
 

@@ -738,7 +738,8 @@ def plan_refresh_batch(
     """Select a deadline-ordered refresh batch (#1359).
 
     ``pending_partitions`` are ``(league, season, pending_matches,
-    min_open_deadline_ts[, open_deadline_matches])`` rows from Bronze:
+    min_open_deadline_ts[, open_deadline_matches, source_season_id,
+    max_overdue_deadline_ts])`` rows from Bronze:
     ``SS-<id>`` partitions holding finished games that have no complete
     capture yet, with the nearest deadline (match end + 24 h,
     ``scrapers.sofascore.match_deadline``) that has not passed.  Each row is
@@ -750,7 +751,8 @@ def plan_refresh_batch(
     accepted: the refresh lane runs the matches phase from Bronze evidence
     without season pages.  ``deadline`` plans the open-deadline matches first,
     nearest deadline first, then the debt (matches whose deadline has passed)
-    biggest first in what is left of the window — a season with both runs its
+    with the most recently missed deadline first, then the smallest (#1751),
+    in what is left of the window — a season with both runs its
     debt as a second scope (``--debt``, ``SOFASCORE_SCOPE_DEBT_ONLY``) after
     every urgent scope; ``backlog`` plans the debt of the seasons without an open
     deadline alone.  Inside each tier the
@@ -811,7 +813,7 @@ def plan_refresh_batch(
         ):
             index[(capture_key, canonical, _season_id)] = (tournament_id, season)
     candidates: list[
-        tuple[str, str, int, int | None, int, Mapping[str, Any], int, int]
+        tuple[str, str, int, int | None, int, Mapping[str, Any], int, int, int | None]
     ] = []
     for row in pending_partitions:
         league, canonical, count, timestamp = row[:4]
@@ -823,6 +825,7 @@ def plan_refresh_batch(
         if league in configured_keys:
             continue
         native_season = row[5] if len(row) > 5 else None
+        overdue_ts = row[6] if len(row) > 6 else None
         if native_season is not None:
             entry = index.get((league, canonical, int(native_season)))
         else:
@@ -868,11 +871,17 @@ def plan_refresh_batch(
                 season,
                 priority,
                 open_matches,
+                overdue_ts
+                if isinstance(overdue_ts, int) and not isinstance(overdue_ts, bool)
+                else None,
             )
         )
     # #1359: tier 1 — the open-deadline matches of every season that has one,
     # the nearest deadline first; tier 2 — the debt (matches whose deadline has
-    # passed), the biggest first, in what the window has left.  A season's debt
+    # passed), the most recently missed deadline first and then the smallest
+    # (#1751: a biggest-first order let old seasons eat every window while
+    # fresh misses were never re-collected), in what the window has left.
+    # ``backlog`` keeps the biggest first.  A season's debt
     # never overtakes another season's open deadline — otherwise the
     # esoccer-sized debt would eat every window again (Astra #1359, finding 3).
     # The debt of a season that also has open deadlines is its own ``debt``
@@ -888,7 +897,11 @@ def plan_refresh_batch(
             item for item in candidates
             if item[2] > item[7] and (queue_mode == "deadline" or item[3] is None)
         ),
-        key=lambda item: (item[6], -(item[2] - item[7]), item[0], item[1], int(item[5]["source_season_id"])),
+        key=lambda item: (
+            (item[6], -(item[8] or 0), item[2] - item[7])
+            if queue_mode == "deadline"
+            else (item[6], -(item[2] - item[7]))
+        ) + (item[0], item[1], int(item[5]["source_season_id"])),
     )
     entries: list[tuple[tuple, str, int]] = []
     opened: set[tuple[str, str, int]] = set()
@@ -961,7 +974,7 @@ def plan_refresh_batch(
 
     planned: list[dict[str, str]] = []
     for item, part, matches in entries:
-        _league, _canonical, _count, _ts, tournament_id, season, _p, _open = item
+        _league, _canonical, _count, _ts, tournament_id, season, _p, _open, _overdue = item
         estimate = matches * seconds_per_match + REFRESH_SCOPE_OVERHEAD_SECONDS
         timeout = min(
             REFRESH_MAX_SCOPE_TIMEOUT_SECONDS,

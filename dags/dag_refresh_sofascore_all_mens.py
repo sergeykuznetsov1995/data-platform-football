@@ -191,7 +191,9 @@ SELECT p.league, p.season,
        min(CASE WHEN p.deadline >= to_unixtime(current_timestamp)
                 THEN CAST(p.deadline AS bigint) END) AS min_open_deadline_ts,
        count_if(p.deadline >= to_unixtime(current_timestamp))
-           AS open_deadline_matches, p.source_season_id
+           AS open_deadline_matches, p.source_season_id,
+       max(CASE WHEN p.deadline < to_unixtime(current_timestamp)
+                THEN CAST(p.deadline AS bigint) END) AS max_overdue_deadline_ts
 FROM (
     SELECT DISTINCT s.league, CAST(s.season AS varchar) AS season, s.game_id,
            CAST(s.season_id AS bigint) AS source_season_id,
@@ -211,7 +213,7 @@ GROUP BY 1, 2, 6
 """
 
 
-def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int, int]]:
+def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int, int, int | None]]:
     """Query at task runtime; no Trino client is touched at DAG parse."""
 
     from utils.silver_tasks import _get_trino_connection
@@ -228,8 +230,10 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None, int, 
                 int(deadline) if deadline is not None else None,
                 int(open_matches or 0),
                 int(source_season_id),
+                int(overdue) if overdue is not None else None,
             )
-            for league, season, count, deadline, open_matches, source_season_id in cursor.fetchall()
+            for league, season, count, deadline, open_matches, source_season_id, overdue
+            in cursor.fetchall()
         ]
     finally:
         conn.close()
@@ -314,7 +318,8 @@ def _capture_refresh_evidence(context, snapshot, rows, planned, stage, observed_
                 "snapshot_id": snapshot["snapshot_id"], "campaign_id": snapshot["campaign_id"],
                 "logical_date": dag_run.logical_date.isoformat(),
                 "started_at": dag_run.start_date.isoformat()}
-    document = planning_snapshot(identity, rows, selected,
+    # #1751: the evidence keeps its six-column census shape.
+    document = planning_snapshot(identity, [tuple(r[:6]) for r in rows], selected,
         core_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 1],
         daily_ids=daily, excluded_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 0],
         disputed_ids=[k for k, r in denominator.rows.items() if r.queue_priority == 9],
