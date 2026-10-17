@@ -3525,3 +3525,57 @@ def test_nonterminal_2xx_cannot_vote_in_availability_threshold(status):
     assert result['observed_matches']==19
     assert result['threshold_met'] is False
     assert result['control_http_status']=={'100':None}
+
+
+def test_match_runner_journals_a_refused_event_payload_and_keeps_the_scope(
+    tmp_path,
+    monkeypatch,
+):
+    """#1751: an event the source sent without ``season`` (13972308, HTTP 200)
+    is a ``schema_error``; it holds its match in the rejects journal instead of
+    failing the whole refresh scope, and replays from raw with zero traffic."""
+    good_match = "20000201"
+    bad_match = "20000202"
+    runtime, transport = _runtime(tmp_path)
+    specs = {
+        (match_id, endpoint): _event_spec(match_id, endpoint)
+        for match_id in (good_match, bad_match)
+        for endpoint in EVENT_PATHS
+    }
+    records = {}
+    for match_id in (good_match, bad_match):
+        records.update(_event_records_for(match_id))
+    payload = json.loads(records[f"{bad_match}:event"]["body"])
+    payload["event"]["season"] = None
+    records[f"{bad_match}:event"]["body"] = json.dumps(payload).encode("utf-8")
+    ingest_prefetched_records(runtime, specs=specs, records=records)
+
+    rc, result, saved, _ = _run_match_pass(
+        runtime, [good_match, bad_match], tmp_path / "refused-event.json", monkeypatch
+    )
+
+    assert rc == 0, result["errors"]
+    assert transport.calls == 0
+    assert set(saved["sofascore_events"]["df"]["match_id"].astype(str)) == {good_match}
+    assert bad_match not in set(saved["sofascore_lineups"]["df"]["match_id"].astype(str))
+    journal = saved["sofascore_rejected_rows"]["df"]
+    refused = journal[journal["reason_code"] == "schema_error"]
+    assert refused["table_name"].tolist() == ["bronze.sofascore_events"]
+    assert json.loads(refused.iloc[0]["row_json"])["match_id"] == bad_match
+    assert result["matches_complete"] == 1
+    assert result["rejected_endpoints"] == len(EVENT_PATHS)
+    assert result["terminal_endpoints"] == len(EVENT_PATHS)
+    event = runtime.manifest_store.get(specs[(bad_match, "event")].key)
+    assert event.status == ManifestStatus.SCHEMA_ERROR
+    for endpoint in EVENT_PATHS:
+        committed = runtime.manifest_store.get(specs[(good_match, endpoint)].key)
+        assert committed.is_terminal
+
+    # The next pass replays only the held match and stays green.
+    rc, again, saved, _ = _run_match_pass(
+        runtime, [bad_match], tmp_path / "refused-event-again.json", monkeypatch
+    )
+    assert rc == 0, again["errors"]
+    assert transport.calls == 0
+    assert "sofascore_events" not in saved
+    assert again["terminal_endpoints"] == 0

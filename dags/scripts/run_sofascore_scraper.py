@@ -641,6 +641,10 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
                     if position not in report.rejected_indices
                 ]
                 frames[dataset] = frame.iloc[keep]
+    # #1751: a source payload the schema validator refused (e.g. an event
+    # without ``season``) holds its match like a rejected row instead of
+    # failing the scope; the record stays ``schema_error`` and replays from raw.
+    rejected_rows.extend(_schema_error_rows(results, league=league, season=season))
     # A match that lost a row (other than a later duplicate) is incomplete:
     # drop it from every frame so no half-written match reaches Bronze. Its
     # manifest stays nonterminal and replays from raw with zero traffic.
@@ -689,6 +693,67 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
 
 
 _ROW_REJECTED_ERROR = "RowRejected"
+
+_ENDPOINT_TABLES = {
+    "event": "bronze.sofascore_events",
+    "lineups": "bronze.sofascore_lineups",
+    "statistics": "bronze.sofascore_match_stats",
+    "shotmap": "bronze.sofascore_event_shotmap",
+    "incidents": "bronze.sofascore_incidents",
+}
+
+
+def _schema_error_rows(results, *, league: str, season: str):
+    """Journal match endpoints the schema validator refused (#1751)."""
+    from dags.utils.sofascore_dq import RejectedRow
+    from scrapers.sofascore.manifest import ManifestStatus
+
+    rows = []
+    for result in results:
+        manifest = result.manifest
+        if (
+            manifest.status != ManifestStatus.SCHEMA_ERROR
+            or manifest.error_type == _ROW_REJECTED_ERROR
+        ):
+            continue
+        key = manifest.key
+        rows.append(
+            RejectedRow(
+                row={
+                    "match_id": key.target_id,
+                    "endpoint": key.endpoint,
+                    "source_tournament_id": key.source_tournament_id,
+                    "source_season_id": key.source_season_id,
+                    "freshness_key": key.freshness_key,
+                    "error_type": manifest.error_type,
+                    "raw_blob_key": manifest.raw_blob_key,
+                },
+                table=_ENDPOINT_TABLES.get(
+                    key.endpoint, f"bronze.sofascore_{key.endpoint}"
+                ),
+                code="schema_error",
+                message=str(manifest.error_message or manifest.error_type or ""),
+                natural_key=f"{league}|{season}|{key.target_id}|{key.endpoint}",
+            )
+        )
+    return rows
+
+
+def _held_before(record) -> bool:
+    if record is None:
+        return False
+    return record.error_type == _ROW_REJECTED_ERROR or (
+        record.status.value == "schema_error"
+    )
+
+
+def _journaled_result(result, rejected_match_ids) -> bool:
+    """A result held back by a rejected row or a refused payload (#1352/#1751)."""
+    manifest = result.manifest
+    return manifest.error_type == _ROW_REJECTED_ERROR or (
+        manifest.status.value == "schema_error"
+        and manifest.key.target_id in rejected_match_ids
+    )
 
 
 def _hold_rejected_matches(pipeline_results, rejected_match_ids, rejected_rows):
@@ -1309,10 +1374,7 @@ def _run_match_capture(
             target
             for (target, _endpoint), spec in endpoint_specs.items()
             if target in endpoint_plan
-            and getattr(
-                capture_runtime.manifest_store.get(spec.key), "error_type", None
-            )
-            == _ROW_REJECTED_ERROR
+            and _held_before(capture_runtime.manifest_store.get(spec.key))
         )
         total = len(match_ids)
         match_ids = [
@@ -1405,6 +1467,7 @@ def _run_match_capture(
                         canonical_url=canonical_url,
                         scope=f"{league}:{season_short}",
                         entity=ENTITY_MATCH_CAPTURE,
+                        tolerate_schema_error=True,
                     )
                 else:
                     remaining_specs = {spec.key: spec for spec in live_specs}
@@ -1439,6 +1502,7 @@ def _run_match_capture(
                                 canonical_url=canonical_url,
                                 scope=f"{league}:{season_short}",
                                 entity=ENTITY_MATCH_CAPTURE,
+                                tolerate_schema_error=True,
                                 workload_plan=workload_plan,
                                 allocation_id=allocation.allocation_id,
                                 attempt_id=(
@@ -1902,7 +1966,7 @@ def _run_match_capture(
                     [
                         result
                         for result in pipeline_results
-                        if result.manifest.error_type != _ROW_REJECTED_ERROR
+                        if not _journaled_result(result, rejected_match_ids)
                     ],
                 )
                 # The commit-verification below must read durable state, not
@@ -1923,7 +1987,7 @@ def _run_match_capture(
                             f"manifest commit missing for {key.stable_id()}"
                         )
                     final_counts[committed.status.value] += 1
-                    if result.manifest.error_type == _ROW_REJECTED_ERROR:
+                    if _journaled_result(result, rejected_match_ids):
                         # Held back by a rejected row: journaled, not missing.
                         continue
                     observations.append(
@@ -1954,7 +2018,13 @@ def _run_match_capture(
                 # Journaled instead of published (#1352): not terminal, so
                 # endpoint_completeness stays honest (120/125 -> 0.96).
                 results.update(
-                    _endpoint_closure(len(pipeline_results), len(held_records))
+                    _endpoint_closure(
+                        len(pipeline_results),
+                        sum(
+                            _journaled_result(result, rejected_match_ids)
+                            for result in pipeline_results
+                        ),
+                    )
                 )
                 completeness = results["endpoint_completeness"]
                 results["traffic"]["endpoint_completeness"] = completeness
