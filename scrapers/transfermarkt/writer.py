@@ -154,6 +154,11 @@ class TransfermarktTrinoManager(TrinoTableManager):
             # The ops registry uses UTC timestamp(6). Never let the generic
             # default TIMESTAMP precision round an immutable microsecond clock.
             types['first_seen_at'] = 'TIMESTAMP(6)'
+        from scrapers.transfermarkt.scraper import SQUAD_DATE_COLUMNS
+        for column in SQUAD_DATE_COLUMNS:
+            if types.get(column) == 'VARCHAR':
+                # An all-NULL first batch arrives as an Arrow null column.
+                types[column] = 'DATE'
         return types
 
     def _execute(self, sql, fetch=False, params=None):

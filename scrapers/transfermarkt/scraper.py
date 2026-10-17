@@ -315,20 +315,19 @@ def _parse_tm_money_eur(raw) -> Optional[int]:
     return int(num * Decimal(_TM_MONEY_UNITS[unit]))
 
 
-_HEIGHT_RE = re.compile(r'(\d+[,.]\d+)\s*m')
+# The squad table is typed by hand: besides ``1,89m`` / ``1.89 m`` / ``1,8m``
+# it carries ``1'87m``, ``1:78m`` and a low-9 quote ``1‚83m``.
+_HEIGHT_RE = re.compile(r"(\d)\s*[,.':\u201a]\s*(\d{1,2})\s*m")
 
 
 def _parse_height_cm(raw) -> Optional[int]:
-    """``'1,89 m'`` / ``'1.89m'`` → ``189``."""
+    """``'1,89 m'`` / ``'1.89m'`` / ``"1'89m"`` → ``189``; ``'1,8m'`` → ``180``."""
     if not raw:
         return None
     m = _HEIGHT_RE.search(str(raw))
     if not m:
         return None
-    try:
-        return int(float(m.group(1).replace(',', '.')) * 100)
-    except ValueError:
-        return None
+    return int(m.group(1)) * 100 + int(m.group(2).ljust(2, '0'))
 
 
 # .com renders dates day-first ('17/08/1993'); .us renders them as 'Aug 17, 1993'.
@@ -577,9 +576,73 @@ _SQUAD_HEADER_FIELDS = {
     'height': 'height_cm',
     'foot': 'foot',
     'contract': 'contract_until',
+    'joined': 'joined_at',
+    'signed from': 'signed_from',
 }
 
 _AGE_IN_PARENS_RE = re.compile(r'\((\d+)\)\s*$')
+
+# Squad-context fields of one player at one club in one season — the
+# ``squad_memberships`` payload read from the same `/plus/1` row.
+SQUAD_CONTEXT_FIELDS = (
+    'shirt_number', 'joined_at', 'signed_from_club_id', 'signed_from_club_name',
+    'signed_from_fee_text', 'signed_from_fee_eur', 'is_on_loan',
+    'loan_from_club_id', 'loan_from_club_name', 'loan_until', 'is_captain',
+    'injury_text', 'injury_return_date', 'nationality_secondary',
+)
+# A flag TM renders for an unknown country; it is not a nationality.
+_NATIONALITY_PLACEHOLDERS = frozenset({'', '-', 'n/a'})
+_VEREIN_ID_RE = re.compile(r'/verein/(\d+)')
+# `Signed from` link title: ``"<club>: Ablöse <fee>"`` (German word even on .com).
+_SIGNED_FROM_TITLE_RE = re.compile(r'^(?P<club>.*?)\s*:\s*Ablöse\s*(?P<fee>.*)$', re.S)
+_LOAN_TITLE_RE = re.compile(
+    r'^On loan from\s+(?P<club>.+?)(?:\s+until\s+(?P<until>\S+))?\s*$', re.S)
+_INJURY_TITLE_RE = re.compile(
+    r'^(?P<text>.*?)\s+-\s+Return(?:\s+expected\s+on\s+(?P<back>\S+))?', re.S)
+
+
+def _parse_signed_from(td) -> Dict:
+    """`Signed from` cell → origin club id/name and the stated fee."""
+    out = {'signed_from_club_id': None, 'signed_from_club_name': None,
+           'signed_from_fee_text': None, 'signed_from_fee_eur': None}
+    a = td.find('a', href=True)
+    img = td.find('img')
+    if a is not None:
+        m = _VEREIN_ID_RE.search(a['href'])
+        out['signed_from_club_id'] = m.group(1) if m else None
+    title = ((a.get('title') if a is not None else None) or '').strip()
+    m = _SIGNED_FROM_TITLE_RE.match(title)
+    name = m.group('club') if m else ((img.get('title') or img.get('alt')) if img else None)
+    out['signed_from_club_name'] = (name or '').strip() or None
+    fee = m.group('fee').strip() if m else ''
+    if fee:
+        out['signed_from_fee_text'] = fee
+        if fee.lower() == 'free transfer':
+            out['signed_from_fee_eur'] = 0
+        else:
+            try:
+                out['signed_from_fee_eur'] = _parse_tm_money_eur(fee)
+            except MoneyLocaleError:
+                out['signed_from_fee_eur'] = None
+    return out
+
+
+def _parse_loan_marker(tr) -> Optional[Dict]:
+    """``On loan from <club> until <date>`` badge next to the player's name.
+
+    Past-season pages reuse the same badge for ``Returned after loan spell…``;
+    that is a departure note, not a loan.
+    """
+    for span in tr.find_all('span', {'class': 'wechsel-kader-wappen'}):
+        a = span.find('a', href=True)
+        m = _LOAN_TITLE_RE.match(((a.get('title') if a else None) or '').strip())
+        if not m:
+            continue
+        club = _VEREIN_ID_RE.search(a['href'])
+        return {'loan_from_club_id': club.group(1) if club else None,
+                'loan_from_club_name': m.group('club').strip() or None,
+                'loan_until': _parse_tm_date(m.group('until'))}
+    return None
 
 
 def _squad_page_is_empty_roster(soup) -> bool:
@@ -623,6 +686,10 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
     proxy) is gone. Bio cells are read via ``_SQUAD_HEADER_FIELDS``; a page
     without the expected headers degrades to the stable core fields
     (id, slug, name, market_value_eur) with bio fields ``None``.
+
+    The same row also yields ``SQUAD_CONTEXT_FIELDS`` (#1406): shirt number,
+    Joined / Signed from, the loan / captain / injury badges of the name cell
+    and a second nationality flag.
     """
     from bs4 import BeautifulSoup
 
@@ -646,6 +713,7 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
             for i, h in enumerate(headers)
             if h in _SQUAD_HEADER_FIELDS
         }
+    club_view = 'signed_from' in col_fields.values()
 
     players: List[Dict] = []
     seen: set = set()
@@ -692,7 +760,28 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
             'foot': None,
             'nationality': None,
             'contract_until': None,
+            **dict.fromkeys(SQUAD_CONTEXT_FIELDS),
         }
+
+        # Shirt number (`#` column, no header text): a number or `-`.
+        rn = tr.find('div', {'class': 'rn_nummer'})
+        rn_text = rn.get_text(strip=True) if rn else ''
+        row['shirt_number'] = int(rn_text) if rn_text.isdigit() else None
+
+        # Name-cell badges. A club page (it has `Signed from`) states loan
+        # status for every row; a national-team page does not.
+        if club_view:
+            loan = _parse_loan_marker(tr)
+            row['is_on_loan'] = loan is not None
+            row.update(loan or {})
+        row['is_captain'] = tr.find('span', {'class': 'kapitaenicon-table'}) is not None
+        injury = tr.find('span', {'class': 'verletzt-table'})
+        if injury is not None:
+            m = _INJURY_TITLE_RE.match((injury.get('title') or '').strip())
+            row['injury_text'] = (
+                m.group('text') if m else (injury.get('title') or '')
+            ).strip() or None
+            row['injury_return_date'] = _parse_tm_date(m.group('back')) if m else None
 
         # Position: second row of the inline name/position table.
         pos_td = tr.find('td', {'class': 'posrela'})
@@ -715,17 +804,25 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
                     age_m = _AGE_IN_PARENS_RE.search(text)
                     row['age'] = int(age_m.group(1)) if age_m else None
                 elif field == 'nationality':
-                    img = td.find('img')
-                    row['nationality'] = (
-                        (img.get('title') or img.get('alt') or '').strip() or None
-                        if img else None
-                    )
+                    flags = [
+                        name for name in (
+                            (img.get('title') or img.get('alt') or '').strip()
+                            for img in td.find_all('img')
+                        )
+                        if name.lower() not in _NATIONALITY_PLACEHOLDERS
+                    ]
+                    row['nationality'] = flags[0] if flags else None
+                    row['nationality_secondary'] = flags[1] if len(flags) > 1 else None
                 elif field == 'height_cm':
                     row['height_cm'] = _parse_height_cm(text)
                 elif field == 'foot':
                     row['foot'] = text.lower() if text not in ('', '-') else None
                 elif field == 'contract_until':
                     row['contract_until'] = _parse_tm_date(text)
+                elif field == 'joined_at':
+                    row['joined_at'] = _parse_tm_date(text)
+                elif field == 'signed_from':
+                    row.update(_parse_signed_from(td))
 
         players.append(row)
     return players
@@ -1186,7 +1283,7 @@ _DEFAULT_REQUEST_ATTEMPT_BUDGET = {
 SQUAD_MEMBERSHIP_COLUMNS = [
     'competition_id', 'edition_id', 'league', 'season', 'club_id', 'club_slug',
     'club_name', 'player_id', 'player_slug', 'player_name', 'observed_at',
-    *_SCOPE_LINEAGE_COLUMNS,
+    *_SCOPE_LINEAGE_COLUMNS, *SQUAD_CONTEXT_FIELDS,
 ]
 PLAYER_ATTRIBUTE_OBSERVATION_COLUMNS = [
     'player_id', 'player_slug', 'name', 'position', 'dob', 'age', 'height_cm',
@@ -1241,8 +1338,12 @@ LEGACY_COACH_COLUMNS = [
 
 _NULLABLE_INTEGER_COLUMNS = {
     'age', 'height_cm', 'market_value_eur', 'value_eur', 'fee_eur',
+    'shirt_number', 'signed_from_fee_eur',
 }
-_NULLABLE_BOOLEAN_COLUMNS = {'is_upcoming'}
+_NULLABLE_BOOLEAN_COLUMNS = {'is_upcoming', 'is_on_loan', 'is_captain'}
+# Added after the tables existed: a first batch where one is all-NULL must not
+# evolve the column as VARCHAR (Arrow types an all-None object column as null).
+SQUAD_DATE_COLUMNS = ('joined_at', 'loan_until', 'injury_return_date')
 
 
 def _apply_nullable_dtypes(frame: pd.DataFrame) -> pd.DataFrame:
@@ -2817,6 +2918,7 @@ class TransfermarktScraper(BaseScraper):
                 'player_name': sp.get('name'),
                 'observed_at': observed_at,
                 **lineage,
+                **{field: sp.get(field) for field in SQUAD_CONTEXT_FIELDS},
             })
             observation_rows.append({
                 'player_id': sp['player_id'],

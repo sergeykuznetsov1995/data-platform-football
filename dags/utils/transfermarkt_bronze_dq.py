@@ -211,7 +211,11 @@ NATIVE_PAYLOAD_COLUMNS = {
     # capture timestamps — that is repetition, not two truths.
     'iceberg.bronze.transfermarkt_squad_memberships': (
         'league', 'season', 'club_slug', 'club_name', 'player_slug',
-        'player_name',
+        'player_name', 'shirt_number', 'joined_at', 'signed_from_club_id',
+        'signed_from_club_name', 'signed_from_fee_text', 'signed_from_fee_eur',
+        'is_on_loan', 'loan_from_club_id', 'loan_from_club_name', 'loan_until',
+        'is_captain', 'injury_text', 'injury_return_date',
+        'nationality_secondary',
     ),
     'iceberg.bronze.transfermarkt_player_attribute_observations': (
         'player_slug', 'name', 'position', 'dob', 'age', 'height_cm',
