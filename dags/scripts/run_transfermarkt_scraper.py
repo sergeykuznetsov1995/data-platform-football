@@ -30,6 +30,8 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
+
 from dags.utils.transfermarkt_dq_contracts import (
     ScopeDQError,
     input_from_capture,
@@ -3064,7 +3066,9 @@ def _canonical_cell(value: Any) -> str:
             return _CARRY_FORWARD_NULL
     except (TypeError, ValueError):
         pass
-    if isinstance(value, bool):
+    # A nullable ``boolean`` frame column yields ``numpy.bool_``, which is not
+    # a ``bool``; Trino returns a Python ``bool`` for the same fact.
+    if isinstance(value, (bool, np.bool_)):
         return 'true' if value else 'false'
     if isinstance(value, datetime):
         return value.date().isoformat()
