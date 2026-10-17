@@ -81,6 +81,24 @@ _KNOWN_SEASON_ALIASES = {
 }
 
 
+# #1751: the gateway answers 409 ``lease_close_pending`` while it still reads
+# the provider tail behind the last request; the counters settle within the
+# latched-slot grace (30 s).  A run that wrote its rows lost the whole refresh
+# to that race (12.10, twice).  Any other refusal keeps the conservative charge.
+_CLOSE_PENDING_DELAYS_S = (2, 5, 10, 20)
+
+
+def _close_settled(provider: Any, lease: Any, sleeper: Callable[[float], None]) -> Any:
+    for delay in (*_CLOSE_PENDING_DELAYS_S, None):
+        try:
+            return provider.close(lease)
+        except Exception as exc:
+            if delay is None or getattr(exc, "code", "") != "lease_close_pending":
+                raise
+        sleeper(delay)
+    raise AssertionError("unreachable")
+
+
 class DiscoveryError(RuntimeError):
     """Base error for a discovery run that must not update the registry."""
 
@@ -622,7 +640,7 @@ class LeaseProxySofaScoreClient:
         if lease is None:
             return
         try:
-            snapshot = self._provider.close(lease)
+            snapshot = _close_settled(self._provider, lease, self._sleeper)
         except Exception as exc:
             # Unmeasured paid traffic is never assumed to be zero: charge the
             # whole lease allowance and let the caller decide to stop.
@@ -893,7 +911,7 @@ class LeaseBrowserSofaScoreClient:
         if lease is None:
             return
         try:
-            snapshot = self._provider.close(lease)
+            snapshot = _close_settled(self._provider, lease, self._sleeper)
         except Exception as exc:
             self._paid_proxy_bytes += int(getattr(lease, "max_bytes", 0) or 0)
             self._accounting_status = "unresolved_close"
