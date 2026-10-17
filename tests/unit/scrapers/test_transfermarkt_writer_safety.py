@@ -129,6 +129,8 @@ def test_stale_capture_refuses_bundle_before_first_save():
 
 
 def test_dq_detects_physical_keys_across_batches_and_latest_reference_loss():
+    assert set(dq.CAREER_WRITE_TABLE_KEYS) == {'iceberg.bronze.transfermarkt_market_value_points',
+                                               'iceberg.bronze.transfermarkt_transfer_events'}
     for table in dq.CAREER_WRITE_TABLE_KEYS:
         sql = dq.build_career_write_duplicates_sql(table)
         assert 'HAVING COUNT(*) > 1' in sql and '_batch_id' not in sql
