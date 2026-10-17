@@ -606,8 +606,8 @@ def test_target_phase_cuts_the_plan_to_the_scope_match_ceiling(
 
 
 def test_a_capped_scope_spends_its_window_on_open_deadlines_first():
-    # #1359: open deadlines (not yet passed), nearest first; then the rest in
-    # their own (id) order — the slice keeps the matches that can still make it.
+    # #1359: open deadlines (not yet passed), nearest first; then the rest —
+    # the slice keeps the matches that can still make it.
     from dags.scripts import prepare_sofascore_workload as workload
 
     now = 1_000_000
@@ -621,8 +621,26 @@ def test_a_capped_scope_spends_its_window_on_open_deadlines_first():
 
     ordered = workload._deadline_order(("1", "2", "3", "4", "5"), deadlines, now)
 
-    assert ordered == ("4", "2", "1", "3", "5")
+    # #1751: then the debt, the most recently missed deadline first; a match
+    # without a deadline last.
+    assert ordered == ("4", "2", "1", "5", "3")
     assert workload._cap_pending_matches(ordered, 2) == ("4", "2")
+
+
+def test_a_debt_scope_recollects_the_freshest_miss_first():
+    """#1751: an id-ordered debt re-collected the oldest misses first, so a
+    match cap never reached the fresh ones."""
+    from dags.scripts import prepare_sofascore_workload as workload
+
+    now = 1_000_000
+    deadlines = {"10": now - 90_000, "11": now - 500, "12": None, "13": now - 40_000}
+
+    ordered = workload._deadline_order(
+        ("10", "11", "12", "13"), deadlines, now, debt_only=True
+    )
+
+    assert ordered == ("11", "13", "10", "12")
+    assert workload._cap_pending_matches(ordered, 1) == ("11",)
 
 
 def test_scope_match_ceiling_is_absent_outside_the_refresh_lane(monkeypatch):

@@ -511,8 +511,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
 
         def fetchall(self):
             return [
-                ("SS-17", "2627", 12, 1_787_788_800, 5, 76986),
-                ("SS-8", 2026, 3, None, 0, 98037),
+                ("SS-17", "2627", 12, 1_787_788_800, 5, 76986, 1_787_700_000),
+                ("SS-8", 2026, 3, None, 0, 98037, None),
             ]
 
     class _Connection:
@@ -532,8 +532,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     partitions = module._pending_refresh_partitions()
 
     assert partitions == [
-        ("SS-17", "2627", 12, 1_787_788_800, 5, 76986),
-        ("SS-8", "2026", 3, None, 0, 98037),
+        ("SS-17", "2627", 12, 1_787_788_800, 5, 76986, 1_787_700_000),
+        ("SS-8", "2026", 3, None, 0, 98037, None),
     ]
     assert connection.closed is True
     sql = executed[0]
@@ -556,6 +556,11 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     ) in normalized_sql
     assert "AS open_deadline_matches" in normalized_sql
     assert "count(*) AS pending_matches" in normalized_sql
+    # #1751: the most recently missed deadline orders the debt.
+    assert (
+        "max(CASE WHEN p.deadline < to_unixtime(current_timestamp) "
+        "THEN CAST(p.deadline AS bigint) END) AS max_overdue_deadline_ts"
+    ) in normalized_sql
 
 
 def _refresh_env(result_path, scope_key="c:8:825"):

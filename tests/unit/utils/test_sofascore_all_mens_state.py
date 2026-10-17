@@ -1360,21 +1360,47 @@ def test_refresh_queue_one_urgent_match_does_not_carry_its_seasons_debt_ahead():
 
 
 @pytest.mark.unit
-def test_refresh_queue_debt_goes_biggest_first_after_every_open_deadline():
+def test_refresh_queue_debt_goes_freshest_miss_first_after_every_open_deadline():
     planned = _window_plan([
-        (*_refresh_pending("SS-8", "2627", 60, 1_787_900_001), 10),
-        (*_refresh_pending("SS-17", "2526", 90, None), 0),
-        (*_refresh_pending("SS-17", "2627", 101, 1_787_900_002), 1),
+        (*_refresh_pending("SS-8", "2627", 60, 1_787_900_001), 10, 826, 1_787_000_300),
+        (*_refresh_pending("SS-17", "2526", 90, None), 0, 1725, 1_786_000_000),
+        (*_refresh_pending("SS-17", "2627", 101, 1_787_900_002), 1, 1726, 1_787_000_100),
     ])
 
-    # Tier 1: the open matches of both open seasons; tier 2: the debts,
-    # the biggest first — every debt that fits the window is taken.
+    # Tier 1: the open matches of both open seasons; tier 2: the debts, the
+    # most recently missed deadline first (#1751) — the old big season last.
     assert _parts(planned) == [
         ("campaign-test:8:826", False, 10),
         ("campaign-test:17:1726", False, 1),
+        ("campaign-test:8:826", True, 50),
         ("campaign-test:17:1726", True, 100),
         ("campaign-test:17:1725", False, 90),
-        ("campaign-test:8:826", True, 50),
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_queue_debt_with_the_same_miss_goes_smallest_first():
+    planned = _window_plan([
+        (*_refresh_pending("SS-17", "2526", 90, None), 0, 1725, 1_787_000_000),
+        (*_refresh_pending("SS-8", "2627", 5, None), 0, 826, 1_787_000_000),
+    ])
+
+    assert _parts(planned) == [
+        ("campaign-test:8:826", False, 5),
+        ("campaign-test:17:1725", False, 90),
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_backlog_debt_still_goes_biggest_first():
+    planned = _window_plan([
+        (*_refresh_pending("SS-8", "2627", 5, None), 0, 826, 1_787_000_300),
+        (*_refresh_pending("SS-17", "2526", 90, None), 0, 1725, 1_786_000_000),
+    ], queue_mode="backlog")
+
+    assert _parts(planned) == [
+        ("campaign-test:17:1725", False, 90),
+        ("campaign-test:8:826", False, 5),
     ]
 
 

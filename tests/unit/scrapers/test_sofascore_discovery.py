@@ -1138,6 +1138,69 @@ def test_browser_final_close_failure_is_reported_and_conservatively_billed():
 
 
 @pytest.mark.unit
+def test_browser_final_close_waits_for_the_gateway_to_settle_its_counters():
+    """#1751: a 409 ``lease_close_pending`` is a counter race, not lost
+    accounting — the close is asked again and the exact bytes are billed."""
+    from scrapers.sofascore.lease_client import SofascoreLeaseRejected
+
+    class SettlingProvider(_BrowserLeaseProvider):
+        attempts = 0
+
+        def close(self, lease):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise SofascoreLeaseRejected(
+                    "counters are not final", status_code=409,
+                    code="lease_close_pending",
+                )
+            return super().close(lease)
+
+    provider = SettlingProvider()
+    client, _, _ = _browser_client(
+        [{"status": 200, "json": {"seasons": []}, "challenge": False, "body": b"{}"}],
+        lease_provider=provider,
+        per_lease_max_bytes=8_388_608,
+    )
+    client.get_json("/unique-tournament/8/seasons")
+
+    client.close()
+
+    assert provider.attempts == 3
+    assert client.stats["paid_proxy_bytes"] == 4096
+    assert client.stats["accounting_status"] == "verified"
+
+
+@pytest.mark.unit
+def test_browser_close_that_never_settles_keeps_the_conservative_charge():
+    from scrapers.sofascore.lease_client import SofascoreLeaseRejected
+
+    class PendingProvider(_BrowserLeaseProvider):
+        attempts = 0
+
+        def close(self, lease):
+            self.attempts += 1
+            raise SofascoreLeaseRejected(
+                "counters are not final", status_code=409,
+                code="lease_close_pending",
+            )
+
+    provider = PendingProvider()
+    client, _, _ = _browser_client(
+        [{"status": 200, "json": {"seasons": []}, "challenge": False, "body": b"{}"}],
+        lease_provider=provider,
+        per_lease_max_bytes=4096,
+    )
+    client.get_json("/unique-tournament/8/seasons")
+
+    with pytest.raises(DiscoveryError, match="did not close cleanly"):
+        client.close()
+
+    assert provider.attempts == 5
+    assert client.stats["paid_proxy_bytes"] == 4096
+    assert client.stats["accounting_status"] == "unresolved_close"
+
+
+@pytest.mark.unit
 def test_browser_lease_transport_retries_with_a_new_lease_and_no_direct_fallback():
     client, provider, captures = _browser_client([
         None,
