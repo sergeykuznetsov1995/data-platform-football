@@ -243,7 +243,10 @@ def test_lost_response_retries_do_not_duplicate_rows(fixture):
 
     def fail_after_commit(sql):
         result = original(sql)
-        if sql.startswith(("DELETE ", "INSERT ")):
+        # Lost response after the atomic statement on the target table itself.
+        if sql.startswith("DELETE ") or (
+            sql.startswith("INSERT ") and " SELECT " in sql
+        ):
             raise OSError("response lost after atomic commit")
         return result
 
@@ -310,3 +313,34 @@ def test_rollback_restores_null_and_quoted_cells(fixture):
     repair.execute(db, path, mode="apply", writers_quiesced=True)
     repair.execute(db, path, mode="rollback", writers_quiesced=True)
     assert db.rows() == before
+
+
+def test_statements_stay_under_trino_text_limit_for_many_rows(fixture, monkeypatch):
+    """#1288: 2 752 full-row predicates made a 5.5 MB DELETE (Trino limit 1 MB)."""
+    db, manifest, directory = fixture
+    entry = manifest["targets"][0]["provenance"][0]
+    for index in range(200):
+        batch = f"old-batch-{index:03d}"
+        manifest["targets"][0]["provenance"].append({**entry, "batch_id": batch})
+        db.add("2025", batch, entry["sha256"], entry["raw_uri"], note="x" * 50)
+    before = db.rows()
+    path = directory / "plan.json"
+    repair.save_plan(path, plan(fixture))
+    monkeypatch.setattr(repair, "MAX_VALUES_TEXT", 2_000)
+
+    assert repair.execute(db, path, mode="apply", writers_quiesced=True) == "applied"
+    delete = [sql for sql in db.writes if sql.startswith("DELETE ")]
+    assert len(delete) == 1 and len(delete[0]) < 500
+    assert [row[1] for row in db.rows()] == ["2024", "2025 - Apertura", "2025 - Clausura"]
+
+    db.writes.clear()
+    assert (
+        repair.execute(db, path, mode="rollback", writers_quiesced=True) == "restored"
+    )
+    staged = [sql for sql in db.writes if " VALUES " in sql]
+    assert len(staged) > 1
+    assert all(len(sql) < 2_000 + 1_000 for sql in staged)
+    assert sorted(db.rows()) == sorted(before)
+    assert not db.connection.execute(
+        "SELECT name FROM bronze.sqlite_master WHERE name LIKE '%rollback%'"
+    ).fetchall()

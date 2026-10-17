@@ -21,6 +21,9 @@ from scrapers.fotmob.catalog import SEASONS_PARSER_VERSION, parse_seasons
 TABLE = "fotmob_competition_seasons"
 LIMITS = {337: 17, 335: 12, 274: 11, 230: 9}
 FORMAT = "fotmob-1231-repair-v1"
+# Trino rejects query text over 1 000 000 characters (QUERY_TEXT_TOO_LARGE).
+MAX_VALUES_TEXT = 500_000
+ROLLBACK_STAGING_SUFFIX = "__repair_1231_rollback"
 SCALAR_TYPE = re.compile(
     r"(?:varchar(?:\(\d+\))?|char\(\d+\)|boolean|bigint|integer|smallint|tinyint|"
     r"double|real|decimal\(\d+,\s*\d+\)|date|timestamp(?:\(\d+\))?(?: with time zone)?)\Z"
@@ -268,8 +271,29 @@ def save_plan(path: Path, plan: dict) -> None:
         os.close(directory_fd)
 
 
+def _value_batches(plan: dict) -> list[str]:
+    tuples = [
+        "("
+        + ", ".join(
+            f"CAST({_literal(cell)} AS {kind})"
+            for (_, kind), cell in zip(plan["columns"], row)
+        )
+        + ")"
+        for row in plan["rows"]
+    ]
+    batches: list[list[str]] = [[]]
+    size = 0
+    for item in tuples:
+        if batches[-1] and size + len(item) > MAX_VALUES_TEXT:
+            batches.append([])
+            size = 0
+        batches[-1].append(item)
+        size += len(item) + 2
+    return [", ".join(batch) for batch in batches if batch]
+
+
 def execute(client: Any, path: Path, *, mode: str, writers_quiesced: bool) -> str:
-    """One atomic Iceberg DML statement; repeat safely after uncertain client result."""
+    """One atomic target DML statement; repeat safely after uncertain client result."""
     if mode not in {"apply", "rollback"}:
         raise ValueError("explicit apply or rollback required")
     if not writers_quiesced:
@@ -289,18 +313,12 @@ def execute(client: Any, path: Path, *, mode: str, writers_quiesced: bool) -> st
         _check_current(client, plan)
         if not before:
             return "already_applied"
-        # Full-row predicates protect every backed-up value; the external maintenance
-        # window is still mandatory because Iceberg has no cross-query transaction.
-        predicates = [
-            "("
-            + " AND ".join(
-                f"CAST({_ident(name)} AS VARCHAR) IS NOT DISTINCT FROM {_literal(value)}"
-                for (name, _), value in zip(plan["columns"], row)
-            )
-            + ")"
-            for row in plan["rows"]
-        ]
-        client.query(f"DELETE FROM {_table(plan)} WHERE " + " OR ".join(predicates))
+        # The full physical set of the target keys was just proven equal to the
+        # reviewed backup, so one DELETE by exact keys removes exactly those rows.
+        # Full-row predicates exceeded Trino's 1 MB query text limit (#1288). The
+        # external maintenance window is still mandatory: Iceberg has no
+        # cross-query transaction.
+        client.query(f"DELETE FROM {_table(plan)} WHERE {_key_where(plan['targets'])}")
         if _rows(client, plan):
             raise ValueError(
                 "apply postcondition failed; preserve backup and keep writers quiesced"
@@ -309,16 +327,26 @@ def execute(client: Any, path: Path, *, mode: str, writers_quiesced: bool) -> st
     if before:
         return "already_restored"
     columns = ", ".join(_ident(name) for name, _ in plan["columns"])
-    values = ", ".join(
-        "("
-        + ", ".join(
-            f"CAST({_literal(cell)} AS {kind})"
-            for (_, kind), cell in zip(plan["columns"], row)
-        )
-        + ")"
-        for row in plan["rows"]
+    # Batched VALUES fill a staging copy (each INSERT stays under Trino's query
+    # text limit); one INSERT ... SELECT then restores the target atomically.
+    staging = _table(plan, ROLLBACK_STAGING_SUFFIX)
+    client.query(f"DROP TABLE IF EXISTS {staging}")
+    client.query(f"CREATE TABLE {staging} AS SELECT * FROM {_table(plan)} WHERE 1 = 0")
+    for batch in _value_batches(plan):
+        client.query(f"INSERT INTO {staging} ({columns}) VALUES {batch}")
+    projection = ", ".join(
+        f"CAST({_ident(name)} AS VARCHAR)" for name, _ in plan["columns"]
     )
-    client.query(f"INSERT INTO {_table(plan)} ({columns}) VALUES {values}")
+    staged = sorted(
+        (list(row) for row in client.query(f"SELECT {projection} FROM {staging}")),
+        key=_json,
+    )
+    if staged != plan["rows"]:
+        raise ValueError("rollback staging differs from backup; target untouched")
+    client.query(
+        f"INSERT INTO {_table(plan)} ({columns}) SELECT {columns} FROM {staging}"
+    )
+    client.query(f"DROP TABLE IF EXISTS {staging}")
     if _rows(client, plan) != plan["rows"]:
         raise ValueError(
             "rollback postcondition failed; preserve backup and keep writers quiesced"
