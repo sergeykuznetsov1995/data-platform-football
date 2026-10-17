@@ -150,7 +150,7 @@ def test_automatic_history_advances_after_the_newest_cycle_is_complete():
     assert [item.identity for item in plan] == [(49, "2023/2024")]
 
 
-def test_automatic_history_retry_in_newest_cycle_blocks_older_cycles():
+def test_automatic_history_waiting_retry_does_not_block_older_cycles():
     now = datetime(2026, 8, 23, 10)
     attempts = {
         (47, "2024/2025"): ScopeAttemptState(
@@ -175,7 +175,22 @@ def test_automatic_history_retry_in_newest_cycle_blocks_older_cycles():
         attempt_states=attempts,
         now=now,
     )
-    assert plan == []
+    # #1292: скоуп, ждущий повтора, не держит старший цикл.
+    assert [item.identity for item in plan] == [(49, "2023/2024")]
+
+    due = plan_seasons(
+        [_classified(47), _classified(49)],
+        [
+            SeasonRef(47, "2024/2025", source_order=1),
+            SeasonRef(49, "2023/2024", source_order=2),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+        attempt_states=attempts,
+        now=now + timedelta(hours=2),
+    )
+    # Повтор наступил — новейший цикл снова впереди.
+    assert [item.identity for item in due] == [(47, "2024/2025")]
 
 
 def test_explicit_history_scopes_are_not_reduced_to_one_cycle():
@@ -283,7 +298,7 @@ def test_terminal_scope_returns_to_the_plan_after_ttl():
     assert [item.competition_id for item in plan] == [48, 47]
 
 
-def test_fresh_terminal_in_newest_history_cycle_blocks_older_cycles():
+def test_fresh_terminal_in_newest_history_cycle_does_not_block_older_cycles():
     now = datetime(2026, 8, 23, 10)
     plan = plan_seasons(
         [_classified(47), _classified(49)],
@@ -301,7 +316,7 @@ def test_fresh_terminal_in_newest_history_cycle_blocks_older_cycles():
         now=now,
     )
 
-    assert plan == []
+    assert [item.identity for item in plan] == [(49, "2023/2024")]
 
 
 def test_expired_terminal_is_runnable_in_newest_history_cycle():
