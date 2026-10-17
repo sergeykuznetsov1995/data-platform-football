@@ -247,17 +247,55 @@ def _season_recency_key(season: SeasonRef) -> int:
     return 0
 
 
-def _is_current_season(season: SeasonRef) -> bool:
+def _season_start_year(source_season_key: str) -> Optional[int]:
+    match = re.search(r"(?<!\d)([12]\d{3})(?!\d)", str(source_season_key))
+    return int(match.group(1)) if match else None
+
+
+def _parallel_current_identities(
+    seasons: Iterable[SeasonRef], current_year: int
+) -> set[tuple[int, str]]:
+    """Unflagged seasons that still run beside the source-flagged one (#1309).
+
+    A competition running two parallel seasons keeps the source flags on only
+    one of them (9123: ``2026/2027`` flagged while ``2026`` runs to November).
+    The season right after the flagged one in source order whose start year is
+    neither older than the flagged season's nor than the current UTC year is
+    treated as current too; a finished one drops out on 1 January. No extra
+    reads: only the catalog already parsed for this wave is used.
+    """
+
+    seasons = list(seasons)
+    flagged_start: dict[int, int] = {}
+    for season in seasons:
+        if season.is_selected or season.is_latest:
+            year = _season_start_year(season.source_season_key)
+            if year is not None:
+                flagged_start[season.competition_id] = max(
+                    year, flagged_start.get(season.competition_id, year)
+                )
+    parallel = set()
+    for season in seasons:
+        if season.is_selected or season.is_latest or season.source_order != 1:
+            continue
+        year = _season_start_year(season.source_season_key)
+        floor = flagged_start.get(season.competition_id)
+        if year is not None and floor is not None and year >= max(floor, current_year):
+            parallel.add(season.identity)
+    return parallel
+
+
+def _is_current_season(
+    season: SeasonRef, parallel: set[tuple[int, str]] = frozenset()
+) -> bool:
     """Is this scope part of the source-current lane?
 
     One definition for the lane filters, the order rank and the work item, so
-    they cannot drift apart.  A competition running two parallel seasons keeps
-    the source flags on only one of them, so the other silently leaves the
-    current lane — that is a separate defect with its own issue, not a
-    predicate this planner can decide on its own.
+    they cannot drift apart.  Source flags, plus the parallel running season
+    from ``_parallel_current_identities``.
     """
 
-    return bool(season.is_selected or season.is_latest)
+    return bool(season.is_selected or season.is_latest or season.identity in parallel)
 
 
 def _history_season_cycle_key(source_season_key: str) -> tuple[int, str]:
@@ -308,6 +346,8 @@ def _plan_seasons(
     if observed_now.tzinfo is not None:
         observed_now = observed_now.astimezone(timezone.utc).replace(tzinfo=None)
 
+    seasons = list(seasons)
+    parallel = _parallel_current_identities(seasons, observed_now.year)
     candidates: list[tuple[SeasonRef, ScopeAttemptState | None]] = []
     seen: set[tuple[int, str]] = set()
     for season in seasons:
@@ -319,7 +359,7 @@ def _plan_seasons(
             continue
         if requested is not None and identity not in requested:
             continue
-        is_current = _is_current_season(season)
+        is_current = _is_current_season(season, parallel)
         if lane == ScopeLane.CURRENT and not is_current:
             continue
         if lane == ScopeLane.HISTORY:
@@ -381,7 +421,7 @@ def _plan_seasons(
 
     output: list[SeasonWorkItem] = []
     for season, attempt in candidates:
-        is_current = _is_current_season(season)
+        is_current = _is_current_season(season, parallel)
         active_rank = 0 if is_current else 1
         recency = _season_recency_key(season)
         reason = "active_or_latest" if active_rank == 0 else "historical_backfill"
