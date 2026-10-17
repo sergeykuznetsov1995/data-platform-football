@@ -254,3 +254,19 @@ def test_pending_prewrite_anchor_protects_compaction_retention_gap(monkeypatch):
     result = maintenance._maintain_one(MagicMock(), 'iceberg.bronze.transfermarkt_transfer_events', '30d')
     assert result['retention_skipped'] and result['protected_receipt_count'] == 1
     execute.assert_not_called()
+
+
+def test_squad_context_columns_keep_types_when_a_batch_is_all_null():
+    # #1406 adds the columns to live tables: whichever batch writes first may
+    # carry no loan, no injury and no known number at all.
+    from scrapers.transfermarkt import scraper as tm
+    from scrapers.transfermarkt.writer import TransfermarktIcebergWriter, TransfermarktTrinoManager
+
+    row = {column: None for column in tm.SQUAD_MEMBERSHIP_COLUMNS}
+    row.update({'competition_id': 'GB1', 'edition_id': '2026', 'club_id': '11', 'player_id': '1'})
+    frame = tm._with_metadata([row], tm.SQUAD_MEMBERSHIP_COLUMNS, entity_type='squad_memberships', batch_id='b')
+    types = TransfermarktTrinoManager().arrow_schema_to_trino(TransfermarktIcebergWriter()._pandas_to_arrow(frame).schema)
+    assert {column: types[column] for column in ('shirt_number', 'signed_from_fee_eur')} == {
+        'shirt_number': 'BIGINT', 'signed_from_fee_eur': 'BIGINT'}
+    assert types['is_on_loan'] == types['is_captain'] == 'BOOLEAN'
+    assert {types[column] for column in tm.SQUAD_DATE_COLUMNS} == {'DATE'}

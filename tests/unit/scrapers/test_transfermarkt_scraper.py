@@ -89,6 +89,11 @@ class TestParseHeightCm:
         ('1,89 m', 189),
         ('1.89m', 189),
         ('1,96 m', 196),
+        ("1'87m", 187),
+        ('1:78m', 178),
+        ('1.80 m', 180),
+        ('1,8m', 180),
+        ('1\u201a83m', 183),
         ('', None),
         (None, None),
         ('N/A', None),
@@ -371,6 +376,159 @@ class TestParseSquadPageBio:
         assert len(players) == 1
         assert players[0]['player_id'] == '262749'
         assert players[0]['dob'] is None
+
+
+class TestParseSquadPageContext:
+    """Squad-context fields from the same `/plus/1` row (#1406).
+
+    Markup as served on transfermarkt.com (raw captures 2026-10): the number
+    sits in ``div.rn_nummer``; loan / captain / injury are badges in the name
+    cell; `Signed from` states club and fee in the link title.
+    """
+
+    _CLUB_HEADERS = [
+        '#', 'Player', 'Date of birth/Age', 'Nat.', 'Height', 'Foot',
+        'Joined', 'Signed from', 'Contract', 'Market value',
+    ]
+    _NATIONAL_HEADERS = [
+        '#', 'Player', 'Date of birth/Age', 'Club', 'Height', 'Foot',
+        'International matches', 'Goals', 'Debut', 'Market value',
+    ]
+
+    @staticmethod
+    def _player_td(badges: str = '') -> str:
+        return (
+            f'<td class="posrela">{badges}<table class="inline-table">'
+            '<tr><td class="hauptlink">'
+            '<a href="/agustin-rossi/profil/spieler/352324">Agustín Rossi</a>'
+            '</td></tr><tr><td>Goalkeeper</td></tr></table></td>'
+        )
+
+    @staticmethod
+    def _signed_from(title: str) -> str:
+        return (
+            '<td class="zentriert"><a href="/club-atletico-boca-juniors/'
+            f'startseite/verein/189/saison_id/2023" title="{title}">'
+            '<img alt="CA Boca Juniors" title="CA Boca Juniors"/></a></td>'
+        )
+
+    def _club_row(self, number='1', badges='', nat='<img title="Argentina"/>',
+                  signed='CA Boca Juniors: Ablöse free transfer'):
+        return (
+            f'<td class="zentriert rueckennummer"><div class="rn_nummer">{number}</div></td>'
+            + self._player_td(badges)
+            + '<td class="zentriert">21/08/1995 (31)</td>'
+            f'<td class="zentriert">{nat}</td>'
+            '<td class="zentriert">1,93m</td><td class="zentriert">right</td>'
+            '<td class="zentriert">01/07/2023</td>'
+            + self._signed_from(signed)
+            + '<td class="zentriert">31/12/2027</td>'
+            '<td class="rechts hauptlink"><a>€10.00m</a></td>'
+        )
+
+    def _parse(self, headers, cells):
+        return _parse_squad_page(
+            TestParseSquadPageBio._html(headers, cells), club_id='614',
+        )[0]
+
+    def test_club_row_reads_every_context_field(self):
+        badges = (
+            '<span class="wechsel-kader-wappen hide-for-small"><a title="On loan'
+            ' from Al-Ettifaq FC until 30/06/2027" href="/al-ettifaq-fc/'
+            'kadernaechstesaison/verein/7732/saison_id/2026"><img title='
+            '"Al-Ettifaq FC"/></a></span>'
+            '<span class="kapitaenicon-table icons_sprite" title="Team captain"></span>'
+            '<span class="verletzt-table icons_sprite" title="Cruciate ligament'
+            ' tear - Return expected on 31/12/2026"></span>'
+        )
+        p = self._parse(self._CLUB_HEADERS, self._club_row(
+            badges=badges,
+            nat='<img title="Argentina"/><br/><img title="Italy"/>',
+            signed='CA Boca Juniors: Ablöse €7.00m',
+        ))
+        assert p['shirt_number'] == 1
+        assert p['nationality'] == 'Argentina'
+        assert p['nationality_secondary'] == 'Italy'
+        assert p['joined_at'] == date(2023, 7, 1)
+        assert p['signed_from_club_id'] == '189'
+        assert p['signed_from_club_name'] == 'CA Boca Juniors'
+        assert p['signed_from_fee_text'] == '€7.00m'
+        assert p['signed_from_fee_eur'] == 7_000_000
+        assert p['is_on_loan'] is True
+        assert p['loan_from_club_id'] == '7732'
+        assert p['loan_from_club_name'] == 'Al-Ettifaq FC'
+        assert p['loan_until'] == date(2027, 6, 30)
+        assert p['is_captain'] is True
+        assert p['injury_text'] == 'Cruciate ligament tear'
+        assert p['injury_return_date'] == date(2026, 12, 31)
+        assert p['contract_until'] == date(2027, 12, 31)
+
+    def test_club_row_without_badges_states_false(self):
+        p = self._parse(self._CLUB_HEADERS, self._club_row())
+        assert p['is_on_loan'] is False
+        assert p['is_captain'] is False
+        assert p['loan_from_club_id'] is None and p['loan_until'] is None
+        assert p['injury_text'] is None and p['injury_return_date'] is None
+        assert p['nationality_secondary'] is None
+        assert p['signed_from_fee_text'] == 'free transfer'
+        assert p['signed_from_fee_eur'] == 0
+
+    def test_returned_after_loan_is_not_a_loan(self):
+        badges = (
+            '<span class="wechsel-kader-wappen hide-for-small"><a href="/vipers-sc/'
+            'startseite/verein/29757/saison_id/2025" title="Returned after loan'
+            ' spell with Vipers SC; date: 30/06/2026; fee: End of loan">'
+            '<img title="Vipers SC"/></a></span>'
+        )
+        p = self._parse(self._CLUB_HEADERS, self._club_row(badges=badges))
+        assert p['is_on_loan'] is False
+        assert p['loan_from_club_name'] is None
+
+    @pytest.mark.parametrize('fee,text,eur', [
+        ('?', '?', None),
+        ('-', '-', None),
+        ('€130k', '€130k', 130_000),
+        ('$2.00m', '$2.00m', None),
+    ])
+    def test_unknown_and_foreign_fees_keep_text_only(self, fee, text, eur):
+        p = self._parse(self._CLUB_HEADERS, self._club_row(
+            signed=f'CA Boca Juniors : Ablöse {fee}'))
+        assert p['signed_from_club_name'] == 'CA Boca Juniors'
+        assert p['signed_from_fee_text'] == text
+        assert p['signed_from_fee_eur'] == eur
+
+    def test_unknown_number_and_placeholder_flag_are_null(self):
+        p = self._parse(self._CLUB_HEADERS, self._club_row(
+            number='-', nat='<img title="N/A"/>'))
+        assert p['shirt_number'] is None
+        assert p['nationality'] is None
+        assert p['nationality_secondary'] is None
+
+    def test_injury_with_unknown_return(self):
+        badges = ('<span class="verletzt-table icons_sprite" title="Hamstring'
+                  ' injury - Return unknown"></span>')
+        p = self._parse(self._CLUB_HEADERS, self._club_row(badges=badges))
+        assert p['injury_text'] == 'Hamstring injury'
+        assert p['injury_return_date'] is None
+
+    def test_national_team_page_leaves_club_fields_unknown(self):
+        cells = (
+            '<td class="zentriert rueckennummer"><div class="rn_nummer">12</div></td>'
+            + self._player_td(
+                '<span class="kapitaenicon-table icons_sprite" title="Team captain"></span>')
+            + '<td class="zentriert">21/08/1995 (31)</td>'
+            '<td class="zentriert"><img title="Flamengo"/></td>'
+            '<td class="zentriert">1,93m</td><td class="zentriert">right</td>'
+            '<td class="zentriert">5</td><td class="zentriert">0</td>'
+            '<td class="zentriert">01/06/2021</td>'
+            '<td class="rechts hauptlink"><a>€10.00m</a></td>'
+        )
+        p = self._parse(self._NATIONAL_HEADERS, cells)
+        assert p['shirt_number'] == 12
+        assert p['is_captain'] is True
+        assert p['is_on_loan'] is None
+        assert p['joined_at'] is None
+        assert p['signed_from_club_id'] is None
 
 
 # ---------------------------------------------------------------------------

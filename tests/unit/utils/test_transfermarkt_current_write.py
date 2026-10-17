@@ -555,6 +555,45 @@ def test_baseline_verifier_rejects_tampered_recovery_and_ops_receipts(scraper):
         current.verify_current_roster_baseline(scraper, old, [receipt], PREFLIGHT)
 
 
+def _pre_1406_receipt(scraper, monkeypatch, original):
+    # The membership contract as it stood before the squad-context columns.
+    old_columns = [c for c in tm.SQUAD_MEMBERSHIP_COLUMNS if c not in tm.SQUAD_CONTEXT_FIELDS]
+    with monkeypatch.context() as patch:
+        patch.setattr(tm, 'SQUAD_MEMBERSHIP_COLUMNS', old_columns)
+        receipt = current.write_current_roster(scraper, original, PREFLIGHT, 'pre-1406')
+    assert set(receipt['outputs']['memberships']['columns']).isdisjoint(tm.SQUAD_CONTEXT_FIELDS)
+    return receipt
+
+
+def test_baseline_verifier_accepts_receipt_that_predates_squad_context_columns(scraper, monkeypatch):
+    original = snapshot(changed=('10', '20'))
+    receipt = _pre_1406_receipt(scraper, monkeypatch, original)
+    assert current.verify_current_roster_baseline(scraper, committed(original, receipt), [receipt], PREFLIGHT)['verified']
+
+
+def test_baseline_verifier_rejects_context_values_an_old_receipt_never_covered(scraper, monkeypatch):
+    original = snapshot(changed=('10', '20'))
+    receipt = _pre_1406_receipt(scraper, monkeypatch, original)
+    old = committed(original, receipt)
+    row = {**old.clubs['20'].rows[0], 'shirt_number': 7}
+    fake = replace(old, clubs={**dict(old.clubs), '20': replace(old.clubs['20'], rows=(row,))})
+    with pytest.raises(current.CurrentWriteError, match='columns differ from contract'):
+        current.verify_current_roster_baseline(scraper, fake, [receipt], PREFLIGHT)
+
+
+def test_roster_memberships_carry_squad_context_fields(scraper):
+    original = snapshot(changed=('10', '20'))
+    row = {**original.clubs['10'].rows[0], 'shirt_number': 9, 'joined_at': '2024-07-01',
+           'is_captain': True, 'is_on_loan': False}
+    original = replace(original, clubs={**dict(original.clubs), '10': replace(original.clubs['10'], rows=(row,))})
+    receipt = current.write_current_roster(scraper, original, PREFLIGHT, 'current-1406')
+    memberships = _table(scraper, 'transfermarkt_squad_memberships').set_index('club_id')
+    assert str(memberships.loc['10', 'shirt_number']) == '9'
+    assert memberships.loc['10', 'joined_at'] == '2024-07-01'
+    assert pd.isna(memberships.loc['20', 'shirt_number'])
+    assert current.verify_current_roster_baseline(scraper, committed(original, receipt), [receipt], PREFLIGHT)['verified']
+
+
 def test_baseline_verifier_detects_old_source_timestamp_changed_within_day(scraper):
     original = snapshot(changed=('10', '20'))
     receipt = current.write_current_roster(scraper, original, PREFLIGHT, 'same-cycle')

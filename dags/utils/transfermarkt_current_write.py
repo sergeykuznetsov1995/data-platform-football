@@ -320,13 +320,26 @@ def _commit(scraper, spec, frames, scope, mode, revision, cycle_id, *, empty_ids
             attest_career_manifest(scraper, receipt)
         return receipt, frames
 
+# Membership columns added after receipts already existed (#1406).  A receipt
+# that predates them never covered them: they may be absent from it only while
+# the rebuilt rows also lack them (all NULL — the retained snapshot predates them).
+_LATE_ROSTER_COLUMNS = frozenset(tm.SQUAD_CONTEXT_FIELDS)
+
+
+def _receipt_columns(proof_columns, frame):
+    late = set(frame.columns) - set(proof_columns)
+    if not late <= _LATE_ROSTER_COLUMNS or frame[sorted(late)].notna().any().any():
+        raise CurrentWriteError('retained output physical columns differ from contract')
+    return [column for column in frame.columns if column in proof_columns]
+
+
 def _roster_frames(scraper, snapshot, scope, cycle_id):
     now = _stamp(getattr(scraper, '_current_roster_write_at', None) or datetime.now(timezone.utc))
     retained_stamps = _retained_roster_stamps(scraper, snapshot, scope)
     memberships, observations, contracts = [], [], []
     for row in snapshot.rows:
         row = dict(row)
-        for column in ('dob', 'contract_until'):
+        for column in ('dob', 'contract_until', *tm.SQUAD_DATE_COLUMNS):
             value = row.get(column)
             if value is not None:
                 try:
@@ -345,7 +358,8 @@ def _roster_frames(scraper, snapshot, scope, cycle_id):
             'league': scope['compatibility_league'], 'season': scope['canonical_season'],
             'club_id': str(row['club_id']), 'player_id': str(row['player_id']), 'observed_at': observed_at, **lineage}
         memberships.append({**common, 'club_slug': row.get('club_slug'), 'club_name': row.get('current_club_name'),
-                            'player_slug': row['player_slug'], 'player_name': row['name']})
+                            'player_slug': row['player_slug'], 'player_name': row['name'],
+                            **{field: row.get(field) for field in tm.SQUAD_CONTEXT_FIELDS}})
         observations.append({**row, **common, 'club_name': row.get('current_club_name')})
         if scope['record'].team_type.value == 'club':
             contracts.append({**lineage, 'competition_id': scope['competition_id'], 'edition_id': scope['edition_id'],
@@ -851,10 +865,9 @@ def verify_current_roster_baseline(scraper, snapshot: FullRosterSnapshot, receip
         else:
             predicate, params = 'competition_id = ? AND edition_id = ?', [scope['competition_id'], scope['edition_id']]
         try:
-            proof_columns = proof.get('columns', list(frame.columns))
+            proof_columns = proof.get('columns', [column for column in frame.columns if column not in _LATE_ROSTER_COLUMNS])
             if (not isinstance(proof_columns, list) or len(proof_columns) != len(set(proof_columns))
-                    or set(proof_columns) - set(frame.columns) - {'first_seen_at'}
-                    or not set(frame.columns) <= set(proof_columns)):
+                    or set(proof_columns) - set(frame.columns) - {'first_seen_at'}):
                 raise CurrentWriteError('retained output physical columns differ from contract')
             physical = run._query_dataframe(conn, f'SELECT {", ".join(proof_columns)} FROM {proof["table"]} WHERE {predicate}', params)
         except Exception as exc:
@@ -862,10 +875,11 @@ def verify_current_roster_baseline(scraper, snapshot: FullRosterSnapshot, receip
                 physical = frame
             else:
                 raise CurrentWriteError('retained full-roster output is unavailable') from exc
+        covered = _receipt_columns(proof_columns, frame)
         digest = hashlib.sha256(json.dumps(_rows(physical), sort_keys=True).encode()).hexdigest()
         if len(physical) != proof['rows'] or digest != proof['physical_hash']:
             raise CurrentWriteError('retained full-roster physical checksum differs')
-        columns = [column for column in frame.columns if column not in {'observed_at', '_ingested_at', '_batch_id', 'first_seen_at'}]
+        columns = [column for column in covered if column not in {'observed_at', '_ingested_at', '_batch_id', 'first_seen_at'}]
         if _rows(physical[columns]) != _rows(frame[columns]):
             raise CurrentWriteError('recovery roster business/lineage differs from committed physical rows')
         verified[output.key] = dict(proof)
