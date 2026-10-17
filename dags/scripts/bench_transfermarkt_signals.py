@@ -9,6 +9,9 @@ Probe: --mode probe --ids 8198,28003 --evidence-dir /evidence/probe
 Cohort: --mode cohort --sample /evidence/cohort-template.json --evidence-dir /evidence/cohort
 Parity: --mode parity --sample /evidence/cohort/cohort-sample.json
         --evidence-dir /evidence/day1
+Cohort also GETs each scope's unforced competition profile: the source, not the
+denominator TSV, proves the current edition. Parity ends with closing tmapi
+packets so a reference update landing mid-day is matched the same day.
 Repeat the same parity command for the next <=45 minute portion. Different
 observations share --experiment-dir (default evidence-dir.parent); budgets apply
 across portions AND days. An interrupted process fails closed on resume.
@@ -25,7 +28,7 @@ from contextlib import contextmanager
 import signal
 
 import argparse
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -53,6 +56,10 @@ MAX_PORTION_SECONDS = 45 * 60
 MEASUREMENT_DAG_ID = "dag_discover_transfermarkt_registry"
 COUNTERS = ("request_attempts", "provider_metered_bytes", "decoded_response_body_bytes")
 GROUPS = {"top_league", "lower_league", "calendar", "cup"}
+# Club 26645 (ASCQ/2026) answered both cohort GETs of 09.10 with an AWS WAF
+# challenge; the owner barred any further request to it (#1393, D3).
+BLOCKED_CLUB_IDS = frozenset({"26645"})
+MSK = ZoneInfo("Europe/Moscow")
 
 
 class ProbeGateError(ValueError):
@@ -96,9 +103,14 @@ def recheck_sample(baseline: dict, current: dict, limit: int = 64):
     """A bounded measured repeat of actual changed IDs; never manufactures one."""
     before = {row["player_id"]: row for row in baseline["qualification_observation"]["players"]}
     after = {row["player_id"]: row for row in current["qualification_observation"]["players"]}
-    if set(before) != set(after) or baseline["cohort"] != current["cohort"]:
+    # A player who left the sampled club is a real roster change: recheck him
+    # first, against the full page of the club the detector now reports.
+    absent = {row["player_id"]: row for row in current["qualification_observation"].get("missing_details", [])}
+    if set(before) != set(after) | set(absent) or set(after) & set(absent) or baseline["cohort"] != current["cohort"]:
         raise ProbeGateError("recheck needs the same exact measured cohort")
-    changed = [player for player in sorted(before, key=int) if before[player]["tmapi"] != after[player]["tmapi"]]
+    after = {**after, **absent}
+    changed = sorted(absent, key=int) + [player for player in sorted(before, key=int)
+                                         if player not in absent and before[player]["tmapi"] != after[player]["tmapi"]]
     selected = changed[:limit]
     clubs = {}
     scope = baseline["cohort"]["scopes"][0]
@@ -129,9 +141,11 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
     clubs = sample.get("clubs")
     if not isinstance(clubs, list) or not clubs:
         raise ProbeGateError("sample needs explicit current clubs")
-    tasks, players, groups, seen_clubs, participant_tasks = [], [], set(), set(), {}
+    tasks, players, groups, seen_clubs, participant_tasks, edition_tasks = [], [], set(), set(), {}, {}
     for club in clubs:
         club_id = _id(club["club_id"])
+        if club_id in BLOCKED_CLUB_IDS:
+            raise ProbeGateError(f"club {club_id} is barred from source requests")
         season = int(club["saison_id"])
         if not 1800 <= season <= 2199 or not str(club.get("scope", "")).strip():
             raise ProbeGateError("sample needs valid saison_id and scope")
@@ -141,8 +155,17 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
             scope = str(club["scope"])
             parts = scope.split("/")
             row = load_denominator().row(parts[0]) if len(parts) == 2 else None
-            if not row or not row.is_core or parts[1] != str(season) or row.current_saison_id != season:
-                raise ProbeGateError("cohort template scope is not a live current denominator edition")
+            if not row or not row.is_core or parts[1] != str(season):
+                raise ProbeGateError("cohort template scope is not a live core denominator competition")
+            # Currentness comes from the source's own competition profile, not
+            # from the configured denominator season (kept only as a cross-check).
+            kind = "pokalwettbewerb" if row.route == "pokal" else "wettbewerb"
+            edition_tasks.setdefault(scope, {
+                "key": f"edition/{scope}", "kind": "edition", "scope": scope,
+                "competition_id": parts[0], "saison_id": season, "json": False,
+                "denominator_saison_id": row.current_saison_id,
+                "url": f"https://www.transfermarkt.com/competition/startseite/{kind}/{parts[0]}",
+            })
             participant_tasks.setdefault(scope, {
                 "key": f"participants/{scope}", "kind": "participants", "scope": scope,
                 "competition_id": parts[0], "saison_id": season, "json": True,
@@ -171,7 +194,7 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
                       "scope": club["scope"], "ids": ids, "json": False,
                       "url": url, "groups": list(club.get("groups", [])), "saison_id": season})
     if roster_only:
-        return list(participant_tasks.values()) + tasks, players, groups
+        return list(edition_tasks.values()) + list(participant_tasks.values()) + tasks, players, groups
     players = list(dict.fromkeys(players))
     for offset in range(0, len(players), 300):
         ids = players[offset:offset + 300]
@@ -182,6 +205,12 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
             tasks.append({"key": f"{kind}/{player}", "kind": kind, "player_id": player,
                           "scope": "parity/careers", "json": True,
                           "url": f"https://www.transfermarkt.com/ceapi/{path}/{player}"})
+    # Closing packets re-read the detector after every reference of the day: a
+    # source update landing mid-observation must be matched the same day.
+    for offset in range(0, len(players), 300):
+        ids = players[offset:offset + 300]
+        tasks.append({"key": f"players-closing/{offset}", "kind": "players_closing", "ids": ids,
+                      "scope": "parity/players-closing", "json": True, "url": player_url(ids)})
     return tasks, players, groups
 
 
@@ -194,7 +223,8 @@ def cohort_report(tasks, results, store, *, player_target=1000, min_scopes=20):
     from bs4 import BeautifulSoup
     from scrapers.transfermarkt.scraper import _parse_squad_page
     from scrapers.transfermarkt.tmapi import parse_competition_clubs, TmapiSchemaError
-    candidates, notes, participants, membership_errors = [], [], {}, []
+    from scrapers.transfermarkt.discovery import DiscoverySchemaError, _selector_options
+    candidates, notes, participants, membership_errors, editions = [], [], {}, [], {}
     for task in tasks:
         if task["key"] not in results:
             membership_errors.append({"scope": task["scope"], "reason": "task_raw_not_proven", "key": task["key"]})
@@ -203,6 +233,27 @@ def cohort_report(tasks, results, store, *, player_target=1000, min_scopes=20):
         body, record = store.load_capture(results[task["key"]]["raw_capture_id"])
         if record.url != task["url"] or record.status_code != 200:
             raise ProbeGateError("cohort raw identity mismatch")
+        if task["kind"] == "edition":
+            try:
+                options = _selector_options(BeautifulSoup(body.decode("utf-8"), "html.parser"), profile_url=record.url)
+                selected = next(edition for edition, _label, chosen, _attrs in options if chosen)
+            except (DiscoverySchemaError, UnicodeDecodeError):
+                selected = None
+            note = {"scope": task["scope"], "kind": "edition", "source_selected_edition_id": selected,
+                    "denominator_saison_id": task["denominator_saison_id"],
+                    "raw_capture_id": record.capture_id, "raw_fetched_at": record.fetched_at}
+            notes.append(note)
+            if selected is None:
+                membership_errors.append({"scope": task["scope"], "reason": "source_current_edition_unreadable"})
+            elif selected != str(task["saison_id"]):
+                membership_errors.append({"scope": task["scope"], "reason": "source_current_edition_differs",
+                                          "source_selected_edition_id": selected})
+            else:
+                editions[task["scope"]] = {"scope": task["scope"], "competition_id": task["competition_id"],
+                                           "edition_id": selected, "capture_id": record.capture_id,
+                                           "body_sha256": getattr(record, "content_hash", None), "url": record.url,
+                                           "fetched_at": record.fetched_at}
+            continue
         if task["kind"] == "participants":
             try:
                 ids = parse_competition_clubs(json.loads(body), competition_id=task["competition_id"], saison_id=task["saison_id"])
@@ -228,7 +279,7 @@ def cohort_report(tasks, results, store, *, player_target=1000, min_scopes=20):
         if not membership:
             membership_errors.append({"scope": task["scope"], "club_id": task["club_id"], "reason": "template_club_not_a_proven_current_participant"})
             continue
-        if not rows or "contract" not in headers or selected_id is None:
+        if not rows or "contract" not in headers or selected_id is None or task["scope"] not in editions:
             continue
         ids = sorted({str(row["player_id"]) for row in rows}, key=int)
         candidates.append({"club_id": task["club_id"], "saison_id": task["saison_id"], "scope": task["scope"],
@@ -260,15 +311,18 @@ def cohort_report(tasks, results, store, *, player_target=1000, min_scopes=20):
     return {"clubs": clubs, "unique_players": len(seen), "scopes": sorted(scopes), "groups": sorted(groups),
             "missing_groups": sorted(GROUPS - groups), "cohort_notes": notes,
             "membership_errors": membership_errors,
+            "edition_proofs": [editions[scope] for scope in sorted(scopes)],
             "cohort_gate": len(seen) >= player_target and len(scopes) >= min_scopes and GROUPS <= groups and not membership_errors,
-            "detector_gate": False, "scope_membership_freshness_proven": not membership_errors}
+            "detector_gate": None, "detector_gate_evaluated_by": "qualify",
+            "scope_membership_freshness_proven": not membership_errors}
 
 
 
-def parity_report(tasks: list[dict], results: dict, store, players: list[str], groups: set[str]) -> dict:
+def parity_report(tasks: list[dict], results: dict, store, players: list[str], groups: set[str],
+                  edition_proofs: list[dict] | None = None) -> dict:
     from scrapers.transfermarkt.scraper import _parse_squad_page, _parse_mv_history, _parse_transfers
-    tmapi, squads, mv, transfers, observed = {}, {}, {}, {}, []
-    api_raw, squad_raw = {}, {}
+    tmapi, closing, squads, mv, transfers, observed = {}, {}, {}, {}, {}, []
+    api_raw, closing_raw, squad_raw, sampled_clubs = {}, {}, {}, {}
     for task in tasks:
         proof = results[task["key"]]
         body, record = store.load_capture(proof["raw_capture_id"])
@@ -282,6 +336,9 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
         if task["kind"] == "players":
             tmapi.update(parse_players(payload, task["ids"]))
             api_raw.update({player: raw for player in task["ids"]})
+        elif task["kind"] == "players_closing":
+            closing.update(parse_players(payload, task["ids"]))
+            closing_raw.update({player: raw for player in task["ids"]})
         elif task["kind"] == "squad":
             from bs4 import BeautifulSoup
             header = BeautifulSoup(payload, "html.parser").select("table.items thead th")
@@ -289,8 +346,9 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
                 raise ProbeGateError("full current squad lacks contract header")
             rows = {str(row["player_id"]): row for row in _parse_squad_page(payload, task["club_id"])}
             for player in task["ids"]:
+                sampled_clubs.setdefault(player, []).append(task["club_id"])
                 if player not in rows:
-                    raise ProbeGateError("sampled player is absent from full squad")
+                    continue
                 squads.setdefault(player, []).append((task["club_id"], rows[player]))
                 squad_raw[(player, task["club_id"])] = raw
         elif task["kind"] == "mv":
@@ -301,13 +359,12 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
             if not isinstance(payload, dict) or not isinstance(payload.get("transfers"), list):
                 raise ProbeGateError("ceapi transfers list missing")
             transfers[task["player_id"]] = (_parse_transfers(payload, task["player_id"]), source_day, raw, len(payload["transfers"]))
-    failures, comparisons, qualification_rows = [], [], []
+    failures, comparisons, qualification_rows, absent = [], [], [], []
     empty_counts = {"mv": 0, "transfers": 0}
-    for player in players:
-        api = tmapi[player]
-        value, contract = api.market_value_eur, api.contract_until
-        clubs = api.club_ids
-        matching = [(club_id, row) for club_id, row in squads[player] if club_id in clubs]
+
+    def detector_issues(api, player_squads, latest_mv, moves):
+        value, contract, clubs = api.market_value_eur, api.contract_until, api.club_ids
+        matching = [(club_id, row) for club_id, row in player_squads if club_id in clubs]
         issues = []
         if not matching:
             issues.append("tmapi_club_vs_squad")
@@ -317,20 +374,42 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
                 issues.append("tmapi_value_vs_squad")
             if contract != (row["contract_until"].isoformat() if row.get("contract_until") else None):
                 issues.append("tmapi_contract_vs_squad")
-        mv_rows, mv_day, mv_raw, mv_raw_count = mv[player]
-        transfer_rows, transfer_day, transfer_raw, transfer_raw_count = transfers[player]
-        history = [row for row in mv_rows if row.get("mv_date") and row["mv_date"] <= mv_day]
-        if history:
-            latest_mv = max(history, key=lambda row: row["mv_date"])
+        if latest_mv:
             if latest_mv["value_eur"] != value:
                 issues.append("tmapi_value_vs_ceapi")
             if latest_mv["mv_date"].isoformat() != api.market_value_date:
                 issues.append("tmapi_value_date_vs_ceapi")
-        moves = [row for row in transfer_rows if row.get("transfer_date") and row["transfer_date"] <= transfer_day and not row.get("is_upcoming")]
         if moves and max(moves, key=lambda row: row["transfer_date"])["to_club_id"] not in clubs:
             issues.append("tmapi_club_vs_ceapi")
+        return issues, matching
+
+    for player in players:
+        if player not in squads:
+            # Left every sampled club: a roster change, never a crash or a
+            # silent exclusion. Only a measured recheck can complete the row.
+            api = closing.get(player, tmapi[player])
+            absent.append({"player_id": player, "reason": "absent_from_sampled_club", "sampled_club_ids": sampled_clubs[player],
+                           "tmapi": {"value": api.market_value_eur, "value_date": api.market_value_date,
+                                     "value_present": api.market_value_present, "contract": api.contract_until,
+                                     "clubs": list(api.club_ids)}})
+            failures.append({"player_id": player, "issues": ["absent_from_sampled_club"]})
+            continue
+        mv_rows, mv_day, mv_raw, mv_raw_count = mv[player]
+        transfer_rows, transfer_day, transfer_raw, transfer_raw_count = transfers[player]
+        history = [row for row in mv_rows if row.get("mv_date") and row["mv_date"] <= mv_day]
+        latest_mv = max(history, key=lambda row: row["mv_date"]) if history else None
+        moves = [row for row in transfer_rows if row.get("transfer_date") and row["transfer_date"] <= transfer_day and not row.get("is_upcoming")]
+        # The initial packet precedes every reference and the closing packet
+        # follows them all; the first one matching the full references counts.
+        candidates = [("initial", tmapi[player], api_raw[player])]
+        if player in closing:
+            candidates.append(("closing", closing[player], closing_raw[player]))
+        checked = [(name, api, proof, *detector_issues(api, squads[player], latest_mv, moves)) for name, api, proof in candidates]
+        detector_fetch, api, detector_raw, issues, matching = next((item for item in checked if not item[3]), checked[-1])
+        value, contract, clubs = api.market_value_eur, api.contract_until, api.club_ids
         comparisons.append({"player_id": player, "fields": {"value": value, "value_date": api.market_value_date, "value_present": api.market_value_present, "contract": contract, "clubs": clubs},
-                            "mv_rows": len(mv_rows), "transfer_rows": len(transfer_rows), "issues": issues})
+                            "mv_rows": len(mv_rows), "transfer_rows": len(transfer_rows), "issues": issues,
+                            "detector_fetch": detector_fetch})
         chosen_club, chosen_row = matching[0] if matching else squads[player][0]
         mv_ref = ({"status": "compared", "value": latest_mv["value_eur"], "value_date": latest_mv["mv_date"].isoformat(), "raw_rows": mv_raw_count}
                   if history else {"status": "authoritative_empty" if mv_raw_count == 0 else "unknown", "raw_rows": mv_raw_count})
@@ -341,24 +420,31 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
         qualification_rows.append({"player_id": player, "tmapi": {**comparisons[-1]["fields"], "clubs": list(clubs)},
                                    "plus1": {"value": chosen_row.get("market_value_eur"), "contract": chosen_row["contract_until"].isoformat() if chosen_row.get("contract_until") else None, "club_id": chosen_club},
                                    "ceapi": {"mv": mv_ref, "transfers": transfer_ref},
-                                   "raw": {"tmapi": api_raw[player], "plus1": squad_raw[(player, chosen_club)], "mv": mv_raw, "transfers": transfer_raw}})
+                                   "raw": {"tmapi": detector_raw, "plus1": squad_raw[(player, chosen_club)], "mv": mv_raw, "transfers": transfer_raw}})
         if issues:
             failures.append({"player_id": player, "issues": issues})
     day_msk = datetime.fromisoformat(max(observed).replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/Moscow")).date().isoformat()
+    scopes = sorted({task["scope"] for task in tasks if task["kind"] == "squad"})
+    proofs = sorted((proof for proof in edition_proofs or [] if proof["scope"] in scopes), key=lambda proof: proof["scope"])
+    editions_proven = bool(scopes) and [proof["scope"] for proof in proofs] == scopes
     return {"players_checked": len(players), "groups": sorted(groups), "comparisons": comparisons,
             "cohort": {"player_ids": sorted(players, key=int), "groups": sorted(groups),
-                       "scope_basis": "configured_denominator", "source_current_editions_proven": False,
-                       "scopes": sorted({task["scope"] for task in tasks if task["kind"] == "squad"})},
+                       "scope_basis": "source_current_edition" if editions_proven else "configured_denominator",
+                       "source_current_editions_proven": editions_proven,
+                       "edition_proofs": proofs if editions_proven else [],
+                       "scopes": scopes},
             "qualification_observation": {"schema_version": "tm-signal-parity-observation-v1", "players": qualification_rows,
-                                          "missing_ids": [], "unknown_ids": [], "observed_from": min(observed), "observed_to": max(observed),
-                                          "counts": {"expected": len(players), "compared": len(qualification_rows), "missing": 0, "unknown": 0},
+                                          "missing_ids": [row["player_id"] for row in absent], "missing_details": absent,
+                                          "unknown_ids": [], "observed_from": min(observed), "observed_to": max(observed),
+                                          "counts": {"expected": len(players), "compared": len(qualification_rows), "missing": len(absent), "unknown": 0},
                                           "day_msk": day_msk, "ceapi_empty_counts": empty_counts},
             "mismatches": failures, "observed_from": min(observed), "observed_to": max(observed),
             "observation_day_msk": day_msk, "career_date_rule": "source calendar Europe/Berlin at raw fetched_at; original raw is UTC",
             "ceapi_missing_comparisons": {"value": sum(not mv[player][0] for player in players),
                                           "club": sum(not transfers[player][0] for player in players)},
             "field_parity_gate": len(players) >= 1000 and GROUPS <= groups and not failures,
-            "detector_gate": False, "remaining_gate": "second-day real changes and freshness evidence required"}
+            "detector_gate": None, "detector_gate_evaluated_by": "qualify",
+            "remaining_gate": "second-day real changes and freshness evidence required"}
 
 
 def _client(evidence: Path, remaining: dict, portion_id: str):
@@ -386,6 +472,18 @@ def _now_utc():
     return datetime.now(timezone.utc)
 
 
+def _parity_day_guard(state: dict, pending: int, now: datetime) -> None:
+    """One parity observation must stay inside one Moscow date (same-day rule)."""
+    today = now.astimezone(MSK).date()
+    stamps = [datetime.fromisoformat(result["raw_fetched_at"].replace("Z", "+00:00"))
+              for result in state["results"].values() if result.get("raw_fetched_at")]
+    if stamps and min(stamps).astimezone(MSK).date() != today:
+        raise ProbeGateError("parity observation crossed Moscow midnight; start a new evidence directory")
+    midnight = datetime(today.year, today.month, today.day, tzinfo=MSK) + timedelta(days=1)
+    if not stamps and now + timedelta(seconds=pending * 5) > midnight:  # 12 requests/min
+        raise ProbeGateError("parity observation cannot finish before Moscow midnight")
+
+
 def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) -> int:
     if args.mode == "qualify":
         from scrapers.transfermarkt.signal_qualification import build_qualification, QualificationError
@@ -404,7 +502,7 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
     evidence = Path(args.evidence_dir).resolve()
     if admitted_seconds == 0:
         evidence.mkdir(parents=True, exist_ok=True)
-        _write(evidence / "report.json", {"mode": args.mode, "detector_gate": False, "waiting_for": "delivery_quiet_window",
+        _write(evidence / "report.json", {"mode": args.mode, "detector_gate": None, "waiting_for": "delivery_quiet_window",
                                            "resume_after_utc": next_admitted_time(now).isoformat(), "complete": False})
         return 3
     experiment = Path(args.experiment_dir).resolve() if args.experiment_dir else evidence.parent
@@ -428,7 +526,7 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         elif args.mode == "recheck":
             selected_sample = recheck_sample(_read(Path(args.day1)), _read(Path(args.day2)), args.recheck_players)
             if not selected_sample["selected_changed_ids"]:
-                _write(evidence / "report.json", {"mode": "recheck", "complete": True, "detector_gate": False,
+                _write(evidence / "report.json", {"mode": "recheck", "complete": True, "detector_gate": None,
                                                    "actual_changed_count": 0, "qualification_error": "no actual changed IDs; no request was made"})
                 return 2
             tasks, players, groups = plan_tasks(selected_sample)
@@ -443,6 +541,8 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         state.setdefault("failures", {})
         if state["identity"] != identity:
             raise ProbeGateError("observation input changed; create a new evidence directory")
+        if args.mode in {"parity", "recheck"}:
+            _parity_day_guard(state, sum(task["key"] not in state["results"] for task in tasks), now)
         remaining = {key: (args.max_attempts if key == "request_attempts" else args.max_bytes) - ledger["totals"][key] for key in COUNTERS}
         if remaining["request_attempts"] <= 0 or min(remaining["provider_metered_bytes"], remaining["decoded_response_body_bytes"]) <= MIB:
             raise ProbeGateError("experiment budget exhausted")
@@ -452,7 +552,8 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         client = client_factory(evidence, remaining, portion_id)
         ledger["active"] = True
         _write(ledger_path, ledger)
-        report = {"mode": args.mode, "identity": identity, "portion_id": portion_id, "detector_gate": False}
+        report = {"mode": args.mode, "identity": identity, "portion_id": portion_id,
+                  "detector_gate": None, "detector_gate_evaluated_by": "qualify"}
         exit_code = 3
         try:
             for task in tasks:
@@ -503,7 +604,8 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                     report.update({key: value for key, value in cohort.items() if key != "clubs"})
                     exit_code = 0 if cohort["cohort_gate"] else 2
                 else:
-                    report.update(parity_report(tasks, state["results"], client._raw_store, players, groups))
+                    report.update(parity_report(tasks, state["results"], client._raw_store, players, groups,
+                                                edition_proofs=sample.get("edition_proofs") if args.mode == "parity" else None))
                     if args.mode == "recheck":
                         report["original_cohort"] = selected_sample["cohort"]
                         report["unrechecked_changed_ids"] = selected_sample["unrechecked_changed_ids"]
@@ -599,7 +701,7 @@ def main():
         with _cli_portion_alarm(args.portion_seconds - 15):
             return run(args)
     except Exception as exc:
-        print(json.dumps({"error_type": type(exc).__name__, "detector_gate": False}), file=sys.stderr)
+        print(json.dumps({"error_type": type(exc).__name__, "detector_gate": None}), file=sys.stderr)
         return 2
 
 

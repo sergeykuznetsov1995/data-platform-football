@@ -368,7 +368,8 @@ def qualify_offline(pin_directory, day1, day2, capture_index, output, *, evidenc
     # result.json. Never retain that format for fixtures or unauthenticated
     # exports: use it only inside a private directory and clean it on failure too.
     with TemporaryDirectory(prefix=".offline-validation-", dir=output) as private:
-        validated = build_qualification(output / "day1.json", output / "day2.json", Path(private) / "parity-evidence.json")
+        validated = build_qualification(output / "day1.json", output / "day2.json", Path(private) / "parity-evidence.json",
+                                        editions_proven_by_pin=True)
     result = {"version": VERSION, "status": "fixture_validated" if evidence_kind == "fixture" else "offline_export_validated",
               "evidence_kind": evidence_kind, "pin_sha256": sha((Path(pin_directory) / "pin.json").read_bytes()),
               "source_raw_export": {"index_path": str(Path(capture_index).resolve()),

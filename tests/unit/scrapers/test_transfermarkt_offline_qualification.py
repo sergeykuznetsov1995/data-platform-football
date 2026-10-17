@@ -316,9 +316,9 @@ def test_private_runtime_format_is_cleaned_even_when_validation_raises(exports, 
     original = intake.build_qualification
     private_paths = []
 
-    def fail_after_build(day1, day2, output):
+    def fail_after_build(day1, day2, output, **kwargs):
         assert Path(output).parent.stat().st_mode & 0o777 == 0o700
-        original(day1, day2, output)
+        original(day1, day2, output, **kwargs)
         private_paths.append(Path(output))
         raise RuntimeError("injected failure after validation")
 
@@ -342,7 +342,8 @@ def test_day2_transfer_reparses_fresh_roster_without_rewriting_initial_cohort(tm
     # Keep its production-format intermediate private, including on test error.
     from tempfile import TemporaryDirectory
     with TemporaryDirectory(dir=tmp_path) as private:
-        baseline = intake.build_qualification(exports / "day1.json", exports / "day2.json", Path(private) / "evidence.json")
+        baseline = intake.build_qualification(exports / "day1.json", exports / "day2.json", Path(private) / "evidence.json",
+                                              editions_proven_by_pin=True)
     assert any(change["player_id"] == "1" and change["field"] == "clubs"
                and change["before"] == ["100"] and change["after"] == [destination]
                for change in baseline["changed_observations"])
