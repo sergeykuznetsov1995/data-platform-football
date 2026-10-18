@@ -2115,8 +2115,15 @@ def _merge_career_cache_frames(
     import pandas as pd
 
     key, _, _, columns, natural_key = _CAREER_CACHE_COLUMNS[spec.name]
+    fresh = fetched.get(key)
+    captured = sorted(set(fresh['player_id'].dropna().astype(str))) if fresh is not None and not fresh.empty else []
+    stored = cached.get(key)
+    if stored is not None and captured:
+        # A fresh capture is the whole truth for its player (#1758): a cached
+        # row the new page no longer shows must not ride along as new.
+        stored = stored[~stored['player_id'].astype(str).isin(captured)]
     parts = _align_ingested_at_units([
-        frame for frame in (cached.get(key), fetched.get(key))
+        frame for frame in (stored, fresh)
         if frame is not None
     ])
     native = (
@@ -2127,8 +2134,6 @@ def _merge_career_cache_frames(
         native = native.drop_duplicates(list(natural_key), keep='last')
     # Cache hydration is a read reference, never a new native capture. Keep
     # original native batch/lineage; the manifest records these physical refs.
-    fresh = fetched.get(key)
-    captured = sorted(set(fresh['player_id'].dropna().astype(str))) if fresh is not None and not fresh.empty else []
     native.attrs['tm_captured_player_ids'] = captured
     native.attrs['tm_original_capture_refs'] = [
         {'player_id': str(player), 'batch_id': str(batch)}
@@ -2286,6 +2291,18 @@ def _merge_coach_cache_frames(
     legacy = scraper.materialize_legacy_coaches(
         profiles, stints, league, scope['season_year'], scope['season_format'],
     )
+    # Cached clubs/coaches are read references (#1758): native writes and the
+    # first-seen registry take only what this run captured, so a cached club
+    # is never rewritten without its original lineage.
+    for frame, column, attr in (
+        (stints, 'club_id', 'tm_captured_club_ids'),
+        (profiles, 'coach_id', 'tm_captured_coach_ids'),
+    ):
+        fresh = fetched.get('stints' if column == 'club_id' else 'profiles')
+        frame.attrs[attr] = (
+            sorted(set(fresh[column].dropna().astype(str)))
+            if fresh is not None and not fresh.empty else []
+        )
     return {
         'profiles': profiles,
         'stints': stints,
@@ -2453,10 +2470,11 @@ def _save_frames(
                     capture_times=getattr(scraper, '_tm_empty_capture_times', {}))
             finally:
                 connection.close()
+        from scrapers.transfermarkt.first_seen import captured_mask
         native_keys = {output.key for output in spec.outputs if not output.is_legacy}
         captured_frames = {
-            key: frame[frame['player_id'].astype(str).isin(frame.attrs['tm_captured_player_ids'])].copy()
-            if key in native_keys and frame is not None and 'tm_captured_player_ids' in frame.attrs else frame
+            key: frame[captured_mask(frame)].copy()
+            if key in native_keys and frame is not None and captured_mask(frame) is not None else frame
             for key, frame in frames.items()
         }
         guard_cached_frames(scraper, spec.outputs, frames)

@@ -16,6 +16,7 @@ scraper = _physical_scraper_fixture
 
 pytestmark = pytest.mark.unit
 NOW = datetime(2026, 10, 12, 12, tzinfo=timezone.utc)
+INGESTED = NOW.replace(tzinfo=None)
 
 
 @pytest.fixture
@@ -180,3 +181,79 @@ def test_first_seen_schema_and_physical_writer_preserve_microseconds(backend):
     arrow = TransfermarktIcebergWriter()._pandas_to_arrow(frame)
     assert TransfermarktTrinoManager().arrow_schema_to_trino(arrow.schema)['first_seen_at'] == 'TIMESTAMP(6)'
     assert arrow.to_pandas().first_seen_at[0] == stamp.replace(tzinfo=None)
+
+
+def _cached(frame):
+    """A Bronze cache row as the runner reads it: no original raw lineage."""
+    return frame.drop(columns=['fetched_at', 'source_url', 'source_body_hash', 'cycle_id']).assign(
+        _ingested_at=INGESTED - timedelta(days=40), _batch_id='old')
+
+
+def _coach_frames(fresh_club=None):
+    from dags.scripts import run_transfermarkt_scraper as run
+
+    stints = bundle('transfermarkt_coach_stints')
+    fetched = {} if fresh_club is None else {
+        'stints': stints.assign(club_id=fresh_club, _ingested_at=INGESTED),
+        'profiles': pd.DataFrame([{'coach_id': '8', 'name': 'New', 'fetched_at': NOW, '_ingested_at': INGESTED}]),
+    }
+    cached = {'stints': _cached(stints), 'profiles': pd.DataFrame([{'coach_id': '7', 'name': 'Old', '_ingested_at': INGESTED}])}
+    legacy = SimpleNamespace(materialize_legacy_coaches=lambda *args: pd.DataFrame({'coach_id': ['7']}))
+    return run._merge_coach_cache_frames(legacy, fetched, cached, 'ENG-Premier League', 2025)
+
+
+def test_cache_only_coach_stints_are_not_new_observations(backend):
+    # #1758: ARCA 2025, selected=0 cache_hits=64 died on lineage.
+    frames = _coach_frames()
+    assert enrich(backend, 'transfermarkt_coach_stints', frames['stints']).club_id.tolist() == ['10']
+    assert backend.db.sql.execute('SELECT COUNT(*) FROM transfermarkt_first_seen_v1').fetchone()[0] == 0
+
+
+def test_mixed_coach_scope_registers_only_freshly_captured_clubs(backend):
+    frames = _coach_frames(fresh_club='20')
+    assert sorted(frames['stints'].club_id) == ['10', '20']
+    enriched = enrich(backend, 'transfermarkt_coach_stints', frames['stints'])
+    assert enriched.set_index('club_id').first_seen_at.isna().to_dict() == {'10': True, '20': False}
+    assert backend.db.sql.execute('SELECT COUNT(*) FROM transfermarkt_first_seen_v1').fetchone()[0] == 1
+    assert sorted(frames['profiles'].coach_id) == ['7', '8']
+
+
+def test_mixed_coach_scope_rewrites_only_freshly_captured_clubs(scraper):
+    from dags.scripts import run_transfermarkt_scraper as run
+
+    table = 'transfermarkt_coach_stints'
+    frames = _coach_frames(fresh_club='20')
+    columns = sorted(set(frames['stints'].columns) | {'first_seen_at'})
+    scraper.test_db.sql.execute(f'CREATE TABLE {table}(' + ', '.join(column + ' TEXT' for column in columns) + ')')
+    scraper.test_db.sql.execute(f"INSERT INTO {table}(club_id, coach_id, source_url) VALUES ('10', '7', 'original')")
+    output = run.OutputSpec('stints', table, (), ('club_id',), None)
+    spec = run.EntitySpec('coaches', 'coach_id', 'coaches_with_rows', None, '', '', (output,))
+    stints = seen.prepare_frames(scraper, spec.outputs, {'stints': frames['stints']})
+    results = {'outputs': {}, 'tables': []}
+    run._save_frames(scraper, spec, stints, True, results)
+    rows = scraper.test_db.sql.execute(f'SELECT club_id, source_url FROM {table} ORDER BY club_id').fetchall()
+    assert rows == [('10', 'original'), ('20', 'https://www.transfermarkt.com/proof')]
+    assert results['outputs']['stints']['captured_rows'] == 1
+
+
+def test_fresh_career_capture_supersedes_cached_rows_of_the_same_player(backend):
+    # #1758: BRCM transfers, player 191614 was fresh and cached; his old
+    # lineage-less transfer missing from the fresh page counted as new.
+    from dags.scripts import run_transfermarkt_scraper as run
+
+    table = 'transfermarkt_transfer_events'
+    fresh = bundle(table).assign(player_id='1', transfer_id='new', _ingested_at=INGESTED)
+    cached = pd.concat([_cached(bundle(table)).assign(player_id='1', transfer_id='stale'),
+                        _cached(bundle(table)).assign(player_id='2', transfer_id='kept')], ignore_index=True)
+    spec = SimpleNamespace(name=run.ENTITY_TRANSFERS, outputs=())
+    merged = run._merge_career_cache_frames(None, spec, {'transfer_events': fresh}, {'transfer_events': cached},
+                                            'ENG-Premier League', 2025)['transfer_events']
+    assert sorted(merged.transfer_id) == ['kept', 'new']
+    enriched = enrich(backend, table, merged)
+    assert enriched.set_index('transfer_id').first_seen_at.isna().to_dict() == {'kept': True, 'new': False}
+
+
+def test_lineage_error_names_table_and_column(backend):
+    frame = bundle('transfermarkt_coach_stints').drop(columns='source_body_hash')
+    with pytest.raises(RuntimeError, match='transfermarkt_coach_stints.*source_body_hash'):
+        enrich(backend, 'transfermarkt_coach_stints', frame)

@@ -612,7 +612,9 @@ def test_market_value_date_only_queues_career_without_full_squad_download(offlin
     assert [(endpoint, ids) for endpoint, ids, _ in offline.careers] == [('market_value_points', ('110',))]
 
 
-def test_actual_decoded_cap_preserves_first_page_and_next_grant_finishes_full_roster(offline):
+def test_actual_decoded_cap_preserves_first_page_and_next_grant_finishes_full_roster(offline, monkeypatch):
+    # Resume mechanics at the historical 16 MiB players cap (#1758 raised it).
+    monkeypatch.setitem(current.PRODUCTION_ENTITY_BUDGETS['players'], 'decoded_mb', 16.0)
     offline.squad_padding = {'10': 8 * 1024 * 1024, '20': 8 * 1024 * 1024}
     first = offline.run('first')
     assert any(item['status'] == 'failed' for item in first['scopes'])

@@ -67,7 +67,7 @@ def _params(module, **overrides):
         'coach_history_ttl_days': 28,
         'checkpoint_ttl_days': 35,
         'proxy_lease_ttl_seconds': 3600,
-        'proxy_request_limit': 1610,
+        'proxy_request_limit': 1900,
         'proxy_retry_limit': 2,
         'entity_timeout_seconds': 3600,
     }
@@ -189,13 +189,13 @@ class TestDagShape:
         params = dag_module.dag._dag_kwargs['params']
         assert params['mv_transfers_limit']._kw['maximum'] == 500
         assert params['proxy_retry_limit']._kw['maximum'] == 800
-        assert params['proxy_request_limit']._kw['maximum'] == 1610
+        assert params['proxy_request_limit']._kw['maximum'] == 1900
         assert params['proxy_lease_ttl_seconds']._kw['maximum'] == 3600
         assert dag_module.PROVIDER_HARD_CAP_BYTES == 24 * 1024 * 1024
         assert dag_module.PROVIDER_SOFT_STOP_BYTES == 22 * 1024 * 1024
         assert not hasattr(dag_module, 'PARENT_BYTE_BUDGET')
         assert not hasattr(dag_module, 'PARENT_SOFT_BYTE_STOP')
-        assert dag_module.PARENT_REQUEST_LIMIT == 8 * 1610
+        assert dag_module.PARENT_REQUEST_LIMIT == 8 * 1900
         assert dag_module.PARENT_RETRY_LIMIT == 8 * 800
         assert dag_module.PROXY_CONCURRENCY == 1
 
@@ -306,7 +306,7 @@ class TestPlanningGate:
         assert env['TM_PROVIDER_HARD_CAP_BYTES'] == str(24 * 1024 * 1024)
         # #1387: the children get no parent byte budget.
         assert not [key for key in env if key.startswith('TM_PARENT_') and 'BYTE' in key]
-        assert env['TM_PARENT_REQUEST_LIMIT'] == str(8 * 1610)
+        assert env['TM_PARENT_REQUEST_LIMIT'] == str(8 * 1900)
         assert env['TM_PARENT_RETRY_LIMIT'] == str(8 * 800)
         assert env['TM_REFRESH_MODE'] == 'current'
         assert env['TM_CHECKPOINT_TTL_DAYS'] == '35'
@@ -371,7 +371,7 @@ def _write_standing_policy(tmp_path: Path, **overrides) -> tuple[Path, str]:
         'expires_at': '2100-01-01T00:00:00Z',
         'paid_proxy': {
             'byte_cap_bytes': 24 * 1024 * 1024,
-            'request_limit': 1610,
+            'request_limit': 1900,
             'retry_limit': 800,
             'concurrency': 1,
         },
@@ -611,7 +611,7 @@ class TestStandingPolicyGate:
         self._arm(dag_module, monkeypatch, tmp_path)
         paid = {
             'byte_cap_bytes': 24 * 1024 * 1024,
-            'request_limit': 1610,
+            'request_limit': 1900,
             'retry_limit': 800,
             'concurrency': 1,
         }

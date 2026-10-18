@@ -34,8 +34,8 @@ def test_production_profile_has_exact_phase_and_shared_caps():
     assert bench.PRODUCTION_CYCLE_BUDGET_BYTES == 24 * MIB
     assert bench.PRODUCTION_PHASE_BUDGETS == {
         'squads': {
-            'decoded_body_bytes': 16 * MIB,
-            'request_attempts': 150,
+            'decoded_body_bytes': 48 * MIB,
+            'request_attempts': 250,
         },
         'market_value_points': {
             'decoded_body_bytes': 4 * MIB,
@@ -46,21 +46,21 @@ def test_production_profile_has_exact_phase_and_shared_caps():
             'request_attempts': 650,
         },
         'coaches': {
-            'decoded_body_bytes': 14 * MIB,
-            'request_attempts': 160,
+            'decoded_body_bytes': 40 * MIB,
+            'request_attempts': 350,
         },
     }
     assert scraper_module._DEFAULT_DECODED_BUDGET_MB == {
-        'players': 16.0,
+        'players': 48.0,
         'market_value_history': 4.0,
         'transfers': 12.0,
-        'coaches': 14.0,
+        'coaches': 40.0,
     }
     assert scraper_module._DEFAULT_REQUEST_ATTEMPT_BUDGET == {
-        'players': 150,
+        'players': 250,
         'market_value_history': 650,
         'transfers': 650,
-        'coaches': 160,
+        'coaches': 350,
     }
 
 
@@ -68,11 +68,11 @@ def test_phase_cap_plus_one_byte_fails_on_raw_counter():
     report = {'phases': []}
     before = {'decoded_response_body_bytes': 0, 'request_attempts': 0}
     after = {
-        'decoded_response_body_bytes': 16 * MIB + 1,
+        'decoded_response_body_bytes': 48 * MIB + 1,
         'request_attempts': 1,
     }
 
-    with pytest.raises(TrafficBudgetExceeded, match='16777217/16777216 bytes'):
+    with pytest.raises(TrafficBudgetExceeded, match='50331649/50331648 bytes'):
         _append_checked_phase(report, 'squads', before, after)
 
     assert report['phases'][0]['within_budget'] is False

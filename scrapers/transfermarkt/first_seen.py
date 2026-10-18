@@ -21,6 +21,21 @@ KEYS = {
     'transfermarkt_transfer_events': ('transfer_id',),
     'transfermarkt_coach_stints': ('club_id', 'coach_id', 'appointed_date', 'left_date'),
 }
+# Merged cache+fresh frames name the entities captured by this run; every
+# other row is a cached physical Bronze reference, never a new observation.
+CAPTURE_ATTRS = {
+    'player_id': 'tm_captured_player_ids',
+    'club_id': 'tm_captured_club_ids',
+    'coach_id': 'tm_captured_coach_ids',
+}
+
+
+def captured_mask(frame):
+    """Rows captured by this run, or None when the frame is entirely fresh."""
+    for column, attr in CAPTURE_ATTRS.items():
+        if attr in frame.attrs:
+            return frame[column].astype(str).isin(set(map(str, frame.attrs[attr])))
+    return None
 
 
 def _cell(value):
@@ -117,10 +132,10 @@ source_url varchar, source_body_hash varchar, cycle_id varchar
             for output in relevant:
                 frame = frames[output.key]
                 cached = {str(ref['player_id']) for ref in frame.attrs.get('tm_original_capture_refs', [])}
-                captured = frame.attrs.get('tm_captured_player_ids')
+                captured = captured_mask(frame)
                 active = [index for index, row in enumerate(frame.to_dict('records'))
                           if ('player_id' not in row or str(row['player_id']) not in cached)
-                          and (captured is None or str(row.get('player_id')) in set(map(str, captured)))]
+                          and (captured is None or captured.iloc[index])]
                 if not active:
                     continue
                 rows = frame.to_dict('records')
@@ -139,8 +154,11 @@ source_url varchar, source_body_hash varchar, cycle_id varchar
                         if supplied is not None and not pd.isna(supplied) and _time(supplied) != stamp:
                             raise RuntimeError('immutable first_seen_at differs from registered observation')
                     else:
-                        if any(not row.get(field) or pd.isna(row[field]) for field in ('source_url', 'source_body_hash', 'fetched_at')):
-                            raise RuntimeError('new first_seen observation lacks source lineage')
+                        missing = [field for field in ('source_url', 'source_body_hash', 'fetched_at')
+                                   if not row.get(field) or pd.isna(row[field])]
+                        if missing:
+                            raise RuntimeError(f'new first_seen observation lacks source lineage: '
+                                               f'{output.table_name} {encoded} missing {", ".join(missing)}')
                         stamp = _time(row['fetched_at'])
                         supplied = row.get('first_seen_at')
                         if supplied is not None and not pd.isna(supplied) and _time(supplied) != stamp:

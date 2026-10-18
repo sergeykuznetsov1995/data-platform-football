@@ -202,6 +202,8 @@ def _squad(club_id):
 
 def test_brc_2025_full_roster_finishes_after_exact_decoded_cap_failure(tmp_path, monkeypatch):
     """Real roster reader + raw store + transport; no source or Bronze I/O."""
+    # Resume mechanics at the historical 16 MiB players cap (#1758 raised it).
+    monkeypatch.setitem(tm._DEFAULT_DECODED_BUDGET_MB, 'players', 16.0)
     clubs = [{'club_id': str(i), 'club_slug': f'team-{i}', 'club_name': f'Team {i}'}
              for i in range(1, 127)]
     monkeypatch.setattr(tm, '_parse_participant_table', lambda _: clubs)
