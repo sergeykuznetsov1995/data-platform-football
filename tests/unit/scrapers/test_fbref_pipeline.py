@@ -14502,6 +14502,8 @@ class _FlakyTrinoWriter(FakeWriter):
 def _transient_cohort(tmp_path, *, count, errors):
     control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=count)
     pipeline.generic_writer = _FlakyTrinoWriter(errors)
+    # What run_live_waves switches on for its own waves.
+    pipeline._defer_transient_parse = True
     return control, pipeline, target_ids
 
 
@@ -14568,6 +14570,35 @@ def test_permanent_trino_failure_still_fails_the_wave(tmp_path, make_error):
             page_kinds=["squad"],
             settings=_settings("backfill"),
         )
+
+
+def test_single_parse_wave_outside_live_run_stays_loud(tmp_path):
+    # parse_fbref_wave and the recovery drain have no later wave in this
+    # process to retry a deferred target, so they keep failing loudly.
+    _control, pipeline, _ids = _transient_cohort(
+        tmp_path, count=1, errors=[_replay_17_10_00()]
+    )
+    pipeline._defer_transient_parse = False
+
+    with pytest.raises(ParseWaveError, match="TrinoError"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+
+def test_sql_error_masked_by_a_failed_reconnect_stays_loud():
+    # Cleanup after a SQL error reconnects and gives up: the connect error
+    # rides __cause__, the SQL error only __context__.
+    from scrapers.base.trino_manager import TrinoUnavailableError
+
+    unavailable = TrinoUnavailableError("Failed to connect to Trino")
+    unavailable.__cause__ = ConnectionError("Connection refused")
+    unavailable.__context__ = _trino_user_error()
+
+    assert not pipeline_module._is_transient_trino_failure(unavailable)
+    assert pipeline_module._is_transient_trino_failure(_replay_17_10_06())
 
 
 def test_trino_unavailable_is_transient(tmp_path):
@@ -14653,7 +14684,9 @@ def test_run_level_deferred_parse_failure_ceiling_is_above_twenty_five(
         calls.append(1)
         if len(calls) > batches:
             # The final retry after the last batch finds Trino back.
+            pipeline._parse_deferrals_pending = False
             return WaveResult(cohort_size=5, parsed=5)
+        pipeline._parse_deferrals_pending = True
         return WaveResult(
             cohort_size=25,
             parsed=20,
@@ -14682,57 +14715,103 @@ def test_run_level_deferred_parse_failure_ceiling_is_above_twenty_five(
         assert len(calls) == batches + 1
 
 
-def test_run_retries_deferred_parse_after_budget_ends_the_loop(tmp_path):
+def _drain_run(tmp_path, waves, **fetch):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
-    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(
-        claimed=1, fetched=1, budget_exhausted=True
+    fetches = fetch.pop("fetches", None)
+    pipeline.fetch_wave = (
+        (lambda *_a, **_k: fetches.pop(0))
+        if fetches is not None
+        else (lambda *_a, **_k: WaveResult(claimed=1, fetched=1, **fetch))
     )
-    waves = [
-        WaveResult(
-            cohort_size=1,
-            deferred_parse_failures=["fbref:schedule:646:2026:TrinoError"],
-        ),
-        WaveResult(cohort_size=1, parsed=1),
-    ]
-    pipeline.parse_wave = lambda *_a, **_k: waves.pop(0)
+    flags = []
 
-    result = pipeline.run_live_waves(
-        str(uuid.UUID(int=17599)),
-        worker_id="schedule-worker",
-        page_kinds=["schedule"],
-        settings=_settings(),
-        max_batches=5,
+    def fake_parse(*_args, **_kwargs):
+        flags.append(pipeline._defer_transient_parse)
+        wave = waves.pop(0)
+        pipeline._parse_deferrals_pending = bool(wave.deferred_parse_failures)
+        return wave
+
+    pipeline.parse_wave = fake_parse
+
+    def execute(**kwargs):
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=17599)),
+            worker_id="schedule-worker",
+            page_kinds=["schedule"],
+            settings=_settings(),
+            **{"max_batches": 5, **kwargs},
+        )
+
+    return pipeline, flags, execute
+
+
+def _deferred_wave():
+    return WaveResult(
+        cohort_size=1,
+        deferred_parse_failures=["fbref:schedule:646:2026:TrinoError"],
     )
+
+
+def test_run_retries_deferred_parse_after_budget_ends_the_loop(tmp_path):
+    waves = [_deferred_wave(), WaveResult(cohort_size=1, parsed=1)]
+    pipeline, flags, execute = _drain_run(
+        tmp_path, waves, budget_exhausted=True
+    )
+
+    result = execute()
 
     assert waves == []
     assert result.batches == 1
     assert result.parse.parsed == 1
+    assert flags == [True, True]
+    assert pipeline._defer_transient_parse is False
+
+
+def test_run_fails_when_final_parse_retry_defers_again(tmp_path):
+    waves = [_deferred_wave(), _deferred_wave()]
+    _pipeline, _flags, execute = _drain_run(
+        tmp_path, waves, budget_exhausted=True
+    )
+
+    with pytest.raises(
+        ParseWaveError, match="persisted through the final parse retry"
+    ):
+        execute()
+
+
+def test_deadline_stop_does_not_reparse(tmp_path):
+    waves = [_deferred_wave()]
+    pipeline, _flags, execute = _drain_run(tmp_path, waves)
+    ticks = iter([0.0, 10.0])
+    pipeline.monotonic = lambda: next(ticks)
+
+    result = execute(deadline_monotonic=5.0)
+
+    assert result.deadline_reached is True
+    assert waves == []
+
+
+def test_deferral_already_retried_needs_no_final_parse(tmp_path):
+    waves = [_deferred_wave(), WaveResult(cohort_size=1, parsed=1)]
+    _pipeline, _flags, execute = _drain_run(tmp_path, waves)
+
+    result = execute(max_batches=2)
+
+    assert waves == []
+    assert result.batches == 2
 
 
 def test_frontier_closed_run_does_not_reparse(tmp_path):
-    raw = _raw_store(tmp_path)
-    control = FakeControl(raw)
-    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
-    fetches = [WaveResult(claimed=1, fetched=1), WaveResult()]
-    pipeline.fetch_wave = lambda *_a, **_k: fetches.pop(0)
-    waves = [
-        WaveResult(
-            cohort_size=1,
-            deferred_parse_failures=["fbref:schedule:646:2026:TrinoError"],
-        ),
-        WaveResult(),
-    ]
-    pipeline.parse_wave = lambda *_a, **_k: waves.pop(0)
-
-    result = pipeline.run_live_waves(
-        str(uuid.UUID(int=17600)),
-        worker_id="schedule-worker",
-        page_kinds=["schedule"],
-        settings=_settings(),
-        max_batches=5,
+    waves = [_deferred_wave(), WaveResult()]
+    _pipeline, _flags, execute = _drain_run(
+        tmp_path,
+        waves,
+        fetches=[WaveResult(claimed=1, fetched=1), WaveResult()],
     )
+
+    result = execute()
 
     assert result.frontier_closed is True
     assert waves == []

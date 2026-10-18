@@ -252,10 +252,10 @@ class TrinoTableManager:
             f"Failed to connect to Trino after {self._CONNECT_RETRIES} attempts: {last_error}"
         ) from last_error
 
-    @classmethod
-    def clear_unreachable(cls) -> None:
+    @staticmethod
+    def clear_unreachable() -> None:
         """Let the next connection attempt retry instead of failing fast."""
-        cls._trino_unreachable = False
+        TrinoTableManager._trino_unreachable = False
 
     def _reset_connection(self):
         """Reset the connection (close existing, will reconnect on next use).

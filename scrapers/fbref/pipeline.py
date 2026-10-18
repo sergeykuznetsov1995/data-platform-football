@@ -2239,19 +2239,24 @@ def _is_infrastructure_failure(exc: BaseException) -> bool:
 def _is_transient_trino_failure(exc: BaseException) -> bool:
     """Tell "Trino blinked" from "this statement can never succeed" (#1759).
 
-    The cause chain is read like ``_is_infrastructure_failure`` reads it: the
-    driver routinely raises "failed to cancel query" from the cursor close in
-    TrinoTableManager._execute, which replaces the real error and leaves it on
-    ``__context__``.  So one transient link is not enough -- any named driver
-    error outside TRANSIENT_TRINO_ERROR_NAMES anywhere in the chain (a SQL or
-    schema error the cancel happened to mask) keeps the failure loud.
-    Classification goes by type and driver error name, never by message text.
+    The driver routinely raises "failed to cancel query" from the cursor
+    close in TrinoTableManager._execute, which replaces the real error and
+    leaves it on ``__context__``; a reconnect that gives up during cleanup
+    puts the connect error on ``__cause__`` and the real one on
+    ``__context__``.  So both links of every exception are read, and one
+    transient link is not enough -- any named driver error outside
+    TRANSIENT_TRINO_ERROR_NAMES anywhere in the graph (a SQL or schema error
+    the cancel happened to mask) keeps the failure loud.  Classification goes
+    by type and driver error name, never by message text.
     """
 
     transient = False
     seen: set[int] = set()
-    current: Optional[BaseException] = exc
-    while current is not None and id(current) not in seen:
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
         seen.add(id(current))
         error_name = getattr(current, "error_name", None)
         if error_name is not None:
@@ -2268,7 +2273,11 @@ def _is_transient_trino_failure(exc: BaseException) -> bool:
             and type(current).__module__.split(".", 1)[0] == "trino"
         ):
             transient = True
-        current = current.__cause__ or current.__context__
+        pending.extend(
+            link
+            for link in (current.__cause__, current.__context__)
+            if link is not None
+        )
     return transient
 
 
@@ -2637,8 +2646,12 @@ class FBrefPipeline:
         self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
         self._dead_lettered_targets: set[str] = set()
         # Transient Trino deferrals per target for the life of this process,
-        # i.e. one run (#1759).
+        # i.e. one run (#1759).  Only run_live_waves turns deferral on: it is
+        # the one caller that guarantees a later parse wave in this process.
+        # A single parse_fbref_wave or recovery drain stays loud.
         self._parse_deferrals: dict[str, int] = {}
+        self._defer_transient_parse = False
+        self._parse_deferrals_pending = False
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
@@ -4484,6 +4497,7 @@ class FBrefPipeline:
             finalization_guard=self.finalization_guard,
         )
         failed = True
+        self._defer_transient_parse = True
         try:
             # Each claim independently evaluates _FRONTIER_SCOPE_CTE while
             # holding its frontier lock, so current discovery cannot lease an
@@ -4570,12 +4584,15 @@ class FBrefPipeline:
                         aggregate.frontier_closed = True
                         break
                 if (
-                    aggregate.parse.deferred_parse_failures
+                    self._parse_deferrals_pending
                     and not aggregate.frontier_closed
+                    and not aggregate.deadline_reached
                 ):
-                    # The loop ended on budget, deadline or batch count, so
-                    # no later wave will retry a deferred target (#1759).
-                    # Parse once more: raw only, no request, no paid lease.
+                    # The loop ended on budget or batch count with a target
+                    # the last wave deferred, and no later wave will retry it
+                    # (#1759).  Parse once more: raw only, no request, no paid
+                    # lease.  A deadline stop skips this -- the task timeout
+                    # is the harder limit -- and validation reports the raw.
                     with self._profiled_wave() as parse_ms:
                         parsed = self.parse_wave(
                             run_id,
@@ -4584,10 +4601,11 @@ class FBrefPipeline:
                         )
                     self._apply_stage_ms(parsed, parse_ms)
                     self._merge_wave_result(aggregate.parse, parsed)
-                    if _is_run_mass_deferred_parse_failures(aggregate.parse):
+                    if parsed.deferred_parse_failures:
                         raise ParseWaveError(
-                            "mass_parse_deferrals_run="
-                            f"{len(aggregate.parse.deferred_parse_failures)}"
+                            "transient Trino failure persisted through the "
+                            "final parse retry: "
+                            + "; ".join(parsed.deferred_parse_failures)
                         )
                 loop_finished = self.stage_clock()
             logger.info(
@@ -4621,6 +4639,7 @@ class FBrefPipeline:
             failed = False
             return aggregate
         finally:
+            self._defer_transient_parse = False
             close_started = self.stage_clock()
             live_session.close(
                 self.control,
@@ -6257,7 +6276,8 @@ class FBrefPipeline:
                     )
         deferrals = self._parse_deferrals.get(record.target_id, 0)
         if (
-            not failures
+            self._defer_transient_parse
+            and not failures
             and deferrals < MAX_PARSE_DEFERRALS_PER_TARGET
             and _is_transient_trino_failure(exc)
         ):
@@ -7342,10 +7362,12 @@ class FBrefPipeline:
         """Parse and persist a bounded handoff using raw storage only."""
 
         result = WaveResult()
-        if self._parse_deferrals:
-            # A deferred target is retried here; a Trino that was down when it
-            # was deferred must get a fresh connection attempt, not fast-fail.
+        if self._parse_deferrals_pending:
+            # The previous wave deferred a target that is retried here; a Trino
+            # that was down then must get a fresh connection attempt, not
+            # fast-fail.
             TrinoTableManager.clear_unreachable()
+            self._parse_deferrals_pending = False
         # One wave, one budget: the wave body is single-threaded, so a plain
         # instance counter bounds how much scope a single wave may retire
         # before the run stops instead of silently shrinking further.
@@ -7581,6 +7603,7 @@ class FBrefPipeline:
                 "mass_parse_deferrals="
                 f"{len(result.deferred_parse_failures)} of {result.cohort_size}"
             )
+        self._parse_deferrals_pending = bool(result.deferred_parse_failures)
         if _is_mass_contract_rejection(result):
             # Retiring a handful of archived editions is routine.  Retiring the
             # bulk of a live cohort is not a property of those pages -- it is
