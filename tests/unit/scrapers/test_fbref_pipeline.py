@@ -14414,3 +14414,381 @@ def test_profiled_wave_restores_the_stores_when_the_wave_raises(tmp_path):
     assert pipeline.generic_writer is writer
     assert pipeline.typed_adapter.writer is typed_writer
     assert pipeline._stage_ms is None
+
+
+# --- transient Trino failure while persisting a parse (#1759) ----------------
+
+
+def _trino_split_error(page_kind):
+    """TrinoTableManager._execute wrapping ICEBERG_CANNOT_OPEN_SPLIT."""
+
+    from trino.exceptions import TrinoExternalError
+
+    driver = TrinoExternalError(
+        {
+            "errorName": "ICEBERG_CANNOT_OPEN_SPLIT",
+            "errorType": "EXTERNAL",
+            "message": (
+                "Error opening Iceberg split s3://football/warehouse/"
+                f"fbref_table_cells/data/page_kind={page_kind}/x.parquet: "
+                "Failed to open S3 file"
+            ),
+        },
+        "20261017_082603_00001_x8c8i",
+    )
+    error = TrinoError(f"SQL execution failed: {driver}")
+    error.__cause__ = driver
+    return error
+
+
+def _trino_cancel_error(context):
+    """The driver's cursor-close cancel replacing the in-flight error."""
+
+    from trino.exceptions import TrinoConnectionError
+
+    error = TrinoConnectionError(
+        "failed to cancel query: HTTPSConnectionPool(host='trino', "
+        "port=8443): Max retries exceeded"
+    )
+    error.__context__ = context
+    return error
+
+
+def _replay_04_10():
+    from trino.exceptions import TrinoConnectionError
+
+    return _trino_cancel_error(
+        TrinoConnectionError("failed to fetch: Max retries exceeded")
+    )
+
+
+def _replay_17_10_00():
+    return _trino_split_error("match")
+
+
+def _replay_17_10_06():
+    return _trino_cancel_error(_trino_split_error("schedule"))
+
+
+def _trino_user_error():
+    from trino.exceptions import TrinoUserError
+
+    driver = TrinoUserError(
+        {
+            "errorName": "COLUMN_NOT_FOUND",
+            "errorType": "USER_ERROR",
+            "message": "Column 'cell_idx' cannot be resolved",
+        },
+        "20261017_082603_00002_x8c8i",
+    )
+    error = TrinoError(f"SQL execution failed: {driver}")
+    error.__cause__ = driver
+    return error
+
+
+class _FlakyTrinoWriter(FakeWriter):
+    """Raise the scripted errors in order, then persist like FakeWriter."""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = list(errors)
+
+    def persist_page(self, page, **kwargs):
+        if self.errors:
+            raise self.errors.pop(0)
+        return super().persist_page(page, **kwargs)
+
+
+def _transient_cohort(tmp_path, *, count, errors):
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=count)
+    pipeline.generic_writer = _FlakyTrinoWriter(errors)
+    # What run_live_waves switches on for its own waves.
+    pipeline._defer_transient_parse = True
+    return control, pipeline, target_ids
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [_replay_04_10, _replay_17_10_00, _replay_17_10_06],
+    ids=["04.10-cancel", "17.10-00-split", "17.10-06-split-then-cancel"],
+)
+@pytest.mark.parametrize("batch_persist", [False, True], ids=["seq", "batch"])
+def test_transient_trino_failure_defers_target_to_next_parse_wave(
+    tmp_path, make_error, batch_persist
+):
+    error = make_error()
+    # In batch mode the batch write fails first and the per-item fallback
+    # meets the same blink; either way the next wave finds Trino back.
+    control, pipeline, target_ids = _transient_cohort(
+        tmp_path, count=1, errors=[error]
+    )
+    pipeline.batch_persist_enabled = batch_persist
+    if batch_persist:
+        pipeline.generic_writer.batch_error = error
+    run_id = str(uuid.uuid4())
+    settings = _settings("backfill")
+
+    first = pipeline.parse_wave(run_id, page_kinds=["squad"], settings=settings)
+
+    assert first.failures == []
+    assert first.parsed == 0
+    assert first.deferred_parse_failures == [
+        f"{target_ids[0]}:{type(error).__name__}"
+    ]
+    assert control.frontier[target_ids[0]]["state"] == "fetched"
+
+    pipeline.generic_writer.batch_error = None
+    second = pipeline.parse_wave(run_id, page_kinds=["squad"], settings=settings)
+
+    assert second.failures == []
+    assert second.deferred_parse_failures == []
+    assert second.parsed == 1
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        _trino_user_error,
+        lambda: _trino_cancel_error(_trino_user_error()),
+        lambda: TrinoError("SQL execution failed: coordinator unavailable"),
+    ],
+    ids=["sql-error", "cancel-masking-sql-error", "bare-trino-error"],
+)
+def test_permanent_trino_failure_still_fails_the_wave(tmp_path, make_error):
+    _control, pipeline, _ids = _transient_cohort(
+        tmp_path, count=1, errors=[make_error()]
+    )
+
+    with pytest.raises(ParseWaveError):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+
+def test_single_parse_wave_outside_live_run_stays_loud(tmp_path):
+    # parse_fbref_wave and the recovery drain have no later wave in this
+    # process to retry a deferred target, so they keep failing loudly.
+    _control, pipeline, _ids = _transient_cohort(
+        tmp_path, count=1, errors=[_replay_17_10_00()]
+    )
+    pipeline._defer_transient_parse = False
+
+    with pytest.raises(ParseWaveError, match="TrinoError"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+
+def test_sql_error_masked_by_a_failed_reconnect_stays_loud():
+    # A connection error raised while handling a SQL error, chained to a
+    # transport cause: the SQL error rides only __context__.
+    from trino.exceptions import TrinoConnectionError
+
+    connection = TrinoConnectionError("failed to execute: Connection refused")
+    connection.__cause__ = ConnectionError("Connection refused")
+    connection.__context__ = _trino_user_error()
+
+    assert not pipeline_module._is_transient_trino_failure(connection)
+    assert pipeline_module._is_transient_trino_failure(_replay_17_10_06())
+
+
+def test_third_transient_failure_of_one_target_is_loud(tmp_path):
+    _control, pipeline, target_ids = _transient_cohort(
+        tmp_path, count=1, errors=[_replay_17_10_00() for _ in range(3)]
+    )
+    run_id = str(uuid.uuid4())
+    settings = _settings("backfill")
+
+    for _ in range(2):
+        result = pipeline.parse_wave(
+            run_id, page_kinds=["squad"], settings=settings
+        )
+        assert len(result.deferred_parse_failures) == 1
+
+    with pytest.raises(ParseWaveError, match=target_ids[0]):
+        pipeline.parse_wave(run_id, page_kinds=["squad"], settings=settings)
+
+
+@pytest.mark.parametrize(
+    ("count", "failing", "raises"),
+    [(10, 6, True), (25, 5, False), (25, 6, False)],
+)
+def test_mass_transient_trino_failures_fail_the_wave(
+    tmp_path, count, failing, raises
+):
+    _control, pipeline, _ids = _transient_cohort(
+        tmp_path,
+        count=count,
+        errors=[_replay_17_10_00() for _ in range(failing)],
+    )
+
+    def execute():
+        return pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=replace(_settings("backfill"), shard_size=25),
+        )
+
+    if raises:
+        with pytest.raises(
+            ParseWaveError, match=f"mass_parse_deferrals={failing} of {count}"
+        ):
+            execute()
+    else:
+        result = execute()
+        assert len(result.deferred_parse_failures) == failing
+        assert result.parsed == count - failing
+
+
+@pytest.mark.parametrize(
+    ("batches", "raises"),
+    [(5, False), (6, True)],
+)
+def test_run_level_deferred_parse_failure_ceiling_is_above_twenty_five(
+    tmp_path, batches, raises
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(claimed=25, fetched=25)
+    calls = []
+
+    def fake_parse(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) > batches:
+            # The final retry after the last batch finds Trino back.
+            pipeline._parse_deferrals_pending = False
+            return WaveResult(cohort_size=5, parsed=5)
+        pipeline._parse_deferrals_pending = True
+        return WaveResult(
+            cohort_size=25,
+            parsed=20,
+            deferred_parse_failures=[
+                f"fbref:match:{n:08x}:TrinoError" for n in range(5)
+            ],
+        )
+
+    pipeline.parse_wave = fake_parse
+
+    def execute():
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=17590 + batches)),
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=batches,
+        )
+
+    if raises:
+        with pytest.raises(ParseWaveError, match="mass_parse_deferrals_run=30"):
+            execute()
+    else:
+        result = execute()
+        assert len(result.parse.deferred_parse_failures) == 25
+        assert len(calls) == batches + 1
+
+
+def _drain_run(tmp_path, waves, **fetch):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    fetches = fetch.pop("fetches", None)
+    pipeline.fetch_wave = (
+        (lambda *_a, **_k: fetches.pop(0))
+        if fetches is not None
+        else (lambda *_a, **_k: WaveResult(claimed=1, fetched=1, **fetch))
+    )
+    flags = []
+
+    def fake_parse(*_args, **_kwargs):
+        flags.append(pipeline._defer_transient_parse)
+        wave = waves.pop(0)
+        pipeline._parse_deferrals_pending = bool(wave.deferred_parse_failures)
+        return wave
+
+    pipeline.parse_wave = fake_parse
+
+    def execute(**kwargs):
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=17599)),
+            worker_id="schedule-worker",
+            page_kinds=["schedule"],
+            settings=_settings(),
+            **{"max_batches": 5, **kwargs},
+        )
+
+    return pipeline, flags, execute
+
+
+def _deferred_wave():
+    return WaveResult(
+        cohort_size=1,
+        deferred_parse_failures=["fbref:schedule:646:2026:TrinoError"],
+    )
+
+
+def test_run_retries_deferred_parse_after_budget_ends_the_loop(tmp_path):
+    waves = [_deferred_wave(), WaveResult(cohort_size=1, parsed=1)]
+    pipeline, flags, execute = _drain_run(
+        tmp_path, waves, budget_exhausted=True
+    )
+
+    result = execute()
+
+    assert waves == []
+    assert result.batches == 1
+    assert result.parse.parsed == 1
+    assert flags == [True, True]
+    assert pipeline._defer_transient_parse is False
+
+
+def test_run_fails_when_final_parse_retry_defers_again(tmp_path):
+    waves = [_deferred_wave(), _deferred_wave()]
+    _pipeline, _flags, execute = _drain_run(
+        tmp_path, waves, budget_exhausted=True
+    )
+
+    with pytest.raises(
+        ParseWaveError, match="persisted through the final parse retry"
+    ):
+        execute()
+
+
+def test_deadline_stop_does_not_reparse(tmp_path):
+    waves = [_deferred_wave()]
+    pipeline, _flags, execute = _drain_run(tmp_path, waves)
+    ticks = iter([0.0, 10.0])
+    pipeline.monotonic = lambda: next(ticks)
+
+    result = execute(deadline_monotonic=5.0)
+
+    assert result.deadline_reached is True
+    assert waves == []
+
+
+def test_deferral_already_retried_needs_no_final_parse(tmp_path):
+    waves = [_deferred_wave(), WaveResult(cohort_size=1, parsed=1)]
+    _pipeline, _flags, execute = _drain_run(tmp_path, waves)
+
+    result = execute(max_batches=2)
+
+    assert waves == []
+    assert result.batches == 2
+
+
+def test_frontier_closed_run_does_not_reparse(tmp_path):
+    waves = [_deferred_wave(), WaveResult()]
+    _pipeline, _flags, execute = _drain_run(
+        tmp_path,
+        waves,
+        fetches=[WaveResult(claimed=1, fetched=1), WaveResult()],
+    )
+
+    result = execute()
+
+    assert result.frontier_closed is True
+    assert waves == []
