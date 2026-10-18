@@ -188,7 +188,7 @@ class TrinoTableManager:
         """Get or create Trino connection with retry logic."""
         if self._conn is None:
             if TrinoTableManager._trino_unreachable:
-                raise TrinoError(
+                raise TrinoUnavailableError(
                     f"Trino fast-fail: previously detected as unreachable "
                     f"at {self.host}:{self.port}. "
                     f"Skipping retry to avoid delays."
@@ -248,9 +248,14 @@ class TrinoTableManager:
                     )
 
         TrinoTableManager._trino_unreachable = True
-        raise TrinoError(
+        raise TrinoUnavailableError(
             f"Failed to connect to Trino after {self._CONNECT_RETRIES} attempts: {last_error}"
-        )
+        ) from last_error
+
+    @classmethod
+    def clear_unreachable(cls) -> None:
+        """Let the next connection attempt retry instead of failing fast."""
+        cls._trino_unreachable = False
 
     def _reset_connection(self):
         """Reset the connection (close existing, will reconnect on next use).
@@ -1520,6 +1525,10 @@ WITH (
 class TrinoError(Exception):
     """Trino operation error."""
     pass
+
+
+class TrinoUnavailableError(TrinoError):
+    """Trino did not answer: connection retries exhausted or fast-fail."""
 
 
 _ICEBERG_METADATA_ERRORS = frozenset({

@@ -14414,3 +14414,325 @@ def test_profiled_wave_restores_the_stores_when_the_wave_raises(tmp_path):
     assert pipeline.generic_writer is writer
     assert pipeline.typed_adapter.writer is typed_writer
     assert pipeline._stage_ms is None
+
+
+# --- transient Trino failure while persisting a parse (#1759) ----------------
+
+
+def _trino_split_error(page_kind):
+    """TrinoTableManager._execute wrapping ICEBERG_CANNOT_OPEN_SPLIT."""
+
+    from trino.exceptions import TrinoExternalError
+
+    driver = TrinoExternalError(
+        {
+            "errorName": "ICEBERG_CANNOT_OPEN_SPLIT",
+            "errorType": "EXTERNAL",
+            "message": (
+                "Error opening Iceberg split s3://football/warehouse/"
+                f"fbref_table_cells/data/page_kind={page_kind}/x.parquet: "
+                "Failed to open S3 file"
+            ),
+        },
+        "20261017_082603_00001_x8c8i",
+    )
+    error = TrinoError(f"SQL execution failed: {driver}")
+    error.__cause__ = driver
+    return error
+
+
+def _trino_cancel_error(context):
+    """The driver's cursor-close cancel replacing the in-flight error."""
+
+    from trino.exceptions import TrinoConnectionError
+
+    error = TrinoConnectionError(
+        "failed to cancel query: HTTPSConnectionPool(host='trino', "
+        "port=8443): Max retries exceeded"
+    )
+    error.__context__ = context
+    return error
+
+
+def _replay_04_10():
+    from trino.exceptions import TrinoConnectionError
+
+    return _trino_cancel_error(
+        TrinoConnectionError("failed to fetch: Max retries exceeded")
+    )
+
+
+def _replay_17_10_00():
+    return _trino_split_error("match")
+
+
+def _replay_17_10_06():
+    return _trino_cancel_error(_trino_split_error("schedule"))
+
+
+def _trino_user_error():
+    from trino.exceptions import TrinoUserError
+
+    driver = TrinoUserError(
+        {
+            "errorName": "COLUMN_NOT_FOUND",
+            "errorType": "USER_ERROR",
+            "message": "Column 'cell_idx' cannot be resolved",
+        },
+        "20261017_082603_00002_x8c8i",
+    )
+    error = TrinoError(f"SQL execution failed: {driver}")
+    error.__cause__ = driver
+    return error
+
+
+class _FlakyTrinoWriter(FakeWriter):
+    """Raise the scripted errors in order, then persist like FakeWriter."""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = list(errors)
+
+    def persist_page(self, page, **kwargs):
+        if self.errors:
+            raise self.errors.pop(0)
+        return super().persist_page(page, **kwargs)
+
+
+def _transient_cohort(tmp_path, *, count, errors):
+    control, pipeline, target_ids = _dead_letter_cohort(tmp_path, count=count)
+    pipeline.generic_writer = _FlakyTrinoWriter(errors)
+    return control, pipeline, target_ids
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [_replay_04_10, _replay_17_10_00, _replay_17_10_06],
+    ids=["04.10-cancel", "17.10-00-split", "17.10-06-split-then-cancel"],
+)
+@pytest.mark.parametrize("batch_persist", [False, True], ids=["seq", "batch"])
+def test_transient_trino_failure_defers_target_to_next_parse_wave(
+    tmp_path, monkeypatch, make_error, batch_persist
+):
+    from scrapers.base.trino_manager import TrinoTableManager
+
+    error = make_error()
+    # In batch mode the batch write fails first and the per-item fallback
+    # meets the same blink; either way the next wave finds Trino back.
+    control, pipeline, target_ids = _transient_cohort(
+        tmp_path, count=1, errors=[error]
+    )
+    pipeline.batch_persist_enabled = batch_persist
+    if batch_persist:
+        pipeline.generic_writer.batch_error = error
+    run_id = str(uuid.uuid4())
+    settings = _settings("backfill")
+
+    first = pipeline.parse_wave(run_id, page_kinds=["squad"], settings=settings)
+
+    assert first.failures == []
+    assert first.parsed == 0
+    assert first.deferred_parse_failures == [
+        f"{target_ids[0]}:{type(error).__name__}"
+    ]
+    assert control.frontier[target_ids[0]]["state"] == "fetched"
+
+    # Trino was declared unreachable meanwhile: the retry must reconnect.
+    monkeypatch.setattr(TrinoTableManager, "_trino_unreachable", True)
+    pipeline.generic_writer.batch_error = None
+    second = pipeline.parse_wave(run_id, page_kinds=["squad"], settings=settings)
+
+    assert TrinoTableManager._trino_unreachable is False
+    assert second.failures == []
+    assert second.deferred_parse_failures == []
+    assert second.parsed == 1
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        _trino_user_error,
+        lambda: _trino_cancel_error(_trino_user_error()),
+        lambda: TrinoError("SQL execution failed: coordinator unavailable"),
+    ],
+    ids=["sql-error", "cancel-masking-sql-error", "bare-trino-error"],
+)
+def test_permanent_trino_failure_still_fails_the_wave(tmp_path, make_error):
+    _control, pipeline, _ids = _transient_cohort(
+        tmp_path, count=1, errors=[make_error()]
+    )
+
+    with pytest.raises(ParseWaveError):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+
+def test_trino_unavailable_is_transient(tmp_path):
+    from scrapers.base.trino_manager import TrinoUnavailableError
+
+    _control, pipeline, target_ids = _transient_cohort(
+        tmp_path,
+        count=1,
+        errors=[TrinoUnavailableError("Trino fast-fail")],
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["squad"], settings=_settings("backfill")
+    )
+
+    assert result.deferred_parse_failures == [
+        f"{target_ids[0]}:TrinoUnavailableError"
+    ]
+
+
+def test_third_transient_failure_of_one_target_is_loud(tmp_path):
+    _control, pipeline, target_ids = _transient_cohort(
+        tmp_path, count=1, errors=[_replay_17_10_00() for _ in range(3)]
+    )
+    run_id = str(uuid.uuid4())
+    settings = _settings("backfill")
+
+    for _ in range(2):
+        result = pipeline.parse_wave(
+            run_id, page_kinds=["squad"], settings=settings
+        )
+        assert len(result.deferred_parse_failures) == 1
+
+    with pytest.raises(ParseWaveError, match=target_ids[0]):
+        pipeline.parse_wave(run_id, page_kinds=["squad"], settings=settings)
+
+
+@pytest.mark.parametrize(
+    ("count", "failing", "raises"),
+    [(10, 6, True), (25, 5, False), (25, 6, False)],
+)
+def test_mass_transient_trino_failures_fail_the_wave(
+    tmp_path, count, failing, raises
+):
+    _control, pipeline, _ids = _transient_cohort(
+        tmp_path,
+        count=count,
+        errors=[_replay_17_10_00() for _ in range(failing)],
+    )
+
+    def execute():
+        return pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=replace(_settings("backfill"), shard_size=25),
+        )
+
+    if raises:
+        with pytest.raises(
+            ParseWaveError, match=f"mass_parse_deferrals={failing} of {count}"
+        ):
+            execute()
+    else:
+        result = execute()
+        assert len(result.deferred_parse_failures) == failing
+        assert result.parsed == count - failing
+
+
+@pytest.mark.parametrize(
+    ("batches", "raises"),
+    [(5, False), (6, True)],
+)
+def test_run_level_deferred_parse_failure_ceiling_is_above_twenty_five(
+    tmp_path, batches, raises
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(claimed=25, fetched=25)
+    calls = []
+
+    def fake_parse(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) > batches:
+            # The final retry after the last batch finds Trino back.
+            return WaveResult(cohort_size=5, parsed=5)
+        return WaveResult(
+            cohort_size=25,
+            parsed=20,
+            deferred_parse_failures=[
+                f"fbref:match:{n:08x}:TrinoError" for n in range(5)
+            ],
+        )
+
+    pipeline.parse_wave = fake_parse
+
+    def execute():
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=17590 + batches)),
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=batches,
+        )
+
+    if raises:
+        with pytest.raises(ParseWaveError, match="mass_parse_deferrals_run=30"):
+            execute()
+    else:
+        result = execute()
+        assert len(result.parse.deferred_parse_failures) == 25
+        assert len(calls) == batches + 1
+
+
+def test_run_retries_deferred_parse_after_budget_ends_the_loop(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(
+        claimed=1, fetched=1, budget_exhausted=True
+    )
+    waves = [
+        WaveResult(
+            cohort_size=1,
+            deferred_parse_failures=["fbref:schedule:646:2026:TrinoError"],
+        ),
+        WaveResult(cohort_size=1, parsed=1),
+    ]
+    pipeline.parse_wave = lambda *_a, **_k: waves.pop(0)
+
+    result = pipeline.run_live_waves(
+        str(uuid.UUID(int=17599)),
+        worker_id="schedule-worker",
+        page_kinds=["schedule"],
+        settings=_settings(),
+        max_batches=5,
+    )
+
+    assert waves == []
+    assert result.batches == 1
+    assert result.parse.parsed == 1
+
+
+def test_frontier_closed_run_does_not_reparse(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    fetches = [WaveResult(claimed=1, fetched=1), WaveResult()]
+    pipeline.fetch_wave = lambda *_a, **_k: fetches.pop(0)
+    waves = [
+        WaveResult(
+            cohort_size=1,
+            deferred_parse_failures=["fbref:schedule:646:2026:TrinoError"],
+        ),
+        WaveResult(),
+    ]
+    pipeline.parse_wave = lambda *_a, **_k: waves.pop(0)
+
+    result = pipeline.run_live_waves(
+        str(uuid.UUID(int=17600)),
+        worker_id="schedule-worker",
+        page_kinds=["schedule"],
+        settings=_settings(),
+        max_batches=5,
+    )
+
+    assert result.frontier_closed is True
+    assert waves == []

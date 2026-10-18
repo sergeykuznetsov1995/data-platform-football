@@ -21,7 +21,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse, urlsplit
 
-from scrapers.base.trino_manager import TrinoError
+from scrapers.base.trino_manager import (
+    TrinoError,
+    TrinoTableManager,
+    TrinoUnavailableError,
+)
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
     GenericPagePersistItem,
@@ -250,6 +254,22 @@ MAX_RUN_TERMINAL_OVERSIZED_PAGES = 25
 # MAX_ROUTINE_CONTRACT_QUARANTINES; the run gets the same hard ceiling as
 # permanent redirects, so a thin but steady stream of failures still ends red.
 MAX_DEFERRED_TARGET_FAILURES_PER_RUN = 25
+# #1759: the parse-side mirror of the deferral above.  A transient Trino
+# failure while persisting one parsed page (Trino restarting, an Iceberg split
+# SeaweedFS failed to open, a dropped connection) releases that observation for
+# the next parse wave of the same run instead of failing the run: its raw is
+# already stored, so the retry costs no request.  Three such failures across
+# 59 runs (03-17.10.2026) were one or two events each.  A target gets this many
+# deferrals per run; its next transient failure is loud.  The per-wave floor
+# is MAX_ROUTINE_CONTRACT_QUARANTINES plus a cohort majority, as for #1324, and
+# the run gets the same hard ceiling as the other run-level deferrals: Trino
+# that keeps failing is down, not blinking, and the run must end red.
+MAX_PARSE_DEFERRALS_PER_TARGET = 2
+MAX_DEFERRED_PARSE_FAILURES_PER_RUN = 25
+# Driver error names that describe the storage under Trino blinking, not the
+# statement or the table.  Only observed names belong here; any other named
+# driver error (a USER_ERROR is SQL or schema) stays loud.
+TRANSIENT_TRINO_ERROR_NAMES = frozenset({"ICEBERG_CANNOT_OPEN_SPLIT"})
 # Only classes the control store's traffic summary already counts as
 # classified target failures may be deferred: any other class (an internal
 # transport bug, a raw-contract rejection, anything new) would reappear as
@@ -809,6 +829,9 @@ class WaveResult:
     # "{target_id}:{error_class}" of target-local fetch failures handed back
     # to the next run instead of failing the wave (#1324).
     deferred_target_failures: list[str] = field(default_factory=list)
+    # "{target_id}:{error_class}" of observations whose persistence hit a
+    # transient Trino failure and were left for a later parse wave (#1759).
+    deferred_parse_failures: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     # Wall-clock profile of the wave in whole milliseconds (#1320).  Integers,
     # because the run aggregate sums every counter through ``int()``.
@@ -897,6 +920,7 @@ class _ProcessedObservation:
     skipped_ineligible: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
+    deferred_parse_failures: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
 
@@ -1404,6 +1428,25 @@ def _is_mass_deferred_target_failures(result: "WaveResult") -> bool:
     return (
         deferred > MAX_ROUTINE_CONTRACT_QUARANTINES
         and deferred * 2 > result.cohort_size
+    )
+
+
+def _is_mass_deferred_parse_failures(result: "WaveResult") -> bool:
+    """Tell a Trino blink on a few pages from Trino being down (#1759)."""
+
+    deferred = len(result.deferred_parse_failures)
+    return (
+        deferred > MAX_ROUTINE_CONTRACT_QUARANTINES
+        and deferred * 2 > result.cohort_size
+    )
+
+
+def _is_run_mass_deferred_parse_failures(parse: "WaveResult") -> bool:
+    """Catch transient Trino failures spread thinly across many waves."""
+
+    return (
+        len(parse.deferred_parse_failures)
+        > MAX_DEFERRED_PARSE_FAILURES_PER_RUN
     )
 
 
@@ -2193,6 +2236,42 @@ def _is_infrastructure_failure(exc: BaseException) -> bool:
     return False
 
 
+def _is_transient_trino_failure(exc: BaseException) -> bool:
+    """Tell "Trino blinked" from "this statement can never succeed" (#1759).
+
+    The cause chain is read like ``_is_infrastructure_failure`` reads it: the
+    driver routinely raises "failed to cancel query" from the cursor close in
+    TrinoTableManager._execute, which replaces the real error and leaves it on
+    ``__context__``.  So one transient link is not enough -- any named driver
+    error outside TRANSIENT_TRINO_ERROR_NAMES anywhere in the chain (a SQL or
+    schema error the cancel happened to mask) keeps the failure loud.
+    Classification goes by type and driver error name, never by message text.
+    """
+
+    transient = False
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        error_name = getattr(current, "error_name", None)
+        if error_name is not None:
+            if (
+                error_name not in TRANSIENT_TRINO_ERROR_NAMES
+                or getattr(current, "error_type", None) != "EXTERNAL"
+            ):
+                return False
+            transient = True
+        elif isinstance(current, TrinoUnavailableError):
+            transient = True
+        elif (
+            type(current).__name__ == "TrinoConnectionError"
+            and type(current).__module__.split(".", 1)[0] == "trino"
+        ):
+            transient = True
+        current = current.__cause__ or current.__context__
+    return transient
+
+
 def _is_mass_contract_rejection(result: "WaveResult") -> bool:
     """Tell a few unusable archived pages from the source changing shape."""
 
@@ -2557,6 +2636,9 @@ class FBrefPipeline:
         self._scope_reconcile_pending = False
         self._dead_letter_budget = MAX_ROUTINE_CONTRACT_QUARANTINES
         self._dead_lettered_targets: set[str] = set()
+        # Transient Trino deferrals per target for the life of this process,
+        # i.e. one run (#1759).
+        self._parse_deferrals: dict[str, int] = {}
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
@@ -2567,8 +2649,6 @@ class FBrefPipeline:
 
     @classmethod
     def from_env(cls) -> "FBrefPipeline":
-        from scrapers.base.trino_manager import TrinoTableManager
-
         manager = TrinoTableManager()
         return cls(
             ControlStore.from_env(),
@@ -4351,7 +4431,11 @@ class FBrefPipeline:
     def _merge_wave_result(target: WaveResult, source: WaveResult) -> None:
         for name in WaveResult.__dataclass_fields__:
             value = getattr(source, name)
-            if name in {"failures", "deferred_target_failures"}:
+            if name in {
+                "failures",
+                "deferred_target_failures",
+                "deferred_parse_failures",
+            }:
                 getattr(target, name).extend(value)
             elif isinstance(value, bool):
                 setattr(target, name, bool(getattr(target, name)) or value)
@@ -4474,12 +4558,37 @@ class FBrefPipeline:
                             "mass_target_failures_run="
                             f"{len(aggregate.fetch.deferred_target_failures)}"
                         )
+                    if _is_run_mass_deferred_parse_failures(aggregate.parse):
+                        raise ParseWaveError(
+                            "mass_parse_deferrals_run="
+                            f"{len(aggregate.parse.deferred_parse_failures)}"
+                        )
 
                     if fetched.budget_exhausted:
                         break
                     if fetched.claimed == 0 and parsed.cohort_size == 0:
                         aggregate.frontier_closed = True
                         break
+                if (
+                    aggregate.parse.deferred_parse_failures
+                    and not aggregate.frontier_closed
+                ):
+                    # The loop ended on budget, deadline or batch count, so
+                    # no later wave will retry a deferred target (#1759).
+                    # Parse once more: raw only, no request, no paid lease.
+                    with self._profiled_wave() as parse_ms:
+                        parsed = self.parse_wave(
+                            run_id,
+                            page_kinds=page_kinds,
+                            settings=settings,
+                        )
+                    self._apply_stage_ms(parsed, parse_ms)
+                    self._merge_wave_result(aggregate.parse, parsed)
+                    if _is_run_mass_deferred_parse_failures(aggregate.parse):
+                        raise ParseWaveError(
+                            "mass_parse_deferrals_run="
+                            f"{len(aggregate.parse.deferred_parse_failures)}"
+                        )
                 loop_finished = self.stage_clock()
             logger.info(
                 "FBref live waves deferred scope reconcile took %d ms",
@@ -6146,6 +6255,33 @@ class FBrefPipeline:
                         dead_lettered=1,
                         failures=tuple(failures),
                     )
+        deferrals = self._parse_deferrals.get(record.target_id, 0)
+        if (
+            not failures
+            and deferrals < MAX_PARSE_DEFERRALS_PER_TARGET
+            and _is_transient_trino_failure(exc)
+        ):
+            # The failure manifest and the released observation above both
+            # landed, so the next parse wave re-lists this raw (#1759).
+            self._parse_deferrals[record.target_id] = deferrals + 1
+            logger.warning(
+                "Deferred %s to a later parse wave after transient Trino "
+                "failure %d/%d: %s: %s",
+                record.target_id,
+                deferrals + 1,
+                MAX_PARSE_DEFERRALS_PER_TARGET,
+                type(exc).__name__,
+                exc,
+            )
+            return _ProcessedObservation(
+                typed_promoted=typed_promoted,
+                stale_typed_observations_skipped=(
+                    stale_typed_observations_skipped
+                ),
+                deferred_parse_failures=(
+                    f"{record.target_id}:{type(exc).__name__}",
+                ),
+            )
         failures.append(f"{record.target_id}:{type(exc).__name__}:{exc}")
         return _ProcessedObservation(
             typed_promoted=typed_promoted,
@@ -6808,6 +6944,7 @@ class FBrefPipeline:
         result.skipped_ineligible += outcome.skipped_ineligible
         result.contract_quarantined += outcome.contract_quarantined
         result.dead_lettered += outcome.dead_lettered
+        result.deferred_parse_failures.extend(outcome.deferred_parse_failures)
         result.failures.extend(outcome.failures)
 
     def _prepare_acceptance_replay_match(
@@ -7205,6 +7342,10 @@ class FBrefPipeline:
         """Parse and persist a bounded handoff using raw storage only."""
 
         result = WaveResult()
+        if self._parse_deferrals:
+            # A deferred target is retried here; a Trino that was down when it
+            # was deferred must get a fresh connection attempt, not fast-fail.
+            TrinoTableManager.clear_unreachable()
         # One wave, one budget: the wave body is single-threaded, so a plain
         # instance counter bounds how much scope a single wave may retire
         # before the run stops instead of silently shrinking further.
@@ -7435,6 +7576,11 @@ class FBrefPipeline:
             flush_buffers(matches=True, generic=True)
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
+        if _is_mass_deferred_parse_failures(result):
+            raise ParseWaveError(
+                "mass_parse_deferrals="
+                f"{len(result.deferred_parse_failures)} of {result.cohort_size}"
+            )
         if _is_mass_contract_rejection(result):
             # Retiring a handful of archived editions is routine.  Retiring the
             # bulk of a live cohort is not a property of those pages -- it is
