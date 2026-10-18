@@ -376,13 +376,28 @@ class TestProductionTrafficCeilings:
         reserve.assert_not_called()
         stub_pkg.TransfermarktScraper.assert_not_called()
 
+    def test_entity_caps_fit_the_largest_daily_cups(self):
+        # #1758, 18.10: BRC players died at 16814745 decoded bytes after 123
+        # of 126 squads (105 attempts); BRA4 coaches at 133 attempts of ~260.
+        from scrapers.transfermarkt.models import (
+            PRODUCTION_ENTITY_BUDGETS, SCOPE_HARD_PROVIDER_BYTE_CAP,
+        )
+        players = PRODUCTION_ENTITY_BUDGETS['players']
+        coaches = PRODUCTION_ENTITY_BUDGETS['coaches']
+        assert players['decoded_mb'] * 1024 * 1024 > 2 * 16814745 * 126 / 123
+        assert players['requests'] >= 2 * 105 * 126 / 123
+        assert coaches['decoded_mb'] * 1024 * 1024 > 2 * 14731756
+        assert coaches['requests'] >= 260
+        # Paid bytes stay bounded by the unchanged per-scope provider cap.
+        assert SCOPE_HARD_PROVIDER_BYTE_CAP == 24 * 1024 * 1024
+
     @pytest.mark.parametrize(
         'extra,expected',
         [
-            (['--decoded-body-budget-mb', '16.0001'],
-             '--decoded-body-budget-mb cannot exceed 16.0'),
-            (['--request-budget', '151'],
-             '--request-budget cannot exceed 150'),
+            (['--decoded-body-budget-mb', '48.0001'],
+             '--decoded-body-budget-mb cannot exceed 48.0'),
+            (['--request-budget', '251'],
+             '--request-budget cannot exceed 250'),
             (['--cycle-budget-bytes', str(24 * 1024 * 1024 + 1)],
              '--cycle-budget-bytes cannot exceed production cap'),
         ],

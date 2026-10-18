@@ -809,7 +809,7 @@ def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
     # #1387: no parent byte cap; request/retry ceilings are unchanged.
     assert not hasattr(control, 'SCOPE_SET_HARD_BYTE_CAP')
     assert not hasattr(control, 'SCOPE_SET_SOFT_BYTE_STOP')
-    assert control.SCOPE_SET_REQUEST_LIMIT == 12_880
+    assert control.SCOPE_SET_REQUEST_LIMIT == 15_200
     assert control.SCOPE_SET_RETRY_LIMIT == 6_400
 
     manifest = _scope_manifest_fixture(control)

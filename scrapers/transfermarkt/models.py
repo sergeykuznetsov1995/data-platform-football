@@ -75,8 +75,13 @@ History keeps its former batch envelope byte for byte: hard is
 ``PARENT_DAILY_PLANNING_BYTES``, soft is this value.  Not a UTC-day cap.
 """
 
-SCOPE_REQUEST_LIMIT = 1_610
-"""Attempt ceiling for one scope cycle (150 + 650 + 650 + 160)."""
+SCOPE_REQUEST_LIMIT = 1_900
+"""Attempt ceiling for one scope cycle (250 + 650 + 650 + 350).
+
+Raised from 1610 by the owner on 18.10.2026 (#1758, standing policies
+ingest v5 / backfill v3): a 96-club cup needs ~260 coach attempts.  Paid
+bytes stay bounded by SCOPE_HARD_PROVIDER_BYTE_CAP.
+"""
 
 SCOPE_RETRY_LIMIT = 800
 """Paid-retry ceiling for one scope cycle.
@@ -101,7 +106,7 @@ The client is rate-limited to 12 requests/minute (5 s spacing), so a full
 backoff and checkpoint I/O add roughly 1.4 s per attempt, and a 1.3x margin
 keeps a slow wave from dying in TimeoutExpired (which burns attempt-guard
 budget without result evidence): 650 x (5 + 1.4) x 1.3 = 5408 -> 5400 s.
-Players (150 attempts) and coaches (160) stay on 3600 s.
+Players (250 attempts) and coaches (350) stay on 3600 s.
 """
 
 ENTITY_TIMEOUT_SECONDS: Dict[str, int] = {
@@ -175,9 +180,14 @@ PRODUCTION_ENTITY_BUDGETS: Dict[str, Dict[str, Any]] = {
     # so early entities get their full ask while the last one (coaches) may
     # receive only what is left — and when nothing is left the runner fails
     # closed with a RuntimeError before any paid I/O.
+    #
+    # players/coaches decoded caps are sized to their provider reserve, not to
+    # a ~20-club league (#1758): 18.10 measured ~0.2 provider bytes per decoded
+    # byte (BRC players 16 MiB -> 2.9 MiB, BRA4 coaches 14 MiB -> 3.1 MiB), and
+    # the 126/96-club cups died on 16/14 MiB with paid traffic far from cap.
     'players': {
-        'decoded_mb': 16.0, 'requests': 150,
-        'provider_reserve_bytes': 10_485_760,  # 16 MiB decoded x ~0.57
+        'decoded_mb': 48.0, 'requests': 250,
+        'provider_reserve_bytes': 10_485_760,  # 48 MiB decoded x ~0.2
     },
     'market_value_history': {
         'decoded_mb': 4.0, 'requests': 650,
@@ -188,8 +198,8 @@ PRODUCTION_ENTITY_BUDGETS: Dict[str, Dict[str, Any]] = {
         'provider_reserve_bytes': 8_388_608,  # 650 pages x ~10 KiB + margin
     },
     'coaches': {
-        'decoded_mb': 14.0, 'requests': 160,
-        'provider_reserve_bytes': 8_388_608,  # 14 MiB decoded x ~0.57
+        'decoded_mb': 40.0, 'requests': 350,
+        'provider_reserve_bytes': 8_388_608,  # 40 MiB decoded x ~0.2
     },
 }
 

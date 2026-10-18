@@ -15,7 +15,7 @@ from utils.transfermarkt_season_handoff import closed_targets
 from scrapers.transfermarkt.history_pool import validate_history_pool_files
 from scrapers.transfermarkt.models import SCOPE_HARD_PROVIDER_BYTE_CAP, SCOPE_REQUEST_LIMIT, SCOPE_RETRY_LIMIT
 
-NOW = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 19, 12, tzinfo=timezone.utc)
 POLICY_PATH = Path(__file__).resolve().parents[3] / 'dags/configs/transfermarkt/standing_backfill_policy.json'
 
 
@@ -353,9 +353,14 @@ def test_historical_frame_authority_rechecks_after_waiting_for_writer_lock(monke
     ('dag_ingest_transfermarkt', 'standing_approval_policy.json', 3, 'dual'),
     ('dag_backfill_transfermarkt', 'standing_backfill_policy.json', 1, 'native-only'),
 ])
-def test_known_handoff_version_migration_preserves_original_grant(monkeypatch, dag_id, filename, original_version, write_mode):
+def test_known_handoff_version_migration_preserves_original_grant(monkeypatch, tmp_path, dag_id, filename, original_version, write_mode):
     from dags.scripts import run_transfermarkt_scope_cycle as cycle
-    path = POLICY_PATH.with_name(filename)
+    # The handoff migration is defined for the version right after it; later
+    # versions (e.g. the #1758 request raise) rebind every pin by design.
+    body = json.loads(POLICY_PATH.with_name(filename).read_text())
+    body['policy_version'] = cycle.SEASON_HANDOFF_POLICY_VERSIONS[dag_id][1]
+    path = tmp_path / filename
+    path.write_text(json.dumps(body))
     current = load_standing_policy(path)
     original = replace(current, policy_version=original_version, allowed_write_tables=tuple(
         table for table in current.allowed_write_tables if table not in cycle.SEASON_HANDOFF_OPS_TABLES))
