@@ -865,11 +865,12 @@ def _clip(items: Sequence[str], limit: int = 5) -> str:
     return shown + (f' (+{hidden} more)' if hidden > 0 else '')
 
 
+# Native careers only (owner decision 17.10.2026, #1399): the legacy tables'
+# keys are coarser than the source facts (two real transfers can share a date and
+# clubs) and carry pre-native June–July rows; #1409 freezes them.
 CAREER_WRITE_TABLE_KEYS = {
     'iceberg.bronze.transfermarkt_market_value_points': ('player_id', 'mv_date'),
     'iceberg.bronze.transfermarkt_transfer_events': ('transfer_id',),
-    'iceberg.bronze.transfermarkt_market_value_history': ('player_id', 'mv_date', 'league', 'season'),
-    'iceberg.bronze.transfermarkt_transfers': ('player_id', 'transfer_date', 'from_club_id', 'to_club_id', 'league', 'season'),
 }
 
 
