@@ -14514,10 +14514,8 @@ def _transient_cohort(tmp_path, *, count, errors):
 )
 @pytest.mark.parametrize("batch_persist", [False, True], ids=["seq", "batch"])
 def test_transient_trino_failure_defers_target_to_next_parse_wave(
-    tmp_path, monkeypatch, make_error, batch_persist
+    tmp_path, make_error, batch_persist
 ):
-    from scrapers.base.trino_manager import TrinoTableManager
-
     error = make_error()
     # In batch mode the batch write fails first and the per-item fallback
     # meets the same blink; either way the next wave finds Trino back.
@@ -14539,12 +14537,9 @@ def test_transient_trino_failure_defers_target_to_next_parse_wave(
     ]
     assert control.frontier[target_ids[0]]["state"] == "fetched"
 
-    # Trino was declared unreachable meanwhile: the retry must reconnect.
-    monkeypatch.setattr(TrinoTableManager, "_trino_unreachable", True)
     pipeline.generic_writer.batch_error = None
     second = pipeline.parse_wave(run_id, page_kinds=["squad"], settings=settings)
 
-    assert TrinoTableManager._trino_unreachable is False
     assert second.failures == []
     assert second.deferred_parse_failures == []
     assert second.parsed == 1
@@ -14589,34 +14584,16 @@ def test_single_parse_wave_outside_live_run_stays_loud(tmp_path):
 
 
 def test_sql_error_masked_by_a_failed_reconnect_stays_loud():
-    # Cleanup after a SQL error reconnects and gives up: the connect error
-    # rides __cause__, the SQL error only __context__.
-    from scrapers.base.trino_manager import TrinoUnavailableError
+    # A connection error raised while handling a SQL error, chained to a
+    # transport cause: the SQL error rides only __context__.
+    from trino.exceptions import TrinoConnectionError
 
-    unavailable = TrinoUnavailableError("Failed to connect to Trino")
-    unavailable.__cause__ = ConnectionError("Connection refused")
-    unavailable.__context__ = _trino_user_error()
+    connection = TrinoConnectionError("failed to execute: Connection refused")
+    connection.__cause__ = ConnectionError("Connection refused")
+    connection.__context__ = _trino_user_error()
 
-    assert not pipeline_module._is_transient_trino_failure(unavailable)
+    assert not pipeline_module._is_transient_trino_failure(connection)
     assert pipeline_module._is_transient_trino_failure(_replay_17_10_06())
-
-
-def test_trino_unavailable_is_transient(tmp_path):
-    from scrapers.base.trino_manager import TrinoUnavailableError
-
-    _control, pipeline, target_ids = _transient_cohort(
-        tmp_path,
-        count=1,
-        errors=[TrinoUnavailableError("Trino fast-fail")],
-    )
-
-    result = pipeline.parse_wave(
-        str(uuid.uuid4()), page_kinds=["squad"], settings=_settings("backfill")
-    )
-
-    assert result.deferred_parse_failures == [
-        f"{target_ids[0]}:TrinoUnavailableError"
-    ]
 
 
 def test_third_transient_failure_of_one_target_is_loud(tmp_path):

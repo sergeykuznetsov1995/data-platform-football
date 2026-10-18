@@ -1902,26 +1902,6 @@ class TestTrinoManagerRestartResilience:
             reconnect.assert_called_once()
             ok_cursor.execute.assert_called_once_with('SELECT 1')
 
-    def test_unreachable_trino_raises_a_typed_error_until_cleared(self):
-        """#1759: callers tell "Trino did not answer" by type, not message."""
-        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
-            from scrapers.base import trino_manager as tm_mod
-
-            manager = self._manager()
-            refused = ConnectionError('Connection refused')
-            with patch.object(manager, '_create_connection', side_effect=refused), \
-                 patch.object(tm_mod.time, 'sleep'):
-                with pytest.raises(tm_mod.TrinoUnavailableError) as exhausted:
-                    manager._connect_with_retry()
-            assert exhausted.value.__cause__ is refused
-            assert isinstance(exhausted.value, tm_mod.TrinoError)
-
-            with pytest.raises(tm_mod.TrinoUnavailableError, match='fast-fail'):
-                manager.connection
-
-            tm_mod.TrinoTableManager.clear_unreachable()
-            assert tm_mod.TrinoTableManager._trino_unreachable is False
-
 
 class TestMetadataCaching:
     """Every write asked SHOW TABLES twice, DESCRIBE once and CREATE SCHEMA

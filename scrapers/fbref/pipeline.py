@@ -21,11 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse, urlsplit
 
-from scrapers.base.trino_manager import (
-    TrinoError,
-    TrinoTableManager,
-    TrinoUnavailableError,
-)
+from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
     GenericPagePersistItem,
@@ -2242,7 +2238,7 @@ def _is_transient_trino_failure(exc: BaseException) -> bool:
     The driver routinely raises "failed to cancel query" from the cursor
     close in TrinoTableManager._execute, which replaces the real error and
     leaves it on ``__context__``; a reconnect that gives up during cleanup
-    puts the connect error on ``__cause__`` and the real one on
+    can put the connect error on ``__cause__`` and the real one on
     ``__context__``.  So both links of every exception are read, and one
     transient link is not enough -- any named driver error outside
     TRANSIENT_TRINO_ERROR_NAMES anywhere in the graph (a SQL or schema error
@@ -2265,8 +2261,6 @@ def _is_transient_trino_failure(exc: BaseException) -> bool:
                 or getattr(current, "error_type", None) != "EXTERNAL"
             ):
                 return False
-            transient = True
-        elif isinstance(current, TrinoUnavailableError):
             transient = True
         elif (
             type(current).__name__ == "TrinoConnectionError"
@@ -2662,6 +2656,8 @@ class FBrefPipeline:
 
     @classmethod
     def from_env(cls) -> "FBrefPipeline":
+        from scrapers.base.trino_manager import TrinoTableManager
+
         manager = TrinoTableManager()
         return cls(
             ControlStore.from_env(),
@@ -7362,12 +7358,7 @@ class FBrefPipeline:
         """Parse and persist a bounded handoff using raw storage only."""
 
         result = WaveResult()
-        if self._parse_deferrals_pending:
-            # The previous wave deferred a target that is retried here; a Trino
-            # that was down then must get a fresh connection attempt, not
-            # fast-fail.
-            TrinoTableManager.clear_unreachable()
-            self._parse_deferrals_pending = False
+        self._parse_deferrals_pending = False
         # One wave, one budget: the wave body is single-threaded, so a plain
         # instance counter bounds how much scope a single wave may retire
         # before the run stops instead of silently shrinking further.
