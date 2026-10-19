@@ -2536,7 +2536,7 @@ def _archive_native_career_intent(scraper, spec, path, frames, results):
     if not records or not evidence['checkpoint_ids']:
         results['career_capture_archive_status'] = 'unavailable_raw_proof'
         return  # No synthetic capture proof for mocks/cache-only materialization.
-    from scrapers.transfermarkt.superseded import _hash, attest_career_manifest, verify_complete
+    from scrapers.transfermarkt.superseded import _hash, attest_career_manifest, captured_players, verify_complete
     manifest = results['native_write_manifest'] if mode == 'native-only' else results['batch_manifest']
     if manifest['status'] != 'success':
         raise RuntimeError('career archive requires successful original writer manifest')
@@ -2558,7 +2558,7 @@ def _archive_native_career_intent(scraper, spec, path, frames, results):
     attest_career_manifest(scraper, receipt)
     archived = {'intent_sha256': Path(path).stem, 'journal': journal,
         'receipt': receipt, 'frames': write_intents.pack_frames(physical)}
-    verify_complete(scraper, spec, archived, players=evidence['checkpoint_ids'], live=False, allow_later_manifest=False)
+    verify_complete(scraper, spec, archived, players=captured_players(evidence), live=False, allow_later_manifest=False)
     write_intents.archive_complete(path, receipt, physical)
     results['career_capture_archive_status'] = 'complete'
 
