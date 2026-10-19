@@ -421,6 +421,30 @@ def _validate_refresh_scope(
     return outcome
 
 
+_TRANSIENT_SCOPE_ERROR = "status=retryable_failure error=TransportError:"
+
+
+def _transient_scope_failure(env: dict[str, str]) -> bool:
+    """#1751: the scope lost only its transport, with exact byte accounting.
+
+    Every error must be a retryable TransportError; any accounting doubt,
+    control-channel failure, schema error or other error keeps the scope red.
+    """
+    try:
+        result = json.loads(Path(env["SOFASCORE_SCOPE_RESULT_PATH"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(result, dict) or result.get("run_id") != env.get("SOFASCORE_SCOPE_RUN_ID"):
+        return False
+    phases = result.get("phases")
+    if not phases or not all(isinstance(p, dict) for p in phases):
+        return False
+    errors = [*(result.get("errors") or []), *(e for p in phases for e in (p.get("errors") or []))]
+    return bool(errors) and all(_TRANSIENT_SCOPE_ERROR in str(e) for e in errors) and all(
+        p.get("accounting_uncertain") == 0 and p.get("control_channel_failures") == 0
+        and not (p.get("status_counts") or {}).get("schema_error") for p in phases)
+
+
 def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
     """Execute an independently signed continuation under the original deadline."""
     deadline = float(env["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
@@ -470,7 +494,8 @@ def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
             child.wait()
         raise
     if code:
-        return {"status": "failed", "errors": [f"scope cycle exit_code={code}"],
+        return {"status": "transient_failure" if _transient_scope_failure(env) else "failed",
+                "errors": [f"scope cycle exit_code={code}"],
                 "elapsed_s": time.monotonic() - started,
                 "scope_key": env["SOFASCORE_SCOPE_KEY"]}
     return _validate_refresh_scope(env)

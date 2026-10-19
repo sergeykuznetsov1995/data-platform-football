@@ -143,3 +143,50 @@ def test_stalled_scope_does_not_block_another_due_partition():
     assert visited == ['8','17']
     assert result['stop_reason'] == 'no_progress'
     assert result['blocked_scopes'] == ['c:8:825']
+
+
+def _scopes_harness(statuses):
+    rows = [(f'SS-{tid}', '2026', 1, 1000, 1, tid * 100) for tid in range(1, len(statuses) + 1)]
+    visited = []
+    def plan(current, budget, round_number):
+        tid = current[0][0].split('-')[1]
+        return {'SOFASCORE_SCOPE_KEY': f'c:{tid}', 'SOFASCORE_TOURNAMENT_ID': tid,
+                'SOFASCORE_CANONICAL_SEASON': '2026', 'SOFASCORE_SOURCE_SEASON_ID': str(int(tid) * 100)}
+    def execute(env):
+        tid = env['SOFASCORE_TOURNAMENT_ID']
+        visited.append(tid)
+        status = statuses[int(tid) - 1]
+        if status != 'transient_failure':
+            rows[:] = [row for row in rows if row[0] != f'SS-{tid}']
+        return {'status': status, 'elapsed_s': 20}
+    return rows, visited, plan, execute
+
+
+def test_provider_blip_skips_the_scope_and_keeps_filling_the_window():
+    rows, visited, plan, execute = _scopes_harness(['refreshed', 'transient_failure', 'refreshed'])
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                           plan=plan, execute=execute, now=lambda: 1000)
+    assert visited == ['1', '2', '3']
+    assert result['status'] == 'partial'
+    assert result['stop_reason'] == 'no_progress'
+    assert result['blocked_scopes'] == ['c:2']
+    assert result['transient_failures'] == 1
+
+
+def test_a_streak_of_transport_failures_is_red():
+    rows, visited, plan, execute = _scopes_harness(['transient_failure'] * 4)
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                           plan=plan, execute=execute, now=lambda: 1000)
+    assert visited == ['1', '2', '3']
+    assert result['status'] == 'failed'
+    assert result['stop_reason'] == 'transient_failures'
+
+
+def test_a_success_between_blips_resets_the_streak():
+    rows, visited, plan, execute = _scopes_harness(
+        ['transient_failure', 'transient_failure', 'refreshed', 'transient_failure', 'transient_failure'])
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                           plan=plan, execute=execute, now=lambda: 1000)
+    assert visited == ['1', '2', '3', '4', '5']
+    assert result['status'] == 'partial'
+    assert result['transient_failures'] == 4

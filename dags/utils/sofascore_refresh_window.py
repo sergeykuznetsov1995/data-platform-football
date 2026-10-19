@@ -42,6 +42,7 @@ def refill_window(
     max_rounds: int = 128,
     now: Callable[[], float] = time.time,
     persist: Callable[[dict[str, Any]], None] | None = None,
+    max_transient_failures: int = 3,
 ) -> dict[str, Any]:
     for value in (initial_elapsed_s, deadline_epoch, budget_s):
         if not math.isfinite(value) or value < 0:
@@ -49,6 +50,7 @@ def refill_window(
     outcomes: list[dict[str, Any]] = []
     blocked: dict[tuple[str, str, str], str] = {}
     used = 0.0
+    transient = 0
     status = "partial"
     reason = "round_cap"
 
@@ -56,6 +58,7 @@ def refill_window(
         return {"status": status, "stop_reason": reason,
                 "elapsed_s": round(used, 3), "outcomes": list(outcomes),
                 "blocked_scopes": sorted(blocked.values()),
+                "transient_failures": sum(o.get("status") == "transient_failure" for o in outcomes),
                 "window_deadline_epoch": deadline_epoch,
                 "window_budget_s": budget_s}
 
@@ -90,13 +93,28 @@ def refill_window(
             raise ValueError("invalid scope elapsed time")
         used += elapsed
         outcomes.append(outcome)
+        key = (f"SS-{env['SOFASCORE_TOURNAMENT_ID']}",
+               env['SOFASCORE_CANONICAL_SEASON'], env['SOFASCORE_SOURCE_SEASON_ID'])
+        # #1751: a provider blip (502/522, captcha) costs one scope, not the
+        # window. The scope waits for the next run; only a streak means the
+        # transport itself is down, and that stays red.
+        if outcome.get("status") == "transient_failure":
+            blocked[key] = env['SOFASCORE_SCOPE_KEY']
+            transient += 1
+            if transient >= max_transient_failures:
+                status, reason = "failed", "transient_failures"
+                if persist:
+                    persist(report())
+                break
+            if persist:
+                persist(report())
+            continue
+        transient = 0
         if outcome.get("status") not in {"success", "refreshed", "partial"}:
             status, reason = "failed", "scope_failure"
             if persist:
                 persist(report())
             break
-        key = (f"SS-{env['SOFASCORE_TOURNAMENT_ID']}",
-               env['SOFASCORE_CANONICAL_SEASON'], env['SOFASCORE_SOURCE_SEASON_ID'])
         before = sum(int(row[2]) for row in rows if _partition(row) == key)
         refreshed = pending()
         after = sum(int(row[2]) for row in refreshed if _partition(row) == key)
