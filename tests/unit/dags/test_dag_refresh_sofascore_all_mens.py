@@ -885,3 +885,29 @@ def test_propagate_reports_partial_scopes_and_window_use(clean_env, monkeypatch)
     ]
     assert verdict["window_used_s"] == 5_400.0
     assert verdict["window_use"] == 0.75
+
+
+_BLIP = ('SofaScore endpoint did not reach a publishable state: ["25","97078","event","16395967","event","final"] '
+         'status=retryable_failure error=TransportError: warmed SofaScore request failed for '
+         '/api/v1/event/16395967: Page.goto: NS_ERROR_PROXY_BAD_GATEWAY')
+
+
+def _scope_result(tmp_path, *, run_id="r:refill:11--25-97078", errors=(_BLIP,), uncertain=0, schema=0):
+    path = tmp_path / "scope.json"
+    path.write_text(json.dumps({
+        "status": "failed", "run_id": run_id, "errors": [f"matches: {e}" for e in errors],
+        "phases": [{"phase": "matches", "status": "failed", "errors": list(errors),
+                    "accounting_uncertain": uncertain, "control_channel_failures": 0,
+                    "status_counts": {"retryable_failure": 1, "schema_error": schema}}]}))
+    return {"SOFASCORE_SCOPE_RESULT_PATH": str(path), "SOFASCORE_SCOPE_RUN_ID": "r:refill:11--25-97078"}
+
+
+def test_refill_treats_only_a_clean_transport_loss_as_transient(clean_env, monkeypatch, tmp_path):
+    module = _load_dag_module(monkeypatch)
+    assert module._transient_scope_failure(_scope_result(tmp_path)) is True
+    for kwargs in ({"uncertain": 1}, {"schema": 1}, {"run_id": "stale"},
+                   {"errors": (_BLIP, "reported traffic exceeds endpoint reservation")},
+                   {"errors": ("season_mismatch: 2 rows do not match source season",)}, {"errors": ()}):
+        assert module._transient_scope_failure(_scope_result(tmp_path, **kwargs)) is False, kwargs
+    assert module._transient_scope_failure(
+        {"SOFASCORE_SCOPE_RESULT_PATH": str(tmp_path / "missing.json"), "SOFASCORE_SCOPE_RUN_ID": "x"}) is False
