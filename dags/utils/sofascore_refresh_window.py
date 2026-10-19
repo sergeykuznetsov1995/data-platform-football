@@ -6,9 +6,11 @@ immutable wall deadline independently bounds queue waits and retries.
 """
 from __future__ import annotations
 
+import json
 import math
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -25,6 +27,37 @@ def refill_deadline(deadline_epoch: float, run_started: datetime | None) -> floa
     if started.hour < 6:
         return min(deadline_epoch, started.replace(hour=4, minute=0, second=0, microsecond=0).timestamp())
     return deadline_epoch
+
+
+_TRANSIENT_SCOPE_ERROR = "status=retryable_failure error=TransportError:"
+
+
+def transient_scope_failure(result_path: str, run_id: str, not_before: float | None = None) -> bool:
+    """#1751: the scope lost only its transport, with exact byte accounting.
+
+    Every error must be a retryable TransportError; any accounting doubt,
+    control-channel failure, schema error or other error keeps the scope red.
+    ``not_before`` rejects a stale result left by an earlier try.
+    """
+    try:
+        result = json.loads(Path(result_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(result, dict) or not run_id or result.get("run_id") != run_id:
+        return False
+    if not_before is not None:
+        try:
+            if datetime.fromisoformat(str(result.get("started_at"))).timestamp() < not_before:
+                return False
+        except ValueError:
+            return False
+    phases = result.get("phases")
+    if not phases or not all(isinstance(p, dict) for p in phases):
+        return False
+    errors = [*(result.get("errors") or []), *(e for p in phases for e in (p.get("errors") or []))]
+    return bool(errors) and all(_TRANSIENT_SCOPE_ERROR in str(e) for e in errors) and all(
+        p.get("accounting_uncertain") == 0 and p.get("control_channel_failures") == 0
+        and not (p.get("status_counts") or {}).get("schema_error") for p in phases)
 
 
 def _partition(row: tuple) -> tuple[str, str, str]:

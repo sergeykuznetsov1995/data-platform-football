@@ -77,6 +77,8 @@ METADATA_TIMEOUT = timedelta(minutes=25)
 # the next run's.  The other half of the old window is the reserve for the
 # retries (``retries=1`` below: the workload plan supports a resumed retry).
 REFRESH_SCOPE_BUDGET = timedelta(hours=2)
+# #1751: transport-only scope losses in one run before it is red.
+MAX_INITIAL_TRANSIENT_FAILURES = 3
 REFRESH_RETRY_RESERVE = timedelta(hours=2)
 if (
     REFRESH_FETCH_TIMEOUT
@@ -390,6 +392,11 @@ def _validate_refresh_scope(
     except (OSError, json.JSONDecodeError) as exc:
         raise AirflowException(f"scope result is unreadable: {exc}") from exc
     status = result.get("status")
+    # #1751: the scope command lets a transport-only loss through on its last
+    # try; it is not refreshed, the next run re-plans it.
+    if status == "failed" and _transient_scope_failure(environment):
+        return {"status": "transient_failure", "scope_key": environment["SOFASCORE_SCOPE_KEY"],
+                "elapsed_s": result.get("elapsed_s"), "errors": result.get("errors")}
     # #1358: ``partial`` is a scope that stopped at its own time/byte/match
     # ceiling with the rest left for the next run — a finished task, not red.
     if status not in {"success", "partial"}:
@@ -421,28 +428,10 @@ def _validate_refresh_scope(
     return outcome
 
 
-_TRANSIENT_SCOPE_ERROR = "status=retryable_failure error=TransportError:"
-
-
 def _transient_scope_failure(env: dict[str, str]) -> bool:
-    """#1751: the scope lost only its transport, with exact byte accounting.
+    from utils.sofascore_refresh_window import transient_scope_failure
 
-    Every error must be a retryable TransportError; any accounting doubt,
-    control-channel failure, schema error or other error keeps the scope red.
-    """
-    try:
-        result = json.loads(Path(env["SOFASCORE_SCOPE_RESULT_PATH"]).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(result, dict) or result.get("run_id") != env.get("SOFASCORE_SCOPE_RUN_ID"):
-        return False
-    phases = result.get("phases")
-    if not phases or not all(isinstance(p, dict) for p in phases):
-        return False
-    errors = [*(result.get("errors") or []), *(e for p in phases for e in (p.get("errors") or []))]
-    return bool(errors) and all(_TRANSIENT_SCOPE_ERROR in str(e) for e in errors) and all(
-        p.get("accounting_uncertain") == 0 and p.get("control_channel_failures") == 0
-        and not (p.get("status_counts") or {}).get("schema_error") for p in phases)
+    return transient_scope_failure(env["SOFASCORE_SCOPE_RESULT_PATH"], env.get("SOFASCORE_SCOPE_RUN_ID", ""))
 
 
 def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
@@ -713,6 +702,9 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
             failures.append(task_instance.task_id)
     summary = _window_summary(context)
     print(f"SofaScore refresh window: {json.dumps(summary, sort_keys=True)}")
+    # One provider blip costs a scope; this many means the transport is down.
+    if summary["initial_transient_failures"] >= MAX_INITIAL_TRANSIENT_FAILURES:
+        failures.append(f"run_refresh_scope ({summary['initial_transient_failures']} transport failures)")
     if failures:
         raise AirflowException(
             "SofaScore refresh attempt failed: " + ", ".join(sorted(failures))
@@ -754,6 +746,7 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
         else:
             if isinstance(persisted, dict) and persisted.get("run_id") == str(run_id):
                 refill = persisted
+    initial_transient = sum(1 for item in outcomes if item.get("status") == "transient_failure")
     if isinstance(refill, dict):
         if "initial_outcomes" in refill:
             # A failed mapped validation may yield no XCom at all. Physical
@@ -782,6 +775,7 @@ def _window_summary(context: dict[str, Any]) -> dict[str, Any]:
         "window_budget_s": budget,
         "window_use": round(used / budget, 3),
         "refill_stop_reason": refill_reason,
+        "initial_transient_failures": initial_transient,
     }
 
 
@@ -811,6 +805,8 @@ cd /opt/airflow
 RUN_SCOPE_COMMAND = """
 set -euo pipefail
 cd /opt/airflow
+code=0
+started=$(date +%s)
 /opt/legacy-scraper-venv/bin/python \
   dags/scripts/run_sofascore_scope_cycle.py \
   --snapshot "${SOFASCORE_CAMPAIGN_SNAPSHOT}" \
@@ -824,7 +820,17 @@ cd /opt/airflow
   --output-dir "${SOFASCORE_SCOPE_OUTPUT_DIR}" \
   --output "${SOFASCORE_SCOPE_RESULT_PATH}" \
   --workload-artifact "${SOFASCORE_WORKLOAD_ARTIFACT}" \
-  --run-id "${SOFASCORE_SCOPE_RUN_ID}"
+  --run-id "${SOFASCORE_SCOPE_RUN_ID}" || code=$?
+# #1751: a transport-only loss (provider 502/522, captcha) with exact byte
+# accounting fails the first try so Airflow retries it; on the last try the
+# scope waits for the next run instead of failing the whole DagRun.
+if [ "${code}" -ne 0 ] && [ "{{ ti.try_number }}" -gt "{{ ti.max_tries }}" ] \
+    && /opt/legacy-scraper-venv/bin/python -c 'import sys; sys.path.insert(0, "dags"); from utils.sofascore_refresh_window import transient_scope_failure as t; sys.exit(0 if t(sys.argv[1], sys.argv[2], float(sys.argv[3])) else 1)' \
+        "${SOFASCORE_SCOPE_RESULT_PATH}" "${SOFASCORE_SCOPE_RUN_ID}" "${started}"; then
+  echo "SofaScore scope lost only its transport on the last try; it waits for the next run (#1751)"
+  exit 0
+fi
+exit "${code}"
 """
 
 

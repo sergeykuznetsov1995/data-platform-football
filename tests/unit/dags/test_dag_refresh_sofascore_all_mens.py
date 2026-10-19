@@ -911,3 +911,79 @@ def test_refill_treats_only_a_clean_transport_loss_as_transient(clean_env, monke
         assert module._transient_scope_failure(_scope_result(tmp_path, **kwargs)) is False, kwargs
     assert module._transient_scope_failure(
         {"SOFASCORE_SCOPE_RESULT_PATH": str(tmp_path / "missing.json"), "SOFASCORE_SCOPE_RUN_ID": "x"}) is False
+
+
+def test_validate_passes_a_transport_loss_on_to_the_window(clean_env, monkeypatch, tmp_path):
+    module = _load_dag_module(monkeypatch)
+    env = {**_scope_result(tmp_path), "SOFASCORE_CAMPAIGN_ACTION": "refresh", "SOFASCORE_SCOPE_KEY": "c:25:97078"}
+    outcome = module._validate_refresh_scope(env=env)
+    assert outcome["status"] == "transient_failure"
+    assert outcome["scope_key"] == "c:25:97078"
+    with pytest.raises(module.AirflowException):
+        module._validate_refresh_scope(env={**_scope_result(tmp_path, uncertain=1),
+                                            "SOFASCORE_CAMPAIGN_ACTION": "refresh",
+                                            "SOFASCORE_SCOPE_KEY": "c:25:97078"})
+
+
+@pytest.mark.parametrize("losses, red", [(2, False), (3, True)])
+def test_propagate_is_red_only_on_a_streak_of_transport_losses(clean_env, monkeypatch, losses, red):
+    module = _load_dag_module(monkeypatch)
+    dag_run = SimpleNamespace(get_task_instances=lambda: [
+        SimpleNamespace(task_id="run_refresh_scope", state="success")])
+    outcomes = [{"status": "refreshed", "scope_key": "c:1:1", "elapsed_s": 60.0}] + [
+        {"status": "transient_failure", "scope_key": f"c:{n}:{n}", "elapsed_s": 20.0} for n in range(2, 2 + losses)]
+    ti = SimpleNamespace(xcom_pull=lambda task_ids: outcomes)
+    if red:
+        with pytest.raises(module.AirflowException, match="3 transport failures"):
+            module._propagate_status(dag_run=dag_run, ti=ti)
+    else:
+        assert module._propagate_status(dag_run=dag_run, ti=ti)["initial_transient_failures"] == losses
+
+
+def _run_scope_command(module, tmp_path, *, try_number, result, exit_code=1):
+    """Execute the real rendered scope command with a stub scope cycle."""
+    import subprocess
+    from pathlib import Path
+
+    import jinja2
+
+    root = tmp_path / "airflow"
+    if not root.exists():
+        (root / "dags").mkdir(parents=True)
+        (root / "dags" / "utils").symlink_to(Path(module.__file__).parent / "utils")
+    stub = tmp_path / "python"
+    result_path = tmp_path / "out" / "result.json"
+    result_path.parent.mkdir(exist_ok=True)
+    stub.write_text(
+        f"#!/bin/sh\nif [ \"$1\" = dags/scripts/run_sofascore_scope_cycle.py ]; then\n"
+        f"  cat > {result_path} <<'JSON'\n{json.dumps(result)}\nJSON\n  exit {exit_code}\nfi\n"
+        f"exec {sys.executable} \"$@\"\n")
+    stub.chmod(0o755)
+    command = jinja2.Template(module.RUN_SCOPE_COMMAND).render(
+        ti=SimpleNamespace(try_number=try_number, max_tries=1))
+    command = command.replace("/opt/legacy-scraper-venv/bin/python", str(stub)).replace(
+        "cd /opt/airflow", f"cd {root}")
+    env = {"PATH": "/usr/bin:/bin", "SOFASCORE_SCOPE_RESULT_PATH": str(result_path),
+           "SOFASCORE_SCOPE_RUN_ID": "r:1"}
+    for name in ("SOFASCORE_CAMPAIGN_SNAPSHOT", "SOFASCORE_TOURNAMENT_ID", "SOFASCORE_SOURCE_SEASON_ID",
+                 "SOFASCORE_EXPECTED_SNAPSHOT_ID", "SOFASCORE_EXPECTED_CAMPAIGN_ID",
+                 "SOFASCORE_SCOPE_OUTPUT_DIR", "SOFASCORE_WORKLOAD_ARTIFACT"):
+        env[name] = "x"
+    return subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True).returncode
+
+
+def test_scope_command_lets_a_transport_loss_through_only_on_the_last_try(clean_env, monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    module = _load_dag_module(monkeypatch)
+    now = datetime.now(timezone.utc).isoformat()
+    blip = {"status": "failed", "run_id": "r:1", "started_at": now, "errors": [f"matches: {_BLIP}"],
+            "phases": [{"status": "failed", "errors": [_BLIP], "accounting_uncertain": 0,
+                        "control_channel_failures": 0, "status_counts": {"retryable_failure": 1}}]}
+    assert _run_scope_command(module, tmp_path, try_number=1, result=blip) == 1
+    assert _run_scope_command(module, tmp_path, try_number=2, result=blip) == 0
+    doubt = {**blip, "phases": [{**blip["phases"][0], "accounting_uncertain": 1}]}
+    assert _run_scope_command(module, tmp_path, try_number=2, result=doubt) == 1
+    stale = {**blip, "started_at": "2026-01-01T00:00:00+00:00"}
+    assert _run_scope_command(module, tmp_path, try_number=2, result=stale) == 1
+    assert _run_scope_command(module, tmp_path, try_number=1, result={"status": "success"}, exit_code=0) == 0
