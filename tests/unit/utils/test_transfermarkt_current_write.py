@@ -1735,6 +1735,68 @@ def _native_history_portion(scraper, monkeypatch, tmp_path, player, value, mode=
     return source, exported
 
 
+@pytest.mark.parametrize('mode', ['native-only', 'dual'])
+@pytest.mark.parametrize('status,state', [(405, 'blocked'), (503, 'retry_exhausted')])
+def test_history_archive_proves_only_captured_players_of_a_partly_failed_portion(scraper, monkeypatch, tmp_path, status, state, mode):
+    # #1764: one failed player among the portion must not fail the archive of
+    # the players that were captured and written (10/11 clears the 90% target).
+    import contextlib
+    import scrapers.transfermarkt
+    from scrapers.transfermarkt import career_refs
+    body = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 9000000, 'verein': 'History', 'age': '21', 'mw': 'EUR9m'}]}
+    captured = [str(player) for player in range(1, 11)]
+    factory = _ClientFactory([_FakeResp(json.dumps(body).encode()) for _ in captured] + [_FakeResp(b'', status=status) for _ in range(8)])
+    scraper._http_client = TransfermarktHttpClient(proxy_manager=_manager(3), raw_store=scraper.test_store,
+        require_raw_store=True, client_factory=factory, rate_limiter=_NoWaitLimiter(), sleep_fn=lambda _: None)
+    scraper._batch_id = 'history-partly-failed'
+    with monkeypatch.context() as patch:
+        patch.setattr(scrapers.transfermarkt, 'TransfermarktScraper', lambda **_: contextlib.nullcontext(scraper))
+        patch.setattr(current.run, '_select_player_ids', lambda *_args, **_kwargs:
+            (captured + ['11'], 0, 0, [], {'roster_size': 11, 'selected': 11, 'pending': 0}))
+        result = current.run._run_entity(current.run.ENTITY_SPECS['market_value_history'], ['GB1'], 2026,
+            11, str(tmp_path / 'history-result.json'), refresh_mode='history',
+            run_key='partly-failed-child', write_mode=mode, expected_reader_revision=7)
+    exported = json.loads((tmp_path / 'history-result.json').read_text())
+    assert result == 0, exported.get('errors')
+    assert exported['career_capture_archive_status'] == 'complete'
+    assert sorted(_table(scraper, 'transfermarkt_market_value_points').player_id) == sorted(captured)
+    refs = json.loads(scraper.test_db.sql.execute(f'SELECT refs_json FROM {career_refs.TABLE.split(".")[-1]}').fetchone()[0])
+    assert sorted(item[0] for item in refs) == sorted(captured)
+    states = dict(scraper.test_db.sql.execute('SELECT source_id, status FROM transfermarkt_fetch_state').fetchall())
+    assert {states[player] for player in captured} == {'success'} and states['11'] == state
+
+
+def test_history_archive_still_requires_every_captured_player_in_physical_refs(scraper, monkeypatch, tmp_path):
+    # The #1764 filter skips only failed players: a player claimed as captured
+    # but absent from the physical refs still stops the archive.
+    import contextlib
+    import scrapers.transfermarkt
+    from scrapers.transfermarkt import superseded
+    body = {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 9000000, 'verein': 'History', 'age': '21', 'mw': 'EUR9m'}]}
+    captured = [str(player) for player in range(1, 11)]
+    factory = _ClientFactory([_FakeResp(json.dumps(body).encode()) for _ in captured] + [_FakeResp(b'', status=405) for _ in range(8)])
+    scraper._http_client = TransfermarktHttpClient(proxy_manager=_manager(3), raw_store=scraper.test_store,
+        require_raw_store=True, client_factory=factory, rate_limiter=_NoWaitLimiter(), sleep_fn=lambda _: None)
+    scraper._batch_id = 'history-claimed-capture'
+    with monkeypatch.context() as patch:
+        patch.setattr(scrapers.transfermarkt, 'TransfermarktScraper', lambda **_: contextlib.nullcontext(scraper))
+        patch.setattr(current.run, '_select_player_ids', lambda *_args, **_kwargs:
+            (captured + ['11'], 0, 0, [], {'roster_size': 11, 'selected': 11, 'pending': 0}))
+        patch.setattr(superseded, 'captured_players', lambda evidence: list(evidence['checkpoint_ids']))
+        result = current.run._run_entity(current.run.ENTITY_SPECS['market_value_history'], ['GB1'], 2026,
+            11, str(tmp_path / 'history-result.json'), refresh_mode='history',
+            run_key='claimed-capture-child', write_mode='native-only', expected_reader_revision=7)
+    exported = json.loads((tmp_path / 'history-result.json').read_text())
+    assert result != 0 and exported['errors'] == ['supersession does not cover every retired player']
+
+
+def test_captured_players_keeps_journal_order_and_drops_failed_states():
+    from scrapers.transfermarkt.superseded import captured_players
+    rows = [['success', 1], ['blocked', 0], ['authoritative_empty', 0], ['retry_exhausted', 0], ['valid_empty', 0]]
+    assert captured_players({'checkpoint_ids': ['1', '2', '3', '4', '5'], 'state_rows': rows}) == ['1', '3', '5']
+    assert captured_players({'processed': ['7'], 'checkpoint_ids': ['1'], 'state_rows': [['success', 1]]}) == ['7']
+
+
 @pytest.mark.parametrize('empty', [False, True])
 @pytest.mark.parametrize('boundary,mode', [
     ('archive', 'native-only'), ('archive', 'dual'),

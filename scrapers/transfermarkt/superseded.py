@@ -17,6 +17,13 @@ def _hash(frame):
     return hashlib.sha256(json.dumps(_rows(frame), sort_keys=True).encode()).hexdigest()
 
 
+def captured_players(evidence):
+    """Journal players with a successful full endpoint; failed ones have no capture to prove."""
+    selected = evidence.get('processed', evidence.get('checkpoint_ids', []))
+    return [player for player, state in zip(selected, evidence['state_rows'], strict=True)
+            if state[0] in {'success', 'authoritative_empty', 'valid_empty'}]
+
+
 def _raw_player(scraper, journal, frame, player, entity):
     """Validate original successful raw envelope/body and full parser output."""
     from scrapers.transfermarkt.scraper import _parse_mv_history, _parse_transfers, PARSER_REVISION, SCHEMA_REVISION, MARKET_VALUE_POINT_COLUMNS, TRANSFER_EVENT_COLUMNS, _SCOPE_LINEAGE_COLUMNS, _apply_nullable_dtypes
@@ -155,9 +162,7 @@ def verify_complete(scraper, spec, archived, *, players, live=True, allow_later_
                 or later_receipt['manifests'][0]['season'] != receipt['manifests'][0]['season']
                 or tuple(later_row[field] for field in fields) != actual_manifest[0]):
                 raise RuntimeError('later native-only complete archive differs from actual manifest')
-            later_evidence = later['journal']['evidence']
-            verify_complete(scraper, spec, later,
-                players=later_evidence.get('processed', later_evidence.get('checkpoint_ids', [])),
+            verify_complete(scraper, spec, later, players=captured_players(later['journal']['evidence']),
                 live=False, allow_later_manifest=False)
         if row['status'] != 'success':
             raise RuntimeError('supersession original capture manifest is unsuccessful')
@@ -360,7 +365,7 @@ def cached_supersession(scraper, spec, retired, selected, *, reconcile=False):
                 if candidate is None:
                     continue
                 candidate_ids = [player for player in ids if player not in current_proofs
-                    and player in candidate['journal']['evidence'].get('processed', candidate['journal']['evidence'].get('checkpoint_ids', []))]
+                    and player in captured_players(candidate['journal']['evidence'])]
                 if not candidate_ids:
                     continue
                 try:
