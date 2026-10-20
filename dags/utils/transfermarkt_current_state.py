@@ -451,6 +451,7 @@ class ScopeCursor:
     roster_completed_at: datetime | None = None
     last_work_at: datetime | None = None
     resume_json: str = '{}'
+    staff_completed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _text('scope_id', self.scope_id)
@@ -459,7 +460,7 @@ class ScopeCursor:
         if not isinstance(self.cold_complete, bool):
             raise CurrentStateError('cold_complete must be boolean')
         for name in ('listing_checked_at', 'players_checked_at', 'injury_checked_at',
-                     'roster_completed_at', 'last_work_at'):
+                     'roster_completed_at', 'last_work_at', 'staff_completed_at'):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _time(getattr(self, name)))
         try:
@@ -476,7 +477,7 @@ class ScopeCursor:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'ScopeCursor':
-        return cls(**_mapping(cls, value))
+        return cls(**_mapping(cls, {'staff_completed_at': None, **value}))
 
     def daily_due(self, now: datetime) -> tuple[str, ...]:
         current = _time(now)
@@ -624,7 +625,7 @@ class CurrentWork:
 
 def plan_current_work(
     targets: Iterable[CurrentTarget], cursors: Mapping[str, ScopeCursor], *,
-    now: datetime, limit: int = 8, turn: int = 0,
+    now: datetime, limit: int = 8, turn: int = 0, staff_enabled: bool = False,
 ) -> tuple[CurrentWork, ...]:
     """Interleave fresh checks and continuation, including limit=1 via turn.
 
@@ -659,6 +660,9 @@ def plan_current_work(
             resume.append(((last_work, target.cold_priority), CurrentWork(target, 'resume')))
         elif cursor.roster_due(timestamp):
             resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_roster')))
+        elif staff_enabled and (cursor.staff_completed_at is None
+                               or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
+            resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_staff')))
     queues = [[item[1] for item in sorted(fresh, key=lambda pair: pair[0])],
               [item[1] for item in sorted(resume, key=lambda pair: pair[0])]]
     chosen: list[CurrentWork] = []

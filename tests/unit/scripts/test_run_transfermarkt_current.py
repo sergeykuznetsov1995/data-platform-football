@@ -137,6 +137,11 @@ class Offline:
                         value['data'] = value['data'][:-1]
                 elif '/verletztespieler/' in parsed.path:
                     value = outer.injury_html
+                elif '/mitarbeiter/' in parsed.path:
+                    from pathlib import Path
+                    club = parsed.path.rsplit('/', 1)[-1]
+                    fixture = Path('tests/fixtures/transfermarkt/staff/ca-boca-juniors.html').read_text()
+                    value = getattr(outer, 'staff_html', {}).get(club, fixture)
                 elif '/kader/' in parsed.path:
                     club = parsed.path.split('/verein/')[1].split('/')[0]
                     if outer.fail_club == club:
