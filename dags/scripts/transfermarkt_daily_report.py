@@ -90,27 +90,10 @@ def main(argv=None) -> int:
                           'current_editions': denominator.rows,
                           'denominator_definition_hash': denominator.denominator_definition_hash}, default=str, ensure_ascii=False))
         return 0
-    if args.execute:
-        try:
-            report = execute_measure(args.day, args.as_of, args.denominator or denominator_path())
-        except Exception:
-            # Query errors can include connection details; never export them to the summary.
-            print(json.dumps({'report': None, 'status': 'not_measured',
-                              'summary': f'Transfermarkt {args.day} МСК: не измерено — ошибка чтения измерителя'},
-                             ensure_ascii=False))
-            return 1
-    else:
-        report = json.loads(args.report_json.read_text())
     def ops_clock(value):
         stamp = datetime.fromisoformat(value) if isinstance(value, str) else value
         return utc(stamp.replace(tzinfo=stamp.tzinfo or timezone.utc))
     start, end = day_bounds(args.day)
-    if (report.get('measurement_version') != VERSION or ops_clock(report['day_start']) != start
-        or ops_clock(report['day_end']) != end or ops_clock(report['as_of']) != utc(args.as_of)):
-        raise MeasurementError('daily SQL report version/day/as_of differs from requested evidence')
-    report['report_day'] = args.day
-    samples = import_site_sample(json.loads(args.samples_json.read_text()), evidence_dir=args.samples_json.parent,
-                                 day=args.day, as_of=args.as_of) if args.samples_json else None
     dq_status = 'unknown'
     if args.dq_json and args.dq_state_root:
         parser.error('choose one DQ input')
@@ -125,6 +108,24 @@ def main(argv=None) -> int:
             dq_status = dq.get('status', 'unknown')
             if dq_status == 'RED' and dq.get('completed') is not True:
                 dq_status += ' (неполная проверка)'
+    if args.execute:
+        try:
+            report = execute_measure(args.day, args.as_of, args.denominator or denominator_path())
+        except Exception:
+            # Query errors can include connection details; never export them to the summary.
+            print(json.dumps({'report': None, 'status': 'not_measured',
+                              'summary': (f'Transfermarkt {args.day} МСК: не измерено — ошибка чтения измерителя; '
+                                          f'Bronze DQ {dq_status}')},
+                             ensure_ascii=False))
+            return 1
+    else:
+        report = json.loads(args.report_json.read_text())
+    if (report.get('measurement_version') != VERSION or ops_clock(report['day_start']) != start
+        or ops_clock(report['day_end']) != end or ops_clock(report['as_of']) != utc(args.as_of)):
+        raise MeasurementError('daily SQL report version/day/as_of differs from requested evidence')
+    report['report_day'] = args.day
+    samples = import_site_sample(json.loads(args.samples_json.read_text()), evidence_dir=args.samples_json.parent,
+                                 day=args.day, as_of=args.as_of) if args.samples_json else None
     print(json.dumps({'report': report, 'site_sample': samples,
                       'summary': format_daily_summary(report, dq_status=dq_status, site_sample=samples)},
                      default=str, ensure_ascii=False))

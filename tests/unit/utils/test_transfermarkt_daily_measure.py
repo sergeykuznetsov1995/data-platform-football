@@ -791,6 +791,44 @@ def test_unsupported_sample_is_unproven_instead_of_synthetic_row(tmp_path):
     assert report["samples"][0]["unproven_reason"] == "unsupported_change_kind"
 
 
+@pytest.mark.parametrize("dq_input", ["--dq-json", "--dq-state-root"])
+@pytest.mark.parametrize(
+    "completed,status,override,expected",
+    [
+        (True, "RED", {}, "RED"),
+        (False, "RED", {}, "RED (неполная проверка)"),
+        (False, "GREEN", {}, "unknown"),
+        (True, "RED", {"day_msk": "2026-10-07"}, "unknown"),
+        (True, "RED", {"version": "old"}, "unknown"),
+        (True, "RED", {"cutoff_at": (AS_OF + timedelta(seconds=1)).isoformat()}, "unknown"),
+    ],
+)
+def test_cli_sql_failure_preserves_independent_dq(
+    tmp_path, monkeypatch, capsys, dq_input, completed, status, override, expected
+):
+    from dags.utils.transfermarkt_daily_dq import VERSION
+
+    def fail(*args):
+        raise RuntimeError("query failed: private connection details")
+
+    monkeypatch.setattr(cli, "execute_measure", fail)
+    path = tmp_path / f"{DAY}.json"
+    dq = {"day_msk": DAY, "version": VERSION, "completed": completed,
+          "status": status, "cutoff_at": START.isoformat()}
+    dq.update(override)
+    path.write_text(json.dumps(dq))
+    result = cli.main(["--day", DAY, "--as-of", AS_OF.isoformat(), "--execute",
+                       dq_input, str(path if dq_input == "--dq-json" else tmp_path)])
+    output = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert output["report"] is None
+    assert output["status"] == "not_measured"
+    assert "не измерено" in output["summary"]
+    assert "охват 0/" not in output["summary"]
+    assert "private connection details" not in output["summary"]
+    assert output["summary"].endswith(f"Bronze DQ {expected}")
+
+
 @pytest.mark.parametrize("fault", [None, "journal", "sql", "zero", "two"])
 def test_cli_executes_promoted_registry_daily_select(tmp_path, monkeypatch, capsys, fault):
     from dags.utils import transfermarkt_native_v2 as native
