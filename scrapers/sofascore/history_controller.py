@@ -229,7 +229,8 @@ def plan(snapshot: Mapping, *, inventory: Mapping, checkpoint_path: str | Path,
                     if any(s["group"] == g and s["kind"] == "ready"
                            and (s["unknown"] or s["evidence"].get("closed", 0) < s["evidence"].get("finished", 0))
                            for s in scopes)]
-        active = next((g for g in open_core + workable if g in workable), open_core[0]) if open_core else None
+        active = (next((g for g in open_core if g in workable), workable[0] if workable else open_core[0])
+                  if open_core else None)
         if active is None:
             active = next((g for g in ("july", "3", "4", "5")
                            if (groups[g]["remaining"] or groups[g]["unknown_scopes"])
