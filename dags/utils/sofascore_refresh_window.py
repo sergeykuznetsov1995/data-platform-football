@@ -84,6 +84,7 @@ def refill_window(
     blocked: dict[tuple[str, str, str], str] = {}
     used = 0.0
     transient = 0
+    failed = 0
     status = "partial"
     reason = "round_cap"
 
@@ -143,11 +144,17 @@ def refill_window(
                 persist(report())
             continue
         transient = 0
+        # #1778: one red scope costs that scope, not the rest of the window;
+        # the run stays red, and a streak still stops it.
         if outcome.get("status") not in {"success", "refreshed", "partial"}:
-            status, reason = "failed", "scope_failure"
+            blocked[key] = env['SOFASCORE_SCOPE_KEY']
+            failed += 1
             if persist:
                 persist(report())
-            break
+            if failed >= max_transient_failures:
+                break
+            continue
+        failed = 0
         before = sum(int(row[2]) for row in rows if _partition(row) == key)
         refreshed = pending()
         after = sum(int(row[2]) for row in refreshed if _partition(row) == key)
@@ -159,6 +166,9 @@ def refill_window(
         rows = refreshed
         if persist:
             persist(report())
+    if any(o.get("status") not in {"success", "refreshed", "partial", "transient_failure"}
+           for o in outcomes) and status != "failed":
+        status, reason = "failed", "scope_failure"
     result = report()
     if persist:
         persist(result)

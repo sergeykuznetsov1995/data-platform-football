@@ -542,6 +542,9 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     assert "LIKE 'SS-%'" in sql
     assert "status_type = 'finished'" in sql
     assert "capture_complete" in sql
+    # #1778: a match moved to another season leaves the pending debt.
+    assert "iceberg.bronze.sofascore_rejected_rows" in sql
+    assert "r.reason_code = 'season_mismatch'" in sql
     # #1359: the nearest deadline that has not passed, by the meter's rule.
     from scrapers.sofascore.match_deadline import match_deadline_sql
 

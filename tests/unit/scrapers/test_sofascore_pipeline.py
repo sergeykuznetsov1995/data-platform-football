@@ -1385,6 +1385,7 @@ def _event_records_for(
     home_gender: str = "M",
     incidents: bool = True,
     jersey_number=None,
+    season_id=None,
 ) -> dict:
     records = {}
     for endpoint in EVENT_PATHS:
@@ -1394,6 +1395,8 @@ def _event_records_for(
             payload["event"]["id"] = int(match_id)
             payload["event"]["homeTeam"]["gender"] = home_gender
             payload["event"]["awayTeam"]["gender"] = away_gender
+            if season_id is not None:
+                payload["event"]["season"]["id"] = season_id
             body = json.dumps(payload).encode("utf-8")
         if endpoint == "lineups" and jersey_number is not None:
             payload = json.loads(body)
@@ -1422,6 +1425,7 @@ def _match_batch_runtime(
     bad_gender=True,
     bad_jersey_number=None,
     good_jersey_number=None,
+    bad_season_id=None,
 ):
     runtime, transport = _runtime(tmp_path)
     specs = {
@@ -1441,6 +1445,7 @@ def _match_batch_runtime(
                 jersey_number=(
                     bad_jersey_number if bad else good_jersey_number
                 ),
+                season_id=bad_season_id if bad else None,
             )
         )
     ingest_prefetched_records(runtime, specs=specs, records=records)
@@ -1572,6 +1577,57 @@ def test_match_runner_rejects_one_bad_row_and_publishes_the_other_24_matches(
         held = runtime.manifest_store.get(specs[(bad_match, endpoint)].key)
         assert held.status == ManifestStatus.SCHEMA_ERROR
         assert held.error_type == "RowRejected"
+
+
+def test_match_runner_holds_match_moved_to_another_season_and_publishes_the_rest(
+    tmp_path,
+    monkeypatch,
+):
+    """#1778: SofaScore moved one scheduled match to another season; the stale
+    schedule row must not fail the whole season on every pass."""
+    match_ids = [str(20_000_300 + n) for n in range(5)]
+    bad_match = match_ids[2]
+    runtime, transport, specs = _match_batch_runtime(
+        tmp_path, match_ids, bad_match, bad_gender=False, bad_season_id=87177
+    )
+
+    rc, result, saved, _ = _run_match_pass(
+        runtime, match_ids, tmp_path / "moved-season.json", monkeypatch
+    )
+
+    assert rc == 0, result["errors"]
+    assert transport.calls == 0
+    assert sorted(saved["sofascore_events"]["df"]["match_id"].astype(str)) == sorted(
+        set(match_ids) - {bad_match}
+    )
+    journal = saved["sofascore_rejected_rows"]["df"]
+    assert set(journal["reason_code"]) == {"season_mismatch"}
+    assert set(journal["natural_key"]) == {bad_match}
+    held = runtime.manifest_store.get(specs[(bad_match, "event")].key)
+    assert held.status == ManifestStatus.SCHEMA_ERROR
+    assert held.error_type == "RowRejected"
+
+    # The held match replays alone from raw: journaled again, not red.
+    rc, alone, saved, _ = _run_match_pass(
+        runtime, [bad_match], tmp_path / "moved-alone.json", monkeypatch
+    )
+    assert rc == 0, alone["errors"]
+    assert set(saved["sofascore_rejected_rows"]["df"]["reason_code"]) == {
+        "season_mismatch"
+    }
+
+
+def test_match_runner_fresh_pass_of_only_moved_matches_is_red(tmp_path, monkeypatch):
+    bad_match = "20000400"
+    runtime, _, _ = _match_batch_runtime(
+        tmp_path, [bad_match], bad_match, bad_gender=False, bad_season_id=87177
+    )
+    rc, result, saved, _ = _run_match_pass(
+        runtime, [bad_match], tmp_path / "moved-fresh.json", monkeypatch
+    )
+    assert rc == 1
+    assert result["errors"] == ["all 1 matches refused: season_mismatch"]
+    assert saved == {}
 
 
 def test_match_runner_quarantines_fractional_jersey_and_publishes_integral_match(

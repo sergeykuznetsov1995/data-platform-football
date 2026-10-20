@@ -688,6 +688,48 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
             + repr(sorted(source_season_ids))
         )
     expected_source_season_id = next(iter(source_season_ids))
+    # #1778: a match SofaScore moved to another season after its schedule row
+    # was written is held like a rejected row, not a failure of the season.
+    from dags.utils.sofascore_dq import RejectedRow
+
+    moved = []
+    for name, frame in frames.items():
+        if name == "capture_status" or frame.empty:
+            continue
+        column = "match_id" if "match_id" in frame.columns else "game_id"
+        if column not in frame.columns:
+            continue
+        records = frame.to_dict("records")
+        report = validate_season_alignment(
+            records,
+            expected_source_season_id=expected_source_season_id,
+            expected_canonical_season=season,
+        )
+        for index, reasons in report.rejected_indices.items():
+            row = records[index]
+            moved.append(
+                RejectedRow(
+                    row={**row, "match_id": row[column]},
+                    table=dq_tables.get(name, f"bronze.sofascore_{name}"),
+                    code="season_mismatch",
+                    message=reasons[0].message,
+                    natural_key=str(row[column]),
+                )
+            )
+    moved_ids = frozenset(str(rejected.row["match_id"]) for rejected in moved)
+    if moved_ids:
+        rejected_rows.extend(moved)
+        rejected_match_ids = rejected_match_ids | moved_ids
+        if all_rejected is None and {
+            str(r.manifest.key.target_id) for r in results
+        } <= rejected_match_ids:
+            all_rejected = f"all {len(moved_ids)} matches refused: season_mismatch"
+        for name, frame in frames.items():
+            if name == "capture_status" or frame.empty:
+                continue
+            column = "match_id" if "match_id" in frame.columns else "game_id"
+            if column in frame.columns:
+                frames[name] = frame[~frame[column].astype(str).isin(moved_ids)]
     for name, frame in frames.items():
         if name == "capture_status" or frame.empty:
             continue
