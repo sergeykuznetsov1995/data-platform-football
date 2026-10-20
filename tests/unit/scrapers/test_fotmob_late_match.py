@@ -573,3 +573,181 @@ def test_late_match_runner_deadline_is_soft_deferral(monkeypatch):
         "reason": "run deadline deferred late matches",
     }]
     assert not any("matchDetails" in url for url, _ in transport.calls)
+
+
+@pytest.mark.parametrize("observation_metadata", [False, True])
+def test_review3_current_keeps_newer_source_when_older_wave_commits_last(observation_metadata):
+    import duckdb
+    from scrapers.fotmob.repository import PARSER_VERSION
+
+    with duckdb.connect() as db:
+        db.execute("CREATE SCHEMA bronze")
+        # Execute generated view SQL with equivalents of Trino's scalar functions.
+        db.execute("CREATE MACRO from_iso8601_timestamp(value) AS CAST(value AS TIMESTAMPTZ)")
+        db.execute("CREATE MACRO json_extract_scalar(value, path) AS json_extract_string(value, path)")
+        db.execute("""CREATE TABLE bronze.fotmob_ingest_manifest (
+            batch_id VARCHAR, target_key VARCHAR, parser_version VARCHAR, status VARCHAR,
+            target_type VARCHAR, entity_id VARCHAR, competition_id VARCHAR,
+            source_season_key VARCHAR, capabilities_json VARCHAR,
+            fetched_at TIMESTAMP, completed_at TIMESTAMP
+        )""")
+        for table in ("fotmob_matches", "fotmob_match_payloads"):
+            db.execute(f"""CREATE TABLE bronze.{table} (
+                competition_id VARCHAR, source_season_key VARCHAR, match_id VARCHAR,
+                _target_batch_id VARCHAR, _observed_at TIMESTAMP, _ingested_at TIMESTAMP
+            )""")
+        db.execute("INSERT INTO bronze.fotmob_matches VALUES ('47', '2025/2026', '100', 'calendar', ?, ?)", [T, T])
+        db.execute("INSERT INTO bronze.fotmob_ingest_manifest VALUES ('calendar', 'calendar', ?, 'success', 'league_season', NULL, '47', '2025/2026', '{}', ?, ?)", [PARSER_VERSION, T, T])
+        for batch, observed, completed in (
+            ("newer", T + timedelta(hours=50), T + timedelta(hours=51)),
+            ("older", T + timedelta(hours=49), T + timedelta(hours=52)),
+        ):
+            capabilities = json.dumps({"source_observed_at": observed.isoformat()}) if observation_metadata else "{}"
+            # A 304 inherits an old fetched_at but validates at observed.
+            fetched = T if observation_metadata else observed
+            db.execute("INSERT INTO bronze.fotmob_ingest_manifest VALUES (?, ?, ?, 'success', 'match', '100', '47', '2025/2026', ?, ?, ?)", [batch, TARGET.target_key, PARSER_VERSION, capabilities, fetched, completed])
+            db.execute("INSERT INTO bronze.fotmob_match_payloads VALUES ('47', '2025/2026', '100', ?, ?, ?)", [batch, observed, completed])
+
+        class Trino:
+            def table_exists(self, schema, table):
+                return table in {"fotmob_matches", "fotmob_match_payloads"}
+
+            def get_table_columns(self, schema, table):
+                return [row[0] for row in db.execute(f"DESCRIBE {schema}.{table}").fetchall()]
+
+            def _execute(self, sql):
+                db.execute(sql.replace("iceberg.bronze.", "bronze."))
+
+        writer = ReconcileWriter()
+        writer.trino = Trino()
+        FotMobRepository(writer=writer).ensure_current_views()
+        assert db.execute("SELECT _target_batch_id FROM bronze.fotmob_match_payloads_current").fetchall() == [("newer",)]
+
+
+@pytest.mark.parametrize("stop", ["budget", "deadline"])
+def test_review3_explicit_refresh_reports_unfinished_ids(monkeypatch, stop):
+    from dags.scripts import run_fotmob_scraper as runner
+    from scrapers.fotmob.repository import MemoryFotMobRepository
+    from tests.unit.scrapers.test_run_fotmob_scraper import _run_native_admitted
+
+    transport, session = _transport([FakeResponse(200, json.dumps(GOOD).encode())], max_attempts=4)
+    repository = MemoryFotMobRepository()
+    repository.tables["fotmob_matches"] = [
+        bundle().matches[0], {**bundle().matches[0], "match_id": 101},
+    ]
+    service = FotMobIngestService(
+        transport=transport, repository=repository,
+        budget=TransportBudget(max_requests=1, max_direct_bytes=100000),
+    )
+    if stop == "deadline":
+        service.deadline_at = T
+    monkeypatch.setattr(service_module, "utc_now", lambda: T + timedelta(hours=48))
+    args = runner._argument_parser().parse_args([
+        "--mode", "refresh", "--match-ids", "100", "101", "--max-requests", "1",
+    ])
+    rc, report = _run_native_admitted(runner, args, service=service)
+    assert rc == 1
+    assert not report["complete"] and report["status"] != "success"
+    assert len(session.calls) == (1 if stop == "budget" else 0)
+    assert any("refresh incomplete" in error for error in report["errors"])
+
+
+@pytest.mark.parametrize("failure", ["quota", "retryable", "terminal", "deadline"])
+def test_review3_scope_finalizes_after_late_pass(monkeypatch, failure):
+    from dags.scripts import run_fotmob_scraper as runner
+    from tests.unit.scrapers.test_run_fotmob_scraper import _run_native_admitted
+
+    now = T + timedelta(hours=48)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=tz) if tz else now
+
+    monkeypatch.setattr(runner, "datetime", Clock)
+    monkeypatch.setattr(service_module, "utc_now", lambda: now)
+    service, transport, repository = _service({
+        canonicalize_target("allLeagues").canonical_url: {
+            "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}],
+        },
+        canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        TARGET.canonical_url: GOOD,
+    })
+    seed(repository)
+    if failure != "quota":
+        service.ledger.requests = 90
+    original = service.sync_match_payloads
+
+    def late_pass(*args, **kwargs):
+        if kwargs.get("phase") == "late":
+            assert not any(c.target_type == "scope_completion" for c in repository.commits)
+            assert not any(c.target_type == "scope_attempt" for c in repository.commits)
+            if failure == "deadline":
+                service.deadline_at = now
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "sync_match_payloads", late_pass)
+    original_fetch = transport.fetch_json
+
+    def fetch(endpoint, *args, **kwargs):
+        if endpoint == "matchDetails":
+            if failure == "retryable":
+                raise OSError("storage unavailable")
+            if failure == "terminal":
+                raise ValueError("invalid match payload")
+        return original_fetch(endpoint, *args, **kwargs)
+
+    monkeypatch.setattr(transport, "fetch_json", fetch)
+    args = runner._argument_parser().parse_args([
+        "--mode", "refresh", "--catalog-contract", "fotmob-catalog-v1",
+        "--entities", "season,matches",
+    ])
+    rc, report = _run_native_admitted(runner, args, service=service)
+    assert report["selection"]["completed_scopes"] == []
+    assert not any(c.target_type == "scope_completion" for c in repository.commits)
+    attempts = report["selection"]["scope_attempts"]
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt["outcome"] == {
+        "quota": "deferred", "deadline": "deferred", "retryable": "retryable", "terminal": "terminal",
+    }[failure]
+    if failure != "terminal":
+        assert attempt["next_retry_at"] is not None
+    assert not report["complete"]
+    assert rc == (0 if failure in {"quota", "deadline"} else 1)
+
+
+@pytest.mark.parametrize("wait", ["retry_after", "rate_limit"])
+def test_review3_late_transport_stops_after_wait_crosses_cutoff(monkeypatch, wait):
+    from scrapers.fotmob.repository import MemoryFotMobRepository
+
+    clock = [T + timedelta(hours=72) - timedelta(seconds=1)]
+    transport, session = _transport([
+        FakeResponse(503, b"down", {"Retry-After": "2"}),
+        FakeResponse(200, json.dumps(GOOD).encode()),
+    ], max_attempts=2)
+    repository = MemoryFotMobRepository()
+    seed(repository)
+    service = FotMobIngestService(transport=transport, repository=repository)
+    service.ledger.requests = 90
+    monkeypatch.setattr(service_module, "utc_now", lambda: clock[0])
+
+    def advance(_delay):
+        clock[0] += timedelta(seconds=2)
+
+    if wait == "retry_after":
+        transport.sleep_fn = advance
+    else:
+        class Limiter:
+            def acquire(self, **kwargs):
+                advance(2)
+                return True
+
+        transport.rate_limiter = Limiter()
+    result = service.sync_match_payloads(bundle(), phase="late")
+    assert result.ok
+    expected = 1 if wait == "retry_after" else 0
+    assert len(session.calls) == expected
+    assert service.ledger.requests == 90 + expected
+    assert service._late_match_requests == expected
+    assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == T

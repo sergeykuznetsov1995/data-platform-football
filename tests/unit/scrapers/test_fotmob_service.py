@@ -161,7 +161,9 @@ class StubTransport:
         self._results.append(result)
         return result
 
-    def fetch_json(self, endpoint, params=None):
+    def fetch_json(self, endpoint, params=None, **kwargs):
+        if kwargs.get("before_attempt") is not None:
+            kwargs["before_attempt"]()
         return self._get(endpoint, params, False)
 
     def replay_json(self, endpoint, params=None):

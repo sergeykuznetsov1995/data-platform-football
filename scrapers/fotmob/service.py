@@ -69,6 +69,7 @@ from .repository import (
 )
 from .raw_store import RawStoreError
 from .match_refresh import (
+    LATE_MATCH_CUTOFF, MATCH_SETTLE_MARGIN,
     MatchRefresh, match_refresh, match_time, source_observed_at,
 )
 from .transport import FetchOutcome, FetchResult, FotMobTransport, canonicalize_target
@@ -2741,7 +2742,10 @@ class FotMobIngestService:
         fetch = self.transport.replay_json("matchDetails", {"matchId": str(match["match_id"])})
         return replace(fetch, source_observed_at=record.validated_at)
 
-    def _fetch_match(self, match_id: str, *, late: bool, single_attempt: bool) -> FetchResult:
+    def _fetch_match(
+        self, match_id: str, *, late: bool, single_attempt: bool,
+        cutoff_at: Optional[datetime] = None,
+    ) -> FetchResult:
         self._raise_if_cancelled()
         if (getattr(self, "_match_budget_stopped", False)
             or self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes):
@@ -2754,8 +2758,16 @@ class FotMobIngestService:
         ):
             raise BudgetExceeded("late match quota deferred target")
         before = self.transport.snapshot_stats()
+
+        def before_attempt() -> None:
+            self._raise_if_cancelled()
+            if cutoff_at is not None and utc_now() >= cutoff_at:
+                raise RuntimeError("FotMob match refresh cutoff reached")
+
         try:
             kwargs = {"max_attempts": 1} if single_attempt else {}
+            if cutoff_at is not None:
+                kwargs["before_attempt"] = before_attempt
             fetch = self.transport.fetch_json("matchDetails", {"matchId": match_id}, **kwargs)
         except Exception:
             after = self.transport.snapshot_stats()
@@ -2833,11 +2845,20 @@ class FotMobIngestService:
                         if kind not in {"primary", "late"}:
                             result.skipped += 1
                             continue
-                    fetch = self._fetch_match(key, late=kind == "late", single_attempt=force_refresh)
+                    fetch = self._fetch_match(
+                        key, late=kind == "late", single_attempt=force_refresh,
+                        cutoff_at=(
+                            match_time(match.get("utc_time")) + MATCH_SETTLE_MARGIN + LATE_MATCH_CUTOFF
+                            if kind == "late" else None
+                        ),
+                    )
             except BudgetExceeded as exc:
                 result.metadata["deferred_reason"] = str(exc)
                 break
             except Exception as exc:
+                if str(exc) == "FotMob match refresh cutoff reached":
+                    result.skipped += 1
+                    continue
                 if str(exc) == "FotMob ingestion deadline reached":
                     result.metadata["deferred_reason"] = "deadline"
                     continue

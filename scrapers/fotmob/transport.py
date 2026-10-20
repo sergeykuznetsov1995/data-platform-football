@@ -921,6 +921,7 @@ class FotMobTransport:
         *,
         allow_stale_on_error: bool = True,
         max_attempts: Optional[int] = None,
+        before_attempt: Optional[Callable[[], None]] = None,
     ) -> FetchResult:
         attempt_limit = self.max_attempts if max_attempts is None else min(self.max_attempts, max(1, max_attempts))
         self._raise_if_cancelled()
@@ -939,9 +940,11 @@ class FotMobTransport:
         last_status: Optional[int] = None
         last_error = cache_error
         while attempts < attempt_limit:
-            attempts += 1
             self._acquire_rate_limit()
             self._raise_if_cancelled()
+            if before_attempt is not None:
+                before_attempt()
+            attempts += 1
             response: Optional[requests.Response] = None
             try:
                 response = self.session.get(

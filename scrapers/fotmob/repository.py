@@ -2280,6 +2280,17 @@ class FotMobRepository:
                             f"{table}: replacement target has no manifest identity"
                         )
                     manifest_partition = ", ".join(manifest_identity)
+                    observation_order = ""
+                    if table == "fotmob_match_payloads":
+                        # Parallel waves may publish an older response last.
+                        observation_order = """
+                                       COALESCE(
+                                           TRY(CAST(from_iso8601_timestamp(
+                                               json_extract_scalar(capabilities_json,
+                                                   '$.source_observed_at')
+                                           ) AS TIMESTAMP(6))), fetched_at
+                                       ) DESC,
+                        """
                     committed_cte = f"""
                     observed_targets AS (
                         SELECT batch_id, target_key, parser_version, status,
@@ -2289,6 +2300,7 @@ class FotMobRepository:
                                        CASE WHEN parser_version =
                                                  '{safe_parser_version}'
                                             THEN 1 ELSE 0 END DESC,
+                                       {observation_order}
                                        completed_at DESC, batch_id DESC
                                ) AS target_rn
                         FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
