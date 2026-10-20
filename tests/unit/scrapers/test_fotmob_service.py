@@ -3496,3 +3496,32 @@ def test_seasons_identity_leaves_other_target_identities_untouched():
         ),
         "match": None,
     }
+
+
+def test_1771_team_refresh_with_real_repository_replaces_old_parse():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    url = canonicalize_target("teams", {"id": "1"}).canonical_url
+    writer = _SeasonsWriter()
+    for attempt, overview in enumerate([False, True, False, False]):
+        payload = {"details": {"id": 1, "name": "Alpha"}, "overview": overview, "squad": {}}
+        service, _, _ = _service({url: payload}, mode=RunMode.REPLAY)
+        repository = FotMobRepository(writer=writer, batch_size=50)
+        repository.preload_manifest_index()
+        service.repository = repository
+        result, players = service.sync_team_snapshots(bundle, limit=1)
+        assert result.ok and result.succeeded == 1
+        assert players == set()
+        paths = repository.flush()
+        if attempt < 3:
+            assert "iceberg.bronze.fotmob_team_snapshots" in paths
+        rows = writer.rows["fotmob_team_snapshots"]
+        assert len(rows) == (1 if attempt == 0 else 2)
+        if attempt == 0:
+            batch_id = rows[0]["_target_batch_id"]
+            rows[0]["overview_json"] = "{}"
+        elif attempt >= 2:
+            current = next(row for row in rows if row["_target_batch_id"] == batch_id)
+            assert current["overview_json"] == "false"
+        # Ensure latest_success refers to the preceding, different raw batch
+        # when the original payload returns on the third observation.
+        writer.rows["fotmob_ingest_manifest"][-1]["completed_at"] = datetime(2026, 7, 11 + attempt)

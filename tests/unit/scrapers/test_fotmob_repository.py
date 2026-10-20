@@ -1504,6 +1504,15 @@ class ReconcileWriter(RecordingWriter):
                 for row in self.rows.get(table, [])
                 if str(row.get("_target_batch_id")) not in deleted
             ]
+        merge_keys = kwargs.get("merge_keys")
+        if merge_keys:
+            assert not delete_filter
+            incoming = df.to_dict("records")
+            keys = {tuple(row[key] for key in merge_keys) for row in incoming}
+            self.rows[table] = [
+                row for row in self.rows.get(table, [])
+                if tuple(row[key] for key in merge_keys) not in keys
+            ]
         self.rows.setdefault(table, []).extend(df.to_dict("records"))
         if self.fail_after_commit == table:
             self.fail_after_commit = None
@@ -3224,3 +3233,69 @@ def test_1289_failed_abort_cannot_be_followed_by_a_payload_flush(monkeypatch):
     with pytest.raises(RuntimeError, match='interrupted'):
         repository.flush()
     assert writer.calls == []
+
+
+@pytest.mark.parametrize("lost_response", [False, True])
+def test_1771_confirmed_old_team_parse_is_merged_atomically(caplog, lost_response):
+    writer = ReconcileWriter()
+    commit = _commit(target_type="team", target_key="team-target", entity_id="1")
+    current = {"team_id": "1", "overview_json": False, "snapshot_date": "2026-07-11"}
+    dataset = TableRows("fotmob_team_snapshots", [current], "team_snapshots")
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [dataset])
+    repository.flush()
+    old = writer.rows["fotmob_team_snapshots"][0]
+    old["overview_json"] = "{}"  # Previous parser collapsed scalar overview.
+    neighbor = {**old, "team_id": "2", "_target_batch_id": "neighbor"}
+    writer.rows["fotmob_team_snapshots"].append(neighbor.copy())
+    writer.fail_after_commit = "fotmob_team_snapshots" if lost_response else None
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [dataset])
+    if lost_response:
+        with pytest.raises(RuntimeError, match="lost writer response"):
+            repository.flush()
+    paths = repository.flush()
+    assert "iceberg.bronze.fotmob_team_snapshots" in paths
+    assert repository.flush() == []
+    restarted = FotMobRepository(writer=writer, batch_size=50)
+    restarted.commit(commit, [dataset])
+    restarted.flush()
+    rows = writer.rows["fotmob_team_snapshots"]
+    assert len(rows) == 2
+    assert rows[0] == neighbor
+    assert rows[1]["overview_json"] == "false"
+    assert rows[1]["_target_batch_id"] == commit.batch_id
+    merges = [kwargs for _, kwargs in writer.calls if kwargs.get("merge_keys")]
+    assert len(merges) == 1
+    assert merges[0]["merge_keys"] == ("_target_batch_id",)
+    assert not merges[0].get("delete_filter")
+    if not lost_response:
+        assert "changed parser representation" in caplog.text
+        assert commit.batch_id in caplog.text
+        assert "fotmob_team_snapshots" in caplog.text
+
+
+@pytest.mark.parametrize("corruption", ["team_id", "_payload_sha256", "_parser_version", "missing_hash", "duplicate", "manifest_hash", "manifest_target", "manifest_entity"])
+def test_1771_team_merge_requires_matching_singleton_evidence(corruption):
+    writer = ReconcileWriter()
+    commit = _commit(target_type="team", target_key="team-target", entity_id="1")
+    dataset = TableRows("fotmob_team_snapshots", [{"team_id": "1", "overview_json": False, "snapshot_date": "2026-07-11"}], "team_snapshots")
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [dataset])
+    repository.flush()
+    old = writer.rows["fotmob_team_snapshots"][0]
+    old["overview_json"] = "{}"
+    if corruption == "duplicate":
+        writer.rows["fotmob_team_snapshots"].append(old.copy())
+    elif corruption == "missing_hash":
+        old.pop("_payload_sha256")
+    elif corruption.startswith("manifest_"):
+        column = {"manifest_hash": "content_hash", "manifest_target": "target_key", "manifest_entity": "entity_id"}[corruption]
+        writer.rows[MANIFEST_TABLE][0][column] = "wrong"
+    else:
+        old[corruption] = "wrong"
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit, [dataset])
+    with pytest.raises(RuntimeError, match="expected either 0 or 1"):
+        repository.flush()
+    assert not any(kwargs.get("merge_keys") for _, kwargs in writer.calls)
