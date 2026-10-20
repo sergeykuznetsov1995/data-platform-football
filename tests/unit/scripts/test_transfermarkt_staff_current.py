@@ -5,7 +5,7 @@ import pytest
 
 from dags.scripts import run_transfermarkt_current as current
 from scrapers.transfermarkt.models import TrafficBudgetExceeded
-from tests.unit.scripts.test_run_transfermarkt_current import offline
+from tests.unit.scripts.test_run_transfermarkt_current import offline, production_current
 from tests.unit.dags.test_transfermarkt_scope_planner import _competition, _edition, _joined_row
 
 pytestmark = pytest.mark.unit
@@ -32,22 +32,14 @@ def staff_calls(offline):
     return [url.rsplit('/', 1)[-1] for _, url in offline.calls if '/mitarbeiter/' in url]
 
 
-def test_production_current_wires_independent_staff_sweep(offline, monkeypatch):
-    writer, writes = writer_for(offline)
-    monkeypatch.setattr(current, '_production_factory', offline.factory)
-    monkeypatch.setattr('dags.utils.transfermarkt_staff.write_current_staff', writer)
-    # Keep the public call compatible with the pre-fix runner. Only the actual
-    # production factory is replaced; no new staff injection argument is used.
-    current.run_current_portion(
-        [_joined_row(_competition('GB1'), _edition('GB1', '2026'))],
-        {'paid_io_allowed': True, 'write_mode': 'dual', 'revision': 1}, 'production-wiring',
-        denominator_rows=[{'competition_id': 'GB1', 'live': True, 'competition_class': 'core_club', 'tier': 1}],
-        state_dir=offline.root / 'state', qualification=offline.qualification,
-        max_seconds=2400, roster_writer=offline.roster_writer,
-        career_writer=offline.career_writer, coach_writer=offline.coach_writer,
-        now_fn=lambda: offline.clock.wall, monotonic_fn=lambda: offline.clock.elapsed,
-    )
-    assert writes == ['10', '20']
+def test_production_current_wires_independent_staff_sweep(offline, production_current):
+    from dags.utils.transfermarkt_staff import STAFF_TABLE, STAFF_RECEIPTS_TABLE
+
+    policy = json.loads(production_current.policy_path.read_text())
+    policy['allowed_write_tables'] += [STAFF_TABLE, STAFF_RECEIPTS_TABLE]
+    production_current.policy_path.write_text(json.dumps(policy))
+    production_current.run('production-wiring')
+    assert production_current.writes == ['10', '20']
     assert data(offline)['cursor']['staff_completed_at']
 
 

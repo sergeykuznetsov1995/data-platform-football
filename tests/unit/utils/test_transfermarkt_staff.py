@@ -151,7 +151,7 @@ def test_writer_rejects_missing_staff_grants_before_raw_read_or_sql(physical, st
     (), (staff.STAFF_TABLE,), (staff.STAFF_RECEIPTS_TABLE,),
     (staff.STAFF_TABLE, staff.STAFF_RECEIPTS_TABLE),
 ])
-def test_production_preflight_requires_staff_grants_before_scraper_construction(staff_policy, monkeypatch, missing):
+def test_production_factory_allows_current_without_staff_grants(staff_policy, monkeypatch, missing):
     from dags.scripts import run_transfermarkt_current as runner
     from tests.unit.dags.test_transfermarkt_scope_planner import _competition, _edition, _joined_row
 
@@ -167,13 +167,8 @@ def test_production_preflight_requires_staff_grants_before_scraper_construction(
     monkeypatch.setattr(tm, 'TransfermarktScraper', create)
     target = SimpleNamespace(competition_id='GB1', edition_id='2026', scope_id='scope')
     row = _joined_row(_competition('GB1'), _edition('GB1', '2026'))
-    if missing:
-        with pytest.raises(staff.current.CurrentWriteError, match='authorize staff tables'):
-            runner._production_factory(target, row, {}, 1000, {})
-        assert constructed == []
-    else:
-        assert runner._production_factory(target, row, {}, 1000, {}) == 'scraper'
-        assert len(constructed) == 1
+    assert runner._production_factory(target, row, {}, 1000, {}) == 'scraper'
+    assert len(constructed) == 1
 
 
 @pytest.mark.parametrize('phase', ['business', 'receipt'])

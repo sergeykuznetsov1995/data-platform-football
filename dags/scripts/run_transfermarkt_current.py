@@ -12,6 +12,7 @@ import fcntl
 import argparse
 import hashlib
 import json
+import logging
 import os
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -267,7 +268,6 @@ def _production_factory(target, row, cache, deadline, used):
     from dags.scripts.run_transfermarkt_scope_cycle import validate_standing_policy_for_scope_cycle
     from dags.utils.transfermarkt_approval import load_standing_policy
     from dags.utils.transfermarkt_scope_planner import _competition_from_joined_row
-    from dags.utils.transfermarkt_staff import validate_staff_write_policy
     from scrapers.transfermarkt.scraper import TransfermarktScraper
 
     if os.environ.get('TM_STANDING_POLICY_ENABLED', '').lower() not in {'true', '1'}:
@@ -286,7 +286,6 @@ def _production_factory(target, row, cache, deadline, used):
     allowed = {table.split('.')[-1] for table in policy.allowed_write_tables}
     if not {'transfermarkt_current_signals_v1', 'transfermarkt_current_checks_v1', 'transfermarkt_season_close_v1'} <= allowed:
         raise CurrentPortionError('standing policy does not authorize current ops tables')
-    validate_staff_write_policy(policy)
     remaining = SCOPE_HARD_PROVIDER_BYTE_CAP - used.get('provider_metered_bytes', 0)
     soft = SCOPE_SOFT_PROVIDER_BYTE_STOP - used.get('provider_metered_bytes', 0)
     if soft <= 0 or used.get('requests', 0) >= SCOPE_REQUEST_LIMIT or used.get('retries', 0) >= SCOPE_RETRY_LIMIT:
@@ -1641,9 +1640,20 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
     if coach_writer is None and scraper_factory is None:
         from dags.utils.transfermarkt_current_write import fetch_current_coaches
         coach_writer = fetch_current_coaches
-    if staff_writer is None and scraper_factory is None:
-        from dags.utils.transfermarkt_staff import write_current_staff
-        staff_writer = write_current_staff
+    if scraper_factory is None:
+        from dags.utils.transfermarkt_approval import load_standing_policy
+        from dags.utils.transfermarkt_current_write import CurrentWriteError
+        from dags.utils.transfermarkt_staff import validate_staff_write_policy, write_current_staff
+        path = os.environ.get('TM_STANDING_POLICY_PATH', '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json')
+        policy = load_standing_policy(path)
+        try:
+            validate_staff_write_policy(policy)
+        except CurrentWriteError:
+            staff_writer = None
+            report['staff_status'] = 'staff not authorized'
+            logging.getLogger(__name__).warning('staff not authorized: skipping staff collection')
+        else:
+            staff_writer = staff_writer or write_current_staff
     factory = scraper_factory or _production_factory
     directory = Path(state_dir or os.environ.get('TM_CURRENT_STATE_DIR', '/opt/airflow/logs/transfermarkt-native-v2/current'))
     directory.mkdir(parents=True, exist_ok=True)
