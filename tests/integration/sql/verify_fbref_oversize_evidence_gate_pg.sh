@@ -332,7 +332,7 @@ INSERT INTO fbref_control.fetch_attempt VALUES
         repeat('a', 64),
         'manifests/fetches/20000000-0000-4000-8000-000000000001.json',
         5000000, 1200, 3000, 3000,
-        'fbref-camoufox-metered-warm-http-v10',
+        'fbref-camoufox-metered-warm-http-v11',
         '60000000-0000-4000-8000-000000000001'
     ),
     (
@@ -345,7 +345,7 @@ INSERT INTO fbref_control.fetch_attempt VALUES
         repeat('b', 64),
         'manifests/fetches/20000000-0000-4000-8000-000000000002.json',
         6000000, 1500, 2000, 2000,
-        'fbref-camoufox-metered-warm-http-v10',
+        'fbref-camoufox-metered-warm-http-v11',
         '60000000-0000-4000-8000-000000000001'
     );
 
@@ -657,15 +657,15 @@ SET transport_version = NULL
 WHERE attempt_id = '40000000-0000-4000-8000-000000000001'::uuid;"
 assert_no_go "null-attempt-transport"
 "${psql_cmd[@]}" -c "UPDATE fbref_control.fetch_attempt
-SET transport_version = 'fbref-camoufox-metered-warm-http-v10'
+SET transport_version = 'fbref-camoufox-metered-warm-http-v11'
 WHERE attempt_id = '40000000-0000-4000-8000-000000000001'::uuid;"
 
 "${psql_cmd[@]}" -c "UPDATE fbref_control.fetch_attempt
-SET transport_version = 'fbref-camoufox-metered-warm-http-v9'
+SET transport_version = 'fbref-camoufox-metered-warm-http-v10'
 WHERE attempt_id = '40000000-0000-4000-8000-000000000001'::uuid;"
 assert_no_go "foreign-fetcher-version"
 "${psql_cmd[@]}" -c "UPDATE fbref_control.fetch_attempt
-SET transport_version = 'fbref-camoufox-metered-warm-http-v10'
+SET transport_version = 'fbref-camoufox-metered-warm-http-v11'
 WHERE attempt_id = '40000000-0000-4000-8000-000000000001'::uuid;"
 
 "${psql_cmd[@]}" -c "UPDATE fbref_control.fetch_attempt
@@ -763,7 +763,7 @@ INSERT INTO fbref_control.fetch_attempt VALUES (
     1, NULL, 'succeeded', NULL, NULL, 200, 1, ARRAY[200]::integer[],
     'orphan-content', 'raw/manifests/orphan.json',
     1000, 500, 1000, 1000,
-    'fbref-camoufox-metered-warm-http-v10',
+    'fbref-camoufox-metered-warm-http-v11',
     '60000000-0000-4000-8000-000000000001'
 );"
 assert_no_go "orphan-extra-attempt" "${orphan_target_id}"

@@ -76,8 +76,8 @@ def test_operator_order_marks_terminal_candidate_no_go_pending_review() -> None:
     raw = _raw(REMEDIATION_FILE)
     fetcher = _raw(FETCHER_FILE)
 
-    assert "fbref-camoufox-metered-warm-http-v10" in raw
-    assert "fbref-camoufox-metered-warm-http-v10" in fetcher
+    assert "fbref-camoufox-metered-warm-http-v11" in raw
+    assert "fbref-camoufox-metered-warm-http-v11" in fetcher
     assert "TERMINAL AUTHORITY BAKED" in raw
     assert "CANDIDATE NO-GO UNTIL INDEPENDENT REVIEW" in raw
     assert "DO NOT EXECUTE" in raw
@@ -90,6 +90,24 @@ def test_operator_order_marks_terminal_candidate_no_go_pending_review() -> None:
     assert "8 mib decoded-body cap" in raw.lower()
     assert "9 mib target reservation" in raw.lower()
     assert "8 mib+1" in raw.lower()
+
+
+def test_runtime_pins_match_current_transport_and_pipeline() -> None:
+    version = re.search(r'FETCHER_VERSION = "([^"]+)"', _raw(FETCHER_FILE))[1]
+    raw = _raw(REMEDIATION_FILE)
+
+    assert f"assert FETCHER_VERSION == '{version}'" in raw
+    assert (
+        f"assert c == '{hashlib.sha256(PIPELINE_FILE.read_bytes()).hexdigest()}'"
+        in raw
+    )
+    assert f"all_attempts.transport_version = '{version}'" in _sql(GATE_FILE)
+
+    pg = _raw(POSTGRES_REGRESSION_FILE)
+    versions = re.findall(r"'fbref-camoufox-metered-warm-http-v\d+'", pg)
+    assert versions == [f"'{version}'"] * 3 + [
+        "'fbref-camoufox-metered-warm-http-v10'",
+    ] + [f"'{version}'"] * 2
 
 
 @pytest.mark.parametrize("path", [REMEDIATION_FILE, GATE_FILE])
@@ -497,7 +515,7 @@ def test_success_gate_proves_full_raw_and_page_accounting_are_lossless() -> (
         in sql
     )
     assert (
-        "all_attempts.transport_version = 'fbref-camoufox-metered-warm-http-v10'"
+        "all_attempts.transport_version = 'fbref-camoufox-metered-warm-http-v11'"
         in sql
     )
     assert "page.attempt_session_version <> page.session_id::text" in sql
