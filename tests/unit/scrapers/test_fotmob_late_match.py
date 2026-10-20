@@ -174,8 +174,9 @@ def test_late_match_recovers_raw_after_cutoff_without_http(tmp_path, monkeypatch
     assert bool(repository.tables.get("fotmob_match_payloads")) == (not incomplete)
 
 
-def test_late_match_processed_missing_raw_allows_scheduled_http(tmp_path, monkeypatch):
-    from scrapers.fotmob.repository import MemoryFotMobRepository
+@pytest.mark.parametrize("persisted", [False, True], ids=["buffer", "sql"])
+def test_late_match_processed_missing_raw_allows_scheduled_http(tmp_path, monkeypatch, persisted):
+    from scrapers.fotmob import repository as repository_module
 
     raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())
     missing = {"error": True, "message": "Data not found", "matchId": 100}
@@ -183,10 +184,33 @@ def test_late_match_processed_missing_raw_allows_scheduled_http(tmp_path, monkey
         FakeResponse(200, json.dumps(missing).encode()),
         FakeResponse(200, json.dumps(GOOD).encode()),
     ], raw_store=raw_store, max_attempts=1)
-    repository = MemoryFotMobRepository()
+    writer = ReconcileWriter()
+    repository = FotMobRepository(writer=writer, batch_size=100)
+    query = writer.trino.execute_query
+
+    def projected(sql):
+        if "WHERE target_type = 'match'" in sql or "ROW_NUMBER()" in sql:
+            rows = list(writer.rows.get("fotmob_ingest_manifest", []))
+            if "status IN ('success', 'not_modified')" in sql:
+                rows = [row for row in rows if row["status"] in {"success", "not_modified"}]
+            if "ROW_NUMBER()" in sql:
+                latest = {}
+                for row in sorted(rows, key=lambda row: (row["completed_at"], row["batch_id"])):
+                    key = ((row["target_type"], row["entity_id"])
+                           if "PARTITION BY target_type, entity_id" in sql else row["target_key"])
+                    latest[key] = row
+                rows = list(latest.values())
+            if "LIMIT 1" in sql:
+                rows = sorted(rows, key=lambda row: (row["completed_at"], row["batch_id"]), reverse=True)[:1]
+            columns = [column.strip() for column in sql.split("SELECT", 1)[1].split("FROM", 1)[0].split(",")]
+            return [tuple(row.get(column) for column in columns) for row in rows]
+        return query(sql)
+
+    monkeypatch.setattr(writer.trino, "execute_query", projected)
     seed(repository)
     clock = [T + timedelta(hours=6)]
     monkeypatch.setattr(service_module, "utc_now", lambda: clock[0])
+    monkeypatch.setattr(repository_module, "utc_now", lambda: clock[0])
     original_store = raw_store.store
 
     def store(*args, **kwargs):
@@ -197,20 +221,32 @@ def test_late_match_processed_missing_raw_allows_scheduled_http(tmp_path, monkey
     service = FotMobIngestService(transport=transport, repository=repository, run_id="missing")
     service.ledger.requests = 90
     assert service.sync_match_payloads(bundle()).not_available == 1
-    assert repository.commits[-1].error_code == "source_data_not_found"
-    # Memory commits need an explicit completion time to sort after seed().
-    repository.commits[-1] = replace(repository.commits[-1], completed_at=clock[0])
+    assert repository._pending_manifest[-1]["error_code"] == "source_data_not_found"
     assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == T
+    if persisted:
+        repository.flush()
+        repository = FotMobRepository(writer=writer, batch_size=100)
+
+    replay_calls = []
+    replay = transport.replay_json
+
+    def tracked_replay(*args, **kwargs):
+        replay_calls.append((args, kwargs))
+        return replay(*args, **kwargs)
+
+    monkeypatch.setattr(transport, "replay_json", tracked_replay)
 
     clock[0] += timedelta(hours=1)
     restarted = FotMobIngestService(transport=transport, repository=repository, run_id="retry-missing")
     restarted.ledger.requests = 90
     result = restarted.sync_match_payloads(bundle())
     assert result.succeeded == 1 and result.not_available == 0
+    assert not replay_calls
     assert len(session.calls) == 2
-    assert sum(commit.status == ManifestStatus.NOT_AVAILABLE for commit in repository.commits) == 1
     assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == clock[0]
-    assert repository.tables["fotmob_match_payloads"][0]["match_facts_json"]["infoBox"]["Attendance"] == 14757
+    repository.flush()
+    assert sum(row["status"] == "not_available" for row in writer.rows["fotmob_ingest_manifest"]) == 1
+    assert json.loads(writer.rows["fotmob_match_payloads"][0]["match_facts_json"])["infoBox"]["Attendance"] == 14757
 
 
 @pytest.mark.parametrize("changed", ["body", "validation", "both"])

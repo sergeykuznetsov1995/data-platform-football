@@ -880,6 +880,7 @@ class FotMobRepository:
         "completed_at",
         "actual_counts_json",
         "capabilities_json",
+        "error_code",
     )
 
     def __init__(
@@ -2589,7 +2590,7 @@ class FotMobRepository:
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
                    status, stale, fetched_at, completed_at, actual_counts_json,
-                   capabilities_json
+                   capabilities_json, error_code
             FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
             WHERE target_key = '{safe}'
               AND parser_version = '{safe_version}'
@@ -2656,7 +2657,7 @@ class FotMobRepository:
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
                    status, stale, fetched_at, completed_at, actual_counts_json,
-                   capabilities_json
+                   capabilities_json, error_code
             FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
             WHERE target_type = '{safe_type}'
               AND entity_id = '{safe_id}'

@@ -280,6 +280,7 @@ class EntityAttemptTrino:
                 datetime(2026, 8, 8, 10),
                 "{}",
                 "{}",
+                "http_error",
             )
         ]
 
@@ -891,6 +892,7 @@ def test_iceberg_latest_entity_attempt_includes_failure_statuses():
 
     assert latest is not None
     assert latest["status"] == "retryable_failure"
+    assert latest["error_code"] == "http_error"
     assert latest["completed_at"] == datetime(2026, 8, 8, 10)
     sql = " ".join(writer.trino.sql[0].split())
     assert "target_type = 'competition_seasons'" in sql
@@ -2020,6 +2022,7 @@ def _manifest_row(
         completed,
         "{}",
         "{}",
+        None,
         target_type,
         entity_id,
     )
