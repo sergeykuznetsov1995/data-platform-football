@@ -216,8 +216,8 @@ reason is exported by `field_map.py` and written to the field inventory.
 - snapshot-backed current views first select the newest successful exact target,
   so removed/postponed fixtures and departed squad members do not survive from
   an older payload; catalog tombstones retain their separate two-snapshot rule;
-- immutable finished matches skip successful manifests before applying batch
-  limits, so each daily chunk progresses instead of refetching its prefix;
+- finished matches skip successful manifests except for the bounded late refresh
+  policy below; primary collection precedes late requests and batch limits;
 - team snapshots have a 20-hour freshness window, player snapshots seven days;
 - one league payload feeds season/matches/tables/stages/teams/categories and the
   selected discovery response is reused (no second season GET);
@@ -280,3 +280,28 @@ competitions whose names do not carry gender/age metadata.
 - `git diff --check`: успешно;
 - `docker compose config --quiet`: успешно с ожидаемыми предупреждениями о
   секретах, отсутствующих в локальном audit shell.
+
+### Late matchDetails refresh (#1185)
+
+Finished cards are revalidated at T+6h and T+48h, where T is the saved kickoff
+(`utc_time`) plus the existing three-hour settle margin. HTTP refresh stops at
+T+72h, including repeated 404/503 or schema failures. A successful observation
+at or beyond a threshold satisfies it; a delayed observation can satisfy both.
+Only published, non-stale success observations count. Old manifests fall back
+to `fetched_at`; new ones carry source validation time in `capabilities_json`.
+304 and identical 200 update this observation with the same physical batch ID.
+
+Primary collection across the selected wave runs first. Late requests, including
+retries and exceptions, share the existing request/byte/RPM/deadline limits and
+satisfy `9 * late_attempts <= ordinary_attempts`. A small wave may have no late
+quota; deferred work remains due until the cutoff, without a checkpoint.
+History completion, campaign markers and cooldowns do not suppress due cards.
+
+Already received raw is parsed and validated before publication, without HTTP,
+even after the cutoff/deadline. Automatic reopening uses saved calendar rows
+from the last seven days, a bounded recovery horizon; after a longer outage,
+use an explicit offline replay for saved IDs. Invalid raw cannot replace current.
+For the agreed post-delivery acceptance, `--match-ids 5847135` uses saved calendar
+metadata, skips discovery, and permits one HTTP attempt per ID. `--mode replay
+--match-ids 5847135` is the offline recovery path. No acceptance request has been
+made as part of this implementation.

@@ -4602,6 +4602,7 @@ class TestFotmobNativeRunner:
             for item in competitions
         }
         repository = SimpleNamespace(
+            stored_match_rows=lambda: [],
             scope_completion_times=MagicMock(return_value={}),
             competition_completion_times=MagicMock(return_value={}),
             flush=MagicMock(return_value=[]),
@@ -5616,7 +5617,9 @@ class _IndexedRepository:
         match_id = self.collected.get(target_key)
         if match_id is None:
             return None
-        return {"stale": match_id in self.stale}
+        return {"stale": match_id in self.stale, "fetched_at": datetime(2026, 9, 15, 22)}
+
+    latest_match_source = latest_success
 
 
 class _BareRepository:

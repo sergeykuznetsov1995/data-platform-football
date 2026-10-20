@@ -81,6 +81,7 @@ class FetchResult:
     proxy_bytes: int
     error: Optional[str] = None
     retry_after: Optional[timedelta] = None
+    source_observed_at: Optional[str] = None
 
     @property
     def status(self) -> str:
@@ -288,6 +289,7 @@ class FotMobTransport:
         self.jitter_seconds = max(0.0, jitter_seconds)
         self.max_retry_delay = max(0.0, max_retry_delay)
         self._stats_lock = threading.Lock()
+        self._thread_attempts = threading.local()
         self._cancelled = threading.Event()
         self._stats: dict[str, Any] = {}
         self.reset_stats()
@@ -352,11 +354,25 @@ class FotMobTransport:
             values["outcome_counts"] = dict(self._stats["outcome_counts"])
         return TransportStats(**values)
 
+    def thread_attempt_stats(self, *, reset: bool = False) -> dict[str, int]:
+        """Completed HTTP attempts on this worker, also available after an exception."""
+        if reset:
+            self._thread_attempts.attempts = 0
+            self._thread_attempts.direct_bytes = 0
+        return {
+            "attempts": getattr(self._thread_attempts, "attempts", 0),
+            "direct_bytes": getattr(self._thread_attempts, "direct_bytes", 0),
+            "proxy_bytes": 0,
+        }
+
     def _start_target(self) -> None:
+        self.thread_attempt_stats(reset=True)
         with self._stats_lock:
             self._stats["logical_targets"] += 1
 
     def _record_attempt(self, status: Union[int, str], encoded_bytes: int) -> None:
+        self._thread_attempts.attempts = getattr(self._thread_attempts, "attempts", 0) + 1
+        self._thread_attempts.direct_bytes = getattr(self._thread_attempts, "direct_bytes", 0) + encoded_bytes
         status_key = str(status)
         with self._stats_lock:
             self._stats["attempts"] += 1
@@ -450,6 +466,7 @@ class FotMobTransport:
         error: Optional[str] = None,
         expects_json: bool = True,
         retry_after: Optional[timedelta] = None,
+        source_observed_at: Optional[str] = None,
     ) -> FetchResult:
         # FotMob answers HTTP 200 with a literal JSON ``null`` body for dead
         # catalog entries (placeholder/promo competitions).  A null payload
@@ -497,6 +514,11 @@ class FotMobTransport:
             proxy_bytes=0,
             error=error,
             retry_after=retry_after,
+            source_observed_at=(
+                source_observed_at or (record.validated_at if record is not None else datetime.now(timezone.utc).isoformat())
+                if not stale and outcome in {FetchOutcome.SUCCESS, FetchOutcome.NOT_MODIFIED}
+                else None
+            ),
             **fields,
         )
 
@@ -898,7 +920,10 @@ class FotMobTransport:
         params: Optional[Params] = None,
         *,
         allow_stale_on_error: bool = True,
+        max_attempts: Optional[int] = None,
+        before_attempt: Optional[Callable[[], None]] = None,
     ) -> FetchResult:
+        attempt_limit = self.max_attempts if max_attempts is None else min(self.max_attempts, max(1, max_attempts))
         self._raise_if_cancelled()
         target = canonicalize_target(url_or_endpoint, params)
         self._start_target()
@@ -914,10 +939,12 @@ class FotMobTransport:
         network_bytes = 0
         last_status: Optional[int] = None
         last_error = cache_error
-        while attempts < self.max_attempts:
-            attempts += 1
+        while attempts < attempt_limit:
             self._acquire_rate_limit()
             self._raise_if_cancelled()
+            if before_attempt is not None:
+                before_attempt()
+            attempts += 1
             response: Optional[requests.Response] = None
             try:
                 response = self.session.get(
@@ -987,13 +1014,14 @@ class FotMobTransport:
                             )
                         )
                     record = cached_record
+                    validated_at = datetime.now(timezone.utc).isoformat()
                     if self.raw_store is not None:
                         try:
                             record = self.raw_store.store(
                                 target,
                                 cached_body,
                                 fetched_at=cached_record.fetched_at,
-                                validated_at=datetime.now(timezone.utc).isoformat(),
+                                validated_at=validated_at,
                                 etag=response.headers.get("ETag") or cached_record.etag,
                                 last_modified=(
                                     response.headers.get("Last-Modified")
@@ -1012,6 +1040,7 @@ class FotMobTransport:
                     return self._finish(
                         self._result(
                             outcome=FetchOutcome.NOT_MODIFIED,
+                            source_observed_at=validated_at,
                             target=target,
                             http_status=last_status,
                             body=cached_body,
@@ -1028,7 +1057,7 @@ class FotMobTransport:
                 )
                 if retryable:
                     last_error = f"FotMob returned retryable HTTP {last_status}"
-                    if attempts < self.max_attempts:
+                    if attempts < attempt_limit:
                         self._sleep_interruptibly(
                             self._retry_delay(
                                 attempts,
@@ -1161,7 +1190,7 @@ class FotMobTransport:
                 self._record_attempt("exception", 0)
                 self._raise_if_cancelled()
                 last_error = f"request failed: {type(exc).__name__}: {exc}"
-                if attempts < self.max_attempts:
+                if attempts < attempt_limit:
                     self._sleep_interruptibly(self._retry_delay(attempts, None))
                     continue
                 return self._stale_or_failure(

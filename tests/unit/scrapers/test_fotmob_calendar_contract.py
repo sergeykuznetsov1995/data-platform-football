@@ -1,10 +1,10 @@
 """Behavioral regressions for #1288; no source or storage connections."""
 
-import sqlite3
 import json
 from dataclasses import replace
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from scrapers.fotmob.catalog import CatalogShapeError
@@ -93,10 +93,16 @@ def test_empty_new_scope_is_valid_and_dependency_cannot_hide_known_matches():
 
 
 class CurrentSQL:
-    """Execute production SELECT/window/join SQL, adapting only Trino DDL names."""
+    """Execute production SQL with equivalents of Trino's scalar functions."""
 
     def __init__(self):
-        self.db = sqlite3.connect(":memory:")
+        self.db = duckdb.connect(":memory:")
+        self.db.execute(
+            "CREATE MACRO from_iso8601_timestamp(value) AS CAST(value AS TIMESTAMPTZ)"
+        )
+        self.db.execute(
+            "CREATE MACRO json_extract_scalar(value, path) AS json_extract_string(value, path)"
+        )
         self.columns = {
             "fotmob_matches": [
                 "competition_id",
@@ -124,11 +130,17 @@ class CurrentSQL:
                 "source_season_key",
                 "entity_id",
                 "completed_at",
+                "fetched_at",
+                "capabilities_json",
             ],
         }
         self.sql = []
         for table, columns in self.columns.items():
-            self.db.execute(f"CREATE TABLE {table} ({', '.join(columns)})")
+            definitions = ", ".join(
+                f"{column} {'TIMESTAMP' if column == 'fetched_at' else 'VARCHAR'}"
+                for column in columns
+            )
+            self.db.execute(f"CREATE TABLE {table} ({definitions})")
 
     def _get_trino_manager(self):
         return self
@@ -136,7 +148,7 @@ class CurrentSQL:
     def table_exists(self, schema, table):
         return bool(
             self.db.execute(
-                "SELECT 1 FROM sqlite_master WHERE name=?", (table,)
+                "SELECT 1 FROM information_schema.tables WHERE table_name=?", (table,)
             ).fetchone()
         )
 
@@ -146,10 +158,6 @@ class CurrentSQL:
     def _execute(self, sql):
         self.sql.append(sql)
         adapted = sql.replace("iceberg.bronze.", "")
-        if "CREATE OR REPLACE VIEW" in adapted:
-            view = adapted.split("VIEW", 1)[1].split()[0]
-            self.db.execute(f"DROP VIEW IF EXISTS {view}")
-            adapted = adapted.replace("CREATE OR REPLACE VIEW", "CREATE VIEW")
         return self.db.execute(adapted)
 
     def execute_query(self, sql):
@@ -166,10 +174,15 @@ class CurrentSQL:
         status="success",
         entity=None,
         time=None,
+        fetched_at=None,
+        capabilities=None,
     ):
         self.db.execute(
-            "INSERT INTO fotmob_ingest_manifest VALUES (?,?,?,?,?,?,?,?,?)",
-            (batch, batch, version, status, kind, cid, season, entity, time or batch),
+            "INSERT INTO fotmob_ingest_manifest VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                batch, batch, version, status, kind, cid, season, entity, time or batch,
+                fetched_at, json.dumps(capabilities or {}),
+            ),
         )
 
     def rows(self, batch, ids, *, table="fotmob_matches", cid="10618", season="2026"):
