@@ -713,7 +713,7 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
                     table=dq_tables.get(name, f"bronze.sofascore_{name}"),
                     code="season_mismatch",
                     message=reasons[0].message,
-                    natural_key=str(row[column]),
+                    natural_key=f"{expected_source_season_id}|{row[column]}",
                 )
             )
     moved_ids = frozenset(str(rejected.row["match_id"]) for rejected in moved)

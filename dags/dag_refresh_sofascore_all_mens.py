@@ -215,8 +215,10 @@ FROM (
       AND NOT EXISTS (
           SELECT 1 FROM iceberg.bronze.sofascore_rejected_rows r
           WHERE r.league = s.league
+            AND r.season = CAST(s.season AS varchar)
             AND r.reason_code = 'season_mismatch'
-            AND r.natural_key = CAST(s.game_id AS varchar))
+            AND r.natural_key = CAST(CAST(s.season_id AS bigint) AS varchar)
+                || '|' || CAST(s.game_id AS varchar))
 ) p
 GROUP BY 1, 2, 6
 """

@@ -499,6 +499,50 @@ def test_plan_task_fails_closed_without_a_dag_run(clean_env, monkeypatch):
 
 
 @pytest.mark.unit
+def test_pending_partitions_skip_only_the_season_a_moved_match_was_refused_in(
+    clean_env, monkeypatch
+):
+    """#1778: a match journaled as season_mismatch leaves only that season."""
+    import duckdb
+    import sqlglot
+
+    module = _load_dag_module(monkeypatch)
+    conn = duckdb.connect()
+    conn.execute("ATTACH ':memory:' AS iceberg")
+    conn.execute("CREATE SCHEMA iceberg.bronze")
+    conn.execute(
+        "CREATE TABLE iceberg.bronze.sofascore_schedule (league VARCHAR, season VARCHAR,"
+        " game_id BIGINT, season_id DOUBLE, status_type VARCHAR,"
+        " start_timestamp BIGINT, changes_change_timestamp BIGINT)"
+    )
+    conn.execute(
+        "CREATE TABLE iceberg.bronze.sofascore_match_capture_status"
+        " (league VARCHAR, season VARCHAR, match_id VARCHAR, capture_complete BOOLEAN)"
+    )
+    conn.execute(
+        "CREATE TABLE iceberg.bronze.sofascore_rejected_rows"
+        " (league VARCHAR, season VARCHAR, reason_code VARCHAR, natural_key VARCHAR)"
+    )
+    conn.execute(
+        "INSERT INTO iceberg.bronze.sofascore_schedule VALUES"
+        " ('SS-16437', '2026', 17003244, 90005.0, 'finished', 1000, NULL),"
+        " ('SS-16437', '2026', 17003245, 90005.0, 'finished', 1000, NULL),"
+        " ('SS-16437', '2027', 17003244, 91000.0, 'finished', 1000, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO iceberg.bronze.sofascore_rejected_rows VALUES"
+        " ('SS-16437', '2026', 'season_mismatch', '90005|17003244'),"
+        " ('SS-16437', '2026', 'invalid_enum_value', '90005|17003245')"
+    )
+    sql = sqlglot.transpile(module.PENDING_PARTITIONS_SQL, read="trino", write="duckdb")[0]
+    rows = sorted(
+        (league, season, pending, source)
+        for league, season, pending, _, _, source, _ in conn.execute(sql).fetchall()
+    )
+    assert rows == [("SS-16437", "2026", 1, 90005), ("SS-16437", "2027", 1, 91000)]
+
+
+@pytest.mark.unit
 def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     clean_env, monkeypatch
 ):
@@ -542,9 +586,6 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     assert "LIKE 'SS-%'" in sql
     assert "status_type = 'finished'" in sql
     assert "capture_complete" in sql
-    # #1778: a match moved to another season leaves the pending debt.
-    assert "iceberg.bronze.sofascore_rejected_rows" in sql
-    assert "r.reason_code = 'season_mismatch'" in sql
     # #1359: the nearest deadline that has not passed, by the meter's rule.
     from scrapers.sofascore.match_deadline import match_deadline_sql
 

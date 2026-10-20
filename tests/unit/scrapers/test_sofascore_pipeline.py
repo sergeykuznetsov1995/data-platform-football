@@ -1585,8 +1585,8 @@ def test_match_runner_holds_match_moved_to_another_season_and_publishes_the_rest
 ):
     """#1778: SofaScore moved one scheduled match to another season; the stale
     schedule row must not fail the whole season on every pass."""
-    match_ids = [str(20_000_300 + n) for n in range(5)]
-    bad_match = match_ids[2]
+    match_ids = [str(20_000_300 + n) for n in range(95)]
+    bad_match = match_ids[42]
     runtime, transport, specs = _match_batch_runtime(
         tmp_path, match_ids, bad_match, bad_gender=False, bad_season_id=87177
     )
@@ -1602,7 +1602,9 @@ def test_match_runner_holds_match_moved_to_another_season_and_publishes_the_rest
     )
     journal = saved["sofascore_rejected_rows"]["df"]
     assert set(journal["reason_code"]) == {"season_mismatch"}
-    assert set(journal["natural_key"]) == {bad_match}
+    assert set(journal["natural_key"]) == {f"76986|{bad_match}"}
+    assert len(journal) == journal["table_name"].nunique()
+    assert result["matches_complete"] == 94
     held = runtime.manifest_store.get(specs[(bad_match, "event")].key)
     assert held.status == ManifestStatus.SCHEMA_ERROR
     assert held.error_type == "RowRejected"
