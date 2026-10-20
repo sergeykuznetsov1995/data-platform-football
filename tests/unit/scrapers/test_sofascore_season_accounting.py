@@ -291,6 +291,22 @@ def test_corrupt_or_cross_identity_receipts_are_unknown(tmp_path, change):
     assert summarize_day(journal_for_day(), day, tmp_path)["verdict"] == "UNKNOWN"
 
 
+@pytest.mark.parametrize("active,rejected", [("2", False), ("3", True)])
+def test_only_deeper_groups_need_the_core_gate(tmp_path, active, rejected):
+    day = day_input()
+    save_receipt(tmp_path, day)
+    checkpoint_path = tmp_path / "checkpoint-run-a.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["groups"]["1"].update(closed=98, gate_passed=False)
+    checkpoint["active_group"] = active
+    raw = json.dumps(checkpoint).encode()
+    checkpoint_path.write_bytes(raw)
+    day["expected_runs"][0]["checkpoint_sha256"] = hashlib.sha256(raw).hexdigest()
+    day["run_roster_digest"] = digest(day["expected_runs"])
+    missing = summarize_day(journal_for_day(), day, tmp_path)["missing_evidence"]
+    assert any("before core gate" in m for m in missing) is rejected
+
+
 @pytest.mark.parametrize("status,publication_run", [("failed", "native-1-scope::targets"),
                                                      ("success", "refresh-run::targets"),
                                                      ("success", None)])

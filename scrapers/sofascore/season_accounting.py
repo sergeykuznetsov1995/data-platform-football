@@ -260,13 +260,12 @@ def summarize_day(journal: dict, saved_day: dict, result_dir: str | Path) -> dic
             active = checkpoint.get("active_group")
             if active not in {"1", "2", "july", "3", "4", "5"}:
                 raise ValueError("saved selected history group missing")
-            for earlier in ("1", "2"):
-                if earlier == active:
-                    break
-                group = checkpoint["groups"][earlier]
-                if (group["unknown_scopes"] != 0 or group["closed"] * 100 < group["finished"] * 99
-                        or group.get("gate_passed") is not True):
-                    raise ValueError("saved checkpoint selected group before core gate")
+            if active not in {"1", "2"}:
+                for earlier in ("1", "2"):
+                    group = checkpoint["groups"][earlier]
+                    if (group["unknown_scopes"] != 0 or group["closed"] * 100 < group["finished"] * 99
+                            or group.get("gate_passed") is not True):
+                        raise ValueError("saved checkpoint selected group before core gate")
             for item in receipt["items"]:
                 ledger_item = {k: v for k, v in item.items() if k not in {"index", "environment"}}
                 if reservation["items"].get(str(item["index"])) != ledger_item:
