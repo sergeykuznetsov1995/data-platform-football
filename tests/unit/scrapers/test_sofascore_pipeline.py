@@ -1452,7 +1452,7 @@ def _match_batch_runtime(
     return runtime, transport, specs
 
 
-def _run_match_pass(runtime, match_ids, output, monkeypatch):
+def _run_match_pass(runtime, match_ids, output, monkeypatch, *, plan_factory=None):
     """One offline match pass over ``match_ids``; returns (rc, result, saves)."""
     from dags.scripts import run_sofascore_scraper as runner
 
@@ -1492,8 +1492,9 @@ def _run_match_pass(runtime, match_ids, output, monkeypatch):
             limit=None,
             output_path=str(output),
             capture_runtime=runtime,
-            workload_plan=None,
-            offline_replay=True,
+            workload_plan=plan_factory(runtime) if plan_factory else None,
+            offline_replay=plan_factory is None,
+            **({"workload_allocations": ()} if plan_factory else {}),
         )
     result = json.loads(output.read_text(encoding="utf-8"))
     return rc, result, saved, events
@@ -1617,6 +1618,31 @@ def test_match_runner_holds_match_moved_to_another_season_and_publishes_the_rest
     assert set(saved["sofascore_rejected_rows"]["df"]["reason_code"]) == {
         "season_mismatch"
     }
+
+
+def test_signed_plan_replay_holds_a_moved_match_like_the_offline_pass(
+    tmp_path, monkeypatch
+):
+    """#1778: production replays raw under a signed plan, not offline_replay."""
+    match_ids = [str(20_000_500 + n) for n in range(25)]
+    bad_match = match_ids[9]
+    runtime, transport, specs = _match_batch_runtime(
+        tmp_path, match_ids, bad_match, bad_gender=False, bad_season_id=87177
+    )
+    rc, result, saved, _ = _run_match_pass(
+        runtime, match_ids, tmp_path / "moved-signed.json", monkeypatch,
+        plan_factory=lambda rt: _unallocated_plan(rt),
+    )
+    assert rc == 0, result["errors"]
+    assert transport.calls == 0
+    assert len(saved["sofascore_events"]["df"]) == 24
+    assert set(saved["sofascore_rejected_rows"]["df"]["reason_code"]) == {
+        "season_mismatch"
+    }
+    assert (
+        runtime.manifest_store.get(specs[(bad_match, "event")].key).error_type
+        == "RowRejected"
+    )
 
 
 def test_match_runner_fresh_pass_with_no_aligned_match_stays_strictly_red(tmp_path, monkeypatch):
