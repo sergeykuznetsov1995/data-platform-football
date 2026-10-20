@@ -286,6 +286,9 @@ DEFERRABLE_TARGET_FAILURE_CLASSES = frozenset({
 # Other hosts -- another subdomain, a CDN -- are to be allowed deliberately
 # once seen, not trusted in advance.
 MOVED_PAGE_HOST = "fbref.com"
+# Match the run ceiling for deferred target/parse failures, including failures
+# interleaved with productive sessions across wave boundaries (#1588).
+MAX_DEFERRED_SESSION_FAILURES_PER_RUN = 25
 # Each consecutive refresh costs one browser solve, so a source that rejects
 # fresh clearances outright must still fail the wave rather than launch
 # browsers in a loop. A productive warm session resets this streak: later
@@ -817,6 +820,7 @@ class WaveResult:
     requeued_dead_clearance: int = 0
     requeued_session_exhaustion: int = 0
     deferred_dead_clearance: int = 0
+    deferred_session_failures: int = 0
     contract_quarantined: int = 0
     dead_lettered: int = 0
     moved_pages_skipped: int = 0
@@ -1029,6 +1033,7 @@ class _LiveFetchSession:
     # in between.  One such target is evidence about that page; a streak of
     # them is evidence about the source.
     clearance_exhausted_targets: int = 0
+    deferred_session_failures: int = 0
     needs_clearance: bool = True
     # What the next solve may spend, once the run's remaining budget can no
     # longer fund the full reservation.  ``None`` means the settings default.
@@ -1415,6 +1420,13 @@ def _is_run_mass_terminal_oversized_pages(fetch: "WaveResult") -> bool:
     """Catch oversized responses spread thinly across many waves."""
 
     return fetch.terminal_oversized_pages > MAX_RUN_TERMINAL_OVERSIZED_PAGES
+
+
+def _is_mass_deferred_session_failures(result: "WaveResult") -> bool:
+    return (
+        result.deferred_session_failures > MAX_ROUTINE_CONTRACT_QUARANTINES
+        and result.deferred_session_failures * 2 > result.cohort_size
+    )
 
 
 def _is_mass_deferred_target_failures(result: "WaveResult") -> bool:
@@ -3770,7 +3782,10 @@ class FBrefPipeline:
                     if (
                         page_settlement is not None
                         and page_settlement.budget_exceeded
-                        and exc.error_class != "hard_transport_policy"
+                        and (
+                            exc.error_class != "hard_transport_policy"
+                            or exc.session_failure_reason is not None
+                        )
                     ):
                         if settings.persistent_http_session:
                             live_session.finalize(
@@ -3805,7 +3820,10 @@ class FBrefPipeline:
                             ),
                         )
                         break
-                    if exc.error_class == "hard_transport_policy":
+                    if (
+                        exc.error_class == "hard_transport_policy"
+                        and exc.session_failure_reason is None
+                    ):
                         # This is a run-level paid-transport invariant, not a
                         # bad target or a clearance that may be re-solved. Save
                         # the exact failed attempt, leave untouched targets
@@ -3835,7 +3853,7 @@ class FBrefPipeline:
                             f"{lease.target_id}:hard_transport_policy"
                         )
                         break
-                    if _session_failure(exc):
+                    if _session_failure(exc) or exc.session_failure_reason is not None:
                         # The attempt is real traffic evidence, but the page
                         # itself was never judged. Retry the same immutable
                         # logical refresh when a full browser+HTTP reservation
@@ -3855,7 +3873,8 @@ class FBrefPipeline:
                         )
                         live_session.consecutive_clearance_refreshes += 1
                         clearance_streak_exhausted = (
-                            live_session.consecutive_clearance_refreshes
+                            exc.session_failure_reason is not None
+                            or live_session.consecutive_clearance_refreshes
                             > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
                         )
                         result.requeued_dead_clearance += 1
@@ -4035,10 +4054,21 @@ class FBrefPipeline:
                             # every fresh clearance it is handed.
                             live_session.clearance_exhausted_targets += 1
                             live_session.consecutive_clearance_refreshes = 0
-                            result.deferred_dead_clearance += 1
+                            if _session_failure(exc):
+                                result.deferred_dead_clearance += 1
+                            result.deferred_session_failures += 1
+                            live_session.deferred_session_failures += 1
+                            logger.warning(
+                                "FBref deferred session failure: target=%s session=%s reason=%s",
+                                lease.target_id, retry_evidence["session_version"],
+                                exc.session_failure_reason or exc.error_class,
+                            )
                             if (
                                 live_session.clearance_exhausted_targets
                                 >= MAX_CLEARANCE_EXHAUSTED_TARGETS
+                                or _is_mass_deferred_session_failures(result)
+                                or live_session.deferred_session_failures
+                                > MAX_DEFERRED_SESSION_FAILURES_PER_RUN
                             ):
                                 untouched = leases[lease_index + 1:]
                                 result.requeued_session_exhaustion += (
@@ -4049,15 +4079,18 @@ class FBrefPipeline:
                                 result.failures.append(
                                     "clearance_session_refreshes_exhausted="
                                     f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
+                                    if live_session.clearance_exhausted_targets
+                                    >= MAX_CLEARANCE_EXHAUSTED_TARGETS
+                                    else "mass_session_failures="
+                                    f"{live_session.deferred_session_failures}"
                                 )
                                 break
                             logger.warning(
-                                "FBref %s used up its %d re-solve(s) and is "
-                                "returned to the queue for a later run — this "
+                                "FBref %s is returned to the queue after a "
+                                "session failure for a later run — this "
                                 "wave continues on a fresh clearance (%d/%d "
                                 "exhausted target(s) in a row)",
                                 lease.target_id,
-                                MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
                                 live_session.clearance_exhausted_targets,
                                 MAX_CLEARANCE_EXHAUSTED_TARGETS,
                             )
@@ -4563,6 +4596,14 @@ class FBrefPipeline:
                             "mass_response_too_large_run="
                             f"{aggregate.fetch.terminal_oversized_pages}"
                         )
+                    if (
+                        aggregate.fetch.deferred_session_failures
+                        > MAX_DEFERRED_SESSION_FAILURES_PER_RUN
+                    ):
+                        raise FetchWaveError(
+                            "mass_session_failures_run="
+                            f"{aggregate.fetch.deferred_session_failures}"
+                        )
                     if _is_run_mass_deferred_target_failures(aggregate.fetch):
                         raise FetchWaveError(
                             "mass_target_failures_run="
@@ -4622,7 +4663,10 @@ class FBrefPipeline:
                 # its eventual repair has not run yet.  Do not report a false
                 # closure to the downstream validator.
                 aggregate.frontier_closed = False
-            deferred = len(aggregate.fetch.deferred_target_failures)
+            deferred = (
+                len(aggregate.fetch.deferred_target_failures)
+                + aggregate.fetch.deferred_session_failures
+            )
             if deferred:
                 counts = self.control.get_run_target_counts(run_id)
                 if int(counts.get("succeeded") or 0) == 0:
@@ -8268,6 +8312,7 @@ def _validate_oversize_evidence_wave_result(
             "requeued_dead_clearance",
             "requeued_session_exhaustion",
             "deferred_dead_clearance",
+            "deferred_session_failures",
             "contract_quarantined",
             "dead_lettered",
             "moved_pages_skipped",

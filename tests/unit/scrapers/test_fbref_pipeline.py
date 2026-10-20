@@ -11221,6 +11221,7 @@ def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
     assert result.fetched == 2
     assert result.failures == []
     assert result.deferred_dead_clearance == 1
+    assert result.deferred_session_failures == 1
     assert result.requeued_session_exhaustion == 0
     assert result.budget_exhausted is False
 
@@ -14792,3 +14793,285 @@ def test_frontier_closed_run_does_not_reparse(tmp_path):
 
     assert result.frontier_closed is True
     assert waves == []
+
+
+def _session_abort_error(reason):
+    """Replay real transport flags through the fetcher classifier (#1588)."""
+    from unittest.mock import MagicMock
+    from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
+    from scrapers.fbref.fetcher import FBrefFetcher
+    from scrapers.fbref.proxy_lease import FBrefProxyLeaseError
+
+    transport = CamoufoxFbrefTransport(geoip=False, max_network_bytes=4096)
+    if reason == "byte_budget_exhausted":
+        transport._abort_session_for_byte_budget("response_exceeded_reservation")
+    elif reason == "request_budget_exhausted":
+        transport._request_budget_exhausted = True
+    stats = transport.traffic_stats()
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher._http_session = None
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._transport = MagicMock()
+    fetcher._transport.fetch.return_value = None
+    fetcher._transport.traffic_delta.return_value = stats
+    fetcher._lease_client = MagicMock()
+    fetcher._provider_context = {}
+    fetcher._provider_http_ready = False
+    fetcher._provider_max_bytes = 50 * 1024 * 1024
+    fetcher._provider_total_bytes = (
+        3_100_000 if reason == "browser_provider_cap_exhausted" else 0
+    )
+    fetcher._provider_bootstrap_max_bytes = 3_100_000
+    fetcher._provider_bootstrap_spent_bytes = fetcher._provider_total_bytes
+    fetcher._provider_lease_observed_bytes = 0
+    fetcher._provider_lease = SimpleNamespace(lease_id="dead-exit", max_bytes=4096)
+    if reason in {"browser_provider_cap_exhausted", "browser_provider_drain_failed"}:
+        stats.update(
+            geoip_lookup_failed=True,
+            geoip_transport_failure=True,
+            real_bytes_downloaded=3_100_000,
+        )
+        if reason == "browser_provider_drain_failed":
+            stats.update(geoip_lookup_failed=False, geoip_transport_failure=False)
+        drain_error = FBrefProxyLeaseError("dead port")
+        drain_error.session_failure_reason = "provider_meter_unavailable"
+        fetcher._lease_client.wait_drained.side_effect = drain_error
+    else:
+        fetcher._lease_client.wait_drained.return_value = SimpleNamespace(
+            total_bytes=100,
+            budget_exceeded=False,
+        )
+    fetcher._lease_client.close_strict.return_value = SimpleNamespace(
+        total_bytes=0 if reason == "browser_provider_cap_exhausted" else 100
+    )
+    with pytest.raises(FetchError) as raised:
+        fetcher.ensure_clearance()
+    return raised.value
+
+
+def _session_failure_wave(
+    tmp_path, failing_indices, *, size=8, live=None, reason="byte_budget_exhausted"
+):
+    run_id = str(uuid.UUID(int=1588))
+    leases = [_match_fetch_lease(run_id, n) for n in range(1, size + 1)]
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, [leases])
+    control.run.update(request_limit=4000, byte_limit=2048 * 1024 * 1024)
+    error = _session_abort_error(reason)
+    calls = []
+
+    class Fetcher(FakeFetcher):
+        def fetch(self, url, **kwargs):
+            calls.append(url)
+            if url in {leases[n].canonical_url for n in failing_indices}:
+                raise error
+            return super().fetch(url, **kwargs)
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: Fetcher(control.events, b"<html>ok</html>"),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    def execute():
+        return pipeline.fetch_wave(
+            run_id,
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=replace(
+                _settings(),
+                shard_size=size,
+                request_limit=4000,
+                byte_limit=2048 * 1024 * 1024,
+            ),
+            _live_session=live,
+        )
+
+    return execute, control, leases, calls
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "byte_budget_exhausted",
+        "request_budget_exhausted",
+        "browser_provider_cap_exhausted",
+        "browser_provider_drain_failed",
+    ],
+)
+def test_session_abort_defers_once_and_continues_wave(tmp_path, reason):
+    execute, control, leases, calls = _session_failure_wave(
+        tmp_path, {0}, reason=reason
+    )
+    result = execute()
+    assert result.deferred_session_failures == 1
+    assert result.fetched == 7
+    assert result.failures == []
+    assert len(calls) == 8
+    assert len(control.failed) == 1
+    assert control.failed[0][0] == leases[0]
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["provider_billed_bytes"] == (
+        0 if reason == "browser_provider_cap_exhausted" else 100
+    )
+    assert not control.failed[0][1].get("session_retry")
+    assert control.events.index("session_close") < control.events.index(
+        "session_open", control.events.index("session_close")
+    )
+
+
+def test_three_consecutive_session_aborts_stop_before_next_target(tmp_path):
+    execute, control, leases, calls = _session_failure_wave(tmp_path, {0, 1, 2})
+    with pytest.raises(FetchWaveError, match="clearance_session_refreshes_exhausted"):
+        execute()
+    assert len(calls) == 3
+    assert len(control.failed) == 3
+    assert all(kwargs["requeue"] for _, kwargs in control.failed)
+    assert [e for e in control.events if e.startswith("requeue:")] == [
+        f"requeue:{lease.target_id}" for lease in leases[3:]
+    ]
+
+
+@pytest.mark.parametrize(
+    "size, failing, raises",
+    [
+        (10, {0, 1, 3, 4, 6}, False),  # floor: five failures
+        (12, {0, 1, 3, 4, 6, 7}, False),  # exactly half
+        (11, {0, 1, 3, 4, 6, 7}, True),  # six and more than half
+    ],
+)
+def test_session_abort_fraction_guard(tmp_path, size, failing, raises):
+    execute, control, leases, calls = _session_failure_wave(
+        tmp_path, failing, size=size
+    )
+    if raises:
+        with pytest.raises(FetchWaveError, match="mass_session_failures=6"):
+            execute()
+        assert len(calls) == 8
+        assert f"requeue:{leases[-1].target_id}" in control.events
+    else:
+        result = execute()
+        assert result.deferred_session_failures == len(failing)
+        assert result.fetched == size - len(failing)
+
+
+def test_session_abort_streak_survives_wave_boundary(tmp_path):
+    live = pipeline_module._LiveFetchSession()
+    execute, control, _, _ = _session_failure_wave(
+        tmp_path / "a", {0, 1}, size=2, live=live
+    )
+    assert execute().deferred_session_failures == 2
+    execute, _, _, calls = _session_failure_wave(tmp_path / "b", {0}, size=2, live=live)
+    with pytest.raises(FetchWaveError, match="clearance_session_refreshes_exhausted"):
+        execute()
+    assert len(calls) == 1
+    live.close(control, status="failed")
+
+
+@pytest.mark.parametrize("prior, raises", [(24, False), (25, True)])
+def test_session_abort_run_limit_survives_wave_boundary(tmp_path, prior, raises):
+    live = pipeline_module._LiveFetchSession(deferred_session_failures=prior)
+    execute, control, _, calls = _session_failure_wave(tmp_path, {0}, live=live)
+    if raises:
+        with pytest.raises(FetchWaveError, match="mass_session_failures=26"):
+            execute()
+        assert len(calls) == 1
+    else:
+        assert execute().deferred_session_failures == 1
+    live.close(control, status="closed")
+
+
+def test_session_deferrals_zero_work_is_red(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.get_run_target_counts = lambda _: {"skipped": 1}
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_a, **_k: WaveResult(
+        claimed=1, deferred_session_failures=1
+    )
+    pipeline.parse_wave = lambda *_a, **_k: WaveResult()
+    with pytest.raises(FetchWaveError, match="no page fetched"):
+        pipeline.run_live_waves(
+            str(uuid.UUID(int=1588)),
+            worker_id="w",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "finalizer_fails, budget_exceeded", [(False, False), (True, False), (False, True)]
+)
+def test_session_abort_persistent_settlement_precedes_reset(
+    tmp_path, finalizer_fails, budget_exceeded
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    control.force_page_budget_exceeded = budget_exceeded
+
+    class Fetcher(PersistentFakeFetcher):
+        def fetch(self, url, **kwargs):
+            self.events.append("http_abort")
+            raise FetchError(
+                "local session byte admission stopped",
+                error_class="hard_transport_policy",
+                session_failure_reason="byte_budget_exhausted",
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+                provider_billed_bytes=120,
+            )
+
+        def reset_clearance(self):
+            self.events.append("reset")
+
+        def finalize_metered_session(self):
+            if finalizer_fails:
+                raise RuntimeError("unknown provider tail")
+            return super().finalize_metered_session()
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: Fetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    def execute():
+        return pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="w",
+            page_kinds=["competition_index"],
+            settings=_persistent_settings(),
+        )
+
+    if finalizer_fails:
+        with pytest.raises(FetchWaveError, match="finalizer failed"):
+            execute()
+        assert "reset" not in control.events
+        assert control.events.count("meter_begin") == 1
+    else:
+        result = execute()
+        assert result.deferred_session_failures == (0 if budget_exceeded else 1)
+        if budget_exceeded:
+            assert result.budget_exhausted
+            assert "reset" not in control.events
+        else:
+            order = [
+                control.events.index(e)
+                for e in (
+                    "page_settle",
+                    "provider_finalize",
+                    "tail_settle",
+                    "session_close",
+                    "reset",
+                )
+            ]
+            assert order == sorted(order)
+        assert control.run["bytes_used"] == 130
+        assert control.run["bytes_reserved"] == 0
