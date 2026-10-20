@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import random
 import threading
 import time
@@ -224,7 +225,8 @@ def _parse_retry_after(value: Optional[str], now: datetime) -> Optional[float]:
         return None
     candidate = value.strip()
     try:
-        return max(0.0, float(candidate))
+        seconds = float(candidate)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except ValueError:
         pass
     try:
