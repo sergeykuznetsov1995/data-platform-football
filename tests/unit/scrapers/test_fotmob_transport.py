@@ -11,6 +11,7 @@ from scrapers.fotmob.raw_store import FotMobRawStore
 from scrapers.fotmob.transport import (
     FetchOutcome,
     FotMobTransport,
+    _parse_retry_after,
     canonicalize_target,
 )
 
@@ -247,6 +248,34 @@ def test_rotated_url_neither_inherits_validators_nor_closes_on_304(tmp_path):
     }
     assert replay.outcome == FetchOutcome.NOT_MODIFIED
     assert replay.body == body
+
+
+@pytest.mark.parametrize("value", ["Infinity", "-Infinity", "NaN"])
+def test_parse_retry_after_ignores_non_finite_values(value):
+    now = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    assert _parse_retry_after(value, now) is None
+    transport, _session = _transport([], backoff_base=2)
+    assert transport._retry_delay(2, value) == 4.0
+
+
+@pytest.mark.parametrize("value", ["Infinity", "-Infinity", "NaN"])
+def test_retry_after_duration_ignores_non_finite_values(value):
+    assert FotMobTransport._retry_after_duration(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2.5", 2.5),
+        ("0", 0.0),
+        ("-3", 0.0),
+        ("Tue, 18 Aug 2026 12:00:03 GMT", 3.0),
+        ("Tue, 18 Aug 2026 11:59:59 GMT", 0.0),
+    ],
+)
+def test_parse_retry_after_preserves_finite_values_and_http_dates(value, expected):
+    now = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+    assert _parse_retry_after(value, now) == expected
 
 
 def test_retry_after_retryable_statuses_then_success_are_counted():
