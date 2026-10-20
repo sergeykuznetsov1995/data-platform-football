@@ -184,6 +184,7 @@ class BudgetLedger:
 
         attempts = max(0, int(attempts))
         next_requests = self.requests + attempts
+        self.requests = next_requests
         if next_requests > self.budget.max_requests:
             raise BudgetExceeded(
                 "FotMob request budget exceeded by transport retries: "
@@ -193,11 +194,12 @@ class BudgetLedger:
             direct_bytes=direct_bytes,
             proxy_bytes=proxy_bytes,
         )
-        self.requests = next_requests
 
     def account_bytes(self, *, direct_bytes: int, proxy_bytes: int) -> None:
         next_direct = self.direct_bytes + max(0, int(direct_bytes))
         next_proxy = self.proxy_bytes + max(0, int(proxy_bytes))
+        self.direct_bytes = next_direct
+        self.proxy_bytes = next_proxy
         if next_direct > self.budget.max_direct_bytes:
             raise BudgetExceeded(
                 "FotMob direct-byte budget exceeded: "
@@ -208,8 +210,6 @@ class BudgetLedger:
                 "FotMob proxy-byte invariant exceeded: "
                 f"{next_proxy}>{self.budget.max_proxy_bytes}"
             )
-        self.direct_bytes = next_direct
-        self.proxy_bytes = next_proxy
 
     @property
     def remaining_requests(self) -> int:
@@ -326,6 +326,7 @@ def _plan_seasons(
     now: Optional[datetime] = None,
     scope_debt: Mapping[tuple[int, str], int] | None = None,
     enforce_history_cycle_barrier: bool,
+    match_refresh_scopes: Iterable[tuple[int, str]] = (),
 ) -> list[SeasonWorkItem]:
     """Build shared catalog-obligation or runnable-plan work items."""
 
@@ -334,7 +335,8 @@ def _plan_seasons(
         for item in classifications
         if item.decision == ScopeDecision.INCLUDED
     }
-    success = {(int(comp), str(season)) for comp, season in previously_successful}
+    refresh = set(match_refresh_scopes)
+    success = {(int(comp), str(season)) for comp, season in previously_successful} - refresh
     requested = (
         {(int(comp), str(season)) for comp, season in explicit_scopes}
         if explicit_scopes is not None
@@ -373,7 +375,7 @@ def _plan_seasons(
             # Replay is bounded to known raw identities, not a network backfill.
             continue
 
-        attempt = attempts.get(identity)
+        attempt = attempts.get(identity) if identity not in refresh else None
         if attempt is not None:
             if attempt.outcome == "success" and lane != ScopeLane.CURRENT:
                 continue
@@ -416,7 +418,8 @@ def _plan_seasons(
         candidates = [
             (season, attempt)
             for season, attempt in candidates
-            if _history_season_cycle_key(season.source_season_key) == newest_cycle
+            if season.identity in refresh
+            or _history_season_cycle_key(season.source_season_key) == newest_cycle
         ]
 
     output: list[SeasonWorkItem] = []
@@ -468,6 +471,7 @@ def plan_seasons(
     attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
     now: Optional[datetime] = None,
     scope_debt: Mapping[tuple[int, str], int] | None = None,
+    match_refresh_scopes: Iterable[tuple[int, str]] = (),
 ) -> list[SeasonWorkItem]:
     """Build a stable runnable daily/backfill/replay plan.
 
@@ -495,6 +499,7 @@ def plan_seasons(
         now=now,
         scope_debt=scope_debt,
         enforce_history_cycle_barrier=True,
+        match_refresh_scopes=match_refresh_scopes,
     )
 
 

@@ -654,3 +654,23 @@ def test_previous_season_of_an_older_cycle_stays_history(flagged, previous):
     )
 
     assert [item.identity for item in current] == [(47, flagged)]
+
+
+@pytest.mark.parametrize("outcome", ["success", "deferred", "source_gap", "terminal"])
+def test_late_match_debt_reopens_completed_history_and_bypasses_cooldown(outcome):
+    identity = (47, "2024/2025")
+    now = datetime(2026, 1, 1)
+    attempts = {identity: ScopeAttemptState(
+        competition_id=47, source_season_key=identity[1], outcome=outcome,
+        reason="old journal", attempt_count=1, last_attempt_at=now,
+        plan_signature="late-match-test",
+        next_retry_at=now + timedelta(days=30),
+    )}
+    kwargs = dict(
+        mode=RunMode.BACKFILL, lane=ScopeLane.HISTORY,
+        previously_successful={identity}, attempt_states=attempts, now=now,
+    )
+    seasons = [SeasonRef(47, identity[1]), SeasonRef(47, "2025/2026")]
+    assert identity not in {item.identity for item in plan_seasons([_classified(47)], seasons, **kwargs)}
+    work = plan_seasons([_classified(47)], seasons, match_refresh_scopes={identity}, **kwargs)
+    assert identity in {item.identity for item in work}

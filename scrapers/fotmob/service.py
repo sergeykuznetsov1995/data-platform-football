@@ -67,6 +67,10 @@ from .repository import (
     TargetCommit,
     utc_now,
 )
+from .raw_store import RawStoreError
+from .match_refresh import (
+    MatchRefresh, match_refresh, match_time, source_observed_at,
+)
 from .transport import FetchOutcome, FetchResult, FotMobTransport, canonicalize_target
 
 
@@ -618,6 +622,7 @@ class FotMobIngestService:
         self.run_id = run_id or utc_run_id()
         self.ledger = BudgetLedger(budget or TransportBudget())
         self.max_workers = min(int(max_workers), 16)
+        self._late_match_requests = 0
         self._budget_lock = threading.Lock()
         self._cancelled = threading.Event()
         self._next_build_id: Optional[str] = None
@@ -678,11 +683,18 @@ class FotMobIngestService:
                     "remaining request budget cannot cover one retry-bounded "
                     f"target ({self.ledger.remaining_requests}<{max_attempts})"
                 )
-            if getattr(self, "deadline_at", None) is not None and (
-                self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes
-            ):
+            if self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes:
                 raise BudgetExceeded("FotMob direct-byte budget exhausted")
-        fetch = self.transport.fetch_json(endpoint, params)
+        attempt_stats = getattr(self.transport, "thread_attempt_stats", None)
+        if attempt_stats is not None:
+            attempt_stats(reset=True)
+        try:
+            fetch = self.transport.fetch_json(endpoint, params)
+        except Exception:
+            if attempt_stats is not None:
+                with self._budget_lock:
+                    self.ledger.account_fetch(**attempt_stats())
+            raise
         self._account(fetch)
         self._raise_if_cancelled()
         return fetch
@@ -787,6 +799,13 @@ class FotMobIngestService:
         force_dataset_write: bool = False,
     ) -> list[str]:
         manifest_status = status or _fetch_manifest_status(fetch)
+        capabilities = dict(capabilities or {})
+        if target_type == "match" and not fetch.stale and manifest_status in {
+            ManifestStatus.SUCCESS, ManifestStatus.NOT_MODIFIED,
+        }:
+            observed = match_time(fetch.source_observed_at or fetch.fetched_at)
+            if observed is not None:
+                capabilities["source_observed_at"] = observed.isoformat()
         commit = TargetCommit(
             run_id=self.run_id,
             target_type=target_type,
@@ -2691,12 +2710,80 @@ class FotMobIngestService:
             "missing_expected_sections": missing,
         }
 
+    def match_refresh_state(self, match: Mapping[str, Any], now: datetime) -> MatchRefresh:
+        target = canonicalize_target("matchDetails", {"matchId": str(match.get("match_id"))})
+        previous = self.repository.latest_match_source(target.target_key)
+        return match_refresh(match, source_observed_at(previous), now)
+
+    def _recover_match_fetch(self, match: Mapping[str, Any]) -> Optional[FetchResult]:
+        raw_store = getattr(self.transport, "raw_store", None)
+        if raw_store is None:
+            return None
+        target = canonicalize_target("matchDetails", {"matchId": str(match["match_id"])})
+        previous = self.repository.latest_match_source(target.target_key)
+        last = source_observed_at(previous)
+        try:
+            _, record = raw_store.load(target)
+        except RawStoreError:
+            return None
+        observed = match_time(record.validated_at)
+        if observed is None or (last is not None and observed <= last):
+            return None
+        # A raw response can survive a crash before publication. Recover only
+        # an open threshold, including after the HTTP cutoff, with no request.
+        state = match_refresh(match, last, observed)
+        if state.kind not in {"primary", "late"}:
+            return None
+        latest = self.repository.latest_entity_attempt("match", match["match_id"])
+        if (latest and latest.get("content_hash") == record.content_hash
+            and latest.get("status") == ManifestStatus.SCHEMA_DRIFT.value):
+            return None
+        fetch = self.transport.replay_json("matchDetails", {"matchId": str(match["match_id"])})
+        return replace(fetch, source_observed_at=record.validated_at)
+
+    def _fetch_match(self, match_id: str, *, late: bool, single_attempt: bool) -> FetchResult:
+        self._raise_if_cancelled()
+        if (getattr(self, "_match_budget_stopped", False)
+            or self.ledger.direct_bytes >= self.ledger.budget.max_direct_bytes):
+            raise BudgetExceeded("match byte budget exhausted")
+        max_attempts = 1 if single_attempt else max(1, int(getattr(self.transport, "max_attempts", 1)))
+        if self.ledger.remaining_requests < max_attempts:
+            raise BudgetExceeded("remaining request budget cannot cover match retries")
+        if late and 9 * (self._late_match_requests + max_attempts) > (
+            self.ledger.requests - self._late_match_requests
+        ):
+            raise BudgetExceeded("late match quota deferred target")
+        before = self.transport.snapshot_stats()
+        try:
+            kwargs = {"max_attempts": 1} if single_attempt else {}
+            fetch = self.transport.fetch_json("matchDetails", {"matchId": match_id}, **kwargs)
+        except Exception:
+            after = self.transport.snapshot_stats()
+            attempts = max(0, after.attempts - before.attempts)
+            self._late_match_requests += attempts if late else 0
+            self.ledger.account_fetch(
+                attempts=attempts, direct_bytes=max(0, after.direct_bytes - before.direct_bytes),
+                proxy_bytes=max(0, after.proxy_bytes - before.proxy_bytes),
+            )
+            raise
+        self._late_match_requests += fetch.attempts if late else 0
+        try:
+            self._account(fetch)
+        except BudgetExceeded as exc:
+            # The raw response already exists. Publish it before returning the
+            # budget error; a restart must not discard the final observation.
+            self._match_budget_error = str(exc)
+            self._match_budget_stopped = True
+        return fetch
+
     def sync_match_payloads(
         self,
         bundle: SeasonBundle,
         *,
         include_unfinished: bool = False,
         limit: Optional[int] = None,
+        phase: Optional[str] = None,
+        force_refresh: bool = False,
     ) -> OperationResult:
         """Fetch each needed match with exactly one ``matchDetails`` request."""
 
@@ -2713,38 +2800,44 @@ class FotMobIngestService:
                 "source_season_key": bundle.scope.source_season_key,
             },
         )
-        requests: list[tuple[str, str, Mapping[str, Any]]] = []
-        by_key: dict[str, Mapping[str, Any]] = {}
+        candidates = []
+        now = utc_now()
         for match in matches:
-            match_id = match.get("match_id")
-            key = str(match_id)
-            manifest_target = canonicalize_target(
-                "matchDetails", {"matchId": str(match_id)}
-            )
-            previous = self.repository.latest_success(manifest_target.target_key)
-            if (
-                previous is not None
-                and not previous.get("stale")
-                and self.mode != RunMode.REPLAY
-            ):
+            state = self.match_refresh_state(match, now)
+            # Recovery precedes quota, deadline and cutoff, and is parsed anew.
+            recover = None
+            if self.mode != RunMode.REPLAY and not force_refresh:
+                recover = self._recover_match_fetch(match)
+            kind = state.kind
+            if self.mode == RunMode.REPLAY or force_refresh:
+                kind = "primary"
+            if phase is not None and kind != phase and recover is None:
                 result.skipped += 1
                 continue
-            by_key[key] = match
-            requests.append((key, "matchDetails", {"matchId": str(match_id)}))
-        if limit is not None:
-            requests = requests[: max(0, int(limit))]
-            by_key = {key: by_key[key] for key, _, _ in requests}
-        try:
-            fetched = self._fetch_many(requests)
-        except BudgetExceeded as exc:
-            result.errors.append(str(exc))
-            return result
-        for key, outcome in fetched.items():
-            match = by_key[key]
-            if isinstance(outcome, Exception):
-                result.record_exception(f"match {key}: {outcome}", outcome)
+            if kind not in {"primary", "late"} and recover is None:
+                result.skipped += 1
                 continue
-            fetch = outcome
+            candidates.append((kind, match, recover))
+        candidates.sort(key=lambda item: item[0] != "primary")
+        selected = candidates if limit is None else candidates[:max(0, int(limit))]
+        for kind, match, recovered in selected:
+            key = str(match.get("match_id"))
+            try:
+                if recovered is not None:
+                    fetch = recovered
+                elif self.mode == RunMode.REPLAY:
+                    fetch = self._fetch("matchDetails", {"matchId": key}, replay=True)
+                else:
+                    fetch = self._fetch_match(key, late=kind == "late", single_attempt=force_refresh)
+            except BudgetExceeded as exc:
+                result.metadata["deferred_reason"] = str(exc)
+                break
+            except Exception as exc:
+                result.record_exception(f"match {key}: {exc}", exc)
+                continue
+            if getattr(self, "_match_budget_error", None):
+                result.errors.append(self._match_budget_error)
+                self._match_budget_error = None
             if not fetch.ok:
                 self._commit_for_fetch(
                     fetch,
@@ -2783,6 +2876,7 @@ class FotMobIngestService:
                         entity_id=key, error_code=type(shape_exc).__name__, error=str(shape_exc),
                     )
                     continue
+                row["_observed_at"] = match_time(fetch.source_observed_at or fetch.fetched_at)
                 paths = inventory_json_paths(fetch.data)
                 inventory, unknown = self._inventory_rows(
                     "match",

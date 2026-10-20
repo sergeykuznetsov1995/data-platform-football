@@ -193,6 +193,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/match_refresh.py",
     "scrapers/fotmob/player_collector.py",
     "scrapers/fotmob/scope_codec.py",
     "scrapers/fotmob/source_refresh.py",

@@ -20,11 +20,13 @@ import signal
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from scrapers.fotmob.match_refresh import MATCH_SETTLE_MARGIN, match_refresh, source_observed_at
+from scrapers.fotmob.domain import ScopeRef, SeasonBundle
 from scrapers.fotmob.interruption import FotMobTerminated
 from scrapers.fotmob.writer_lock import WriterLockBusy, writer_lock
 
@@ -145,7 +147,6 @@ CURRENT_SCOPE_COOLDOWN = timedelta(hours=48)
 CURRENT_SCOPE_OBLIGATION_COOLDOWN = timedelta(hours=2)
 # Сколько ждать ПОСЛЕ начала матча, прежде чем идти за его флагом: полтора часа
 # игры плюс запас на то, что источник проставляет терминальный статус не мгновенно.
-MATCH_SETTLE_MARGIN = timedelta(hours=3)
 # Короткий возврат скоупа ради матча, по которому источник ответил «данных нет»
 # (#1450): дыра считается подтверждённой после двух ранов с промежутком не меньше
 # двух часов (или после трёх любых); спустя трое суток от начала матча короткого
@@ -682,34 +683,28 @@ def _schedule_cooldown(matches: Iterable[Mapping[str, Any]], now: datetime) -> t
     return min(CURRENT_SCOPE_COOLDOWN, earliest_future + MATCH_SETTLE_MARGIN - now)
 
 
+def _match_refresh_cooldown(matches, service, now):
+    due = [service.match_refresh_state(match, now).next_due for match in matches]
+    return min(
+        (max(timedelta(minutes=1), value - now) for value in due if value is not None),
+        default=CURRENT_SCOPE_COOLDOWN,
+    )
+
+
 def _match_debt_is_open(
     match: Mapping[str, Any],
     repository: Any,
     now: datetime,
     canonicalize: Any,
 ) -> bool:
-    """Придёт ли раннер за карточкой этого матча, если обойдёт скоуп сейчас.
-
-    Дословно фильтр `FotMobIngestService.sync_match_payloads`
-    (`scrapers/fotmob/service.py:2466-2493`): долг — ровно то, что раннер сам
-    запросил бы после обхода, ни больше. Матч, который начался, но не помечен
-    `finished`, долгом НЕ считается: его карточку раннер не качает
-    (`include_unfinished=False`), и такой матч дал бы вечный долг.
-    """
-
-    if not match.get("finished"):
-        return False
-    if match.get("cancelled") or match.get("postponed"):
-        return False
-    kickoff = _match_kickoff(match.get("utc_time"))
-    if kickoff is None or kickoff > now - MATCH_SETTLE_MARGIN:
-        return False
+    """The same primary/late obligation used by the ingest service."""
     match_id = match.get("match_id")
     if match_id is None:
         return False
     target = canonicalize("matchDetails", {"matchId": str(match_id)})
-    previous = repository.latest_success(target.target_key)
-    return previous is None or bool(previous.get("stale"))
+    lookup = repository.latest_match_source
+    previous = lookup(target.target_key)
+    return match_refresh(match, source_observed_at(previous), now).kind in {"primary", "late"}
 
 
 def _unconfirmed_gap_matches(
@@ -811,11 +806,14 @@ def _scope_debt_counts(
         if bundle is None:
             continue
         identity = tuple(bundle.scope.identity[:2])
-        counts[identity] = sum(
-            1
-            for match in bundle.matches
-            if _match_debt_is_open(match, repository, now, canonicalize_target)
-        )
+        counts[identity] = 0
+        for match in bundle.matches:
+            if match_refresh(match, None, now).kind != "primary":
+                continue
+            target = canonicalize_target("matchDetails", {"matchId": str(match.get("match_id"))})
+            observed = source_observed_at(repository.latest_match_source(target.target_key))
+            if match_refresh(match, observed, now).kind == "primary":
+                counts[identity] += 1
     return counts
 
 
@@ -1679,6 +1677,25 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         }
         return rc, payload
 
+    if getattr(args, "match_ids", None):
+        ids = sorted(set(args.match_ids))
+        rows = service.repository.stored_match_rows(ids)
+        found = {int(row["match_id"]) for row in rows}
+        if found != set(ids):
+            operations.append(OperationResult(
+                "match_payloads", errors=[f"missing saved match metadata: {sorted(set(ids) - found)}"],
+            ))
+        else:
+            for row in {int(row["match_id"]): row for row in rows}.values():
+                bundle = SeasonBundle(
+                    ScopeRef(int(row["competition_id"]), row["source_season_key"]),
+                    details={}, capabilities={}, matches=(row,),
+                )
+                operations.append(service.sync_match_payloads(
+                    bundle, include_unfinished=True, force_refresh=True,
+                ))
+        return finish()
+
     explicit_scopes = _parse_scopes(args.scope)
     explicit_ids = {competition_id for competition_id, _ in explicit_scopes}
     daily_competition_ids = {
@@ -1686,6 +1703,26 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     }
     requested_competition_ids = explicit_ids | daily_competition_ids
     entities = _selected_native_entities(args)
+
+    match_bundles = {}
+    if "matches" in entities and args.mode not in {"replay", "discover"}:
+        grouped = {}
+        for row in service.repository.stored_match_rows():
+            identity = (int(row["competition_id"]), str(row["source_season_key"]))
+            if explicit_scopes and identity not in explicit_scopes:
+                continue
+            if daily_competition_ids and identity[0] not in daily_competition_ids:
+                continue
+            grouped.setdefault(identity, []).append(row)
+        for identity, rows in grouped.items():
+            bundle = SeasonBundle(
+                ScopeRef(*identity), details={}, capabilities={}, matches=tuple(rows),
+            )
+            match_bundles[identity] = bundle
+            # Finish raw-first publication before any discovery, deadline or
+            # season-budget gate can hide it. This pass cannot schedule HTTP.
+            if any(service._recover_match_fetch(match) is not None for match in rows):
+                operations.append(service.sync_match_payloads(bundle, phase="recovery"))
 
     catalog = service.discover_catalog()
     operations.append(catalog.operation)
@@ -2115,6 +2152,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         else {}
     )
     planning_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    refresh_scopes = set()
+    if "matches" in entities and mode not in {RunMode.REPLAY, RunMode.DISCOVER}:
+        for discovered in discovery_results:
+            if discovered.selected_bundle is not None:
+                bundle = discovered.selected_bundle
+                match_bundles[tuple(bundle.scope.identity[:2])] = bundle
+        for identity, bundle in match_bundles.items():
+            states = [service.match_refresh_state(match, planning_observed_at) for match in bundle.matches]
+            if any(state.kind == "late" for state in states):
+                refresh_scopes.add(identity)
+        # Keep the campaign's family bridge only for scopes with no due card.
+        campaign_completed_scopes -= refresh_scopes
+        planner_complete_scopes -= refresh_scopes
 
     work = plan_seasons(
         classifications,
@@ -2125,6 +2175,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         lane=(automatic_lane if automatic_catalog else None),
         attempt_states=attempt_states,
         scope_debt=scope_debt,
+        match_refresh_scopes=refresh_scopes,
     )
     daily_scope_times = {}
     if mode == RunMode.DAILY and not automatic_catalog:
@@ -2138,6 +2189,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 work_item.competition_id,
             )
         )
+    def match_scope_priority(item):
+        bundle = match_bundles.get(item.identity)
+        states = (
+            [service.match_refresh_state(match, planning_observed_at).kind for match in bundle.matches]
+            if bundle is not None else []
+        )
+        return 0 if "primary" in states or bundle is None else (2 if "late" in states else 1)
+
+    if "matches" in entities and mode != RunMode.REPLAY:
+        work.sort(key=match_scope_priority)
     # Очередь кандидатов полосы: неизменное обязательство каталога минус
     # закрытые скоупы и признанные дыры источника, чей 30-дневный срок
     # пересмотра ещё не наступил. Планировщик временно исключает ровно те же
@@ -2304,6 +2365,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     calendar_unavailable_scopes: list[str] = []
     replay_gap_entries: list[dict[str, Any]] = []
 
+    late_bundles = []
+
     # Complete one exact scope end-to-end before starting the next.  This is
     # the fairness boundary that prevents a season-first pass from consuming
     # the whole request budget and permanently starving child entities.
@@ -2364,6 +2427,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if bundle is None:
             work_plan.retryable.append(f"scope {scope_key} has no season bundle")
         else:
+            if "matches" in entities and mode != RunMode.REPLAY:
+                late_bundles.append(bundle)
             if "leaderboards" in entities:
                 leaderboard_operation = service.sync_leaderboards(bundle)
                 operations.append(leaderboard_operation)
@@ -2375,6 +2440,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 match_operation = service.sync_match_payloads(
                     bundle,
                     limit=min(per_run_limit, capacity),
+                    phase=("primary" if mode != RunMode.REPLAY else None),
                 )
                 operations.append(match_operation)
                 scope_operations.append(match_operation)
@@ -2507,7 +2573,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     reason="scope completion committed",
                     next_retry_at=(
                         observed_at
-                        + _schedule_cooldown(bundle.matches, observed_at)
+                        + min(
+                            _schedule_cooldown(bundle.matches, observed_at),
+                            _match_refresh_cooldown(bundle.matches, service, observed_at),
+                        )
                         if automatic_lane == ScopeLane.CURRENT
                         else None
                     ),
@@ -3027,6 +3096,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 f"{len(obligation_scopes)} obligation scopes remain outside the "
                 "completion journal"
             )
+    for bundle in late_bundles:
+        operations.append(service.sync_match_payloads(
+            bundle, phase="late", limit=args.match_limit or None,
+        ))
+
     rc, payload = finish()
     replay_missing_inputs = (
         _replay_missing_raw_evidence(
@@ -3265,6 +3339,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--competition-limit", type=int, default=0)
     parser.add_argument("--season-limit", type=int, default=0)
     parser.add_argument("--match-limit", type=int, default=0)
+    parser.add_argument("--match-ids", type=int, nargs="+", default=[])
     parser.add_argument("--team-limit", type=int, default=0)
     parser.add_argument("--player-limit", type=int, default=0)
     parser.add_argument(
@@ -3299,6 +3374,11 @@ def _argument_parser() -> argparse.ArgumentParser:
 def _validate_args(
     parser: argparse.ArgumentParser, args
 ) -> dict[str, Any] | None:
+    if getattr(args, "match_ids", None):
+        if any(value <= 0 for value in args.match_ids):
+            parser.error("--match-ids must contain positive IDs")
+        if args.mode not in {"daily", "refresh", "backfill", "replay"} or getattr(args, "catalog_contract", ""):
+            parser.error("--match-ids requires an explicit non-catalog ingest mode")
     positive = {
         "--max-requests": args.max_requests,
         "--max-direct-mib": args.max_direct_mib,
