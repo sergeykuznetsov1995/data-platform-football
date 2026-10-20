@@ -161,6 +161,7 @@ class RepositoryWriter(Protocol):
         add_metadata: bool = True,
         source: Optional[str] = None,
         delete_filter: Optional[str] = None,
+        merge_keys: Optional[Sequence[str]] = None,
     ) -> str: ...
 
 
@@ -1019,6 +1020,7 @@ class FotMobRepository:
         entity_type: str,
         partition_cols: Optional[Sequence[str]] = None,
         delete_filter: Optional[str] = None,
+        merge_keys: Optional[Sequence[str]] = None,
     ) -> Optional[str]:
         normalized = normalize_rows(rows)
         if not normalized:
@@ -1047,6 +1049,7 @@ class FotMobRepository:
             add_metadata=False,
             source="fotmob",
             delete_filter=delete_filter,
+            **({"merge_keys": merge_keys} if merge_keys else {}),
         )
 
     def commit(
@@ -1653,6 +1656,46 @@ class FotMobRepository:
             return None
         return {str(key[0]) for key in fingerprints if key[5] == "published"}
 
+    def _can_refresh_team_snapshot(
+        self,
+        batch_id: str,
+        actual: Sequence[Mapping[str, Any]],
+        pending: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        """Only a proven singleton of the same team/raw/parser may be merged."""
+
+        if len(actual) != 1 or len(pending) != 1:
+            return False
+        identity = ("team_id", "_payload_sha256", "_parser_version")
+        if any(
+            not pending[0].get(column)
+            or actual[0].get(column) != pending[0][column]
+            for column in identity
+        ):
+            return False
+        manifests = self._stored_manifest_fingerprints([batch_id])
+        if manifests is None:
+            return False
+        for row in self._pending_manifest:
+            if (
+                row.get("batch_id") == batch_id
+                and row.get("target_type") == "team"
+                and row.get("entity_id") == pending[0]["team_id"]
+                and row.get("content_hash") == pending[0]["_payload_sha256"]
+                and row.get("parser_version") == pending[0]["_parser_version"]
+                and any(
+                    key[0] == batch_id
+                    and key[1] == row["target_key"]
+                    and key[2] == row["content_hash"]
+                    and key[3] == row["parser_version"]
+                    and key[5] == "published"
+                    and key[9] == row["entity_id"]
+                    for key in manifests
+                )
+            ):
+                return True
+        return False
+
     def _reconcile_pending_table(
         self,
         key: tuple[str, str, Optional[tuple[str, ...]]],
@@ -1676,7 +1719,10 @@ class FotMobRepository:
             by_batch.setdefault(str(row["_target_batch_id"]), []).append(row)
         for row in rows:
             original_by_batch.setdefault(str(row["_target_batch_id"]), []).append(row)
-        result = self._stored_batch_rows(table, by_batch, columns)
+        read_columns = columns
+        if table == "fotmob_team_snapshots":
+            read_columns = sorted(set(columns) | {"_payload_sha256", "_parser_version"})
+        result = self._stored_batch_rows(table, by_batch, read_columns)
         if result is None:
             return
         stored, types = result
@@ -1713,6 +1759,23 @@ class FotMobRepository:
                 legacy = pd.DataFrame(legacy).to_dict("records")
                 if present == row_multiset(legacy, columns, types):
                     continue
+            if (
+                table == "fotmob_team_snapshots"
+                and self._can_refresh_team_snapshot(batch_id, actual, pending)
+            ):
+                # One atomic update, never DELETE followed by INSERT. The
+                # writer lock covers this read/merge; retries recheck storage.
+                self._write(
+                    table, original_by_batch[batch_id],
+                    entity_type=key[1], partition_cols=key[2],
+                    merge_keys=("_target_batch_id",),
+                )
+                logger.warning(
+                    "%s: confirmed batch %s has changed parser representation; "
+                    "merged %d row with current parse",
+                    table, batch_id, len(pending),
+                )
+                continue
             if actual:
                 if successes is None:
                     successes = self._successful_batch_ids(by_batch)
