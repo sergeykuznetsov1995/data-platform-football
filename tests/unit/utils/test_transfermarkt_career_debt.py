@@ -1,7 +1,13 @@
 """Offline regression of global career selection and physical observation writes."""
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
+import json
+import os
+from pathlib import Path
 import re
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -126,6 +132,29 @@ def test_scope_writer_merges_unchanged_attributes_but_preserves_a_b_a(scraper):
     assert attrs[attrs.player_id == '1'].market_value_eur.astype(int).tolist() == [1000000, 2000000, 1000000]
 
 
+def _career_registry(db):
+    db.execute('CREATE TABLE transfermarkt_competitions_v2 (competition_id text, '
+        'registry_snapshot_id text, active boolean, classification_status text, gender text, '
+        'age_category text, team_type text, competition_type text)')
+    db.execute('CREATE TABLE transfermarkt_competition_editions_v2 (competition_id text, '
+        'edition_id text, registry_snapshot_id text, active boolean)')
+    for comp in ('GB1', 'ES1'):
+        db.execute('INSERT INTO transfermarkt_competitions_v2 VALUES '
+            "(?, 'registry', true, 'eligible', 'men', 'senior', 'club', 'domestic_league')", (comp,))
+        db.execute('INSERT INTO transfermarkt_competition_editions_v2 VALUES '
+            "(?, '2026', 'registry', true)", (comp,))
+
+
+def _career_query(db):
+    # Execute the actual Trino query through the same SQLite store as writes.
+    query = dq.build_career_debt_sql(registry_snapshot_id='registry')
+    query = re.sub(r'iceberg\.(?:ops|bronze|silver)\.', '', query)
+    query = query.replace('TRY_CAST', 'CAST')
+    query = re.sub(r'COUNT_IF\((.*?)\)', r'COALESCE(SUM(\1), 0)', query)
+    db.create_function('json_extract_scalar', 2, lambda value, path: json.loads(value).get('pending'))
+    return query
+
+
 def test_dq_counts_unique_players_missing_either_endpoint(scraper):
     db = scraper.test_db.sql
     run._ensure_fetch_state(scraper.test_db)
@@ -134,21 +163,129 @@ def test_dq_counts_unique_players_missing_either_endpoint(scraper):
         [('GB1', '2026', '1'), ('ES1', '2026', '1'), ('GB1', '2026', '2')])
     db.execute('CREATE TABLE transfermarkt_scope_manifest_v2 (competition_id text, edition_id text, '
         'entity_manifest_json text, committed_at text, status text)')
-    # Execute the actual query through a small Trino-to-SQLite adapter.
-    query = dq.build_career_debt_sql()
-    query = re.sub(r'iceberg\.(?:ops|bronze)\.', '', query)
-    query = query.replace('TRY_CAST', 'CAST').replace('COUNT_IF(pending IS NULL)', 'SUM(pending IS NULL)')
-    db.create_function('json_extract_scalar', 2, lambda value, path: 0)
+    _career_registry(db)
+    query = _career_query(db)
     for comp in ('GB1', 'ES1'):
         db.execute('INSERT INTO transfermarkt_scope_manifest_v2 VALUES (?, ?, ?, ?, ?)',
-            (comp, '2026', '{}', '2026-10-20', state.SCOPE_COMPLETION_STATUS))
-    assert db.execute(query).fetchone() == (2, 0, 2, 2)
+            (comp, '2026', '{"pending":0}', '2026-10-20', state.SCOPE_COMPLETION_STATUS))
+    assert db.execute(query).fetchone() == (2, 0, 2, 2, 2)
     for endpoint in ('transfers', 'market_value_history'):
         assert run._persist_fetch_state(scraper, run.ENTITY_SPECS[endpoint], ['1'],
             [('authoritative_empty', 0, None, None)], 'commit')
-    assert db.execute(query).fetchone() == (1, 0, 2, 2)
+    assert db.execute(query).fetchone() == (1, 0, 2, 2, 2)
     # Failed refresh does not make a previously successful player initial debt.
     assert 'last_success_at IS NOT NULL' in career_debt_ctes()
+
+
+@pytest.mark.parametrize('complete_scopes', [0, 1, 2])
+def test_dq_includes_unfinished_target_rosters_and_separates_evidence(scraper, complete_scopes):
+    db = scraper.test_db.sql
+    run._ensure_fetch_state(scraper.test_db)
+    _career_registry(db)
+    db.execute('CREATE TABLE transfermarkt_squad_memberships '
+        '(competition_id text, edition_id text, player_id text)')
+    db.executemany('INSERT INTO transfermarkt_squad_memberships VALUES (?, ?, ?)',
+        [('GB1', '2026', '1'), ('ES1', '2026', '2'), ('ES1', '2026', '2'), ('ZZ1', '2026', '3')])
+    db.execute('CREATE TABLE transfermarkt_scope_manifest_v2 (competition_id text, edition_id text, '
+        'entity_manifest_json text, committed_at text, status text)')
+    for comp in ('GB1', 'ES1')[:complete_scopes]:
+        db.execute('INSERT INTO transfermarkt_scope_manifest_v2 VALUES (?, ?, ?, ?, ?)',
+            (comp, '2026', '{"pending":0}' if comp == 'GB1' else '{}',
+             '2026-10-20', state.SCOPE_COMPLETION_STATUS))
+    for endpoint in ('transfers', 'market_value_history'):
+        assert run._persist_fetch_state(scraper, run.ENTITY_SPECS[endpoint], ['1'],
+            [('success', 1, None, None)], 'complete-global-career')
+    assert db.execute(_career_query(db)).fetchone() == (
+        1, int(complete_scopes == 2), complete_scopes, 2, 2)
+
+
+@pytest.mark.parametrize('mode', ['dual', 'native-only'])
+@pytest.mark.parametrize('uncached,new_empty', [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize('empty', [False, True])
+def test_fresh_global_careers_complete_scope_cycle_without_refetch(scraper, monkeypatch, tmp_path, mode, uncached, new_empty, empty):
+    from dags.scripts import run_transfermarkt_scope_cycle as cycle
+    from scrapers import transfermarkt as tm
+    from tests.unit.scripts.test_run_transfermarkt_scope_cycle import (
+        _payload, _approved_args, _parse_args, _fake_subprocess,
+    )
+    from tests.unit.utils.test_transfermarkt_current_write import http
+
+    from scrapers.transfermarkt import ops_traffic
+    monkeypatch.setattr(ops_traffic, 'record_traffic_run', lambda *a, **k: None)
+    query_dataframe = run._query_dataframe
+
+    def sqlite_dataframe(*args, **kwargs):
+        frame = query_dataframe(*args, **kwargs)
+        if 'is_upcoming' in frame:
+            # MemoryWriter stores every SQLite column as TEXT; Trino returns bool.
+            frame['is_upcoming'] = frame['is_upcoming'].map({'false': False, 'true': True})
+        return frame
+
+    monkeypatch.setattr(run, '_query_dataframe', sqlite_dataframe)
+    payloads = {
+        'market_value_points': {'list': [{'datum_mw': 'Jan 1, 2025', 'y': 1000000,
+            'verein': 'Club', 'age': '20', 'mw': '€1m'}]},
+        'transfer_events': {'transfers': [{'id': 'source-1', 'date': 'Jul 1, 2020', 'season': '20/21',
+            'from': {'clubName': 'A', 'href': '/verein/1/'}, 'to': {'clubName': 'B', 'href': '/verein/2/'},
+            'fee': '€1.00m', 'marketValue': '€2.00m', 'upcoming': False}]},
+    }
+    for endpoint, body in payloads.items():
+        scraper._batch_id = 'original-' + endpoint
+        http(scraper, [{('list' if endpoint == 'market_value_points' else 'transfers'): []} if empty else body])
+        assert current.fetch_current_career(scraper, endpoint, ['1'],
+            {'competition_id': 'ES1', 'edition_id': '2026'}, {'write_mode': mode, 'revision': 7},
+            'original-' + endpoint, decoded_body_soft_stop_bytes=100000)['verified']
+    original_state = _table(scraper, 'transfermarkt_fetch_state').set_index('endpoint').last_success_at.to_dict()
+    scraper._batch_id = 'new-scope'
+    new_payloads = [(('list' if entity == 'market_value_history' else 'transfers'),
+        payloads[run.ENTITY_SPECS[entity].state_endpoint])
+        for entity in cycle.ENTITY_ORDER if entity in {'transfers', 'market_value_history'}]
+    factory = http(scraper, [({key: []} if new_empty else body) for key, body in new_payloads] if uncached else [])
+    monkeypatch.setattr(scraper, 'close', lambda: None)
+    monkeypatch.setattr(tm, 'TransfermarktScraper', lambda **kwargs: scraper)
+    monkeypatch.setattr(scraper, '_resolve_player_ids_from_bronze', lambda *a, **k: ['1', '2'] if uncached else ['1'])
+    monkeypatch.setattr(scraper, 'get_traffic_stats', lambda: {
+        'network_fetches': sum(len(client.get_calls) for client in factory.clients),
+        'retries': 0, 'decoded_response_body_bytes': 0,
+        'wire_response_bytes': 0, 'provider_metered_bytes': 0, 'provider_metering_available': True,
+        'hard_provider_byte_budget': int(os.environ.get(run.PROVIDER_GRANT_ENV_VAR, cycle.HARD_BYTE_CAP)),
+        'soft_provider_byte_stop': 1,
+    })
+    payload = _payload(tmp_path)
+    monkeypatch.setenv('TM_RESPONSE_CACHE_PATH', str(tmp_path / 'response-cache.json'))
+    monkeypatch.setattr(cycle, 'RESPONSE_CACHE_ROOT', tmp_path / 'responses')
+    argv, _ = _approved_args(tmp_path, payload, write_mode=mode, refresh_mode='current')
+    args = _parse_args(argv)
+    fake = _fake_subprocess([], mutate=lambda command, result: dict(result,
+        native_write_manifest=result['batch_manifest'], native_write_manifest_complete=True))
+
+    def subprocess_runner(command, **kwargs):
+        entity = command[command.index('--entity') + 1]
+        if entity not in {'transfers', 'market_value_history'}:
+            return fake(command, **kwargs)
+        with patch.dict(os.environ, kwargs['env']), patch.object(sys, 'argv', list(command[1:])):
+            rc = run.main()
+        return SimpleNamespace(returncode=rc, stdout='', stderr='')
+
+    manifest = cycle.run_scope_cycle(args, operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=subprocess_runner, manifest_writer=lambda value: None,
+        parent_ledger_writer=lambda value: None)
+    assert manifest['status'] == 'complete'
+    assert manifest['dq_evidence']['career_fetches_pending'] == 0
+    assert sum(len(client.get_calls) for client in factory.clients) == (2 if uncached else 0)
+    for entity in ('transfers', 'market_value_history'):
+        result = json.loads((Path(payload['result_paths']['entity_staging_dir']) / (entity + '.json')).read_text())
+        assert result['native_write_complete']
+        if not uncached:
+            assert result['cache_only_materialization'] and result['network_fetches'] == 0
+        key = run.ENTITY_SPECS[entity].state_endpoint
+        assert result['outputs'][key]['rows'] == int(not empty) + int(uncached and not new_empty)
+        assert result['career_cache_materialized_keys'] == 1
+    final_state = _table(scraper, 'transfermarkt_fetch_state')
+    assert final_state[final_state.source_id == '1'].set_index('endpoint').last_success_at.to_dict() == original_state
+    if mode == 'dual' and (not empty or (uncached and not new_empty)):
+        for table in ('transfermarkt_market_value_history', 'transfermarkt_transfers'):
+            assert '2526' in set(_table(scraper, table).season)
 
 
 def test_manifest_counts_player_once_across_endpoints():
@@ -160,6 +297,38 @@ def test_manifest_counts_player_once_across_endpoints():
     with pytest.raises(state.ScopeManifestError):
         state.ScopeManifest._validate_roster_coverage(None, {
             'roster_coverage': {'transfers': dict(item, pending=0)}, 'career_fetches_pending': 0})
+
+
+@pytest.mark.parametrize('drift', ['missing_proof', 'physical_rows', 'before_manifest'])
+def test_cached_empty_requires_original_proof_and_rechecks_physical_rows(scraper, drift):
+    from tests.unit.utils.test_transfermarkt_current_write import http
+    http(scraper, [{'list': []}])
+    assert current.fetch_current_career(scraper, 'market_value_points', ['1'],
+        {'competition_id': 'GB1', 'edition_id': '2026'}, {'write_mode': 'native-only', 'revision': 7},
+        'empty-source', decoded_body_soft_stop_bytes=100000)['verified']
+    factory = http(scraper, [])
+    spec = run._spec_for_write_mode(run.ENTITY_SPECS['market_value_history'], 'native-only')
+    db = scraper.test_db.sql
+    if drift == 'missing_proof':
+        db.execute('DELETE FROM transfermarkt_career_capture_refs_v1')
+        with pytest.raises(RuntimeError, match='lacks original typed proof'):
+            run._load_cached_career_frames(scraper, spec, ['1'])
+    else:
+        cached = run._load_cached_career_frames(scraper, spec, ['1'])
+        frames = run._merge_career_cache_frames(scraper, spec, {}, cached, 'ES1', 2026)
+        results = {'outputs': {}, 'tables': []}
+        if drift == 'before_manifest':
+            for frame in frames.values():
+                frame.attrs['fetch_status'] = 'authoritative_empty'
+            run._save_frames(scraper, spec, frames, False, results)
+        db.execute('CREATE TABLE transfermarkt_market_value_points (player_id text)')
+        db.execute("INSERT INTO transfermarkt_market_value_points VALUES ('1')")
+        with pytest.raises(RuntimeError, match='has physical rows'):
+            if drift == 'before_manifest':
+                run._persist_native_write_manifest(scraper, spec, frames, results, 'next', 'ES1', 2026, 7)
+            else:
+                run._save_frames(scraper, spec, frames, False, results)
+    assert factory.clients == []
 
 
 @pytest.mark.parametrize('mode', ['dual', 'native-only'])

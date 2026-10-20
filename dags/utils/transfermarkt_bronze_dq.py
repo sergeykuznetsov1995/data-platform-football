@@ -779,10 +779,12 @@ FROM (
 WHERE rn = 1"""
 
 
-def build_career_debt_sql() -> str:
+def build_career_debt_sql(*, registry_snapshot_id: str) -> str:
     """Unique roster players missing either committed full career endpoint."""
 
-    return f"""WITH {career_debt_ctes()}, latest AS (
+    return f"""WITH {career_debt_ctes()}, targets AS (
+    {build_registry_target_sql(registry_snapshot_id)}
+), latest AS (
     SELECT competition_id, edition_id, TRY_CAST(json_extract_scalar(
         entity_manifest_json, '$.dq_evidence.career_fetches_pending'
     ) AS bigint) AS pending
@@ -798,12 +800,13 @@ def build_career_debt_sql() -> str:
 )
 SELECT (
     SELECT COUNT(DISTINCT d.player_id) FROM career_debt d
-    JOIN latest l ON l.competition_id = d.competition_id AND l.edition_id = d.edition_id
-), COUNT_IF(pending IS NULL), COUNT(*), (
+    JOIN targets t ON t.competition_id = d.competition_id AND t.edition_id = d.edition_id
+), COUNT_IF(l.competition_id IS NOT NULL AND l.pending IS NULL), COUNT(l.competition_id), (
     SELECT COUNT(DISTINCT r.player_id) FROM career_roster r
-    JOIN latest l ON l.competition_id = r.competition_id AND l.edition_id = r.edition_id
-)
-FROM latest"""
+    JOIN targets t ON t.competition_id = r.competition_id AND t.edition_id = r.edition_id
+), COUNT(*)
+FROM targets t
+LEFT JOIN latest l ON l.competition_id = t.competition_id AND l.edition_id = t.edition_id"""
 
 
 # ---------------------------------------------------------------------------
@@ -1370,7 +1373,7 @@ def run_bronze_dq(
     run('tm_target_scope_coverage', 'target_scope_coverage', 'WARNING', coverage)
 
     def career_debt():
-        cur.execute(build_career_debt_sql())
+        cur.execute(build_career_debt_sql(registry_snapshot_id=snapshot))
         rows = list(cur.fetchall())
         if len(rows) != 1:
             raise ValueError('career debt query must return exactly one row')
@@ -1386,9 +1389,14 @@ def run_bronze_dq(
             roster_size = int(rows[0][3])
             value.update(roster_players=roster_size,
                 debt_ratio=pending / roster_size if roster_size else None)
+        if len(rows[0]) > 4:
+            target_count = int(rows[0][4])
+            value.update(target_scopes=target_count,
+                missing_complete_manifests=target_count - manifest_count)
         details = (
-            f'{pending} unique players without complete careers across {manifest_count} '
-            f'complete manifests; {null_evidence} without evidence'
+            f'{pending} unique target roster players without complete careers; '
+            f'{manifest_count} complete manifests; {null_evidence} without evidence; '
+            f"{value.get('missing_complete_manifests', 0)} missing complete manifests"
         )
         return True, details, value
     run('tm_career_debt', 'career_debt', 'WARNING', career_debt)
