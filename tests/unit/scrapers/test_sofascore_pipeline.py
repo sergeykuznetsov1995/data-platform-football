@@ -1603,7 +1603,7 @@ def test_match_runner_holds_match_moved_to_another_season_and_publishes_the_rest
     journal = saved["sofascore_rejected_rows"]["df"]
     assert set(journal["reason_code"]) == {"season_mismatch"}
     assert set(journal["natural_key"]) == {f"76986|{bad_match}"}
-    assert len(journal) == journal["table_name"].nunique()
+    assert list(journal["table_name"]) == ["bronze.sofascore_events"]
     assert result["matches_complete"] == 94
     held = runtime.manifest_store.get(specs[(bad_match, "event")].key)
     assert held.status == ManifestStatus.SCHEMA_ERROR
@@ -1619,7 +1619,7 @@ def test_match_runner_holds_match_moved_to_another_season_and_publishes_the_rest
     }
 
 
-def test_match_runner_fresh_pass_of_only_moved_matches_is_red(tmp_path, monkeypatch):
+def test_match_runner_fresh_pass_with_no_aligned_match_stays_strictly_red(tmp_path, monkeypatch):
     bad_match = "20000400"
     runtime, _, _ = _match_batch_runtime(
         tmp_path, [bad_match], bad_match, bad_gender=False, bad_season_id=87177
@@ -1628,8 +1628,8 @@ def test_match_runner_fresh_pass_of_only_moved_matches_is_red(tmp_path, monkeypa
         runtime, [bad_match], tmp_path / "moved-fresh.json", monkeypatch
     )
     assert rc == 1
-    assert result["errors"] == ["all 1 matches refused: season_mismatch"]
-    assert saved == {}
+    assert result["errors"][0].startswith("season_mismatch: 1 rows do not match")
+    assert "sofascore_rejected_rows" not in saved
 
 
 def test_match_runner_quarantines_fractional_jersey_and_publishes_integral_match(

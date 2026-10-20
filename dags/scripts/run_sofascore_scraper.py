@@ -529,11 +529,14 @@ def _logical_capture_traffic(engine, live_traffic=None):
     return traffic
 
 
-def _materialize_endpoint_results(scraper, results, *, league: str, season: str):
+def _materialize_endpoint_results(
+    scraper, results, *, league: str, season: str, held=frozenset()
+):
     """Build every match DataFrame from the raw/replay engine datasets."""
     import pandas as pd
 
     from dags.utils.sofascore_dq import (
+        RejectedRow,
         validate_event_participants,
         validate_lineup_semantics,
         validate_season_alignment,
@@ -690,40 +693,39 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
     expected_source_season_id = next(iter(source_season_ids))
     # #1778: a match SofaScore moved to another season after its schedule row
     # was written is held like a rejected row, not a failure of the season.
-    from dags.utils.sofascore_dq import RejectedRow
-
+    # Only an event that carries its own, different season while the rest of
+    # the pass matches (or a replay of such a hold) counts as moved; a wrong
+    # season for the whole pass or missing lineage still fails strictly below.
+    events = frames["events"]
     moved = []
-    for name, frame in frames.items():
-        if name == "capture_status" or frame.empty:
-            continue
-        column = "match_id" if "match_id" in frame.columns else "game_id"
-        if column not in frame.columns:
-            continue
-        records = frame.to_dict("records")
+    if not events.empty:
+        column = "match_id" if "match_id" in events.columns else "game_id"
+        records = events.to_dict("records")
         report = validate_season_alignment(
             records,
             expected_source_season_id=expected_source_season_id,
             expected_canonical_season=season,
         )
+        aligned = len(report.rejected_indices) < len(records)
         for index, reasons in report.rejected_indices.items():
             row = records[index]
-            moved.append(
-                RejectedRow(
-                    row={**row, "match_id": row[column]},
-                    table=dq_tables.get(name, f"bronze.sofascore_{name}"),
-                    code="season_mismatch",
-                    message=reasons[0].message,
-                    natural_key=f"{expected_source_season_id}|{row[column]}",
+            if column in row and any(
+                row.get(field) not in (None, "")
+                for field in ("season_id", "sofascore_season_id", "source_season_id")
+            ) and (aligned or str(row[column]) in held):
+                moved.append(
+                    RejectedRow(
+                        row={**row, "match_id": row[column]},
+                        table=dq_tables["events"],
+                        code="season_mismatch",
+                        message=reasons[0].message,
+                        natural_key=f"{expected_source_season_id}|{row[column]}",
+                    )
                 )
-            )
     moved_ids = frozenset(str(rejected.row["match_id"]) for rejected in moved)
     if moved_ids:
         rejected_rows.extend(moved)
         rejected_match_ids = rejected_match_ids | moved_ids
-        if all_rejected is None and {
-            str(r.manifest.key.target_id) for r in results
-        } <= rejected_match_ids:
-            all_rejected = f"all {len(moved_ids)} matches refused: season_mismatch"
         for name, frame in frames.items():
             if name == "capture_status" or frame.empty:
                 continue
@@ -1499,6 +1501,7 @@ def _run_match_capture(
                     pipeline_results,
                     league=league,
                     season=season_short,
+                    held=quarantined_before,
                 )
             else:
                 from scrapers.sofascore.live_capture import capture_live_specs
@@ -1669,6 +1672,7 @@ def _run_match_capture(
                     pipeline_results,
                     league=league,
                     season=season_short,
+                    held=quarantined_before,
                 )
             rejected_rows = frames.pop("rejected_rows", [])
             rejected_match_ids = frames.pop("rejected_match_ids", frozenset())

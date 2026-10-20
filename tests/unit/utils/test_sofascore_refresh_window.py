@@ -209,3 +209,21 @@ def test_a_streak_of_failed_scopes_stops_the_window():
     assert visited == ['1', '2', '3']
     assert result['status'] == 'failed'
     assert result['stop_reason'] == 'scope_failure'
+
+
+def test_alternating_blips_and_failed_scopes_still_stop_the_window():
+    rows, visited, plan, execute = _scopes_harness(
+        ['transient_failure', 'failed', 'transient_failure', 'failed', 'refreshed'])
+    result = refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                           plan=plan, execute=execute, now=lambda: 1000)
+    assert visited == ['1', '2', '3']
+    assert result['status'] == 'failed'
+    assert result['stop_reason'] == 'scope_failure'
+
+
+def test_persisted_report_is_red_right_after_a_failed_scope():
+    rows, visited, plan, execute = _scopes_harness(['failed', 'refreshed'])
+    saved = []
+    refill_window(initial_elapsed_s=0, deadline_epoch=15000, pending=lambda: list(rows),
+                  plan=plan, execute=execute, now=lambda: 1000, persist=saved.append)
+    assert all(r['status'] == 'failed' and r['stop_reason'] == 'scope_failure' for r in saved)
