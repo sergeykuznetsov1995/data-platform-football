@@ -174,6 +174,84 @@ def test_late_match_recovers_raw_after_cutoff_without_http(tmp_path, monkeypatch
     assert bool(repository.tables.get("fotmob_match_payloads")) == (not incomplete)
 
 
+def test_late_match_processed_missing_raw_allows_scheduled_http(tmp_path, monkeypatch):
+    from scrapers.fotmob.repository import MemoryFotMobRepository
+
+    raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())
+    missing = {"error": True, "message": "Data not found", "matchId": 100}
+    transport, session = _transport([
+        FakeResponse(200, json.dumps(missing).encode()),
+        FakeResponse(200, json.dumps(GOOD).encode()),
+    ], raw_store=raw_store, max_attempts=1)
+    repository = MemoryFotMobRepository()
+    seed(repository)
+    clock = [T + timedelta(hours=6)]
+    monkeypatch.setattr(service_module, "utc_now", lambda: clock[0])
+    original_store = raw_store.store
+
+    def store(*args, **kwargs):
+        kwargs["fetched_at"] = kwargs["validated_at"] = clock[0].isoformat()
+        return original_store(*args, **kwargs)
+
+    monkeypatch.setattr(raw_store, "store", store)
+    service = FotMobIngestService(transport=transport, repository=repository, run_id="missing")
+    service.ledger.requests = 90
+    assert service.sync_match_payloads(bundle()).not_available == 1
+    assert repository.commits[-1].error_code == "source_data_not_found"
+    # Memory commits need an explicit completion time to sort after seed().
+    repository.commits[-1] = replace(repository.commits[-1], completed_at=clock[0])
+    assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == T
+
+    clock[0] += timedelta(hours=1)
+    restarted = FotMobIngestService(transport=transport, repository=repository, run_id="retry-missing")
+    restarted.ledger.requests = 90
+    result = restarted.sync_match_payloads(bundle())
+    assert result.succeeded == 1 and result.not_available == 0
+    assert len(session.calls) == 2
+    assert sum(commit.status == ManifestStatus.NOT_AVAILABLE for commit in repository.commits) == 1
+    assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == clock[0]
+    assert repository.tables["fotmob_match_payloads"][0]["match_facts_json"]["infoBox"]["Attendance"] == 14757
+
+
+@pytest.mark.parametrize("changed", ["body", "validation", "both"])
+def test_late_match_recovery_rejects_raw_changed_during_replay(tmp_path, monkeypatch, changed):
+    from scrapers.fotmob.repository import MemoryFotMobRepository
+
+    raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())
+    observed = T + timedelta(hours=48)
+    raw_store.store(TARGET, json.dumps(GOOD).encode(), fetched_at=observed.isoformat())
+    transport, session = _transport([], raw_store=raw_store, max_attempts=1)
+    repository = MemoryFotMobRepository()
+    seed(repository, observed=T + timedelta(hours=6))
+    service = FotMobIngestService(transport=transport, repository=repository, run_id="raced-recovery")
+    monkeypatch.setattr(service_module, "utc_now", lambda: T + timedelta(hours=100))
+    older = copy.deepcopy(GOOD)
+    older["content"]["matchFacts"]["infoBox"]["Attendance"] = None
+    original_load = raw_store.load
+    reads = []
+
+    def raced_load(target):
+        pair = original_load(target)
+        reads.append(pair[1])
+        if len(reads) == 1:
+            # A delayed writer replaces the target between the eligibility
+            # check and replay; the first read still returns the newer pair.
+            raw_store.store(
+                TARGET, json.dumps(GOOD if changed == "validation" else older).encode(),
+                fetched_at=(observed if changed == "body" else T + timedelta(hours=6)).isoformat(),
+            )
+        return pair
+
+    monkeypatch.setattr(raw_store, "load", raced_load)
+    result = service.sync_match_payloads(bundle())
+    assert len(reads) == 2
+    assert result.ok and result.succeeded == 0 and result.skipped == 1
+    assert not session.calls
+    assert not repository.tables.get("fotmob_match_payloads")
+    assert len(repository.commits) == 1
+    assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == T + timedelta(hours=6)
+
+
 @pytest.mark.parametrize("stop", ["bytes", "deadline"])
 def test_late_match_publishes_received_payload_before_budget_or_deadline(tmp_path, monkeypatch, stop):
     raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())

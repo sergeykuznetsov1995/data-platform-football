@@ -2737,9 +2737,16 @@ class FotMobIngestService:
             return None
         latest = self.repository.latest_entity_attempt("match", match["match_id"])
         if (latest and latest.get("content_hash") == record.content_hash
-            and latest.get("status") == ManifestStatus.SCHEMA_DRIFT.value):
+            and (latest.get("status") == ManifestStatus.SCHEMA_DRIFT.value
+                 or (latest.get("status") == ManifestStatus.NOT_AVAILABLE.value
+                     and latest.get("error_code") == "source_data_not_found"))):
             return None
         fetch = self.transport.replay_json("matchDetails", {"matchId": str(match["match_id"])})
+        # The mutable raw manifest may have changed during replay. Never pair
+        # another payload or validation with the observation checked above.
+        if (fetch.content_hash != record.content_hash
+            or fetch.source_observed_at != record.validated_at):
+            return None
         return replace(fetch, source_observed_at=record.validated_at)
 
     def _fetch_match(
