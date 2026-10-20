@@ -372,20 +372,82 @@ def test_portion_stops_before_45minutes_without_starting_paid_request(tmp_path):
 
 
 def test_cohort_templates_need_current_club_page_and_do_not_reuse_old_player_ids():
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "groups": ["top_league"], "player_ids": ["obsolete"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "edition_url": "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2", "groups": ["top_league"], "player_ids": ["obsolete"]}]}
     tasks, players, _ = bench.plan_tasks(sample, roster_only=True)
     assert len(tasks) == 3 and not players and not tasks[2]["ids"]
     assert [task["kind"] for task in tasks] == ["edition", "participants", "squad"]
-    assert tasks[0]["url"] == "https://www.transfermarkt.com/competition/startseite/wettbewerb/ARG2"
+    assert tasks[0]["url"] == "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2"
     assert tasks[2]["url"].endswith("/kader/verein/11/plus/1")
     sample["clubs"][0]["squad_url"] = "https://www.transfermarkt.com/arsenal/kader/verein/11/saison_id/2025/plus/1"
     with pytest.raises(bench.ProbeGateError, match="current club URL"):
         bench.plan_tasks(sample, roster_only=True)
 
 
+@pytest.mark.parametrize("competition,route,slug", [
+    ("GB1", "wettbewerb", "premier-league"), ("DFB", "pokalwettbewerb", "dfb-pokal"),
+])
+def test_cohort_edition_url_is_taken_from_template_once_per_scope(competition, route, slug):
+    url = f"https://www.transfermarkt.com/{slug}/startseite/{route}/{competition}"
+    clubs = [{"club_id": club, "saison_id": 2026, "scope": f"{competition}/2026", "edition_url": url}
+             for club in ("11", "12")]
+    tasks, _, _ = bench.plan_tasks({"clubs": clubs}, roster_only=True)
+    editions = [task for task in tasks if task["kind"] == "edition"]
+    assert len(editions) == 1 and editions[0]["url"] == url
+    clubs[1]["edition_url"] = url.replace(slug, "other-slug")
+    with pytest.raises(bench.ProbeGateError, match="conflicting edition_url"):
+        bench.plan_tasks({"clubs": clubs}, roster_only=True)
+
+
+@pytest.mark.parametrize("url", [
+    None, "", 123, "http://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+    "https://transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+    "https://www.transfermarkt.com.evil/premier-league/startseite/wettbewerb/GB1",
+    "https://user@www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+    "https://[invalid/premier-league/startseite/wettbewerb/GB1",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/ES1",
+    "https://www.transfermarkt.com/premier-league/startseite/pokalwettbewerb/GB1",
+    "https://www.transfermarkt.com/premier-league/kader/wettbewerb/GB1",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1/saison_id/2026",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1?saison_id=2026",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1#2026",
+])
+def test_invalid_cohort_edition_url_is_refused_before_client(tmp_path, url):
+    club = {"club_id": "11", "saison_id": 2026, "scope": "GB1/2026"}
+    if url is not None:
+        club["edition_url"] = url
+    sample_path = tmp_path / "template.json"
+    sample_path.write_text(json.dumps({"clubs": [club]}))
+    (tmp_path / "signal-probe-ledger.json").write_text(json.dumps({
+        "active": False, "packet_schema_gate": True, "totals": dict.fromkeys(bench.COUNTERS, 0)}))
+    with pytest.raises(bench.ProbeGateError, match="edition_url"):
+        bench.run(args(tmp_path, mode="cohort", sample=str(sample_path)),
+                  client_factory=lambda *a: pytest.fail("must not construct HTTP client"))
+
+
+def test_changed_cohort_edition_url_cannot_resume_old_evidence(tmp_path):
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026",
+                          "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1"}]}
+    sample_path = tmp_path / "template.json"
+    sample_path.write_text(json.dumps(sample))
+    ledger_path = tmp_path / "signal-probe-ledger.json"
+    ledger_path.write_text(json.dumps({"active": False, "packet_schema_gate": True,
+                                       "totals": dict.fromkeys(bench.COUNTERS, 0)}))
+    tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
+    build, factory = transport_factory(tmp_path, responses={task["url"]: (405, b"blocked") for task in tasks})
+    options = args(tmp_path, mode="cohort", sample=str(sample_path), player_target=1000, min_scopes=20)
+    assert bench.run(options, client_factory=build) == 3
+    assert len(factory.calls) == 3
+    ledger = ledger_path.read_text()
+    sample["clubs"][0]["edition_url"] = sample["clubs"][0]["edition_url"].replace("premier-league", "other-slug")
+    sample_path.write_text(json.dumps(sample))
+    with pytest.raises(bench.ProbeGateError, match="new evidence directory"):
+        bench.run(options, client_factory=lambda *a: pytest.fail("must not construct HTTP client"))
+    assert ledger_path.read_text() == ledger
+
+
 def test_bootstrap_uses_fresh_raw_roster_and_declares_scope_vs_club_season(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "edition_url": "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2026" selected>26/27</option></select>' + SQUAD
@@ -405,7 +467,7 @@ def test_bootstrap_uses_fresh_raw_roster_and_declares_scope_vs_club_season(tmp_p
 
 def test_bootstrap_does_not_silently_count_unusable_contract_roster(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2026" selected>26/27</option></select>' + SQUAD.replace(b"<th>Contract</th>", b"<th>Current club</th>")
@@ -450,7 +512,7 @@ def test_template_scope_must_be_live_core_denominator_competition():
         with pytest.raises(bench.ProbeGateError, match="denominator"):
             bench.plan_tasks({"clubs": [{"club_id": "11", "scope": scope, "saison_id": season}]}, roster_only=True)
     # A season other than the configured one is planned: the source profile decides.
-    tasks, _, _ = bench.plan_tasks({"clubs": [{"club_id": "11", "scope": "GB1/2025", "saison_id": 2025}]}, roster_only=True)
+    tasks, _, _ = bench.plan_tasks({"clubs": [{"club_id": "11", "scope": "GB1/2025", "saison_id": 2025, "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1"}]}, roster_only=True)
     assert tasks[0]["kind"] == "edition" and tasks[0]["denominator_saison_id"] == 2026
 
 
@@ -471,7 +533,7 @@ def test_barred_club_is_refused_before_any_request(tmp_path):
 
 def test_source_edition_other_than_scope_blocks_scope_without_counting_its_clubs(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "edition_url": "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2025" selected>2025</option></select>' + SQUAD
@@ -483,7 +545,7 @@ def test_source_edition_other_than_scope_blocks_scope_without_counting_its_clubs
 
 def test_cohort_keeps_a_nonparticipant_as_qualification_failure(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2026" selected>26/27</option></select>' + SQUAD
@@ -495,8 +557,8 @@ def test_cohort_keeps_a_nonparticipant_as_qualification_failure(tmp_path):
 
 
 def test_failed_scope_bootstrap_continues_other_clubs_and_retries_only_failed_task(tmp_path):
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]},
-                        {"club_id": "12", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]},
+                        {"club_id": "12", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]}]}
     sample_path = tmp_path / "templates.json"
     sample_path.write_text(json.dumps(sample))
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)

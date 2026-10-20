@@ -17,7 +17,9 @@ observations share --experiment-dir (default evidence-dir.parent); budgets apply
 across portions AND days. An interrupted process fails closed on resume.
 
 sample.json: {"clubs": [{"club_id":"281", "saison_id":2026,
- "scope":"GB1/2026", "groups":["top_league"], "player_ids":["8198"]}]}
+ "scope":"GB1/2026",
+ "edition_url":"https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+ "groups":["top_league"], "player_ids":["8198"]}]}
 The public tmapi.parse_player_signals contract is grounded in saved 300-ID
 source raw and rechecked by the initial probe. Neither missing cost nor national
 team membership is guessed from a generic JSON field map.
@@ -160,11 +162,22 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
             # Currentness comes from the source's own competition profile, not
             # from the configured denominator season (kept only as a cross-check).
             kind = "pokalwettbewerb" if row.route == "pokal" else "wettbewerb"
+            url = club.get("edition_url")
+            try:
+                parsed = urlsplit(url) if isinstance(url, str) else None
+            except ValueError:
+                parsed = None
+            if (parsed is None or parsed.scheme != "https" or parsed.netloc != "www.transfermarkt.com"
+                    or "?" in url or "#" in url
+                    or not re.fullmatch(rf"/[^/]+/startseite/{kind}/{re.escape(parts[0])}", parsed.path)):
+                raise ProbeGateError("sample edition_url must match the official unforced competition profile")
+            if scope in edition_tasks and edition_tasks[scope]["url"] != url:
+                raise ProbeGateError("conflicting edition_url for the same scope")
             edition_tasks.setdefault(scope, {
                 "key": f"edition/{scope}", "kind": "edition", "scope": scope,
                 "competition_id": parts[0], "saison_id": season, "json": False,
                 "denominator_saison_id": row.current_saison_id,
-                "url": f"https://www.transfermarkt.com/competition/startseite/{kind}/{parts[0]}",
+                "url": url,
             })
             participant_tasks.setdefault(scope, {
                 "key": f"participants/{scope}", "kind": "participants", "scope": scope,
