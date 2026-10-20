@@ -37,6 +37,7 @@ from dags.utils.transfermarkt_dq_contracts import (
     input_from_capture,
     validate_scope_capture,
 )
+from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY, CAREER_TTL, SUCCESS_STATUSES
 # The budget canon is stdlib-only and safe at module import time; the heavy
 # scraper modules stay lazy inside _run_entity.
 from scrapers.transfermarkt.models import (
@@ -779,6 +780,8 @@ def _load_data_derived_state(
     source = _DERIVED_STATE_SOURCES.get(endpoint)
     if source is None:
         return {}
+    from scrapers.transfermarkt.scraper import PARSER_REVISION, SCHEMA_REVISION
+    compatible = ' AND n.parser_revision = ? AND n.schema_revision = ? '
     table, key_column = source
     entity = {
         'market_value_points': 'market_value_points',
@@ -797,6 +800,7 @@ def _load_data_derived_state(
             f"SELECT CAST(n.{key_column} AS varchar), count(*), max(n._ingested_at) "
             f"FROM {table} n "
             f"WHERE CAST(n.{key_column} AS varchar) IN ({placeholders}) "
+            + compatible +
             f"AND EXISTS (SELECT 1 FROM {DUAL_WRITE_MANIFEST_TABLE} m "
             "WHERE m.entity = ? AND m.status = 'success' "
             "AND m.legacy_batch_id = m.native_batch_id "
@@ -804,7 +808,7 @@ def _load_data_derived_state(
             "AND m.legacy_hash = m.native_hash "
             "AND m.native_batch_id = n._batch_id) "
             f"GROUP BY n.{key_column}",
-            tuple(roster) + (entity,),
+            tuple(roster) + (PARSER_REVISION, SCHEMA_REVISION, entity),
             fetch=True,
         ) or []
         derived = {
@@ -860,10 +864,10 @@ def _load_data_derived_state(
         conn = scraper._bronze_connection()
         native_rows = _execute_cursor(
             conn,
-            f"SELECT CAST(player_id AS varchar), {select_columns}, "
+            f"SELECT CAST(n.player_id AS varchar), {select_columns}, "
             "_ingested_at, _batch_id "
-            f"FROM {table} WHERE CAST(player_id AS varchar) IN ({placeholders})",
-            tuple(roster),
+            f"FROM {table} n WHERE CAST(n.player_id AS varchar) IN ({placeholders})" + compatible,
+            tuple(roster) + (PARSER_REVISION, SCHEMA_REVISION),
             fetch=True,
         ) or []
         legacy_rows = _execute_cursor(
@@ -1438,6 +1442,7 @@ def _select_player_ids(
         raise _EmptyRosterError(
             f'no player ids in Bronze roster for {league}/{season}'
         )
+    roster = list(dict.fromkeys(str(pid) for pid in roster))
     state = _load_fetch_state(
         scraper,
         spec.state_endpoint or spec.name,
@@ -1475,6 +1480,8 @@ def _select_player_ids(
     )
     derived = (_load_data_derived_state(scraper, endpoint, league, season, derived_scope)
         if legacy_materialization_required else {})
+    derived = {pid: item for pid, item in derived.items()
+        if pid not in state or state[pid].get('status') in SUCCESS_STATUSES}
     hydrate_ids = sorted(
         source_id for source_id, item in derived.items()
         if item.get('needs_legacy_materialization')
@@ -1530,6 +1537,18 @@ def _select_player_ids(
         candidates = [pid for pid in roster if pid not in cached]
         cache_hits = len(set(roster) & cached)
         selected = candidates[:limit]
+    elif refresh_mode == 'current':
+        changes = _load_career_changes(scraper, roster)
+        now = datetime.now(timezone.utc)
+        cached = {
+            pid for pid, item in state.items()
+            if item.get('status') in SUCCESS_STATUSES
+            and (stamp := _as_utc(item.get('last_success_at'))) is not None
+            and now - CAREER_TTL < stamp <= now
+            and (changes.get(pid) is None or changes[pid] <= stamp)
+        }
+        candidates = [pid for pid in roster if pid not in cached]
+        cache_hits = len(set(roster) & cached)
     else:
         already_this_run = {
             pid for pid, item in state.items()
@@ -1550,6 +1569,7 @@ def _select_player_ids(
             return (last is not None, str(last or ''), (0, int(pid)) if pid.isdigit() else (1, pid))
 
         selected = sorted(candidates, key=_age_key)[:limit]
+        hydrate_ids = [pid for pid in hydrate_ids if pid not in selected]
 
     # One cycle buys at most ``limit`` careers of a roster that can run to
     # thousands.  Whoever reads this scope's manifest has to be able to see how
@@ -1561,6 +1581,14 @@ def _select_player_ids(
         'selected': len(selected),
         'pending': pending,
     }
+    if refresh_mode == 'current':
+        debt_ids = [pid for pid in roster if _as_utc(state.get(pid, {}).get('last_success_at')) is None]
+        coverage.update(
+            policy_version=CAREER_DEBT_POLICY,
+            debt_player_ids=debt_ids,
+            pending=len(debt_ids),
+            refresh_pending=sum(pid not in debt_ids and pid not in selected for pid in candidates),
+        )
     from scrapers.transfermarkt.history_portion import enabled as history_enabled
     if refresh_mode == 'historical' and history_enabled():
         coverage.update(roster_ids=list(roster), remaining_ids=list(candidates[len(selected):]))
@@ -1571,6 +1599,38 @@ def _select_player_ids(
         cache_hits, pending,
     )
     return selected, cache_hits, seeded, hydrate_ids, coverage
+
+
+def _load_career_changes(scraper, roster):
+    """Only changed player signals invalidate a globally fresh career.
+
+    A cold observation in another scope is a new association, not a change to
+    the player. Missing signal tables on the legacy lane leave the slow TTL.
+    """
+    from dags.utils.transfermarkt_current_state import SIGNALS_TABLE
+    if not callable(getattr(scraper, '_bronze_connection', None)):
+        return {}
+    try:
+        rows = _execute_cursor(scraper._bronze_connection(),
+            f'SELECT entity_id, MAX(first_detected_at) FROM {SIGNALS_TABLE} '
+            "WHERE entity = 'player' AND measurement_kind = 'change' "
+            'AND entity_id IN (' + ', '.join('?' for _ in roster) + ') GROUP BY entity_id',
+            tuple(roster), fetch=True) or []
+    except Exception as exc:
+        if any(token in str(exc).lower() for token in ('table_not_found', 'table not found', 'does not exist')):
+            return {}
+        raise RuntimeError('career change signals unavailable; refusing paid refetch') from exc
+    return {str(pid): stamp for pid, value in rows if (stamp := _as_utc(value)) is not None}
+
+
+def _commit_career_coverage(results, selected, rows):
+    """Selection does not pay debt; only a successful Bronze+manifest commit does."""
+    coverage = results.get('roster_coverage', {})
+    if coverage.get('policy_version') != CAREER_DEBT_POLICY:
+        return
+    successful = {str(pid) for pid, row in zip(selected, rows) if row[0] in SUCCESS_STATUSES}
+    coverage['debt_player_ids'] = [pid for pid in coverage['debt_player_ids'] if pid not in successful]
+    coverage['pending'] = len(coverage['debt_player_ids'])
 
 
 def _frame_hash(frame) -> str:
@@ -2444,10 +2504,11 @@ def _apply_career_window(scraper, spec, selected, results):
     if isinstance(coverage, dict):
         if 'remaining_ids' in coverage:
             coverage['remaining_ids'] = list(deferred) + coverage['remaining_ids']
-        coverage.update(
-            selected=len(attempted),
-            pending=coverage['pending'] + len(deferred),
-        )
+        coverage['selected'] = len(attempted)
+        if coverage.get('policy_version') == CAREER_DEBT_POLICY:
+            coverage['refresh_pending'] += sum(pid not in coverage['debt_player_ids'] for pid in deferred)
+        else:
+            coverage['pending'] += len(deferred)
     return list(attempted)
 
 
@@ -2515,6 +2576,8 @@ def _save_frames(
                 replace_partitions=list(output.replace_keys) or None,
                 min_replace_ratio=guard,
                 replace_guard_key=output.guard_key,
+                **({'natural_keys': ['competition_id', 'edition_id', 'club_id', 'player_id', 'observed_at']}
+                   if output.key == 'attribute_observations' else {}),
             )
             results['tables'].append(table_path)
             results['outputs'][output.key] = {
@@ -2617,6 +2680,7 @@ def _reconcile_native_career_intent(scraper, spec, mode, revision, league, seaso
         results['checkpoint_status'] = _commit_checkpoint_or_pending(scraper, spec,
             evidence['checkpoint_ids'], evidence['state_rows'], original_run, league, season,
             captured_at_by_id=evidence.get('captured_at_by_id'))
+        _commit_career_coverage(results, evidence['checkpoint_ids'], evidence['state_rows'])
         results['native_write_complete'] = mode != 'legacy-only'
         results['reconciled_without_http'] = True
         results['original_capture_run_key'] = original_run
@@ -4206,6 +4270,7 @@ def _run_entity_unbounded(
                                 raise RuntimeError(
                                     'valid-empty commit has no recoverable checkpoint'
                                 )
+                            _commit_career_coverage(results, selected, rows)
                             if career_intent_path is not None:
                                 from scrapers.transfermarkt.write_intents import finish_intent
                                 _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)
@@ -4422,6 +4487,7 @@ def _run_entity_unbounded(
                         raise RuntimeError(
                             'Bronze+manifest committed without recoverable checkpoint'
                         )
+                    _commit_career_coverage(results, checkpoint_ids, rows)
                 if career_intent_path is not None:
                     from scrapers.transfermarkt.write_intents import finish_intent
                     _archive_native_career_intent(scraper, write_spec, career_intent_path, frames, results)

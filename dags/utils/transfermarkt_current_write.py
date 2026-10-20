@@ -544,7 +544,24 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     empty = []
     admitted_windows = []
     stop_reason = 'window_complete'
+    cached = _global_career_captures(scraper, spec, selected, resolved) if not retired else {}
     for player in selected:
+        if player in cached:
+            source = cached[player]
+            bundle = run._merge_career_cache_frames(scraper, spec, {},
+                {source['native_key']: source['frame']}, resolved['competition_id'], int(resolved['edition_id']))
+            # The current writer commits a new local bundle from verified raw,
+            # rather than a scope-runner reference to an old native batch.
+            for frame in bundle.values():
+                frame.attrs.clear()
+            pieces.append(bundle)
+            processed.append(player)
+            state_rows.append(source['state'])
+            if source['state'][0] in {'authoritative_empty', 'valid_empty'}:
+                empty.append(player)
+            envelope = source['raw']['envelope']
+            scraper._http_client._cache_sources[envelope['envelope_id']] = scraper._http_client._raw_store.verify_attempt_envelope(envelope['envelope_id'])
+            continue
         decoded = scraper._http_client.get_traffic_stats()['decoded_response_body_bytes']
         if decoded >= decoded_body_soft_stop_bytes:
             stop_reason = 'decoded_body_soft_stop'
@@ -579,26 +596,82 @@ def fetch_current_career(scraper, endpoint, ids, scope, preflight, cycle_id, *, 
     for frame in frames.values():
         if frame.empty and empty:
             frame.attrs['fetch_status'] = 'authoritative_empty'
-    scraper._tm_empty_capture_times = run._career_capture_times(scraper, spec, frames, processed)
+    clocks = run._career_capture_times(scraper, spec, frames, processed)
+    clocks.update({player: source['raw']['fetched_at'] for player, source in cached.items() if player in processed})
+    scraper._tm_empty_capture_times = clocks
     from scrapers.transfermarkt.first_seen import prepare_frames
     frames = prepare_frames(scraper, spec.outputs, frames)
     intent_path = save_intent(intent_identity, frames, mode=mode, revision=revision,
         batch_id=str(scraper._batch_id), cycle_id=cycle_id, empty=empty,
         processed=processed, state_rows=state_rows, window=window,
-        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed),
+        captured_at_by_id=clocks,
         raw_attempts=list(scraper.get_raw_attempt_records()), cache_sources=list(scraper.get_cache_source_records()),
         signal_generations=dict(getattr(scraper, '_current_career_signal_generations', {}) or {}))
     scraper._tm_career_intent_path = intent_path
     receipt, committed_frames = _commit(scraper, spec, frames, resolved, mode, revision, cycle_id, empty_ids=empty)
     checkpoint_status = run._commit_checkpoint_or_pending(scraper, spec, processed, state_rows, cycle_id,
         resolved['competition_id'], int(resolved['edition_id']),
-        captured_at_by_id=run._career_capture_times(scraper, spec, frames, processed))
+        captured_at_by_id=clocks)
     receipt['checkpoint_status'] = checkpoint_status
     receipt.update(business_entity=spec.state_endpoint, career_window=window, **window)
+    if cached:
+        receipt['cached_capture_ids'] = {player: source['raw']['capture_id'] for player, source in cached.items() if player in processed}
+        receipt['signal_generations'] = dict(getattr(scraper, '_current_career_signal_generations', {}) or {})
     receipt['committed_at'] = archive_complete(intent_path, receipt, committed_frames)['committed_at']
     finish_intent(intent_path)
     scraper._tm_career_intent_path = None
     return receipt
+
+
+def _global_career_captures(scraper, spec, selected, scope):
+    """Reuse fresh global careers only after original raw/physical receipt checks."""
+    generations = getattr(scraper, '_current_career_signal_generations', {}) or {}
+    if not generations:
+        return {}  # Explicit callers without a signal generation retain force semantics.
+    from scrapers.transfermarkt.career_refs import TABLE
+    from scrapers.transfermarkt.write_intents import completed_capture
+    from scrapers.transfermarkt.superseded import verify_complete
+    state = run._load_fetch_state(scraper, spec.state_endpoint)
+    changes = run._load_career_changes(scraper, selected)
+    native = next(output for output in spec.outputs if not output.is_legacy)
+    cached = {}
+    now = datetime.now(timezone.utc)
+    for player in selected:
+        if player in getattr(scraper, '_current_career_force_ids', set()):
+            continue  # A CEAPI/tmapi mismatch requires a new source observation.
+        prior = state.get(player, {})
+        stamp = run._as_utc(prior.get('last_success_at'))
+        if (prior.get('status') not in run.SUCCESS_STATUSES or stamp is None
+            or not now - run.CAREER_TTL < stamp <= now
+            or (changes.get(player) is not None and changes[player] > stamp)):
+            continue
+        # JSON paths are bound parameters, including numeric source IDs.
+        candidates = run._execute_cursor(scraper._bronze_connection(),
+            f'SELECT cycle_id, entity, native_batch_id FROM {TABLE} '
+            'WHERE native_table = ? AND json_extract_scalar(capture_times_json, ?) IS NOT NULL '
+            'ORDER BY committed_at DESC', (native.table_name, '$."' + player + '"'), fetch=True) or []
+        for cycle, entity, batch in candidates:
+            archived = completed_capture(cycle, entity, batch)
+            if archived is None:
+                continue
+            evidence = archived['journal']['evidence']
+            if run._as_utc(evidence.get('captured_at_by_id', {}).get(player)) != stamp:
+                continue
+            identity = archived['journal']['identity']
+            if (identity.get('scope_id') == scope['scope_id']
+                and evidence.get('signal_generations', {}).get(player) != generations.get(player)):
+                continue
+            try:
+                proof = verify_complete(scraper, spec, archived, players=[player])
+            except StaleTransfermarktWrite:
+                continue
+            original_ids = evidence.get('processed', evidence.get('checkpoint_ids', []))
+            original_states = dict(zip(original_ids, evidence['state_rows'], strict=True))
+            cached[player] = {'native_key': native.key,
+                'frame': proof['frames'][native.key][proof['frames'][native.key].player_id.astype(str) == player].copy(),
+                'state': original_states[player], 'raw': proof['raw'][player]}
+            break
+    return cached
 
 
 def _write_cached_supersession(scraper, spec, scope, mode, revision, cycle_id, selected, cached, identity, soft_stop, *, original_evidence=None):
