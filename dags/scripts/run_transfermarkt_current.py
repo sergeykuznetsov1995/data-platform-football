@@ -1499,7 +1499,7 @@ class _Scope:
         from scrapers.transfermarkt.models import TrafficBudgetExceeded, TrafficMeterError
 
         sweep = self.data.get('staff_sweep')
-        if sweep is None:
+        if sweep is None or self.now() - _utc(sweep['started_at']) >= timedelta(days=7):
             checked = self.cursor.staff_completed_at
             if checked is not None and self.now() - checked < timedelta(days=7):
                 return
@@ -1511,8 +1511,7 @@ class _Scope:
             sweep = {'started_at': self.now().isoformat(), 'clubs': clubs,
                      'pending': list(self.snapshot.expected_team_ids), 'deferred': {}}
             self.data['staff_sweep'] = sweep
-        self.initialize_resume()
-        self.resume['staff_pending'] = True
+        self.cursor = replace(self.cursor, staff_pending=True)
         self.persist()
         for club_id in list(sweep['pending']):
             # Admission is outside the per-club catch: exhausted budgets stop
@@ -1540,8 +1539,7 @@ class _Scope:
                 sweep['deferred'].pop(club_id, None)
             self.persist()
         if not sweep['pending']:
-            self.cursor = replace(self.cursor, staff_completed_at=_utc(sweep['started_at']))
-            self.resume.pop('staff_pending', None)
+            self.cursor = replace(self.cursor, staff_completed_at=_utc(sweep['started_at']), staff_pending=False)
             self.data.pop('staff_sweep', None)
             self.persist()
 
@@ -1779,12 +1777,17 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                             scope.check(kind, [], 0, 0, status='uncertain', result=error)
                 elif item.kind == 'weekly_staff':
                     scope.staff(staff_writer)
-                    if (not scope.resume.get('staff_pending') and not scope.resume.get('required')
+                    if (not scope.resume.get('required')
                         and not any(scope.resume.get('careers', {}).values())
                         and not scope.resume.get('coaches_pending')):
                         scope.resume = {}
                 else:
                     if item.kind == 'season_close':
+                        # Staff is current-only work. Retain its unfinished journal
+                        # for diagnosis without blocking the historical handoff.
+                        if data.get('staff_sweep'):
+                            data['staff_sweep_at_close'] = data.pop('staff_sweep')
+                        scope.cursor = replace(scope.cursor, staff_pending=False)
                         if not data.get('season_close_roster_captured'):
                             first_close_portion = not data.get('season_close_roster_started')
                             if first_close_portion:
@@ -1806,7 +1809,7 @@ def run_current_portion(registry_rows, preflight, cycle_id, *, denominator_rows=
                         or coach_checked is None or now() - _utc(coach_checked) >= timedelta(days=28)):
                         scope.coaches()
                     if (not any(scope.resume.get('careers', {}).values()) and not scope.resume.get('required')
-                        and not scope.resume.get('coaches_pending') and not scope.resume.get('staff_pending')):
+                        and not scope.resume.get('coaches_pending')):
                         scope.cursor = replace(scope.cursor, cold_complete=True)
                         scope.resume = {}
                 scope.cursor = replace(scope.cursor, last_work_at=now())

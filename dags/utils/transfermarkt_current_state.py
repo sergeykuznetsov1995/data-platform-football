@@ -452,6 +452,7 @@ class ScopeCursor:
     last_work_at: datetime | None = None
     resume_json: str = '{}'
     staff_completed_at: datetime | None = None
+    staff_pending: bool = False
 
     def __post_init__(self) -> None:
         _text('scope_id', self.scope_id)
@@ -459,6 +460,8 @@ class ScopeCursor:
             raise CurrentStateError('cursor policy changed; explicit migration required')
         if not isinstance(self.cold_complete, bool):
             raise CurrentStateError('cold_complete must be boolean')
+        if not isinstance(self.staff_pending, bool):
+            raise CurrentStateError('staff_pending must be boolean')
         for name in ('listing_checked_at', 'players_checked_at', 'injury_checked_at',
                      'roster_completed_at', 'last_work_at', 'staff_completed_at'):
             if getattr(self, name) is not None:
@@ -477,7 +480,12 @@ class ScopeCursor:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> 'ScopeCursor':
-        return cls(**_mapping(cls, {'staff_completed_at': None, **value}))
+        values = {'staff_completed_at': None, 'staff_pending': False, **value}
+        cursor = cls(**_mapping(cls, values))
+        resume = json.loads(cursor.resume_json)
+        if isinstance(resume, dict) and resume.pop('staff_pending', False):
+            cursor = replace(cursor, staff_pending=True, resume_json=_json(resume))
+        return cursor
 
     def daily_due(self, now: datetime) -> tuple[str, ...]:
         current = _time(now)
@@ -656,11 +664,22 @@ def plan_current_work(
             # A never-successful scope must move behind due healthy scopes
             # after an attempted check, rather than owning datetime.min forever.
             fresh.append(((max(oldest, last_work), oldest, target.cold_priority), CurrentWork(target, 'signals', due)))
-        if not cursor.cold_complete or json.loads(cursor.resume_json):
+        pending = json.loads(cursor.resume_json)
+        # Old staff cursors contain roster metadata even without roster work.
+        # Keep it for membership reconciliation, but allow a due full roster.
+        staff_metadata = (cursor.staff_pending and not pending.get('required')
+                          and not any(pending.get('careers', {}).values())
+                          and not pending.get('coaches_pending')
+                          and set(pending) <= {'clubs', 'squad_year', 'reason', 'captured', 'capture_proofs',
+                                              'squad_generations', 'required', 'careers',
+                                              'coaches_pending', 'coach_club_ids'})
+        if cursor.roster_due(timestamp) and staff_metadata:
+            resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_roster')))
+        elif not cursor.cold_complete or pending:
             resume.append(((last_work, target.cold_priority), CurrentWork(target, 'resume')))
         elif cursor.roster_due(timestamp):
             resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_roster')))
-        elif staff_enabled and (cursor.staff_completed_at is None
+        elif staff_enabled and (cursor.staff_pending or cursor.staff_completed_at is None
                                or timestamp - cursor.staff_completed_at >= WEEKLY_INTERVAL):
             resume.append(((last_work, target.cold_priority), CurrentWork(target, 'weekly_staff')))
     queues = [[item[1] for item in sorted(fresh, key=lambda pair: pair[0])],
