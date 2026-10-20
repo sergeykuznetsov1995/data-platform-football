@@ -210,6 +210,15 @@ FROM (
     WHERE s.league LIKE 'SS-%'
       AND s.status_type = 'finished'
       AND c.match_id IS NULL
+      -- #1778: SofaScore moved the match to another season; its stale
+      -- schedule row is no longer this partition's debt.
+      AND NOT EXISTS (
+          SELECT 1 FROM iceberg.bronze.sofascore_rejected_rows r
+          WHERE r.league = s.league
+            AND r.season = CAST(s.season AS varchar)
+            AND r.reason_code = 'season_mismatch'
+            AND r.natural_key = CAST(CAST(s.season_id AS bigint) AS varchar)
+                || '|' || CAST(s.game_id AS varchar))
 ) p
 GROUP BY 1, 2, 6
 """
