@@ -41,6 +41,8 @@
 --    daily but quarantined as ScopeQuarantined/noncurrent_season and not due.
 --    Competition 569/2025-2026 must still be present and current before its
 --    exact playingtime/standard pair can be requeued.
+--    Only that selected pair moves from daily to weekly on requeue, matching
+--    the current season_stats claim policy; terminal provenance stays intact.
 --    This ordering is mandatory: false-current pages must consume no proxy.
 -- 5. Only after that acceptance, with FBref ingestion paused and every
 --    writer/lease guard clear, apply the baked artifact without authority
@@ -517,6 +519,7 @@ AS
 WITH updated_rows AS (
     UPDATE fbref_control.page_frontier AS frontier
     SET state = 'queued',
+        refresh_policy = 'weekly',
         updated_at = clock_timestamp()
     FROM fbref_20260825_oversize_evidence_selected AS selected
     WHERE frontier.target_id = selected.target_id

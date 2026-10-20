@@ -2724,7 +2724,7 @@ def test_1325_explicit_acceptance_keeps_all_seven_enrichment_members(frozen):
         if "SET status = 'skipped'" in sql:
             # An external urgent match must not remove frozen members.
             assert "AND NOT %s" in sql
-            assert params == (run_id, frozen)
+            assert params == (run_id, frozen, run_id)
             seen["handback"] = True
             return [], 0
         return probe(sql, params)
@@ -2735,3 +2735,29 @@ def test_1325_explicit_acceptance_keeps_all_seven_enrichment_members(frozen):
     # Seven enrichment members must pass even alongside the mandatory spine.
     assert f"WHERE ({frozen} OR NOT claim_order.enrichment" in seen["sql"]
     assert "claim_order.kind_ordinal <= 6" in seen["sql"]
+
+
+def test_1325_urgent_handback_excludes_all_existing_run_members():
+    """A requeued/skipped match cannot be admitted again in the same run."""
+    run_id = str(uuid.uuid4())
+    seen = {}
+    probe = _claim_sql_probe(run_id, seen)
+
+    def handler(sql, params):
+        if "SET status = 'skipped'" in sql:
+            membership = " ".join(sql.split())
+            assert "member.target_id = urgent.target_id" in membership
+            assert (
+                "AND (member.run_id = %s OR ( "
+                "member.status IN ('pending', 'leased', 'retry') "
+                "AND owner.status IN ('pending', 'running') ))"
+            ) in membership
+            assert params == (run_id, False, run_id)
+            seen["handback"] = True
+        return probe(sql, params)
+
+    store = ControlStore(
+        "postgresql://unused/test", connection_factory=FakeFactory(handler)
+    )
+    assert store.claim_targets(run_id, "current", limit=25) == []
+    assert seen["handback"]

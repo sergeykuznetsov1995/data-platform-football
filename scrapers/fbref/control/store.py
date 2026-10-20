@@ -9904,11 +9904,13 @@ class ControlStore:
                         SELECT 1 FROM fbref_control.run_target member
                         JOIN fbref_control.crawl_run owner USING (run_id)
                         WHERE member.target_id = urgent.target_id
-                          AND member.status IN ('pending', 'leased', 'retry')
-                          AND owner.status IN ('pending', 'running')
+                          AND (member.run_id = %s OR (
+                            member.status IN ('pending', 'leased', 'retry')
+                            AND owner.status IN ('pending', 'running')
+                          ))
                       )
                   )
-                """, (run, frozen_acceptance),
+                """, (run, frozen_acceptance, run),
             )
             cursor.execute(
                 _frontier_scope_cte_for_candidates(
