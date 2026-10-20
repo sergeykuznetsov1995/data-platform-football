@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import re
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -15,6 +16,7 @@ from urllib.parse import urlsplit
 import pandas as pd
 
 from dags.utils import transfermarkt_current_write as current
+from dags.utils.transfermarkt_approval import load_standing_policy
 from dags.utils.transfermarkt_current_state import _sql
 from scrapers.transfermarkt import scraper as tm
 from scrapers.transfermarkt.models import FetchStatus
@@ -35,6 +37,17 @@ _RECEIPT_COLUMNS = (
     'club_id', 'observed_day', 'observed_at', 'raw_capture_id', 'source_body_hash',
     'parser_revision', 'bronze_manifest', 'row_count', 'physical_hash', 'committed_at',
 )
+
+
+def validate_staff_write_policy(policy):
+    if not {STAFF_TABLE, STAFF_RECEIPTS_TABLE} <= set(policy.allowed_write_tables):
+        raise current.CurrentWriteError('standing policy does not authorize staff tables')
+
+
+def _authorize(preflight):
+    path = os.environ.get('TM_STANDING_POLICY_PATH', '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json')
+    validate_staff_write_policy(load_standing_policy(path))
+    return current._authorize(preflight)
 
 
 def staff_ddl():
@@ -89,7 +102,7 @@ def _staff_frame(scraper, scope, cycle_id, club_id, outcome, source_url):
 @current._bounded_current_writer
 def write_current_staff(scraper, scope, preflight, cycle_id, *, club_id, outcome, source_url):
     """Merge one full club capture; never delete an observation or write coaches."""
-    mode, revision, _ = current._authorize(preflight)
+    _authorize(preflight)
     resolved = current._scope(scraper, scope)
     frame = _staff_frame(scraper, resolved, cycle_id, club_id, outcome, source_url)
     first = frame.iloc[0]
@@ -97,7 +110,7 @@ def write_current_staff(scraper, scope, preflight, cycle_id, *, club_id, outcome
     output = SimpleNamespace(table_name='transfermarkt_club_staff', key='staff',
                              is_legacy=False, replace_keys=())
     with writer_deadline(getattr(scraper, '_current_deadline_monotonic', None)), writer_lock():
-        current.run._authorize_write_mode(mode, revision)
+        _authorize(preflight)
         connection = scraper._bronze_connection()
         try:
             for ddl in staff_ddl():
@@ -129,7 +142,7 @@ def write_current_staff(scraper, scope, preflight, cycle_id, *, club_id, outcome
                 merge_keys=list(STAFF_KEY), add_metadata=False, source='transfermarkt',
             )
             physical = current._read_back(scraper, output, frame, cycle_id)
-            current.run._authorize_write_mode(mode, revision)
+            _authorize(preflight)
             values = {
                 'club_id': str(club_id), 'observed_day': first['observed_day'],
                 'observed_at': first['observed_at'], 'raw_capture_id': first['raw_capture_id'],

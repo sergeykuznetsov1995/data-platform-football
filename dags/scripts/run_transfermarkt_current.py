@@ -267,6 +267,7 @@ def _production_factory(target, row, cache, deadline, used):
     from dags.scripts.run_transfermarkt_scope_cycle import validate_standing_policy_for_scope_cycle
     from dags.utils.transfermarkt_approval import load_standing_policy
     from dags.utils.transfermarkt_scope_planner import _competition_from_joined_row
+    from dags.utils.transfermarkt_staff import validate_staff_write_policy
     from scrapers.transfermarkt.scraper import TransfermarktScraper
 
     if os.environ.get('TM_STANDING_POLICY_ENABLED', '').lower() not in {'true', '1'}:
@@ -285,6 +286,7 @@ def _production_factory(target, row, cache, deadline, used):
     allowed = {table.split('.')[-1] for table in policy.allowed_write_tables}
     if not {'transfermarkt_current_signals_v1', 'transfermarkt_current_checks_v1', 'transfermarkt_season_close_v1'} <= allowed:
         raise CurrentPortionError('standing policy does not authorize current ops tables')
+    validate_staff_write_policy(policy)
     remaining = SCOPE_HARD_PROVIDER_BYTE_CAP - used.get('provider_metered_bytes', 0)
     soft = SCOPE_SOFT_PROVIDER_BYTE_STOP - used.get('provider_metered_bytes', 0)
     if soft <= 0 or used.get('requests', 0) >= SCOPE_REQUEST_LIMIT or used.get('retries', 0) >= SCOPE_RETRY_LIMIT:

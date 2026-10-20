@@ -1,8 +1,10 @@
 """Offline parser, physical writer, and read-only role projection regressions."""
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import re
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -78,7 +80,18 @@ class StaffDB(MemoryDB):
 
 
 @pytest.fixture
-def physical(scraper, monkeypatch, tmp_path):
+def staff_policy(monkeypatch, tmp_path):
+    policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
+    policy['allowed_write_tables'] += [staff.STAFF_TABLE, staff.STAFF_RECEIPTS_TABLE]
+    policy['expires_at'] = '2999-01-01T00:00:00Z'
+    path = tmp_path / 'staff-policy.json'
+    path.write_text(json.dumps(policy))
+    monkeypatch.setenv('TM_STANDING_POLICY_PATH', str(path))
+    return path
+
+
+@pytest.fixture
+def physical(scraper, monkeypatch, tmp_path, staff_policy):
     monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'writer.lock'))
     monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
     db = StaffDB()
@@ -110,6 +123,81 @@ def write(instance, html=None, at=NOW, **kwargs):
 
 def table(instance):
     return pd.read_sql_query('SELECT * FROM transfermarkt_club_staff', instance.test_db.sql)
+
+
+def restrict_staff_policy(path, missing):
+    policy = json.loads(path.read_text())
+    policy['allowed_write_tables'] = [table for table in policy['allowed_write_tables'] if table not in missing]
+    path.write_text(json.dumps(policy))
+
+
+@pytest.mark.parametrize('missing', [
+    (staff.STAFF_TABLE,), (staff.STAFF_RECEIPTS_TABLE,),
+    (staff.STAFF_TABLE, staff.STAFF_RECEIPTS_TABLE),
+])
+def test_writer_rejects_missing_staff_grants_before_raw_read_or_sql(physical, staff_policy, monkeypatch, missing):
+    outcome = capture(physical)
+    restrict_staff_policy(staff_policy, missing)
+    def unexpected_read(*args):
+        pytest.fail('raw read before staff policy authorization')
+    monkeypatch.setattr(physical.test_store, 'load_capture', unexpected_read)
+    with pytest.raises(staff.current.CurrentWriteError, match='authorize staff tables'):
+        staff.write_current_staff(physical, SCOPE, PREFLIGHT, 'denied',
+                                  club_id='10', outcome=outcome, source_url=URL)
+    assert physical.test_db.events == []
+
+
+@pytest.mark.parametrize('missing', [
+    (), (staff.STAFF_TABLE,), (staff.STAFF_RECEIPTS_TABLE,),
+    (staff.STAFF_TABLE, staff.STAFF_RECEIPTS_TABLE),
+])
+def test_production_preflight_requires_staff_grants_before_scraper_construction(staff_policy, monkeypatch, missing):
+    from dags.scripts import run_transfermarkt_current as runner
+    from tests.unit.dags.test_transfermarkt_scope_planner import _competition, _edition, _joined_row
+
+    restrict_staff_policy(staff_policy, missing)
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    monkeypatch.setenv('TM_PROXY_CONTROL_URL', 'http://offline.invalid')
+    monkeypatch.setenv('TRANSFERMARKT_REQUIRE_RAW_STORE', 'true')
+    monkeypatch.setenv('TM_WRITE_MODE', 'dual')
+    constructed = []
+    def create(**kwargs):
+        constructed.append(kwargs)
+        return 'scraper'
+    monkeypatch.setattr(tm, 'TransfermarktScraper', create)
+    target = SimpleNamespace(competition_id='GB1', edition_id='2026', scope_id='scope')
+    row = _joined_row(_competition('GB1'), _edition('GB1', '2026'))
+    if missing:
+        with pytest.raises(staff.current.CurrentWriteError, match='authorize staff tables'):
+            runner._production_factory(target, row, {}, 1000, {})
+        assert constructed == []
+    else:
+        assert runner._production_factory(target, row, {}, 1000, {}) == 'scraper'
+        assert len(constructed) == 1
+
+
+@pytest.mark.parametrize('phase', ['business', 'receipt'])
+def test_writer_rechecks_staff_grants_before_each_write(physical, staff_policy, monkeypatch, phase):
+    if phase == 'business':
+        original = staff._staff_frame
+        def frame(*args):
+            result = original(*args)
+            restrict_staff_policy(staff_policy, (staff.STAFF_TABLE,))
+            return result
+        monkeypatch.setattr(staff, '_staff_frame', frame)
+    else:
+        original = staff.current._read_back
+        def read_back(*args):
+            result = original(*args)
+            restrict_staff_policy(staff_policy, (staff.STAFF_RECEIPTS_TABLE,))
+            return result
+        monkeypatch.setattr(staff.current, '_read_back', read_back)
+    with pytest.raises(staff.current.CurrentWriteError, match='authorize staff tables'):
+        write(physical)
+    if phase == 'business':
+        assert physical.test_db.events == []
+    else:
+        assert not any(sql.startswith('MERGE INTO iceberg.ops.') for sql in physical.test_db.events)
 
 
 def test_native_day_merge_is_idempotent_and_keeps_history_without_coach_writes(physical):
