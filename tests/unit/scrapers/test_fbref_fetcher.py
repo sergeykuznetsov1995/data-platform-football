@@ -1479,3 +1479,133 @@ def test_retained_clearance_without_lease_extension_stays_hard():
     assert raised.value.error_class == "hard_transport_policy"
     assert "not extended for warm HTTP" in str(raised.value)
     fetcher._create_http_session.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "flags, expected",
+    [
+        (
+            {
+                "byte_budget_exhausted": True,
+                "byte_budget_failure": "response_exceeded_reservation",
+            },
+            "byte_budget_exhausted",
+        ),
+        ({"request_budget_exhausted": True}, "request_budget_exhausted"),
+        ({"byte_budget_exhausted": True, "network_policy_failed": True}, None),
+        ({"request_budget_exhausted": True, "redirect_blocked": True}, None),
+        ({"request_budget_exhausted": True, "geoip_lookup_failed": True}, None),
+        (
+            {
+                "network_policy_failed": True,
+                "network_policy_failure": "request_budget_exhausted",
+            },
+            None,
+        ),
+    ],
+)
+@pytest.mark.parametrize("finalization_failed", [False, True])
+def test_session_failure_reason_preserves_policy_and_finalization_guards(
+    flags, expected, finalization_failed
+):
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher._http_session = None
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._transport = MagicMock()
+    fetcher._transport.fetch.return_value = None
+    fetcher._transport.traffic_delta.return_value = flags
+    if finalization_failed:
+        fetcher._transport.close.side_effect = RuntimeError("not closed")
+        fetcher._full_browser_reservation_breakdown = lambda: (0, 0, 0, 0, 0)
+    with pytest.raises(FetchError) as raised:
+        fetcher.ensure_clearance()
+    assert raised.value.error_class == "hard_transport_policy"
+    assert raised.value.session_failure_reason == (
+        None if finalization_failed else expected
+    )
+
+
+@pytest.mark.parametrize(
+    "failure", ["unknown_counter", "run_cap", "drain", "meter_budget"]
+)
+def test_provider_cap_does_not_hide_accounting_failures(failure):
+    fetcher = _fetcher_with_dead_exit_and_failing_drain()
+    fetcher._provider_bootstrap_max_bytes = 4096
+    fetcher._provider_bootstrap_spent_bytes = 4096
+    fetcher._provider_max_bytes = 8192
+    fetcher._provider_total_bytes = 4096
+    if failure == "run_cap":
+        fetcher._provider_max_bytes = 4096
+    if failure == "drain":
+        fetcher._transport.traffic_delta.return_value["geoip_transport_failure"] = False
+    if failure == "meter_budget":
+        fetcher._provider_http_ready = False
+        fetcher._lease_client.wait_drained.side_effect = None
+        fetcher._lease_client.wait_drained.return_value = SimpleNamespace(
+            total_bytes=0,
+            budget_exceeded=True,
+        )
+    if failure == "unknown_counter":
+        fetcher._lease_client.wait_drained.side_effect = FBrefProxyLeaseError(
+            "unreachable meter", session_failure_reason="provider_meter_unavailable"
+        )
+        fetcher._lease_client.close_strict.side_effect = FBrefProxyLeaseError(
+            "unknown counter"
+        )
+        fetcher._lease_client.close.side_effect = FBrefProxyLeaseError(
+            "unknown counter"
+        )
+        with pytest.raises(FetchError) as raised:
+            fetcher.ensure_clearance()
+    else:
+        with pytest.raises(FetchError) as raised:
+            fetcher._ensure_clearance()
+    assert raised.value.error_class == "hard_transport_policy"
+    assert raised.value.session_failure_reason is None
+
+
+def test_expired_lease_is_structured_but_budget_rejection_is_not():
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher._lease_client = MagicMock()
+    fetcher._provider_lease = SimpleNamespace(expires_at=0)
+    fetcher._provider_http_ready = False
+    fetcher._wait_and_observe_provider = lambda: SimpleNamespace(
+        closed=False, budget_exceeded=False
+    )
+    with pytest.raises(FBrefProxyLeaseError) as raised:
+        fetcher._extend_provider_lease_for_http()
+    assert raised.value.session_failure_reason == "provider_lease_expired"
+    fetcher._wait_and_observe_provider = lambda: SimpleNamespace(
+        closed=False, budget_exceeded=True
+    )
+    with pytest.raises(FBrefProxyLeaseError) as raised:
+        fetcher._extend_provider_lease_for_http()
+    assert raised.value.session_failure_reason is None
+    fetcher._lease_client.extend.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "terminal", ["budget_exceeded", "accounting_uncertain", "expired"]
+)
+def test_session_abort_strict_refusal_stays_red_even_if_tolerant_close_succeeds(
+    terminal,
+):
+    fetcher = _fetcher_with_dead_exit_and_failing_drain()
+    fetcher._transport.traffic_delta.return_value = {"byte_budget_exhausted": True}
+    fetcher._provider_total_bytes = 0
+    fetcher._provider_max_bytes = 8192
+    fetcher._provider_bootstrap_max_bytes = 4096
+    fetcher._provider_http_ready = False
+    fetcher._lease_client.wait_drained.side_effect = None
+    fetcher._lease_client.wait_drained.return_value = SimpleNamespace(
+        total_bytes=0, budget_exceeded=False
+    )
+    fetcher._lease_client.close_strict.side_effect = FBrefProxyLeaseError(terminal)
+    fetcher._lease_client.close.return_value = SimpleNamespace(total_bytes=0)
+    with pytest.raises(FetchError) as raised:
+        fetcher.ensure_clearance()
+    assert raised.value.error_class == "hard_transport_policy"
+    assert raised.value.session_failure_reason is None
+    # A tolerant accounting read can record spend, but cannot authorize requeue.
+    assert raised.value.provider_billed_bytes == 0
+    fetcher._lease_client.acquire.assert_not_called()

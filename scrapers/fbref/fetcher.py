@@ -30,7 +30,7 @@ from scrapers.fbref.settings import (
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v10"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v11"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 MAX_SEASON_STATS_HTML_BYTES = DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES
@@ -214,9 +214,11 @@ class FetchError(RuntimeError):
         http_status_history: Optional[Sequence[int]] = None,
         latency_ms: int = 0,
         redirect_location: Optional[str] = None,
+        session_failure_reason: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
+        self.session_failure_reason = session_failure_reason
         # Where a 3xx pointed, when the source bothered to say.  A redirect
         # without it is not a usable "the page moved" statement.
         self.redirect_location = redirect_location
@@ -615,14 +617,38 @@ class FBrefFetcher:
             or getattr(self, "_persistent_session_id", None) is None
             or getattr(self, "_persistent_receipt", None) is not None
         ):
-            return self._ensure_clearance()
+            before = int(getattr(self, "_provider_total_bytes", 0))
+            try:
+                return self._ensure_clearance()
+            except FetchError as original:
+                if (
+                    original.session_failure_reason is not None
+                    and getattr(self, "_lease_client", None) is not None
+                ):
+                    try:
+                        self._close_provider_lease(strict=True, allow_escrow=False)
+                    except Exception as meter_error:
+                        raise self._provider_meter_failure(
+                            meter_error, original=original,
+                            before_provider_bytes=before,
+                        ) from original
+                    original.provider_billed_bytes = (
+                        self._provider_total_bytes - before
+                    )
+                raise
 
         before = int(self._persistent_page_cursor)
         try:
             return self._ensure_clearance()
         except Exception as original:
             try:
-                billed = self._persistent_page_checkpoint(close_tunnel=True)
+                billed = self._persistent_page_checkpoint(
+                    close_tunnel=True,
+                    allow_escrow=not (
+                        isinstance(original, FetchError)
+                        and original.session_failure_reason is not None
+                    ),
+                )
             except Exception as meter_error:
                 failure = self._provider_meter_failure(
                     meter_error,
@@ -697,7 +723,9 @@ class FBrefFetcher:
         self._observe_provider_stats(stats)
         return stats
 
-    def _close_provider_lease(self, *, strict: Optional[bool] = None) -> None:
+    def _close_provider_lease(
+        self, *, strict: Optional[bool] = None, allow_escrow: bool = True
+    ) -> None:
         lease_client = getattr(self, "_lease_client", None)
         provider_lease = getattr(self, "_provider_lease", None)
         if lease_client is None or provider_lease is None:
@@ -718,6 +746,8 @@ class FBrefFetcher:
                     expected=self._provider_context,
                 )
             except FBrefProxyLeaseError as strict_error:
+                if not allow_escrow:
+                    raise
                 # One mid-response abort latches the lease accounting-uncertain
                 # for good, so the strict proof can never arrive. The filter
                 # keeps the unproven tail as durable escrow and its counters are
@@ -766,10 +796,19 @@ class FBrefFetcher:
         # curl session can send a target request.
         stats = self._wait_and_observe_provider()
         if (
+            stats is not None
+            and not stats.closed
+            and not stats.budget_exceeded
+            and lease.expires_at <= time.time()
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref browser lease expired before warm HTTP",
+                session_failure_reason="provider_lease_expired",
+            )
+        if (
             stats is None
             or stats.closed
             or stats.budget_exceeded
-            or lease.expires_at <= time.time()
         ):
             raise FBrefProxyLeaseError(
                 "FBref browser lease is not usable for warm HTTP"
@@ -894,7 +933,9 @@ class FBrefFetcher:
             )
         return now + guard >= deadline
 
-    def _persistent_page_checkpoint(self, *, close_tunnel: bool) -> int:
+    def _persistent_page_checkpoint(
+        self, *, close_tunnel: bool, allow_escrow: bool = True
+    ) -> int:
         if (
             self._persistent_session_id is None
             or self._persistent_receipt is not None
@@ -915,7 +956,7 @@ class FBrefFetcher:
                 except Exception as exc:  # noqa: BLE001 - revoke regardless
                     close_error = close_error or exc
             try:
-                self._close_provider_lease(strict=True)
+                self._close_provider_lease(strict=True, allow_escrow=allow_escrow)
             except Exception as exc:  # noqa: BLE001 - preserve ownership
                 close_error = close_error or exc
             if close_error is not None:
@@ -1132,6 +1173,11 @@ class FBrefFetcher:
             )
             hard_policy = self._hard_transport_policy_reason(bootstrap_stats)
             drain_relief = None
+            drain_error = None
+            provider_stats = None
+            session_failure_reason = self._local_session_failure_reason(
+                bootstrap_stats, hard_policy
+            )
             if finalize_error is not None and hard_policy is None:
                 hard_policy = "browser_finalization_failed"
             if (
@@ -1214,6 +1260,26 @@ class FBrefFetcher:
                         if hard_policy is None
                         else f"verdict {hard_policy}",
                     )
+            if (
+                finalize_error is not None
+                or (
+                    drain_error is not None
+                    and not (
+                        isinstance(drain_error, FBrefProxyLeaseError)
+                        and drain_error.session_failure_reason is not None
+                    )
+                )
+                or bool(provider_stats is not None and provider_stats.budget_exceeded)
+                or (
+                    getattr(self, "_provider_max_bytes", 0) > 0
+                    and self._provider_total_bytes >= self._provider_max_bytes
+                )
+            ):
+                session_failure_reason = None
+            elif hard_policy in {
+                "browser_provider_cap_exhausted", "browser_provider_drain_failed"
+            }:
+                session_failure_reason = hard_policy
             breakdown = (
                 self._full_browser_reservation_breakdown()
                 if finalize_error is not None
@@ -1242,6 +1308,7 @@ class FBrefFetcher:
                     if hard_policy is not None
                     else "clearance_failed"
                 ),
+                session_failure_reason=session_failure_reason,
                 browser_document_bytes=breakdown[0],
                 browser_asset_bytes=breakdown[1],
                 browser_requests=breakdown[2],
@@ -1273,6 +1340,10 @@ class FBrefFetcher:
             raise FetchError(
                 f"Camoufox hard transport policy failed: {hard_policy}",
                 error_class="hard_transport_policy",
+                session_failure_reason=(
+                    self._local_session_failure_reason(bootstrap_stats, hard_policy)
+                    if finalize_error is None else None
+                ),
                 browser_document_bytes=breakdown[0],
                 browser_asset_bytes=breakdown[1],
                 browser_requests=breakdown[2],
@@ -1312,6 +1383,10 @@ class FBrefFetcher:
                 f"{type(exc).__name__}"
                 + (f": {cause_text}" if cause_text else ""),
                 error_class="hard_transport_policy",
+                session_failure_reason=(
+                    exc.session_failure_reason
+                    if isinstance(exc, FBrefProxyLeaseError) else None
+                ),
                 browser_document_bytes=breakdown[0],
                 browser_asset_bytes=breakdown[1],
                 browser_requests=breakdown[2],
@@ -1335,6 +1410,30 @@ class FBrefFetcher:
         self._clearance = dict(clearance)
         self._bootstrap_stats = bootstrap_stats
         return True
+
+    @staticmethod
+    def _local_session_failure_reason(
+        stats: Optional[dict], reason: Optional[str]
+    ) -> Optional[str]:
+        """Only local admission stops may retire a session; policy wins."""
+
+        source = stats or {}
+        if (
+            source.get("network_policy_failed")
+            or source.get("redirect_blocked")
+            or (
+                source.get("geoip_lookup_failed")
+                and not source.get("geoip_transport_failure")
+            )
+        ):
+            return None
+        if reason == "request_budget_exhausted":
+            return reason
+        if source.get("byte_budget_exhausted") and reason == (
+            source.get("byte_budget_failure") or "byte_budget_exhausted"
+        ):
+            return "byte_budget_exhausted"
+        return None
 
     @staticmethod
     def _exit_never_answered(stats: Optional[dict]) -> bool:
@@ -2062,7 +2161,13 @@ class FBrefFetcher:
             )
         except Exception as original:
             try:
-                billed = self._persistent_page_checkpoint(close_tunnel=True)
+                billed = self._persistent_page_checkpoint(
+                    close_tunnel=True,
+                    allow_escrow=not (
+                        isinstance(original, FetchError)
+                        and original.session_failure_reason is not None
+                    ),
+                )
             except Exception as meter_error:
                 failure = self._provider_meter_failure(
                     meter_error,
@@ -2136,7 +2241,13 @@ class FBrefFetcher:
             )
         except Exception as original:
             try:
-                self._finish_metered_fetch()
+                if (
+                    isinstance(original, FetchError)
+                    and original.session_failure_reason is not None
+                ):
+                    self._close_provider_lease(strict=True, allow_escrow=False)
+                else:
+                    self._finish_metered_fetch()
             except Exception as meter_error:
                 raise self._provider_meter_failure(
                     meter_error,
