@@ -20,7 +20,7 @@ PUBLICATION_REQUIRED_PAGE_KINDS = (
 # globally required because some competition layouts do not publish a distinct
 # standings page/table.
 PUBLICATION_FRESHNESS_PAGE_KINDS = frozenset(
-    (*PUBLICATION_REQUIRED_PAGE_KINDS, "standings")
+    (*PUBLICATION_REQUIRED_PAGE_KINDS, "standings", "squad")
 )
 
 DISCOVERY_SPINE_PAGE_KINDS = (
@@ -42,3 +42,11 @@ OTHER_PUBLICATION_CRITICAL_PAGE_KINDS = (
 PAGE_DOCUMENT_VERSION = "fbref-page-document-v4"
 TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v4"
 DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v6"
+
+# Current enrichment stays below the match/schedule drain. Eight hours leave
+# one six-hour scheduling phase plus two hours of ordinary execution slack.
+CURRENT_ENRICHMENT = {
+    "season": ("weekly", 60, 160),
+    "season_stats": ("weekly", 55, 160),
+    "squad": ("monthly", 50, 664),
+}

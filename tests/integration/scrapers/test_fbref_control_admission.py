@@ -615,6 +615,7 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
                 },
                 current_policy,
                 "1940-01-01T00:00:00Z",
+                60,
             )
             insert_target(
                 fresh_schedule_target,
@@ -635,6 +636,7 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
                 },
                 current_policy,
                 "1930-01-01T00:00:00Z",
+                55,
             )
             insert_target(
                 player_target,
@@ -683,13 +685,11 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
             refresh_policies=current_policies,
             limit=5,
         )
-        # The season page is overdue by far more than its freshness SLA, so it
-        # preempts the match drain it feeds; the schedule page that is merely
-        # due stays behind those matches.
+        # Season enrichment stays below the match/schedule drain even when
+        # its discovery timestamp is decades older.
         assert [item.target_id for item in first] == [
             index_target,
-            season_target,
-            *match_targets[:3],
+            *match_targets,
         ]
         assert [item.ordinal for item in first] == list(range(5))
 
@@ -713,8 +713,8 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
             refresh_policies=current_policies,
             limit=1,
         )
-        assert [item.target_id for item in second] == [match_targets[3]]
-        assert [item.target_id for item in third] == [fresh_schedule_target]
+        assert [item.target_id for item in second] == [fresh_schedule_target]
+        assert [item.target_id for item in third] == [season_target]
         assert [item.target_id for item in fourth] == [stats_target]
         assert [item.target_id for item in fifth] == [player_target]
         selected = {
@@ -1078,7 +1078,7 @@ def test_candidate_scope_matches_the_full_frontier_rollup_and_ordering():
                 index_target, "competition_index", {}, "1950-01-01T00:00:00Z"
             )
             insert_target(
-                season_target, "season", male_current, "1940-01-01T00:00:00Z"
+                season_target, "season", male_current, "1940-01-01T00:00:00Z", 60
             )
             insert_target(
                 match_target, "match", male_current, "1960-01-01T00:00:00Z", 65
@@ -1151,10 +1151,8 @@ def test_candidate_scope_matches_the_full_frontier_rollup_and_ordering():
         )
         assert [item.target_id for item in cohort] == [
             index_target,
-            season_target,
             match_target,
-            carried_target,
-            both_target,
+            season_target,
         ]
 
         leases = store.claim_targets(
@@ -1163,6 +1161,67 @@ def test_candidate_scope_matches_the_full_frontier_rollup_and_ordering():
         assert sorted(lease.target_id for lease in leases) == sorted(
             item.target_id for item in cohort
         )
+        # With the urgent cohort leased, spare capacity can admit both rosters.
+        extra = store.create_due_run_cohort(run_id, refresh_policies=[policy], limit=2)
+        assert [item.target_id for item in extra] == [carried_target, both_target]
+
     finally:
         connection.rollback()
         connection.close()
+
+
+def test_1325_resumed_enrichment_yields_to_new_urgent_and_uses_spare_capacity(isolated_postgres_uri):
+    """Real SQL: large old cohort, a new urgent target, then a quiet wave."""
+    from scrapers.fbref.control import FrontierTarget
+    store = ControlStore(isolated_postgres_uri)
+    run = store.create_run("current", request_limit=100, byte_limit=50*1024*1024)
+    store.start_run(run)
+    snap = str(uuid.uuid4())
+    with store._transaction() as cursor:
+        cursor.execute("""INSERT INTO fbref_control.registry_snapshot(snapshot_id,successful,fetched_at)
+                          VALUES (%s,true,clock_timestamp())""", (snap,))
+        cursor.execute("""INSERT INTO fbref_control.competition_registry(
+          competition_id,canonical_url,name,gender,classification,crawl_state,
+          first_seen_at,last_seen_at,first_snapshot_id,last_snapshot_id)
+          VALUES ('9','https://fbref.com/en/comps/9','Premier League','male','league:club','active',
+                  clock_timestamp(),clock_timestamp(),%s,%s)""", (snap,snap))
+        cursor.execute("""INSERT INTO fbref_control.season_registry(
+          competition_id,season_id,canonical_url,is_current,
+          first_seen_at,last_seen_at,first_snapshot_id,last_snapshot_id)
+          VALUES ('9','2026-2027','https://fbref.com/en/comps/9/2026-2027',true,
+                  clock_timestamp(),clock_timestamp(),%s,%s)""", (snap,snap))
+    targets = [FrontierTarget(f"squad-{i}", "squad", f"https://fbref.com/en/squads/{i}/Team",
+               {"competition_id":"9", "season_id":"2026-2027"}, "weekly", 999) for i in range(80)]
+    for target in targets:
+        store.upsert_frontier_target(target)
+    with store._transaction() as cursor:
+        cursor.execute("UPDATE fbref_control.page_frontier SET state='quarantined' WHERE target_id='squad-0'")
+        cursor.execute("""UPDATE fbref_control.page_frontier SET state='retry',
+          retry_after=clock_timestamp()+interval '1 day' WHERE target_id='squad-1'""")
+    assert store.normalize_current_enrichment() == 79
+    assert store.normalize_current_enrichment() == 0
+    assert store.get_frontier_target("squad-0")["refresh_policy"] == "weekly"
+    retry = store.get_frontier_target("squad-1")
+    assert retry["state"] == "retry" and retry["retry_after"] > datetime.now(timezone.utc)
+    assert retry["refresh_policy"] == "monthly" and retry["next_fetch_at"] is None
+    old = store.create_due_run_cohort(run, refresh_policies=["weekly","monthly","daily"], limit=25)
+    assert len(old) == 25
+    store.upsert_frontier_target(FrontierTarget("urgent", "match", "https://fbref.com/en/matches/12345678",
+        {"competition_id":"9", "season_id":"2026-2027"}, "daily", 1))
+    assert store.claim_targets(run, "worker", limit=25) == []
+    assert store.count_skipped_enrichment(run, [t.target_id for t in old]) == 25
+    cohort = store.create_due_run_cohort(run, limit=25)
+    leases = store.claim_targets(run, "worker", limit=25)
+    assert leases[0].target_id == "urgent"
+    assert sum(t.page_kind == "squad" for t in leases) == 6
+    assert len(leases) == len(cohort) == 7
+    # Complete the wave; no urgent remains, so the next wave can use spare capacity.
+    with store._transaction() as cursor:
+        cursor.execute("""UPDATE fbref_control.page_frontier SET state='fetched',
+          last_fetched_at=clock_timestamp(), next_fetch_at=clock_timestamp()+interval '28 days',
+          claim_token=NULL, lease_expires_at=NULL, lease_run_id=NULL, lease_refresh_id=NULL, leased_by=NULL
+          WHERE target_id=ANY(%s::text[])""", ([t.target_id for t in leases],))
+        cursor.execute("UPDATE fbref_control.run_target SET status='succeeded' WHERE run_id=%s AND status='leased'", (run,))
+    spare = store.create_due_run_cohort(run, limit=25)
+    assert len(spare) == 25
+    assert len(store.claim_targets(run, "worker", limit=25)) == 25

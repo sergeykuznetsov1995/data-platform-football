@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 from scrapers.fbref.daily_report import adult_competition, instant
+from scrapers.fbref.control.store import _frontier_scope_cte_for_candidates
 
 REGISTRY_SQL = """
 SELECT jsonb_build_object(
@@ -73,29 +74,86 @@ SELECT coalesce(jsonb_agg(r), '[]')::text FROM (
 """
 
 
+# Canonical scopes include aliases and discovery provenance. Aggregate them
+# before joining the frontier so a shared roster counts exactly once.
+PAGE_AGES_SQL = _frontier_scope_cte_for_candidates("""
+ SELECT target_id FROM fbref_control.page_frontier
+ WHERE source='fbref' AND refresh_policy <> 'historical_once'
+   AND state NOT IN ('dead','skipped','quarantined')
+""") + """
+SELECT coalesce(jsonb_agg(p), '[]')::text FROM (
+ SELECT f.target_id,f.page_kind,f.canonical_url,f.state,f.refresh_policy,
+        f.last_fetched_at, f.last_content_hash,
+        EXISTS (SELECT 1 FROM fbref_control.dataset_manifest m
+          WHERE m.target_id=f.target_id AND m.content_hash=f.last_content_hash
+            AND m.dataset='__page__' AND m.parse_status='succeeded'
+            AND m.persistence_status='succeeded' AND m.validation_status='succeeded'
+            AND m.completed_at <= '{cutoff}'::timestamptz) AS processed,
+        coalesce(scope.has_current_ownership,false)
+          AND NOT coalesce(scope.competition_missing,true)
+          AND NOT coalesce(scope.has_female,false)
+          AND NOT coalesce(scope.has_unknown,true)
+          AND NOT coalesce(scope.inactive_competition,true)
+          AND NOT coalesce(scope.invalid_season,true) AS current_ownership,
+        (SELECT coalesce(jsonb_agg(DISTINCT jsonb_build_object(
+           'competition_id',c.competition_id,'season_id',c.season_id)), '[]')
+         FROM canonical_scope c WHERE c.target_id=f.target_id) AS scopes
+ FROM fbref_control.page_frontier f
+ LEFT JOIN scope_rollup scope USING (target_id)
+ WHERE f.source='fbref' AND f.refresh_policy <> 'historical_once'
+   AND f.state NOT IN ('dead','skipped','quarantined') AND f.created_at <= '{cutoff}'::timestamptz
+) p
+"""
+
+
+PAGE_AGE_EXCLUSIONS_SQL = """
+SELECT coalesce(jsonb_object_agg(reason,n), '{}')::text FROM (
+ SELECT CASE WHEN state IN ('dead','skipped','quarantined') THEN state ELSE 'history' END AS reason,
+        count(*) AS n
+ FROM fbref_control.page_frontier WHERE source='fbref'
+   AND created_at <= '{cutoff}'::timestamptz
+   AND (state IN ('dead','skipped','quarantined') OR refresh_policy='historical_once')
+ GROUP BY 1
+) counts
+"""
+
+
 def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
                      as_of: datetime, mapping: dict, lookback: int = 14) -> dict:
     """Call injected SELECT executors; never migrate, seed, fetch or publish."""
     cutoff = instant(as_of).isoformat()
     snapshot = {"competitions": [], "seasons": [], "schedules": [],
                 "observations": [], "readiness": [], "schedule_health": [],
-                "fotmob_seasons": [], "fotmob_matches": [], "errors": []}
+                "fotmob_seasons": [], "fotmob_matches": [], "errors": [], "page_age_errors": []}
     def read(label, function, query, default):
         try:
             return function(query)
         except Exception:
             # Driver exceptions may contain credentials: record the failed source only.
-            snapshot["errors"].append({"source": label, "reason": "read_failed"})
+            error_key = "page_age_errors" if label in {
+                "fbref_page_ages", "fbref_page_age_exclusions", "fbref_standings_inventory"
+            } else "errors"
+            snapshot[error_key].append({"source": label, "reason": "read_failed"})
             return default
     registry = read("fbref_registry", pg, REGISTRY_SQL.format(cutoff=cutoff), {})
     snapshot.update(registry)
     snapshot["observations"] = read("fbref_observations", pg, OBSERVATIONS_SQL.format(cutoff=cutoff), [])
     snapshot["readiness"] = read("fbref_readiness", pg, READINESS_SQL.format(cutoff=cutoff), [])
+    snapshot["page_ages"] = read("fbref_page_ages", pg, PAGE_AGES_SQL.replace("{cutoff}", cutoff), [])
+    snapshot["page_age_exclusions"] = read("fbref_page_age_exclusions", pg,
+        PAGE_AGE_EXCLUSIONS_SQL.replace("{cutoff}", cutoff), {})
     adults = {str(c["competition_id"]) for c in snapshot["competitions"] if adult_competition(c)}
     if not adults:
         snapshot["errors"].append({"source": "fbref_registry", "reason": "empty_adult_universe"})
         return snapshot
     fb_ids = ",".join("'" + str(int(cid)) + "'" for cid in sorted(adults))
+    snapshot["standings_inventory"] = read("fbref_standings_inventory", trino, f"""
+        SELECT DISTINCT target_id,content_hash
+        FROM iceberg.bronze.fbref_table_inventory
+        WHERE page_kind='season' AND regexp_like(table_id, '^results.*_overall$')
+          AND availability IN ('available','empty')
+          AND persisted_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+    """, [])
     start = (day - timedelta(days=lookback - 1)).isoformat()
     end = day.isoformat()
     snapshot["schedules"] = read("fbref_schedule", trino, f"""

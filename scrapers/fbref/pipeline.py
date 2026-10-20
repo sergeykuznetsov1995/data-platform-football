@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse, urlsplit
 
+from scrapers.fbref.policy import CURRENT_ENRICHMENT
 from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
@@ -2303,14 +2304,13 @@ def _is_mass_contract_rejection(result: "WaveResult") -> bool:
 def _frontier_policy(page_kind: str, *, historical: bool) -> tuple[str, int]:
     if historical:
         return "historical_once", 10
+    if page_kind in CURRENT_ENRICHMENT:
+        return CURRENT_ENRICHMENT[page_kind][:2]
     policies = {
         "competition_index": ("daily", 100),
         "competition": ("weekly", 90),
-        "season": ("daily", 80),
-        "season_stats": ("daily", 75),
         "schedule": ("six_hourly", 85),
         "standings": ("daily", 70),
-        "squad": ("weekly", 60),
         "player": ("monthly", 40),
         "matchlog": ("monthly", 20),
         "match": ("daily", 65),
@@ -2339,16 +2339,15 @@ def frontier_target(
 def _next_fetch_at(page_kind: str, *, historical: bool) -> Optional[datetime]:
     if historical:
         return None
+    if page_kind in CURRENT_ENRICHMENT:
+        return _utcnow() + timedelta(hours=CURRENT_ENRICHMENT[page_kind][2])
     delays = {
         # Small cadence slack keeps a 06:00 scheduled run due even when the
         # previous task finished a few minutes after its nominal slot.
         "competition_index": timedelta(hours=23),
         "competition": timedelta(days=6, hours=23),
         "schedule": timedelta(hours=5),
-        "season": timedelta(hours=23),
-        "season_stats": timedelta(hours=23),
         "standings": timedelta(hours=23),
-        "squad": timedelta(days=6, hours=23),
         "player": timedelta(days=29, hours=23),
         "matchlog": timedelta(days=29, hours=23),
         "match": timedelta(hours=23),
@@ -3476,7 +3475,7 @@ class FBrefPipeline:
             leases = self.control.claim_targets(
                 run_id,
                 worker_id,
-                limit=len(cohort),
+                limit=limit,
                 lease_seconds=FETCH_LEASE_SECONDS,
                 page_kinds=page_kinds,
                 refresh_policies=policies,
@@ -3485,9 +3484,18 @@ class FBrefPipeline:
             result.cohort_size = len(leases)
         result.claimed = len(leases)
         if len(leases) != result.cohort_size:
+            # A newly due match/schedule can preempt enrichment between the
+            # admission and claim transactions. Only confirmed hand-backs
+            # excuse missing claims; lost/blocked leases still fail closed.
+            result.cohort_size -= self.control.count_skipped_enrichment(
+                run_id, [item.target_id for item in cohort]
+            )
+        if len(leases) != result.cohort_size:
             raise FetchWaveError(
                 f"Claimed {len(leases)} of {result.cohort_size} cohort targets"
             )
+        if not leases:
+            return result
         owns_session = _live_session is None
         live_session = _live_session or _LiveFetchSession(
             persistent_enabled=settings.persistent_http_session,
@@ -3874,6 +3882,7 @@ class FBrefPipeline:
                         live_session.consecutive_clearance_refreshes += 1
                         clearance_streak_exhausted = (
                             exc.session_failure_reason is not None
+                            or (not historical and lease.page_kind in CURRENT_ENRICHMENT)
                             or live_session.consecutive_clearance_refreshes
                             > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
                         )

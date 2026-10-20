@@ -787,7 +787,7 @@ def test_publication_policy_distinguishes_required_from_discovered_standings():
         "match",
     )
     assert PUBLICATION_FRESHNESS_PAGE_KINDS == frozenset(
-        (*PUBLICATION_REQUIRED_PAGE_KINDS, "standings")
+        (*PUBLICATION_REQUIRED_PAGE_KINDS, "standings", "squad")
     )
     assert set(DISCOVERY_SPINE_PAGE_KINDS).isdisjoint(
         OTHER_PUBLICATION_CRITICAL_PAGE_KINDS
@@ -833,8 +833,8 @@ def test_due_cohort_uses_explicit_publication_admission_tiers():
     # admission-tier arrays moved behind them.
     assert selected["params"][:4] == (None, None, None, None)
     assert selected["params"][4:7] == (
-        list(DISCOVERY_SPINE_PAGE_KINDS),
-        list(DISCOVERY_SPINE_PAGE_KINDS),
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
         list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
     )
     assert selected["params"][-2:] == (run_id, 5)
@@ -1041,7 +1041,7 @@ def test_claim_scope_is_narrowed_to_this_runs_targets():
     assert "JOIN scope_candidates AS claim_candidate" in sql
     assert "ON candidate.target_id = edge.child_target_id" in sql
     # The candidate predicate is the outer predicate, verbatim.
-    assert sql.count("status IN ('pending', 'retry')") == 2
+    assert sql.count("status IN ('pending', 'retry')") == 3
     assert seen["params"] == (
         run_id,
         run_id,
@@ -1103,8 +1103,8 @@ def test_due_cohort_scope_is_narrowed_to_due_candidates():
         ["match"],
         ["daily"],
         ["daily"],
-        list(DISCOVERY_SPINE_PAGE_KINDS),
-        list(DISCOVERY_SPINE_PAGE_KINDS),
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
+        [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
         list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
         ["match"],
         ["match"],
@@ -2653,3 +2653,53 @@ def test_batch_latest_content_guard_rejects_duplicate_target():
             ("fbref:match:aaaa", "h", refresh),
         ]):
             pass
+
+
+def test_1325_normalization_preserves_fences_and_backoff():
+    statements = []
+    def handler(sql, params):
+        statements.append(sql)
+        if "SELECT frontier.target_id FROM fbref_control.page_frontier" in sql:
+            return [{"target_id": "season"}], 1
+        return [], 0
+    store = ControlStore("postgresql://unused/test", connection_factory=FakeFactory(handler))
+    assert store.normalize_current_enrichment() == 0
+    assert store.normalize_current_enrichment() == 0
+    assert statements[0] == statements[2] and statements[1] == statements[3]
+    assert "FOR UPDATE OF frontier SKIP LOCKED" in statements[0]
+    sql = statements[1]
+    assert "frontier.target_id = ANY(%s::text[])" in sql
+    assert "IS DISTINCT FROM" in sql
+    assert "frontier.state IN ('queued', 'retry', 'fetched')" in sql
+    assert "member.status IN ('pending', 'leased', 'retry')" in sql
+    assert "run.status IN ('pending', 'running')" in sql
+    assignment = sql[sql.index("SET refresh_policy"):sql.index("FROM desired")]
+    assert "retry_after" not in assignment and "state =" not in assignment
+    assert "frontier.last_fetched_at + desired.hours" in assignment
+    assert "has_current_ownership" in sql and "canonical_scope" in sql
+    assert "'monthly', 50, 664" in sql and "'weekly', 60, 160" in sql
+
+
+@pytest.mark.parametrize("limit,cap", [(1, 0), (3, 0), (4, 1), (25, 6)])
+def test_1325_due_and_claim_cap_old_cohorts_and_small_budget(limit, cap):
+    seen = {}
+    run_id = str(uuid.uuid4())
+    def handler(sql, params):
+        if "SELECT status FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running"}], 1
+        if "END AS admission_tier" in sql:
+            seen["due"] = sql
+            return [], 0
+        if "SELECT COALESCE(max(ordinal)" in sql:
+            return [{"next_ordinal": 0}], 1
+        return _claim_sql_probe(run_id, seen)(sql, params)
+    store = ControlStore("postgresql://unused/test", connection_factory=FakeFactory(handler))
+    assert store.create_due_run_cohort(run_id, limit=limit) == []
+    assert store.claim_targets(run_id, "test", limit=limit) == []
+    assert f"eligible.kind_ordinal <= {cap}" in seen["due"]
+    assert f"claim_order.kind_ordinal <= {cap}" in seen["sql"]
+    case = seen["due"].split("END AS admission_tier")[0]
+    assert "('season', 'season_stats', 'squad')" in case
+    assert "WHEN frontier.page_kind IN ('match', 'schedule') THEN 0" in seen["sql"]
+    assert "THEN 2 ELSE 1 END," in seen["sql"]
+    assert "THEN frontier.priority ELSE 0 END DESC, target.ordinal" in seen["sql"]

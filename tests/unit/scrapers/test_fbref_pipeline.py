@@ -5871,7 +5871,7 @@ def test_seed_filter_applies_from_competition_and_discovery_paths(tmp_path):
 @pytest.mark.parametrize(
     ("run_type", "seeded_season", "season_policy"),
     [
-        ("current", "2025", "daily"),
+        ("current", "2025", "weekly"),
         ("backfill", "2024", "historical_once"),
     ],
 )
@@ -15075,3 +15075,45 @@ def test_session_abort_persistent_settlement_precedes_reset(
             assert order == sorted(order)
         assert control.run["bytes_used"] == 130
         assert control.run["bytes_reserved"] == 0
+
+
+@pytest.mark.parametrize("kind,policy,hours", [
+    ("season", "weekly", 160), ("season_stats", "weekly", 160),
+    ("squad", "monthly", 664),
+])
+def test_1325_current_enrichment_seed_and_fetch_cadence(monkeypatch, kind, policy, hours):
+    from datetime import timedelta
+    import scrapers.fbref.pipeline as module
+    now = datetime(2026, 10, 20, 0, 15, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "_utcnow", lambda: now)
+    assert module._frontier_policy(kind, historical=False)[0] == policy
+    assert module._frontier_policy(kind, historical=False)[1] < module._frontier_policy("match", historical=False)[1]
+    target = PageTarget(source="fbref", page_kind=kind, target_id=f"fbref:{kind}:1325",
+                        canonical_url="https://fbref.com/en/comps/9/2026-2027",
+                        source_ids={"competition_id": "9", "season_id": "2026-2027"})
+    assert module.frontier_target(target).refresh_policy == policy
+    assert module.frontier_target(target, historical=True).refresh_policy == "historical_once"
+    due = module._next_fetch_at(kind, historical=False)
+    assert due == now + timedelta(hours=hours)
+    # Every normal six-hour phase, including a two-hour execution allowance.
+    sla = 672 if kind == "squad" else 168
+    for phase_minutes in range(360):
+        assert (due-now) + timedelta(minutes=phase_minutes, hours=2) < timedelta(hours=sla)
+    assert module._frontier_policy(kind, historical=True) == ("historical_once", 10)
+    assert module._next_fetch_at(kind, historical=True) is None
+
+
+def test_1325_new_urgent_between_admission_and_claim_defers_cleanly(tmp_path):
+    from scrapers.fbref.control import CohortTarget
+    from scrapers.fbref.pipeline import FBrefPipeline
+    control = FakeControl()
+    control.claim_targets = lambda *a, **k: []
+    control.get_run_target_counts = lambda *a: {}
+    control.create_due_run_cohort = lambda *a, **k: [CohortTarget("season", str(uuid.uuid4()), 0)]
+    control.count_skipped_enrichment = lambda run, ids: int(ids == ["season"])
+    pipeline = FBrefPipeline(control, _raw_store(tmp_path), generic_writer=FakeWriter())
+    settings = PipelineSettings(run_type="current", request_limit=100, byte_limit=50*1024*1024)
+    pipeline._remaining_wave_limit = lambda *a, **k: 25
+    result = pipeline.fetch_wave("run", worker_id="worker", page_kinds=["season"], settings=settings)
+    assert result.claimed == result.cohort_size == 0
+    assert result.failures == []

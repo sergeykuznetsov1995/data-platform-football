@@ -249,3 +249,89 @@ def test_report_contains_lag_and_no_unqualified_success_for_unknown():
     mapping = json.loads((Path(__file__).resolve().parents[3] / 'configs/fbref/fotmob-report-map.json').read_text())
     assert len(mapping["competitions"]) == 112
     assert not {"850", "851", "852", "853", "Big5"} & set(mapping["competitions"])
+
+
+def test_1325_page_age_denominator_boundaries_and_exclusions():
+    from scrapers.fbref.daily_report import page_age_line
+    data = snapshot()
+    base = {"page_kind": "season", "canonical_url": "https://fbref.com/en/comps/9/x",
+            "state": "queued", "refresh_policy": "daily", "current_ownership": True,
+            "scopes": [{"competition_id": "9", "season_id": "2026-2027"}]}
+    data["page_ages"] = [
+        dict(base, target_id="never", last_fetched_at=None),
+        dict(base, target_id="edge", last_fetched_at=(AS_OF-timedelta(days=7)).isoformat()),
+        dict(base, target_id="fresh", last_fetched_at=(AS_OF-timedelta(days=7, seconds=-1)).isoformat()),
+        dict(base, target_id="future", last_fetched_at=(AS_OF+timedelta(seconds=1)).isoformat()),
+        dict(base, target_id="dead", state="dead", last_fetched_at=None),
+        dict(base, target_id="quarantine", state="quarantined", last_fetched_at=None),
+        dict(base, target_id="history", refresh_policy="historical_once", last_fetched_at=None),
+        dict(base, target_id="outside", current_ownership=False, last_fetched_at=None),
+        dict(base, target_id="roster", page_kind="squad", last_fetched_at=(AS_OF-timedelta(days=27)).isoformat()),
+        dict(base, target_id="logs", page_kind="squad", canonical_url="https://fbref.com/en/squads/abc/matchlogs/x", last_fetched_at=None),
+    ]
+    data["page_ages"].append(dict(data["page_ages"][2]))
+    result = report(data)
+    ages = result["page_ages"]
+    assert ages["by_kind"]["season"]["total"] == 4
+    assert ages["by_kind"]["season"]["fresh"] == 1
+    assert ages["by_kind"]["season"]["never"] == 1
+    assert ages["by_kind"]["season"]["aged"] == 1
+    assert ages["by_kind"]["squad"]["fresh"] == 1
+    assert ages["total"] == 5 and ages["fresh_percent"] == 40
+    assert ages["excluded"] == {"dead": 1, "quarantined": 1, "history": 1,
+                                "outside_current_adult_scope": 1, "non_roster": 1}
+    line = page_age_line(result)
+    assert "Возраст по видам страниц: " in line
+    assert "season_stats: N=0" in line and "н/д" in line
+    assert "fresh28=1" in line and "median/p95/max=" in line
+
+
+def test_1325_reader_keeps_aliases_and_provenance_in_page_age_slice():
+    from scrapers.fbref.daily_report_reader import PAGE_AGES_SQL
+    queries = []
+    data = snapshot()
+    def pg(sql):
+        queries.append(sql)
+        if "jsonb_build_object(\n 'competitions'" in sql:
+            return {k: data[k] for k in ("competitions", "seasons")}
+        return []
+    result = collect_snapshot(pg, lambda _: [], day=DAY, as_of=AS_OF, mapping=MAP)
+    assert result["page_ages"] == []
+    sql = next(q for q in queries if "current_ownership" in q)
+    assert "season_alias" in sql and "frontier_provenance" in sql
+    assert "jsonb_agg(DISTINCT" in sql and "f.last_fetched_at" in sql
+    assert "refresh_policy = 'weekly'" not in PAGE_AGES_SQL
+
+
+def test_1325_standings_proof_uses_processed_season_current_content():
+    data = snapshot()
+    base = {"page_kind": "season", "canonical_url": "https://fbref.com/en/comps/9/x",
+            "state": "fetched", "refresh_policy": "weekly", "current_ownership": True,
+            "scopes": [{"competition_id": "9", "season_id": "2026-2027"}],
+            "last_fetched_at": AS_OF.isoformat(), "last_content_hash": "current", "processed": True}
+    data["page_ages"] = [dict(base, target_id="season"), dict(base, target_id="unprocessed", processed=False),
+                         dict(base, target_id="old-content"), dict(base, target_id="stats", page_kind="season_stats")]
+    data["standings_inventory"] = [{"target_id": "season", "content_hash": "current"},
+                                  {"target_id": "unprocessed", "content_hash": "current"},
+                                  {"target_id": "old-content", "content_hash": "old"},
+                                  {"target_id": "stats", "content_hash": "current"}]
+    assert report(data)["page_ages"]["standings_confirmed_seasons"] == 1
+    # Not every competition format publishes standings; absence stays evidence, not a failure.
+    data["standings_inventory"] = []
+    assert report(data)["page_ages"]["standings_confirmed_seasons"] == 0
+
+
+def test_1325_optional_page_age_read_failure_does_not_break_match_milestone():
+    data = snapshot()
+    def pg(sql):
+        if "jsonb_build_object(\n 'competitions'" in sql:
+            return {k: data[k] for k in ("competitions", "seasons", "schedule_health")}
+        if "AS current_ownership" in sql:
+            raise RuntimeError("private credentials")
+        if "jsonb_object_agg(reason,n)" in sql:
+            return {}
+        return []
+    collected = collect_snapshot(pg, lambda _: [], day=DAY, as_of=AS_OF, mapping=MAP)
+    assert collected["errors"] == []
+    assert collected["page_age_errors"] == [{"source": "fbref_page_ages", "reason": "read_failed"}]
+    assert "private" not in json.dumps(collected)

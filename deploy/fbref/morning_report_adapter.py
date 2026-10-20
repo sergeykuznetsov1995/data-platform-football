@@ -17,7 +17,8 @@ def fbref_daily_report() -> list[str]:
             "--host-read-only", "--output-dir", str(output),
         ], capture_output=True, text=True, timeout=180, check=True)
         lines = result.stdout.strip().splitlines()
-        if len(lines) != 3 or not lines[0].startswith("FBref: матчей "):
+        if (len(lines) != 4 or not lines[0].startswith("FBref: матчей ")
+                or not lines[3].startswith("Возраст по видам страниц: ")):
             raise ValueError("Unexpected report output")
         return ["• " + line for line in lines]
     except (OSError, subprocess.SubprocessError, ValueError):
