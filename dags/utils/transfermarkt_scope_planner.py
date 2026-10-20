@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
-from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY, career_debt_ctes
+from dags.utils.transfermarkt_career_debt import career_debt_ctes
 
 from scrapers.transfermarkt.denominator import Denominator, load_denominator
 from scrapers.transfermarkt.registry import (
@@ -998,12 +998,7 @@ def build_promoted_registry_query(
     LIMIT 1
 ), {career_debt_ctes()}, last_complete_scope AS (
     SELECT competition_id, edition_id,
-           with_timezone(committed_at, 'UTC') AS last_success_at,
-           json_extract_scalar(entity_manifest_json,
-               '$.dq_evidence.roster_coverage.market_value_history.policy_version') AS career_debt_policy,
-           COALESCE(TRY_CAST(json_extract_scalar(
-               entity_manifest_json, '$.dq_evidence.career_fetches_pending'
-           ) AS bigint), 0) AS career_fetches_pending
+           with_timezone(committed_at, 'UTC') AS last_success_at
     FROM (
         SELECT *, ROW_NUMBER() OVER (
             PARTITION BY competition_id, edition_id
@@ -1064,9 +1059,7 @@ SELECT
     e.schema_revision AS edition_schema_revision,
     p.registry_snapshot_id,
     s.last_success_at,
-    CASE WHEN s.career_debt_policy = '{CAREER_DEBT_POLICY}'
-         THEN COALESCE(d.pending, 0)
-         ELSE COALESCE(s.career_fetches_pending, 0) END AS career_fetches_pending
+    COALESCE(d.pending, 0) AS career_fetches_pending
 FROM {COMPETITIONS_TABLE} c
 JOIN {EDITIONS_TABLE} e
   ON e.competition_id = c.competition_id
