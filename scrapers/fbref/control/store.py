@@ -44,6 +44,7 @@ from scrapers.fbref.control.replay_effects import (
     normalize_replay_control_effects,
 )
 from scrapers.fbref.policy import (
+    CURRENT_ENRICHMENT,
     DISCOVERY_SPINE_PAGE_KINDS,
     OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
     PUBLICATION_FRESHNESS_PAGE_KINDS,
@@ -102,7 +103,7 @@ _PAGE_KIND_SLA_SECONDS = {
     "season": 604_800,
     "season_stats": 604_800,
     "standings": 604_800,
-    "squad": 604_800,
+    "squad": 2_419_200,
     "player": 2_592_000,
     "matchlog": 2_592_000,
 }
@@ -6674,6 +6675,66 @@ class ControlStore:
                 inserted += 1
         return inserted
 
+    def normalize_current_enrichment(self) -> int:
+        """Repair recurring current targets without opening quarantines or leases."""
+        values = ", ".join(
+            f"('{kind}', '{policy}', {priority}, {hours})"
+            for kind, (policy, priority, hours) in CURRENT_ENRICHMENT.items()
+        )
+        scope_sql = _frontier_scope_cte_for_candidates("""
+            SELECT f.target_id FROM fbref_control.page_frontier f
+            WHERE f.page_kind IN ('season', 'season_stats', 'squad')
+              AND f.refresh_policy <> 'historical_once'
+              AND f.state IN ('queued', 'retry', 'fetched')
+        """) + f", desired(page_kind, policy, priority, hours) AS (VALUES {values}) "
+        predicate = """
+                WHERE frontier.target_id = scope.target_id
+                  AND frontier.source = 'fbref'
+                  AND frontier.page_kind = desired.page_kind
+                  AND frontier.refresh_policy <> 'historical_once'
+                  AND frontier.state IN ('queued', 'retry', 'fetched')
+                  AND COALESCE(scope.has_current_ownership, false)
+                  AND NOT COALESCE(scope.competition_missing, true)
+                  AND NOT COALESCE(scope.has_female, false)
+                  AND NOT COALESCE(scope.has_unknown, true)
+                  AND NOT COALESCE(scope.inactive_competition, true)
+                  AND NOT COALESCE(scope.invalid_season, true)
+                  AND (frontier.page_kind <> 'squad' OR
+                       frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM fbref_control.run_target member
+                    JOIN fbref_control.crawl_run run USING (run_id)
+                    WHERE member.target_id = frontier.target_id
+                      AND member.status IN ('pending', 'leased', 'retry')
+                      AND run.status IN ('pending', 'running')
+                  )
+                  AND (frontier.refresh_policy, frontier.priority)
+                    IS DISTINCT FROM (desired.policy, desired.priority)
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                scope_sql + """
+                SELECT frontier.target_id FROM fbref_control.page_frontier AS frontier,
+                  desired, scope_rollup AS scope
+                """ + predicate + " FOR UPDATE OF frontier SKIP LOCKED"
+            )
+            target_ids = [row["target_id"] for row in _fetchall(cursor)]
+            if not target_ids:
+                return 0
+            # Admission fences the same frontier row. Recheck membership in a
+            # new command snapshot after acquiring that fence, as due admission
+            # does, so a concurrent cohort cannot be normalized underneath it.
+            cursor.execute(
+                scope_sql + """
+                UPDATE fbref_control.page_frontier AS frontier
+                SET refresh_policy = desired.policy, priority = desired.priority,
+                    updated_at = clock_timestamp()
+                FROM desired, scope_rollup AS scope
+                """ + predicate + " AND frontier.target_id = ANY(%s::text[])",
+                (target_ids,),
+            )
+            return cursor.rowcount
+
     def create_due_run_cohort(
         self,
         run_id: object,
@@ -6699,6 +6760,9 @@ class ControlStore:
             )
             if not policies:
                 return []
+        if (policies is not None and "historical_once" not in policies
+                and set(policies) & {"daily", "weekly", "monthly", "six_hourly"}):
+            self.normalize_current_enrichment()
         # Admission tiers keep the publication spine ahead of an arbitrarily
         # old enrichment backlog.  In particular, a newly discovered current
         # match must not need a previous fetch before it becomes critical.
@@ -6753,6 +6817,9 @@ class ControlStore:
                            frontier.created_at
                          ) AS due_at,
                          CASE
+                           WHEN frontier.page_kind IN ('season', 'season_stats', 'squad')
+                            AND frontier.refresh_policy <> 'historical_once'
+                             THEN 5
                            WHEN frontier.page_kind = 'competition_index'
                              THEN 0
                            WHEN frontier.page_kind = ANY(%s::text[])
@@ -6776,7 +6843,16 @@ class ControlStore:
                             AND frontier.refresh_policy <> 'historical_once'
                              THEN 4
                            ELSE 5
-                         END AS admission_tier
+                         END AS admission_tier,
+                         row_number() OVER (
+                           PARTITION BY (frontier.page_kind IN ('season', 'season_stats', 'squad')
+                             AND frontier.refresh_policy <> 'historical_once')
+                           ORDER BY frontier.priority DESC,
+                             COALESCE(frontier.retry_after, frontier.next_fetch_at,
+                               frontier.last_fetched_at, frontier.created_at), frontier.target_id
+                         ) AS kind_ordinal,
+                         (frontier.page_kind IN ('season', 'season_stats', 'squad')
+                           AND frontier.refresh_policy <> 'historical_once') AS enrichment
                   FROM fbref_control.page_frontier AS frontier
                   JOIN scope_candidates AS cohort_candidate
                     ON cohort_candidate.target_id = frontier.target_id
@@ -6792,6 +6868,7 @@ class ControlStore:
                             AND frontier.next_fetch_at <= clock_timestamp()
                         )
                     )
+                  AND (frontier.page_kind <> 'squad' OR frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)')
                   AND (frontier.next_fetch_at IS NULL
                        OR frontier.next_fetch_at <= clock_timestamp())
                   AND (frontier.retry_after IS NULL
@@ -6850,7 +6927,10 @@ class ControlStore:
                 FROM eligible
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = eligible.target_id
+                WHERE NOT eligible.enrichment OR eligible.kind_ordinal <= {normalized_limit // 4}
+                   OR NOT EXISTS (SELECT 1 FROM eligible urgent WHERE urgent.admission_tier < 5)
                 ORDER BY eligible.admission_tier,
+                         CASE WHEN eligible.enrichment THEN frontier.priority ELSE 0 END DESC,
                          eligible.due_at,
                          frontier.priority DESC,
                          frontier.created_at,
@@ -6863,8 +6943,8 @@ class ControlStore:
                     kinds,
                     policies,
                     policies,
-                    list(DISCOVERY_SPINE_PAGE_KINDS),
-                    list(DISCOVERY_SPINE_PAGE_KINDS),
+                    [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
+                    [kind for kind in DISCOVERY_SPINE_PAGE_KINDS if kind != "season"],
                     list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
                     kinds,
                     kinds,
@@ -6953,6 +7033,22 @@ class ControlStore:
         return {
             str(row["status"]): int(row["count"]) for row in _fetchall(cursor)
         }
+
+    def count_skipped_enrichment(self, run_id: object, target_ids: Sequence[str]) -> int:
+        """Confirm deliberate hand-back between admission and the first claim."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT count(*) AS count FROM fbref_control.run_target member
+                JOIN fbref_control.page_frontier page USING (target_id)
+                WHERE member.run_id = %s AND member.target_id = ANY(%s::text[])
+                  AND member.status = 'skipped'
+                  AND page.page_kind IN ('season', 'season_stats', 'squad')
+                  AND page.refresh_policy <> 'historical_once'
+                  AND page.state IN ('queued', 'retry')
+                """, (_uuid(run_id, "run_id"), list(target_ids)),
+            )
+            return int(_fetchone(cursor)["count"])
 
     def get_run_target_counts(self, run_id: object) -> dict[str, int]:
         """Return the run's target counts by status without the full summary.
@@ -7670,6 +7766,11 @@ class ControlStore:
                     LEFT JOIN scope_rollup AS scope
                       ON scope.target_id = frontier.target_id
                     WHERE frontier.source = 'fbref'
+                      AND (frontier.page_kind NOT IN ('season', 'season_stats', 'squad')
+                        OR (frontier.state NOT IN ('quarantined', 'dead', 'skipped')
+                          AND frontier.refresh_policy <> 'historical_once'
+                          AND (frontier.page_kind <> 'squad' OR frontier.canonical_url
+                            !~ '/(matchlogs|goallogs|history|wages)(/|$)')))
                       -- Current runs cannot claim historical one-shot matches.
                       AND NOT (
                         frontier.page_kind = 'match'
@@ -9761,6 +9862,56 @@ class ControlStore:
                 run_ids=(run,),
                 run_rows_locked=True,
             )
+            # Explicit acceptance must fetch its whole frozen cohort in one
+            # wave, independently of work outside that bounded experiment.
+            frozen_acceptance = (
+                run_metadata.get("acceptance_profile") is True
+                and run_metadata.get("execution_mode") == "acceptance_nonpublishing"
+                and bool(run_metadata.get("acceptance_cohort"))
+            )
+            # A resumed enrichment cohort cannot hide newly due match/schedule
+            # work outside it. Hand back unleased enrichment before admission;
+            # retry/backoff and the frontier identity remain untouched.
+            cursor.execute(
+                _frontier_scope_cte_for_candidates("""
+                  SELECT f.target_id FROM fbref_control.page_frontier f
+                  WHERE f.page_kind IN ('match', 'schedule')
+                    AND f.refresh_policy <> 'historical_once'
+                    AND (f.state IN ('queued', 'retry') OR
+                         (f.state = 'fetched' AND f.next_fetch_at IS NOT NULL))
+                    AND (f.next_fetch_at IS NULL OR f.next_fetch_at <= clock_timestamp())
+                    AND (f.retry_after IS NULL OR f.retry_after <= clock_timestamp())
+                """) + """
+                UPDATE fbref_control.run_target AS target
+                SET status = 'skipped', updated_at = clock_timestamp()
+                FROM fbref_control.page_frontier AS page
+                WHERE target.run_id = %s AND target.target_id = page.target_id
+                  AND NOT %s
+                  AND target.status IN ('pending', 'retry')
+                  AND page.state IN ('queued', 'retry')
+                  AND page.page_kind IN ('season', 'season_stats', 'squad')
+                  AND page.refresh_policy <> 'historical_once'
+                  AND EXISTS (
+                    SELECT 1 FROM scope_candidates urgent
+                    JOIN scope_rollup scope USING (target_id)
+                    WHERE COALESCE(scope.has_current_ownership, false)
+                      AND NOT COALESCE(scope.competition_missing, true)
+                      AND NOT COALESCE(scope.has_female, false)
+                      AND NOT COALESCE(scope.has_unknown, true)
+                      AND NOT COALESCE(scope.inactive_competition, true)
+                      AND NOT COALESCE(scope.invalid_season, true)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM fbref_control.run_target member
+                        JOIN fbref_control.crawl_run owner USING (run_id)
+                        WHERE member.target_id = urgent.target_id
+                          AND (member.run_id = %s OR (
+                            member.status IN ('pending', 'leased', 'retry')
+                            AND owner.status IN ('pending', 'running')
+                          ))
+                      )
+                  )
+                """, (run, frozen_acceptance, run),
+            )
             cursor.execute(
                 _frontier_scope_cte_for_candidates(
                     """        SELECT candidate_target.target_id
@@ -9768,7 +9919,24 @@ class ControlStore:
         WHERE candidate_target.run_id = %s
           AND candidate_target.status IN ('pending', 'retry')"""
                 )
-                + """
+                + f"""
+                , claim_order AS (
+                  SELECT member.target_id,
+                    (page.page_kind IN ('season', 'season_stats', 'squad')
+                      AND page.refresh_policy <> 'historical_once') AS enrichment,
+                    row_number() OVER (
+                      PARTITION BY (page.page_kind IN ('season', 'season_stats', 'squad')
+                        AND page.refresh_policy <> 'historical_once')
+                      ORDER BY member.ordinal
+                    ) AS kind_ordinal
+                  FROM fbref_control.run_target member
+                  JOIN fbref_control.page_frontier page USING (target_id)
+                  WHERE member.run_id = '{run}'
+                    AND member.status IN ('pending', 'retry')
+                    AND page.state IN ('queued', 'retry')
+                    AND (page.retry_after IS NULL OR page.retry_after <= clock_timestamp())
+                    AND (page.next_fetch_at IS NULL OR page.next_fetch_at <= clock_timestamp())
+                )
                 SELECT target.target_id, target.logical_refresh_id,
                        frontier.canonical_url, frontier.page_kind,
                        frontier.source_ids, frontier.lease_epoch
@@ -9781,7 +9949,10 @@ class ControlStore:
                   ON claim_candidate.target_id = target.target_id
                 LEFT JOIN scope_rollup AS scope
                   ON scope.target_id = frontier.target_id
-                WHERE target.run_id = %s AND run.status = 'running'
+                JOIN claim_order ON claim_order.target_id = target.target_id
+                WHERE ({frozen_acceptance} OR NOT claim_order.enrichment OR claim_order.kind_ordinal <= {normalized_limit // 4}
+                  OR NOT EXISTS (SELECT 1 FROM claim_order urgent WHERE NOT urgent.enrichment))
+                  AND target.run_id = %s AND run.status = 'running'
                   AND target.status IN ('pending', 'retry')
                   AND frontier.state IN ('queued', 'retry')
                   AND (%s::text[] IS NULL
@@ -9804,11 +9975,18 @@ class ControlStore:
                       )
                     )
                   )
+                  AND (frontier.page_kind <> 'squad' OR frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)')
                   AND (frontier.next_fetch_at IS NULL
                        OR frontier.next_fetch_at <= clock_timestamp())
                   AND (frontier.retry_after IS NULL
                        OR frontier.retry_after <= clock_timestamp())
-                ORDER BY frontier.priority DESC, target.ordinal
+                ORDER BY CASE
+                    WHEN frontier.refresh_policy = 'historical_once' THEN 0
+                    WHEN frontier.page_kind IN ('match', 'schedule') THEN 0
+                    WHEN frontier.page_kind IN ('season', 'season_stats', 'squad') THEN 2
+                    ELSE 1 END,
+                    CASE WHEN frontier.refresh_policy = 'historical_once' THEN frontier.priority ELSE 0 END DESC,
+                    target.ordinal
                 LIMIT %s
                 FOR UPDATE OF frontier SKIP LOCKED
                 """,

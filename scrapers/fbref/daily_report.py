@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from urllib.parse import urlparse
 from scrapers.fbref.report_observations import played_score
+from scrapers.fbref.policy import CURRENT_ENRICHMENT, PUBLICATION_FRESHNESS_PAGE_KINDS
 
 REPORT_VERSION = "fbref-daily-v1"
 EXCLUDED_IDS = {"Big5", "850", "851", "852", "853"}
@@ -156,6 +157,81 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
     return dict(counts), problems
 
 
+def page_age_metrics(snapshot: Mapping, as_of: datetime) -> dict:
+    adults, pairs, _ = _scope(snapshot)
+    active = {cid for cid,c in adults.items() if c.get("crawl_state") == "active"
+              and c.get("present") and c.get("lifecycle_state") in {"present", "missing_once"}}
+    buckets = {kind: [] for kind in PUBLICATION_FRESHNESS_PAGE_KINDS}
+    excluded = Counter(snapshot.get("page_age_exclusions") or {})
+    seen = set()
+    standings = {(r["target_id"], r["content_hash"]) for r in snapshot.get("standings_inventory", [])}
+    standings_confirmed = 0
+    for row in snapshot.get("page_ages", []):
+        if row["target_id"] in seen:
+            continue
+        seen.add(row["target_id"])
+        kind = row["page_kind"]
+        buckets.setdefault(kind, [])
+        reason = None
+        if row.get("state") in {"quarantined", "dead", "skipped"}:
+            reason = row["state"]
+        elif row.get("refresh_policy") == "historical_once":
+            reason = "history"
+        elif kind == "squad" and any(part in {"matchlogs", "goallogs", "history", "wages"}
+                for part in urlparse(row["canonical_url"]).path.split("/")[4:]):
+            reason = "non_roster"
+        elif kind != "competition_index" and (not row.get("current_ownership") or not any(
+            str(scope["competition_id"]) in active and
+            (kind == "competition" or (str(scope["competition_id"]), str(scope["season_id"])) in pairs)
+            for scope in row.get("scopes", [])
+        )):
+            reason = "outside_current_adult_scope"
+        if reason:
+            excluded[reason] += 1
+            continue
+        if (kind == "season" and row.get("processed") and
+                (row["target_id"], row.get("last_content_hash")) in standings):
+            standings_confirmed += 1
+        fetched = instant(row.get("last_fetched_at"))
+        buckets[kind].append(None if fetched is None else (as_of-fetched).total_seconds()/3600)
+    def metrics(values, hours):
+        ages = [v for v in values if v is not None and v >= 0]
+        fresh = sum(0 <= v < hours for v in ages)
+        return {"total": len(values), "sla_hours": hours, "fresh": fresh,
+                "fresh_percent": 100*fresh/len(values) if values else None,
+                "never": values.count(None), "aged": sum(v >= hours for v in ages),
+                "median_hours": median(ages) if ages else None,
+                "p95_hours": percentile95(ages), "max_hours": max(ages) if ages else None}
+    by_kind = {kind: metrics(values, 672 if kind == "squad" else
+                           24 if kind in {"match", "schedule", "competition_index"} else
+                           720 if kind in {"player", "matchlog"} else 168)
+               for kind, values in sorted(buckets.items())}
+    total = sum(by_kind[k]["total"] for k in CURRENT_ENRICHMENT)
+    fresh = sum(by_kind[k]["fresh"] for k in CURRENT_ENRICHMENT)
+    return {"by_kind": by_kind, "total": total, "fresh": fresh,
+            "fresh_percent": 100*fresh/total if total else None, "excluded": dict(excluded),
+            "standings_confirmed_seasons": standings_confirmed,
+            "errors": list(snapshot.get("page_age_errors", []))}
+
+
+def page_age_line(report: Mapping) -> str:
+    chunks = []
+    for kind, row in report["page_ages"]["by_kind"].items():
+        pct = f"{row['fresh_percent']:.1f}%" if row["fresh_percent"] is not None else "н/д"
+        ages = "/".join(f"{row[k]:.1f}" if row[k] is not None else "н/д"
+                        for k in ("median_hours", "p95_hours", "max_hours"))
+        chunks.append(f"{kind}: N={row['total']}, fresh{row['sla_hours']//24}={row['fresh']} ({pct}), "
+                      f"never={row['never']}, aged={row['aged']}, median/p95/max={ages} ч")
+    overall = report["page_ages"]
+    pct = f"{overall['fresh_percent']:.1f}%" if overall["fresh_percent"] is not None else "н/д"
+    chunks.append(f"season/season_stats/squad: {overall['fresh']}/{overall['total']} ({pct})")
+    chunks.append(f"season results*_overall={overall['standings_confirmed_seasons']}")
+    chunks.append("исключения=" + str(overall["excluded"]))
+    if overall["errors"]:
+        chunks.append("н/д: ошибки измерения=" + str(overall["errors"]))
+    return "Возраст по видам страниц: " + "; ".join(chunks)
+
+
 def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
                        mapping: Mapping) -> dict:
     as_of = instant(as_of)
@@ -265,6 +341,7 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
                        "basis": "observed completed link minus explicit kickoff + 2h; upper-bound estimate"},
         "match_to_first_fetch": _stats(fetch_lags), "match_to_bronze": _stats(bronze_lags),
         "competitions": by_competition, "matches": sorted(entries, key=lambda r: (r["competition_id"], r["match_id"] or "")),
+        "page_ages": page_age_metrics(snapshot, as_of),
         "violators": [r for r in entries if r["status"] == "late"],
     }
 
@@ -302,7 +379,7 @@ def render_markdown(report: Mapping) -> str:
     def hours(value):
         return f"{value:.3f} ч" if value is not None else "н/д"
     lag = report["source_lag"]
-    output = [f"# FBref — {report['date']}", "", summary_line(report), "",
+    output = [f"# FBref — {report['date']}", "", summary_line(report), "", page_age_line(report), "",
               f"Срез: {instant(report['as_of']).astimezone(ZoneInfo('Europe/Moscow')).isoformat()} МСК.", "",
               f"Задержка FBref: медиана {hours(lag['median_hours'])}, 95-й процентиль {hours(lag['p95_hours'])}; "
               f"выборка {lag['samples']}, неизвестно {lag['unknown']}.",

@@ -200,7 +200,7 @@ FBREF_CURRENT_SCOPE_FRESHNESS_HOURS = {
     "season": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
     "season_stats": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
     "standings": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
-    "squad": FBREF_SEASON_STATS_SQUAD_FRESHNESS_HOURS,
+    "squad": 28 * 24,
     "player": FBREF_PLAYER_MATCHLOG_FRESHNESS_HOURS,
     "matchlog": FBREF_PLAYER_MATCHLOG_FRESHNESS_HOURS,
 }
@@ -1095,7 +1095,7 @@ def validate_fbref_current_scope_freshness(
                     f"{kind}:sla_seconds={reported_seconds}>"
                     f"{expected_seconds}"
                 )
-            if total == 0:
+            if total == 0 and kind != "squad":
                 violations.append(f"{kind}:total_targets=0")
             aged, stale_never, exact_split = _freshness_stale_split(raw_metrics)
             if stale and not exact_split:

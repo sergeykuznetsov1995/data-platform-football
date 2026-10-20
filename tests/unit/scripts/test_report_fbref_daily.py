@@ -48,3 +48,18 @@ def test_host_adapter_has_no_side_effects_until_called_and_surfaces_failure(tmp_
     output = adapter.fbref_daily_report()
     assert "приёмка не подтверждена" in output[0]
     assert "credentials" not in output[0]
+
+
+def test_1325_adapter_accepts_four_lines_and_rejects_old_payload(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("fbref_adapter_1325", ROOT / "deploy/fbref/morning_report_adapter.py")
+    adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adapter)
+    monkeypatch.setenv("FBREF_DAILY_REPORT_ROOT", str(tmp_path))
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts/report_fbref_daily.py").touch()
+    lines = ["FBref: матчей 1", "Последний окончательный: н/д", "Серия ≥99 %: 0 суток.",
+             "Возраст по видам страниц: squad: N=0, н/д"]
+    monkeypatch.setattr(adapter.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="\n".join(lines)))
+    assert adapter.fbref_daily_report() == ["• " + line for line in lines]
+    lines.pop()
+    assert "недоступен" in adapter.fbref_daily_report()[0]

@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scrapers.fbref.daily_report import (  # noqa: E402
-    build_daily_report, instant, milestone_streak, render_markdown, summary_line,
+    build_daily_report, page_age_line, instant, milestone_streak, render_markdown, summary_line,
 )
 from scrapers.fbref.daily_report_reader import collect_snapshot  # noqa: E402
 
@@ -35,6 +35,7 @@ def host_trino(query: str):
     rows = list(csv.reader(io.StringIO(result.stdout)))
     # The established host wrapper emits CSV without a header.
     columns = {
+        "fbref_table_inventory": ["target_id", "content_hash"],
         "fbref_schedule": ["source_competition_id", "source_season_id", "date", "time", "home", "away", "score", "notes", "match_url"],
         "fotmob_ingest_manifest": ["competition_id", "season_key", "fetched_at"],
         "fotmob_matches_current": ["competition_id", "season_key", "match_id", "utc_time", "timezone", "finished", "cancelled", "postponed", "awarded"],
@@ -89,6 +90,7 @@ def main(argv=None) -> int:
     print(summary_line(current))
     print("Последний окончательный: " + summary_line(final) if final else "Окончательных срезов пока нет.")
     print(f"Серия ≥99 %: {bundle['milestone_streak']} суток.")
+    print(page_age_line(current))
     return 2 if args.require_final and not current["final"] else 0
 
 

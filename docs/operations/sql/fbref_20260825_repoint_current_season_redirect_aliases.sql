@@ -13,7 +13,7 @@
 --   1. Deploy the code.
 --   2. Run this read-only probe in the deployed scheduler; it must print the
 --      mapping version and cohort-policy SHA256 shown here:
---      docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import SEASON_INSTALL_REDIRECT_VERSION as v, _canonical_season_install_url as f; h=hashlib.sha256(inspect.getsource(ControlStore.create_due_run_cohort).encode()).hexdigest(); assert v == 'fbref-season-install-redirects-20260825-v1'; assert h == '0dda965971f898747a7233de3ad349aaa723fe9be9324e92d2c1d890c8832395'; assert f('33','2026-2027','https://fbref.com/en/comps/33/2-Bundesliga-Stats') == 'https://fbref.com/en/comps/33/2'; assert f('59','2026-2027','https://fbref.com/en/comps/59/3-Liga-Stats') == 'https://fbref.com/en/comps/59/3'; print(v,h)"
+--      docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import SEASON_INSTALL_REDIRECT_VERSION as v, _canonical_season_install_url as f; h=hashlib.sha256(inspect.getsource(ControlStore.create_due_run_cohort).encode()).hexdigest(); assert v == 'fbref-season-install-redirects-20260825-v1'; assert h == '45559057c0a5c1ef48f77a840e099265be3a7187dcbb1c245824e071a434291a'; assert f('33','2026-2027','https://fbref.com/en/comps/33/2-Bundesliga-Stats') == 'https://fbref.com/en/comps/33/2'; assert f('59','2026-2027','https://fbref.com/en/comps/59/3-Liga-Stats') == 'https://fbref.com/en/comps/59/3'; print(v,h)"
 --   3. Apply this SQL while the active-run guard is clear. Its executable
 --      preflight must prove that the production cohort policy would choose
 --      comp59 then comp33 as prospective ordinals 0 and 1.
@@ -234,8 +234,9 @@ BEGIN
 END
 $recovery_zero_guard$;
 
--- Exact mirror of ControlStore.create_due_run_cohort for the current DAG's
--- fixed page-kind and refresh-policy sets. The deployed-method SHA256 probe
+-- Admission mirror of ControlStore.create_due_run_cohort for the current DAG's
+-- fixed page-kind and refresh-policy sets and shard 25 (quota 6). LIMIT 2
+-- inspects only the prefix; it does not reduce the production shard quota. The deployed-method SHA256 probe
 -- above prevents applying this mirror beside a different production policy.
 -- No same-run membership exists before a fresh canary; the active-run guard
 -- makes the production outstanding-run exclusion empty, but it remains here
@@ -245,6 +246,22 @@ DECLARE
     candidate record;
     prospective_target_ids text[] := ARRAY[]::text[];
 BEGIN
+    -- Production normalizes policy/priority before admission. This read-only
+    -- probe refuses unnormalized candidates instead of predicting from stale
+    -- priorities. Due timestamps are preserved by normalization.
+    IF EXISTS (
+        SELECT 1 FROM fbref_control.page_frontier frontier
+        WHERE frontier.page_kind IN ('season', 'season_stats', 'squad')
+          AND frontier.refresh_policy <> 'historical_once'
+          AND frontier.state IN ('queued', 'retry', 'fetched')
+          AND (frontier.refresh_policy, frontier.priority) IS DISTINCT FROM (
+              CASE WHEN frontier.page_kind = 'squad' THEN 'monthly' ELSE 'weekly' END,
+              CASE frontier.page_kind WHEN 'season' THEN 60 WHEN 'season_stats' THEN 55 ELSE 50 END
+          )
+    ) THEN
+        RAISE EXCEPTION 'FBref redirect remediation refused: enrichment normalization required';
+    END IF;
+
     FOR candidate IN
         WITH declared_scope AS (
             SELECT frontier.target_id, frontier.source,
@@ -348,7 +365,7 @@ BEGIN
                 ('schedule', 86400),
                 ('season', 604800),
                 ('season_stats', 604800),
-                ('squad', 604800),
+                ('squad', 2419200),
                 ('standings', 604800)
         ),
         eligible AS MATERIALIZED (
@@ -362,10 +379,13 @@ BEGIN
                        frontier.created_at
                    ) AS due_at,
                    CASE
+                       WHEN frontier.page_kind IN ('season', 'season_stats', 'squad')
+                        AND frontier.refresh_policy <> 'historical_once'
+                         THEN 5
                        WHEN frontier.page_kind = 'competition_index'
                          THEN 0
                        WHEN frontier.page_kind = ANY (ARRAY[
-                                'competition', 'season', 'schedule'
+                                'competition', 'schedule'
                             ]::text[])
                         AND frontier.refresh_policy <> 'historical_once'
                         AND COALESCE(
@@ -381,7 +401,7 @@ BEGIN
                         AND COALESCE(scope.has_current_season, false)
                          THEN 2
                        WHEN frontier.page_kind = ANY (ARRAY[
-                                'competition', 'season', 'schedule'
+                                'competition', 'schedule'
                             ]::text[])
                         AND frontier.refresh_policy <> 'historical_once'
                          THEN 3
@@ -391,7 +411,16 @@ BEGIN
                         AND frontier.refresh_policy <> 'historical_once'
                          THEN 4
                        ELSE 5
-                   END AS admission_tier
+                   END AS admission_tier,
+                   row_number() OVER (
+                       PARTITION BY (frontier.page_kind IN ('season', 'season_stats', 'squad')
+                           AND frontier.refresh_policy <> 'historical_once')
+                       ORDER BY frontier.priority DESC,
+                           COALESCE(frontier.retry_after, frontier.next_fetch_at,
+                               frontier.last_fetched_at, frontier.created_at), frontier.target_id
+                   ) AS kind_ordinal,
+                   (frontier.page_kind IN ('season', 'season_stats', 'squad')
+                       AND frontier.refresh_policy <> 'historical_once') AS enrichment
             FROM fbref_control.page_frontier AS frontier
             LEFT JOIN scope_rollup AS scope
               ON scope.target_id = frontier.target_id
@@ -413,6 +442,7 @@ BEGIN
                   frontier.retry_after IS NULL
                   OR frontier.retry_after <= clock_timestamp()
               )
+              AND (frontier.page_kind <> 'squad' OR frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)')
               AND frontier.page_kind = ANY (ARRAY[
                   'competition_index',
                   'competition',
@@ -466,7 +496,10 @@ BEGIN
         FROM eligible
         JOIN fbref_control.page_frontier AS frontier
           ON frontier.target_id = eligible.target_id
+        WHERE NOT eligible.enrichment OR eligible.kind_ordinal <= 6
+           OR NOT EXISTS (SELECT 1 FROM eligible urgent WHERE urgent.admission_tier < 5)
         ORDER BY eligible.admission_tier,
+                 CASE WHEN eligible.enrichment THEN frontier.priority ELSE 0 END DESC,
                  eligible.due_at,
                  frontier.priority DESC,
                  frontier.created_at,
