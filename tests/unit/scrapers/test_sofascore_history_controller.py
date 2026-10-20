@@ -265,7 +265,7 @@ def test_parked_core_scope_remains_debt_and_blocks_gate(tmp_path):
     ev = evidence(snap)
     failures = {"history-test:8:826": {"count": 3, "last_at": NOW.isoformat()}}
     planned = run(tmp_path, snap, ev, failures=failures)
-    assert not planned
+    assert [p["SOFASCORE_HISTORY_GROUP"] for p in planned] == ["2"]
     groups = controller.read_summary(tmp_path / "controller.json", "history-test")["groups"]
     assert groups["1"]["parked"] == 1 and not groups["1"]["gate_passed"]
 
@@ -293,6 +293,21 @@ def test_future_metadata_missing_core_cannot_vanish_from_99_denominator(tmp_path
     assert not planned
     report = controller.read_summary(tmp_path / "controller.json", "history-test")
     assert report["groups"]["1"]["unknown_scopes"] == 1
+
+
+def test_blocked_group1_without_ready_debt_yields_to_group2_not_deeper(tmp_path):
+    snap = snapshot(ids=(8,))
+    ev = evidence(snap, closed=100)
+    group_closed(ev, 26, 0)
+    group_closed(ev, 25, 0)
+    group_closed(ev, 24, 0)
+    failures = {"history-test:8:826": {"count": 3, "streak_no_traffic": 3, "last_release": "test"}}
+    planned = run(tmp_path, snap, ev, failures=failures)
+    assert [p["SOFASCORE_HISTORY_GROUP"] for p in planned] == ["2"]
+    finish(tmp_path)
+    group_closed(ev, 25, 100)
+    assert run(tmp_path, snap, ev, failures=failures, run_id="run2") == []
+    assert controller.read_summary(tmp_path / "controller.json", "history-test")["active_group"] == "1"
 
 
 def test_summary_reports_actual_match_fraction_not_completed_scopes(tmp_path):

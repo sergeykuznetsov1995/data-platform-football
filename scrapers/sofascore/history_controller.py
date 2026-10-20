@@ -222,7 +222,13 @@ def plan(snapshot: Mapping, *, inventory: Mapping, checkpoint_path: str | Path,
             groups[group]["unknown_scopes"] += missing_core
             if missing_core:
                 groups[group]["gate_passed"] = False
-        active = next((g for g in ("1", "2") if not groups[g]["gate_passed"]), None)
+        open_core = [g for g in ("1", "2") if not groups[g]["gate_passed"]]
+        # A core group blocked only by unplannable scopes must not starve the
+        # other one; deeper groups still wait for both gates.
+        active = next((g for g in open_core
+                       if any(s["group"] == g and s["kind"] == "ready"
+                              and (s["unknown"] or s["evidence"].get("closed", 0) < s["evidence"].get("finished", 0))
+                              for s in scopes)), open_core[0] if open_core else None)
         if active is None:
             active = next((g for g in ("july", "3", "4", "5")
                            if (groups[g]["remaining"] or groups[g]["unknown_scopes"])

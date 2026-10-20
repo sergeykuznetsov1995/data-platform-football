@@ -260,9 +260,7 @@ def summarize_day(journal: dict, saved_day: dict, result_dir: str | Path) -> dic
             active = checkpoint.get("active_group")
             if active not in {"1", "2", "july", "3", "4", "5"}:
                 raise ValueError("saved selected history group missing")
-            for earlier in ("1", "2"):
-                if earlier == active:
-                    break
+            for earlier in ("1", "2") if active not in {"1", "2"} else ():
                 group = checkpoint["groups"][earlier]
                 if (group["unknown_scopes"] != 0 or group["closed"] * 100 < group["finished"] * 99
                         or group.get("gate_passed") is not True):
