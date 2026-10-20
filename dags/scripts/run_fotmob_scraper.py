@@ -3097,9 +3097,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 "completion journal"
             )
     for bundle in late_bundles:
-        operations.append(service.sync_match_payloads(
+        late_operation = service.sync_match_payloads(
             bundle, phase="late", limit=args.match_limit or None,
-        ))
+        )
+        operations.append(late_operation)
+        if late_operation.metadata.get("deferred_reason") == "deadline":
+            add_automatic_deferral(
+                kind="deadline",
+                target_type="scope",
+                targets=[format_scope_token(
+                    bundle.scope.competition_id, bundle.scope.source_season_key,
+                )],
+                reason="run deadline deferred late matches",
+            )
 
     rc, payload = finish()
     replay_missing_inputs = (

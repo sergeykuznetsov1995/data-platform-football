@@ -2731,7 +2731,7 @@ class FotMobIngestService:
             return None
         # A raw response can survive a crash before publication. Recover only
         # an open threshold, including after the HTTP cutoff, with no request.
-        state = match_refresh(match, last, observed)
+        state = match_refresh(match, last, observed, allow_after_cutoff=True)
         if state.kind not in {"primary", "late"}:
             return None
         latest = self.repository.latest_entity_attempt("match", match["match_id"])
@@ -2828,11 +2828,19 @@ class FotMobIngestService:
                 elif self.mode == RunMode.REPLAY:
                     fetch = self._fetch("matchDetails", {"matchId": key}, replay=True)
                 else:
+                    if not force_refresh:
+                        kind = self.match_refresh_state(match, utc_now()).kind
+                        if kind not in {"primary", "late"}:
+                            result.skipped += 1
+                            continue
                     fetch = self._fetch_match(key, late=kind == "late", single_attempt=force_refresh)
             except BudgetExceeded as exc:
                 result.metadata["deferred_reason"] = str(exc)
                 break
             except Exception as exc:
+                if str(exc) == "FotMob ingestion deadline reached":
+                    result.metadata["deferred_reason"] = "deadline"
+                    continue
                 result.record_exception(f"match {key}: {exc}", exc)
                 continue
             if getattr(self, "_match_budget_error", None):

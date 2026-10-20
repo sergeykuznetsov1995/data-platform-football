@@ -375,7 +375,10 @@ def _plan_seasons(
             # Replay is bounded to known raw identities, not a network backfill.
             continue
 
-        attempt = attempts.get(identity) if identity not in refresh else None
+        attempt = attempts.get(identity)
+        # Reopen completed match obligations without cancelling error backoff.
+        if identity in refresh and attempt is not None and attempt.outcome in {"success", "source_gap"}:
+            attempt = None
         if attempt is not None:
             if attempt.outcome == "success" and lane != ScopeLane.CURRENT:
                 continue

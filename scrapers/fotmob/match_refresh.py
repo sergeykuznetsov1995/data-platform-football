@@ -40,11 +40,13 @@ class MatchRefresh:
 
 def match_refresh(
     match: Mapping[str, Any], last_observed: Optional[datetime], now: datetime,
+    *, allow_after_cutoff: bool = False,
 ) -> MatchRefresh:
     """Two successful observations after T+6/T+48, with HTTP stopped at T+72.
 
     A delayed first observation can satisfy both thresholds. Failed attempts
     never close an obligation; no attempt counters or separate checkpoints.
+    Recovery of a received response may close an obligation after the cutoff.
     """
     if (
         not match.get("finished") or match.get("cancelled")
@@ -61,6 +63,6 @@ def match_refresh(
         (end + delay for delay in LATE_MATCH_THRESHOLDS if last_observed < end + delay),
         None,
     )
-    if threshold is None or now >= end + LATE_MATCH_CUTOFF:
+    if threshold is None or (not allow_after_cutoff and now >= end + LATE_MATCH_CUTOFF):
         return MatchRefresh("done")
     return MatchRefresh("late" if now >= threshold else "wait", threshold)

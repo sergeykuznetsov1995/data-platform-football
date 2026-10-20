@@ -432,3 +432,144 @@ def test_late_match_runner_recovers_before_discovery_deadline_and_budget(tmp_pat
     assert not session.calls
     assert repository.tables["fotmob_match_payloads"][0]["match_facts_json"]["infoBox"]["Attendance"] == 14757
     assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == T + timedelta(hours=48)
+
+
+def test_late_match_recovers_response_received_after_http_cutoff(tmp_path, monkeypatch):
+    raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())
+    transport, session = _transport(
+        [FakeResponse(200, json.dumps(GOOD).encode())], raw_store=raw_store, max_attempts=1,
+    )
+    from scrapers.fotmob.repository import MemoryFotMobRepository
+    repository = MemoryFotMobRepository()
+    seed(repository, observed=T + timedelta(hours=6))
+    service = FotMobIngestService(transport=transport, repository=repository)
+    service.ledger.requests = 90
+    clock = [T + timedelta(hours=72) - timedelta(seconds=1)]
+    received_at = T + timedelta(hours=72, seconds=1)
+    monkeypatch.setattr(service_module, "utc_now", lambda: clock[0])
+    original_store = raw_store.store
+
+    def received(*args, **kwargs):
+        clock[0] = received_at
+        kwargs["fetched_at"] = kwargs["validated_at"] = received_at.isoformat()
+        return original_store(*args, **kwargs)
+
+    monkeypatch.setattr(raw_store, "store", received)
+
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("interrupted before publication")
+
+    monkeypatch.setattr(service, "_commit_for_fetch", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted before publication"):
+        service.sync_match_payloads(bundle())
+    assert len(session.calls) == 1
+    restarted = FotMobIngestService(transport=transport, repository=repository)
+    restarted.deadline_at = T
+    clock[0] = T + timedelta(hours=100)
+    result = restarted.sync_match_payloads(bundle())
+    assert result.ok and result.succeeded == 1
+    assert len(session.calls) == 1
+    assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == received_at
+    assert repository.tables["fotmob_match_payloads"][0]["match_facts_json"]["infoBox"]["Attendance"] == 14757
+
+
+def test_late_match_rechecks_cutoff_before_each_http(monkeypatch):
+    other = canonicalize_target("matchDetails", {"matchId": "101"})
+    season_bundle = bundle()
+    season_bundle = replace(season_bundle, matches=(
+        *season_bundle.matches, {**season_bundle.matches[0], "match_id": 101},
+    ))
+    service, transport, repository = _service({
+        TARGET.canonical_url: GOOD,
+        other.canonical_url: {**GOOD, "general": {"matchId": 101}},
+    })
+    seed(repository)
+    repository.record(replace(repository.commits[-1], target_key=other.target_key, entity_id="101"))
+    service.ledger.requests = 90
+    clock = [T + timedelta(hours=72) - timedelta(seconds=1)]
+    monkeypatch.setattr(service_module, "utc_now", lambda: clock[0])
+    original = transport.fetch_json
+
+    def received(*args, **kwargs):
+        fetch = original(*args, **kwargs)
+        clock[0] += timedelta(seconds=2)
+        return replace(fetch, fetched_at=clock[0].isoformat())
+
+    monkeypatch.setattr(transport, "fetch_json", received)
+    result = service.sync_match_payloads(season_bundle)
+    assert result.ok and result.succeeded == 1 and result.skipped == 1
+    assert transport.calls == [(TARGET.canonical_url, False)]
+    assert source_observed_at(repository.latest_match_source(other.target_key)) == T
+
+
+def test_late_match_deadline_defers_http_and_still_recovers_raw(tmp_path, monkeypatch):
+    other = canonicalize_target("matchDetails", {"matchId": "101"})
+    season_bundle = bundle()
+    season_bundle = replace(season_bundle, matches=(
+        *season_bundle.matches, {**season_bundle.matches[0], "match_id": 101},
+    ))
+    raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())
+    now = T + timedelta(hours=48)
+    raw_store.store(
+        other, json.dumps({**GOOD, "general": {"matchId": 101}}).encode(),
+        fetched_at=now.isoformat(),
+    )
+    transport, session = _transport([], raw_store=raw_store, max_attempts=1)
+    from scrapers.fotmob.repository import MemoryFotMobRepository
+    repository = MemoryFotMobRepository()
+    seed(repository)
+    repository.record(replace(repository.commits[-1], target_key=other.target_key, entity_id="101"))
+    service = FotMobIngestService(transport=transport, repository=repository)
+    service.deadline_at = now
+    monkeypatch.setattr(service_module, "utc_now", lambda: now)
+    result = service.sync_match_payloads(season_bundle, phase="late")
+    assert result.ok and result.succeeded == 1
+    assert result.metadata["deferred_reason"] == "deadline"
+    assert not session.calls
+    assert source_observed_at(repository.latest_match_source(TARGET.target_key)) == T
+    assert source_observed_at(repository.latest_match_source(other.target_key)) == now
+
+
+def test_late_match_runner_deadline_is_soft_deferral(monkeypatch):
+    import importlib
+    from tests.unit.scrapers.test_run_fotmob_scraper import _run_native_admitted
+    runner = importlib.import_module("dags.scripts.run_fotmob_scraper")
+    now = T + timedelta(hours=48)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=tz) if tz else now
+
+    monkeypatch.setattr(runner, "datetime", Clock)
+    monkeypatch.setattr(service_module, "utc_now", lambda: now)
+    service, transport, repository = _service({
+        canonicalize_target("allLeagues").canonical_url: {
+            "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}],
+        },
+        canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        TARGET.canonical_url: GOOD,
+    })
+    seed(repository)
+    service.ledger.requests = 90
+    original = service.sync_match_payloads
+
+    def expire_after_primary(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if kwargs.get("phase") == "primary":
+            service.deadline_at = now
+        return result
+
+    monkeypatch.setattr(service, "sync_match_payloads", expire_after_primary)
+    args = runner._argument_parser().parse_args([
+        "--mode", "refresh", "--catalog-contract", "fotmob-catalog-v1",
+        "--entities", "season,matches",
+    ])
+    rc, report = _run_native_admitted(runner, args, service=service)
+    assert rc == 0, report["errors"]
+    assert report["status"] == "partial_success" and not report["complete"]
+    assert report["selection"]["deferrals"] == [{
+        "kind": "deadline", "target_type": "scope", "targets": ["47=2025/2026"],
+        "reason": "run deadline deferred late matches",
+    }]
+    assert not any("matchDetails" in url for url, _ in transport.calls)
