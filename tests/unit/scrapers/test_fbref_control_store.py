@@ -2675,7 +2675,8 @@ def test_1325_normalization_preserves_fences_and_backoff():
     assert "run.status IN ('pending', 'running')" in sql
     assignment = sql[sql.index("SET refresh_policy"):sql.index("FROM desired")]
     assert "retry_after" not in assignment and "state =" not in assignment
-    assert "frontier.last_fetched_at + desired.hours" in assignment
+    assert "next_fetch_at" not in assignment
+    assert "frontier.next_fetch_at) IS DISTINCT FROM" not in sql
     assert "has_current_ownership" in sql and "canonical_scope" in sql
     assert "'monthly', 50, 664" in sql and "'weekly', 60, 160" in sql
 
@@ -2703,3 +2704,34 @@ def test_1325_due_and_claim_cap_old_cohorts_and_small_budget(limit, cap):
     assert "WHEN frontier.page_kind IN ('match', 'schedule') THEN 0" in seen["sql"]
     assert "THEN 2 ELSE 1 END," in seen["sql"]
     assert "THEN frontier.priority ELSE 0 END DESC, target.ordinal" in seen["sql"]
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_1325_explicit_acceptance_keeps_all_seven_enrichment_members(frozen):
+    run_id = str(uuid.uuid4())
+    seen = {}
+    target_ids = ["season", *[f"stats-{i}" for i in range(5)], "squad"]
+    metadata = {
+        "acceptance_profile": True,
+        "execution_mode": "acceptance_nonpublishing",
+        "acceptance_cohort": {"target_ids": target_ids} if frozen else {},
+    }
+    probe = _claim_sql_probe(run_id, seen)
+
+    def handler(sql, params):
+        if "SELECT status, metadata FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running", "metadata": metadata}], 1
+        if "SET status = 'skipped'" in sql:
+            # An external urgent match must not remove frozen members.
+            assert "AND NOT %s" in sql
+            assert params == (run_id, frozen)
+            seen["handback"] = True
+            return [], 0
+        return probe(sql, params)
+
+    store = ControlStore("postgresql://unused/test", connection_factory=FakeFactory(handler))
+    store.claim_targets(run_id, "acceptance", limit=25)
+    assert seen["handback"]
+    # Seven enrichment members must pass even alongside the mandatory spine.
+    assert f"WHERE ({frozen} OR NOT claim_order.enrichment" in seen["sql"]
+    assert "claim_order.kind_ordinal <= 6" in seen["sql"]

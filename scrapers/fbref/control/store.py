@@ -6708,9 +6708,8 @@ class ControlStore:
                       AND member.status IN ('pending', 'leased', 'retry')
                       AND run.status IN ('pending', 'running')
                   )
-                  AND (frontier.refresh_policy, frontier.priority, frontier.next_fetch_at)
-                    IS DISTINCT FROM (desired.policy, desired.priority,
-                      frontier.last_fetched_at + desired.hours * interval '1 hour')
+                  AND (frontier.refresh_policy, frontier.priority)
+                    IS DISTINCT FROM (desired.policy, desired.priority)
         """
         with self._transaction() as cursor:
             cursor.execute(
@@ -6729,8 +6728,6 @@ class ControlStore:
                 scope_sql + """
                 UPDATE fbref_control.page_frontier AS frontier
                 SET refresh_policy = desired.policy, priority = desired.priority,
-                    next_fetch_at = frontier.last_fetched_at
-                        + desired.hours * interval '1 hour',
                     updated_at = clock_timestamp()
                 FROM desired, scope_rollup AS scope
                 """ + predicate + " AND frontier.target_id = ANY(%s::text[])",
@@ -9865,6 +9862,13 @@ class ControlStore:
                 run_ids=(run,),
                 run_rows_locked=True,
             )
+            # Explicit acceptance must fetch its whole frozen cohort in one
+            # wave, independently of work outside that bounded experiment.
+            frozen_acceptance = (
+                run_metadata.get("acceptance_profile") is True
+                and run_metadata.get("execution_mode") == "acceptance_nonpublishing"
+                and bool(run_metadata.get("acceptance_cohort"))
+            )
             # A resumed enrichment cohort cannot hide newly due match/schedule
             # work outside it. Hand back unleased enrichment before admission;
             # retry/backoff and the frontier identity remain untouched.
@@ -9882,6 +9886,7 @@ class ControlStore:
                 SET status = 'skipped', updated_at = clock_timestamp()
                 FROM fbref_control.page_frontier AS page
                 WHERE target.run_id = %s AND target.target_id = page.target_id
+                  AND NOT %s
                   AND target.status IN ('pending', 'retry')
                   AND page.state IN ('queued', 'retry')
                   AND page.page_kind IN ('season', 'season_stats', 'squad')
@@ -9903,7 +9908,7 @@ class ControlStore:
                           AND owner.status IN ('pending', 'running')
                       )
                   )
-                """, (run,),
+                """, (run, frozen_acceptance),
             )
             cursor.execute(
                 _frontier_scope_cte_for_candidates(
@@ -9943,7 +9948,7 @@ class ControlStore:
                 LEFT JOIN scope_rollup AS scope
                   ON scope.target_id = frontier.target_id
                 JOIN claim_order ON claim_order.target_id = target.target_id
-                WHERE (NOT claim_order.enrichment OR claim_order.kind_ordinal <= {normalized_limit // 4}
+                WHERE ({frozen_acceptance} OR NOT claim_order.enrichment OR claim_order.kind_ordinal <= {normalized_limit // 4}
                   OR NOT EXISTS (SELECT 1 FROM claim_order urgent WHERE NOT urgent.enrichment))
                   AND target.run_id = %s AND run.status = 'running'
                   AND target.status IN ('pending', 'retry')

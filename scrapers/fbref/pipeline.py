@@ -803,6 +803,7 @@ _DISCOVERY_EDGE_BATCH_LIMIT = 5000
 class WaveResult:
     cohort_size: int = 0
     claimed: int = 0
+    enrichment_handed_back: int = 0
     fetched: int = 0
     recovered_from_raw: int = 0
     parsed: int = 0
@@ -3487,9 +3488,10 @@ class FBrefPipeline:
             # A newly due match/schedule can preempt enrichment between the
             # admission and claim transactions. Only confirmed hand-backs
             # excuse missing claims; lost/blocked leases still fail closed.
-            result.cohort_size -= self.control.count_skipped_enrichment(
+            result.enrichment_handed_back = self.control.count_skipped_enrichment(
                 run_id, [item.target_id for item in cohort]
             )
+            result.cohort_size -= result.enrichment_handed_back
         if len(leases) != result.cohort_size:
             raise FetchWaveError(
                 f"Claimed {len(leases)} of {result.cohort_size} cohort targets"
@@ -4626,7 +4628,11 @@ class FBrefPipeline:
 
                     if fetched.budget_exhausted:
                         break
-                    if fetched.claimed == 0 and parsed.cohort_size == 0:
+                    if (
+                        fetched.claimed == 0
+                        and parsed.cohort_size == 0
+                        and fetched.enrichment_handed_back == 0
+                    ):
                         aggregate.frontier_closed = True
                         break
                 if (

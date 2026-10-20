@@ -15117,3 +15117,35 @@ def test_1325_new_urgent_between_admission_and_claim_defers_cleanly(tmp_path):
     result = pipeline.fetch_wave("run", worker_id="worker", page_kinds=["season"], settings=settings)
     assert result.claimed == result.cohort_size == 0
     assert result.failures == []
+
+
+def test_1325_live_cycle_continues_after_enrichment_handback(tmp_path):
+    from scrapers.fbref.control import CohortTarget
+    control = FakeControl()
+    control.claim_targets = lambda *a, **k: []
+    control.get_run_target_counts = lambda *a: {}
+    control.create_due_run_cohort = lambda *a, **k: [CohortTarget("season", str(uuid.uuid4()), 0)]
+    control.count_skipped_enrichment = lambda run, ids: int(ids == ["season"])
+    pipeline = FBrefPipeline(control, _raw_store(tmp_path), generic_writer=FakeWriter())
+    pipeline._remaining_wave_limit = lambda *a, **k: 25
+    original_fetch = pipeline.fetch_wave
+    calls = []
+
+    def fetch(*args, **kwargs):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return original_fetch(*args, **kwargs)
+        if len(calls) == 2:
+            # The next admission now sees and fetches the newly urgent match.
+            return WaveResult(cohort_size=1, claimed=1, fetched=1)
+        return WaveResult()
+
+    pipeline.fetch_wave = fetch
+    pipeline.parse_wave = lambda *a, **k: WaveResult()
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()), worker_id="current", page_kinds=["season", "match"],
+        settings=_settings(), max_batches=3,
+    )
+    assert len(calls) == 3
+    assert result.fetch.fetched == 1
+    assert result.frontier_closed

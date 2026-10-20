@@ -354,7 +354,8 @@ def test_redirect_alias_remediation_requires_exact_prospective_ordinals() -> Non
 
     assert "prospective_target_ids := array_append" in guard
     assert (
-        "order by eligible.admission_tier, eligible.due_at, "
+        "order by eligible.admission_tier, "
+        "case when eligible.enrichment then frontier.priority else 0 end desc, eligible.due_at, "
         "frontier.priority desc, frontier.created_at, frontier.target_id"
     ) in guard
     assert "array[ 'fbref:season:59:2026-2027', 'fbref:season:33:2026-2027' ]" in guard
@@ -532,3 +533,15 @@ def test_redirect_alias_canary_gate_rejects_cross_identity_extra_attempts() -> N
     ):
         assert identity_count in actual
         assert f"a.{identity_count} = {expected}" in sql
+
+
+def test_1325_redirect_mirror_tracks_enrichment_admission():
+    sql = _normalized(REDIRECT_ALIASES_SQL)
+    assert "eligible.kind_ordinal <= 6" in sql
+    assert "urgent.admission_tier < 5" in sql
+    assert "case when eligible.enrichment then frontier.priority else 0 end desc" in sql
+    assert "when frontier.page_kind in ('season', 'season_stats', 'squad') and frontier.refresh_policy <> 'historical_once' then 5" in sql
+    assert "'competition', 'season', 'schedule'" not in sql
+    assert "('squad', 2419200)" in sql
+    assert "enrichment normalization required" in sql
+    assert "frontier.canonical_url !~ '/(matchlogs|goallogs|history|wages)(/|$)'" in sql
