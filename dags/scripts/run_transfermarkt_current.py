@@ -35,7 +35,7 @@ if str(ROOT / 'dags') not in sys.path:
 from dags.utils.transfermarkt_current_state import (
     CURRENT_POLICY_VERSION, CurrentWork, EditionCheck, ScopeCursor, SignalObservation,
     SignalState, build_check_merge, build_current_state_tables, build_measurement_kind_migration_sql,
-    build_signal_merge, build_signals_merge, build_check_fingerprint_migrations_sql,
+    build_signal_merge, build_signals_merge, build_player_signature_migration, build_check_fingerprint_migrations_sql,
     denominator_definition_hash, edition_measurement_fingerprint, current_scope_targets, daily_complete, mark_applied,
     mark_seen, mark_failed, plan_current_work, record_check,
 )
@@ -677,6 +677,8 @@ class _Scope:
         state = self.signals.get(f'player:{player_id}')
         if old.signature == old.legacy_signature or state is None or state.observation.signature != old.legacy_signature:
             return
+        if state.status == 'applied':
+            _sql(self.scraper, build_player_signature_migration(state, old.signature))
         self.signals[f'player:{player_id}'] = replace(
             state, observation=replace(state.observation, signature=old.signature),
             applied_signature=old.signature if state.applied_signature == old.legacy_signature else state.applied_signature)

@@ -1600,6 +1600,8 @@ def test_gateway_502_with_upstream_header_logs_the_class(monkeypatch, caplog):
         )
 
     assert outcome.status_code == 502
+    assert outcome.proxy_upstream_status == '407'
+    assert outcome.with_status(FetchStatus.RETRY_EXHAUSTED).proxy_upstream_status == '407'
     lines = [
         record.getMessage() for record in caplog.records
         if "attempt 1/1 failed" in record.getMessage()

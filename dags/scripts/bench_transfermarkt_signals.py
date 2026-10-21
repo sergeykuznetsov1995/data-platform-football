@@ -608,10 +608,11 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                 _write(state_path, state)
                 outcome = client.fetch(task["url"], as_json=task["json"], max_attempts=1,
                                        label=task["kind"], context={"cycle_id": portion_id, "scope_id": task["scope"]})
-                # The client normalizes gateway errors/timeouts (including
-                # TransportStatusError) to status 0; real HTTP responses keep
-                # their status, including 403/405/429 and source 5xx responses.
-                if not outcome.is_success and outcome.status_code in (None, 0):
+                # Transport-class failures (no response, gateway errors, any 5xx —
+                # gateway 502 often arrives without an upstream-class header) use the
+                # transport cap; site refusals (403/405/404/429) keep the endpoint cap.
+                if not outcome.is_success and (outcome.status_code in (None, 0)
+                        or outcome.status_code >= 500 or outcome.proxy_upstream_status):
                     state["endpoint_tries"][task["key"]] -= 1
                     state["transport_tries"][task["key"]] = state["transport_tries"].get(task["key"], 0) + 1
                 if not outcome.is_success or not outcome.raw_capture_id:

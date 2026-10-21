@@ -997,7 +997,29 @@ def test_unpriced_signature_equivalence_keeps_positive_values_and_dates_strict()
     assert replace(zero, market_value_date='2026-10-09').signature != zero.signature
 
 
-def test_legacy_zero_signature_migration_preserves_applied_proof_and_replays_old_fact(offline):
+@pytest.fixture
+def signal_ops(monkeypatch):
+    """Execute the runner's signal MERGEs, including their actual SQL guards."""
+    import duckdb
+    from dags.utils.transfermarkt_current_state import build_current_state_tables, SIGNALS_TABLE
+    connection = duckdb.connect(':memory:')
+    connection.execute("ATTACH ':memory:' AS iceberg")
+    connection.execute('CREATE SCHEMA iceberg.ops')
+    connection.execute(build_current_state_tables()[0].split(' WITH (')[0])
+    original_sql = current._sql
+
+    def execute(scraper, statement, *args, **kwargs):
+        if statement.startswith(f'MERGE INTO {SIGNALS_TABLE} '):
+            connection.execute(statement)
+        if scraper is not None:
+            return original_sql(scraper, statement, *args, **kwargs)
+
+    monkeypatch.setattr(current, '_sql', execute)
+    yield connection
+    connection.close()
+
+
+def test_legacy_zero_signature_migration_preserves_applied_proof_and_replays_old_fact(offline, signal_ops):
     offline.squad_values['10'] = '-'
     offline.player_values['110'] = 0
     offline.run('cold')
@@ -1009,6 +1031,9 @@ def test_legacy_zero_signature_migration_preserves_applied_proof_and_replays_old
     signal_state = data['signals']['player:110']
     signal_state['observation']['signature'] = old.legacy_signature
     signal_state.update(applied_signature=old.legacy_signature, result='legacy-proof')
+    signal_ops.execute("UPDATE iceberg.ops.transfermarkt_current_signals_v1 SET "
+        "observed_signature = ?, applied_signature = ?, result = 'legacy-proof' "
+        "WHERE entity = 'player' AND entity_id = '110'", [old.legacy_signature, old.legacy_signature])
     data.setdefault('player_roster_applied', {})['110'] = old.legacy_signature
     data['cursor']['players_checked_at'] = None
     offline.write_state(saved)
@@ -1029,8 +1054,47 @@ def test_legacy_zero_signature_migration_preserves_applied_proof_and_replays_old
     assert result['first_detected_at'] == signal_state['first_detected_at']
     assert result['status'] == 'applied'
     assert result['result'] == 'legacy-proof'
+    signal_ops.execute("SELECT * FROM iceberg.ops.transfermarkt_current_signals_v1 "
+                       "WHERE entity = 'player' AND entity_id = '110'")
+    ops = dict(zip([column[0] for column in signal_ops.description], signal_ops.fetchone()))
+    assert ops['observed_signature'] == old.signature
+    assert ops['applied_signature'] == old.signature
+    assert ops['last_checked_at'].isoformat() == result['observation']['checked_at'].removesuffix('+00:00')
+    assert ops['bronze_manifest'] == signal_state['bronze_manifest']
+    assert ops['committed_at'].isoformat() == signal_state['committed_at'].removesuffix('+00:00')
+    assert ops['first_detected_at'].isoformat() == signal_state['first_detected_at'].removesuffix('+00:00')
+    assert ops['status'] == 'applied' and ops['result'] == 'legacy-proof'
     assert offline.careers == []
     assert not any('/kader/' in url for _, url in offline.calls)
+
+
+@pytest.mark.parametrize('drift', ['signature', 'newer', 'proof', 'failed', 'version', 'missing'])
+def test_legacy_zero_ops_migration_cannot_overwrite_concurrent_state(offline, signal_ops, drift):
+    from dataclasses import replace
+    old = current.tmapi.parse_player_signals(packet(['110'], {'110': 0}), expected_ids=['110'])['110']
+    stamp = datetime(2026, 10, 9, 10, tzinfo=timezone.utc)
+    observation = current.SignalObservation('scope', 'player', '110', old.legacy_signature, stamp,
+        current.CURRENT_POLICY_VERSION, 'raw', stamp, current.tmapi.players_url(['110']), 'a' * 64)
+    before = current.SignalState(observation=observation, status='applied', result='old-proof',
+        bronze_manifest='old-bronze', committed_at=stamp, applied_signature=old.legacy_signature)
+    target = before
+    if drift == 'signature':
+        target = replace(before, observation=replace(observation, signature='b' * 64), applied_signature='b' * 64)
+    elif drift == 'newer':
+        target = replace(before, observation=replace(observation, checked_at=stamp + timedelta(seconds=1)))
+    elif drift == 'proof':
+        target = replace(before, bronze_manifest='new-bronze')
+    elif drift == 'failed':
+        target = replace(before, status='failed', result='unfinished')
+    elif drift == 'version':
+        target = replace(before, observation=replace(observation, signal_version='new-version'))
+    if drift != 'missing':
+        signal_ops.execute(current.build_signal_merge(target))
+    query = 'SELECT * FROM iceberg.ops.transfermarkt_current_signals_v1'
+    rows_before = signal_ops.execute(query).fetchall()
+    scope = SimpleNamespace(signals={'player:110': before}, data={}, scraper=None)
+    current._Scope._normalize_player_signature(scope, '110', old.as_dict())
+    assert signal_ops.execute(query).fetchall() == rows_before
 
 
 @pytest.mark.parametrize('status', ['pending', 'failed'])
