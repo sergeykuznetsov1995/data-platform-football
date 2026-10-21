@@ -713,6 +713,11 @@ def test_validate_refresh_scope_rejects_other_campaign_actions(
     [
         ({"refresh_season_schedules": "success", "run_refresh_scope": "success"}, []),
         (
+            {"refresh_season_schedules": "failed", "plan_refresh_batch": "success",
+             "run_refresh_scope": "success", "validate_refresh_scope": "success"},
+            ["refresh_season_schedules"],
+        ),
+        (
             {"refresh_season_schedules": "failed", "plan_refresh_batch": "upstream_failed"},
             ["plan_refresh_batch", "refresh_season_schedules"],
         ),
@@ -739,6 +744,14 @@ def test_propagate_refresh_status_is_the_single_honest_leaf(
         verdict = module._propagate_status(dag_run=dag_run)
         assert verdict["status"] == "success"
         assert verdict["partial"] == 0
+
+
+@pytest.mark.unit
+def test_failed_sweep_allows_planning_existing_bronze_after_fetch(clean_env, monkeypatch):
+    _load_dag_module(monkeypatch)
+    plan = _operators()["plan_refresh_batch"]
+    assert plan._init_kwargs["trigger_rule"] == "all_done"
+    assert plan.upstream_task_ids == {"refresh_season_schedules"}
 
 
 @pytest.mark.unit

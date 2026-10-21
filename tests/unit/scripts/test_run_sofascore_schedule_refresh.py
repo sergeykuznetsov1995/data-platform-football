@@ -10,9 +10,11 @@ import pytest
 from dags.scripts import run_sofascore_schedule_refresh as refresh
 from dags.utils.sofascore_dq import SofaScoreDQViolation
 from scrapers.sofascore.discovery import (
+    DiscoveryError,
     DiscoveryHTTPError,
     DiscoverySchemaError,
 )
+from scrapers.sofascore.lease_client import SofascoreLeaseRejected
 from scrapers.sofascore.schedule_refresh import (
     DailyEventsSchemaError,
     ScheduleSweepError,
@@ -465,6 +467,61 @@ def test_a_failed_run_leaves_the_cursor_where_it_was(offline, monkeypatch):
     assert report["errors"] == ["RuntimeError: gateway said 429"]
     assert report["discovery"]["requests"] == 4
     assert offline["calls"]["writes"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "case", ["clean", "interrupted", "empty", "uncertain", "other_code", "other_status", "text_only"]
+)
+def test_pending_close_only_warns_after_a_clean_nonempty_sweep(offline, monkeypatch, case):
+    class PendingClient(_FakeClient):
+        @property
+        def stats(self):
+            return {
+                "paid_proxy_bytes": 4096,
+                "accounting_status": "unresolved_close" if self.closed or case == "uncertain" else "verified",
+            }
+
+        def close(self):
+            self.closed = True
+            if case == "text_only":
+                raise DiscoveryError("HTTP 409 lease_close_pending")
+            try:
+                raise SofascoreLeaseRejected(
+                    "counters are not final",
+                    status_code=503 if case == "other_status" else 409,
+                    code="other" if case == "other_code" else "lease_close_pending",
+                )
+            except SofascoreLeaseRejected as exc:
+                raise DiscoveryError("lease did not close cleanly") from exc
+
+    monkeypatch.setattr(refresh, "LeaseBrowserSofaScoreClient", PendingClient)
+    if case == "interrupted":
+        # Stale rows reach Bronze before the seed calendar is interrupted.
+        offline["calls"]["known"] = {(7, 76953)}
+        offline["calls"]["fixtures_transport"] = {(23, 88001)}
+    elif case == "empty":
+        _mute_everything(monkeypatch)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == (0 if case == "clean" else 1)
+    report = json.loads(offline["output"].read_text())
+    if case == "empty":
+        assert report["rows_written"] == 0
+    else:
+        assert report["rows_written"] > 0
+    assert report["discovery"]["accounting_status"] == "unresolved_close"
+    assert report["discovery"]["paid_proxy_bytes"] == 4096
+    if case == "clean":
+        assert report["status"] == "success"
+        assert report["errors"] == []
+        assert report["accounting_status"] == "unresolved_close"
+        assert report["warnings"] == ["DiscoveryError: lease did not close cleanly"]
+    else:
+        assert report["status"] == "failed"
+        assert report["errors"]
+        assert not report.get("warnings")
+        if case == "interrupted":
+            assert "HTTP 503" in report["errors"][0]
 
 
 @pytest.mark.unit

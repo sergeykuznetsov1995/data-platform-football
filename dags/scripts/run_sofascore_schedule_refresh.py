@@ -50,8 +50,10 @@ from scrapers.sofascore.catalog import SofaScoreCatalog  # noqa: E402
 from scrapers.sofascore.discovery import (  # noqa: E402
     DISCOVERY_LEASE_MAX_BYTES,
     DISCOVERY_LEASE_TTL_SECONDS,
+    DiscoveryError,
     LeaseBrowserSofaScoreClient,
 )
+from scrapers.sofascore.lease_client import SofascoreLeaseRejected  # noqa: E402
 from dags.utils.sofascore_dq import SofaScoreDQViolation  # noqa: E402
 from dags.utils.sofascore_all_mens_state import (  # noqa: E402
     SeasonTarget,
@@ -1752,12 +1754,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if client is not None:
             # Close first: the bytes of the open lease are billed to
             # paid_proxy_bytes only when the lease closes.
+            accounting_verified = client.stats.get("accounting_status") == "verified"
             try:
                 client.close()
             except Exception as exc:
-                report["status"] = "failed"
-                report["errors"].append(f"{type(exc).__name__}: {exc}")
-                exit_code = 1
+                cause = exc.__cause__
+                if (
+                    report["status"] == "success"
+                    and report.get("rows_written", 0) > 0
+                    and accounting_verified
+                    and isinstance(exc, DiscoveryError)
+                    and isinstance(cause, SofascoreLeaseRejected)
+                    and cause.status_code == 409
+                    and cause.code == "lease_close_pending"
+                ):
+                    # The sweep finished; the client still charges the full
+                    # lease reservation when final accounting is unavailable.
+                    report["accounting_status"] = "unresolved_close"
+                    report.setdefault("warnings", []).append(f"{type(exc).__name__}: {exc}")
+                else:
+                    report["status"] = "failed"
+                    report["errors"].append(f"{type(exc).__name__}: {exc}")
+                    exit_code = 1
             report["discovery"] = dict(client.stats)
         # The CURSOR of the classes that DID finish is saved whatever happened
         # afterwards — a later class failing, or the lease failing to close.
