@@ -147,6 +147,92 @@ def test_failed_attempt_retains_envelope_and_can_retry_within_global_limit(tmp_p
     assert not third.calls
 
 
+@pytest.mark.parametrize("status_code,error", [
+    (None, None), (0, "transport:connection:TransportStatusError"),
+    (0, "transport:timeout:TimeoutError"),
+])
+def test_transport_failures_allow_three_interruptions_then_success(tmp_path, status_code, error):
+    for _ in range(3):
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED,
+                                         status_code=status_code, error=error, attempts=1)])
+        assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+        assert len(client.calls) == 1
+    client = FakeClient([FetchOutcome(status=FetchStatus.OK, status_code=200,
+                                     raw_capture_id="raw", attempts=1)])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 0
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == 3
+    assert state["endpoint_tries"]["probe"] == 1
+    assert state["tries"]["probe"] == 4
+    assert json.loads((tmp_path / "signal-probe-ledger.json").read_text())["totals"]["request_attempts"] == 4
+
+
+@pytest.mark.parametrize("status_code,limit", [(None, 4), (405, 2), (403, 2), (404, 2), (429, 2), (502, 2), (522, 2)])
+def test_class_attempt_limits_stop_before_another_fetch(tmp_path, status_code, limit):
+    for _ in range(limit):
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED,
+                                         status_code=status_code, attempts=1)])
+        assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+    client = FakeClient([])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 2
+    assert not client.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    counter = "transport_tries" if status_code is None else "endpoint_tries"
+    assert state[counter]["probe"] == limit
+
+
+def test_mixed_failures_have_independent_persisted_limits(tmp_path):
+    for status in [405, None, None, None]:
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, status_code=status)])
+        assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+    client = FakeClient([FetchOutcome(status=FetchStatus.OK, status_code=200, raw_capture_id="raw")])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 0
+
+
+@pytest.mark.parametrize("old_tries,expected", [(1, 0), (2, 2)])
+def test_legacy_tries_are_conservatively_counted_as_site_responses(tmp_path, old_tries, expected):
+    client = FakeClient([FetchOutcome(status=FetchStatus.BLOCKED, status_code=405)])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+    path = tmp_path / "day1/state.json"
+    state = json.loads(path.read_text())
+    state.pop("endpoint_tries", None)
+    state.pop("transport_tries", None)
+    state["tries"]["probe"] = old_tries
+    path.write_text(json.dumps(state))
+    client = FakeClient([FetchOutcome(status=FetchStatus.OK, status_code=200, raw_capture_id="raw")])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == expected
+    assert len(client.calls) == (1 if expected == 0 else 0)
+    state = json.loads(path.read_text())
+    assert state["endpoint_tries"]["probe"] == 2
+
+
+def test_transport_limit_override_and_global_budget_are_preserved(tmp_path):
+    for _ in range(2):
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED)])
+        assert bench.run(args(tmp_path, transport_attempts=2), client_factory=lambda *a: client) == 3
+    client = FakeClient([])
+    assert bench.run(args(tmp_path, transport_attempts=2), client_factory=lambda *a: client) == 2
+    assert not client.calls
+    with pytest.raises(bench.ProbeGateError, match="budget exhausted"):
+        bench.run(args(tmp_path, max_attempts=2), client_factory=lambda *a: pytest.fail("budget must stop fetch"))
+
+
+@pytest.mark.parametrize("limit", [0, 1, 4, 5])
+def test_cli_transport_attempt_bounds(tmp_path, monkeypatch, limit):
+    monkeypatch.setattr(sys, "argv", ["bench", "--mode", "probe", "--evidence-dir", str(tmp_path),
+                                     "--transport-attempts", str(limit)])
+    seen = []
+    monkeypatch.setattr(bench, "run", lambda options: seen.append(options.transport_attempts) or 0)
+    if limit in (1, 4):
+        assert bench.main() == 0
+        assert seen == [limit]
+    else:
+        with pytest.raises(SystemExit) as exc:
+            bench.main()
+        assert exc.value.code == 2
+        assert not seen
+
+
 def test_parity_gate_reports_contract_value_club_mismatch(monkeypatch):
     import scrapers.transfermarkt.scraper as scraper
     monkeypatch.setattr(scraper, "_parse_squad_page", lambda *a: [{"player_id": "1", "contract_until": date(2028, 6, 30), "market_value_eur": 100}])
@@ -286,7 +372,7 @@ def test_past_roster_without_contract_column_does_not_prove_null_parity(tmp_path
         bench.parity_report(tasks, results, store, players, groups)
 
 
-def transport_factory(tmp_path, *, status=200, close_error=False, responses=None):
+def transport_factory(tmp_path, *, status=200, close_error=False, responses=None, transport_error=None):
     from dataclasses import replace
     from scrapers.transfermarkt.client import TransfermarktHttpClient
     from scrapers.transfermarkt.models import LeaseTrafficSnapshot, ProxyLease, SharedTrafficLedger
@@ -311,6 +397,9 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
 
     class TLS:
         def get(self, url, **kwargs):
+            if transport_error is not None:
+                factory.calls.append(url)
+                raise transport_error
             response_status, body = responses[url] if responses is not None else (status, probe_body(url))
             factory.calls.append(url)
             factory.bytes += len(body)
@@ -326,6 +415,22 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
         client.set_cycle_decoded_body_budget(remaining["decoded_response_body_bytes"])
         return client
     return build, factory
+
+
+@pytest.mark.parametrize("proxy_status", [502, 522, None])
+def test_real_transport_gateway_errors_use_transport_limit(tmp_path, proxy_status):
+    from scrapers.transfermarkt.client import TransportStatusError
+    error = (TimeoutError("offline timeout") if proxy_status is None else
+             TransportStatusError("offline proxy failure", status_code=proxy_status))
+    for _ in range(3):
+        build, factory = transport_factory(tmp_path, transport_error=error)
+        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+        assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 0
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == 3
+    assert [record["outcome_kind"] for record in state["attempt_records"]] == ["transport_error"] * 3 + ["response"]
 
 
 def test_real_transport_proxy_raw_probe_chain_with_exact_paid_attempt(tmp_path):

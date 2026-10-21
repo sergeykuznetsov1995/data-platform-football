@@ -52,7 +52,7 @@ if str(ROOT / "dags") not in sys.path:
 from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, players_url
 
 MIB = 1024 * 1024
-MAX_ATTEMPTS = 4600
+MAX_ATTEMPTS = 5071  # 4471 + 600 по решению владельца 21.10.2026 («Больше повторов», #1393)
 MAX_BYTES = 256 * MIB
 MAX_PORTION_SECONDS = 45 * 60
 # Existing gateway traffic namespace; the unique run/task labels identify an
@@ -553,6 +553,19 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         state_path = evidence / "state.json"
         state = _read(state_path) if state_path.exists() else {"identity": identity, "results": {}, "tries": {}, "attempt_records": [], "failures": {}}
         state.setdefault("failures", {})
+        # Unknown historical attempts consume the stricter site-response limit.
+        # Keep total tries for existing readers and reserve each new attempt as
+        # a site response until the client proves it was a transport failure.
+        state.setdefault("transport_tries", {})
+        state.setdefault("endpoint_tries", {
+            key: count - state["transport_tries"].get(key, 0)
+            for key, count in state["tries"].items()
+        })
+
+        def attempts_exhausted(key):
+            return (state["endpoint_tries"].get(key, 0) >= args.endpoint_attempts
+                    or state["transport_tries"].get(key, 0) >= getattr(args, "transport_attempts", 4))
+
         if state["identity"] != identity:
             raise ProbeGateError("observation input changed; create a new evidence directory")
         if args.mode in {"parity", "recheck"}:
@@ -575,15 +588,21 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                     continue
                 if monotonic() - started >= admitted_seconds - 120:
                     break
-                tries = state["tries"].get(task["key"], 0)
-                if tries >= args.endpoint_attempts:
+                if attempts_exhausted(task["key"]):
                     if args.mode == "cohort":
                         continue
                     raise ProbeGateError("endpoint attempt limit exhausted; no schema gate")
-                state["tries"][task["key"]] = tries + 1
+                state["tries"][task["key"]] = state["tries"].get(task["key"], 0) + 1
+                state["endpoint_tries"][task["key"]] = state["endpoint_tries"].get(task["key"], 0) + 1
                 _write(state_path, state)
                 outcome = client.fetch(task["url"], as_json=task["json"], max_attempts=1,
                                        label=task["kind"], context={"cycle_id": portion_id, "scope_id": task["scope"]})
+                # The client normalizes gateway errors/timeouts (including
+                # TransportStatusError) to status 0; real HTTP responses keep
+                # their status, including 403/405/429 and source 5xx responses.
+                if not outcome.is_success and outcome.status_code in (None, 0):
+                    state["endpoint_tries"][task["key"]] -= 1
+                    state["transport_tries"][task["key"]] = state["transport_tries"].get(task["key"], 0) + 1
                 if not outcome.is_success or not outcome.raw_capture_id:
                     report["failure"] = {"key": task["key"], "status": outcome.status.value, "http_status": outcome.status_code}
                     state["failures"][task["key"]] = report["failure"]
@@ -596,7 +615,7 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                                                     "raw_fetched_at": outcome.raw_fetched_at}
                 _write(state_path, state)
             terminal = all(task["key"] in state["results"] or (
-                args.mode == "cohort" and state["tries"].get(task["key"], 0) >= args.endpoint_attempts
+                args.mode == "cohort" and attempts_exhausted(task["key"])
             ) for task in tasks)
             if terminal:
                 if args.mode == "probe":
@@ -686,6 +705,7 @@ def main():
     parser.add_argument("--max-bytes", type=int, default=MAX_BYTES)
     parser.add_argument("--portion-seconds", type=int, default=MAX_PORTION_SECONDS)
     parser.add_argument("--endpoint-attempts", type=int, default=2)
+    parser.add_argument("--transport-attempts", type=int, default=4)
     parser.add_argument("--player-target", type=int, default=1000)
     parser.add_argument("--min-scopes", type=int, default=20)
     parser.add_argument("--day1")
@@ -694,9 +714,11 @@ def main():
     parser.add_argument("--recheck-players", type=int, default=64)
     args = parser.parse_args()
     if not 1 <= args.max_attempts <= MAX_ATTEMPTS or not MIB < args.max_bytes <= MAX_BYTES:
-        parser.error("limits must fit the agreed 4600 attempts / 256 MiB experiment")
+        parser.error(f"limits must fit the agreed {MAX_ATTEMPTS} attempts / 256 MiB experiment")
     if not 121 <= args.portion_seconds <= MAX_PORTION_SECONDS or not 1 <= args.endpoint_attempts <= 2:
         parser.error("portion <=45 minutes and endpoint attempts <=2 required")
+    if not 1 <= args.transport_attempts <= 4:
+        parser.error("transport attempts must be 1..4")
     if args.mode == "parity" and not args.sample:
         parser.error("parity needs fresh cohort sample")
     if args.mode == "cohort" and not args.sample:
