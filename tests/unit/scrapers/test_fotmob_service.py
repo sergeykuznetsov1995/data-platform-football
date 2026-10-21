@@ -3567,3 +3567,35 @@ def test_late_match_enriches_attendance_and_stats_at_both_thresholds(monkeypatch
     clock[0] += timedelta(days=20)
     assert service.sync_match_payloads(bundle).skipped == 1
     assert len(transport.calls) == 3
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_1792_league_season_manifest_preserves_304_validation_not_replay_time(stale):
+    service, transport, repository = _service({})
+    fetch = _null_body_fetch("leagues", {"id": 47})
+    fetch = replace(fetch, outcome=FetchOutcome.STALE_REPLAY if stale else FetchOutcome.NOT_MODIFIED,
+                    stale=stale, terminal=False, json_data={}, body=b"{}",
+                    content_hash="a"*64, fetched_at="2026-10-01T00:00:00+00:00",
+                    source_observed_at="2026-10-21T04:00:00+00:00")
+    service._commit_for_fetch(fetch, target_type="league_season", competition_id=47,
+                              source_season_key="2026/2027")
+    commit = repository.commits[-1]
+    assert commit.fetched_at == datetime(2026, 10, 1)
+    assert commit.capabilities.get("source_observed_at") == (
+        None if stale else "2026-10-21T04:00:00+00:00")
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_1792_competition_seasons_manifest_preserves_304_validation(stale):
+    service, transport, repository = _service({})
+    fetch = _null_body_fetch("leagues", {"id": 47})
+    fetch = replace(fetch, outcome=FetchOutcome.STALE_REPLAY if stale else FetchOutcome.NOT_MODIFIED,
+                    stale=stale, terminal=False, json_data={}, body=b"{}",
+                    content_hash="a"*64, fetched_at="2026-10-01T00:00:00+00:00",
+                    source_observed_at="2026-10-21T04:00:00+00:00")
+    service._commit_for_fetch(fetch, target_type="competition_seasons", competition_id=47,
+                              entity_id=47)
+    commit = repository.commits[-1]
+    assert commit.fetched_at == datetime(2026, 10, 1)
+    assert commit.capabilities.get("source_observed_at") == (
+        None if stale else "2026-10-21T04:00:00+00:00")

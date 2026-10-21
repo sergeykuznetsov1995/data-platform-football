@@ -26,7 +26,7 @@ def test_host_readers_only_select_and_keep_credentials_out_of_results(monkeypatc
     calls = []
     def run(argv, **kwargs):
         calls.append(argv)
-        output = '{"competitions":[]}' if argv[0] == "docker" else '"47","2026/2027","2026-10-07T20:00:00Z"\n'
+        output = '{"competitions":[]}' if argv[0] == "docker" else '"47","2026/2027","2026-10-07T20:00:00Z","2026-10-08T20:00:00Z"\n'
         return SimpleNamespace(stdout=output)
     monkeypatch.setattr("scripts.report_fbref_daily.subprocess.run", run)
     assert host_postgres("SELECT '{}'::jsonb") == {"competitions": []}
@@ -63,3 +63,65 @@ def test_1325_adapter_accepts_four_lines_and_rejects_old_payload(tmp_path, monke
     assert adapter.fbref_daily_report() == ["• " + line for line in lines]
     lines.pop()
     assert "недоступен" in adapter.fbref_daily_report()[0]
+
+
+def test_1792_reader_host_trino_four_column_manifest_contract(monkeypatch):
+    from datetime import date, datetime, timezone
+    from scrapers.fbref.daily_report_reader import collect_snapshot
+    calls = []
+
+    def run(argv, **kwargs):
+        query = argv[1]
+        calls.append(query)
+        # Actual host_trino path: quoted CSV, no header, UTC timestamps,
+        # and a second legacy manifest without source_observed_at evidence.
+        if 'fotmob_competition_seasons' in query:
+            return SimpleNamespace(stdout='')
+        if 'fotmob_ingest_manifest' in query:
+            assert 'max(validated_at)' in query
+            assert 'source_season_key AS season_key' in query
+            return SimpleNamespace(stdout=(
+                '"47","2026/2027","2026-10-01T00:00:00Z","2026-10-08T20:00:00Z"\n'
+                '"47","2025/2026","2026-09-01T00:00:00Z","2026-09-01T00:00:00Z"\n'))
+        return SimpleNamespace(stdout='')
+
+    monkeypatch.setattr('scripts.report_fbref_daily.subprocess.run', run)
+
+    def pg(query):
+        if 'competition_registry' in query:
+            return {'competitions': [{'competition_id': '9', 'gender': 'male', 'name': 'Premier League'}]}
+        return []
+
+    result = collect_snapshot(pg, host_trino, day=date(2026, 10, 7),
+                              as_of=datetime(2026, 10, 9, tzinfo=timezone.utc),
+                              mapping={'9': {'fotmob_ids': ['47']}})
+    assert not result['errors']
+    assert result['fotmob_seasons'] == [
+        {'competition_id': '47', 'season_key': '2026/2027',
+         'fetched_at': '2026-10-01T00:00:00Z', 'validated_at': '2026-10-08T20:00:00Z'},
+        {'competition_id': '47', 'season_key': '2025/2026',
+         'fetched_at': '2026-09-01T00:00:00Z', 'validated_at': '2026-09-01T00:00:00Z'}]
+
+
+def test_1792_round3_phase_catalog_reader_csv_contract(monkeypatch):
+    from datetime import date, datetime, timezone
+    from scrapers.fbref.daily_report_reader import collect_snapshot
+    queries = []
+    def run(argv, **kwargs):
+        query = argv[1]
+        queries.append(query)
+        if 'fotmob_competition_seasons' in query:
+            assert 's._target_batch_id=m.batch_id' in query
+            assert "target_type='competition_seasons'" in query
+            assert 'm.rn=1' in query and 'completed_at <=' in query
+            return SimpleNamespace(stdout='"274","2026 - Apertura","2026-10-21T04:00:00Z","2026-10-21T04:00:00Z"\n"274","2026 - Clausura","2026-10-21T04:00:00Z","2026-10-21T04:00:00Z"\n')
+        return SimpleNamespace(stdout='')
+    monkeypatch.setattr('scripts.report_fbref_daily.subprocess.run', run)
+    def pg(query):
+        if 'competition_registry' in query:
+            return {'competitions': [{'competition_id': '41', 'gender': 'male', 'name': 'Primera A'}]}
+        return []
+    result = collect_snapshot(pg, host_trino, day=date(2026, 10, 20),
+        as_of=datetime(2026, 10, 21, 5, tzinfo=timezone.utc), mapping={'41': {'fotmob_ids': ['274']}})
+    assert not result['errors']
+    assert {r['season_key'] for r in result['fotmob_phase_catalog']} == {'2026 - Apertura', '2026 - Clausura'}
