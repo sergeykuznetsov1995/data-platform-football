@@ -108,6 +108,7 @@ from scripts.proxy_filter.budget import (  # noqa: E402 - standalone entry point
     load_verified_policy,
 )
 from scripts.proxy_filter.sofascore_registry import compact as _compact_registry
+from scripts.proxy_filter.sofascore_registry import iter_events as _iter_registry_events
 from scripts.proxy_filter.sofascore_registry import validate_checkpoint as _validate_registry_checkpoint
 
 _REGISTRY_LOCK = RLock()
@@ -2673,16 +2674,16 @@ def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
         return 0
     today = _utc_day()
     with stream:
-        line_number = 0
-        while True:
-            raw = stream.readline(MAX_LEDGER_EVENT_BYTES + 1)
-            if not raw:
-                break
-            line_number += 1
+        events = (_iter_registry_events(path) if SOURCE_MODE == "sofascore-only"
+                  else iter(lambda: stream.readline(MAX_LEDGER_EVENT_BYTES + 1), b""))
+        for line_number, raw in enumerate(events, 1):
             try:
-                if len(raw) > MAX_LEDGER_EVENT_BYTES:
-                    raise ValueError("paid byte event exceeds bounded line limit")
-                event = json.loads(raw.decode("utf-8"))
+                if SOURCE_MODE == "sofascore-only":
+                    event = raw
+                else:
+                    if len(raw) > MAX_LEDGER_EVENT_BYTES:
+                        raise ValueError("paid byte event exceeds bounded line limit")
+                    event = json.loads(raw.decode("utf-8"))
                 if not isinstance(event, dict):
                     raise ValueError("paid byte event must be a JSON object")
                 if event.get("event_type") != "bytes":
@@ -7840,7 +7841,9 @@ def _compact_sofascore_registry(path: str, *, kind: str):
         with _REGISTRY_LOCK:
             if _ALLOCATION_WAL_PENDING_ROLLBACK is not None:
                 return None
-            return _compact_registry(path, _REGISTRY_LOCK, kind=kind)
+            force = (SOURCE_MODE == "sofascore-only"
+                     and _sofascore_registry_bytes() >= SOFASCORE_REGISTRY_COMPACT_BYTES)
+            return _compact_registry(path, _REGISTRY_LOCK, kind=kind, force=force)
     with _REGISTRY_LOCK:
         _repair_paid_ledger_append()
         force = (SOURCE_MODE == "sofascore-only"
@@ -7868,7 +7871,7 @@ async def _periodic_dump(out_path: str, interval: float = 2.0) -> None:
             except Exception:  # noqa: BLE001
                 log.exception("periodic SofaScore ledger flush failed")
             if SOURCE_MODE == "sofascore-only":
-                for kind, path in (("paid", LEDGER_PATH), ("wal", SOFASCORE_ALLOCATION_WAL_PATH)):
+                for kind, path in (("wal", SOFASCORE_ALLOCATION_WAL_PATH), ("paid", LEDGER_PATH)):
                     if kind == "wal" and _ALLOCATION_WAL_PENDING_ROLLBACK is not None:
                         continue
                     try:

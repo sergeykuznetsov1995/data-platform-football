@@ -26,7 +26,8 @@ SHARED_FILTER_SHA256 = (
     # #1398 dedicated TM streams; both source contracts are retained.
     # #1365 follow-up: executable sofascore-only mode and registry startup.
     # #1365 aggregate-pressure compaction; dedicated FBref bytes unchanged.
-    "3f6858b53d828c957fc117ca8dc6a4d4c88781e9fc05a762fb664c03174b72be"
+    # #1790: SofaScore archived recovery and WAL pressure compaction.
+    "ea1957fa4a218a6c3980ecda34c540a67e50dfefceb58364da07dceec2e37f93"
 )
 
 

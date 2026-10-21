@@ -71,7 +71,7 @@ def _digest(stream):
 def _snapshot_name(path, event):
     digest = event.get("sha256", "")
     if (
-        event.get("schema_version") != 1
+        event.get("schema_version") not in {1, 2}
         or event.get("source") not in SOURCES
         or not isinstance(digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
@@ -145,7 +145,8 @@ def _snapshot_events(snapshot, checkpoint):
                 event = json.loads(raw)
                 if (
                     not isinstance(event, dict) or event.get("source") not in SOURCES
-                    or event.get("event_type") in {"bytes", CHECKPOINT_TYPE}
+                    or event.get("event_type") == CHECKPOINT_TYPE
+                    or (event.get("event_type") == "bytes" and checkpoint["schema_version"] < 2)
                 ):
                     raise RuntimeError("corrupt SofaScore forensic snapshot: event type")
                 yield event, raw
@@ -172,7 +173,8 @@ def iter_events(path):
 
     The reader pins its files before yielding. It validates the compressed
     digest, gzip stream and exact event count; callers must not use a partial
-    result if iteration raises. Legacy byte readers can keep reading JSONL.
+    result if iteration raises. Version 2 snapshots also contain recovery sums;
+    budget replay must consume this iterator instead of only the JSONL tail.
     """
     with ExitStack() as stack:
         stream, end, checkpoint, snapshot = _open_prefix(str(path), RLock(), stack)
@@ -253,13 +255,13 @@ def _projected_bytes(path, after, archive_bytes, temporary_paths):
 def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before_replace=None, force=False):
     """Compact without discarding recovery sums or seven-day evidence.
 
-    Aggregate pressure can force a paid scan below its individual trigger.
-    It never relaxes the retained-size caps or forces WAL rotation.
+    Aggregate pressure can force either journal below its individual trigger.
+    It never relaxes the retained-size caps or drops unfinished WAL claims.
     """
     if kind not in {"paid", "wal"}:
         raise ValueError("unknown registry kind")
     path = str(path)
-    forced = force and kind == "paid"
+    forced = force
     limit = trigger if trigger is not None else (PAID_TRIGGER_BYTES if kind == "paid" else WAL_TRIGGER_BYTES)
     current = now or datetime.now(timezone.utc)
     cutoff = (current - timedelta(days=FORENSIC_DAYS)).isoformat()
@@ -318,6 +320,7 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                     day = str(event.get("occurred_at", ""))[:10]
                     if len(day) != 10:
                         raise RuntimeError("corrupt SofaScore registry: missing day")
+                    datetime.strptime(day, "%Y-%m-%d")
                     key = tuple(str(event.get(k, "")) for k in RECOVERY_FIELDS) + (day,)
                     if key not in groups:
                         groups[key] = {k: event[k] for k in RECOVERY_FIELDS if event.get(k)}
@@ -325,6 +328,14 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                     groups[key]["bytes"] += count
                 elif str(event.get("occurred_at", "")) >= cutoff:
                     raw = _line({k: event[k] for k in FORENSIC_FIELDS if k in event})
+                    packed.write(raw)
+                    forensic_count += 1
+                    forensic_length += len(raw)
+            for event in groups.values():
+                raw = _line(event)
+                # Keep the entire UTC day online until its end is outside the
+                # evidence window. Archived recovery keys never expire.
+                if event["occurred_at"][:10] < cutoff[:10]:
                     packed.write(raw)
                     forensic_count += 1
                     forensic_length += len(raw)
@@ -338,14 +349,15 @@ def compact(path: str, lock: RLock, *, kind: str, now=None, trigger=None, before
                 digest = _digest(archive_out)
                 archive_name = f"{Path(path).name}.forensics-{digest}.jsonl.gz"
                 archive_bytes = os.fstat(archive_out.fileno()).st_size
-                out.write(_line({"event_type": CHECKPOINT_TYPE, "schema_version": 1,
+                out.write(_line({"event_type": CHECKPOINT_TYPE, "schema_version": 2,
                                  "source": "sofascore", "occurred_at": current.isoformat(),
                                  "archive": archive_name, "sha256": digest,
                                  "events_count": forensic_count, "uncompressed_bytes": forensic_length}))
                 kept += forensic_count
             for event in groups.values():
-                out.write(_line(event))
-                kept += 1
+                if event["occurred_at"][:10] >= cutoff[:10]:
+                    out.write(_line(event))
+                    kept += 1
             out.flush()
             with lock:
                 if before_replace is not None:

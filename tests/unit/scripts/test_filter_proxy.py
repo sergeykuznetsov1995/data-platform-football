@@ -11353,7 +11353,8 @@ def test_sofascore_1365_registry_size_includes_archives_and_generations(shared_m
 
 
 @pytest.mark.parametrize("size,expected_force", [(57_999_999, False), (58_000_000, True), (60_013_623, True)])
-def test_sofascore_paid_rotation_uses_aggregate_pressure(shared_mod, monkeypatch, size, expected_force):
+@pytest.mark.parametrize("kind", ["paid", "wal"])
+def test_sofascore_paid_rotation_uses_aggregate_pressure(shared_mod, monkeypatch, size, expected_force, kind):
     shared_mod.SOURCE_MODE = "sofascore-only"
     monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
     measured = []
@@ -11363,7 +11364,7 @@ def test_sofascore_paid_rotation_uses_aggregate_pressure(shared_mod, monkeypatch
     monkeypatch.setattr(shared_mod, "_sofascore_registry_bytes", registry_bytes)
     calls = []
     monkeypatch.setattr(shared_mod, "_compact_registry", lambda *a, **k: calls.append(k) or None)
-    shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
+    shared_mod._compact_sofascore_registry(f"{kind}.jsonl", kind=kind)
     assert calls[0].get("force", False) is expected_force
     assert measured == [size]
 
@@ -11380,14 +11381,13 @@ def test_sofascore_paid_rotation_rechecks_pressure_after_reduction(shared_mod, m
     assert calls == [True, False]
 
 
-def test_other_sources_and_wal_do_not_force_pressure_rotation(shared_mod, monkeypatch):
+def test_other_sources_do_not_force_pressure_rotation(shared_mod, monkeypatch):
     monkeypatch.setattr(shared_mod, "_repair_paid_ledger_append", lambda: None)
     monkeypatch.setattr(shared_mod, "_sofascore_registry_bytes", lambda: pytest.fail("unrelated pressure scan"))
     calls = []
     monkeypatch.setattr(shared_mod, "_compact_registry", lambda *a, **k: calls.append(k.get("force", False)))
     shared_mod.SOURCE_MODE = "shared"
     shared_mod._compact_sofascore_registry("paid.jsonl", kind="paid")
-    shared_mod.SOURCE_MODE = "sofascore-only"
     shared_mod._compact_sofascore_registry("wal.jsonl", kind="wal")
     assert calls == [False, False]
 
@@ -11478,7 +11478,7 @@ def test_sofascore_1365_periodic_dump_runs_real_registry_rotations(shared_mod, m
     monkeypatch.setattr(shared_mod.asyncio, "to_thread", direct)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(shared_mod._periodic_dump(str(tmp_path / "bytes.json")))
-    assert calls == [(shared_mod.LEDGER_PATH, "paid"), (shared_mod.SOFASCORE_ALLOCATION_WAL_PATH, "wal")]
+    assert calls == [(shared_mod.SOFASCORE_ALLOCATION_WAL_PATH, "wal"), (shared_mod.LEDGER_PATH, "paid")]
 
 
 def test_sofascore_1365_real_cli_rejects_anonymous_paid_path(shared_mod, monkeypatch):
@@ -11494,3 +11494,71 @@ def test_sofascore_1365_real_startup_rejects_missing_forensic_snapshot(shared_mo
     monkeypatch.setattr(shared_mod, "_recover_allocation_wal", lambda: pytest.fail("must fail before recovery and listeners"))
     with pytest.raises(RuntimeError, match="missing SofaScore forensic snapshot"):
         _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path, extra_argv=("--source-mode", "sofascore-only"))
+
+
+def test_history_pressure_reclaims_small_wal_and_archives_old_daily_sums(shared_mod, monkeypatch, tmp_path):
+    from scripts.proxy_filter import sofascore_registry as registry
+    from tests.unit.scripts.test_sofascore_registry import event, totals, write
+
+    now = datetime.now(timezone.utc)
+    shared_mod.SOURCE_MODE = "sofascore-only"
+    path = Path(shared_mod.LEDGER_PATH)
+    wal = Path(shared_mod.SOFASCORE_ALLOCATION_WAL_PATH)
+    old = (now - timedelta(days=30)).date().isoformat() + "T00:00:00+00:00"
+    # Already compacted sums: no padding and no repeated recovery keys.
+    rows = [{k: value for k, value in event(occurred_at=old, lease_id=f"l{i}",
+              run_id=f"r{i // 2}", direction="up" if i % 2 else "down").items()
+             if k in (*registry.RECOVERY_FIELDS, "event_type", "occurred_at", "bytes")}
+            for i in range(3000)]
+    rows += [event(occurred_at=now.isoformat(), padding=""),
+             event(event_type="endpoint_finished", occurred_at=now.isoformat(), request_id="week", padding="")]
+    write(path, rows)
+    done = [event(event_type="claim_intent", lease_id="done", padding="x" * 1000) for _ in range(1500)]
+    done.append(event(event_type="allocation_finished", lease_id="done", padding=""))
+    pending = event(event_type="claim_intent", lease_id="pending", padding="")
+    write(wal, done + [pending])
+    pending_raw = wal.read_bytes().splitlines(keepends=True)[-1]
+    assert wal.stat().st_size < registry.WAL_TRIGGER_BYTES
+    # Use a sparse unchanged state file; retain the real 58/60 MB limits.
+    with (tmp_path / "allocations.json").open("wb") as out:
+        out.truncate(61_017_183 - shared_mod._sofascore_registry_bytes())
+    assert shared_mod._sofascore_registry_bytes() == 61_017_183
+
+    def restore():
+        for name in ("_run_up_bytes", "_run_down_bytes", "_url_up_bytes", "_url_down_bytes"):
+            getattr(shared_mod, name).clear()
+        shared_mod._daily_up_bytes = shared_mod._daily_down_bytes = 0
+        shared_mod._restore_budget_ledger(str(path))
+        return [dict(getattr(shared_mod, name)) for name in (
+            "_run_up_bytes", "_run_down_bytes", "_url_up_bytes", "_url_down_bytes",
+            "_RESTORED_ALLOCATION_LEASE_BYTES", "_RESTORED_PARENT_PHASE_BYTES")] + [
+                shared_mod._daily_up_bytes, shared_mod._daily_down_bytes]
+
+    expected = restore()
+    ticks = iter([0, shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1,
+                  shared_mod.LEDGER_FLUSH_INTERVAL_SECONDS + 1])
+    monkeypatch.setattr(shared_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    sleeps = 0
+    async def sleep(_interval):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(shared_mod.asyncio, "sleep", sleep)
+    for name in ("_reap_expired_leases", "_dump", "_repair_paid_ledger_append", "_repair_allocation_wal_append", "_flush_ledgers", "_repair_failed_claim_creations"):
+        monkeypatch.setattr(shared_mod, name, lambda *a, **k: None)
+    async def direct(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(shared_mod.asyncio, "to_thread", direct)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(shared_mod._periodic_dump(str(tmp_path / "bytes.json")))
+    assert wal.read_bytes() == pending_raw
+    assert shared_mod._sofascore_registry_bytes() < shared_mod.SOFASCORE_REGISTRY_LIMIT_BYTES
+    assert totals(registry.iter_events(path)) == totals(rows)
+    assert len([e for e in map(json.loads, path.read_text().splitlines()) if e["event_type"] == "bytes"]) == 1
+    assert any(e.get("request_id") == "week" for e in registry.iter_events(path))
+    assert restore() == expected
+    # A daily refresh/restart retains all archived lease/run/URL/phase counters.
+    registry.compact(str(path), shared_mod._REGISTRY_LOCK, kind="paid", now=now + timedelta(days=1))
+    assert restore() == expected
+    assert totals(registry.iter_events(path)) == totals(rows)
