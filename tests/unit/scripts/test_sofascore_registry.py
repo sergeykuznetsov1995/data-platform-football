@@ -210,16 +210,17 @@ def test_large_week_of_forensics_is_archived_without_losing_events(tmp_path):
     assert len(list(tmp_path.glob("*.jsonl.gz"))) == 1
 
 
-def _archived(path):
-    write(path, [event() for _ in range(30)] + [event(event_type="lease_created")])
+def _archived(path, **values):
+    write(path, [event(**values) for _ in range(30)] + [event(event_type="lease_created")])
     registry.compact(str(path), RLock(), kind="paid", now=NOW, trigger=10000)
     return path.parent / read(path)[0]["archive"]
 
 
 @pytest.mark.parametrize("stage", ["archive_directory", "journal_replace", "journal_directory"])
-def test_crash_boundaries_preserve_committed_evidence(tmp_path, monkeypatch, stage):
+@pytest.mark.parametrize("old_recovery", [False, True])
+def test_crash_boundaries_preserve_committed_evidence(tmp_path, monkeypatch, stage, old_recovery):
     path = tmp_path / "paid.jsonl"
-    old_archive = _archived(path)
+    old_archive = _archived(path, **({"occurred_at": "2026-09-01T00:00:00+00:00"} if old_recovery else {}))
     extra = [event() for _ in range(30)] + [event(event_type="endpoint_finished", request_id="new")]
     with path.open("a") as out:
         out.write("".join(json.dumps(e) + "\n" for e in extra))
@@ -257,7 +258,7 @@ def test_crash_boundaries_preserve_committed_evidence(tmp_path, monkeypatch, sta
     assert len(list(tmp_path.glob("*.jsonl.gz"))) == 1
 
 
-@pytest.mark.parametrize("fault", ["missing", "digest", "count", "gzip", "path", "type", "oversized"])
+@pytest.mark.parametrize("fault", ["missing", "digest", "count", "gzip", "path", "type", "oversized", "version"])
 def test_snapshot_corruption_is_rejected_without_replacing_journal(tmp_path, fault):
     import gzip
     import hashlib
@@ -273,9 +274,11 @@ def test_snapshot_corruption_is_rejected_without_replacing_journal(tmp_path, fau
         checkpoint["events_count"] += 1
     elif fault == "path":
         checkpoint["archive"] = "../elsewhere.gz"
+    elif fault == "version":
+        checkpoint["schema_version"] = 3
     elif fault in {"gzip", "type", "oversized"}:
         raw = b"not gzip" if fault == "gzip" else gzip.compress(
-            b"x" * (registry.MAX_LINE_BYTES + 1) if fault == "oversized" else registry._line(event()), mtime=0,
+            b"x" * (registry.MAX_LINE_BYTES + 1) if fault == "oversized" else registry._line(event(source="whoscored")), mtime=0,
         )
         digest = hashlib.sha256(raw).hexdigest()
         archive.unlink()
@@ -314,7 +317,8 @@ def test_recompaction_expires_old_forensics_and_keeps_exact_byte_keys(tmp_path):
     registry.compact(str(path), RLock(), kind="paid", now=NOW + timedelta(days=8), trigger=10000)
     assert not old_archive.exists()
     assert {e["event_type"] for e in registry.iter_events(path)} == {"bytes"}
-    assert totals(read(path)) == totals([event() for _ in range(30)])
+    assert totals(registry.iter_events(path)) == totals([event() for _ in range(30)])
+    assert totals(read(path)) == {}
 
 
 def test_orphan_cleanup_requires_valid_durable_small_journal(tmp_path, monkeypatch):
@@ -369,13 +373,13 @@ def test_small_raw_tail_expires_after_last_snapshot_became_empty(tmp_path):
     path = tmp_path / "paid.jsonl"
     _archived(path)
     registry.compact(str(path), RLock(), kind="paid", now=NOW + timedelta(days=8), trigger=10000)
-    assert read(path)[0]["events_count"] == 0
+    assert read(path)[0]["events_count"] == 1  # Recovery bytes never expire.
     created = event(event_type="lease_created", occurred_at=(NOW + timedelta(days=8)).isoformat(), padding="")
     with path.open("a") as out:
         out.write(json.dumps(created) + "\n")
     registry.compact(str(path), RLock(), kind="paid", now=NOW + timedelta(days=16), trigger=10000)
     assert not [e for e in registry.iter_events(path) if e["event_type"] == "lease_created"]
-    assert totals(read(path)) == totals([event() for _ in range(30)])
+    assert totals(registry.iter_events(path)) == totals([event() for _ in range(30)])
 
 
 def test_small_initial_journal_gets_daily_snapshot_marker(tmp_path):
@@ -402,3 +406,98 @@ def test_orphan_cleanup_scans_snapshot_outside_writer_lock(tmp_path, monkeypatch
     monkeypatch.setattr(registry, "_snapshot_events", checked)
     registry.compact(str(path), lock, kind="paid", now=NOW, trigger=10000)
     assert not orphan.exists()
+
+
+def test_old_daily_sums_move_to_archive_without_losing_any_recovery_key(tmp_path):
+    from datetime import timedelta
+    path = tmp_path / "paid.jsonl"
+    old = event(occurred_at="2026-09-01T00:00:00+00:00", padding="")
+    rows = [old]
+    for field in registry.RECOVERY_FIELDS:
+        value = "up" if field == "direction" else "sofascore_discovery" if field == "source" else "other"
+        rows.append({**old, field: value})
+    # The cutoff is Oct 2 at noon: retain that entire day, archive Oct 1.
+    rows += [event(occurred_at="2026-10-01T23:59:59+00:00", padding=""),
+             event(occurred_at="2026-10-02T00:00:00+00:00", padding=""),
+             event(event_type="endpoint_finished", request_id="recent", padding="")]
+    write(path, rows)
+    now = NOW + timedelta(hours=12)
+    registry.compact(str(path), RLock(), kind="paid", now=now)
+    assert read(path)[0]["schema_version"] == 2
+    assert {e["occurred_at"][:10] for e in read(path) if e["event_type"] == "bytes"} == {"2026-10-02"}
+    assert totals(registry.iter_events(path)) == totals(rows)
+    assert any(e.get("request_id") == "recent" for e in registry.iter_events(path))
+    # Daily refresh must retain archived recovery even after evidence expires.
+    registry.compact(str(path), RLock(), kind="paid", now=now + timedelta(days=20))
+    assert totals(registry.iter_events(path)) == totals(rows)
+    assert totals(read(path)) == {}
+    assert not any(e.get("request_id") == "recent" for e in registry.iter_events(path))
+
+
+@pytest.mark.parametrize("fault", ["fsync", "replace"])
+def test_archiving_old_sums_failure_preserves_recovery(tmp_path, monkeypatch, fault):
+    path = tmp_path / "paid.jsonl"
+    rows = [event(occurred_at="2026-09-01T00:00:00+00:00", lease_id=str(i), padding="") for i in range(30)]
+    write(path, rows)
+    original = path.read_bytes()
+    def fail(*args):
+        raise OSError("injected disk failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(registry.os, fault, fail)
+        with pytest.raises(OSError):
+            registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    assert path.read_bytes() == original
+    assert totals(registry.iter_events(path)) == totals(rows)
+    registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    assert totals(registry.iter_events(path)) == totals(rows)
+    archive = tmp_path / read(path)[0]["archive"]
+    archive.write_bytes(archive.read_bytes() + b"corrupted")
+    with pytest.raises(RuntimeError, match="digest"):
+        registry.validate_checkpoint(str(path))
+
+
+def test_archiving_old_sums_copies_concurrent_append_once(tmp_path, monkeypatch):
+    path = tmp_path / "paid.jsonl"
+    old = event(occurred_at="2026-09-01T00:00:00+00:00", padding="")
+    write(path, [old])
+    expanded = registry._expanded_events
+    appended = {**old, "lease_id": "concurrent", "bytes": 17}
+    def scan(*args):
+        for item in expanded(*args):
+            with path.open("a") as out:
+                out.write(json.dumps(appended) + "\n")
+            yield item
+    with monkeypatch.context() as patch:
+        patch.setattr(registry, "_expanded_events", scan)
+        registry.compact(str(path), RLock(), kind="paid", now=NOW)
+    assert totals(registry.iter_events(path)) == totals([old, appended])
+    from datetime import timedelta
+    registry.compact(str(path), RLock(), kind="paid", now=NOW + timedelta(days=1))
+    assert totals(registry.iter_events(path)) == totals([old, appended])
+
+
+def test_v1_checkpoint_remains_readable_but_cannot_hide_recovery_bytes(tmp_path):
+    import gzip
+    import hashlib
+    path = tmp_path / "paid.jsonl"
+    for row in (event(event_type="endpoint_finished", padding=""), event(padding="")):
+        raw = registry._line(row)
+        packed = gzip.compress(raw, mtime=0)
+        digest = hashlib.sha256(packed).hexdigest()
+        name = f"paid.jsonl.forensics-{digest}.jsonl.gz"
+        (tmp_path / name).write_bytes(packed)
+        write(path, [{"event_type": registry.CHECKPOINT_TYPE, "schema_version": 1,
+                      "source": "sofascore", "archive": name, "sha256": digest,
+                      "events_count": 1, "uncompressed_bytes": len(raw)}])
+        if row["event_type"] == "bytes":
+            with pytest.raises(RuntimeError, match="event type"):
+                list(registry.iter_events(path))
+        else:
+            assert list(registry.iter_events(path)) == [row]
+            old = event(occurred_at="2026-09-01T00:00:00+00:00", padding="")
+            with path.open("a") as out:
+                out.write(json.dumps(old) + "\n")
+            registry.compact(str(path), RLock(), kind="paid", now=NOW)
+            assert read(path)[0]["schema_version"] == 2
+            assert totals(registry.iter_events(path)) == totals([old])
+            assert next(registry.iter_events(path)) == {k: row[k] for k in registry.FORENSIC_FIELDS if k in row}
