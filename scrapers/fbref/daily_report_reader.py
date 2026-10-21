@@ -187,6 +187,26 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
           AND completed_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
         GROUP BY competition_id,source_season_key
     """, [])
+    snapshot["fotmob_phase_catalog"] = read("fotmob_phase_catalog", trino, f"""
+        WITH catalogs AS (
+          SELECT competition_id,batch_id,fetched_at,stale,
+                 row_number() OVER (PARTITION BY competition_id
+                                    ORDER BY completed_at DESC,batch_id DESC) AS rn
+          FROM iceberg.bronze.fotmob_ingest_manifest
+          WHERE target_type='competition_seasons' AND competition_id IN ({fm_list})
+            AND status IN ('success','not_modified')
+            AND fetched_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+            AND completed_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+        )
+        SELECT CAST(s.competition_id AS varchar) AS competition_id,
+               s.source_season_key AS season_key,
+               to_iso8601(with_timezone(m.fetched_at, 'UTC')) AS fetched_at,
+               to_iso8601(with_timezone(m.fetched_at, 'UTC')) AS validated_at
+        FROM catalogs m JOIN iceberg.bronze.fotmob_competition_seasons s
+          ON s._target_batch_id=m.batch_id
+        WHERE m.rn=1 AND NOT coalesce(m.stale,false)
+          AND s._ingested_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+    """, [])
     snapshot["fotmob_matches"] = read("fotmob_matches", trino, f"""
         SELECT competition_id,source_season_key AS season_key,match_id,utc_time,timezone,
                finished,cancelled,postponed,awarded

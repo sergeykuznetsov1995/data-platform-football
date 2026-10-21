@@ -439,6 +439,9 @@ def test_1792_exact_phase_mapping_counts_and_deduplicates(cid, sid, fid, phase):
     data["fotmob_matches"][0].update(competition_id=fid, season_key=phase)
     data["fotmob_matches"].append(dict(data["fotmob_matches"][0]))
     mapping = json.loads((Path(__file__).resolve().parents[3]/'configs/fbref/fotmob-report-map.json').read_text())["competitions"]
+    keys = mapping[cid]['season_keys'][sid][fid]
+    data['fotmob_seasons'] = [dict(data['fotmob_seasons'][0], season_key=k) for k in keys]
+    data['fotmob_phase_catalog'] = deepcopy(data['fotmob_seasons'])
     result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
     assert result["fotmob"] == 1 and result["milestone_day_pass"]
     data["fotmob_seasons"][0]["season_key"] = "2030 - Clausura"
@@ -518,8 +521,95 @@ def test_1792_every_mapped_phase_needs_its_own_fresh_evidence(confirmation):
         data['fotmob_seasons'].append(dict(data['fotmob_seasons'][0],
             season_key='2026/2027 - Clausura',
             fetched_at=(AS_OF - timedelta(hours=25 if confirmation == 'stale' else 1)).isoformat()))
+    data['fotmob_phase_catalog'] = [dict(data['fotmob_seasons'][0], season_key=k)
+        for k in ['2026/2027 - Apertura', '2026/2027 - Clausura']]
     mapping = {'9': {'fotmob_ids': ['47'], 'season_keys': {
         '2026-2027': {'47': ['2026/2027 - Apertura', '2026/2027 - Clausura']}}}}
     result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
     assert result['milestone_day_pass'] is (confirmation == 'fresh')
     assert result['fotmob'] == (1 if confirmation == 'fresh' else None)
+
+
+@pytest.mark.parametrize('catalog_state', ['missing', 'stale', 'new_phase_unloaded', 'fresh'])
+def test_1792_round3_phase_catalog_prevents_unseen_phase_false_zero(catalog_state):
+    data = snapshot()
+    data['schedules'] = data['observations'] = data['fotmob_matches'] = []
+    data['fotmob_seasons'][0]['season_key'] = '2026/2027 - Apertura'
+    mapping = {'9': {'fotmob_ids': ['47'], 'season_keys': {
+        '2026-2027': {'47': ['2026/2027 - Apertura']}}}}
+    if catalog_state != 'missing':
+        data['fotmob_phase_catalog'] = [dict(data['fotmob_seasons'][0],
+            fetched_at=(AS_OF - timedelta(hours=25 if catalog_state == 'stale' else 1)).isoformat())]
+        if catalog_state == 'new_phase_unloaded':
+            data['fotmob_phase_catalog'].append(dict(data['fotmob_phase_catalog'][0],
+                season_key='2026/2027 - Clausura'))
+    result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert result['fotmob'] == (0 if catalog_state == 'fresh' else None)
+    assert not result['milestone_day_pass']  # Empty days never count.
+    assert bool(result['fotmob_problems']) is (catalog_state != 'fresh')
+
+
+def test_1792_round3_colombia_map_covers_both_snapshot_phases():
+    mapping = json.loads(Path('configs/fbref/fotmob-report-map.json').read_text())['competitions']
+    assert set(mapping['41']['season_keys']['2026']['274']) == {'2026 - Apertura', '2026 - Clausura'}
+
+
+@pytest.mark.parametrize('cid', ['257', '665', '666', '693'])
+@pytest.mark.parametrize('failure', ['none', 'utc', 'schedule', 'readiness', 'deadline'])
+def test_1792_round3_absent_reference_keeps_all_fbref_guards(cid, failure):
+    from scrapers.fbref.daily_report import summary_line
+    data = snapshot()
+    # Keep the ordinary mapped league as well, proving mixed coverage comparison.
+    for name in ['competitions', 'seasons', 'schedule_health', 'schedules', 'observations', 'readiness']:
+        extra = dict(data[name][0])
+        key = 'source_competition_id' if name == 'schedules' else 'competition_id'
+        extra[key] = cid
+        if failure == 'utc' and name == 'observations':
+            extra['kickoff_at'] = None
+        if failure == 'schedule' and name == 'schedule_health':
+            extra['fetched'] = False
+        if failure == 'readiness' and name == 'readiness':
+            extra['bronze_ready_at'] = None
+        if failure == 'deadline' and name == 'observations':
+            extra['first_completed_seen_at'] = (AS_OF - timedelta(hours=1)).isoformat()
+        data[name].append(extra)
+    mapping = {**MAP, cid: json.loads(Path('configs/fbref/fotmob-report-map.json').read_text())['competitions'][cid]}
+    if failure == 'deadline':
+        data['observations'][-1]['first_completed_seen_at'] = '2026-10-20T23:00:00Z'
+    data['fotmob_seasons'][0]['fetched_at'] = '2026-10-20T23:00:00Z'
+    result = build_daily_report(data, day=DAY, as_of=datetime(2026, 10, 21, tzinfo=timezone.utc), mapping=mapping)
+    assert result['played'] == 2
+    assert result['without_reference'] == [cid]
+    assert result['fotmob'] == 1
+    assert result['milestone_day_pass'] is (failure == 'none')
+    assert 'без эталона: 1' in summary_line(result)
+    assert result['competitions'][0 if cid < '9' else 1]['fotmob'] is None
+    mapping[cid] = {'fotmob_ids': []}
+    blocked = build_daily_report(data, day=DAY, as_of=datetime(2026, 10, 21, tzinfo=timezone.utc), mapping=mapping)
+    assert not blocked['milestone_day_pass']
+    assert any(p['reason'] == 'unmapped_fotmob_competition' for p in blocked['fotmob_problems'])
+
+
+@pytest.mark.parametrize('attributes', [
+    '<span data-venue-epoch="1791392400"></span><span data-venue-epoch="1791478800"></span>',
+    '<span data-venue-epoch="1791392400" data-venue-time="2026-10-08T17:00:00Z"></span>',
+    '<span data-venue-time="2026-10-07T17:00:00Z"></span><span data-venue-time="2026-10-08T17:00:00Z"></span>',
+])
+def test_1792_round3_conflicting_timestamps_inside_row_are_unconfirmed(attributes):
+    html = '<table id="sched_all"><tr><td>' + attributes + '<a href="/en/matches/12345678/Test">Report</a></td></tr></table>'
+    rows = [{'match_url': '/en/matches/12345678/Test', 'score': '2–1'}]
+    assert schedule_observations(html, rows)[0]['kickoff_at'] is None
+
+
+@pytest.mark.parametrize('fetched,validated', [
+    (AS_OF + timedelta(hours=1), AS_OF - timedelta(hours=1)),
+    (AS_OF, AS_OF - timedelta(hours=1)),
+    (None, AS_OF - timedelta(hours=1)),
+    (AS_OF - timedelta(hours=2), AS_OF + timedelta(hours=1)),
+])
+def test_1792_round3_saved_snapshot_rejects_invalid_confirmation_order(fetched, validated):
+    data = snapshot()
+    data['fotmob_seasons'][0].update(fetched_at=fetched.isoformat() if fetched else None,
+                                   validated_at=validated.isoformat())
+    result = report(data)
+    assert result['fotmob'] is None and not result['milestone_day_pass']

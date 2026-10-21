@@ -35,25 +35,31 @@ def schedule_observations(html: str, rows: list[dict]) -> list[dict]:
                     match_ids.add(match_page_target(link["href"]).source_ids["match_id"])
                 except ValueError:
                     continue
-            stamp = row.select_one("[data-venue-epoch]") or row.select_one("[data-venue-time]")
-            if len(match_ids) != 1 or stamp is None:
+            if len(match_ids) != 1:
                 continue
-            try:
-                match_id = next(iter(match_ids))
-                value = str(stamp.get("data-venue-epoch", stamp.get("data-venue-time")))
-                if re.fullmatch(r"\d{10}", value):
-                    instant = datetime.fromtimestamp(int(value), timezone.utc)
-                else:
-                    instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                    if instant.tzinfo is None or instant.utcoffset() is None:
+            match_id = next(iter(match_ids))
+            instants = set()
+            for stamp in row.select("[data-venue-epoch], [data-venue-time]"):
+                for attribute in ("data-venue-epoch", "data-venue-time"):
+                    value = str(stamp.get(attribute, ""))
+                    try:
+                        if re.fullmatch(r"\d{10}", value):
+                            value_at = datetime.fromtimestamp(int(value), timezone.utc)
+                        else:
+                            value_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                            if value_at.tzinfo is None or value_at.utcoffset() is None:
+                                continue
+                        instants.add(value_at)
+                    except (ValueError, OverflowError, OSError):
                         continue
-                # Conflicting duplicate rows must not silently confirm a date.
-                if match_id in kickoff and kickoff[match_id] != instant:
-                    kickoff[match_id] = None
-                else:
-                    kickoff[match_id] = instant
-            except (ValueError, OverflowError, OSError):
+            if not instants:
                 continue
+            value_at = next(iter(instants)) if len(instants) == 1 else None
+            # Conflicts within a row or across duplicate rows stay unconfirmed.
+            if match_id in kickoff and kickoff[match_id] != value_at:
+                kickoff[match_id] = None
+            else:
+                kickoff[match_id] = value_at
     observations = {}
     for row in rows:
         if not row.get("match_url"):

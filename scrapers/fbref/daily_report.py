@@ -133,6 +133,29 @@ def _fotmob_season_keys(entry: Mapping, fid: object, sid: str) -> set[str]:
     return set(aliases) if aliases else set()
 
 
+def _confirmation(row: Mapping, as_of: datetime) -> datetime | None:
+    try:
+        fetched = instant(row.get("fetched_at"))
+        validated = instant(row.get("validated_at") or row.get("fetched_at"))
+    except (ValueError, TypeError):
+        return None
+    if row.get("stale") or fetched is None or validated is None:
+        return None
+    return validated if fetched <= validated <= as_of else None
+
+
+def _without_reference(entry: Mapping, as_of: datetime) -> bool:
+    # An empty ID list alone is still a mapping defect. This explicit decision
+    # is backed by the owner's complete source catalogue, dated for audit.
+    try:
+        evidence_date = date.fromisoformat(entry.get("reference_evidence_date", ""))
+    except (ValueError, TypeError):
+        return False
+    return (entry.get("reference_coverage") == "absent_from_fotmob_catalog"
+            and bool(entry.get("reference_evidence")) and evidence_date <= as_of.date()
+            and not entry.get("fotmob_ids"))
+
+
 def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
                    as_of: datetime) -> tuple[dict, list]:
     counts = Counter()
@@ -147,6 +170,8 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
         entry = mapping.get(cid, {})
         ids = entry.get("fotmob_ids", [])
         if not ids:
+            if _without_reference(entry, as_of):
+                continue
             problems.append({"competition_id": cid, "reason": "unmapped_fotmob_competition",
                              "detail": entry.get("reason", "unmapped")})
             continue
@@ -157,7 +182,7 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
             def matches_season(key):
                 return key in aliases if aliases else season_token(key) == canonical_season
             known_keys = {str(r.get("season_key") or "")
-                          for r in [*seasons, *fixtures]
+                          for r in [*seasons, *fixtures, *snapshot.get("fotmob_phase_catalog", [])]
                           if str(r["competition_id"]) == str(fid)}
             newer = sorted(key for key in known_keys
                            if _edition_token(key) and
@@ -176,15 +201,32 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
                                  "fotmob_id": str(fid), "reason": "unknown_fotmob_season_phase",
                                  "season_keys": unknown_phases})
                 valid = False
+            if aliases:
+                # Loaded seasons are not a complete phase catalogue. Require
+                # a fresh full discovery, then load/confirm ALL its phases.
+                catalog = [r for r in snapshot.get("fotmob_phase_catalog", [])
+                           if str(r["competition_id"]) == str(fid)]
+                latest_catalog = max((_confirmation(r, as_of) for r in catalog
+                                      if _confirmation(r, as_of) is not None), default=None)
+                catalog_keys = {str(r["season_key"]) for r in catalog
+                                if _confirmation(r, as_of) == latest_catalog}
+                edition_keys = {k for k in catalog_keys if _edition_token(k) == canonical_season}
+                if (latest_catalog is None or as_of - latest_catalog > timedelta(hours=24)
+                        or not edition_keys or not edition_keys <= aliases
+                        or any(_edition_token(k) is None for k in catalog_keys)):
+                    problems.append({"competition_id": cid, "season_id": sid,
+                                     "fotmob_id": str(fid),
+                                     "reason": "missing_or_incomplete_fotmob_phase_catalog",
+                                     "season_keys": sorted(edition_keys)})
+                    valid = False
             # Every explicit phase must have its own fresh confirmation.
             required = [{key} for key in sorted(aliases)] if aliases else [
                 {key for key in known_keys if matches_season(key)}]
             for keys in required:
                 available = [s for s in seasons if str(s["competition_id"]) == str(fid)
                              and s.get("season_key") in keys]
-                confirmations = [instant(s.get("validated_at") or s.get("fetched_at"))
-                                 for s in available if not s.get("stale")]
-                confirmations = [t for t in confirmations if t is not None and t <= as_of]
+                confirmations = [_confirmation(s, as_of) for s in available]
+                confirmations = [t for t in confirmations if t is not None]
                 latest = max(confirmations, default=None)
                 if latest is None or as_of - latest > timedelta(hours=24):
                     problems.append({"competition_id": cid, "fotmob_id": str(fid), "season_id": sid,
@@ -364,6 +406,8 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
         })
     totals = Counter(row["status"] for row in entries)
     comparator_pairs, day_scope_exclusions = _day_comparator_scope(snapshot, pairs, day)
+    without_reference = sorted({cid for cid, _ in comparator_pairs
+                                if _without_reference(mapping.get(cid, {}), as_of)})
     fm_counts, fm_problems = _fotmob_counts(snapshot, mapping, comparator_pairs, day, as_of)
     errors = list(snapshot.get("errors", []))
     population_complete = not gaps and not errors and bool(pairs) and all(r["date_confirmed"] for r in entries)
@@ -378,6 +422,9 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
         k = fm_counts.get(cid)
         by_competition.append({"competition_id": cid, "name": adults[cid]["name"],
                                "played": len(rows), **{s: count[s] for s in ("on_time", "late", "pending", "unknown")},
+                               "reference_coverage": ("absent_from_fotmob_catalog"
+                                   if cid in without_reference else
+                                   "mapped" if mapping.get(cid, {}).get("fotmob_ids") else "unmapped"),
                                "fotmob": k, "difference": len(rows) - k if k is not None else None})
     return {
         "schema_version": REPORT_VERSION, "date": day.isoformat(), "as_of": as_of.isoformat(),
@@ -389,10 +436,12 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
         "on_time_percent": pct, "final": completed,
         "milestone_day_pass": completed and pct >= 99 and not fm_problems and all(
             r["difference"] == 0 for r in by_competition
+            if r["competition_id"] not in without_reference
         ),
         "fotmob": sum(fm_counts.values()) if not fm_problems and not errors else None,
         "fotmob_known_count": sum(v for v in fm_counts.values() if v is not None),
         "fotmob_problems": fm_problems,
+        "without_reference": without_reference,
         "source_lag": {**_stats(source_lags), "unknown": len(entries) - len(source_lags),
                        "basis": "observed completed link minus explicit kickoff + 2h; upper-bound estimate"},
         "match_to_first_fetch": _stats(fetch_lags), "match_to_bronze": _stats(bronze_lags),
@@ -432,7 +481,7 @@ def summary_line(report: Mapping) -> str:
     differences = sum(r["difference"] not in (None, 0) for r in report["competitions"])
     blockers = (f"UTC не подтверждено {unconfirmed}; дедлайн не истёк {deadlines}; "
                 f"FotMob причины {dict(reasons)}; известно частично {report['fotmob_known_count']}; "
-                f"расхождений {differences}")
+                f"расхождений {differences}; без эталона: {len(report.get('without_reference', []))}")
     return (f"FBref: матчей {report['date']} UTC {report['played']}, ≤24 ч {report['on_time']} "
             f"({percentage}), у FotMob {k}; {state}; ожидают {report['pending']}, "
             f"неизвестно {report['unknown']}; "

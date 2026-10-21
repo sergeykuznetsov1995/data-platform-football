@@ -43,7 +43,10 @@
       "fbref_name": "OFC Nations Cup",
       "fotmob_ids": [],
       "fotmob_names": [],
-      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+      "reason": "Absent from complete FotMob catalog (562 competitions, discovery_date 2026-10-21); no substitute tournament inferred",
+      "reference_coverage": "absent_from_fotmob_catalog",
+      "reference_evidence": ".local/task/fotmob-catalog-evidence.md",
+      "reference_evidence_date": "2026-10-21"
     },
     "676": {
       "fbref_name": "UEFA European Football Championship",
@@ -238,7 +241,10 @@
       "fbref_name": "FIFA Confederations Cup",
       "fotmob_ids": [],
       "fotmob_names": [],
-      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+      "reason": "Absent from complete FotMob catalog (562 competitions, discovery_date 2026-10-21); no substitute tournament inferred",
+      "reference_coverage": "absent_from_fotmob_catalog",
+      "reference_evidence": ".local/task/fotmob-catalog-evidence.md",
+      "reference_evidence_date": "2026-10-21"
     },
     "24": {
       "fbref_name": "Campeonato Brasileiro Série A",
@@ -284,11 +290,12 @@
       "season_keys": {
         "2026": {
           "274": [
+            "2026 - Apertura",
             "2026 - Clausura"
           ]
         }
       },
-      "season_evidence": "Exact phase edition observed in FotMob snapshot 2026-10-21T05:39:19Z; other editions/phases are not inferred"
+      "season_evidence": "Both exact 2026 phase keys in FotMob season manifests of snapshot 2026-10-21T05:39:19Z; fresh full phase discovery and individual phase confirmations still required"
     },
     "37": {
       "fbref_name": "Belgian Pro League",
@@ -869,7 +876,10 @@
       "fbref_name": "AFC Asian Cup qualification",
       "fotmob_ids": [],
       "fotmob_names": [],
-      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+      "reason": "Absent from complete FotMob catalog (562 competitions, discovery_date 2026-10-21); no substitute tournament inferred",
+      "reference_coverage": "absent_from_fotmob_catalog",
+      "reference_evidence": ".local/task/fotmob-catalog-evidence.md",
+      "reference_evidence_date": "2026-10-21"
     },
     "7": {
       "fbref_name": "FIFA World Cup Qualification — AFC",
@@ -947,7 +957,10 @@
       "fbref_name": "Coupe de la Ligue",
       "fotmob_ids": [],
       "fotmob_names": [],
-      "reason": "No matching competition in observed FotMob included catalog; not inferred from similar names"
+      "reason": "Absent from complete FotMob catalog (562 competitions, discovery_date 2026-10-21); no substitute tournament inferred",
+      "reference_coverage": "absent_from_fotmob_catalog",
+      "reference_evidence": ".local/task/fotmob-catalog-evidence.md",
+      "reference_evidence_date": "2026-10-21"
     },
     "604": {
       "fbref_name": "Trophée des Champions",
