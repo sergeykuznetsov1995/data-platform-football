@@ -903,6 +903,8 @@ with DAG(
     plan = PythonOperator(
         task_id="plan_refresh_batch",
         python_callable=_plan_refresh_batch,
+        # Existing Bronze schedules remain usable after a failed sweep.
+        trigger_rule="all_done",
         retries=0,
     )
     run = BashOperator.partial(
