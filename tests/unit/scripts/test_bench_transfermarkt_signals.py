@@ -295,6 +295,73 @@ def test_real_raw_store_and_source_parsers_roundtrip(tmp_path):
     assert len(list((tmp_path / "raw/attempts").rglob("*.json"))) == 5
 
 
+@pytest.mark.parametrize("roster_value,ceapi_value,issues", [
+    (None, None, []), (None, 0, []),
+    (100000, None, ["tmapi_value_vs_squad"]),
+    (None, 100000, ["tmapi_value_vs_ceapi"]),
+])
+def test_zero_value_parity_preserves_positive_mismatches(tmp_path, roster_value, ceapi_value, issues):
+    roster = SQUAD.replace(b"\xe2\x82\xac30.00m", b"-" if roster_value is None else b"\xe2\x82\xac100k")
+    payload = json.dumps({"success": True, "data": [tmapi_row(
+        "262749", value=0, contract="2028-06-30", club="11", value_date="2026-10-09")]}).encode()
+    tasks, players, groups, store, results = real_parity_evidence(
+        tmp_path, squad=roster, players=payload, players_closing=payload,
+        mv=json.dumps({"list": [{"datum_mw": "Oct 9, 2026", "y": ceapi_value}]}).encode())
+    report = bench.parity_report(tasks, results, store, players, groups)
+    assert report["comparisons"][0]["issues"] == issues
+
+
+@pytest.mark.parametrize("contracts,other_issue,expected", [
+    (0, None, True), (10, None, True), (20, None, True), (21, None, False),
+    (10, "club", False), (10, "value_date", False), (20, "absent", False),
+])
+def test_contract_share_gate_counts_compared_players(monkeypatch, contracts, other_issue, expected):
+    import scrapers.transfermarkt.scraper as scraper
+    ids = [str(i) for i in range(1, 1001)]
+    tasks, players, groups = bench.plan_tasks({"clubs": [{
+        "club_id": "281", "scope": "GB1/2026", "saison_id": 2026,
+        "groups": sorted(bench.GROUPS), "player_ids": ids}]})
+    monkeypatch.setattr(scraper, "_parse_squad_page", lambda *a: [
+        {"player_id": player, "market_value_eur": 1000,
+         "contract_until": date(2029 if int(player) <= contracts else 2028, 6, 30)}
+        for player in ids if not (player == "1000" and other_issue == "absent")])
+    bodies = {}
+    for task in tasks:
+        if task["kind"] == "squad":
+            body = b'<table class="items"><thead><th>Contract</th></thead></table>'
+        elif task["kind"] in {"players", "players_closing"}:
+            body = json.dumps({"success": True, "data": [tmapi_row(
+                player, value=1000, contract="2028-06-30",
+                club="999" if player == "1000" and other_issue == "club" else "281")
+                for player in task["ids"]]}).encode()
+        elif task["kind"] == "mv" and task["player_id"] == "1000" and other_issue == "value_date":
+            body = b'{"list":[{"datum_mw":"Oct 8, 2026","y":1000}]}'
+        else:
+            body = b'{"list":[]}' if task["kind"] == "mv" else b'{"transfers":[]}'
+        bodies[task["url"]] = body
+    store = SimpleNamespace(load_capture=lambda url: (bodies[url], SimpleNamespace(
+        url=url, status_code=200, fetched_at="2026-10-09T00:00:00Z")))
+    report = bench.parity_report(tasks, {t["key"]: {"raw_capture_id": t["url"]} for t in tasks}, store, players, groups)
+    assert report["field_parity_gate"] is expected
+    assert report["contract_mismatches"] == [
+        {"player_id": str(i), "tmapi_contract": "2028-06-30", "squad_contract": "2029-06-30"}
+        for i in range(1, contracts + 1)]
+    assert report["contract_mismatch_count"] == contracts
+    assert report["contract_mismatch_share"] == contracts / (999 if other_issue == "absent" else 1000)
+    assert report["contract_mismatch_threshold"] == 0.02
+
+
+def test_tolerated_initial_contract_is_preferred_to_strict_closing_mismatch(tmp_path):
+    def payload(value):
+        return json.dumps({"success": True, "data": [tmapi_row(
+            "262749", value=value, contract="2029-06-30", club="11", value_date="2026-10-09")]}).encode()
+    tasks, players, groups, store, results = real_parity_evidence(
+        tmp_path, players=payload(30000000), players_closing=payload(25000000))
+    report = bench.parity_report(tasks, results, store, players, groups)
+    assert report["comparisons"][0]["detector_fetch"] == "initial"
+    assert report["comparisons"][0]["issues"] == ["tmapi_contract_vs_squad"]
+
+
 def test_reference_update_mid_observation_is_matched_by_closing_packet(tmp_path):
     def packet(value, value_date):
         return json.dumps({"success": True, "data": [tmapi_row("262749", value=value, contract="2028-06-30", club="11", value_date=value_date)]}).encode()

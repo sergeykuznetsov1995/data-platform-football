@@ -660,12 +660,29 @@ class _Scope:
             self.scraper._http_client._record_cache_hit(label='current_players', duration_seconds=0)
             packets[capture_id] = (parsed, receipt)
         parsed, receipt = packets[capture_id]
-        if player_id not in parsed or parsed[player_id].signature != fact['signature']:
+        if player_id not in parsed or fact['signature'] not in (parsed[player_id].signature, parsed[player_id].legacy_signature):
             raise CurrentPortionError('cached global player fields differ from primary raw payload')
         outcome = FetchOutcome(status=FetchStatus.OK, cache_hit=True, raw_capture_id=capture_id,
             raw_body_hash=receipt.content_hash, raw_fetched_at=receipt.fetched_at,
             raw_uri=receipt.raw_uri, raw_attempt_envelope_ids=tuple(fact['raw_attempt_envelope_ids']))
         return parsed[player_id], outcome, receipt.url, fact['primary_scope_id']
+
+    def _normalize_player_signature(self, player_id, previous):
+        """Migrate only a signature proven by the saved exact player fields.
+
+        Preserve pending/failed status and all Bronze proof and event times.
+        Positive values and already canonical signatures are unchanged.
+        """
+        old = tmapi.PlayerSignal(**previous)
+        state = self.signals.get(f'player:{player_id}')
+        if old.signature == old.legacy_signature or state is None or state.observation.signature != old.legacy_signature:
+            return
+        self.signals[f'player:{player_id}'] = replace(
+            state, observation=replace(state.observation, signature=old.signature),
+            applied_signature=old.signature if state.applied_signature == old.legacy_signature else state.applied_signature)
+        applied = self.data.get('player_roster_applied', {})
+        if applied.get(player_id) == old.legacy_signature:
+            applied[player_id] = old.signature
 
     def _save_player_packet(self, parsed, outcome, url):
         facts = {}
@@ -851,6 +868,8 @@ class _Scope:
                 source_times.append(outcome.raw_fetched_at)
                 source_scopes[outcome.raw_capture_id] = primary_scope
                 previous = self.data.setdefault('player_values', {}).get(player_id)
+                if previous is not None:
+                    self._normalize_player_signature(player_id, previous)
                 national_career_only = False
                 if national and previous is not None:
                     old_assignments = [assignment for assignment in previous.get('assignments', []) if assignment[1] == 'nationalTeam']
@@ -858,14 +877,14 @@ class _Scope:
                     national_career_only = (
                         (not old_assignments or not new_assignments
                          or semantic_signature(old_assignments) == semantic_signature(new_assignments))
-                        and previous.get('market_value_eur') == signal.market_value_eur
+                        and tmapi.normalize_market_value(previous.get('market_value_eur')) == tmapi.normalize_market_value(signal.market_value_eur)
                         and previous.get('attributes_json') == signal.attributes_json)
                 value_dates = self.data.get('career_value_dates', {})
                 known_value_date = value_dates.get(player_id)
                 date_only = previous is not None and (
                     previous.get('market_value_date') != signal.market_value_date
-                    and semantic_signature({key: value for key, value in previous.items() if key != 'market_value_date'})
-                    == semantic_signature({key: value for key, value in signal.as_dict().items() if key != 'market_value_date'}))
+                    and tmapi.player_signal_signature({key: value for key, value in previous.items() if key != 'market_value_date'})
+                    == tmapi.player_signal_signature({key: value for key, value in signal.as_dict().items() if key != 'market_value_date'}))
                 player_rows = [row for row in self.snapshot.rows if row['player_id'] == player_id]
                 baseline_proof = None
                 if previous is None:
@@ -879,7 +898,7 @@ class _Scope:
                     comparable_matches = (
                         self.data.get('roster_proof')
                         and signal_roster_clubs == memberships[player_id]
-                        and all(row.get('market_value_eur') == signal.market_value_eur
+                        and all(tmapi.normalize_market_value(row.get('market_value_eur')) == tmapi.normalize_market_value(signal.market_value_eur)
                                 and (national or (str(row['contract_until']) if row.get('contract_until') is not None else None) == signal.contract_until)
                                 and (row.get('market_value_date') is None or str(row['market_value_date']) == signal.market_value_date)
                                 for row in player_rows))
@@ -912,7 +931,7 @@ class _Scope:
                         self.resume.setdefault('squad_generations', {})[club_id] = semantic_signature(
                             [state.first_detected_at.isoformat(), signal.signature])
                     careers = self.resume.setdefault('careers', {})
-                    if (previous.get('market_value_eur'), previous.get('market_value_date')) != (signal.market_value_eur, signal.market_value_date):
+                    if (tmapi.normalize_market_value(previous.get('market_value_eur')), previous.get('market_value_date')) != (tmapi.normalize_market_value(signal.market_value_eur), signal.market_value_date):
                         careers.setdefault('market_value_points', []).append(player_id)
                     if _professional_assignment_changed(previous, signal):
                         careers.setdefault('transfer_events', []).append(player_id)
@@ -1024,7 +1043,7 @@ class _Scope:
             expected = set(values['club_ids']) & set(snapshot.expected_team_ids)
             changed = memberships if national else memberships | expected
             inconsistent = (not national and memberships != expected) or any(
-                row['market_value_eur'] != values['market_value_eur']
+                tmapi.normalize_market_value(row['market_value_eur']) != tmapi.normalize_market_value(values['market_value_eur'])
                 or (not national and (str(row['contract_until']) if row['contract_until'] is not None else None)
                     != values['contract_until']) for row in rows)
             if inconsistent:
@@ -1456,7 +1475,7 @@ class _Scope:
                         expected = self.data.get('player_values', {}).get(player_id)
                         if expected and expected.get('market_value_present') and points:
                             latest = max(points, key=lambda point: str(point['mv_date']))
-                            if (latest['value_eur'] != expected['market_value_eur']
+                            if (tmapi.normalize_market_value(latest['value_eur']) != tmapi.normalize_market_value(expected['market_value_eur'])
                                 or (expected.get('market_value_date') is not None
                                     and str(latest['mv_date']) != expected['market_value_date'])):
                                 mismatched_ids.append(player_id)

@@ -36,6 +36,28 @@ class TmapiSchemaError(ValueError):
     """A tmapi payload does not have the shape this module relies on."""
 
 
+def normalize_market_value(value: Any) -> Any:
+    """Compare source zero and Bronze's absent rating as the same value.
+
+    Keep positive amounts and all other fields (including dates) strict.
+    The dash is the website's unpriced display before Bronze parsing.
+    """
+    return None if value is None or value == 0 or value == '-' else value
+
+
+def player_signal_signature(fields: Mapping[str, Any]) -> str:
+    normalized = dict(fields)
+    normalized['market_value_eur'] = normalize_market_value(fields['market_value_eur'])
+    normalized['market_value_present'] = normalized['market_value_eur'] is not None
+    return _signal_hash(normalized)
+
+
+def _signal_hash(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        fields, sort_keys=True, separators=(',', ':'), allow_nan=False,
+    ).encode('utf-8')).hexdigest()
+
+
 @dataclass(frozen=True)
 class RegulationSeason:
     saison_id: int
@@ -66,9 +88,12 @@ class PlayerSignal:
 
     @property
     def signature(self) -> str:
-        return hashlib.sha256(json.dumps(
-            self.as_dict(), sort_keys=True, separators=(',', ':'), allow_nan=False,
-        ).encode('utf-8')).hexdigest()
+        return player_signal_signature(self.as_dict())
+
+    @property
+    def legacy_signature(self) -> str:
+        """Read old saved facts without changing their immutable raw payload."""
+        return _signal_hash(self.as_dict())
 
 
 def _source_id(value: Any) -> str:
@@ -309,4 +334,6 @@ __all__ = [
     "players_url",
     "PlayerSignal",
     "parse_player_signals",
+    "normalize_market_value",
+    "player_signal_signature",
 ]

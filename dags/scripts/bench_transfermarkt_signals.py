@@ -49,7 +49,8 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "dags") not in sys.path:
     sys.path.append(str(ROOT / "dags"))
 
-from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, players_url
+from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, players_url, normalize_market_value
+from scrapers.transfermarkt.signal_qualification import CONTRACT_MISMATCH_THRESHOLD
 
 MIB = 1024 * 1024
 MAX_ATTEMPTS = 5071  # 4471 + 600 по решению владельца 21.10.2026 («Больше повторов», #1393)
@@ -384,12 +385,12 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
             issues.append("tmapi_club_vs_squad")
         else:
             _, row = matching[0]
-            if value != row.get("market_value_eur"):
+            if normalize_market_value(value) != normalize_market_value(row.get("market_value_eur")):
                 issues.append("tmapi_value_vs_squad")
             if contract != (row["contract_until"].isoformat() if row.get("contract_until") else None):
                 issues.append("tmapi_contract_vs_squad")
         if latest_mv:
-            if latest_mv["value_eur"] != value:
+            if normalize_market_value(latest_mv["value_eur"]) != normalize_market_value(value):
                 issues.append("tmapi_value_vs_ceapi")
             if latest_mv["mv_date"].isoformat() != api.market_value_date:
                 issues.append("tmapi_value_date_vs_ceapi")
@@ -397,6 +398,7 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
             issues.append("tmapi_club_vs_ceapi")
         return issues, matching
 
+    contract_mismatches = []
     for player in players:
         if player not in squads:
             # Left every sampled club: a roster change, never a crash or a
@@ -419,12 +421,16 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
         if player in closing:
             candidates.append(("closing", closing[player], closing_raw[player]))
         checked = [(name, api, proof, *detector_issues(api, squads[player], latest_mv, moves)) for name, api, proof in candidates]
-        detector_fetch, api, detector_raw, issues, matching = next((item for item in checked if not item[3]), checked[-1])
+        tolerated = next((item for item in checked if set(item[3]) <= {"tmapi_contract_vs_squad"}), checked[-1])
+        detector_fetch, api, detector_raw, issues, matching = next((item for item in checked if not item[3]), tolerated)
         value, contract, clubs = api.market_value_eur, api.contract_until, api.club_ids
         comparisons.append({"player_id": player, "fields": {"value": value, "value_date": api.market_value_date, "value_present": api.market_value_present, "contract": contract, "clubs": clubs},
                             "mv_rows": len(mv_rows), "transfer_rows": len(transfer_rows), "issues": issues,
                             "detector_fetch": detector_fetch})
         chosen_club, chosen_row = matching[0] if matching else squads[player][0]
+        if "tmapi_contract_vs_squad" in issues:
+            contract_mismatches.append({"player_id": player, "tmapi_contract": contract,
+                                        "squad_contract": chosen_row["contract_until"].isoformat() if chosen_row.get("contract_until") else None})
         mv_ref = ({"status": "compared", "value": latest_mv["value_eur"], "value_date": latest_mv["mv_date"].isoformat(), "raw_rows": mv_raw_count}
                   if history else {"status": "authoritative_empty" if mv_raw_count == 0 else "unknown", "raw_rows": mv_raw_count})
         transfer_ref = ({"status": "compared", "club_id": max(moves, key=lambda row: row["transfer_date"])["to_club_id"], "raw_rows": transfer_raw_count}
@@ -441,6 +447,8 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
     scopes = sorted({task["scope"] for task in tasks if task["kind"] == "squad"})
     proofs = sorted((proof for proof in edition_proofs or [] if proof["scope"] in scopes), key=lambda proof: proof["scope"])
     editions_proven = bool(scopes) and [proof["scope"] for proof in proofs] == scopes
+    contract_share = len(contract_mismatches) / len(qualification_rows) if qualification_rows else 0.0
+    strict_failures = any(any(issue != "tmapi_contract_vs_squad" for issue in row["issues"]) for row in failures)
     return {"players_checked": len(players), "groups": sorted(groups), "comparisons": comparisons,
             "cohort": {"player_ids": sorted(players, key=int), "groups": sorted(groups),
                        "scope_basis": "source_current_edition" if editions_proven else "configured_denominator",
@@ -452,11 +460,14 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
                                           "unknown_ids": [], "observed_from": min(observed), "observed_to": max(observed),
                                           "counts": {"expected": len(players), "compared": len(qualification_rows), "missing": len(absent), "unknown": 0},
                                           "day_msk": day_msk, "ceapi_empty_counts": empty_counts},
-            "mismatches": failures, "observed_from": min(observed), "observed_to": max(observed),
+            "mismatches": failures, "contract_mismatches": contract_mismatches,
+            "contract_mismatch_count": len(contract_mismatches), "contract_mismatch_share": contract_share,
+            "contract_mismatch_threshold": CONTRACT_MISMATCH_THRESHOLD,
+            "observed_from": min(observed), "observed_to": max(observed),
             "observation_day_msk": day_msk, "career_date_rule": "source calendar Europe/Berlin at raw fetched_at; original raw is UTC",
             "ceapi_missing_comparisons": {"value": sum(not mv[player][0] for player in players),
                                           "club": sum(not transfers[player][0] for player in players)},
-            "field_parity_gate": len(players) >= 1000 and GROUPS <= groups and not failures,
+            "field_parity_gate": len(players) >= 1000 and GROUPS <= groups and not strict_failures and contract_share <= CONTRACT_MISMATCH_THRESHOLD,
             "detector_gate": None, "detector_gate_evaluated_by": "qualify",
             "remaining_gate": "second-day real changes and freshness evidence required"}
 
