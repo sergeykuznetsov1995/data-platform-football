@@ -801,12 +801,17 @@ class FotMobIngestService:
     ) -> list[str]:
         manifest_status = status or _fetch_manifest_status(fetch)
         capabilities = dict(capabilities or {})
-        if target_type == "match" and not fetch.stale and manifest_status in {
+        if target_type in {"match", "league_season"} and not fetch.stale and manifest_status in {
             ManifestStatus.SUCCESS, ManifestStatus.NOT_MODIFIED,
         }:
             observed = match_time(fetch.source_observed_at or fetch.fetched_at)
             if observed is not None:
-                capabilities["source_observed_at"] = observed.isoformat()
+                # League manifests are read as ISO timestamps by the daily
+                # meter; keep an explicit UTC offset independent of SQL session.
+                capabilities["source_observed_at"] = (
+                    observed.replace(tzinfo=timezone.utc) if target_type == "league_season"
+                    else observed
+                ).isoformat()
         commit = TargetCommit(
             run_id=self.run_id,
             target_type=target_type,
