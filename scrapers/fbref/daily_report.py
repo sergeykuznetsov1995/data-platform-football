@@ -112,38 +112,18 @@ def _scope(snapshot: Mapping) -> tuple[dict, set, list]:
 
 
 def _day_comparator_scope(snapshot: Mapping, pairs: set, day: date) -> tuple[set, list]:
-    """A latest advertised season can be historical, not an ongoing edition.
+    """Keep every current pair without positive evidence of edition closure.
 
-    Exclude only old editions with a successfully fetched schedule and no rows
-    in the UTC day neighbourhood (including unplayed fixtures). Missing reads,
-    unhealthy schedules and recent/off-season editions remain blockers.
+    A year in the registry, a fresh schedule fetch and empty day windows do
+    not establish closure. The snapshot has no authoritative edition bounds
+    or complete tournament catalogue, so it cannot justify exclusions.
     """
-    health = {(str(r["competition_id"]), str(r["season_id"])): r.get("fetched")
-              for r in snapshot.get("schedule_health", [])}
-    occupied = set()
-    for row in snapshot.get("schedules", []):
-        pair = (str(row["source_competition_id"]), str(row["source_season_id"]))
-        try:
-            nearby = abs((date.fromisoformat(str(row.get("date"))) - day).days) <= 1
-        except ValueError:
-            nearby = True
-        if nearby:
-            occupied.add(pair)
-    # Explicit UTC evidence also prevents exclusion when a fixture was moved
-    # away from the date still present in its source schedule row.
-    for row in snapshot.get("observations", []):
-        kickoff = instant(row.get("kickoff_at"))
-        if kickoff is not None and abs((kickoff.date() - day).days) <= 1:
-            occupied.add((str(row["competition_id"]), str(row["season_id"])))
-    excluded = []
-    for cid, sid in sorted(pairs):
-        token = season_token(sid)
-        if (token and int(token[-4:]) < day.year - 1
-                and health.get((cid, sid)) and (cid, sid) not in occupied
-                and not snapshot.get("errors")):
-            excluded.append({"competition_id": cid, "season_id": sid,
-                             "reason": "historical_latest_season_without_day_fixtures"})
-    return pairs - {(r["competition_id"], r["season_id"]) for r in excluded}, excluded
+    return pairs, []
+
+
+def _edition_token(key: object) -> str | None:
+    # Detection only: this never makes an unknown phase an accepted alias.
+    return season_token(str(key or "").split(" - ", 1)[0])
 
 
 def _fotmob_season_keys(entry: Mapping, fid: object, sid: str) -> set[str]:
@@ -176,19 +156,43 @@ def _fotmob_counts(snapshot: Mapping, mapping: Mapping, pairs: set, day: date,
             aliases = _fotmob_season_keys(entry, fid, sid)
             def matches_season(key):
                 return key in aliases if aliases else season_token(key) == canonical_season
-            available = [s for s in seasons if str(s["competition_id"]) == str(fid)
-                         and matches_season(s.get("season_key"))]
-            confirmations = [instant(s.get("validated_at") or s.get("fetched_at"))
-                             for s in available if not s.get("stale")]
-            confirmations = [t for t in confirmations if t is not None and t <= as_of]
-            latest = max(confirmations, default=None)
-            if latest is None or as_of - latest > timedelta(hours=24):
-                problems.append({"competition_id": cid, "fotmob_id": str(fid), "season_id": sid,
-                                 "reason": "stale_fotmob_season" if latest else "missing_fotmob_season",
-                                 "last_confirmed_at": latest.isoformat() if latest else None,
-                                 "age_hours": (as_of-latest).total_seconds()/3600 if latest else None})
+            known_keys = {str(r.get("season_key") or "")
+                          for r in [*seasons, *fixtures]
+                          if str(r["competition_id"]) == str(fid)}
+            newer = sorted(key for key in known_keys
+                           if _edition_token(key) and
+                           int(_edition_token(key)[-4:]) > int(canonical_season[-4:]))
+            if newer:
+                problems.append({"competition_id": cid, "season_id": sid,
+                                 "fotmob_id": str(fid), "reason": "fbref_registry_behind_fotmob",
+                                 "newer_season_keys": newer})
                 valid = False
-                continue
+            unknown_phases = sorted(key for key in known_keys
+                                    if (_edition_token(key) == canonical_season
+                                        or _edition_token(key) is None)
+                                    and not matches_season(key))
+            if unknown_phases:
+                problems.append({"competition_id": cid, "season_id": sid,
+                                 "fotmob_id": str(fid), "reason": "unknown_fotmob_season_phase",
+                                 "season_keys": unknown_phases})
+                valid = False
+            # Every explicit phase must have its own fresh confirmation.
+            required = [{key} for key in sorted(aliases)] if aliases else [
+                {key for key in known_keys if matches_season(key)}]
+            for keys in required:
+                available = [s for s in seasons if str(s["competition_id"]) == str(fid)
+                             and s.get("season_key") in keys]
+                confirmations = [instant(s.get("validated_at") or s.get("fetched_at"))
+                                 for s in available if not s.get("stale")]
+                confirmations = [t for t in confirmations if t is not None and t <= as_of]
+                latest = max(confirmations, default=None)
+                if latest is None or as_of - latest > timedelta(hours=24):
+                    problems.append({"competition_id": cid, "fotmob_id": str(fid), "season_id": sid,
+                                     "season_keys": sorted(keys),
+                                     "reason": "stale_fotmob_season" if latest else "missing_fotmob_season",
+                                     "last_confirmed_at": latest.isoformat() if latest else None,
+                                     "age_hours": (as_of-latest).total_seconds()/3600 if latest else None})
+                    valid = False
             for row in fixtures:
                 if str(row["competition_id"]) != str(fid) or not matches_season(row.get("season_key")):
                     continue

@@ -37,7 +37,7 @@ def host_trino(query: str):
     columns = {
         "fbref_table_inventory": ["target_id", "content_hash"],
         "fbref_schedule": ["source_competition_id", "source_season_id", "date", "time", "home", "away", "score", "notes", "match_url"],
-        "fotmob_ingest_manifest": ["competition_id", "season_key", "fetched_at"],
+        "fotmob_ingest_manifest": ["competition_id", "season_key", "fetched_at", "validated_at"],
         "fotmob_matches_current": ["competition_id", "season_key", "match_id", "utc_time", "timezone", "finished", "cancelled", "postponed", "awarded"],
     }
     selected = next(fields for table, fields in columns.items() if table in query)

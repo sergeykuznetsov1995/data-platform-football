@@ -447,27 +447,16 @@ def test_1792_exact_phase_mapping_counts_and_deduplicates(cid, sid, fid, phase):
 
 
 @pytest.mark.parametrize("cid,sid", [("257", "2024"), ("665", "2023"), ("666", "2017"), ("693", "2019-2020")])
-def test_1792_old_latest_seasons_without_day_fixtures_do_not_require_invented_ids(cid, sid):
+def test_1792_old_latest_seasons_without_proof_remain_blockers(cid, sid):
     data = snapshot()
     data["competitions"].append({**data["competitions"][0], "competition_id": cid})
     data["seasons"].append({**data["seasons"][0], "competition_id": cid, "season_id": sid})
     data["schedule_health"].append({"competition_id": cid, "season_id": sid, "fetched": True})
     result = report(data)
-    assert result["milestone_day_pass"]
-    assert result["day_scope_exclusions"] == [{"competition_id": cid, "season_id": sid,
-          "reason": "historical_latest_season_without_day_fixtures"}]
-    data["schedules"].append({**data["schedules"][0], "source_competition_id": cid,
-                              "source_season_id": sid, "score": "", "match_url": None})
-    assert not report(data)["milestone_day_pass"]  # even an unplayed row restores comparator checks
-    data["schedules"].pop()
-    data["observations"].append({**data["observations"][0], "competition_id": cid, "season_id": sid})
-    assert not report(data)["milestone_day_pass"]  # explicit UTC evidence also restores comparator checks
-    data["observations"].pop()
-    data["schedule_health"][-1]["fetched"] = False
-    assert not report(data)["milestone_day_pass"]
-    data["schedule_health"][-1]["fetched"] = True
-    data["seasons"][-1]["season_id"] = "2026"
-    assert not report(data)["milestone_day_pass"]
+    assert not result["milestone_day_pass"]
+    assert result["day_scope_exclusions"] == []
+    assert any(p["competition_id"] == cid and p["reason"] == "unmapped_fotmob_competition"
+               for p in result["fotmob_problems"])
 
 
 def test_1792_summary_names_date_deadline_comparator_blockers_even_with_unknown_zero():
@@ -483,3 +472,54 @@ def test_1792_summary_names_date_deadline_comparator_blockers_even_with_unknown_
     assert "UTC не подтверждено 1" in line and "дедлайн не истёк 1" in line
     assert "missing_fotmob_season" in line and "известно частично 0" in line
     assert not result["final"] and not result["milestone_day_pass"]
+
+
+def test_1792_registry_lag_is_visible_even_with_fresh_old_edition():
+    from scrapers.fbref.daily_report import summary_line
+    data = snapshot()
+    data['seasons'][0]['season_id'] = '2023'
+    data['schedule_health'][0]['season_id'] = '2023'
+    data['schedules'] = data['observations'] = []
+    data['fotmob_matches'] = []
+    data['fotmob_seasons'] = [
+        dict(data['fotmob_seasons'][0], season_key='2023'),
+        dict(data['fotmob_seasons'][0], season_key='2027')]
+    result = report(data)
+    assert result['day_scope_exclusions'] == []
+    assert result['fotmob'] is None and not result['milestone_day_pass']
+    assert 'fbref_registry_behind_fotmob' in summary_line(result)
+
+
+@pytest.mark.parametrize('evidence', ['fotmob_seasons', 'fotmob_matches'])
+@pytest.mark.parametrize('phase', ['2026/2027 - Clausura', '2026/2027 Clausura', 'New phase'])
+def test_1792_new_phase_blocks_false_zero_even_with_fresh_apertura(evidence, phase):
+    data = snapshot()
+    data['schedules'] = data['observations'] = []
+    data['fotmob_seasons'][0]['season_key'] = '2026/2027 - Apertura'
+    data['fotmob_matches'] = []
+    if evidence == 'fotmob_seasons':
+        data[evidence].append(dict(data['fotmob_seasons'][0], season_key=phase))
+    else:
+        data[evidence].append(dict(snapshot()['fotmob_matches'][0], season_key=phase))
+    mapping = {'9': {'fotmob_ids': ['47'], 'season_keys': {
+        '2026-2027': {'47': ['2026/2027 - Apertura']}}}}
+    result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert result['fotmob'] is None
+    assert any(p['reason'] == 'unknown_fotmob_season_phase' for p in result['fotmob_problems'])
+    assert not result['milestone_day_pass']
+
+
+@pytest.mark.parametrize('confirmation', ['missing', 'stale', 'fresh'])
+def test_1792_every_mapped_phase_needs_its_own_fresh_evidence(confirmation):
+    data = snapshot()
+    data['fotmob_seasons'][0]['season_key'] = '2026/2027 - Apertura'
+    data['fotmob_matches'][0]['season_key'] = '2026/2027 - Clausura'
+    if confirmation != 'missing':
+        data['fotmob_seasons'].append(dict(data['fotmob_seasons'][0],
+            season_key='2026/2027 - Clausura',
+            fetched_at=(AS_OF - timedelta(hours=25 if confirmation == 'stale' else 1)).isoformat()))
+    mapping = {'9': {'fotmob_ids': ['47'], 'season_keys': {
+        '2026-2027': {'47': ['2026/2027 - Apertura', '2026/2027 - Clausura']}}}}
+    result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert result['milestone_day_pass'] is (confirmation == 'fresh')
+    assert result['fotmob'] == (1 if confirmation == 'fresh' else None)
