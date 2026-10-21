@@ -24,6 +24,9 @@ from datetime import date
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlencode
 
+MAX_PLAYER_IDS = 100
+MAX_PLAYERS_QUERY_BYTES = 2000
+
 TMAPI_BASE = "https://tmapi.transfermarkt.technology"
 _ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 _SAISON_RE = re.compile(r"(?:18|19|20|21)\d{2}")
@@ -186,14 +189,17 @@ def competition_regulation_url(competition_id: Any) -> str:
 
 
 def players_url(player_ids) -> str:
-    """Public player signal packet: at most 300 distinct positive IDs."""
+    """Public player packet within the WAF ID and encoded query limits."""
     ids = tuple(str(value).strip() for value in player_ids)
     if (
-        not 1 <= len(ids) <= 300 or len(set(ids)) != len(ids)
+        not 1 <= len(ids) <= MAX_PLAYER_IDS or len(set(ids)) != len(ids)
         or any(not re.fullmatch(r'[0-9]+', value) or int(value) <= 0 for value in ids)
     ):
-        raise ValueError('players packet requires 1..300 unique positive IDs')
-    return f'{TMAPI_BASE}/players?' + urlencode([('ids[]', value) for value in ids])
+        raise ValueError('players packet requires 1..100 unique positive IDs')
+    query = urlencode([('ids[]', value) for value in ids])
+    if len(query.encode('ascii')) > MAX_PLAYERS_QUERY_BYTES:
+        raise ValueError('players packet query exceeds 2000 bytes')
+    return f'{TMAPI_BASE}/players?' + query
 
 
 def _data(payload: Any) -> Any:
@@ -298,6 +304,8 @@ __all__ = [
     "current_saison_id",
     "parse_competition_clubs",
     "parse_regulation",
+    "MAX_PLAYER_IDS",
+    "MAX_PLAYERS_QUERY_BYTES",
     "players_url",
     "PlayerSignal",
     "parse_player_signals",

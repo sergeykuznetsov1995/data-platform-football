@@ -824,8 +824,8 @@ class _Scope:
         source_times = list(progress.get('source_times', []))
         source_scopes = dict(progress.get('source_scopes', {}))
         membership_validation = dict(progress.get('membership_validation', {}))
-        for offset in range(progress['offset'], len(ids), 300):
-            packet = ids[offset:offset + 300]
+        for offset in range(progress['offset'], len(ids), tmapi.MAX_PLAYER_IDS):
+            packet = ids[offset:offset + tmapi.MAX_PLAYER_IDS]
             facts = {player_id: self._player_fact(player_id, packets) for player_id in packet}
             missing = [player_id for player_id, fact in facts.items() if fact is None]
             if missing:

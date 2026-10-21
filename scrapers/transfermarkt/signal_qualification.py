@@ -19,6 +19,8 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
+from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, MAX_PLAYERS_QUERY_BYTES
+
 SCHEMA = "tm-signal-qualification-v1"
 OBSERVATION_SCHEMA = "tm-signal-parity-observation-v1"
 GROUPS = {"top_league", "lower_league", "calendar", "cup"}
@@ -59,8 +61,10 @@ def _ids(values):
 
 @lru_cache(maxsize=64)
 def _packet_ids(url):
-    query = parse_qs(urlsplit(url).query)
-    _require(set(query) == {"ids[]"} and len(query["ids[]"]) <= 300, "tmapi packet identity is wrong")
+    raw_query = urlsplit(url).query
+    _require(len(raw_query.encode("utf-8")) <= MAX_PLAYERS_QUERY_BYTES, "tmapi packet query exceeds 2000 bytes")
+    query = parse_qs(raw_query)
+    _require(set(query) == {"ids[]"} and 1 <= len(query["ids[]"]) <= MAX_PLAYER_IDS, "tmapi packet identity is wrong")
     return frozenset(_ids(query["ids[]"]))
 
 

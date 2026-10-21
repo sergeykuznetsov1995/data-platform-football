@@ -20,8 +20,8 @@ sample.json: {"clubs": [{"club_id":"281", "saison_id":2026,
  "scope":"GB1/2026",
  "edition_url":"https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
  "groups":["top_league"], "player_ids":["8198"]}]}
-The public tmapi.parse_player_signals contract is grounded in saved 300-ID
-source raw and rechecked by the initial probe. Neither missing cost nor national
+The public tmapi.parse_player_signals contract is grounded in saved source
+raw and rechecked by the initial probe; requests use at most 100 IDs. Neither missing cost nor national
 team membership is guessed from a generic JSON field map.
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 import uuid
 from zoneinfo import ZoneInfo
 import re
@@ -48,6 +48,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(ROOT / "dags") not in sys.path:
     sys.path.append(str(ROOT / "dags"))
+
+from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, players_url
 
 MIB = 1024 * 1024
 MAX_ATTEMPTS = 4600
@@ -86,11 +88,10 @@ def _id(value) -> str:
 
 
 def player_url(ids: list[str]) -> str:
-    if not ids or len(ids) > 300 or len(set(ids)) != len(ids):
-        raise ProbeGateError("tmapi batch needs 1..300 unique IDs")
-    return "https://tmapi.transfermarkt.technology/players?" + urlencode(
-        [("ids[]", _id(item)) for item in ids]
-    )
+    try:
+        return players_url(ids)
+    except ValueError as exc:
+        raise ProbeGateError(str(exc)) from exc
 
 
 def parse_players(payload, expected: list[str]):
@@ -209,8 +210,8 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
     if roster_only:
         return list(edition_tasks.values()) + list(participant_tasks.values()) + tasks, players, groups
     players = list(dict.fromkeys(players))
-    for offset in range(0, len(players), 300):
-        ids = players[offset:offset + 300]
+    for offset in range(0, len(players), MAX_PLAYER_IDS):
+        ids = players[offset:offset + MAX_PLAYER_IDS]
         tasks.append({"key": f"players/{offset}", "kind": "players", "ids": ids,
                       "scope": "parity/players", "json": True, "url": player_url(ids)})
     for player in players:
@@ -220,8 +221,8 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
                           "url": f"https://www.transfermarkt.com/ceapi/{path}/{player}"})
     # Closing packets re-read the detector after every reference of the day: a
     # source update landing mid-observation must be matched the same day.
-    for offset in range(0, len(players), 300):
-        ids = players[offset:offset + 300]
+    for offset in range(0, len(players), MAX_PLAYER_IDS):
+        ids = players[offset:offset + MAX_PLAYER_IDS]
         tasks.append({"key": f"players-closing/{offset}", "kind": "players_closing", "ids": ids,
                       "scope": "parity/players-closing", "json": True, "url": player_url(ids)})
     return tasks, players, groups

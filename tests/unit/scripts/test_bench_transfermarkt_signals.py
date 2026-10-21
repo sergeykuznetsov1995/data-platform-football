@@ -36,7 +36,7 @@ def outside_delivery_window(monkeypatch):
 
 def test_player_batches_are_bounded_and_encoded():
     assert bench.player_url(["40104", "8198"]).endswith("ids%5B%5D=40104&ids%5B%5D=8198")
-    for ids in ([], ["1"] * 2, [str(i) for i in range(1, 302)], ["0"], ["1&a=2"]):
+    for ids in ([], ["1"] * 2, [str(i) for i in range(1, 102)], [str(i) for i in range(1, 301)], [str(10000000000 + i) for i in range(100)], ["0"], ["1&a=2"]):
         with pytest.raises(bench.ProbeGateError):
             bench.player_url(ids)
 
@@ -67,13 +67,13 @@ def test_tmapi_batch_requires_identity_and_explicit_required_fields():
             bench.parse_players(payload, ["1"])
 
 
-def test_task_planner_reuses_careers_for_multiclub_player_and_batch300():
+def test_task_planner_reuses_careers_for_multiclub_player_and_batch100():
     sample = {"clubs": [{"club_id": "281", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"], "player_ids": [str(i) for i in range(1, 302)]},
                          {"club_id": "583", "saison_id": 2026, "scope": "FR1/2026", "player_ids": ["1"]}]}
     tasks, players, groups = bench.plan_tasks(sample)
     assert len(players) == 301
     assert "top_league" in groups
-    assert [len(task["ids"]) for task in tasks if task["kind"] == "players"] == [300, 1]
+    assert [len(task["ids"]) for task in tasks if task["kind"] == "players"] == [100, 100, 100, 1]
     assert len([task for task in tasks if task["key"] == "mv/1"]) == 1
     assert all("/plus/1" in task["url"] for task in tasks if task["kind"] == "squad")
 
@@ -668,3 +668,16 @@ def test_proxy_rejection_details_are_redacted_without_charging_source_attempt(tm
     assert "closed source allowlist" in report["error_detail"]
     assert "private" not in report["error_detail"] and "user:" not in report["error_detail"]
     assert report["experiment_totals"]["request_attempts"] == 0
+
+
+def test_thousand_players_use_ten_initial_and_ten_closing_packets():
+    ids = [str(value) for value in range(1000000, 1001000)]
+    sample = {"clubs": [{"club_id": "281", "saison_id": 2026, "scope": "GB1/2026", "player_ids": ids}]}
+    tasks, players, _ = bench.plan_tasks(sample)
+    assert players == ids
+    for kind in ("players", "players_closing"):
+        packets = [task for task in tasks if task["kind"] == kind]
+        assert len(packets) == 10
+        assert [player for task in packets for player in task["ids"]] == ids
+        assert all(len(task["ids"]) == 100 for task in packets)
+        assert all(len(bench.urlsplit(task["url"]).query.encode('ascii')) <= 2000 for task in packets)

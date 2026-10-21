@@ -664,7 +664,7 @@ def test_cli_expired_job_writes_reviewable_report_without_calling_collector(tmp_
     assert json.loads(output.read_text())['status'] == 'deadline'
 
 
-def test_player_packets_300_and_exact_partial_cursor_resume_in_same_signal_cycle(offline):
+def test_player_packets_100_and_exact_partial_cursor_resume_in_same_signal_cycle(offline):
     offline.club_ids = ('10',)
     offline.squad_players['10'] = [str(value) for value in range(101, 402)]
     offline.partial_careers = True
@@ -674,13 +674,13 @@ def test_player_packets_300_and_exact_partial_cursor_resume_in_same_signal_cycle
     offline.clock.advance(21 * 3600)
     offline.run('first-packet')
     data = next(iter(offline.state()['scopes'].values()))
-    assert data['player_check_progress']['offset'] == 300
+    assert data['player_check_progress']['offset'] == 100
     first_urls = [url for _, url in offline.calls if '/players?' in url]
-    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in first_urls] == [300]
+    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in first_urls] == [100]
     offline.calls.clear()
     offline.run('second-packet')
     urls = [url for _, url in offline.calls if '/players?' in url]
-    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in urls] == [1]
+    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in urls] == [100, 100, 1]
     assert 'player_check_progress' not in next(iter(offline.state()['scopes'].values()))
     assert not any('/kader/' in url for _, url in offline.calls)
 

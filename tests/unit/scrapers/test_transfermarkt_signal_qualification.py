@@ -27,7 +27,7 @@ def qualified_fixture(tmp_path, *, changes=True, players=1000):
     cohort = {"player_ids": ids, "groups": sorted(GROUPS), "scope_basis": "source_current_edition", "source_current_editions_proven": True,
               "edition_proofs": proofs, "scopes": scopes}
     paths = []
-    batch_urls = {start // 300: players_url(ids[start:start + 300]) for start in range(0, players, 300)}
+    batch_urls = {start // 100: players_url(ids[start:start + 100]) for start in range(0, players, 100)}
     for day in (10, 11):
         prefix = f"2026-10-{day:02d}T10:00:"
         rows = []
@@ -37,7 +37,7 @@ def qualified_fixture(tmp_path, *, changes=True, players=1000):
             value = 2000 if changed else 1000
             value_date = "2026-10-11" if changed else "2026-10-10"
             api = {"value": value, "value_date": value_date, "value_present": True, "contract": "2028-06-30", "clubs": [club]}
-            urls = {"tmapi": batch_urls[offset // 300], "plus1": f"https://www.transfermarkt.com/test/kader/verein/{club}/plus/1",
+            urls = {"tmapi": batch_urls[offset // 100], "plus1": f"https://www.transfermarkt.com/test/kader/verein/{club}/plus/1",
                     "mv": f"https://www.transfermarkt.com/ceapi/marketValueDevelopment/graph/{player}",
                     "transfers": f"https://www.transfermarkt.com/ceapi/transferHistory/list/{player}"}
             raw = {endpoint: {"capture_id": hashlib.sha256(f"synthetic/{day}/{endpoint}/{player}".encode()).hexdigest(),
@@ -240,3 +240,14 @@ def test_player_absent_on_day2_qualifies_only_with_measured_recheck_of_new_club(
     recheck_path.write_text(json.dumps(recheck))
     with pytest.raises(QualificationError, match="bounded original-cohort subset"):
         build_qualification(day1, day2, tmp_path / "absent-not-rechecked.json", recheck=recheck_path)
+
+
+@pytest.mark.parametrize('ids', [[str(i) for i in range(1, 102)],
+                                [str(i) for i in range(1, 301)],
+                                [str(10000000000 + i) for i in range(100)]])
+def test_qualification_rejects_packets_exceeding_transport_limits(ids):
+    from urllib.parse import urlencode
+    from scrapers.transfermarkt.signal_qualification import _packet_ids
+    url = 'https://tmapi.transfermarkt.technology/players?' + urlencode([('ids[]', value) for value in ids])
+    with pytest.raises(QualificationError):
+        _packet_ids(url)
