@@ -335,3 +335,151 @@ def test_1325_optional_page_age_read_failure_does_not_break_match_milestone():
     assert collected["errors"] == []
     assert collected["page_age_errors"] == [{"source": "fbref_page_ages", "reason": "read_failed"}]
     assert "private" not in json.dumps(collected)
+
+
+RAW_1792 = Path(__file__).resolve().parents[2] / "fixtures/fbref/report_observations"
+
+
+def parsed_1792(cid, html=None):
+    from scrapers.fbref.discovery import CalendarType, SeasonRef, parse_schedule_html
+    html = html if html is not None else (RAW_1792 / f"schedule-{cid}.html").read_text()
+    season = SeasonRef(str(cid), "2026-2027", "2026-2027", CalendarType.SPLIT_YEAR,
+                       f"https://fbref.com/en/comps/{cid}/2026-2027/x")
+    parsed = parse_schedule_html(html, season)
+    assert not parsed.has_errors
+    return html, list(parsed.datasets["schedule_rows"].records)
+
+
+@pytest.mark.parametrize("commented", [False, True])
+def test_1792_raw_date_link_before_report_does_not_hide_epoch(commented):
+    html, rows = parsed_1792("15")
+    if commented:
+        html = "<!--" + html + "-->"
+    observed = schedule_observations(html, rows)
+    assert len(observed) == 1
+    assert observed[0]["match_id"] == "27d4bb29"
+    assert observed[0]["kickoff_at"] == datetime(2026, 8, 15, 11, 30, tzinfo=timezone.utc)
+    assert observed[0]["completed"]
+
+
+def test_1792_raw_played_saudi_match_has_confirmed_utc():
+    html, rows = parsed_1792("70")
+    assert schedule_observations(html, rows)[0]["kickoff_at"] == datetime(2026, 10, 20, 15, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("cid,count", [("15", 1), ("16", 1)])
+def test_1792_raw_oct20_has_no_score_or_match_report(cid, count):
+    html, rows = parsed_1792(cid)
+    future = [r for r in rows if r["date"] == "2026-10-20"]
+    assert len(future) == count
+    assert all(not r["score"] and not r["match_url"] for r in future)
+    assert "Head-to-Head" in html
+
+
+def test_1792_conflicting_epochs_are_unconfirmed_and_offset_crosses_utc_day():
+    html, rows = parsed_1792("70")
+    duplicate = html.replace('1792508400', '1792594800')
+    assert schedule_observations(html + duplicate, rows)[0]["kickoff_at"] is None
+    html = html.replace('data-venue-epoch="1792508400"', '').replace(
+        'data-venue-time="18:00"', 'data-venue-time="2026-10-20T00:30:00+03:00"')
+    assert schedule_observations(html, rows)[0]["kickoff_at"].astimezone(timezone.utc).date() == date(2026, 10, 19)
+    html = html.replace('2026-10-20T00:30:00+03:00', '18:00')
+    assert schedule_observations(html, rows)[0]["kickoff_at"] is None
+
+
+@pytest.mark.parametrize("age,expected", [(24, 1), (24 + 1/3600, None), (-1, None)])
+def test_1792_fotmob_validation_proves_freshness_without_rewriting_body_time(age, expected):
+    data = snapshot()
+    data["fotmob_seasons"][0].update(
+        fetched_at=(AS_OF-timedelta(days=10)).isoformat(),
+        validated_at=(AS_OF-timedelta(hours=age)).isoformat())
+    result = report(data)
+    assert result["fotmob"] == expected
+    assert result["milestone_day_pass"] is (expected == 1)
+    if age > 24:
+        problem = result["fotmob_problems"][0]
+        assert problem["reason"] == "stale_fotmob_season"
+        assert problem["age_hours"] == pytest.approx(age)
+        assert problem["last_confirmed_at"]
+
+
+def test_1792_fotmob_stale_replay_cannot_confirm_freshness():
+    data = snapshot()
+    data["fotmob_seasons"][0]["stale"] = True
+    assert report(data)["fotmob"] is None
+
+
+def test_1792_reader_uses_source_validation_and_guards_cutoff():
+    queries = []
+    data = snapshot()
+    def pg(sql):
+        return {k: data[k] for k in ("competitions", "seasons")} if "'competitions'" in sql else []
+    def trino(sql):
+        queries.append(sql)
+        return []
+    collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=MAP)
+    query = next(q for q in queries if "fotmob_ingest_manifest" in q)
+    assert "$.source_observed_at" in query and "max(validated_at)" in query
+    assert "validated_at >= fetched_at" in query and "AND validated_at <=" in query
+    assert "AND completed_at <=" in query and "NOT coalesce(stale,false)" in query
+    assert "completed_at)" not in query  # ingestion time alone never proves freshness
+
+
+@pytest.mark.parametrize("cid,sid,fid,phase", [
+    ("31", "2026-2027", "230", "2026/2027 - Apertura"),
+    ("41", "2026", "274", "2026 - Clausura"),
+])
+def test_1792_exact_phase_mapping_counts_and_deduplicates(cid, sid, fid, phase):
+    data = snapshot()
+    data["competitions"][0]["competition_id"] = cid
+    for kind in ("seasons", "schedule_health", "observations", "readiness"):
+        data[kind][0].update(competition_id=cid, season_id=sid)
+    data["schedules"][0].update(source_competition_id=cid, source_season_id=sid)
+    data["fotmob_seasons"][0].update(competition_id=fid, season_key=phase)
+    data["fotmob_matches"][0].update(competition_id=fid, season_key=phase)
+    data["fotmob_matches"].append(dict(data["fotmob_matches"][0]))
+    mapping = json.loads((Path(__file__).resolve().parents[3]/'configs/fbref/fotmob-report-map.json').read_text())["competitions"]
+    result = build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)
+    assert result["fotmob"] == 1 and result["milestone_day_pass"]
+    data["fotmob_seasons"][0]["season_key"] = "2030 - Clausura"
+    assert build_daily_report(data, day=DAY, as_of=AS_OF, mapping=mapping)["fotmob"] is None
+    assert season_token(phase) is None
+
+
+@pytest.mark.parametrize("cid,sid", [("257", "2024"), ("665", "2023"), ("666", "2017"), ("693", "2019-2020")])
+def test_1792_old_latest_seasons_without_day_fixtures_do_not_require_invented_ids(cid, sid):
+    data = snapshot()
+    data["competitions"].append({**data["competitions"][0], "competition_id": cid})
+    data["seasons"].append({**data["seasons"][0], "competition_id": cid, "season_id": sid})
+    data["schedule_health"].append({"competition_id": cid, "season_id": sid, "fetched": True})
+    result = report(data)
+    assert result["milestone_day_pass"]
+    assert result["day_scope_exclusions"] == [{"competition_id": cid, "season_id": sid,
+          "reason": "historical_latest_season_without_day_fixtures"}]
+    data["schedules"].append({**data["schedules"][0], "source_competition_id": cid,
+                              "source_season_id": sid, "score": "", "match_url": None})
+    assert not report(data)["milestone_day_pass"]  # even an unplayed row restores comparator checks
+    data["schedules"].pop()
+    data["observations"].append({**data["observations"][0], "competition_id": cid, "season_id": sid})
+    assert not report(data)["milestone_day_pass"]  # explicit UTC evidence also restores comparator checks
+    data["observations"].pop()
+    data["schedule_health"][-1]["fetched"] = False
+    assert not report(data)["milestone_day_pass"]
+    data["schedule_health"][-1]["fetched"] = True
+    data["seasons"][-1]["season_id"] = "2026"
+    assert not report(data)["milestone_day_pass"]
+
+
+def test_1792_summary_names_date_deadline_comparator_blockers_even_with_unknown_zero():
+    from scrapers.fbref.daily_report import summary_line
+    data = snapshot()
+    data["observations"][0]["kickoff_at"] = None
+    data["readiness"][0]["bronze_ready_at"] = ANCHOR.isoformat()
+    data["fotmob_seasons"] = []
+    result = report(data, cutoff=ANCHOR+timedelta(hours=12))
+    assert result["unknown"] == result["pending"] == 0
+    line = summary_line(result)
+    assert line.startswith("FBref: матчей ") and "\n" not in line
+    assert "UTC не подтверждено 1" in line and "дедлайн не истёк 1" in line
+    assert "missing_fotmob_season" in line and "известно частично 0" in line
+    assert not result["final"] and not result["milestone_day_pass"]

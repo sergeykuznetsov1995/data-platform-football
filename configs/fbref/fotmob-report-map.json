@@ -280,7 +280,15 @@
       ],
       "fotmob_names": [
         "Primera A"
-      ]
+      ],
+      "season_keys": {
+        "2026": {
+          "274": [
+            "2026 - Clausura"
+          ]
+        }
+      },
+      "season_evidence": "Exact phase edition observed in FotMob snapshot 2026-10-21T05:39:19Z; other editions/phases are not inferred"
     },
     "37": {
       "fbref_name": "Belgian Pro League",
@@ -433,7 +441,15 @@
       ],
       "fotmob_names": [
         "Liga MX"
-      ]
+      ],
+      "season_keys": {
+        "2026-2027": {
+          "230": [
+            "2026/2027 - Apertura"
+          ]
+        }
+      },
+      "season_evidence": "Exact phase edition observed in FotMob snapshot 2026-10-21T05:39:19Z; other editions/phases are not inferred"
     },
     "23": {
       "fbref_name": "Eredivisie",

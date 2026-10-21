@@ -168,12 +168,22 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
         return snapshot
     fm_list = ",".join("'" + fid + "'" for fid in fm_ids)
     snapshot["fotmob_seasons"] = read("fotmob_season_manifest", trino, f"""
+        WITH evidence AS (
+          SELECT *, coalesce(
+            try(CAST(from_iso8601_timestamp(json_extract_scalar(
+              capabilities_json, '$.source_observed_at')) AT TIME ZONE 'UTC' AS timestamp)),
+            fetched_at) AS validated_at
+          FROM iceberg.bronze.fotmob_ingest_manifest
+        )
         SELECT competition_id,source_season_key AS season_key,
-               to_iso8601(with_timezone(max(fetched_at), 'UTC')) AS fetched_at
-        FROM iceberg.bronze.fotmob_ingest_manifest
+               to_iso8601(with_timezone(max(fetched_at), 'UTC')) AS fetched_at,
+               to_iso8601(with_timezone(max(validated_at), 'UTC')) AS validated_at
+        FROM evidence
         WHERE target_type = 'league_season' AND competition_id IN ({fm_list})
           AND status IN ('success','not_modified') AND NOT coalesce(stale,false)
           AND fetched_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
+          AND validated_at >= fetched_at
+          AND validated_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
           AND completed_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
         GROUP BY competition_id,source_season_key
     """, [])

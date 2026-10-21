@@ -27,12 +27,19 @@ def schedule_observations(html: str, rows: list[dict]) -> list[dict]:
     ]
     for document in documents:
         for row in document.select("table[id^=sched] tr"):
-            link = row.select_one('a[href*="/en/matches/"]')
+            # The date cell links to /en/matches/YYYY-MM-DD before the
+            # score/report link. Validate each candidate, not just the first.
+            match_ids = set()
+            for link in row.select('a[href*="/en/matches/"]'):
+                try:
+                    match_ids.add(match_page_target(link["href"]).source_ids["match_id"])
+                except ValueError:
+                    continue
             stamp = row.select_one("[data-venue-epoch]") or row.select_one("[data-venue-time]")
-            if link is None or stamp is None:
+            if len(match_ids) != 1 or stamp is None:
                 continue
             try:
-                match_id = match_page_target(link["href"]).source_ids["match_id"]
+                match_id = next(iter(match_ids))
                 value = str(stamp.get("data-venue-epoch", stamp.get("data-venue-time")))
                 if re.fullmatch(r"\d{10}", value):
                     instant = datetime.fromtimestamp(int(value), timezone.utc)
@@ -40,7 +47,11 @@ def schedule_observations(html: str, rows: list[dict]) -> list[dict]:
                     instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
                     if instant.tzinfo is None or instant.utcoffset() is None:
                         continue
-                kickoff[match_id] = instant
+                # Conflicting duplicate rows must not silently confirm a date.
+                if match_id in kickoff and kickoff[match_id] != instant:
+                    kickoff[match_id] = None
+                else:
+                    kickoff[match_id] = instant
             except (ValueError, OverflowError, OSError):
                 continue
     observations = {}
