@@ -425,6 +425,22 @@ def test_1792_reader_uses_source_validation_and_guards_cutoff():
     assert "completed_at)" not in query  # ingestion time alone never proves freshness
 
 
+def test_1792_reader_phase_catalog_uses_source_validation_after_304():
+    queries = []
+    data = snapshot()
+    def pg(sql):
+        return {k: data[k] for k in ("competitions", "seasons")} if "'competitions'" in sql else []
+    def trino(sql):
+        queries.append(sql)
+        return []
+    collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=MAP)
+    query = next(q for q in queries if "target_type='competition_seasons'" in q)
+    assert "$.source_observed_at" in query
+    assert "with_timezone(m.validated_at, 'UTC')) AS validated_at" in query
+    assert "validated_at >= fetched_at" in query and "AND validated_at <=" in query
+    assert "AND completed_at <=" in query and "NOT coalesce(m.stale,false)" in query
+
+
 @pytest.mark.parametrize("cid,sid,fid,phase", [
     ("31", "2026-2027", "230", "2026/2027 - Apertura"),
     ("41", "2026", "274", "2026 - Clausura"),
