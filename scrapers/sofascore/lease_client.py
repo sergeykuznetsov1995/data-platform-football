@@ -49,10 +49,58 @@ class SofascoreLeaseError(RuntimeError):
 class SofascoreLeaseRejected(SofascoreLeaseError):
     """The control plane rejected a lease or its credentials."""
 
-    def __init__(self, message: str, *, status_code: int, code: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        code: str = "",
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.details = dict(details or {})
+
+
+# Gateway fields that explain a refused close (#1788): why accounting latched,
+# what the lease metered against which limit, and what still holds it open.
+# An allowlist, so no token or upstream identity reaches a run report.
+_REJECTION_DETAIL_FIELDS = (
+    "close_complete",
+    "close_error",
+    "accounting_uncertain",
+    "accounting_uncertain_reason",
+    "accounting_uncertain_error_type",
+    "accounting_uncertain_error",
+    "budget_exceeded",
+    "expired",
+    "closed",
+    "max_bytes",
+    "total_bytes",
+    "up_bytes",
+    "down_bytes",
+    "active_tunnels",
+    "tunnels_total",
+    "reserved_bytes",
+    "global_budget_escrow_bytes",
+    "paid_ledger_uncertain",
+    "endpoint_path",
+    "dagrun_total_bytes",
+    "dagrun_budget_bytes",
+)
+
+
+def _rejection_details(body: Mapping[str, Any], token: str) -> dict[str, Any]:
+    return {
+        name: (
+            body[name]
+            if body[name] is None or isinstance(body[name], (bool, int, float))
+            else redact_sensitive(body[name], secrets=(token,))
+        )
+        for name in _REJECTION_DETAIL_FIELDS
+        if name in body
+    }
 
 
 class SofascoreLeaseProtocolError(SofascoreLeaseError):
@@ -508,6 +556,7 @@ class _DiscoveryLeaseProvider:
                 f"proxy lease API rejected {method} {path} (HTTP {status}): {error}",
                 status_code=status,
                 code=str(body.get("code") or ""),
+                details=_rejection_details(body, token),
             )
         return body
 

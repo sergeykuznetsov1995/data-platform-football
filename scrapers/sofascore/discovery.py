@@ -816,6 +816,8 @@ class LeaseBrowserSofaScoreClient:
         self._lease_count = 0
         self._upstream_repins = 0
         self._accounting_status = "verified"
+        self._unmeasured_charge_bytes = 0
+        self._close_failures: list[dict[str, Any]] = []
 
     @staticmethod
     def _default_provider(
@@ -852,6 +854,13 @@ class LeaseBrowserSofaScoreClient:
             "lease_count": self._lease_count,
             "upstream_repins": self._upstream_repins,
             "accounting_status": self._accounting_status,
+            # paid_proxy_bytes = metered + the whole allowance of every lease
+            # whose close never confirmed its counters (#1788).
+            "measured_proxy_bytes": (
+                self._paid_proxy_bytes - self._unmeasured_charge_bytes
+            ),
+            "unmeasured_charge_bytes": self._unmeasured_charge_bytes,
+            "close_failures": [dict(item) for item in self._close_failures],
         }
 
     def _acquire(self) -> Any:
@@ -897,7 +906,12 @@ class LeaseBrowserSofaScoreClient:
                 f"SofaScore discovery browser lease unavailable: {exc}"
             ) from exc
 
-    def _release(self, *, raise_on_error: bool) -> None:
+    def _release(
+        self,
+        *,
+        raise_on_error: bool,
+        request_error: Optional[BaseException] = None,
+    ) -> None:
         lease, capture_cm = self._lease, self._capture_cm
         self._lease = None
         self._capture = None
@@ -913,12 +927,31 @@ class LeaseBrowserSofaScoreClient:
         try:
             snapshot = _close_settled(self._provider, lease, self._sleeper)
         except Exception as exc:
-            self._paid_proxy_bytes += int(getattr(lease, "max_bytes", 0) or 0)
+            charge = int(getattr(lease, "max_bytes", 0) or 0)
+            self._paid_proxy_bytes += charge
+            self._unmeasured_charge_bytes += charge
             self._accounting_status = "unresolved_close"
+            # Keep the request failure that led to this close: a refused close
+            # used to replace it, and the run report lost the cause (#1788).
+            cause = (
+                f"{type(request_error).__name__}: {request_error}"
+                if request_error is not None
+                else ""
+            )
+            self._close_failures.append({
+                "lease_id": str(getattr(lease, "lease_id", "")),
+                "charged_bytes": charge,
+                "close_error": f"{type(exc).__name__}: {exc}",
+                "close_status_code": getattr(exc, "status_code", None),
+                "close_code": str(getattr(exc, "code", "") or ""),
+                "gateway": dict(getattr(exc, "details", None) or {}),
+                "request_error": cause,
+            })
             if raise_on_error:
-                raise DiscoveryError(
-                    f"SofaScore discovery lease did not close cleanly: {exc}"
-                ) from exc
+                message = f"SofaScore discovery lease did not close cleanly: {exc}"
+                if cause:
+                    message += f"; after request error: {cause}"
+                raise DiscoveryError(message) from exc
             return
         self._paid_proxy_bytes += int(snapshot.provider_bytes)
         self._upstream_repins += int(snapshot.upstream_repins)
@@ -988,7 +1021,7 @@ class LeaseBrowserSofaScoreClient:
                 raise
             except Exception as exc:
                 last_error = exc
-                self._release(raise_on_error=True)
+                self._release(raise_on_error=True, request_error=exc)
                 if attempt == self.max_attempts:
                     break
                 self._sleeper(min(2 ** (attempt - 1), 4))
@@ -998,7 +1031,7 @@ class LeaseBrowserSofaScoreClient:
                 last_error = DiscoveryHTTPError(
                     f"metered browser returned no response for {clean_path}"
                 )
-                self._release(raise_on_error=True)
+                self._release(raise_on_error=True, request_error=last_error)
                 if attempt < self.max_attempts:
                     self._sleeper(min(2 ** (attempt - 1), 4))
                     continue
@@ -1035,7 +1068,7 @@ class LeaseBrowserSofaScoreClient:
                 raise error
             if status == 429 or 500 <= status <= 599:
                 last_error = error
-                self._release(raise_on_error=True)
+                self._release(raise_on_error=True, request_error=error)
                 if attempt < self.max_attempts:
                     self._sleeper(min(2 ** (attempt - 1), 4))
                     continue

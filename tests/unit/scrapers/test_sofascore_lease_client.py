@@ -795,3 +795,55 @@ def test_control_token_is_required_and_never_taken_from_proxy_environment(
     monkeypatch.delenv("SOFASCORE_PROXY_CONTROL_TOKEN", raising=False)
     with pytest.raises(ValueError, match="CONTROL_TOKEN"):
         SofascoreLeaseClient("http://proxy_filter:8899")
+
+
+def test_discovery_close_rejection_keeps_allowlisted_gateway_fields():
+    """#1788: a refused close must say why — latch reason, metered bytes
+    against the limit, tunnels and reserves — without the lease token."""
+    session = _Session(
+        _Response(201, {
+            "id": "lease-1",
+            "token": "secret-token",
+            "proxy_url": "http://proxy_filter:8900",
+            "max_bytes": 8_388_608,
+            "expires_at": 2_000_000_000.0,
+        }),
+        _Response(409, {
+            "code": "lease_close_pending",
+            "error": "lease provider counters are not final",
+            "id": "lease-1",
+            "token": "secret-token",
+            "upstream_fingerprint": "abc123",
+            "accounting_uncertain": True,
+            "accounting_uncertain_reason": "budget_exhausted_without_eof",
+            "accounting_uncertain_error": "read stopped for secret-token",
+            "budget_exceeded": False,
+            "max_bytes": 8_388_608,
+            "total_bytes": 1_234_567,
+            "active_tunnels": 0,
+            "reserved_bytes": 512,
+            "close_error": "provider byte accounting is uncertain; durable escrow retained",
+        }),
+    )
+    provider = _DiscoveryLeaseProvider(
+        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN
+    )
+    lease = provider.acquire(
+        max_bytes=8_388_608, ttl_seconds=3600, run_id="run", task_id="task"
+    )
+
+    with pytest.raises(SofascoreLeaseRejected) as caught:
+        provider.close(lease)
+
+    assert caught.value.code == "lease_close_pending"
+    assert caught.value.details == {
+        "close_error": "provider byte accounting is uncertain; durable escrow retained",
+        "accounting_uncertain": True,
+        "accounting_uncertain_reason": "budget_exhausted_without_eof",
+        "accounting_uncertain_error": "read stopped for [REDACTED]",
+        "budget_exceeded": False,
+        "max_bytes": 8_388_608,
+        "total_bytes": 1_234_567,
+        "active_tunnels": 0,
+        "reserved_bytes": 512,
+    }
