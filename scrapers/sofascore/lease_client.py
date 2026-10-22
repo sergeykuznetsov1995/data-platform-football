@@ -91,12 +91,14 @@ _REJECTION_DETAIL_FIELDS = (
 )
 
 
-def _rejection_details(body: Mapping[str, Any], token: str) -> dict[str, Any]:
+def _rejection_details(
+    body: Mapping[str, Any], secrets: tuple[str, ...]
+) -> dict[str, Any]:
     return {
         name: (
             body[name]
             if body[name] is None or isinstance(body[name], (bool, int, float))
-            else redact_sensitive(body[name], secrets=(token,))
+            else redact_sensitive(body[name], secrets=secrets)
         )
         for name in _REJECTION_DETAIL_FIELDS
         if name in body
@@ -556,7 +558,7 @@ class _DiscoveryLeaseProvider:
                 f"proxy lease API rejected {method} {path} (HTTP {status}): {error}",
                 status_code=status,
                 code=str(body.get("code") or ""),
-                details=_rejection_details(body, token),
+                details=_rejection_details(body, (token, self._control_token)),
             )
         return body
 

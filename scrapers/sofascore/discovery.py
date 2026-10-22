@@ -860,7 +860,7 @@ class LeaseBrowserSofaScoreClient:
                 self._paid_proxy_bytes - self._unmeasured_charge_bytes
             ),
             "unmeasured_charge_bytes": self._unmeasured_charge_bytes,
-            "close_failures": [dict(item) for item in self._close_failures],
+            "close_failures": deepcopy(self._close_failures),
         }
 
     def _acquire(self) -> Any:
@@ -901,7 +901,7 @@ class LeaseBrowserSofaScoreClient:
                 self._lease = lease
             if self._capture_cm is None and capture_cm is not None:
                 self._capture_cm = capture_cm
-            self._release(raise_on_error=False)
+            self._release(raise_on_error=False, request_error=exc)
             raise DiscoveryError(
                 f"SofaScore discovery browser lease unavailable: {exc}"
             ) from exc
@@ -933,18 +933,29 @@ class LeaseBrowserSofaScoreClient:
             self._accounting_status = "unresolved_close"
             # Keep the request failure that led to this close: a refused close
             # used to replace it, and the run report lost the cause (#1788).
+            # Browser errors can quote the lease proxy URL; the stats land in
+            # run reports as they are.
+            from scrapers.sofascore.lease_client import redact_sensitive
+
+            secrets = (str(getattr(lease, "token", "") or ""),)
             cause = (
-                f"{type(request_error).__name__}: {request_error}"
+                redact_sensitive(
+                    f"{type(request_error).__name__}: {request_error}",
+                    secrets=secrets,
+                )
                 if request_error is not None
                 else ""
             )
+            details = getattr(exc, "details", None)
             self._close_failures.append({
                 "lease_id": str(getattr(lease, "lease_id", "")),
                 "charged_bytes": charge,
-                "close_error": f"{type(exc).__name__}: {exc}",
+                "close_error": redact_sensitive(
+                    f"{type(exc).__name__}: {exc}", secrets=secrets
+                ),
                 "close_status_code": getattr(exc, "status_code", None),
                 "close_code": str(getattr(exc, "code", "") or ""),
-                "gateway": dict(getattr(exc, "details", None) or {}),
+                "gateway": dict(details) if isinstance(details, Mapping) else {},
                 "request_error": cause,
             })
             if raise_on_error:
@@ -968,7 +979,7 @@ class LeaseBrowserSofaScoreClient:
             snapshot = self._provider.stats(self._lease)
             current = int(snapshot.provider_bytes)
         except Exception as exc:
-            self._release(raise_on_error=False)
+            self._release(raise_on_error=False, request_error=exc)
             raise DiscoveryError(
                 f"SofaScore discovery lease meter unavailable: {exc}"
             ) from exc
