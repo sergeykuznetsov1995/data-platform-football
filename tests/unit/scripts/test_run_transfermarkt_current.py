@@ -137,6 +137,11 @@ class Offline:
                         value['data'] = value['data'][:-1]
                 elif '/verletztespieler/' in parsed.path:
                     value = outer.injury_html
+                elif '/mitarbeiter/' in parsed.path:
+                    from pathlib import Path
+                    club = parsed.path.rsplit('/', 1)[-1]
+                    fixture = Path('tests/fixtures/transfermarkt/staff/ca-boca-juniors.html').read_text()
+                    value = getattr(outer, 'staff_html', {}).get(club, fixture)
                 elif '/kader/' in parsed.path:
                     club = parsed.path.split('/verein/')[1].split('/')[0]
                     if outer.fail_club == club:
@@ -248,6 +253,110 @@ class Offline:
 @pytest.fixture
 def offline(tmp_path, monkeypatch):
     return Offline(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def production_current(offline, monkeypatch):
+    """Exercise production policy admission with only transport/writers replaced."""
+    from pathlib import Path
+    from scrapers.transfermarkt.registry import deterministic_scope_id
+
+    policy = json.loads(Path('dags/configs/transfermarkt/standing_approval_policy.json').read_text())
+    policy['expires_at'] = '2999-01-01T00:00:00Z'
+    path = offline.root / 'current-policy.json'
+    path.write_text(json.dumps(policy))
+    monkeypatch.setenv('TM_STANDING_POLICY_PATH', str(path))
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    monkeypatch.setenv('TM_PROXY_CONTROL_URL', 'http://offline.invalid')
+    monkeypatch.setenv('TRANSFERMARKT_REQUIRE_RAW_STORE', 'true')
+    monkeypatch.setenv('TM_WRITE_MODE', 'dual')
+
+    def create(**kwargs):
+        competition, edition = kwargs['leagues'][0], str(kwargs['seasons'][0])
+        target = SimpleNamespace(competition_id=competition, edition_id=edition,
+                                 scope_id=deterministic_scope_id(competition, edition))
+        with monkeypatch.context() as transport_env:
+            transport_env.delenv('TM_PROXY_CONTROL_URL')
+            transport_env.setenv('TRANSFERMARKT_REQUIRE_RAW_STORE', 'false')
+            return offline.factory(target, {'canonical_season': kwargs['canonical_season']},
+                                   kwargs['response_cache'], kwargs['request_deadline_monotonic'], {})
+
+    monkeypatch.setattr('scrapers.transfermarkt.scraper.TransfermarktScraper', create)
+    writes = []
+
+    def staff_writer(scraper, scope, preflight, cycle_id, *, club_id, outcome, source_url):
+        writes.append(club_id)
+        return {**offline.proof(), 'club_id': club_id, 'raw_capture_id': outcome.raw_capture_id,
+                'source_body_hash': outcome.raw_body_hash}
+
+    monkeypatch.setattr('dags.utils.transfermarkt_staff.write_current_staff', staff_writer)
+
+    def run(cycle, *, rows=None, max_scopes=8):
+        return current.run_current_portion(
+            rows if rows is not None else [_joined_row(_competition('GB1'), _edition('GB1', '2026'))],
+            {'paid_io_allowed': True, 'write_mode': 'dual', 'revision': 1}, cycle,
+            denominator_rows=[{'competition_id': 'GB1', 'live': True, 'competition_class': 'core_club', 'tier': 1}],
+            state_dir=offline.root / 'state', qualification=offline.qualification,
+            max_seconds=2400, max_scopes=max_scopes, roster_writer=offline.roster_writer,
+            career_writer=offline.career_writer, coach_writer=offline.coach_writer,
+            now_fn=lambda: offline.clock.wall, monotonic_fn=lambda: offline.clock.elapsed,
+        )
+
+    return SimpleNamespace(run=run, policy_path=path, writes=writes)
+
+
+@pytest.mark.parametrize('grants', ['none', 'staff_only', 'receipts_only', 'both'])
+def test_production_current_staff_policy_preserves_other_work(offline, production_current, caplog, grants):
+    from dags.utils.transfermarkt_staff import STAFF_TABLE, STAFF_RECEIPTS_TABLE
+
+    policy = json.loads(production_current.policy_path.read_text())
+    if grants in {'staff_only', 'both'}:
+        policy['allowed_write_tables'].append(STAFF_TABLE)
+    if grants in {'receipts_only', 'both'}:
+        policy['allowed_write_tables'].append(STAFF_RECEIPTS_TABLE)
+    production_current.policy_path.write_text(json.dumps(policy))
+
+    cold = production_current.run('cold')
+    assert any(item['kind'] == 'resume' and item['status'] == 'complete' for item in cold['scopes']), [
+        (item['kind'], item['status'], item.get('error')) for item in cold['scopes']]
+    assert all(item['status'] != 'failed' for item in cold['scopes'])
+    saved = next(iter(offline.state()['scopes'].values()))
+    assert saved['cursor']['cold_complete']
+    assert len(offline.writes) == 1
+
+    offline.clock.advance(21 * 3600)
+    daily = production_current.run('daily')
+    assert any(item['kind'] == 'signals' and item['status'] in {'complete', 'pending'}
+               and not item.get('check_failures') for item in daily['scopes'])
+    assert daily['daily_complete_scope_ids']
+    production_current.run('daily-apply')
+
+    offline.clock.advance(7 * 86400)
+    weekly = production_current.run('weekly')
+    assert any(item['kind'] == 'weekly_roster' and item['status'] == 'complete' for item in weekly['scopes'])
+    assert len(offline.writes) == 2
+
+    rows = [_joined_row(_competition('GB1'), _edition('GB1', '2026', current=False)),
+            _joined_row(_competition('GB1'), _edition('GB1', '2027', current=True))]
+    closed = production_current.run('close', rows=rows, max_scopes=1)
+    result, = closed['scopes']
+    assert result['kind'] == 'season_close' and result['status'] == 'complete'
+    assert result['historical_handoff'] is True
+    assert not offline.state()['season_closures']
+
+    staff_http = [url for _, url in offline.calls if '/mitarbeiter/' in url]
+    saved = next(iter(offline.state()['scopes'].values()))
+    if grants == 'both':
+        assert production_current.writes == ['10', '20', '10', '20']
+        assert len(staff_http) == 4
+        assert saved['cursor']['staff_completed_at']
+        assert 'staff not authorized' not in caplog.text
+    else:
+        assert production_current.writes == []
+        assert staff_http == []
+        assert saved['cursor']['staff_completed_at'] is None
+        assert 'staff not authorized' in caplog.text
+        assert all(report['staff_status'] == 'staff not authorized' for report in (cold, daily, weekly, closed))
 
 
 @pytest.mark.parametrize('hour,minute', [(0, 30), (2, 59)])
