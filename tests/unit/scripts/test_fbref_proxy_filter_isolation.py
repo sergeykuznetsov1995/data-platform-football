@@ -27,7 +27,8 @@ SHARED_FILTER_SHA256 = (
     # #1365 follow-up: executable sofascore-only mode and registry startup.
     # #1365 aggregate-pressure compaction; dedicated FBref bytes unchanged.
     # #1790: SofaScore archived recovery and WAL pressure compaction.
-    "ea1957fa4a218a6c3980ecda34c540a67e50dfefceb58364da07dceec2e37f93"
+    # #1804: align the FBref history-controller DAG allowlist with the client.
+    "47a185330117d9cdcbaeb2b3790d1dee21930666070368c44a0242be0ff925b3"
 )
 
 
@@ -37,6 +38,16 @@ def _load(path: Path, name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_fbref_proxy_dag_allowlists_match_the_lease_client():
+    from scrapers.fbref.proxy_lease import FBREF_DAG_IDS
+
+    shared = _load(SHARED_FILTER, "shared_fbref_dag_allowlist")
+    dedicated = _load(FBREF_FILTER, "dedicated_fbref_dag_allowlist")
+
+    assert shared.FBREF_DAG_IDS == FBREF_DAG_IDS
+    assert dedicated.FBREF_DAG_IDS == FBREF_DAG_IDS
 
 
 def test_fbref_runtime_is_separate_from_paid_sofascore_filter_bytes():
