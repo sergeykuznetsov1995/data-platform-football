@@ -82,18 +82,23 @@ class FakeClient:
     def __init__(self, outcomes):
         self.outcomes = iter(outcomes)
         self.calls = []
+        self.status_counts = {}
         self._raw_store = SimpleNamespace(load_capture=lambda capture: (probe_body(self.calls[-1][0]), SimpleNamespace(url=self.calls[-1][0], status_code=200)))
         self.closed = False
 
     def fetch(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return next(self.outcomes)
+        outcome = next(self.outcomes)
+        status = str(outcome.status_code or (200 if outcome.is_success else 0))
+        self.status_counts[status] = self.status_counts.get(status, 0) + 1
+        return outcome
 
     def close(self):
         self.closed = True
 
     def get_traffic_stats(self):
         return {"request_attempts": len(self.calls), "provider_metered_bytes": len(self.calls) * 10,
+                "status_counts": dict(self.status_counts),
                 "decoded_response_body_bytes": len(self.calls) * 20, "provider_metering_available": True}
 
     def get_raw_attempt_records(self):
@@ -112,7 +117,7 @@ def test_probe_is_one_get_raw_only_and_keeps_gate_unconfirmed(tmp_path):
     client = FakeClient([FetchOutcome(status=FetchStatus.OK, raw_capture_id="raw", attempts=1)])
     assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 0
     assert client.closed and len(client.calls) == 1
-    assert client.calls[0][1]["max_attempts"] == 1
+    assert client.calls[0][1]["max_attempts"] == 4
     report = json.loads((tmp_path / "day1/report.json").read_text())
     assert report["detector_gate"] is None and report["detector_gate_evaluated_by"] == "qualify"
     assert report["experiment_totals"]["request_attempts"] == 1
@@ -444,12 +449,13 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
     from scrapers.transfermarkt.client import TransfermarktHttpClient
     from scrapers.transfermarkt.models import LeaseTrafficSnapshot, ProxyLease, SharedTrafficLedger
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    factory = SimpleNamespace(calls=[], bytes=0, leases=[])
+    factory = SimpleNamespace(calls=[], bytes=0, leases=[], lease_ttls=[])
 
     class Provider:
         def acquire(self, *, max_bytes, ttl_seconds, metadata):
             lease = ProxyLease("offline-lease", "offline-token", "http://offline-proxy:8900", max_bytes, 9999999999)
             factory.leases.append(lease)
+            factory.lease_ttls.append(ttl_seconds)
             return lease
         def stats(self, lease):
             return LeaseTrafficSnapshot(up_bytes=256 * len(factory.calls), down_bytes=factory.bytes)
@@ -457,7 +463,7 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
             if close_error:
                 raise RuntimeError("unavailable accounting")
             return replace(self.stats(lease), closed=True)
-        def acquire_request_permit(self, *, metadata, request_id):
+        def acquire_request_permit(self, *, metadata, request_id, **kwargs):
             return "offline-permit"
         def authenticated_proxy_url(self, lease):
             return "http://offline-proxy:8900"
@@ -467,7 +473,8 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
             if transport_error is not None:
                 factory.calls.append(url)
                 raise transport_error
-            response_status, body = responses[url] if responses is not None else (status, probe_body(url))
+            response_status, body = (next(responses) if hasattr(responses, "__next__") else
+                                    responses[url] if responses is not None else (status, probe_body(url)))
             factory.calls.append(url)
             factory.bytes += len(body)
             return SimpleNamespace(status_code=response_status, content=body,
@@ -482,7 +489,42 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
         client.begin_request_scope(request_attempt_budget=remaining["request_attempts"])
         client.set_cycle_decoded_body_budget(remaining["decoded_response_body_bytes"])
         return client
+    factory.provider = Provider()
+    factory.tls_factory = TLS
     return build, factory
+
+
+def test_fresh_lease_405_rotates_inside_one_endpoint_try(tmp_path, monkeypatch):
+    import scrapers.transfermarkt.client as transport
+    url = bench.player_url(["8198"])
+    _, factory = transport_factory(tmp_path, responses=iter([(405, b"Human Verification"), (200, probe_body(url))]))
+    real_client = transport.TransfermarktHttpClient
+
+    def client(**kwargs):
+        return real_client(**{**kwargs, "client_factory": lambda **kw: factory.tls_factory(),
+                              "sleep_fn": lambda seconds: None, "rate_limiter": None})
+
+    monkeypatch.setenv("TM_PROXY_CONTROL_URL", "http://offline-control")
+    monkeypatch.setenv("TM_PROXY_CONTROL_TOKEN", "offline-token")
+    class Provider:
+        def __new__(cls, url):
+            return factory.provider
+
+    monkeypatch.setattr(transport, "ProxyFilterLeaseProvider", Provider)
+    monkeypatch.setattr(transport, "TransfermarktHttpClient", client)
+    result = bench.run(args(tmp_path, ids="8198"))
+    assert result == 0, (tmp_path / "day1/report.json").read_text()
+    assert factory.calls == [url, url]
+    assert factory.lease_ttls == [3600, 3600]
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    report = json.loads((tmp_path / "day1/report.json").read_text())
+    assert state["endpoint_tries"]["probe"] == 1
+    assert state["tries"]["probe"] == 1
+    assert [row["status_code"] for row in sorted(state["attempt_records"], key=lambda row: row["attempt"])] == [405, 200]
+    assert report["complete"] is True
+    assert report["traffic"]["request_attempts"] == 2
+    assert report["experiment_totals"]["request_attempts"] == 2
+    assert json.loads((tmp_path / "signal-probe-ledger.json").read_text())["totals"]["request_attempts"] == 2
 
 
 @pytest.mark.parametrize("proxy_status", [502, 522, None])
@@ -490,30 +532,30 @@ def test_real_transport_gateway_errors_use_transport_limit(tmp_path, proxy_statu
     from scrapers.transfermarkt.client import TransportStatusError
     error = (TimeoutError("offline timeout") if proxy_status is None else
              TransportStatusError("offline proxy failure", status_code=proxy_status))
-    for _ in range(3):
-        build, factory = transport_factory(tmp_path, transport_error=error)
-        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
-        assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path, transport_error=error)
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+    assert len(factory.calls) == 4
     build, factory = transport_factory(tmp_path)
-    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 0
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
+    assert not factory.calls
     state = json.loads((tmp_path / "day1/state.json").read_text())
-    assert state["transport_tries"]["probe"] == 3
-    assert [record["outcome_kind"] for record in state["attempt_records"]] == ["transport_error"] * 3 + ["response"]
+    assert state["transport_tries"]["probe"] == 4
+    assert [record["outcome_kind"] for record in state["attempt_records"]] == ["transport_error"] * 4
 
 
 @pytest.mark.parametrize("upstream_class", ["407", "timeout", "dead_exit"])
 def test_gateway_http_response_uses_transport_limit(tmp_path, upstream_class):
-    for _ in range(3):
-        build, factory = transport_factory(tmp_path, status=502,
-            headers={"x-proxy-upstream-status": upstream_class})
-        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
-        assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path, status=502,
+        headers={"x-proxy-upstream-status": upstream_class})
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+    assert len(factory.calls) == 4
     build, factory = transport_factory(tmp_path)
-    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 0
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
+    assert not factory.calls
     state = json.loads((tmp_path / "day1/state.json").read_text())
-    assert state["transport_tries"]["probe"] == 3
-    assert state["endpoint_tries"]["probe"] == 1
-    assert [record["status_code"] for record in state["attempt_records"]] == [502] * 3 + [200]
+    assert state["transport_tries"]["probe"] == 4
+    assert state["endpoint_tries"]["probe"] == 0
+    assert [record["status_code"] for record in state["attempt_records"]] == [502] * 4
     assert json.loads((tmp_path / "day1/report.json").read_text())["experiment_totals"]["request_attempts"] == 4
 
 
@@ -522,7 +564,7 @@ def test_site_http_response_still_uses_endpoint_limit(tmp_path, status):
     for _ in range(2):
         build, factory = transport_factory(tmp_path, status=status)
         assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
-        assert len(factory.calls) == 1
+        assert len(factory.calls) == (1 if status == 404 else 4)
     build, factory = transport_factory(tmp_path)
     assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
     assert not factory.calls
@@ -532,17 +574,35 @@ def test_site_http_response_still_uses_endpoint_limit(tmp_path, status):
 
 
 def test_gateway_http_transport_limit_is_not_unbounded(tmp_path):
-    for _ in range(4):
-        build, factory = transport_factory(tmp_path, status=502,
-            headers={"X-Proxy-Upstream-Status": "407"})
-        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
-        assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path, status=502,
+        headers={"X-Proxy-Upstream-Status": "407"})
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+    assert len(factory.calls) == 4
     build, factory = transport_factory(tmp_path)
     assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
     assert not factory.calls
     state = json.loads((tmp_path / "day1/state.json").read_text())
     assert state["transport_tries"]["probe"] == 4
     assert state["endpoint_tries"]["probe"] == 0
+
+
+@pytest.mark.parametrize("statuses,transport_tries", [([502, 502, 502, 405], 3), ([405, 405, 405, 502], 1)])
+def test_mixed_internal_retries_preserve_remaining_transport_limit(tmp_path, statuses, transport_tries):
+    build, factory = transport_factory(tmp_path, responses=iter((status, b"failure") for status in statuses))
+    options = args(tmp_path, ids="8198")
+    assert bench.run(options, client_factory=build) == 3
+    assert len(factory.calls) == 4
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == transport_tries
+    assert state["endpoint_tries"]["probe"] == (1 if statuses[-1] == 405 else 0)
+    build, factory = transport_factory(tmp_path, status=502)
+    assert bench.run(options, client_factory=build) == 3
+    assert len(factory.calls) == 4 - transport_tries
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(options, client_factory=build) == 2
+    assert not factory.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == 4
 
 
 def test_real_transport_proxy_raw_probe_chain_with_exact_paid_attempt(tmp_path):
@@ -653,7 +713,7 @@ def test_changed_cohort_edition_url_cannot_resume_old_evidence(tmp_path):
     build, factory = transport_factory(tmp_path, responses={task["url"]: (405, b"blocked") for task in tasks})
     options = args(tmp_path, mode="cohort", sample=str(sample_path), player_target=1000, min_scopes=20)
     assert bench.run(options, client_factory=build) == 3
-    assert len(factory.calls) == 3
+    assert len(factory.calls) == 12
     ledger = ledger_path.read_text()
     sample["clubs"][0]["edition_url"] = sample["clubs"][0]["edition_url"].replace("premier-league", "other-slug")
     sample_path.write_text(json.dumps(sample))
@@ -786,7 +846,7 @@ def test_failed_scope_bootstrap_continues_other_clubs_and_retries_only_failed_ta
     initial, _ = transport_factory(tmp_path)
     assert bench.run(args(tmp_path, ids="8198", evidence_dir=str(tmp_path / "probe")), client_factory=initial) == 0
     assert bench.run(options, client_factory=build) == 3
-    assert len(factory.calls) == 4  # A bad scope does not cancel the paid successful pages.
+    assert len(factory.calls) == 7  # A bad scope does not cancel the paid successful pages.
     state = json.loads((tmp_path / "day1/state.json").read_text())
     assert len(state["results"]) == 3 and len(state["failures"]) == 1
     participant = tasks[1]
@@ -796,10 +856,10 @@ def test_failed_scope_bootstrap_continues_other_clubs_and_retries_only_failed_ta
     assert calls.calls == [participant["url"]]
     report = json.loads((tmp_path / "day1/report.json").read_text())
     assert report["scope_membership_freshness_proven"] is True
-    assert report["task_failures"] == {} and report["experiment_totals"]["request_attempts"] == 6
+    assert report["task_failures"] == {} and report["experiment_totals"]["request_attempts"] == 9
     assert [proof["scope"] for proof in report["edition_proofs"]] == ["GB1/2026"]
     state = json.loads((tmp_path / "day1/state.json").read_text())
-    assert sorted(row["status_code"] for row in state["attempt_records"]) == [200, 200, 200, 200, 405]
+    assert sorted(row["status_code"] for row in state["attempt_records"]) == [200] * 4 + [405] * 4
 
 
 def test_expensive_measurement_cannot_skip_initial_raw_packet_schema_probe(tmp_path):

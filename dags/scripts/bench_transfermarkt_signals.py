@@ -485,6 +485,7 @@ def _client(evidence: Path, remaining: dict, portion_id: str):
         lease_provider=ProxyFilterLeaseProvider(os.environ["TM_PROXY_CONTROL_URL"]),
         traffic_ledger=ledger, raw_store=RawResponseStore.from_uri((evidence / "raw").as_uri()),
         require_raw_store=True, rate_limiter=RateLimiter(max_requests=12, window_seconds=60, burst_size=1),
+        lease_ttl_seconds=3600,
         request_deadline_monotonic=remaining["deadline_monotonic"],
         lease_metadata={"dag_id": MEASUREMENT_DAG_ID, "run_id": portion_id, "task_id": "signal_probe_1393", "scope": "signal-experiment"},
     )
@@ -495,6 +496,11 @@ def _client(evidence: Path, remaining: dict, portion_id: str):
 
 def _now_utc():
     return datetime.now(timezone.utc)
+
+
+def _transport_attempts(stats):
+    return sum(count for status, count in stats["status_counts"].items()
+               if int(status) in (0, 407) or int(status) >= 500)
 
 
 def _parity_day_guard(state: dict, pending: int, now: datetime) -> None:
@@ -606,15 +612,19 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                 state["tries"][task["key"]] = state["tries"].get(task["key"], 0) + 1
                 state["endpoint_tries"][task["key"]] = state["endpoint_tries"].get(task["key"], 0) + 1
                 _write(state_path, state)
-                outcome = client.fetch(task["url"], as_json=task["json"], max_attempts=1,
+                transport_remaining = getattr(args, "transport_attempts", 4) - state["transport_tries"].get(task["key"], 0)
+                before = client.get_traffic_stats()
+                request_remaining = remaining["request_attempts"] - before["request_attempts"]
+                outcome = client.fetch(task["url"], as_json=task["json"], max_attempts=min(4, transport_remaining, request_remaining),
                                        label=task["kind"], context={"cycle_id": portion_id, "scope_id": task["scope"]})
+                transport_attempts = _transport_attempts(client.get_traffic_stats()) - _transport_attempts(before)
+                state["transport_tries"][task["key"]] = state["transport_tries"].get(task["key"], 0) + transport_attempts
                 # Transport-class failures (no response, gateway errors, any 5xx —
                 # gateway 502 often arrives without an upstream-class header) use the
                 # transport cap; site refusals (403/405/404/429) keep the endpoint cap.
                 if not outcome.is_success and (outcome.status_code in (None, 0)
                         or outcome.status_code >= 500 or outcome.proxy_upstream_status):
                     state["endpoint_tries"][task["key"]] -= 1
-                    state["transport_tries"][task["key"]] = state["transport_tries"].get(task["key"], 0) + 1
                 if not outcome.is_success or not outcome.raw_capture_id:
                     report["failure"] = {"key": task["key"], "status": outcome.status.value, "http_status": outcome.status_code}
                     state["failures"][task["key"]] = report["failure"]
