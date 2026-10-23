@@ -1259,27 +1259,38 @@ def test_refused_close_after_a_failed_request_keeps_both_errors_and_gateway_fiel
 
 
 @pytest.mark.unit
-def test_refused_close_record_does_not_leak_the_lease_token():
+@pytest.mark.parametrize("malformed_details", [False, True])
+def test_refused_close_record_does_not_leak_the_lease_token(malformed_details):
     from scrapers.sofascore.lease_client import SofascoreLeaseRejected
 
     class LatchedProvider(_BrowserLeaseProvider):
+        _control_token = CONTROL_TOKEN
+
         def close(self, lease):
-            raise SofascoreLeaseRejected(
-                f"rejected for {lease.token}", status_code=409,
-                code="lease_close_pending", details="not a mapping",
+            error = SofascoreLeaseRejected(
+                f"rejected for {lease.token} and {CONTROL_TOKEN}", status_code=409,
+                code="lease_close_pending",
             )
+            if malformed_details:
+                error.details = "not a mapping"
+            raise error
 
     client, _, _ = _browser_client(
-        [RuntimeError("proxy http://lease:token-1@proxy_filter:8900 refused")],
+        [RuntimeError(f"proxy token-1 and {CONTROL_TOKEN} refused")],
         lease_provider=LatchedProvider(),
     )
 
-    with pytest.raises(DiscoveryError):
+    with pytest.raises(DiscoveryError) as caught:
         client.get_json("/unique-tournament/8/seasons")
 
-    [failure] = client.stats["close_failures"]
-    assert "token-1" not in json.dumps(failure)
-    assert "RuntimeError: proxy" in failure["request_error"]
+    stats = client.stats
+    for diagnostic in (json.dumps(stats), str(caught.value)):
+        assert "token-1" not in diagnostic
+        assert CONTROL_TOKEN not in diagnostic
+        assert "rejected for" in diagnostic
+        assert "RuntimeError: proxy" in diagnostic
+    [failure] = stats["close_failures"]
+    assert failure["close_status_code"] == 409
     assert failure["gateway"] == {}
 
 

@@ -810,7 +810,7 @@ def test_discovery_close_rejection_keeps_allowlisted_gateway_fields():
         }),
         _Response(409, {
             "code": "lease_close_pending",
-            "error": "lease provider counters are not final",
+            "error": f"lease secret-token and {CONTROL_TOKEN} counters are not final",
             "id": "lease-1",
             "token": "secret-token",
             "upstream_fingerprint": "abc123",
@@ -835,6 +835,8 @@ def test_discovery_close_rejection_keeps_allowlisted_gateway_fields():
     with pytest.raises(SofascoreLeaseRejected) as caught:
         provider.close(lease)
 
+    assert "secret-token" not in str(caught.value)
+    assert CONTROL_TOKEN not in str(caught.value)
     assert caught.value.code == "lease_close_pending"
     assert caught.value.details == {
         "close_error": "provider byte accounting is uncertain; durable escrow retained",

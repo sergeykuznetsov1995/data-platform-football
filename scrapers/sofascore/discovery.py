@@ -804,6 +804,7 @@ class LeaseBrowserSofaScoreClient:
         self._provider = lease_provider or self._default_provider(
             control_url, control_token, dag_id
         )
+        self._control_token = control_token or getattr(self._provider, "_control_token", "")
         self._rate_limiter = rate_limiter or self._default_rate_limiter()
         self._lease: Optional[Any] = None
         self._capture_cm: Optional[Any] = None
@@ -863,6 +864,17 @@ class LeaseBrowserSofaScoreClient:
             "close_failures": deepcopy(self._close_failures),
         }
 
+    def _redact_error(self, value: Any, lease: Optional[Any] = None) -> str:
+        from scrapers.sofascore.lease_client import redact_sensitive
+
+        return redact_sensitive(
+            value,
+            secrets=(
+                str(getattr(lease or self._lease, "token", "") or ""),
+                self._control_token,
+            ),
+        )
+
     def _acquire(self) -> Any:
         remaining = self.budget_cap_bytes - self._paid_proxy_bytes
         if remaining <= 0:
@@ -901,9 +913,10 @@ class LeaseBrowserSofaScoreClient:
                 self._lease = lease
             if self._capture_cm is None and capture_cm is not None:
                 self._capture_cm = capture_cm
+            message = self._redact_error(exc)
             self._release(raise_on_error=False, request_error=exc)
             raise DiscoveryError(
-                f"SofaScore discovery browser lease unavailable: {exc}"
+                f"SofaScore discovery browser lease unavailable: {message}"
             ) from exc
 
     def _release(
@@ -935,13 +948,9 @@ class LeaseBrowserSofaScoreClient:
             # used to replace it, and the run report lost the cause (#1788).
             # Browser errors can quote the lease proxy URL; the stats land in
             # run reports as they are.
-            from scrapers.sofascore.lease_client import redact_sensitive
-
-            secrets = (str(getattr(lease, "token", "") or ""),)
             cause = (
-                redact_sensitive(
-                    f"{type(request_error).__name__}: {request_error}",
-                    secrets=secrets,
+                self._redact_error(
+                    f"{type(request_error).__name__}: {request_error}", lease,
                 )
                 if request_error is not None
                 else ""
@@ -950,8 +959,8 @@ class LeaseBrowserSofaScoreClient:
             self._close_failures.append({
                 "lease_id": str(getattr(lease, "lease_id", "")),
                 "charged_bytes": charge,
-                "close_error": redact_sensitive(
-                    f"{type(exc).__name__}: {exc}", secrets=secrets
+                "close_error": self._redact_error(
+                    f"{type(exc).__name__}: {exc}", lease
                 ),
                 "close_status_code": getattr(exc, "status_code", None),
                 "close_code": str(getattr(exc, "code", "") or ""),
@@ -959,7 +968,10 @@ class LeaseBrowserSofaScoreClient:
                 "request_error": cause,
             })
             if raise_on_error:
-                message = f"SofaScore discovery lease did not close cleanly: {exc}"
+                message = (
+                    "SofaScore discovery lease did not close cleanly: "
+                    f"{self._redact_error(exc, lease)}"
+                )
                 if cause:
                     message += f"; after request error: {cause}"
                 raise DiscoveryError(message) from exc
@@ -979,9 +991,10 @@ class LeaseBrowserSofaScoreClient:
             snapshot = self._provider.stats(self._lease)
             current = int(snapshot.provider_bytes)
         except Exception as exc:
+            message = self._redact_error(exc)
             self._release(raise_on_error=False, request_error=exc)
             raise DiscoveryError(
-                f"SofaScore discovery lease meter unavailable: {exc}"
+                f"SofaScore discovery lease meter unavailable: {message}"
             ) from exc
         if current < self._lease_provider_bytes:
             self._release(raise_on_error=False)
@@ -1031,7 +1044,7 @@ class LeaseBrowserSofaScoreClient:
             except DiscoveryError:
                 raise
             except Exception as exc:
-                last_error = exc
+                last_error = DiscoveryError(self._redact_error(exc))
                 self._release(raise_on_error=True, request_error=exc)
                 if attempt == self.max_attempts:
                     break

@@ -535,7 +535,7 @@ class _DiscoveryLeaseProvider:
                 timeout=self.timeout_seconds,
             )
         except Exception as exc:  # noqa: BLE001 - requests is an adapter boundary
-            message = redact_sensitive(exc, secrets=(token,))
+            message = redact_sensitive(exc, secrets=(token, self._control_token))
             raise SofascoreLeaseProtocolError(
                 f"proxy lease control request failed: {message}"
             ) from exc
@@ -552,7 +552,8 @@ class _DiscoveryLeaseProvider:
             )
         if not 200 <= status < 300:
             error = redact_sensitive(
-                body.get("error") or "request rejected", secrets=(token,)
+                body.get("error") or "request rejected",
+                secrets=(token, self._control_token),
             )
             raise SofascoreLeaseRejected(
                 f"proxy lease API rejected {method} {path} (HTTP {status}): {error}",
