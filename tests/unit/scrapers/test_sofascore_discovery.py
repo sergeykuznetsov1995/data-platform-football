@@ -1201,6 +1201,100 @@ def test_browser_close_that_never_settles_keeps_the_conservative_charge():
 
 
 @pytest.mark.unit
+def test_refused_close_after_a_failed_request_keeps_both_errors_and_gateway_fields():
+    """#1788: the browser got no response, then the gateway refused the close
+    for good.  Both failures and the gateway's reason reach the stats, and the
+    whole lease is charged once, apart from the measured bytes."""
+    from scrapers.sofascore.lease_client import SofascoreLeaseRejected
+
+    gateway = {
+        "accounting_uncertain": True,
+        "accounting_uncertain_reason": "budget_exhausted_without_eof",
+        "max_bytes": 8_388_608,
+        "total_bytes": 1_234_567,
+        "active_tunnels": 0,
+        "reserved_bytes": 0,
+    }
+
+    class LatchedProvider(_BrowserLeaseProvider):
+        def close(self, lease):
+            raise SofascoreLeaseRejected(
+                "counters are not final", status_code=409,
+                code="lease_close_pending", details=gateway,
+            )
+
+    client, _, _ = _browser_client(
+        [
+            {"status": 200, "json": {"seasons": []}, "challenge": False, "body": b"{}"},
+            None,
+        ],
+        lease_provider=LatchedProvider(),
+        per_lease_max_bytes=8_388_608,
+    )
+    client.get_json("/unique-tournament/8/seasons")
+
+    with pytest.raises(DiscoveryError) as caught:
+        client.get_json("/unique-tournament/9/seasons")
+    client.close()
+
+    message = str(caught.value)
+    assert "did not close cleanly" in message
+    assert "metered browser returned no response for /unique-tournament/9/seasons" in message
+    stats = client.stats
+    assert stats["accounting_status"] == "unresolved_close"
+    assert stats["paid_proxy_bytes"] == 8_388_608
+    assert stats["unmeasured_charge_bytes"] == 8_388_608
+    assert stats["measured_proxy_bytes"] == 0
+    [failure] = stats["close_failures"]
+    assert failure["lease_id"] == "browser-1"
+    assert failure["charged_bytes"] == 8_388_608
+    assert failure["close_status_code"] == 409
+    assert failure["close_code"] == "lease_close_pending"
+    assert failure["gateway"] == gateway
+    assert failure["request_error"] == (
+        "DiscoveryHTTPError: metered browser returned no response for "
+        "/unique-tournament/9/seasons"
+    )
+    json.dumps(stats)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("malformed_details", [False, True])
+def test_refused_close_record_does_not_leak_the_lease_token(malformed_details):
+    from scrapers.sofascore.lease_client import SofascoreLeaseRejected
+
+    class LatchedProvider(_BrowserLeaseProvider):
+        _control_token = CONTROL_TOKEN
+
+        def close(self, lease):
+            error = SofascoreLeaseRejected(
+                f"rejected for {lease.token} and {CONTROL_TOKEN}", status_code=409,
+                code="lease_close_pending",
+            )
+            if malformed_details:
+                error.details = "not a mapping"
+            raise error
+
+    client, _, _ = _browser_client(
+        [RuntimeError(f"proxy token-1 and {CONTROL_TOKEN} refused")],
+        lease_provider=LatchedProvider(),
+    )
+
+    with pytest.raises(DiscoveryError) as caught:
+        client.get_json("/unique-tournament/8/seasons")
+
+    stats = client.stats
+    for diagnostic in (json.dumps(stats), str(caught.value)):
+        assert "token-1" not in diagnostic
+        assert CONTROL_TOKEN not in diagnostic
+        assert "rejected for" in diagnostic
+        assert "RuntimeError: proxy" in diagnostic
+    [failure] = stats["close_failures"]
+    assert failure["close_status_code"] == 409
+    assert failure["gateway"] == {}
+
+
+@pytest.mark.unit
 def test_browser_lease_transport_retries_with_a_new_lease_and_no_direct_fallback():
     client, provider, captures = _browser_client([
         None,

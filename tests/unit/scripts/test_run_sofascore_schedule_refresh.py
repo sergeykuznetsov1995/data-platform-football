@@ -525,6 +525,92 @@ def test_pending_close_only_warns_after_a_clean_nonempty_sweep(offline, monkeypa
 
 
 @pytest.mark.unit
+def test_failed_request_and_refused_close_reach_the_json_report(offline, monkeypatch):
+    from types import SimpleNamespace
+
+    from scrapers.sofascore.discovery import LeaseBrowserSofaScoreClient
+    from scrapers.sofascore.lease_client import _DiscoveryLeaseProvider
+
+    lease_token = "report-lease-secret"
+    control_token = "report-control-secret" * 2
+    gateway = {
+        "accounting_uncertain": True,
+        "accounting_uncertain_reason": "budget_exhausted_without_eof",
+        "max_bytes": 4096,
+        "total_bytes": 1234,
+        "active_tunnels": 0,
+        "reserved_bytes": 512,
+    }
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            if method == "POST":
+                return SimpleNamespace(status_code=201, json=lambda: {
+                    "id": "report-lease", "token": lease_token,
+                    "proxy_url": "http://proxy_filter:8900",
+                    "max_bytes": 4096, "expires_at": 2_000_000_000,
+                })
+            assert method == "DELETE"
+            return SimpleNamespace(status_code=409, json=lambda: {
+                **gateway, "code": "lease_close_pending",
+                "error": f"counters are not final for {lease_token} {control_token}",
+                "token": lease_token,
+            })
+
+    @contextmanager
+    def capture(**kwargs):
+        def fetch(path):
+            raise RuntimeError(f"browser request failed for {lease_token} {control_token}")
+
+        yield SimpleNamespace(warm_exact_json=lambda url: None, fetch_api_json=fetch)
+
+    def client(**kwargs):
+        return LeaseBrowserSofaScoreClient(
+            **kwargs,
+            lease_provider=_DiscoveryLeaseProvider(
+                "http://gw", control_token=control_token, session=Session(),
+            ),
+            capture_factory=capture,
+            rate_limiter=SimpleNamespace(acquire=lambda: True),
+            sleeper=lambda seconds: None,
+        )
+
+    original_fixtures = refresh.fetch_season_fixtures
+
+    def fixtures(client, targets, raw_store, **kwargs):
+        targets = list(targets)
+        if (23, 88001) in targets:
+            client.get_json("/unique-tournament/23/season/88001/events/last/0")
+        return original_fixtures(client, targets, raw_store, **kwargs)
+
+    monkeypatch.setattr(refresh, "LeaseBrowserSofaScoreClient", client)
+    monkeypatch.setattr(refresh, "fetch_season_fixtures", fixtures)
+    offline["calls"]["known"] = {(7, 76953)}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    text = offline["output"].read_text()
+    report = json.loads(text)
+    assert report["status"] == "failed"
+    assert report["rows_written"] > 0
+    assert "browser request failed" in " ".join(report["errors"])
+    assert "counters are not final" in " ".join(report["errors"])
+    assert lease_token not in text
+    assert control_token not in text
+    stats = report["discovery"]
+    assert stats["accounting_status"] == "unresolved_close"
+    assert stats["paid_proxy_bytes"] == 4096
+    assert stats["unmeasured_charge_bytes"] == 4096
+    assert stats["measured_proxy_bytes"] == 0
+    [failure] = stats["close_failures"]
+    assert failure["gateway"] == gateway
+    assert failure["close_status_code"] == 409
+    assert failure["close_code"] == "lease_close_pending"
+    assert "browser request failed" in failure["request_error"]
+    assert "counters are not final" in failure["close_error"]
+
+
+@pytest.mark.unit
 def test_the_work_of_a_finished_class_survives_a_failed_lease_close(
     offline, monkeypatch
 ):
