@@ -303,6 +303,19 @@ def test_1325_reader_keeps_aliases_and_provenance_in_page_age_slice():
     assert "refresh_policy = 'weekly'" not in PAGE_AGES_SQL
 
 
+def test_1805_page_age_scopes_are_aggregated_once_before_frontier_join():
+    from scrapers.fbref.daily_report_reader import PAGE_AGES_SQL
+    sql = " ".join(PAGE_AGES_SQL.split())
+    # A correlated scan of this materialized CTE per frontier row times out.
+    assert "FROM canonical_scope c WHERE c.target_id=f.target_id" not in sql
+    scopes = sql.split("page_age_scopes AS (", 1)[1].split(") SELECT coalesce(jsonb_agg(p)", 1)[0]
+    assert "jsonb_agg(DISTINCT jsonb_build_object(" in scopes
+    assert "'competition_id',competition_id,'season_id',season_id" in scopes
+    assert "FROM canonical_scope GROUP BY target_id" in scopes
+    assert "LEFT JOIN page_age_scopes USING (target_id)" in sql
+    assert "coalesce(page_age_scopes.scopes, '[]'::jsonb) AS scopes" in sql
+
+
 def test_1325_standings_proof_uses_processed_season_current_content():
     data = snapshot()
     base = {"page_kind": "season", "canonical_url": "https://fbref.com/en/comps/9/x",

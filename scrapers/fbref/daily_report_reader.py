@@ -81,6 +81,13 @@ PAGE_AGES_SQL = _frontier_scope_cte_for_candidates("""
  WHERE source='fbref' AND refresh_policy <> 'historical_once'
    AND state NOT IN ('dead','skipped','quarantined')
 """) + """
+, page_age_scopes AS (
+ SELECT target_id,
+        jsonb_agg(DISTINCT jsonb_build_object(
+          'competition_id',competition_id,'season_id',season_id)) AS scopes
+ FROM canonical_scope
+ GROUP BY target_id
+)
 SELECT coalesce(jsonb_agg(p), '[]')::text FROM (
  SELECT f.target_id,f.page_kind,f.canonical_url,f.state,f.refresh_policy,
         f.last_fetched_at, f.last_content_hash,
@@ -95,11 +102,10 @@ SELECT coalesce(jsonb_agg(p), '[]')::text FROM (
           AND NOT coalesce(scope.has_unknown,true)
           AND NOT coalesce(scope.inactive_competition,true)
           AND NOT coalesce(scope.invalid_season,true) AS current_ownership,
-        (SELECT coalesce(jsonb_agg(DISTINCT jsonb_build_object(
-           'competition_id',c.competition_id,'season_id',c.season_id)), '[]')
-         FROM canonical_scope c WHERE c.target_id=f.target_id) AS scopes
+        coalesce(page_age_scopes.scopes, '[]'::jsonb) AS scopes
  FROM fbref_control.page_frontier f
  LEFT JOIN scope_rollup scope USING (target_id)
+ LEFT JOIN page_age_scopes USING (target_id)
  WHERE f.source='fbref' AND f.refresh_policy <> 'historical_once'
    AND f.state NOT IN ('dead','skipped','quarantined') AND f.created_at <= '{cutoff}'::timestamptz
 ) p
