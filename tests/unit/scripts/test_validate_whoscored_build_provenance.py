@@ -296,13 +296,16 @@ def _promote_mutated_manifest(
     _git(root, "commit", "--amend", "--no-edit", "-q")
 
 
-def test_current_repository_evidence_matches_its_declared_state() -> None:
-    attestation_path = ROOT / provenance.ATTESTATION_RELATIVE
-    manifest_path = ROOT / provenance.MANIFEST_RELATIVE
+def test_current_repository_evidence_matches_its_declared_state(
+    protected_whoscored_checkout,
+) -> None:
+    root = protected_whoscored_checkout
+    attestation_path = root / provenance.ATTESTATION_RELATIVE
+    manifest_path = root / provenance.MANIFEST_RELATIVE
     attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
     if attestation.get("status") == "blocked-v1":
         discovery = provenance.validate(
-            ROOT,
+            root,
             attestation_path=attestation_path,
             manifest_path=manifest_path,
             deployment_attestation_path=None,
@@ -312,7 +315,7 @@ def test_current_repository_evidence_matches_its_declared_state() -> None:
         assert discovery.issues
     elif attestation.get("status") == "ready-v1":
         discovery = provenance.validate_ready_build_evidence(
-            ROOT,
+            root,
             attestation_path=attestation_path,
             manifest_path=manifest_path,
         )
@@ -321,14 +324,16 @@ def test_current_repository_evidence_matches_its_declared_state() -> None:
     else:
         pytest.fail("repository attestation has an unsupported state")
     assert provenance.canonical_bytes(discovery.report).endswith(b"\n")
-    workflow = (ROOT / ".github/workflows/whoscored-ci.yml").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/whoscored-ci.yml").read_text(encoding="utf-8")
     assert "scripts/validate_whoscored_build_provenance.py" in workflow
     assert "--expect-blocked" in workflow
     assert "--expect-ready-build" in workflow
 
 
 def test_current_repository_generate_ready_discovers_all_split_project_services(
+    protected_whoscored_checkout,
 ) -> None:
+    root = protected_whoscored_checkout
     groups = deployment_generator.IMAGE_GROUP_SERVICES
     payload_by_group = {
         group: f"sha256:{character * 64}"
@@ -341,10 +346,10 @@ def test_current_repository_generate_ready_discovers_all_split_project_services(
     }
     assert len(payload_ids) == 14
 
-    revision = provenance.source_revision(ROOT)
-    provenance._validate_payload_blocked_evidence(ROOT, revision)
+    revision = provenance.source_revision(root)
+    provenance._validate_payload_blocked_evidence(root, revision)
     discovery = provenance.discover_repository(
-        ROOT,
+        root,
         payload_image_ids=payload_ids,
         revision=revision,
     )
@@ -358,27 +363,28 @@ def test_current_repository_generate_ready_discovers_all_split_project_services(
     assert {
         relative.as_posix() for relative in provenance.CANONICAL_COMPOSE_RELATIVES
     } <= {
-        path.relative_to(ROOT).as_posix() for path in discovery.material_paths
+        path.relative_to(root).as_posix() for path in discovery.material_paths
     }
     assert all(discovery.records[key] for key in provenance.RECORD_KEYS)
 
 
 def test_declared_repository_mode_emits_report_but_default_rejects_without_deployment(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], protected_whoscored_checkout,
 ) -> None:
+    root = protected_whoscored_checkout
     attestation = json.loads(
-        (ROOT / provenance.ATTESTATION_RELATIVE).read_text(encoding="utf-8")
+        (root / provenance.ATTESTATION_RELATIVE).read_text(encoding="utf-8")
     )
     mode = (
         "--expect-blocked"
         if attestation.get("status") == "blocked-v1"
         else "--expect-ready-build"
     )
-    assert provenance.main(["--root", str(ROOT), mode]) == 0
+    assert provenance.main(["--root", str(root), mode]) == 0
     output = capsys.readouterr()
     assert json.loads(output.out)["status"] == attestation["status"]
 
-    assert provenance.main(["--root", str(ROOT)]) == provenance.EXIT_CONFIG
+    assert provenance.main(["--root", str(root)]) == provenance.EXIT_CONFIG
     output = capsys.readouterr()
     assert output.out == ""
     assert "build provenance blocked" in output.err
@@ -3037,8 +3043,11 @@ def test_workflow_rejects_yaml_forms_outside_scanner_subset(
     ],
 )
 def test_protected_stage_recipe_pins_baked_entrypoint_and_cmd(
-    service: str, path: Path, stage: str, needle: str, replacement: str
+    service: str, path: Path, stage: str, needle: str, replacement: str,
+    protected_whoscored_checkout,
 ) -> None:
+    path = protected_whoscored_checkout / path.relative_to(ROOT)
+    root = protected_whoscored_checkout
     expected = provenance.PROTECTED_SERVICE_BUILDS[service]
     config = provenance.BuildConfig(
         service=service,
@@ -3047,8 +3056,8 @@ def test_protected_stage_recipe_pins_baked_entrypoint_and_cmd(
         target=expected[2],
         image=expected[3],
     )
-    context = (ROOT / expected[0]).resolve()
-    discovery = provenance._empty_discovery(ROOT, COMMIT)
+    context = (root / expected[0]).resolve()
+    discovery = provenance._empty_discovery(root, COMMIT)
     _, context_inputs = provenance._context_digest(context, path, discovery)
     closure = provenance._scan_dockerfile(
         path,
@@ -3067,7 +3076,10 @@ def test_protected_stage_recipe_pins_baked_entrypoint_and_cmd(
         provenance._validate_protected_stage_recipe(config, closure)
 
 
-def test_protected_recipe_pins_reachable_parent_environment() -> None:
+def test_protected_recipe_pins_reachable_parent_environment(
+    protected_whoscored_checkout,
+) -> None:
+    root = protected_whoscored_checkout
     service = "airflow-scheduler"
     expected = provenance.PROTECTED_SERVICE_BUILDS[service]
     config = provenance.BuildConfig(
@@ -3077,9 +3089,9 @@ def test_protected_recipe_pins_reachable_parent_environment() -> None:
         target=expected[2],
         image=expected[3],
     )
-    path = ROOT / expected[1]
-    context = ROOT / expected[0]
-    discovery = provenance._empty_discovery(ROOT, COMMIT)
+    path = root / expected[1]
+    context = root / expected[0]
+    discovery = provenance._empty_discovery(root, COMMIT)
     _, context_inputs = provenance._context_digest(context, path, discovery)
     closure = provenance._scan_dockerfile(
         path,

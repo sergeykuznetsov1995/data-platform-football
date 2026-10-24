@@ -195,10 +195,28 @@ def test_interruption_keeps_production_trust_root_at_the_old_decision(
 
 
 @pytest.mark.unit
-def test_checked_in_runtime_evidence_matches_generator():
-    rendered = evidence.render_evidence(ROOT)
+def test_checked_in_runtime_evidence_matches_generator(protected_whoscored_checkout):
+    rendered = evidence.render_evidence(protected_whoscored_checkout)
 
-    assert evidence.check_evidence(ROOT, rendered)
+    assert evidence.check_evidence(protected_whoscored_checkout, rendered)
+
+
+@pytest.mark.parametrize("member", (".", "payload.py", "dags"))
+def test_runtime_evidence_rejects_group_writable_material(tmp_path, member):
+    _runtime_fixture(tmp_path)
+    path = tmp_path / member
+    path.chmod(path.stat().st_mode | 0o020)
+
+    with pytest.raises(evidence.EvidenceError, match="writable|protected regular"):
+        evidence.render_evidence(tmp_path)
+
+
+def test_changed_payload_does_not_match_unchanged_runtime_evidence(tmp_path):
+    _runtime_fixture(tmp_path)
+    evidence.write_evidence(tmp_path, evidence.render_evidence(tmp_path))
+    (tmp_path / "payload.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    assert evidence.check_evidence(tmp_path, evidence.render_evidence(tmp_path)) is False
 
 
 @pytest.mark.unit
