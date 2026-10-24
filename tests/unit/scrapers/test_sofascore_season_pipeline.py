@@ -1385,15 +1385,26 @@ def test_deferred_normalized_results_materialize_before_atomic_merge_finalize(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("has_finished_matches", [True, False])
 def test_runner_offline_season_replay_merges_then_noops_without_browser(
     tmp_path,
     monkeypatch,
+    has_finished_matches,
 ):
     from dags.scripts import run_sofascore_scraper as runner
 
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     _complete_plan_with_expansion_raw(raw_store, manifest)
+    if not has_finished_matches:
+        payload = _payload(FIXTURE_PATHS["schedule_last"])
+        for event in payload["events"]:
+            # Past starts remain visible; absence of finals is not proof of
+            # a future season or a successful match phase.
+            event["status"] = {"type": "notstarted"}
+        _seed_json(raw_store, build_schedule_page_spec(
+            direction="last", page=0, **_common(),
+        ), payload)
     engine, transport = _engine(
         tmp_path,
         raw_store=raw_store,
@@ -1449,6 +1460,15 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     assert payload["league_table_rows"] == 4
     assert payload["traffic"]["request_count"] == 0
     assert payload["traffic"]["replay_hit_rate"] == 1.0
+    inventory = payload["schedule_inventory"]
+    assert inventory == {
+        "verified": True, "tournament_id": TOURNAMENT_ID,
+        "source_season_id": SEASON_ID, "canonical_season": "2526",
+        "finished_matches": 2 if has_finished_matches else 0,
+        "schedule_events": 2,
+    }
+    manifests_before_noop = {spec.key: manifest.get(spec.key)
+                             for spec in committed_plan.specs}
 
     replay_engine, replay_transport = _engine(
         tmp_path,
@@ -1473,6 +1493,8 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     assert replay_transport.calls == 0
     browser.assert_not_called()
     no_op = json.loads(no_op_output.read_text(encoding="utf-8"))
+    assert no_op["schedule_inventory"] == inventory
+    assert {spec.key: manifest.get(spec.key) for spec in committed_plan.specs} == manifests_before_noop
     # #1357: Trino round-trips of the process; the count is process-wide.
     assert set(no_op["traffic"].pop("trino_queries")) == {"select", "merge", "other"}
     assert no_op["traffic"] == {
@@ -1831,6 +1853,7 @@ def _live_season_run(tmp_path, monkeypatch, committed):
 
     materialized = SimpleNamespace(
         endpoint_completeness=1.0,
+        match_phase_ready=True,
         schedule_rows=(),
         standings_rows=(),
     )
@@ -1945,13 +1968,19 @@ def test_runner_live_season_tolerates_a_pending_referee_profile_after_commit(
     that is not the season manifest failing to commit, so the runner reports
     it and exits green instead of failing the league every day."""
     committed = _plan_with_missing(pending=("referee_profile",))
+    committed = replace(committed, specs=(build_referee_profile_spec(
+        source_tournament_id="17", source_season_id="76986", referee_id=1,
+        freshness_key="day-2026-08-20", paid_proxy=False,
+    ),))
     assert committed.complete is False
 
     with caplog.at_level("WARNING"):
         rc, _captured, payload = _live_season_run(tmp_path, monkeypatch, committed)
 
     assert rc == 0
-    assert payload["endpoint_completeness"] == 1.0
+    assert payload["endpoint_completeness"] == 0.0
+    assert payload["full_complete"] is False
+    assert payload["match_phase_ready"] is True
     assert payload["pending_endpoints"] == 1
     assert "referee" in caplog.text
     assert committed.pending_keys[0].stable_id() in caplog.text
@@ -2916,3 +2945,163 @@ def test_player_universe_gap_does_not_block_the_season_or_match_phase(tmp_path):
     assert transport.calls == 0
     with pytest.raises(SeasonPlanningError, match="evidence is incomplete"):
         squad_player_ids(raw_store, committed)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("profile_body", [
+    b'{"referee":{"id":789719,"slug":"sofiia-prychyna"}}',
+    b'{"referee":',
+])
+def test_rejected_optional_referee_keeps_raw_and_allows_real_season_commit(
+    tmp_path, monkeypatch, profile_body,
+):
+    """The retained 791840 cross-talk must not poison independent schedule rows."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    raw = _raw_store(tmp_path)
+    manifests = InMemoryManifestStore()
+    _seed_complete_partition_roots(
+        raw,
+        schedule_last_payload=_schedule_payload([16412939], has_next=False),
+        schedule_next_payload=_schedule_payload([], has_next=False),
+    )
+    _seed_full_event_referee(
+        raw, event_id=16412939, referee_id=791840,
+        referee_slug="sofia-prychyna", freshness_key="final",
+    )
+    profile = build_referee_profile_spec(
+        referee_id=791840, expected_slugs=("sofia-prychyna",), **_common(),
+    )
+    _seed_raw(raw, profile, profile_body)
+    plan = plan_season_partition(raw, manifests, event_freshness_key="final", **_common())
+    assert profile.key in plan.pending_keys
+    assert profile.key not in plan.missing_raw_keys
+    engine, transport = _engine(tmp_path, raw_store=raw, manifest_store=manifests,
+                                sink=DeferredCaptureSink())
+    runtime = CaptureRuntime(engine, manifests, raw)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID))
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame
+    scraper.save_to_iceberg.side_effect = lambda **kw: "iceberg.bronze." + kw["table_name"]
+    output = tmp_path / "rejected-referee.json"
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"], season=2025, output_path=str(output),
+            capture_runtime=runtime, workload_plan=None, offline_replay=True,
+        )
+    report = json.loads(output.read_text())
+    assert rc == 0, report["errors"]
+    assert transport.calls == 0
+    assert report["manifest_committed"] is True
+    assert report["match_phase_ready"] is True
+    assert report["full_complete"] is False
+    assert 0 < report["endpoint_completeness"] < 1
+    assert report["traffic"]["endpoint_completeness"] == report["endpoint_completeness"]
+    assert report["optional_endpoint_errors"][0]["status"] == "schema_error"
+    assert report["schedule_inventory"]["finished_matches"] == 1
+    rejected = manifests.get(profile.key)
+    assert rejected.status == ManifestStatus.SCHEMA_ERROR
+    assert rejected.raw_content_hash
+    assert raw.load_bytes(profile.raw_target)[0] == profile_body
+    assert scraper.save_to_iceberg.call_count == 2
+    # A second planning/replay sees the same local rejection, without paid retry.
+    retained = plan_season_partition(raw, manifests, event_freshness_key="final", **_common())
+    assert retained.match_phase_ready
+    assert retained.pending_keys == (profile.key,)
+    assert retained.missing_raw_keys == ()
+
+
+@pytest.mark.unit
+def test_rejected_required_schedule_still_aborts_season_planning(tmp_path):
+    raw = _raw_store(tmp_path)
+    spec = build_schedule_page_spec(direction="last", page=0, **_common())
+    _seed_json(raw, spec, {"events": "wrong"})
+    with pytest.raises(SeasonPlanningError, match="stored schema rejected"):
+        plan_season_partition(raw, InMemoryManifestStore(), **_common())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["storage", "terminal", "lineage"])
+def test_optional_referee_does_not_hide_storage_or_manifest_corruption(tmp_path, monkeypatch, failure):
+    from scrapers.sofascore.raw_store import RawStoreError
+
+    raw = _raw_store(tmp_path)
+    manifests = InMemoryManifestStore()
+    _seed_complete_partition_roots(raw)
+    _seed_full_event_referee(raw, event_id=14000001, referee_id=791840,
+                            referee_slug="sofia-prychyna", freshness_key="final")
+    profile = build_referee_profile_spec(
+        referee_id=791840, expected_slugs=("sofia-prychyna",), **_common(),
+    )
+    _seed_json(raw, profile, {"referee": {"id": 789719, "slug": "sofiia-prychyna"}})
+    engine, _ = _engine(tmp_path, raw_store=raw, manifest_store=manifests)
+    rejected = engine.capture(profile, offline=True, force_replay=True)
+    assert rejected.manifest.status == ManifestStatus.SCHEMA_ERROR
+    if failure == "terminal":
+        manifests.upsert(replace(rejected.manifest, status=ManifestStatus.SUCCESS, row_count=1))
+        with pytest.raises(SeasonPlanningError, match="terminal manifest points at rejected schema"):
+            plan_season_partition(raw, manifests, event_freshness_key="final", **_common())
+    elif failure == "storage":
+        original_load = raw.load_bytes
+
+        def load(target):
+            if target == profile.raw_target:
+                raise RawStoreError("corrupt referee blob")
+            return original_load(target)
+
+        monkeypatch.setattr(raw, "load_bytes", load)
+        with pytest.raises(SeasonPlanningError, match="cannot read stored raw"):
+            plan_season_partition(raw, manifests, event_freshness_key="final", **_common())
+    else:
+        plan = replace(_plan_with_missing(pending=("referee_profile",)),
+                       specs=(profile,))
+        forged = replace(rejected, raw=replace(rejected.raw, content_hash="wrong"))
+        with pytest.raises(SeasonMaterializationError, match="invalid raw lineage"):
+            materialize_season_partition(plan, [forged], canonical_league="SS-17",
+                                         canonical_season="2526")
+
+
+@pytest.mark.unit
+def test_optional_referee_manifest_write_failure_stops_real_season_commit(tmp_path, monkeypatch):
+    """The engine's SCHEMA_ERROR envelope can carry an infrastructure failure."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    raw = _raw_store(tmp_path)
+    manifests = InMemoryManifestStore()
+    _seed_complete_partition_roots(
+        raw, schedule_last_payload=_schedule_payload([16412939], has_next=False),
+        schedule_next_payload=_schedule_payload([], has_next=False),
+    )
+    _seed_full_event_referee(raw, event_id=16412939, referee_id=791840,
+                            referee_slug="sofia-prychyna", freshness_key="final")
+    profile = build_referee_profile_spec(referee_id=791840, **_common())
+    _seed_json(raw, profile, {"referee": {"id": 791840, "slug": "sofia-prychyna"}})
+    upsert = manifests.upsert
+
+    def fail_success(record):
+        if record.key == profile.key and record.status == ManifestStatus.SUCCESS:
+            raise OSError("referee manifest storage unavailable")
+        upsert(record)
+
+    monkeypatch.setattr(manifests, "upsert", fail_success)
+    engine, _ = _engine(tmp_path, raw_store=raw, manifest_store=manifests,
+                        sink=DeferredCaptureSink())
+    runtime = CaptureRuntime(engine, manifests, raw)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID))
+    output = tmp_path / "manifest-write-failure.json"
+    scraper = MagicMock()
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"], season=2025, output_path=str(output),
+            capture_runtime=runtime, workload_plan=None, offline_replay=True,
+        )
+    report = json.loads(output.read_text())
+    assert rc == 1
+    assert "manifest_committed" not in report
+    assert any("nonterminal: schema_error" in error for error in report["errors"])
+    assert manifests.get(profile.key).error_type == "OSError"
+    scraper.save_to_iceberg.assert_not_called()

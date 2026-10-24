@@ -133,7 +133,7 @@ def history_scope_counts(result_dir: Path, t0_utc: str, t1_utc: str,
                 raise ValueError("invalid history slot receipt item")
             env = item["environment"]
             if (item.get("accounted") is not True or not isinstance(item.get("outcome"), dict)
-                    or item["outcome"].get("status") not in ("success", "failed", "not_started")):
+                    or item["outcome"].get("status") not in ("success", "failed", "not_started", "waiting")):
                 raise ValueError("unaccounted history slot attempt")
             if item["outcome"].get("status") == "not_started":
                 if isinstance(item.get("attempts"), bool) or item.get("attempts") != 0:
@@ -159,18 +159,42 @@ def history_scope_counts(result_dir: Path, t0_utc: str, t1_utc: str,
                     or stamp["started_at"] != item.get("started_at")
                     or stamp["finished_at"] != item.get("finished_at")
                     or started.tzinfo is None or finished.tzinfo is None or finished < started
-                    or status not in ("success", "failed") or status != item["outcome"].get("status")
+                    or status not in ("success", "failed", "waiting") or status != item["outcome"].get("status")
                     or not payload.get("scope_digest")
                     or payload.get("run_id") != env["SOFASCORE_SCOPE_RUN_ID"]
                     or payload.get("campaign_id") != env["SOFASCORE_EXPECTED_CAMPAIGN_ID"]
                     or str(payload.get("tournament_id")) != str(env["SOFASCORE_TOURNAMENT_ID"])
                     or str(payload.get("source_season_id")) != str(env["SOFASCORE_SOURCE_SEASON_ID"])):
                 raise ValueError("invalid history scope attempt report")
+            if status == "waiting":
+                # This module is also loaded standalone by host reporting: keep
+                # the exact waiting proof check free of application imports.
+                phases = payload.get("phases")
+                phase = phases[0] if isinstance(phases, list) and len(phases) == 1 else {}
+                phase = phase if isinstance(phase, dict) else {}
+                inventory = phase.get("schedule_inventory")
+                if (payload.get("status") != "waiting"
+                        or payload.get("waiting_reason") != "season_has_no_finished_matches"
+                        or phase.get("phase") != "season" or phase.get("status") != "success"
+                        or not isinstance(inventory, dict) or inventory.get("verified") is not True
+                        or str(inventory.get("tournament_id")) != env["SOFASCORE_TOURNAMENT_ID"]
+                        or str(inventory.get("source_season_id")) != env["SOFASCORE_SOURCE_SEASON_ID"]
+                        or inventory.get("canonical_season") != env.get("SOFASCORE_CANONICAL_SEASON")
+                        or not inventory.get("canonical_season")
+                        or type(inventory.get("finished_matches")) is not int
+                        or inventory["finished_matches"] != 0
+                        or type(inventory.get("schedule_events")) is not int
+                        or inventory["schedule_events"] < 0):
+                    raise ValueError("unverified history waiting outcome")
             identity = (run, payload["scope_digest"])
             if identity in reports:
                 raise ValueError("duplicate history scope attempt in finalize receipt")
             reports[identity] = (started, status)
-    attempts = [status for started, status in reports.values() if d0 <= started < d1]
+    # Waiting consumed real work, but proved neither failure nor completed
+    # history. Keep it in the receipt without making the red-share denominator
+    # look healthier through a new class of green attempts.
+    attempts = [status for started, status in reports.values()
+                if d0 <= started < d1 and status != "waiting"]
     return sum(status == "failed" for status in attempts), len(attempts)
 
 
