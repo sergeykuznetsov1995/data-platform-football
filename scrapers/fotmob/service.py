@@ -105,7 +105,8 @@ def _failure_status(exc: BaseException) -> ManifestStatus:
 def _is_calendar_unavailable_stub(payload: Mapping[str, Any]) -> bool:
     """Recognize the retained metadata-only source page, never an empty list.
 
-    This shape was observed for six included competitions before #1288.
+    This shape was observed for six included competitions before #1288 and
+    with only the seasons tab for the historical Super Cup page in #1812.
     Extra calendar fields and malformed explicit lists remain schema drift.
     Caller must still validate all JSON paths and protect committed matches.
     """
@@ -122,7 +123,7 @@ def _is_calendar_unavailable_stub(payload: Mapping[str, Any]) -> bool:
         and isinstance(overview_matches, Mapping)
         and set(overview_matches) == {"hasOngoingMatch"}
         and overview_matches["hasOngoingMatch"] is False
-        and payload.get("tabs") == []
+        and payload.get("tabs") in ([], ["seasons"])
         and payload.get("table") is None
         and payload.get("stats") == {}
         and payload.get("playoff") is None
