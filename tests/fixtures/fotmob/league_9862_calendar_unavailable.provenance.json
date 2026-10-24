@@ -1,0 +1,8 @@
+{
+  "issue": "https://github.com/sergeykuznetsov1995/data-platform-football/issues/1812",
+  "retained_copy": ".local/tasks/1587/drift-9862/payload.json",
+  "campaign_report": "reports/report_4049.json",
+  "competition_id": 9862,
+  "source_season_key": "2017/2018",
+  "sha256": "20d271c661ea72a501419a83d96b4766757e0a9238d5853cfd662540a8cb7679"
+}
