@@ -53,7 +53,8 @@ from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, players_url, normalize_
 from scrapers.transfermarkt.signal_qualification import CONTRACT_MISMATCH_THRESHOLD
 
 MIB = 1024 * 1024
-MAX_ATTEMPTS = 5071  # 4471 + 600 по решению владельца 21.10.2026 («Больше повторов», #1393)
+LEGACY_MAX_ATTEMPTS = 5071
+MAX_ATTEMPTS = 8244  # 2744 paid + 5500 new; owner approval 24.10.2026, #1393
 MAX_BYTES = 256 * MIB
 MAX_PORTION_SECONDS = 45 * 60
 # Existing gateway traffic namespace; the unique run/task labels identify an
@@ -542,6 +543,9 @@ def _parity_day_guard(state: dict, pending: int, now: datetime) -> None:
 
 
 def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) -> int:
+    qualification_run = bool(getattr(args, 'qualification_run', False))
+    if args.max_attempts > MAX_ATTEMPTS or (args.max_attempts > LEGACY_MAX_ATTEMPTS and not qualification_run):
+        raise ProbeGateError('approved 8244 ceiling requires --qualification-run')
     if args.mode == "qualify":
         from scrapers.transfermarkt.signal_qualification import build_qualification, QualificationError
         evidence = Path(args.evidence_dir).resolve()
@@ -567,8 +571,21 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
     experiment.mkdir(parents=True, exist_ok=True)
     with (experiment / "signal-probe.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        from dags.scripts.transfermarkt_signal_guard import QualificationGuard, GuardHalt, GuardWait, attempt_id
         ledger_path = experiment / "signal-probe-ledger.json"
         ledger = _read(ledger_path) if ledger_path.exists() else {"version": 1, "active": False, "totals": dict.fromkeys(COUNTERS, 0)}
+        pinned = ledger.get('qualification_guard_version')
+        if pinned is not None and (type(pinned) is not int or pinned != 1):
+            raise ProbeGateError('unsupported pinned qualification guard')
+        guard = (QualificationGuard(experiment, now, _write) if qualification_run or
+                 pinned or (experiment / 'qualification-guard.json').exists() else None)
+        if guard and not pinned:
+            ledger['qualification_guard_version'] = 1
+            _write(ledger_path, ledger)
+        if guard and guard.data.get('stop'):
+            _write(evidence / 'report.json', {'mode': args.mode, 'complete': False,
+                   'detector_gate': None, 'stop_reason': guard.data['stop']['reason']})
+            return 2
         if ledger.get("active"):
             raise ProbeGateError("interrupted experiment: reconcile gateway lease bytes before any resume")
         if args.mode != "probe" and not ledger.get("packet_schema_gate"):
@@ -614,6 +631,12 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
 
         if state["identity"] != identity:
             raise ProbeGateError("observation input changed; create a new evidence directory")
+        if guard:
+            if not 1 <= args.endpoint_attempts <= 2 or not 1 <= getattr(args, 'transport_attempts', 4) <= 4:
+                raise ProbeGateError('qualification URL limits must remain <=2 responses / <=4 transport')
+            if state.get('qualification_day_msk', guard.day) != guard.day:
+                raise ProbeGateError('qualification observation must remain in one Moscow day')
+            state['qualification_day_msk'] = guard.day
         if args.mode in {"parity", "recheck"}:
             _parity_day_guard(state, sum(task["key"] not in state["results"] for task in tasks), now)
         remaining = {key: (args.max_attempts if key == "request_attempts" else args.max_bytes) - ledger["totals"][key] for key in COUNTERS}
@@ -628,6 +651,8 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         report = {"mode": args.mode, "identity": identity, "portion_id": portion_id,
                   "detector_gate": None, "detector_gate_evaluated_by": "qualify"}
         exit_code = 3
+        guard_pending = False
+        accounting_failed = False
         try:
             for task in tasks:
                 if task["key"] in state["results"]:
@@ -638,10 +663,18 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                     if args.mode == "cohort":
                         continue
                     raise ProbeGateError("endpoint attempt limit exhausted; no schema gate")
+                if guard:
+                    guard.now = (now_fn or _now_utc)()
+                    if guard.now.astimezone(MSK).date().isoformat() != guard.day:
+                        guard.halt('moscow_day_changed')
+                    guard.check(task, tasks, state['results'], args.endpoint_attempts,
+                                getattr(args, 'transport_attempts', 4))
                 counts = state['url_attempts'][task['url']]
                 response_remaining = args.endpoint_attempts - counts['responses']
                 transport_remaining = getattr(args, 'transport_attempts', 4) - counts['transport']
                 before = client.get_traffic_stats()
+                before_records = {attempt_id(r) for r in client.get_raw_attempt_records()} if guard else set()
+                outcome = None
                 request_remaining = remaining["request_attempts"] - before["request_attempts"]
                 # Reserve an unknown attempt conservatively before I/O. The active
                 # experiment marker still forbids unaccounted crash recovery.
@@ -649,11 +682,14 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                 state['endpoint_tries'][task['key']] = state['endpoint_tries'].get(task['key'], 0) + 1
                 counts['responses'] += 1
                 _write(state_path, state)
+                if guard:
+                    guard_pending = True
+                    guard.reserve(task['url'])
                 try:
                     # A fetch may rotate internally. Bounding it by BOTH remaining
                     # classes prevents any response ordering from overrunning a cap.
                     outcome = client.fetch(task['url'], as_json=task['json'],
-                                           max_attempts=min(4, response_remaining, transport_remaining, request_remaining),
+                                           max_attempts=min(1 if guard else 4, response_remaining, transport_remaining, request_remaining),
                                            label=task['kind'], context={'cycle_id': portion_id, 'scope_id': task['scope']})
                 finally:
                     after = client.get_traffic_stats()
@@ -667,6 +703,33 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                         counts['responses'] += responses - 1
                         counts['transport'] += transport
                     _write(state_path, state)
+                    if guard:
+                        new_records = [r for r in client.get_raw_attempt_records() if attempt_id(r) not in before_records]
+                        delta = {s: n - before['status_counts'].get(s, 0) for s, n in after['status_counts'].items()}
+                        upstream = getattr(outcome, 'proxy_upstream_status', None)
+                        if (isinstance(upstream, str) and re.fullmatch(r'[A-Za-z0-9_]{1,64}', upstream)
+                                and getattr(outcome, 'status_code', 0) and outcome.status_code >= 500):
+                            proofs = state.setdefault('qualification_transport_proofs', {})
+                            for record in new_records:
+                                if record.get('status_code') == outcome.status_code:
+                                    proofs[attempt_id(record)] = upstream
+                            _write(state_path, state)
+                        guard.now = (now_fn or _now_utc)()
+                        try:
+                            guard.observe(task['url'], attempts, delta, new_records, client, outcome,
+                                          proven_transport=state.get('qualification_transport_proofs', {}),
+                                          transport_limit=getattr(args, 'transport_attempts', 4))
+                        except GuardHalt:
+                            guard_pending = False
+                            raise
+                        retry_after = guard.counts(task['url']).get('retry_after')
+                        if retry_after:
+                            from dags.scripts.transfermarkt_signal_guard import quota_key
+                            state.setdefault('qualification_retry_after', {})[quota_key(task['url'])] = retry_after
+                            _write(state_path, state)
+                        guard_pending = False
+                        if guard.now.astimezone(MSK).date().isoformat() != guard.day:
+                            guard.halt('moscow_day_changed')
                 if not outcome.is_success or not outcome.raw_capture_id:
                     report["failure"] = {"key": task["key"], "status": outcome.status.value, "http_status": outcome.status_code}
                     state["failures"][task["key"]] = report["failure"]
@@ -712,11 +775,22 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                         exit_code = 0 if report["field_parity_gate"] else 2
         except Exception as exc:
             report["error_type"] = type(exc).__name__
+            from scrapers.transfermarkt.raw_store import RawStoreError
+            from scrapers.transfermarkt.models import TrafficMeterError
+            accounting_failed = isinstance(exc, (RawStoreError, TrafficMeterError))
+            if isinstance(exc, GuardHalt):
+                report['stop_reason'] = exc.reason
+                state['qualification_stop'] = dict(guard.data['stop'])
+                _write(state_path, state)
+            if isinstance(exc, GuardWait):
+                report.update(waiting_for='transport_backoff', resume_after_utc=exc.until)
             from scrapers.transfermarkt.models import ProxyRequiredError
             if isinstance(exc, ProxyRequiredError):
                 from scrapers.transfermarkt.client import redact_sensitive
                 report["error_detail"] = redact_sensitive(exc)
             exit_code = 2
+            if isinstance(exc, GuardWait):
+                exit_code = 3
         finally:
             # Never clear an active marker unless close and provider accounting
             # succeed. A killed process cannot quietly discard paid attempts.
@@ -724,6 +798,12 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
             stats = client.get_traffic_stats()
             if not stats.get("provider_metering_available"):
                 raise ProbeGateError("provider accounting unavailable")
+            if guard_pending:
+                raise ProbeGateError('qualification guard not durable; reconcile before resume')
+            if guard and len(client.get_raw_attempt_records()) != stats['request_attempts']:
+                raise ProbeGateError('raw attempts differ from settled traffic; reconcile before resume')
+            if guard and accounting_failed:
+                raise ProbeGateError('raw accounting failed; reconcile before resume')
             for key in COUNTERS:
                 ledger["totals"][key] += int(stats[key])
             state["attempt_records"].extend(client.get_raw_attempt_records())
@@ -765,7 +845,8 @@ def main():
     parser.add_argument("--sample")
     parser.add_argument("--evidence-dir", required=True)
     parser.add_argument("--experiment-dir")
-    parser.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS)
+    parser.add_argument('--qualification-run', action='store_true', help='sticky daily URL quotas and first-CAPTCHA stop')
+    parser.add_argument("--max-attempts", type=int)
     parser.add_argument("--max-bytes", type=int, default=MAX_BYTES)
     parser.add_argument("--portion-seconds", type=int, default=MAX_PORTION_SECONDS)
     parser.add_argument("--endpoint-attempts", type=int, default=2)
@@ -777,6 +858,10 @@ def main():
     parser.add_argument("--recheck-report")
     parser.add_argument("--recheck-players", type=int, default=64)
     args = parser.parse_args()
+    if args.max_attempts is None:
+        args.max_attempts = MAX_ATTEMPTS if args.qualification_run else LEGACY_MAX_ATTEMPTS
+    if args.max_attempts > LEGACY_MAX_ATTEMPTS and not args.qualification_run:
+        parser.error('the approved 8244 ceiling requires --qualification-run')
     if not 1 <= args.max_attempts <= MAX_ATTEMPTS or not MIB < args.max_bytes <= MAX_BYTES:
         parser.error(f"limits must fit the agreed {MAX_ATTEMPTS} attempts / 256 MiB experiment")
     if not 121 <= args.portion_seconds <= MAX_PORTION_SECONDS or not 1 <= args.endpoint_attempts <= 2:

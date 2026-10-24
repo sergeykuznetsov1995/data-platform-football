@@ -12,6 +12,292 @@ from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from dags.scripts import bench_transfermarkt_signals as bench
 
 
+def qualification_args(tmp_path, **changes):
+    return args(tmp_path, qualification_run=True, **changes)
+
+
+def test_approved_ceiling_8244_requires_qualification_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['bench', '--mode', 'probe', '--ids', '8198',
+        '--evidence-dir', str(tmp_path), '--max-attempts', '8244', '--qualification-run'])
+    seen = []
+    monkeypatch.setattr(bench, 'run', lambda options: seen.append(options) or 0)
+    assert bench.main() == 0
+    assert seen[0].max_attempts == 8244 and seen[0].qualification_run
+    monkeypatch.setattr(sys, 'argv', ['bench', '--mode', 'probe', '--ids', '8198',
+        '--evidence-dir', str(tmp_path), '--max-attempts', '8244'])
+    with pytest.raises(SystemExit):
+        bench.main()
+
+
+@pytest.mark.parametrize('mode', ['probe', 'cohort', 'parity', 'recheck'])
+def test_qualification_first_405_stops_whole_pair_and_survives_restart(tmp_path, monkeypatch, mode):
+    url = bench.player_url(['8198'])
+    tasks = [dict(key='first', kind='players', scope='scope', url=url, json=True),
+             dict(key='next', kind='players', scope='scope', url=bench.player_url(['1']), json=True)]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    monkeypatch.setattr(bench, 'recheck_sample', lambda *a: {'selected_changed_ids': ['8198']})
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    options = qualification_args(tmp_path, mode=mode, ids='8198', sample=str(sample),
+                                 day1=str(sample), day2=str(sample), recheck_players=64)
+    build, factory = transport_factory(tmp_path, responses=iter([(405, b'Human Verification'), (200, probe_body(url))]))
+    assert bench.run(options, client_factory=build) == 2
+    assert factory.calls == [url]
+    report = json.loads((tmp_path/'day1/report.json').read_text())
+    assert report['stop_reason'] == 'captcha'
+    assert report['experiment_totals']['request_attempts'] == 1
+    ledger = json.loads((tmp_path/'signal-probe-ledger.json').read_text())
+    assert not ledger['active']
+    options.evidence_dir = str(tmp_path/'different-directory')
+    # Dropping the flag or changing the day must not bypass the stored stop.
+    options.qualification_run = False
+    assert bench.run(options, client_factory=lambda *a: pytest.fail('stopped pair opened a client'),
+                     now_fn=lambda: datetime(2026, 10, 9, 12, tzinfo=timezone.utc)) == 2
+
+
+def test_qualification_aws_captcha_under_http200_is_not_a_roster_success(tmp_path, monkeypatch):
+    url = 'https://www.transfermarkt.com/manchester-city/kader/verein/281/plus/1'
+    tasks = [dict(key='squad', kind='squad', scope='GB1/2026', url=url, json=False)]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    body = b'<title>Human Verification</title><script src="https://abc.captcha.awswaf.com/a.js"></script>'
+    build, factory = transport_factory(tmp_path, responses=iter([(200, body)]))
+    assert bench.run(qualification_args(tmp_path, mode='cohort', sample=str(sample)), client_factory=build) == 2
+    assert factory.calls == [url]
+    state = json.loads((tmp_path/'day1/state.json').read_text())
+    assert state['results'] == {}
+    assert json.loads((tmp_path/'day1/report.json').read_text())['stop_reason'] == 'captcha'
+
+
+def test_qualification_url_count_is_shared_across_directories_and_resets_only_next_day(tmp_path):
+    for name in ['first-stage', 'second-stage']:
+        build, factory = transport_factory(tmp_path)
+        assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/name)), client_factory=build) == 0
+        assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'day2')), client_factory=build,
+                     now_fn=lambda: datetime(2026, 10, 9, 12, tzinfo=timezone.utc)) == 0
+    assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'third-stage')), client_factory=build) == 2
+    assert factory.calls == []
+
+
+def test_qualification_reserves_the_closing_response_before_retry(tmp_path, monkeypatch):
+    url = bench.player_url(['8198'])
+    tasks = [dict(key=k, kind='players', scope='scope', url=url, json=True) for k in ['initial', 'closing']]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    options = qualification_args(tmp_path, mode='parity', sample=str(sample))
+    build, factory = transport_factory(tmp_path, responses=iter([(404, b'missing'), (200, probe_body(url))]))
+    assert bench.run(options, client_factory=build) == 3
+    assert factory.calls == [url]
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(options, client_factory=build) == 2
+    assert factory.calls == []
+
+
+def test_qualification_feedback_failure_keeps_paid405_and_stop_marker(tmp_path):
+    body = b'<title>Human Verification</title>https://abc.captcha.awswaf.com/a.js'
+    build, factory = transport_factory(tmp_path, responses=iter([(405, body)]))
+    assert bench.run(qualification_args(tmp_path), client_factory=build) == 2
+    assert len(factory.calls) == 1
+    report = json.loads((tmp_path/'day1/report.json').read_text())
+    assert report['stop_reason'] == 'captcha'
+    assert report['experiment_totals']['request_attempts'] == 1
+    assert len(json.loads((tmp_path/'day1/state.json').read_text())['attempt_records']) == 1
+
+
+def test_qualification_missing_durable_marker_leaves_experiment_active(tmp_path, monkeypatch):
+    original = bench._write
+    def write(path, value):
+        if path.name == 'qualification-guard.json' and value.get('stop'):
+            raise OSError('offline failed marker write')
+        original(path, value)
+    monkeypatch.setattr(bench, '_write', write)
+    build, factory = transport_factory(tmp_path, responses=iter([(405, b'blocked')]))
+    with pytest.raises(bench.ProbeGateError, match='not durable'):
+        bench.run(qualification_args(tmp_path), client_factory=build)
+    assert len(factory.calls) == 1
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['active']
+    with pytest.raises(bench.ProbeGateError, match='reconcile'):
+        bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'new')),
+                  client_factory=lambda *a: pytest.fail('unsettled experiment opened a client'))
+
+
+def test_qualification_known_captcha_does_not_depend_on_a_second_raw_read(tmp_path):
+    client = FakeClient([FetchOutcome(status=FetchStatus.BLOCKED, status_code=200, attempts=1)])
+    url = bench.player_url(['40104', '8198'])
+    client.get_raw_attempt_records = lambda: ([{'envelope_id': 'one', 'url': url,
+        'status_code': 200, 'outcome_kind': 'response'}] if client.calls else [])
+    client._raw_store.load_capture = lambda *a: pytest.fail('known block should already be durable')
+    assert bench.run(qualification_args(tmp_path), client_factory=lambda *a: client) == 2
+    assert len(client.calls) == 1
+    assert json.loads((tmp_path/'qualification-guard.json').read_text())['stop']['reason'] == 'captcha'
+
+
+def test_qualification_prior_2744_attempts_are_not_reset(tmp_path):
+    totals = {'request_attempts': 2744, 'provider_metered_bytes': 16705757,
+              'decoded_response_body_bytes': 84284212}
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False, 'totals': totals}))
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, max_attempts=8244), client_factory=build) == 0
+    assert len(factory.calls) == 1
+    saved = json.loads((tmp_path/'signal-probe-ledger.json').read_text())
+    assert saved['totals']['request_attempts'] == 2745
+    assert saved['totals']['provider_metered_bytes'] > totals['provider_metered_bytes']
+
+
+def test_qualification_transport_backoff_and_four_attempt_limit(tmp_path):
+    from datetime import timedelta
+    for attempt in range(4):
+        build, factory = transport_factory(tmp_path, transport_error=TimeoutError('offline'))
+        assert bench.run(qualification_args(tmp_path), client_factory=build,
+            now_fn=lambda: datetime(2026, 10, 8, 12, tzinfo=timezone.utc) + timedelta(seconds=70*attempt)) == (2 if attempt == 3 else 3)
+        assert len(factory.calls) == 1
+        # No immediate extra permit/HTTP during the transport retry fence.
+        build, factory = transport_factory(tmp_path)
+        result = bench.run(qualification_args(tmp_path), client_factory=build,
+            now_fn=lambda: datetime(2026, 10, 8, 12, tzinfo=timezone.utc) + timedelta(seconds=70*attempt))
+        assert result == (2 if attempt == 3 else 3)
+        assert factory.calls == []
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['totals']['request_attempts'] == 4
+    assert bench.run(qualification_args(tmp_path, ids='1', evidence_dir=str(tmp_path/'new-url')),
+        client_factory=lambda *a: pytest.fail('four transport errors did not stop pair')) == 2
+
+
+def test_qualification_club_aliases_share_daily_quota_between_stages(tmp_path, monkeypatch):
+    tasks = []
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    monkeypatch.setattr(bench, 'parity_report', lambda *a, **kw: {'field_parity_gate': True})
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    for number, slug in enumerate(['manchester-city', 'club', 'another-alias']):
+        url = f'https://www.transfermarkt.com/{slug}/kader/verein/281/plus/1'
+        tasks[:] = [dict(key=f'club-{number}', kind='squad', scope='GB1/2026', url=url, json=False)]
+        build, factory = transport_factory(tmp_path, responses=iter([(200, b'<html>Roster</html>')]))
+        result = bench.run(qualification_args(tmp_path, mode='parity', sample=str(sample),
+            evidence_dir=str(tmp_path/f'stage{number}')), client_factory=build)
+        assert result == (0 if number < 2 else 2)
+        assert len(factory.calls) == (1 if number < 2 else 0)
+
+
+def test_qualification_imports_existing_daily_attempts_before_new_directory(tmp_path):
+    for name in ['old1', 'old2']:
+        client = FakeClient([FetchOutcome(status=FetchStatus.OK, raw_capture_id='raw', attempts=1)])
+        assert bench.run(args(tmp_path, evidence_dir=str(tmp_path/name)), client_factory=lambda *a: client) == 0
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'new')), client_factory=build,
+        now_fn=lambda: datetime.now(timezone.utc).replace(hour=12)) == 2
+    assert factory.calls == []
+
+
+def test_qualification_cohort_does_not_cross_moscow_midnight(tmp_path, monkeypatch):
+    tasks = [dict(key='one', kind='players', scope='scope', url=bench.player_url(['8198']), json=True)]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    stamps = iter([datetime(2026, 10, 8, 20, 59, 59, tzinfo=timezone.utc),
+                   datetime(2026, 10, 8, 21, 0, 1, tzinfo=timezone.utc)])
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, mode='cohort', sample=str(sample)),
+                     client_factory=build, now_fn=lambda: next(stamps)) == 2
+    assert factory.calls == []
+
+
+def test_qualification_removed_guard_is_rebuilt_with_saved_captcha_stop(tmp_path):
+    build, _ = transport_factory(tmp_path, responses=iter([(405, b'blocked')]))
+    assert bench.run(qualification_args(tmp_path), client_factory=build) == 2
+    (tmp_path/'qualification-guard.json').unlink()
+    assert bench.run(args(tmp_path, evidence_dir=str(tmp_path/'new')),
+                     client_factory=lambda *a: pytest.fail('saved CAPTCHA stop was lost')) == 2
+
+
+def test_qualification_corrupt_negative_counter_fails_before_client(tmp_path):
+    url = bench.player_url(['8198'])
+    (tmp_path/'qualification-guard.json').write_text(json.dumps({'version': 1,
+        'days': {'2026-10-08': {url: {'responses': -1, 'transport': 0}}}, 'stop': None}))
+    with pytest.raises(ValueError, match='counters'):
+        bench.run(qualification_args(tmp_path), client_factory=lambda *a: pytest.fail('corrupt quota opened client'))
+
+
+def test_qualification_raw_storage_failure_after200_keeps_active(tmp_path):
+    from scrapers.transfermarkt.raw_store import RawStoreError
+    original, factory = transport_factory(tmp_path)
+    def broken_raw(*a):
+        client = original(*a)
+        def fail_store(**kw):
+            raise RawStoreError('offline write failure after received200')
+        client._raw_store.store_attempt = fail_store
+        return client
+    with pytest.raises(bench.ProbeGateError, match='raw attempts'):
+        bench.run(qualification_args(tmp_path), client_factory=broken_raw)
+    assert len(factory.calls) == 1
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['active']
+    with pytest.raises(bench.ProbeGateError, match='reconcile'):
+        bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'new')),
+                  client_factory=lambda *a: pytest.fail('unproven response allowed another HTTP'))
+
+
+@pytest.mark.parametrize('upstream_class', ['407', 'timeout', 'dead_exit'])
+def test_qualification_gateway502_proof_survives_guard_rebuild(tmp_path, upstream_class):
+    from datetime import timedelta
+    stamp = datetime.now(timezone.utc)
+    original, factory = transport_factory(tmp_path, status=502,
+                                         headers={'X-Proxy-Upstream-Status': upstream_class})
+    assert bench.run(qualification_args(tmp_path), client_factory=original, now_fn=lambda: stamp) == 3
+    assert len(factory.calls) == 1
+    (tmp_path/'qualification-guard.json').unlink()
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, evidence_dir=str(tmp_path/'next-stage')),
+                     client_factory=build, now_fn=lambda: stamp+timedelta(seconds=70)) == 0
+    guard = json.loads((tmp_path/'qualification-guard.json').read_text())
+    day = (stamp+timedelta(seconds=70)).astimezone(bench.MSK).date().isoformat()
+    counts = next(iter(guard['days'][day].values()))
+    assert counts['transport'] == 1 and counts['responses'] == 1
+
+
+def test_qualification_transport_raw_failure_with_zero_counts_keeps_active(tmp_path):
+    from scrapers.transfermarkt.raw_store import RawStoreError
+    original, factory = transport_factory(tmp_path, transport_error=TimeoutError('offline'))
+    def broken_raw(*a):
+        client = original(*a)
+        def fail_store(**kw):
+            raise RawStoreError('offline transport envelope write failure')
+        client._raw_store.store_transport_error = fail_store
+        return client
+    with pytest.raises(bench.ProbeGateError, match='raw accounting'):
+        bench.run(qualification_args(tmp_path), client_factory=broken_raw)
+    assert len(factory.calls) == 1
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['active']
+    with pytest.raises(bench.ProbeGateError, match='reconcile'):
+        bench.run(args(tmp_path, ids='1', evidence_dir=str(tmp_path/'new')),
+                  client_factory=lambda *a: pytest.fail('lost paid attempt allowed another HTTP'))
+
+
+def test_qualification_rebuild_retains_retry_fence_without_the_flag(tmp_path):
+    from datetime import timedelta
+    stamp = datetime(2026, 10, 8, 12, tzinfo=timezone.utc)
+    build, factory = transport_factory(tmp_path, transport_error=TimeoutError('offline'))
+    assert bench.run(qualification_args(tmp_path, ids='8198'), client_factory=build, now_fn=lambda: stamp) == 3
+    assert len(factory.calls) == 1
+    (tmp_path/'qualification-guard.json').unlink()
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids='8198', evidence_dir=str(tmp_path/'new')),
+                     client_factory=build, now_fn=lambda: stamp) == 3
+    assert factory.calls == []
+    assert bench.run(args(tmp_path, ids='8198', evidence_dir=str(tmp_path/'new')),
+                     client_factory=build, now_fn=lambda: stamp+timedelta(seconds=11)) == 0
+    assert len(factory.calls) == 1
+
+
 def test_absolute_cli_deadline_interrupts_a_stuck_call_in_real_process():
     code = '''import signal, time
 from dags.scripts.bench_transfermarkt_signals import _cli_portion_alarm, ProbeGateError
