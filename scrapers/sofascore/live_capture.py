@@ -1547,6 +1547,7 @@ def capture_live_dynamic_specs(
     workload_plan: Optional[SignedDagRunPlan | Mapping[str, Any]] = None,
     allocation_id: str = "",
     attempt_id: Optional[str] = None,
+    optional_schema_endpoints: frozenset[str] = frozenset(),
     transport_factory: Callable[..., LeaseBackedCamoufoxTransport] = (
         LeaseBackedCamoufoxTransport
     ),
@@ -1609,7 +1610,18 @@ def capture_live_dynamic_specs(
                 for spec in batch:
                     result = engine.capture(spec)
                     captured.append(result)
-                    _require_publishable(result)
+                    _require_publishable(
+                        result,
+                        tolerate_schema_error=(
+                            spec.raw_only
+                            and spec.key.endpoint in optional_schema_endpoints
+                            # The engine also wraps failed manifest writes as
+                            # schema_error. Only payload rejection is optional.
+                            and result.manifest.error_type in {
+                                "SchemaValidationError", "RawPayloadSchemaError",
+                            }
+                        ),
+                    )
                 plan = planner()
     finally:
         engine.transport = previous_transport

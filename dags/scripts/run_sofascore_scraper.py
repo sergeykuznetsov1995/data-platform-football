@@ -2759,6 +2759,19 @@ def _run_season_capture_engine(
             }
         )
         if plan.complete and not offline_replay and not force_replace:
+            # The complete planner validates the entire stored page chain;
+            # inspect its statuses without replaying or demoting manifests.
+            if getattr(plan, "finished_event_ids", None) is not None:
+                results["schedule_inventory"] = {
+                    "verified": True,
+                    "tournament_id": source_tournament_id,
+                    "source_season_id": source_season_id,
+                    "canonical_season": canonical_season,
+                    "finished_matches": len(plan.finished_event_ids),
+                    "schedule_events": len(plan.schedule_event_ids),
+                }
+            results["match_phase_ready"] = True
+            results["full_complete"] = True
             results["endpoint_completeness"] = 1.0
             results["traffic"] = {
                 "paid_proxy_bytes": 0,
@@ -2822,6 +2835,7 @@ def _run_season_capture_engine(
                 canonical_url=canonical_url,
                 scope=f"{league}:{canonical_season}",
                 entity="season_capture",
+                optional_schema_endpoints=frozenset({"referee_profile"}),
                 **allocation_kwargs,
             )
             results.update(
@@ -2844,9 +2858,9 @@ def _run_season_capture_engine(
             canonical_league=league,
             canonical_season=canonical_season,
         )
-        if materialized.endpoint_completeness != 1.0:
+        if not materialized.match_phase_ready:
             raise RuntimeError(
-                "offline season replay did not cover every planned endpoint"
+                "offline season replay did not cover every required endpoint"
             )
 
         from scrapers.sofascore.writer_lock import bronze_writer_lock
@@ -2913,7 +2927,13 @@ def _run_season_capture_engine(
             )
         promote_repaired_results(
             capture_runtime,
-            replayed,
+            [
+                result for result in replayed
+                if not (
+                    result.manifest.key.endpoint == "referee_profile"
+                    and not result.manifest.is_terminal
+                )
+            ],
             canonical_freshness_key=_season_freshness_key(
                 capture_runtime,
                 force_replace=False,
@@ -2923,12 +2943,39 @@ def _run_season_capture_engine(
         _flush_manifest_store(capture_runtime.manifest_store)
         results["manifest_committed"] = True
         results["pending_endpoints"] = len(committed.pending_keys)
-        results["endpoint_completeness"] = 1.0
+        results["match_phase_ready"] = committed.match_phase_ready
+        results["full_complete"] = committed.complete
+        results["endpoint_completeness"] = (
+            (len(committed.specs) - len(committed.pending_keys)) / len(committed.specs)
+            if committed.specs else 1.0
+        )
+        results["optional_endpoint_errors"] = [
+            {
+                "key": result.manifest.key.stable_id(),
+                "status": result.manifest.status.value,
+                "error_type": result.manifest.error_type,
+                "error_message": result.manifest.error_message,
+            }
+            for result in replayed
+            if result.manifest.key.endpoint == "referee_profile"
+            and not result.manifest.is_terminal
+        ]
+        results["schedule_inventory"] = {
+            "verified": True,
+            "tournament_id": source_tournament_id,
+            "source_season_id": source_season_id,
+            "canonical_season": canonical_season,
+            "finished_matches": sum(
+                row.get("status_type") == "finished"
+                for row in materialized.schedule_rows
+            ),
+            "schedule_events": len(materialized.schedule_rows),
+        }
         results["traffic"] = _logical_capture_traffic(
             capture_runtime.engine,
             live_traffic,
         )
-        results["traffic"]["endpoint_completeness"] = 1.0
+        results["traffic"]["endpoint_completeness"] = results["endpoint_completeness"]
         _record_player_universe_gaps(results, committed)
         _write_results(output_path, results)
         return 0

@@ -662,3 +662,60 @@ def test_restarted_slot_accounts_saved_success_after_last_attempt_without_source
     assert run_slot(checkpoint=path,campaign_id='history-test',run_id='run1',slot=0,
                     state_path=tmp_path/'state.json',failures_path=tmp_path/'failures.json',
                     admitted=lambda:False,execute=lambda *a:pytest.fail('saved success must not recapture'),clock=lambda:NOW)==0
+
+
+def test_history_waiting_is_accounted_once_without_retry_failure_or_completion(tmp_path):
+    from pathlib import Path
+    from scrapers.sofascore.history_worker import run_slot
+    snap, _, path = slot_queue(tmp_path, ids=(8, 17))
+    calls = []
+    def execute(env, timeout):
+        calls.append(env['SOFASCORE_SCOPE_KEY'])
+        inventory = {'verified': True, 'tournament_id': int(env['SOFASCORE_TOURNAMENT_ID']),
+                     'source_season_id': int(env['SOFASCORE_SOURCE_SEASON_ID']),
+                     'canonical_season': env['SOFASCORE_CANONICAL_SEASON'],
+                     'finished_matches': 0, 'schedule_events': 153}
+        result = {'status': 'waiting', 'waiting_reason': 'season_has_no_finished_matches',
+                  'campaign_id': snap['campaign_id'], 'tournament_id': inventory['tournament_id'],
+                  'source_season_id': inventory['source_season_id'],
+                  'canonical_season': inventory['canonical_season'], 'run_id': env['SOFASCORE_SCOPE_RUN_ID'],
+                  'phases': [{'phase': 'season', 'status': 'success', 'schedule_inventory': inventory}]}
+        dest = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(result))
+        return 0
+    assert run_slot(checkpoint=path, campaign_id='history-test', run_id='run1', slot=0,
+                    state_path=tmp_path/'state.json', failures_path=tmp_path/'failures.json',
+                    admitted=lambda:True, execute=execute, clock=lambda:NOW,
+                    sleep=lambda _:pytest.fail('waiting must not be retried'), release='test') == 0
+    assert len(calls) == 2
+    assert not (tmp_path/'state.json').exists()
+    assert not (tmp_path/'failures.json').exists()
+    stored = controller.read_summary(path, 'history-test')['run']
+    assert all(i['accounted'] and i['attempts'] == 1 and i['outcome']['status'] == 'waiting'
+               for i in stored['items'].values())
+    controller.finalize(path, campaign_id='history-test', run_id='run1')
+
+
+@pytest.mark.parametrize('mutation', ['unverified', 'wrong_season', 'wrong_run', 'failed_process'])
+def test_history_worker_rejects_unverified_empty_waiting(tmp_path, mutation):
+    from pathlib import Path
+    from scrapers.sofascore.history_worker import scope_outcome
+    _, _, checkpoint = slot_queue(tmp_path, ids=(8,))
+    _, env = claim(checkpoint, 0)
+    inventory = {'verified': True, 'tournament_id': int(env['SOFASCORE_TOURNAMENT_ID']),
+                 'source_season_id': int(env['SOFASCORE_SOURCE_SEASON_ID']),
+                 'canonical_season': env['SOFASCORE_CANONICAL_SEASON'],
+                 'finished_matches': 0, 'schedule_events': 153}
+    result = {'status': 'waiting', 'waiting_reason': 'season_has_no_finished_matches',
+              'campaign_id': 'history-test', 'tournament_id': inventory['tournament_id'],
+              'source_season_id': inventory['source_season_id'], 'run_id': env['SOFASCORE_SCOPE_RUN_ID'],
+              'phases': [{'phase': 'season', 'status': 'success', 'schedule_inventory': inventory}]}
+    if mutation == 'unverified':
+        inventory['verified'] = False
+    if mutation == 'wrong_season':
+        inventory['source_season_id'] += 1
+    if mutation == 'wrong_run':
+        result['run_id'] = 'old-attempt'
+    path = Path(env['SOFASCORE_SCOPE_RESULT_PATH']); path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result))
+    assert scope_outcome(env, 1 if mutation == 'failed_process' else 0)['status'] == 'failed'

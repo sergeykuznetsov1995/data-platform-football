@@ -50,13 +50,19 @@ def save_receipt(path, day, *, slot=0, status="failed", start="2026-10-15T01:00:
     env = {"SOFASCORE_CAMPAIGN_ACTION": "capture", "SOFASCORE_SCOPE_RESULT_PATH": f"/{run}.json",
            "SOFASCORE_SCOPE_RUN_ID": f"native-{tid}-scope", "SOFASCORE_EXPECTED_CAMPAIGN_ID": "campaign",
            "SOFASCORE_EXPECTED_SNAPSHOT_ID": "snapshot", "SOFASCORE_TOURNAMENT_ID": str(tid),
-           "SOFASCORE_SOURCE_SEASON_ID": "2", "SOFASCORE_HISTORY_GROUP": "2"}
+           "SOFASCORE_SOURCE_SEASON_ID": "2", "SOFASCORE_HISTORY_GROUP": "2",
+           "SOFASCORE_CANONICAL_SEASON": "2627"}
     item = {"slot": slot, "index": 0, "plan_index": 0, "started_at": start, "finished_at": end,
             "accounted": True, "attempts": attempts, "outcome": {"status": status}, "environment": env}
     payload = {"history_scope_attempt": True, "scope_digest": run, "run_id": f"native-{tid}-scope",
                "campaign_id": "campaign", "tournament_id": tid, "source_season_id": 2,
                "history_slot": {"slot": slot, "dag_run_id": run, "started_at": start,
                                 "finished_at": end, "terminal_state": status}}
+    if status == "waiting":
+        payload.update(status="waiting", waiting_reason="season_has_no_finished_matches",
+                       phases=[{"phase": "season", "status": "success", "schedule_inventory": {
+                           "verified": True, "tournament_id": tid, "source_season_id": 2,
+                           "canonical_season": "2627", "finished_matches": 0, "schedule_events": 153}}])
     (path / f"{run}.json").write_text(json.dumps(payload))
     plan_digest = digest([env])
     receipt = {"history_slots_receipt": True, "dag_run_id": run, "campaign_id": "campaign",
@@ -326,3 +332,18 @@ def test_started_history_scope_never_credits_refresh_publications(tmp_path, stat
     report = summarize_day(state, day, tmp_path)
     assert report["verdict"] == "UNKNOWN"
     assert any("publication association" in reason for reason in report["missing_evidence"])
+
+
+def test_waiting_consumes_slot_time_without_claiming_history_closures(tmp_path):
+    day = day_input()
+    save_receipt(tmp_path, day, status='waiting', attempts=2)
+    day['expected_runs'][0]['attempt_histories'] = {'0': [
+        {'status':'failed', 'started_at':'2026-10-15T01:00:00Z', 'finished_at':'2026-10-15T01:10:00Z'},
+        {'status':'waiting', 'started_at':'2026-10-15T01:12:00Z', 'finished_at':'2026-10-15T02:00:00Z'}]}
+    day['run_roster_digest'] = digest(day['expected_runs'])
+    report = summarize_day(journal_for_day(count=0), day, tmp_path)
+    assert report['missing_evidence'] == []
+    assert report['verdict'] == 'FAIL'
+    assert report['closed_seasons'] == report['closed_matches'] == 0
+    assert report['occupied_slot_seconds'] == 3600
+    assert report['attempts'][0]['status'] == 'waiting'
