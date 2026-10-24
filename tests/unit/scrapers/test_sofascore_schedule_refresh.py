@@ -519,6 +519,106 @@ def test_a_chase_that_hits_its_bound_is_left_for_the_next_run(tmp_path):
     ]
 
 
+def test_mixed_tail_probes_keep_native_seasons_and_queue_the_unread_suffix(tmp_path):
+    """A cold finished game is parsed after one page without a full-season claim."""
+    first, _ = _fixture_events()
+    fresh_kick_off = 1_792_584_000
+    payloads = {}
+    for pair, first_id in ((READY_TARGET, 100), (PREVIOUS_TARGET, 200)):
+        for page in range(3):
+            events = [_event(
+                first, event_id=first_id + page, tournament_id=pair[0],
+                season_id=pair[1], kick_off=fresh_kick_off - page * 86_400,
+            )]
+            if pair == PREVIOUS_TARGET and page == 0:
+                events.append(_event(
+                    first, event_id=299, tournament_id=pair[0],
+                    season_id=424242, kick_off=fresh_kick_off,
+                ))
+            payloads[schedule_page_path(*pair, page)] = _page(
+                *events, has_next=page < 2,
+            )
+    client = _Client(payloads)
+    store = _store(tmp_path)
+
+    fetched, counters, incomplete = fetch_season_schedules(
+        client, [READY_TARGET, PREVIOUS_TARGET], store, max_pages=3,
+        probe_targets={PREVIOUS_TARGET},
+        chase_before={pair: fresh_kick_off - 3 * 86_400
+                      for pair in (READY_TARGET, PREVIOUS_TARGET)},
+    )
+
+    # Same tournament, different native season: only the named season is a
+    # probe, even when the snapshot maps both to the same canonical year.
+    assert client.paths == [
+        *(schedule_page_path(*READY_TARGET, page) for page in range(3)),
+        schedule_page_path(*PREVIOUS_TARGET, 0),
+    ]
+    assert counters["pages"] == 4 and counters["foreign_season"] == 1
+    assert counters["truncated"] == 1
+    assert incomplete == [(*PREVIOUS_TARGET, 1, fresh_kick_off)]
+    snapshot = json.loads(json.dumps(SNAPSHOT))
+    snapshot["tournaments"][0]["seasons"][1]["canonical_season"] = "2627"
+    rows, row_counters = schedule_rows_from_events(fetched, snapshot, set())
+    assert row_counters["matched"] == 4
+    probe_row = next(row for row in rows if row["game_id"] == 200)
+    assert probe_row["status_type"] == "finished"
+    assert probe_row["season"] == "2627"
+    assert probe_row["source_season_id"] == str(PREVIOUS_TARGET[1])
+    assert {row["source_season_id"] for row in rows} == {
+        str(READY_TARGET[1]), str(PREVIOUS_TARGET[1]),
+    }
+    probe_raw = next(item.raw for item in fetched if item.event["id"] == 200)
+    body, record = store.load_bytes(PayloadTarget(
+        source_tournament_id=str(PREVIOUS_TARGET[0]),
+        source_season_id=str(PREVIOUS_TARGET[1]), target_type="season_page",
+        target_id="last-0", endpoint=SCHEDULE_PAGE_ENDPOINT, freshness_key="refresh",
+    ))
+    assert body == client.body(schedule_page_path(*PREVIOUS_TARGET, 0))
+    assert record.content_hash == probe_raw.content_hash
+
+
+def test_a_head_probe_rejects_resume_before_any_paid_page(tmp_path):
+    client = _Client(_sweep_payloads())
+    with pytest.raises(ValueError, match="probe.*resume|resume.*probe"):
+        fetch_season_schedules(
+            client, [READY_TARGET, PREVIOUS_TARGET], _store(tmp_path),
+            max_pages=3, probe_targets={PREVIOUS_TARGET},
+            start_pages={PREVIOUS_TARGET: 2},
+        )
+    assert client.paths == []
+
+
+@pytest.mark.parametrize("unusable", ["malformed", "missing"])
+def test_tail_probes_preserve_batch_drift_guards(tmp_path, unusable):
+    first, _ = _fixture_events()
+    bad = [READY_TARGET, PREVIOUS_TARGET]
+    payloads = {
+        schedule_page_path(*CONFIGURED_TARGET): _page(_event(
+            first, event_id=101, tournament_id=CONFIGURED_TARGET[0],
+            season_id=CONFIGURED_TARGET[1],
+        )),
+    }
+    if unusable == "malformed":
+        payloads.update({schedule_page_path(*pair): {
+            "events": [], "hasNextPage": "broken",
+        } for pair in bad})
+    client = _Client(
+        payloads,
+        missing=[schedule_page_path(*pair) for pair in bad]
+        if unusable == "missing" else (),
+    )
+    with pytest.raises(ScheduleSweepError) as caught:
+        fetch_season_schedules(
+            client, [*bad, CONFIGURED_TARGET], _store(tmp_path),
+            max_pages=3, probe_targets=set(bad),
+        )
+    assert len(client.paths) == 3
+    assert [item.event["id"] for item in caught.value.fetched] == [101]
+    assert caught.value.counters["malformed" if unusable == "malformed"
+                                 else "missing_expected"] == 2
+
+
 def test_fetch_skips_a_season_the_source_does_not_serve(tmp_path):
     # A season that has not started answers 404: one absent season must not
     # fail a slice of hundreds, and the sweep goes on to the next target.
