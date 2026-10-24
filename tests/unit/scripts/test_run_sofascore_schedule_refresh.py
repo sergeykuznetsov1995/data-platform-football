@@ -153,6 +153,7 @@ def offline(monkeypatch, tmp_path):
         client, targets, raw_store, *, max_pages=1, start_pages=None,
         resume_anchors=None, chase_before=None, owed_pages=None,
         missing_fail_share=refresh.fetch_season_schedules, failures=None,
+        probe_targets=None,
     ):
         targets = list(targets)
         calls["fetch"].append({
@@ -162,6 +163,7 @@ def offline(monkeypatch, tmp_path):
             "chase_before": dict(chase_before or {}),
             "owed_pages": set(owed_pages or ()),
             "missing_fail_share": missing_fail_share,
+            "probe_targets": set(probe_targets or ()),
         })
         # A season whose page broke the endpoint contract, exactly as the real
         # fetcher answers for one: its whole visit is rolled back — no event, no
@@ -286,6 +288,310 @@ def _cursor_file(offline, index, *, targets=None):
 
 def _fetch_by_class(offline):
     return dict(zip(refresh.SWEEP_CLASSES, offline["calls"]["fetch"]))
+
+
+def test_cold_schedule_is_discovered_within_two_budgeted_sweeps(offline, monkeypatch):
+    """A0 regression: an absent fixture cannot earn Bronze due priority.
+
+    Preserve the old combined stale/seed ceiling, but discover a newly
+    finished game without waiting seven complete stale rotations.
+    """
+    targets = [
+        refresh.SeasonTarget(i, i + 10000, f"SS-{i}", "2026")
+        for i in range(1000, 2227)
+    ]
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets)
+    offline["calls"]["known"] = {target.partition for target in targets}
+    _cursor_file(offline, {"stale": list(targets[1].pair)})
+    seen = set()
+    for _ in range(2):
+        offline["calls"]["fetch"].clear()
+        assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
+        report = json.loads(offline["output"].read_text())
+        seen.update(pair for call in offline["calls"]["fetch"] for pair in call["targets"])
+        assert report["planned_pages"] <= refresh.worst_case_pages(0, 200, 40, 3, 12)
+        assert report["stale_full_targets"] <= 200
+        assert report["stale_probe_targets"] == 680
+        assert report["stale_full_targets"] == 200
+        assert report["stale_discovery"]["planned_pages"] == 1480
+    # This season was just visited when its fixture/result appeared. It must
+    # be seen in the next two sweeps (16h in the pinned A0 model), not at56h.
+    assert targets[0].pair in seen
+
+
+@pytest.mark.parametrize("members,limit,chase", [
+    (0, 200, 3), (1, 0, 3), (1, 1, 3), (3, 1, 1),
+    (201, 200, 3), (401, 200, 3), (1227, 200, 3),
+    (1227, 200, 1), (1594, 200, 3), (5000, 200, 3), (1227, 200, 7),
+])
+def test_stale_discovery_respects_weighted_budget_and_reports_capacity(members, limit, chase):
+    targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(members)]
+    selected, _, probes, detail = refresh.plan_stale_checks(
+        targets, None, lambda _: True, full_limit=limit, chase_pages=chase,
+    )
+    full = len(selected) - len(probes)
+    assert full <= limit
+    assert full * (chase + 1) + len(probes) <= limit * (chase + 1)
+    assert len({target.pair for target in selected}) == len(selected)
+    assert detail["coverage_limited"] is (members > 2 * len(selected))
+    if limit * (chase + 1) >= (members + 1) // 2 + ((members + 8) // 9) * (chase + 1) and members:
+        assert detail["rotation_sweeps"] <= 2
+
+
+def _large_stale_pool(offline, monkeypatch):
+    targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(1000, 2227)]
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets)
+    offline["calls"]["known"] = {target.partition for target in targets}
+    _cursor_file(offline, {"stale": list(targets[0].pair)})
+    return targets
+
+
+@pytest.mark.parametrize("resumed,new_seed", [
+    (0, 17), (7, 10), (17, 0), (0, 18), (0, 19), (40, 15), (45, 15), (0, 45),
+])
+def test_only_unselected_seed_reserve_funds_discovery(offline, monkeypatch, resumed, new_seed):
+    targets = _large_stale_pool(offline, monkeypatch)
+    seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3000 + new_seed)]
+    queued = [_target(i, i + 10000, f"SS-{i}", "2025") for i in range(4000, 4000 + resumed)]
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds + queued)
+    offline["calls"]["known"].update(target.partition for target in queued)
+    offline["incomplete"].write_text(json.dumps({
+        "seasons": [[*target.pair, 5, 1_700_000] for target in queued],
+    }))
+    assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
+    report = json.loads(offline["output"].read_text())
+    expected_seed = min(40, resumed + new_seed)
+    assert report["seed_targets"] == expected_seed
+    reserve = report["stale_discovery"]["unselected_seed_reserve"]
+    assert reserve["reserved_targets"] == 40
+    assert reserve["selected_targets"] == expected_seed
+    assert reserve["available_pages"] == (40 - expected_seed) * 17
+    assert 0 <= reserve["transferred_pages"] <= reserve["available_pages"]
+    assert report["planned_pages"] == refresh.worst_case_pages(0, 200, 40, 3, 12)
+    assert report["budget_cap_bytes"] == refresh.derive_budget_cap(0, 200, 40, 3, 12)
+    detail = report["stale_discovery"]
+    assert detail["planned_pages"] + expected_seed * 17 <= report["planned_pages"]
+    if expected_seed <= 18:
+        assert report["stale_full_targets"] == (144 if expected_seed == 17 else 140)
+        assert report["stale_probe_targets"] == (615 if expected_seed == 17 else 614)
+        assert detail["full_rotation_sweeps"] == 9
+        assert detail["rotation_sweeps"] == 2
+    else:
+        assert report["stale_full_targets"] == 200
+        assert report["stale_probe_targets"] == 0
+        assert detail["coverage_limited"] is True
+
+
+def test_insufficient_reserve_preserves_future_fixture_rotation():
+    targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(1227)]
+    selected, _, probes, detail = refresh.plan_stale_checks(
+        targets, None, lambda _: True, full_limit=200, chase_pages=3,
+    )
+    assert len(selected) == 200
+    assert not probes
+    assert detail["full_rotation_sweeps"] == 7
+    assert detail["full_target_sweeps"] == 9
+    assert detail["coverage_limited"] is True
+
+
+def test_unselected_seed_reserve_does_not_relax_byte_preflight(offline, monkeypatch):
+    _large_stale_pool(offline, monkeypatch)
+    # Even 40 entirely unselected seed slots cannot lower the old preflight
+    # or recover paid/uncertain bytes. The original cap must still fit.
+    assert refresh.main(_argv(
+        offline, "--control-url", "http://local", "--budget-cap-bytes", "100000",
+    )) == 1
+    assert _FakeClient.created == []
+    assert not offline["calls"]["fetch"]
+    report = json.loads(offline["output"].read_text())
+    assert "byte cap" in report["errors"][0]
+
+
+@pytest.mark.parametrize("page_budget", [200, 800, 1200])
+def test_seed_reserve_is_based_on_budgeted_slots(offline, monkeypatch, page_budget):
+    targets = _large_stale_pool(offline, monkeypatch)
+    seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3017)]
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds)
+    assert refresh.main(_argv(
+        offline, "--control-url", "http://local", "--page-budget", str(page_budget),
+    )) == 0
+    report = json.loads(offline["output"].read_text())
+    reserve = report["stale_discovery"]["unselected_seed_reserve"]
+    reserved = min(40, page_budget // 17)
+    assert reserve["reserved_targets"] == reserved
+    assert reserve["available_pages"] == (reserved - min(reserved, 17)) * 17
+    assert report["planned_pages"] <= page_budget
+    assert report["stale_discovery"]["planned_pages"] + report["seed_targets"] * 17 <= page_budget
+
+
+def test_probe_suffix_is_queued_after_merge_and_resumed_in_seed_share(offline, monkeypatch):
+    targets = _large_stale_pool(offline, monkeypatch)
+    pair = targets[300].pair
+    offline["calls"].update(truncate={pair}, truncate_at=1)
+    assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
+    stale = _fetch_by_class(offline)["stale"]
+    assert pair in stale["probe_targets"]
+    assert pair not in set(sum(offline["calls"]["fixtures"], []))
+    queued, _ = refresh.read_incomplete(offline["incomplete"])
+    assert queued[pair][0] == 1
+    assert offline["calls"]["writes"]
+    # Restart from the old state format: probe chains keep the original queue,
+    # overlap and signed/native identities, not another head-only visit.
+    offline["calls"]["truncate"].clear()
+    offline["calls"]["fetch"].clear()
+    assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
+    calls = _fetch_by_class(offline)
+    assert pair not in calls["stale"]["targets"]
+    assert calls["seed"]["start_pages"][pair] == 1
+    assert calls["seed"]["resume_anchors"][pair] == 1_700_000
+    assert pair not in refresh.read_incomplete(offline["incomplete"])[0]
+
+
+@pytest.mark.parametrize("failure", ["merge", "transport"])
+def test_failed_probe_batch_does_not_commit_unread_cursor_or_suffix(offline, monkeypatch, failure):
+    targets = _large_stale_pool(offline, monkeypatch)
+    initial_state = json.loads(offline["cursor"].read_text())
+    initial_state["index"]["stale_full"] = list(targets[50].pair)
+    offline["cursor"].write_text(json.dumps(initial_state))
+    pair = targets[300].pair
+    offline["calls"].update(truncate={pair}, truncate_at=1)
+    if failure == "merge":
+        def broken_write(_):
+            raise RuntimeError("injected Bronze failure")
+        monkeypatch.setattr(refresh, "write_schedule_rows", broken_write)
+    else:
+        original = refresh.fetch_season_schedules
+
+        def broken_fetch(*args, **kwargs):
+            if kwargs.get("probe_targets"):
+                raise DiscoveryHTTPError("injected503", status_code=503)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(refresh, "fetch_season_schedules", broken_fetch)
+    assert refresh.main(_argv(offline, "--control-url", "http://local")) == 1
+    assert refresh.read_cursor(offline["cursor"])["stale"] == targets[0].pair
+    assert refresh.read_cursor(offline["cursor"], classes=("stale_full",))["stale_full"] == targets[50].pair
+    assert pair not in refresh.read_incomplete(offline["incomplete"])[0]
+
+
+def test_discovery_preserves_due_overdue_and_seed_allowances(offline, monkeypatch):
+    targets = _large_stale_pool(offline, monkeypatch)
+    late, due, seed = targets[:3]
+    offline["calls"]["known"].remove(seed.partition)
+    offline["calls"].update(due={due.partition}, overdue={late.partition: 999_999})
+    assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
+    calls = _fetch_by_class(offline)
+    assert calls["overdue"]["targets"] == [late.pair]
+    assert calls["due"]["targets"] == [due.pair]
+    assert calls["seed"]["targets"] == [seed.pair]
+    assert not set(target.pair for target in targets[:3]) & set(calls["stale"]["targets"])
+    report = json.loads(offline["output"].read_text())
+    assert report["class_limits"]["overdue"] == 1
+    assert report["class_limits"]["due"] == 1
+    assert report["class_limits"]["seed"] == 40
+    assert report["planned_pages"] == refresh.worst_case_pages(1, 201, 40, 3, 12)
+
+
+def test_discovery_capacity_deficit_is_explicit_without_borrowing_due_budget(offline, monkeypatch):
+    targets = _large_stale_pool(offline, monkeypatch)
+    seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3040)]
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds)
+    # All 40 seed slots are selected: no reserve may be borrowed.
+    # 400 pages cannot fund two-sweep discovery and preserve full visits.
+    # Fall back to the original full rotation rather than lose all fixtures.
+    assert refresh.main(_argv(offline, "--control-url", "http://local", "--chase-pages", "1")) == 0
+    report = json.loads(offline["output"].read_text())
+    assert report["stale_discovery"]["coverage_limited"] is True
+    assert report["stale_discovery"]["rotation_sweeps"] == 7
+    assert report["stale_probe_targets"] == 0
+    assert report["stale_full_targets"] == 200
+    assert report["stale_discovery"]["planned_pages"] <= 400
+    assert any("more than two sweeps" in warning for warning in report["warnings"])
+
+
+@pytest.mark.parametrize("population", [1227, 1228])
+@pytest.mark.parametrize("seed_count,full_sweeps", [(0, 7), (17, 9)])
+def test_full_rotation_serves_every_season_across_restart_and_snapshot_refresh(
+    offline, monkeypatch, population, seed_count, full_sweeps,
+):
+    targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(1000, 1000 + population)]
+    seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3000 + seed_count)]
+    monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds)
+    offline["calls"]["known"] = {target.partition for target in targets}
+    _cursor_file(offline, {"stale": list(targets[0].pair)})
+    full_seen = set()
+    for sweep in range(9):
+        if sweep == 3:
+            snapshot = json.loads(offline["snapshot"].read_text())
+            snapshot["snapshot_id"] = "z" * 64
+            offline["snapshot"].write_text(json.dumps(snapshot))
+        assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
+        report = json.loads(offline["output"].read_text())
+        assert report["stale_discovery"]["full_rotation_sweeps"] == full_sweeps
+        assert report["stale_discovery"]["full_freshness_limited"] is False
+        full_seen.update((row["tournament_id"], row["source_season_id"])
+                         for row in report["stale_discovery"]["selected"] if row["mode"] == "full")
+        if len(full_seen) == population:
+            break
+    assert full_seen == {target.pair for target in targets}
+    assert sweep + 1 <= full_sweeps
+    # Full coverage must actually request and publish fixtures. A counter or
+    # head-only discovery cannot stand in for a refreshed future calendar.
+    fixture_seen = {pair for batch in offline["calls"]["fixtures"] for pair in batch}
+    assert {target.pair for target in targets} <= fixture_seen
+    converted = {event for batch, _, _ in offline["calls"]["rows"] for event in batch}
+    assert {f"fixture-{t.tournament_id}-{t.season_id}" for t in targets} <= converted
+
+
+def test_future_fixture_capacity_deficit_is_explicit(offline, monkeypatch):
+    targets = _large_stale_pool(offline, monkeypatch)
+    assert refresh.main(_argv(offline, "--control-url", "http://local", "--max-stale", "100")) == 0
+    report = json.loads(offline["output"].read_text())
+    detail = report["stale_discovery"]
+    assert report["stale_full_targets"] == 100
+    assert detail["full_rotation_sweeps"] == 13
+    assert detail["full_freshness_limited"] is True
+    assert any("future fixtures need more than nine sweeps" in w for w in report["warnings"])
+    assert len(targets) == detail["eligible_targets"]
+
+
+@pytest.mark.parametrize("population", [1227, 1228])
+def test_future_fixtures_stay_fresh_when_seed_reserve_changes(offline, monkeypatch, population):
+    targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(1000, 1000 + population)]
+    seeds = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(3000, 3019)]
+    offline["calls"]["known"] = {target.partition for target in targets}
+    _cursor_file(offline, {"stale": list(targets[0].pair)})
+    full_batches = []
+    previous_full_cursor = None
+    for sweep in range(18):
+        seed_count = (17, 19, 19)[sweep % 3]
+        monkeypatch.setattr(refresh, "current_season_targets", lambda *_: targets + seeds[:seed_count])
+        offline["calls"]["fixtures"] = []
+        assert refresh.main(_argv(offline, "--control-url", "http://local")) == 0
+        report = json.loads(offline["output"].read_text())
+        detail = report["stale_discovery"]
+        if previous_full_cursor is not None:
+            assert detail["full_cursor_start"] == previous_full_cursor
+        previous_full_cursor = detail["next_full_cursor"]
+        full_batches.append({pair for batch in offline["calls"]["fixtures"] for pair in batch})
+        if sweep >= 8:
+            assert {target.pair for target in targets} <= set().union(*full_batches[-9:])
+
+
+@pytest.mark.parametrize("population", [1227, 1228])
+def test_independent_full_anchor_does_not_break_two_sweep_discovery(population):
+    targets = [_target(i, i + 10000, f"SS-{i}", "2026") for i in range(population)]
+    cursor, full_cursor = targets[100].pair, targets[900].pair
+    seen = set()
+    for _ in range(2):
+        selected, cursor, probes, detail = refresh.plan_stale_checks(
+            targets, cursor, lambda _: True, full_limit=200, chase_pages=3,
+            full_cursor=full_cursor, unselected_seed_pages=391,
+        )
+        full_cursor = tuple(detail["next_full_cursor"])
+        seen.update(target.pair for target in selected)
+        assert len(selected) - len(probes) == 144
+        assert detail["planned_pages"] == 1191
+    assert len(seen) == population
 
 
 @pytest.mark.unit
