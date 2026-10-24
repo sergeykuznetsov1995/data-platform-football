@@ -283,6 +283,57 @@ def _scope_attempt_target_key(
     return hashlib.sha256(material).hexdigest()
 
 
+def _scope_source_gap_records(
+    rows: Iterable[Mapping[str, Any]], plan_signature: str, parser_version: str,
+) -> dict[tuple[int, str], dict[str, Any]]:
+    """Decode explicit gap markers separately from full coverage successes."""
+    output: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in rows:
+        if (
+            row.get("target_type") != "scope_source_gap"
+            or row.get("entity_id") != plan_signature
+            or row.get("parser_version") != parser_version
+            or row.get("status") != ManifestStatus.NOT_AVAILABLE.value
+        ):
+            continue
+        try:
+            raw = row.get("capabilities_json")
+            values = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+            completed = _evidence_datetime(row.get("completed_at"))
+            identity = (int(row["competition_id"]), str(row["source_season_key"]))
+            proofs = values.get("source_gap_matches")
+            if (
+                completed is None or not identity[1]
+                or values.get("plan_signature") != plan_signature
+                or values.get("outcome") != "source_gap"
+                or not isinstance(proofs, list) or not proofs
+                or any(not isinstance(proof, Mapping) or any(
+                    not proof.get(key) for key in
+                    ("match_id", "target_key", "raw_uri", "content_hash", "run_id", "observed_at")
+                ) or proof.get("reason") != "source_data_not_found" for proof in proofs)
+            ):
+                continue
+            expected = values.get("match_ids")
+            available = values.get("available_match_ids")
+            if not isinstance(expected, list) or not isinstance(available, list):
+                continue
+            missing = [proof["match_id"] for proof in proofs]
+            if (
+                len(set(expected)) != len(expected)
+                or len(set(available)) != len(available)
+                or len(set(missing)) != len(missing)
+                or set(available) & set(missing)
+                or set(available) | set(missing) != set(expected)
+            ):
+                continue
+            record = {**values, "completed_at": completed, "run_id": row.get("run_id")}
+            if identity not in output or completed >= output[identity]["completed_at"]:
+                output[identity] = record
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return output
+
+
 def _scope_attempt_state_from_values(
     *,
     competition_id: Any,
@@ -2908,6 +2959,30 @@ class FotMobRepository:
                 continue
         return output
 
+    def source_gap_scope_records(
+        self, plan_signature: str, *, parser_version: str = PARSER_VERSION,
+    ) -> dict[tuple[int, str], dict[str, Any]]:
+        """Read explicit source-gap resolutions, including buffered markers."""
+        columns = (
+            "competition_id", "source_season_key", "entity_id", "parser_version",
+            "target_type", "status", "capabilities_json", "completed_at", "run_id",
+        )
+        rows = list(self._pending_manifest)
+        getter = getattr(self.writer, "_get_trino_manager", None)
+        if getter is not None:
+            signature = str(plan_signature).replace("'", "''")
+            version = str(parser_version).replace("'", "''")
+            durable = getter().execute_query(f"""
+                SELECT {", ".join(columns)}
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE target_type = 'scope_source_gap'
+                  AND entity_id = '{signature}'
+                  AND parser_version = '{version}'
+                  AND status = 'not_available'
+            """)
+            rows.extend(dict(zip(columns, row)) for row in durable)
+        return _scope_source_gap_records(rows, plan_signature, parser_version)
+
     def scope_attempt_states(
         self,
         plan_signature: str,
@@ -3593,6 +3668,14 @@ class MemoryFotMobRepository:
             and commit.competition_id is not None
             and commit.source_season_key is not None
         }
+
+    def source_gap_scope_records(
+        self, plan_signature: str, *, parser_version: str = PARSER_VERSION,
+    ) -> dict[tuple[int, str], dict[str, Any]]:
+        return _scope_source_gap_records(
+            (commit.manifest_row() for commit in self.commits),
+            plan_signature, parser_version,
+        )
 
     def scope_attempt_states(
         self,

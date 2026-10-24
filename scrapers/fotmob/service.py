@@ -2906,6 +2906,18 @@ class FotMobIngestService:
                 result.metadata["intentional_not_available"] = (
                     int(result.metadata.get("intentional_not_available", 0)) + 1
                 )
+                # Keep identity-bearing proof, not just a count. Explicit
+                # historical scopes may resolve this absence on their first
+                # run, but only after the raw-bearing manifest is committed.
+                result.metadata.setdefault("source_gap_matches", []).append({
+                    "match_id": key,
+                    "target_key": fetch.target_key,
+                    "raw_uri": fetch.raw_uri,
+                    "content_hash": fetch.content_hash,
+                    "run_id": self.run_id,
+                    "reason": "source_data_not_found",
+                    "observed_at": fetch.source_observed_at or fetch.fetched_at,
+                })
                 continue
             try:
                 try:
@@ -3590,6 +3602,82 @@ class FotMobIngestService:
                 }
             ).encode("utf-8")
         ).hexdigest()
+
+    def record_scope_source_gap(
+        self,
+        bundle: SeasonBundle,
+        *,
+        plan_signature: str,
+        scope_entities: Iterable[str],
+        source_gap_matches: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Resolve an explicit scope without claiming unavailable rows exist.
+
+        Every finished match must have a successful published card or an exact
+        raw-bearing absence committed by this run. Flush dependencies before
+        buffering the marker, so even a partial final flush cannot publish a
+        resolution ahead of its evidence.
+        """
+        signature = str(plan_signature).strip()
+        if not signature or not source_gap_matches:
+            raise ValueError("source gap requires a plan and match evidence")
+        expected = {str(match["match_id"]) for match in bundle.matches if match.get("finished")}
+        proofs = {str(proof["match_id"]): dict(proof) for proof in source_gap_matches}
+        if len(proofs) != len(source_gap_matches) or not set(proofs) <= expected:
+            raise ValueError("source gap evidence must identify unique finished matches")
+        available = set()
+        for match_id in sorted(expected):
+            target = canonicalize_target("matchDetails", {"matchId": match_id})
+            if self.repository.latest_match_source(target.target_key) is not None:
+                if match_id in proofs:
+                    raise ValueError("source gap cannot replace successful match details")
+                available.add(match_id)
+                continue
+            proof = proofs.get(match_id)
+            manifest = self.repository.latest_entity_attempt("match", match_id, run_id=self.run_id)
+            if (
+                proof is None or manifest is None
+                or manifest.get("status") != ManifestStatus.NOT_AVAILABLE.value
+                or manifest.get("error_code") != "source_data_not_found"
+                or manifest.get("stale")
+                or proof.get("run_id") != self.run_id
+                or proof.get("reason") != "source_data_not_found"
+                or not proof.get("observed_at")
+                or any(not proof.get(key) or proof[key] != manifest.get(key)
+                       for key in ("target_key", "raw_uri", "content_hash"))
+                or proof.get("target_key") != target.target_key
+            ):
+                raise ValueError(f"match {match_id} has no committed source gap proof")
+        evidence = {
+            "plan_signature": signature,
+            "outcome": "source_gap",
+            "reason": "source_data_not_found",
+            "scope_entities": sorted(set(scope_entities)),
+            "match_ids": sorted(expected),
+            "available_match_ids": sorted(available),
+            "source_gap_matches": [proofs[key] for key in sorted(proofs)],
+        }
+        paths = list(self.repository.flush())
+        commit = TargetCommit(
+            run_id=self.run_id,
+            target_type="scope_source_gap",
+            target_key=_completion_target_key(
+                "scope_source_gap", bundle.scope.competition_id,
+                bundle.scope.source_season_key, signature,
+            ),
+            status=ManifestStatus.NOT_AVAILABLE,
+            competition_id=str(bundle.scope.competition_id),
+            source_season_key=bundle.scope.source_season_key,
+            entity_id=signature,
+            observation_id=self.run_id,
+            content_hash=hashlib.sha256(_json(evidence).encode("utf-8")).hexdigest(),
+            capabilities=evidence,
+            error_code="source_data_not_found",
+            error="explicit historical scope resolved with source gaps",
+            completed_at=utc_now(),
+        )
+        paths.extend(self.repository.commit(commit))
+        return list(dict.fromkeys(paths)), evidence
 
     def record_scope_completion(
         self,
