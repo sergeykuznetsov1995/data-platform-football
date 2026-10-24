@@ -255,3 +255,104 @@ def test_unstarted_reservation_is_not_a_capture_attempt(red_share,tmp_path,attem
     else:
         with pytest.raises(ValueError,match='unstarted scope'):
             red_share.history_scope_counts(*args)
+
+
+def _partial_slot_report(directory):
+    import json
+    import hashlib
+    from tests.unit.scrapers.test_sofascore_history_controller import continuation_report
+    path = _slot_report(directory, 'run', 1, status='partial')
+    report_path = directory/'1.json'
+    payload = json.loads(report_path.read_text())
+    payload.update(continuation_report(1, 1, 'camp', 'scope-1'))
+    report_path.write_text(json.dumps(payload))
+    receipt = json.loads(path.read_text())
+    receipt['items'][0]['outcome']['partial'] = payload['phases'][0]['partial']
+    receipt['receipt_digest'] = hashlib.sha256(json.dumps(
+        {k:v for k,v in receipt.items() if k != 'receipt_digest'}, sort_keys=True).encode()).hexdigest()
+    path.write_text(json.dumps(receipt))
+    return path, report_path
+
+
+def test_durable_season_continuation_counts_attempt_without_failure(red_share, tmp_path):
+    _partial_slot_report(tmp_path)
+    assert red_share.history_scope_counts(tmp_path, '2026-10-07T00:00:00Z',
+                                         '2026-10-08T00:00:00Z', {'run'}) == (0, 1)
+
+
+@pytest.mark.parametrize('damage', ['marker', 'proof', 'frontier', 'raw', 'errors', 'phase'])
+def test_partial_receipt_requires_exact_healthy_report_proof(red_share, tmp_path, damage):
+    import json
+    import hashlib
+    path, report_path = _partial_slot_report(tmp_path)
+    payload = json.loads(report_path.read_text())
+    receipt = json.loads(path.read_text())
+    if damage == 'proof': receipt['items'][0]['outcome']['partial'] = {}
+    elif damage == 'marker': payload['phases'][0]['partial']['kind'] = 'time_budget'
+    elif damage == 'frontier': payload['phases'][0]['partial']['continuation']['last'] = 48
+    elif damage == 'raw': payload['phases'][0]['partial']['raw_manifest_committed'] = False
+    elif damage == 'errors': payload['errors'] = ['failed']
+    elif damage == 'phase': payload['phases'][0]['phase'] = 'matches'
+    report_path.write_text(json.dumps(payload))
+    receipt['receipt_digest'] = hashlib.sha256(json.dumps(
+        {k:v for k,v in receipt.items() if k != 'receipt_digest'}, sort_keys=True).encode()).hexdigest()
+    path.write_text(json.dumps(receipt))
+    with pytest.raises(ValueError):
+        red_share.history_scope_counts(tmp_path, '2026-10-07T00:00:00Z',
+                                       '2026-10-08T00:00:00Z', {'run'})
+
+
+def test_partial_receipt_works_as_standalone_stdlib_host_adapter(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    _partial_slot_report(tmp_path)
+    module_path = Path(__file__).resolve().parents[3]/'dags/utils/sofascore_red_share.py'
+    code = (
+        'import importlib.util,sys\n'
+        f'spec=importlib.util.spec_from_file_location("standalone", {str(module_path)!r})\n'
+        'module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n'
+        f'assert module.history_scope_counts(module.Path({str(tmp_path)!r}), '
+        '"2026-10-07T00:00:00Z", "2026-10-08T00:00:00Z", {"run"}) == (0,1)\n'
+        'assert not any(k == "scrapers" or k.startswith("scrapers.") for k in sys.modules)\n'
+    )
+    result = subprocess.run([sys.executable, '-I', '-c', code], cwd=tmp_path,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('damage', ['bool_range', 'negative', 'oversize', 'zero', 'extra',
+                                   'identity', 'digest', 'noncanonical', 'duplicate'])
+def test_continuation_token_evidence_fails_closed(red_share, tmp_path, damage):
+    import json
+    import base64
+    _, report_path = _partial_slot_report(tmp_path)
+    partial = json.loads(report_path.read_text())['phases'][0]['partial']
+    encoded = partial['chunk_unit'].split('.', 1)[1]
+    chunk = json.loads(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
+    if damage == 'bool_range': chunk['last'][0] = False
+    elif damage == 'negative': chunk['last'][0] = -1
+    elif damage == 'oversize': chunk['last'][1] = 50
+    elif damage == 'zero': chunk['last'] = chunk['next'] = [0, 0]
+    elif damage == 'extra': chunk['hint'] = 'unsigned'
+    elif damage == 'identity': chunk['season_id'] = '01'
+    elif damage == 'digest': chunk['evidence_digest'] = 'A' * 64
+    body = json.dumps(chunk, sort_keys=True, separators=(',', ':'))
+    if damage == 'noncanonical': body = json.dumps(chunk, indent=2)
+    elif damage == 'duplicate': body = body[:-1] + ',"season_id":"1"}'
+    partial['chunk_unit'] = 'season-chunk-v1.' + base64.urlsafe_b64encode(body.encode()).decode().rstrip('=')
+    with pytest.raises(ValueError):
+        red_share.validate_season_continuation(partial, tournament_id='1', season_id='1')
+
+
+def test_continuation_allows_inactive_direction_frontier_at_start(red_share):
+    import json
+    import base64
+    from tests.unit.scrapers.test_sofascore_history_controller import continuation_report
+    partial = continuation_report()['phases'][0]['partial']
+    chunk = dict(tournament_id='8', season_id='826', last=[0, 50], next=[5, 5],
+                 evidence_digest='a' * 64)
+    body = json.dumps(chunk, sort_keys=True, separators=(',', ':'))
+    partial['chunk_unit'] = 'season-chunk-v1.' + base64.urlsafe_b64encode(body.encode()).decode().rstrip('=')
+    partial['continuation'] = {'last': None, 'next': 5}
+    assert red_share.validate_season_continuation(partial, tournament_id=8, season_id=826) == partial

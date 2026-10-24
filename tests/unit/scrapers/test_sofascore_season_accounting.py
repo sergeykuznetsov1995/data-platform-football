@@ -57,6 +57,10 @@ def save_receipt(path, day, *, slot=0, status="failed", start="2026-10-15T01:00:
                "campaign_id": "campaign", "tournament_id": tid, "source_season_id": 2,
                "history_slot": {"slot": slot, "dag_run_id": run, "started_at": start,
                                 "finished_at": end, "terminal_state": status}}
+    if status == 'partial':
+        from tests.unit.scrapers.test_sofascore_history_controller import continuation_report
+        payload.update(continuation_report(tid, 2, 'campaign', f'native-{tid}-scope'))
+        item['outcome']['partial'] = payload['phases'][0]['partial']
     (path / f"{run}.json").write_text(json.dumps(payload))
     plan_digest = digest([env])
     receipt = {"history_slots_receipt": True, "dag_run_id": run, "campaign_id": "campaign",
@@ -263,6 +267,25 @@ def test_internal_retry_needs_saved_failed_attempt_and_retains_it(tmp_path):
     report = summarize_day(journal_for_day(), day, tmp_path)
     assert report["verdict"] == "FAIL"
     assert report["attempts"][0]["attempt_history"][0]["status"] == "failed"
+
+
+@pytest.mark.parametrize('attempts', [1, 2])
+def test_season_continuation_occupies_slot_without_closure_or_publication(tmp_path, attempts):
+    day = day_input()
+    save_receipt(tmp_path, day, status='partial', attempts=attempts)
+    if attempts == 2:
+        day['expected_runs'][0]['attempt_histories'] = {'0': [
+            dict(status='failed', started_at='2026-10-15T01:00:00Z', finished_at='2026-10-15T01:10:00Z'),
+            dict(status='partial', started_at='2026-10-15T01:12:00Z', finished_at='2026-10-15T02:00:00Z')]}
+        day['run_roster_digest'] = digest(day['expected_runs'])
+    report = summarize_day(journal_for_day(count=0), day, tmp_path)
+    assert report['missing_evidence'] == []
+    assert report['attempts'][0]['status'] == 'partial'
+    assert report['occupied_slot_seconds'] == 3600
+    assert report['closed_seasons'] == 0 and report['closed_matches'] == 0
+    assert report['verdict'] == 'FAIL'  # Valid evidence, insufficient completed work.
+    falsely_closed = summarize_day(journal_for_day(), day, tmp_path)
+    assert any('successful history publication' in reason for reason in falsely_closed['missing_evidence'])
 
 
 @pytest.mark.parametrize("change", ["digest", "report", "checkpoint", "slot", "native_group", "capture_gate"])

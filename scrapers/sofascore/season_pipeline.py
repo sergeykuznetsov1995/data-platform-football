@@ -8,6 +8,7 @@ fixtures/direct canaries opt out explicitly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from scrapers.sofascore.manifest import (
     ManifestStatus,
     ManifestStore,
 )
+from scrapers.sofascore.season_chunks import SeasonScheduleChunk
 from scrapers.sofascore.raw_store import (
     PayloadTarget,
     RawPayloadNotFound,
@@ -98,6 +100,13 @@ class SeasonPartitionPlan:
     referee_ids: tuple[str, ...]
     player_universe_evidence_gaps: tuple[str, ...] = ()
     placeholder_team_ids: tuple[str, ...] = ()
+    schedule_chunk: Optional[SeasonScheduleChunk] = None
+    schedule_frontier: tuple[Optional[int], Optional[int]] = (None, None)
+    deferred_schedule_keys: tuple[ManifestKey, ...] = ()
+
+    @property
+    def schedule_chain_complete(self) -> bool:
+        return self.schedule_frontier == (None, None)
 
     @property
     def complete(self) -> bool:
@@ -105,7 +114,7 @@ class SeasonPartitionPlan:
         # They are kept on the plan and gate only the player phase
         # (``player_universe_ready``); a season whose participants omit a club
         # used to fail every attempt at zero traffic, forever.
-        return not self.pending_keys
+        return self.schedule_chain_complete and not self.pending_keys
 
     @property
     def match_phase_ready(self) -> bool:
@@ -124,7 +133,7 @@ class SeasonPartitionPlan:
         profiles are still planned and captured — just on the next run.
         """
 
-        return not any(
+        return self.schedule_chain_complete and not any(
             key.endpoint != REFEREE_PROFILE_ENDPOINT for key in self.pending_keys
         )
 
@@ -801,6 +810,22 @@ def _event_referee_from_stored_page(
         ) from exc
 
 
+def _schedule_prefix_digest(tournament, season, freshness, prefix) -> str:
+    proof = {"tournament_id": tournament, "season_id": season,
+             "freshness_key": freshness, "prefix": prefix}
+    return hashlib.sha256(json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def initial_season_chunk(tournament_id, season_id, freshness_key, *, max_pages=50):
+    """Conservative initial window for legacy signed season identities."""
+    tournament, season = _source_ids(tournament_id, season_id)
+    limit = min(max_pages, 50)
+    last = max(1, limit - 1)
+    other = 1 if limit > 1 else 0
+    return SeasonScheduleChunk(tournament, season, (0, last), (0, other),
+        _schedule_prefix_digest(tournament, season, freshness_key, {"last": [], "next": []}))
+
+
 def plan_season_partition(
     raw_store: RawPayloadStore,
     manifest_store: ManifestStore,
@@ -811,14 +836,17 @@ def plan_season_partition(
     event_freshness_key: Optional[str] = None,
     paid_proxy: bool = True,
     max_pages: int = 50,
+    schedule_chunk: Optional[SeasonScheduleChunk] = None,
 ) -> SeasonPartitionPlan:
     """Derive a resumable partition plan solely from raw/manifest state.
 
     Both schedule directions start at page zero and advance only when the
     stored, season-validated page says ``hasNextPage=true``. The next spec is
     appended before it is inspected, so an interrupted chain remains visibly
-    pending. Hitting ``max_pages`` while the source still promises another page
-    raises instead of silently truncating the season.
+    pending. ``max_pages`` bounds a signed portion rather than the entire
+    season. Stored pages are scanned without network; only missing pages in
+    the frozen portion are exposed to paid capture. An unfinished chain
+    remains nonterminal even when every page of this portion was retained.
     """
 
     tournament, season = _source_ids(source_tournament_id, source_season_id)
@@ -848,6 +876,8 @@ def plan_season_partition(
     # own canonicalised profile without weakening the cross-talk guard (#1081).
     referee_slugs: dict[str, set[str]] = {}
     player_universe_evidence_gaps: list[str] = []
+    page_evidence: dict[str, list[dict]] = {"last": [], "next": []}
+    frontiers: dict[str, Optional[int]] = {"last": 0, "next": 0}
 
     def append_key_once(keys: list[ManifestKey], key: ManifestKey) -> None:
         if key not in keys:
@@ -912,6 +942,7 @@ def plan_season_partition(
 
     for direction in ("last", "next"):
         page = 0
+        seen_pages: set[tuple[str, ...]] = set()
         while True:
             spec = build_schedule_page_spec(
                 direction=direction,
@@ -920,10 +951,26 @@ def plan_season_partition(
             )
             specs.append(spec)
             stored = inspect(spec, required_schedule_page=True)
+            if stored.raw is not None:
+                page_evidence[direction].append({
+                    "page": page, "http_status": stored.raw.http_status,
+                    "content_hash": stored.raw.content_hash,
+                })
             if not stored.has_valid_json:
                 # Crucially, do not infer end-of-chain from an absent page.
+                accepted_empty_raw = bool(
+                    stored.raw is not None
+                    and stored.raw.http_status in spec.legitimate_empty_http_statuses
+                )
+                frontiers[direction] = None if accepted_empty_raw else page
                 break
             payload = stored.payload
+            signature = tuple(sorted(str(event["id"]) for event in payload["events"]))
+            if payload.get("hasNextPage") is True and (not signature or signature in seen_pages):
+                raise SeasonPlanningError(
+                    f"schedule {direction} repeated or empty nonterminal page {page}"
+                )
+            seen_pages.add(signature)
             for event in payload["events"]:
                 event_id = _positive_id(event["id"], "event_id")
                 if event_id not in event_ids:
@@ -963,12 +1010,51 @@ def plan_season_partition(
                             embedded_slug
                         )
             if payload.get("hasNextPage") is not True:
+                frontiers[direction] = None
                 break
-            if page + 1 >= max_pages:
-                raise SeasonPlanningError(
-                    f"schedule {direction} chain exceeded max_pages={max_pages}"
-                )
             page += 1
+
+    # The raw prefix is the durable cursor. Its proof excludes this portion's
+    # pages and mutable manifest status so a retry cannot invalidate itself.
+    if schedule_chunk is None:
+        limit = min(max_pages, 50)
+        open_directions = [name for name in ("last", "next") if frontiers[name] is not None]
+        windows = {}
+        for name in ("last", "next"):
+            start = frontiers[name] if frontiers[name] is not None else len(page_evidence[name])
+            if len(open_directions) == 2:
+                length = max(1, limit - 1) if name == "last" else (1 if limit > 1 else 0)
+            else:
+                length = limit if name in open_directions else 0
+            windows[name] = (start, start + length)
+    else:
+        if (schedule_chunk.tournament_id, schedule_chunk.season_id) != (tournament, season):
+            raise SeasonPlanningError("schedule chunk belongs to another source season")
+        windows = {"last": schedule_chunk.last, "next": schedule_chunk.next}
+        if any(stop - start > max_pages for start, stop in windows.values()):
+            raise SeasonPlanningError("schedule chunk exceeds the configured page limit")
+    prefix = {}
+    for name, (start, _) in windows.items():
+        # A page whose read failed is not valid prefix evidence. Prefixes may
+        # never jump over an absent/promised page, including on stale retry.
+        frontier = frontiers[name]
+        usable = frontier if frontier is not None else len(page_evidence[name])
+        if start > usable:
+            raise SeasonPlanningError(f"schedule {name} chunk lost its raw prefix")
+        prefix[name] = page_evidence[name][:start]
+    digest = _schedule_prefix_digest(tournament, season, freshness, prefix)
+    if schedule_chunk is not None and digest != schedule_chunk.evidence_digest:
+        raise SeasonPlanningError("schedule chunk raw-prefix proof changed")
+    chunk = schedule_chunk or SeasonScheduleChunk(tournament, season, windows["last"], windows["next"], digest)
+    deferred_schedule = []
+    for spec in specs:
+        if spec.key not in missing_raw or not spec.key.endpoint.startswith("schedule_"):
+            continue
+        direction, token = spec.key.target_id.split(":")
+        start, stop = windows[direction]
+        if not start <= int(token) < stop:
+            deferred_schedule.append(spec.key)
+    missing_raw = [key for key in missing_raw if key not in deferred_schedule]
 
     standings = build_standings_total_spec(**common)
     rounds = build_rounds_spec(**common)
@@ -1058,6 +1144,9 @@ def plan_season_partition(
         referee_ids=tuple(sorted(referee_ids, key=int)),
         player_universe_evidence_gaps=tuple(player_universe_evidence_gaps),
         placeholder_team_ids=tuple(sorted(placeholder_team_ids, key=int)),
+        schedule_chunk=chunk,
+        schedule_frontier=(frontiers["last"], frontiers["next"]),
+        deferred_schedule_keys=tuple(deferred_schedule),
     )
 
 

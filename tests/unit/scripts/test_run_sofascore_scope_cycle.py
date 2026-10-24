@@ -737,6 +737,30 @@ def test_cycle_reports_a_partial_scope_as_a_finished_task(tmp_path, monkeypatch)
 
 
 @pytest.mark.unit
+def test_cycle_retains_season_continuation_and_never_starts_matches(tmp_path, monkeypatch):
+    from tests.unit.scrapers.test_sofascore_history_controller import continuation_report
+    paths = cycle.ScopeOverlayPaths(tmp_path/'tournaments.json', tmp_path/'medallion/competitions.yaml')
+    monkeypatch.setattr(cycle, 'load_exact_scope', lambda *a, **kw:_scope())
+    monkeypatch.setattr(cycle, 'render_scope_overlays', lambda *a, **kw:paths)
+    partial = continuation_report()['phases'][0]['partial']
+    entities = []
+    def run_capture(argv, **kwargs):
+        entities.append(argv[argv.index('--entity') + 1])
+        dest = Path(argv[argv.index('--output') + 1]); dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(dict(errors=[], partial=partial, traffic={'paid_proxy_bytes': 4321})))
+        return 0
+    with (patch('dags.scripts.prepare_sofascore_workload.prepare_workload_plan', side_effect=_plan_double),
+          patch('dags.scripts.run_sofascore_scraper.main', side_effect=run_capture)):
+        assert cycle.main(_cycle_argv(tmp_path, '--phase', 'all')) == 0
+    report = json.loads((tmp_path/'result.json').read_text())
+    assert entities == ['all']
+    assert report['status'] == 'partial' and report['errors'] == []
+    assert len(report['phases']) == 1 and report['phases'][0]['phase'] == 'season'
+    assert report['phases'][0]['partial'] == partial
+    assert report['bytes'] == 4321
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("archive_enabled", [False, True])
 def test_cycle_result_carries_elapsed_time_of_a_green_scope(tmp_path, monkeypatch, archive_enabled):
     if archive_enabled:

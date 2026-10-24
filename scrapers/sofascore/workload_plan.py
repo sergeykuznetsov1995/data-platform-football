@@ -36,6 +36,10 @@ from scrapers.sofascore.runtime_fingerprint import (
     RuntimeFingerprintError,
     validate_runtime_fingerprint,
 )
+from scrapers.sofascore.season_chunks import (
+    SeasonScheduleChunk,
+    encode_season_chunk_unit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1048,6 +1052,17 @@ class SeasonWorkload:
     season_id: int | str
     shape: Mapping[str, object]
     pending: bool = True
+    schedule_chunk: Optional[SeasonScheduleChunk] = None
+
+    def __post_init__(self) -> None:
+        if self.schedule_chunk is not None:
+            if not isinstance(self.schedule_chunk, SeasonScheduleChunk):
+                raise WorkloadPlanError("season schedule_chunk has an invalid type")
+            if (
+                self.schedule_chunk.tournament_id != str(self.tournament_id)
+                or self.schedule_chunk.season_id != str(self.season_id)
+            ):
+                raise WorkloadPlanError("season chunk source identity differs from workload")
 
     @property
     def workload_class(self) -> str:
@@ -1059,6 +1074,8 @@ class SeasonWorkload:
 
     @property
     def unit(self) -> str:
+        if self.schedule_chunk is not None:
+            return encode_season_chunk_unit(self.schedule_chunk)
         tournament = _required_token(str(self.tournament_id), "tournament_id")
         season = _required_token(str(self.season_id), "season_id")
         return f"{tournament}:{season}"

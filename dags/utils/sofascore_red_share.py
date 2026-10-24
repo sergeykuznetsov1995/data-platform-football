@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 import json
 import hashlib
+import base64
+import binascii
 from typing import NamedTuple
 
 RED_SHARE_THRESHOLD_PCT = 20
@@ -27,6 +29,75 @@ SCOPE_DAG_IDS = (HISTORY_DAG_ID, REFRESH_DAG_ID)
 SCOPE_TASK_PATTERN = "run\\_%\\_scope"
 
 _UTC_LITERAL = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def validate_season_continuation(partial: dict, *, tournament_id, season_id) -> dict:
+    """Accept only a durable, completed signed schedule portion, never a budget stop."""
+    if (not isinstance(partial, dict)
+            or partial.get("kind") != "season_schedule_continuation"
+            or partial.get("stop_reason") != "schedule_chunk_complete"
+            or partial.get("raw_manifest_committed") is not True):
+        raise ValueError("unproven season schedule continuation")
+    # This host adapter is also loaded by absolute path outside the repository.
+    # Independently check the small evidence value with stdlib only; signature
+    # and allocation authorization remain the capture runner's responsibility.
+    unit = partial.get("chunk_unit")
+    prefix = "season-chunk-v1."
+    if not isinstance(unit, str) or not unit.startswith(prefix):
+        raise ValueError("invalid season continuation chunk unit")
+    encoded = unit[len(prefix):]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", encoded):
+        raise ValueError("invalid season continuation chunk encoding")
+    try:
+        chunk = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4),
+                                            altchars=b"-_", validate=True).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ValueError("invalid season continuation chunk payload") from exc
+    if (not isinstance(chunk, dict)
+            or set(chunk) != {"tournament_id", "season_id", "last", "next", "evidence_digest"}
+            or any(not isinstance(chunk[name], str) or not re.fullmatch(r"[1-9][0-9]*", chunk[name])
+                   for name in ("tournament_id", "season_id"))
+            or chunk["tournament_id"] != str(tournament_id)
+            or chunk["season_id"] != str(season_id)):
+        raise ValueError("season continuation native identity mismatch")
+    if (not isinstance(chunk["evidence_digest"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", chunk["evidence_digest"])):
+        raise ValueError("invalid season continuation evidence digest")
+    for direction in ("last", "next"):
+        bounds = chunk[direction]
+        if (not isinstance(bounds, list) or len(bounds) != 2
+                or any(type(value) is not int for value in bounds) or not 0 <= bounds[0] <= bounds[1]):
+            raise ValueError("invalid season continuation range")
+    pages = sum(chunk[d][1] - chunk[d][0] for d in ("last", "next"))
+    canonical = base64.urlsafe_b64encode(json.dumps(chunk, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode()).decode().rstrip("=")
+    if not 1 <= pages <= 50 or canonical != encoded:
+        raise ValueError("invalid season continuation chunk bounds or canonical encoding")
+    continuation = partial.get("continuation")
+    if (not isinstance(continuation, dict) or set(continuation) != {"last", "next"}
+            or not any(value is not None for value in continuation.values())):
+        raise ValueError("season continuation has no bounded progress")
+    for direction in ("last", "next"):
+        value = continuation[direction]
+        start, stop = chunk[direction]
+        if value is not None and (type(value) is not int or value < stop):
+            raise ValueError("season continuation stopped inside its signed range")
+    return partial
+
+
+def season_continuation_proof(payload: dict, *, tournament_id, season_id) -> dict:
+    """Validate the cycle and season phase before crediting a healthy partial."""
+    phases = payload.get("phases") if isinstance(payload, dict) else None
+    if (not isinstance(payload, dict) or payload.get("status") != "partial"
+            or payload.get("errors") != [] or not isinstance(phases, list) or len(phases) != 1):
+        raise ValueError("invalid season continuation cycle result")
+    phase = phases[0]
+    if (not isinstance(phase, dict) or phase.get("phase") != "season"
+            or phase.get("status") != "partial" or type(phase.get("exit_code")) is not int
+            or phase["exit_code"] != 0 or phase.get("errors") != []):
+        raise ValueError("invalid season continuation phase result")
+    return validate_season_continuation(phase.get("partial"),
+                                        tournament_id=tournament_id, season_id=season_id)
 
 
 def _bounds(t0_utc: str, t1_utc: str) -> None:
@@ -133,7 +204,7 @@ def history_scope_counts(result_dir: Path, t0_utc: str, t1_utc: str,
                 raise ValueError("invalid history slot receipt item")
             env = item["environment"]
             if (item.get("accounted") is not True or not isinstance(item.get("outcome"), dict)
-                    or item["outcome"].get("status") not in ("success", "failed", "not_started")):
+                    or item["outcome"].get("status") not in ("success", "failed", "partial", "not_started")):
                 raise ValueError("unaccounted history slot attempt")
             if item["outcome"].get("status") == "not_started":
                 if isinstance(item.get("attempts"), bool) or item.get("attempts") != 0:
@@ -159,13 +230,19 @@ def history_scope_counts(result_dir: Path, t0_utc: str, t1_utc: str,
                     or stamp["started_at"] != item.get("started_at")
                     or stamp["finished_at"] != item.get("finished_at")
                     or started.tzinfo is None or finished.tzinfo is None or finished < started
-                    or status not in ("success", "failed") or status != item["outcome"].get("status")
+                    or status not in ("success", "failed", "partial") or status != item["outcome"].get("status")
                     or not payload.get("scope_digest")
                     or payload.get("run_id") != env["SOFASCORE_SCOPE_RUN_ID"]
                     or payload.get("campaign_id") != env["SOFASCORE_EXPECTED_CAMPAIGN_ID"]
                     or str(payload.get("tournament_id")) != str(env["SOFASCORE_TOURNAMENT_ID"])
                     or str(payload.get("source_season_id")) != str(env["SOFASCORE_SOURCE_SEASON_ID"])):
                 raise ValueError("invalid history scope attempt report")
+            if status == "partial":
+                proof = season_continuation_proof(payload,
+                    tournament_id=env["SOFASCORE_TOURNAMENT_ID"],
+                    season_id=env["SOFASCORE_SOURCE_SEASON_ID"])
+                if item["outcome"].get("partial") != proof:
+                    raise ValueError("history continuation receipt proof mismatch")
             identity = (run, payload["scope_digest"])
             if identity in reports:
                 raise ValueError("duplicate history scope attempt in finalize receipt")

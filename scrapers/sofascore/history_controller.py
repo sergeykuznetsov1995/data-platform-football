@@ -410,6 +410,12 @@ def account_scope(environment, outcome, *, state_path, failures_path, release):
     run_id = environment["SOFASCORE_SCOPE_RUN_ID"]
     if outcome["status"] == "not_started":
         return
+    if outcome["status"] == "partial":
+        from dags.utils.sofascore_red_share import validate_season_continuation
+        validate_season_continuation(outcome.get("partial"),
+            tournament_id=environment["SOFASCORE_TOURNAMENT_ID"],
+            season_id=environment["SOFASCORE_SOURCE_SEASON_ID"])
+        return
     if outcome["status"] == "success":
         if environment.get("SOFASCORE_HISTORY_GROUP") != "july":
             state.mark_completed(state_path, campaign_id=campaign, scope_key=scope_key)

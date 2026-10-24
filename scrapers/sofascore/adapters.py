@@ -237,6 +237,12 @@ class TrinoManifestStore(ManifestStore):
         self.preload_scope(source_tournament_id, source_season_id)
         return list(self._index.values())
 
+    def refresh_scope(self, source_tournament_id, source_season_id):
+        """Discard a pre-lock read and reload durable observations (#1730)."""
+        self._index = None
+        self._index_scope = None
+        return self.preload_scope(source_tournament_id, source_season_id)
+
     def _in_index_scope(self, key: ManifestKey) -> bool:
         return self._index is not None and self._index_scope == (
             key.source_tournament_id,

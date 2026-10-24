@@ -555,6 +555,151 @@ def test_network_free_planner_follows_every_stored_schedule_page(tmp_path):
 
 
 @pytest.mark.unit
+def test_large_season_retains_continuation_after_fifty_schedule_pages(tmp_path):
+    """#1730: replay the observed 26947/92699 shape without source calls."""
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    common = dict(_common(), source_tournament_id=26947, source_season_id=92699)
+    for page in range(50):
+        payload = _schedule_payload(range(17_000_000 + page * 30, 17_000_030 + page * 30), has_next=True)
+        for event in payload["events"]:
+            event["season"]["id"] = 92699
+            event["tournament"] = {"uniqueTournament": {"id": 26947}}
+        _seed_json(raw_store, build_schedule_page_spec(direction="last", page=page, **common), payload)
+    plan = plan_season_partition(raw_store, manifest, max_pages=50, **common)
+    # Stored page49 promises page50. It must remain unfinished rather than
+    # fail at the supported chunk boundary or silently claim completeness.
+    assert plan.complete is False
+    assert plan.schedule_chunk.last == (50, 99)
+    assert plan.schedule_chunk.next == (0, 1)
+    assert plan.schedule_frontier == (50, 0)
+    assert not plan.match_phase_ready
+    assert not plan.player_universe_ready
+
+
+@pytest.mark.parametrize("direction", ["last", "next"])
+def test_signed_schedule_window_stops_then_resumes_beyond_fifty(tmp_path, direction):
+    store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    other = "next" if direction == "last" else "last"
+    _seed_json(store, build_schedule_page_spec(direction=other, page=0, **_common()),
+               _schedule_payload([], has_next=False))
+    initial = plan_season_partition(store, manifest, **_common())
+    chunk = initial.schedule_chunk
+    assert getattr(chunk, direction) == (0, 50)
+    for page in range(50):
+        _seed_json(store, build_schedule_page_spec(direction=direction, page=page, **_common()),
+                   _schedule_payload([14_000_000 + page], has_next=True))
+    bounded = plan_season_partition(store, manifest, schedule_chunk=chunk, **_common())
+    assert not bounded.complete and not bounded.match_phase_ready and not bounded.player_universe_ready
+    assert bounded.schedule_frontier[("last", "next").index(direction)] == 50
+    assert [key.target_id for key in bounded.deferred_schedule_keys] == [f"{direction}:50"]
+    assert not any(key.endpoint.startswith("schedule_") for key in bounded.missing_raw_keys)
+    # Restart with no in-process state. Native raw is the cursor; pending
+    # manifests do not buy already retained pages again.
+    resumed = plan_season_partition(store, InMemoryManifestStore(), **_common())
+    assert getattr(resumed.schedule_chunk, direction) == (50, 100)
+    for page in range(50, 56):
+        _seed_json(store, build_schedule_page_spec(direction=direction, page=page, **_common()),
+                   _schedule_payload([14_000_000 + page], has_next=page < 55))
+    for spec in _specs():
+        if not spec.key.endpoint.startswith("schedule_"):
+            _seed_json(store, spec, _payload(FIXTURE_PATHS[spec.key.endpoint]))
+    complete_raw = plan_season_partition(store, manifest, schedule_chunk=resumed.schedule_chunk, **_common())
+    assert complete_raw.schedule_chain_complete
+    engine, transport = _engine(tmp_path, raw_store=store)
+    replayed = replay_season_specs(engine, complete_raw.specs)
+    materialized = materialize_season_partition(
+        complete_raw, replayed, canonical_league="ENG-Premier League", canonical_season="2526",
+    )
+    assert transport.calls == 0
+    assert len(materialized.schedule_rows) == 56
+    assert materialized.endpoint_completeness == 1.0
+
+
+def test_chunk_prefix_proof_rejects_changed_or_missing_raw(tmp_path):
+    store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    first = build_schedule_page_spec(direction="last", page=0, **_common())
+    _seed_json(store, first, _schedule_payload([14000001], has_next=True))
+    plan = plan_season_partition(store, manifest, **_common())
+    _seed_json(store, first, _schedule_payload([14000002], has_next=True))
+    with pytest.raises(SeasonPlanningError, match="raw-prefix proof changed"):
+        plan_season_partition(store, manifest, schedule_chunk=plan.schedule_chunk, **_common())
+    empty = _raw_store(tmp_path / "lost-prefix")
+    with pytest.raises(SeasonPlanningError, match="lost its raw prefix"):
+        plan_season_partition(empty, manifest, schedule_chunk=plan.schedule_chunk, **_common())
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_nonterminal_repeated_or_empty_page_stops_without_extending_plan(tmp_path, empty):
+    store = _raw_store(tmp_path)
+    for page in range(2):
+        _seed_json(store, build_schedule_page_spec(direction="last", page=page, **_common()),
+                   _schedule_payload([] if empty else [14000001], has_next=True))
+    expected = "stored schema rejected" if empty else "repeated or empty nonterminal page"
+    with pytest.raises(SeasonPlanningError, match=expected):
+        plan_season_partition(store, InMemoryManifestStore(), **_common())
+
+
+@pytest.mark.parametrize("flush_failure", [False, True])
+def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, monkeypatch, flush_failure):
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore.manifest import BatchingManifestStore
+    from scrapers.sofascore.season_chunks import encode_season_chunk_unit
+    from scrapers.sofascore.workload_plan import qualify_work_unit
+
+    store = _raw_store(tmp_path)
+    chunk = plan_season_partition(store, InMemoryManifestStore(), **_common()).schedule_chunk
+    for page in range(49):
+        _seed_json(store, build_schedule_page_spec(direction="last", page=page, **_common()),
+                   _schedule_payload([14_000_000 + page], has_next=True))
+    _seed_json(store, build_schedule_page_spec(direction="next", page=0, **_common()),
+               _schedule_payload([], has_next=False))
+    for spec in _specs():
+        if not spec.key.endpoint.startswith("schedule_"):
+            _seed_json(store, spec, _payload(FIXTURE_PATHS[spec.key.endpoint]))
+    engine, transport = _engine(tmp_path, raw_store=store, sink=DeferredCaptureSink())
+    durable = InMemoryManifestStore()
+    buffered = BatchingManifestStore(durable, max_pending=200)
+    engine.manifest_store = buffered
+    runtime = CaptureRuntime(engine=engine, raw_store=store, manifest_store=buffered)
+    monkeypatch.setattr(runner, "_write_results", lambda path, payload: Path(path).write_text(json.dumps(payload)))
+    if flush_failure:
+        monkeypatch.setattr(buffered, "flush", lambda: (_ for _ in ()).throw(RuntimeError("injected flush failure")))
+    monkeypatch.setattr(runner, "_source_context", lambda *_: (TOURNAMENT_ID, SEASON_ID))
+    allocation = SimpleNamespace(units=(qualify_work_unit("ENG-Premier League:2526", encode_season_chunk_unit(chunk)),))
+    signed = SimpleNamespace(freshness_key=lambda scope: FRESHNESS if scope == "season" else "final")
+    output = tmp_path / "chunk-result.json"
+    with (
+        patch("scrapers.sofascore.SofaScoreScraper") as publish,
+        patch("scrapers.sofascore.pipeline.finalize_materialized_results") as finalize,
+    ):
+        rc = runner._run_season_capture_engine(
+            ["ENG-Premier League"], 2025, str(output), force_replace=False,
+            entity="season_capture", capture_runtime=runtime, offline_replay=True,
+            workload_plan=signed, workload_allocations=(allocation,),
+        )
+    result = json.loads(output.read_text())
+    assert transport.calls == 0
+    publish.assert_not_called()
+    finalize.assert_not_called()
+    if flush_failure:
+        assert rc == 1 and "partial" not in result
+    else:
+        assert rc == 0
+        assert result["partial"]["continuation"] == {"last": 49, "next": None}
+        assert result["partial"]["raw_manifest_committed"] is True
+        assert result["manifest_committed"] is False
+        assert result["endpoint_completeness"] == 0.0
+        for page in range(49):
+            spec = build_schedule_page_spec(direction="last", page=page, **_common())
+            record = durable.get(spec.key)
+            assert record.raw_content_hash and not record.is_terminal
+            assert record.error_type == "DeferredMaterialization"
+
+
+@pytest.mark.unit
 def test_schedule_404_is_legitimate_empty_on_seed_and_promised_pages():
     """#1351: a 404 further down the chain means the chain ended (as in
     ``schedule_refresh``); it used to be a retryable failure that reddened the
@@ -641,13 +786,10 @@ def test_missing_promised_schedule_page_stays_planned_and_nonterminal(tmp_path):
     assert plan.complete is False
     assert all(spec.key.target_id != "last:2" for spec in plan.specs)
 
-    with pytest.raises(SeasonPlanningError, match="exceeded max_pages=1"):
-        plan_season_partition(
-            raw_store,
-            manifest,
-            max_pages=1,
-            **_common(),
-        )
+    bounded = plan_season_partition(raw_store, manifest, max_pages=1, **_common())
+    assert bounded.complete is False
+    assert promised in bounded.pending_keys
+    assert bounded.schedule_chunk.last == (1, 2)
 
 
 @pytest.mark.unit

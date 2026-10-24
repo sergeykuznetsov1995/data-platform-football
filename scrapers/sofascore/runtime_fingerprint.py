@@ -36,6 +36,7 @@ RUNTIME_FILE_ENTRIES = (
     "dags/utils/medallion_config.py",
     "dags/utils/sofascore_dq.py",
     "dags/utils/sofascore_all_mens_state.py",
+    "dags/utils/sofascore_red_share.py",
     "scripts/build_sofascore_all_mens_snapshot.py",
     "scripts/enrich_sofascore_all_mens_snapshot.py",
     "scripts/backfill_sofascore.py",
