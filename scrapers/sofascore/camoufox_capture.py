@@ -26,6 +26,17 @@ from scrapers.sofascore._flatten import _auto_flatten
 logger = logging.getLogger(__name__)
 
 
+class AnchorChallengeError(RuntimeError):
+    """Rejected official CAPTCHA anchor; never a successful origin proof."""
+
+    reason = "sofascore_anchor_challenge"
+
+    def __init__(self, *, source_requests: int):
+        super().__init__(self.reason)
+        self.source_requests = source_requests
+        self.navigations = 1
+
+
 class ProxyConnectivityError(RuntimeError):
     """The residential exit did not answer; the browser runtime is still alive.
 
@@ -712,6 +723,17 @@ class SofascoreCamoufoxCapture:
         )
         origin_ok = self._page.evaluate("() => location.origin") == BASE
         source_request_delta = self._source_request_count - source_before
+        if (
+            status == 200
+            and origin_ok
+            and final_url_evidence["scheme"] == "https"
+            and final_url_evidence["hostname"] == "www.sofascore.com"
+            and final_url_evidence["port"] in (None, 443)
+            and final_url_evidence["userinfo_present"] is False
+            and final_url_evidence["path"] == "/captcha.html"
+            and source_request_delta in (1, 2)
+        ):
+            raise AnchorChallengeError(source_requests=source_request_delta)
         if (
             response is None
             or not anchor_url_ok
