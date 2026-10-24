@@ -2458,7 +2458,7 @@ def test_sparse_resume_first_endpoint_accounts_browser_bootstrap(
 
 
 @pytest.mark.parametrize("delta", [1, 2])
-@pytest.mark.parametrize("scenario", ["success", "persistent", "exhausted", "close_error", "timeout", "api_error"])
+@pytest.mark.parametrize("scenario", ["success", "persistent", "exhausted", "close_error", "timeout", "api_error", "empty204", "empty404"])
 def test_anchor_captcha_retries_with_fresh_browser_and_exact_meter(tmp_path, delta, scenario):
     from unittest.mock import MagicMock
     from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
@@ -2466,6 +2466,10 @@ def test_anchor_captcha_retries_with_fresh_browser_and_exact_meter(tmp_path, del
     runtime, _ = _runtime(tmp_path)
     client = _LeaseClient([0, 0, 40, 40, 90], final_total=90)
     captures = []
+    empty_status = {"empty204": 204, "empty404": 404}.get(scenario)
+    if empty_status:
+        client.totals = deque([0, 0, 40, 40, 90, 90, 120])
+        client.final_total = 120
     persistent = scenario in {"persistent", "close_error"}
     failed = persistent or scenario in {"timeout", "api_error"}
     if scenario == "exhausted":
@@ -2512,14 +2516,17 @@ def test_anchor_captcha_retries_with_fresh_browser_and_exact_meter(tmp_path, del
         def new_capture(**capture_kwargs):
             if captures:
                 assert captures[-1].exit_calls == 1
-            browser = Browser([_record(b'{"items":[{"id":1}]}', 503 if scenario == "api_error" else 200)])
+            browser = Browser([
+                _record(b'{"items":[{"id":1}]}', empty_status or (503 if scenario == "api_error" else 200)),
+                _record(b'{"items":[{"id":2}]}'),
+            ])
             captures.append(browser)
             return browser.configure(**capture_kwargs)
         transport._capture_factory = new_capture
         return transport
 
     def run():
-        return capture_live_specs(runtime, [_spec(17371523)],
+        return capture_live_specs(runtime, [_spec(17371523), _spec(2)] if empty_status else [_spec(17371523)],
             canonical_url="https://www.sofascore.com/event/17371523",
             scope="ENG-Premier League:2526", entity="match_capture",
             transport_factory=transport_factory)
@@ -2537,15 +2544,17 @@ def test_anchor_captcha_retries_with_fresh_browser_and_exact_meter(tmp_path, del
             assert all(not browser.fetch_paths for browser in captures)
     else:
         results, traffic = run()
-        assert len(results) == 1
-        assert traffic["source_request_count"] == delta + 2
+        assert len(results) == (2 if empty_status else 1)
+        if empty_status:
+            assert results[0].manifest.status.value in {"legitimate_empty", "not_supported"}
+        assert traffic["source_request_count"] == delta + (3 if empty_status else 2)
         assert traffic["browser_navigations"] == 2
         assert traffic["browser_sessions"] == 2
-        assert traffic["endpoint_request_provider_bytes"] == {"event": [40, 50]}
+        assert traffic["endpoint_request_provider_bytes"] == {"event": [40, 50, 30] if empty_status else [40, 50]}
     assert len(captures) == (1 if scenario == "exhausted" else 2)
     assert all(browser.exit_calls == 1 for browser in captures)
     assert len(client.acquire_calls) == 1
-    assert runtime.engine.budget.spent == (40 if scenario == "exhausted" else 90)
+    assert runtime.engine.budget.spent == (40 if scenario == "exhausted" else (120 if empty_status else 90))
 
 
 def test_dynamic_season_rejected_optional_referee_is_retained_without_retry(tmp_path):

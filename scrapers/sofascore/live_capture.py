@@ -967,7 +967,10 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             )
         status = int(record["status"])
         self._needs_rewarm = status == 403 or bool(record.get("challenge"))
-        if status == 200 and not self._needs_rewarm:
+        # 204/404 can finish an endpoint too. Only retryable HTTP responses
+        # keep this recovery episode open; the engine validates empty/error
+        # semantics for the exact EndpointSpec before advancing the batch.
+        if 200 <= status < 500 and status != 429 and not self._needs_rewarm:
             self._anchor_attempts = 0
         body = record.get("body")
         if isinstance(body, str):
