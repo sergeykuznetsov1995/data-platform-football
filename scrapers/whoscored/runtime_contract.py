@@ -94,6 +94,7 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/fotmob/constants.py",
     "scrapers/sofascore/__init__.py",
     "scrapers/sofascore/runtime_fingerprint.py",
+    "scrapers/sofascore/season_chunks.py",
     "scrapers/sofascore/workload_plan.py",
     "scrapers/utils/__init__.py",
     "scrapers/utils/proxy_manager.py",
