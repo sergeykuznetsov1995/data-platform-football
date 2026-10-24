@@ -30,7 +30,7 @@ from scripts.proxy_filter.budget import (
     BudgetAccountingError,
     ProxyBudgetExceeded,
 )
-from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
+from scrapers.sofascore.camoufox_capture import AnchorChallengeError, ProxyConnectivityError
 from scrapers.sofascore.lease_client import (
     SofascoreLeaseControlUnavailable,
     SofascoreLeaseError,
@@ -278,6 +278,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._capture = None
         self._entered = False
         self._closed = False
+        self._anchor_attempts = 0
         self._broken = False
         self._needs_rewarm = False
         self._accounted_provider_bytes = 0
@@ -575,7 +576,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                     self._proxy_exit_hash = hash_proxy_exit(
                         self._capture.probe_proxy_exit()
                     )
-            except ProxyConnectivityError:
+            except (ProxyConnectivityError, AnchorChallengeError):
                 # The residential exit died; the browser runtime is fine.  Tear
                 # it down and drop the session so the next attempt cold-starts a
                 # fresh dial through the same lease.  ``_broken`` stays False, so
@@ -593,7 +594,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             before = int(getattr(self._capture, "_navigation_count", 0) or 0)
             try:
                 self._capture.warm_exact_json(self.canonical_url)
-            except ProxyConnectivityError:
+            except (ProxyConnectivityError, AnchorChallengeError):
                 # Same dead-exit recovery for a challenge re-warm: drop the
                 # session so the retry cold-starts, without latching ``_broken``.
                 self._teardown_capture()
@@ -677,6 +678,13 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             )
         if provider_budget.run_id != self.engine.run_id:
             raise BudgetAccountingError("SofaScore provider token run mismatch")
+        if self._anchor_attempts >= 2:
+            raise TransportError(
+                "sofascore_anchor_challenge: recovery attempt exhausted",
+                provider_bytes=0, retryable=False, source_requests=0,
+            )
+        if self._anchor_attempts:
+            self._anchor_attempts += 1
         path = self._source_path(url)
         try:
             before_stats = self._client.stats(self._lease)
@@ -729,6 +737,8 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         except (BudgetAccountingError, ProxyBudgetExceeded):
             raise
         except BaseException as exc:
+            if isinstance(exc, AnchorChallengeError) and not self._anchor_attempts:
+                self._anchor_attempts = 1
             if self._browser_started and not self._browser_reported:
                 sessions = 1
                 self._browser_reported = True
@@ -742,6 +752,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             navigations = max(
                 navigations,
                 max(0, navigation_after - navigation_before),
+                exc.navigations if isinstance(exc, AnchorChallengeError) else 0,
             )
             source_after = int(
                 getattr(self._capture, "_source_request_count", source_before) or 0
@@ -816,10 +827,12 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             raise TransportError(
                 f"warmed SofaScore request failed for {path}: {self._safe_error(exc)}",
                 provider_bytes=provider_bytes,
-                retryable=not self._broken and not lease_lost,
+                retryable=(not self._broken and not lease_lost
+                           and self._anchor_attempts < 2),
                 browser_sessions=sessions,
                 navigations=navigations,
-                source_requests=max(0, source_after - source_before),
+                source_requests=(exc.source_requests if isinstance(exc, AnchorChallengeError)
+                                 else max(0, source_after - source_before)),
                 accounting_uncertain=accounting_uncertain,
                 control_channel_failure=(
                     meter_channel_failure
@@ -954,6 +967,8 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             )
         status = int(record["status"])
         self._needs_rewarm = status == 403 or bool(record.get("challenge"))
+        if status == 200 and not self._needs_rewarm:
+            self._anchor_attempts = 0
         body = record.get("body")
         if isinstance(body, str):
             body = body.encode("utf-8")
