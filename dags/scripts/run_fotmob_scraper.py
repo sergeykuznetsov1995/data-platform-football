@@ -2069,6 +2069,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if automatic_contract is not None
         else journal_plan_signature
     )
+    explicit_history = bool(explicit_scopes) and mode == RunMode.BACKFILL and not automatic_catalog
 
     if args.mode == RunMode.DISCOVER.value:
         rc, payload = finish()
@@ -2116,6 +2117,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             if raw_store is not None and raw_store.has_target(target):
                 previously_complete.add(season.identity)
 
+    # A source gap resolves the campaign unit, but must never enter the
+    # successful full-coverage journal (or its automatic-history bridge).
+    explicit_gap_records = (
+        service.repository.source_gap_scope_records(journal_plan_signature)
+        if explicit_history else {}
+    )
+    gap_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    resumed_gaps = {
+        identity: record for identity, record in explicit_gap_records.items()
+        if identity in explicit_scopes and identity not in previously_complete
+        and timedelta(0) <= gap_observed_at - _naive_utc(record["completed_at"]) < SOURCE_GAP_REVIEW_AFTER
+    }
+
     # The external campaign has one exact, un-laned season+matches contract.
     # Its marker is partial evidence for the wider automatic HISTORY plan, not
     # a full history completion: scopes still run for every other family and
@@ -2141,6 +2155,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
     remaining_scope_entities = scope_entities - _CAMPAIGN_SCOPE_ENTITIES
     planner_complete_scopes = set(previously_complete)
+    planner_complete_scopes.update(resumed_gaps)
     if campaign_plan_signature is not None and not remaining_scope_entities:
         # A season+matches-only history contract has nothing left to execute.
         # Keep the journals separate and let the exact campaign marker satisfy
@@ -2363,7 +2378,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     operations.append(work_plan)
     if automatic_catalog:
         operations.append(attempt_operation)
-    completed_scopes: list[str] = []
+    source_gap_scopes = [format_scope_token(*identity) for identity in sorted(resumed_gaps)]
+    completed_scopes: list[str] = list(source_gap_scopes)
+    for identity, record in sorted(resumed_gaps.items()):
+        operations.append(OperationResult(
+            "scope_source_gap", skipped=1,
+            metadata={
+                **record, "scope": format_scope_token(*identity),
+                "completed_at": record["completed_at"].isoformat(), "resumed": True,
+            },
+        ))
     # Скоупы, у которых доказательства дыры источника уже собраны, но второго
     # наблюдения ещё нет. До #1255 такой скоуп шёл в work_plan.retryable и красил
     # первую попытку, хотя источник честно ответил «матчей нет».
@@ -2419,6 +2443,39 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 {"scope": scope_key, "outstanding": outstanding}
             )
             return False, True
+        if (
+            explicit_history and bundle is not None and source_missing_matches > 0
+            and all(operation.ok and not operation.review_required for operation in scope_operations)
+            and not outstanding
+        ):
+            proofs = {
+                str(proof["match_id"]): proof
+                for operation in scope_operations if operation.entity == "match_payloads"
+                for proof in operation.metadata.get("source_gap_matches", [])
+            }
+            known_times = all(
+                _match_kickoff(match.get("utc_time")) is not None
+                for match in bundle.matches if str(match.get("match_id")) in proofs
+            )
+            if proofs and known_times and not _unconfirmed_gap_matches(
+                bundle.matches, service.repository, observed_at, run_id,
+            ):
+                gap = OperationResult("scope_source_gap", attempted=1, metadata={"scope": scope_key})
+                try:
+                    paths, evidence = service.record_scope_source_gap(
+                        bundle, plan_signature=journal_plan_signature,
+                        scope_entities=scope_entities, source_gap_matches=list(proofs.values()),
+                    )
+                    gap.tables.extend(paths)
+                    gap.metadata.update(evidence)
+                    gap.succeeded = 1
+                    work_plan.succeeded += 1
+                    source_gap_scopes.append(scope_key)
+                    completed_scopes.append(scope_key)
+                except Exception as exc:
+                    gap.record_exception(f"scope {scope_key} source gap: {type(exc).__name__}: {exc}", exc)
+                operations.append(gap)
+                return gap.ok, False
         if scope_ok and bundle is not None:
             descriptors = (
                 (
@@ -3181,10 +3238,18 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         "scope_plan_signature": scope_plan_signature,
         "planned_scopes": planned_scopes,
         "completed_scopes": completed_scopes,
+        "source_gap_scopes": source_gap_scopes,
         "calendar_unavailable_scopes": sorted(calendar_unavailable_scopes),
         "completed_transfer_competition_ids": (completed_transfer_competition_ids),
         "requests_per_minute": args.requests_per_minute,
     }
+    if explicit_history and rc != 0:
+        # The external driver advances from this list even when rc != 0.
+        # In particular, a failed final manifest flush cannot close a unit.
+        payload["selection"]["completed_scopes"] = [
+            scope for scope in completed_scopes if scope not in source_gap_scopes
+        ]
+        payload["selection"]["source_gap_scopes"] = []
     if replay_missing_inputs is not None:
         payload["selection"]["replay_missing_player_inputs"] = replay_missing_inputs
     daily_contract = getattr(args, "daily_competition_contract", None)
