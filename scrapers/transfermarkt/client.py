@@ -2013,6 +2013,7 @@ class TransfermarktHttpClient:
         for attempt in range(1, attempts_cap + 1):
             self._request_timeout()
             proxy_status = ""
+            proxy_upstream_status = None
             self._check_request_budget()
             self._check_decoded_budget(before_request=True)
             self._check_provider_budget(retry=attempt > 1)
@@ -2097,6 +2098,8 @@ class TransfermarktHttpClient:
                 response_headers = getattr(resp, "headers", {})
                 if not isinstance(response_headers, Mapping):
                     response_headers = {}
+                if status_code >= 500 or status_code == 407:
+                    proxy_upstream_status = _header_value(response_headers, PROXY_UPSTREAM_STATUS_HEADER) or None
                 try:
                     body, raw_record, attempt_envelope = self._commit_raw_response(
                         url=url,
@@ -2408,6 +2411,22 @@ class TransfermarktHttpClient:
                     retry=attempt > 1,
                     duration_seconds=elapsed,
                 )
+                if status_code == 405:
+                    # AWS WAF uses 405 for CAPTCHA. A plain method error must
+                    # not slow the source; identify the header or saved HTML.
+                    text = body.decode('utf-8', errors='replace').lower()
+                    is_aws_captcha = (
+                        (_header_value(response_headers, 'x-amzn-waf-action') or '').lower() == 'captcha'
+                        or ('<title>human verification</title>' in text
+                            and '.captcha.awswaf.com/' in text)
+                    )
+                    if is_aws_captcha:
+                        # Account the actual source reply before fallible feedback.
+                        # A control failure is not another source/transport attempt.
+                        try:
+                            self._report_site_block(status_code, challenge=True)
+                        except Exception as exc:
+                            raise TrafficMeterError('CAPTCHA site feedback unavailable') from exc
                 if not proxy_success:
                     self._avoid_on_next_client(proxy_obj)
                     self._discard_failed_transport(label=label)
@@ -2548,6 +2567,7 @@ class TransfermarktHttpClient:
         return self._finish(FetchOutcome(
             status=terminal_status,
             status_code=last_status,
+            proxy_upstream_status=proxy_upstream_status,
             error=last_error,
             attempts=self._attempts - endpoint_attempt_start,
             label=label,

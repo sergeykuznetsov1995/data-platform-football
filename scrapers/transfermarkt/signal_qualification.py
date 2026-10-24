@@ -19,10 +19,13 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
+from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, MAX_PLAYERS_QUERY_BYTES, normalize_market_value
+
 SCHEMA = "tm-signal-qualification-v1"
 OBSERVATION_SCHEMA = "tm-signal-parity-observation-v1"
 GROUPS = {"top_league", "lower_league", "calendar", "cup"}
 FIELDS = ("value", "value_date", "value_present", "contract", "clubs")
+CONTRACT_MISMATCH_THRESHOLD = 0.02
 
 
 class QualificationError(ValueError):
@@ -59,8 +62,10 @@ def _ids(values):
 
 @lru_cache(maxsize=64)
 def _packet_ids(url):
-    query = parse_qs(urlsplit(url).query)
-    _require(set(query) == {"ids[]"} and len(query["ids[]"]) <= 300, "tmapi packet identity is wrong")
+    raw_query = urlsplit(url).query
+    _require(len(raw_query.encode("utf-8")) <= MAX_PLAYERS_QUERY_BYTES, "tmapi packet query exceeds 2000 bytes")
+    query = parse_qs(raw_query)
+    _require(set(query) == {"ids[]"} and 1 <= len(query["ids[]"]) <= MAX_PLAYER_IDS, "tmapi packet identity is wrong")
     return frozenset(_ids(query["ids[]"]))
 
 
@@ -95,6 +100,7 @@ def _observation(value, cohort):
     _require(start <= end and end - start <= timedelta(hours=24), "source observation exceeds one day")
     _require(value.get("day_msk") == end.astimezone(ZoneInfo("Europe/Moscow")).date().isoformat(), "source observation Moscow day is wrong")
     indexed, missing = {}, {"mv": 0, "transfers": 0}
+    contract_mismatches = 0
     for row in rows:
         player = row["player_id"]
         api, roster, ceapi, raw = (row.get(name) for name in ("tmapi", "plus1", "ceapi", "raw"))
@@ -107,7 +113,9 @@ def _observation(value, cohort):
                  (not api["value_present"] and api["value"] is None and api["value_date"] is None), "value presence contradicts source fields")
         _nullable_date(api["value_date"])
         _nullable_date(api["contract"])
-        _require(api["value"] == roster["value"] and api["contract"] == roster["contract"] and roster["club_id"] in clubs, "tmapi differs from full roster")
+        _nullable_date(roster["contract"])
+        _require(normalize_market_value(api["value"]) == normalize_market_value(roster["value"]) and roster["club_id"] in clubs, "tmapi differs from full roster")
+        contract_mismatches += int(api["contract"] != roster["contract"])
         stamps = {"tmapi": _proof(raw.get("tmapi"), "tmapi", player),
                   "plus1": _proof(raw.get("plus1"), "plus1", player, roster["club_id"]),
                   "mv": _proof(raw.get("mv"), "mv", player),
@@ -121,10 +129,11 @@ def _observation(value, cohort):
                 missing[endpoint] += 1
             elif endpoint == "mv":
                 _require(type(ref.get("raw_rows")) is int and ref["raw_rows"] > 0 and {"value", "value_date"} <= set(ref), "MV comparison is incomplete")
-                _require(ref["value"] == api["value"] and ref["value_date"] == api["value_date"], "tmapi differs from ceapi market value")
+                _require(normalize_market_value(ref["value"]) == normalize_market_value(api["value"]) and ref["value_date"] == api["value_date"], "tmapi differs from ceapi market value")
             else:
                 _require(type(ref.get("raw_rows")) is int and ref["raw_rows"] > 0 and ref.get("club_id") in clubs, "tmapi differs from ceapi current club")
         indexed[player] = (row, stamps)
+    _require(contract_mismatches <= len(indexed) * CONTRACT_MISMATCH_THRESHOLD, "tmapi contract mismatch share exceeds 0.02")
     _require(value.get("ceapi_empty_counts") == missing, "ceapi empty counts differ from concrete outcomes")
     _require(value.get("counts") == {"expected": len(cohort), "compared": len(indexed), "missing": 0, "unknown": 0}, "comparison counts differ from concrete rows")
     return indexed, start, end
@@ -243,13 +252,17 @@ def validate_qualification(qualification: Mapping[str, Any], *, editions_proven_
         before, before_stamps = old[player]
         after, after_stamps = new[player]
         for field, reference, raw_kind in (("value", "value", "mv"), ("value_date", "value_date", "mv"), ("contract", "contract", "plus1"), ("clubs", "club_id", "plus1")):
-            if before["tmapi"][field] == after["tmapi"][field]:
+            normalize = normalize_market_value if field == "value" else lambda value: value
+            if normalize(before["tmapi"][field]) == normalize(after["tmapi"][field]):
                 continue
             if raw_kind == "mv":
                 prev_ref, next_ref = before["ceapi"]["mv"], after["ceapi"]["mv"]
-                if prev_ref["status"] != "compared" or next_ref["status"] != "compared" or prev_ref[reference] == next_ref[reference]:
+                if prev_ref["status"] != "compared" or next_ref["status"] != "compared" or normalize(prev_ref[reference]) == normalize(next_ref[reference]):
                     continue
             elif before["plus1"][reference] == after["plus1"][reference]:
+                continue
+            elif field == "contract" and any(row["tmapi"][field] != row["plus1"][reference] for row in (before, after)):
+                # Tolerated discrepancies cannot prove a real matched change.
                 continue
             signal_time, reference_time = after_stamps["tmapi"], after_stamps[raw_kind]
             _require(signal_time.astimezone(ZoneInfo("Europe/Moscow")).date() == reference_time.astimezone(ZoneInfo("Europe/Moscow")).date(), "changed reference and detector were not seen on the same day")

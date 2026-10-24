@@ -17,9 +17,11 @@ observations share --experiment-dir (default evidence-dir.parent); budgets apply
 across portions AND days. An interrupted process fails closed on resume.
 
 sample.json: {"clubs": [{"club_id":"281", "saison_id":2026,
- "scope":"GB1/2026", "groups":["top_league"], "player_ids":["8198"]}]}
-The public tmapi.parse_player_signals contract is grounded in saved 300-ID
-source raw and rechecked by the initial probe. Neither missing cost nor national
+ "scope":"GB1/2026",
+ "edition_url":"https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+ "groups":["top_league"], "player_ids":["8198"]}]}
+The public tmapi.parse_player_signals contract is grounded in saved source
+raw and rechecked by the initial probe; requests use at most 100 IDs. Neither missing cost nor national
 team membership is guessed from a generic JSON field map.
 """
 from __future__ import annotations
@@ -36,7 +38,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 import uuid
 from zoneinfo import ZoneInfo
 import re
@@ -47,8 +49,11 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "dags") not in sys.path:
     sys.path.append(str(ROOT / "dags"))
 
+from scrapers.transfermarkt.tmapi import MAX_PLAYER_IDS, players_url, normalize_market_value
+from scrapers.transfermarkt.signal_qualification import CONTRACT_MISMATCH_THRESHOLD
+
 MIB = 1024 * 1024
-MAX_ATTEMPTS = 4600
+MAX_ATTEMPTS = 5071  # 4471 + 600 по решению владельца 21.10.2026 («Больше повторов», #1393)
 MAX_BYTES = 256 * MIB
 MAX_PORTION_SECONDS = 45 * 60
 # Existing gateway traffic namespace; the unique run/task labels identify an
@@ -84,11 +89,10 @@ def _id(value) -> str:
 
 
 def player_url(ids: list[str]) -> str:
-    if not ids or len(ids) > 300 or len(set(ids)) != len(ids):
-        raise ProbeGateError("tmapi batch needs 1..300 unique IDs")
-    return "https://tmapi.transfermarkt.technology/players?" + urlencode(
-        [("ids[]", _id(item)) for item in ids]
-    )
+    try:
+        return players_url(ids)
+    except ValueError as exc:
+        raise ProbeGateError(str(exc)) from exc
 
 
 def parse_players(payload, expected: list[str]):
@@ -160,11 +164,22 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
             # Currentness comes from the source's own competition profile, not
             # from the configured denominator season (kept only as a cross-check).
             kind = "pokalwettbewerb" if row.route == "pokal" else "wettbewerb"
+            url = club.get("edition_url")
+            try:
+                parsed = urlsplit(url) if isinstance(url, str) else None
+            except ValueError:
+                parsed = None
+            if (parsed is None or parsed.scheme != "https" or parsed.netloc != "www.transfermarkt.com"
+                    or "?" in url or "#" in url
+                    or not re.fullmatch(rf"/[^/]+/startseite/{kind}/{re.escape(parts[0])}", parsed.path)):
+                raise ProbeGateError("sample edition_url must match the official unforced competition profile")
+            if scope in edition_tasks and edition_tasks[scope]["url"] != url:
+                raise ProbeGateError("conflicting edition_url for the same scope")
             edition_tasks.setdefault(scope, {
                 "key": f"edition/{scope}", "kind": "edition", "scope": scope,
                 "competition_id": parts[0], "saison_id": season, "json": False,
                 "denominator_saison_id": row.current_saison_id,
-                "url": f"https://www.transfermarkt.com/competition/startseite/{kind}/{parts[0]}",
+                "url": url,
             })
             participant_tasks.setdefault(scope, {
                 "key": f"participants/{scope}", "kind": "participants", "scope": scope,
@@ -196,8 +211,8 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
     if roster_only:
         return list(edition_tasks.values()) + list(participant_tasks.values()) + tasks, players, groups
     players = list(dict.fromkeys(players))
-    for offset in range(0, len(players), 300):
-        ids = players[offset:offset + 300]
+    for offset in range(0, len(players), MAX_PLAYER_IDS):
+        ids = players[offset:offset + MAX_PLAYER_IDS]
         tasks.append({"key": f"players/{offset}", "kind": "players", "ids": ids,
                       "scope": "parity/players", "json": True, "url": player_url(ids)})
     for player in players:
@@ -207,8 +222,8 @@ def plan_tasks(sample: dict, *, roster_only=False) -> tuple[list[dict], list[str
                           "url": f"https://www.transfermarkt.com/ceapi/{path}/{player}"})
     # Closing packets re-read the detector after every reference of the day: a
     # source update landing mid-observation must be matched the same day.
-    for offset in range(0, len(players), 300):
-        ids = players[offset:offset + 300]
+    for offset in range(0, len(players), MAX_PLAYER_IDS):
+        ids = players[offset:offset + MAX_PLAYER_IDS]
         tasks.append({"key": f"players-closing/{offset}", "kind": "players_closing", "ids": ids,
                       "scope": "parity/players-closing", "json": True, "url": player_url(ids)})
     return tasks, players, groups
@@ -370,12 +385,12 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
             issues.append("tmapi_club_vs_squad")
         else:
             _, row = matching[0]
-            if value != row.get("market_value_eur"):
+            if normalize_market_value(value) != normalize_market_value(row.get("market_value_eur")):
                 issues.append("tmapi_value_vs_squad")
             if contract != (row["contract_until"].isoformat() if row.get("contract_until") else None):
                 issues.append("tmapi_contract_vs_squad")
         if latest_mv:
-            if latest_mv["value_eur"] != value:
+            if normalize_market_value(latest_mv["value_eur"]) != normalize_market_value(value):
                 issues.append("tmapi_value_vs_ceapi")
             if latest_mv["mv_date"].isoformat() != api.market_value_date:
                 issues.append("tmapi_value_date_vs_ceapi")
@@ -383,6 +398,7 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
             issues.append("tmapi_club_vs_ceapi")
         return issues, matching
 
+    contract_mismatches = []
     for player in players:
         if player not in squads:
             # Left every sampled club: a roster change, never a crash or a
@@ -405,12 +421,16 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
         if player in closing:
             candidates.append(("closing", closing[player], closing_raw[player]))
         checked = [(name, api, proof, *detector_issues(api, squads[player], latest_mv, moves)) for name, api, proof in candidates]
-        detector_fetch, api, detector_raw, issues, matching = next((item for item in checked if not item[3]), checked[-1])
+        tolerated = next((item for item in checked if set(item[3]) <= {"tmapi_contract_vs_squad"}), checked[-1])
+        detector_fetch, api, detector_raw, issues, matching = next((item for item in checked if not item[3]), tolerated)
         value, contract, clubs = api.market_value_eur, api.contract_until, api.club_ids
         comparisons.append({"player_id": player, "fields": {"value": value, "value_date": api.market_value_date, "value_present": api.market_value_present, "contract": contract, "clubs": clubs},
                             "mv_rows": len(mv_rows), "transfer_rows": len(transfer_rows), "issues": issues,
                             "detector_fetch": detector_fetch})
         chosen_club, chosen_row = matching[0] if matching else squads[player][0]
+        if "tmapi_contract_vs_squad" in issues:
+            contract_mismatches.append({"player_id": player, "tmapi_contract": contract,
+                                        "squad_contract": chosen_row["contract_until"].isoformat() if chosen_row.get("contract_until") else None})
         mv_ref = ({"status": "compared", "value": latest_mv["value_eur"], "value_date": latest_mv["mv_date"].isoformat(), "raw_rows": mv_raw_count}
                   if history else {"status": "authoritative_empty" if mv_raw_count == 0 else "unknown", "raw_rows": mv_raw_count})
         transfer_ref = ({"status": "compared", "club_id": max(moves, key=lambda row: row["transfer_date"])["to_club_id"], "raw_rows": transfer_raw_count}
@@ -427,6 +447,8 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
     scopes = sorted({task["scope"] for task in tasks if task["kind"] == "squad"})
     proofs = sorted((proof for proof in edition_proofs or [] if proof["scope"] in scopes), key=lambda proof: proof["scope"])
     editions_proven = bool(scopes) and [proof["scope"] for proof in proofs] == scopes
+    contract_share = len(contract_mismatches) / len(qualification_rows) if qualification_rows else 0.0
+    strict_failures = any(any(issue != "tmapi_contract_vs_squad" for issue in row["issues"]) for row in failures)
     return {"players_checked": len(players), "groups": sorted(groups), "comparisons": comparisons,
             "cohort": {"player_ids": sorted(players, key=int), "groups": sorted(groups),
                        "scope_basis": "source_current_edition" if editions_proven else "configured_denominator",
@@ -438,11 +460,14 @@ def parity_report(tasks: list[dict], results: dict, store, players: list[str], g
                                           "unknown_ids": [], "observed_from": min(observed), "observed_to": max(observed),
                                           "counts": {"expected": len(players), "compared": len(qualification_rows), "missing": len(absent), "unknown": 0},
                                           "day_msk": day_msk, "ceapi_empty_counts": empty_counts},
-            "mismatches": failures, "observed_from": min(observed), "observed_to": max(observed),
+            "mismatches": failures, "contract_mismatches": contract_mismatches,
+            "contract_mismatch_count": len(contract_mismatches), "contract_mismatch_share": contract_share,
+            "contract_mismatch_threshold": CONTRACT_MISMATCH_THRESHOLD,
+            "observed_from": min(observed), "observed_to": max(observed),
             "observation_day_msk": day_msk, "career_date_rule": "source calendar Europe/Berlin at raw fetched_at; original raw is UTC",
             "ceapi_missing_comparisons": {"value": sum(not mv[player][0] for player in players),
                                           "club": sum(not transfers[player][0] for player in players)},
-            "field_parity_gate": len(players) >= 1000 and GROUPS <= groups and not failures,
+            "field_parity_gate": len(players) >= 1000 and GROUPS <= groups and not strict_failures and contract_share <= CONTRACT_MISMATCH_THRESHOLD,
             "detector_gate": None, "detector_gate_evaluated_by": "qualify",
             "remaining_gate": "second-day real changes and freshness evidence required"}
 
@@ -460,6 +485,7 @@ def _client(evidence: Path, remaining: dict, portion_id: str):
         lease_provider=ProxyFilterLeaseProvider(os.environ["TM_PROXY_CONTROL_URL"]),
         traffic_ledger=ledger, raw_store=RawResponseStore.from_uri((evidence / "raw").as_uri()),
         require_raw_store=True, rate_limiter=RateLimiter(max_requests=12, window_seconds=60, burst_size=1),
+        lease_ttl_seconds=3600,
         request_deadline_monotonic=remaining["deadline_monotonic"],
         lease_metadata={"dag_id": MEASUREMENT_DAG_ID, "run_id": portion_id, "task_id": "signal_probe_1393", "scope": "signal-experiment"},
     )
@@ -470,6 +496,37 @@ def _client(evidence: Path, remaining: dict, portion_id: str):
 
 def _now_utc():
     return datetime.now(timezone.utc)
+
+
+def _transport_attempts(stats):
+    return sum(count for status, count in stats["status_counts"].items()
+               if int(status) in (0, 407) or int(status) >= 500)
+
+
+def _restore_url_attempts(state, tasks):
+    """Keep limits per URL, including closing packets and older internal retries."""
+    keys_by_url = {}
+    for task in tasks:
+        keys_by_url.setdefault(task['url'], set()).add(task['key'])
+    observed = {url: {'responses': 0, 'transport': 0} for url in keys_by_url}
+    for record in state['attempt_records']:
+        counts = observed.get(record.get('url'))
+        if counts is None:
+            continue
+        status = record.get('status_code')
+        transport = (record.get('outcome_kind') == 'transport_error'
+                     or status in (0, 407) or (isinstance(status, int) and status >= 500))
+        counts['transport' if transport else 'responses'] += 1
+    previous = state.get('url_attempts', {})
+    restored = {}
+    for url, keys in keys_by_url.items():
+        restored[url] = {
+            'responses': max(observed[url]['responses'], previous.get(url, {}).get('responses', 0),
+                             sum(state['endpoint_tries'].get(key, 0) for key in keys)),
+            'transport': max(observed[url]['transport'], previous.get(url, {}).get('transport', 0),
+                             sum(state['transport_tries'].get(key, 0) for key in keys)),
+        }
+    state['url_attempts'] = restored
 
 
 def _parity_day_guard(state: dict, pending: int, now: datetime) -> None:
@@ -539,6 +596,22 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         state_path = evidence / "state.json"
         state = _read(state_path) if state_path.exists() else {"identity": identity, "results": {}, "tries": {}, "attempt_records": [], "failures": {}}
         state.setdefault("failures", {})
+        # Unknown historical attempts consume the stricter site-response limit.
+        # Keep total tries for existing readers and reserve each new attempt as
+        # a site response until the client proves it was a transport failure.
+        state.setdefault("transport_tries", {})
+        state.setdefault("endpoint_tries", {
+            key: max(0, count - state["transport_tries"].get(key, 0))
+            for key, count in state["tries"].items()
+        })
+        _restore_url_attempts(state, tasks)
+        urls = {task['key']: task['url'] for task in tasks}
+
+        def attempts_exhausted(key):
+            counts = state['url_attempts'][urls[key]]
+            return (counts['responses'] >= args.endpoint_attempts
+                    or counts['transport'] >= getattr(args, 'transport_attempts', 4))
+
         if state["identity"] != identity:
             raise ProbeGateError("observation input changed; create a new evidence directory")
         if args.mode in {"parity", "recheck"}:
@@ -561,15 +634,39 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                     continue
                 if monotonic() - started >= admitted_seconds - 120:
                     break
-                tries = state["tries"].get(task["key"], 0)
-                if tries >= args.endpoint_attempts:
+                if attempts_exhausted(task["key"]):
                     if args.mode == "cohort":
                         continue
                     raise ProbeGateError("endpoint attempt limit exhausted; no schema gate")
-                state["tries"][task["key"]] = tries + 1
+                counts = state['url_attempts'][task['url']]
+                response_remaining = args.endpoint_attempts - counts['responses']
+                transport_remaining = getattr(args, 'transport_attempts', 4) - counts['transport']
+                before = client.get_traffic_stats()
+                request_remaining = remaining["request_attempts"] - before["request_attempts"]
+                # Reserve an unknown attempt conservatively before I/O. The active
+                # experiment marker still forbids unaccounted crash recovery.
+                state['tries'][task['key']] = state['tries'].get(task['key'], 0) + 1
+                state['endpoint_tries'][task['key']] = state['endpoint_tries'].get(task['key'], 0) + 1
+                counts['responses'] += 1
                 _write(state_path, state)
-                outcome = client.fetch(task["url"], as_json=task["json"], max_attempts=1,
-                                       label=task["kind"], context={"cycle_id": portion_id, "scope_id": task["scope"]})
+                try:
+                    # A fetch may rotate internally. Bounding it by BOTH remaining
+                    # classes prevents any response ordering from overrunning a cap.
+                    outcome = client.fetch(task['url'], as_json=task['json'],
+                                           max_attempts=min(4, response_remaining, transport_remaining, request_remaining),
+                                           label=task['kind'], context={'cycle_id': portion_id, 'scope_id': task['scope']})
+                finally:
+                    after = client.get_traffic_stats()
+                    attempts = after['request_attempts'] - before['request_attempts']
+                    if attempts:
+                        transport = _transport_attempts(after) - _transport_attempts(before)
+                        responses = attempts - transport
+                        state['tries'][task['key']] += attempts - 1
+                        state['endpoint_tries'][task['key']] += responses - 1
+                        state['transport_tries'][task['key']] = state['transport_tries'].get(task['key'], 0) + transport
+                        counts['responses'] += responses - 1
+                        counts['transport'] += transport
+                    _write(state_path, state)
                 if not outcome.is_success or not outcome.raw_capture_id:
                     report["failure"] = {"key": task["key"], "status": outcome.status.value, "http_status": outcome.status_code}
                     state["failures"][task["key"]] = report["failure"]
@@ -582,7 +679,7 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                                                     "raw_fetched_at": outcome.raw_fetched_at}
                 _write(state_path, state)
             terminal = all(task["key"] in state["results"] or (
-                args.mode == "cohort" and state["tries"].get(task["key"], 0) >= args.endpoint_attempts
+                args.mode == "cohort" and attempts_exhausted(task["key"])
             ) for task in tasks)
             if terminal:
                 if args.mode == "probe":
@@ -672,6 +769,7 @@ def main():
     parser.add_argument("--max-bytes", type=int, default=MAX_BYTES)
     parser.add_argument("--portion-seconds", type=int, default=MAX_PORTION_SECONDS)
     parser.add_argument("--endpoint-attempts", type=int, default=2)
+    parser.add_argument("--transport-attempts", type=int, default=4)
     parser.add_argument("--player-target", type=int, default=1000)
     parser.add_argument("--min-scopes", type=int, default=20)
     parser.add_argument("--day1")
@@ -680,9 +778,11 @@ def main():
     parser.add_argument("--recheck-players", type=int, default=64)
     args = parser.parse_args()
     if not 1 <= args.max_attempts <= MAX_ATTEMPTS or not MIB < args.max_bytes <= MAX_BYTES:
-        parser.error("limits must fit the agreed 4600 attempts / 256 MiB experiment")
+        parser.error(f"limits must fit the agreed {MAX_ATTEMPTS} attempts / 256 MiB experiment")
     if not 121 <= args.portion_seconds <= MAX_PORTION_SECONDS or not 1 <= args.endpoint_attempts <= 2:
         parser.error("portion <=45 minutes and endpoint attempts <=2 required")
+    if not 1 <= args.transport_attempts <= 4:
+        parser.error("transport attempts must be 1..4")
     if args.mode == "parity" and not args.sample:
         parser.error("parity needs fresh cohort sample")
     if args.mode == "cohort" and not args.sample:
