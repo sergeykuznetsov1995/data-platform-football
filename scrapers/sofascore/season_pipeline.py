@@ -98,6 +98,8 @@ class SeasonPartitionPlan:
     referee_ids: tuple[str, ...]
     player_universe_evidence_gaps: tuple[str, ...] = ()
     placeholder_team_ids: tuple[str, ...] = ()
+    # None means an older caller did not supply schedule-status evidence.
+    finished_event_ids: Optional[tuple[str, ...]] = None
 
     @property
     def complete(self) -> bool:
@@ -160,11 +162,22 @@ class SeasonPartitionMaterialization:
             for key, status in self.endpoint_statuses.items()
         ) / len(self.endpoint_statuses)
 
+    @property
+    def match_phase_ready(self) -> bool:
+        deferred = set(self.deferred_keys)
+        return all(
+            status.terminal or key in deferred
+            or (key.endpoint == REFEREE_PROFILE_ENDPOINT
+                and status == ManifestStatus.SCHEMA_ERROR)
+            for key, status in self.endpoint_statuses.items()
+        )
+
 
 @dataclass(frozen=True)
 class _StoredPayload:
     payload: Optional[object]
     raw: Optional[RawPayloadRecord]
+    rejected_schema: bool = False
 
     @property
     def has_valid_json(self) -> bool:
@@ -692,6 +705,8 @@ def _load_stored_payload(
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if spec.raw_only and spec.key.endpoint == REFEREE_PROFILE_ENDPOINT:
+            return _StoredPayload(None, raw, rejected_schema=True)
         raise SeasonPlanningError(
             f"stored raw is not JSON for {spec.key.stable_id()}"
         ) from exc
@@ -702,6 +717,8 @@ def _load_stored_payload(
             f"stored schema validation failed for {spec.key.stable_id()}: {exc}"
         ) from exc
     if valid is False:
+        if spec.raw_only and spec.key.endpoint == REFEREE_PROFILE_ENDPOINT:
+            return _StoredPayload(None, raw, rejected_schema=True)
         raise SeasonPlanningError(f"stored schema rejected for {spec.key.stable_id()}")
     return _StoredPayload(payload, raw)
 
@@ -713,6 +730,10 @@ def _assert_terminal_raw_consistency(
 ) -> None:
     if manifest is None or not manifest.is_terminal:
         return
+    if stored.rejected_schema:
+        raise SeasonPlanningError(
+            f"terminal manifest points at rejected schema for {spec.key.stable_id()}"
+        )
     if manifest.status == ManifestStatus.NOT_SUPPORTED:
         return
     if stored.raw is None:
@@ -841,6 +862,7 @@ def plan_season_partition(
     pending: list[ManifestKey] = []
     missing_raw: list[ManifestKey] = []
     event_ids: list[str] = []
+    finished_event_ids: set[str] = set()
     scheduled_team_ids: set[str] = set()
     placeholder_team_ids: set[str] = set()
     embedded_referee_ids: set[str] = set()
@@ -906,7 +928,8 @@ def plan_season_partition(
         else:
             if not terminal:
                 append_key_once(pending, spec.key)
-            if not stored.has_valid_json and not accepted_without_json:
+            if (not stored.has_valid_json and not accepted_without_json
+                    and not stored.rejected_schema):
                 append_key_once(missing_raw, spec.key)
         return stored
 
@@ -928,6 +951,9 @@ def plan_season_partition(
                 event_id = _positive_id(event["id"], "event_id")
                 if event_id not in event_ids:
                     event_ids.append(event_id)
+                status = event.get("status")
+                if isinstance(status, Mapping) and status.get("type") == "finished":
+                    finished_event_ids.add(event_id)
                 for side in ("homeTeam", "awayTeam"):
                     try:
                         team = event[side]
@@ -1058,6 +1084,7 @@ def plan_season_partition(
         referee_ids=tuple(sorted(referee_ids, key=int)),
         player_universe_evidence_gaps=tuple(player_universe_evidence_gaps),
         placeholder_team_ids=tuple(sorted(placeholder_team_ids, key=int)),
+        finished_event_ids=tuple(sorted(finished_event_ids, key=int)),
     )
 
 
@@ -1322,7 +1349,25 @@ def materialize_season_partition(
         manifest = result.manifest
         statuses[spec.key] = manifest.status
         deferred = _is_deferred_materialization(spec, result)
-        if not manifest.is_terminal and not deferred:
+        rejected_referee = bool(
+            spec.raw_only and spec.key.endpoint == REFEREE_PROFILE_ENDPOINT
+            and manifest.status == ManifestStatus.SCHEMA_ERROR
+            # A manifest persistence failure can use the same status envelope;
+            # it must block publication even for an optional profile.
+            and manifest.error_type in {
+                "SchemaValidationError", "RawPayloadSchemaError",
+            }
+        )
+        if rejected_referee:
+            raw = result.raw
+            if (raw is None or raw.target != spec.raw_target
+                    or raw.content_hash != manifest.raw_content_hash
+                    or raw.blob_key != manifest.raw_blob_key
+                    or not 200 <= raw.http_status < 300 or raw.http_status == 204):
+                raise SeasonMaterializationError(
+                    "rejected referee profile has invalid raw lineage"
+                )
+        if not manifest.is_terminal and not deferred and not rejected_referee:
             raise SeasonMaterializationError(
                 f"endpoint {spec.key.endpoint} is nonterminal: {manifest.status.value}"
             )

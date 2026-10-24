@@ -303,7 +303,7 @@ def summarize_day(journal: dict, saved_day: dict, result_dir: str | Path) -> dic
                         last_end = a
                         for detail in history:
                             begin, end = _time(detail["started_at"]), _time(detail["finished_at"])
-                            if not (last_end <= begin <= end <= b) or detail["status"] not in ("success", "failed"):
+                            if not (last_end <= begin <= end <= b) or detail["status"] not in ("success", "failed", "waiting"):
                                 raise ValueError("invalid saved retry attempt timeline")
                             last_end = end
                         if history[-1]["status"] != status:
