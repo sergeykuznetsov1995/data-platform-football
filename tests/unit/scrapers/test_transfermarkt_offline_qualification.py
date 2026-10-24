@@ -90,8 +90,8 @@ def create_fixture(root, *, day2_transfer_to=None):
             tasks.append(item)
             results[label] = {"raw_capture_id": identity}
 
-        for start in range(0, len(ids), 300):
-            selected = ids[start:start + 300]
+        for start in range(0, len(ids), 100):
+            selected = ids[start:start + 100]
             body = packet(selected)
             for player in body["data"]:
                 player["clubAssignments"][0]["clubId"] = str(100 + (int(player["id"]) - 1) // 50)

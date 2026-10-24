@@ -347,6 +347,8 @@ class FetchOutcome(Generic[T]):
     raw_fetched_at: Optional[str] = None
     raw_attempt_envelope_id: Optional[str] = None
     raw_attempt_envelope_ids: tuple[str, ...] = ()
+    # Gateway-generated HTTP errors retain their HTTP status and upstream class.
+    proxy_upstream_status: Optional[str] = None
 
     @property
     def is_success(self) -> bool:
@@ -393,6 +395,7 @@ class FetchOutcome(Generic[T]):
             raw_fetched_at=self.raw_fetched_at,
             raw_attempt_envelope_id=self.raw_attempt_envelope_id,
             raw_attempt_envelope_ids=self.raw_attempt_envelope_ids,
+            proxy_upstream_status=self.proxy_upstream_status,
         )
 
     def as_checkpoint(self) -> Dict[str, Any]:
@@ -421,6 +424,7 @@ class FetchOutcome(Generic[T]):
             "raw_fetched_at": self.raw_fetched_at,
             "raw_attempt_envelope_id": self.raw_attempt_envelope_id,
             "raw_attempt_envelope_ids": list(self.raw_attempt_envelope_ids),
+            "proxy_upstream_status": self.proxy_upstream_status,
         }
 
     @classmethod
@@ -521,6 +525,7 @@ class FetchOutcome(Generic[T]):
             ),
             raw_attempt_envelope_id=last_envelope_id,
             raw_attempt_envelope_ids=envelope_ids,
+            proxy_upstream_status=value.get("proxy_upstream_status"),
         )
 
     def as_cache_hit(self, *, duration_seconds: float) -> "FetchOutcome[T]":
