@@ -202,6 +202,28 @@ def test_checked_in_runtime_evidence_matches_generator():
 
 
 @pytest.mark.unit
+def test_sofascore_chunk_dependency_changes_whoscored_runtime_evidence(tmp_path):
+    """#1730: importing the shared planner must bind its new local module."""
+    dependency = evidence.PurePosixPath("scrapers/sofascore/season_chunks.py")
+    source = (ROOT / evidence.SOURCE_RELATIVE).read_bytes()
+    paths = set(evidence._expected_runtime_files(source)) | {dependency}
+    for relative in paths:
+        parent = tmp_path
+        for part in relative.parts[:-1]:
+            parent /= part
+            parent.mkdir(mode=0o700, exist_ok=True)
+        descriptor = os.open(tmp_path / relative, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write((ROOT / relative).read_bytes())
+    before = evidence.render_evidence(tmp_path)
+    with (tmp_path / dependency).open("ab") as stream:
+        stream.write(b"\n# Changed dependency: consumers need new runtime evidence.\n")
+    after = evidence.render_evidence(tmp_path)
+    assert before != after
+    assert dependency.as_posix() in json.loads(before[evidence.LOCK_RELATIVE])["files"]
+
+
+@pytest.mark.unit
 def test_command_refuses_a_nonisolated_interpreter():
     completed = subprocess.run(
         [

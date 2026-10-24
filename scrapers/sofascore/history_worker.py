@@ -136,6 +136,10 @@ def scope_outcome(env, exit_code):
                      "canonical_season": env["SOFASCORE_CANONICAL_SEASON"]}
             if waiting_for_finished_matches(result, scope):
                 return {"status": "waiting", "reason": result["waiting_reason"]}
+        if exit_code == 0 and result.get("status") == "partial":
+            from dags.utils.sofascore_red_share import season_continuation_proof
+            proof = season_continuation_proof(result, tournament_id=tournament, season_id=season)
+            return {"status": "partial", "partial": proof}
         reason, requests = state.read_scope_outcome(path)
         return {"status": "failed", "reason": reason or "scope cycle failed", "source_requests": requests}
     except (OSError, ValueError, TypeError) as exc:
@@ -209,7 +213,7 @@ def run_slot(*, checkpoint, campaign_id, run_id, slot, state_path, failures_path
                     terminated = isinstance(exc, KeyboardInterrupt)
                     outcome = {"status": "failed", "reason": f"scope process: {type(exc).__name__}: {exc}", "source_requests": None}
                 item = controller.read_summary(checkpoint, campaign_id)["run"]["items"][str(index)]
-                if terminated or outcome["status"] in {"success", "waiting"} or item["attempts"] >= 2 or not admitted() or timeout <= 120:
+                if terminated or outcome["status"] in {"success", "partial", "waiting"} or item["attempts"] >= 2 or not admitted() or timeout <= 120:
                     break
                 try:
                     sleep(120)

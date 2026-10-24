@@ -23,6 +23,7 @@ carries in ``AIRFLOW__DATABASE__SQL_ALCHEMY_CONN``.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import time
@@ -66,6 +67,7 @@ def bronze_writer_lock(
     *,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    _lock_key: int = WRITER_LOCK_KEY,
 ) -> Iterator[bool]:
     """Hold the SofaScore Bronze writer lock for the duration of the block.
 
@@ -97,7 +99,7 @@ def bronze_writer_lock(
         started = clock()
         while True:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT pg_try_advisory_lock(%s)", (WRITER_LOCK_KEY,))
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", (_lock_key,))
                 acquired = bool(cursor.fetchone()[0])
             waited = clock() - started
             if acquired:
@@ -109,7 +111,7 @@ def bronze_writer_lock(
             if waited >= timeout:
                 raise WriterLockTimeout(
                     "another SofaScore writer held the bronze writer lock "
-                    f"(key {WRITER_LOCK_KEY}) for {timeout}s; giving up"
+                    f"(key {_lock_key}) for {timeout}s; giving up"
                 )
             if not waited:
                 logger.warning(
@@ -121,3 +123,29 @@ def bronze_writer_lock(
         # Closing the session releases the advisory lock; an explicit UNLOCK
         # would not run when the process dies.
         connection.close()
+
+
+@contextmanager
+def season_capture_lock(
+    tournament_id: str | int,
+    season_id: str | int,
+    freshness_key: str,
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Iterator[bool]:
+    """Serialize check→capture→raw/manifest flush for one season freshness.
+
+    Unlike the Bronze writer key, this namespace preserves parallel capture
+    of other seasons. PostgreSQL releases the session lock on process death;
+    no new shared filesystem mount or live lockfile migration is needed.
+    """
+    identity = ["sofascore-season-capture-v1", str(tournament_id), str(season_id), freshness_key]
+    if not all(isinstance(value, str) and value.strip() for value in identity):
+        raise ValueError("season capture lock identity must not be empty")
+    key = int.from_bytes(hashlib.blake2b(
+        json.dumps(identity, separators=(",", ":")).encode(), digest_size=8,
+    ).digest(), "big", signed=True)
+    with bronze_writer_lock(environ, sleep=sleep, clock=clock, _lock_key=key) as acquired:
+        yield acquired

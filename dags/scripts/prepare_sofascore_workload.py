@@ -653,6 +653,7 @@ def prepare_workload_plan(
                         source_season.season_id,
                         shape,
                         pending=bool(season_plan.missing_raw_keys) or force_replace,
+                        schedule_chunk=getattr(season_plan, "schedule_chunk", None),
                     ),
                 )
             )
