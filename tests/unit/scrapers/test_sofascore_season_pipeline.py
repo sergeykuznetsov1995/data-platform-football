@@ -642,8 +642,9 @@ def test_nonterminal_repeated_or_empty_page_stops_without_extending_plan(tmp_pat
         plan_season_partition(store, InMemoryManifestStore(), **_common())
 
 
+@pytest.mark.parametrize("profile_case", [None, "json", "identity", "storage", "lineage"])
 @pytest.mark.parametrize("flush_failure", [False, True])
-def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, monkeypatch, flush_failure):
+def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, monkeypatch, flush_failure, profile_case):
     from dags.scripts import run_sofascore_scraper as runner
     from scrapers.sofascore.manifest import BatchingManifestStore
     from scrapers.sofascore.season_chunks import encode_season_chunk_unit
@@ -651,9 +652,17 @@ def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, mo
 
     store = _raw_store(tmp_path)
     chunk = plan_season_partition(store, InMemoryManifestStore(), **_common()).schedule_chunk
+    profile = build_referee_profile_spec(referee_id=791840, **_common())
+    if profile_case:
+        body = {"json": b'{"referee":', "lineage": b'{"referee":',
+                "identity": b'{"referee":{"id":789719}}',
+                "storage": b'{"referee":{"id":791840}}'}[profile_case]
+        _seed_raw(store, profile, body)
     for page in range(49):
-        _seed_json(store, build_schedule_page_spec(direction="last", page=page, **_common()),
-                   _schedule_payload([14_000_000 + page], has_next=True))
+        payload = _schedule_payload([14_000_000 + page], has_next=True)
+        if page == 0 and profile_case:
+            payload["events"][0]["referee"] = {"id": 791840, "name": "R"}
+        _seed_json(store, build_schedule_page_spec(direction="last", page=page, **_common()), payload)
     _seed_json(store, build_schedule_page_spec(direction="next", page=0, **_common()),
                _schedule_payload([], has_next=False))
     for spec in _specs():
@@ -662,6 +671,20 @@ def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, mo
     engine, transport = _engine(tmp_path, raw_store=store, sink=DeferredCaptureSink())
     durable = InMemoryManifestStore()
     buffered = BatchingManifestStore(durable, max_pending=200)
+    if profile_case == "storage":
+        original_upsert = buffered.upsert
+        def upsert(record):
+            if record.key == profile.key and record.status == ManifestStatus.SUCCESS:
+                raise OSError("referee manifest storage unavailable")
+            return original_upsert(record)
+        monkeypatch.setattr(buffered, "upsert", upsert)
+    if profile_case == "lineage":
+        original_replay = __import__("scrapers.sofascore.season_pipeline", fromlist=["replay_season_specs"]).replay_season_specs
+        def replay(engine, specs):
+            return [replace(result, raw=replace(result.raw, content_hash="wrong"))
+                    if result.manifest.key == profile.key else result
+                    for result in original_replay(engine, specs)]
+        monkeypatch.setattr("scrapers.sofascore.season_pipeline.replay_season_specs", replay)
     engine.manifest_store = buffered
     runtime = CaptureRuntime(engine=engine, raw_store=store, manifest_store=buffered)
     monkeypatch.setattr(runner, "_write_results", lambda path, payload: Path(path).write_text(json.dumps(payload)))
@@ -684,10 +707,13 @@ def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, mo
     assert transport.calls == 0
     publish.assert_not_called()
     finalize.assert_not_called()
-    if flush_failure:
+    if flush_failure or profile_case in {"storage", "lineage"}:
         assert rc == 1 and "partial" not in result
     else:
-        assert rc == 0
+        assert rc == 0, result.get("errors")
+        if profile_case:
+            assert durable.get(profile.key).status == ManifestStatus.SCHEMA_ERROR
+            assert store.load_bytes(profile.raw_target)[0] == body
         assert result["partial"]["continuation"] == {"last": 49, "next": None}
         assert result["partial"]["raw_manifest_committed"] is True
         assert result["manifest_committed"] is False

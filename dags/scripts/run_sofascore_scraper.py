@@ -2884,13 +2884,27 @@ def _run_season_capture_engine(
             unavailable = set(plan.missing_raw_keys) | set(plan.deferred_schedule_keys)
             retained = [spec for spec in plan.specs if spec.key not in unavailable]
             repaired = replay_season_specs(capture_runtime.engine, retained)
+            retained_by_key = {spec.key: spec for spec in retained}
             for result in repaired:
                 record = result.manifest
+                spec = retained_by_key[record.key]
+                rejected_referee = (
+                    spec.raw_only and spec.key.endpoint == "referee_profile"
+                    and record.status.value == "schema_error"
+                    and record.error_type in {"SchemaValidationError", "RawPayloadSchemaError"}
+                )
+                if rejected_referee:
+                    raw = result.raw
+                    if (raw is None or raw.target != spec.raw_target
+                            or raw.content_hash != record.raw_content_hash
+                            or raw.blob_key != record.raw_blob_key
+                            or not 200 <= raw.http_status < 300 or raw.http_status == 204):
+                        raise RuntimeError("season chunk rejected referee has invalid raw lineage")
                 if not record.is_terminal and not (
                     record.status.value == "retryable_failure"
                     and record.error_type == "DeferredMaterialization"
                     and result.raw is not None
-                ):
+                ) and not rejected_referee:
                     raise RuntimeError("season chunk raw replay has an unresolved endpoint")
             _flush_manifest_store(capture_runtime.manifest_store)
             # Never report healthy progress after a capture stopped inside
