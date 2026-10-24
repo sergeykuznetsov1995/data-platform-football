@@ -664,7 +664,7 @@ def test_cli_expired_job_writes_reviewable_report_without_calling_collector(tmp_
     assert json.loads(output.read_text())['status'] == 'deadline'
 
 
-def test_player_packets_300_and_exact_partial_cursor_resume_in_same_signal_cycle(offline):
+def test_player_packets_100_and_exact_partial_cursor_resume_in_same_signal_cycle(offline):
     offline.club_ids = ('10',)
     offline.squad_players['10'] = [str(value) for value in range(101, 402)]
     offline.partial_careers = True
@@ -674,13 +674,13 @@ def test_player_packets_300_and_exact_partial_cursor_resume_in_same_signal_cycle
     offline.clock.advance(21 * 3600)
     offline.run('first-packet')
     data = next(iter(offline.state()['scopes'].values()))
-    assert data['player_check_progress']['offset'] == 300
+    assert data['player_check_progress']['offset'] == 100
     first_urls = [url for _, url in offline.calls if '/players?' in url]
-    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in first_urls] == [300]
+    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in first_urls] == [100]
     offline.calls.clear()
     offline.run('second-packet')
     urls = [url for _, url in offline.calls if '/players?' in url]
-    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in urls] == [1]
+    assert [len(parse_qs(urlsplit(url).query)['ids[]']) for url in urls] == [100, 100, 1]
     assert 'player_check_progress' not in next(iter(offline.state()['scopes'].values()))
     assert not any('/kader/' in url for _, url in offline.calls)
 
@@ -951,6 +951,170 @@ def test_warm_unpriced_player_with_old_value_history_does_not_redownload_history
     offline.run('warm-unpriced-continue')
     assert offline.careers == []
     assert not any('/kader/' in url for _, url in offline.calls)
+
+
+def test_zero_value_baseline_and_absent_signal_do_not_refetch(offline):
+    offline.squad_values['10'] = '-'
+    offline.player_values['110'] = 0
+    offline.run('cold')
+    offline.calls.clear()
+    offline.careers.clear()
+    offline.clock.advance(21 * 3600)
+    offline.run('zero-baseline')
+    assert not any('/kader/' in url for _, url in offline.calls)
+    assert offline.careers == []
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['signals']['player:110']['result'] == 'baseline_verified'
+    offline.unpriced_players.add('110')
+    offline.calls.clear()
+    offline.clock.advance(24 * 3600)
+    offline.run('absent-after-zero')
+    assert not any('/kader/' in url for _, url in offline.calls)
+    assert offline.careers == []
+
+
+def test_zero_value_does_not_block_ack_of_real_roster_change(offline):
+    offline.run('cold')
+    offline.run('baseline')
+    offline.squad_values['10'] = '-'
+    offline.player_values['110'] = 0
+    offline.clock.advance(21 * 3600)
+    offline.run('becomes-unpriced')
+    data = next(iter(offline.state()['scopes'].values()))
+    assert data['signals']['player:110']['status'] == 'applied'
+    assert data['cursor']['resume_json'] == '{}'
+
+
+def test_unpriced_signature_equivalence_keeps_positive_values_and_dates_strict():
+    from scrapers.transfermarkt.tmapi import parse_player_signals
+    zero = parse_player_signals(packet(['110'], {'110': 0}), expected_ids=['110'])['110']
+    absent_packet = packet(['110'])
+    absent_packet['data'][0]['marketValueDetails'] = None
+    absent = parse_player_signals(absent_packet, expected_ids=['110'])['110']
+    positive = parse_player_signals(packet(['110'], {'110': 100000}), expected_ids=['110'])['110']
+    assert zero.signature == absent.signature
+    assert zero.signature != positive.signature
+    assert replace(zero, market_value_date='2026-10-09').signature != zero.signature
+
+
+@pytest.fixture
+def signal_ops(monkeypatch):
+    """Execute the runner's signal MERGEs, including their actual SQL guards."""
+    import duckdb
+    from dags.utils.transfermarkt_current_state import build_current_state_tables, SIGNALS_TABLE
+    connection = duckdb.connect(':memory:')
+    connection.execute("ATTACH ':memory:' AS iceberg")
+    connection.execute('CREATE SCHEMA iceberg.ops')
+    connection.execute(build_current_state_tables()[0].split(' WITH (')[0])
+    original_sql = current._sql
+
+    def execute(scraper, statement, *args, **kwargs):
+        if statement.startswith(f'MERGE INTO {SIGNALS_TABLE} '):
+            connection.execute(statement)
+        if scraper is not None:
+            return original_sql(scraper, statement, *args, **kwargs)
+
+    monkeypatch.setattr(current, '_sql', execute)
+    yield connection
+    connection.close()
+
+
+def test_legacy_zero_signature_migration_preserves_applied_proof_and_replays_old_fact(offline, signal_ops):
+    offline.squad_values['10'] = '-'
+    offline.player_values['110'] = 0
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    saved = offline.state()
+    data = next(iter(saved['scopes'].values()))
+    old = current.tmapi.PlayerSignal(**data['player_values']['110'])
+    signal_state = data['signals']['player:110']
+    signal_state['observation']['signature'] = old.legacy_signature
+    signal_state.update(applied_signature=old.legacy_signature, result='legacy-proof')
+    signal_ops.execute("UPDATE iceberg.ops.transfermarkt_current_signals_v1 SET "
+        "observed_signature = ?, applied_signature = ?, result = 'legacy-proof' "
+        "WHERE entity = 'player' AND entity_id = '110'", [old.legacy_signature, old.legacy_signature])
+    data.setdefault('player_roster_applied', {})['110'] = old.legacy_signature
+    data['cursor']['players_checked_at'] = None
+    offline.write_state(saved)
+    offline.calls.clear()
+    offline.careers.clear()
+    # Keep the cached zero packet, but mark its fact with the legacy signature.
+    for path in (offline.root / 'state').rglob('*.json'):
+        body = json.loads(path.read_text())
+        if '110' in body.get('facts', {}):
+            body['facts']['110']['signature'] = old.legacy_signature
+            path.write_text(json.dumps(body))
+    offline.run('legacy-replay')
+    result = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
+    assert result['observation']['signature'] == old.signature
+    assert result['applied_signature'] == old.signature
+    assert result['bronze_manifest'] == signal_state['bronze_manifest']
+    assert result['committed_at'] == signal_state['committed_at']
+    assert result['first_detected_at'] == signal_state['first_detected_at']
+    assert result['status'] == 'applied'
+    assert result['result'] == 'legacy-proof'
+    signal_ops.execute("SELECT * FROM iceberg.ops.transfermarkt_current_signals_v1 "
+                       "WHERE entity = 'player' AND entity_id = '110'")
+    ops = dict(zip([column[0] for column in signal_ops.description], signal_ops.fetchone()))
+    assert ops['observed_signature'] == old.signature
+    assert ops['applied_signature'] == old.signature
+    assert ops['last_checked_at'].isoformat() == result['observation']['checked_at'].removesuffix('+00:00')
+    assert ops['bronze_manifest'] == signal_state['bronze_manifest']
+    assert ops['committed_at'].isoformat() == signal_state['committed_at'].removesuffix('+00:00')
+    assert ops['first_detected_at'].isoformat() == signal_state['first_detected_at'].removesuffix('+00:00')
+    assert ops['status'] == 'applied' and ops['result'] == 'legacy-proof'
+    assert offline.careers == []
+    assert not any('/kader/' in url for _, url in offline.calls)
+
+
+@pytest.mark.parametrize('drift', ['signature', 'newer', 'proof', 'failed', 'version', 'missing'])
+def test_legacy_zero_ops_migration_cannot_overwrite_concurrent_state(offline, signal_ops, drift):
+    from dataclasses import replace
+    old = current.tmapi.parse_player_signals(packet(['110'], {'110': 0}), expected_ids=['110'])['110']
+    stamp = datetime(2026, 10, 9, 10, tzinfo=timezone.utc)
+    observation = current.SignalObservation('scope', 'player', '110', old.legacy_signature, stamp,
+        current.CURRENT_POLICY_VERSION, 'raw', stamp, current.tmapi.players_url(['110']), 'a' * 64)
+    before = current.SignalState(observation=observation, status='applied', result='old-proof',
+        bronze_manifest='old-bronze', committed_at=stamp, applied_signature=old.legacy_signature)
+    target = before
+    if drift == 'signature':
+        target = replace(before, observation=replace(observation, signature='b' * 64), applied_signature='b' * 64)
+    elif drift == 'newer':
+        target = replace(before, observation=replace(observation, checked_at=stamp + timedelta(seconds=1)))
+    elif drift == 'proof':
+        target = replace(before, bronze_manifest='new-bronze')
+    elif drift == 'failed':
+        target = replace(before, status='failed', result='unfinished')
+    elif drift == 'version':
+        target = replace(before, observation=replace(observation, signal_version='new-version'))
+    if drift != 'missing':
+        signal_ops.execute(current.build_signal_merge(target))
+    query = 'SELECT * FROM iceberg.ops.transfermarkt_current_signals_v1'
+    rows_before = signal_ops.execute(query).fetchall()
+    scope = SimpleNamespace(signals={'player:110': before}, data={}, scraper=None)
+    current._Scope._normalize_player_signature(scope, '110', old.as_dict())
+    assert signal_ops.execute(query).fetchall() == rows_before
+
+
+@pytest.mark.parametrize('status', ['pending', 'failed'])
+def test_legacy_zero_migration_does_not_ack_or_reset_unfinished_work(status):
+    old = current.tmapi.parse_player_signals(packet(['110'], {'110': 0}), expected_ids=['110'])['110']
+    stamp = datetime(2026, 10, 9, 10, tzinfo=timezone.utc)
+    observation = current.SignalObservation('scope', 'player', '110', old.legacy_signature, stamp,
+        current.CURRENT_POLICY_VERSION, 'raw', stamp, current.tmapi.players_url(['110']), 'a' * 64)
+    before = current.SignalState(observation=observation, status=status, result='unfinished',
+        bronze_manifest='old-bronze', committed_at=stamp, applied_signature='b' * 64)
+    scope = SimpleNamespace(signals={'player:110': before}, data={})
+    current._Scope._normalize_player_signature(scope, '110', old.as_dict())
+    after = scope.signals['player:110']
+    assert after.observation.signature == old.signature
+    assert after.status == before.status
+    assert after.result == before.result
+    assert after.first_detected_at == before.first_detected_at
+    assert after.applied_signature == before.applied_signature
+    assert after.bronze_manifest == before.bronze_manifest
+    assert after.committed_at == before.committed_at
 
 
 def test_initial_empty_injury_signal_has_explicit_raw_durable_ack(offline):

@@ -204,6 +204,14 @@ def preload_manifest_scope(
     return preload(source_tournament_id, source_season_id)
 
 
+def refresh_manifest_scope(store: object, source_tournament_id, source_season_id) -> int:
+    """Refresh a scope after capture-lock acquisition without losing writes."""
+    refresh = getattr(store, "refresh_scope", None)
+    if callable(refresh):
+        return refresh(source_tournament_id, source_season_id)
+    return preload_manifest_scope(store, source_tournament_id, source_season_id)
+
+
 class BatchingManifestStore:
     """Write-behind buffer bounding Iceberg snapshot growth (#1003).
 
@@ -248,6 +256,11 @@ class BatchingManifestStore:
             records.update({key: record for key, record in self._pending.items()
                             if key.as_tuple()[:2] == scope})
             return list(records.values())
+
+    def refresh_scope(self, source_tournament_id, source_season_id) -> int:
+        with self._lock:
+            self._flush_locked()
+            return refresh_manifest_scope(self.inner, source_tournament_id, source_season_id)
 
     def get(self, key: ManifestKey) -> Optional[EndpointManifest]:
         with self._lock:

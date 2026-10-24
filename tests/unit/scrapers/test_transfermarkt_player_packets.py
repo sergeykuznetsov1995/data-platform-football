@@ -9,7 +9,7 @@ from scrapers.transfermarkt.tmapi import players_url, parse_player_signals, Tmap
 
 
 def test_full_packet_preserves_requested_identity():
-    ids = [str(i) for i in range(1, 301)]
+    ids = [str(i) for i in range(1, 101)]
     url = urlsplit(players_url(ids))
     assert url.hostname == 'tmapi.transfermarkt.technology'
     assert url.path == '/players'
@@ -17,7 +17,7 @@ def test_full_packet_preserves_requested_identity():
 
 
 @pytest.mark.parametrize('ids', [[], ['1', '1'], ['0'], ['-1'], ['１２'],
-                               ['1&token=secret'], list(range(1, 302))])
+                               ['1&token=secret'], list(range(1, 102)), list(range(1, 301))])
 def test_packet_rejects_invalid_identity(ids):
     with pytest.raises(ValueError, match='unique positive'):
         players_url(ids)
@@ -72,3 +72,16 @@ def test_renewal_and_same_amount_new_date_change_signature():
     redated = deepcopy(packet)
     redated['data'][0]['marketValueDetails']['current']['determined'] = '2026-10-08'
     assert parse_player_signals(redated, expected_ids=[row['id']])[row['id']].signature != first.signature
+
+
+@pytest.mark.parametrize('start', [100000, 1000000])
+def test_hundred_realistic_ids_fit_waf_query_limit(start):
+    ids = [str(value) for value in range(start, start + 100)]
+    query = urlsplit(players_url(ids)).query
+    assert len(query.encode('ascii')) <= 2000
+    assert parse_qsl(query) == [('ids[]', value) for value in ids]
+
+
+def test_query_byte_limit_rejects_oversized_ids_before_request():
+    with pytest.raises(ValueError, match='2000'):
+        players_url([str(10000000000 + value) for value in range(100)])

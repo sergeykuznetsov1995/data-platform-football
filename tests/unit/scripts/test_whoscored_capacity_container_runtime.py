@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import io
 import importlib.util
+from itertools import count
 import os
 from pathlib import Path
 import sys
@@ -648,15 +649,21 @@ def test_barrier_resource_sample_can_stop_before_atomic_release(
     assert release_writes == []
 
 
+@pytest.mark.parametrize("clock_step", (0.0, 0.002))
 def test_normal_exit_during_stats_is_reconciled_with_fresh_exact_inspect(
-    binds: tuple[Path, Path],
+    binds: tuple[Path, Path], clock_step: float,
 ) -> None:
-    # Two four-worker samples happen before release; finish during the third.
+    # Startup may produce extra samples; finish only after the release gate.
     fake = FakeDocker(
-        complete_after_stats_call=3,
         omit_completed_stats_rows=True,
     )
     runtime_root, source_circuit = binds
+    release_stats = []
+
+    def finish_after_release():
+        release_stats.append(fake.stats_calls)
+        fake.complete_after_stats_call = fake.stats_calls + 1
+
     samples = []
     try:
         outcome = runtime.run_capacity_containers(
@@ -666,7 +673,7 @@ def test_normal_exit_during_stats_is_reconciled_with_fresh_exact_inspect(
             workers=_workers(),
             runtime_root=runtime_root,
             source_circuit_root=source_circuit,
-            before_release=lambda: None,
+            before_release=finish_after_release,
             on_sample=samples.append,
             stop_requested=lambda: False,
             deadline_reached=lambda: False,
@@ -674,24 +681,31 @@ def test_normal_exit_during_stats_is_reconciled_with_fresh_exact_inspect(
             runner=fake,
             attach_factory=fake.attach,
             sample_interval_seconds=0.001,
+            monotonic=count(0.0, clock_step).__next__,
         )
     finally:
         fake.close()
 
     assert outcome.status == "completed"
-    assert fake.stats_calls == 3
+    assert fake.stats_calls == release_stats[0] + 1
     assert all(not item.running for item in samples[-1].containers)
 
 
+@pytest.mark.parametrize("clock_step", (0.0, 0.002))
 def test_stats_accepts_legacy_short_container_display_id(
-    binds: tuple[Path, Path],
+    binds: tuple[Path, Path], clock_step: float,
 ) -> None:
     fake = FakeDocker(
-        complete_after_stats_call=3,
         omit_completed_stats_rows=True,
         stats_container_full_id=False,
     )
     runtime_root, source_circuit = binds
+    release_stats = []
+
+    def finish_after_release():
+        release_stats.append(fake.stats_calls)
+        fake.complete_after_stats_call = fake.stats_calls + 1
+
     try:
         outcome = runtime.run_capacity_containers(
             scheduler_image_id=IMAGE_ID,
@@ -700,7 +714,7 @@ def test_stats_accepts_legacy_short_container_display_id(
             workers=_workers(),
             runtime_root=runtime_root,
             source_circuit_root=source_circuit,
-            before_release=lambda: None,
+            before_release=finish_after_release,
             on_sample=lambda _: None,
             stop_requested=lambda: False,
             deadline_reached=lambda: False,
@@ -708,11 +722,12 @@ def test_stats_accepts_legacy_short_container_display_id(
             runner=fake,
             attach_factory=fake.attach,
             sample_interval_seconds=0.001,
+            monotonic=count(0.0, clock_step).__next__,
         )
     finally:
         fake.close()
 
-    assert outcome.status == "completed"
+    assert outcome.status == "completed", outcome.reason
     assert outcome.cleanup_complete is True
 
 

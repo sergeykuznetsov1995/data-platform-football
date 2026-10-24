@@ -82,6 +82,38 @@ UNIT_UNSHARE_SHA256 = frozenset(
 )
 
 
+@pytest.fixture(autouse=True)
+def protected_capacity_sources(monkeypatch, protected_whoscored_checkout, tmp_path_factory):
+    # Keep every real admission check; only relocate exact source bytes.
+    original = capacity.REPO_ROOT
+
+    def relocate(value):
+        if isinstance(value, Path) and value.is_relative_to(original):
+            return protected_whoscored_checkout / value.relative_to(original)
+        if isinstance(value, tuple):
+            return tuple(relocate(item) for item in value)
+        return value
+
+    for name, value in vars(capacity).copy().items():
+        replacement = relocate(value)
+        if replacement != value:
+            monkeypatch.setattr(capacity, name, replacement)
+
+    # Deployment bridge tests must never inspect the live .env/secret files.
+    environment_root = tmp_path_factory.mktemp("whoscored-compose-env")
+    environment_files = tuple(
+        environment_root / name for name in ("platform.env", "runtime.env", "proxy.env")
+    )
+    for path in environment_files:
+        path.write_text("SAFE_TEST_VALUE=1\n")
+        path.chmod(0o600)
+    monkeypatch.setattr(capacity, "PRODUCTION_COMPOSE_ENV_FILES", environment_files)
+    monkeypatch.setattr(
+        capacity, "_LOCAL_GIT_ENVIRONMENT",
+        {**capacity._LOCAL_GIT_ENVIRONMENT, "GIT_OPTIONAL_LOCKS": "0"},
+    )
+
+
 @pytest.fixture
 def unit_namespace_helper(monkeypatch, tmp_path):
     """Admit pinned test bytes, retaining real namespace and metadata checks."""

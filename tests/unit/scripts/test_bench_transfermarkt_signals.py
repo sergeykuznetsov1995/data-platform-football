@@ -12,6 +12,292 @@ from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from dags.scripts import bench_transfermarkt_signals as bench
 
 
+def qualification_args(tmp_path, **changes):
+    return args(tmp_path, qualification_run=True, **changes)
+
+
+def test_approved_ceiling_8244_requires_qualification_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['bench', '--mode', 'probe', '--ids', '8198',
+        '--evidence-dir', str(tmp_path), '--max-attempts', '8244', '--qualification-run'])
+    seen = []
+    monkeypatch.setattr(bench, 'run', lambda options: seen.append(options) or 0)
+    assert bench.main() == 0
+    assert seen[0].max_attempts == 8244 and seen[0].qualification_run
+    monkeypatch.setattr(sys, 'argv', ['bench', '--mode', 'probe', '--ids', '8198',
+        '--evidence-dir', str(tmp_path), '--max-attempts', '8244'])
+    with pytest.raises(SystemExit):
+        bench.main()
+
+
+@pytest.mark.parametrize('mode', ['probe', 'cohort', 'parity', 'recheck'])
+def test_qualification_first_405_stops_whole_pair_and_survives_restart(tmp_path, monkeypatch, mode):
+    url = bench.player_url(['8198'])
+    tasks = [dict(key='first', kind='players', scope='scope', url=url, json=True),
+             dict(key='next', kind='players', scope='scope', url=bench.player_url(['1']), json=True)]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    monkeypatch.setattr(bench, 'recheck_sample', lambda *a: {'selected_changed_ids': ['8198']})
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    options = qualification_args(tmp_path, mode=mode, ids='8198', sample=str(sample),
+                                 day1=str(sample), day2=str(sample), recheck_players=64)
+    build, factory = transport_factory(tmp_path, responses=iter([(405, b'Human Verification'), (200, probe_body(url))]))
+    assert bench.run(options, client_factory=build) == 2
+    assert factory.calls == [url]
+    report = json.loads((tmp_path/'day1/report.json').read_text())
+    assert report['stop_reason'] == 'captcha'
+    assert report['experiment_totals']['request_attempts'] == 1
+    ledger = json.loads((tmp_path/'signal-probe-ledger.json').read_text())
+    assert not ledger['active']
+    options.evidence_dir = str(tmp_path/'different-directory')
+    # Dropping the flag or changing the day must not bypass the stored stop.
+    options.qualification_run = False
+    assert bench.run(options, client_factory=lambda *a: pytest.fail('stopped pair opened a client'),
+                     now_fn=lambda: datetime(2026, 10, 9, 12, tzinfo=timezone.utc)) == 2
+
+
+def test_qualification_aws_captcha_under_http200_is_not_a_roster_success(tmp_path, monkeypatch):
+    url = 'https://www.transfermarkt.com/manchester-city/kader/verein/281/plus/1'
+    tasks = [dict(key='squad', kind='squad', scope='GB1/2026', url=url, json=False)]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    body = b'<title>Human Verification</title><script src="https://abc.captcha.awswaf.com/a.js"></script>'
+    build, factory = transport_factory(tmp_path, responses=iter([(200, body)]))
+    assert bench.run(qualification_args(tmp_path, mode='cohort', sample=str(sample)), client_factory=build) == 2
+    assert factory.calls == [url]
+    state = json.loads((tmp_path/'day1/state.json').read_text())
+    assert state['results'] == {}
+    assert json.loads((tmp_path/'day1/report.json').read_text())['stop_reason'] == 'captcha'
+
+
+def test_qualification_url_count_is_shared_across_directories_and_resets_only_next_day(tmp_path):
+    for name in ['first-stage', 'second-stage']:
+        build, factory = transport_factory(tmp_path)
+        assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/name)), client_factory=build) == 0
+        assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'day2')), client_factory=build,
+                     now_fn=lambda: datetime(2026, 10, 9, 12, tzinfo=timezone.utc)) == 0
+    assert len(factory.calls) == 1
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'third-stage')), client_factory=build) == 2
+    assert factory.calls == []
+
+
+def test_qualification_reserves_the_closing_response_before_retry(tmp_path, monkeypatch):
+    url = bench.player_url(['8198'])
+    tasks = [dict(key=k, kind='players', scope='scope', url=url, json=True) for k in ['initial', 'closing']]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    options = qualification_args(tmp_path, mode='parity', sample=str(sample))
+    build, factory = transport_factory(tmp_path, responses=iter([(404, b'missing'), (200, probe_body(url))]))
+    assert bench.run(options, client_factory=build) == 3
+    assert factory.calls == [url]
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(options, client_factory=build) == 2
+    assert factory.calls == []
+
+
+def test_qualification_feedback_failure_keeps_paid405_and_stop_marker(tmp_path):
+    body = b'<title>Human Verification</title>https://abc.captcha.awswaf.com/a.js'
+    build, factory = transport_factory(tmp_path, responses=iter([(405, body)]))
+    assert bench.run(qualification_args(tmp_path), client_factory=build) == 2
+    assert len(factory.calls) == 1
+    report = json.loads((tmp_path/'day1/report.json').read_text())
+    assert report['stop_reason'] == 'captcha'
+    assert report['experiment_totals']['request_attempts'] == 1
+    assert len(json.loads((tmp_path/'day1/state.json').read_text())['attempt_records']) == 1
+
+
+def test_qualification_missing_durable_marker_leaves_experiment_active(tmp_path, monkeypatch):
+    original = bench._write
+    def write(path, value):
+        if path.name == 'qualification-guard.json' and value.get('stop'):
+            raise OSError('offline failed marker write')
+        original(path, value)
+    monkeypatch.setattr(bench, '_write', write)
+    build, factory = transport_factory(tmp_path, responses=iter([(405, b'blocked')]))
+    with pytest.raises(bench.ProbeGateError, match='not durable'):
+        bench.run(qualification_args(tmp_path), client_factory=build)
+    assert len(factory.calls) == 1
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['active']
+    with pytest.raises(bench.ProbeGateError, match='reconcile'):
+        bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'new')),
+                  client_factory=lambda *a: pytest.fail('unsettled experiment opened a client'))
+
+
+def test_qualification_known_captcha_does_not_depend_on_a_second_raw_read(tmp_path):
+    client = FakeClient([FetchOutcome(status=FetchStatus.BLOCKED, status_code=200, attempts=1)])
+    url = bench.player_url(['40104', '8198'])
+    client.get_raw_attempt_records = lambda: ([{'envelope_id': 'one', 'url': url,
+        'status_code': 200, 'outcome_kind': 'response'}] if client.calls else [])
+    client._raw_store.load_capture = lambda *a: pytest.fail('known block should already be durable')
+    assert bench.run(qualification_args(tmp_path), client_factory=lambda *a: client) == 2
+    assert len(client.calls) == 1
+    assert json.loads((tmp_path/'qualification-guard.json').read_text())['stop']['reason'] == 'captcha'
+
+
+def test_qualification_prior_2744_attempts_are_not_reset(tmp_path):
+    totals = {'request_attempts': 2744, 'provider_metered_bytes': 16705757,
+              'decoded_response_body_bytes': 84284212}
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False, 'totals': totals}))
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, max_attempts=8244), client_factory=build) == 0
+    assert len(factory.calls) == 1
+    saved = json.loads((tmp_path/'signal-probe-ledger.json').read_text())
+    assert saved['totals']['request_attempts'] == 2745
+    assert saved['totals']['provider_metered_bytes'] > totals['provider_metered_bytes']
+
+
+def test_qualification_transport_backoff_and_four_attempt_limit(tmp_path):
+    from datetime import timedelta
+    for attempt in range(4):
+        build, factory = transport_factory(tmp_path, transport_error=TimeoutError('offline'))
+        assert bench.run(qualification_args(tmp_path), client_factory=build,
+            now_fn=lambda: datetime(2026, 10, 8, 12, tzinfo=timezone.utc) + timedelta(seconds=70*attempt)) == (2 if attempt == 3 else 3)
+        assert len(factory.calls) == 1
+        # No immediate extra permit/HTTP during the transport retry fence.
+        build, factory = transport_factory(tmp_path)
+        result = bench.run(qualification_args(tmp_path), client_factory=build,
+            now_fn=lambda: datetime(2026, 10, 8, 12, tzinfo=timezone.utc) + timedelta(seconds=70*attempt))
+        assert result == (2 if attempt == 3 else 3)
+        assert factory.calls == []
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['totals']['request_attempts'] == 4
+    assert bench.run(qualification_args(tmp_path, ids='1', evidence_dir=str(tmp_path/'new-url')),
+        client_factory=lambda *a: pytest.fail('four transport errors did not stop pair')) == 2
+
+
+def test_qualification_club_aliases_share_daily_quota_between_stages(tmp_path, monkeypatch):
+    tasks = []
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    monkeypatch.setattr(bench, 'parity_report', lambda *a, **kw: {'field_parity_gate': True})
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    for number, slug in enumerate(['manchester-city', 'club', 'another-alias']):
+        url = f'https://www.transfermarkt.com/{slug}/kader/verein/281/plus/1'
+        tasks[:] = [dict(key=f'club-{number}', kind='squad', scope='GB1/2026', url=url, json=False)]
+        build, factory = transport_factory(tmp_path, responses=iter([(200, b'<html>Roster</html>')]))
+        result = bench.run(qualification_args(tmp_path, mode='parity', sample=str(sample),
+            evidence_dir=str(tmp_path/f'stage{number}')), client_factory=build)
+        assert result == (0 if number < 2 else 2)
+        assert len(factory.calls) == (1 if number < 2 else 0)
+
+
+def test_qualification_imports_existing_daily_attempts_before_new_directory(tmp_path):
+    for name in ['old1', 'old2']:
+        client = FakeClient([FetchOutcome(status=FetchStatus.OK, raw_capture_id='raw', attempts=1)])
+        assert bench.run(args(tmp_path, evidence_dir=str(tmp_path/name)), client_factory=lambda *a: client) == 0
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'new')), client_factory=build,
+        now_fn=lambda: datetime.now(timezone.utc).replace(hour=12)) == 2
+    assert factory.calls == []
+
+
+def test_qualification_cohort_does_not_cross_moscow_midnight(tmp_path, monkeypatch):
+    tasks = [dict(key='one', kind='players', scope='scope', url=bench.player_url(['8198']), json=True)]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda *a, **kw: (tasks, ['8198'], set()))
+    sample = tmp_path/'sample.json'; sample.write_text('{}')
+    (tmp_path/'signal-probe-ledger.json').write_text(json.dumps({'active': False,
+        'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    stamps = iter([datetime(2026, 10, 8, 20, 59, 59, tzinfo=timezone.utc),
+                   datetime(2026, 10, 8, 21, 0, 1, tzinfo=timezone.utc)])
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(qualification_args(tmp_path, mode='cohort', sample=str(sample)),
+                     client_factory=build, now_fn=lambda: next(stamps)) == 2
+    assert factory.calls == []
+
+
+def test_qualification_removed_guard_is_rebuilt_with_saved_captcha_stop(tmp_path):
+    build, _ = transport_factory(tmp_path, responses=iter([(405, b'blocked')]))
+    assert bench.run(qualification_args(tmp_path), client_factory=build) == 2
+    (tmp_path/'qualification-guard.json').unlink()
+    assert bench.run(args(tmp_path, evidence_dir=str(tmp_path/'new')),
+                     client_factory=lambda *a: pytest.fail('saved CAPTCHA stop was lost')) == 2
+
+
+def test_qualification_corrupt_negative_counter_fails_before_client(tmp_path):
+    url = bench.player_url(['8198'])
+    (tmp_path/'qualification-guard.json').write_text(json.dumps({'version': 1,
+        'days': {'2026-10-08': {url: {'responses': -1, 'transport': 0}}}, 'stop': None}))
+    with pytest.raises(ValueError, match='counters'):
+        bench.run(qualification_args(tmp_path), client_factory=lambda *a: pytest.fail('corrupt quota opened client'))
+
+
+def test_qualification_raw_storage_failure_after200_keeps_active(tmp_path):
+    from scrapers.transfermarkt.raw_store import RawStoreError
+    original, factory = transport_factory(tmp_path)
+    def broken_raw(*a):
+        client = original(*a)
+        def fail_store(**kw):
+            raise RawStoreError('offline write failure after received200')
+        client._raw_store.store_attempt = fail_store
+        return client
+    with pytest.raises(bench.ProbeGateError, match='raw attempts'):
+        bench.run(qualification_args(tmp_path), client_factory=broken_raw)
+    assert len(factory.calls) == 1
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['active']
+    with pytest.raises(bench.ProbeGateError, match='reconcile'):
+        bench.run(qualification_args(tmp_path, evidence_dir=str(tmp_path/'new')),
+                  client_factory=lambda *a: pytest.fail('unproven response allowed another HTTP'))
+
+
+@pytest.mark.parametrize('upstream_class', ['407', 'timeout', 'dead_exit'])
+def test_qualification_gateway502_proof_survives_guard_rebuild(tmp_path, upstream_class):
+    from datetime import timedelta
+    stamp = datetime.now(timezone.utc)
+    original, factory = transport_factory(tmp_path, status=502,
+                                         headers={'X-Proxy-Upstream-Status': upstream_class})
+    assert bench.run(qualification_args(tmp_path), client_factory=original, now_fn=lambda: stamp) == 3
+    assert len(factory.calls) == 1
+    (tmp_path/'qualification-guard.json').unlink()
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, evidence_dir=str(tmp_path/'next-stage')),
+                     client_factory=build, now_fn=lambda: stamp+timedelta(seconds=70)) == 0
+    guard = json.loads((tmp_path/'qualification-guard.json').read_text())
+    day = (stamp+timedelta(seconds=70)).astimezone(bench.MSK).date().isoformat()
+    counts = next(iter(guard['days'][day].values()))
+    assert counts['transport'] == 1 and counts['responses'] == 1
+
+
+def test_qualification_transport_raw_failure_with_zero_counts_keeps_active(tmp_path):
+    from scrapers.transfermarkt.raw_store import RawStoreError
+    original, factory = transport_factory(tmp_path, transport_error=TimeoutError('offline'))
+    def broken_raw(*a):
+        client = original(*a)
+        def fail_store(**kw):
+            raise RawStoreError('offline transport envelope write failure')
+        client._raw_store.store_transport_error = fail_store
+        return client
+    with pytest.raises(bench.ProbeGateError, match='raw accounting'):
+        bench.run(qualification_args(tmp_path), client_factory=broken_raw)
+    assert len(factory.calls) == 1
+    assert json.loads((tmp_path/'signal-probe-ledger.json').read_text())['active']
+    with pytest.raises(bench.ProbeGateError, match='reconcile'):
+        bench.run(args(tmp_path, ids='1', evidence_dir=str(tmp_path/'new')),
+                  client_factory=lambda *a: pytest.fail('lost paid attempt allowed another HTTP'))
+
+
+def test_qualification_rebuild_retains_retry_fence_without_the_flag(tmp_path):
+    from datetime import timedelta
+    stamp = datetime(2026, 10, 8, 12, tzinfo=timezone.utc)
+    build, factory = transport_factory(tmp_path, transport_error=TimeoutError('offline'))
+    assert bench.run(qualification_args(tmp_path, ids='8198'), client_factory=build, now_fn=lambda: stamp) == 3
+    assert len(factory.calls) == 1
+    (tmp_path/'qualification-guard.json').unlink()
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids='8198', evidence_dir=str(tmp_path/'new')),
+                     client_factory=build, now_fn=lambda: stamp) == 3
+    assert factory.calls == []
+    assert bench.run(args(tmp_path, ids='8198', evidence_dir=str(tmp_path/'new')),
+                     client_factory=build, now_fn=lambda: stamp+timedelta(seconds=11)) == 0
+    assert len(factory.calls) == 1
+
+
 def test_absolute_cli_deadline_interrupts_a_stuck_call_in_real_process():
     code = '''import signal, time
 from dags.scripts.bench_transfermarkt_signals import _cli_portion_alarm, ProbeGateError
@@ -36,7 +322,7 @@ def outside_delivery_window(monkeypatch):
 
 def test_player_batches_are_bounded_and_encoded():
     assert bench.player_url(["40104", "8198"]).endswith("ids%5B%5D=40104&ids%5B%5D=8198")
-    for ids in ([], ["1"] * 2, [str(i) for i in range(1, 302)], ["0"], ["1&a=2"]):
+    for ids in ([], ["1"] * 2, [str(i) for i in range(1, 102)], [str(i) for i in range(1, 301)], [str(10000000000 + i) for i in range(100)], ["0"], ["1&a=2"]):
         with pytest.raises(bench.ProbeGateError):
             bench.player_url(ids)
 
@@ -67,13 +353,13 @@ def test_tmapi_batch_requires_identity_and_explicit_required_fields():
             bench.parse_players(payload, ["1"])
 
 
-def test_task_planner_reuses_careers_for_multiclub_player_and_batch300():
+def test_task_planner_reuses_careers_for_multiclub_player_and_batch100():
     sample = {"clubs": [{"club_id": "281", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"], "player_ids": [str(i) for i in range(1, 302)]},
                          {"club_id": "583", "saison_id": 2026, "scope": "FR1/2026", "player_ids": ["1"]}]}
     tasks, players, groups = bench.plan_tasks(sample)
     assert len(players) == 301
     assert "top_league" in groups
-    assert [len(task["ids"]) for task in tasks if task["kind"] == "players"] == [300, 1]
+    assert [len(task["ids"]) for task in tasks if task["kind"] == "players"] == [100, 100, 100, 1]
     assert len([task for task in tasks if task["key"] == "mv/1"]) == 1
     assert all("/plus/1" in task["url"] for task in tasks if task["kind"] == "squad")
 
@@ -82,18 +368,23 @@ class FakeClient:
     def __init__(self, outcomes):
         self.outcomes = iter(outcomes)
         self.calls = []
+        self.status_counts = {}
         self._raw_store = SimpleNamespace(load_capture=lambda capture: (probe_body(self.calls[-1][0]), SimpleNamespace(url=self.calls[-1][0], status_code=200)))
         self.closed = False
 
     def fetch(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return next(self.outcomes)
+        outcome = next(self.outcomes)
+        status = str(outcome.status_code or (200 if outcome.is_success else 0))
+        self.status_counts[status] = self.status_counts.get(status, 0) + 1
+        return outcome
 
     def close(self):
         self.closed = True
 
     def get_traffic_stats(self):
         return {"request_attempts": len(self.calls), "provider_metered_bytes": len(self.calls) * 10,
+                "status_counts": dict(self.status_counts),
                 "decoded_response_body_bytes": len(self.calls) * 20, "provider_metering_available": True}
 
     def get_raw_attempt_records(self):
@@ -112,7 +403,7 @@ def test_probe_is_one_get_raw_only_and_keeps_gate_unconfirmed(tmp_path):
     client = FakeClient([FetchOutcome(status=FetchStatus.OK, raw_capture_id="raw", attempts=1)])
     assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 0
     assert client.closed and len(client.calls) == 1
-    assert client.calls[0][1]["max_attempts"] == 1
+    assert client.calls[0][1]["max_attempts"] == 2
     report = json.loads((tmp_path / "day1/report.json").read_text())
     assert report["detector_gate"] is None and report["detector_gate_evaluated_by"] == "qualify"
     assert report["experiment_totals"]["request_attempts"] == 1
@@ -145,6 +436,92 @@ def test_failed_attempt_retains_envelope_and_can_retry_within_global_limit(tmp_p
     with pytest.raises(bench.ProbeGateError, match="budget exhausted"):
         bench.run(args(tmp_path, evidence_dir=str(tmp_path / "day2"), max_attempts=2), client_factory=lambda *a: third)
     assert not third.calls
+
+
+@pytest.mark.parametrize("status_code,error", [
+    (None, None), (0, "transport:connection:TransportStatusError"),
+    (0, "transport:timeout:TimeoutError"),
+])
+def test_transport_failures_allow_three_interruptions_then_success(tmp_path, status_code, error):
+    for _ in range(3):
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED,
+                                         status_code=status_code, error=error, attempts=1)])
+        assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+        assert len(client.calls) == 1
+    client = FakeClient([FetchOutcome(status=FetchStatus.OK, status_code=200,
+                                     raw_capture_id="raw", attempts=1)])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 0
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == 3
+    assert state["endpoint_tries"]["probe"] == 1
+    assert state["tries"]["probe"] == 4
+    assert json.loads((tmp_path / "signal-probe-ledger.json").read_text())["totals"]["request_attempts"] == 4
+
+
+@pytest.mark.parametrize("status_code,limit", [(None, 4), (405, 2), (403, 2), (404, 2), (429, 2), (500, 4), (502, 4), (522, 4)])
+def test_class_attempt_limits_stop_before_another_fetch(tmp_path, status_code, limit):
+    for _ in range(limit):
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED,
+                                         status_code=status_code, attempts=1)])
+        assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+    client = FakeClient([])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 2
+    assert not client.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    counter = "transport_tries" if status_code is None or status_code >= 500 else "endpoint_tries"
+    assert state[counter]["probe"] == limit
+
+
+def test_mixed_failures_have_independent_persisted_limits(tmp_path):
+    for status in [405, None, None, None]:
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, status_code=status)])
+        assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+    client = FakeClient([FetchOutcome(status=FetchStatus.OK, status_code=200, raw_capture_id="raw")])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 0
+
+
+@pytest.mark.parametrize("old_tries,expected", [(1, 0), (2, 2)])
+def test_legacy_tries_are_conservatively_counted_as_site_responses(tmp_path, old_tries, expected):
+    client = FakeClient([FetchOutcome(status=FetchStatus.BLOCKED, status_code=405)])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == 3
+    path = tmp_path / "day1/state.json"
+    state = json.loads(path.read_text())
+    state.pop("endpoint_tries", None)
+    state.pop("transport_tries", None)
+    state["tries"]["probe"] = old_tries
+    path.write_text(json.dumps(state))
+    client = FakeClient([FetchOutcome(status=FetchStatus.OK, status_code=200, raw_capture_id="raw")])
+    assert bench.run(args(tmp_path), client_factory=lambda *a: client) == expected
+    assert len(client.calls) == (1 if expected == 0 else 0)
+    state = json.loads(path.read_text())
+    assert state["endpoint_tries"]["probe"] == 2
+
+
+def test_transport_limit_override_and_global_budget_are_preserved(tmp_path):
+    for _ in range(2):
+        client = FakeClient([FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED)])
+        assert bench.run(args(tmp_path, transport_attempts=2), client_factory=lambda *a: client) == 3
+    client = FakeClient([])
+    assert bench.run(args(tmp_path, transport_attempts=2), client_factory=lambda *a: client) == 2
+    assert not client.calls
+    with pytest.raises(bench.ProbeGateError, match="budget exhausted"):
+        bench.run(args(tmp_path, max_attempts=2), client_factory=lambda *a: pytest.fail("budget must stop fetch"))
+
+
+@pytest.mark.parametrize("limit", [0, 1, 4, 5])
+def test_cli_transport_attempt_bounds(tmp_path, monkeypatch, limit):
+    monkeypatch.setattr(sys, "argv", ["bench", "--mode", "probe", "--evidence-dir", str(tmp_path),
+                                     "--transport-attempts", str(limit)])
+    seen = []
+    monkeypatch.setattr(bench, "run", lambda options: seen.append(options.transport_attempts) or 0)
+    if limit in (1, 4):
+        assert bench.main() == 0
+        assert seen == [limit]
+    else:
+        with pytest.raises(SystemExit) as exc:
+            bench.main()
+        assert exc.value.code == 2
+        assert not seen
 
 
 def test_parity_gate_reports_contract_value_club_mismatch(monkeypatch):
@@ -207,6 +584,73 @@ def test_real_raw_store_and_source_parsers_roundtrip(tmp_path):
     assert not report["field_parity_gate"]  # One player proves parsing, not cohort acceptance.
     assert report["comparisons"][0]["detector_fetch"] == "initial"
     assert len(list((tmp_path / "raw/attempts").rglob("*.json"))) == 5
+
+
+@pytest.mark.parametrize("roster_value,ceapi_value,issues", [
+    (None, None, []), (None, 0, []),
+    (100000, None, ["tmapi_value_vs_squad"]),
+    (None, 100000, ["tmapi_value_vs_ceapi"]),
+])
+def test_zero_value_parity_preserves_positive_mismatches(tmp_path, roster_value, ceapi_value, issues):
+    roster = SQUAD.replace(b"\xe2\x82\xac30.00m", b"-" if roster_value is None else b"\xe2\x82\xac100k")
+    payload = json.dumps({"success": True, "data": [tmapi_row(
+        "262749", value=0, contract="2028-06-30", club="11", value_date="2026-10-09")]}).encode()
+    tasks, players, groups, store, results = real_parity_evidence(
+        tmp_path, squad=roster, players=payload, players_closing=payload,
+        mv=json.dumps({"list": [{"datum_mw": "Oct 9, 2026", "y": ceapi_value}]}).encode())
+    report = bench.parity_report(tasks, results, store, players, groups)
+    assert report["comparisons"][0]["issues"] == issues
+
+
+@pytest.mark.parametrize("contracts,other_issue,expected", [
+    (0, None, True), (10, None, True), (20, None, True), (21, None, False),
+    (10, "club", False), (10, "value_date", False), (20, "absent", False),
+])
+def test_contract_share_gate_counts_compared_players(monkeypatch, contracts, other_issue, expected):
+    import scrapers.transfermarkt.scraper as scraper
+    ids = [str(i) for i in range(1, 1001)]
+    tasks, players, groups = bench.plan_tasks({"clubs": [{
+        "club_id": "281", "scope": "GB1/2026", "saison_id": 2026,
+        "groups": sorted(bench.GROUPS), "player_ids": ids}]})
+    monkeypatch.setattr(scraper, "_parse_squad_page", lambda *a: [
+        {"player_id": player, "market_value_eur": 1000,
+         "contract_until": date(2029 if int(player) <= contracts else 2028, 6, 30)}
+        for player in ids if not (player == "1000" and other_issue == "absent")])
+    bodies = {}
+    for task in tasks:
+        if task["kind"] == "squad":
+            body = b'<table class="items"><thead><th>Contract</th></thead></table>'
+        elif task["kind"] in {"players", "players_closing"}:
+            body = json.dumps({"success": True, "data": [tmapi_row(
+                player, value=1000, contract="2028-06-30",
+                club="999" if player == "1000" and other_issue == "club" else "281")
+                for player in task["ids"]]}).encode()
+        elif task["kind"] == "mv" and task["player_id"] == "1000" and other_issue == "value_date":
+            body = b'{"list":[{"datum_mw":"Oct 8, 2026","y":1000}]}'
+        else:
+            body = b'{"list":[]}' if task["kind"] == "mv" else b'{"transfers":[]}'
+        bodies[task["url"]] = body
+    store = SimpleNamespace(load_capture=lambda url: (bodies[url], SimpleNamespace(
+        url=url, status_code=200, fetched_at="2026-10-09T00:00:00Z")))
+    report = bench.parity_report(tasks, {t["key"]: {"raw_capture_id": t["url"]} for t in tasks}, store, players, groups)
+    assert report["field_parity_gate"] is expected
+    assert report["contract_mismatches"] == [
+        {"player_id": str(i), "tmapi_contract": "2028-06-30", "squad_contract": "2029-06-30"}
+        for i in range(1, contracts + 1)]
+    assert report["contract_mismatch_count"] == contracts
+    assert report["contract_mismatch_share"] == contracts / (999 if other_issue == "absent" else 1000)
+    assert report["contract_mismatch_threshold"] == 0.02
+
+
+def test_tolerated_initial_contract_is_preferred_to_strict_closing_mismatch(tmp_path):
+    def payload(value):
+        return json.dumps({"success": True, "data": [tmapi_row(
+            "262749", value=value, contract="2029-06-30", club="11", value_date="2026-10-09")]}).encode()
+    tasks, players, groups, store, results = real_parity_evidence(
+        tmp_path, players=payload(30000000), players_closing=payload(25000000))
+    report = bench.parity_report(tasks, results, store, players, groups)
+    assert report["comparisons"][0]["detector_fetch"] == "initial"
+    assert report["comparisons"][0]["issues"] == ["tmapi_contract_vs_squad"]
 
 
 def test_reference_update_mid_observation_is_matched_by_closing_packet(tmp_path):
@@ -286,17 +730,18 @@ def test_past_roster_without_contract_column_does_not_prove_null_parity(tmp_path
         bench.parity_report(tasks, results, store, players, groups)
 
 
-def transport_factory(tmp_path, *, status=200, close_error=False, responses=None):
+def transport_factory(tmp_path, *, status=200, close_error=False, responses=None, transport_error=None, headers=None):
     from dataclasses import replace
     from scrapers.transfermarkt.client import TransfermarktHttpClient
     from scrapers.transfermarkt.models import LeaseTrafficSnapshot, ProxyLease, SharedTrafficLedger
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    factory = SimpleNamespace(calls=[], bytes=0, leases=[])
+    factory = SimpleNamespace(calls=[], bytes=0, leases=[], lease_ttls=[])
 
     class Provider:
         def acquire(self, *, max_bytes, ttl_seconds, metadata):
             lease = ProxyLease("offline-lease", "offline-token", "http://offline-proxy:8900", max_bytes, 9999999999)
             factory.leases.append(lease)
+            factory.lease_ttls.append(ttl_seconds)
             return lease
         def stats(self, lease):
             return LeaseTrafficSnapshot(up_bytes=256 * len(factory.calls), down_bytes=factory.bytes)
@@ -304,17 +749,22 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
             if close_error:
                 raise RuntimeError("unavailable accounting")
             return replace(self.stats(lease), closed=True)
-        def acquire_request_permit(self, *, metadata, request_id):
+        def acquire_request_permit(self, *, metadata, request_id, **kwargs):
             return "offline-permit"
         def authenticated_proxy_url(self, lease):
             return "http://offline-proxy:8900"
 
     class TLS:
         def get(self, url, **kwargs):
-            response_status, body = responses[url] if responses is not None else (status, probe_body(url))
+            if transport_error is not None:
+                factory.calls.append(url)
+                raise transport_error
+            response_status, body = (next(responses) if hasattr(responses, "__next__") else
+                                    responses[url] if responses is not None else (status, probe_body(url)))
             factory.calls.append(url)
             factory.bytes += len(body)
-            return SimpleNamespace(status_code=response_status, content=body, headers={"Content-Length": str(len(body))})
+            return SimpleNamespace(status_code=response_status, content=body,
+                                   headers={"Content-Length": str(len(body)), **(headers or {})})
         def close(self):
             pass
 
@@ -325,7 +775,193 @@ def transport_factory(tmp_path, *, status=200, close_error=False, responses=None
         client.begin_request_scope(request_attempt_budget=remaining["request_attempts"])
         client.set_cycle_decoded_body_budget(remaining["decoded_response_body_bytes"])
         return client
+    factory.provider = Provider()
+    factory.tls_factory = TLS
     return build, factory
+
+
+def test_fresh_lease_405_rotates_inside_one_endpoint_try(tmp_path, monkeypatch):
+    import scrapers.transfermarkt.client as transport
+    url = bench.player_url(["8198"])
+    _, factory = transport_factory(tmp_path, responses=iter([(405, b"Human Verification"), (200, probe_body(url))]))
+    real_client = transport.TransfermarktHttpClient
+
+    def client(**kwargs):
+        return real_client(**{**kwargs, "client_factory": lambda **kw: factory.tls_factory(),
+                              "sleep_fn": lambda seconds: None, "rate_limiter": None})
+
+    monkeypatch.setenv("TM_PROXY_CONTROL_URL", "http://offline-control")
+    monkeypatch.setenv("TM_PROXY_CONTROL_TOKEN", "offline-token")
+    class Provider:
+        def __new__(cls, url):
+            return factory.provider
+
+    monkeypatch.setattr(transport, "ProxyFilterLeaseProvider", Provider)
+    monkeypatch.setattr(transport, "TransfermarktHttpClient", client)
+    result = bench.run(args(tmp_path, ids="8198"))
+    assert result == 0, (tmp_path / "day1/report.json").read_text()
+    assert factory.calls == [url, url]
+    assert factory.lease_ttls == [3600, 3600]
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    report = json.loads((tmp_path / "day1/report.json").read_text())
+    assert state["endpoint_tries"]["probe"] == 2
+    assert state["tries"]["probe"] == 2
+    assert [row["status_code"] for row in sorted(state["attempt_records"], key=lambda row: row["attempt"])] == [405, 200]
+    assert report["complete"] is True
+    assert report["traffic"]["request_attempts"] == 2
+    assert report["experiment_totals"]["request_attempts"] == 2
+    assert json.loads((tmp_path / "signal-probe-ledger.json").read_text())["totals"]["request_attempts"] == 2
+
+
+@pytest.mark.parametrize('statuses', [[405, 405], [405, 502], [502, 405]])
+def test_site_response_budget_counts_internal_attempts_and_resume(tmp_path, statuses):
+    url = bench.player_url(['8198'])
+    build, factory = transport_factory(tmp_path, responses=iter(
+        [(s, b'failure') for s in statuses] + [(200, probe_body(url))]))
+    assert bench.run(args(tmp_path, ids='8198'), client_factory=build) == 3
+    assert len(factory.calls) == 2
+    state = json.loads((tmp_path / 'day1/state.json').read_text())
+    assert state['endpoint_tries']['probe'] == statuses.count(405)
+    assert state['transport_tries'].get('probe', 0) == statuses.count(502)
+    build, factory = transport_factory(tmp_path, responses=iter([(200, probe_body(url))]))
+    expected = 2 if statuses.count(405) == 2 else 0
+    assert bench.run(args(tmp_path, ids='8198'), client_factory=build) == expected
+    assert len(factory.calls) == (0 if expected == 2 else 1)
+
+
+def test_old_internal_response_counts_are_recovered_before_paid_resume(tmp_path):
+    build, _ = transport_factory(tmp_path, responses=iter([(405, b'blocked')] * 4))
+    assert bench.run(args(tmp_path, ids='8198'), client_factory=build) == 3
+    path = tmp_path / 'day1/state.json'
+    state = json.loads(path.read_text())
+    # 898a57b0 counted a fetch containing several HTTP responses as one try.
+    state['tries']['probe'] = state['endpoint_tries']['probe'] = 1
+    state.pop('url_attempts', None)
+    path.write_text(json.dumps(state))
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids='8198'), client_factory=build) == 2
+    assert not factory.calls
+
+
+def test_two_task_keys_for_one_url_share_the_response_limit(tmp_path, monkeypatch):
+    url = bench.player_url(['8198'])
+    tasks = [dict(key=key, kind='players', scope='scope', url=url, json=True)
+             for key in ['initial', 'closing']]
+    monkeypatch.setattr(bench, 'plan_tasks', lambda sample: (tasks, ['8198'], set()))
+    sample = tmp_path / 'sample.json'
+    sample.write_text('{}')
+    (tmp_path / 'signal-probe-ledger.json').write_text(json.dumps({
+        'active': False, 'packet_schema_gate': True, 'totals': dict.fromkeys(bench.COUNTERS, 0)}))
+    options = args(tmp_path, mode='parity', sample=str(sample))
+    build, factory = transport_factory(tmp_path, responses=iter([(405, b'first'), (200, probe_body(url)),
+                                                               (200, probe_body(url))]))
+    assert bench.run(options, client_factory=build) == 2
+    assert len(factory.calls) == 2
+    assert json.loads((tmp_path / 'day1/report.json').read_text())['complete'] is False
+
+
+def test_each_internal_attempt_is_accounted_when_portion_is_deferred(tmp_path):
+    from scrapers.transfermarkt.client import SourceStreamPaused
+    build, factory = transport_factory(tmp_path, responses=iter([(405, b'blocked')]))
+    original_build = build
+    def deferred_client(*a):
+        client = original_build(*a)
+        original_permit = client._lease_provider.acquire_request_permit
+        calls = []
+        def permit(**kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise SourceStreamPaused(1234)
+            return original_permit(**kwargs)
+        client._lease_provider.acquire_request_permit = permit
+        return client
+    assert bench.run(args(tmp_path, ids='8198'), client_factory=deferred_client) == 2
+    state = json.loads((tmp_path / 'day1/state.json').read_text())
+    assert state['endpoint_tries']['probe'] == 1
+    assert state['transport_tries'].get('probe', 0) == 0
+    assert len(factory.calls) == 1
+
+
+@pytest.mark.parametrize("proxy_status", [502, 522, None])
+def test_real_transport_gateway_errors_use_transport_limit(tmp_path, proxy_status):
+    from scrapers.transfermarkt.client import TransportStatusError
+    error = (TimeoutError("offline timeout") if proxy_status is None else
+             TransportStatusError("offline proxy failure", status_code=proxy_status))
+    for _ in range(2):
+        build, factory = transport_factory(tmp_path, transport_error=error)
+        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+        assert len(factory.calls) == 2
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
+    assert not factory.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == 4
+    assert [record["outcome_kind"] for record in state["attempt_records"]] == ["transport_error"] * 4
+
+
+@pytest.mark.parametrize("upstream_class", ["407", "timeout", "dead_exit"])
+def test_gateway_http_response_uses_transport_limit(tmp_path, upstream_class):
+    for _ in range(2):
+        build, factory = transport_factory(tmp_path, status=502,
+            headers={"x-proxy-upstream-status": upstream_class})
+        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+        assert len(factory.calls) == 2
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
+    assert not factory.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == 4
+    assert state["endpoint_tries"]["probe"] == 0
+    assert [record["status_code"] for record in state["attempt_records"]] == [502] * 4
+    assert json.loads((tmp_path / "day1/report.json").read_text())["experiment_totals"]["request_attempts"] == 4
+
+
+@pytest.mark.parametrize("status", [403, 405, 404, 429])
+def test_site_http_response_still_uses_endpoint_limit(tmp_path, status):
+    for _ in range(2 if status == 404 else 1):
+        build, factory = transport_factory(tmp_path, status=status)
+        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+        assert len(factory.calls) == (1 if status == 404 else 2)
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
+    assert not factory.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["endpoint_tries"]["probe"] == 2
+    assert state["transport_tries"].get("probe", 0) == 0
+
+
+def test_gateway_http_transport_limit_is_not_unbounded(tmp_path):
+    for _ in range(2):
+        build, factory = transport_factory(tmp_path, status=502,
+            headers={"X-Proxy-Upstream-Status": "407"})
+        assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 3
+        assert len(factory.calls) == 2
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(args(tmp_path, ids="8198"), client_factory=build) == 2
+    assert not factory.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == 4
+    assert state["endpoint_tries"]["probe"] == 0
+
+
+@pytest.mark.parametrize('portions,transport_tries,site_tries', [
+    ([[502, 502], [502, 405], [502]], 4, 1),
+    ([[405, 502], [405]], 1, 2),
+])
+def test_mixed_internal_retries_preserve_remaining_transport_limit(tmp_path, portions, transport_tries, site_tries):
+    options = args(tmp_path, ids="8198")
+    for statuses in portions:
+        build, factory = transport_factory(tmp_path, responses=iter((status, b'failure') for status in statuses))
+        assert bench.run(options, client_factory=build) == 3
+        assert len(factory.calls) == len(statuses)
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == transport_tries
+    assert state["endpoint_tries"]["probe"] == site_tries
+    build, factory = transport_factory(tmp_path)
+    assert bench.run(options, client_factory=build) == 2
+    assert not factory.calls
+    state = json.loads((tmp_path / "day1/state.json").read_text())
+    assert state["transport_tries"]["probe"] == transport_tries
 
 
 def test_real_transport_proxy_raw_probe_chain_with_exact_paid_attempt(tmp_path):
@@ -372,20 +1008,82 @@ def test_portion_stops_before_45minutes_without_starting_paid_request(tmp_path):
 
 
 def test_cohort_templates_need_current_club_page_and_do_not_reuse_old_player_ids():
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "groups": ["top_league"], "player_ids": ["obsolete"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "edition_url": "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2", "groups": ["top_league"], "player_ids": ["obsolete"]}]}
     tasks, players, _ = bench.plan_tasks(sample, roster_only=True)
     assert len(tasks) == 3 and not players and not tasks[2]["ids"]
     assert [task["kind"] for task in tasks] == ["edition", "participants", "squad"]
-    assert tasks[0]["url"] == "https://www.transfermarkt.com/competition/startseite/wettbewerb/ARG2"
+    assert tasks[0]["url"] == "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2"
     assert tasks[2]["url"].endswith("/kader/verein/11/plus/1")
     sample["clubs"][0]["squad_url"] = "https://www.transfermarkt.com/arsenal/kader/verein/11/saison_id/2025/plus/1"
     with pytest.raises(bench.ProbeGateError, match="current club URL"):
         bench.plan_tasks(sample, roster_only=True)
 
 
+@pytest.mark.parametrize("competition,route,slug", [
+    ("GB1", "wettbewerb", "premier-league"), ("DFB", "pokalwettbewerb", "dfb-pokal"),
+])
+def test_cohort_edition_url_is_taken_from_template_once_per_scope(competition, route, slug):
+    url = f"https://www.transfermarkt.com/{slug}/startseite/{route}/{competition}"
+    clubs = [{"club_id": club, "saison_id": 2026, "scope": f"{competition}/2026", "edition_url": url}
+             for club in ("11", "12")]
+    tasks, _, _ = bench.plan_tasks({"clubs": clubs}, roster_only=True)
+    editions = [task for task in tasks if task["kind"] == "edition"]
+    assert len(editions) == 1 and editions[0]["url"] == url
+    clubs[1]["edition_url"] = url.replace(slug, "other-slug")
+    with pytest.raises(bench.ProbeGateError, match="conflicting edition_url"):
+        bench.plan_tasks({"clubs": clubs}, roster_only=True)
+
+
+@pytest.mark.parametrize("url", [
+    None, "", 123, "http://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+    "https://transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+    "https://www.transfermarkt.com.evil/premier-league/startseite/wettbewerb/GB1",
+    "https://user@www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+    "https://[invalid/premier-league/startseite/wettbewerb/GB1",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/ES1",
+    "https://www.transfermarkt.com/premier-league/startseite/pokalwettbewerb/GB1",
+    "https://www.transfermarkt.com/premier-league/kader/wettbewerb/GB1",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1/saison_id/2026",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1?saison_id=2026",
+    "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1#2026",
+])
+def test_invalid_cohort_edition_url_is_refused_before_client(tmp_path, url):
+    club = {"club_id": "11", "saison_id": 2026, "scope": "GB1/2026"}
+    if url is not None:
+        club["edition_url"] = url
+    sample_path = tmp_path / "template.json"
+    sample_path.write_text(json.dumps({"clubs": [club]}))
+    (tmp_path / "signal-probe-ledger.json").write_text(json.dumps({
+        "active": False, "packet_schema_gate": True, "totals": dict.fromkeys(bench.COUNTERS, 0)}))
+    with pytest.raises(bench.ProbeGateError, match="edition_url"):
+        bench.run(args(tmp_path, mode="cohort", sample=str(sample_path)),
+                  client_factory=lambda *a: pytest.fail("must not construct HTTP client"))
+
+
+def test_changed_cohort_edition_url_cannot_resume_old_evidence(tmp_path):
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026",
+                          "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1"}]}
+    sample_path = tmp_path / "template.json"
+    sample_path.write_text(json.dumps(sample))
+    ledger_path = tmp_path / "signal-probe-ledger.json"
+    ledger_path.write_text(json.dumps({"active": False, "packet_schema_gate": True,
+                                       "totals": dict.fromkeys(bench.COUNTERS, 0)}))
+    tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
+    build, factory = transport_factory(tmp_path, responses={task["url"]: (405, b"blocked") for task in tasks})
+    options = args(tmp_path, mode="cohort", sample=str(sample_path), player_target=1000, min_scopes=20)
+    assert bench.run(options, client_factory=build) == 2
+    assert len(factory.calls) == 6
+    ledger = ledger_path.read_text()
+    sample["clubs"][0]["edition_url"] = sample["clubs"][0]["edition_url"].replace("premier-league", "other-slug")
+    sample_path.write_text(json.dumps(sample))
+    with pytest.raises(bench.ProbeGateError, match="new evidence directory"):
+        bench.run(options, client_factory=lambda *a: pytest.fail("must not construct HTTP client"))
+    assert ledger_path.read_text() == ledger
+
+
 def test_bootstrap_uses_fresh_raw_roster_and_declares_scope_vs_club_season(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "edition_url": "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2026" selected>26/27</option></select>' + SQUAD
@@ -405,7 +1103,7 @@ def test_bootstrap_uses_fresh_raw_roster_and_declares_scope_vs_club_season(tmp_p
 
 def test_bootstrap_does_not_silently_count_unusable_contract_roster(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2026" selected>26/27</option></select>' + SQUAD.replace(b"<th>Contract</th>", b"<th>Current club</th>")
@@ -450,7 +1148,7 @@ def test_template_scope_must_be_live_core_denominator_competition():
         with pytest.raises(bench.ProbeGateError, match="denominator"):
             bench.plan_tasks({"clubs": [{"club_id": "11", "scope": scope, "saison_id": season}]}, roster_only=True)
     # A season other than the configured one is planned: the source profile decides.
-    tasks, _, _ = bench.plan_tasks({"clubs": [{"club_id": "11", "scope": "GB1/2025", "saison_id": 2025}]}, roster_only=True)
+    tasks, _, _ = bench.plan_tasks({"clubs": [{"club_id": "11", "scope": "GB1/2025", "saison_id": 2025, "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1"}]}, roster_only=True)
     assert tasks[0]["kind"] == "edition" and tasks[0]["denominator_saison_id"] == 2026
 
 
@@ -471,7 +1169,7 @@ def test_barred_club_is_refused_before_any_request(tmp_path):
 
 def test_source_edition_other_than_scope_blocks_scope_without_counting_its_clubs(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2025, "scope": "ARG2/2025", "edition_url": "https://www.transfermarkt.com/primera-nacional/startseite/wettbewerb/ARG2", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2025" selected>2025</option></select>' + SQUAD
@@ -483,7 +1181,7 @@ def test_source_edition_other_than_scope_blocks_scope_without_counting_its_clubs
 
 def test_cohort_keeps_a_nonparticipant_as_qualification_failure(tmp_path):
     from scrapers.transfermarkt.raw_store import RawResponseStore
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]}]}
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
     body = b'<select name="saison_id"><option value="2026" selected>26/27</option></select>' + SQUAD
@@ -495,13 +1193,13 @@ def test_cohort_keeps_a_nonparticipant_as_qualification_failure(tmp_path):
 
 
 def test_failed_scope_bootstrap_continues_other_clubs_and_retries_only_failed_task(tmp_path):
-    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]},
-                        {"club_id": "12", "saison_id": 2026, "scope": "GB1/2026", "groups": ["top_league"]}]}
+    sample = {"clubs": [{"club_id": "11", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]},
+                        {"club_id": "12", "saison_id": 2026, "scope": "GB1/2026", "edition_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1", "groups": ["top_league"]}]}
     sample_path = tmp_path / "templates.json"
     sample_path.write_text(json.dumps(sample))
     tasks, _, _ = bench.plan_tasks(sample, roster_only=True)
     roster = b'<select name="saison_id"><option value="2026" selected>26/27</option></select>' + SQUAD
-    responses = {task["url"]: (405, b"blocked") if task["kind"] == "participants" else (200, edition_page() if task["kind"] == "edition" else roster) for task in tasks}
+    responses = {task["url"]: (404, b"missing") if task["kind"] == "participants" else (200, edition_page() if task["kind"] == "edition" else roster) for task in tasks}
     build, factory = transport_factory(tmp_path, responses=responses)
     options = args(tmp_path, mode="cohort", sample=str(sample_path), player_target=1000, min_scopes=20)
     initial, _ = transport_factory(tmp_path)
@@ -520,7 +1218,7 @@ def test_failed_scope_bootstrap_continues_other_clubs_and_retries_only_failed_ta
     assert report["task_failures"] == {} and report["experiment_totals"]["request_attempts"] == 6
     assert [proof["scope"] for proof in report["edition_proofs"]] == ["GB1/2026"]
     state = json.loads((tmp_path / "day1/state.json").read_text())
-    assert sorted(row["status_code"] for row in state["attempt_records"]) == [200, 200, 200, 200, 405]
+    assert sorted(row["status_code"] for row in state["attempt_records"]) == [200] * 4 + [404]
 
 
 def test_expensive_measurement_cannot_skip_initial_raw_packet_schema_probe(tmp_path):
@@ -606,3 +1304,16 @@ def test_proxy_rejection_details_are_redacted_without_charging_source_attempt(tm
     assert "closed source allowlist" in report["error_detail"]
     assert "private" not in report["error_detail"] and "user:" not in report["error_detail"]
     assert report["experiment_totals"]["request_attempts"] == 0
+
+
+def test_thousand_players_use_ten_initial_and_ten_closing_packets():
+    ids = [str(value) for value in range(1000000, 1001000)]
+    sample = {"clubs": [{"club_id": "281", "saison_id": 2026, "scope": "GB1/2026", "player_ids": ids}]}
+    tasks, players, _ = bench.plan_tasks(sample)
+    assert players == ids
+    for kind in ("players", "players_closing"):
+        packets = [task for task in tasks if task["kind"] == kind]
+        assert len(packets) == 10
+        assert [player for task in packets for player in task["ids"]] == ids
+        assert all(len(task["ids"]) == 100 for task in packets)
+        assert all(len(bench.urlsplit(task["url"]).query.encode('ascii')) <= 2000 for task in packets)

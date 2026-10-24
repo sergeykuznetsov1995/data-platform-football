@@ -17,6 +17,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from scrapers.transfermarkt.registry import deterministic_scope_id
+from scrapers.transfermarkt.tmapi import normalize_market_value
 
 
 FULL_PLAYER_FIELDS = frozenset({
@@ -150,7 +151,7 @@ def player_changes(
             endpoints.add('transfer_events')
         if player in old and player in new:
             def values(memberships: Mapping[str, Mapping[str, Any]]) -> set[str]:
-                return {_json([row.get('market_value_eur'),
+                return {_json([normalize_market_value(row.get('market_value_eur')),
                                row.get('market_value_date', row.get('market_value_updated_at'))])
                         for row in memberships.values()}
             if values(old[player]) != values(new[player]):

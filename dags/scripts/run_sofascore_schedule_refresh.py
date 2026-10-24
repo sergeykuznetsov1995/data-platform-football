@@ -16,7 +16,10 @@ Every run works three classes of target, in this order of priority:
   (beyond that the class rotates on its cursor like the others).  This is the
   fast path.
 * ``stale`` — seasons already in Bronze but outside that window: their tail
-  page too, but only a cursor slice per run.  ``schedule_last`` serves finished
+  page too, but only a cursor slice per run. Large queues split the existing
+  page allowance between full visits and one-page head probes (no fixtures),
+  seeking a two-sweep rotation without raising the page or byte ceiling.
+  Actual spend can rise inside that ceiling. ``schedule_last`` serves finished
   matches only, so a season whose last known match has aged out of the window
   would otherwise never be asked again — and a weekly league leaves the window
   four days before its next match.  The cursor slice is what bounds the lag.
@@ -287,7 +290,9 @@ def targets_digest(targets: Sequence[SeasonTarget]) -> str:
 SWEEP_CLASSES = ("overdue", "due", "stale", "seed")
 
 
-def read_cursor(path: Path) -> dict[str, Optional[tuple[int, int]]]:
+def read_cursor(
+    path: Path, *, classes: Sequence[str] = SWEEP_CLASSES,
+) -> dict[str, Optional[tuple[int, int]]]:
     """Where each class stopped last run, as a ``(tournament, season)`` pair.
 
     The cursor is an ANCHOR, not an index.  An index only means anything for
@@ -303,7 +308,7 @@ def read_cursor(path: Path) -> dict[str, Optional[tuple[int, int]]]:
     """
 
     restart: dict[str, Optional[tuple[int, int]]] = {
-        name: None for name in SWEEP_CLASSES
+        name: None for name in classes
     }
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -315,7 +320,7 @@ def read_cursor(path: Path) -> dict[str, Optional[tuple[int, int]]]:
     if not isinstance(index, Mapping):
         return restart
     cursors: dict[str, Optional[tuple[int, int]]] = {}
-    for name in SWEEP_CLASSES:
+    for name in classes:
         entry = index.get(name)
         if (
             isinstance(entry, list)
@@ -1139,6 +1144,97 @@ def plan_sweep(
     return plan, next_cursors, members
 
 
+def plan_stale_checks(
+    targets: Sequence[SeasonTarget],
+    cursor: Optional[tuple[int, int]],
+    wanted: Any,
+    *,
+    full_limit: int,
+    chase_pages: int,
+    full_cursor: Optional[tuple[int, int]] = None,
+    unselected_seed_pages: int = 0,
+) -> tuple[list[SeasonTarget], Optional[tuple[int, int]], set[tuple[int, int]], dict]:
+    """Trade reserved stale pages for discovery breadth, never a larger cap.
+
+    A full visit reserves ``chase_pages + 1`` pages. A head probe reserves
+    one, has no fixture request, and queues any unread suffix. Maximise full
+    visits while covering a fixed healthy queue in two sweeps when possible.
+    Only seed slots left unselected by the final plan can add page capacity.
+    Do not trade full fixture freshness beyond nine sweeps for head discovery.
+    Independent FIFO anchors prevent resonance from assigning the same small
+    subset full visits forever. No freshness/completion claim is persisted.
+    """
+    members = sum(1 for target in targets if wanted(target))
+    cost = chase_pages + 1
+    if unselected_seed_pages < 0:
+        raise ValueError("unselected seed pages cannot be negative")
+    allowance = full_limit * cost + unselected_seed_pages
+    full = full_limit
+    probes = 0
+    full_start = full_cursor if full_cursor is not None else cursor
+    if members > 2 * full_limit and allowance:
+        needed = (members + 1) // 2
+        candidate_full = min(full_limit, (allowance - needed) // cost)
+        minimum_full = (members + 8) // 9
+        if candidate_full >= minimum_full:
+            full = candidate_full
+            probes = min(members - full, allowance - full * cost)
+    check_limit = full + probes
+    if probes:
+        # Probe capacity ALONE covers the discovery horizon: a full visit may
+        # overlap a previous sweep's probes. Both modes remain disjoint NOW.
+        full_selected, next_full_cursor = take_slice(
+            targets, full_start, full, wanted,
+        )
+        full_pairs = {target.pair for target in full_selected}
+        probe_selected, next_cursor = take_slice(
+            targets, cursor, probes,
+            lambda target: wanted(target) and target.pair not in full_pairs,
+        )
+        selected = full_selected + probe_selected
+        probe_pairs = {target.pair for target in probe_selected}
+    else:
+        # Preserve full rotation when the existing allowance cannot afford
+        # both the discovery horizon AND the fixture freshness bound. Keep
+        # the legacy full quota instead of silently stretching fixture age.
+        # Keep the independent full anchor across mode changes too. Starting
+        # from the broad anchor here resets fixture progress whenever the
+        # selected seed count crosses the probe/fallback threshold.
+        selected, next_cursor = take_slice(targets, full_start, check_limit, wanted)
+        next_full_cursor = next_cursor
+        probe_pairs = set()
+    selected_full = len(selected) - len(probe_pairs)
+    coverage_capacity = len(probe_pairs) if probes else len(selected)
+    detail = {
+        "selection_version": 3,
+        "eligible_targets": members,
+        "full_limit": full,
+        "probe_limit": probes,
+        "check_limit": check_limit,
+        "legacy_full_limit": full_limit,
+        "page_allowance": allowance,
+        "planned_pages": selected_full * cost + len(probe_pairs),
+        "target_sweeps": 2,
+        "full_target_sweeps": 9,
+        "full_freshness_limited": members > 9 * selected_full,
+        "rotation_sweeps": (members + coverage_capacity - 1) // coverage_capacity
+                           if coverage_capacity else None,
+        "full_rotation_sweeps": (members + selected_full - 1) // selected_full
+                                if selected_full else None,
+        "next_full_cursor": list(next_full_cursor) if next_full_cursor else None,
+        "full_cursor_start": list(full_start) if full_start else None,
+        "coverage_limited": members > 2 * coverage_capacity,
+        "unselected_reason": "existing_page_allowance_exhausted" if members > 2 * coverage_capacity
+                             else "next_cursor_rotation",
+        "selected": [
+            {"tournament_id": target.tournament_id, "source_season_id": target.season_id,
+             "mode": "head_probe" if target.pair in probe_pairs else "full"}
+            for target in selected
+        ],
+    }
+    return selected, next_cursor, probe_pairs, detail
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     report: dict[str, Any] = {"status": "running", "errors": []}
@@ -1177,6 +1273,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         digest = targets_digest(all_targets)
         cursor_path = Path(args.cursor)
         cursors = read_cursor(cursor_path)
+        full_cursor = read_cursor(cursor_path, classes=("stale_full",))["stale_full"]
         idle_runs = read_idle_runs(cursor_path)
         interrupted_runs = read_interrupted_runs(cursor_path)
         known, due, played = bronze_partitions(args.window_hours)
@@ -1241,6 +1338,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan["seed"] = retry_targets + [
             target for target in plan["seed"] if target.pair not in retried
         ]
+        seed_cost = class_page_costs(args.chase_pages, args.seed_pages)["seed"]
+        unselected_seed_pages = (limits["seed"] - len(plan["seed"])) * seed_cost
+        # Bronze cannot prioritise a fixture/result it has never seen. The
+        # old 200 full stale visits took seven runs to cover 1227 seasons.
+        # Reuse reserved pages only after the seed/resume selection is final.
+        plan["stale"], next_cursors["stale"], stale_probes, stale_checks = plan_stale_checks(
+            all_targets, cursors.get("stale"), wanted_now["stale"],
+            full_limit=limits["stale"], chase_pages=args.chase_pages,
+            full_cursor=full_cursor, unselected_seed_pages=unselected_seed_pages,
+        )
+        stale_checks["unselected_seed_reserve"] = {
+            "reserved_targets": limits["seed"],
+            "selected_targets": len(plan["seed"]),
+            "pages_per_target": seed_cost,
+            "available_pages": unselected_seed_pages,
+            "transferred_pages": max(
+                0, stale_checks["planned_pages"] - limits["stale"] * (args.chase_pages + 1),
+            ),
+        }
         # The page each resumed chain owes.  The fetcher itself re-reads the one
         # before it (the source repacks its pages, and a page fetched twice is a
         # MERGE no-op) while counting its bound from the owed page — doing the
@@ -1289,6 +1405,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "overdue_targets": len(plan["overdue"]),
                 "due_targets": len(plan["due"]),
                 "stale_targets": len(plan["stale"]),
+                "stale_full_targets": len(plan["stale"]) - len(stale_probes),
+                "stale_probe_targets": len(stale_probes),
+                "stale_discovery": stale_checks,
                 "seed_targets": len(plan["seed"]),
                 # The whole class, and the limit its slice was actually taken
                 # with: a class bigger than its limit is the one whose anchor
@@ -1300,7 +1419,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "class_limits": {
                     "overdue": limits["overdue"],
                     "due": limits["due"],
-                    "stale": limits["stale"],
+                    "stale": stale_checks["check_limit"],
                     "seed": limits["seed"] - len(retry_targets),
                 },
                 "page_budget": args.page_budget,
@@ -1329,6 +1448,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
             }
         )
+        if stale_checks["coverage_limited"]:
+            report.setdefault("warnings", []).append(
+                "stale discovery needs more than two sweeps under the existing "
+                f"page allowance: {stale_checks['eligible_targets']} seasons, "
+                f"{stale_checks['check_limit']} checks per sweep"
+            )
+        if stale_checks["full_freshness_limited"]:
+            report.setdefault("warnings", []).append(
+                "stale future fixtures need more than nine sweeps under the existing "
+                f"full quota: {stale_checks['eligible_targets']} seasons, "
+                f"{stale_checks['full_limit']} full visits per sweep"
+            )
         if report["idle"]:
             raise ValueError(
                 f"sweep plan is empty for {len(all_targets)} campaign seasons "
@@ -1372,6 +1503,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for name, pair in cursors.items()
             },
         }
+        if stale_probes or full_cursor is not None:
+            cursor_state["index"]["stale_full"] = list(full_cursor) if full_cursor else None
         attempted: set[tuple[int, int]] = set()
         # Verdicts about slices, gathered across classes: the sweep finishes,
         # then the run fails on the first of them.
@@ -1478,6 +1611,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         # like.
                         owed_pages=owed_pages,
                         failures=failures,
+                        **({"probe_targets": stale_probes} if name == "stale" and stale_probes else {}),
                     )
                 except SweepVerdictError as exc:
                     events, counters, cut_short = (
@@ -1527,7 +1661,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # the whole seed round to come back (Sol round 5, finding 4).
                 try:
                     fixture_events, fixture_counters = fetch_season_fixtures(
-                        client, pairs, raw_store, failures=failures
+                        client,
+                        [pair for pair in pairs if name != "stale" or pair not in stale_probes],
+                        raw_store, failures=failures,
                     )
                 except SweepVerdictError as exc:
                     # The calendar walk is an EXTRA on top of the tail pages,
@@ -1673,6 +1809,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     report.setdefault("skipped_slices", []).append(name)
                     held = 0
             cursor_state["interrupted_runs"][name] = held
+            if name == "stale" and (stale_probes or full_cursor is not None) and (
+                interrupted is None or name in report.get("skipped_slices", ())
+            ):
+                cursor_state["index"]["stale_full"] = stale_checks["next_full_cursor"]
             # Retire only the visited retry prefix.  Completed chains leave;
             # refused chains return through cut_short; unread chains stay put.
             if name == "seed" and queue_safe:

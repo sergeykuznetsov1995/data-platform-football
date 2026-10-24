@@ -195,10 +195,50 @@ def test_interruption_keeps_production_trust_root_at_the_old_decision(
 
 
 @pytest.mark.unit
-def test_checked_in_runtime_evidence_matches_generator():
-    rendered = evidence.render_evidence(ROOT)
+def test_checked_in_runtime_evidence_matches_generator(protected_whoscored_checkout):
+    rendered = evidence.render_evidence(protected_whoscored_checkout)
 
-    assert evidence.check_evidence(ROOT, rendered)
+    assert evidence.check_evidence(protected_whoscored_checkout, rendered)
+
+
+@pytest.mark.parametrize("member", (".", "payload.py", "dags"))
+def test_runtime_evidence_rejects_group_writable_material(tmp_path, member):
+    _runtime_fixture(tmp_path)
+    path = tmp_path / member
+    path.chmod(path.stat().st_mode | 0o020)
+
+    with pytest.raises(evidence.EvidenceError, match="writable|protected regular"):
+        evidence.render_evidence(tmp_path)
+
+
+def test_changed_payload_does_not_match_unchanged_runtime_evidence(tmp_path):
+    _runtime_fixture(tmp_path)
+    evidence.write_evidence(tmp_path, evidence.render_evidence(tmp_path))
+    (tmp_path / "payload.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    assert evidence.check_evidence(tmp_path, evidence.render_evidence(tmp_path)) is False
+
+
+@pytest.mark.unit
+def test_sofascore_chunk_dependency_changes_whoscored_runtime_evidence(tmp_path):
+    """#1730: importing the shared planner must bind its new local module."""
+    dependency = evidence.PurePosixPath("scrapers/sofascore/season_chunks.py")
+    source = (ROOT / evidence.SOURCE_RELATIVE).read_bytes()
+    paths = set(evidence._expected_runtime_files(source)) | {dependency}
+    for relative in paths:
+        parent = tmp_path
+        for part in relative.parts[:-1]:
+            parent /= part
+            parent.mkdir(mode=0o700, exist_ok=True)
+        descriptor = os.open(tmp_path / relative, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write((ROOT / relative).read_bytes())
+    before = evidence.render_evidence(tmp_path)
+    with (tmp_path / dependency).open("ab") as stream:
+        stream.write(b"\n# Changed dependency: consumers need new runtime evidence.\n")
+    after = evidence.render_evidence(tmp_path)
+    assert before != after
+    assert dependency.as_posix() in json.loads(before[evidence.LOCK_RELATIVE])["files"]
 
 
 @pytest.mark.unit
