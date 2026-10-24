@@ -408,7 +408,7 @@ def account_scope(environment, outcome, *, state_path, failures_path, release):
     campaign = environment["SOFASCORE_EXPECTED_CAMPAIGN_ID"]
     scope_key = environment["SOFASCORE_SCOPE_KEY"]
     run_id = environment["SOFASCORE_SCOPE_RUN_ID"]
-    if outcome["status"] == "not_started":
+    if outcome["status"] in {"not_started", "waiting"}:
         return
     if outcome["status"] == "success":
         if environment.get("SOFASCORE_HISTORY_GROUP") != "july":

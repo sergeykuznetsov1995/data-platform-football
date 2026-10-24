@@ -77,6 +77,33 @@ def _target(tournament_id, season_id, league, canonical):
     )
 
 
+def test_missing_fixture_can_wait_seven_stale_sweeps_before_discovery():
+    """A0 reproduction: an absent fixture cannot promote its season to due.
+
+    The 2026-10-21 report had 1227 stale members and a 200-target slice.
+    This synthetic inventory demonstrates the discovery gap; it does not
+    reconstruct selection of every historically delayed game.
+    """
+    targets = [_target(i, i, f"SS-{i}", "2026") for i in range(1, 1228)]
+    known = {target.partition for target in targets}
+    # The fixture appears just after this season's previous visit. Bronze
+    # still contains only its old finished matches: no due/overdue evidence.
+    cursors = {"stale": targets[1].pair}
+    predicates = refresh.sweep_predicates(known, due=set(), overdue=set())
+    assert predicates["stale"](targets[0])
+    assert not predicates["due"](targets[0])
+    assert not predicates["overdue"](targets[0])
+    for sweep in range(1, 8):
+        plan, cursors, members = refresh.plan_sweep(
+            targets, known, set(), cursors,
+            max_due=24, max_stale=200, max_seed=40,
+        )
+        assert members["stale"] == 1227
+        assert (targets[0] in plan["stale"]) is (sweep == 7)
+    # At an eight-hour cadence this is 56h, beyond a 24h discovery target.
+    assert sweep * 8 == 56
+
+
 class _FakeClient:
     created: list[dict] = []
 

@@ -705,3 +705,25 @@ def test_slot_finalizer_will_not_steal_a_running_capture(monkeypatch,tmp_path):
     dr=SimpleNamespace(get_task_instance=lambda *args,**kwargs:SimpleNamespace(state='running'))
     with pytest.raises(Exception,match='not terminal'):
         module._finalize_historical_run(ti=ti,dag_run=dr,run_id='old')
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("verified", [True, False])
+def test_legacy_history_waiting_does_not_mark_scope_complete(monkeypatch, tmp_path, verified):
+    module = _load_dag_module()
+    inventory = {"verified": verified, "tournament_id": 8, "source_season_id": 825,
+                 "canonical_season": "2526", "finished_matches": 0, "schedule_events": 153}
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps({"status": "waiting", "waiting_reason": "season_has_no_finished_matches",
+        "campaign_id": "c", "tournament_id": 8, "source_season_id": 825, "run_id": "r",
+        "phases": [{"phase": "season", "status": "success", "schedule_inventory": inventory}]}))
+    monkeypatch.setattr(module.state, "mark_completed", lambda *a, **k: pytest.fail("waiting is not completion"))
+    monkeypatch.setattr(module.state, "clear_failed", lambda *a, **k: pytest.fail("waiting preserves prior failure evidence"))
+    env = {"SOFASCORE_CAMPAIGN_ACTION": "capture", "SOFASCORE_SCOPE_RESULT_PATH": str(path),
+           "SOFASCORE_SCOPE_KEY": "c:8:825", "SOFASCORE_SCOPE_RUN_ID": "r",
+           "SOFASCORE_CANONICAL_SEASON": "2526"}
+    if verified:
+        assert module._validate_historical_scope(**env) == {"status": "waiting", "scope_key": "c:8:825"}
+    else:
+        with pytest.raises(module.AirflowException, match="unverified"):
+            module._validate_historical_scope(**env)

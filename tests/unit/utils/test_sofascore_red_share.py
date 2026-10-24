@@ -255,3 +255,27 @@ def test_unstarted_reservation_is_not_a_capture_attempt(red_share,tmp_path,attem
     else:
         with pytest.raises(ValueError,match='unstarted scope'):
             red_share.history_scope_counts(*args)
+
+
+@pytest.mark.parametrize('verified', [True, False])
+def test_waiting_receipt_is_neutral_and_never_improves_red_share(red_share, tmp_path, verified):
+    import json, hashlib
+    _slot_report(tmp_path, 'run', 0, status='failed')
+    path = _slot_report(tmp_path, 'run', 1, status='waiting')
+    receipt = json.loads(path.read_text())
+    receipt['items'][1]['environment']['SOFASCORE_CANONICAL_SEASON'] = '2627'
+    receipt['receipt_digest'] = hashlib.sha256(json.dumps({k:v for k,v in receipt.items() if k != 'receipt_digest'},sort_keys=True).encode()).hexdigest()
+    path.write_text(json.dumps(receipt))
+    report_path = tmp_path / '1.json'
+    payload = json.loads(report_path.read_text())
+    payload.update(status='waiting', waiting_reason='season_has_no_finished_matches',
+                   phases=[{'phase':'season', 'status':'success', 'schedule_inventory':{
+                       'verified':verified, 'tournament_id':1, 'source_season_id':1,
+                       'canonical_season':'2627', 'finished_matches':0, 'schedule_events':153}}])
+    report_path.write_text(json.dumps(payload))
+    args = (tmp_path, '2026-10-07T00:00:00Z', '2026-10-08T00:00:00Z', {'run'})
+    if verified:
+        assert red_share.history_scope_counts(*args) == (1, 1)
+    else:
+        with pytest.raises(ValueError, match='unverified'):
+            red_share.history_scope_counts(*args)
