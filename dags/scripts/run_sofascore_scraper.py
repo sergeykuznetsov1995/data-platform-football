@@ -2685,6 +2685,8 @@ def _run_season_capture_engine(
     the two incremental Bronze MERGEs, and only then finalizes deferred
     normalized manifest records.
     """
+    from contextlib import ExitStack
+
     import pandas as pd
 
     from scrapers.base.base_scraper import ReplaceGuardError
@@ -2695,11 +2697,16 @@ def _run_season_capture_engine(
     )
     from scrapers.sofascore.scraper import _season_label
     from scrapers.sofascore.season_pipeline import (
+        initial_season_chunk,
         materialize_season_partition,
         plan_season_partition,
         replay_season_specs,
     )
 
+    from scrapers.sofascore.season_chunks import decode_season_chunk_unit, encode_season_chunk_unit
+    from scrapers.sofascore.workload_runtime import target_ids
+
+    lock_stack = ExitStack()
     league = leagues[0]
     canonical_season = _season_label(league, season)
     results = {
@@ -2716,12 +2723,6 @@ def _run_season_capture_engine(
         results["evidence_identity"] = _capture_identity(
             league, canonical_season, source_tournament_id, source_season_id
         )
-        # #1357: one manifest SELECT for the scope before the season plan.
-        from scrapers.sofascore.manifest import preload_manifest_scope
-
-        preload_manifest_scope(
-            capture_runtime.manifest_store, source_tournament_id, source_season_id
-        )
         freshness_key = _planned_freshness_key(
             workload_plan,
             "season",
@@ -2736,6 +2737,30 @@ def _run_season_capture_engine(
             "match",
             "final",
         )
+        # One scope/freshness lock also covers different logical runs.
+        # Re-read after acquisition: a cached pre-lock SELECT is not evidence
+        # that another worker has not already paid for these pages.
+        from scrapers.sofascore.manifest import preload_manifest_scope, refresh_manifest_scope
+        if workload_plan is not None and not offline_replay:
+            from scrapers.sofascore.writer_lock import season_capture_lock
+            lock_stack.enter_context(season_capture_lock(
+                source_tournament_id, source_season_id, freshness_key,
+            ))
+            refresh_manifest_scope(capture_runtime.manifest_store, source_tournament_id, source_season_id)
+        else:
+            preload_manifest_scope(capture_runtime.manifest_store, source_tournament_id, source_season_id)
+        chunk = None
+        if workload_plan is not None and workload_allocations:
+            if len(workload_allocations) != 1:
+                raise RuntimeError("season capture requires exactly one signed allocation")
+            unit, = target_ids(workload_allocations[0])
+            chunk = decode_season_chunk_unit(unit)
+            if chunk is None:
+                if unit != f"{source_tournament_id}:{source_season_id}":
+                    raise RuntimeError("legacy season allocation belongs to another scope")
+                chunk = initial_season_chunk(
+                    source_tournament_id, source_season_id, freshness_key, max_pages=_season_max_pages(),
+                )
         plan = plan_season_partition(
             capture_runtime.raw_store,
             capture_runtime.manifest_store,
@@ -2745,7 +2770,9 @@ def _run_season_capture_engine(
             event_freshness_key=event_freshness_key,
             paid_proxy=True,
             max_pages=_season_max_pages(),
+            schedule_chunk=chunk,
         )
+        chunk = getattr(plan, "schedule_chunk", chunk)
         results.update(
             {
                 "source_tournament_id": source_tournament_id,
@@ -2811,6 +2838,7 @@ def _run_season_capture_engine(
                     event_freshness_key=event_freshness_key,
                     paid_proxy=True,
                     max_pages=_season_max_pages(),
+                    schedule_chunk=chunk,
                 )
 
             if workload_plan is not None and len(workload_allocations) != 1:
@@ -2847,6 +2875,59 @@ def _run_season_capture_engine(
                     "referees": len(plan.referee_ids),
                 }
             )
+
+        if not getattr(plan, "schedule_chain_complete", True):
+            # Retained normalized pages remain deferred until the entire
+            # season can pass its existing atomic Bronze publication path.
+            # Replay only available raw to repair a crash before manifest;
+            # this never requests a page outside the signed portion.
+            unavailable = set(plan.missing_raw_keys) | set(plan.deferred_schedule_keys)
+            retained = [spec for spec in plan.specs if spec.key not in unavailable]
+            repaired = replay_season_specs(capture_runtime.engine, retained)
+            retained_by_key = {spec.key: spec for spec in retained}
+            for result in repaired:
+                record = result.manifest
+                spec = retained_by_key[record.key]
+                rejected_referee = (
+                    spec.raw_only and spec.key.endpoint == "referee_profile"
+                    and record.status.value == "schema_error"
+                    and record.error_type in {"SchemaValidationError", "RawPayloadSchemaError"}
+                )
+                if rejected_referee:
+                    raw = result.raw
+                    if (raw is None or raw.target != spec.raw_target
+                            or raw.content_hash != record.raw_content_hash
+                            or raw.blob_key != record.raw_blob_key
+                            or not 200 <= raw.http_status < 300 or raw.http_status == 204):
+                        raise RuntimeError("season chunk rejected referee has invalid raw lineage")
+                if not record.is_terminal and not (
+                    record.status.value == "retryable_failure"
+                    and record.error_type == "DeferredMaterialization"
+                    and result.raw is not None
+                ) and not rejected_referee:
+                    raise RuntimeError("season chunk raw replay has an unresolved endpoint")
+            _flush_manifest_store(capture_runtime.manifest_store)
+            # Never report healthy progress after a capture stopped inside
+            # its own paid range (including byte exhaustion).
+            frontier = dict(zip(("last", "next"), plan.schedule_frontier))
+            for direction in ("last", "next"):
+                start, stop = getattr(chunk, direction)
+                value = frontier[direction]
+                if stop > start and value is not None and value < stop:
+                    raise RuntimeError("season chunk stopped before its signed boundary")
+            results["partial"] = {
+                "kind": "season_schedule_continuation",
+                "stop_reason": "schedule_chunk_complete",
+                "raw_manifest_committed": True,
+                "chunk_unit": encode_season_chunk_unit(chunk),
+                "continuation": frontier,
+            }
+            results["manifest_committed"] = False
+            results["endpoint_completeness"] = 0.0
+            results["traffic"] = _logical_capture_traffic(capture_runtime.engine, live_traffic)
+            results["traffic"]["endpoint_completeness"] = 0.0
+            _write_results(output_path, results)
+            return 0
 
         replayed = replay_season_specs(
             capture_runtime.engine,
@@ -2911,6 +2992,7 @@ def _run_season_capture_engine(
             event_freshness_key=event_freshness_key,
             paid_proxy=True,
             max_pages=_season_max_pages(),
+            schedule_chunk=chunk,
         )
         # `match_phase_ready`, not `complete`: a referee profile is an
         # attribute of the match, discovered from event pages and captured on
@@ -2990,6 +3072,8 @@ def _run_season_capture_engine(
         results["traffic"] = capture_runtime.engine.metrics.snapshot()
         _write_results(output_path, results)
         return 1
+    finally:
+        lock_stack.close()
 
 
 def _run_legacy(

@@ -212,3 +212,104 @@ def test_immutable_plan_file_is_retry_safe_and_tamper_safe(tmp_path):
 
 def test_partition_key_is_not_a_delimiter_based_collision():
     assert partition_key("A|B", "C") != partition_key("A", "B|C")
+
+
+def test_signed_season_chunk_keeps_caps_and_freezes_retry_identity(tmp_path):
+    from dataclasses import replace
+    from scrapers.sofascore.season_chunks import SeasonScheduleChunk, decode_season_chunk_unit
+
+    chunk = SeasonScheduleChunk("17", "76986", (50, 100), (0, 0), "a" * 64)
+    workload = SeasonWorkload(17, 76986, EPL_SEASON_SHAPE, schedule_chunk=chunk)
+    partition = PartitionWorkload("ENG-Premier League", "2526", 17, season_workload=workload)
+
+    def build(work):
+        return build_partitioned_plan(
+            _policy(), dag_id="dag_ingest_sofascore", run_id="chunk-run::season",
+            partitions=(work,), control_token=TOKEN,
+            freshness_keys={"season": "final", "match": "final", "player": "final"},
+        )
+
+    plan = build(partition)
+    legacy = build(replace(partition, season_workload=SeasonWorkload(17, 76986, EPL_SEASON_SHAPE)))
+    assert len(plan.allocations) == 1
+    allocation = plan.allocations[0]
+    assert decode_season_chunk_unit(target_ids(allocation)[0]) == chunk
+    assert allocation.workload_class == legacy.allocations[0].workload_class
+    assert allocation.budget_bytes == legacy.allocations[0].budget_bytes
+    assert plan.run_cap_bytes == legacy.run_cap_bytes
+    assert plan.artifact_id == legacy.artifact_id
+    assert plan.to_dict()["schema_version"] == legacy.to_dict()["schema_version"]
+    assert allocation.allocation_id != legacy.allocations[0].allocation_id
+    path = tmp_path / "plan.json"
+    write_plan(path, plan)
+    assert write_plan(path, build(partition)) == path
+    assert load_plan(path, control_token=TOKEN) == plan
+    changed = replace(chunk, last=(100, 150))
+    with pytest.raises(WorkloadPlanError, match="different bytes"):
+        write_plan(path, build(replace(partition, season_workload=replace(workload, schedule_chunk=changed))))
+
+
+def test_season_chunk_source_identity_must_match_workload_and_partition():
+    from scrapers.sofascore.season_chunks import SeasonScheduleChunk
+
+    chunk = SeasonScheduleChunk("17", "76986", (0, 49), (0, 1), "a" * 64)
+    with pytest.raises(WorkloadPlanError, match="chunk.*identity"):
+        SeasonWorkload(16, 76986, EPL_SEASON_SHAPE, schedule_chunk=chunk)
+    with pytest.raises(WorkloadPlanError, match="chunk.*identity"):
+        SeasonWorkload(17, 999, EPL_SEASON_SHAPE, schedule_chunk=chunk)
+    with pytest.raises(WorkloadPlanError, match="tournament"):
+        build_partitioned_plan(
+            _policy(), dag_id="dag_ingest_sofascore", run_id="mismatch::season",
+            partitions=(PartitionWorkload("L", "2526", 16,
+                season_workload=SeasonWorkload(17, 76986, EPL_SEASON_SHAPE, schedule_chunk=chunk)),),
+            control_token=TOKEN,
+        )
+
+
+@pytest.mark.parametrize("changed_field", ["bounds", "evidence", "freshness"])
+def test_chunk_bound_evidence_and_freshness_cannot_change_after_signing(changed_field):
+    from dataclasses import replace
+    from scrapers.sofascore.season_chunks import SeasonScheduleChunk, encode_season_chunk_unit
+    from scrapers.sofascore.workload_plan import (
+        SignedDagRunPlan, WorkloadPlanSignatureError, qualify_work_unit,
+    )
+
+    chunk = SeasonScheduleChunk("17", "76986", (50, 100), (0, 0), "a" * 64)
+    plan = build_partitioned_plan(
+        _policy(), dag_id="dag_ingest_sofascore", run_id="chunk-run::season",
+        partitions=(PartitionWorkload("L", "2526", 17,
+            season_workload=SeasonWorkload(17, 76986, EPL_SEASON_SHAPE, schedule_chunk=chunk)),),
+        control_token=TOKEN,
+    )
+    payload = plan.to_dict()
+    if changed_field == "freshness":
+        payload["freshness_keys"]["season"] = "another-day"
+    else:
+        changed = replace(chunk, **({"last": (100, 150)} if changed_field == "bounds"
+                                   else {"evidence_digest": "b" * 64}))
+        payload["allocations"][0]["units"] = [qualify_work_unit(
+            partition_key("L", "2526"), encode_season_chunk_unit(changed),
+        )]
+    with pytest.raises(WorkloadPlanSignatureError, match="digest"):
+        SignedDagRunPlan.from_dict(payload, control_token=TOKEN)
+
+
+@pytest.mark.parametrize("targets", [
+    ("season-chunk-v9.invalid",), ("017:76986",), ("17:76986", "17:999"),
+])
+def test_runtime_partition_selection_rejects_invalid_season_units(targets):
+    from dataclasses import replace
+    from scrapers.sofascore.workload_plan import qualify_work_unit
+
+    plan = build_partitioned_plan(
+        _policy(), dag_id="dag_ingest_sofascore", run_id="chunk-run::season",
+        partitions=(PartitionWorkload("L", "2526", 17,
+            season_workload=SeasonWorkload(17, 76986, EPL_SEASON_SHAPE)),),
+        control_token=TOKEN,
+    )
+    invalid = replace(plan.allocations[0], units=tuple(
+        qualify_work_unit(partition_key("L", "2526"), unit) for unit in targets
+    ))
+    with pytest.raises(WorkloadPlanError, match="season.*unit"):
+        allocations_for_partition(replace(plan, allocations=(invalid,)),
+            league="L", canonical_season="2526", scope="season")

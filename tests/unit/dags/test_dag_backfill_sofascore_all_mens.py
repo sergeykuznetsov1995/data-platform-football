@@ -692,6 +692,53 @@ def test_slot_finalizer_recovers_terminal_worker_without_failing_unissued(monkey
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize('saved_outcome', [False, True])
+def test_slot_finalizer_recovers_durable_season_continuation(monkeypatch, tmp_path, saved_outcome):
+    from scrapers.sofascore import history_controller as controller
+    from scrapers.sofascore.history_worker import scope_outcome
+    from tests.unit.scrapers.test_sofascore_history_controller import (
+        snapshot, evidence, denominator, NOW, continuation_report,
+    )
+    module = _load_dag_module()
+    snap = snapshot(ids=(8,))
+    controller.plan(snap, inventory=evidence(snap), checkpoint_path=module.CONTROLLER_PATH,
+        denominator=denominator((8,)), dag_run_id='old', slot_count=1,
+        result_dir=str(tmp_path/'results'), moment=NOW)
+    index, env = controller.claim_scope(module.CONTROLLER_PATH, campaign_id=snap['campaign_id'],
+                                        run_id='old', slot=0, now=NOW)
+    controller.record_scope(module.CONTROLLER_PATH, campaign_id=snap['campaign_id'],
+                             run_id='old', slot=0, index=index, started_attempt=True)
+    dest = pathlib.Path(env['SOFASCORE_SCOPE_RESULT_PATH'])
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(continuation_report(run_id=env['SOFASCORE_SCOPE_RUN_ID'])))
+    if saved_outcome:
+        controller.record_scope(module.CONTROLLER_PATH, campaign_id=snap['campaign_id'],
+                                 run_id='old', slot=0, index=index, outcome=scope_outcome(env, 0))
+    monkeypatch.setattr(module, 'STATE_PATH', str(tmp_path/'state.json'))
+    monkeypatch.setattr(module, 'FAILURES_PATH', str(tmp_path/'failures.json'))
+    monkeypatch.setattr(module, 'RESULT_DIR', str(tmp_path/'results'))
+    monkeypatch.setattr(module.state, 'read_snapshot', lambda *a, **kw:snap)
+    ti = SimpleNamespace(xcom_pull=lambda **kw:[], xcom_push=lambda **kw:None)
+    dr = SimpleNamespace(get_task_instance=lambda *a, **kw:SimpleNamespace(state='failed'))
+    result = module._finalize_historical_run(ti=ti, dag_run=dr, run_id='old')
+    ledger = controller.read_summary(module.CONTROLLER_PATH, snap['campaign_id'])['run']
+    assert ledger['finalized'] and ledger['items']['0']['accounted']
+    assert ledger['items']['0']['outcome']['status'] == 'partial'
+    assert not pathlib.Path(module.STATE_PATH).exists()
+    assert not pathlib.Path(module.FAILURES_PATH).exists()
+    receipt = json.loads(pathlib.Path(result['receipt']).read_text())
+    assert receipt['items'][0]['outcome']['status'] == 'partial'
+    from dags.utils.sofascore_red_share import history_scope_counts
+    stamp = json.loads(dest.read_text())['history_slot']['started_at']
+    from datetime import datetime
+    end = datetime.fromisoformat(json.loads(dest.read_text())['history_slot']['finished_at'])
+    # The fixture starts on NOW; include its real terminal stamp in the readback.
+    from datetime import timedelta
+    assert history_scope_counts(tmp_path/'results', stamp[:10]+'T00:00:00Z',
+        (end + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z'), {'old'}) == (0, 1)
+
+
+@pytest.mark.unit
 def test_slot_finalizer_will_not_steal_a_running_capture(monkeypatch,tmp_path):
     from scrapers.sofascore import history_controller as controller
     from tests.unit.scrapers.test_sofascore_history_controller import snapshot,evidence,denominator,NOW

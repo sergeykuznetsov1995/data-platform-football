@@ -302,7 +302,7 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
 
 
 def _finalize_slots(reservation, snapshot, context, release):
-    from scrapers.sofascore.history_worker import stamp_result
+    from scrapers.sofascore.history_worker import scope_outcome, stamp_result
     campaign, run_id = snapshot["campaign_id"], reservation["run_id"]
     for index, item in reservation["items"].items():
         if item["accounted"]:
@@ -313,7 +313,12 @@ def _finalize_slots(reservation, snapshot, context, release):
         if ti is None or _task_state(ti) not in {"success", "failed", "upstream_failed", "skipped", "removed"}:
             raise AirflowException("history slot is not terminal; cannot reconcile")
         environment = reservation["plan"][item["plan_index"]]
-        outcome = item["outcome"] or {"status": "not_started" if item["attempts"] == 0 else "failed",
+        outcome = item["outcome"]
+        if outcome is None and item["attempts"] > 0:
+            saved = scope_outcome(environment, 0)
+            if saved["status"] in {"success", "partial"}:
+                outcome = saved
+        outcome = outcome or {"status": "not_started" if item["attempts"] == 0 else "failed",
                                     "reason": "history worker interrupted before accounting",
                                     "source_requests": 0 if item["attempts"] == 0 else None}
         history_controller.record_scope(CONTROLLER_PATH, campaign_id=campaign, run_id=run_id,
