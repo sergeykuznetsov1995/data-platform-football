@@ -737,6 +737,30 @@ def test_cycle_reports_a_partial_scope_as_a_finished_task(tmp_path, monkeypatch)
 
 
 @pytest.mark.unit
+def test_cycle_retains_season_continuation_and_never_starts_matches(tmp_path, monkeypatch):
+    from tests.unit.scrapers.test_sofascore_history_controller import continuation_report
+    paths = cycle.ScopeOverlayPaths(tmp_path/'tournaments.json', tmp_path/'medallion/competitions.yaml')
+    monkeypatch.setattr(cycle, 'load_exact_scope', lambda *a, **kw:_scope())
+    monkeypatch.setattr(cycle, 'render_scope_overlays', lambda *a, **kw:paths)
+    partial = continuation_report()['phases'][0]['partial']
+    entities = []
+    def run_capture(argv, **kwargs):
+        entities.append(argv[argv.index('--entity') + 1])
+        dest = Path(argv[argv.index('--output') + 1]); dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(dict(errors=[], partial=partial, traffic={'paid_proxy_bytes': 4321})))
+        return 0
+    with (patch('dags.scripts.prepare_sofascore_workload.prepare_workload_plan', side_effect=_plan_double),
+          patch('dags.scripts.run_sofascore_scraper.main', side_effect=run_capture)):
+        assert cycle.main(_cycle_argv(tmp_path, '--phase', 'all')) == 0
+    report = json.loads((tmp_path/'result.json').read_text())
+    assert entities == ['all']
+    assert report['status'] == 'partial' and report['errors'] == []
+    assert len(report['phases']) == 1 and report['phases'][0]['phase'] == 'season'
+    assert report['phases'][0]['partial'] == partial
+    assert report['bytes'] == 4321
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("archive_enabled", [False, True])
 def test_cycle_result_carries_elapsed_time_of_a_green_scope(tmp_path, monkeypatch, archive_enabled):
     if archive_enabled:
@@ -890,3 +914,83 @@ def test_phase_report_preserves_availability_and_control_evidence(tmp_path):
     path = tmp_path / "matches.json"
     path.write_text(json.dumps({"endpoint_availability": report, "errors": []}))
     assert cycle._phase_report(path)["endpoint_availability"] == report
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("events", [0, 153])
+def test_verified_season_without_finished_games_waits_before_matches(tmp_path, monkeypatch, events):
+    scope = {**_scope(), "tournament_id": 17, "source_season_id": 76986}
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: scope)
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: cycle.ScopeOverlayPaths(
+        tmp_path / "registry.json", tmp_path / "medallion" / "competitions.yaml"))
+    calls = []
+    inventory = {"verified": True, "tournament_id": 17, "source_season_id": 76986,
+                 "canonical_season": "2526", "finished_matches": 0, "schedule_events": events}
+    def phase(name, *a, **k):
+        calls.append(name)
+        return {"phase": name, "status": "success", "schedule_inventory": inventory}
+    monkeypatch.setattr(cycle, "run_phase", phase)
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "all")) == 0
+    assert calls == ["season"]  # Even stale notstarted games cannot trigger paid match capture.
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result["status"] == "waiting"
+    assert result["waiting_reason"] == "season_has_no_finished_matches"
+    assert result["phases"][0]["schedule_inventory"] == inventory
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("change", [
+    {"verified": False}, {"source_season_id": 1}, {"tournament_id": 1},
+    {"canonical_season": "2425"}, {"finished_matches": 1}, {"finished_matches": False},
+    {"schedule_events": -1},
+])
+def test_empty_season_wait_requires_verified_exact_inventory(tmp_path, monkeypatch, change):
+    scope = {**_scope(), "tournament_id": 17, "source_season_id": 76986}
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: scope)
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: cycle.ScopeOverlayPaths(
+        tmp_path / "registry.json", tmp_path / "medallion" / "competitions.yaml"))
+    calls = []
+    inventory = {"verified": True, "tournament_id": 17, "source_season_id": 76986,
+                 "canonical_season": "2526", "finished_matches": 0, "schedule_events": 153, **change}
+    def phase(name, *a, **k):
+        calls.append(name)
+        return {"phase": name, "status": "success", "schedule_inventory": inventory}
+    monkeypatch.setattr(cycle, "run_phase", phase)
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "all")) == 0
+    assert calls == ["season", "matches"]
+    assert json.loads((tmp_path / "result.json").read_text())["status"] == "success"
+
+
+@pytest.mark.unit
+def test_phase_report_preserves_exact_schedule_inventory(tmp_path):
+    inventory = {"verified": True, "tournament_id": 136, "source_season_id": 98511,
+                 "canonical_season": "2627", "finished_matches": 0, "schedule_events": 153}
+    path = tmp_path / "season.json"
+    path.write_text(json.dumps({"schedule_inventory": inventory}))
+    assert cycle._phase_report(path)["schedule_inventory"] == inventory
+
+
+@pytest.mark.unit
+def test_optional_referee_reject_keeps_diagnostics_and_does_not_block_matches(tmp_path, monkeypatch):
+    scope = {**_scope(), "tournament_id": 17, "source_season_id": 76986}
+    monkeypatch.setattr(cycle, "load_exact_scope", lambda *a, **k: scope)
+    monkeypatch.setattr(cycle, "render_scope_overlays", lambda *a, **k: cycle.ScopeOverlayPaths(
+        tmp_path / "registry.json", tmp_path / "medallion" / "competitions.yaml"))
+    inventory = {"verified": True, "tournament_id": 17, "source_season_id": 76986,
+                 "canonical_season": "2526", "finished_matches": 5, "schedule_events": 153}
+    season = {"phase": "season", "status": "success", "match_phase_ready": True,
+              "full_complete": False, "optional_endpoint_errors": [{"endpoint": "referee_profile", "status": "schema_error"}],
+              "schedule_inventory": inventory}
+    report_path = tmp_path / 'season.json'
+    report_path.write_text(json.dumps(season))
+    assert cycle._phase_report(report_path)['optional_endpoint_errors'] == season['optional_endpoint_errors']
+    calls = []
+    def phase(name, *a, **k):
+        calls.append(name)
+        return season if name == 'season' else {'phase':name, 'status':'success'}
+    monkeypatch.setattr(cycle, "run_phase", phase)
+    assert cycle.main(_cycle_argv(tmp_path, "--phase", "all")) == 0
+    assert calls == ['season', 'matches']
+    result = json.loads((tmp_path / 'result.json').read_text())
+    assert result['status'] == 'success'
+    assert result['phases'][0]['full_complete'] is False

@@ -2546,3 +2546,76 @@ def test_anchor_captcha_retries_with_fresh_browser_and_exact_meter(tmp_path, del
     assert all(browser.exit_calls == 1 for browser in captures)
     assert len(client.acquire_calls) == 1
     assert runtime.engine.budget.spent == (40 if scenario == "exhausted" else 90)
+
+
+def test_dynamic_season_rejected_optional_referee_is_retained_without_retry(tmp_path):
+    from scrapers.sofascore.season_pipeline import build_referee_profile_spec
+
+    runtime, _ = _runtime(tmp_path)
+    profile = build_referee_profile_spec(
+        referee_id=791840, expected_slugs=("sofia-prychyna",),
+        source_tournament_id=17, source_season_id=76986,
+        freshness_key="final", paid_proxy=True,
+    )
+    required = _spec(16412939)
+    specs = (profile, required)
+    client = _LeaseClient([0, 0, 80, 80, 180], final_total=180)
+    capture = _Capture([
+        _record(b'{"referee":{"id":789719,"slug":"sofiia-prychyna"}}'),
+        _record(b'{"items":[{"id":16412939}]}'),
+    ])
+    factory = _TransportFactory(client, capture)
+
+    def planner():
+        # A rejected JSON exists locally even though the profile stays pending.
+        missing = tuple(spec.key for spec in specs
+                        if not runtime.raw_store.has_payload(spec.raw_target))
+        return SimpleNamespace(specs=specs, missing_raw_keys=missing)
+
+    results, plan, traffic = capture_live_dynamic_specs(
+        runtime, planner, canonical_url="https://www.sofascore.com/tournament/17",
+        scope="SS-17:2526", entity="season_capture", transport_factory=factory,
+        optional_schema_endpoints=frozenset({"referee_profile"}),
+    )
+    assert len(results) == 2
+    assert results[0].manifest.status.value == "schema_error"
+    assert results[1].manifest.error_type == "DeferredMaterialization"
+    assert plan.missing_raw_keys == ()
+    assert factory.calls == capture.enter_calls == 1
+    assert traffic["provider_total_bytes"] == 180
+    assert runtime.raw_store.has_payload(profile.raw_target)
+
+
+def test_dynamic_optional_referee_does_not_tolerate_manifest_write_failure(tmp_path, monkeypatch):
+    from scrapers.sofascore.manifest import ManifestStatus
+    from scrapers.sofascore.season_pipeline import build_referee_profile_spec
+
+    runtime, _ = _runtime(tmp_path)
+    profile = build_referee_profile_spec(
+        referee_id=791840, expected_slugs=("sofia-prychyna",),
+        source_tournament_id=17, source_season_id=76986,
+        freshness_key="final", paid_proxy=True,
+    )
+    upsert = runtime.manifest_store.upsert
+
+    def fail_success(record):
+        if record.key == profile.key and record.status == ManifestStatus.SUCCESS:
+            raise OSError("referee manifest storage unavailable")
+        upsert(record)
+
+    monkeypatch.setattr(runtime.manifest_store, "upsert", fail_success)
+    client = _LeaseClient([0, 0, 80], final_total=80)
+    capture = _Capture([_record(b'{"referee":{"id":791840,"slug":"sofia-prychyna"}}')])
+
+    def planner():
+        missing = () if runtime.raw_store.has_payload(profile.raw_target) else (profile.key,)
+        return SimpleNamespace(specs=(profile,), missing_raw_keys=missing)
+
+    with pytest.raises(RuntimeError, match="OSError: referee manifest storage unavailable"):
+        capture_live_dynamic_specs(
+            runtime, planner, canonical_url="https://www.sofascore.com/tournament/17",
+            scope="SS-17:2526", entity="season_capture",
+            transport_factory=_TransportFactory(client, capture),
+            optional_schema_endpoints=frozenset({"referee_profile"}),
+        )
+    assert runtime.manifest_store.get(profile.key).error_type == "OSError"

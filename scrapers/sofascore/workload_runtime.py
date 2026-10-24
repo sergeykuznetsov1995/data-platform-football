@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from scrapers.sofascore.season_chunks import SeasonChunkError, decode_season_chunk_unit
 from scrapers.sofascore.workload_plan import (
     MATCH_BATCH_SIZE,
     PLAYER_BATCH_SIZE,
@@ -162,6 +163,8 @@ def build_partitioned_plan(
             )
         season = workload.season_workload
         if season is not None and season.pending:
+            if str(season.tournament_id) != tournament_id:
+                raise WorkloadPlanError("season workload tournament differs from partition")
             requests.append(
                 AllocationRequest(
                     task_id=f"capture_season_{slug}_batch_00000",
@@ -194,6 +197,13 @@ def allocations_for_partition(
     key = partition_key(league, canonical_season)
     selected: list[WorkloadAllocation] = []
     for allocation in plan.allocations:
+        if allocation.scope == "season":
+            if len(allocation.units) != 1:
+                raise WorkloadPlanError("season allocation must contain exactly one unit")
+            try:
+                decode_season_chunk_unit(parse_qualified_work_unit(allocation.units[0])[1])
+            except SeasonChunkError as exc:
+                raise WorkloadPlanError(f"invalid signed season unit: {exc}") from exc
         partitions = {parse_qualified_work_unit(unit)[0] for unit in allocation.units}
         if len(partitions) != 1:
             raise WorkloadPlanError(

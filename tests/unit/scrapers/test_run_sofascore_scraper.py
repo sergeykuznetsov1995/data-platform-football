@@ -300,7 +300,9 @@ def test_season_runner_receipts_are_after_merges_and_noop_does_not_claim_publica
     monkeypatch.setattr(writer_lock, "bronze_writer_lock", nullcontext)
     monkeypatch.setenv("SOFASCORE_REFRESH_EVIDENCE_DIR", str(tmp_path / "evidence"))
     monkeypatch.setenv("SOFASCORE_EVIDENCE_CODE_REVISION", "a" * 40)
-    test_runner_offline_season_replay_merges_then_noops_without_browser(tmp_path, monkeypatch)
+    test_runner_offline_season_replay_merges_then_noops_without_browser(
+        tmp_path, monkeypatch, has_finished_matches=True,
+    )
     report = json.loads((tmp_path / "season-offline.json").read_text())
     assert report["manifest_committed"] is True
     assert report["evidence_identity"]["source_season_id"] == 76986

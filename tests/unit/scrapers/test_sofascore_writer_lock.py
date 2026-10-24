@@ -102,6 +102,21 @@ def test_lock_is_taken_and_released_by_closing_the_connection(monkeypatch):
 
 
 @pytest.mark.unit
+def test_season_capture_lock_has_stable_scope_specific_key_and_releases_on_failure(monkeypatch):
+    connections = _fake_psycopg2(monkeypatch, answers=[True])
+    env = {writer_lock.WRITER_LOCK_DSN_ENV: DSN}
+    for season, freshness in [(92699, "final"), (92699, "final"), (92700, "final"), (92699, "next-day")]:
+        with pytest.raises(RuntimeError, match="injected crash"):
+            with writer_lock.season_capture_lock(26947, season, freshness, env):
+                raise RuntimeError("injected crash")
+    keys = [connection.executed[0][1][0] for _, connection in connections]
+    assert keys[0] == keys[1]
+    assert len(set(keys)) == 3
+    assert writer_lock.WRITER_LOCK_KEY not in keys
+    assert all(connection.closed for _, connection in connections)
+
+
+@pytest.mark.unit
 def test_busy_lock_waits_and_then_acquires(monkeypatch):
     connections = _fake_psycopg2(monkeypatch, answers=[False, False, True])
     clock = _FakeClock()

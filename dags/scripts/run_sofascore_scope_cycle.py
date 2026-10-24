@@ -113,10 +113,43 @@ def _phase_report(path: Path) -> dict[str, Any]:
     for field in (
         "rejected_rows", "rejected_players", "rejected_endpoints", "partial",
         "endpoint_availability",
+        "schedule_inventory",
+        "match_phase_ready", "full_complete", "optional_endpoint_errors",
     ):
         if field in payload:
             report[field] = payload[field]
     return report
+
+
+def verified_empty_schedule(phase: Mapping[str, Any], scope: Mapping[str, Any]) -> bool:
+    """Only a committed, fully enumerated exact season can justify waiting.
+
+    A missing target signature or an empty Bronze lookup is not this evidence.
+    In particular, overdue notstarted rows remain unresolved schedule data;
+    waiting does not claim that they are future games or that history is done.
+    """
+    inventory = phase.get("schedule_inventory")
+    return (
+        phase.get("phase") == "season" and phase.get("status") == "success"
+        and isinstance(inventory, dict) and inventory.get("verified") is True
+        and all(inventory.get(key) == scope.get(key) and scope.get(key) is not None
+                for key in ("tournament_id", "source_season_id", "canonical_season"))
+        and type(inventory.get("finished_matches")) is int
+        and inventory["finished_matches"] == 0
+        and type(inventory.get("schedule_events")) is int
+        and inventory["schedule_events"] >= 0
+    )
+
+
+def waiting_for_finished_matches(result: Mapping[str, Any], scope: Mapping[str, Any]) -> bool:
+    """Validate the waiting outcome at consumer boundaries, including retries."""
+    phases = result.get("phases")
+    return (
+        result.get("status") == "waiting"
+        and result.get("waiting_reason") == "season_has_no_finished_matches"
+        and isinstance(phases, list) and len(phases) == 1
+        and isinstance(phases[0], dict) and verified_empty_schedule(phases[0], scope)
+    )
 
 
 def run_phase(
@@ -383,6 +416,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
                 _finish("failed")
                 return 1
+            if args.phase == "all" and verified_empty_schedule(phase_result, scope):
+                result["waiting_reason"] = "season_has_no_finished_matches"
+                _finish("waiting")
+                return 0
         _finish("success")
         return 0
     except Exception as exc:
@@ -406,4 +443,5 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["ScopeOverlayPaths", "main", "run_phase"]
+__all__ = ["ScopeOverlayPaths", "main", "run_phase", "verified_empty_schedule",
+           "waiting_for_finished_matches"]
