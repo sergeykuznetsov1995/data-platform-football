@@ -1152,24 +1152,31 @@ def plan_stale_checks(
     full_limit: int,
     chase_pages: int,
     full_cursor: Optional[tuple[int, int]] = None,
+    unselected_seed_pages: int = 0,
 ) -> tuple[list[SeasonTarget], Optional[tuple[int, int]], set[tuple[int, int]], dict]:
     """Trade reserved stale pages for discovery breadth, never a larger cap.
 
     A full visit reserves ``chase_pages + 1`` pages. A head probe reserves
     one, has no fixture request, and queues any unread suffix. Maximise full
     visits while covering a fixed healthy queue in two sweeps when possible.
+    Only seed slots left unselected by the final plan can add page capacity.
+    Do not trade full fixture freshness beyond nine sweeps for head discovery.
     Independent FIFO anchors prevent resonance from assigning the same small
     subset full visits forever. No freshness/completion claim is persisted.
     """
     members = sum(1 for target in targets if wanted(target))
     cost = chase_pages + 1
-    allowance = full_limit * cost
+    if unselected_seed_pages < 0:
+        raise ValueError("unselected seed pages cannot be negative")
+    allowance = full_limit * cost + unselected_seed_pages
     full = full_limit
     probes = 0
+    full_start = full_cursor if full_cursor is not None else cursor
     if members > 2 * full_limit and allowance:
         needed = (members + 1) // 2
         candidate_full = min(full_limit, (allowance - needed) // cost)
-        if candidate_full > 0:
+        minimum_full = (members + 8) // 9
+        if candidate_full >= minimum_full:
             full = candidate_full
             probes = min(members - full, allowance - full * cost)
     check_limit = full + probes
@@ -1177,7 +1184,7 @@ def plan_stale_checks(
         # Probe capacity ALONE covers the discovery horizon: a full visit may
         # overlap a previous sweep's probes. Both modes remain disjoint NOW.
         full_selected, next_full_cursor = take_slice(
-            targets, full_cursor if full_cursor is not None else cursor, full, wanted,
+            targets, full_start, full, wanted,
         )
         full_pairs = {target.pair for target in full_selected}
         probe_selected, next_cursor = take_slice(
@@ -1188,15 +1195,18 @@ def plan_stale_checks(
         probe_pairs = {target.pair for target in probe_selected}
     else:
         # Preserve full rotation when the existing allowance cannot afford
-        # both the discovery horizon AND any full visits. Never probe forever
-        # at the expense of all future fixture updates.
-        selected, next_cursor = take_slice(targets, cursor, check_limit, wanted)
+        # both the discovery horizon AND the fixture freshness bound. Keep
+        # the legacy full quota instead of silently stretching fixture age.
+        # Keep the independent full anchor across mode changes too. Starting
+        # from the broad anchor here resets fixture progress whenever the
+        # selected seed count crosses the probe/fallback threshold.
+        selected, next_cursor = take_slice(targets, full_start, check_limit, wanted)
         next_full_cursor = next_cursor
         probe_pairs = set()
     selected_full = len(selected) - len(probe_pairs)
     coverage_capacity = len(probe_pairs) if probes else len(selected)
     detail = {
-        "selection_version": 2,
+        "selection_version": 3,
         "eligible_targets": members,
         "full_limit": full,
         "probe_limit": probes,
@@ -1205,13 +1215,14 @@ def plan_stale_checks(
         "page_allowance": allowance,
         "planned_pages": selected_full * cost + len(probe_pairs),
         "target_sweeps": 2,
+        "full_target_sweeps": 9,
+        "full_freshness_limited": members > 9 * selected_full,
         "rotation_sweeps": (members + coverage_capacity - 1) // coverage_capacity
                            if coverage_capacity else None,
         "full_rotation_sweeps": (members + selected_full - 1) // selected_full
                                 if selected_full else None,
         "next_full_cursor": list(next_full_cursor) if next_full_cursor else None,
-        "full_cursor_start": list(full_cursor if probes and full_cursor is not None else cursor)
-                             if cursor is not None or (probes and full_cursor is not None) else None,
+        "full_cursor_start": list(full_start) if full_start else None,
         "coverage_limited": members > 2 * coverage_capacity,
         "unselected_reason": "existing_page_allowance_exhausted" if members > 2 * coverage_capacity
                              else "next_cursor_rotation",
@@ -1298,14 +1309,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             overdue=overdue,
             max_overdue=limits["overdue"],
         )
-        # Bronze cannot prioritise a fixture/result it has never seen. The
-        # old 200 full stale visits took seven runs to cover 1227 seasons.
-        # Reuse that SAME reserved page/byte allowance for broader head checks.
-        plan["stale"], next_cursors["stale"], stale_probes, stale_checks = plan_stale_checks(
-            all_targets, cursors.get("stale"), wanted_now["stale"],
-            full_limit=limits["stale"], chase_pages=args.chase_pages,
-            full_cursor=full_cursor,
-        )
         # The knobs are read from the environment, so an override can ask for
         # more pages than the byte cap admits.  Refuse before a single paid
         # request instead of dying fail-closed with the sweep half done.
@@ -1335,6 +1338,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan["seed"] = retry_targets + [
             target for target in plan["seed"] if target.pair not in retried
         ]
+        seed_cost = class_page_costs(args.chase_pages, args.seed_pages)["seed"]
+        unselected_seed_pages = (limits["seed"] - len(plan["seed"])) * seed_cost
+        # Bronze cannot prioritise a fixture/result it has never seen. The
+        # old 200 full stale visits took seven runs to cover 1227 seasons.
+        # Reuse reserved pages only after the seed/resume selection is final.
+        plan["stale"], next_cursors["stale"], stale_probes, stale_checks = plan_stale_checks(
+            all_targets, cursors.get("stale"), wanted_now["stale"],
+            full_limit=limits["stale"], chase_pages=args.chase_pages,
+            full_cursor=full_cursor, unselected_seed_pages=unselected_seed_pages,
+        )
+        stale_checks["unselected_seed_reserve"] = {
+            "reserved_targets": limits["seed"],
+            "selected_targets": len(plan["seed"]),
+            "pages_per_target": seed_cost,
+            "available_pages": unselected_seed_pages,
+            "transferred_pages": max(
+                0, stale_checks["planned_pages"] - limits["stale"] * (args.chase_pages + 1),
+            ),
+        }
         # The page each resumed chain owes.  The fetcher itself re-reads the one
         # before it (the source repacks its pages, and a page fetched twice is a
         # MERGE no-op) while counting its bound from the owed page — doing the
@@ -1431,6 +1453,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "stale discovery needs more than two sweeps under the existing "
                 f"page allowance: {stale_checks['eligible_targets']} seasons, "
                 f"{stale_checks['check_limit']} checks per sweep"
+            )
+        if stale_checks["full_freshness_limited"]:
+            report.setdefault("warnings", []).append(
+                "stale future fixtures need more than nine sweeps under the existing "
+                f"full quota: {stale_checks['eligible_targets']} seasons, "
+                f"{stale_checks['full_limit']} full visits per sweep"
             )
         if report["idle"]:
             raise ValueError(
