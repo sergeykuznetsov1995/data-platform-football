@@ -60,6 +60,7 @@ class MemoryCursor:
         if self.db.fail_sql and self.db.fail_sql in sql:
             raise RuntimeError('injected late physical SQL failure')
         sql = re.sub(r'iceberg\.(?:bronze|ops)\.', '', sql).strip()
+        sql = sql.replace('json_extract_scalar(', 'json_extract(')
         if '$snapshots' in sql:
             target = re.search(r'FROM "?(\w+)\$snapshots', sql).group(1)
             if not self.db.sql.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (target,)).fetchone():

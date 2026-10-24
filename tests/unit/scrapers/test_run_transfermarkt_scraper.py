@@ -2392,7 +2392,10 @@ class TestProviderByteGrant:
 
         assert len(selected) == 500
         assert coverage == {
-            'roster_size': 2199, 'selected': 500, 'pending': 1699,
+            'roster_size': 2199, 'selected': 500, 'pending': 2199,
+            'policy_version': 'player-endpoint-v1',
+            'debt_player_ids': [str(value) for value in range(1, 2200)],
+            'refresh_pending': 0,
         }
 
 

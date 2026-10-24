@@ -1240,6 +1240,43 @@ def test_career_debt_gate_is_exact_at_its_boundary():
     assert over['passed'] is False
 
 
+@pytest.mark.parametrize('pending,passed', [(0, True), (10, True), (15, False)])
+def test_player_debt_gate_counts_scope_roster_once_for_both_endpoints(pending, passed):
+    control = _load().control
+    from dags.utils.transfermarkt_career_debt import CAREER_DEBT_POLICY
+    coverage = {
+        endpoint: {'roster_size': 100, 'selected': 0, 'pending': pending,
+            'policy_version': CAREER_DEBT_POLICY, 'debt_player_ids': [str(i) for i in range(pending)],
+            'refresh_pending': 0}
+        for endpoint in ('transfers', 'market_value_history')
+    }
+    manifest = SimpleNamespace(scope_id='new-scope', dq_evidence={
+        'career_fetches_pending': pending, 'roster_coverage': coverage})
+    report = control._career_debt_report([manifest])
+    assert report['career_fetches_pending'] == pending
+    assert report['roster_size'] == 100
+    assert report['career_debt_ratio'] == pending / 100
+    assert report['passed'] is passed
+
+
+def test_career_debt_gate_preserves_legacy_endpoint_denominator_in_mixed_slot():
+    control = _load().control
+    legacy = SimpleNamespace(scope_id='old-scope', dq_evidence={
+        'career_fetches_pending': 30, 'roster_coverage': {
+            endpoint: {'roster_size': 100, 'selected': 0, 'pending': 15}
+            for endpoint in ('transfers', 'market_value_history')}})
+    modern = SimpleNamespace(scope_id='new-scope', dq_evidence={
+        'career_fetches_pending': 15, 'roster_coverage': {
+            endpoint: {'roster_size': 100, 'selected': 0, 'pending': 15,
+                'policy_version': 'player-endpoint-v1'}
+            for endpoint in ('transfers', 'market_value_history')}})
+    assert control._career_debt_report([legacy])['roster_size'] == 200
+    report = control._career_debt_report([legacy, modern])
+    assert report['roster_size'] == 300
+    assert report['career_debt_ratio'] == 0.15
+    assert report['passed'] is False
+
+
 def test_career_debt_gate_sums_the_whole_slot_and_honours_an_override():
     mod = _load()
     control = mod.control

@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
+from dags.utils.transfermarkt_career_debt import career_debt_ctes
+
 from scrapers.transfermarkt.denominator import Denominator, load_denominator
 from scrapers.transfermarkt.registry import (
     ClassificationStatus,
@@ -994,12 +996,9 @@ def build_promoted_registry_query(
       AND unknown_active_count = 0{snapshot_filter}
     ORDER BY revision DESC
     LIMIT 1
-), last_complete_scope AS (
+), {career_debt_ctes()}, last_complete_scope AS (
     SELECT competition_id, edition_id,
-           with_timezone(committed_at, 'UTC') AS last_success_at,
-           COALESCE(TRY_CAST(json_extract_scalar(
-               entity_manifest_json, '$.dq_evidence.career_fetches_pending'
-           ) AS bigint), 0) AS career_fetches_pending
+           with_timezone(committed_at, 'UTC') AS last_success_at
     FROM (
         SELECT *, ROW_NUMBER() OVER (
             PARTITION BY competition_id, edition_id
@@ -1060,13 +1059,17 @@ SELECT
     e.schema_revision AS edition_schema_revision,
     p.registry_snapshot_id,
     s.last_success_at,
-    COALESCE(s.career_fetches_pending, 0) AS career_fetches_pending
+    COALESCE(d.pending, 0) AS career_fetches_pending
 FROM {COMPETITIONS_TABLE} c
 JOIN {EDITIONS_TABLE} e
   ON e.competition_id = c.competition_id
 JOIN promoted p
   ON p.registry_snapshot_id = c.registry_snapshot_id
  AND p.registry_snapshot_id = e.registry_snapshot_id
+LEFT JOIN (
+    SELECT competition_id, edition_id, COUNT(DISTINCT player_id) AS pending
+    FROM career_debt GROUP BY competition_id, edition_id
+) d ON d.competition_id = c.competition_id AND d.edition_id = e.edition_id
 LEFT JOIN last_complete_scope s
   ON s.competition_id = c.competition_id
  AND s.edition_id = e.edition_id

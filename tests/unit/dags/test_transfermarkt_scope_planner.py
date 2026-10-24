@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -373,6 +375,70 @@ def test_historical_success_is_immutable_and_current_fresh_scope_is_not_due():
     )
     assert plan.total_selected_count == 0
     assert plan.mapped_payloads == ()
+
+
+@pytest.mark.parametrize('policy', [None, 'legacy-policy', 'player-endpoint-v1'])
+@pytest.mark.parametrize('manifest_pending', [0, 7])
+def test_completed_historical_scope_uses_live_global_debt(monkeypatch, policy, manifest_pending):
+    monkeypatch.setenv('TM_PARSER_VERSION', 'v2')
+    monkeypatch.setenv('TM_SCHEMA_VERSION', '2')
+    competition = _competition('HIST')
+    edition = _edition('HIST', '2024', current=False)
+    evidence = {'career_fetches_pending': manifest_pending}
+    if policy is not None:
+        evidence['roster_coverage'] = {
+            'market_value_history': {'policy_version': policy},
+        }
+
+    with sqlite3.connect(':memory:') as db:
+        db.row_factory = sqlite3.Row
+        db.create_function('with_timezone', 2, lambda value, zone: value)
+        edition_row = edition.as_dict()
+        edition_row['is_current'] = edition_row.pop('current')
+        tables = {
+            'transfermarkt_competitions_v2': competition.as_dict(),
+            'transfermarkt_competition_editions_v2': edition_row,
+            'transfermarkt_registry_state_v2': {
+                'state_key': 'canonical', 'status': 'promoted',
+                'unknown_active_count': 0, 'registry_snapshot_id': 'registry-1', 'revision': 1,
+            },
+            'transfermarkt_scope_manifest_v2': {
+                'competition_id': 'HIST', 'edition_id': '2024',
+                'status': state.SCOPE_COMPLETION_STATUS,
+                'committed_at': (NOW - timedelta(days=365)).isoformat(),
+                'entity_manifest_json': json.dumps({'dq_evidence': evidence}),
+            },
+            'transfermarkt_squad_memberships': {
+                'competition_id': 'HIST', 'edition_id': '2024', 'player_id': '1',
+            },
+        }
+        for table, row in tables.items():
+            db.execute(f'CREATE TABLE {table} ({", ".join(row)})')
+            db.execute(f'INSERT INTO {table} VALUES ({", ".join("?" for _ in row)})',
+                tuple(row.values()))
+        db.execute('CREATE TABLE transfermarkt_fetch_state (source_id text, endpoint text, '
+            'parser_version text, schema_version text, last_success_at text)')
+        # Success from an old parser cannot discharge current-parser debt.
+        for endpoint in ('transfer_events', 'market_value_points'):
+            db.execute('INSERT INTO transfermarkt_fetch_state VALUES (?, ?, ?, ?, ?)',
+                ('1', endpoint, 'old', '2', NOW.isoformat()))
+        sql = planner.build_promoted_registry_query()
+        sql = re.sub(r'iceberg\.(?:ops|bronze|silver)\.', '', sql)
+        sql = sql.replace('json_extract_scalar', 'json_extract').replace('TRY_CAST', 'CAST')
+
+        for completed, expected in enumerate((1, 1, 0)):
+            rows = [dict(row) for row in db.execute(sql)]
+            assert len(rows) == 1
+            assert rows[0]['career_fetches_pending'] == expected
+            plan = planner.plan_transfermarkt_scopes(
+                {}, parent_cycle_id=f'scheduled__global-debt-{completed}',
+                registry_rows=rows, now=NOW, selection_mode='historical_only',
+            )
+            assert len(plan.mapped_payloads) == expected
+            if completed < 2:
+                endpoint = ('transfer_events', 'market_value_points')[completed]
+                db.execute('INSERT INTO transfermarkt_fetch_state VALUES (?, ?, ?, ?, ?)',
+                    ('1', endpoint, 'v2', '2', NOW.isoformat()))
 
 
 def test_current_registry_query_filters_editions_without_weakening_classification():

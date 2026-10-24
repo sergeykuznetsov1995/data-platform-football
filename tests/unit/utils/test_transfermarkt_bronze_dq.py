@@ -73,6 +73,18 @@ class StubCursor:
         return self._rows
 
 
+def test_career_debt_reports_unfinished_scope_evidence_separately():
+    cur = StubCursor(overrides=[('WITH career_roster AS', [(1, 0, 1, 2, 2)])])
+    results = dq.run_bronze_dq(cur, registry_snapshot_id='snap-1',
+        zone='full', legacy_allowlist=[])
+    result = next(item for item in results if item.name == 'tm_career_debt')
+    assert result.value == {
+        'career_fetches_pending': 1, 'null_evidence_manifests': 0,
+        'complete_manifests': 1, 'roster_players': 2, 'debt_ratio': 0.5,
+        'target_scopes': 2, 'missing_complete_manifests': 1,
+    }
+
+
 def _pair_counts_override(table, rows):
     return (
         lambda sql, t=table: (
