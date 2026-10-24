@@ -10366,7 +10366,8 @@ def test_transfermarkt_reserved_streams_survive_restart_and_lease_rotation(share
     assert request('history-0', 'after-restart').granted
 
 
-def test_transfermarkt_site_feedback_requires_consumed_stream_permit(shared_mod, tmp_path):
+@pytest.mark.parametrize('status,challenge', [(403, False), (429, False), (405, True)])
+def test_transfermarkt_site_feedback_requires_consumed_stream_permit(shared_mod, tmp_path, status, challenge):
     from scrapers.transfermarkt.streams import TransfermarktStreams
     clock = [0.0]
     controller = shared_mod.TransfermarktStreamPermitController(
@@ -10378,16 +10379,16 @@ def test_transfermarkt_site_feedback_requires_consumed_stream_permit(shared_mod,
     decision = controller.request(**context)
     with pytest.raises(shared_mod.TransfermarktPermitError):
         controller.report_block(stream_id='history-0', permit_id=decision.permit_id,
-                                status=403, challenge=False)
+                                status=status, challenge=challenge)
     controller.consume(**context, permit_id=decision.permit_id, permit_token=decision.permit_token)
     controller.report_block(stream_id='history-0', permit_id=decision.permit_id,
-                            status=403, challenge=False)
+                            status=status, challenge=challenge)
     assert controller.rate.slow['history-0'] == 1805
     assert controller.rate.slow['current-0'] == 0
     # Repeated feedback cannot manufacture a series of three site failures.
     for _ in range(3):
         controller.report_block(stream_id='history-0', permit_id=decision.permit_id,
-                                status=403, challenge=False)
+                                status=status, challenge=challenge)
     assert controller.rate.pause['history-0'] == 0
     restarted = shared_mod.TransfermarktStreamPermitController(
         streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])

@@ -503,6 +503,32 @@ def _transport_attempts(stats):
                if int(status) in (0, 407) or int(status) >= 500)
 
 
+def _restore_url_attempts(state, tasks):
+    """Keep limits per URL, including closing packets and older internal retries."""
+    keys_by_url = {}
+    for task in tasks:
+        keys_by_url.setdefault(task['url'], set()).add(task['key'])
+    observed = {url: {'responses': 0, 'transport': 0} for url in keys_by_url}
+    for record in state['attempt_records']:
+        counts = observed.get(record.get('url'))
+        if counts is None:
+            continue
+        status = record.get('status_code')
+        transport = (record.get('outcome_kind') == 'transport_error'
+                     or status in (0, 407) or (isinstance(status, int) and status >= 500))
+        counts['transport' if transport else 'responses'] += 1
+    previous = state.get('url_attempts', {})
+    restored = {}
+    for url, keys in keys_by_url.items():
+        restored[url] = {
+            'responses': max(observed[url]['responses'], previous.get(url, {}).get('responses', 0),
+                             sum(state['endpoint_tries'].get(key, 0) for key in keys)),
+            'transport': max(observed[url]['transport'], previous.get(url, {}).get('transport', 0),
+                             sum(state['transport_tries'].get(key, 0) for key in keys)),
+        }
+    state['url_attempts'] = restored
+
+
 def _parity_day_guard(state: dict, pending: int, now: datetime) -> None:
     """One parity observation must stay inside one Moscow date (same-day rule)."""
     today = now.astimezone(MSK).date()
@@ -575,13 +601,16 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
         # a site response until the client proves it was a transport failure.
         state.setdefault("transport_tries", {})
         state.setdefault("endpoint_tries", {
-            key: count - state["transport_tries"].get(key, 0)
+            key: max(0, count - state["transport_tries"].get(key, 0))
             for key, count in state["tries"].items()
         })
+        _restore_url_attempts(state, tasks)
+        urls = {task['key']: task['url'] for task in tasks}
 
         def attempts_exhausted(key):
-            return (state["endpoint_tries"].get(key, 0) >= args.endpoint_attempts
-                    or state["transport_tries"].get(key, 0) >= getattr(args, "transport_attempts", 4))
+            counts = state['url_attempts'][urls[key]]
+            return (counts['responses'] >= args.endpoint_attempts
+                    or counts['transport'] >= getattr(args, 'transport_attempts', 4))
 
         if state["identity"] != identity:
             raise ProbeGateError("observation input changed; create a new evidence directory")
@@ -609,22 +638,35 @@ def run(args, *, client_factory=_client, monotonic=time.monotonic, now_fn=None) 
                     if args.mode == "cohort":
                         continue
                     raise ProbeGateError("endpoint attempt limit exhausted; no schema gate")
-                state["tries"][task["key"]] = state["tries"].get(task["key"], 0) + 1
-                state["endpoint_tries"][task["key"]] = state["endpoint_tries"].get(task["key"], 0) + 1
-                _write(state_path, state)
-                transport_remaining = getattr(args, "transport_attempts", 4) - state["transport_tries"].get(task["key"], 0)
+                counts = state['url_attempts'][task['url']]
+                response_remaining = args.endpoint_attempts - counts['responses']
+                transport_remaining = getattr(args, 'transport_attempts', 4) - counts['transport']
                 before = client.get_traffic_stats()
                 request_remaining = remaining["request_attempts"] - before["request_attempts"]
-                outcome = client.fetch(task["url"], as_json=task["json"], max_attempts=min(4, transport_remaining, request_remaining),
-                                       label=task["kind"], context={"cycle_id": portion_id, "scope_id": task["scope"]})
-                transport_attempts = _transport_attempts(client.get_traffic_stats()) - _transport_attempts(before)
-                state["transport_tries"][task["key"]] = state["transport_tries"].get(task["key"], 0) + transport_attempts
-                # Transport-class failures (no response, gateway errors, any 5xx —
-                # gateway 502 often arrives without an upstream-class header) use the
-                # transport cap; site refusals (403/405/404/429) keep the endpoint cap.
-                if not outcome.is_success and (outcome.status_code in (None, 0)
-                        or outcome.status_code >= 500 or outcome.proxy_upstream_status):
-                    state["endpoint_tries"][task["key"]] -= 1
+                # Reserve an unknown attempt conservatively before I/O. The active
+                # experiment marker still forbids unaccounted crash recovery.
+                state['tries'][task['key']] = state['tries'].get(task['key'], 0) + 1
+                state['endpoint_tries'][task['key']] = state['endpoint_tries'].get(task['key'], 0) + 1
+                counts['responses'] += 1
+                _write(state_path, state)
+                try:
+                    # A fetch may rotate internally. Bounding it by BOTH remaining
+                    # classes prevents any response ordering from overrunning a cap.
+                    outcome = client.fetch(task['url'], as_json=task['json'],
+                                           max_attempts=min(4, response_remaining, transport_remaining, request_remaining),
+                                           label=task['kind'], context={'cycle_id': portion_id, 'scope_id': task['scope']})
+                finally:
+                    after = client.get_traffic_stats()
+                    attempts = after['request_attempts'] - before['request_attempts']
+                    if attempts:
+                        transport = _transport_attempts(after) - _transport_attempts(before)
+                        responses = attempts - transport
+                        state['tries'][task['key']] += attempts - 1
+                        state['endpoint_tries'][task['key']] += responses - 1
+                        state['transport_tries'][task['key']] = state['transport_tries'].get(task['key'], 0) + transport
+                        counts['responses'] += responses - 1
+                        counts['transport'] += transport
+                    _write(state_path, state)
                 if not outcome.is_success or not outcome.raw_capture_id:
                     report["failure"] = {"key": task["key"], "status": outcome.status.value, "http_status": outcome.status_code}
                     state["failures"][task["key"]] = report["failure"]

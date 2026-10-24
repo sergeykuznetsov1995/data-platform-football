@@ -2411,6 +2411,22 @@ class TransfermarktHttpClient:
                     retry=attempt > 1,
                     duration_seconds=elapsed,
                 )
+                if status_code == 405:
+                    # AWS WAF uses 405 for CAPTCHA. A plain method error must
+                    # not slow the source; identify the header or saved HTML.
+                    text = body.decode('utf-8', errors='replace').lower()
+                    is_aws_captcha = (
+                        (_header_value(response_headers, 'x-amzn-waf-action') or '').lower() == 'captcha'
+                        or ('<title>human verification</title>' in text
+                            and '.captcha.awswaf.com/' in text)
+                    )
+                    if is_aws_captcha:
+                        # Account the actual source reply before fallible feedback.
+                        # A control failure is not another source/transport attempt.
+                        try:
+                            self._report_site_block(status_code, challenge=True)
+                        except Exception as exc:
+                            raise TrafficMeterError('CAPTCHA site feedback unavailable') from exc
                 if not proxy_success:
                     self._avoid_on_next_client(proxy_obj)
                     self._discard_failed_transport(label=label)

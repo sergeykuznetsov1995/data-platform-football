@@ -150,6 +150,54 @@ def test_stream_lease_pins_profile_and_binds_feedback_to_consumed_permit():
         status=403, challenge=False)
 
 
+@pytest.mark.parametrize('body,headers,is_captcha', [
+    (b'<title>Human Verification</title><script src="https://x.captcha.awswaf.com/captcha.js"></script>', {}, True),
+    (b'captcha', {'X-Amzn-Waf-Action': 'captcha'}, True),
+    (b'Method Not Allowed', {}, False),
+    (b'<title>Human Verification</title>', {}, False),
+])
+def test_aws_405_feedback_slows_stream_and_survives_restart(body, headers, is_captcha):
+    from scrapers.transfermarkt.streams import StreamRateState, TransfermarktStreams
+    rates = StreamRateState(TransfermarktStreams(), 0)
+    rates.grant('current-0', 5)
+    provider = _FakeLeaseProvider([LeaseTrafficSnapshot(up_bytes=100, down_bytes=len(body))])
+    feedback = []
+    def report(**kwargs):
+        feedback.append(kwargs)
+        rates.site_block('current-0', 5, **kwargs)
+    provider.report_site_block = report
+    response = _Response(body, status=405)
+    response.headers.update(headers)
+    client = TransfermarktHttpClient(lease_provider=provider, client_factory=_TlsFactory([response]),
+                                    traffic_ledger=SharedTrafficLedger(hard_provider_bytes=1000000, soft_provider_bytes=900000),
+                                    sleep_fn=lambda _: None)
+    outcome = client.fetch('https://www.transfermarkt.com/x', as_json=False, max_attempts=1)
+    client.close()
+    assert outcome.status == FetchStatus.BLOCKED
+    assert feedback == ([{'status': 405, 'challenge': True}] if is_captcha else [])
+    resumed = StreamRateState(rates.streams, 5, rates.dump())
+    assert resumed.ready_at('current-0', 5) == (15 if is_captcha else 10)
+    assert resumed.slow['current-0'] == (1805 if is_captcha else 0)
+    assert client.get_traffic_stats()['status_counts'] == {'405': 1}
+
+
+def test_captcha_feedback_failure_stops_without_retry_or_transport_reclassification():
+    provider = _FakeLeaseProvider([LeaseTrafficSnapshot(up_bytes=100, down_bytes=10)])
+    def fail(**kwargs):
+        raise RuntimeError('offline control failure')
+    provider.report_site_block = fail
+    response = _Response(b'CAPTCHA', status=405)
+    response.headers['x-amzn-waf-action'] = 'captcha'
+    factory = _TlsFactory([response])
+    client = TransfermarktHttpClient(lease_provider=provider, client_factory=factory,
+                                    traffic_ledger=SharedTrafficLedger(hard_provider_bytes=1000000, soft_provider_bytes=900000),
+                                    sleep_fn=lambda _: None)
+    with pytest.raises(TrafficMeterError, match='feedback'):
+        client.fetch('https://www.transfermarkt.com/x', as_json=False)
+    assert len(factory.calls) == 1
+    assert client.get_traffic_stats()['status_counts'] == {'405': 1}
+
+
 @pytest.mark.parametrize('wait,pause,expected', [(900,1000,1000),(120,0,220)])
 def test_known_gateway_site_pause_defers_portion_without_platform_failure(wait,pause,expected):
     from scrapers.transfermarkt.client import SourceStreamPaused, CurrentPortionDeadlineExceeded
