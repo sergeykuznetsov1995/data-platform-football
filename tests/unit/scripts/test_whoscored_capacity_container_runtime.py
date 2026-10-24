@@ -22,6 +22,15 @@ BOOTSTRAP_SOURCE = (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_host_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each test owns its host paths, including stale-artifact cleanup scenarios.
+    # Keep production ownership/mode checks and the production /tmp root intact.
+    root = tmp_path / "host-artifacts"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(runtime, "HOST_ARTIFACT_ROOT", root)
+
+
 def _workers(
     mode: str = runtime.DIRECT_DIAGNOSTIC_MODE,
 ) -> tuple[runtime.WorkerSpec, ...]:
