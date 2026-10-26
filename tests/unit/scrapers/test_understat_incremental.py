@@ -9,6 +9,7 @@ import pytest
 
 from scrapers.understat import UnderstatClient, UnderstatSource
 from scrapers.understat.cache_state import CacheState, atomic_json, digest
+from scrapers.understat.parsers import TEAM_BREAKDOWN_DIMENSIONS
 from tests.unit.scrapers.test_understat_native import (
     LEAGUE_PAYLOAD, MATCH_PAYLOAD, _team_payload, _Response,
 )
@@ -283,6 +284,74 @@ def test_empty_team_envelope_is_retried_after_failed_quality_attempt(tmp_path):
     assert not run(src)["understat_player_team_season_stats"].empty
     assert session.calls == ["/getLeagueData/EPL/2025", "/getTeamData/Home/2025",
                              "/getTeamData/Away/2025"]
+
+
+@pytest.mark.parametrize("dimension", sorted(TEAM_BREAKDOWN_DIMENSIONS))
+@pytest.mark.parametrize("validated_cache", [False, True])
+def test_partial_team_breakdowns_recover_on_unchanged_league(tmp_path, dimension, validated_cache):
+    from dags.scripts.run_understat_scraper import _decorate_frames
+    from scrapers.understat.manifest import ScopeKey
+    from scrapers.understat.quality import validate_understat_scope
+
+    def team_payload(home):
+        payload = _team_payload(7 if home else 9)
+        if home:
+            payload["players"].extend(_team_payload(8)["players"])
+        return payload
+
+    class PartialTeamSession(Session):
+        partial = True
+
+        def __init__(self):
+            super().__init__()
+            for player_id in (8, 9):
+                self.league["players"].extend(_team_payload(player_id)["players"])
+
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if "/getTeamData/" in url:
+                response._payload = team_payload("/Home/" in url)
+            if self.partial and "/getTeamData/Home/" in url:
+                response._payload["statistics"][dimension] = {}
+            return response
+
+    def quality(frames):
+        return validate_understat_scope(
+            _decorate_frames(frames, batch_id="team-recovery"),
+            scope=ScopeKey(LEAGUE, "2526", "EPL", 2025), active=True,
+            observed_at=datetime(2025, 8, 10, tzinfo=timezone.utc),
+        )
+
+    session = PartialTeamSession()
+    src, _ = source(tmp_path, session)
+    first = run(src)
+    report = quality(first)
+    assert not report.passed
+    assert "team_breakdown_dimension_mismatch" in {issue.code for issue in report.issues}
+    cache = CacheState(tmp_path)
+    name = "team_Home_2025.json"
+    identity = [LEAGUE, 2025, 1]
+    if validated_cache:
+        # Reproduce an incomplete entry accepted by the previous implementation.
+        payload = team_payload(True)
+        payload["statistics"][dimension] = {}
+        fingerprint = digest([session.league["teams"]["1"], [
+            [100, digest(session.league["dates"][0]), digest(session.match)],
+        ]])
+        cache.save(name, identity, fingerprint, payload, TODAY)
+    else:
+        assert cache.load(name, identity) is None
+    session.partial = False
+    session.calls.clear()
+    recovered = run(src)
+    assert session.calls == ["/getLeagueData/EPL/2025", "/getTeamData/Home/2025"]
+    recovered_report = quality(recovered)
+    assert recovered_report.passed, recovered_report.issues
+    session.calls.clear()
+    warm = run(src)
+    assert session.calls == ["/getLeagueData/EPL/2025"]
+    for table in recovered:
+        pd.testing.assert_frame_equal(recovered[table], warm[table])
 
 
 def test_confirmed_closed_scope_is_not_probed_daily(tmp_path):

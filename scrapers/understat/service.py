@@ -28,6 +28,7 @@ from .client import (
 )
 from .closed_check import league_payload_hashes
 from .parsers import (
+    TEAM_BREAKDOWN_DIMENSIONS,
     UnderstatSchemaDrift,
     parse_match_payload,
     parse_player_season_stats,
@@ -56,6 +57,14 @@ def _match_payload_is_complete(payload: Mapping[str, Any]) -> bool:
             and all(isinstance(rosters.get(side), (list, Mapping)) and rosters[side]
                     for side in ("h", "a"))
             and _match_payload_has_rows({"shots": payload.get("shots")}))
+
+
+def _team_payload_is_complete(payload: Mapping[str, Any]) -> bool:
+    statistics = payload.get("statistics")
+    return (bool(payload.get("players")) and isinstance(statistics, Mapping)
+            and set(statistics) == TEAM_BREAKDOWN_DIMENSIONS
+            and all(isinstance(categories, Mapping) and categories
+                    for categories in statistics.values()))
 
 
 def _match_payload_has_rows(payload: Mapping[str, Any]) -> bool:
@@ -303,7 +312,7 @@ class UnderstatSource:
                 entry = cache.load(name, identity) if incremental else None
                 refresh = (refresh_scope if not incremental else
                            entry is None or entry.get("fingerprint") != fingerprint
-                           or not entry["payload"])
+                           or not _team_payload_is_complete(entry["payload"]))
                 team_payload = self.client.get_team_data(
                     team_name, source_season_id, force_refresh=refresh,
                 ) if refresh or not incremental else entry["payload"]
@@ -319,7 +328,7 @@ class UnderstatSource:
                         team_id=team_id,
                         team_name=team_name,
                     )
-                if incremental and refresh and not player_team.empty and not breakdowns.empty:
+                if incremental and refresh and _team_payload_is_complete(team_payload):
                     cache.save(name, identity, fingerprint, team_payload, self.today)
                 player_team_frames.append(player_team)
                 breakdown_frames.append(breakdowns)
