@@ -278,7 +278,14 @@ def test_parse_retry_after_preserves_finite_values_and_http_dates(value, expecte
     assert _parse_retry_after(value, now) == expected
 
 
-def test_retry_after_retryable_statuses_then_success_are_counted():
+def test_retry_after_retryable_statuses_then_success_are_counted(monkeypatch):
+    import scrapers.fotmob.transport as module
+    class Clock(datetime):
+        current = datetime(2026, 10, 26, tzinfo=timezone.utc)
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+    monkeypatch.setattr(module, "datetime", Clock)
     delays = []
     session = FakeSession(
         [
@@ -287,10 +294,13 @@ def test_retry_after_retryable_statuses_then_success_are_counted():
             FakeResponse(200, b'{"ok":true}'),
         ]
     )
+    def sleep(seconds):
+        delays.append(seconds)
+        Clock.current += timedelta(seconds=seconds)
     transport = FotMobTransport(
         session=session,
         max_attempts=4,
-        sleep_fn=delays.append,
+        sleep_fn=sleep,
         jitter_fn=lambda _low, _high: 0.0,
     )
 
@@ -574,3 +584,92 @@ def test_document_fetch_reuses_direct_only_accounting_without_json_validation():
     assert stats.logical_targets == stats.attempts == 1
     assert stats.direct_bytes == len(encoded)
     assert stats.decoded_bytes == len(html)
+
+
+@pytest.mark.parametrize("document", [False, True])
+@pytest.mark.parametrize("status", [429, 503])
+def test_long_retry_after_defers_without_early_retry_and_blocks_second_client(document, status):
+    from scrapers.fotmob.shared_rate_limiter import CompositeRateLimiter, RefundableRateLimiter
+    from tests.unit.scrapers.test_fotmob_shared_rate_limiter import _limiter
+    shared, connection = _limiter(rows=[(3.0,)] * 8)
+    def client(responses):
+        local = RefundableRateLimiter(max_requests=60, window_seconds=60, burst_size=4)
+        return _transport(responses, rate_limiter=CompositeRateLimiter(local, shared), max_retry_delay=60)
+    first, session = client([FakeResponse(status, b"busy", {"Retry-After": "7200"}), FakeResponse(200, b'{}')])
+    fetch = first.fetch_document if document else first.fetch_json
+    result = fetch("https://www.fotmob.com/")
+    assert result.outcome == FetchOutcome.RETRYABLE_FAILURE
+    assert result.retry_after == timedelta(hours=2)
+    assert result.blocked_until is not None
+    assert len(session.calls) == 1
+    second_shared = type(shared)("ignored", connection=connection)
+    second, other_session = client([FakeResponse(200, b'{}')])
+    second.rate_limiter.shared = second_shared
+    other = second.fetch_json("allLeagues")
+    assert other.attempts == 0 and other.stop_reason == "retry_after"
+    assert not other_session.calls
+
+
+def test_three_distinct_403_stop_wave_and_shared_client():
+    from scrapers.fotmob.shared_rate_limiter import CompositeRateLimiter, RefundableRateLimiter
+    from tests.unit.scrapers.test_fotmob_shared_rate_limiter import _limiter
+    shared, connection = _limiter(rows=[(3.0,)] * 10)
+    transport, session = _transport([FakeResponse(403)] * 4)
+    transport.rate_limiter = CompositeRateLimiter(
+        RefundableRateLimiter(max_requests=600, window_seconds=60, burst_size=10), shared)
+    transport.fetch_json("leagues", {"id": 1})
+    transport.fetch_json("leagues", {"id": 1})
+    transport.fetch_document("https://www.fotmob.com/")
+    assert transport.stop_reason is None
+    transport.fetch_json("leagues", {"id": 2})
+    blocked = transport.fetch_json("leagues", {"id": 3})
+    assert blocked.stop_reason == "ban" and blocked.attempts == 0
+    assert timedelta(minutes=14) < blocked.retry_after <= timedelta(minutes=15)
+    assert len(session.calls) == 4
+    other, session2 = _transport([FakeResponse(200, b'{}')])
+    other.rate_limiter = CompositeRateLimiter(
+        RefundableRateLimiter(max_requests=60, window_seconds=60, burst_size=4),
+        type(shared)("ignored", connection=connection))
+    assert other.fetch_document().stop_reason == "ban"
+    assert session2.calls == []
+
+
+def test_non_403_response_resets_ban_series():
+    transport, session = _transport([FakeResponse(s, b'{}') for s in [403, 403, 404, 403, 403, 200]])
+    for target in range(6):
+        transport.fetch_json("leagues", {"id": target})
+    assert transport.stop_reason is None
+    assert len(session.calls) == 6
+
+
+@pytest.mark.parametrize("document", [False, True])
+def test_expired_pause_still_requires_rate_limit_admission(monkeypatch, document):
+    transport, session = _transport([FakeResponse(200, b'{}')])
+    class Limiter:
+        calls = 0
+        def acquire(self, **kwargs):
+            self.calls += 1
+            return True
+    limiter = Limiter()
+    transport.rate_limiter = limiter
+    # Pause is seen inside acquire, and expires before the next loop.
+    states = iter([None, (datetime.now(timezone.utc), "retry_after"), None, None, None])
+    monkeypatch.setattr(transport, "_pause_state", lambda: next(states, None))
+    fetch = transport.fetch_document if document else transport.fetch_json
+    assert fetch("https://www.fotmob.com/").ok
+    assert len(session.calls) == limiter.calls == 1
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_non_403_headers_reset_series_even_when_body_read_fails(status):
+    class BrokenBody:
+        def read(self, **kwargs):
+            raise requests.ConnectionError("body interrupted")
+    response = FakeResponse(status)
+    response.raw = BrokenBody()
+    transport, session = _transport([FakeResponse(403), FakeResponse(403), response, FakeResponse(403)], max_attempts=1)
+    for target in range(4):
+        transport.fetch_json("leagues", {"id": target})
+    assert transport.stop_reason is None
+    assert transport.snapshot_stats().attempts == 4
+    assert len(session.calls) == 4

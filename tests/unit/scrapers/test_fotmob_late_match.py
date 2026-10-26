@@ -836,6 +836,11 @@ def test_review3_late_transport_stops_after_wait_crosses_cutoff(monkeypatch, wai
     from scrapers.fotmob.repository import MemoryFotMobRepository
 
     clock = [T + timedelta(hours=72) - timedelta(seconds=1)]
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].replace(tzinfo=tz)
+    monkeypatch.setattr("scrapers.fotmob.transport.datetime", Clock)
     transport, session = _transport([
         FakeResponse(503, b"down", {"Retry-After": "2"}),
         FakeResponse(200, json.dumps(GOOD).encode()),

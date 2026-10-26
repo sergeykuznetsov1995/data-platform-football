@@ -577,11 +577,13 @@ class RunReport:
     operations: list[OperationResult] = field(default_factory=list)
     budget: dict[str, int] = field(default_factory=dict)
     transport: dict[str, Any] = field(default_factory=dict)
+    stop_reason: Optional[str] = None
+    blocked_until: Optional[datetime] = None
     exclusions: tuple[dict[str, str], ...] = INTENTIONAL_EXCLUSIONS
 
     @property
     def ok(self) -> bool:
-        return bool(self.operations) and all(item.ok for item in self.operations)
+        return self.stop_reason != "ban" and bool(self.operations) and all(item.ok for item in self.operations)
 
     @property
     def status(self) -> str:
@@ -592,6 +594,8 @@ class RunReport:
             "run_id": self.run_id,
             "mode": self.mode,
             "status": self.status,
+            "stop_reason": self.stop_reason,
+            "blocked_until": self.blocked_until.isoformat() if self.blocked_until else None,
             "started_at": self.started_at.isoformat(),
             "completed_at": self.completed_at.isoformat()
             if self.completed_at
@@ -739,6 +743,9 @@ class FotMobIngestService:
             }
             for future in as_completed(futures):
                 self._raise_if_cancelled()
+                if getattr(self.transport, "stop_reason", None) == "ban":
+                    for pending in futures:
+                        pending.cancel()
                 key = futures[future]
                 try:
                     output[key] = future.result()
@@ -3816,6 +3823,8 @@ class FotMobIngestService:
             operations=list(operations),
             budget=self.ledger.as_dict(),
             transport=transport,
+            stop_reason=getattr(self.transport, "stop_reason", None),
+            blocked_until=getattr(self.transport, "blocked_until", None),
         )
 
 
