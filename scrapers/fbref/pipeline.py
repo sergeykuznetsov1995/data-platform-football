@@ -6729,14 +6729,14 @@ class FBrefPipeline:
         return outcomes
 
     def _add_shared_processing_work(self, items, started):
-        """Charge the whole shared operation to each page, never an invented share."""
+        """Keep a measurement only when the operation belongs to one page."""
         elapsed = self.stage_clock() - started
         return [
             replace(
                 item,
                 processing_work_seconds=(
                     None
-                    if item.processing_work_seconds is None
+                    if len(items) != 1 or item.processing_work_seconds is None
                     else item.processing_work_seconds + elapsed
                 ),
             )

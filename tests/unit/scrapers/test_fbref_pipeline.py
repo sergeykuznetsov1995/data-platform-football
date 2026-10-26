@@ -15151,13 +15151,11 @@ def test_1325_live_cycle_continues_after_enrichment_handback(tmp_path):
     assert result.frontier_closed
 
 
-@pytest.mark.parametrize(
-    "kind,batch",
-    [("generic", False), ("generic", True), ("match", False), ("match", True)],
-)
+@pytest.mark.parametrize("kind", ["generic", "match"])
+@pytest.mark.parametrize("mode", ["sequential", "single", "shared"])
 @pytest.mark.parametrize("failed_write", [False, True])
-def test_processing_work_excludes_other_pages_and_counts_shared_writes(
-    tmp_path, kind, batch, failed_write
+def test_processing_work_excludes_shared_writes_and_measures_individual_pages(
+    tmp_path, kind, mode, failed_write
 ):
     if kind == 'match':
         pipeline, control, _ = _pipeline_with_small_durable_matches(tmp_path)
@@ -15165,7 +15163,10 @@ def test_processing_work_excludes_other_pages_and_counts_shared_writes(
     else:
         pipeline, control, _ = _pipeline_with_saved_generic_pages(tmp_path, ['9', '12'])
         page_kinds = ['competition']
+    batch = mode != "sequential"
     pipeline.batch_persist_enabled = batch
+    if mode == "single":
+        pipeline.batch_persist_matches = 1
     now = [0.0]
     pipeline.stage_clock = lambda: now[0]
 
@@ -15184,8 +15185,8 @@ def test_processing_work_excludes_other_pages_and_counts_shared_writes(
     timed(pipeline, '_record_page_completion', 17)
     timed(pipeline, '_record_generic_table_results', 1)
     timed(pipeline, '_match_item_cells' if kind == 'match' else '_generic_item_cells', 4)
-    # Batch doubles call persist_page/match for each item. Charging the whole
-    # call means both pages receive 2 * 7 (and 2 * 11 for typed), never half.
+    # Batch doubles spend time on every page. Shared work cannot provide an
+    # individual measurement, including when a failed batch is retried alone.
     timed(pipeline.generic_writer, 'persist_page', 7)
     if kind == 'match':
         timed(pipeline, '_parse_typed_match', 5)
@@ -15203,14 +15204,18 @@ def test_processing_work_excludes_other_pages_and_counts_shared_writes(
         str(uuid.uuid4()), page_kinds=page_kinds, settings=_settings()
     )
     assert result.parsed == 2
-    expected = 2 + 3 + 1 + 13 + 17 + (14 if batch else 7)
+    measurements = [row['processing_work_ms'] for row in control.observations.values()]
+    if mode == "shared":
+        assert measurements == [None, None]
+        return
+    expected = 2 + 3 + 1 + 13 + 17 + 7
     if batch:
         expected += 4
     if failed_write and batch:
         expected += 23 + 7
     if kind == 'match':
-        expected += 5 + (22 if batch and not failed_write else 11)
-    assert [row['processing_work_ms'] for row in control.observations.values()] == [expected * 1000] * 2
+        expected += 5 + 11
+    assert measurements == [expected * 1000] * 2
 
 
 def test_incomplete_preparation_does_not_publish_processing_measurement(tmp_path):
