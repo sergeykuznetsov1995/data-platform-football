@@ -810,6 +810,11 @@ def validate_data(
         transport = result.get("transport") or {}
         budget = result.get("budget") or {}
         violations = []
+        dag_run = context.get("dag_run")
+        if dag_run is not None:
+            scraper = dag_run.get_task_instance("scrape_fotmob_data")
+            if scraper is None or scraper.state != "success":
+                violations.append("scrape_fotmob_data did not succeed")
         required_transport = {
             "attempts",
             "direct_bytes",
@@ -827,6 +832,8 @@ def validate_data(
         missing_budget = sorted(required_budget - budget.keys())
         if missing_transport:
             violations.append(f"missing transport metrics={missing_transport!r}")
+        if result.get("stop_reason") == "ban":
+            violations.append(f"ban: blocked_until={result.get('blocked_until')}")
         if missing_budget:
             violations.append(f"missing budget metrics={missing_budget!r}")
         if automatic_catalog:
@@ -1013,6 +1020,8 @@ def validate_data(
         )
         summary = {
             "status": result.get("status"),
+            "stop_reason": result.get("stop_reason"),
+            "blocked_until": result.get("blocked_until"),
             "run_id": result.get("run_id"),
             "mode": mode,
             "rows": result.get("rows") or {},
@@ -1188,6 +1197,7 @@ python dags/scripts/run_fotmob_scraper.py \\
         task_id="validate_data",
         python_callable=validate_data,
         op_kwargs={"result_path": RESULT_PATH},
+        trigger_rule="all_done",
     )
 
     replay_missing_inputs_proof = PythonOperator(

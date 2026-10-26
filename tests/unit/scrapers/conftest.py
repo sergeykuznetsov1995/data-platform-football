@@ -11,6 +11,24 @@ import pytest
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
+import sys
+from types import ModuleType
+
+try:
+    import psycopg2  # noqa: F401
+except ModuleNotFoundError:
+    # В CI-образе нет драйвера PG. Тесты FotMob-лимитера/транспорта берут из него
+    # только классы ошибок и подменяют connect — подставляем минимальный модуль.
+    _psycopg2 = ModuleType("psycopg2")
+    _psycopg2.OperationalError = type("OperationalError", (Exception,), {})
+    _psycopg2.InterfaceError = type("InterfaceError", (Exception,), {})
+
+    def _no_driver(*_args, **_kwargs):
+        raise _psycopg2.OperationalError("psycopg2 is not installed")
+
+    _psycopg2.connect = _no_driver
+    sys.modules["psycopg2"] = _psycopg2
+
 
 @pytest.fixture(autouse=True)
 def set_trino_password(monkeypatch):
