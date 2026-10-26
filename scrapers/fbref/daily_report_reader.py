@@ -4,7 +4,6 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 from scrapers.fbref.daily_report import adult_competition, instant
-from scrapers.fbref.control.store import _frontier_scope_cte_for_candidates
 
 REGISTRY_SQL = """
 SELECT jsonb_build_object(
@@ -74,15 +73,16 @@ SELECT coalesce(jsonb_agg(r), '[]')::text FROM (
 """
 
 
-# Canonical scopes include aliases and discovery provenance. Aggregate them
-# before joining the frontier so a shared roster counts exactly once.
-PAGE_AGES_SQL = _frontier_scope_cte_for_candidates("""
- SELECT target_id FROM fbref_control.page_frontier
- WHERE source='fbref' AND refresh_policy <> 'historical_once'
-   AND state NOT IN ('dead','skipped','quarantined')
-""") + """
-SELECT coalesce(jsonb_agg(p), '[]')::text FROM (
+# Stored scopes preserve canonical aliases and provenance without scanning edges.
+# Fail closed during initial backfill or after an out-of-band registry edit.
+PAGE_AGES_SQL = """
+SELECT CASE WHEN coalesce(bool_or(NOT coalesce(p.scope_summary_ready,false)),false)
+  OR EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)
+ THEN jsonb_build_object('error','scope_summary_incomplete')::text
+ ELSE coalesce(jsonb_agg(to_jsonb(p) - 'scope_summary_ready'), '[]'::jsonb)::text END
+FROM (
  SELECT f.target_id,f.page_kind,f.canonical_url,f.state,f.refresh_policy,
+        scope.is_complete AND NOT scope.pending AS scope_summary_ready,
         f.last_fetched_at, f.last_content_hash,
         EXISTS (SELECT 1 FROM fbref_control.dataset_manifest m
           WHERE m.target_id=f.target_id AND m.content_hash=f.last_content_hash
@@ -95,11 +95,9 @@ SELECT coalesce(jsonb_agg(p), '[]')::text FROM (
           AND NOT coalesce(scope.has_unknown,true)
           AND NOT coalesce(scope.inactive_competition,true)
           AND NOT coalesce(scope.invalid_season,true) AS current_ownership,
-        (SELECT coalesce(jsonb_agg(DISTINCT jsonb_build_object(
-           'competition_id',c.competition_id,'season_id',c.season_id)), '[]')
-         FROM canonical_scope c WHERE c.target_id=f.target_id) AS scopes
+        coalesce(scope.scopes, '[]'::jsonb) AS scopes
  FROM fbref_control.page_frontier f
- LEFT JOIN scope_rollup scope USING (target_id)
+ LEFT JOIN fbref_control.page_scope_summary scope USING (target_id)
  WHERE f.source='fbref' AND f.refresh_policy <> 'historical_once'
    AND f.state NOT IN ('dead','skipped','quarantined') AND f.created_at <= '{cutoff}'::timestamptz
 ) p
@@ -140,6 +138,9 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
     snapshot["observations"] = read("fbref_observations", pg, OBSERVATIONS_SQL.format(cutoff=cutoff), [])
     snapshot["readiness"] = read("fbref_readiness", pg, READINESS_SQL.format(cutoff=cutoff), [])
     snapshot["page_ages"] = read("fbref_page_ages", pg, PAGE_AGES_SQL.replace("{cutoff}", cutoff), [])
+    if isinstance(snapshot["page_ages"], dict) and snapshot["page_ages"].get("error") == "scope_summary_incomplete":
+        snapshot["page_ages"] = []
+        snapshot["page_age_errors"].append({"source": "fbref_page_ages", "reason": "scope_summary_incomplete"})
     snapshot["page_age_exclusions"] = read("fbref_page_age_exclusions", pg,
         PAGE_AGE_EXCLUSIONS_SQL.replace("{cutoff}", cutoff), {})
     adults = {str(c["competition_id"]) for c in snapshot["competitions"] if adult_competition(c)}
@@ -151,7 +152,6 @@ def collect_snapshot(pg: Callable, trino: Callable, *, day: date,
         SELECT DISTINCT target_id,content_hash
         FROM iceberg.bronze.fbref_table_inventory
         WHERE page_kind='season' AND regexp_like(table_id, '^results.*_overall$')
-          AND availability IN ('available','empty')
           AND persisted_at <= CAST(from_iso8601_timestamp('{cutoff}') AT TIME ZONE 'UTC' AS timestamp)
     """, [])
     start = (day - timedelta(days=lookback - 1)).isoformat()

@@ -16,6 +16,258 @@ from typing import Tuple
 CONTROL_SCHEMA = "fbref_control"
 MIGRATION_LOCK_KEY = 7_733_210_923
 
+# Acquired only after locking the complete frontier write set.
+SCOPE_SUMMARY_LOCK_KEY = 7_733_210_924
+
+# Immutable ownership SQL snapshot for migration v13. Preserve after release;
+# collector ownership changes require a new snapshot and migration.
+SCOPE_CTE_V13 = """
+    {with_clause}declared_scope AS (
+        SELECT frontier.target_id, frontier.source,
+               frontier.source_ids ->> 'competition_id' AS competition_id,
+               frontier.source_ids ->> 'season_id' AS season_id
+        FROM fbref_control.page_frontier AS frontier{declared_candidate_join}
+        WHERE frontier.source_ids ? 'competition_id'
+        UNION
+        SELECT edge.child_target_id AS target_id, child.source,
+               edge.carried_competition_id AS competition_id,
+               edge.carried_season_id AS season_id
+        FROM fbref_control.frontier_provenance AS edge
+        JOIN fbref_control.page_frontier AS child
+          ON child.target_id = edge.child_target_id{edge_candidate_join}
+        WHERE edge.carried_competition_id IS NOT NULL
+    ),
+    canonical_scope AS (
+        SELECT declared.target_id, declared.source,
+               declared.competition_id,
+               COALESCE(alias.season_id, declared.season_id) AS season_id
+        FROM declared_scope AS declared
+        LEFT JOIN fbref_control.season_alias AS alias
+          ON alias.source = declared.source
+         AND alias.competition_id = declared.competition_id
+         AND alias.alias = declared.season_id
+    ),
+    scope_rollup AS (
+        SELECT scoped.target_id,
+               count(DISTINCT (
+                   scoped.competition_id, scoped.season_id
+               )) AS scope_count,
+               bool_or(competition.competition_id IS NULL)
+                   AS competition_missing,
+               bool_or(competition.gender = 'female') AS has_female,
+               bool_or(competition.gender = 'unknown') AS has_unknown,
+               bool_or(
+                   competition.gender = 'male'
+                   AND competition.crawl_state = 'active'
+                   AND competition.lifecycle_state IN ('present', 'missing_once')
+                   AND competition.present
+                   AND (
+                       scope_frontier.page_kind = 'competition'
+                       OR (
+                           scoped.season_id IS NOT NULL
+                           AND season.lifecycle_state = 'present'
+                           AND season.present
+                           AND season.is_current
+                       )
+                   )
+               ) AS has_current_ownership,
+               bool_or(
+                   competition.competition_id IS NOT NULL
+                   AND (
+                       competition.gender <> 'male'
+                       OR (competition.crawl_state <> 'active' AND NOT (
+                           scope_frontier.refresh_policy='historical_once'
+                           AND competition.crawl_state='skipped'
+                           AND competition.metadata->>'current_scope_lifecycle'='discontinued'
+                           AND competition.metadata->>'current_scope_reason' IS NOT NULL
+                       ))
+                       OR competition.lifecycle_state NOT IN (
+                           'present', 'missing_once'
+                       )
+                       OR NOT competition.present
+                   )
+               ) AS inactive_competition,
+               bool_or(
+                   scoped.season_id IS NOT NULL
+                   AND (
+                       season.season_id IS NULL
+                       OR season.lifecycle_state <> 'present'
+                       OR NOT season.present
+                   )
+               ) AS invalid_season,
+               bool_or(
+                   scoped.season_id IS NOT NULL
+                   AND season.lifecycle_state = 'present'
+                   AND season.present
+                   AND season.is_current
+               ) AS has_current_season,
+               bool_or(scoped.season_id IS NULL)
+                   AS has_competition_scope
+        FROM canonical_scope AS scoped
+        JOIN fbref_control.page_frontier scope_frontier ON scope_frontier.target_id=scoped.target_id
+        LEFT JOIN fbref_control.competition_registry AS competition
+          ON competition.source = scoped.source
+         AND competition.competition_id = scoped.competition_id
+        LEFT JOIN fbref_control.season_registry AS season
+          ON season.source = scoped.source
+         AND season.competition_id = scoped.competition_id
+         AND season.season_id = scoped.season_id
+        GROUP BY scoped.target_id
+    )
+"""
+
+# Append-only v13 schema, functions, and triggers.
+_declared = """
+    WITH declared_scope AS (
+        SELECT frontier.target_id, frontier.source,
+               frontier.source_ids->>'competition_id' AS competition_id,
+               frontier.source_ids->>'season_id' AS season_id
+        FROM fbref_control.page_frontier frontier
+        WHERE frontier.target_id = ANY(targets)
+          AND frontier.source_ids ? 'competition_id'
+        UNION
+        SELECT frontier.target_id, frontier.source,
+               raw->>'competition_id', raw->>'season_id'
+        FROM fbref_control.page_scope_summary summary
+        JOIN fbref_control.page_frontier frontier USING (target_id)
+        CROSS JOIN LATERAL jsonb_array_elements(summary.provenance_scopes) raw
+        WHERE summary.target_id = ANY(targets)
+    ),
+"""
+# Reuse the exact rollup used by collection, including three-valued booleans.
+_rollup = SCOPE_CTE_V13.split('    canonical_scope AS (', 1)[1]
+_REFRESH_SQL = _declared + '    canonical_scope AS (' + _rollup + """
+    , scopes AS (
+        SELECT target_id, jsonb_agg(DISTINCT jsonb_build_object(
+            'competition_id', competition_id, 'season_id', season_id)) AS scopes
+        FROM canonical_scope GROUP BY target_id
+    )
+    UPDATE fbref_control.page_scope_summary summary
+    SET has_current_ownership = rollup.has_current_ownership,
+        competition_missing = rollup.competition_missing,
+        has_female = rollup.has_female, has_unknown = rollup.has_unknown,
+        inactive_competition = rollup.inactive_competition,
+        invalid_season = rollup.invalid_season,
+        scopes = coalesce(scopes.scopes, '[]'::jsonb), pending = false
+    FROM unnest(targets) target(target_id)
+    LEFT JOIN scope_rollup rollup USING (target_id)
+    LEFT JOIN scopes USING (target_id)
+    WHERE summary.target_id = target.target_id;
+"""
+
+SCOPE_SUMMARY_V13_STATEMENTS = (
+    """CREATE TABLE fbref_control.page_scope_summary (
+        target_id text PRIMARY KEY REFERENCES fbref_control.page_frontier(target_id)
+            ON DELETE CASCADE,
+        provenance_scopes jsonb NOT NULL DEFAULT '[]'::jsonb,
+        scopes jsonb NOT NULL DEFAULT '[]'::jsonb,
+        has_current_ownership boolean, competition_missing boolean,
+        has_female boolean, has_unknown boolean,
+        inactive_competition boolean, invalid_season boolean,
+        is_complete boolean NOT NULL DEFAULT false,
+        pending boolean NOT NULL DEFAULT true
+    )""",
+    """CREATE TABLE fbref_control.page_scope_backfill (
+        singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+        after_target_id text NOT NULL DEFAULT ''
+    )""",
+    """INSERT INTO fbref_control.page_scope_backfill(singleton) VALUES (true)""",
+    """CREATE TABLE fbref_control.page_scope_registry_dirty (
+        source text NOT NULL, competition_id text NOT NULL,
+        PRIMARY KEY(source, competition_id)
+    )""",
+    """CREATE FUNCTION fbref_control.refresh_page_scope_summary(targets text[])
+        RETURNS void LANGUAGE sql AS $scope$""" + _REFRESH_SQL + "$scope$",
+    """CREATE FUNCTION fbref_control.queue_frontier_scope_summary()
+        RETURNS trigger LANGUAGE plpgsql AS $scope$
+        BEGIN
+            PERFORM pg_advisory_xact_lock_shared(7733210924);
+            INSERT INTO fbref_control.page_scope_summary(target_id, is_complete)
+            VALUES (NEW.target_id, TG_OP = 'INSERT')
+            ON CONFLICT (target_id) DO UPDATE SET pending = true;
+            RETURN NULL;
+        END $scope$""",
+    """CREATE TRIGGER page_scope_frontier_insert AFTER INSERT
+        ON fbref_control.page_frontier FOR EACH ROW
+        EXECUTE FUNCTION fbref_control.queue_frontier_scope_summary()""",
+    """CREATE TRIGGER page_scope_frontier_update
+        AFTER UPDATE OF source, source_ids, page_kind, refresh_policy
+        ON fbref_control.page_frontier FOR EACH ROW
+        WHEN ((OLD.source, OLD.source_ids, OLD.page_kind, OLD.refresh_policy)
+              IS DISTINCT FROM
+              (NEW.source, NEW.source_ids, NEW.page_kind, NEW.refresh_policy))
+        EXECUTE FUNCTION fbref_control.queue_frontier_scope_summary()""",
+    """CREATE FUNCTION fbref_control.queue_provenance_scope_summary()
+        RETURNS trigger LANGUAGE plpgsql AS $scope$
+        BEGIN
+            PERFORM pg_advisory_xact_lock_shared(7733210924);
+            IF NEW.carried_competition_id IS NOT NULL THEN
+                INSERT INTO fbref_control.page_scope_summary AS summary
+                    (target_id, provenance_scopes)
+                VALUES (NEW.child_target_id, jsonb_build_array(jsonb_build_object(
+                    'competition_id', NEW.carried_competition_id,
+                    'season_id', NEW.carried_season_id)))
+                ON CONFLICT (target_id) DO UPDATE SET
+                    provenance_scopes = (SELECT jsonb_agg(DISTINCT scope)
+                        FROM jsonb_array_elements(summary.provenance_scopes ||
+                            EXCLUDED.provenance_scopes) scope),
+                    pending = true;
+            END IF;
+            RETURN NULL;
+        END $scope$""",
+    """CREATE TRIGGER page_scope_provenance_insert AFTER INSERT
+        ON fbref_control.frontier_provenance FOR EACH ROW
+        EXECUTE FUNCTION fbref_control.queue_provenance_scope_summary()""",
+    # Also catches SQL edits outside ControlStore. Such edits fail report reads
+    # closed until refresh-page-scopes drains this durable invalidation queue.
+    """CREATE FUNCTION fbref_control.invalidate_registry_scope_summary()
+        RETURNS trigger LANGUAGE plpgsql AS $scope$
+        BEGIN
+            IF TG_OP = 'UPDATE' THEN
+                CASE TG_TABLE_NAME
+                WHEN 'competition_registry' THEN
+                    IF (OLD.source, OLD.competition_id, OLD.gender, OLD.crawl_state,
+                        OLD.lifecycle_state, OLD.present,
+                        OLD.metadata->>'current_scope_lifecycle', OLD.metadata->>'current_scope_reason')
+                       IS NOT DISTINCT FROM
+                       (NEW.source, NEW.competition_id, NEW.gender, NEW.crawl_state,
+                        NEW.lifecycle_state, NEW.present,
+                        NEW.metadata->>'current_scope_lifecycle', NEW.metadata->>'current_scope_reason')
+                    THEN RETURN NULL; END IF;
+                WHEN 'season_registry' THEN
+                    IF (OLD.source, OLD.competition_id, OLD.season_id,
+                        OLD.is_current, OLD.lifecycle_state, OLD.present)
+                       IS NOT DISTINCT FROM
+                       (NEW.source, NEW.competition_id, NEW.season_id,
+                        NEW.is_current, NEW.lifecycle_state, NEW.present)
+                    THEN RETURN NULL; END IF;
+                WHEN 'season_alias' THEN
+                    IF (OLD.source, OLD.competition_id, OLD.alias, OLD.season_id)
+                       IS NOT DISTINCT FROM
+                       (NEW.source, NEW.competition_id, NEW.alias, NEW.season_id)
+                    THEN RETURN NULL; END IF;
+                END CASE;
+            END IF;
+            IF TG_OP <> 'INSERT' THEN
+                INSERT INTO fbref_control.page_scope_registry_dirty
+                VALUES (OLD.source, OLD.competition_id)
+                ON CONFLICT (source, competition_id) DO UPDATE
+                    SET competition_id = EXCLUDED.competition_id;
+            END IF;
+            IF TG_OP <> 'DELETE' THEN
+                INSERT INTO fbref_control.page_scope_registry_dirty
+                VALUES (NEW.source, NEW.competition_id)
+                ON CONFLICT (source, competition_id) DO UPDATE
+                    SET competition_id = EXCLUDED.competition_id;
+            END IF;
+            RETURN NULL;
+        END $scope$""",
+    *(f"""CREATE TRIGGER page_scope_registry_change
+        AFTER INSERT OR UPDATE OR DELETE ON fbref_control.{table}
+        FOR EACH ROW EXECUTE FUNCTION fbref_control.invalidate_registry_scope_summary()"""
+      for table in ('competition_registry', 'season_registry', 'season_alias')),
+)
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -925,6 +1177,11 @@ MIGRATIONS = (
     ),
     Migration(
         version=13,
+        name="page_scope_summary",
+        statements=SCOPE_SUMMARY_V13_STATEMENTS,
+    ),
+    Migration(
+        version=14,
         name="observation_processing_work",
         statements=(
             """ALTER TABLE fbref_control.observation_processing

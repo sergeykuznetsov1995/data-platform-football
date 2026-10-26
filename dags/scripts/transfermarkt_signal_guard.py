@@ -53,14 +53,21 @@ class QualificationGuard:
         if self.path.exists():
             self.data = json.loads(self.path.read_text())
             self._validate()
+            if self.data['version'] == 1:
+                self.data.update(version=2, response_window=[], captcha_streaks={})
+                self._restore_policy_history(Path(experiment))
+                self.save()
         else:
-            self.data = {'version': 1, 'days': {}, 'stop': None}
+            self.data = {'version': 2, 'days': {}, 'stop': None, 'response_window': [], 'captcha_streaks': {}}
             self._adopt_history(Path(experiment))
+            self._restore_policy_history(Path(experiment))
             self.save()
 
     def _validate(self):
-        if (set(self.data) != {'version', 'days', 'stop'} or type(self.data['version']) is not int
-                or self.data['version'] != 1 or not isinstance(self.data['days'], dict)):
+        if (type(self.data.get('version')) is not int or self.data['version'] not in (1, 2)
+                or set(self.data) != ({'version', 'days', 'stop'} if self.data['version'] == 1 else
+                                      {'version', 'days', 'stop', 'response_window', 'captcha_streaks'})
+                or not isinstance(self.data['days'], dict)):
             raise ValueError('unsupported qualification guard')
         for day, urls in self.data['days'].items():
             if date.fromisoformat(day).isoformat() != day or not isinstance(urls, dict):
@@ -73,6 +80,17 @@ class QualificationGuard:
                     raise ValueError('invalid qualification counters')
                 if 'retry_after' in counts and datetime.fromisoformat(counts['retry_after']).tzinfo is None:
                     raise ValueError('invalid qualification retry clock')
+        if self.data['version'] == 2:
+            if (not isinstance(self.data['response_window'], list)
+                    or not isinstance(self.data['captcha_streaks'], dict)
+                    or any(not isinstance(url, str) or type(n) is not int or n < 0
+                           for url, n in self.data['captcha_streaks'].items())):
+                raise ValueError('invalid qualification CAPTCHA history')
+            for event in self.data['response_window']:
+                if (not isinstance(event, dict) or set(event) != {'at', 'captcha'}
+                        or type(event['captcha']) is not bool
+                        or datetime.fromisoformat(event['at']).tzinfo is None):
+                    raise ValueError('invalid qualification response clock')
         stop = self.data['stop']
         if stop is not None and (not isinstance(stop, dict) or not stop.get('reason')
                                  or not isinstance(stop['reason'], str)):
@@ -110,10 +128,14 @@ class QualificationGuard:
                         if stamp else datetime.fromtimestamp(path.stat().st_mtime, MSK).date().isoformat()))
                 days.add(day)
                 kind = 'transport' if _transport(record, proven) else 'responses'
-                recorded.setdefault(url, {'responses': 0, 'transport': 0})[kind] += 1
+                captcha = record.get('qualification_captcha', record.get('status_code') in (403, 405, 429))
+                # New states exclude confirmed CAPTCHA from their URL quota.
+                # Legacy states counted it; retain their reservation convention.
+                recorded.setdefault(url, {'responses': 0, 'transport': 0})[kind] += int(
+                    kind == 'transport' or not record.get('qualification_captcha', False))
                 key = attempt_id(record)
                 if key not in seen:
-                    self.counts(url, day)[kind] += 1
+                    self.counts(url, day)[kind] += int(not captcha or kind == 'transport')
                     seen.add(key)
             # Keep unknown pre-I/O reservations; do not turn old ambiguity into I/O.
             fallback_day = (state.get('qualification_day_msk') or
@@ -129,6 +151,37 @@ class QualificationGuard:
                         datetime.fromisoformat(until) > datetime.fromisoformat(counts['retry_after'])):
                     counts['retry_after'] = until
         self._validate()
+
+    def _restore_policy_history(self, experiment):
+        seen, records = set(), []
+        for path in sorted(experiment.rglob('state.json')):
+            state = json.loads(path.read_text())
+            if (not isinstance(state, dict) or not isinstance(state.get('attempt_records'), list)
+                    or not isinstance(state.get('identity'), str)
+                    or not re.fullmatch('[0-9a-f]{64}', state['identity'])):
+                continue
+            for record in state['attempt_records']:
+                key = attempt_id(record)
+                if key in seen or not record.get('url'):
+                    continue
+                seen.add(key)
+                stamp = record.get('qualification_observed_at') or record.get('observed_at')
+                if stamp:
+                    records.append((datetime.fromisoformat(stamp.replace('Z', '+00:00')), record,
+                                    state.get('qualification_transport_proofs', {})))
+        for stamp, record, proven in sorted(records, key=lambda item: item[0]):
+            captcha = record.get('qualification_captcha', record.get('status_code') in (403, 405, 429))
+            self._policy_response(record['url'], captcha, _transport(record, proven), stamp)
+
+    def _policy_response(self, url, captcha, transport, stamp):
+        key = quota_key(url)
+        streaks = self.data['captcha_streaks']
+        streaks[key] = streaks.get(key, 0) + 1 if captcha else 0
+        if not transport:
+            self.data['response_window'].append({'at': stamp.isoformat(), 'captcha': captcha})
+        cutoff = self.now - timedelta(seconds=3600)
+        self.data['response_window'] = [event for event in self.data['response_window']
+                                       if datetime.fromisoformat(event['at']) > cutoff]
 
     def halt(self, reason, url=None):
         if not self.data.get('stop'):
@@ -155,31 +208,34 @@ class QualificationGuard:
         self.save()
 
     def observe(self, url, attempts, status_delta, records, client, outcome, *, proven_transport=(), transport_limit=4):
+        self.last_captcha = False
+        blocked = any(status_delta.get(str(code), 0) for code in (403, 405, 429))
+        blocked |= any(r.get('status_code') in (403, 405, 429) for r in records)
+        blocked |= getattr(getattr(outcome, 'status', None), 'value', None) == 'blocked'
+        if not blocked:
+            for record in records:
+                if record.get('status_code') == 200 and record.get('capture_id'):
+                    body, _ = client._raw_store.load_capture(record['capture_id'])
+                    text = body.decode('utf-8', errors='replace').lower()
+                    blocked |= bool(re.search(r'<title>\s*human verification\s*</title>', text)
+                                    and '.captcha.awswaf.com/' in text)
+        self.last_captcha = blocked
         counts = self.counts(url)
         transport = max(sum(_transport(r, proven_transport) for r in records),
                         status_delta.get('0', 0) + status_delta.get('407', 0))
         if attempts:
-            counts['responses'] += attempts - min(attempts, transport) - 1
+            counts['responses'] += attempts - min(attempts, transport) - int(blocked) - 1
             counts['transport'] += min(attempts, transport)
+            self._policy_response(url, blocked, bool(transport), self.now)
             if transport:
                 delay = (10, 30, 60)[min(counts['transport'] - 1, 2)]
                 counts['retry_after'] = (self.now + timedelta(seconds=delay)).isoformat()
         self.save()
-        blocked = any(status_delta.get(str(code), 0) for code in (403, 405, 429))
-        blocked |= any(r.get('status_code') in (403, 405, 429) for r in records)
-        blocked |= getattr(getattr(outcome, 'status', None), 'value', None) == 'blocked'
-        if blocked:
-            self.halt('captcha', url)
-        for record in records:
-            if record.get('status_code') == 200 and record.get('capture_id'):
-                body, _ = client._raw_store.load_capture(record['capture_id'])
-                text = body.decode('utf-8', errors='replace').lower()
-                blocked |= bool(re.search(r'<title>\s*human verification\s*</title>', text)
-                                and '.captcha.awswaf.com/' in text)
-                if blocked:
-                    self.halt('captcha', url)
-        if blocked:
-            self.halt('captcha', url)
+        if self.data['captcha_streaks'].get(quota_key(url), 0) >= 3:
+            self.halt('captcha_streak', url)
+        window = self.data['response_window']
+        if len(window) >= 100 and sum(event['captcha'] for event in window) * 100 > len(window):
+            self.halt('captcha_rate', url)
         server_responses = sum(n for s, n in status_delta.items() if int(s) >= 500)
         proven_server_errors = sum(bool(r.get('status_code')) and r['status_code'] >= 500
                                   and _transport(r, proven_transport) for r in records)
@@ -187,5 +243,6 @@ class QualificationGuard:
             self.halt('unproven_site_5xx', url)
         if counts['transport'] >= transport_limit:
             self.halt('transport_limit', url)
-        if getattr(getattr(outcome, 'status', None), 'value', None) == 'schema_error':
+        if not blocked and getattr(getattr(outcome, 'status', None), 'value', None) == 'schema_error':
             self.halt('schema_error', url)
+        return blocked

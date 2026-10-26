@@ -453,7 +453,7 @@ def test_history_mode_can_reuse_valid_match_cache():
     assert client.match_refreshes == [False]
 
 
-def test_match_shape_drift_fails_closed():
+def test_match_extra_field_warns():
     payload = {
         **MATCH_PAYLOAD,
         "shots": {
@@ -461,8 +461,9 @@ def test_match_shape_drift_fails_closed():
             "a": [],
         },
     }
-    with pytest.raises(UnderstatSchemaDrift, match="new_metric"):
-        validate_match_payload(payload)
+    warnings = []
+    validate_match_payload(payload, warnings=warnings)
+    assert warnings == [{"path": "getMatchData.shots.h[0]", "fields": ["new_metric"]}]
 
 
 @pytest.mark.parametrize(

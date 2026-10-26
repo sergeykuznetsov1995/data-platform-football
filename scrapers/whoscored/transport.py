@@ -3260,7 +3260,7 @@ class WhoScoredTransport:
         return True
 
     def probe_egress(self) -> None:
-        """Check ipify on at most three distinct pool members before work.
+        """Check ipify on at most ten distinct pool members before work.
 
         Authentication failures keep the previous two-member budget. Injected
         sessions without a residential pool retain the no-op behavior.
@@ -3271,7 +3271,7 @@ class WhoScoredTransport:
     def _probe_pool_egress(self, tested: set[str], *, replace_first: bool) -> None:
         # A failed source request already consumed the first member when this
         # helper is called by _http_fetch. The remaining checks share its cap.
-        limit = 3
+        limit = min(self._pool_manager.total_count, 10)
         replaced = False
         detail = "no replacement checked"
         reason = "budget_exhausted"
@@ -3310,6 +3310,7 @@ class WhoScoredTransport:
                 authorization = bool(re.search(r"\b407\b", str(exc)))
                 transient = (
                     _is_proxy_failure(exc)
+                    or _is_tls_connect_failure(exc)
                     # curl_cffi Timeout is an OSError, not built-in TimeoutError.
                     # Code 28 is transient here; source timeouts keep their policy.
                     or getattr(exc, "code", None) == 28
@@ -3640,6 +3641,7 @@ class WhoScoredTransport:
                 session=self._direct_http,
                 route=TransportRoute.DIRECT_HTTP,
                 referer=browser_bootstrap_url,
+                before_network=before_network,
             )
             try:
                 self._validate(response, validator)
@@ -3943,6 +3945,7 @@ class WhoScoredTransport:
                         session=self._direct_http,
                         route=TransportRoute.DIRECT_HTTP,
                         referer=bootstrap_url,
+                        before_network=item.before_network,
                     )
                     self._validate(direct, item.validator)
                 except CloudflareChallenge:
@@ -4226,6 +4229,7 @@ class WhoScoredTransport:
                             session=self._direct_http,
                             route=TransportRoute.DIRECT_HTTP,
                             referer=bootstrap_url,
+                            before_network=item.before_network,
                         )
                         self._validate(fresh_direct, item.validator)
                     except CloudflareChallenge:
@@ -4386,6 +4390,7 @@ class WhoScoredTransport:
         session: Any,
         route: TransportRoute,
         referer: Optional[str] = None,
+        before_network: Optional[Callable[[], None]] = None,
     ) -> TransportResponse:
         request_kwargs: dict[str, Any] = {"timeout": self.request_timeout}
         if _is_whoscored_stage_bootstrap_url(url):
@@ -4425,59 +4430,90 @@ class WhoScoredTransport:
             # which would defeat the browser endpoint's no-follow policy.
             request_kwargs["allow_redirects"] = False
         pooled = self._is_pool_session(session)
-        try:
-            raw = session.get(url, **request_kwargs)
-        except Exception as exc:
-            if not (pooled and _is_proxy_failure(exc)):
-                self._raise_http_request_failure(url, route=route, exc=exc)
-            self._record_proxy_failure(url, route=route, exc=exc)
-            if re.search(r"\b407\b", str(exc)):
-                # Preserve the bounded authorization path from #1476.
-                self._rotate_pool_proxy()
+        for attempt in range(2):
+            authorization = False
+            try:
+                raw = session.get(url, **request_kwargs)
+            except Exception as exc:
+                if not (
+                    pooled and (_is_proxy_failure(exc) or _is_tls_connect_failure(exc))
+                ) or (attempt and _is_tls_connect_failure(exc)):
+                    try:
+                        self._raise_http_request_failure(url, route=route, exc=exc)
+                    except WhoScoredTransportError as failure:
+                        if attempt:
+                            # The replacement passed ipify; a source timeout
+                            # does not establish pool failure. Replay is spent.
+                            failure.retryable = False
+                        raise
+                if self._source_probe_active():
+                    # The caller preserves an uncertain half-open result;
+                    # it is not evidence that the pool is unavailable.
+                    self._raise_http_request_failure(url, route=route, exc=exc)
+                self._record_proxy_failure(url, route=route, exc=exc)
+                if attempt:
+                    raise ProxyUnavailable(
+                        "WhoScored access check exhausted: reason=source_replay_failed; "
+                        f"{type(exc).__name__}"
+                    ) from None
+                authorization = bool(re.search(r"\b407\b", str(exc)))
             else:
-                # Count the failed source member toward the three-member cap;
-                # only a replacement that passes ipify may replay the source.
+                content = bytes(raw.content or b"")
+                response = self._response(
+                    url=url,
+                    content=content,
+                    status_code=int(raw.status_code),
+                    headers=dict(raw.headers or {}),
+                    route=route,
+                    wire_bytes=_response_wire_bytes(raw, content),
+                    request_bytes=_request_wire_bytes(raw),
+                )
+                self._record_response(response)
+                if (
+                    "Model-last-Mode" in request_kwargs.get("headers", {})
+                    and 200 <= response.status_code < 300
+                ):
+                    self.stats.stage_xhr_token["curl_2xx_responses"] += 1
+                if not (
+                    pooled
+                    and (
+                        response.status_code == 502
+                        or (attempt and response.status_code >= 500)
+                    )
+                ):
+                    if pooled and response.status_code >= 500:
+                        self._rotate_pool_proxy()
+                    return response
+                # Record the failed source response (including byte limits)
+                # before testing another member; ipify is not a source success.
+                try:
+                    self._validate(response, None)
+                except WhoScoredTransportError as exc:
+                    if exc.kind is not FailureKind.HTTP_STATUS or self._source_probe_active():
+                        raise
+                    if attempt:
+                        exc.retryable = False
+                        raise
+            if authorization:
+                # Preserve the separate two-member authorization path.
+                if not self._rotate_pool_proxy():
+                    raise ProxyUnavailable(
+                        "WhoScored access check exhausted: reason=replacement_unavailable"
+                    ) from None
+            else:
                 tested = {self._pool_proxy_url} if self._pool_proxy_url else set()
                 self._probe_pool_egress(tested, replace_first=True)
-            try:
-                # Rotation creates a new cookie jar. The old token must never
-                # be replayed to its replacement member with the old kwargs.
-                if "headers" in request_kwargs:
-                    request_kwargs["headers"] = {
-                        key: value
-                        for key, value in request_kwargs["headers"].items()
-                        if key != "Model-last-Mode"
-                    }
-                raw = self._direct_http.get(url, **request_kwargs)
-            except Exception as retry_exc:
-                if not _is_proxy_failure(retry_exc):
-                    self._raise_http_request_failure(url, route=route, exc=retry_exc)
-                self._record_proxy_failure(url, route=route, exc=retry_exc)
-                raise ProxyUnavailable(
-                    "WhoScored access check exhausted: reason=source_replay_failed; "
-                    f"{type(retry_exc).__name__}"
-                ) from None
-        content = bytes(raw.content or b"")
-        response = self._response(
-            url=url,
-            content=content,
-            status_code=int(raw.status_code),
-            headers=dict(raw.headers or {}),
-            route=route,
-            wire_bytes=_response_wire_bytes(raw, content),
-            request_bytes=_request_wire_bytes(raw),
-        )
-        self._record_response(response)
-        if (
-            "Model-last-Mode" in request_kwargs.get("headers", {})
-            and 200 <= response.status_code < 300
-        ):
-            # Physical HTTP outcome, independent of content/parser acceptance.
-            self.stats.stage_xhr_token["curl_2xx_responses"] += 1
-        if pooled and response.status_code >= 500:
-            # One member swap per 5xx; the caller's retry policy is unchanged.
-            self._rotate_pool_proxy()
-        return response
+            # A new member has neither the old cookie jar nor its source token.
+            if "headers" in request_kwargs:
+                request_kwargs["headers"] = {
+                    key: value
+                    for key, value in request_kwargs["headers"].items()
+                    if key != "Model-last-Mode"
+                }
+            if before_network is not None:
+                before_network()
+            session = self._direct_http
+        raise AssertionError("pool recovery loop returned no result")
 
     def _record_proxy_failure(
         self, url: str, *, route: TransportRoute, exc: BaseException

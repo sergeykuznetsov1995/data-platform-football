@@ -28,7 +28,8 @@ SHARED_FILTER_SHA256 = (
     # #1365 aggregate-pressure compaction; dedicated FBref bytes unchanged.
     # #1790: SofaScore archived recovery and WAL pressure compaction.
     # #1804: align the FBref history-controller DAG allowlist with the client.
-    "47a185330117d9cdcbaeb2b3790d1dee21930666070368c44a0242be0ff925b3"
+    # #1788: measured CONNECT 502 refusal for SofaScore discovery; FBref bytes unchanged.
+    "531c9bc4478882a99118881e2bf51acb1dc8dd8732dc96e8a39128d4efe389c2"
 )
 
 
