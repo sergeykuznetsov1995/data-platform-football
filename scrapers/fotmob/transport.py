@@ -296,6 +296,7 @@ class FotMobTransport:
         self._forbidden_targets: set[str] = set()
         self.blocked_until: Optional[datetime] = None
         self.stop_reason: Optional[str] = None
+        self._pause_pending = False
         self._stats_lock = threading.Lock()
         self._thread_attempts = threading.local()
         self._cancelled = threading.Event()
@@ -352,11 +353,19 @@ class FotMobTransport:
                 self.stop_reason = reason
             shared = self._shared_guard()
             if shared is not None:
+                self._pause_pending = True
                 shared.pause(self.blocked_until, self.stop_reason)
+                self._pause_pending = False
 
     def _pause_state(self):
         shared = self._shared_guard()
         if shared is not None:
+            with self._guard_lock:
+                # A lost connection must not leave the pause local forever.
+                # Clear only after a confirmed write; replay is idempotent.
+                if self._pause_pending:
+                    shared.pause(self.blocked_until, self.stop_reason)
+                    self._pause_pending = False
             state = shared.pause_state()
             if state is not None:
                 with self._guard_lock:

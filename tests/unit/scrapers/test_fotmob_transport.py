@@ -634,6 +634,44 @@ def test_three_distinct_403_stop_wave_and_shared_client():
     assert session2.calls == []
 
 
+@pytest.mark.parametrize("reason", ["retry_after", "ban"])
+@pytest.mark.parametrize("document", [False, True])
+def test_failed_pause_write_is_republished_after_reconnect(reason, document):
+    import psycopg2
+    from scrapers.fotmob.shared_rate_limiter import CompositeRateLimiter, RefundableRateLimiter
+    from tests.unit.scrapers.test_fotmob_shared_rate_limiter import _limiter
+
+    shared, broken = _limiter(rows=[(3.0,)])
+    recovered_shared, recovered = _limiter(rows=[(3.0,)])
+    first, first_session = _transport([FakeResponse(200, b'{}')])
+    second, second_session = _transport([FakeResponse(200, b'{}')])
+    for transport, limiter in [(first, shared), (second, recovered_shared)]:
+        transport.rate_limiter = CompositeRateLimiter(
+            RefundableRateLimiter(max_requests=60, window_seconds=60, burst_size=4),
+            limiter,
+        )
+
+    def unavailable():
+        raise psycopg2.OperationalError("metadb unavailable")
+
+    broken.broken = True
+    shared._connect = unavailable
+    with pytest.raises(psycopg2.OperationalError):
+        first._pause(7200, reason)
+    until = first.blocked_until
+    assert shared._connection is None
+    assert recovered.pause is None
+
+    shared._connect = lambda: recovered
+    fetch = first.fetch_document if document else first.fetch_json
+    assert fetch("https://www.fotmob.com/").stop_reason == reason
+    assert recovered.pause == (until, reason)
+    other = second.fetch_json("allLeagues")
+    assert other.stop_reason == reason and other.blocked_until == until
+    assert other.attempts == 0
+    assert first_session.calls == second_session.calls == []
+
+
 def test_non_403_response_resets_ban_series():
     transport, session = _transport([FakeResponse(s, b'{}') for s in [403, 403, 404, 403, 403, 200]])
     for target in range(6):
