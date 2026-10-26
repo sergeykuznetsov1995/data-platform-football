@@ -2271,12 +2271,12 @@ def test_proxy_unavailable_in_discover_is_source_unavailable(monkeypatch, tmp_pa
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("healthy_third", [False, True])
-def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, healthy_third):
+@pytest.mark.parametrize("healthy_fourth", [False, True])
+def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, healthy_fourth):
     from scrapers.utils.proxy_manager import ProxyManager
     from scrapers.whoscored.transport import TransportContext, WhoScoredTransport
 
-    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(3)]
+    urls = [f"http://test:secret@pool.invalid:{10000 + i}" for i in range(4)]
     monkeypatch.setattr(
         ProxyManager,
         "get_http_proxy_url",
@@ -2285,7 +2285,7 @@ def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, h
         ),
     )
     pool = tmp_path / "pool.txt"
-    pool.write_text("pool.invalid:10000:test:secret\n")
+    pool.write_text("".join(f"pool.invalid:{10000 + i}:test:secret\n" for i in range(4)))
     monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
     calls = []
 
@@ -2295,7 +2295,7 @@ def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, h
 
         def get(self, url, **kwargs):
             calls.append((self.proxy, url))
-            if self.proxy != urls[2] or not healthy_third:
+            if self.proxy != urls[3] or not healthy_fourth:
                 raise RuntimeError("curl: (56) CONNECT tunnel failed, response 502")
             return SimpleNamespace(status_code=200)
 
@@ -2313,14 +2313,15 @@ def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, h
     )
     assert report["error_details"] == []
     assert all(url == "https://api.ipify.org" for _, url in calls)
-    if healthy_third:
+    if healthy_fourth:
         assert rc == 0
         assert len(service_cls.instances) == 2
         assert [service.probes for service in service_cls.instances] == [1, 1]
-        assert [proxy for proxy, _ in calls] == urls + [urls[2]]
+        assert [proxy for proxy, _ in calls] == urls + [urls[3]]
     else:
         assert rc == runner.SOURCE_UNAVAILABLE_EXIT_CODE == 3
         assert report["status"] == "source_unavailable"
         assert [item["status"] for item in report["scopes"]] == ["source_unavailable", "pending"]
         assert len(service_cls.instances) == 1
         assert [proxy for proxy, _ in calls] == urls
+        assert service_cls.instances[0].calls == []
