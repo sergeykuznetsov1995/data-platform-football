@@ -4437,7 +4437,7 @@ class WhoScoredTransport:
             except Exception as exc:
                 if not (
                     pooled and (_is_proxy_failure(exc) or _is_tls_connect_failure(exc))
-                ):
+                ) or (attempt and _is_tls_connect_failure(exc)):
                     try:
                         self._raise_http_request_failure(url, route=route, exc=exc)
                     except WhoScoredTransportError as failure:
@@ -4491,14 +4491,9 @@ class WhoScoredTransport:
                 except WhoScoredTransportError as exc:
                     if exc.kind is not FailureKind.HTTP_STATUS or self._source_probe_active():
                         raise
-                    if attempt and response.status_code != 502:
+                    if attempt:
                         exc.retryable = False
                         raise
-                if attempt:
-                    raise ProxyUnavailable(
-                        "WhoScored access check exhausted: reason=source_replay_failed; "
-                        f"HTTP {response.status_code}"
-                    ) from None
             if authorization:
                 # Preserve the separate two-member authorization path.
                 if not self._rotate_pool_proxy():

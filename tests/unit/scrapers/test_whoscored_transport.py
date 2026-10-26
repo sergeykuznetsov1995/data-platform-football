@@ -5234,20 +5234,15 @@ def test_schedule_pool_replay_failure_never_requests_source_a_third_time(
     second = FakeHTTPSession(FakeHTTPResponse(), replay_failure)
     transport, seen = _pool_transport(monkeypatch, tmp_path, first, second, http_attempts=3)
     tokens = []
-    source_failure = failure in {"timeout", "http500", "http503"}
-    expected = WhoScoredTransportError if source_failure else transport_module.ProxyUnavailable
-    with pytest.raises(expected) as caught:
+    with pytest.raises(WhoScoredTransportError) as caught:
         transport.fetch(
             "https://www.whoscored.com/tournaments/25590/data/?d=202610",
             before_network=lambda: tokens.append(1),
         )
-    if source_failure:
-        assert caught.value.kind is (
-            FailureKind.TIMEOUT if failure == "timeout" else FailureKind.HTTP_STATUS
-        )
-        assert caught.value.retryable is False
-    else:
-        assert "source_replay_failed" in str(caught.value)
+    assert caught.value.kind is (
+        FailureKind.TIMEOUT if failure in {"tls", "timeout"} else FailureKind.HTTP_STATUS
+    )
+    assert caught.value.retryable is False
     assert len(seen) == 2 and seen[0] != seen[1]
     assert [len(s.calls) for s in (first, second)] == [1, 2]
     assert len(tokens) == 2

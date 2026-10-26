@@ -2272,7 +2272,7 @@ def test_proxy_unavailable_in_discover_is_source_unavailable(monkeypatch, tmp_pa
 
 @pytest.mark.unit
 @pytest.mark.parametrize("initial_failure", ["tls", "http502"])
-@pytest.mark.parametrize("replay_failure", ["timeout", "http500", "http503"])
+@pytest.mark.parametrize("replay_failure", ["tls", "http502", "timeout", "http500", "http503"])
 def test_source_replay_failure_continues_next_scope(
     monkeypatch, tmp_path, initial_failure, replay_failure
 ):
@@ -2282,14 +2282,15 @@ def test_source_replay_failure_continues_next_scope(
     )
 
     pool = tmp_path / "pool.txt"
-    pool.write_text("pool.invalid:10000:test:secret\npool.invalid:10001:test:secret\n")
+    pool.write_text("".join(f"pool.invalid:{10000 + i}:test:secret\n" for i in range(3)))
     monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
     calls = []
     proxies = []
     failures = [
         SSLError("curl: (35) TLS connect error", code=35)
         if initial_failure == "tls" else 502,
-        RuntimeError("curl: (28) timed out")
+        SSLError("curl: (35) TLS connect error", code=35)
+        if replay_failure == "tls" else RuntimeError("curl: (28) timed out")
         if replay_failure == "timeout" else int(replay_failure[4:]),
         200,
     ]
