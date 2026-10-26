@@ -4440,13 +4440,12 @@ class WhoScoredTransport:
                 ):
                     try:
                         self._raise_http_request_failure(url, route=route, exc=exc)
-                    except WhoScoredTransportError:
-                        if not attempt:
-                            raise
-                        raise ProxyUnavailable(
-                            "WhoScored access check exhausted: reason=source_replay_failed; "
-                            f"{type(exc).__name__}"
-                        ) from None
+                    except WhoScoredTransportError as failure:
+                        if attempt:
+                            # The replacement passed ipify; a source timeout
+                            # does not establish pool failure. Replay is spent.
+                            failure.retryable = False
+                        raise
                 if self._source_probe_active():
                     # The caller preserves an uncertain half-open result;
                     # it is not evidence that the pool is unavailable.
@@ -4491,6 +4490,9 @@ class WhoScoredTransport:
                     self._validate(response, None)
                 except WhoScoredTransportError as exc:
                     if exc.kind is not FailureKind.HTTP_STATUS or self._source_probe_active():
+                        raise
+                    if attempt and response.status_code != 502:
+                        exc.retryable = False
                         raise
                 if attempt:
                     raise ProxyUnavailable(

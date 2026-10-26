@@ -5215,7 +5215,7 @@ def test_schedule_pool_failure_probes_replacement_before_single_replay(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failure", ["tls", "http502", "timeout", "http503"])
+@pytest.mark.parametrize("failure", ["tls", "http502", "timeout", "http500", "http503"])
 def test_schedule_pool_replay_failure_never_requests_source_a_third_time(
     monkeypatch, tmp_path, failure
 ):
@@ -5228,16 +5228,26 @@ def test_schedule_pool_replay_failure_never_requests_source_a_third_time(
     first = FakeHTTPSession(failed())
     replay_failure = {
         "timeout": RuntimeError("curl: (28) timed out"),
+        "http500": FakeHTTPResponse(status_code=500),
         "http503": FakeHTTPResponse(status_code=503),
     }.get(failure, failed())
     second = FakeHTTPSession(FakeHTTPResponse(), replay_failure)
     transport, seen = _pool_transport(monkeypatch, tmp_path, first, second, http_attempts=3)
     tokens = []
-    with pytest.raises(transport_module.ProxyUnavailable, match="source_replay_failed"):
+    source_failure = failure in {"timeout", "http500", "http503"}
+    expected = WhoScoredTransportError if source_failure else transport_module.ProxyUnavailable
+    with pytest.raises(expected) as caught:
         transport.fetch(
             "https://www.whoscored.com/tournaments/25590/data/?d=202610",
             before_network=lambda: tokens.append(1),
         )
+    if source_failure:
+        assert caught.value.kind is (
+            FailureKind.TIMEOUT if failure == "timeout" else FailureKind.HTTP_STATUS
+        )
+        assert caught.value.retryable is False
+    else:
+        assert "source_replay_failed" in str(caught.value)
     assert len(seen) == 2 and seen[0] != seen[1]
     assert [len(s.calls) for s in (first, second)] == [1, 2]
     assert len(tokens) == 2
