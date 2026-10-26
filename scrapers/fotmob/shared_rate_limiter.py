@@ -120,14 +120,23 @@ class PgSharedRateLimiter:
         self._query(f"""
             ALTER TABLE {SHARED_RATE_LIMIT_TABLE}
                 ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMPTZ,
-                ADD COLUMN IF NOT EXISTS stop_reason TEXT
+                ADD COLUMN IF NOT EXISTS stop_reason TEXT,
+                ADD COLUMN IF NOT EXISTS policy_version INTEGER
         """)
         self._query(f"""
             INSERT INTO {SHARED_RATE_LIMIT_TABLE}
-                (key, tokens, capacity, rate_per_second, updated_at)
-            VALUES (%s, %s, %s, %s, clock_timestamp())
+                (key, tokens, capacity, rate_per_second, updated_at, policy_version)
+            VALUES (%s, %s, %s, %s, clock_timestamp(), 1)
             ON CONFLICT (key) DO NOTHING
         """, (self.key, self.burst, self.burst, self.rpm / 60.0))
+        if (self.rpm, self.burst) == (FOTMOB_SHARED_RPM, FOTMOB_SHARED_BURST):
+            # Only legacy rows are migrated, once, to the source policy.
+            # Keep tokens, refill timestamp and any active pause untouched.
+            self._query(f"""
+                UPDATE {SHARED_RATE_LIMIT_TABLE}
+                   SET capacity = %s, rate_per_second = %s, policy_version = 1
+                 WHERE key = %s AND policy_version IS NULL
+            """, (self.burst, self.rpm / 60.0, self.key))
         policy = self._query(f"""
             SELECT capacity, rate_per_second FROM {SHARED_RATE_LIMIT_TABLE}
              WHERE key = %s

@@ -38,6 +38,10 @@ class _FakeCursor:
             raise psycopg2.OperationalError("connection lost")
         if sql.startswith("INSERT") and self._connection.policy is None:
             self._connection.policy = (params[2], params[3])
+            self._connection.policy_version = 1
+        if "SET capacity = %s" in sql and self._connection.policy_version is None:
+            self._connection.policy = params[:2]
+            self._connection.policy_version = 1
         if "SET blocked_until = GREATEST" in sql:
             until, reason, _key = params
             old = self._connection.pause
@@ -58,6 +62,7 @@ class _FakeCursor:
 class _FakeConnection:
     def __init__(self, rows=None):
         self.policy = None
+        self.policy_version = None
         self.pause = None
         self.broken = False
         self.autocommit = False
@@ -85,7 +90,7 @@ def test_bootstrap_creates_the_row_and_carries_current_constants():
     limiter, connection = _limiter(rpm=60.0, burst=4.0)
 
     statements = [sql for sql, _params in connection.executed]
-    assert len(statements) == 4
+    assert len(statements) == 5
     assert statements[0].startswith(
         f"CREATE TABLE IF NOT EXISTS {SHARED_RATE_LIMIT_TABLE}"
     )
@@ -316,6 +321,31 @@ def test_incompatible_policy_does_not_overwrite_bucket_or_pause():
     assert connection.policy == (4.0, 1.0)
     assert connection.rows == [(0.5,)]
     assert connection.pause == (until, "ban")
+
+
+@pytest.mark.parametrize("tokens", [0.5, 7.0])
+def test_legacy_worker_policy_migrates_once_preserving_bucket_and_pause(tokens):
+    connection = _FakeConnection(rows=[(tokens,)])
+    connection.policy = (8.0, 1.0)
+    until = datetime.now(timezone.utc) + timedelta(minutes=15)
+    connection.pause = (until, "ban")
+
+    PgSharedRateLimiter("ignored", connection=connection)
+
+    assert connection.policy == (4.0, 1.0)
+    assert connection.policy_version == 1
+    assert connection.rows == [(tokens,)]
+    assert connection.pause == (until, "ban")
+    migration = next(sql for sql, _ in connection.executed if "SET capacity = %s" in sql)
+    assert "policy_version IS NULL" in migration
+    assert "tokens =" not in migration
+    assert "updated_at =" not in migration
+    assert "blocked_until =" not in migration
+    # A versioned row with conflicting policy must still fail closed.
+    connection.policy = (8.0, 1.0)
+    with pytest.raises(ValueError, match="policy mismatch"):
+        PgSharedRateLimiter("ignored", connection=connection)
+    assert connection.policy == (8.0, 1.0)
 
 
 @pytest.mark.parametrize("workers", [1, 4, 16])

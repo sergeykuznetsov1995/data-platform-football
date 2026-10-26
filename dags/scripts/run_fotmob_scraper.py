@@ -1457,6 +1457,17 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
 
     def finish() -> tuple[int, dict[str, Any]]:
+        pause_flush = getattr(service.transport, "flush_pending_pause", None)
+        if pause_flush is not None:
+            pause_operation = OperationResult("pause_flush", attempted=1)
+            try:
+                pause_flush()
+                pause_operation.succeeded = 1
+            except Exception as exc:
+                pause_operation.errors.append(
+                    f"pause flush: {type(exc).__name__}: {exc}"
+                )
+            operations.append(pause_operation)
         # Buffered commits are only durable once flushed. Every exit path of
         # this run — completion, budget cut, empty catalog — goes through
         # finish(), so the flush belongs here and its failure must turn the
