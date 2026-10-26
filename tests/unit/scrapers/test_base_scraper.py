@@ -125,6 +125,15 @@ class TestBaseScraper:
         assert result == 'iceberg.bronze.test'
         assert 'iceberg.bronze.test' in concrete_scraper._stats['tables_written']
 
+    def test_save_to_iceberg_preserves_writer_keyword_contract(self, concrete_scraper):
+        frame = pd.DataFrame({'league': ['A'], 'season': ['2526'], 'game_id': [1]})
+        concrete_scraper.save_to_iceberg(
+            frame, 'schedule', natural_keys=['league', 'season', 'game_id'],
+        )
+        kwargs = concrete_scraper._iceberg_writer.write_dataframe.call_args.kwargs
+        assert kwargs['merge_keys'] == ['league', 'season', 'game_id']
+        assert 'merge_partition_cols' not in kwargs
+
     def test_save_to_iceberg_empty(self, concrete_scraper):
         """Test saving empty DataFrame."""
         df = pd.DataFrame()

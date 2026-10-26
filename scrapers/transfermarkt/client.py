@@ -909,11 +909,43 @@ class TransfermarktHttpClient:
                     self._request_deadline_monotonic - self._monotonic()
                     - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS,
                 )
-            self._lease_provider.acquire_request_permit(
-                metadata=metadata,
-                request_id=request_id,
-                **options,
-            )
+            while True:
+                try:
+                    self._lease_provider.acquire_request_permit(
+                        metadata=metadata,
+                        request_id=request_id,
+                        **options,
+                    )
+                    break
+                except SourceStreamPaused as exc:
+                    from .history_portion import enabled as history_enabled
+                    if history_enabled() or self._request_deadline_monotonic is None:
+                        raise
+                    delay = max(0.0, exc.resume_at_epoch - self._time()) + 0.1
+                    remaining = (
+                        self._request_deadline_monotonic - self._monotonic()
+                        - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS
+                    )
+                    if not math.isfinite(delay) or delay >= remaining:
+                        raise
+                    self._sleep(delay)
+                    try:
+                        self._request_timeout()
+                    except CurrentPortionDeadlineExceeded:
+                        raise exc
+                    if self._lease_expiring() or (
+                        self._lease is not None and self._lease.expires_at <= self._time()
+                    ):
+                        self._discard_client()
+                        self._close_lease(label=label)
+                        self._ensure_client(
+                            url=url, label=label, context=context, retry=False,
+                        )
+                    options["max_wait_seconds"] = min(
+                        TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS,
+                        self._request_deadline_monotonic - self._monotonic()
+                        - CURRENT_PORTION_SETTLE_SECONDS - CURRENT_PORTION_MIN_REQUEST_SECONDS,
+                    )
         except CurrentPortionDeadlineExceeded:
             raise
         except TrafficMeterError:
@@ -2037,6 +2069,9 @@ class TransfermarktHttpClient:
                     url=url,
                     label=label,
                     context=context,
+                )
+                client, proxy_obj = self._ensure_client(
+                    url=url, label=label, context=context, retry=attempt > 1,
                 )
                 if self._lease_expiring() or self._lease_near_byte_cap():
                     # Planned rotation right before I/O: rate-limit and
