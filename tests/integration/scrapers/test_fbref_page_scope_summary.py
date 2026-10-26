@@ -307,3 +307,58 @@ def test_registry_observation_timestamps_do_not_invalidate_ownership(scope_db):
             cursor.execute("SELECT count(*) FROM fbref_control.page_scope_registry_dirty")
             assert cursor.fetchone()[0] == 0
     assert_equivalent(connection, cursor_class)
+
+
+def test_concurrent_alias_updates_skip_locked_registry_invalidations(scope_db):
+    import threading
+    import psycopg2
+
+    connection, store, cursor_class = scope_db
+    finish_backfill(store)
+    store.upsert_season_alias(SeasonAlias("10", "current", "2026", alias_kind="label"))
+    store.upsert_frontier_target(FrontierTarget(
+        "l-alias", "season", "https://example.invalid/l-alias",
+        {"competition_id": "10", "season_id": "current"}, "weekly"))
+    with connection:
+        with connection.cursor() as cursor:
+            # 99 sorts after both edited competitions, so its separate lock
+            # cannot mask the original two-transaction queue-lock cycle.
+            cursor.execute("""INSERT INTO fbref_control.page_scope_registry_dirty
+                (source, competition_id) VALUES ('fbref','9'),('fbref','10'),('fbref','99')""")
+
+    ready = threading.Barrier(2)
+    class ConcurrentStore(ControlStore):
+        def _refresh_registry_scopes(self, cursor):
+            # Each alias trigger has locked its own pre-existing dirty row.
+            # The old queue-wide FOR UPDATE now creates a two-transaction cycle.
+            ready.wait(timeout=5)
+            return super()._refresh_registry_scopes(cursor)
+
+    def update_alias(cid):
+        other = ConcurrentStore(store.db_uri, connection_factory=lambda dsn:
+            psycopg2.connect(dsn, options="-c statement_timeout=5000"))
+        other.upsert_season_alias(SeasonAlias(cid, "current", "2025", alias_kind="label"))
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT competition_id FROM fbref_control.page_scope_registry_dirty
+                WHERE competition_id='99' FOR UPDATE""")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(update_alias, cid) for cid in ("9", "10")]
+            for future in futures:
+                future.result(timeout=10)
+    finally:
+        # A skipped row must survive even if its lock holder rolls back.
+        connection.rollback()
+
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT competition_id, season_id FROM fbref_control.season_alias
+                WHERE alias='current' ORDER BY competition_id""")
+            assert cursor.fetchall() == [("10", "2025"), ("9", "2025")]
+            cursor.execute("SELECT competition_id FROM fbref_control.page_scope_registry_dirty")
+            assert cursor.fetchall() == [("99",)]
+            cursor.execute(PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
+            assert json.loads(cursor.fetchone()[0]) == {"error": "scope_summary_incomplete"}
+    store.refresh_page_scopes()
+    assert_equivalent(connection, cursor_class)

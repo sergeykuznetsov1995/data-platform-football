@@ -35,6 +35,27 @@ def test_1805_backfill_limits_fail_before_opening_a_connection():
             store.backfill_page_scopes(batch_size=size)
 
 
+def test_registry_refresh_skips_locked_invalidations_and_deletes_only_captured_rows():
+    captured = [{"source": "fbref", "competition_id": "9"}]
+    deleted = []
+    class Cursor:
+        def execute(self, sql, params=None):
+            self.rows = []
+            if "SELECT source, competition_id" in sql:
+                assert "FOR UPDATE SKIP LOCKED" in sql
+                # Another registry transaction owns competition 10's queue row.
+                self.rows = captured
+            elif "DELETE FROM fbref_control.page_scope_registry_dirty" in sql:
+                deleted.extend(json.loads(params[0]))
+
+        def fetchall(self):
+            return self.rows
+
+    store = ControlStore("postgresql://test.invalid/scope")
+    assert store._refresh_registry_scopes(Cursor()) == 0
+    assert deleted == captured
+
+
 def test_1805_backfill_deadline_applies_to_the_entire_batch(monkeypatch):
     calls = []
     class Cursor:

@@ -1014,10 +1014,11 @@ class ControlStore:
     def _refresh_registry_scopes(self, cursor: Any) -> int:
         # Lock the captured invalidations until commit. An edit of the same
         # competition waits, then enqueues a fresh invalidation after our DELETE;
-        # edits of other competitions are not accidentally acknowledged.
+        # skip rows held by other registry edits to avoid a queue-lock deadlock.
+        # Only captured rows are acknowledged; skipped invalidations stay queued.
         cursor.execute("""SELECT source, competition_id
             FROM fbref_control.page_scope_registry_dirty
-            ORDER BY source, competition_id FOR UPDATE""")
+            ORDER BY source, competition_id FOR UPDATE SKIP LOCKED""")
         dirty = _fetchall(cursor)
         if not dirty:
             return 0
@@ -1026,7 +1027,7 @@ class ControlStore:
         # set, before changing summary rows. Thus enumeration cannot miss a
         # committed new scope, nor publish flags from an old registry snapshot.
         cursor.execute("SELECT pg_advisory_xact_lock(%s)", (SCOPE_SUMMARY_LOCK_KEY,))
-        affected = _json(dirty)
+        affected = json.dumps(dirty, sort_keys=True, separators=(",", ":"))
         after = ""
         refreshed = 0
         while True:
