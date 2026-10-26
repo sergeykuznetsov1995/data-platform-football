@@ -1219,3 +1219,17 @@ def test_closed_check_without_baseline_hashes_reingests_without_probe():
     full.scrape_scope.assert_called_once()
     assert repository.appended[-1].quality["league_payload_hashes"] == _LEAGUE_HASHES
     assert repository.appended[-1].quality["request_count"] == 380
+
+
+@pytest.mark.parametrize("physical", [True, False])
+def test_catalog_quality_ready_requires_verified_manifest_publication(physical):
+    factory, scraper = _scraper_factory(_complete_frames())
+    repository = _Repository(physical=physical)
+    def note_quality(league, year, report):
+        assert repository.verified
+        assert repository.appended[-1].status is ManifestStatus.COMPLETE
+        assert report.passed
+    scraper.note_quality.side_effect = note_quality
+    _, code = runner.run_scope(_args(), scraper_factory=factory, repository=repository)
+    assert code == (0 if physical else 2)
+    assert scraper.note_quality.call_count == (1 if physical else 0)

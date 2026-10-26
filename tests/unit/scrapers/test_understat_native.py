@@ -163,7 +163,7 @@ def test_catalog_has_six_canonical_leagues_and_no_post_rollover_extra_probe():
 
     rolling = catalog.rolling_scopes(window=2, probe_next=True)
     assert len(rolling) == 12
-    assert {scope.season for scope in rolling} == {"2526", "2627"}
+    assert {scope.season for scope in rolling} == {"2425", "2526"}
     assert "2728" not in {scope.season for scope in rolling}
 
 

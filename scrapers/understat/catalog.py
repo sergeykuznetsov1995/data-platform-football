@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import date
+from dataclasses import asdict, dataclass, replace
+from datetime import date, timedelta
 import math
 import json
 from pathlib import Path
@@ -11,7 +11,8 @@ import uuid
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
-from .client import UnderstatPayloadError, save_schema_drift_payload
+from .client import UnderstatHTTPError, UnderstatPayloadError, save_schema_drift_payload
+from .cache_state import atomic_json, digest, read_json
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,7 @@ class UnderstatCatalog:
             raise _payload_error("stat", "must contain discovery rows")
 
         current = current_source_season_id(self.today)
+        confirmed = {item.league: self._confirmed(item) for item in LEAGUES}
         found: dict[tuple[str, int], UnderstatScope] = {}
         covered_leagues: set[str] = set()
 
@@ -225,6 +227,10 @@ class UnderstatCatalog:
                 )
             covered_leagues.add(definition.league)
             source_year = year if month >= 7 else year - 1
+            matching = [int(y) for y, state in confirmed[definition.league].items()
+                        if f"{year:04d}-{month:02d}" in state.get("months", [])]
+            if matching:
+                source_year = max(matching)
             key = (definition.league, source_year)
             found[key] = UnderstatScope(
                 league=definition.league,
@@ -232,7 +238,9 @@ class UnderstatCatalog:
                 source_league_id=definition.source_league_id,
                 season=season_slug(source_year),
                 source_season_id=source_year,
-                is_closed=source_year < current,
+                is_closed=confirmed[definition.league].get(str(source_year), {}).get(
+                    "is_closed", source_year < current
+                ),
                 discovered=True,
             )
 
@@ -277,10 +285,11 @@ class UnderstatCatalog:
                 discovered = self._scopes_from(json.loads(target.read_text(encoding="utf-8")))
             except (OSError, ValueError) as exc:
                 raise UnderstatPayloadError(f"Invalid last successful registry: {exc}") from exc
-        return self._rolling_window(discovered, window=window, probe_next=probe_next)
+        return self._rolling_window(discovered, window=window, probe_next=probe_next, live=False)
 
     def _rolling_window(
         self, scopes: tuple[UnderstatScope, ...], *, window: int, probe_next: bool,
+        live: bool = True,
     ) -> tuple[UnderstatScope, ...]:
         if window <= 0:
             raise ValueError("window must be positive")
@@ -289,31 +298,154 @@ class UnderstatCatalog:
             for scope in scopes
         }
         current = current_source_season_id(self.today)
-        years = list(range(current - window + 1, current + 1))
-        # Before the July rollover, probe the source id matching this calendar
-        # year. After rollover it is already the current season; do not invent
-        # a 2027/28 probe a full year early.
-        if probe_next and self.today.year not in years:
-            years.append(self.today.year)
-
         result: list[UnderstatScope] = []
         for definition in LEAGUES:
-            for source_year in years:
-                result.append(
-                    discovered.get(
-                        (definition.league, source_year),
-                        UnderstatScope(
-                            league=definition.league,
-                            source_league=definition.source_league,
-                            source_league_id=definition.source_league_id,
-                            season=season_slug(source_year),
-                            source_season_id=source_year,
-                            is_closed=source_year < current,
-                            discovered=False,
-                        ),
-                    )
+            known = [scope.source_season_id for scope in scopes if scope.league == definition.league]
+            confirmed = self._confirmed(definition)
+            published = [int(year) for year, state in confirmed.items() if state.get("published")]
+            latest = max([*known, *published], default=current)
+            # Stat rows are only a bootstrap hint. Keep a continuing season
+            # across July until its own league schedule says it has finished.
+            latest = max(latest, current - 1)
+            years = list(range(latest - window + 1, latest + 1))
+            getter = getattr(self.client, "get_league_data", None) if live else None
+            if callable(getter):
+                active = [int(y) for y, state in confirmed.items()
+                          if state.get("published") and not state["is_closed"]]
+                if not confirmed.get(str(latest), {}).get("is_closed"):
+                    active.append(latest)
+                if not confirmed and latest >= self.today.year:
+                    # A July stat row may still belong to last year's source
+                    # season. Confirm both candidates during cold bootstrap.
+                    active.append(latest - 1)
+                for year in sorted(set(active)):
+                    self._probe(definition, year, confirmed,
+                                force=year in known and not confirmed.get(str(year), {}).get("published"))
+                # Probe only around the actual end of the latest schedule.
+                # Negative responses are cached for seven days.
+                state = confirmed.get(str(latest), {})
+                end = state.get("last_match")
+                if (probe_next and end and
+                        -14 <= (self.today - date.fromisoformat(end)).days <= 90):
+                    self._probe(definition, latest + 1, confirmed)
+                published = [int(y) for y, state in confirmed.items() if state.get("published")]
+                if published:
+                    if not confirmed.get(str(latest), {}).get("published") and latest == self.today.year:
+                        latest = max(published)
+                    latest = max(latest, max(published))
+                    years = list(range(latest - window + 1, latest + 1))
+                    years.extend(int(y) for y, state in confirmed.items()
+                                 if state.get("published") and not state["is_closed"]
+                                 and int(y) not in years)
+            elif not confirmed and probe_next and self.today.month == 6 and self.today.year not in years:
+                # Offline/bootstrap fallback has no league evidence yet.
+                years.append(self.today.year)
+            years.extend(int(y) for y, state in confirmed.items()
+                         if state.get("published") and not state["is_closed"]
+                         and int(y) not in years)
+            for source_year in sorted(years):
+                scope = discovered.get(
+                    (definition.league, source_year),
+                    UnderstatScope(
+                        league=definition.league,
+                        source_league=definition.source_league,
+                        source_league_id=definition.source_league_id,
+                        season=season_slug(source_year),
+                        source_season_id=source_year,
+                        is_closed=source_year < current,
+                        discovered=False,
+                    ),
                 )
+                state = confirmed.get(str(source_year))
+                if state is not None and state.get("published"):
+                    scope = replace(scope, is_closed=state["is_closed"], discovered=True)
+                result.append(scope)
         return tuple(sorted(result))
+
+    def _confirmed(self, definition: LeagueDefinition) -> dict[str, Any]:
+        cache_dir = getattr(self.client, "cache_dir", None)
+        if cache_dir is None:
+            return {}
+        folder = Path(cache_dir) / "confirmed"
+        return {path.stem.rsplit("_", 1)[1]: state
+                for path in folder.glob(f"{definition.source_league}_*.json")
+                if isinstance(state := read_json(path), dict)}
+
+    def record_league(self, definition: LeagueDefinition, year: int,
+                      payload: Mapping[str, Any]) -> dict[str, Any]:
+        from .parsers import _boolean
+        dates = payload.get("dates", [])
+        previous = self._confirmed(definition).get(str(year), {})
+        last_match = max((str(row["datetime"])[:10] for row in dates), default=None)
+        state = {
+            "published": bool(dates), "checked_on": self.today.isoformat(),
+            "last_match": last_match,
+            "months": sorted({str(row["datetime"])[:7] for row in dates}),
+            "schedule_closed": bool(dates) and all(
+                _boolean(row["isResult"], "getLeagueData.dates[].isResult") for row in dates
+            ) and date.fromisoformat(last_match) < self.today - timedelta(days=2),
+            "league_hash": digest(payload),
+            "quality_ready": previous.get("quality_ready", False)
+            and previous.get("league_hash") == digest(payload),
+            "quarantine_until": previous.get("quarantine_until"),
+        }
+        state["is_closed"] = self._can_close(state)
+        self._save_confirmation(definition, year, state)
+        return state
+
+    def _can_close(self, state: Mapping[str, Any]) -> bool:
+        until = state.get("quarantine_until")
+        return bool(state.get("schedule_closed") and state.get("quality_ready")
+                    and (not until or self.today > date.fromisoformat(until[:10])))
+
+    def _save_confirmation(self, definition: LeagueDefinition, year: int, state: Any) -> None:
+        cache_dir = getattr(self.client, "cache_dir", None)
+        if cache_dir is not None:
+            atomic_json(Path(cache_dir) / "confirmed" / f"{definition.source_league}_{year}.json", state)
+
+    def note_quality(self, league: str, year: int, report: Any) -> None:
+        definition = LEAGUE_BY_CANONICAL[league]
+        state = self._confirmed(definition).get(str(year))
+        if state is None:
+            return
+        state["quality_ready"] = report.passed
+        state["quarantine_until"] = max(
+            (item.retry_until for item in report.match_quarantine if item.state == "waiting_data"),
+            default=None,
+        )
+        state["is_closed"] = self._can_close(state)
+        self._save_confirmation(definition, year, state)
+
+    def _probe(self, definition: LeagueDefinition, year: int,
+               confirmed: dict[str, Any], *, force: bool = False) -> None:
+        previous = confirmed.get(str(year), {})
+        checked = previous.get("checked_on")
+        ttl = 1 if previous.get("published") else 7
+        if not force and checked and (self.today - date.fromisoformat(checked)).days < ttl:
+            return
+        try:
+            payload = self.client.get_league_data(definition.source_league, year, force_refresh=True)
+        except UnderstatHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            payload = {"dates": [], "players": [], "teams": {}}
+        # Imported here because parsers use the catalog's scope definitions.
+        from .parsers import validate_league_payload
+        try:
+            validate_league_payload(payload)
+        except Exception:
+            save_schema_drift_payload(getattr(self.client, "cache_dir", None),
+                                      f"league_{definition.source_league}_{year}.json", payload)
+            raise
+        state = self.record_league(definition, year, payload)
+        # A transient empty response must not erase a confirmed continuing
+        # season. The runner still fails on an empty discovered scope.
+        if previous.get("published") and not state["published"]:
+            state = {**previous, "checked_on": self.today.isoformat()}
+            cache_dir = getattr(self.client, "cache_dir", None)
+            if cache_dir is not None:
+                atomic_json(Path(cache_dir) / "confirmed" / f"{definition.source_league}_{year}.json", state)
+        confirmed[str(year)] = state
 
 
 __all__ = [

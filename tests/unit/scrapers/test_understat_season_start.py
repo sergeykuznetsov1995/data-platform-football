@@ -390,9 +390,9 @@ class _StatClient:
 @pytest.mark.parametrize(
     "today, expected",
     [
-        (date(2027, 1, 15), {2025: True, 2026: True, 2027: False}),
+        (date(2027, 1, 15), {2025: True, 2026: True}),
         (date(2027, 6, 30), {2025: True, 2026: True, 2027: False}),
-        (date(2027, 7, 1), {2026: True, 2027: False}),
+        (date(2027, 7, 1), {2025: True, 2026: True}),
     ],
 )
 def test_rolling_window_around_the_july_rollover(today, expected):

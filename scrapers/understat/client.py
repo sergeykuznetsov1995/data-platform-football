@@ -14,6 +14,8 @@ import time
 from typing import Any, Optional
 from urllib.parse import quote
 
+from .cache_state import CacheState, atomic_json
+
 
 UNDERSTAT_URL = "https://understat.com"
 API_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
@@ -266,12 +268,7 @@ class UnderstatClient:
 
         if cache_path is not None:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temporary.replace(cache_path)
+            atomic_json(cache_path, payload)
         return payload
 
     def _save_rejected(
@@ -292,6 +289,7 @@ class UnderstatClient:
         last_error: Optional[BaseException] = None
         for attempt in range(1, self.max_attempts + 1):
             self._pacer.acquire()
+            CacheState(self.cache_dir).count_request(self.now().date())
             self.request_count += 1
             try:
                 response = self.session.get(
