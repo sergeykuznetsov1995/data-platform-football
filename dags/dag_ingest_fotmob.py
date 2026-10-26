@@ -810,6 +810,11 @@ def validate_data(
         transport = result.get("transport") or {}
         budget = result.get("budget") or {}
         violations = []
+        dag_run = context.get("dag_run")
+        if dag_run is not None:
+            scraper = dag_run.get_task_instance("scrape_fotmob_data")
+            if scraper is None or scraper.state != "success":
+                violations.append("scrape_fotmob_data did not succeed")
         required_transport = {
             "attempts",
             "direct_bytes",
@@ -1192,6 +1197,7 @@ python dags/scripts/run_fotmob_scraper.py \\
         task_id="validate_data",
         python_callable=validate_data,
         op_kwargs={"result_path": RESULT_PATH},
+        trigger_rule="all_done",
     )
 
     replay_missing_inputs_proof = PythonOperator(
