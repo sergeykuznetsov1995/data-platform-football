@@ -584,6 +584,22 @@ docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace r
 Сначала проверить актуальные gate/stop-флаги и отсутствие другого контроллера;
 если прежняя служба ещё работает, остановить её по протоколу ниже.
 
+Если при замене службы выполнен модульный `stop`, он оставляет `measurement.off`.
+Только после явного разрешения владельца на возобновление и подтверждённого
+выхода прежнего контроллера установить разовый runtime override:
+
+```bash
+sudo mkdir -p /run/systemd/system/espn-1510-measure.service.d
+sudo tee /run/systemd/system/espn-1510-measure.service.d/resume.conf >/dev/null <<'EOF'
+[Service]
+Restart=no
+ExecStart=
+ExecStart=/usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace resume --benchmark-at-boundaries --expected-ids-sha256 eedc73cf4e3748fd589cd8a9aae0209c87bf5f0a0299628dd69ac40e0e864133
+EOF
+```
+
+Затем установить и запустить службу (при отсутствии stop-флага override не нужен):
+
 ```bash
 sudo install -m 0644 deploy/espn/systemd/espn-1510-measure.service /etc/systemd/system/espn-1510-measure.service
 sudo systemctl daemon-reload
@@ -591,6 +607,26 @@ sudo systemctl enable --now espn-1510-measure.service
 sudo systemctl is-enabled espn-1510-measure.service
 sudo systemctl status espn-1510-measure.service
 ```
+
+После запуска проверить статус контроллера дважды с интервалом 10 секунд:
+
+```bash
+docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace status --format json
+```
+
+Продолжение подтверждают `status=running`, увеличивающийся свежий `heartbeat`
+и `stale=false`; одного `systemctl status` недостаточно. После подтверждения
+удалить только разовый override и перечитать unit, без перезапуска контроллера:
+
+```bash
+sudo rm /run/systemd/system/espn-1510-measure.service.d/resume.conf
+sudo systemctl daemon-reload
+```
+
+Разовый override отключает автоматические повторы `resume`.
+При неудачном возобновлении также удалить override и разобрать причину;
+повторный `resume` требует явного решения оператора. Дальнейшие автоматические
+запуски используют постоянный `run` и сохраняют операторский stop-флаг.
 
 Unit запускается после Docker и повторяет неудачный запуск каждые 15 секунд
 без исчерпания попыток, если контейнер ещё не готов. `ExecStart` использует `run`,

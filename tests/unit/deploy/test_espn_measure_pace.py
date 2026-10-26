@@ -567,6 +567,43 @@ def test_documented_supervisor_survives_reboot_without_clearing_operator_stop():
     assert 'systemd-run --unit=espn-1510-measure' not in text
 
 
+def test_documented_service_replacement_resumes_after_operator_stop(tmp_path, monkeypatch):
+    from pathlib import Path
+    import shlex
+    from scrapers.espn import trino_manager
+    root = Path(__file__).resolve().parents[3]
+    text = (root / 'deploy/espn/README.md').read_text()
+    override = '/run/systemd/system/espn-1510-measure.service.d/resume.conf'
+    setup = text.index(f'sudo tee {override}')
+    enable = text.index('sudo systemctl enable --now espn-1510-measure.service', setup)
+    cleanup = text.index(f'sudo rm {override}', enable)
+    block = text[setup:enable]
+    assert 'Restart=no\nExecStart=\nExecStart=' in block
+    command = shlex.split(block.split('ExecStart=\nExecStart=', 1)[1].splitlines()[0])
+    permanent = (root / 'deploy/espn/systemd/espn-1510-measure.service').read_text()
+    expected = shlex.split(permanent.split('ExecStart=', 1)[1].splitlines()[0])
+    expected[6] = 'resume'
+    assert command == expected
+    verification = text[enable:cleanup]
+    assert 'measure_pace status --format json' in verification
+    assert all(field in verification for field in ('status=running', 'heartbeat', 'stale=false'))
+    assert 'sudo systemctl daemon-reload' in text[cleanup:]
+
+    store = PaceStore(tmp_path / 'pace.sqlite3')
+    store.save({'status': 'stopped', 'accepted_step': 1})
+    assert main(['stop', '--state-dir', str(tmp_path)]) == 0
+    stop_file = tmp_path / 'measurement.off'
+    assert stop_file.exists()
+    calls = []
+    monkeypatch.setattr(trino_manager, 'EspnTrinoTableManager', lambda: Trino())
+    monkeypatch.setattr('scrapers.espn.measure_pace.accepted_ids', lambda _: list(range(380)))
+    monkeypatch.setattr('scrapers.espn.measure_pace.digest', lambda _: command[-1])
+    monkeypatch.setattr(Controller, 'run_locked', lambda self: calls.append(stop_file.exists()))
+    assert main(command[6:] + ['--state-dir', str(tmp_path)]) == 0
+    assert calls == [False]
+    assert store.get()['accepted_step'] == 1
+
+
 def test_full_s3_opt_in_progression_expires_to_previously_accepted_s2(controller):
     c = controller
     c.max_step = 3
