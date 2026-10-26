@@ -1180,7 +1180,15 @@ MIGRATIONS = (
         name="page_scope_summary",
         statements=SCOPE_SUMMARY_V13_STATEMENTS,
     ),
-
+    Migration(
+        version=14,
+        name="observation_processing_work",
+        statements=(
+            """ALTER TABLE fbref_control.observation_processing
+               ADD COLUMN processing_work_ms bigint
+               CHECK (processing_work_ms >= 0)""",
+        ),
+    ),
 )
 
 

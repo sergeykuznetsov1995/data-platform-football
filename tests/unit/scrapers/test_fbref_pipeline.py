@@ -1821,6 +1821,11 @@ def _pipeline_with_saved_matches(tmp_path, match_ids=("0701e218", "a071faa8")):
         fetcher_factory=forbidden_transport,
     )
     pipeline.batch_persist_enabled = True
+    # These fixtures isolate cohort persistence/fencing; sampling is covered
+    # by the parse-wave regression in test_fbref_history_controller.py.
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, records, generic, typed
 
 
@@ -2142,7 +2147,9 @@ class DurableReplayPipeline(FBrefPipeline):
         )
 
 
-def _pipeline_with_small_durable_matches(path):
+def _pipeline_with_small_durable_matches(
+    path, match_ids=("d000000a", "d000000b")
+):
     raw = _raw_store(path)
     control = FakeControl(raw)
     control.registry["9"] = {
@@ -2160,7 +2167,7 @@ def _pipeline_with_small_durable_matches(path):
       <tbody><tr><td data-stat="label">durable</td></tr></tbody>
     </table></body></html>
     """
-    for position, match_id in enumerate(("d000000a", "d000000b")):
+    for position, match_id in enumerate(match_ids):
         target = PageTarget(
             source="fbref",
             page_kind="match",
@@ -2200,6 +2207,9 @@ def _pipeline_with_small_durable_matches(path):
     )
 
     pipeline.batch_persist_enabled = True
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, records
 
 
@@ -4954,6 +4964,9 @@ def _pipeline_with_saved_generic_pages(tmp_path, competition_ids, broken=()):
         fetcher_factory=forbidden_transport,
     )
     pipeline.batch_persist_enabled = True
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, generic
 
 
@@ -15149,3 +15162,87 @@ def test_1325_live_cycle_continues_after_enrichment_handback(tmp_path):
     assert len(calls) == 3
     assert result.fetch.fetched == 1
     assert result.frontier_closed
+
+
+@pytest.mark.parametrize("kind", ["generic", "match"])
+@pytest.mark.parametrize("mode", ["sequential", "single", "shared"])
+@pytest.mark.parametrize("failed_write", [False, True])
+def test_processing_work_excludes_shared_writes_and_measures_individual_pages(
+    tmp_path, kind, mode, failed_write
+):
+    if kind == 'match':
+        pipeline, control, _ = _pipeline_with_small_durable_matches(tmp_path)
+        page_kinds = ['match']
+    else:
+        pipeline, control, _ = _pipeline_with_saved_generic_pages(tmp_path, ['9', '12'])
+        page_kinds = ['competition']
+    batch = mode != "sequential"
+    pipeline.batch_persist_enabled = batch
+    if mode == "single":
+        pipeline.batch_persist_matches = 1
+    now = [0.0]
+    pipeline.stage_clock = lambda: now[0]
+
+    def timed(target, name, seconds):
+        original = getattr(target, name)
+
+        def call(*args, **kwargs):
+            now[0] += seconds
+            return original(*args, **kwargs)
+
+        setattr(target, name, call)
+
+    timed(pipeline.raw_store, 'load_fetch_html', 2)
+    timed(pipeline, '_parse_generic', 3)
+    timed(pipeline, '_apply_stateful_effects', 13)
+    timed(pipeline, '_record_page_completion', 17)
+    timed(pipeline, '_record_generic_table_results', 1)
+    timed(pipeline, '_match_item_cells' if kind == 'match' else '_generic_item_cells', 4)
+    # Batch doubles spend time on every page. Shared work cannot provide an
+    # individual measurement, including when a failed batch is retried alone.
+    timed(pipeline.generic_writer, 'persist_page', 7)
+    if kind == 'match':
+        timed(pipeline, '_parse_typed_match', 5)
+        timed(pipeline.typed_adapter.writer, 'persist_match', 11)
+    if failed_write and batch:
+        original_write = pipeline.generic_writer.persist_pages
+
+        def fail_after_shared_write(items):
+            original_write(items)
+            now[0] += 23
+            raise RuntimeError("shared write interrupted")
+
+        pipeline.generic_writer.persist_pages = fail_after_shared_write
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=page_kinds, settings=_settings()
+    )
+    assert result.parsed == 2
+    measurements = [row['processing_work_ms'] for row in control.observations.values()]
+    if mode == "shared":
+        assert measurements == [None, None]
+        return
+    expected = 2 + 3 + 1 + 13 + 17 + 7
+    if batch:
+        expected += 4
+    if failed_write and batch:
+        expected += 23 + 7
+    if kind == 'match':
+        expected += 5 + 11
+    assert measurements == [expected * 1000] * 2
+
+
+def test_incomplete_preparation_does_not_publish_processing_measurement(tmp_path):
+    pipeline, control, _ = _pipeline_with_small_durable_matches(tmp_path)
+    original = pipeline._parse_typed_match
+    calls = [0]
+
+    def fail_preparation_once(*args):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ValueError('preparation interrupted')
+        return original(*args)
+
+    pipeline._parse_typed_match = fail_preparation_once
+    result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=['match'], settings=_settings())
+    assert result.parsed == 2
+    assert next(iter(control.observations.values()))['processing_work_ms'] is None

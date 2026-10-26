@@ -87,7 +87,7 @@ def scope_db():
                          carried_competition_id,carried_season_id,parent_content_hash,parser_version)
                         VALUES (%s,'h-index',%s,'link',%s,'2026','hash','fixture')""",
                         (str(uuid.uuid4()), child, cid))
-                for statement in MIGRATIONS[-1].statements:
+                for statement in next(m for m in MIGRATIONS if m.version == 13).statements:
                     cursor.execute(statement)
         store = ControlStore(dsn)
         yield connection, store, RealDictCursor
