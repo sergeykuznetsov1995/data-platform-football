@@ -750,6 +750,9 @@ def run_scope(
         # completion (including the physical fence), not DQ completion.
         proposed_attempt = replace(proposed_attempt, completed_at=utc_now_iso())
         repository.append_attempt(proposed_attempt)
+        confirm_cache = getattr(active_scraper, "confirm_cache", None)
+        if report.status is ManifestStatus.COMPLETE and callable(confirm_cache):
+            confirm_cache()
         if callable(note_quality):
             note_quality(args.league, args.source_season_id, report)
         if args.mode == "backfill" and report.status is not ManifestStatus.COMPLETE:

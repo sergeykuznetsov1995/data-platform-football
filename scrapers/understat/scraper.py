@@ -146,6 +146,9 @@ class UnderstatScraper(BaseScraper):
 
         return self.source.league_snapshot(league, season_slug, source_season_id)
 
+    def confirm_cache(self) -> None:
+        self.source.confirm_cache()
+
     def note_quality(self, league: str, source_season_id: int, report: Any, *,
                      publication_ready: bool = True) -> None:
         """Keep pending/failed scopes daily until the existing DQ gates heal."""

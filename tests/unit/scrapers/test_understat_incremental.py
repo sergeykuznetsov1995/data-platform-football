@@ -60,7 +60,10 @@ def source(tmp_path, session=None, today=TODAY):
 
 
 def run(src, **kwargs):
-    return src.scrape_scope(LEAGUE, "2526", 2025, **kwargs)
+    frames = src.scrape_scope(LEAGUE, "2526", 2025, **kwargs)
+    # Extraction-only tests simulate the runner's successful publication hook.
+    src.confirm_cache()
+    return frames
 
 
 def test_warm_current_uses_only_fresh_league_and_returns_full_seven_tables(tmp_path):
@@ -492,7 +495,9 @@ def test_recorded_rfpl_schedule_writes_same_full_batch_after_warm_cache(tmp_path
 
     src, session = source(tmp_path, Replay(), date(2026, 10, 26))
     def scrape(**kwargs):
-        return src.scrape_scope("RUS-Premier League", "2627", 2026, **kwargs)
+        frames = src.scrape_scope("RUS-Premier League", "2627", 2026, **kwargs)
+        src.confirm_cache()
+        return frames
     scrape()
     session.calls.clear()
     cached = scrape()
@@ -544,3 +549,103 @@ def test_placeholder_before_played_teams_is_ignored(tmp_path, placeholder):
     assert session.calls == ["/getLeagueData/EPL/2025"]
     for table in first:
         pd.testing.assert_frame_equal(first[table], second[table])
+
+
+@pytest.mark.parametrize("failure", ["players", "match", "write", "physical", "terminal"])
+def test_failed_scope_retries_only_unconfirmed_responses(tmp_path, monkeypatch, failure):
+    from dags.scripts import run_understat_scraper as runner
+    from scrapers.understat.manifest import ManifestStatus
+    from scrapers.understat.scraper import UnderstatScraper
+    from tests.unit.scrapers.test_run_understat_scraper import (
+        _Repository, _args, _freeze_runner_time, _scraper_factory,
+    )
+
+    class ValidSession(Session):
+        broken = False
+
+        def __init__(self):
+            super().__init__()
+            for player_id in (8, 9):
+                self.league["players"].extend(_team_payload(player_id)["players"])
+
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if "/getTeamData/" in url:
+                home = "/Home/" in url
+                response._payload = _team_payload(7 if home else 9)
+                if home and not (self.broken and failure == "players"):
+                    response._payload["players"].extend(_team_payload(8)["players"])
+            if self.broken and failure == "match" and "/getMatchData/" in url:
+                response._payload["shots"]["h"][0]["xG"] = "2"
+            return response
+
+    _freeze_runner_time(monkeypatch, datetime(2025, 8, 10, tzinfo=timezone.utc))
+    session = ValidSession()
+    src, _ = source(tmp_path, session)
+    wrapper = UnderstatScraper.__new__(UnderstatScraper)
+    wrapper.source = src
+    factory, scraper = _scraper_factory({})
+    scraper.scrape_scope.side_effect = wrapper.scrape_scope
+    scraper.confirm_cache.side_effect = getattr(wrapper, "confirm_cache", lambda: None)
+    scraper.note_quality.side_effect = wrapper.note_quality
+    repository = _Repository()
+    args = _args()
+    assert runner.run_scope(args, scraper_factory=factory, repository=repository)[1] == 0
+
+    # Make only one previously confirmed response require an HTTP refresh.
+    target = "match_100.json" if failure == "match" else "team_Home_2025.json"
+    path = tmp_path / "validated" / target
+    record = json.loads(path.read_text())
+    record["fingerprint"] = "stale"
+    atomic_json(path, record)
+    session.broken = True
+    repository.physical = failure != "physical"
+    append = repository.append_attempt
+
+    def append_attempt(attempt):
+        if session.broken and failure == "terminal" and attempt.status is ManifestStatus.COMPLETE:
+            raise ValueError("offline terminal manifest failure")
+        return append(attempt)
+
+    repository.append_attempt = append_attempt
+    if failure == "write":
+        scraper.save_to_iceberg.side_effect = ValueError("offline write failure")
+    for _ in range(2):
+        session.calls.clear()
+        payload, code = runner.run_scope(args, scraper_factory=factory, repository=repository)
+        assert code == 2, payload
+        if failure in {"players", "match"}:
+            assert repository.failures[-1].status is ManifestStatus.DQ_FAILURE
+            codes = {issue["code"] for issue in payload["scope_attempt"]["quality"]["issues"]}
+            assert ("player_team_reference_gap" if failure == "players" else "invalid_xg") in codes
+        assert f"/get{'MatchData/100' if failure == 'match' else 'TeamData/Home/2025'}" in session.calls
+        if failure != "match":
+            assert session.calls == ["/getLeagueData/EPL/2025", "/getTeamData/Home/2025"]
+    assert not path.exists()
+
+    session.broken = False
+    repository.physical = True
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: kwargs["table_name"]
+    session.calls.clear()
+    payload, code = runner.run_scope(args, scraper_factory=factory, repository=repository)
+    assert code == 0, payload
+    assert payload["status"] == "complete"
+    assert (tmp_path / "validated" / target).exists()
+    session.calls.clear()
+    assert runner.run_scope(args, scraper_factory=factory, repository=repository)[1] == 0
+    assert session.calls == ["/getLeagueData/EPL/2025"]
+
+
+def test_previous_cache_version_requires_publication_confirmation(tmp_path):
+    src, session = source(tmp_path)
+    run(src)
+    path = tmp_path / "validated" / "team_Home_2025.json"
+    record = json.loads(path.read_text())
+    record["version"] = 1
+    atomic_json(path, record)
+    session.calls.clear()
+    src.scrape_scope(LEAGUE, "2526", 2025)
+    assert session.calls == ["/getLeagueData/EPL/2025", "/getTeamData/Home/2025"]
+    assert not path.exists()
+    src.confirm_cache()
+    assert json.loads(path.read_text())["version"] == 2

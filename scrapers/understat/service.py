@@ -92,6 +92,11 @@ class UnderstatSource:
         self.catalog = UnderstatCatalog(client, today=self.today)
         # #1431: fingerprints of the last parsed league response.
         self.last_league_hashes: dict[str, str] = {}
+        self.cache = CacheState(getattr(client, "cache_dir", None))
+
+    def confirm_cache(self) -> None:
+        """Called by the runner after DQ, physical fence and terminal manifest."""
+        self.cache.confirm()
 
     @contextmanager
     def _keep_on_drift(self, payload: Any, cache_name: str) -> Iterator[None]:
@@ -188,6 +193,8 @@ class UnderstatSource:
     ) -> dict[str, pd.DataFrame]:
         if mode not in {"current", "history", "reparse"}:
             raise ValueError("mode must be current, history, or reparse")
+        # A previous failed/abandoned attempt must never certify a later one.
+        self.cache = CacheState(getattr(self.client, "cache_dir", None))
         definition, scope = self._scope(league, season_slug, source_season_id)
         refresh_scope = force_refresh or mode in {"current", "reparse"}
         try:
@@ -228,7 +235,7 @@ class UnderstatSource:
         result_mask = schedule["is_result"].fillna(False).astype(bool)
         schedule.loc[result_mask, "has_data"] = False
         played_rows: list[dict[str, Any]] = []
-        cache = CacheState(getattr(self.client, "cache_dir", None))
+        cache = self.cache
         incremental = mode == "current" and not force_refresh
         raw_matches = {int(item["id"]): item for item in league_payload["dates"]}
         records = schedule[result_mask].to_dict(orient="records")
@@ -257,6 +264,7 @@ class UnderstatSource:
                 if incremental and not refresh:
                     match_payload = cached[game_id]["payload"]
                 else:
+                    cache.invalidate(name)
                     match_payload = self.client.get_match_data(game_id, force_refresh=refresh)
             except UnderstatHTTPError as exc:
                 if exc.status_code == 404:
@@ -276,10 +284,10 @@ class UnderstatSource:
             schedule.loc[
                 schedule["game_id"] == row["game_id"], "has_data"
             ] = _match_payload_has_rows(match_payload)
-            if incremental and refresh and _match_payload_is_complete(match_payload):
+            if (refresh or not incremental) and _match_payload_is_complete(match_payload):
                 cache.save(name, [league, source_season_id, game_id],
                            fingerprints[game_id], match_payload, self.today,
-                           match_date=row["date"].date().isoformat())
+                           match_date=row["date"].date().isoformat(), staged=True)
             for team_id in (int(row["home_team_id"]), int(row["away_team_id"])):
                 team_matches.setdefault(team_id, []).append(
                     [game_id, fingerprints[game_id], digest(match_payload)]
@@ -313,6 +321,8 @@ class UnderstatSource:
                 refresh = (refresh_scope if not incremental else
                            entry is None or entry.get("fingerprint") != fingerprint
                            or not _team_payload_is_complete(entry["payload"]))
+                if refresh or not incremental:
+                    cache.invalidate(name)
                 team_payload = self.client.get_team_data(
                     team_name, source_season_id, force_refresh=refresh,
                 ) if refresh or not incremental else entry["payload"]
@@ -328,8 +338,9 @@ class UnderstatSource:
                         team_id=team_id,
                         team_name=team_name,
                     )
-                if incremental and refresh and _team_payload_is_complete(team_payload):
-                    cache.save(name, identity, fingerprint, team_payload, self.today)
+                if (refresh or not incremental) and _team_payload_is_complete(team_payload):
+                    cache.save(name, identity, fingerprint, team_payload, self.today,
+                               staged=True)
                 player_team_frames.append(player_team)
                 breakdown_frames.append(breakdowns)
 

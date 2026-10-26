@@ -14,7 +14,7 @@ import uuid
 
 
 logger = logging.getLogger(__name__)
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 DAILY_LIMIT = 500
 ROTATION_LIMIT = 72
 # Leave room for later leagues, weekly probes and retries. Mandatory work is
@@ -48,6 +48,19 @@ def atomic_json(path: Path, value: Any) -> None:
 class CacheState:
     def __init__(self, cache_dir: Path | str | None):
         self.root = Path(cache_dir) if cache_dir is not None else None
+        self.pending: dict[str, dict[str, Any]] = {}
+
+    def invalidate(self, name: str) -> None:
+        # Do this before HTTP, including refreshes returning identical payloads.
+        if self.root is not None:
+            (self.root / "validated" / name).unlink(missing_ok=True)
+
+    def confirm(self) -> None:
+        """Persist staged envelopes only after the scope has been published."""
+        if self.root is not None:
+            for name, record in self.pending.items():
+                atomic_json(self.root / "validated" / name, record)
+        self.pending.clear()
 
     def load(self, name: str, identity: list[Any]) -> dict[str, Any] | None:
         if self.root is None:
@@ -62,16 +75,21 @@ class CacheState:
         return {**record, "payload": payload}
 
     def save(self, name: str, identity: list[Any], fingerprint: str,
-             payload: dict[str, Any], today: date, *, match_date: str | None = None) -> None:
+             payload: dict[str, Any], today: date, *, match_date: str | None = None,
+             staged: bool = False) -> None:
         if self.root is None:
             return
         # The response hash binds this state to the exact validated payload.
         # A crash or concurrent replacement can only cause a cache miss.
-        atomic_json(self.root / "validated" / name, {
+        record = {
             "version": CACHE_VERSION, "identity": identity,
             "fingerprint": fingerprint, "payload_hash": digest(payload),
             "checked_on": today.isoformat(), "match_date": match_date,
-        })
+        }
+        if staged:
+            self.pending[name] = record
+        else:
+            atomic_json(self.root / "validated" / name, record)
 
     @contextmanager
     def ledger(self, today: date) -> Iterator[dict[str, Any]]:
