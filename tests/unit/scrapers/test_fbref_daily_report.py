@@ -298,9 +298,54 @@ def test_1325_reader_keeps_aliases_and_provenance_in_page_age_slice():
     result = collect_snapshot(pg, lambda _: [], day=DAY, as_of=AS_OF, mapping=MAP)
     assert result["page_ages"] == []
     sql = next(q for q in queries if "current_ownership" in q)
-    assert "season_alias" in sql and "frontier_provenance" in sql
-    assert "jsonb_agg(DISTINCT" in sql and "f.last_fetched_at" in sql
+    assert "page_scope_summary" in sql and "frontier_provenance" not in sql
+    assert "scope.scopes" in sql and "f.last_fetched_at" in sql
     assert "refresh_policy = 'weekly'" not in PAGE_AGES_SQL
+
+
+def test_1805_page_age_query_reads_stored_scopes_without_provenance():
+    from scrapers.fbref.daily_report_reader import PAGE_AGES_SQL
+    sql = " ".join(PAGE_AGES_SQL.split())
+    assert "fbref_control.page_scope_summary scope USING (target_id)" in sql
+    assert "frontier_provenance" not in sql
+    assert "canonical_scope" not in sql
+    assert "season_alias" not in sql
+    assert "scope.is_complete AND NOT scope.pending" in sql
+    assert "scope_summary_incomplete" in sql
+    for flag in ("has_current_ownership", "competition_missing", "has_female",
+                 "has_unknown", "inactive_competition", "invalid_season"):
+        assert "scope." + flag in sql
+    assert "m.content_hash=f.last_content_hash" in sql
+    assert "m.completed_at <= '{cutoff}'::timestamptz" in sql
+    assert "f.created_at <= '{cutoff}'::timestamptz" in sql
+
+
+def test_1805_incomplete_summary_is_a_distinct_error_not_an_orphan():
+    def pg(sql):
+        if "AS current_ownership" in sql:
+            return {"error": "scope_summary_incomplete"}
+        return {}
+    result = collect_snapshot(pg, lambda _: [], day=DAY, as_of=AS_OF, mapping=MAP)
+    assert result["page_ages"] == []
+    assert result["page_age_errors"] == [{"source": "fbref_page_ages", "reason": "scope_summary_incomplete"}]
+
+
+def test_1805_standings_accepts_unclassified_inventory_and_keeps_cutoff():
+    data = snapshot()
+    def trino(sql):
+        if "fbref_table_inventory" in sql:
+            assert "availability" not in sql
+            assert "page_kind='season'" in sql and "^results.*_overall$" in sql
+            assert "persisted_at <=" in sql and AS_OF.isoformat() in sql
+            return [{"target_id": "season", "content_hash": "current"}]
+        return []
+    def pg(sql):
+        if "jsonb_build_object(\n 'competitions'" in sql:
+            return {k: data[k] for k in ("competitions", "seasons")}
+        return []
+    result = collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=MAP)
+    assert result["standings_inventory"] == [{"target_id": "season", "content_hash": "current"}]
+    assert result["page_age_errors"] == []
 
 
 def test_1325_standings_proof_uses_processed_season_current_content():
