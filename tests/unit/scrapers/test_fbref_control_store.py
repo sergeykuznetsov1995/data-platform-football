@@ -48,7 +48,15 @@ class FakeCursor:
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split())
         self.executions.append((normalized, params))
-        self.rows, self.rowcount = self.handler(normalized, params)
+        if normalized.startswith((
+            "SELECT pg_advisory_xact_lock_shared(%s)",
+            "SELECT target_id FROM fbref_control.page_scope_summary ",
+            "SELECT fbref_control.refresh_page_scope_summary(",
+            "SELECT target_id FROM fbref_control.page_frontier WHERE target_id = ANY(",
+        )):
+            self.rows, self.rowcount = [], 0
+        else:
+            self.rows, self.rowcount = self.handler(normalized, params)
 
     def fetchone(self):
         return self.rows.pop(0) if self.rows else None

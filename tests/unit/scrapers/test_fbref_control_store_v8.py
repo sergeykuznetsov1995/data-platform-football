@@ -30,7 +30,15 @@ class FakeCursor:
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split())
         self.executions.append((normalized, params))
-        self.rows, self.rowcount = self.handler(normalized, params)
+        if normalized.startswith((
+            "SELECT pg_advisory_xact_lock_shared(%s)",
+            "SELECT target_id FROM fbref_control.page_scope_summary ",
+            "SELECT fbref_control.refresh_page_scope_summary(",
+            "SELECT target_id FROM fbref_control.page_frontier WHERE target_id = ANY(",
+        )):
+            self.rows, self.rowcount = [], 0
+        else:
+            self.rows, self.rowcount = self.handler(normalized, params)
 
     def fetchone(self):
         return self.rows.pop(0) if self.rows else None
@@ -98,7 +106,7 @@ def competition_entry(index, *, gender="male", crawl_state=None, metadata=None):
 
 def test_v8_is_append_only_schema_for_provenance_aliases_and_cancellation():
     assert tuple(migration.version for migration in MIGRATIONS) == tuple(
-        range(1, 13)
+        range(1, 14)
     )
     migration = next(item for item in MIGRATIONS if item.version == 8)
     assert migration.version == 8
@@ -670,7 +678,12 @@ def test_frontier_discovery_batch_reuses_one_transaction_and_is_idempotent():
     assert len(installed_edges) == 50
     for connection in factory.connections:
         executions = connection.fake_cursor.executions
-        assert len(executions) == 200
+        assert len(executions) == 204
+        assert "FOR NO KEY UPDATE" in executions[0][0]
+        assert "OR canonical_url = ANY" in executions[0][0]
+        assert executions[0][1][1] == [target.canonical_url for target in sorted(targets, key=lambda t: t.target_id)]
+        assert sum("SELECT fbref_control.refresh_page_scope_summary" in sql
+                   for sql, _ in executions) == 1
         target_ids = [
             params[0]
             for sql, params in executions
