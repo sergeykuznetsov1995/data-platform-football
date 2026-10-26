@@ -5,30 +5,12 @@
 явно — одной строкой в контрольной БД.
 """
 
-import sys
 import time
 from datetime import datetime, timedelta, timezone
-from types import ModuleType
+
+import psycopg2
 
 import pytest
-
-try:
-    import psycopg2
-except ModuleNotFoundError:  # в CI-образе нет драйвера PG — нужны только классы ошибок
-    psycopg2 = ModuleType("psycopg2")
-    psycopg2.OperationalError = type("OperationalError", (Exception,), {})
-    psycopg2.InterfaceError = type("InterfaceError", (Exception,), {})
-
-    def _no_driver(*_args, **_kwargs):
-        raise psycopg2.OperationalError("psycopg2 is not installed")
-
-    psycopg2.connect = _no_driver
-
-
-@pytest.fixture(autouse=True)
-def _psycopg2_module(monkeypatch):
-    # Код лимитера импортирует psycopg2 лениво — подставляем тот же модуль.
-    monkeypatch.setitem(sys.modules, "psycopg2", psycopg2)
 
 from scrapers.fotmob.shared_rate_limiter import (
     SHARED_RATE_LIMIT_TABLE,
