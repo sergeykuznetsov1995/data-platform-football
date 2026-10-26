@@ -1464,3 +1464,15 @@ class TestBronzeOnlyPublication:
             "writer_task_ids": ["scrape_fotmob_data"],
         }
         assert mod.finalize_publication._init_kwargs["trigger_rule"] == "all_done"
+
+
+def test_ban_reason_and_deadline_reach_airflow_failure(tmp_path):
+    import json
+    from airflow.exceptions import AirflowException
+    mod = _reload_dag_module()
+    payload = _daily_report(mod)
+    payload.update(stop_reason="ban", blocked_until="2026-10-26T12:15:00+00:00")
+    report = tmp_path / "ban.json"
+    report.write_text(json.dumps(payload))
+    with pytest.raises(AirflowException, match="ban: blocked_until=2026-10-26T12:15:00"):
+        mod.validate_data(str(report))

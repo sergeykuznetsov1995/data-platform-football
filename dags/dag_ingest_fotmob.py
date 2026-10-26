@@ -827,6 +827,8 @@ def validate_data(
         missing_budget = sorted(required_budget - budget.keys())
         if missing_transport:
             violations.append(f"missing transport metrics={missing_transport!r}")
+        if result.get("stop_reason") == "ban":
+            violations.append(f"ban: blocked_until={result.get('blocked_until')}")
         if missing_budget:
             violations.append(f"missing budget metrics={missing_budget!r}")
         if automatic_catalog:
@@ -1013,6 +1015,8 @@ def validate_data(
         )
         summary = {
             "status": result.get("status"),
+            "stop_reason": result.get("stop_reason"),
+            "blocked_until": result.get("blocked_until"),
             "run_id": result.get("run_id"),
             "mode": mode,
             "rows": result.get("rows") or {},
