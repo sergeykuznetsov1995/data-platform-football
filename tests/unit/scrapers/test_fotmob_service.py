@@ -3599,3 +3599,33 @@ def test_1792_competition_seasons_manifest_preserves_304_validation(stale):
     assert commit.fetched_at == datetime(2026, 10, 1)
     assert commit.capabilities.get("source_observed_at") == (
         None if stale else "2026-10-21T04:00:00+00:00")
+
+
+def test_1290_queue_cannot_spend_more_than_eight_request_budget():
+    from tests.unit.scrapers.test_fotmob_transport import _transport, FakeResponse
+    transport, session = _transport([FakeResponse(503)] * 8, max_attempts=4)
+    service = FotMobIngestService(
+        transport=transport, repository=MemoryFotMobRepository(),
+        mode=RunMode.DAILY, run_id="budget-regression", max_workers=2,
+        budget=TransportBudget(max_requests=8, max_direct_bytes=10000))
+    results = service._fetch_many([(str(i), "leagues", {"id": i}) for i in range(10)])
+    assert len(results) == 10
+    assert len(session.calls) == service.ledger.requests == 8
+    assert sum(isinstance(value, Exception) for value in results.values()) == 8
+
+
+def test_1290_ban_cancels_pending_queue_and_preserves_report_reason():
+    from tests.unit.scrapers.test_fotmob_transport import _transport, FakeResponse
+    from dags.scripts.run_fotmob_scraper import _native_output_payload
+    transport, session = _transport([FakeResponse(200, b'{}')] + [FakeResponse(403)] * 20)
+    service = FotMobIngestService(
+        transport=transport, repository=MemoryFotMobRepository(),
+        mode=RunMode.DAILY, run_id="ban-regression", max_workers=1,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10000))
+    results = service._fetch_many([(str(i), "leagues", {"id": i}) for i in range(20)])
+    assert results["0"].ok
+    assert len(session.calls) == 4
+    payload = _native_output_payload(service.report([OperationResult("wave", succeeded=1)], datetime.now(timezone.utc)))
+    assert payload["stop_reason"] == "ban"
+    assert payload["blocked_until"]
+    assert payload["complete"] is False and payload["status"] == "incomplete"

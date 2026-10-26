@@ -979,6 +979,148 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert '"rating" = s."rating"' in set_clause
             assert 't."' not in set_clause
 
+    @pytest.mark.parametrize("path", ["staged", "single", "fallback", "unscoped"])
+    def test_merge_partition_scope_preserves_partial_schedule(self, path):
+        """Exact target tuples, escaped literals and idempotent partial upserts."""
+        import duckdb
+        from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+        manager = TrinoTableManager()
+        frame = pd.DataFrame([
+            {"league": "O'Brien", "season": "2526", "game_id": 1, "score": 3},
+            {"league": "B", "season": "2627", "game_id": 2, "score": 4},
+            {"league": "O'Brien", "season": "2526", "game_id": 3, "score": 5},
+        ])
+        if path in {"single", "fallback"}:
+            frame = frame.iloc[:1]
+        keys = ["league", "season", "game_id"]
+        types = {"league": "varchar", "season": "varchar",
+                 "game_id": "bigint", "score": "bigint"}
+        merges = []
+
+        def execute(sql, fetch=False):
+            if sql.startswith("MERGE INTO"):
+                merges.append(sql)
+                if path == "fallback" and len(merges) == 1:
+                    raise TrinoError("TYPE_MISMATCH: exercise staged fallback")
+            if fetch:
+                return [[len(frame)]]
+
+        with patch.object(manager, '_execute', side_effect=execute), \
+             patch.object(manager, 'insert_dataframe', return_value=len(frame)), \
+             patch.object(manager, 'drop_table'):
+            assert manager.insert_dataframe_atomic(
+                'bronze', 'target', frame, merge_keys=keys,
+                merge_partition_cols=None if path == "unscoped" else keys[:2],
+                target_column_types=types,
+            ) == len(frame)
+
+        expected_scope = '(t."league" = \'O\'\'Brien\' AND t."season" = \'2526\')'
+        if path == "staged":
+            expected_scope += ' OR (t."league" = \'B\' AND t."season" = \'2627\')'
+        key_join = ' AND '.join(f't."{key}" = s."{key}"' for key in keys)
+        expected_on = key_join
+        if path != "unscoped":
+            expected_on += f" AND ({expected_scope})"
+        assert len(merges) == (2 if path == "fallback" else 1)
+        for sql in merges:
+            assert sql.split(" ON ")[1].split(" WHEN MATCHED")[0] == expected_on
+            assert "DELETE" not in sql
+        assert ('USING (SELECT' in merges[0]) == (path in {"single", "fallback"})
+        if path == "fallback":
+            assert "__stg_" in merges[-1]
+
+        # Execute the emitted MERGE locally; this verifies row semantics, not
+        # Iceberg pruning or Trino coordinator memory usage.
+        with duckdb.connect(":memory:") as connection:
+            connection.execute(
+                "CREATE TABLE target (league VARCHAR, season VARCHAR, "
+                "game_id BIGINT, score BIGINT)"
+            )
+            original = [("O'Brien", "2526", 1, 0),
+                        ("O'Brien", "2526", 9, 9),  # untouched, inside scope
+                        ("O'Brien", "2627", 1, 8),  # crossed tuple
+                        ("B", "2526", 2, 7),       # crossed tuple
+                        ("C", "2425", 1, 6)]       # outside scope
+            connection.executemany("INSERT INTO target VALUES (?, ?, ?, ?)", original)
+            connection.register("incoming", frame)
+            sql = merges[-1].replace("iceberg.bronze.target", "target", 1)
+            if "__stg_" in sql:
+                source = sql.split(" USING ", 1)[1].split(" s ON ", 1)[0]
+                sql = sql.replace(source, "incoming", 1)
+            for _ in range(2):
+                connection.execute(sql)
+                actual = connection.execute("SELECT * FROM target").fetchall()
+                expected = {row[:3]: row[3] for row in original}
+                expected.update({tuple(row[:3]): row[3]
+                                 for row in frame.itertuples(index=False, name=None)})
+                assert len(actual) == len(expected)
+                assert {row[:3]: row[3] for row in actual} == expected
+
+    @pytest.mark.parametrize("provided_types", [True, False])
+    @pytest.mark.parametrize("staged", [True, False])
+    def test_merge_partition_scope_uses_target_numeric_type(self, provided_types, staged):
+        """REAL scope must round exactly like REAL source, avoiding duplicates."""
+        import duckdb
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        frame = pd.DataFrame({'partition_key': [1.1], 'game_id': [1], 'score': [3]})
+        types = {'partition_key': 'real', 'game_id': 'bigint', 'score': 'bigint'}
+        with patch.object(manager, '_execute', side_effect=self._exec_ok(1)) as execute, \
+             patch.object(manager, 'get_table_columns', return_value=types) as describe, \
+             patch.object(manager, 'insert_dataframe', return_value=1) as insert, \
+             patch.object(manager, 'drop_table'):
+            manager.insert_dataframe_atomic(
+                'bronze', 'target', frame, merge_keys=['partition_key', 'game_id'],
+                merge_partition_cols=['partition_key'],
+                staging_id='typed_scope' if staged else None,
+                target_column_types=types if provided_types else None,
+            )
+        assert describe.call_count == (0 if provided_types else 1)
+        sql = next(call.args[0] for call in execute.call_args_list
+                   if call.args[0].startswith('MERGE INTO'))
+        assert 't."partition_key" = CAST(1.1 AS REAL)' in sql
+        if staged:
+            assert insert.call_args.kwargs['column_types'] == types
+        with duckdb.connect(":memory:") as connection:
+            connection.execute(
+                'CREATE TABLE target (partition_key REAL, game_id BIGINT, score BIGINT)'
+            )
+            connection.execute('INSERT INTO target VALUES (1.1, 1, 0)')
+            connection.execute('CREATE TABLE incoming AS SELECT * FROM target')
+            connection.execute('UPDATE incoming SET score = 3')
+            sql = sql.replace('iceberg.bronze.target', 'target', 1)
+            if staged:
+                source = sql.split(' USING ', 1)[1].split(' s ON ', 1)[0]
+                sql = sql.replace(source, 'incoming', 1)
+            for _ in range(2):
+                connection.execute(sql)
+                assert connection.execute('SELECT game_id, score FROM target').fetchall() == [(1, 3)]
+
+    @pytest.mark.parametrize("frame,keys,partitions,message", [
+        ({"league": ["A"]}, [], ["league"], "must be in merge_keys"),
+        ({"league": ["A"], "score": [1]}, ["league"], ["score"],
+         "must be in merge_keys"),
+        ({"game_id": [1]}, ["league", "game_id"], ["league"], "absent"),
+        ({"league": ["A", None]}, ["league"], ["league"], "null"),
+        ({"league": ["A", "A"]}, ["league"], ["league"], "duplicate"),
+        ({"bad-name": ["A"]}, ["bad-name"], ["bad-name"], "[Ii]nvalid"),
+    ])
+    def test_merge_partition_scope_rejects_unsafe_keys(
+        self, frame, keys, partitions, message,
+    ):
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        with patch.object(manager, '_execute') as execute:
+            with pytest.raises(ValueError, match=message):
+                manager.insert_dataframe_atomic(
+                    'bronze', 'target', pd.DataFrame(frame), merge_keys=keys,
+                    merge_partition_cols=partitions,
+                )
+        execute.assert_not_called()
+
     # ------------------------------------------------------------------
     # Single-row MERGE fast path (#951): one statement, no staging table.
     # ------------------------------------------------------------------

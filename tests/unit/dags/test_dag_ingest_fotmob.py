@@ -1464,3 +1464,51 @@ class TestBronzeOnlyPublication:
             "writer_task_ids": ["scrape_fotmob_data"],
         }
         assert mod.finalize_publication._init_kwargs["trigger_rule"] == "all_done"
+
+
+def test_ban_reason_and_deadline_reach_airflow_failure(tmp_path):
+    import json
+    from airflow.exceptions import AirflowException
+    mod = _reload_dag_module()
+    payload = _daily_report(mod)
+    payload.update(stop_reason="ban", blocked_until="2026-10-26T12:15:00+00:00")
+    report = tmp_path / "ban.json"
+    report.write_text(json.dumps(payload))
+    with pytest.raises(AirflowException, match="ban: blocked_until=2026-10-26T12:15:00"):
+        mod.validate_data(str(report))
+
+
+@pytest.mark.parametrize("reason", ["ban", None])
+def test_failed_scraper_runs_validation_and_blocks_publication(tmp_path, reason):
+    import json
+    from types import SimpleNamespace
+    from airflow.exceptions import AirflowException
+
+    mod = _reload_dag_module()
+    payload = _daily_report(mod)
+    if reason == "ban":
+        payload.update(
+            status="failed", complete=False, stop_reason="ban",
+            blocked_until="2026-10-26T12:15:00+00:00",
+        )
+    report = tmp_path / "result.json"
+    report.write_text(json.dumps(payload))
+    states = {"scrape_fotmob_data": "failed"}  # BashOperator after runner rc=1.
+    dag_run = SimpleNamespace(
+        get_task_instance=lambda task_id: SimpleNamespace(state=states[task_id])
+    )
+    validation = mod.validate_data_task
+    assert validation.upstream_task_ids == {"scrape_fotmob_data"}
+    # Evaluate the real task configuration, including upstream failure.
+    rule = validation._init_kwargs.get("trigger_rule", "all_success")
+    runnable = rule == "all_done" or all(
+        states[task_id] == "success" for task_id in validation.upstream_task_ids
+    )
+    assert runnable, "failed scraper must still expose its report reason"
+    expected = "ban: blocked_until=2026-10-26T12:15:00" if reason else "scrape_fotmob_data did not succeed"
+    with pytest.raises(AirflowException, match=expected):
+        validation.python_callable(result_path=str(report), dag_run=dag_run)
+    candidate = mod.record_bronze_only_candidate
+    assert candidate.upstream_task_ids == {"validate_data"}
+    assert candidate._init_kwargs.get("trigger_rule", "all_success") == "all_success"
+    assert mod.seal_publication.upstream_task_ids == {candidate.task_id}

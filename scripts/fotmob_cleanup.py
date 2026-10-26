@@ -1186,11 +1186,15 @@ def _attest_isolated_host(args: argparse.Namespace, *, run: Callable[..., Any]) 
             raise CleanupError(f"isolated readonly runtime mount mismatch: {destination}")
     # Reject overlays of tracked code. The external .airflowignore is the sole
     # admitted nested file bind in the ceremony-free recipe.
+    ignore_source = None
     for item in mounts:
         destination = str(item.get("Destination", ""))
         if destination == "/opt/airflow/dags/.airflowignore":
             if item.get("Type") != "bind" or item.get("RW") is not False:
                 raise CleanupError("isolated DAG ignore mount must be readonly")
+            if ignore_source is not None or not item.get("Source"):
+                raise CleanupError("isolated DAG ignore mount source is ambiguous or missing")
+            ignore_source = Path(item["Source"])
             continue
         if any(destination.startswith("/opt/airflow/" + relative + "/")
                for relative in ISOLATED_RUNTIME_ROOTS):
@@ -1219,6 +1223,11 @@ def _attest_isolated_host(args: argparse.Namespace, *, run: Callable[..., Any]) 
         manifest["/opt/airflow/" + relative] = hashlib.sha256(content).hexdigest()
     if "/opt/airflow/scripts/fotmob_cleanup.py" not in manifest:
         raise CleanupError("isolated release does not contain cleanup implementation")
+    if ignore_source is not None:
+        try:
+            manifest["/opt/airflow/dags/.airflowignore"] = hashlib.sha256(ignore_source.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise CleanupError("cannot read isolated DAG ignore mount source") from exc
     return {
         "scheduler_container_id": args.scheduler_container_id,
         "git_sha": args.release_sha, "manifest": manifest,

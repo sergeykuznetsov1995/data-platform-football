@@ -982,6 +982,11 @@ def _host_attestation(tmp_path, monkeypatch):
     content = b'# reviewed isolated cleanup\n'
     path.write_bytes(content)
     blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+    ignore = root / 'dags/.airflowignore'
+    ignore.parent.mkdir()
+    ignore_content = b'# tracked ignore\n'
+    ignore.write_bytes(ignore_content)
+    ignore_blob = hashlib.sha1(b'blob ' + str(len(ignore_content)).encode() + b'\0' + ignore_content).hexdigest()
     env = {'FOTMOB_ISOLATED_STACK': '1', 'ALERT_ENV': 'fotmob-isolated', 'TRINO_HOST': 'trino',
            'AIRFLOW__DATABASE__SQL_ALCHEMY_CONN': 'postgresql+psycopg2://airflow:secret@fotmob-airflow-metadb:5432/airflow'}
     container = {'Id': 'b' * 64, 'Name': '/fotmob-airflow-scheduler', 'State': {'Running': True},
@@ -994,13 +999,128 @@ def _host_attestation(tmp_path, monkeypatch):
                            release_root=root, release_sha='a' * 40)
     monkeypatch.setattr(mod.runtime_binding, '_inspect_container', lambda *a, **k: container)
     git_output = {'rev-parse': 'a' * 40, 'status': '', 'ls-files': '',
-                  'ls-tree': '100644 blob ' + blob + '\tscripts/fotmob_cleanup.py\n'}
+                  'ls-tree': '100644 blob ' + blob + '\tscripts/fotmob_cleanup.py\n'
+                             + '100644 blob ' + ignore_blob + '\tdags/.airflowignore\n'}
     calls = []
     def run(command, **kwargs):
         calls.append(command)
         assert command[:1] == ('git',)
         return subprocess.CompletedProcess(command, 0, stdout=git_output[command[3]], stderr='')
     return args, container, git_output, calls, run
+
+
+def _ignore_overlay(tmp_path, container):
+    source = tmp_path / 'external.airflowignore'
+    source.write_bytes(b'# isolated ignore\n')
+    container['Mounts'].append({'Destination': '/opt/airflow/dags/.airflowignore',
+                               'Source': str(source), 'Type': 'bind', 'RW': False})
+    return source
+
+
+@pytest.mark.parametrize('overlay', [False, True])
+def test_isolated_plan_checks_visible_ignore_before_import(tmp_path, monkeypatch, overlay):
+    import builtins
+    import hashlib
+    import io
+    import socket
+    import sys
+    args, container, _, _, git_run = _host_attestation(tmp_path, monkeypatch)
+    baseline = mod._attest_isolated_host(args, run=git_run)['manifest']
+    source = (_ignore_overlay(tmp_path, container) if overlay
+              else args.release_root / 'dags/.airflowignore')
+    identity = mod._attest_isolated_host(args, run=git_run)
+    ignore_path = '/opt/airflow/dags/.airflowignore'
+    expected = dict(baseline)
+    expected[ignore_path] = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert identity['manifest'] == expected
+    visible = {path: (args.release_root / path.removeprefix('/opt/airflow/')).read_bytes()
+               for path in baseline}
+    visible[ignore_path] = source.read_bytes()
+    real_read = mod.Path.read_bytes
+    def read_bytes(path):
+        return visible[str(path)] if str(path) in visible else real_read(path)
+    monkeypatch.setattr(mod.Path, 'read_bytes', read_bytes)
+    env = dict(entry.split('=', 1) for entry in container['Config']['Env'])
+    monkeypatch.setattr(mod.os, 'environ', env)
+    monkeypatch.setattr(socket, 'gethostname', lambda: identity['hostname'])
+    client = PlanClient()
+    monkeypatch.setattr(mod, '_connect_isolated_from_env', lambda **k: client)
+    monkeypatch.setattr(mod, '_isolated_trino_nodes', lambda c: [['node', 'http://trino']])
+    monkeypatch.setattr(mod, '_now_dt', lambda: NOW)
+    imports = []
+    real_import = builtins.__import__
+    def track_import(name, *a, **k):
+        if name == 'scripts.fotmob_cleanup':
+            imports.append(name)
+        return real_import(name, *a, **k)
+    def run(command, **kwargs):
+        if command[0] == 'git':
+            return git_run(command, **kwargs)
+        assert command[:4] == ('docker', 'exec', '-i', args.scheduler_container_id)
+        with monkeypatch.context() as context:
+            output = io.StringIO()
+            context.setattr(sys, 'stdin', io.StringIO(kwargs['input']))
+            context.setattr(sys, 'stdout', output)
+            context.setattr(sys, 'path', list(sys.path))
+            context.setattr(sys, 'dont_write_bytecode', True)
+            context.setattr(sys, 'pycache_prefix', sys.pycache_prefix)
+            exec(command[-1], {'__builtins__': {**vars(builtins), '__import__': track_import,
+                                              'open': lambda path, mode: io.BytesIO(visible[path])}})
+        return subprocess.CompletedProcess(command, 0, stdout=output.getvalue())
+    args = mod.build_parser().parse_args([
+        'plan', '--isolated-stack', '--output', str(tmp_path / 'plan.json'),
+        '--release-root', str(args.release_root), '--release-sha', args.release_sha,
+        '--scheduler-container-id', args.scheduler_container_id])
+    assert mod._isolated_request(args, run=run)['passed'] is True
+    assert imports == ['scripts.fotmob_cleanup']
+    mod._attest_isolated_process(identity)
+    visible[ignore_path] = b'# tampered container ignore\n'
+    imports.clear()
+    with pytest.raises(RuntimeError, match='before cleanup import'):
+        mod._isolated_request(args, run=run)
+    assert imports == []
+    with pytest.raises(mod.CleanupError, match='container-visible runtime bytes'):
+        mod._attest_isolated_process(identity)
+    if overlay:
+        visible[ignore_path] = source.read_bytes()
+        def drift_run(command, **kwargs):
+            result = run(command, **kwargs)
+            if command[0] == 'docker':
+                source.write_bytes(b'# changed host overlay\n')
+            return result
+        with pytest.raises(mod.CleanupError, match='identity changed during cleanup'):
+            mod._isolated_request(args, run=drift_run)
+
+
+@pytest.mark.parametrize('change', ['rw', 'non-bind', 'destination', 'duplicate',
+                                    'missing-source', 'missing-file', 'unreadable', 'tracked-drift'])
+def test_isolated_host_rejects_invalid_ignore_overlay(tmp_path, monkeypatch, change):
+    args, container, _, _, run = _host_attestation(tmp_path, monkeypatch)
+    source = _ignore_overlay(tmp_path, container)
+    mount = container['Mounts'][-1]
+    if change == 'rw':
+        mount['RW'] = True
+    elif change == 'non-bind':
+        mount['Type'] = 'volume'
+    elif change == 'destination':
+        mount['Destination'] = '/opt/airflow/dags/other-ignore'
+    elif change == 'duplicate':
+        container['Mounts'].append(dict(mount))
+    elif change == 'missing-source':
+        mount.pop('Source')
+    elif change == 'missing-file':
+        source.unlink()
+    elif change == 'unreadable':
+        real_read = mod.Path.read_bytes
+        def read_bytes(path):
+            if path == source:
+                raise PermissionError('unreadable overlay')
+            return real_read(path)
+        monkeypatch.setattr(mod.Path, 'read_bytes', read_bytes)
+    else:
+        (args.release_root / 'dags/.airflowignore').write_bytes(b'# changed tracked ignore\n')
+    with pytest.raises(mod.CleanupError):
+        mod._attest_isolated_host(args, run=run)
 
 
 def test_isolated_host_attests_exact_readonly_runtime_without_writes(tmp_path, monkeypatch):

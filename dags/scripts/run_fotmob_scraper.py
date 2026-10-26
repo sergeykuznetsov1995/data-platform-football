@@ -28,6 +28,9 @@ from typing import Any, Iterable, Iterator, Mapping
 from scrapers.fotmob.match_refresh import MATCH_SETTLE_MARGIN, match_refresh, source_observed_at
 from scrapers.fotmob.domain import ScopeRef, SeasonBundle
 from scrapers.fotmob.interruption import FotMobTerminated
+from scrapers.fotmob.shared_rate_limiter import (
+    FOTMOB_SHARED_RPM as FOTMOB_SHARED_RPM_CEILING,
+)
 from scrapers.fotmob.writer_lock import WriterLockBusy, writer_lock
 
 from scrapers.fotmob.scope_codec import format_scope_token, parse_scope_groups
@@ -174,7 +177,6 @@ WRITER_LOCK_ENV = "FOTMOB_WRITER_LOCK"
 # этого числа — сегодня 60/мин, ровно та нагрузка, которую источник видит от
 # одной волны. Раньше суммарный потолок держался лишь тем, что замок писателя
 # исключал одновременную работу волны и кампании.
-FOTMOB_SHARED_RPM_CEILING = 60.0
 FOTMOB_SHARED_RPM_ENV = "FOTMOB_SHARED_RPM"
 # Маркер узкого замка: по нему драйвер кампании отличает дерево, в котором волна
 # и юнит могут писать одновременно, от прежнего с замком на весь ран.
@@ -1023,7 +1025,6 @@ def _with_shared_rpm_ceiling(limiter, *, workers: int):
     shared = PgSharedRateLimiter(
         resolve_control_db_uri(os.environ),
         rpm=rpm,
-        burst=float(max(1, workers)),
     )
     return CompositeRateLimiter(limiter, shared)
 
@@ -1362,7 +1363,8 @@ def _run_transfers(args, service, started_at, operations, finish):
         status["completed_transfer_competition_ids"]
     )
     if (
-        flushed
+        payload.get("stop_reason") != "ban"
+        and flushed
         and catalog_complete
         and unfinished_ids
         and unfinished_ids <= deferred_ids
@@ -1455,6 +1457,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
 
     def finish() -> tuple[int, dict[str, Any]]:
+        pause_flush = getattr(
+            getattr(service, "transport", None), "flush_pending_pause", None
+        )
+        if pause_flush is not None:
+            pause_operation = OperationResult("pause_flush", attempted=1)
+            try:
+                pause_flush()
+                pause_operation.succeeded = 1
+            except Exception as exc:
+                pause_operation.errors.append(
+                    f"pause flush: {type(exc).__name__}: {exc}"
+                )
+            operations.append(pause_operation)
         # Buffered commits are only durable once flushed. Every exit path of
         # this run — completion, budget cut, empty catalog — goes through
         # finish(), so the flush belongs here and its failure must turn the
@@ -3346,7 +3361,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             retryable_attempts or unauthorized_operation_retries
         ) and not scope_progress
         if (
-            terminal_attempts
+            payload.get("stop_reason") == "ban"
+            or terminal_attempts
             or unauthorized_deferred_attempts
             or hard_failures
             or no_progress_failure

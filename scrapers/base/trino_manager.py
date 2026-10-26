@@ -894,6 +894,7 @@ WITH (
         merge_keys: Optional[Sequence[str]] = None,
         single_statement_replace: bool = False,
         target_column_types: Optional[Mapping[str, str]] = None,
+        merge_partition_cols: Optional[Sequence[str]] = None,
     ) -> int:
         """
         Insert a DataFrame so the target table receives exactly ONE snapshot.
@@ -930,6 +931,8 @@ WITH (
                 never downgraded to a silent append.
             merge_keys: Optional natural key for an incremental Iceberg MERGE.
                 Mutually exclusive with ``delete_filter``.
+            merge_partition_cols: Natural-key columns used to statically scope
+                the target to the exact partition tuples in ``df``.
             single_statement_replace: Replace ``delete_filter`` scope with one
                 Iceberg MERGE snapshot. The stage carries insert rows plus
                 tombstones copied from the current target, eliminating the
@@ -981,6 +984,40 @@ WITH (
         if keys and df.duplicated(subset=list(keys)).any():
             raise ValueError(f"duplicate rows for merge keys {list(keys)!r}")
 
+        partition_cols = tuple(merge_partition_cols or ())
+        for column in partition_cols:
+            validate_identifier(column, "merge partition column")
+            if column not in keys:
+                raise ValueError(
+                    f"merge partition column {column!r} must be in merge_keys"
+                )
+        # Every staged row must satisfy this target-only predicate. Otherwise a
+        # matched key could take NOT MATCHED and create a duplicate (#1836).
+        partition_predicate = ""
+        if partition_cols:
+            # Use the same target types for scope and source literals. In
+            # particular, REAL rounding must not exclude an existing key.
+            if target_column_types is None:
+                target_column_types = self.get_table_columns(schema, table)
+            partition_types = {
+                str(column).lower(): column_type
+                for column, column_type in target_column_types.items()
+            }
+            for column in partition_cols:
+                if not partition_types.get(column.lower()):
+                    raise ValueError(
+                        f"merge partition column {column!r} has no target type"
+                    )
+            partitions = df[list(partition_cols)].drop_duplicates()
+            partition_predicate = " OR ".join(
+                "(" + " AND ".join(
+                    f't."{column}" = '
+                    f'{self._format_sql_value(value, partition_types[column.lower()])}'
+                    for column, value in zip(partition_cols, values)
+                ) + ")"
+                for values in partitions.itertuples(index=False, name=None)
+            )
+
         qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
 
         # Fast path: a plain append that fits in ONE ``INSERT ... VALUES``
@@ -1017,7 +1054,7 @@ WITH (
             )
             if column_types is not None:
                 merge_sql = self._build_single_row_merge_sql(
-                    qualified_target, df, keys, column_types
+                    qualified_target, df, keys, column_types, partition_predicate
                 )
                 try:
                     self._execute_committing(merge_sql)
@@ -1138,6 +1175,8 @@ WITH (
                 on_clause = " AND ".join(
                     f't."{key}" = s."{key}"' for key in keys
                 )
+                if partition_predicate:
+                    on_clause += f" AND ({partition_predicate})"
                 update_columns = [column for column in df.columns if column not in keys]
                 update_clause = ""
                 if update_columns:
@@ -1255,6 +1294,7 @@ WITH (
         df: pd.DataFrame,
         keys: Sequence[str],
         column_types: Mapping[str, str],
+        partition_predicate: str = "",
     ) -> str:
         """One-statement MERGE upsert for a single-row frame (#951).
 
@@ -1278,6 +1318,8 @@ WITH (
         source = 'SELECT ' + ', '.join(select_items)
 
         on_clause = ' AND '.join(f't."{key}" = s."{key}"' for key in keys)
+        if partition_predicate:
+            on_clause += f" AND ({partition_predicate})"
         update_columns = [c for c in df.columns if c not in keys]
         update_clause = ''
         if update_columns:

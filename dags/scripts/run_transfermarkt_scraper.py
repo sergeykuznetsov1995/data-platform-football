@@ -3812,6 +3812,10 @@ def _run_entity_unbounded(
             ),
             cache_ttl_seconds=cache_ttl,
             canonical_season=os.environ.get('TM_CANONICAL_SEASON'),
+            request_deadline_monotonic=(
+                float(os.environ['TM_REQUEST_DEADLINE_MONOTONIC'])
+                if 'TM_REQUEST_DEADLINE_MONOTONIC' in os.environ else None
+            ),
         ) as scraper:
             _reconcile_pending_fetch_state(scraper)
             if spec.name in {ENTITY_MV_HISTORY, ENTITY_TRANSFERS} and not dry_run:
@@ -4454,7 +4458,7 @@ def _run_entity_unbounded(
         exit_code = 3
     except Exception as exc:  # noqa: BLE001
         from scrapers.transfermarkt.history_portion import HistoryContinuation, enabled as history_enabled
-        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded
+        from scrapers.transfermarkt.client import CurrentPortionDeadlineExceeded, SourceStreamPaused
         if history_enabled() and (isinstance(exc, (HistoryContinuation, CurrentPortionDeadlineExceeded)) or str(exc) == 'historical portion boundary reached'):
             results['continuation'] = True
         safe_error = _redact_sensitive(exc)
@@ -4470,6 +4474,8 @@ def _run_entity_unbounded(
             _mark_failure(results, stage='platform', kind='traffic_meter')
         elif isinstance(exc, RawStoreError):
             _mark_failure(results, stage='platform', kind='raw_store')
+        elif isinstance(exc, SourceStreamPaused) and not history_enabled():
+            _mark_failure(results, stage='source', kind='source_paused')
         elif failure_phase == 'source':
             _mark_failure(results, stage='source', kind='source_runtime')
         else:
