@@ -344,6 +344,13 @@ class FotMobTransport:
     def _shared_guard(self):
         return getattr(self.rate_limiter, "shared", None)
 
+    def flush_pending_pause(self) -> None:
+        """Publish an unconfirmed pause even when no further fetch is planned."""
+        with self._guard_lock:
+            if self._pause_pending:
+                self._shared_guard().pause(self.blocked_until, self.stop_reason)
+                self._pause_pending = False
+
     def _pause(self, seconds: float, reason: str) -> None:
         until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         with self._guard_lock:
@@ -360,12 +367,7 @@ class FotMobTransport:
     def _pause_state(self):
         shared = self._shared_guard()
         if shared is not None:
-            with self._guard_lock:
-                # A lost connection must not leave the pause local forever.
-                # Clear only after a confirmed write; replay is idempotent.
-                if self._pause_pending:
-                    shared.pause(self.blocked_until, self.stop_reason)
-                    self._pause_pending = False
+            self.flush_pending_pause()
             state = shared.pause_state()
             if state is not None:
                 with self._guard_lock:
