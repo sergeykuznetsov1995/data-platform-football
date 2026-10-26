@@ -23,7 +23,31 @@ pytestmark = pytest.mark.unit
 class Bronze(FakeTrino):
     fail_match = False
 
-    def execute_query(self, sql):
+    def execute_query(self, sql, params=None):
+        if params is not None:
+            ids = {
+                int(x)
+                for x in re.search(r"event_id IN \(([\d, ]+)\)", sql)[1].split(", ")
+            }
+            if sql.startswith("SELECT event_id, competition_slug, season_year"):
+                slug, year = params
+                return [
+                    (r["event_id"], r["competition_slug"], r["season_year"])
+                    for r in self.tables[MATCH_TABLE]
+                    if r["event_id"] in ids
+                    and r["duplicate_of"] is None
+                    and (r["competition_slug"], r["season_year"]) != (slug, year)
+                ]
+            assert sql.startswith("UPDATE iceberg.bronze.espn_match SET duplicate_of")
+            owner, slug, year = params
+            for row in self.tables[MATCH_TABLE]:
+                if (
+                    row["event_id"] in ids
+                    and row["competition_slug"] == slug
+                    and row["season_year"] == year
+                ):
+                    row["duplicate_of"] = owner
+            return []
         fields, table, scope = re.match(
             r"SELECT (.*?) FROM iceberg.bronze.(\w+) WHERE (.*)", sql
         ).groups()
@@ -60,9 +84,12 @@ def no_network(monkeypatch):
     monkeypatch.setattr(PaceStore, "__init__", forbidden)
 
 
-def corpus(tmp_path):
+def corpus(tmp_path, competition=None):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     data = json.loads(_bytes("summary_jpn1_2026_ten_starters.json"))
     header = data["header"]
+    if competition is not None:
+        header["league"].update(slug=competition[0], id=str(competition[1]))
     year = header["season"]["year"]
     data["keyEvents"] = [{"id": "k1", "text": "Goal"}]
     data["commentary"] = [{"id": "c1", "sequence": 1, "text": "Comment"}]
@@ -276,6 +303,54 @@ def test_actual_cells_guard_is_independent_of_old_parse(tmp_path):
     result = replay.run(manifest, editions, store=store, trino=bronze)
     assert result["matches"][0]["outcome"] == "skipped"
     assert "actual Bronze cells" in result["matches"][0]["write_error"]
+
+
+@pytest.mark.parametrize("qual_first", [False, True])
+def test_cross_competition_duplicate_owner(tmp_path, qual_first):
+    competitions = [("uefa.champions", 775), ("uefa.champions_qual", 19874)]
+    if qual_first:
+        competitions.reverse()
+    bronze = Bronze()
+    for slug, cid in competitions:
+        _, manifest, editions, store, _ = corpus(tmp_path / slug, (slug, cid))
+        for _ in range(2):
+            result = replay.run(manifest, editions, store=store, trino=bronze)
+            assert result["matches"][0]["outcome"] == "written", result
+    rows = {r["competition_slug"]: r for r in bronze.tables[MATCH_TABLE]}
+    assert len(rows) == len(bronze.tables[MATCH_TABLE]) == 2
+    assert rows["uefa.champions"]["duplicate_of"] is None
+    assert rows["uefa.champions_qual"]["duplicate_of"] == "uefa.champions:2026"
+
+
+@pytest.mark.parametrize("kind", ["keyEvents", "commentary"])
+@pytest.mark.parametrize("remaining", [[], [123], [789]])
+def test_event_participant_loss_is_rejected(tmp_path, kind, remaining):
+    data, manifest, editions, store, add = corpus(tmp_path)
+    event = data[kind][0]
+    if kind == "commentary":
+        event = event.setdefault("play", {"id": "c1"})
+    event["participants"] = [
+        {"athlete": {"id": str(athlete_id)}} for athlete_id in (123, 456)
+    ]
+    add(data, "2026-08-03 00:00:00")
+    bronze = Bronze()
+    result = replay.run(manifest, editions, store=store, trino=bronze)
+    assert result["matches"][0]["outcome"] == "written", result
+    assert any(
+        json.loads(row["athlete_ids"]) == [123, 456]
+        for row in bronze.tables["espn_match_events"]
+    )
+    event["participants"] = [
+        {"athlete": {"id": str(athlete_id)}} for athlete_id in remaining
+    ]
+    add(data, "2026-08-13 00:00:00")
+    before = {table: [dict(row) for row in rows] for table, rows in bronze.tables.items()}
+    calls = len(bronze.calls)
+    result = replay.run(manifest, editions, store=store, trino=bronze)
+    assert result["matches"][0]["outcome"] == "skipped", result
+    assert "actual Bronze cells" in result["matches"][0]["write_error"]
+    assert bronze.tables == before
+    assert len(bronze.calls) == calls
 
 
 def test_cli_dry_run_report_and_outside_registry(tmp_path, monkeypatch, capsys):

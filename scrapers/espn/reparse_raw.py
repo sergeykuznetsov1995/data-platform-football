@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import csv
 import hashlib
@@ -24,6 +24,7 @@ from .bronze_schema import MATCH_TABLE, NATURAL_KEYS, TABLES
 from .bronze_writer import TournamentBatch, delete_filter, write_tournament_batch
 from .denominator import load_denominator
 from .editions_store import load as load_editions
+from .history import duplicate_owners, mark_duplicates
 from .parser_contracts import PARSER_VERSION, SummaryDisposition
 from .parser_common import EspnParseError
 from .raw_store import EspnRawStore, RawStoreError
@@ -137,6 +138,9 @@ def _loses_rows(before, after):
                     continue
                 if value is not None and new.get(name) is None:
                     return True
+                if name == "athlete_ids" and value is not None:
+                    if not set(json.loads(value)).issubset(json.loads(new[name])):
+                        return True
     return False
 
 
@@ -328,8 +332,20 @@ def run(
         pending = batches[key]
         if not pending:
             return
+        slug, year = key
+        owners, retake = duplicate_owners(
+            trino, slug, year, [p.schedule.event_id for p, _ in pending]
+        )
+        for (other_slug, other_year), ids in sorted(retake.items()):
+            mark_duplicates(trino, f"{slug}:{year}", other_slug, other_year, ids)
+        payloads = [
+            replace(p, schedule=replace(p.schedule, duplicate_of=owners[eid]))
+            if (eid := p.schedule.event_id) in owners
+            else p
+            for p, _ in pending
+        ]
         receipt = write_tournament_batch(
-            TournamentBatch(*key, [p for p, _ in pending]), trino=trino
+            TournamentBatch(*key, payloads), trino=trino
         )
         report["receipts"].append(asdict(receipt))
         for _, record in pending:
