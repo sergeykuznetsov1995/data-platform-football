@@ -1083,8 +1083,9 @@ class _Scope:
             changed = memberships if national else memberships | expected
             inconsistent = (not national and memberships != expected) or any(
                 tmapi.normalize_market_value(row['market_value_eur']) != tmapi.normalize_market_value(values['market_value_eur'])
-                or (not national and row['contract_until'] is not None and values['contract_until'] is not None
-                    and str(row['contract_until']) != values['contract_until']) for row in rows)
+                or (not national and str(row['contract_until']) != str(values['contract_until'])
+                    and not (row['contract_until'] is None
+                             and row.get('_contract_status') in {'unknown', 'not_rendered'})) for row in rows)
             if inconsistent:
                 mismatches.update(changed)
                 failed.append((key, mark_failed(state, 'source_mismatch: tmapi and complete squad fields disagree')))

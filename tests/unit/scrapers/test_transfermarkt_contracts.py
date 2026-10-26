@@ -197,3 +197,40 @@ def test_current_cycle_rejects_two_known_conflicting_dates(tmp_path, monkeypatch
     offline.run('conflict-apply')
     assert len(offline.writes) == initial_writes
     assert any('source_mismatch' in line for line in offline.sql)
+
+
+@pytest.mark.parametrize('html_contract,api_contract', [
+    ('bad date', '2028-06-30'), ('Jun 30, 2028', None),
+])
+def test_current_cycle_rejects_contract_null_mismatch(tmp_path, monkeypatch, html_contract, api_contract):
+    from tests.unit.scripts import test_run_transfermarkt_current as fixtures
+    offline = fixtures.Offline(tmp_path, monkeypatch)
+    offline.squad_players['10'] = ['110', '111']
+    offline.run('cold')
+    offline.clock.advance(21 * 3600)
+    offline.run('baseline')
+    offline.run('baseline-apply')
+    initial_writes = len(offline.writes)
+
+    # Keep another player's date so the club completeness guard can pass.
+    monkeypatch.setattr(fixtures, 'squad', lambda *args, **kwargs: squad(*args, **kwargs).replace(
+        'Jun 30, 2028', html_contract, 1))
+
+    def changed_packet(*args, **kwargs):
+        body = packet(*args, **kwargs)
+        for row in body['data']:
+            if row['id'] == '110':
+                row['attributes']['contractUntil'] = api_contract
+        return body
+
+    monkeypatch.setattr(fixtures, 'packet', changed_packet)
+    offline.player_values['110'] = 2000000
+    offline.squad_values['10'] = '€2.0m'
+    offline.clock.advance(21 * 3600)
+    offline.run('contract-change')
+    report = offline.run('contract-apply')
+    assert len(offline.writes) == initial_writes
+    state = next(iter(offline.state()['scopes'].values()))['signals']['player:110']
+    assert state['status'] == 'failed' and 'source_mismatch' in state['result']
+    assert state['applied_signature'] != state['observation']['signature']
+    assert any('source_mismatch' in item.get('error', '') for item in report['scopes'])
