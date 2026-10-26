@@ -101,6 +101,17 @@ class QualityIssue:
         }
 
 
+def _schema_warning_issues(warnings: Sequence[Mapping[str, Any]]) -> list[QualityIssue]:
+    return [
+        QualityIssue(
+            code="unknown_source_fields",
+            message=f"{warning['response']} {warning['path']}: unknown fields {warning['fields']}",
+            details=dict(warning),
+        )
+        for warning in warnings
+    ]
+
+
 @dataclass(frozen=True)
 class MatchQuarantine:
     game_id: str
@@ -148,6 +159,7 @@ class QualityReport:
     teams_pending_first_match: Sequence[str] = ()
     match_quarantine: Sequence[MatchQuarantine] = ()
     match_quarantine_summary: Mapping[str, Any] = field(default_factory=dict)
+    retry_count: Optional[int] = None
 
     @property
     def publishable(self) -> bool:
@@ -188,6 +200,7 @@ class QualityReport:
             "issues": [issue.to_dict() for issue in self.issues],
             "league_payload_hashes": dict(self.league_payload_hashes),
             "request_count": self.request_count,
+            "retry_count": self.retry_count,
             "teams_pending_first_match": sorted(self.teams_pending_first_match),
             "match_quarantine": [
                 item.to_dict()
@@ -444,6 +457,8 @@ def validate_understat_scope(
     coverage_exceptions: Optional[Mapping[str, object]] = None,
     league_payload_hashes: Optional[Mapping[str, str]] = None,
     request_count: Optional[int] = None,
+    retry_count: Optional[int] = None,
+    schema_warnings: Sequence[Mapping[str, Any]] = (),
 ) -> QualityReport:
     """Validate all seven entity frames for exactly one league-season scope.
 
@@ -466,7 +481,7 @@ def validate_understat_scope(
         for key, value in dict(payload_hashes or {}).items()
     }
     exceptions = dict(coverage_exceptions or {})
-    issues: list[QualityIssue] = []
+    issues = _schema_warning_issues(schema_warnings)
 
     missing_entities = set(UNDERSTAT_ENTITIES) - set(supplied)
     extra_entities = set(supplied) - set(UNDERSTAT_ENTITIES)
@@ -1322,6 +1337,7 @@ def validate_understat_scope(
         site_result_game_ids=tuple(sorted(completed_ids)),
         league_payload_hashes=dict(league_payload_hashes or {}),
         request_count=request_count,
+        retry_count=retry_count,
         teams_pending_first_match=tuple(
             sorted(schedule_team_ids - played_team_ids)
         ),
@@ -1394,6 +1410,8 @@ def build_failure_attempt(
     site_result_game_ids: Optional[Iterable[str]] = None,
     league_payload_hashes: Optional[Mapping[str, str]] = None,
     request_count: Optional[int] = None,
+    retry_count: Optional[int] = None,
+    schema_warnings: Sequence[Mapping[str, Any]] = (),
 ) -> ScopeAttempt:
     """Build an auditable terminal attempt when extraction/DQ cannot report.
 
@@ -1429,6 +1447,10 @@ def build_failure_attempt(
         known["league_payload_hashes"] = dict(league_payload_hashes)
     if request_count is not None:
         known["request_count"] = request_count
+    if retry_count is not None:
+        known["retry_count"] = retry_count
+    if schema_warnings:
+        known["issues"] = [issue.to_dict() for issue in _schema_warning_issues(schema_warnings)]
     return ScopeAttempt(
         scope=scope,
         status=status,

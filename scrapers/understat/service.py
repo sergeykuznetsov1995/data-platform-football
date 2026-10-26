@@ -74,6 +74,17 @@ class UnderstatSource:
         self.catalog = UnderstatCatalog(client, today=self.today)
         # #1431: fingerprints of the last parsed league response.
         self.last_league_hashes: dict[str, str] = {}
+        self.schema_warnings: list[dict[str, Any]] = []
+
+    def _validate(self, validator: Any, payload: Any, response: str, **kwargs: Any) -> None:
+        warnings: list[dict[str, Any]] = []
+        try:
+            validator(payload, warnings=warnings, **kwargs)
+        finally:
+            for warning in warnings:
+                self.schema_warnings.append({**warning, "response": response})
+                logger.warning("Understat unknown fields: response=%s path=%s fields=%s",
+                               response, warning["path"], warning["fields"])
 
     @contextmanager
     def _keep_on_drift(self, payload: Any, cache_name: str) -> Iterator[None]:
@@ -125,6 +136,7 @@ class UnderstatSource:
         back to the full path, which fails as an unpublished closed scope.
         """
 
+        self.schema_warnings = []
         definition, scope = self._scope(league, season_slug, source_season_id)
         try:
             league_payload = self.client.get_league_data(
@@ -148,7 +160,10 @@ class UnderstatSource:
             league_payload,
             league_cache_name(definition.source_league, source_season_id),
         ):
-            validate_league_payload(league_payload)
+            self._validate(
+                validate_league_payload, league_payload,
+                league_cache_name(definition.source_league, source_season_id),
+            )
             return league_payload_hashes(
                 {
                     "schedule": parse_schedule(league_payload, scope),
@@ -170,6 +185,7 @@ class UnderstatSource:
     ) -> dict[str, pd.DataFrame]:
         if mode not in {"current", "history", "reparse"}:
             raise ValueError("mode must be current, history, or reparse")
+        self.schema_warnings = []
         definition, scope = self._scope(league, season_slug, source_season_id)
         refresh_scope = force_refresh or mode in {"current", "reparse"}
         try:
@@ -193,7 +209,10 @@ class UnderstatSource:
             league_payload,
             league_cache_name(definition.source_league, source_season_id),
         ):
-            validate_league_payload(league_payload)
+            self._validate(
+                validate_league_payload, league_payload,
+                league_cache_name(definition.source_league, source_season_id),
+            )
             schedule = parse_schedule(league_payload, scope)
             players = parse_player_season_stats(league_payload, scope)
             team_match = parse_team_match_stats(league_payload, scope)
@@ -227,7 +246,10 @@ class UnderstatSource:
                 match_payload,
                 match_cache_name(int(row["game_id"])),
             ):
-                validate_match_payload(match_payload)
+                self._validate(
+                    validate_match_payload, match_payload,
+                    match_cache_name(int(row["game_id"])),
+                )
                 shot_frame, player_frame = parse_match_payload(
                     match_payload, scope, row
                 )
@@ -264,8 +286,10 @@ class UnderstatSource:
                 with self._keep_on_drift(
                     team_payload, team_cache_name(team_name, source_season_id)
                 ):
-                    validate_team_payload(
-                        team_payload, source_season_id=source_season_id
+                    self._validate(
+                        validate_team_payload, team_payload,
+                        team_cache_name(team_name, source_season_id),
+                        source_season_id=source_season_id
                     )
                     player_team, breakdowns = parse_team_payload(
                         team_payload,
