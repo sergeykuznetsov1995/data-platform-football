@@ -403,12 +403,13 @@ class UnderstatCatalog:
         if cache_dir is not None:
             atomic_json(Path(cache_dir) / "confirmed" / f"{definition.source_league}_{year}.json", state)
 
-    def note_quality(self, league: str, year: int, report: Any) -> None:
+    def note_quality(self, league: str, year: int, report: Any, *,
+                     publication_ready: bool = True) -> None:
         definition = LEAGUE_BY_CANONICAL[league]
         state = self._confirmed(definition).get(str(year))
         if state is None:
             return
-        state["quality_ready"] = report.passed
+        state["quality_ready"] = report.passed and publication_ready
         state["quarantine_until"] = max(
             (item.retry_until for item in report.match_quarantine if item.state == "waiting_data"),
             default=None,

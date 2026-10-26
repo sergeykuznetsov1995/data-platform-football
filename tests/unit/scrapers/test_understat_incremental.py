@@ -443,3 +443,35 @@ def test_recorded_rfpl_schedule_writes_same_full_batch_after_warm_cache(tmp_path
         pd.testing.assert_frame_equal(call.kwargs["df"], expected[call.kwargs["table_name"]])
         assert call.kwargs["min_replace_ratio"] == 0.9
     assert repository.verified
+
+
+@pytest.mark.parametrize("side", ["h", "a"])
+@pytest.mark.parametrize("validated_cache", [False, True])
+def test_one_sided_roster_is_not_reused(tmp_path, side, validated_cache):
+    src, session = source(tmp_path)
+    session.match["rosters"][side] = []
+    run(src)
+    cache = CacheState(tmp_path)
+    if validated_cache:
+        # Also repair partial entries written by the previous implementation.
+        cache.save("match_100.json", [LEAGUE, 2025, 100],
+                   digest(session.league["dates"][0]), session.match, TODAY)
+    else:
+        assert cache.load("match_100.json", [LEAGUE, 2025, 100]) is None
+    session.match = deepcopy(MATCH_PAYLOAD)
+    session.calls.clear()
+    frames = run(src)
+    assert "/getMatchData/100" in session.calls
+    assert set(frames["understat_player_match_stats"]["team_side"]) == {"h", "a"}
+
+
+@pytest.mark.parametrize("placeholder", [{}, {"history": []}])
+def test_placeholder_before_played_teams_is_ignored(tmp_path, placeholder):
+    src, session = source(tmp_path)
+    session.league["teams"] = {"placeholder": placeholder, **session.league["teams"]}
+    first = run(src)
+    session.calls.clear()
+    second = run(src)
+    assert session.calls == ["/getLeagueData/EPL/2025"]
+    for table in first:
+        pd.testing.assert_frame_equal(first[table], second[table])

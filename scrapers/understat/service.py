@@ -51,8 +51,11 @@ def _concat(frames: list[pd.DataFrame], empty: pd.DataFrame) -> pd.DataFrame:
 
 
 def _match_payload_is_complete(payload: Mapping[str, Any]) -> bool:
-    return all(_match_payload_has_rows({name: payload.get(name)})
-               for name in ("shots", "rosters"))
+    rosters = payload.get("rosters")
+    return (isinstance(rosters, Mapping)
+            and all(isinstance(rosters.get(side), (list, Mapping)) and rosters[side]
+                    for side in ("h", "a"))
+            and _match_payload_has_rows({"shots": payload.get("shots")}))
 
 
 def _match_payload_has_rows(payload: Mapping[str, Any]) -> bool:
@@ -264,7 +267,7 @@ class UnderstatSource:
             schedule.loc[
                 schedule["game_id"] == row["game_id"], "has_data"
             ] = _match_payload_has_rows(match_payload)
-            if incremental and refresh and not shot_frame.empty and not player_frame.empty:
+            if incremental and refresh and _match_payload_is_complete(match_payload):
                 cache.save(name, [league, source_season_id, game_id],
                            fingerprints[game_id], match_payload, self.today,
                            match_date=row["date"].date().isoformat())
@@ -287,17 +290,15 @@ class UnderstatSource:
             # team page yet; asking for it only returns empty statistics.
             teams = sorted(
                 (
-                    (int(team["id"]), str(team["title"]))
+                    (int(team["id"]), str(team["title"]), team)
                     for team in _team_records(league_payload.get("teams"))
                     if team.get("history")
                 ),
                 key=lambda item: item[0],
             )
-            for team_id, team_name in teams:
+            for team_id, team_name, team_record in teams:
                 name = team_cache_name(team_name, source_season_id)
                 identity = [league, source_season_id, team_id]
-                team_record = next(team for team in _team_records(league_payload.get("teams"))
-                                   if int(team["id"]) == team_id)
                 fingerprint = digest([team_record, sorted(team_matches.get(team_id, []))])
                 entry = cache.load(name, identity) if incremental else None
                 refresh = (refresh_scope if not incremental else

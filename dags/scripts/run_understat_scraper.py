@@ -680,6 +680,11 @@ def run_scope(
                 entities_to_write = ()
 
             if entities_to_write:
+                # A previous successful publication cannot certify this write.
+                # Clear readiness before even the IN_PROGRESS marker can persist.
+                if callable(note_quality):
+                    note_quality(args.league, args.source_season_id, report,
+                                 publication_ready=False)
                 # Fence the exact scope before the first non-transactional
                 # table replacement. If the worker is killed mid-loop, this
                 # marker remains the latest attempt and every native consumer
