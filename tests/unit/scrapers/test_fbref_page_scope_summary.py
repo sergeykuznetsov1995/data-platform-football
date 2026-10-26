@@ -12,7 +12,7 @@ from scrapers.fbref.control.store import _ScopeBackfillCursor, _FRONTIER_SCOPE_C
 
 
 def test_1805_summary_migration_is_schema_only_and_invalidations_lock_conflicts():
-    migration = MIGRATIONS[-1]
+    migration = next(m for m in MIGRATIONS if m.version == 13)
     assert migration.version == 13
     ddl = "\n".join(migration.statements)
     assert "SELECT DISTINCT" not in ddl.split("CREATE FUNCTION", 1)[0]
