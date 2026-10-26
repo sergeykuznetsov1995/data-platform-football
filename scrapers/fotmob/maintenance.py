@@ -71,11 +71,12 @@ FOTMOB_COMPACTION_TABLES: tuple[str, ...] = (
 )
 
 # Кандидат в склейку — живой файл данных меньше этого порога. Порог кандидата
-# намеренно НИЖЕ размера склеенного файла (порция ≤ 64 МиБ входа): выход
-# компакции второй раз в кандидаты не попадает, и ночи не гоняют одно и то же.
+# ограничивает вход; результат склейки тоже может быть меньше порога.
+# Одиночные файлы внутри партиции не переписываются.
 SMALL_FILE_MAX_BYTES = 8 * 1024 * 1024
 FILE_SIZE_THRESHOLD = "128MB"
 
+MAX_PARTITIONS_PER_CHUNK = 32
 MAX_FILES_PER_CHUNK = 1_000
 MAX_INPUT_BYTES_PER_CHUNK = 64 * 1024 * 1024
 # `query.max-length` Trino — 1 000 000 байт, клиент оборачивает запрос в
@@ -166,10 +167,11 @@ def _empty_chunk_sql_bytes(table: str) -> int:
 def plan_chunks(
     table: str, candidates: Iterable[tuple[Any, str, int]]
 ) -> list[dict[str, Any]]:
-    """Разложить кандидатов по порциям: одна партиция, мелкие первыми.
+    """Разложить кандидатов по порциям: до 32 партиций, мелкие первыми.
 
     Партиции идут по убыванию числа кандидатов (где мусора больше — там и
     выигрыш волны), партиция с одним кандидатом пропускается: склеивать нечего.
+    Группы внутри партиций объединяются с общими лимитами входа и SQL.
     """
 
     groups: dict[str, list[tuple[int, str]]] = {}
@@ -200,7 +202,26 @@ def plan_chunks(
             chunk_bytes += size
             sql_bytes += cost
         _append_chunk(chunks, partition, paths, chunk_bytes, sql_bytes)
-    return chunks
+    packed: list[dict[str, Any]] = []
+    for chunk in chunks:
+        previous = packed[-1] if packed else None
+        if previous is not None:
+            partitions = list(dict.fromkeys(previous["partitions"] + chunk["partitions"]))
+            sql_bytes = previous["sql_bytes"] + chunk["sql_bytes"] - base_bytes
+            if (
+                len(partitions) <= MAX_PARTITIONS_PER_CHUNK
+                and previous["files"] + chunk["files"] <= MAX_FILES_PER_CHUNK
+                and previous["bytes"] + chunk["bytes"] <= MAX_INPUT_BYTES_PER_CHUNK
+                and sql_bytes <= MAX_SQL_BYTES
+            ):
+                previous["partitions"] = partitions
+                previous["paths"].extend(chunk["paths"])
+                previous["files"] += chunk["files"]
+                previous["bytes"] += chunk["bytes"]
+                previous["sql_bytes"] = sql_bytes
+                continue
+        packed.append(chunk)
+    return packed
 
 
 def _append_chunk(
@@ -215,7 +236,7 @@ def _append_chunk(
         return
     chunks.append(
         {
-            "partition": partition,
+            "partitions": [partition],
             "paths": list(paths),
             "files": len(paths),
             "bytes": chunk_bytes,
@@ -369,16 +390,16 @@ def run(
                 break
             except Exception as error:  # noqa: BLE001 — любая ошибка Trino красит прогон
                 logger.error(
-                    "FotMob compaction failed: table=%s partition=%s files=%s: %s",
+                    "FotMob compaction failed: table=%s partitions=%s files=%s: %s",
                     table,
-                    chunk["partition"],
+                    chunk["partitions"],
                     chunk["files"],
                     error,
                 )
                 try:
                     notify(
-                        f"FotMob compaction failed on {table} (partition="
-                        f"{chunk['partition']}, files={chunk['files']}): {error}"
+                        f"FotMob compaction failed on {table} (partitions="
+                        f"{chunk['partitions']}, files={chunk['files']}): {error}"
                     )
                 except Exception:  # noqa: BLE001 — молчащий алерт не должен съесть отчёт
                     logger.exception("FotMob compaction: алерт не доставлен")
@@ -391,10 +412,10 @@ def run(
             entry["chunks"] += 1
             result["chunks"] += 1
             logger.info(
-                "FotMob compaction: table=%s partition=%s files=%s bytes=%s "
+                "FotMob compaction: table=%s partitions=%s files=%s bytes=%s "
                 "sql_bytes=%s elapsed=%.1fs",
                 table,
-                chunk["partition"],
+                chunk["partitions"],
                 chunk["files"],
                 chunk["bytes"],
                 chunk["sql_bytes"],
@@ -472,7 +493,7 @@ def _compact_chunk(manager, writer_lock, table: str, chunk, *, now, cutoff):
             cursor.close()
     if overrun:
         raise CompactionOverrun(
-            f"порция {table}/{chunk['partition']} держала замок дольше "
+            f"порция {table}/{chunk['partitions']} держала замок дольше "
             f"{MAX_LOCK_HOLD_SECONDS:.0f} с — запрос снят на сервере"
         )
     if "error" in outcome:
