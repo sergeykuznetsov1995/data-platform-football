@@ -75,6 +75,8 @@ from scrapers.sofascore.schedule_refresh import (  # noqa: E402
 
 DAG_ID = "dag_refresh_sofascore_all_mens"
 TASK_ID = "refresh_season_schedules"
+# Bound each MERGE's target file planning, including position-delete files.
+MAX_MERGE_PARTITIONS = 100
 # A ``schedule_last`` page measured on the campaign's own traffic accounting is
 # ~20-27 KB, plus ~75-80 KB once per lease for the browser warm-up.  The worst
 # case of a plan is computed, not guessed — see ``worst_case_pages`` — and the
@@ -656,12 +658,26 @@ def write_schedule_rows(rows: list[dict]) -> str:
             host=writer.trino_host, port=writer.trino_port, catalog=writer.catalog,
         )
         frame = scraper._add_metadata(pd.DataFrame(rows), "schedule")
-        return scraper.save_to_iceberg(
-            df=frame,
-            table_name="sofascore_schedule",
-            partition_cols=["league", "season"],
-            natural_keys=["league", "season", "game_id"],
-        )
+        batches = [frame]
+        if not frame.empty:
+            partitions = frame.groupby(
+                ["league", "season"], sort=False, dropna=False,
+            ).ngroup()
+            batches = (
+                batch for _, batch in frame.groupby(
+                    partitions // MAX_MERGE_PARTITIONS, sort=False,
+                )
+            )
+        # Keep whole partitions together and stop on the first failed batch.
+        # Earlier batches can be retried safely by the same natural-key upsert.
+        for batch in batches:
+            table = scraper.save_to_iceberg(
+                df=batch,
+                table_name="sofascore_schedule",
+                partition_cols=["league", "season"],
+                natural_keys=["league", "season", "game_id"],
+            )
+        return table
 
 
 def _parser() -> argparse.ArgumentParser:
