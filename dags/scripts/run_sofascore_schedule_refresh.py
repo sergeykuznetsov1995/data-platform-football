@@ -637,10 +637,24 @@ def write_schedule_rows(rows: list[dict]) -> str:
 
     import pandas as pd
 
+    from scrapers.base.trino_manager import TrinoTableManager
     from scrapers.sofascore.scraper import SofaScoreScraper
     from scrapers.sofascore.writer_lock import bronze_writer_lock
 
+    class ScheduleTrinoTableManager(TrinoTableManager):
+        def insert_dataframe_atomic(self, schema, table, df, **kwargs):
+            return super().insert_dataframe_atomic(
+                schema, table, df,
+                merge_partition_cols=["league", "season"], **kwargs,
+            )
+
     with SofaScoreScraper() as scraper, bronze_writer_lock():
+        # Keep the shared writer and its metadata/schema/atomic-write guards.
+        # Only this dedicated schedule writer uses a scoped MERGE (#1836).
+        writer = scraper._iceberg_writer
+        writer._trino_manager = ScheduleTrinoTableManager(
+            host=writer.trino_host, port=writer.trino_port, catalog=writer.catalog,
+        )
         frame = scraper._add_metadata(pd.DataFrame(rows), "schedule")
         return scraper.save_to_iceberg(
             df=frame,

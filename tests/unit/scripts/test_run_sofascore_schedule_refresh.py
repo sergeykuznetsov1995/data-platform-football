@@ -2430,11 +2430,16 @@ def test_a_slice_of_seasons_that_have_not_started_is_not_a_failure(
 
 @pytest.mark.unit
 def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
+    from types import SimpleNamespace
+
     events = []
 
     class _Scraper:
         def __init__(self, **kwargs):
             events.append(("scraper", kwargs))
+            self._iceberg_writer = SimpleNamespace(
+                trino_host="trino", trino_port=8080, catalog="iceberg",
+            )
 
         def __enter__(self):
             return self
@@ -2450,6 +2455,12 @@ def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
         def save_to_iceberg(self, **kwargs):
             events.append(("save", kwargs["table_name"], kwargs["natural_keys"],
                            kwargs["partition_cols"], len(kwargs["df"])))
+            assert "merge_partition_cols" not in kwargs
+            manager = self._iceberg_writer._trino_manager
+            manager.insert_dataframe_atomic(
+                "bronze", kwargs["table_name"], kwargs["df"],
+                merge_keys=kwargs["natural_keys"],
+            )
             return "bronze.sofascore_schedule"
 
     @contextmanager
@@ -2461,6 +2472,13 @@ def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
     import scrapers.sofascore.scraper as scraper_module
     import scrapers.sofascore.writer_lock as writer_lock
 
+    from scrapers.base.trino_manager import TrinoTableManager
+
+    def insert(manager, schema, table, frame, **kwargs):
+        events.append(("merge", schema, table, kwargs))
+        return len(frame)
+
+    monkeypatch.setattr(TrinoTableManager, "insert_dataframe_atomic", insert)
     monkeypatch.setattr(scraper_module, "SofaScoreScraper", _Scraper)
     monkeypatch.setattr(writer_lock, "bronze_writer_lock", lock)
 
@@ -2476,6 +2494,10 @@ def test_write_schedule_rows_merges_by_game_inside_the_writer_lock(monkeypatch):
         ("metadata", "schedule", 2),
         ("save", "sofascore_schedule", ["league", "season", "game_id"],
          ["league", "season"], 2),
+        ("merge", "bronze", "sofascore_schedule", {
+            "merge_keys": ["league", "season", "game_id"],
+            "merge_partition_cols": ["league", "season"],
+        }),
         "lock:exit",
         "scraper:exit",
     ]
