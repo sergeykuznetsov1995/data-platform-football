@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
@@ -9182,9 +9183,16 @@ class ControlStore:
         *,
         typed_status: str,
         stateful_status: str,
+        processing_work_ms: Optional[int] = None,
     ) -> None:
         """Close an observation only after all stateful effects succeeded."""
 
+        started = time.monotonic()
+        work_ms = (
+            None
+            if processing_work_ms is None
+            else _non_negative(processing_work_ms, "processing_work_ms")
+        )
         typed = str(typed_status).strip().lower()
         stateful = str(stateful_status).strip().lower()
         if typed not in {"succeeded", "skipped"}:
@@ -9216,6 +9224,20 @@ class ControlStore:
                 (typed, stateful, *identity, lease.claim_token),
             )
             if cursor.rowcount:
+                if work_ms is not None:
+                    # The fenced UPDATE holds the row until commit. Include its
+                    # work in the same transaction; telemetry/commit is excluded.
+                    cursor.execute(
+                        """UPDATE fbref_control.observation_processing
+                        SET processing_work_ms = %s
+                        WHERE logical_refresh_id = %s AND parser_version = %s
+                          AND typed_parser_version = %s
+                          AND stateful_parser_version = %s""",
+                        (
+                            work_ms + math.ceil((time.monotonic() - started) * 1000),
+                            *identity,
+                        ),
+                    )
                 return
             cursor.execute(
                 """

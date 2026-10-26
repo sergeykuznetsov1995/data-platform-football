@@ -167,3 +167,127 @@ def test_old_fetch_only_projection_cannot_admit_a_long_parse_batch():
             measured_page_seconds=180,
             now=datetime(2026, 10, 9, 22, 30, tzinfo=timezone.utc),
         )
+
+
+@pytest.fixture
+def measured_history():
+    """Execute admission SQL offline against a batch with queued completions."""
+    import sqlite3
+    from contextlib import contextmanager
+    from scrapers.fbref import history
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("ATTACH DATABASE ':memory:' AS fbref_control")
+    db.execute("""CREATE TABLE fbref_control.observation_processing (
+        logical_refresh_id text, target_id text, content_hash text,
+        status text, generic_status text, typed_status text, stateful_status text,
+        validation_status text, parser_version text, typed_parser_version text,
+        stateful_parser_version text, started_at real, completed_at real,
+        processing_work_ms integer)""")
+    db.execute("""CREATE TABLE fbref_control.fetch_attempt (
+        logical_refresh_id text, target_id text, content_hash text,
+        status text, started_at real, latency_ms integer)""")
+    for i in range(3):
+        db.execute(
+            "INSERT INTO fbref_control.observation_processing VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(i), str(i), 'hash', 'succeeded', 'succeeded', 'skipped',
+             'succeeded', 'succeeded', history.PAGE_DOCUMENT_VERSION,
+             history.TYPED_BRONZE_PARSER_VERSION, history.DISCOVERY_PARSER_VERSION,
+             1000, 2000 + i * 30, 30000),
+        )
+        db.execute("INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?,?,?)",
+                   (str(i), str(i), 'hash', 'succeeded', 500, 200000))
+    db.execute("INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?,?,?)",
+               ('0', '0', 'hash', 'failed', 0, 1000))
+
+    class Cursor:
+        def execute(self, sql, params=()):
+            if 'history_timing' in sql:
+                self.row = {'seconds': None}
+            else:
+                # Only PostgreSQL's interval extraction needs translation for
+                # the pre-fix regression run; timestamps here are epoch seconds.
+                sql = sql.replace(
+                    'extract(epoch FROM (observed.completed_at-attempt.started_at))',
+                    '(observed.completed_at-attempt.started_at)',
+                )
+                self.row = dict(db.execute(sql.replace('%s', '?'), params).fetchone())
+
+        def fetchone(self):
+            return self.row
+
+    @contextmanager
+    def transaction():
+        yield Cursor()
+
+    yield history.HistoryCampaign(SimpleNamespace(_transaction=transaction)), db
+    db.close()
+
+
+def test_initial_timing_measures_page_work_without_batch_queue_or_retry(measured_history):
+    campaign, db = measured_history
+    assert campaign.page_seconds() == 230
+    db.execute('UPDATE fbref_control.observation_processing SET completed_at=completed_at+9000')
+    assert campaign.page_seconds() == 230
+
+
+@pytest.mark.parametrize('change', [
+    'processing_work_ms=NULL', 'processing_work_ms=0', "status='failed'",
+    "generic_status='failed'", "typed_status='failed'", "stateful_status='failed'",
+    "validation_status='failed'", "parser_version='old'",
+    "typed_parser_version='old'", "stateful_parser_version='old'",
+])
+def test_initial_timing_refuses_unmeasured_or_incompatible_observations(measured_history, change):
+    campaign, db = measured_history
+    db.execute('UPDATE fbref_control.observation_processing SET ' + change)
+    with pytest.raises(RuntimeError, match='history stays closed'):
+        campaign.page_seconds()
+
+
+@pytest.mark.parametrize('change', [
+    'latency_ms=NULL', 'latency_ms=0', "status='failed'",
+    "target_id='other'", "content_hash='other'", "logical_refresh_id='other'",
+])
+def test_initial_timing_requires_matching_measured_fetch(measured_history, change):
+    campaign, db = measured_history
+    db.execute('UPDATE fbref_control.fetch_attempt SET ' + change)
+    with pytest.raises(RuntimeError, match='history stays closed'):
+        campaign.page_seconds()
+
+
+def test_initial_timing_excludes_ambiguous_successes(measured_history):
+    campaign, db = measured_history
+    db.execute("""INSERT INTO fbref_control.fetch_attempt
+        SELECT logical_refresh_id,target_id,content_hash,status,started_at,latency_ms
+        FROM fbref_control.fetch_attempt WHERE status='succeeded'""")
+    with pytest.raises(RuntimeError, match='history stays closed'):
+        campaign.page_seconds()
+
+
+def test_initial_timing_uses_max_of_latest_100_usable_observations(measured_history):
+    campaign, db = measured_history
+    db.execute('UPDATE fbref_control.observation_processing SET processing_work_ms=999000')
+    for i in range(3, 103):
+        db.execute("""INSERT INTO fbref_control.observation_processing
+            SELECT ?,?,?,status,generic_status,typed_status,stateful_status,
+            validation_status,parser_version,typed_parser_version,stateful_parser_version,
+            started_at,?,30001 FROM fbref_control.observation_processing LIMIT 1""",
+            (str(i), str(i), 'hash', 3000 + i))
+        db.execute("INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?,?,?)",
+                   (str(i), str(i), 'hash', 'succeeded', 500, 200000))
+    assert campaign.page_seconds() == 231
+    db.execute("UPDATE fbref_control.fetch_attempt SET latency_ms=1")
+    db.execute("UPDATE fbref_control.observation_processing SET processing_work_ms=1")
+    assert campaign.page_seconds() == 180
+
+
+def test_history_run_timing_remains_authoritative():
+    from scrapers.fbref.history import HistoryCampaign
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {'seconds': 230001}
+    control = MagicMock()
+    control._transaction.return_value.__enter__.return_value = cursor
+    assert HistoryCampaign(control).page_seconds() == 231
+    assert cursor.execute.call_count == 1

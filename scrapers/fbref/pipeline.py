@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -938,9 +939,11 @@ class _ClaimedMatchObservation:
     match_id: str
     stateful_run_id: str
     stateful_run_type: str
+    processing_work_seconds: Optional[float] = None
 
     def sequential_args(self, *, generic_persisted: bool = False) -> dict:
         return {
+            "processing_work_seconds": self.processing_work_seconds,
             "run_id": self.run_id,
             "html": self.html,
             "record": self.record,
@@ -971,9 +974,11 @@ class _ClaimedGenericObservation:
     stateful_run_id: str
     stateful_run_type: str
     recover_cross_run: bool = False
+    processing_work_seconds: Optional[float] = None
 
     def sequential_args(self, *, generic_persisted: bool = False) -> dict:
         return {
+            "processing_work_seconds": self.processing_work_seconds,
             "run_id": self.run_id,
             "html": self.html,
             "record": self.record,
@@ -6382,9 +6387,11 @@ class FBrefPipeline:
         stateful_run_type: str,
         typed_batch_counts: Optional[Mapping[str, int]] = None,
         progress: Optional[dict[str, int]] = None,
+        processing_work_seconds: Optional[float] = None,
     ) -> _ProcessedObservation:
         """Finish one supplied lease under an already-held frontier verdict."""
 
+        work_started = self.stage_clock()
         typed_page = record.page_kind in {
             "schedule",
             "season",
@@ -6465,6 +6472,14 @@ class FBrefPipeline:
             observation_lease,
             typed_status=typed_status,
             stateful_status=stateful_status,
+            processing_work_ms=(
+                None
+                if processing_work_seconds is None
+                else math.ceil(
+                    (processing_work_seconds + self.stage_clock() - work_started)
+                    * 1000
+                )
+            ),
         )
         return _ProcessedObservation(
             parsed=1,
@@ -6489,9 +6504,11 @@ class FBrefPipeline:
         match_id: Optional[str] = None,
         generic_persisted: bool = False,
         recover_cross_run: bool = False,
+        processing_work_seconds: Optional[float] = None,
     ) -> _ProcessedObservation:
         """Persist and finish an already-claimed observation without I/O."""
 
+        work_started = self.stage_clock()
         prepared_page = page
         try:
             if prepared_page is None:
@@ -6549,6 +6566,11 @@ class FBrefPipeline:
                     stateful_run_id=stateful_run_id,
                     stateful_run_type=stateful_run_type,
                     progress=progress,
+                    processing_work_seconds=(
+                        None
+                        if processing_work_seconds is None
+                        else processing_work_seconds + self.stage_clock() - work_started
+                    ),
                 )
         except Exception as exc:
             return self._failed_claimed_observation(
@@ -6611,7 +6633,9 @@ class FBrefPipeline:
                 cohort_cells = 0
 
         for item in materialized:
+            work_started = self.stage_clock()
             item_cells = self._match_item_cells(item)
+            item = self._add_shared_processing_work([item], work_started)[0]
             if item.page.errors or item.typed_match.has_errors:
                 flush_cohort()
                 outcomes.append(
@@ -6680,7 +6704,9 @@ class FBrefPipeline:
                 cohort_cells = 0
 
         for item in materialized:
+            work_started = self.stage_clock()
             item_cells = self._generic_item_cells(item)
+            item = self._add_shared_processing_work([item], work_started)[0]
             # A page with parser errors writes error evidence instead of rows,
             # which the batch writer rejects outright; oversized pages keep
             # their own write so one page cannot blow the cohort's cell bound.
@@ -6702,9 +6728,25 @@ class FBrefPipeline:
         flush_cohort()
         return outcomes
 
+    def _add_shared_processing_work(self, items, started):
+        """Charge the whole shared operation to each page, never an invented share."""
+        elapsed = self.stage_clock() - started
+        return [
+            replace(
+                item,
+                processing_work_seconds=(
+                    None
+                    if item.processing_work_seconds is None
+                    else item.processing_work_seconds + elapsed
+                ),
+            )
+            for item in items
+        ]
+
     def _persist_and_finish_generic_batch(
         self, items: Sequence[_ClaimedGenericObservation]
     ) -> list[_ProcessedObservation]:
+        work_started = self.stage_clock()
         try:
             generic_counts = self.generic_writer.persist_pages(
                 [
@@ -6722,6 +6764,7 @@ class FBrefPipeline:
                     "Generic batch returned misaligned item counts"
                 )
         except Exception:
+            items = self._add_shared_processing_work(items, work_started)
             # The writer may have committed a prefix. Re-run each page
             # sequentially: same lease, same immutable raw, idempotent write.
             return [
@@ -6729,8 +6772,10 @@ class FBrefPipeline:
                 for item in items
             ]
 
+        items = self._add_shared_processing_work(items, work_started)
         outcomes: list[_ProcessedObservation] = []
         for item in items:
+            work_started = self.stage_clock()
             # The per-page path records these right after its own write; the
             # cohort has to do it here, or the pages it wrote carry no dataset
             # manifests.
@@ -6746,6 +6791,7 @@ class FBrefPipeline:
                     )
                 )
                 continue
+            item = self._add_shared_processing_work([item], work_started)[0]
             outcomes.append(
                 self._process_claimed_observation(
                     **item.sequential_args(generic_persisted=True)
@@ -6756,6 +6802,7 @@ class FBrefPipeline:
     def _persist_and_finish_match_batch(
         self, items: Sequence[_ClaimedMatchObservation]
     ) -> list[_ProcessedObservation]:
+        work_started = self.stage_clock()
         try:
             generic_counts = self.generic_writer.persist_pages(
                 [
@@ -6773,6 +6820,7 @@ class FBrefPipeline:
                     "Generic batch returned misaligned item counts"
                 )
         except Exception:
+            items = self._add_shared_processing_work(items, work_started)
             # The generic writer may have committed a prefix. Re-run each
             # parsed page idempotently, using the same lease and immutable raw.
             return [
@@ -6780,9 +6828,11 @@ class FBrefPipeline:
                 for item in items
             ]
 
+        items = self._add_shared_processing_work(items, work_started)
         outcomes: dict[str, _ProcessedObservation] = {}
         active_items = []
         for item in items:
+            work_started = self.stage_clock()
             try:
                 self._record_generic_table_results(item.record, item.page)
             except Exception as exc:
@@ -6795,11 +6845,14 @@ class FBrefPipeline:
                     )
                 )
             else:
-                active_items.append(item)
+                active_items.extend(
+                    self._add_shared_processing_work([item], work_started)
+                )
         finish_failures: list[
             tuple[_ClaimedMatchObservation, Exception, dict[str, int]]
         ] = []
         lock_errors: list[Exception] = []
+        work_started = self.stage_clock()
         with _captured_exit_stack(lock_errors) as stack:
             # One control transaction for the whole cohort: per-match guards
             # took one Postgres connection each, and 25 of them overran the
@@ -6850,6 +6903,7 @@ class FBrefPipeline:
                 except Exception as exc:
                     batch_error = exc
 
+            active_items = self._add_shared_processing_work(active_items, work_started)
             for item in active_items:
                 verdict = verdicts[item.record.target_id]
                 if verdict is None:
@@ -6890,6 +6944,7 @@ class FBrefPipeline:
                             stateful_run_type=item.stateful_run_type,
                             typed_batch_counts=typed_counts,
                             progress=progress,
+                            processing_work_seconds=item.processing_work_seconds,
                         )
                     )
                 except Exception as exc:
@@ -7493,6 +7548,7 @@ class FBrefPipeline:
             return item_stateful_run_id, item_stateful_run_type
 
         def process_sequential_item(item):
+            work_started = self.stage_clock()
             try:
                 claimed = self._load_and_claim_observation(item)
             except Exception as exc:
@@ -7515,12 +7571,14 @@ class FBrefPipeline:
                 stateful_run_id=item_run_id,
                 stateful_run_type=item_run_type,
                 recover_cross_run=_recover_cross_run,
+                processing_work_seconds=self.stage_clock() - work_started,
             )
             self._merge_processed_result(result, outcome)
 
         def flush_match_items(buffer):
             prepared: list[_ClaimedMatchObservation] = []
             for item in buffer:
+                work_started = self.stage_clock()
                 try:
                     claimed = self._load_and_claim_observation(item)
                 except Exception as exc:
@@ -7556,6 +7614,7 @@ class FBrefPipeline:
                     self._merge_processed_result(result, outcome)
                     continue
                 prepared.append(_ClaimedMatchObservation(
+                    processing_work_seconds=self.stage_clock() - work_started,
                     run_id=run_id,
                     html=html,
                     record=record,
@@ -7573,6 +7632,7 @@ class FBrefPipeline:
         def flush_generic_items(buffer):
             prepared: list[_ClaimedGenericObservation] = []
             for item in buffer:
+                work_started = self.stage_clock()
                 try:
                     claimed = self._load_and_claim_observation(item)
                 except Exception as exc:
@@ -7604,6 +7664,7 @@ class FBrefPipeline:
                     self._merge_processed_result(result, outcome)
                     continue
                 prepared.append(_ClaimedGenericObservation(
+                    processing_work_seconds=self.stage_clock() - work_started,
                     run_id=run_id,
                     html=html,
                     record=record,

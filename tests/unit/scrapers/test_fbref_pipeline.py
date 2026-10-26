@@ -15149,3 +15149,82 @@ def test_1325_live_cycle_continues_after_enrichment_handback(tmp_path):
     assert len(calls) == 3
     assert result.fetch.fetched == 1
     assert result.frontier_closed
+
+
+@pytest.mark.parametrize(
+    "kind,batch",
+    [("generic", False), ("generic", True), ("match", False), ("match", True)],
+)
+@pytest.mark.parametrize("failed_write", [False, True])
+def test_processing_work_excludes_other_pages_and_counts_shared_writes(
+    tmp_path, kind, batch, failed_write
+):
+    if kind == 'match':
+        pipeline, control, _ = _pipeline_with_small_durable_matches(tmp_path)
+        page_kinds = ['match']
+    else:
+        pipeline, control, _ = _pipeline_with_saved_generic_pages(tmp_path, ['9', '12'])
+        page_kinds = ['competition']
+    pipeline.batch_persist_enabled = batch
+    now = [0.0]
+    pipeline.stage_clock = lambda: now[0]
+
+    def timed(target, name, seconds):
+        original = getattr(target, name)
+
+        def call(*args, **kwargs):
+            now[0] += seconds
+            return original(*args, **kwargs)
+
+        setattr(target, name, call)
+
+    timed(pipeline.raw_store, 'load_fetch_html', 2)
+    timed(pipeline, '_parse_generic', 3)
+    timed(pipeline, '_apply_stateful_effects', 13)
+    timed(pipeline, '_record_page_completion', 17)
+    timed(pipeline, '_record_generic_table_results', 1)
+    timed(pipeline, '_match_item_cells' if kind == 'match' else '_generic_item_cells', 4)
+    # Batch doubles call persist_page/match for each item. Charging the whole
+    # call means both pages receive 2 * 7 (and 2 * 11 for typed), never half.
+    timed(pipeline.generic_writer, 'persist_page', 7)
+    if kind == 'match':
+        timed(pipeline, '_parse_typed_match', 5)
+        timed(pipeline.typed_adapter.writer, 'persist_match', 11)
+    if failed_write and batch:
+        original_write = pipeline.generic_writer.persist_pages
+
+        def fail_after_shared_write(items):
+            original_write(items)
+            now[0] += 23
+            raise RuntimeError("shared write interrupted")
+
+        pipeline.generic_writer.persist_pages = fail_after_shared_write
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=page_kinds, settings=_settings()
+    )
+    assert result.parsed == 2
+    expected = 2 + 3 + 1 + 13 + 17 + (14 if batch else 7)
+    if batch:
+        expected += 4
+    if failed_write and batch:
+        expected += 23 + 7
+    if kind == 'match':
+        expected += 5 + (22 if batch and not failed_write else 11)
+    assert [row['processing_work_ms'] for row in control.observations.values()] == [expected * 1000] * 2
+
+
+def test_incomplete_preparation_does_not_publish_processing_measurement(tmp_path):
+    pipeline, control, _ = _pipeline_with_small_durable_matches(tmp_path)
+    original = pipeline._parse_typed_match
+    calls = [0]
+
+    def fail_preparation_once(*args):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ValueError('preparation interrupted')
+        return original(*args)
+
+    pipeline._parse_typed_match = fail_preparation_once
+    result = pipeline.parse_wave(str(uuid.uuid4()), page_kinds=['match'], settings=_settings())
+    assert result.parsed == 2
+    assert next(iter(control.observations.values()))['processing_work_ms'] is None

@@ -923,7 +923,15 @@ MIGRATIONS = (
                 PRIMARY KEY(source,run_id))""",
         ),
     ),
-
+    Migration(
+        version=13,
+        name="observation_processing_work",
+        statements=(
+            """ALTER TABLE fbref_control.observation_processing
+               ADD COLUMN processing_work_ms bigint
+               CHECK (processing_work_ms >= 0)""",
+        ),
+    ),
 )
 
 
