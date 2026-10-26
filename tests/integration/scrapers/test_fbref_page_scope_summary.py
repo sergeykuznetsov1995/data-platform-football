@@ -124,7 +124,7 @@ def assert_equivalent(connection, cursor_class):
                 key = lambda scope: json.dumps(scope, sort_keys=True)
                 assert sorted(row["scopes"], key=key) == sorted(scopes.get(row["target_id"], []), key=key)
             cursor.execute(PAGE_AGES_SQL.replace("{cutoff}", CUTOFF))
-            report_rows = json.loads(cursor.fetchone()["case"])
+            report_rows = json.loads(next(iter(cursor.fetchone().values())))
             assert isinstance(report_rows, list)
             assert "z-future" not in {row["target_id"] for row in report_rows}
             # Compare the final metrics as well, replacing stored ownership/scopes
