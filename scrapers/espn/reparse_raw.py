@@ -113,11 +113,34 @@ def _read_tables(trino, slug, year, event_id):
     }
 
 
+def _loses_json(before, after):
+    """Keep stored substitution facts; list order alone is not a loss."""
+    if isinstance(before, dict):
+        return not isinstance(after, dict) or any(
+            key not in after or _loses_json(value, after[key])
+            for key, value in before.items()
+        )
+    if isinstance(before, list):
+        if not isinstance(after, list):
+            return True
+        remaining = list(after)
+        for value in before:
+            for index, candidate in enumerate(remaining):
+                if not _loses_json(value, candidate):
+                    remaining.pop(index)
+                    break
+            else:
+                return True
+        return False
+    return before != after
+
+
 def _loses_rows(before, after):
     """Check actual Bronze cells, including both event kinds and match facts.
 
     Counts alone miss losses within one team/athlete or event kind. A present
-    value may change, but may not disappear from its natural key.
+    value may change, but may not disappear from its natural key. Opaque
+    substitution facts are retained conservatively, including their values.
     """
     ignored = {"reason", "anomalies", "duplicate_of"}
     for table, old_rows in before.items():
@@ -140,6 +163,9 @@ def _loses_rows(before, after):
                     return True
                 if name == "athlete_ids" and value is not None:
                     if not set(json.loads(value)).issubset(json.loads(new[name])):
+                        return True
+                if name == "substitutions_json" and value is not None:
+                    if _loses_json(json.loads(value), json.loads(new[name])):
                         return True
     return False
 
@@ -269,6 +295,7 @@ def run(
     batch_size=100,
     competition=None,
     code_sha=None,
+    require_complete_editions=False,
 ):
     """Only the injected raw reader and (in write mode) Bronze manager do IO."""
     if batch_size < 1:
@@ -313,6 +340,17 @@ def run(
         candidate = (timestamp, sha, uri)
         if previous is None or candidate > previous:
             versions[sha] = candidate
+    missing = sorted(
+        {
+            (target_rows[cid].slug, year)
+            for cid, year, _ in grouped
+            if cid in target_rows
+            and (competition is None or target_rows[cid].slug == competition)
+            and (cid, year) not in contexts
+        }
+    )
+    if trino is not None and require_complete_editions and missing:
+        raise ValueError(f"incomplete editions snapshot: {missing}")
     report = {
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "editions_sha256": hashlib.sha256(edition_bytes).hexdigest(),
@@ -323,6 +361,18 @@ def run(
         "unique_blobs": len({r[5] for r in rows}),
         "unique_matches": len({key[2] for key in grouped}),
         "mode": "write" if trino is not None else "dry-run",
+        "missing_editions": [
+            {
+                "competition": slug,
+                "season_year": year,
+                "matches": sum(
+                    target_rows[cid].slug == slug and season == year
+                    for cid, season, _ in grouped
+                    if cid in target_rows
+                ),
+            }
+            for slug, year in missing
+        ],
         "matches": [],
         "receipts": [],
     }
@@ -336,8 +386,6 @@ def run(
         owners, retake = duplicate_owners(
             trino, slug, year, [p.schedule.event_id for p, _ in pending]
         )
-        for (other_slug, other_year), ids in sorted(retake.items()):
-            mark_duplicates(trino, f"{slug}:{year}", other_slug, other_year, ids)
         payloads = [
             replace(p, schedule=replace(p.schedule, duplicate_of=owners[eid]))
             if (eid := p.schedule.event_id) in owners
@@ -347,6 +395,10 @@ def run(
         receipt = write_tournament_batch(
             TournamentBatch(*key, payloads), trino=trino
         )
+        # Publish the owner before hiding qualifying rows. A retry also repairs
+        # an interruption between publication and marking the duplicates.
+        for (other_slug, other_year), ids in sorted(retake.items()):
+            mark_duplicates(trino, f"{slug}:{year}", other_slug, other_year, ids)
         report["receipts"].append(asdict(receipt))
         for _, record in pending:
             record["outcome"] = "written"
@@ -452,6 +504,10 @@ def main(argv=None):
     mode.add_argument("--write", action="store_true")
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--competition")
+    parser.add_argument(
+        "--require-complete-editions", action="store_true",
+        help="reject writes if selected manifest seasons are absent from editions",
+    )
     parser.add_argument("--report", type=Path)
     parser.add_argument("--code-sha", help="release commit in containers without .git")
     args = parser.parse_args(argv)
@@ -468,6 +524,7 @@ def main(argv=None):
         batch_size=args.batch_size,
         competition=args.competition,
         code_sha=args.code_sha,
+        require_complete_editions=args.require_complete_editions,
     )
     output = json.dumps(report, ensure_ascii=False, sort_keys=True, default=str)
     if args.report:

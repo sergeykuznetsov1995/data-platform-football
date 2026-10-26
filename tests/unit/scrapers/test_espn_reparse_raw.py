@@ -364,6 +364,7 @@ def test_cli_dry_run_report_and_outside_registry(tmp_path, monkeypatch, capsys):
             "--editions",
             str(editions),
             "--dry-run",
+            "--require-complete-editions",
             "--report",
             str(report_path),
         ]
@@ -429,12 +430,105 @@ def test_missing_edition_remains_in_raw_denominator(tmp_path):
     snapshot["editions"] = []
     editions.write_text(json.dumps(snapshot))
     bronze = Bronze()
-    report = replay.run(manifest, editions, store=store, trino=bronze)
+    report = replay.run(manifest, editions, store=store)
     assert report["matches"][0]["outcome"] == "missing_edition"
     assert report["corpus"]["comparison_matches"] == 1
     assert report["corpus"]["parts"]["lineup"]["raw_share"] == 1
     assert report["corpus"]["parts"]["lineup"]["parsed_share"] == 0
     assert not bronze.calls
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_incomplete_snapshot_write_modes(tmp_path, monkeypatch, strict):
+    _, manifest, editions, store, _ = corpus(tmp_path)
+    # The first match has a context; a later one does not. No partial write.
+    with manifest.open("a") as handle:
+        csv.writer(handle).writerow(
+            ["775:2025", 775, 2025, 999999, "bad", "bad",
+             "2026-08-02 00:00:00", "old", "old"]
+        )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("IO before coverage check")
+
+    bronze = Bronze()
+    if strict:
+        monkeypatch.setattr(store, "load_exact", forbidden)
+        with pytest.raises(ValueError, match="incomplete editions snapshot.*uefa.champions.*2025"):
+            replay.run(
+                manifest, editions, store=store, trino=bronze, batch_size=1,
+                require_complete_editions=True,
+            )
+        assert not bronze.calls
+    else:
+        report = replay.run(
+            manifest, editions, store=store, trino=bronze, batch_size=1,
+        )
+        assert report["missing_editions"] == [
+            {"competition": "uefa.champions", "season_year": 2025, "matches": 1}
+        ]
+        assert report["corpus"]["outcomes"] == {"written": 1, "missing_edition": 1}
+        assert [r["event_id"] for r in bronze.tables[MATCH_TABLE]] == [
+            report["matches"][0]["event_id"]
+        ]
+
+
+@pytest.mark.parametrize("failure", ["publication", "marking"])
+def test_duplicate_owner_recovers_after_interruption(tmp_path, monkeypatch, failure):
+    bronze = Bronze()
+    _, manifest, editions, store, _ = corpus(
+        tmp_path / "qual", ("uefa.champions_qual", 19874)
+    )
+    replay.run(manifest, editions, store=store, trino=bronze)
+    _, manifest, editions, store, _ = corpus(
+        tmp_path / "main", ("uefa.champions", 775)
+    )
+    if failure == "publication":
+        bronze.fail_match = True
+    with monkeypatch.context() as m:
+        if failure == "marking":
+            def interrupted(*args, **kwargs):
+                raise RuntimeError("interrupted marking")
+
+            m.setattr(replay, "mark_duplicates", interrupted)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            replay.run(manifest, editions, store=store, trino=bronze)
+    rows = {r["competition_slug"]: r for r in bronze.tables[MATCH_TABLE]}
+    assert rows["uefa.champions_qual"]["duplicate_of"] is None
+    if failure == "publication":
+        assert "uefa.champions" not in rows
+    else:
+        assert rows["uefa.champions"]["duplicate_of"] is None
+    replay.run(manifest, editions, store=store, trino=bronze)
+    rows = {r["competition_slug"]: r for r in bronze.tables[MATCH_TABLE]}
+    assert rows["uefa.champions"]["duplicate_of"] is None
+    assert rows["uefa.champions_qual"]["duplicate_of"] == "uefa.champions:2026"
+
+
+@pytest.mark.parametrize("loss", ["section", "nested", "list_item"])
+def test_substitution_details_loss_is_rejected(tmp_path, loss):
+    data, manifest, editions, store, add = corpus(tmp_path)
+    player = data["rosters"][0]["roster"][0]
+    player["substitution"] = {"athlete": {"id": "123", "displayName": "Player"}}
+    player["substitutions"] = [{"clock": {"value": 60}}, {"clock": {"value": 80}}]
+    add(data, "2026-08-03 00:00:00")
+    bronze = Bronze()
+    replay.run(manifest, editions, store=store, trino=bronze)
+    if loss == "section":
+        del player["substitution"]
+        del player["substitutions"]
+    elif loss == "nested":
+        del player["substitution"]["athlete"]["displayName"]
+    else:
+        player["substitutions"].pop()
+    add(data, "2026-08-13 00:00:00")
+    before = {table: [dict(row) for row in rows] for table, rows in bronze.tables.items()}
+    calls = len(bronze.calls)
+    result = replay.run(manifest, editions, store=store, trino=bronze)
+    assert result["matches"][0]["outcome"] == "skipped", result
+    assert "actual Bronze cells" in result["matches"][0]["write_error"]
+    assert bronze.tables == before
+    assert len(bronze.calls) == calls
 
 
 def test_raw_presence_survives_malformed_neighbour(tmp_path):
