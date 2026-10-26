@@ -6743,6 +6743,18 @@ class FBrefPipeline:
             for item in items
         ]
 
+    def _process_prepared_observations(self, items, process_batch, *, sample_timing):
+        outcomes = []
+        if sample_timing and len(items) > 1:
+            # Shared writes cannot measure one page's work. Persist one
+            # prepared page alone, retaining its measured preparation work.
+            outcomes.append(
+                self._process_claimed_observation(**items[0].sequential_args())
+            )
+            items = items[1:]
+        outcomes.extend(process_batch(items))
+        return outcomes
+
     def _persist_and_finish_generic_batch(
         self, items: Sequence[_ClaimedGenericObservation]
     ) -> list[_ProcessedObservation]:
@@ -7575,6 +7587,20 @@ class FBrefPipeline:
             )
             self._merge_processed_result(result, outcome)
 
+        timing_sampled = False
+
+        def process_prepared_items(prepared, process_batch):
+            nonlocal timing_sampled
+            outcomes = self._process_prepared_observations(
+                prepared,
+                process_batch,
+                sample_timing=not timing_sampled and self.batch_persist_matches > 1,
+            )
+            if len(prepared) > 1:
+                timing_sampled = True
+            for outcome in outcomes:
+                self._merge_processed_result(result, outcome)
+
         def flush_match_items(buffer):
             prepared: list[_ClaimedMatchObservation] = []
             for item in buffer:
@@ -7626,8 +7652,7 @@ class FBrefPipeline:
                     stateful_run_id=item_run_id,
                     stateful_run_type=item_run_type,
                 ))
-            for outcome in self._process_claimed_match_batch(prepared):
-                self._merge_processed_result(result, outcome)
+            process_prepared_items(prepared, self._process_claimed_match_batch)
 
         def flush_generic_items(buffer):
             prepared: list[_ClaimedGenericObservation] = []
@@ -7674,8 +7699,7 @@ class FBrefPipeline:
                     stateful_run_type=item_run_type,
                     recover_cross_run=_recover_cross_run,
                 ))
-            for outcome in self._process_claimed_generic_batch(prepared):
-                self._merge_processed_result(result, outcome)
+            process_prepared_items(prepared, self._process_claimed_generic_batch)
 
         if not self.batch_persist_enabled:
             for item in fetches:

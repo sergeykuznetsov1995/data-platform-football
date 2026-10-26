@@ -1821,6 +1821,11 @@ def _pipeline_with_saved_matches(tmp_path, match_ids=("0701e218", "a071faa8")):
         fetcher_factory=forbidden_transport,
     )
     pipeline.batch_persist_enabled = True
+    # These fixtures isolate cohort persistence/fencing; sampling is covered
+    # by the parse-wave regression in test_fbref_history_controller.py.
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, records, generic, typed
 
 
@@ -2142,7 +2147,9 @@ class DurableReplayPipeline(FBrefPipeline):
         )
 
 
-def _pipeline_with_small_durable_matches(path):
+def _pipeline_with_small_durable_matches(
+    path, match_ids=("d000000a", "d000000b")
+):
     raw = _raw_store(path)
     control = FakeControl(raw)
     control.registry["9"] = {
@@ -2160,7 +2167,7 @@ def _pipeline_with_small_durable_matches(path):
       <tbody><tr><td data-stat="label">durable</td></tr></tbody>
     </table></body></html>
     """
-    for position, match_id in enumerate(("d000000a", "d000000b")):
+    for position, match_id in enumerate(match_ids):
         target = PageTarget(
             source="fbref",
             page_kind="match",
@@ -2200,6 +2207,9 @@ def _pipeline_with_small_durable_matches(path):
     )
 
     pipeline.batch_persist_enabled = True
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, records
 
 
@@ -4954,6 +4964,9 @@ def _pipeline_with_saved_generic_pages(tmp_path, competition_ids, broken=()):
         fetcher_factory=forbidden_transport,
     )
     pipeline.batch_persist_enabled = True
+    pipeline._process_prepared_observations = (
+        lambda items, process_batch, **_kwargs: process_batch(items)
+    )
     return pipeline, control, generic
 
 

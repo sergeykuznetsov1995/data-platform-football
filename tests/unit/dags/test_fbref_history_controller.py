@@ -232,6 +232,91 @@ def test_initial_timing_measures_page_work_without_batch_queue_or_retry(measured
     assert campaign.page_seconds() == 230
 
 
+@pytest.mark.parametrize('kind', ['generic', 'match'])
+@pytest.mark.parametrize('failed_write', [False, True])
+def test_batch_processing_supplies_individual_history_timing(
+    tmp_path, measured_history, kind, failed_write
+):
+    import uuid
+    from tests.unit.scrapers.test_fbref_pipeline import (
+        _pipeline_with_saved_generic_pages,
+        _pipeline_with_small_durable_matches,
+        _settings,
+    )
+
+    campaign, db = measured_history
+    if kind == 'match':
+        pipeline, control, _ = _pipeline_with_small_durable_matches(
+            tmp_path, match_ids=('d000000a', 'd000000b', 'd000000c')
+        )
+        page_kinds = ['match']
+    else:
+        pipeline, control, _ = _pipeline_with_saved_generic_pages(
+            tmp_path, ['9', '12', '13']
+        )
+        page_kinds = ['competition']
+    # Restore production orchestration, including sampling, around the batch
+    # writer doubles used by the isolated cohort tests.
+    del pipeline._process_prepared_observations
+    now = [0.0]
+    pipeline.stage_clock = lambda: now[0]
+
+    def timed(target, name, seconds):
+        original = getattr(target, name)
+
+        def call(*args, **kwargs):
+            now[0] += seconds
+            return original(*args, **kwargs)
+
+        setattr(target, name, call)
+
+    timed(pipeline.raw_store, 'load_fetch_html', 2)
+    timed(pipeline, '_parse_generic', 3)
+    timed(pipeline, '_apply_stateful_effects', 13)
+    timed(pipeline, '_record_page_completion', 17)
+    timed(pipeline, '_record_generic_table_results', 1)
+    timed(pipeline.generic_writer, 'persist_page', 7)
+    if kind == 'match':
+        timed(pipeline, '_parse_typed_match', 5)
+        timed(pipeline.typed_adapter.writer, 'persist_match', 11)
+    if failed_write:
+        original_write = pipeline.generic_writer.persist_pages
+
+        def fail_shared_write(items):
+            original_write(items)
+            now[0] += 9000
+            raise RuntimeError('shared write interrupted')
+
+        pipeline.generic_writer.persist_pages = fail_shared_write
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=page_kinds, settings=_settings()
+    )
+    assert result.parsed == result.claimed == 3
+    assert not result.failures
+    expected_ms = (43 + (16 if kind == 'match' else 0)) * 1000
+    assert [row['processing_work_ms'] for row in control.observations.values()] == [
+        expected_ms, None, None,
+    ]
+    assert pipeline.generic_writer.batch_sizes == [2]
+
+    # Feed the actual completion arguments into the admission SQL, rather than
+    # inventing processing measurements that the batch path cannot produce.
+    db.execute('DELETE FROM fbref_control.observation_processing')
+    db.execute('DELETE FROM fbref_control.fetch_attempt')
+    for index, (key, row) in enumerate(control.observations.items()):
+        db.execute(
+            'INSERT INTO fbref_control.observation_processing VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (key[0], row['target_id'], row['content_hash'], row['status'],
+             'succeeded', row['typed_status'], row['stateful_status'], 'succeeded',
+             *key[1:], 1000, 10000 + index * 30, row['processing_work_ms']),
+        )
+        db.execute(
+            'INSERT INTO fbref_control.fetch_attempt VALUES (?,?,?,?,?,?)',
+            (key[0], row['target_id'], row['content_hash'], 'succeeded', 500, 200000),
+        )
+    assert campaign.page_seconds() == 200 + expected_ms // 1000
+
+
 @pytest.mark.parametrize('change', [
     'processing_work_ms=NULL', 'processing_work_ms=0', "status='failed'",
     "generic_status='failed'", "typed_status='failed'", "stateful_status='failed'",
