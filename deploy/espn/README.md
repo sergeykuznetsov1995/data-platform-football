@@ -577,11 +577,34 @@ ID/baseline/completed, а новое окно начинается после п
 docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace resume --benchmark-at-boundaries
 ```
 
-Прикладной пример выделенной host-службы (после приёмки кода, не из feature-tree):
+Постоянная host-служба [espn-1510-measure.service](systemd/espn-1510-measure.service)
+восстанавливает контроллер после загрузки хоста. Временный `systemd-run` unit
+после reboot исчезает даже с `Restart=on-failure`. Установка и запуск — лидом
+после разрешения владельца, из принятой копии кода, не из feature-tree.
+Сначала проверить актуальные gate/stop-флаги и отсутствие другого контроллера;
+если прежняя служба ещё работает, остановить её по протоколу ниже.
 
 ```bash
-systemd-run --unit=espn-1510-measure --property=Restart=on-failure --property=RestartSec=15s --property=TimeoutStopSec=infinity /usr/bin/docker exec espn-live-airflow-scheduler-1 python -m scrapers.espn.measure_pace run --benchmark-at-boundaries
+sudo install -m 0644 deploy/espn/systemd/espn-1510-measure.service /etc/systemd/system/espn-1510-measure.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now espn-1510-measure.service
+sudo systemctl is-enabled espn-1510-measure.service
+sudo systemctl status espn-1510-measure.service
 ```
+
+Unit запускается после Docker и повторяет неудачный запуск каждые 15 секунд
+без исчерпания попыток, если контейнер ещё не готов. `ExecStart` использует `run`,
+сохраняющий операторский `measurement.off`, и обязательный пин
+`--expected-ids-sha256 eedc73cf4e3748fd589cd8a9aae0209c87bf5f0a0299628dd69ac40e0e864133`.
+Это SHA256 списка ID принятого eng.1/2015, а не CSV-файла; при несовпадении
+контроллер откажется запускаться. `resume` удаляет stop-флаг и допустим только
+при явном возобновлении оператором. Принятый S1, measurement_id, baseline,
+completed, cursor и benchmarks сохраняются; ступень берётся из текущего gate.
+Новое окно начинается с первого нового наблюдения: при S2 снова нужны ≥86400 с,
+закрытый пересекающийся UTC-день и все прежние гейты. `window_too_short` в начале
+нового окна ожидаем; старое окно не даёт приёмку. После загрузки лид проверяет
+единственность процесса и свежий heartbeat через `status`; `stale=true` сообщает
+об устаревших данных, но само по себе не доказывает отсутствие процесса.
 
 Сначала выполнить модульный stop и дождаться завершения внутри контейнера,
 затем останавливать host-службу. Не добавлять `ExecStop` с постоянным stop-флагом:
