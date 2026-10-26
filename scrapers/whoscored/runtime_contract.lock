@@ -83,7 +83,7 @@
     "scrapers/whoscored/service.py": "4068e8a46ec0a0f7bf7444371ee787fdefb5a11d249d0b8df488fb763b45250b",
     "scrapers/whoscored/source_circuit.py": "a5151da85688c9514d4d7eac55d4ca7200e62fdcabc6fcb10431406e6c37fe24",
     "scrapers/whoscored/stage_feeds.py": "9099865f34517c4e2e626083954f508eafb948768492c206153c1f11f5d0cd66",
-    "scrapers/whoscored/transport.py": "2a7c66d092467f210a03fa0fe7037623839d853edf4d76d7af8dae0492be4a4c",
+    "scrapers/whoscored/transport.py": "9c737393a69857d35999a09ef03e2044ac8cd8a7f3eee276588227bf4da06086",
     "scripts/__init__.py": "8f76198351bb6714cff1dc9e2978806d2e87060ce4b8deeabeac72c391c7a9fc",
     "scripts/fbref_proxy/filter_proxy.py": "815f2a76db55eb012bdb8c25e380f1ed9aac470609bbeb1a1a20bf94b7de58b3",
     "scripts/flaresolverr_extended.py": "6a37011652dbb9e7b7b9edcbac2457b23b7ea2c0fad6d5b913ad3a5b37adc2d5",
