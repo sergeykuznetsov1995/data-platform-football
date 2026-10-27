@@ -393,6 +393,125 @@ def mixed_stage_coverage():
         con.close()
 
 
+def deferred_chunk(tmp_path):
+    kwargs, s, repo, service = setup_chunk(tmp_path)
+    repo.history_coverage.return_value = {(s.scope.competition_id, s.scope.season_id):
+                                         coverage(closed=100, deferred_stages=1)}
+    repo.list_match_candidates.return_value = []
+    repo.latest_stage_feed_snapshot.return_value = {
+        "parser_version": history.PARSER_VERSION, "feed_policy": history.STAGE_XG_FEED_POLICY,
+        "feed_checks": {"1": {"final": True, "checked_at": NOW.isoformat()}},
+        "feed_states": {"1:team:xg-teamstats:summary": "present",
+                        "1:player:xg-stats:summary": "present"},
+    }
+    return kwargs, s, repo, service
+
+
+@pytest.mark.parametrize("confirm_day", [None, 29, 31])
+def test_deferred_refresh_ends_at_thirty_days(tmp_path, monkeypatch, confirm_day):
+    from tests.unit.scrapers import test_whoscored_repository_sql_semantics as sql
+
+    kwargs, s, repo, service = deferred_chunk(tmp_path)
+    start = NOW.replace(tzinfo=None)
+    monkeypatch.setattr(sql, "NOW", start)
+    con = sql._connection()
+    try:
+        con.execute("CREATE TABLE iceberg.bronze.whoscored_scope_ingest_manifest "
+                    "(league VARCHAR, season VARCHAR, state VARCHAR, entity_counts_json VARCHAR)")
+        con.execute("INSERT INTO iceberg.bronze.whoscored_scope_ingest_manifest VALUES "
+                    "(?, ?, 'success', '{\"whoscored_schedule\":2}')", [sql.LEAGUE, sql.SEASON])
+        sql._game(con, 1, 1, 40)
+        sql._attempt(con, 1, "success", 1)
+        sql._game(con, 2, 1, 28, lineup=False)
+        real_repo = sql._history_repository(con)
+        key = (s.scope.competition_id, s.scope.season_id)
+        repo.history_coverage.side_effect = lambda: {
+            key: real_repo.history_coverage()[(sql.LEAGUE, sql.SEASON)]}
+        repo.list_match_candidates.side_effect = lambda *a, **k: real_repo.list_match_candidates(
+            sql.LEAGUE, sql.SEASON, **k)
+        for age in (28, 29, 30, 31):
+            moment = NOW + timedelta(days=age - 28)
+            monkeypatch.setattr(sql, "NOW", moment.replace(tzinfo=None))
+            kwargs["now"] = moment
+            kwargs["checkpoint"] = state.HistoryState(kwargs["checkpoint"].path)
+            if age == confirm_day:
+                con.execute("UPDATE iceberg.bronze.whoscored_schedule_current "
+                            "SET is_lineup_confirmed=TRUE WHERE game_id=2")
+            row = repo.history_coverage()[key]
+            confirmed = confirm_day is not None and age >= confirm_day
+            assert row["closeable"] == 1 + int(confirmed)
+            assert row["closed"] == 1
+            assert row["unknown_stages"] == 0
+            history.run_chunk(**kwargs)
+            if confirmed:
+                service.sync_matches.assert_called_once_with(limit=25, lane="history")
+                break
+            assert service.sync_schedule.call_count == min(age - 27, 2)
+            assert row["deferred_stages"] == int(age < 30)
+        if confirm_day is None:
+            service.sync_matches.assert_not_called()
+    finally:
+        con.close()
+
+
+def test_failed_probe_does_not_spend_daily_refresh(tmp_path):
+    kwargs, s, repo, service = deferred_chunk(tmp_path)
+    service.probe_egress.side_effect = RuntimeError("probe failed")
+    with pytest.raises(RuntimeError, match="probe failed"):
+        history.run_chunk(**kwargs)
+    with kwargs["checkpoint"]._connect() as con:
+        assert con.execute("SELECT schedule_next_at FROM scopes").fetchone() == (0,)
+    service.sync_schedule.assert_not_called()
+    kwargs["checkpoint"] = state.HistoryState(kwargs["checkpoint"].path)
+    kwargs["now"] = NOW + timedelta(seconds=state.COOLDOWN_SECONDS + 1)
+    service.probe_egress.side_effect = None
+    history.run_chunk(**kwargs)
+    service.sync_schedule.assert_called_once_with()
+
+
+@pytest.mark.parametrize("delay, expired", [(120, False), (state.LEASE_SECONDS, True)])
+def test_deferred_reservation_uses_clock_after_probe(tmp_path, delay, expired):
+    kwargs, s, repo, service = deferred_chunk(tmp_path)
+    current = NOW
+    kwargs["now"] = lambda: current
+
+    def probe():
+        nonlocal current
+        current += timedelta(seconds=delay)
+
+    service.probe_egress.side_effect = probe
+    if expired:
+        with pytest.raises(RuntimeError, match="lease was lost"):
+            history.run_chunk(**kwargs)
+        service.sync_schedule.assert_not_called()
+    else:
+        history.run_chunk(**kwargs)
+        service.sync_schedule.assert_called_once_with()
+    with kwargs["checkpoint"]._connect() as con:
+        deadline = con.execute("SELECT schedule_next_at FROM scopes").fetchone()[0]
+    assert deadline == (0 if expired else current.timestamp() + state.DEFERRED_REFRESH_SECONDS)
+    if not expired:
+        current += timedelta(seconds=state.COOLDOWN_SECONDS + 1)
+        assert history.run_chunk(**kwargs)["reason"] == "idle"
+        service.probe_egress.assert_called_once_with()
+
+
+def test_deferred_due_check_uses_clock_after_inventory(tmp_path):
+    kwargs, s, repo, service = deferred_chunk(tmp_path)
+    history.run_chunk(**kwargs)
+    current = NOW + timedelta(seconds=state.DEFERRED_REFRESH_SECONDS - 1)
+    kwargs["now"] = lambda: current
+
+    def candidates(*args, **kw):
+        nonlocal current
+        current += timedelta(seconds=2)
+        return []
+
+    repo.list_match_candidates.side_effect = candidates
+    history.run_chunk(**kwargs)
+    assert service.sync_schedule.call_count == 2
+
+
 @pytest.mark.parametrize("failed", [False, True])
 def test_mixed_stage_refresh_survives_restart_and_failure(tmp_path, failed):
     kwargs, s, repo, service = setup_chunk(tmp_path)

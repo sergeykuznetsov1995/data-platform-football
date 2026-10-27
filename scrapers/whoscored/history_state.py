@@ -127,8 +127,18 @@ class HistoryState:
                 return scope, token
         return None
 
+    def deferred_refresh_due(self, key: str, token: str, *, now: float) -> bool:
+        """Check the cooldown without spending an attempt before the egress probe."""
+        with self._connect() as con:
+            row = con.execute("SELECT schedule_next_at FROM scopes "
+                              "WHERE scope=? AND token=? AND lease_until>?",
+                              (key, token, now)).fetchone()
+            if row is None:
+                raise RuntimeError("history scope lease was lost")
+            return row[0] <= now
+
     def reserve_deferred_refresh(self, key: str, token: str, *, now: float) -> bool:
-        """Persist the attempt before source calls, even if the worker crashes."""
+        """Persist the attempt before schedule sync, even if the worker crashes."""
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT schedule_next_at FROM scopes "

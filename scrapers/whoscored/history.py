@@ -61,7 +61,8 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
         return {"reason": "disabled", "attempted": 0}
     if current_running():
         return {"reason": "current_running", "attempted": 0}
-    moment = now or datetime.now(timezone.utc)
+    clock = now if callable(now) else lambda: now or datetime.now(timezone.utc)
+    moment = clock()
     scopes = inventory(catalog, repository, today=moment.date())
     gate = state.first_wave_ready(scopes)
     second = [s["coverage"] for s in scopes if s["wave"] == 2]
@@ -70,7 +71,7 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
     eligible = [s for s in scopes if s["wave"] == 1 or
                 (gate and (s["wave"] == 2 or second_ready))]
     while eligible:
-        reservation = checkpoint.reserve(eligible, now=moment.timestamp())
+        reservation = checkpoint.reserve(eligible, now=clock().timestamp())
         if reservation is None:
             break
         item, token = reservation
@@ -99,8 +100,8 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
                 feeds_due = ended and not final_feeds(repository, season, moment=moment)
             refresh_deferred = (not schedule_due and not (matches or players or previews or feeds_due)
                                 and item["coverage"].get("deferred_stages", 0) > 0
-                                and checkpoint.reserve_deferred_refresh(
-                                    item["key"], token, now=moment.timestamp(),
+                                and checkpoint.deferred_refresh_due(
+                                    item["key"], token, now=clock().timestamp(),
                                 ))
             schedule_due = schedule_due or refresh_deferred
             if not (schedule_due or matches or players or previews or feeds_due):
@@ -109,6 +110,10 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
             with service_cls(season, catalog=catalog, repository=repository) as service:
                 try:
                     service.probe_egress()
+                    if refresh_deferred and not checkpoint.reserve_deferred_refresh(
+                            item["key"], token, now=clock().timestamp()):
+                        failed = False
+                        continue
                     if schedule_due:
                         consume(service.sync_schedule())
                         did_work = True
@@ -150,10 +155,10 @@ def run_chunk(*, catalog, repository, checkpoint, service_cls, enabled,
             failed = False
             return {"scope": item["key"], "wave": item["wave"], "attempted": attempted,
                     "did_work": did_work, "duration_seconds": time.monotonic() - started,
-                    "pace": state.pace(refreshed, parked=checkpoint.parked(now=moment.timestamp()))}
+                    "pace": state.pace(refreshed, parked=checkpoint.parked(now=clock().timestamp()))}
         finally:
             checkpoint.release(item["key"], token,
-                               now=moment.timestamp() + time.monotonic() - started,
+                               now=clock().timestamp(),
                                failed=failed, idle=not did_work or refresh_deferred, duration=time.monotonic() - started)
     return {"reason": "idle", "attempted": 0,
-            "pace": state.pace(scopes, parked=checkpoint.parked(now=moment.timestamp()))}
+            "pace": state.pace(scopes, parked=checkpoint.parked(now=clock().timestamp()))}
