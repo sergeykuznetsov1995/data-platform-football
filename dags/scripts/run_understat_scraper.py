@@ -347,7 +347,6 @@ def run_scope(
     from scrapers.understat import UnderstatScraper
     from scrapers.understat.catalog import (
         LEAGUE_BY_CANONICAL,
-        current_source_season_id,
         season_slug,
     )
     from scrapers.understat.manifest import (
@@ -668,10 +667,9 @@ def run_scope(
             report = validate_understat_scope(
                 frames,
                 scope=scope,
-                active=(
-                    args.mode == "current"
-                    and args.source_season_id >= current_source_season_id()
-                ),
+                # A current season can continue across July; the catalog
+                # routes closed scopes through closed_check.
+                active=args.mode == "current",
                 previous_row_counts=previous_counts,
                 previous_quality=previous.quality if previous is not None else {},
                 observed_at=datetime.fromisoformat(started_at),
@@ -684,6 +682,9 @@ def run_scope(
                     probe_request_count, _scraper_request_count(scraper)
                 ),
             )
+            note_quality = getattr(scraper, "note_quality", None)
+            if callable(note_quality) and not report.passed:
+                note_quality(args.league, args.source_season_id, report)
             proposed_attempt = build_scope_attempt(
                 report,
                 batch_id=batch_id,
@@ -723,6 +724,11 @@ def run_scope(
                 entities_to_write = ()
 
             if entities_to_write:
+                # A previous successful publication cannot certify this write.
+                # Clear readiness before even the IN_PROGRESS marker can persist.
+                if callable(note_quality):
+                    note_quality(args.league, args.source_season_id, report,
+                                 publication_ready=False)
                 # Fence the exact scope before the first non-transactional
                 # table replacement. If the worker is killed mid-loop, this
                 # marker remains the latest attempt and every native consumer
@@ -788,6 +794,11 @@ def run_scope(
         # completion (including the physical fence), not DQ completion.
         proposed_attempt = replace(proposed_attempt, completed_at=utc_now_iso())
         repository.append_attempt(proposed_attempt)
+        confirm_cache = getattr(active_scraper, "confirm_cache", None)
+        if report.status is ManifestStatus.COMPLETE and callable(confirm_cache):
+            confirm_cache()
+        if callable(note_quality):
+            note_quality(args.league, args.source_season_id, report)
         if args.mode == "backfill" and report.status is not ManifestStatus.COMPLETE:
             message = (
                 "closed history scope did not publish completely: "

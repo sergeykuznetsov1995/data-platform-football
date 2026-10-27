@@ -51,7 +51,7 @@ def _scope(
         league=league,
         season=season,
         source_season_id=source_id,
-        is_closed=True,
+        is_closed=source_id < 2026,
         discovered=discovered,
     )
 
