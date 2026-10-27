@@ -362,7 +362,10 @@ def test_monotonic_master_must_descend_from_accepted(env):
     ("scrapers/espn/helper.py", True),            # относительный импорт из wave
     ("scrapers/base/trino_manager.py", True),     # общий модуль в замыкании
     ("configs/espn/denominator.tsv", True),
-    ("deploy/espn/README.md", True),
+    ("deploy/espn/README.md", False),
+    ("deploy/espn/systemd/espn-1510-measure.service", False),
+    ("deploy/espn/systemd/nested/measure.conf", False),
+    ("tests/unit/deploy/test_espn_auto_deliver.py", False),
 ])
 def test_path_filter(env, rel, delivered):
     repo, paths, world, host, base = env
@@ -370,7 +373,43 @@ def test_path_filter(env, rel, delivered):
     sha = repo.commit({rel: "# changed\nX = 2\n"}, "touch")
     assert ad.main([], host=host) == 0
     assert (state(paths, "accepted") == sha) is delivered
+    if not delivered:
+        assert state(paths, "accepted") == base
     assert bool(up_calls(world)) is delivered
+
+
+def test_runtime_changes_accumulate_after_skipped_commits(env):
+    repo, paths, world, host, base = env
+    seed(env)
+    for rel in ("deploy/espn/README.md", "deploy/espn/systemd/espn-1510-measure.service",
+                "tests/unit/deploy/test_espn_auto_deliver.py"):
+        repo.commit({rel: "# changed\n"}, "non-runtime")
+        assert ad.main([], host=host) == 0
+        assert state(paths, "accepted") == base
+        assert up_calls(world) == []
+    world.running = 1
+    repo.commit({"scrapers/espn/helper.py": "def go():\n    return 2\n"}, "runtime")
+    assert ad.main([], host=host) == 0   # ждём завершения волны
+    assert state(paths, "accepted") == base
+    assert up_calls(world) == []
+    sha = repo.commit({"deploy/espn/README.md": "# updated again\n"}, "docs")
+    world.running = 0
+    assert ad.main([], host=host) == 0   # diff от accepted всё ещё содержит runtime
+    assert state(paths, "accepted") == sha
+    assert state(paths, "accepted-prev") == base
+    assert len(up_calls(world)) == 1
+    assert (world.root / "scrapers/espn/helper.py").read_text() == "def go():\n    return 2\n"
+
+
+def test_mixed_runtime_and_host_changes_are_delivered(env):
+    repo, paths, world, host, base = env
+    seed(env)
+    sha = repo.commit({"deploy/espn/README.md": "# changed\n",
+                       "deploy/espn/systemd/espn-1510-measure.service": "# changed\n",
+                       "scrapers/espn/helper.py": "def go():\n    return 2\n"}, "mixed")
+    assert ad.main([], host=host) == 0
+    assert state(paths, "accepted") == sha
+    assert len(up_calls(world)) == 1
 
 
 def test_import_closure_follows_relative_and_lazy_imports():
@@ -390,6 +429,9 @@ def test_rejected_sha_and_same_contour_are_not_retried(env):
     assert ad.main([], host=host) == 0                      # тот же master — не повторяем
     repo.commit({"scrapers/other/x.py": "X = 5\n"}, "unrelated")
     assert ad.main([], host=host) == 0                      # контур = отклонённому — не повторяем
+    repo.commit({"deploy/espn/README.md": "# changed\n",
+                 "deploy/espn/systemd/espn-1510-measure.service": "# changed\n"}, "host docs")
+    assert ad.main([], host=host) == 0                      # host-правки не исправляют контур
     assert len(world.compose_calls) == calls
     fix = repo.commit({"deploy/espn/dags/dag_espn_current.py": DAG_OK + "# fixed\n"}, "fix")
     assert ad.main([], host=host) == 0
