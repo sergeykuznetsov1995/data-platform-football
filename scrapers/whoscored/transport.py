@@ -625,17 +625,20 @@ def _is_proxy_failure(exc: BaseException) -> bool:
     return bool(_PROXY_FAILURE_TEXT.search(str(exc)))
 
 
-def _is_tls_connect_failure(exc: Optional[BaseException]) -> bool:
-    """Recognise curl35, separately from CONNECT/proxy and certificate errors."""
+def _is_tls_connect_failure(
+    exc: Optional[BaseException], *, pooled: bool = False
+) -> bool:
+    """Recognise curl35 and, for pooled recovery only, certificate curl60."""
     if exc is None:
         return False
     code = getattr(exc, "code", None)
     if code is not None:
         try:
-            return int(code) == 35
+            return int(code) in ({35, 60} if pooled else {35})
         except (TypeError, ValueError):
             return False
-    return bool(re.search(r"curl: \(35\)", str(exc)))
+    pattern = r"curl: \((?:35|60)\)" if pooled else r"curl: \(35\)"
+    return bool(re.search(pattern, str(exc)))
 
 
 def _is_schedule_month_url(url: str) -> bool:
@@ -3310,7 +3313,7 @@ class WhoScoredTransport:
                 authorization = bool(re.search(r"\b407\b", str(exc)))
                 transient = (
                     _is_proxy_failure(exc)
-                    or _is_tls_connect_failure(exc)
+                    or _is_tls_connect_failure(exc, pooled=True)
                     # curl_cffi Timeout is an OSError, not built-in TimeoutError.
                     # Code 28 is transient here; source timeouts keep their policy.
                     or getattr(exc, "code", None) == 28
@@ -3675,7 +3678,9 @@ class WhoScoredTransport:
                     if not retryable_direct or attempt + 1 >= self.direct_http_attempts:
                         raise
                     if (
-                        _is_tls_connect_failure(exc.__cause__)
+                        _is_tls_connect_failure(
+                            exc.__cause__, pooled=self._is_pool_session(self._direct_http)
+                        )
                         and _is_schedule_month_url(url)
                     ):
                         self._renew_schedule_http_session(url)
@@ -4436,8 +4441,10 @@ class WhoScoredTransport:
                 raw = session.get(url, **request_kwargs)
             except Exception as exc:
                 if not (
-                    pooled and (_is_proxy_failure(exc) or _is_tls_connect_failure(exc))
-                ) or (attempt and _is_tls_connect_failure(exc)):
+                    pooled and (
+                        _is_proxy_failure(exc) or _is_tls_connect_failure(exc, pooled=True)
+                    )
+                ) or (attempt and _is_tls_connect_failure(exc, pooled=pooled)):
                     try:
                         self._raise_http_request_failure(url, route=route, exc=exc)
                     except WhoScoredTransportError as failure:

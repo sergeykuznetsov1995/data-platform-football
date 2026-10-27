@@ -2271,12 +2271,12 @@ def test_proxy_unavailable_in_discover_is_source_unavailable(monkeypatch, tmp_pa
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("initial_failure", ["tls", "http502"])
-@pytest.mark.parametrize("replay_failure", ["tls", "http502", "timeout", "http500", "http503"])
+@pytest.mark.parametrize("initial_failure", ["tls", "certificate", "http502"])
+@pytest.mark.parametrize("replay_failure", ["tls", "certificate", "http502", "timeout", "http500", "http503"])
 def test_source_replay_failure_continues_next_scope(
     monkeypatch, tmp_path, initial_failure, replay_failure
 ):
-    from curl_cffi.requests.exceptions import SSLError
+    from curl_cffi.requests.exceptions import CertificateVerifyError, SSLError
     from scrapers.whoscored.transport import (
         EGRESS_PROBE_URL, TransportContext, WhoScoredTransport,
     )
@@ -2288,9 +2288,11 @@ def test_source_replay_failure_continues_next_scope(
     proxies = []
     failures = [
         SSLError("curl: (35) TLS connect error", code=35)
-        if initial_failure == "tls" else 502,
+        if initial_failure == "tls" else CertificateVerifyError("curl: (60) certificate verify failed", code=60)
+        if initial_failure == "certificate" else 502,
         SSLError("curl: (35) TLS connect error", code=35)
-        if replay_failure == "tls" else RuntimeError("curl: (28) timed out")
+        if replay_failure == "tls" else CertificateVerifyError("curl: (60) certificate verify failed", code=60)
+        if replay_failure == "certificate" else RuntimeError("curl: (28) timed out")
         if replay_failure == "timeout" else int(replay_failure[4:]),
         200,
     ]

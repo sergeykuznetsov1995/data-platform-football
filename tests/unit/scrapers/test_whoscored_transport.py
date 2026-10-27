@@ -5180,16 +5180,17 @@ def test_non_proxy_curl_failure_keeps_retryable_timeout_without_swap(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failure", ["tls", "http502"])
+@pytest.mark.parametrize("failure", ["tls", "certificate", "http502"])
 @pytest.mark.parametrize("http_attempts", [1, 3])
 def test_schedule_pool_failure_probes_replacement_before_single_replay(
     monkeypatch, tmp_path, failure, http_attempts
 ):
-    from curl_cffi.requests.exceptions import SSLError
+    from curl_cffi.requests.exceptions import CertificateVerifyError, SSLError
 
     first = FakeHTTPSession(
         SSLError("curl: (35) TLS connect error", code=35)
-        if failure == "tls" else FakeHTTPResponse(status_code=502)
+        if failure == "tls" else CertificateVerifyError("curl: (60) certificate verify failed", code=60)
+        if failure == "certificate" else FakeHTTPResponse(status_code=502)
     )
     second = FakeHTTPSession(FakeHTTPResponse(), FakeHTTPResponse(content=b'{"tournaments":[]}'))
     transport, seen = _pool_transport(
@@ -5215,15 +5216,16 @@ def test_schedule_pool_failure_probes_replacement_before_single_replay(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failure", ["tls", "http502", "timeout", "http500", "http503"])
+@pytest.mark.parametrize("failure", ["tls", "certificate", "http502", "timeout", "http500", "http503"])
 def test_schedule_pool_replay_failure_never_requests_source_a_third_time(
     monkeypatch, tmp_path, failure
 ):
-    from curl_cffi.requests.exceptions import SSLError
+    from curl_cffi.requests.exceptions import CertificateVerifyError, SSLError
 
     def failed():
         return (SSLError("curl: (35) TLS connect error", code=35)
-                if failure == "tls" else FakeHTTPResponse(status_code=502))
+                if failure == "tls" else CertificateVerifyError("curl: (60) certificate verify failed", code=60)
+                if failure == "certificate" else FakeHTTPResponse(status_code=502))
 
     first = FakeHTTPSession(failed())
     replay_failure = {
@@ -5240,7 +5242,7 @@ def test_schedule_pool_replay_failure_never_requests_source_a_third_time(
             before_network=lambda: tokens.append(1),
         )
     assert caught.value.kind is (
-        FailureKind.TIMEOUT if failure in {"tls", "timeout"} else FailureKind.HTTP_STATUS
+        FailureKind.TIMEOUT if failure in {"tls", "certificate", "timeout"} else FailureKind.HTTP_STATUS
     )
     assert caught.value.retryable is False
     assert len(seen) == 2 and seen[0] != seen[1]
@@ -5250,7 +5252,7 @@ def test_schedule_pool_replay_failure_never_requests_source_a_third_time(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("code", [28, 60])
+@pytest.mark.parametrize("code", [28])
 def test_schedule_other_curl_errors_do_not_renew_session(monkeypatch, tmp_path, code):
     from curl_cffi.requests.exceptions import RequestException
 
@@ -5265,6 +5267,25 @@ def test_schedule_other_curl_errors_do_not_renew_session(monkeypatch, tmp_path, 
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("code", [35, 60])
+def test_tls_failure_without_pool_keeps_error_policy(code):
+    from curl_cffi.requests.exceptions import CertificateVerifyError, SSLError
+
+    error_type = SSLError if code == 35 else CertificateVerifyError
+    session = FakeHTTPSession(error_type(f"curl: ({code}) TLS error", code=code))
+    transport, seen = _transport(session, http_attempts=1)
+
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch("https://www.whoscored.com/tournaments/25590/data/?d=202610")
+
+    assert caught.value.kind is FailureKind.TIMEOUT
+    assert caught.value.retryable is True
+    assert len(session.calls) == 1
+    assert not session.closed
+    assert seen == []
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("url", [
     "https://www.whoscored.com/Matches/1/Live",
     "https://www.whoscored.com/tournaments/25590/data/",
@@ -5276,10 +5297,11 @@ def test_schedule_other_curl_errors_do_not_renew_session(monkeypatch, tmp_path, 
     "https://www.whoscored.com:443/tournaments/25590/data/?d=202610",
     "https://www.whoscored.com/tournaments/25590/data/?d=202610#fragment",
 ])
-def test_pool_tls_error_recovers_for_other_urls(monkeypatch, tmp_path, url):
+@pytest.mark.parametrize("code", [35, 60])
+def test_pool_tls_error_recovers_for_other_urls(monkeypatch, tmp_path, url, code):
     from curl_cffi.requests.exceptions import SSLError
 
-    first = FakeHTTPSession(SSLError("curl: (35) TLS connect error", code=35))
+    first = FakeHTTPSession(SSLError(f"curl: ({code}) TLS error", code=code))
     second = FakeHTTPSession(FakeHTTPResponse(), FakeHTTPResponse())
     transport, seen = _pool_transport(monkeypatch, tmp_path, first, second, http_attempts=3)
     transport.fetch(url)
@@ -5373,8 +5395,9 @@ def _ordered_pool_transport(monkeypatch, tmp_path, sessions, *, choices=None):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("failures", [0, 1, 2, 3, 9])
-def test_egress_recovery_reaches_first_healthy_member(monkeypatch, tmp_path, failures):
-    sessions = [FakeHTTPSession(PROXY_502) for _ in range(failures)]
+@pytest.mark.parametrize("error", [PROXY_502, RuntimeError("curl: (60) certificate verify failed")])
+def test_egress_recovery_reaches_first_healthy_member(monkeypatch, tmp_path, failures, error):
+    sessions = [FakeHTTPSession(error) for _ in range(failures)]
     sessions.append(FakeHTTPSession(FakeHTTPResponse()))
     transport, seen, urls = _ordered_pool_transport(monkeypatch, tmp_path, sessions)
     permit = object()
@@ -5573,18 +5596,19 @@ def test_late_407_never_restarts_extended_egress_budget(monkeypatch, tmp_path, a
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failure", ["tls", "http502"])
+@pytest.mark.parametrize("failure", ["tls", "certificate", "http502"])
 def test_pool_recovery_preserves_single_half_open_source_probe(monkeypatch, tmp_path, failure):
     first = FakeHTTPSession(
         RuntimeError("curl: (35) TLS connect error")
-        if failure == "tls" else FakeHTTPResponse(status_code=502)
+        if failure == "tls" else RuntimeError("curl: (60) certificate verify failed")
+        if failure == "certificate" else FakeHTTPResponse(status_code=502)
     )
     transport, seen = _pool_transport(monkeypatch, tmp_path, first, http_attempts=3)
     circuit = FakeSourceCircuit(probe=True)
     transport._source_circuit = circuit
     with pytest.raises(WhoScoredTransportError) as caught:
         transport.fetch(TEAM_STATS_URL)
-    assert caught.value.kind is (FailureKind.TIMEOUT if failure == "tls" else FailureKind.HTTP_STATUS)
+    assert caught.value.kind is (FailureKind.TIMEOUT if failure in {"tls", "certificate"} else FailureKind.HTTP_STATUS)
     assert len(seen) == 1
     assert len(first.calls) == 1
     assert circuit.calls == [("admit", False), ("inconclusive", True)]
