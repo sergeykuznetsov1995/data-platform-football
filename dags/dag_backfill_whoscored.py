@@ -1,18 +1,4 @@
-"""Source-native WhoScored history backfill DAG.
-
-Manual, self-draining backfill of every men's competition WhoScored exposes.
-One isolated runner freezes a durable plan (kept in the on-VM ops store) over
-the full-history catalog and drains it in bounded chunks: each continuous run
-processes up to ``max_work_items`` schedule/match/roster/profile work items and
-resumes the same ``queue_id`` until the plan is complete.
-
-Traffic egresses through the residential proxy pool (``WHOSCORED_PROXY_FILE``);
-data lands on the VM only — Bronze Iceberg via Trino plus raw blobs in
-SeaweedFS.  No paid gateway, approval, pointer or off-host backup.
-
-Manual trigger only until #1480 (``schedule=None``); paused on creation.  Daily
-current data is a separate DAG (``dag_ingest_whoscored``).
-"""
+"""Continuous journal-led WhoScored history; activation requires owner approval."""
 
 import json
 import logging
@@ -23,7 +9,6 @@ from typing import Any
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
-from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.sensors.python import PythonSensor
@@ -35,14 +20,12 @@ logger = logging.getLogger(__name__)
 
 DAG_ID = "dag_backfill_whoscored"
 RUNNER = "dags/scripts/run_whoscored_scraper.py"
-QUEUE_ID = "whoscored-history"
 RESULT_PATH = "/tmp/whoscored_backfill_{{ ts_nodash }}.json"
 # Tree the Bash task runs from; the isolated WhoScored stack mounts it outside
 # /opt/airflow and sets WHOSCORED_RUNTIME_ROOT.
 RUNTIME_ROOT = os.environ.get("WHOSCORED_RUNTIME_ROOT", "/opt/airflow")
 
-# Cooldown between continuous runs: short while draining, long once the plan is
-# empty so an idle DAG does not hot-spin the shared scheduler.
+# Cooldown between continuous runs: short while draining, long while idle.
 ACTIVE_COOLDOWN = timedelta(seconds=30)
 IDLE_COOLDOWN = timedelta(minutes=15)
 
@@ -63,15 +46,20 @@ def finalize_chunk(**context: Any) -> None:
     try:
         with Path(result_path).open("r", encoding="utf-8") as handle:
             report = json.load(handle)
-    except (OSError, ValueError):
-        report = {}
-    rows = int(report.get("rows") or 0)
-    status = report.get("status")
-    did_work = rows > 0
-    logger.info(
-        "WhoScored backfill chunk: status=%s rows=%d queue=%s",
-        status, rows, QUEUE_ID,
-    )
+    except (OSError, ValueError) as exc:
+        raise AirflowException("history report is missing or invalid") from exc
+    if (not isinstance(report, dict) or report.get("schema_version") != 3
+            or report.get("command") != "history" or report.get("status") != "success"
+            or report.get("errors") != [] or not isinstance(report.get("history"), dict)):
+        raise AirflowException("history chunk report failed validation")
+    task = context["dag_run"].get_task_instance("run_backfill_chunk")
+    if task is None or task.state != "success":
+        raise AirflowException("history chunk process failed")
+    attempted = report["history"].get("attempted")
+    if type(attempted) is not int or not 0 <= attempted <= 25:
+        raise AirflowException("history chunk exceeds match limit")
+    did_work = report["history"].get("did_work", attempted > 0) is True
+    logger.info("WhoScored history chunk: %s", report["history"])
     now = datetime.now(timezone.utc)
     target = now + (ACTIVE_COOLDOWN if did_work else IDLE_COOLDOWN)
     context["ti"].xcom_push(key="next_poll_at", value=target.isoformat())
@@ -91,33 +79,30 @@ def _poll_ready(**context: Any) -> bool:
 with DAG(
     dag_id=DAG_ID,
     default_args=SCRAPER_ARGS,
-    # Manual only until the history campaign is re-planned (#1480).
-    schedule=None,
+    schedule="@continuous",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
     is_paused_upon_creation=True,
     tags=DAG_TAGS.get("whoscored"),
-    params={
-        "max_work_items": Param(100, type="integer", minimum=1, maximum=100),
-    },
 ) as dag:
     run_chunk = BashOperator(
         task_id="run_backfill_chunk",
         bash_command=(
             "cd {root} && rm -f {result} && "
-            "python {runner} backfill "
-            "--all-catalog "
-            "--as-of-date {{{{ ds }}}} "
-            "--queue-id {queue} "
-            "--max-work-items {{{{ params.max_work_items }}}} "
+            "python {runner} history "
+            "--split-lanes {{{{ var.value.get('whoscored_history_enabled', 'false') | lower }}}} "
             "--transport-policy direct_only "
             "--output {result}"
         ).format(
-            root=RUNTIME_ROOT, runner=RUNNER, queue=QUEUE_ID, result=RESULT_PATH
+            root=RUNTIME_ROOT, runner=RUNNER, result=RESULT_PATH
         ),
         env=_TASK_ENV,
         append_env=True,
+        # Schedule/feed collection can outlast the 25-match portion. Record
+        # duration_seconds in every report to tune this bound after activation.
+        execution_timeout=timedelta(hours=8),
+        retries=0,
     )
 
     finalize = PythonOperator(

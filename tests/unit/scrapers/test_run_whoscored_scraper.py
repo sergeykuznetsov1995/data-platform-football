@@ -2396,3 +2396,37 @@ def test_real_egress_recovery_controls_remaining_scopes(monkeypatch, tmp_path, h
         assert len(service_cls.instances) == 1
         assert [proxy for proxy, _ in calls] == urls
         assert service_cls.instances[0].calls == []
+
+
+def test_history_disabled_keeps_runtime_preflight_but_no_repository(monkeypatch, tmp_path):
+    rc, report, service, catalog = _run(monkeypatch, tmp_path, ["history", "--transport-policy", "direct_only"])
+    assert rc == 0
+    assert report["status"] == "success"
+    assert report["history"] == {"reason": "disabled", "attempted": 0}
+
+
+
+def test_history_result_error_is_red_and_keeps_runtime_path(monkeypatch, tmp_path):
+    from scrapers.whoscored import history, history_state
+    monkeypatch.setattr(history_state, "HistoryState", lambda path: object())
+
+    def chunk(**kwargs):
+        kwargs["consume"](_result("matches", scope="ENG-Premier League=2526", errors=["bad chunk"]))
+
+    monkeypatch.setattr(history, "run_chunk", chunk)
+    rc, report, _, _ = _run(monkeypatch, tmp_path,
+                           ["history", "--split-lanes", "true", "--transport-policy", "direct_only"])
+    assert rc == 1
+    assert report["status"] == "failed"
+    assert any("bad chunk" in error for error in report["errors"])
+
+
+def test_current_lane_is_opt_in_in_service_invocation():
+    from unittest.mock import MagicMock
+    args = runner._build_parser().parse_args(["daily", "--skip-profiles"])
+    service = MagicMock()
+    runner._invoke(service, "matches", args)
+    assert "lane" not in service.sync_matches.call_args.kwargs
+    args.split_lanes = "true"
+    runner._invoke(service, "matches", args)
+    assert service.sync_matches.call_args.kwargs["lane"] == "current"

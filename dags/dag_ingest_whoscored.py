@@ -133,6 +133,7 @@ def validate_data(**context: Any) -> None:
     """Red when a rule (a)-(e) above fires; the message names the rules."""
     from dags.scripts.whoscored_criterion import (
         SCHEDULE_MAX_AGE_HOURS,
+        DEADLINE_HOURS,
         denominator_partitions,
         inactive_partitions,
         render_overdue_sql,
@@ -188,7 +189,14 @@ def validate_data(**context: Any) -> None:
 
     partitions = denominator_partitions(report)
     try:
-        overdue = _trino_query(render_overdue_sql(now))
+        overdue_sql = render_overdue_sql(now)
+        if report.get("match_lane") == "current":
+            cutoff = (now - timedelta(days=7) + timedelta(hours=DEADLINE_HOURS)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            overdue_sql = (f"SELECT * FROM ({overdue_sql}) current_overdue "
+                           f"WHERE deadline >= TIMESTAMP '{cutoff}'")
+        overdue = _trino_query(overdue_sql)
     except Exception as exc:
         fired.append(f"(d) overdue query failed: {type(exc).__name__}: {exc}")
     else:
@@ -342,6 +350,7 @@ with DAG(
             "cd {root} && rm -f {result} && "
             "python {runner} daily "
             "--skip-profiles "
+            "--split-lanes {{{{ var.value.get('whoscored_history_enabled', 'false') | lower }}}} "
             "--transport-policy direct_only "
             "--output {result} "
             "|| [ -s {result} ]"
