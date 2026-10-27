@@ -257,6 +257,8 @@ def contour_paths(h: Host, sha: str) -> set[str]:
 
 def contour_differs(h: Host, a: str, b: str) -> bool:
     paths = sorted(contour_paths(h, a) | contour_paths(h, b))
+    # Документация и host units не исполняются в контейнере и не требуют его рестарта.
+    paths += [":(exclude)deploy/espn/README.md", ":(exclude)deploy/espn/systemd/**"]
     return bool(git(h, "diff", "--name-only", a, b, "--", *paths).strip())
 
 
