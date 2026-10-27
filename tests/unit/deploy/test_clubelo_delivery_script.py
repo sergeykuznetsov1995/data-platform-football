@@ -33,7 +33,10 @@ MAIN = "scrapers/clubelo/daily.py"
 BASE_FILES = {
     "scrapers/__init__.py": "",
     "scrapers/base/base_scraper.py": "BASE = 1\n",
-    "scrapers/base/iceberg_writer.py": "class IcebergWriter: pass\n",
+    "scrapers/base/iceberg_writer.py": "class IcebergWriter:\n"
+        "    def _get_trino_manager(self): pass\n",
+    "scrapers/base/trino_manager.py": "class TrinoTableManager:\n"
+        "    def execute_query(self, sql, params=None): pass\n",
     "scrapers/base/flaresolverr_client.py": "class FlareSolverrClient:\n"
         "    def __init__(self, url, default_timeout, default_max_timeout_ms): pass\n"
         "    def create_session(self, session_id, proxy_url=None): pass\n"
@@ -242,6 +245,29 @@ def test_solver_api_checked_before_writes(stand: Stand, method: str | None) -> N
             assert "ОТМЕНА: совместимость" in res.stdout
     assert stand.tree_text(MAIN) == ("VERSION = 1\n" if method else "VERSION = 2\n")
     assert stand.accepted() == (stand.base if method else sha)
+    assert stand.tree_text(path) == body
+    assert not (stand.state / "clubelo-inflight").exists()
+
+
+@pytest.mark.parametrize("required_params", [False, True])
+def test_trino_query_api_checked_before_writes(stand: Stand, required_params: bool) -> None:
+    path = "scrapers/base/trino_manager.py"
+    body = BASE_FILES[path]
+    if required_params:
+        body = body.replace("params=None", "params")
+    (stand.tree / path).write_text(body)
+    candidate = ("class Store:\n"
+                 "    def read(self):\n"
+                 "        return self.writer._get_trino_manager().execute_query('SELECT 1')\n")
+    sha = stand.master({MAIN: candidate})
+    for args in [("--check",), ()]:
+        res = stand.run(*args)
+        assert res.returncode == (1 if required_params else 0), res.stdout + res.stderr
+        if required_params:
+            assert "ОТМЕНА: совместимость" in res.stdout
+            assert "missing a required argument: 'params'" in res.stdout + res.stderr
+    assert stand.tree_text(MAIN) == ("VERSION = 1\n" if required_params else candidate)
+    assert stand.accepted() == (stand.base if required_params else sha)
     assert stand.tree_text(path) == body
     assert not (stand.state / "clubelo-inflight").exists()
 

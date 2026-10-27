@@ -43,7 +43,7 @@ def no_network(event, args):
         raise RuntimeError("network disabled in ClubElo compatibility check")
 
 
-def check_calls(root, writer, send, failure, solver):
+def check_calls(root, writer, send, failure, solver, trino):
     # Bind the candidate's actual call shapes to real shared signatures. Unit
     # tests may mock IO methods without autospec, hiding incompatible APIs.
     for path in (root / "scrapers/clubelo").glob("*.py"):
@@ -61,6 +61,16 @@ def check_calls(root, writer, send, failure, solver):
                 owner = writer if node.func.value.attr == "writer" else solver
                 function = getattr(owner, node.func.attr)
                 prefix = [None]  # unbound instance method
+            elif (isinstance(node.func, ast.Attribute)
+                  and isinstance(node.func.value, ast.Call)
+                  and isinstance(node.func.value.func, ast.Attribute)
+                  and node.func.value.func.attr == "_get_trino_manager"
+                  and isinstance(node.func.value.func.value, ast.Attribute)
+                  and node.func.value.func.value.attr == "writer"
+                  and isinstance(node.func.value.func.value.value, ast.Name)
+                  and node.func.value.func.value.value.id == "self"):
+                function = getattr(trino, node.func.attr)
+                prefix = [None]  # unbound instance method
             if function is not None:
                 if any(isinstance(arg, ast.Starred) for arg in node.args) or any(k.arg is None for k in node.keywords):
                     raise RuntimeError(f"unverified dynamic shared call: {path}:{node.lineno}")
@@ -76,11 +86,13 @@ def run_tests(root):
     sys.addaudithook(no_network)
     # Check real lazy dependencies before unit tests can install mocks.
     from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.base.trino_manager import TrinoTableManager
     from scrapers.base.flaresolverr_client import FlareSolverrClient
     from utils.alerts import send_telegram_message, telegram_on_failure
     from scrapers.clubelo import daily, history
     assert callable(IcebergWriter) and callable(send_telegram_message) and callable(telegram_on_failure)
-    check_calls(root, IcebergWriter, send_telegram_message, telegram_on_failure, FlareSolverrClient)
+    check_calls(root, IcebergWriter, send_telegram_message, telegram_on_failure, FlareSolverrClient,
+                TrinoTableManager)
     import pytest
     tests = sorted(str(p.relative_to(root)) for p in (root / "tests/unit").rglob("test_*clubelo*.py")
                    if "deploy" not in p.relative_to(root / "tests/unit").parts)
