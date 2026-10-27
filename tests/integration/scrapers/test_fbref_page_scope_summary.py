@@ -513,7 +513,7 @@ def test_page_age_aggregate_matches_rows_at_age_scope_and_standings_boundaries(s
     "DELETE FROM fbref_control.page_scope_summary WHERE target_id='g-orphan'",
     "UPDATE fbref_control.page_scope_summary SET pending=true WHERE target_id='g-orphan'",
     "UPDATE fbref_control.page_scope_summary SET is_complete=false WHERE target_id='g-orphan'",
-    "UPDATE fbref_control.competition_registry SET name='Edited' WHERE competition_id='9'",
+    "UPDATE fbref_control.competition_registry SET present=NOT present WHERE competition_id='9'",
 ])
 def test_aggregate_guard_checks_even_pages_outside_report_scope(scope_db, mutation):
     connection, store, cursor_class = scope_db
