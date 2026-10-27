@@ -297,7 +297,7 @@ def test_1325_reader_keeps_aliases_and_provenance_in_page_age_slice():
         return []
     result = collect_snapshot(pg, lambda _: [], day=DAY, as_of=AS_OF, mapping=MAP)
     assert result["page_ages"] == []
-    sql = next(q for q in queries if "current_ownership" in q)
+    sql = next(q for q in queries if "scope_summary_ready" in q)
     assert "page_scope_summary" in sql and "frontier_provenance" not in sql
     assert "scope.scopes" in sql and "f.last_fetched_at" in sql
     assert "refresh_policy = 'weekly'" not in PAGE_AGES_SQL
@@ -322,7 +322,7 @@ def test_1805_page_age_query_reads_stored_scopes_without_provenance():
 
 def test_1805_incomplete_summary_is_a_distinct_error_not_an_orphan():
     def pg(sql):
-        if "AS current_ownership" in sql:
+        if "AS scope_summary_ready" in sql:
             return {"error": "scope_summary_incomplete"}
         return {}
     result = collect_snapshot(pg, lambda _: [], day=DAY, as_of=AS_OF, mapping=MAP)
@@ -371,7 +371,7 @@ def test_1325_optional_page_age_read_failure_does_not_break_match_milestone():
     def pg(sql):
         if "jsonb_build_object(\n 'competitions'" in sql:
             return {k: data[k] for k in ("competitions", "seasons", "schedule_health")}
-        if "AS current_ownership" in sql:
+        if "AS scope_summary_ready" in sql:
             raise RuntimeError("private credentials")
         if "jsonb_object_agg(reason,n)" in sql:
             return {}
@@ -674,3 +674,100 @@ def test_1792_round3_saved_snapshot_rejects_invalid_confirmation_order(fetched, 
                                    validated_at=validated.isoformat())
     result = report(data)
     assert result['fotmob'] is None and not result['milestone_day_pass']
+
+
+def test_1805_page_age_sql_returns_groups_instead_of_page_payloads():
+    from scrapers.fbref.daily_report_reader import PAGE_AGES_SQL
+    sql = " ".join(PAGE_AGES_SQL.split())
+    assert "jsonb_agg" not in sql and "to_jsonb" not in sql
+    assert "GROUP BY page_kind" in sql
+    assert "jsonb_object_agg(page_kind,metrics)" in sql
+    assert "percentile_cont(0.5)" in sql and "percentile_cont(0.95)" in sql
+    assert "jsonb_array_elements(scope.scopes)" in sql
+    assert "CASE WHEN f.page_kind='season' AND f.reason IS NULL" in sql
+    assert sql.index("jsonb_to_recordset({standings_inventory}") < sql.index("dataset_manifest m")
+    assert "bool_or(NOT coalesce(scope_summary_ready,false)) FROM classified" in sql
+
+
+def test_1805_reader_passes_compact_aggregate_and_deduplicated_inventory():
+    from scrapers.fbref.daily_report import page_age_line
+    data = snapshot()
+    data["page_age_exclusions"] = {"dead": 2}
+    expected = report(data)["page_ages"]
+    aggregate = {"cutoff": AS_OF.isoformat(), "by_kind": expected["by_kind"],
+                 "excluded": {"non_roster": 1}, "standings_confirmed_seasons": 3}
+    inventory_read = False
+    def trino(sql):
+        nonlocal inventory_read
+        if "fbref_table_inventory" in sql:
+            inventory_read = True
+            return [{"target_id": "season'\\{cutoff}", "content_hash": "hash"}] * 2
+        return []
+    def pg(sql):
+        if "jsonb_build_object(\n 'competitions'" in sql:
+            return {k: data[k] for k in ("competitions", "seasons", "schedule_health")}
+        if "AS scope_summary_ready" in sql:
+            assert inventory_read
+            assert sql.count("season''" + "\\" * 4 + "{cutoff}") == 1
+            assert '"competition_id": "9", "season_id": "2026-2027"' in sql
+            return deepcopy(aggregate)
+        if "jsonb_object_agg(reason,n)" in sql:
+            return {"dead": 2}
+        return []
+    collected = collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=MAP)
+    assert collected["page_ages"] == aggregate
+    result = report(collected)
+    assert result["page_ages"]["standings_confirmed_seasons"] == 3
+    assert result["page_ages"]["excluded"] == {"dead": 2, "non_roster": 1}
+    assert "season_stats: N=0" in page_age_line(result)
+    # Every day in the CLI lookback reuses the same immutable cutoff aggregate.
+    assert result["page_ages"] == build_daily_report(
+        collected, day=DAY-timedelta(days=1), as_of=AS_OF, mapping=MAP)["page_ages"]
+    assert collected["page_ages"] == aggregate
+
+
+def test_1805_saved_aggregate_preserves_line_and_rejects_another_cutoff():
+    from scrapers.fbref.daily_report import page_age_line
+    data = snapshot()
+    data["page_age_exclusions"] = {"quarantined": 1, "dead": 2}
+    data["page_ages"] = [{"target_id": "one", "page_kind": "competition_index",
+                         "state": "queued", "refresh_policy": "daily", "last_fetched_at": None}]
+    base = {"page_kind": "season", "state": "queued", "refresh_policy": "weekly",
+            "current_ownership": True, "last_fetched_at": AS_OF.isoformat(),
+            "scopes": [{"competition_id": "9", "season_id": "2026-2027"}]}
+    data["page_ages"].extend([
+        dict(base, target_id="fresh"), dict(base, target_id="never", last_fetched_at=None),
+        dict(base, target_id="roster", page_kind="squad", canonical_url="https://fbref.com/en/squads/a",
+             last_fetched_at=(AS_OF-timedelta(hours=672)).isoformat()),
+    ])
+    expected = report(data)
+    ages = expected["page_ages"]
+    assert list(ages["excluded"]) == ["quarantined", "dead"]
+    data["page_ages"] = json.loads(json.dumps({"cutoff": AS_OF.isoformat(),
+        "by_kind": ages["by_kind"], "excluded": {},
+        "standings_confirmed_seasons": ages["standings_confirmed_seasons"]}))
+    assert report(data)["page_ages"] == ages
+    assert page_age_line(report(data)) == page_age_line(expected)
+    changed = report(data, cutoff=AS_OF+timedelta(seconds=1))["page_ages"]
+    assert changed["by_kind"]["competition_index"]["total"] == 0
+    assert changed["errors"] == [{"source": "fbref_page_ages", "reason": "aggregate_cutoff_mismatch"}]
+
+
+def test_1805_inventory_failure_is_isolated_and_aggregate_still_read():
+    data = snapshot()
+    aggregate = {"cutoff": AS_OF.isoformat(), "by_kind": report(data)["page_ages"]["by_kind"],
+                 "excluded": {}, "standings_confirmed_seasons": 0}
+    def pg(sql):
+        if "jsonb_build_object(\n 'competitions'" in sql:
+            return {k: data[k] for k in ("competitions", "seasons")}
+        return aggregate if "AS scope_summary_ready" in sql else []
+    def trino(sql):
+        if "fbref_table_inventory" in sql:
+            raise RuntimeError("private credentials")
+        return []
+    collected = collect_snapshot(pg, trino, day=DAY, as_of=AS_OF, mapping=MAP)
+    assert collected["page_ages"] == aggregate
+    assert collected["errors"] == []
+    assert report(collected)["page_ages"]["errors"] == [
+        {"source": "fbref_standings_inventory", "reason": "read_failed"}]
+    assert "private" not in json.dumps(collected)
