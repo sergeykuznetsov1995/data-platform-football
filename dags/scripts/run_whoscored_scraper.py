@@ -8,6 +8,8 @@ The public commands are deliberately workflow-shaped:
 ``daily``
     Read active scopes from that persisted catalog and incrementally ingest
     them.  There is no fallback to the historical six-league allow-list.
+``history``
+    Run one journal-led scope chunk without immutable plans or receipts.
 ``backfill``
     Freeze an immutable S3 plan, append one receipt per 25-match/200-profile
     work item, and resume from those receipts after a task/process failure.
@@ -101,7 +103,7 @@ DAILY_MATCH_LIMIT_PER_SCOPE = 300
 WEEKLY_GATE_WEEKDAY = 0
 WEEKLY_GATE_BEFORE_HOUR_UTC = 12
 DAILY_PARTS = ("matches", "stages")
-PUBLIC_COMMANDS = ("discover", "daily", "backfill", "replay")
+PUBLIC_COMMANDS = ("discover", "daily", "history", "backfill", "replay")
 COMMANDS = PUBLIC_COMMANDS
 DEFAULT_BACKFILL_CHUNK_SIZE = 25
 _SAFE_QUEUE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
@@ -336,6 +338,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SHA-256 of the exact due-profile player-id set",
     )
     parser.add_argument("--max-matches", type=int, default=None)
+    parser.add_argument("--split-lanes", choices=("true", "false"), default="false")
     parser.add_argument(
         "--daily-part",
         choices=DAILY_PARTS,
@@ -505,6 +508,8 @@ def _validate_args(
             parser.error("direct_then_paid requires --proxy-work-item-id")
     elif any(proxy_values.values()) or args.proxy_work_item_id:
         parser.error("proxy approval arguments require direct_then_paid")
+    if args.command == "history" and (scopes or args.max_matches is not None):
+        parser.error("history uses its computed queue and fixed match limit")
     if args.chunk_size <= 0:
         parser.error("--chunk-size must be positive")
     if args.command == "backfill" and args.chunk_size != DEFAULT_BACKFILL_CHUNK_SIZE:
@@ -1602,6 +1607,8 @@ def _invoke(
             ),
             "force_replay": bool(getattr(args, "_force_replay", False)),
         }
+        if daily_incremental and getattr(args, "split_lanes", "false") == "true":
+            match_kwargs["lane"] = "current"
         if bool(getattr(args, "_historical_replay", False)):
             match_kwargs["historical_replay"] = True
         return service.sync_matches(**match_kwargs)
@@ -2136,6 +2143,53 @@ def _validate_cli_backfill_deadline(plan: Mapping[str, Any]) -> None:
         raise ValueError("backfill plan deadline has expired")
 
 
+def _run_history(args, service_cls, report):
+    from scrapers.whoscored import history, history_state
+
+    if args.split_lanes != "true":
+        report["history"] = {"reason": "disabled", "attempted": 0}
+        return _finish(report, args.output)
+    try:
+        repository = _new_repository()
+        repository.ensure_schema()
+        os.environ["WHOSCORED_SCHEMA_READY"] = "1"
+        generation, catalog = repository.load_catalog_generation_snapshot()
+        report["catalog_batch_id"] = str(generation["catalog_batch_id"])
+        checkpoint = history_state.HistoryState("/opt/airflow/logs/whoscored-history.sqlite3")
+
+        def consume(result):
+            scope = RunnerScope.parse(result.scope)
+            if not report["scopes"]:
+                report["scopes"] = _new_report("history", [scope])["scopes"]
+            record = _scope_record(report, scope)
+            _merge_result(report, result, scope_record=record)
+            _record_result_state(report, record, scope, result.entity, result)
+            _set_scope_status(record)
+            if record["errors"]:
+                raise RuntimeError("; ".join(e["message"] for e in record["errors"]))
+
+        @contextmanager
+        def scoped_service(season, **kwargs):
+            with _transport_scope_environment(_scope_value(season.scope), "history"):
+                with service_cls(season, **kwargs) as service:
+                    yield service
+
+        report["history"] = history.run_chunk(
+            catalog=catalog, repository=repository, checkpoint=checkpoint,
+            service_cls=scoped_service, enabled=lambda: args.split_lanes == "true",
+            current_running=history_state.current_running, consume=consume,
+            collect_traffic=lambda service, scope: _collect_traffic(report, _scope_value(scope), service),
+        )
+        pace = report["history"].get("pace")
+        if pace:
+            logger.log(logging.WARNING if pace["alert"] else logging.INFO, pace["text"])
+    except Exception as exc:
+        report["errors"].append(f"history: {exc}")
+        report["error_details"].append({"scope": None, "entity": "history",
+            "type": type(exc).__name__, "message": str(exc), "retryable": False})
+    return _finish(report, args.output)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -2183,6 +2237,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 }
             )
         return _finish(report, args.output)
+
+    if args.command == "history":
+        return _run_history(args, service_cls, report)
 
     resumed_backfill_plan: Optional[dict[str, Any]] = None
     if args.command == "backfill" and args.plan_id:
@@ -2339,6 +2396,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _finish(report, args.output)
 
         report = _new_report(args.command, [item[0] for item in selected])
+        if args.command == "daily" and args.split_lanes == "true":
+            report["match_lane"] = "current"
         # #1601: the catalog's activity lets the schedule freshness rule
         # tell a finished season (not re-read daily) from a stale one.
         for record, (_, catalog_season) in zip(report["scopes"], selected):

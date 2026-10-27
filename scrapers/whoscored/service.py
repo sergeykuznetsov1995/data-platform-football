@@ -2957,6 +2957,7 @@ class WhoScoredIngestService:
         limit: Optional[int] = None,
         force_replay: bool = False,
         historical_replay: bool = False,
+        lane: Optional[str] = None,
     ) -> EntityResult:
         result = EntityResult(
             "matches",
@@ -2971,6 +2972,7 @@ class WhoScoredIngestService:
             limit=limit,
             include_success=force_replay,
             include_exact_count=True,
+            **({"lane": lane} if lane is not None else {}),
         )
         result.attempted = len(candidates)
         result.attempted_snapshots["match"] = {
@@ -3342,6 +3344,7 @@ class WhoScoredIngestService:
         limit: Optional[int] = None,
         match_ids: Optional[Iterable[int]] = None,
         force_replay: bool = False,
+        historical: bool = False,
     ) -> EntityResult:
         result = EntityResult(
             "previews",
@@ -3355,6 +3358,7 @@ class WhoScoredIngestService:
             limit=limit,
             match_ids=match_ids,
             force_replay=force_replay,
+            **({"historical": True} if historical else {}),
         )
         result.attempted = len(candidates)
         result.attempted_snapshots["preview"] = {

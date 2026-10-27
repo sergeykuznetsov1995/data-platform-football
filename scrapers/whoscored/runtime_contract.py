@@ -103,6 +103,8 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/whoscored/catalog.py",
     "scrapers/whoscored/detailed_feeds.py",
     "scrapers/whoscored/domain.py",
+    "scrapers/whoscored/history.py",
+    "scrapers/whoscored/history_state.py",
     "scrapers/whoscored/parsers.py",
     "scrapers/whoscored/profile_policy.py",
     "scrapers/whoscored/proxy_campaign.py",
