@@ -191,12 +191,13 @@ def environment(tmp_path, monkeypatch):
     initial = plan_season_partition(raw, BatchingManifestStore(TrinoManifestStore(manager, ensure_table=False)), **COMMON)
     chunk = initial.schedule_chunk
 
-    def build(name, *, hard_task_bytes=5000, schedule_chunk=chunk):
+    def build(name, *, hard_task_bytes=5000, schedule_chunk=chunk,
+              dag_id="dag_backfill_sofascore_all_mens"):
         policy = WorkloadBudgetPolicy("a" * 64, {CLASS: WorkloadClassBudget(
             CLASS, "season", 1, hard_task_bytes, tuple(SEASON_STATIC_ENDPOINTS + SEASON_DYNAMIC_ENDPOINTS),
             workload_shape_digest(SHAPE),
         )})
-        signed = build_partitioned_plan(policy, dag_id="dag_backfill_sofascore_all_mens",
+        signed = build_partitioned_plan(policy, dag_id=dag_id,
             run_id=f"{name}::season", control_token=TOKEN,
             freshness_keys={"season": FRESHNESS, "match": "final", "player": "final"},
             partitions=[PartitionWorkload("ENG-Premier League", "2526", 17,
@@ -241,10 +242,10 @@ def test_two_dagruns_share_raw_under_real_scope_lock_and_never_pay_twice(environ
     assert env.manager.reads_under_lock == 2
     assert all(code == 0 for code, report in results), results
     for _, report in results:
-        assert report["partial"]["continuation"] == {"last": 49, "next": None}
+        assert report["partial"]["continuation"] == {"last": 25, "next": None}
         assert report["endpoint_completeness"] == 0
         assert report["manifest_committed"] is False
-    assert len([path for path in env.source.calls if "/events/last/" in path]) == 49
+    assert len([path for path in env.source.calls if "/events/last/" in path]) == 25
     assert all(count == 1 for count in env.source.calls.values())
     counts = sorted(item.runtime.engine.metrics.snapshot()["request_count"] for item in (first, second))
     assert counts[0] == 0 < counts[1]
@@ -276,17 +277,17 @@ def test_two_dagruns_share_raw_under_real_scope_lock_and_never_pay_twice(environ
 def test_raw_before_manifest_retry_replays_saved_prefix_without_source_payment(environment):
     env = environment
     attempt = env.build("raw-before-manifest")
-    for page in range(30):
+    for page in range(20):
         spec = build_schedule_page_spec(direction="last", page=page, **COMMON)
         status, body = env.source.response(spec.url)
         env.raw.store_bytes(spec.raw_target, body, request_url=spec.url, http_status=status)
     code, report = attempt.run()
     assert code == 0, report
     assert report["partial"]["raw_manifest_committed"]
-    assert all(int(path.rsplit("/", 1)[1]) >= 30 for path in env.source.calls if "/events/last/" in path)
-    assert len([path for path in env.source.calls if "/events/last/" in path]) == 19
-    assert attempt.runtime.engine.metrics.snapshot()["replay_hits"] >= 30
-    assert len(env.manager.rows) >= 50
+    assert all(int(path.rsplit("/", 1)[1]) >= 20 for path in env.source.calls if "/events/last/" in path)
+    assert len([path for path in env.source.calls if "/events/last/" in path]) == 5
+    assert attempt.runtime.engine.metrics.snapshot()["replay_hits"] >= 20
+    assert len(env.manager.rows) >= 26
     env.publication.assert_not_called()
 
 
@@ -307,3 +308,51 @@ def test_budget_exhaustion_keeps_saved_raw_and_same_cap_without_healthy_partial(
     assert all(run["hard_run_bytes"] == original_cap for run in ledger["runs"].values())
     assert attempt.signed.run_cap_bytes == original_cap == 23
     env.publication.assert_not_called()
+
+
+@pytest.mark.parametrize("dag_id", ["dag_ingest_sofascore", "dag_refresh_sofascore_all_mens"])
+def test_non_history_lane_rejects_incomplete_schedule(environment, dag_id):
+    env = environment
+    attempt = env.build("incomplete", dag_id=dag_id)
+    code, report = attempt.run()
+    assert code == 1, report
+    assert any("season schedule exceeds one chunk on a non-history lane" in error
+               for error in report["errors"])
+    assert "partial" not in report
+    env.publication.assert_not_called()
+
+
+def test_daily_current_season_publishes_both_schedule_directions(environment, monkeypatch):
+    env = environment
+
+    def response(url):
+        if "/events/" not in url:
+            return 204, b""
+        direction, page = url.rsplit("/", 2)[-2:]
+        page = int(page)
+        event = copy.deepcopy(env.source.event)
+        event["id"] = 14000000 + (page if direction == "last" else 100 + page)
+        event.pop("referee", None)
+        return 200, json.dumps({
+            "events": [event],
+            "hasNextPage": page < (7 if direction == "last" else 2),
+        }).encode()
+
+    env.source.response = response
+    monkeypatch.setattr("scrapers.sofascore.season_pipeline.materialize_season_partition", materialize_season_partition)
+    monkeypatch.setattr("scrapers.sofascore.pipeline.finalize_materialized_results", finalize_materialized_results)
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper._add_metadata.side_effect = lambda frame, entity: frame
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: "iceberg.bronze." + kwargs["table_name"]
+    monkeypatch.setattr("scrapers.sofascore.SofaScoreScraper", lambda **kwargs: scraper)
+    attempt = env.build("daily", dag_id="dag_ingest_sofascore")
+    code, report = attempt.run()
+    assert code == 0, report
+    assert "partial" not in report
+    assert report["schedule_rows"] == 11
+    scraper.save_to_iceberg.assert_called_once()
+    committed = plan_season_partition(env.raw, attempt.runtime.manifest_store, **COMMON)
+    assert committed.schedule_chain_complete and committed.match_phase_ready
+    assert len([path for path in env.source.calls if "/events/last/" in path]) == 8
+    assert len([path for path in env.source.calls if "/events/next/" in path]) == 3

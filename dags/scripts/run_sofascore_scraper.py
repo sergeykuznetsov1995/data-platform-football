@@ -2877,6 +2877,13 @@ def _run_season_capture_engine(
             )
 
         if not getattr(plan, "schedule_chain_complete", True):
+            dag_id = getattr(workload_plan, "dag_id", None) or os.environ.get(
+                "AIRFLOW_CTX_DAG_ID", ""
+            ).strip()
+            if dag_id != "dag_backfill_sofascore_all_mens":
+                raise RuntimeError(
+                    "season schedule exceeds one chunk on a non-history lane"
+                )
             # Retained normalized pages remain deferred until the entire
             # season can pass its existing atomic Bronze publication path.
             # Replay only available raw to repair a crash before manifest;

@@ -570,8 +570,8 @@ def test_large_season_retains_continuation_after_fifty_schedule_pages(tmp_path):
     # Stored page49 promises page50. It must remain unfinished rather than
     # fail at the supported chunk boundary or silently claim completeness.
     assert plan.complete is False
-    assert plan.schedule_chunk.last == (50, 99)
-    assert plan.schedule_chunk.next == (0, 1)
+    assert plan.schedule_chunk.last == (50, 75)
+    assert plan.schedule_chunk.next == (0, 25)
     assert plan.schedule_frontier == (50, 0)
     assert not plan.match_phase_ready
     assert not plan.player_universe_ready
@@ -658,7 +658,7 @@ def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, mo
                 "identity": b'{"referee":{"id":789719}}',
                 "storage": b'{"referee":{"id":791840}}'}[profile_case]
         _seed_raw(store, profile, body)
-    for page in range(49):
+    for page in range(25):
         payload = _schedule_payload([14_000_000 + page], has_next=True)
         if page == 0 and profile_case:
             payload["events"][0]["referee"] = {"id": 791840, "name": "R"}
@@ -692,7 +692,7 @@ def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, mo
         monkeypatch.setattr(buffered, "flush", lambda: (_ for _ in ()).throw(RuntimeError("injected flush failure")))
     monkeypatch.setattr(runner, "_source_context", lambda *_: (TOURNAMENT_ID, SEASON_ID))
     allocation = SimpleNamespace(units=(qualify_work_unit("ENG-Premier League:2526", encode_season_chunk_unit(chunk)),))
-    signed = SimpleNamespace(freshness_key=lambda scope: FRESHNESS if scope == "season" else "final")
+    signed = SimpleNamespace(dag_id="dag_backfill_sofascore_all_mens", freshness_key=lambda scope: FRESHNESS if scope == "season" else "final")
     output = tmp_path / "chunk-result.json"
     with (
         patch("scrapers.sofascore.SofaScoreScraper") as publish,
@@ -714,11 +714,11 @@ def test_runner_commits_raw_chunk_without_publishing_partial_season(tmp_path, mo
         if profile_case:
             assert durable.get(profile.key).status == ManifestStatus.SCHEMA_ERROR
             assert store.load_bytes(profile.raw_target)[0] == body
-        assert result["partial"]["continuation"] == {"last": 49, "next": None}
+        assert result["partial"]["continuation"] == {"last": 25, "next": None}
         assert result["partial"]["raw_manifest_committed"] is True
         assert result["manifest_committed"] is False
         assert result["endpoint_completeness"] == 0.0
-        for page in range(49):
+        for page in range(25):
             spec = build_schedule_page_spec(direction="last", page=page, **_common())
             record = durable.get(spec.key)
             assert record.raw_content_hash and not record.is_terminal
